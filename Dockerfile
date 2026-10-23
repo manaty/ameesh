@@ -59,7 +59,7 @@ RUN set -eux; \
     rm -rf /var/lib/apt/lists/*
 
 COPY --from=build /wheels /wheels
-RUN pip install --no-cache-dir /wheels/ameesh-*.whl 'psycopg[binary]>=3.1' \
+RUN pip install --no-cache-dir /wheels/ameesh-*.whl 'psycopg[binary]>=3.2' \
     && rm -rf /wheels
 
 RUN useradd --uid 10001 --user-group --create-home --home-dir /home/ameesh \

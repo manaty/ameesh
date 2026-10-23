@@ -28,6 +28,9 @@ activity.
    gel a été renouvelé après l'avis) → `fix` (l'auteur) ;
 4. puis selon l'état : `start`, `build`, `unblock`, `verdict`, `merge`.
 
+#2511 : une fusion d'un lot du canon (branche `canon/…`, dépôt `manaty/home`)
+attend le **bureau**, qui fusionne ce dépôt ; aucun paquet ameesh ne le porte.
+
 `waiting_for` (forme d'origine de L26, champ du même nom de `ameesh-alert/1`)
 en est le résumé en un mot : `verdict`, `correction`, `fusion`,
 `decision_humaine`, ou None.
@@ -144,15 +147,35 @@ def _waiting(what: str, who) -> dict:
     return {"what": what, "who": who, "label": with_who % who if who else without}
 
 
-def _merge_wait(actions: list[dict], responsible, assignee) -> dict:
-    """L'attente d'une fusion : la dernière action `git-merge` tranche (L26)."""
+#: #2511 : les lots du canon (dépôt `manaty/home`) nomment leur branche
+#: `canon/<lot>-…` ; leur fusion est celle du bureau, hors des paquets ameesh.
+CANON_BRANCH_PREFIX = "canon/"
+
+
+def canon_target(item: dict) -> bool:
+    """#2511 : ce lot cible-t-il le dépôt du canon (manaty/home) ?
+
+    Sa branche (ou sa cible) est alors `canon/<lot>-…` : aucun paquet ameesh
+    ne la porte, la fusion revient au bureau et non au pilote/composeur."""
+    return any(str(item.get(key) or "").startswith(CANON_BRANCH_PREFIX)
+               for key in ("branch", "branch_target"))
+
+
+def _merge_wait(actions: list[dict], responsible, assignee, *,
+                canon: bool = False) -> dict:
+    """L'attente d'une fusion : la dernière action `git-merge` tranche (L26).
+
+    #2511 : un lot du canon (manaty/home) attend le bureau, qui fusionne son
+    dépôt ; une approbation d'action ne change pas ce porteur."""
     merges = [a for a in actions if a.get("connector") == MERGE_CONNECTOR]
     last = merges[-1] if merges else None
     if last is not None:
-        if last.get("state") == "approved":
-            return _waiting("merge", last.get("proposed_by"))
         if last.get("state") == "failed":
             return _waiting("fix", assignee)
+        if last.get("state") == "approved" and not canon:
+            return _waiting("merge", last.get("proposed_by"))
+    if canon:
+        return dict(_waiting("merge", "bureau"), canon=True)
     return _waiting("merge", responsible)
 
 
@@ -170,6 +193,7 @@ def waiting(item: dict, jalons: dict, actions: Iterable[dict] = (), *,
     verdict, sans deviner aucune classe."""
     state = item.get("state") or ""
     assignee = item.get("assignee") or None
+    canon = canon_target(item)
     if state in DONE_STATES:
         return None
     actions = list(actions)
@@ -201,12 +225,12 @@ def waiting(item: dict, jalons: dict, actions: Iterable[dict] = (), *,
     # ne part à un relecteur.
     if (jalons.get("verdict_kind") == "ok" and jalons.get("verdict_current")) \
             or jalons.get("verdict_required", True) is False:
-        return _merge_wait(actions, responsible, assignee)
+        return _merge_wait(actions, responsible, assignee, canon=canon)
     from . import lot_class  # import tardif : lot_class lit work et canon
     if review_class == lot_class.LIGHT:
         # §2 : la relecture d'un lot léger suit la fusion ; aucun verdict
         # n'est dû avant, même si un relecteur est désigné (#1822).
-        return _merge_wait(actions, responsible, assignee)
+        return _merge_wait(actions, responsible, assignee, canon=canon)
     if jalons.get("pending_reviewers"):
         return _waiting("verdict", jalons["pending_reviewers"])
     return _waiting("verdict", jalons.get("reviewer"))

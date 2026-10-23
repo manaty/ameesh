@@ -965,9 +965,13 @@ def gauges_of(book, profile: Profile, items: list[Profile], environ=None, *,
         # $CODEX_HOME/sessions > ~/.codex/sessions. Un compte qui désigne un
         # dossier (déclaré, ou synthétique avec `path`) lit SES sessions ; le
         # profil synthétique sans dossier garde le mécanisme de l'exécuteur.
+        # #3034 : son `auth.json` nomme le forfait vivant, pour ignorer les
+        # relevés d'un ancien forfait restés dans le même dossier de sessions.
         if profile.declared or profile.path:
+            from .codex_gauges import live_plan
+            home = profile.home(environ)
             return book.codex_gauges(
-                sessions=os.path.join(profile.home(environ), "sessions"))
+                sessions=os.path.join(home, "sessions"), plan=live_plan(home))
         return book.codex_gauges()
     return []
 
@@ -1233,7 +1237,13 @@ def evaluate(book, profile: Profile, items: list[Profile], now: float,
         # absolue — la garde de budget désactivée ne le lève pas
         result.hard = bool(getattr(profile, "refused", ""))
         return result
-    result.gauges = gauges_of(book, profile, items, environ, model=model, now=now)
+    from .codex_gauges import AmbiguousCodexGauges
+    try:
+        result.gauges = gauges_of(book, profile, items, environ, model=model, now=now)
+    except AmbiguousCodexGauges as exc:
+        result.reason = str(exc)
+        result.hard = True
+        return result
     if result.gauges and record:
         # historique des jauges de L26, attribué au compte (migration 0028)
         book.record_gauges(result.gauges, account=profile.name)
@@ -1346,6 +1356,38 @@ def pause_label(evaluations: dict) -> str:
     from .cost import until_label
     return "pause (account %s, %s %.0f %%) until %s; " % (
         first.profile.name, first.held[0], first.held[1] * 100, until_label(first.until))
+
+
+#: #2934 : le préambule d'une pause budget — le compte, la fenêtre qui le
+#: retient et l'échéance annoncée. Le pourcentage qui suit la fenêtre est une
+#: mesure continue : il reste dans `status_text`, pas dans la nature.
+_PAUSE_NATURE = re.compile(
+    r"^pause \(account (?P<compte>\(default\)|[^,)]+)"
+    r"(?:, (?P<fenetre>[^\s,]+) [\d.,]+\s*%)?\)"
+    r"(?: until (?P<echeance>[^;]+))?")
+
+#: #2934 : les mesures continues d'une raison sans ce préambule (plafond du
+#: mesh ou du compte payé au token, solde d'API). Elles changent à chaque
+#: contrôle sans que la pause change de nature.
+_PAUSE_MEASURE = re.compile(r"\d+(?:[.,]\d+)?\s*(?:%|\$|€|USD\b|EUR\b)")
+
+
+def pause_nature(reason: str) -> str:
+    """La nature d'une pause budget : ce dont le changement mérite une note.
+
+    « pause (account tertiaire, seven_day 83 %) until 14:20; … » donne le
+    compte, la fenêtre et l'échéance (``tertiaire``, ``seven_day``,
+    ``14:20``) ; les pourcentages, qui bougent à chaque relevé, n'en font pas
+    partie (#2934). Une raison sans ce préambule se compare sans ses mesures
+    continues (montants, pourcentages) : deux contrôles qui ne diffèrent que
+    par la dépense ou la jauge ne réécrivent pas la note du fil, le détail
+    restant dans `status_text`."""
+    found = _PAUSE_NATURE.match(reason or "")
+    if found:
+        return "pause|%s|%s|%s" % (
+            found.group("compte"), found.group("fenetre") or "",
+            found.group("echeance") or "")
+    return _PAUSE_MEASURE.sub("#", reason or "")
 
 
 def _label(evaluations: dict) -> str:
@@ -1494,9 +1536,12 @@ def _informative_partial(gauges, result: Evaluation, now: float) -> bool:
     vérifié. Le pilote en a borné le classement (GO du 15/10, lot #1566) : il
     garde le rang d'un relevé **courant** (fraîcheur 1, jamais 0) quand
 
-    * son âge est connu, fini et non futur, et ne dépasse pas ce qui reste
-      d'**au moins une** fenêtre datée encore ouverte — même frontière que
-      `cost.reading_outdated` (#1672) ; et
+    * l'âge d'**au moins une** fenêtre encore ouverte est connu, fini et non
+      futur, et ne dépasse pas ce qui lui reste (`now - read_at <=
+      resets_at - now`) — même frontière que `cost.reading_outdated` (#1672),
+      et lue par fenêtre : une fenêtre courte échue conservée par
+      `codex_gauges.reconcile` ne vieillit pas la semaine récemment observée
+      (#2843) ; et
     * **chaque** fenêtre encore ouverte (non datée comprise : elle ne prouve
       pas sa remise à zéro) reste sous son plafond effectif moins `RESERVE`
       (`Evaluation.limits` : rythme, fenêtre courte, plafond fixe ou d'overage
@@ -1508,15 +1553,19 @@ def _informative_partial(gauges, result: Evaluation, now: float) -> bool:
     reste écarté du placement par `placeable`.
     """
     gauges = list(gauges)
-    stamps = [stamp for stamp in (getattr(g, "read_at", None) for g in gauges)
-              if stamp]
-    if not stamps:
-        return False
-    age = now - min(stamps)
-    if not math.isfinite(age) or age < 0:
-        return False
     running = [g for g in gauges if not g.resets_at or not g.reset_passed(now)]
-    if not any(g.resets_at and age <= g.resets_at - now for g in running):
+    ages = []
+    for gauge in running:
+        stamp = getattr(gauge, "read_at", None)
+        if not stamp:
+            continue
+        age = now - float(stamp)
+        if not math.isfinite(age) or age < 0:
+            continue
+        ages.append((age, gauge))
+    if not ages:
+        return False
+    if not any(g.resets_at and age <= g.resets_at - now for age, g in ages):
         return False
     for gauge in running:
         found = result.limits.get(gauge.key)
@@ -2219,6 +2268,11 @@ def report(cfg, db, book, *, now: float | None = None,
     Chaque jauge porte son plafond effectif (`pace_ceiling`, #1176) et sa
     raison (`ceiling_reason`, vide pour le plafond de base) : le relèvement de
     fin de fenêtre s'y lit, comme dans la raison du compte.
+
+    #2648 : l'évaluation applique la réserve des agents non critiques
+    (`reserve=True`, L242b), comme `choose` — l'état, les plafonds affichés et
+    le prochain choix sont ceux de la pause : un compte dans la bande de
+    réserve n'est ni « ok » ni proposé.
     """
     now = time.time() if now is None else now
     from . import account_claims
@@ -2240,7 +2294,14 @@ def report(cfg, db, book, *, now: float | None = None,
         evaluations = {}
         for profile in items:
             try:
-                result = (evaluate_fn or evaluate)(book, profile, items, now, record=record)
+                # #2648 : la lecture qui désigne le compte d'une nouvelle
+                # session applique l'éligible de la pause d'un non-critique
+                # (réserve des critiques comprise). Sinon `accounts list`
+                # proposait un compte que la garde mettait en pause sur une
+                # autre fenêtre, et l'alerte `plan_underused` promettait la
+                # même capacité.
+                result = (evaluate_fn or evaluate)(
+                    book, profile, items, now, record=record, reserve=True)
             except Exception as exc:  # noqa: BLE001 — #1600 : jauge illisible
                 # #1600 : une lecture en erreur ne fait pas tomber l'affichage
                 # (`ameesh accounts list`) : le compte reste listé, sans marge

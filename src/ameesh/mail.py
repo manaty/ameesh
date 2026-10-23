@@ -19,11 +19,12 @@ from __future__ import annotations
 
 import json
 import re
+import time
 import unicodedata
 import uuid
 from typing import Any, Sequence
 
-from . import fastmail, fil, storage
+from . import fastmail, fil, resident_queue, storage
 from .config import NAME_RE
 from .db import Db
 from .storage.postgres import mailbox as _pg
@@ -150,10 +151,53 @@ def unread_urgent(db: Db, recipient: str, limit: int = 50) -> list[dict]:
     return storage.of(db).mailbox.unread_urgent(recipient, limit)
 
 
-def unread_mid_turn(db: Db, recipient: str, limit: int = UNREAD_LIMIT) -> list[dict]:
+def unread_human(db: Db, recipient: str, limit: int = UNREAD_LIMIT, *,
+                 names: Sequence[str] | None = None) -> list[dict]:
+    """L77/B13 : les non-lus d'un humain ACTIF, filtrés DANS la requête — rang 2.
+
+    Un humain (`payload.human`, ancien expéditeur `human:*`, ou nom déclaré de
+    l'hôte dans `names`, None = aucun) derrière plus de `UNREAD_LIMIT` non-lus
+    ordinaires n'est plus masqué par le préfixe : `_pick` le sert avant la
+    suite et la consigne en attente.
+
+    L77/B14 : les messages passifs (copie `cc`, accusé…) sont écartés par la
+    requête, comme par `passive_reason` : une copie humaine ne remplit pas la
+    fenêtre devant un humain actif.
+
+    Médié : `mailbox.unread_human` est au contrat (1.5) — le serveur filtre
+    dans sa requête, il n'y a plus de lecture bornée aux 200 premiers non-lus
+    pour trouver un humain."""
+    from .agent_names import resolve as resolve_agent_name
+    recipient = resolve_agent_name(recipient, db=db, operation="mail.unread_human")
+    return storage.of(db).mailbox.unread_human(recipient, limit, names=names)
+
+
+def unread_human_page(db: Db, recipient: str, limit: int = UNREAD_LIMIT, *,
+                      after_id: int | None = None,
+                      names: Sequence[str] | None = None) -> list[dict]:
+    """L77/B14 : les humains actifs après `after_id` — franchit un préfixe
+    de plus de `UNREAD_LIMIT` humains retenus sur un serveur médié borné.
+
+    La première page reste `unread_human` (contrat 1.5) ; les suivantes
+    passent par `mailbox.unread_human_page` (contrat 1.6). Un ancien serveur
+    refuse l'opération : l'appelant garde les humains déjà trouvés et
+    s'arrête (lecture comme avant 1.5)."""
+    from .agent_names import resolve as resolve_agent_name
+    recipient = resolve_agent_name(recipient, db=db,
+                                   operation="mail.unread_human_page")
+    return storage.of(db).mailbox.unread_human_page(
+        recipient, limit, after_id=after_id, names=names)
+
+
+def unread_mid_turn(db: Db, recipient: str, limit: int = UNREAD_LIMIT, *,
+                    include_human: bool = True) -> list[dict]:
     """L514/#885 : les non-lus qu'une remise mi-tour peut livrer — verdict,
     arbitrage, message d'un humain, urgent (`mid_turn`) —, filtrés DANS la
     requête : un verdict derrière plus de `UNREAD_LIMIT` non-lus est vu.
+
+    ``include_human=False`` (L77/B11) : un tour résident ne remet pas les
+    messages humains par le hook ; ils restent à la file du tour, qui les
+    réserve et les solde à sa fin effective (rang 1/2, au moins une fois).
 
     Chemin médié : `mailbox.unread_mid_turn` n'est pas dans le contrat 1.1, il
     lit `mailbox.unread` (admis) et filtre ici, comme `unread_active` — au plus
@@ -161,8 +205,9 @@ def unread_mid_turn(db: Db, recipient: str, limit: int = UNREAD_LIMIT) -> list[d
     st = storage.of(db)
     if getattr(st, "driver", None) == "mediated":
         rows = st.mailbox.unread(recipient, max(int(limit), UNREAD_LIMIT))
-        return [row for row in rows if mid_turn(row)][:int(limit)]
-    return st.mailbox.unread_mid_turn(recipient, limit)
+        return [row for row in rows
+                if mid_turn(row) and (include_human or not is_human(row))][:int(limit)]
+    return st.mailbox.unread_mid_turn(recipient, limit, include_human=include_human)
 
 
 def get(db: Db, message_id: int) -> dict | None:
@@ -180,6 +225,32 @@ def mark_delivered(db: Db, ids: Sequence[int]) -> int:
 #: réservation peut être reprise et le message est signalé « re-livré ».
 RESERVATION_TTL = 600.0
 HOOK_RESERVATION_TTL = 60.0
+
+#: L77/B6 : plafond de la réservation d'un message humain quand le tour n'a
+#: pas de durée maximale (`turn_max_seconds` = 0). La réservation doit couvrir
+#: un tour réaliste sans être infinie ; au-delà, la reprise par le hook vaut
+#: mieux qu'une réservation qui ne s'éteint jamais.
+HUMAN_RESERVATION_MAX = 24 * 3600.0
+
+
+def human_reservation_ttl(turn_max_seconds: float | int | None) -> float:
+    """L77/B6 : durée de la réservation d'un message humain.
+
+    Un message humain n'est soldé qu'à la **fin** du tour (`_solde_humains`) :
+    une réservation au TTL ordinaire expirerait pendant un tour plus long que
+    10 min, et le hook pourrait reprendre le message (doublon, solde final
+    refusé, pas de trace L78). La réservation couvre donc tout le tour, plus
+    la marge de livraison ; sans durée maximale (0), un plafond fixe la borne.
+    Elle reste liée au bail (runner, epoch) : un bail perdu la rend
+    inutilisable même avant son échéance.
+    """
+    try:
+        seconds = float(turn_max_seconds or 0)
+    except (TypeError, ValueError):
+        seconds = 0.0
+    if seconds > 0:
+        return seconds + RESERVATION_TTL
+    return HUMAN_RESERVATION_MAX
 
 
 def new_token() -> str:
@@ -259,7 +330,8 @@ def _readable_body(row: dict, limite: int | None = None) -> str:
     body = row.get("body") or ""
     if fil.unreadable_reason(body):
         return "[unreadable body, not reproduced: see the thread, message #%s]" % row.get("id")
-    text = fil.clean_text(body).strip("\n")
+    # L77 : un corps ne se fait jamais passer pour l'enveloppe écrite par ameesh.
+    text = resident_queue.neutralise(fil.clean_text(body).strip("\n"))
     if limite is not None:
         text, retire = _tronque(text, limite)
         if retire:
@@ -284,17 +356,22 @@ def _verdict_note(db: Db | None, row: dict) -> str:
     return "  [⚠ signature NOT valid: %s]" % verdict.reason
 
 
-def _block(db: Db | None, row: dict, limite: int | None = None, note: str | None = None
-           ) -> str:
+def _block(db: Db | None, row: dict, limite: int | None = None, note: str | None = None,
+           envelope: str | None = None) -> str:
     """Le rendu d'un message : en-tête (n°, expéditeur, heure, nature,
-    autorité, re-livré) puis corps lisible cité ligne à ligne."""
+    autorité, re-livré) puis corps lisible cité ligne à ligne.
+
+    `envelope` (L77) : la ligne d'enveloppe écrite par ameesh pour un message
+    humain, placée AVANT l'en-tête du message — elle ne vient jamais du corps.
+    """
     nature = _nature(row)
     relivre = ("  [re-delivered: already reserved for delivery before an outage, "
                "you may have handled it already]" if maybe_redelivered(row) else "")
     moment = fil.iso_local(row.get("created_ts") or 0.0)
     corps = _readable_body(row, limite)
-    return "— message #%s from %s, %s%s%s%s%s:\n%s" % (
-        row.get("id"), row.get("sender") or "?", moment, nature,
+    tete = (envelope + "\n") if envelope else ""
+    return "%s— message #%s from %s, %s%s%s%s%s:\n%s" % (
+        tete, row.get("id"), row.get("sender") or "?", moment, nature,
         _verdict_note(db, row) if note is None else note, relivre, forwarded_note(row),
         "\n".join("> " + line for line in corps.split("\n")))
 
@@ -319,14 +396,27 @@ def _assemble(kind: str, blocks: Sequence[str], remaining: int) -> str:
         parts.append(adapters.MAIL_REMAINING % remaining)
     parts.append(footer)
     parts.append(adapters.TMP_NOTE)  # L162 : $TMPDIR, jamais /tmp en dur
+    parts.append(adapters.VENV_NOTE)  # #2763 : jamais pip dans le venv partagé
     # L159b: with a lending VM, heavy suites go there; otherwise L131, heavy
     # suites capped per host by `ameesh heavy`
     parts.append(adapters.offload_note() or adapters.HEAVY_NOTE)
     return "\n\n".join(parts)
 
 
+def _envelope_for(envelopes: dict[int, str] | None, row: dict) -> str | None:
+    """L'enveloppe L77 d'un message, ou None (message ordinaire)."""
+    if not envelopes:
+        return None
+    try:
+        key = int(row.get("id"))
+    except (TypeError, ValueError):
+        return None
+    return envelopes.get(key)
+
+
 def prompt_for(db: Db | None, rows: Sequence[dict], *, kind: str,
-               budget: int = PROMPT_MAX_BYTES, extra_remaining: int = 0
+               budget: int = PROMPT_MAX_BYTES, extra_remaining: int = 0,
+               envelopes: dict[int, str] | None = None
                ) -> tuple[str, list[dict], int]:
     """La consigne d'un tour de courrier, bornée sur son rendu RÉEL complet.
 
@@ -342,7 +432,8 @@ def prompt_for(db: Db | None, rows: Sequence[dict], *, kind: str,
     blocks: list[str] = []
     for index, row in enumerate(rows):
         note = _verdict_note(db, row)  # une vérification par message, pas par essai
-        bloc = _block(db, row, note=note)
+        env = _envelope_for(envelopes, row)
+        bloc = _block(db, row, note=note, envelope=env)
         if octets(_assemble(kind, blocks + [bloc], total - index - 1)) <= budget:
             blocks.append(bloc)
             continue
@@ -351,7 +442,7 @@ def prompt_for(db: Db | None, rows: Sequence[dict], *, kind: str,
         # Premier message trop long à lui seul : corps tronqué jusqu'à tenir.
         limite = budget
         while True:
-            bloc = _block(db, row, limite, note=note)
+            bloc = _block(db, row, limite, note=note, envelope=env)
             exces = octets(_assemble(kind, [bloc], total - 1)) - budget
             if exces <= 0 or limite == 0:
                 break
@@ -384,6 +475,15 @@ def review_requests(db: Db, recipient: str, lot: int | str) -> list[dict]:
     from .agent_names import resolve as resolve_agent_name
     recipient = resolve_agent_name(recipient, db=db, operation="mail.review_requests")
     return storage.of(db).mailbox.review_requests(recipient, str(int(lot)))
+
+
+def delivered_for_lot(db: Db, recipient: str, lot, limit: int) -> list[dict]:
+    """#2539 : les derniers messages déjà remis de ce lot, filtrés dans la
+    requête (destinataire + lot), sans fenêtre de temps. Non admis en mode
+    médié (contrat fermé) : l'appelant retombe sur les non-lus."""
+    from .agent_names import resolve as resolve_agent_name
+    recipient = resolve_agent_name(recipient, db=db, operation="mail.delivered_for_lot")
+    return storage.of(db).mailbox.delivered_for_lot(recipient, str(lot or "").strip(), limit)
 
 
 def pending_recipients(db: Db) -> list[str]:
@@ -431,6 +531,53 @@ def is_event(row: Any) -> bool:
 def is_urgent(row: Any) -> bool:
     """Un événement `urgent` perce le regroupement (C9)."""
     return bool(message_payload(row).get("urgent"))
+
+
+#: #2814: the EXPLICIT request deadline, in the message payload. It is NOT
+#: the signature's `signature_expires_at` (a TTL for the signature, 24 h by
+#: default): a signed owner order must never disappear because its signature
+#: aged. A client that wants a deadline sets this key (absolute epoch
+#: seconds), e.g. `agent-mail send … --request-expires 2h`.
+REQUEST_DEADLINE_KEY = "request_expires_ts"
+
+
+def request_deadline(row: Any) -> float | None:
+    """The explicit request deadline of a message (epoch seconds), or None.
+
+    Only `payload.request_expires_ts` counts; `signature_expires_ts` is the
+    signature's own TTL and never a request deadline. A missing, non-numeric,
+    non-finite or non-positive value means "no deadline" (never guessed)."""
+    value = _payload(row).get(REQUEST_DEADLINE_KEY)
+    if isinstance(value, bool):
+        return None
+    if not isinstance(value, (int, float)):
+        return None
+    moment = float(value)
+    if moment != moment or moment <= 0:
+        return None
+    return moment
+
+
+def request_expired(row: Any, now: float | None = None) -> bool:
+    """#2814: has the message's explicit request deadline passed?
+
+    No deadline (the ordinary case, including every signed message that does
+    not carry one) means it never expires while queued."""
+    deadline = request_deadline(row)
+    return deadline is not None and deadline <= (time.time() if now is None else float(now))
+
+
+def drop_expired(db: Db, rows: Sequence[dict]) -> int:
+    """#2814 : solde des requêtes à échéance explicite dépassée, sans tour.
+
+    Rend le nombre de messages marqués remis. L'échéance est celle que
+    l'expéditeur a posée (`request_expires_ts`) ; le message reste dans
+    l'historique et le fil, et l'appelant prévient l'expéditeur avant de le
+    solder. Une erreur de base est laissée à l'appelant (le tour est différé,
+    rien n'est consommé)."""
+    ids = [int(row["id"]) for row in rows or ()
+           if row.get("id") is not None and request_expired(row)]
+    return mark_delivered(db, ids) if ids else 0
 
 
 # --------------------------------------------------------------------------
@@ -481,8 +628,21 @@ def passive_reason(row: Any) -> str:
 
 
 def is_human(row: Any) -> bool:
-    """L125 : message d'un humain, marqué à l'envoi — il réveille tout de suite."""
-    return bool(_payload(row).get("human"))
+    """L125 : message d'un humain, marqué à l'envoi — il réveille tout de suite.
+
+    L77/B1 : un expéditeur déjà qualifié ``human:<id>`` est humain même si une
+    ancienne ligne n'a pas le marqueur (les décisions l'écrivent ainsi)."""
+    sender = str(row.get("sender") or row.get("from") or "")
+    return bool(_payload(row).get("human")) or sender.startswith("human:")
+
+
+def human_account(row: Any) -> str:
+    """L77 : la preuve d'entrée d'un message humain (``user@host``), ou ''.
+
+    Écrite par le CLI au dépôt, à partir du compte Unix réel et de l'hôte du
+    processus : le lecteur ne la recalcule jamais avec son propre compte."""
+    value = _payload(row).get("human_account")
+    return value.strip() if isinstance(value, str) else ""
 
 
 #: L514: payload keys of a message the sender marked as a review verdict

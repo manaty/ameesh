@@ -7,6 +7,7 @@
 // approval and system notifications stay the host's decisions (study §2.2).
 // Nothing else crosses: no popup, no cookie, no storage.
 import { AmeeshConfig } from "./components/ameesh-config";
+import type { DeviceState } from "./components/this-device";
 
 /** A mesh known to the host: a public API base, and what to call it. */
 export interface AmeeshMesh {
@@ -65,6 +66,27 @@ export interface AmeeshHost {
   theme?: "auto" | "light" | "dark";
   /** Optional language imposed by the host (fr, en). */
   language?: string;
+  /** L93: read the local state of this machine's runners (the main process
+   * reads the Unix sockets; a renderer cannot). Null: no local runner. */
+  deviceState?(): DeviceState | null | Promise<DeviceState | null>;
+  /** L93: perform the stop the <ameesh-this-device> screen asked for. The
+   * clean stop goes to the runner's control socket; the immediate stop is
+   * the Compute runner's own gesture, after native confirmation in main.
+   * Main resolves the agent/runner and socket from its own local state;
+   * renderer identifiers are hints, never authority or filesystem paths. */
+  stopAgent?(agent: string, options: DeviceStopOptions): void | Promise<void>;
+}
+
+/** A stop asked by <ameesh-this-device>; the host decides how. */
+export interface DeviceStopOptions {
+  mode: "clean" | "immediate";
+  runner?: string;
+  mesh?: string;
+}
+
+/** The detail of the `ameesh:stop` event. */
+export interface DeviceStop extends DeviceStopOptions {
+  agent: string;
 }
 
 export interface ConnectHostOptions {
@@ -83,6 +105,7 @@ export const HOST_EVENTS = {
   open: ["ameesh:open-project", "ameesh:open-agent", "ameesh:open-lot"],
   approval: "ameesh:approval-requested",
   alert: "ameesh:alert",
+  deviceStop: "ameesh:stop",
 } as const;
 
 function firstConfig(root: ParentNode): AmeeshConfig | null {
@@ -174,15 +197,31 @@ export function connectHost(host: AmeeshHost, options: ConnectHostOptions = {}):
     const value: AmeeshHostAlert = typeof detail === "string" ? { text: detail } : detail ?? { text: "" };
     if (value.text) void host.notify({ ...value, mesh: value.mesh ?? mesh });
   };
+  // L93: the device screen asks for a stop; the host performs it (its main
+  // process holds the control socket, the renderer never opens it).
+  const deviceStop = (event: Event) => {
+    const detail = (event as CustomEvent).detail as DeviceStop | undefined;
+    if (!detail || typeof detail.agent !== "string" || !detail.agent) return;
+    if (!host.stopAgent) return;
+    void host.stopAgent(detail.agent, {
+      mode: detail.mode === "immediate" ? "immediate" : "clean",
+      runner: detail.runner, mesh: detail.mesh,
+    });
+  };
   for (const [type, fn] of openFns) on(type, fn);
   on(HOST_EVENTS.approval, approval);
   on(HOST_EVENTS.alert, alert);
+  // the device screen is not bound to a mesh: it may live outside the
+  // <ameesh-config>, so its stop event is listened to on the host root
+  const rootEvents = root as unknown as EventTarget;
+  rootEvents.addEventListener(HOST_EVENTS.deviceStop, deviceStop);
 
   return () => {
     disposed = true;
     for (const [type, fn] of openFns) off(type, fn);
     off(HOST_EVENTS.approval, approval);
     off(HOST_EVENTS.alert, alert);
+    rootEvents.removeEventListener(HOST_EVENTS.deviceStop, deviceStop);
     if (target.tokenProvider === tokenProvider) target.tokenProvider = undefined;
   };
 }

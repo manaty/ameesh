@@ -313,7 +313,20 @@ class EnvoiTest(_Base):
         proc = self.cli("send", "orch", "Merci !", "--from", "proprio",
                         env=self.env(AMEESH_HUMANS="proprio"))
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertEqual(self._payload("orch"), {"human": True})
+        payload = self._payload("orch")
+        self.assertTrue(payload.get("human"))
+        self.assertIn("@", payload.get("human_account", ""))
+
+    def test_from_human_lie_ne_porte_pas_de_preuve(self):
+        """(a) : un processus lié à un agent ne prouve jamais un humain."""
+        registry.upsert(self.db, "orch", harness="claude")
+        proc = self.cli("send", "orch", "Merci !", "--from", "proprio",
+                        env=self.env(AMEESH_HUMANS="proprio",
+                                     AGENT_MAIL_NAME="dev1"))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        payload = self._payload("orch")
+        self.assertTrue(payload.get("human"))
+        self.assertNotIn("human_account", payload)
 
     def test_copie_sans_reveil(self):
         for name in ("orch", "dev1", "dev2"):

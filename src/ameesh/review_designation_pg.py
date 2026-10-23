@@ -83,9 +83,27 @@ def designation_of(note: str) -> Optional[dict]:
     return found
 
 
+def _mark_author(author) -> dict:
+    """One author of the frozen content, with its proof trace when it has one.
+
+    `proof: turn-journal` and `fallback_commits` are written only for an author
+    admitted by the #2721 fallback (a rewritten or pre-hook commit): the mark
+    keeps which commits relied on the commit's turn journal, so the decision is
+    auditable without pretending they carry an exact receipt."""
+    row = {"name": str((author or {}).get("name") or ""),
+           "family": str((author or {}).get("family") or "")}
+    proof = str((author or {}).get("proof") or "").strip()
+    if proof:
+        row["proof"] = proof
+        commits = (author or {}).get("fallback_commits")
+        if isinstance(commits, (list, tuple)):
+            row["fallback_commits"] = [str(commit) for commit in commits]
+    return row
+
+
 def _mark_note(lot: int, freeze_id: int, *, state: str, required: int, reviewers,
                missing: int, why: str, authors, policy_ref: str, sha: str,
-               sent=()) -> str:
+               sent=(), unknown=()) -> str:
     payload = {
         "state": state,
         "required": int(required),
@@ -95,9 +113,11 @@ def _mark_note(lot: int, freeze_id: int, *, state: str, required: int, reviewers
         "missing": int(missing),
         "why": str(why or ""),
         "freeze": {"id": int(freeze_id), "sha": sha},
-        "authors": [{"name": str((a or {}).get("name") or ""),
-                     "family": str((a or {}).get("family") or "")}
-                    for a in authors or ()],
+        "authors": [_mark_author(a) for a in authors or ()],
+        # #2864 : la lecture de provenance n'est complète que si elle nomme les
+        # commits qu'elle n'a pas pu attribuer. La marque le garde pour que la
+        # proposition de relecture échoue fermé sur une lecture partielle.
+        "unknown_authors": [str(value) for value in unknown or () if str(value).strip()],
         "policy_ref": str(policy_ref or ""),
         # #2557 : les courriels réellement déposés pour ce gel, en noms
         # primaires. La marque est écrite dans la même transaction qu'eux et
@@ -112,7 +132,8 @@ def _mark_note(lot: int, freeze_id: int, *, state: str, required: int, reviewers
 
 
 def _designation(lot: int, freeze_id: int, *, state: str, required: int, reviewers,
-                 missing: int, why: str, authors, policy_ref: str, sha: str) -> dict:
+                 missing: int, why: str, authors, policy_ref: str, sha: str,
+                 unknown_authors=()) -> dict:
     """The shape returned by `commit`, the one `apply` passes to its caller."""
     return {
         "state": state,
@@ -122,6 +143,8 @@ def _designation(lot: int, freeze_id: int, *, state: str, required: int, reviewe
         "why": str(why or ""),
         "freeze": {"id": int(freeze_id), "sha": sha},
         "authors": [dict(a) for a in authors or ()],
+        "unknown_authors": [str(value) for value in unknown_authors or ()
+                            if str(value).strip()],
         "policy_ref": str(policy_ref or ""),
     }
 
@@ -352,7 +375,7 @@ class PgPort:
                reviewers: Sequence[Mapping], missing: int, why: str,
                authors: Sequence[Mapping] = (), policy_ref: str = "",
                notify: str = "", messages: Sequence[Mapping] = (),
-               force: bool = False) -> dict:
+               unknown_authors: Sequence[str] = (), force: bool = False) -> dict:
         """Writes the freeze's designation in one transaction and returns its shape.
 
         Under the lock of the lot row: rechecks that `freeze` is still the
@@ -374,6 +397,7 @@ class PgPort:
                                state=state, reviewers=reviewers, missing=missing,
                                why=why, authors=authors, policy_ref=policy_ref,
                                notify=notify, messages=messages,
+                               unknown_authors=unknown_authors,
                                hook=self.at_freeze, force=force)
         threads: list = []
         inner = PgPort(self.db, sender=self.sender, after_commit=threads)
@@ -391,7 +415,8 @@ class PgPort:
             out = inner._write(tx, lot, freeze=freeze, required=required, state=state,
                                reviewers=reviewers, missing=missing, why=why,
                                authors=authors, policy_ref=policy_ref, notify=notify,
-                               messages=messages, hook=False, force=force)
+                               messages=messages, unknown_authors=unknown_authors,
+                               hook=False, force=force)
         # the external thread only after the commit: a cancelled send leaves nothing
         for record in threads:
             record(self.db.cfg, self.db)
@@ -400,7 +425,7 @@ class PgPort:
     def _write(self, db, lot: int, *, freeze: Mapping, required: int, state: str,
                reviewers: Sequence[Mapping], missing: int, why: str, authors,
                policy_ref: str, notify: str, messages, hook: bool,
-               force: bool = False) -> dict:
+               unknown_authors: Sequence[str] = (), force: bool = False) -> dict:
         freeze = dict(freeze or {})
         sha = str(freeze.get("sha") or "").strip().lower()
         try:
@@ -516,8 +541,9 @@ class PgPort:
                  _mark_note(lot, freeze_id, state=state, required=required,
                             reviewers=reviewers, missing=missing, why=why,
                             authors=authors, policy_ref=policy_ref, sha=sha,
-                            sent=deposited),
+                            sent=deposited, unknown=unknown_authors),
                  self.sender)
         return _designation(lot, freeze_id, state=state, required=required,
                             reviewers=reviewers, missing=missing, why=why,
-                            authors=authors, policy_ref=policy_ref, sha=sha)
+                            authors=authors, policy_ref=policy_ref, sha=sha,
+                            unknown_authors=unknown_authors)

@@ -5,6 +5,7 @@
   ameesh work backlog add --title T --value "valeur attendue" --score N
                           [--priority 1|2|3] [--source S] [--team E]
                           [--requires CAP …] [--body B] [--package F]
+                          [--chantier C] [--review-of LOT]
   ameesh work backlog list [--all] [--json] [--limit N]
 
 Un élément de la file est un lot (`work_items`) de type `improvement`, en
@@ -12,6 +13,31 @@ Un élément de la file est un lot (`work_items`) de type `improvement`, en
 à 100), une priorité (1 haute, 2 normale, 3 basse), éventuellement une équipe
 et des capacités exigées. Pas de table neuve : le cycle, le journal, les
 jalons, la vue d'avancement et les alertes des lots s'appliquent tels quels.
+
+**Panier du chantier** (#2584, canon §2 l.129, owner 15/10 puis 19/10/2026 :
+« un défaut non bloquant ne crée pas de lot […] il ne devient un lot qu'à
+partir d'une valeur de 30, et un défaut trouvé en relisant une suite d'avis ne
+crée rien ») : quand le canon déclare le seuil (`backlog.lot_min_value` de
+`processus/mecanique.yaml`, `rules`), un élément de valeur inférieure n'est
+plus un lot. Il devient une **ligne** du panier ouvert de son chantier pour le
+jour (heure du canon) : un seul lot `improvement` par chantier et par jour,
+dont la source est la clé `backlog-basket:<projet>:<chantier>:<jour>`. Le
+chantier est `--chantier`, sinon la fiche (`--package`), sinon la fiche ou le
+numéro du lot relu, sinon le projet. Un panier déjà pris est fermé : la ligne
+suivante en ouvre un autre. Au seuil ou au-dessus, l'élément reste un lot.
+Un élément issu de la relecture d'une **suite d'avis** (panier, élément de
+backlog né d'une relecture, lot marqué N/P2/P3) est refusé : le relecteur le
+corrige sur place ou le laisse. Le lot relu est `--review-of`, sinon le `#N`
+d'une source de relecture (« relecture #313 », « verdict … #2577 »), sinon
+celui d'un titre de suite (« #2464 N : … ») ; un lot de relecture après fusion
+renvoie au lot qu'il relit. Sans seuil au canon (bloc absent, canon
+illisible), rien de ceci ne s'applique : aucun seuil n'est supposé (§7).
+
+Tant qu'un lot de roadmap du projet est prenable, un élément sous le seuil
+(panier, élément ancien) n'est pas confié à un agent (`work assign`,
+`assign_refusal`) : un agent libre ne le prend que faute de travail plus
+utile. La prise au repos (`auto_take`) tenait déjà plus large : toute la file
+attend tant qu'un lot d'un projet attend un preneur (0037, ci-dessous).
 
 **Prise automatique** (`auto_take`, appelée à chaque passage d'`ameesh
 notify`, et par l'exécuteur de chaque hôte pour ses propres agents — #804) :
@@ -108,6 +134,8 @@ from __future__ import annotations
 import json
 import re
 import time
+from dataclasses import dataclass
+from datetime import datetime
 
 from . import storage
 from .db import Db, DbError, is_deadlock
@@ -151,6 +179,12 @@ TAKE_WINDOW_S = 3600.0
 #: alertes qui empêchent une prise sur l'hôte de l'agent
 HOST_BLOCKING_ALERTS = ("host_pressure", "host_power_low", "host_not_ready", "host_disk_low")
 SENDER = "ameesh"
+#: #2584 : `source` d'un panier — `backlog-basket:<projet>:<chantier>:<jour>`
+BASKET_PREFIX = "backlog-basket:"
+#: #2584 : marque structurée de la relecture dont vient un élément au seuil
+#: (`--review-of`), en tête de sa source : l'élément est une suite d'avis
+REVIEW_OF_PREFIX = "review-of:#"
+BASKET_LINE_NOTE = interface.BASKET_LINE_NOTE
 
 
 class BacklogError(ValueError):
@@ -278,8 +312,205 @@ def followup_hint(*, title: str, source: str = "", issue_ref: str = "",
     return ("this looks like a non-blocking follow-up (N, P2, P3): canon §2 does not "
             "create a lot for it — record it in the backlog "
             "(`ameesh work backlog add --title \"%s\" --value \"<valeur attendue>\" "
-            "--score <1-100>`%s), grouped with the other minor defects of the same "
-            "workstream" % (short, where))
+            "--score <1-100>`%s, and `--review-of <lot>` for a review finding): under "
+            "the canon's lot threshold it becomes a line of its workstream's basket, "
+            "and a defect found reviewing a review follow-up creates nothing" % (short, where))
+
+
+# --------------------------------------------------------------------------
+# #2584 : seuil du canon, panier du chantier, suites d'avis
+# --------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class Rules:
+    """Le seuil de lot d'un défaut non bloquant, compilé du canon (#2584)."""
+
+    lot_min_value: int
+    timezone: str
+    commit: str
+
+
+#: `(dépôt, commit, projet) -> Rules | None` : le canon est relu au commit
+#: exact, une fois par commit et par projet dans le processus
+_RULES: dict = {}
+
+
+def rules(cfg, project: str) -> Rules | None:
+    """Le seuil de lot du canon pour `project` (`backlog.lot_min_value` de
+    `processus/mecanique.yaml`, lu au commit exact par `mechanics.load`), ou
+    None : canon non configuré ou illisible, mécanique absente, projet non
+    déclaré, bloc `backlog` absent. None garde la route historique (un élément
+    = un lot) : aucun seuil n'est supposé (canon §7)."""
+    project = str(project or "").strip()
+    if cfg is None or not project or not getattr(cfg, "canon", ""):
+        return None
+    from . import canon as canon_mod
+    from . import mechanics
+    try:
+        canons = canon_mod.load_configured(cfg)
+    except Exception:  # noqa: BLE001 - canon illisible : aucun seuil supposé
+        return None
+    for loaded in canons:
+        for source in getattr(loaded, "sources", ()) or ():
+            if source.mode != "git" or not source.repo or not source.commit:
+                continue
+            key = (source.repo, source.commit, project)
+            if key not in _RULES:
+                try:
+                    compiled = mechanics.load(source.repo, source.commit, project)
+                except Exception:  # noqa: BLE001 - canon sans mécanique : le suivant
+                    compiled = None
+                threshold = getattr(compiled, "backlog_lot_min_value", None)
+                _RULES[key] = (None if threshold is None else
+                               Rules(int(threshold), compiled.timezone, compiled.commit))
+            if _RULES[key] is not None:
+                return _RULES[key]
+    return None
+
+
+#: une source de relecture : « relecture #313 », « verdict dev7 #2525 »,
+#: « R2 #1300 », « review of #12 », « en relisant #N », « avis … #N »
+REVIEW_WORDS = re.compile(
+    r"\b(?:relectures?|relire|relis|relit|relisant|relu|relue|relus|verdicts?|reviews?|reviewed|"
+    r"avis|r[0-9])\b", re.I)
+#: une référence de lot `#N` (jamais `owner/repo#N`, une issue GitHub)
+LOT_REF = re.compile(r"(?<![\w/])#([0-9]+)\b")
+#: ce qui précède un `#N` qui n'est pas un lot : « PR #1943 », « pull request
+#: #1943 », « pull-request #1943 », « issue #12 »
+NOT_LOT_REF = re.compile(r"\b(?:prs?|pull(?:[\s-]+requests?)?|issues?)\s*$", re.I)
+
+
+def _lot_ref(text: str) -> int | None:
+    """Le premier `#N` de `text` qui désigne un lot (ni PR, ni issue)."""
+    text = str(text or "")
+    for match in LOT_REF.finditer(text):
+        if not NOT_LOT_REF.search(text[:match.start()]):
+            return int(match.group(1))
+    return None
+
+
+def review_origin(*, title: str = "", source: str = "") -> int | None:
+    """Le lot dont la relecture a produit cet élément, lu sur son texte, ou None.
+
+    La marque structurée (`review-of:#N`) d'abord ; puis le premier `#N` d'une
+    source de relecture (« relecture #313 (qa-01, N1) », « verdict … sur
+    #2577 ») ; puis le premier `#N` d'un titre de suite (« #2464 N (dev7) : … »,
+    marqueurs de `followup_hint`). Un constat (« #2577 dry-run complet ») ou une
+    source sans relecture (« finding ») n'a pas d'origine."""
+    source = str(source or "")
+    if source.startswith(REVIEW_OF_PREFIX):
+        match = re.match(r"[0-9]+", source[len(REVIEW_OF_PREFIX):])
+        if match:
+            return int(match.group(0))
+    if REVIEW_WORDS.search(source):
+        lot = _lot_ref(source)
+        if lot is not None:
+            return lot
+    if followup_hint(title=title):
+        return _lot_ref(title)
+    return None
+
+
+def sensitive_p2(*, title: str = "", source: str = "", app: str = "") -> bool:
+    """Canon §2 : « sauf P2 sensible ameesh » — sur ameesh, un P2 de la classe
+    sensible bloque encore : ni panier, ni seuil, ni refus de suite d'avis ;
+    il garde son lot."""
+    return (str(app or "").strip().lower() == "ameesh"
+            and bool(SENSITIVE_P2.search(" ".join([str(title or ""), str(source or "")]))))
+
+
+def is_basket(item: dict) -> bool:
+    """Le lot est-il un panier de chantier (#2584) ?"""
+    return (item.get("type") == ITEM_TYPE
+            and str(item.get("source") or "").startswith(BASKET_PREFIX))
+
+
+def is_review_followup(item: dict) -> bool:
+    """Le lot est-il une **suite d'avis** (canon §2, owner 19/10/2026) ?
+
+    Un panier ; un élément du backlog né d'une relecture (marque `review-of:#`,
+    ou origine lisible sur sa source ou son titre, `review_origin`) ; un lot
+    marqué comme suite non bloquante (N, P2, P3 : `followup_hint`). Un lot de
+    relecture après fusion n'en est pas une : il relit le lot d'origine ; un
+    P2 sensible d'ameesh non plus (`sensitive_p2`), même né d'une relecture."""
+    item = item or {}
+    if is_basket(item):
+        return True
+    title, source = str(item.get("title") or ""), str(item.get("source") or "")
+    if sensitive_p2(title=title, source=source, app=item.get("app") or ""):
+        return False
+    if followup_hint(title=title, source=source, issue_ref=item.get("issue_ref") or "",
+                     app=item.get("app") or ""):
+        return True
+    return item.get("type") == ITEM_TYPE and review_origin(title=title, source=source) is not None
+
+
+def _reviewed_lot(db: Db, review_of, *, title: str, source: str) -> dict | None:
+    """Le lot relu dont vient l'élément : `--review-of`, sinon `review_origin`.
+    Un lot de relecture après fusion renvoie au lot qu'il relit. Un `--review-of`
+    inconnu est refusé ; une origine lue sur le texte et introuvable est ignorée."""
+    from . import review_lot, work
+    explicit = review_of is not None and str(review_of).strip() != ""
+    if explicit:
+        try:
+            lot = int(str(review_of).strip().lstrip("#"))
+        except ValueError:
+            raise BacklogError("--review-of: a lot number is required, got %r"
+                               % review_of) from None
+    else:
+        lot = review_origin(title=title, source=source)
+        if lot is None:
+            return None
+    item = work.get(db, lot)
+    if item is None:
+        if explicit:
+            raise BacklogError("--review-of: lot #%d not found" % lot)
+        return None
+    ref = review_lot.review_ref(item)
+    if ref:
+        try:
+            origin = work.get(db, int(ref[len(review_lot.PREFIX):].strip().lstrip("#")))
+        except ValueError:
+            origin = None
+        if origin is not None:
+            return origin
+    return item
+
+
+def _chantier(chantier, fiche, reviewed, project: str) -> tuple[str, dict | None]:
+    """Le chantier d'une ligne de panier et la fiche qui le porte, s'il y en a
+    une : `--chantier`, sinon la fiche (`--package`), sinon la fiche ou le
+    numéro du lot relu, sinon le projet."""
+    label = " ".join(str(chantier or "").split())
+    if label:
+        return label, fiche
+    if fiche:
+        return str(fiche["id"]), fiche
+    if reviewed is not None:
+        package = (reviewed.get("package_id") or "").strip()
+        if package:
+            return package, {"id": package, "parent": reviewed.get("package_parent")}
+        return "#%d" % int(reviewed["id"]), None
+    return project, None
+
+
+def basket_key(project: str, chantier: str, day: str) -> str:
+    """La source d'un panier : un panier par projet, chantier et jour."""
+    return "%s%s:%s:%s" % (BASKET_PREFIX, project, " ".join(chantier.split()).casefold(), day)
+
+
+def _basket_day(rule: Rules, now: float | None) -> str:
+    from zoneinfo import ZoneInfo
+    stamp = time.time() if now is None else float(now)
+    return datetime.fromtimestamp(stamp, ZoneInfo(rule.timezone)).date().isoformat()
+
+
+def followup_refusal(reviewed: dict) -> str:
+    """Le refus d'un élément issu de la relecture d'une suite d'avis."""
+    return ("lot #%d is a review follow-up (%s): a defect found reviewing it creates "
+            "nothing — no lot, no basket line (canon §2 l.129, owner 19/10/2026). Fix it "
+            "on the branch if it fits in the review (canon §2), otherwise leave it" % (
+                int(reviewed["id"]), " ".join(str(reviewed.get("title") or "").split())[:80]))
 
 
 # --------------------------------------------------------------------------
@@ -300,14 +531,23 @@ def add(db: Db, *, title: str, expected_value: str, value_score: int,
         priority: int = DEFAULT_PRIORITY, source: str = "", team: str | None = None,
         required_capabilities=None, body: str = "", package: str | None = None,
         actor: str = "", app: str | None = None, creator: str | None = None,
-        cfg=None, new_project: bool = False) -> dict:
+        cfg=None, new_project: bool = False, chantier: str | None = None,
+        review_of=None, now: float | None = None) -> dict:
     """Ajoute un élément à la file. La valeur attendue est obligatoire : la
     file ne reçoit pas de travail pour occuper.
 
     `app` (L118c, #495): the item's project. Omitted, it is inherited from
     `creator` (default `actor`) as `work add` does; given, it must be a known
     project (`work_projects.known_projects`), unless `new_project` (#506)
-    introduces it, which the item's history records."""
+    introduces it, which the item's history records.
+
+    #2584 : quand le canon déclare le seuil de lot (`rules`), un élément issu
+    de la relecture d'une suite d'avis est refusé, et un élément sous le seuil
+    devient une ligne du panier de son chantier (`chantier`, sinon la fiche,
+    sinon le lot relu, sinon le projet) : le lot rendu est alors le panier,
+    avec `basket` vrai, `basket_lines` et `basket_opened`. `review_of` nomme
+    le lot relu ; au seuil, il est gardé en tête de la source (`review-of:#N`).
+    Un P2 sensible d'ameesh (`sensitive_p2`) garde la route historique."""
     title = (title or "").strip()
     if not title:
         raise BacklogError("title required")
@@ -340,15 +580,51 @@ def add(db: Db, *, title: str, expected_value: str, value_score: int,
     fiche = None
     if package:
         fiche = work._package(db, package)
-    return storage.of(db).work.backlog_add(
-        title=title, body=body or "", source=source or "", expected_value=expected_value,
-        value_score=value_score, priority=int(priority), team=(team or "").strip() or None,
-        required_capabilities=_capabilities(required_capabilities) or None,
+    source = " ".join(str(source or "").split())
+    team = (team or "").strip() or None
+    capabilities = _capabilities(required_capabilities) or None
+    rule = rules(cfg, project)
+    if rule is not None and sensitive_p2(title=title, source=source, app=project):
+        rule = None                     # canon §2 : le P2 sensible d'ameesh garde son lot
+    reviewed = _reviewed_lot(db, review_of, title=title, source=source)
+    if rule is not None and reviewed is not None and is_review_followup(reviewed):
+        raise BacklogError(followup_refusal(reviewed))
+    if reviewed is not None and review_of is not None \
+            and not source.startswith(REVIEW_OF_PREFIX):
+        # la relecture d'origine reste lisible : l'élément est une suite d'avis
+        source = ("%s%d %s" % (REVIEW_OF_PREFIX, int(reviewed["id"]), source)).strip()
+    if rule is None or value_score >= rule.lot_min_value:
+        return storage.of(db).work.backlog_add(
+            title=title, body=body or "", source=source, expected_value=expected_value,
+            value_score=value_score, priority=int(priority), team=team,
+            required_capabilities=capabilities,
+            package_id=fiche["id"] if fiche else None,
+            package_parent=fiche.get("parent") if fiche else None,
+            note="improvement backlog (value %d): %s%s" % (
+                value_score, expected_value, "; %s" % introduced if introduced else ""),
+            actor=actor, app=project)
+    label, fiche = _chantier(chantier, fiche, reviewed, project)
+    day = _basket_day(rule, now)
+    line = "- [value %d, P%d] %s — %s (source: %s; by %s)" % (
+        value_score, int(priority), " ".join(title.split()), expected_value,
+        source or "—", actor or creator or "?")
+    if (body or "").strip():
+        line += "\n" + "\n".join("  " + row for row in str(body).strip().splitlines())
+    item = storage.of(db).work.backlog_basket_add(
+        key=basket_key(project, label, day),
+        title="Panier « %s » du %s : défauts non bloquants (N, P2, P3)" % (label, day),
+        expected_value=("défauts non bloquants du chantier « %s », regroupés (canon §2 "
+                        "l.129) : chacun sous le seuil de lot (%d)"
+                        % (label, rule.lot_min_value)),
+        line=line, value_score=value_score, priority=int(priority), team=team,
+        required_capabilities=capabilities,
         package_id=fiche["id"] if fiche else None,
         package_parent=fiche.get("parent") if fiche else None,
-        note="improvement backlog (value %d): %s%s" % (
-            value_score, expected_value, "; %s" % introduced if introduced else ""),
+        note="%s (value %d < lot threshold %d, canon %s): %s%s" % (
+            BASKET_LINE_NOTE, value_score, rule.lot_min_value, rule.commit[:12],
+            " ".join(title.split())[:120], "; %s" % introduced if introduced else ""),
         actor=actor, app=project)
+    return dict(item, basket=True)
 
 
 def items(db: Db, *, open_only: bool = True, limit: int = 100) -> list:
@@ -477,7 +753,8 @@ def _default_budget_check(cfg, db):
     from . import cost as cost_mod
     limits = budget_mod.current(cfg, db)
     book = cost_mod.CostBook(state_dir=cfg.state_dir, db=db, **limits.book_kwargs())
-    return lambda agent: book.over(agent, pace=False)
+    return lambda agent: book.over(
+        agent, pace=False, account_checked=bool(cfg.accounts.get(book.tool_of(agent))))
 
 
 def lot_take_message(item: dict, orchestras: list) -> str:
@@ -576,6 +853,67 @@ def _lot_project(item: dict) -> str:
     d'abord, son équipe ensuite — même clé que `lot_workdir.project` (#811 N2 :
     `lot_fits` filtrait sur `lot_team`, le dossier se résout sur `app`)."""
     return (item.get("app") or item.get("lot_team") or item.get("team") or "").strip()
+
+
+def roadmap_waiting(db: Db, project: str, *, now: float | None = None) -> list:
+    """#2584 : les lots de roadmap de `project` prenables maintenant — du
+    travail plus utile qu'un élément sous le seuil de lot. Un lot non assigné
+    hors file d'amélioration (`unassigned_lots`, dépendances fusionnées),
+    prenable (`lot_takeable` : ni décision, ni production, équipe connue, début
+    prévu échu), sans attente planifiée (`waiting_project_lots`), qui n'est ni
+    une relecture après fusion ni une suite d'avis."""
+    from . import review_lot, sous_utilisation
+    project = str(project or "").strip()
+    if not project:
+        return []
+    stamp = time.time() if now is None else float(now)
+    today = time.strftime("%Y-%m-%d", time.localtime(stamp))
+    out = [item for item in storage.of(db).work.unassigned_lots(200)
+           if _lot_project(item) == project and lot_takeable(item, today)
+           and not review_lot.review_ref(item) and not is_review_followup(item)]
+    if not out:
+        return []
+    return sous_utilisation.waiting_project_lots(out, db=db, now=stamp)
+
+
+def roadmap_first(db: Db, item: dict, *, cfg=None, now: float | None = None) -> list:
+    """#2584 : les lots de roadmap qui passent avant cet élément du backlog, ou
+    `[]`. Seul un élément sous le seuil de lot du canon (`rules`) attend : un
+    panier, un élément ancien de faible valeur. Sans seuil au canon, rien
+    n'attend (aucun seuil supposé)."""
+    item = item or {}
+    if item.get("type") != ITEM_TYPE:
+        return []
+    project = str(item.get("app") or item.get("team") or "").strip()
+    rule = rules(cfg, project)
+    if rule is None or sensitive_p2(title=item.get("title") or "",
+                                    source=item.get("source") or "", app=project):
+        return []
+    try:
+        score = int(item.get("value_score") or 0)
+    except (TypeError, ValueError):
+        score = 0
+    if score >= rule.lot_min_value:
+        return []
+    return roadmap_waiting(db, project, now=now)
+
+
+def assign_refusal(db: Db, item: dict, *, cfg=None, now: float | None = None) -> str:
+    """#2584 : pourquoi cet élément du backlog ne se confie pas à un agent
+    maintenant, ou "" (`work assign`, comme la prise au repos)."""
+    waiting = roadmap_first(db, item, cfg=cfg, now=now)
+    if not waiting:
+        return ""
+    project = str(item.get("app") or item.get("team") or "").strip()
+    rule = rules(cfg, project)
+    return ("lot #%d is a backlog %s of value %s, under the canon's lot threshold (%d): it "
+            "is not given to an agent while a roadmap lot of %s can be taken (%s%s). Canon "
+            "§2 l.129: a free agent takes it only for lack of more useful work — assign "
+            "the roadmap lot first" % (
+                int(item["id"]), "basket" if is_basket(item) else "item",
+                item.get("value_score"), rule.lot_min_value if rule else 0, project,
+                ", ".join("#%d" % int(lot["id"]) for lot in waiting[:5]),
+                ", …" if len(waiting) > 5 else ""))
 
 
 def lot_fits(item: dict, agent: dict, *, auditor: bool = False, card=None,
@@ -692,7 +1030,8 @@ def _team_orchestrators(cfg, db, listing: list, team: str, orchestras=None) -> l
     return sorted([name for name in known if team in teams[name]] or known)
 
 
-def _assign_ready(st, item: dict, assignee: str, note: str, take) -> dict | None:
+def _assign_ready(st, item: dict, assignee: str, note: str, take,
+                  cap: int) -> dict | None:
     """La prise conditionnelle d'un élément prêt (`assign_capped`,
     `ready_only`), ou None s'il a été pris, bloqué, ou si l'agent a atteint
     le plafond §4 entre-temps.
@@ -702,11 +1041,10 @@ def _assign_ready(st, item: dict, assignee: str, note: str, take) -> dict | None
     Le serveur annule alors la prise entière (rien d'écrit) : c'est une prise
     perdue entre-temps, comme une course perdue, et non une panne du passage.
     L'élément reste libre et le prochain passage le revérifie en entier ;
-    toute autre erreur remonte."""
-    from . import work
+    toute autre erreur remonte. `cap` : le plafond du canon (`work.build_limit`)."""
     try:
         return st.work.assign_capped(int(item["id"]), assignee, current=None, note=note,
-                                     actor=SENDER, max_build=work.BUILD_LIMIT,
+                                     actor=SENDER, max_build=cap,
                                      take=take, ready_only=True)
     except DbError as exc:
         if not is_deadlock(exc):
@@ -728,7 +1066,11 @@ def _propose_reviews(db, st, listing, *, pool, room, dry_run=False, canons=(),
     famille, il n'en dispense pas —, `may_take` de l'auditeur, plafond de
     budget, agent réveillable (#1021), jamais un orchestrateur. L'auteur du
     lot est écarté (B3) et sa famille se lit au tour du gel
-    (`review_lot._author_at_freeze`, #1053/#1777).
+    (`review_lot._author_at_freeze`, #1053/#1777). Une relecture écarte en
+    outre **toutes** les familles d'auteur de la plage gelée (#2864), lues sur
+    la marque de désignation du dernier gel (`frozen_authors`) : la même
+    lecture que la désignation et la porte. Sans cette lecture (pas de marque,
+    famille d'auteur inconnue), aucune proposition n'est faite (échec fermé).
 
     Rend les propositions dans la forme des prises (`item`, `agent`,
     `message_id`, `kind` valant `review` ou `correction`, `notified`). Le lot
@@ -737,7 +1079,8 @@ def _propose_reviews(db, st, listing, *, pool, room, dry_run=False, canons=(),
     la fenêtre et la note sont pris sous un verrou consultatif par lot
     (#1738 N5), et une relecture désigne son relecteur (#705, #1738 N7) — la
     double relecture est écartée et `stale_lot` sait à qui s'adresser."""
-    from . import mail, registry, review_lot
+    from . import mail, registry, review_designation as rd, review_lot
+    from . import review_designation_activation as activation
     if room <= 0 or not pool:
         return []
     # N6 : lire plus large que la pièce demandée — l'appariement (famille,
@@ -751,6 +1094,9 @@ def _propose_reviews(db, st, listing, *, pool, room, dry_run=False, canons=(),
     # relectures d'abord, corrections ensuite (l'ordre du SQL est conservé)
     rows = sorted(rows, key=lambda r: 1 if (r.get("last_verdict") or "") == "blocked" else 0)
     by_name = {row.get("name"): row for row in listing}
+    # #2864 : la lecture des auteurs ne dépend que du lot — une fois par lot,
+    # pas une fois par couple (agent, lot). None (lecture absente) est mémorisé.
+    frozen_reading: dict = {}
     out: list = []
     used: set = set()
     for row in pool:
@@ -801,14 +1147,45 @@ def _propose_reviews(db, st, listing, *, pool, room, dry_run=False, canons=(),
                 # pas la production) ; famille d'auteur inconnue, toute famille
                 # connue fait l'affaire
                 author_info = review_lot._author_at_freeze(db, lot, item)
-                want = review_lot.reviewer_family(author_info.get("harness"))
-                if want == review_lot.UNKNOWN_FAMILY:
-                    ok = mine in ("codex", "claude")
-                else:
-                    ok = mine == want
-                if not ok:
+                # #2664 : les familles viennent du canon compilé, au dernier
+                # commit audité ; illisible -> aucune proposition (fail closed).
+                try:
+                    families = review_lot.compiled_families(db)
+                except review_lot.FamiliesError:
                     continue
-                family = want
+                # #2864 : écarter **toutes** les familles d'auteur de la plage
+                # gelée, avec la lecture de la désignation au gel (sa marque),
+                # pas seulement celle de l'assigné au gel. Provenance inconnue
+                # (pas de marque lisible, auteur sans famille) : aucune
+                # proposition, l'indépendance ne se suppose pas (échec fermé).
+                if lot not in frozen_reading:
+                    frozen_reading[lot] = activation.frozen_authors(db, item)
+                authors = frozen_reading[lot]
+                if authors is None:
+                    continue
+                author_names, forbidden_families = rd.families_of(authors)
+                if rd.unknown_families(authors) or name in author_names:
+                    continue
+                eligible = [family for family in families
+                            if family not in forbidden_families]
+                mine_family = review_lot.family_of(mine, families)
+                if not mine_family or not eligible:
+                    continue
+                # la famille opposée à l'auteur de référence reste préférée ;
+                # si elle est elle-même auteur de la plage, une autre famille
+                # indépendante convient (même règle que la désignation).
+                reference = next((row.get("family") for row in authors
+                                  if row.get("name") == author_info.get("name")), "")
+                want = review_lot.reviewer_family(
+                    reference or author_info.get("harness"), families)
+                if want != review_lot.UNKNOWN_FAMILY and want in eligible:
+                    if mine_family != want:
+                        continue
+                    family = want
+                else:
+                    if mine_family not in eligible:
+                        continue
+                    family = mine_family
             kind = "correction" if correction else "review"
             payload = {"review_proposal": {"lot": lot, "agent": name, "kind": kind}}
             message_id = None
@@ -850,7 +1227,7 @@ def _still_free(st, item_id) -> bool:
             and item.get("state") in ("intake", "build"))
 
 
-def _cap_reached(st, agent: str) -> bool:
+def _cap_reached(st, agent: str, cap: int) -> bool:
     """§4 : l'agent est-il au plafond d'en-cours ?
 
     Distingue, après un refus `None` de `assign_capped` sur un lot encore
@@ -859,9 +1236,7 @@ def _cap_reached(st, agent: str) -> bool:
     Relecture hors du verrou de la prise : un agent redescendu entre-temps fait
     seulement retenter la prise, un agent remonté au plafond est refusé de
     nouveau par `assign_capped`."""
-    from . import work
-
-    return st.work.count_builds(agent) >= work.BUILD_LIMIT
+    return st.work.count_builds(agent) >= cap
 
 
 def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE_IDLE_S,
@@ -899,6 +1274,15 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
 
     now = time.time() if now is None else float(now)
     st = storage.of(db)
+    caps: list = []
+
+    def cap() -> int:
+        """§4 : le plafond du canon compilé, lu à la première prise tentée ;
+        sans document lisible, `mechanics.MechanicsError` arrête le passage
+        (l'appelant l'isole) au lieu de supposer un plafond (#2451)."""
+        if not caps:
+            caps.append(work.build_limit(cfg))
+        return caps[0]
 
     # #804 : la place restante est relue avant **chaque** prise, pas une fois
     # par passe. Les compteurs sont en base et partagés par tous les
@@ -1030,10 +1414,10 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
                 break
             if not within_budget(row):
                 continue
-            # §4 canon : au plus 2 lots en build par agent — la prise
-            # automatique refuse le troisième (le témoin concurrent est dans
+            # §4 canon : plafond de lots en build par agent — la prise
+            # automatique refuse au-delà (le témoin concurrent est dans
             # le stockage : `assign_capped` recompte sous le verrou de l'agent)
-            if st.work.count_builds(row["name"]) >= work.BUILD_LIMIT:
+            if st.work.count_builds(row["name"]) >= cap():
                 continue
             agent = registry.get(db, row["name"])
             if agent is None:
@@ -1075,7 +1459,7 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
                     # #1242 (L165) : la prise ne vise qu'un lot intake dont
                     # toutes les dépendances sont satisfaites.
                     done = _assign_ready(st, item, check["assignee"], note,
-                                         work.takes_rule(check))
+                                         work.takes_rule(check), cap())
                 except storage.PendingLot:
                     break                   # le lot reste à l'agent suivant
                 if done is None:
@@ -1086,7 +1470,7 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
                     if not _still_free(st, item["id"]):
                         lots.remove(item)
                         continue        # pris entre-temps : lot suivant
-                    if _cap_reached(st, check["assignee"]):
+                    if _cap_reached(st, check["assignee"], cap()):
                         break           # agent au plafond : au suivant
                     continue            # refus sous verrou : lot suivant
                 lots.remove(item)
@@ -1140,7 +1524,7 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
         if not within_budget(row):
             continue
         # §4 : le plafond de lots en build vaut aussi pour la file
-        if st.work.count_builds(row["name"]) >= work.BUILD_LIMIT:
+        if st.work.count_builds(row["name"]) >= cap():
             continue
         agent = registry.get(db, row["name"])
         if agent is None:
@@ -1174,7 +1558,7 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
                 item.get("expected_value") or "")
             try:
                 done = _assign_ready(st, item, check["assignee"], note,
-                                     work.takes_rule(check))
+                                     work.takes_rule(check), cap())
             except storage.PendingLot:
                 break                       # #540 : l'élément reste au suivant
             if done is None:
@@ -1183,7 +1567,7 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
                 if not _still_free(st, item["id"]):
                     queue.remove(item)
                     continue                # pris entre-temps : élément suivant
-                if _cap_reached(st, check["assignee"]):
+                if _cap_reached(st, check["assignee"], cap()):
                     break                   # agent au plafond : au suivant
                 continue                    # refus sous verrou : élément suivant
             queue.remove(item)
@@ -1219,6 +1603,13 @@ def add_parsers(work_sub, func) -> None:
                        help="required capability (repeatable, or comma-separated list)")
     p_add.add_argument("--body", default="")
     p_add.add_argument("--package", default=None, help="WorkPackage sheet (L29)")
+    p_add.add_argument("--chantier", default=None,
+                       help="#2584: the workstream whose basket receives an item under the "
+                            "canon's lot threshold (default: the sheet, else the reviewed "
+                            "lot, else the project)")
+    p_add.add_argument("--review-of", default=None, dest="review_of", metavar="LOT",
+                       help="#2584: the lot whose review found this defect; a defect found "
+                            "reviewing a review follow-up is refused (canon §2)")
     p_add.add_argument("--actor", default="")
     p_add.add_argument("--app", default=None,
                        help="its project (L118c); default: the creator's project")
@@ -1266,12 +1657,19 @@ def run(db: Db, args, cfg=None) -> int:
                        app=getattr(args, "app", None),
                        creator=binding.name if binding is not None and binding.ok
                        else args.actor, cfg=cfg,
-                       new_project=getattr(args, "new_project", False))
+                       new_project=getattr(args, "new_project", False),
+                       chantier=getattr(args, "chantier", None),
+                       review_of=getattr(args, "review_of", None))
         except BacklogError as exc:
             print("error: %s" % exc, file=sys.stderr)
             return 2
         if args.json:
             print(json.dumps(item, ensure_ascii=False, default=str))
+        elif item.get("basket"):
+            print("line added to basket #%d (%s, %d line(s), value %d): %s — under the "
+                  "canon's lot threshold, no lot is created (canon §2)" % (
+                      item["id"], "opened" if item.get("basket_opened") else "open",
+                      item.get("basket_lines") or 0, item["value_score"], item["title"]))
         else:
             print("item #%d added to the backlog (value %d, priority %d): %s" % (
                 item["id"], item["value_score"], item["priority"], item["title"]))

@@ -7,13 +7,16 @@ There is no fallback to a current registry, last verdict or journal note.
 """
 from __future__ import annotations
 
+import time
+
 from . import land, merge_queue, radar, train_diagnosis
-from .train import TrainError, digest, identity, ordered
+from .train import SCHEMA, TrainError, digest, identity, ordered
 
 
 class Runtime:
     def __init__(self, *, ledger, repository, ci, fires, admissions, target,
-                 policy, notify, inventory=None, enrollment=None, migrations=None):
+                 policy, notify, inventory=None, enrollment=None, migrations=None,
+                 prevalidation=None):
         target = merge_queue._remote_branch(target)
         if ledger.key != land.lock_key(repository.project, target) or fires.ledger is not ledger:
             raise TrainError("runtime adapters must share the exact target reservation")
@@ -32,6 +35,11 @@ class Runtime:
         self.target_branch, self.policy, self.notify = target, policy, notify
         self.inventory, self.enrollment = inventory, enrollment
         self.migrations = migrations
+        #: #2644 : la prévalidation de la composition, appelée avant toute
+        #: publication ; None = pas d'accroche (banc, mode sans train).
+        if prevalidation is not None and not callable(prevalidation):
+            raise TrainError("explicit train prevalidation port required")
+        self.prevalidation = prevalidation
         self.enrollment_result = None
 
     def enroll(self, epoch):
@@ -43,8 +51,53 @@ class Runtime:
         self.enrollment_result = self.enrollment.enroll_many(candidates, self.target(),
             actor=self.ledger.owner, lease=(self.ledger.key, self.ledger.owner, epoch))
         self._held(epoch)
-        if self.enrollment_result["deferred"]:
-            self.notify("candidate enrollment deferred", self.enrollment_result)
+        deferred = self.enrollment_result["deferred"]
+        # #3139: a refusal is a fact about a lot, not a generic notice. Persist
+        # it in the train document and journal it lot by lot, or the pilot sees
+        # only "candidate enrollment deferred" and cannot tell why a ready lot
+        # never entered the packet.
+        self._record_enrollment(deferred, epoch)
+        for row in deferred:
+            self.notify(
+                "candidate enrollment deferred: lot #%s (gel %s) — %s"
+                % (row.get("work_item_id"), (row.get("frozen_sha") or "?")[:12],
+                   row.get("reason") or "no reason"), row)
+
+    def _record_enrollment(self, deferred, epoch):
+        """Persist this pass's refusals in the exact target train document.
+
+        A train with no document yet still needs the record: an empty
+        enrollment is precisely why a cutoff had nothing to compose. The
+        container is a terminal ("empty") state, so the next pass reads it,
+        enrolls again and replaces the record; a composed packet keeps the
+        current record with its plan. An empty list clears stale refusals.
+        """
+        state = self.load()
+        if state is None and not deferred:
+            return
+        checked = time.time()
+        rows = [dict(lot=row.get("work_item_id"),
+                     branch=row.get("branch") or "",
+                     frozen_sha=row.get("frozen_sha") or "",
+                     frozen_id=row.get("frozen_id"),
+                     candidate_sha=row.get("candidate_sha") or "",
+                     candidate_origin=row.get("candidate_origin") or "",
+                     reason=row.get("reason") or "",
+                     checked_ts=checked) for row in deferred]
+        expected = 0
+        if state is None:
+            state = dict(schema=SCHEMA, source=self.repository.source,
+                         target=self.target_branch, phase="empty")
+        else:
+            expected = int(state.get("revision", 0))
+        state = dict(state, enrollment_deferred=rows,
+                     enrollment_checked_ts=checked)
+        try:
+            self.save(state, expected, epoch)
+        except TrainError as exc:
+            # The refusal itself is still true and already qualified; losing
+            # the record must not hide it from the journal.
+            self.notify("candidate enrollment record not persisted: %s" % exc, state)
 
     def acquire(self, epoch):
         return self.ledger.acquire(epoch)
@@ -73,6 +126,17 @@ class Runtime:
     def dependencies(self, rows):
         return self.admissions.dependencies(rows)
 
+    def admitted(self, rows, slot):
+        """#2965: rows admissible at the cutoff, dated by their admission.
+
+        The proofs of this pass's enrollment are the fast path; a packet row
+        replayed from storage reads the same gate instant. A manual admission
+        is never re-dated by its freeze/verdicts and stays late when queued
+        after the cutoff.
+        """
+        return self.admissions.admitted(rows, slot, self.target(),
+                                        proofs=self.enrollment_result)
+
     def qualify(self, rows, base, mode):
         if mode != self.policy.ci_mode:
             raise TrainError("runtime and engine CI policy differ")
@@ -84,8 +148,11 @@ class Runtime:
             raise TrainError("missing structured historical admission evidence")
         return proof
 
-    def compose(self, base, rows, nonce):
-        return self.repository.compose(self.target_branch, base, rows, nonce)
+    def sync(self, base):
+        return self.repository.main_sync(self.target_branch, base)
+
+    def compose(self, base, rows, nonce, sync=None):
+        return self.repository.compose(self.target_branch, base, rows, nonce, sync=sync)
 
     def validate_transports(self, plan):
         self._belongs(plan)
@@ -124,6 +191,12 @@ class Runtime:
             self.validate_transports(plan)
 
     def publish(self, plan, epoch):
+        # #2644 : la prévalidation passe avant la publication, donc avant de
+        # tenir le bail et de renouveler la réservation : un run long ne fait
+        # pas expirer l'époque. Un rouge lève avant tout effet distant ; une
+        # indisponibilité est signalée par le port et la CI reste la preuve.
+        if self.prevalidation is not None:
+            self.prevalidation(plan["head"], plan["base"])
         self._current(plan)
         self._held(epoch)
         if hasattr(self.ledger, "before_publish"):

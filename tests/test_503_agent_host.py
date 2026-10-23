@@ -667,10 +667,11 @@ class AgentHostTest(unittest.TestCase):
     def test_failed_lift_is_not_announced_before_the_exit_retry(self):
         """#2198/N3 : « NON levé » n'apparaît qu'après la dernière tentative
         du trap EXIT ; une levée qui réussit à la seconde passe ne l'affiche
-        pas et ne laisse pas de pause."""
+        pas et ne laisse pas de pause. #2498 : les passes du trap précèdent le
+        verdict, une levée réussie rend donc 0."""
         self.env['DRAIN_ATTENTE'] = '1'
         p = self.run_vm(scenario='resume-error-deux-fois')
-        self.assertNotEqual(p.returncode, 0)
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
         self.assertNotIn('drain NON levé', p.stderr)
         self.assertNotIn('NON levé', p.stderr)
         self.assertNotIn('pause à lever à la main', p.stderr)

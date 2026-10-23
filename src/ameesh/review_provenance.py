@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """#1465 — le fournisseur exact d'origine d'un commit et d'un jalon.
 
-Contrat importable pour le qualificateur du train (#1467,
-`train_review.qualify`). Pour chaque sujet, il rend un reçu aux champs de
+Contrat importable pour le lecteur du train (#1467/#2681,
+`review_authors` et `merge_queue.review_gate`). Pour chaque sujet, il rend un reçu aux champs de
 `train_review.Receipt` — `subject`, `commit`, `actor`, `session`, `turn`,
 `harness`, `record`, `milestone` — ou `None` quand la source manque.
 
@@ -46,8 +46,6 @@ import subprocess
 
 from . import storage
 
-#: les familles de harnais que le qualificateur de train sait opposer
-FAMILIES = frozenset({"claude", "codex", "deepseek"})
 #: un identifiant de commit complet : SHA-1 (40) ou SHA-256 (64)
 FULL_SHA = re.compile(r"[0-9a-f]{40}(?:[0-9a-f]{24})?")
 #: une abréviation Git citée par un jalon (au moins 7 caractères)
@@ -143,12 +141,16 @@ def receipt_for_milestone(db, milestone_id) -> dict | None:
     })
 
 
-def capture(environ=None, *, actor: str = "") -> dict:
-    """L'identité d'écriture d'un fait, lue dans le tour managé courant.
+def _identity(environ=None, *, actor: str = "") -> dict:
+    """L'identité brute d'écriture d'un fait, sans contrôle de famille.
 
-    Refuse hors tour (`AMEESH_TURN_ID` absent) ou sur un harnais inconnu : une
-    preuve sans tour ou sans famille n'est pas une preuve. Le harnais du tour
-    est celui du runner (`AMEESH_HARNESS`), jamais un nom choisi par le dépôt.
+    Refuse hors tour (`AMEESH_TURN_ID` absent) ou sans identité : une preuve
+    sans tour ou sans acteur n'est pas une preuve. Le harnais du tour est
+    celui du runner (`AMEESH_HARNESS`), jamais un nom choisi par le dépôt.
+
+    Les hooks `pre-commit`/`post-commit` n'ont pas de base : ils attestent
+    cette identité sans lire le canon (#2664) ; c'est l'écriture de la preuve
+    (`capture`, avec les familles du canon) qui refuse un harnais inconnu.
 
     `actor` n'est qu'une **attente** : quand il est fourni, il doit être celui
     du tour (`AGENT_MAIL_NAME`, posé par le runner) — un tour ne signe pas la
@@ -165,10 +167,36 @@ def capture(environ=None, *, actor: str = "") -> dict:
     if turn_actor and who != turn_actor:
         raise ProvenanceError(
             "actor %r is not the agent of this turn (%r)" % (who, turn_actor))
-    if harness not in FAMILIES:
-        raise ProvenanceError("unknown harness %r (expected %s)"
-                              % (harness, ", ".join(sorted(FAMILIES))))
     return {"actor": who, "turn": turn, "harness": harness}
+
+
+def compiled_families(db) -> tuple:
+    """Les familles du canon compilé, ou une `ProvenanceError` nommée (#2664).
+
+    Le harnais d'un reçu se contrôle contre le canon, au dernier commit audité
+    de l'hôte (`review_lot.compiled_families`) ; aucun repli local, et un
+    canon illisible refuse l'écriture de la preuve avec son diagnostic."""
+    from . import review_lot
+    try:
+        return review_lot.compiled_families(db)
+    except review_lot.FamiliesError as exc:
+        raise ProvenanceError("model families unreadable: %s" % exc) from exc
+
+
+def capture(environ=None, *, actor: str = "", families) -> dict:
+    """L'identité d'écriture d'un fait, contrôlée contre les familles du canon.
+
+    Refuse hors tour (`AMEESH_TURN_ID` absent) ou sur un harnais que le canon
+    ne déclare pas : une preuve sans tour ou sans famille n'est pas une preuve.
+    `families` vient de `compiled_families` (#2664) ; une liste vide refuse
+    (aucune famille n'est supposée)."""
+    ident = _identity(environ, actor=actor)
+    if not families:
+        raise ProvenanceError("no model families: the canon cannot be read")
+    if ident["harness"] not in families:
+        raise ProvenanceError("unknown harness %r (expected %s)"
+                              % (ident["harness"], ", ".join(sorted(families))))
+    return ident
 
 
 def live_session(db, actor: str, *, harness: str = "") -> str:
@@ -276,7 +304,7 @@ def prepare_commit_intent(cwd: str | None = None, *, environ=None,
     env = os.environ if environ is None else environ
     path = intent_path(cwd)
     try:
-        ident = capture(env, actor=actor)
+        ident = _identity(env, actor=actor)
     except ProvenanceError:
         ident = None
     tree = _git(cwd, "write-tree") if ident is not None else None
@@ -437,7 +465,7 @@ def prepare_commit_creation(cwd: str | None = None, *, environ=None,
     if path is None:
         return None
     try:
-        ident = capture(env, actor=actor)
+        ident = _identity(env, actor=actor)
     except ProvenanceError:
         return None
     intent = read_commit_intent(cwd)
@@ -489,7 +517,7 @@ def proof_for_current_turn(db, *, actor: str = "", sha: str = "",
     preuve, jamais avec une preuve que `receipt_for_milestone` devrait ensuite
     refuser à jamais (N1 de la relecture Claude de #1465)."""
     try:
-        ident = capture(actor=actor)
+        ident = capture(actor=actor, families=compiled_families(db))
         ident["session"] = live_session(db, ident["actor"], harness=ident["harness"])
     except ProvenanceError:
         return None
@@ -778,7 +806,7 @@ def main(argv: list[str] | None = None) -> int:
     db = _connect()
     try:
         if args.command == "record":
-            identity = capture()
+            identity = capture(families=compiled_families(db))
             identity["session"] = live_session(db, identity["actor"],
                                                harness=identity["harness"])
             row = record_commit(db, args.commit, identity=identity,

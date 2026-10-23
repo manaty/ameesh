@@ -411,8 +411,12 @@ class RoadmapPgTest(PgTestCase):
         done = self._lot("Lot livré", package="comptes")
         for state in ("build", "qa"):
             work.move(self.db, done["id"], state)
-        work.milestone(self.db, done["id"], roadmap_dev.jalon("soumise"), actor="auteur")
-        work.milestone(self.db, done["id"], "verdict", verdict="ok", actor="relecteur")
+        # #2786 : un gel nomme une tête immuable ; ce témoin ne lit pas de
+        # dépôt, un commit complet suffit (le jalon n'a pas d'autre usage).
+        work.milestone(self.db, done["id"], roadmap_dev.jalon("soumise"),
+                       sha="a" * 40, actor="auteur")
+        work.milestone(self.db, done["id"], "verdict", verdict="ok",
+                       sha="a" * 40, actor="relecteur")
         work.close_merged(self.db, done["id"], actor="porte")
         late = self._lot("Lot en retard", package="comptes")
         work.move(self.db, late["id"], "build")

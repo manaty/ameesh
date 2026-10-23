@@ -73,6 +73,16 @@ echo "bascule: pip est interdit dans le venv vivant ; préparez un venv versionn
 exit 1
 """
 
+#: macOS refuse un shebang dont l'interpréteur est lui-même un script
+#: (`Exec format error`), là où Linux enchaîne les shebangs. Un script hérité
+#: dont l'interpréteur devient un lanceur passe donc par `/usr/bin/env`
+#: (binaire) : env exécute le lanceur, sans shebang imbriqué et sans toucher
+#: au corps Python (docstring, `from __future__`, codage). Le noyau ne lit
+#: qu'une ligne de shebang bornée, saut de ligne compris : 255 octets sur
+#: Linux (BINPRM_BUF_SIZE) et 511 sur macOS (xnu). La ligne produite ici ne
+#: doit donc pas dépasser 254 / 510 octets.
+_LIMITE_SHEBANG = 510 if sys.platform == "darwin" else 254
+
 
 def _die(message, code=1):
     print("bascule: %s" % message, file=sys.stderr)
@@ -107,6 +117,21 @@ def _write(path, data, mode=0o755):
     tmp = "%s.tmp.%d" % (path, os.getpid())
     try:
         with open(tmp, "w") as handle:
+            handle.write(data)
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    finally:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass  # déjà renommé, ou nettoyage impossible : garder l'erreur initiale
+
+
+def _write_bytes(path, data, mode=0o755):
+    """Comme `_write`, pour un contenu binaire (script hérité) : temp + rename."""
+    tmp = "%s.tmp.%d" % (path, os.getpid())
+    try:
+        with open(tmp, "wb") as handle:
             handle.write(data)
         os.chmod(tmp, mode)
         os.replace(tmp, path)
@@ -164,6 +189,36 @@ def _pip_install(directory, src):
     pip = os.path.join(directory, "bin", "pip")
     _run([pip, "install", "-q", "--force-reinstall", "--no-deps", src])
     _run([pip, "install", "-q", src])
+
+
+def _sceller(directory):
+    """#2763 : un venv versionné préparé ne s'installe plus.
+
+    Son `pip` refuse (comme celui du venv stable), et `lib/` et `bin/` passent
+    en lecture seule : `uv pip install --python <venv-sha7>/bin/python` (ou un
+    `VIRTUAL_ENV` hérité) ne peut ni créer, ni retirer, ni remplacer un
+    fichier du venv vivant (incident du 19/10/2026 à 20:03, installation
+    éditable d'un worktree d'agent). `_supprimer` rend l'écriture avant de
+    retirer un venv."""
+    bin_dir = os.path.join(directory, "bin")
+    for nom in os.listdir(bin_dir):
+        if re.fullmatch(r"pip[0-9.]*", nom):
+            _write(os.path.join(bin_dir, nom), _PIP_REFUS)
+    for racine in (os.path.join(directory, "lib"), bin_dir):
+        for dossier, _sous, fichiers in os.walk(racine, topdown=False):
+            for nom in fichiers:
+                chemin = os.path.join(dossier, nom)
+                if not os.path.islink(chemin):
+                    os.chmod(chemin, os.lstat(chemin).st_mode & ~0o222)
+            os.chmod(dossier, os.stat(dossier).st_mode & ~0o222)
+
+
+def _supprimer(directory):
+    """Retire un venv versionné, scellé ou non (`_sceller`)."""
+    for dossier, _sous, _fichiers in os.walk(directory):
+        if not os.path.islink(dossier):
+            os.chmod(dossier, os.stat(dossier).st_mode | 0o700)
+    shutil.rmtree(directory)
 
 
 def _verifier_shebang(ameesh, python):
@@ -237,14 +292,18 @@ def preparer(args):
         if etat.get("versions", {}).get(version) == "complete":
             print("bascule: venv-%s déjà préparé" % version)
             return 0
-        shutil.rmtree(cible)
+        _supprimer(cible)
     print("bascule: préparation de venv-%s depuis %s" % (version, src))
     try:
         _creer_venv(cible, args.python)
         _pip_install(cible, src)
         _controles(cible)
+        _sceller(cible)
     except (OSError, subprocess.CalledProcessError, RuntimeError) as exc:
-        shutil.rmtree(cible, ignore_errors=True)   # rien de partiel ne reste
+        try:
+            _supprimer(cible)   # rien de partiel ne reste
+        except OSError:
+            pass
         print("bascule: préparation de venv-%s ÉCHOUÉE, version active intacte : %s"
               % (version, exc), file=sys.stderr)
         return 1
@@ -258,12 +317,82 @@ def preparer(args):
 # lanceurs stables : le processus voit un chemin concret, pas le lien
 # --------------------------------------------------------------------------
 
+def _shebang_env(data, interpreteur):
+    """Pointe un script hérité sur son interpréteur via `/usr/bin/env`.
+
+    Le noyau démarre `env` (binaire), qui exécute le lanceur stable : plus de
+    shebang imbriqué, et le corps Python reste intact (docstring,
+    `from __future__`, ligne de codage, instructions sur une même ligne).
+    Rend None si la ligne dépasserait la limite du noyau : le script n'est
+    alors pas réécrit.
+    """
+    ligne = b"#!/usr/bin/env " + interpreteur
+    if len(ligne) > _LIMITE_SHEBANG:
+        return None
+    fin = data.find(b"\n")
+    if fin < 0:
+        return ligne + b"\n"
+    return ligne + data[fin:]
+
+
+def _convertir_scripts_herites(venv):
+    """Rend portables les scripts dont l'interpréteur devient un lanceur.
+
+    Un script de `bin/` resté d'une version quittée garde un shebang vers
+    `<venv>/bin/python*`. Après l'activation, cet interpréteur est un lanceur
+    `/bin/sh` : le noyau macOS refuse de chaîner deux scripts (`Exec format
+    error`), là où Linux le fait. Le shebang `/usr/bin/env` fait démarrer
+    `env` (binaire) qui exécute le lanceur ; le corps du script reste intact
+    et suit la version vivante.
+    """
+    bin_dir = os.path.join(venv, "bin")
+    try:
+        noms = sorted(os.listdir(bin_dir))
+    except OSError:
+        return
+    motif = re.compile(re.escape(os.fsencode(os.path.join(bin_dir, "python")))
+                       + rb"[0-9]*(?:\.[0-9]+)*")
+    for nom in noms:
+        if _LANCEURS_RESERVES.fullmatch(nom):
+            continue
+        chemin = os.path.join(bin_dir, nom)
+        if os.path.islink(chemin) or not os.path.isfile(chemin):
+            continue
+        try:
+            with open(chemin, "rb") as handle:
+                data = handle.read()
+        except OSError:
+            continue
+        if not data.startswith(b"#!"):
+            continue
+        fin = data.find(b"\n")
+        if fin < 0:
+            continue
+        interpreteur = data[2:fin].rstrip()
+        if not motif.fullmatch(interpreteur):
+            continue
+        converti = _shebang_env(data, interpreteur)
+        if converti is None:
+            # au-delà de la limite du noyau, aucun shebang ne tient : ne pas
+            # réécrire au hasard, mais le dire.
+            print("bascule: %s : shebang trop long, script laissé inchangé" % chemin,
+                  file=sys.stderr)
+            continue
+        mode = os.stat(chemin).st_mode & 0o777
+        _write_bytes(chemin, converti, mode)
+
+
 def _installer_lanceurs(venv, version):
     bin_dir = os.path.join(venv, "bin")
     try:
         os.makedirs(bin_dir, exist_ok=True)
     except OSError as exc:
         raise OSError("bin/ inscriptible requis dans %s : %s" % (venv, exc))
+    # Les scripts hérités d'une version quittée pointent sur le python stable,
+    # qui devient un lanceur : on les rend exécutables sous macOS AVANT de
+    # remplacer les interpréteurs (une interruption laisse des scripts qui
+    # marchent encore).
+    _convertir_scripts_herites(venv)
     # Les scripts console installés par pip pointent souvent sur python3,
     # qui peut viser directement le binaire de base et contourner python.
     interpreteurs = {"python"} | {nom for nom in os.listdir(bin_dir)
@@ -279,8 +408,9 @@ def _installer_lanceurs(venv, version):
     # ameesh-approve, futur outil…) n'existaient dans le venv stable que s'ils
     # étaient là à l'adoption. On leur rend un lanceur qui suit `venv-courant`,
     # comme python et ameesh. Un script présent dans le stable mais absent de
-    # la version visée n'est PAS touché : il garde son shebang vers le python
-    # stable, qui résout la version vivante (témoin #1969 des alias).
+    # la version visée n'est pas remplacé : il garde son shebang
+    # /usr/bin/env vers le python stable, qui résout la version vivante
+    # (témoin #1969 des alias).
     cible_bin = os.path.join(_version_dir(venv, version), "bin")
     scripts = _scripts_console(cible_bin)
     for nom in scripts:

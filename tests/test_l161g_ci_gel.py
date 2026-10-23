@@ -58,7 +58,7 @@ from urllib.parse import unquote
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
-from ameesh import ci, mesh_cli, plan_github, work  # noqa: E402
+from ameesh import ci, mesh_cli, plan_github, prevalidation, work  # noqa: E402
 
 DEPOT = "manaty/ameesh"
 GEL = "a" * 40
@@ -210,7 +210,7 @@ class Github:
     def __init__(self, *, head: str = GEL, base=BASE, runs=(), workflow: str | None = WORKFLOW,
                  pulls=None, checks=None, manifest: str | None = None,
                  base_reviews=("integration-paquet-h-20261017-0500.md",),
-                 message: str = "lot 1343: clean head"):
+                 message: str = "lot 1343: clean head", packet_runs=()):
         self.head = head
         self.base = base
         self.runs = list(runs)
@@ -220,6 +220,7 @@ class Github:
         self.manifest = manifest
         self.base_reviews = list(base_reviews)
         self.message = message
+        self.packet_runs = list(packet_runs)
         self.paths: list[str] = []
 
     def rows(self) -> list[dict]:
@@ -244,6 +245,9 @@ class Github:
             # Le motif exact laisse passer `…/commits/<sha>/check-runs`.
             return {"sha": path.rsplit("/", 1)[-1],
                     "commit": {"message": self.message}}
+        if "/actions/runs?" in path:
+            page = int(re.search(r"[?&]page=(\d+)", path).group(1))
+            return {"workflow_runs": self.packet_runs[(page-1)*100:page*100]}
         if "/actions/workflows/tests.yml/runs?" in path:
             runs = self.rows()
             found = re.search(r"[?&]head_sha=([0-9a-f]{40})", path)
@@ -1042,7 +1046,8 @@ class RequestTest(GelTestCase):
         super().setUp()
         self.args = argparse.Namespace(id=1343, sha="", avis=1, exception="", reason="",
                                        full=False, force=False, repo=DEPOT, dry_run=False,
-                                       json=True)
+                                       json=True, prevalidation_repo="",
+                                       prevalidation_map="")
         self.notes: list[str] = []
         self.seq = itertools.count(1)
         self.on_note = None
@@ -1130,6 +1135,94 @@ class RequestTest(GelTestCase):
         parsed = ci.request_events(self.db, self.item["id"])
         self.assertEqual([(e["state"], e["avis"]) for e in parsed],
                          [("reserve", 0), ("applied", 0)])
+
+    def packet_request(self, rows=(), *, refuse=(), dry_run=False, runs=()):
+        self.gele()
+        api = Github(pulls=[pull(head_ref="integration/paquet-h-2876")],
+                     packet_runs=rows, runs=runs)
+        args = argparse.Namespace(**{**vars(self.args), "full": True,
+                                     "reason": "paquet #2876", "dry_run": dry_run})
+        gh = Gh(refuse=refuse)
+        code, notes = self.run_cmd(api, gh, args=args)
+        return code, api, gh, notes
+
+    @staticmethod
+    def portier(**overrides):
+        return {"id": 2876, "path": ".github/workflows/paquet.yml",
+                "event": "push", "head_branch": BRANCHE, "head_sha": GEL,
+                "status": "in_progress", **overrides}
+
+    def test_full_annule_le_portier_avant_l_etiquette_et_journalise(self):
+        code, api, gh, notes = self.packet_request([self.portier()])
+        self.assertEqual(code, 0, notes)
+        cancel = gh.annulations()[0]
+        pose = next(c for c in gh.calls if len(c) > 3 and c[3].endswith("/issues/%d/labels" % PR))
+        self.assertLess(gh.calls.index(cancel), gh.calls.index(pose))
+        self.assertTrue(any("packet portier: cancel run 2876" in n for n in notes))
+        self.assertEqual(gh.poses(), [LABEL_FULL])
+
+    def test_full_ne_touche_que_le_portier_vivant_de_la_meme_tete_et_branche(self):
+        rows = [self.portier(id=1, head_sha=TETE),
+                self.portier(id=2, head_branch="integration/autre"),
+                self.portier(id=3, path=".github/workflows/tests.yml"),
+                self.portier(id=4, status="completed"),
+                self.portier(id=5, event="pull_request"),
+                self.portier(id=6, status="queued")]
+        code, api, gh, notes = self.packet_request(rows)
+        self.assertEqual(code, 0, notes)
+        self.assertEqual([c[3] for c in gh.annulations()],
+                         ["repos/%s/actions/runs/6/cancel" % DEPOT])
+
+    def test_full_refuse_le_doublon_si_l_annulation_echoue(self):
+        code, api, gh, notes = self.packet_request([self.portier()], refuse=("/cancel",))
+        self.assertEqual(code, 1, notes)
+        self.assertFalse(gh.poses())
+        self.assertTrue(any("packet portier:" in n and "refused" in n for n in notes))
+
+    def test_full_lit_aussi_la_seconde_page_des_runs(self):
+        rows = [self.portier(id=n, status="completed") for n in range(100)]
+        code, api, gh, notes = self.packet_request(rows + [self.portier()])
+        self.assertEqual(code, 0, notes)
+        self.assertEqual(len(gh.annulations()), 1)
+        self.assertTrue(any("page=2&" in p for p in api.paths))
+
+    def test_full_dry_run_ne_lit_ni_n_annule_de_portier(self):
+        code, api, gh, notes = self.packet_request([self.portier()], dry_run=True)
+        self.assertEqual(code, 0, notes)
+        self.assertFalse(gh.annulations())
+        self.assertFalse(any("/actions/runs?" in p for p in api.paths))
+
+    def test_full_hors_integration_ne_touche_pas_au_portier(self):
+        self.gele()
+        api = Github(packet_runs=[self.portier()])
+        args = argparse.Namespace(**{**vars(self.args), "full": True, "reason": "release"})
+        gh = Gh()
+        code, notes = self.run_cmd(api, gh, args=args)
+        self.assertEqual(code, 0, notes)
+        self.assertEqual(gh.poses(), [LABEL_FULL])
+        self.assertFalse(gh.annulations())
+        self.assertFalse(any("/actions/runs?" in p for p in api.paths))
+
+    def test_full_api_portier_illisible_ne_pose_pas_d_etiquette(self):
+        original = Github.__call__
+
+        def fail_packet_read(api, path):
+            if "/actions/runs?" in path:
+                raise plan_github.GithubError("packet runs unavailable")
+            return original(api, path)
+
+        with mock.patch.object(Github, "__call__", fail_packet_read):
+            code, api, gh, notes = self.packet_request([self.portier()])
+        self.assertEqual(code, 1, notes)
+        self.assertFalse(gh.poses())
+        self.assertFalse(gh.annulations())
+
+    def test_full_deja_en_cours_ne_touche_pas_le_portier(self):
+        code, api, gh, notes = self.packet_request(
+            [self.portier()], runs=[label_run(mode="full", statut="in_progress")])
+        self.assertEqual(code, 0, notes)
+        self.assertFalse(gh.annulations())
+        self.assertFalse(gh.poses())
 
     def test_un_avis_zero_full_hors_porteur_ne_pose_rien(self):
         # N1 #2240 (b) : la garde ne touche que la demande de CI ; hors
@@ -1682,6 +1775,87 @@ class RequestTest(GelTestCase):
         self.assertEqual(code, 0)
         self.assertEqual(self.db.transactions, 0)
         self.assertEqual(gh.poses(), [LABEL])
+
+
+    # -- #2644 : la prévalidation passe avant l'étiquette d'un porteur --
+
+    def packet_args(self, **over):
+        values = dict(vars(self.args), avis=0, full=True,
+                      reason="porteur, unités relues au manifeste",
+                      prevalidation_repo="/arbre-paquet",
+                      prevalidation_map="/carte/carte.json.gz")
+        values.update(over)
+        return argparse.Namespace(**values)
+
+    def packet_api(self):
+        return Github(pulls=[pull(head_ref="integration/paquet-h-20261019-0600")],
+                      manifest="integration-paquet-h-20261019-0600.md")
+
+    def test_paquet_vert_pose_l_etiquette(self):
+        gh = Gh()
+        with mock.patch("ameesh.prevalidation_calls.gate_packet",
+                        return_value={"state": "green",
+                                      "report": {"schema": "ameesh-prevalidation/1",
+                                                 "ok": True, "sha": GEL,
+                                                 "modules": ["test_a"],
+                                                 "seconds": 12.0,
+                                                 "host": "vm1"}}) as gate:
+            code, notes = self.run_cmd(self.packet_api(), gh,
+                                       args=self.packet_args(), packet=False)
+        self.assertEqual(code, 0, notes)
+        self.assertIn(LABEL_FULL, gh.poses())
+        gate.assert_called_once()
+        kwargs = gate.call_args.kwargs
+        self.assertEqual(kwargs["repo"], "/arbre-paquet")
+        self.assertEqual(kwargs["map_path"], "/carte/carte.json.gz")
+
+    def test_paquet_rouge_ne_pose_aucune_etiquette(self):
+        gh = Gh()
+        with mock.patch("ameesh.prevalidation_calls.gate_packet",
+                        return_value={"state": "red",
+                                      "why": "run-red — tests en échec: tests.test_x"}):
+            code, notes = self.run_cmd(self.packet_api(), gh,
+                                       args=self.packet_args(), packet=False)
+        self.assertEqual(code, 1)
+        self.assertEqual(gh.poses(), [])
+        self.assertEqual(self.marques("reserve"), [])
+
+    def test_paquet_indisponible_continue_et_journalise(self):
+        # Décision pilote 19/10 : une prévalidation indisponible ne bloque
+        # jamais ; le motif est journalisé pour le manifeste du porteur.
+        gh = Gh()
+        with mock.patch("ameesh.prevalidation_calls.gate_packet",
+                        return_value={"state": "unavailable", "cause": "no-vm",
+                                      "why": "aucune VM de prévalidation"}):
+            code, notes = self.run_cmd(self.packet_api(), gh,
+                                       args=self.packet_args(), packet=False)
+        self.assertEqual(code, 0, notes)
+        self.assertIn(LABEL_FULL, gh.poses())
+        self.assertTrue(any(n.startswith("prevalidation-unavailable: no-vm")
+                            for n in notes), notes)
+
+    def test_exception_declaree_ne_bloque_pas_la_prevalidation(self):
+        self.events.append({"id": next(self.seq), "created_ts": time.time(),
+                            "note": "packet-exception incident sha=%s reason=incident"
+                                    % GEL})
+        gh = Gh()
+        with mock.patch("ameesh.prevalidation_calls.gate_packet") as gate:
+            code, notes = self.run_cmd(self.packet_api(), gh,
+                                       args=self.packet_args(), packet=False)
+        self.assertEqual(code, 0, notes)
+        self.assertIn(LABEL_FULL, gh.poses())
+        gate.assert_not_called()
+
+    def test_lot_hors_paquet_n_appelle_pas_la_prevalidation(self):
+        self.gele()
+        self.events.append({"id": next(self.seq), "created_ts": time.time(),
+                            "note": "packet-exception unblock sha=%s reason=test" % GEL})
+        gh = Gh()
+        with mock.patch("ameesh.prevalidation_calls.gate_packet") as gate:
+            code, notes = self.run_cmd(Github(), gh, packet=False)
+        self.assertEqual(code, 0, notes)
+        self.assertIn(LABEL, gh.poses())
+        gate.assert_not_called()
 
 
 class ParsingTest(unittest.TestCase):

@@ -21,7 +21,7 @@ import time
 import unittest
 from unittest import mock
 
-from ameesh import canon, p256, visibility
+from ameesh import canon, p256, platform, visibility
 from ameesh.mediated_executor import device, contract as C, identity, jose
 from ameesh.mediated_executor import interfaces as I
 
@@ -37,6 +37,29 @@ def _key_dir() -> str:
     path = tempfile.mkdtemp(prefix="ameesh-l110-")
     os.chmod(path, 0o700)
     return os.path.join(path, "exec")
+
+
+def _observed(value):
+    """Rend une observation de la couche plateforme pour la recherche du code.
+
+    Une lecture refusée n'est pas une absence (#3023) : `None` ou un
+    environnement vide, et un argv vide (processus vivant dont les arguments
+    n'ont pas pu être lus) lèvent, au lieu de passer pour « rien à trouver ».
+    `command_argv` rend `[]` quand le processus est illisible."""
+    if value is None:
+        raise AssertionError("environ illisible : le code pourrait y être sans être vu")
+    if isinstance(value, dict):
+        if not value:
+            raise AssertionError("environ vide : le code pourrait y être sans être vu")
+        return "\n".join("%s=%s" % (key, item) for key, item in value.items())
+    if isinstance(value, list):
+        # codex #393 N2: command_argv rend [] quand le processus est
+        # illisible ; une liste vide rendrait "" et la preuve
+        # "secret absent" passerait à vide.
+        if not value:
+            raise AssertionError("argv vide : le code pourrait y être sans être vu")
+        return "\0".join(value)
+    return value
 
 
 # ==========================================================================
@@ -536,6 +559,33 @@ class IdentiteBaseTest(PgTestCase):
             source.access_token(refresh=True)
 
 
+class ObservationRefuseeTest(unittest.TestCase):
+    """#3023 : le témoin de confidentialité ne confond plus une observation
+    impossible avec une absence de secret dans argv (garde N2 de #393).
+
+    La couche plateforme rend `None` pour un environnement illisible, `{}`
+    pour un environnement vide et `[]` pour un argv illisible (processus
+    disparu, lecture refusée) : tous doivent faire échouer le témoin, jamais
+    passer pour une chaîne vide."""
+
+    def test_une_lecture_refusee_est_refusee(self):
+        for value in (None, [], {}):
+            with self.subTest(valeur=value):
+                with self.assertRaises(AssertionError):
+                    _observed(value)
+
+    def test_un_pid_disparu_rend_un_argv_vide_que_le_temoin_refuse(self):
+        # le vrai chemin de la couche : un processus qui n'existe plus.
+        disparu = platform.command_argv(2 ** 31 - 1)
+        self.assertEqual(disparu, [])
+        with self.assertRaises(AssertionError):
+            _observed(disparu)
+
+    def test_une_lecture_valide_reste_cherchee(self):
+        self.assertEqual(_observed(["a", "b"]), "a\0b")
+        self.assertEqual(_observed({"A": "b"}), "A=b")
+
+
 class DeviceCliTest(PgTestCase):
     """La vraie commande `ameesh device enroll --code-file` : le code n'est
     ni dans la ligne de commande, ni dans l'environnement, ni dans la sortie."""
@@ -561,9 +611,12 @@ class DeviceCliTest(PgTestCase):
             def do_POST(self):
                 body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
                 pid = test.proc.pid
-                for name in ("cmdline", "environ"):
-                    with open("/proc/%d/%s" % (pid, name), "rb") as fh:
-                        seen[name] = fh.read()
+                # L68: the platform layer, not /proc. An empty argv or a None
+                # environment (unreadable process) is kept and fails the
+                # assertion below: a secret that could not be observed must
+                # never pass for absent.
+                seen["cmdline"] = platform.command_argv(pid)
+                seen["environ"] = platform.environ(pid)
                 try:
                     status, reply = 201, provider.enroll(body, server_url=test.url)
                 except I.AuthError as exc:
@@ -604,7 +657,7 @@ class DeviceCliTest(PgTestCase):
         for variant in (code, code.replace("-", ""), jose.normalize_code(code)):
             for name, raw in seen.items():
                 with self.subTest(where=name):
-                    self.assertNotIn(variant.encode(), raw)
+                    self.assertNotIn(variant, _observed(raw))
             self.assertNotIn(variant, out + err)
         with open(os.path.join(home, device.STATE_FILE), encoding="utf-8") as fh:
             self.assertNotIn(jose.normalize_code(code), fh.read())

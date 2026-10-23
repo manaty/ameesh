@@ -55,7 +55,8 @@ Non implémenté ; liste de contrôle pour qui l'écrira.
    leases          claim attach_claim state renew release turn_in_progress
                    reap clear_session take_pending_prompt begin_turn
                    restore_prompt end_turn adopt_session_origin
-   pending_spend   put set_model get clear (Postgres optional: put_get clear_if)
+   pending_spend   put set_model set_resident_usage get clear
+                   (Postgres optional: put_get clear_if)
    turn_costs      last_reading insert spent ledger correct last_before first_after
    mailbox         send unread unread_active unread_urgent get mark_delivered reserve
                    deliver release unread_counts history pending_recipients
@@ -68,8 +69,8 @@ Non implémenté ; liste de contrôle pour qui l'écrira.
                    delays timeline link_package by_package close_merged close
                    refresh_package_parents delegate current_delegation
                    mark_delegate_turn due_delegations resolve_delegation
-                   overdue_delegations returned_delegations backlog_add backlog
-                   auto_takes_since unassigned_lots issue_feed set_issue_ref set_estimate
+                   overdue_delegations returned_delegations backlog_add
+                   backlog_basket_add backlog auto_takes_since unassigned_lots issue_feed set_issue_ref set_estimate
                    estimates mark_started estimate_history
    packages       all get upsert retire lock_sync
    actions         get recent attempts events log_event last_event_note
@@ -194,6 +195,9 @@ AUTO_TAKE_NOTE = "prise automatique"
 HANDOFF_NOTE = "pause budget (reprise) : lot repris"
 ASSIGN_NOTE_PREFIXES = ("assigned to ", "assigné à ", "created and assigned to ",
                         DELEGATED_NOTE, LOT_TAKE_NOTE, AUTO_TAKE_NOTE, HANDOFF_NOTE)
+#: #2584 : début de la note de journal d'une ligne de panier (`backlog_basket_add`)
+#: — le compte des lignes d'un panier se lit sur ce préfixe
+BASKET_LINE_NOTE = "basket line"
 
 
 class Domain(abc.ABC):
@@ -277,7 +281,12 @@ class Agents(Domain):
     @abc.abstractmethod
     def claimable(self, host: str, names: Sequence[str] | None, *,
                   require_responsible: bool) -> list[dict]:
-        """Agents de l'hôte sans bail vivant, réclamables (mêmes règles que `claim`)."""
+        """Agents de l'hôte sans bail vivant, réclamables (mêmes règles que `claim`).
+
+        L165 (EP3) : pour un agent `releve: election` rendu sur un hôte
+        candidat, `host` est l'hôte qui réclame et `previous_host` l'hôte de la
+        ligne (l'ancien détenteur, ou l'hôte de la dernière synchronisation) ;
+        `session_id` est encore la session de cet ancien détenteur."""
 
     @abc.abstractmethod
     def runner_seen(self, host: str, owner: str, names: Sequence[str] | None) -> None:
@@ -318,6 +327,18 @@ class Agents(Domain):
         """Pose le statut (et l'erreur) de l'agent ; `stop_reason` (L37) n'est
         gardé que pour `stopped` / `dead`."""
 
+    def set_status_text(self, name: str, text: str) -> bool:
+        """#2789 : le texte libre de `agent-mail status`, en une instruction,
+        SANS toucher au statut : `status`, `last_error` et `stop_reason`
+        restent ceux de l'exécuteur (un tour en cours reste `running`). Écrit
+        seulement sur un agent `idle`, `queued` ou `running` : le texte d'un
+        agent `blocked`, `stopped` ou `dead` est un marqueur (retenue, arrêt)
+        que sa levée relit à l'identique. Faux si rien n'est écrit.
+
+        Pas une opération du contrat médié : un statut libre n'est pas admis
+        depuis une session médiée (`MediatedBackend.set_status`)."""
+        raise NotImplementedError
+
     @abc.abstractmethod
     def set_mode(self, name: str, mode: str) -> bool:
         """Pose le mode (`execute` | `externe`, L37) ; faux si l'agent est inconnu."""
@@ -354,8 +375,21 @@ class Leases(Domain):
 
     @abc.abstractmethod
     def claim(self, name: str, owner: str, ttl_seconds: float, *,
-              require_responsible: bool) -> dict | None:
-        """Prend le bail s'il est libre ou expiré ; rend la ligne, sinon None."""
+              require_responsible: bool, host: str | None = None,
+              election_brief: str | None = None) -> dict | None:
+        """Prend le bail s'il est libre ou expiré ; rend la ligne, sinon None.
+
+        `host` (L165, EP1) : l'hôte qui réclame, pour un agent
+        `releve: election`. None : l'hôte de la ligne (comportement d'un agent
+        épinglé). Le serveur médié force cet argument à l'hôte de l'exécuteur.
+
+        `election_brief` (L165, EP3) : appliqué seulement sur une relève
+        croisée d'un agent élu (la ligne était chez un autre hôte) — la même
+        instruction oublie la session de l'ancien hôte, laisse son compte au
+        choix de cet hôte et écrit le brief comme résumé de la session neuve.
+        Ignoré sur le même hôte et pour un agent `hote`. Une relève croisée
+        SANS brief est **refusée** (le CAS ne déplace pas la ligne), cas d'un
+        exécuteur médié (contrat 1.9 : valeur forcée à null côté appareil)."""
 
     @abc.abstractmethod
     def attach_claim(self, name: str, owner: str, ttl_seconds: float, *,
@@ -371,7 +405,8 @@ class Leases(Domain):
 
     @abc.abstractmethod
     def renew(self, name: str, owner: str, epoch: int, ttl_seconds: float) -> float | None:
-        """Prolonge le bail ; rend la nouvelle échéance, None si on ne le détient plus."""
+        """Prolonge le bail sans raccourcir son échéance ; rend la nouvelle
+        échéance, None si on ne le détient plus."""
 
     @abc.abstractmethod
     def release(self, name: str, owner: str, epoch: int) -> bool:
@@ -518,11 +553,29 @@ class Catalog(Domain):
 class PendingSpend(Domain):
     """Marqueur comptable d'un tour (`spend_pending`) : une ligne par agent.
 
+    Le marqueur porte son identité **exacte** (#2166) : `created_at`, texte
+    UTC à la microseconde, et `spend_key`, la clé du grand livre
+    (`turn_costs.spend_key`, L60) et de la réservation #1469. Une écriture
+    conditionnelle s'y compare, jamais à un `extract(epoch)::float8` relu —
+    une connexion à précision réduite (`extra_float_digits=0`) en perd les
+    derniers chiffres. `spend_key` est NULL sur les marqueurs d'avant 0471 :
+    leur réparation retrouve la clé déjà écrite par leur tour (ligne ou
+    réservation) par l'identité du tour, jamais par un float8 recalculé ni
+    par l'ordre des écritures ; plusieurs candidats incohérents suspendent
+    (`ledger_ambiguous`).
+
+    #2905 : la colonne `spend_key` n'est crue que si elle est l'identité
+    exacte du marqueur. Après un retour arrière de version (§14), l'ancien
+    `put` réécrit cette identité sans la clé : la colonne garde alors celle du
+    tour précédent, que `get` traite comme NULL (repli par l'identité du tour)
+    — l'écrire ferait perdre le coût du tour au conflit de
+    `turn_costs.spend_key`.
+
     Extensions PostgreSQL optionnelles (#1469), détectées par `hasattr` :
     `put_get(name, start_index, turn, model)` écrit et rend le marqueur comme
-    `get`, dans la même instruction ; `clear_if(name, created_ts)` ne retire
-    que ce marqueur. Absentes de l'interface distante : elle garde les
-    opérations de base, avec le contrôle du bail côté serveur.
+    `get`, dans la même instruction ; `clear_if(name, created_at, spend_key)`
+    ne retire que ce marqueur. Absentes de l'interface distante : elle garde
+    les opérations de base, avec le contrôle du bail côté serveur.
     """
 
     @abc.abstractmethod
@@ -541,16 +594,33 @@ class PendingSpend(Domain):
 
     @abc.abstractmethod
     def set_resident_usage(self, name: str, usage: dict | None,
-                           created_ts: float | None = None) -> bool:
+                           created_at: str | None = None,
+                           spend_key: str | None = None) -> bool:
         """Pose (ou efface avec None) l'événement `resident.turn` du marqueur
-        (L80a) ; faux s'il n'y a pas de marqueur, ou si `created_ts` désigne
-        un autre marqueur. Cet état durable permet à un worker de remplacement
-        de réparer un tour résident dont l'événement n'a pas été écrit."""
+        (L80a) ; faux s'il n'y a pas de marqueur, ou si `created_at`/`spend_key`
+        désignent un autre marqueur. `created_at` est le texte exact rendu par
+        `get`/`put_get` (#2166), jamais un float8 relu. Cet état durable permet
+        à un worker de remplacement de réparer un tour résident dont
+        l'événement n'a pas été écrit."""
 
     @abc.abstractmethod
     def get(self, name: str) -> dict | None:
-        """Le marqueur (agent, start_index, turn, model, created_ts,
-        work_item_id, turn_id, resident_usage), ou None."""
+        """Le marqueur (agent, start_index, turn, model, created_at,
+        created_ts, spend_key, ledger_key, ledger_ambiguous, work_item_id,
+        turn_id, resident_usage), ou None. `created_at` est l'identité exacte
+        (#2166) ; `spend_key` est l'identité brute portée par la colonne (NULL
+        avant 0471 ; elle borne `clear_if`/`set_resident_usage` et peut être
+        périmée après un retour arrière, #2905) ; `ledger_key` est la clé fiable
+        déjà écrite par ce tour — celle du marqueur seulement si la colonne EST
+        son identité (`agent:index:created_at`, le format de `put`), ou celle
+        l'identité du tour (`turn_id`, instant de pose, époque de la clé égale
+        à un arrondi historique exact du marqueur, jamais une fenêtre), et la
+        ligne/réservation doit suivre le marqueur — jamais par le seul index
+        de début ni par ordre temporel ;
+        `ledger_ambiguous` vrai interdit de deviner et suspend la comptabilité
+        (B1, notamment une réservation étrangère au même index) ;
+        `created_ts` reste l'epoch float8 pour le début du tour
+        (`turn_costs.started_at`)."""
 
     @abc.abstractmethod
     def clear(self, name: str) -> bool:
@@ -603,7 +673,8 @@ class TurnCosts(Domain):
                cache_write_tokens: int | None = None,
                work_item_id: int | None = None,
                started_at: float | None = None,
-               turn_id: str | None = None) -> bool:
+               turn_id: str | None = None,
+               inputs: Sequence[str] | None = None) -> bool:
         """Écrit la ligne du tour (une instruction) ; une erreur de base remonte
         telle quelle et n'a rien écrit. `account` (L30, migration 0028) : le
         compte qui a porté le tour ; None = colonne non écrite. `spend_key`
@@ -621,7 +692,8 @@ class TurnCosts(Domain):
         le tour et son instant de début (epoch, horloge de la base) ; None =
         inconnu, colonne non écrite. `turn_id` (#796) : l'identifiant du tour
         (`turn_resources.turn_id`), pour relier la ligne à ses ressources ;
-        None = inconnu."""
+        None = inconnu. `inputs` (L80b, migration 0472) : les identifiants des
+        messages servis par le tour (JSON array) ; None = colonne non écrite."""
 
     @abc.abstractmethod
     def spent(self, seconds: float, *, agent: str,
@@ -1055,12 +1127,45 @@ class Mailbox(Domain):
         """Messages non remis marqués `payload.urgent`."""
 
     @abc.abstractmethod
-    def unread_mid_turn(self, recipient: str, limit: int) -> list[dict]:
+    def unread_human(self, recipient: str, limit: int, *,
+                     names: Sequence[str] | None = None) -> list[dict]:
+        """L77/B13 : messages non remis d'un humain ACTIF, filtrés DANS la requête.
+
+        Un humain (`payload.human`, ancien expéditeur `human:*`, ou nom
+        déclaré de l'hôte dans `names`, None = aucun) ne doit pas rester
+        invisible derrière plus de `UNREAD_LIMIT` non-lus ordinaires : le rang 2
+        le sert avant la suite et la consigne en attente. Du plus ancien au
+        plus récent.
+
+        L77/B14 : les passifs (copie `cc`, accusé…) sont écartés par la
+        requête, comme par `mail.passive_reason` — une copie humaine ne
+        remplit pas la fenêtre devant un humain actif.
+        """
+
+    @abc.abstractmethod
+    def unread_human_page(self, recipient: str, limit: int, *,
+                          after_id: int | None = None,
+                          names: Sequence[str] | None = None) -> list[dict]:
+        """L77/B14 : les humains actifs d'APRÈS `after_id`, du plus ancien au
+        plus récent.
+
+        Le serveur médié borne chaque page à 200 et `unread_human` n'a pas de
+        décalage : un préfixe de plus de 200 humains retenus (lots retenus)
+        ne se franchit qu'avec un curseur. `after_id` est l'id du dernier
+        message de la page précédente ; None lit depuis le début. Les passifs
+        sont écartés comme dans `unread_human`.
+        """
+
+    @abc.abstractmethod
+    def unread_mid_turn(self, recipient: str, limit: int, *,
+                        include_human: bool = True) -> list[dict]:
         """L514/#885 : les messages non remis qu'une remise mi-tour peut
         livrer — verdict, arbitrage, message d'un humain, urgent
         (`mail.mid_turn`) —, du plus ancien au plus récent, sans s'arrêter
         aux `UNREAD_LIMIT` premiers non-lus : un verdict derrière plus de 200
-        non-lus est vu au prochain point sûr, pas à la fin du tour."""
+        non-lus est vu au prochain point sûr, pas à la fin du tour.
+        `include_human=False` (L77/B11) : les messages humains sont laissés à
+        la file du tour résident."""
 
     @abc.abstractmethod
     def get(self, message_id: int) -> dict | None:
@@ -1111,6 +1216,13 @@ class Mailbox(Domain):
         Le filtre (destinataire, nature, lot) est fait DANS la requête : un
         `history` borne avant de filtrer, donc une demande ancienne du même lot
         sortait de la fenêtre et une re-désignation renvoyait un doublon."""
+
+    @abc.abstractmethod
+    def delivered_for_lot(self, recipient: str, lot: str, limit: int) -> list[dict]:
+        """Messages déjà remis d'un lot, du plus récent au plus ancien, bornés
+        par `limit`. Filtre destinataire ET lot dans la requête, sans fenêtre
+        de temps : un verdict ancien reste lisible dans le brief de son lot.
+        Non admis en mode médié (contrat fermé) : l'appelant garde les non-lus."""
 
     @abc.abstractmethod
     def pending_recipients(self) -> list[str]:
@@ -1352,6 +1464,11 @@ class WorkItems(Domain):
         """L118c: journaled project correction, atomically with its old value."""
 
     @abc.abstractmethod
+    def set_type(self, item_id: int, type: str, *, current: str, actor: str) -> dict | None:
+        """#2954: journaled lot type correction, if the lot still carries
+        `current` (compare-and-set, no lost concurrent correction)."""
+
+    @abc.abstractmethod
     def without_project(self) -> list[dict]:
         """L118c: open lots with empty app, once per id, including waiting_human."""
 
@@ -1369,7 +1486,7 @@ class WorkItems(Domain):
             estimate_source: str | None = None, change_size: str | None = None,
             queued_note: str | None = None, forced_note: str | None = None,
             mark_item_id: int | None = None, mark_note: str = "",
-            parent_lot: int | None = None) -> dict:
+            parent_lot: int | None = None, unique_ref: bool = False) -> dict:
         """Crée le lot en `intake` (rattaché à une fiche WorkPackage si
         `package_id`, L29 ; avec sa branche si `branch`, L118 ; sa priorité
         si `priority`, L130 ; avec sa durée estimée et sa ligne d'historique
@@ -1396,6 +1513,13 @@ class WorkItems(Domain):
         **same** transaction — a blocking edge if the parent is still open, a
         journal trace if it is already finished, everything rolled back if it
         is unknown.
+
+        `unique_ref` (#2954): with an `issue_ref`, take a transaction advisory
+        lock on the reference and refuse the creation (`DbError`) when any lot,
+        whatever its state, already carries it. Two hosts creating the incident
+        of the same run serialize: the second sees the first and the caller
+        re-reads the winner. Off by default: several lots may legitimately
+        share a reference except where the identity is one per execution.
 
         L'ordre des verrous est commun avec `assign` (#540, revue R1 delta) :
         les lignes de lots d'abord (`mark_item_id` et `parent_lot`, par
@@ -1495,18 +1619,27 @@ class WorkItems(Domain):
     @abc.abstractmethod
     def reserve_migration(self, item_id: int, repo: str | None, number: int | None,
                           floor: int, *, note: str, actor: str, issue_ref: str | None,
-                          release: bool = False) -> dict | None:
-        """L122, #443 : réserve un numéro de migration du dépôt `repo` au lot
-        ouvert (journalisé) : `number` s'il est donné, sinon le prochain libre
-        de ce dépôt, au moins `floor`. L'unicité (dépôt, numéro) est celle de
-        l'index unique : deux réservations simultanées ne prennent jamais le
-        même numéro ; la perdante réessaie avec une attente aléatoire croissante,
-        dans un budget de temps (#478). `note` peut citer `%(number)04d`. None
-        si le lot n'est plus ouvert, ou si `issue_ref` — la référence lue par
-        l'appelant — a changé entre-temps (#1830 : NULL et chaîne vide
-        confondus) ; DbError si `number` est pris par un autre lot ;
-        `ReservationContention` si le budget du prochain libre est épuisé.
-        `release` libère la réservation, sans condition sur la référence."""
+                          release: bool = False,
+                          release_number: int | None = None) -> dict | None:
+        """L122, #443, #2481 : réserve un numéro de migration du dépôt `repo`
+        au lot ouvert (journalisé) : `number` s'il est donné, sinon le prochain
+        libre de ce dépôt, au moins `floor`. Un lot garde ses réservations
+        précédentes : `number` s'ajoute à la liste (`migrations`), il ne
+        remplace plus le numéro courant. L'unicité (dépôt, numéro) est celle
+        des index uniques : deux réservations simultanées ne prennent jamais
+        le même numéro ; la perdante réessaie avec une attente aléatoire
+        croissante, dans un budget de temps (#478). `note` peut citer
+        `%(number)04d` pour une réservation ou une libération d'UN numéro ; une
+        libération totale nomme elle-même l'ensemble des numéros (un gabarit
+        y rend la liste, jamais le sentinelle 0). None si le lot n'est plus
+        ouvert, ou si `issue_ref` —
+        la référence lue par l'appelant — a changé entre-temps (#1830 : NULL
+        et chaîne vide confondus) ; DbError si `number` est pris par un autre
+        lot ; `ReservationContention` si le budget du prochain libre est
+        épuisé. `release` libère toutes les réservations du lot, ou seulement
+        `release_number` s'il est donné, sans condition sur la référence.
+        Les colonnes scalaires (`migration`, `migration_repo`) restent la
+        réservation principale et `migrations` porte la liste complète."""
 
     @abc.abstractmethod
     def migration_holder(self, number: int, repo: str) -> dict | None:
@@ -1613,6 +1746,40 @@ class WorkItems(Domain):
         """
 
     @abc.abstractmethod
+    def train_abandon(self, key: str, plan_id: str, document: dict, *, revision: int,
+                      owner: str, epoch: int) -> dict | None:
+        """#3138: terminal write of one exact never-fired train plan.
+
+        Same lease/epoch and revision checks as `train_save`, plus in the same
+        transaction: the persisted plan id is still `plan_id`, its phase is not
+        terminal or `promoting`, and no active/promoting/landed fire receipt
+        exists for it. A concurrent fire grant is serialized on the target
+        lease, so a plan cannot be abandoned between the grant's check and its
+        insertion. Returns the new document, None on any mismatch.
+        """
+
+    @abc.abstractmethod
+    def train_adopt(self, key: str, owner: str, *, revision: int,
+                    previous: tuple | None, service: tuple, ttl_s: float) -> dict | None:
+        """#3142: the train service's current holder takes over the target
+        reservation another `train:*` owner left behind.
+
+        In one transaction: ``service`` (key, owner, epoch) must be the live
+        service lease; a key bound to a role
+        (``train-service:<role>:<epoch>``) also requires that role's live
+        lease at that exact epoch, so an old election's still-live service
+        key cannot adopt the reservation back from the new holder; the target
+        row must be held by another `train:*` owner (at ``previous``
+        (owner, epoch) when given, expired or not); the train document must
+        still be at ``revision``. The row passes to ``owner`` at the next
+        epoch, so every write of the old epoch is refused afterwards. A
+        reservation ticket of the document naming the held (owner, epoch) is
+        rewritten to the new ones; with ``previous``, it must exist.
+        Never takes an ordinary (non-`train:*`) reservation. Returns
+        {epoch, previous_owner, previous_epoch}, or None.
+        """
+
+    @abc.abstractmethod
     def train_fire_read(self, key: str, plan_id: str) -> dict | None:
         """#1467: latest persisted fire receipt, including withdrawn history."""
 
@@ -1662,6 +1829,13 @@ class WorkItems(Domain):
         """L118 : les lots ouverts d'un assigné."""
 
     @abc.abstractmethod
+    def held_by(self, agents: Sequence[str]) -> dict[str, dict]:
+        """#2877 : ce que ces agents tiennent encore, en une lecture sans
+        verrou : par assigné, ``open`` (un lot ni fusionné, ni promu, ni fermé)
+        et ``promoted`` (un lot promu) ; un agent qui ne tient rien est absent.
+        Sert à ne verrouiller (``release_agent``) que s'il y a un lot à rendre."""
+
+    @abc.abstractmethod
     def release_agent(self, agent: str, *, reason: str, actor: str,
                       measure_actor: str = "", measure_reason: str = "",
                       dry_run: bool = False,
@@ -1686,6 +1860,15 @@ class WorkItems(Domain):
         """L539 : les lots portant exactement cette `issue_ref`, **quel que
         soit leur état** — l'identité d'un lot de relecture après fusion
         survit à sa fermeture, sinon un second lot serait ouvert."""
+
+    @abc.abstractmethod
+    def lock(self, item_id: int) -> dict | None:
+        """Le lot, verrouillé `FOR UPDATE` jusqu'à la fin de la transaction
+        courante ; None s'il n'existe pas. #2744 : c'est le verrou commun des
+        écritures de retenue (les notes `hold:`/`unhold:` le prennent avant
+        `note`, les transitions par leur UPDATE) et de la fermeture par
+        contenu — une retenue ne se glisse pas entre la lecture du journal et
+        la fermeture."""
 
     @abc.abstractmethod
     def get(self, item_id: int) -> dict | None:
@@ -1789,6 +1972,21 @@ class WorkItems(Domain):
 
         `once` sérialise sur le lot et n'insère pas un texte déjà présent.
         """
+
+    @abc.abstractmethod
+    def note_with_wake(self, item_id: int, state: str, text: str, actor: str,
+                       wake_ts: float, *, once: bool = False) -> None:
+        """#2466 : journalise une note et pose, dans la même transaction, le
+        réveil programmé du lot (epoch) : une note `hold: …` ne laisse jamais
+        la retenue sans son échéance si l'écriture s'interrompt."""
+
+    @abc.abstractmethod
+    def schedule_wake(self, item_id: int, wake_ts: float | None, *, text: str,
+                      actor: str) -> dict | None:
+        """#2466 : pose (ou efface avec `wake_ts=None`) le réveil programmé du
+        lot et journalise le geste, en une transaction ; rend le lot relu, ou
+        None s'il n'existe pas ou n'est plus ouvert. Un seul réveil par lot :
+        le dernier posé remplace le précédent."""
 
     @abc.abstractmethod
     def log_review_attempt(self, item_id: int, state: str, text: str, actor: str) -> None:
@@ -2035,6 +2233,31 @@ class WorkItems(Domain):
         """Les lots rattachés à cette fiche, tous états confondus, par id."""
 
     @abc.abstractmethod
+    def record_packet(self, package_id: int, *, branch: str, base_sha: str,
+                      head_sha: str, units: Sequence[dict], note: str,
+                      actor: str) -> list[dict]:
+        """#2443 : enregistre la composition d'un paquet (lot porteur
+        `package_id`, branche `branch`), en remplaçant l'ensemble de ses
+        unités, en UNE transaction.
+
+        `units` : des dicts `work_item_id`, `unit_sha`, `source_sha`,
+        `frozen_sha`. Un lot porteur ou une unité inconnue annule tout
+        (l'intégrité référentielle tranche) ; l'événement `note` est écrit au
+        journal du porteur dans la même transaction. Rend les lignes relues
+        par `packet_members` (ordre de `recorded_at` décroissant).
+        """
+
+    @abc.abstractmethod
+    def packet_members(self, *, item_ids: Sequence[int] | None = None,
+                       package_ids: Sequence[int] | None = None) -> list[dict]:
+        """#2443 : les appartenances de paquet, filtrées par unités
+        (`item_ids`) ou par porteur (`package_ids`), les plus récentes
+        d'abord. Chaque ligne porte `package_id`, `work_item_id`,
+        `package_branch`, `base_sha`, `head_sha`, `unit_sha`, `source_sha`,
+        `frozen_sha`, `recorded_by`, `recorded_ts`, l'état du porteur
+        (`package_state`) et son jalon de fusion (`package_merged_sha`)."""
+
+    @abc.abstractmethod
     def close_merged(self, item_id: int, *, current: str, sha: str, actor: str, note: str,
                      pr_ref: str | None, frozen_id: int | None = None,
                      landed: tuple[int, str] | None = None,
@@ -2080,6 +2303,29 @@ class WorkItems(Domain):
         assigné, et sa première ligne de journal ; rend le lot.
 
         `app`: its project (L118c), empty when unknown."""
+
+    @abc.abstractmethod
+    def backlog_basket_add(self, *, key: str, title: str, expected_value: str, line: str,
+                           value_score: int, priority: int, team: str | None,
+                           required_capabilities: list | None, package_id: str | None,
+                           package_parent: str | None, note: str, actor: str,
+                           app: str = "") -> dict:
+        """#2584 (canon §2 l.129) : ajoute une ligne au panier ouvert `key`
+        d'un chantier, ou ouvre ce panier ; rend le panier.
+
+        Le panier est un lot `improvement` en `intake`, sans assigné, dont la
+        `source` vaut `key` : la clé seule le désigne, l'équipe d'une ligne
+        n'ouvre pas un second panier. La ligne s'ajoute au corps ; la valeur
+        du panier est la plus haute de ses lignes, sa priorité la plus haute
+        (le plus petit nombre), ses capacités exigées l'union des leurs, son
+        équipe la première donnée (`team` de la ligne qui l'ouvre, sinon
+        d'une suivante) ;
+        `note` (qui commence par `BASKET_LINE_NOTE`) va au journal. Un panier
+        déjà pris (assigné, ou sorti d'`intake`) est fermé aux lignes : la
+        suivante ouvre un nouveau panier. Deux ajouts simultanés sur la même
+        clé n'ouvrent jamais deux paniers (un écrivain par clé). Le lot rendu
+        porte `basket_lines` (lignes au journal du panier) et `basket_opened`
+        (vrai si cet ajout l'a ouvert)."""
 
     @abc.abstractmethod
     def backlog(self, *, open_only: bool, limit: int,
@@ -2443,6 +2689,40 @@ class Canon(Domain):
         si le CAS refuse une lecture périmée : la politique n'est pas appliquée."""
 
     @abc.abstractmethod
+    def set_election(self, name: str, releve: str, candidats: Sequence[str] | None,
+                     *, canon: str) -> None:
+        """L165 (EP1) : écrit `releve` / `candidats` de la ligne du canon et
+        retire les verdicts de candidats qui ne sont plus des candidats (ou
+        tous si le rôle redevient `hote`). Ne déplace jamais l'agent."""
+
+    @abc.abstractmethod
+    def write_candidate(self, name: str, host: str, *, canon: str, cwd: str | None,
+                        ok: bool | None, diagnostic: str, ref: str | None,
+                        harness: str | None, provider: str | None,
+                        model: str | None, credential_mode: str | None) -> None:
+        """L165 (EP1) : inscrit le verdict de placement de `name` sur l'hôte
+        candidat `host` (profil évalué calculé dans la même instruction), pour
+        que la réclamation depuis cet hôte soit jugée sur SA politique."""
+
+    @abc.abstractmethod
+    def candidate_names(self, host: str, canon: str = "") -> list[str]:
+        """L165 (EP1) : noms des agents qui ont un verdict de candidat sur
+        `host`, pour que le sync de CET hôte voie aussi les fiches retirées
+        dont la ligne est encore chez un autre détenteur."""
+
+    @abc.abstractmethod
+    def close_candidates(self, name: str, *, canon: str, diagnostic: str) -> None:
+        """L165 (EP1) : ferme TOUS les verdicts candidats d'un agent dont la
+        fiche est en erreur (responsable non résolu, candidat non admis…),
+        quel que soit l'hôte qui l'a constaté. Laisse `releve` intact ; une
+        synchronisation ultérieure rouvrira les hôtes valides."""
+
+    @abc.abstractmethod
+    def clear_candidate(self, name: str, host: str, *, canon: str) -> None:
+        """L165 (EP1) : retire le verdict candidat de `name` sur `host` (hôte
+        qui n'est plus admis), sans toucher aux autres candidats."""
+
+    @abc.abstractmethod
     def clear_responsible(self, name: str, host: str,
                           owner: tuple[str, bool] | None = None) -> None:
         """Vide le responsable d'un agent non éphémère de l'hôte ; `owner`
@@ -2490,11 +2770,15 @@ class Canon(Domain):
 
     @abc.abstractmethod
     def stop_removed(self, name: str, host: str, *, pending_text: str,
-                     stop_text: str, owner: tuple[str, bool] | None = None) -> dict | None:
+                     stop_text: str, owner: tuple[str, bool] | None = None,
+                     expected_lease_epoch: int | None = None) -> dict | None:
         """Arrête un agent retiré du canon (sauf en plein tour : arrêt demandé) ;
         rend name et status, ou None s'il n'y avait rien à faire. `owner` (L42) :
         (id, défaut) du canon auquel la ligne doit appartenir — jamais celle
-        d'un autre canon."""
+        d'un autre canon. `expected_lease_epoch` (L165) : le retrait constaté
+        sur un AUTRE hôte que celui de la ligne ne s'applique que si le bail
+        n'a pas changé depuis la lecture (aucune réclamation concurrente
+        n'est tuée)."""
 
 
 class Ephemerals(Domain):
@@ -3234,7 +3518,8 @@ class Operations(Domain):
         """Lots ouverts avec leur DERNIÈRE activité (`last_activity_ts`) :
         maximum de la ligne du lot, de ses transitions, jalons, actions et
         messages liés (`agent_mailbox.work_item_id`) ; plus id, title, state,
-        assignee, `package_id`, type et `priority` (le délai court du canon §9
+        assignee, `package_id`, type, `planned_start` (jour ISO ou None,
+        origine du délai intake #2562) et `priority` (le délai court du canon §9
         pour un P1, #789), app, workstream, reviewer (#705 : le projet du lot et
         son relecteur désigné), `lot_team` (équipe du lot : la sienne, sinon
         celle de son paquet ou du parent, sinon son `app`), `workflow_ref`
@@ -3260,13 +3545,16 @@ class Operations(Domain):
         en `build` sont bornés par le plafond par agent)."""
 
     @abc.abstractmethod
-    def turns(self, *, agent: str | None, since_s: float, limit: int) -> list[dict]:
+    def turns(self, *, agent: str | None, since_s: float, limit: int,
+              message: str | None = None) -> list[dict]:
         """Lignes du grand livre `turn_costs` des `since_s` dernières
         secondes (de l'agent si donné), les plus récentes d'abord : id,
         agent, harness, turn, model, session, usd, input_tokens,
         cached_input_tokens, output_tokens, work_item_id, started_ts,
-        recorded_ts. `work_item_id` et `started_ts` (#796) valent None pour
-        une ligne d'avant la migration 0423 ou un tour sans lot."""
+        recorded_ts, inputs. `work_item_id` et `started_ts` (#796) valent None
+        pour une ligne d'avant la migration 0423 ou un tour sans lot.
+        `message` (L80b) restreint aux tours qui ont servi ce message
+        (`inputs` contient son identifiant)."""
 
     @abc.abstractmethod
     def record_gauges(self, readings: Sequence[dict]) -> int:
@@ -3353,7 +3641,13 @@ class HostLifecycle(Domain):
     @abc.abstractmethod
     def drain(self, host: str, *, actor: str, duration: int | None = None,
               critical: Sequence[str] = ()) -> dict:
-        """Close claims/enable atomically and retain agents' original host."""
+        """Close claims/enable atomically and retain agents' original host.
+
+        #3029: an elected role holding its lease on this host is returned in
+        the same transaction, with its epoch bumped, so another candidate can
+        claim at once instead of waiting for the TTL. It stays out of the
+        L232e handoff journal (there is no local work to publish).
+        """
 
     @abc.abstractmethod
     def undrain(self, host: str, *, actor: str) -> dict | None:
@@ -3384,6 +3678,19 @@ class HostLifecycle(Domain):
     def detect_losses(self, *, actor: str, older_than: int,
                       critical: Sequence[str] = ()) -> list[dict]:
         """Close stale known hosts atomically; loss is not a quiescence proof."""
+
+    @abc.abstractmethod
+    def reconcile_loss(self, host: str, *, actor: str, fresh_within: int) -> dict:
+        """Reopen a lost host only on a verified proof.
+
+        Readings in database time must cover at least `fresh_within` without a
+        hole that large, with no reading dated in the future; every origin
+        agent must still be home and unfenced, with no live lease, no active
+        handoff and no `recover_source` attempt since the loss. The transition
+        `lost -> returning -> available` is atomic and leaves its actor and
+        evidence in `ameesh_events`. Returns `{"host", "mode", "reconciled",
+        "missing", ...}`; a refusal names the missing proof.
+        """
 
 
 class HostResources(Domain):
@@ -3457,6 +3764,15 @@ class HostResources(Domain):
     def since(self, host: str, since_s: float) -> list[dict]:
         """L159g: the readings of the host over the last `since_s` seconds,
         oldest first (the pilot report)."""
+
+    @abc.abstractmethod
+    def disk_history(self, host: str, since_s: float, step_s: float) -> list[dict]:
+        """#2879: the disk fields of the host's readings over the last
+        `since_s` seconds, one reading per `step_s` bucket at most, oldest
+        first (`id`, `sampled_ts`, `volumes`, `disk_path`, `disk_free_bytes`
+        only) — the disk trend does not pay for the ~50 columns of `since`,
+        nor for every reading of a dense history. Each `volumes` entry is
+        reduced to its trend fields (`path`, `paths`, `disk_free_bytes`)."""
 
     @abc.abstractmethod
     def record_harness_version(self, host: str, harness: str, *, path: str | None,
@@ -3623,15 +3939,31 @@ class Housekeeping(Domain):
         dans les bilans), les plus récentes d'abord ; instant en `at_ts`."""
 
     @abc.abstractmethod
-    def latest_by_path(self, host: str | None, kind: str) -> list[dict]:
+    def latest_by_path(self, host: str | None, kind: str,
+                       *, since_s: float | None = None,
+                       only_paths_with: Sequence[str] | None = None) -> list[dict]:
         """#222: the last line of each (host, path) of this `kind` (of the host
-        if given), with no time window nor limit: only the retention of the
-        log bounds it."""
+        if given). Without `since_s`, no time window nor limit: only the
+        retention of the log bounds it; with it (#2851), the lines older than
+        `since_s` seconds are left out — a caller that ignores them anyway
+        does not sort the whole journal.
+
+        `only_paths_with` (#2851) restricts the result to the paths that have
+        at least one line whose `action` is in this set. The line returned is
+        still the **latest of that path, whatever its action and whatever its
+        age**: a path last seen `unowned` then `deleted` comes back with
+        `deleted`, so the caller never keeps a closed alert alive. The
+        candidate filter runs in SQL, which keeps the sort on a handful of
+        paths instead of the whole journal."""
 
     @abc.abstractmethod
     def summary(self, host: str | None, since_s: float) -> list[dict]:
         """Par (hôte, kind, action) : nombre de lignes et octets, sur les
-        `since_s` dernières secondes (les bilans `mesure` exclus)."""
+        `since_s` dernières secondes (les bilans `mesure` exclus).
+
+        #2617 : un signalement `orphan` (ré-écrit toutes les 12 h pour une
+        entrée non attribuée) compte une fois par chemin, avec sa dernière
+        taille ; les autres actions comptent leurs lignes."""
 
     @abc.abstractmethod
     def last_measure(self, host: str | None) -> list[dict]:
@@ -3739,6 +4071,9 @@ class LotSessions(Domain):
     ACTIONABLE_STATES = ("intake", "build")
     #: note de lot qui retient le réveil (`ameesh work note N "hold: …"`)
     HOLD_PREFIX = "hold:"
+    #: notes du réveil programmé (#2466 : pose, annulation, déclenchement) :
+    #: elles ne changent pas la retenue d'un lot tenu par une note `hold:`
+    WAKE_PREFIX = "wake:"
 
     @abc.abstractmethod
     def switch(self, name: str, owner: str, epoch: int, *, to_lot: str | None,
@@ -3772,10 +4107,11 @@ class LotSessions(Domain):
         puis ancienneté : assignés à lui, en `intake`/`build`, ni prévus après
         `today`, ni en attente d'une décision (demande non lue, jalon de
         décision ouvert), d'un lot bloquant ouvert ou d'une note `hold:`
-        (la dernière note du lot). Chaque ligne : `id`, `title`, `state`,
-        `priority`, `activity_ts` (dernier signe de vie du lot : lot, journal,
-        pointe de branche, courrier sur le lot), `wakes`, `last_wake_ts`,
-        `wake_activity_ts`."""
+        (la dernière note du lot). Une note `wake:` (#2466 : pose ou
+        déclenchement d'un réveil programmé) ne lève pas la retenue. Chaque
+        ligne : `id`, `title`, `state`, `priority`, `activity_ts` (dernier
+        signe de vie du lot : lot, journal, pointe de branche, courrier sur
+        le lot), `wakes`, `last_wake_ts`, `wake_activity_ts`."""
 
     @abc.abstractmethod
     def note_wake(self, name: str, lot: int, activity_ts: float | None) -> dict:
@@ -3783,6 +4119,34 @@ class LotSessions(Domain):
         compte repart à 1 si le lot a vécu depuis le réveil précédent
         (`activity_ts` plus récent que `wake_activity_at`), sinon il croît.
         Rend la ligne."""
+
+    @abc.abstractmethod
+    def due_wakes(self, name: str, now: float, claim_ttl_s: float = 120.0) -> list[dict]:
+        """#2466 : les réveils programmés échus des lots encore ouverts de
+        `name`, par échéance puis priorité : `id`, `title`, `state`,
+        `priority`, `wake_ts`. Un réveil programmé est un rendez-vous
+        explicite : il ne dépend ni de l'état `intake`/`build`, ni d'une note
+        `hold:`, ni d'une décision ouverte — seulement de l'assignation et de
+        l'échéance. Un claim plus récent que `claim_ttl_s` écarte le lot : sa
+        livraison est en cours. Une base d'avant 0466 rend une liste vide."""
+
+    @abc.abstractmethod
+    def claim_wake(self, name: str, lot: int, now: float,
+                   claim_ttl_s: float = 120.0) -> dict | None:
+        """#2466 : réclame le réveil programmé échu du lot (bail de livraison),
+        dans une transaction : `wake_claim_at` est posé et le journal reçoit
+        une ligne `wake: … delivered …` (témoin de la délivrance). Rend
+        `{id, state, title, wake_ts}` ou None si le lot n'a plus de réveil
+        échu, est déjà réclamé, n'est plus assigné à `name` ou est fini.
+        L'échéance n'est pas effacée : `consume_wake` le fera au lancement du
+        tour, un claim non consommé expirant après `claim_ttl_s`."""
+
+    @abc.abstractmethod
+    def consume_wake(self, name: str, lot: int, wake_ts: float) -> bool:
+        """#2466 : consomme le réveil programmé délivré : efface `wake_at` et
+        `wake_claim_at` (une seule fois), **seulement** si l'échéance est
+        encore celle qui a été réclamée (`wake_ts`) et sous claim — une
+        nouvelle échéance posée entre-temps est conservée. Rend False sinon."""
 
     @abc.abstractmethod
     def purge(self, name: str | None = None) -> list[dict]:
@@ -3934,6 +4298,14 @@ class CiResults(Domain):
         """Le dernier relevé de file par dépôt : `{repo, oldest_id, oldest_ts,
         queued, seen_ts}` (les dépôts sans job `queued` ont `oldest_ts` NULL)."""
 
+    @abc.abstractmethod
+    def prune_queue(self, repos: Sequence[str]) -> None:
+        """Retire les relevés de file des dépôts hors du périmètre actif
+        `repos`. Un dépôt sorti de `github.projects` ne doit pas laisser une
+        ligne qui fonderait une alerte de silence perpétuelle sur les autres
+        hôtes (#2957). Un périmètre vide ne purge rien : il ne prouve pas que
+        des dépôts ont été retirés."""
+
     # -- #845 (revue N/P2 2328) : fenêtre et cache du relevé ----------------
     @abc.abstractmethod
     def claim_guard_scan(self, repo: str, *, now: float, window_s: float) -> bool:
@@ -4061,6 +4433,35 @@ class PrevalidationReports(Domain):
 # le stockage d'une connexion
 # --------------------------------------------------------------------------
 
+class GithubWatch(Domain):
+    """#2845: transactional GitHub intake; notifier host only."""
+
+    @abc.abstractmethod
+    def cursor(self, project: str, repo: str) -> float | None:
+        """Last completed scan, absent before bootstrap."""
+
+    @abc.abstractmethod
+    def lock(self, project: str, repo: str, initial: float) -> float:
+        """Create and lock the cursor until commit; return its timestamp."""
+
+    @abc.abstractmethod
+    def remember(self, project: str, repo: str, kind: str, object_id: int,
+                 digest: str) -> bool:
+        """True only for a new object version. Caller holds the cursor lock."""
+
+    @abc.abstractmethod
+    def advance(self, project: str, repo: str, until: float) -> None:
+        """Advance after every mailbox deposit succeeded, never backwards."""
+
+    @abc.abstractmethod
+    def scan(self, project: str, repo: str) -> dict | None:
+        """Incomplete scan window and next page, absent when the scan is complete."""
+
+    @abc.abstractmethod
+    def checkpoint(self, project: str, repo: str, progress: dict | None) -> None:
+        """Persist or clear partial progress atomically with mailbox delivery."""
+
+
 class Storage(abc.ABC):
     """Les domaines du stockage, liés à une connexion ou une transaction."""
 
@@ -4083,6 +4484,7 @@ class Storage(abc.ABC):
     watches: Watches
     events: Events
     mailbox: Mailbox
+    github_watch: GithubWatch
     wakeups: Wakeups
     keys: Keys
     approvals: Approvals

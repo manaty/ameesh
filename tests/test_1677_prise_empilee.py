@@ -16,7 +16,9 @@ import threading
 import time
 from unittest.mock import patch
 
-from ameesh import backlog, storage, sous_utilisation, work
+from ameesh import backlog, plan_git, storage, sous_utilisation, work
+from ameesh import review_designation as rd
+from ameesh import review_designation_pg as pg
 
 from .test_l119_backlog import HEURE, _Base
 
@@ -24,11 +26,34 @@ SHA = "a" * 40
 
 
 class _Prise(_Base):
+    def setUp(self):
+        super().setUp()
+        # #2864 : les auteurs lus par la désignation du dernier gel, tels que
+        # la marque `review-designation` les garde (par lot).
+        self.marques: dict = {}
+
     def lot(self, title, *, app="nexlink", age_s=HEURE, **kw):
         item = work.add(self.db, title=title, app=app, **kw)
         self.db.execute("UPDATE work_items SET created_at = created_at - make_interval("
                         "secs => %s) WHERE id = %s", (age_s, item["id"]))
         return item
+
+    def marque(self, item_id, authors, *, state=rd.WAITING, required=1, sha=SHA):
+        """La marque du dernier gel, avec la lecture d'auteurs de la désignation.
+
+        #2864 : la proposition de relecture lit les auteurs de la plage sur
+        cette marque ; un banc sans désignation réelle la pose explicitement.
+        """
+        freeze = plan_git.latest_freeze(work.milestones(self.db, int(item_id)))
+        self.assertIsNotNone(freeze, "le lot doit être gelé avant sa marque")
+        note = pg._mark_note(
+            int(item_id), int(freeze["id"]), state=state, required=required,
+            reviewers=[], missing=1, why="test : désignation en attente",
+            authors=[dict(row) for row in authors], policy_ref="",
+            sha=str(freeze.get("sha") or sha))
+        storage.of(self.db).work.note(int(item_id), "qa", note, "test")
+        self.marques[int(item_id)] = [dict(row) for row in authors]
+        return freeze
 
     def take(self, **kw):
         kw.setdefault("orchestras", ["orchestrateur"])
@@ -65,13 +90,22 @@ class _Prise(_Base):
                     if r["name"] == name)
 
     def juge(self, item_id, *, sha=SHA, verdict="ok"):
-        """Un verdict déclaré sur le lot (sans gel, pour le cas B2)."""
-        return work.milestone(self.db, item_id, "verdict", verdict=verdict, sha=sha,
-                              actor="test")
+        """Un verdict déclaré sur le lot (sans gel, pour le cas B2).
+
+        #2962 : un SHA complet doit se résoudre, même sur un lot jamais gelé ;
+        ce témoin simule le dépôt qui porte le commit, le cas B2 restant celui
+        d'un verdict sans gel (le sujet est la prise, pas la tête relue)."""
+        with patch("ameesh.freeze_checks.commit_in", return_value=sha):
+            return work.milestone(self.db, item_id, "verdict", verdict=verdict,
+                                  sha=sha, actor="test")
 
     def regeler(self, item_id, sha):
-        """Un nouveau gel, plus récent que le précédent (B1)."""
-        return work.milestone(self.db, item_id, "frozen", sha=sha, actor="test")
+        """Un nouveau gel, plus récent que le précédent (B1), avec la marque de
+        désignation du nouveau gel (#2864 : sans elle, aucune proposition)."""
+        row = work.milestone(self.db, item_id, "frozen", sha=sha, actor="test")
+        self.marque(item_id, self.marques.get(
+            int(item_id), [{"name": "auteur", "family": "claude"}]))
+        return row
 
 
 class DependanceNonFusionneeTest(_Prise):
@@ -116,7 +150,7 @@ class DependanceNonFusionneeTest(_Prise):
         juge = self.lot("amont juge", assignee="human:proprio")
         self.db.execute("UPDATE work_items SET state = 'qa', branch = 'lot/juge'"
                         " WHERE id = %s", (juge["id"],))
-        self.juge(juge["id"], sha="")           # ok qui ne nomme aucune tête (B2)
+        self.juge(juge["id"])                   # ok sur un lot jamais gelé (B2)
         bloque = self.amont("blocked", branch="lot/bloque")
         empile = self.bloque(sans, title="empile trois qa", priority=3)
         for amont in (juge, bloque):
@@ -164,7 +198,7 @@ class PropositionTest(_Prise):
         self.agent(name, harness=harness, team=team)
 
     def qa(self, title, *, verdict=None, author="auteur", branch="lot/qa", sha=SHA,
-           app="nexlink"):
+           app="nexlink", author_family="claude"):
         item = self.lot(title, assignee=author, app=app)
         self.db.execute("UPDATE work_items SET state = 'qa', branch = %s"
                         " WHERE id = %s", (branch, item["id"]))
@@ -172,6 +206,7 @@ class PropositionTest(_Prise):
         if verdict is not None:
             work.milestone(self.db, item["id"], "verdict", verdict=verdict, sha=sha,
                            actor="test")
+        self.marque(item["id"], [{"name": author, "family": author_family}], sha=sha)
         return item
 
     def harnais_vivant(self, name, harness):
@@ -329,7 +364,7 @@ class PropositionTest(_Prise):
         à un Claude, pas à lui."""
         self.auteur()
         self.harnais_vivant("auteur", "codex")
-        lot = self.qa("propre lot", branch="lot/propre")
+        lot = self.qa("propre lot", branch="lot/propre", author_family="codex")
 
         self.assertEqual(self.take(), [], "l'auteur ne relit pas son propre lot")
         self.assertEqual(self.mails("auteur"), [])

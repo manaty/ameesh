@@ -99,10 +99,15 @@ Merci de votre intérêt. Quelques règles avant d'ouvrir une demande de fusion 
   le fichier, avec `ameesh work migration <lot>` (après un `git fetch`) ; le
   fichier s'appelle `src/ameesh/migrations/<numéro réservé>_<nom>.sql`. Une
   contribution sans lot prend le numéro suivant le plus haut de `main` et de
-  toutes les PR ouvertes. Deux migrations de même numéro font échouer la
-  suite unitaire (`tests/test_l122_numeros_de_migration.py`) : la dernière
-  venue se renumérote. Une migration ne fait qu'ajouter, sauf version majeure
-  (voir ci-dessous).
+  toutes les PR ouvertes. Un numéro exact (`--number N`) ne lit que la
+  branche cible : une branche non fusionnée qui porte déjà N ne bloque pas
+  (elle sera renumérotée à sa fusion, #2400). La cible est celle du lot, sinon
+  celle de son projet, sinon `git config ameesh.target` ; sans cible déclarée
+  la commande refuse, elle ne lit jamais `origin/HEAD` (#2660). Deux
+  migrations de même numéro
+  font échouer la suite unitaire (`tests/test_l122_numeros_de_migration.py`) :
+  la dernière venue se renumérote. Une migration ne fait qu'ajouter, sauf
+  version majeure (voir ci-dessous).
 - **En-tête de licence** `SPDX-License-Identifier: AGPL-3.0-only` en tête des
   nouveaux fichiers source.
 

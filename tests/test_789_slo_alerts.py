@@ -12,6 +12,7 @@ from __future__ import annotations
 import datetime
 import json
 import os
+import shutil
 import subprocess
 import tempfile
 import time
@@ -19,8 +20,8 @@ import unittest
 from unittest import mock
 
 from ameesh import (alert_briefs, decisions, exploitation, lot_class, merge_queue,
-                    notify, planned_waits, registry, stagnation, storage, work,
-                    work_dependencies)
+                    notify, packet_guard, planned_waits, registry, slo, stagnation,
+                    storage, work, work_dependencies)
 from ameesh.storage.postgres.operations import Operations
 
 from .support import FAKEBIN, PgTestCase
@@ -36,11 +37,24 @@ def _seuils(**kw):
     return out
 
 
+#: #2739 : les dépôts du banc doivent committer sous une identité d'agent ; le
+#: runner impose `ameesh-dev3` dans l'environnement, qui écraserait la config
+#: locale du dépôt. Sans identité d'agent, la porte ne peut pas attribuer la
+#: plage gelée et refuse en échec fermé.
+_GIT_DEV1 = dict(os.environ, GIT_AUTHOR_NAME="dev1",
+                 GIT_AUTHOR_EMAIL="dev1@ameesh.invalid",
+                 GIT_COMMITTER_NAME="dev1", GIT_COMMITTER_EMAIL="dev1@ameesh.invalid")
+
+
 class _Base(PgTestCase):
     def setUp(self):
         super().setUp()
         for name in ("orch", "dev1", "bureau", "auditeur"):
             registry.upsert(self.db, name, harness="claude", host=self.cfg.host)
+        # #3036 : un brief n'est plus déposé à un destinataire sans bail
+        # vivant ; ces agents simulent un runner qui les tient (régime normal).
+        self.db.execute("UPDATE agent_registry SET lease_owner = 'runner-' || name,"
+                        " lease_expires_at = now() + interval '1 hour'")
         # le lot reste en intake : « prêt, pas démarré » — l'étape qui court
         self.lot = work.add(self.db, title="un lot SLO", assignee="dev1")
         self.now = time.time()
@@ -113,6 +127,21 @@ class _Base(PgTestCase):
 
 
 class AlerteTest(_Base):
+    def test_intake_reporte_ne_reprend_pas_les_jours_avant_le_debut(self):
+        from ameesh.plan import day_start_ts
+        self.age(8 * 24 * HEURE)
+        self.db.execute("UPDATE work_items SET planned_start = '2026-10-19' WHERE id = %s",
+                        (self.lot["id"],))
+        planned = day_start_ts("2026-10-19")
+        # Une origine ancienne, comme les lots reportés #114/#65/#313.
+        self.db.execute("UPDATE work_items SET created_at = to_timestamp(%s) WHERE id = %s",
+                        (planned - 8 * 24 * HEURE, self.lot["id"]))
+        for offset, levels in ((-1, []), (180, []), (3600, [1]), (10800, [3])):
+            with self.subTest(offset=offset):
+                self.now = planned + offset
+                alerts = [a for a in self.slo() if a["step"] == "intake_started"]
+                self.assertEqual([a["level"] for a in alerts], levels)
+
     def test_niveau_1_assigne(self):
         self.age(1.5 * HEURE)
         alerts = self.slo()
@@ -173,6 +202,43 @@ class AlerteTest(_Base):
         self.age(4 * HEURE)
         self.assertEqual(self.slo(), [])
 
+    def test_bloquant_fusionne_le_delai_part_de_la_levee(self):
+        # #2551 : #2198/#2498 — un lot assigné depuis 13 h mais retenu par
+        # #2184 ne doit pas escalader au niveau 3 à la seconde où le bloqueur
+        # fusionne : la mesure d'intake part de la fusion.
+        bloqueur = work.add(self.db, title="bloqueur", assignee="human:proprio")
+        work_dependencies.add(self.db, self.lot["id"], bloqueur["id"], actor="test")
+        self.age(13 * HEURE)
+        self.assertEqual(self.slo(), [])
+        self.db.execute("UPDATE work_items SET state = 'merged' WHERE id = %s",
+                        (bloqueur["id"],))
+        merged = time.time()
+        self.now = merged + 60
+        self.assertEqual(self.slo(), [])
+        self.now = merged + 1.5 * HEURE
+        alerts = self.slo()
+        self.assertEqual([(a["step"], a["level"], a["targets"]) for a in alerts],
+                         [("intake_started", 1, ["assignee"])])
+        self.assertAlmostEqual(alerts[0]["since"], merged, delta=5)
+        self.assertAlmostEqual(alerts[0]["value"], 1800, delta=5)
+
+    def test_bloquant_clos_le_delai_part_de_la_cloture(self):
+        # #2551 : la fermeture d'un prérequis (abandon, remplacement) le rend
+        # non bloquant, comme la fusion : le délai part de sa clôture.
+        bloqueur = work.add(self.db, title="bloqueur", assignee="human:proprio")
+        work_dependencies.add(self.db, self.lot["id"], bloqueur["id"], actor="test")
+        self.age(13 * HEURE)
+        self.assertEqual(self.slo(), [])
+        work.close(self.db, bloqueur["id"], abandoned=True, actor="test")
+        closed = time.time()
+        self.now = closed + 60
+        self.assertEqual(self.slo(), [])
+        self.now = closed + 1.5 * HEURE
+        alerts = self.slo()
+        self.assertEqual([(a["step"], a["level"]) for a in alerts],
+                         [("intake_started", 1)])
+        self.assertAlmostEqual(alerts[0]["since"], closed, delta=5)
+
     def test_etapes_tenues_puis_verdict_recent(self):
         # créé il y a 4 h, démarré 30 min plus tard, verdict ok il y a 5 min :
         # aucune étape en dépassement, seule la fusion reste à faire
@@ -201,23 +267,40 @@ class ReviewGateRepositoryTest(_Base):
         self.addCleanup(subprocess.run, ["rm", "-rf", base])
         repo = os.path.join(base, "repo")
         subprocess.run(["git", "init", "-q", "-b", "main", repo], check=True)
-        for key, value in (("user.email", "t@t"), ("user.name", "t")):
+        # #2739 : le committer doit être un agent pour que la porte lise la
+        # plage gelée sans inventer d'auteur ; l'assigné du lot est `dev1`.
+        for key, value in (("user.email", "dev1@ameesh.invalid"), ("user.name", "dev1")):
             subprocess.run(["git", "-C", repo, "config", key, value], check=True)
         os.makedirs(os.path.join(repo, "docs"))
         with open(os.path.join(repo, "docs", "notes.md"), "w") as fh:
             fh.write("base\n")
         subprocess.run(["git", "-C", repo, "add", "."], check=True)
-        subprocess.run(["git", "-C", repo, "commit", "-q", "-m", "base"], check=True)
+        subprocess.run(["git", "-C", repo, "commit", "-q", "-m", "base"], check=True,
+                       env=_GIT_DEV1)
         subprocess.run(["git", "-C", repo, "checkout", "-q", "-b", "lot"], check=True)
         os.makedirs(os.path.join(repo, "src", "ameesh"))
         with open(os.path.join(repo, "src", "ameesh", "db.py"), "w") as fh:
             fh.write("# critique\n")
         subprocess.run(["git", "-C", repo, "add", "."], check=True)
-        subprocess.run(["git", "-C", repo, "commit", "-q", "-m", "gel"], check=True)
+        subprocess.run(["git", "-C", repo, "commit", "-q", "-m", "gel"], check=True,
+                       env=_GIT_DEV1)
         sha = subprocess.run(["git", "-C", repo, "rev-parse", "HEAD"],
                              check=True, capture_output=True, text=True).stdout.strip()
         subprocess.run(["git", "-C", repo, "checkout", "-q", "main"], check=True)
         return repo, sha
+
+    def _freeze_and_qa(self, lot, sha, *, verdict_s=3000.0):
+        """Le lot passe en qa, gelé sur `sha`, avec un verdict `ok` ancien."""
+        work.move(self.db, lot["id"], "build")
+        work.move(self.db, lot["id"], "qa")
+        self.db.execute(
+            "INSERT INTO work_item_milestones (work_item_id, kind, at, sha, actor)"
+            " VALUES (%s, 'frozen', now() - make_interval(secs => 4000), %s, 'dev1')",
+            (lot["id"], sha))
+        self.db.execute(
+            "INSERT INTO work_item_milestones (work_item_id, kind, at, sha, actor, verdict)"
+            " VALUES (%s, 'verdict', now() - make_interval(secs => %s), %s, 'cx', 'ok')",
+            (lot["id"], float(verdict_s), sha))
 
     def test_depot_du_gel_retrouve_par_un_autre_agent_local(self):
         """Le dépôt n'est pas dans le radar de l'hôte : le dossier de travail
@@ -228,7 +311,52 @@ class ReviewGateRepositoryTest(_Base):
         item = work.get(self.db, self.lot["id"])
         self.assertFalse((registry.get(self.db, "dev1") or {}).get("cwd"))
         self.assertEqual(lot_class.repo_for_freeze(self.db, self.cfg, item, sha),
-                         os.path.realpath(repo))
+                         (os.path.realpath(repo), sha))
+
+    def test_le_gel_abrege_est_resolu_avant_la_classe(self):
+        """#2564 : `repo_for_freeze` rend le SHA complet, et `of_lot` reçoit ce
+        SHA — jamais le préfixe saisi dans le jalon de gel."""
+        repo, sha = self._frozen_repo()
+        registry.upsert(self.db, "orch", harness="claude", host=self.cfg.host,
+                        cwd=repo)
+        registry.upsert(self.db, "cx", harness="codex", host=self.cfg.host)
+        item = work.get(self.db, self.lot["id"])
+        self.assertEqual(lot_class.repo_for_freeze(self.db, self.cfg, item, sha[:12]),
+                         (os.path.realpath(repo), sha))
+        marks = [{"kind": "frozen", "sha": sha[:12], "actor": "dev1", "at_ts": 1},
+                 {"kind": "verdict", "sha": sha[:12], "actor": "cx", "verdict": "ok",
+                  "at_ts": 2}]
+        with mock.patch("ameesh.lot_class.of_lot", wraps=lot_class.of_lot) as classe:
+            gate = merge_queue.review_gate_for_item(self.db, self.cfg, item, marks)
+        self.assertIsNotNone(gate)
+        self.assertEqual(classe.call_args.kwargs["head"], sha)
+
+    def test_une_passe_sur_deux_lots_lit_le_registre_une_fois(self):
+        """#2564 : la porte est interrogée pour chaque lot en attente de
+        fusion, mais `registry.overview` n'est lu qu'une fois par passe."""
+        repo, sha = self._frozen_repo()
+        registry.upsert(self.db, "orch", harness="claude", host=self.cfg.host,
+                        cwd=repo)
+        registry.upsert(self.db, "cx", harness="codex", host=self.cfg.host)
+        lots = [self.lot, work.add(self.db, title="un second lot SLO",
+                                   assignee="dev1")]
+        for lot in lots:
+            self._freeze_and_qa(lot, sha)
+        self.now = time.time()
+        listing = storage.of(self.db).operations.listing()
+        calls = []
+        real = registry.overview
+
+        def counting(db):
+            calls.append(db)
+            return real(db)
+
+        with mock.patch("ameesh.registry.overview", side_effect=counting), \
+                mock.patch("ameesh.exploitation._review_gate_open",
+                           wraps=exploitation._review_gate_open) as gate_open:
+            exploitation._slo_breaches(self.cfg, self.db, listing, now=self.now)
+        self.assertEqual(gate_open.call_count, 2)
+        self.assertEqual(len(calls), 1)
 
     def test_un_avis_sur_chemin_critique_ne_fait_pas_le_go(self):
         """Un avis indépendant sur `db.py` ne suffit pas : la porte exige deux
@@ -268,16 +396,28 @@ class ReviewGateRepositoryTest(_Base):
         subprocess.run(["git", "-C", repo, "checkout", "-q", "lot"], check=True)
         with open(os.path.join(repo, "docs", "notes.md"), "a") as fh:
             fh.write("suite\n")
-        subprocess.run(["git", "-C", repo, "commit", "-qam", "notes"], check=True)
+        subprocess.run(["git", "-C", repo, "commit", "-qam", "notes"], check=True,
+                       env=_GIT_DEV1)
         sha = subprocess.run(["git", "-C", repo, "rev-parse", "HEAD"],
                              check=True, capture_output=True, text=True).stdout.strip()
         registry.upsert(self.db, "orch", harness="claude", host=self.cfg.host,
                         cwd=repo)
         registry.upsert(self.db, "cx", harness="codex", host=self.cfg.host)
         row = dict(work.get(self.db, self.lot["id"]), branch_target="main")
+        # #2928 : un avis sensible ne compte que sur son reçu exact, lu sur le
+        # vrai jalon ; l'avis est donc posé en base avant d'être relu.
+        mark = work.milestone(self.db, self.lot["id"], "verdict", sha=sha,
+                              actor="cx", verdict="ok", repo=repo)
+        self.db.execute(
+            "INSERT INTO provenance_receipts"
+            " (subject, sha, actor, session, turn, harness, work_item_id)"
+            " VALUES (%s, %s, %s, %s, %s, %s, %s)"
+            " ON CONFLICT (subject) DO NOTHING",
+            ("milestone:%d" % int(mark["id"]), sha, "cx", "s-codex", "t",
+             "codex", self.lot["id"]))
         marks = [{"kind": "frozen", "sha": sha, "actor": "dev1", "at_ts": 1},
-                 {"kind": "verdict", "sha": sha, "actor": "cx", "verdict": "ok",
-                  "at_ts": 2}]
+                 {"kind": "verdict", "id": int(mark["id"]), "sha": sha,
+                  "actor": "cx", "verdict": "ok", "at_ts": 2}]
         gate = merge_queue.review_gate_for_item(self.db, self.cfg, row, marks)
         self.assertIsNotNone(gate)
         self.assertEqual(gate["required"], 1)
@@ -286,9 +426,17 @@ class ReviewGateRepositoryTest(_Base):
 
 class PaquetTest(_Base):
     """#2335 : un paquet en cours est une attente planifiée, et l'horloge
-    GO → fusion ne part qu'au premier créneau de paquet après le GO."""
+    GO → fusion ne part qu'au premier créneau de paquet après le GO. #2919 :
+    cible p80 du paquet sur le chemin normal, aucune escalade propre pour une
+    unité de paquet ouvert."""
 
     GO = datetime.datetime(2026, 10, 17, 23, 5, tzinfo=datetime.timezone.utc).timestamp()
+
+    def setUp(self):
+        super().setUp()
+        # Le banc ne vide pas `ci_runs` ; chaque témoin de p80 part d'une
+        # mesure propre (les runs d'un test ne comptent pas dans le suivant).
+        self.db.execute("TRUNCATE ci_test_failures, ci_runs")
 
     def test_lot_dans_un_paquet_ouvert_est_une_attente_planifiee(self):
         self.qa_at(self.GO)
@@ -303,6 +451,79 @@ class PaquetTest(_Base):
         self.assertIn("packet merge", info["waiting"]["label"])
         self.assertIn("packet merge", work_dependencies.wait_label(info["planned_wait"]))
         self.assertIsNone(info["stale"])
+
+    def test_porteur_sans_liste_lie_par_les_trailers(self):
+        # #2599 : le corps des porteurs h-2300/h-0100 n'a pas la liste
+        # « #N <tête> » ; les trailers des commits de composition lient
+        # l'unité au paquet, et le SLO est tu.
+        self.qa_at(self.GO)
+        carrier = self.packet(body="aucune liste d'unités dans ce corps")
+        with mock.patch.object(planned_waits, "packet_attachments",
+                               return_value={carrier["id"]: {self.lot["id"]}}):
+            self.now = self.GO + 75 * 60
+            self.assertEqual(self.slo(), [])
+            rows = storage.of(self.db).operations.open_lots_activity(None)
+            described = stagnation.describe(self.db, rows, now=self.now, open_items=rows)
+        info = described[self.lot["id"]]
+        self.assertEqual((info["planned_wait"] or {}).get("what"), "packet")
+        self.assertIn("packet merge", info["waiting"]["label"])
+        self.assertIsNone(info["stale"])
+
+    def test_membre_d_un_vehicule_ouvert_ne_leve_pas_le_slo_et_revient_s_il_est_retire(self):
+        # #2837 : la composition se lit sur un clone du registre quand l'hôte
+        # n'a pas les réglages radar ; l'unité d'un véhicule ouvert est tue,
+        # et une recomposition qui la retire rend l'alerte.
+        self.qa_at(self.GO)
+        repo = tempfile.mkdtemp(prefix="paquet-2837-")
+        self.addCleanup(shutil.rmtree, repo, True)
+
+        def git(*args):
+            return subprocess.run(
+                ["git", "-C", repo, *args], check=True, capture_output=True,
+                text=True, env=_GIT_DEV1).stdout.strip()
+
+        git("init", "-q", "-b", "main")
+        with open(os.path.join(repo, "README"), "w", encoding="utf-8") as fh:
+            fh.write("base\n")
+        git("add", "README")
+        git("commit", "-q", "-m", "base")
+        git("checkout", "-q", "-b", "integration/paquet-test")
+        with open(os.path.join(repo, "note"), "w", encoding="utf-8") as fh:
+            fh.write("member\n")
+        git("add", "note")
+        git("commit", "-q", "-m", "vehicule : #%d abcdef0\n\nameesh-work: %d"
+            % (self.lot["id"], self.lot["id"]))
+        carrier = self.packet(body="composition sans liste",
+                              head=git("rev-parse", "HEAD"))
+        registry.upsert(self.db, "dev1", harness="claude", host=self.cfg.host,
+                        cwd=repo)
+        self.now = self.GO + 125 * 60
+        self.assertEqual(self.slo(), [])
+        # Recomposition sans le lot : le trailer disparaît, l'alerte revient.
+        git("checkout", "-q", "-b", "observed", "main")
+        with open(os.path.join(repo, "note"), "w", encoding="utf-8") as fh:
+            fh.write("other\n")
+        git("add", "note")
+        git("commit", "-q", "-m",
+            "vehicule : #999999 abcdef0\n\nameesh-work: 999999")
+        self.db.execute("UPDATE work_items SET branch_head = %s WHERE id = %s",
+                        (git("rev-parse", "HEAD"), carrier["id"]))
+        self.assertEqual([a["lot"] for a in self.slo()], [self.lot["id"]])
+
+    def test_lot_exclu_en_prose_reste_signale_meme_avec_trailers(self):
+        # #2599 : un lot cité en prose n'est pas attaché ; même quand la
+        # lecture des trailers rend d'autres unités, son alerte reste due.
+        self.qa_at(self.GO)
+        exclu = work.add(self.db, title="exclu du paquet", assignee="dev1")
+        self.qa_at(self.GO, lot=exclu)
+        carrier = self.packet(body="paquet ; #%d exclu (verdict manquant)"
+                              % exclu["id"])
+        with mock.patch.object(planned_waits, "packet_attachments",
+                               return_value={carrier["id"]: {self.lot["id"]}}):
+            self.now = self.GO + 125 * 60
+            alerts = self.slo()
+        self.assertEqual([a["lot"] for a in alerts], [exclu["id"]], alerts)
+        self.assertEqual(alerts[0]["step"], "verdict_merge")
 
     def test_lot_exclu_en_prose_reste_signale(self):
         # B1 (relecture dev7) : un lot seulement cité (« exclu », « garder »)
@@ -364,6 +585,128 @@ class PaquetTest(_Base):
             None, self.GO, "ameesh", observed=True), self.GO + 55 * 60)
         self.assertIsNone(exploitation._packet_slot(
             None, self.GO, "ameesh", observed=False))
+
+    def _ci_run(self, minutes, *, run_id):
+        """Une suite complète conclue autour de `GO`, pour le p80 mesuré."""
+        self.db.execute(
+            "INSERT INTO ci_runs (repo, run_id, head_sha, branch, event, base,"
+            " status, url, first_seen_at, concluded_at)"
+            " VALUES ('manaty/ameesh', %s, %s, 'integration/paquet-test', 'push',"
+            " 'main', 'success', 'u', to_timestamp(%s), to_timestamp(%s))",
+            (run_id, "0" * 40, self.GO - 600.0,
+             self.GO - 600.0 + float(minutes) * 60.0))
+
+    def test_unite_de_paquet_mesuree_contre_le_p80_sans_alerte(self):
+        # #2919 : la cible est le p80 réel de la CI du paquet (7 jours) ; la
+        # ligne est mesurée, jamais alertée (aucune cible d'escalade propre).
+        self.qa_at(self.GO)
+        self.packet(body="unités : #%d @ abcdef0" % self.lot["id"])
+        for run_id, minutes in enumerate((10, 20, 30, 40), start=1):
+            self._ci_run(minutes, run_id=run_id)
+        self.now = self.GO + 75 * 60
+        calls = []
+        real = slo.lot_steps
+
+        def spy(*args, **kwargs):
+            calls.append(kwargs)
+            return real(*args, **kwargs)
+
+        with mock.patch.object(exploitation, "_project_github",
+                               return_value="manaty/ameesh"), \
+                mock.patch.object(slo, "lot_steps", side_effect=spy):
+            self.assertEqual(self.slo(), [])
+        packet_calls = [kw for kw in calls if kw.get("packet")]
+        self.assertEqual(len(packet_calls), 1, calls)
+        # [600, 1200, 1800, 2400] : p80 interpolé à 2040 s.
+        self.assertEqual(packet_calls[0]["p80_s"], 2040.0)
+
+    def test_chemin_normal_p1_p80_40_min_pas_d_alerte_puis_niveau_1(self):
+        # Témoin du N auditeur (#2919) : P1, GO courant hors paquet ouvert,
+        # p80 40 min ; 20 min après le créneau → tenu, 41 min → niveau 1.
+        self.qa_at(self.GO)
+        self.db.execute("UPDATE work_items SET priority = 1 WHERE id = %s",
+                        (self.lot["id"],))
+        # Un porteur ouvert observe la cadence : le créneau est 00:00 ; le lot
+        # n'y est pas, il garde donc l'escalade du chemin normal.
+        self.packet(body="unités : #999999 @ cafebabe")
+        for run_id, minutes in enumerate((20, 40, 40, 40), start=1):
+            self._ci_run(minutes, run_id=run_id)
+        with mock.patch.object(exploitation, "_project_github",
+                               return_value="manaty/ameesh"):
+            self.now = self.GO + 75 * 60          # 00:20, 20 min après le créneau
+            self.assertEqual(self.slo(), [])
+            self.now = self.GO + 96 * 60          # 00:41, 41 min après le créneau
+            alerts = self.slo()
+        self.assertEqual([(a["step"], a["level"], a["threshold"]) for a in alerts],
+                         [("verdict_merge", 1, 2400)])
+        self.assertIn("pilot", alerts[0]["targets"])
+
+    def test_chemin_normal_p1_sans_mesure_garde_le_repli_30_min(self):
+        # Témoin cx2 (#15024) : P1 normal sans mesure CI → repli 30 min, pas
+        # la cible P1 de 15 min (réservée à une exception déclarée).
+        self.qa_at(self.GO)
+        self.db.execute("UPDATE work_items SET priority = 1 WHERE id = %s",
+                        (self.lot["id"],))
+        self.packet(body="unités : #999999 @ cafebabe")
+        with mock.patch.object(exploitation, "_project_github",
+                               return_value="manaty/ameesh"):
+            self.now = self.GO + 75 * 60          # 00:20, 20 min après le créneau
+            self.assertEqual(self.slo(), [])
+            self.now = self.GO + 96 * 60          # 00:41, 41 min après le créneau
+            alerts = self.slo()
+        self.assertEqual([(a["step"], a["level"], a["threshold"]) for a in alerts],
+                         [("verdict_merge", 1, 1800)])
+        self.assertIn("pilot", alerts[0]["targets"])
+
+    def test_exception_p1_garde_15_min_depuis_le_go(self):
+        # Hors paquet déclaré : la cible de table (15 min en P1) court depuis
+        # le GO, sans le report au créneau de paquet.
+        self.qa_at(self.GO)
+        self.db.execute("UPDATE work_items SET priority = 1 WHERE id = %s",
+                        (self.lot["id"],))
+        head = "c" * 40
+        self.db.execute("UPDATE work_items SET branch_head = %s WHERE id = %s",
+                        (head, self.lot["id"]))
+        packet_guard.declare(self.db, self.lot["id"], "unblock",
+                             "CI bloquée", head, actor="dev1")
+        self.now = self.GO + 16 * 60
+        alerts = self.slo()
+        self.assertEqual([(a["step"], a["level"], a["threshold"]) for a in alerts],
+                         [("verdict_merge", 1, 900)])
+        self.assertEqual(alerts[0]["since"], self.GO)
+        self.assertEqual(alerts[0]["value"], 60)
+
+    def test_exception_declaree_sort_du_paquet_et_alerte(self):
+        # #2919 : une exception `packet-exception incident` pour la tête
+        # courante ramène la cible de la table (30 min) et l'escalade.
+        self.qa_at(self.GO)
+        head = "a" * 40
+        self.db.execute("UPDATE work_items SET branch_head = %s WHERE id = %s",
+                        (head, self.lot["id"]))
+        self.packet(body="unités : #%d @ %s" % (self.lot["id"], head))
+        packet_guard.declare(self.db, self.lot["id"], "incident",
+                             "cible rouge", head, actor="dev1")
+        self.now = self.GO + 50 * 60
+        alerts = self.slo()
+        self.assertEqual([(a["step"], a["level"], a["targets"]) for a in alerts],
+                         [("verdict_merge", 1, ["assignee"])])
+        self.assertIsNone(alerts[0]["waiting"])
+        self.assertEqual(alerts[0]["threshold"], 1800)
+
+    def test_exception_d_une_autre_tete_ne_sort_pas_du_paquet(self):
+        # Une exception ne couvre que sa tête : le nouveau gel reste dans le
+        # paquet, mesuré au p80 et sans alerte.
+        self.qa_at(self.GO)
+        head = "b" * 40
+        self.db.execute("UPDATE work_items SET branch_head = %s WHERE id = %s",
+                        (head, self.lot["id"]))
+        self.packet(body="unités : #%d @ %s" % (self.lot["id"], head))
+        packet_guard.declare(self.db, self.lot["id"], "incident",
+                             "ancienne tête", "a" * 40, actor="dev1")
+        self.now = self.GO + 125 * 60
+        with mock.patch.object(exploitation, "_project_github",
+                               return_value="manaty/ameesh"):
+            self.assertEqual(self.slo(), [])
 
 
 class BriefsTest(_Base):
@@ -427,6 +770,38 @@ class AttentePorteurTest(_Base):
             self.assertIn("merge vehicle/package", text)
             self.assertIn("push the pilot/composer", text)
             self.assertNotIn("reassign it now", text)
+
+    def test_fusion_canon_vise_le_bureau(self):
+        """#2511 : une branche `canon/…` cible manaty/home, qu'un paquet ameesh
+        ne porte pas ; l'alerte va au bureau qui fusionne, pas au pilote."""
+        self.qa(verdict_s=50 * 60)
+        work.set_branch(self.db, self.lot["id"], "canon/2511-test")
+        alerts = self.slo()
+        self.assertEqual([(a["step"], a["level"], a["targets"]) for a in alerts],
+                         [("verdict_merge", 1, ["bureau"])])
+        alert = alerts[0]
+        self.assertEqual((alert["waiting"] or {}).get("what"), "merge")
+        self.assertTrue((alert["waiting"] or {}).get("canon"))
+        out = self.briefs(alert)
+        self.assertEqual(sorted(out), ["bureau"])
+        self.assertIn("merge it directly", out["bureau"])
+        self.assertIn("manaty/home", out["bureau"])
+        self.assertNotIn("push the pilot/composer", out["bureau"])
+        self.assertNotIn("include it in the next package", out["bureau"])
+
+    def test_fusion_canon_niveau_3_bureau_et_auditeur(self):
+        """#2511 : au triple, le bureau fusionne (l'auditeur veille) ; le
+        composeur de paquets ameesh n'est plus nommé."""
+        self.qa(verdict_s=100 * 60)
+        work.set_branch(self.db, self.lot["id"], "canon/2511-test")
+        alerts = self.slo()
+        self.assertEqual([(a["level"], a["targets"]) for a in alerts],
+                         [(3, ["bureau", "auditeur"])])
+        out = self.briefs(alerts[0])
+        self.assertEqual(sorted(out), ["auditeur", "bureau"])
+        for text in out.values():
+            self.assertIn("merge it directly", text)
+            self.assertNotIn("push the pilot/composer", text)
 
     def test_lot_bloque_vise_le_pilote(self):
         self.qa(verdict_s=50 * 60)
@@ -560,6 +935,63 @@ def stagnation_wait(db, lot, now):
     return stagnation.describe(db, [row], now=now)[int(lot["id"])]["planned_wait"]
 
 
+class RetourAttenteHumaineTest(_Base):
+    """#2916 : au retour en intake après une décision owner, le délai intake
+    repart de ce retour. Les quatre alertes de niveau 3 du 21/10 venaient de
+    lots sortis de `waiting_human` : leur porteur reprenait le travail, une
+    réattribution aurait cassé ce tour."""
+
+    def answer_after_two_days(self):
+        """Le lot attend une décision owner 2 jours, puis elle est rendue."""
+        held_s = 2 * 24 * HEURE
+        self.age(held_s)
+        view = decisions.ask(self.cfg, self.db, requester="dev1",
+                             question="Quel critère pour la porte des avis ?",
+                             options=["a=union", "b=par auteur"],
+                             lot=str(self.lot["id"]))
+        self.assertEqual(work.get(self.db, self.lot["id"])["state"], "waiting_human")
+        # la demande a tenu le lot depuis son début (journal)
+        self.db.execute(
+            "UPDATE work_item_events SET created_at = now() - make_interval(secs => %s)"
+            " WHERE work_item_id = %s AND state = 'waiting_human'",
+            (float(held_s) - 60.0, self.lot["id"]))
+        result = decisions.answer(self.cfg, self.db, view["id"], "a",
+                                 human="human:alice", channel="cli")
+        self.assertEqual(work.get(self.db, self.lot["id"])["state"], "intake")
+        self.assertEqual(result["lot"]["state"], "intake")
+        return time.time()
+
+    def test_retour_en_intake_repart_de_la_decision(self):
+        answered = self.answer_after_two_days()
+        for offset, levels in ((300, []), (3660, [1])):
+            with self.subTest(offset=offset):
+                self.now = answered + offset
+                alerts = [a for a in self.slo() if a["step"] == "intake_started"]
+                self.assertEqual([a["level"] for a in alerts], levels)
+
+    def test_hold_de_pilote_repart_de_la_levee(self):
+        # #2916/#1225 : le cas réel nexlink #1225 — un lot parqué deux jours
+        # sous un hold de pilote ne demande pas de réattribution à la levée.
+        self.age(2 * 24 * HEURE)
+        work.note(self.db, self.lot["id"], "hold: attente des gestes owner",
+                  actor="human:pilote")
+        # la retenue date du début du lot (journal)
+        self.db.execute(
+            "UPDATE work_item_events SET created_at = now() - make_interval(secs => %s)"
+            " WHERE work_item_id = %s AND note LIKE 'hold:%%'",
+            (2 * 24 * HEURE - 60.0, self.lot["id"]))
+        self.now = time.time()
+        self.assertEqual([a for a in self.slo() if a["step"] == "intake_started"], [])
+        lifted = time.time()
+        work.note(self.db, self.lot["id"], "unhold: gestes owner faits",
+                  actor="human:pilote")
+        for offset, levels in ((300, []), (3660, [1])):
+            with self.subTest(offset=offset):
+                self.now = lifted + offset
+                alerts = [a for a in self.slo() if a["step"] == "intake_started"]
+                self.assertEqual([a["level"] for a in alerts], levels)
+
+
 class NotifyLivreTest(_Base):
     """B1 (#1035 R1) : la livraison RÉELLE par le Notifier — depuis #2395,
     aucun `slo_breach` n'est poussé à l'owner (canon §9, décision owner 18/10),
@@ -579,7 +1011,11 @@ class NotifyLivreTest(_Base):
             self.cfg, notify.parse_config(raw), None, log=self.logs.append,
             clock=lambda: self.now,
             sender=notify.Sender(env={
+                # #3042 : le canal desktop suit l'OS ; le faux binaire doit
+                # couvrir les deux backends du banc (Linux notify-send, macOS
+                # osascript), qui journalisent tous deux argv dans `desk`.
                 "AMEESH_NOTIFY_SEND_BIN": FAKE_NOTIFY_SEND,
+                "AMEESH_OSASCRIPT_BIN": FAKE_NOTIFY_SEND,
                 "AMEESH_FAKE_NOTIFY_LOG": self.desk,
                 "PATH": os.environ.get("PATH", "")}))
 

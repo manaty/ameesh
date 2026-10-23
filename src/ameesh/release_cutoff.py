@@ -55,6 +55,17 @@ SCHEMA = "ameesh-release-cutoff/1"
 WINDOW_S = 1800.0
 #: default timeout of the whole staging sequence
 STAGING_TIMEOUT_S = 7200.0
+#: after a staging timeout, how long the workstation's transient units
+#: (`poste-maj-staging-<pid>-*`, restart and rollback, #3039) may finish before
+#: they are stopped: they run from the release worktree (#3049)
+STAGING_UNIT_GRACE_S = 600.0
+#: pause between two reads of those units
+STAGING_UNIT_POLL_S = 5.0
+#: after SIGTERM to a timed-out staging group, before SIGKILL
+STAGING_KILL_GRACE_S = 10.0
+#: last bounded read of the staging output once its units are settled: a
+#: survivor may still hold the pipe (`systemd-run --pipe`)
+STAGING_DRAIN_S = 10.0
 #: default target lease duration, the same as the train and the merge queue
 LOCK_TTL_S = land.LOCK_TTL_S
 #: default bounded wait for the target lease (a packet CI may run 45 min)
@@ -78,6 +89,10 @@ _PR_MERGE = re.compile(r"^Merge pull request #(\d+) from [^/\s]+/([^\s]+)\s*$")
 _LOT_BRANCH = re.compile(r"^lot/(\d+)(?:-|$)")
 _LOT_REF = re.compile(r"(?<![\w/])#(\d{1,7})(?![\w])")
 _TRAILER = re.compile(r"(?im)^[ \t>*-]*ameesh-work[ \t]*:[ \t]*#?(\d+)[ \t]*$")
+#: #2692: prefixes GitHub adds to a full-suite job on a packet head — the
+#: packet gate's caller job and the flow check runs of tests.yml. A required
+#: job is matched exactly or under one of these, never by a loose suffix.
+_JOB_PREFIXES = ("suite complète du paquet / ", "tests (flux) ")
 
 
 class ReleaseError(RuntimeError):
@@ -419,6 +434,16 @@ def ci_reading(project: "ProjectRelease", sha: str) -> dict:
         return radar.commit_ci(target, sha)
     except plan_github.GithubError as exc:
         raise TransientReleaseError("CI of %s unreadable: %s" % (sha[:12], exc)) from exc
+
+
+def suite_reading(project: "ProjectRelease", sha: str) -> dict:
+    """The runs and jobs of the exact head (#2692); a failed read is transient."""
+    target = radar.Project(name=project.name, repo=project.repo, target=project.target,
+                           github=project.github)
+    try:
+        return radar.commit_suite(target, sha)
+    except plan_github.GithubError as exc:
+        raise TransientReleaseError("CI jobs of %s unreadable: %s" % (sha[:12], exc)) from exc
 
 
 def _release_commit(repo: str, sha: str) -> bool:
@@ -914,6 +939,9 @@ class Plan:
     notes: str
     # N4: the base carries the previous tag's exact tree, nothing to release.
     empty: bool = False
+    #: #2692: the target head's CI is still in progress, but its tree is the
+    #: packet head's green content; the evidence (head, runs) or None.
+    tree_green: dict | None = None
 
 
 def same_tree(repo: str, left: str, right: str) -> bool:
@@ -924,6 +952,158 @@ def same_tree(repo: str, left: str, right: str) -> bool:
     return trees[0].stdout.strip() == trees[1].stdout.strip()
 
 
+def packet_head(repo: str, sha: str) -> str | None:
+    """The head a packet merge integrated, when the merge carries its tree.
+
+    A packet merge `M = merge(main, H)` has the packet head as second parent
+    (`H`). A conflict resolution makes M's tree differ from H's: the CI of H
+    then proves nothing about the merged content and no proof is inherited
+    (#2692). A fast-forward has no merge commit (and its exact CI is H's).
+    """
+    subject = _out(repo, "log", "-1", "--format=%s", sha)
+    if not _PACKAGE_MERGE.match(subject):
+        return None
+    parents = _out(repo, "rev-list", "--parents", "-n", "1", sha).split()
+    if len(parents) != 3:
+        return None
+    head = parents[2]
+    return head if same_tree(repo, sha, head) else None
+
+
+def _same_job(required: str, actual: str) -> bool:
+    """A job the target ran, as the packet head names it.
+
+    GitHub surfaces a reusable workflow's jobs under the caller job
+    (`suite complète du paquet / …`) and the flow check runs under
+    `tests (flux) …`: only those two known prefixes are accepted, so a
+    similarly named unrelated job never stands in for a required one.
+    """
+    return actual == required or any(actual == prefix + required
+                                     for prefix in _JOB_PREFIXES)
+
+
+def _full_suite_run(suite: dict) -> dict | None:
+    """The run of a commit that carries the target's full suite.
+
+    The target's suite is the run with the most jobs (the matrix run). Tied
+    runs with the same job set are re-runs of that suite (one is enough);
+    tied runs with a different job set are ambiguous and prove nothing. A run
+    without jobs (a skipped workflow) certifies nothing.
+    """
+    runs = [run for run in suite.get("runs") or ()
+            if run.get("conclusion") == "success" and run.get("jobs")]
+    if not runs:
+        return None
+    best = max(runs, key=lambda run: (len(run["jobs"]), -int(run["id"])))
+    ties = [run for run in runs if len(run["jobs"]) == len(best["jobs"])]
+    names = {job["name"] for job in best["jobs"]}
+    if any({job["name"] for job in run["jobs"]} != names for run in ties):
+        return None
+    return best
+
+
+def _suite_proof(reference: dict, candidate: dict) -> dict | None:
+    """The candidate proves the target's full suite, job by job.
+
+    Every job that ran green in the target's full-suite run must exist on the
+    candidate under the same name (a caller/flow prefix is allowed), be
+    completed, and be green. The target's suite is re-read on the last green
+    commit, so a packet that changes the job set (a workflow edit, a reduced
+    matrix) inherits nothing: it needs its own green target CI. Returns
+    `{reference_run, runs}` when the proof holds, else None.
+    """
+    reference_run = _full_suite_run(reference)
+    if reference_run is None:
+        return None
+    # Only the jobs that actually ran prove the target's suite. A job skipped
+    # on the target (a doc lane, a version lane) executed nothing: its absence
+    # on the packet head is not a hole, and a tolerated failure certifies
+    # nothing either.
+    required = {}
+    for job in reference_run["jobs"]:
+        if job["conclusion"] == "success":
+            required[job["name"]] = "success"
+    candidates = [(run, job) for run in candidate.get("runs") or ()
+                  for job in run.get("jobs") or ()]
+    proof_runs: dict[int, dict] = {}
+    for name, conclusion in required.items():
+        hits = [(run, job) for run, job in candidates if _same_job(name, job["name"])]
+        if not hits or any(job.get("status") != "completed" for _, job in hits):
+            return None
+        if not any(job["conclusion"] == "success" for _, job in hits):
+            return None
+        if any(job["conclusion"] not in radar.CI_PASSING for _, job in hits):
+            return None
+        for run, job in hits:
+            if job["conclusion"] == "success":
+                proof_runs[int(run["id"])] = run
+    if not proof_runs:
+        return None
+    return {"reference_run": reference_run,
+            "runs": [proof_runs[key] for key in sorted(proof_runs)]}
+
+
+def _run_evidence(run: dict) -> dict:
+    """The durable identity of a run cited by the notes and the report."""
+    return {"id": run["id"], "url": run["url"], "workflow": run["workflow"],
+            "event": run["event"], "jobs": len(run["jobs"])}
+
+
+def tree_green(repo: str, project: "ProjectRelease", sha: str, reference: str | None,
+               reading: dict | None = None) -> dict | None:
+    """#2692: the head's tree is content a green packet head validated.
+
+    Only a head whose own CI is still in progress may inherit (a concluded red
+    stays red, even with an equal tree). The packet merge must carry the
+    packet head's exact tree (no conflict resolution), that head must be green,
+    and its jobs must prove the same full suite as the target's last green
+    commit. Returns the evidence or None; a read failure stays transient.
+    """
+    own = ci_reading(project, sha) if reading is None else reading
+    if own.get("green") or own.get("failed") or own.get("missing"):
+        return None
+    if not own.get("pending"):
+        return None
+    if not reference or reference == sha:
+        return None
+    head = packet_head(repo, sha)
+    if head is None:
+        return None
+    head_reading = ci_reading(project, head)
+    if not head_reading.get("green"):
+        return None
+    candidate = suite_reading(project, head)
+    # The target's suite is read on its last green commit; a release commit
+    # inherits its first parent's content and has no run of its own.
+    cursor = reference
+    for _ in range(4):
+        proof = _suite_proof(suite_reading(project, cursor), candidate)
+        if proof is not None:
+            tree = _out(repo, "rev-parse", "--verify", "%s^{tree}" % sha)
+            return {"head": head, "tree": tree, "reference": cursor,
+                    "reference_run": _run_evidence(proof["reference_run"]),
+                    "runs": [_run_evidence(run) for run in proof["runs"]]}
+        # A failed match on a tested commit is final: an older, smaller
+        # suite cannot certify the current target's required jobs.
+        if not _release_commit(repo, cursor):
+            break
+        parent = _out(repo, "rev-parse", "--verify", "%s^1" % cursor)
+        if not parent:
+            break
+        cursor = parent
+    return None
+
+
+def tree_proof_text(head: str, proof: dict) -> str:
+    """The validation line cited in the release notes (SHA and run, #2692)."""
+    runs = ", ".join(run["url"] or "run %s" % run["id"] for run in proof["runs"])
+    reference = proof["reference_run"]
+    return ("tree of %s equals packet head %s, whose full suite (same jobs as the "
+            "target's green %s) is green: %s%s"
+            % (head[:12], proof["head"][:12], proof["reference"][:12], runs,
+               "; reference run %s" % reference["url"] if reference.get("url") else ""))
+
+
 def build_plan(cfg, project: ProjectRelease, *, now: float,
                version: str | None = None) -> Plan:
     rules, source = compiled_rules(cfg, project.name)
@@ -932,8 +1112,15 @@ def build_plan(cfg, project: ProjectRelease, *, now: float,
     head = commit_of(project.repo, "%s/%s" % (project.remote, project.target))
     reading = ci_reading(project, head)
     green = commit_is_green(project.repo, project, head, reading=reading)
+    tree_proof = None
     if not green:
         green_commit = last_green(project.repo, head, project)
+        # #2692: a packet merge whose tree is the green packet head's content
+        # is green while the target's own CI is still in progress.
+        tree_proof = tree_green(project.repo, project, head, green_commit,
+                                reading=reading)
+        if tree_proof is not None:
+            green, green_commit = True, head
     else:
         green_commit = head
     base = green_commit or head
@@ -979,13 +1166,16 @@ def build_plan(cfg, project: ProjectRelease, *, now: float,
         project=project, repo=project.repo, since=since, target=base, version=version,
         cutoff_label=cutoff_label, cutoff_at=cutoff_at, rules=rules, previous=previous,
         floor=floor, floor_reason=floor_reason, packets=packets, direct=direct,
-        migrations=migrations, version_bump=project.version_bump)
+        migrations=migrations,
+        runs=[tree_proof_text(head, tree_proof)] if tree_proof else None,
+        version_bump=project.version_bump)
     return Plan(project=project, rules=rules, canon_commit=source.commit,
                 cutoff_at=cutoff_at, cutoff_label=cutoff_label, head=head, ci=reading,
                 green=green, last_green=green_commit, base=base, current_version=current,
                 previous=previous, version=version, floor=floor, floor_reason=floor_reason,
                 packets=packets, direct=direct, migrations=migrations,
-                included=included, excluded=excluded, notes=notes)
+                included=included, excluded=excluded, notes=notes,
+                tree_green=tree_proof)
 
 
 # --------------------------------------------------------------------------
@@ -1289,6 +1479,76 @@ def _kill_group(proc, sig=signal.SIGTERM) -> None:
         pass
 
 
+_UNIT_LIVE = frozenset({"active", "activating", "deactivating", "reloading", "refreshing"})
+
+
+def _systemctl(*args: str, timeout: float = 30) -> subprocess.CompletedProcess | None:
+    try:
+        return subprocess.run(["systemctl", "--user", *args], capture_output=True,
+                              text=True, timeout=timeout)
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def _poste_units(pid: int) -> list[str] | None:
+    """Live transient workstation units started by the staging run `pid`.
+
+    `staging.sh` names them `poste-maj-staging-$$-<gesture>`; `$$` is the pid
+    of the bash started here. The systemd manager runs them, not this process
+    group: killing the run leaves them running (#3049). None when their state
+    is unreadable; [] without systemctl, where staging.sh starts none.
+    """
+    if shutil.which("systemctl") is None:
+        return []
+    proc = _systemctl("list-units", "--all", "--plain", "--no-legend", "--type=service",
+                      "poste-maj-staging-%d-*" % pid)
+    if proc is None or proc.returncode:
+        return None
+    units = []
+    for line in proc.stdout.splitlines():
+        fields = line.split()
+        if fields and not fields[0].endswith(".service"):
+            fields = fields[1:]  # status bullet of some systemd versions
+        if len(fields) >= 3 and fields[2] in _UNIT_LIVE:
+            units.append(fields[0])
+    return units
+
+
+def _settle_poste_units(pid: int, wait, grace_s: float | None = None) -> tuple[str, bool]:
+    """Let a timed-out run's workstation units end before the worktree goes.
+
+    A restart cut in the middle can leave the executors stopped, so the units
+    get `grace_s` to finish on their own; past it they are stopped. `wait`
+    pauses between two reads and keeps draining the staging output, which a
+    unit started with `--pipe` holds. Returns the note for the report and
+    whether the worktree may be dropped: only once no unit is seen alive,
+    never on an unreadable state.
+    """
+    units = _poste_units(pid)
+    if units == []:
+        return "", True
+    if grace_s is None:
+        grace_s = STAGING_UNIT_GRACE_S
+    seen = set(units or ())
+    deadline = time.monotonic() + grace_s
+    while units != [] and time.monotonic() < deadline:
+        wait(STAGING_UNIT_POLL_S)
+        units = _poste_units(pid)
+        seen.update(units or ())
+    names = ", ".join(sorted(seen)) or "poste-maj-staging-%d-*" % pid
+    if units == []:
+        return "; workstation unit(s) %s ended before the worktree was dropped" % names, True
+    _systemctl("stop", "poste-maj-staging-%d-*" % pid, timeout=180)
+    alive = _poste_units(pid)
+    if alive == []:
+        return ("; workstation unit(s) %s still running after %ss, stopped: "
+                "the workstation may be half restarted" % (names, grace_s)), True
+    return ("; workstation unit(s) %s %s after %ss and a stop: worktree kept, "
+            "check the workstation"
+            % (", ".join(alive) if alive else names,
+               "still running" if alive else "in an unreadable state", grace_s)), False
+
+
 def run_staging(project: ProjectRelease, release_sha: str, included: list[int],
                 *, state_dir: str, timeout_s: float | None = None) -> dict:
     """Run `staging.sh` from a worktree of the release commit, under its lock."""
@@ -1296,6 +1556,7 @@ def run_staging(project: ProjectRelease, release_sha: str, included: list[int],
     if os.path.isabs(relative):
         relative = os.path.relpath(relative, project.repo)
     folder, worktree = _worktree(project.repo, release_sha)
+    drop = True
     try:
         script = os.path.join(worktree, relative)
         if not os.path.isfile(script):
@@ -1321,23 +1582,42 @@ def run_staging(project: ProjectRelease, release_sha: str, included: list[int],
                 output, _ = proc.communicate(
                     timeout=timeout_s or project.staging_timeout_s)
             except subprocess.TimeoutExpired as exc:
-                partial = exc.output or ""
-                if isinstance(partial, bytes):
-                    partial = partial.decode("utf-8", "replace")
-                log.write(partial)
+                read = {"output": None, "partial": exc.output}
+
+                def wait(seconds):
+                    # a bounded read: a unit started with `--pipe` keeps the
+                    # pipe open after the group is dead (#3049)
+                    if read["output"] is not None:
+                        time.sleep(seconds)
+                        return
+                    try:
+                        read["output"], _ = proc.communicate(timeout=seconds)
+                    except subprocess.TimeoutExpired as again:
+                        read["partial"] = again.output or read["partial"]
+
                 # `communicate` kills bash only; the sequence's ssh/vm.sh
                 # children would survive and keep the worktree/flock. Kill the
                 # whole session started for this run, then wait for it.
                 _kill_group(proc, signal.SIGTERM)
-                try:
-                    output, _ = proc.communicate(timeout=10)
-                except subprocess.TimeoutExpired:
+                wait(STAGING_KILL_GRACE_S)
+                if read["output"] is None:
                     _kill_group(proc, signal.SIGKILL)
-                    output, _ = proc.communicate()
-                log.write(output or "")
+                # the restart/rollback units of the workstation outlive the
+                # group and run from this worktree (#3049)
+                note, drop = _settle_poste_units(proc.pid, wait)
+                if read["output"] is None:
+                    wait(STAGING_DRAIN_S)
+                if read["output"] is None:
+                    # still held by a survivor: keep what was read, reap bash
+                    with contextlib.suppress(OSError, subprocess.TimeoutExpired):
+                        proc.wait(timeout=STAGING_DRAIN_S)
+                text = read["output"] if read["output"] is not None else read["partial"]
+                if isinstance(text, bytes):
+                    text = text.decode("utf-8", "replace")
+                log.write(text or "")
                 raise TransientReleaseError(
-                    "staging timed out after %ss (log %s)"
-                    % (timeout_s or project.staging_timeout_s, log_path)) from exc
+                    "staging timed out after %ss (log %s)%s"
+                    % (timeout_s or project.staging_timeout_s, log_path, note)) from exc
             log.write(output or "")
         return {"exit": proc.returncode, "duration_s": round(time.time() - started, 1),
                 "log": log_path,
@@ -1345,7 +1625,8 @@ def run_staging(project: ProjectRelease, release_sha: str, included: list[int],
                 "summary": staging_summary(read_journal(since_iso), release_sha),
                 "attestation": read_attestation(release_sha)}
     finally:
-        _drop_worktree(project.repo, folder, worktree)
+        if drop:
+            _drop_worktree(project.repo, folder, worktree)
 
 
 # --------------------------------------------------------------------------
@@ -1376,7 +1657,13 @@ def _report_body(project: ProjectRelease, plan: Plan | None, *, result: str,
         lines.append("Avant: %s (tag %s, commit %s)."
                      % (previous["version"], previous["tag"], previous["commit"][:12]))
     lines.append("Après: %s (commit %s)." % (version, release_sha[:12]))
-    if plan and plan.ci:
+    if plan and plan.tree_green:
+        proof = plan.tree_green
+        lines.append("CI tête: en cours ; arbre identique à la tête de paquet %s, "
+                     "suite complète verte (preuve %s)."
+                     % (proof["head"][:12], ", ".join(
+                         run["url"] or "run %s" % run["id"] for run in proof["runs"])))
+    elif plan and plan.ci:
         lines.append("CI tête: %s%s." % (
             "verte" if plan.ci.get("green") else "non verte",
             " ; dernier vert %s" % plan.last_green[:12]
@@ -1583,7 +1870,14 @@ def _execute_locked(cfg, db, project: ProjectRelease, *, now: float, force: bool
         return report
 
     deviations = []
-    if not plan.green:
+    if plan.tree_green:
+        deviations.append(
+            "tête %s: CI en cours, arbre identique à la tête de paquet %s "
+            "(suite complète verte, %s)"
+            % (plan.head[:12], plan.tree_green["head"][:12],
+               ", ".join(run["url"] or "run %s" % run["id"]
+                         for run in plan.tree_green["runs"])))
+    elif not plan.green:
         deviations.append("tête %s non verte: release sur le dernier commit vert %s"
                           % (plan.head[:12], plan.base[:12]))
     version_sha = create_version_commit(project, plan)
@@ -1647,6 +1941,7 @@ def _execute_locked(cfg, db, project: ProjectRelease, *, now: float, force: bool
               "direct": plan.direct, "included": plan.included,
               "excluded": plan.excluded, "migrations": plan.migrations,
               "notes": plan.notes, "staging": staging, "started_at": started,
+              "tree_green": plan.tree_green,
               "deviations": deviations}
     return finish(cfg, db, project, report, state, state_slot, at, label, rules,
                   plan.previous, plan, staging, no_staging)

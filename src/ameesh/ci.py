@@ -93,7 +93,16 @@ L125 :
   de la base (la cible de la PR, sinon la base du dépôt —
   `github.projects.<projet>.base`, `main` par défaut, `develop` pour Nexlink :
   #1483 ; pour une base, l'exécution précédente de la même suite) n'est jamais
-  imputé à l'auteur : pas d'urgent, une ligne dans le verdict.
+  imputé à l'auteur : pas d'urgent, une ligne dans le verdict ;
+* **échec d'une branche de base sans lot** (une fusion de paquet ne porte
+  souvent pas la ligne `ameesh-work:`) : au pilote du projet, l'orchestrateur
+  déclaré au canon (`alert_briefs.project_pilots`) — plus jamais « (no
+  recipient) » (#2935). La tête de chaque base est par ailleurs relue à chaque
+  passage, même au-delà de la fenêtre de rattrapage : le dernier résultat
+  **utile** (`success`/`failure`) par workflow suivi, relances terminées
+  comprises et annulations ignorées, ferme `ci_main_red` au premier vert
+  enregistré de la même base, sans attendre la prochaine exécution de cette
+  base (#2935).
 
 Une exécution rouge sur une branche de base lève aussi l'alerte `ci_main_red`
 (`exploitation`, poussée par `ameesh notify` au responsable humain) : #846,
@@ -112,8 +121,9 @@ import re
 import secrets
 import time
 from datetime import datetime
+from urllib.parse import quote
 
-from . import packet_guard, storage
+from . import packet_guard, role_run, storage
 
 #: workflows suivis par défaut (nom du fichier), quand le dépôt publie le
 #: workflow des tests L161 : comportement historique, compatible ameesh.
@@ -164,6 +174,11 @@ BASE_BRANCHES = ("main",)
 #: confondus — pouvait cacher une exécution suivie, que seul le rattrapage
 #: rendait, une heure plus tard.
 LIST_PER_PAGE = 100
+#: #2938 : pages lues au plus pour la tête d'une base. La première suffit
+#: quand le dernier `success`/`failure` de chaque workflow suivi y est ; des
+#: annulations plus récentes peuvent le cacher au-delà (N1/N2 de la relecture
+#: #2935). Le plafond borne le coût d'une branche qui n'a jamais ce résultat.
+HEAD_LIST_MAX_PAGES = 5
 ECHECS = ("echec", "erreur")
 #: conclusion GitHub → état de `ci_runs`
 _CONCLUSIONS = {"success": "success", "neutral": "success", "skipped": "success",
@@ -875,7 +890,7 @@ class Watcher:
         settings = self.settings()
         if settings is None:
             return []  # déjà journalisé par la projection des issues
-        if not settings.projects or settings.host != getattr(self.cfg, "host", None):
+        if not settings.projects or not role_run.host_authorized(self.cfg, settings.host):
             return []
         return sorted(set(settings.projects.values()))
 
@@ -975,6 +990,20 @@ class Watcher:
                      "be seen late" % (repo, status, len(runs), total))
         return runs
 
+    def _listed_on(self, repo: str, branch: str, status: str, *,
+                   page: int = 1) -> list[dict]:
+        """#2935 : une page (`page`, `LIST_PER_PAGE` exécutions) de la liste
+        des exécutions d'une branche (filtre `branch` de l'API).
+
+        #2938 (N1/N2 de la relecture #2935) : la première page ne suffit pas
+        à dire l'état d'une base — plus de cent annulations plus récentes
+        peuvent cacher le dernier `success`/`failure` utile. L'appelant page
+        donc tant qu'il n'a pas le résultat utile de chaque workflow suivi
+        (`_refresh_bases`), sous un plafond (`HEAD_LIST_MAX_PAGES`)."""
+        data = self.api("repos/%s/actions/runs?branch=%s&status=%s&per_page=%d&page=%d"
+                        % (repo, quote(branch, safe=""), status, LIST_PER_PAGE, page)) or {}
+        return list(data.get("workflow_runs") or ())
+
     def branch_head(self, repo: str, branch: str) -> str | None:
         """La tête de `branch` selon GitHub, ou None (API muette, branche
         disparue) : elle prouve quelle exécution de la branche n'est pas
@@ -1051,6 +1080,17 @@ class Watcher:
                     break
                 except Exception as exc:  # noqa: BLE001 - jamais fatal au passage
                     self.log("CI %s: check failed (%s)" % (repo, " ".join(str(exc).split())[:200]))
+            # #2957 : le périmètre actif est la configuration de l'hôte
+            # désigné. Un dépôt qui en sort ne doit pas laisser sa ligne de
+            # file : le repli de `github_observation` sur un hôte sans
+            # configuration la surveillerait et alerterait à jamais de son
+            # silence. La purge ne dépend pas des appels GitHub du passage
+            # (un quota épuisé ou une erreur d'un dépôt ne la saute pas).
+            try:
+                storage.of(db).ci.prune_queue(repos)
+            except Exception as exc:  # noqa: BLE001 - cache seulement, jamais fatal
+                self.log("CI: queue rows outside the active perimeter not pruned (%s)"
+                         % " ".join(str(exc).split())[:200])
             return out
         finally:
             plan_github.flush_reads(getattr(self.cfg, "state_dir", None))
@@ -1079,6 +1119,10 @@ class Watcher:
         # les exécutions courtes, nées et finies entre deux passages, n'ont
         # jamais été vues « en cours » : rattrapage borné (#1110)
         out += self._catch_up(db, repo, lots, followed, bases)
+        # #2935 : la tête de chaque base est relue même au-delà de la fenêtre
+        # de rattrapage — sans quoi un veilleur arrêté plus d'une heure perdait
+        # le vert qui ferme `ci_main_red`, et l'alerte restait fausse
+        self._refresh_bases(db, repo, followed, bases)
         # les lignes que ce passage conclut sont figées AVANT les envois : le
         # verdict d'un workflow ne cite pas comme « encore en cours » un
         # workflow conclu dans le même passage (#1110)
@@ -1181,6 +1225,159 @@ class Watcher:
                        and int(r["run_id"]) not in settled]
             out += self._conclude(db, repo, row, run=run, pending=pending)
         return out
+
+    def _refresh_bases(self, db, repo: str, followed: set, bases=BASE_BRANCHES) -> None:
+        """#2935 : relève l'état terminal de la tête de chaque base, même plus
+        ancien que `CATCHUP_WINDOW`.
+
+        Le rattrapage est borné pour ne pas rendre de verdicts anciens après
+        une interruption du veilleur ; mais `ci_main_red` lit `ci_runs`, et la
+        base dont le vert (ou le rouge) a conclu pendant l'interruption n'y
+        entrait jamais : l'alerte restait rouge alors que la base était verte,
+        jusqu'à la prochaine exécution de cette base. Ici, seule la plus
+        récente exécution **utile** (`success`/`failure`) par workflow suivi
+        est retenue, sans courrier ni réveil : l'état de la base suffit à
+        fermer l'alerte, un verdict ancien ne rouvre pas un tour pour rien.
+
+        #2935 (relecture cx3) : une annulation derrière le dernier résultat
+        utile ne le cache plus (`latest_concluded` ignore les annulations) ;
+        une relance terminée pendant l'arrêt (`run_attempt` plus récent sur
+        une ligne déjà connue) est reprise.
+
+        #2938 (N1/N2 cx3) : la liste est paginée jusqu'au dernier résultat
+        utile de chaque workflow suivi — plus de cent annulations plus
+        récentes ne le cachent plus. #2938 (N auditeur) : seules les
+        exécutions **antérieures** à `CATCHUP_WINDOW` sont enregistrées ici ;
+        une exécution récente que le rattrapage n'aurait pas vue doit passer
+        par `_catch_up`, qui courrielle, jamais par ce relevé silencieux.
+        """
+        from . import plan_github
+        st = storage.of(db)
+        now = float(self.clock())
+        for branch in bases:
+            newest: dict[str, dict] = {}
+            seen: set[int] = set()
+            page = 1
+            while page <= HEAD_LIST_MAX_PAGES:
+                try:
+                    runs = self._listed_on(repo, branch, "completed", page=page)
+                except plan_github.GithubRateLimited:
+                    raise
+                except Exception as exc:  # noqa: BLE001 - jamais fatal au relevé
+                    self.log("CI %s: head of base %s unreadable (%s)"
+                             % (repo, branch, " ".join(str(exc).split())[:200]))
+                    runs = []
+                    break
+                fresh = 0
+                for run in runs:
+                    run_id = int(run.get("id") or 0)
+                    if not run_id or run_id in seen:
+                        continue
+                    seen.add(run_id)
+                    fresh += 1
+                    if (run.get("head_branch") or "").casefold() != branch.casefold():
+                        continue
+                    workflow = workflow_of(run.get("path"))
+                    if workflow not in followed:
+                        continue
+                    if _CONCLUSIONS.get(run.get("conclusion") or "", "failure") \
+                            not in ("success", "failure"):
+                        continue  # annulée : elle ne dit pas l'état de la base
+                    if workflow not in newest or run_id > int(newest[workflow]["id"]):
+                        newest[workflow] = run
+                # fin de liste, plus rien de neuf (API qui ignore `page`), ou
+                # dernier résultat utile de chaque workflow trouvé
+                if len(runs) < LIST_PER_PAGE \
+                        or all(w in newest for w in followed) or not fresh:
+                    break
+                page += 1
+            if page > HEAD_LIST_MAX_PAGES and not all(w in newest for w in followed) \
+                    and (repo, "head:%s" % branch) not in self._warned_truncated:
+                self._warned_truncated.add((repo, "head:%s" % branch))
+                self.log("CI %s: head list of base %s truncated at %d pages, a "
+                         "useful result may be hidden deeper"
+                         % (repo, branch, HEAD_LIST_MAX_PAGES))
+            for run in newest.values():
+                updated = updated_ts(run)
+                if updated is None or now - updated <= CATCHUP_WINDOW:
+                    continue  # récent ou indatable : laissé au rattrapage courriellé
+                row = st.ci.run(repo, int(run["id"]))
+                if row is None:
+                    self._record_terminal(st, repo, run, bases)
+                elif int(run.get("run_attempt") or 1) > int(row.get("run_attempt") or 1):
+                    self._record_attempt(st, repo, run, bases)
+
+    def _record_terminal(self, st, repo: str, run: dict,
+                         bases=BASE_BRANCHES) -> None:
+        """#2935 : enregistre une exécution terminale de base sans courrier.
+
+        Son état (et ses échecs) sert à `ci_main_red` ; son verdict n'est pas
+        rendu : il porte sur une exécution hors de la fenêtre de rattrapage, et
+        rouvrir un tour pour un vert ancien n'a aucun sens. `open_run` puis
+        `conclude` gardent la ligne dans la forme du relevé normal."""
+        run_id = int(run["id"])
+        status = _CONCLUSIONS.get(run.get("conclusion") or "", "failure")
+        if status not in ("success", "failure"):
+            return
+        st.ci.open_run(repo, run_id, head_sha=run.get("head_sha") or "",
+                       branch=run.get("head_branch") or "",
+                       event=run.get("event") or "",
+                       base=base_of(run, default=bases[0]),
+                       work_item_id=lot_of_run(run, [], bases),
+                       url=run.get("html_url"), workflow=workflow_of(run.get("path")),
+                       created_at=run.get("created_at"),
+                       run_attempt=int(run.get("run_attempt") or 1))
+        row = st.ci.run(repo, run_id)
+        if row is None:
+            return
+        st.ci.conclude(repo, run_id, status)
+        self._record_base_failures(st, repo, row, run_id, status, bases)
+
+    def _record_attempt(self, st, repo: str, run: dict,
+                        bases=BASE_BRANCHES) -> None:
+        """#2935 (relecture cx3 B1) : une relance terminée pendant l'arrêt du
+        veilleur (`run_attempt` plus récent) remplace le résultat de l'attempt
+        suivi — sinon un rouge d'attempt 1 reste alors que la relance a rendu
+        vert. Une annulation n'est pas rejouée : elle ne dit ni vert ni rouge,
+        l'ancien résultat utile reste (`main_red` ignore les annulations).
+
+        `reopen_run` garde ses refus (ligne remplacée, tête plus récente) :
+        une relance d'une tête qui n'est plus la tête courante de la base ne
+        change pas son état courant."""
+        run_id = int(run["id"])
+        status = _CONCLUSIONS.get(run.get("conclusion") or "", "failure")
+        if status not in ("success", "failure"):
+            return
+        attempt = int(run.get("run_attempt") or 1)
+        reopened = st.ci.reopen_run(repo, run_id, run_attempt=attempt)
+        if reopened is None:
+            return
+        st.ci.conclude(repo, run_id, status)
+        row = st.ci.run(repo, run_id) or reopened
+        self._record_base_failures(st, repo, row, run_id, status, bases)
+
+    def _record_base_failures(self, st, repo: str, row: dict, run_id: int,
+                              status: str, bases=BASE_BRANCHES) -> None:
+        """#2935 : les échecs d'un résultat de base, pour le détail de
+        `ci_main_red` ; aucun message : une exécution hors fenêtre ne réveille
+        pas (seul son état est relu)."""
+        if status != "failure":
+            return
+        try:
+            self._record_failed_jobs(st, repo, dict(row, status="failure"), bases)
+            checks = self.api("repos/%s/commits/%s/check-runs?per_page=100"
+                              % (repo, row["head_sha"])) or {}
+        except Exception as exc:  # noqa: BLE001 - le statut suffit à l'alerte
+            self.log("CI %s run %s: failures unreadable (%s)"
+                     % (repo, run_id, " ".join(str(exc).split())[:200]))
+            return
+        for ev in events_of(checks.get("check_runs"), run_id):
+            st.ci.add_failure(repo, run_id, run_attempt=event_attempt(ev),
+                              part=str(ev.get("part") or ""), test=ev["test"],
+                              module=ev.get("module") or "", status=ev.get("statut"),
+                              inherited=False, excerpt=ev.get("extrait") or "",
+                              replay=ev.get("rejouer") or "",
+                              duration_s=ev.get("duree_s"), failed_at=ev.get("ts"))
 
     def _late_link(self, db, repo: str, run: dict, row: dict, lots: list[dict],
                    settled: set, bases=BASE_BRANCHES) -> list[dict]:
@@ -1570,6 +1767,36 @@ class Watcher:
                  "waited_s": int(waited), "cancelled": list(cancelled),
                  "message_id": message_id}]
 
+    def _project_pilot(self, db, repo: str) -> str | None:
+        """#2935 : le pilote du projet d'un dépôt, pour un échec de base sans
+        lot.
+
+        Le projet est celui que `github.projects` associe au dépôt ; le pilote
+        est l'orchestrateur déclaré au canon (`alert_briefs.project_pilots`).
+        Aucun rôle lisible : None, l'échec reste sans destinataire comme avant
+        (le journal le dit)."""
+        from . import alert_briefs, canon as canon_mod
+        settings = self.settings()
+        if settings is None:
+            return None
+        project = next((name for name, url in settings.projects.items()
+                        if (url or "").casefold() == repo.casefold()), None)
+        if not project:
+            return None
+        try:
+            pilots = alert_briefs.project_pilots(
+                project, storage.of(db).operations.listing(), cfg=self.cfg, db=db,
+                canons=canon_mod.load_configured(self.cfg))
+        except Exception as exc:  # noqa: BLE001 - jamais fatal au relevé
+            self.log("CI %s: pilot of project %s unreadable (%s)"
+                     % (repo, project, " ".join(str(exc).split())[:200]))
+            return None
+        if not pilots:
+            self.log("CI %s: no pilot declared for project %s: base failure has no "
+                     "recipient" % (repo, project))
+            return None
+        return pilots[0]
+
     def _failures(self, db, repo: str, row: dict, bases=BASE_BRANCHES) -> list[dict]:
         """Les échecs nouveaux d'une exécution suivie, et leur message.
 
@@ -1624,6 +1851,11 @@ class Watcher:
             return []
         lot = work.get(db, int(row["work_item_id"])) if row.get("work_item_id") else None
         to = recipient_of(lot)
+        if not to and (row.get("branch") or "").casefold() in _base_set(bases):
+            # #2935 : une poussée sur une base n'appartient souvent à aucun lot
+            # (une fusion de paquet porte rarement la ligne `ameesh-work:`) ;
+            # l'échec partait « (no recipient) ». Il va au pilote du projet.
+            to = self._project_pilot(db, repo)
         if not to:
             # sans destinataire, aucun message ne portera jamais ces lignes :
             # seules les nouvelles sont journalisées, pas toutes à chaque passe.
@@ -1656,7 +1888,8 @@ class Watcher:
         # #795 N2 : le courrier et sa preuve (`urgent_message_id`, `message_id`
         # des échecs) dans la même transaction : le NOTIFY du courrier n'est
         # délivré qu'au commit, quand l'exécuteur peut déjà le vérifier.
-        message_id = _send_posed(db, to, text, short, lot=lot["id"], payload=payload,
+        message_id = _send_posed(db, to, text, short,
+                                 lot=(lot or {}).get("id"), payload=payload,
                                  urgent=urgent, pose=pose)
         return [{"action": "failures", "repo": repo, "run_id": row["run_id"],
                  "tests": [f["test"] for f in own], "to": to, "urgent": urgent,
@@ -2155,6 +2388,28 @@ def _runs_of(api, repo: str, *, sha: str = "", branch: str = "",
     return list(data.get("workflow_runs") or ())
 
 
+def _packet_runs(api, repo: str, branch: str, sha: str) -> list[dict]:
+    """#2876 : portiers push vivants de cette branche et cette tête seulement.
+
+    La liste générale évite un 404 sur les dépôts sans paquet.yml. Paginer
+    garde les portiers visibles même après de nombreuses relances.
+    """
+    found, page = [], 1
+    while True:
+        data = api("repos/%s/actions/runs?per_page=100&page=%d&head_sha=%s&branch=%s&event=push"
+                   % (repo, page, _q(sha), _q(branch))) or {}
+        rows = list(data.get("workflow_runs") or ())
+        found.extend(row for row in rows
+                     if row.get("path") == ".github/workflows/paquet.yml"
+                     and row.get("event") == "push"
+                     and row.get("head_branch") == branch
+                     and row.get("head_sha") == sha
+                     and row.get("status") in OPEN_STATUSES)
+        if len(rows) < 100:
+            return found
+        page += 1
+
+
 def pr_run(row: dict) -> dict | None:
     """Une exécution de PR étiquetée #1343 : PR, mode, tête gelée, base.
 
@@ -2586,6 +2841,7 @@ def gel_plan(db, cfg, item_id: int, *, api, sha: str = "", avis: int = 1,
              and r["conclusion"] == "success"]
     decision = {"schema": GEL_SCHEMA, "work_item": int(item_id), "repo": name,
                 "branch": branch, "target": target, "sha": frozen_sha, "base": base,
+                "head_ref": pr["head_ref"], "base_ref": pr["base_ref"],
                 "mode": mode, "label": label, "path": "pr-label", "pr": pr["number"],
                 "exception": exception, "reason": reason.strip(), "avis": avis,
                 "verdicts": sorted((m.get("actor") or "") for m in reviews),
@@ -3012,6 +3268,19 @@ def _request_once(db, item_id: int, decision: dict, *, api, gh, force: bool) -> 
                    "run `ameesh ci run %d` again" % (base[:12], pr["base"][:12], item_id))
             note("released", why)
             return {"requested": False, "action": "refuse", "why": why}
+        # #2876 : le push peut avoir lancé le portier avant la création de
+        # la PR. Son workflow_call ne porte pas le check requis de cette PR.
+        # Le remplacer avant labeled, après toutes les gardes et sous verrou.
+        if mode == "full" and pr["head_ref"].startswith("integration/"):
+            for row in _packet_runs(api, decision["repo"], decision["branch"], sha):
+                messages = []
+                failed = _cancel_runs(gh, decision["repo"], [_short_run(row)],
+                                      say=messages.append)
+                text = "packet portier: " + "; ".join(messages)
+                work.note(tx, int(item_id), text)
+                if failed:
+                    note("released", text)
+                    return {"requested": False, "action": "refuse", "why": text}
         posed = _pose_request(gh, decision["repo"], pr, label, mode)
         if not posed["ok"]:
             note("released", posed["error"])
@@ -3062,7 +3331,108 @@ def _render_gel(decision: dict) -> list[str]:
     if run.get("id"):
         lines.append("  run %s %s %s" % (run.get("id"), run.get("status"),
                                          run.get("url") or ""))
+    armed = decision.get("auto_merge")
+    if armed:
+        lines.append(("  auto-merge: %s — %s" if armed["state"] in
+                      ("armed", "already-armed") else
+                      "  auto-merge NOT armed (%s): %s") % (armed["state"], armed["why"]))
+        merge = armed.get("merge") or {}
+        if merge.get("result") in ("merged", "error", "busy"):
+            lines.append("  auto-merge now: %s%s" % (
+                merge["result"], (" — %s" % merge["error"]) if merge.get("error") else ""))
     return lines
+
+
+def _packet_prevalidation(cfg, db, item, decision, args) -> int:
+    """#2644 : la prévalidation d'un porteur `integration/**`, avant l'étiquette.
+
+    Rend 0 quand la demande peut être posée (verte, hors porteur, exception
+    déclarée, ou prévalidation indisponible), 1 seulement sur un rouge : aucun
+    appelant ne pose d'étiquette sur un retour non nul. Un incident déclaré
+    (`--exception` ou journal `packet-exception` de cette tête) ne bloque pas :
+    la porte de fusion reste la CI complète.
+    """
+    from . import packet_guard, prevalidation_calls, work
+    head_ref = str(decision.get("head_ref") or "")
+    if not head_ref.startswith("integration/"):
+        return 0
+    declared = str(decision.get("exception") or "")
+    if not declared:
+        found = packet_guard.declared(db, args.id, decision.get("sha") or "")
+        declared = str((found or {}).get("exception") or "")
+    if declared:
+        decision["prevalidation"] = {"state": "skipped", "exception": declared}
+        if not getattr(args, "json", False):
+            print("  prévalidation non bloquante : exception %s déclarée pour %s"
+                  % (declared, str(decision.get("sha") or "")[:12]))
+        return 0
+    result = prevalidation_calls.gate_packet(
+        cfg, db, item, decision,
+        repo=getattr(args, "prevalidation_repo", "") or "",
+        map_path=getattr(args, "prevalidation_map", "") or "")
+    if result.get("state") == "red":
+        #: décision pilote 19/10 : seul un rouge bloque la demande de CI.
+        why = result.get("why") or "run-red"
+        text = "prévalidation refusée (run-red) — %s ; aucune étiquette posée" % why
+        if getattr(args, "json", False):
+            print(json.dumps({"schema": GEL_SCHEMA, "ok": False, "work_item": args.id,
+                              "action": "refuse", "why": text},
+                             ensure_ascii=False, indent=1))
+        else:
+            print("ameesh ci run: " + text)
+        return 1
+    if result.get("state") == "unavailable":
+        #: une prévalidation indisponible ne bloque jamais : le motif est
+        #: journalisé pour être cité au manifeste du porteur.
+        cause = str(result.get("cause") or "unavailable")
+        why = str(result.get("why") or "")
+        text = "prevalidation-unavailable: %s%s" % (
+            cause, (" — " + why) if why else "")
+        try:
+            work.note(db, args.id, text, actor="ameesh", once=True)
+        except Exception:  # noqa: BLE001 - une note ne bloque pas la demande
+            pass
+        decision["prevalidation"] = {"state": "unavailable", "cause": cause,
+                                     "why": why}
+        if not getattr(args, "json", False):
+            print("  prévalidation indisponible (%s)%s : ci run continue, motif "
+                  "journalisé (à citer au manifeste)" % (cause, (" — " + why) if why else ""))
+        return 0
+    report = result.get("report") or {}
+    decision["prevalidation"] = {
+        "state": "green", "sha": report.get("sha"),
+        "host": report.get("host"), "seconds": report.get("seconds"),
+        "modules": len(report.get("modules") or ())}
+    if not getattr(args, "json", False):
+        print("  prévalidation verte : %s, %s module(s), %s s sur %s"
+              % (str(report.get("sha") or "")[:12], len(report.get("modules") or ()),
+                 report.get("seconds"), report.get("host")))
+    return 0
+
+
+def _arm_packet(cfg, db, decision: dict, gh, args) -> dict | None:
+    """#2813 (canon §12) : publier un porteur `integration/**` — sa suite
+    complète demandée, en vol ou verte sur la tête gelée — arme sa fusion
+    automatique sur cette tête et cette cible (`packet_automerge.arm`) :
+    ameesh fusionne lui-même cette tête dans cette cible, portes vertes.
+
+    L'issue est rangée dans `decision["auto_merge"]` et rendue avec la
+    décision ; elle ne change jamais le code de retour : l'étiquette est
+    posée, la CI part, et un armement manqué laisse seulement le paquet à
+    fusionner à la main (le motif est au journal du lot)."""
+    from . import packet_automerge, work
+    if decision.get("mode") != "full" or not packet_automerge.carrier(decision.get("head_ref")) \
+            or decision.get("action") not in ("request", "green", "running"):
+        return None
+    try:
+        out = packet_automerge.arm(
+            cfg, db, args.id, slug=decision["repo"], number=decision["pr"], sha=decision["sha"],
+            target=decision.get("base_ref") or "", gh=packet_automerge.gh_of(gh),
+            actor=getattr(args, "actor", "") or work.SYSTEM_SENDER)
+    except Exception as exc:  # noqa: BLE001 - l'étiquette est posée : jamais fatal
+        out = {"state": "error", "why": "%s: %s" % (type(exc).__name__, exc)}
+    decision["auto_merge"] = out
+    return out
 
 
 def cmd_ci_run(cfg, args) -> int:
@@ -3112,12 +3482,18 @@ def cmd_ci_run(cfg, args) -> int:
             print("ameesh ci run: %s" % exc)
         return 1
     if args.dry_run or decision["action"] != "request":
+        if not args.dry_run:
+            _arm_packet(cfg, db, decision, gh, args)
         if args.json:
             print(json.dumps({**decision, "ok": True, "requested": False},
                              ensure_ascii=False, indent=1))
         else:
             print("\n".join(_render_gel(decision)))
         return 0
+    # #2644 : la prévalidation #1770 passe avant l'étiquette d'un porteur
+    # `integration/**` ; un refus nommé ne pose rien (aucune étiquette).
+    if _packet_prevalidation(cfg, db, item, decision, args):
+        return 1
     # canon §3 : un run de la branche hors de la composition courante (autre
     # SHA, autre base) est périmé ; jamais celui de la composition demandée.
     # #2333 : l'exception est journalisée à la tête que le plan a retenue
@@ -3146,6 +3522,7 @@ def cmd_ci_run(cfg, args) -> int:
             return 1
         decision = {**decision, "action": result["action"], "why": result["why"],
                     "run": result.get("run")}
+        _arm_packet(cfg, db, decision, gh, args)
         if args.json:
             print(json.dumps({**decision, "ok": True, "requested": False},
                              ensure_ascii=False, indent=1))
@@ -3154,6 +3531,7 @@ def cmd_ci_run(cfg, args) -> int:
         return 0
     if result.get("warnings"):
         print("ameesh ci run: posed, with warnings: %s" % "; ".join(result["warnings"]))
+    _arm_packet(cfg, db, decision, gh, args)
     if args.json:
         print(json.dumps({**decision, "ok": True, "requested": True,
                           "run": result.get("run") or {}}, ensure_ascii=False, indent=1))

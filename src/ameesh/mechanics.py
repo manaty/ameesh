@@ -17,8 +17,16 @@ mécanique, ce que l'outillage exécute sans agent :
   fautif ;
 - `reviews.families`, `exclude_author_family`, `distinct_families` : les
   familles de modèle et l'indépendance des avis ;
+- `reviews.light_reviews` : le nombre d'avis d'un lot **léger** (§2, #2642) ;
+  c'est le plancher lu par `reviews_for`, jamais une règle de chemin — une
+  règle positive reclasse le chemin en sensible et ne doit pas servir de
+  raccourci fourre-tout ;
 - `merge.named_fire`, `repeat_freeze`, `on_green_packet`, `post_merge_red` :
-  la fusion du paquet dès la suite verte, sans feu nominatif ni gel répété.
+  la fusion du paquet dès la suite verte, sans feu nominatif ni gel répété ;
+- `backlog.lot_min_value` (#2584, bloc optionnel) : la valeur à partir de
+  laquelle un défaut non bloquant devient un lot (canon §2 l.129, owner
+  19/10/2026) ; en dessous, il rejoint le panier de son chantier. Bloc absent :
+  `None`, et la route du panier reste inactive — aucun seuil n'est supposé.
 
 Les classes sensibles et le nombre d'avis par chemin ne sont pas répétés : ils
 viennent de `federation.yaml` (`review_policies.risk_classes` et
@@ -33,12 +41,14 @@ immuable qui porte le commit audité.
 """
 from __future__ import annotations
 
+import functools
 import re
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from . import canon, review
+from .deadline import Deadline
 
 #: version du contrat `processus/mecanique.yaml`
 SCHEMA = "ameesh-mechanics/1"
@@ -64,7 +74,7 @@ _LABEL = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 _SHA = re.compile(r"^([0-9a-f]{40}|[0-9a-f]{64})$")
 
 _DOCUMENT_KEYS = ("schema", "timezone", "cutoffs", "packets", "build", "ci", "reviews",
-                  "merge", "prevalidation", "projects")
+                  "merge", "prevalidation", "backlog", "projects")
 _OVERRIDE_KEYS = ("timezone", "cutoffs", "packets", "build", "ci")
 _PACKETS_KEYS = ("cutoffs",)
 #: classes du plan L161f qu'un bloc `prevalidation` peut sélectionner
@@ -73,8 +83,12 @@ _PREVALIDATION_KEYS = ("classes", "contracts", "hosts", "parts_script",
                        "timeout_seconds")
 _BUILD_KEYS = ("max_in_build",)
 _CI_KEYS = ("packet", "incident_label", "environment_red", "faulty_lot")
-_REVIEWS_KEYS = ("families", "exclude_author_family", "distinct_families")
+_REVIEWS_KEYS = ("families", "exclude_author_family", "distinct_families",
+                 "light_reviews")
 _MERGE_KEYS = ("named_fire", "repeat_freeze", "on_green_packet", "post_merge_red")
+_BACKLOG_KEYS = ("lot_min_value",)
+#: bornes du score de valeur d'un élément de backlog (`backlog.add`)
+_VALUE_SCORE = (1, 100)
 
 
 class MechanicsError(canon.CanonError):
@@ -145,6 +159,9 @@ class Document:
     families: tuple[str, ...]
     exclude_author_family: bool
     distinct_families: bool
+    #: nombre d'avis d'un lot léger (`reviews.light_reviews`, §2) ; 0 = aucune
+    #: valeur déclarée (transition bornée à la PR home qui le pose à 1, #2642)
+    light_reviews: int
     merge_named_fire: bool
     merge_repeat_freeze: bool
     merge_on_green_packet: bool
@@ -153,6 +170,8 @@ class Document:
     packet_cutoffs: tuple[str, ...] = ()
     overrides: tuple[ProjectOverride, ...] = ()
     prevalidation: Prevalidation | None = None
+    #: #2584 : seuil de lot d'un défaut non bloquant ; None = bloc absent
+    backlog_lot_min_value: int | None = None
 
     def override(self, project: str) -> ProjectOverride | None:
         for item in self.overrides:
@@ -173,7 +192,8 @@ class Document:
                    "faulty_lot": self.ci_faulty_lot},
             "reviews": {"families": list(self.families),
                         "exclude_author_family": self.exclude_author_family,
-                        "distinct_families": self.distinct_families},
+                        "distinct_families": self.distinct_families,
+                        "light_reviews": self.light_reviews},
             "merge": {"named_fire": self.merge_named_fire,
                       "repeat_freeze": self.merge_repeat_freeze,
                       "on_green_packet": self.merge_on_green_packet,
@@ -183,6 +203,8 @@ class Document:
         if self.prevalidation is not None:
             # absent, la clé n'existe pas : le document sans bloc compile à l'identique
             payload["prevalidation"] = self.prevalidation.to_dict()
+        if self.backlog_lot_min_value is not None:
+            payload["backlog"] = {"lot_min_value": self.backlog_lot_min_value}
         return payload
 
 
@@ -221,6 +243,7 @@ class Mechanics:
     families: tuple[str, ...]
     exclude_author_family: bool
     distinct_families: bool
+    light_reviews: int
     merge_named_fire: bool
     merge_repeat_freeze: bool
     merge_on_green_packet: bool
@@ -229,6 +252,8 @@ class Mechanics:
     rules: tuple[ReviewRule, ...]
     prevalidation: Prevalidation | None = None
     source: str = ""
+    #: #2584 : seuil de lot d'un défaut non bloquant ; None = bloc absent
+    backlog_lot_min_value: int | None = None
 
     # -- coupures -----------------------------------------------------------
 
@@ -246,7 +271,7 @@ class Mechanics:
         return tuple(out)
 
     def cutoff(self, now: float) -> float:
-        """Dernière coupure locale à `now` ou avant (même contrat que `train.cutoff`)."""
+        """Dernière coupure locale à `now` ou avant."""
         local = datetime.fromtimestamp(now, self.zone())
         for offset in (0, -1):
             before = [stamp for stamp, _ in self.cutoffs_on(local.date() + timedelta(days=offset))
@@ -322,6 +347,11 @@ class Mechanics:
     def reviews_for(self, paths) -> ReviewNeed:
         """Classe et nombre d'avis d'un changement décrit par ses chemins.
 
+        Le nombre d'avis d'un chemin léger part du plancher déclaré
+        (`reviews.light_reviews`, §2, #2642) : la classe reste `light`, le
+        plancher ne reclasse pas. Une règle de chemin reste prioritaire et
+        positive : elle reclasse le chemin en sensible, jamais en léger.
+
         Un chemin non léger sans nombre d'avis déclaré fait refuser : le
         lecteur ne suppose jamais un repli (`train_reviews`, PR85).
         """
@@ -336,7 +366,7 @@ class Mechanics:
         if not paths:
             # un changement sans fichier ne se classe pas : zéro avis serait un repli
             raise MechanicsError("no path to classify")
-        risk, reviews = "light", 0
+        risk, reviews = "light", self.light_reviews
         for path in paths:
             if not isinstance(path, str):
                 raise MechanicsError("path is not a repository path: %r" % path)
@@ -378,7 +408,8 @@ class Mechanics:
                    "faulty_lot": self.ci_faulty_lot},
             "reviews": {"families": list(self.families),
                         "exclude_author_family": self.exclude_author_family,
-                        "distinct_families": self.distinct_families},
+                        "distinct_families": self.distinct_families,
+                        "light_reviews": self.light_reviews},
             "merge": {"named_fire": self.merge_named_fire,
                       "repeat_freeze": self.merge_repeat_freeze,
                       "on_green_packet": self.merge_on_green_packet,
@@ -389,6 +420,8 @@ class Mechanics:
         if self.prevalidation is not None:
             # absent, la clé n'existe pas : le document sans bloc compile à l'identique
             payload["prevalidation"] = self.prevalidation.to_dict()
+        if self.backlog_lot_min_value is not None:
+            payload["backlog"] = {"lot_min_value": self.backlog_lot_min_value}
         if self.source:
             payload["source"] = self.source
         return payload
@@ -436,6 +469,18 @@ def _packets(value, where: str) -> tuple[str, ...]:
 def _positive_int(value, where: str) -> int:
     if type(value) is not int or value <= 0:
         raise MechanicsError("%s: a positive integer is required" % where)
+    return value
+
+
+def _review_floor(value, where: str) -> int:
+    """Le nombre d'avis d'un lot léger : 0 (aucune valeur déclarée) ou 1 (§2).
+
+    Le canon §2 demande un avis d'une autre famille pour un lot léger ; 0
+    n'est admis que le temps de la PR home qui pose `light_reviews: 1`
+    (#2642). Aucun autre nombre n'est une règle de revue.
+    """
+    if type(value) is not int or value not in (0, 1):
+        raise MechanicsError("%s: 0 or 1 expected" % where)
     return value
 
 
@@ -567,6 +612,18 @@ def _merge(value, where: str) -> tuple[bool, bool, bool, str]:
             post)
 
 
+def _backlog(value, where: str) -> int:
+    """Le bloc `backlog` (#2584, canon §2 l.129) : le seuil de lot, dans les
+    bornes du score de valeur d'un élément (1 à 100)."""
+    data = _mapping(value, where, _BACKLOG_KEYS)
+    threshold = data.get("lot_min_value")
+    low, high = _VALUE_SCORE
+    if type(threshold) is not int or not low <= threshold <= high:
+        raise MechanicsError("%s.lot_min_value: an integer from %d to %d is required"
+                             % (where, low, high))
+    return threshold
+
+
 def _families(value, where: str) -> tuple[str, ...]:
     if not isinstance(value, list) or not value:
         raise MechanicsError("%s: a non-empty list of families is required" % where)
@@ -643,12 +700,20 @@ def compile_document(text: str, *, source: str = PATH) -> Document:
                              % (source, SCHEMA_PREVALIDATION))
     build = _mapping(parsed.get("build"), source + ".build", _BUILD_KEYS)
     reviews = _mapping(parsed.get("reviews"), source + ".reviews", _REVIEWS_KEYS)
+    # `light_reviews` absent : 0, la transition explicitement bornée à la PR
+    # home qui le pose à 1 (#2642) ; un zéro déclaré se dit, jamais un implicite.
+    light_reviews = _review_floor(reviews.get("light_reviews", 0),
+                                  source + ".reviews.light_reviews")
     packet, label, environment, faulty = _ci(parsed.get("ci"), source + ".ci")
     named_fire, repeat_freeze, on_green, post_merge = _merge(parsed.get("merge"),
                                                              source + ".merge")
     # `packets` optionnel : absent = aucune cadence (tuple vide explicite), un
     # bloc présent — même vide — est validé strictement et refusé s'il est mal formé.
     packets = _packets(parsed["packets"], source + ".packets") if "packets" in parsed else ()
+    # `backlog` optionnel (#2584) : absent = None, la route du panier reste
+    # inactive ; présent, il est validé strictement.
+    lot_min_value = (_backlog(parsed["backlog"], source + ".backlog")
+                     if "backlog" in parsed else None)
     return Document(
         schema=schema,
         timezone=_timezone(parsed.get("timezone"), source + ".timezone"),
@@ -664,6 +729,7 @@ def compile_document(text: str, *, source: str = PATH) -> Document:
                                        source + ".reviews.exclude_author_family"),
         distinct_families=_boolean(reviews.get("distinct_families"),
                                    source + ".reviews.distinct_families"),
+        light_reviews=light_reviews,
         merge_named_fire=named_fire,
         merge_repeat_freeze=repeat_freeze,
         merge_on_green_packet=on_green,
@@ -672,6 +738,7 @@ def compile_document(text: str, *, source: str = PATH) -> Document:
         overrides=_overrides(parsed.get("projects"), source + ".projects"),
         prevalidation=(_prevalidation(parsed["prevalidation"],
                                       source + ".prevalidation") if has_block else None),
+        backlog_lot_min_value=lot_min_value,
     )
 
 
@@ -679,33 +746,59 @@ def compile_document(text: str, *, source: str = PATH) -> Document:
 # lecture au commit exact
 # --------------------------------------------------------------------------
 
-def _exact_commit(repo: str, commit: str) -> str:
+def _git_timeout(deadline: Deadline | None, what: str) -> float:
+    """Le délai d'une lecture git : le plafond du canon, ramené au temps restant.
+
+    Une échéance épuisée refuse avant l'appel (#2665) : la lecture ne part pas
+    pour découvrir après coup qu'elle n'avait plus de budget.
+    """
+    if deadline is None:
+        return canon.GIT_TIMEOUT
+    if deadline.expired():
+        raise MechanicsError("deadline exhausted before %s" % what)
+    return deadline.timeout(canon.GIT_TIMEOUT)
+
+
+def _exact_commit(repo: str, commit: str, *,
+                  deadline: Deadline | None = None) -> str:
     if not isinstance(commit, str) or not _SHA.fullmatch(commit):
         raise MechanicsError("an exact canon commit is required")
     try:
-        resolved = canon.git_commit(repo, commit)
+        resolved = canon.git_commit(
+            repo, commit, timeout=_git_timeout(deadline, "the canon commit"))
     except (canon.GitError, OSError) as exc:
+        if deadline is not None and deadline.expired():
+            raise MechanicsError("deadline exhausted while reading the canon commit") from None
         raise MechanicsError("cannot read the canon repository: %s" % exc) from exc
     if resolved != commit:
         raise MechanicsError("an exact canon commit is required")
     return commit
 
 
-def _regular_blob(repo: str, commit: str, path: str) -> str:
+def _regular_blob(repo: str, commit: str, path: str, *,
+                  deadline: Deadline | None = None) -> str:
     """Le texte d'un fichier ordinaire (`path`) au commit exact, sinon refuse.
 
     `_git_list` est le lecteur d'arbre du canon : il ne retient que les
     fichiers ordinaires (ni lien symbolique, ni sous-module), donc un chemin
-    qui n'en est pas un est refusé comme absent.
+    qui n'en est pas un est refusé comme absent. Avec ``deadline`` (#2665),
+    chaque lecture git ne prend que le temps qui reste au passage.
     """
     try:
-        listed = canon._git_list(repo, commit, path)
+        listed = canon._git_list(
+            repo, commit, path, timeout=_git_timeout(deadline, "the canon tree"))
     except (canon.GitError, OSError) as exc:
+        if deadline is not None and deadline.expired():
+            raise MechanicsError("deadline exhausted while reading the canon tree") from None
         raise MechanicsError("cannot read the canon tree: %s" % exc) from exc
     if len([sha for name, sha in listed if name == path]) != 1:
         raise MechanicsAbsent("%s is absent at %s" % (path, commit))
-    raw = canon.git_read(repo, commit, path)
+    raw = canon.git_read(
+        repo, commit, path, timeout=_git_timeout(deadline, "the canon blob"))
     if raw is None:
+        if deadline is not None and deadline.expired():
+            raise MechanicsError("deadline exhausted while reading %s at %s"
+                                 % (path, commit))
         raise MechanicsAbsent("%s is unreadable at %s" % (path, commit))
     try:
         return raw.decode("utf-8")
@@ -713,16 +806,78 @@ def _regular_blob(repo: str, commit: str, path: str) -> str:
         raise MechanicsError("%s is not UTF-8 at %s" % (path, commit)) from exc
 
 
-def load_global(repo: str, commit: str) -> Document:
+def load_global(repo: str, commit: str, *,
+                deadline: Deadline | None = None) -> Document:
     """Le document global (`processus/mecanique.yaml`) au commit exact."""
-    commit = _exact_commit(repo, commit)
-    return compile_document(_regular_blob(repo, commit, PATH), source=PATH)
+    commit = _exact_commit(repo, commit, deadline=deadline)
+    return compile_document(_regular_blob(repo, commit, PATH, deadline=deadline),
+                            source=PATH)
 
 
-def _federation(repo: str, commit: str) -> dict:
+#: documents globaux déjà compilés, par `(dépôt, commit exact)` : un commit
+#: ne change pas, la passe d'un exécuteur ne relit donc pas le blob par lot
+_CONFIGURED: dict = {}
+
+
+def configured(cfg) -> Document:
+    """Le document global du canon appliqué (#2451), sans repli.
+
+    Même source que le constat de `ameesh canon sync` (`sync_mechanics`) : la
+    première source du canon par défaut, Git et épinglée, à la racine du dépôt.
+    Aucun canon lisible, une source non Git, un canon en sous-répertoire ou un
+    document absent refusent par `MechanicsError` (`MechanicsAbsent` pour le
+    document manquant) : un consommateur historique — plafond d'en-cours,
+    familles de relecture — ne se rabat jamais sur une valeur locale.
+    """
+    canons = canon.load_configured(cfg) if cfg is not None else []
+    if not canons or not canons[0].sources:
+        raise MechanicsError("no readable canon: compiled mechanics unavailable")
+    source = canons[0].sources[0]
+    if source.mode != "git" or not source.repo or not source.commit:
+        raise MechanicsError("no exact canon commit applied: "
+                             "compiled mechanics unavailable")
+    if source.prefix:
+        raise MechanicsError("canon under a sub-directory (%s): the mechanics are "
+                             "read at the Git root only" % source.prefix)
+    key = (source.repo, source.commit)
+    if key not in _CONFIGURED:
+        _CONFIGURED[key] = load_global(source.repo, source.commit)
+    return _CONFIGURED[key]
+
+
+@functools.lru_cache(maxsize=256)
+def light_reviews_at(repo: str, commit: str) -> int:
+    """Le plancher d'avis d'un lot léger au commit exact (#2642).
+
+    Un seul lecteur pour les consommateurs qui n'ont pas déjà l'objet compilé
+    (le lecteur de classe, donc la porte de fusion et `paquet-candidats`) :
+    `compile_document`, strict, et le même commit que la classification.
+    `MechanicsAbsent` remonte tel quel : un canon sans document n'est pas un
+    zéro implicite, c'est au consommateur de dire ce qu'il en fait.
+    """
+    return load_global(repo, commit).light_reviews
+
+
+@functools.lru_cache(maxsize=256)
+def review_flags_at(repo: str, commit: str) -> tuple[bool, bool]:
+    """Les drapeaux `reviews` au commit exact (#2726).
+
+    `(exclude_author_family, distinct_families)`, lus dans le même document
+    `mechanismes` que le plancher léger et la politique de classe. Le lecteur
+    de classe les porte dans `klass` ; la porte de fusion et le train les
+    appliquent au lieu de supposer un repli. `MechanicsAbsent` et
+    `MechanicsError` remontent tels quels, comme `light_reviews_at`.
+    """
+    document = load_global(repo, commit)
+    return document.exclude_author_family, document.distinct_families
+
+
+def _federation(repo: str, commit: str, *,
+                deadline: Deadline | None = None) -> dict:
     try:
-        parsed = canon.load_yaml(_regular_blob(repo, commit, FEDERATION_PATH),
-                                 use_pyyaml=False)
+        parsed = canon.load_yaml(
+            _regular_blob(repo, commit, FEDERATION_PATH, deadline=deadline),
+            use_pyyaml=False)
     except canon.YamlError as exc:
         raise MechanicsError("%s: unreadable YAML: %s" % (FEDERATION_PATH, exc)) from exc
     if not isinstance(parsed, dict):
@@ -791,19 +946,22 @@ def _review_policy(federation: dict, project: str, commit: str
     return policy, tuple(rules)
 
 
-def load(repo: str, commit: str, project: str) -> Mechanics:
+def load(repo: str, commit: str, project: str, *,
+         deadline: Deadline | None = None) -> Mechanics:
     """Compile les paramètres d'un projet depuis le canon, au commit exact.
 
     Aucun repli : projet inconnu, bloc absent, schéma inconnu ou règle mal
     formée refusent, et `commit` doit être un commit exact (jamais une
-    branche ou un tag).
+    branche ou un tag). Avec ``deadline`` (#2665), les lectures git du canon
+    ne prennent que le temps qui reste au passage.
     """
     if not isinstance(project, str) or not project.strip() or project != project.strip():
         raise MechanicsError("an explicit project is required")
-    commit = _exact_commit(repo, commit)
-    document = compile_document(_regular_blob(repo, commit, PATH), source=PATH)
+    commit = _exact_commit(repo, commit, deadline=deadline)
+    document = compile_document(_regular_blob(repo, commit, PATH, deadline=deadline),
+                                source=PATH)
     override = document.override(project)
-    federation = _federation(repo, commit)
+    federation = _federation(repo, commit, deadline=deadline)
     policy, rules = _review_policy(federation, project, commit)
     return Mechanics(
         schema=document.schema,
@@ -833,6 +991,7 @@ def load(repo: str, commit: str, project: str) -> Mechanics:
         families=document.families,
         exclude_author_family=document.exclude_author_family,
         distinct_families=document.distinct_families,
+        light_reviews=document.light_reviews,
         merge_named_fire=document.merge_named_fire,
         merge_repeat_freeze=document.merge_repeat_freeze,
         merge_on_green_packet=document.merge_on_green_packet,
@@ -841,4 +1000,5 @@ def load(repo: str, commit: str, project: str) -> Mechanics:
         rules=rules,
         prevalidation=document.prevalidation,
         source="%s@%s:%s" % (repo, commit, PATH),
+        backlog_lot_min_value=document.backlog_lot_min_value,
     )

@@ -28,6 +28,23 @@ class TrainServiceTest(unittest.TestCase):
                          [mock.call(first, 100), mock.call(second, 101)])
         service.report.assert_called_once()
 
+    def test_a_landed_passage_is_repassed_at_once_on_the_same_deadline(self):
+        """#2965 (c): landing frees a cutoff the packet overran."""
+        passage = mock.Mock()
+        passage.scheduled_step.side_effect = [({"result": "landed"}, 200),
+                                              ({"result": "ci"}, 300)]
+        service = self.service(passage)
+        service.pending.clear()
+        with mock.patch("ameesh.scoped_db.ScopedDb", return_value=mock.Mock()):
+            self.assertEqual(service.pass_once(0, 100), 200)
+        self.assertEqual(service.pending, {0})
+        service.pending.clear()
+        with mock.patch("ameesh.scoped_db.ScopedDb", return_value=mock.Mock()):
+            self.assertEqual(service.pass_once(0, 101), 300)
+        self.assertEqual(service.pending, set())
+        self.assertEqual([call.args[1] for call in passage.scheduled_step.call_args_list],
+                         [100, 101])
+
     def test_schedule_and_engine_share_the_same_compiled_object(self):
         passage = train_runner.Passage.__new__(train_runner.Passage)
         passage.policy = train.Policy(enabled=True)

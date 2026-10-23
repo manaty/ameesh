@@ -75,6 +75,12 @@ PRIORITY_FOOTER = ("Handle it first, then resume your work without waiting "
 TMP_NOTE = ("Temporary files: in $TMPDIR (your own directory, on disk), never hard-coded "
             "in /tmp; nothing over 500 MB in /tmp (in memory, shared by all agents "
             "on the host).")
+#: #2763 : jamais d'installation dans le venv partagé de l'hôte (le
+#: 2026-10-19, un `uv pip install -e` lancé d'un worktree de relecture a
+#: remplacé l'ameesh de pc-smichea et mis six agents critiques en pause)
+VENV_NOTE = ("Never pip/uv install into the host's shared ameesh venv: test a branch "
+             "with `PYTHONPATH=src python -m unittest …`, or a venv of your own "
+             "under $TMPDIR.")
 #: L131: heavy suites go through `ameesh heavy` (on 2026-10-10, 11 agents
 #: started jest, SQL suites and builds together: load 43 for 12 CPUs)
 HEAVY_NOTE = ("Heavy suites (full test suite, jest, SQL suites, build): run them "
@@ -269,6 +275,16 @@ LOT_WAKE_PROMPT = (
     "again; once it is ready for review, move it to qa."
 )
 
+#: #2466 : réveil programmé (séance owner, relecture planifiée, échéance de
+#: reprise d'un hold) — un rendez-vous explicite, même sur un lot tenu
+SCHEDULED_WAKE_PROMPT = (
+    "Scheduled wake for lot #%(id)d \"%(title)s\" (%(state)s): the deadline "
+    "recorded for %(when)s is due. This is an explicit appointment (an owner "
+    "session, a planned slot or the resume time of a hold): open it now. If it "
+    "cannot advance, record a new hold and its next deadline with: ameesh work "
+    "note %(id)d \"hold: <reason>\" --wake-at <ISO time with timezone>."
+)
+
 #: anciens dossiers de binaires acceptés en repli (renommage agent-mesh → ameesh)
 BIN_DIR_ENV = ("AMEESH_BIN_DIR", "AGENT_MESH_BIN_DIR")
 
@@ -385,7 +401,8 @@ class HarnessMissing(RuntimeError):
 
     L106 : c'est une erreur de l'HÔTE (installation, PATH, interpréteur), pas
     de l'agent — l'exécuteur pose « hôte non prêt » et réessaie, sans compter
-    d'échec rapide (L48)."""
+    d'échec rapide (L48). Sert aussi aux capacités absentes d'un descripteur
+    (session interactive non déclarée, #2706) : on refuse avant d'agir."""
 
 
 # --------------------------------------------------------------------------
@@ -1136,6 +1153,21 @@ class HarnessAdapter:
         argv += ["--prompt", text]
         return argv
 
+    def require_interactive(self) -> None:
+        """Refuse un harnais qui ne déclare **aucune** session interactive.
+
+        `ameesh.interactive` est la liste d'arguments de la session (un `[]`
+        légitime) ; `null` (ou absent en ACP) la refuse. Le refus doit tomber
+        avant toute prise de bail : lancer une commande headless sans tâche
+        (dsh `--profile agent`, #2706) ne fait que rendre le bail en quelques
+        secondes, après avoir réveillé l'agent pour rien.
+        """
+        if not self.spec.attach:
+            raise HarnessMissing(
+                "harness %s declares no interactive session (descriptor's "
+                "`ameesh.interactive` is null): `ameesh attach` and `ameesh chat` "
+                "are unavailable for it" % self.key)
+
     def interactive_command(self, session_id: str | None = None, *,
                             permission_mode: str | None = None) -> list[str]:
         """Commande d'une session **interactive** sur la même session (attach, C9).
@@ -1145,10 +1177,7 @@ class HarnessAdapter:
         déclare pas `ameesh.interactive` (typiquement un agent ACP) refuse.
         L223: the permission mode (`permission_mode()`) follows `interactive`.
         """
-        if not self.spec.attach:
-            raise HarnessMissing(
-                "descriptor %s declares no interactive command: "
-                "`ameesh attach` is not available for this harness" % self.key)
+        self.require_interactive()
         argv = [self.binary, *self.spec.launcher, *self.spec.interactive]
         mode = self.permission_mode(permission_mode)
         if mode:

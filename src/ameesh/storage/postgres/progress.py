@@ -118,7 +118,7 @@ class Progress(interface.Progress):
         if not ids:
             return []
         return self.db.query(
-            "SELECT id, work_item_id, kind, actor, verdict, sha,"
+            "SELECT id, work_item_id, kind, actor, verdict, sha, note,"
             "       extract(epoch from at)::float8 AS at_ts"
             "  FROM work_item_milestones WHERE work_item_id IN (%s)"
             " ORDER BY at, id" % _marks(ids), tuple(ids))

@@ -174,7 +174,8 @@ dans le canon :
 * La bascule demande `ameesh migrate` (migration 0028). La configuration de
   l'hôte est relue à chaud (#1466) : un compte ajouté, retiré ou corrigé dans
   `config.json` prend effet au tour suivant, sans redémarrage de l'exécuteur.
-  Seuls les comptes, les plafonds, les rôles critiques et les binaires de
+  Seuls les comptes, les plafonds, les rôles critiques, le partage des comptes
+  (`accounts_shared`, `account_sharing`, `account_registry`) et les binaires de
   harnais suivent la relecture : la base, le schéma, le dossier d'état et les
   cadences sont ceux du démarrage.
 * Deux meshes sur un même hôte (#313, #2580) : un dossier d'identifiants, un
@@ -214,12 +215,18 @@ du choix) :
 
 ```
 harnais   compte         actif   état     jauges
-claude    primaire       oui     ok       five_hour 37% (rythme 83%), seven_day 35% (rythme 55%)
+claude    primaire       oui     ok       five_hour 37% (rythme 73%), seven_day 35% (rythme 45%)
                                           ↳ perdu à la remise à zéro si rien ne change : five_hour 63 % dans 1 h 21, seven_day 65 % dans 3 j 20 h
 claude    secondaire             ok       —
-                                          ↳ prochain choix pour une nouvelle session : sans relevé : non vérifié, premier (L117) ; avant : tertiaire sans relevé : non vérifié, primaire seven_day 35 % utilisé (rythme 55 %)
+                                          ↳ prochain choix pour une nouvelle session : sans relevé : non vérifié, premier (L117) ; avant : tertiaire sans relevé : non vérifié, primaire seven_day 35 % utilisé (rythme 45 %)
 claude    tertiaire              ok       —
 ```
+
+Le rythme affiché — et celui de la raison du prochain choix — est celui de la
+pause d'un agent non critique : la réserve de 10 points gardée pour les agents
+critiques est déduite (#2648), comme dans `accounts.choose`. Un compte encore
+sous son plafond ordinaire mais dans cette bande est donc « limit » et n'est
+pas proposé comme prochain choix.
 
 La colonne « actif » est le **dernier compte choisi** pour une nouvelle
 session (ligne `account_active`) : des agents dont la session est ouverte sur
@@ -231,13 +238,63 @@ ou à `ameesh cost gauges`. Un relevé dont la fenêtre est échue (`resets_at`
 passé) compte pour **0 %** : un compte inutilisé dont le dernier relevé date
 d'une fenêtre close n'est plus jugé au seuil (il ne servait pas, donc son
 relevé n'était jamais rafraîchi). L'affichage garde le dernier relevé :
-« codex-300min 0% (rythme 90%, remise à zéro passée, dernier relevé 93%) ».
+« codex-300min 0% (rythme 80%, remise à zéro passée, dernier relevé 93%) ».
 Un relevé **partiel** (une fenêtre remise à zéro, une autre ouverte) est au
 contraire marqué `↳ reading not current: window reset since the reading
 (unverified)` : la valeur lue n'est qu'une borne, et les pertes annoncées
 sont tues tant que le relevé n'est pas rafraîchi (#1561). Chaque relevé porte
 son horodatage (`read_at` : marqueur de compte Claude, date du journal Codex),
 exposé par `accounts list --json` et l'instantané `progress`.
+
+Les journaux Codex récents sont réconciliés fenêtre par fenêtre (#2839) :
+un relevé hebdomadaire seul ne supprime plus une fenêtre courte encore
+ouverte. Leur horodatage d'événement prime sur la date de modification du
+fichier. À identité et forfait égaux, la dernière observation de chaque
+fenêtre gagne, y compris si sa remise à zéro varie ou a lieu plus tôt.
+Des relevés vivants qui portent des identités de créateur ou des
+forfaits incompatibles rendent le compte ambigu :
+il est refusé, même garde de rythme désactivée, et le choix cherche un autre
+compte. `creator_account_id` ne suffit pas à attribuer un relevé : une session
+reprise peut conserver son créateur alors que ses nouvelles jauges portent
+un autre forfait. Aucune valeur d'identifiant n'apparaît dans le diagnostic.
+Les fenêtres échues ne maintiennent pas ce refus.
+
+#3034 : pour un compte déclaré, le `auth.json` du compte vivant est lu ; son
+`id_token` nomme le forfait (`chatgpt_plan_type`). Si les relevés partagent
+une identité unique, ceux d'un autre forfait ne comptent plus pour
+l'ambiguïté ni dans les fenêtres, au lieu de rendre le compte inutilisable
+après une bascule. Ce forfait n'est pas une certitude : un relevé d'un autre
+forfait peut être plus récent que le dernier du forfait vivant. Aussi, si une
+de ses fenêtres vivantes est saturée ou en overage, le compte reste refusé —
+l'ignorer masquerait une pause ou une dépense. Une fenêtre de l'autre forfait
+déjà remise à zéro ne maintient pas ce refus. Le jeton n'est jamais affiché ni
+journalisé. Sans forfait vivant lisible (fichier absent, vide ou sans jeton),
+ou avec plusieurs identités de créateur, le refus d'ambiguïté reste la règle ;
+le compte non déclaré garde le comportement précédent.
+Sans compte déclaré, l'exécuteur met l'agent en pause avec la raison
+d'ambiguïté ; le rapport de coût affiche cette raison avec des jauges vides.
+La lecture porte sur les 32 journaux les plus récemment modifiés, avec
+256 Kio de fin de fichier et 64 Kio de métadonnées au maximum par journal,
+puis une seule réconciliation. Si une fenêtre attendue reste introuvable
+dans un échantillon tronqué, le compte est refusé comme relevé incomplet :
+une limite de lecture ne doit pas masquer une fenêtre saturée. Le forfait
+pro peut ne publier que la semaine.
+
+#3044 : un compte non-pro **au repos** — aucun relevé plus récent que sa
+fenêtre courte (5 h) — ne peut plus produire de courte vivante. Quand une
+courte a été retenue, échue, elle compte pour 0 % (L71) et le relevé est
+accepté au lieu d'être refusé pour toujours : jamais choisi, le compte ne
+serait jamais rafraîchi. La relaxation est bornée : un relevé récent (moins
+d'une fenêtre courte) sans courte vivante, ou un échantillon sans aucune
+courte, garde le refus #2843 — une courte saturée peut se cacher hors de
+l'échantillon borné, et le format n'est pas prouvé sans courte observée.
+
+#3122 : ce repos ne se prouve que sur les journaux **lus**. Un journal écarté
+du scan (33e par date), un préfixe tronqué (> 256 Kio) ou un journal illisible
+peut porter une courte vivante : sa date de fichier borne ce qu'il a pu
+observer, et le repos n'est accepté que si le plus récent de ces journaux est
+plus vieux qu'une fenêtre courte. Une date inconnue interdit le repos, même
+quand le reste de l'échantillon est au repos.
 
 Depuis la tranche 3 de #1580 (15/10/2026), les jauges d'un compte Claude
 peuvent venir du fichier du widget omarchy (`~/.local/state/omarchy/agents/
@@ -284,7 +341,7 @@ concerné.
 Chaque choix de compte est journalisé avec sa raison dans le journal de
 l'exécuteur (`[agent] compte claude : secondaire — sans relevé : non vérifié,
 premier (L117) ; avant : tertiaire sans relevé : non vérifié, primaire
-seven_day 35 % utilisé (rythme 55 %)`, ou `— continuité :
+seven_day 35 % utilisé (rythme 45 %)`, ou `— continuité :
 la session reste sur primaire, sous son seuil`), une fois par changement de choix et non à
 chaque sondage. Chaque changement du dernier choix est journalisé en base
 (`account_switches`, type `bascule`, avec la même raison) et dans le fil de
@@ -930,6 +987,16 @@ is written rather than a claim under a different identity. Two databases or
 two schemas are two meshes. This is what #1883 could not see: its
 `account_identities` compare fingerprints inside ONE database.
 
+**Identity of the machine** (#2593, 2026-10-19, N3 of the review of #2580).
+A claim also carries a fingerprint of the machine (`/etc/machine-id`, else the
+system hostname; the identifier itself is never written). Claims are matched
+on it, never on the configuration's `host` (`AMEESH_HOST`): two meshes of one
+workstation that name the host differently still see each other. The registry
+is already local to the machine and the user; the fingerprint only guards a
+registry shared between machines (a common `$XDG_STATE_HOME` or
+`account_registry`), where one path names two different credentials. A claim
+written before #2593 has no machine fingerprint and is still matched on `host`.
+
 **Report or refuse.** A credential claimed, within the hour, by **another**
 mesh of the same host is shared. By default this mesh only reports it:
 
@@ -953,7 +1020,10 @@ guard on or off, a turn or `ameesh attach` on it is not started, and
 `ameesh accounts list` gives the reason. The policy belongs to each mesh: to
 keep a credential in mesh A and give it up in mesh B, set `refuse`/`strict` in
 B only. With it in both, neither uses the account until the configurations are
-separated. Any other value is refused when the configuration is read.
+separated. Any other value is refused when the configuration is read. The
+policy and the registry follow the hot reload (#1466, #2571): a switch from
+`report` to `refuse`/`strict`, or a moved `account_registry`, takes effect at
+the next turn and the next claim pass, without restarting the runner.
 
 ```json
 {"accounts_shared": "refuse"}

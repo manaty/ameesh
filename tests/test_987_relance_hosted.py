@@ -4,10 +4,14 @@
 Sans base : la décision pure de `scripts/ci-relance-hosted.py` sur des jobs
 synthétiques au format de l'API GitHub (relevé de première source : job
 115427733668 du run 38428931108 — `cancelled`, `runner_name` vide, aucune
-étape), puis le contrat des deux fichiers de workflow.
+étape ; #2954 : job 119070444901 du run 39554271532 — auto-hébergé, job
+`failure`, étape `part 12` `cancelled`, aucune étape `failure`), puis le
+contrat des deux fichiers de workflow.
 
 La garde ne doit jamais noyer un échec réel, ni boucler sous une capacité qui
-manque durablement : ces deux refus sont testés ici.
+manque durablement : ces deux refus sont testés ici. Une perte de runner
+auto-hébergé (#2954) est rejouée une fois ; une annulation de concurrence et
+un test rouge ne le sont pas.
 """
 from __future__ import annotations
 
@@ -32,19 +36,34 @@ GARDE = REPO / ".github" / "workflows" / "relance-hosted.yml"
 
 
 def job(nom, conclusion, runner="", etapes=(), labels=()):
-    """Un job au format de l'API (champs qui décident, seulement)."""
+    """Un job au format de l'API (champs qui décident, seulement).
+
+    Une étape est un nom (sans conclusion) ou un dict complet quand la
+    conclusion de l'étape décide (perte de runner, #2954).
+    """
+    steps = [e if isinstance(e, dict) else {"name": e} for e in etapes]
     return {"name": nom, "conclusion": conclusion, "runner_name": runner,
-            "steps": [{"name": e} for e in etapes], "labels": list(labels)}
+            "steps": steps, "labels": list(labels)}
 
 
 #: le job annulé faute de runner : jamais pris, aucune étape (signature #987)
 MACOS_ANNULE = job("plateforme macOS", "cancelled", labels=["macos-26-intel"])
-#: l'agrégat requis, rouge parce qu'il exige platform-macos == success
+#: l'agrégat requis, rouge sur un vrai échec d'une part (le job macOS n'est
+#: plus dans ses `needs` depuis la décision de la revue #393)
 AGREGAT = job("tests", "failure", runner="ameesh-ci-1-1",
               etapes=["bilan des parts"],
               labels=["self-hosted", "linux", "ameesh-ci"])
 PLAN = job("plan", "success", runner="ameesh-ci-2-1", etapes=["plan du run"],
            labels=["self-hosted", "linux", "ameesh-ci"])
+#: job auto-hébergé dont le runner a disparu (relevé run 39554271532, job
+#: 119070444901) : le job conclut `failure`, l'étape utile est `cancelled`,
+#: aucune étape ne conclut `failure`
+PSQL_PERDU = job("psql 12/16", "failure", runner="ameesh-ci-1-1",
+                 etapes=[{"name": "Set up job", "conclusion": "success"},
+                         {"name": "part 12", "conclusion": "cancelled"},
+                         {"name": "fin du check run", "conclusion": "skipped"},
+                         {"name": "Complete job", "conclusion": "success"}],
+                 labels=["self-hosted", "linux", "ameesh-ci"])
 
 
 class DecisionTest(unittest.TestCase):
@@ -75,7 +94,35 @@ class DecisionTest(unittest.TestCase):
         psql = job("psql 1/1", "cancelled", labels=["self-hosted", "linux", "ameesh-ci"])
         relancer, raison = ci_relance.decision([PLAN, psql, AGREGAT], 1)
         self.assertFalse(relancer, raison)
-        self.assertIn("aucun job hébergé", raison)
+        self.assertIn("psql 1/1", raison)
+
+    def test_job_auto_heberge_perdu_relance_une_fois(self):
+        # #2954 : le runner du groupe a disparu en cours de part ; l'étape
+        # utile est annulée, aucune étape n'a échoué
+        relancer, raison = ci_relance.decision([PLAN, PSQL_PERDU, AGREGAT], 1)
+        self.assertTrue(relancer, raison)
+        self.assertIn("psql 12/16", raison)
+
+    def test_job_auto_heberge_echec_reel_ne_relance_pas(self):
+        # un vrai test rouge a une étape `failure` : ce n'est pas une perte
+        # de runner, même si le job conclut ensuite `failure`
+        psql = job("psql 12/16", "failure", runner="ameesh-ci-1-1",
+                   etapes=[{"name": "part 12", "conclusion": "failure"},
+                           {"name": "Complete job", "conclusion": "success"}],
+                   labels=["self-hosted", "linux", "ameesh-ci"])
+        relancer, raison = ci_relance.decision([PLAN, psql, AGREGAT], 1)
+        self.assertFalse(relancer, raison)
+        self.assertIn("psql 12/16", raison)
+
+    def test_annulation_de_concurrence_auto_hebergee_ne_relance_pas(self):
+        # la concurrence conclut le job `cancelled` (pas `failure`) : elle ne
+        # doit pas être confondue avec une perte de runner
+        annule = job("psql 12/16", "cancelled", runner="ameesh-ci-1-1",
+                     etapes=[{"name": "part 12", "conclusion": "cancelled"}],
+                     labels=["self-hosted", "linux", "ameesh-ci"])
+        relancer, raison = ci_relance.decision([PLAN, annule, AGREGAT], 1)
+        self.assertFalse(relancer, raison)
+        self.assertIn("psql 12/16", raison)
 
     def test_job_annule_avec_etapes_n_est_pas_la_signature(self):
         # un job pris par un runner puis annulé (concurrency) a des étapes :
@@ -95,7 +142,7 @@ class DecisionTest(unittest.TestCase):
     def test_aucun_job_annule_ne_relance_pas(self):
         relancer, raison = ci_relance.decision([PLAN, AGREGAT], 1)
         self.assertFalse(relancer, raison)
-        self.assertIn("aucun job hébergé", raison)
+        self.assertIn("aucun job annulé", raison)
 
     def test_jamais_pris(self):
         self.assertTrue(ci_relance.jamais_pris(MACOS_ANNULE))
@@ -106,6 +153,26 @@ class DecisionTest(unittest.TestCase):
         self.assertFalse(ci_relance.jamais_pris(
             job("x", "failure", labels=["macos-26-intel"])))
 
+    def test_perdu_par_son_runner(self):
+        # #2954 : signature de première source, et ses refus
+        self.assertTrue(ci_relance.perdu_par_son_runner(PSQL_PERDU))
+        self.assertFalse(ci_relance.perdu_par_son_runner(MACOS_ANNULE))
+        self.assertFalse(ci_relance.perdu_par_son_runner(
+            job("psql 1/1", "failure", labels=["self-hosted", "linux", "ameesh-ci"],
+                etapes=[{"name": "part 1", "conclusion": "cancelled"}])))
+        self.assertFalse(ci_relance.perdu_par_son_runner(
+            job("psql 1/1", "failure", runner="ameesh-ci-1-1",
+                labels=["self-hosted", "linux", "ameesh-ci"],
+                etapes=[{"name": "part 1", "conclusion": "success"}])))
+        self.assertFalse(ci_relance.perdu_par_son_runner(
+            job("psql 1/1", "failure", runner="ameesh-ci-1-1",
+                labels=["self-hosted", "linux", "ameesh-ci"],
+                etapes=[{"name": "part 1", "conclusion": "failure"}])))
+        self.assertFalse(ci_relance.perdu_par_son_runner(
+            job("psql 1/1", "cancelled", runner="ameesh-ci-1-1",
+                labels=["self-hosted", "linux", "ameesh-ci"],
+                etapes=[{"name": "part 1", "conclusion": "cancelled"}])))
+
     def test_check_run_de_flux_n_est_pas_un_job(self):
         # les check runs « tests (flux) » des parts (L161c) apparaissent dans
         # la liste des jobs avec des étiquettes vides (relevé run 38377916850) :
@@ -113,6 +180,7 @@ class DecisionTest(unittest.TestCase):
         flux = job("tests (flux) psql 1/1", "cancelled")
         self.assertFalse(ci_relance.job_reel(flux))
         self.assertFalse(ci_relance.jamais_pris(flux))
+        self.assertFalse(ci_relance.perdu_par_son_runner(flux))
 
     def test_check_run_de_flux_annule_ne_bloque_pas_la_relance(self):
         # un check run de flux annulé à côté du job macOS annulé ne doit pas
@@ -186,11 +254,12 @@ class WorkflowTest(unittest.TestCase):
         self.assertIn("runs-on: macos-26-intel", texte)
         self.assertNotIn("runs-on: macos-latest", texte)
 
-    def test_le_check_requis_exige_toujours_macos(self):
-        # la garde ne remplace pas la porte : l'agrégat requis exige encore le
-        # succès du job macOS (une annulation reste rouge tant qu'elle dure)
+    def test_le_job_macos_n_est_pas_encore_requis(self):
+        # Décision de la revue #393 : le job macOS n'entre dans les `needs` de
+        # l'agrégat qu'une fois la suite complète verte sous macOS. La relance
+        # garde son utilité : une annulation de capacité reste reprise.
         texte = TESTS.read_text(encoding="utf-8")
-        self.assertIn('test "${{ needs.platform-macos.result }}" = success', texte)
+        self.assertNotIn('test "${{ needs.platform-macos.result }}" = success', texte)
 
     def ligne_declencheurs(self):
         """La ligne `workflows:` de la garde : le contrat du déclencheur."""

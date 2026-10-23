@@ -42,6 +42,10 @@ from .canon import FETCH_TIMEOUT, GitError
 LOCK_TTL_S = float(os.environ.get("AMEESH_LAND_LOCK_TTL", "1800"))
 #: one gate at most
 GATE_TIMEOUT_S = float(os.environ.get("AMEESH_LAND_GATE_TIMEOUT", "1800"))
+#: L165 (EP4) : marge du bail élu renouvelée juste avant un push/merge externe
+#: (`FETCH_TIMEOUT` du push + marge de lecture). La course résiduelle est
+#: documentée dans `docs/HOST-HANDOFFS.md`.
+AGENT_CALL_MARGIN_S = FETCH_TIMEOUT + 60.0
 #: lines of a failed gate's output kept in the ejection
 GATE_TAIL = 20
 TRAILER = "ameesh-work"
@@ -114,7 +118,11 @@ def _branch_of(target: str) -> str:
 
 
 def _origin(project) -> str:
-    return plan_git._out(project.repo, "remote", "get-url", "origin") or ""
+    """#3041 : l'URL `origin` du checkout, un chemin relatif lu depuis lui
+    (elle est rejouée dans le clone du radar)."""
+    from . import resolutions
+    url = plan_git._out(project.repo, "remote", "get-url", "origin") or ""
+    return resolutions._local_from(project.repo, url)
 
 
 def _passive(db, to, lot: int, text: str, data: dict) -> None:
@@ -365,7 +373,8 @@ def pr_status(slug: str, branch: str, gh=_gh, *, project=None) -> dict | None:
     rows = _json(proc, "gh pr list", list)
     if not rows:
         return None
-    rollup = radar.latest_rollup(rows[0].get("statusCheckRollup"))
+    rollup = radar.merge_rollup(rows[0].get("statusCheckRollup"), slug=slug,
+                                head=rows[0].get("headRefOid") or "", branch=branch, gh=gh)
     required = radar.required_statuses(project, branch)
     pending = any((c.get("status") or "COMPLETED") != "COMPLETED"
                   or (c.get("state") or "") == "PENDING" for c in rollup)
@@ -536,7 +545,7 @@ class _Landing:
     once, at the end (`land_head`)."""
 
     def __init__(self, db, project, row, key, owner, epoch, locks, projects=(),
-                 cfg=None, clone=None, replayer=None, parts=None):
+                 cfg=None, clone=None, replayer=None, parts=None, fence=None):
         self.db, self.project, self.row = db, project, row
         self.lot = int(row["work_item_id"])
         self.ops = storage.of(db).work
@@ -544,6 +553,9 @@ class _Landing:
         self.release = False
         self.projects = projects
         self.cfg, self.clone = cfg, clone
+        #: L165 (EP4) : garde du bail élu, appliquée juste avant chaque effet
+        #: externe (push de la cible, push de la branche, fusion de la PR).
+        self.fence = fence
         #: L1651 : le clone radar (pour relire la source de sélection versionnée
         #: de la cible) et les parts dues déjà requalifiées par l'appelant
         #: (§12 : le manifeste de paquet remplace la CI individuelle)
@@ -593,6 +605,21 @@ class _Landing:
             return True
         self.locks.pop(self.key, None)
         return False
+
+    def fence_hold(self) -> None:
+        """L165 (EP4) : renouvelle le bail élu juste avant l'effet externe.
+
+        Refusé (`LandError`) si l'époque a changé, si le bail n'a pas la marge
+        de l'appel, ou si le rôle s'est arrêté. L'effet externe n'est alors
+        jamais atteint ; `land_head` journalise l'erreur et rend la ligne.
+        """
+        if self.fence is None:
+            return
+        from . import pilot_gesture
+        try:
+            self.fence.hold(self.db, margin_s=AGENT_CALL_MARGIN_S)
+        except pilot_gesture.GestureRefused as exc:
+            raise LandError(str(exc)) from exc
 
     def write(self, **kw) -> bool:
         return self.ops.queue_update(self.lot, lease=self.lease, entry=self.entry, **kw) is not None
@@ -674,13 +701,15 @@ class _Landing:
         from . import review_lot
         try:
             item = work.get(self.db, self.lot)
+            repo = self.clone or self.project.repo
             klass = review_lot.class_at_merge(
-                self.db, self.lot, item=item,
-                repo=self.clone or self.project.repo,
+                self.db, self.lot, item=item, repo=repo,
                 target=self.row.get("target") or "", sha=merged_sha)
+            # #2585 : le dépôt sert aussi de preuve que le gel relu est entré
+            # dans le commit fusionné.
             return review_lot.open_after_merge(
                 self.db, lot=self.lot, klass=klass, item=item, merged_sha=merged_sha,
-                pr=pr, target=self.row.get("target") or "")
+                pr=pr, target=self.row.get("target") or "", repo=repo)
         except Exception as exc:  # noqa: BLE001 - la fusion est un fait, jamais défait
             return {"lot": self.lot, "id": None, "created": False, "class": "",
                     "why": "lot de relecture non ouvert : %s: %s"
@@ -735,6 +764,16 @@ def land_head(cfg, db, project, row: dict, *, owner: str, replayer=None, locks=N
             "queue source %s does not match project %s repository; select the source "
             "project (or requeue a legacy entry without a source)"
             % (source or "<missing>", project.name))}
+    # L165 (EP4) : faire atterrir la file est un geste du pilote hors base (le
+    # push suit). Un passage radar n'a pas d'identité de session : sans bail
+    # élu à vérifier, `gate` ne fait rien. Le bail est renouvelé juste avant
+    # chaque push/merge dans `_Landing.fence_hold`.
+    from . import pilot_gesture
+    try:
+        fence = pilot_gesture.gate(cfg, db, "queue", "land #%d" % lot,
+                                   project=project.name)
+    except pilot_gesture.GestureRefused as exc:
+        return {"lot": lot, "result": "error", "error": str(exc)}
     projects = tuple(radar.settings_of(cfg).projects.values())
     key = lock_key(project, row["target"])
     ops = storage.of(db).work
@@ -747,10 +786,11 @@ def land_head(cfg, db, project, row: dict, *, owner: str, replayer=None, locks=N
         return {"lot": lot, "result": "busy"}
     locks[key] = epoch
     if replayer is None:
-        replayer = resolutions.Replayer(project.repo, radar.clone_dir(cfg, project.name))
+        replayer = resolutions.Replayer(project.repo, radar.clone_dir(cfg, project.name),
+                                        target=project.target)
     landing = _Landing(db, project, row, key, owner, epoch, locks, projects,
                        cfg=cfg, clone=getattr(replayer, "path", None), replayer=replayer,
-                       parts=parts)
+                       parts=parts, fence=fence)
     slug = radar.github_slug(project) if project.land == "pr" else None
     try:
         try:
@@ -920,6 +960,8 @@ def _land(landing: _Landing, replayer, slug, gh) -> dict:
         stopped = _fire_guard(landing, gh=gh)
         if stopped is not None:
             return stopped
+        # L165 (EP4) : bail élu renouvelé juste avant le push externe.
+        landing.fence_hold()
         # #194 r6: one atomic push, two compare-and-swaps that the server
         # checks: the target on the base seen, the lease ref on the value this
         # holder wrote — moved to a child commit, so git sends that update
@@ -960,7 +1002,14 @@ def _land(landing: _Landing, replayer, slug, gh) -> dict:
     stopped = _fire_guard(landing, gh=gh)
     if stopped is not None:
         return stopped
+    # L165 (EP4) : bail élu renouvelé juste avant le push de la branche.
+    landing.fence_hold()
     # #194 r4: compare and swap on the freeze (see `local`)
+    # #3080: publish the landing identity before its head can be seen on the
+    # forge. Otherwise fire can observe the push while the row is still
+    # queued, mistake our merge for a third-party push and withdraw the fire.
+    if not landing.write(state="landing", landing_sha=merged["sha"]):
+        return landing.busy("lease on %s lost before pushing" % landing.key)
     branch_ref = "refs/heads/%s" % row["branch"]
     proc = resolutions._run(replayer.path, "push", "--quiet", "--no-verify",
                             "--force-with-lease=%s:%s" % (branch_ref, row["frozen_sha"]),
@@ -1020,6 +1069,50 @@ def pr_view(slug: str, number, gh=_gh) -> dict:
             "state": data.get("state")}
 
 
+def merged_base(replayer, project, branch: str) -> str:
+    """#2603 : la cible par défaut du dépôt, quand `branch` y est déjà
+    fusionnée ; sinon "".
+
+    La file exige déjà que la PR vise la cible du lot (`branch`) ; restait le
+    cas d'une cible de travail elle-même déjà fusionnée dans la cible par
+    défaut : fusionner la PR dessus pose le contenu sur une branche morte
+    (home#112/#113 après la fusion de canon/2452). La cible par défaut est lue
+    dans le dépôt du projet ; une cible configurée introuvable refuse
+    (`LandError`) plutôt que de laisser fusionner à l'aveugle. Un `fetch`
+    impossible refuse : relire la seule cible du lot ne prouve pas que la
+    branche par défaut est lisible."""
+    from . import resolutions
+
+    base = _branch_of(branch or "")
+    try:
+        default = _branch_of(plan_git.default_target(project.repo) or "")
+    except plan_git.MergeProbeError as exc:
+        raise LandError("cannot read the default target of %s: %s: not landing on %s"
+                        % (project.repo, exc, base or "?")) from exc
+    if not base:
+        return ""
+    if not default:
+        raise LandError("cannot determine the default target of %s: not landing on %s"
+                        % (project.repo, base))
+    if base == default:
+        return ""
+    url = _origin(project) or project.repo
+    refs = ("refs/ameesh/land/base", "refs/ameesh/land/default")
+    proc = resolutions._run(replayer.path, "fetch", "--quiet", "--no-tags", url,
+                            "+refs/heads/%s:%s" % (base, refs[0]),
+                            "+refs/heads/%s:%s" % (default, refs[1]),
+                            timeout=FETCH_TIMEOUT)
+    if proc.returncode != 0:
+        raise LandError("cannot compare stacked base %s with %s: %s"
+                        % (base, default, resolutions._err(proc)[:200]))
+    compared = resolutions._run(replayer.path, "merge-base", "--is-ancestor",
+                                refs[0], refs[1])
+    if compared.returncode not in (0, 1):
+        raise LandError("cannot compare stacked base %s with %s: %s"
+                        % (base, default, resolutions._err(compared)[:200]))
+    return default if compared.returncode == 0 else ""
+
+
 def _follow_pr(landing: _Landing, slug, *, gh, replayer) -> dict:
     project, row, lot = landing.project, landing.row, landing.lot
     branch = _branch_of(row["target"])
@@ -1064,6 +1157,13 @@ def _follow_pr(landing: _Landing, slug, *, gh, replayer) -> dict:
         return landing.eject("PR #%s targets %s, not %s" % (
             status["number"], status.get("base") or "?", branch),
             "Point the PR at %s, freeze again, then ameesh work queue add %d." % (branch, lot))
+    stale_base = merged_base(replayer, project, branch)
+    if stale_base:
+        return landing.eject(
+            "PR #%s targets %s, already merged into %s: merging it there would land its "
+            "content on a dead branch" % (status["number"], branch, stale_base),
+            "Retarget the PR (`gh pr edit --base %s %s`), freeze again, then "
+            "ameesh work queue add %d." % (stale_base, status["number"], lot))
     if not merge_queue._same(status["head"], row.get("landing_sha")):
         return landing.eject("its branch moved while ameesh was landing it (%s)"
                              % (status["head"] or "?")[:12],
@@ -1102,6 +1202,9 @@ def _follow_pr(landing: _Landing, slug, *, gh, replayer) -> dict:
     stopped = _fire_guard(landing, gh=gh)
     if stopped is not None:
         return stopped
+    # L165 (EP4) : bail élu renouvelé juste avant `gh pr merge` ; la fusion
+    # GitHub n'est pas dans la transaction, d'où la marge.
+    landing.fence_hold()
     error = pr_merge(slug, status["number"], row["landing_sha"], project.merge_method, gh=gh)
     # #194 r8: past this call, the PR may be merged: nothing raises any more,
     # and every outcome is read back from GitHub

@@ -36,8 +36,8 @@ from typing import Any, Mapping, Optional
 
 from ..storage.postgres.mailbox import PROJECT_SQL
 from ..storage.postgres.hosts import TURN_COLUMNS
-from ..storage.postgres.registry import (canon_governed_sql, placement_admitted_sql,
-                                         write_runner_seen)
+from ..storage.postgres.registry import (canon_governed_sql, check_name,
+                                         placement_admitted_sql, write_runner_seen)
 from .contract import Fence, Operation, agent_name
 from .interfaces import Principal, ScopeError, ScopeRules
 
@@ -70,11 +70,18 @@ def host_available(db, host: str) -> bool:
     return bool(rows and rows[0]["ok"])
 
 
-def admitted_sql() -> str:
-    """Requête des agents admis sur un hôte (paramètre : l'hôte)."""
+def admitted_sql(host: str) -> str:
+    """Requête des agents admis sur un hôte (paramètre lié : l'hôte).
+
+    L165 (EP1) : un agent `releve: election` est admis sur chaque hôte
+    candidat, même si sa ligne est encore chez un autre ; l'admission est
+    alors celle de CET hôte (`agent_candidates`), pas celle de la ligne.
+    """
+    host = check_name(host)
     return ("SELECT r.name, r.credential_mode FROM agent_registry r"
-            " WHERE r.host = %%s AND %s AND %s ORDER BY r.name"
-            % (canon_governed_sql("r"), placement_admitted_sql("r")))
+            " WHERE (r.host = %%s OR (r.releve = 'election' AND %%s = ANY(r.candidats)))"
+            " AND %s AND %s ORDER BY r.name"
+            % (canon_governed_sql("r"), placement_admitted_sql("r", host=host)))
 
 
 class HostScopeRules(ScopeRules):
@@ -90,7 +97,8 @@ class HostScopeRules(ScopeRules):
     # -- agents admis -------------------------------------------------------
     def admitted_agents(self, principal: Principal) -> frozenset:
         if self._admitted is None:
-            rows = self.db.query(admitted_sql(), (principal.host,))
+            rows = self.db.query(admitted_sql(principal.host),
+                                 (principal.host, principal.host))
             names = {r["name"] for r in rows
                      if self.credential_modes is None
                      or (r.get("credential_mode") or "") in self.credential_modes}
@@ -226,6 +234,8 @@ class HostScopeRules(ScopeRules):
         kw["limit"] = self._bound_limit(kw.get("limit"))
 
     _apply_mailbox_unread_urgent = _apply_mailbox_unread
+    _apply_mailbox_unread_human = _apply_mailbox_unread
+    _apply_mailbox_unread_human_page = _apply_mailbox_unread
 
     def _apply_mailbox_reserve(self, principal, kw, fence):
         self._owner_epoch(kw)

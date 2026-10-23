@@ -166,13 +166,30 @@ class BasculeTest(unittest.TestCase):
         alias = self.venv / "bin" / "python3"
         alias.unlink()
         alias.symlink_to(os.path.realpath(sys.executable))
-        for nom in ("agent-mail", "agent-runner"):
-            script = self.venv / "bin" / nom
-            script.write_text("#!%s\nimport pkg1969\nprint(pkg1969.VALUE)\n" % alias)
-            script.chmod(0o755)
+        script = self.venv / "bin" / "agent-mail"
+        script.write_text("#!%s\nimport pkg1969\nprint(pkg1969.VALUE)\n" % alias)
+        script.chmod(0o755)
+        # #3135 : un script hérité valide peut commencer par une docstring et un
+        # `from __future__` ; la conversion ne doit pas invalider l'ordre exigé
+        # par Python (relecture ameesh-cx2, B1).
+        script = self.venv / "bin" / "agent-runner"
+        script.write_text("#!%s\n\"\"\"Legacy command.\"\"\"\n"
+                          "from __future__ import annotations\n"
+                          "import pkg1969\nprint(pkg1969.VALUE)\n" % alias)
+        script.chmod(0o755)
         vrai_venv(self.base, "v2", "v2", "new_only")
         (self.base / "venv-v2" / bascule.MARKER).write_text('{}')
         self.assertEqual(0, activer(self.venv, "v2", precedent="v1"))
+        # #3135 : python3 est devenu un lanceur /bin/sh ; un script hérité qui
+        # garderait `#!…/bin/python3` serait un shebang imbriqué, que macOS
+        # refuse (Errno 8). Il passe par /usr/bin/env (binaire), qui exécute le
+        # lanceur ; seul le shebang change.
+        for nom in ("agent-mail", "agent-runner"):
+            lignes = (self.venv / "bin" / nom).read_text().splitlines()
+            self.assertEqual(lignes[0], "#!/usr/bin/env %s" % alias, nom)
+        lignes = (self.venv / "bin" / "agent-runner").read_text().splitlines()
+        self.assertEqual(lignes[1], '"""Legacy command."""')
+        self.assertEqual(lignes[2], "from __future__ import annotations")
         for valeur in ("v2", "v1"):
             for nom in ("python", "python3", "agent-mail", "agent-runner"):
                 with self.subTest(version=valeur, commande=nom):
@@ -184,6 +201,37 @@ class BasculeTest(unittest.TestCase):
                     self.assertEqual(valeur, resultat.stdout.strip())
             if valeur == "v2":
                 self.assertEqual(0, retour(self.venv))
+
+    def test_script_herite_garde_ses_instructions_sur_une_ligne(self):
+        """#3135 B1 (ameesh-cx2) : la conversion ne touche qu'au shebang.
+
+        Les cas « docstring ; from __future__ » et deux imports __future__ sur
+        une même ligne restent valides : le corps du script est intact, sans
+        déplacement ni duplication d'instructions.
+        """
+        vrai_venv(self.base, "v1", "v1", "old_only")
+        os.rename(self.base / "venv-v1", self.venv)
+        alias = self.venv / "bin" / "python3"
+        alias.unlink()
+        alias.symlink_to(os.path.realpath(sys.executable))
+        corps = ('#!%s\n'
+                 '"""Legacy command."""; from __future__ import annotations\n'
+                 'from __future__ import annotations; from __future__ import division; '
+                 'print("once")\n'
+                 'print("OK")\n' % alias)
+        script = self.venv / "bin" / "herite"
+        script.write_text(corps)
+        script.chmod(0o755)
+        vrai_venv(self.base, "v2", "v2", "new_only")
+        (self.base / "venv-v2" / bascule.MARKER).write_text('{}')
+        self.assertEqual(0, activer(self.venv, "v2", precedent="v1"))
+        lignes = script.read_text().splitlines()
+        self.assertEqual(lignes[0], "#!/usr/bin/env %s" % alias)
+        self.assertEqual(lignes[1:], corps.splitlines()[1:],
+                         "le corps du script a été déplacé ou dupliqué")
+        resultat = subprocess.run([str(script)], capture_output=True, text=True)
+        self.assertEqual(0, resultat.returncode, resultat.stderr)
+        self.assertEqual(resultat.stdout.splitlines(), ["once", "OK"])
 
     def test_script_console_ajoute_par_une_version_ulterieure_est_expose(self):
         """#2155 : un point d'entrée pip de la v2 apparaît dans le venv stable."""

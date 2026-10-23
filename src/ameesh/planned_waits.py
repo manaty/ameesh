@@ -122,23 +122,14 @@ def explicit_holds(events, *, allowed=None) -> dict[int, dict]:
     return out
 
 
-def pilot_holds(db, events, *, cfg=None) -> dict[int, dict]:
-    """Les holds posés par un pilote (#1664) — les seuls comptés par la
-    stagnation.
-
-    `events` est le flux ciblé lu par le stockage
-    (`Progress.lot_hold_events` : transitions d'état + notes hold/levée), ou
-    un journal complet ; les deux donnent le même hold.
+def _pilot_allowed(db, cfg):
+    """Le prédicat d'autorisation d'un hold de pilote (#1664, #2916).
 
     Même autorisation que la correction d'état et la désignation du relecteur
     (`work.corrector`, rôles `work.CORRECTOR_ROLES`) : un humain, ou un agent
     orchestrateur/conception déclaré (`AMEESH_ALERT_ORCHESTRATORS`, fiche Agent
     du canon), sans l'historique des lots confiés. Un hold d'un autre acteur
     garde son effet sur le réveil (règle 1) mais ne supprime pas l'alerte."""
-    events = list(events or ())
-    if not any(is_hold_note(event.get("note")) for event in events):
-        return {}
-    cfg = getattr(db, "cfg", None) if cfg is None else cfg
     from . import assignments, work            # imports tardifs : pas de cycle
     verdict: dict[str, bool] = {}
 
@@ -154,7 +145,78 @@ def pilot_holds(db, events, *, cfg=None) -> dict[int, dict]:
                 verdict[who] = False           # autorisation illisible : pas de hold
         return verdict[who]
 
-    return explicit_holds(events, allowed=allowed)
+    return allowed
+
+
+def pilot_holds(db, events, *, cfg=None) -> dict[int, dict]:
+    """Les holds posés par un pilote (#1664) — les seuls comptés par la
+    stagnation.
+
+    `events` est le flux ciblé lu par le stockage
+    (`Progress.lot_hold_events` : transitions d'état + notes hold/levée), ou
+    un journal complet ; les deux donnent le même hold. La lecture
+    d'autorisation est celle de `_pilot_allowed`."""
+    events = list(events or ())
+    if not any(is_hold_note(event.get("note")) for event in events):
+        return {}
+    cfg = getattr(db, "cfg", None) if cfg is None else cfg
+    return explicit_holds(events, allowed=_pilot_allowed(db, cfg))
+
+
+def pilot_hold_releases(db, events, *, cfg=None) -> dict[int, list]:
+    """#2916 : les instants où un hold de pilote a été levé, par lot.
+
+    Même journal et même autorisation que `pilot_holds` (`hold:` d'un pilote,
+    levé par `unhold:`/`hold lifted:`/`cleared:` ou par un changement d'état).
+    Le délai intake repart de la dernière levée antérieure au début du lot
+    (#2921) : le temps parqué sous un hold de pilote n'est pas un retard
+    imputable au porteur. Un `hold:` d'un acteur ordinaire ne compte pas — il
+    ne suspend pas la stagnation non plus. Toutes les levées sont rendues :
+    l'appelant les filtre par `started` avant de choisir la dernière.
+    """
+    events = list(events or ())
+    if not any(is_hold_note(event.get("note")) for event in events):
+        return {}
+    cfg = getattr(db, "cfg", None) if cfg is None else cfg
+    allowed = _pilot_allowed(db, cfg)
+    ordered: dict[int, list[dict]] = {}
+    for event in events:
+        ordered.setdefault(int(event["work_item_id"]), []).append(event)
+    out: dict[int, list] = {}
+    for ident, lot_events in ordered.items():
+        try:
+            held = False
+            previous = None
+            released: list = []
+            for event in sorted(lot_events,
+                                key=lambda e: (float(e.get("created_ts") or 0.0),
+                                               int(e.get("id") or 0))):
+                state = event.get("state")
+                at = event.get("created_ts")
+                if previous is not None and state != previous:
+                    if held and at is not None:
+                        released.append(float(at))
+                    held = False
+                previous = state
+                text = str(event.get("note") or "").strip()
+                if not text:
+                    continue
+                if is_hold_note(text):
+                    if allowed(event.get("actor") or ""):
+                        held = True
+                elif is_lift_note(text) and held:
+                    if not allowed(event.get("actor") or ""):
+                        continue
+                    held = False
+                    if at is not None:
+                        released.append(float(at))
+        except (TypeError, ValueError):
+            # #1107 : un journal illisible est isolé par lot ; le calcul SLO
+            # du lot portera lui-même l'alerte `lot_unreadable`.
+            continue
+        if released:
+            out[ident] = released
+    return out
 
 
 def ancestors(package_id, packages):
@@ -216,6 +278,165 @@ def packet_carriers(rows):
     return out
 
 
+#: #2599 : commits lus au plus sur la branche d'un porteur (borne de coût)
+MAX_PACKET_COMMITS = 500
+
+
+def _dry_pass(db) -> bool:
+    """La connexion est-elle une passe à blanc de `db.batched` ?
+
+    Une passe à blanc n'envoie aucune requête : la lecture des trailers
+    (git) attend la vraie passe, sinon elle est refaite à chaque niveau de
+    préchargement (#2599). La classe `_Recorder` de `db.batched` est la seule
+    marque d'une passe à blanc."""
+    from . import db as db_mod
+
+    return isinstance(db, db_mod._Recorder)
+
+
+def _carrier_ref(repo, carrier):
+    """La ref lisible de la branche du porteur, sans fetch.
+
+    La branche publiée d'abord, puis la branche locale, puis la tête observée
+    (`branch_head`) : un clone qui n'a pas la branche peut quand même avoir
+    le commit du dernier relevé. Aucune ref : None."""
+    from . import plan_git
+
+    branch = str(carrier.get("branch") or "").strip()
+    refs = []
+    if branch:
+        refs += [plan_git.published_target(repo, branch), branch,
+                 "refs/remotes/origin/" + branch, "refs/heads/" + branch]
+    head = str(carrier.get("branch_head") or "").strip()
+    if head:
+        refs.append(head)
+    for ref in refs:
+        if plan_git._commit(repo, ref):
+            return ref
+    return None
+
+
+def packet_trailers(repo, carrier, target=None, *, head=None):
+    """#2599 : les lots liés par les trailers `ameesh-work:` de la branche.
+
+    Le corps du lot porteur peut manquer la liste « #N <tête> » (paquets
+    h-2300 et h-0100) ; les commits de composition `vehicule …` portent, eux,
+    leur `ameesh-work: <lot>`. On ne lit que les commits **au-dessus de la
+    cible** (`<merge-base>..<branche>`) : les trailers hérités de `main` ne
+    désignent pas les unités de ce paquet. `head` (#2837) lit un commit exact
+    — la tête observée du porteur quand le dépôt a été retrouvé par elle — au
+    lieu d'une ref de clone qui peut être en retard. Rend un ensemble, ou None
+    quand la branche n'est pas lisible — un doute ne tait aucune alerte."""
+    from . import plan_git
+
+    ref = head or _carrier_ref(repo, carrier)
+    if ref is None:
+        return None
+    rev = ref
+    if target:
+        target = plan_git.published_target(repo, target)
+        base = plan_git._out(repo, "merge-base", ref, target)
+        if not base:
+            return None
+        rev = "%s..%s" % (base, ref)
+    text = plan_git._out(repo, "log", "--max-count=%d" % MAX_PACKET_COMMITS,
+                         "--format=%B%x00", rev)
+    if text is None:
+        return None
+    found: set[int] = set()
+    for message in text.split("\x00"):
+        found.update(plan_git.cited_lots(message))
+    return found
+
+
+def _carrier_repo(db, cfg, carrier, *, overview=None):
+    """Le dépôt local et la tête exacte où lire la composition (#2599, #2837).
+
+    `radar.projects` d'abord : l'hôte opérateur connaît le dépôt du projet, et
+    la ref publiée qu'il y lit est la plus fraîche (tête rendue vide : c'est
+    `packet_trailers` qui choisit la ref). Un hôte d'agents ne l'a pas
+    forcément ; on y retrouve alors un clone qui résout la tête observée
+    (`branch_head`), la ref publiée de la branche ou la branche locale — la
+    même découverte que `lot_class.repo_for_freeze` (#2564), sans quoi un
+    porteur composé sur cet hôte restait invisible et ses unités levaient un
+    faux retard `verdict_merge`. La tête résolue est rendue avec le dépôt :
+    lire ce commit exact plutôt qu'une ref de clone en retard garantit qu'un
+    lot retiré du véhicule ne reste pas attaché. Sans dépôt, aucun
+    attachement : le doute ne tait aucune alerte."""
+    from . import lot_class
+
+    repo = lot_class.repository(cfg, carrier)
+    if repo:
+        return repo, ""
+    if db is None:
+        return None, ""
+    branch = str(carrier.get("branch") or "").strip()
+    refs = [str(carrier.get("branch_head") or "").strip()]
+    if branch:
+        refs += ["refs/remotes/origin/" + branch, branch]
+    for ref in refs:
+        if not ref:
+            continue
+        try:
+            repo, commit = lot_class.repo_for_freeze(
+                db, cfg, carrier, ref, overview=overview)
+        except Exception:  # noqa: BLE001 - registre ou clone illisible : doute
+            continue
+        if repo:
+            return repo, str(commit or "")
+    return None, ""
+
+
+def packet_attachments(cfg, open_items, rows=(), *, db=None):
+    """#2599 : `{porteur: lots}` lus dans les trailers de sa branche.
+
+    `cfg` est la configuration de l'hôte qui lit : le dépôt vient de
+    `radar.projects.<app>.repo` (`lot_class.repository`). `db` (#2837) sert
+    de repli quand cet hôte n'a pas les réglages radar : un clone du registre
+    qui résout la tête du porteur suffit à lire ses commits de composition.
+    Le census est `open_items` plus `rows` (même univers que `packet_waits`).
+    Sans dépôt, sans cible ou sans branche lisible, le porteur n'a pas
+    d'attachement — sa liste de corps reste la seule preuve, et aucune alerte
+    n'est tue par un doute (le sens sûr)."""
+    from . import lot_class, plan_git
+
+    universe: dict[int, dict] = {}
+    for row in open_items or ():
+        universe[int(row["id"])] = row
+    for row in rows or ():
+        universe.setdefault(int(row["id"]), row)
+    carriers = packet_carriers(universe.values())
+    if not carriers:
+        return {}
+    repos = {cid: lot_class.repository(cfg, carrier) if cfg is not None else None
+             for cid, carrier in carriers.items()}
+    overview = None
+    if db is not None and any(repo is None for repo in repos.values()):
+        try:
+            from . import registry
+            overview = registry.overview(db)
+        except Exception:  # noqa: BLE001 - registre illisible : pistes locales seules
+            overview = []
+    out: dict[int, set[int]] = {}
+    for cid, carrier in carriers.items():
+        try:
+            repo, head = ((repos[cid], "") if repos[cid]
+                          else _carrier_repo(db, cfg, carrier, overview=overview))
+            if not repo:
+                continue
+            target = lot_class.default_base(cfg, carrier, repo)
+            if not target:
+                target = plan_git.default_target(repo)
+            if not target:
+                continue
+            members = packet_trailers(repo, carrier, target, head=head or None)
+        except Exception:  # noqa: BLE001 - dépôt illisible : aucune conclusion
+            continue
+        if members:
+            out[cid] = members
+    return out
+
+
 def _packet_wait(carrier):
     """L'attente d'un lot inclus dans un paquet ouvert (forme `planned_wait`)."""
     out = {"what": "packet", "vehicle": int(carrier["id"])}
@@ -228,14 +449,16 @@ def _packet_wait(carrier):
     return out
 
 
-def packet_waits(rows, open_items=None):
+def packet_waits(rows, open_items=None, attachments=None):
     """#2335 : `{lot: wait}` pour tout lot ouvert nommé par un paquet.
 
-    La seule preuve est le manifeste du porteur : une unité y est nommée avec
-    sa tête gelée (`#<lot> <hex>` / `#<lot> @ <hex>`), la forme des manifestes
-    réels. Un simple `#N` en prose est ignoré (B1 de la relecture dev7) : un
-    lot exclu du paquet doit continuer d'alerter, sinon son attente serait
-    tue par un porteur qui ne le transporte pas.
+    Deux preuves : le manifeste du porteur — une unité nommée avec sa tête
+    gelée (`#<lot> <hex>` / `#<lot> @ <hex>`) — et, depuis #2599, les
+    `attachments` lues dans les trailers `ameesh-work:` des commits de sa
+    branche (`packet_attachments`), qui complètent un corps sans liste. Un
+    simple `#N` en prose est ignoré (B1 de la relecture dev7) : un lot exclu
+    du paquet doit continuer d'alerter, sinon son attente serait tue par un
+    porteur qui ne le transporte pas.
 
     Un lot inclus attend la **fusion du paquet**, pas un exécuteur : cette
     attente est planifiée et tait la stagnation comme le SLO (#2335/A1).
@@ -255,6 +478,13 @@ def packet_waits(rows, open_items=None):
         text = "%s\n%s" % (carrier.get("title") or "", carrier.get("body") or "")
         for match in _UNIT.finditer(text):
             ident = int(match.group(1))
+            if ident in open_ids and ident != cid:
+                declared.setdefault(ident, carrier)
+        for ident in (attachments or {}).get(cid, ()):
+            try:
+                ident = int(ident)
+            except (TypeError, ValueError):
+                continue
             if ident in open_ids and ident != cid:
                 declared.setdefault(ident, carrier)
     out: dict[int, dict] = {}
@@ -520,7 +750,12 @@ def read(db, rows, *, now=None, packages=None, open_items=None, dependencies=Non
     ouvert comme attente de paquet. `None` (défaut) réutilise le census déjà
     fourni (`open_items`) ou déjà lu pour les engagements ; `True` le force ;
     `False` l'interdit. Un appelant qui n'a pas le census ne paie donc pas une
-    lecture `open_lots_activity(None)` en plus (N1 de la relecture dev7)."""
+    lecture `open_lots_activity(None)` en plus (N1 de la relecture dev7).
+
+    #2599 : quand un porteur est lu, les `ameesh-work:` de sa branche
+    (`packet_attachments`) complètent le corps, qui peut manquer la liste
+    « #N <tête> ». Dépôt ou branche illisibles : aucun attachement, l'alerte
+    reste due (le sens sûr)."""
     if not rows:
         return {}
     now = time.time() if now is None else float(now)
@@ -543,7 +778,10 @@ def read(db, rows, *, now=None, packages=None, open_items=None, dependencies=Non
     elif packets is True and not open_items:
         open_items = st.operations.open_lots_activity(None)
     want_packets = bool(packets) if packets is not None else (supplied or bool(open_items))
-    packet = packet_waits(rows, open_items) if want_packets else {}
+    attached = (packet_attachments(getattr(db, "cfg", None), open_items, rows,
+                                   db=db)
+                if want_packets and not _dry_pass(db) else {})
+    packet = packet_waits(rows, open_items, attachments=attached) if want_packets else {}
     landings = _with_heads(st, _admitted(
         st, rows, st.work_dependencies.landings_for([int(r["id"]) for r in rows])))
     if decisions is None:

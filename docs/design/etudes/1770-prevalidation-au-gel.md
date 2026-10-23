@@ -200,6 +200,47 @@ L'application à Nexlink appartient à son pilote (§7 : une règle vaut pour to
 les projets, avec un lot d'application par projet) : ce lot ne crée ni carte ni
 bloc Nexlink, et ne lance aucune de ses suites.
 
+## Accroches automatiques (#2644)
+
+La commande explicite ne suffisait pas : le paquet h-0500 a été regelé trois
+fois pour des rouges que la sélection P0/P1 aurait vus avant la suite
+complète. `src/ameesh/prevalidation_calls.py` porte les trois appels, avec les
+paramètres du bloc `prevalidation` du canon (classes, contrats, hôtes, délai,
+lanceur de part) :
+
+- `ci.cmd_ci_run` : pour une tête `integration/**`, la prévalidation passe
+  **avant** l'étiquette `ci-full-<sha>`. **Seul un rouge** refuse nommément,
+  avec les tests en échec ; aucune étiquette n'est posée. Une prévalidation
+  indisponible (carte absente ou de plus de 48 h, VM absente, canon sans bloc,
+  sélection non prouvée, run incomplet) ne bloque jamais : le motif est
+  journalisé et la demande part (décision pilote du 19/10), sinon tous les
+  paquets s'arrêteraient. Une exception `incident|unblock` déjà déclarée
+  (`packet_guard`) ne bloque pas non plus.
+- `work milestone <lot> frozen` : le rapport est attaché à la tête gelée
+  (`prevalidation_reports`), après l'écriture du jalon et la désignation. Un
+  rouge ou une indisponibilité est journalisé, jamais bloquant : le gel est
+  déjà écrit.
+- le passage du train (#2446) : la prévalidation passe avant
+  `train_runtime.Runtime.publish`, donc avant le bail et tout push. Un rouge
+  arrête la publication ; une indisponibilité est journalisée et la CI
+  complète reste la preuve finale.
+
+Le plan L161f est calculé dans un arbre **détaché du commit candidat**, par le
+`scripts/test-plan.py` de ce commit. La carte mesurée vient, dans l'ordre,
+d'un `--prevalidation-map` explicite, de `carte/carte.json.gz` dans l'arbre,
+ou du dernier artefact `carte` vert de GitHub. Sa fraîcheur et l'ascendance de
+son commit restent vérifiées par le plan : aucune carte n'est supposée bonne
+parce qu'elle a été téléchargée. Sans plan sûr, `prevalidation.validate`
+refuse (`selection-full`, `selection-unsafe`) : `ci run` continue et journalise
+l'indisponibilité (seul un rouge arrête la demande) ; le gel et le train
+continuent et le disent.
+
+Le bloc global vaut pour tous les projets, mais `scripts/test-plan.py` et le
+lanceur de part sont des outils du dépôt ameesh (#2794) : avant tout arbre,
+carte ou hôte, leur présence est vérifiée au SHA candidat ; un dépôt qui ne
+les porte pas (nexlink) est indisponible, cause `tooling-missing`, au lieu
+d'un `can't open file` journalisé en `selection-unsafe`.
+
 ## Raccords
 
 - #1616 (lecteur) : extension additive, tête gelée non élargie ; ce delta est

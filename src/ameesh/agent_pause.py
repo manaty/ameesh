@@ -110,11 +110,12 @@ def cmd_cli(cfg, args, *, paused: bool) -> int:
             # #2184/R3 : dire pourquoi la pose a été refusée ; le JSON la porte
             # aussi (refusal=not_after), le drain la lit sans la confondre avec
             # une pause étrangère. En texte, le refus remplace le compte rendu
-            # habituel (la pause n'est pas posée).
+            # habituel (la pause n'est pas posée) et rend un code non nul
+            # (#2498) ; en JSON, le refus est une réponse lue (rc 0).
             print("%s: operator pause refused (%s)" % (args.agent, out["refusal"]),
                   file=sys.stderr)
             if not args.json:
-                return 0
+                return 1
         if args.json:
             print(json.dumps(out, ensure_ascii=False))
         elif not paused and expect is not None:

@@ -10,12 +10,13 @@ from __future__ import annotations
 import os
 import subprocess
 import time
+import unittest
 from unittest import mock
 
 from ameesh import db as db_mod, mail, registry, storage, work
 from ameesh.runner import AgentWorker, Runner
 
-from .support import FAKEBIN, PgTestCase
+from .support import FAKEBIN, REPO, PgTestCase, hold_for_owner
 
 
 class _Base(PgTestCase):
@@ -293,6 +294,121 @@ class StockageTest(_Base):
         self.assertEqual(set(ids), {haut, bas, build, repris})
         self.assertNotIn(demain, ids)
         self.assertTrue(all(r["activity_ts"] for r in self.st.actionable("a6")))
+
+    def test_reveil_programme_tenu_est_du_et_consomme_une_fois(self):
+        """#2466 : une note hold: portant une échéance réveille à l'échéance,
+        une seule fois, et laisse un témoin `wake:` qui ne lève pas la retenue."""
+        self.bail("aw")
+        lot = work.add(self.db, title="séance owner", assignee="aw",
+                       force=_FORCE)["id"]
+        work.move(self.db, lot, "build")
+        now = time.time()
+        work.note(self.db, lot, "hold: séance owner 14:00", actor="aw",
+                  wake_ts=now + 60)
+        self.assertNotIn(lot, [r["id"] for r in self.st.actionable("aw")])
+        self.assertEqual(self.st.due_wakes("aw", now), [], "pas avant l'échéance")
+        rows = self.st.due_wakes("aw", now + 61)
+        self.assertEqual([(r["id"], r["title"]) for r in rows],
+                         [(lot, "séance owner")])
+        taken = self.st.claim_wake("aw", lot, now + 61)
+        self.assertEqual((taken["id"], taken["state"]), (lot, "build"))
+        self.assertIsNone(self.st.claim_wake("aw", lot, now + 61),
+                          "un claim en cours écarte une seconde délivrance")
+        self.assertEqual(self.st.due_wakes("aw", now + 61), [])
+        self.assertIsNotNone(work.get(self.db, lot)["wake_ts"],
+                             "l'échéance n'est pas consommée par la délivrance")
+        event = work.events(self.db, lot)[0]
+        self.assertEqual(event["actor"], "ameesh")
+        self.assertTrue(event["note"].startswith("wake: scheduled wake delivered"))
+        self.assertTrue(self.st.consume_wake("aw", lot, taken["wake_ts"]))
+        self.assertIsNone(work.get(self.db, lot)["wake_ts"])
+        self.assertFalse(self.st.consume_wake("aw", lot, taken["wake_ts"]),
+                         "une seule consommation")
+        self.assertNotIn(lot, [r["id"] for r in self.st.actionable("aw")],
+                         "le témoin wake: ne lève pas la retenue hold:")
+
+    def test_reveil_programme_waiting_human_est_du(self):
+        """#640 : l'agent en hold sur un lot waiting_human est réveillé à
+        l'échéance, sans dépendre de la règle 1 ni d'une décision lue."""
+        self.bail("aw2")
+        lot = work.add(self.db, title="séance owner", assignee="aw2",
+                       force=_FORCE)["id"]
+        work.move(self.db, lot, "build")
+        hold_for_owner(self.db, lot)
+        now = time.time()
+        work.note(self.db, lot, "hold: reprise à la séance", actor="aw2",
+                  wake_ts=now - 1)
+        self.assertEqual([r["id"] for r in self.st.due_wakes("aw2", now)], [lot])
+        taken = self.st.claim_wake("aw2", lot, now)
+        self.assertEqual(taken["state"], "waiting_human")
+        self.assertTrue(self.st.consume_wake("aw2", lot, taken["wake_ts"]))
+
+    def test_claim_expire_redelivre_le_reveil(self):
+        """#2466 B1 : un claim non consommé (drainage, arrêt, panne avant
+        lancement) expire et le réveil est délivré de nouveau — jamais perdu."""
+        self.bail("aw5")
+        lot = work.add(self.db, title="séance owner", assignee="aw5",
+                       force=_FORCE)["id"]
+        now = time.time()
+        work.schedule_wake(self.db, lot, now - 1, text="séance",
+                           actor="orchestrateur")
+        self.assertEqual([r["id"] for r in self.st.due_wakes("aw5", now)], [lot])
+        self.assertIsNotNone(self.st.claim_wake("aw5", lot, now, claim_ttl_s=60))
+        self.assertEqual(self.st.due_wakes("aw5", now, claim_ttl_s=60), [],
+                         "claim en cours : pas de seconde délivrance")
+        self.db.execute("UPDATE work_items SET wake_claim_at ="
+                        " now() - interval '2 minutes' WHERE id = %s", (lot,))
+        self.assertEqual([r["id"] for r in self.st.due_wakes("aw5", now,
+                                                            claim_ttl_s=60)],
+                         [lot], "claim expiré : délivré de nouveau")
+
+    def test_consume_ne_detruit_pas_une_echeance_reposee(self):
+        """#2466 : une échéance reposée entre le claim et le lancement n'est
+        pas effacée par la consommation du claim précédent."""
+        self.bail("aw6")
+        lot = work.add(self.db, title="séance owner", assignee="aw6",
+                       force=_FORCE)["id"]
+        now = time.time()
+        work.schedule_wake(self.db, lot, now - 1, text="", actor="pilot")
+        taken = self.st.claim_wake("aw6", lot, now)
+        self.assertIsNotNone(taken)
+        work.schedule_wake(self.db, lot, now + 3600, text="report", actor="pilot")
+        self.assertFalse(self.st.consume_wake("aw6", lot, taken["wake_ts"]))
+        self.assertAlmostEqual(work.get(self.db, lot)["wake_ts"], now + 3600,
+                               delta=2)
+
+    def test_reveil_programme_remplace_et_annule(self):
+        self.bail("aw3")
+        lot = work.add(self.db, title="séance owner", assignee="aw3",
+                       force=_FORCE)["id"]
+        now = time.time()
+        work.schedule_wake(self.db, lot, now + 600, text="séance owner",
+                           actor="orchestrateur")
+        self.assertAlmostEqual(work.get(self.db, lot)["wake_ts"], now + 600, delta=2)
+        self.assertIn("wake: séance owner", work.events(self.db, lot)[0]["note"])
+        work.schedule_wake(self.db, lot, now + 120, text="", actor="orchestrateur")
+        self.assertAlmostEqual(work.get(self.db, lot)["wake_ts"], now + 120, delta=2)
+        work.schedule_wake(self.db, lot, None, text="", actor="orchestrateur")
+        self.assertIsNone(work.get(self.db, lot)["wake_ts"])
+        self.assertIn("cancelled", work.events(self.db, lot)[0]["note"])
+
+    def test_note_porte_wake_at_dans_le_texte(self):
+        """#2466 : `wake_at=<ISO>` dans la note est l'autre écriture de
+        `--wake-at`, lue par le même chemin ; une valeur illisible est
+        refusée au lieu d'être ignorée."""
+        self.bail("aw4")
+        lot = work.add(self.db, title="séance owner", assignee="aw4",
+                       force=_FORCE)["id"]
+        work.note(self.db, lot,
+                  "hold: séance owner wake_at=2999-01-01T00:00:00+00:00",
+                  actor="aw4")
+        self.assertIsNotNone(work.get(self.db, lot)["wake_ts"])
+        with self.assertRaises(work.WorkError):
+            work.note(self.db, lot, "hold: séance wake_at=demain", actor="aw4")
+        with self.assertRaises(work.WorkError):
+            work.note(self.db, lot,
+                      "hold: séance wake_at=2999-01-01T00:00:00+00:00",
+                      actor="aw4", wake_ts=time.time() + 60)
 
 
 class RoutageTest(_Base):
@@ -801,7 +917,7 @@ class BriefDeLotTest(_Base):
         self.assertIn("lot/b1", text)
         self.assertIn("travail.py", text)
         self.assertIn("1 file changed", text)
-        self.assertIn("## Lot thread — decisions and unread messages", text)
+        self.assertIn("## Lot thread — decisions, unread and delivered messages", text)
         self.assertIn("un message non lu sur le lot", text)
         # jamais le contenu d'un autre lot, ni l'ancienne session, ni la liste
         # des lots assignés du brief de reprise
@@ -809,6 +925,126 @@ class BriefDeLotTest(_Base):
         self.assertNotIn("un message pour un autre lot", text)
         self.assertNotIn("Previous session", text)
         self.assertNotIn("Work items assigned to you", text)
+
+    def test_bascule_reprend_un_verdict_livre_du_lot_suivant(self):
+        """#2539 : un message livré dans la session d'un autre lot ne disparaît
+        pas quand la session dédiée à son lot s'ouvre.
+
+        Vraie bascule : la session du lot A est active, le verdict du lot B a
+        été livré pendant celle-ci (et date de plus de 24 h), puis la session
+        de B s'ouvre. Le verdict doit figurer dans son brief, sinon le nouveau
+        tour ne sait pas qu'un blocked l'attend."""
+        from ameesh import reprise
+        runner, lease = self.bail("b4")
+        worker = AgentWorker(runner, registry.get(self.db, "b4"), lease)
+        try:
+            a = work.add(self.db, title="Le lot de la session neuve", assignee="b4",
+                         force=_FORCE)["id"]
+            b = work.add(self.db, title="Le lot du verdict", assignee="b4",
+                         force=_FORCE)["id"]
+            cwd = self._cwd("b4")
+            storage.of(self.db).operations.set_session_work_item(
+                "b4", runner.runner_id, worker.epoch, str(a))
+            registry.set_session(self.db, "b4", "sess-a", None, harness="claude", cwd=cwd)
+            worker.agent = registry.get(self.db, "b4")
+            mid = mail.send(self.db, "orch", "b4", "verdict B : blocked",
+                            work_item_id=str(b))
+            self.assertEqual(mail.mark_delivered(self.db, [mid]), 1)
+            self.db.execute(
+                "UPDATE agent_mailbox SET delivered_at = now() - interval '25 hours'"
+                " WHERE id = %s", (mid,))
+
+            self.assertTrue(worker._switch_lot(str(a), str(b)))
+            text = worker.resume_summary or ""
+            self.assertIn("verdict B : blocked", text)
+            self.assertIn("- delivered #%d" % mid, text)
+            self.assertNotIn("- unread #%d" % mid, text)
+        finally:
+            worker.watchdog_stop.set()
+
+    def test_brief_ne_prend_que_les_courriers_du_lot_sous_le_bruit(self):
+        """#2539 B2 : le filtre par lot est dans la requête, pas après une
+        fenêtre de 200 messages : 201 courriers d'un autre lot ne masquent pas
+        le verdict de CE lot."""
+        from ameesh import reprise
+        self.bail("b5")
+        a = work.add(self.db, title="Le lot du verdict", assignee="b5")["id"]
+        autre = work.add(self.db, title="Le lot bruyant", assignee="b5")["id"]
+        mid = mail.send(self.db, "orch", "b5", "verdict utile", work_item_id=str(a))
+        self.assertEqual(mail.mark_delivered(self.db, [mid]), 1)
+        # 201 courriers plus récents d'un autre lot : un history(limit=200)
+        # les lirait tous avant de filtrer et perdrait le verdict ci-dessus.
+        self.db.execute(
+            "INSERT INTO agent_mailbox"
+            " (sender, recipient, body, work_item_id, status, delivered_at)"
+            " SELECT 'orch', %s, 'bruit ' || g, %s, 'delivered', now()"
+            "   FROM generate_series(1, 201) AS g",
+            ("b5", str(autre)))
+
+        text = reprise.lot_brief(self.cfg, self.db, registry.get(self.db, "b5"), a,
+                                 consigne="go")
+        self.assertIn("verdict utile", text)
+        self.assertNotIn("bruit 200", text)
+
+    def test_courriers_livres_du_lot_lus_sur_la_colonne_indexee(self):
+        """#2752 : le lot est filtré sur `work_item_id`, sans fonction, pour
+        que l'index partiel 0413 serve (comme #2563 pour les requests)."""
+        self.bail("b7")
+        a = work.add(self.db, title="Le lot indexé", assignee="b7")["id"]
+        mid = mail.send(self.db, "orch", "b7", "livré", work_item_id=str(a))
+        self.assertEqual(mail.mark_delivered(self.db, [mid]), 1)
+        seen = []
+
+        class Trace:
+            """La connexion réelle, avec le SQL de la lecture du lot noté."""
+            def __init__(self, db):
+                self.db = db
+
+            def query(self, sql, params=()):
+                seen.append(" ".join(sql.split()))
+                return self.db.query(sql, params)
+
+            def __getattr__(self, name):
+                return getattr(self.db, name)
+
+        found = mail.delivered_for_lot(Trace(self.db), "b7", a, 10)
+        self.assertEqual([r["id"] for r in found], [mid])
+        queries = [sql for sql in seen if "FROM agent_mailbox" in sql]
+        self.assertEqual(len(queries), 1)
+        predicate = queries[0].split("WHERE", 1)[1]
+        self.assertIn("work_item_id = %s", predicate)
+        self.assertNotIn("btrim", predicate)
+
+    def test_brief_borne_les_courriers_livres(self):
+        """#2539 : la lecture par lot est bornée ; le brief annonce le reste."""
+        from ameesh import reprise
+        self.bail("b6")
+        a = work.add(self.db, title="Le lot borné", assignee="b6")["id"]
+        ids = []
+        for i in range(reprise.LOT_MAIL_MAX + 2):
+            ids.append(mail.send(self.db, "orch", "b6", "livré %d" % i,
+                                 work_item_id=str(a)))
+        self.assertEqual(mail.mark_delivered(self.db, ids), reprise.LOT_MAIL_MAX + 2)
+
+        text = reprise.lot_brief(self.cfg, self.db, registry.get(self.db, "b6"), a,
+                                 consigne="go")
+        self.assertEqual(text.count("- delivered #"), reprise.LOT_MAIL_MAX)
+        self.assertIn("more delivered messages for this lot", text)
+
+    def test_brief_reste_lisible_si_la_lecture_mediate_refuse(self):
+        """#2539 : en mode médié, `mailbox.delivered_for_lot` est refusé au
+        contrat ; le brief garde les non-lus et n'échoue pas."""
+        from ameesh import reprise
+        from ameesh.mediated_executor.contract import NotSupportedRemotely
+        self.bail("b7")
+        a = work.add(self.db, title="Le lot médié", assignee="b7")["id"]
+        mail.send(self.db, "orch", "b7", "un message non lu", work_item_id=str(a))
+        with mock.patch.object(mail, "delivered_for_lot",
+                               side_effect=NotSupportedRemotely("refusé")):
+            text = reprise.lot_brief(self.cfg, self.db, registry.get(self.db, "b7"), a,
+                                     consigne="go")
+        self.assertIn("un message non lu", text)
+        self.assertNotIn("- delivered #", text)
 
     def test_brief_ne_dit_pas_put_aside_quand_rien_n_est_garde(self):
         """#2242 : `_switch_lot` peut ne rien garder (lot courant fini ou
@@ -867,6 +1103,7 @@ class ReveilTest(_Base):
 
     def pick(self, worker):
         worker._lot_wake_checked = float("-inf")
+        worker._scheduled_wake_checked = float("-inf")
         return worker.pick()
 
     def recule(self, name, lot, secondes):
@@ -935,6 +1172,110 @@ class ReveilTest(_Base):
         b = work.add(self.db, title="à faire", assignee="r6", force=_FORCE)["id"]
         work.note(self.db, b, "hold: attend l'hôte de test", actor="r6")
         self.assertIsNone(self.pick(worker))
+
+    def test_reveil_programme_delivre_puis_consomme(self):
+        """#2466 : un réveil programmé échu réveille l'agent même sous hold ;
+        la délivrance (claim + témoin `wake:`) ne consomme l'échéance qu'au
+        lancement du harnais."""
+        worker = self._worker("r7")
+        lot = work.add(self.db, title="séance owner", assignee="r7",
+                       force=_FORCE)["id"]
+        work.move(self.db, lot, "build")
+        work.note(self.db, lot, "hold: séance owner 14:00", actor="r7",
+                  wake_ts=time.time() - 1)
+        spec = self.pick(worker)
+        self.assertEqual((spec["kind"], spec["lot"]), ("idle", str(lot)))
+        self.assertIn("Scheduled wake", spec["prompt"])
+        self.assertIsNotNone(work.get(self.db, lot)["wake_ts"],
+                             "la délivrance ne consomme pas l'échéance")
+        self.assertTrue(work.events(self.db, lot)[0]["note"].startswith(
+            "wake: scheduled wake delivered"))
+        worker._turn_launched = True
+        worker._consume_scheduled_wake(spec)
+        self.assertIsNone(work.get(self.db, lot)["wake_ts"])
+        worker._scheduled_wake_checked = float("-inf")
+        self.assertIsNone(worker._scheduled_wake_spec(), "l'échéance ne se rejoue pas")
+        consumed = [e for e in work.events(self.db, lot)
+                    if e["note"].startswith("wake: scheduled wake delivered")]
+        self.assertEqual(len(consumed), 1)
+
+    def test_reveil_programme_sur_executeur_medie(self):
+        """#2613 : le runner médié ne refuse plus le réveil programmé ; les
+        trois opérations de wake passent par le contrat (due_wakes,
+        claim_wake, consume_wake), pas seulement par un exécuteur local."""
+        worker = self._worker("r7m")
+        lot = work.add(self.db, title="séance owner", assignee="r7m",
+                       force=_FORCE)["id"]
+        work.note(self.db, lot, "hold: séance owner", actor="r7m",
+                  wake_ts=time.time() - 1)
+        with mock.patch.object(storage, "is_remote", return_value=True):
+            spec = self.pick(worker)
+        self.assertIsNotNone(spec, "un exécuteur médié délivre le réveil (#2613)")
+        self.assertEqual((spec["kind"], spec["lot"]), ("idle", str(lot)))
+        self.assertIn("Scheduled wake", spec["prompt"])
+        self.assertIsNotNone(work.get(self.db, lot)["wake_ts"],
+                             "la délivrance médiée ne consomme pas l'échéance")
+
+    def test_reveil_programme_perdu_au_drainage_est_redelivre(self):
+        """#2466 B1 (cx2) : si le drainage refuse le tour entre le choix et le
+        lancement, le claim expire et le réveil est délivré de nouveau."""
+        worker = self._worker("r7b")
+        lot = work.add(self.db, title="séance owner", assignee="r7b",
+                       force=_FORCE)["id"]
+        work.note(self.db, lot, "hold: séance owner", actor="r7b",
+                  wake_ts=time.time() - 1)
+        spec = self.pick(worker)
+        self.assertEqual(spec["lot"], str(lot))
+        worker.runner.draining.set()
+        self.assertFalse(worker.run_turn(spec), "le drainage refuse le tour")
+        self.assertIsNotNone(work.get(self.db, lot)["wake_ts"],
+                             "l'échéance survit au tour refusé")
+        self.db.execute("UPDATE work_items SET wake_claim_at ="
+                        " now() - interval '10 minutes' WHERE id = %s", (lot,))
+        worker._scheduled_wake_checked = float("-inf")
+        again = worker._scheduled_wake_spec()
+        self.assertIsNotNone(again, "claim expiré : le réveil revient")
+        self.assertEqual(again["lot"], str(lot))
+        delivered = [e for e in work.events(self.db, lot)
+                     if e["note"].startswith("wake: scheduled wake delivered")]
+        self.assertEqual(len(delivered), 2, "chaque délivrance a son témoin")
+
+    def test_reveil_programme_non_consomme_si_le_tour_n_est_pas_lance(self):
+        """#2466 B1 (cx2, 2e tour) : tant que le harnais n'a pas démarré
+        (`_turn_launched` faux : refus READY, send résident en échec), la
+        consommation ne doit pas effacer l'échéance."""
+        worker = self._worker("r7c")
+        lot = work.add(self.db, title="séance owner", assignee="r7c",
+                       force=_FORCE)["id"]
+        work.note(self.db, lot, "hold: séance owner", actor="r7c",
+                  wake_ts=time.time() - 1)
+        spec = self.pick(worker)
+        worker._turn_launched = False
+        worker._consume_scheduled_wake(spec)
+        self.assertIsNotNone(work.get(self.db, lot)["wake_ts"],
+                             "aucune consommation avant le lancement effectif")
+        self.assertFalse(any(e["note"].endswith("consumed")
+                             for e in work.events(self.db, lot)))
+
+    def test_reveil_programme_resiste_a_lot_wake_off(self):
+        worker = self._worker("r8", lot_wake=False)
+        lot = work.add(self.db, title="séance owner", assignee="r8",
+                       force=_FORCE)["id"]
+        work.note(self.db, lot, "hold: rendez-vous", actor="r8",
+                  wake_ts=time.time() - 1)
+        self.assertIsNotNone(self.pick(worker),
+                             "un rendez-vous explicite ne dépend pas de lot_wake")
+
+    def test_reveil_programme_passe_avant_le_courrier_en_fenetre(self):
+        worker = self._worker("r9")
+        lot = work.add(self.db, title="séance owner", assignee="r9",
+                       force=_FORCE)["id"]
+        work.note(self.db, lot, "hold: rendez-vous", actor="r9",
+                  wake_ts=time.time() - 1)
+        mail.send(self.db, "orch", "r9", "un message en fenêtre de regroupement")
+        spec = self.pick(worker)
+        self.assertEqual(spec["lot"], str(lot),
+                         "le rendez-vous passe avant la fenêtre L125")
 
 
 class PurgeTest(_Base):
@@ -1033,3 +1374,74 @@ class AlerteTest(_Base):
         self.assertIn("--lot %d" % a, textes["x1"])
         work.note(self.db, a, "avancé", actor="x1")         # le lot a vécu
         self.assertEqual(self.alertes(), [])
+
+
+class ReveilProgrammeCliTest(_Base):
+    """#2466 : `work wake` et `work note --wake-at` arment l'échéance."""
+
+    def test_work_wake_arme_affiche_et_annule(self):
+        self.register("c1", "claude")
+        lot = work.add(self.db, title="séance owner", assignee="c1",
+                       force=_FORCE)["id"]
+        proc = self.mesh("work", "wake", str(lot), "--in", "15m",
+                         "--why", "séance owner", "--actor", "tester")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("wake scheduled", proc.stdout)
+        self.assertIsNotNone(work.get(self.db, lot)["wake_ts"])
+        self.assertIn("wake: séance owner", work.events(self.db, lot)[0]["note"])
+        proc = self.mesh("work", "show", str(lot))
+        self.assertIn("wake     :", proc.stdout)
+        proc = self.mesh("work", "wake", str(lot), "--cancel", "--actor", "tester")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("cancelled", proc.stdout)
+        self.assertIsNone(work.get(self.db, lot)["wake_ts"])
+
+    def test_work_note_porte_l_echeance(self):
+        self.register("c2", "claude")
+        lot = work.add(self.db, title="séance owner", assignee="c2",
+                       force=_FORCE)["id"]
+        proc = self.mesh("work", "note", str(lot), "hold: séance owner",
+                         "--wake-at", "2999-01-01T00:00:00+00:00",
+                         "--actor", "tester")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIsNotNone(work.get(self.db, lot)["wake_ts"])
+        self.assertIn("[réveil programmé:", work.events(self.db, lot)[0]["note"])
+
+    def test_at_sans_fuseau_est_refuse(self):
+        self.register("c3", "claude")
+        lot = work.add(self.db, title="séance owner", assignee="c3",
+                       force=_FORCE)["id"]
+        proc = self.mesh("work", "wake", str(lot), "--at",
+                         "2999-01-01T00:00:00", "--actor", "tester")
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("timezone", proc.stderr)
+
+
+class WakeDeadlineCliTest(unittest.TestCase):
+    """The absolute CLI deadline reaches the shared deadline validator."""
+
+    def test_absolute_deadline_is_parsed(self):
+        from ameesh.mesh_cli import build_parser, _wake_deadline
+        args = build_parser().parse_args([
+            "work", "wake", "1", "--at", "2999-01-01T00:00:00Z"])
+        self.assertIsNotNone(_wake_deadline(args))
+
+    def test_absolute_and_relative_deadlines_are_rejected(self):
+        from ameesh.mesh_cli import build_parser, _wake_deadline
+        args = build_parser().parse_args([
+            "work", "wake", "1", "--at", "2999-01-01T00:00:00Z",
+            "--in", "15m"])
+        with self.assertRaisesRegex(work.WorkError, "exactly one"):
+            _wake_deadline(args)
+
+
+class WakeGrantTest(unittest.TestCase):
+    """#2466 : le GRANT du superviseur porte la colonne lue par `item_columns`."""
+
+    def test_role_superviseur_lit_wake_at(self):
+        path = os.path.join(REPO, "deploy/sql/role-superviseur.sql")
+        with open(path, encoding="utf-8") as fh:
+            text = fh.read()
+        block = text.split("('work_items', ARRAY[", 1)[1].split("]),", 1)[0]
+        self.assertIn("'wake_at'", block)
+        self.assertIn("'wake_claim_at'", block)

@@ -71,7 +71,8 @@
 --     plus (deploy/sql/role-superviseur-contenus.sql) :
 --       agent_mailbox.body, .payload, .meta
 --       agent_registry.pending_prompt, .current_prompt (et agent_mesh_overview),
---              .restart_brief (brief de `ameesh restart` en attente, L26)
+--              .restart_brief (brief de `ameesh restart` en attente, L26),
+--              .election_brief (brief de relève élue, L165/EP3)
 --       thread_index.last_excerpt
 --       actions.args, .last_note
 --       action_events.note
@@ -157,6 +158,9 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         'placement_profile', 'lease_expires_ts', 'last_seen_ts',
         'last_turn_ts', 'key_ready', 'has_owner_key',
         'ephemeral_expires_ts', 'responsible_ok', 'unread',
+        -- #2689 : non-lus passifs (copies, accusés, radars), un compteur — la
+        -- même règle L125 que l'exécuteur, sans contenu
+        'passive_unread',
         -- L26 (0027), désormais exposés par la vue : réglages sans contenu
         'session_policy', 'effort', 'tier', 'session_work_item',
         'status_since', 'restart_requested_at', 'session_reset_at',
@@ -205,6 +209,9 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         'created_by', 'canon_ref', 'capabilities', 'last_event_at',
         'placement_ok', 'placement_diagnostic', 'placement_ref',
         'placement_profile',
+        -- L165 (EP1) : relève et hôtes candidats (des réglages et des noms,
+        -- pas de contenu), comme `mode` et `admitted_hosts`
+        'releve', 'candidats',
         -- #508 (0411) : preuve de vie du runner, sans contenu ni secret
         'runner_seen_at', 'runner_seen_host', 'runner_seen_owner',
         -- L232a (0371) : clôture de passage entre hôtes
@@ -299,7 +306,11 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         'agent', 'start_index', 'turn', 'model', 'created_at',
         -- #796 (0423) : lot et tour du marqueur comptable, gardés pour la
         -- réparation d'un tour interrompu (de l'état, aucun contenu)
-        'work_item_id', 'turn_id'
+        'work_item_id', 'turn_id',
+        -- #2166 (0471) : clé exacte du marqueur, la même que
+        -- `turn_costs.spend_key` (déjà lue par le rôle) ; elle ne dit que
+        -- l'agent, l'index et l'instant déjà accordés.
+        'spend_key'
     ]),
     ('standing_approvals', ARRAY[
         'id', 'approver', 'authenticator_id', 'connector', 'operations',
@@ -394,7 +405,10 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         -- L159f (0069): host gate state, seq and the guard's short reason
         'gate_state', 'gate_seq', 'gate_reason',
         -- #2022 (0455): process and zombie counts, the publishing runner
-        'procs_total', 'procs_zombie', 'runner_id', 'runner_procs', 'runner_zombies'
+        'procs_total', 'procs_zombie', 'runner_id', 'runner_procs', 'runner_zombies',
+        -- #2814 (0469) : mesures du cgroup v2 du processus (PSI, quota,
+        -- compteurs, chemin d'état) — des nombres et un chemin, pas un secret
+        'cgroup'
     ]),
     ('turn_resources', ARRAY[
         'id', 'turn_id', 'agent', 'host', 'pgid', 'label', 'containers',
@@ -635,7 +649,11 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         'change_size',
         -- #705 (0421) : le relecteur désigné d'un lot en qa — l'alerte
         -- stale_lot le nomme, le superviseur doit donc le lire
-        'reviewer', 'reviewers'
+        'reviewer', 'reviewers',
+        -- #2466 (0466) : échéance du réveil programmé d'un lot et bail de
+        -- livraison (des instants, de l'ÉTAT) — sans eux, la lecture de la
+        -- ligne par `to_jsonb` échouerait pour le rôle à droits de colonne
+        'wake_at', 'wake_claim_at'
     ]),
     -- L157 (0052) : historique des estimations d'un lot (de l'ÉTAT)
     ('work_item_estimates', ARRAY[

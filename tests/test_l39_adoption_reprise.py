@@ -354,7 +354,9 @@ class ResumeTest(_Base):
         comptes = self._codex()
         secondaire = comptes["codex"][1]["path"]
         transcript = _rollout(secondaire, "sess-b", self.travail)
-        os.unlink(os.path.join(secondaire, "auth.json"))  # compte inutilisable
+        # Public permissions make the account unusable on every platform;
+        # a missing auth.json alone is valid with the macOS keychain.
+        os.chmod(secondaire, 0o755)
         self._arrete("coord", "sess-b", "secondaire")
         self.db.execute("UPDATE agent_registry SET chantier = 'atelier', "
                         "responsible = 'human:proprio' WHERE name = 'coord'")
@@ -486,11 +488,12 @@ class ResumeTest(_Base):
         avertissements: list[str] = []
         out = reprise.resume(self.cfg, self.db, "orphelin", warn=avertissements.append)
         self.assertFalse(out["runner_live"])
-        self.assertTrue(any("no runner" in a for a in avertissements), avertissements)
+        self.assertTrue(any("no runner holds orphelin's lease" in a
+                            for a in avertissements), avertissements)
 
     def test_resume_warns_only_without_runner(self):
-        # under a live runner, or for a stopped agent (its runner returned the
-        # lease), the missing lease is normal: no warning about the runner
+        # A live lease, or a recent runner pass for a stopped agent, avoids
+        # the warning. The latter still has no live lease.
         self.register("vivant", "codex", cwd=self.travail)
         registry.set_session(self.db, "vivant", "sess-v")
         registry.claim(self.db, "vivant", "r1", 3600)
@@ -498,9 +501,47 @@ class ResumeTest(_Base):
         out = reprise.resume(self.cfg, self.db, "vivant", warn=avertissements.append)
         self.assertTrue(out["runner_live"])
         self._arrete("arrete", "sess-a", None)
+        registry.runner_seen(self.db, self.cfg.host, "r1", ["arrete"])
         out = reprise.resume(self.cfg, self.db, "arrete", warn=avertissements.append)
         self.assertFalse(out["runner_live"])
         self.assertFalse(any("no runner" in a for a in avertissements), avertissements)
+
+    def test_resume_stopped_without_runner_proof_warns_and_queues(self):
+        for name, age, host, owner in [
+            ("absent", None, None, None),
+            ("perime", 121, self.cfg.host, "r1"),
+            ("deplace", 0, "elsewhere", "r1"),
+            ("sans-identite", 0, self.cfg.host, None),
+            ("futur", -60, self.cfg.host, "r1"),
+        ]:
+            with self.subTest(name=name):
+                self._arrete(name, "sess-" + name, None)
+                if age is not None:
+                    self.db.execute(
+                        "UPDATE agent_registry SET runner_seen_at = clock_timestamp()"
+                        " - %s * interval '1 second', runner_seen_host = %s,"
+                        " runner_seen_owner = %s WHERE name = %s", (age, host, owner, name))
+                warnings = []
+                out = reprise.resume(self.cfg, self.db, name, brief="REPRENDRE",
+                                     warn=warnings.append)
+                self.assertFalse(out["runner_live"])
+                self.assertIn(
+                    "no runner has reported serving %s on %s recently: the instruction "
+                    "waits until a runner serves it again" % (name, self.cfg.host), warnings)
+                self.assertIn("REPRENDRE", registry.get(self.db, name)["pending_prompt"])
+
+    def test_resume_stopped_respects_runner_interval(self):
+        self._arrete("lent", "sess-lent", None)
+        registry.runner_seen(self.db, self.cfg.host, "r1", ["lent"])
+        self.db.execute("UPDATE agent_registry SET runner_seen_at = clock_timestamp()"
+                        " - interval '3 minutes' WHERE name = 'lent'")
+        for cfg in (dataclasses.replace(self.cfg, runner_liveness_interval=120),
+                    dataclasses.replace(self.cfg, poll=120)):
+            with self.subTest(poll=cfg.poll, interval=cfg.runner_liveness_interval):
+                self.db.execute("UPDATE agent_registry SET status = 'stopped' WHERE name = 'lent'")
+                warnings = []
+                reprise.resume(cfg, self.db, "lent", warn=warnings.append)
+                self.assertFalse(any("no runner" in w for w in warnings), warnings)
 
 
 # --------------------------------------------------------------------------
@@ -573,7 +614,7 @@ class SessionAccountTest(_Base):
         secondaire = comptes["codex"][1]["path"]
         self.register("rb", "codex", cwd=self.travail)
         registry.set_session(self.db, "rb", "sess-x", "secondaire")
-        os.unlink(os.path.join(secondaire, "auth.json"))  # ancien compte inutilisable
+        os.chmod(secondaire, 0o755)  # unusable even with the macOS keychain
         cfg = dataclasses.replace(self._cfg(comptes), budget_usd_per_hour=10.0,
                                   budget_check_interval=0.0)
         runner, worker = self._worker("rb", cfg)

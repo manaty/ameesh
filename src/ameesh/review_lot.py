@@ -39,11 +39,12 @@ relit les tours de l'assigné.
 l'atterrissage (`land`), et toute fusion **enregistrée** ailleurs l'ouvre par
 `open_for_merge` — le point d'entrée de `work.close_merged`, donc du relevé
 des branches (L118), de `sync-merges`, de `sync-github`, de la porte
-`git-merge` et de `ameesh work merged`. La classe est alors relue sur le diff
-que la fusion a fait entrer (`class_at_merge`, `lot_measures.diff_range`) —
-jamais `cible..gel`, vide dès que le gel est un ancêtre de la cible — avec les
-indices de l'appelant ; seule `light` ouvre, un doute n'ouvre rien, et
-l'idempotence reste celle de `open_after_merge`.
+`git-merge` et de `ameesh work merged`. La classe est alors relue sur le delta
+**du lot** (`class_at_merge`, `lot_measures.lot_diff_range`) — celui de son
+gel, jamais le diff du paquet qui l'a porté ni `cible..gel`, vide dès que le
+gel est un ancêtre de la cible — avec les indices de l'appelant ; seule
+`light` ouvre, un doute n'ouvre rien, et l'idempotence reste celle de
+`open_after_merge`.
 
 #1280 (R codex3 B2) : un avis (`review-after-merge:#P`, `REVUE #N` ou mission
 `R1`/`R2`) n'ouvre **jamais** la relecture d'un avis — la garde est posée ici,
@@ -69,6 +70,17 @@ source, une marque structurée (`requirement_mark`) que `work.close --delivered`
 relit (`guard_delivery`) : la clôture est refusée tant que les avis dus ne sont
 pas rendus sur le sha fusionné. Le nombre d'avis n'est donc plus seulement
 écrit dans le corps.
+
+#2585 : un lot léger peut déjà porter l'avis d'une autre famille sur la tête
+qui entre, rendu avant la fusion (gel relu, revue désignée). Ouvrir une seconde
+mission `REVUE #N` demanderait une relecture déjà faite. Quand assez d'avis
+`ok` d'une famille **tracée à l'instant du verdict** (`turn_costs`, jamais le
+registre courant) et autre que celle de l'auteur couvrent la tête fusionnée —
+le sha fusionné, ou le dernier gel dont Git prouve que le **delta net est
+identique** à celui du lot fusionné (`_entered`, patch-id) — l'ouverture est
+close sans création. Un avis bloquant, une famille inconnue, un sha différent,
+un delta différent ou une preuve Git absente ne dispensent de rien : la
+relecture reste due, et le doute n'ouvre jamais une dispense (§8).
 """
 from __future__ import annotations
 
@@ -78,7 +90,7 @@ import re
 from datetime import datetime
 from typing import Optional
 
-from . import lot_class, storage, work
+from . import lot_class, plan_git, storage, work
 
 #: la référence qui identifie le lot de relecture d'un lot fusionné
 PREFIX = "review-after-merge:"
@@ -91,7 +103,8 @@ ATTEMPT_PREFIX = "review-after-merge:attempt:#"
 ATTEMPT_RETRY_S = 3600
 #: le marqueur de journal d'un candidat **terminal** : un lot non-light
 #: confirmé (le canon §2 ne demande une relecture après fusion que pour un lot
-#: léger) ou un doute épuisé après `CATCH_UP_MAX_ATTEMPTS` tentatives. Le
+#: léger), une tête déjà relue par une autre famille (#2585) ou un doute épuisé
+#: après `CATCH_UP_MAX_ATTEMPTS` tentatives. Le
 #: premier mot de la note est `TERMINAL_PREFIX + <id>` ; la sélection l'exclut
 #: toujours — la marque reste au journal, visible, mais aucune tentative
 #: horaire perpétuelle (arbitrage pilote du 15/10 sur le P2 de la R2 #1104).
@@ -103,10 +116,14 @@ CATCH_UP_MAX_ATTEMPTS = 3
 #: l'échéance du canon §2 : le jour même de la fusion, heure de Paris
 TZ = "Europe/Paris"
 HOUR = "23:59"
-#: les familles de modèle connues du mesh
-FAMILIES = ("claude", "codex", "deepseek")
-#: la famille de relecture opposée à celle de l'auteur (règle du pilote,
-#: 2026-10-13) : codex si l'auteur est Claude ou DeepSeek, sinon Claude.
+#: les familles de modèle du mesh ne sont plus recopiées ici : elles viennent
+#: du canon compilé (`compiled_families`, lu au dernier commit audité de
+#: l'hôte), et sans lecture aucune famille n'est supposée (#2449/#2664).
+#: la famille de relecture opposée à celle de l'auteur (règle du pilote du
+#: 2026-10-13) : codex si l'auteur est Claude ou DeepSeek, sinon Claude. C'est
+#: une règle pilote datée, hors `processus/mecanique.yaml` (décision
+#: mesh-design du 19/10) ; elle deviendra sans objet quand #2642 aura retiré
+#: la relecture après fusion — son retrait ira alors au panier.
 OPPOSITE = {"claude": "codex", "deepseek": "codex", "codex": "claude"}
 UNKNOWN_FAMILY = "codex ou claude"
 #: avis requis pour la relecture après fusion : un pour un lot léger, deux
@@ -133,9 +150,11 @@ FREEZE_TURN_WINDOW_S = 1800.0
 BLOCKING = ("un défaut **bloquant** (B, P1) trouvé après la fusion ouvre aussitôt un lot de "
             "correction, qui passe avant tout nouveau travail ; un défaut **non bloquant** "
             "(N, P2, P3) ne crée pas de lot : il va au backlog "
-            "(`ameesh work backlog add --title … --value … --score …`), regroupé avec les "
-            "autres défauts mineurs du même chantier (canon §2, owner du 15/10/2026 ; sur "
-            "ameesh, un P2 de la classe sensible bloque encore)")
+            "(`ameesh work backlog add --title … --value … --score … --review-of <lot>`), "
+            "regroupé avec les autres défauts mineurs du même chantier — sous le seuil de "
+            "lot du canon, une ligne du panier du chantier — et un défaut trouvé en "
+            "relisant une suite d'avis ne crée rien (canon §2, owner du 15/10/2026 puis du "
+            "19/10/2026 ; sur ameesh, un P2 de la classe sensible bloque encore)")
 
 
 def ref_of(lot: int) -> str:
@@ -154,39 +173,131 @@ def deadline(now: Optional[datetime] = None) -> str:
     return "%s %s %s" % (now.date().isoformat(), HOUR, TZ)
 
 
-def family_of(harness: Optional[str]) -> str:
+class FamiliesError(Exception):
+    """Les familles de modèle du canon compilé ne peuvent pas être lues."""
+
+
+#: le document compilé est immuable par commit : un canon lu une fois est
+#: relu seulement pour un nouveau commit audité (#2664).
+_FAMILIES_CACHE: dict = {}
+
+
+def _families_at(repo: str, commit: str) -> tuple:
+    """Les familles du document global (`reviews.families`) à ce commit exact."""
+    key = (str(repo), str(commit))
+    if key not in _FAMILIES_CACHE:
+        from . import mechanics
+        _FAMILIES_CACHE[key] = tuple(mechanics.load_global(repo, commit).families)
+    return _FAMILIES_CACHE[key]
+
+
+def compiled_families(db, cfg=None) -> tuple:
+    """Les familles de modèle du canon compilé, au dernier commit audité.
+
+    Le canon n'est pas recopié ici (#2449) : `processus/mecanique.yaml` est
+    compilé par `mechanics.load_global`, au commit que l'hôte a réellement
+    audité (`canon_state.last_good_commit`, #2447 B2) et non à la référence
+    configurée, qui peut être en avance d'un fetch sans synchro. Un état
+    enregistré fait foi même si le passage courant est invalide ; sans état du
+    tout (banc, premier démarrage), le commit exact de la source est le seul
+    connu.
+
+    Lève `FamiliesError` quand aucun canon ne donne de familles lisibles : une
+    seule synchro ratée ne bloque pas les fusions tant qu'un commit audité
+    reste lisible ; en l'absence de tout commit lisible, l'appelant échoue
+    fermé et nomme le canon. Rend un tuple non vide, dans l'ordre du canon.
+    """
+    from . import canon as canon_mod
+    from . import canon_sync
+
+    cfg = cfg if cfg is not None else getattr(db, "cfg", None)
+    if cfg is None or not str(getattr(cfg, "canon", "") or "").strip():
+        raise FamiliesError("no canon configured: the model families are unknown")
+    try:
+        canons = canon_mod.load_configured(cfg)
+    except Exception as exc:  # noqa: BLE001 - canon illisible : diagnostic rendu
+        raise FamiliesError("cannot read the configured canon: %s: %s"
+                            % (type(exc).__name__, str(exc)[:200])) from exc
+    if not canons:
+        raise FamiliesError("no readable canon configured: the model families are unknown")
+    errors = []
+    for canon in canons:
+        root = str(getattr(canon, "root", "") or "") or "canon"
+        for source in getattr(canon, "sources", ()) or ():
+            if getattr(source, "mode", "") != "git" \
+                    or not getattr(source, "repo", "") \
+                    or not getattr(source, "commit", ""):
+                errors.append("%s: canon source is not an exact Git commit" % root)
+                continue
+            if getattr(source, "prefix", ""):
+                errors.append("%s: canon under a sub-directory, mechanics are read"
+                              " at the Git root only" % getattr(source, "repo", ""))
+                continue
+            try:
+                commit = canon_sync.audited_commit(db, cfg, canon, source)
+            except Exception as exc:  # noqa: BLE001 - état illisible : canon suivant
+                errors.append("%s: cannot read the audited commit: %s" % (root, exc))
+                continue
+            if not commit:
+                errors.append("%s: no audited commit readable" % root)
+                continue
+            try:
+                return _families_at(source.repo, commit)
+            except Exception as exc:  # noqa: BLE001 - document illisible : suivant
+                errors.append("%s@%s: %s"
+                              % (source.repo, commit[:12], str(exc)[:240]))
+    raise FamiliesError("; ".join(errors[:4])
+                        or "no canon declares the model families")
+
+
+def family_of(harness: Optional[str], families) -> str:
     """La famille de modèle d'un harnais (`claude`, `codex`, `deepseek`), ou "".
 
     Le harnais peut être un nom précis (`claude-opus-5-5`, `deepseek-flash`) :
-    la famille est celle du mot qu'il porte. Un harnais inconnu ne rend pas une
-    famille par défaut : l'indépendance d'un avis ne se suppose pas (#1374)."""
+    la famille est celle du mot qu'il porte, **dans les familles du canon**
+    (`compiled_families`). Un harnais inconnu, ou un canon illisible (liste
+    vide), ne rend pas une famille par défaut : l'indépendance d'un avis ne se
+    suppose pas (#1374/#2664)."""
     text = (harness or "").strip().lower()
-    for family in FAMILIES:
-        if family in text:
+    for family in families or ():
+        family = str(family or "").strip().lower()
+        if family and family in text:
             return family
     return ""
 
 
-def reviewer_family(harness: Optional[str]) -> str:
-    """La famille de relecture opposée au harnais de l'auteur."""
-    return OPPOSITE.get(family_of(harness), UNKNOWN_FAMILY)
+def reviewer_family(harness: Optional[str], families) -> str:
+    """La famille de relecture opposée au harnais de l'auteur.
+
+    `OPPOSITE` est la règle pilote du 13/10 ; si la famille opposée n'est pas
+    déclarée par le canon, elle n'est pas proposée (aucune famille supposée)."""
+    known = tuple(families or ())
+    family = family_of(harness, known)
+    if not family:
+        return UNKNOWN_FAMILY
+    opposite = OPPOSITE.get(family)
+    return opposite if opposite in known else UNKNOWN_FAMILY
 
 
-def review_families(harness: Optional[str]) -> tuple:
+def review_families(harness: Optional[str], families) -> tuple:
     """Les deux familles d'une relecture sensible, hors de celle de l'auteur.
 
     La première est la famille opposée à l'auteur (`reviewer_family`) ; la
-    seconde est la première des familles connues qui n'est ni celle de
+    seconde est la première des familles du canon qui n'est ni celle de
     l'auteur ni la première. Un harnais inconnu laisse les deux familles
-    ouvertes, sans supposer l'indépendance (#2374)."""
-    author = family_of(harness)
-    first = reviewer_family(harness)
+    ouvertes, dans l'ordre historique d'affichage, sans supposer
+    l'indépendance (#2374)."""
+    known = tuple(str(f or "").strip().lower() for f in (families or ()) if f)
+    author = family_of(harness, known)
+    first = reviewer_family(harness, known)
     if first == UNKNOWN_FAMILY:
-        return ("codex", "claude")
-    for family in FAMILIES:
+        preferred = tuple(f for f in ("codex", "claude") if f in known)
+        return (preferred + tuple(f for f in known if f not in preferred))[:2]
+    for family in known:
         if family not in (author, first):
             return (first, family)
     return (first,)
+
 
 
 def _critical_changed(klass) -> bool:
@@ -420,6 +531,23 @@ def review_ref(item: dict) -> str:
     return ""
 
 
+def _required_family(db, item: dict, families) -> Optional[str]:
+    """`required_family` avec les familles du canon déjà lues."""
+    ref = review_ref(item)
+    if not ref:
+        return None
+    try:
+        lot = int(ref[len(PREFIX):].strip().lstrip("#"))
+        source = work.get(db, lot)
+        if source is None:
+            return ""
+        family = reviewer_family(_author_at_freeze(db, lot, source).get("harness"),
+                                 families)
+    except Exception:  # noqa: BLE001 - lecture impossible : famille inconnue
+        return ""
+    return "" if family == UNKNOWN_FAMILY else family
+
+
 def required_family(db, item: dict) -> Optional[str]:
     """La famille de harnais qu'exige la prise d'un lot de relecture (#2377).
 
@@ -431,21 +559,18 @@ def required_family(db, item: dict) -> Optional[str]:
     opposée à celle de l'auteur au gel (`reviewer_family`), celle que le canon
     §2 demande au relecteur.
 
-    La lecture réutilise `_author_at_freeze` : c'est la même preuve que celle
-    qui a écrit le corps du lot (gel, acteur, tours tracés), jamais le registre
-    courant — il ne dit rien du harnais qui a produit le travail (#1053)."""
-    ref = review_ref(item)
-    if not ref:
+    Les familles viennent du canon compilé (`compiled_families`, #2664) ; un
+    canon illisible rend la famille inconnue, jamais supposée. La lecture
+    réutilise `_author_at_freeze` : c'est la même preuve que celle qui a écrit
+    le corps du lot (gel, acteur, tours tracés), jamais le registre courant —
+    il ne dit rien du harnais qui a produit le travail (#1053)."""
+    if not review_ref(item):
         return None
     try:
-        lot = int(ref[len(PREFIX):].strip().lstrip("#"))
-        source = work.get(db, lot)
-        if source is None:
-            return ""
-        family = reviewer_family(_author_at_freeze(db, lot, source).get("harness"))
-    except Exception:  # noqa: BLE001 - lecture impossible : famille inconnue
+        families = compiled_families(db)
+    except FamiliesError:
         return ""
-    return "" if family == UNKNOWN_FAMILY else family
+    return _required_family(db, item, families)
 
 
 def may_take(db, item: dict, agent: dict) -> bool:
@@ -454,15 +579,23 @@ def may_take(db, item: dict, agent: dict) -> bool:
     Hors lot de relecture, oui, sans autre condition. Pour un lot de
     relecture, seule la famille opposée à celle de l'auteur au gel le prend ;
     la session vivante du preneur fait foi (`registry.live_harness`, #1037),
-    et un harnais hors des familles connues (`family_of`) ne compte pas.
-    Famille de l'auteur inconnue ou famille du preneur inconnue : non — la
-    prise ne devine jamais une indépendance d'avis (#1374)."""
-    family = required_family(db, item)
+    et un harnais hors des familles du canon (`family_of`) ne compte pas.
+    Famille de l'auteur inconnue, canon illisible ou famille du preneur
+    inconnue : non — la prise ne devine jamais une indépendance d'avis
+    (#1374/#2664)."""
+    if not review_ref(item):
+        return True
+    try:
+        families = compiled_families(db)
+    except FamiliesError:
+        return False
+    family = _required_family(db, item, families)
     if family is None:
         return True
     from . import registry
-    mine = family_of(registry.live_harness(agent or {}))
+    mine = family_of(registry.live_harness(agent or {}), families)
     return bool(family) and family == mine
+
 
 
 def title_of(item: dict, lot: int) -> str:
@@ -472,14 +605,15 @@ def title_of(item: dict, lot: int) -> str:
 
 
 def body_of(item: dict, lot: int, *, klass: dict, merged_sha: str = "", pr=None,
-            target: str = "", author: Optional[dict] = None, family: str = "") -> str:
+            target: str = "", author: Optional[dict] = None, family: str = "",
+            families=()) -> str:
     """Le corps du lot de relecture : quoi relire, par qui, avant quand."""
     author = author or {}
     who = author.get("name") or "inconnu"
     # #2384 : la famille se lit sur le harnais du gel, jamais sur le texte
     # affiché (le nom d'un tiers qui a reposé le gel peut contenir un mot de
     # famille) ; le corps doit annoncer exactement ce que la garde relira.
-    author_family = family_of(author.get("harness"))
+    author_family = family_of(author.get("harness"), families)
     harness = author.get("harness") or UNTRACED
     if author.get("refroze"):
         # #1859 : un tiers a reposé le gel ; il n'est pas l'auteur
@@ -487,7 +621,8 @@ def body_of(item: dict, lot: int, *, klass: dict, merged_sha: str = "", pr=None,
     where = "PR #%s" % pr if pr else (merged_sha[:12] if merged_sha else "?")
     why = " ".join(str((klass or {}).get("why") or "").split())
     critical = bool((klass or {}).get("critical"))
-    families = review_families(author.get("harness")) if critical else ()
+    pair = review_families(author.get("harness"), families) if critical else ()
+
     author_human = who.lower().startswith(work.HUMAN_PREFIX)
     untraced = critical and not author_family and not author_human
     lines = [
@@ -519,14 +654,15 @@ def body_of(item: dict, lot: int, *, klass: dict, merged_sha: str = "", pr=None,
     if critical:
         lines.extend([
             "- Relecteurs : **deux familles distinctes**, hors de celle de l'auteur — "
-            "%s (règle du pilote du 13/10)." % " et ".join(families),
+            "%s (règle du pilote du 13/10)." % (" et ".join(pair) or
+                                                 "familles non lisibles au canon"),
             "- Avis requis : **%d** verdicts indépendants sur la fusion ; le lot n'est "
             "clos qu'après le second." % CRITICAL_REVIEWS,
         ])
     else:
         lines.append(
             "- Relecteur : une **autre famille de modèle** — %s (règle du pilote du 13/10)."
-            % (family or reviewer_family(harness)))
+            % (family or reviewer_family(author.get("harness"), families)))
     lines.extend([
         "- Échéance : **%s**, le jour même de la fusion." % deadline(),
         "",
@@ -585,20 +721,194 @@ def _review_recursion(item: dict) -> str:
     return ""
 
 
+def _entered(repo: Optional[str], merged: str, frozen: str) -> bool:
+    """Le contenu du lot fusionné **égale-t-il** le gel relu ?
+
+    Preuve par le delta net, jamais par l'ancêtre seul (B1/P1 des revues cx1
+    et dev1 #2585) : le diff du commit fusionné depuis son **premier parent**
+    doit avoir le même patch-id que le diff du gel depuis sa base commune avec
+    ce premier parent (`plan_git._diff_patch_id`). Le premier parent est la
+    cible au moment de la fusion pour un commit de fusion, la base du commit
+    pour un squash ou un cherry-pick.
+
+    Ainsi une tête C poussée après le gel A puis fusionnée (merge ou voie
+    `pr`, `merged_sha = C`) a un delta A+C, différent de A : la REVUE reste
+    due. Une résolution de fusion qui ajoute du contenu change aussi le delta
+    du commit de fusion : refusée. Un gel A simplement **ancêtre** du commit
+    fusionné ne suffit jamais. L'égalité exacte des commits est le seul
+    raccourci (même contenu par construction). Sans dépôt, commit illisible ou
+    patch-id indisponible : rien n'est prouvé."""
+    if not repo or not merged or not frozen:
+        return False
+    try:
+        head = plan_git._commit(str(repo), str(merged))
+        tip = plan_git._commit(str(repo), str(frozen))
+        if not head or not tip:
+            return False
+        if plan_git.same_commit(head, tip):
+            return True
+        parents = plan_git._commit_parents(str(repo), head)
+        if not parents:
+            return False
+        base = parents[0]
+        reviewed_base = plan_git._out(str(repo), "merge-base", tip, base)
+        if not reviewed_base:
+            return False
+        delivered = plan_git._diff_patch_id(str(repo), base, head)
+        reviewed = plan_git._diff_patch_id(str(repo), reviewed_base, tip)
+        return bool(delivered and reviewed and delivered == reviewed)
+    except Exception:  # noqa: BLE001 - preuve impossible : pas de dispense
+        return False
+
+
+def _heads_on_merge(db, lot: int, merged: str, repo: Optional[str] = None) -> list:
+    """Les têtes qu'une fusion a fait entrer : le sha fusionné, le gel **prouvé**.
+
+    La file en mode `pr` nomme la tête du lot (`landing_sha`) ; une fusion
+    locale ou un relevé de branches nomme le commit de fusion sur la cible.
+    Dans ce second cas, l'avis est porté par le dernier gel : il n'est compté
+    que si Git prouve que le **delta du lot fusionné** est celui du gel
+    (`_entered`). Un gel A relu puis une tête B différente fusionnée ne
+    couvrent pas B : `_entered` est faux et la REVUE reste due (B1 cx1/dev1).
+    Une lecture de jalon impossible ne rend que les têtes connues, jamais une
+    tête inventée."""
+    heads: list = []
+    merged_heads: list = []
+
+    def add(value, into: list) -> None:
+        text = str(value or "").strip()
+        if text and not any(plan_git.same_commit(text, head) for head in into):
+            into.append(text)
+
+    add(merged, merged_heads)
+    if not merged_heads:
+        # Le sha de la fusion constatée fait foi quand l'appelant le connaît :
+        # un jalon `merged` plus ancien ne doit pas élargir les têtes au-delà
+        # du fait examiné (sinon un gel égal au jalon dispenserait une tête C
+        # différente). Le jalon n'est qu'un repli quand le sha manque.
+        add(merged_sha(db, lot), merged_heads)
+    for head in merged_heads:
+        add(head, heads)
+    freezes = _freezes(db, lot)
+    if freezes:
+        frozen = str(freezes[-1].get("sha") or "").strip()
+        # Le gel n'est une tête relue que si Git prouve que le delta livré est
+        # le sien ; sans cette preuve, l'avis sur le gel ne couvre pas la
+        # fusion.
+        if frozen and any(_entered(repo, head, frozen) for head in merged_heads):
+            add(frozen, heads)
+    return heads
+
+
+def _family_at(db, actor: str, at_ts, *, families) -> str:
+    """La famille de modèle tracée de `actor` **à l'instant du verdict**.
+
+    Le registre courant ne prouve rien : une rotation de harnais (Codex vers
+    Claude) ferait compter un avis rendu sous Codex comme indépendant d'un
+    auteur Codex. La trace est celle des tours (`turn_costs`), relue autour de
+    l'instant du verdict par `_turns_harness` — la même preuve que la famille
+    de l'auteur au gel (#1053). Les familles connues sont celles du canon
+    compilé (#2664), jamais une liste locale. Sans tour tracé, aucune famille
+    n'est prouvée et la relecture reste due (autre point de la revue cx1
+    #2585)."""
+    actor = str(actor or "").strip()
+    if not actor or actor.startswith(work.HUMAN_PREFIX) or ":" in actor:
+        return ""
+    try:
+        return family_of(_turns_harness(db, actor, float(at_ts or 0.0)), families)
+    except Exception:  # noqa: BLE001 - trace illisible : famille non prouvée
+        return ""
+
+
+def _reviewed_on_head(db, item: dict, *, heads: list, required: int,
+                      author: Optional[dict] = None, families) -> dict:
+    """Les avis `ok` d'une **autre famille** qui couvrent déjà `heads` (#2585).
+
+    Rend `{done, accepted, blocked}`. `done` n'est vrai qu'avec assez d'avis
+    indépendants : dernier verdict de chaque relecteur, `ok`, sur une des
+    têtes, d'un acteur distinct de l'auteur, de famille **tracée à l'instant
+    du verdict** (`_family_at`) et différente de celle de l'auteur (un auteur
+    humain n'a pas de famille). Un `blocked` courant interdit la dispense :
+    la correction puis un `ok` restent dus.
+
+    L'indépendance ne se suppose jamais (#1374) : une famille illisible ou
+    inconnue ne prouve pas « une autre famille », donc la relecture reste due.
+    Les familles connues viennent du canon compilé (#2664), comme celle de
+    l'auteur au gel. C'est plus strict que `guard_delivery`, qui garde la règle
+    de clôture de la mission ; ici on décide de **ne pas ouvrir** une mission,
+    jamais de fermer une preuve manquante."""
+    out = {"done": False, "accepted": [], "blocked": []}
+    author = author or {}
+    name = str(author.get("name") or "").strip()
+    if not name or not heads:
+        return out
+    author_family = family_of(author.get("harness"), families)
+    author_human = name.lower().startswith(work.HUMAN_PREFIX)
+    try:
+        rows = work.milestones(db, int(item["id"]), limit=200) or []
+    except Exception:  # noqa: BLE001 - lecture impossible : la relecture reste due
+        return out
+    latest: dict = {}
+    for mark in rows:
+        if str(mark.get("kind") or "") != "verdict":
+            continue
+        # `work.milestones` rend du plus récent au plus ancien : le premier
+        # verdict de chaque relecteur est son dernier.
+        latest.setdefault(str(mark.get("actor") or "").strip().lower() or "?", mark)
+    accepted, accepted_families, blocked = [], set(), []
+    for mark in latest.values():
+        kind = str(mark.get("verdict") or "")
+        if kind not in ("ok", "blocked"):
+            continue
+        if not any(plan_git.same_commit(mark.get("sha"), head) for head in heads):
+            continue
+        actor = str(mark.get("actor") or "").strip()
+        if kind == "blocked":
+            blocked.append(actor or "?")
+            continue
+        if actor and actor.lower() == name.lower():
+            continue                      # on ne relit pas son propre travail
+        family = _family_at(db, actor, mark.get("at_ts"), families=families)
+        if not family:
+            continue                      # aucune preuve d'une autre famille
+        if not author_human:
+            if not author_family or family == author_family:
+                continue
+        if required >= 2 and family in accepted_families:
+            continue
+        accepted_families.add(family)
+        accepted.append({"actor": actor or "?", "family": family})
+    if blocked:
+        # Un avis bloquant n'est pas une relecture rendue : la relecture
+        # après fusion reste due (la correction suit son propre lot).
+        return {"done": False, "accepted": accepted, "blocked": blocked}
+    out.update({"done": len(accepted) >= int(required),
+                "accepted": accepted, "blocked": blocked})
+    return out
+
+
 def open_after_merge(db, *, lot: int, klass: dict, item: Optional[dict] = None,
                      merged_sha: str = "", pr=None, target: str = "",
-                     actor: str = work.SYSTEM_SENDER) -> dict:
+                     actor: str = work.SYSTEM_SENDER,
+                     repo: Optional[str] = None) -> dict:
     """Ouvre le lot de relecture du lot léger `lot`, s'il n'existe pas déjà.
 
-    Rend `{lot, id, created, class, merged_class, critical, reviews, why}` —
-    ne lève jamais. `klass` est la classe lue sur le diff fusionné ; seule
-    `light` ouvre un lot de relecture, un doute ou une classe supérieure
-    n'ouvre rien (le canon §2 ne demande une relecture après fusion que pour
-    les lots légers). Une classe `light` dont le diff touche pourtant un
-    chemin critique (porte de fusion, SQL, sécurité, prod : `CRITICAL_SCOPE`)
-    ouvre une relecture **sensible**, avec **deux** avis de familles
-    distinctes (#2374) : le classement du canon ne peut pas dispenser la
-    sécurité d'une seconde lecture quand il a omis le chemin.
+    Rend `{lot, id, created, class, merged_class, critical, reviews,
+    already_reviewed, reviewed_by, why}` — ne lève jamais. `klass` est la
+    classe lue sur le diff fusionné ; seule `light` ouvre un lot de relecture,
+    un doute ou une classe supérieure n'ouvre rien (le canon §2 ne demande une
+    relecture après fusion que pour les lots légers). Une classe `light` dont
+    le diff touche pourtant un chemin critique (porte de fusion, SQL, sécurité,
+    prod : `CRITICAL_SCOPE`) ouvre une relecture **sensible**, avec **deux**
+    avis de familles distinctes (#2374) : le classement du canon ne peut pas
+    dispenser la sécurité d'une seconde lecture quand il a omis le chemin.
+
+    #2585 : si assez d'avis `ok` d'une autre famille couvrent déjà la tête
+    fusionnée, rien n'est créé : `already_reviewed` est vrai et `reviewed_by`
+    nomme les avis retenus. Le gel relu n'est compté que si Git prouve son
+    entrée dans la fusion (`repo` : `_entered`). Un avis bloquant, une famille
+    inconnue, un sha différent ou une preuve Git absente laissent la relecture
+    due.
 
     La création et la marque au journal de `lot` sont **une seule écriture**
     (revue #544 r1) : un échec de la marque annule la création, donc un nouvel
@@ -619,11 +929,16 @@ def open_after_merge(db, *, lot: int, klass: dict, item: Optional[dict] = None,
                    + "porte de fusion : chemin critique, deux avis requis",
         })
     review_class = str(klass.get("class") or "")
+    # #2642 : le plancher léger vient du canon quand la classe le porte (le
+    # lecteur `lot_class` l'a lu pour ce même diff) ; le plancher historique
+    # d'un avis reste le repli d'une classe sans paramètre, jamais zéro.
     reviews = (CRITICAL_REVIEWS if critical
-               else LIGHT_REVIEWS if merged_class == lot_class.LIGHT else 0)
+               else int(klass.get("light_reviews") or LIGHT_REVIEWS)
+               if merged_class == lot_class.LIGHT else 0)
     out = {"lot": lot, "id": None, "created": False, "class": review_class,
            "merged_class": merged_class, "critical": critical,
-           "reviews": reviews, "why": ""}
+           "reviews": reviews, "already_reviewed": False, "reviewed_by": [],
+           "why": ""}
     if merged_class != lot_class.LIGHT:
         out["why"] = ("class %s: pas de lot de relecture après fusion (§2)"
                       % (merged_class or "?"))
@@ -649,8 +964,50 @@ def open_after_merge(db, *, lot: int, klass: dict, item: Optional[dict] = None,
         out["why"] = "lot de relecture déjà marqué au journal de #%d" % lot
         return out
     author = _author_at_freeze(db, lot, item)
-    family = reviewer_family(author.get("harness"))
-    author_family = family_of(author.get("harness"))
+    # #2664 : familles du canon compilé ; un canon illisible laisse la famille
+    # inconnue (le corps et la marque le disent, la garde de livraison refuse
+    # `--done` à deux avis). L'ouverture d'une relecture reste un fait dû.
+    try:
+        families = compiled_families(db)
+    except FamiliesError:
+        families = ()
+    family = reviewer_family(author.get("harness"), families)
+    author_family = family_of(author.get("harness"), families)
+    # #2585 : la revue déjà rendue avant la fusion est la relecture due ; ne
+    # pas en ouvrir une seconde. `merged_sha` peut être le commit de fusion
+    # (voie locale) : `_heads_on_merge` ne compte le dernier gel que si Git
+    # prouve que le delta livré est le sien (`repo`) — un gel A relu ne couvre
+    # pas une tête B différente fusionnée, ni une résolution qui ajoute du
+    # contenu. Les familles de l'auteur et des relecteurs sont celles du canon
+    # compilé (#2664), jamais une liste locale.
+    try:
+        reviewed = _reviewed_on_head(
+            db, item, heads=_heads_on_merge(db, lot, merged_sha, repo=repo),
+            required=reviews, author=author, families=families)
+    except Exception:  # noqa: BLE001 - lecture impossible : la relecture reste due
+        reviewed = {"done": False, "accepted": [], "blocked": []}
+    if reviewed["done"]:
+        reviewed_by = ", ".join("%s (%s)" % (entry["actor"], entry["family"])
+                                for entry in reviewed["accepted"])
+        out.update({
+            "already_reviewed": True,
+            "reviewed_by": reviewed["accepted"],
+            "why": ("avis déjà rendu sur la tête fusionnée : %s — pas de lot de "
+                    "relecture ouvert" % reviewed_by),
+        })
+        # La marque terminale est le fait durable : le rattrapage ne
+        # réexaminera pas un lot déjà relu (souvent sans dépôt pour prouver le
+        # gel) et le journal dit pourquoi aucune mission n'est ouverte. Best
+        # effort : si elle échoue, le rattrapage réévalue, jamais ne perd un
+        # avis dû.
+        try:
+            ops.log_review_attempt(
+                lot, str(item.get("state") or ""),
+                "%s%d avis déjà rendu sur la tête fusionnée : %s"
+                % (TERMINAL_PREFIX, lot, reviewed_by), actor)
+        except Exception:  # noqa: BLE001 - marque de confort, jamais bloquante
+            pass
+        return out
     mark = requirement_mark(lot, required=reviews, merged_sha=merged_sha,
                             author=author.get("name") or "",
                             author_family=author_family)
@@ -659,7 +1016,8 @@ def open_after_merge(db, *, lot: int, klass: dict, item: Optional[dict] = None,
             db, title=title_of(item, lot), type="evolution", source=ref,
             app=str(item.get("app") or ""),
             body=body_of(item, lot, klass=klass, merged_sha=merged_sha, pr=pr,
-                         target=target, author=author, family=family),
+                         target=target, author=author, family=family,
+                         families=families),
             issue_ref=ref, actor=actor, mark_item_id=lot,
             mark_note="%s lot #{lot} ouvert (classe %s, %d avis, relecture due %s) — %s"
                       % (ref, review_class, reviews, deadline(), mark))
@@ -862,12 +1220,13 @@ def class_at_merge(db, lot: int, *, item: Optional[dict] = None,
                    sha: str = "") -> dict:
     """La classe du lot au moment d'une fusion constatée (L539, canon §8).
 
-    Le diff lu est celui que la fusion a fait entrer : `sha` (le commit de la
-    fusion constatée, le gel à défaut) est ramené à son intervalle de
-    changement par `lot_measures.diff_range` — commit de fusion, fusion qui a
-    introduit le gel, ou gel hors cible. Lire `cible..gel` serait un piège :
-    une fois la fusion faite, le gel est un ancêtre de la cible, ce diff est
-    vide et toute classe y serait « light ».
+    Le diff lu est celui du **lot** : `sha` (le commit de la fusion constatée)
+    ou, à défaut, son gel, ramené au delta du lot par
+    `lot_measures.lot_diff_range` — la fusion d'un paquet est lue sur le gel
+    du lot, pas sur le diff du paquet (#2702), et une cible locale périmée
+    n'élargit plus le diff à l'historique entre les deux. Lire `cible..gel`
+    serait un piège : une fois la fusion faite, le gel est un ancêtre de la
+    cible, ce diff est vide et toute classe y serait « light ».
 
     Un merge sans delta (arbre identique à son premier parent, le contenu du
     lot ayant été porté par un autre commit de la cible) a lui aussi un diff
@@ -875,67 +1234,119 @@ def class_at_merge(db, lot: int, *, item: Optional[dict] = None,
     (`lot_measures.lot_diff_range`, #2374 / #2340), jamais conclue « light »
     sur le vide.
 
-    `repo` est le dépôt où la fusion a été constatée (le relevé des branches
-    le connaît), sinon le dossier de travail de l'assigné au registre, sinon
-    le dépôt du projet (`lot_class.repository`) — toujours pour y lire le diff
-    de la fusion, jamais `cible..gel`. `target` la cible déjà résolue.
+    Les dépôts candidats sont essayés dans l'ordre : `repo` explicite
+    (autoritaire, sans repli), sinon le dossier de travail de l'assigné au
+    registre, puis le dépôt du projet (`lot_class.repository`) — toujours pour
+    y lire le diff du lot. On retient le premier qui porte le commit de fusion
+    ou le gel **et** dont le delta est lisible : un répertoire qui n'est pas un
+    dépôt git, un clone partiel ou un diff illisible laisse la place au
+    suivant (#2968). `target` la cible déjà résolue.
 
-    Sans intervalle **prouvé** (diff illisible, commit de fusion absent du
-    dépôt, ni gel ni commit), la classe n'est pas demandée à `of_lot` : son
+    Sans intervalle **prouvé** (aucun candidat ne contient le commit, diff
+    illisible, ni gel ni commit), la classe n'est pas demandée à `of_lot` : son
     repli gel/cible rendrait `cible..gel`, vide dès que le gel est un ancêtre
     de la cible — « light » sur un lot SQL fusionné (R1 #1104 P2-1). On rend un
-    doute conservateur, et d'une classe inconnue on n'ouvre pas de relecture."""
+    doute conservateur, qui nomme les dépôts essayés, et d'une classe inconnue
+    on n'ouvre pas de relecture."""
     from . import lot_measures, plan_git
     if item is None:
         item = work.get(db, lot)
     if item is None:
         return {"class": "", "why": "lot #%d introuvable" % int(lot), "doubt": True}
-    where = repo or _repo_of_agent(db, str(item.get("assignee") or ""))
-    if not where:
-        where = lot_class.repository(getattr(db, "cfg", None), item) or ""
+    # Le répertoire de l'assigné peut n'être qu'un dossier de travail (pas un
+    # dépôt git) ou un clone partiel sans le commit : on essaie les candidats
+    # dans l'ordre (--repo explicite, dépôt de l'assigné, dépôt du projet) et
+    # on retient le premier qui prouve l'intervalle. --repo explicite reste
+    # autoritaire, sans repli (#2968).
+    candidates: list[str] = []
+    if repo:
+        candidates = [repo]
+    else:
+        for path in (_repo_of_agent(db, str(item.get("assignee") or "")),
+                     lot_class.repository(getattr(db, "cfg", None), item) or ""):
+            path = str(path or "").strip()
+            if path and path not in candidates:
+                candidates.append(path)
+    where = candidates[0] if candidates else ""
     base = head = ""
     proven = False
     why = "aucun intervalle de fusion lisible"
+    tried: list[tuple[str, str]] = []
     try:
         frozen = ""
-        if where:
+        if candidates:
             freeze = plan_git.latest_freeze(work.milestones(db, int(lot)))
             frozen = str((freeze or {}).get("sha") or "").strip()
-        tips = [t for t in ((sha or "").strip(), frozen) if t]
-        if not where:
+        tips = list(dict.fromkeys(t for t in ((sha or "").strip(), frozen) if t))
+        if not candidates:
             why = "dépôt inconnu : aucun intervalle de fusion lisible"
         elif not tips:
             why = "ni commit de fusion ni gel : aucun intervalle de fusion lisible"
-        # le commit de la fusion constatée d'abord ; à défaut le gel (fusion
-        # déclarée sans commit lisible, `ameesh work merged` à la main)
-        for tip in tips:
-            rng = lot_measures.diff_range(where, tip, target or None)
-            if not rng:
-                why = "le dépôt %s ne contient pas le commit %s" % (where, tip[:12])
-                continue
-            paths = lot_measures.diff_paths(where, *rng)
-            if paths is None:
-                why = "diff de fusion illisible pour %s" % tip[:12]
+        unproven = ""
+        for candidate in candidates:
+            reason = ""
+            # le commit de la fusion constatée d'abord ; à défaut le gel (fusion
+            # déclarée sans commit lisible, `ameesh work merged` à la main)
+            for tip in tips:
+                # #2702 : lire le delta **du lot** d'abord — une fusion de paquet
+                # ne classe pas ses lots sur le diff du paquet, et une cible
+                # locale périmée n'élargit pas le diff à l'historique entre les
+                # deux ; l'intervalle de la fusion reste le repli (#2374).
+                # UnprovenLotDiff (#2823) interrompt aussi ce repli et l'essai
+                # du gel seul : le paquet ne prouve pas le delta du lot.
+                try:
+                    rng = lot_measures.lot_diff_range(candidate, tip, target or None,
+                                                      frozen=frozen or None)
+                    if rng is None:
+                        rng = lot_measures.diff_range(candidate, tip, target or None)
+                    if not rng:
+                        reason = "le dépôt %s ne contient pas le commit %s" % (
+                            candidate, tip[:12])
+                        continue
+                    paths = lot_measures.diff_paths(candidate, *rng)
+                except lot_measures.UnprovenLotDiff as exc:
+                    # Ce n'est pas un dépôt illisible : c'est la preuve que le
+                    # gel n'appartient pas à la fusion observée. Le doute vaut
+                    # pour la lecture entière — ni un autre dépôt ni un autre
+                    # commit ne doivent relire un gel séparé de sa fusion.
+                    unproven = str(exc)
+                    break
+                except Exception as exc:  # noqa: BLE001 - candidat illisible : le suivant
+                    reason = "lecture du diff impossible : %s: %s" % (
+                        type(exc).__name__, str(exc)[:160])
+                    break
+                if paths is None:
+                    reason = "diff de fusion illisible pour %s" % tip[:12]
+                    break
+                if paths:
+                    where = candidate
+                    base, head = rng
+                    proven = True
+                    break
+                # #2374 (2e cas, #2340) : un intervalle vide — arbre du merge égal
+                # à son premier parent, ou gel déjà porté par la cible — n'est pas
+                # une preuve. Classer ce vide dirait « light » sans jamais lire le
+                # lot : on doute.
+                reason = ("diff de fusion vide et aucun delta du lot lisible pour %s"
+                          % tip[:12])
                 break
-            if paths:
-                base, head = rng
-                proven = True
+            if unproven:
                 break
-            # #2374 (2e cas, #2340) : un merge dont l'arbre égale son premier
-            # parent a un diff vide — un delta déjà porté par un autre commit
-            # de la cible (rebase, adaptation). Classer ce vide dirait « light »
-            # sans jamais lire le lot : on relit le delta propre au lot
-            # (`merge-base(premier parent, tête du lot)..tête du lot`).
-            alt = lot_measures.lot_diff_range(where, tip, target or None)
-            alt_paths = lot_measures.diff_paths(where, *alt) if alt else None
-            if alt_paths:
-                base, head = alt
-                proven = True
-                why = "diff de fusion vide : classe lue sur le diff du lot"
+            tried.append((candidate, reason or "aucun intervalle lisible"))
+            if proven:
                 break
-            why = ("diff de fusion vide et aucun delta du lot lisible pour %s"
-                   % tip[:12])
-            break
+        if unproven:
+            proven = False
+            why = "lecture du diff impossible : UnprovenLotDiff: %s" % unproven
+        elif not proven and tips and tried:
+            if len(tried) == 1:
+                why = tried[0][1]
+            else:
+                why = ("aucun dépôt candidat ne contient le commit %s : %s"
+                       % (tips[0][:12], "; ".join(
+                           "%s: %s" % (path, reason) for path, reason in tried)))
+        # ni commit ni gel : `why` garde le motif posé plus haut, sans nommer
+        # des dépôts qui n'ont rien eu à essayer.
     except Exception as exc:  # noqa: BLE001 - pas d'intervalle : doute, jamais de classe
         proven = False
         why = "lecture du diff impossible : %s: %s" % (type(exc).__name__, str(exc)[:160])
@@ -968,17 +1379,21 @@ def open_for_merge(db, lot: int, *, merged_sha: str = "", pr=None,
 
     Toute voie qui enregistre une fusion (`work.close_merged`) passe ici : le
     relevé des branches (L118), `sync-merges`, `sync-github`, la porte
-    `git-merge` et `ameesh work merged`. La classe est relue sur le diff de la
-    fusion constatée (`class_at_merge`) avec les indices de l'appelant ; seule
+    `git-merge` et `ameesh work merged`. La classe est relue sur le delta du
+    lot (`class_at_merge`) avec les indices de l'appelant ; seule
     `light` ouvre, un doute n'ouvre rien, et un `light` qui touche un chemin
     critique ouvre une relecture sensible à deux avis (#2374). Idempotent : un
     lot de relecture déjà écrit, **quel que soit son état**, est rendu sans
     relire la classe. `merged_class` garde la classe du diff fusionné (pour le
-    rattrapage), `class` celle du lot de relecture ouvert. Ne lève jamais —
-    la fusion est un fait déjà enregistré."""
+    rattrapage), `class` celle du lot de relecture ouvert. #2585 : un avis
+    d'une autre famille déjà rendu sur la tête fusionnée donne
+    `already_reviewed` sans création ; `repo` sert aussi de preuve que le gel
+    relu est entré dans le commit fusionné. Ne lève jamais — la fusion est un
+    fait déjà enregistré."""
     lot = int(lot)
     out = {"lot": lot, "id": None, "created": False, "class": "",
-           "merged_class": "", "critical": False, "reviews": 0, "why": ""}
+           "merged_class": "", "critical": False, "reviews": 0,
+           "already_reviewed": False, "reviewed_by": [], "why": ""}
     try:
         item = work.get(db, lot)
         if item is None:
@@ -1000,14 +1415,20 @@ def open_for_merge(db, lot: int, *, merged_sha: str = "", pr=None,
         out["class"] = klass.get("class") or ""
         out["merged_class"] = out["class"]
         out["doubt"] = bool(klass.get("doubt"))
+        if out["doubt"]:
+            # #2823 : garder la cause, sans annoncer une classe confirmée.
+            out["why"] = klass.get("why") or "classe après fusion incertaine"
+            return out
         opened = open_after_merge(
             db, lot=lot, klass=klass, item=item, merged_sha=merged_sha, pr=pr,
-            target=where_target, actor=actor)
+            target=where_target, actor=actor, repo=repo)
         out.update({"id": opened.get("id"), "created": bool(opened.get("created")),
                     "class": opened.get("class") or out["class"],
                     "merged_class": opened.get("merged_class") or out["merged_class"],
                     "critical": bool(opened.get("critical")),
                     "reviews": int(opened.get("reviews") or 0),
+                    "already_reviewed": bool(opened.get("already_reviewed")),
+                    "reviewed_by": list(opened.get("reviewed_by") or []),
                     "why": opened.get("why") or ""})
         return out
     except Exception as exc:  # noqa: BLE001 - la fusion reste un fait
@@ -1064,12 +1485,17 @@ def catch_up(db, *, repo: str = "", target: str = "",
     (classe non confirmée) est réessayé au plus `max_attempts` fois, espacées de
     `retry_s`, puis marqué terminal à son tour — le journal garde la trace.
 
-    Ne lève jamais ; rend `{examined, missing, opened, already, attempted,
-    terminal, failed, bound}` (`attempted` : tentatives sans création marquées,
-    `already` : relecture ouverte entre la sélection et le geste, `terminal` :
+    #2585 : un candidat dont la tête est déjà relue par une autre famille
+    n'ouvre rien ; il reçoit la marque terminale (`reviewed`) au lieu d'être
+    retenté à chaque balayage — la relecture est rendue, pas manquante.
+
+    Ne lève jamais ; rend `{examined, missing, opened, already, reviewed,
+    attempted, terminal, failed, bound}` (`attempted` : tentatives sans
+    création marquées, `already` : relecture ouverte entre la sélection et le
+    geste, `reviewed` : avis déjà rendu sur la tête fusionnée, `terminal` :
     candidats clos par la marque terminale)."""
     out = {"examined": 0, "missing": 0, "opened": 0, "already": 0,
-           "attempted": 0, "terminal": 0, "failed": 0, "bound": ""}
+           "reviewed": 0, "attempted": 0, "terminal": 0, "failed": 0, "bound": ""}
     try:
         ops = storage.of(db).work
         bound = ops.review_catch_up_bound()
@@ -1128,6 +1554,22 @@ def catch_up(db, *, repo: str = "", target: str = "",
                                   target=target or str(row.get("branch_target") or ""))
             if done.get("created"):
                 out["opened"] += 1
+                continue
+            if done.get("already_reviewed"):
+                # #2585 : la relecture est déjà rendue sur la tête fusionnée ;
+                # aucune mission n'est due, et le candidat ne doit pas revenir
+                # à chaque balayage (marque terminale, pas une tentative).
+                out["reviewed"] += 1
+                out["terminal"] += 1
+                reviewed_by = ", ".join(
+                    "%s (%s)" % (entry.get("actor"), entry.get("family"))
+                    for entry in done.get("reviewed_by") or ()) or "?"
+                # `open_after_merge` a déjà posé la marque terminale avec la
+                # même raison ; ne pas la doubler (elle est best effort, le
+                # repli la pose si elle a manqué).
+                if not _noted(ops, lot, TERMINAL_PREFIX):
+                    terminal(lot, state, "avis déjà rendu sur la tête fusionnée : %s"
+                             % reviewed_by)
                 continue
             if done.get("id") or "déjà" in str(done.get("why") or ""):
                 # un autre exécuteur a ouvert la relecture entre la sélection

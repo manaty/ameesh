@@ -61,6 +61,18 @@ reprendre le bail l'un de l'autre (le SQL autorise le même propriétaire à
 prendre un nouvel epoch). Après un arrêt brutal, le successeur attend donc
 l'expiration du TTL ; un arrêt propre le libère tout de suite.
 
+Les réservations de cible (`<projet>:<cible>`, propriétaire `train:<exécuteur>`)
+ne suivent pas le bail de service : un exécuteur arrêté laisse les siennes
+posées. Le nouveau porteur du bail les adopte (#3142) au lieu d'attendre leur
+TTL de 30 min : dans une même transaction, son bail de service vivant est
+vérifié, la réservation passe à son propriétaire `train:` à l'epoch suivant, et
+le ticket du plan en vol est réécrit. L'ancien epoch est ensuite refusé partout
+(sauvegarde du train, renouvellement, publication, revendication de
+promotion, libération). Le plan reprend où il était : une publication
+incertaine est republiée à l'identique (idempotente), une promotion incertaine
+passe par la réconciliation. Une réservation ordinaire (fusion d'un lot seul)
+n'est jamais adoptée, ni un ticket dont l'epoch ne correspond plus à la ligne.
+
 ## Modes
 
 ### `shadow` — le plan calculé, sans effet
@@ -75,12 +87,34 @@ service :
    `$AMEESH_STATE/trains/shadow/<projet>-<cible>-<empreinte>.json` ;
 4. compare ce plan au manifeste du composeur humain quand le paquet de la même
    heure a atterri : lots manquants (avec le motif que le train avait), lots en
-   trop, paquet et base qui ont servi.
+   trop, paquet et base qui ont servi. Un lot déjà composé dans un paquet
+   `integration/**` encore en vol au créneau (paquet fusionné après la coupure,
+   ou branche encore ouverte, lue en lecture seule) n'est pas un désaccord : il
+   est exclu des « en trop » et nommé « porté par <paquet> en vol » dans
+   `carried` et `explanations`. La composition au créneau est **prouvée** au
+   dernier commit first-parent de la branche antérieur à la coupure, avec le
+   manifeste exact `reviews/integration-<paquet>.md` : le manifeste final d'une
+   branche enrichie après la coupure ne compte pas, et aucun manifeste d'un
+   autre paquet n'est repris (pas de repli). Sans preuve, le lot reste dans
+   `extra`, expliqué « porteur inconnu » ; une branche ouverte dont la dernière
+   composition avant la coupure dépasse six heures est tenue pour abandonnée,
+   jamais porteuse.
 
 L'inventaire de l'ombre applique la **même décision d'inscription** que le mode
 actif (`Enrollment.decide` : préparation, avis, puis frontière initiale et
 reçus de retrait), sans écrire : un gel retiré, d'historique inconnu ou une ligne de file sans reçu d'allocation
 n'est jamais présenté comme un membre que le train inscrirait.
+
+Une cible autre que `main` reçoit la **synchro mécanique de main** (#2727) :
+quand le paquet a des membres et que `main` porte des commits absents de la
+cible, le plan porte `sync: {ref: "main", sha: …}` et le paquet réel fusionne
+ce commit en tête, sans avis ni lot build. La comparaison expose le fait dans
+`sync` (`plan`, `manual`, `lots`) et retire des lots manquants celui d'une
+fusion manuelle **prouvée pure** : deux parents (côté paquet, `main`), un seul
+trailer `ameesh-work`, arbre identique à la fusion propre des parents. Une
+fusion qui ajoute autre chose, résout à la main ou porte plusieurs trailers
+laisse son lot manquant (`sync.refused`) : une synchro non prouvée n'est pas un
+écart de composition.
 
 Rien n'est réservé, poussé, dispatché ni fusionné : aucun `merge_locks` de
 cible, aucune branche `integration/**`, aucune CI. C'est le mode qui doit
@@ -90,7 +124,7 @@ Lecture :
 
 ```sh
 jq '.plans[-2:]' "$AMEESH_STATE"/trains/shadow/*.json
-jq '.comparisons[] | {packet: .packet.stamp, missing, extra, explanations}' \
+jq '.comparisons[] | {packet: .packet.stamp, missing, extra, carried, explanations}' \
   "$AMEESH_STATE"/trains/shadow/*.json
 ```
 
@@ -109,6 +143,15 @@ suites que le change set intégré rend dues. Un push ameesh couvert par une PR
 ouverte laisse `suite` sauté : ce n'est pas une preuve de paquet, le train
 refuse. Le composeur humain devient le repli : en cas de rouge, le train
 s'arrête, alerte et n'enchaîne pas ; un humain reprend la main.
+
+Avant les membres, le train fusionne le commit `main` que la cible ne porte
+pas encore (membre mécanique #2727, sans avis) : la tête du paquet porte
+`ameesh-sync: main <sha>`, cite `main` parmi ses parents et reste reproductible
+depuis le plan. Un conflit refuse le paquet en nommant `main`, la base et les
+fichiers ; un fichier **généré** du projet fait exception : il est régénéré sur
+l'arbre fusionné comme à l'atterrissage, et un échec de régénération refuse le
+paquet. Une réécriture de `main` qui retire le commit planifié refuse aussi la
+publication. Une cible `main` n'a évidemment pas cette synchro.
 
 La bascule est un geste de pilote : changer `mode` en `active`, vérifier le
 commit canon audité et l'échéance, puis redémarrer l'exécuteur. Aucun code ne
@@ -141,6 +184,19 @@ la matrice complète 8 psycopg + 16 psql, le job `plateforme macOS` et l'agréga
 le train ne s'en sert jamais. Une modification d'un de ces fichiers exige un
 nouveau contrat audité : le témoin `tests/test_2446_train_contract.py` compare
 les blobs au commit.
+
+#3098 : les blobs de référence ne sont pas lus dans le module installé, qui
+reste l'instantané de la release, mais dans `src/ameesh/train_contracts.py` au
+**commit de base** de la cible — code relu et atterri. Le module installé
+fournit toujours les chemins et les jobs du contrat. Un paquet qui change une
+source est donc refusé, et une fois ce paquet atterri par la voie « déblocage
+CI » (§11 bis) avec son ré-épinglage, la coupure suivante repart immédiatement,
+sans attendre la release et le déploiement suivants. **Toutes** les sources
+déclarées par la base sont vérifiées, y compris celles que le module installé ne
+connaît pas encore : la tête ne peut pas les déplacer. Une base dont les épingles
+ne correspondent pas à son propre arbre, qui omet une source auditée, ou dont le
+commit est absent du clone, est refusée par un message nommé. Témoins :
+`tests/test_3098_train_contract_pins.py`.
 
 ### Nexlink — les parts dues (#2503)
 

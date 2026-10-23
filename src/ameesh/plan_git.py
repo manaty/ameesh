@@ -39,6 +39,13 @@ qui a un tel gel, la fusion est constatée, dans cet ordre :
 La fermeture est conditionnée en base au gel examiné : si un nouveau gel est
 déclaré entre l'examen et l'écriture, rien n'est fermé (`refrozen`).
 
+#2443 : une unité dont la composition de paquet est enregistrée
+(`work_packet_members`) est d'abord prouvée par son commit de composition,
+dans la cible (`ameesh-work`, revert #1825 compris) : un jalon `frozen` n'est
+pas nécessaire, ce qui couvre le cas #2366. La preuve est écartée si le gel
+effectif courant de l'unité n'est plus celui de la composition (re-gel), et le
+relevé retombe alors sur le gel déclaré.
+
 Lecture seule du dépôt (`git merge-base`, `rev-list`, `log -p`, `patch-id`) ;
 la cible est lue telle que le clone la connaît. Deux exceptions, bornées et
 best-effort :
@@ -53,6 +60,14 @@ best-effort :
   périmée. Un clone que personne ne fetch ne fermait jamais les lots livrés
   par un paquet ; si le fetch échoue, le relevé continue sur les refs lues.
 
+#2744 : une fermeture par contenu est retenue tant que le lot est `blocked`
+ou qu'une note `hold:` n'est pas levée (le contenu fusionné est constaté, le
+journal le dit, le détenteur est réveillé, le lot reste ouvert) ; le contrôle
+et la fermeture partagent le verrou de ligne du lot avec les notes hold/lift
+(`work.close_merged(content_guard=…)`), et une lecture du journal en erreur
+retient aussi. `sync-branches` et les unités de paquet (`sync-packets`)
+portent la même garde.
+
 Un lot absorbé par un autre ou remplacé se clôt par
 `ameesh work close <id> --superseded-by <id>` ; jamais de réouverture d'un
 lot fermé.
@@ -61,7 +76,9 @@ from __future__ import annotations
 
 import os
 import re
+import tempfile
 
+from . import planned_waits
 from . import storage
 from . import work as work_mod
 from .canon import (FETCH_TIMEOUT, GitError, NO_LAZY_FETCH, _git, _norm_url,
@@ -112,11 +129,68 @@ def _out(repo: str, *args: str) -> str | None:
     return proc.stdout.decode("utf-8", "replace").strip()
 
 
-def _commit(repo: str, rev: str) -> str | None:
+def _commit(repo: str, rev: str, *, timeout: float | None = None) -> str | None:
     # #1749 : sonde de présence — pas de fetch paresseux (l'échec laisse un
     # transport orphelin derrière lui dans un clone partiel).
+    # #2665 : `timeout` laisse l'appelant ramener la sonde au temps qui reste ;
+    # le défaut de `canon._git` (GIT_TIMEOUT) vaut quand il est absent.
+    bound = {} if timeout is None else {"timeout": timeout}
     proc = _git(repo, "rev-parse", "--verify", "--quiet", rev + "^{commit}",
-                env_extra=NO_LAZY_FETCH)
+                env_extra=NO_LAZY_FETCH, **bound)
+    if proc.returncode != 0:
+        return None
+    return proc.stdout.decode("utf-8", "replace").strip()
+
+
+#: #2851 : une sonde de présence de commit reste locale. Dans un clone partiel,
+#: `rev-parse <absent>^{commit}` lance un fetch paresseux du promisor — mesuré
+#: ~10 s vers GitHub, et `GIT_NO_LAZY_FETCH` ne l'empêche pas avec git 2.43.
+#: La borne couvre une lecture d'objets locaux ; un dépassement rend None.
+PROBE_TIMEOUT_S = 2.0
+
+
+def local_commit(repo: str, rev: str, *,
+                 timeout: float | None = PROBE_TIMEOUT_S) -> str | None:
+    """`rev` résolu en commit complet **depuis les objets locaux** de `repo`.
+
+    Sert aux sondes de présence qui balaient des clones d'autres projets
+    (#2851 : le dépôt d'un gel, `lot_class.repo_for_freeze`) : elles ne
+    doivent jamais réveiller le réseau. La résolution se fait dans un dépôt
+    git vide, sans remote ni promisor, dont le magasin d'objets est celui de
+    `repo` (`GIT_OBJECT_DIRECTORY`) : un commit absent — le cas d'un clone
+    partiel qui n'a pas la branche — échoue en quelques millisecondes au lieu
+    de lancer un fetch. Le commit présent se résout comme d'habitude, y
+    compris à travers `objects/info/alternates`.
+
+    Une ref non-SHA (`HEAD`, une branche) n'a pas de sens dans un magasin sans
+    refs : on retombe sur `_commit`, borné. Lecture seule, jamais de fetch."""
+    rev = str(rev or "").strip()
+    if not rev or rev.startswith("-"):
+        return None
+    if not commit_id(rev):
+        return _commit(repo, rev, timeout=timeout)
+    try:
+        objects = _out(repo, "rev-parse", "--git-path", "objects")
+    except Exception:  # noqa: BLE001 - dépôt illisible : la piste est écartée
+        return None
+    if not objects:
+        return None
+    objects = os.path.realpath(os.path.join(repo, objects))
+    bound = {} if timeout is None else {"timeout": timeout}
+    try:
+        with tempfile.TemporaryDirectory(prefix="ameesh-objets-") as gitdir:
+            # sans GIT_DIR, `git init --bare` prend le dossier courant
+            init = _git(gitdir, "init", "--quiet", "--bare")
+            if init.returncode != 0:
+                return None
+            proc = _git(gitdir, "rev-parse", "--verify", "--quiet",
+                        rev + "^{commit}", env_extra={
+                            "GIT_DIR": gitdir,
+                            "GIT_OBJECT_DIRECTORY": objects,
+                            "GIT_ALTERNATE_OBJECT_DIRECTORIES": objects,
+                            **NO_LAZY_FETCH}, **bound)
+    except (GitError, OSError):
+        return None
     if proc.returncode != 0:
         return None
     return proc.stdout.decode("utf-8", "replace").strip()
@@ -198,12 +272,21 @@ def _fetch_missing(repo: str, sha: str, target: str) -> str | None:
     return remote
 
 
-def probe(repo: str, sha: str, target: str, *, lot: int | None = None) -> dict:
+def probe(repo: str, sha: str, target: str, *, lot: int | None = None,
+          frozen_at: float | None = None, frozen_absent=()) -> dict:
     """Le commit `sha` est-il entré dans `target` ? Rend `{merged, how, ref, detail}`.
 
     `how` : ancestor | patch-id | squash | reverted ; `ref` : le commit de la
     cible qui porte le contenu (le gel lui-même s'il est ancêtre). `lot` :
     l'id du lot examiné, pour rattacher un revert à son porteur (#1825).
+
+    `frozen_at` (#2786) : l'instant du jalon `frozen` examiné. Si le commit
+    était déjà ancêtre de la cible **à cet instant**, il n'a jamais eu de
+    commit propre : ce n'est pas une livraison (cas #2784). `frozen_absent`
+    (la marque du gel) dispense de cette lecture d'instant pour la branche
+    cible : le gel y était absent quand il a été posé, une avance rapide
+    ultérieure est donc bien une livraison. Absent (une tête de branche, un
+    avis), la preuve par l'ancêtre reste celle d'avant.
 
     #1825 : une preuve par le contenu est annulée par un revert postérieur
     (`reverted_content`) — une tête ancêtre de la cible dont la fusion a été
@@ -230,6 +313,15 @@ def probe(repo: str, sha: str, target: str, *, lot: int | None = None) -> dict:
                 detail += " (explicit fetch from %s brought nothing)" % remote
             return {"merged": False, "how": None, "ref": None, "detail": detail}
     if _git(repo, "merge-base", "--is-ancestor", frozen, head).returncode == 0:
+        # #2786 (4)/(5) : un gel déjà ancêtre de la cible au moment où il a
+        # été posé ne prouve aucune livraison — c'est le cas #2784 (un ancien
+        # commit d'un autre lot, déjà dans main, gelé sans commit propre). La
+        # marque `frozen_absent` (branche cible absente au gel) lève le doute.
+        if frozen_at and _target_branch(target) not in set(frozen_absent) \
+                and _was_ancestor_at(repo, frozen, target, frozen_at):
+            return {"merged": False, "how": None, "ref": None,
+                    "detail": "%s was already an ancestor of %s when frozen: no own "
+                              "commit, not a delivery" % (frozen[:12], target)}
         stopped = reverted_content(repo, frozen, target, lot=lot)
         if stopped:
             return {"merged": False, "how": "reverted", "ref": None,
@@ -399,6 +491,10 @@ def latest_freeze(rows: list[dict]) -> dict | None:
 #: jusqu'à 4). La résolution en commit complet et unique reste au lecteur qui
 #: a le dépôt (#1756).
 _COMMIT_ID = re.compile(r"[0-9a-f]{4,64}")
+#: #2786 : une tête gelée lue par le balayage est un commit **complet** (40 ou
+#: 64 hexadécimaux) ; une abréviation ou une ref symbolique n'y est jamais
+#: résolue (le `HEAD` du clone du balayage a passé un lot en `merged`, #2712).
+_FULL_COMMIT_ID = re.compile(r"[0-9a-f]{40}(?:[0-9a-f]{24})?")
 
 
 def commit_id(value) -> str:
@@ -407,10 +503,47 @@ def commit_id(value) -> str:
     return text if _COMMIT_ID.fullmatch(text) else ""
 
 
+def full_commit_id(value) -> str:
+    """Le commit complet (40 ou 64 hexadécimaux) d'un jalon, en minuscules, ou ''.
+
+    #2786 : l'identifiant qu'un balayage ou une désignation accepte pour une
+    tête gelée ; une abréviation reste lisible par `commit_id` (compatibilité)
+    mais n'est jamais une preuve de livraison."""
+    text = str(value or "").strip().lower()
+    return text if _FULL_COMMIT_ID.fullmatch(text) else ""
+
+
 def same_commit(a, b) -> bool:
     """Deux identifiants qui nomment le même commit (préfixe admis, #1756)."""
     a, b = commit_id(a), commit_id(b)
     return bool(a and b) and (a == b or a.startswith(b) or b.startswith(a))
+
+
+#: #2786 (5) : les branches d'intégration où le gel n'était PAS quand il a été
+#: posé, écrites dans la note du jalon par `work.milestone` (une ligne
+#: machine) : la preuve de livraison y reste valable, même après une avance
+#: rapide. Les gels antérieurs n'ont pas la marque : repli sur l'instant.
+_FREEZE_ABSENT_RE = re.compile(r"(?m)^ameesh-freeze-absent:\s*(.*)$")
+
+
+def freeze_absent(note) -> frozenset[str]:
+    """Les branches d'intégration absentes au gel, lues dans la note (#2786)."""
+    match = _FREEZE_ABSENT_RE.search(str(note or ""))
+    if not match:
+        return frozenset()
+    return frozenset(word for word in match.group(1).split() if word)
+
+
+def _target_branch(target) -> str:
+    """Le nom de branche d'une cible (`origin/develop`, `develop`, …), ou ''."""
+    text = str(target or "").strip()
+    for prefix in ("refs/remotes/origin/", "refs/heads/", "origin/"):
+        if text.startswith(prefix):
+            text = text[len(prefix):]
+            break
+    if not text or _SHA_RE.match(text):
+        return ""
+    return text
 
 
 def rebase_identity(repo: str, reviewed: str, frozen: str, target: str) -> dict:
@@ -469,7 +602,7 @@ def _freeze_mark(row: dict | None) -> dict | None:
 
 
 def freeze_candidate(rows: list[dict], repo: str | None = None,
-                     target: str | None = None) -> dict:
+                     target: str | None = None, *, waived: bool = False) -> dict:
     """Le gel effectif d'un lot (#1756) : le commit sur lequel un avis
     favorable existe, même sans jalon `frozen`, ou malgré un gel périmé.
 
@@ -491,6 +624,9 @@ def freeze_candidate(rows: list[dict], repo: str | None = None,
       et écarté, note `late-verdict-on-older-commit` (#1767) ;
     * gel postérieur à l'avis sur un autre commit : refus
       `freeze-after-verdict`, un nouvel avis est dû sur la tête gelée (#1283) ;
+      si un avis favorable nomme déjà cette tête, retour au gel déclaré,
+      note `returned-to-reviewed-head` (#2884), sous réserve des blocages
+      applicables sur cette tête, lus par relecteur ci-dessous ;
       si `repo` est fourni et que le delta du lot est **mécaniquement
       constant** entre la tête relue et la tête gelée (`rebase_identity`,
       #1905), l'avis est porté sur la tête gelée, note `mechanical-rebase` ;
@@ -500,6 +636,11 @@ def freeze_candidate(rows: list[dict], repo: str | None = None,
     * aucun avis : le gel déclaré reste candidat (note `no-verdict` — la
       classe légère n'exige pas d'avis) ; sans gel non plus, refus
       `no-verdict` ;
+    * `waived` (#2681, dispense `-none` du pilote, #1979) : le gel déclaré
+      est le candidat même quand le dernier avis porte sur une tête
+      antérieure — la dispense couvre la tête gelée, pas une remise (#2496) ;
+      note `verdict-not-required`. Un `blocked` sur la tête gelée refuse
+      toujours ;
     * un `blocked` applicable n'est jamais masqué par le `ok` d'un autre
       relecteur : refus `blocked-verdict`.
 
@@ -533,8 +674,23 @@ def freeze_candidate(rows: list[dict], repo: str | None = None,
                 and any(same_commit(sha, b) for b in before))
 
     last = newest([v for v in verdicts if not late(v)])
+    # #2884 : retour explicite à une source déjà relue après une tête
+    # intermédiaire. Les avis acquis sur ce SHA restent valables ; le dernier
+    # avis toutes têtes confondues ne suffit pas à choisir le candidat.
+    returned = None
+    if (f_sha and last is not None
+            and f_at > float(last.get("at_ts") or 0)
+            and commit_id(last.get("sha"))
+            and not same_commit(f_sha, commit_id(last.get("sha")))):
+        returned = newest([v for v in verdicts
+                           if (v.get("verdict") or "ok") == "ok"
+                           and same_commit(commit_id(v.get("sha")), f_sha)])
+        if returned is not None:
+            last = returned
     out = {"sha": "", "origin": "", "declared": _freeze_mark(freeze),
            "verdict": _freeze_mark(last), "causes": [], "notes": []}
+    if returned is not None:
+        out["notes"].append("returned-to-reviewed-head")
     if any(late(v) for v in verdicts):
         out["notes"].append("late-verdict-on-older-commit")
     if freeze is not None and not f_sha:
@@ -542,42 +698,49 @@ def freeze_candidate(rows: list[dict], repo: str | None = None,
     v_sha = commit_id((last or {}).get("sha"))
     v_at = float((last or {}).get("at_ts") or 0)
 
-    if last is None:
-        if f_sha:
-            out.update(sha=f_sha, origin="frozen")
-            out["notes"].append("no-verdict")
-            return out
-        out["causes"].append("no-verdict")
-        return out
-    if (last.get("verdict") or "ok") != "ok":
-        out["causes"].append("blocked-verdict")
-        return out
     carried_from = None
-    if f_sha and v_sha:
-        if same_commit(f_sha, v_sha):
-            out.update(sha=max(f_sha, v_sha, key=len), origin="frozen")
-        elif f_at > v_at:
-            carried = (rebase_identity(repo, v_sha, f_sha, target or DEFAULT_TARGET)
-                       if repo else {"mechanical": False})
-            if not carried["mechanical"]:
-                out["causes"].append("freeze-after-verdict")
-                return out
-            out.update(sha=f_sha, origin="frozen")
-            out["notes"].append("mechanical-rebase: %s" % carried["detail"])
-            carried_from = v_sha
-        else:
-            out.update(sha=v_sha, origin="verdict")
-            out["notes"].append("declared-freeze-stale")
-    elif v_sha:
-        out.update(sha=v_sha, origin="verdict")
-        if freeze is not None:
-            out["notes"].append("declared-freeze-stale")
-    elif f_sha and v_at >= f_at:
+    if waived and f_sha:
+        # La dispense du pilote couvre la tête déclarée (#2681) : un avis
+        # antérieur ne la déclasse pas. La porte garde son blocage courant,
+        # vérifié ci-dessous sur cette même tête.
         out.update(sha=f_sha, origin="frozen")
-        out["notes"].append("verdict-names-no-commit")
+        out["notes"].append("verdict-not-required")
     else:
-        out["causes"].append("verdict-names-no-commit")
-        return out
+        if last is None:
+            if f_sha:
+                out.update(sha=f_sha, origin="frozen")
+                out["notes"].append("no-verdict")
+                return out
+            out["causes"].append("no-verdict")
+            return out
+        if (last.get("verdict") or "ok") != "ok":
+            out["causes"].append("blocked-verdict")
+            return out
+        if f_sha and v_sha:
+            if same_commit(f_sha, v_sha):
+                out.update(sha=max(f_sha, v_sha, key=len), origin="frozen")
+            elif f_at > v_at:
+                carried = (rebase_identity(repo, v_sha, f_sha, target or DEFAULT_TARGET)
+                           if repo else {"mechanical": False})
+                if not carried["mechanical"]:
+                    out["causes"].append("freeze-after-verdict")
+                    return out
+                out.update(sha=f_sha, origin="frozen")
+                out["notes"].append("mechanical-rebase: %s" % carried["detail"])
+                carried_from = v_sha
+            else:
+                out.update(sha=v_sha, origin="verdict")
+                out["notes"].append("declared-freeze-stale")
+        elif v_sha:
+            out.update(sha=v_sha, origin="verdict")
+            if freeze is not None:
+                out["notes"].append("declared-freeze-stale")
+        elif f_sha and v_at >= f_at:
+            out.update(sha=f_sha, origin="frozen")
+            out["notes"].append("verdict-names-no-commit")
+        else:
+            out["causes"].append("verdict-names-no-commit")
+            return out
 
     # Blocage applicable : le dernier avis de chaque relecteur sur le commit
     # candidat (mêmes règles que la porte des avis, #1374).
@@ -632,6 +795,213 @@ def _content_refs(row: dict, target: str | None, *, declared_repo: str | None,
     return to_try
 
 
+def _packet_delivery(repo: str, lot: int, members: list[dict], refs: list[tuple],
+                     marks: list[dict], *, default: str | None) -> dict | None:
+    """#2443 : l'unité a-t-elle été livrée par un paquet composé ?
+
+    `members` sont les appartenances enregistrées (`work_packet_members`) ;
+    seule une ref qui ferme est examinée. Le commit de composition (`unit_sha`)
+    doit être entré dans cette ref (`probe`, revert #1825 compris). La preuve
+    n'est retenue que si le gel effectif courant de l'unité est encore celui de
+    la composition — le gel enregistré, ou la tête composée elle-même quand
+    aucun gel n'existait alors ; un nouveau gel rend la preuve périmée et le
+    lot retombe sur le relevé de son gel.
+
+    Rend `{ref, proof, member, target, off_target}` ou None.
+    """
+    if not members or not refs:
+        return None
+    target_ref = refs[0][0]
+    try:
+        candidate = freeze_candidate(marks, repo=repo, target=target_ref)
+    except (MergeProbeError, GitError):
+        return None                       # gel courant illisible : jamais de preuve
+    current = commit_id(candidate.get("sha"))
+    # Sans gel effectif, seule l'absence de tout gel/avis (`no-verdict`) laisse
+    # la composition conclure : un avis bloqué, un gel postérieur à l'avis ou
+    # un avis sans commit déclarent une tête que la composition ne couvre pas.
+    undecided = not current and bool(
+        set(candidate.get("causes") or ()) - {"no-verdict"})
+    for member in members:
+        unit = commit_id(member.get("unit_sha"))
+        if not unit:
+            continue
+        recorded = commit_id(member.get("frozen_sha"))
+        source = commit_id(member.get("source_sha"))
+        if current:
+            if not (same_commit(current, recorded) or same_commit(current, source)):
+                continue                 # un nouveau gel : la composition est périmée
+            # Le gel capturé par record peut avoir avancé APRÈS la composition.
+            # Son identité avec le gel courant ne prouve donc pas sa livraison :
+            # la source réellement composée doit aussi en porter le contenu.
+            if not same_commit(current, source):
+                if not source:
+                    continue
+                try:
+                    if not probe(repo, current, source, lot=lot)["merged"]:
+                        continue
+                except (MergeProbeError, GitError):
+                    continue
+        elif recorded:
+            continue                     # le gel enregistré a disparu : ne pas conclure
+        elif undecided:
+            continue                     # une déclaration existe, sans gel lisible
+        for ref, off, closes in refs:
+            if not closes:
+                continue
+            try:
+                proof = probe(repo, unit, ref, lot=lot)
+            except (MergeProbeError, GitError):
+                continue
+            if not proof["merged"]:
+                continue
+            return {"ref": ref, "proof": proof, "member": member, "target": ref,
+                    "off_target": default if off else None}
+    return None
+
+
+#: #2744 : états qui retiennent la fermeture par le contenu — le lot peut être
+#: livré sans être clos (une passe, une décision ou un déblocage restent dus).
+CONTENT_HELD_STATES = ("blocked",)
+
+
+def content_retention(st, row: dict) -> dict | None:
+    """#2744 : la retenue qui empêche de fermer un lot par son contenu.
+
+    Un lot `blocked`, ou sous une note `hold: …` non levée (#1664), n'est pas
+    fermé par le contenu : sa livraison est constatée, sa fermeture attend la
+    levée. `planned_waits.explicit_holds` est la seule lecture des hold : une
+    note `unhold:` ou un changement d'état lève la retenue. Une lecture du
+    journal qui échoue rend une retenue `unreadable` : une erreur ne doit
+    jamais autoriser une fermeture. Rend `{what, motif, by, since}`, ou None.
+    """
+    row = row or {}
+    try:
+        lot = int(row["id"])
+        state = str(row.get("state") or "")
+    except (KeyError, TypeError, ValueError):
+        return None
+    try:
+        events = st.progress.lot_hold_events([lot], planned_waits.HOLD_NOTE_PATTERNS)
+    except Exception as exc:  # noqa: BLE001 — l'erreur retient, elle n'ouvre pas
+        return {"what": "unreadable",
+                "motif": "journal des retenues illisible (%s: %s)"
+                         % (type(exc).__name__, " ".join(str(exc).split())[:120]),
+                "by": str(row.get("assignee") or ""), "since": None}
+    held = planned_waits.explicit_holds(events).get(lot)
+    if held:
+        by = str(held.get("by") or "")
+        reason = ""
+        for event in reversed(events):
+            text = str(event.get("note") or "").strip()
+            if planned_waits.is_hold_note(text):
+                reason = " ".join(text.split())
+                if reason[:5].lower() == "hold:":
+                    reason = reason[5:].strip()
+                reason = reason[:160]
+                break
+        motif = "hold" + (" de %s" % by if by else "")
+        if reason:
+            motif += " : %s" % reason
+        return {"what": "hold", "motif": motif, "by": by,
+                "since": held.get("since")}
+    if state in CONTENT_HELD_STATES:
+        transitions = [e for e in events if e.get("state") in CONTENT_HELD_STATES]
+        last = transitions[-1] if transitions else {}
+        by = str(last.get("actor") or row.get("assignee") or "")
+        return {"what": "blocked", "motif": "état %s" % state, "by": by,
+                "since": last.get("created_ts")}
+    return None
+
+
+def _retention_text(retention: dict, entry: dict, target: str) -> str:
+    """La ligne de journal d'une fermeture retenue (#2744)."""
+    ref = str(entry.get("ref") or entry.get("sha") or "")
+    return ("contenu fusionné, fermeture retenue : %s — %s (%s %s)"
+            % (retention["motif"], target, entry.get("how") or "?",
+               ref[:12] or "?"))
+
+
+def mark_withheld(entry: dict, retention: dict, *, target: str,
+                  dry_run: bool = False) -> str:
+    """#2744 : l'entrée de compte rendu d'une fermeture retenue."""
+    text = _retention_text(retention, entry, target)
+    entry["retention"] = retention
+    entry["result"] = "would-withhold" if dry_run else "withheld"
+    entry["detail"] = "%s — %s" % (entry.get("detail") or "", text)
+    return text
+
+
+def mark_retained(entry: dict, retention: dict, *, target: str,
+                  dry_run: bool = False) -> None:
+    """#2744 : compte rendu d'une retenue, ou d'une lecture de journal en
+    erreur — cette dernière est une **erreur** explicite, jamais un simple
+    hold : le lot reste ouvert et l'appelant la voit (`result: error`)."""
+    if retention.get("what") == "unreadable":
+        entry["retention"] = retention
+        entry["result"] = "error"
+        entry["detail"] = "%s — %s" % (entry.get("detail") or "",
+                                       retention.get("motif") or "journal illisible")
+        return
+    mark_withheld(entry, retention, target=target, dry_run=dry_run)
+
+
+def record_content_withheld(db, st, row: dict, entry: dict, retention: dict, *,
+                            target: str, actor: str = "") -> None:
+    """#2744 : journalise et réveille une fermeture retenue, une fois.
+
+    Appelé après le refus atomique de `work.close_merged` : la note et le
+    courrier ne sont pas dans la transaction de fermeture, mais la fermeture,
+    elle, a déjà été refusée sous le verrou du lot."""
+    text = _retention_text(retention, entry, target)
+    lot = int(row["id"])
+    if not _first_observation(st, lot, text):
+        return
+    try:
+        work_mod.note(db, lot, text, actor=actor)
+    except work_mod.WorkError:
+        return                    # le lot a changé : rien à journaliser
+    _wake_retention(db, row, retention, entry=entry, target=target)
+
+
+def _first_observation(st, lot: int, text: str) -> bool:
+    """#2744 : cette retenue n'est-elle pas déjà au journal ? (une note et un
+    réveil par observation, pas un par balayage)."""
+    try:
+        return not any((e.get("note") or "").strip() == text
+                       for e in st.work.events(lot, 40))
+    except Exception:  # noqa: BLE001 — une lecture impossible ne bloque pas la note
+        return True
+
+
+def _wake_retention(db, row: dict, retention: dict, *, entry: dict, target: str) -> None:
+    """#2744 : réveille le détenteur du hold, sinon le signaleur du blocage.
+
+    Best-effort : la note est déjà écrite ; un courrier non délivré ne doit pas
+    casser le relevé. Un humain n'est pas réveillé par la boîte aux lettres."""
+    from . import mail
+    recipient = str(retention.get("by") or row.get("assignee") or "").strip()
+    if not recipient or recipient.startswith(work_mod.HUMAN_PREFIX) \
+            or recipient == work_mod.SYSTEM_SENDER:
+        return
+    ref = str(entry.get("ref") or entry.get("sha") or "")
+    body = ("Lot #%d \"%s\": its frozen content is merged into %s (%s, %s), but the "
+            "closure is withheld: %s. The lot stays %s; lift the hold (a state change "
+            "or an `unhold:` note) and the next content sweep will close it."
+            % (int(row["id"]), row.get("title") or "", target,
+               entry.get("how") or "?", ref[:12] or "?", retention["motif"],
+               row.get("state") or "?"))
+    try:
+        mail.send(db, work_mod.SYSTEM_SENDER, recipient, body, kind="event",
+                  work_item_id=str(int(row["id"])),
+                  payload={"closure_withheld": {
+                      "lot": int(row["id"]), "reason": retention["what"],
+                      "target": target, "how": entry.get("how"),
+                      "ref": ref}})
+    except Exception:  # noqa: BLE001 — le journal porte déjà la retenue
+        pass
+
+
 def sync_merges(db, repo_dir: str, *, target: str | None = None, dry_run: bool = False,
                 limit: int = 1000) -> dict:
     """Ferme les lots dont le contenu gelé est entré dans la cible.
@@ -643,7 +1013,11 @@ def sync_merges(db, repo_dir: str, *, target: str | None = None, dry_run: bool =
     d'intégration reconnues (`develop`, `main`, `master`, `release/…`) sont
     essayées à leur tour et la fermeture nomme celle qui a livré. Une cible
     explicite ou déclarée garde le sens d'origine : seule elle ferme, et son
-    absence est une erreur (`target %r not found in …`)."""
+    absence est une erreur (`target %r not found in …`).
+
+    #2786 : le dernier gel examiné doit nommer un commit complet ; une ref
+    symbolique (`HEAD`, une branche) ou une abréviation vaut doute (`doubt`),
+    rien n'est résolu dans ce clone ni fermé."""
     st = storage.of(db)
     if target is not None:
         try:
@@ -668,6 +1042,18 @@ def sync_merges(db, repo_dir: str, *, target: str | None = None, dry_run: bool =
     declared: dict = {}
     for ms in st.progress.lot_milestones([int(r["id"]) for r in rows]):
         declared.setdefault(int(ms["work_item_id"]), []).append(ms)
+    # #2443 : l'appartenance enregistrée à la composition, lue une fois pour
+    # tous les lots examinés. Une base d'avant 0465 ne fait pas échouer le
+    # relevé : le repli par le gel reste inchangé, l'absence est dite.
+    packet_error = ""
+    packets: dict[int, list[dict]] = {}
+    try:
+        from .db import DbError
+        members = st.work.packet_members(item_ids=[int(r["id"]) for r in rows])
+    except DbError as exc:                     # table absente (schéma ancien)
+        members, packet_error = [], str(exc)
+    for member in members:
+        packets.setdefault(int(member["work_item_id"]), []).append(member)
     results: list[dict] = []
     for row in sorted(rows, key=lambda r: int(r["id"])):
         lot = int(row["id"])
@@ -682,8 +1068,10 @@ def sync_merges(db, repo_dir: str, *, target: str | None = None, dry_run: bool =
             # effectif (`freeze.origin=verdict`, #1756) ; sans jalon `frozen`,
             # c'est le contenu relu qui entre dans la cible. Un avis sur une
             # autre tête ne prouve rien : la branche a avancé depuis.
-            candidate = freeze_candidate(marks, repo_dir,
-                                         target or row.get("branch_target") or default)
+            from . import merge_queue
+            candidate = freeze_candidate(
+                marks, repo_dir, target or row.get("branch_target") or default,
+                waived=merge_queue.is_waived(row))
             # #2444 : la tête confrontée est la tête publiée (origin d'abord) ;
             # une branche disparue ne vaut pas un contrôle de la tête.
             reviewed = commit_id(candidate.get("sha"))
@@ -692,22 +1080,91 @@ def sync_merges(db, repo_dir: str, *, target: str | None = None, dry_run: bool =
                 if head is None:
                     unchecked = "verdict freeze not checked: branch head not found"
                 elif same_commit(reviewed, head):
-                    sha, freeze_origin = reviewed, "verdict"
+                    sha, freeze_origin = head, "verdict"
         entry = {"work_item": lot, "package": row.get("package_id"),
                  "state": row["state"], "result": "no-commit", "how": None, "ref": None,
                  "target": None, "off_target": None, "freeze_origin": freeze_origin,
                  "detail": unchecked or (
                      "last freeze has no commit (milestone frozen --sha)" if freeze
                      else "no freeze declared (milestone frozen --sha)")}
-        if not sha:
-            results.append(entry)
-            continue
+        if sha:
+            # #2786 : le gel examiné doit nommer un commit complet. Un `HEAD`, une
+            # branche ou une abréviation n'est jamais résolu ici : le balayage
+            # d'un autre clone lirait un commit que personne n'a relu (#2712).
+            resolved_sha = full_commit_id(sha)
+            if not resolved_sha:
+                entry.update(result="doubt", how="unreadable",
+                             detail="last freeze %r is not a full commit id: doubt, "
+                                    "nothing merged — freeze again on the full head "
+                                    "(`git rev-parse <ref>`)" % sha[:24])
+                results.append(entry)
+                continue
+            sha = resolved_sha
+        # #2443 : ne pas sortir sur l'absence de gel déclaré avant d'avoir
+        # examiné une composition de paquet — c'est la voie du cas #2366.
         refs = _content_refs(row, target, declared_repo=declared_repo, default=default,
                              candidates=candidates)
         if not refs:
             entry.update(result="no-target",
                          detail="no target: `git config %s <branch>` in %s, or --target"
                                 % (TARGET_GIT_KEY, repo_dir))
+            results.append(entry)
+            continue
+        composition = _packet_delivery(repo_dir, lot, packets.get(lot, []), refs,
+                                       declared.get(lot, []), default=default)
+        if composition is not None:
+            member = composition["member"]
+            entry.update(target=composition["target"],
+                         off_target=composition["off_target"], how="composition",
+                         ref=composition["proof"]["ref"], sha=member["unit_sha"],
+                         packet=int(member["package_id"]), result="open",
+                         detail=("%s is the composition unit of package #%s (%s) in %s"
+                                 % ((member["unit_sha"] or "")[:12],
+                                    member["package_id"],
+                                    member.get("package_branch") or "?",
+                                    composition["target"])),
+                         composition={"package": int(member["package_id"]),
+                                      "branch": member.get("package_branch") or "",
+                                      "unit": member["unit_sha"]})
+            if dry_run:
+                # #2744 : la même retenue que la fermeture par le gel.
+                retention = content_retention(st, row)
+                if retention is not None:
+                    mark_retained(entry, retention, target=composition["target"],
+                                  dry_run=True)
+                    results.append(entry)
+                    continue
+                entry["result"] = "would-merge"
+            else:
+                done = work_mod.close_merged(
+                    db, lot, sha=entry["ref"] or "", actor="composition:%s"
+                    % member["package_id"],
+                    source="package composition #%s (%s)"
+                    % (member["package_id"], member.get("package_branch") or "?"),
+                    frozen_id=int(freeze["id"]) if freeze else None,
+                    # #2444 : aucun gel déclaré examiné (gel d'origine verdict) ;
+                    # un gel apparu entre-temps refuse la fermeture.
+                    unfrozen=freeze is None,
+                    repo=repo_dir,      # L539 : dépôt du relevé, indice de classe
+                    content_guard=content_retention)   # #2744 : verrou commun avec le hold
+                entry["result"] = done["result"]
+                if done["result"] in ("withheld", "error"):
+                    mark_retained(entry, done["retention"],
+                                  target=composition["target"])
+                    if done["result"] == "withheld":
+                        record_content_withheld(
+                            db, st, row, entry, done["retention"],
+                            target=composition["target"],
+                            actor="composition:%s" % member["package_id"])
+                else:
+                    entry["detail"] = "%s — %s" % (entry["detail"], done["detail"])
+            results.append(entry)
+            continue
+        if not sha:
+            if packets.get(lot):
+                entry["detail"] += ("; recorded packet composition #%s not delivered yet"
+                                    % ", #".join(str(m["package_id"])
+                                                 for m in packets[lot]))
             results.append(entry)
             continue
         found_target = None              # la ref qui a livré le gel
@@ -719,7 +1176,12 @@ def sync_merges(db, repo_dir: str, *, target: str | None = None, dry_run: bool =
         error = None
         for ref, off, closes in refs:
             try:
-                proof = probe(repo_dir, sha, ref, lot=lot)
+                proof = probe(
+                    repo_dir, sha, ref, lot=lot,
+                    frozen_at=(freeze or {}).get("at_ts")
+                    if freeze_origin == "frozen" else None,
+                    frozen_absent=freeze_absent((freeze or {}).get("note"))
+                    if freeze_origin == "frozen" else ())
             except (MergeProbeError, GitError) as exc:
                 if off:
                     residue = residue or "%s is unreadable (%s)" % (ref, exc)
@@ -763,21 +1225,36 @@ def sync_merges(db, repo_dir: str, *, target: str | None = None, dry_run: bool =
                      ref=found_proof["ref"], sha=sha, result="open",
                      detail=found_proof["detail"])
         if dry_run:
+            retention = content_retention(st, row)
+            if retention is not None:
+                mark_retained(entry, retention, target=found_target, dry_run=True)
+                results.append(entry)
+                continue
             entry["result"] = "would-merge"
         else:
             done = work_mod.close_merged(
                 db, lot, sha=entry["ref"] or "", actor="git:%s" % found_target,
                 source="content (%s)" % entry["how"], frozen_id=frozen_id,
                 unfrozen=frozen_id is None,   # #2444 : un gel apparu entre-temps refuse
-                repo=repo_dir)          # L539 : dépôt du relevé, indice de classe
+                repo=repo_dir,          # L539 : dépôt du relevé, indice de classe
+                content_guard=content_retention)   # #2744 : verrou commun avec le hold
             entry["result"] = done["result"]
-            detail = "%s — %s" % (entry["detail"], done["detail"])
-            entry["detail"] = detail
+            if done["result"] in ("withheld", "error"):
+                mark_retained(entry, done["retention"], target=found_target)
+                if done["result"] == "withheld":
+                    record_content_withheld(
+                        db, st, row, entry, done["retention"], target=found_target,
+                        actor="git:%s" % found_target)
+            else:
+                entry["detail"] = "%s — %s" % (entry["detail"], done["detail"])
         results.append(entry)
-    return {"git_dir": repo_dir, "target": target if target is not None else (default or ""),
-            "auto": target is None, "off_target": default if target is None else None,
-            "dry_run": bool(dry_run), "results": results,
-            "merged": sum(1 for r in results if r["result"] == "merged")}
+    report = {"git_dir": repo_dir, "target": target if target is not None else (default or ""),
+              "auto": target is None, "off_target": default if target is None else None,
+              "dry_run": bool(dry_run), "results": results,
+              "merged": sum(1 for r in results if r["result"] == "merged")}
+    if packet_error:
+        report["packet_error"] = packet_error
+    return report
 
 
 # --------------------------------------------------------------------------
@@ -1027,6 +1504,64 @@ def _published_tip(repo: str, branch: str) -> str | None:
     return None
 
 
+#: #2654 : réponse de `git ls-remote --exit-code` quand la ref n'existe pas
+_LS_REMOTE_ABSENT = 2
+
+
+def _remote_head(repo: str, branch: str) -> tuple[str, str | None]:
+    """#2654 : la tête de `branch` sur la forge (`git ls-remote origin`), lue
+    au moment de conclure — un clone peut ignorer une branche recréée ou
+    poussée depuis son dernier fetch. Rend `("local", None)` sans remote
+    `origin` (rien à confronter), `("absent", None)` si la forge n'a pas la
+    branche, `("sha", <sha>)`, ou `("error", <raison>)`."""
+    if _out(repo, "remote", "get-url", "origin") is None:
+        return "local", None
+    try:
+        proc = _git(repo, "ls-remote", "--exit-code", "origin", "refs/heads/" + branch,
+                    timeout=FETCH_TIMEOUT)
+    except GitError as exc:
+        return "error", str(exc)
+    if proc.returncode == _LS_REMOTE_ABSENT:
+        return "absent", None
+    words = proc.stdout.decode("utf-8", "replace").split()
+    if proc.returncode != 0 or not words or not _SHA_RE.match(words[0]):
+        detail = proc.stderr.decode("utf-8", "replace").strip()
+        return "error", "git ls-remote origin: %s" % (detail[-200:] or "unreadable")
+    return "sha", words[0]
+
+
+def _remote_moved(repo: str, branch: str, target: str, out: dict,
+                  found: dict) -> dict:
+    """#2654 : `found` conclut à la livraison de `branch` sur une pointe du
+    clone ou une tête vue (`branch_head`) ; elle ne tient que si la tête
+    publiée de la branche est déjà dans la cible. Une forge illisible, ou une
+    branche poussée depuis (recréée sous le même nom, #2623) avec du travail
+    hors de la cible, laisse le lot ouvert ; la nouvelle pointe, présente au
+    clone, est rendue en avance (l'appelant la retient)."""
+    kind, value = _remote_head(repo, branch)
+    if kind in ("local", "absent"):
+        return found
+    if kind == "error":
+        return dict(out, tip=None, ahead=False,
+                    detail="%s; but the head of %s on origin is unreadable (%s): no "
+                           "conclusion" % (found.get("detail"), branch, value))
+    present = _commit(repo, value)
+    if present and (present == found.get("tip")
+            or probe(repo, present, target, lot=branch_lot(branch))["merged"]):
+        # la tête publiée est celle de la preuve, ou elle est entrée elle
+        # aussi (ancêtre, contenu identique : squash)
+        return found
+    if present:
+        return dict(out, tip=present, ahead=True,
+                    detail="%s ahead of %s (%s, origin): pushed since the evidence "
+                           "(%s), not concluded" % (branch, target, present[:12],
+                                                    found.get("detail")))
+    return dict(out, tip=None, ahead=False,
+                detail="%s is at %s on origin, absent from this clone (pushed since "
+                       "the last fetch): no conclusion on %s"
+                       % (branch, value[:12], found.get("detail")))
+
+
 def _on_first_parent(repo: str, commit: str, head: str) -> bool:
     chain = _out(repo, "rev-list", "--first-parent", "--max-count=%d" % MAX_TARGET_COMMITS,
                  head)
@@ -1093,12 +1628,25 @@ def branch_probe(repo: str, branch: str, target: str, *, seen_head: str | None =
                  since_ts: float | None = None) -> dict:
     """La branche est-elle entrée dans `target` ? Rend `{merged, how, ref, tip,
     ahead, detail}` ; `ahead` : la pointe a du travail absent de la cible
-    (l'appelant la retient comme `branch_head`)."""
+    (l'appelant la retient comme `branch_head`).
+
+    #2654 : une livraison prouvée par la branche (pointe du clone ou tête vue)
+    n'est rendue qu'après lecture de sa tête sur la forge (`_remote_moved`)."""
     head = _commit(repo, target)
     if head is None:
         raise MergeProbeError("target %r not found in %s" % (target, repo))
     tip = _tip(repo, branch)
     out = {"merged": False, "how": None, "ref": None, "tip": tip, "ahead": False}
+    found = _branch_probe(repo, branch, target, head, tip, out, seen_head=seen_head,
+                          since_ts=since_ts)
+    if found["merged"] and found["how"] != "message":
+        # la citation par une fusion de la cible ne dépend pas de la pointe
+        return _remote_moved(repo, branch, target, out, found)
+    return found
+
+
+def _branch_probe(repo: str, branch: str, target: str, head: str, tip: str | None,
+                  out: dict, *, seen_head: str | None, since_ts: float | None) -> dict:
 
     def seen() -> dict | None:
         if not seen_head:
@@ -1563,17 +2111,57 @@ def _is_ancestor(repo: str, sha: str, ref: str) -> bool:
     return _git(repo, "merge-base", "--is-ancestor", sha, ref).returncode == 0
 
 
-def _content_ancestor(repo: str, sha: str, target: str) -> bool:
+def _target_tip_at(repo: str, target: str, when) -> str | None:
+    """Le commit de la cible au plus tard à `when` (horodatage epoch), ou None.
+
+    #2786 (5) : la chaîne première-parente de la cible, lue à l'instant du
+    gel, dit si le gel y était déjà. `CLOCK_SLACK_S` est ajouté à l'instant du
+    jalon (horloge de la base) pour couvrir l'écart avec la date de committer
+    du poste qui a poussé : mieux vaut garder un lot ouvert (doute) que
+    fermer sur une fusion qui a suivi le gel."""
+    try:
+        stamp = float(when)
+    except (TypeError, ValueError):
+        return None
+    if stamp <= 0:
+        return None
+    return _out(repo, "rev-list", "-1", "--first-parent",
+                "--before=@%d" % int(stamp + CLOCK_SLACK_S), target)
+
+
+def _was_ancestor_at(repo: str, sha: str, target: str, when) -> bool:
+    """Le commit `sha` était-il déjà ancêtre de `target` à l'instant `when` ?"""
+    tip = _target_tip_at(repo, target, when)
+    return bool(tip) and _is_ancestor(repo, sha, tip)
+
+
+def _content_ancestor(repo: str, sha: str, target: str, *,
+                      at_ts: float | None = None, absent=()) -> bool:
     """#1005 : le commit gelé est-il ancêtre de la cible ? C'est la preuve par
     contenu la moins chère (une commande git), celle d'une fusion `--no-ff`
     (ou d'une avance rapide) poussée sur la branche d'intégration sans citer
     le lot. Le patch-id exact (rebase, cherry-pick, squash) reste au relevé de
-    contenu (`sync-merges`), dont c'est le travail et le coût assumé."""
-    head = _commit(repo, target)
-    frozen = _commit(repo, sha)
-    if head is None or frozen is None:
+    contenu (`sync-merges`), dont c'est le travail et le coût assumé.
+
+    #2786 : seul un commit complet est résolu ; une ref symbolique (`HEAD`, une
+    branche) n'est jamais passée à `rev-parse`, dont le résultat dépendrait du
+    clone du balayage — le cas #2712, qui a fermé un lot sur le `HEAD` d'un
+    autre arbre. Et un gel déjà ancêtre de la cible **quand il a été posé**
+    (`at_ts`) n'a aucun commit propre : ce n'est pas une livraison (#2784),
+    sauf si la marque `absent` dit que la branche cible ne le portait pas au
+    gel (une avance rapide ultérieure est alors une vraie livraison)."""
+    frozen = full_commit_id(sha)
+    if not frozen:
         return False
-    return _is_ancestor(repo, frozen, head)
+    head = _commit(repo, target)
+    if head is None:
+        return False
+    if not _is_ancestor(repo, frozen, head):
+        return False
+    if at_ts and _target_branch(target) not in set(absent) \
+            and _was_ancestor_at(repo, frozen, target, at_ts):
+        return False
+    return True
 
 
 def _content_carrier(repo: str, sha: str, target: str) -> tuple[dict | None, bool]:
@@ -1810,7 +2398,9 @@ def _sweep_target(repo: str, lot: int, row: dict, branch: str | None, target: st
     content = None
     reverted = None
     if freeze_sha and cited is None and not held and not (found and found["merged"]) \
-            and _content_ancestor(repo, freeze_sha, target):
+            and _content_ancestor(
+                repo, freeze_sha, target, at_ts=(freeze or {}).get("at_ts"),
+                absent=freeze_absent((freeze or {}).get("note"))):
         # #1825 : la tête gelée reste ancêtre de la cible quand sa fusion a
         # été annulée par un revert — le contenu n'y est plus, rien n'est livré
         reverted = reverted_content(repo, freeze_sha, target, lot=lot, branch=branch,
@@ -1972,7 +2562,7 @@ def published_target(repo: str, target: str) -> str:
     return target
 
 
-def _refresh_clone(repo: str, target: str | None, refreshed: dict) -> dict:
+def refresh_clone(repo: str, target: str | None, refreshed: dict) -> dict:
     """#2302 : rafraîchit le clone avant de sonder, au plus une fois par
     relevé et par remote. Best-effort : rend `{remote: erreur}` et ne lève
     jamais — un fetch refusé laisse le relevé continuer sur les refs lues."""
@@ -1988,6 +2578,38 @@ def _refresh_clone(repo: str, target: str | None, refreshed: dict) -> dict:
         if refreshed[key]:
             errors[remote] = refreshed[key]
     return errors
+
+
+def integration_tips(repo: str, *, refreshed: dict | None = None) -> dict[str, str] | None:
+    """Les têtes des branches d'intégration **publiées** (#2786 (5)).
+
+    Une ref `origin/<branche>` périmée ne prouve pas qu'un gel en était absent
+    au moment où il a été posé : un clone d'auteur en retard garde `main` à A
+    alors que la forge porte déjà le commit gelé B, et la marque d'absence
+    rendrait B livrable alors qu'il n'a jamais eu de commit propre (avis cx1).
+    Quand `origin` existe, le clone est donc rafraîchi (fetch borné, au plus
+    une fois par relevé via `refreshed`) avant la lecture. Un fetch en échec
+    rend `None` : l'appelant n'écrit alors **aucune** marque d'absence.
+
+    Sans remote `origin`, rend les refs locales des branches d'intégration :
+    il n'y a aucune cible publiée à rafraîchir, le clone est la référence."""
+    fresh = refreshed if refreshed is not None else {}
+    if _out(repo, "remote", "get-url", "origin") is None:
+        prefix = "refs/heads/"
+    else:
+        if refresh_clone(repo, "", fresh).get("origin"):
+            return None
+        prefix = _REMOTE_REFS + "origin/"
+    out = _out(repo, "for-each-ref", "--format=%(refname) %(objectname)", prefix)
+    tips: dict[str, str] = {}
+    for line in (out or "").splitlines():
+        parts = line.split()
+        if len(parts) != 2:
+            continue
+        name = parts[0][len(prefix):]
+        if name and integration_branch(name):
+            tips[name] = parts[1].lower()
+    return tips
 
 
 def _repo_slug(repo: str) -> str | None:
@@ -2134,7 +2756,13 @@ def sync_branches(db, *, host: str | None = None, agents=None, dry_run: bool = F
     la fusion de la cible) ; quand la limite de lecture est atteinte sans
     porteur connu, le lot reste ouvert. B1 : la fermeture est
     conditionnée au jalon `frozen` examiné (`frozen_id`) : un regel
-    concurrent, vu après la lecture, laisse le lot ouvert (`refrozen`)."""
+    concurrent, vu après la lecture, laisse le lot ouvert (`refrozen`).
+
+    #2786 : un dernier gel qui ne nomme pas un commit complet (`HEAD`, une
+    branche, une abréviation) est un doute (`doubt`) : aucune ref n'est
+    résolue dans ce clone, rien n'est fermé, et l'assigné est prévenu pour
+    regeler sur la tête complète. Un gel absent ne bloque pas : la branche ou
+    une citation peuvent encore prouver la livraison."""
     from . import fil, registry
 
     st = storage.of(db)
@@ -2186,6 +2814,24 @@ def sync_branches(db, *, host: str | None = None, agents=None, dry_run: bool = F
             continue
         if host is not None and (reg.get("host") or "") != host:
             continue
+        # #2786 : un dernier gel qui ne nomme pas un commit complet (HEAD, une
+        # branche, une abréviation) vaut doute : rien n'est résolu dans ce
+        # clone ni fermé, et l'assigné est prévenu pour regeler sur la tête
+        # complète. Un gel absent ne bloque pas (la branche peut prouver).
+        freeze = freezes.get(lot)
+        frozen_sha = str((freeze or {}).get("sha") or "").strip()
+        if frozen_sha and not full_commit_id(frozen_sha):
+            detail = ("last freeze %r is not a full commit id: doubt, nothing merged — "
+                      "freeze again on the full head (`ameesh work milestone %d frozen "
+                      "--sha <commit>`)" % (frozen_sha[:24], lot))
+            entry.update(result="doubt", how="unreadable", detail=detail)
+            if not dry_run and assignee:
+                _signal_off_target(
+                    db, st, lot, assignee, reg, "merge sweep: %s" % detail,
+                    "non-full freeze %s" % frozen_sha[:12],
+                    actor=actor or "git:sweep")
+            results.append(entry)
+            continue
         repo = os.path.expanduser(reg.get("cwd") or "")
         if not repo or not os.path.isdir(repo):
             entry.update(result="no-repo", detail="working directory of %s missing (%s)"
@@ -2209,7 +2855,7 @@ def sync_branches(db, *, host: str | None = None, agents=None, dry_run: bool = F
             # #2302 : un clone que personne ne fetch garde une cible et des
             # branches périmées ; le rafraîchir une fois par relevé est ce qui
             # permet de constater la fusion d'un paquet.
-            _refresh_clone(repo, "", refreshed)
+            refresh_clone(repo, "", refreshed)
             # #746 : une cible déclarée — celle du lot, ou `ameesh.target` du
             # dépôt — fait foi ; sinon la cible par défaut du clone
             # (`origin/HEAD`, figé à sa création), puis les refs d'intégration
@@ -2234,7 +2880,7 @@ def sync_branches(db, *, host: str | None = None, agents=None, dry_run: bool = F
                 primary, explicit = targets[repo], declared[repo]
             # #2302 : la cible peut nommer un autre remote ; la ref publiée
             # (origin/<branche>) est préférée à une branche locale périmée.
-            _refresh_clone(repo, primary, refreshed)
+            refresh_clone(repo, primary, refreshed)
             primary = published_target(repo, primary)
             # #990 : la liste dépend de la cible primaire, propre au lot — un
             # cache par dépôt la figerait pour les lots suivants
@@ -2359,6 +3005,11 @@ def sync_branches(db, *, host: str | None = None, agents=None, dry_run: bool = F
             results.append(entry)
             continue
         if dry_run:
+            retention = content_retention(st, row)
+            if retention is not None:
+                mark_retained(entry, retention, target=target, dry_run=True)
+                results.append(entry)
+                continue
             entry["result"] = "would-merge"
             results.append(entry)
             continue
@@ -2375,8 +3026,17 @@ def sync_branches(db, *, host: str | None = None, agents=None, dry_run: bool = F
         done = work_mod.close_merged(
             db, lot, sha=found["ref"] or "", actor=actor or "git:%s" % target,
             source=source, frozen_id=found.get("frozen_id"),
-            repo=repo)                          # L539 : dépôt du relevé, indice de classe
-        entry.update(result=done["result"], detail="%s — %s" % (entry["detail"], done["detail"]))
+            repo=repo,                          # L539 : dépôt du relevé, indice de classe
+            content_guard=content_retention)    # #2744 : verrou commun avec le hold
+        entry["result"] = done["result"]
+        if done["result"] in ("withheld", "error"):
+            mark_retained(entry, done["retention"], target=target)
+            if done["result"] == "withheld":
+                record_content_withheld(
+                    db, st, row, entry, done["retention"], target=target,
+                    actor=actor or "git:%s" % target)
+        else:
+            entry["detail"] = "%s — %s" % (entry["detail"], done["detail"])
         if done["result"] == "merged":
             if found.get("kind") == "content":
                 delivered = "its last freeze %s is an ancestor of %s" % (

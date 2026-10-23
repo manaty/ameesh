@@ -7,13 +7,18 @@ Faux `ssh` (aucune VM : lectures de migrations, unité) et faux CLI
 `ameesh` du poste (registre, pause, reprise) sur PATH. Les règles du drain
 (posé/levé/non levé, trap de sortie) sont couvertes en mode agents par
 `tests/test_503_agent_host.py` ; ce banc prouve le câblage du mode serveur,
-où la pause passe par le CLI du poste.
+où la pause passe par le CLI du poste. Il couvre aussi l'appel direct de
+`appel_drain` (#2578) : le script appelant meurt du signal reçu au lieu de
+poursuivre après le Ctrl-C.
 """
 from __future__ import annotations
 
 import os
+import shlex
+import signal
 import subprocess
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -107,6 +112,17 @@ elif action == 'pause':
 elif action == 'resume':
     if (state / 'sans-expect-reason').exists() and '--expect-reason' in sys.argv[3:]:
         sys.exit(2)
+    echecs = state / 'reprises-en-echec'
+    if echecs.exists():
+        # #2498 : reprise sans réponse (transport coupé) ; le fichier compte
+        # les échecs restants, « toujours » ne s'épuise jamais.
+        reste = echecs.read_text().strip()
+        if reste != 'toujours':
+            if int(reste) <= 1:
+                echecs.unlink()
+            else:
+                echecs.write_text(str(int(reste) - 1))
+        sys.exit(1)
     attendu = opt('--expect-reason')
     raison = motif.read_text() if motif.exists() else ''
     if pause.exists() and attendu is not None and raison == attendu:
@@ -238,6 +254,45 @@ class RedemarrageServeurDrainTest(unittest.TestCase):
         self.assertIn('systemctl start ameesh-runner@dev9',
                       (self.state / 'ssh.log').read_text())
 
+    def test_transient_resume_failure_is_not_reported_once_lifted(self):
+        """#2498 : une reprise en échec passager est rejouée (passe du trap)
+        avant le verdict ; levée, elle n'est plus signalée « NON levé(s) »."""
+        self.env['DRAIN_ATTENTE'] = '1'
+        (self.state / 'reprises-en-echec').write_text('1')
+        p = self.run_vm()
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertNotIn('drain(s) NON levé(s)', p.stdout + p.stderr)
+        self.assertIn('drain levé (sortie du script)', p.stdout)
+        self.assertFalse((self.state / 'pause-dev9').exists())
+
+    def test_lasting_resume_failure_is_reported_after_the_retry(self):
+        """#2498 : le verdict « NON levé(s) » suit la nouvelle tentative et ne
+        nomme que les drains encore en place."""
+        self.env['DRAIN_ATTENTE'] = '1'
+        (self.state / 'reprises-en-echec').write_text('toujours')
+        p = self.run_vm()
+        self.assertNotEqual(p.returncode, 0, p.stdout + p.stderr)
+        sortie = p.stdout + p.stderr
+        self.assertIn('drain(s) NON levé(s) : dev9', sortie)
+        reprises = [l for l in self.poste().splitlines()
+                    if l.startswith('resume dev9 --operator')]
+        # Levée au redémarrage, puis les deux passes rejouées avant le verdict.
+        self.assertGreaterEqual(len(reprises), 3)
+        self.assertTrue((self.state / 'pause-dev9').exists())
+
+    def test_final_verdict_is_not_followed_by_another_cleanup(self):
+        """#2498 : les trois premières reprises échouent ; une quatrième
+        réussirait et rendrait le verdict final périmé."""
+        self.env['DRAIN_ATTENTE'] = '1'
+        (self.state / 'reprises-en-echec').write_text('3')
+        p = self.run_vm()
+        self.assertNotEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertIn('drain(s) NON levé(s) : dev9', p.stdout + p.stderr)
+        reprises = [l for l in self.poste().splitlines()
+                    if l.startswith('resume dev9 --operator')]
+        self.assertEqual(len(reprises), 3)
+        self.assertTrue((self.state / 'pause-dev9').exists())
+
     def test_non_execute_agent_is_skipped_in_server_mode(self):
         """#2198/N5 : etat_agent honore le mode aussi en mode serveur ; une
         persona passée `externe` n'est ni arrêtée ni redémarrée."""
@@ -250,6 +305,78 @@ class RedemarrageServeurDrainTest(unittest.TestCase):
         self.assertNotIn('systemctl stop ameesh-runner@dev9', journal_ssh)
         self.assertNotIn('systemctl start ameesh-runner@dev9', journal_ssh)
         self.assertNotIn('pause dev9', self.poste())
+
+
+class AppelDrainSignalTest(unittest.TestCase):
+    """#2578 : un appel direct à `appel_drain` (hors $(…) ou pipeline) meurt du
+    signal reçu. Sinon son code de sortie 128+sig est une sortie ordinaire :
+    le script de déploiement poursuit après le Ctrl-C. Le trap EXIT du
+    script (levée des drains) doit toujours passer."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix='ameesh-2578-')
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        texte = SCRIPT.read_text()
+        debut = texte.index('appel_drain() {')
+        fin = texte.index('\n}\n', debut) + len('\n}\n')
+        self.fonction = texte[debut:fin]
+        self.enfant = self.root / 'enfant-demarre'
+        self.poursuite = self.root / 'poursuite'
+        self.nettoyage = self.root / 'nettoyage'
+        self.script = self.root / 'appel-direct.sh'
+        self.script.write_text(
+            '#!/bin/bash\n'
+            'trap \'echo nettoyage > {nettoyage}\' EXIT\n'
+            '{fonction}\n'
+            'appel_drain 30 bash -c \'echo demarre > {enfant}; exec sleep 30\'\n'
+            'echo poursuite > {poursuite}\n'.format(
+                nettoyage=shlex.quote(str(self.nettoyage)),
+                fonction=self.fonction,
+                enfant=shlex.quote(str(self.enfant)),
+                poursuite=shlex.quote(str(self.poursuite))))
+        self.script.chmod(0o755)
+
+    def test_direct_call_dies_from_the_signal_and_stops_the_caller(self):
+        proc = subprocess.Popen(['bash', str(self.script)],
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                text=True, start_new_session=True)
+
+        def nettoyer():
+            if proc.poll() is None:
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                proc.communicate()
+
+        self.addCleanup(nettoyer)
+        try:
+            limite = time.monotonic() + 10
+            while not self.enfant.exists() and time.monotonic() < limite:
+                time.sleep(0.05)
+            self.assertTrue(self.enfant.exists(),
+                            "enfant de l'appel non démarré")
+            # `appel_drain` lance son enfant avant d'installer ses
+            # gestionnaires : laisser passer cette fenêtre de quelques
+            # instructions, puis simuler le Ctrl-C du terminal, qui frappe
+            # tout le groupe (bash appelant et client Python).
+            time.sleep(0.2)
+            os.killpg(proc.pid, signal.SIGINT)
+            _, err = proc.communicate(timeout=15)
+        except subprocess.TimeoutExpired:
+            os.killpg(proc.pid, signal.SIGKILL)
+            proc.communicate()
+            self.fail("l'appel direct n'a pas été interrompu")
+        self.assertEqual(proc.returncode, -signal.SIGINT,
+                         'le script appelant doit mourir du SIGINT (rc %r)'
+                         % proc.returncode)
+        self.assertIn('appel de drain interrompu (signal %d transmis)'
+                      % signal.SIGINT, err)
+        self.assertFalse(self.poursuite.exists(),
+                         'le script a poursuivi après le Ctrl-C')
+        self.assertTrue(self.nettoyage.exists(),
+                        'le trap EXIT (levée des drains) doit passer')
 
 
 if __name__ == '__main__':

@@ -85,6 +85,7 @@ from . import plan as plan_mod
 from . import process_projection as projection_mod
 from . import process_workflow as workflow_mod
 from . import projects as projects_mod
+from . import role_run
 from . import storage
 from . import work as work_mod
 from .connectors import ConnectorError
@@ -1497,9 +1498,19 @@ class _Repo:
         return data if isinstance(data, dict) else None
 
     def comment(self, number: int, body: str) -> dict:
+        # #2845: every projection comment must be ignored by the incoming
+        # watch, including closure and duplicate comments. Accounts can be
+        # shared with humans, so author identity cannot serve as a filter.
+        if "<!-- ameesh:" not in body:
+            body += "\n\n<!-- ameesh:projection:v1 -->"
         return _json(self.gh, ["api", "-X", "POST",
                                "repos/%s/issues/%d/comments" % (self.repo, number),
                                "--input", "-"], json.dumps({"body": body})) or {}
+
+    def comments(self, number: int) -> list[dict]:
+        return _lines(self.gh, ["api", "--paginate",
+                               "repos/%s/issues/%d/comments?per_page=100" % (self.repo, number),
+                               "--jq", ".[] | @json"])
 
     def issues(self) -> list[dict]:
         """TOUTES les issues du dépôt (sans filtre de label) : une issue se
@@ -2472,7 +2483,15 @@ def _three_way(view: LotView, issue: dict, managed=None) -> tuple[dict, list, li
         ours = [k for k, d in zip(_FIELD_NAMES, recorded) if _digest(want[k]) != d]
         human = [k for k, d in zip(_FIELD_NAMES, recorded) if _digest(have[k]) != d]
     else:
+        # Issue désignée et adoptée : rien n'a encore été écrit, donc aucune
+        # empreinte. Seules les étiquettes sont à nous — plus la fermeture :
+        # un lot déjà clos ferme son issue dans ce passage même, sinon le
+        # commentaire « issue closed by ameesh » contredirait une issue restée
+        # ouverte et l'empreinte figerait cet écart en retouche humaine (#3086).
         ours, human = ["labels"], []
+        if (want["state"] or "").lower() == "closed" \
+                and (have["state"] or "").lower() != "closed":
+            ours.append("state")
     write = [k for k in ours if want[k] != have[k]]
     kept = [k for k in human if k not in ours]
     return want, write, human, kept
@@ -2519,7 +2538,7 @@ def project_lots(db, gh, project: str, repo: str, *, dry_run: bool = False,
                     "public": public, "dry_run": bool(dry_run), "issues": [],
                     "labels_created": [], "refused": [], "withheld": [], "human_edits": [],
                     "issue_refs": [], "duplicates": [], "orphans": [], "errors": [],
-                    "projection_refused": []}
+                    "projection_refused": [], "comments": []}
     issues = gh_repo.issues()
     by_number = {int(i["number"]): i for i in issues if i.get("number") is not None}
     markers: dict = {}
@@ -2587,6 +2606,7 @@ def project_lots(db, gh, project: str, repo: str, *, dry_run: bool = False,
         managed_set.update(admitted.labels.values())
     managed = managed_set or None
     refused_lots: set = set()
+    stage_closings: dict = {}
     for item, issue in mine:
         lot_id = int(item["id"])
         mapping = projection_mod.mapping_for(mappings, item)
@@ -2609,6 +2629,8 @@ def project_lots(db, gh, project: str, repo: str, *, dry_run: bool = False,
                                      "action": "refused-projection", "changes": [],
                                      "codes": list(view.projection_refused)})
             continue
+        if item.get("state") == "closed" and view.closing:
+            stage_closings[lot_id] = view.closing.replace(" delivered", " completed")
         if issue is None and view.state == "closed":
             continue                    # jamais d'issue neuve pour un lot terminé
         for part in view.withheld:
@@ -2675,10 +2697,7 @@ def project_lots(db, gh, project: str, repo: str, *, dry_run: bool = False,
         entry["action"] = "close" if closing else "update"
         entry["changes"] = [_LOT_FIELD_FR[k] for k in write] or ["digests"]
         plans.append({"entry": entry, "item": item, "payload": payload,
-                      "labels": view.labels if "labels" in write else [],
-                      "comment": view.closing if closing else None})
-        if closing:
-            entry["comment"] = view.closing
+                      "labels": view.labels if "labels" in write else []})
     needed = sorted({lab for plan in plans for lab in plan["labels"]})
     if needed:
         existing = gh_repo.labels()
@@ -2702,6 +2721,9 @@ def project_lots(db, gh, project: str, repo: str, *, dry_run: bool = False,
                                  and ref[1] in by_number):
                 continue
             _remember_ref(db, st, gh_repo, report, item, int(issue["number"]), created=False)
+    from . import github_stage_comments
+    github_stage_comments.project(db, st, gh_repo, report, mine, guard=guard,
+                                  refused=refused_lots, project=project, closings=stage_closings)
     return _tally_lots(report)
 
 
@@ -2717,8 +2739,6 @@ def _execute(db, st, gh_repo: "_Repo", report: dict, plan: dict) -> None:
             _remember_ref(db, st, gh_repo, report, plan["item"], entry["number"], created=True)
             return
         gh_repo.update(int(entry["number"]), plan["payload"])
-        if plan.get("comment"):
-            gh_repo.comment(int(entry["number"]), plan["comment"])
     except GithubError as exc:
         entry["error"] = _one_line(exc)
         report["errors"].append({"work_item": entry["work_item"], "number": entry.get("number"),
@@ -2828,15 +2848,15 @@ class Projector:
         if not settings.projects:
             return []
         here = getattr(self.cfg, "host", None)
-        if not settings.host:
-            self._once("no-host", "GitHub issues: no designated host (`github.host`): no "
-                                  "automatic projection; `ameesh work project-github --app "
-                                  "<project>` remains possible")
-            return []
-        if settings.host != here:
-            self._once(("elsewhere", settings.host),
-                       "GitHub issues: the projection is run by host %s, not %s"
-                       % (settings.host, here))
+        if not role_run.host_authorized(self.cfg, settings.host):
+            if not settings.host:
+                self._once("no-host", "GitHub issues: no designated host (`github.host`): no "
+                                      "automatic projection; `ameesh work project-github --app "
+                                      "<project>` remains possible")
+            else:
+                self._once(("elsewhere", settings.host),
+                           "GitHub issues: the projection is run by host %s, not %s"
+                           % (settings.host, here))
             return []
         reports: list[dict] = []
         feed = None

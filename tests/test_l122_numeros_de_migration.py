@@ -115,6 +115,40 @@ class NumerosDuDepotTest(unittest.TestCase):
                                               also_skip=("integration/paquet-5",))
             self.assertEqual(sorted(skipped), [375])
 
+    def test_la_cible_seule_est_lue(self):
+        """#2620 : un numéro exact ne lit que la branche cible — ni l'arbre de
+        travail, ni le paquet, ni les branches non fusionnées ; `origin/`
+        publiée l'emporte sur la branche locale (#1333)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = _depot(os.path.join(tmp, "nexlink"), "manaty/nexlink", NEXLINK.directory,
+                          ["375_a.sql", "376_b.sql", "377_receipt+fix.sql"],
+                          {"agent/x-417": ["378_autre.sql"]})
+            with open(os.path.join(repo, NEXLINK.directory, "379_wt.sql"), "w") as fh:
+                fh.write("--")
+            found = migrations.target_numbers(repo, NEXLINK, "develop")
+            # tout nom numéroté de la cible compte, même hors du format
+            self.assertEqual(sorted(found), [375, 376, 377])
+            self.assertEqual(found[377], ["develop:377_receipt+fix.sql"])
+            self.assertEqual(migrations.target_numbers(repo, NEXLINK, "origin/develop"), found)
+            self.assertIsNone(migrations.target_numbers(repo, NEXLINK, "main"))
+            self.assertIsNone(migrations.target_numbers(repo, NEXLINK, ""))
+            # la ref publiée `origin/develop` fait foi sur la locale figée
+            os.remove(os.path.join(repo, NEXLINK.directory, "379_wt.sql"))
+            _git(repo, "checkout", "-q", "--orphan", "publie")
+            _git(repo, "rm", "-rqf", ".")
+            os.makedirs(os.path.join(repo, NEXLINK.directory))
+            with open(os.path.join(repo, NEXLINK.directory, "390_publie.sql"), "w") as fh:
+                fh.write("--")
+            _git(repo, "add", ".")
+            _git(repo, "commit", "-qm", "390 publie")
+            sha = subprocess.check_output(["git", "-C", repo, "rev-parse", "HEAD"],
+                                          text=True).strip()
+            _git(repo, "checkout", "-q", "develop")
+            _git(repo, "update-ref", "refs/remotes/origin/develop", sha)
+            found = migrations.target_numbers(repo, NEXLINK, "develop")
+            self.assertEqual(sorted(found), [390])
+            self.assertIn("origin/develop:390_publie.sql", found[390])
+
     def test_l_arbre_de_travail_peut_etre_ignore(self):
         """#2400 : le train compose la migration qu'il réserve ; le scan de
         réservation ignore alors l'arbre de travail, jamais les branches."""
@@ -178,6 +212,10 @@ class ReservationTest(PgTestCase):
                               {"agent/autre": ["377_c.sql"]})
         self.ameesh = _depot(os.path.join(self.tmp, "ameesh"), "manaty/ameesh",
                              AMEESH.directory, ["0005_e.sql"])
+        # #2620 : un numéro exact lit la cible du lot ; ces dépôts n'ont que
+        # `develop` (pas d'`origin/HEAD`, pas de main), la cible est déclarée.
+        _git(self.nexlink, "config", "ameesh.target", "develop")
+        _git(self.ameesh, "config", "ameesh.target", "develop")
         self.floor = max(migrations.repo_numbers(self.ameesh, AMEESH)) + 1
 
     def _lot(self, title="un lot", repo="manaty/ameesh", n=1):
@@ -205,37 +243,38 @@ class ReservationTest(PgTestCase):
         self.assertIn("migration: %04d reserved in manaty/ameesh" % (self.floor + 1),
                       proc.stdout)
 
-    def test_numero_porte_par_la_branche_du_paquet_ignore(self):
-        """#1603 : à la composition, la branche d'intégration porte déjà les
-        fichiers renumérotés ; `--skip-branch` la retire du scan, sans
-        exempter de l'unicité entre lots."""
+    def test_branche_du_paquet_ignoree_hors_cible(self):
+        """#1603 × #2620 : à la composition, la branche d'intégration porte déjà
+        les fichiers renumérotés ; un numéro exact ne lit que la cible et n'a
+        plus besoin de `--skip-branch` ; l'allocation du prochain libre, elle,
+        l'ignore sur demande, sans exempter de l'unicité entre lots."""
         _git(self.nexlink, "checkout", "-qb", "integration/paquet-5")
         _commit(self.nexlink, NEXLINK.directory, "453_demo.sql", "455_autre.sql")
         _git(self.nexlink, "checkout", "-q", "develop")
-        lot = self._lot("nx", "manaty/nexlink")
-        with self.assertRaises(work.WorkError) as ctx:
-            self._nx(lot, 453)
-        self.assertIn("already in manaty/nexlink", str(ctx.exception))
-        got = self._nx(lot, 453, skip_branches=("integration/paquet-5",))
-        self.assertEqual(got["migration"], 453)
-        # la même option par la CLI
-        proc = self.mesh("work", "migration", str(self._lot("nx2", "manaty/nexlink", 2)["id"]),
-                         "--number", "455", "--repo", self.nexlink,
-                         "--skip-branch", "integration/paquet-5")
+        # prochain libre : la branche d'intégration compte, sauf --skip-branch
+        skipped = self._lot("nx", "manaty/nexlink")
+        self.assertEqual(self._nx(skipped, skip_branches=("integration/paquet-5",))["migration"],
+                         378)      # 375, 376, 377 (agent/autre), sans 453/455
+        other = self._lot("nx2", "manaty/nexlink", 2)
+        self.assertEqual(self._nx(other)["migration"], 456)   # au-delà de 453/455
+        # un numéro exact lit la cible seule : 453 et 455 sont libres
+        lot = self._lot("nx3", "manaty/nexlink", 3)
+        self.assertEqual(self._nx(lot, 453)["migration"], 453)
+        proc = self.mesh("work", "migration", str(self._lot("nx4", "manaty/nexlink", 4)["id"]),
+                         "--number", "455", "--repo", self.nexlink)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("migration 455 reserved in manaty/nexlink", proc.stdout)
         # l'option ne dispense pas de l'unicité (dépôt, numéro) entre lots
-        other = self._lot("nx3", "manaty/nexlink", 3)
-        holder = self._nx(other, 454)
+        holder = self._nx(self._lot("nx5", "manaty/nexlink", 5), 454)
         with self.assertRaises(work.WorkError) as ctx:
-            self._nx(lot, 454, skip_branches=("integration/paquet-5",))
+            self._nx(lot, 454)
         self.assertIn("lot #%d" % holder["id"], str(ctx.exception))
         # le tronc ne s'ignore jamais : il porte les migrations fusionnées
         for trunk in ("develop", "main"):
             with self.assertRaises(work.WorkError) as ctx:
                 self._nx(other, 376, skip_branches=(trunk,))
             self.assertIn("trunk branch", str(ctx.exception))
-        self.assertEqual(work.get(self.db, other["id"])["migration"], 454)
+        self.assertEqual(work.get(self.db, other["id"])["migration"], 456)
 
     def test_lot_nexlink_dossier_et_numerotation_de_nexlink(self):
         lot = self._lot("nx", "manaty/nexlink", 169)
@@ -265,14 +304,76 @@ class ReservationTest(PgTestCase):
         self.assertEqual(self._nx(other)["migration"], 9001)
         self.assertEqual(self._am(self._lot("am2"))["migration"], 9001)
 
-    def test_numero_present_dans_le_depot_cible_refuse(self):
+    def test_un_numero_d_une_branche_non_fusionnee_ne_refuse_plus(self):
+        """#2620 : le témoin du défaut — `377` n'existe que sur la branche non
+        fusionnée `agent/autre` ; une réservation à numéro exact l'accepte,
+        alors qu'un fichier de la cible refuse toujours."""
+        self.assertEqual(sorted(migrations.target_numbers(self.nexlink, NEXLINK, "develop")),
+                         [375, 376])
         lot = self._lot("nx", "manaty/nexlink")
-        for number in (376, 377):     # la branche principale, puis une autre branche
-            with self.assertRaises(work.WorkError) as ctx:
-                self._nx(lot, number)
-            self.assertIn("already in manaty/nexlink", str(ctx.exception))
-        # le même numéro est libre dans ameesh
+        with self.assertRaises(work.WorkError) as ctx:
+            self._nx(lot, 376)          # la cible, sous son propre nom
+        self.assertIn("already in manaty/nexlink", str(ctx.exception))
+        self.assertIn("develop:376_b.sql", str(ctx.exception))
+        got = self._nx(lot, 377)        # la branche non fusionnée ne compte pas
+        self.assertEqual(got["migration"], 377)
+        notes = [e["note"] for e in work.events(self.db, lot["id"])]
+        self.assertIn("migration 377 reserved (manaty/nexlink; before: none)", notes)
+        # le même numéro est libre dans ameesh (0005 seulement sur sa cible)
         self.assertEqual(self._am(self._lot("am"), 376)["migration"], 376)
+
+    def test_la_cible_du_lot_prime_sur_celle_du_depot(self):
+        """#2620 : `branch_target` fait foi (celle que lisent la file de fusion
+        et la classe de revue), avant la cible déclarée du clone."""
+        lot = self._lot("nx", "manaty/nexlink")
+        work.set_branch(self.db, lot["id"], "lot/2620", "agent/autre")
+        with self.assertRaises(work.WorkError) as ctx:
+            self._nx(lot, 377)
+        self.assertIn("agent/autre:377_c.sql", str(ctx.exception))
+
+    def test_numero_exact_sans_cible_connue_refuse(self):
+        """#2620 : sans cible connue, refuser plutôt que de retomber sur le
+        scan de toutes les branches (le défaut corrigé)."""
+        _git(self.nexlink, "config", "--unset", "ameesh.target")
+        lot = self._lot("nx", "manaty/nexlink")
+        with self.assertRaises(work.WorkError) as ctx:
+            self._nx(lot, 377)
+        self.assertIn("no target branch", str(ctx.exception))
+        self.assertIn("#2620", str(ctx.exception))
+        self.assertIsNone(work.get(self.db, lot["id"])["migration"])
+
+    def test_numero_exact_ne_lit_pas_origin_head(self):
+        """#2660 : sans cible déclarée, un numéro exact ne lit plus
+        `origin/HEAD` — main sur un clone nexlink dont le projet intègre sur
+        develop — et refuse. La cible du projet et `ameesh.target` restent
+        lues : ce sont des cibles déclarées."""
+        _git(self.nexlink, "config", "--unset", "ameesh.target")
+        # `origin/HEAD` dit main, et main porte 377 : le repli silencieux
+        # vérifierait un lot qui vise develop contre main.
+        _git(self.nexlink, "checkout", "-qb", "main")
+        _commit(self.nexlink, NEXLINK.directory, "377_main.sql")
+        _git(self.nexlink, "checkout", "-q", "develop")
+        _git(self.nexlink, "update-ref", "refs/remotes/origin/main", "refs/heads/main")
+        _git(self.nexlink, "symbolic-ref", "refs/remotes/origin/HEAD",
+             "refs/remotes/origin/main")
+        lot = work.add(self.db, title="nx", app="nexlink",
+                       issue_ref="manaty/nexlink#7", actor="mesh-design")
+        with self.assertRaises(work.WorkError) as ctx:
+            self._nx(lot, 377)
+        self.assertIn("no target branch", str(ctx.exception))
+        self.assertIn("#2620", str(ctx.exception))
+        self.assertIn("#2660", str(ctx.exception))
+        self.assertNotIn("already in", str(ctx.exception))
+        self.assertIsNone(work.get(self.db, lot["id"])["migration"])
+        # la cible du projet, déclarée à l'hôte, suffit et fait foi
+        cfg = types.SimpleNamespace(github=None, radar={"projects": {"nexlink": {
+            "repo": self.nexlink, "github": "manaty/nexlink",
+            "migrations": NEXLINK.directory, "target": "develop"}}})
+        self.assertEqual(self._nx(lot, 377, cfg=cfg)["migration"], 377)
+        # `ameesh.target` du clone reste une cible déclarée
+        work.reserve_migration(self.db, lot["id"], release=True)
+        _git(self.nexlink, "config", "ameesh.target", "develop")
+        self.assertEqual(self._nx(lot, 377)["migration"], 377)
 
     def test_clone_d_un_autre_depot_ou_lot_sans_depot_refuse(self):
         nx = self._lot("nx", "manaty/nexlink")
@@ -673,6 +774,7 @@ class CorrectionIssueRefTest(PgTestCase):
         lot = self._lot()
         nexlink = _depot(os.path.join(self.tmp, "nexlink"), "manaty/nexlink",
                          NEXLINK.directory, ["376_b.sql"])
+        _git(nexlink, "config", "ameesh.target", "develop")   # #2620 : cible lue
         work.reserve_migration(self.db, lot["id"], 453, repo=nexlink)
         with self.assertRaises(work.WorkError) as ctx:
             work.set_issue_ref(self.db, lot["id"], "manaty/ameesh#1603", actor="human:owner")
@@ -701,6 +803,7 @@ class CorrectionIssueRefTest(PgTestCase):
         observed = work.get(self.db, lot["id"])   # lue AVANT la réservation
         nexlink = _depot(os.path.join(self.tmp, "nexlink"), "manaty/nexlink",
                          NEXLINK.directory, ["376_b.sql"])
+        _git(nexlink, "config", "ameesh.target", "develop")   # #2620 : cible lue
         work.reserve_migration(self.db, lot["id"], 453, repo=nexlink)
         live = work.get(self.db, lot["id"])
         with mock.patch.object(work, "get", side_effect=[observed, live]):
@@ -720,6 +823,7 @@ class CorrectionIssueRefTest(PgTestCase):
         observed = work.get(self.db, lot["id"])
         nexlink = _depot(os.path.join(self.tmp, "nexlink"), "manaty/nexlink",
                          NEXLINK.directory, ["376_b.sql"])
+        _git(nexlink, "config", "ameesh.target", "develop")   # #2620 : cible lue
         work.reserve_migration(self.db, lot["id"], 453, repo=nexlink)
         store = storage.of(self.db).work
         self.assertFalse(store.set_issue_ref(lot["id"], "manaty/ameesh#1603",

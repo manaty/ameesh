@@ -5,10 +5,14 @@ Canon §2 requires, for a frozen sensitive lot, "a review by another model
 family (two for SQL, security or prod)". Until now an agent chose the reviewer
 by hand, and on 15/10 eighteen lots waited without a reviewer, for up to 42 h.
 This module does the **selection**: it takes the versioned policy
-(`review_policies.train_reviews`, read by #1616/#1467), the exact frozen head
-and the registry, and returns either designated reviewers with their mail, or
+(`review_policies.train_reviews`, read by #1616/#1467), the exact frozen head,
+the registry and, since #2668, the plan advance of each family
+(`review_pace`), and returns either designated reviewers with their mail, or
 an **explicit waiting state** with a capacity notification — never an implicit
-admission.
+admission. The family furthest behind its plan comes first, the load only
+breaking a tie; an unreadable plan reading is neutral (#1561), and the pace
+never makes an eligible family ineligible: two opinions still take two
+distinct families.
 
 What the module deliberately does not do:
 
@@ -21,8 +25,9 @@ What the module deliberately does not do:
   source is the session's real family (`registry.live_harness`, #1037 / L242b);
 - it neither counts nor requalifies verdicts: the required number comes from
   the maximum of the rules per path, the independence of the rendered opinions
-  remains that of #1465/#1467 (`train_review.qualify`), and a new freeze
-  invalidates the stale designation instead of reusing it.
+  remains that of the merge gate (`merge_queue.review_gate`) and its authors
+  reading (`review_authors`, #2681), and a new freeze invalidates the stale
+  designation instead of reusing it.
 
 Idempotence: the designation is tied to the **`frozen` milestone** (its
 identifier and its exact SHA), not to the lot. The same freeze replayed returns
@@ -36,6 +41,7 @@ for a freeze that is no longer the latest: no return to an old head.
 from __future__ import annotations
 
 import json
+import math
 import re
 from dataclasses import dataclass, field
 from typing import Iterable, Mapping, Optional, Protocol, Sequence
@@ -51,10 +57,6 @@ NONE = "none"
 REQUEST_KIND = "request"
 #: a harness that is not a model family (registry without a session)
 PLACEHOLDER_FAMILIES = frozenset(("", "none", "other", "unknown", "inconnu"))
-#: fallback families as long as the compiled canon (#1616) does not declare
-#: them: same values as `train_review.FAMILIES`, to be passed as a parameter as
-#: soon as the machine declaration "families and independence" is available
-KNOWN_FAMILIES = frozenset(("claude", "codex", "deepseek"))
 #: the registry states that forbid designation
 UNAVAILABLE_STATUS = frozenset(("stopped", "paused"))
 #: the `status_text` prefixes of an operations or budget pause
@@ -156,15 +158,21 @@ def rules_of(declaration) -> tuple[Rule, ...]:
     return tuple(out)
 
 
-def required_count(rules: Sequence[Rule], paths: Iterable[str]) -> int:
-    """The number of opinions required for these paths: the **maximum** of the rules.
+def required_count(rules: Sequence[Rule], paths: Iterable[str],
+                   light: int = 0) -> int:
+    """The number of opinions required for these paths: the **maximum** of the
+    rules and of the declared light floor.
 
-    A path that no rule covers counts as zero: that is the light rule ("zero for
-    light outside a rule", PR85). Coverage of non-light paths is checked by the
+    The light floor comes from the caller that read it (`mechanics.reviews_for`,
+    §2: one opinion, #2642); it is never guessed here. `light` defaults to 0 for
+    the pure rule reader, whose only inputs are the rules. A path that no rule
+    covers counts as the floor. Coverage of non-light paths is checked by the
     policy reader (#1467), not here.
     """
+    if type(light) is not int or light < 0:
+        raise DesignationError("light opinions: a non-negative integer is expected")
     rules = tuple(rules or ())
-    highest = 0
+    highest = light
     for path in paths or ():
         for rule in rules:
             if rule.matches(path):
@@ -181,26 +189,28 @@ class Candidate:
     """A possible reviewer, as the registry describes it.
 
     `family` is the **real** family of the session
-    (`registry.live_harness`); `available` and `load` come from the registry
-    and from the number of open lots. The module completes nothing: an empty
-    family or a harness outside the known families makes the candidate
-    ineligible.
+    (`registry.live_harness`); `available`, `load` and `model` come from the
+    registry and from the charge computed by the caller (assigned open lots and
+    pending reviews, #3004). `model` is only used to choose the model-scoped
+    gauges that apply to this reviewer (#2668); it never changes the family or
+    the eligibility. The module completes nothing: an empty family or a harness
+    outside the known families makes the candidate ineligible.
     """
 
     name: str
     family: str
     available: bool = True
     load: int = 0
+    model: str = ""
 
-    def eligible(self, *, forbidden_names, forbidden_families,
-                 families=KNOWN_FAMILIES) -> bool:
+    def eligible(self, *, forbidden_names, forbidden_families, families) -> bool:
         name = (self.name or "").strip()
         family = (self.family or "").strip().lower()
         return bool(name) and self.available and family in families \
             and name not in forbidden_names and family not in forbidden_families
 
 
-def live_family(row: Mapping, *, families=KNOWN_FAMILIES) -> str:
+def live_family(row: Mapping, *, families) -> str:
     """The real family of a registry row, never the declared label.
 
     `registry.live_harness` (imported locally here so the module remains
@@ -235,13 +245,15 @@ def is_available(row: Mapping) -> bool:
 
 
 def candidates_from_registry(rows: Iterable[Mapping], *, loads: Optional[Mapping] = None,
-                             project: str = "", families=KNOWN_FAMILIES) -> list[Candidate]:
-    """The candidates of a project: real family, availability, load of open lots.
+                             project: str = "", families) -> list[Candidate]:
+    """The candidates of a project: real family, availability, caller's charge.
 
-    `loads` maps a name to the number of open lots (`build`/`qa`); when absent,
-    the load is zero. `project` (the lot's `app`) restricts to agents of the
-    same team: an ameesh lot is reviewed by an ameesh agent. An empty project
-    does not filter — the caller knows what it is doing.
+    `loads` maps a name to the agent's charge (`review_designation_activation.
+    _loads`: open lots assigned to them plus the reviews they still owe,
+    #3004); when absent, the load is zero. `project` (the lot's `app`)
+    restricts to agents of the same team: an ameesh lot is reviewed by an
+    ameesh agent. An empty project does not filter — the caller knows what it
+    is doing.
     """
     loads = loads or {}
     wanted = (project or "").strip()
@@ -257,26 +269,31 @@ def candidates_from_registry(rows: Iterable[Mapping], *, loads: Optional[Mapping
             load = int(loads.get(name, 0))
         except (TypeError, ValueError):
             load = 0
+        row = dict(row or {})
+        model = str(row.get("model") or row.get("session_model") or "").strip()
         out.append(Candidate(name=name, family=live_family(row, families=families),
-                             available=is_available(row), load=max(load, 0)))
+                             available=is_available(row), load=max(load, 0),
+                             model=model))
     return out
 
 
 # --------------------------------------------------------------------------
-# the selection: two distinct families, excluding authors and fixers
+# the selection: two distinct families, excluding every author (correctors
+# included)
 # --------------------------------------------------------------------------
 
 def families_of(authors: Iterable) -> tuple[set, set]:
     """`(names, families)` forbidden, drawn from the authors of the frozen content.
 
-    An author is `{"name", "family"}`: the lot's assignee and each fixer who
-    pushed onto the head (exact evidence #1465). An unknown family is not
-    guessed: `select` then waits instead of designating (see
-    `unknown_families`).
+    An author is `{"name", "family"}`: the lot's assignee, each co-author and
+    each reviewer who pushed a correction onto the head (exact evidence #1465,
+    canon §2 and #2888). An unknown family is not guessed: `select` then waits
+    instead of designating (see `unknown_families`).
     """
     names, families = set(), set()
     for author in authors or ():
-        row = dict(author or {})
+        row = dict(author or {}) if isinstance(author, Mapping) \
+            else {"name": str(author or "").strip()}
         name = str(row.get("name") or "").strip()
         family = str(row.get("family") or "").strip().lower()
         if name:
@@ -296,68 +313,263 @@ def unknown_families(authors: Iterable) -> list[str]:
                    in PLACEHOLDER_FAMILIES})
 
 
-def select(*, required: int, authors: Iterable = (), candidates: Iterable = (),
-           families=KNOWN_FAMILIES) -> dict:
-    """Chooses `required` (1 or 2) independent and least-loaded reviewers.
+def names_of(rows: Iterable) -> set:
+    """The names carried by `{name, ...}` rows or bare strings, stripped.
 
-    - each reviewer's family differs from that of **every** author or fixer, and
-      for two opinions the two families differ from each other (canon §2);
+    The selection applies it to its `fixers` input: the same rows may be read
+    from a journal mark (strings) or from the frozen range (mappings). A
+    corrector's family comes from `families_of`, never from the name.
+    """
+    names = set()
+    for row in rows or ():
+        name = str((row or {}).get("name") or "").strip() if isinstance(row, Mapping) \
+            else str(row or "").strip()
+        if name:
+            names.add(name)
+    return names
+
+
+def manual_seats(already: Iterable, *, authors: Iterable = (), fixers: Iterable = (),
+                 families) -> list:
+    """The manual reviewers that can count toward the required opinions.
+
+    A manual reviewer is kept in the column whatever happens (`#2627`); this
+    helper only says which ones cover a seat: a known family from the policy,
+    distinct from every author's family, distinct from the other manual
+    reviewers, and not an author itself. An unknown family, or the author's
+    family, does not prove independence: the seat remains to designate.
+
+    `fixers` are the designated reviewers who pushed a small first-round
+    correction (#2739). They are authors of the head (#2888): their family is
+    forbidden exactly like any author's, and the agent itself cannot count a
+    seat — it would be reviewing its own fix. The name list is kept as a
+    safety net when the caller's `authors` list is partial.
+    """
+    names, forbidden = families_of(authors)
+    fixer_names = names_of(fixers)
+    forbidden = forbidden | families_of(fixers)[1]
+    if unknown_families(authors):
+        # An author of unknown family makes every reviewer's independence
+        # unprovable: no manual reviewer can cover a seat either (#2627).
+        return []
+    covered = set(forbidden)
+    seats = []
+    seen_names = set()
+    for row in already or ():
+        row = dict(row or {})
+        name = str(row.get("name") or "").strip()
+        family = str(row.get("family") or "").strip().lower()
+        if (not name or name in seen_names or name in names or name in fixer_names
+                or not family or family in PLACEHOLDER_FAMILIES
+                or family not in families or family in covered):
+            continue
+        seen_names.add(name)
+        covered.add(family)
+        seats.append({"name": name, "family": family})
+    return seats
+
+
+def _finite(value) -> Optional[float]:
+    """A finite float, or None; a malformed advance is ignored, never guessed."""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _normalise_advances(advances) -> dict:
+    """`{family: advance}` or `{family: {scope: advance}}`, numbers only.
+
+    A flat value is the family's general advance; a nested mapping carries the
+    general `""` key and one key per model scope (`fable`), so a candidate's
+    model can pick the gauges that apply to it (#2668, cx3 B/P1). A nested
+    `None` means the family carries that scope but no account has a current
+    applicable reading: the model is neutral, never rescued by the general
+    reading of an account whose scoped window is stale.
+    """
+    out: dict = {}
+    for family, value in (advances or {}).items():
+        family = str(family or "").strip().lower()
+        if not family:
+            continue
+        if isinstance(value, Mapping):
+            nested = {}
+            for scope, number in value.items():
+                scope = str(scope or "").strip().lower()
+                if number is None:
+                    nested[scope] = None
+                    continue
+                number = _finite(number)
+                if number is not None:
+                    nested[scope] = number
+            if nested:
+                out[family] = nested
+        else:
+            number = _finite(value)
+            if number is not None:
+                out[family] = number
+    return out
+
+
+def _advance_of(candidate, pace: Mapping) -> float:
+    """The advance applicable to one candidate, model-scoped gauges included.
+
+    A scope counts when its name is part of the candidate's model, the rule of
+    `accounts.model_scoped`; the general `""` reading is used only when no
+    scope matches. A matching scope with no current reading (`None`) makes the
+    candidate neutral (0) — it does not fall back to the general reading of a
+    stale account (cx3 B/P1). A family absent from `pace` is neutral too.
+    """
+    entry = pace.get((candidate.family or "").strip().lower())
+    if entry is None:
+        return 0.0
+    if not isinstance(entry, Mapping):
+        return entry
+    model = str(getattr(candidate, "model", "") or "").strip().lower()
+    matching = [value for scope, value in entry.items()
+                if scope and scope in model]
+    if matching:
+        values = [value for value in matching if value is not None]
+        return max(values) if values else 0.0
+    general = entry.get("")
+    return general if general is not None else 0.0
+
+
+def select(*, required: int, authors: Iterable = (), candidates: Iterable = (),
+           families, already: Iterable = (), fixers: Iterable = (),
+           advances: Optional[Mapping] = None) -> dict:
+    """Chooses `required` (1 or 2) independent reviewers, by plan pace then load.
+
+    - each reviewer's family differs from that of **every** author, and for two
+      opinions the two families differ from each other (canon §2);
     - the family comes from the real session (`Candidate.family`), never from
       the name;
-    - an unavailable candidate, without a known family, or an author itself is
-      discarded;
+    - an unavailable candidate, without a known family, an author itself, or an
+      agent that pushed a reviewer's correction is discarded: a reviewer's
+      correction makes its author an author of the head (#2888), so neither the
+      exact agent nor its family can review that head;
     - an author whose real family is unknown (empty or a label) makes the
       designation **wait**: without it, a reviewer's independence is not proven
       (canon §2);
-    - at equal load, the order of names decides: the selection is deterministic.
+    - `advances` maps a family to its advance over the plan pace, in points
+      (`review_pace`; positive = ahead, negative = behind). A family value may
+      be a `{scope: advance}` mapping: the general `""` plus the model-scoped
+      buckets, selected by the candidate's `model` (a `fable` bucket counts
+      only for a Fable reviewer, never for another model or an unknown one).
+      When several families are eligible, the family **furthest behind** comes
+      first; an absent reading is neutral (0, at its pace), so the other
+      criteria decide (#2668, #1561). Never a reason to discard an eligible
+      family: two opinions still take two distinct families;
+    - the load of the agent only breaks a pace tie (least loaded first), then
+      the name: the same order chooses the family's representative and orders
+      the families; the selection is deterministic. The load is the caller's
+      charge (`Candidate.load`), which counts the agent's open lots **and** the
+      reviews they still owe (#3004);
+    - `already` names the manual reviewers already designated (#2627). The ones
+      that prove an independent family cover a seat; only the **missing** seats
+      are designated, never a manual reviewer removed or overridden;
+    - `fixers` names the designated reviewers whose small first-round
+      correction is an authored commit of the head (#2739/#2888). Their family
+      is forbidden like any author's family; their exact name is excluded too,
+      as a safety net: they would review their own fix.
 
-    Returns `{state, required, reviewers, missing, why, forbidden}`: `waiting`
-    when independent families are missing or an author family is unknown, with
-    the missing count — never an implicit admission.
+    Returns `{state, required, reviewers, missing, manual, why, forbidden,
+    families, fixers}`: `waiting` when independent families are missing or an author
+    family is unknown, with the missing count — never an implicit admission.
+    `reviewers` names only the automatic reviewers of this call; `manual` the
+    manual seats that count; `families` the eligible automatic families
+    (outside the authors and the manual seats). With the manual seats, that
+    count is the independent families available on this head: a reviewer's
+    correction that makes the reviewer an author of the head removes one, so
+    it is receivable only if the rest still covers the required opinions
+    (canon §2, #2670).
     """
     if type(required) is not int or required not in (0, 1, 2):
         raise DesignationError("required reviews must be 0, 1 or 2, not %r" % (required,))
     names, forbidden = families_of(authors)
+    fixer_names = names_of(fixers)
+    forbidden = forbidden | families_of(fixers)[1]
+    seats = manual_seats(already, authors=authors, fixers=fixers, families=families)
     out = {"state": NONE, "required": required, "reviewers": [], "missing": 0,
-           "why": "no review required", "forbidden": sorted(forbidden)}
+           "manual": seats, "why": "no review required",
+           "forbidden": sorted(forbidden), "families": [],
+           "fixers": sorted(fixer_names)}
     if required == 0:
+        return out
+    remaining = max(required - len(seats), 0)
+    if remaining == 0:
+        out.update({"state": DESIGNATED, "missing": 0,
+                    "why": "manual reviewer(s) already cover the required reviews"})
         return out
     unknown = unknown_families(authors)
     if unknown:
         # An author with no known real family: independence is not proven,
         # so we wait instead of discarding the only name (canon §2).
-        out.update({"state": WAITING, "missing": required,
+        out.update({"state": WAITING, "missing": remaining,
                     "why": "author family unknown: %s" % ", ".join(unknown)})
         return out
+    seat_names = {row["name"] for row in seats}
+    seat_families = {row["family"] for row in seats}
     eligible = [c for c in candidates or ()
-                if c.eligible(forbidden_names=names, forbidden_families=forbidden,
+                if c.eligible(forbidden_names=names | seat_names | fixer_names,
+                              forbidden_families=forbidden | seat_families,
                               families=families)]
-    # a single candidate per family: the least loaded, then the name
+    # #2668: a family's advance over its plan pace (points), lower is further
+    # behind. An unreadable or stale reading (#1561) is neutral: 0, as if at
+    # pace, so the load and the name decide. A model-scoped value is selected
+    # by the candidate's own model.
+    pace = _normalise_advances(advances)
+    # a single candidate per family: the applicable pace first (cx3 B/P1: a
+    # Fable bucket must not make a less-loaded Fable agent hide a further
+    # behind Opus agent of the same family), then the least loaded, then the
+    # name.
     best: dict[str, Candidate] = {}
     for candidate in eligible:
         family = candidate.family.strip().lower()
         current = best.get(family)
-        if current is None or (candidate.load, candidate.name) < (current.load, current.name):
+        if current is None or ((_advance_of(candidate, pace), candidate.load,
+                                candidate.name)
+                               < (_advance_of(current, pace), current.load,
+                                  current.name)):
             best[family] = candidate
     ordered = [best[family] for family in sorted(best)]
-    ordered.sort(key=lambda c: (c.load, c.name))
-    chosen = ordered[:required]
+    # pace first, then load, then name; a family absent from `pace` is neutral
+    ordered.sort(key=lambda c: (_advance_of(c, pace), c.load, c.name))
+    chosen = ordered[:remaining]
     out["reviewers"] = [{"name": c.name, "family": c.family} for c in chosen]
-    if len(chosen) < required:
+    out["families"] = sorted(best)
+    if len(chosen) < remaining:
+        missing_why = ("%d independent %s missing: %d eligible famil%s (%s), "
+                       "forbidden %s" % (
+                           remaining - len(chosen),
+                           "review" if remaining == 1 else "reviews",
+                           len(ordered), "y" if len(ordered) == 1 else "ies",
+                           ", ".join(sorted(best)) or "none",
+                           ", ".join(sorted(forbidden | seat_families)) or "none"))
+        if fixer_names:
+            missing_why += " (corrector(s) excluded: %s)" % ", ".join(sorted(fixer_names))
         out.update({
             "state": WAITING,
-            "missing": required - len(chosen),
+            "missing": remaining - len(chosen),
             "reviewers": [],
-            "why": ("%d independent %s missing: %d eligible famil%s (%s), "
-                    "forbidden %s" % (
-                        required - len(chosen), "review" if required == 1 else "reviews",
-                        len(ordered), "y" if len(ordered) == 1 else "ies",
-                        ", ".join(sorted(best)) or "none",
-                        ", ".join(sorted(forbidden)) or "none")),
+            "why": missing_why,
         })
         return out
-    out.update({"state": DESIGNATED,
-                "why": "designated %d reviewer(s)" % len(chosen)})
+    why = "designated %d reviewer(s)" % len(chosen)
+    if fixer_names:
+        why += " (corrector(s) excluded: %s)" % ", ".join(sorted(fixer_names))
+    if pace:
+        reading = ["%s %+.0f pt" % (c.family.strip().lower(), _advance_of(c, pace) * 100)
+                   for c in chosen if c.family.strip().lower() in pace]
+        if reading:
+            why += " (plan pace: %s)" % ", ".join(reading)
+    # #3004: the journal (why) keeps the load each chosen reviewer was retained
+    # with, so a designation can be audited against the reviewer's real queue.
+    if chosen:
+        why += " (load: %s)" % ", ".join(
+            "%s %d" % (c.name, max(int(c.load or 0), 0)) for c in chosen)
+    out.update({"state": DESIGNATED, "why": why})
     return out
 
 
@@ -367,13 +579,22 @@ def select(*, required: int, authors: Iterable = (), candidates: Iterable = (),
 
 def reviewer_message(lot: dict, *, freeze: Mapping, required: int, rank: int,
                      reviewer: Mapping, authors: Iterable = (), base: str = "",
-                     risk: str = "", policy_ref: str = "") -> str:
+                     risk: str = "", policy_ref: str = "",
+                     eligible_families: Optional[int] = None) -> str:
     """The mail that hands the reviewer the exact head and its place.
 
     The SHA is written in full, with its `frozen` milestone: the verdict will
     have to cite it as-is (`ameesh work milestone <lot> verdict ok --sha <sha>`).
-    The reviewer who fixes becomes an author of their fix: their own opinion no
-    longer counts (canon §2), the next selection will discard them.
+    Any correction makes the reviewer an author of the new head, whatever its
+    size (canon §2, #2888): their own opinion no longer counts and their family
+    is no longer eligible for the opinions on that head. `eligible_families` is
+    the number of independent families available on this head (automatic and
+    manual seats): if the correction would leave fewer than `required`
+    families, the mail tells the reviewer not to push it and to return it to
+    the author instead (canon §2, #2670). Without the count, the mail states
+    the rule alone. The `~50 lines` threshold only says whether a correction is
+    a first-round fix or goes back to the author; it never keeps a family
+    eligible.
     """
     sha = str((freeze or {}).get("sha") or "")
     fid = (freeze or {}).get("id")
@@ -404,13 +625,37 @@ def reviewer_message(lot: dict, *, freeze: Mapping, required: int, rank: int,
         "- render the verdict: `ameesh work milestone %s verdict ok|blocked --sha %s`;"
         % (row.get("id"), sha),
         "- fix a blocking defect yourself and push to the lot branch "
-        "(canon §2): you then become the author of your fix, your opinion on the "
-        "new head no longer counts, another reviewer takes over;",
-        "- a fix longer than ~50 lines, or a design change, goes back to the author;",
-        "- in a sensitive class, the second family reviews the lot **with** your fix, "
-        "in the same round, distinct from every author;",
+        "(canon §2): **any correction makes you an author of the new head**, "
+        "whatever its size — your own opinion no longer counts and your family "
+        "is no longer eligible for the opinions on that head; the second family "
+        "reviews the lot **with** your fix, in the same round;",
+        "- a fix longer than ~50 lines, or a design change, is not a first-round "
+        "correction: it goes back to the author;",
         "- your commits carry their exact origin (`ameesh provenance show --commit "
-        "<sha>`): by fixing you become an author of the new head;",
+        "<sha>`): the next designation reads it to establish who authored the "
+        "head;",
+    ]
+    if eligible_families is not None:
+        available = max(int(eligible_families), 0)
+        remaining = max(available - 1, 0)
+        if remaining < required:
+            lines.append(
+                "- **do not push this correction**: it would leave %d "
+                "independent famil%s for %d required opinion(s), and the merge "
+                "gate could not be satisfied — return the defect to the author, "
+                "who fixes it and freezes a new head (canon §2, #2670/#2888);" % (remaining, "y" if remaining == 1 else "ies", required))
+        else:
+            lines.append(
+                "- this correction is receivable: it leaves %d independent "
+                "famil%s for %d required opinion(s) (canon §2, #2670/#2888);"
+                % (remaining, "y" if remaining == 1 else "ies", required))
+    else:
+        lines.append(
+            "- any correction makes you an author of the new head: do not push "
+            "one that would leave fewer independent families than required "
+            "opinions (canon §2, #2670/#2888) — return it to the author, who "
+            "fixes it and freezes a new head;")
+    lines += [
         "- a non-blocking defect goes to the backlog, it does not block the merge;",
         "- do not rerun the suites: targeted tests are the author's job, CI "
         "runs on the frozen head once the required opinions are acquired.",
@@ -466,8 +711,11 @@ def manual_reviewer_message(lot: Mapping, *, freeze: Optional[Mapping] = None,
         "To do:",
         "- read the diff of the frozen head and check the edge cases;",
         "- a blocking defect: fix it yourself and push to the lot branch "
-        "(canon §2); a fix longer than ~50 lines, or a design change, goes back "
-        "to the author;",
+        "(canon §2). Any correction makes you an author of the new head: your "
+        "own opinion no longer counts and your family is no longer eligible; "
+        "a fix longer than ~50 lines, a design change, or a correction that "
+        "would leave fewer independent families than required opinions goes "
+        "back to the author (canon §2, #2670/#2888);",
         "- a non-blocking defect goes to the backlog, it does not block the merge;",
         "- do not rerun the suites: targeted tests are the author's job, CI runs "
         "on the frozen head once the required opinions are acquired.",
@@ -592,14 +840,17 @@ class Port(Protocol):
     def commit(self, lot: int, *, freeze: Mapping, required: int, state: str,
                reviewers: Sequence[Mapping], missing: int, why: str,
                authors: Sequence[Mapping], policy_ref: str = "",
-               notify: str = "", messages: Sequence[Mapping] = ()) -> dict:
+               notify: str = "", messages: Sequence[Mapping] = (),
+               unknown_authors: Sequence[str] = ()) -> dict:
         """Writes the freeze's designation in one transaction and returns its shape."""
 
 
 def apply(lot_item: Mapping, *, policy, paths: Iterable[str], port: Port,
           freeze_sha: str, authors: Iterable = (), candidates: Iterable = (), risk: str = "light",
           base: str = "", policy_ref: str = "", notify: str = "",
-          unknown_authors: Iterable = (), families=KNOWN_FAMILIES) -> dict:
+          unknown_authors: Iterable = (), families,
+          already: Iterable = (), fixers: Iterable = (), required: Optional[int] = None,
+          advances: Optional[Mapping] = None) -> dict:
     """Designates the reviewers of the lot's latest freeze, or says why it waits.
 
     `policy` carries the already parsed rules (`Rule` or `{rules: [...]}`
@@ -609,10 +860,33 @@ def apply(lot_item: Mapping, *, policy, paths: Iterable[str], port: Port,
     `Port`). Returns the designation: `{state, required, reviewers, missing,
     why, freeze}` with `replayed` when it already existed.
 
+    `required` is the count already read by the policy reader
+    (`mechanics.reviews_for`) and includes the light floor (#2642) and the
+    critical floor of the merge gate (#2627): it is authoritative and overrides
+    the count read from the rules. Without it, the count comes from the rules
+    alone (pure callers). It must be 0, 1 or 2; without a changed path nothing
+    is due, whatever the caller's floor.
+
     `unknown_authors` names the commits of the freeze whose exact provenance
     (#1465) is unknown: without it, a reviewer's independence cannot be
     established, so the designation waits instead of guessing — an explicit
     state, never a fallback.
+
+    `already` carries the manual reviewers already designated (#2627): the ones
+    that prove an independent family cover a seat, and only the missing seats
+    are selected. None is ever removed, and two manual reviewers of the same
+    family count one seat.
+
+    `fixers` names the designated reviewers whose small first-round correction
+    is an authored commit of the head (#2739/#2888): their family is forbidden
+    like any author's family, and the exact agent is never designated again.
+
+    `advances` maps a family to its advance over the plan pace, in points
+    (`review_pace`, #2668), or to a `{scope: advance}` mapping whose scoped
+    buckets are selected by the candidate's model: the selection prefers the
+    family furthest behind, the load only breaking a tie. A family without a
+    current reading is neutral, and the pace never makes an eligible family
+    ineligible: two required opinions still take two distinct families.
 
     The freeze is re-read **once**, and the provided inputs (paths, authors,
     class) are those of this freeze: if the `Port` refuses a freeze that has
@@ -654,13 +928,21 @@ def apply(lot_item: Mapping, *, policy, paths: Iterable[str], port: Port,
             "the inputs of lot #%d were collected for freeze %s, the last freeze is %s:"
             " nothing written; recollect the paths, authors and class of the new"
             " freeze, then retry" % (lot, expected[:12], sha[:12]))
-    required = required_count(rules, paths)
+    paths = tuple(paths or ())
+    # Sans chemin changé il n'y a rien à relire, quel que soit le plancher.
+    if not paths:
+        required = 0
+    elif required is None:
+        required = required_count(rules, paths)
+    if type(required) is not int or required not in (0, 1, 2):
+        raise DesignationError("required reviews must be 0, 1 or 2, not %r" % (required,))
     if risk != "light" and required == 0:
         raise DesignationError(
             "review count unknown for a non-light lot (#%d, class %s)" % (lot, risk))
     if required == 0:
         return {"state": NONE, "required": 0, "reviewers": [], "missing": 0,
-                "why": "light lot: no review before merge", "freeze": freeze}
+                "why": ("light lot: no pre-merge reviewer is due (the other-family"
+                        " review happens after merge)"), "freeze": freeze}
     existing = port.recorded(lot, freeze["id"])
     if existing and existing.get("state") == DESIGNATED:
         out = dict(existing)
@@ -672,10 +954,11 @@ def apply(lot_item: Mapping, *, policy, paths: Iterable[str], port: Port,
         why = ("author provenance unknown for %d commit(s) of the frozen range: %s"
                % (len(unknown), ", ".join(unknown[:5])))
         selection = {"state": WAITING, "required": required, "reviewers": [],
-                     "missing": required, "why": why}
+                     "missing": required, "manual": [], "why": why}
     else:
         selection = select(required=required, authors=authors, candidates=candidates,
-                           families=families)
+                           families=families, already=already, fixers=fixers,
+                           advances=advances)
     if selection["state"] == WAITING and existing:
         # The waiting state of this freeze is already recorded and notified: we
         # do not send a second one, but the selection was retried — if capacity
@@ -684,16 +967,29 @@ def apply(lot_item: Mapping, *, policy, paths: Iterable[str], port: Port,
         out["replayed"] = True
         return out
     state = selection["state"]
+    if state == DESIGNATED and not selection["reviewers"]:
+        # The manual reviewers already cover every required seat (#2627): no
+        # automatic reviewer, no mail, no designation mark to write.
+        return {"state": "manual", "required": required, "reviewers": [],
+                "missing": 0, "manual": [dict(row) for row in selection["manual"]],
+                "why": selection["why"], "freeze": freeze}
     messages = []
     if state == DESIGNATED:
-        for rank, reviewer in enumerate(selection["reviewers"], start=1):
+        first_rank = len(selection.get("manual") or ()) + 1
+        # The independent families available on this head: the manual seats and
+        # the automatic families. Any reviewer correction authors the head and
+        # removes its own family from the opinions (canon §2, #2670/#2888).
+        eligible_families = (len(selection.get("manual") or ())
+                             + len(selection.get("families") or ()))
+        for rank, reviewer in enumerate(selection["reviewers"], start=first_rank):
             messages.append({
                 "to": reviewer["name"],
                 "family": reviewer["family"],
                 "kind": REQUEST_KIND,
                 "body": reviewer_message(item, freeze=freeze, required=required,
                                          rank=rank, reviewer=reviewer, authors=authors,
-                                         base=base, risk=risk, policy_ref=policy_ref),
+                                         base=base, risk=risk, policy_ref=policy_ref,
+                                         eligible_families=eligible_families),
             })
     else:
         messages.append({
@@ -708,7 +1004,8 @@ def apply(lot_item: Mapping, *, policy, paths: Iterable[str], port: Port,
         return port.commit(lot, freeze=freeze, required=required, state=state,
                            reviewers=selection["reviewers"], missing=selection["missing"],
                            why=selection["why"], authors=authors, policy_ref=policy_ref,
-                           notify=notify, messages=tuple(messages))
+                           notify=notify, messages=tuple(messages),
+                           unknown_authors=tuple(unknown))
     except StaleFreeze as exc:
         # Nothing was written. The provided inputs held for the old freeze:
         # recollect them for the new one before replaying (B1, codex review cx2).

@@ -13,7 +13,8 @@
 #                migrations de REF (défaut HEAD, comme installer), lancées
 #                depuis son instantané AVANT de l'installer : base du mesh
 #                (UNE fois), puis ancienne
-#                base ; refusé si l'une n'est pas additive (voir MIGRER_APRES) ;
+#                base ; refusé si l'une n'est pas additive — garde inconditionnelle,
+#                MIGRER_APRES ne la désactive jamais (docs/BASCULE.md, L232b) ;
 #                --additif-seulement garde ce refus même quand REF est déjà
 #                installé (staging : des VM tournent encore le code précédent) ;
 #                si la sonde d'auto-prise du code installé échoue après la
@@ -27,7 +28,9 @@
 #   role         rôle superviseur réappliqué, sur chaque base où il existe
 #   redemarrer   exécuteurs du poste un par un (arrêt prouvé avant chaque
 #                démarrage), puis notify, puis les exécuteurs de l'ancienne base
-#   controler    doctor, budget, accounts list, projects, alerts
+#                refusé depuis une unité ameesh-* (risque de tuer le script)
+#   controler    doctor, budget, accounts list, projects, alerts ; vérifie aussi
+#                le venv réellement exécuté par le MainPID de notify
 #   retour       bascule en arrière vers le venv précédent conservé (sans pip),
 #                puis redémarre (sans toucher aux bases : 0041 à 0047 sont
 #                additives)
@@ -330,7 +333,7 @@ installer() {
 # when the user manager accepts it, and only fall back to the direct call in a
 # plain shell or where systemd-run is unavailable (tests, CI).
 redemarrer_urgence() {
-  local unite="ameesh-maj-urgence-$$" env_args=()
+  local unite="poste-maj-urgence-$$" env_args=()
   [ -n "${BASCULE_ENV:-}" ] && env_args+=(--setenv=BASCULE_ENV="$BASCULE_ENV")
   [ -n "${AMEESH_CONFIG:-}" ] && env_args+=(--setenv=AMEESH_CONFIG="$AMEESH_CONFIG")
   if command -v systemd-run >/dev/null 2>&1 \
@@ -340,7 +343,7 @@ redemarrer_urgence() {
     echo "redémarrage terminé dans l'unité transitoire $unite ; journalctl --user -u $unite" >&2
     return 0
   fi
-  echo "unité transitoire indisponible ou en échec : redémarrage direct (un agent lancé depuis son propre exécuteur serait interrompu)." >&2
+  echo "unité transitoire indisponible ou en échec : tentative directe, refusée depuis une unité ameesh-*." >&2
   # A fresh dispatcher preserves errexit even when this function is tested
   # by `if ! redemarrer_urgence` (Bash disables it throughout that call).
   "$ICI/poste.sh" redemarrer
@@ -598,7 +601,24 @@ redemarrer_liste() {
   done
 }
 
+# #2950 : ne jamais arrêter le cgroup qui héberge le script de redémarrage.
+# Le nom de l'unité transitoire d'urgence est hors de cet espace ; un appel
+# direct depuis un agent est refusé AVANT tout arrêt (y compris le repli #2357).
+verifier_hors_agent() {
+  local groupes
+  groupes=$(cat "/proc/$$/cgroup") \
+    || { echo "cgroup illisible : redémarrage refusé, aucun arrêt effectué" >&2; return 1; }
+  [ -n "$groupes" ] \
+    || { echo "cgroup vide : redémarrage refusé, aucun arrêt effectué" >&2; return 1; }
+  if [[ "$groupes" =~ /ameesh-[^/[:space:]]*\.(service|scope)(/|$|[[:space:]]) ]]; then
+    echo "redémarrage refusé depuis une unité ameesh-* : le script serait tué avec son exécuteur." >&2
+    echo "Relancer depuis un terminal indépendant ou une unité transitoire poste-maj-* (systemd-run --user --collect --unit poste-maj-<identifiant>), puis terminer le tour ; suivre son journal." >&2
+    return 1
+  fi
+}
+
 redemarrer() {
+  verifier_hors_agent || return 1
   # shellcheck source=bail.sh
   . "$ICI/bail.sh"
   local unites
@@ -621,6 +641,18 @@ redemarrer() {
   fi
 }
 
+# L'ExecStart peut pointer vers le lanceur stable alors que le processus
+# vivant garde l'ancien venv. Ni ExecStart ni /proc/PID/exe seuls ne le prouvent.
+controler_notify() {
+  local pid apres
+  systemctl --user is-active --quiet ameesh-notify.service || return 1
+  pid=$(systemctl --user show -p MainPID --value ameesh-notify.service) || return 1
+  python3 "$ICI/notify-venv.py" "$pid" "$VENV" || return 1
+  apres=$(systemctl --user show -p MainPID --value ameesh-notify.service) || return 1
+  [ "$pid" = "$apres" ] \
+    || { echo "ameesh-notify : MainPID changé pendant le contrôle, relancer controler" >&2; return 1; }
+}
+
 controler() {
   local echecs=()
   verif() { etape "$*"; "$@" || echecs+=("$*"); }
@@ -629,6 +661,7 @@ controler() {
   verif "$AMEESH" accounts list
   verif "$AMEESH" projects
   verif "$AMEESH" alerts
+  verif controler_notify
   etape "exécuteurs en échec"
   systemctl --user list-units 'ameesh-*' --state=failed --plain --no-legend || true
   if ancienne; then
@@ -642,6 +675,7 @@ controler() {
 }
 
 retour() {
+  verifier_hors_agent || return 1
   local precedent
   precedent=$(cat "$TRAVAIL/precedent" 2>/dev/null || true)
   [ -n "$precedent" ] && [ -d "$PARTAGE/$precedent" ] \

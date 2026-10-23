@@ -14,9 +14,11 @@ import tempfile
 import unittest
 from datetime import datetime
 from types import SimpleNamespace
+from unittest import mock
 from zoneinfo import ZoneInfo
 
-from ameesh import canon_sync, mechanics
+from ameesh import canon, canon_sync, mechanics
+from ameesh.deadline import Deadline
 
 MECHANICS = """schema: ameesh-mechanics/1
 timezone: Europe/Paris
@@ -134,6 +136,55 @@ class MechanicsTest(unittest.TestCase):
         return _Repo(self.tmp.name, **kwargs)
 
 
+class TestDeadline(MechanicsTest):
+    """#2665 : les lectures du canon ne repartent pas de GIT_TIMEOUT."""
+
+    def test_an_expired_deadline_refuses_before_git(self):
+        repo = self.repo()
+        head = repo.git("rev-parse", "HEAD")
+        with mock.patch.object(canon, "_git") as git:
+            with self.assertRaises(mechanics.MechanicsError) as caught:
+                mechanics.load(repo.root, head, "ameesh", deadline=Deadline(0.0))
+        self.assertIn("deadline", str(caught.exception))
+        git.assert_not_called()
+
+    def test_each_canon_read_takes_only_the_remaining_time(self):
+        repo = self.repo()
+        head = repo.git("rev-parse", "HEAD")
+        now = [1000.0]
+        seen = []
+        real = canon._git
+
+        def timed(repo_path, *args, **kwargs):
+            seen.append(kwargs.get("timeout"))
+            now[0] += 1.0
+            return real(repo_path, *args, **kwargs)
+
+        with mock.patch.object(canon, "_git", side_effect=timed):
+            loaded = mechanics.load(repo.root, head, "ameesh",
+                                    deadline=Deadline(50.0, clock=lambda: now[0]))
+        self.assertEqual(loaded.commit, head)
+        self.assertGreaterEqual(len(seen), 4)
+        self.assertEqual(seen[0], 50.0)
+        self.assertLess(seen[-1], 50.0)
+        self.assertTrue(all(0 < value <= 50.0 for value in seen))
+
+    def test_a_git_timeout_is_a_named_mechanics_error(self):
+        repo = self.repo()
+        head = repo.git("rev-parse", "HEAD")
+        now = [1000.0]
+
+        def slow(repo_path, *args, **kwargs):
+            now[0] += kwargs.get("timeout", 0.0)
+            raise canon.GitError("git ls-tree: timed out")
+
+        with mock.patch.object(canon, "_git", side_effect=slow):
+            with self.assertRaises(mechanics.MechanicsError) as caught:
+                mechanics.load(repo.root, head, "ameesh",
+                               deadline=Deadline(5.0, clock=lambda: now[0]))
+        self.assertIn("deadline", str(caught.exception))
+
+
 class TestCutoffs(MechanicsTest):
     def test_cutoffs_and_timezone_follow_the_canon(self):
         repo = self.repo()
@@ -238,6 +289,39 @@ class TestRules(MechanicsTest):
                          mechanics.ReviewNeed("light", 0))
         self.assertEqual(rules.reviews_for(["src/ameesh/conversation.py"]),
                          mechanics.ReviewNeed("sensitive", 1))
+
+    def test_light_reviews_is_the_floor_without_reclassifying(self):
+        # #2642 : le plancher d'avis d'un lot léger vient du canon, pas d'une
+        # règle fourre-tout `**` qui reclasserait tout chemin en sensible.
+        text = MECHANICS.replace("  distinct_families: true",
+                                 "  distinct_families: true\n  light_reviews: 1")
+        repo = self.repo(mechanics_text=text)
+        rules = mechanics.load(repo.root, repo.git("rev-parse", "HEAD"), "ameesh")
+        self.assertEqual(rules.light_reviews, 1)
+        self.assertEqual(rules.reviews_for(["README.md"]),
+                         mechanics.ReviewNeed("light", 1))
+        # Une règle de chemin reste prioritaire et reclassifie : le plancher
+        # n'est pas un motif fourre-tout.
+        self.assertEqual(rules.reviews_for(["src/ameesh/conversation.py"]),
+                         mechanics.ReviewNeed("sensitive", 1))
+        self.assertEqual(rules.reviews_for(["src/ameesh/migrations/0001.sql"]),
+                         mechanics.ReviewNeed("sensitive", 2))
+        # Le plancher léger ne couvre jamais un chemin sensible sans règle.
+        repo = self.repo(
+            mechanics_text=text,
+            federation_text=_without_train_path("src/ameesh/mechanics.py"))
+        rules = mechanics.load(repo.root, repo.git("rev-parse", "HEAD"), "ameesh")
+        with self.assertRaises(mechanics.MechanicsError):
+            rules.reviews_for(["src/ameesh/mechanics.py"])
+
+    def test_light_reviews_is_declared_zero_or_one(self):
+        for value in ('"1"', "true", "2", "-1", "1.0", "null"):
+            with self.subTest(value=value):
+                text = MECHANICS.replace(
+                    "  distinct_families: true",
+                    "  distinct_families: true\n  light_reviews: %s" % value)
+                with self.assertRaises(mechanics.MechanicsError):
+                    mechanics.compile_document(text)
 
     def test_non_light_path_without_rule_is_refused(self):
         # mechanics.py est classé sensible mais aucune règle d'avis ne le couvre.

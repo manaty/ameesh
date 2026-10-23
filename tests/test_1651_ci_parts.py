@@ -26,7 +26,7 @@ import time
 import unittest
 from unittest import mock
 
-from ameesh import ci_parts, land, merge_queue, plan_git, radar, resolutions
+from ameesh import ci_parts, land, merge_queue, plan_git, platform, radar, resolutions
 
 from .test_l160b_radar import _git, _write
 from .test_l160e2_land import _Land
@@ -685,7 +685,7 @@ time.sleep(600)
 '''
 
 
-@unittest.skipUnless(os.path.isdir("/proc"), "Linux: /proc is read to find the grandchild")
+@unittest.skipUnless(hasattr(os, "killpg"), "process groups")
 class TimeoutGroupTest(_Contract):
     """N4 de #1666 : au délai dépassé, le sélecteur **et ses petits-enfants**
     meurent — `subprocess.run(timeout=…)` ne tuait que l'enfant direct."""
@@ -693,15 +693,11 @@ class TimeoutGroupTest(_Contract):
     marker = "ameesh1666grandchild"
 
     def _grandchild(self):
-        for name in os.listdir("/proc"):
-            if not name.isdigit():
-                continue
-            try:
-                with open("/proc/%s/cmdline" % name, "rb") as handle:
-                    if self.marker.encode() in handle.read():
-                        return int(name)
-            except OSError:
-                continue
+        # L68: process list and argv through the platform layer (psutil on
+        # macOS, /proc fallback on Linux), never a direct /proc scan.
+        for proc in platform.process_table():
+            if self.marker in platform.command_line(proc["pid"]):
+                return proc["pid"]
         return None
 
     def _reap(self):

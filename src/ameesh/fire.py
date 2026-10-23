@@ -61,6 +61,10 @@ FIRE_KINDS = (FIRE, UNFIRE)
 MAX_LOTS = 1000
 #: durée du bail d'une opération de feu
 LOCK_TTL_S = 120.0
+#: L165 (EP4) : marge du bail élu renouvelée juste avant `gh pr merge`
+#: (timeout de 120 s + relecture de la PR). La course résiduelle est
+#: documentée dans `docs/HOST-HANDOFFS.md`.
+FIRE_CALL_MARGIN_S = 180.0
 #: résultats qu'un passage n'a pas à journaliser
 QUIET = ("idle", "armed", "queued", "busy", "withdrawn")
 #: résultats qu'un passage de l'exécuteur dit dans son journal : état changé,
@@ -185,15 +189,22 @@ def give(db, lot: int, *, sha: str, actor: str, note: str = "", repo: str | None
     if handle is None:
         raise FireError("another fire operation holds lot #%d: retry once it is done" % lot)
     try:
+        # L165 (EP4) : le feu du pilote est un geste hors base (il arme la
+        # fusion) ; l'époque du bail élu est vérifiée et journalisée avant.
+        from . import pilot_gesture
+        try:
+            fence = pilot_gesture.gate(None, db, "merge", "fire #%d" % lot)
+        except pilot_gesture.GestureRefused as exc:
+            raise FireError(str(exc)) from exc
         return _give_locked(db, lot, sha=sha, actor=actor, note=note, repo=repo,
-                            exception=exception, reason=reason)
+                            exception=exception, reason=reason, fence=fence)
     finally:
         _unlock(handle)
 
 
 def _give_locked(db, lot: int, *, sha: str, actor: str, note: str = "",
                  repo: str | None = None, exception: str = "",
-                 reason: str = "") -> dict:
+                 reason: str = "", fence=None) -> dict:
     item = work.get(db, lot)
     if item is None:
         raise FireError("lot #%d not found" % lot)
@@ -230,14 +241,32 @@ def _give_locked(db, lot: int, *, sha: str, actor: str, note: str = "",
             target = plan_git.default_target(repo) or ""
         except plan_git.MergeProbeError:
             target = ""
-    try:
-        packet_guard.check_merge(db, lot, item.get("branch") or "", target, frozen,
-                                 exception=exception, reason=reason, actor=actor)
-    except packet_guard.PacketGuardError as exc:
-        raise FireError(str(exc)) from exc
     full = merge_queue.pinned(repo, wanted) if repo else None
-    return work.milestone(db, lot, FIRE, sha=full or wanted, actor=actor,
-                          note=(note or "").strip())
+
+    def check(database):
+        try:
+            packet_guard.check_merge(database, lot, item.get("branch") or "", target,
+                                     frozen, exception=exception, reason=reason,
+                                     actor=actor)
+        except packet_guard.PacketGuardError as exc:
+            raise FireError(str(exc)) from exc
+
+    if fence is None:
+        check(db)
+        return work.milestone(db, lot, FIRE, sha=full or wanted, actor=actor,
+                              note=(note or "").strip())
+    # L165 (EP4) : la déclaration `--exception` de `check_merge` et le jalon
+    # sont des écritures du même geste ; hold, déclaration et jalon partagent
+    # la transaction gardée après les lectures de préparation (revue cx2 B3).
+    from . import pilot_gesture
+    with db.transaction() as tx:
+        try:
+            fence.hold(tx)
+        except pilot_gesture.GestureRefused as exc:
+            raise FireError(str(exc)) from exc
+        check(tx)
+        return work.milestone(tx, lot, FIRE, sha=full or wanted, actor=actor,
+                              note=(note or "").strip())
 
 
 def withdraw(db, lot: int, *, actor: str, note: str = "", repo: str | None = None) -> dict:
@@ -248,14 +277,28 @@ def withdraw(db, lot: int, *, actor: str, note: str = "", repo: str | None = Non
     if handle is None:
         raise FireError("another fire operation holds lot #%d: retry once it is done" % lot)
     try:
+        from . import pilot_gesture
+        try:
+            fence = pilot_gesture.gate(None, db, "merge", "unfire #%d" % lot)
+        except pilot_gesture.GestureRefused as exc:
+            raise FireError(str(exc)) from exc
         item = work.get(db, lot)
         if item is None:
             raise FireError("lot #%d not found" % lot)
         fire = active(work.milestones(db, lot))
         if fire is None:
             raise FireError("lot #%d carries no active fire: nothing to withdraw" % lot)
-        return work.milestone(db, lot, UNFIRE, sha=_norm(fire.get("sha")), actor=actor,
-                              note=(note or "withdrawn by %s" % actor).strip())
+        if fence is None:
+            return work.milestone(db, lot, UNFIRE, sha=_norm(fire.get("sha")), actor=actor,
+                                  note=(note or "withdrawn by %s" % actor).strip())
+        with db.transaction() as tx:
+            try:
+                fence.hold(tx)
+            except pilot_gesture.GestureRefused as exc:
+                raise FireError(str(exc)) from exc
+            return work.milestone(tx, lot, UNFIRE, sha=_norm(fire.get("sha")),
+                                  actor=actor,
+                                  note=(note or "withdrawn by %s" % actor).strip())
     finally:
         _unlock(handle)
 
@@ -489,7 +532,8 @@ def _pr_status(slug: str, branch: str, *, gh) -> dict | None:
     if row is None:
         return None
     from . import radar
-    rollup = radar.latest_rollup(row.get("statusCheckRollup"))
+    rollup = radar.merge_rollup(row.get("statusCheckRollup"), slug=slug,
+                                head=_norm(row.get("headRefOid")), branch=branch, gh=gh)
     pending = any((c.get("status") or "COMPLETED") != "COMPLETED"
                   or (c.get("state") or "") == "PENDING" for c in rollup)
     ci = "green" if radar.ci_green(rollup) else "pending" if pending or not rollup else "red"
@@ -605,14 +649,62 @@ def _method(project, info: dict) -> str:
     return allowed[0] if allowed else "merge"
 
 
-def _merge_pr(slug: str, status: dict, sha: str, method: str, *, gh) -> tuple:
+def _stacked_base_guard(slug: str, status: dict, target: str, default: str, *,
+                        gh) -> str:
+    """#2603 : refuse une fusion sur une base de travail déjà fusionnée dans la
+    cible par défaut (home#112/#113 après canon/2452) : le contenu atterrirait
+    sur une branche morte. La comparaison GitHub `base...default` rend `ahead`
+    ou `identical` quand la base est un ancêtre de la cible par défaut. Une
+    lecture impossible refuse : le doute ne fusionne pas sur une base morte."""
+    base = merge_queue._remote_branch(status.get("base") or "")
+    target = merge_queue._remote_branch(target or "")
+    default = merge_queue._remote_branch(default or "")
+    if not base or not target or base != target:
+        return ""
+    if not default:
+        return ("PR #%s targets %s, and the repository's default target is unknown: "
+                "nothing merged — read the default branch by hand"
+                % (status.get("number"), base))
+    if base == default:
+        return ""
+    proc = gh(["api", "repos/%s/compare/%s...%s" % (
+        slug, quote(base, safe=""), quote(default, safe=""))])
+    if proc.returncode != 0:
+        return ("PR #%s targets %s, not the default target %s, and the comparison cannot be "
+                "read (%s): nothing merged on a possibly dead base — check the PR by hand"
+                % (status.get("number"), base, default,
+                   (proc.stderr or proc.stdout or "").strip()[:200]))
+    try:
+        compared = land._json(proc, "gh api compare %s...%s" % (base, default), dict)
+    except land.LandError as exc:
+        return ("PR #%s targets %s, not the default target %s, and the comparison is "
+                "unreadable (%s): nothing merged on a possibly dead base"
+                % (status.get("number"), base, default, exc))
+    comparison = str(compared.get("status") or "")
+    if comparison not in ("ahead", "identical", "behind", "diverged"):
+        return ("PR #%s: comparison of %s with %s unreadable: nothing merged"
+                % (status.get("number"), base, default))
+    if comparison in ("ahead", "identical"):
+        return ("PR #%s targets %s, already merged into %s: merging it there would land its "
+                "content on a dead branch — retarget it (`gh pr edit --base %s %s`), then "
+                "freeze and re-review" % (status.get("number"), base, default, default,
+                                          status.get("number")))
+    return ""
+
+
+def _merge_pr(slug: str, status: dict, sha: str, method: str, *, gh,
+              target: str = "", default: str = "") -> tuple:
     """Fusionne la PR **maintenant**, sur la tête exacte `sha` (#1374, P1-4).
 
     C'est ce geste, et lui seul, qui est lié au feu : `--match-head-commit`
     est vérifié par GitHub au moment de la fusion, pas à l'armement. Laisser
     une auto-fusion armée entre deux passages ferait fusionner une tête
     poussée après le feu (GitHub ne la désarme pas pour un push d'un compte
-    avec droit d'écriture). Rend `(ok, detail)`."""
+    avec droit d'écriture). Rend `(ok, detail)`. #2603 : une base de travail
+    déjà fusionnée dans la cible par défaut refuse avant l'appel."""
+    refusal = _stacked_base_guard(slug, status, target, default, gh=gh)
+    if refusal:
+        return False, refusal
     proc = gh(["pr", "merge", str(status["number"]), "--repo", slug, "--%s" % method,
                "--match-head-commit", sha], timeout=120.0)
     if proc.returncode == 0:
@@ -636,7 +728,7 @@ def _disarm_auto(slug: str, status: dict, *, gh) -> tuple:
 # --------------------------------------------------------------------------
 
 def ready_verdicts(cfg, db, row: dict, marks: list, *, repo: str | None,
-                   project, target: str) -> tuple:
+                   project, target: str, base_sha: str | None = None) -> tuple:
     """La première porte, celle qui ne doit rien déclencher (#1374, B) : la
     classe du lot et les **avis requis** sur la tête gelée, comptés et
     indépendants (`merge_queue.review_gate`). Rend `(ok, raison, classe)`.
@@ -651,6 +743,12 @@ def ready_verdicts(cfg, db, row: dict, marks: list, *, repo: str | None,
     retard y ajouterait des commits déjà fusionnés, dont des chemins
     sensibles, et surclasserait le lot au-dessus de ses vrais avis.
 
+    #3091 : `base_sha` est la cible **déjà résolue** par l'appelant (le
+    `baseRefOid` de la PR pour l'auto-fusion d'un paquet). Elle sert de
+    révision de classe et de preuve de la base de composition ; la ref locale
+    peut être en retard, jamais cette lecture. Sans elle, la ref résolue par
+    `_class_base` fait foi, comme avant.
+
     Cette porte s'évalue **avant** toute PR, toute entrée en file et toute CI :
     un feu peut être enregistré au gel, mais rien ne part avant les avis."""
     lot = int(row["id"])
@@ -660,13 +758,48 @@ def ready_verdicts(cfg, db, row: dict, marks: list, *, repo: str | None,
     base = target or None
     if repo and target:
         base = merge_queue._class_base(repo, target) or target
+    class_sha = str(base_sha or "").strip() or None
+    if class_sha and repo:
+        class_sha = merge_queue.pinned(repo, class_sha) or class_sha
+    resolved = class_sha or (merge_queue.pinned(repo, base) if (repo and base) else None)
     klass = lot_class.of_lot(db, lot, cfg=cfg, item=row, repo=repo or None,
-                             base=base, head=head)
+                             base=target, base_sha=resolved or base, head=head)
     if str(klass.get("class") or "") == lot_class.RELEASE:
         return False, ("class: release (%s) — the release procedure belongs to the pilot: "
                        "a fire never arms an automatic merge on a release"
                        % (klass.get("why") or "release")), klass
-    gate = merge_queue.review_gate(db, marks, frozen, repo=repo, klass=klass, item=row)
+    gate_authors = {}
+    if frozen and merge_queue.required_verdicts(klass) > 0:
+        # #2803/#2766 (B cx1) : sur un véhicule de paquet, la porte borne
+        # elle-même la lecture au delta propre relu (`packet_reviews.need`).
+        # Pré-lire toute la plage du paquet agrège les familles des membres
+        # déjà relus et peut lever « famille ambiguë » avant que le périmètre
+        # ne soit déterminé : la lecture est reportée à la porte, qui la borne.
+        from . import packet_reviews
+        if not packet_reviews.is_vehicle(row):
+            # #1515 N1/B1 : la porte compte tous les auteurs du lot — détenteurs
+            # du journal et auteurs du delta gelé (fusions comprises, petit
+            # correctif de relecteur excepté, #2739) —, pas le seul assigné. Une
+            # provenance illisible refuse la porte. On lit même si la ligne
+            # courante porte une dispense : la porte relit la marque après les
+            # jalons (#2281) et une dispense périmée ne doit pas laisser la porte
+            # sur le seul assigné.
+            try:
+                authors, families = merge_queue._complete_authors(
+                    db, row, frozen, repo, target, klass=klass, marks=marks)
+            except merge_queue._ProvenanceError as exc:
+                return False, (
+                    "no review verdict ok on the freeze %s (class: %s): the complete "
+                    "authors of the lot cannot be established (%s), so no verdict can "
+                    "be proven independent (canon §2: independence is never assumed)"
+                    % (frozen[:12], klass.get("class") or "?", exc)), klass
+            gate_authors = {"authors": authors, "families": families,
+                            "authors_complete": True}
+    # #3091 : la base de composition du véhicule est prouvée sur cette cible
+    # résolue, jamais sur la ref du checkout.
+    gate = merge_queue.review_gate(db, marks, frozen, repo=repo, klass=klass,
+                                   item=row, cfg=cfg, target=resolved or base,
+                                   **gate_authors)
     if not gate["ok"]:
         return False, gate["why"], klass
     return True, "", klass
@@ -727,6 +860,38 @@ def _required_pairs(required) -> tuple:
     return tuple(pairs)
 
 
+def _latest_runs(runs) -> list:
+    """#3008 : les derniers check runs par (application, suite, nom), comme
+    `radar.latest_rollup` pour le rollup (#2524) : un re-run vert sur la même
+    tête remplace l'ancien run rouge de sa suite.
+
+    Seule une date strictement plus récente remplace une entrée. Suite
+    inconnue, date absente, invalide ou ex aequo : toutes les entrées
+    ambiguës restent, afin de ne jamais masquer un échec sur la foi de
+    l'ordre reçu."""
+    from datetime import datetime
+
+    groups = {}
+    for index, run in enumerate(runs or ()):
+        suite = run.get("check_suite_id")
+        key = (("suite", run.get("app_id"), suite, _rollup_name(run))
+               if suite is not None else ("unknown", index))
+        try:
+            stamp = datetime.fromisoformat(run.get("started_at").replace("Z", "+00:00"))
+            stamp = stamp.timestamp() if stamp.tzinfo is not None else None
+        except (AttributeError, TypeError, ValueError, OverflowError):
+            stamp = None
+        groups.setdefault(key, []).append((run, stamp))
+    latest = []
+    for entries in groups.values():
+        if any(stamp is None for _, stamp in entries):
+            latest.extend(run for run, _ in entries)
+        else:
+            newest = max(stamp for _, stamp in entries)
+            latest.extend(run for run, stamp in entries if stamp == newest)
+    return latest
+
+
 def _required_gap(required, rollup, provenance=None) -> list:
     """Les checks requis que `rollup` et `provenance` ne prouvent pas.
 
@@ -752,8 +917,9 @@ def _required_gap(required, rollup, provenance=None) -> list:
             if bad:
                 gaps.append("%s (%s)" % (name, ", ".join(bad)))
             continue
-        runs = [entry for entry in provenance or ()
-                if _rollup_name(entry) == name and entry.get("app_id") == app_id]
+        runs = _latest_runs([entry for entry in provenance or ()
+                             if _rollup_name(entry) == name
+                             and entry.get("app_id") == app_id])
         if not runs:
             providers = sorted({str(entry.get("app_id")) for entry in provenance or ()
                                 if _rollup_name(entry) == name
@@ -916,10 +1082,18 @@ def _head_check_runs(slug: str | None, sha: str, *, gh) -> list:
             if app_id is not None and (isinstance(app_id, bool)
                                        or not isinstance(app_id, int)):
                 raise land.LandError("gh api %s: malformed check run app" % path)
+            # #3008 : la date et la suite départagent un re-run sur la même tête
+            suite = run.get("check_suite")
+            suite_id = suite.get("id") if isinstance(suite, dict) else None
+            if isinstance(suite_id, bool) or not isinstance(suite_id, int):
+                suite_id = None
+            started = run.get("started_at")
             runs.append({"name": run["name"],
                          "status": str(run.get("status") or ""),
                          "conclusion": str(run.get("conclusion") or ""),
-                         "app_id": app_id})
+                         "app_id": app_id,
+                         "started_at": started if isinstance(started, str) else None,
+                         "check_suite_id": suite_id})
     return runs
 
 
@@ -1159,8 +1333,13 @@ def required_on_head(project, target: str, sha: str, *, gh) -> list:
         return []
     runs = _head_check_runs(slug, sha, gh=gh)
     statuses = _head_statuses(slug, sha, gh=gh)
-    rollup = ([{"__typename": "CheckRun", "name": run["name"], "status": run["status"],
-                "conclusion": run["conclusion"]} for run in runs] + statuses)
+    # #3008 : la date ne sert que si la suite est connue — sans elle,
+    # `latest_rollup` regrouperait deux workflows homonymes par le seul nom
+    rollup = ([dict({"__typename": "CheckRun", "name": run["name"],
+                     "status": run["status"], "conclusion": run["conclusion"]},
+                    **({"startedAt": run["started_at"], "checkSuiteId": run["check_suite_id"]}
+                       if run.get("check_suite_id") is not None else {}))
+               for run in runs] + statuses)
     return _required_gap(required, rollup, runs)
 
 
@@ -1504,6 +1683,49 @@ def _not_ready(db, row: dict, status, out: dict, why: str, *, gh, slug: str,
     return out
 
 
+def _queue_landing(cfg, db, row: dict, fire: dict, freeze: dict, status: dict, *,
+                   repo: str | None, project, target: str, path: str) -> bool:
+    """#3080: only the queue's clean two-parent landing preserves the fire.
+
+    Recompute its tree without checking out any branch. Remote objects and
+    the target are fetched into the radar clone; an unreadable proof raises
+    QueueError, so a transient read never withdraws an otherwise valid fire.
+    Conflict resolutions or extra edits require a new freeze and review.
+    """
+    if path != "queue" or not repo or getattr(project, "land", "pr") != "pr" \
+            or status.get("base") != land._branch_of(target):
+        return False
+    entry = next((r for r in storage.of(db).work.queue()
+                  if int(r["work_item_id"]) == int(row["id"])), None)
+    if not entry or entry.get("state") != "landing" \
+            or entry.get("target") != target \
+            or entry.get("source") != merge_queue.source_of(repo) \
+            or entry.get("frozen_id") != freeze.get("id") \
+            or not same_commit(entry.get("frozen_sha"), fire.get("sha"), repo) \
+            or not same_commit(entry.get("landing_sha"), status.get("head"), repo):
+        return False
+    from . import radar, resolutions
+    name = project.name if project is not None else os.path.basename(repo.rstrip("/"))
+    clone = resolutions.Replayer(repo, radar.clone_dir(cfg, name), target=target)
+    tips, where = merge_queue.fetch_fresh(repo, [row["branch"], target], clone, base=target)
+    head = merge_queue.pinned(where, status.get("head"))
+    frozen = merge_queue.pinned(where, fire.get("sha"))
+    if not head or not frozen or tips.get(row["branch"]) != head or not tips.get(target):
+        return False
+    parents = plan_git._out(where, "show", "-s", "--format=%P", head)
+    if parents is None:
+        raise merge_queue.QueueError("cannot read the queue landing's parents")
+    if parents.split() != [tips[target], frozen]:
+        return False
+    merged = resolutions._run(where, "merge-tree", "--write-tree", tips[target], frozen)
+    if merged.returncode not in (0, 1):
+        raise merge_queue.QueueError("cannot prove the queue landing's clean merge tree")
+    tree = plan_git._out(where, "show", "-s", "--format=%T", head)
+    if tree is None:
+        raise merge_queue.QueueError("cannot read the queue landing's tree")
+    return merged.returncode == 0 and resolutions._text(merged).strip() == tree
+
+
 def _act(cfg, db, row: dict, marks: list, *, gh, dry_run: bool, repo: str | None,
          cache: dict, handle=None) -> dict:
     lot = int(row["id"])
@@ -1515,7 +1737,17 @@ def _act(cfg, db, row: dict, marks: list, *, gh, dry_run: bool, repo: str | None
     if not branch:
         out.update(result="no-branch", detail="lot without branch: no PR to arm")
         return out
-    work_repo = _checkout(repo) if repo else _repo_of(db, row)
+    work_repo = _repo_of(db, row) if repo is None else _checkout(repo)
+    # #2535 : un `--repo` explicite qui n'est pas un checkout est un refus,
+    # jamais un repli silencieux sur le clone que le projet déclare
+    # (`radar.projects.<p>.repo`). Le pilote qui se trompe de dépôt verrait
+    # sinon le feu lire une autre copie que celle demandée et rendre un
+    # verdict de préparation trompeur.
+    if repo is not None and work_repo is None:
+        out.update(result="no-repository", detail=(
+            "--repo %s is not a git checkout: pass a path inside the lot's repository "
+            "(#2535: refusing to read the project's declared clone instead)" % repo))
+        return out
     slug = _slug(cfg, row, work_repo)
     if not slug:
         out.update(result="no-repository", detail="no GitHub repository known for this lot")
@@ -1565,17 +1797,23 @@ def _act(cfg, db, row: dict, marks: list, *, gh, dry_run: bool, repo: str | None
                            % (_norm((freeze or {}).get("sha"))[:12] or "—",
                               _norm(fire.get("sha"))[:12]),
                            status=status, gh=gh, slug=slug, dry_run=dry_run, handle=handle)
-    if status is not None and status.get("head") \
-            and not same_commit(status.get("head"), fire.get("sha"), work_repo):
-        return _invalidate(db, row, marks, fire,
-                           "the PR head moved to %s, the fire covers %s"
-                           % (status["head"][:12], _norm(fire.get("sha"))[:12]),
-                           status=status, gh=gh, slug=slug, dry_run=dry_run, handle=handle)
-
     info = _repo_info(slug, gh=gh, cache=cache)
     target = _target(row, project, work_repo, info)
     path, landing_why = landing_path(cfg, db, project, work_repo, slug)
     out["landing"] = path
+    if status is not None and status.get("head") \
+            and not same_commit(status.get("head"), fire.get("sha"), work_repo):
+        try:
+            landing = _queue_landing(cfg, db, row, fire, freeze, status, repo=work_repo,
+                                     project=project, target=target, path=path)
+        except merge_queue.QueueError as exc:
+            return _not_ready(db, row, status, out, str(exc), gh=gh, slug=slug,
+                              dry_run=dry_run, handle=handle)
+        if not landing:
+            return _invalidate(db, row, marks, fire,
+                               "the PR head moved to %s, the fire covers %s"
+                               % (status["head"][:12], _norm(fire.get("sha"))[:12]),
+                               status=status, gh=gh, slug=slug, dry_run=dry_run, handle=handle)
 
     # #2333 (canon §11 bis) : aucune fusion de lot directe hors paquet, même
     # pour un feu donné avant la garde ou avec une auto-fusion déjà armée. La
@@ -1760,7 +1998,20 @@ def _merge_direct(cfg, db, row: dict, marks: list, fire: dict, status: dict, *, 
     try:
         if not _renew(handle) or not _renew(cible, land.LOCK_TTL_S):
             return {"lot": lot, "result": "busy"}
-        ok, error = _merge_pr(slug, status, head, _method(project, info), gh=gh)
+        # L165 (EP4) : le passage peut être mené par une minuterie de rôle
+        # (`AMEESH_ROLE`) ; le bail élu est renouvelé juste avant l'appel
+        # GitHub, avec la marge de `gh pr merge` et de sa relecture.
+        from . import pilot_gesture
+        try:
+            fence = pilot_gesture.gate(cfg, db, "merge", "fire merge #%d" % lot,
+                                       project=(fresh_row.get("app") or None))
+            if fence is not None:
+                fence.hold(db, margin_s=FIRE_CALL_MARGIN_S)
+        except pilot_gesture.GestureRefused as exc:
+            return {"lot": lot, "result": "error", "error": str(exc)}
+        ok, error = _merge_pr(slug, status, head, _method(project, info), gh=gh,
+                              target=target,
+                              default=str(info.get("default_branch") or ""))
         if ok:
             out.update(result="merged", detail=error, sha=head)
             try:
@@ -1831,7 +2082,9 @@ def _queue(db, row: dict, marks: list, fire: dict, *, project, repo: str | None,
         return out
     from . import radar, resolutions
     name = project.name if project is not None else os.path.basename((repo or "project").rstrip("/"))
-    clone = resolutions.Replayer(repo, radar.clone_dir(cfg, name)) if repo else None
+    clone = resolutions.Replayer(
+        repo, radar.clone_dir(cfg, name),
+        target=getattr(project, "target", "") or "") if repo else None
     try:
         entered = merge_queue.enter(db, lot, repo=repo, actor=work.SYSTEM_SENDER,
                                     project=project, clone=clone, cfg=cfg)

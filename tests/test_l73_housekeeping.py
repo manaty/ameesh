@@ -10,6 +10,7 @@ import io
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -191,6 +192,27 @@ class DossiersTest(_Tmp):
                          {})
         xdg = menage.turn_env(self.cfg, menage.Policy(xdg_cache=True), "a1", {})
         self.assertEqual(xdg["XDG_CACHE_HOME"], os.path.join(cache, "xdg"))
+
+    @unittest.skipUnless(platform.is_linux(),
+                         "#2704 : les chemins tenus se lisent dans /proc (Linux)")
+    def test_nouvelle_session_ne_vide_pas_un_dossier_tmp_tenu(self):
+        """#2704 : une application lancée depuis le dossier temporaire de
+        l'agent (AppImage extraite) le tient hors tour ; la nouvelle session
+        ne le vide pas sous elle."""
+        pol = menage.Policy()
+        mine = menage.turn_env(self.cfg, pol, "a1", {})["TMPDIR"]
+        garde = os.path.join(mine, "garde")
+        _write(garde, 10)
+        proc = subprocess.Popen([sys.executable, "-c",
+                                 "import time; time.sleep(60)"], cwd=mine)
+        self.addCleanup(proc.wait)
+        self.addCleanup(proc.kill)
+        tour = menage.Turn.begin(self.cfg, pol, "a1", None, new_session=True,
+                                 base_env={})
+        self.addCleanup(tour.lock.release)
+        self.assertTrue(os.path.exists(garde))
+        self.assertIn(("tmp", "held"),
+                      {(e["kind"], e["action"]) for e in tour.entries})
 
     def test_eviction_du_plus_ancien_jusqu_au_quota(self):
         root = os.path.join(self.base, "cache")
@@ -732,6 +754,77 @@ class MenageDbTest(PgTestCase):
         loin = time.time() + 30 * 24 * 3600
         menage.run_pass(self.cfgl, self.db, pol, host="pc", actor="t", now=loin)
         self.assertFalse(os.path.exists(root))
+
+    @unittest.skipUnless(platform.is_linux(),
+                         "#2704 : les chemins tenus se lisent dans /proc (Linux)")
+    def test_dossier_tmp_d_un_agent_absent_tenu_par_un_processus_est_garde(self):
+        """#2704 : un dossier ancien qu'un processus vivant utilise (ici son
+        dossier courant) n'est pas supprimé, même sans worktree dedans."""
+        pol = menage.Policy()
+        troot = menage.tmp_root(self.cfgl, pol)
+        menage._ensure_root(troot)
+        root = os.path.join(troot, "ancien-agent")
+        os.makedirs(root)
+        menage._write_owner(troot, "ancien-agent", menage.mesh_key(self.cfgl),
+                            menage.ORIGIN_CREATED)
+        _write(os.path.join(root, "reste.txt"), 10)
+        proc = subprocess.Popen([sys.executable, "-c",
+                                 "import time; time.sleep(60)"], cwd=root)
+        self.addCleanup(proc.wait)
+        self.addCleanup(proc.kill)
+        loin = time.time() + 30 * 24 * 3600
+        rapport = menage.run_pass(self.cfgl, self.db, pol, host="pc", actor="t",
+                                  now=loin)
+        self.assertTrue(os.path.isdir(root))
+        self.assertTrue(any("kept: held by process" in note
+                            for note in rapport["skipped"]), rapport["skipped"])
+
+    def test_processus_tmp_verifie_avant_retrait_des_worktrees(self):
+        """#2704 : récupérer un worktree le supprime déjà ; la garde des
+        fichiers projetés doit donc précéder cette récupération."""
+        pol = menage.Policy()
+        troot = menage.tmp_root(self.cfgl, pol)
+        menage._ensure_root(troot)
+        root = os.path.join(troot, "ancien-agent")
+        os.makedirs(root)
+        menage._write_owner(troot, "ancien-agent", menage.mesh_key(self.cfgl),
+                            menage.ORIGIN_CREATED)
+        procs = platform.UserPaths()
+        procs.paths[os.path.join(root, "copie", "lib.node")] = "123 electron"
+        with mock.patch.object(platform, "user_paths", return_value=procs), \
+                mock.patch.object(menage, "_git_copies_report",
+                                  return_value=([os.path.join(root, "copie")], "")), \
+                mock.patch.object(menage, "tmp_git_work", return_value=""), \
+                mock.patch.object(menage, "recover_tmp_git_copies",
+                                  return_value=(True, "", [])) as recover:
+            menage.run_pass(self.cfgl, self.db, pol, host="pc", actor="t",
+                            now=time.time() + 30 * 24 * 3600)
+        recover.assert_not_called()
+        self.assertTrue(os.path.isdir(root))
+
+    @unittest.skipUnless(platform.is_linux(),
+                         "#2704 : les chemins tenus se lisent dans /proc (Linux)")
+    def test_dossier_tmp_tenu_par_un_processus_n_est_pas_evince(self):
+        """#2704 : le quota ne libère pas les fichiers d'un dossier temporaire
+        qu'un processus vivant utilise (AppImage extraite et lancée)."""
+        self.register("a1", "claude")
+        pol = menage.Policy(tmp_quota=1024)
+        troot = menage.tmp_root(self.cfgl, pol)
+        menage._ensure_root(troot)
+        root = os.path.join(troot, "a1")
+        os.makedirs(root)
+        menage._write_owner(troot, "a1", menage.mesh_key(self.cfgl),
+                            menage.ORIGIN_CREATED)
+        gros = os.path.join(root, "gros")
+        _write(gros, 100000, age_s=10 * 3600)
+        proc = subprocess.Popen([sys.executable, "-c",
+                                 "import time; time.sleep(60)"], cwd=root)
+        self.addCleanup(proc.wait)
+        self.addCleanup(proc.kill)
+        rapport = menage.run_pass(self.cfgl, self.db, pol, host="pc", actor="t")
+        self.assertTrue(os.path.exists(gros))
+        self.assertTrue(any("kept: held by process" in note
+                            for note in rapport["skipped"]), rapport["skipped"])
 
     def test_dossier_de_repli_avec_une_copie_git_n_est_pas_supprime(self):
         """#2326 : même à nous, un dossier de repli qui porte une copie git

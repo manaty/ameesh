@@ -50,8 +50,10 @@ def main() -> int:
             "bonjour du faux codex (fil %s)" % thread]:
         print(json.dumps({"type": "item.completed", "item": {
             "type": "agent_message", "text": texte}}), flush=True)
-    print(json.dumps({"type": "turn.completed", "usage": {"input_tokens": 10,
-                                                          "output_tokens": 5}}), flush=True)
+    # #2932 : AMEESH_TEST_CODEX_USAGE, usage JSON de fin de tour (cumulé)
+    usage = json.loads(os.environ.get("AMEESH_TEST_CODEX_USAGE") or "null") or {
+        "input_tokens": 10, "output_tokens": 5}
+    print(json.dumps({"type": "turn.completed", "usage": usage}), flush=True)
     return int(os.environ.get("AMEESH_TEST_EXIT", "0"))
 
 

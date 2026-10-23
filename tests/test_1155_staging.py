@@ -14,6 +14,7 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -60,6 +61,13 @@ if [ "$(basename "$0")" = vm.sh ]; then
   fi
 fi
 action=${1:-}
+if [ "$host" = pc-smichea ]; then
+  case "$action" in
+    redemarrer|retour)
+      . "$state/garde.sh"
+      verifier_hors_agent || exit 1 ;;
+  esac
+fi
 printf 'call host=%s action=%s args=%s\n' "$host" "$action" "$*" >> "$state/calls.log"
 if grep -qx "ko=$host:$action" "$state/scenario" 2>/dev/null; then
   grep -vx "ko=$host:$action" "$state/scenario" > "$state/scenario.tmp" || true
@@ -116,6 +124,49 @@ printf 'ssh %s\n' "$*" >> "${FAKE_STATE:?}/calls.log"
 exit 255
 '''
 
+SYSTEMD_RUN = r'''
+import json, os, subprocess, sys
+from pathlib import Path
+args = iter(sys.argv[1:])
+env = dict(os.environ)
+# Le gestionnaire ne transmet pas l'environnement de l'appelant.
+for name in ('BASCULE_ENV', 'AMEESH_CONFIG'):
+    env.pop(name, None)
+unit = cwd = None
+flags = []
+for arg in args:
+    if arg in ('--user', '--collect', '--wait', '--pipe'):
+        flags.append(arg)
+    elif arg == '--unit':
+        unit = next(args)
+    elif arg == '--working-directory':
+        cwd = next(args)
+    elif arg.startswith('--setenv='):
+        name, value = arg.removeprefix('--setenv=').split('=', 1)
+        env[name] = value
+    else:
+        command = [arg, *args]
+        break
+assert set(flags) == {'--user', '--collect', '--wait', '--pipe'}
+assert unit.startswith('poste-maj-') and cwd
+env['FAKE_CGROUP'] = '0::/user.slice/app.slice/' + unit + '.service'
+state = Path(env['FAKE_STATE'])
+with (state / 'units.jsonl').open('a') as log:
+    log.write(json.dumps(dict(unit=unit, cwd=cwd, command=command,
+                             bascule=env.get('BASCULE_ENV'),
+                             config=env.get('AMEESH_CONFIG'))) + '\n')
+if ('unit-ko=' + command[-1]) in (state / 'scenario').read_text().splitlines():
+    sys.exit(23)
+sys.exit(subprocess.run(command, env=env, cwd=cwd).returncode)
+'''
+
+CAT = r'''#!/bin/sh
+case "$1" in
+  /proc/*/cgroup) printf '%s\n' "${FAKE_CGROUP:-0::/user.slice/session.scope}" ;;
+  *) exec /usr/bin/cat "$@" ;;
+esac
+'''
+
 
 class StagingTest(unittest.TestCase):
     maxDiff = None
@@ -127,6 +178,10 @@ class StagingTest(unittest.TestCase):
         self.state = self.root / 'state'; self.state.mkdir()
         (self.state / 'calls.log').touch()
         (self.state / 'scenario').write_text('')
+        # La vraie garde #2950, sans lancer les gestes du dispatcher poste.
+        poste = (DEPLOY / 'poste.sh').read_text()
+        garde = poste.split('verifier_hors_agent() {', 1)[1].split('\nredemarrer() {', 1)[0]
+        (self.state / 'garde.sh').write_text('verifier_hors_agent() {' + garde)
         self.home = self.root / 'home'; self.home.mkdir()
         self.repo = self.root / 'repo'
         self.script_dir = self.repo / 'deploy/mise-a-jour'
@@ -138,9 +193,11 @@ class StagingTest(unittest.TestCase):
             path.write_text(source)
             path.chmod(0o755)
         self.bin = self.root / 'bin'; self.bin.mkdir()
-        for name in ('ssh',):
+        (self.bin / 'python3').symlink_to(sys.executable)
+        for name, source in (('ssh', SSH), ('cat', CAT),
+                             ('systemd-run', '#!' + sys.executable + '\n' + SYSTEMD_RUN)):
             path = self.bin / name
-            path.write_text(SSH)
+            path.write_text(source)
             path.chmod(0o755)
         venv = self.home / '.local/share/ameesh/venv/bin'; venv.mkdir(parents=True)
         for name, source in (('python', VENV_PYTHON), ('ameesh', VENV_AMEESH)):
@@ -333,6 +390,55 @@ class StagingTest(unittest.TestCase):
                                 and t['verdict'] == 'ok' for t in traces), traces)
         self.assertEqual((self.home / '.local/state/ameesh/mise-a-jour').stat().st_mode & 0o777, 0o700)
         self.assertEqual(list(self.script_dir.glob('staging-*.env')), [])
+
+    def units(self):
+        return [json.loads(line) for line in
+                (self.state / 'units.jsonl').read_text().splitlines()]
+
+    def test_release_cgroup_restarts_and_rolls_back_in_separate_units(self):
+        self.env['FAKE_CGROUP'] = '0::/user.slice/app.slice/ameesh-release.service'
+        # Un chemin relatif avec espaces exige aussi le bon cwd dans l'unite.
+        relative = Path(os.path.relpath(self.config, Path.cwd())).with_name('bascule test.env')
+        self.config.rename(relative)
+        self.env['BASCULE_ENV'] = str(relative)
+        self.env['AMEESH_CONFIG'] = 'config test.json'
+        (self.state / 'scenario').write_text('ko=sante:pc-smichea\n')
+        p = self.run_staging()
+        self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
+        units = self.units()
+        self.assertEqual([u['command'][-1] for u in units], ['redemarrer', 'retour'])
+        self.assertNotEqual(units[0]['unit'], units[1]['unit'])
+        for unit in units:
+            self.assertEqual(unit['cwd'], str(Path.cwd()))
+            self.assertEqual(unit['bascule'], str(relative))
+            self.assertEqual(unit['config'], 'config test.json')
+        self.assertIn(('pc-smichea', 'redemarrer'), self.actions())
+        self.assertIn(('pc-smichea', 'retour'), self.actions())
+        self.assertTrue(any(t['etape'] == 'retour' and t['verdict'] == 'ok'
+                            for t in self.traces()))
+
+    def test_transient_failure_attempts_rollback_then_notifies(self):
+        self.env['FAKE_CGROUP'] = '0::/user.slice/app.slice/ameesh-release.service'
+        for rollback_fails in (False, True):
+            with self.subTest(rollback_fails=rollback_fails):
+                (self.state / 'calls.log').write_text('')
+                (self.state / 'units.jsonl').write_text('')
+                scenario = 'unit-ko=redemarrer\n'
+                if rollback_fails:
+                    scenario += 'unit-ko=retour\n'
+                (self.state / 'scenario').write_text(scenario)
+                p = self.run_staging()
+                self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
+                self.assertEqual([u['command'][-1] for u in self.units()],
+                                 ['redemarrer', 'retour'])
+                # Aucun repli direct apres l'echec de systemd-run.
+                self.assertNotIn(('pc-smichea', 'redemarrer'), self.actions())
+                notifications = [l for l in self.calls() if l.startswith('venv-python - ')]
+                self.assertEqual(len(notifications), 1)
+                expected = 'retour de pc-smichea en ECHEC' if rollback_fails else 'retour effectue'
+                self.assertIn(expected, notifications[0])
+                self.assertEqual(('pc-smichea', 'retour') in self.actions(),
+                                 not rollback_fails)
 
     def test_failure_stops_sequence_and_rolls_back_host(self):
         (self.state / 'scenario').write_text('ko=manaty-mesh-1:controler\n')
@@ -751,6 +857,95 @@ class SanteCourrierTest(unittest.TestCase):
             self.assertEqual(self.mod.stuck(object(), rows, 0.0, 1000.0), [])
         unread.assert_not_called()
 
+    def test_stuck_ignore_une_persona_sans_bail(self):
+        """#2899 : sans bail vivant, aucun tour ne peut ouvrir : ce n'est pas
+        une souffrance de la chaine, c'est `sans_executeur`."""
+        rows = [{'name': 'sans-bail', 'status': 'idle'}]
+        with mock.patch.object(self.mod.mail, 'unread_active') as unread:
+            self.assertEqual(self.mod.stuck(object(), rows, 0.0, 1000.0), [])
+        unread.assert_not_called()
+
+    def test_stuck_compte_une_persona_menee_au_courrier_ancien(self):
+        rows = [{'name': 'menee', 'status': 'idle', 'lease_owner': 'r',
+                 'lease_expires_ts': 1060.0}]
+        with mock.patch.object(self.mod.mail, 'unread_active',
+                               return_value=[{'id': 3, 'created_ts': 900.0}]), \
+             mock.patch.object(self.mod.mail, 'maybe_redelivered', return_value=False):
+            self.assertEqual(self.mod.stuck(object(), rows, 0.0, 1000.0),
+                             [{'destinataire': 'menee', 'message': 3, 'age_s': 100.0}])
+
+    def test_sans_executeur_nomme_le_destinataire_non_menee(self):
+        """#2899 : le courrier operationnel d'un agent sans bail vivant sort en
+        `sans_executeur`, avec son age et son dernier tour, jamais en retard de
+        remise."""
+        rows = [{'name': 'orchestrateur', 'status': 'idle', 'last_turn_ts': 800.0}]
+        with mock.patch.object(self.mod.mail, 'unread_active',
+                               return_value=[{'id': 1, 'created_ts': 900.0},
+                                             {'id': 2, 'created_ts': 950.0}]), \
+             mock.patch.object(self.mod.mail, 'maybe_redelivered', return_value=False):
+            self.assertEqual(self.mod.sans_executeur(object(), rows, 0.0, 1000.0),
+                             [{'destinataire': 'orchestrateur', 'n': 2,
+                               'plus_ancien_s': 100.0, 'statut': 'idle',
+                               'dernier_tour_s': 200.0,
+                               'motif': 'aucun bail vivant'}])
+
+    def test_sans_executeur_ignore_pause_et_bail_vivant(self):
+        """#2899 : une pause (operateur, budget) ou un bail vivant n'est pas un
+        destinataire sans executant."""
+        rows = [{'name': 'pause', 'status': 'idle', 'operator_paused': True},
+                {'name': 'budget', 'status': 'blocked',
+                 'status_text': 'budget : pause (compte) until 08:00'},
+                {'name': 'menee', 'status': 'idle', 'lease_owner': 'r',
+                 'lease_expires_ts': 1060.0}]
+        with mock.patch.object(self.mod.mail, 'unread_active') as unread:
+            self.assertEqual(self.mod.sans_executeur(object(), rows, 0.0, 1000.0), [])
+        unread.assert_not_called()
+
+    def test_sans_executeur_exclut_le_profil_humain_meme_en_mode_execute(self):
+        """#2957 : une ligne humaine (cle owner / harness none) n'est pas un
+        executant a relancer : elle reste dans canal_humain, jamais comptee
+        deux fois."""
+        rows = [{'name': 'smichea', 'status': 'idle', 'mode': 'execute',
+                 'key_role': 'owner', 'harness': 'none',
+                 'responsible': 'human:smichea'},
+                {'name': 'orchestrateur', 'status': 'idle'}]
+        with mock.patch.object(self.mod.mail, 'unread_active',
+                               return_value=[{'id': 1, 'created_ts': 900.0}]), \
+             mock.patch.object(self.mod.mail, 'maybe_redelivered', return_value=False):
+            self.assertEqual(
+                [e['destinataire'] for e in
+                 self.mod.sans_executeur(object(), rows, 0.0, 1000.0)],
+                ['orchestrateur'])
+            self.assertEqual(
+                [e['destinataire'] for e in
+                 self.mod.canal_humain(object(), 'h', 1000.0, rows)],
+                ['smichea'])
+
+    def test_sans_executeur_lit_le_prefixe_de_pause_budget(self):
+        """#2957 : la pause budget se lit avec budget.PAUSE_PREFIX, pas un
+        litteral qui deriverait si le prefixe changeait."""
+        rows = [{'name': 'budget', 'status': 'blocked',
+                 'status_text': 'pause : compte epuise'}]
+        with mock.patch.object(self.mod.budget, 'PAUSE_PREFIX', 'pause : '):
+            with mock.patch.object(self.mod.mail, 'unread_active') as unread:
+                self.assertEqual(
+                    self.mod.sans_executeur(object(), rows, 0.0, 1000.0), [])
+            unread.assert_not_called()
+
+    def test_sans_executeur_nomme_un_bloque_avec_erreur(self):
+        """#2899 : un bloque sans bail et hors pause budget garde sa cause et
+        son courrier ; il n'est plus invisible."""
+        rows = [{'name': 'casse', 'status': 'blocked',
+                 'last_error': 'auth introuvable', 'last_turn_ts': 800.0}]
+        with mock.patch.object(self.mod.mail, 'unread_active',
+                               return_value=[{'id': 1, 'created_ts': 900.0}]), \
+             mock.patch.object(self.mod.mail, 'maybe_redelivered', return_value=False):
+            self.assertEqual(self.mod.sans_executeur(object(), rows, 0.0, 1000.0),
+                             [{'destinataire': 'casse', 'n': 1,
+                               'plus_ancien_s': 100.0, 'statut': 'blocked',
+                               'dernier_tour_s': 200.0,
+                               'motif': 'bloqué : auth introuvable'}])
+
     def test_dead_letters_include_stopped_personas(self):
         """N1 : une boite morte d'une persona arretee de l'hote est rapportee."""
         db = object()
@@ -762,6 +957,173 @@ class SanteCourrierTest(unittest.TestCase):
                 {'recipient': 'a', 'n': 2}, {'recipient': 'b', 'n': 1}]
             self.assertEqual(self.mod.dead_letters(db, 'h'),
                              [{'destinataire': 'a', 'n': 2}])
+
+    def test_dead_letters_exclut_le_profil_humain_sans_executeur(self):
+        """#2899 : le porte-cle n'est pas une boite morte d'agent ; son courrier
+        va au canal humain."""
+        rows = [{'name': 'smichea', 'host': 'h', 'status': 'stopped',
+                 'mode': 'externe', 'key_role': 'owner',
+                 'responsible': 'human:smichea'},
+                {'name': 'a', 'host': 'h', 'status': 'stopped', 'mode': 'execute'}]
+        with mock.patch.object(self.mod.registry, 'overview', return_value=rows), \
+             mock.patch.object(self.mod.storage, 'of') as of:
+            of.return_value.mailbox.dead_letters.return_value = [
+                {'recipient': 'smichea', 'n': 5}, {'recipient': 'a', 'n': 2}]
+            self.assertEqual(self.mod.dead_letters(object(), 'h'),
+                             [{'destinataire': 'a', 'n': 2}])
+
+    def test_canal_humain_liste_les_sessions_humaines(self):
+        """#2899 : toute session humaine sans exécuteur (chat, porte-clé) est
+        nommée avec l'humain et la lecture sans marquage, non bloquant."""
+        rows = [{'name': 'smichea', 'host': 'h', 'status': 'stopped',
+                 'mode': 'externe', 'key_role': 'owner',
+                 'responsible': 'human:smichea'},
+                {'name': 'chat-smichea', 'host': 'h', 'status': 'idle',
+                 'mode': 'externe', 'harness': 'claude',
+                 'responsible': 'human:smichea'}]
+
+        def unread(_db, nom):
+            return ([{'id': 1, 'created_ts': 900.0},
+                     {'id': 2, 'created_ts': 950.0}] if nom == 'smichea' else
+                    [{'id': 3, 'created_ts': 990.0}])
+
+        with mock.patch.object(self.mod.mail, 'unread_active', side_effect=unread):
+            self.assertEqual(
+                self.mod.canal_humain(object(), 'h', 1000.0, rows),
+                [{'destinataire': 'smichea', 'n': 2, 'plus_ancien_s': 100.0,
+                  'responsable': 'human:smichea', 'canal': 'human:smichea',
+                  'alerte': 'stopped_with_mail',
+                  'lecture': 'agent-mail inbox smichea'},
+                 {'destinataire': 'chat-smichea', 'n': 1, 'plus_ancien_s': 10.0,
+                  'responsable': 'human:smichea', 'canal': 'chat',
+                  'alerte': None,
+                  'lecture': 'agent-mail inbox chat-smichea'}])
+
+    def test_canal_humain_fallback_owner_pour_un_profil_sans_responsable(self):
+        """#2957 : un profil externe sans responsable prend le canal humain du
+        proprietaire, lu au registre ; le rapport ne laisse pas 'human:?'."""
+        rows = [{'name': 'veille', 'host': 'h', 'status': 'idle',
+                 'mode': 'externe', 'harness': 'other'}]
+        owner = [{'name': 'smichea', 'key_role': 'owner',
+                  'responsible': 'human:smichea', 'host': 'h'}]
+        with mock.patch.object(self.mod.registry, 'overview', return_value=owner), \
+             mock.patch.object(self.mod.mail, 'unread_active',
+                               return_value=[{'id': 4, 'created_ts': 990.0}]):
+            self.assertEqual(
+                self.mod.canal_humain(object(), 'h', 1000.0, rows),
+                [{'destinataire': 'veille', 'n': 1, 'plus_ancien_s': 10.0,
+                  'responsable': 'human:smichea', 'canal': 'human:smichea',
+                  'alerte': 'idle_with_mail',
+                  'lecture': 'agent-mail inbox veille'}])
+
+    def test_main_sans_executeur_sort_ko_avec_sa_cause(self):
+        """#2899 : un destinataire operationnel sans bail vivant est un KO
+        explicite, meme sans souffrance de chaine."""
+        rows = [{'name': 'orchestrateur', 'host': 'h', 'mode': 'execute',
+                 'status': 'idle'}]
+        sortie = io.StringIO()
+        with mock.patch.object(self.mod.db_mod, 'connect', return_value=mock.MagicMock()), \
+             mock.patch.object(self.mod.config, 'load', return_value={}), \
+             mock.patch.object(self.mod.registry, 'overview', return_value=rows), \
+             mock.patch.object(self.mod, 'stuck', return_value=[]), \
+             mock.patch.object(self.mod, 'sans_executeur',
+                               return_value=[{'destinataire': 'orchestrateur',
+                                              'n': 66, 'plus_ancien_s': 21847.5,
+                                              'statut': 'idle'}]), \
+             mock.patch.object(self.mod, 'dead_letters', return_value=[]), \
+             mock.patch.object(self.mod, 'canal_humain', return_value=[]), \
+             mock.patch.object(self.mod.mail, 'send') as envoi, \
+             mock.patch.object(self.mod.time, 'time', return_value=1000.0), \
+             redirect_stdout(sortie):
+            code = self.mod.main(['--hote', 'h', '--sonde', 'jamais', '--json'])
+        self.assertEqual(code, 1, sortie.getvalue())
+        rapport = json.loads(sortie.getvalue())
+        self.assertEqual(rapport['verdict'], 'ko')
+        self.assertEqual(rapport['souffrance'], [])
+        self.assertEqual(rapport['sans_executeur'][0]['destinataire'], 'orchestrateur')
+        self.assertEqual(rapport['sans_executeur'][0]['n'], 66)
+        envoi.assert_not_called()
+
+    def test_main_canal_humain_non_bloquant(self):
+        """#2899 : le courrier du porte-cle est rapporte, mais ne bloque pas une
+        sonde de chaine reussie."""
+        rows = [{'name': 'cx1', 'host': 'h', 'mode': 'execute', 'status': 'idle',
+                 'lease_owner': 'r', 'lease_expires_ts': 1060.0}]
+        resultat = {'message': 7, 'destinataire': 'cx1', 'delai_s': 1.0,
+                    'remise_s': 0.5, 'hote_destinataire': 'h',
+                    'statut_cible': 'idle', 'tour': 'ok'}
+        sortie = io.StringIO()
+        with mock.patch.object(self.mod.db_mod, 'connect', return_value=mock.MagicMock()), \
+             mock.patch.object(self.mod.config, 'load', return_value={}), \
+             mock.patch.object(self.mod.registry, 'overview', return_value=rows), \
+             mock.patch.object(self.mod.registry, 'get', return_value=rows[0]), \
+             mock.patch.object(self.mod, 'stuck', return_value=[]), \
+             mock.patch.object(self.mod, 'sans_executeur', return_value=[]), \
+             mock.patch.object(self.mod, 'dead_letters', return_value=[]), \
+             mock.patch.object(self.mod, 'canal_humain',
+                               return_value=[{'destinataire': 'smichea', 'n': 5,
+                                              'canal': 'human:smichea'}]), \
+             mock.patch.object(self.mod, 'probe', return_value=resultat), \
+             mock.patch.object(self.mod.time, 'time', return_value=1000.0), \
+             redirect_stdout(sortie):
+            code = self.mod.main(['--hote', 'h', '--json'])
+        self.assertEqual(code, 0, sortie.getvalue())
+        rapport = json.loads(sortie.getvalue())
+        self.assertEqual(rapport['verdict'], 'ok')
+        self.assertEqual(rapport['canal_humain'][0]['destinataire'], 'smichea')
+
+    def test_incident_2899_separe_sans_executeur_et_canal_humain(self):
+        """#2899 : le cas reel — orchestrateur idle sans bail (66 messages) et
+        porte-cle arrete (5 messages) — ne doit plus melanger les deux causes :
+        KO par `sans_executeur` seulement, `canal_humain` non bloquant."""
+        rows = [
+            {'name': 'orchestrateur', 'host': 'pc-smichea', 'mode': 'execute',
+             'status': 'idle', 'last_turn_ts': 800.0},
+            {'name': 'cx1', 'host': 'pc-smichea', 'mode': 'execute',
+             'status': 'idle', 'lease_owner': 'r', 'lease_expires_ts': 1060.0},
+            {'name': 'smichea', 'host': 'pc-smichea', 'mode': 'externe',
+             'status': 'stopped', 'key_role': 'owner', 'harness': 'none',
+             'responsible': 'human:smichea'},
+        ]
+        resultat = {'message': 7, 'destinataire': 'cx1', 'delai_s': 1.0,
+                    'remise_s': 0.5, 'hote_destinataire': 'pc-smichea',
+                    'statut_cible': 'idle', 'tour': 'ok'}
+
+        def unread(_db, nom):
+            if nom == 'orchestrateur':
+                return [{'id': 120201 + i, 'created_ts': 100.0} for i in range(66)]
+            if nom == 'smichea':
+                return [{'id': 900 + i, 'created_ts': 900.0} for i in range(5)]
+            return []
+
+        sortie = io.StringIO()
+        with mock.patch.object(self.mod.db_mod, 'connect', return_value=mock.MagicMock()), \
+             mock.patch.object(self.mod.config, 'load', return_value={}), \
+             mock.patch.object(self.mod.registry, 'overview', return_value=rows), \
+             mock.patch.object(self.mod.registry, 'get',
+                               return_value=rows[1]), \
+             mock.patch.object(self.mod.storage, 'of') as of, \
+             mock.patch.object(self.mod.mail, 'unread_active', side_effect=unread), \
+             mock.patch.object(self.mod, 'probe', return_value=resultat), \
+             mock.patch.object(self.mod.time, 'time', return_value=1000.0), \
+             redirect_stdout(sortie):
+            of.return_value.mailbox.dead_letters.return_value = [
+                {'recipient': 'smichea', 'n': 4},
+                {'recipient': 'smichea', 'n': 1}]
+            code = self.mod.main(['--hote', 'pc-smichea', '--souffrance', '0',
+                                  '--json'])
+        self.assertEqual(code, 1, sortie.getvalue())
+        rapport = json.loads(sortie.getvalue())
+        self.assertEqual(rapport['verdict'], 'ko')
+        self.assertEqual(rapport['souffrance'], [])
+        self.assertEqual([(e['destinataire'], e['n']) for e in rapport['sans_executeur']],
+                         [('orchestrateur', 66)])
+        self.assertEqual(rapport['boites_mortes'], [])
+        self.assertEqual(rapport['canal_humain'][0]['destinataire'], 'smichea')
+        self.assertEqual(rapport['canal_humain'][0]['n'], 5)
+        self.assertEqual(rapport['canal_humain'][0]['canal'], 'human:smichea')
+        self.assertEqual(rapport['sonde']['destinataire'], 'cx1')
+        self.assertEqual(rapport['sonde']['tour'], 'ok')
 
     def sonde(self, etat, repond=False, attente=0.2, accuse_remis=False):
         """La sonde sur faux courrier/registre (#1460) : remise a 100.0."""
@@ -982,7 +1344,9 @@ class SanteCourrierTest(unittest.TestCase):
                                              'lease_expires_ts': maintenant + 60,
                                              'status': 'idle'}), \
              mock.patch.object(self.mod, 'stuck', return_value=[]), \
+             mock.patch.object(self.mod, 'sans_executeur', return_value=[]), \
              mock.patch.object(self.mod, 'dead_letters', return_value=[]), \
+             mock.patch.object(self.mod, 'canal_humain', return_value=[]), \
              mock.patch.object(self.mod.mail, 'send', side_effect=faux_send), \
              mock.patch.object(self.mod.mail, 'get', side_effect=faux_get), \
              mock.patch.object(self.mod.mail, 'history', side_effect=faux_history), \
@@ -1016,7 +1380,9 @@ class SanteCourrierTest(unittest.TestCase):
              mock.patch.object(self.mod.config, 'load', return_value={}), \
              mock.patch.object(self.mod.registry, 'overview', return_value=autres), \
              mock.patch.object(self.mod, 'stuck', return_value=[]), \
+             mock.patch.object(self.mod, 'sans_executeur', return_value=[]), \
              mock.patch.object(self.mod, 'dead_letters', return_value=[]), \
+             mock.patch.object(self.mod, 'canal_humain', return_value=[]), \
              mock.patch.object(self.mod.mail, 'send') as envoi, \
              mock.patch.object(self.mod.time, 'time', return_value=maintenant), \
              redirect_stdout(sortie):
@@ -1045,7 +1411,9 @@ class SanteCourrierTest(unittest.TestCase):
              mock.patch.object(self.mod.registry, 'overview', return_value=rows), \
              mock.patch.object(self.mod.registry, 'get', return_value=occupee), \
              mock.patch.object(self.mod, 'stuck', return_value=[]), \
+             mock.patch.object(self.mod, 'sans_executeur', return_value=[]), \
              mock.patch.object(self.mod, 'dead_letters', return_value=[]), \
+             mock.patch.object(self.mod, 'canal_humain', return_value=[]), \
              mock.patch.object(self.mod.mail, 'send') as envoi, \
              mock.patch.object(self.mod.time, 'time', return_value=maintenant), \
              redirect_stdout(sortie):
@@ -1090,7 +1458,9 @@ class SanteCourrierTest(unittest.TestCase):
              mock.patch.object(self.mod.registry, 'overview', return_value=rows), \
              mock.patch.object(self.mod.registry, 'get', return_value=en_pause), \
              mock.patch.object(self.mod, 'stuck', return_value=[]), \
+             mock.patch.object(self.mod, 'sans_executeur', return_value=[]), \
              mock.patch.object(self.mod, 'dead_letters', return_value=[]), \
+             mock.patch.object(self.mod, 'canal_humain', return_value=[]), \
              mock.patch.object(self.mod.mail, 'send') as envoi, \
              mock.patch.object(self.mod.time, 'time', return_value=maintenant), \
              redirect_stdout(sortie):
@@ -1116,7 +1486,9 @@ class SanteCourrierTest(unittest.TestCase):
              mock.patch.object(self.mod.registry, 'overview', return_value=rows), \
              mock.patch.object(self.mod.registry, 'get', return_value=rows[0]), \
              mock.patch.object(self.mod, 'stuck', return_value=[]), \
+             mock.patch.object(self.mod, 'sans_executeur', return_value=[]), \
              mock.patch.object(self.mod, 'dead_letters', return_value=[]), \
+             mock.patch.object(self.mod, 'canal_humain', return_value=[]), \
              mock.patch.object(self.mod.mail, 'send', return_value=7), \
              mock.patch.object(self.mod.mail, 'get',
                                return_value={'id': 7, 'delivered_ts': None}), \
@@ -1164,7 +1536,9 @@ class SanteCourrierTest(unittest.TestCase):
              mock.patch.object(self.mod.config, 'load', return_value={}), \
              mock.patch.object(self.mod.registry, 'overview', return_value=rows), \
              mock.patch.object(self.mod, 'stuck', return_value=[]), \
+             mock.patch.object(self.mod, 'sans_executeur', return_value=[]), \
              mock.patch.object(self.mod, 'dead_letters', return_value=[]), \
+             mock.patch.object(self.mod, 'canal_humain', return_value=[]), \
              mock.patch.object(self.mod.mail, 'send') as envoi, \
              mock.patch.object(self.mod.time, 'time', return_value=1000.0), \
              redirect_stdout(sortie):

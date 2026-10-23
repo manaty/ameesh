@@ -449,6 +449,18 @@ class BranchMergeTest(_Base):
         self.assertTrue(any("branch agent/dev1-a" in n for n in notes), notes)
         self.assertEqual(self.sync()["results"], [])          # lot livré : plus examiné
 
+    def test_2744_un_lot_blocked_n_est_pas_ferme_par_le_releve_des_branches(self):
+        """#2744 : la garde vaut aussi pour le relevé automatique des branches."""
+        self.branch("agent/dev1-bloque", "b1")
+        lot = self.lot("agent/dev1-bloque")
+        for state in ("build", "qa", "blocked"):
+            work.move(self.db, lot["id"], state)
+        _git(self.repo, "merge", "-q", "--no-ff", "-m", "merge agent/dev1-bloque",
+             "agent/dev1-bloque")
+        report = self.sync()
+        self.assertEqual(report["results"][0]["result"], "withheld")
+        self.assertEqual(work.get(self.db, lot["id"])["state"], "blocked")
+
     def test_branche_sans_travail_n_est_pas_une_fusion(self):
         self.branch("agent/dev1-vide")
         lot = self.lot("agent/dev1-vide")
@@ -495,6 +507,94 @@ class BranchMergeTest(_Base):
         self.assertEqual(report["results"][0]["how"], "vu-ancestor")
         self.assertEqual(work.get(self.db, lot["id"])["state"], "merged")
 
+    def origin(self):
+        """#2654 : une forge (dépôt nu `origin`) et un second clone qui y pousse."""
+        bare = os.path.join(self.tmp, "forge.git")
+        _git(self.tmp, "init", "-q", "--bare", bare)
+        _git(self.repo, "remote", "add", "origin", bare)
+        _git(self.repo, "push", "-q", "origin", "develop")
+        other = os.path.join(self.tmp, "autre")
+        _git(self.tmp, "clone", "-q", bare, other)
+        return bare, other
+
+    def push_new_work(self, other, branch, name):
+        _git(other, "fetch", "-q", "origin")
+        _git(other, "checkout", "-q", "-B", branch, "origin/develop")
+        with open(os.path.join(other, name), "w") as fh:
+            fh.write(name + "\n")
+        _git(other, "add", name)
+        _git(other, "commit", "-q", "-m", "ajoute %s" % name)
+        _git(other, "push", "-q", "-f", "origin", branch)
+        return _git(other, "rev-parse", "HEAD")
+
+    def test_branche_recreee_absente_du_clone_reste_ouverte(self):
+        """#2654, témoin #2623 : la branche du lot, vue en avance puis entrée
+        dans la cible, est recréée sous le même nom avec du travail neuf, poussé
+        depuis un autre clone ; le clone relevé ne l'a pas. La tête vue,
+        périmée, ne prouve plus rien : le lot reste ouvert."""
+        _bare, other = self.origin()
+        self.branch("agent/dev1-neuf", "n1")
+        _git(self.repo, "push", "-q", "origin", "agent/dev1-neuf")
+        lot = self.lot("agent/dev1-neuf")
+        self.sync()                                   # retient la pointe en avance
+        _git(self.repo, "merge", "-q", "--ff-only", "agent/dev1-neuf")
+        _git(self.repo, "push", "-q", "origin", "develop")
+        _git(self.repo, "branch", "-q", "-D", "agent/dev1-neuf")
+        _git(self.repo, "branch", "-q", "-D", "-r", "origin/agent/dev1-neuf")
+        self.push_new_work(other, "agent/dev1-neuf", "n2")
+        # le fetch du relevé échoue (ou précède la poussée) : le clone l'ignore
+        with mock.patch.object(plan_git, "git_fetch", return_value="fetch refused"):
+            entry = self.sync()["results"][0]
+        self.assertEqual(entry["result"], "open", entry)
+        self.assertIn("absent from this clone", entry["detail"])
+        self.assertEqual(work.get(self.db, lot["id"])["state"], "intake")
+
+    def test_branche_poussee_depuis_la_tete_vue_reste_ouverte(self):
+        """#2654 : la pointe du clone est entrée dans la cible, mais la forge
+        porte depuis un commit de plus, présent au clone : le lot reste ouvert
+        et cette tête devient la tête vue."""
+        self.origin()
+        self.branch("agent/dev1-suite", "s1")
+        lot = self.lot("agent/dev1-suite")
+        self.sync()
+        _git(self.repo, "merge", "-q", "--ff-only", "agent/dev1-suite")
+        _git(self.repo, "push", "-q", "origin", "develop")
+        _git(self.repo, "checkout", "-q", "--detach", "develop")
+        suite = self.commit("s2")
+        _git(self.repo, "checkout", "-q", "develop")
+        _git(self.repo, "push", "-q", "origin", "%s:refs/heads/agent/dev1-suite" % suite)
+        entry = self.sync()["results"][0]
+        self.assertEqual(entry["result"], "open", entry)
+        item = work.get(self.db, lot["id"])
+        self.assertEqual((item["state"], item["branch_head"]), ("intake", suite))
+
+    def test_branche_supprimee_de_la_forge_apres_fusion_ferme(self):
+        """#2654 : la branche fusionnée puis supprimée de la forge (GitHub) :
+        la tête vue reste la preuve, comme avant."""
+        self.origin()
+        self.branch("agent/dev1-fin", "f1")
+        _git(self.repo, "push", "-q", "origin", "agent/dev1-fin")
+        lot = self.lot("agent/dev1-fin")
+        self.sync()
+        _git(self.repo, "merge", "-q", "--ff-only", "agent/dev1-fin")
+        _git(self.repo, "push", "-q", "origin", "develop", ":agent/dev1-fin")
+        _git(self.repo, "branch", "-q", "-D", "agent/dev1-fin")
+        report = self.sync()
+        self.assertEqual(report["results"][0]["how"], "vu-ancestor")
+        self.assertEqual(work.get(self.db, lot["id"])["state"], "merged")
+
+    def test_forge_illisible_ne_conclut_pas(self):
+        """#2654 : sans lecture de la forge, la tête vue ne ferme pas le lot."""
+        self.branch("agent/dev1-muet", "m1")
+        lot = self.lot("agent/dev1-muet")
+        self.sync()
+        _git(self.repo, "merge", "-q", "--ff-only", "agent/dev1-muet")
+        _git(self.repo, "remote", "add", "origin", os.path.join(self.tmp, "absent.git"))
+        entry = self.sync()["results"][0]
+        self.assertEqual(entry["result"], "open", entry)
+        self.assertIn("unreadable", entry["detail"])
+        self.assertEqual(work.get(self.db, lot["id"])["state"], "intake")
+
     def test_show_etiquette_la_tete_vue_au_balayage(self):
         """#1899 : la tête en avance affichée vient du dernier balayage, pas de
         la forge — deux triages faux le 16/10 l'ont lue comme la tête réelle."""
@@ -517,6 +617,24 @@ class BranchMergeTest(_Base):
         _git(self.repo, "commit", "-q", "-m", "squash")
         _git(self.repo, "branch", "-q", "-D", "agent/dev1-sq")
         report = self.sync()
+        self.assertEqual(report["results"][0]["how"], "vu-squash")
+        self.assertEqual(work.get(self.db, lot["id"])["state"], "merged")
+
+    def test_squash_branche_restee_sur_la_forge_ferme(self):
+        """#2654 : la forge garde la branche après un squash ; sa tête, au
+        contenu entré dans la cible, ne retient pas le lot."""
+        self.origin()
+        self.branch("agent/dev1-sqf", "q1", "q2")
+        _git(self.repo, "push", "-q", "origin", "agent/dev1-sqf")
+        lot = self.lot("agent/dev1-sqf")
+        self.sync()
+        _git(self.repo, "merge", "-q", "--squash", "agent/dev1-sqf")
+        _git(self.repo, "commit", "-q", "-m", "squash")
+        _git(self.repo, "push", "-q", "origin", "develop")
+        _git(self.repo, "branch", "-q", "-D", "agent/dev1-sqf")
+        _git(self.repo, "branch", "-q", "-D", "-r", "origin/agent/dev1-sqf")
+        with mock.patch.object(plan_git, "git_fetch", return_value="fetch refused"):
+            report = self.sync()
         self.assertEqual(report["results"][0]["how"], "vu-squash")
         self.assertEqual(work.get(self.db, lot["id"])["state"], "merged")
 

@@ -14,6 +14,8 @@ import sys
 import tempfile
 import unittest
 
+from tests import support  # noqa: F401 — environnement isolé du poste
+
 
 ROOT = Path(__file__).resolve().parents[1]
 # poste.sh « sauvegarder » exécute sauvegarder-prive.py, qui parle psycopg : la
@@ -56,6 +58,9 @@ class MigrationPinningTest(unittest.TestCase):
         bin_dir = self.root / "bin"
         bin_dir.mkdir()
         (bin_dir / "python3").symlink_to(sys.executable)
+        (bin_dir / "cat").write_text(
+            '#!/bin/sh\ncase "$1" in /proc/*/cgroup) printf "%s\\n" "${FAKE_CGROUP_TEXT:-0::/user.slice/session.scope}" ;; *) exec /usr/bin/cat "$@" ;; esac\n')
+        (bin_dir / "cat").chmod(0o755)
         (bin_dir / "pg_dump").write_text(
             '#!/bin/sh\nprintf "%s\\n" "$*" >> "${PG_DUMP_CALLS:?}"\n'
             'while [ "$1" != --file ]; do shift; done\nprintf archive > "$2"\n')
@@ -85,13 +90,17 @@ class MigrationPinningTest(unittest.TestCase):
             '*) exit 97 ;; esac ;;\n'
             '*) exit 98 ;; esac\n')
         (bin_dir / "systemctl").chmod(0o755)
+        # #3042 : macOS n'a pas /usr/bin/sha256sum (coreutils le fournit dans
+        # libexec/gnubin). Résoudre le vrai binaire AVANT d'ajouter `bin_dir`
+        # au PATH, sinon le faux se rappelle lui-même.
+        vrai_sha256sum = shutil.which("sha256sum") or "/usr/bin/sha256sum"
         (bin_dir / "sha256sum").write_text(
             '#!/bin/sh\n'
             'if [ "${FAKE_SHA256_BAD:-0}" = 1 ]; then\n'
             '  printf "%064d  %s\\n" 0 "${2:-}"\n'
             '  exit 0\n'
             'fi\n'
-            'exec /usr/bin/sha256sum "$@"\n')
+            'exec ' + shlex.quote(vrai_sha256sum) + ' "$@"\n')
         (bin_dir / "sha256sum").chmod(0o755)
         (bin_dir / "sleep").write_text("#!/bin/sh\nexit 0\n")
         (bin_dir / "sleep").chmod(0o755)
@@ -217,9 +226,19 @@ class MigrationPinningTest(unittest.TestCase):
         self.assertIn("redémarrage terminé dans l'unité transitoire", done.stderr)
         lancements = self.systemd_run_calls()
         self.assertEqual(len(lancements), 1)
-        self.assertIn("--user --collect --wait --unit ameesh-maj-urgence-", lancements[0])
+        self.assertIn("--user --collect --wait --unit poste-maj-urgence-", lancements[0])
         self.assertIn('/bin/sh -c "$0" redemarrer', lancements[0])
         self.assertNotIn("--user restart ameesh-notify.service", self.systemctl_calls())
+
+    def test_emergency_fallback_in_agent_cgroup_refuses_without_stopping(self):
+        done = self.run_script(
+            "migrer", self.a, AUTO_TAKE_PROBE_STATUS="1", SYSTEMD_RUN_STATUS="1",
+            FAKE_CGROUP_TEXT="0::/user.slice/ameesh-runner-agent@dev9.service")
+        self.assertNotEqual(done.returncode, 0)
+        self.assertIn("redémarrage refusé depuis une unité ameesh-*", done.stderr)
+        self.assertIn("ÉCHEC du redémarrage immédiat", done.stderr)
+        self.assertEqual(self.systemctl_calls(), [])
+        self.assertEqual(len(self.systemd_run_calls()), 1)
 
     def test_emergency_install_failure_stops_before_activation_and_restart(self):
         bascule = self.script.with_name("bascule.py")

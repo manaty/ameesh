@@ -202,7 +202,13 @@ La séquence de staging écrit chaque événement en JSONL (`date`, `hôte`, `é
 l’étape `sante` est le **rapport JSON** de `sante-courrier.py` (hôte, commit,
 verdict, et pour une remise réelle le message de sonde, son destinataire,
 l’hôte de ce destinataire et son délai) : c’est la preuve structurée que le
-signal ci-dessous exige. L’événement porte aussi ce rapport comme objet
+signal ci-dessous exige. Le rapport sépare les causes de courrier non remis :
+`souffrance` (courrier actif chez une persona **menée** et libre, donc retard
+de remise), `sans_executeur` (courrier actif chez une persona opérationnelle
+sans bail vivant : aucun exécuteur ne peut ouvrir son tour), `boites_mortes`
+(personas opérationnelles arrêtées, non bloquant) et `canal_humain` (sessions
+humaines sans exécuteur, porte-clé compris, non bloquant). L’événement porte
+aussi ce rapport comme objet
 `rapport`, et une notification d’échec le reprend en clair : un KO de sonde
 garde son message, son destinataire et son motif, jamais un simple « santé en
 échec » (#2190). Un verdict `sans-sonde` — `SONDE_<HOTE>=jamais`, `auto` sans
@@ -218,6 +224,28 @@ nomme les personas occupées ou en pause ; le délai de 300 s ne s’applique qu
 une remise partie vers une persona libre, et exige toujours la réponse outil et
 la fin propre du tour (#2190). Le courrier actif en attente chez une persona
 en pause n’est pas compté comme bloqué : son tour est refusé par construction.
+Le courrier actif d’une persona **opérationnelle sans bail vivant** n’est pas
+une souffrance de la chaîne : aucun exécuteur ne peut ouvrir son tour. Il est
+néanmoins un KO, dans `sans_executeur`, parce qu’un courrier opérationnel doit
+avoir un destinataire actif ; le rapport nomme le statut, l’âge du plus ancien
+message et le temps depuis le dernier tour, et la sortie est de démarrer
+l’exécuteur ou de relancer l’agent (`ameesh resume <agent>`), jamais d’élargir
+le délai ni de retirer la garde. Un agent `blocked` sans bail vivant et hors
+pause budget est nommé avec son erreur, jamais silencieusement omis. Une
+session humaine sans exécuteur (`mode=externe`, dont le propriétaire porte-clé
+`key_role=owner` ou la ligne de secours `harness=none`) ne compte ni comme
+boîte morte ni comme souffrance : son courrier est listé dans `canal_humain`,
+avec l’humain responsable, l’alerte poussée (`stopped_with_mail` ou
+`idle_with_mail`) et la lecture sans marquage (`agent-mail inbox <nom>`) ; ce
+courrier ne bloque pas la séquence. Un profil sans responsable déclaré prend le
+canal humain du propriétaire, lu dans le registre (`key_role=owner`) : le
+rapport ne laisse plus `canal: "human:?"` quand le propriétaire est connu. Une
+session de chat (`chat-<humain>`) reste un canal humain, mais elle lit son
+courrier à l’ouverture de la conversation : son entrée porte `canal: "chat"` et
+`alerte: null`, jamais `idle_with_mail`/`stopped_with_mail` qu’aucune alerte
+poussée ne couvre (#2957). Les profils humains sont aussi exclus de
+`sans_executeur`, même si une ligne `mode=execute` portait `key_role=owner` ou
+`harness=none` : ils ne sont jamais comptés deux fois (#2957).
 
 ## Signal « staging actif » (#1323)
 
@@ -230,6 +258,14 @@ attestation durable sous
 rapporteurs déclarés avec `--lots "917 988"` et
 `--rapporteurs "mty-amh-docs-01"` (ou `LOTS_VERIF` / `RAPPORTEURS_VERIF` dans
 `BASCULE_ENV`).
+
+Sur le poste, `redemarrer` et `retour` passent par des unités transitoires
+`poste-maj-staging-<pid>-<action>` (`systemd-run --user --collect --wait --pipe`,
+#3039). Le staging attend leur résultat et conserve leur sortie dans son
+journal ; un échec suit le retour automatique puis la notification habituels.
+Cette enveloppe dans `staging.sh` couvre aussi le retour depuis le tick
+`ameesh-release.service`, sans modifier la garde #2950 de `poste.sh` qui
+refuse les appels directs depuis une unité `ameesh-*`.
 
 Le courrier nomme les hôtes, le commit **relu actif** sur chacun après la
 séquence, les preuves `installer`/`redemarrer`/`controler`/`sante` et les lots
@@ -323,6 +359,39 @@ systemctl --user daemon-reload
 systemctl --user enable --now ameesh-release.timer
 ameesh release calendar                # prochaine coupure et canon lu
 ameesh release cutoff --dry-run        # plan, notes, aucun effet
+```
+
+**Alerte « créneau manqué » (#2601)** : le même tick relit la cadence des
+paquets (`packets.cutoffs`) et réveille le composeur et le pilote quand un
+créneau passe sans paquet alors que des lots sont prêts (voir
+[ORCHESTRATEUR.md](ORCHESTRATEUR.md)). Sans bloc `packet_watch`, rien ne
+tourne : un #2601 fusionné reste éteint (canon §5). Le bloc s'ajoute à côté de
+`release`, sur l'hôte opérateur seulement ; aucune unité de plus :
+
+```json
+"packet_watch": {
+  "host": "pc-smichea",
+  "projects": {
+    "ameesh": {
+      "notify": ["<composeur>", "<pilote>"],
+      "grace_s": 900,
+      "target": "main",
+      "repo": "/home/ameesh/work/ameesh"
+    }
+  }
+}
+```
+
+`repo` est requis quand l'hôte n'a pas de bloc `radar` (cas de pc-smichea) :
+sans lui, chaque tick échoue sur la liste calculée (`project 'ameesh' is in
+neither radar.projects nor packet_watch.projects.ameesh.repo`). Le clone de
+`release.projects.<projet>.repo` convient : il n'est lu qu'à travers un clone
+jetable `--shared`. `target` évite de dépendre de `origin/HEAD`. Vérification
+après l'ajout :
+
+```sh
+ameesh release packet-watch --dry-run      # grace, busy, served, nothing-ready, would-alert… ; jamais error
+journalctl --user -u ameesh-release -n 5   # une ligne « packet-watch ameesh: … » par tick
 ```
 
 **Ce que fait un tick** : il prend `B`, la tête de la cible si la CI du

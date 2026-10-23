@@ -63,6 +63,7 @@ class AlertTest(unittest.TestCase):
     def alerts(self, reading: dict, now: float) -> list[dict]:
         store = mock.MagicMock()
         store.hosts.current.return_value = [dict({"host": "vm", "sampled_ts": now}, **reading)]
+        store.hosts.disk_history.return_value = []
         store.turn_resources.orphans.return_value = []
         store.turn_resources.stale_running.return_value = []
         with mock.patch.object(storage, "of", return_value=store), \

@@ -8,7 +8,8 @@ import types
 import unittest
 from unittest import mock
 
-from ameesh import resolutions, storage, train, train_admissions, train_candidates, train_git
+from ameesh import (resolutions, storage, train, train_admissions, train_candidates,
+                    train_git, work)
 from .support import PgTestCase
 from . import test_1467_train_history as history_tests
 
@@ -43,9 +44,14 @@ class InventoryTest(unittest.TestCase):
         self.assertEqual([call[0] for call in self.ops.mock_calls], ["items", "milestones"])
         self.ops.items.assert_called_once_with(state="qa", assignee=None, limit=None)
         self.ops.milestones.assert_called_once_with(2005, None)
-        self.reader.assert_called_once_with(self.marks)
+        self.reader.assert_called_once_with(self.marks, waived=False)
         self.assertEqual((self.item, self.marks, self.result), before)
         self.assertNotIn("generation", result["candidates"][0])
+
+    def test_pilot_waiver_is_read_from_the_row_and_passed_to_the_candidate(self):
+        self.item["reviewer"] = work.REVIEWER_NONE
+        self.inventory.read()
+        self.reader.assert_called_once_with(self.marks, waived=True)
 
     def test_other_projects_are_not_read_and_own_target_or_branch_failures_are_named(self):
         self.ops.items.return_value = [dict(self.item, app="other"),
@@ -82,47 +88,50 @@ class CompleteInventoryStorageTest(PgTestCase):
         self.assertEqual(len(ops.items(state="qa", assignee=None, limit=None)), 205)
 
 
-class PreparationTest(unittest.TestCase):
-    git = history_tests.RecordedHistoryTest.git
-    commit = history_tests.RecordedHistoryTest.commit
-
+class PreparationTest(history_tests.HistoryFixture, PgTestCase):
     def setUp(self):
-        history_tests.RecordedHistoryTest.setUp(self)
+        super().setUp()
         self.git("branch", "main", self.base)
         self.git("branch", "lot/member", self.head)
-        origin = os.path.join(self.path, "origin.git")
-        subprocess.run(["git", "clone", "-q", "--bare", self.path, origin],
+        origin = os.path.join(self.repo, "origin.git")
+        subprocess.run(["git", "clone", "-q", "--bare", self.repo, origin],
                        check=True, capture_output=True)
         self.git("remote", "add", "origin", origin)
-        self.project = types.SimpleNamespace(name="nexlink", repo=self.path, target="main")
-        clone = resolutions.Replayer(self.path, os.path.join(self.path, "private.clone"))
+        self.project = types.SimpleNamespace(name="nexlink", repo=self.repo, target="main")
+        self.db.execute("UPDATE work_items SET app = %s, branch = %s,"
+                        " branch_target = %s WHERE id = %s",
+                        ("nexlink", "lot/member", "origin/main", self.lot))
+        self.item = work.get(self.db, self.lot)
+        clone = resolutions.Replayer(self.repo, os.path.join(self.repo, "private.clone"))
         self.repository = train_git.Repository(self.project, clone)
         self.history.path = clone.path
-        self.item = dict(id=1, app="nexlink", state="qa", branch="lot/member",
-                         branch_target="origin/main", type="improvement", title="member")
-        self.ops.get.return_value = self.item
-        self.requirement = train_admissions.Requirement(1, self.base, self.head,
-                                                       "sensitive", 2, self.base,
-                                                       files=({"path": "content",
-                                                               "class": "sensitive",
-                                                               "rule": None},))
+        self.requirement = train_admissions.Requirement(
+            self.lot, self.base, self.head, "sensitive", 2, self.base,
+            files=({"path": "content", "class": "sensitive", "rule": None},))
         self.policy = mock.Mock(return_value=self.requirement)
-        self.preparation = train_candidates.Preparation(None, self.project,
-            repository=self.repository, history=self.history, policy=self.policy)
-        self.candidate = dict(work_item_id=1, branch="lot/member", target="main", causes=[],
-            candidate=dict(sha=self.head, origin="frozen", declared=self.marks[0]))
+        self.preparation = train_candidates.Preparation(
+            self.db, self.project, repository=self.repository,
+            history=self.history, policy=self.policy)
+        self.candidate = dict(work_item_id=self.lot, branch="lot/member",
+            target="main", causes=[],
+            candidate=dict(sha=self.head, origin="frozen", declared=self.frozen))
 
     def prepare(self):
         return self.preparation.prepare(self.candidate, self.base)
+
+    def last_freeze(self):
+        return storage.of(self.db).work.milestones(self.lot, None)[0]
 
     def test_real_published_git_and_history_need_no_queue_generation_or_individual_ci(self):
         before = copy.deepcopy(self.candidate)
         proof = self.prepare()
         self.assertEqual(proof["subject"]["frozen_sha"], self.head)
-        self.assertEqual(set(proof["history"]["reviews"]["coverage"]), {self.first, self.head})
+        self.assertTrue(proof["history"]["reviews"]["gate"]["ok"])
+        # #2965: the shared admissibility instant is published with the
+        # preparation proof, so the shadow can apply the active late filter.
+        self.assertIsInstance(proof["history"]["reviews"]["admitted_ts"], float)
         self.assertNotIn("generation", proof["subject"])
         self.assertNotIn("admission", proof["history"])
-        self.assertEqual([call[0] for call in self.ops.mock_calls], ["get", "milestones"])
         self.assertEqual(self.candidate, before)
 
     def test_abbreviated_supplier_sha_resolves_to_the_exact_published_commit(self):
@@ -145,50 +154,68 @@ class PreparationTest(unittest.TestCase):
         self.candidate["causes"] = ["blocked-verdict"]
         with self.assertRaisesRegex(train.TrainError, "blocked-verdict"):
             self.prepare()
-        self.assertEqual(self.ops.mock_calls, [])
 
     def test_changed_qa_subject_and_current_base_refuse_before_historical_qualification(self):
         for field, value in (("state", "build"), ("app", "other"),
                              ("branch", "lot/other"), ("branch_target", "develop")):
-            old = self.item[field]
-            self.item[field] = value
+            original = work.get(self.db, self.lot)[field]
+            self.db.execute("UPDATE work_items SET " + field + " = %s WHERE id = %s",
+                            (value, self.lot))
             with self.subTest(field=field), self.assertRaisesRegex(train.TrainError, "QA branch"):
                 self.prepare()
-            self.item[field] = old
+            self.db.execute("UPDATE work_items SET " + field + " = %s WHERE id = %s",
+                            (original, self.lot))
         with self.assertRaisesRegex(train.TrainError, "current target base"):
             self.preparation.prepare(self.candidate, self.first)
         self.policy.assert_not_called()
 
     def test_new_same_sha_freeze_and_missing_author_or_review_still_refuse(self):
-        self.marks.append(dict(self.marks[0], id=4, at_ts=9))
+        self.ops.add_milestone(self.lot, "frozen", sha=self.head, actor="author",
+                               verdict=None, note="same head, new generation")
         with self.assertRaisesRegex(train.TrainError, "latest exact freeze"):
             self.prepare()
-        self.marks.pop()
-        receipt = self.receipts.pop("commit:" + self.first)
-        with self.assertRaisesRegex(train.TrainError, "unknown historical author"):
+        # the preparation reads the latest freeze; remove the extra one
+        self.db.execute("DELETE FROM work_item_milestones WHERE work_item_id = %s"
+                        " AND kind = 'frozen' AND id <> %s",
+                        (self.lot, self.frozen["id"]))
+        # #2808 : le titulaire n'est auteur que par un commit de la plage.
+        # Sans reçu **ni** tour pour la famille, ses deux commits (first et
+        # head) restent sans famille prouvée : retirer les deux reçus, sinon
+        # celui de `head` suffit encore à prouver la famille de l'auteur.
+        self.db.execute("DELETE FROM provenance_receipts WHERE subject IN (%s, %s)",
+                        ("commit:" + self.first, "commit:" + self.head))
+        self.db.execute("DELETE FROM turn_costs WHERE agent = 'author'")
+        with self.assertRaisesRegex(train.TrainError,
+                                    "unknown (model family|historical author)|no known model family"):
             self.prepare()
-        self.receipts["commit:" + self.first] = receipt
-        self.marks[:] = [self.marks[0]]
-        with self.assertRaisesRegex(train.TrainError, "missing independent"):
+        self.receipt_commit(self.first, "author", "deepseek")
+        self.turn("author", "deepseek")
+        self.db.execute("DELETE FROM work_item_milestones WHERE work_item_id = %s"
+                        " AND kind = 'verdict'", (self.lot,))
+        with self.assertRaisesRegex(train.TrainError, "no review verdict ok"):
             self.prepare()
 
     def test_light_without_review_passes_but_explicit_blockage_is_preserved(self):
-        self.marks[:] = [self.marks[0]]
         self.policy.return_value = dataclasses.replace(
             self.requirement, risk="light", reviews=0,
             files=({"path": "content", "class": "light", "rule": None},))
-        self.assertEqual(self.prepare()["history"]["reviews"]["coverage"],
-                         {self.first: [], self.head: []})
-        self.marks.append(dict(id=4, kind="verdict", actor="blocked-reader", at_ts=9,
-                               sha=self.head, verdict="blocked"))
-        with self.assertRaisesRegex(train.TrainError, "unresolved blocking"):
+        self.assertTrue(self.prepare()["history"]["reviews"]["gate"]["ok"])
+        self.ops.add_milestone(self.lot, "verdict", sha=self.head,
+                               actor="blocked-reader", verdict="blocked", note="")
+        with self.assertRaisesRegex(train.TrainError, "blocked verdict"):
             self.prepare()
 
     def test_release_or_wrong_policy_is_refused(self):
-        self.item["type"] = "release"
+        self.project.target = "release/1.0"
+        self.candidate["target"] = "release/1.0"
+        self.db.execute("UPDATE work_items SET branch_target = 'release/1.0'"
+                        " WHERE id = %s", (self.lot,))
         with self.assertRaisesRegex(train.TrainError, "release lots"):
             self.prepare()
-        self.item["type"] = "improvement"
+        self.project.target = "main"
+        self.candidate["target"] = "main"
+        self.db.execute("UPDATE work_items SET branch_target = 'origin/main'"
+                        " WHERE id = %s", (self.lot,))
         self.policy.return_value = dataclasses.replace(self.requirement, head=self.first)
         with self.assertRaisesRegex(train.TrainError, "another lot, base or frozen head"):
             self.prepare()

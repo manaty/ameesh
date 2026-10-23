@@ -40,6 +40,37 @@ def verdict(sha, at, id=2, actor="cx1", kind="ok"):
             "actor": actor, "verdict": kind}
 
 
+class RemoteBranchRevertTest(unittest.TestCase):
+    def test_remote_head_reverted_does_not_close_stale_branch(self):
+        """#2654 : une tête distante ancêtre mais annulée n'est pas livrée."""
+        with tempfile.TemporaryDirectory() as repo:
+            def git(*args):
+                return _git(repo, *args).stdout.strip()
+
+            def commit(name):
+                with open(os.path.join(repo, name), "w") as fh:
+                    fh.write(name + "\n")
+                git("add", name)
+                git("commit", "-qm", name)
+                return git("rev-parse", "HEAD")
+
+            git("init", "-q", "-b", "main")
+            commit("base")
+            old = commit("old")
+            git("branch", "agent/reused", old)
+            new = commit("new")
+            git("revert", "--no-edit", new)
+            bare = os.path.join(repo, "forge.git")
+            git("init", "-q", "--bare", bare)
+            git("remote", "add", "origin", bare)
+            git("push", "-q", "origin", new + ":refs/heads/agent/reused")
+            self.assertEqual(plan_git.probe(repo, new, "main")["how"], "reverted")
+            found = plan_git.branch_probe(repo, "agent/reused", "main", seen_head=old)
+            self.assertFalse(found["merged"], found)
+            self.assertEqual(found["tip"], new)
+            self.assertTrue(found["ahead"])
+
+
 class FreezeCandidateTest(unittest.TestCase):
     def test_commit_id_et_meme_commit(self):
         self.assertEqual(plan_git.commit_id(" 86EBEBEDb8 "), "86ebebedb8")
@@ -76,6 +107,27 @@ class FreezeCandidateTest(unittest.TestCase):
         out = plan_git.freeze_candidate([verdict(A, 10), frozen(B, 20)])
         self.assertEqual(out["sha"], "")
         self.assertEqual(out["causes"], ["freeze-after-verdict"])
+
+    def test_dispense_du_pilote_couvre_le_gel_apres_avis(self):
+        # #2681 : le gel déclaré est le candidat même si le dernier avis porte
+        # sur une tête antérieure ; la dispense `-none` couvre cette tête.
+        out = plan_git.freeze_candidate([verdict(A, 10), frozen(B, 20)], waived=True)
+        self.assertEqual(out["sha"], B)
+        self.assertEqual(out["origin"], "frozen")
+        self.assertEqual(out["causes"], [])
+        self.assertIn("verdict-not-required", out["notes"])
+
+    def test_dispense_ne_leve_pas_un_blocage_sur_la_tete_gelee(self):
+        out = plan_git.freeze_candidate(
+            [frozen(A, 10), verdict(A, 11, kind="blocked")], waived=True)
+        self.assertEqual(out["sha"], "")
+        self.assertEqual(out["causes"], ["blocked-verdict"])
+
+    def test_dispense_ne_cree_pas_de_gel_ni_de_candidat(self):
+        out = plan_git.freeze_candidate(
+            [{"kind": "requested", "sha": "", "at_ts": 1, "id": 1}], waived=True)
+        self.assertEqual(out["sha"], "")
+        self.assertEqual(out["causes"], ["no-verdict"])
 
     def test_gel_sans_avis_reste_candidat(self):
         # classe légère : le gel déclaré suffit ; la note dit l'avis manquant

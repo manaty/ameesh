@@ -18,7 +18,8 @@ courrier :
   une tête locale n'est pas la forge) ;
 * verdicts requis acquis **sur cette tête**, par la même porte que la fusion
   (`merge_queue.review_gate`, #1374) : comptés par classe, indépendants, sans
-  blocage courant ;
+  blocage courant ; la dispense `-none` du pilote (#1979) couvre la tête
+  gelée, jamais une remise (#2496/#2681) ;
 * `git merge-tree` propre contre la cible (le commit de base du paquet) ;
   #2496 : sinon, une **remise** propre sur la cible
   (`refs/ameesh/resolutions/<lot>/<cible>-*` ou `union-<cible>-*`) rend le
@@ -146,7 +147,9 @@ def list_remises(repo: str, where: str, lots, target: str) -> tuple[dict, str]:
     lots = {int(lot) for lot in lots}
     if not lots:
         return {}, ""
-    url = plan_git._out(repo, "remote", "get-url", "origin")
+    # #3041 : l'URL est rejouée dans `where` ; un chemin relatif se lit
+    # depuis `repo`.
+    url = resolutions._local_from(repo, plan_git._out(repo, "remote", "get-url", "origin") or "")
     if url:
         try:
             listing = resolutions._run(where, "ls-remote", url, resolutions.REF_PREFIX + "*",
@@ -306,7 +309,9 @@ def evaluate_remise(db, row: dict, marks, *, repo: str, package_base: str,
     remise) ou `mechanical` (`mechanical_union`, §2 : aucun avis). La porte
     des avis applique la classe **la plus stricte** du gel (`klass`) et du
     contenu réellement composé (la remise contre `package_base`) ; la
-    dispense du pilote, liée à la tête gelée, ne la couvre jamais. Ne lève
+    dispense du pilote, liée à la tête gelée, ne la couvre jamais. `row` est
+    la ligne de classe, cible du paquet comprise (`_class_row`) : la remise se
+    lit sur la même cible que la tête gelée, pas sur `origin/HEAD`. Ne lève
     jamais : un doute refuse."""
     out = {"ref": ref, "sha": sha, "ok": False, "why": "", "cover": "",
            "target_parent": "", "review_class": None}
@@ -349,7 +354,8 @@ def evaluate_remise(db, row: dict, marks, *, repo: str, package_base: str,
         dict(effective, **{"class": lot_class.NORMAL})
     try:
         gate = merge_queue.review_gate(db, marks, sha, repo=repo, klass=gate_class,
-                                       item=_without_waiver(row))
+                                       item=_without_waiver(row), cfg=cfg,
+                                       target=row.get("branch_target") or None)
     except Exception as exc:  # noqa: BLE001 - porte illisible : on refuse
         out["why"] = "review gate of the remise unreadable: %s" % exc
         return out
@@ -372,6 +378,16 @@ def evaluate_remise(db, row: dict, marks, *, repo: str, package_base: str,
 
 def _row_target(row: dict, target: str) -> str:
     return merge_queue._remote_branch(row.get("branch_target") or target)
+
+
+def _class_row(row: dict, target: str) -> dict:
+    """La ligne de classe : la cible **résolue du paquet** quand le lot n'en
+    déclare pas (#2464, #2574).
+
+    Sans elle, `of_lot` relirait `origin/HEAD` du clone radar — resté sur une
+    `release/*` sur pc-smichea — et surclasserait le lot. La tête gelée et ses
+    remises doivent lire la même cible, jamais la ligne brute du lot."""
+    return row if row.get("branch_target") else dict(row, branch_target=target)
 
 
 def _release_target(branch: str) -> bool:
@@ -474,7 +490,8 @@ def inventory(db, project, *, repo: str, clone, target: str | None = None,
     names = [target_branch]
     names += [str(row.get("branch") or "") for row in rows if row.get("branch")]
     try:
-        tips, where = merge_queue.fetch_fresh(repo, names, clone)
+        tips, where = merge_queue.fetch_fresh(repo, names, clone,
+                                              base=target_branch)
     except merge_queue.QueueError as exc:
         raise CandidateError(str(exc)) from exc
     fetched_target = tips.get(target_branch)
@@ -589,7 +606,8 @@ def _apply_remises(db, candidates: list[dict], rows: dict, marks: dict, remises:
                                   "why": "remise not fetched as listed on origin"})
                 continue
             evaluated.append(evaluate_remise(
-                db, rows[lot], marks.get(lot, []), repo=where, package_base=package_base,
+                db, _class_row(rows[lot], entry["target"]), marks.get(lot, []),
+                repo=where, package_base=package_base,
                 frozen=entry["frozen_sha"], ref=ref, sha=sha, klass=entry["review_class"],
                 cfg=cfg, canons=canons))
         entry["remises"] = evaluated
@@ -669,7 +687,9 @@ def _candidate(db, row: dict, *, target_branch: str, tips: dict, where: str,
         return entry
     entry["published_head"] = tip
     try:
-        freeze = plan_git.freeze_candidate(marks, repo=where, target=package_base)
+        freeze = plan_git.freeze_candidate(
+            marks, repo=where, target=package_base,
+            waived=merge_queue.is_waived(row))
     except Exception as exc:  # noqa: BLE001 - lecture du gel impossible
         entry["error"] = "cannot read the effective freeze: %s" % exc
         return entry
@@ -690,11 +710,11 @@ def _candidate(db, row: dict, *, target_branch: str, tips: dict, where: str,
     try:
         # La classe se lit sur la cible **résolue du paquet** (#2464), comme la
         # file de fusion : sans `branch_target` sur la ligne du lot, `of_lot`
-        # relirait `origin/HEAD` du clone radar et surclasserait le lot.
-        class_row = row if row.get("branch_target") else dict(row, branch_target=target)
-        klass = lot_class.of_lot(db, lot, cfg=cfg, item=class_row, repo=where,
-                                 base=package_base, head=tip, milestones=marks,
-                                 canons=canons)
+        # relirait `origin/HEAD` du clone radar et surclasserait le lot. Les
+        # remises de ce lot lisent la même ligne (`_class_row`, #2574).
+        klass = lot_class.of_lot(db, lot, cfg=cfg, item=_class_row(row, target),
+                                 repo=where, base=package_base, head=tip,
+                                 milestones=marks, canons=canons)
     except Exception as exc:  # noqa: BLE001 - classification impossible
         entry["error"] = "cannot read the review class: %s" % exc
         return entry
@@ -706,7 +726,8 @@ def _candidate(db, row: dict, *, target_branch: str, tips: dict, where: str,
     try:
         if frozen:
             gate = merge_queue.review_gate(db, marks, frozen, repo=where,
-                                           klass=klass, item=row)
+                                           klass=klass, item=row,
+                                           cfg=cfg, target=target)
             entry["gate"] = gate
             if gate.get("error"):
                 # #2521 : une lecture impossible n'est pas un verdict manquant ;

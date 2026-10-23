@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 
-from . import land, lot_class, merge_queue, review, storage, work
+from . import land, lot_class, merge_queue, packet_guard, review, storage, work
 from .train import MemberDeferred, TrainError, identity
 from .train_review import SHA
 
@@ -61,13 +61,17 @@ class Requirement:
     #: paths need two distinct families) instead of trusting the count alone.
     files: tuple = ()
 
+    def klass(self) -> dict:
+        """La classe et les chemins classés, lus par la porte des avis (#2681)."""
+        return {"class": self.risk, "files": list(self.files)}
+
     def check(self, row, base):
         if (self.lot, self.base, self.head) != (row["work_item_id"], base, row["frozen_sha"]):
             raise TrainError("review policy covers another lot, base or frozen head")
         if not isinstance(self.policy_commit, str) or not SHA.fullmatch(self.policy_commit):
             raise TrainError("versioned review policy required")
         if type(self.reviews) is not int or self.risk not in _RISKS \
-                or self.reviews not in ({0} if self.risk == "light" else {1, 2}):
+                or self.reviews not in ({0, 1, 2} if self.risk == "light" else {1, 2}):
             raise TrainError("explicit known non-release review requirement expected")
         files = _classified(self.files)
         worst = max((entry["class"] for entry in files), key=review.RANK.__getitem__)
@@ -101,6 +105,87 @@ class Admissions:
         return storage.of(self.db).work_dependencies.for_items(
             [int(row["work_item_id"]) for row in rows]) if rows else []
 
+    # -- packet-cutoff admission (#2965) -------------------------------------
+
+    def _packet_generations(self, rows) -> set:
+        """(lot, generation, frozen_id) the train itself allocated."""
+        ids = sorted({int(row["work_item_id"]) for row in rows})
+        if not ids:
+            return set()
+        marks = ", ".join(["%s"] * len(ids))
+        receipts = self.db.query(
+            "SELECT work_item_id, generation, frozen_id, kind"
+            " FROM integration_train_queue_receipts"
+            " WHERE work_item_id IN (" + marks + ") ORDER BY id", tuple(ids))
+        return {(int(receipt["work_item_id"]), int(receipt["generation"]),
+                 receipt["frozen_id"])
+                for receipt in receipts if receipt["kind"] == "packet"}
+
+    def _admission_instant(self, row, base):
+        """The candidate's admissibility instant, read by its own admission.
+
+        Same policy, same review gate and same historical proof as
+        `_member_proof`; only the queue insertion is left out.
+        """
+        item = self.ops.get(row["work_item_id"])
+        if item is None:
+            return None
+        requirement = self.policy(item, row, base, self.history.path)
+        if not isinstance(requirement, Requirement):
+            return None
+        requirement.check(row, base)
+        historical = self.history.qualify(
+            row, base, required=requirement.reviews, klass=requirement.klass())
+        value = ((historical or {}).get("reviews") or {}).get("admitted_ts")
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            return None
+        return float(value)
+
+    def admitted(self, rows, slot, base, *, proofs=None):
+        """Rows admissible at the packet cutoff (#2965).
+
+        A row this train enrolled (a packet allocation receipt) is dated by
+        the instant its admission became complete: effective freeze and
+        verdicts that complete the gate, read by the same admission reader.
+        Any other (manual) queue insertion keeps its own instant, so an
+        admission placed by hand after the cutoff stays late. `proofs` is the
+        enrollment result of the current pass, a fast path over the same
+        persisted facts; an absent or unreadable instant keeps the queue
+        timestamp, never an inferred one.
+        """
+        try:
+            cutoff = float(slot)
+        except (TypeError, ValueError) as exc:
+            raise TrainError("numeric packet cutoff required") from exc
+        if isinstance(slot, bool):
+            raise TrainError("numeric packet cutoff required")
+        instant = {}
+        for item in (proofs or {}).get("admitted") or ():
+            entry = item.get("entry") or {}
+            try:
+                value = item["proof"]["members"][0]["history"]["reviews"]["admitted_ts"]
+            except (KeyError, IndexError, TypeError):
+                continue
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                continue
+            instant[identity(entry)] = float(value)
+        allocated = self._packet_generations(rows)
+        out = []
+        for row in rows:
+            stamp = instant.get(identity(row))
+            packet = (int(row["work_item_id"]), int(row["generation"]), row["frozen_id"])
+            if stamp is None and packet in allocated:
+                try:
+                    stamp = self._admission_instant(row, base)
+                except TrainError:
+                    # An unreadable admission is not an earlier admission.
+                    stamp = None
+            if stamp is None:
+                stamp = float(row["queued_ts"])
+            if stamp <= cutoff:
+                out.append(row)
+        return out
+
     def _current(self, row, current):
         fresh = current.get(row["work_item_id"])
         if fresh is None or identity(fresh) != identity(row) or fresh["branch"] != row["branch"]:
@@ -115,6 +200,10 @@ class Admissions:
             raise TrainError("lot target changed since admission")
         if lot_class.release_reason(item, row["target"]):
             raise TrainError("release lots cannot enter an automatic train")
+        if packet_guard.is_packet_branch(item["branch"]):
+            # #2908 : un paquet en file est un véhicule, jamais un membre.
+            raise TrainError("packet-vehicle: branch %s is itself a package, never a unit"
+                             % item["branch"])
         return item
 
     def qualify(self, rows, base, mode):
@@ -144,7 +233,8 @@ class Admissions:
         if not isinstance(requirement, Requirement):
             raise TrainError("trusted policy returned no structured review requirement")
         requirement.check(row, base)
-        historical = self.history.qualify(row, base, required=requirement.reviews)
+        historical = self.history.qualify(row, base, required=requirement.reviews,
+                                          klass=requirement.klass())
         proof = dict(admission=identity(row), policy=asdict(requirement), history=historical)
         if mode == "targeted":
             ci = self.targeted_ci(row) if self.targeted_ci is not None else None

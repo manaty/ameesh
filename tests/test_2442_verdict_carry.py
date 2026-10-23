@@ -24,7 +24,7 @@ from unittest import mock
 from ameesh import db as db_mod
 from ameesh import lot_class, merge_queue, plan_git, registry, verdict_carry, work
 
-from .support import PgTestCase
+from .support import PgTestCase, patch_families
 
 A = "a" * 40
 B = "b" * 40
@@ -36,7 +36,7 @@ ENV = dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@example.invalid"
 FAM = {"author": "deepseek", "rev1": "claude", "rev2": "codex"}
 
 
-def _family(db, name):
+def _family(db, name, **kw):
     return FAM.get(str(name or "").strip(), "")
 
 
@@ -342,6 +342,9 @@ class CarryTest(PgTestCase):
             registry.upsert(cls.db, name, harness=harness, host="pc")
 
     def setUp(self) -> None:
+        # #2664 : le banc n'a pas de canon Git, les familles compilées sont
+        # épinglées ; le registre seedé en setUpClass reste en place.
+        patch_families(self)
         self.repo = Repo()
         self.addCleanup(self.repo.cleanup)
         self.lot = work.add(self.db, title="un lot", branch="lot/9-x",
@@ -349,7 +352,18 @@ class CarryTest(PgTestCase):
         work.milestone(self.db, self.lot, "frozen", sha=self.repo.reviewed, actor="author")
 
     def verdict(self, actor, sha, verdict="ok"):
-        work.milestone(self.db, self.lot, "verdict", sha=sha, actor=actor, verdict=verdict)
+        mark = work.milestone(self.db, self.lot, "verdict", sha=sha, actor=actor,
+                              verdict=verdict)
+        # #2928 : la porte sensible ne compte que les verdicts à reçu exact.
+        full = _git(self.repo.root, "rev-parse", sha)
+        harness = FAM[actor]
+        self.db.execute(
+            "INSERT INTO provenance_receipts"
+            " (subject, sha, actor, session, turn, harness, work_item_id)"
+            " VALUES (%s, %s, %s, %s, %s, %s, %s)"
+            " ON CONFLICT (subject) DO NOTHING",
+            ("milestone:%d" % int(mark["id"]), full, actor, "s-" + harness,
+             "t", harness, self.lot))
 
     def freeze(self, sha):
         work.milestone(self.db, self.lot, "frozen", sha=sha, actor="author")
@@ -490,8 +504,16 @@ class CarryTest(PgTestCase):
 
         def genuine():
             try:
-                work.milestone(other, self.lot, "verdict", sha=frozen, actor="rev1",
-                               verdict="blocked")
+                mark = work.milestone(other, self.lot, "verdict", sha=frozen, actor="rev1",
+                                      verdict="blocked")
+                # #2928 : l'avis réel porte son reçu exact, comme au runner.
+                other.execute(
+                    "INSERT INTO provenance_receipts"
+                    " (subject, sha, actor, session, turn, harness, work_item_id)"
+                    " VALUES (%s, %s, %s, %s, %s, %s, %s)"
+                    " ON CONFLICT (subject) DO NOTHING",
+                    ("milestone:%d" % int(mark["id"]), frozen, "rev1",
+                     "s-claude", "t", FAM["rev1"], self.lot))
             except Exception as exc:  # noqa: BLE001 - remonté par l'assertion
                 errors.append(exc)
             finally:
@@ -538,6 +560,18 @@ class CarryTest(PgTestCase):
                       " 'réel, transaction ouverte avant le report',"
                       " to_timestamp(%s))",
                       (self.lot, frozen, original["at_ts"] + 0.0005))
+        # #2928 : cet avis réel porte lui aussi son reçu exact.
+        blocked = self.db.query(
+            "SELECT id FROM work_item_milestones WHERE work_item_id = %s"
+            " AND kind = 'verdict' AND actor = 'rev1' AND verdict = 'blocked'"
+            " ORDER BY id DESC LIMIT 1", (self.lot,))[0]
+        self.db.execute(
+            "INSERT INTO provenance_receipts"
+            " (subject, sha, actor, session, turn, harness, work_item_id)"
+            " VALUES (%s, %s, %s, %s, %s, %s, %s)"
+            " ON CONFLICT (subject) DO NOTHING",
+            ("milestone:%d" % int(blocked["id"]), frozen, "rev1", "s-claude", "t",
+             FAM["rev1"], self.lot))
         gate = self.gate(frozen)
         self.assertFalse(gate["ok"])
         self.assertEqual([b["actor"] for b in gate["blocked"]], ["rev1"])
@@ -566,7 +600,9 @@ class CarryTest(PgTestCase):
         self.verdict("rev1", self.repo.reviewed)
         frozen = self.repo.merge_target()
         out, err = io.StringIO(), io.StringIO()
-        with mock.patch.dict(os.environ, self.env(), clear=True), \
+        with mock.patch.dict(os.environ,
+                             dict(self.env(), AGENT_MAIL_NAME="author"),
+                             clear=True), \
                 mock.patch.object(lot_class, "repository", return_value=self.repo.root), \
                 contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             code = mesh_cli.main(["work", "milestone", str(self.lot), "frozen", "--sha",

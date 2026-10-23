@@ -156,6 +156,72 @@ class SendMailTest(unittest.TestCase):
             self.assertEqual([s for s in self._pass(stale) if s["key"].endswith("1-2")], [])
             self.assertEqual([s for s in self._pass(report) if s["key"].endswith("1-2")], [])
 
+    def test_reassigned_conflict_notifies_new_holder_once(self):
+        import copy
+        report = radar.scan(self.repo, ASSIGNED, migrations=MIG)
+        self._pass(report)
+        reassigned = copy.deepcopy(report)
+        for branch in reassigned["branches"]:
+            if branch["work_item"] == 1:
+                branch["assignee"] = "a3"
+        out = self._pass(reassigned)
+        self.assertEqual([(s["lot"], s["to"]) for s in out], [(1, "a3"), (1, "a3")])
+        self.assertEqual(self._pass(reassigned), [])
+
+    def test_continuous_conflict_on_changed_head_notifies_once(self):
+        import copy
+        report = radar.scan(self.repo, ASSIGNED, migrations=MIG)
+        self._pass(report)
+        moved = copy.deepcopy(report)
+        for pair in moved["pairs"]:
+            if pair["lots"] == [1, 2]:
+                pair["tips"] = [pair["tips"][0], "f" * 40]
+        out = self._pass(moved)
+        self.assertEqual(sorted(s["to"] for s in out if s["key"] == "pair:1-2"),
+                         ["a1", "a2"])
+        self.assertEqual(self._pass(moved), [])
+
+    def test_continuous_conflict_on_moved_target_is_not_resent(self):
+        import copy
+        report = radar.scan(self.repo, ASSIGNED, migrations=MIG)
+        self._pass(report)
+        moved = copy.deepcopy(report)
+        for branch in moved["branches"]:
+            branch["target_head"] = "e" * 40
+        self.assertEqual([s for s in self._pass(moved) if s["key"] == "pair:1-2"], [])
+
+    def test_flapping_migration_notice_keeps_same_delivery(self):
+        import copy
+        report = radar.scan(self.repo, ASSIGNED, migrations=MIG)
+        self._pass(report)
+        missing = copy.deepcopy(report)
+        missing["migrations"] = []
+        self.assertEqual(self._pass(missing), [])
+        self.assertEqual(self._pass(report), [])
+
+    def test_legacy_migration_state_without_fingerprint_is_not_resent(self):
+        # #2640: migration/unreserved conflicts had no fingerprint before
+        # #2602; the first pass after the upgrade must not resend the active
+        # notice just because the state has no `fp` yet.
+        import copy
+        report = radar.scan(self.repo, ASSIGNED, migrations=MIG)
+        radar._write_notified(self.cfg, "ameesh",
+                              {"migration:main:0002": {"1": "passive", "3": "passive"}})
+        self.assertEqual([s for s in self._pass(report)
+                          if s["key"] == "migration:main:0002"], [])
+        state = radar.read_notified(self.cfg, "ameesh")["migration:main:0002"]
+        self.assertIn("fp", state)
+        self.assertEqual([s for s in self._pass(report)
+                          if s["key"] == "migration:main:0002"], [])
+        # a changed lot head is still a new input
+        moved = copy.deepcopy(report)
+        for branch in moved["branches"]:
+            if branch["work_item"] == 3:
+                branch["tip"] = "f" * 40
+        self.assertEqual(sorted(s["to"] for s in self._pass(moved)
+                                if s["key"] == "migration:main:0002"),
+                         ["a1", "a1"])
+
     def test_failed_send_is_retried(self):
         report = radar.scan(self.repo, ASSIGNED, migrations=MIG)
         with mock.patch.object(mail, "send", side_effect=RuntimeError("base")):

@@ -51,6 +51,10 @@ class Repo:
     def __init__(self) -> None:
         self.root = tempfile.mkdtemp(prefix="ameesh-2542-")
         subprocess.run(["git", "init", "-q", "-b", "main", self.root], check=True, env=ENV)
+        # #2786 : un gel n'est jamais la tête de la cible (aucun commit
+        # propre) ; un socle sur main, puis les commits sur une branche de lot.
+        _git(self.root, "commit", "-q", "--allow-empty", "-m", "socle")
+        _git(self.root, "checkout", "-q", "-b", "lot/test")
 
     def commit(self, *, script: str | None = None, path: str = "lot.txt",
                text: str = "lot\n") -> str:
@@ -129,6 +133,29 @@ class ScriptTest(unittest.TestCase):
         self.addCleanup(shutil.rmtree, root, True)
         code, _out = self.main(root)
         self.assertEqual(code, 2)
+
+    def test_garde_mecanique_refuse_un_litteral_et_montre_le_constat(self):
+        """#2809 : le vrai garde du projet tourne sur l'arbre contrôlé."""
+        root = self.tree()
+        shutil.copyfile(REPO / "scripts/garde-mecanique.py",
+                        pathlib.Path(root, "scripts/garde-mecanique.py"))
+        checks = tuple(c for c in script.CHECKS
+                       if "scripts/garde-mecanique.py" in c[1])
+        self.assertEqual(len(checks), 1)
+        source = pathlib.Path(root, "src/ameesh/example.py")
+        source.write_text("def f(*, distinct_families=False):\n    pass\n",
+                          encoding="utf-8")
+        code, out = self.main(root, checks)
+        self.assertEqual(code, 1, out)
+        self.assertIn("RED garde mécanique", out)
+        self.assertIn("src/ameesh/example.py", out)
+        self.assertIn("reviews.distinct_families", out)
+        # Une lecture dynamique du canon est acceptée par le même contrôle.
+        source.write_text("distinct_families = policy.distinct_families\n",
+                          encoding="utf-8")
+        code, out = self.main(root, checks)
+        self.assertEqual(code, 0, out)
+        self.assertIn("ok  garde mécanique", out)
 
 
 class GuardTest(unittest.TestCase):
@@ -235,10 +262,54 @@ class CliTest(PgTestCase):
 
     def freeze(self, sha, *extra):
         return self.mesh("work", "milestone", str(self.lot), "frozen", "--sha", sha,
-                         "--actor", "author", "--repo", self.repo.root, *extra)
+                         "--actor", "author", "--repo", self.repo.root, *extra,
+                         env=self.env(AGENT_MAIL_NAME="author"))
 
     def frozen(self) -> list:
         return [m for m in work.milestones(self.db, self.lot) if m["kind"] == "frozen"]
+
+    def test_symbolic_refs_refused_even_when_checks_skipped(self):
+        self.repo.commit(script=GREEN)
+        for ref in ("HEAD", "main", "HEAD~0", "refs/heads/main", ""):
+            with self.subTest(ref=ref):
+                proc = self.freeze(ref, "--no-static-checks", "incident")
+                self.assertEqual(proc.returncode, 1, proc.stdout)
+                self.assertIn("head-missing", proc.stderr)
+                self.assertEqual(self.frozen(), [])
+
+    def test_abbreviation_is_stored_as_full_commit(self):
+        sha = self.repo.commit(script=GREEN)
+        proc = self.freeze(sha[:12].upper())
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual([m["sha"] for m in self.frozen()], [sha])
+
+    def test_short_and_unknown_abbreviations_refused(self):
+        sha = self.repo.commit(script=GREEN)
+        for ref, cause in ((sha[:7], "head-missing"),
+                           ("deadbeefdead", "head-unresolved")):
+            with self.subTest(ref=ref):
+                proc = self.freeze(ref)
+                self.assertEqual(proc.returncode, 1, proc.stdout)
+                self.assertIn(cause, proc.stderr)
+                self.assertEqual(self.frozen(), [])
+
+    def test_direct_api_refuses_symbolic_ref_before_hook(self):
+        self.repo.commit(script=GREEN)
+        hook = mock.Mock()
+        with self.assertRaisesRegex(work.WorkError, "head-missing"):
+            work.milestone(self.db, self.lot, "frozen", sha="HEAD",
+                           repo=self.repo.root, on_frozen=hook)
+        hook.assert_not_called()
+        self.assertEqual(self.frozen(), [])
+
+    def test_direct_api_expands_abbreviation_before_hook(self):
+        sha = self.repo.commit(script=GREEN)
+        seen = []
+        work.milestone(self.db, self.lot, "frozen", sha=sha[:12],
+                       repo=self.repo.root,
+                       on_frozen=lambda tx, milestone, threads: seen.append(milestone["sha"]))
+        self.assertEqual(seen, [sha])
+        self.assertEqual([m["sha"] for m in self.frozen()], [sha])
 
     def test_rouge_refuse_le_gel_sans_jalon(self):
         proc = self.freeze(self.repo.commit(script=RED))
@@ -254,7 +325,10 @@ class CliTest(PgTestCase):
         self.assertEqual(self.frozen(), [])
         proc = self.freeze(sha, "--no-static-checks", "incident #1", "--note", "regel")
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertEqual(self.frozen()[0]["note"], "regel — static checks skipped: incident #1")
+        note = self.frozen()[0]["note"]
+        self.assertIn("regel — static checks skipped: incident #1", note)
+        # #2786 (5) : la marque machine des branches absentes au gel suit.
+        self.assertIn("ameesh-freeze-absent: main", note)
 
     def test_vert_gele_et_le_dit(self):
         sha = self.repo.commit(script=GREEN)
@@ -266,14 +340,28 @@ class CliTest(PgTestCase):
 
     def test_sans_depot_qui_porte_le_sha_le_gel_passe_et_le_dit(self):
         proc = self.mesh("work", "milestone", str(self.lot), "frozen", "--sha", "a" * 40,
-                         "--actor", "author")
+                         "--actor", "author",
+                         env=self.env(AGENT_MAIL_NAME="author"))
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("static checks not run", proc.stderr)
         self.assertEqual(len(self.frozen()), 1)
 
+    def test_la_prevalidation_est_appelee_apres_le_gel_sans_le_defaire(self):
+        # #2644 : le jalon est écrit avant la prévalidation ; un rouge ou une
+        # indisponibilité ne change pas le sort du gel. Le geste est un vrai
+        # sous-processus : on lit sa trace au journal, pas un mock.
+        sha = self.repo.commit(script=GREEN)
+        proc = self.freeze(sha)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual([m["sha"] for m in self.frozen()], [sha])
+        notes = [e.get("note") or "" for e in work.events(self.db, self.lot)]
+        self.assertTrue(any(n.startswith("prevalidation") for n in notes), notes)
+        self.assertNotIn("prevalidation: ", proc.stderr)
+
     def test_options_du_gel_refusees_hors_gel(self):
         proc = self.mesh("work", "milestone", str(self.lot), "verdict", "ok", "--sha", "a" * 40,
-                         "--actor", "rev", "--no-static-checks", "x")
+                         "--actor", "rev", "--no-static-checks", "x",
+                         env=self.env(AGENT_MAIL_NAME="rev"))
         self.assertEqual(proc.returncode, 1)
         self.assertIn("only apply to a freeze", proc.stderr)
 

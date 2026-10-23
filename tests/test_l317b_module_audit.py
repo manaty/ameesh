@@ -179,6 +179,11 @@ class AuditEvidenceTest(PgTestCase):
         sender = notify.DrySender()
         ncfg = notify.parse_config({"default_human": "human:owner", "default": ["desktop"]})
         self.db.execute("UPDATE agent_registry SET chantier = 'acme' WHERE name = 'orch'")
+        # #3036 : un brief ne part plus à un agent sans bail vivant ; ce banc
+        # simule le runner qui tient les deux destinataires.
+        self.db.execute("UPDATE agent_registry SET lease_owner = 'runner-' || name,"
+                        " lease_expires_at = now() + interval '1 hour'"
+                        " WHERE name IN ('orch', 'auditeur')")
         cfg = dataclasses.replace(self.cfg, canon="test-canon")
         notifier = notify.Notifier(cfg, ncfg, sender=sender, log=lambda text: None, clock=lambda: 200.)
         alert = dict(self.findings()[0], orchestrators=["orch"])
@@ -198,6 +203,10 @@ class AuditEvidenceTest(PgTestCase):
 
     def scoped_notifier(self, sender=None):
         registry.upsert(self.db, "orch", chantier="acme", harness="claude", host=self.cfg.host)
+        # #3036 : le brief n'est plus déposé à un agent sans bail vivant ; ce
+        # banc simule un runner qui tient l'orchestrateur.
+        self.db.execute("UPDATE agent_registry SET lease_owner = 'runner-' || name,"
+                        " lease_expires_at = now() + interval '1 hour' WHERE name = 'orch'")
         cfg = dataclasses.replace(self.cfg, canon="test-canon")
         ncfg = notify.parse_config({"default_human": "human:owner", "default": ["desktop"]})
         return notify.Notifier(cfg, ncfg, sender=sender or notify.DrySender(),

@@ -158,14 +158,29 @@ or, for a lot carried by an open integration packet (#2335):
 A packet is a structured carrier, not prose: an open work item whose branch
 starts with `integration/`, whose body/manifest names each carried lot with
 its frozen head (`#<lot> @ <sha>` / `#<lot> <sha>`, at least 7 hex digits).
-A bare `#<lot>` in running text is **not** an inclusion — an excluded lot
-(« #2203 exclu », « garder #1024 ») must keep its `stale` and `slo_breach`
-alerts. The units declared with their head wait for the packet merge, not for
-a lot executor, so `stale` and `slo_breach` are silenced for them. The
-`verdict_merge` clock of a merge-ready lot starts at the first packet slot
-after its GO (`mechanics.next_packet` as soon as the canon declares a cadence,
-even between two packets; otherwise the observed hourly UTC cut-off): the
-time before that slot is not a delay under canon §11 bis.
+Since #2599 the carrier's body may omit that list: the `ameesh-work: <lot>`
+trailers of the composition commits on its branch, above the target, are also
+read (the repo comes from `radar.projects.<app>.repo`, or from a registry
+clone that resolves the carrier's head when the reading host has no such
+setting, #2837; an unreadable branch concludes nothing and the alert stays
+due). A bare `#<lot>` in running text
+is **not** an inclusion — an excluded lot (« #2203 exclu », « garder #1024 »)
+must keep its `stale` and `slo_breach` alerts. The units declared with their
+head wait for the packet merge, not for a lot executor, so `stale` and
+`slo_breach` are silenced for them. The `verdict_merge` clock of a merge-ready
+lot starts at the first packet slot after its GO (`mechanics.next_packet` as
+soon as the canon declares a cadence, even between two packets; otherwise the
+observed hourly UTC cut-off): the time before that slot is not a delay under
+canon §11 bis. On the normal path — any lot with a current GO and no declared
+exception — the target is the real p80 of the packet CI (`progress.ci_suite`,
+7-day window, #2919), with the table's 30-minute target as the fallback when
+no suite is measured — that packet row has no P1 column, so a P1 keeps 30
+min, not 15 —; the ×2/×3 thresholds apply to it. A unit declared by an
+open packet has no escalation target of its own — the packet composer or the
+pilot carries the merge (canon §9, owner decision #103509 option a, home#147).
+A `packet-exception incident|unblock sha=… reason=…` declared for the current
+head takes the lot out of the packet: the table target (30 min; 15 min in P1)
+runs from the GO and the escalation applies.
 
 `planned_wait` is null when no explicit wait applies. While it applies,
 `stale` is null and no `stale_lot` is raised, so the notifier also stops its

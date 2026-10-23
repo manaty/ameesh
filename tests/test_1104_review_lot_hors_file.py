@@ -122,7 +122,7 @@ class ClassAtMergeRuleTest(unittest.TestCase):
 
     def test_une_panne_de_lecture_du_diff_ne_classe_pas_light(self):
         out, of_lot = self.call({"side_effect": RuntimeError("panne de lecture")})
-        of_lot.assert_not_called()
+        self.assertFalse(of_lot.called, "of_lot ne classe pas un doute")
         self.assertEqual(out["class"], "sensitive")
         self.assertTrue(out["doubt"])
         self.assertIn("lecture du diff impossible", out["why"])
@@ -131,7 +131,7 @@ class ClassAtMergeRuleTest(unittest.TestCase):
         """Gel lisible et ancêtre de la cible, commit de fusion absent du
         dépôt : le repli serait un diff vide, donc « light »."""
         out, of_lot = self.call({"return_value": None})
-        of_lot.assert_not_called()
+        self.assertFalse(of_lot.called, "of_lot ne classe pas un doute")
         self.assertEqual(out["class"], "sensitive")
         self.assertTrue(out["doubt"])
         self.assertIn("ne contient pas le commit", out["why"])
@@ -799,8 +799,11 @@ class CloseGuardWitnessTest(_Witness):
         self.assertIn("pilote", text)
         self.assertIn("abandon/remplacement", text)
 
-    def verdict(self, lot, sha, actor):
-        work.milestone(self.db, lot, "verdict", sha=sha, actor=actor, verdict="ok")
+    def verdict(self, lot, sha, actor, verdict="ok"):
+        # Témoin de lecture de la porte des avis : le verdict est posé au
+        # stockage (les writes synthétiques de la porte #2962 sont ailleurs).
+        return storage.of(self.db).work.add_milestone(
+            lot, "verdict", sha=sha, actor=actor, verdict=verdict, note="")
 
     def test_la_marque_porte_le_nombre_d_avis_et_le_sha(self):
         sha = "b" * 40
@@ -865,8 +868,7 @@ class CloseGuardWitnessTest(_Witness):
         sha = "f" * 40
         lot, review = self.critical_review(sha)
         self.verdict(lot, sha, "codex1")
-        work.milestone(self.db, lot, "verdict", sha=sha, actor="codex1",
-                       verdict="blocked")
+        self.verdict(lot, sha, "codex1", verdict="blocked")
         self.verdict(lot, sha, "claude2")
         with self.assertRaises(work.WorkError):
             work.close(self.db, review, delivered=True, sha=sha, actor="claude2")
@@ -882,8 +884,7 @@ class CloseGuardWitnessTest(_Witness):
         out = review_lot.open_after_merge(
             self.db, lot=lot, klass={"class": "light", "why": "policy"},
             merged_sha=sha)
-        work.milestone(self.db, lot, "verdict", sha=sha, actor="codex1",
-                       verdict="blocked")
+        self.verdict(lot, sha, "codex1", verdict="blocked")
         self.verdict(lot, sha, "deepseek2")
         with self.assertRaises(work.WorkError) as ctx:
             work.close(self.db, out["id"], delivered=True, sha=sha, actor="deepseek2")
@@ -935,8 +936,8 @@ class CloseGuardWitnessTest(_Witness):
         sha = "6" * 40
         lot, review = self.critical_review(sha)
         work.assign(self.db, review, "codex1", actor="orch")
-        self.verdict(lot, "bad0000", "codex1")
-        self.verdict(lot, "bad0000", "claude2")
+        self.verdict(lot, "bad" + "0" * 37, "codex1")
+        self.verdict(lot, "bad" + "0" * 37, "claude2")
         with self.assertRaises(work.WorkError):
             work.close(self.db, review, done=True, actor="codex1")
         self.verdict(lot, sha, "codex1")
@@ -948,8 +949,7 @@ class CloseGuardWitnessTest(_Witness):
         sha = "5" * 40
         lot, review = self.critical_review(sha)
         work.assign(self.db, review, "codex1", actor="orch")
-        work.milestone(self.db, lot, "verdict", sha=sha, actor="codex1",
-                       verdict="blocked")
+        self.verdict(lot, sha, "codex1", verdict="blocked")
         self.verdict(lot, sha, "claude2")
         with self.assertRaisesRegex(work.WorkError, "bloquant"):
             work.close(self.db, review, done=True, actor="claude2")
@@ -964,7 +964,7 @@ class CloseGuardWitnessTest(_Witness):
             self.db, lot=lot, klass={"class": "light", "why": "policy"},
             merged_sha=sha)
         work.assign(self.db, out["id"], "codex1", actor="orch")
-        self.verdict(lot, "bad0000", "codex1")
+        self.verdict(lot, "bad" + "0" * 37, "codex1")
         with self.assertRaises(work.WorkError):
             work.close(self.db, out["id"], done=True, actor="codex1")
         self.verdict(lot, sha, "codex1")
@@ -978,8 +978,7 @@ class CloseGuardWitnessTest(_Witness):
         review = work.add(self.db, title="R1 Codex #%d : avis" % int(parent),
                           source="mail", issue_ref="manaty/ameesh#941",
                           app="ameesh", assignee="codex1")["id"]
-        work.milestone(self.db, parent, "verdict", verdict="blocked",
-                       sha="3" * 40, actor="codex1")
+        self.verdict(parent, "3" * 40, "codex1", verdict="blocked")
         row = work.close(self.db, review, done=True, actor="codex1")
         self.assertEqual(row["state"], "closed")
 

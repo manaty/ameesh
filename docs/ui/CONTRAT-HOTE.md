@@ -130,7 +130,37 @@ const unbind = connectHost(host, {
 | `ameesh:open-project`, `ameesh:open-agent`, `ameesh:open-lot` | the row (`detail.project`, `detail.agent` or `detail.lot` carries the identifier) | `open(target)` |
 | `ameesh:approval-requested` | `{ url }` or the URL string | `openApproval(url)` |
 | `ameesh:alert` | `AmeeshHostAlert` or the text | `notify(alert)` |
+| `ameesh:stop` | `{agent, mode, runner?, mesh?}` (L93) | `stopAgent(agent, options)` |
 | `ameesh:unauthorized` | — | listener: renew the token, ask the human |
+
+### `deviceState()` and `stopAgent(agent, options)` (L93)
+
+"my workstation" does not read a mesh: the local state of the machine's
+runners is served on Unix sockets (`ameesh-device/1`, see
+[`../DEVICE-LOCAL.md`](../DEVICE-LOCAL.md)). The **main process** reads and
+merges those sockets, then exposes `deviceState()`; the renderer sets it as
+the provider of `<ameesh-this-device>`:
+
+```js
+const device = document.querySelector("ameesh-this-device");
+device.provider = () => window.ameeshHost.deviceState();
+```
+
+A browser page cannot open a machine socket: without a provider, the
+component says so and renders nothing invented. `stopAgent(agent, options)`
+receives the component's `ameesh:stop`. No socket path crosses this contract:
+the main process validates the IPC sender and arguments, rediscovers local
+runners and resolves the agent's control socket from fresh local state. The
+page's agent/runner/mesh identifiers are untrusted hints; reject missing or
+ambiguous matches. `mode: "clean"` goes to the runner's
+control socket (`ameesh device stop <agent>`, status `stopped`, reason
+`manuel`, lots returned, turn ending at its safe point); `mode: "immediate"`
+is the **Compute runner's** gesture (destroy the sandbox), not an ameesh
+route and never an approval. The component offers explicit confirm/cancel
+buttons for immediate stop; the main process must obtain native confirmation
+as well before destroying the sandbox, including for a direct IPC request.
+Cancellation does nothing. Both members are optional; a host that does not
+lend its machine simply omits them.
 
 ### Several meshes
 

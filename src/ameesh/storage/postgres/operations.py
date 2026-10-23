@@ -273,6 +273,9 @@ class Operations(interface.Operations):
             UPDATE agent_registry AS r
                SET session_id = NULL,
                    session_work_item = NULL,
+                   -- L165 (EP3) : le brief de relève décrivait l'ancienne
+                   -- session ; il part avec elle.
+                   election_brief = NULL,
                    session_reset_at = clock_timestamp(),
                    -- le brief EN TÊTE, puis la consigne courante d'un tour qui
                    -- n'a pas abouti (bail expiré ou rendu), puis l'attente :
@@ -323,6 +326,9 @@ class Operations(interface.Operations):
                    session_cwd = coalesce(%s::text, r.cwd),
                    session_origin = %s,
                    session_work_item = NULL,
+                   -- L165 (EP3) : une session adoptée remplace tout brief de
+                   -- relève en attente.
+                   election_brief = NULL,
                    -- #1037 : un changement de harnais DÉCLARÉ emporte les
                    -- réglages du harnais précédent : les garder ferait lancer
                    -- le nouveau harnais avec le modèle, l'effort ou le tier de
@@ -372,6 +378,10 @@ class Operations(interface.Operations):
                SET session_id = CASE WHEN p.oubli THEN NULL ELSE r.session_id END,
                    session_work_item = CASE WHEN p.oubli THEN NULL
                                             ELSE r.session_work_item END,
+                   -- L165 (EP3) : oublier la session oublie le brief de relève
+                   -- qui la décrivait ; sans oubli, il reste en attente.
+                   election_brief = CASE WHEN p.oubli THEN NULL
+                                         ELSE r.election_brief END,
                    session_reset_at = CASE WHEN p.oubli THEN clock_timestamp()
                                            ELSE r.session_reset_at END,
                    pending_prompt = CASE
@@ -434,6 +444,7 @@ class Operations(interface.Operations):
                    -- pour un porteur : pas pour tous les lots ouverts (N2 de
                    -- la relecture dev7).
                    w.branch, w.branch_head,
+                   to_char(w.planned_start, 'YYYY-MM-DD') AS planned_start,
                    CASE WHEN left(btrim(w.branch), 12) = 'integration/' THEN w.body END AS body,
                    to_jsonb(w)->'reviewers' AS reviewers,
                    coalesce(to_jsonb(w)->>'workflow_ref', '') AS workflow_ref,
@@ -513,9 +524,10 @@ class Operations(interface.Operations):
             (int(limit) if limit is not None else None,))
 
     # -- usage par tour ------------------------------------------------------
-    def turns(self, *, agent, since_s, limit) -> list[dict]:
+    def turns(self, *, agent, since_s, limit, message=None) -> list[dict]:
         sql = ("SELECT id, agent, harness, turn, model, session, usd::float8 AS usd,"
                " input_tokens, cached_input_tokens, output_tokens, work_item_id,"
+               " inputs,"
                " extract(epoch from recorded_at)::float8 AS recorded_ts,"
                " extract(epoch from started_at)::float8 AS started_ts"
                " FROM turn_costs WHERE recorded_at >= now() - make_interval(secs => %s)"
@@ -524,6 +536,11 @@ class Operations(interface.Operations):
         if agent:
             sql += " AND agent = %s"
             params.append(agent)
+        if message is not None:
+            # L80b : les tours qui ont servi ce message (l'index GIN porte le
+            # contenant). Le coût rendu est celui du tour entier, jamais divisé.
+            sql += " AND inputs @> %s::jsonb"
+            params.append(json.dumps([str(message)]))
         sql += " ORDER BY recorded_at DESC, id DESC LIMIT %s"
         params.append(int(limit))
         return self.db.query(sql, tuple(params))

@@ -10,8 +10,10 @@ from __future__ import annotations
 import dataclasses
 import os
 import shutil
+import signal
 import subprocess
 import tempfile
+import time
 import types
 import unittest
 from datetime import datetime
@@ -116,7 +118,7 @@ class FakeGh:
         return 0, "", ""
 
 
-class ReleaseFixture(unittest.TestCase):
+class ReleaseFixtureMixin:
     maxDiff = None
 
     def setUp(self):
@@ -223,6 +225,8 @@ class ReleaseFixture(unittest.TestCase):
                                return_value=green or self.head):
             return release_cutoff.execute(self.cfg, None, self.project,
                                           now=now or _paris(11, 5), force=force)
+
+class ReleaseFixture(ReleaseFixtureMixin, unittest.TestCase):
 
     def test_release_tags_green_head_generates_notes_and_runs_staging(self):
         report = self.execute()
@@ -568,6 +572,259 @@ class ReleaseFixture(unittest.TestCase):
         self.assertEqual(plan.packets[0].package, "paquet-h-test")
 
 
+def _job(name, conclusion="success", status="completed"):
+    return {"name": name, "status": status, "conclusion": conclusion}
+
+
+def _run(run_id, jobs, *, event="push", workflow="tests", conclusion="success"):
+    return {"id": run_id,
+            "url": "https://github.com/manaty/ameesh/actions/runs/%d" % run_id,
+            "workflow": workflow, "event": event, "conclusion": conclusion,
+            "jobs": jobs}
+
+
+class PacketTreeGreenTest(ReleaseFixtureMixin, unittest.TestCase):
+    """#2692: a packet merge whose tree is the green packet head is green.
+
+    The target's CI is still in progress; the packet head's full suite was
+    validated before the merge, under the same jobs. These are the three
+    witnesses of the lot, plus the two guards (red target, red packet head)
+    and the evidence cited in the release notes.
+    """
+
+    def reference_run(self):
+        return _run(500, [
+            _job("plan"),
+            _job("psycopg 1/8"),
+            _job("psql 1/16"),
+            _job("plateforme macOS"),
+            _job("bilan des impactés"),
+            _job("tests"),
+            _job("version number", "skipped"),
+        ])
+
+    def packet_runs(self, *, missing=None):
+        """Two runs: the PR run (matrix) and the packet gate (flow checks)."""
+        jobs = [
+            _job("plan"),
+            _job("psycopg 1/8"),
+            _job("psql 1/16"),
+            _job("plateforme macOS"),
+            _job("bilan des impactés"),
+            _job("tests"),
+        ]
+        if missing:
+            jobs = [job for job in jobs if job["name"] != missing]
+        flows = [
+            _job("tests (flux) psql 1/16"),
+            _job("tests (flux) psycopg 1/8"),
+        ]
+        if missing:
+            flows = [job for job in flows if not job["name"].endswith(" " + missing)]
+        return [
+            _run(501, jobs, event="pull_request"),
+            _run(502, [
+                _job("couverture (PR ouverte sur cette tête)"),
+                _job("suite complète du paquet", "skipped"),
+                *flows,
+            ], workflow="paquet"),
+        ]
+
+    def second_packet(self, *, conflict=False, subject=(
+            "Merge pull request #101 from manaty/integration/paquet-h-2692")):
+        """A green main commit, then a packet head merged as a packet merge."""
+        self.write("main-2.txt", "main\n")
+        base = self.commit("main green base")
+        self.git(self.seed, "push", "-q", "origin", "main")
+        self.git(self.seed, "checkout", "-qb", "integration/paquet-h-2692")
+        self.write("packet-2.txt", "packet\n")
+        self.write("main-2.txt", "packet\n")
+        head = self.commit("packet head")
+        self.git(self.seed, "push", "-q", "origin", "integration/paquet-h-2692")
+        self.git(self.seed, "checkout", "-q", "main")
+        if not conflict:
+            self.git(self.seed, "merge", "--no-ff", "-q",
+                     "integration/paquet-h-2692", "-m", subject)
+            merge = self.git(self.seed, "rev-parse", "HEAD")
+            self.git(self.seed, "push", "-q", "origin", "main")
+            return base, base, head, merge
+        self.write("main-2.txt", "main edited\n")
+        second = self.commit("main green second")
+        proc = subprocess.run(["git", "-C", str(self.seed), "merge", "--no-ff",
+                               "integration/paquet-h-2692"],
+                              capture_output=True, text=True)
+        self.assertNotEqual(proc.returncode, 0, "a conflict is expected")
+        self.write("main-2.txt", "resolved\n")
+        self.commit(subject)
+        merge = self.git(self.seed, "rev-parse", "HEAD")
+        self.git(self.seed, "push", "-q", "origin", "main")
+        return base, second, head, merge
+
+    def ci(self, *, green=(), pending=(), failed=()):
+        def reading(project, sha):
+            if sha in failed:
+                return {"green": False, "pending": [], "failed": ["tests [main]"],
+                        "missing": []}
+            if sha in pending:
+                return {"green": False, "pending": ["tests [main]"], "failed": [],
+                        "missing": []}
+            return {"green": sha in green}
+        return reading
+
+    def suites(self, reference, head, *, missing=None):
+        def reading(project, sha):
+            if sha == head:
+                return {"head": sha, "runs": self.packet_runs(missing=missing)}
+            if sha == reference:
+                return {"head": sha, "runs": [self.reference_run()]}
+            return {"head": sha, "runs": []}
+        return reading
+
+    def plan(self, reading, suites):
+        with mock.patch.object(release_cutoff, "ci_reading", side_effect=reading), \
+             mock.patch.object(release_cutoff, "suite_reading", side_effect=suites):
+            return release_cutoff.build_plan(self.cfg, self.project,
+                                             now=_paris(11, 5))
+
+    def test_equal_tree_with_a_green_packet_and_running_target_is_green(self):
+        """Witness 1: arbre égal + paquet vert + main en cours → vert."""
+        base, _second, head, merge = self.second_packet()
+        plan = self.plan(self.ci(green=(base, head), pending=(merge,)),
+                         self.suites(base, head))
+        self.assertTrue(plan.ci.get("pending"), plan.ci)
+        self.assertFalse(plan.ci.get("green"))
+        self.assertTrue(plan.green)
+        self.assertEqual(plan.base, merge)
+        self.assertEqual(plan.last_green, merge)
+        self.assertEqual(plan.tree_green["head"], head)
+        self.assertEqual(plan.tree_green["reference"], base)
+        self.assertEqual(plan.tree_green["tree"],
+                         self.git(self.clone, "rev-parse", "%s^{tree}" % merge))
+        self.assertIn("tree of %s" % merge[:12], plan.notes)
+        self.assertIn(head[:12], plan.notes)
+        self.assertIn("actions/runs/501", plan.notes)
+        self.assertIn("reference run", plan.notes)
+        self.assertIn("#2000", plan.notes)
+
+    def test_equal_tree_with_a_red_target_never_inherits(self):
+        """Witness 2: arbre égal + main rouge → pas vert."""
+        base, _second, head, merge = self.second_packet()
+        plan = self.plan(self.ci(green=(base, head), failed=(merge,)),
+                         self.suites(base, head))
+        self.assertFalse(plan.green)
+        self.assertIsNone(plan.tree_green)
+        self.assertEqual(plan.base, base)
+        self.assertNotIn("tree of %s" % merge[:12], plan.notes)
+
+    def test_different_tree_never_inherits(self):
+        """Witness 3: arbre différent (résolution de conflit) → pas d'héritage."""
+        base, second, head, merge = self.second_packet(conflict=True)
+        self.assertFalse(release_cutoff.same_tree(
+            self.clone, merge, head))
+        plan = self.plan(self.ci(green=(base, second, head), pending=(merge,)),
+                         self.suites(second, head))
+        self.assertFalse(plan.green)
+        self.assertIsNone(plan.tree_green)
+        self.assertEqual(plan.base, second)
+
+    def test_a_red_packet_head_never_inherits(self):
+        """Guard: a red on main stays red only while the packet head is green."""
+        base, _second, head, merge = self.second_packet()
+        plan = self.plan(self.ci(green=(base,), pending=(merge,), failed=(head,)),
+                         self.suites(base, head))
+        self.assertFalse(plan.green)
+        self.assertIsNone(plan.tree_green)
+        self.assertEqual(plan.base, base)
+
+    def test_a_different_job_set_never_inherits(self):
+        """Same tree is not enough: the packet's jobs must be the target's."""
+        base, _second, head, merge = self.second_packet()
+        plan = self.plan(self.ci(green=(base, head), pending=(merge,)),
+                         self.suites(base, head, missing="psql 1/16"))
+        self.assertFalse(plan.green)
+        self.assertIsNone(plan.tree_green)
+        self.assertEqual(plan.base, base)
+
+    def test_a_smaller_ancestor_suite_cannot_replace_the_last_green_suite(self):
+        base, _second, head, merge = self.second_packet()
+        older = self.git(self.seed, "rev-parse", base + "^1")
+
+        def suites(project, sha):
+            if sha == head:
+                return {"head": sha, "runs": self.packet_runs(missing="psql 1/16")}
+            run = self.reference_run()
+            if sha == older:
+                run["jobs"] = [job for job in run["jobs"]
+                               if job["name"] != "psql 1/16"]
+            return {"head": sha, "runs": [run]}
+
+        plan = self.plan(self.ci(green=(base, head), pending=(merge,)), suites)
+        self.assertFalse(plan.green)
+        self.assertIsNone(plan.tree_green)
+        self.assertEqual(plan.base, base)
+
+    def test_a_failed_required_job_never_inherits(self):
+        """A green run cannot hide a required job that actually failed."""
+        base, _second, head, merge = self.second_packet()
+
+        def suites(project, sha):
+            runs = self.packet_runs()
+            if sha == head:
+                runs[0]["jobs"][1]["conclusion"] = "failure"
+                return {"head": sha, "runs": runs}
+            return {"head": sha, "runs": [self.reference_run()]}
+
+        plan = self.plan(self.ci(green=(base, head), pending=(merge,)), suites)
+        self.assertFalse(plan.green)
+        self.assertIsNone(plan.tree_green)
+        self.assertEqual(plan.base, base)
+
+    def test_a_similarly_named_job_never_stands_in_for_a_required_one(self):
+        """Only an exact job, a caller prefix or a flow run proves it."""
+        base, _second, head, merge = self.second_packet()
+
+        def suites(project, sha):
+            runs = self.packet_runs()
+            if sha == head:
+                runs[0]["jobs"] = [job for job in runs[0]["jobs"]
+                                   if job["name"] != "tests"]
+                runs[0]["jobs"].append(_job("sommaire des tests"))
+                return {"head": sha, "runs": runs}
+            return {"head": sha, "runs": [self.reference_run()]}
+
+        plan = self.plan(self.ci(green=(base, head), pending=(merge,)), suites)
+        self.assertFalse(plan.green)
+        self.assertIsNone(plan.tree_green)
+        self.assertEqual(plan.base, base)
+
+    def test_execute_releases_the_packet_tree_and_cites_the_runs(self):
+        """The release tags the packet merge's content, not the previous green."""
+        base, _second, head, merge = self.second_packet()
+        reading = self.ci(green=(base, head), pending=(merge,))
+        suites = self.suites(base, head)
+        with mock.patch.dict(os.environ,
+                             {"GIT_COMMITTER_DATE": "2026-10-18T11:04:00+0200"}), \
+             mock.patch.object(release_cutoff, "ci_reading", side_effect=reading), \
+             mock.patch.object(release_cutoff, "suite_reading", side_effect=suites):
+            report = release_cutoff.execute(self.cfg, None, self.project,
+                                            now=_paris(11, 5))
+        self.assertEqual(report["result"], "released", report)
+        self.assertEqual(report["version"], "1.11.8")
+        self.assertEqual(report["target_head"], merge)
+        self.assertEqual(report["release_sha"], report["landing_sha"])
+        self.assertEqual(self.git(self.clone, "rev-parse", "origin/main"),
+                         report["release_sha"])
+        self.assertEqual(self.git(self.clone, "rev-parse", "v1.11.8^{commit}"),
+                         report["release_sha"])
+        self.assertEqual(report["tree_green"]["head"], head)
+        notes = self.git(self.clone, "show", "origin/main:docs/versions/1.11.8.md")
+        self.assertIn("tree of %s" % merge[:12], notes)
+        self.assertIn(head[:12], notes)
+        self.assertIn("actions/runs/501", notes)
+        self.assertTrue(any("arbre identique" in text for text in report["deviations"]),
+                        report["deviations"])
+
+
 class StagingTimeoutTest(unittest.TestCase):
     def test_timeout_accepts_bytes_and_kills_the_process_group(self):
         """B2: partial bytes output must not break the report, children die."""
@@ -590,7 +847,8 @@ class StagingTimeoutTest(unittest.TestCase):
                 if self.calls == 1:
                     raise subprocess.TimeoutExpired("bash", timeout,
                                                     output=b"partial output\n")
-                return "", ""
+                # as Popen: a retried communicate returns the whole output
+                return "partial output\nrest\n", ""
 
         proc = FakeProc()
         project = release_cutoff.ProjectRelease(
@@ -601,6 +859,7 @@ class StagingTimeoutTest(unittest.TestCase):
              mock.patch.object(release_cutoff, "_drop_worktree"), \
              mock.patch.object(release_cutoff.subprocess, "Popen",
                                return_value=proc) as popen, \
+             mock.patch.object(release_cutoff, "_poste_units", return_value=[]), \
              mock.patch.object(release_cutoff, "_kill_group") as kill:
             with self.assertRaises(release_cutoff.TransientReleaseError):
                 release_cutoff.run_staging(project, "a" * 40, [],
@@ -611,7 +870,181 @@ class StagingTimeoutTest(unittest.TestCase):
         self.assertIn("partial output", log.read_text())
 
 
+
+# Fake `systemctl --user`: the transient units live in $UNITES_ETAT ("name
+# state pid" lines), alive while their pid is (a zombie is not); `stop` kills them unless
+# STOP_SANS_EFFET=1. LIST_KO=1 makes every read fail, LIST_KO_APRES_STOP=1
+# every read after a stop. Every call is appended to $UNITES_ETAT.calls.
+FAKE_SYSTEMCTL = r"""#!/usr/bin/env bash
+etat=$UNITES_ETAT
+shift
+cmd=$1; shift
+echo "$cmd $*" >> "$etat.calls"
+case $cmd in
+  list-units)
+    [ "${LIST_KO:-0}" = 1 ] && exit 1
+    [ "${LIST_KO_APRES_STOP:-0}" = 1 ] && [ -e "$etat.stopped" ] && exit 1
+    pat=${@: -1}
+    while read -r u st pid; do
+      etat_pid=$(ps -o stat= -p "$pid" 2>/dev/null) || continue
+      [[ $u == $pat && $etat_pid != Z* ]] && echo "$u loaded $st running [systemd-run] poste.sh"
+    done < "$etat" ;;
+  stop)
+    : > "$etat.stopped"
+    if [ "${STOP_SANS_EFFET:-0}" != 1 ]; then
+      while read -r u st pid; do kill "$pid" 2>/dev/null; done < "$etat"
+    fi ;;
+esac
+exit 0
+"""
+
+# A staging run that hands the workstation restart to a detached writer (as
+# systemd-run --pipe does, the "unit" keeps the staging stdout), then outlives
+# its timeout.
+SLOW_STAGING = """#!/usr/bin/env bash
+setsid sleep "$DUREE_UNITE" &
+echo "$!" >> "$UNITES_ETAT.pids"
+echo "poste-maj-staging-$$-redemarrer.service active $!" > "$UNITES_ETAT"
+echo "restart handed to poste-maj-staging-$$-redemarrer"
+sleep 30
+"""
+
+
+class StagingTimeoutUnitsTest(unittest.TestCase):
+    """#3049: a timed-out staging never drops the worktree under a live unit."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory(prefix="ameesh-3049-")
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+        self.worktree = self.root / "worktree"
+        script = self.worktree / "deploy/mise-a-jour/staging.sh"
+        script.parent.mkdir(parents=True)
+        script.write_text(SLOW_STAGING)
+        bin_dir = self.root / "bin"
+        bin_dir.mkdir()
+        (bin_dir / "systemctl").write_text(FAKE_SYSTEMCTL)
+        os.chmod(bin_dir / "systemctl", 0o755)
+        self.state = self.root / "units"
+        self.state.write_text("")
+        self.env = {"PATH": "%s:%s" % (bin_dir, os.environ.get("PATH", "")),
+                    "UNITES_ETAT": str(self.state), "DUREE_UNITE": "30"}
+        self.addCleanup(self.kill_units)
+
+    def kill_units(self):
+        pids = Path(str(self.state) + ".pids")
+        for pid in (pids.read_text().split() if pids.exists() else ()):
+            try:
+                os.kill(int(pid), signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+    def run_timeout(self, grace=0.6, **env):
+        project = release_cutoff.ProjectRelease(
+            name="ameesh", repo=str(self.root / "repo"), target="main",
+            staging="deploy/mise-a-jour/staging.sh", github="manaty/ameesh")
+        at_drop = []
+        started = time.monotonic()
+        with mock.patch.dict(os.environ, {**self.env, **env}), \
+             mock.patch.object(release_cutoff, "STAGING_UNIT_GRACE_S", grace), \
+             mock.patch.object(release_cutoff, "STAGING_UNIT_POLL_S", 0.05), \
+             mock.patch.object(release_cutoff, "STAGING_KILL_GRACE_S", 0.2), \
+             mock.patch.object(release_cutoff, "STAGING_DRAIN_S", 0.3), \
+             mock.patch.object(release_cutoff, "_worktree",
+                               return_value=(str(self.root), str(self.worktree))), \
+             mock.patch.object(release_cutoff, "_drop_worktree",
+                               side_effect=lambda *a: at_drop.append(self.live())):
+            with self.assertRaises(release_cutoff.TransientReleaseError) as caught:
+                release_cutoff.run_staging(project, "a" * 40, [],
+                                           state_dir=str(self.root), timeout_s=0.5)
+        # bounded: neither the held pipe nor the 30 s unit is waited for
+        self.assertLess(time.monotonic() - started, 10)
+        calls = Path(str(self.state) + ".calls").read_text().splitlines()
+        log = next((self.root / "release").glob("staging-*.log")).read_text()
+        self.assertIn("restart handed to", log)
+        return str(caught.exception), at_drop, calls
+
+    def live(self):
+        """pids of the fake units still alive"""
+        pids = Path(str(self.state) + ".pids")
+        alive = []
+        for pid in pids.read_text().split():
+            try:
+                stat = Path("/proc/%s/stat" % pid).read_text()
+            except OSError:
+                continue
+            if stat.rsplit(")", 1)[1].split()[0] != "Z":
+                alive.append(pid)
+        return alive
+
+    def stops(self, calls):
+        return [call for call in calls if call.startswith("stop")]
+
+    def test_the_worktree_is_dropped_once_the_unit_ended(self):
+        message, at_drop, calls = self.run_timeout(grace=5, DUREE_UNITE="2")
+        self.assertIn("timed out", message)
+        # seen alive while it held stdout, not after it ended
+        self.assertIn("ended before the worktree was dropped", message)
+        self.assertRegex(message, r"poste-maj-staging-\d+-redemarrer\.service")
+        self.assertEqual(at_drop, [[]])
+        self.assertEqual(self.stops(calls), [])
+
+    def test_a_unit_past_its_grace_is_stopped_before_the_drop(self):
+        message, at_drop, calls = self.run_timeout()
+        self.assertIn("stopped: the workstation may be half restarted", message)
+        self.assertEqual(at_drop, [[]])
+        self.assertRegex(self.stops(calls)[0], r"^stop poste-maj-staging-\d+-\*$")
+
+    def test_a_unit_that_survives_its_stop_keeps_the_worktree(self):
+        message, at_drop, _ = self.run_timeout(STOP_SANS_EFFET="1")
+        self.assertIn("still running", message)
+        self.assertIn("worktree kept", message)
+        self.assertEqual(at_drop, [])
+
+    def test_an_unreadable_state_keeps_the_worktree(self):
+        message, at_drop, calls = self.run_timeout(LIST_KO="1")
+        self.assertIn("unreadable state", message)
+        self.assertIn("worktree kept", message)
+        self.assertEqual(at_drop, [])
+        self.assertEqual(len(self.stops(calls)), 1, calls)
+
+    def test_an_unprovable_stop_keeps_the_worktree(self):
+        message, at_drop, _ = self.run_timeout(LIST_KO_APRES_STOP="1")
+        self.assertNotIn("stopped:", message)
+        self.assertIn("unreadable state", message)
+        self.assertEqual(at_drop, [])
+
+    def test_without_systemctl_there_is_no_unit(self):
+        with mock.patch.object(release_cutoff.shutil, "which", return_value=None):
+            self.assertEqual(release_cutoff._poste_units(1), [])
+            self.assertEqual(release_cutoff._settle_poste_units(1, time.sleep), ("", True))
+
+    def test_the_status_bullet_and_dead_units_are_not_live(self):
+        out = ("● poste-maj-staging-7-retour.service loaded failed failed x\n"
+               "poste-maj-staging-7-redemarrer.service loaded active running x\n"
+               "poste-maj-staging-7-vieux.service loaded inactive dead x\n")
+        done = subprocess.CompletedProcess([], 0, stdout=out, stderr="")
+        with mock.patch.object(release_cutoff.shutil, "which", return_value="systemctl"), \
+             mock.patch.object(release_cutoff, "_systemctl", return_value=done) as call:
+            self.assertEqual(release_cutoff._poste_units(7),
+                             ["poste-maj-staging-7-redemarrer.service"])
+        self.assertEqual(call.call_args.args[-1], "poste-maj-staging-7-*")
+        failed = subprocess.CompletedProcess([], 1, stdout="", stderr="no bus")
+        with mock.patch.object(release_cutoff.shutil, "which", return_value="systemctl"), \
+             mock.patch.object(release_cutoff, "_systemctl", return_value=failed):
+            self.assertIsNone(release_cutoff._poste_units(7))
+
+
 class PureReleaseTest(unittest.TestCase):
+    def test_a_rerun_of_the_same_suite_is_not_ambiguous(self):
+        same = {"runs": [_run(2, [_job("plan"), _job("tests")]),
+                         _run(1, [_job("plan"), _job("tests")])]}
+        self.assertIsNotNone(release_cutoff._full_suite_run(same))
+        other = {"runs": [_run(2, [_job("plan")]), _run(1, [_job("tests")])]}
+        self.assertIsNone(release_cutoff._full_suite_run(other))
+        empty = {"runs": [_run(3, [])]}
+        self.assertIsNone(release_cutoff._full_suite_run(empty))
+
     def test_version_bumps(self):
         self.assertEqual(release_cutoff.next_version("1.11.7"), "1.11.8")
         self.assertEqual(release_cutoff.next_version("1.11.7", bump="level", floor="minor"),

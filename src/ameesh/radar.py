@@ -1366,8 +1366,9 @@ def annotate_resolutions(cfg, db, project: Project, report: dict, lots: list[dic
         report["resolution_error"] = "%s: %s" % (type(exc).__name__, exc)
     try:
         resolutions.annotate(report, rows, {int(r["id"]): r for r in lots},
-                             replayer=resolutions.Replayer(project.repo,
-                                                           clone_dir(cfg, project.name)),
+                             replayer=resolutions.Replayer(
+                                 project.repo, clone_dir(cfg, project.name),
+                                 target=project.target),
                              cache=cache,
                              generated=frozenset(g.path for g in project.generated))
     except Exception as exc:  # noqa: BLE001 - never fatal for the pass
@@ -1437,6 +1438,9 @@ def _status_success(contexts, required) -> list:
 
 def latest_rollup(rollup) -> list:
     """#2524 : les derniers checks par (workflow, nom), statuts par contexte.
+    #3008 : une suite connue (`checkSuiteId`, rollup construit depuis les
+    check runs de la tête) entre dans la clé : deux workflows homonymes ne se
+    masquent pas.
 
     Seule une date strictement plus récente remplace une entrée. Dates
     absentes, invalides ou ex aequo : garder les entrées ambiguës afin de ne
@@ -1450,7 +1454,8 @@ def latest_rollup(rollup) -> list:
                    or "state" in entry and "conclusion" not in entry)
         name = entry.get("context" if context else "name")
         key = (("context", name) if context else
-               ("check", entry.get("workflowName"), name)) if name else ("unknown", index)
+               ("check", entry.get("workflowName"), entry.get("checkSuiteId"), name)
+               ) if name else ("unknown", index)
         # `gh` exporte la date d'un StatusContext sous `startedAt` (son
         # `createdAt` GraphQL) ; `createdAt` reste lu pour un rollup GraphQL brut.
         raw = (entry.get("startedAt") or entry.get("createdAt")) if context else entry.get("startedAt")
@@ -1470,9 +1475,130 @@ def latest_rollup(rollup) -> list:
     return latest
 
 
+def merge_rollup(rollup, *, slug: str, head: str, branch: str, gh) -> list:
+    """#2876 : remplacer un portier seulement sur preuve de son run annulé.
+
+    Lire le run PR et TOUS les runs push paquet de la composition : le plus
+    récent peut être actif sans aucun check visible dans le rollup. Sans
+    preuve API fraîche, aucun remplacement et aucun vert d'intégration.
+    `ci_green` reste un prédicat pur ; les lecteurs lui passent ce rollup.
+    """
+    from datetime import datetime
+    from urllib.parse import urlencode
+
+    original = list(rollup or ())
+    rows = latest_rollup(original)
+    if not branch.startswith("integration/"):
+        return rows
+    aggregate = [c for c in rows if c.get("__typename") == "CheckRun"
+                 and c.get("workflowName") == "tests" and c.get("name") == "tests"]
+    if len(aggregate) != 1 or aggregate[0].get("conclusion") != "SUCCESS":
+        return rows
+
+    def blocked():
+        return rows + [{"__typename": "CheckRun", "name": "paquet (run proof unavailable)",
+                        "status": "COMPLETED", "conclusion": "FAILURE"}]
+
+    def read(path):
+        if hasattr(gh, "run"):
+            code, out, _ = gh.run(["api", path])
+        else:
+            proc = gh(["api", path])
+            code, out = proc.returncode, proc.stdout
+        if code:
+            raise ValueError("packet run proof unavailable")
+        return json.loads(out)
+
+    def run_id(check):
+        url = check.get("detailsUrl") or ""
+        if not isinstance(url, str):
+            return None
+        match = re.fullmatch(r"https://github[.]com/" + re.escape(slug)
+                             + r"/actions/runs/([1-9][0-9]*)/job/[1-9][0-9]*", url)
+        return int(match.group(1)) if match else None
+
+    def finished(check):
+        if check.get("status") != "COMPLETED":
+            return None
+        try:
+            stamp = datetime.fromisoformat(check["completedAt"].replace("Z", "+00:00"))
+            return stamp.timestamp() if stamp.tzinfo is not None else None
+        except (KeyError, AttributeError, TypeError, ValueError, OverflowError):
+            return None
+
+    try:
+        runs, page = [], 1
+        while True:
+            query = urlencode({"head_sha": head, "branch": branch, "event": "push",
+                               "per_page": 100, "page": page})
+            # La liste générale fonctionne aussi dans un dépôt sans portier
+            # (pas de 404 ambigu sur un workflow absent).
+            data = read("repos/%s/actions/runs?%s" % (slug, query))
+            batch = data["workflow_runs"]
+            total = data["total_count"]
+            if not isinstance(batch, list) or type(total) is not int or total < 0:
+                return blocked()
+            runs.extend(batch)
+            if len(runs) >= total:
+                if len(runs) != total:
+                    return blocked()
+                break
+            if not batch:
+                return blocked()
+            page += 1
+        if any(type(r.get("id")) is not int or r["id"] <= 0
+               or r.get("head_sha") != head or r.get("head_branch") != branch
+               or r.get("event") != "push" or not isinstance(r.get("path"), str)
+               for r in runs):
+            return blocked()
+        if len({r["id"] for r in runs}) != len(runs):
+            return blocked()  # pagination déplacée pendant la lecture
+        runs = [r for r in runs if r.get("path") == ".github/workflows/paquet.yml"]
+        if not runs:
+            # Aucun portier créé : la PR porte toute la validation.
+            return rows if not any(c.get("workflowName") == "paquet" for c in rows) else blocked()
+        if any(r.get("status") != "completed" for r in runs):
+            return blocked()  # y compris une nouvelle tentative d'un ancien run
+        latest = max(runs, key=lambda r: r["id"])
+        if latest.get("conclusion") == "success":
+            return rows  # aucun échec de portier n'est effacé sans annulation
+        if latest.get("conclusion") != "cancelled":
+            return blocked()
+        replacement = aggregate[0]
+        end, replacement_id = finished(replacement), run_id(replacement)
+        if end is None or replacement_id is None or gh is None:
+            return blocked()
+        pr_run = read("repos/%s/actions/runs/%d" % (slug, replacement_id))
+        if (pr_run.get("id") != replacement_id or pr_run.get("head_sha") != head
+                or pr_run.get("head_branch") != branch or pr_run.get("event") != "pull_request"
+                or pr_run.get("path") != ".github/workflows/tests.yml"
+                or pr_run.get("status") != "completed" or pr_run.get("conclusion") != "success"):
+            return blocked()
+    except (ValueError, KeyError, TypeError, AttributeError, OSError, RuntimeError):
+        return blocked()
+
+    all_packet = [c for c in original if c.get("__typename") == "CheckRun"
+                  and c.get("workflowName") == "paquet"]
+    packet = [c for c in all_packet
+              if (c.get("name") == "couverture (PR ouverte sur cette tête)"
+                   or (c.get("name") or "").startswith("suite complète du paquet / "))]
+    # Le run annulé le plus récent doit être visible : un CANCELLED d'un
+    # ancien run ne permet jamais de retirer les FAILURE d'un nouveau run.
+    ids = [run_id(c) for c in all_packet]
+    if (not packet or None in ids or any(i not in {r["id"] for r in runs} for i in ids)
+            or not any(run_id(c) == latest["id"] and c.get("conclusion") == "CANCELLED"
+                       for c in packet)):
+        return blocked()
+    ends = [finished(c) for c in all_packet]
+    if any(t is None for t in ends) or end <= max(ends):
+        return blocked()
+    return [c for c in rows if c not in packet]
+
+
 def ci_green(rollup, required=()) -> bool:
     """`statusCheckRollup` d'une PR : vert si au moins un check, et tous
     terminés sans échec, après sélection des derniers checks (#2524).
+    Les lecteurs valident le remplacement éventuel du portier via merge_rollup (#2876).
     #1748 (a) : chaque préfixe de `required`
     (`required_statuses`) doit en outre être porté par un statut de commit
     (`StatusContext`, jamais un check run, dont le nom est libre) en
@@ -1521,10 +1647,11 @@ def github_ci(project: Project, gh=None, *, strict: bool = False):
             return None
         if not rows:
             return None
+        rollup = merge_rollup(rows[0].get("statusCheckRollup"), slug=slug,
+                              head=rows[0].get("headRefOid") or "", branch=branch, gh=gh)
         return {"number": rows[0].get("number"), "url": rows[0].get("url"),
                 "head": rows[0].get("headRefOid"),
-                "green": ci_green(rows[0].get("statusCheckRollup"),
-                                  required_statuses(project, branch)),
+                "green": ci_green(rollup, required_statuses(project, branch)),
                 "draft": bool(rows[0].get("isDraft"))}
     return status
 
@@ -1739,21 +1866,24 @@ def _full_suite_ids(gh, slug: str, declared) -> dict:
     return out
 
 
-def _run_jobs(gh, run: dict, slug: str) -> list:
+def _run_jobs(gh, run: dict, slug: str, *, empty_ok: bool = False) -> list:
     """L756 (#566): les jobs d'une exécution, pour refuser un vert sans tests.
 
     Rend `[(nom, statut, conclusion)]`. Une lecture impossible, vide ou
     tronquée lève `GithubError` : un job qu'on ne peut pas lire ne vaut jamais
-    vert. Le dépôt est nommé (`--repo`), jamais déduit du répertoire courant :
-    `Gh.run` ne fixe ni `cwd` ni `GH_REPO`, et `gh run view` sans `--repo`
-    échoue hors d'un clone (« failed to determine base repo ») — R2 de
+    vert. `empty_ok` distingue la lecture de tous les runs d'un commit
+    (#2692), où une exécution sautée sans job ne prouve rien, sans être une
+    lecture ratée. Le dépôt est nommé (`--repo`), jamais déduit du répertoire
+    courant : `Gh.run` ne fixe ni `cwd` ni `GH_REPO`, et `gh run view` sans
+    `--repo` échoue hors d'un clone (« failed to determine base repo ») — R2 de
     mty-amh-qa-01 sur PR manaty/ameesh#633."""
     from . import plan_github
     run_id = run.get("databaseId")
     if type(run_id) is not int or run_id <= 0:
         raise plan_github.GithubError("gh run view: missing or invalid run id")
     data = plan_github._json(gh, ["run", "view", str(run_id), "--repo", slug, "--json", "jobs"])
-    if not isinstance(data, dict) or not isinstance(data.get("jobs"), list) or not data["jobs"]:
+    if (not isinstance(data, dict) or not isinstance(data.get("jobs"), list)
+            or (not data["jobs"] and not empty_ok)):
         raise plan_github.GithubError("gh run view: no readable job for run %s" % run_id)
     if len(data["jobs"]) >= 100:
         raise plan_github.GithubError("gh run view: result may be truncated; cannot certify "
@@ -1765,6 +1895,55 @@ def _run_jobs(gh, run: dict, slug: str) -> list:
             raise plan_github.GithubError("gh run view: invalid job")
         out.append((job["name"], job["status"], (job.get("conclusion") or "").lower()))
     return out
+
+
+def commit_suite(project: Project, sha: str, gh=None) -> dict:
+    """#2692: les exécutions et leurs jobs sur le commit exact `sha`.
+
+    Une suite complète de paquet peut être répartie sur plusieurs exécutions
+    (le run `pull_request` de la PR porte la matrice, le portier `paquet` les
+    flux) : l'appelant compare les **jobs**, jamais un nom de workflow ni un
+    seul run vert. Rend `{head, runs: [{id, url, workflow, event, conclusion,
+    jobs: [{name, status, conclusion}]}]}` ; une lecture impossible ou
+    tronquée lève `GithubError`, une exécution sans job est gardée vide (elle
+    ne prouve aucun job)."""
+    from . import plan_github
+    slug = github_slug(project)
+    if not slug:
+        raise plan_github.GithubError("project %s declares no GitHub repository"
+                                      % project.name)
+    gh = gh or plan_github.Gh()
+    rows = plan_github._json(gh, ["run", "list", "--repo", slug, "--commit", sha,
+                                  "--limit", "100", "--json",
+                                  "databaseId,workflowName,name,event,status,conclusion,"
+                                  "headSha,url"])
+    if not isinstance(rows, list) or not all(isinstance(r, dict) for r in rows):
+        raise plan_github.GithubError("gh run list: unexpected output")
+    if len(rows) >= 100:
+        raise plan_github.GithubError("gh run list: result may be truncated; cannot certify "
+                                      "the full suite")
+    if any(r.get("headSha") != sha for r in rows):
+        raise plan_github.GithubError("gh run list: a run does not match the frozen commit")
+    runs = []
+    for run in rows:
+        run_id = run.get("databaseId")
+        if type(run_id) is not int or run_id <= 0:
+            raise plan_github.GithubError("gh run list: missing or invalid run id")
+        run_conclusion = (run.get("conclusion") or "").lower()
+        # A skipped workflow executed no job: reading its (empty) job list
+        # would spend an API call to prove nothing.
+        jobs = [] if run_conclusion == "skipped" else _run_jobs(
+            gh, run, slug, empty_ok=True)
+        runs.append({
+            "id": run_id,
+            "url": run.get("url") or "",
+            "workflow": run.get("workflowName") or run.get("name") or "",
+            "event": run.get("event") or "",
+            "conclusion": run_conclusion,
+            "jobs": [dict(name=name, status=status, conclusion=conclusion)
+                     for name, status, conclusion in jobs],
+        })
+    return {"head": sha, "runs": runs}
 
 
 def _job_matches(required: str, job_name: str) -> bool:
@@ -1984,6 +2163,11 @@ def conflicts_of(report: dict) -> dict:
             "kind": "unreserved", "lots": [one["work_item"]], "files": [one["path"]],
             "target": one["target"], "number": one["number"], "repo": one["repo"],
             "holder": one.get("holder")}
+    for conflict in out.values():
+        if "fingerprint" not in conflict:
+            conflict["fingerprint"] = json.dumps(
+                [[(lot, (heads.get(lot) or {}).get("tip")) for lot in conflict["lots"]],
+                 conflict["files"], conflict.get("holder")], sort_keys=True)
     return out
 
 
@@ -2127,6 +2311,14 @@ def _key_lots(key: str) -> list[int] | None:
     return None
 
 
+def _lot_inputs(fingerprint):
+    """A `conflicts_of` fingerprint without the target's head (`lot:tip@head`
+    becomes `lot:tip`); JSON fingerprints carry no target head (#2602)."""
+    if not fingerprint or fingerprint.startswith("["):
+        return fingerprint
+    return re.sub(r"@[^|]*", "", fingerprint)
+
+
 def send_mail(cfg, db, project: Project, report: dict, *, ci="github") -> list[dict]:
     """Le courrier d'un passage : un message par lot concerné et par conflit
     nouveau (passif), puis un réveil quand un conflit avec la cible bloque
@@ -2149,20 +2341,34 @@ def send_mail(cfg, db, project: Project, report: dict, *, ci="github") -> list[d
     for key, conflict in sorted(current.items()):
         done = dict(before.get(key) or {})
         fingerprint = conflict.get("fingerprint")
-        if done.pop("dormant", False) and done.get("fp") != fingerprint:
-            # #2238: back on other inputs than the notice already sent
+        dormant = done.pop("dormant", False)
+        known = done.get("fp")
+        if (dormant and known != fingerprint) or (
+                known is not None
+                and _lot_inputs(known) != _lot_inputs(fingerprint)):
+            # #2238: back on other inputs than the notice already sent.
+            # #2602: changed lot heads are new inputs, even without an absent
+            # pass; the target's head alone is not (it moves every packet).
+            # #2640: a state written before the JSON fingerprints of
+            # migration/unreserved conflicts has no `fp`; upgrading the code
+            # must not resend a notice already delivered.
             done = {}
         for lot in conflict["lots"]:
             one = branches.get(lot) or {}
             to = one.get("assignee")
             if not to or to.startswith(work.HUMAN_PREFIX):
                 continue
+            recipient_key = "%s:%s" % (lot, to)
+            # Upgrade the old per-lot ledger without resending existing mail.
+            previous = done.get(recipient_key, done.get(str(lot)))
             level, status = "passive", None
-            if conflict["kind"] == "target" and done.get(str(lot)) != "blocking" and ci:
+            if conflict["kind"] == "target" and previous != "blocking" and ci:
                 status = ci(one["branch"])
                 if status and status.get("green"):
                     level = "blocking"
-            if done.get(str(lot)) in (level, "blocking"):
+            if previous in (level, "blocking"):
+                done[recipient_key] = previous
+                done.pop(str(lot), None)
                 continue
             if conflict["kind"] == "target" and "merged" not in done:
                 # les lots fusionnés d'où vient le conflit, notés à sa première
@@ -2182,19 +2388,21 @@ def send_mail(cfg, db, project: Project, report: dict, *, ci="github") -> list[d
                     payload={"radar_blocking" if level == "blocking" else "radar": data})
             except Exception:  # noqa: BLE001 - réessayé au passage suivant
                 continue
-            done[str(lot)] = level
+            done[recipient_key] = level
+            done.pop(str(lot), None)
             sent.append({"key": key, "lot": lot, "to": to, "level": level,
                          "message_id": message_id})
         if done:
             if fingerprint is not None:
                 done["fp"] = fingerprint
+            done["lots"] = conflict["lots"]
             keys[key] = done
     # #2238: a conflict absent from this pass whose lots all stay on the
     # radar keeps its notice, dormant, instead of being forgotten.
     for key, done in before.items():
         if key in current or "fp" not in done:
             continue
-        lots = _key_lots(key)
+        lots = done.get("lots") or _key_lots(key)
         if lots and all(n in branches for n in lots):
             keys[key] = dict(done, dormant=True)
     if keys != before:

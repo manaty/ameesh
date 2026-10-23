@@ -72,27 +72,67 @@ class Housekeeping(interface.Housekeeping):
             " ORDER BY at DESC, id DESC LIMIT %s", tuple(params))
         return [_data(dict(r)) for r in rows]
 
-    def latest_by_path(self, host, kind) -> list[dict]:
-        where, params = "", [kind]
+    def latest_by_path(self, host, kind, *, since_s=None,
+                       only_paths_with=None) -> list[dict]:
+        where, params = " WHERE kind = %s", [kind]
+        window = ""
         if host:
-            where = " AND host = %s"
+            where += " AND host = %s"
             params.append(host)
+        if since_s is not None:
+            # #2851 : une alerte qui ignore de toute façon les lignes plus
+            # vieilles ne doit pas trier tout le journal de rétention.
+            window = " AND at >= now() - make_interval(secs => %s)"
+            where += window
+            params.append(float(since_s))
+        if only_paths_with is not None:
+            actions = [str(action) for action in only_paths_with]
+            if not actions:
+                return []
+            # #2851 : les chemins qui portent une de ces actions, puis la
+            # dernière ligne de chacun — toutes actions et tous âges confondus.
+            # Le filtre des candidats passe en SQL : sans lui, le DISTINCT ON
+            # triait les 4 000 chemins `tmp` du journal pour n'en garder
+            # qu'une poignée, et un `unowned` suivi d'un `deleted` restait
+            # alerté faute de relire la dernière action.
+            sub_where, sub_params = "kind = %s", [kind]
+            if host:
+                sub_where += " AND host = %s"
+                sub_params.append(host)
+            sub_where += window
+            sub_params.extend([float(since_s)] if since_s is not None else [])
+            marks = ", ".join(["%s"] * len(actions))
+            where += (" AND (host, path) IN (SELECT host, path FROM housekeeping_log"
+                      " WHERE " + sub_where + " AND action IN (" + marks + "))")
+            params.extend(sub_params + actions)
         rows = self.db.query(
             "SELECT DISTINCT ON (host, path) " + LOG_COLUMNS + " FROM housekeeping_log"
-            " WHERE kind = %s" + where +
-            " ORDER BY host, path, at DESC, id DESC", tuple(params))
+            + where + " ORDER BY host, path, at DESC, id DESC", tuple(params))
         return [_data(dict(r)) for r in rows]
 
     def summary(self, host, since_s) -> list[dict]:
+        # #2617: an unattributed /tmp entry is signaled again every 12 h; in
+        # the 24 h window each path counts once, with its latest size, or the
+        # report shows its volume twice.
         where, params = "", [float(since_s)]
         if host:
             where = " AND host = %s"
             params.append(host)
         return self.db.query(
-            "SELECT host, kind, action, count(*)::int AS n,"
-            " coalesce(sum(bytes), 0)::bigint AS bytes FROM housekeeping_log"
+            "WITH recent AS ("
+            " SELECT host, kind, action, path, bytes, at, id FROM housekeeping_log"
             " WHERE at >= now() - make_interval(secs => %s) AND kind <> 'mesure'" + where +
-            " GROUP BY host, kind, action ORDER BY host, kind, action", tuple(params))
+            "), signaled_once AS ("
+            " SELECT DISTINCT ON (host, path) host, kind, action, bytes FROM recent"
+            " WHERE kind = 'orphan' AND action = 'signaled'"
+            " ORDER BY host, path, at DESC, id DESC)"
+            " SELECT host, kind, action, count(*)::int AS n,"
+            " coalesce(sum(bytes), 0)::bigint AS bytes FROM ("
+            " SELECT host, kind, action, bytes FROM recent"
+            " WHERE NOT (kind = 'orphan' AND action = 'signaled')"
+            " UNION ALL SELECT host, kind, action, bytes FROM signaled_once"
+            ") AS lignes GROUP BY host, kind, action ORDER BY host, kind, action",
+            tuple(params))
 
     def last_measure(self, host) -> list[dict]:
         where, params = "", []

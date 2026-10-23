@@ -6,7 +6,14 @@ Contrat figé par le lot L107 (version `1.0.0`, schéma
 qui porte deux ajouts — l'expiration médiée des fils (#499, voir « Contrat 1.2 »)
 et l'aperçu d'activité (#1349, voir « Aperçu d'activité ») — puis par la
 résolution d'alias des agents (#423, version `1.3.0`, compatible : voir
-« Contrat 1.3 »).
+« Contrat 1.3 »), puis par le réveil programmé médié (#2613, version
+`1.4.0`, compatible : voir « Contrat 1.4 »), puis par la recherche des
+humains du rang 2 au-delà du préfixe (#286/B13, version `1.5.0`, compatible :
+voir « Contrat 1.5 »), puis par le franchissement d'un préfixe de 200 humains
+actifs retenus (#286/B14, version `1.6.0`, compatible : voir « Contrat 1.6 »),
+puis par l'élection d'un pilote entre hôtes candidats (L165/EP1, version
+`1.8.0`, compatible : voir « Contrat 1.8 »), puis par le brief de relève à
+l'élection (L165/EP3, version `1.9.0`, compatible : voir « Contrat 1.9 »).
 Étude et décision : `docs/design/etudes/executeur-mediee.md`,
 `docs/design/decisions/00xx-executeur-mediee.md`.
 
@@ -19,7 +26,7 @@ en silence.
 
 | Fichier | Rôle |
 |---|---|
-| `src/ameesh/mediated_executor/contract.json` | la table fermée des 67 opérations et la liste des 396 refusées |
+| `src/ameesh/mediated_executor/contract.json` | la table fermée des 72 opérations et la liste des 421 refusées |
 | `src/ameesh/mediated_executor/contract.py` | chargeur (`load()`), enveloppes, idempotence, erreurs, vérificateur de schémas |
 | `src/ameesh/mediated_executor/events.py` | flux SSE, attente longue, curseurs |
 | `src/ameesh/mediated_executor/gate.py` | `HostGate`, `ameesh-host-state/1`, `ameesh-host-ack/1` |
@@ -62,12 +69,12 @@ Les portées :
 - **S** : l'agent et l'epoch sont tirés du jeton de session.
 - **aggregate** : une donnée agrégée.
 
-Comptes : 67 opérations, dont 26 lectures et 41 écritures. 57 passent par
-`op`, 9 par `session/op`, et `wakeups.subscribe` passe par `events`. Sept
-lignes de `op` sont marquées `session: true` (contrats 1.1, 1.2 et 1.3) :
-elles sont servies aussi par `session/op`. Le test
+Comptes : 72 opérations, dont 29 lectures et 43 écritures. 62 passent par
+`op`, 9 par `session/op`, et `wakeups.subscribe` passe par `events`. Neuf
+lignes de `op` sont marquées `session: true` (contrats 1.1, 1.2, 1.3, 1.5 et
+1.6) : elles sont servies aussi par `session/op`. Le test
 vérifie que chaque ligne existe dans `storage.interface` avec la même
-signature et les mêmes types. Il vérifie aussi que l'interface entière (463
+signature et les mêmes types. Il vérifie aussi que l'interface entière (493
 opérations) est classée, admise ou refusée. Toute opération ajoutée à
 l'interface fait donc échouer le test tant qu'elle n'est pas classée.
 
@@ -359,6 +366,132 @@ L'ajout est compatible : la version passe à `1.3.0` et une septième ligne de
   auditée (`agent_name_resolutions`) ; elle ne donne aucun droit : les gardes
   d'autorité restent sur les opérations qui les portent.
 
+## Contrat 1.4 : réveil programmé d'un exécuteur médié (#2613)
+
+Le réveil programmé d'un lot (#2466, `wake_at`, `wake_claim_at`) est porté
+par le runner. Sur un exécuteur médié, les trois opérations qui le lisent et
+le consomment passent désormais par le contrat, au lieu d'être refusées :
+
+- **`lot_sessions.due_wakes`** (lecture, portée A, `param_agent: name`) :
+  `name`, `now`, `claim_ttl_s` (120 s par défaut). Rend les réveils échus des
+  lots ouverts de l'agent, par échéance puis priorité ; un claim plus récent
+  que `claim_ttl_s` écarte le lot (livraison en cours).
+- **`lot_sessions.claim_wake`** (écriture, portée B, enveloppe de bail) :
+  `name`, `lot`, `now`, `claim_ttl_s`. Pose le bail de livraison
+  (`wake_claim_at`) et écrit la ligne `wake: scheduled wake delivered` au
+  journal ; l'échéance reste armée. Rend `{id, state, title, wake_ts}` ou
+  `null` si le réveil n'est plus dû, déjà réclamé, réassigné ou fini.
+- **`lot_sessions.consume_wake`** (écriture, portée B, enveloppe de bail) :
+  `name`, `lot`, `wake_ts`. Efface l'échéance réclamée **seulement** si elle
+  porte encore le même `wake_ts` ; une échéance reposée entre-temps est
+  conservée. Rend `true` si elle a été consommée.
+
+La délivrance est un bail, pas une consommation : un drainage, un arrêt ou
+une panne entre le choix du tour et le lancement du harnais laisse le claim
+expirer ; le réveil est alors délivré de nouveau, sans doublon de témoin
+(une ligne `wake:` par délivrance). Le runner local et le runner médié
+suivent le même chemin ; seule la couche de stockage diffère. Les opérations
+de session mises de côté (`lot_sessions.actionable`, `listing`, `note_wake`,
+`purge`, `switch`) restent refusées : elles portent l'état de session du
+runner du mesh, pas le réveil. L'ajout est compatible : la version passe à
+`1.4.0`, et aucune opération n'est retirée. Déployer le serveur avant les
+nouveaux exécuteurs : un ancien serveur refuse les trois opérations, le
+runner journalise la lecture impossible et le réveil reste armé, sans perte
+ni blocage du harnais.
+
+## Contrat 1.5 : humains du rang 2, au-delà du préfixe (#286/B13)
+
+La file résidente sert les messages humains ordinaires (rang 2) avant le
+courrier urgent d'agent, la suite et la consigne en attente. Sur Postgres, une
+requête filtrée (`payload.human`, ancien `sender human:*`, noms déclarés)
+trouvait déjà l'humain derrière plus de 200 non-lus ordinaires. Sur un
+exécuteur médié, `mailbox.unread` est borné à 200 lignes et n'a pas de
+décalage : un humain en position 201 restait invisible, et la consigne
+passait devant lui. L'opération `mailbox.unread_human(recipient, limit,
+names=None)` applique le même filtre dans la requête du serveur ; le client
+la sert sans repli sur `mailbox.unread`, les pages suivantes étant décrites
+au contrat 1.6. `names` porte les noms déclarés humains de l'hôte
+(`AMEESH_HUMANS` historique) et peut être nul.
+
+## Contrat 1.6 : humains actifs et préfixe retenu (#286/B14)
+
+B14 : `mailbox.unread_human` ne rend que les humains **actifs** — les copies
+passives (`cc`, accusé…) sont écartées comme par `mail.passive_reason`, sinon
+200 copies humaines passives remplissaient la fenêtre devant un humain actif.
+
+Un préfixe de plus de 200 humains actifs **retenus** (lots retenus) ne se
+franchit pas avec `limit` : le serveur borne chaque page. L'opération
+`mailbox.unread_human_page(recipient, limit, after_id=None, names=None)` rend
+la page suivante (`id > after_id`), avec le même filtre humain actif.
+`deliverable_unread` lit la première page par `unread_human`, puis les
+suivantes par cette opération, et filtre les lots retenus page par page sans
+les livrer. Côté client, `deliverable_unread` signale aussi une lecture
+**tronquée** quand sa page n'a pas progressé ; `_pick` déclenche alors la
+recherche humaine même si peu de lignes de la fenêtre sont remisables.
+
+L'ajout est compatible : la version passe à `1.6.0`, aucune opération n'est
+retirée ni modifiée. Déployer le serveur avant les nouveaux exécuteurs : un
+ancien serveur refuse `mailbox.unread_human_page` ; le runner médié garde les
+humains déjà trouvés et lit comme avant, sans tuer le fil de l'agent.
+
+## Contrat 1.7 : attribution des messages au grand livre (#288/L80b)
+
+Un tour résident peut servir plusieurs messages (consigne groupée, steer) :
+son coût est celui du **tour**, partagé par ses entrées. L'opération
+`turn_costs.insert` gagne un mot-clé facultatif `inputs` : un tableau de
+chaînes (ou `null`) portant les identifiants des messages réellement servis.
+La ligne `turn_costs.inputs` les conserve (`jsonb`, migration 0472) et
+`ameesh cost turns --message ID` rend les tours qui les ont servis — le `usd`
+affiché est celui du tour entier, jamais divisé.
+
+L'ajout est compatible : la version passe à `1.7.0`, aucune opération n'est
+retirée ni modifiée ; `inputs` est facultatif (`null` par défaut) et les
+lignes antérieures restent `null`. Un client 1.6 n'envoie pas le paramètre.
+Un **serveur 1.6** refuse un appel qui le porte (`bad_args`) : l'exécuteur
+réessaie alors sans `inputs` — le tour reste compté, l'attribution est perdue
+et journalisée ; la comptabilité n'est jamais suspendue pour autant. Déployer
+le serveur avant les exécuteurs n'est pas nécessaire, mais le fait donne
+l'attribution dès le premier tour.
+
+## Contrat 1.8 : élection d'un pilote entre hôtes candidats (L165/EP1)
+
+Une fiche Agent peut déclarer `releve: election` et ses `candidats` : le
+bail n'est plus lié à l'hôte de la ligne, et le premier hôte candidat qui
+réclame un bail libre ou expiré le prend (`agent_candidates` porte le
+verdict de placement de chaque hôte, écrit par `canon sync`). Côté médié,
+`leases.claim` gagne un mot-clé facultatif `host`, **forcé à l'hôte de
+l'exécuteur authentifié** : un appelant ne peut pas réclamer pour un autre
+hôte. L'agent doit être admis sur cet hôte (`releve: election` et
+`candidats`, ou `host` de la ligne) ; la réclamation déplace alors la ligne,
+son dossier et son verdict sur cet hôte, et lève la clôture L232e — un rôle
+élu n'a pas de travail local à publier, le bail et son epoch suffisent.
+
+L'ajout est compatible : la version passe à `1.8.0` ; un client 1.7 omet
+`host` (le serveur le force de toute façon), aucune opération n'est retirée
+ni modifiée. Les deux écritures de `canon sync` (`canon.set_election`,
+`canon.write_candidate`) restent refusées à distance, comme le reste du
+canon.
+
+## Contrat 1.9 : brief de reprise d'une relève élue (L165/EP3)
+
+Un hôte qui gagne une relève **croisée** (la ligne de l'agent élu était chez
+un autre hôte) ouvre une session neuve : aucune session ne traverse un hôte.
+`leases.claim` gagne un mot-clé facultatif `election_brief` : la même
+instruction écrit ce résumé de reprise sur la ligne
+(`agent_registry.election_brief`), remet la session et son compte à zéro et
+laisse au nouvel hôte le soin de l'ouvrir. Le premier tour du nouveau
+détenteur est préfixé par ce brief (`reprise.election_brief`, construit sans
+modèle depuis la base : lots, courrier, décisions, alertes, dernier relevé
+GitHub, canon). Sur un même hôte (redémarrage de l'exécuteur), le brief est
+ignoré et la session locale est reprise normalement.
+
+L'ajout est compatible : la version passe à `1.9.0` ; un client 1.8 omet
+`election_brief`. Côté médié, le paramètre est **forcé à `null`** : un
+appareil ne choisit jamais le texte du résumé. Une relève **croisée sans
+brief est refusée** (`leases.claim` ne déplace pas la ligne) : côté médié, le
+paramètre forcé à null interdit donc une relève croisée et l'appareil reste en
+attente ; EP3 est natif. Rien d'autre ne change dans la table.
+
 ## Porte d'hôte
 
 Le runner Compute écrit `ameesh-host-state/1`. Ce message porte `state`
@@ -546,7 +679,7 @@ Le client vit dans `src/ameesh/storage/remote/` :
 
 | Fichier | Rôle |
 |---|---|
-| `client.py` | `RemoteDb` (la « connexion », sans SQL), `RemoteStorage` (les 67 opérations), `LeaseBook` (carnet des baux) |
+| `client.py` | `RemoteDb` (la « connexion », sans SQL), `RemoteStorage` (les 72 opérations), `LeaseBook` (carnet des baux) |
 | `http.py` | `HttpTransport(ExecTransport)`, `StaticTokenSource`, `FileTokenSource` |
 | `events.py` | `RemoteSubscription` : SSE, repli en attente longue, curseur gardé |
 | `__init__.py` | `connect(cfg)`, `set_token_source_factory` (point d'attache de L110) |

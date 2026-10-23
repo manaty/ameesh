@@ -208,6 +208,7 @@ class FileBackend:
             row.setdefault("name", filename[:-5])
             row["host"] = socket.gethostname().split(".")[0]
             row["unread"] = len(self.unread(row["name"]))
+            row["passive_unread"] = 0  # le repli fichier n'a pas la notion L125
             row["status"] = "?"
             row["status_text"] = self.get_status(row["name"])
             row["lease_owner"] = None
@@ -375,7 +376,12 @@ class PgBackend:
                 "host": row.get("host") or "",
                 "status": row.get("status") or "?",
                 "status_text": row.get("status_text") or "",
+                # #2689 : `unread` reste tous les non-lus (contrat de la liste
+                # humaine) ; les copies, accusés et radars sont comptés à part
+                # (L125) pour que « unread:6 » ne fasse plus passer un agent au
+                # repos pour bloqué.
                 "unread": int(row.get("unread") or 0),
+                "passive_unread": int(row.get("passive_unread") or 0),
                 "lease_owner": row.get("lease_owner"),
                 "lease_expires_ts": row.get("lease_expires_ts"),
                 "chantier": row.get("chantier") or "",
@@ -391,8 +397,12 @@ class PgBackend:
         return (row or {}).get("status_text") or ""
 
     def set_status(self, name: str, text: str) -> None:
-        registry.upsert(self.db, name, host=self.cfg.host)
-        registry.set_status(self.db, name, "idle", status_text=text)
+        # #2789 : le texte seulement. Poser `idle` ici faisait passer un agent
+        # en plein tour pour un agent au repos (impl-01, 19/10 23:29 : tour de
+        # 30 min vu `idle`, relancé par l'auditeur). L46 : inscription sans
+        # bail — jamais l'hôte ni la session d'un agent `execute`.
+        registry.upsert_unleased(self.db, name, host=self.cfg.host)
+        registry.set_status_text(self.db, name, text)
 
     # -- état local --------------------------------------------------------
     def stop_counter(self, name: str, reset: bool = False, bump: bool = False) -> int:

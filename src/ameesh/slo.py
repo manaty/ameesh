@@ -61,6 +61,12 @@ class Step(NamedTuple):
 #: La table du §9, dans l'ordre du canon. `measured` : ameesh sait la mesurer
 #: aujourd'hui depuis les événements du lot ; une étape non mesurée est
 #: déclarée ici pour que le trou soit visible, pas silencieux.
+#:
+#: #2919 : `verdict_merge` porte la ligne « hors paquet » du canon (incident ou
+#: déblocage de la CI, §11 bis : 30 min, 15 min en P1). Le chemin normal a une
+#: cible dynamique, le p80 réel de la CI du paquet (`lot_steps(..., p80_s=...)`,
+#: canon §9, décision owner #103509 option a, home#147) ; une unité d'un paquet
+#: ouvert n'a en plus aucune cible d'escalade propre (`packet=True`).
 STEPS: tuple = (
     Step("signal_assigned",
          "request or incident reported → lot assigned to an executor",
@@ -144,11 +150,37 @@ def targets(level_: int, *, critical: bool = False) -> tuple:
 # mesure depuis les événements du lot
 # --------------------------------------------------------------------------
 
-def _first_event(events: Iterable[dict], state: str) -> float | None:
-    """Le premier instant où le lot est vu dans cet état (transition ou note)."""
-    stamps = [ev.get("created_ts") for ev in events if ev.get("state") == state]
-    stamps = [float(s) for s in stamps if s is not None]
+def start_ts(events: Iterable[dict]) -> float | None:
+    """L'instant mesuré du début du lot : le premier passage en `build`, ou le
+    début mesuré (premier tour du porteur, `estimates.START_NOTE`) s'il est
+    antérieur (#3162). Un lot dont le porteur travaille déjà reste parfois en
+    intake : le début mesuré conclut alors `intake_started`. `None` sans
+    aucun de ces faits."""
+    from . import estimates
+
+    stamps = [float(ev["created_ts"]) for ev in events
+              if ev.get("created_ts") is not None
+              and (ev.get("state") == "build"
+                   or (ev.get("note") or "").startswith(estimates.START_NOTE))]
     return min(stamps) if stamps else None
+
+
+def begun(events: Iterable[dict], jalons: dict | None = None) -> bool:
+    """Le lot porte une preuve de début sans date de début (#3162) : une
+    branche associée (`work.set_branch`, `attach_implicit_branch` : note
+    `branch … (before: …)`, hors détachement) ou un gel (`jalons["frozen"]`).
+    Il n'est plus « prêt, pas démarré » — aucune alerte —, mais l'instant de
+    son début reste inconnu : aucune durée n'est inventée (#1982)."""
+    from . import work
+
+    if (jalons or {}).get("frozen") is not None:
+        return True
+    for ev in events:
+        note = ev.get("note") or ""
+        if (note.startswith("branch ") and " (before: " in note
+                and not note.startswith(work.DETACH_NOTE)):
+            return True
+    return False
 
 
 def assigned_ts(item: dict, events: Iterable[dict]) -> float | None:
@@ -219,6 +251,74 @@ def handover_ts(item: dict, events: Iterable[dict]) -> float | None:
     return last
 
 
+#: #2916 : les états de retenue (`work.WAITING`), où le lot n'attend pas un
+#: exécutant mais la levée de la retenue. Le délai intake ne court pas
+#: pendant une retenue.
+HOLDS = ("blocked", "waiting_human")
+
+
+def hold_release_ts(events: Iterable[dict], *,
+                    started: float | None = None) -> float | None:
+    """Le dernier instant où le lot est sorti d'une retenue (#2916).
+
+    Un lot `blocked` ou `waiting_human` n'attend pas un preneur : il attend la
+    levée de sa retenue (déblocage, décision de l'owner). Le temps passé sous
+    retenue n'est donc pas un retard intake ; au retour en intake, l'horloge
+    repart de ce retour, comme de la levée d'une dépendance (#2551).
+
+    Les transitions sont lues dans l'ordre d'écriture `(created_ts, id)` : une
+    note qui répète l'état n'est pas une transition. `None` sans retenue. Un
+    lot déjà démarré garde sa mesure : seules les levées antérieures au début
+    comptent, une retenue ajoutée après le début ne réécrit pas le passé.
+    """
+    ordered = sorted(events or (),
+                     key=lambda ev: (float(ev.get("created_ts") or 0.0),
+                                     int(ev.get("id") or 0)))
+    released = None
+    previous = None
+    for event in ordered:
+        state = event.get("state")
+        at = event.get("created_ts")
+        if previous in HOLDS and state not in HOLDS and at is not None:
+            stamp = float(at)
+            # #2921 : une levée postérieure au premier build ne réécrit pas la
+            # mesure acquise — on garde la dernière levée antérieure au début.
+            if started is None or stamp <= float(started):
+                released = stamp
+        previous = state
+    return released
+
+
+def intake_ready_ts(assigned: float | None, requested: float | None,
+                    dependencies: Iterable[dict] = (), *,
+                    started: float | None = None) -> float | None:
+    """L'instant où le lot est prêt pour `intake_started` (#2551).
+
+    Une dépendance bloquante ouverte retient le lot : son porteur ne peut rien
+    faire avant sa levée, donc le lot n'est pas « prêt, pas démarré » et aucun
+    délai ne court (`None`). Toutes les dépendances satisfaites, le départ est
+    le plus tardif de l'attribution (ou de la demande) et de la levée du
+    dernier bloqueur — les jalons `merged` ou `closed` du bloqueur, portés par
+    `satisfied_ts`. Le délai mesure alors l'attente d'un preneur, pas le temps
+    où le travail dépendait d'un autre lot.
+
+    Un lot déjà démarré (`started`) garde sa mesure : seules les levées
+    antérieures au début comptent, et une dépendance ajoutée après le début ne
+    réécrit pas le passé.
+    """
+    base = assigned if assigned is not None else requested
+    if base is None:
+        return None
+    edges = list(dependencies or ())
+    if started is None and any(edge.get("blocking") for edge in edges):
+        return None
+    stamps = [float(edge["satisfied_ts"]) for edge in edges
+              if edge.get("satisfied_ts") is not None]
+    if started is not None:
+        stamps = [stamp for stamp in stamps if stamp <= float(started)]
+    return max([float(base)] + stamps)
+
+
 def last_event_ts(item: dict, events: Iterable[dict]) -> float | None:
     """Dernière activité écrite (ligne du lot ou événement)."""
     stamps = [item.get("updated_ts"), item.get("created_ts")]
@@ -227,13 +327,17 @@ def last_event_ts(item: dict, events: Iterable[dict]) -> float | None:
     return max(stamps) if stamps else None
 
 
-def _row(step: Step, start, *, now: float, critical: bool, done_ts=None, **extra) -> dict:
+def _row(step: Step, start, *, now: float, critical: bool, done_ts=None,
+         target: float | None = None, escalate: bool = True, **extra) -> dict:
+    """Une ligne de mesure ; `target` remplace la cible de la table (p80 d'un
+    paquet) et `escalate=False` laisse la ligne mesurée mais sans escalade
+    propre (l'unité d'un paquet ouvert, #2919)."""
     start = float(start)
     # une étape terminée ne court plus : son délai est acquis, quel qu'il soit
     end = float(done_ts) if done_ts is not None else float(now)
     elapsed = max(0.0, end - start)
-    target = target_s(step, critical=critical)
-    lvl = 0 if done_ts is not None else level(elapsed, target)
+    target = target_s(step, critical=critical) if target is None else float(target)
+    lvl = 0 if (done_ts is not None or not escalate) else level(elapsed, target)
     row = {
         "step": step.key,
         "label": step.label,
@@ -249,12 +353,17 @@ def _row(step: Step, start, *, now: float, critical: bool, done_ts=None, **extra
     }
     if done_ts is not None:
         row["done_ts"] = round(float(done_ts), 3)
+    if not escalate:
+        row["escalation"] = False
     row.update(extra)
     return row
 
 
 def lot_steps(item: dict, jalons: dict, events: Iterable[dict], *,
-              now: float | None = None, packet_slot: float | None = None) -> list:
+              now: float | None = None, packet_slot: float | None = None,
+              dependencies: Iterable[dict] = (), packet: bool = False,
+              p80_s: float | None = None, outside_packet: bool = False,
+              hold_releases: Iterable[float] = ()) -> list:
     """Les étapes mesurables d'un lot, une ligne par étape applicable.
 
     `jalons` vient de `progress._work_item_milestones` — le SEUL lecteur des
@@ -269,6 +378,9 @@ def lot_steps(item: dict, jalons: dict, events: Iterable[dict], *,
     sont pas un retard. La ligne porte `packet_slot` pour que l'alerte dise
     d'où part la mesure ; une fusion déjà faite garde sa durée réelle.
 
+    #2562 : le délai intake part au plus tôt du début planifié (minuit
+    local). Avant cette date, aucune ligne intake en cours ne court.
+
     #2217 : quand le lot vient d'être pris en charge (dernière ligne
     `assigned to … (before: …)` il y a moins de `HANDOVER_GRACE_S`), les
     dépassements déjà courus ne sont pas imputés au nouveau porteur : leur
@@ -276,6 +388,38 @@ def lot_steps(item: dict, jalons: dict, events: Iterable[dict], *,
     ligne porte `handover_grace_s` (secondes restantes). La mesure reste
     visible (`elapsed_s`, `target_s`) ; après la grâce, l'escalade reprend au
     niveau que le retard justifie.
+
+    #2919 : `p80_s`, quand il est mesuré, remplace la cible de la table pour
+    « GO → fusion » sur le **chemin normal** (tout lot à GO courant sans
+    exception). C'est le p80 réel de la CI du paquet (`progress.ci_suite`,
+    fenêtre de 7 jours). Sans mesure, le repli est la cible de la ligne
+    paquet du canon (30 min, colonne P1 « — »), que le lot soit dans un
+    paquet ouvert ou non. `p80_s=None` ne distingue donc pas une exception
+    déclarée : l'appelant passe `outside_packet=True` pour elle, et la cible
+    de la table reprend sa colonne P1 (15 min) et son escalade depuis le GO.
+    Les seuils ×2/×3 s'appliquent à la cible retenue. `packet=True` marque en
+    plus une unité d'un paquet **ouvert** (attente `packet` de
+    `planned_waits`) : elle n'a **aucune cible d'escalade propre** — `level`
+    0, `targets` vides, `overdue_s` 0 —, le composeur du paquet ou le pilote
+    porte la fusion (canon §9, décision owner #103509 option a, home#147). La
+    mesure reste lisible (`elapsed_s`, `target_s`, `packet`, `target_source`)
+    pour le taux de respect.
+
+    #2551 : `dependencies` sont les arêtes de prérequis du lot
+    (`work_dependencies.grouped`, enrichies de `satisfied_ts` — fusion ou
+    clôture du bloqueur — par l'appelant). Une dépendance bloquante ouverte ne
+    produit pas de ligne `intake_started` ; toutes satisfaites, le départ est
+    la levée du dernier bloqueur (`intake_ready_ts`).
+
+    #2916 : une retenue (`blocked`, `waiting_human`) suspend le délai intake,
+    comme une dépendance ouverte : au retour en intake, l'horloge repart de
+    la dernière sortie de retenue (`hold_release_ts`), pas de l'attribution
+    d'origine. Sinon une décision de l'owner rendue après deux jours faisait
+    crier « réattribuer maintenant » sur un lot que son porteur reprenait.
+    #2916/#1225 : `hold_releases` porte les levées des holds explicites de
+    pilote (`hold:`/`unhold:`, #1664), autorisées par l'appelant
+    (`planned_waits.pilot_hold_releases`) — un cas réel nexlink. Le temps
+    parqué sous un hold de pilote n'est pas un retard du porteur.
     """
     events = list(events)
     now = time.time() if now is None else float(now)
@@ -294,15 +438,44 @@ def lot_steps(item: dict, jalons: dict, events: Iterable[dict], *,
         else:
             out.append(_row(step, requested, now=now, critical=critical))
 
-    started = _first_event(events, "build")
+    # #3162 : le début mesuré conclut l'étape comme le passage en build, même
+    # quand le lot est resté en intake.
+    started = start_ts(events)
     if requested is not None and state not in ("merged", "promoted", "closed"):
         step = step_of("intake_started")
-        ready = assigned if assigned is not None else requested
-        if started is not None:
+        ready = intake_ready_ts(assigned, requested, dependencies, started=started)
+        # #2916 : le temps passé sous retenue n'est pas un retard intake ; au
+        # retour, l'horloge repart de la levée (dernière sortie de retenue).
+        # #1225 : les holds explicites de pilote (#1664) comptent aussi ; leurs
+        # levées sont autorisées par l'appelant et filtrées par `started` ici.
+        released = hold_release_ts(events, started=started)
+        for stamp in hold_releases or ():
+            value = float(stamp)
+            if started is not None and value > float(started):
+                continue
+            if released is None or value > float(released):
+                released = value
+        if ready is not None and released is not None:
+            ready = max(float(ready), released)
+        # #2562 : un report planifié ne constitue pas un retard intake.
+        from .plan import day_start_ts
+        planned = day_start_ts(item.get("planned_start"))
+        if ready is not None and planned is not None:
+            ready = max(float(ready), planned)
+        if ready is None:
+            # #2551 : dépendance bloquante ouverte — le lot n'est pas prêt,
+            # aucun délai ne court : son porteur ne peut rien faire avant la
+            # levée du prérequis. La mesure repart de cette levée.
+            pass
+        elif started is not None:
             out.append(_row(step, ready, now=now, critical=critical,
                             done_ts=round(started, 3),
                             elapsed_s=int(max(0.0, started - float(ready)))))
-        elif state == "intake":
+        elif begun(events, jalons):
+            # #3162 : branche associée ou gel — le lot est commencé, mais son
+            # début n'est pas daté : ni retard ni durée inventés (#1982).
+            pass
+        elif state == "intake" and now >= float(ready):
             # prêt, pas encore démarré : le délai court depuis que le lot est
             # prêt. Passé intake sans événement `build` (#1982), la phase est
             # franchie mais non mesurable : aucune ligne, donc aucun retard
@@ -319,19 +492,45 @@ def lot_steps(item: dict, jalons: dict, events: Iterable[dict], *,
     merged = jalons.get("merged")
     if kind == "ok" and verdict is not None and jalons.get("verdict_current", True):
         step = step_of("verdict_merge")
+        # #2919 : le p80 mesuré remplace la cible de la table sur le chemin
+        # normal (escalade ×2/×3 relative à lui). Sans mesure, le repli est la
+        # cible de la ligne paquet (30 min, colonne P1 « — ») ; une exception
+        # déclarée (`outside_packet`) garde la cible de la table, colonne P1
+        # comprise (15 min pour un P1), depuis le GO.
+        p80 = None
+        if not outside_packet and p80_s is not None:
+            try:
+                candidate = float(p80_s)
+            except (TypeError, ValueError):
+                candidate = 0.0
+            if candidate > 0:
+                p80 = candidate
+        target = p80
+        if target is None and not outside_packet:
+            target = float(step.target_s)
+        extra = {}
+        if p80 is not None:
+            extra["target_source"] = "p80"
+        elif outside_packet:
+            extra["target_source"] = "table"
+        else:
+            extra["target_source"] = "fallback"
+        if packet:
+            extra["packet"] = True
         if merged is not None:
             out.append(_row(step, verdict, now=now, critical=critical,
                             done_ts=round(float(merged), 3),
-                            elapsed_s=int(max(0.0, float(merged) - float(verdict)))))
+                            elapsed_s=int(max(0.0, float(merged) - float(verdict))),
+                            target=target, escalate=not packet, **extra))
         elif state not in ("merged", "promoted", "closed"):
             start = float(verdict)
-            extra = {}
             if packet_slot is not None and float(packet_slot) > start:
                 # #2335/A2 : la fusion ne peut entrer qu'au prochain paquet ;
                 # l'horloge GO → fusion part de ce créneau, pas du GO.
                 start = float(packet_slot)
                 extra["packet_slot"] = round(start, 3)
-            out.append(_row(step, start, now=now, critical=critical, **extra))
+            out.append(_row(step, start, now=now, critical=critical,
+                            target=target, escalate=not packet, **extra))
 
     handover = handover_ts(item, events)
     if handover is not None and state not in ("merged", "promoted", "closed"):

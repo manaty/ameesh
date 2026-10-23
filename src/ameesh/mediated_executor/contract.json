@@ -1,6 +1,6 @@
 {
  "schema": "ameesh-exec-contract/1",
- "version": "1.3.0",
+ "version": "1.9.0",
  "prefix": "/api/exec/v1",
  "description": "Contrat de l'API d'exécuteur médiée (L107) : la liste FERMÉE des opérations de storage.interface qu'un exécuteur d'appareil peut appeler, leur portée et leur fencing. Référence : docs/EXECUTEUR-MEDIEE.md.",
  "scopes": {
@@ -686,7 +686,10 @@
    ],
    "fence": false,
    "param_agent": "name",
-   "forced": {},
+   "forced": {
+    "host": "executor_host",
+    "election_brief": null
+   },
    "params": [
     {
      "name": "name",
@@ -719,6 +722,30 @@
       "type": "boolean"
      },
      "required": true
+    },
+    {
+     "name": "host",
+     "kind": "keyword",
+     "schema": {
+      "type": [
+       "string",
+       "null"
+      ]
+     },
+     "required": false,
+     "default": null
+    },
+    {
+     "name": "election_brief",
+     "kind": "keyword",
+     "schema": {
+      "type": [
+       "string",
+       "null"
+      ]
+     },
+     "required": false,
+     "default": null
     }
    ],
    "result": {
@@ -735,7 +762,8 @@
    "rules": [
     "owner préfixé par exec:<executor_id>: sinon 403 forbidden_scope",
     "ttl_seconds borné par le lease_ttl de l'hôte (GET /host)",
-    "hôte indisponible : 403 host_unavailable"
+    "hôte indisponible : 403 host_unavailable",
+    "election_brief : natif seulement, forcé à null sur un appareil ; une relève croisée écrit le résumé de reprise de la session neuve, et une relève croisée sans ce brief est refusée (aucun déplacement de ligne)"
    ]
   },
   {
@@ -1394,6 +1422,139 @@
    },
    "rules": [
     "limit borné à 200",
+    "session : recipient = agent du jeton"
+   ],
+   "session": true
+  },
+  {
+   "name": "mailbox.unread_human",
+   "write": false,
+   "transport": "op",
+   "scope": [
+    "A"
+   ],
+   "fence": false,
+   "param_agent": "recipient",
+   "forced": {},
+   "params": [
+    {
+     "name": "recipient",
+     "kind": "positional",
+     "schema": {
+      "type": "string"
+     },
+     "required": true
+    },
+    {
+     "name": "limit",
+     "kind": "positional",
+     "schema": {
+      "type": "integer"
+     },
+     "required": true
+    },
+    {
+     "name": "names",
+     "kind": "keyword",
+     "schema": {
+      "type": [
+       "array",
+       "null"
+      ],
+      "items": {
+       "type": "string"
+      }
+     },
+     "required": false,
+     "default": null
+    }
+   ],
+   "result": {
+    "type": "array",
+    "items": {
+     "type": "object"
+    }
+   },
+   "refusal": null,
+   "idempotency": {
+    "key": "none",
+    "natural": true
+   },
+   "rules": [
+    "limit borné à 200",
+    "session : recipient = agent du jeton"
+   ],
+   "session": true
+  },
+  {
+   "name": "mailbox.unread_human_page",
+   "write": false,
+   "transport": "op",
+   "scope": [
+    "A"
+   ],
+   "fence": false,
+   "param_agent": "recipient",
+   "forced": {},
+   "params": [
+    {
+     "name": "recipient",
+     "kind": "positional",
+     "schema": {
+      "type": "string"
+     },
+     "required": true
+    },
+    {
+     "name": "limit",
+     "kind": "positional",
+     "schema": {
+      "type": "integer"
+     },
+     "required": true
+    },
+    {
+     "name": "after_id",
+     "kind": "keyword",
+     "schema": {
+      "type": [
+       "integer",
+       "null"
+      ]
+     },
+     "required": false,
+     "default": null
+    },
+    {
+     "name": "names",
+     "kind": "keyword",
+     "schema": {
+      "type": [
+       "array",
+       "null"
+      ],
+      "items": {
+       "type": "string"
+      }
+     },
+     "required": false,
+     "default": null
+    }
+   ],
+   "result": {
+    "type": "array",
+    "items": {
+     "type": "object"
+    }
+   },
+   "refusal": null,
+   "idempotency": {
+    "key": "none",
+    "natural": true
+   },
+   "rules": [
+    "limit borné à 200",
+    "after_id : id strictement supérieur, curseur de page",
     "session : recipient = agent du jeton"
    ],
    "session": true
@@ -2182,6 +2343,21 @@
        "string",
        "null"
       ]
+     },
+     "required": false,
+     "default": null
+    },
+    {
+     "name": "inputs",
+     "kind": "keyword",
+     "schema": {
+      "type": [
+       "array",
+       "null"
+      ],
+      "items": {
+       "type": "string"
+      }
      },
      "required": false,
      "default": null
@@ -4120,6 +4296,166 @@
    "rules": [
     "Bounded sanitised snapshot of this agent only; no raw thoughts, prompts, arguments or tool output."
    ]
+  },
+  {
+   "name": "lot_sessions.due_wakes",
+   "write": false,
+   "transport": "op",
+   "scope": [
+    "A"
+   ],
+   "fence": false,
+   "param_agent": "name",
+   "forced": {},
+   "params": [
+    {
+     "name": "name",
+     "kind": "positional",
+     "schema": {
+      "type": "string"
+     },
+     "required": true
+    },
+    {
+     "name": "now",
+     "kind": "positional",
+     "schema": {
+      "type": "number"
+     },
+     "required": true
+    },
+    {
+     "name": "claim_ttl_s",
+     "kind": "positional",
+     "schema": {
+      "type": "number"
+     },
+     "required": false,
+     "default": 120.0
+    }
+   ],
+   "result": {
+    "type": "array",
+    "items": {
+     "type": "object"
+    }
+   },
+   "refusal": null,
+   "idempotency": {
+    "key": "none",
+    "natural": true
+   },
+   "rules": [
+    "Scheduled wakes due for this agent's open lots; a claim younger than claim_ttl_s excludes the lot; the agent must be admitted on the executor's host."
+   ]
+  },
+  {
+   "name": "lot_sessions.claim_wake",
+   "write": true,
+   "transport": "op",
+   "scope": [
+    "B"
+   ],
+   "fence": true,
+   "param_agent": "name",
+   "forced": {},
+   "params": [
+    {
+     "name": "name",
+     "kind": "positional",
+     "schema": {
+      "type": "string"
+     },
+     "required": true
+    },
+    {
+     "name": "lot",
+     "kind": "positional",
+     "schema": {
+      "type": "integer"
+     },
+     "required": true
+    },
+    {
+     "name": "now",
+     "kind": "positional",
+     "schema": {
+      "type": "number"
+     },
+     "required": true
+    },
+    {
+     "name": "claim_ttl_s",
+     "kind": "positional",
+     "schema": {
+      "type": "number"
+     },
+     "required": false,
+     "default": 120.0
+    }
+   ],
+   "result": {
+    "type": [
+     "object",
+     "null"
+    ]
+   },
+   "refusal": null,
+   "idempotency": {
+    "key": "required",
+    "natural": false
+   },
+   "rules": [
+    "Delivery lease of a due scheduled wake: wake_claim_at is set and a 'wake: scheduled wake delivered' journal line is written; the due date stays armed until consume_wake, and a claim not consumed expires after claim_ttl_s."
+   ]
+  },
+  {
+   "name": "lot_sessions.consume_wake",
+   "write": true,
+   "transport": "op",
+   "scope": [
+    "B"
+   ],
+   "fence": true,
+   "param_agent": "name",
+   "forced": {},
+   "params": [
+    {
+     "name": "name",
+     "kind": "positional",
+     "schema": {
+      "type": "string"
+     },
+     "required": true
+    },
+    {
+     "name": "lot",
+     "kind": "positional",
+     "schema": {
+      "type": "integer"
+     },
+     "required": true
+    },
+    {
+     "name": "wake_ts",
+     "kind": "positional",
+     "schema": {
+      "type": "number"
+     },
+     "required": true
+    }
+   ],
+   "result": {
+    "type": "boolean"
+   },
+   "refusal": false,
+   "idempotency": {
+    "key": "required",
+    "natural": false
+   },
+   "rules": [
+    "Clears the claimed due date only when it is still the same wake_ts; a deadline re-armed in the meantime is preserved."
+   ]
   }
  ],
  "refused": {
@@ -4164,8 +4500,9 @@
    "work": "hors du sous-ensemble de l'exécuteur médié",
    "watches": "CI watches: mesh server only",
    "handoffs": "host handoff controller: mesh server only",
-   "lot_sessions": "sessions put aside per lot and lot wakes (#408): runner of the mesh server only",
-   "host_lifecycle": "host withdrawal and loss recovery: mesh server only"
+   "lot_sessions": "session parking and activity wake listing: runner of the mesh server only; scheduled lot wakes pass by lot_sessions.due_wakes/claim_wake/consume_wake",
+   "host_lifecycle": "host withdrawal and loss recovery: mesh server only",
+   "github_watch": "GitHub intake cursors and deduplication: notifier host only"
   },
   "operations": {
    "accounts": [
@@ -4248,9 +4585,12 @@
     "put"
    ],
    "canon": [
+    "candidate_names",
     "claim_commit",
+    "clear_candidate",
     "clear_pending_stop",
     "clear_responsible",
+    "close_candidates",
     "close_others",
     "flag_default",
     "host_rows",
@@ -4265,10 +4605,12 @@
     "relocate",
     "revive",
     "set_default_id",
+    "set_election",
     "set_placement",
     "state",
     "states",
     "stop_removed",
+    "write_candidate",
     "write_declared"
    ],
    "catalog": [
@@ -4298,6 +4640,7 @@
     "observe_runners",
     "open_run",
     "prune_guard_runs",
+    "prune_queue",
     "queued_oldest",
     "reopen_run",
     "run",
@@ -4348,6 +4691,7 @@
     "revoke"
    ],
    "hosts": [
+    "disk_history",
     "gate_guard",
     "harness_versions",
     "history",
@@ -4388,6 +4732,7 @@
    ],
    "mailbox": [
     "dead_letters",
+    "delivered_for_lot",
     "expire_dead_letters",
     "forward",
     "history",
@@ -4525,6 +4870,7 @@
     "auto_takes_since",
     "backlog",
     "backlog_add",
+    "backlog_basket_add",
     "by_issue_ref",
     "by_package",
     "claim_review_proposal",
@@ -4545,6 +4891,7 @@
     "events_noted",
     "handoff",
     "handoff_lots",
+    "held_by",
     "issue_feed",
     "items",
     "items_missing_ref",
@@ -4552,10 +4899,13 @@
     "land_unlock",
     "train_read",
     "train_save",
+    "train_abandon",
+    "train_adopt",
     "train_fire_read",
     "train_fire_give",
     "train_fire_change",
     "link_package",
+    "lock",
     "lock_deep_analysis",
     "log_review_attempt",
     "mark_started",
@@ -4568,6 +4918,7 @@
     "open_for",
     "open_for_sweep",
     "overdue_delegations",
+    "packet_members",
     "publish_reference",
     "queue",
     "queue_add",
@@ -4575,6 +4926,7 @@
     "queue_update",
     "recent_or_cited",
     "record_landed_migration",
+    "record_packet",
     "record_resolution",
     "rectify_close",
     "reference",
@@ -4593,6 +4945,7 @@
     "set_estimate",
     "set_issue_ref",
     "set_partial_seen",
+    "set_type",
     "timeline",
     "turn_spans",
     "unassign",
@@ -4600,7 +4953,9 @@
     "unassigned_lots",
     "waiting_episodes",
     "wip_exceptions",
-    "without_project"
+    "without_project",
+    "schedule_wake",
+    "note_with_wake"
    ],
    "watches": [
     "delete",
@@ -4646,7 +5001,16 @@
     "get",
     "listing",
     "progress",
+    "reconcile_loss",
     "undrain"
+   ],
+   "github_watch": [
+    "advance",
+    "checkpoint",
+    "cursor",
+    "lock",
+    "remember",
+    "scan"
    ]
   }
  },

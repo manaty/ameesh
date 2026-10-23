@@ -10,6 +10,12 @@ the canon; a change made there becomes a **proposal**, never a second source.
 ameesh reads only the YAML **frontmatter** of OKF files. Unknown keys are kept
 and ignored, so a canon can carry more than ameesh needs.
 
+**Process cards** (`processus/*.md`, `type: Process`) are the working rules
+injected into every agent's brief. A card may also carry an executable
+`workflow:` block: data compiled to the native `process-workflow/1` schema and
+admitted by an exact revision pin. The prose and the workflow live in the same
+card; see [Write a Process card](../guides/write-a-process.md).
+
 ## Where ameesh reads it
 
 `AMEESH_CANON` (or `canon` in the configuration file) points to the root of an
@@ -206,3 +212,5 @@ members:
 
 - [Members, agents, hosts, placements](members-agents-hosts.md): the card types.
 - [Write a canon](../guides/write-a-canon.md): a worked example.
+- [Write a Process card](../guides/write-a-process.md): working rules and the
+  executable `workflow:` block.

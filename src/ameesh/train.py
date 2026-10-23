@@ -16,9 +16,7 @@ import hashlib
 import json
 import math
 from dataclasses import dataclass
-from datetime import datetime, timedelta
 from typing import Protocol
-from zoneinfo import ZoneInfo
 
 from . import merge_queue
 
@@ -28,6 +26,16 @@ TERMINAL = ("landed", "empty", "paused", "invalidated")
 
 class TrainError(RuntimeError):
     """A missing proof or an uncertain effect: do not merge."""
+
+
+class PrevalidationRed(TrainError):
+    """La prévalidation de la composition a exécuté la sélection et un test a
+    échoué : un résultat, pas une réponse perdue.
+
+    L'Engine ne doit pas la confondre avec une publication incertaine (qui
+    garde `publishing`, la réservation et rejoue la même composition à chaque
+    événement) : le paquet est arrêté (`paused`, terminal) et la réservation
+    est rendue par le `finally` de `step`."""
 
 
 class MemberDeferred(TrainError):
@@ -41,7 +49,6 @@ class MemberDeferred(TrainError):
 class Policy:
     enabled: bool = False
     # Build/beta uses the installed passage's compiled packet calendar.
-    # The uninstalled engine retains its historical fixture calendars.
     build_beta: bool = True
     interval_s: int = 3600
     threshold: int = 5
@@ -49,7 +56,7 @@ class Policy:
     ci_mode: str = "packet"
     max_failures: int = 8
     # The installed passage supplies the compiled canon calendar (#1616).
-    # None retains the standalone, uninstalled engine's legacy calendar.
+    # None has no calendar: a cutoff is refused, never a local default (#2451).
     schedule: object | None = None
 
     def __post_init__(self):
@@ -61,7 +68,9 @@ class Policy:
             raise ValueError("positive train limits expected")
 
     def cutoff(self, now):
-        at = self.schedule.last_packet(now) if self.schedule is not None else cutoff(now)
+        if self.schedule is None:
+            raise TrainError("compiled canon calendar required for a packet cutoff")
+        at = self.schedule.last_packet(now)
         if isinstance(at, bool) or not isinstance(at, (int, float)) \
                 or not math.isfinite(at) or at > now:
             raise TrainError("compiled canon must provide a packet cutoff at or before now")
@@ -105,24 +114,17 @@ def ordered(rows: list[dict], dependencies: list[dict]) -> list[dict]:
     return result
 
 
-def cutoff(now: float) -> float:
-    """Latest 11:00/23:00 Europe/Paris cutoff, including across DST."""
-    local = datetime.fromtimestamp(now, ZoneInfo("Europe/Paris"))
-    if local.hour >= 23:
-        slot = local.replace(hour=23, minute=0, second=0, microsecond=0)
-    elif local.hour >= 11:
-        slot = local.replace(hour=11, minute=0, second=0, microsecond=0)
-    else:
-        slot = (local - timedelta(days=1)).replace(hour=23, minute=0, second=0, microsecond=0)
-    return slot.timestamp()
-
-
 def due(rows: list[dict], now: float, policy: Policy, *, last_started: float = 0) -> bool:
     if not rows:
         return False
     if policy.build_beta:
+        # `rows` is already the admissible set for the cutoff: the engine
+        # filters by the candidate's admissibility instant, not by the queue
+        # insertion its own enrollment wrote after the cutoff (#2965). `due`
+        # must not re-apply the queue timestamp, or that rescued row would
+        # still skip the packet.
         slot = policy.cutoff(now)
-        return last_started < slot and any(float(r["queued_ts"]) <= slot for r in rows)
+        return last_started < slot and bool(rows)
     # First train: at most an hour from the oldest admitted lot. Subsequent
     # trains: at most an hour since the preceding train, never an idle burst.
     since = max(last_started, min(float(r["queued_ts"]) for r in rows))
@@ -136,9 +138,13 @@ class Ports(Protocol):
     unresolved B/P2-sensitive, delta reviews, protected/release targets, fire
     (including withdrawal) and targeted CI only in that policy mode. It
     returns JSON evidence, not a boolean inferred from the latest verdict.
-    `authorize` binds (source,target,base,head,tree,members,proof) to the
-    compiled merge policy, or to a named pilot fire when that policy requires
-    one. Named-fire withdrawal is serialized with `promote`.
+    `admitted` (#2965, optional) filters the queue rows to those admissible at
+    a packet cutoff: the rows the train enrolled itself are dated by the
+    admissibility instant of their admission proof, every other admission by
+    its own queue instant. `authorize` binds
+    (source,target,base,head,tree,members,proof) to the compiled merge policy,
+    or to a named pilot fire when that policy requires one. Named-fire
+    withdrawal is serialized with `promote`.
     """
     def acquire(self, epoch: int | None) -> int | None: ...
     def release(self, epoch: int) -> None: ...
@@ -146,9 +152,12 @@ class Ports(Protocol):
     def save(self, state: dict, expected: int, epoch: int) -> dict: ...
     def target(self) -> str: ...
     def entries(self) -> list[dict]: ...
+    def admitted(self, rows: list[dict], slot: float) -> list[dict]: ...
     def dependencies(self, rows: list[dict]) -> list[dict]: ...
     def qualify(self, rows: list[dict], base: str, mode: str) -> dict: ...
-    def compose(self, base: str, rows: list[dict], nonce: str) -> dict: ...
+    def sync(self, base: str) -> dict | None: ...
+    def compose(self, base: str, rows: list[dict], nonce: str,
+                sync: dict | None = None) -> dict: ...
     def validate_transports(self, plan: dict) -> list[dict]: ...
     def publish(self, plan: dict, epoch: int) -> None: ...
     def start_ci(self, plan: dict) -> None: ...
@@ -179,7 +188,10 @@ class Engine:
         number = len(state["attempts"]) + 1
         nonce = digest([self.source, self.target, state["base"], state["started_ts"],
                         [identity(r) for r in members], proof, number])
-        merged = self.ports.compose(state["base"], members, nonce)
+        sync = self.ports.sync(state["base"])
+        merged = (self.ports.compose(state["base"], members, nonce, sync=sync)
+                  if sync is not None
+                  else self.ports.compose(state["base"], members, nonce))
         # The adapter refuses conflicts unless their exact merged delta is
         # reviewed. No implicit rerere approval and no inferred CI transfer.
         for field in ("head", "tree"):
@@ -195,6 +207,17 @@ class Engine:
                     nonce=nonce,
                     branch="integration/train-%s-%s" % (state["stamp"], token[:16]),
                     id=token, created_ts=now)
+        if sync is not None:
+            receipt = merged.get("sync")
+            if not isinstance(receipt, dict) or receipt.get("ref") != sync.get("ref") \
+                    or receipt.get("sha") != sync.get("sha") \
+                    or receipt.get("base") != state["base"]:
+                raise TrainError("compose returned no exact main sync receipt")
+            for field in ("head", "tree"):
+                value = receipt.get(field, "")
+                if not merge_queue._HEX.fullmatch(value) or len(value) not in (40, 64):
+                    raise TrainError("compose returned no full main sync %s" % field)
+            plan["sync"] = copy.deepcopy(receipt)
         if "transports" in merged:
             if not isinstance(merged["transports"], list) or not merged["transports"]:
                 raise TrainError("nonempty structured composition transports required")
@@ -279,12 +302,22 @@ class Engine:
                 if callable(enroll):
                     enroll(epoch)
                     self._held()
+                    # #3139: enrollment persists its per-lot refusals in the
+                    # same document. Reload its exact revision before this
+                    # pass writes anything (a stale revision would refuse).
+                    state = self.ports.load()
                 rows = self.ports.entries()
                 if self.policy.build_beta:
                     # A late admission belongs to the next packet, even if
                     # this cutoff was empty or the executor has restarted.
+                    # #2965: the instant is the candidate's admissibility,
+                    # read by the admission reader — not the queue insertion
+                    # this train itself just wrote after the cutoff. A manual
+                    # admission keeps its own queue instant and stays late.
                     slot = self.policy.cutoff(now)
-                    rows = [r for r in rows if float(r["queued_ts"]) <= slot]
+                    admitted = getattr(self.ports, "admitted", None)
+                    rows = (admitted(rows, slot) if callable(admitted)
+                            else [r for r in rows if float(r["queued_ts"]) <= slot])
                 rows = ordered(rows, self.ports.dependencies(rows))
                 if not due(rows, now, self.policy,
                            last_started=float((state or {}).get("started_ts", 0))):
@@ -294,7 +327,10 @@ class Engine:
                              revision=int((state or {}).get("revision", 0)), phase="composing",
                              base=self.ports.target(), members=rows, started_ts=now,
                              stamp=datetime.fromtimestamp(now, timezone.utc).strftime("%Y%m%d-%H%M"),
-                             attempts=[], failures=0, pending=[], excluded=[], good=[], deferred=[])
+                             attempts=[], failures=0, pending=[], excluded=[], good=[], deferred=[],
+                             enrollment_deferred=copy.deepcopy(
+                                 (state or {}).get("enrollment_deferred") or []),
+                             enrollment_checked_ts=(state or {}).get("enrollment_checked_ts"))
                 state = self._save(state)
             if self.policy.build_beta and (state.get("plan") or {}).get("diagnostic"):
                 raise TrainError("diagnostic CI is disabled during build/beta")
@@ -328,6 +364,11 @@ class Engine:
                 # Idempotent compare-and-swap publication of an immutable ref.
                 try:
                     self.ports.publish(state["plan"], self.epoch)
+                except PrevalidationRed as exc:
+                    # Un rouge de prévalidation est un résultat, pas une
+                    # réponse perdue : on arrête le paquet (terminal, donc
+                    # réservation rendue) au lieu de rejouer la composition.
+                    return self._prevalidation_red(state, exc)
                 except TrainError as exc:
                     # A push may have succeeded despite a lost response.
                     # Keep the immutable publication intent for reconciliation.
@@ -416,6 +457,25 @@ class Engine:
             if state is None or state.get("phase") in TERMINAL:
                 self.ports.release(epoch)
                 self.epoch = None
+
+    def _prevalidation_red(self, state, exc):
+        """Arrête un paquet dont la prévalidation a exécuté et échoué.
+
+        La composition est immuable : rester en `publishing` rejouerait le
+        même rouge à chaque événement et tiendrait la réservation. `paused`
+        est terminal — le `finally` rend l'époque — et le diagnostic porte les
+        tests en échec. Comme après un CI rouge en build/beta, le train reste
+        arrêté et attend le pilote : `step()` court-circuite `paused`, aucun
+        créneau ne repart tout seul (même comportement que `_red`). Aucun
+        diagnostic automatique n'est lancé : un échec multi-lots ne prouve pas
+        un coupable.
+        """
+        state["failures"] += 1
+        state["diagnosis"] = {"stage": "prevalidation", "why": str(exc)}
+        state["phase"] = "paused"
+        state = self._save(state)
+        self.ports.notify("prevalidation red before publication: %s" % exc, state)
+        return {"result": "paused", "error": str(exc)}
 
     def _red(self, state, now):
         state["failures"] += 1

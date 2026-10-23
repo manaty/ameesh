@@ -10,6 +10,7 @@ import json
 import os
 import subprocess
 import tempfile
+import time
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
@@ -216,6 +217,52 @@ class ValidateTest(unittest.TestCase):
         # l'arbre vérifié et l'identité envoyée sont recopiés dans le rapport
         self.assertEqual(report["tree"],
                          {"head": A, "snapshot": C, "plan": "plan.json"})
+
+    def test_une_echeance_borne_le_geste_jusqu_a_l_offload(self):
+        # #2665/B1 cx2 : l'échéance traverse validate jusqu'au runner réel ;
+        # l'attente locale du client est tuée et le rapport est indisponible,
+        # jamais vert.
+        seen = {}
+
+        def runner(argv, **kwargs):
+            seen["timeout"] = kwargs.get("timeout")
+            seen["wait_timeout"] = argv[argv.index("--wait-timeout") + 1]
+            raise subprocess.TimeoutExpired(argv, kwargs.get("timeout"))
+
+        report = pv.validate(lot=1770, plan_path=self.plan, head=A, host="vm1",
+                             params=params(), repo=self.tmp.name, runner=runner,
+                             snapshotter=snapshot_for(),
+                             git_runner=git_runner_for(),
+                             deadline=pv.Deadline(30.0))
+        self.assertFalse(report["ok"])
+        self.assertEqual(report["outcome"], "run-incomplete")
+        self.assertIn("run-incomplete", report["causes"])
+        self.assertEqual(report["exit"], 124)
+        self.assertGreater(seen["timeout"], 30.0)
+        self.assertGreater(int(seen["wait_timeout"]), 0)
+
+    def test_une_echeance_borne_les_git_locaux_de_validate(self):
+        # #2665/B1 cx2 : un git local dormant (contrats, HEAD, chemin du
+        # plan, relecture après run) ne dépasse plus l'échéance ; le refus est
+        # une indisponibilité, pas une sélection fausse.
+        seen = {}
+
+        def git_runner(argv, **kwargs):
+            seen["timeout"] = kwargs.get("timeout")
+            subprocess.run(["sleep", "0.15"], timeout=kwargs.get("timeout"))
+            return _Proc(0, A + "\n")
+
+        began = time.monotonic()
+        with self.assertRaises(pv.PrevalidationError) as caught:
+            pv.validate(lot=1770, plan_path=self.plan, head=A, host="vm1",
+                        params=params(), repo=self.tmp.name,
+                        runner=runner_for(0, flux()),
+                        snapshotter=snapshot_for(), git_runner=git_runner,
+                        deadline=pv.Deadline(0.03))
+        self.assertEqual(caught.exception.cause, "run-incomplete")
+        self.assertLess(time.monotonic() - began, 0.2)
+        self.assertIsNotNone(seen.get("timeout"))
+        self.assertLessEqual(seen["timeout"], 0.03)
 
     def test_lanceur_de_part_du_bloc_dans_la_commande(self):
         """Le bloc nomme le lanceur de part : il part tel quel sur la VM."""
@@ -438,6 +485,16 @@ class CommandTest(unittest.TestCase):
                                   "--plan", "plan.json", "--host", "vm1"])
         self.assertEqual(args.work_command, "prevalidate")
         self.assertEqual(args.lot, 1770)
+
+    def test_lot_zero_refuse(self):
+        """Le lot 0 est réservé à la composition du train (#2644) ; la
+        commande explicite garde un lot positif, sinon le rapport persisté
+        n'aurait pas de clé."""
+        out = StringIO()
+        with redirect_stdout(out):
+            code = pv.run(None, None, self._args(lot=0))
+        self.assertEqual(code, 1)
+        self.assertIn("lot invalide", out.getvalue())
 
     def test_canon_absent_refuse_block_missing(self):
         out = StringIO()

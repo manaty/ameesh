@@ -22,6 +22,7 @@ la tête gelée, les portes et le bail.
 from __future__ import annotations
 
 import os
+import re
 from typing import Optional
 
 from . import canon as canon_mod
@@ -89,9 +90,16 @@ def repository(cfg, item: dict) -> Optional[str]:
     return getattr(project, "repo", None) or None
 
 
-def default_base(cfg, item: dict, repo: str) -> Optional[str]:
+def default_base(cfg, item: dict, repo: str, *, declared_only: bool = False) -> Optional[str]:
     """La cible du lot : `branch_target`, puis la cible du projet, puis celle
-    du dépôt (`plan_git.default_target`, `origin/HEAD` ou main/master)."""
+    du dépôt (`plan_git.default_target`, `origin/HEAD` ou main/master).
+
+    `declared_only` (#2660) : ne retenir que les cibles **déclarées** — lot,
+    projet, puis `git config ameesh.target` — et rendre None sans elles,
+    jamais la branche par défaut du clone. Un clone nexlink a `origin/HEAD`
+    sur main alors que son projet intègre sur develop : ce repli ferait
+    vérifier un numéro de migration contre la mauvaise branche en silence.
+    """
     explicit = str(item.get("branch_target") or "").strip()
     if explicit:
         return explicit
@@ -106,27 +114,68 @@ def default_base(cfg, item: dict, repo: str) -> Optional[str]:
     target = str(getattr(project, "target", "") or "").strip() if project is not None else ""
     if target:
         return target
+    if declared_only:
+        try:
+            return plan_git.declared_target(repo)
+        except Exception:  # noqa: BLE001 - dépôt illisible : l'appelant doutera
+            return None
     try:
         return plan_git.default_target(repo)
     except Exception:  # noqa: BLE001 - dépôt illisible : l'appelant doutera
         return None
 
 
-def repo_for_freeze(db, cfg, item: dict, frozen: str, *, extra_paths=()) -> str:
-    """Le dépôt local qui contient le commit gelé `frozen`, ou "" (#2559).
+def _landing_ref(repo: str, target: str) -> str:
+    """La référence qui lit la cible d'atterrissage `target` dans `repo`.
+
+    `refs/remotes/<distant>/<cible>` quand le clone la connaît, sinon `target`
+    tel quel (dépôt sans distant, SHA) : jamais une branche locale qu'aucun
+    `fetch` ne fait avancer quand sa version distante est lisible (#3068).
+    La référence est rendue **complète** : le nom court `origin/main` se
+    résout d'abord en `refs/tags/origin/main`, et une étiquette homonyme
+    remplacerait la cible dans le diff de classe (B1 de la relecture cx2)."""
+    try:
+        remote = canon_mod.remote_branch(repo, target)
+        if remote:
+            full = "refs/remotes/" + remote
+            if plan_git._commit(repo, full):
+                return full
+    except canon_mod.GitError:  # sonde illisible : le diff dira son erreur
+        pass
+    return target
+
+
+def repo_for_freeze(db, cfg, item: dict, frozen: str, *, extra_paths=(),
+                    overview: list | None = None) -> tuple[str, str]:
+    """Le dépôt local qui contient le commit gelé `frozen`, et ce commit résolu.
 
     L'hôte qui lit un lot (alerte SLO, vue) n'est pas forcément celui de son
     auteur : `radar` ne connaît pas toujours le dépôt du projet. On essaie donc,
     dans l'ordre, le dossier de travail de l'assigné (registre), le dépôt du
     projet (`repository`), tout dossier de travail local du registre, les
     chemins `extra_paths` de l'appelant, puis le dossier courant. Le premier
-    dont le dépôt résout `frozen` en commit gagne ; aucun : "" — l'appelant ne
-    conclut pas (jamais de classe rassurante par défaut). Lecture seule."""
+    dont le dépôt résout `frozen` en commit gagne.
+
+    Rend `(dépôt, commit complet)` — le SHA résolu, jamais le préfixe reçu
+    (#2564) — ou `("", "")` si aucun dépôt ne le résout : l'appelant ne conclut
+    pas (jamais de classe rassurante par défaut). `overview` réutilise les
+    lignes de `registry.overview` déjà lues par l'appelant (une passe = une
+    lecture pour N lots, #2564) ; `None` les relit. Lecture seule.
+
+    #2851 : la sonde est locale (`plan_git.local_commit`). Un clone partiel
+    d'un autre projet dont le commit manque lançait sinon un fetch paresseux
+    (~10 s) avant d'échouer, et le balayage des dossiers du registre payait ce
+    délai plusieurs fois par passe d'alertes."""
     from . import registry
 
     frozen = str(frozen or "").strip()
     if not frozen:
-        return ""
+        return "", ""
+    # #2786 : un gel qui ne nomme pas un commit hexadécimal (`HEAD`, une
+    # branche) n'est jamais résolu dans le clone de l'hôte, qui lirait une
+    # tête que personne n'a gelée (#2712) ; la lecture reste en doute.
+    if not plan_git.commit_id(frozen):
+        return "", ""
     candidates = []
     assignee = str((item or {}).get("assignee") or "").strip()
     try:
@@ -139,7 +188,8 @@ def repo_for_freeze(db, cfg, item: dict, frozen: str, *, extra_paths=()) -> str:
     except Exception:  # noqa: BLE001 - pas de réglage radar : les autres pistes
         pass
     try:
-        candidates.extend(str(row.get("cwd") or "") for row in registry.overview(db))
+        rows = registry.overview(db) if overview is None else overview
+        candidates.extend(str(row.get("cwd") or "") for row in rows)
     except Exception:  # noqa: BLE001 - registre illisible : les autres pistes
         pass
     candidates.extend(extra_paths or ())
@@ -160,11 +210,12 @@ def repo_for_freeze(db, cfg, item: dict, frozen: str, *, extra_paths=()) -> str:
             continue
         seen.add(root)
         try:
-            if plan_git._commit(root, frozen):
-                return root
+            commit = plan_git.local_commit(root, frozen)
         except Exception:  # noqa: BLE001 - commit illisible : piste suivante
             continue
-    return ""
+        if commit:
+            return root, commit
+    return "", ""
 
 
 def _doubtful_files(paths) -> list:
@@ -176,19 +227,163 @@ def _doubtful_files(paths) -> list:
             for path in paths or () if str(path or "")]
 
 
+def _light_reviews(canons) -> tuple[int, str]:
+    """Le plancher d'avis d'un lot léger, au même commit que la politique.
+
+    `reviews.light_reviews` du canon (#2642) est lu par le lecteur strict
+    `mechanics`, jamais recopié ici : la porte de fusion et `paquet-candidats`
+    lisent la classe, donc le même plancher que la désignation. Rend
+    `(plancher, problème)` : 0 sans document mécanique (canon antérieur, ou
+    canon en fichiers de travail sans commit exact — la transition bornée à la
+    PR home qui le pose à 1), mais un document présent et illisible rend un
+    problème que l'appelant traduit en doute, jamais en zéro rassurant.
+    """
+    from . import mechanics
+    value = 0
+    for canon in canons or ():
+        for source in getattr(canon, "sources", ()) or ():
+            if (getattr(source, "mode", "") != "git" or not source.repo
+                    or not source.commit or getattr(source, "prefix", "")):
+                continue
+            try:
+                value = max(value, mechanics.light_reviews_at(source.repo,
+                                                              source.commit))
+            except mechanics.MechanicsAbsent:
+                continue
+            except mechanics.MechanicsError as exc:
+                return value, str(exc)
+    return value, ""
+
+
+def _review_flags(canons) -> tuple[bool, bool, str]:
+    """Les drapeaux d'avis du canon compilé, au même commit que la classe (#2726).
+
+    `reviews.exclude_author_family` et `reviews.distinct_families` sont lus par
+    le lecteur strict `mechanics` : la porte de fusion et le train les
+    appliquent, ils ne sont pas recopiés ici. Le plus strict l'emporte entre
+    canons : une exclusion demandée par un canon s'applique, et une double
+    famille n'est levée que si tous les documents la lèvent. Rend
+    `(exclude, distinct, problème)` : sans document mécanique (canon
+    antérieur), le repli est le comportement historique (pas d'exclusion de
+    famille, deux familles distinctes) ; un document présent et illisible rend
+    un problème que l'appelant traduit en doute, jamais en repli rassurant.
+    """
+    from . import mechanics
+    exclude, distinct = False, None
+    for canon in canons or ():
+        for source in getattr(canon, "sources", ()) or ():
+            if (getattr(source, "mode", "") != "git" or not source.repo
+                    or not source.commit or getattr(source, "prefix", "")):
+                continue
+            try:
+                declared_exclude, declared_distinct = mechanics.review_flags_at(
+                    source.repo, source.commit)
+            except mechanics.MechanicsAbsent:
+                continue
+            except mechanics.MechanicsError as exc:
+                return True, True, str(exc)
+            exclude = exclude or declared_exclude
+            distinct = declared_distinct if distinct is None else distinct or declared_distinct
+    return exclude, True if distinct is None else distinct, ""
+
+
+def _train_reviews(federation, project: Optional[str], paths) -> tuple[int, str]:
+    """Le nombre d'avis déclaré par chemin (`train_reviews`, PR85).
+
+    Lu dans le **même document** que la politique de classe, donc au même
+    commit : la désignation au gel, la porte de fusion et `paquet-candidats`
+    lisent le même nombre (#2696, canon §7). Le maximum des règles applicables
+    l'emporte ; un avis déclaré 2 sur un chemin léger ne reclasse pas le
+    chemin, il exige le second avis.
+
+    Un bloc absent (canon antérieur) ou un projet absent du bloc ne disent
+    rien : 0, sans doute. Un bloc ou une règle illisible rend un problème que
+    `class_of_paths` traduit en doute, jamais en zéro rassurant.
+    """
+    if not isinstance(federation, dict):
+        return 0, ""
+    policies = federation.get("review_policies")
+    if not isinstance(policies, dict):
+        return 0, ""
+    block = policies.get("train_reviews")
+    if block is None:
+        return 0, ""
+    if not isinstance(block, dict) \
+            or block.get("schema") != "ameesh-train-reviews-policy/1":
+        return 0, "review_policies.train_reviews: unknown schema"
+    projects = block.get("projects")
+    if not isinstance(projects, dict):
+        return 0, "review_policies.train_reviews.projects: not a mapping"
+    declaration = projects.get(project)
+    if declaration is None:
+        return 0, ""            # ce canon ne déclare pas les avis de ce projet
+    rules = declaration.get("rules") if isinstance(declaration, dict) else None
+    if not isinstance(rules, list):
+        return 0, ("review_policies.train_reviews.projects.%s.rules: not a list"
+                   % project)
+    wanted = [str(path) for path in paths or () if str(path or "")]
+    value = 0
+    for index, rule in enumerate(rules):
+        where = ("review_policies.train_reviews.projects.%s.rules[%d]"
+                 % (project, index))
+        if not isinstance(rule, dict) or set(rule) != {"paths", "reviews"}:
+            return 0, "%s: expected {paths, reviews}" % where
+        count = rule["reviews"]
+        if type(count) is not int or count not in (1, 2):
+            return 0, "%s.reviews: expected 1 or 2" % where
+        patterns = rule["paths"]
+        if (not isinstance(patterns, list) or not patterns
+                or any(not isinstance(p, str) or not p.strip() for p in patterns)):
+            return 0, "%s.paths: nonempty strings required" % where
+        try:
+            compiled = tuple(review_mod.compile_glob(pattern) for pattern in patterns)
+        except re.error as exc:
+            return 0, "%s.paths: invalid pattern (%s)" % (where, exc)
+        if any(rx.fullmatch(path) for path in wanted for rx in compiled):
+            value = max(value, count)
+    return value, ""
+
+
 def class_of_paths(canons, project: Optional[str], paths) -> dict:
     """La classe des `paths` pour `project`, lue dans tous les canons.
 
-    Rend `{class, why, files, policy_ref, doubt}` ; une politique illisible, un
-    projet que **aucun** canon ne déclare (sans repli déclaré) ou des chemins
-    inclassables rendent `sensitive` avec `doubt` — jamais une classe rassurante
-    par défaut. Un canon qui déclare d'autres projets sans repli ne dit rien de
-    celui-ci : il est ignoré, pas compté comme un doute.
+    Rend `{class, why, files, policy_ref, doubt, project, light_reviews,
+    train_reviews, exclude_author_family, distinct_families}` ; une politique
+    illisible, un projet que **aucun** canon
+    ne déclare (sans repli déclaré) ou des chemins inclassables rendent
+    `sensitive` avec `doubt` — jamais une classe rassurante par défaut. Un
+    canon qui déclare d'autres projets sans repli ne dit rien de celui-ci : il
+    est ignoré, pas compté comme un doute. `light_reviews` est le plancher
+    d'avis de la classe légère (#2642), lu au même commit ; la classe reste
+    `light`, le plancher ne reclasse pas. `train_reviews` est le plus grand
+    nombre d'avis déclaré par chemin (`train_reviews`, #2696) : la porte et
+    `paquet-candidats` lisent le même nombre que la désignation au gel.
+    `exclude_author_family` et `distinct_families` sont les drapeaux compilés
+    du canon (#2726) : la porte exclut la famille d'un auteur et la double
+    famille au compte d'avis requis au lieu de supposer un repli.
+    `project` permet à la porte de n'appliquer ses motifs de secours qu'au
+    projet ameesh, dont ils décrivent les chemins (#2696, cas pilote Nexlink).
     """
+    canons = tuple(canons or ())
+    light_reviews, light_problem = _light_reviews(canons)
+    exclude_author_family, distinct_families, flags_problem = _review_flags(canons)
+    if light_problem:
+        return {"class": SENSITIVE, "files": _doubtful_files(paths),
+                "policy_ref": "", "doubt": True, "project": project or "",
+                "light_reviews": light_reviews, "train_reviews": 0,
+                "exclude_author_family": True, "distinct_families": True,
+                "why": "review light floor unreadable: %s" % light_problem}
+    if flags_problem:
+        return {"class": SENSITIVE, "files": _doubtful_files(paths),
+                "policy_ref": "", "doubt": True, "project": project or "",
+                "light_reviews": light_reviews, "train_reviews": 0,
+                "exclude_author_family": True, "distinct_families": True,
+                "why": "review flags unreadable: %s" % flags_problem}
     worst, why, files, ref = LIGHT, "", [], ""
     critical_paths = set()
     files_by_path = {}
     covered = False
+    train_reviews = 0
     for canon in canons or ():
         root = str(getattr(canon, "root", "") or "")
         federation = getattr(canon, "federation", None)
@@ -199,8 +394,12 @@ def class_of_paths(canons, project: Optional[str], paths) -> dict:
             continue
         if errors:
             return {"class": SENSITIVE, "files": _doubtful_files(paths),
-                    "policy_ref": _ref(canon),
-                    "doubt": True,
+                    "policy_ref": _ref(canon), "doubt": True,
+                    "project": project or "",
+                    "light_reviews": light_reviews,
+                    "train_reviews": train_reviews,
+                    "exclude_author_family": exclude_author_family,
+                    "distinct_families": distinct_families,
                     "why": "review policy unreadable (%s): %s"
                            % (root or "canon", errors[0][2])}
         covered = True
@@ -209,7 +408,25 @@ def class_of_paths(canons, project: Optional[str], paths) -> dict:
         except review_mod.ReviewError as exc:
             return {"class": SENSITIVE, "files": _doubtful_files(paths),
                     "policy_ref": _ref(canon), "doubt": True,
+                    "project": project or "",
+                    "light_reviews": light_reviews,
+                    "train_reviews": train_reviews,
+                    "exclude_author_family": exclude_author_family,
+                    "distinct_families": distinct_families,
                     "why": "cannot classify the change: %s" % exc}
+        declared, declared_problem = _train_reviews(
+            federation, project, [entry["path"] for entry in result["files"]])
+        if declared_problem:
+            return {"class": SENSITIVE, "files": _doubtful_files(paths),
+                    "policy_ref": _ref(canon), "doubt": True,
+                    "project": project or "",
+                    "light_reviews": light_reviews,
+                    "train_reviews": train_reviews,
+                    "exclude_author_family": exclude_author_family,
+                    "distinct_families": distinct_families,
+                    "why": "review train counts unreadable (%s): %s"
+                           % (root or "canon", declared_problem)}
+        train_reviews = max(train_reviews, declared)
         if not ref:
             ref = _ref(canon)
         critical_paths.update(entry["path"] for entry in result["files"]
@@ -226,7 +443,10 @@ def class_of_paths(canons, project: Optional[str], paths) -> dict:
             why = "policy of %s" % (root or "canon")
     if not covered:
         return {"class": SENSITIVE, "files": _doubtful_files(paths), "policy_ref": "",
-                "doubt": True,
+                "doubt": True, "project": project or "", "light_reviews": light_reviews,
+                "train_reviews": 0,
+                "exclude_author_family": exclude_author_family,
+                "distinct_families": distinct_families,
                 "why": "project %r is not declared by any canon (no fallback policy)"
                        % (project,)}
     # Le maximum du lot ne suffit pas : une exception de la porte (Markdown
@@ -236,7 +456,10 @@ def class_of_paths(canons, project: Optional[str], paths) -> dict:
         if entry["path"] in critical_paths:
             entry["critical"] = True
     return {"class": worst, "why": why, "files": files, "policy_ref": ref,
-            "doubt": False}
+            "doubt": False, "project": project or "", "light_reviews": light_reviews,
+            "train_reviews": train_reviews,
+            "exclude_author_family": exclude_author_family,
+            "distinct_families": distinct_families}
 
 
 def of_lot(db, lot: int, *, cfg=None, item: Optional[dict] = None,
@@ -254,15 +477,21 @@ def of_lot(db, lot: int, *, cfg=None, item: Optional[dict] = None,
     `canons` (liste ou lecteur différé) réutilisent les lectures groupées de
     l'appelant. Rend aussi `files`, `policy_ref`, `target`, `frozen_sha`,
     `why` et `doubt` (vrai quand la classe vient d'une lecture impossible, pas
-    d'une politique) pour la trace.
+    d'une politique), `light_reviews` (le plancher d'avis d'un lot léger,
+    #2642), `train_reviews` avec `project` (le barème par chemin et le
+    projet qui décide du repli de la porte, #2696) et les drapeaux compilés
+    `exclude_author_family` / `distinct_families` (#2726) pour la trace.
     """
     out: dict = {"lot": int(lot), "class": SENSITIVE, "why": "", "files": [],
                  "policy_ref": "", "repo": repo or "", "target": base or "",
-                 "frozen_sha": head or "", "doubt": True}
+                 "base_sha": "", "frozen_sha": head or "", "doubt": True,
+                 "project": "", "exclude_author_family": False,
+                 "distinct_families": True}
     row = item if item is not None else work.get(db, lot)
     if row is None:
         out["why"] = "lot #%d not found" % lot
         return out
+    out["project"] = str(row.get("app") or "")
     reason = release_reason(row)
     if reason:
         out.update({"class": RELEASE, "why": reason, "doubt": False})
@@ -280,6 +509,12 @@ def of_lot(db, lot: int, *, cfg=None, item: Optional[dict] = None,
             out["why"] = "lot #%d is not frozen" % lot
             return out
         frozen = str(freeze["sha"]).strip()
+        # #2786 : jamais de ref symbolique résolue ici (le `HEAD` d'un autre
+        # clone a classé/fermé le mauvais commit, #2712).
+        if not plan_git.commit_id(frozen):
+            out["why"] = ("the freeze %r is not a commit id (the last freeze must "
+                          "name the full commit)" % (frozen[:24],))
+            return out
         try:
             head = plan_git._commit(repo, frozen)
         except canon_mod.GitError as exc:
@@ -300,14 +535,21 @@ def of_lot(db, lot: int, *, cfg=None, item: Optional[dict] = None,
     if not base:
         base = landing
     out["target"] = base or ""
+    out["base_sha"] = str(base or "")
     reason = release_reason(row, base)
     if reason:
         out.update({"class": RELEASE, "why": reason, "doubt": False})
         return out
-    revision = base_sha or base
+    # #3068 : une cible que l'appelant n'a pas nommée (vue `work show`,
+    # stagnation) se lit sur `origin/<cible>` avant la branche locale, comme la
+    # file (#2207) : dans le clone partagé des agents, `main` local n'avance
+    # pas, et le diff depuis lui rapportait au lot tout ce qui a été fusionné
+    # depuis (#2955 léger affiché sensible, 60 fichiers au lieu de 3).
+    revision = base_sha or (_landing_ref(repo, base) if landing else base)
     if not revision:
         out["why"] = "no target branch: freeze the lot or name its target"
         return out
+    out["base_sha"] = str(revision)
     try:
         paths = canon_mod.git_range_paths(repo, revision, head)
     except canon_mod.GitError as exc:

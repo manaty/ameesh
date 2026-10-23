@@ -39,7 +39,15 @@ test_1467_train_storage  # stockage : intentions CAS et bail cible partagé (#14
 test_2446_train_initial  # stockage : frontière d'activation et reçus de file réels (#2446)
 test_2446_train_service_lease  # stockage : bail de service, même runner/incarnations distinctes (#2446)
 test_2446_train_shadow  # stockage : plan ombre sur file, historique et préparation réels (#2446)
+test_2839_codex_account_gauges  # stockage : seuil et ambiguïté Codex au placement, continuité et rapport (#2839)
+test_2786_freeze_head  # stockage : gel écrit en SHA complet (#2786), balayage et désignation sans ref résolue
+test_2845_github_watch  # stockage : curseur, déduplication et checkpoint de la veille GitHub (#2845)
+test_2893_spend_pending_exact  # stockage : identité exacte du marqueur (created_at, clé 0471) sous extra_float_digits, réparation d'avant 0471 (#2166)
+test_2933_housekeeping_alert_identity  # stockage : première observation stable des orphelins et worktrees malgré les relevés (#2933)
+test_2905_stale_spend_key  # stockage : un spend_key périmé après retour arrière n'est jamais la clé du tour (#2905)
+test_2951_github_observation  # stockage : fraîcheur ci_queue_state, silence GitHub et résolution par tout notificateur (#2951)
 test_423_agent_aliases  # storage: alias namespace guards, audit, same fenced lease/session and canon sync (#423)
+test_1022_creneau_landed  # storage: une fusion lande le creneau de migration, une liberation sans atterrissage le libere (#1022)
 test_472_zombie_turn_close  # storage: worker close and live-review settlement of real zombie-only groups (#472)
 test_508_runner_liveness  # #508 : preuve de vie groupée à l’heure DB, sans bail
 test_653_db_connections  # stockage : sessions périodiques libérées, transactions conservées, capacité globale (#653)
@@ -94,6 +102,7 @@ test_l56_role_executor  # driver: the creator role is set for several statements
 test_l59_activity  # storage: bounded timeline SQL, timestamps, voided costs and delegation resolution (L59)
 test_l61_allers_retours  # allers-retours comptés par le pilote lui-même (AMEESH_DB_TRACE)
 test_l72_panne_de_base  # panne de base, reconnexion, réveils (listener)
+test_l77_human_queue_db  # storage : trace L78 des messages humains servis, idempotence par message (#286 L77)
 test_l78_conversations  # storage: cursor locking, JSON pages, R12 outbox, retention and commit NOTIFY (L78)
 test_l82_attach  # leases: resident handoff, duplicate refusal and queued inputs across native attach (L82)
 test_l87c_alert_ack  # storage: alert acknowledgement, concurrent insert, expiry and durable actor/principal (L87c)

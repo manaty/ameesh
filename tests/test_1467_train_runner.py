@@ -13,11 +13,12 @@ import types
 from datetime import datetime
 from unittest import mock
 
-from ameesh import (db as db_mod, radar, storage, train, train_ci, train_fire,
-                    train_candidates, train_git, train_policy, train_runner, train_transports,
-                    train_transport_journal, work)
+from ameesh import (db as db_mod, prevalidation_calls, radar, registry, storage, train, train_ci,
+                    train_fire, train_candidates, train_git, train_policy, train_runner,
+                    train_transports, train_transport_journal, work)
 
 from .support import PgTestCase
+from .test_1467_train_cutoffs import paris_cutoff
 from .test_1467_train_review import author, verdict
 
 
@@ -36,7 +37,7 @@ class FixtureMechanics(train_policy.Versioned):
     # Independent packet calendar fixture; the release methods must never
     # schedule a train. #1757's real supplier is exercised by the port probe.
     packet_cutoffs = ("11:00", "23:00")
-    last_packet = staticmethod(train.cutoff)
+    last_packet = staticmethod(paris_cutoff)
 
     def next_packet(self, now):
         # Explicit fixture calendar; real provider/DST tested by the port probe.
@@ -93,27 +94,49 @@ class TrainRunnerTest(PgTestCase):
         self.assertNotEqual(subprocess.run(["git", "-C", self.host, "cat-file", "-e", self.head],
                                           capture_output=True).returncode, 0)
         self.ops = storage.of(self.db).work
+        registry.upsert(self.db, "author", harness="deepseek", host="fixture",
+                        cwd=self.host, status="idle")
         item = work.add(self.db, title="runner fixture", app=self.project.name, source="fixture",
-                        actor="fixture", branch="lot/member", branch_target="main")
+                        actor="fixture", assignee="author", branch="lot/member",
+                        branch_target="main")
         mark = self.ops.add_milestone(item["id"], "frozen", sha=self.head, actor="fixture",
                                       verdict=None, note="")
         from ameesh import merge_queue
         self.ops.queue_add(item["id"], target="main", frozen_sha=self.head, note="", actor="fixture",
                            source=merge_queue.source_of(self.host), frozen_id=mark["id"])
-        self.receipts = {"commit:" + self.head: dataclasses.asdict(author(self.head))}
-        for reader, family in (("r1", "claude"), ("r2", "deepseek")):
+        self.db.execute("INSERT INTO turn_costs (agent, harness, session, recorded_at)"
+                        " VALUES ('author', 'deepseek', 's-author', now())")
+        self.receipts = {"commit:" + self.head:
+                         dataclasses.asdict(author(self.head, harness="deepseek"))}
+        for reader, family in (("r1", "claude"), ("r2", "codex")):
             mark = self.ops.add_milestone(item["id"], "verdict", sha=self.head,
                                           actor=reader, verdict="ok", note="")
             _, receipt = verdict(mark["id"], reader, family, commit=self.head)
             receipt = dataclasses.replace(receipt, milestone={key: mark[key]
                 for key in ("id", "actor", "at_ts", "sha", "verdict")})
             self.receipts[receipt.subject] = dataclasses.asdict(receipt)
+            # #2928 : la porte sensible lit le reçu exact dans la base.
+            self.db.execute(
+                "INSERT INTO provenance_receipts"
+                " (subject, sha, actor, session, turn, harness, work_item_id)"
+                " VALUES (%s, %s, %s, %s, %s, %s, %s)"
+                " ON CONFLICT (subject) DO NOTHING",
+                (receipt.subject, self.head, reader, "s-" + family, "t", family,
+                 item["id"]))
         self.provider = types.SimpleNamespace(ProvenanceError=RuntimeError,
             receipt_for_commit=lambda db, sha: self.receipts.get("commit:" + sha),
             receipt_for_milestone=lambda db, mid: self.receipts.get("milestone:%d" % mid))
         self.mechanics = types.SimpleNamespace(MechanicsError=train.TrainError,
             load=mock.Mock(side_effect=FixtureMechanics))
         self.notices, self.api_calls = [], []
+        # #2644 : le canon du banc n'a pas de `processus/mecanique.yaml` et le
+        # port de prévalidation du train est couvert par
+        # test_2644_prevalidation_calls et test_1467_train_runtime ; ce banc
+        # reste hermétique (aucun plan ni hôte réel).
+        gate = mock.patch.object(prevalidation_calls, "gate_train",
+                                 return_value={"state": "green"})
+        gate.start()
+        self.addCleanup(gate.stop)
         self.key = self.project.name + ":main"
         self.now = datetime.fromisoformat("2026-10-15T11:00:00+02:00").timestamp()
         self.db.execute("UPDATE merge_queue SET queued_at=to_timestamp(%s)", [self.now - 3600])
@@ -176,9 +199,14 @@ class TrainRunnerTest(PgTestCase):
     def test_passage_intake_replays_real_generation_at_next_cutoff_then_keeps_active_manifest(self):
         original, reader = self.packet_intake()
         rules = FixtureMechanics(self.publisher, self.base, self.project.name)
-        # Observe the cutoff before allocation rather than assuming today's
-        # SQL time falls after the fixture's historical calendar date.
-        slot = self.db.query("SELECT extract(epoch from clock_timestamp())::float8 AS ts")[0]["ts"]
+        # #2965: anchor the cutoff before the effective freeze. The candidate
+        # is then really late (its admission instant is after the cutoff), so
+        # the generation replay is observed on the next cutoff, not because
+        # the train's own queue insertion happens to be after the cutoff.
+        freeze_at = next(mark["at_ts"] for mark in
+                         self.ops.milestones(original["work_item_id"], None)
+                         if mark["id"] == original["frozen_id"])
+        slot = freeze_at - 1
         rules.last_packet = lambda now: slot
         self.mechanics.load.side_effect = None
         self.mechanics.load.return_value = rules
@@ -190,7 +218,6 @@ class TrainRunnerTest(PgTestCase):
         self.assertEqual(result["enrollment"]["deferred"], [])
         self.assertEqual(self.api_calls, [])
         self.assertIsNone(self.ops.train_read(self.key))
-        slot = entry["queued_ts"] - 1
         rules.last_packet = lambda now: slot if now < slot + 3600 else slot + 3600
         shutil.rmtree(passage.repository_path())
         other_db = db_mod.connect(self.__class__.cfg)
@@ -210,6 +237,8 @@ class TrainRunnerTest(PgTestCase):
         self.assertNotIn("enrollment", result)
         reader.assert_not_called()
         self.assertEqual(train.digest(self.ops.train_read(self.key)["plan"]), train.digest(plan))
+        # #3139: the composed packet keeps the enrollment record of its pass.
+        self.assertEqual(self.ops.train_read(self.key)["enrollment_deferred"], [])
         self.assertEqual(len(self.ops.train_read(self.key)["attempts"]), 1)
         self.assertEqual(self.ops.queue(None)[0]["generation"], entry["generation"])
         self.assertEqual(self.notices, [])
@@ -223,10 +252,30 @@ class TrainRunnerTest(PgTestCase):
         refused = result["enrollment"]["deferred"]
         self.assertEqual([row["work_item_id"] for row in refused], [original["work_item_id"]])
         self.assertIn("queue-history-unknown", refused[0]["reason"])
+        # #3139: the refusal names the lot and its freeze, and the journal
+        # carries the same facts lot by lot instead of one generic line.
+        self.assertEqual(refused[0]["frozen_sha"], self.head)
+        self.assertEqual(refused[0]["frozen_id"], original["frozen_id"])
+        self.assertEqual(len(self.notices), 1)
+        self.assertIn("lot #%d" % original["work_item_id"], self.notices[0])
+        self.assertIn(self.head[:12], self.notices[0])
+        self.assertIn("queue-history-unknown", self.notices[0])
+        state = self.ops.train_read(self.key)
+        self.assertEqual(state["phase"], "empty")
+        self.assertEqual([row["lot"] for row in state["enrollment_deferred"]],
+                         [original["work_item_id"]])
+        self.assertEqual(state["enrollment_deferred"][0]["frozen_sha"], self.head)
+        self.assertIn("queue-history-unknown",
+                      state["enrollment_deferred"][0]["reason"])
+        self.assertIsInstance(state["enrollment_checked_ts"], float)
         self.assertEqual(self.ops.queue(None), [])
         self.assertEqual(work.events(self.db, original["work_item_id"]), before)
         self.assertEqual(self.api_calls, [])
-        self.assertEqual(self.notices, ["candidate enrollment deferred"])
+        # A second pass replaces the record instead of stacking stale refusals.
+        self.passage(candidate=reader).step(self.db, self.now + 1)
+        replay = self.ops.train_read(self.key)
+        self.assertGreater(replay["revision"], state["revision"])
+        self.assertEqual(len(replay["enrollment_deferred"]), 1)
 
     def test_competing_passage_cannot_read_candidates_or_allocate_without_target_reservation(self):
         _, reader = self.packet_intake()
@@ -268,7 +317,7 @@ class TrainRunnerTest(PgTestCase):
         self.assertEqual(result["result"], "ci", result)
         plan, epoch = result["plan"], passage.epoch
         self.assertEqual(plan["proof"]["members"][0]["policy"]["reviews"], 2)
-        self.assertIn(self.head, plan["proof"]["members"][0]["history"]["reviews"]["coverage"])
+        self.assertTrue(plan["proof"]["members"][0]["history"]["reviews"]["gate"]["ok"])
         self.assertEqual(self.git(self.origin, "rev-parse", plan["branch"]), plan["head"])
         other_db = db_mod.connect(self.__class__.cfg)
         self.addCleanup(other_db.close)
@@ -310,9 +359,10 @@ class TrainRunnerTest(PgTestCase):
         self.assertEqual(self.ops.milestones(item_id, None), marks)
         self.assertEqual(self.api_calls, [])
 
-        # Anchor decision times to the returned SQL fact, never wall-clock
-        # progress. The allocation is one second after this fixture cutoff.
-        slot = entry["queued_ts"] - 1
+        # #2965: anchor the cutoff before the effective freeze so the
+        # candidate is late by its own admission instant, never merely by the
+        # queue insertion the train just wrote after the cutoff.
+        slot = freeze["at_ts"] - 1
         rules = FixtureMechanics(self.publisher, self.base, self.project.name)
         rules.last_packet = lambda now: slot if now < slot + 3600 else slot + 3600
         self.mechanics.load.side_effect = None
@@ -354,6 +404,73 @@ class TrainRunnerTest(PgTestCase):
             (item_id,))
         self.assertEqual(receipts, [dict(generation=entry["generation"], kind="packet")])
         self.assertEqual(self.notices, [])
+
+    def test_candidate_admissible_before_the_cutoff_is_composed_at_that_cutoff(self):
+        """#2965 (a): the train's own enrollment is not a late admission."""
+        _, reader = self.packet_intake()
+        slot = self.db.query(
+            "SELECT extract(epoch from clock_timestamp())::float8 AS ts")[0]["ts"]
+        rules = FixtureMechanics(self.publisher, self.base, self.project.name)
+        rules.last_packet = lambda now: slot
+        self.mechanics.load.side_effect = None
+        self.mechanics.load.return_value = rules
+        passage = self.passage(candidate=reader, initial=lambda db, **context: True)
+        result = passage.step(self.db, slot)
+        self.assertEqual(result["result"], "ci", result)
+        entry = result["enrollment"]["admitted"][0]["entry"]
+        # The queue insertion is after the cutoff; only the admission proof,
+        # completed before it, admits the candidate into this packet.
+        self.assertGreater(entry["queued_ts"], slot)
+        self.assertLess(
+            result["enrollment"]["admitted"][0]["proof"]["members"][0]["history"]
+            ["reviews"]["admitted_ts"], slot)
+        self.assertEqual([train.identity(row) for row in result["plan"]["members"]],
+                         [train.identity(entry)])
+        self.assertEqual(self.git(self.origin, "rev-parse", result["plan"]["branch"]),
+                         result["plan"]["head"])
+
+    def test_last_verdict_after_the_cutoff_makes_the_candidate_late(self):
+        """#2965 (b): the completing verdict is dated, not the enrollment."""
+        original, reader = self.packet_intake()
+        item_id = original["work_item_id"]
+        marks = self.ops.milestones(item_id, None)
+        verdicts = sorted((mark for mark in marks if mark["kind"] == "verdict"),
+                          key=lambda mark: (mark["at_ts"], mark["id"]))
+        self.assertEqual(len(verdicts), 2)
+        self.assertLess(verdicts[0]["at_ts"], verdicts[1]["at_ts"])
+        slot = (verdicts[0]["at_ts"] + verdicts[1]["at_ts"]) / 2
+        rules = FixtureMechanics(self.publisher, self.base, self.project.name)
+        rules.last_packet = lambda now: slot if now < slot + 3600 else slot + 3600
+        self.mechanics.load.side_effect = None
+        self.mechanics.load.return_value = rules
+        passage = self.passage(candidate=reader, initial=lambda db, **context: True)
+        result = passage.step(self.db, slot)
+        self.assertEqual(result["result"], "idle", result)
+        entry = result["enrollment"]["admitted"][0]["entry"]
+        self.assertIsNone(self.ops.train_read(self.key))
+        result = passage.step(self.db, slot + 3600)
+        self.assertEqual(result["result"], "ci", result)
+        self.assertEqual([train.identity(row) for row in result["plan"]["members"]],
+                         [train.identity(entry)])
+
+    def test_manual_queue_admission_after_the_cutoff_stays_late(self):
+        """#2965 (d): a hand-queued admission is never re-dated by its gate."""
+        original = self.ops.queue(None)[0]
+        slot = self.db.query(
+            "SELECT extract(epoch from clock_timestamp())::float8 AS ts")[0]["ts"]
+        self.db.execute("UPDATE merge_queue SET queued_at = to_timestamp(%s)"
+                        " WHERE work_item_id = %s", (slot + 60, original["work_item_id"]))
+        rules = FixtureMechanics(self.publisher, self.base, self.project.name)
+        rules.last_packet = lambda now: slot if now < slot + 3600 else slot + 3600
+        self.mechanics.load.side_effect = None
+        self.mechanics.load.return_value = rules
+        passage = self.passage()
+        self.assertEqual(passage.step(self.db, slot + 1), {"result": "idle"})
+        self.assertIsNone(self.ops.train_read(self.key))
+        result = passage.step(self.db, slot + 3600)
+        self.assertEqual(result["result"], "ci", result)
+        self.assertEqual([row["work_item_id"] for row in result["plan"]["members"]],
+                         [original["work_item_id"]])
 
     def test_scheduled_passage_uses_compiled_calendar_with_real_sql_and_reservation(self):
         rules = FixtureMechanics(self.publisher, self.base, self.project.name)
@@ -404,25 +521,41 @@ class TrainRunnerTest(PgTestCase):
     def test_missing_member_history_defers_dependents_and_publishes_independent_member(self):
         original = self.ops.queue(None)[0]
         added = []
-        for branch, base in (("lot/dependent", self.head), ("lot/independent", self.base)):
+        for branch, base, agent in (("lot/dependent", self.head, "dep"),
+                                    ("lot/independent", self.base, "indep")):
+            registry.upsert(self.db, agent, harness="deepseek", host="fixture",
+                            cwd=self.host, status="idle")
+            self.db.execute("INSERT INTO turn_costs (agent, harness, session, recorded_at)"
+                            " VALUES (%s, 'deepseek', %s, now())",
+                            (agent, "s-" + agent))
             self.git(self.publisher, "checkout", "-qb", branch, base)
             self.write(branch.rsplit("/", 1)[1], "independent reviewed fixture\n")
             head = self.commit(branch)
             self.git(self.publisher, "push", "-q", "origin", branch)
             item = work.add(self.db, title=branch, app=self.project.name, source="fixture",
-                            actor="fixture", branch=branch, branch_target="main")
-            freeze = self.ops.add_milestone(item["id"], "frozen", sha=head, actor="fixture",
+                            actor="fixture", assignee=agent, branch=branch,
+                            branch_target="main")
+            freeze = self.ops.add_milestone(item["id"], "frozen", sha=head, actor=agent,
                                            verdict=None, note="")
             member = self.ops.queue_add(item["id"], target="main", frozen_sha=head,
                 note="", actor="fixture", source=original["source"], frozen_id=freeze["id"])
-            self.receipts["commit:" + head] = dataclasses.asdict(author(head))
-            for reader, family in (("r1", "claude"), ("r2", "deepseek")):
+            self.receipts["commit:" + head] = dataclasses.asdict(
+                author(head, actor=agent, harness="deepseek"))
+            for reader, family in (("r1", "claude"), ("r2", "codex")):
                 mark = self.ops.add_milestone(item["id"], "verdict", sha=head,
                     actor=reader, verdict="ok", note="")
                 _, receipt = verdict(mark["id"], reader, family, commit=head)
                 receipt = dataclasses.replace(receipt, milestone={key: mark[key]
                     for key in ("id", "actor", "at_ts", "sha", "verdict")})
                 self.receipts[receipt.subject] = dataclasses.asdict(receipt)
+                # #2928 : la porte sensible lit le reçu exact dans la base.
+                self.db.execute(
+                    "INSERT INTO provenance_receipts"
+                    " (subject, sha, actor, session, turn, harness, work_item_id)"
+                    " VALUES (%s, %s, %s, %s, %s, %s, %s)"
+                    " ON CONFLICT (subject) DO NOTHING",
+                    (receipt.subject, head, reader, "s-" + family, "t", family,
+                     item["id"]))
             added.append(member)
         dependent, independent = added
         storage.of(self.db).work_dependencies.add(dependent["work_item_id"],
@@ -547,11 +680,18 @@ class TrainRunnerTest(PgTestCase):
     def test_compiled_families_are_used_by_real_historical_admission(self):
         rules = FixtureMechanics(self.publisher, self.base, self.project.name)
         rules.families = ("codex", "claude")
+        # L'auteur est rattaché à codex par le journal et le reçu ; les avis
+        # sont claude et codex, donc un seul est indépendant sous la famille
+        # compilée : la porte refuse avant tout effet.
+        self.db.execute("UPDATE turn_costs SET harness = 'codex' WHERE agent = 'author'")
+        self.receipts["commit:" + self.head] = dataclasses.asdict(
+            author(self.head, harness="codex"))
         self.mechanics.load.side_effect = None
         self.mechanics.load.return_value = rules
         result = self.passage().step(self.db, self.now)
         self.assertEqual(result["result"], "empty", result)
-        self.assertIn("missing independent", result["selection"][0]["reason"])
+        self.assertIn("2 independent review verdict(s) required",
+                      result["selection"][0]["reason"])
         self.assertEqual(self.api_calls, [])
 
     def test_lost_member_history_during_ci_preserves_plan_until_terminal_outcome(self):

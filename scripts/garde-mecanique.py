@@ -16,7 +16,7 @@ script (il porte les motifs et les exemptions). Pour chaque clé du schéma
 `ameesh-mechanics` elle refuse les motifs littéraux connus — coupures et
 fuseau, cadence des paquets, plafond de lots en build, politique CI, familles
 et indépendance des avis, politique de fusion, seuils et plafonds de
-prévalidation — et exige une exemption nommée et datée pour un littéral
+prévalidation, seuil de lot du backlog (#2584) — et exige une exemption nommée et datée pour un littéral
 historique.
 
 Une exemption vit dans `EXEMPTIONS` ci-dessous : chemin, paramètre, littéral
@@ -80,6 +80,7 @@ SCHEMA_KEYS = (
     "reviews.families",
     "reviews.exclude_author_family",
     "reviews.distinct_families",
+    "reviews.light_reviews",
     "merge.named_fire",
     "merge.repeat_freeze",
     "merge.on_green_packet",
@@ -89,6 +90,7 @@ SCHEMA_KEYS = (
     "prevalidation.hosts",
     "prevalidation.parts_script",
     "prevalidation.timeout_seconds",
+    "backlog.lot_min_value",
     "projects",
 )
 
@@ -123,6 +125,7 @@ BINDINGS = {
     "exclude_author_family": "reviews.exclude_author_family",
     "distinct_families": "reviews.distinct_families",
     "families": "reviews.families",
+    "light_reviews": "reviews.light_reviews",
     "cutoffs": "cutoffs",
     "timezone": "timezone",
     "classes": "prevalidation.classes",
@@ -130,6 +133,7 @@ BINDINGS = {
     "hosts": "prevalidation.hosts",
     "parts_script": "prevalidation.parts_script",
     "timeout_seconds": "prevalidation.timeout_seconds",
+    "lot_min_value": "backlog.lot_min_value",
 }
 
 #: constantes d'implémentation historiques dont le nom ne porte pas la clé
@@ -163,9 +167,11 @@ DICT_BINDINGS = {
     "exclude_author_family": "reviews.exclude_author_family",
     "distinct_families": "reviews.distinct_families",
     "families": "reviews.families",
+    "light_reviews": "reviews.light_reviews",
     "cutoffs": "cutoffs",
     "timezone": "timezone",
     "schema": "schema",
+    "lot_min_value": "backlog.lot_min_value",
 }
 #: clés du bloc `prevalidation` dans un mapping, seulement dans un fichier
 #: qui parle de prévalidation
@@ -252,102 +258,52 @@ class Exemption:
 #: inutilisée est signalée et le témoin refuse de la laisser traîner.
 EXEMPTIONS = (
     Exemption(
-        path="src/ameesh/work.py",
-        parameter="build.max_in_build",
-        literal="2",
-        name="lot #2449 (mty-amh-impl-08), inventaire du 18/10",
-        date="2026-10-18",
-        reason="constante §4 historique lue par work/wip/progress/backlog ; "
-               "conversion au canon suivie au backlog #2451",
-    ),
-    Exemption(
-        path="src/ameesh/train.py",
-        parameter="timezone",
-        literal="Europe/Paris",
-        name="lot #2449 (mty-amh-impl-08), inventaire du 18/10",
-        date="2026-10-18",
-        reason="moteur du train non installé : calendrier historique conservé "
-               "pour ses témoins ; le passage raccordé fournit `Policy.schedule` (retrait : #2451)",
-    ),
-    Exemption(
-        path="src/ameesh/train.py",
-        parameter="cutoffs",
-        literal="*",
-        name="lot #2449 (mty-amh-impl-08), inventaire du 18/10",
-        date="2026-10-18",
-        reason="moteur du train non installé : les coupures historiques "
-               "11:00/23:00 ne servent que sans `Policy.schedule`, jamais au "
-               "passage raccordé au canon (retrait : #2451)",
-    ),
-    Exemption(
         path="src/ameesh/review_lot.py",
-        parameter="reviews.families",
-        literal="*",
-        name="lot #2449 (mty-amh-impl-08), inventaire du 18/10",
-        date="2026-10-18",
-        reason="relecture après fusion : familles connues et famille opposée "
-               "viennent de la règle du pilote (13/10), pas de "
-               "`processus/mecanique.yaml` (retrait : #2451)",
+        parameter="reviews.light_reviews",
+        literal="1",
+        name="lot #2642 (mty-amh-impl-08), 19/10",
+        date="2026-10-19",
+        reason="relecture après fusion : plancher historique d'un avis pour un "
+               "lot léger, repli d'une classe qui ne porte pas encore le "
+               "paramètre ; la valeur du canon (`light_reviews`) fait foi dès "
+               "qu'elle est déclarée (retrait : PR home)",
     ),
     Exemption(
-        path="src/ameesh/review_provenance.py",
-        parameter="reviews.families",
-        literal="*",
-        name="lot #2449 (mty-amh-impl-08), inventaire du 18/10",
-        date="2026-10-18",
-        reason="validation du harnais d'un reçu #1465 contre les familles "
-               "connues du mesh ; le fournisseur de provenance ne lit pas le "
-               "canon et refuse un harnais inconnu (retrait : #2451)",
-    ),
-    Exemption(
-        path="src/ameesh/review_designation.py",
-        parameter="reviews.families",
-        literal="*",
-        name="lot #2449 (mty-amh-impl-08), inventaire du 18/10",
-        date="2026-10-18",
-        reason="désignation #1617 : repli documenté tant que le canon compilé "
-               "n'est pas câblé ; les appelants peuvent déjà passer `families` "
-               "(retrait : #2451)",
-    ),
-    Exemption(
-        path="src/ameesh/train_policy.py",
-        parameter="schema",
-        literal="ameesh-mechanics/1",
-        name="lot #2449 (mty-amh-impl-08), inventaire du 18/10",
-        date="2026-10-18",
-        reason="l'adaptateur du train n'accepte que le schéma /1 ; le bloc /2 "
-               "(prévalidation) sera porté à l'activation du train (#2446) ; "
-               "retrait : #2451",
-    ),
-    Exemption(
-        path="src/ameesh/train_review.py",
-        parameter="reviews.families",
-        literal="*",
-        name="lot #2449 (mty-amh-impl-08), inventaire du 18/10",
-        date="2026-10-18",
-        reason="bibliothèque du train non installé : défaut de la fonction "
-               "pure ; le passage raccordé (`train_history`) passe "
-               "`rules.families` et l'indépendance compilées (retrait : #2451)",
-    ),
-    Exemption(
-        path="src/ameesh/train_review.py",
+        path="src/ameesh/lot_class.py",
         parameter="reviews.exclude_author_family",
         literal="True",
-        name="lot #2449 (mty-amh-impl-08), inventaire du 18/10",
-        date="2026-10-18",
-        reason="défaut de la fonction pure pour ses appelants sans règle "
-               "compilée ; le passage raccordé passe la valeur du canon "
-               "(retrait : #2451)",
+        name="lot #2726 (ameesh-dev3), 20/10",
+        date="2026-10-20",
+        reason="repli en doute quand le canon est illisible : la direction "
+               "stricte (True), jamais une valeur du canon, toujours lue par "
+               "`_review_flags` puis écrasée. Valeur exacte : une exemption "
+               "large couvrirait un False affaiblissant. Retrait quand "
+               "lot_class lira un repli nommé du lecteur.",
     ),
     Exemption(
-        path="src/ameesh/train_review.py",
+        path="src/ameesh/lot_class.py",
+        parameter="reviews.exclude_author_family",
+        literal="False",
+        name="lot #2726 (ameesh-dev3), 20/10",
+        date="2026-10-20",
+        reason="état initial d'`of_lot` avant la lecture du canon, toujours "
+               "écrasé par `class_of_paths` dès qu'un canon est lisible ; les "
+               "retours précoces qui le gardent sont des doutes `sensitive`, "
+               "où la porte applique déjà l'exclusion de famille. Valeur "
+               "exacte : aucune autre valeur n'est couverte.",
+    ),
+    Exemption(
+        path="src/ameesh/lot_class.py",
         parameter="reviews.distinct_families",
         literal="True",
-        name="lot #2449 (mty-amh-impl-08), inventaire du 18/10",
-        date="2026-10-18",
-        reason="défaut de la fonction pure pour ses appelants sans règle "
-               "compilée ; le passage raccordé passe la valeur du canon "
-               "(retrait : #2451)",
+        name="lot #2726 (ameesh-dev3), 20/10",
+        date="2026-10-20",
+        reason="repli en doute quand le canon est illisible (True) et état "
+               "initial d'`of_lot` avant la lecture (True) : ces littéraux ne "
+               "fournissent jamais la valeur du canon, toujours lue par "
+               "`_review_flags` puis écrasée ; la direction est stricte (deux "
+               "familles). Valeur exacte : une exemption large couvrirait un "
+               "False affaiblissant.",
     ),
 )
 
@@ -473,6 +429,9 @@ def _valid_binding(key: str, value, name: str, train_context: bool,
     if key == "reviews.families":
         return (isinstance(value, tuple) and bool(value)
                 and bool(set(value) & FAMILY_NAMES))
+    if key == "reviews.light_reviews":
+        # §2 (#2642) : 0 n'est admis que le temps de la PR home, 1 au canon.
+        return type(value) is int and value in (0, 1)
     if key in ("cutoffs", "packets.cutoffs"):
         return _is_cutoff_literal(value)
     if key == "timezone":
@@ -492,6 +451,9 @@ def _valid_binding(key: str, value, name: str, train_context: bool,
                 and bool(value) and "/" in value)
     if key == "prevalidation.timeout_seconds":
         return prevalidation_context and type(value) is int and value > 0
+    if key == "backlog.lot_min_value":
+        # #2584 : un score de valeur (1 à 100), le seuil d'un lot du canon §2
+        return type(value) is int and 1 <= value <= 100
     return False
 
 
@@ -517,6 +479,8 @@ def _binding_key(name: str, value, train_context: bool,
         key = "packets.cutoffs" if "packet" in lower else "cutoffs"
     if key is None and lower.endswith("project_overrides"):
         key = "projects"
+    if key is None and lower.endswith("lot_min_value"):
+        key = "backlog.lot_min_value"
     if key is None:
         return None
     if key == "timezone" and not train_context:

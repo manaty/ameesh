@@ -187,25 +187,20 @@ class DisarmGh(MergeGh):
 
 
 class AutoMergeDirectTest(MergePrBase):
-    def test_the_direct_merge_disarms_before_its_proof(self):
+    """#2813 (décision owner 20/10) : `work merge-pr` ne désarme plus. L'auto-
+    fusion d'un porteur est armée à sa publication sur la tête gelée et
+    désarmée quand cette tête bouge (`packet_automerge`) ; la fusion directe
+    garde ses gardes et sa relecture fraîche, liées à `--head`."""
+
+    def test_the_direct_merge_leaves_the_auto_merge_armed(self):
         gh = DisarmGh(merge_view(headRefOid=self.head,
                                  autoMergeRequest={"enabledAt": "2026-10-15T12:28:00Z"}),
                       later=lambda: merge_view(state="MERGED", headRefOid=self.head,
                                                mergeCommit={"oid": self.tip()}))
         out = self.merge(gh)
         self.assertEqual(out["state"], "merged", out)
-        self.assertEqual(len(gh.disarms), 1)
-        self.assertEqual(gh.disarms[0][:2], ["pr", "merge"])
+        self.assertEqual(gh.disarms, [])
         self.assertTrue(all(c[:2] == ["pr", "view"] for c in gh.calls), gh.calls)
-
-    def test_a_failed_disarm_writes_nothing(self):
-        gh = DisarmGh(merge_view(headRefOid=self.head,
-                                 autoMergeRequest={"enabledAt": "2026-10-15T12:28:00Z"}))
-        gh.disable_error = "HTTP 403: must have admin rights"
-        with self.assertRaises(merge_pr.MergePrError) as caught:
-            self.merge(gh)
-        self.assertIn("auto-merge", str(caught.exception))
-        self.assertEqual(self.tip(), self.base)      # rien n'a été poussé
 
 
 class AutoMergeEarlyEjectTest(_land.PrLandTest):

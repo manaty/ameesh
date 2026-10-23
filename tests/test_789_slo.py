@@ -147,6 +147,63 @@ class MesureTest(unittest.TestCase):
         self.assertEqual(row["level"], 1)
         self.assertEqual(row["targets"], ("assignee",))
 
+    def test_intake_reporte_part_du_jour_planifie(self):
+        from ameesh.plan import day_start_ts
+        planned = day_start_ts("2026-10-19")
+        item = _item(assignee="executant", planned_start="2026-10-19")
+        for offset, expected in ((-1, None), (0, 0), (180, 0),
+                                 (3599, 0), (3600, 1), (10800, 3)):
+            with self.subTest(offset=offset):
+                rows = slo.lot_steps(item, _jalons(item, []), [], now=planned + offset)
+                intake = [r for r in rows if r["step"] == "intake_started"]
+                if expected is None:
+                    self.assertEqual(intake, [])
+                else:
+                    self.assertEqual(intake[0]["started_ts"], planned)
+                    self.assertEqual(intake[0]["elapsed_s"], offset)
+                    self.assertEqual(intake[0]["level"], expected)
+
+    def test_intake_planifie_et_prerequis_combines(self):
+        from ameesh.plan import day_start_ts
+        planned = day_start_ts("2026-10-19")
+        item = _item(assignee="executant", planned_start="2026-10-19")
+        cases = (
+            (True, None, planned + 10800, None),
+            (False, planned - 3600, planned - 1, None),
+            (False, planned - 3600, planned + 1800, planned),
+            (False, planned + 3600, planned + 5400, planned + 3600),
+        )
+        for blocking, satisfied, now, expected in cases:
+            with self.subTest(blocking=blocking, satisfied=satisfied, now=now):
+                edges = [{"blocking": blocking, "satisfied_ts": satisfied}]
+                rows = slo.lot_steps(item, _jalons(item, []), [], now=now,
+                                     dependencies=edges)
+                intake = [r for r in rows if r["step"] == "intake_started"]
+                if expected is None:
+                    self.assertEqual(intake, [])
+                else:
+                    self.assertEqual(intake[0]["started_ts"], expected)
+                    self.assertEqual(intake[0]["elapsed_s"], 1800)
+                    self.assertEqual(intake[0]["level"], 0)
+
+    def test_intake_assignation_apres_date_planifiee(self):
+        from ameesh.plan import day_start_ts
+        planned = day_start_ts("2026-10-19")
+        item = _item(assignee="executant", planned_start="2026-10-19")
+        events = [_ev("intake", planned + 7200,
+                      "assigned to executant (before: nobody)")]
+        before = self._row(slo.lot_steps(item, _jalons(item, events), events,
+                                        now=planned + 10800), "intake_started")
+        self.assertEqual(before["started_ts"], planned + 7200)
+        self.assertEqual(before["elapsed_s"], 3600)
+        events.append(_ev("build", planned + 10800))
+        item["state"] = "build"
+        after = self._row(slo.lot_steps(item, _jalons(item, events), events,
+                                       now=planned + 14400), "intake_started")
+        self.assertEqual(after["started_ts"], before["started_ts"])
+        self.assertEqual(after["elapsed_s"], 3600)
+        self.assertEqual(after["level"], 0)
+
     def test_intake_garde_son_origine_au_demarrage(self):
         events = [_ev("intake", T0), _ev("intake", T0 + 7200,
                   "assigned to executant (before: nobody)")]
@@ -160,6 +217,149 @@ class MesureTest(unittest.TestCase):
         self.assertEqual(before["elapsed_s"], 900)
         self.assertEqual(after["started_ts"], before["started_ts"])
         self.assertEqual(after["elapsed_s"], before["elapsed_s"])
+
+    def test_intake_avec_prerequis_bloquant_ouvert_ne_court_pas(self):
+        # #2551 : un lot retenu par une dépendance bloquante ouverte n'est pas
+        # « prêt » ; son porteur ne peut rien y faire, aucun retard intake.
+        events = [_ev("intake", T0)]
+        item = _item(assignee="executant")
+        edges = [{"blocker_id": 7, "blocking": True, "satisfied_ts": None}]
+        rows = slo.lot_steps(item, _jalons(item, events), events,
+                             now=T0 + 13 * 3600, dependencies=edges)
+        self.assertEqual([r for r in rows if r["step"] == "intake_started"], [])
+        self.assertEqual(slo.breaches(rows), [])
+
+    def test_intake_prerequis_satisfait_compte_depuis_la_levee(self):
+        # #2551 : le blocage a duré 10 h ; le délai part de la fusion du
+        # bloqueur, pas de l'attribution (sinon niveau 3 à la seconde).
+        events = [_ev("intake", T0)]
+        item = _item(assignee="executant")
+        unblocked = T0 + 10 * 3600
+        edges = [{"blocker_id": 7, "blocking": False, "satisfied_ts": unblocked}]
+        rows = slo.lot_steps(item, _jalons(item, events), events,
+                             now=unblocked + 1800, dependencies=edges)
+        row = self._row(rows, "intake_started")
+        self.assertEqual(row["started_ts"], unblocked)
+        self.assertEqual(row["elapsed_s"], 1800)
+        self.assertEqual(row["level"], 0)
+        rows = slo.lot_steps(item, _jalons(item, events), events,
+                             now=unblocked + 3660, dependencies=edges)
+        self.assertEqual(self._row(rows, "intake_started")["level"], 1)
+
+    def test_intake_dernier_prerequis_satisfait_gouverne(self):
+        # #2551 : c'est la levée du DERNIER bloqueur qui rend le lot prêt.
+        events = [_ev("intake", T0)]
+        item = _item(assignee="executant")
+        edges = [{"blocker_id": 7, "blocking": False, "satisfied_ts": T0 + 100},
+                 {"blocker_id": 8, "blocking": False, "satisfied_ts": T0 + 200}]
+        rows = slo.lot_steps(item, _jalons(item, events), events, now=T0 + 300,
+                             dependencies=edges)
+        self.assertEqual(self._row(rows, "intake_started")["started_ts"], T0 + 200)
+
+    def test_intake_repart_au_retour_d_une_retenue(self):
+        # #2916 : 2 jours en attente d'une décision owner (ou sous une autre
+        # retenue) ne comptent pas comme retard intake ; au retour, l'horloge
+        # repart de ce retour — témoin de l'auditeur.
+        release = T0 + 2 * 86400
+        item = _item(assignee="executant")
+        for held in ("waiting_human", "blocked"):
+            with self.subTest(held=held):
+                events = [_ev("intake", T0),
+                          _ev(held, T0 + 60, "decision #1 requested"),
+                          _ev("intake", release, "decision #1 answered")]
+                jalons = _jalons(item, events)
+                for offset, lvl in ((300, 0), (3660, 1)):
+                    with self.subTest(offset=offset):
+                        row = self._row(slo.lot_steps(item, jalons, events,
+                                                     now=release + offset),
+                                        "intake_started")
+                        self.assertEqual(row["started_ts"], release)
+                        self.assertEqual(row["elapsed_s"], offset)
+                        self.assertEqual(row["level"], lvl)
+
+    def test_intake_derniere_retenue_levee_gouverne(self):
+        # #2916 : seule la DERNIÈRE sortie de retenue fixe le départ.
+        release = T0 + 7200
+        events = [_ev("intake", T0),
+                  _ev("waiting_human", T0 + 60),
+                  _ev("intake", T0 + 1800),
+                  _ev("blocked", T0 + 3600),
+                  _ev("intake", release)]
+        item = _item(assignee="executant")
+        row = self._row(slo.lot_steps(item, _jalons(item, events), events,
+                                     now=release + 300), "intake_started")
+        self.assertEqual(row["started_ts"], release)
+        self.assertEqual(row["elapsed_s"], 300)
+
+    def test_intake_retenue_apres_le_debut_ne_reecrit_pas_la_mesure(self):
+        # #2916/#2921 : une retenue postérieure au premier build ne réécrit pas
+        # la mesure acquise ; la dernière levée ANTÉRIEURE au début gouverne.
+        events = [_ev("intake", T0),
+                  _ev("waiting_human", T0 + 60),
+                  _ev("intake", T0 + 1800),
+                  _ev("build", T0 + 3600),
+                  _ev("waiting_human", T0 + 7200),
+                  _ev("intake", T0 + 9000)]
+        item = _item(state="intake", assignee="executant", updated_ts=T0 + 9000)
+        row = self._row(slo.lot_steps(item, _jalons(item, events), events,
+                                     now=T0 + 10_000), "intake_started")
+        self.assertEqual(row["started_ts"], T0 + 1800)
+        self.assertEqual(row["done_ts"], T0 + 3600)
+        self.assertEqual(row["elapsed_s"], 1800)
+        # sans levée antérieure, la levée postérieure au début est ignorée
+        events = [_ev("intake", T0),
+                  _ev("build", T0 + 3600),
+                  _ev("waiting_human", T0 + 7200),
+                  _ev("intake", T0 + 9000)]
+        item = _item(state="intake", assignee="executant", updated_ts=T0 + 9000)
+        row = self._row(slo.lot_steps(item, _jalons(item, events), events,
+                                     now=T0 + 10_000), "intake_started")
+        self.assertEqual(row["started_ts"], T0)
+        self.assertEqual(row["elapsed_s"], 3600)
+
+    def test_intake_repart_apres_un_hold_de_pilote(self):
+        # #2916/#1225 : un hold explicite de pilote (#1664) n'est pas un état ;
+        # sa levée, autorisée par l'appelant, fait repartir l'horloge comme
+        # une retenue d'état. Cas réel nexlink #1225.
+        release = T0 + 2 * 86400
+        events = [_ev("intake", T0),
+                  _ev("intake", T0 + 60, "hold: attente des gestes owner")]
+        item = _item(assignee="executant")
+        for offset, lvl in ((300, 0), (3660, 1)):
+            with self.subTest(offset=offset):
+                row = self._row(slo.lot_steps(item, _jalons(item, events), events,
+                                             now=release + offset,
+                                             hold_releases=[release]),
+                                "intake_started")
+                self.assertEqual(row["started_ts"], release)
+                self.assertEqual(row["elapsed_s"], offset)
+                self.assertEqual(row["level"], lvl)
+
+    def test_intake_hold_de_pilote_apres_le_debut_ne_reecrit_pas_la_mesure(self):
+        # #2916/#2921 : même filtre pour les holds de pilote — la dernière
+        # levée antérieure au premier build gouverne.
+        events = [_ev("intake", T0),
+                  _ev("intake", T0 + 60, "hold: attente"),
+                  _ev("build", T0 + 3600)]
+        item = _item(state="build", assignee="executant", updated_ts=T0 + 3600)
+        row = self._row(slo.lot_steps(item, _jalons(item, events), events,
+                                     now=T0 + 10_000,
+                                     hold_releases=[T0 + 1800, T0 + 9000]),
+                        "intake_started")
+        self.assertEqual(row["started_ts"], T0 + 1800)
+        self.assertEqual(row["elapsed_s"], 1800)
+
+    def test_intake_demarre_ne_reecrit_pas_sa_mesure(self):
+        # #2551 : une dépendance ajoutée après le début ne réécrit pas la
+        # mesure d'intake déjà acquise.
+        events = [_ev("intake", T0), _ev("build", T0 + 1800)]
+        item = _item(state="build", assignee="executant", updated_ts=T0 + 1800)
+        edges = [{"blocker_id": 7, "blocking": True, "satisfied_ts": None}]
+        rows = slo.lot_steps(item, _jalons(item, events), events, now=T0 + 7200,
+                             dependencies=edges)
+        row = self._row(rows, "intake_started")
+        self.assertEqual(row["started_ts"], T0)
+        self.assertEqual(row["done_ts"], T0 + 1800)
 
     def test_intake_passee_sans_evenement_build_n_est_pas_un_retard(self):
         # #1982 : un lot en build ou en qa sans événement `build` a franchi
@@ -236,6 +436,160 @@ class MesureTest(unittest.TestCase):
                 {"step": "d", "level": 2, "overdue_s": 99}]
         got = [r["step"] for r in slo.breaches(rows)]
         self.assertEqual(got, ["b", "d", "a"])
+
+
+class PaquetTest(unittest.TestCase):
+    """#2919 : la cible « GO → fusion » d'une unité d'un paquet ouvert est le
+    p80 réel de la CI du paquet, et l'unité n'a aucune cible d'escalade propre
+    (canon §9, décision owner #103509 option a, home#147). Hors paquet
+    (incident ou déblocage de la CI), la cible de la table reste."""
+
+    def _qa(self, *, priority=None):
+        events = [_ev("intake", T0), _ev("build", T0 + 600), _ev("qa", T0 + 1200)]
+        item = _item(state="qa", assignee="executant", updated_ts=T0 + 1200)
+        if priority is not None:
+            item["priority"] = priority
+        jalons = _jalons(item, events)
+        jalons["verdict"], jalons["verdict_kind"] = T0 + 1800, "ok"
+        jalons["verdict_current"] = True
+        return item, jalons, events
+
+    def _row(self, rows, key):
+        got = [r for r in rows if r["step"] == key]
+        self.assertEqual(len(got), 1, "%s absent de %s" % (key, rows))
+        return got[0]
+
+    def test_cible_p80_et_aucune_escalade_propre(self):
+        item, jalons, events = self._qa()
+        # 45 min de CI de paquet (le p80 mesuré), dépassées d'une heure.
+        rows = slo.lot_steps(item, jalons, events, now=T0 + 1800 + 3600,
+                             packet=True, p80_s=2700)
+        row = self._row(rows, "verdict_merge")
+        self.assertEqual(row["target_s"], 2700)
+        self.assertEqual(row["elapsed_s"], 3600)
+        self.assertEqual(row["level"], 0)
+        self.assertEqual(row["targets"], ())
+        self.assertEqual(row["overdue_s"], 0)
+        self.assertTrue(row["packet"])
+        self.assertEqual(row["target_source"], "p80")
+        self.assertFalse(row["escalation"])
+        self.assertEqual(slo.breaches(rows), [])
+
+    def test_chemin_normal_p80_garde_l_escalade(self):
+        # #2919 : un lot à GO courant hors paquet ouvert est mesuré contre le
+        # p80 ; l'escalade ×2/×3 reste (le pilote porte la fusion).
+        item, jalons, events = self._qa()
+        rows = slo.lot_steps(item, jalons, events, now=T0 + 1800 + 3600,
+                             p80_s=2700)
+        row = self._row(rows, "verdict_merge")
+        self.assertEqual(row["target_s"], 2700)
+        self.assertEqual(row["elapsed_s"], 3600)
+        self.assertEqual(row["level"], 1)
+        self.assertEqual(row["overdue_s"], 900)
+        self.assertEqual(row["targets"], ("assignee",))
+        self.assertEqual(row["target_source"], "p80")
+        self.assertNotIn("packet", row)
+        self.assertNotIn("escalation", row)
+
+    def test_chemin_normal_p1_p80_40_min(self):
+        # Témoin du N auditeur : P1, GO courant hors paquet, p80 40 min ;
+        # 20 min après le créneau → tenu, 41 min → niveau 1.
+        item, jalons, events = self._qa(priority=1)
+        for offset, level in ((20 * 60, 0), (41 * 60, 1)):
+            with self.subTest(offset=offset):
+                rows = slo.lot_steps(item, jalons, events,
+                                     now=T0 + 1800 + offset, p80_s=2400)
+                row = self._row(rows, "verdict_merge")
+                self.assertEqual(row["target_s"], 2400)
+                self.assertEqual(row["level"], level)
+
+    def test_sans_mesure_repli_sur_la_cible_de_la_table(self):
+        # Aucun run de suite complète mesuré : la cible de la table (30 min)
+        # reste le repli. L'unité de paquet garde ses cibles vides ; le
+        # chemin normal garde l'escalade de la table.
+        for measured in (None, 0, -1, "illisible"):
+            with self.subTest(measured=measured, packet=True):
+                item, jalons, events = self._qa()
+                rows = slo.lot_steps(item, jalons, events, now=T0 + 1800 + 3600,
+                                     packet=True, p80_s=measured)
+                row = self._row(rows, "verdict_merge")
+                self.assertEqual(row["target_s"], 1800)
+                self.assertEqual(row["level"], 0)
+                self.assertEqual(row["targets"], ())
+                self.assertEqual(row["target_source"], "fallback")
+                self.assertEqual(slo.breaches(rows), [])
+            with self.subTest(measured=measured, packet=False):
+                item, jalons, events = self._qa()
+                rows = slo.lot_steps(item, jalons, events, now=T0 + 1800 + 1900,
+                                     p80_s=measured)
+                row = self._row(rows, "verdict_merge")
+                self.assertEqual(row["target_s"], 1800)
+                self.assertEqual(row["level"], 1)
+                self.assertEqual(row["overdue_s"], 100)
+                self.assertEqual(row["targets"], ("assignee",))
+                self.assertEqual(row["target_source"], "fallback")
+
+    def test_chemin_normal_p1_sans_mesure_repli_30_min(self):
+        # Témoin cx2 (#15024) : P1 normal sans mesure, la ligne paquet a une
+        # colonne P1 « — » ; 20 min après le créneau → tenu (pas 900/15 min),
+        # 31 min → niveau 1 sur 1800.
+        item, jalons, events = self._qa(priority=1)
+        for offset, level in ((20 * 60, 0), (31 * 60, 1)):
+            with self.subTest(offset=offset):
+                rows = slo.lot_steps(item, jalons, events,
+                                     now=T0 + 1800 + offset)
+                row = self._row(rows, "verdict_merge")
+                self.assertEqual(row["target_s"], 1800)
+                self.assertEqual(row["level"], level)
+                self.assertEqual(row["target_source"], "fallback")
+
+    def test_paquet_p1_garde_le_p80_pas_la_cible_p1(self):
+        # La colonne P1 de la ligne « paquet » est « — » : un P1 ne reprend pas
+        # la cible de 15 min, il suit le p80 comme les autres.
+        item, jalons, events = self._qa(priority=1)
+        rows = slo.lot_steps(item, jalons, events, now=T0 + 1800 + 1000,
+                             packet=True, p80_s=2700)
+        row = self._row(rows, "verdict_merge")
+        self.assertEqual(row["target_s"], 2700)
+        self.assertEqual(row["level"], 0)
+        self.assertEqual(row["targets"], ())
+
+    def test_exception_p1_garde_15_min_et_l_escalade(self):
+        # Incident/déblocage CI déclaré (`outside_packet`) : la cible de la
+        # table reprend sa colonne P1 (15 min) et l'escalade depuis le GO.
+        item, jalons, events = self._qa(priority=1)
+        rows = slo.lot_steps(item, jalons, events, now=T0 + 1800 + 1000,
+                             outside_packet=True)
+        row = self._row(rows, "verdict_merge")
+        self.assertEqual(row["target_s"], 900)
+        self.assertEqual(row["level"], 1)
+        self.assertEqual(row["targets"],
+                         ("assignee", "bureau", "auditeur"))
+        self.assertEqual(row["target_source"], "table")
+        self.assertNotIn("packet", row)
+
+    def test_paquet_fusionne_garde_la_duree_et_le_p80(self):
+        item, jalons, events = self._qa()
+        jalons["merged"] = T0 + 1800 + 3000
+        rows = slo.lot_steps(item, jalons, events, now=T0 + 10_000,
+                             packet=True, p80_s=2700)
+        row = self._row(rows, "verdict_merge")
+        self.assertEqual(row["elapsed_s"], 3000)
+        self.assertEqual(row["target_s"], 2700)
+        self.assertEqual(row["done_ts"], T0 + 4800)
+        self.assertFalse(row["escalation"])
+
+    def test_creneau_de_paquet_garde_le_report(self):
+        # #2335/A2 : l'horloge part du premier créneau après le GO ; la cible
+        # p80 ne change pas ce départ.
+        item, jalons, events = self._qa()
+        rows = slo.lot_steps(item, jalons, events, now=T0 + 1800 + 5400,
+                             packet_slot=T0 + 7200,
+                             packet=True, p80_s=2700)
+        row = self._row(rows, "verdict_merge")
+        self.assertEqual(row["started_ts"], T0 + 7200)
+        self.assertEqual(row["packet_slot"], T0 + 7200)
+        self.assertEqual(row["target_s"], 2700)
 
 
 class GracePriseTest(unittest.TestCase):

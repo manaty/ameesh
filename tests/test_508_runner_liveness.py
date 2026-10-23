@@ -29,6 +29,10 @@ class RunnerLivenessTest(PgTestCase):
         r._gate_settled = threading.Event()  # aucune admission possible
         r.lock, r.workers = threading.Lock(), {}
         r.expire_delegations_once = lambda: []
+        # L165 (EP2) : `sweep` publie aussi les scores de rôles de l'hôte ;
+        # la doublure n'a ni horloge ni registre de rôles, elle neutralise
+        # cette passe comme `expire_delegations_once`.
+        r.role_evaluation_once = lambda: None
         # main : sweep passe aussi par la rétention du journal (L85) ; le stub
         # porte l'état de cette passe, comme __init__ le pose.
         r._events_pruned_at, r._events_prune_error = None, None
@@ -75,16 +79,16 @@ class RunnerLivenessTest(PgTestCase):
         self.runner.report_liveness()
         self.assertEqual(registry.get(self.db, 'alpha')['runner_seen_ts'], before)
 
-    def test_bulk_write_filters_placement_mode_and_stopped(self):
+    def test_bulk_write_filters_placement_mode_and_includes_stopped(self):
         with mock.patch.object(self.db, 'execute', wraps=self.db.execute) as write:
             registry.runner_seen(self.db, self.cfg.host, 'host:123', None)
         self.assertEqual(write.call_count, 1, 'une instruction pour les deux personas')
         sql = ' '.join(write.call_args.args[0].split())
         self.assertIn('ORDER BY name FOR UPDATE) s', sql)
         self.assertIn('WHERE r.name = s.name', sql)
-        for name in ['alpha', 'beta']:
+        for name in ['alpha', 'beta', 'stopped']:
             self.assertIsNotNone(registry.get(self.db, name)['runner_seen_ts'])
-        for name in ['other', 'external', 'stopped']:
+        for name in ['other', 'external']:
             self.assertIsNone(registry.get(self.db, name)['runner_seen_ts'])
         registry.upsert(self.db, 'beta', host='elsewhere')
         before = registry.get(self.db, 'beta')['runner_seen_ts']
@@ -93,6 +97,17 @@ class RunnerLivenessTest(PgTestCase):
 
     def test_empty_filter_writes_nothing(self):
         registry.runner_seen(self.db, self.cfg.host, 'host:123', [])
+        self.assertIsNone(registry.get(self.db, 'alpha')['runner_seen_ts'])
+
+    def test_stopped_agent_is_reported_only_by_its_runner_without_changing_state(self):
+        self.runner.agents_filter = ['stopped']
+        before = registry.get(self.db, 'stopped')
+        self.runner.sweep()
+        after = registry.get(self.db, 'stopped')
+        self.assertIsNotNone(after['runner_seen_ts'])
+        self.assertEqual(after['runner_seen_owner'], self.runner.runner_id)
+        for key in ['lease_owner', 'lease_epoch', 'status', 'last_seen_ts', 'host']:
+            self.assertEqual(after[key], before[key], key)
         self.assertIsNone(registry.get(self.db, 'alpha')['runner_seen_ts'])
 
     def test_cadence_config_has_a_sixty_second_floor(self):

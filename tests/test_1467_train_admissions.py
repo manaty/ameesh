@@ -9,8 +9,8 @@ import threading
 import types
 from unittest import mock
 
-from ameesh import (resolutions, storage, train, train_admissions, train_candidates,
-                    train_git, train_history, train_policy, work)
+from ameesh import (registry, resolutions, storage, train, train_admissions,
+                    train_candidates, train_git, train_history, train_policy, work)
 from ameesh.db import DbError
 from .support import PgTestCase
 from .test_1467_train_review import author, verdict
@@ -33,13 +33,18 @@ class TrainAdmissionsTest(PgTestCase):
                                                  "rule": ["content"]},)))
         self.admissions = train_admissions.Admissions(
             self.db, self.project, self.history, policy=self.requirement)
+        registry.upsert(self.db, "author", harness="deepseek", host=self.cfg.host,
+                        cwd=self.tmp, status="idle")
         self.entry = self.enqueue()
 
     def enqueue(self, *, source=None, target="main"):
         item = work.add(self.db, title="train member", app=self.project.name, source="fixture",
-                        actor="fixture", branch="lot/admission", branch_target=target)
-        freeze = self.ops.add_milestone(item["id"], "frozen", sha=HEAD, actor="fixture",
+                        actor="fixture", assignee="author", branch="lot/admission",
+                        branch_target=target)
+        freeze = self.ops.add_milestone(item["id"], "frozen", sha=HEAD, actor="author",
                                          verdict=None, note="")
+        self.db.execute("INSERT INTO turn_costs (agent, harness, session, recorded_at)"
+                        " VALUES ('author', 'deepseek', 's-author', now())")
         return self.ops.queue_add(item["id"], target=target, frozen_sha=HEAD, note="", actor="fixture",
             source=self.admissions.source if source is None else source, frozen_id=freeze["id"])
 
@@ -57,7 +62,11 @@ class TrainAdmissionsTest(PgTestCase):
         member = proof["members"][0]
         self.assertEqual(member["policy"]["reviews"], 2)
         self.assertEqual(member["policy"]["policy_commit"], "c" * 40)
-        self.history.qualify.assert_called_once_with(self.entry, BASE, required=2)
+        self.history.qualify.assert_called_once_with(
+            self.entry, BASE, required=2,
+            klass={"class": "sensitive",
+                   "files": [{"path": "content", "class": "sensitive",
+                              "rule": ["content"]}]})
 
     def test_other_source_and_inactive_queue_rows_do_not_enter(self):
         foreign = self.enqueue(source="github.com/foreign/repository")
@@ -72,6 +81,33 @@ class TrainAdmissionsTest(PgTestCase):
                            note="new generation", actor="fixture", source=self.admissions.source)
         with self.assertRaisesRegex(train.TrainError, "requeued"):
             self.qualify()
+
+    def test_cutoff_dates_train_enrollment_by_its_admission_not_the_insertion(self):
+        """#2965: the queue instant the train wrote after the cutoff is skipped.
+
+        A manual insertion keeps its own instant, so a hand-queued admission
+        after the cutoff stays late even when its freeze and verdicts are old.
+        """
+        slot = 1000.0
+        packet = dict(self.entry, queued_ts=2000.0)
+        manual = dict(packet)
+        proofs = {"admitted": [dict(entry=packet, proof={"members": [dict(
+            history={"reviews": {"admitted_ts": 900.0}})]})], "deferred": []}
+        self.assertEqual(self.admissions.admitted([packet], slot, BASE, proofs=proofs),
+                         [packet])
+        self.assertEqual(self.admissions.admitted([manual], slot, BASE), [])
+        # An unreadable instant never borrows the other one.
+        proofs["admitted"][0]["proof"]["members"][0]["history"]["reviews"]["admitted_ts"] = None
+        self.assertEqual(self.admissions.admitted([packet], slot, BASE, proofs=proofs), [])
+        proofs["admitted"][0]["proof"]["members"][0]["history"]["reviews"]["admitted_ts"] = 3000.0
+        self.assertEqual(self.admissions.admitted([packet], slot, BASE, proofs=proofs), [])
+        # B2 (cx1) : c'est la période ouverte courante qui classe au cutoff ;
+        # 1050 est tard pour le cutoff 1000, 800 ne l'est pas.
+        proofs["admitted"][0]["proof"]["members"][0]["history"]["reviews"]["admitted_ts"] = 1050.0
+        self.assertEqual(self.admissions.admitted([packet], 1000.0, BASE, proofs=proofs), [])
+        proofs["admitted"][0]["proof"]["members"][0]["history"]["reviews"]["admitted_ts"] = 800.0
+        self.assertEqual(self.admissions.admitted([packet], 1000.0, BASE, proofs=proofs),
+                         [packet])
 
     def test_waiting_lot_and_changed_project_target_or_branch_refuse(self):
         item = self.entry["work_item_id"]
@@ -107,7 +143,7 @@ class TrainAdmissionsTest(PgTestCase):
             self.qualify()
 
     def recorded_admission(self, *, light=False, reviewed=True, path="content",
-                           reviews=2, reviewers=(("r1", "claude"), ("r2", "deepseek"))):
+                           reviews=2, reviewers=(("r1", "claude"), ("r2", "codex"))):
         env = dict(os.environ, GIT_AUTHOR_NAME="fixture", GIT_AUTHOR_EMAIL="fixture@example.invalid",
                    GIT_COMMITTER_NAME="fixture", GIT_COMMITTER_EMAIL="fixture@example.invalid")
         def git(*args):
@@ -136,16 +172,30 @@ class TrainAdmissionsTest(PgTestCase):
         base, first, head = commit("base"), commit("author"), commit("correction")
         self.admissions.policy = train_policy.Versioned(self.tmp, base, self.project.name)
         item = self.entry["work_item_id"]
-        freeze = self.ops.add_milestone(item, "frozen", sha=head, actor="fixture", verdict=None, note="")
+        # #2924 : le gel d'attente du banc (SHA factice, sans objet Git) est
+        # remplacé par le gel réel ; gardé, il serait un gel antérieur illisible
+        # et la lecture stricte du train refuserait l'admission.
+        self.db.execute("DELETE FROM work_item_milestones WHERE work_item_id = %s"
+                        " AND kind = 'frozen'", (item,))
+        freeze = self.ops.add_milestone(item, "frozen", sha=head, actor="author", verdict=None, note="")
         entry = self.ops.queue_add(item, target="main", frozen_sha=head, note="", actor="fixture",
                                   source=self.admissions.source, frozen_id=freeze["id"])
-        receipts = {"commit:" + sha: dataclasses.asdict(author(sha)) for sha in (first, head)}
+        receipts = {"commit:" + sha: dataclasses.asdict(author(sha, harness="deepseek"))
+                    for sha in (first, head)}
         for reader, family in (reviewers if reviewed else ()):
             mark = self.ops.add_milestone(item, "verdict", sha=head, actor=reader, verdict="ok", note="")
             _, receipt = verdict(mark["id"], reader, family, commit=head)
             receipt = dataclasses.replace(receipt, milestone={
                 key: mark[key] for key in ("id", "actor", "at_ts", "sha", "verdict")})
             receipts[receipt.subject] = dataclasses.asdict(receipt)
+            # #2928 : la porte sensible ne compte un verdict que sur son reçu
+            # exact lu dans la base, pas seulement dans le fournisseur du train.
+            self.db.execute(
+                "INSERT INTO provenance_receipts"
+                " (subject, sha, actor, session, turn, harness, work_item_id)"
+                " VALUES (%s, %s, %s, %s, %s, %s, %s)"
+                " ON CONFLICT (subject) DO NOTHING",
+                (receipt.subject, head, reader, "s-" + family, "t", family, item))
         provider = types.SimpleNamespace(ProvenanceError=RuntimeError,
             receipt_for_commit=lambda db, sha: receipts.get("commit:" + sha),
             receipt_for_milestone=lambda db, mid: receipts.get("milestone:%d" % mid))
@@ -156,9 +206,10 @@ class TrainAdmissionsTest(PgTestCase):
         base, first, head, entry = self.recorded_admission()
         proof = self.admissions.qualify([entry], base, "packet")
         self.assertEqual(proof["members"][0]["policy"]["policy_commit"], base)
-        coverage = proof["members"][0]["history"]["reviews"]["coverage"]
-        self.assertEqual(set(coverage), {first, head})
-        self.assertTrue(all(len(readers) == 2 for readers in coverage.values()))
+        reviews = proof["members"][0]["history"]["reviews"]
+        self.assertTrue(reviews["gate"]["ok"], reviews["gate"])
+        self.assertEqual(len(reviews["gate"]["accepted"]), 2)
+        self.assertEqual({row["name"] for row in reviews["authors"]}, {"author"})
         self.ops.add_milestone(entry["work_item_id"], "frozen", sha=head,
                                actor="fixture", verdict=None, note="new gel")
         with self.assertRaisesRegex(train.TrainError, "latest exact freeze"):
@@ -201,7 +252,7 @@ class TrainAdmissionsTest(PgTestCase):
         entry = result["entry"]
         self.assertGreater(entry["generation"], old_entry["generation"])
         proof = result["proof"]["members"][0]
-        self.assertEqual(set(proof["history"]["reviews"]["coverage"]), {first, head})
+        self.assertTrue(proof["history"]["reviews"]["gate"]["ok"])
         self.assertNotIn("targeted_ci", proof)
         self.assertEqual(self.ops.milestones(item, None), marks_before)
         replay = enrollment.enroll(candidate, base, actor="restarted-fixture")
@@ -231,11 +282,21 @@ class TrainAdmissionsTest(PgTestCase):
         actual = preparation.ops.queue_add
         def blocked(*args, **kwargs):
             row = actual(*args, **kwargs)
-            storage.of(other).work.add_milestone(item, "verdict", sha=head, actor="blocked-reader",
-                                                 verdict="blocked", note="fresh blockage")
+            mark = storage.of(other).work.add_milestone(
+                item, "verdict", sha=head, actor="blocked-reader",
+                verdict="blocked", note="fresh blockage")
+            # #2928 : un avis sensible ne compte que sur son reçu exact ; ce
+            # vote réel porte donc sa preuve, sinon le blocage n'existerait pas.
+            other.execute(
+                "INSERT INTO provenance_receipts"
+                " (subject, sha, actor, session, turn, harness, work_item_id)"
+                " VALUES (%s, %s, %s, %s, %s, %s, %s)"
+                " ON CONFLICT (subject) DO NOTHING",
+                ("milestone:%d" % int(mark["id"]), head, "blocked-reader",
+                 "s-claude", "t", "claude", item))
             return row
         with mock.patch.object(preparation.ops, "queue_add", side_effect=blocked):
-            with self.assertRaisesRegex(train.TrainError, "unresolved blocking"):
+            with self.assertRaisesRegex(train.TrainError, "blocked verdict"):
                 self.enrollment(preparation).enroll(
                     candidate, base, actor="fixture")
 
@@ -308,12 +369,12 @@ class TrainAdmissionsTest(PgTestCase):
         self.assertIn(entry, self.admissions.entries())
         proof = self.admissions.qualify([entry], base, "packet")["members"][0]
         self.assertEqual((proof["policy"]["risk"], proof["policy"]["reviews"]), ("light", 0))
-        self.assertEqual(proof["history"]["reviews"]["coverage"], {first: [], head: []})
-        self.assertEqual(proof["history"]["reviews"]["reviews"], [])
+        self.assertTrue(proof["history"]["reviews"]["gate"]["ok"])
+        self.assertEqual(proof["history"]["reviews"]["gate"]["accepted"], [])
 
     def test_sensitive_admission_with_no_verdict_still_refuses(self):
         base, _, _, entry = self.recorded_admission(reviewed=False)
-        with self.assertRaisesRegex(train.TrainError, "missing independent final-head reviews"):
+        with self.assertRaisesRegex(train.TrainError, "no review verdict ok"):
             self.admissions.qualify([entry], base, "packet")
 
     def test_critical_sensitive_lot_with_two_same_family_reviews_is_refused_at_admission(self):
@@ -324,21 +385,21 @@ class TrainAdmissionsTest(PgTestCase):
         base, _, _, entry = self.recorded_admission(
             path="deploy/mise-a-jour/bascule.py", reviews=1,
             reviewers=(("r1", "claude"), ("r2", "claude")))
-        with self.assertRaisesRegex(train.TrainError, "missing independent final-head reviews"):
+        with self.assertRaisesRegex(train.TrainError, "no review verdict ok"):
             self.admissions.qualify([entry], base, "packet")
 
     def test_critical_sensitive_lot_with_two_families_is_admitted(self):
         base, first, head, entry = self.recorded_admission(
             path="deploy/mise-a-jour/bascule.py", reviews=1,
-            reviewers=(("r1", "claude"), ("r2", "deepseek")))
+            reviewers=(("r1", "claude"), ("r2", "codex")))
         proof = self.admissions.qualify([entry], base, "packet")["members"][0]
         self.assertEqual((proof["policy"]["risk"], proof["policy"]["reviews"]),
                          ("sensitive", 2))
         self.assertEqual(proof["policy"]["files"], (
             {"path": "deploy/mise-a-jour/bascule.py", "class": "sensitive", "rule": None},))
-        self.assertEqual(set(proof["history"]["reviews"]["coverage"]), {first, head})
-        self.assertTrue(all(len(readers) == 2
-                            for readers in proof["history"]["reviews"]["coverage"].values()))
+        accepted = proof["history"]["reviews"]["gate"]["accepted"]
+        self.assertEqual(len(accepted), 2)
+        self.assertEqual(len({row["family"] for row in accepted}), 2)
 
     def test_requirement_refuses_a_critical_class_with_one_review(self):
         valid = self.requirement(None, self.entry, BASE, self.tmp)
@@ -359,7 +420,7 @@ class TrainAdmissionsTest(PgTestCase):
         base, _, head, entry = self.recorded_admission(light=True, reviewed=False)
         self.ops.add_milestone(entry["work_item_id"], "verdict", sha=head,
                                actor="blocked-reader", verdict="blocked", note="")
-        with self.assertRaisesRegex(train.TrainError, "unresolved blocking.*blocked-reader"):
+        with self.assertRaisesRegex(train.TrainError, "blocked verdict.*blocked-reader"):
             self.admissions.qualify([entry], base, "packet")
 
     def test_dependency_read_keeps_open_prerequisite_outside_packet(self):

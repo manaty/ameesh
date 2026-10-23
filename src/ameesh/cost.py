@@ -48,6 +48,7 @@ import json
 import os
 import re
 import math
+import sys
 import time
 from dataclasses import dataclass, replace
 from typing import Callable, Iterable, Iterator, Sequence
@@ -56,7 +57,18 @@ from . import config as config_mod
 from . import harnesses
 from . import storage
 from .gauge_cache import CLAUDE_GAUGES
+from .resident import INPUTS_EVENT as RESIDENT_INPUTS_EVENT
 from .resident import USAGE_EVENT as RESIDENT_USAGE_EVENT
+
+
+def log(message: str) -> None:
+    """Journal de la comptabilité : un échec d'écriture ne lève jamais."""
+    try:
+        sys.stderr.write("[cost] %s\n" % message)
+        sys.stderr.flush()
+    except (OSError, ValueError):
+        pass
+
 
 #: Barème par défaut du poste de travail (reprise de l'outil de comptage
 #: existant). USD par million de jetons : [entrée, entrée en cache, sortie].
@@ -223,14 +235,17 @@ class Overage:
 
 class Gauges(list):
     """The gauges of one reading, with the overage flags of the same reading
-    (`overage`, None if unknown): a list, so every reader of gauges is
-    unchanged."""
+    (`overage`, None if unknown), and read refusals keyed by harness (`errors`).
+    Refused readings contain no gauges; budget guards must honor their error.
+    """
 
     overage: Overage | None = None
 
-    def __init__(self, items=(), overage: Overage | None = None):
+    def __init__(self, items=(), overage: Overage | None = None, *,
+                 errors: dict[str, str] | None = None):
         super().__init__(items)
         self.overage = overage
+        self.errors = dict(errors or {})
 
     def in_overage(self, now: float) -> bool:
         """Is the account billed beyond its plan at `now`? A reading in
@@ -262,7 +277,10 @@ class Gauge:
     resets_at: float | None         #: epoch, ou None si le harnais ne le dit pas
     window_s: float
     #: #1561 : quand le relevé a été produit (epoch), None si la source ne le
-    #: date pas. Toutes les fenêtres d'un même relevé portent le même âge.
+    #: date pas. Un même relevé porte le même âge pour toutes ses fenêtres,
+    #: mais `codex_gauges.reconcile` conserve chaque fenêtre depuis sa propre
+    #: observation : une fenêtre réconciliée peut donc être plus récente
+    #: qu'une autre du même compte (#2843).
     read_at: float | None = None
     #: #1132 : instant de PRODUCTION du relevé (epoch), None quand le flux ne
     #: le date pas (sans marqueur, ou Codex) — l'heure d'insertion n'en tient
@@ -439,8 +457,11 @@ def reading_outdated(gauges, now: float) -> bool:
 
     `stale_reading` dit qu'un relevé partiel — une fenêtre datée remise à zéro,
     une autre encore ouverte — n'est plus un instantané courant ; il reste
-    néanmoins informatif pour les fenêtres encore ouvertes tant que son âge
-    (`now - read_at`) ne dépasse pas ce qui leur reste (`resets_at - now`).
+    néanmoins informatif pour les fenêtres encore ouvertes tant que l'âge de
+    **chacune** (`now - read_at` de son observation) ne dépasse pas ce qui lui
+    reste (`resets_at - now`). Une fenêtre court échue conservée par
+    `codex_gauges.reconcile` ne vieillit donc pas une semaine récemment
+    observée, sans relever l'âge d'une semaine réellement ancienne (#2843).
     Au-delà, la remise à zéro qui rendra le relevé caduc est plus proche que le
     trou d'observation : **prudence sur une information ancienne**, pas la
     preuve d'un quota atteint. Le cas réel du 15/10 : relevé de 30 % vieux de
@@ -451,8 +472,8 @@ def reading_outdated(gauges, now: float) -> bool:
     pour un relevé dont **toutes** les fenêtres datées sont échues (L71, la
     suivante est vierge à 0 %). Faux sans âge connu (`read_at` absent : une
     date manquante ne prouve aucune péremption de plus). Faux dès qu'**une**
-    fenêtre encore ouverte reste plus longue que l'âge : le relevé garde du
-    sens pour elle.
+    fenêtre encore ouverte reste plus longue que son propre âge : le relevé
+    garde du sens pour elle.
     """
     dated = [g for g in gauges if g.resets_at]
     if not any(g.reset_passed(now) for g in dated):
@@ -460,11 +481,13 @@ def reading_outdated(gauges, now: float) -> bool:
     opened = [g for g in dated if not g.reset_passed(now)]
     if not opened:
         return False                    # L71 : toutes échues, la suivante est vierge
-    stamps = [stamp for stamp in (getattr(g, "read_at", None) for g in gauges) if stamp]
-    if not stamps:
-        return False
-    age = now - min(stamps)
-    return all(age > float(g.resets_at) - now for g in opened)
+    for gauge in opened:
+        stamp = getattr(gauge, "read_at", None)
+        if not stamp:
+            return False                # âge inconnu : aucune péremption de plus
+        if now - float(stamp) <= float(gauge.resets_at) - now:
+            return False                # cette fenêtre reste plus longue que son âge
+    return True
 
 
 @dataclass(frozen=True)
@@ -1051,8 +1074,18 @@ class CostBook:
         """Le dernier relevé connu de chaque jauge d'un compte (#1132)."""
         return storage.of(self.db).operations.gauge_latest(harness=harness, account=account)
 
-    def codex_gauges(self, sessions: str | None = None) -> list:
-        """Les `rate_limits` primaire et secondaire du journal de session le plus récent.
+    def codex_gauges(self, sessions: str | None = None, *, plan: str | None = None) -> list:
+        """Les fenêtres `rate_limits` des journaux récents du compte.
+
+        #2839 : une lecture partielle ne masque aucune fenêtre ; des relevés
+        vivants contradictoires refusent le compte au lieu de choisir au mtime.
+        #3034 : `plan` est le forfait du compte vivant (`auth.json`) ; quand il
+        est connu et l'identité unique, les relevés d'un autre forfait sont
+        ignorés au lieu de rendre le compte ambigu.
+        #3122 : la date du plus récent journal non lu (écarté du scan borné,
+        # préfixe tronqué, lecture en échec) borne ce qu'il a pu observer ;
+        `reconcile` ne prouve le repos #3044 que si elle est plus vieille
+        qu'une fenêtre courte.
 
         Lecture **JSON structurée**, pas une expression régulière : l'ordre des clés
         n'est pas garanti (`plan_type` peut précéder `primary`), `secondary` peut
@@ -1062,48 +1095,34 @@ class CostBook:
         (`<CODEX_HOME>/sessions`) ; par défaut celui de la machine.
         """
         racine = sessions if sessions is not None else self.codex_sessions
-        files = sorted(
-            glob.glob(os.path.join(racine, "**", "*.jsonl"), recursive=True),
-            key=lambda p: os.path.getmtime(p) if os.path.exists(p) else 0,
-        )[-CODEX_FILES:]
-        for path in reversed(files):
-            try:
-                read_at = os.path.getmtime(path)
-            except OSError:
-                read_at = None
-            limits = None
-            for line in _read_tail(path, 2_000_000).splitlines():
-                line = line.strip()
-                if not line or "rate_limits" not in line:
-                    continue
-                try:
-                    event = json.loads(line)
-                except ValueError:
-                    continue
-                found = _find_rate_limits(event)
-                if found:
-                    limits = found          # le dernier de la session gagne
-            if not limits:
-                continue
-            gauges = []
-            for key in ("primary", "secondary"):
-                value = limits.get(key)
-                if not isinstance(value, dict):
-                    continue                    # `secondary: null` n'est pas une jauge
-                minutes = float(value.get("window_minutes") or 0)
-                gauges.append(Gauge(
-                    "codex",
-                    "codex-%dmin" % int(minutes or 0),
-                    _fraction(value.get("used_percent"), percent=True),
-                    _epoch(value.get("resets_at")),
-                    minutes * 60 if minutes else float(KNOWN_WINDOWS["seven_day"]),
-                    read_at,
-                ))
-            if gauges:
-                return Gauges(gauges, _codex_overage(limits, gauges))
-        return []
+        from .codex_gauges import recent_files, reconcile, session_reading
 
-    def gauges(self, harness: str | None = None, *, record: bool = True) -> list:
+        files, truncated, unread_before = recent_files(racine)
+
+        def unread(stamp):
+            nonlocal unread_before
+            if unread_before is None or stamp > unread_before:
+                unread_before = stamp
+
+        now = self.clock()
+        readings = []
+        for read_at, path in files:
+            try:
+                sample = session_reading(path, read_at)
+            except OSError:
+                # Journal sauté : sa date reste une borne de ce qu'il a pu
+                # observer (#3122).
+                truncated = True
+                unread(read_at)
+                continue
+            readings.extend(sample)
+            if sample.truncated:
+                truncated = True
+                unread(read_at)
+        return reconcile(readings, now, truncated=truncated, plan=plan,
+                         unread_before=unread_before)
+
+    def gauges(self, harness: str | None = None, *, record: bool = True) -> Gauges:
         """Les jauges de forfait, par **source déclarée** dans les descripteurs (L16).
 
         `ameesh.cost.gauges` nomme le lecteur (`transcript` pour Claude,
@@ -1115,7 +1134,9 @@ class CostBook:
         l'historique — les commandes de lecture (`progress`, `cost gauges`
         sans `--record`) ; l'exécuteur, lui, relève avant chaque tour.
         """
-        out: list = []
+        from .codex_gauges import AmbiguousCodexGauges
+
+        out = Gauges()
         for ident, descriptor in harnesses.scan()[0].items():
             if harness not in (None, ident):
                 continue
@@ -1123,7 +1144,12 @@ class CostBook:
                        "sessions": self.codex_gauges}.get(
                            str(descriptor.cost.get("gauges") or ""))
             if lecteur is not None:
-                out += [replace(gauge, harness=ident) for gauge in lecteur()]
+                try:
+                    out += [replace(gauge, harness=ident) for gauge in lecteur()]
+                except AmbiguousCodexGauges as exc:
+                    # The default account has no accounts.evaluate boundary.
+                    # Keep the refusal for its budget guard and reports.
+                    out.errors[ident] = str(exc)
         if record:
             self.record_gauges(out)
         return out
@@ -1174,7 +1200,12 @@ class CostBook:
         `pace_multiplier` de son profil (#1075, #1028).
         """
         now = self.clock()
-        held = [gauge for gauge in self.gauges(harness) if gauge.exceeded(now, reserve)]
+        gauges = self.gauges(harness)
+        errors = getattr(gauges, "errors", {})
+        if errors:
+            return "pause (account %s): %s" % (
+                DEFAULT_ACCOUNT_LABEL, "; ".join(errors.values()))
+        held = [gauge for gauge in gauges if gauge.exceeded(now, reserve)]
         if not held:
             return ""
         # L242b (4), #373 r1 : la pause en court d'abord, comme avec des
@@ -1201,6 +1232,14 @@ class CostBook:
                            gauge.held_cap(now, reserve) * 100,
                            ", %.0f points kept for critical agents" % (reserve * 100)
                            if reserve else ""))
+
+    def default_account_error(self, harness: str) -> str:
+        """Hard refusal of a default reading, independent of the pace guard."""
+        if gauges_source(harness) != "sessions":
+            return ""
+        errors = getattr(self.gauges(harness, record=False), "errors", {})
+        return ("pause (account %s): %s" % (
+            DEFAULT_ACCOUNT_LABEL, "; ".join(errors.values()))) if errors else ""
 
     # -- comptabilité par tour ---------------------------------------------
     def baseline(self, agent: str, harness: str, session: str | None = None) -> dict:
@@ -1374,6 +1413,34 @@ class CostBook:
         except (OSError, ValueError, TypeError):
             return None
         return before_turn
+
+    def codex_last_call_usage(self, thread: str | None) -> dict | None:
+        """L'usage du dernier appel au modèle d'un fil Codex (#2932).
+
+        `codex exec --json` ne publie qu'un usage de fin de tour, cumulé ; le
+        contexte d'un appel (la taille de la session, #2336) se lit dans le
+        journal de session du fil : `info.last_token_usage` du dernier
+        `token_count`, lu depuis la fin. None si le journal est introuvable ou
+        n'en porte aucun.
+        """
+        path = self.codex_rollout(thread)
+        if not path:
+            return None
+        for ligne in _lines_reverse(path):
+            if b"last_token_usage" not in ligne:
+                continue
+            try:
+                event = json.loads(ligne)
+            except ValueError:
+                continue
+            payload = event.get("payload") if isinstance(event, dict) else None
+            if not isinstance(payload, dict) or payload.get("type") != "token_count":
+                continue
+            info = payload.get("info")
+            usage = info.get("last_token_usage") if isinstance(info, dict) else None
+            if isinstance(usage, dict):
+                return usage
+        return None
 
     def codex_session_roots(self) -> list:
         """Les dossiers de sessions Codex de la machine : le défaut, puis ceux
@@ -1628,6 +1695,30 @@ class CostBook:
                          input_tokens=tin, cached_input_tokens=tcache, output_tokens=tout,
                          **(marque if tin or tcache or tout else {}))
 
+    def _insert_turn_cost(self, *, inputs=None, **kwargs) -> None:
+        """Écrit la ligne du tour ; l'attribution de messages est facultative.
+
+        L80b : un exécuteur médié peut parler à un serveur **1.6**, dont la
+        table ne connaît pas `inputs`. Le refus (`bad_args`) ne doit jamais
+        suspendre la comptabilité : on réessaie sans l'attribution — le coût du
+        tour reste compté, l'attribution est perdue et journalisée. Sans
+        `inputs`, le paramètre n'est pas transmis du tout (compatible 1.6)."""
+        insert = dict(kwargs)
+        if inputs is not None:
+            insert["inputs"] = inputs
+        try:
+            storage.of(self.db).turn_costs.insert(**insert)
+        except Exception as exc:  # noqa: BLE001 - réessai limité au refus 1.6
+            from . import db as db_mod
+            texte = str(exc)
+            if inputs is None or not isinstance(exc, db_mod.DbError) \
+                    or ("bad_args" not in texte and "paramètre inconnu" not in texte):
+                raise
+            log("serveur médié sans `inputs` (%s) : tour compté sans attribution "
+                "de messages" % texte[:160])
+            insert.pop("inputs", None)
+            storage.of(self.db).turn_costs.insert(**insert)
+
     def record(self, agent: str, start: int = 0, turn: str | None = None,
                session: str | None = None, model: str | None = None,
                key: str | None = None, ended: float | None = None,
@@ -1698,7 +1789,19 @@ class CostBook:
         row = usage.row()
         row["turn"] = turn or usage.turn
         row["session"] = session_id
-        storage.of(self.db).turn_costs.insert(
+        # L80b : les messages servis par ce tour, quand le flux résident les
+        # porte. Codex/ACP les mettent dans `resident.turn.inputs` ; Claude,
+        # dont le flux porte déjà l'usage, dans l'événement séparé
+        # `resident.inputs`. Aucun autre chemin n'en produit : les tours non
+        # résidents gardent la colonne non écrite.
+        attribution = resident if resident is not None \
+            else _resident_inputs_event(events)
+        inputs = None
+        if attribution is not None \
+                and isinstance(attribution.get("inputs"), (list, tuple)):
+            inputs = tuple(str(i) for i in attribution["inputs"] if i is not None)
+        self._insert_turn_cost(
+            inputs=inputs,
             agent=row["agent"], harness=row["harness"], turn=row["turn"],
             model=row["model"], session=row["session"], usd=row["usd"],
             input_tokens=row["input_tokens"], cached_input_tokens=row["cached_input_tokens"],
@@ -1892,7 +1995,8 @@ class CostBook:
 
     def over(self, agent: str = "all", *,
              paid_harnesses: Sequence[str] | None = None, pace: bool = True,
-             reserve: float = 0.0, hourly_share: float = 1.0) -> str:
+             reserve: float = 0.0, hourly_share: float = 1.0,
+             account_checked: bool = False) -> str:
         """Le garde-fou : raison si l'agent (ou le compte) doit s'arrêter, sinon ''.
 
         Le plafond horaire ne somme que l'usage payé au token
@@ -1906,7 +2010,8 @@ class CostBook:
 
         `pace=False` (L30) : le rythme est jugé compte par compte par
         `ameesh.accounts`, qui bascule au lieu de mettre en pause ; seul le
-        plafond horaire reste ici.
+        plafond horaire reste ici si `account_checked=True`. Sans compte
+        déjà évalué, un relevé ambigu reste interdit même sans rythme.
 
         L70 : même règle pour le plafond par jour glissant du mesh
         (`daily_usd`) et pour les plafonds propres à l'agent
@@ -1917,7 +2022,10 @@ class CostBook:
         (`paid_spent`), l'estimation ne servant qu'entre deux relevés.
         """
         harness = self.tool_of(agent) if agent != "all" else ""
-        reason = self.pace_exceeded(harness, reserve) if (harness and pace) else ""
+        reason = ""
+        if harness:
+            reason = (self.pace_exceeded(harness, reserve) if pace else
+                      "" if account_checked else self.default_account_error(harness))
         if reason:
             return reason
         paid = paid_harnesses_of() if paid_harnesses is None else tuple(paid_harnesses)
@@ -2011,6 +2119,9 @@ class CostBook:
                     for g in by_harness.get(harness, [])
                 ],
             })
+            error = getattr(by_harness.get(harness), "errors", {}).get(harness)
+            if error:
+                rows[-1]["gauge_error"] = error
         return rows
 
 
@@ -2029,7 +2140,7 @@ def format_report(rows: Iterable[dict]) -> str:
                 g["key"], g["used"] * 100, g["cap"] * 100,
                 ", reset passed, last reading %.0f%%" % (g["last_used"] * 100)
                 if g.get("reset_passed") else "")
-            for g in row["gauges"]) or "—"
+            for g in row["gauges"]) or row.get("gauge_error") or "—"
         lines.append("%-16s %-9s %-16s %-8s %10.4f %10.4f  %s" % (
             row["agent"],
             row["harness"] + ("/%s" % row["account"] if row.get("account") else ""),
@@ -2429,6 +2540,20 @@ def _resident_event(events: Iterable[dict]) -> dict | None:
     return found
 
 
+def _resident_inputs_event(events: Iterable[dict]) -> dict | None:
+    """L'événement `resident.inputs` de la tranche, s'il y en a un (L80b).
+
+    Le flux de Claude porte lui-même l'usage du tour, donc il n'écrit pas de
+    `resident.turn` ; les messages servis voyagent dans cet événement, écrit
+    après la barrière steer. C'est une attribution seule — l'usage reste celui
+    du flux."""
+    found = None
+    for event in events:
+        if event.get("type") == RESIDENT_INPUTS_EVENT:
+            found = event
+    return found
+
+
 def _resident_turn_usage(agent: str, harness: str, modele: str, event: dict,
                          pin: float, pcache: float, pout: float,
                          marque: dict, *, cum: dict, session: str | None,
@@ -2518,11 +2643,11 @@ def _resident_codex_cumulative(book: "CostBook", agent: str, session: str | None
 
 def _read_tail(path: str, limit: int = TAIL_BYTES) -> str:
     try:
-        size = os.path.getsize(path)
         with open(path, "rb") as fh:
+            size = os.fstat(fh.fileno()).st_size
             if size > limit:
                 fh.seek(size - limit)
-            return fh.read().decode("utf-8", "ignore")
+            return fh.read(limit).decode("utf-8", "ignore")
     except OSError:
         return ""
 

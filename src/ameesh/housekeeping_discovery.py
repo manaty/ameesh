@@ -3,8 +3,11 @@
 
 Only linked worktrees of a local agent's repository enter the existing
 cleanup lifecycle. Main checkouts, unknown repositories and plain folders
-are reported. Discovery itself never removes anything or revives old lot
-metadata: a reused path gets a fresh registration and age guard.
+are reported. Ad-hoc clones are left to `housekeeping_clones` (#2743),
+which attributes them to a lot and reports or removes them under its own
+guards; this module does not report them twice. Discovery itself never
+removes anything or revives old lot metadata: a reused path gets a fresh
+registration and age guard.
 """
 from __future__ import annotations
 
@@ -153,7 +156,9 @@ def discover(db, host: str, agents: dict, roots, *, dry_run: bool) -> dict:
                         continue
                     kind = _marker(path)
                     if kind == "clone":
-                        signal(path, "main checkout or clone; never removed automatically")
+                        # #2743: `housekeeping_clones` owns ad-hoc clones
+                        # (attribution, dry-run report, removal guards).
+                        continue
                     elif kind == "plain":
                         signal(path, "directory without a Git marker; never removed automatically")
                     elif kind == "linked":

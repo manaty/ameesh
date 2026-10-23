@@ -3,15 +3,18 @@
 from __future__ import annotations
 
 from pathlib import Path
+import io
+import json
 import sys
 import tempfile
 import threading
+import types as types_mod
 import unittest
 from unittest import mock
 
 from tests import support  # isolate host config before module tests
 from tests.support import PgTestCase
-from ameesh import canon, canon_sync, db as db_mod, identity, modules, work
+from ameesh import canon, canon_sync, db as db_mod, identity, modules, storage, work
 from ameesh.modules import it
 from ameesh.modules.it.execution import OUTPUT_BYTES, digest, execute
 from ameesh.modules.storage import ModuleStore
@@ -22,7 +25,67 @@ def federation(project="acme", names=None):
         project: {"modules": ["it"] if names is None else names}}}}}
 
 
+FIVE_DOCUMENTARY = ("docs", "investigation", "governance-tracking",
+                    "promotion", "human_operation")
+
+
+class FakeDistribution:
+    def __init__(self, name="ameesh-sample-module", version="0.1.0"):
+        self.name = name
+        self.version = version
+
+
+class FakeEntryPoint:
+    group = "ameesh.modules"
+
+    def __init__(self, module, name="sample", dist=None):
+        self.name = name
+        self.module = module
+        self.value = "sample_module"
+        self.dist = dist if dist is not None else FakeDistribution()
+
+    def load(self):
+        if isinstance(self.module, Exception):
+            raise self.module
+        return self.module
+
+
+class FakeEntryPoints(list):
+    def select(self, group=None):
+        return [point for point in self if group in (None, point.group)]
+
+
+def external_sample(types=None, name="sample", descriptor=None):
+    """Un descripteur externe de test, installé hors du dépôt public."""
+    module = types_mod.ModuleType("sample_module")
+    declared = tuple(types or FIVE_DOCUMENTARY)
+    module.NAME = name
+    module.TYPES = declared
+    if descriptor is not None:
+        module.descriptor = descriptor
+    else:
+        def compile_descriptor(options=None):
+            options = dict(options or {})
+            if options:
+                raise ValueError("unknown sample module option(s): %s"
+                                 % ", ".join(sorted(options)))
+            return {"types": list(declared), "schemas": {}, "rules": []}
+        module.descriptor = compile_descriptor
+    return module
+
+
+def external_points(*points):
+    return mock.patch("ameesh.modules.metadata.entry_points",
+                      return_value=FakeEntryPoints(points))
+
+
 class ModuleConfigurationTest(unittest.TestCase):
+    def setUp(self):
+        # Aucun descripteur externe réel de l'hôte ne doit fuiter dans les tests.
+        discover = external_points()
+        discover.start()
+        self.addCleanup(discover.stop)
+
     def test_module_refusal_is_per_lot_but_other_database_errors_propagate(self):
         store = mock.Mock()
         # MagicMock : la fermeture ouvre sa transaction (et prend le verrou de
@@ -62,6 +125,131 @@ class ModuleConfigurationTest(unittest.TestCase):
             with self.subTest(raw=raw), self.assertRaises(ValueError):
                 modules.declarations(raw)
 
+    def test_external_descriptor_is_discovered_and_compiled(self):
+        fake = external_sample()
+        with external_points(FakeEntryPoint(fake)):
+            self.assertIs(modules.installed()["sample"], fake)
+            entries = modules.declarations(federation(names=["sample"]))
+        self.assertEqual([(e["project"], e["module"]) for e in entries],
+                         [("acme", "sample")])
+        self.assertEqual(entries[0]["types"], list(FIVE_DOCUMENTARY))
+        # Q1 #1915 : aucun schéma ni règle métier inventé pour ces types.
+        self.assertEqual(entries[0]["schemas"], {})
+        self.assertEqual(entries[0]["rules"], [])
+        with self.assertRaisesRegex(ValueError, "unknown sample module option"):
+            fake.descriptor({"require_qa": ["promoted"]})
+
+    def test_external_descriptor_and_it_coexist_with_disjoint_types(self):
+        fake = external_sample()
+        with external_points(FakeEntryPoint(fake)):
+            entries = modules.declarations(federation(names=["it", "sample"]))
+        self.assertEqual([(e["project"], e["module"]) for e in entries],
+                         [("acme", "it"), ("acme", "sample")])
+        it_types = set(next(e["types"] for e in entries if e["module"] == "it"))
+        self.assertEqual(set(fake.TYPES), set(FIVE_DOCUMENTARY))
+        self.assertFalse(it_types & set(fake.TYPES))
+
+    def test_external_module_refusals(self):
+        mismatch = external_sample(name="other")
+        no_descriptor = types_mod.ModuleType("broken_module")
+        no_descriptor.NAME = "sample"
+        malformed = external_sample(
+            descriptor=lambda options=None: {"types": [], "schemas": {}, "rules": []})
+        wrong_keys = external_sample(
+            descriptor=lambda options=None: {"types": ["docs"], "schemas": {}})
+        bad_types = external_sample(types=["docs", "docs"])
+        cases = (
+            ("load", (FakeEntryPoint(RuntimeError("boom")),), "cannot be loaded"),
+            ("name", (FakeEntryPoint(mismatch),), "declares NAME"),
+            ("descriptor", (FakeEntryPoint(no_descriptor),), "no descriptor"),
+            ("types", (FakeEntryPoint(malformed),), "types must be unique"),
+            ("duplicate-types", (FakeEntryPoint(bad_types),), "types must be unique"),
+            ("keys", (FakeEntryPoint(wrong_keys),), "descriptor keys"),
+            ("duplicates", (FakeEntryPoint(external_sample()),
+                            FakeEntryPoint(external_sample())),
+             "duplicate installed module"),
+            ("builtin", (FakeEntryPoint(it, name="it"),), "duplicate installed module"),
+        )
+        for label, points, message in cases:
+            with self.subTest(label=label), external_points(*points), \
+                    self.assertRaisesRegex(ValueError, message):
+                modules.installed()
+        inconsistent = external_sample()
+        inconsistent.TYPES = ("docs",)
+        with external_points(FakeEntryPoint(inconsistent)), \
+                self.assertRaisesRegex(ValueError, "TYPES differ"):
+            modules.installed()
+
+    def test_external_evidence_exposes_installation_proof(self):
+        with external_points(FakeEntryPoint(external_sample())):
+            rows = modules.evidence()
+        row = next(item for item in rows if item["name"] == "sample")
+        self.assertTrue(row["ok"])
+        self.assertEqual(row["source"], "external")
+        self.assertEqual(row["distribution"], "ameesh-sample-module")
+        self.assertEqual(row["version"], "0.1.0")
+        self.assertEqual(len(row["descriptor_sha256"]), 64)
+        broken = external_sample(name="other")
+        with external_points(FakeEntryPoint(broken)):
+            row = next(item for item in modules.evidence()
+                       if item["name"] == "sample")
+        self.assertFalse(row["ok"])
+        self.assertIn("declares NAME", row["error"])
+
+    def test_external_evidence_reports_duplicates_as_unusable(self):
+        points = (FakeEntryPoint(external_sample()),
+                  FakeEntryPoint(external_sample()))
+        with external_points(*points):
+            rows = [row for row in modules.evidence() if row["name"] == "sample"]
+        self.assertEqual(len(rows), 2)
+        self.assertTrue(all(not row["ok"] for row in rows))
+        self.assertTrue(all("duplicate installed module" in row["error"]
+                            for row in rows))
+        with external_points(*points), \
+                self.assertRaisesRegex(ValueError, "duplicate installed module"):
+            modules.installed()
+        with external_points(FakeEntryPoint(it, name="it")):
+            row = next(item for item in modules.evidence()
+                       if item["name"] == "it" and item["source"] == "external")
+        self.assertFalse(row["ok"])
+        self.assertIn("duplicate installed module", row["error"])
+
+    def test_external_types_are_rechecked_with_project_options(self):
+        def descriptor(options=None):
+            options = dict(options or {})
+            return {"types": ["promotion"] if options else ["docs"],
+                    "schemas": {}, "rules": []}
+
+        declared = external_sample(types=["docs"], descriptor=descriptor)
+        with external_points(FakeEntryPoint(declared)), \
+                self.assertRaisesRegex(ValueError, "TYPES differ"):
+            modules.declarations(federation(names={"sample": {"typed": True}}))
+        flexible = external_sample(types=["docs"], descriptor=descriptor)
+        del flexible.TYPES
+        with external_points(FakeEntryPoint(flexible)):
+            entries = modules.declarations(
+                federation(names={"sample": {"typed": True}}))
+        self.assertEqual(entries[0]["types"], ["promotion"])
+
+    def test_external_types_cover_the_five_non_code_process_types(self):
+        from ameesh.process_verifiers import (CODE_TYPES, INSTALLED_TYPES,
+                                              completion_policy)
+        self.assertEqual(set(FIVE_DOCUMENTARY),
+                         set(INSTALLED_TYPES) - set(CODE_TYPES))
+        for kind in FIVE_DOCUMENTARY:
+            with self.subTest(kind=kind):
+                policy = completion_policy(kind)
+                self.assertFalse(policy.code)
+                self.assertTrue(policy.requires_review)
+
+    def test_module_cli_list_prints_installation_evidence(self):
+        with external_points(FakeEntryPoint(external_sample())), \
+                mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+            self.assertEqual(modules.main(["--list"]), 0)
+        rows = json.loads(out.getvalue())
+        self.assertTrue(any(row["name"] == "sample" and row["ok"]
+                            for row in rows))
+
     def test_canon_check_reports_module_errors(self):
         c = canon.Canon(root=".", readable=True, federation=federation(names=["missing"]))
         self.assertTrue(any(f.code == "project-modules-invalid" for f in canon.validate(c)))
@@ -94,6 +282,60 @@ class ModuleConfigurationTest(unittest.TestCase):
                     apply.assert_not_called()
                 else:
                     apply.assert_called_once_with(lock.db, c)
+
+
+class ExternalDiscoveryTest(unittest.TestCase):
+    """Un paquet réellement présent dans l'environnement est découvert."""
+
+    module_name = "ameesh_sample_module_2847"
+
+    def test_a_real_installed_distribution_is_discovered(self):
+        with tempfile.TemporaryDirectory() as folder:
+            source = Path(folder, "%s.py" % self.module_name)
+            source.write_text(
+                "NAME = 'sample'\n"
+                "TYPES = ('docs', 'investigation', 'governance-tracking',\n"
+                "         'promotion', 'human_operation')\n"
+                "def descriptor(options=None):\n"
+                "    options = dict(options or {})\n"
+                "    if options:\n"
+                "        raise ValueError('unknown option')\n"
+                "    return {'types': list(TYPES), 'schemas': {}, 'rules': []}\n")
+            info = Path(folder, "ameesh_sample_module-0.1.0.dist-info")
+            info.mkdir()
+            (info / "METADATA").write_text(
+                "Metadata-Version: 2.1\nName: ameesh-sample-module\nVersion: 0.1.0\n")
+            (info / "entry_points.txt").write_text(
+                "[ameesh.modules]\nsample = %s\n" % self.module_name)
+            sys.path.insert(0, folder)
+            try:
+                registry = modules.installed()
+                rows = modules.evidence()
+            finally:
+                sys.path.remove(folder)
+                sys.modules.pop(self.module_name, None)
+        self.assertEqual(registry["sample"].NAME, "sample")
+        row = next(item for item in rows if item["name"] == "sample")
+        self.assertTrue(row["ok"])
+        self.assertEqual(row["distribution"], "ameesh-sample-module")
+        self.assertEqual(row["version"], "0.1.0")
+        self.assertEqual(len(row["descriptor_sha256"]), 64)
+
+    def test_the_repository_test_module_is_discovered(self):
+        folder = str(Path(__file__).resolve().parent / "fixtures" / "ameesh_modules")
+        sys.path.insert(0, folder)
+        try:
+            registry = modules.installed()
+            rows = modules.evidence()
+        finally:
+            sys.path.remove(folder)
+            sys.modules.pop("sample_module", None)
+        self.assertEqual(registry["sample"].NAME, "sample")
+        self.assertEqual(set(registry["sample"].TYPES), set(FIVE_DOCUMENTARY))
+        row = next(item for item in rows if item["name"] == "sample")
+        self.assertTrue(row["ok"])
+        self.assertEqual(row["distribution"], "ameesh-sample-module")
+        self.assertEqual(row["version"], "0.1.0")
 
 
 class ExecutionTest(unittest.TestCase):
@@ -206,6 +448,9 @@ class LifecycleGateTest(PgTestCase):
         super().setUp()
         # Git identity/ancestry is exercised separately in #1286; this class
         # isolates the IT gate after a valid manual merge declaration.
+        discover = external_points()
+        discover.start()
+        self.addCleanup(discover.stop)
         proof = mock.patch.object(work, "_declared_merge_commit",
                                   side_effect=lambda item, sha, **kw: sha)
         proof.start()
@@ -215,6 +460,11 @@ class LifecycleGateTest(PgTestCase):
         self.artifact = Path(self.tmp, "artifact.py")
         self.artifact.write_text("print('delivered executable smoke passed')\n")
         self.lot = work.add(self.db, title="Publication", type="release", app="acme")["id"]
+        # Ce témoin isole la porte IT après un gel réel : la tête gelée est
+        # posée au stockage (la porte d'écriture du gel a ses propres témoins,
+        # #2962).
+        storage.of(self.db).work.add_milestone(
+            self.lot, "frozen", sha="a" * 40, actor="auteur", verdict=None, note="")
         self.store = ModuleStore(self.db)
 
     def prove(self):
@@ -234,21 +484,25 @@ class LifecycleGateTest(PgTestCase):
             work.merged(self.db, self.lot, sha="abcdef1234")
         self.assertEqual(work.close_merged(self.db, self.lot, source="sync-github")["result"], "refused")
         with self.assertRaises(db_mod.DbError):
-            work.milestone(self.db, self.lot, "verdict", verdict="ok")
+            work.milestone(self.db, self.lot, "verdict", verdict="ok",
+                           sha="a" * 40)
         self.assertEqual(work.get(self.db, self.lot)["state"], "intake")
         self.assertFalse(any(m["kind"] == "merged" for m in work.milestones(self.db, self.lot)))
-        work.milestone(self.db, self.lot, "verdict", verdict="blocked")
+        work.milestone(self.db, self.lot, "verdict", verdict="blocked",
+                       sha="a" * 40)
 
     def test_delivery_without_proof_still_blocks_go(self):
         it.declare(self.db, self.lot, self.artifact, actor="tester")
         with self.assertRaisesRegex(db_mod.DbError, "proof"):
-            work.milestone(self.db, self.lot, "verdict", verdict="ok")
+            work.milestone(self.db, self.lot, "verdict", verdict="ok",
+                           sha="a" * 40)
 
     def test_matching_execution_allows_go_merge_and_promotion(self):
         proof = self.prove()
         self.assertEqual(proof["payload"]["exit_code"], 0)
-        work.milestone(self.db, self.lot, "verdict", verdict="ok", sha="abcdef1234")
-        self.assertEqual(work.merged(self.db, self.lot, sha="abcdef1234")["result"], "merged")
+        work.milestone(self.db, self.lot, "verdict", verdict="ok",
+                       sha="a" * 40)
+        self.assertEqual(work.merged(self.db, self.lot, sha="a" * 40)["result"], "merged")
         self.assertEqual(work.move(self.db, self.lot, "promoted")["state"], "promoted")
 
     def test_work_move_and_raw_storage_cannot_bypass_gate(self):
@@ -370,3 +624,53 @@ class LifecycleGateTest(PgTestCase):
         proc = self.mesh("work", "add", "--title", "Store upload", "--type", "publication",
                          "--app", "acme", "--estimate", "1h", "--actor", "human:test")
         self.assertEqual(proc.returncode, 0, proc.stderr)
+
+
+class DocumentaryTypesGateTest(PgTestCase):
+    """Q1 #1915 : un descripteur externe peut déclarer les cinq types.
+
+    Le descripteur les rend installables ; l'activation reste une sélection de
+    canon par projet. Un projet sans module continue de les refuser, côté CLI
+    comme par écriture SQL directe.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.external = external_sample()
+        with external_points(FakeEntryPoint(self.external)):
+            declarations = modules.declarations(federation(names=["sample"]))
+        with self.db.transaction() as tx:
+            ModuleStore(tx).replace("", declarations)
+
+    def test_each_declared_type_is_admitted_for_the_project(self):
+        for kind in self.external.TYPES:
+            with self.subTest(kind=kind):
+                lot = work.add(self.db, title="Documentary", type=kind, app="acme")
+                self.assertEqual((lot["type"], lot["app"]), (kind, "acme"))
+                self.assertEqual(work.get(self.db, lot["id"])["state"], "intake")
+                self.assertTrue(ModuleStore(self.db).admits("acme", kind))
+
+    def test_a_project_without_the_module_still_refuses_each_type(self):
+        for kind in self.external.TYPES:
+            with self.subTest(kind=kind):
+                with self.assertRaisesRegex(work.WorkError, "enable its module"):
+                    work.add(self.db, title="No module", type=kind, app="other")
+                with self.assertRaisesRegex(db_mod.DbError, "AMEESH_MODULE_RULE"):
+                    self.db.execute(
+                        "INSERT INTO work_items(title,type,app) "
+                        "VALUES ('raw',%s,'other')", (kind,))
+
+    def test_declaration_does_not_admit_other_module_types(self):
+        core = work.add(self.db, title="Core", app="other")["id"]
+        self.assertEqual(work.get(self.db, core)["type"], "evolution")
+        with self.assertRaises(work.WorkError):
+            work.add(self.db, title="Release", type="release", app="acme")
+        self.assertFalse(ModuleStore(self.db).admits("acme", "release"))
+        self.assertTrue(ModuleStore(self.db).admits("acme", "docs"))
+
+    def test_cli_adds_a_documentary_lot_when_the_module_is_active(self):
+        proc = self.mesh("work", "add", "--title", "Read the contract",
+                         "--type", "docs", "--app", "acme", "--new-project",
+                         "--actor", "human:test")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("Read the contract", proc.stdout)

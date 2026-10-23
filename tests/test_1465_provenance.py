@@ -43,25 +43,26 @@ class ContractTest(unittest.TestCase):
 
     def test_capture_refuses_outside_a_managed_turn(self):
         env = {"AGENT_MAIL_NAME": "mty-amh-impl-07", "AMEESH_HARNESS": "deepseek"}
+        families = ("claude", "codex", "deepseek")
         with self.assertRaises(prov.ProvenanceError):
-            prov.capture(env)  # pas de tour
+            prov.capture(env, families=families)  # pas de tour
         env["AMEESH_TURN_ID"] = "t" * 32
-        self.assertEqual(prov.capture(env),
+        self.assertEqual(prov.capture(env, families=families),
                          {"actor": "mty-amh-impl-07", "turn": "t" * 32,
                           "harness": "deepseek"})
         # un tour ne signe pas la preuve d'un autre agent (relecture cx3)
         with self.assertRaises(prov.ProvenanceError):
-            prov.capture(env, actor="autre-agent")
+            prov.capture(env, actor="autre-agent", families=families)
         env["AMEESH_HARNESS"] = "autre"
         with self.assertRaises(prov.ProvenanceError):
-            prov.capture(env)  # famille inconnue
+            prov.capture(env, families=families)  # famille inconnue
         del env["AMEESH_HARNESS"]
         with self.assertRaises(prov.ProvenanceError):
-            prov.capture(env)  # pas de harnais
+            prov.capture(env, families=families)  # pas de harnais
         del env["AGENT_MAIL_NAME"]
         env["AMEESH_HARNESS"] = "claude"
         with self.assertRaises(prov.ProvenanceError):
-            prov.capture(env)  # pas d'acteur
+            prov.capture(env, families=families)  # pas d'acteur
 
 
     def test_resolve_commit_keeps_options_out_of_git(self):
@@ -156,9 +157,15 @@ class PgProvenanceTest(PgTestCase):
         # un autre commit reste inconnu : pas de voisin, pas de repli
         self.assertIsNone(prov.receipt_for_commit(self.db, SHA1_FULL))
 
+    def _verdict(self, sha=SHA1[:12]):
+        # #2674 : une abréviation doit se résoudre ; ce témoin simule un dépôt
+        # qui la connaît (le commit est fictif).
+        with mock.patch("ameesh.freeze_checks.commit_in", return_value=SHA1):
+            return work.milestone(self.db, int(self.lot["id"]), "verdict", sha=sha,
+                                  actor="mty-amh-impl-07", verdict="ok")
+
     def test_milestone_receipt_copies_the_declared_facts(self):
-        mark = work.milestone(self.db, int(self.lot["id"]), "verdict", sha=SHA1[:12],
-                              actor="mty-amh-impl-07", verdict="ok")
+        mark = self._verdict()
         self.assertIsNone(prov.receipt_for_milestone(self.db, mark["id"]))
         self._receipt("milestone:%d" % mark["id"], SHA1, work_item_id=int(self.lot["id"]))
         recu = prov.receipt_for_milestone(self.db, mark["id"])
@@ -177,8 +184,7 @@ class PgProvenanceTest(PgTestCase):
         self.assertEqual(recu["harness"], "deepseek")
 
     def test_milestone_proof_must_match_the_mark(self):
-        mark = work.milestone(self.db, int(self.lot["id"]), "verdict", sha=SHA1[:12],
-                              actor="mty-amh-impl-07", verdict="ok")
+        mark = self._verdict()
         # acteur de la preuve différent de l'acteur du jalon : refus
         self._receipt("milestone:%d" % mark["id"], SHA1, actor="autre-agent")
         with self.assertRaises(prov.ProvenanceError):
@@ -219,14 +225,22 @@ class PgProvenanceTest(PgTestCase):
         turn = "t" * 32
         env = {"AGENT_MAIL_NAME": "mty-amh-impl-07", "AMEESH_TURN_ID": turn,
                "AMEESH_HARNESS": "deepseek"}
-        # le sha déclaré est une abréviation ; le dépôt sous la main la résout
+        # #2786 : le gel nomme une tête immuable, résolue dans le dépôt de
+        # l'auteur et écrite complète. Le mock de résolution ne sert plus
+        # qu'à la provenance, dont la lecture se fait hors de ce dépôt.
+        # La tête vit sur une branche de lot : le gel doit avoir un commit
+        # propre hors de la cible (garde (4) de #2786).
+        repo, _author_env = self._repo()
+        subprocess.run(["git", "checkout", "-q", "-b", "lot/proof"], cwd=repo,
+                       check=True, capture_output=True)
+        head = self._commit(repo, _author_env, "tête du lot")
         with mock.patch.dict(os.environ, env), \
-                mock.patch.object(prov, "resolve_commit", return_value=SHA1):
+                mock.patch.object(prov, "resolve_commit", return_value=head):
             mark = work.milestone(self.db, int(self.lot["id"]), "frozen",
-                                  sha=SHA1[:12], actor="mty-amh-impl-07")
-        self.assertEqual(mark["sha"], SHA1[:12], "le fait garde le sha déclaré")
+                                  sha=head[:12], actor="mty-amh-impl-07", repo=repo)
+        self.assertEqual(mark["sha"], head, "le fait écrit la tête complète (#2786)")
         recu = prov.receipt_for_milestone(self.db, mark["id"])
-        self.assertEqual(recu["commit"], SHA1, "la preuve porte le commit complet")
+        self.assertEqual(recu["commit"], head, "la preuve porte le commit complet")
         self.assertEqual(recu["session"], "s-1")
         self.assertEqual(recu["turn"], turn)
         self.assertEqual(recu["harness"], "deepseek")
@@ -234,31 +248,37 @@ class PgProvenanceTest(PgTestCase):
             "id": mark["id"], "actor": mark["actor"], "at_ts": mark["at_ts"],
             "sha": mark["sha"], "verdict": mark["verdict"]})
 
-    def test_milestone_with_a_symbolic_sha_gets_no_proof(self):
-        """N1 : un --sha non hexadécimal n'écrit pas de preuve que le reçu refuserait.
+    def test_milestone_with_a_symbolic_sha_is_refused_without_writing(self):
+        """#2786 : un --sha symbolique est refusé avant toute écriture.
 
-        Le fait garde le sha DÉCLARÉ (`main`, `HEAD`) ; une preuve écrite avec
-        le commit résolu serait incohérente avec ce fait, et
-        `receipt_for_milestone` lèverait `ProvenanceError` à jamais."""
+        Un gel ne peut nommer qu'une tête immuable : `main`, `HEAD` ou un tag
+        ne sont jamais résolus, chaque lecteur les résoudrait dans son clone.
+        Aucun jalon n'est donc écrit, et aucune preuve que le reçu refuserait."""
         storage.of(self.db).agents.upsert_unleased(
             "mty-amh-impl-07", chantier=None, harness="deepseek", host="h",
             cwd="/tmp", session_id="s-1")
         env = {"AGENT_MAIL_NAME": "mty-amh-impl-07", "AMEESH_TURN_ID": "t" * 32,
                "AMEESH_HARNESS": "deepseek"}
+        before = len(work.milestones(self.db, int(self.lot["id"])))
         for declared in ("main", "HEAD", "v1.2.3"):
             with mock.patch.dict(os.environ, env), \
                     mock.patch.object(prov, "resolve_commit",
                                       return_value=SHA1) as resolve:
-                mark = work.milestone(self.db, int(self.lot["id"]), "frozen",
-                                      sha=declared, actor="mty-amh-impl-07")
-            self.assertEqual(mark["sha"], declared)
+                with self.assertRaises(work.WorkError) as raised:
+                    work.milestone(self.db, int(self.lot["id"]), "frozen",
+                                   sha=declared, actor="mty-amh-impl-07")
+            self.assertIn("head-missing", str(raised.exception))
             resolve.assert_not_called()
-            self.assertIsNone(prov.receipt_for_milestone(self.db, mark["id"]))
+        self.assertEqual(len(work.milestones(self.db, int(self.lot["id"]))), before)
 
     def test_milestone_outside_a_turn_stays_unknown(self):
         """Hors tour managé, le jalon s'écrit, l'origine reste inconnue."""
+        # #2962 : un SHA complet doit se résoudre lui aussi ; ce témoin simule
+        # le dépôt qui porte le commit, comme `_verdict` le fait pour une
+        # abréviation (#2674). Le sujet du test est la provenance, pas la tête.
         with mock.patch.dict(os.environ, {"AMEESH_TURN_ID": "", "AMEESH_HARNESS": ""},
-                             clear=False):
+                             clear=False), \
+                mock.patch("ameesh.freeze_checks.commit_in", return_value=SHA1):
             mark = work.milestone(self.db, int(self.lot["id"]), "verdict",
                                   sha=SHA1, actor="mty-amh-impl-07", verdict="ok")
         self.assertIsNone(prov.receipt_for_milestone(self.db, mark["id"]))

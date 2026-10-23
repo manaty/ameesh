@@ -20,7 +20,7 @@ import unittest
 from unittest import mock
 
 from ameesh import (lot_class, mail, merge_queue, packet_guard, plan_git, plan_github, radar,
-                    registry, resolutions, storage, work)
+                    registry, resolutions, review_lot, storage, work)
 
 from .support import PgTestCase
 from .test_l160b_radar import LOTS, MIG, _git, _write, git_env, make_repo
@@ -143,12 +143,28 @@ class _Base(unittest.TestCase):
         store = mock.Mock(work=self.fake)
         patches = [mock.patch.object(storage, "of", return_value=store),
                    mock.patch.object(work, "get",
-                                     side_effect=lambda db, n: self.fake.lots.get(n)),
+                                     side_effect=lambda db, n, **_: self.fake.lots.get(n)),
                    mock.patch.object(work, "milestones",
                                      side_effect=lambda db, n, *a: self.marks.get(n, [])),
+                   # #2664 : banc sans canon ; familles compilées épinglées.
+                   mock.patch.object(review_lot, "compiled_families",
+                                     return_value=("claude", "codex", "deepseek")),
                    mock.patch.object(merge_queue, "actor_family",
-                                     side_effect=lambda db, n: self.FAMILIES.get(
-                                         str(n or "").strip(), ""))]
+                                     side_effect=lambda db, n, **_: self.FAMILIES.get(
+                                         str(n or "").strip(), "")),
+                   # #1515/#2808 : ce dépôt de banc commite avec une identité
+                   # générique (`t`), sans provenance d'agent ; la porte lirait
+                   # une plage dont l'auteur n'a pas de famille et refuserait
+                   # au nom de `t`. Ce que le banc simule, c'est l'assigné
+                   # auteur du lot (`FAMILIES`) : la lecture complète rend
+                   # cette liste, comme `test_1003_merge_pr`.
+                   mock.patch.object(
+                       merge_queue, "_complete_authors",
+                       side_effect=lambda db, item, *a, **kw: (
+                           [{"name": str(item.get("assignee") or "").strip(),
+                             "family": self.FAMILIES.get(
+                                 str(item.get("assignee") or "").strip(), "")}]
+                           if str(item.get("assignee") or "").strip() else [], ()))]
         if getattr(self, "PACKET_GUARD", True):
             # #2333 : ces bancs sans base simulent la mécanique de file ; la
             # garde du paquet y est simulée (les témoins de la garde elle-même
@@ -211,12 +227,12 @@ class EntryTest(_Base):
         self.assertEqual((row["target"], row["frozen_sha"], row["state"]),
                          ("main", self.tip(1), "queued"))
         self.assertIn("PR #7 green", self.fake.notes[-1][1])
-        # an absent CI status is not a green one: a team that merges locally
-        # without a PR, or a reader that answers nothing, is refused
-        # (revue #544 r1)
+        # #3080: no PR falls back to commit CI; absent commit CI still refuses.
         self.ready(2)
-        with self.assertRaisesRegex(merge_queue.QueueError, "no CI status"):
-            self.enter(2, ci=lambda branch: None)
+        with self.assertRaisesRegex(merge_queue.QueueError, "no run"):
+            self.enter(2, ci=lambda branch: None,
+                       commit_ci=lambda sha: {"runs": 0, "green": False,
+                                              "pending": [], "failed": []})
         with self.assertRaisesRegex(merge_queue.QueueError, "no CI reader"):
             self.enter(2, ci=None)
         self.assertEqual(set(self.fake.queue_rows), {1})
@@ -396,6 +412,9 @@ class EntryTest(_Base):
         agents = os.path.join(self.tmp, "agents")
         _git(self.tmp, "clone", "-q", self.repo, agents)
         clone = resolutions.Replayer(agents, os.path.join(self.tmp, "state", "p.clone"))
+        # #3001 : le clone du radar existe déjà (sa migration vers la forge,
+        # faite une fois à la création, n'est pas l'aller-retour d'admission)
+        clone.ensure()
         self.ready(1)
         calls = []
         real = resolutions._run
@@ -483,8 +502,8 @@ class EntryTest(_Base):
         real = merge_queue.fetch_fresh
         raced = {"done": False}
 
-        def concurrent(repo, names, clone=None):
-            tips, where = real(repo, names, clone)
+        def concurrent(repo, names, clone=None, base=None):
+            tips, where = real(repo, names, clone, base=base)
             if not raced["done"] and where != repo \
                     and any(merge_queue._remote_branch(n) == "main" for n in names):
                 raced["done"] = True
@@ -816,7 +835,7 @@ class ClassOfFreshTargetGitTest(unittest.TestCase):
         self.row, self.marks = {}, []
         for obj, name, kwargs in (
                 (work, "configured_canons", {"return_value": [self.canon()]}),
-                (work, "get", {"side_effect": lambda db, n: self.row}),
+                (work, "get", {"side_effect": lambda db, n, **_: self.row}),
                 (work, "milestones", {"side_effect": lambda db, n, *a: self.marks})):
             patcher = mock.patch.object(obj, name, **kwargs)
             patcher.start()
@@ -893,7 +912,10 @@ class ClassOfFreshTargetGitTest(unittest.TestCase):
                 _git(agents, "fetch", "-q", "origin")
                 clone = self.clone(agents, target)
                 merge_queue.fetch_fresh(agents, ["lot/light"], clone)
-                self.assertEqual(_git(clone.path, "rev-parse", "origin/" + target), a)
+                # #3001 : l'origin du clone est la forge (B), plus la copie du
+                # local A des agents ; la classe ne lit que QUEUE_REF
+                self.assertEqual(_git(clone.path, "rev-parse", "origin/" + target), b)
+                self.assertNotEqual(_git(clone.path, "rev-parse", "origin/" + target), a)
                 self.lot(target)
                 out = merge_queue._class_of(None, 1, self.row, agents, clone.path,
                                             target, c, cfg=None)
@@ -1349,7 +1371,7 @@ class PassTest(_Base):
         by_branch = {self.fake.lots[n]["branch"]: tips[n] for n in (1, 2, 3)}
         with mock.patch.object(merge_queue, "stack", return_value=trial), \
                 mock.patch.object(merge_queue, "fetch_fresh",
-                                  side_effect=lambda repo, names, clone: (
+                                  side_effect=lambda repo, names, clone, base=None: (
                                       dict(by_branch, main="f" * 40), repo)):
             out = merge_queue.run_pass(self.cfg, None, self.project, report,
                                        replayer=mock.Mock())
@@ -1433,8 +1455,14 @@ class QueueWithoutRadarTest(PgTestCase):
         # (`rev1`, `rev2`), comme les bancs sans base plus haut.
         self.db.execute("UPDATE work_items SET assignee = 'a1' WHERE id = %d" % lot)
         work.milestone(self.db, lot, "frozen", sha=fresh, actor="a1")
-        work.milestone(self.db, lot, "verdict", verdict="ok", sha=fresh, actor="rev1")
-        work.milestone(self.db, lot, "verdict", verdict="ok", sha=fresh, actor="rev2")
+        for actor, harness in (("rev1", "codex"), ("rev2", "claude")):
+            mark = work.milestone(self.db, lot, "verdict", verdict="ok", sha=fresh,
+                                  actor=actor)
+            # #2928 : la porte sensible ne compte un verdict que sur son reçu
+            # exact ; ces avis sont réels, ils portent leur preuve.
+            storage.of(self.db).provenance.add(
+                "milestone:%d" % int(mark["id"]), fresh, actor, "s-" + harness,
+                "t", harness, work_item_id=lot)
         # #2333 : `queue add` refuse une tête de lot hors paquet ; ce banc
         # éprouve le clone jetable et la tête fraîche, pas la garde : une
         # exception déclarée sur cette tête exacte autorise l'admission.
@@ -1450,11 +1478,23 @@ class QueueWithoutRadarTest(PgTestCase):
             return path
 
         args = mock.Mock(queue_command="add", id=lot, repo=agents, actor="pilot", json=False)
-        with mock.patch.object(merge_queue, "radar_project", return_value=None), \
+        # #2739/#2726 : ce dépôt de banc commite avec une identité générique,
+        # sans provenance d'agent ; la lecture de plage de la porte échouerait
+        # en échec fermé. Ce témoin porte sur le clone jetable et la tête
+        # fraîche, pas sur les auteurs/correcteurs : la lecture ne rend rien
+        # (#2808 : None, plage non lue — pas (None, []), une lecture vide).
+        # #1515/#2808 : la lecture complète rend l'assigné simulé (a1), sans
+        # quoi la porte refuserait au nom de l'auteur Git générique `t`.
+        with mock.patch.object(merge_queue, "_attribution_on_freeze",
+                               return_value=None), \
+                mock.patch.object(merge_queue, "_complete_authors",
+                                  return_value=([{"name": "a1", "family": "deepseek"}],
+                                                ())), \
+                mock.patch.object(merge_queue, "radar_project", return_value=None), \
                 mock.patch.object(radar, "github_ci",
                                   return_value=lambda branch: dict(status)), \
                 mock.patch.object(merge_queue, "actor_family",
-                                  side_effect=lambda db, n: {
+                                  side_effect=lambda db, n, **_: {
                                       "a1": "deepseek", "rev1": "codex",
                                       "rev2": "claude"}.get(str(n or "").strip(), "")), \
                 mock.patch.object(merge_queue.tempfile, "mkdtemp", side_effect=record):

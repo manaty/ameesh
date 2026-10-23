@@ -42,8 +42,9 @@ read and returns a decision:
   author or corrector of the head; an author whose real family is unknown
   (empty or label) makes the designation **wait** — ruling them out by their
   name alone would let through a reviewer from their real family (B3, Claude
-  dev1 review). A single candidate per family (the least loaded), then the
-  least loaded families; at equal load, the order of the names decides.
+  dev1 review). A single candidate per family (the least loaded). Since
+  #2668, the family furthest behind its plan pace comes first
+  (`review_pace`), the load only breaking that tie, then the name.
 - **explicit wait**: if independent families are missing, or an author's family
   is unknown, the state is `waiting` with the missing number, and a **capacity
   notification** goes to the pilot — never an implicit admission.
@@ -51,6 +52,57 @@ read and returns a decision:
   **exact** SHA to review, the verdict command on that SHA, and the rule of §2
   (fixing a blocker oneself makes one an author: their review no longer counts,
   another reviewer takes over).
+
+## Plan pace tie-break (#2668, 19 October 2026)
+
+The auditor found Codex at 35 % of its weekly window after 19 % of the week
+(the pace was heading to the ceiling around 21/10, then about three days
+without a Codex opinion). The designation used to break ties by load alone,
+which ignored the plans. `src/ameesh/review_pace.py` now reads the shared
+gauge history and gives each family its **advance** over the plan pace, in
+points: `used_at − held_cap`, where `held_cap` is the **raw** pace of a
+non-critical turn (nominal multiplier, default ceiling, and the 10-point
+reserve kept for critical agents, #2648). Positive is ahead, negative is
+behind. The declared `pace_multiplier`/`pace_ceiling` are deliberately not
+read: with the real ×10 (Claude) and ×3 (Codex) profiles, Claude looked 20
+points behind and Codex 21.8, designating Codex — the inverse of the witness.
+The same raw scale applies to every family (B of mesh-design on 4123b99,
+19/10/2026). The plan horizon is the longest applicable window (the weekly
+`seven_day` in practice): a short `five_hour` burst is a capacity signal, not
+the weekly plan, and does not enter the advance (#2675).
+
+When several families are eligible for one opinion, the selection prefers the
+family furthest behind; the agent load only breaks a tie. A family's value is
+its most constrained current account on that horizon (a fresh sibling does not
+hide a plan that is ahead). A **model-scoped** bucket (`seven_day@fable`) is
+kept with its scope: it counts only for a candidate whose model contains that
+scope (`fable` in `fable` or `claude-fable`, the rule of
+`accounts.model_scoped`),
+added to the general windows; a reviewer of another model, or of an unknown
+model, sees the general windows only. A family with only scoped readings is
+neutral for them, never contaminated by a bucket that applies to one model.
+The family's own representative is chosen by the **applicable pace before the
+load**: a less-loaded Fable agent cannot hide a further-behind Opus agent of
+the same family (cx3 B/P1, first case). A scope carried by the family but
+with no current applicable reading is stored as `None`: that model is neutral
+(0), never rescued by the general reading of an account whose scoped window is
+stale (second case). Validity is per model and per account. A stale reading
+(#1561: a dated window reset while another is open, or a reading older than
+its shortest window) is **neutral**, as is an absent reading: the family is
+absent from the mapping, and the load decides. The pace never makes a family
+ineligible: two required opinions still take two distinct families, whatever
+their pace.
+
+Witnesses: a DeepSeek author, one opinion, Codex 16 points ahead and Claude at
+its pace designates Claude even when Codex's agent is less loaded — including
+with the real ×10/×3 declared profiles, which the raw scale ignores, and a
+Fable-only bucket at 95 % that the Claude agent (no declared model) does not
+see (the integration test sets both); a Fable reviewer, by contrast, sees the
+bucket; two opinions designate Claude and Codex whatever the pace; unreadable
+gauges keep the previous load rule. The thresholds are
+not local: the families and the required number come from the compiled canon
+(`mechanics`), the scale from `cost`, the reserve from `accounts`; no declared
+profile multiplier is read.
 
 ## The wiring contract (to be qualified with #1616 and #1467)
 
@@ -183,7 +235,9 @@ only machine sources:
   default;
 - the **frozen diff** `merge-base(target, frozen)..frozen` and the exact
   provenance receipt (#1465) of each of its commits; an unknown commit or an
-  unknown author family waits instead of proving a false independence;
+  unknown author family waits instead of proving a false independence — a
+  commit without a receipt is read from its committer's turn journal, with a
+  `turn-journal` trace (#2721/#2681, see `1465-preuves-par-commit.md` §6);
 - the **candidates** of the lot's project: real session family
   (`registry.live_harness`), availability and open-lot load;
 - the project's `orchestrateur` in the canon as the **capacity-alert
@@ -259,7 +313,7 @@ trace before the external commit (and nothing survives its rollback); after the
 external commit, the caller flushes the list; the callback is rejected outside
 a `frozen`.
 
-`tests/test_2447_review_designation_activation.py` — 20 tests on a real
+`tests/test_2447_review_designation_activation.py` — 27 tests on a real
 database, both drivers: the freeze designates two independent families and
 writes them into `work_items.reviewers`; a new freeze clears only the previous
 automatic names; the last good canon commit wins when the current state is
@@ -270,7 +324,30 @@ recovery — selection, light or unavailable — leaves the newer freeze's colum
 notes and mails untouched; the selection and the column commit together (a
 failure of the column write leaves neither a designated mark nor a reviewer
 mail); a recovery still refuses an undeliverable waiting designation while the
-hook turns it into a waiting mark; the CLI freeze and the recovery command.
+hook turns it into a waiting mark; a light lot journals its no-pre-merge-review
+outcome once; a freeze run outside the lot worktree finds it beside the agent's
+session directory, and a sibling of another project is refused; a policy that
+arrives later is retried on the same freeze (the runner call included); the CLI
+freeze (light explanation included) and the recovery command.
+
+`tests/test_2668_designation_pace.py` — 19 targeted tests, without a database:
+the raw plan advance with the critical reserve (Codex 16 points ahead when
+19 % of the week is elapsed, multiplier 1 and default ceiling), a 5 h burst
+that does not override the weekly plan (#2675), a stale reading neutral
+(#1561), the family's most constrained account on the plan horizon, the
+anonymous readings dropped when named accounts exist, a model-scoped
+`seven_day@fable` bucket that counts for a Fable candidate and not for an
+Opus one (a scoped-only family is neutral for another model), the family
+reduction by applicable pace before load (a less-loaded Fable agent does not
+hide a further-behind Opus one), a stale scope kept as `None` (neutral, not
+rescued by the account's general reading) — the two cx3 B/P1 cases — one
+opinion preferring the family behind even when its agent is more loaded, two
+opinions keeping two distinct families, and the load rule when no reading is
+current.
+One integration test in the activation file adds a current Claude/Codex gauge
+pair, declared ×10/×3 profiles and a Fable-only bucket, checks that the raw
+pace still designates Claude on a real freeze, then removes the readings and
+checks that the load rule returns.
 
 ## Verdict carry and the freeze designation (#2442 × #2487)
 
@@ -355,3 +432,61 @@ state, not "no designation".
   every column write;
 - two independent reviews outside the author for this gate (security of the
   admission chain), then package at the cut-off.
+
+## 18 October, the first real freezes (#2561)
+
+The first freezes after activation (21:51Z) produced no automatic reviewer for
+#2510, #2517, #2522 and #1854; the pilot designated three of them by hand. The
+diagnosis separates four facts:
+
+- **canon published after activation**: `processus/mecanique.yaml` entered canon
+  main with home#111 (`91abace7980f`, merged 21:56:15Z); the audited commit at
+  freeze was still `b7263126`, which has no mechanics file. The hook recorded
+  `review-designation-unavailable:<lot>:<freeze>:` and mailed the pilot — the
+  explicit wait the design asks for, not a guessed policy. The host synced at
+  21:57:46 and the audited policy now resolves;
+- **frozen head not found** (#2510): the freeze command ran from the agent's
+  session directory (`~/work/nexlink-deepseek2`), not from the lot's worktree.
+  `_repository` knew only the registry `cwd`, the host's radar repository and
+  the process `cwd`; none held the ameesh commit, although the pushed head
+  existed in the agent's other checkout. The fallback now reads the worktrees
+  attributed by housekeeping (`managed_worktrees`) and the siblings of the known
+  paths whose name cites the lot or its assignee; the exact SHA and the issue's
+  repository origin decide. A false neighbour can never contribute content:
+  the commit id is exact and the origin must match;
+- **light lots have no pre-merge reviewer**: canon §2 (full table) gives a light
+  lot tests and CI before merge and the other-family review *after* merge; only
+  a normal/sensitive path asks for a reviewer at the freeze. The hook already
+  returned `none`; it now journals
+  `review-designation-none:<lot>:<freeze>: automatic reviewer designation:
+  none — light lot…` once per freeze, and the CLI prints that reason. "No
+  reviewer at the freeze" is therefore an explained outcome, not a failed
+  designation (#2517 had no error at all; #2510/#2522/#1854 are light too);
+- **recovery command version**: `ameesh work reviewers` ships from 1.12.0; the
+  pilot's installation was 1.11.7 and only had the manual `work reviewer`. The
+  unavailable mail now names the required version and keeps the manual path
+  usable on every installation. The runner also replays the unavailable freezes
+  after a successful canon sync (`retry_pending`, bounded to 20 lots per pass,
+  same frozen head; a waiting mark is retried, a designated/light outcome is
+  skipped). The pass resumes after a cursor in the host state directory and
+  wraps at the end of the queue: a resolved lot is skipped without spending an
+  attempt and the 200-note scan window is walked over successive passes, so a
+  backlog larger than one pass cannot starve the older freezes. The recovery
+  command is therefore optional.
+
+A remaining limit, not on the light path: the `pre-commit`/`post-commit`
+provenance hooks are installed at session open in the session's `cwd` repository
+only. A commit made in another clone (or in a worktree of another clone) has no
+`commit:` receipt; a **sensitive** lot then waits (the designation never guesses
+an author family). Light lots are not affected (no pre-merge designation). A
+follow-up lot should install the hooks in every clone/worktree the agent commits
+from.
+
+Verification: the seven new witnesses in
+`tests/test_2447_review_designation_activation.py` (light note and CLI
+explanation once; repository found beside the agent's cwd from a different
+repository; sibling of another project refused; a head only on origin fetched;
+retry on the same freeze after the canon policy arrives; the runner call) plus
+the existing 20 tests, on both drivers. The real proof remains a freeze after the next release:
+`ameesh work milestone <lot> frozen` must write a designation (sensitive) or a
+`review-designation-none` note (light) without any agent.

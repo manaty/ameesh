@@ -423,21 +423,22 @@ class LotIssuesTest(_Base):
         merged = self.issue(PUBLIC, "Fusionné")
         self.assertEqual((merged["state"], merged["state_reason"]), ("closed", "completed"))
         self.assertIn("ameesh:merged", merged["labels"])
-        self.assertEqual(self.comments(PUBLIC, merged["number"]),
-                         ["Work item %d merged by PR #9: issue closed by ameesh." % a["id"]])
+        self.assertIn("Accepted.", self.comments(PUBLIC, merged["number"])[0])
+        self.assertIn("Merged by PR #9;", self.comments(PUBLIC, merged["number"])[1])
+        self.assertNotIn("Delivered in release", "\n".join(self.comments(PUBLIC, merged["number"])))
         replaced = self.issue(PUBLIC, "Remplacé")
         self.assertEqual((replaced["state"], replaced["state_reason"]), ("closed", "not_planned"))
-        self.assertEqual(self.comments(PUBLIC, replaced["number"]),
-                         ["Work item %d superseded by work item %d (#%d): issue closed by ameesh."
-                          % (b["id"], a["id"], merged["number"])])
+        self.assertIn("Work item %d superseded by work item %d (#%d): issue closed by ameesh."
+                      % (b["id"], a["id"], merged["number"]),
+                      self.comments(PUBLIC, replaced["number"])[-1])
         promoted = self.issue(PUBLIC, "Promu")
         self.assertEqual(promoted["state_reason"], "completed")
-        self.assertIn("delivered", self.comments(PUBLIC, promoted["number"])[0])
+        self.assertIn("Completed;", self.comments(PUBLIC, promoted["number"])[-1])
         # une seule fois
         self.gh.reset_calls()
         self.project()
         self.assertEqual(self.gh.writes(), [])
-        self.assertEqual(len(self.comments(PUBLIC, merged["number"])), 1)
+        self.assertEqual(len(self.comments(PUBLIC, merged["number"])), 2)
 
     def test_titre_refuse_rien_n_est_publie(self):
         a = work.add(self.db, title="Purger /home/bob/cache", app="web")
@@ -510,6 +511,29 @@ class LotIssuesTest(_Base):
         self.project()
         self.assertEqual(self.issue(PUBLIC, "Écrite à la main")["state"], "closed")
 
+    def test_issue_designee_adoptee_close_avant_le_premier_passage(self):
+        """#3086 : un lot déjà clos ferme son issue adoptée dans le passage même.
+
+        Le marqueur est écrit avec l'état voulu : sans la fermeture, l'empreinte
+        dirait « ameesh a écrit closed » alors que l'issue est restée ouverte,
+        et le passage suivant prendrait cet écart pour une retouche humaine."""
+        self.gh.repo(PUBLIC)["issues"].append(
+            {"id": 9501, "number": 51, "title": "Ticket externe", "body": "texte humain",
+             "labels": ["bug"], "state": "open", "state_reason": None})
+        lot = work.add(self.db, title="Export", app="web", issue_ref=PUBLIC + "#51")
+        work.close(self.db, lot["id"], abandoned=True)
+        report = self.project()
+        issue = self.issue(PUBLIC, "Ticket externe")
+        self.assertEqual((issue["state"], issue["state_reason"]),
+                         ("closed", "not_planned"))
+        self.assertIn("Work item %d abandoned" % lot["id"],
+                      self.comments(PUBLIC, 51)[-1])
+        self.assertEqual(report["counts"]["closed"], 1)
+        # un passage suivant ne rouvre rien et ne réécrit pas la fermeture
+        self.gh.reset_calls()
+        self.project()
+        self.assertEqual(self.gh.writes(), [])
+
     def test_doublon_d_un_projecteur_concurrent_ferme(self):
         lot = work.add(self.db, title="Export", app="web")
 
@@ -559,8 +583,8 @@ class SyncGithubCloseTest(_Base):
         # puis la projection ferme l'issue, avec la PR dans son commentaire
         self.project()
         self.assertEqual(self.issue(PUBLIC, "Export")["state"], "closed")
-        self.assertEqual(self.comments(PUBLIC, number),
-                         ["Work item %d merged by PR #5: issue closed by ameesh." % lot["id"]])
+        self.assertIn("Merged by PR #5;", self.comments(PUBLIC, number)[-1])
+        self.assertEqual(len(self.comments(PUBLIC, number)), 2)
 
 
 # ==========================================================================

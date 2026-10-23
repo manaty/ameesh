@@ -86,6 +86,11 @@ def choose(worker, book=None, *, pause: bool = True, margin: bool | None = None)
     except accounts.AccountError as exc:
         return "invalid account configuration: %s" % exc if pause else None
     if not items:
+        if harness == "codex":
+            if book is None:
+                book = cost_mod.CostBook(state_dir=worker.cfg.state_dir, db=worker.db,
+                                         tools={worker.name: harness})
+            return book.default_account_error(harness) or None
         return None
     if book is None:
         book = cost_mod.CostBook(state_dir=worker.cfg.state_dir, db=worker.db,
@@ -165,7 +170,7 @@ def fallback(worker, reason: str, limits=None) -> str:
                 profile = choice.profile
             elif book.pace_exceeded(harness):
                 continue
-            if book.over(worker.name, pace=False):
+            if book.over(worker.name, pace=False, account_checked=bool(items)):
                 continue                    # payé au token : plafond du mesh
         except db_mod.Unavailable:
             raise
@@ -670,7 +675,7 @@ def _own_hold(cfg, db, name: str, harness: str, items: list, limites, *, now: fl
         # l'exécuteur autorise.
         return "", False
     part = getattr(cfg, "noncritical_hourly_share", 0.75) if margin else 1.0
-    return book.over(name, pace=False, hourly_share=part), False
+    return book.over(name, pace=False, hourly_share=part, account_checked=True), False
 
 
 def _fallback_available(cfg, db, name: str, own: str, limites, *, now: float,
@@ -701,7 +706,7 @@ def _fallback_available(cfg, db, name: str, own: str, limites, *, now: float,
                     continue
             elif book.pace_exceeded(harness):
                 continue
-            if book.over(name, pace=False):
+            if book.over(name, pace=False, account_checked=bool(items)):
                 continue
         except db_mod.Unavailable:
             raise

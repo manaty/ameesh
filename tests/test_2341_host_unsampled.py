@@ -30,12 +30,12 @@ class HostUnsampledTest(unittest.TestCase):
         store = mock.MagicMock()
         store.hosts.current.return_value = [
             dict({"host": host}, **reading) for host, reading in readings.items()]
-        store.hosts.since.return_value = []
+        store.hosts.disk_history.return_value = []
         store.hosts.runners.return_value = []
         store.turn_resources.orphans.return_value = list(orphans)
         store.turn_resources.stale_running.return_value = []
 
-        def physical(_canons, host):
+        def physical(_canons, host, *, reading=None):
             value = max_agents.get(host) if isinstance(max_agents, dict) else max_agents
             return {"limits": resources.thresholds(None), "max_agents": value,
                     "origin": {}, "fiches": []}

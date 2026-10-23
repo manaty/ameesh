@@ -198,6 +198,7 @@ class FakeCliTest(unittest.TestCase):
 
 
 class SupervisorTest(FakeCliTest):
+    @unittest.skipUnless(login.PEEK_EXIT, "requires waitid(WNOWAIT); fallback tested below")
     def test_le_groupe_est_tue_meme_si_son_chef_est_deja_sorti(self):
         """N1 : la sortie est observée SANS récolter, donc le zombie garde le
         PID (et le pgid) pendant le killpg de nettoyage."""
@@ -342,16 +343,44 @@ class SupervisorTest(FakeCliTest):
         self.assertEqual(self.spawned[0].returncode, -15)
 
     def test_done_refuse_un_cli_interrompu_meme_avec_ancien_cache_sain(self):
-        # Temoin du verdict Codex (#366, B2) : processus interrompu (-15),
-        # auth inchange, sonde healthy -> la demande ne doit pas etre healthy.
-        self.cli("gh", "printf 'WXYZ-9876 https://github.com/login/device\\n'; sleep 30")
-        sup = self.supervisor(health=lambda request: "healthy", grace=0.2)
+        # Isole la décision avant le refus asynchrone du lecteur ; l'autre
+        # ordre est couvert ci-dessous. Un ancien cache sain ne prouve rien.
+        self.cli("gh", "printf 'WXYZ-9876 https://github.com/login/device\\n'; exec sleep 30")
+        health = mock.Mock(return_value="healthy")
+        sup = self.supervisor(health=health, grace=0.2)
+        self.addCleanup(sup.close)
+        with mock.patch.object(sup, "_settle") as settle:
+            request = self.begin(sup)
+            self.assertTrue(wait_for(lambda: request.state == login.VIEWING))
+            self.spawned[0].terminate()
+            reader = sup._threads[request.id]
+            reader.join(timeout=5)
+            self.assertFalse(reader.is_alive())
+            settle.assert_called_once_with(request, self.spawned[0])
+            self.assertEqual(self.spawned[0].wait(timeout=5), -15)
+            done = sup.finish(request.id, "done")
+        self.assertEqual((done.state, done.category), (login.DONE, "provider_refused"))
+        health.assert_not_called()
+
+    def test_cli_interrompu_refuse_avant_done_meme_avec_ancien_cache_sain(self):
+        # Le lecteur peut constater le refus avant la décision : finish
+        # rejette alors une demande déjà close, sans sonder l'ancien cache.
+        self.cli("gh", "printf 'WXYZ-9876 https://github.com/login/device\\n'; exec sleep 30")
+        health = mock.Mock(return_value="healthy")
+        sup = self.supervisor(health=health, grace=0.2)
+        self.addCleanup(sup.close)
         request = self.begin(sup)
         self.assertTrue(wait_for(lambda: request.state == login.VIEWING))
         self.spawned[0].terminate()
-        self.assertTrue(wait_for(lambda: self.spawned[0].poll() is not None))
-        done = sup.finish(request.id, "done")
-        self.assertEqual((done.state, done.category), (login.DONE, "provider_refused"))
+        reader = sup._threads[request.id]
+        reader.join(timeout=5)
+        self.assertFalse(reader.is_alive())
+        self.assertEqual(self.spawned[0].wait(timeout=5), -15)
+        self.assertEqual((request.state, request.category), (login.FAILED, "provider_refused"))
+        with self.assertRaises(login.LoginError) as caught:
+            sup.finish(request.id, "done")
+        self.assertEqual(caught.exception.category, "provider_refused")
+        health.assert_not_called()
 
     def test_un_processus_qui_ignore_sigterm_est_tue(self):
         self.cli("gh", "printf 'WXYZ-9876 https://github.com/login/device\\n'; "
@@ -564,6 +593,7 @@ class SupervisorClosureRaceTest(unittest.TestCase):
         self.assertEqual(invalidated, [remote_id])
         self.assertEqual(request.link, "")
 
+    @unittest.skipUnless(login.PEEK_EXIT, "requires waitid(WNOWAIT); fallback tested below")
     def test_done_nettoie_le_groupe_apres_sortie_reussie_du_chef(self):
         sup = login.Supervisor(health=lambda _request: "healthy", grace=0)
         request = sup.registry.open(host="h", harness="gh", account="a")

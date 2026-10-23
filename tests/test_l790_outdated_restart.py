@@ -152,9 +152,15 @@ class NoClaimAfterStaleTest(unittest.TestCase):
         )
         fake._gate_settled.set()
         fake.expire_delegations_once = lambda: None
+        # L165 (EP2) : `sweep` publie aussi les scores de rôles de l'hôte ;
+        # cette doublure n'a ni horloge ni registre, comme pour #508.
+        fake.role_evaluation_once = lambda: None
         # #508 : `sweep` publie la preuve de vie avant la moisson ; ce témoin
         # L790 n'a ni horloge ni registre, la doublure la neutralise.
         fake.report_liveness = lambda *args, **kwargs: None
+        # #3070 : `sweep` lève les portes d'appareil restées fermées ; cette
+        # doublure n'a ni porte ni horloge, la passe est neutralisée.
+        fake.lift_device_gates_once = lambda: None
         # L85 (#373) : `sweep` prune le journal d'événements après la moisson
         # des baux — la doublure doit fournir le point d'entrée, borné ici.
         fake.prune_events_once = lambda *args, **kwargs: None
@@ -188,6 +194,8 @@ class SelectedTurnRefusedTest(unittest.TestCase):
             runner=runner, db=object(), name="perime", epoch=1, fast_failure=True,
             _attach_pending=lambda: False, _session_lock=mock.Mock(),
             resident=object(), state_dir=state_dir.name,
+            # #2810 : l'enveloppe efface les messages servis à la fin du tour.
+            _servir=mock.Mock(),
             # #2096 : `run_turn` rend la mémoire du tour dans son `finally` ;
             # la doublure n'a pas d'allocateur, le rappel est inerte.
             _release_turn_memory=lambda *a, **k: None)
@@ -204,6 +212,7 @@ class SelectedTurnRefusedTest(unittest.TestCase):
         restore.assert_called_once_with(worker.db, "perime", "runner-1", 1)
         self.assertEqual(set_status.call_args[0][:3], (worker.db, "perime", "queued"))
         self.assertFalse(worker.fast_failure)
+        worker._servir.assert_called_once_with(())
 
 
 class RestartExitTest(unittest.TestCase):

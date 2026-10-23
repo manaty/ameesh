@@ -20,6 +20,7 @@ from unittest import mock
 
 from ameesh import merge_pr, merge_queue, radar, work
 
+from .support import patch_families
 from .test_l160b_radar import _git, git_env
 
 
@@ -74,6 +75,8 @@ class _Base(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="ameesh-1003-test-")
         self.addCleanup(shutil.rmtree, self.tmp, True)
+        # #2664 : banc sans canon ; familles compilées épinglées.
+        patch_families(self)
         self.repo = os.path.join(self.tmp, "repo")
         os.makedirs(self.repo)
         _git(self.repo, "init", "-q")
@@ -123,8 +126,32 @@ class _Base(unittest.TestCase):
                 mock.patch.object(work, "note", side_effect=self._note),
                 mock.patch.object(work, "events", side_effect=self._events),
                 mock.patch.object(merge_queue, "actor_family",
-                                  side_effect=lambda db, n: self.FAMILIES.get(
-                                      str(n or "").strip(), ""))):
+                                  side_effect=lambda db, n, **_: self.FAMILIES.get(
+                                      str(n or "").strip(), "")),
+                # #1515/#2739/#2726 : `db` est un factice sans stockage, et
+                # ce dépôt de banc n'a pas de provenance d'agent : la lecture
+                # de plage de la porte échouerait en échec fermé. Ces témoins
+                # portent sur les gardes de `merge_pr`, pas sur les auteurs/
+                # correcteurs ; l'échec fermé garde ses témoins dédiés
+                # (test_1374_fire, test_2739_review_correction).
+                # #2808 : None = plage non lue ; (None, []) serait une lecture
+                # vide, qui ne prouve plus le titulaire auteur.
+                # #1515/cx2 : la liste rendue est **complète**
+                # (`authors_complete=True`) : elle nomme l'assigné, sinon la
+                # porte conclut qu'il n'a rien écrit et refuse faute de famille.
+                mock.patch.object(merge_queue, "_complete_authors",
+                                  side_effect=lambda db, item, *a, **kw: (
+                                      [{"name": item.get("assignee"),
+                                        "family": self.FAMILIES.get(
+                                            str(item.get("assignee") or ""), "")}],
+                                      ())),
+                mock.patch.object(merge_queue, "_attribution_on_freeze",
+                                  return_value=None),
+                # #2928 : en classe sensible, un verdict ne compte que sur son
+                # reçu exact. Ce banc simule tout le stockage (pas de base
+                # réelle) : les avis de `ready_marks` portent leur reçu.
+                mock.patch.object(merge_queue, "_exact_verdict_receipt",
+                                  side_effect=self._verdict_receipt)):
             patch.start()
             self.addCleanup(patch.stop)
 
@@ -134,6 +161,18 @@ class _Base(unittest.TestCase):
 
     def _events(self, db, item_id, limit=100):
         return list(reversed(self.journal))
+
+    def _verdict_receipt(self, db, mark):
+        """#2928 : le reçu exact synthétique d'un avis de `ready_marks`."""
+        marker = int((mark or {}).get("id") or 0)
+        for known in self.lot_marks:
+            if int(known.get("id") or 0) != marker:
+                continue
+            actor = str(known.get("actor") or "")
+            return {"subject": "milestone:%d" % marker, "actor": actor,
+                    "session": "s-" + self.FAMILIES.get(actor, ""),
+                    "turn": "t", "harness": self.FAMILIES.get(actor, "")}
+        return None
 
     def _lot_row(self, db, lot, *a, **kw):
         row = {"id": int(lot), "state": "build", "branch": self.lot_branch,
@@ -326,6 +365,48 @@ class GuardTest(_Base):
             self.merge(gh)
         self.assertIn("head moved", str(caught.exception))
         self.assertEqual(self.tip(), self.base)
+
+    def test_a_base_already_merged_into_the_default_is_refused(self):
+        """#2603 : canon/2452 est déjà un ancêtre de main ; fusionner une PR
+        qui la vise poserait son contenu sur une branche morte (home#112/#113
+        après la fusion de canon/2452)."""
+        _git(self.origin, "branch", "canon/2452", self.base)
+        before = self.tip()
+        with self.assertRaises(merge_pr.MergePrError) as caught:
+            self.merge(self.gh(baseRefName="canon/2452"), target="canon/2452")
+        message = str(caught.exception)
+        self.assertIn("already merged into main", message)
+        self.assertIn("gh pr edit --base main", message)
+        self.assertEqual(self.tip(), before)
+        self.assertEqual(self.tip("canon/2452"), self.base)
+
+    def test_an_unreadable_ancestry_comparison_is_refused(self):
+        from ameesh import plan_git
+        with mock.patch.object(plan_git, "default_target", return_value="main"), \
+                mock.patch.object(merge_pr, "_run", side_effect=[
+                    subprocess.CompletedProcess(["git"], 0, "", ""),
+                    subprocess.CompletedProcess(["git"], 128, "", "bad object")]):
+            with self.assertRaisesRegex(merge_pr.MergePrError, "comparison.*unreadable"):
+                merge_pr._stacked_base_guard(self.repo, "unused", self.repo,
+                    {"number": 7, "baseRefName": "canon/2452"}, "canon/2452")
+
+    def test_a_work_branch_not_yet_merged_is_not_refused(self):
+        """#2603 : la garde ne vise que la base morte ; une branche de travail
+        absente de la cible par défaut reste une base de fusion légitime."""
+        first = self.head
+        _write(self.repo, ".github/workflows/ci.yml",
+               "on: push\njobs:\n  t:\n    steps: []\n# stack\n")
+        _git(self.repo, "add", "-A")
+        _git(self.repo, "commit", "-q", "-m", "stack")
+        self.head = _git(self.repo, "rev-parse", "HEAD")
+        _git(self.repo, "push", "-q", "origin", "lot/7-work")
+        _git(self.origin, "update-ref", "refs/pull/7/head", self.head)
+        _git(self.origin, "branch", "canon/2453", first)
+        self.ready_marks(self.head)
+        self.lot_target = "canon/2453"
+        out = self.merge(self.gh(baseRefName="canon/2453"), target="canon/2453",
+                         dry_run=True)
+        self.assertEqual(out["state"], "dry-run", out)
 
     def test_a_pr_without_workflow_is_refused(self):
         # une tête qui ne touche pas .github/workflows/** : une branche montée

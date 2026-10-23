@@ -17,11 +17,15 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 import uuid
+from unittest import mock
 
 from ameesh import config as config_mod
 from ameesh import db as db_mod
 from ameesh import migrations
+from ameesh import work as work_mod
+from ameesh.platform import SYSTEM as PLATFORM_SYSTEM
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SRC = os.path.join(REPO, "src")
@@ -305,6 +309,57 @@ def child_env(**extra: str) -> dict:
     return env
 
 
+#: L66/#3131 : la route de notification de bureau de CET OS. Un banc qui
+#: remplace le backend pose les DEUX surcharges explicites (la couche
+#: plateforme choisit selon `SYSTEM`) et ses assertions suivent cette route :
+#: sous Linux `notify-send`, sous macOS `osascript`.
+DESKTOP_MACOS = PLATFORM_SYSTEM == "macos"
+DESKTOP_VAR = "AMEESH_OSASCRIPT_BIN" if DESKTOP_MACOS else "AMEESH_NOTIFY_SEND_BIN"
+DESKTOP_BACKEND = "osascript" if DESKTOP_MACOS else "notify-send"
+DESKTOP_MISSING = DESKTOP_BACKEND + " not found"
+
+
+def desktop_backend_env(binary: str, **extra) -> dict:
+    """Environnement d'un faux backend de bureau, pour CET OS.
+
+    Les deux surcharges pointent le même faux binaire : quelle que soit la
+    route choisie par `ameesh.platform`, le banc n'affiche jamais rien et
+    journalise ce qu'il aurait affiché."""
+    env = {"AMEESH_NOTIFY_SEND_BIN": binary, "AMEESH_OSASCRIPT_BIN": binary}
+    env.update({k: str(v) for k, v in extra.items() if v is not None})
+    return env
+
+
+def desktop_received(argv: list) -> tuple:
+    """(titre, corps, urgence) reçus par le faux backend de cet OS.
+
+    Linux : `notify-send --urgency=… -- titre corps`. macOS : `osascript -e
+    'display notification "corps" with title "titre" [sound name "Basso"]'`
+    (pas de niveau d'urgence : le son signale le critique, L66)."""
+    if DESKTOP_MACOS:
+        script = argv[-1]
+        match = re.search(
+            r'display notification ("(?:[^"\\]|\\.)*") with title '
+            r'("(?:[^"\\]|\\.)*")', script)
+        if match is None:
+            raise AssertionError("script AppleScript sans notification : %r" % script)
+        return (_applescript_text(match.group(2)), _applescript_text(match.group(1)),
+                "critical" if 'sound name "Basso"' in script else "normal")
+    urgency = "normal"
+    for argument in argv:
+        if argument.startswith("--urgency="):
+            urgency = argument.split("=", 1)[1]
+    return argv[-2], argv[-1], urgency
+
+
+def _applescript_text(quoted: str) -> str:
+    """Le texte d'une chaîne AppleScript entre guillemets (cf.
+    `platform.notify._applescript_string`) : `\\`, `"` et les sauts de ligne."""
+    escaped = {"n": "\n", "\\": "\\", '"': '"'}
+    return re.sub(r"\\(.)", lambda m: escaped.get(m.group(1), m.group(1)),
+                  quoted[1:-1])
+
+
 #: L161e : dossier de mesure de la carte test → code (vide : pas de mesure)
 CARTE = os.environ.get("CARTE_MESURE", "")
 
@@ -348,6 +403,39 @@ def noter_tables(cls) -> None:
     except Exception as exc:  # la mesure ne casse jamais un test
         print("carte : tables de %s non relevées (%s)" % (cls.__qualname__, exc),
               file=sys.stderr)
+
+
+#: #2451 : plafond §4 de fixture pour les tests en processus. Le plafond réel
+#: vient du canon compilé (`work.build_limit`) ; sa lecture est couverte par
+#: test_2451_canon_consommateurs, et un test en sous-processus pointe
+#: `AMEESH_CANON` vers `mechanics_canon()`.
+FIXTURE_BUILD_CAP = 2
+
+
+def mechanics_canon(root: str) -> str:
+    """Un canon Git minimal portant `processus/mecanique.yaml` (#2451).
+
+    Le document et la fédération sont ceux de test_l1616_mechanics (plafond 2,
+    familles claude/codex/deepseek) ; `members: []` en fait une racine de
+    canon chargeable par `canon.load_configured` (AMEESH_CANON + _REF=HEAD)."""
+    from .test_l1616_mechanics import FEDERATION, _Repo
+    os.makedirs(root, exist_ok=True)
+    _Repo(root, federation_text=FEDERATION + "members: []\n")
+    return root
+
+
+def patch_families(testcase, families=("claude", "codex", "deepseek")):
+    """Épingle les familles compilées d'un banc sans canon Git (#2664).
+
+    Le lecteur `review_lot.compiled_families` est patché pour la durée du test ;
+    les témoins du lecteur construisent leur propre canon et ne passent pas
+    par ici. Rend le patcheur, déjà arrêté au `cleanup` du test.
+    """
+    patcher = mock.patch("ameesh.review_lot.compiled_families",
+                         return_value=tuple(families))
+    patcher.start()
+    testcase.addCleanup(patcher.stop)
+    return patcher
 
 
 class PgTestCase(unittest.TestCase):
@@ -403,6 +491,9 @@ class PgTestCase(unittest.TestCase):
     # -- utilitaires -------------------------------------------------------
     def setUp(self) -> None:
         """Chaque test part d'une base et d'un disque propres."""
+        cap = mock.patch.object(work_mod, "build_limit", return_value=FIXTURE_BUILD_CAP)
+        cap.start()
+        self.addCleanup(cap.stop)
         self.db.execute(
             "TRUNCATE agent_registry, key_holders, key_events, agent_mailbox, mesh_approvals, "
             "work_items, work_item_events, work_item_milestones, work_packages, "
@@ -412,6 +503,12 @@ class PgTestCase(unittest.TestCase):
         os.makedirs(self.tmp, exist_ok=True)
         for path in (self.state, self.v0state, self.conf):
             os.makedirs(path, exist_ok=True)
+        # #2664 : ces bancs n'ont pas de canon Git configuré ; les familles
+        # compilées y sont épinglées aux trois familles déclarées, comme sur un
+        # hôte équipé. Le lecteur du canon a ses propres témoins, et un test
+        # d'échec fermé défait ce patch localement.
+        patch_families(self)
+
 
     @classmethod
     def env(cls, **extra: str) -> dict:

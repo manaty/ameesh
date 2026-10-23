@@ -59,6 +59,7 @@ from typing import Any, Iterable, Mapping
 from . import harnesses
 from . import review as review_mod
 from .config import NAME_RE
+from .deadline import Deadline
 
 try:  # facultatif : jamais requis
     import yaml as _yaml  # type: ignore
@@ -72,6 +73,9 @@ PROFILE_TYPES = ("Agent", "Persona", "Host", "Placement", "Member", "WorkPackage
                  "Process")
 #: #538 : une fiche Process (`processus/*.md`) porte les règles de travail.
 PROCESS_TYPE = "Process"
+#: #3070 (canon §12) : clés d'une fiche Host déclarant l'appareil indisponible
+UNAVAILABLE_UNTIL_KEY = "indisponible_jusqu_au"
+UNAVAILABLE_REASON_KEY = "indisponible_motif"
 #: #538 : dossier du canon où vivent les fiches Process ; un `type: Process`
 #: posé ailleurs n'est pas une règle de travail et n'est jamais injecté.
 PROCESS_DIR = "processus"
@@ -86,12 +90,12 @@ PROCESS_BODY_MAX = 6000
 #: carte, par le même responsable).
 PROCESS_PROJECTION_START = "<!-- projection courte : début -->"
 PROCESS_PROJECTION_END = "<!-- projection courte : fin -->"
-#: #1372 : budget d'une projection (octets UTF-8). La part de règles d'un brief
-#: est GARANTIE à ≈ 11 900 octets (`BRIEF_MAX_BYTES` 16 000, moins la part texte
-#: réservée 4 000 et l'en-tête/le pied du bloc, 80) : 11 600 gardent la marge du
-#: bloc (diagnostics, autre fiche courte). Une projection au-delà est signalée
-#: et coupée à ce budget, jamais silencieusement.
-PROCESS_PROJECTION_MAX = 11600
+#: #1372, #3126 : budget d'une projection (octets UTF-8). `BRIEF_MAX_BYTES`
+#: 19 000 - réserve texte 4 000 - en-tête/pied 80 - marge du bloc 320 = 14 600.
+#: La marge garde la place des diagnostics et d'une autre fiche courte. Une
+#: projection au-delà est signalée et coupée à ce budget, jamais silencieusement ;
+#: dès 90 % du budget, `canon check` prévient avant la coupe.
+PROCESS_PROJECTION_MAX = 14600
 #: les sortes de fiches WorkPackage (plan de travail, L29) et les parents admis
 PACKAGE_KINDS = ("milestone", "epic", "lot")
 #: L96 : dates d'une fiche WorkPackage (`date` = date d'un jalon, alias de `delivery`)
@@ -771,6 +775,7 @@ class Finding:
     member: str = ""        # membre de la fédération
     agent: str = ""         # agent concerné (une erreur bloque cet agent)
     host: str = ""          # hôte concerné (une erreur bloque ses agents)
+    candidate: str = ""     # L165 : agent élu, sur CET hôte candidat seulement
     untrusted: bool = False  # lu hors source approuvée
     package: str = ""       # fiche WorkPackage concernée (ne bloque aucun agent)
     process: str = ""       # fiche Process concernée (ne bloque aucun agent)
@@ -782,6 +787,8 @@ class Finding:
             out["agent"] = self.agent
         if self.host:
             out["host"] = self.host
+        if self.candidate:
+            out["candidate"] = self.candidate
         if self.package:
             out["package"] = self.package
         if self.process:
@@ -846,6 +853,10 @@ class Member:
     #: references use `human:<id>`.
     deputies: list[str] | None = None
     superiors: list[str] | None = None
+    #: L77 (#286): local `user@host` accounts that prove this human on a host.
+    #: The declaration bounds the claim to this machine and this Unix user
+    #: (decision 0033 §9; OIDC is the v2 path, absent in v1).
+    local_accounts: list[str] | None = None
 
 
 @dataclass
@@ -881,6 +892,13 @@ class Agent:
     projects: list[str] | None = None
     #: L243b: alternative spellings of this identity, not new agents.
     aliases: list[str] | None = None
+    #: L165 (EP1): how the role is held. `hote` (default) pins the agent to
+    #: its placement host; `election` lets any candidate host claim the lease.
+    releve: str = "hote"
+    #: L165 (EP1): candidate hosts of an elected role. Every one is admitted
+    #: by the agent's Placement card, so a claim can only happen on a host
+    #: whose current placement verdict admits the agent.
+    candidats: list[str] | None = None
 
     @property
     def is_persona(self) -> bool:
@@ -903,10 +921,12 @@ class HostPolicy:
     max_agents: int | None = None
     #: seuils de ressources de l'hôte (L31, 0028) : mapping
     #: `{min_mem_available, max_swap_used, max_load, min_disk_free}`, plus la
-    #: pression (L159d/#2296) `{max_cpu_pressure, max_mem_pressure}`,
-    #: l'alimentation (L106) `{min_battery_percent, stop_battery_percent}` et
-    #: btrfs (#246) `{min_btrfs_unallocated, min_btrfs_metadata_headroom}` ; None =
-    #: valeurs par défaut prudentes (`ameesh.resources`).
+    #: pression (L159d/#2296) `{max_cpu_pressure, max_mem_pressure}`, le
+    #: périmètre et les plafonds du cgroup (#2814) `{pressure_scope,
+    #: max_cgroup_memory_used, max_cgroup_throttled}`, l'alimentation (L106)
+    #: `{min_battery_percent, stop_battery_percent}` et btrfs (#246)
+    #: `{min_btrfs_unallocated, min_btrfs_metadata_headroom}` ; None = valeurs
+    #: par défaut prudentes (`ameesh.resources`).
     resources: dict | None = None
     #: racine de travail par projet (L31, 0029) : `work_roots[projet]` sinon
     #: `work_root/<projet>` ; remplace le `cwd` d'une admission. None = pas de
@@ -1035,6 +1055,24 @@ class Host:
     #: responsable et des admins — seules les personas lisibles par eux
     #: partent sur la machine (défaut sûr : rien n'est supposé de plus).
     occupants: list[str] | None = None
+    #: #3070 (canon §12) : l'appareil est déclaré indisponible jusqu'à ce
+    #: jour ISO inclus (`indisponible_jusqu_au`), avec son motif
+    #: (`indisponible_motif`). Une séance qui l'attend ne retarde rien
+    #: (`device_gates`) ; passé ce jour, la déclaration cesse d'elle-même.
+    unavailable_until: str | None = None
+    unavailable_reason: str | None = None
+
+    def unavailable_end(self) -> float | None:
+        """Fin de l'indisponibilité (minuit local du lendemain), ou None."""
+        if not self.unavailable_until:
+            return None
+        day = _dt.date.fromisoformat(self.unavailable_until) + _dt.timedelta(days=1)
+        return float(_dt.datetime.combine(day, _dt.time()).timestamp())
+
+    def unavailable_at(self, now: float) -> bool:
+        """L'appareil est-il indisponible à l'instant `now` (epoch) ?"""
+        end = self.unavailable_end()
+        return end is not None and float(now) < end
 
 
 @dataclass
@@ -1318,10 +1356,13 @@ class Canon:
             "untrusted": self.untrusted,
             "sources": [s.to_dict() for s in self.sources],
             "members": [dict(title=m.title, roles=m.roles, deputies=m.deputies,
-                             superiors=m.superiors, **fiche(m.fiche))
+                             superiors=m.superiors,
+                             local_accounts=m.local_accounts, **fiche(m.fiche))
                         for m in self.members],
             "hosts": [dict(title=h.title, responsible=h.responsible, tags=h.tags,
                            admins=h.admins, occupants=h.occupants,
+                           unavailable_until=h.unavailable_until,
+                           unavailable_reason=h.unavailable_reason,
                            policy=h.policy.__dict__.copy(), **fiche(h.fiche))
                       for h in self.hosts],
             "agents": [dict(title=a.title, aliases=a.aliases or [], type=a.fiche.type, responsible=a.responsible, team=a.team,
@@ -1425,6 +1466,17 @@ class GitError(RuntimeError):
     pass
 
 
+class GitDeadline(RuntimeError):
+    """#2665 : l'échéance monotone d'une découverte de canon est épuisée.
+
+    Volontairement **pas** une sous-classe de `GitError` : les lecteurs du
+    canon convertissent un `GitError` en constat (`canon-git-error`,
+    `readable = False`) et continueraient leur découverte. Une échéance
+    épuisée n'est pas un canon illisible : elle remonte jusqu'à l'appelant
+    borné, qui la dit `run-incomplete`, jamais « canon sans bloc ».
+    """
+
+
 def _git_env() -> dict:
     env = {k: v for k, v in os.environ.items()
            if k not in _GIT_ENV_DROP and not k.startswith(("GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_"))}
@@ -1444,8 +1496,19 @@ NO_LAZY_FETCH = {"GIT_NO_LAZY_FETCH": "1"}
 
 def _git(repo: str, *args: str, stdin: bytes | None = None,
          timeout: float = GIT_TIMEOUT, env_extra: dict | None = None,
+         deadline: Deadline | None = None,
          ) -> subprocess.CompletedProcess:
-    """git sans crochets, sans fsmonitor, sans objets de remplacement, sans pager."""
+    """git sans crochets, sans fsmonitor, sans objets de remplacement, sans pager.
+
+    Avec ``deadline`` (#2665), la commande ne prend que le temps qui reste et
+    une échéance épuisée lève `GitDeadline` : la découverte bornée s'arrête,
+    elle ne se lit pas comme un canon illisible.
+    """
+    if deadline is not None:
+        if deadline.expired():
+            raise GitDeadline("git %s: canon deadline exhausted"
+                              % (args[0] if args else "?"))
+        timeout = deadline.timeout(timeout)
     cmd = ["git", "--no-pager", "--no-replace-objects", "--literal-pathspecs",
            "-c", "core.fsmonitor=false", "-c", "core.hooksPath=%s" % os.devnull,
            *args]
@@ -1464,6 +1527,8 @@ def _git(repo: str, *args: str, stdin: bytes | None = None,
                            % (args[0] if args else "?", repo)) from exc
         raise GitError("git not found") from exc
     except subprocess.TimeoutExpired as exc:
+        if deadline is not None and deadline.expired():
+            raise GitDeadline("git %s: canon deadline exhausted" % args[0]) from exc
         raise GitError("git %s: timed out" % args[0]) from exc
     except OSError as exc:
         # Dossier du dépôt inaccessible (permission refusée, n'est plus un
@@ -1472,8 +1537,9 @@ def _git(repo: str, *args: str, stdin: bytes | None = None,
         raise GitError("git %s: %s" % (args[0], exc.strerror or exc)) from exc
 
 
-def _git_out(repo: str, *args: str) -> str | None:
-    proc = _git(repo, *args)
+def _git_out(repo: str, *args: str, timeout: float = GIT_TIMEOUT,
+             deadline: Deadline | None = None) -> str | None:
+    proc = _git(repo, *args, timeout=timeout, deadline=deadline)
     if proc.returncode != 0:
         return None
     return proc.stdout.decode("utf-8", "replace").strip()
@@ -1604,20 +1670,23 @@ def git_range_paths(repo: str, base: str, head: str) -> list[str]:
     return sorted(_diff_name_status(repo, start, verified_head))
 
 
-def git_toplevel(directory: str) -> str | None:
+def git_toplevel(directory: str, *, timeout: float = GIT_TIMEOUT,
+                 deadline: Deadline | None = None) -> str | None:
     """Racine du dépôt git qui contient `directory`, ou None."""
     try:
-        out = _git_out(directory, "rev-parse", "--show-toplevel")
+        out = _git_out(directory, "rev-parse", "--show-toplevel",
+                       timeout=timeout, deadline=deadline)
     except GitError:
         return None
     return os.path.realpath(out) if out else None
 
 
-def git_commit(repo: str, rev: str) -> str | None:
+def git_commit(repo: str, rev: str, *, timeout: float = GIT_TIMEOUT,
+               deadline: Deadline | None = None) -> str | None:
     if not rev or rev.startswith("-"):
         return None
     return _git_out(repo, "rev-parse", "--verify", "--quiet", "--end-of-options",
-                    rev + "^{commit}")
+                    rev + "^{commit}", timeout=timeout, deadline=deadline)
 
 
 _SHA_RE = re.compile(r"^([0-9a-f]{40}|[0-9a-f]{64})$")
@@ -1662,12 +1731,14 @@ def git_fast_forward(repo: str, commit: str) -> str:
     return ""
 
 
-def _git_list(repo: str, commit: str, prefix: str) -> list[tuple[str, str]]:
+def _git_list(repo: str, commit: str, prefix: str, *,
+              timeout: float = GIT_TIMEOUT,
+              deadline: Deadline | None = None) -> list[tuple[str, str]]:
     """[(chemin dans le dépôt, sha du blob)] des fichiers ordinaires sous `prefix`."""
     args = ["ls-tree", "-r", "-z", "--full-tree", commit]
     if prefix:
         args += ["--", prefix]
-    proc = _git(repo, *args)
+    proc = _git(repo, *args, timeout=timeout, deadline=deadline)
     if proc.returncode != 0:
         raise GitError("git ls-tree: %s" % proc.stderr.decode("utf-8", "replace").strip())
     out = []
@@ -1682,11 +1753,14 @@ def _git_list(repo: str, commit: str, prefix: str) -> list[tuple[str, str]]:
     return out
 
 
-def _git_blobs(repo: str, shas: Iterable[str]) -> dict[str, bytes]:
+def _git_blobs(repo: str, shas: Iterable[str], *,
+               timeout: float = GIT_TIMEOUT,
+               deadline: Deadline | None = None) -> dict[str, bytes]:
     shas = list(dict.fromkeys(shas))
     if not shas:
         return {}
-    proc = _git(repo, "cat-file", "--batch", stdin=("\n".join(shas) + "\n").encode())
+    proc = _git(repo, "cat-file", "--batch", stdin=("\n".join(shas) + "\n").encode(),
+                timeout=timeout, deadline=deadline)
     if proc.returncode != 0:
         raise GitError("git cat-file: %s" % proc.stderr.decode("utf-8", "replace").strip())
     data = proc.stdout
@@ -1707,17 +1781,22 @@ def _git_blobs(repo: str, shas: Iterable[str]) -> dict[str, bytes]:
     return out
 
 
-def _git_read(repo: str, commit: str, path: str) -> bytes | None:
-    proc = _git(repo, "cat-file", "blob", "%s:%s" % (commit, path))
+def _git_read(repo: str, commit: str, path: str, *,
+              timeout: float = GIT_TIMEOUT,
+              deadline: Deadline | None = None) -> bytes | None:
+    proc = _git(repo, "cat-file", "blob", "%s:%s" % (commit, path),
+                timeout=timeout, deadline=deadline)
     return proc.stdout if proc.returncode == 0 else None
 
 
-def git_read(repo: str, commit: str, path: str) -> bytes | None:
+def git_read(repo: str, commit: str, path: str, *,
+             timeout: float = GIT_TIMEOUT,
+             deadline: Deadline | None = None) -> bytes | None:
     """Contenu de `path` au commit `commit` (objets git), ou None."""
     if not _SHA_RE.fullmatch(commit or ""):
         return None
     try:
-        return _git_read(repo, commit, path)
+        return _git_read(repo, commit, path, timeout=timeout, deadline=deadline)
     except GitError:
         return None
 
@@ -1759,8 +1838,9 @@ def remote_branch(repo: str, name: str) -> str | None:
     return short
 
 
-def _remote_of(repo: str, rev: str) -> str:
-    remotes = (_git_out(repo, "remote") or "").split()
+def _remote_of(repo: str, rev: str, *, timeout: float = GIT_TIMEOUT,
+               deadline: Deadline | None = None) -> str:
+    remotes = (_git_out(repo, "remote", timeout=timeout, deadline=deadline) or "").split()
     head = rev.split("/", 1)[0]
     return head if head in remotes else DEFAULT_REMOTE
 
@@ -1780,10 +1860,12 @@ def _norm_url(url: str) -> str:
     return text.lower()
 
 
-def git_fetch(repo: str, remote: str) -> str:
+def git_fetch(repo: str, remote: str, *, timeout: float = FETCH_TIMEOUT,
+              deadline: Deadline | None = None) -> str:
     """`git fetch` sans crochets ; renvoie '' ou le message d'erreur."""
     try:
-        proc = _git(repo, "fetch", "--quiet", "--no-tags", "--", remote, timeout=FETCH_TIMEOUT)
+        proc = _git(repo, "fetch", "--quiet", "--no-tags", "--", remote,
+                    timeout=timeout, deadline=deadline)
     except GitError as exc:
         return str(exc)
     if proc.returncode != 0:
@@ -1835,6 +1917,25 @@ def parse_scope(value: Any) -> tuple[list[str] | None, str | None]:
         if norm not in out:
             out.append(norm)
     return out, None
+
+
+def process_path_ok(relpath: str, scope: Iterable[str] | None = None) -> bool:
+    """#538, #2973 : le chemin (relatif au bundle) d'une fiche Process est-il
+    celui d'une règle ? `processus/…` à la racine du bundle, ou
+    `<dossier>/processus/…` quand `<dossier>` est un dossier déclaré du
+    périmètre ameesh du membre (la fédération roote le membre à `.` et lit le
+    périmètre comme un filtre) ; jamais un autre dossier."""
+    chemin = relpath.replace("\\", "/").split("/")
+    if len(chemin) >= 2 and chemin[0] == PROCESS_DIR:
+        return True
+    for dossier in scope or ():
+        if not dossier:
+            continue                # `.` : la racine, déjà jugée
+        parts = dossier.split("/")
+        reste = chemin[len(parts):]
+        if chemin[:len(parts)] == parts and len(reste) >= 2 and reste[0] == PROCESS_DIR:
+            return True
+    return False
 
 
 def in_scope(relpath: str, scope: Iterable[str] | None) -> bool:
@@ -2116,12 +2217,16 @@ def _interesting(relpath: str) -> bool:
 
 class _Loader:
     def __init__(self, root: str, *, ref: str, untrusted: bool, fetch: bool,
-                 use_pyyaml: bool | None, default: bool = True):
+                 use_pyyaml: bool | None, default: bool = True,
+                 deadline: Deadline | None = None):
         self.root = os.path.abspath(os.path.expanduser(root))
         self.ref = ref
         self.allow_untrusted = untrusted
         self.fetch = fetch
         self.use_pyyaml = use_pyyaml
+        #: #2665 : échéance d'une découverte bornée (prévalidation du train) ;
+        #: chaque lecture git de ce chargeur ne prend que le temps qui reste.
+        self.deadline = deadline
         self.canon = Canon(root=self.root, is_default=default, rev=ref)
         _identify(self.canon, None)     # repli tant que le manifeste n'est pas lu
         self.fetched: set[str] = set()
@@ -2135,12 +2240,13 @@ class _Loader:
                     explicit: bool) -> Source | None:
         if self.fetch and repo not in self.fetched:
             self.fetched.add(repo)
-            error = git_fetch(repo, _remote_of(repo, rev))
+            error = git_fetch(repo, _remote_of(repo, rev, deadline=self.deadline),
+                              deadline=self.deadline)
             if error:
                 self.add("canon-fetch-failed", WARNING,
                          "git fetch failed (%s): reading the last known revision"
                          % error.splitlines()[0][:200], member=member)
-        commit = git_commit(repo, rev)
+        commit = git_commit(repo, rev, deadline=self.deadline)
         if not commit:
             self.add("canon-ref-missing", ERROR,
                      "canonical revision %s not found in %s (git fetch? %s)"
@@ -2157,14 +2263,14 @@ class _Loader:
 
     def _local_state(self, source: Source) -> None:
         """Signale (sans jamais en tenir compte) l'écart entre le clone et le canon."""
-        head = git_commit(source.repo, "HEAD")
+        head = git_commit(source.repo, "HEAD", deadline=self.deadline)
         if head and head != source.commit:
             self.add("canon-local-divergence", WARNING,
                      "the local clone (HEAD %s) differs from %s (%s): only %s is read"
                      % (head[:12], source.rev, source.commit[:12], source.commit[:12]),
                      member=source.member, path=source.prefix)
         args = ["status", "--porcelain", "--untracked-files=normal", "--", source.prefix or "."]
-        proc = _git(source.repo, *args)
+        proc = _git(source.repo, *args, deadline=self.deadline)
         if proc.returncode == 0 and proc.stdout.strip():
             self.add("canon-worktree-dirty", WARNING,
                      "uncommitted local changes under %s: ignored (only %s is read)"
@@ -2186,7 +2292,7 @@ class _Loader:
     def _source(self, member: str, directory: str, rev: str, explicit: bool,
                 same_repo_commit: tuple[str, str, str] | None = None) -> Source | None:
         try:
-            repo = git_toplevel(directory)
+            repo = git_toplevel(directory, deadline=self.deadline)
         except GitError:
             repo = None
         if repo is None:
@@ -2209,7 +2315,8 @@ class _Loader:
         if source.mode != "git" or not declared:
             return
         remote = source.rev.split("/", 1)[0] if "/" in source.rev else DEFAULT_REMOTE
-        actual = _git_out(source.repo, "remote", "get-url", "--", remote) or ""
+        actual = _git_out(source.repo, "remote", "get-url", "--", remote,
+                          deadline=self.deadline) or ""
         if _norm_url(actual) != _norm_url(declared):
             self.add("member-repository-mismatch", WARNING,
                      "remote %s of %s (%s) is not the one in the manifest (%s)"
@@ -2219,7 +2326,8 @@ class _Loader:
     def _read_manifest(self, source: Source) -> bytes | None:
         if source.mode == "git":
             path = (source.prefix + "/" if source.prefix else "") + "federation.yaml"
-            return _git_read(source.repo, source.commit, path)
+            return _git_read(source.repo, source.commit, path,
+                             deadline=self.deadline)
         path = os.path.join(source.directory, "federation.yaml")
         if os.path.isfile(path) and not os.path.islink(path):
             with open(path, "rb") as fh:
@@ -2243,19 +2351,19 @@ class _Loader:
     # -- chargement --------------------------------------------------------------
     def _bootstrap_rev(self) -> str:
         """Révision où lire le manifeste quand AMEESH_CANON_REF n'est pas posé."""
-        repo = git_toplevel(self.root)
+        repo = git_toplevel(self.root, deadline=self.deadline)
         default = "%s/%s" % (DEFAULT_REMOTE, DEFAULT_BRANCH)
         if repo is None:
             return default
         if self.fetch and repo not in self.fetched:
             self.fetched.add(repo)
-            error = git_fetch(repo, DEFAULT_REMOTE)
+            error = git_fetch(repo, DEFAULT_REMOTE, deadline=self.deadline)
             if error:
                 self.add("canon-fetch-failed", WARNING,
                          "git fetch failed (%s): reading the last known revision"
                          % error.splitlines()[0][:200], member="canon")
         for rev in (default, "%s/HEAD" % DEFAULT_REMOTE):
-            if git_commit(repo, rev):
+            if git_commit(repo, rev, deadline=self.deadline):
                 return rev
         return default
 
@@ -2510,7 +2618,8 @@ class _Loader:
                       and s.prefix != source.prefix
                       and (not source.prefix or s.prefix.startswith(source.prefix + "/"))]
             entries = []
-            listed = _git_list(source.repo, source.commit, source.prefix)
+            listed = _git_list(source.repo, source.commit, source.prefix,
+                               deadline=self.deadline)
             if not listed:
                 self.add("canon-bundle-missing", ERROR,
                          "%s missing from %s (%s): nothing to read" % (
@@ -2526,7 +2635,8 @@ class _Loader:
                 if any(path == n or path.startswith(n + "/") for n in nested):
                     continue
                 entries.append((path, rel, sha))
-            blobs = _git_blobs(source.repo, [sha for _p, _r, sha in entries])
+            blobs = _git_blobs(source.repo, [sha for _p, _r, sha in entries],
+                               deadline=self.deadline)
             return [(path, rel, blobs.get(sha), source.commit) for path, rel, sha in entries]
         if self._scope_missing(source, [
                 s for s in self.canon.scopes.get(source.member) or []
@@ -2660,7 +2770,9 @@ class _Loader:
             authenticators=authenticators if isinstance(authenticators, list) else None,
             fiche=fiche,
             deputies=self._list(fiche, "deputies", where, "member-deputies-invalid"),
-            superiors=self._list(fiche, "superiors", where, "member-superiors-invalid")))
+            superiors=self._list(fiche, "superiors", where, "member-superiors-invalid"),
+            local_accounts=self._list(fiche, "local_accounts", where,
+                                      "member-local-accounts-invalid")))
 
     def _roles(self, fiche: Fiche, where: dict, subject: dict) -> list[str] | None:
         """L244 (#420) : les rôles déclarés d'une fiche Agent/Persona.
@@ -2740,6 +2852,23 @@ class _Loader:
             agent_aliases = []
         else:
             agent_aliases = list(alias_value or [])
+        # L165 (EP1) : `releve: hote` (défaut) ou `election` ; les candidats
+        # sont les hôtes qui peuvent prendre le bail, tous admis par la fiche
+        # Placement (contrôlé par `validate`, qui connaît les hôtes).
+        releve = (_text(fiche.data.get("releve")) or "hote").strip().lower()
+        if releve not in ("hote", "election"):
+            # Valeur illisible : repli sur `election` (fail closed). Un repli
+            # sur `hote` rouvrirait la ligne sur l'hôte courant, alors que la
+            # fiche est fautive ; `election` exige un verdict candidat, que la
+            # fiche en erreur ferme partout.
+            self.add("agent-releve-invalid", ERROR,
+                     "`releve`: `hote` or `election` expected, not %r "
+                     "(treated as `election`, not claimable)"
+                     % fiche.data.get("releve"), **where, **subject)
+            releve = "election"
+        candidats = self._list(fiche, "candidats", where, "agent-candidats-invalid", **subject)
+        if candidats is not None:
+            candidats = list(dict.fromkeys(c for c in candidats if c))
         self.canon.agents.append(Agent(
             title=fiche.title,
             responsible=_text(fiche.data.get("responsible")),
@@ -2760,6 +2889,8 @@ class _Loader:
             roles=self._roles(fiche, where, subject),
             projects=projects,
             aliases=agent_aliases,
+            releve=releve,
+            candidats=candidats,
         ))
 
     def _build_persona(self, fiche: Fiche, where: dict) -> None:
@@ -2888,10 +3019,47 @@ class _Loader:
         tags = self._list(fiche, "tags", where, "host-tags-invalid", **subject)
         admins = self._list(fiche, "admins", where, "host-admins-invalid", **subject)
         occupants = self._list(fiche, "occupants", where, "host-occupants-invalid", **subject)
+        until, reason = self._host_unavailability(fiche, where, subject)
         self.canon.hosts.append(Host(title=fiche.title,
                                      responsible=_text(fiche.data.get("responsible")),
                                      policy=policy, tags=tags, admins=admins,
-                                     occupants=occupants, fiche=fiche))
+                                     occupants=occupants, fiche=fiche,
+                                     unavailable_until=until, unavailable_reason=reason))
+
+    def _host_unavailability(self, fiche: Fiche, where: dict,
+                             subject: dict) -> tuple[str | None, str | None]:
+        """#3070 : `indisponible_jusqu_au` (jour ISO) et `indisponible_motif`.
+
+        Une date illisible est une erreur et ne déclare rien (une faute de
+        frappe ne lève aucune porte) ; un motif sans date est signalé ; une
+        date passée est une simple information : la règle a cessé d'elle-même,
+        la ligne peut être retirée de la fiche."""
+        raw = fiche.data.get(UNAVAILABLE_UNTIL_KEY)
+        reason = _text(fiche.data.get(UNAVAILABLE_REASON_KEY))
+        if raw is None:
+            if reason:
+                self.add("host-unavailable-invalid", WARNING,
+                         "`%s` without `%s`: the device is not declared unavailable"
+                         % (UNAVAILABLE_REASON_KEY, UNAVAILABLE_UNTIL_KEY),
+                         **where, **subject)
+            return None, None
+        if isinstance(raw, _dt.datetime):
+            raw = raw.date()
+        try:
+            day = (raw if isinstance(raw, _dt.date)
+                   else _dt.date.fromisoformat(str(raw).strip()))
+        except ValueError:
+            day = None
+        if day is None:
+            self.add("host-unavailable-invalid", ERROR,
+                     "`%s`: ISO day expected (YYYY-MM-DD), got %r"
+                     % (UNAVAILABLE_UNTIL_KEY, raw), **where, **subject)
+            return None, None
+        if day < _dt.date.today():
+            self.add("host-unavailable-past", INFO,
+                     "`%s` %s is past: the device is available again, the line can go"
+                     % (UNAVAILABLE_UNTIL_KEY, day.isoformat()), **where, **subject)
+        return day.isoformat(), reason
 
     def _host_resources(self, raw, where: dict, subject: dict) -> dict | None:
         """Seuils `policy.resources` validés, ou None si rien n'est déclaré.
@@ -2906,6 +3074,16 @@ class _Loader:
                      "`policy.resources`: mapping expected", **where, **subject)
             return None
         parsed: dict = {}
+        # #2814: the pressure scope is a name, not a number; it is read first
+        # so that an unknown value is an error, never a silent fallback.
+        scope = raw.get(resources_mod.PRESSURE_SCOPE_KEY)
+        if scope is not None:
+            if not isinstance(scope, str) or scope not in resources_mod.PRESSURE_SCOPES:
+                self.add("host-policy-invalid", ERROR,
+                         "`policy.resources.pressure_scope`: one of %s expected"
+                         % ", ".join(resources_mod.PRESSURE_SCOPES), **where, **subject)
+            else:
+                parsed[resources_mod.PRESSURE_SCOPE_KEY] = scope
         for key in resources_mod.THRESHOLD_KEYS:
             value = raw.get(key)
             if value is None:
@@ -2978,7 +3156,8 @@ class _Loader:
                 continue
             parsed[key] = caps
         for unknown in sorted(set(raw) - set(resources_mod.THRESHOLD_KEYS)
-                              - set(resources_mod.AGENT_MEMORY_KEYS)):
+                              - set(resources_mod.AGENT_MEMORY_KEYS)
+                              - {resources_mod.PRESSURE_SCOPE_KEY}):
             self.add("host-resources-unknown", WARNING,
                      "`policy.resources.%s`: unknown key (ignored)" % unknown,
                      **where, **subject)
@@ -3046,14 +3225,20 @@ class _Loader:
         Le chemin est contraint, RELATIF AU BUNDLE : `type: Process` dans
         `agents/…` n'est pas une règle (constat, jamais injecté), mais un canon
         imbriqué (`knowledge/`) garde ses `processus/*.md` (verdict codex
-        #510 r2, P2). Le texte est rendu encodable en UTF-8 (un surrogate YAML
+        #510 r2, P2). #2973 : dans un bundle à périmètre ameesh déclaré
+        (`extensions.ameesh.scope`), `<dossier>/processus/*.md` est aussi une
+        règle quand `<dossier>` est l'un des dossiers du périmètre — rien
+        au-delà. Le texte est rendu encodable en UTF-8 (un surrogate YAML
         isolé ne doit pas faire échouer le brief ni un envoi)."""
         subject = {"process": fiche.title}
-        chemin = (fiche.bundle_path or fiche.path).replace("\\", "/").split("/")
-        if len(chemin) < 2 or chemin[0] != PROCESS_DIR:
+        if not process_path_ok(fiche.bundle_path or fiche.path,
+                               self.canon.scopes.get(fiche.member)):
+            scope = [d for d in self.canon.scopes.get(fiche.member) or () if d]
+            dossiers = "`, `".join([PROCESS_DIR + "/"]
+                                   + ["%s/%s/" % (d, PROCESS_DIR) for d in scope])
             self.add("process-path", ERROR,
-                     "Process card outside `%s/`: %s (never injected as a working "
-                     "rule)" % (PROCESS_DIR, fiche.path), **where, **subject)
+                     "Process card outside `%s`: %s (never injected as a working "
+                     "rule)" % (dossiers, fiche.path), **where, **subject)
             fiche = dataclasses.replace(fiche, title=_utf8_safe(fiche.title))
             self.canon.processes.append(Process(
                 fiche=fiche, description=_utf8_safe(_text(fiche.data.get("description")) or ""),
@@ -3194,7 +3379,8 @@ def split_ref(ref: str | None) -> tuple[str | None, str, str, str] | None:
 
 
 def load(root: str, *, ref: str = "", untrusted: bool = False, fetch: bool = False,
-         use_pyyaml: bool | None = None, default: bool = True) -> Canon:
+         use_pyyaml: bool | None = None, default: bool = True,
+         deadline: Deadline | None = None) -> Canon:
     """Lit le canon (§4.1). Les problèmes de lecture sont dans `canon.load_findings`.
 
     Une erreur git imprévue (dépôt cassé, délai dépassé) rend le canon
@@ -3203,9 +3389,12 @@ def load(root: str, *, ref: str = "", untrusted: bool = False, fetch: bool = Fal
 
     `default` (L42) : faux pour un canon qui n'est pas le premier configuré —
     ses références sont alors préfixées de son identifiant.
+
+    ``deadline`` (#2665) : la découverte ne prend que le temps qui reste ;
+    une échéance épuisée lève `GitDeadline`, jamais un canon « illisible ».
     """
     loader = _Loader(root, ref=ref, untrusted=untrusted, fetch=fetch, use_pyyaml=use_pyyaml,
-                     default=default)
+                     default=default, deadline=deadline)
     try:
         return loader.load()
     except GitError as exc:
@@ -3234,7 +3423,7 @@ def configured(cfg) -> tuple:
 
 
 def from_config(cfg, *, root: str | None = None, fetch: bool = False,
-                entry=None) -> Canon:
+                entry=None, deadline: Deadline | None = None) -> Canon:
     """Le canon de la configuration (`AMEESH_CANON`, `AMEESH_CANON_REF`, …).
 
     Sans `entry` : le canon par défaut (ou `root`, lu comme canon par défaut).
@@ -3244,13 +3433,14 @@ def from_config(cfg, *, root: str | None = None, fetch: bool = False,
     if entry is not None:
         default = bool(entries) and entries[0].path == entry.path
         canon = load(entry.path, ref=entry.ref, untrusted=entry.untrusted, fetch=fetch,
-                     default=default)
+                     default=default, deadline=deadline)
     else:
         path = root or cfg.canon
         if not path:
             raise CanonError("no canon configured: set AMEESH_CANON (or `canon` in the "
                              "configuration), or pass --canon DIR")
-        canon = load(path, ref=cfg.canon_ref, untrusted=cfg.canon_untrusted, fetch=fetch)
+        canon = load(path, ref=cfg.canon_ref, untrusted=cfg.canon_untrusted, fetch=fetch,
+                     deadline=deadline)
     if len(entries) > 1:
         note_identity(canon)
     return canon
@@ -3296,21 +3486,34 @@ def _configured_key(cfg, fetch: bool) -> tuple:
                   for entry in configured(cfg)), bool(fetch))
 
 
-def load_configured(cfg, *, fetch: bool = False) -> list[Canon]:
+def load_configured(cfg, *, fetch: bool = False,
+                    deadline: Deadline | None = None) -> list[Canon]:
     """Les canons configurés qui se laissent charger, le canon par défaut
     d'abord (lecture seule : seuils, hôtes). Une configuration fautive d'un
-    canon ne masque pas les autres ; un identifiant en double est écarté."""
+    canon ne masque pas les autres ; un identifiant en double est écarté.
+
+    ``deadline`` (#2665) borne la découverte elle-même — résolution du
+    dépôt, références, manifeste et fiches : chaque lecture git ne prend que
+    le temps qui reste, et une échéance épuisée lève `GitDeadline` au lieu de
+    rendre une liste partielle ou vide lue comme « canon sans bloc ».
+    """
+    if deadline is not None and deadline.expired():
+        raise GitDeadline("canon discovery: deadline exhausted")
     cache = getattr(_CANONS, "loaded", None)
     key = _configured_key(cfg, fetch) if cache is not None else None
     if cache is not None and key in cache:
         return list(cache[key])
     out: list[Canon] = []
     for index, entry in enumerate(configured(cfg)):
+        if deadline is not None and deadline.expired():
+            raise GitDeadline("canon discovery: deadline exhausted")
         try:
-            canon = from_config(cfg, fetch=fetch) if index == 0 \
-                else from_config(cfg, entry=entry, fetch=fetch)
+            canon = from_config(cfg, fetch=fetch, deadline=deadline) if index == 0 \
+                else from_config(cfg, entry=entry, fetch=fetch, deadline=deadline)
         except CanonError:
             continue
+        if deadline is not None and deadline.expired():
+            raise GitDeadline("canon discovery: deadline exhausted")
         if any(c.id == canon.id for c in out):
             continue
         out.append(canon)
@@ -3622,9 +3825,21 @@ def validate(canon: Canon, known_projects: Iterable[str] | None = None) -> list[
             host = canon.host(name)
             if agent is not None and host is not None:
                 for reason in placement_violations(agent, host, placement):
-                    add("placement-policy-violation", ERROR,
-                        "%s on %s: %s" % (agent.title, host.title, reason), f,
-                        agent=agent.title)
+                    # L165 (EP1) : pour un rôle élu, une politique d'hôte qui
+                    # refuse l'agent ne ferme QUE ce candidat ; les autres
+                    # hôtes candidats gardent leur propre verdict. Un agent
+                    # épinglé, lui, reste bloqué partout par son erreur.
+                    if agent.releve == "election":
+                        # Un candidat refusé ne ferme que CE candidat : ni
+                        # l'hôte (les agents épinglés y restent réclamables),
+                        # ni les autres hôtes candidats.
+                        add("placement-policy-violation", ERROR,
+                            "%s on %s: %s" % (agent.title, host.title, reason), f,
+                            candidate=agent.title, host=name)
+                    else:
+                        add("placement-policy-violation", ERROR,
+                            "%s on %s: %s" % (agent.title, host.title, reason), f,
+                            agent=agent.title)
                 _check_work_dir(add, agent, host, placement)
     for name, group in by_agent.items():
         if len(group) > 1:
@@ -3633,6 +3848,36 @@ def validate(canon: Canon, known_projects: Iterable[str] | None = None) -> list[
                     "agent %s admitted %d times (%s)" % (
                         name, len(group), ", ".join(p.agent or "?" for p in group)),
                     placement.fiche, agent=name)
+    # L165 (EP1) : les candidats d'un rôle élu sont des hôtes du canon, tous
+    # admis par l'admission de l'agent. Sans candidat, le rôle ne peut être
+    # tenu nulle part ; un candidat non admis serait refusé au verdict de
+    # placement, donc la fiche est fautive dès `canon check`.
+    for agent in canon.agents:
+        if agent.releve != "election":
+            if agent.candidats:
+                add("agent-candidats-ignored", WARNING,
+                    "`candidats` declared without `releve: election` (ignored)",
+                    agent.fiche, agent=agent.title)
+            continue
+        if not agent.candidats:
+            add("agent-election-candidats-missing", ERROR,
+                "agent %s is `releve: election` without `candidats`" % agent.title,
+                agent.fiche, agent=agent.title)
+            continue
+        admis: set[str] = set()
+        for placement in by_agent.get(agent.title, []):
+            admis |= set(placement.host_names())
+            for tag in placement.tags():
+                admis |= {host.title for host in canon.hosts if tag in (host.tags or [])}
+        for name in agent.candidats:
+            if canon.host(name) is None:
+                add("agent-election-host-unknown", ERROR,
+                    "agent %s is a candidate on unknown host %s" % (agent.title, name),
+                    agent.fiche, agent=agent.title)
+            elif name not in admis:
+                add("agent-election-host-not-admitted", ERROR,
+                    "agent %s is a candidate on %s, which its admission does not cover"
+                    % (agent.title, name), agent.fiche, agent=agent.title)
     for host in canon.hosts:
         for agent in canon.agents:
             paths = {host.policy.work_dirs[n] for n in [agent.title] + list(agent.aliases or [])
@@ -3820,6 +4065,11 @@ def _validate_processes(canon: Canon, add) -> None:
                 "Process card %s: short projection of %d bytes (limit %s) — a "
                 "brief cuts its end" % (process.title, proj, PROCESS_PROJECTION_MAX),
                 where, **subject)
+        elif process.projection and proj * 10 >= PROCESS_PROJECTION_MAX * 9:
+            add("process-projection-near-limit", WARNING,
+                "Process card %s: short projection of %d bytes (limit %s) — at "
+                "least 90%% of its budget; shorten it before a brief cuts its end"
+                % (process.title, proj, PROCESS_PROJECTION_MAX), where, **subject)
         elif not process.projection and taille > PROCESS_BODY_MAX:
             add("process-too-long", WARNING,
                 "Process card %s: %d bytes of rules (limit %s, about two pages); "
@@ -3846,12 +4096,16 @@ class Blocking:
     global_errors: list[Finding]
     by_agent: dict[str, list[Finding]]
     by_host: dict[str, list[Finding]]
+    #: L165 : erreurs qui ne ferment qu'un couple (agent élu, hôte candidat).
+    by_candidate: dict[tuple[str, str], list[Finding]]
 
     def reasons(self, agent: str, hosts: Iterable[str] = ()) -> list[str]:
         out = ["%s (%s)" % (f.code, f.where()) for f in self.global_errors]
         out += ["%s (%s)" % (f.code, f.where()) for f in self.by_agent.get(agent, [])]
         for host in hosts:
             out += ["%s (%s)" % (f.code, f.where()) for f in self.by_host.get(host, [])]
+            out += ["%s (%s)" % (f.code, f.where())
+                    for f in self.by_candidate.get((agent, host), [])]
         return list(dict.fromkeys(out))
 
 
@@ -3860,11 +4114,13 @@ def blocking(findings: Iterable[Finding]) -> Blocking:
     sont placés ; à une fiche du plan (WorkPackage, L29) ou à une règle de
     travail (Process, #538), aucun agent ; sinon (fédération, frontmatter d'une
     fiche du profil, …) tous."""
-    result = Blocking([], defaultdict(list), defaultdict(list))
+    result = Blocking([], defaultdict(list), defaultdict(list), defaultdict(list))
     for finding in errors(findings):
         if finding.package or finding.process:
             continue
-        if finding.agent:
+        if finding.candidate and finding.host:
+            result.by_candidate[(finding.candidate, finding.host)].append(finding)
+        elif finding.agent:
             result.by_agent[finding.agent].append(finding)
         elif finding.host:
             result.by_host[finding.host].append(finding)

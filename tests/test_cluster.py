@@ -77,7 +77,8 @@ SIGNATURES = {
 CONTENUS = {
     "agent_peek": {"payload"},
     "agent_mailbox": {"body", "payload", "meta"},
-    "agent_registry": {"pending_prompt", "current_prompt", "restart_brief"},
+    "agent_registry": {"pending_prompt", "current_prompt", "restart_brief",
+                       "election_brief"},
     "agent_mesh_overview": {"pending_prompt", "current_prompt", "restart_brief"},
     "thread_index": {"last_excerpt"},
     "conversation_log": {"text", "meta", "thread_text"},
@@ -146,6 +147,39 @@ FERMEES = {
     # interne borné au tour (réparation d'un worker mort), pas un état de
     # supervision ; colonne fermée aux deux rôles, aucun GRANT modifié.
     "spend_pending": {"resident_usage"},
+    # L165 (EP1, 0473) : verdicts de placement par hôte candidat, lus par la
+    # condition de réclamation et non par le rôle superviseur ; table interne
+    # fermée aux deux rôles, aucun GRANT ajouté.
+    "agent_candidates": {"name", "host", "canon", "cwd", "placement_ok",
+                         "placement_diagnostic", "placement_ref",
+                         "placement_profile", "updated_at"},
+    # #2443 (0465) : appartenance d'une unité à un paquet, écrite à la
+    # composition (porteur, commit de composition, gel effectif). État interne
+    # lu par `work show` et `sync-merges` ; fermé aux deux rôles superviseur,
+    # aucun GRANT modifié.
+    "work_packet_members": {"package_id", "work_item_id", "package_branch",
+                            "base_sha", "head_sha", "unit_sha", "source_sha",
+                            "frozen_sha", "recorded_by", "recorded_at"},
+    # #2845 (0470) : curseur, reçus et progression de la veille des tickets
+    # GitHub. État interne de l'agent de veille, pas un état de supervision ;
+    # fermé aux deux rôles superviseur, aucun GRANT modifié.
+    "github_watch_cursors": {"project", "repo", "scanned_through"},
+    "github_watch_events": {"project", "repo", "kind", "object_id", "digest"},
+    "github_watch_scans": {"project", "repo", "progress"},
+    # #288 (L80b, 0472) : attribution des messages servis par un tour résident
+    # (`turn_costs.inputs`), consommée par le rapport local
+    # `ameesh cost turns --message` ; le contrat des rôles superviseur reste
+    # inchangé : colonne fermée aux deux rôles, aucun GRANT modifié.
+    "turn_costs": {"inputs"},
+    # L165 (EP2, 0476) : scores de candidats d'un rôle élu, lus par les
+    # exécuteurs candidats et `ameesh role status`, pas par le rôle
+    # superviseur ; table interne fermée aux deux rôles, aucun GRANT ajouté.
+    "role_standings": {"id", "name", "host", "evaluated_at", "availability",
+                       "capacity", "score", "ready", "diagnostic"},
+    # #3099 (0478) : marque de libération d'une bascule de rôle élu, côté hôte
+    # détenteur, relue par l'exécuteur au redémarrage ; état interne fermé aux
+    # deux rôles superviseur, aucun GRANT modifié.
+    "role_handover": {"host", "name", "challenger", "released_until", "updated_at"},
 }
 #: L232b (0417) : l'état interne du contrôleur de release reste hors contrat,
 #: sauf `host_release_fences.host`, lu par `ameesh_host_gate_state` (l.314).
@@ -702,7 +736,8 @@ class SuperviseurRoleTest(PgTestCase):
             "SELECT name || '|' || status FROM agent_registry ORDER BY name")
         self.assertEqual(lu.returncode, 0, lu.stderr)
         self.assertIn("sup1|", lu.stdout)
-        lu = self.as_supervisor("SELECT name, unread FROM agent_mesh_overview")
+        lu = self.as_supervisor(
+            "SELECT name, unread, passive_unread FROM agent_mesh_overview")
         self.assertEqual(lu.returncode, 0, lu.stderr)
         self.assertIn("sup1", lu.stdout)
         lu = self.as_supervisor("SELECT count(*) FROM schema_migrations")

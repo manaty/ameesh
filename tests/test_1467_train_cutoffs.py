@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """Canon §11 bis: one packet per compiled epoch, including Paris DST."""
-from datetime import datetime
+from datetime import datetime, timedelta
 import types
 import unittest
 from zoneinfo import ZoneInfo
@@ -11,6 +11,25 @@ from .test_1467_train import MemoryPorts, row
 
 def stamp(text):
     return datetime.fromisoformat(text).replace(tzinfo=ZoneInfo("Europe/Paris")).timestamp()
+
+
+def paris_cutoff(now: float) -> float:
+    """Fixture calendar: the latest 11:00/23:00 Europe/Paris cutoff, across DST.
+
+    The engine has no calendar of its own (#2451): the installed passage reads
+    the compiled canon (`Mechanics.last_packet`, DST covered by
+    test_l1616_mechanics); these tests pass this fixture explicitly."""
+    local = datetime.fromtimestamp(now, ZoneInfo("Europe/Paris"))
+    if local.hour >= 23:
+        slot = local.replace(hour=23, minute=0, second=0, microsecond=0)
+    elif local.hour >= 11:
+        slot = local.replace(hour=11, minute=0, second=0, microsecond=0)
+    else:
+        slot = (local - timedelta(days=1)).replace(hour=23, minute=0, second=0, microsecond=0)
+    return slot.timestamp()
+
+
+PARIS = types.SimpleNamespace(last_packet=paris_cutoff)
 
 
 def admitted(lot, when="2026-10-15T10:00:00"):
@@ -25,7 +44,8 @@ class CutoffTest(unittest.TestCase):
     def engine(self, rows, **policy):
         self.ports = MemoryPorts(rows)
         return train.Engine(self.ports, source="github.com/o/r", target="main",
-                            policy=train.Policy(enabled=True, **policy))
+                            policy=train.Policy(enabled=True, **dict(
+                                {"schedule": PARIS}, **policy)))
 
     def test_compiled_packet_cutoff_cannot_be_unknown_nonfinite_or_future(self):
         now = stamp("2026-10-15T12:00:00")
@@ -49,6 +69,30 @@ class CutoffTest(unittest.TestCase):
         self.assertEqual(engine.step(stamp("2026-10-15T14:00:04"))["result"], "idle")
         self.assertEqual(engine.step(stamp("2026-10-15T15:00:00"))["result"], "ci")
         self.assertEqual([e[0] for e in self.ports.effects].count("ci"), 3)
+
+    def test_landed_packet_frees_a_cutoff_it_overran_in_the_same_event(self):
+        """#2965 (c): a missed cutoff is composed as soon as the target frees.
+
+        The packet CI spans the next cutoff; a candidate admissible before
+        that cutoff must not wait for the calendar hour after the landing.
+        """
+        # Hourly packets, as the compiled calendar feeds them (#1616): the
+        # fixture's 11:00/23:00 releases are not the packet cadence.
+        schedule = types.SimpleNamespace(last_packet=lambda now: now - now % 3600)
+        engine = self.engine([admitted(1, "2026-10-15T10:00:00")], schedule=schedule)
+        first = engine.step(stamp("2026-10-15T11:00:00"))["plan"]
+        # The packet CI is still in flight across the 12:00 cutoff.
+        self.assertEqual(engine.step(stamp("2026-10-15T12:00:00"))["result"], "ci")
+        self.ports.ci_by_head[first["head"]] = "green"
+        self.assertEqual(engine.step(stamp("2026-10-15T12:00:05"))["result"], "landed")
+        # The landed lot left the queue; a candidate became admissible during
+        # the CI, before the 12:00 cutoff the packet overran.
+        self.ports.rows = [admitted(2, "2026-10-15T11:30:00")]
+        # The runner re-passes the landed passage at once (see the service
+        # test): the 12:00 packet is composed here, not at 13:00.
+        result = engine.step(stamp("2026-10-15T12:00:06"))
+        self.assertEqual(result["result"], "ci", result)
+        self.assertEqual([r["work_item_id"] for r in result["plan"]["members"]], [2])
 
     def test_repeated_paris_hour_starts_distinct_packets_across_restart(self):
         # Explicit supplier epochs: this checks the consumer, not how #1757
@@ -167,7 +211,13 @@ class CutoffTest(unittest.TestCase):
         self.assertEqual([e[0] for e in self.ports.effects], ["publish", "ci"])
         self.assertTrue(self.ports.notices)
 
-    def test_paris_cutoffs_follow_local_date_and_dst(self):
+    def test_policy_without_compiled_calendar_refuses_a_cutoff(self):
+        # #2451: no local 11:00/23:00 fallback survives in the engine
+        self.assertFalse(hasattr(train, "cutoff"))
+        with self.assertRaisesRegex(train.TrainError, "compiled canon calendar"):
+            train.Policy(enabled=True).cutoff(stamp("2026-10-15T12:00:00"))
+
+    def test_paris_fixture_follows_local_date_and_dst(self):
         cases = {
             "2026-10-15T10:59:59": "2026-10-14T23:00:00",
             "2026-10-15T11:00:00": "2026-10-15T11:00:00",
@@ -179,7 +229,7 @@ class CutoffTest(unittest.TestCase):
         }
         for now, expected in cases.items():
             with self.subTest(now=now):
-                self.assertEqual(train.cutoff(stamp(now)), stamp(expected))
+                self.assertEqual(paris_cutoff(stamp(now)), stamp(expected))
 
 
 if __name__ == "__main__":

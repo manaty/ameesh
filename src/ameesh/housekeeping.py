@@ -3,7 +3,7 @@
 de base #1, cycle de vie des worktrees).
 
 ameesh fait le ménage de ce que SES agents créent, au lieu de le laisser à
-l'humain. Cinq familles, cinq règles :
+l'humain. Chaque famille a sa règle :
 
 * **Dossier temporaire d'un agent** (jetable) : `TMPDIR`/`TMP`/`TEMP` d'un
   tour pointent vers `<tmp_root>/<agent>` (par défaut
@@ -53,6 +53,15 @@ l'humain. Cinq familles, cinq règles :
 * **Build output of idle worktrees** (L230, [`build_artifacts`]):
   `node_modules`, Rust `target/`, deleted once the worktree is idle for 24 h
   with no process of the user inside; never in a main checkout.
+
+* **Clones ad hoc d'un lot** (#2743, [`housekeeping_clones`]) : enfant direct
+  d'une racine de travail dont le `.git` est un dossier ; rattaché à un lot
+  par son nom ou une branche `lot/`/`work/`, il part après 24 h si tous les
+  lots nommés sont finis depuis plus de 24 h, qu'il est inactif, propre,
+  poussé (toutes ses branches, sans stash), sans copie Git imbriquée, sans
+  autre worktree lié ni alternate dépendant (#2738), et que rien n'y
+  travaille. Un clone sans lot nommé est seulement signalé ; l'essai
+  (`ameesh menage`) montre le plan, `--apply` exécute.
 
 * **Volumes Docker sans conteneur** (L73/#2003, [`reap_volumes`]) : seuls
   ceux dont le mesh a DÉCLARÉ le cycle de vie jetable sont récoltés —
@@ -122,6 +131,10 @@ DEFAULT_TMP_QUOTA = 4 * GIB          # par agent
 DEFAULT_CACHE_QUOTA = 10 * GIB       # tous caches partagés de l'hôte
 DEFAULT_TMPFS_ALERT = 0.6            # alerte (la contre-pression est à 0,8)
 DEFAULT_ORPHAN_MIN_SIZE = 50 * MIB   # entrée de /tmp signalée au-delà
+DEFAULT_EVENTS_QUOTA = 64 * MIB      # #2820 : flux events.jsonl d'un agent, avant rotation
+#: #2820 : plus petit `events_quota` admis (la reprise du dernier tour en est
+#: le quart)
+MIN_EVENTS_QUOTA = 1 * MIB
 #: âge minimal d'un fichier évincé (secondes) : jamais un fichier en écriture
 EVICT_MIN_AGE_S = 3600.0
 #: #1665 : inactivité (secondes) d'un worktree orphelin (aucun lot nommé par
@@ -233,7 +246,8 @@ POLICY_KEYS = ("tmp_root", "cache_root", "tmp_quota", "cache_quota", "tmpfs_aler
                "redirect", "xdg_cache", "worktrees", "orphan_min_size",
                "orphan_cleanup", "orphan_idle", "deps", "deps_idle", "artifacts",
                "artifact_idle", "unreadable_ok", "docker_orphan_volumes_alert",
-               "docker_build_cache_alert", "docker_volumes", "docker_volume_idle")
+               "docker_build_cache_alert", "docker_volumes", "docker_volume_idle",
+               "events_quota")
 #: racines refusées : le ménage n'y supprimerait que ses sous-dossiers, mais
 #: un dossier partagé par tout le système n'est pas un dossier GÉRÉ
 FORBIDDEN_ROOTS = ("/", "~", "/tmp", "/var/tmp", "/dev/shm", "/home", "/root")
@@ -280,6 +294,9 @@ class Policy:
     #: artifacts of an idle worktree AND the holder check of an abandoned /tmp
     #: entry; empty by default, set per host in its Host card
     unreadable_ok: tuple = ()
+    #: #2820 : taille du flux `events.jsonl` d'un agent au-delà de laquelle il
+    #: tourne au début du tour suivant (`events_rotation`)
+    events_quota: int = DEFAULT_EVENTS_QUOTA
     #: #2180: discovery roots derived from Host work_root/work_roots, never
     #: deletion roots. Not a separate housekeeping setting.
     worktree_roots: tuple = ()
@@ -325,6 +342,12 @@ def parse_policy(raw) -> tuple[dict, list[str], list[str]]:
             problems.append("`%s`: size in bytes expected (e.g. 4GiB)" % key)
         else:
             parsed[key] = octets
+    if raw.get("events_quota") is not None:
+        octets = resources_mod.parse_bytes(raw["events_quota"])
+        if octets is None or octets < MIN_EVENTS_QUOTA:
+            problems.append("`events_quota`: size of at least 1MiB expected (e.g. 64MiB)")
+        else:
+            parsed["events_quota"] = octets
     if raw.get("docker_orphan_volumes_alert") is not None:
         count = raw["docker_orphan_volumes_alert"]
         if type(count) is not int or count <= 0:
@@ -416,7 +439,8 @@ def effective(canons, host: str) -> Policy:
             if key not in values:
                 values[key], origin[key] = value, label
             elif key in ("tmp_quota", "cache_quota", "orphan_min_size", "tmpfs_alert",
-                         "docker_orphan_volumes_alert", "docker_build_cache_alert") \
+                         "docker_orphan_volumes_alert", "docker_build_cache_alert",
+                         "events_quota") \
                     and value < values[key]:
                 values[key], origin[key] = value, label
             elif (key in ("orphan_idle", "deps_idle", "artifact_idle",
@@ -771,11 +795,20 @@ def hold_tmp(cfg, policy: Policy, agent: str, *, new_session: bool) -> TmpHold:
     if read_owner(troot, name) is None:            # under the exclusive lock (above)
         _write_owner(troot, name, key, ORIGIN_CREATED if created else ORIGIN_ADOPTED)
     elif new_session and not created and exclusive and created_by(troot, name, key):
-        freed = _clear_dir(mine, troot)
-        if freed:
-            entries.append({"kind": "tmp", "action": "deleted", "path": mine,
-                            "bytes": freed, "agent": agent,
-                            "detail": "new session: temporary directory emptied"})
+        # #2704 : une application lancée depuis ce dossier (AppImage extraite)
+        # peut le tenir hors tour ; la vider la ferait crasher. On la garde et
+        # on le dit, plutôt que de supprimer sous un processus vivant.
+        held = tmp_user_holder(mine)
+        if held:
+            entries.append({"kind": "tmp", "action": "held", "path": mine,
+                            "agent": agent,
+                            "detail": "new session: %s (not emptied)" % held})
+        else:
+            freed = _clear_dir(mine, troot)
+            if freed:
+                entries.append({"kind": "tmp", "action": "deleted", "path": mine,
+                                "bytes": freed, "agent": agent,
+                                "detail": "new session: temporary directory emptied"})
     fcntl.flock(lock.fileno(), fcntl.LOCK_SH)
     # a resumed session writes nothing at first: the pass must not see it idle
     try:
@@ -1884,11 +1917,14 @@ def unsaved_git_work(path: str, rules=()) -> str:
     return ""
 
 
-def tmp_recovery_command(path: str) -> str:
+def tmp_recovery_command(path: str, *,
+                         report: tuple[list[str], str] | None = None) -> str:
     """#2493 : the commands that inspect a temporary directory before a human
     moves or removes it (never a blind `rm -rf`). Git copies get the
-    saved-work checks; a plain directory just its listing."""
-    copies = _git_copies(path)
+    saved-work checks; a plain directory just its listing. `report` (#2556)
+    is the `_git_copies_report` already read for this entry, so a pass does
+    not walk a deep tree once per helper."""
+    copies = _git_copies_report(path)[0] if report is None else report[0]
     if not copies:
         return "ls -la -- %s" % shlex.quote(path)
     commands = []
@@ -1898,7 +1934,7 @@ def tmp_recovery_command(path: str) -> str:
             commands.append("git -C %s log --all --not --remotes" % shlex.quote(copy))
             continue
         commands.append("git -C %s status --short" % shlex.quote(copy))
-        commands.append("git -C %s log --branches --not --remotes" % shlex.quote(copy))
+        commands.append("git -C %s log --all --not --remotes" % shlex.quote(copy))
     return " ; ".join(commands)
 
 
@@ -1944,7 +1980,7 @@ def _git_copy_work(copy: str, entry: str, rules=()) -> str:
     agent directory of `tmp_git_work` — so a guard added for one never misses
     the other: locked, unreadable metadata, submodules, modified or untracked
     files, ignored files outside the build output `rules`, HEAD on no remote
-    branch, for a CLONE its local branches, stash, other linked worktrees and
+    branch, for a CLONE all local refs, stash, other linked worktrees and
     a remote that lives inside `entry`, and no linked worktree whose common
     repository lives inside `entry`. A bare repository has no working tree to
     prove its refs saved: it is a doubt and keeps the entry (#2525)."""
@@ -1980,15 +2016,16 @@ def _git_copy_work(copy: str, entry: str, rules=()) -> str:
             return "%s: linked worktrees unreadable" % copy
         if sum(line.startswith("worktree ") for line in linked.stdout.splitlines()) > 1:
             return "%s: the clone has other linked worktrees" % copy
-        # A clone takes its local branches and its stash with it (a linked
-        # worktree leaves them in its common repository): HEAD alone does
-        # not prove they are saved. Unreadable: a doubt, the copy stays.
-        local = _git(["log", "--branches", "--not", "--remotes", "--format=%H",
+        # A clone takes all its refs with it (a linked worktree leaves them
+        # in its common repository): branches alone miss tags and custom
+        # refs (#2827). Every reachable commit must be on a remote branch.
+        # Unreadable: a doubt, the copy stays.
+        local = _git(["log", "--all", "--not", "--remotes", "--format=%H",
                       "-1"], copy)
         if local is None or local.returncode != 0:
-            return "%s: local branches unreadable" % copy
+            return "%s: local refs unreadable" % copy
         if local.stdout.strip():
-            return "%s: local branch commit %s on no remote branch" % (
+            return "%s: local ref commit %s on no remote branch" % (
                 copy, local.stdout.strip()[:12])
         stash = _git(["rev-parse", "-q", "--verify", "refs/stash"], copy)
         if stash is None or stash.returncode not in (0, 1):
@@ -2001,17 +2038,19 @@ def _git_copy_work(copy: str, entry: str, rules=()) -> str:
     return ""
 
 
-def tmp_git_work(path: str, rules=()) -> str:
+def tmp_git_work(path: str, rules=(), *,
+                 report: tuple[list[str], str] | None = None) -> str:
     """#2493 (N2) : why a Git copy inside a temporary directory must be kept,
     empty when every copy is safe to recover: the saved-work guards of
     `_git_copy_work` (clean, pushed or integrated, no ignored file outside
-    the build output, for a clone no unpushed local branch, stash, other
-    linked worktree nor remote inside the directory, and no linked worktree
+    the build output, for a clone no local ref commit outside remote branches,
+    stash, other linked worktree nor remote inside the directory, and no linked worktree
     whose common repository is inside it) and no process inside.
     A directory is never deleted merely because its agent left the registry;
     this check is the second condition. A bare repository, or a directory
-    tree whose copies could not all be inspected (#2525), keeps it."""
-    copies, doubt = _git_copies_report(path)
+    tree whose copies could not all be inspected (#2525), keeps it.
+    `report` (#2556) reuses the `_git_copies_report` of the pass."""
+    copies, doubt = _git_copies_report(path) if report is None else report
     for copy in copies:
         work = _git_copy_work(copy, path, rules)
         if work:
@@ -2023,14 +2062,17 @@ def tmp_git_work(path: str, rules=()) -> str:
     return ""
 
 
-def recover_tmp_git_copies(path: str) -> tuple[bool, str, list[str]]:
+def recover_tmp_git_copies(path: str, *,
+                           report: tuple[list[str], str] | None = None
+                           ) -> tuple[bool, str, list[str]]:
     """#2493 (N2) : remove the linked worktrees of `path` with `git worktree
     remove` (never `--force`, its own checks still apply), after `tmp_git_work`
     proved them saved. Clones stay for `_safe_rmtree`; a bare repository is a
     doubt and never gets here. An inspection cut short by a doubt removes
-    nothing (#2525). (ok, error, common repositories to prune)."""
+    nothing (#2525). `report` (#2556) reuses the `_git_copies_report` of the
+    pass. (ok, error, common repositories to prune)."""
     repos: list[str] = []
-    copies, doubt = _git_copies_report(path)
+    copies, doubt = _git_copies_report(path) if report is None else report
     if doubt:
         return False, "git copies not fully inspected (%s)" % doubt, []
     for copy in copies:
@@ -2069,6 +2111,30 @@ def tmp_holder(path: str, allow=()) -> str:
         why = "path on the command line"
     return "held by process %s (%s: %s)" % (first.get("pid"), why,
                                            (first.get("cmd") or "")[:80])
+
+
+def tmp_user_holder(path: str, procs=None) -> str:
+    """#2704 : le processus qui utilise `path`, d'après les chemins observés de
+    l'utilisateur (dossier courant, exécutable, fichiers ouverts et projetés en
+    mémoire — `/proc/<pid>/maps`), en clair ; vide si aucun.
+
+    `procs` : un relevé `platform.user_paths()` déjà lu (un seul par passage,
+    False quand la lecture a échoué), sinon il est lu ici. Contrairement à
+    `tmp_holder`, un processus illisible n'est pas un doute qui retient tout le
+    ménage : un démon non dumpable (`gpg-agent`) n'a rien à faire dans le
+    dossier temporaire d'un agent, et l'ignorer évite d'arrêter toute éviction
+    de l'hôte. Seuls les chemins observés retiennent l'entrée. Hors Linux
+    (`user_paths` indisponible), on ne peut rien observer : vide, comme avant
+    #2704 — le défaut est propre à `/proc`."""
+    if procs is None:
+        try:
+            procs = platform.user_paths()
+        except Exception:  # noqa: BLE001 - un passage de ménage ne lève jamais
+            return ""
+    if procs is False or not getattr(procs, "available", False):
+        return ""
+    found = procs.holders(_real(path))
+    return "held by process %s" % found[0] if found else ""
 
 
 def _tmp_entry_problem(path: str, base: str, ino=None, dev=None) -> str:
@@ -2223,7 +2289,11 @@ def orphan_pass(db, host: str, policy: Policy, *, registered, protected: set,
                 and now - float(row.get("at_ts") or 0) >= UNATTRIBUTED_REFRESH_S:
             # #222: never deleted, an unattributed entry stays signaled, with
             # its current size, for as long as it is on disk (alerts read 24 h)
-            entries.append(dict(base_item, action="signaled", bytes=size, data=data,
+            # #2933: retain the first observation, including legacy signals
+            # whose data predates first_seen; at_ts is only the latest reading.
+            entries.append(dict(base_item, action="signaled", bytes=size,
+                                data=dict(data, first_seen=data.get("first_seen")
+                                          or row.get("at_ts")),
                                 detail=row.get("detail") or UNATTRIBUTED))
         item = {"path": path, "bytes": size, "agent": row.get("agent"),
                 "at_ts": row.get("at_ts"), "status": action, "detail": why,
@@ -2854,7 +2924,8 @@ class Turn:
                           "the host (other turns, other meshes, processes outside turns): "
                           "never deleted automatically" % (UNATTRIBUTED, turn_id[:8],
                                                                  self.agent),
-                "data": {"command": found["command"], "turn": turn_id, "witness": self.agent,
+                "data": {"first_seen": time.time(),
+                         "command": found["command"], "turn": turn_id, "witness": self.agent,
                          "lot": lot, "ino": found["ino"], "dev": found["dev"]}})
         return self.entries
 
@@ -3073,7 +3144,7 @@ def _worktree_pass(db, host: str, *, dry_run: bool,
             if not dry_run and (row["status"] != "kept" or row.get("detail") != detail):
                 store.set_worktree_status(row["id"], "kept", detail)
                 entries.append(dict(base, action="kept", detail=detail, data={
-                    "command": "git -C %s status ; git -C %s log --branches --not --remotes"
+                    "command": "git -C %s status ; git -C %s log --all --not --remotes"
                                % (shlex.quote(path), shlex.quote(path))}))
             continue
         if worktree_in_use(path, allow=allow):
@@ -3146,7 +3217,7 @@ def _worktree_pass(db, host: str, *, dry_run: bool,
             if not dry_run and (row["status"] != "kept" or row.get("detail") != detail):
                 store.set_worktree_status(row["id"], "kept", detail)
                 entries.append(dict(base, action="kept", detail=detail, data={
-                    "command": "git -C %s status ; git -C %s log --branches --not --remotes"
+                    "command": "git -C %s status ; git -C %s log --all --not --remotes"
                                % (shlex.quote(path), shlex.quote(path))}))
             continue
         size = size_of(path)
@@ -3657,6 +3728,8 @@ def _run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool =
       #1665 : un worktree orphelin (aucun lot nommé, ou lot fini sans
       intégration) est retiré après 24 h d'inactivité s'il est propre et
       poussé et qu'aucun agent ne l'utilise ;
+    * #2743 : clones ad hoc rattachés à un lot fini depuis plus de 24 h
+      (`housekeeping_clones`), retirés sous les garde-fous de ce module ;
     * L230: regenerable build dirs of idle worktrees (`build_artifacts`),
       when `artifact_scan` (the runner: at most every `SCAN_EVERY_S`);
     * conteneurs des tours d'ameesh finis (L73, `reap_containers`) ;
@@ -3701,6 +3774,19 @@ def _run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool =
         registered = None  # type: ignore[assignment]
     # 1. dossiers temporaires des agents
     key = mesh_key(cfg)
+    # #2704 : un seul relevé des processus de l'utilisateur par passage (il
+    # lit /proc/*/maps : ~200 ms) ; False quand la lecture est impossible.
+    procs: object = None
+
+    def held_by_user(path: str) -> str:
+        nonlocal procs
+        if procs is None:
+            try:
+                procs = platform.user_paths()
+            except Exception:  # noqa: BLE001 - un passage de ménage ne lève jamais
+                procs = False
+        return tmp_user_holder(path, procs)
+
     # #2493 : dernier signalement d'un dossier sans propriétaire, pour ne pas
     # le répéter dans `skipped` à chaque passe (un constat persistant suffit).
     last_unowned: dict[str, dict] = {}
@@ -3760,9 +3846,11 @@ def _run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool =
                 size = (size_of(full) if changed or previous.get("bytes") is None
                         else int(previous["bytes"]))
                 first_seen = data.get("first_seen") or now
+                # #2556 : la commande d'inspection est la même pour l'entrée
+                # journalisée et pour la liste ; un seul parcours des copies.
+                command = tmp_recovery_command(full)
                 if changed or now - float((previous or {}).get("at_ts") or 0) \
                         >= UNOWNED_REFRESH_S:
-                    command = tmp_recovery_command(full)
                     entries.append({
                         "kind": "tmp", "action": "unowned", "path": full,
                         "bytes": size, "agent": agent,
@@ -3773,7 +3861,7 @@ def _run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool =
                                  "first_seen": first_seen, "command": command}})
                 unowned.append({"path": full, "bytes": size, "agent": agent,
                                 "first_seen": first_seen,
-                                "command": tmp_recovery_command(full)})
+                                "command": command})
                 continue
             why = tmp_problem(full, owner, key, registered=not orphan,
                               idle_after=policy.orphan_idle, now=now)
@@ -3794,6 +3882,14 @@ def _run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool =
                     skipped.append("tmp %s kept: changed during the pass" % full)
                     continue
                 if orphan:
+                    # #2704 : un dossier utilisé par un processus vivant
+                    # (AppImage extraite et lancée hors tour) n'est jamais
+                    # supprimé, même ancien et sans copie git : ses fichiers
+                    # projetés en mémoire (/proc/<pid>/maps) le trahissent.
+                    held = held_by_user(full)
+                    if held:
+                        skipped.append("tmp %s kept: %s" % (full, held))
+                        continue
                     size = size_of(full)          # avant tout retrait : total libéré
                     # #2493 (N2) : un dossier qui porte une copie git n'est
                     # supprimé qu'après la preuve qu'aucun travail n'y est à
@@ -3809,14 +3905,16 @@ def _run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool =
                         continue
                     if copies:
                         work = tmp_git_work(
-                            full, build_artifacts.rules_of(policy.artifacts))
+                            full, build_artifacts.rules_of(policy.artifacts),
+                            report=(copies, doubt))
                         if work:
-                            command = tmp_recovery_command(full)
+                            command = tmp_recovery_command(full, report=(copies, doubt))
                             skipped.append("tmp %s kept: git work — %s ; inspect "
                                            "with: %s" % (full, work, command))
                             continue
                         if not dry_run:
-                            ok, error, git_repos = recover_tmp_git_copies(full)
+                            ok, error, git_repos = recover_tmp_git_copies(
+                                full, report=(copies, doubt))
                             if not ok:
                                 skipped.append("tmp %s kept: git worktree removal "
                                                "refused — %s" % (full, error))
@@ -3838,6 +3936,18 @@ def _run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool =
                                         "detail": "agent not in the registry"
                                         + ("; git worktrees recovered"
                                            if git_repos else "")})
+                    continue
+                # #2704 : l'éviction ne touche pas un dossier qu'un processus
+                # vivant utilise (cwd, fichiers ouverts ou projetés en
+                # mémoire) : une AppImage extraite y tourne hors tour, et
+                # libérer son quota la fait crasher. Le quota reste dit par le
+                # relevé tmpfs ; on ne supprime pas sous le processus.
+                held = held_by_user(full)
+                if held:
+                    skipped.append("tmp %s kept: %s (no eviction)" % (full, held))
+                    entries.append({"kind": "tmp", "action": "held", "path": full,
+                                    "bytes": size_of(full), "agent": agent,
+                                    "detail": held})
                     continue
                 result = evict_lru([full], troot, policy.tmp_quota, now=now,
                                    dry_run=dry_run)
@@ -3956,6 +4066,23 @@ def _run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool =
                                              known_agents=registered or ())
         entries += wt_entries
         plan += wt_plan
+        # 3c. #2743: ad-hoc clones of ended lots (dry run by default);
+        #     like the discovery, the runner rescans at most every 6 h.
+        if artifact_scan:
+            from . import housekeeping_clones
+            try:
+                cl_entries, cl_plan, cl_skipped = housekeeping_clones.reap(
+                    db, host, cfg, roots=policy.worktree_roots, agents=cwd_of,
+                    protected=protected, dry_run=dry_run, now=now,
+                    artifacts=policy.artifacts, allow=policy.unreadable_ok,
+                    lock_path=lock_path, journal_path=journal_path,
+                    skip_roots=(troot, croot, cfg.state_dir) + _shared_roots())
+            except Exception as exc:  # never fatal for the pass
+                cl_entries, cl_plan, cl_skipped = [], [], [
+                    "clones: pass failed (%s)" % type(exc).__name__]
+            entries += cl_entries
+            plan += cl_plan
+            skipped += cl_skipped
     # 3b. L230: regenerable build dirs of idle worktrees
     if artifact_scan and registered is not None:
         try:
@@ -4010,6 +4137,15 @@ def _run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool =
         "others_total": volumes["others_total"]}
     from . import docker_storage
     report_measure["docker_storage"] = docker_storage.collect(runtime, now=now)
+    # #3103 : un pont sur le réseau local de l'hôte (incident #3092), relevé
+    # pour l'alerte critique `host_network_overlap` ; jamais fatal au passage
+    from . import netcheck
+    try:
+        report_measure["docker_network"] = (
+            None if runtime is None else netcheck.collect(cfg, now=now, runtime=runtime))
+    except Exception as exc:
+        report_measure["docker_network"] = None
+        skipped.append("docker networks: not read (%s)" % type(exc).__name__)
     if not dry_run:
         entries.append({"kind": "mesure", "action": "measured", "path": troot,
                         "bytes": report_measure["tmp_bytes"] + report_measure["cache_bytes"],

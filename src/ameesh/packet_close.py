@@ -271,14 +271,28 @@ def sync(db, repo_dir: str, *, target: str | None = None, dry_run: bool = False,
                          detail="composition %s carries `ameesh-work: %d`"
                                 % (unit[:12], lot))
             if dry_run:
+                retention = plan_git.content_retention(st, row)
+                if retention is not None:
+                    plan_git.mark_retained(entry, retention, target=target,
+                                           dry_run=True)
+                    results.append(entry)
+                    continue
                 entry["result"] = "would-merge"
                 results.append(entry)
                 continue
             done = work.close_merged(
                 db, lot, sha=unit, actor=actor or "packet:%s" % target,
-                source="packet manifest (%s)" % sources, repo=repo_dir)
+                source="packet manifest (%s)" % sources, repo=repo_dir,
+                content_guard=plan_git.content_retention)
             entry["result"] = done["result"]
-            entry["detail"] = "%s — %s" % (entry["detail"], done["detail"])
+            if done["result"] in ("withheld", "error"):
+                plan_git.mark_retained(entry, done["retention"], target=target)
+                if done["result"] == "withheld":
+                    plan_git.record_content_withheld(
+                        db, st, row, entry, done["retention"], target=target,
+                        actor=actor or "packet:%s" % target)
+            else:
+                entry["detail"] = "%s — %s" % (entry["detail"], done["detail"])
             results.append(entry)
             continue
         try:
@@ -293,6 +307,11 @@ def sync(db, repo_dir: str, *, target: str | None = None, dry_run: bool = False,
             results.append(entry)
             continue
         if dry_run:
+            retention = plan_git.content_retention(st, row)
+            if retention is not None:
+                plan_git.mark_retained(entry, retention, target=target, dry_run=True)
+                results.append(entry)
+                continue
             entry["result"] = "would-merge"
             results.append(entry)
             continue
@@ -300,9 +319,16 @@ def sync(db, repo_dir: str, *, target: str | None = None, dry_run: bool = False,
             db, lot, sha=found["ref"] or sha, actor=actor or "packet:%s" % target,
             source="packet manifest (%s)" % sources,
             frozen_id=int(freeze["id"]) if freeze and freeze.get("id") else None,
-            repo=repo_dir)
+            repo=repo_dir, content_guard=plan_git.content_retention)
         entry["result"] = done["result"]
-        entry["detail"] = "%s — %s" % (entry["detail"], done["detail"])
+        if done["result"] in ("withheld", "error"):
+            plan_git.mark_retained(entry, done["retention"], target=target)
+            if done["result"] == "withheld":
+                plan_git.record_content_withheld(
+                    db, st, row, entry, done["retention"], target=target,
+                    actor=actor or "packet:%s" % target)
+        else:
+            entry["detail"] = "%s — %s" % (entry["detail"], done["detail"])
         results.append(entry)
     return {"git_dir": repo_dir, "target": target, "dry_run": bool(dry_run),
             "manifests": manifests, "units": len(lots), "results": results,
@@ -331,7 +357,8 @@ def sync_project(cfg, db, project, *, dry_run: bool = False, actor: str = "") ->
     # `land.fresh_target` fetche `refs/heads/<branche>` : une cible écrite
     # `origin/main`, `refs/remotes/origin/main`… perd ses préfixes
     target = plan_git.short_branch(target) or target
-    replayer = resolutions.Replayer(repo, radar.clone_dir(cfg, project.name))
+    replayer = resolutions.Replayer(repo, radar.clone_dir(cfg, project.name),
+                                    target=project.target)
     replayer.ensure()
     tip = land.fresh_target(replayer, project, target)
     return sync(db, replayer.path, target=tip, dry_run=dry_run, actor=actor)

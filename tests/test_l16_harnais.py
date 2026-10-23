@@ -91,6 +91,13 @@ class DescriptorTest(_Tmp):
         self.assertEqual(known["deepseek"].launcher, ("--profile", "agent"))
         self.assertTrue(known["deepseek"].paid_per_token)
         self.assertFalse(known["claude"].paid_per_token)
+        # #2706 : dsh 0.2.0-rc.2 n'a pas de profil interactif — `--profile agent`
+        # est headless et exige une tâche. Pas de session interactive déclarée,
+        # donc pas d'attachement qui prendrait le bail pour échouer ensuite.
+        self.assertFalse(known["deepseek"].attach)
+        self.assertIsNone(known["deepseek"].interactive)
+        self.assertTrue(known["claude"].attach)
+        self.assertTrue(known["codex"].attach)
 
     def test_check_accepte_un_document_valide(self):
         path = self.write_host("faux")
@@ -449,6 +456,9 @@ class HarnessCliTest(_Tmp):
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn("--patch", proc.stdout)
         self.assertIn("fingerprint", proc.stdout)
+        # #2706 : dsh est headless — la sortie le dit au lieu de laisser croire
+        # qu'une session interactive existe.
+        self.assertIn("not declared (attach unavailable)", proc.stdout)
         proc = self.cli("harness", "show", "deepseek", "--json")
         data = json.loads(proc.stdout)
         self.assertEqual(data["descriptor"]["id"], "deepseek")

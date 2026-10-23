@@ -148,7 +148,8 @@ def runner_seen(db: Db, host: str, owner: str, names: Sequence[str] | None) -> N
     storage.of(db).agents.runner_seen(host, owner, names)
 
 
-def claim(db: Db, name: str, owner: str, ttl_seconds: float) -> dict | None:
+def claim(db: Db, name: str, owner: str, ttl_seconds: float, *,
+          host: str | None = None, election_brief: str | None = None) -> dict | None:
     """Prend le bail s'il est libre ou expiré. Renvoie la ligne, sinon None.
 
     Le verrou de ligne est pris **d'abord** (`SELECT ... FOR UPDATE`), puis les
@@ -164,12 +165,27 @@ def claim(db: Db, name: str, owner: str, ttl_seconds: float) -> dict | None:
     `claim` applique **les mêmes règles que `claimable`** — éphémère échu,
     responsable résolu quand il est requis, prédicat du canon — dans la même
     instruction : la course `claimable` → `claim` est fermée.
+
+    L165 (EP1) : `host` est l'hôte qui réclame. Il ne sert qu'à un agent
+    `releve: election` (l'hôte candidat, qui devient le détenteur) ; un agent
+    `hote` n'est réclamable que sur l'hôte de sa ligne.
+
+    L165 (EP3) : `election_brief` n'est appliqué que sur une relève CROISÉE
+    (agent élu dont la ligne était chez un autre hôte). La même instruction
+    oublie alors la session de l'ancien hôte, écrit le brief dans la ligne
+    (résumé de la session neuve) et ouvre un premier tour court ; la ligne
+    rendue porte `elected` et l'ancien détenteur (`previous_host`,
+    `previous_owner`, `previous_epoch`, `previous_session`). Même hôte : brief
+    ignoré, session gardée. Une relève croisée SANS brief est **refusée** (le
+    CAS ne déplace pas la ligne) : sans lui, l'hôte changerait en gardant la
+    session et le compte de l'ancien (le contrat médié force le brief à null).
     """
     from .agent_names import resolve as resolve_agent_name
     name = resolve_agent_name(name, db=db, operation="registry.claim")
     _check_name(name)
     return storage.of(db).leases.claim(
-        name, owner, ttl_seconds, require_responsible=_responsible_required(db))
+        name, owner, ttl_seconds, require_responsible=_responsible_required(db),
+        host=host, election_brief=election_brief)
 
 
 def lease_agent(db: Db, name: str, owner: str, epoch: int) -> tuple[bool, str, dict | None]:
@@ -211,7 +227,10 @@ def renew(db: Db, name: str, owner: str, epoch: int, ttl_seconds: float) -> floa
 
     Verrou pris d'abord, échéance recontrôlée avec `clock_timestamp()` dans
     l'écriture : un renouvellement qui a attendu le verrou au-delà de
-    l'expiration est refusé (grille codex3).
+    l'expiration est refusé (grille codex3). Le renouvellement ne raccourcit
+    jamais l'échéance : l'écriture garde le plus tardif de l'échéance tenue et
+    de la nouvelle (`GREATEST`, sous le verrou de ligne) — un renouvellement
+    concurrent ne peut pas être écrasé par une lecture antérieure (#3115).
     """
     from .agent_names import resolve as resolve_agent_name
     name = resolve_agent_name(name, db=db, operation="registry.renew")
@@ -286,6 +305,10 @@ def claimable(db: Db, host: str, names: Sequence[str] | None = None, *,
     §4.1 (toujours, quel que soit le réglage) : un agent gouverné par le canon
     n'est réclamable que si le dernier état du canon de son hôte est `ok`
     (`canon_claim_predicate_sql`).
+
+    L165 (EP1) : un agent `releve: election` est rendu sur chaque hôte
+    candidat, avec l'hôte et le dossier du candidat qui le réclamerait ; sa
+    ligne peut encore être chez un autre détenteur.
     """
     if names is not None:
         from .agent_names import resolve
@@ -446,13 +469,17 @@ def pending_spend_set_model(db: Db, name: str, model: str | None) -> bool:
 
 
 def pending_spend_set_resident_usage(db: Db, name: str, usage: dict | None,
-                                     created_ts: float | None = None) -> bool:
+                                     marker: dict | None = None) -> bool:
     """Pose (ou efface avec None) l'événement `resident.turn` du marqueur (L80a).
 
     L'état durable du tour incomplet : un worker de remplacement y retrouve la
-    mesure et peut écrire l'événement puis la ligne du grand livre. `created_ts`
-    borne l'écriture au marqueur de ce tour, jamais celui d'un remplaçant."""
-    return storage.of(db).pending_spend.set_resident_usage(name, usage, created_ts)
+    mesure et peut écrire l'événement puis la ligne du grand livre. `marker`
+    porte l'identité exacte (#2166 : `created_at`, `spend_key`) et borne
+    l'écriture au marqueur de ce tour, jamais celui d'un remplaçant."""
+    return storage.of(db).pending_spend.set_resident_usage(
+        name, usage,
+        None if marker is None else marker.get("created_at"),
+        None if marker is None else marker.get("spend_key"))
 
 
 def pending_spend_get(db: Db, name: str) -> dict | None:
@@ -470,7 +497,26 @@ def _pending_spend_row(row: dict | None) -> dict | None:
         "start": int(row["start_index"]),
         "turn": row.get("turn") or "",
         "model": row.get("model"),
+        # #2166 : l'identité brute du marqueur (texte UTC à la microseconde),
+        # jamais un float8 relu ; `created_ts` reste l'epoch pour `started_at`.
+        "created_at": row.get("created_at"),
         "created_ts": row.get("created_ts"),
+        # #2166/#2905 : l'identité brute portée par la colonne ; elle borne
+        # `clear_if`/`set_resident_usage`. None sur un marqueur d'avant 0471,
+        # ou périmée après un retour arrière (§14) : `ledger_key` seul fait foi
+        # pour le grand livre.
+        "spend_key": row.get("spend_key"),
+        # #2166 : la clé déjà écrite par ce tour — celle du marqueur, ou la
+        # clé durable retrouvée dans sa ligne/réservation (marqueur d'avant
+        # 0471, quelle que soit la précision de la connexion de réparation).
+        # #2905 : un `ledger_key` explicitement NULL (clé indémontrable) ne
+        # retombe jamais sur la colonne, qui peut être périmée ; le repli sur
+        # `spend_key` ne sert qu'aux backends qui ne rendent pas `ledger_key`.
+        "ledger_key": (row["ledger_key"] if "ledger_key" in row
+                       else row.get("spend_key")),
+        # #2166/B1 : plusieurs candidats incohérents, aucun tour identifiable :
+        # la comptabilité de ce tour doit rester suspendue (fail-closed).
+        "ledger_ambiguous": bool(row.get("ledger_ambiguous")),
         # #796 : le lot du tour (None si inconnu, ou marqueur d'avant 0423)
         "work_item_id": row.get("work_item_id"),
         # #796 : l'identifiant du tour, pour relier la ligne à ses ressources
@@ -480,20 +526,29 @@ def _pending_spend_row(row: dict | None) -> dict | None:
     }
 
 
-def pending_spend_clear(db: Db, name: str, created_ts: float | None = None) -> bool:
-    """Efface le marqueur ; avec `created_ts` (#1469), seulement s'il est encore
-    celui de ce tour — un worker en retard n'efface pas celui de son remplaçant."""
+def pending_spend_clear(db: Db, name: str, marker: dict | None = None) -> bool:
+    """Efface le marqueur ; avec `marker` (#1469), seulement s'il est encore
+    celui de ce tour — un worker en retard n'efface pas celui de son
+    remplaçant. L'identité est exacte (#2166) : `created_at` en texte et
+    `spend_key`, jamais un float8 relu à précision réduite."""
     from .agent_names import resolve as resolve_agent_name
     name = resolve_agent_name(name, db=db, operation="registry.pending_spend_clear")
     api = storage.of(db).pending_spend
-    if created_ts is None:
+    if marker is None:
         return api.clear(name)
+    created_at = marker.get("created_at")
+    if not created_at:
+        # pas d'identité exacte : on n'efface pas un marqueur qu'on ne peut pas
+        # identifier (fail-closed), même si l'ancien float8 correspondait.
+        return False
+    spend_key = marker.get("spend_key")
     if hasattr(api, "clear_if"):
-        return api.clear_if(name, created_ts)
-    # backend médié : pas d'opération conditionnelle, le bail est fencé au serveur
+        return api.clear_if(name, created_at, spend_key)
+    # backend médié : pas d'opération conditionnelle, le bail est fencé au
+    # serveur ; on compare l'identité exacte rendue par `get`.
     row = api.get(name)
-    if row is None or row.get("created_ts") is None \
-            or abs(float(row["created_ts"]) - float(created_ts)) >= 0.0000005:
+    if row is None or row.get("created_at") != created_at \
+            or (row.get("spend_key") or None) != (spend_key or None):
         return False
     return api.clear(name)
 
@@ -518,6 +573,15 @@ def set_status(
         raise ValueError("unknown stop reason: %r (%s)"
                          % (stop_reason, " | ".join(STOP_REASONS)))
     storage.of(db).agents.set_status(name, status, status_text, error, stop_reason)
+
+
+def set_status_text(db: Db, name: str, text: str) -> bool:
+    """#2789 : le texte libre d'un agent (`agent-mail status`), jamais son
+    statut — un tour en cours reste `running`. Faux si l'agent est inconnu,
+    retenu ou arrêté (son texte est alors un marqueur, gardé)."""
+    from .agent_names import resolve as resolve_agent_name
+    name = resolve_agent_name(name, db=db, operation="registry.set_status_text")
+    return storage.of(db).agents.set_status_text(name, text)
 
 
 def set_mode(db: Db, name: str, mode: str) -> bool:

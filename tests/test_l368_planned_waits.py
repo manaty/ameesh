@@ -5,16 +5,163 @@ from __future__ import annotations
 import datetime
 import os
 import re
+import subprocess
+import tempfile
 import time
+import types
 import unittest
 from unittest import mock
 
-from ameesh import (mesh_cli, plan, planned_waits as W, progress, roadmap,
-                    stagnation, storage, work, work_dependencies)
+from ameesh import (mesh_cli, plan, planned_waits as W, progress,
+                    registry, roadmap, stagnation, storage, work, work_dependencies)
 from ameesh import work_dependencies as D
 from ameesh.storage import interface as SI
 from ameesh.storage.postgres.progress import Progress
 from tests.support import PgTestCase
+
+
+class PacketTrailersTest(unittest.TestCase):
+    """#2599 : l'appartenance d'un porteur se lit aussi dans les trailers.
+
+    Le corps du porteur peut manquer la liste « #N <tête> » ; chaque commit
+    de composition porte `ameesh-work: <lot>`. On ne lit que les commits
+    au-dessus de la cible, jamais ceux hérités de `main`."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.repo = self.tmp.name
+        self.git("init", "-q", "-b", "main")
+        self.write("README", "base\n")
+        self.git("add", "README")
+        self.git("commit", "-q", "-m", "base")
+
+    def git(self, *args):
+        return subprocess.run(
+            ["git", "-c", "user.name=test", "-c", "user.email=test@example.invalid",
+             *args], cwd=self.repo, check=True, capture_output=True, text=True,
+            env=dict(os.environ, GIT_CONFIG_NOSYSTEM="1", HOME=self.repo)).stdout
+
+    def write(self, name, text):
+        with open(os.path.join(self.repo, name), "w", encoding="utf-8") as fh:
+            fh.write(text)
+
+    def commit(self, message):
+        self.write("note", message + "\n")
+        self.git("add", "note")
+        self.git("commit", "-q", "-m", message)
+
+    def packet_branch(self):
+        """Une cible, un trailer hérité, puis une branche de porteur."""
+        self.commit("vehicule 2200 : #9999 abcdef0\n\nameesh-work: 9999")
+        self.git("checkout", "-q", "-b", "integration/paquet-test")
+        self.commit("vehicule 2300 : #1234 abcdef0\n\nameesh-work: 1234")
+        self.commit("vehicule 2300 : #5678 abcdef0\n\nameesh-work: 5678")
+        # un lot cité en prose, sans trailer, n'est pas une unité
+        self.commit("paquet ; #2203 exclu, #1976 admis mais exclu")
+        return self.git("rev-parse", "HEAD").strip()
+
+    def test_reads_the_trailers_above_the_target(self):
+        head = self.packet_branch()
+        carrier = {"branch": "integration/paquet-test", "branch_head": head}
+        self.assertEqual(W.packet_trailers(self.repo, carrier, "main"), {1234, 5678})
+        # la tête observée reste lisible quand la branche locale a disparu
+        self.git("checkout", "-q", "main")
+        self.git("branch", "-q", "-D", "integration/paquet-test")
+        self.assertEqual(W.packet_trailers(self.repo, carrier, "main"), {1234, 5678})
+
+    def test_an_unreadable_branch_is_not_a_membership(self):
+        self.assertIsNone(W.packet_trailers(
+            self.repo, {"branch": "integration/absente"}, "main"))
+
+    def test_published_target_excludes_history_when_local_main_is_stale(self):
+        head = self.packet_branch()
+        self.git("remote", "add", "origin", self.repo)
+        self.git("update-ref", "refs/remotes/origin/main", "main")
+        # Le clone partagé a fetché main sans déplacer sa branche locale.
+        self.git("branch", "-f", "main", "main~1")
+        carrier = {"branch": "integration/paquet-test", "branch_head": head}
+        self.assertEqual(W.packet_trailers(self.repo, carrier, "main"), {1234, 5678})
+
+    def test_published_carrier_excludes_units_dropped_since_local_branch(self):
+        head = self.packet_branch()
+        self.git("remote", "add", "origin", self.repo)
+        self.git("checkout", "-q", "-b", "recomposed", "main")
+        self.commit("vehicule : #5678 abcdef0\n\nameesh-work: 5678")
+        self.git("update-ref", "refs/remotes/origin/integration/paquet-test", "HEAD")
+        carrier = {"branch": "integration/paquet-test", "branch_head": head}
+        self.assertEqual(W.packet_trailers(self.repo, carrier, "main"), {5678})
+
+    def test_attachments_come_from_the_project_repo(self):
+        head = self.packet_branch()
+        cfg = types.SimpleNamespace(radar={"projects": {
+            "ameesh": {"repo": self.repo, "target": "main"}}})
+        carrier = {"id": 9001, "state": "qa", "app": "ameesh",
+                   "branch": "integration/paquet-test", "branch_head": head}
+        self.assertEqual(W.packet_attachments(cfg, [carrier]),
+                         {9001: {1234, 5678}})
+
+    def test_without_a_project_repo_nothing_is_attached(self):
+        carrier = {"id": 9001, "state": "qa", "app": "ameesh",
+                   "branch": "integration/paquet-test"}
+        self.assertEqual(W.packet_attachments(None, [carrier]), {})
+        self.assertEqual(W.packet_attachments(types.SimpleNamespace(radar={}), [carrier]), {})
+
+    def test_a_registry_clone_replaces_a_missing_project_repo(self):
+        # #2837 : l'hôte qui lit les alertes n'a pas forcément les réglages
+        # radar ; un clone d'agent qui porte la tête du porteur suffit à lire
+        # la composition, donc à taire le SLO des unités du paquet.
+        head = self.packet_branch()
+        carrier = {"id": 9001, "state": "qa", "app": "ameesh",
+                   "branch": "integration/paquet-test", "branch_head": head}
+        db = types.SimpleNamespace()
+        with mock.patch.object(registry, "overview",
+                               return_value=[{"cwd": self.repo}]):
+            self.assertEqual(W.packet_attachments(None, [carrier], db=db),
+                             {9001: {1234, 5678}})
+
+    def test_registry_clone_reads_the_observed_head_not_a_stale_published_ref(self):
+        # #2837 : un clone du registre peut garder une ref publiée en retard.
+        # La tête observée (`branch_head`) fait foi : un lot retiré de la
+        # recomposition ne reste pas attaché au véhicule.
+        old = self.packet_branch()
+        self.git("remote", "add", "origin", self.repo)
+        self.git("update-ref", "refs/remotes/origin/main", "main")
+        self.git("update-ref", "refs/remotes/origin/integration/paquet-test", old)
+        self.git("checkout", "-q", "-b", "observed", "main")
+        self.commit("vehicule : #5678 abcdef0\n\nameesh-work: 5678")
+        head = self.git("rev-parse", "HEAD").strip()
+        carrier = {"id": 9001, "state": "qa", "app": "ameesh",
+                   "branch": "integration/paquet-test", "branch_head": head}
+        with mock.patch.object(registry, "overview",
+                               return_value=[{"cwd": self.repo}]):
+            self.assertEqual(W.packet_attachments(None, [carrier],
+                                                  db=types.SimpleNamespace()),
+                             {9001: {5678}})
+
+    def test_a_registry_clone_without_the_carrier_head_attaches_nothing(self):
+        self.packet_branch()
+        carrier = {"id": 9001, "state": "qa", "app": "ameesh",
+                   "branch": "integration/absente", "branch_head": "0" * 40}
+        with mock.patch.object(registry, "overview",
+                               return_value=[{"cwd": self.repo}]):
+            self.assertEqual(
+                W.packet_attachments(None, [carrier], db=types.SimpleNamespace()), {})
+
+    def test_the_dry_pass_is_not_read(self):
+        # la passe à blanc de db.batched ne fait aucune I/O (même règle que
+        # la sonde pgbouncer, #2582)
+        from ameesh import db as db_mod
+
+        self.assertTrue(W._dry_pass(mock.Mock(spec=db_mod._Recorder)))
+        self.assertFalse(W._dry_pass(object()))
+
+    def test_prose_only_is_not_an_attached_unit(self):
+        rows = [{"id": 1234, "state": "qa"}, {"id": 2203, "state": "qa"}]
+        carrier = {"id": 9001, "state": "qa", "branch": "integration/paquet-test",
+                   "body": "paquet ; #2203 exclu (verdict manquant)"}
+        waits = W.packet_waits(rows, rows + [carrier], attachments={9001: {1234}})
+        self.assertEqual(list(waits), [1234])
 
 
 class UnitTest(unittest.TestCase):
@@ -322,6 +469,45 @@ class UnitTest(unittest.TestCase):
         self.assertEqual(W.explicit_holds([event("hold: op", "mesh-design", 1.0, 2)],
                                           allowed=lambda who: who == "mesh-design")[1]["by"],
                          "mesh-design")
+
+    def test_pilot_hold_releases_keep_every_lift_for_the_intake_clock(self):
+        """#2916/#1225 : les levées d'un hold de pilote sont rendues au calcul
+        SLO (toutes, pour qu'il filtre par premier `build`, #2921) ; un hold
+        d'un acteur ordinaire ne compte pas, même autorisation que
+        `pilot_holds`."""
+        def event(note, ts, ident, actor="human:pilote", state="intake"):
+            return {"work_item_id": 1, "state": state, "note": note,
+                    "actor": actor, "created_ts": ts, "id": ident}
+
+        events = [event("created", 0.5, 1),
+                  event("hold: attente owner", 1.0, 2),
+                  event("triage: relevé", 2.0, 3),
+                  event("unhold: gestes faits", 3.0, 4),
+                  event("hold: seconde attente", 4.0, 5),
+                  event("unhold: reprise", 5.0, 6)]
+        self.assertEqual(W.pilot_hold_releases(None, events), {1: [3.0, 5.0]})
+        # un hold d'un acteur ordinaire ne compte pas (il ne suspend pas la
+        # stagnation non plus) ; la levée du pilote ne rend pas de date.
+        self.assertEqual(W.pilot_hold_releases(
+            None, [event("hold: op", 1.0, 2, actor="dev7"),
+                   event("unhold: op", 2.0, 3)]), {})
+        # une levée d'un acteur ordinaire ne lève pas le hold de pilote
+        self.assertEqual(W.pilot_hold_releases(
+            None, [event("hold: op", 1.0, 2),
+                   event("unhold: à tort", 2.0, 3, actor="dev7")]), {})
+        # ... mais la levée du pilote qui suit compte
+        self.assertEqual(W.pilot_hold_releases(
+            None, [event("hold: op", 1.0, 2),
+                   event("unhold: à tort", 2.0, 3, actor="dev7"),
+                   event("unhold: feu reçu", 4.0, 5)]), {1: [4.0]})
+        # un changement d'état lève aussi le hold
+        self.assertEqual(W.pilot_hold_releases(
+            None, [event("hold: op", 1.0, 2),
+                   event("prise", 2.0, 3, state="build")]), {1: [2.0]})
+        # l'ordre est celui de l'écriture, pas celui de la liste
+        self.assertEqual(W.pilot_hold_releases(
+            None, [event("unhold: reprise", 3.0, 3),
+                   event("hold: op", 1.0, 2)]), {1: [3.0]})
 
     def test_hold_outranks_a_declared_dependency_and_its_label(self):
         hold = {1: {"what": "hold", "by": "pilote", "since": 1700000000.0}}

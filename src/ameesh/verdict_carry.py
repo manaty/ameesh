@@ -446,7 +446,13 @@ def _decided(notes, reviewed: str, frozen: str) -> bool:
 def _clone(cfg, row: dict, repo: str):
     from . import radar, resolutions
     name = str(row.get("app") or "").strip() or os.path.basename(repo.rstrip("/"))
-    return resolutions.Replayer(repo, radar.clone_dir(cfg, name))
+    project = None
+    try:
+        project = radar.settings_of(cfg).projects.get(name)
+    except Exception:  # noqa: BLE001 - réglages radar illisibles : cible par défaut
+        project = None
+    return resolutions.Replayer(repo, radar.clone_dir(cfg, name),
+                                target=getattr(project, "target", "") or "")
 
 
 def _passive(db, to, lot: int, text: str, data: dict) -> None:
@@ -597,7 +603,8 @@ def _plan_for(cfg, db, lot: int, out: dict, declared: str, *, repo, clone, notes
         return out, [], [], ""
     out["tip"] = tip
     if merge_queue.pinned(where, declared) is None and row.get("branch"):
-        merge_queue.fetch_fresh(repo, [row["branch"]], clone)   # objets de la tête gelée
+        # objets de la tête gelée, bornés par la cible
+        merge_queue.fetch_fresh(repo, [row["branch"]], clone, base=out["target"])
     frozen = merge_queue.pinned(where, declared)
     if not frozen:
         out.update(result="error", detail="the freeze %s is not a commit of %s"
@@ -648,6 +655,20 @@ _COPY_SQL = ("INSERT INTO work_item_milestones (work_item_id, kind, sha, actor, 
              "  WHERE id = %s AND work_item_id = %s AND kind = 'verdict'"
              " RETURNING id")
 
+#: #2928 : la preuve du verdict d'origine suit le jalon reporté. Le reçu
+#: nomme le nouveau jalon et sa tête (la même que celle du jalon copié), avec
+#: l'acteur, la session, le tour et le harnais du relecteur d'origine : c'est
+#: son geste qui reste la preuve, le report n'étant que mécanique. Sans cette
+#: copie, un verdict reporté sur un lot sensible perdait son reçu et la porte
+#: le refusait, alors que le report dit « pas de nouvelle relecture due ».
+_COPY_RECEIPT_SQL = (
+    "INSERT INTO provenance_receipts"
+    "       (subject, sha, actor, session, turn, harness, work_item_id)"
+    " SELECT 'milestone:' || %s, %s, actor, session, turn, harness, work_item_id"
+    "   FROM provenance_receipts"
+    "  WHERE subject = 'milestone:' || %s"
+    " ON CONFLICT (subject) DO NOTHING")
+
 
 def _write(db, lot: int, out: dict, declared: str, plan: list, refused: list,
            where: str) -> dict:
@@ -682,7 +703,12 @@ def _write(db, lot: int, out: dict, declared: str, plan: list, refused: list,
                 continue              # verdict rendu ou reporté entre-temps : le sien vaut
             note = ("%s %s on %s@%s, same merge result and same lot delta as the reviewed "
                     "head (#2442)" % (CARRIED, _arrow(reviewed, frozen), target, tip[:12]))
-            if tx.query(_COPY_SQL, (frozen, note, int(mark["id"]), int(lot))):
+            copied = tx.query(_COPY_SQL, (frozen, note, int(mark["id"]), int(lot)))
+            if copied:
+                # #2928 : le reçu du verdict d'origine suit le jalon reporté
+                # (même acteur/session/tour, tête du nouveau jalon).
+                tx.execute(_COPY_RECEIPT_SQL,
+                           (int(copied[0]["id"]), frozen, int(mark["id"])))
                 carried.append(_entry(mark, reviewed))
         if carried:
             try:

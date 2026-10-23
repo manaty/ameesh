@@ -406,6 +406,29 @@ class AbandonDbTest(_Systeme, PgTestCase):
         self.assertNotIn(entree, {a.get("path") for a in exploitation.alerts(self.cfg, self.db)
                                   if a["type"] == "tmp_orphan"})
 
+    def test_bilan_24h_compte_un_chemin_non_attribue_une_fois(self):
+        """#2617 : re-signalée toutes les 12 h, une entrée non attribuée ne
+        compte pas deux fois dans le bilan 24 h : un chemin, sa dernière
+        taille."""
+        self._en_tour("a2")
+        entree = os.path.join(self.sys, "double-signalement")
+        self._tour(lambda: _write(os.path.join(entree, "f"), 5000))
+        registry.set_status(self.db, "a2", "idle")
+        _write(os.path.join(entree, "g"), 7000)
+        taille = menage.size_of(entree)
+        self._passage(menage.UNATTRIBUTED_REFRESH_S + 60)
+        hk = storage.of(self.db).housekeeping
+        lignes = [r for r in hk.recent("pc", 86400, 50, kind="orphan")
+                  if r["path"] == entree]
+        self.assertEqual([r["action"] for r in lignes], ["signaled", "signaled"])
+        bilan = {r["action"]: r for r in hk.summary("pc", 86400.0)
+                 if r["kind"] == "orphan"}
+        self.assertEqual(bilan["signaled"]["n"], 1)
+        self.assertEqual(bilan["signaled"]["bytes"], taille)
+        proc = self.mesh("hosts")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("orphan signaled ×1", proc.stdout)
+
     def test_dossier_tmp_sans_proprietaire_alerte_une_fois(self):
         """#2493 N1 : un dossier de la racine gérée sans fichier de
         propriétaire n'est jamais supprimé ; il n'est plus répété dans

@@ -160,6 +160,8 @@ responsible: human:smichea       # REQUIS
 tags: [perso, prod]              # étiquettes visées par les admissions (L31)
 admins: [human:alice]            # administrateurs : règle de visibilité (L31)
 occupants: [human:anna]          # accès physique sans administrer (L110) ; absent = aucun
+indisponible_jusqu_au: 2026-10-30 # appareil indisponible, jour inclus (#3070, canon §12)
+indisponible_motif: "en déplacement"
 policy:
   harnesses: [claude, codex, deepseek]   # absent = tous
   providers: [anthropic, openai, deepseek]
@@ -177,6 +179,16 @@ policy:
   work_roots: {acme-web: ~/acme/acme-web, nexlink: "~/dev/nexlink-{agent}"}   # par projet (L31)
   work_root: ~/src               # défaut : work_root/<projet>
 ```
+
+**Appareil indisponible** (#3070, canon §12) : `indisponible_jusqu_au` (jour
+ISO, inclus) et `indisponible_motif` déclarent l'appareil indisponible ; une
+séance qu'il porte ne retarde ni paquet, ni release, ni prod (voir
+[EXPLOITATION](../EXPLOITATION.md), « Appareil indisponible »). Un appareil
+physique sans agent (Mac, PC de recette) a sa fiche `hotes/` avec
+`policy.max_agents: 0`. Une date illisible est une erreur
+(`host-unavailable-invalid`) qui ne déclare rien ; un motif sans date, un
+avertissement ; une date passée, une information (`host-unavailable-past`) :
+la règle a cessé d'elle-même.
 
 **Dossier de travail d'un agent sur l'hôte** (L31, 0029 ; L35) : c'est un
 réglage de l'hôte, jamais de la persona. Ordre de résolution, le premier qui
@@ -311,6 +323,31 @@ couvre pas `docs/a.md` (écrire `docs/**`).
 par trigger ; `frozen` (branche gelée pour la revue) et `verdict` (`ok` ou
 `blocked`, avec le commit relu) se déclarent par
 `ameesh work milestone <id> frozen|verdict [ok|blocked] --sha S [--note …]`.
+Un `verdict` **exige** que `--sha` nomme la tête relue : le commit complet, ou
+une abréviation d'au moins 12 caractères hexadécimaux résolue dans un dépôt
+(`--repo` s'il est nommé, sinon le répertoire courant, le dépôt du projet ou
+celui de l'assigné) ou dans la tête gelée courante. Sans elle, le jalon est
+refusé et la tête gelée proposée ; les anciens verdicts sans SHA restent
+lisibles mais ne comptent pas à la porte, et `ameesh work show` les signale
+(« avis non rattaché à une tête »).
+Un `frozen` **exige** une tête immuable (#2786) : le commit complet (40 ou 64
+hexadécimaux), ou une abréviation d'au moins 12 caractères hexadécimaux
+résolue dans le dépôt de l'auteur (répertoire courant, `--repo`, dépôt du
+projet ou de l'assigné) et alors **écrite complète** ; une ref symbolique
+(`HEAD`, une branche) est refusée. Le balayage des fusions et la désignation
+automatique n'acceptent qu'un commit complet et ne résolvent jamais une ref
+dans leur propre clone : un gel « HEAD » vaut doute, jamais une livraison, et
+`ameesh work show` le signale (« jalon non rattaché à un commit »). Un gel
+dont le commit est **déjà ancêtre de la cible** au moment du gel (aucun
+commit propre, cas #2784) est refusé à l'écriture ; et le balayage ne compte
+pas comme livraison un gel qui était déjà dans la cible quand il a été posé.
+La cible est lue **publiée et rafraîchie** (fetch borné de `origin`) : un
+clone d'auteur en retard sur la forge ne peut ni accepter un gel déjà livré
+ni écrire la preuve d'absence qui le rendrait livrable. Quand la forge est
+illisible, le gel s'écrit sans cette preuve — le balayage doute, il ne
+devine pas. La preuve d'absence est une ligne machine : une
+`ameesh-freeze-absent:` fournie dans `--note` est ignorée, jamais recopiée
+(sinon n'importe quel appelant contournerait le refus #2784).
 Les durées `demande → gel`, `gel → revue`, `gel → fusion` et le nombre de
 verdicts bloqués se lisent dans `ameesh work list` (colonne DÉLAI), `ameesh work
 show` (frise complète) et le pied de `ameesh list` ; la forme complète est

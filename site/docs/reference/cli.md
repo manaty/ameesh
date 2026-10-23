@@ -47,7 +47,7 @@ agent-mail bind --import FILE         # import bindings from a local bridge file
 agent-mail unbind --session ID --harness H
 agent-mail bindings [--all] [--json]  # active session bindings (--all: revoked ones too)
 agent-mail alias <NAME> <DIR> [PROJECT]
-agent-mail status "<current work>"    # agent status (registry + terminal title)
+agent-mail status "<current work>"    # status text (registry + terminal title); the status stays the runner's
 agent-mail hook <claude|codex|deepseek>   # hook: reads JSON on stdin, delivers unread mail
 agent-mail statusline                 # Claude Code status line
 agent-mail migrate                    # versioned migrations
@@ -352,13 +352,16 @@ ameesh work list [--state S] [--assignee A] [--limit N] [--stale-after S] [--jso
 ameesh work show <id> [--json]
 ameesh work move <id> <intake|build|qa|merged|promoted|blocked|waiting_human> [--note N] [--actor A]
 ameesh work move <id> merged --correct REASON [--actor A]
-ameesh work merged <id> --sha SHA [--migration-landed N] [--note N] [--actor A]
+ameesh work merged <id> (--sha SHA | --pr OWNER/REPO#N) [--migration-landed N]
+                     [--note N] [--actor A]
 ameesh work assign <id> <agent> [--externe] [--actor A] [--claim] [--branch agent/…] [--target BRANCH]
 ameesh work dependencies <id> [--add ID|--remove ID] [--actor A]   # blocking prerequisites (L385)
 ameesh work migration <id> [--number N] [--release] [--repo R]   # reserve a migration number (L122)
 ameesh work set-app <id> <project> [--actor A] | backfill-app [--dry-run]
 ameesh work link <id> [CARD] [--none] [--actor A] | close <id> (--abandoned | --superseded-by ID | --delivered --sha SHA | --done)
-ameesh work sync-merges [--target T] [--dry-run] [--json]   # close frozen lots whose content is merged (L29)
+ameesh work packet record <carrier> [--repo R] [--base SHA] [--head REF] [--dry-run] [--json]
+ameesh work packet show <lot|carrier> [--json]   # recorded package composition (#2443)
+ameesh work sync-merges [--target T] [--dry-run] [--json]   # close frozen lots whose content is merged (L29), unless blocked or held (#2744)
 ameesh work sync-packets [--target T] [--dry-run] [--json] # close the units of merged packages (manifest, #2426)
 ameesh work sync-github [--dry-run] [--json]          # close lots whose PR is merged (read-only)
 ameesh work schedule [--apply] [--json]               # planned dates at the p80 (L157c)
@@ -378,6 +381,12 @@ ameesh work milestone <id> <frozen|verdict> [ok|blocked] [--sha SHA] [--note N] 
                        [--repo R] [--no-static-checks REASON]
         # frozen: the project's static checks (scripts/freeze-checks.py of SHA,
         # run on SHA's tree) pass first; red refuses the freeze (#2542)
+        # frozen SHA: full 40-hex commit, or a 12+ hex abbreviation resolved in
+        # the author's repository and written full; HEAD/a branch is refused,
+        # and a legacy non-full freeze is a doubt, never a merge (#2786)
+        # the target is read published and refreshed (bounded fetch of origin);
+        # a stale clone neither accepts an already-delivered freeze nor writes
+        # the absence mark that would make it look delivered (#2786, cx1)
 ameesh work backlog add --title T --value "expected value" --score 1-100
                         [--priority 1|2|3] [--source S] [--team T] [--requires CAP …]
                         [--body B] [--package CARD] [--json]
@@ -401,7 +410,13 @@ with a journal entry (#333). `work link` attaches a lot to a WorkPackage card
 `work close` closes an abandoned, superseded or delivered-outside-target lot
 (`--delivered --sha <reviewed head>`: the `delivered` milestone carries the
 head and counts as a delivery in `estimates`, #988), and `work sync-merges`
-closes the frozen lots whose content is already merged (L29). `work schedule`
+closes the frozen lots whose content is already merged (L29), including a
+unit linked to a merged package by `work packet record` (#2443). `work packet
+record` reads the package's composition commits (`ameesh-work:` trailers) and
+writes the link — never the manifest; `work packet show` prints it. A lot that
+is `blocked` or carries an unlifted `hold:` note is left open, with a journal
+line `contenu fusionné, fermeture retenue : <motif>` and a wake-up to the
+holder (#2744). `work schedule`
 proposes the planned dates of open assigned lots at the p80 of the L157
 reference table (`--apply` writes), and `work measure` records the actual time
 per phase and the merged diff size. `work project-github` projects the lots (or
@@ -490,6 +505,19 @@ created branch, already an ancestor of its target, is not a merge.
 A configured `ameesh.target` that does not resolve is reported as an error,
 never silently replaced by `main`.
 
+**Stacked PRs.** Before merging a PR whose base is not the repository's
+default branch, the fire (direct `gh pr merge`), `work merge-pr` and the merge
+queue verify that this base is not already merged into the default branch:
+merging there would land the content on a dead branch and lose it
+(home#112/#113 after `canon/2452` was merged). The refusal names the fix
+(`gh pr edit --base <default> N`, then freeze and re-review). A `gh pr merge`
+run by hand outside ameesh — office — keeps that check manual:
+
+```
+git -C <clone> merge-base --is-ancestor origin/<base> origin/<default> \
+  && gh pr edit <N> --repo <owner/repo> --base <default>
+```
+
 **Merges without a PR or a branch.** The same check also covers open lots
 without a branch whose assignee is on the host: a merge commit of the target,
 made after the lot was created, designates the lot with an `ameesh-work: <id>`
@@ -498,9 +526,18 @@ line, or with `#<id>` in its subject when the repository opts in
 The closed lot records the merge commit and a note saying how the merge was
 found. By hand, `work merged <id> --sha SHA` moves a lot from any open state
 (`intake`, `build`, `qa`, `blocked`, `waiting_human`) to `merged` at once,
-with its `merged` milestone; a closed lot is never reopened. A lot set to
-`promoted` by mistake goes back with `work move <id> merged --correct
-"reason"`, logged, for humans and orchestrator or design agents only.
+with its `merged` milestone; a closed lot is never reopened. When the lot's
+PR lives in another repository than the lot's (the canon `manaty/home`, for
+example), `work merged <id> --pr OWNER/REPO#N` reads it with `gh`: the PR must
+be `MERGED`, its head must be the lot's freeze (else its recorded branch),
+and GitHub must report its merge commit; that commit must be in the
+repository's default branch (`gh repo view` then `gh api compare`: `behind`
+or `identical`, any doubt refuses — a merged stacked base that never entered
+the default does not deliver). `--sha` is only an equality check; without a
+reported merge commit, the declaration is refused.
+A lot set to `promoted` by mistake goes back with `work move <id> merged
+--correct "reason"`, logged, for humans and orchestrator or design agents
+only.
 
 **Actor.** Without `--actor`, `work` commands record the session's bound
 identity (`AGENT_MAIL_NAME`, or a session binding), else `inconnu` with a
@@ -563,6 +600,7 @@ ameesh placement check [--canon DIR] [--ref REV] [--fetch] [--json] [--agent A]
 ameesh agent name  --role R [--project P …] [--canon DIR] [--ref REV] [--fetch] [--json]
 ameesh agent spawn [name] --by CREATOR --ttl TTL [--role R] [--project P …] [--cwd DIR] [--prompt TEXT] [--json]
 ameesh review-class [FILE …] [--diff REF] [--canon DIR] [--ref REV] [--fetch] [--json]
+ameesh process check FILE [--ref REF] [--version N] [--json]
 ```
 
 | Option | Meaning |
@@ -575,6 +613,13 @@ ameesh review-class [FILE …] [--diff REF] [--canon DIR] [--ref REV] [--fetch] 
 | `--ttl` (spawn) | expiry: `30m`, `2h`, `1d` (max `7d`) |
 | `--role`, `--project` (name, spawn) | role and projects of a generated name; `--project` repeats, several projects drop the repo segment (`<org>-<role>-<seq>`). Segments come from `extensions.ameesh.naming`; a role without a short name is refused, and a name already used by a card or any registry row (stopped agents included) is never reused. Two repos never share a segment and one repo keeps the same segment in every canon (a divergent mesh is refused); a configured canon that cannot be read also refuses generation, naming the canon and its ref |
 | `--diff` (review-class) | files changed since REF (`REF..HEAD` + working tree) |
+
+`ameesh process check` compiles the `workflow:` block of a Process card
+(`processus/*.md`, see [Write a Process card](../guides/write-a-process.md));
+it reads no database and writes nothing. `--ref` and `--version` label the
+checked revision (default `file:<path>` and `0`), `--json` prints the encoded
+native document and labels. Exit 0 when the block compiles (or the card has no
+workflow), 1 on a named refusal, 2 when the file cannot be read.
 
 ## Hosts, capacity and enrolment
 

@@ -250,6 +250,7 @@ def _dry_run(cfg, project, *, now, version, as_json: bool) -> int:
         "direct": plan.direct, "included": plan.included,
         "excluded": plan.excluded, "migrations": plan.migrations,
         "notes": plan.notes, "empty": plan.empty,
+        "tree_green": plan.tree_green,
     }
     if as_json:
         print(json.dumps(report, ensure_ascii=False, indent=2, default=str))
@@ -260,9 +261,15 @@ def _dry_run(cfg, project, *, now, version, as_json: bool) -> int:
     else:
         print("release %s — coupure %s — cible %s @ %s"
               % (plan.version, plan.cutoff_label, project.target, plan.head[:12]))
-        print("CI verte: %s%s" % ("oui" if plan.green else "non",
-                                  "" if plan.green else
-                                  " ; dernier vert " + (plan.last_green or "?")[:12]))
+        if plan.tree_green:
+            print("CI tête en cours ; arbre = tête de paquet %s, suite complète verte "
+                  "(%s)" % (plan.tree_green["head"][:12], ", ".join(
+                      run["url"] or "run %s" % run["id"]
+                      for run in plan.tree_green["runs"])))
+        else:
+            print("CI verte: %s%s" % ("oui" if plan.green else "non",
+                                      "" if plan.green else
+                                      " ; dernier vert " + (plan.last_green or "?")[:12]))
         print("paquets: %s" % (", ".join(
             "%s%s" % (packet.package, " (#%d)" % packet.pr if packet.pr else "")
             for packet in plan.packets) or "aucun"))
@@ -298,8 +305,111 @@ def _report_error(cfg, db, project, exc, now: float) -> None:
         pass
 
 
+def _release_tick(cfg, args, declared) -> int:
+    """`release cutoff|tick` for the declared release projects (#2448)."""
+    from . import release_cutoff
+    try:
+        names = _project_names(cfg, args)
+    except release_cutoff.ReleaseError as exc:
+        print("error: %s" % exc, file=sys.stderr)
+        return 1
+    now = time.time() if args.now is None else float(args.now)
+    if getattr(args, "dry_run", False):
+        for name in names:
+            try:
+                _dry_run(cfg, declared[name], now=now,
+                         version=getattr(args, "version", None), as_json=args.json)
+            except release_cutoff.ReleaseError as exc:
+                print("%s: %s" % (name, exc), file=sys.stderr)
+                return 1
+        return 0
+    from .db import open_db
+    db = open_db(cfg)
+    try:
+        status = 0
+        for name in names:
+            project = declared[name]
+            try:
+                report = release_cutoff.execute(
+                    cfg, db, project, now=now, force=getattr(args, "force", False),
+                    no_staging=getattr(args, "no_staging", False),
+                    version=getattr(args, "version", None))
+            except release_cutoff.TransientReleaseError as exc:
+                print("%s: %s" % (name, exc), file=sys.stderr)
+                status = 1
+                continue
+            except release_cutoff.ReleaseError as exc:
+                print("%s: %s" % (name, exc), file=sys.stderr)
+                _report_error(cfg, db, project, exc, now)
+                status = 1
+                continue
+            if args.json:
+                print(json.dumps(report, ensure_ascii=False, default=str))
+            else:
+                print("%s: %s%s" % (name, report.get("result"),
+                                    " (%s)" % report.get("version")
+                                    if report.get("version") else ""))
+            if report.get("result") not in ("released", "reconciled", "nothing-new",
+                                            "already-recorded", "not-due", "missed"):
+                status = 1
+        return status
+    finally:
+        db.close()
+
+
+def _packet_watch(cfg, args) -> int:
+    """#2601: the "missed slot" alert of the hourly packets, on the same tick.
+
+    Never fatal for the release: a failure is printed and returns 1."""
+    from . import packet_watch, release_cutoff
+    try:
+        declared = packet_watch.projects(cfg)
+    except packet_watch.WatchError as exc:
+        print("packet-watch: %s" % exc, file=sys.stderr)
+        return 1
+    if not declared:
+        if args.release_command == "packet-watch":
+            print("packet-watch: off (no packet_watch block for this host)")
+        return 0
+    now = time.time() if args.now is None else float(args.now)
+    from .db import open_db
+    try:
+        db = open_db(cfg)
+    except Exception as exc:  # noqa: BLE001 - base injoignable : rien à conclure
+        print("packet-watch: %s" % exc, file=sys.stderr)
+        return 1
+    try:
+        results = packet_watch.tick(
+            cfg, db, now=now, dry_run=getattr(args, "dry_run", False),
+            only=getattr(args, "project", None) if args.release_command == "packet-watch"
+            else None,
+            rules_of=lambda name: release_cutoff.compiled_rules(cfg, name)[0])
+    except packet_watch.WatchError as exc:
+        print("packet-watch: %s" % exc, file=sys.stderr)
+        return 1
+    finally:
+        db.close()
+    status = 0
+    for result in results:
+        if getattr(args, "json", False):
+            print(json.dumps(result, ensure_ascii=False, default=str))
+        else:
+            print("packet-watch %s: %s%s%s" % (
+                result["project"], result["result"],
+                " (%s)" % result["slot"] if result.get("slot") else "",
+                " #%d" % result["lot"] if result.get("lot") else ""))
+            if result.get("body"):
+                print(result["body"])
+        if result["result"] in ("error", "not-delivered"):
+            print("packet-watch %s: %s" % (result["project"],
+                                           result.get("error") or result.get("failed")),
+                  file=sys.stderr)
+            status = 1
+    return status
+
+
 def run(cfg, args) -> int:
-    """`ameesh release open|check|reason|cutoff|tick|calendar`."""
+    """`ameesh release open|check|reason|cutoff|tick|calendar|packet-watch`."""
     from . import release_cutoff
     command = args.release_command
     if command == "calendar":
@@ -320,58 +430,17 @@ def run(cfg, args) -> int:
             except Exception as exc:
                 print("%s: calendrier illisible (%s)" % (name, exc))
         return 0
+    if command == "packet-watch":
+        return _packet_watch(cfg, args)
     if command in ("cutoff", "tick"):
         declared = release_cutoff.projects(cfg)
         if not declared:
             print("release: off (no release block for this host)")
-            return 0
-        try:
-            names = _project_names(cfg, args)
-        except release_cutoff.ReleaseError as exc:
-            print("error: %s" % exc, file=sys.stderr)
-            return 1
-        now = time.time() if args.now is None else float(args.now)
-        if getattr(args, "dry_run", False):
-            for name in names:
-                try:
-                    _dry_run(cfg, declared[name], now=now,
-                             version=getattr(args, "version", None), as_json=args.json)
-                except release_cutoff.ReleaseError as exc:
-                    print("%s: %s" % (name, exc), file=sys.stderr)
-                    return 1
-            return 0
-        from .db import open_db
-        db = open_db(cfg)
-        try:
-            status = 0
-            for name in names:
-                project = declared[name]
-                try:
-                    report = release_cutoff.execute(
-                        cfg, db, project, now=now, force=getattr(args, "force", False),
-                        no_staging=getattr(args, "no_staging", False),
-                        version=getattr(args, "version", None))
-                except release_cutoff.TransientReleaseError as exc:
-                    print("%s: %s" % (name, exc), file=sys.stderr)
-                    status = 1
-                    continue
-                except release_cutoff.ReleaseError as exc:
-                    print("%s: %s" % (name, exc), file=sys.stderr)
-                    _report_error(cfg, db, project, exc, now)
-                    status = 1
-                    continue
-                if args.json:
-                    print(json.dumps(report, ensure_ascii=False, default=str))
-                else:
-                    print("%s: %s%s" % (name, report.get("result"),
-                                        " (%s)" % report.get("version")
-                                        if report.get("version") else ""))
-                if report.get("result") not in ("released", "reconciled", "nothing-new",
-                                                "already-recorded", "not-due", "missed"):
-                    status = 1
-            return status
-        finally:
-            db.close()
+            return _packet_watch(cfg, args) if command == "tick" else 0
+        if command == "tick":
+            status = _release_tick(cfg, args, declared)
+            return max(status, _packet_watch(cfg, args))
+        return _release_tick(cfg, args, declared)
     from .db import open_db
     db = open_db(cfg)
     try:
@@ -437,6 +506,16 @@ def add_parser(sub, func) -> None:
     tick_p.add_argument("--version", default=None)
     tick_p.add_argument("--json", action="store_true")
     tick_p.set_defaults(func=func)
+    watch_p = rel.add_parser(
+        "packet-watch", help="#2601: alert the composer and the pilot when a compiled "
+                             "packet slot passes with ready lots and a free target "
+                             "(also run by `tick`)")
+    watch_p.add_argument("--project", default=None)
+    watch_p.add_argument("--now", type=float, default=None)
+    watch_p.add_argument("--dry-run", action="store_true",
+                         help="print the alert; no mail, no state")
+    watch_p.add_argument("--json", action="store_true")
+    watch_p.set_defaults(func=func)
     calendar_p = rel.add_parser(
         "calendar", help="show the compiled cutoffs and the next one")
     calendar_p.add_argument("--now", type=float, default=None)

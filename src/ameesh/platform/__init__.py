@@ -96,12 +96,34 @@ from .process import (PROC, alive, ancestry, become_subreaper, boot_time, childr
                       open_fd_count, parent_pid, process_table, process_group_exists,
                       reap, exited_child, exited_child_status, self_cgroup_paths, start_time, same_start, ticks_to_epoch, user_paths, UserPaths)
 from .terminal import human_tty  # noqa: E402
-from .host import (CGROUP_ROOT, btrfs_allocation, btrfs_fs_info, cgroup_cpu_seconds,  # noqa: E402
-                   cgroup_memory_bytes, cpu_busy_seconds, load_average, memory, mount_of, parse_pressure,
-                   power, pressure, mountinfo, covering_mount, mount_id)
+from .host import (CGROUP_ROOT, btrfs_allocation, btrfs_fs_info, cgroup_cpu_max,  # noqa: E402
+                   cgroup_cpu_seconds, cgroup_cpu_stat, cgroup_dir, cgroup_memory_bytes,
+                   cgroup_memory_max, cgroup_pressure, cpu_busy_seconds, in_container, load_average, memory,
+                   mount_of, own_cgroup, own_cgroup_bounded, parse_pressure, power, pressure,
+                   mountinfo, covering_mount, mount_id)
+
+#: L68 — fonctions qui servent une GARANTIE de sécurité : sur un hôte qui ne
+#: peut pas répondre (ni psutil, ni /proc, interface absente), elles lèvent
+#: `NotAvailable` ; elles ne rendent jamais une liste vide ni un `None` qui
+#: voudrait dire « rien trouvé ». `tests/test_l63_platform.py::GuaranteeTest`
+#: exerce cette liste sur un OS muet et échoue si une garantie ajoutée ici
+#: n'a pas son témoin.
+GUARANTEES = (
+    "ancestry",
+    "boot_time",
+    "children",
+    "env_values",
+    "environ",
+    "holders",
+    "open_fd_count",
+    "process_table",
+    "self_cgroup_paths",
+    "start_time",
+)
 
 __all__ = [
     "NotAvailable", "SYSTEM", "is_linux", "is_macos", "is_windows", "has_psutil",
+    "GUARANTEES",
     "alive", "ancestry", "become_subreaper", "boot_time", "command_line", "environ",
     "env_values", "fd_path",
     "children", "holders", "open_fd_count", "process_table", "process_group_exists", "reap", "exited_child", "exited_child_status", "start_time", "same_start",
@@ -110,4 +132,6 @@ __all__ = [
     "CGROUP_ROOT", "cgroup_cpu_seconds", "cgroup_memory_bytes", "cpu_busy_seconds",
     "parse_pressure", "pressure", "user_paths", "UserPaths",
     "btrfs_allocation", "btrfs_fs_info", "mountinfo", "covering_mount", "mount_id",
+    "cgroup_cpu_max", "cgroup_cpu_stat", "cgroup_dir", "cgroup_memory_max", "cgroup_pressure",
+    "in_container", "own_cgroup", "own_cgroup_bounded",
 ]

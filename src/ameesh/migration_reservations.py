@@ -123,8 +123,8 @@ def import_reservations(db, rows, mapping: dict, *, repo: str, apply=False,
     numbers = {r["number"] for r in rows}
     if len(mapped) != len(mapping) or len(numbers) != len(rows) or set(mapped) - numbers:
         raise work.WorkError("mapping contains inactive or unknown migration numbers, or duplicate rows")
-    if any(lot <= 0 for lot in mapped.values()) or len(set(mapped.values())) != len(mapped):
-        raise work.WorkError("each reservation needs a distinct positive lot id")
+    if any(lot <= 0 for lot in mapped.values()):
+        raise work.WorkError("each reservation needs a positive lot id")
 
     def preview(conn):
         registry, result = storage.of(conn).work, []
@@ -137,13 +137,13 @@ def import_reservations(db, rows, mapping: dict, *, repo: str, apply=False,
                     raise work.WorkError("lot #%s is missing or closed" % lot)
                 if work.lot_repository(item, cfg) != slug:
                     raise work.WorkError("lot #%s belongs to another repository" % lot)
-                current = item.get("migration")
-                if current is not None and (current != number or item.get("migration_repo") != slug):
-                    raise work.WorkError("lot #%s already has a different reservation" % lot)
+                # #2481 : un lot peut déjà tenir d'autres numéros ; le numéro
+                # mapping s'ajoute, un numéro déjà tenu n'est pas réécrit.
+                held = {held["number"] for held in work.reserved_migrations(item)}
                 holder = registry.migration_holder(number, slug)
                 if holder and int(holder["id"]) != lot:
                     raise work.WorkError("migration %s of %s already held by lot #%s" % (number, slug, holder["id"]))
-                state = "existing" if current is not None else "reserve"
+                state = "existing" if number in held else "reserve"
             result.append(dict(row, lot=lot, action=state,
                                issue_ref=item.get("issue_ref") if lot is not None else None))
         return result
@@ -244,9 +244,20 @@ def update(db, item_id, slots, *, target_branch, target_sha, repo=None, action='
         raise work.WorkError('repository migrations directory unknown')
     branch = merge_queue._remote_branch(target_branch)
     _git(checkout, 'check-ref-format', 'refs/heads/' + branch)
-    canonical = merge_queue.source_of(checkout)
-    if canonical.split('/', 1)[0].split(':', 1)[0] == 'github.com':
-        canonical = canonical.lower()
+    # #879 : un seul espace d'allocation par dépôt. `source_of` garde le
+    # serveur et le port (deux serveurs sur un hôte sont deux sources pour la
+    # file), mais la projection legacy du trigger 0419 alloue toujours sous
+    # `github.com/<slug>` : une cible qui ne s'y ramène pas (autre hôte, ou
+    # `github.com:2222`) ouvrirait un second espace pour le même dépôt, donc
+    # une double réservation possible. `_checkout` a déjà vérifié que le clone
+    # est celui du dépôt du lot ; on alloue sous cette clé canonique.
+    source = merge_queue.source_of(checkout)
+    host, _, path = source.partition('/')
+    if host.split(':', 1)[0].lower() != 'github.com' or path.lower() != slug:
+        raise work.WorkError(
+            'migration slots allocate under github.com/%s (the lot repository); '
+            'observed target %s' % (slug, source))
+    canonical = 'github.com/' + slug
     # Exact commit and target ref; caller fetches first. Never scan the
     # worktree, package, source branch or any other target for the floor.
     resolved = _git(checkout, 'rev-parse', '--verify', target_sha + '^{commit}')

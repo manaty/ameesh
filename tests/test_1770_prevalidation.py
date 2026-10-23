@@ -10,7 +10,9 @@ import json
 import os
 import subprocess
 import tempfile
+import time
 import unittest
+from unittest import mock
 
 import ameesh.prevalidation  # noqa: F401  (preuve du chargement du fichier, plan L161f #1339)
 from ameesh import offload, prevalidation as pv
@@ -228,6 +230,23 @@ class ProofTest(unittest.TestCase):
                 # la part fautive est nommée avec le statut observé
                 self.assertIn("psycopg:2", " ".join(rapport["detail"]))
 
+    def test_les_tests_en_echec_sont_nommes(self):
+        """#2644 : le refus nommé porte le test en échec, pas seulement la part."""
+        flow = "\n".join([
+            pv.PART_MARK + "psycopg:1",
+            json.dumps({"v": 1, "schema": pv.FLOW_SCHEMA, "type": "test",
+                        "part": "psycopg:1", "module": "test_a",
+                        "test": "tests.test_a.C.test_rouge", "statut": "echec"}),
+            json.dumps({"v": 1, "schema": pv.FLOW_SCHEMA, "type": "fin",
+                        "part": "psycopg:1", "statut": "echec", "duree_s": 1.0}),
+        ])
+        rapport = self.sel.proof(lot=7, host="vm", run={"outcome": "green", "exit": 0},
+                                 flow=pv.parse_flow(flow))
+        self.assertFalse(rapport["ok"])
+        self.assertIn("run-red", rapport["causes"])
+        self.assertEqual(rapport["failed"], ["tests.test_a.C.test_rouge"])
+        self.assertIn("tests.test_a.C.test_rouge", " ".join(rapport["detail"]))
+
     def test_run_rouge_de_loffload_refuse(self):
         rapport = self.sel.proof(lot=7, host="vm", run={"outcome": "run-red", "exit": 1},
                                  flow=self.flow)
@@ -375,6 +394,18 @@ class RunTest(unittest.TestCase):
         result = pv.run_offload("vm-agents-1", "echo ko", runner=lambda *a, **k: Fake())
         self.assertEqual(result["outcome"], "run-red")
 
+    def test_run_offload_duree_murale_sans_marque(self):
+        """#2665 : sans durée lue, le repli est mesuré sur la même horloge
+        monotone que le départ (jamais une date murale moins un instant monotone)."""
+        class Fake:
+            returncode = 0
+            stdout = flux()
+            stderr = ""
+
+        result = pv.run_offload("vm-agents-1", "echo ok", runner=lambda *a, **k: Fake())
+        self.assertGreaterEqual(result["seconds"], 0.0)
+        self.assertLess(result["seconds"], 60.0)
+
     def test_run_offload_preempte_par_la_porte(self):
         """#2298 : la note « stopped on … host draining » sort en gate-preempted."""
         class Fake:
@@ -399,6 +430,51 @@ class RunTest(unittest.TestCase):
         result = pv.run_offload("vm-agents-1", "echo coupe", runner=lambda *a, **k: Fake())
         self.assertEqual(result["outcome"], "gate-preempted")
         self.assertEqual(result["flow"]["fins"], ("succes",))
+
+    def test_run_offload_borne_l_attente_locale(self):
+        # #2665/B1 cx2 : l'échéance du passage atteint le runner réel, pas
+        # seulement le timeout du job distant ; le client reçoit un
+        # --wait-timeout pour annuler son job avant le garde-fou local.
+        seen = {}
+
+        def runner(argv, **kwargs):
+            seen["timeout"] = kwargs.get("timeout")
+            seen["wait_timeout"] = argv[argv.index("--wait-timeout") + 1]
+            raise subprocess.TimeoutExpired(argv, kwargs.get("timeout"))
+
+        result = pv.run_offload("vm-agents-1", "echo", timeout=120,
+                                deadline=pv.Deadline(30.0), runner=runner)
+        self.assertEqual(result["outcome"], "run-incomplete")
+        self.assertEqual(result["exit"], 124)
+        self.assertGreater(seen["timeout"], 30.0)
+        self.assertLessEqual(seen["timeout"], 30.0 + pv.OFFLOAD_LOCAL_GRACE_S)
+        self.assertGreater(int(seen["wait_timeout"]), 0)
+
+    def test_run_offload_attente_locale_reellement_tuee(self):
+        # Le vrai subprocess.run est le juge : une commande qui dort plus que
+        # le budget local est tuée et rend un run-incomplete, pas un blocage.
+        started = time.monotonic()
+
+        def runner(argv, **kwargs):
+            return subprocess.run(["sleep", "5"], timeout=kwargs.get("timeout"),
+                                  capture_output=True, text=True)
+
+        with mock.patch.object(pv, "OFFLOAD_LOCAL_GRACE_S", 0.1):
+            result = pv.run_offload("vm-agents-1", "echo", deadline=pv.Deadline(0.05),
+                                    runner=runner)
+        self.assertEqual(result["outcome"], "run-incomplete")
+        self.assertEqual(result["exit"], 124)
+        self.assertLess(time.monotonic() - started, 2.0)
+        self.assertIsNotNone(result["seconds"])
+
+    def test_pinned_snapshot_budget_expired_is_run_incomplete(self):
+        # #2665/B1 cx2 : la construction du snapshot (git) est bornée ; une
+        # échéance épuisée est une indisponibilité, pas une sélection fausse.
+        with tempfile.TemporaryDirectory() as root:
+            with self.assertRaises(pv.PrevalidationError) as caught:
+                pv.pinned_snapshot(root, A, "plan.json", "{}",
+                                   deadline=pv.Deadline(0.0))
+        self.assertEqual(caught.exception.cause, "run-incomplete")
 
 
 class SnapshotIdentityTest(unittest.TestCase):
@@ -499,6 +575,17 @@ class HostTest(unittest.TestCase):
     def test_vm_agents_acceptee(self):
         ok, cause = pv.host_allowed("vm-agents-1", local="pc-smichea")
         self.assertTrue(ok, cause)
+
+    def test_hote_local_declare_au_canon_est_une_vm(self):
+        # Décision pilote 19/10 06:03 (#2644) : l'hôte local déclaré au canon
+        # est une VM d'agents ; un poste local non déclaré reste refusé.
+        ok, cause = pv.host_allowed("ameesh-agents-1", local="ameesh-agents-1",
+                                    declared=("ameesh-agents-1",))
+        self.assertTrue(ok, cause)
+        ok, cause = pv.host_allowed("ameesh-agents-1", local="ameesh-agents-1",
+                                    declared=("ameesh-agents-2",))
+        self.assertFalse(ok)
+        self.assertEqual(cause, "no-vm")
 
 
 if __name__ == "__main__":

@@ -48,7 +48,10 @@ The gesture, and its guards (all checked BEFORE any write):
    their source, so a same-named check from another application or a commit
    status does not satisfy it; an unreadable protection without a
    declaration refuses. This path writes outside the API, so it never
-   bypasses the protection it cannot see;
+   bypasses the protection it cannot see; when the base is not the
+   repository's default target, it must not already be merged into that
+   default (#2603: a stacked PR would land on a dead branch) — the guard
+   refuses before any write and gives the `gh pr edit --base` to run;
 5. **the diff** is computed locally (`merge-base` then `diff --name-only`):
    the PR must touch at least one `.github/workflows/**` path — this path
    therefore never replaces the API merge for the other PRs;
@@ -117,6 +120,12 @@ POLL_S = float(os.environ.get("AMEESH_MERGE_PR_POLL_S", "5"))
 ATTEMPTS = int(os.environ.get("AMEESH_MERGE_PR_ATTEMPTS", "12"))
 #: short `git ls-remote`/`rev-parse` calls; fetch and push use FETCH_TIMEOUT
 SHORT_TIMEOUT = 60.0
+#: L165 (EP4) : marge de bail renouvelée juste avant le push externe. Elle
+#: couvre le pire cas du push (`FETCH_TIMEOUT`) et une lecture de la PR après
+#: (`SHORT_TIMEOUT`). La course résiduelle (un réseau qui bloque au-delà) est
+#: documentée dans `docs/HOST-HANDOFFS.md` ; le CAS de la cible et
+#: `--match-head-commit` restent les dernières gardes.
+PILOT_CALL_MARGIN_S = FETCH_TIMEOUT + SHORT_TIMEOUT
 FULL_SHA = re.compile(r"^[0-9a-f]{40}$")
 _HTTPS = re.compile(r"^https?://", re.I)
 #: a URL carrying credentials (`https://user:token@…`): never shown as such,
@@ -224,6 +233,61 @@ def _pr_guards(view: dict, pr: int, head: str, target: str, project=None) -> Non
     if not radar.ci_green(view.get("statusCheckRollup") or [], required):
         raise MergePrError("PR #%d: the checks on %s are not all concluded and green"
                            % (pr, head[:12]))
+
+
+def _stacked_base_guard(owner: str, fetch_url: str, repo: str, view: dict,
+                        target: str) -> None:
+    """#2603 : refuse une PR dont la base, autre que la cible par défaut du
+    dépôt, est déjà fusionnée dans cette cible par défaut.
+
+    Fusionner là (comme home#112/#113 après la fusion de canon/2452) pose le
+    contenu sur une branche morte : `canon/2452` ne reçoit plus rien dans
+    `main`, le contenu est perdu. La garde ne s'applique qu'à une fusion
+    demandée SUR cette base ; une PR dont la base est la cible par défaut, ou
+    une base non encore fusionnée, passe. Cible par défaut illisible : refus,
+    le doute ne fusionne pas sur une base de travail."""
+    from . import plan_git
+
+    pr = int(view.get("number") or 0)
+    base = _branch_name(view.get("baseRefName") or "")
+    if not base or _branch_name(target) != base:
+        return
+    try:
+        default = _branch_name(plan_git.default_target(repo) or "")
+    except plan_git.MergeProbeError as exc:
+        raise MergePrError(
+            "PR #%d targets %s, and the repository's default target cannot be read (%s): "
+            "nothing written — fix ameesh.target or retarget the PR by hand"
+            % (pr, base, _redact(str(exc))[:200])) from exc
+    if not default:
+        raise MergePrError(
+            "PR #%d targets %s, and the repository's default target cannot be determined: "
+            "nothing written — fetch/configure the default branch or retarget the PR by hand"
+            % (pr, base))
+    if default == base:
+        return
+    refs = {"base": "refs/ameesh/merge-pr/base",
+            "default": "refs/ameesh/merge-pr/default"}
+    proc = _run(owner, "fetch", "--quiet", "--no-tags", fetch_url,
+                "+refs/heads/%s:%s" % (base, refs["base"]),
+                "+refs/heads/%s:%s" % (default, refs["default"]),
+                timeout=FETCH_TIMEOUT)
+    if proc.returncode != 0:
+        raise MergePrError(
+            "PR #%d targets %s, not the default target %s, and the default cannot be read "
+            "(%s): nothing written — retarget it (`gh pr edit --base %s %d`) or verify "
+            "that %s is not already merged into %s by hand"
+            % (pr, base, default, _redact(resolutions._err(proc)[-200:]), default, pr,
+               base, default))
+    compared = _run(owner, "merge-base", "--is-ancestor", refs["base"], refs["default"])
+    if compared.returncode not in (0, 1):
+        raise MergePrError("PR #%d: comparison of %s with %s unreadable: nothing written"
+                           % (pr, base, default))
+    if compared.returncode == 0:
+        raise MergePrError(
+            "PR #%d targets %s, already merged into %s: merging it there would land its "
+            "content on a dead branch and lose it — retarget it (`gh pr edit --base %s %d`), "
+            "then freeze and re-review" % (pr, base, default, default, pr))
 
 
 def _project_of(cfg, repo: str):
@@ -417,7 +481,11 @@ def pr_view(slug: str, pr: int, gh=land._gh) -> dict:
     if proc.returncode != 0:
         raise MergePrError("gh pr view #%s: %s"
                            % (pr, (proc.stderr or proc.stdout or "").strip()[:300]))
-    return _json(proc, "gh pr view #%s" % pr)
+    view = _json(proc, "gh pr view #%s" % pr)
+    view["statusCheckRollup"] = radar.merge_rollup(view.get("statusCheckRollup"), slug=slug,
+                                                 head=view.get("headRefOid") or "",
+                                                 branch=view.get("headRefName") or "", gh=gh)
+    return view
 
 
 def message(pr: int, head: str, target: str, tip: str, tree: str, *,
@@ -595,6 +663,15 @@ def direct_merge(slug: str, pr: int, head: str, *, lot: int, repo: str, db=None,
         slug = slug_ident[1]
     fetch_url = (fetch_url or "").strip() or ("https://github.com/%s.git" % slug)
     push_url = check_push_url(push_url or ("git@github.com:%s.git" % slug))
+    # L165 (EP4) : la fusion hors API est un geste du pilote hors base. Le bail
+    # élu est vérifié avant la première lecture GitHub ; il est renouvelé juste
+    # avant le push avec la marge de l'appel. Un `--dry-run` n'agit pas et n'a
+    # rien à fencer.
+    fence = None
+    if not dry_run:
+        from . import pilot_gesture
+        fence = pilot_gesture.gate(cfg, db, "merge",
+                                   "merge-pr #%d (lot #%d)" % (pr, lot))
     # #1003 B/P1: one repository identity, verified before the first read; a
     # divergence writes nothing and admits nothing.
     _bind_repo_identity(repo, slug, fetch_url, push_url)
@@ -607,15 +684,31 @@ def direct_merge(slug: str, pr: int, head: str, *, lot: int, repo: str, db=None,
         raise MergePrError(str(exc)) from exc
     if branch and _branch_name(branch) != _branch_name(target):
         raise MergePrError("PR #%d targets %s, not %s" % (pr, branch, target))
-    # #2333 (canon §11 bis): the packet rule is checked before any scratch
-    # clone, GitHub mutation or write — the `already MERGED` declaration too.
-    # N1 (#1003): `--dry-run` validates an exception but never journals it.
-    try:
-        packet_guard.check_merge(None if dry_run and exception else db, lot,
-                                 view.get("headRefName") or "", target, head,
-                                 exception=exception, reason=reason, actor=actor)
-    except packet_guard.PacketGuardError as exc:
-        raise MergePrError(str(exc)) from exc
+    # #2333 (canon §11 bis): the packet rule is checked after the PR read and
+    # before any scratch clone, GitHub mutation or write — the `already
+    # MERGED` declaration too. L165 (EP4) : une exception explicite est une
+    # écriture durable ; elle partage la transaction du hold élu, sinon une
+    # bascule pendant `pr_view` laisserait une autorisation hors paquet à
+    # l'ancien détenteur (revue cx2 B3). N1 (#1003): `--dry-run` validates an
+    # exception but never journals it.
+    def declare(database):
+        try:
+            packet_guard.check_merge(database, lot, view.get("headRefName") or "",
+                                     target, head, exception=exception, reason=reason,
+                                     actor=actor)
+        except packet_guard.PacketGuardError as exc:
+            raise MergePrError(str(exc)) from exc
+
+    if fence is not None and exception and not dry_run:
+        from . import pilot_gesture
+        with db.transaction() as tx:
+            try:
+                fence.hold(tx)
+            except pilot_gesture.GestureRefused as exc:
+                raise MergePrError(str(exc)) from exc
+            declare(tx)
+    else:
+        declare(None if dry_run and exception else db)
 
     owner = work_dir or _scratch()
     reservation = None
@@ -625,22 +718,25 @@ def direct_merge(slug: str, pr: int, head: str, *, lot: int, repo: str, db=None,
         if state == "MERGED":
             # N1 (#1003): an already-MERGED PR does not declare a lot without
             # the lot/freeze/branch/target link; nothing is written otherwise.
+            # L165 (EP4) : la déclaration est un effet, fence-la même sans push.
+            if fence is not None:
+                from . import pilot_gesture
+                try:
+                    fence.hold(db)
+                except pilot_gesture.GestureRefused as exc:
+                    raise MergePrError(str(exc)) from exc
             _already_lot_links(db, lot, head, view, target, repo, cfg)
             return _already(slug, pr, head, view, target=target, fetch_url=fetch_url,
                             owner=owner)
         if project is None:
             project = _project_of(cfg, repo)
-        # #1656: the direct merge replays the whole proof here; an armed
-        # auto-merge would merge the head without it — GitHub checks its
-        # --match-head-commit only when it is armed, never after a head
-        # rewrite. Disarm before any guard: ameesh is the only merge actor.
-        if view.get("autoMergeRequest"):
-            error = land.pr_disable_auto(slug, pr, gh=gh)
-            if error is not None:
-                raise MergePrError(
-                    "PR #%d: auto-merge armed and not disarmed (%s): nothing written; disarm "
-                    "it (gh pr merge --disable-auto %d) and retry" % (pr, error, pr))
+        # #2813 (owner decision 20/10, supersedes #1656 here): the direct
+        # merge no longer disarms a GitHub auto-merge. Packet carriers are
+        # merged by ameesh at their published head (`packet_automerge`),
+        # which disarms any GitHub auto-merge it finds; the guards below and
+        # the fresh re-read before the push still bind this merge to `head`.
         _pr_guards(view, pr, head, target, project)
+        _stacked_base_guard(owner, fetch_url, repo, view, target)
         ready = _admission(db, cfg, lot, repo, project, owner, view,
                            slug=slug, target=target, head=head, gh=gh,
                            packet_exception=((exception, reason)
@@ -750,6 +846,7 @@ def direct_merge(slug: str, pr: int, head: str, *, lot: int, repo: str, db=None,
         # the merge commit was built stops without writing.
         fresh = pr_view(slug, pr, gh=gh)
         _pr_guards(fresh, pr, head, target, project)
+        _stacked_base_guard(owner, fetch_url, repo, fresh, target)
         ready = _admission(db, cfg, lot, repo, project, owner, fresh,
                            slug=slug, target=target, head=head, gh=gh,
                            packet_exception=((exception, reason)
@@ -778,6 +875,15 @@ def direct_merge(slug: str, pr: int, head: str, *, lot: int, repo: str, db=None,
 
         ref = "refs/heads/%s" % target
         reservation.refresh()
+        # L165 (EP4) : renouvellement du bail élu juste avant l'appel externe,
+        # avec la marge du push et de sa lecture ; refus si le bail renouvelé
+        # n'a pas cette marge (course résiduelle documentée).
+        if fence is not None:
+            from . import pilot_gesture
+            try:
+                fence.hold(db, margin_s=PILOT_CALL_MARGIN_S)
+            except pilot_gesture.GestureRefused as exc:
+                raise MergePrError(str(exc)) from exc
         try:
             proc = _run(owner, "push", "--quiet", "--no-verify",
                         "--force-with-lease=%s:%s" % (ref, tip), push_url,
