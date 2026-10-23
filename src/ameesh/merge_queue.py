@@ -2293,9 +2293,16 @@ def _parts_reader(project, repo: str, target: str, sha: str, clone, cfg=None):
 
 
 def _required_ci(project, sha: str, commit_ci=None, *, parts=None,
-                 branch: str | None = None) -> None:
+                 branch: str | None = None,
+                 allow_inconclusive: bool = False) -> None:
     """GitHub CI on frozen `sha`: `ci_required` or no PR (#3080).
     QueueError otherwise (no run, running, red, unreadable).
+
+    #3085 (règle owner du 23/10) : `allow_inconclusive` n'est passé que par
+    la porte du feu/paquet (`fire.ready_pr`) — une lecture `acceptable` (tous
+    les checks ont conclu, aucun négatif) suffit alors, un job sauté ou
+    annulé pour quota est consigné au lieu de bloquer. La file et `merge-pr`
+    gardent la preuve stricte (défaut).
 
     L1651 (#1650): `parts` (a callable returning the due contexts, or a
     sequence; None: none) closes the completeness hole. Each due part must
@@ -2319,6 +2326,10 @@ def _required_ci(project, sha: str, commit_ci=None, *, parts=None,
         raise QueueError("project %s requires CI on the frozen commit (%s): no run "
                          "on %s yet (push it, let the workflows run)"
                          % (project.name, requirement, sha[:12]))
+    if allow_inconclusive and parts is None and runs.get("acceptable"):
+        # #3085 : tous les checks ont conclu, aucun n'est négatif ; les non
+        # concluants se consignent, la porte du feu/paquet ne les attend pas.
+        return
     if runs["pending"]:
         raise QueueError("the CI on the frozen commit %s is still running (%s)"
                          % (sha[:12], ", ".join(runs["pending"])))
