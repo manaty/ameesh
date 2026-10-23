@@ -4136,6 +4136,15 @@ def _run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool =
         "others_total": volumes["others_total"]}
     from . import docker_storage
     report_measure["docker_storage"] = docker_storage.collect(runtime, now=now)
+    # #3103 : un pont sur le réseau local de l'hôte (incident #3092), relevé
+    # pour l'alerte critique `host_network_overlap` ; jamais fatal au passage
+    from . import netcheck
+    try:
+        report_measure["docker_network"] = (
+            None if runtime is None else netcheck.collect(cfg, now=now, runtime=runtime))
+    except Exception as exc:
+        report_measure["docker_network"] = None
+        skipped.append("docker networks: not read (%s)" % type(exc).__name__)
     if not dry_run:
         entries.append({"kind": "mesure", "action": "measured", "path": troot,
                         "bytes": report_measure["tmp_bytes"] + report_measure["cache_bytes"],

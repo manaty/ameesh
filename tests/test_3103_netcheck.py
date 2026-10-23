@@ -7,10 +7,11 @@ from __future__ import annotations
 import json
 import subprocess
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 
 from . import support  # isole l'environnement agent de l'hôte
-from ameesh import netcheck
+from ameesh import exploitation, netcheck, notify
 
 WIFI = [
     {"dst": "default", "gateway": "192.168.1.1", "dev": "wlp0s20f3", "protocol": "dhcp"},
@@ -119,6 +120,73 @@ class NetcheckTest(unittest.TestCase):
         for argv in run.calls:
             self.assertTrue(argv[1:3] in (["network", "ls"], ["network", "inspect"])
                             or argv[-3:] == ["show", "table", "main"], argv)
+
+
+    def test_housekeeping_runtime_is_used(self):
+        run = fake_run(WIFI, INSPECT)
+        runtime = SimpleNamespace(binary="/opt/bin/podman", run=run, timeout=3.0)
+        with mock.patch.object(netcheck.containers, "runtime_binary",
+                               side_effect=AssertionError("runtime already resolved")):
+            data = netcheck.collect(self.cfg, now=1, runtime=runtime)
+        self.assertEqual(data["engine"], "podman")
+        self.assertEqual(run.calls[0][0], "/opt/bin/podman")
+
+    def test_collect_is_serialisable_and_names_errors(self):
+        data = netcheck.collect(self.cfg, run=fake_run(WIFI, INSPECT), now=1000)
+        self.assertEqual(json.loads(json.dumps(data)), data)
+        self.assertEqual((data["engine"], data["networks"], data["error"]), ("docker", 2, None))
+        self.assertEqual({c["route"] for c in data["conflicts"]},
+                         {"192.168.1.0/24", "default via 192.168.1.1"})
+        self.assertEqual(data["exposed"], [{"network": "supabase_network_x",
+                                            "subnet": "192.168.0.0/20"}])
+        failed = netcheck.collect(self.cfg, run=fake_run(WIFI, INSPECT, ip_fails=True), now=1)
+        self.assertEqual((failed["conflicts"], failed["error"]),
+                         ([], "host routes not read (`ip -j route`)"))
+
+
+class HostAlertTest(unittest.TestCase):
+    """La remontée : le relevé du ménage → l'alerte d'hôte critique."""
+    DATA = {"sampled_ts": 1000, "engine": "docker", "networks": 2, "error": None,
+            "exposed": [], "conflicts": [
+                {"network": "supabase_network_x", "bridge": "br-aaaaaaaaaaaa",
+                 "subnet": "192.168.0.0/20", "route": "192.168.1.0/24", "dev": "wlp0s20f3"}]}
+
+    def test_findings_fresh_stale_clean(self):
+        found = netcheck.findings(self.DATA, "pc-smichea", 1100)
+        self.assertEqual(len(found), 1)
+        alert = found[0]
+        self.assertEqual((alert["type"], alert["critical"], alert["urgent"], alert["value"]),
+                         ("host_network_overlap", True, True, 1))
+        self.assertIn("supabase_network_x (192.168.0.0/20, br-aaaaaaaaaaaa) overlaps host "
+                      "route 192.168.1.0/24 dev wlp0s20f3", alert["message"])
+        self.assertEqual(netcheck.findings(self.DATA, "pc", 1000 + netcheck.MAX_AGE_S + 1), [])
+        self.assertEqual(netcheck.findings(dict(self.DATA, conflicts=[]), "pc", 1100), [])
+        # une lecture impossible ne lève pas l'alerte critique (le médecin le dit)
+        self.assertEqual(netcheck.findings(dict(self.DATA, conflicts=[], error="x"),
+                                           "pc", 1100), [])
+
+    def test_alert_from_persisted_measure_without_docker(self):
+        hk = SimpleNamespace(
+            last_measure=lambda _: [{"host": "pc-smichea",
+                                     "data": {"docker_network": self.DATA}}],
+            worktrees=lambda *args: [], latest_by_path=lambda *args, **kwargs: [])
+        st = SimpleNamespace(housekeeping=hk, hosts=SimpleNamespace(current=lambda _: []))
+        with mock.patch.object(exploitation.storage, "of", return_value=st), \
+                mock.patch.object(exploitation.time, "time", return_value=1100), \
+                mock.patch.object(netcheck.subprocess, "run",
+                                  side_effect=AssertionError("no command at alert time")):
+            found = exploitation._housekeeping_alerts([], object())
+        self.assertEqual([a["type"] for a in found], ["host_network_overlap"])
+        alert = found[0]
+        self.assertEqual((alert["host"], alert["critical"], alert["since"]),
+                         ("pc-smichea", True, None))
+        self.assertEqual(alert["networks"], ["supabase_network_x"])
+
+    def test_declared_pushed_urgent_and_first(self):
+        self.assertIn("host_network_overlap", exploitation.ALERT_TYPES)
+        self.assertIn("host_network_overlap", exploitation.PRIORITY_TYPES)
+        self.assertIn("host_network_overlap", notify.DEFAULT_TYPES)
+        self.assertIn("host_network_overlap", notify.URGENT_TYPES)
 
 
 if __name__ == "__main__":
