@@ -264,7 +264,13 @@ when a challenger has stayed at least 5 availability points above the holder
 for a full hour (standing history, no hole beyond the freshness threshold)
 and both are fresh and ready: the holder releases at the end of its turn
 (epoch++), and does not reclaim for the challenger's rank delay plus 60 s, so
-a challenger that dies after the release does not leave the role free. A
-workstation that boots therefore does not take the role back from a VM.
+a challenger that dies after the release does not leave the role free. The
+release mark is durable (`role_handover`, migration 0478): an executor restart
+does not let the resumed holder reclaim early or hand the role again to a
+challenger that did not claim — the failed challenger stays out of the
+handovers for an hour, even across the restart. A runner publishes standings
+only for the agents it can claim (`agents_filter`): it never advertises a
+readiness it will not act on. A workstation that boots therefore does not take
+the role back from a VM.
 `ameesh role status [ROLE] [--json]` prints the holder, the epoch and the
 ranked candidates with the diagnostic of each refusal.
