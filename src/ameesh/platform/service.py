@@ -70,6 +70,11 @@ NOT_LOADED_MARKERS = ("could not find service", "could not find specified servic
                       "no such process", "service not found", "not loaded")
 #: code de sortie de launchd pour un service absent (`bootout`/`print`)
 NOT_LOADED_CODES = (113,)
+#: messages d'un `bootout` inconnu des anciens macOS : seul cas où le repli
+#: `unload -w` est légitime. Un autre échec (droits, I/O) est réel : le repli
+#: ne doit pas le masquer.
+LEGACY_BOOTOUT_MARKERS = ("unrecognized subcommand", "unknown subcommand",
+                          "invalid subcommand")
 
 
 class ServiceError(RuntimeError):
@@ -227,21 +232,40 @@ def _not_loaded(result) -> bool:
     return any(marker in text for marker in NOT_LOADED_MARKERS)
 
 
+def _bootout_unknown(result) -> bool:
+    """`bootout` est-il simplement inconnu de ce launchctl (ancien macOS) ?"""
+    text = _output(result).lower()
+    return any(marker in text for marker in LEGACY_BOOTOUT_MARKERS)
+
+
+def _stop_state(service: Service, run: Callable) -> tuple[bool, object]:
+    """Relit l'état réel du job : `(chargé, résultat de print)`."""
+    result = _launchctl(run, "print", "%s/%s" % (_domain(), service.label))
+    return result.returncode == 0, result
+
+
 def _bootout(service: Service, run: Callable, env: Mapping[str, str] | None) -> None:
     """Décharge le service s'il est chargé ; ne tolère qu'une absence confirmée.
 
     `bootout` est la forme moderne ; `unload -w` reste le repli des macOS
-    anciens (et le chargement symétrique plus bas). Un échec réel (droits,
-    launchd injoignable, délai dépassé) lève : le plist reste, pour qu'un
-    `status` et une seconde tentative voient encore le job. Le repli ne
+    anciens (et le chargement symétrique plus bas). Un échec réel de `bootout`
+    (droits, launchd injoignable, délai dépassé) lève : le plist reste, pour
+    qu'un `status` et une seconde tentative voient encore le job. Le repli ne
     décharge que **notre** plist : un agent d'un autre label ne doit pas être
     arrêté avant le refus de suppression.
+
+    `launchctl unload` peut rendre 0 après avoir journalisé un échec (source
+    Apple, `load_and_unload_cmd`) : après le repli, l'absence est relue par
+    `launchctl print`, jamais déduite du seul code de retour (B2, revue #390).
     """
     path = plist_path(service, env)
     result = _launchctl(run, "bootout", "%s/%s" % (_domain(), service.label),
                         timeout=LAUNCHCTL_STOP_TIMEOUT_S)
     if result.returncode == 0 or _not_loaded(result):
         return
+    if not _bootout_unknown(result):
+        raise ServiceError("launchctl bootout %s/%s: %s"
+                           % (_domain(), service.label, _output(result)))
     if not os.path.exists(path):
         raise ServiceError("launchctl bootout %s/%s: %s (no plist to unload)"
                            % (_domain(), service.label, _output(result)))
@@ -251,10 +275,19 @@ def _bootout(service: Service, run: Callable, env: Mapping[str, str] | None) -> 
             % (path, service.label))
     legacy = _launchctl(run, "unload", "-w", path,
                         timeout=LAUNCHCTL_STOP_TIMEOUT_S)
-    if legacy.returncode != 0 and not _not_loaded(legacy):
+    if _not_loaded(legacy):
+        return
+    loaded, state = _stop_state(service, run)
+    if loaded:
         raise ServiceError(
-            "launchctl bootout %s/%s: %s; launchctl unload %s: %s"
-            % (_domain(), service.label, _output(result), path, _output(legacy)))
+            "launchctl unload %s: service still loaded (%s; bootout: %s)"
+            % (path, _output(state) or _output(legacy) or "launchctl print",
+               _output(result)))
+    if not _not_loaded(state):
+        raise ServiceError(
+            "launchctl unload %s: cannot confirm the service stopped "
+            "(unload: %s; print: %s)"
+            % (path, _output(legacy), _output(state)))
 
 
 def _write(service: Service, ameesh_bin: str,

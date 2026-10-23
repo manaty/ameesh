@@ -305,12 +305,14 @@ class ServiceInstallTest(unittest.TestCase):
 
     def test_uninstall_garde_le_plist_si_le_dechargement_echoue(self):
         """B2 de la revue #390 : un bootout réel en échec ne doit pas laisser
-        croire que le service est retiré alors que le job tourne encore."""
+        croire que le service est retiré alors que le job tourne encore. Le
+        repli `unload` ne doit pas masquer l'échec, même s'il rend 0."""
         self._install(_fake_run())
         run = _fake_run({"bootout": 1,
                          "bootout:err": "Operation not permitted",
-                         "unload": 1,
-                         "unload:err": "Operation not permitted"})
+                         "unload": 0,
+                         "unload:err": "Unload failed: 1: Operation not permitted",
+                         "print:out": "state = running\npid = 4321\n"})
         err = io.StringIO()
         with mock.patch.object(platform, "SYSTEM", "macos"), \
                 contextlib.redirect_stderr(err):
@@ -319,7 +321,7 @@ class ServiceInstallTest(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("Operation not permitted", err.getvalue())
         self.assertTrue(os.path.isfile(self.path))
-        self.assertEqual([call[1] for call in run.calls], ["bootout", "unload"])
+        self.assertEqual([call[1] for call in run.calls], ["bootout"])
 
     def test_uninstall_tolere_une_absence_confirmee(self):
         self._install(_fake_run())
@@ -337,11 +339,15 @@ class ServiceInstallTest(unittest.TestCase):
         self.assertEqual([call[1] for call in run.calls], ["bootout"])
 
     def test_uninstall_replie_unload_si_bootout_inconnu(self):
-        """Le repli des anciens macOS ne vaut que si `bootout` est inconnu."""
+        """Le repli des anciens macOS ne vaut que si `bootout` est inconnu ;
+        l'absence est relue par `print`, pas déduite de `unload`."""
         self._install(_fake_run())
-        run = _fake_run({"bootout": 1,
-                         "bootout:err": "Unrecognized subcommand: bootout",
-                         "unload": 0})
+        run = _fake_run({
+            "bootout": 1,
+            "bootout:err": "Unrecognized subcommand: bootout",
+            "unload": 0,
+            "print": 1,
+            "print:err": 'Could not find service "ameesh.runner" in domain'})
         out = io.StringIO()
         with mock.patch.object(platform, "SYSTEM", "macos"), \
                 contextlib.redirect_stdout(out):
@@ -349,7 +355,49 @@ class ServiceInstallTest(unittest.TestCase):
                                     env=self.env, run=run)
         self.assertEqual(code, 0)
         self.assertFalse(os.path.exists(self.path))
-        self.assertEqual([call[1] for call in run.calls], ["bootout", "unload"])
+        self.assertEqual([call[1] for call in run.calls],
+                         ["bootout", "unload", "print"])
+
+    def test_repli_unload_qui_rend_0_mais_laisse_le_job_charge_est_refuse(self):
+        """B2 (revue cx2) : `launchctl unload` rend 0 après avoir journalisé
+        l'échec ; `print` dit que le job est encore chargé."""
+        self._install(_fake_run())
+        run = _fake_run({
+            "bootout": 1,
+            "bootout:err": "Unrecognized subcommand: bootout",
+            "unload": 0,
+            "unload:err": "Unload failed: 1: Operation not permitted",
+            "print:out": "state = running\npid = 4321\n"})
+        err = io.StringIO()
+        with mock.patch.object(platform, "SYSTEM", "macos"), \
+                contextlib.redirect_stderr(err):
+            code = service_cli.main(["uninstall", "--no-notify"],
+                                    env=self.env, run=run)
+        self.assertEqual(code, 1)
+        self.assertIn("still loaded", err.getvalue())
+        self.assertTrue(os.path.isfile(self.path))
+        self.assertEqual([call[1] for call in run.calls],
+                         ["bootout", "unload", "print"])
+
+    def test_repli_unload_en_erreur_mais_job_absent_est_accepte(self):
+        """L'absence relue par `print` vaut mieux que le code de `unload`."""
+        self._install(_fake_run())
+        run = _fake_run({
+            "bootout": 1,
+            "bootout:err": "Unrecognized subcommand: bootout",
+            "unload": 1,
+            "unload:err": "Unload failed: 1: Operation not permitted",
+            "print": 1,
+            "print:err": 'Could not find service "ameesh.runner" in domain'})
+        out = io.StringIO()
+        with mock.patch.object(platform, "SYSTEM", "macos"), \
+                contextlib.redirect_stdout(out):
+            code = service_cli.main(["uninstall", "--no-notify"],
+                                    env=self.env, run=run)
+        self.assertEqual(code, 0)
+        self.assertFalse(os.path.exists(self.path))
+        self.assertEqual([call[1] for call in run.calls],
+                         ["bootout", "unload", "print"])
 
     def test_install_tolere_un_bootout_non_charge(self):
         run = _fake_run({
