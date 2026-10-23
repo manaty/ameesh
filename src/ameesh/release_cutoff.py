@@ -427,11 +427,39 @@ def github_slug(project: "ProjectRelease") -> str:
 
 
 def ci_reading(project: "ProjectRelease", sha: str) -> dict:
-    """`radar.commit_ci` on the exact head; a failed read is transient."""
+    """Exact CI, with ameesh's required aggregate (#3244, decision #128512).
+
+    A workflow's conclusion includes optional jobs. For ameesh, `tests`
+    must itself complete successfully; other jobs block only on FAILURE.
+    Other workflows and external checks retain their existing policy.
+    """
     target = radar.Project(name=project.name, repo=project.repo, target=project.target,
                            github=project.github)
     try:
-        return radar.commit_ci(target, sha)
+        reading = radar.commit_ci(target, sha)
+        if project.name != "ameesh":
+            return reading
+        suite = suite_reading(project, sha)
+        runs = [run for run in suite.get("runs", ()) if run["workflow"] == "tests"]
+        # A newer run must never be redeemed by an older successful attempt.
+        run = max(runs, key=lambda row: int(row["id"]), default=None)
+        aggregate_ok = run is not None and _aggregate_success(run)
+        negative = [name for name in reading.get("negative", ()) if name != "tests"]
+        pending = [name for name in reading.get("pending", ())
+                   if name != "tests" or not aggregate_ok]
+        inconclusive = [name for name in reading.get("inconclusive", ()) if name != "tests"]
+        if run:
+            for job in run["jobs"]:
+                label = "%s (%s; %s)" % (
+                    job["name"], job["conclusion"] or job["status"], run["url"])
+                if job["conclusion"] == "failure":
+                    negative.append(label)
+                elif not _job_success(job):
+                    inconclusive.append(label)
+        acceptable = bool(aggregate_ok and not negative and not pending
+                          and not reading.get("missing"))
+        return dict(reading, green=acceptable, acceptable=acceptable,
+                    negative=negative, pending=pending, inconclusive=inconclusive)
     except plan_github.GithubError as exc:
         raise TransientReleaseError("CI of %s unreadable: %s" % (sha[:12], exc)) from exc
 
@@ -531,7 +559,8 @@ def _latest_green_tag(repo: str, head: str, project: "ProjectRelease") -> str | 
     return None
 
 
-def last_green(repo: str, head: str, project: "ProjectRelease", limit: int = 100) -> str | None:
+def last_green(repo: str, head: str, project: "ProjectRelease", limit: int = 100,
+               *, evidence: dict | None = None) -> str | None:
     """The green content of the history, without a release-chain cap.
 
     A red landing merge `M = merge(main, V)` names the published green content
@@ -543,14 +572,15 @@ def last_green(repo: str, head: str, project: "ProjectRelease", limit: int = 100
     """
     cursor = head
     for _ in range(limit):
+        reading = ci_reading(project, cursor)
+        if commit_is_green(repo, project, cursor, reading=reading):
+            if evidence is not None:
+                evidence.update(reading)
+            return cursor
         if _landing_release(repo, cursor):
             # Exact CI first: a re-validated landing is green content, never
             # an inheritance from its red first parent.
-            if commit_is_green(repo, project, cursor):
-                return cursor
             return _latest_green_tag(repo, head, project)
-        if commit_is_green(repo, project, cursor):
-            return cursor
         parent = _git(repo, "rev-parse", "--verify", "%s^1" % cursor)
         if parent.returncode:
             break
@@ -1002,16 +1032,29 @@ def _same_job(required: str, actual: str) -> bool:
                                      for prefix in _JOB_PREFIXES)
 
 
+def _job_success(job: dict) -> bool:
+    return job.get("status") == "completed" and job.get("conclusion") == "success"
+
+
+def _aggregate_success(run: dict) -> bool:
+    """The stable aggregate certifies its dependencies, regardless of macOS."""
+    aggregates = [job for job in run.get("jobs", ())
+                  if job["name"] in ("tests", "suite complète du paquet / tests")]
+    return bool(aggregates) and all(_job_success(job) for job in aggregates)
+
+
 def _full_suite_run(suite: dict) -> dict | None:
     """The run of a commit that carries the target's full suite.
 
     The target's suite is the run with the most jobs (the matrix run). Tied
     runs with the same job set are re-runs of that suite (one is enough);
     tied runs with a different job set are ambiguous and prove nothing. A run
-    without jobs (a skipped workflow) certifies nothing.
+    without a successful `tests` aggregate certifies nothing. The workflow
+    itself may be unfinished or cancelled because of an optional job.
     """
     runs = [run for run in suite.get("runs") or ()
-            if run.get("conclusion") == "success" and run.get("jobs")]
+            if run.get("jobs") and (run.get("conclusion") == "success" or _aggregate_success(run))
+            and not any(job.get("conclusion") == "failure" for job in run["jobs"])]
     if not runs:
         return None
     best = max(runs, key=lambda run: (len(run["jobs"]), -int(run["id"])))
@@ -1019,17 +1062,18 @@ def _full_suite_run(suite: dict) -> dict | None:
     names = {job["name"] for job in best["jobs"]}
     if any({job["name"] for job in run["jobs"]} != names for run in ties):
         return None
-    return best
+    return best if _aggregate_success(best) else None
 
 
 def _suite_proof(reference: dict, candidate: dict) -> dict | None:
     """The candidate proves the target's full suite, job by job.
 
     Every job that ran green in the target's full-suite run must exist on the
-    candidate under the same name (a caller/flow prefix is allowed), be
-    completed, and be green. The target's suite is re-read on the last green
-    commit, so a packet that changes the job set (a workflow edit, a reduced
-    matrix) inherits nothing: it needs its own green target CI. Returns
+    candidate under the same name (a caller/flow prefix is allowed). Its
+    `tests` aggregate must complete successfully; other jobs may be non
+    conclusive, but a FAILURE always blocks (#3244). The suite is re-read on
+    the last green commit, so a packet that changes the job set (a workflow
+    edit, a reduced matrix) inherits nothing: it needs its own green target CI. Returns
     `{reference_run, runs}` when the proof holds, else None.
     """
     reference_run = _full_suite_run(reference)
@@ -1045,18 +1089,17 @@ def _suite_proof(reference: dict, candidate: dict) -> dict | None:
             required[job["name"]] = "success"
     candidates = [(run, job) for run in candidate.get("runs") or ()
                   for job in run.get("jobs") or ()]
+    if not any(_aggregate_success(run) for run in candidate.get("runs", ())):
+        return None
+    if any(job.get("conclusion") == "failure" for _, job in candidates):
+        return None
     proof_runs: dict[int, dict] = {}
     for name, conclusion in required.items():
         hits = [(run, job) for run, job in candidates if _same_job(name, job["name"])]
-        if not hits or any(job.get("status") != "completed" for _, job in hits):
-            return None
-        if not any(job["conclusion"] == "success" for _, job in hits):
-            return None
-        if any(job["conclusion"] not in radar.CI_PASSING for _, job in hits):
+        if not hits:
             return None
         for run, job in hits:
-            if job["conclusion"] == "success":
-                proof_runs[int(run["id"])] = run
+            proof_runs[int(run["id"])] = run
     if not proof_runs:
         return None
     return {"reference_run": reference_run,
@@ -1066,7 +1109,9 @@ def _suite_proof(reference: dict, candidate: dict) -> dict | None:
 def _run_evidence(run: dict) -> dict:
     """The durable identity of a run cited by the notes and the report."""
     return {"id": run["id"], "url": run["url"], "workflow": run["workflow"],
-            "event": run["event"], "jobs": len(run["jobs"])}
+            "event": run["event"], "jobs": len(run["jobs"]),
+            "inconclusive": ["%s (%s)" % (job["name"], job["conclusion"] or job["status"])
+                             for job in run["jobs"] if not _job_success(job)]}
 
 
 def tree_green(repo: str, project: "ProjectRelease", sha: str, reference: str | None,
@@ -1118,10 +1163,13 @@ def tree_proof_text(head: str, proof: dict) -> str:
     """The validation line cited in the release notes (SHA and run, #2692)."""
     runs = ", ".join(run["url"] or "run %s" % run["id"] for run in proof["runs"])
     reference = proof["reference_run"]
+    caveats = ["%s: %s" % (run["url"], ", ".join(run["inconclusive"]))
+               for run in proof["runs"] if run.get("inconclusive")]
     return ("tree of %s equals packet head %s, whose full suite (same jobs as the "
             "target's green %s) is green: %s%s"
             % (head[:12], proof["head"][:12], proof["reference"][:12], runs,
-               "; reference run %s" % reference["url"] if reference.get("url") else ""))
+               "; reference run %s" % reference["url"] if reference.get("url") else "")
+            + ("; non concluants: " + "; ".join(caveats) if caveats else ""))
 
 
 def build_plan(cfg, project: ProjectRelease, *, now: float,
@@ -1133,8 +1181,10 @@ def build_plan(cfg, project: ProjectRelease, *, now: float,
     reading = ci_reading(project, head)
     green = commit_is_green(project.repo, project, head, reading=reading)
     tree_proof = None
+    base_reading = reading
     if not green:
-        green_commit = last_green(project.repo, head, project)
+        base_reading = {}
+        green_commit = last_green(project.repo, head, project, evidence=base_reading)
         # #2692: a packet merge whose tree is the green packet head's content
         # is green while the target's own CI is still in progress.
         tree_proof = tree_green(project.repo, project, head, green_commit,
@@ -1191,11 +1241,15 @@ def build_plan(cfg, project: ProjectRelease, *, now: float,
         version_bump=project.version_bump)
     # #3085 : un résultat non concluant ne retient pas la release ; il est
     # cité dans les notes et un lot de correction s'ouvre (règle owner 23/10).
-    if reading.get("inconclusive"):
-        notes += ("\n\n## Checks non concluants (non bloquants, règle owner du 23/10)\n\n"
-                  "Sur la tête %s : %s. Aucun n'est un rouge prouvé ; ils sont "
-                  "consignés et un lot de correction est ouvert.\n"
-                  % (head[:12], ", ".join(reading["inconclusive"])))
+    checked = [(head, reading)]
+    if base != head:
+        checked.append((base, base_reading))
+    for checked_sha, checked_reading in checked:
+        if checked_reading.get("inconclusive"):
+            notes += ("\n\n## Checks non concluants (non bloquants, règle owner du 23/10)\n\n"
+                      "Sur le commit %s : %s. Aucun n'est un rouge prouvé ; ils sont "
+                      "consignés pour correction.\n"
+                      % (checked_sha[:12], ", ".join(checked_reading["inconclusive"])))
     return Plan(project=project, rules=rules, canon_commit=source.commit,
                 cutoff_at=cutoff_at, cutoff_label=cutoff_label, head=head, ci=reading,
                 green=green, last_green=green_commit, base=base, current_version=current,
