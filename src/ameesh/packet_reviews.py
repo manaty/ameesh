@@ -327,6 +327,67 @@ def _ancestor(repo: str, tip: str, base: str) -> bool:
     return proc.returncode == 0
 
 
+def _packet_base(db, vehicle: int, repo: str, head: str, target: str) -> tuple[str, str]:
+    """La base enregistrée de la composition du véhicule, prouvée sur la cible.
+
+    Rend `(cible, commit)` ; `("", "")` quand la composition n'est pas lisible,
+    ne correspond pas à cette tête, ou que sa base n'est pas **prouvée sur la
+    cible** que l'appelant a résolue. La base de `work_packet_members` est la
+    seule lecture qui ne dépende pas de la fraîcheur d'une ref du checkout de
+    la porte (#3091) : un `origin/main` en retard y ajoutait au diff du membre
+    les commits que la cible avait gagnés depuis la composition, et un membre
+    léger devenait sensible.
+
+    #3091 (verdict bloquant cx1) : un enregistrement n'est pas une preuve à
+    lui seul. `packet_link.record --base X` accepte tout ancêtre de la tête ;
+    prendre X comme borne ferait sortir de la relecture les commits du
+    véhicule qui le précèdent (X ajoutant un workflow sensible, par exemple).
+    La base n'est donc retenue que si elle est **contenue dans la cible**
+    résolue par l'appelant (`base == cible` ou ancêtre de la cible). Une cible
+    en retard ne prouve rien d'une base plus récente : on garde alors la base
+    de l'appelant, jamais une borne devinée.
+    """
+    if db is None:
+        return "", ""
+    target = plan_git._commit(repo, target) if target else None
+    if not target:
+        return "", ""
+    try:
+        rows = db.query(
+            "SELECT m.base_sha, m.head_sha, p.branch_target AS package_target"
+            " FROM work_packet_members m JOIN work_items p ON p.id = m.package_id"
+            " WHERE m.package_id = %s"
+            " ORDER BY m.recorded_at DESC, m.work_item_id",
+            (int(vehicle),))
+    except Exception:  # noqa: BLE001 - base ou schéma illisible : repli
+        return "", ""
+    head = str(head or "").strip().lower()
+    for row in rows or ():
+        row = row or {}
+        sha = str(row.get("base_sha") or "").strip()
+        if not sha:
+            continue
+        try:
+            base = plan_git._commit(repo, sha)
+            if not base:
+                continue
+            recorded = str(row.get("head_sha") or "").strip()
+            composed = plan_git._commit(repo, recorded) if recorded else None
+            if composed and head and composed != head \
+                    and not _ancestor(repo, composed, head):
+                continue
+            if head and base != head and not _ancestor(repo, base, head):
+                continue
+            # #3091 : la seule preuve qui compte est l'appartenance de cette
+            # base à la cible résolue par l'appelant.
+            if base != target and not _ancestor(repo, base, target):
+                continue
+        except Exception:  # noqa: BLE001 - comparaison git illisible : repli
+            continue
+        return str(row.get("package_target") or "").strip(), base
+    return "", ""
+
+
 def need(db, vehicle: int, row, marks, repo: str, base: str, head: str,
          cfg=None, canons=None) -> Optional[dict]:
     """Ce que la porte du véhicule `vehicle` doit exiger, ou None.
@@ -340,12 +401,26 @@ def need(db, vehicle: int, row, marks, repo: str, base: str, head: str,
     composée ne contient pas cette tête ; `ok` vaut True avec `required == 0`
     quand le véhicule n'a aucun delta propre ; sinon `ok` vaut None et
     `required`/`klass` décrivent le delta propre à relire.
+
+    #3091 : la base de la composition est lue dans `work_packet_members`, pas
+    dans la ref `origin/<cible>` du checkout de la porte. Cette ref peut être
+    en retard ; elle ajoutait alors au diff d'un membre les commits que la
+    cible avait gagnés depuis sa branche (dont des chemins sensibles) et
+    reclassait un membre léger en sensible. La base enregistrée n'est prise
+    comme borne que si elle est prouvée sur la cible passée par l'appelant
+    (`base`, résolue en commit) : sinon c'est cette cible qui fait foi. Le
+    membre est classé depuis le point où sa branche part de la base du paquet
+    (`merge-base`), et le delta propre du véhicule depuis cette même base.
     """
     if not is_vehicle(row):
         return None
     vehicle = int(vehicle)
+    # #3091 : la base du paquet, quand la composition l'a enregistrée ET que
+    # cette base est contenue dans la cible que l'appelant a résolue.
+    packet_target, packet_base = _packet_base(db, vehicle, repo, head, base)
+    anchor = packet_base or base
     try:
-        found = members(db, repo, base, head, vehicle)
+        found = members(db, repo, anchor, head, vehicle)
     except VehicleError as exc:
         return {"ok": False, "required": None, "klass": None,
                 "why": str(exc), "members": [], "own_paths": []}
@@ -414,10 +489,22 @@ def need(db, vehicle: int, row, marks, repo: str, base: str, head: str,
             # correcteurs (#2726/#2739) se font sur elle, pour tout membre,
             # même sans cible explicite (sans elle, la base était vide et la
             # preuve d'indépendance sautée).
+            #
+            # #3091 : quand la composition a enregistré sa base, la classe du
+            # membre se lit depuis le point où SA branche part de cette base,
+            # jamais depuis la ref de cible du checkout (qui peut être en
+            # retard). Un membre parti d'une base plus ancienne n'hérite donc
+            # pas des commits de la cible gagnés depuis.
+            if packet_base:
+                member_base = (plan_git._out(repo, "merge-base", packet_base, frozen)
+                               or packet_base)
+            else:
+                member_base = plan_git._commit(repo, base) or base
             klass = lot_class.of_lot(db, lot, cfg=cfg, item=member_row, repo=repo,
                                      head=frozen, milestones=member_marks,
                                      canons=canons,
-                                     base_sha=plan_git._commit(repo, base) or base)
+                                     base=packet_target or base,
+                                     base_sha=member_base)
             gate = merge_queue.review_gate(db, member_marks, frozen, repo=repo,
                                            klass=klass, item=member_row)
         except Exception as exc:  # noqa: BLE001 - lecture impossible : refus
@@ -432,10 +519,13 @@ def need(db, vehicle: int, row, marks, repo: str, base: str, head: str,
     if not total:
         return None
     try:
-        start = plan_git._out(repo, "merge-base", base, head)
+        # #3091 : le delta propre se lit depuis la base du paquet, pas depuis
+        # une ref de cible périmée du checkout de la porte : les commits que
+        # la cible a gagnés depuis ne sont pas le delta du véhicule.
+        start = plan_git._out(repo, "merge-base", anchor, head)
         if not start:
             raise VehicleError("cannot read merge-base(%s, %s)"
-                               % (base[:12], head[:12]))
+                               % (anchor[:12], head[:12]))
         own = own_changes(repo, start, head, frozen_sources)
     except VehicleError as exc:
         return {"ok": False, "required": None, "klass": None, "why": str(exc),
