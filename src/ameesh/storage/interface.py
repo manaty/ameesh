@@ -1746,6 +1746,19 @@ class WorkItems(Domain):
         """
 
     @abc.abstractmethod
+    def train_abandon(self, key: str, plan_id: str, document: dict, *, revision: int,
+                      owner: str, epoch: int) -> dict | None:
+        """#3138: terminal write of one exact never-fired train plan.
+
+        Same lease/epoch and revision checks as `train_save`, plus in the same
+        transaction: the persisted plan id is still `plan_id`, its phase is not
+        terminal or `promoting`, and no active/promoting/landed fire receipt
+        exists for it. A concurrent fire grant is serialized on the target
+        lease, so a plan cannot be abandoned between the grant's check and its
+        insertion. Returns the new document, None on any mismatch.
+        """
+
+    @abc.abstractmethod
     def train_adopt(self, key: str, owner: str, *, revision: int,
                     previous: tuple | None, service: tuple, ttl_s: float) -> dict | None:
         """#3142: the train service's current holder takes over the target

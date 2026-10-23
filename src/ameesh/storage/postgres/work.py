@@ -2498,6 +2498,41 @@ class WorkItems(interface.WorkItems):
                 " RETURNING revision", (json.dumps(document), key, int(revision)))
             return dict(document, revision=int(rows[0]["revision"])) if rows else None
 
+    def train_abandon(self, key, plan_id, document, *, revision, owner, epoch) -> dict | None:
+        with self.db.transaction() as tx:
+            held = tx.query("SELECT owner, epoch"
+                            " FROM merge_locks WHERE target = %s FOR UPDATE", (key,))
+            if not held or held[0]["owner"] != owner or int(held[0]["epoch"]) != epoch:
+                return None
+            live = tx.query("SELECT 1 FROM merge_locks WHERE target = %s"
+                            " AND expires_at > clock_timestamp()", (key,))
+            if not live:
+                return None
+            # The target row lock is also taken by train_fire_give: a grant is
+            # either committed before this read (seen just below and refused),
+            # or waits and then finds the terminal phase this write leaves.
+            rows = tx.query("SELECT document FROM integration_trains"
+                            " WHERE target_key = %s FOR UPDATE", (key,))
+            if not rows:
+                return None
+            current = rows[0]["document"]
+            if isinstance(current, str):
+                current = json.loads(current)
+            phase = current.get("phase")
+            if phase in ("landed", "empty", "paused", "invalidated") or phase == "promoting" \
+                    or (current.get("plan") or {}).get("id") != plan_id:
+                return None
+            fire = WorkItems(tx).train_fire_read(key, plan_id)
+            if fire and fire.get("state") in ("active", "promoting", "landed"):
+                return None
+            if (document.get("plan") or {}).get("id") != plan_id:
+                return None
+            updated = tx.query(
+                "UPDATE integration_trains SET revision = revision + 1, document = %s::jsonb,"
+                " updated_at = clock_timestamp() WHERE target_key = %s AND revision = %s"
+                " RETURNING revision", (json.dumps(document), key, int(revision)))
+            return dict(document, revision=int(updated[0]["revision"])) if updated else None
+
     def train_adopt(self, key, owner, *, revision, previous, service, ttl_s) -> dict | None:
         if not owner.startswith("train:") or key == service[0]:
             return None

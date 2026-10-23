@@ -4899,6 +4899,7 @@
     "land_unlock",
     "train_read",
     "train_save",
+    "train_abandon",
     "train_adopt",
     "train_fire_read",
     "train_fire_give",
