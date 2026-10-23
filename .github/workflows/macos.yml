@@ -25,9 +25,9 @@
 # de la PR, comme dans tests.yml pour une PR du dépôt.
 #
 # Le job court `platform-macos` de tests.yml (couche plateforme L63/L66, sans
-# base, borné à 20 min) reste le verdict rapide de chaque PR de paquet. Quand
-# #3026 (macOS vert) sera livré, c'est ce job court qui deviendra le check
-# requis, sans ramener la suite longue dans le chemin du paquet.
+# base, borné à 20 min) reste le verdict rapide de chaque PR de paquet ;
+# #3026 (macOS vert) décidera de la désignation du check requis macOS, sans
+# ramener la suite longue dans le chemin du paquet.
 #
 # #3042 : PostgreSQL n'est pas un `service:` — macOS n'a pas de conteneurs —
 # et les outils GNU (findutils pour `find -printf`) viennent de Homebrew, pour

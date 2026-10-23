@@ -845,8 +845,8 @@ jobs:
   # faute de runner.
   # L68 — DÉCISION DE CONCEPTION (revue #393, 23/10) : ce job n'est pas encore
   # exigé par `tests`. La suite complète vit dans `macos.yml`, hors du chemin
-  # du paquet ; quand #3026 aura livré macOS vert, le job requis de la couche
-  # plateforme sera désigné là-bas, sans ramener la suite longue ici.
+  # du paquet ; #3026 (macOS vert) décidera de la désignation du check requis
+  # macOS, sans ramener la suite longue ici.
   platform-macos:
     name: plateforme macOS
     needs: plan

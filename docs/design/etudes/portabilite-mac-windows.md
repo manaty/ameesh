@@ -289,9 +289,9 @@ platform-layer verdict (L63/L66, no database, 20 minutes), while the full
 suite lives in `.github/workflows/macos.yml` — nightly on `main` and on the
 `ci-macos` label — outside the packet's merge path. It is not a required
 check yet: the full plan has not run green under macOS, and requiring it
-would redden the first package for every lot (§11 bis); #3026 will join the
-short job to `tests` once that proof exists. WSL2 is a Linux: what runs on
-Linux runs there, except reaching the Windows desktop.
+would redden the first package for every lot (§11 bis); #3026 (macOS vert)
+will decide the required macOS check once that proof exists. WSL2 is a
+Linux: what runs on Linux runs there, except reaching the Windows desktop.
 
 | Lot | Content after the answers | Depends on | Estimate |
 |---|---|---|---|
