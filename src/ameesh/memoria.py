@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from urllib import error, request
 from urllib.parse import urlsplit
+from uuid import UUID
 
 
 MAX_BYTES = 1024 * 1024
@@ -114,9 +115,29 @@ class Client:
             raise MemoriaError("invalid_request")
         allowed = ({"what", "channel", "date", "pointer", "direction", "idempotency_key"}
                    if operation == "tell" else
-                   {"purpose"} if operation == "context" else {"question"})
+                   {"purpose"} if operation == "context" else {"question", "conversation"})
         if set(data) - allowed:
             raise MemoriaError("scope_override_refused")
+        if operation == "ask" and "conversation" in data:
+            conversation = data["conversation"]
+            if not isinstance(conversation, dict):
+                raise MemoriaError("invalid_request")
+            if set(conversation) - {"topic", "analysis_id", "through_source"}:
+                raise MemoriaError("scope_override_refused")
+            topic = conversation.get("topic")
+            if not isinstance(topic, str) or not topic.strip() or len(topic) > 100:
+                raise MemoriaError("invalid_request")
+            for key in ("analysis_id", "through_source"):
+                if key in conversation:
+                    value = conversation[key]
+                    if not isinstance(value, str) or len(value) != 36:
+                        raise MemoriaError("invalid_request")
+                    try:
+                        canonical = str(UUID(value))
+                    except ValueError:
+                        raise MemoriaError("invalid_request") from None
+                    if canonical != value.lower():
+                        raise MemoriaError("invalid_request")
         if operation == "tell":
             if any(not isinstance(data.get(k), str) or not data[k].strip()
                    for k in ("what", "channel", "date", "pointer", "idempotency_key")):
@@ -185,7 +206,11 @@ def main(argv=None):
                         help="private per-caller JSON config (or AMEESH_MEMORIA_CONFIG)")
     subs = parser.add_subparsers(dest="operation", required=True)
     subs.add_parser("context").add_argument("--purpose", required=True)
-    subs.add_parser("ask").add_argument("--question", required=True)
+    ask = subs.add_parser("ask")
+    ask.add_argument("--question", required=True)
+    ask.add_argument("--topic", help="admitted topic key for a stored conversation assessment")
+    ask.add_argument("--analysis-id", help="specific stored conversation UUID (requires --topic)")
+    ask.add_argument("--through-source", help="last admitted source UUID to include (requires --topic)")
     subs.add_parser("tell").add_argument("--input", required=True,
                                        help="private cited interaction JSON file, or - for stdin")
     args = parser.parse_args(argv)
@@ -201,6 +226,15 @@ def main(argv=None):
             data = _json(raw)
         else:
             data = {k: getattr(args, k) for k in ("purpose", "question") if hasattr(args, k)}
+            if args.operation == "ask":
+                if args.topic is None and (args.analysis_id is not None
+                                           or args.through_source is not None):
+                    raise MemoriaError("conversation_topic_required")
+                if args.topic is not None:
+                    data["conversation"] = {"topic": args.topic}
+                    for key in ("analysis_id", "through_source"):
+                        if getattr(args, key) is not None:
+                            data["conversation"][key] = getattr(args, key)
         result = Client(settings).call(args.operation, data)
         print(json.dumps(result, ensure_ascii=False))
         return 0

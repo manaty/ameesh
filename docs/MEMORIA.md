@@ -54,8 +54,26 @@ admitted private transport. Redirects and inherited HTTP proxies are disabled.
 ```sh
 ameesh memoria --config /private/acme/memoria.json context --purpose "component X"
 ameesh memoria --config /private/acme/memoria.json ask --question "Who sent the guide?"
+ameesh memoria --config /private/acme/memoria.json ask --question "What is established and still open?" --topic component-x
 ameesh memoria --config /private/acme/memoria.json tell --input /private/acme/interaction.json
 ```
+
+`ask --topic` consults a combined conversation assessment already admitted by
+the Memoria operator. It uses the caller's issuer-bound account; the CLI cannot
+select another person. `--analysis-id UUID` selects a specific candidate, and
+`--through-source UUID` limits the recalled state to that admitted source.
+Both require `--topic`. With no analysis ID, the server selects the latest
+admitted conversation for that person and topic. An unavailable or retracted
+candidate is an error, with no fallback to a basic source lookup.
+
+This read uses no new inference. The topic limits knowledge evidence; questions
+and commitments are explicitly scoped to that conversation. Source quotations,
+the last included date, uncertainty and budget omissions remain visible. An
+answered request or reported action does not establish reading or understanding
+of another message. `unknown=true` can accompany useful cited evidence when
+personal knowledge remains unestablished. The result is a proposed assessment,
+not independent human validation. Without `--topic`, ordinary source-grounded
+`ask` keeps its existing behavior.
 
 A `tell` file (mode 0600), or the equivalent JSON supplied through `--input -`:
 

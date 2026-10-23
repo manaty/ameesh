@@ -27,6 +27,8 @@ WRITE = {"what": "Pat received a guide; reading is not attested.",
          "idempotency_key": "session-a:turn-1", "direction": "out"}
 RECEIPT = {"id": "interaction-a", "duplicate": False, "observations": 0,
            "accepted": True, "analysis": "interaction_recorded"}
+ANALYSIS = "d59b9cb2-7cb4-4774-8d37-ab11155e227a"
+HORIZON = "27581d5b-c605-43cf-bfcb-25153446aed8"
 
 
 class MemoriaTest(unittest.TestCase):
@@ -100,6 +102,72 @@ class MemoriaTest(unittest.TestCase):
         self.assertEqual(self.client().call("ask", {"question": "What was sent?"}), REPLY)
         self.assertEqual(self.requests[0][0], "/v1/ask")
         self.assertNotIn("people", self.requests[0][2])
+
+    def test_conversation_ask_keeps_knowledge_uncertainty_and_issuer_scope(self):
+        self.response = {**REPLY, "unknown": True,
+                         "text": "Évaluation non validée. Information transmise ; lecture non attestée."}
+        for selector in ({"topic": "component-x"},
+                         {"topic": "component-x", "analysis_id": ANALYSIS,
+                          "through_source": HORIZON}):
+            self.assertEqual(self.client().call("ask", {"question": "What is established?",
+                                                        "conversation": selector}), self.response)
+            body = self.requests[-1][2]
+            self.assertEqual(body, {"question": "What is established?", "conversation": selector,
+                                   "scope": {"project": "acme"}, "audience": "private",
+                                   "max_tokens": 300})
+            self.assertNotIn("person", body["conversation"])
+
+    def test_conversation_cannot_override_identity_access_or_review(self):
+        for key, value in (("person", {"channel": "fixture", "value": "other"}),
+                           ("project", "other"), ("scope", {"project": "other"}),
+                           ("audience", "public"), ("max_tokens", 4000),
+                           ("validated", True), ("human_reviewed", True), ("token", self.token)):
+            with self.subTest(key=key), self.assertRaisesRegex(m.MemoriaError,
+                                                              "scope_override_refused"):
+                self.client().call("ask", {"question": "a", "conversation": {
+                    "topic": "component-x", key: value}})
+        self.assertEqual(self.requests, [])
+
+    def test_invalid_conversation_selector_is_refused_before_network(self):
+        for selector in (None, [], {}, {"topic": True}, {"topic": " "}, {"topic": "x" * 101},
+                         {"topic": "component-x", "analysis_id": 123},
+                         {"topic": "component-x", "analysis_id": "not-a-source"},
+                         {"topic": "component-x", "through_source": HORIZON.replace("-", "")},
+                         {"topic": "component-x", "analysis_id": "z" * 36}):
+            with self.subTest(selector=selector), self.assertRaisesRegex(m.MemoriaError,
+                                                                       "invalid_request"):
+                self.client().call("ask", {"question": "a", "conversation": selector})
+        self.assertEqual(self.requests, [])
+
+    def test_conversation_cli_preserves_explicit_topic_and_horizon_without_mesh_access(self):
+        output = io.StringIO()
+        with mock.patch("ameesh.db.connect", side_effect=AssertionError("mesh DB used")), \
+                contextlib.redirect_stdout(output):
+            code = command.main(["memoria", "--config", str(self.config), "ask", "--question",
+                                 "What remains open?", "--topic", "component-x", "--analysis-id",
+                                 ANALYSIS, "--through-source", HORIZON])
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(output.getvalue()), REPLY)
+        self.assertEqual(self.requests[0][2]["conversation"], {
+            "topic": "component-x", "analysis_id": ANALYSIS, "through_source": HORIZON})
+
+    def test_conversation_cli_requires_topic_for_source_selectors(self):
+        for option, value in (("--analysis-id", ANALYSIS), ("--through-source", HORIZON)):
+            output, errors = io.StringIO(), io.StringIO()
+            with self.subTest(option=option), contextlib.redirect_stdout(output), \
+                    contextlib.redirect_stderr(errors):
+                self.assertEqual(m.main(["--config", str(self.config), "ask", "--question", "a",
+                                         option, value]), 1)
+            self.assertEqual(output.getvalue(), "")
+            self.assertEqual(errors.getvalue(), "ameesh memoria: conversation_topic_required\n")
+        self.assertEqual(self.requests, [])
+
+    def test_unsupported_rich_service_does_not_retry_as_basic_recall(self):
+        self.code = 400
+        self.response = {"error": "private service detail"}
+        with self.assertRaisesRegex(m.MemoriaError, "memoria_http_400"):
+            self.client().call("ask", {"question": "a", "conversation": {"topic": "component-x"}})
+        self.assertEqual(len(self.requests), 1)
 
     def test_tell_uses_original_source_and_replay_key(self):
         self.response = RECEIPT
