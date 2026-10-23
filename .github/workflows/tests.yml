@@ -843,12 +843,13 @@ jobs:
   # profondeur : .github/workflows/relance-hosted.yml rejoue les jobs annulés
   # faute de runner.
   # L68 — DÉCISION DE CONCEPTION (revue #393, 23/10) : ce job exécute la
-  # suite du plan sous macOS, mais n'est pas encore exigé par `tests`. La
-  # suite complète n'a jamais tourné sous macOS et il n'y a pas de CI de lot
-  # entre deux coupures (§11 bis) : l'exiger ferait rougir le premier paquet
-  # pour tous les lots. Il reste visible et ses échecs sont corrigés ; il
-  # entrera dans les `needs` de `tests` quand un run du plan complet sera
-  # vert sous macOS (preuve : URL du run dans la note du lot #393).
+  # suite du plan sous macOS. L68b (#3026) le rend requis une fois la suite
+  # complète verte sous macOS (preuve : URL du run dans la note du lot #3026) :
+  # il entre dans les `needs` de `tests` et n'est plus toléré par
+  # `continue-on-error`. Le job court `platform-macos-short` reste requis à
+  # côté (N2 de la revue #393) : la couche plateforme L63/L66 rend un verdict
+  # en quelques minutes, sans attendre la suite longue ni dépendre de sa
+  # capacité.
   platform-macos:
     name: plateforme macOS
     needs: plan
@@ -944,12 +945,9 @@ jobs:
       - name: le plan téléchargé est celui du plan (empreinte, #1256 B4)
         run: echo "${{ needs.plan.outputs.plan_sha256 }}  $RUNNER_TEMP/plan.json" | sha256sum -c -
       - name: suite du plan (L68, pilote psycopg)
-        # #3042 : le job macOS n'est pas requis (décision de conception #393)
-        # et la porte de fusion ameesh exige un run vert ; la suite macOS reste
-        # visible et journalisée, tolérée jusqu'au correctif de portabilité
-        # #3042. #3026 retirera cette tolérance en rendant le job requis après
-        # un run complet vert.
-        continue-on-error: true
+        # L68b (#3026) : la suite a tourné verte sous macOS (run dans la note
+        # du lot) ; la tolérance #3042 est retirée. Une part rouge rougit
+        # désormais le check requis `tests`, comme sous Linux.
         env:
           AMEESH_DRIVER: psycopg
           # socket Unix court : macOS place TMPDIR sous /var/folders, au-delà
@@ -979,6 +977,46 @@ jobs:
             echo "::error::une ou plusieurs parts psycopg ont échoué (voir les tests ci-dessus)" >&2
           fi
           exit "$rc"
+
+  # L68b (#3026), N2 de la revue #393 : le job requis COURT, comme avant L68 —
+  # la couche plateforme L63/L66 et la notification de bureau, sans base. Il
+  # reste requis à côté de la suite longue : un verdict macOS en quelques
+  # minutes, indépendant de la durée (ou d'une annulation par capacité) de la
+  # suite. La garde relance-hosted rejoue un job hébergé annulé faute de
+  # runner (#987).
+  platform-macos-short:
+    name: plateforme macOS (court)
+    needs: plan
+    if: needs.plan.outputs.code == 'true'
+    runs-on: macos-26-intel
+    timeout-minutes: 10
+    env:
+      AMEESH_REQUIRE_DB: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: psutil
+        run: python -m pip install 'psutil>=5.9'
+      - name: couche plateforme, lint, garanties et notification de bureau (L63, L66)
+        run: >-
+          python -m unittest -v tests.test_l63_platform.PlatformTest
+          tests.test_l63_platform.LintTest tests.test_l63_platform.GuaranteeTest
+          tests.test_l66_desktop.PlatformNotifyTest
+      - name: osascript réel sur le script produit (L66)
+        run: |
+          set -euo pipefail
+          script=$(python -c 'from ameesh.platform import notify; print(notify._applescript("ameesh CI", "test L66 — ’accent", "normal"))')
+          test -n "$script"
+          if osascript -e "$script"; then
+            echo "osascript: notification affichée"
+          elif osacompile -e "$script" -o "$RUNNER_TEMP/l66.scpt"; then
+            echo "osascript: pas de session GUI sur le runner; le script compile sans erreur"
+          else
+            echo "osascript: le script AppleScript produit ne compile pas" >&2
+            exit 1
+          fi
 
   # L161a : PR de documentation seule, ses lecteurs déclarés seulement, sans base
   doc-readers:
@@ -1088,7 +1126,7 @@ jobs:
     # `always()` (une exécution annulée le conclut en rouge) ; l'attente en file
     # de cet agrégat après annulation est la saturation des runners (lot #828).
     if: always()
-    needs: [plan, version, psycopg, psql, doc-readers, fs-class]
+    needs: [plan, version, psycopg, psql, platform-macos, platform-macos-short, doc-readers, fs-class]
     runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON(vars.AMEESH_CI_PRIO == 'on' && (startsWith(github.ref, 'refs/heads/integration/') || startsWith(github.ref, 'refs/heads/release/') || startsWith(github.base_ref, 'integration/') || startsWith(github.base_ref, 'release/') || startsWith(github.head_ref, 'integration/') || startsWith(github.head_ref, 'release/') || (github.event_name == 'pull_request' && contains(fromJSON(vars.AMEESH_CI_PRIO_PRS || '[]'), github.event.pull_request.number))) && '["self-hosted", "linux", "ameesh-ci-pool"]' || '["self-hosted", "linux", "ameesh-ci"]') || 'ubuntu-latest' }}
     timeout-minutes: 5
     permissions:
@@ -1106,8 +1144,10 @@ jobs:
           echo "doc     : ${{ needs.doc-readers.result }}"
           echo "psycopg : ${{ needs.psycopg.result }} (parts ${{ needs.plan.outputs.psycopg }})"
           echo "psql    : ${{ needs.psql.result }} (parts ${{ needs.plan.outputs.psql }})"
-          # L68 : platform-macos n'est pas encore requis (voir le job) ;
-          # il n'est pas dans les `needs`, donc rien à vérifier ici.
+          # L68b (#3026) : la suite macOS est requise ; le job court l'est
+          # aussi (N2 de la revue #393). Les deux comptent.
+          echo "macOS   : ${{ needs.platform-macos.result }}"
+          echo "macOS court : ${{ needs.platform-macos-short.result }}"
           echo "autre FS: ${{ needs.fs-class.result }}"
           echo "version : ${{ needs.version.result }}"
           # un plan refusé (étiquette étrangère, SHA qui ne nomme pas la tête,
@@ -1140,6 +1180,10 @@ jobs:
           # vides) doit rougir le check requis, jamais conclure SUCCESS.
           test "${{ needs.psycopg.result }}" = success
           test "${{ needs.psql.result }}" = success || { test '${{ needs.plan.outputs.psql }}' = '[]' && test "${{ needs.psql.result }}" = skipped; } || exit 1
+          # L68b (#3026) : les deux jobs macOS sont requis ; une part rouge ou
+          # un job annulé rougit `tests`.
+          test "${{ needs.platform-macos.result }}" = success
+          test "${{ needs.platform-macos-short.result }}" = success
           # #748 : la part sur l'autre système de fichiers n'existe que pour une
           # release (ou à la main) ; quand elle a tourné, elle compte
           test "${{ needs.fs-class.result }}" = success || test "${{ needs.fs-class.result }}" = skipped

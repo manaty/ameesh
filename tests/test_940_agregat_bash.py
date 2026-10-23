@@ -53,6 +53,7 @@ def scenario(**over: str) -> str:
         "needs.psycopg.result": "success",
         "needs.psql.result": "success",
         "needs.platform-macos.result": "success",
+        "needs.platform-macos-short.result": "success",
         "needs.fs-class.result": "success",
         "needs.version.result": "success",
         "github.event_name": "pull_request",

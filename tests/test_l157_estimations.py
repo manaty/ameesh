@@ -197,7 +197,9 @@ class VersionOnlyTest(unittest.TestCase):
         self.assertIn("if: needs.plan.outputs.psql != '[]'", text)
         self.assertIn("if: needs.plan.outputs.code == 'true'", text)
         self.assertIn('if [ "${{ needs.plan.outputs.version_only }}" = "true" ]', text)
-        self.assertIn("needs: [plan, version, psycopg, psql, doc-readers, fs-class]", text)
+        self.assertIn(
+            "needs: [plan, version, psycopg, psql, platform-macos, "
+            "platform-macos-short, doc-readers, fs-class]", text)
 
 
 class EstimatesPgTest(PgTestCase):

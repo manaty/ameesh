@@ -3,10 +3,11 @@
 #
 # GitHub annule un job hébergé quand aucun runner ne l'a pris après plusieurs
 # tentatives (« The job was not acquired by Runner of type hosted », contrainte
-# de capacité macOS arm64 : run 38428931108, job 115427733668, 13/10/2026). Le
-# job `platform-macos` de « tests » conclut alors `cancelled` sans qu'une seule
-# étape tourne ; il n'est pas encore requis par l'agrégat `tests` (décision de
-# la revue #393), mais une annulation de capacité doit rester visible et reprise.
+# de capacité macOS arm64 : run 38428931108, job 115427733668, 13/10/2026). Les
+# jobs `platform-macos` (suite) et `platform-macos-short` (couche plateforme) de
+# « tests » concluent alors `cancelled` sans qu'une seule étape tourne ; depuis
+# L68b (#3026) l'agrégat `tests` les exige tous les deux, et une annulation de
+# capacité doit rester visible et reprise.
 # L'API refuse de rejouer le job tant que l'exécution tourne : la reprise doit
 # venir d'ici, APRÈS la conclusion — d'où le déclencheur `workflow_run`, et non
 # une étape de « tests ».

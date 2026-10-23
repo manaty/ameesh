@@ -284,10 +284,11 @@ already route host memory, swap, load and pressure through
 `ameesh.platform` (psutil, `None` for load without `os.getloadavg`); the
 `platform-macos` job now runs the suite selected by the CI plan against a
 PostgreSQL installed in its own step (L68), with the `/proc` tests going
-through the platform layer. It is not a required check yet: the full plan has
-not run green under macOS, and requiring it would redden the first package
-for every lot (§11 bis); it joins `tests` once that proof exists. WSL2 is a
-Linux: what runs on Linux runs there, except reaching the Windows desktop.
+through the platform layer. Since L68b (#3026) it is a required check: the full
+plan ran green under macOS on 2026-10-23 (run URL in the note of lot #3026), so
+it joins `tests` without `continue-on-error`; the short `platform-macos-short`
+job stays required for the L63/L66 platform contract (review #393, N2). WSL2 is
+a Linux: what runs on Linux runs there, except reaching the Windows desktop.
 
 | Lot | Content after the answers | Depends on | Estimate |
 |---|---|---|---|

@@ -187,12 +187,15 @@ class WorkflowTest(unittest.TestCase):
         self.assertIn("runs-on: macos-26-intel", texte)
         self.assertNotIn("runs-on: macos-latest", texte)
 
-    def test_le_job_macos_n_est_pas_encore_requis(self):
-        # Décision de la revue #393 : le job macOS n'entre dans les `needs` de
-        # l'agrégat qu'une fois la suite complète verte sous macOS. La relance
-        # garde son utilité : une annulation de capacité reste reprise.
+    def test_les_jobs_macos_sont_requis(self):
+        # L68b (#3026) : la suite macOS entre dans les `needs` de `tests` ; le
+        # job court l'accompagne (N2 de la revue #393). La relance garde son
+        # utilité : une annulation de capacité reste reprise.
         texte = TESTS.read_text(encoding="utf-8")
-        self.assertNotIn('test "${{ needs.platform-macos.result }}" = success', texte)
+        self.assertIn('test "${{ needs.platform-macos.result }}" = success', texte)
+        self.assertIn(
+            'test "${{ needs.platform-macos-short.result }}" = success', texte)
+        self.assertNotIn("platform-macos n'est pas encore requis", texte)
 
     def ligne_declencheurs(self):
         """La ligne `workflows:` de la garde : le contrat du déclencheur."""

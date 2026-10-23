@@ -1,16 +1,20 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """L68 : la CI exécute la suite sous macOS, PostgreSQL installé dans une étape.
 
-Le job `platform-macos` de `tests.yml` est le seul à tourner sous macOS. Avant
-L68 il n'exécutait que la couche plateforme ; il porte désormais la sélection
-du plan (toute la suite sur main/release/**/paquet, les impactés d'une PR de
-lot) avec le pilote psycopg. macOS n'a pas de conteneurs de service : la base
-est installée et démarrée dans une étape, jamais par `services:`.
+Le job `platform-macos` de `tests.yml` est le seul à exécuter la suite sous
+macOS. Avant L68 il n'exécutait que la couche plateforme ; il porte désormais
+la sélection du plan (toute la suite sur main/release/**/paquet, les impactés
+d'une PR de lot) avec le pilote psycopg. macOS n'a pas de conteneurs de
+service : la base est installée et démarrée dans une étape, jamais par
+`services:`.
 
 Décision de la revue #393 (23/10) : tant que la suite complète n'a pas tourné
-verte sous macOS, ce job reste **indépendant** du check requis `tests` —
-l'exiger ferait rougir le premier paquet pour tous les lots (§11 bis). Il
-entre dans les `needs` de `tests` quand cette preuve existe (lot de suite).
+verte sous macOS, ce job reste **indépendant** du check requis `tests`.
+L68b (#3026) a fourni cette preuve (URL du run dans la note du lot) : le job
+entre dans les `needs` de `tests` et n'est plus toléré par `continue-on-error`.
+Le job court `platform-macos-short` reste requis à côté (N2 de la revue) : la
+couche plateforme L63/L66, sans base, rend un verdict macOS en quelques
+minutes.
 
 Ces témoins lisent le workflow (sous-ensemble de texte, pas de PyYAML) et les
 tests `/proc` réécrits : une régression du job ou un retour à une lecture
@@ -46,7 +50,7 @@ class MacosSuiteJobTest(unittest.TestCase):
             text = fh.read()
         cls.text = text
         debut = text.index("\n  platform-macos:\n")
-        fin = text.index("\n  doc-readers:\n", debut)
+        fin = text.index("\n  platform-macos-short:\n", debut)
         cls.job = text[debut:fin]
 
     def test_the_full_suite_comes_from_the_plan(self):
@@ -102,15 +106,63 @@ class MacosSuiteJobTest(unittest.TestCase):
         self.assertIn("- *git", self.job)
         self.assertIn("GIT_CONFIG_GLOBAL=", self.text)
 
-    def test_the_job_is_not_required_before_its_first_full_green_run(self):
-        # Décision de conception de la revue #393 : aucun paquet ne doit
-        # rougir pour un job macOS qui n'a jamais exécuté le plan complet.
+    def test_the_suite_job_is_required_after_its_first_full_green_run(self):
+        # L68b (#3026) : la preuve d'un run complet vert existe (note du lot) ;
+        # le job entre dans les `needs` et n'est plus toléré.
         debut = self.text.index("\n  tests:\n")
         aggregate = self.text[debut:]
         needs = re.search(r"(?m)^    needs: \[(.*)\]$", aggregate)
         self.assertIsNotNone(needs, "job tests : ligne needs introuvable")
-        self.assertNotIn("platform-macos", needs.group(1))
-        self.assertIn("platform-macos n'est pas encore requis", aggregate)
+        self.assertIn("platform-macos", needs.group(1).split(", "))
+        self.assertIn('test "${{ needs.platform-macos.result }}" = success',
+                      aggregate)
+        self.assertNotIn("platform-macos n'est pas encore requis", aggregate)
+
+    def test_the_suite_is_not_tolerated_any_more(self):
+        # #3042 avait posé `continue-on-error` le temps du correctif ; L68b le
+        # retire : une part macOS rouge rougit le check requis.
+        self.assertNotIn("continue-on-error: true", self.job)
+
+
+class MacosShortJobTest(unittest.TestCase):
+    """L68b (#3026) : la couche plateforme L63/L66 reste requise sous macOS.
+
+    N2 de la revue #393 : le basculement garde un job macOS requis court, à
+    côté de la suite longue ; il rend un verdict sans base en quelques minutes.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        with open(WORKFLOW, encoding="utf-8") as fh:
+            text = fh.read()
+        cls.text = text
+        debut = text.index("\n  platform-macos-short:\n")
+        fin = text.index("\n  doc-readers:\n", debut)
+        cls.job = text[debut:fin]
+
+    def test_it_is_the_short_platform_contract(self):
+        self.assertIn("timeout-minutes: 10", self.job)
+        self.assertIn('AMEESH_REQUIRE_DB: "0"', self.job)
+        for nom in ("tests.test_l63_platform.PlatformTest",
+                    "tests.test_l63_platform.LintTest",
+                    "tests.test_l63_platform.GuaranteeTest",
+                    "tests.test_l66_desktop.PlatformNotifyTest"):
+            self.assertIn(nom, self.job)
+        self.assertIn("osascript", self.job)
+        # pas de base ni de suite : c'est le verdict court, pas le doublon.
+        self.assertNotIn("test-parts.py", self.job)
+        self.assertNotIn("PostgreSQL", self.job)
+
+    def test_it_is_required(self):
+        debut = self.text.index("\n  tests:\n")
+        aggregate = self.text[debut:]
+        needs = re.search(r"(?m)^    needs: \[(.*)\]$", aggregate)
+        self.assertIsNotNone(needs, "job tests : ligne needs introuvable")
+        self.assertIn("platform-macos-short", needs.group(1).split(", "))
+        self.assertIn(
+            'test "${{ needs.platform-macos-short.result }}" = success',
+            aggregate)
+        self.assertIn("runs-on: macos-26-intel", self.job)
 
 
 class BenchTmpdirTest(unittest.TestCase):
