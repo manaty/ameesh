@@ -81,6 +81,34 @@ KeychainTest). Le contrôle d'inclusion signale pour cette raison le contenu de
 la remise, pas une omission. Le job macOS reste hors du chemin du paquet
 (#3198) et ces témoins suivent la plateforme macOS.
 
+## Corrections après revue (tête `884d1c510d24`)
+
+La CI complète du gel (`40024941418`) a rendu quatre témoins rouges, dont le
+B/P1 cx2/dev2 ; correctif `3460bd874` sur la branche du paquet, avis sur le
+delta final (§12).
+
+- **Contrat du train réépinglé** : `src/ameesh/train_contracts.py` épinglait
+  `tests.yml` à `2f83414c75f8` (avant la remise #390) alors que la tête porte
+  `7a6fc3bd619c` (remise #390×#3198, témoins L65). Le contrat suit le blob
+  livré ; les autres blobs étaient déjà à jour.
+- **Témoin #1635** : le nom de l'agrégat dépend désormais de
+  `github.event.label.name` (#3198) ; l'évaluateur local du témoin reçoit
+  `label_name` (défaut vide) et vérifie les deux noms — `tests (ci-macos,
+  hors gel)` sur l'étiquette, `tests` sur un gel ordinaire.
+- **Témoin #876** : le job `tests` garde `always()` et exclut l'étiquette
+  `ci-macos` (#3198) ; le témoin évalue la condition livrée (vraie sur une
+  annulation ordinaire, fausse sur `ci-macos`) au lieu d'exiger `always()`
+  seul.
+- **Ordre de l'aide (#2179)** : #390 avait inséré `ameesh service …` entre
+  `notify` et `offload` ; le bloc rejoint sa place alphabétique, entre
+  `serve` et `session`. Aucune commande ne change.
+
+Tests ciblés verts sur `3460bd874` : `test_2446_train_contract`,
+`test_1635_dispatch_porte`, `test_l148_stage2b_scripts`,
+`test_2179_roadmap_cli`, `test_l68_macos_ci`, `test_3108_train_contract_jobs`,
+`test_3098_train_contract_pins` ; `scripts/freeze-checks.py` 6/6. La suite
+complète est redemandée sur la nouvelle tête gelée (PR #2447).
+
 ## Écartés (ce véhicule)
 
 | lot | motif |
@@ -101,7 +129,7 @@ la remise, pas une omission. Le job macOS reste hors du chemin du paquet
   pour ce véhicule. Aucun lot prêt laissé hors paquet.
 - **Contrôles statiques** : `scripts/freeze-checks.py` **6/6** verts
   (12,3 s) sur cet arbre.
-- **Diff** : 65 fichiers, +4591/−539 ; `git diff --check` propre ; aucun
+- **Diff** : 68 fichiers, +4732/−542 ; `git diff --check` propre ; aucun
   marqueur de conflit ni de saut de CI dans les commits de composition.
 - **Migrations** : aucune ajoutée par le paquet ; la base 1.20.0 porte
   `0475`–`0478`, appliquées par le déploiement release avant la CI.
@@ -111,3 +139,4 @@ la remise, pas une omission. Le job macOS reste hors du chemin du paquet
   PR (§12). Aucune CI de lot.
 
 Tête composée (unités, avant le commit du manifeste) : `518698a0c309`.
+Tête corrigée après revue : `3460bd8743` ; ce manifeste est la tête gelée.
