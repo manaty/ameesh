@@ -6,7 +6,9 @@ Base : `main` **`18204348c558`** (tête au 23/10 13:08Z). Branche
 13:07Z : trois P1 prêts étaient en attente. Le train ameesh est hors service
 (`train.projects = ['nexlink']`), le repli manuel s'applique.
 
-Composeur : mty-amh-impl-01. Une seule suite complète sur la tête finale.
+Composeur : mty-amh-impl-01. Porteur : **#3146** (issue
+manaty/ameesh#2408), PR **#2409**. Une seule suite complète sur la tête
+finale.
 
 ## Unités (3 unités, 3 lots portés)
 
