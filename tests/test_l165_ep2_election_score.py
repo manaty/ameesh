@@ -251,6 +251,28 @@ class ReadinessTest(_RoleCase):
         self.assertFalse(state["ready"])
         self.assertIn("placement refused", state["diagnostic"])
 
+    def test_verdict_de_placement_d_un_autre_canon(self):
+        # Le CAS d'EP1 exige le verdict du canon COURANT de la fiche : un
+        # verdict resté sur l'ancien canon ne doit pas être classé prêt.
+        self.db.execute(
+            "UPDATE agent_registry SET canon = 'home' WHERE name = 'pilote'")
+        self.db.execute(
+            "INSERT INTO canon_state (host, canon, status, root, source, diagnostic)"
+            " VALUES ('banc', 'home', 'ok', '/home', 'test', '')"
+            " ON CONFLICT (host, canon) DO UPDATE SET status = excluded.status")
+        state = self.candidate()
+        self.assertFalse(state["ready"])
+        self.assertIn("another canon", state["diagnostic"])
+
+    def test_verdict_de_placement_anterieur_a_la_fiche(self):
+        # Profil de placement divergé depuis l'évaluation (le CAS refuse) :
+        # le classement ne doit pas faire attendre le candidat suivant.
+        self.db.execute(
+            "UPDATE agent_registry SET model = 'claude-opus' WHERE name = 'pilote'")
+        state = self.candidate()
+        self.assertFalse(state["ready"])
+        self.assertIn("predates the current card", state["diagnostic"])
+
     def test_releve_de_ressources_perime(self):
         self.db.execute("DELETE FROM host_resources")
         self.reading("banc", sampled_ts=time.time() - 3600)
