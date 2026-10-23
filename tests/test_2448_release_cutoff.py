@@ -10,8 +10,10 @@ from __future__ import annotations
 import dataclasses
 import os
 import shutil
+import signal
 import subprocess
 import tempfile
+import time
 import types
 import unittest
 from datetime import datetime
@@ -845,7 +847,8 @@ class StagingTimeoutTest(unittest.TestCase):
                 if self.calls == 1:
                     raise subprocess.TimeoutExpired("bash", timeout,
                                                     output=b"partial output\n")
-                return "", ""
+                # as Popen: a retried communicate returns the whole output
+                return "partial output\nrest\n", ""
 
         proc = FakeProc()
         project = release_cutoff.ProjectRelease(
@@ -869,9 +872,9 @@ class StagingTimeoutTest(unittest.TestCase):
 
 
 # Fake `systemctl --user`: the transient units live in $UNITES_ETAT ("name
-# state" lines); a unit ends by itself after FIN_APRES reads (0 = never);
-# `stop` clears them unless STOP_SANS_EFFET=1. Every call is appended to
-# $UNITES_ETAT.calls.
+# state pid" lines), alive while their pid is (a zombie is not); `stop` kills them unless
+# STOP_SANS_EFFET=1. LIST_KO=1 makes every read fail, LIST_KO_APRES_STOP=1
+# every read after a stop. Every call is appended to $UNITES_ETAT.calls.
 FAKE_SYSTEMCTL = r"""#!/usr/bin/env bash
 etat=$UNITES_ETAT
 shift
@@ -879,21 +882,29 @@ cmd=$1; shift
 echo "$cmd $*" >> "$etat.calls"
 case $cmd in
   list-units)
+    [ "${LIST_KO:-0}" = 1 ] && exit 1
+    [ "${LIST_KO_APRES_STOP:-0}" = 1 ] && [ -e "$etat.stopped" ] && exit 1
     pat=${@: -1}
-    n=$(cat "$etat.n" 2>/dev/null || echo 0); n=$((n + 1)); echo "$n" > "$etat.n"
-    if [ "${FIN_APRES:-0}" != 0 ] && [ "$n" -gt "$FIN_APRES" ]; then : > "$etat"; fi
-    while read -r u st; do
-      [[ $u == $pat ]] && echo "$u loaded $st running [systemd-run] poste.sh"
+    while read -r u st pid; do
+      etat_pid=$(ps -o stat= -p "$pid" 2>/dev/null) || continue
+      [[ $u == $pat && $etat_pid != Z* ]] && echo "$u loaded $st running [systemd-run] poste.sh"
     done < "$etat" ;;
-  stop) [ "${STOP_SANS_EFFET:-0}" = 1 ] || : > "$etat" ;;
+  stop)
+    : > "$etat.stopped"
+    if [ "${STOP_SANS_EFFET:-0}" != 1 ]; then
+      while read -r u st pid; do kill "$pid" 2>/dev/null; done < "$etat"
+    fi ;;
 esac
 exit 0
 """
 
-# A staging run that hands the workstation restart to a transient unit (as
-# poste_transitoire does), then outlives its timeout.
+# A staging run that hands the workstation restart to a detached writer (as
+# systemd-run --pipe does, the "unit" keeps the staging stdout), then outlives
+# its timeout.
 SLOW_STAGING = """#!/usr/bin/env bash
-echo "poste-maj-staging-$$-redemarrer.service active" > "$UNITES_ETAT"
+setsid sleep "$DUREE_UNITE" &
+echo "$!" >> "$UNITES_ETAT.pids"
+echo "poste-maj-staging-$$-redemarrer.service active $!" > "$UNITES_ETAT"
 echo "restart handed to poste-maj-staging-$$-redemarrer"
 sleep 30
 """
@@ -917,60 +928,112 @@ class StagingTimeoutUnitsTest(unittest.TestCase):
         self.state = self.root / "units"
         self.state.write_text("")
         self.env = {"PATH": "%s:%s" % (bin_dir, os.environ.get("PATH", "")),
-                    "UNITES_ETAT": str(self.state)}
+                    "UNITES_ETAT": str(self.state), "DUREE_UNITE": "30"}
+        self.addCleanup(self.kill_units)
 
-    def run_timeout(self, **env):
+    def kill_units(self):
+        pids = Path(str(self.state) + ".pids")
+        for pid in (pids.read_text().split() if pids.exists() else ()):
+            try:
+                os.kill(int(pid), signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+
+    def run_timeout(self, grace=0.6, **env):
         project = release_cutoff.ProjectRelease(
             name="ameesh", repo=str(self.root / "repo"), target="main",
             staging="deploy/mise-a-jour/staging.sh", github="manaty/ameesh")
         at_drop = []
+        started = time.monotonic()
         with mock.patch.dict(os.environ, {**self.env, **env}), \
-             mock.patch.object(release_cutoff, "STAGING_UNIT_GRACE_S", 0.6), \
+             mock.patch.object(release_cutoff, "STAGING_UNIT_GRACE_S", grace), \
              mock.patch.object(release_cutoff, "STAGING_UNIT_POLL_S", 0.05), \
+             mock.patch.object(release_cutoff, "STAGING_KILL_GRACE_S", 0.2), \
+             mock.patch.object(release_cutoff, "STAGING_DRAIN_S", 0.3), \
              mock.patch.object(release_cutoff, "_worktree",
                                return_value=(str(self.root), str(self.worktree))), \
              mock.patch.object(release_cutoff, "_drop_worktree",
-                               side_effect=lambda *a: at_drop.append(self.state.read_text())):
+                               side_effect=lambda *a: at_drop.append(self.live())):
             with self.assertRaises(release_cutoff.TransientReleaseError) as caught:
                 release_cutoff.run_staging(project, "a" * 40, [],
-                                           state_dir=str(self.root), timeout_s=1)
+                                           state_dir=str(self.root), timeout_s=0.5)
+        # bounded: neither the held pipe nor the 30 s unit is waited for
+        self.assertLess(time.monotonic() - started, 10)
         calls = Path(str(self.state) + ".calls").read_text().splitlines()
+        log = next((self.root / "release").glob("staging-*.log")).read_text()
+        self.assertIn("restart handed to", log)
         return str(caught.exception), at_drop, calls
 
+    def live(self):
+        """pids of the fake units still alive"""
+        pids = Path(str(self.state) + ".pids")
+        alive = []
+        for pid in pids.read_text().split():
+            try:
+                stat = Path("/proc/%s/stat" % pid).read_text()
+            except OSError:
+                continue
+            if stat.rsplit(")", 1)[1].split()[0] != "Z":
+                alive.append(pid)
+        return alive
+
+    def stops(self, calls):
+        return [call for call in calls if call.startswith("stop")]
+
     def test_the_worktree_is_dropped_once_the_unit_ended(self):
-        message, at_drop, calls = self.run_timeout(FIN_APRES="3")
+        message, at_drop, calls = self.run_timeout(grace=5, DUREE_UNITE="2")
         self.assertIn("timed out", message)
+        # seen alive while it held stdout, not after it ended
         self.assertIn("ended before the worktree was dropped", message)
         self.assertRegex(message, r"poste-maj-staging-\d+-redemarrer\.service")
-        self.assertEqual(at_drop, [""])
-        self.assertFalse(any(call.startswith("stop") for call in calls), calls)
+        self.assertEqual(at_drop, [[]])
+        self.assertEqual(self.stops(calls), [])
 
     def test_a_unit_past_its_grace_is_stopped_before_the_drop(self):
         message, at_drop, calls = self.run_timeout()
         self.assertIn("stopped: the workstation may be half restarted", message)
-        self.assertEqual(at_drop, [""])
-        stops = [call for call in calls if call.startswith("stop")]
-        self.assertEqual(len(stops), 1, calls)
-        self.assertRegex(stops[0], r"^stop poste-maj-staging-\d+-redemarrer\.service$")
+        self.assertEqual(at_drop, [[]])
+        self.assertRegex(self.stops(calls)[0], r"^stop poste-maj-staging-\d+-\*$")
 
     def test_a_unit_that_survives_its_stop_keeps_the_worktree(self):
         message, at_drop, _ = self.run_timeout(STOP_SANS_EFFET="1")
+        self.assertIn("still running", message)
         self.assertIn("worktree kept", message)
         self.assertEqual(at_drop, [])
 
-    def test_no_unit_or_no_systemctl_means_no_wait(self):
-        with mock.patch.object(release_cutoff, "_systemctl", return_value=None):
-            self.assertEqual(release_cutoff._settle_poste_units(1), ("", True))
+    def test_an_unreadable_state_keeps_the_worktree(self):
+        message, at_drop, calls = self.run_timeout(LIST_KO="1")
+        self.assertIn("unreadable state", message)
+        self.assertIn("worktree kept", message)
+        self.assertEqual(at_drop, [])
+        self.assertEqual(len(self.stops(calls)), 1, calls)
+
+    def test_an_unprovable_stop_keeps_the_worktree(self):
+        message, at_drop, _ = self.run_timeout(LIST_KO_APRES_STOP="1")
+        self.assertNotIn("stopped:", message)
+        self.assertIn("unreadable state", message)
+        self.assertEqual(at_drop, [])
+
+    def test_without_systemctl_there_is_no_unit(self):
+        with mock.patch.object(release_cutoff.shutil, "which", return_value=None):
+            self.assertEqual(release_cutoff._poste_units(1), [])
+            self.assertEqual(release_cutoff._settle_poste_units(1, time.sleep), ("", True))
 
     def test_the_status_bullet_and_dead_units_are_not_live(self):
         out = ("● poste-maj-staging-7-retour.service loaded failed failed x\n"
                "poste-maj-staging-7-redemarrer.service loaded active running x\n"
                "poste-maj-staging-7-vieux.service loaded inactive dead x\n")
         done = subprocess.CompletedProcess([], 0, stdout=out, stderr="")
-        with mock.patch.object(release_cutoff, "_systemctl", return_value=done) as call:
+        with mock.patch.object(release_cutoff.shutil, "which", return_value="systemctl"), \
+             mock.patch.object(release_cutoff, "_systemctl", return_value=done) as call:
             self.assertEqual(release_cutoff._poste_units(7),
                              ["poste-maj-staging-7-redemarrer.service"])
         self.assertEqual(call.call_args.args[-1], "poste-maj-staging-7-*")
+        failed = subprocess.CompletedProcess([], 1, stdout="", stderr="no bus")
+        with mock.patch.object(release_cutoff.shutil, "which", return_value="systemctl"), \
+             mock.patch.object(release_cutoff, "_systemctl", return_value=failed):
+            self.assertIsNone(release_cutoff._poste_units(7))
+
 
 class PureReleaseTest(unittest.TestCase):
     def test_a_rerun_of_the_same_suite_is_not_ambiguous(self):

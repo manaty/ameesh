@@ -61,6 +61,11 @@ STAGING_TIMEOUT_S = 7200.0
 STAGING_UNIT_GRACE_S = 600.0
 #: pause between two reads of those units
 STAGING_UNIT_POLL_S = 5.0
+#: after SIGTERM to a timed-out staging group, before SIGKILL
+STAGING_KILL_GRACE_S = 10.0
+#: last bounded read of the staging output once its units are settled: a
+#: survivor may still hold the pipe (`systemd-run --pipe`)
+STAGING_DRAIN_S = 10.0
 #: default target lease duration, the same as the train and the merge queue
 LOCK_TTL_S = land.LOCK_TTL_S
 #: default bounded wait for the target lease (a packet CI may run 45 min)
@@ -1485,17 +1490,20 @@ def _systemctl(*args: str, timeout: float = 30) -> subprocess.CompletedProcess |
         return None
 
 
-def _poste_units(pid: int) -> list[str]:
+def _poste_units(pid: int) -> list[str] | None:
     """Live transient workstation units started by the staging run `pid`.
 
     `staging.sh` names them `poste-maj-staging-$$-<gesture>`; `$$` is the pid
     of the bash started here. The systemd manager runs them, not this process
-    group: killing the run leaves them running (#3049).
+    group: killing the run leaves them running (#3049). None when their state
+    is unreadable; [] without systemctl, where staging.sh starts none.
     """
+    if shutil.which("systemctl") is None:
+        return []
     proc = _systemctl("list-units", "--all", "--plain", "--no-legend", "--type=service",
                       "poste-maj-staging-%d-*" % pid)
     if proc is None or proc.returncode:
-        return []
+        return None
     units = []
     for line in proc.stdout.splitlines():
         fields = line.split()
@@ -1506,34 +1514,39 @@ def _poste_units(pid: int) -> list[str]:
     return units
 
 
-def _settle_poste_units(pid: int, grace_s: float | None = None) -> tuple[str, bool]:
+def _settle_poste_units(pid: int, wait, grace_s: float | None = None) -> tuple[str, bool]:
     """Let a timed-out run's workstation units end before the worktree goes.
 
     A restart cut in the middle can leave the executors stopped, so the units
-    get `grace_s` to finish on their own; past it they are stopped. Returns
-    the note for the report and whether the worktree may be dropped (False
-    while a unit is still alive: it keeps running from it).
+    get `grace_s` to finish on their own; past it they are stopped. `wait`
+    pauses between two reads and keeps draining the staging output, which a
+    unit started with `--pipe` holds. Returns the note for the report and
+    whether the worktree may be dropped: only once no unit is seen alive,
+    never on an unreadable state.
     """
     units = _poste_units(pid)
-    if not units:
+    if units == []:
         return "", True
     if grace_s is None:
         grace_s = STAGING_UNIT_GRACE_S
-    seen = list(units)
+    seen = set(units or ())
     deadline = time.monotonic() + grace_s
-    while units and time.monotonic() < deadline:
-        time.sleep(STAGING_UNIT_POLL_S)
+    while units != [] and time.monotonic() < deadline:
+        wait(STAGING_UNIT_POLL_S)
         units = _poste_units(pid)
-    if not units:
-        return ("; workstation unit(s) %s ended before the worktree was dropped"
-                % ", ".join(seen)), True
-    _systemctl("stop", *units, timeout=180)
+        seen.update(units or ())
+    names = ", ".join(sorted(seen)) or "poste-maj-staging-%d-*" % pid
+    if units == []:
+        return "; workstation unit(s) %s ended before the worktree was dropped" % names, True
+    _systemctl("stop", "poste-maj-staging-%d-*" % pid, timeout=180)
     alive = _poste_units(pid)
-    if alive:
-        return ("; workstation unit(s) %s still running after %ss and a stop: "
-                "worktree kept, check the workstation" % (", ".join(alive), grace_s)), False
-    return ("; workstation unit(s) %s still running after %ss, stopped: "
-            "the workstation may be half restarted" % (", ".join(units), grace_s)), True
+    if alive == []:
+        return ("; workstation unit(s) %s still running after %ss, stopped: "
+                "the workstation may be half restarted" % (names, grace_s)), True
+    return ("; workstation unit(s) %s %s after %ss and a stop: worktree kept, "
+            "check the workstation"
+            % (", ".join(alive) if alive else names,
+               "still running" if alive else "in an unreadable state", grace_s)), False
 
 
 def run_staging(project: ProjectRelease, release_sha: str, included: list[int],
@@ -1569,23 +1582,39 @@ def run_staging(project: ProjectRelease, release_sha: str, included: list[int],
                 output, _ = proc.communicate(
                     timeout=timeout_s or project.staging_timeout_s)
             except subprocess.TimeoutExpired as exc:
-                partial = exc.output or ""
-                if isinstance(partial, bytes):
-                    partial = partial.decode("utf-8", "replace")
-                log.write(partial)
+                read = {"output": None, "partial": exc.output}
+
+                def wait(seconds):
+                    # a bounded read: a unit started with `--pipe` keeps the
+                    # pipe open after the group is dead (#3049)
+                    if read["output"] is not None:
+                        time.sleep(seconds)
+                        return
+                    try:
+                        read["output"], _ = proc.communicate(timeout=seconds)
+                    except subprocess.TimeoutExpired as again:
+                        read["partial"] = again.output or read["partial"]
+
                 # `communicate` kills bash only; the sequence's ssh/vm.sh
                 # children would survive and keep the worktree/flock. Kill the
                 # whole session started for this run, then wait for it.
                 _kill_group(proc, signal.SIGTERM)
-                try:
-                    output, _ = proc.communicate(timeout=10)
-                except subprocess.TimeoutExpired:
+                wait(STAGING_KILL_GRACE_S)
+                if read["output"] is None:
                     _kill_group(proc, signal.SIGKILL)
-                    output, _ = proc.communicate()
-                log.write(output or "")
                 # the restart/rollback units of the workstation outlive the
                 # group and run from this worktree (#3049)
-                note, drop = _settle_poste_units(proc.pid)
+                note, drop = _settle_poste_units(proc.pid, wait)
+                if read["output"] is None:
+                    wait(STAGING_DRAIN_S)
+                if read["output"] is None:
+                    # still held by a survivor: keep what was read, reap bash
+                    with contextlib.suppress(OSError, subprocess.TimeoutExpired):
+                        proc.wait(timeout=STAGING_DRAIN_S)
+                text = read["output"] if read["output"] is not None else read["partial"]
+                if isinstance(text, bytes):
+                    text = text.decode("utf-8", "replace")
+                log.write(text or "")
                 raise TransientReleaseError(
                     "staging timed out after %ss (log %s)%s"
                     % (timeout_s or project.staging_timeout_s, log_path, note)) from exc
