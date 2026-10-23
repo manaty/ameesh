@@ -1646,6 +1646,7 @@ class WorkItems(interface.WorkItems):
         return self.db.query(
             """
             SELECT e.id, e.work_item_id, e.state, e.note, e.actor, w.assignee,
+                   e.evidence,
                    extract(epoch from e.created_at)::float8 as created_ts
               FROM work_item_events e JOIN work_items w ON w.id = e.work_item_id
              WHERE e.note LIKE %s AND e.created_at >= to_timestamp(%s)

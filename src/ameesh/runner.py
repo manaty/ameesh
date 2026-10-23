@@ -237,6 +237,10 @@ TURN_CGROUP_READY_S = 30.0
 #: L976 : au plus un balayage du courrier en souffrance par heure (le seuil de
 #: l'alerte `mail_undeliverable` est de 15 min)
 DEAD_LETTER_SWEEP_EVERY_S = 3600.0
+#: #3007 : cadence du constat de vie du notificateur, porté par chaque hôte
+#: (le ménage peut être coupé ; ce fil ne dépend pas de lui). La réclamation
+#: en base dédoublonne les hôtes et espace les relances de six heures.
+NOTIFY_HEALTH_EVERY_S = 300.0
 #: #339 r2: a process of this user whose environment cannot be read keeps a
 #: row if it started after the row, less this margin (the harness starts
 #: just before its row is opened; the base's clock may drift from the host's)
@@ -8662,6 +8666,7 @@ class Runner:
         maximum = limits.get("max_agents")
         self._host_max_agents = int(maximum) if maximum is not None else None
         self._host_limits_origin = {"max_agents": "serveur"}
+        self._host_pinned_admissions = None
         self.relocate = False
 
 
@@ -10636,6 +10641,43 @@ class Runner:
                       % (action["old"], action["new"], action["reason"].splitlines()[0]))
         return report
 
+    def notify_health_once(self, db=None, now: float | None = None) -> dict | None:
+        """#3007 : dit, depuis cet hôte, si un notificateur vivant couvre les
+        humains qui ont des décisions en attente, et briefe les agents.
+
+        Le constat vient des battements partagés (`notify_liveness`) : une VM
+        sans route n'est plus une alerte, et le brief ne dépend pas du poste
+        qui porte `ameesh-notify`. La réclamation `(destinataire, humain)` en
+        base dédoublonne les hôtes et espace les relances. Sa propre connexion
+        quand `db` est absent ; jamais fatal à l'exécuteur."""
+        if getattr(self, "dry_run", False) or getattr(self, "mediated", False):
+            return None
+        own = db is None
+        try:
+            if own:
+                from .scoped_db import ScopedDb
+                db = ScopedDb(self.cfg)
+            from . import notify_gap
+            report = notify_gap.brief_once(self.cfg, db, now=now)
+        except Exception as exc:      # jamais fatal pour l'exécuteur
+            log_async("notify gap: pass failed (%s: %s)" % (type(exc).__name__, exc))
+            return None
+        finally:
+            if own and db is not None:
+                try:
+                    db.close()
+                except Exception:
+                    pass
+        for entry in report["sent"]:
+            log_async("notify gap: brief %s to %s for %s (%d decision(s))"
+                      % ("reminder" if entry.get("reminder") else "sent",
+                         entry["recipient"], entry["human"],
+                         len(entry.get("decisions") or ())))
+        for entry in report["failed"]:
+            log_async("notify gap: brief to %s failed (%s)"
+                      % (entry.get("recipient") or "?", entry.get("error")))
+        return report
+
     def branch_sweep_once(self) -> dict | None:
         """L118 : un relevé des branches des lots ouverts dont l'assigné est sur
         cet hôte (et, avec `--agents`, parmi eux) : une branche fusionnée dans
@@ -10950,6 +10992,28 @@ class Runner:
 
         threading.Thread(target=boucle, daemon=True, name="menage").start()
 
+    def start_notify_health_poll(self) -> None:
+        """#3007 : le constat de vie du notificateur, depuis chaque hôte.
+
+        Une passe toutes les `NOTIFY_HEALTH_EVERY_S` (5 min), indépendante du
+        ménage et du poste qui porte `ameesh-notify` : quand celui-ci tombe,
+        les VM continuent de voir le silence et de briefer les agents. Le
+        premier passage est décalé pour ne pas faire partir tous les hôtes à
+        la même seconde (la réclamation en base dédoublonne de toute façon)."""
+        if self.once or getattr(self, "mediated", False) or getattr(self, "dry_run", False):
+            return
+
+        def boucle() -> None:
+            import random
+            if self.stop.wait(random.uniform(30.0, 120.0)):
+                return
+            while not self.stop.is_set():
+                self.notify_health_once()
+                if self.stop.wait(NOTIFY_HEALTH_EVERY_S):
+                    return
+
+        threading.Thread(target=boucle, daemon=True, name="notify-health").start()
+
     def refresh_host_limits(self, canon, *others, complete: bool = True) -> None:
         """Met à jour les limites physiques de CET hôte depuis les canons.
 
@@ -11006,6 +11070,11 @@ class Runner:
                     self._handoff_limits[h.title] = dict(effective["limits"], max_agents=effective["max_agents"])
         self._host_max_agents = mine["max_agents"]
         self._host_limits_origin = mine["origin"]
+        # #3101 : places des admissions épinglées sur cet hôte (tous les
+        # canons) ; un rôle élu ne prend que celles qu'elles laissent libres
+        from . import placement as placement_mod
+        self._host_pinned_admissions = sum(
+            placement_mod.host_load(one)[0].get(self.host, 0) for one in canons)
         # L159f : un hôte prêteur (offre `policy.lend`) a une porte fermée
         # par défaut
         sync_gate = getattr(self, "_sync_host_gate", None)
@@ -11073,17 +11142,28 @@ class Runner:
         fiches Host de tous les canons) borne le nombre de personas que cet
         exécuteur fait tourner à la fois. Les éphémères n'y comptent pas (ils
         n'ont pas d'admission ; `max_agents` compte des admissions). Sans
-        maximum déclaré : pas de borne."""
+        maximum déclaré : pas de borne.
+
+        #3101 : un rôle élu (`releve: election`) ne prend que les places que
+        les admissions épinglées de l'hôte laissent libres ; sinon il reste
+        réclamable par ses autres candidats."""
         if getattr(self, "mediated", False) and not self._gate_admits(agent):
             return False  # L112 : `caps.max_concurrent` de la porte
         cap = getattr(self, "_host_max_agents", None)
         if cap is None or (agent or {}).get("ephemeral"):
             return True
         with self.lock:
-            running = sum(1 for name, worker in self.workers.items()
-                          if name != (agent or {}).get("name") and worker.is_alive()
-                          and not (getattr(worker, "agent", None) or {}).get("ephemeral"))
-        return running < cap
+            others = [(getattr(worker, "agent", None) or {})
+                      for name, worker in self.workers.items()
+                      if name != (agent or {}).get("name") and worker.is_alive()
+                      and not (getattr(worker, "agent", None) or {}).get("ephemeral")]
+        if len(others) >= cap:
+            return False
+        pinned = getattr(self, "_host_pinned_admissions", None)
+        if (agent or {}).get("releve") != "election" or pinned is None:
+            return True
+        elected = sum(1 for other in others if other.get("releve") == "election")
+        return elected < cap - pinned
 
     def host_limits_for(self, host: str) -> dict | None:
         """Seuils connus d'un hôte (dernier `canon sync`), ou None."""
@@ -11893,6 +11973,7 @@ class Runner:
         self.start_resource_poll()
         self.start_version_poll()
         self.start_housekeeping_poll()
+        self.start_notify_health_poll()
         self.start_branch_sweep_poll()
         self.start_train_service()
         self.start_device_channels()

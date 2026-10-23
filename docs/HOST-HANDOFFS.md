@@ -119,15 +119,18 @@ readiness supply those separate integrations.
 
 ## Host drain, return and loss recovery (L232e)
 
-`ameesh host drain HOST [--for 8h]` closes new claims, turns and prompt
-consumption while preserving the current turn and lease. The persistent
-request takes precedence over later resource readings that say `available`.
-The controller considers critical agents first, checks receiving-host
-readiness and uses a handoff at a turn boundary. `ameesh host undrain HOST`
-requests their return; an elapsed `--for` duration makes the same request.
-`ameesh host reconcile HOST` reopens a lost host on the verified proof below.
-Missing helper, secret requirements and host-scoped logins remain named
-refusals. These paths currently use simulated adapters.
+`ameesh host drain HOST [--for 8h] [--actor human:<id>]` closes new claims,
+turns and prompt consumption while preserving the current turn and lease. The
+persistent request takes precedence over later resource readings that say
+`available`. The controller considers critical agents first, checks
+receiving-host readiness and uses a handoff at a turn boundary.
+`ameesh host undrain HOST [--actor human:<id>]` requests their return; an
+elapsed `--for` duration makes the same request. `ameesh host reconcile HOST
+[--actor human:<id>]` reopens a lost host on the verified proof below. From a
+terminal without an agent identity, `--actor` names the human who acts;
+without it the command refuses instead of guessing. Missing helper, secret
+requirements and host-scoped logins remain named refusals. These paths
+currently use simulated adapters.
 
 The runner detects a known host as `lost` after its latest resource sample
 is older than the larger of 180 seconds and three resource intervals, and
@@ -140,12 +143,14 @@ claims on a lost host.
 recovery proof. A returning machine stays withdrawn until a verified
 reconciliation proves a sustained fresh reading history in database time
 (covering one detection window without a hole, and no reading dated in the
-future), every origin agent still home with no live lease, no fence and no
-active handoff, and no `recover_source` attempt since the loss. The next
-lifecycle pass of a healthy runner, or `ameesh host reconcile HOST`, then
-records `lost -> returning -> available` with its actor and evidence in the
-event log. A single fresh heartbeat does not reopen claims, and an agent moved
-elsewhere by a recovery keeps the automatic proof closed.
+future), every origin agent still home and unfenced, no active handoff, and no
+`recover_source` attempt since the loss. A live lease of an agent that is home
+does not block the return: it is the returning host's own runner taking its
+lease back, and a recovery that moved the agent elsewhere still closes the
+proof. The next lifecycle pass of a healthy runner, or `ameesh host reconcile
+HOST`, then records `lost -> returning -> available` with its actor and
+evidence in the event log. A single fresh heartbeat does not reopen claims,
+and an agent moved elsewhere by a recovery keeps the automatic proof closed.
 `ameesh_host_gate_state` names a lost host `lost` (the generic `draining` it
 used to return hid the bound). Lost-host recovery moves agents forward rather
 than restoring an uncertain source executor.
@@ -329,7 +334,12 @@ never shortens the lease: it keeps at least the TTL of the agent's host
 — the runner's own rule), and the locked renewal keeps the later of the
 current expiry and the new one (`GREATEST`, not a pre-read), so a gesture
 cannot make the lease expire before the next heartbeat and elect another
-pilot (#3115).
+pilot (#3115). It also does not extend past that host rule: the 300 s
+default of a gesture only applies to a host whose card rules no TTL. On a
+volatile host (90 s), holding 300 s after a gesture would keep a disappeared
+host's pilot alive for 300 s instead of 90 s and delay the election by as
+much; an external call's margin still extends the lease when it needs to
+(#3123).
 
 An EP5 timer (`ameesh role run`) may carry no agent identity but passes
 `AMEESH_ROLE` and the epoch it entered with. That pair is fenced too: a role

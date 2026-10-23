@@ -24,8 +24,10 @@ bin
 **/id_*
 **/.pgpass
 **/config.json
-# exceptions : le point d'entrée de l'image (L114), le binaire dsh épinglé
-# déposé au contexte, et l'essai de bout en bout (L115, faux harnais)
+# exceptions : le point d'entrée de l'image (L114), le manifeste et le
+# verrou npm de dsh (arbre figé par version et intégrité), et l'essai de bout
+# en bout (L115, faux harnais)
 !deploy/executor-image/ameesh-executor
-!deploy/executor-image/dsh
+!deploy/executor-image/package.json
+!deploy/executor-image/package-lock.json
 !tests/fakebin/dsh

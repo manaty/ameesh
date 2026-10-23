@@ -3182,6 +3182,12 @@ def note(db: Db, item_id: int, text: str, *, actor: str = "", once: bool = False
     if not (text or "").strip():
         raise WorkError("empty note")
     text = text.strip()
+    from . import review_floor
+    if review_floor.is_floor_note(text):
+        # #3183 : la ligne du plancher d'avis est lue par la porte ; seule la
+        # commande du pilote l'écrit, après contrôle de son autorité.
+        raise WorkError("note refused: `%s` is reserved to the review floor; use "
+                        "ameesh work reviewer %s --floor N" % (review_floor.PREFIX, item_id))
     actor = check_wait_note(getattr(db, "cfg", None), db, actor, text)
     token_ts = _note_wake_at(text)
     if wake_ts is not None and token_ts is not None:

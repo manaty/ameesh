@@ -540,7 +540,11 @@ def need(db, vehicle: int, row, marks, repo: str, base: str, head: str,
         canons = canons if canons is not None else work.configured_canons(cfg)
         klass = lot_class.class_of_paths(canons, str((row or {}).get("app") or ""),
                                          own["paths"])
-        from . import merge_queue
+        # #3183 : le plancher posé par le pilote sur le véhicule s'exige sur
+        # son delta propre ; les membres portent le leur sur leur tête.
+        from . import merge_queue, review_floor
+
+        klass = review_floor.apply(dict(klass), db, vehicle, cfg=cfg)
 
         required = merge_queue.required_verdicts(klass)
     except Exception as exc:  # noqa: BLE001 - classe illisible : refus

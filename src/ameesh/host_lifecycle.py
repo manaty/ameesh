@@ -203,11 +203,14 @@ def main(argv=None):
     withdraw = commands.add_parser("drain", help="close new turns and prepare agents' evacuation")
     withdraw.add_argument("host")
     withdraw.add_argument("--for", dest="duration", help="request return after this duration, e.g. 8h")
+    withdraw.add_argument("--actor", help="who drains (human:<id>) from an unbound terminal")
     restore = commands.add_parser("undrain", help="reopen the host and request agents' return")
     restore.add_argument("host")
+    restore.add_argument("--actor", help="who reopens (human:<id>) from an unbound terminal")
     recovered = commands.add_parser(
         "reconcile", help="verified reopening of a lost host whose readings returned")
     recovered.add_argument("host")
+    recovered.add_argument("--actor", help="who reconciles (human:<id>) from an unbound terminal")
     status = commands.add_parser("status", help="show durable drain and return progress")
     status.add_argument("host", nargs="?")
     args = parser.parse_args(argv)
@@ -217,13 +220,17 @@ def main(argv=None):
         api = storage.of(db).host_lifecycle
         if args.command == "drain":
             duration = estimates.parse(args.duration) * 60 if args.duration else None
-            result = drain(cfg, db, args.host, duration=duration)
+            # An explicit --actor is authenticated like every other correction:
+            # a bound agent session must not claim a human's name.
+            actor = work.corrector(cfg, db, args.actor) if args.actor else None
+            result = drain(cfg, db, args.host, duration=duration, actor=actor)
         elif args.command == "undrain":
-            result = api.undrain(args.host, actor=work.corrector(cfg, db))
+            result = api.undrain(args.host, actor=work.corrector(cfg, db, args.actor))
             if result is None:
                 raise ValueError("host has no drain request")
         elif args.command == "reconcile":
-            result = reconcile(cfg, db, args.host)
+            result = reconcile(cfg, db, args.host,
+                               actor=work.corrector(cfg, db, args.actor))
         else:
             result = [api.get(args.host)] if args.host else api.listing()
         print(json.dumps(result, ensure_ascii=False))
@@ -231,7 +238,7 @@ def main(argv=None):
                 result.get("reconciled") or result.get("mode") == "available"):
             return 1
         return 0
-    except (ValueError, db_mod.DbError) as exc:
+    except (ValueError, work.WorkError, db_mod.DbError) as exc:
         print("host request refused: " + str(exc))
         return 1
     finally:

@@ -210,11 +210,13 @@ class HostLifecycle(interface.HostLifecycle):
         `promote_loss`/`recover_source` take: a reading or a recovery effect
         cannot interleave between the checks and the `lost -> returning ->
         available` transition. Recovery evidence is database state (readings in
-        database time, origins home, no live lease, no active handoff, no
+        database time, origins home, no fence, no active handoff, no
         `recover_source` since the loss), never the returning machine's own
-        claim. One fresh reading is not enough: the host must have published
-        continuously for at least one detection window, without a hole that
-        large, and a reading dated in the future is refused.
+        claim. A live lease of a home agent does not block the return (#3180):
+        it is the returning host's own runner, and a move away is refused by
+        the origin check. One fresh reading is not enough: the host must have
+        published continuously for at least one detection window, without a
+        hole that large, and a reading dated in the future is refused.
         """
         if not isinstance(host, str) or not host:
             raise ValueError("host required")
@@ -271,13 +273,12 @@ class HostLifecycle(interface.HostLifecycle):
                         "missing": ["sustained_readings"], "lost_ts": lost_ts}
 
             missing = []
-            # Every execute agent of the host, not only the recorded origins:
-            # a canon sync may have added one after the loss. Claims are closed,
-            # so a live lease here would mean a renewal slipped through.
-            live = tx.query(
-                "SELECT name FROM agent_registry r WHERE r.host=%s AND r.mode='execute' "
-                "AND r.lease_expires_at > clock_timestamp() ORDER BY name FOR UPDATE", (host,))
-            missing.extend("live_lease:" + row["name"] for row in live)
+            # #3180: a returning host's own runners reclaim their leases as
+            # soon as they boot, before the sustained-reading window closes.
+            # That lease is the host's own executor, not a second one; a move
+            # away from the host is refused below (`agent_moved`), as are a
+            # fence and an active handoff. Detection already required no live
+            # lease at the instant of the loss.
             # An active handoff of any age still owns a destination reservation
             # and may be about to switch; reopening would leave it held. This
             # read is under the same gate lock as `promote_loss` and
@@ -296,6 +297,7 @@ class HostLifecycle(interface.HostLifecycle):
             missing.extend("recovery_attempted:" + row["agent"] for row in recovered)
             origins = tx.query(
                 "SELECT r.name, r.host, r.handoff_fenced, "
+                "(r.lease_expires_at > clock_timestamp()) AS live, "
                 "EXISTS (SELECT 1 FROM host_handoffs h WHERE h.agent=r.name "
                 "        AND h.state NOT IN ('verified','cancelled')) AS active_handoff "
                 "FROM host_lifecycle_agents a JOIN agent_registry r ON r.name=a.agent "
@@ -350,9 +352,11 @@ class HostLifecycle(interface.HostLifecycle):
                 "readings_since_loss": len(times),
                 "coverage_s": covered,
                 "agents": [row["name"] for row in origins],
+                # Informational: the returning machine's own runners had
+                # already taken their leases back; they are not a refusal.
+                "live_lease_agents": [row["name"] for row in origins if row["live"]],
                 "checks": ["fresh_reading", "sustained_readings", "no_reading_gap",
-                           "agents_home", "no_live_lease", "no_active_handoff",
-                           "no_recovery_attempt"],
+                           "agents_home", "no_active_handoff", "no_recovery_attempt"],
             }
             tx.execute(
                 "INSERT INTO ameesh_events(type,object,project,data) "
