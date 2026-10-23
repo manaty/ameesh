@@ -287,6 +287,19 @@ def collect_batch(api, sub, since, now, scan):
     def inside(row):
         return when(row) <= settled
 
+    def note_live(rows, page):
+        """#2955 B11: any read may reveal a page that has just become mixed.
+
+        The current page, the previous-page anchor read and the one-page
+        fallback are all reads of the window: a row edited since the page was
+        first read is deferred there now, and a settled row can later recede
+        into that page. Extend the recheck floor to it.
+        """
+        if any(not inside(row) for row in rows):
+            first = state.get("recheck_from")
+            state["recheck_from"] = page if first is None else min(first, page)
+            state["recheck_to"] = max(state.get("recheck_to") or page, page)
+
     def anchor_position(previous, snapshot):
         """Position of the last accepted row still present with the same stamp.
 
@@ -376,10 +389,7 @@ def collect_batch(api, sub, since, now, scan):
         # row from a later page can recede into it (or into a page between it
         # and the reader), so the recheck starts at the first such page and
         # covers every page up to the last one read.
-        if len(settled_rows) < len(rows):
-            first = state.get("recheck_from")
-            state["recheck_from"] = state["page"] if first is None else min(
-                first, state["page"])
+        note_live(rows, state["page"])
         state["recheck_to"] = state["page"]
 
         # A row is surely indexed once its stamp is at least INDEX_LAG old at
@@ -426,6 +436,7 @@ def collect_batch(api, sub, since, now, scan):
                     else read(state["page"] - 1))
         recovered = []
         if previous is not None:
+            note_live(previous, state["page"] - 1)
             snapshot = state.get("snap_prev") or []
             if snapshot:
                 position, _key = anchor_position(previous, snapshot)
@@ -434,6 +445,7 @@ def collect_batch(api, sub, since, now, scan):
                     # one page. Read one more page backwards before giving up.
                     if calls < PAGES_PER_TICK and state["page"] >= 3:
                         back = read(state["page"] - 2)
+                        note_live(back, state["page"] - 2)
                         back_position, _back_key = anchor_position(back, snapshot)
                         if back_position is not None:
                             recovered = recovered_rows(back, snapshot, back_position)

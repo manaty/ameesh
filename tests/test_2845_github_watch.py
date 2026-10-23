@@ -905,6 +905,72 @@ class CollectionTest(unittest.TestCase):
                          {1, 2, 3, 7, 8, 9, 13})
         self.assertEqual(until, NOW - watch.INDEX_LAG)
 
+    def test_b11_anchor_page_becoming_mixed_is_rechecked(self):
+        # B11 #2955 (cx2): page 1 is settled when read; before page 2 is read,
+        # #2..#6 are edited (still deferred, keys lagging), so the anchor page
+        # becomes mixed. It is only re-read as `previous`, which used to leave
+        # the recheck floor at 2. #7 then recedes into page 1 and was lost.
+        for kind in ("issue", "comment"):
+            with self.subTest(kind=kind):
+                with mock.patch.object(watch, "PAGE_SIZE", 3):
+                    rows = ([issue(n) for n in range(1, 8)] if kind == "issue"
+                            else [comment(n) for n in range(10, 17)])
+                    ids = [row["id"] for row in rows]
+                    for n, row in enumerate(rows, start=1):
+                        row["key"] = row["updated_at"] = watch.iso(NOW - 2500 + n)
+                    api = (LagApi(rows, []) if kind == "issue"
+                           else LagApi(comments=rows))
+                    get = api.get
+                    edited, caught = [], []
+
+                    def mutate(path, **kw):
+                        page = int(parse_qs(urlsplit(path).query)["page"][0])
+                        if page == 2 and not edited:
+                            edited.append(True)
+                            for row in rows[1:6]:
+                                row["updated_at"] = watch.iso(NOW + 1)
+                        elif page == 3 and not caught:
+                            caught.append(True)
+                            for row in rows[1:6]:
+                                row["key"] = row["updated_at"]
+                        return get(path, **kw)
+
+                    with mock.patch.object(api, "get", side_effect=mutate):
+                        events, until = self.finish(api, NOW - 3600, NOW)
+                self.assertEqual({e["object_id"] for e in events},
+                                 {ids[0], ids[1], ids[2], ids[6]})
+                self.assertEqual(until, NOW - watch.INDEX_LAG)
+
+    def test_b11_real_page_size_anchor_page_becoming_mixed(self):
+        # B11 #2955 at the real page size: page 1 is settled when read, then
+        # #2..#200 are edited before page 2; the anchor page becomes mixed and
+        # must enter the recheck range, or #201 is lost.
+        with mock.patch.object(watch, "PAGE_SIZE", 100):
+            rows = [issue(n) for n in range(1, 202)]
+            for n, row in enumerate(rows, start=1):
+                row["key"] = row["updated_at"] = watch.iso(NOW - 2500 + n)
+            api = LagApi(rows, [])
+            get = api.get
+            edited, caught = [], []
+
+            def mutate(path, **kw):
+                page = int(parse_qs(urlsplit(path).query)["page"][0])
+                if page == 2 and not edited:
+                    edited.append(True)
+                    for row in rows[1:200]:
+                        row["updated_at"] = watch.iso(NOW + 1)
+                elif page == 3 and not caught:
+                    caught.append(True)
+                    for row in rows[1:200]:
+                        row["key"] = row["updated_at"]
+                return get(path, **kw)
+
+            with mock.patch.object(api, "get", side_effect=mutate):
+                events, until = self.finish(api, NOW - 3600, NOW)
+        self.assertEqual({e["object_id"] for e in events},
+                         set(range(1, 101)) | {201})
+        self.assertEqual(until, NOW - watch.INDEX_LAG)
+
     def test_b6_anchor_must_be_an_accepted_row(self):
         # B6 #2955: #6 is deferred (> U) but its old key sits at the end of the
         # page. When #1..#5 move and #6 catches up its key, the re-read page is
