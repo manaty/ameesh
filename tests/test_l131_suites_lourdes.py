@@ -193,6 +193,8 @@ class RunChildTest(unittest.TestCase):
         self.assertIsNotNone(got)
         heavy.release(got[1])
 
+    @unittest.skipUnless(platform.is_linux(),
+                         "L131c : waitid(WNOWAIT) et zombie du chef de groupe (Linux)")
     def test_a_worker_ignoring_sigterm_keeps_the_slot_until_sigkill(self):
         proc, (suite, worker) = self._wrapper(self.SUITE % "1", grace=1.5, pids=2)
         proc.send_signal(signal.SIGTERM)
@@ -228,6 +230,8 @@ class RunChildTest(unittest.TestCase):
         self.assertIsNotNone(got)
         heavy.release(got[1])
 
+    @unittest.skipUnless(platform.is_linux(),
+                         "L131c : waitid(WNOWAIT) et contrôle de terminal (Linux)")
     def test_a_suite_on_a_terminal_can_read_it(self):
         # codex r3: on a controlling terminal the command's group gets the
         # foreground; input() would otherwise stop on SIGTTIN, the wrapper
@@ -343,6 +347,8 @@ class RunChildTest(unittest.TestCase):
                     break
         return out
 
+    @unittest.skipUnless(platform.is_linux(),
+                         "L131c : waitid(WNOWAIT) et contrôle de terminal (Linux)")
     def test_reads_dev_tty_with_stdin_redirected(self):
         # L131c (codex r4): stdin is /dev/null, the command opens /dev/tty
         proc, master = self._on_pty(
@@ -353,6 +359,8 @@ class RunChildTest(unittest.TestCase):
         self.assertEqual(proc.wait(timeout=20), 0)
         self.assertIn(b"got yes", self._read_until(master, b"got yes", 5))
 
+    @unittest.skipUnless(platform.is_linux(),
+                         "L131c : waitid(WNOWAIT) et contrôle de terminal (Linux)")
     def test_ctrl_z_suspends_the_wrapper_and_fg_resumes(self):
         # L131c (codex r4): Ctrl-Z stops the command's group; the wrapper
         # stops too (the shell gets its prompt), and SIGCONT (`fg`) resumes
@@ -371,6 +379,8 @@ class RunChildTest(unittest.TestCase):
         self.assertEqual(proc.wait(timeout=20), 0)
         self.assertIn(b"got yes", self._read_until(master, b"got yes", 5))
 
+    @unittest.skipUnless(platform.is_linux(),
+                         "L131c : sous-moissonneur (Linux) — un setsid s'échappe ailleurs")
     def test_a_fork_chain_and_setsid_cannot_outlive_the_slot(self):
         # L131c (codex r4): W1 forks W2 and exits, W2 leaves the group
         # (setsid), forks W3 and exits; W3 runs on — the wrapper, a

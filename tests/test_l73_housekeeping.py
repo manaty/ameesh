@@ -193,6 +193,8 @@ class DossiersTest(_Tmp):
         xdg = menage.turn_env(self.cfg, menage.Policy(xdg_cache=True), "a1", {})
         self.assertEqual(xdg["XDG_CACHE_HOME"], os.path.join(cache, "xdg"))
 
+    @unittest.skipUnless(platform.is_linux(),
+                         "#2704 : les chemins tenus se lisent dans /proc (Linux)")
     def test_nouvelle_session_ne_vide_pas_un_dossier_tmp_tenu(self):
         """#2704 : une application lancée depuis le dossier temporaire de
         l'agent (AppImage extraite) le tient hors tour ; la nouvelle session
@@ -753,6 +755,8 @@ class MenageDbTest(PgTestCase):
         menage.run_pass(self.cfgl, self.db, pol, host="pc", actor="t", now=loin)
         self.assertFalse(os.path.exists(root))
 
+    @unittest.skipUnless(platform.is_linux(),
+                         "#2704 : les chemins tenus se lisent dans /proc (Linux)")
     def test_dossier_tmp_d_un_agent_absent_tenu_par_un_processus_est_garde(self):
         """#2704 : un dossier ancien qu'un processus vivant utilise (ici son
         dossier courant) n'est pas supprimé, même sans worktree dedans."""
@@ -798,6 +802,8 @@ class MenageDbTest(PgTestCase):
         recover.assert_not_called()
         self.assertTrue(os.path.isdir(root))
 
+    @unittest.skipUnless(platform.is_linux(),
+                         "#2704 : les chemins tenus se lisent dans /proc (Linux)")
     def test_dossier_tmp_tenu_par_un_processus_n_est_pas_evince(self):
         """#2704 : le quota ne libère pas les fichiers d'un dossier temporaire
         qu'un processus vivant utilise (AppImage extraite et lancée)."""

@@ -1,6 +1,6 @@
 {
  "schema": "ameesh-exec-contract/1",
- "version": "1.8.0",
+ "version": "1.9.0",
  "prefix": "/api/exec/v1",
  "description": "Contrat de l'API d'exécuteur médiée (L107) : la liste FERMÉE des opérations de storage.interface qu'un exécuteur d'appareil peut appeler, leur portée et leur fencing. Référence : docs/EXECUTEUR-MEDIEE.md.",
  "scopes": {
@@ -687,7 +687,8 @@
    "fence": false,
    "param_agent": "name",
    "forced": {
-    "host": "executor_host"
+    "host": "executor_host",
+    "election_brief": null
    },
    "params": [
     {
@@ -733,6 +734,18 @@
      },
      "required": false,
      "default": null
+    },
+    {
+     "name": "election_brief",
+     "kind": "keyword",
+     "schema": {
+      "type": [
+       "string",
+       "null"
+      ]
+     },
+     "required": false,
+     "default": null
     }
    ],
    "result": {
@@ -749,7 +762,8 @@
    "rules": [
     "owner préfixé par exec:<executor_id>: sinon 403 forbidden_scope",
     "ttl_seconds borné par le lease_ttl de l'hôte (GET /host)",
-    "hôte indisponible : 403 host_unavailable"
+    "hôte indisponible : 403 host_unavailable",
+    "election_brief : natif seulement, forcé à null sur un appareil ; une relève croisée écrit le résumé de reprise de la session neuve, et une relève croisée sans ce brief est refusée (aucun déplacement de ligne)"
    ]
   },
   {
@@ -4885,6 +4899,8 @@
     "land_unlock",
     "train_read",
     "train_save",
+    "train_abandon",
+    "train_adopt",
     "train_fire_read",
     "train_fire_give",
     "train_fire_change",

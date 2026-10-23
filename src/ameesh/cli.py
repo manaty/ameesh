@@ -1994,6 +1994,14 @@ def cmd_doctor(cfg: Config, notify_test: bool, probe: bool = False,
                                  % ", ".join(exceptions) if exceptions else
                                  "UID isolation required; active host peers disable transport",
                                  memory_note))
+    # #3103 : un pont Docker sur le réseau local de l'hôte (incident #3092) ;
+    # lu avant la base, injoignable quand le réseau local est capté
+    from . import netcheck
+    try:
+        for line in netcheck.doctor_lines(cfg):
+            print(line)
+    except Exception as exc:  # a reading never breaks the doctor
+        print("network    : not checked (%s)" % (" ".join(str(exc).split())[:120],))
     started = time.monotonic()
     try:
         db = db_mod.connect(cfg)

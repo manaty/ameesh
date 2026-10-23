@@ -224,15 +224,18 @@ increments `lease_epoch`; the former holder is fenced from renewing, ending
 its turn or reclaiming. The holder is the one that renews, so only it takes
 turns.
 
-These roles are outside L232e: `host drain`, loss detection and handoff
-planning skip them, and a pending `handoff_fenced` does not close their claim.
-There is nothing to publish from a local worktree — the pilot's state lives in
-the mesh database, the canon and GitHub — so the L232e source proof does not
-apply. A stopped host loses the role when its lease expires (the L232e timing,
-180 s by default); a returning host goes back to standby until the lease is
-
-free again. This lot only makes the cross-host claim possible; EP2 decides
-which candidate wins and when (next section).
+These roles are outside L232e's handoff: loss detection and handoff planning
+skip them, and a pending `handoff_fenced` does not close their claim. There is
+nothing to publish from a local worktree — the pilot's state lives in the mesh
+database, the canon and GitHub — so the L232e source proof does not apply. A
+planned `host drain` still returns the holder's lease immediately, in the same
+transaction as the drain and with `lease_epoch` incremented: a standby can
+claim without waiting for the TTL, the drained host cannot claim again, and the
+former holder is fenced from renewing, ending its turn or reclaiming. An
+unplanned stop loses the role when its lease expires (the L232e timing, 180 s
+by default); a returning host goes back to standby until the lease is free
+again. This lot only makes the cross-host claim and the planned-drain release
+possible; EP2 decides which candidate wins and when (next section).
 
 ## Candidate score, rank delay and hysteresis (L165/EP2)
 
@@ -265,11 +268,42 @@ when a challenger has stayed at least 5 availability points above the holder
 for a full hour (standing history, no hole beyond the freshness threshold)
 and both are fresh and ready: the holder releases at the end of its turn
 (epoch++), and does not reclaim for the challenger's rank delay plus 60 s, so
-a challenger that dies after the release does not leave the role free. A
-workstation that boots therefore does not take the role back from a VM.
+a challenger that dies after the release does not leave the role free. The
+release mark is durable (`role_handover`, migration 0478): an executor restart
+does not let the resumed holder reclaim early or hand the role again to a
+challenger that did not claim — the failed challenger stays out of the
+handovers for an hour, even across the restart. A runner publishes standings
+only for the agents it can claim (`agents_filter`): it never advertises a
+readiness it will not act on. A workstation that boots therefore does not take
+the role back from a VM.
 `ameesh role status [ROLE] [--json]` prints the holder, the epoch and the
 ranked candidates with the diagnostic of each refusal.
 
+## Standby executors and the election briefing (L165/EP3)
+
+Every candidate host runs the role's runner, and none of them takes a turn
+before the claim: the runner only creates a worker after `registry.claim`
+returns a live lease, the worker renews it before each turn, and a lost lease
+kills the harness before any further turn. Standby costs no tokens and opens
+no session.
+
+When the winner is a DIFFERENT host from the previous holder, no session
+crosses hosts. The same claim resets the session, its account and its lot
+(`session_reset_at` set durably) and persists the resume briefing built by
+the winner in `agent_registry.election_brief`. The new holder consumes it as
+the resume summary of its new session; the first turn is a short "you are
+elected" instruction framed by that briefing. The briefing is deterministic
+and built from the last persisted state (role card and canon, assigned and
+takeable lots, unread mail, pending decisions, alerts, GitHub observation per
+repository); it names the previous holder, the epoch and the session left
+behind. A same-host re-claim (runner restart) keeps the local session: it is
+not an election. A cross-host claim **without** the brief is refused (the CAS
+writes nothing): a mediated executor, whose brief is forced to null, therefore
+stays on standby. The brief is dropped with its session (`set_session`,
+`clear_session`) so it never resurfaces in a later session. The first turn
+after an election may open a lot session: the lot's minimal brief then
+completes the election briefing, it never replaces it (the role state is not
+lost when the first turn is a lot turn).
 ## Fencing the elected pilot's gestures outside the database (L165/EP4)
 
 The epoch fences more than the runner's own writes. The effects a pilot

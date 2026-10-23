@@ -281,7 +281,12 @@ class Agents(Domain):
     @abc.abstractmethod
     def claimable(self, host: str, names: Sequence[str] | None, *,
                   require_responsible: bool) -> list[dict]:
-        """Agents de l'hôte sans bail vivant, réclamables (mêmes règles que `claim`)."""
+        """Agents de l'hôte sans bail vivant, réclamables (mêmes règles que `claim`).
+
+        L165 (EP3) : pour un agent `releve: election` rendu sur un hôte
+        candidat, `host` est l'hôte qui réclame et `previous_host` l'hôte de la
+        ligne (l'ancien détenteur, ou l'hôte de la dernière synchronisation) ;
+        `session_id` est encore la session de cet ancien détenteur."""
 
     @abc.abstractmethod
     def runner_seen(self, host: str, owner: str, names: Sequence[str] | None) -> None:
@@ -370,12 +375,21 @@ class Leases(Domain):
 
     @abc.abstractmethod
     def claim(self, name: str, owner: str, ttl_seconds: float, *,
-              require_responsible: bool, host: str | None = None) -> dict | None:
+              require_responsible: bool, host: str | None = None,
+              election_brief: str | None = None) -> dict | None:
         """Prend le bail s'il est libre ou expiré ; rend la ligne, sinon None.
 
         `host` (L165, EP1) : l'hôte qui réclame, pour un agent
         `releve: election`. None : l'hôte de la ligne (comportement d'un agent
-        épinglé). Le serveur médié force cet argument à l'hôte de l'exécuteur."""
+        épinglé). Le serveur médié force cet argument à l'hôte de l'exécuteur.
+
+        `election_brief` (L165, EP3) : appliqué seulement sur une relève
+        croisée d'un agent élu (la ligne était chez un autre hôte) — la même
+        instruction oublie la session de l'ancien hôte, laisse son compte au
+        choix de cet hôte et écrit le brief comme résumé de la session neuve.
+        Ignoré sur le même hôte et pour un agent `hote`. Une relève croisée
+        SANS brief est **refusée** (le CAS ne déplace pas la ligne), cas d'un
+        exécuteur médié (contrat 1.9 : valeur forcée à null côté appareil)."""
 
     @abc.abstractmethod
     def attach_claim(self, name: str, owner: str, ttl_seconds: float, *,
@@ -1729,6 +1743,40 @@ class WorkItems(Domain):
         revision=0 creates it. Every write locks and then rechecks the lease
         against wall time, and compares the previous document revision.
         A stale holder cannot overwrite a newer train. No remote API grant.
+        """
+
+    @abc.abstractmethod
+    def train_abandon(self, key: str, plan_id: str, document: dict, *, revision: int,
+                      owner: str, epoch: int) -> dict | None:
+        """#3138: terminal write of one exact never-fired train plan.
+
+        Same lease/epoch and revision checks as `train_save`, plus in the same
+        transaction: the persisted plan id is still `plan_id`, its phase is not
+        terminal or `promoting`, and no active/promoting/landed fire receipt
+        exists for it. A concurrent fire grant is serialized on the target
+        lease, so a plan cannot be abandoned between the grant's check and its
+        insertion. Returns the new document, None on any mismatch.
+        """
+
+    @abc.abstractmethod
+    def train_adopt(self, key: str, owner: str, *, revision: int,
+                    previous: tuple | None, service: tuple, ttl_s: float) -> dict | None:
+        """#3142: the train service's current holder takes over the target
+        reservation another `train:*` owner left behind.
+
+        In one transaction: ``service`` (key, owner, epoch) must be the live
+        service lease; a key bound to a role
+        (``train-service:<role>:<epoch>``) also requires that role's live
+        lease at that exact epoch, so an old election's still-live service
+        key cannot adopt the reservation back from the new holder; the target
+        row must be held by another `train:*` owner (at ``previous``
+        (owner, epoch) when given, expired or not); the train document must
+        still be at ``revision``. The row passes to ``owner`` at the next
+        epoch, so every write of the old epoch is refused afterwards. A
+        reservation ticket of the document naming the held (owner, epoch) is
+        rewritten to the new ones; with ``previous``, it must exist.
+        Never takes an ordinary (non-`train:*`) reservation. Returns
+        {epoch, previous_owner, previous_epoch}, or None.
         """
 
     @abc.abstractmethod
@@ -3593,7 +3641,13 @@ class HostLifecycle(Domain):
     @abc.abstractmethod
     def drain(self, host: str, *, actor: str, duration: int | None = None,
               critical: Sequence[str] = ()) -> dict:
-        """Close claims/enable atomically and retain agents' original host."""
+        """Close claims/enable atomically and retain agents' original host.
+
+        #3029: an elected role holding its lease on this host is returned in
+        the same transaction, with its epoch bumped, so another candidate can
+        claim at once instead of waiting for the TTL. It stays out of the
+        L232e handoff journal (there is no local work to publish).
+        """
 
     @abc.abstractmethod
     def undrain(self, host: str, *, actor: str) -> dict | None:
