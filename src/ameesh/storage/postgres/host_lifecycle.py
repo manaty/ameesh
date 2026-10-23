@@ -220,13 +220,18 @@ class HostLifecycle(interface.HostLifecycle):
                 "FROM host_resources WHERE host=%s AND sampled_at > to_timestamp(%s) "
                 "AND sampled_at <= clock_timestamp() ORDER BY sampled_at", (host, lost_ts))
             times = [float(row["at_ts"]) for row in readings]
-            if len(times) < 2 or now["now_ts"] - times[0] < fresh_within:
+            # Measure the recent continuous suffix, not every reading since the
+            # loss: an old hole before a host stabilised must not block a
+            # return that has since been continuous (review B1). Coverage is
+            # the span between the suffix's readings, never the silence after
+            # the last one (review B2).
+            start = len(times) - 1
+            while start > 0 and times[start] - times[start - 1] <= fresh_within:
+                start -= 1
+            covered = (times[-1] - times[start]) if times else 0.0
+            if len(times) - start < 2 or covered < fresh_within:
                 return {"host": host, "mode": "lost", "reconciled": False,
                         "missing": ["sustained_readings"], "lost_ts": lost_ts}
-            if any(later - earlier > fresh_within
-                   for earlier, later in zip(times, times[1:])):
-                return {"host": host, "mode": "lost", "reconciled": False,
-                        "missing": ["reading_gap"], "lost_ts": lost_ts}
 
             missing = []
             # Every execute agent of the host, not only the recorded origins:
@@ -290,9 +295,8 @@ class HostLifecycle(interface.HostLifecycle):
                 " AND h.state NOT IN ('verified','cancelled')))) RETURNING c.host", (host,))
             if not completed:
                 raise ValueError("lost host return proof changed during reconciliation")
-            # #3035: the first reading after the loss is the start of the
-            # measured recovery (fresh reading -> first lease taken).
-            first_fresh = times[0]
+            # #3035: the first reading of the stable suffix is the start of
+            # the measured recovery (fresh reading -> first lease taken).
             evidence = {
                 "generation": control["generation"],
                 "actor": actor,
@@ -300,9 +304,10 @@ class HostLifecycle(interface.HostLifecycle):
                 "via": "returning",
                 "to": "available",
                 "lost_ts": lost_ts,
-                "first_fresh_ts": first_fresh,
+                "first_fresh_ts": times[start],
                 "fresh_ts": now["latest_ts"],
-                "readings": len(times),
+                "readings": len(times) - start,
+                "coverage_s": covered,
                 "agents": [row["name"] for row in origins],
                 "checks": ["fresh_reading", "sustained_readings", "no_reading_gap",
                            "agents_home", "no_live_lease", "no_active_handoff",

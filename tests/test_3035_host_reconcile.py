@@ -130,7 +130,33 @@ class HostReconcileTest(PgTestCase):
         self.db.execute("INSERT INTO host_resources(host, sampled_at, gate_state) "
                         "VALUES ('source', clock_timestamp()-interval '200 seconds', 'available')")
         self.fresh()
-        self.assertEqual(self.reconcile()["missing"], ["reading_gap"])
+        self.assertEqual(self.reconcile()["missing"], ["sustained_readings"])
+
+    def test_an_older_hole_before_the_recent_window_does_not_block(self):
+        # B1 de la relecture cx2 : perte t-900, relevés t-600/t-200/t-100/t ;
+        # le trou ancien (400 s) précède un suffixe continu de 200 s.
+        self.db.execute(
+            "INSERT INTO host_resources(host, sampled_at, gate_state) VALUES "
+            "('source', clock_timestamp()-interval '600 seconds', 'available'), "
+            "('source', clock_timestamp()-interval '200 seconds', 'available'), "
+            "('source', clock_timestamp()-interval '100 seconds', 'available')")
+        self.fresh()
+        result = self.reconcile()
+        self.assertTrue(result["reconciled"], result)
+        self.assertEqual(result["evidence"]["readings"], 3)
+        self.assertGreaterEqual(result["evidence"]["coverage_s"], 180)
+
+    def test_coverage_is_measured_between_the_suffix_readings(self):
+        # B2 de la relecture cx2 : deux relevés espacés de 100 s, le dernier
+        # encore frais ; la couverture réelle est 100 s, pas le silence final.
+        self.db.execute(
+            "INSERT INTO host_resources(host, sampled_at, gate_state) VALUES "
+            "('source', clock_timestamp()-interval '200 seconds', 'available'), "
+            "('source', clock_timestamp()-interval '100 seconds', 'available')")
+        result = self.reconcile()
+        self.assertFalse(result["reconciled"])
+        self.assertEqual(result["missing"], ["sustained_readings"])
+        self.assertEqual(self.api.host_lifecycle.get("source")["mode"], "lost")
 
     def test_a_future_reading_is_refused(self):
         self.returned()
