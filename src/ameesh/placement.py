@@ -100,18 +100,19 @@ def host_load(canon: Canon) -> tuple[dict[str, int], dict[str, str | None]]:
 
 
 def capacity_baseline(canon: Canon, agent: str) -> tuple[dict[str, list], set[str]]:
-    """Admissions sans `agent`, et rôles élus sans place AVANT de le placer.
+    """Admissions sans `agent`, et rôles élus assis AVANT de le placer.
 
     #3101 (B4) : la référence est le canon tel qu'il est. Un rôle élu y
     concourt déjà pour sa place : la référence est le canon complet. Un agent
     épinglé, lui, est déplacé par la proposition : la référence est le canon
-    sans lui.
+    sans lui. L'agent lui-même n'est pas dans les rôles assis rendus.
     """
     covered = covered_by_host(canon, without=agent)
     fiche = canon.agent(agent)
     elected = fiche is not None and fiche.releve == "election" and bool(fiche.candidats)
     seats = (host_load(canon) if elected else canon_mod.admission_load(canon, covered))[1]
-    return covered, {role for role, seat in seats.items() if seat is None}
+    title = fiche.title if fiche is not None else agent
+    return covered, {role for role, seat in seats.items() if seat is not None and role != title}
 
 
 def capacity_reason(canon: Canon, agent: str, host: str,
@@ -119,28 +120,25 @@ def capacity_reason(canon: Canon, agent: str, host: str,
     """Pourquoi `host` n'a pas de place pour `agent` sous `max_agents`, ou None.
 
     #3101 : les admissions épinglées des autres agents remplissent l'hôte, ou
-    y placer l'agent laisserait sans place plus de rôles élus que le canon
+    y placer l'agent ferait perdre sa place à un rôle élu assis dans le canon
     tel qu'il est (`capacity_baseline`, à passer quand l'appelant juge
-    plusieurs hôtes). Un rôle déjà sans place ne ferme donc pas le candidat
-    d'un autre : seule sa propre fiche est en erreur.
+    plusieurs hôtes). Seuls ces rôles assis sont rassis (B5) : un rôle déjà
+    sans place ne prend la place de personne, et ne ferme le candidat de
+    personne ; sa propre fiche seule est en erreur.
     """
     fiche = next((h for h in canon.hosts if h.title == host), None)
     limit = fiche.policy.max_agents if fiche is not None else None
     if limit is None:
         return None
-    covered, unseated = baseline if baseline is not None else capacity_baseline(canon, agent)
-    pinned, with_agent = canon_mod.admission_load(canon, covered, extra=host)
+    covered, seated = baseline if baseline is not None else capacity_baseline(canon, agent)
+    pinned, with_agent = canon_mod.admission_load(canon, covered, extra=host, only=seated)
     if pinned.get(host, 0) > limit:
         return "host %s full: %d placement(s) for max_agents = %d" % (
             host, pinned[host] - 1, limit)
-    # l'agent placé sur l'hôte n'est plus un rôle à asseoir ; s'il était
-    # lui-même sans place, il ne prend celle d'aucun rôle assis (les sièges
-    # de `canon check` font foi, sa fiche seule est en erreur)
-    title = canon.agent(agent).title if canon.agent(agent) else agent
-    lost = {role for role, seat in with_agent.items() if seat is None}
-    if len(lost) > len(unseated - {title}):
+    lost = sorted(role for role, seat in with_agent.items() if seat is None)
+    if lost:
         return "host %s full: elected role(s) %s would find no place for max_agents = %d" % (
-            host, ", ".join(sorted(lost - unseated)), limit)
+            host, ", ".join(lost), limit)
     return None
 
 

@@ -1435,11 +1435,13 @@ def seat_elected(free: Mapping[str, int | None],
 
 
 def admission_load(canon: Canon, covered: Mapping[str, Iterable[Any]],
-                   extra: str | None = None) -> tuple[dict[str, int], dict[str, str | None]]:
+                   extra: str | None = None, only: Iterable[str] | None = None,
+                   ) -> tuple[dict[str, int], dict[str, str | None]]:
     """Admissions épinglées par hôte et siège de chaque rôle élu (#3101).
 
     `covered` : hôte -> admissions qui le couvrent ; `extra` : un hôte où
-    compter une admission épinglée de plus (proposition de placement).
+    compter une admission épinglée de plus (proposition de placement) ;
+    `only` : les seuls rôles élus à asseoir (les autres ne prennent rien).
     """
     pinned: dict[str, int] = defaultdict(int)
     hosts_of: dict[int, set[str]] = defaultdict(set)
@@ -1459,6 +1461,9 @@ def admission_load(canon: Canon, covered: Mapping[str, Iterable[Any]],
             seats += [host for host in candidates if host not in seats]
     if extra is not None:
         pinned[extra] += 1
+    if only is not None:
+        keep = set(only)
+        roles = {role: hosts for role, hosts in roles.items() if role in keep}
     free: dict[str, int | None] = {}
     for host in canon.hosts:
         limit = host.policy.max_agents

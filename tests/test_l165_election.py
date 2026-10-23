@@ -175,6 +175,30 @@ class ElectionMaxAgentsTest(test_canon._TmpMixin, unittest.TestCase):
         self.assertEqual([placement.evaluate(loaded, r, "atelier").ok
                           for r in ("relecteur", "relecteur2")], [True, True])
 
+    def test_role_sans_place_ne_se_substitue_pas_a_un_role_assis(self):
+        """B5 (relecture cx2) : trois rôles ; placer un rôle assis ailleurs ne
+        doit pas déloger un rôle assis au profit d'un rôle sans place."""
+        from ameesh import placement
+        write(self.root, "agents/relecteur.md", election_agent(candidats=["atelier"]))
+        for name in ("relecteur2", "relecteur3"):
+            write(self.root, "agents/%s.md" % name, election_agent(title=name))
+            write(self.root, "placements/%s.md" % name, fiche(
+                type="Placement", title="%s@candidats" % name, agent=name,
+                hosts=["atelier", "banc"], credential_mode="api-key"))
+        self.hosts(atelier=2, banc=2)
+        loaded = self.load()
+        self.assertEqual(placement.host_load(loaded)[1],
+                         {"relecteur": "atelier", "relecteur2": "banc", "relecteur3": None})
+        self.assertEqual({f.agent for f in canon.validate(loaded)
+                          if f.code == "agent-election-max-agents"}, {"relecteur3"})
+        verdict = placement.evaluate(loaded, "relecteur2", "atelier")
+        self.assertIs(verdict.ok, False)
+        self.assertIn("elected role(s) relecteur would find no place", verdict.diagnostic)
+        self.assertIs(placement.evaluate(loaded, "relecteur2", "banc").ok, True)
+        self.assertIs(placement.evaluate(loaded, "relecteur", "atelier").ok, True)
+        for host in ("atelier", "banc"):
+            self.assertIs(placement.evaluate(loaded, "relecteur3", host).ok, False, host)
+
     def test_candidat_refuse_par_sa_politique_n_assoit_pas(self):
         """B2 (relecture cx2) : un candidat qui refuse le harnais n'offre pas de place."""
         from ameesh import placement
