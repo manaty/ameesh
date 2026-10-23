@@ -103,10 +103,6 @@
   ameesh notify [--once] [--dry-run] [--interval S] [--json] | --test human:ID
         alerts PUSHED to the responsible human (desktop, ntfy, Slack;
         `notify` key of the host configuration; L38);
-  ameesh service install|uninstall|status [--agent A]... [--no-runner]
-        [--no-notify] [--dry-run] [--json]
-        user services (launchd on macOS, L65): the host runner and
-        `ameesh notify`, or one runner per agent; `status` reads launchd;
   ameesh offload run [--profile P] [--fallback local|none] -- <command…>
         | status [<job>] | cancel <job>
         heavy suites run on a lending VM over SSH (L159b, AMEESH_OFFLOAD_HOST);
@@ -152,6 +148,10 @@
   ameesh serve [--port 8780] [--token-file F] [--human human:ID] | --openapi
         the read API /api/v1 on 127.0.0.1, Bearer token in a 0600 file (L84,
         docs/api/openapi-v1.json); GET /api/v1/events streams the event log (L85);
+  ameesh service install|uninstall|status [--agent A]... [--no-runner]
+        [--no-notify] [--dry-run] [--json]
+        user services (launchd on macOS, L65): the host runner and
+        `ameesh notify`, or one runner per agent; `status` reads launchd;
   ameesh session list|backup|restore <agent>   off-device session backups (L53);
   ameesh sessions <persona> [--limit N] [--json]  current and past sessions (L52);
   ameesh set <agent> model=… effort=… tier=… session_policy=par-lot|taille|jamais

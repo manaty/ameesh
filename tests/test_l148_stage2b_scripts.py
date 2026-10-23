@@ -27,6 +27,8 @@ import sys
 import tempfile
 import unittest
 
+from .test_1468_ci_prio import evaluate
+
 REPO = pathlib.Path(__file__).resolve().parent.parent
 SCRIPTS = REPO / "scripts"
 
@@ -184,10 +186,21 @@ class CallersTest(unittest.TestCase):
         # même requis, et un check requis sauté ne bloque plus la fusion. Le
         # check requis `tests` garde donc `always()` : une exécution annulée le
         # conclut en rouge au lieu de laisser la PR fusionnable sans test.
+        # #3198 : l'étiquette ci-macos renomme l'agrégat et le saute (elle ne
+        # publie jamais le contexte requis `tests`) ; la garde reste vraie
+        # dans tous les autres cas.
         bloc = self._job_block("tests.yml", "tests")
         condition = re.search(r"(?m)^    if: (.+)$", bloc)
         self.assertIsNotNone(condition, "if du job tests")
-        self.assertEqual(condition.group(1).strip(), "always()")
+        expression = "${{ %s }}" % condition.group(1).strip()
+        expression = expression.replace("always()", "true")
+        expression = expression.replace("cancelled()", "false")
+        cancelled = {"github": {"event_name": "pull_request",
+                                "event": {"label": {}}}}
+        self.assertTrue(bool(evaluate(expression, cancelled)))
+        ci_macos = {"github": {"event_name": "pull_request",
+                               "event": {"label": {"name": "ci-macos"}}}}
+        self.assertFalse(bool(evaluate(expression, ci_macos)))
 
     def test_non_required_aggregates_skip_a_cancelled_run(self):
         # #876 : les agrégats non requis sautent l'exécution annulée (mesure
