@@ -13,7 +13,8 @@ survivant ; (2) ligne propre retrouvée seulement comme préfixe : non
 survivant ; (3) ligne propre exacte reportée ailleurs : survivant (B8) ;
 (4) déplacement entre chemins : toujours une preuve ; (5) réordre seul :
 survivant tant que la tête garde un de ses hunks tel quel ; (6) diff
-binaire ou arbre illisible : survivant.
+binaire ou arbre illisible : survivant ; (7) ni la configuration de `git grep`
+ni une destination binaire ne cachent une ligne propre reportée.
 """
 from __future__ import annotations
 
@@ -87,6 +88,45 @@ class CommitSurvivesTest(TestCase):
         self.repo.write("c.py", "def moved():\n    own_corrector_guard(worker)\n")
         head = self.repo.commit("impl: déplacement", agent="dev4")
         self.assertTrue(self.survives(head, fix, base))
+
+    def reported_elsewhere(self, files):
+        """Correctif cx1 (#2994 B1/B2) : b.py porte la ligne propre ; la tête
+        repart de la base, réécrit b.py et reporte la ligne dans `files`."""
+        self.repo.write("a.py", "base_line_here()\n")
+        base = self.repo.commit("base")
+        self.repo.write("b.py", "    own_corrector_guard(worker)\n")
+        fix = self.repo.commit("fix", agent="dev3")
+        self.repo.git("reset", "-q", "--hard", base)
+        self.repo.write("b.py", "rewritten_by_author()\n")
+        for path, data in files.items():
+            with open(os.path.join(self.repo.root, path), "wb") as handle:
+                handle.write(data)
+        head = self.repo.commit("impl: déplacement", agent="dev4")
+        return base, fix, head
+
+    def test_the_git_grep_configuration_does_not_hide_the_own_line(self):
+        # B1 (cx1) : numéros, colonnes ou couleur forcés par la configuration
+        # du dépôt ne changent pas la sortie lue.
+        base, fix, head = self.reported_elsewhere(
+            {"c.py": b"def moved():\n    own_corrector_guard(worker)\n"})
+        for key, value in (("grep.lineNumber", "true"),
+                           ("grep.column", "true"),
+                           ("color.grep", "always")):
+            self.repo.git("config", key, value)
+            self.assertTrue(self.survives(head, fix, base), key)
+            self.repo.git("config", "--unset", key)
+
+    def test_an_own_line_in_a_binary_file_keeps_the_corrector(self):
+        # B2 (cx1) : la ligne propre reportée dans un fichier binaire reste une
+        # preuve.
+        base, fix, head = self.reported_elsewhere(
+            {"moved.bin": b"\x00payload\n    own_corrector_guard(worker)\n"})
+        self.assertTrue(self.survives(head, fix, base))
+
+    def test_a_prefix_in_a_binary_file_is_not_the_own_line(self):
+        base, fix, head = self.reported_elsewhere(
+            {"moved.bin": b"\x00payload\n    own_corrector_guard(worker) + 1\n"})
+        self.assertFalse(self.survives(head, fix, base))
 
     def test_a_move_between_paths_still_proves_the_correction(self):
         # Le correctif déplace la fixture d'un fichier à l'autre : la ligne

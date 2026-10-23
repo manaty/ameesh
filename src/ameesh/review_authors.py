@@ -581,24 +581,33 @@ def _any_line_in_head(repo: str, head: str, lines: Sequence[str]) -> bool:
     #2994 : seule une ligne **égale** à la ligne cherchée (à l'indentation
     près) compte, comme dans `_lines_in_tree` ; une ligne plus longue qui la
     contient (`self.assertIsNone(self.pick(worker), …)` pour
-    `self.assertIsNone(self.pick(worker),`) n'en est pas la trace."""
-    found = _tree_lines(repo, head, lines)
+    `self.assertIsNone(self.pick(worker),`) n'en est pas la trace. Un fichier
+    binaire est lu comme du texte : la ligne propre qu'il porte reste une
+    preuve, comme avant l'égalité de ligne."""
+    found = _tree_lines(repo, head, lines, binary=True)
     return True if found is None else bool(found)
 
 
-def _tree_lines(repo: str, rev: str, lines: Sequence[str]) -> Optional[set]:
+def _tree_lines(repo: str, rev: str, lines: Sequence[str], *,
+                binary: bool = False) -> Optional[set]:
     """Les lignes (dépouillées) de `lines` égales à une ligne de l'arbre de
     `rev` (à l'indentation près), ou None si la lecture est impossible.
 
     `git grep -F` trouve les lignes qui *contiennent* un motif ; seules celles
-    qui lui sont égales une fois dépouillées sont rendues."""
+    qui lui sont égales une fois dépouillées sont rendues. Le format de sortie
+    est fixé (ni couleur, ni numéro, ni colonne) : la configuration Git du
+    dépôt ou de l'hôte (`grep.lineNumber`, `color.grep=always`…) ne doit pas
+    changer la lecture (#2994 B1 cx1). `binary=True` lit aussi les fichiers
+    binaires comme du texte (`-a`) ; sinon ils sont ignorés (`-I`)."""
     wanted = {str(line).strip() for line in lines or () if str(line).strip()}
     if not wanted:
         return set()
     if not repo or not rev:
         return None
     try:
-        proc = plan_git._git(repo, "grep", "-h", "-I", "-F", "-f", "-", rev,
+        proc = plan_git._git(repo, "grep", "--no-color", "--no-line-number",
+                             "--no-column", "-h", "-a" if binary else "-I",
+                             "-F", "-f", "-", rev,
                              stdin=("\n".join(sorted(wanted)) + "\n").encode("utf-8"))
     except Exception:  # noqa: BLE001 - lecture impossible : doute
         return None
