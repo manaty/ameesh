@@ -77,9 +77,13 @@ STEPS: tuple = (
     Step("build_quiet",
          "lot started with no new event (commit, milestone, note)",
          7200, 3600, LOT_EVENTS, True),
+    # #3033 : mesurée depuis le journal du lot. Le canon (§3, §11 bis) place la
+    # relecture AVANT la CI : la tête « verte » d'ameesh est la tête gelée, et
+    # l'horloge de chaque relecteur part de sa désignation sur elle
+    # (`review_designation_activation.pending_reviews`), jusqu'à son verdict.
     Step("green_verdict",
-         "green PR → review verdict delivered",
-         7200, 1800, EXTERNAL, False),
+         "frozen head designated → reviewer's verdict delivered",
+         7200, 1800, LOT_EVENTS, True),
     Step("verdict_merge",
          "review GO → merge",
          1800, 900, LOT_EVENTS, True),
@@ -337,7 +341,8 @@ def lot_steps(item: dict, jalons: dict, events: Iterable[dict], *,
               now: float | None = None, packet_slot: float | None = None,
               dependencies: Iterable[dict] = (), packet: bool = False,
               p80_s: float | None = None, outside_packet: bool = False,
-              hold_releases: Iterable[float] = ()) -> list:
+              hold_releases: Iterable[float] = (),
+              reviews: Iterable[dict] = ()) -> list:
     """Les étapes mesurables d'un lot, une ligne par étape applicable.
 
     `jalons` vient de `progress._work_item_milestones` — le SEUL lecteur des
@@ -394,6 +399,16 @@ def lot_steps(item: dict, jalons: dict, events: Iterable[dict], *,
     pilote (`hold:`/`unhold:`, #1664), autorisées par l'appelant
     (`planned_waits.pilot_hold_releases`) — un cas réel nexlink. Le temps
     parqué sous un hold de pilote n'est pas un retard du porteur.
+
+    #3033 : `reviews` sont les avis encore dus sur ce lot
+    (`review_designation_activation.pending_reviews` : `name`,
+    `designated_ts`). Chacun donne une ligne `green_verdict` en cours, au nom
+    de son relecteur (`reviewer`) : l'escalade vise le relecteur au premier
+    dépassement, puis le pilote, qui le relance ou en désigne un autre. Un
+    verdict rendu sur la tête gelée retire l'avis de la lecture, donc la
+    ligne ; un nouveau gel le remet, depuis la nouvelle désignation. La grâce
+    de prise en charge (#2217) ne s'y applique pas : elle protège le porteur
+    du lot, pas un relecteur.
     """
     events = list(events)
     now = time.time() if now is None else float(now)
@@ -500,12 +515,21 @@ def lot_steps(item: dict, jalons: dict, events: Iterable[dict], *,
             out.append(_row(step, start, now=now, critical=critical,
                             target=target, escalate=not packet, **extra))
 
+    if state not in ("merged", "promoted", "closed"):
+        step = step_of("green_verdict")
+        for review in reviews or ():
+            name = str(review.get("name") or "").strip()
+            since = review.get("designated_ts")
+            if not name or since is None:
+                continue
+            out.append(_row(step, since, now=now, critical=critical, reviewer=name))
+
     handover = handover_ts(item, events)
     if handover is not None and state not in ("merged", "promoted", "closed"):
         remaining = HANDOVER_GRACE_S - (now - handover)
         if 0 < remaining <= HANDOVER_GRACE_S:
             for row in out:
-                if int(row.get("level") or 0) < 1:
+                if int(row.get("level") or 0) < 1 or row.get("reviewer"):
                     continue
                 # #2217 : le retard a couru avant la prise en charge ; le
                 # nouveau porteur n'a pas à recevoir une demande de

@@ -749,153 +749,205 @@ def corrections_of_head(db, item: Mapping, milestone: Optional[Mapping],
 # the candidates: real session family, availability, open-lot load
 # --------------------------------------------------------------------------
 
-def _mark_reviewers(note: str) -> Optional[list]:
-    """The reviewer names a latest designation mark carries, or None.
-
-    The JSON is parsed **in Python**, before any cast: a hand-written note with
-    a valid mark prefix and invalid JSON is an unreadable mark, not a database
-    error that aborts the freeze transaction (#3047). `designation_of` refuses
-    an unreadable selection mark and `carried_mark_of` returns None; both are
-    the same refusal here, and the caller journals it.
-    """
-    from . import verdict_carry
-
-    text = str(note or "")
-    if text.startswith(pg.MARK_PREFIX):
-        try:
-            payload = pg.designation_of(text)
-        except rd.DesignationError:
-            return None
-    elif text.startswith(verdict_carry.CARRIED_MARK_PREFIX):
-        payload = verdict_carry.carried_mark_of(text)
-    else:
-        return []
-    if not isinstance(payload, dict):
-        return None
-    reviewers = payload.get("reviewers")
-    if reviewers is None:
-        return []
-    if not isinstance(reviewers, (list, tuple)):
-        return None
-    names = []
-    for row in reviewers:
-        if not isinstance(row, dict):
-            return None
-        names.append(str(row.get("name") or "").strip())
-    return names
+#: #3033: the reviews an agent still owes, as SQL CTEs ending in `pending`
+#: (`lot`, `name`, `sha`, `designated_at`). It is the **only** calculation of
+#: a pending review: the selection load (`_loads`, #3004), the reading of an
+#: agent's queue (`pending_reviews`: resume brief, idle turn) and the §9
+#: `green_verdict` relaunch all read it, so they cannot disagree.
+#:
+#: A review is pending when an open lot's **latest** freeze designates the
+#: agent and no verdict of theirs names that head. The designees are the gate's
+#: `reviewers` column (what the merge gate waits for), restricted to the
+#: current head:
+#:
+#: - a name of the **effective** mark of the latest freeze
+#:   (`review-designation:` selection or `review-designation-carried:` report,
+#:   the last one in journal order — the mark `_sync_reviewers` derives the
+#:   column from);
+#: - a manual designation: a name that no automatic mark of the lot ever
+#:   carried (kept across freezes by `_sync_reviewers`), or one designated by
+#:   hand (`reviewer X designated`, `ameesh work reviewer`) since the latest
+#:   freeze.
+#:
+#: An automatic name of an older freeze is therefore not a pending review of
+#: the new head — including during the selection itself, when the column has
+#: not been synced yet (#3004) — and a reviewer the pilot removed (#3004:
+#: dev1 removed, dev2 designated) is no longer one. Only a verdict naming the
+#: frozen head discharges it, full or abbreviated SHA, the `_same_freeze`
+#: rule; a `blocked` verdict counts, the reviewer has rendered it. A closed,
+#: merged or promoted lot owes nothing. `designated_at` is when the agent was
+#: designated for this head (latest of the freeze, the mark naming them, a
+#: manual designation since the freeze): the start of the §9 clock.
+#:
+#: #3047: the note's JSON is never cast blindly. `readable` checks
+#: `pg_input_is_valid` (PostgreSQL 16) and the object/array shape **before**
+#: any `::jsonb`; `marked` and `ever_marked` only see readable marks, and the
+#: `invalid` CTE names the latest unreadable mark of each open lot (`lot`,
+#: `note id`) so `_loads` journals it. A hand-written note with a mark prefix
+#: and invalid JSON designates nobody and can never abort a freeze transaction.
+PENDING_REVIEWS_CTE = """
+    open_items AS (
+        SELECT id, assignee, reviewers
+          FROM work_items
+         WHERE state NOT IN ('merged', 'promoted', 'closed')
+    ), latest_freeze AS (
+        SELECT DISTINCT ON (m.work_item_id)
+               m.work_item_id AS lot, m.id AS freeze_id, m.sha AS sha, m.at AS at
+          FROM work_item_milestones m
+          JOIN open_items o ON o.id = m.work_item_id
+         WHERE m.kind = 'frozen'
+         ORDER BY m.work_item_id, m.at DESC, m.id DESC
+    ), latest_mark AS (
+        SELECT f.lot, f.sha, f.at, mk.note, mk.id AS note_id,
+               mk.created_at AS mark_at,
+               substring(mk.note from position(': ' in mk.note) + 2) AS payload
+          FROM latest_freeze f
+          LEFT JOIN LATERAL (
+                SELECT e.id, e.note, e.created_at
+                  FROM work_item_events e
+                 WHERE e.work_item_id = f.lot
+                   AND e.created_at >= f.at
+                   AND (starts_with(e.note,
+                                    'review-designation:' || f.lot
+                                    || ':' || f.freeze_id || ':')
+                        OR starts_with(e.note,
+                                       'review-designation-carried:' || f.lot
+                                       || ':' || f.freeze_id || ':'))
+                 ORDER BY e.id DESC
+                 LIMIT 1) mk ON true
+    ), latest_ok AS (
+        SELECT f.*,
+               CASE WHEN pg_input_is_valid(f.payload, 'jsonb')
+                    THEN jsonb_typeof(f.payload::jsonb) = 'object'
+                         AND jsonb_typeof(f.payload::jsonb -> 'reviewers') = 'array'
+                    ELSE false END AS readable
+          FROM latest_mark f
+    ), marked AS (
+        SELECT f.lot, btrim(r.value->>'name') AS name
+          FROM latest_ok f
+          CROSS JOIN LATERAL jsonb_array_elements(
+              CASE WHEN f.readable THEN f.payload::jsonb -> 'reviewers' END) AS r(value)
+         WHERE f.note IS NOT NULL
+    ), invalid AS (
+        SELECT f.lot, f.note_id
+          FROM latest_ok f
+         WHERE f.note IS NOT NULL AND NOT f.readable
+    ), all_notes AS (
+        SELECT e.work_item_id AS lot,
+               substring(e.note from position(': ' in e.note) + 2) AS payload
+          FROM work_item_events e
+          JOIN open_items o ON o.id = e.work_item_id
+         WHERE starts_with(e.note, 'review-designation:' || e.work_item_id || ':')
+            OR starts_with(e.note, 'review-designation-carried:'
+                                   || e.work_item_id || ':')
+    ), all_ok AS (
+        SELECT n.*,
+               CASE WHEN pg_input_is_valid(n.payload, 'jsonb')
+                    THEN jsonb_typeof(n.payload::jsonb) = 'object'
+                         AND jsonb_typeof(n.payload::jsonb -> 'reviewers') = 'array'
+                    ELSE false END AS readable
+          FROM all_notes n
+    ), ever_marked AS (
+        SELECT DISTINCT n.lot, btrim(r.value->>'name') AS name
+          FROM all_ok n
+          CROSS JOIN LATERAL jsonb_array_elements(
+              CASE WHEN n.readable THEN n.payload::jsonb -> 'reviewers' END) AS r(value)
+         WHERE n.readable
+    ), designees AS (
+        SELECT f.lot, f.sha, btrim(c.name) AS name,
+               greatest(f.at,
+                        CASE WHEN EXISTS (SELECT 1 FROM marked k
+                                           WHERE k.lot = f.lot
+                                             AND k.name = btrim(c.name))
+                             THEN f.mark_at END,
+                        (SELECT max(e.created_at)
+                           FROM work_item_events e
+                          WHERE e.work_item_id = f.lot
+                            AND e.created_at >= f.at
+                            AND e.note = 'reviewer ' || btrim(c.name)
+                                         || ' designated')) AS designated_at
+          FROM latest_ok f
+          JOIN open_items o ON o.id = f.lot
+          CROSS JOIN LATERAL unnest(coalesce(o.reviewers, ARRAY[]::text[])) AS c(name)
+         WHERE btrim(coalesce(c.name, '')) NOT IN ('', '-none')
+           AND btrim(f.sha) <> ''
+           AND (EXISTS (SELECT 1 FROM marked k
+                         WHERE k.lot = f.lot AND k.name = btrim(c.name))
+                OR NOT EXISTS (SELECT 1 FROM ever_marked k
+                                WHERE k.lot = f.lot AND k.name = btrim(c.name))
+                OR EXISTS (SELECT 1 FROM work_item_events e
+                            WHERE e.work_item_id = f.lot
+                              AND e.created_at >= f.at
+                              AND e.note = 'reviewer ' || btrim(c.name)
+                                           || ' designated'))
+    ), pending AS (
+        SELECT d.lot, d.name, d.sha, d.designated_at
+          FROM designees d
+         WHERE NOT EXISTS (
+                SELECT 1
+                  FROM work_item_milestones v
+                 WHERE v.work_item_id = d.lot
+                   AND v.kind = 'verdict'
+                   AND lower(btrim(v.actor)) = lower(d.name)
+                   AND (lower(btrim(v.sha)) = lower(btrim(d.sha))
+                        OR (length(btrim(v.sha)) >= 7
+                            AND starts_with(lower(btrim(d.sha)),
+                                            lower(btrim(v.sha))))
+                        OR (length(btrim(d.sha)) >= 7
+                            AND starts_with(lower(btrim(v.sha)),
+                                            lower(btrim(d.sha))))))
+    )
+"""
 
 
 def _loads(db, *, unreadable: Optional[list] = None) -> dict:
     """Open lots per agent (the load of the selection), in **one** read.
 
     The charge of a reviewer is every open lot they carry: the lots assigned to
-    them, plus the lots where the **last freeze designates them** without a
-    verdict of theirs on that head (#3004). The second part is what was
-    missing: a reviewer with an empty assignment queue but a full review queue
-    looked free, so every freeze of their family picked them again.
+    them, plus the reviews they still owe (#3004) — `PENDING_REVIEWS_CTE`, the
+    same calculation as their queue (`pending_reviews`, #3033). The second part
+    is what was missing: a reviewer with an empty assignment queue but a full
+    review queue looked free, so every freeze of their family picked them
+    again. An unreadable read is zero, as before: never a guess and never a
+    failed freeze. A lot where the agent is both assignee and designated
+    reviewer counts once: `charges` is a set of (lot, agent).
 
-    The designation is the effective journal mark of the lot's latest freeze
-    (`review-designation:` for a selection, `review-designation-carried:` for a
-    carried report), the authoritative mark `_sync_reviewers` derives the
-    gate's `reviewers` column from — not the column itself, which is synced
-    **after** the selection and would charge the old head while a new freeze
-    designates. Only a verdict naming
-    the frozen head discharges the review — full or abbreviated SHA, the same
-    `_same_freeze` rule as the designation itself; a `blocked` verdict counts,
-    the reviewer has rendered it. A closed, merged or promoted lot is no longer
-    a charge, and an unreadable read is zero, as before: never a guess and
-    never a failed freeze. A lot where the agent is both assignee and
-    designated reviewer counts once: `charges` is a set of (lot, agent).
-
-    #3047: the mark is read as **text** and its JSON is parsed in Python
-    (`_mark_reviewers`), never cast by PostgreSQL. A note with a valid prefix
-    and invalid JSON charges nobody and is reported in `unreadable` as
-    `(lot, note id)`; the caller journals it. No bad note can abort the freeze
-    transaction any more, while a valid mark next to it is still read.
+    #3047: an unreadable mark is ignored by `PENDING_REVIEWS_CTE` (no
+    `::jsonb` cast can abort the freeze) and the same query returns its
+    `(lot, note id)` in the `invalid` CTE; they are reported in `unreadable`
+    for the caller to journal, and the load continues with the valid marks.
     """
     try:
         rows = db.query(
-            """
-            WITH open_items AS (
-                SELECT id, assignee
-                  FROM work_items
-                 WHERE state NOT IN ('merged', 'promoted', 'closed')
-            ), latest_freeze AS (
-                SELECT DISTINCT ON (m.work_item_id)
-                       m.work_item_id AS lot, m.id AS freeze_id, m.sha AS sha, m.at AS at
-                  FROM work_item_milestones m
-                  JOIN open_items o ON o.id = m.work_item_id
-                 WHERE m.kind = 'frozen'
-                 ORDER BY m.work_item_id, m.at DESC, m.id DESC
-            ), latest_mark AS (
-                SELECT f.lot, f.sha, mark.id AS note_id, mark.note
-                  FROM latest_freeze f
-                  LEFT JOIN LATERAL (
-                      SELECT e.id, e.note
-                        FROM work_item_events e
-                       WHERE e.work_item_id = f.lot
-                         AND e.created_at >= f.at
-                         AND (starts_with(e.note,
-                                          'review-designation:' || f.lot
-                                          || ':' || f.freeze_id || ':')
-                              OR starts_with(e.note,
-                                             'review-designation-carried:' || f.lot
-                                             || ':' || f.freeze_id || ':'))
-                       ORDER BY e.id DESC
-                       LIMIT 1
-                  ) mark ON true
+            "WITH" + PENDING_REVIEWS_CTE + """
+            , charges AS (
+                SELECT id AS lot, assignee AS name
+                  FROM open_items
+                 WHERE assignee IS NOT NULL AND assignee <> ''
+                UNION
+                SELECT lot, name FROM pending
             )
-            SELECT o.id AS lot, o.assignee,
-                   m.sha AS freeze_sha, m.note, m.note_id,
-                   v.actor AS verdict_actor, v.sha AS verdict_sha
-              FROM open_items o
-              LEFT JOIN latest_mark m ON m.lot = o.id
-              LEFT JOIN work_item_milestones v
-                     ON v.work_item_id = o.id
-                    AND v.kind = 'verdict'
+            SELECT 'load' AS kind, name, count(*)::int AS load,
+                   NULL::bigint AS note_id, NULL::int AS lot
+              FROM charges
+             GROUP BY name
+            UNION ALL
+            SELECT 'unreadable' AS kind, NULL AS name, NULL::int AS load,
+                   note_id, lot
+              FROM invalid
             """)
     except Exception:  # noqa: BLE001 - unreadable load: zero, never a guess
         return {}
-    charges: set = set()
-    verdicts: dict = {}
-    marks: dict = {}
+    out: dict = {}
     for row in rows or ():
+        if str(row.get("kind") or "") == "unreadable":
+            if unreadable is not None:
+                unreadable.append((row.get("lot"), row.get("note_id")))
+            continue
         try:
-            lot_id = int(row["lot"])
+            out[str(row["name"])] = int(row["load"])
         except (KeyError, TypeError, ValueError):
             continue
-        assignee = str(row.get("assignee") or "").strip()
-        if assignee:
-            charges.add((lot_id, assignee))
-        actor = str(row.get("verdict_actor") or "").strip()
-        sha = str(row.get("verdict_sha") or "").strip()
-        if actor and sha:
-            verdicts.setdefault(lot_id, []).append((actor, sha))
-        if lot_id not in marks and row.get("note") is not None:
-            marks[lot_id] = (str(row.get("freeze_sha") or "").strip(),
-                             row.get("note_id"), str(row.get("note") or ""))
-    for lot_id, (frozen_sha, note_id, note) in marks.items():
-        names = _mark_reviewers(note)
-        if names is None:
-            if unreadable is not None:
-                unreadable.append((lot_id, note_id))
-            continue
-        if not frozen_sha:
-            continue
-        rendered = verdicts.get(lot_id) or ()
-        for name in names:
-            if not name:
-                continue
-            lowered = name.lower()
-            discharged = any(
-                str(actor).strip().lower() == lowered
-                and rd._same_freeze(frozen_sha, sha)
-                for actor, sha in rendered)
-            if not discharged:
-                charges.add((lot_id, name))
-    out: dict = {}
-    for _lot_id, name in charges:
-        out[name] = out.get(name, 0) + 1
     return out
 
 
@@ -940,6 +992,39 @@ def _note_unreadable(db, lot: int, state: str,
                 db.execute("RELEASE SAVEPOINT review_designation_load_trace")
         except Exception:  # noqa: BLE001 - best effort only
             continue
+
+
+def pending_reviews(db, agent: Optional[str] = None) -> list:
+    """The reviews still owed, oldest designation first (#3033), in one read.
+
+    One row per (lot, reviewer): `lot`, `name`, `sha` (the frozen head),
+    `designated_ts` (epoch of the designation for this head), `title`,
+    `state`, `app`. `agent` restricts to one reviewer (names compared without
+    case, like the verdict). The calculation is `PENDING_REVIEWS_CTE`, shared
+    with the selection load (#3004). The read raises when the base cannot be
+    read: the caller says « unreadable », it never shows an empty queue.
+    """
+    where, params = "", ()
+    if agent is not None:
+        where, params = " WHERE lower(p.name) = lower(btrim(%s))", (str(agent),)
+    rows = db.query(
+        "WITH" + PENDING_REVIEWS_CTE + """
+        SELECT p.lot, p.name, p.sha,
+               extract(epoch FROM p.designated_at)::float8 AS designated_ts,
+               w.title, w.state, w.app
+          FROM pending p
+          JOIN work_items w ON w.id = p.lot""" + where + """
+         ORDER BY p.designated_at, p.lot, p.name
+        """, params)
+    out = []
+    for row in rows or ():
+        out.append({"lot": int(row["lot"]), "name": str(row["name"]),
+                    "sha": str(row.get("sha") or ""),
+                    "designated_ts": (float(row["designated_ts"])
+                                      if row.get("designated_ts") is not None else None),
+                    "title": row.get("title") or "", "state": row.get("state") or "",
+                    "app": row.get("app") or ""})
+    return out
 
 
 def _advances(db) -> dict:
