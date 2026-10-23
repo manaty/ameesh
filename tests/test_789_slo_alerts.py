@@ -51,6 +51,10 @@ class _Base(PgTestCase):
         super().setUp()
         for name in ("orch", "dev1", "bureau", "auditeur"):
             registry.upsert(self.db, name, harness="claude", host=self.cfg.host)
+        # #3036 : un brief n'est plus déposé à un destinataire sans bail
+        # vivant ; ces agents simulent un runner qui les tient (régime normal).
+        self.db.execute("UPDATE agent_registry SET lease_owner = 'runner-' || name,"
+                        " lease_expires_at = now() + interval '1 hour'")
         # le lot reste en intake : « prêt, pas démarré » — l'étape qui court
         self.lot = work.add(self.db, title="un lot SLO", assignee="dev1")
         self.now = time.time()
