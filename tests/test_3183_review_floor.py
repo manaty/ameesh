@@ -186,6 +186,25 @@ class FloorGateTest(PgTestCase):
         self.floor(0, actor="human:smichea")
         self.assertEqual(review_floor.of_lot(self.db, self.lot)["floor"], 0)
 
+    def test_a_human_recharge_at_the_same_value_keeps_the_floor(self):
+        # #3196 : pilote 2 puis humain 2 ; sans ligne humaine, `human_floor`
+        # restait à 0 et le pilote pouvait ensuite poser 0.
+        self.as_session("pilot")
+        self.floor(2)
+        self.as_session("")
+        out = self.floor(2, actor="human:smichea")
+        self.assertTrue(out["changed"])
+        found = review_floor.of_lot(self.db, self.lot, cfg=self.cfg)
+        self.assertEqual((found["floor"], found["actor"], found["human_floor"]),
+                         (2, "human:smichea", 2))
+        # une seconde recharge identique n'écrit rien
+        self.assertFalse(self.floor(2, actor="human:smichea")["changed"])
+        self.as_session("pilot")
+        with self.assertRaises(work.WorkError) as caught:
+            self.floor(0)
+        self.assertIn("only a human lowers it", str(caught.exception))
+        self.assertEqual(review_floor.of_lot(self.db, self.lot)["floor"], 2)
+
     def test_a_copied_line_does_not_lower_the_floor(self):
         # d'autres écritures du journal portent un texte libre : la ligne
         # copiée par l'assigné ne compte pas, faute d'autorité de pilote.
