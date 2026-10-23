@@ -1594,6 +1594,23 @@ def work_detail(cfg: Config, db, lot_id: int, repo: str | None = None,
             return None
         item["events"] = work.events(db, lot_id)
         item["milestones"] = work.milestones(db, lot_id)
+        # #2988 : la tête relue écrite à la création (`reviewed head:`), ou
+        # `absent` pour un lot né d'une revue sans tête.
+        from . import intake_neighbors
+        item["reviewed"] = intake_neighbors.reviewed_head_of(item["events"])
+        creation_seen = any(str(event.get("note") or "").startswith("created")
+                            for event in item["events"])
+        if (item["reviewed"] is None and not creation_seen
+                and intake_neighbors.review_born(
+                    title=item.get("title") or "", source=item.get("source") or "",
+                    issue_ref=item.get("issue_ref") or "")):
+            # journal plus long que la fenêtre de `work show` : la création
+            # seule porte la marque, on la relit sans tronquer
+            try:
+                full = work.events(db, lot_id, limit=None)
+            except Exception:  # noqa: BLE001 - l'affichage ne casse pas le lot
+                full = []
+            item["reviewed"] = intake_neighbors.reviewed_head_of(full)
         from . import plan_git
         item["freeze"] = plan_git.freeze_candidate(
             item["milestones"], repo=repo,
@@ -1699,13 +1716,38 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
         if args.work_command == "fire":   # #1374 : le feu du pilote au gel
             from . import fire
             return fire.run(cfg, db, args)
+        if args.work_command == "neighbors":
+            # #2988 : lecture seule, AVANT la création — les lots voisins du
+            # projet (même fichier, titre proche, ligne déjà changée depuis la
+            # tête relue) et l'état du contrôle git.
+            from . import intake_neighbors
+            try:
+                head = intake_neighbors.normalize_head(args.reviewed_head)
+            except intake_neighbors.IntakeNeighborsError as exc:
+                raise work.WorkError(str(exc)) from None
+            found = intake_neighbors.neighbors(
+                db, args.app or "", title=args.title, body=args.body or "",
+                reviewed_head=head, cfg=cfg, repo=args.repo)
+            if args.json:
+                print(json.dumps(found, ensure_ascii=False, indent=2, default=str))
+                return 0
+            if found.get("git") == "non vérifié":
+                print("git non vérifié : aucun clone local du dépôt du projet",
+                      file=sys.stderr)
+            if not found.get("neighbors"):
+                print("no neighbor found (project %s, %d days)"
+                      % (args.app or "—", found.get("since_days")))
+                return 0
+            for neighbor in found["neighbors"]:
+                print(intake_neighbors.format_neighbor(neighbor))
+            return 0
         if args.work_command == "add":
             # L37 (0030, règle 2) : attribution gardée — un assigné non
             # réveillable est refusé AVANT la création (WorkError, code 1).
             # L157 : durée estimée, obligatoire pour un agent (refus AVANT la
             # création), avertissement pour un humain
             from . import estimates
-            from . import identity, work_projects
+            from . import identity, intake_neighbors, work_projects
             binding = identity.resolve_binding(cfg, db)
             creator = binding.name if binding.ok else args.actor
             if args.new_project and args.app is None:
@@ -1719,6 +1761,19 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
             warn_estimate = estimates.check(db, args.actor, minutes)
             check = (work.check_assignee(db, args.assignee, externe=args.externe, cfg=cfg)
                      if args.assignee else None)
+            # #2988 : tête relue, détection d'une revue et voisins calculés
+            # AVANT `work.add` — la recherche git ne doit pas tourner dans
+            # `work._create`, appelé aussi par incident.py, assignments.py et
+            # review_lot.py. Le segment est préfixé à la note de création.
+            try:
+                segment, infos = intake_neighbors.creation_note(
+                    db, cfg, app=args.app or "", title=args.title,
+                    body=args.body or "", source=args.source or "",
+                    issue_ref=args.issue_ref or "",
+                    reviewed_head=args.reviewed_head)
+            except intake_neighbors.IntakeNeighborsError as exc:
+                raise work.WorkError(str(exc)) from None
+            note = "; ".join(part for part in (segment, introduced) if part)
             item = work.add(
                 db, title=args.title, type=args.type, source=args.source, app=args.app,
                 body=args.body or "", issue_ref=args.issue_ref, workstream=args.workstream,
@@ -1726,7 +1781,7 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                 package=args.package, externe=args.externe, cfg=cfg,
                 branch=args.branch, branch_target=args.target, priority=args.priority,
                 estimate=minutes, estimate_source=args.estimate_source, size=args.size,
-                note=introduced,
+                note=note,
                 force=args.force,
                 parent_lot=args.parent_lot)
             print("lot #%d created in %s: %s%s%s%s" % (
@@ -1756,6 +1811,19 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
             _print_assignment(check)
             if item.get("queue_warning"):
                 print("warning: %s" % item["queue_warning"], file=sys.stderr)
+            # #2988 : la tête relue manquante, les voisins trouvés et l'état du
+            # contrôle git sont dits au rédacteur (stderr), jamais refusés.
+            if infos.get("reviewed_warning"):
+                print("warning: %s" % infos["reviewed_warning"], file=sys.stderr)
+            if infos.get("neighbors_error"):
+                print("warning: voisins non recherchés: %s" % infos["neighbors_error"],
+                      file=sys.stderr)
+            if infos.get("neighbors_git") == "non vérifié":
+                print("warning: git non vérifié (aucun clone local du dépôt du projet)",
+                      file=sys.stderr)
+            for neighbor in infos.get("neighbors") or ():
+                print("neighbor: %s" % intake_neighbors.format_neighbor(neighbor),
+                      file=sys.stderr)
             return 0
         if args.work_command == "assign":
             out = work.assign(db, args.id, args.agent, externe=args.externe,
@@ -1906,6 +1974,10 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                 item.get("app") or "—", item.get("source") or "—", item.get("workstream") or "—"))
             print("issue    : %-12s loops: %-3s budget: %s" % (
                 item.get("issue_ref") or "—", item.get("loops"), _budget(item)))
+            from . import intake_neighbors
+            reviewed = intake_neighbors.format_reviewed_line(item.get("reviewed"))
+            if reviewed:
+                print("reviewed : %s" % reviewed)
             if item.get("reviewer") == work.REVIEWER_NONE:
                 print("reviewer : — (verdict not required, #1979)")
             else:
@@ -3139,6 +3211,20 @@ def build_parser() -> argparse.ArgumentParser:
 
     p_work = sub.add_parser("work", help="work items (work_items)")
     work_sub = p_work.add_subparsers(dest="work_command")
+    pw_neighbors = work_sub.add_parser(
+        "neighbors", help="#2988: read-only preview of the lots already touching this "
+                          "constat (same file, close title, line changed since the "
+                          "reviewed head)")
+    pw_neighbors.add_argument("--app", default="", help="the lot's project")
+    pw_neighbors.add_argument("--title", required=True)
+    pw_neighbors.add_argument("--body", default="")
+    pw_neighbors.add_argument("--reviewed-head", default=None, metavar="SHA",
+                              help="#2988: the head the review read (7 to 64 hex)")
+    pw_neighbors.add_argument("--repo", default=None, metavar="DIR",
+                              help="local clone of the project's repository (default: the "
+                                   "one declared for the project, else the current one)")
+    pw_neighbors.add_argument("--json", action="store_true")
+    pw_neighbors.set_defaults(func=cmd_work)
     pw_add = work_sub.add_parser("add")
     pw_add.add_argument("--title", required=True)
     pw_add.add_argument("--force", metavar="REASON",
@@ -3182,6 +3268,11 @@ def build_parser() -> argparse.ArgumentParser:
     pw_add.add_argument("--size", default=None, choices=list(work.SIZES),
                         help="size of the change: s small, m medium, l large — a key of "
                              "the reference estimate (L157b)")
+    pw_add.add_argument("--reviewed-head", default=None, metavar="SHA",
+                        help="#2988: the head the review (ultrareview, verdict, "
+                             "re-reading) actually read; written as `reviewed head: "
+                             "<sha>` in the creation note. A review-born lot without it "
+                             "is still created, marked `absent` and warned")
     pw_add.set_defaults(func=cmd_work)
     pw_list = work_sub.add_parser("list")
     pw_list.add_argument("--state", default=None)
@@ -3501,6 +3592,9 @@ def build_parser() -> argparse.ArgumentParser:
     pc_turns.add_argument("--agent", default=None)
     pc_turns.add_argument("--since", default="24h", help="duration (16h, 2d) or ISO date")
     pc_turns.add_argument("--limit", type=int, default=500)
+    pc_turns.add_argument("--message", default=None,
+                          help="only turns that served this message (mail id); "
+                               "the cost shown is the turn's")
     pc_turns.add_argument("--json", action="store_true")
     pc_turns.set_defaults(func=cmd_cost)
     pc_gauges = cost_sub.add_parser("gauges", help="plan gauge history")
@@ -3904,11 +3998,15 @@ def _cost_l26(cfg: Config, db, what: str, args) -> int:
     ops = storage.of(db).operations
     if what == "turns":
         rows = ops.turns(agent=args.agent, since_s=_since_seconds(args.since),
-                         limit=args.limit)
+                         limit=args.limit, message=getattr(args, "message", None))
         if args.json:
             print(json.dumps({"schema": "ameesh-turns/1", "turns": rows},
                              ensure_ascii=False, indent=2))
             return 0
+        if getattr(args, "message", None) is not None:
+            # L80b : le coût est celui du TOUR qui a servi le message, partagé
+            # avec les autres messages du même tour — jamais divisé.
+            print("turns serving message %s (turn cost, not divided)" % args.message)
         print("%-19s %-16s %-6s %-9s %10s %10s %9s %10s" % (
             "WHEN", "AGENT", "LOT", "HARNESS", "INPUT", "CACHE", "OUTPUT", "USD"))
         for row in rows:

@@ -174,6 +174,11 @@ BASE_BRANCHES = ("main",)
 #: confondus — pouvait cacher une exécution suivie, que seul le rattrapage
 #: rendait, une heure plus tard.
 LIST_PER_PAGE = 100
+#: #2938 : pages lues au plus pour la tête d'une base. La première suffit
+#: quand le dernier `success`/`failure` de chaque workflow suivi y est ; des
+#: annulations plus récentes peuvent le cacher au-delà (N1/N2 de la relecture
+#: #2935). Le plafond borne le coût d'une branche qui n'a jamais ce résultat.
+HEAD_LIST_MAX_PAGES = 5
 ECHECS = ("echec", "erreur")
 #: conclusion GitHub → état de `ci_runs`
 _CONCLUSIONS = {"success": "success", "neutral": "success", "skipped": "success",
@@ -985,13 +990,18 @@ class Watcher:
                      "be seen late" % (repo, status, len(runs), total))
         return runs
 
-    def _listed_on(self, repo: str, branch: str, status: str) -> list[dict]:
-        """#2935 : la liste des exécutions d'une branche (filtre `branch` de
-        l'API), page `LIST_PER_PAGE`, **sans** journal de troncature : seule la
-        plus récente par workflow est lue pour l'état de la base, et elle est
-        en tête de la liste. Une liste tronquée ne cache donc pas la tête."""
-        data = self.api("repos/%s/actions/runs?branch=%s&status=%s&per_page=%d"
-                        % (repo, quote(branch, safe=""), status, LIST_PER_PAGE)) or {}
+    def _listed_on(self, repo: str, branch: str, status: str, *,
+                   page: int = 1) -> list[dict]:
+        """#2935 : une page (`page`, `LIST_PER_PAGE` exécutions) de la liste
+        des exécutions d'une branche (filtre `branch` de l'API).
+
+        #2938 (N1/N2 de la relecture #2935) : la première page ne suffit pas
+        à dire l'état d'une base — plus de cent annulations plus récentes
+        peuvent cacher le dernier `success`/`failure` utile. L'appelant page
+        donc tant qu'il n'a pas le résultat utile de chaque workflow suivi
+        (`_refresh_bases`), sous un plafond (`HEAD_LIST_MAX_PAGES`)."""
+        data = self.api("repos/%s/actions/runs?branch=%s&status=%s&per_page=%d&page=%d"
+                        % (repo, quote(branch, safe=""), status, LIST_PER_PAGE, page)) or {}
         return list(data.get("workflow_runs") or ())
 
     def branch_head(self, repo: str, branch: str) -> str | None:
@@ -1222,32 +1232,64 @@ class Watcher:
         utile ne le cache plus (`latest_concluded` ignore les annulations) ;
         une relance terminée pendant l'arrêt (`run_attempt` plus récent sur
         une ligne déjà connue) est reprise.
+
+        #2938 (N1/N2 cx3) : la liste est paginée jusqu'au dernier résultat
+        utile de chaque workflow suivi — plus de cent annulations plus
+        récentes ne le cachent plus. #2938 (N auditeur) : seules les
+        exécutions **antérieures** à `CATCHUP_WINDOW` sont enregistrées ici ;
+        une exécution récente que le rattrapage n'aurait pas vue doit passer
+        par `_catch_up`, qui courrielle, jamais par ce relevé silencieux.
         """
         from . import plan_github
         st = storage.of(db)
+        now = float(self.clock())
         for branch in bases:
-            try:
-                runs = self._listed_on(repo, branch, "completed")
-            except plan_github.GithubRateLimited:
-                raise
-            except Exception as exc:  # noqa: BLE001 - jamais fatal au relevé
-                self.log("CI %s: head of base %s unreadable (%s)"
-                         % (repo, branch, " ".join(str(exc).split())[:200]))
-                continue
             newest: dict[str, dict] = {}
-            for run in runs:
-                if (run.get("head_branch") or "").casefold() != branch.casefold():
-                    continue
-                workflow = workflow_of(run.get("path"))
-                if workflow not in followed:
-                    continue
-                if _CONCLUSIONS.get(run.get("conclusion") or "", "failure") \
-                        not in ("success", "failure"):
-                    continue  # annulée : elle ne dit pas l'état de la base
-                run_id = int(run["id"])
-                if workflow not in newest or run_id > int(newest[workflow]["id"]):
-                    newest[workflow] = run
+            seen: set[int] = set()
+            page = 1
+            while page <= HEAD_LIST_MAX_PAGES:
+                try:
+                    runs = self._listed_on(repo, branch, "completed", page=page)
+                except plan_github.GithubRateLimited:
+                    raise
+                except Exception as exc:  # noqa: BLE001 - jamais fatal au relevé
+                    self.log("CI %s: head of base %s unreadable (%s)"
+                             % (repo, branch, " ".join(str(exc).split())[:200]))
+                    runs = []
+                    break
+                fresh = 0
+                for run in runs:
+                    run_id = int(run.get("id") or 0)
+                    if not run_id or run_id in seen:
+                        continue
+                    seen.add(run_id)
+                    fresh += 1
+                    if (run.get("head_branch") or "").casefold() != branch.casefold():
+                        continue
+                    workflow = workflow_of(run.get("path"))
+                    if workflow not in followed:
+                        continue
+                    if _CONCLUSIONS.get(run.get("conclusion") or "", "failure") \
+                            not in ("success", "failure"):
+                        continue  # annulée : elle ne dit pas l'état de la base
+                    if workflow not in newest or run_id > int(newest[workflow]["id"]):
+                        newest[workflow] = run
+                # fin de liste, plus rien de neuf (API qui ignore `page`), ou
+                # dernier résultat utile de chaque workflow trouvé
+                if len(runs) < LIST_PER_PAGE \
+                        or all(w in newest for w in followed) or not fresh:
+                    break
+                page += 1
+            if page > HEAD_LIST_MAX_PAGES and not all(w in newest for w in followed) \
+                    and (repo, "head:%s" % branch) not in self._warned_truncated:
+                self._warned_truncated.add((repo, "head:%s" % branch))
+                self.log("CI %s: head list of base %s truncated at %d pages, a "
+                         "useful result may be hidden deeper"
+                         % (repo, branch, HEAD_LIST_MAX_PAGES))
             for run in newest.values():
+                updated = updated_ts(run)
+                if updated is None or now - updated <= CATCHUP_WINDOW:
+                    continue  # récent ou indatable : laissé au rattrapage courriellé
                 row = st.ci.run(repo, int(run["id"]))
                 if row is None:
                     self._record_terminal(st, repo, run, bases)
