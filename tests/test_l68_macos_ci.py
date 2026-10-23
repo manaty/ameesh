@@ -162,6 +162,13 @@ class MacosFullSuiteWorkflowTest(unittest.TestCase):
                       self.job)
         self.assertIn("$(brew --prefix findutils)/libexec/gnubin", self.job)
 
+    def test_the_flock_of_the_staging_lock_is_installed(self):
+        # #3130 : staging.sh prend son verrou d'opérateur unique (#2448) par
+        # `flock -n 9` (util-linux) ; macOS n'a pas cette commande et le banc
+        # du staging sortait en « flock: command not found ».
+        self.assertIn("gnu-sed findutils flock\n", self.job)
+        self.assertIn('echo "$(brew --prefix flock)/bin"', self.job)
+
     def test_the_runner_is_the_standard_x64_image(self):
         self.assertIn("runs-on: macos-26-intel", self.job)
         # La suite complète reste bornée (jusqu'à 3 h 50 mesuré), hors du

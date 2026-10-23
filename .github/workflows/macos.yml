@@ -96,13 +96,17 @@ jobs:
           HOMEBREW_NO_INSTALL_CLEANUP: "1"
         run: |
           set -euo pipefail
-          brew install postgresql@17 bash coreutils gnu-sed findutils
+          # #3130 : `flock` (staging.sh, verrou d'opérateur unique #2448) est
+          # util-linux, absent de macOS ; la formule `flock` fournit la même
+          # commande (flock(2), `-n` sur un descripteur) dans son bin/.
+          brew install postgresql@17 bash coreutils gnu-sed findutils flock
           {
             echo "$(brew --prefix postgresql@17)/bin"
             echo "$(brew --prefix bash)/bin"
             echo "$(brew --prefix coreutils)/libexec/gnubin"
             echo "$(brew --prefix gnu-sed)/libexec/gnubin"
             echo "$(brew --prefix findutils)/libexec/gnubin"
+            echo "$(brew --prefix flock)/bin"
           } >> "$GITHUB_PATH"
       - name: base jetable (PostgreSQL dans une étape, pas un service)
         run: |
