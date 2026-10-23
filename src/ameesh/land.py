@@ -965,6 +965,11 @@ def _land(landing: _Landing, replayer, slug, gh) -> dict:
     if stopped is not None:
         return stopped
     # #194 r4: compare and swap on the freeze (see `local`)
+    # #3080: publish the landing identity before its head can be seen on the
+    # forge. Otherwise fire can observe the push while the row is still
+    # queued, mistake our merge for a third-party push and withdraw the fire.
+    if not landing.write(state="landing", landing_sha=merged["sha"]):
+        return landing.busy("lease on %s lost before pushing" % landing.key)
     branch_ref = "refs/heads/%s" % row["branch"]
     proc = resolutions._run(replayer.path, "push", "--quiet", "--no-verify",
                             "--force-with-lease=%s:%s" % (branch_ref, row["frozen_sha"]),
