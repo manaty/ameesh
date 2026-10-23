@@ -1323,6 +1323,23 @@ def _commit_survives(repo: str, head: str, sha: str, cache: dict,
                         repo, head, sha, path, row, added, base, cache):
                     continue
                 return True
+    if added:
+        # #3220/mesh-design (2) : le blob exact peut avoir changé (contenu
+        # regroupé avec d'autres lignes) ; la post-image d'un retrait retrouvée
+        # d'un seul tenant ailleurs, sans la ligne retirée, prouve sa survie.
+        # #2994/#2614 : un bloc dont un retrait ne satisfait pas la règle de
+        # survie (base de fusion, retrait pur) est écarté.
+        # B1 (cx3/auditeur) : ce contrôle passe **avant** la conclusion des
+        # copies/réordres ; sinon une en-tête héritée dans un doc fait rendre
+        # `False` à la branche `copied` alors qu'un retrait survit.
+        allow = (lambda block_path, block_row:
+                 _removal_proves_survival(
+                     repo, head, sha, block_path, block_row, added, base,
+                     cache))
+        if _removal_block_survives(
+                repo, head, sha, {path for path, _row in removed}, cache,
+                allow=allow):
+            return True
     if copied:
         # #2977 B1/B2 et #3220 B2/B5 (revues cx2) : une copie ne subsiste
         # qu'à son chemin, ou au chemin déplacé du fichier. Une occurrence de
@@ -1403,22 +1420,12 @@ def _commit_survives(repo: str, head: str, sha: str, cache: dict,
         # l'a laissé, s'il subsiste dans la tête.
         reordered = {path for path, row in copied
                      if path in removed_from.get(row.strip(), set())}
-        return any(_hunks_survive(repo, head, sha, path, cache)
-                   for path in sorted(reordered))
-    if added:
-        # #3220/mesh-design (2) : le blob exact peut avoir changé (contenu
-        # regroupé avec d'autres lignes) ; la post-image d'un retrait retrouvée
-        # d'un seul tenant ailleurs, sans la ligne retirée, prouve sa survie.
-        # #2994/#2614 : un bloc dont un retrait ne satisfait pas la règle de
-        # survie (base de fusion, retrait pur) est écarté.
-        allow = (lambda block_path, block_row:
-                 _removal_proves_survival(
-                     repo, head, sha, block_path, block_row, added, base,
-                     cache))
-        if _removal_block_survives(
-                repo, head, sha, {path for path, _row in removed}, cache,
-                allow=allow):
+        if any(_hunks_survive(repo, head, sha, path, cache)
+               for path in sorted(reordered)):
             return True
+        if not added:
+            return False
+    if added:
         # #3220 : les additions propres du commit ont toutes disparu, et aucun
         # retrait ni copie ne subsiste.
         return False
