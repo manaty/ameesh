@@ -470,6 +470,45 @@ class UnitTest(unittest.TestCase):
                                           allowed=lambda who: who == "mesh-design")[1]["by"],
                          "mesh-design")
 
+    def test_pilot_hold_releases_keep_every_lift_for_the_intake_clock(self):
+        """#2916/#1225 : les levées d'un hold de pilote sont rendues au calcul
+        SLO (toutes, pour qu'il filtre par premier `build`, #2921) ; un hold
+        d'un acteur ordinaire ne compte pas, même autorisation que
+        `pilot_holds`."""
+        def event(note, ts, ident, actor="human:pilote", state="intake"):
+            return {"work_item_id": 1, "state": state, "note": note,
+                    "actor": actor, "created_ts": ts, "id": ident}
+
+        events = [event("created", 0.5, 1),
+                  event("hold: attente owner", 1.0, 2),
+                  event("triage: relevé", 2.0, 3),
+                  event("unhold: gestes faits", 3.0, 4),
+                  event("hold: seconde attente", 4.0, 5),
+                  event("unhold: reprise", 5.0, 6)]
+        self.assertEqual(W.pilot_hold_releases(None, events), {1: [3.0, 5.0]})
+        # un hold d'un acteur ordinaire ne compte pas (il ne suspend pas la
+        # stagnation non plus) ; la levée du pilote ne rend pas de date.
+        self.assertEqual(W.pilot_hold_releases(
+            None, [event("hold: op", 1.0, 2, actor="dev7"),
+                   event("unhold: op", 2.0, 3)]), {})
+        # une levée d'un acteur ordinaire ne lève pas le hold de pilote
+        self.assertEqual(W.pilot_hold_releases(
+            None, [event("hold: op", 1.0, 2),
+                   event("unhold: à tort", 2.0, 3, actor="dev7")]), {})
+        # ... mais la levée du pilote qui suit compte
+        self.assertEqual(W.pilot_hold_releases(
+            None, [event("hold: op", 1.0, 2),
+                   event("unhold: à tort", 2.0, 3, actor="dev7"),
+                   event("unhold: feu reçu", 4.0, 5)]), {1: [4.0]})
+        # un changement d'état lève aussi le hold
+        self.assertEqual(W.pilot_hold_releases(
+            None, [event("hold: op", 1.0, 2),
+                   event("prise", 2.0, 3, state="build")]), {1: [2.0]})
+        # l'ordre est celui de l'écriture, pas celui de la liste
+        self.assertEqual(W.pilot_hold_releases(
+            None, [event("unhold: reprise", 3.0, 3),
+                   event("hold: op", 1.0, 2)]), {1: [3.0]})
+
     def test_hold_outranks_a_declared_dependency_and_its_label(self):
         hold = {1: {"what": "hold", "by": "pilote", "since": 1700000000.0}}
         commitment = {"status": "open", "work_item_id": 1, "depends_on": ["#2"]}

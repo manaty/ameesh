@@ -4417,6 +4417,10 @@ class AgentWorker(threading.Thread):
         if getattr(self.runner, "mediated", False):
             # Device relocation is controlled by the mesh server (L109).
             return False
+        # L165 (EP1) : un rôle élu ne se déplace pas par handoff ; un autre
+        # hôte candidat reprend le bail expiré, sans preuve de source.
+        if self.agent.get("releve") == "election":
+            return False
         from . import handoffs, host_lifecycle, storage, work
         try:
             api = storage.of(self.db)
@@ -6302,50 +6306,102 @@ class AgentWorker(threading.Thread):
                 return
         self.stop_group_now(raison, group=False)
 
-    def _resident_result(self, rp, tour, voulu: bool) -> tuple[int, str | None, str | None]:
-        """Code, erreur et session d'un tour résident fini (`voulu` : clos par
-        l'exécuteur, une interruption n'est pas un échec).
+    def _served_message_ids(self, initial_ids=()) -> tuple[str, ...]:
+        """L80b : les messages que ce tour résident a réellement servis.
+
+        Les messages de la consigne (`initial_ids`, ceux du spec) et les
+        remises steer acceptées — même condition que `_solde_steers` : tour
+        achevé et `input_id` présent dans le `TurnResult`. Les uuids de
+        corrélation ne sortent jamais : le grand livre reçoit des identifiants
+        de messages (mail id / human_message id), pas des jetons internes."""
+        from . import resident as resident_mod
+        ids = {str(i) for i in (initial_ids or ()) if i is not None}
+        with self.lock:
+            generation = self._turn_generation
+            pending = list(self._steer_pending)
+        for _jeton, mail_ids, gen, turn, input_id in pending:
+            if gen != generation or turn is None:
+                continue
+            result = getattr(turn, "result", None)
+            if getattr(result, "status", "") != resident_mod.COMPLETED \
+                    or input_id not in (getattr(result, "inputs", ()) or ()):
+                continue
+            ids.update(str(i) for i in (mail_ids or ()) if i is not None)
+        return tuple(sorted(ids))
+
+    def _resident_result(self, rp, tour, voulu: bool,
+                         ) -> tuple[int, str | None, str | None, object | None]:
+        """Code, erreur, session et `TurnResult` d'un tour résident fini
+        (`voulu` : clos par l'exécuteur, une interruption n'est pas un échec).
 
         Le `TurnResult` est aussi la seule source d'usage du tour pour le grand
         livre quand le flux brut ne la porte pas (Codex app-server, ACP) : il
-        est écrit une fois dans `events.jsonl` (L80a), avant la comptabilité.
-        Si le flux refuse l'écriture, l'événement est d'abord confié au
-        marqueur comptable : un worker de remplacement pourra réparer le tour
-        sans dépendre de la mémoire de celui-ci."""
-        from . import resident, resident_runner
+        est écrit une fois dans `events.jsonl` (L80a), après la barrière steer
+        de `_resident_turn_end` et avant la comptabilité — par
+        `_resident_usage_final`, qui rend le `TurnResult` pour que sa mesure et
+        ses entrées soient lues au même point de clôture."""
+        from . import resident
         if tour is None:
-            return 1, None, rp.session  # pas lancé : l'erreur est déjà notée
+            return 1, None, rp.session, None  # pas lancé : l'erreur est déjà notée
         fin = tour.wait(RESIDENT_END_WAIT_S)
         if fin is None:
-            return 1, "resident turn did not end", rp.session
+            return 1, "resident turn did not end", rp.session, None
         # L81 (étude §6.1) : la mesure continue d'un tour résident — contexte
         # courant, fenêtre, relu du tour et relu cumulé de la session.
         rp.record_turn(fin)
         self._resident_reread_keep(rp)
-        evenement = resident_runner.usage_event(
-            rp.driver.protocol, fin, turn=self._turn_id or "")
         session = fin.session or rp.session
-        if evenement is not None and not resident_runner.write_usage_event(
-                self._path("events.jsonl"), evenement):
-            # L80a B2 : la mesure passe d'abord dans le marqueur comptable
-            # (durable) ; à défaut elle reste en mémoire pour ce worker. Le
-            # tour n'est pas comptablement complet et le marqueur ne sera pas
-            # soldé tant que le flux ne porte pas la mesure.
-            travail = getattr(self, "_compta_travail", None)
-            if self._resident_usage_marker(evenement, travail):
-                if travail is not None:
-                    self._compta_travail = dict(travail, resident_usage=evenement)
-            else:
-                self._resident_usage_pending.append(evenement)
-                self._compta_en_echec = True
-            return 1, "resident usage event not written", session
         if fin.status == resident.COMPLETED:
-            self._resident_failures = 0     # T2 : la série d'échecs est close
-            return 0, None, session
+            # N1 (#288) : la série est close par `_resident_usage_final`, une
+            # fois la mesure écrite — pas ici, avant l'écriture.
+            return 0, None, session, fin
         if fin.status == resident.INTERRUPTED:
-            return ((0, None, session) if voulu
-                    else (1, "resident turn interrupted", session))
-        return 1, fin.error or "resident turn failed", session
+            return ((0, None, session, fin) if voulu
+                    else (1, "resident turn interrupted", session, fin))
+        return 1, fin.error or "resident turn failed", session, fin
+
+    def _resident_usage_final(self, rp, fin, served_ids=()) -> tuple[bool, str | None]:
+        """Écrit la mesure et les entrées du tour résident (L80a/L80b).
+
+        Appelé **après** `_resident_turn_end`, dont la barrière `_steer_lock`
+        ferme la génération : un ACK de steer accepté pendant la clôture est
+        alors dans `_steer_pending`, donc compté dans les messages servis
+        (L80b B2). Les protocoles à usage natif (Claude) n'écrivent pas de
+        `resident.turn` ; leurs entrées partent dans `resident.inputs`, dont
+        l'échec ne fait jamais échouer le tour (le coût est déjà dans le flux).
+        """
+        from . import resident, resident_runner
+        inputs = self._served_message_ids(served_ids)
+        evenement = resident_runner.usage_event(
+            rp.driver.protocol, fin, turn=self._turn_id or "", inputs=inputs)
+        if evenement is not None:
+            if not resident_runner.write_usage_event(
+                    self._path("events.jsonl"), evenement):
+                # L80a B2 : la mesure passe d'abord dans le marqueur comptable
+                # (durable) ; à défaut elle reste en mémoire pour ce worker. Le
+                # tour n'est pas comptablement complet et le marqueur ne sera
+                # pas soldé tant que le flux ne porte pas la mesure.
+                travail = getattr(self, "_compta_travail", None)
+                if self._resident_usage_marker(evenement, travail):
+                    if travail is not None:
+                        self._compta_travail = dict(travail, resident_usage=evenement)
+                else:
+                    self._resident_usage_pending.append(evenement)
+                    self._compta_en_echec = True
+                return False, "resident usage event not written"
+        else:
+            attribution = resident_runner.inputs_event(
+                rp.driver.protocol, fin, turn=self._turn_id or "", inputs=inputs)
+            if attribution is not None and not resident_runner.write_usage_event(
+                    self._path("events.jsonl"), attribution):
+                log_async("[%s] resident inputs event not written: message "
+                          "attribution lost for this turn" % self.name)
+        # N1 (#288) : la série d'échecs n'est close qu'une fois la mesure
+        # ÉCRITE ; un échec d'écriture garde la série (avant, `_resident_result`
+        # la remettait à zéro avant même de tenter l'écriture).
+        if getattr(fin, "status", "") == resident.COMPLETED:
+            self._resident_failures = 0
+        return True, None
 
     def _resident_turn_end(self, rp) -> None:
         """Fin d'un tour résident : dépublié ; le processus reste pour le tour
@@ -6975,6 +7031,8 @@ class AgentWorker(threading.Thread):
             account=compte.name if compte is not None else None, cwd=cwd, env=env)
         rp = None
         tour_resident = None
+        #: L80b : le `TurnResult` du tour résident, écrit après la barrière steer
+        fin_resident = None
         #: #210 : l'empreinte du jeton qui part avec le tour, lue au lancement —
         #: le propriétaire peut se reconnecter sur un autre jeton pendant le tour
         empreinte = sentinel.launch_fingerprint(harness, compte, env)
@@ -7258,8 +7316,9 @@ class AgentWorker(threading.Thread):
                             background_handles[pid] = handle
                 result_code = proc.wait()
             else:
-                result_code, erreur_resident, session_resident = self._resident_result(
-                    rp, tour_resident, clos or self.host_yield is not None)
+                result_code, erreur_resident, session_resident, fin_resident = \
+                    self._resident_result(
+                        rp, tour_resident, clos or self.host_yield is not None)
                 error = error or erreur_resident
                 # L80a : un tour résident Codex/ACP n'annonce sa session que
                 # dans son `TurnResult` (le flux brut est du JSON-RPC) ; sans
@@ -7283,6 +7342,15 @@ class AgentWorker(threading.Thread):
             pgid = self.pgid
             if rp is not None:
                 self._resident_turn_end(rp)
+                # L80b B2 : la mesure et les entrées se lisent APRÈS la
+                # barrière steer de `_resident_turn_end` — un ACK accepté
+                # pendant la clôture du tour compte dans ce tour.
+                if fin_resident is not None:
+                    ecrit, erreur_flux = self._resident_usage_final(
+                        rp, fin_resident, spec.get("ids") or ())
+                    if not ecrit:
+                        error = error or erreur_flux
+                        result_code = result_code or 1
             # L498 : les descripteurs du READY ne survivent pas au tour (le
             # descripteur d'écriture est déjà fermé après le Popen).
             if ready_r is not None:
@@ -7883,6 +7951,36 @@ class AgentWorker(threading.Thread):
             return {"error": "unreadable stream: %s" % exc}
 
     # -- boucles -----------------------------------------------------------
+    #: L165 (EP2) : fréquence de vérification d'une bascule planifiée
+    HANDOVER_CHECK_S = 60.0
+
+    def _election_handover(self) -> dict | None:
+        """Une bascule planifiée est-elle due à cette fin de tour ? (EP2)
+
+        Lit la ligne fraîche du registre (l'échéance du bail y est renouvelée)
+        et laisse `election.handover_due` juger l'hystérésis : un challenger
+        resté ≥ 5 points de disponibilité au-dessus du détenteur pendant une
+        heure. Le retour est le challenger et la durée de la supériorité.
+        """
+        if (self.agent or {}).get("releve") != "election":
+            return None
+        now = _clock_of(self).monotonic()
+        if now < getattr(self, "_handover_next", 0.0):
+            return None
+        self._handover_next = now + self.HANDOVER_CHECK_S
+        from . import election
+        try:
+            row = registry.get(self.db, self.name)
+            if row is None:
+                return None
+            return election.handover_due(self.db, row, self.runner.host)
+        except db_mod.DbError as exc:
+            message = "elected-role handover not evaluated (%s)" % db_mod.explain(exc)
+            if message != getattr(self, "_handover_error", None):
+                log_async(message)
+            self._handover_error = message
+            return None
+
     def ensure_peek(self) -> None:
         if getattr(self, "_peek_publisher", None) is None:
             from .agent_peek import Publisher
@@ -7963,6 +8061,27 @@ class AgentWorker(threading.Thread):
                         break
                     self.apply_restart_if_requested()
                     self.maybe_rotate()
+                    # L165 (EP2) : bascule planifiée — le détenteur rend le bail
+                    # en fin de tour, le challenger le réclame à son rang.
+                    handover = self._election_handover()
+                    if handover:
+                        log("[%s] elected role: %s has stayed %.1f availability points "
+                            "ahead for %d min; lease released at end of turn"
+                            % (self.name, handover["challenger"], handover["gap"],
+                               max(1, int(handover["seconds"] // 60))))
+                        self._fil_note(
+                            "Elected role handed over to %s: it has stayed %.1f "
+                            "availability points ahead for %d min (planned switch at "
+                            "the end of this holder's turn)."
+                            % (handover["challenger"], handover["gap"],
+                               max(1, int(handover["seconds"] // 60))),
+                            meta={"action": "election-handover",
+                                  "challenger": handover["challenger"],
+                                  "ahead_s": round(handover["seconds"], 1)})
+                        self.runner.note_handover_release(
+                            self.name, handover["challenger"],
+                            float(handover.get("delay_s") or 0.0))
+                        break
                     # #1270 B1 : l'échéance de reprise durable garde le
                     # lancement du tour ; un courrier, un reset ou le budget
                     # ne la court-circuitent pas — l'attente consomme les
@@ -8122,6 +8241,19 @@ class Runner:
         #: `ameesh alerts` et `ameesh notify` (`exploitation.balance_thresholds`).
         self.take_balance = dict(take_balance or {})
         self._take_next = 0.0
+        #: L165 (EP2) : publication périodique des scores de candidats de cet
+        #: hôte (rôles `releve: election`), élagage de leur historique, et
+        #: instant (monotone) du premier bail libre vu par rôle pour le délai
+        #: par rang. Aucune écriture hors de `role_evaluation_once`.
+        self._role_eval_next = 0.0
+        self._role_prune_next = 0.0
+        self._role_error: str | None = None
+        self._election_free_since: dict[str, float] = {}
+        #: L165 (EP2) : `{rôle: (échéance monotone, challenger)}` — un détenteur
+        #: qui a rendu le bail pour une bascule planifiée ne le reprend qu'au-delà
+        #: du délai de rang du challenger plus une marge, sinon un challenger
+        #: mort laisserait le rôle libre pour toujours.
+        self._handover_released: dict[str, tuple[float, str]] = {}
         # #1467: explicit qualified passages only; no live policy selected here.
         self.train_passages = tuple(train_passages)
         # #2446: the exclusive service lease assembled from `train.host`.
@@ -8472,6 +8604,102 @@ class Runner:
         for agent in registry.claimable(self.db, self.host, self.agents_filter):
             self._note_unleased(agent, reason)
 
+    # -- rôles élus (L165, EP2) -------------------------------------------
+    #: fréquence de publication des scores de candidats de cet hôte
+    ROLE_EVAL_INTERVAL_S = 60.0
+    #: l'hystérésis lit une heure ; l'historique garde deux jours
+    ROLE_PRUNE_EVERY_S = 6 * 3600.0
+
+    def role_evaluation_once(self) -> int | None:
+        """Publie le score de cet hôte pour chaque rôle élu dont il est candidat.
+
+        Une ligne par rôle et par minute (`role_standings`), lue par les autres
+        hôtes et par `ameesh role status`. Silencieux en exécuteur médié (les
+        comptes et le budget sont sur le serveur) et en `--dry-run` (aucune
+        écriture). Seule la partie LOCALE est publiée (harnais, compte,
+        budget) : la porte, le canon, le placement et la fraîcheur sont
+        recalculés par le lecteur depuis la base.
+        """
+        if self.dry_run or getattr(self, "mediated", False):
+            return None
+        now = self.clock.monotonic()
+        if self._role_eval_next and now < self._role_eval_next:
+            return None
+        self._role_eval_next = now + self.ROLE_EVAL_INTERVAL_S
+        from . import election, role_standings_pg as pg
+        try:
+            published = election.publish_self(self.cfg, self.db, self.host)
+            self._role_error = None
+        except Exception as exc:  # un score de rôle ne fait jamais tomber l'exécuteur
+            message = "role standings not published (%s)" % db_mod.brief(exc)
+            if message != self._role_error:
+                log_async(message)
+            self._role_error = message
+            return None
+        if published and now >= self._role_prune_next:
+            self._role_prune_next = now + self.ROLE_PRUNE_EVERY_S
+            try:
+                pg.prune(self.db)
+            except db_mod.DbError as exc:
+                log_async("role standings not pruned (%s)" % db_mod.explain(exc))
+        return published
+
+    def note_handover_release(self, name: str, challenger: str,
+                              delay_s: float = 0.0) -> None:
+        """L165 (EP2) : ce détenteur vient de rendre le rôle pour une bascule.
+
+        Le challenger est le mieux classé : il tente le CAS tout de suite. Si
+        son exécuteur est mort, l'ancien détenteur ne reprend qu'après
+        `délai de rang du challenger + HANDOVER_RECLAIM_MARGIN_S`.
+        """
+        from . import election
+        self._handover_released[name] = (
+            self.clock.monotonic()
+            + max(0.0, float(delay_s)) + election.HANDOVER_RECLAIM_MARGIN_S,
+            challenger)
+
+    def handover_wait_s(self, name: str, now: float | None = None) -> float:
+        """Temps restant avant que ce détenteur puisse reprendre un rôle rendu."""
+        now = self.clock.monotonic() if now is None else float(now)
+        mark = self._handover_released.get(name)
+        if mark is None:
+            return 0.0
+        deadline, _challenger = mark
+        if now >= deadline:
+            del self._handover_released[name]
+            return 0.0
+        return deadline - now
+
+    def election_claim_allowed(self, agent: dict) -> tuple[bool, str, dict | None]:
+        """L165 (EP2) : ce rôle élu peut-il être tenté maintenant, à son rang ?
+
+        `free_since` est l'instant monotone où CETTE passe a vu le bail libre
+        pour la première fois ; le délai vaut `rang × 20 s`. Un hôte sans
+        relevé frais, non prêt, ou illisible ne tente pas : le CAS refuserait
+        de toute façon, mais il ne doit pas prendre la place d'un candidat prêt.
+        """
+        if self.dry_run or getattr(self, "mediated", False):
+            return True, "", None
+        from . import election
+        name = agent["name"]
+        now = self.clock.monotonic()
+        released = self._handover_released.get(name)
+        if released is not None:
+            left = self.handover_wait_s(name, now)
+            if left > 0:
+                return (False,
+                        "handover: waits %ds for %s" % (int(left) + 1, released[1]),
+                        None)
+        since = self._election_free_since.setdefault(name, now)
+        try:
+            return election.claim_wait(self.db, agent, self.host, since, now=now)
+        except Exception as exc:  # idem : fail closed, jamais un tour sans rang
+            message = "role standings unreadable (%s)" % db_mod.brief(exc)
+            if message != self._role_error:
+                log_async(message)
+            self._role_error = message
+            return False, "not ready: " + message, None
+
     def _start_host_gate(self) -> None:
         with self._host_gate_lock:
             self._gate_running = True
@@ -8807,6 +9035,7 @@ class Runner:
 
     def sweep(self) -> None:
         self.report_liveness()
+        self.role_evaluation_once()  # L165 (EP2) : score des candidats de l'hôte
         self.expire_delegations_once()
         for row in registry.reap(self.db, self.host):
             log("lease expired: %s (owner %s)" % (row["name"], row.get("lease_owner")))
@@ -8860,9 +9089,19 @@ class Runner:
             except Exception as exc:
                 log_async("auto-take pass failed (%s): %s; runner continues"
                           % (type(exc).__name__, db_mod.brief(exc)))
-        for agent in registry.claimable(self.db, self.host, self.agents_filter):
+        candidates = registry.claimable(self.db, self.host, self.agents_filter)
+        for agent in candidates:
             with self.lock:
                 if not self.once and agent["name"] in self.workers:
+                    continue
+            # L165 (EP2) : un rôle élu attend son rang avant de tenter le CAS ;
+            # le bail (EP1) reste le seul arbitre, ce délai n'est que la
+            # politesse qui laisse le meilleur candidat passer d'abord.
+            if agent.get("releve") == "election":
+                allowed, reason, _standing = self.election_claim_allowed(agent)
+                if not allowed:
+                    if reason.startswith("not ready"):
+                        self._note_unleased(agent, "election: " + reason)
                     continue
             admitted, slot = self._gate_slot(agent) if self.host_gate is not None \
                 else (True, None)
@@ -8891,10 +9130,17 @@ class Runner:
             try:
                 if getattr(self, "_host_gate_rejected", ""):
                     self._note_unleased(agent, self._host_gate_rejected)
-                lease = registry.claim(self.db, agent["name"], self.runner_id, self.lease_ttl)
+                lease = registry.claim(self.db, agent["name"], self.runner_id,
+                                       self.lease_ttl, host=self.host)
                 if not lease:
                     self._release_slot(agent["name"])
                     continue  # un autre exécuteur a gagné la course
+                self._election_free_since.pop(agent["name"], None)
+                # L165 (EP1) : un rôle élu peut être réclamé depuis cet hôte
+                # alors que sa ligne était chez un autre candidat ; le worker
+                # doit lire l'hôte et le dossier effectivement acquis.
+                agent = dict(agent, host=lease.get("host") or self.host,
+                             cwd=lease.get("cwd", agent.get("cwd")))
                 log("lease acquired: %s (epoch %s, host %s)"
                     % (agent["name"], lease["lease_epoch"], self.host))
                 worker = AgentWorker(self, agent, lease)
@@ -8949,6 +9195,21 @@ class Runner:
                 if not registered:
                     self._release_slot(agent["name"])
                 raise
+
+        # L165 (EP2) : un rôle qui n'est plus libre (bail repris ailleurs)
+        # repart de zéro au prochain bail libre : le délai par rang se compte
+        # depuis la première observation de CETTE liberté.
+        free = {agent["name"] for agent in candidates
+                if agent.get("releve") == "election"
+                and agent["name"] in self._election_free_since}
+        for name in list(self._election_free_since):
+            if name not in free:
+                del self._election_free_since[name]
+        # `_handover_released` n'est PAS purgé ici : le worker pose la marque
+        # juste avant de rendre le bail (`finally`), donc un balayage
+        # concurrent verrait encore le bail vivant, conclurait « pas libre »
+        # et effacerait la marge de reprise. La marque s'efface d'elle-même
+        # à l'échéance dans `handover_wait_s` ; une entrée périmée est inerte.
 
     #: `--once` : intervalle des nouveaux essais d'un bail non rendu
     RELEASE_RETRY_S = 5.0
@@ -9758,7 +10019,8 @@ class Runner:
         try:
             api = storage.of(db).host_lifecycle
             api.detect_losses(actor=self.runner_id,
-                              older_than=max(180, int(self.cfg.resource_interval * 3)),
+                              older_than=int(host_lifecycle.staleness_s(
+                                  self.cfg.resource_interval)),
                               critical=host_lifecycle.critical_names(self.cfg, db))
             api.expire_returns()
             for control in api.listing():

@@ -170,7 +170,9 @@ DECLARATIVE = ("harness", "host", "cwd", "model", "budget_usd", "responsible", "
                # L244 (#420) : les rôles déclarés d'une fiche Agent/Persona,
                # persistés pour le garde SQL du rôle QA. Le vocabulaire est
                # celui des fiches (L242c, #414) ; aucune criticité n'est écrite.
-               "roles")
+               "roles",
+               # L165 (EP1) : relève (`hote`/`election`) et hôtes candidats
+               "releve", "candidats")
 
 #: statuts de `canon_state` (0008)
 CANON_OK = "ok"
@@ -1276,6 +1278,42 @@ def _set_placement(db: Db, name: str, host: str, verdict: placement_mod.Verdict)
                                        profile=verdict.profile)
 
 
+def _write_candidate(db: Db, canon: Canon, agent, admission, host: str, *,
+                     canon_key: str, forge=None) -> None:
+    """L165 (EP1) : verdict de placement de `agent` sur l'hôte candidat `host`.
+
+    Le verdict est évalué comme celui de l'hôte courant (politique de l'hôte
+    et règle de visibilité), mais écrit dans `agent_candidates` : c'est lui
+    que la réclamation depuis `host` compare. Ne déplace jamais la ligne.
+    """
+    verdict = placement_mod.evaluate(canon, agent.title, host)
+    visibility_mod.annotate(canon, agent, host, verdict, db=db, forge=forge)
+    cwd, _ = canon_mod.work_dir_for(canon.host(host), agent, admission)
+    storage.of(db).canon.write_candidate(
+        agent.title, host, canon=canon_key,
+        cwd=os.path.expanduser(cwd) if cwd else None,
+        ok=verdict.ok, diagnostic=verdict.diagnostic, ref=verdict.ref,
+        harness=agent.harness or "other", provider=agent.provider,
+        model=agent.model,
+        credential_mode=admission.credential_mode or agent.credential_mode)
+
+
+def _card_error_text(errors) -> str:
+    """Texte court et stable d'une erreur de fiche Agent (codes, sans contenu)."""
+    return "agent card invalid: " + "; ".join(sorted({f.code for f in errors}))
+
+
+def _close_card_candidates(db: Db, name: str, canon_key: str, errors) -> None:
+    """L165 (EP1) : une fiche Agent fautive ferme TOUS ses candidats.
+
+    L'erreur est portée par la fiche (responsable non résolu, candidat non
+    admis, relève illisible), donc elle vaut sur chaque hôte : le verdict
+    local d'un candidat ne suffit pas à rouvrir la réclamation depuis un autre.
+    """
+    storage.of(db).canon.close_candidates(
+        name, canon=canon_key, diagnostic=_card_error_text(errors))
+
+
 def _lineage_root(by_name: dict[str, dict], creator: str | None) -> tuple[dict | None, str]:
     """Créateur racine d'un éphémère, suivi comme `registry.canon_governed_sql`.
 
@@ -1435,6 +1473,9 @@ def sync(db: Db, canon: Canon, host: str, findings: list[Finding] | None = None,
     #: sa fiche Host). La réclamation est déjà fermée par `canon_state` : une
     #: telle erreur ne doit pas détruire le dernier responsable résolu.
     host_wide = bool(block.global_errors or block.by_host.get(host))
+    #: L165 : membres réellement lus, pour ne jamais retirer un rôle élu sur
+    #: la foi d'une lecture locale incomplète (clone ou membre fédéré absent).
+    loaded = canon.loaded_members()
     actions: list[SyncAction] = []
 
     # L31 (0029) : une fiche `Placement` est une ADMISSION (hôtes nommés ou
@@ -1452,7 +1493,46 @@ def sync(db: Db, canon: Canon, host: str, findings: list[Finding] | None = None,
         if admis:
             other_admitted[agent.title] = [h for h in admis if h != host]
 
-    rows = _rows(db, host, sorted(set(admitted_here) | set(other_admitted)))
+    # L165 (EP1) : la relève et les candidats sont déclaratifs, comme le
+    # placement. Écrits avant la lecture pour que `_same` voie la fiche du
+    # jour ; `set_election` ne déplace jamais l'agent et retire les verdicts
+    # des hôtes qui ne sont plus candidats.
+    canon_key = "" if canon.is_default else ident
+    for declared in canon.agents:
+        storage.of(db).canon.set_election(
+            declared.title, declared.releve, declared.candidats, canon=canon_key)
+    # L165 (EP1) : un agent élu peut avoir sa ligne chez un AUTRE candidat.
+    # Le sync de cet hôte doit quand même voir les fiches retirées (pour
+    # fermer leur candidature) et les candidats qui ne sont plus admis ici.
+    stale_candidates = storage.of(db).canon.candidate_names(host, canon_key)
+    removed_candidates = sorted(name for name in stale_candidates
+                                if canon.agent(name) is None)
+    for stale in stale_candidates:
+        if stale in admitted_here:
+            continue
+        declared = canon.agent(stale)
+        known = registry.get(db, stale)
+        cross = known is not None and (known.get("host") or host) != host
+        if cross and (block.global_errors
+                      or _member_of(known.get("canon_ref")) not in loaded):
+            # Lecture locale incomplète : ne pas retirer le rôle au détenteur
+            # sain ; son propre sync (ou une lecture complète) jugera.
+            continue
+        if declared is None:
+            # Fiche retirée : fermer la candidature tout de suite, même si la
+            # ligne appartient désormais à un autre canon ; la boucle de
+            # retrait arrête ensuite l'agent sur l'hôte de sa ligne.
+            storage.of(db).canon.set_election(stale, "hote", None, canon=canon_key)
+            continue
+        errors = block.by_agent.get(stale, ())
+        if errors:
+            _close_card_candidates(db, stale, canon_key, errors)
+            if known is not None and mine(known):
+                _clear_responsible(db, stale, known.get("host") or host, owner)
+        else:
+            storage.of(db).canon.clear_candidate(stale, host, canon=canon_key)
+    rows = _rows(db, host, sorted(set(admitted_here) | set(other_admitted)
+                                  | set(removed_candidates)))
 
     #: #538 : les agents réellement gouvernés par CE canon sur CET hôte — les
     #: seuls destinataires d'une poussée de règles (jamais un agent écarté pour
@@ -1483,10 +1563,29 @@ def sync(db: Db, canon: Canon, host: str, findings: list[Finding] | None = None,
                 member=agent.fiche.member, agent=name, untrusted=canon.untrusted))
             actions.append(SyncAction(name, "conflit", message, [NAME_CONFLICT]))
             continue
+        # L165 (EP1) : sur un hôte candidat, le verdict de placement de CET
+        # hôte est écrit même si la ligne est encore chez un autre candidat :
+        # c'est lui qui autorisera la réclamation depuis ici.
+        candidate = agent.releve == "election" and host in (agent.candidats or [])
+        card_errors = list(block.by_agent.get(name, ()))
         # Hôte courant admis et différent de celui qu'on synchronise : on ne
-        # touche à rien, l'exécution reste où elle est (0029).
+        # touche à rien, l'exécution reste où elle est (0029). Une fiche en
+        # erreur ferme néanmoins TOUS les candidats (L165), et son responsable
+        # périmé est vidé même si la ligne est chez un autre détenteur.
         if row is not None and row.get("host") not in (None, host) \
                 and row.get("host") in other_admitted.get(name, []):
+            election_card = agent.releve == "election" and bool(card_errors)
+            if candidate or election_card:
+                if block.global_errors:
+                    # Lecture locale incomplète : le sync du détenteur jugera.
+                    pass
+                elif card_errors:
+                    _close_card_candidates(db, name, canon_key, card_errors)
+                    if mine(row):
+                        _clear_responsible(db, name, row.get("host") or host, owner)
+                else:
+                    _write_candidate(db, canon, agent, admission, host,
+                                     canon_key=canon_key, forge=forge)
             actions.append(SyncAction(
                 name, "laissé",
                 "running on %s, an admitted host: \"canon sync\" does not move it"
@@ -1513,6 +1612,12 @@ def sync(db: Db, canon: Canon, host: str, findings: list[Finding] | None = None,
         # (fail closed ; sans dépôt de mémoire, sans objet).
         visibility_ok, visibility_diag = visibility_mod.annotate(
             canon, agent, host, verdict, db=db, forge=forge)
+        if candidate and card_errors:
+            # L165 : le verdict de placement local ne valide pas la fiche.
+            _close_card_candidates(db, name, canon_key, card_errors)
+            verdict.ok = False
+            verdict.diagnostic = _card_error_text(card_errors) + (
+                "; " + verdict.diagnostic if verdict.diagnostic else "")
         # Dossier de travail (L31, 0029 ; L35) : politique de l'hôte d'abord
         # (`work_dirs[agent]`, `work_roots[projet]`, `work_root`), repli
         # transitoire sur le `cwd` d'une ancienne fiche Placement, noté ici.
@@ -1566,6 +1671,11 @@ def sync(db: Db, canon: Canon, host: str, findings: list[Finding] | None = None,
             "placement_ok": verdict.ok,
             "placement_diagnostic": verdict.diagnostic,
             "placement_ref": verdict.ref,
+            # L165 (EP1) : relève et hôtes candidats, déclaratifs comme le
+            # placement ; un agent `hote` n'a pas de liste (NULL).
+            "releve": agent.releve,
+            "candidats": (list(agent.candidats) if agent.candidats is not None
+                          else None),
             # L42 (0031) : canon déclarant (NULL pour le canon par défaut)
             "canon": None if canon.is_default else ident,
             # Reject writes based on a pre-handoff read, including after the
@@ -1591,6 +1701,9 @@ def sync(db: Db, canon: Canon, host: str, findings: list[Finding] | None = None,
                 actions.append(SyncAction(name, "différé", message, [SYNC_INCOMPLETE]))
                 continue
             action = SyncAction(name, "créé" if row is None else "mis à jour")
+        if candidate and not card_errors:
+            _write_candidate(db, canon, agent, admission, host,
+                             canon_key=canon_key, forge=forge)
         action.placement = verdict
         if reasons:
             action.blocked = reasons
@@ -1606,15 +1719,22 @@ def sync(db: Db, canon: Canon, host: str, findings: list[Finding] | None = None,
         elif row is not None and (row.get("status_text") or "").startswith(PENDING_MARK):
             storage.of(db).canon.clear_pending_stop(name, PENDING_MARK)
 
-    loaded = canon.loaded_members()
     for name, row in sorted(rows.items()):
-        if name in admitted_here or row.get("host") != host:
+        if name in admitted_here:
+            continue
+        target = row.get("host") or host
+        cross = target != host
+        if cross and name not in removed_candidates:
             continue
         if row.get("ephemeral") or not row.get("canon_ref"):
             continue  # éphémère, ou jamais venu du canon : sync ne le gouverne pas
         if not mine(row):
             continue  # L42 : ligne d'un autre canon, jamais touchée
         member = _member_of(row.get("canon_ref"))
+        if cross and (block.global_errors or member not in loaded):
+            # Lecture locale incomplète : le sync du détenteur jugera, on ne
+            # touche ni son responsable ni son placement ni son bail.
+            continue
         unverifiable = ("member %s not read" % member if member not in loaded
                         else "invalid canon" if block.global_errors else "")
         if unverifiable:
@@ -1625,11 +1745,11 @@ def sync(db: Db, canon: Canon, host: str, findings: list[Finding] | None = None,
             # invalide garde le dernier responsable résolu (keep last_good) —
             # `canon_state` ferme déjà la réclamation.
             if member not in loaded:
-                _clear_responsible(db, name, host, owner)
+                _clear_responsible(db, name, target, owner)
             verdict = placement_mod.Verdict(
-                name, host, False, "unverifiable placement: %s" % unverifiable,
+                name, target, False, "unverifiable placement: %s" % unverifiable,
                 row.get("placement_ref"))
-            _set_placement(db, name, host, verdict)
+            _set_placement(db, name, target, verdict)
             actions.append(SyncAction(
                 name, "laissé", "%s: removal deferred, not claimable" % unverifiable,
                 block.reasons(name) if block.global_errors else [], verdict))
@@ -1654,12 +1774,20 @@ def sync(db: Db, canon: Canon, host: str, findings: list[Finding] | None = None,
         why = "no longer admitted" if canon.agent(name) is not None else "sheet missing"
         # Sans admission sur cet hôte, plus réclamable ici, quel que soit son
         # statut (fin de tour comprise) : écrit avant l'arrêt, colonnes
-        # déclaratives seulement.
-        verdict = placement_mod.evaluate(canon, name, host)
-        _set_placement(db, name, host, verdict)
+        # déclaratives seulement. Un rôle élu retiré du canon ne garde pas de
+        # candidats.
+        storage.of(db).canon.set_election(name, "hote", None, canon=canon_key)
+        verdict = placement_mod.evaluate(canon, name, target)
+        _set_placement(db, name, target, verdict)
+        if cross:
+            # Fiche absente constatée depuis un autre candidat : le
+            # responsable n'est plus confirmé, et le retrait n'est appliqué
+            # que si le bail n'a pas changé depuis la lecture (guard epoch).
+            _clear_responsible(db, name, target, owner)
         stopped = storage.of(db).canon.stop_removed(
-            name, host, pending_text="%s (%s)" % (PENDING_MARK, why),
-            stop_text="%s (%s)" % (STOP_MARK, why), owner=owner)
+            name, target, pending_text="%s (%s)" % (PENDING_MARK, why),
+            stop_text="%s (%s)" % (STOP_MARK, why), owner=owner,
+            expected_lease_epoch=row.get("lease_epoch") if cross else None)
         if stopped is None:
             continue
         if stopped["status"] == "stopped":

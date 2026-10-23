@@ -146,6 +146,12 @@ FERMEES = {
     # interne borné au tour (réparation d'un worker mort), pas un état de
     # supervision ; colonne fermée aux deux rôles, aucun GRANT modifié.
     "spend_pending": {"resident_usage"},
+    # L165 (EP1, 0473) : verdicts de placement par hôte candidat, lus par la
+    # condition de réclamation et non par le rôle superviseur ; table interne
+    # fermée aux deux rôles, aucun GRANT ajouté.
+    "agent_candidates": {"name", "host", "canon", "cwd", "placement_ok",
+                         "placement_diagnostic", "placement_ref",
+                         "placement_profile", "updated_at"},
     # #2443 (0465) : appartenance d'une unité à un paquet, écrite à la
     # composition (porteur, commit de composition, gel effectif). État interne
     # lu par `work show` et `sync-merges` ; fermé aux deux rôles superviseur,
@@ -159,6 +165,11 @@ FERMEES = {
     "github_watch_cursors": {"project", "repo", "scanned_through"},
     "github_watch_events": {"project", "repo", "kind", "object_id", "digest"},
     "github_watch_scans": {"project", "repo", "progress"},
+    # #288 (L80b, 0472) : attribution des messages servis par un tour résident
+    # (`turn_costs.inputs`), consommée par le rapport local
+    # `ameesh cost turns --message` ; le contrat des rôles superviseur reste
+    # inchangé : colonne fermée aux deux rôles, aucun GRANT modifié.
+    "turn_costs": {"inputs"},
 }
 #: L232b (0417) : l'état interne du contrôleur de release reste hors contrat,
 #: sauf `host_release_fences.host`, lu par `ameesh_host_gate_state` (l.314).

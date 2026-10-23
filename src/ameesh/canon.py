@@ -772,6 +772,7 @@ class Finding:
     member: str = ""        # membre de la fédération
     agent: str = ""         # agent concerné (une erreur bloque cet agent)
     host: str = ""          # hôte concerné (une erreur bloque ses agents)
+    candidate: str = ""     # L165 : agent élu, sur CET hôte candidat seulement
     untrusted: bool = False  # lu hors source approuvée
     package: str = ""       # fiche WorkPackage concernée (ne bloque aucun agent)
     process: str = ""       # fiche Process concernée (ne bloque aucun agent)
@@ -783,6 +784,8 @@ class Finding:
             out["agent"] = self.agent
         if self.host:
             out["host"] = self.host
+        if self.candidate:
+            out["candidate"] = self.candidate
         if self.package:
             out["package"] = self.package
         if self.process:
@@ -886,6 +889,13 @@ class Agent:
     projects: list[str] | None = None
     #: L243b: alternative spellings of this identity, not new agents.
     aliases: list[str] | None = None
+    #: L165 (EP1): how the role is held. `hote` (default) pins the agent to
+    #: its placement host; `election` lets any candidate host claim the lease.
+    releve: str = "hote"
+    #: L165 (EP1): candidate hosts of an elected role. Every one is admitted
+    #: by the agent's Placement card, so a claim can only happen on a host
+    #: whose current placement verdict admits the agent.
+    candidats: list[str] | None = None
 
     @property
     def is_persona(self) -> bool:
@@ -1886,6 +1896,25 @@ def parse_scope(value: Any) -> tuple[list[str] | None, str | None]:
     return out, None
 
 
+def process_path_ok(relpath: str, scope: Iterable[str] | None = None) -> bool:
+    """#538, #2973 : le chemin (relatif au bundle) d'une fiche Process est-il
+    celui d'une règle ? `processus/…` à la racine du bundle, ou
+    `<dossier>/processus/…` quand `<dossier>` est un dossier déclaré du
+    périmètre ameesh du membre (la fédération roote le membre à `.` et lit le
+    périmètre comme un filtre) ; jamais un autre dossier."""
+    chemin = relpath.replace("\\", "/").split("/")
+    if len(chemin) >= 2 and chemin[0] == PROCESS_DIR:
+        return True
+    for dossier in scope or ():
+        if not dossier:
+            continue                # `.` : la racine, déjà jugée
+        parts = dossier.split("/")
+        reste = chemin[len(parts):]
+        if chemin[:len(parts)] == parts and len(reste) >= 2 and reste[0] == PROCESS_DIR:
+            return True
+    return False
+
+
 def in_scope(relpath: str, scope: Iterable[str] | None) -> bool:
     """Le chemin (relatif au bundle) est-il dans le périmètre ? None = tout."""
     if scope is None:
@@ -2800,6 +2829,23 @@ class _Loader:
             agent_aliases = []
         else:
             agent_aliases = list(alias_value or [])
+        # L165 (EP1) : `releve: hote` (défaut) ou `election` ; les candidats
+        # sont les hôtes qui peuvent prendre le bail, tous admis par la fiche
+        # Placement (contrôlé par `validate`, qui connaît les hôtes).
+        releve = (_text(fiche.data.get("releve")) or "hote").strip().lower()
+        if releve not in ("hote", "election"):
+            # Valeur illisible : repli sur `election` (fail closed). Un repli
+            # sur `hote` rouvrirait la ligne sur l'hôte courant, alors que la
+            # fiche est fautive ; `election` exige un verdict candidat, que la
+            # fiche en erreur ferme partout.
+            self.add("agent-releve-invalid", ERROR,
+                     "`releve`: `hote` or `election` expected, not %r "
+                     "(treated as `election`, not claimable)"
+                     % fiche.data.get("releve"), **where, **subject)
+            releve = "election"
+        candidats = self._list(fiche, "candidats", where, "agent-candidats-invalid", **subject)
+        if candidats is not None:
+            candidats = list(dict.fromkeys(c for c in candidats if c))
         self.canon.agents.append(Agent(
             title=fiche.title,
             responsible=_text(fiche.data.get("responsible")),
@@ -2820,6 +2866,8 @@ class _Loader:
             roles=self._roles(fiche, where, subject),
             projects=projects,
             aliases=agent_aliases,
+            releve=releve,
+            candidats=candidats,
         ))
 
     def _build_persona(self, fiche: Fiche, where: dict) -> None:
@@ -3117,14 +3165,20 @@ class _Loader:
         Le chemin est contraint, RELATIF AU BUNDLE : `type: Process` dans
         `agents/…` n'est pas une règle (constat, jamais injecté), mais un canon
         imbriqué (`knowledge/`) garde ses `processus/*.md` (verdict codex
-        #510 r2, P2). Le texte est rendu encodable en UTF-8 (un surrogate YAML
+        #510 r2, P2). #2973 : dans un bundle à périmètre ameesh déclaré
+        (`extensions.ameesh.scope`), `<dossier>/processus/*.md` est aussi une
+        règle quand `<dossier>` est l'un des dossiers du périmètre — rien
+        au-delà. Le texte est rendu encodable en UTF-8 (un surrogate YAML
         isolé ne doit pas faire échouer le brief ni un envoi)."""
         subject = {"process": fiche.title}
-        chemin = (fiche.bundle_path or fiche.path).replace("\\", "/").split("/")
-        if len(chemin) < 2 or chemin[0] != PROCESS_DIR:
+        if not process_path_ok(fiche.bundle_path or fiche.path,
+                               self.canon.scopes.get(fiche.member)):
+            scope = [d for d in self.canon.scopes.get(fiche.member) or () if d]
+            dossiers = "`, `".join([PROCESS_DIR + "/"]
+                                   + ["%s/%s/" % (d, PROCESS_DIR) for d in scope])
             self.add("process-path", ERROR,
-                     "Process card outside `%s/`: %s (never injected as a working "
-                     "rule)" % (PROCESS_DIR, fiche.path), **where, **subject)
+                     "Process card outside `%s`: %s (never injected as a working "
+                     "rule)" % (dossiers, fiche.path), **where, **subject)
             fiche = dataclasses.replace(fiche, title=_utf8_safe(fiche.title))
             self.canon.processes.append(Process(
                 fiche=fiche, description=_utf8_safe(_text(fiche.data.get("description")) or ""),
@@ -3711,9 +3765,21 @@ def validate(canon: Canon, known_projects: Iterable[str] | None = None) -> list[
             host = canon.host(name)
             if agent is not None and host is not None:
                 for reason in placement_violations(agent, host, placement):
-                    add("placement-policy-violation", ERROR,
-                        "%s on %s: %s" % (agent.title, host.title, reason), f,
-                        agent=agent.title)
+                    # L165 (EP1) : pour un rôle élu, une politique d'hôte qui
+                    # refuse l'agent ne ferme QUE ce candidat ; les autres
+                    # hôtes candidats gardent leur propre verdict. Un agent
+                    # épinglé, lui, reste bloqué partout par son erreur.
+                    if agent.releve == "election":
+                        # Un candidat refusé ne ferme que CE candidat : ni
+                        # l'hôte (les agents épinglés y restent réclamables),
+                        # ni les autres hôtes candidats.
+                        add("placement-policy-violation", ERROR,
+                            "%s on %s: %s" % (agent.title, host.title, reason), f,
+                            candidate=agent.title, host=name)
+                    else:
+                        add("placement-policy-violation", ERROR,
+                            "%s on %s: %s" % (agent.title, host.title, reason), f,
+                            agent=agent.title)
                 _check_work_dir(add, agent, host, placement)
     for name, group in by_agent.items():
         if len(group) > 1:
@@ -3722,6 +3788,36 @@ def validate(canon: Canon, known_projects: Iterable[str] | None = None) -> list[
                     "agent %s admitted %d times (%s)" % (
                         name, len(group), ", ".join(p.agent or "?" for p in group)),
                     placement.fiche, agent=name)
+    # L165 (EP1) : les candidats d'un rôle élu sont des hôtes du canon, tous
+    # admis par l'admission de l'agent. Sans candidat, le rôle ne peut être
+    # tenu nulle part ; un candidat non admis serait refusé au verdict de
+    # placement, donc la fiche est fautive dès `canon check`.
+    for agent in canon.agents:
+        if agent.releve != "election":
+            if agent.candidats:
+                add("agent-candidats-ignored", WARNING,
+                    "`candidats` declared without `releve: election` (ignored)",
+                    agent.fiche, agent=agent.title)
+            continue
+        if not agent.candidats:
+            add("agent-election-candidats-missing", ERROR,
+                "agent %s is `releve: election` without `candidats`" % agent.title,
+                agent.fiche, agent=agent.title)
+            continue
+        admis: set[str] = set()
+        for placement in by_agent.get(agent.title, []):
+            admis |= set(placement.host_names())
+            for tag in placement.tags():
+                admis |= {host.title for host in canon.hosts if tag in (host.tags or [])}
+        for name in agent.candidats:
+            if canon.host(name) is None:
+                add("agent-election-host-unknown", ERROR,
+                    "agent %s is a candidate on unknown host %s" % (agent.title, name),
+                    agent.fiche, agent=agent.title)
+            elif name not in admis:
+                add("agent-election-host-not-admitted", ERROR,
+                    "agent %s is a candidate on %s, which its admission does not cover"
+                    % (agent.title, name), agent.fiche, agent=agent.title)
     for host in canon.hosts:
         for agent in canon.agents:
             paths = {host.policy.work_dirs[n] for n in [agent.title] + list(agent.aliases or [])
@@ -3935,12 +4031,16 @@ class Blocking:
     global_errors: list[Finding]
     by_agent: dict[str, list[Finding]]
     by_host: dict[str, list[Finding]]
+    #: L165 : erreurs qui ne ferment qu'un couple (agent élu, hôte candidat).
+    by_candidate: dict[tuple[str, str], list[Finding]]
 
     def reasons(self, agent: str, hosts: Iterable[str] = ()) -> list[str]:
         out = ["%s (%s)" % (f.code, f.where()) for f in self.global_errors]
         out += ["%s (%s)" % (f.code, f.where()) for f in self.by_agent.get(agent, [])]
         for host in hosts:
             out += ["%s (%s)" % (f.code, f.where()) for f in self.by_host.get(host, [])]
+            out += ["%s (%s)" % (f.code, f.where())
+                    for f in self.by_candidate.get((agent, host), [])]
         return list(dict.fromkeys(out))
 
 
@@ -3949,11 +4049,13 @@ def blocking(findings: Iterable[Finding]) -> Blocking:
     sont placés ; à une fiche du plan (WorkPackage, L29) ou à une règle de
     travail (Process, #538), aucun agent ; sinon (fédération, frontmatter d'une
     fiche du profil, …) tous."""
-    result = Blocking([], defaultdict(list), defaultdict(list))
+    result = Blocking([], defaultdict(list), defaultdict(list), defaultdict(list))
     for finding in errors(findings):
         if finding.package or finding.process:
             continue
-        if finding.agent:
+        if finding.candidate and finding.host:
+            result.by_candidate[(finding.candidate, finding.host)].append(finding)
+        elif finding.agent:
             result.by_agent[finding.agent].append(finding)
         elif finding.host:
             result.by_host[finding.host].append(finding)
