@@ -222,3 +222,24 @@ apply. A stopped host loses the role when its lease expires (the L232e timing,
 180 s by default); a returning host goes back to standby until the lease is
 free again. Candidate ranking, rank delays and hysteresis are EP2; this lot
 only makes the cross-host claim possible.
+
+## Standby executors and the election briefing (L165/EP3)
+
+Every candidate host runs the role's runner, and none of them takes a turn
+before the claim: the runner only creates a worker after `registry.claim`
+returns a live lease, the worker renews it before each turn, and a lost lease
+kills the harness before any further turn. Standby costs no tokens and opens
+no session.
+
+When the winner is a DIFFERENT host from the previous holder, no session
+crosses hosts. The same claim resets the session, its account and its lot
+(`session_reset_at` set durably) and persists the resume briefing built by
+the winner in `agent_registry.election_brief`. The new holder consumes it as
+the resume summary of its new session; the first turn is a short "you are
+elected" instruction framed by that briefing. The briefing is deterministic
+and built from the last persisted state (role card and canon, assigned and
+takeable lots, unread mail, pending decisions, alerts, GitHub observation per
+repository); it names the previous holder, the epoch and the session left
+behind. A same-host re-claim (runner restart) keeps the local session: it is
+not an election. The brief is dropped with its session (`set_session`,
+`clear_session`) so it never resurfaces in a later session.

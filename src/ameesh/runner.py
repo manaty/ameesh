@@ -2152,6 +2152,63 @@ class AgentWorker(threading.Thread):
         log_async("[%s] pending resume summary recovered (%d characters)"
                   % (self.name, len(resume)))
 
+    def adopt_election(self, lease: dict, brief: str | None = None) -> bool:
+        """L165 (EP3) : ce worker vient de gagner une relève croisée.
+
+        Aucune session ne traverse un hôte : la remise à zéro DURABLE a été
+        écrite par `claim` ; ici on jette l'état local périmé de CET hôte
+        (fichier de session et résumé en attente d'une tenure précédente),
+        puis on garde le briefing persisté comme résumé de reprise de la
+        session neuve. Le brief est relu de la ligne (`election_brief`) pour
+        survivre à un exécuteur mort entre la réclamation et le premier tour ;
+        il est oublié avec la session (`set_session`, `clear_session`).
+        """
+        lease = lease or {}
+        brief = (brief if brief is not None else lease.get("election_brief")) or ""
+        previous = lease.get("previous_host") or (self.agent or {}).get("previous_host")
+        # L'état local de l'hôte est celui d'une tenure précédente, jamais
+        # celui de l'ancien détenteur : il ne doit pas rouvrir une session.
+        self.agent = dict(self.agent, session_id=None, session_account=None,
+                          session_harness=None, session_cwd=None,
+                          session_origin=None,
+                          session_reset_ts=lease.get("session_reset_ts"),
+                          lease_owner=self.runner.runner_id,
+                          lease_epoch=lease.get("lease_epoch"),
+                          status="queued")
+        try:
+            os.unlink(self._path("session"))
+        except OSError:
+            pass
+        self._resume_drop()
+        self.session_turns = 0
+        self.session_tokens = 0.0
+        if not brief.strip():
+            log_async("[%s] elected on %s: no persisted resume brief; new session "
+                      "opens without one" % (self.name, self.runner.host))
+            return False
+        if not self._resume_keep(brief, "ameesh"):
+            # #389 r3 : au moins en mémoire, le brief ouvre le tour
+            self.resume_summary, self.resume_origin = brief, "ameesh"
+            self.resume_continuation = False
+        log_async("[%s] elected on %s (epoch %s, previous %s/%s epoch %s): new "
+                  "session on the resume brief (%d characters)"
+                  % (self.name, self.runner.host, lease.get("lease_epoch"),
+                     previous or "?", lease.get("previous_owner") or "?",
+                     lease.get("previous_epoch"), len(brief)))
+        self._fil_note(
+            "Elected on %s (epoch %s): previous holder %s (%s, epoch %s). Its "
+            "session %s stays there; this host opens a new session on a "
+            "deterministic resume brief (%d characters)."
+            % (self.runner.host, lease.get("lease_epoch"), previous or "?",
+               lease.get("previous_owner") or "?",
+               lease.get("previous_epoch"),
+               lease.get("previous_session") or "none", len(brief)),
+            meta={"action": "election-brief",
+                  "previous_host": previous or "",
+                  "previous_epoch": lease.get("previous_epoch"),
+                  "session": lease.get("previous_session") or ""})
+        return True
+
     def maybe_rotate(self) -> bool:
         """Résume la session courante puis en ouvre une neuve (0018, R19).
 
@@ -8530,6 +8587,38 @@ class Runner:
         if agent.get("last_error") != error:
             storage.of(self.db).agents.note_unleased(agent["name"], self.host, error)
 
+    def election_brief_for(self, agent: dict) -> str | None:
+        """L165 (EP3) : briefing de reprise d'une relève CROISÉE, ou None.
+
+        None : ce n'est pas une relève (agent `hote`, ou ligne déjà sur cet
+        hôte — une reprise de session locale est normale). "" : une relève est
+        due mais le brief n'a pas pu être construit ; l'appelant ne réclame
+        pas — jamais de tour sans briefing. Construit APRÈS la porte de rang
+        d'EP2, juste avant le CAS : le brief décrit l'état au plus près.
+        """
+        if agent.get("releve") != "election":
+            return None
+        previous = agent.get("previous_host")
+        if not previous or previous == self.host:
+            return None
+        from . import reprise
+        try:
+            brief = reprise.election_brief(
+                self.cfg, self.db, agent,
+                previous_host=previous,
+                previous_owner=agent.get("lease_owner"),
+                previous_epoch=agent.get("lease_epoch"),
+                previous_session=agent.get("session_id"))
+        except Exception as exc:
+            log_async("election brief for %s unavailable (%s): no claim this pass"
+                      % (agent.get("name"), db_mod.brief(exc)))
+            return ""
+        if not brief.strip():
+            log_async("election brief for %s is empty: no claim this pass"
+                      % agent.get("name"))
+            return ""
+        return brief
+
     def _note_gate_wait(self, reason: str) -> None:
         if getattr(self, "mediated", False):
             return
@@ -8955,8 +9044,16 @@ class Runner:
             try:
                 if getattr(self, "_host_gate_rejected", ""):
                     self._note_unleased(agent, self._host_gate_rejected)
+                # L165 (EP3) : le brief de relève est construit APRÈS la porte
+                # de rang d'EP2, juste avant le CAS. Un brief impossible ne
+                # réclame pas : jamais de tour sans briefing.
+                election_brief = self.election_brief_for(agent)
+                if election_brief == "":
+                    self._release_slot(agent["name"])
+                    continue
                 lease = registry.claim(self.db, agent["name"], self.runner_id,
-                                       self.lease_ttl, host=self.host)
+                                       self.lease_ttl, host=self.host,
+                                       election_brief=election_brief or None)
                 if not lease:
                     self._release_slot(agent["name"])
                     continue  # un autre exécuteur a gagné la course
@@ -8965,9 +9062,33 @@ class Runner:
                 # doit lire l'hôte et le dossier effectivement acquis.
                 agent = dict(agent, host=lease.get("host") or self.host,
                              cwd=lease.get("cwd", agent.get("cwd")))
+                # L165 (EP3) : relève croisée, ou brief d'une relève resté
+                # d'un exécuteur mort avant son premier tour. La session de
+                # l'ancien hôte n'est jamais reprise : le worker reçoit une
+                # ligne remise à zéro et le brief comme résumé de la neuve.
+                resumed_brief = lease.get("election_brief") or ""
+                elected = bool(lease.get("elected"))
+                # Un brief resté d'un exécuteur mort ne s'applique que si
+                # aucune session n'est ouverte : une session ouverte a déjà
+                # consommé le sien (et `set_session` l'a effacé).
+                resume_election = elected or bool(resumed_brief
+                                                  and not agent.get("session_id"))
+                if resume_election:
+                    agent.update(session_id=None, session_account=None,
+                                 session_harness=None, session_cwd=None,
+                                 session_origin=None,
+                                 session_reset_ts=lease.get("session_reset_ts"),
+                                 lease_owner=self.runner_id,
+                                 lease_epoch=lease["lease_epoch"],
+                                 status="queued")
+                elif resumed_brief:
+                    log_async("[%s] election brief left aside: a session is already open"
+                              % agent["name"])
                 log("lease acquired: %s (epoch %s, host %s)"
                     % (agent["name"], lease["lease_epoch"], self.host))
                 worker = AgentWorker(self, agent, lease)
+                if resume_election:
+                    worker.adopt_election(lease, resumed_brief or election_brief)
                 if worker._reprise_attach:
                     # L106 : la session interactive est morte sans rendre son bail
                     log("[%s] attached session dead (lease of %s expired): the runner "

@@ -28,6 +28,7 @@ import stat
 import subprocess
 import sys
 import time
+from typing import Sequence
 
 from . import accounts, account_turn, auth_failure, fil, identity, mail, platform, registry, stagnation, storage
 from . import config as config_mod
@@ -675,7 +676,9 @@ def _fil(cfg: Config, project: str) -> tuple[list[str], int]:
 
 
 def deterministic_brief(cfg: Config, db, row: dict | None, *, session: str | None = None,
-                        account=None, reason: str = "", consigne: str = "") -> str:
+                        account=None, reason: str = "", consigne: str = "",
+                        election: Sequence[str] | None = None,
+                        extra_sections: Sequence[Sequence[str]] = ()) -> str:
     """Le brief de reprise d'un agent, construit par ameesh SANS appel de modèle
     (L39, décision 0030) : identité et rôle, lots assignés et leur attente,
     derniers échanges du fil du projet, courrier non lu, transcript de
@@ -684,6 +687,11 @@ def deterministic_brief(cfg: Config, db, row: dict | None, *, session: str | Non
 
     `account` : le profil (ou le nom) du compte de l'ancienne session, pour
     retrouver son transcript.
+
+    `election` (L165/EP3, « ## Election ») et `extra_sections` (blocs de
+    l'état persisté) : sections supplémentaires d'un brief de relève. Elles
+    sont bornées par leurs producteurs et comptent dans la place réservée,
+    avant le fil du projet (la partie élastique).
     """
     row = dict(row or {})
     name = row.get("name") or "?"
@@ -706,6 +714,10 @@ def deterministic_brief(cfg: Config, db, row: dict | None, *, session: str | Non
         ident.append("- capabilities: %s" % (", ".join(map(str, caps))
                                            if isinstance(caps, (list, tuple)) else caps))
     ident += _role(cfg, name)
+    election_sec = list(election or ())
+    extra: list[str] = []
+    for block in extra_sections:
+        extra.extend(block)
     try:
         lots = _lots(db, name)
     except Exception as exc:
@@ -742,7 +754,8 @@ def deterministic_brief(cfg: Config, db, row: dict | None, *, session: str | Non
                     "it and do not write to it.", ""]
     fin = ["## Instructions", (consigne or DEFAULT_RESUME).strip()]
     lots_sec = ["## Work items assigned to you"] + lots + [""]
-    fixe = "\n".join(head + ident + [""] + lots_sec + courrier + [""] + ancienne + fin)
+    fixe = "\n".join(head + ident + election_sec + [""] + lots_sec + courrier
+                     + [""] + extra + ancienne + fin)
     reste = BRIEF_MAX_BYTES - _octets(fixe) - 200
     fil_lines, total = _fil(cfg, project)
     fil_sec = ["## Latest exchanges in thread %s (%d of %d)" % (
@@ -752,11 +765,183 @@ def deterministic_brief(cfg: Config, db, row: dict | None, *, session: str | Non
             break
         reste -= _octets(line) + 1
         fil_sec.append(line)
-    text = "\n".join(head + ident + [""] + lots_sec + fil_sec + [""] + courrier + [""]
-                     + ancienne + fin)
+    text = "\n".join(head + ident + election_sec + [""] + lots_sec + fil_sec + [""]
+                     + courrier + [""] + extra + ancienne + fin)
     return with_process_rules(cfg, _clip(text.replace("\x00", ""), BRIEF_MAX_BYTES),
                               agent=name, canon_id=row.get("canon"),
                               host=row.get("host") or "")
+
+
+#: L165 (EP3) : bornes du briefing de relève (chaque section est bornée pour
+#: laisser la place aux instructions et aux règles du canon).
+ELECTION_DECISIONS_MAX = 5
+ELECTION_ALERTS_MAX = 5
+ELECTION_GITHUB_MAX = 8
+ELECTION_LOTS_MAX = 5
+ELECTION_LINE_CHARS = 240
+
+
+def _age_s(ts, now: float) -> str:
+    if not ts:
+        return ""
+    seconds = max(0, int(now - float(ts)))
+    if seconds < 60:
+        return "%ds" % seconds
+    if seconds < 3600:
+        return "%dm" % (seconds // 60)
+    if seconds < 86400:
+        return "%dh" % (seconds // 3600)
+    return "%dd" % (seconds // 86400)
+
+
+def _election_state_sections(cfg: Config, db, row: dict, *,
+                             now: float | None = None) -> list[list[str]]:
+    """L165 (EP3) : l'état persisté du rôle, pour son briefing de relève.
+
+    Aucune mémoire de session : décisions en attente, alertes en cours, dernier
+    relevé GitHub connu par dépôt et lots prenables. Chaque lecture échoue en
+    le disant, jamais en silence ; chaque section est bornée.
+    """
+    now = time.time() if now is None else float(now)
+    out: list[list[str]] = []
+    # Décisions en attente (les plus anciennes d'abord).
+    try:
+        pending = storage.of(db).decisions.pending(limit=ELECTION_DECISIONS_MAX)
+    except Exception as exc:
+        out.append(["## Pending decisions",
+                    "(unreadable: %s)" % fil.excerpt(str(exc), ELECTION_LINE_CHARS), ""])
+    else:
+        lines = ["## Pending decisions (%d shown)" % len(pending)]
+        if not pending:
+            lines.append("- none.")
+        for decision in pending:
+            payload = decision.get("payload") or {}
+            detail = payload.get("decision") or {}
+            question = detail.get("question") or decision.get("body") or ""
+            lot = str(decision.get("work_item_id") or "").strip()
+            age = _age_s(decision.get("created_ts"), now)
+            lines.append("- #%s from %s%s%s: %s" % (
+                decision.get("id"), decision.get("sender") or "?",
+                " (%s ago)" % age if age else "",
+                " — lot #%s" % lot if lot else "",
+                fil.excerpt(question, ELECTION_LINE_CHARS)))
+        lines.append("")
+        out.append(lines)
+    # Alertes en cours (`ameesh alerts`, sans la console locale du pool).
+    try:
+        from . import exploitation
+        alerts = exploitation.alerts(cfg, db, local_pool=False, now=now)
+    except Exception as exc:
+        out.append(["## Alerts",
+                    "(unreadable: %s)" % fil.excerpt(str(exc), ELECTION_LINE_CHARS), ""])
+    else:
+        lines = ["## Alerts in progress (%d)" % len(alerts)]
+        for alert in alerts[:ELECTION_ALERTS_MAX]:
+            subject = (alert.get("agent") or alert.get("lot") or alert.get("host")
+                       or alert.get("repo") or "")
+            age = _age_s(alert.get("since"), now)
+            lines.append("- %s%s%s: %s" % (
+                alert.get("type") or "?", " (%s)" % subject if subject else "",
+                " since %s" % age if age else "",
+                fil.excerpt(alert.get("detail") or "", ELECTION_LINE_CHARS)))
+        if len(alerts) > ELECTION_ALERTS_MAX:
+            lines.append("- … and %d more: `ameesh alerts`"
+                         % (len(alerts) - ELECTION_ALERTS_MAX))
+        if not alerts:
+            lines.append("- none.")
+        lines.append("")
+        out.append(lines)
+    # Dernier relevé GitHub complet, par dépôt configuré.
+    try:
+        from . import plan_github
+        settings = plan_github.settings_of(cfg)
+    except Exception as exc:
+        out.append(["## GitHub observation",
+                    "(configuration unreadable: %s)"
+                    % fil.excerpt(str(exc), ELECTION_LINE_CHARS), ""])
+    else:
+        lines = ["## GitHub observation"]
+        if not settings.projects:
+            lines.append("- no GitHub repository configured on this host.")
+        for project, repo in sorted(settings.projects.items())[:ELECTION_GITHUB_MAX]:
+            try:
+                seen = storage.of(db).github_watch.cursor(project, repo)
+            except Exception as exc:
+                lines.append("- %s (%s): unreadable (%s)" % (
+                    project, repo, fil.excerpt(str(exc), 120)))
+                continue
+            lines.append("- %s (%s): last complete reading %s" % (
+                project, repo, _stamp(seen) if seen is not None else "never recorded"))
+        if len(settings.projects) > ELECTION_GITHUB_MAX:
+            lines.append("- … and %d more repositories"
+                         % (len(settings.projects) - ELECTION_GITHUB_MAX))
+        lines.append("")
+        out.append(lines)
+    # Lots prenables (aucun agent), pour un pilote qui répartit.
+    try:
+        lots = storage.of(db).work.unassigned_lots(ELECTION_LOTS_MAX)
+    except Exception as exc:
+        out.append(["## Takeable lots",
+                    "(unreadable: %s)" % fil.excerpt(str(exc), ELECTION_LINE_CHARS), ""])
+    else:
+        lines = ["## Takeable lots (no assignee)"]
+        if not lots:
+            lines.append("- none.")
+        for lot in lots[:ELECTION_LOTS_MAX]:
+            lines.append("- #%s [%s] %s" % (
+                lot.get("id"), lot.get("state") or "?",
+                fil.excerpt(lot.get("title") or "", ELECTION_LINE_CHARS)))
+        lines.append("")
+        out.append(lines)
+    return out
+
+
+def election_brief(cfg: Config, db, row: dict | None, *, previous_host: str,
+                   previous_owner: str | None = None,
+                   previous_epoch: int | None = None,
+                   previous_session: str | None = None,
+                   reason: str = "", consigne: str = "",
+                   now: float | None = None) -> str:
+    """Le briefing de reprise d'une relève élue (L165/EP3, étude §5).
+
+    Construit par ameesh SANS appel de modèle, à partir du dernier état
+    PERSISTÉ du rôle : sa fiche et son canon, ses lots, son courrier non lu,
+    les décisions en attente, les alertes en cours, le dernier relevé GitHub
+    par dépôt et les lots prenables. Aucune session ne traverse un hôte : le
+    brief rappelle l'ancien détenteur et dit que sa session reste là-bas.
+
+    `row` est la ligne du candidat qui a gagné (hôte et dossier de CET hôte).
+    Le brief devient le résumé de reprise de la session neuve ; la consigne
+    du tour qui l'ouvre suit.
+    """
+    row = dict(row or {})
+    host = row.get("host") or cfg.host
+    owner = previous_owner or "unknown owner"
+    epoch = " (epoch %s)" % previous_epoch if previous_epoch is not None else ""
+    session = ("its session %s stays there" % previous_session
+               if previous_session else "it leaves no session here")
+    election = [
+        "## Election",
+        "- you have just been elected on host %s; the lease epoch is %s."
+        % (host, row.get("lease_epoch") or "?"),
+        "- previous holder: host %s, %s%s. No session is transferred: %s and is "
+        "never resumed or written by this host." % (previous_host, owner, epoch, session),
+        "- your state is the mesh database, the canon and GitHub, not a local "
+        "worktree. Check it before acting: open lots, mail, pending decisions, "
+        "alerts and the GitHub observation below.",
+        "",
+    ]
+    consigne = consigne or (
+        "You have just been elected: this briefing is the persisted state of the "
+        "role. Verify it, then follow this turn's instruction.")
+    return deterministic_brief(
+        cfg, db, row, session=previous_session,
+        reason=reason or ("elected on %s after %s%s on %s"
+                          % (host, owner, epoch, previous_host)),
+        consigne=consigne, election=election,
+        extra_sections=_election_state_sections(cfg, db, row, now=now))
+
+
 
 
 # --------------------------------------------------------------------------

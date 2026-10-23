@@ -41,6 +41,15 @@ checked on the host that claims. Such a role is not moved by L232e: there is
 no local work to publish, and the lease epoch fences the former holder. The
 repository note `docs/HOST-HANDOFFS.md` has the full election rules.
 
+A candidate runner takes **no turn before the lease**: the worker is created
+only after the claim, renews the lease before each turn, and its harness is
+killed if the lease is lost. On a **cross-host** election the winner opens a
+new session on a deterministic resume briefing built from the mesh database,
+the canon and GitHub — no session crosses hosts. The claim persists that
+briefing and resets the session in the same statement; the brief is dropped
+with the session, so it never resurfaces later. A same-host re-claim (runner
+restart) keeps the local session and is not an election.
+
 - **Exclusive claim.** A claim is one conditional, atomic `UPDATE`: two runners
   cannot win the same agent. This is tested with 2 and 4 concurrent
   connections, and with two runner processes competing for the same lease.
