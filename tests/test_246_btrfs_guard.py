@@ -547,7 +547,7 @@ class AlertTest(unittest.TestCase):
                     {"btrfs_unallocated_bytes": MIB},
                     {"btrfs_unallocated_bytes": 20 * GIB}]
         events = []
-        with mock.patch.multiple(notify.Notifier, _brief_orchestrators=mock.DEFAULT,
+        with mock.patch.multiple(notify.Notifier,
                                  _brief_agents=mock.DEFAULT, _github_issues=mock.DEFAULT,
                                  _ci_failures=mock.DEFAULT):
             for reading in readings:
@@ -564,7 +564,7 @@ class AlertTest(unittest.TestCase):
         notifier = notify.Notifier(None, notify.parse_config({"default": ["desktop"]}),
                                    sender=mock.Mock(send=lambda c, m: sent.append(m)),
                                    log=lambda text: None, clock=lambda: 1000.0)
-        with mock.patch.multiple(notify.Notifier, _brief_orchestrators=mock.DEFAULT,
+        with mock.patch.multiple(notify.Notifier,
                                  _brief_agents=mock.DEFAULT, _github_issues=mock.DEFAULT,
                                  _ci_failures=mock.DEFAULT):
             for reading in ({"btrfs_unallocated_bytes": MIB},

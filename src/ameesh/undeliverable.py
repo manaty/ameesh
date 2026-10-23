@@ -534,13 +534,12 @@ def _alert(kind, agent, since, value, threshold, detail, **extra) -> dict:
     return make(kind, agent, since, value, threshold, detail, **extra)
 
 
-def orchestrator_briefs(alert: dict) -> dict:
-    """`mail_undeliverable` part aussi aux orchestrateurs de l'équipe
-    (`alert["orchestrators"]`), en courrier `event` d'`ameesh notify` : ce
-    sont eux qui peuvent re-livrer (`ameesh mail forward`) ou faire relancer
-    l'agent. Rend `{orchestrateur: texte}` ; jamais au destinataire mort."""
-    if alert.get("type") != "mail_undeliverable":
-        return {}
+def brief_text(alert: dict) -> str:
+    """#3036 : le texte du courrier en souffrance, sans destinataire.
+
+    `alert_briefs` le route vers les orchestrateurs vivants, puis vers les
+    auditeurs, le bureau ou le fil quand aucun ne l'est ; le texte ne dépend
+    pas du destinataire."""
     name = alert.get("agent") or "?"
     count = int(alert.get("value") or 0)
     senders = ", ".join(alert.get("senders") or ()) or "?"
@@ -560,6 +559,22 @@ def orchestrator_briefs(alert: dict) -> dict:
                 "its owner (ameesh resume %s)."
                 % (count, name, _span(alert.get("threshold") or 0), senders, name,
                    heir.split(", ")[0] if heir else "<agent>", name))
+    return text
+
+
+def orchestrator_briefs(alert: dict) -> dict:
+    """`mail_undeliverable` part aux orchestrateurs de l'équipe
+    (`alert["orchestrators"]`), en courrier `event` : ce sont eux qui peuvent
+    re-livrer (`ameesh mail forward`) ou faire relancer l'agent. Rend
+    `{orchestrateur: texte}` ; jamais au destinataire mort.
+
+    #3036 : le filtrage de vivacité et les replis sont faits par
+    `alert_briefs.briefs` (auditeurs, bureau, fil) ; cette fonction garde le
+    contrat historique pour ses appelants directs et les tests."""
+    if alert.get("type") != "mail_undeliverable":
+        return {}
+    name = alert.get("agent") or "?"
+    text = brief_text(alert)
     return {orch: text for orch in alert.get("orchestrators") or () if orch != name}
 
 
