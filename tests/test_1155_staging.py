@@ -160,12 +160,14 @@ if ('unit-ko=' + command[-1]) in (state / 'scenario').read_text().splitlines():
 sys.exit(subprocess.run(command, env=env, cwd=cwd).returncode)
 '''
 
+# #3129 : le vrai cat, résolu avant les faux bancs (/usr/bin/cat sous Linux, /bin/cat sous macOS).
+REAL_CAT = shutil.which('cat') or '/bin/cat'
 CAT = r'''#!/bin/sh
 case "$1" in
   /proc/*/cgroup) printf '%s\n' "${FAKE_CGROUP:-0::/user.slice/session.scope}" ;;
-  *) exec /usr/bin/cat "$@" ;;
+  *) exec @CAT@ "$@" ;;
 esac
-'''
+'''.replace('@CAT@', REAL_CAT)
 
 
 class StagingTest(unittest.TestCase):

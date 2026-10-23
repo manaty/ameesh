@@ -17,6 +17,9 @@ import unittest
 
 from tests import support  # noqa: F401 — environnement isolé du poste
 
+# #3129 : le vrai cat, résolu avant les faux bancs (/usr/bin/cat sous Linux, /bin/cat sous macOS).
+REAL_CAT = shutil.which("cat") or "/bin/cat"
+
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SCRIPT = os.path.join(ROOT, "deploy", "mise-a-jour", "poste.sh")
 
@@ -244,7 +247,7 @@ class RestartLeaseTest(unittest.TestCase):
             fh.write('{"dsn": "postgresql://ameesh:%s@mesh.invalid/ameesh"}\n' % PASSWORD)
         for path, text in ((os.path.join(bin_dir, "systemctl"), FAKE_SYSTEMCTL),
                            # Les faux services sont dans un terminal indépendant.
-                           (os.path.join(bin_dir, "cat"), '#!/bin/sh\ncase "$1" in /proc/*/cgroup) echo "0::/user.slice/session.scope" ;; *) exec /usr/bin/cat "$@" ;; esac\n'),
+                           (os.path.join(bin_dir, "cat"), '#!/bin/sh\ncase "$1" in /proc/*/cgroup) echo "0::/user.slice/session.scope" ;; *) exec ' + REAL_CAT + ' "$@" ;; esac\n'),
                            (os.path.join(bin_dir, "sleep"), "#!/bin/sh\nexit 0\n"),
                            (os.path.join(bin_dir, "ssh"), FAKE_SSH),
                            (os.path.join(bin_dir, "psql"), FAKE_LOGGED_CLOCK),
