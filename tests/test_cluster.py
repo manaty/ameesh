@@ -77,7 +77,8 @@ SIGNATURES = {
 CONTENUS = {
     "agent_peek": {"payload"},
     "agent_mailbox": {"body", "payload", "meta"},
-    "agent_registry": {"pending_prompt", "current_prompt", "restart_brief"},
+    "agent_registry": {"pending_prompt", "current_prompt", "restart_brief",
+                       "election_brief"},
     "agent_mesh_overview": {"pending_prompt", "current_prompt", "restart_brief"},
     "thread_index": {"last_excerpt"},
     "conversation_log": {"text", "meta", "thread_text"},
@@ -146,6 +147,12 @@ FERMEES = {
     # interne borné au tour (réparation d'un worker mort), pas un état de
     # supervision ; colonne fermée aux deux rôles, aucun GRANT modifié.
     "spend_pending": {"resident_usage"},
+    # L165 (EP1, 0473) : verdicts de placement par hôte candidat, lus par la
+    # condition de réclamation et non par le rôle superviseur ; table interne
+    # fermée aux deux rôles, aucun GRANT ajouté.
+    "agent_candidates": {"name", "host", "canon", "cwd", "placement_ok",
+                         "placement_diagnostic", "placement_ref",
+                         "placement_profile", "updated_at"},
     # #2443 (0465) : appartenance d'une unité à un paquet, écrite à la
     # composition (porteur, commit de composition, gel effectif). État interne
     # lu par `work show` et `sync-merges` ; fermé aux deux rôles superviseur,
@@ -164,6 +171,21 @@ FERMEES = {
     # `ameesh cost turns --message` ; le contrat des rôles superviseur reste
     # inchangé : colonne fermée aux deux rôles, aucun GRANT modifié.
     "turn_costs": {"inputs"},
+    # L165 (EP2, 0476) : scores de candidats d'un rôle élu, lus par les
+    # exécuteurs candidats et `ameesh role status`, pas par le rôle
+    # superviseur ; table interne fermée aux deux rôles, aucun GRANT ajouté.
+    "role_standings": {"id", "name", "host", "evaluated_at", "availability",
+                       "capacity", "score", "ready", "diagnostic"},
+    # #3099 (0478) : marque de libération d'une bascule de rôle élu, côté hôte
+    # détenteur, relue par l'exécuteur au redémarrage ; état interne fermé aux
+    # deux rôles superviseur, aucun GRANT modifié.
+    "role_handover": {"host", "name", "challenger", "released_until", "updated_at"},
+    # #3007 (0474) : battement partagé du notificateur et réclamation des
+    # briefs par (destinataire, humain). État interne lu par l'exécuteur, les
+    # alertes et les décisions, pas par le rôle superviseur ; tables fermées
+    # aux deux rôles, aucun GRANT modifié.
+    "notify_liveness": {"host", "human", "seen_at"},
+    "notify_briefs": {"recipient", "human", "sent_at"},
 }
 #: L232b (0417) : l'état interne du contrôleur de release reste hors contrat,
 #: sauf `host_release_fences.host`, lu par `ameesh_host_gate_state` (l.314).

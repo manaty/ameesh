@@ -93,9 +93,14 @@ class HealthProbeTest(unittest.TestCase):
         executable.write_text("#!/bin/sh\n"
                               "printf '%%s\\n' \"$@\" > '%s.args'\n"
                               "env > '%s.env'\n"
-                              "stat -c '%%a' \"$AMEESH_CONFIG\" > '%s.mode'\n"
+                              "# GNU stat (-c) sous Linux, BSD stat (-f %%Lp) sous macOS.\n"
+                              "if stat -c '%%a' \"$AMEESH_CONFIG\" >/dev/null 2>&1; then\n"
+                              "  stat -c '%%a' \"$AMEESH_CONFIG\" > '%s.mode'\n"
+                              "else\n"
+                              "  stat -f '%%Lp' \"$AMEESH_CONFIG\" > '%s.mode'\n"
+                              "fi\n"
                               "cp \"$AMEESH_CONFIG\" '%s.config'\n"
-                              "exit %d\n" % (prefix, prefix, prefix, prefix, exit_code))
+                              "exit %d\n" % (prefix, prefix, prefix, prefix, prefix, exit_code))
         executable.chmod(0o755)
         (root / 'ready.json').write_text(json.dumps(document, sort_keys=True))
         # Same traversable modes as environnement-versionne's store: the

@@ -150,6 +150,13 @@ def record(db, package_id: int, *, repo: str | None = None, base: str | None = N
             "packet carrier #%s is on %s, not %s: correct the carrier's branch "
             "first (`ameesh work branch %s %s`)"
             % (package_id, declared_branch, _text(branch), package_id, declared_branch))
+    # L165 (EP4) : l'enregistrement d'une composition de paquet est un geste du
+    # pilote hors base (les unités seront fermées et le paquet poussé). Le bail
+    # élu est vérifié avant les lectures du dépôt, puis journalisé dans la
+    # transaction de l'écriture.
+    from . import pilot_gesture
+    fence = pilot_gesture.gate(cfg, db, "packet", "packet record #%d" % int(package_id),
+                               project=(package.get("app") or None))
     try:
         slug = work.lot_repository(package, cfg)
     except work.WorkError as exc:
@@ -225,9 +232,16 @@ def record(db, package_id: int, *, repo: str | None = None, base: str | None = N
     note = ("packet composition recorded: %d unit(s) %s..%s (branch %s)"
             % (len(known), base_sha[:12], head_sha[:12], package_branch))
     try:
-        report["members"] = storage.of(db).work.record_packet(
-            int(package_id), branch=package_branch, base_sha=base_sha, head_sha=head_sha,
-            units=known, note=note, actor=actor)
+        if fence is None:
+            report["members"] = storage.of(db).work.record_packet(
+                int(package_id), branch=package_branch, base_sha=base_sha,
+                head_sha=head_sha, units=known, note=note, actor=actor)
+        else:
+            with db.transaction() as tx:
+                fence.hold(tx)
+                report["members"] = storage.of(tx).work.record_packet(
+                    int(package_id), branch=package_branch, base_sha=base_sha,
+                    head_sha=head_sha, units=known, note=note, actor=actor)
     except DbError as exc:
         raise PacketLinkError("packet composition not recorded: %s" % exc) from exc
     report["recorded"] = True

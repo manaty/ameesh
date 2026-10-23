@@ -196,6 +196,10 @@ class ReviewerDesignationTest(PgTestCase):
         return next(a for a in alertes if a["type"] == "stale_lot" and a["lot"] == lot)
 
     def _briefs(self, alert):
+        # #3036 : un brief ne part plus à un agent sans bail vivant ; ce banc
+        # simule les runners qui tiennent les agents enregistrés.
+        self.db.execute("UPDATE agent_registry SET lease_owner = 'runner-' || name,"
+                        " lease_expires_at = now() + interval '1 hour'")
         return alert_briefs.briefs(alert, storage.of(self.db).operations.listing())
 
     def test_relecteur_designe_nomme_avant_tout_verdict(self):
@@ -344,6 +348,10 @@ class ReviewerDesignationTest(PgTestCase):
         self._stale(lot["id"])
 
         alert = self._stale_alert(lot["id"])
+        # #3036 : le brief n'est plus déposé à un agent sans bail vivant.
+        self.db.execute("UPDATE agent_registry SET lease_owner = 'runner-' || name,"
+                        " lease_expires_at = now() + interval '1 hour'"
+                        " WHERE name IN ('relecteur', 'orchestrateur')")
         ncfg = notify.parse_config({"default": []})
         notifier = notify.Notifier(self.cfg, ncfg, sender=object(), log=lambda t: None)
         notifier.run_pass(self.db, current=[alert])

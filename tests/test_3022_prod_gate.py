@@ -12,6 +12,7 @@ from unittest import mock
 
 from ameesh import mail, mechanics, plan_git, prod_gate, storage, work
 
+from .test_3219_lift_own_hold import bound
 from .test_canon import git
 from .test_l1616_mechanics import MECHANICS
 from .test_plan import _PlanDb
@@ -79,14 +80,15 @@ class ProdGateCloseTest(_PlanDb):
         git(self.repo, "commit", "-q", "-m", message)
         return git(self.repo, "rev-parse", "HEAD")
 
-    def on_develop(self, name: str, *, app: str = "nexlink", mark: str | None = None) -> dict:
+    def on_develop(self, name: str, *, app: str = "nexlink", mark: str | None = None,
+                   assignee: str | None = None) -> dict:
         """Un lot gelé, fusionné dans develop seul, encore en `qa`."""
         git(self.repo, "checkout", "-q", "-b", "lot/%s" % name, "develop")
         sha = self.commit("%s.txt" % name, "%s\n" % name, name)
         git(self.repo, "checkout", "-q", "develop")
         git(self.repo, "merge", "-q", "--no-ff", "-m", "paquet %s" % name, "lot/%s" % name)
         git(self.repo, "checkout", "-q", "main")
-        item = work.add(self.db, title=name, app=app)
+        item = work.add(self.db, title=name, app=app, assignee=assignee)
         for state in ("build", "qa"):
             work.move(self.db, item["id"], state)
         storage.of(self.db).work.add_milestone(
@@ -164,6 +166,27 @@ class ProdGateCloseTest(_PlanDb):
         done = work.close_merged(self.db, item["id"], sha=head, actor="sync",
                                  source="sync-github", repo=self.repo)
         self.assertEqual(done["result"], "merged")
+
+    def test_le_hold_leve_de_l_assigne_n_exempte_pas_de_la_porte(self):
+        """#3219 lève le hold de règle 1 de l'assigné par le contenu ; la porte
+        de production retient encore, puis la note de fusion dit les deux."""
+        self.register("dev-a", "claude")
+        item = self.on_develop("leve-hold", mark="porte OTA", assignee="dev-a")
+        with bound("dev-a"):
+            work.note(self.db, item["id"], "hold: j'attends la fusion du paquet",
+                      actor="dev-a")
+        dry = plan_git.sync_merges(self.db, self.repo, target="develop", dry_run=True)
+        [entry] = [r for r in dry["results"] if r["work_item"] == item["id"]]
+        self.assertEqual((entry["result"], entry["retention"]["what"]),
+                         ("would-withhold", "production"))
+        result = self.run_sync()[item["id"]]
+        self.assertEqual((result["result"], result["retention"]["what"]),
+                         ("withheld", "production"))
+        self.release()
+        self.assertEqual(self.run_sync()[item["id"]]["result"], "merged")
+        merged = [m for m in work.milestones(self.db, item["id"]) if m["kind"] == "merged"]
+        self.assertIn("porte de production : présent sur main", merged[0]["note"])
+        self.assertIn("levée du hold de l'assigné dev-a", merged[0]["note"])
 
 
 if __name__ == "__main__":

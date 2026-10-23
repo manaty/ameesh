@@ -119,6 +119,29 @@ class Preparation:
                     policy=asdict(requirement), history=historical)
 
 
+def _deferred(candidate, error):
+    """A refused candidate with the facts an operator needs (#3139).
+
+    The reason alone cannot tell a pilot which freeze or branch was refused
+    once the enrollment result is journaled without its state. Every field is
+    read from the inventory candidate, never guessed from the work item. The
+    declared freeze and the effective candidate are both kept: a verdict on a
+    remise can name another head than the freeze the train requires.
+    """
+    origin = candidate.get("candidate") if isinstance(candidate.get("candidate"), dict) else {}
+    declared = origin.get("declared") if isinstance(origin.get("declared"), dict) else {}
+    frozen_id = declared.get("id")
+    return dict(
+        work_item_id=candidate.get("work_item_id"),
+        branch=candidate.get("branch") or "",
+        frozen_sha=declared.get("sha") or origin.get("sha") or "",
+        frozen_id=frozen_id if type(frozen_id) is int else None,
+        candidate_sha=origin.get("sha") or "",
+        candidate_origin=origin.get("origin") or "",
+        reason=str(error),
+    )
+
+
 class Enrollment:
     """Explicit packet enrollment; no runner or live queue is installed."""
 
@@ -140,7 +163,7 @@ class Enrollment:
             try:
                 admitted.append(self.enroll(candidate, base, actor=actor, lease=lease))
             except TrainError as exc:
-                deferred.append(dict(work_item_id=candidate["work_item_id"], reason=str(exc)))
+                deferred.append(_deferred(candidate, exc))
         return dict(admitted=admitted, deferred=deferred)
 
     def decide(self, candidate, base):

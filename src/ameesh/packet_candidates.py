@@ -147,7 +147,9 @@ def list_remises(repo: str, where: str, lots, target: str) -> tuple[dict, str]:
     lots = {int(lot) for lot in lots}
     if not lots:
         return {}, ""
-    url = plan_git._out(repo, "remote", "get-url", "origin")
+    # #3041 : l'URL est rejouée dans `where` ; un chemin relatif se lit
+    # depuis `repo`.
+    url = resolutions._local_from(repo, plan_git._out(repo, "remote", "get-url", "origin") or "")
     if url:
         try:
             listing = resolutions._run(where, "ls-remote", url, resolutions.REF_PREFIX + "*",

@@ -354,7 +354,9 @@ class ResumeTest(_Base):
         comptes = self._codex()
         secondaire = comptes["codex"][1]["path"]
         transcript = _rollout(secondaire, "sess-b", self.travail)
-        os.unlink(os.path.join(secondaire, "auth.json"))  # compte inutilisable
+        # Public permissions make the account unusable on every platform;
+        # a missing auth.json alone is valid with the macOS keychain.
+        os.chmod(secondaire, 0o755)
         self._arrete("coord", "sess-b", "secondaire")
         self.db.execute("UPDATE agent_registry SET chantier = 'atelier', "
                         "responsible = 'human:proprio' WHERE name = 'coord'")
@@ -612,7 +614,7 @@ class SessionAccountTest(_Base):
         secondaire = comptes["codex"][1]["path"]
         self.register("rb", "codex", cwd=self.travail)
         registry.set_session(self.db, "rb", "sess-x", "secondaire")
-        os.unlink(os.path.join(secondaire, "auth.json"))  # ancien compte inutilisable
+        os.chmod(secondaire, 0o755)  # unusable even with the macOS keychain
         cfg = dataclasses.replace(self._cfg(comptes), budget_usd_per_hour=10.0,
                                   budget_check_interval=0.0)
         runner, worker = self._worker("rb", cfg)

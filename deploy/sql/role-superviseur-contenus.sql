@@ -55,7 +55,7 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         'pending_prompt', 'current_prompt', 'restart_brief'
     ]),
     ('agent_registry', ARRAY[
-        'pending_prompt', 'current_prompt', 'restart_brief'
+        'pending_prompt', 'current_prompt', 'restart_brief', 'election_brief'
     ]),
     -- L232a (0371) : plan et preuves sans secrets, détails du journal
     ('host_lifecycle_agents', ARRAY['missing']),

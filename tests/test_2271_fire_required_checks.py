@@ -12,8 +12,9 @@ configuration locale du projet le déclarait.
 Le feu lit désormais la protection de la branche cible à la forge, complétée
 par la déclaration `radar.projects.<p>.required_checks`, et exige chaque
 contexte requis **présent** sur la tête gelée et en `SUCCESS` — un check
-absent ou `SKIPPED` laisse la PR non prête. La protection peut imposer une
-application GitHub (`checks[].app_id`) : le feu lit alors la provenance des
+absent laisse la PR non prête ; depuis #3085 (règle owner du 23/10), un check
+sauté ou annulé est non concluant, consigné, et ne bloque plus. La protection
+peut imposer une application GitHub (`checks[].app_id`) : le feu lit alors la provenance des
 check runs de la tête exacte et refuse un homonyme d'une autre application,
 un statut de commit sans source, ou une source illisible (B1 de la relecture
 du 17/10). Un contexte est un nom exact : ses espaces significatifs sont
@@ -411,11 +412,12 @@ class ReadyPrTest(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("tests (absent)", why)
 
-    def test_a_skipped_required_check_is_not_success(self):
+    def test_a_skipped_required_check_is_consigned_not_blocking(self):
+        # #3085 (règle owner 23/10) : un check sauté n'a rien démontré, il est
+        # non concluant — consigné par la porte, jamais compté comme un rouge.
         gh = FakeGh(check_runs=[_run("tests", conclusion="skipped")])
         ok, why = self.ready([_check("tests", "SKIPPED"), _check("couverture")], gh=gh)
-        self.assertFalse(ok)
-        self.assertIn("tests (SKIPPED)", why)
+        self.assertTrue(ok, why)
 
     def test_a_pending_required_check_is_not_ready(self):
         gh = FakeGh(check_runs=[_run("tests", conclusion=None, status="in_progress")])
@@ -506,11 +508,16 @@ class ReadyPrTest(unittest.TestCase):
         ok, why = self.ready([_context("tests")], gh=gh)
         self.assertTrue(ok, why)
 
-    def test_a_non_success_duplicate_of_the_required_name_blocks(self):
+    def test_a_non_success_duplicate_of_the_required_name_does_not_block(self):
+        # #3085 : le doublon sauté est non concluant, pas un négatif ; seul un
+        # FAILURE du nom requis bloque encore.
         gh = FakeGh(check_runs=[_run("tests"), _run("tests", conclusion="skipped")])
         ok, why = self.ready([_check("tests"), _check("tests", "SKIPPED")], gh=gh)
+        self.assertTrue(ok, why)
+        gh = FakeGh(check_runs=[_run("tests"), _run("tests", conclusion="failure")])
+        ok, why = self.ready([_check("tests"), _check("tests", "FAILURE")], gh=gh)
         self.assertFalse(ok)
-        self.assertIn("tests (SKIPPED)", why)
+        self.assertIn("tests (FAILURE)", why)
 
     def test_a_pr_head_past_the_freeze_is_not_ready(self):
         ok, why = self.ready([_check("tests")],
