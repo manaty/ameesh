@@ -47,8 +47,14 @@ def ameesh() -> tuple[Workflow, ...]:
 
     #3098: the blobs are also declared by this file at the target's base
     commit, and that versioned copy is the reference for a packet head. The
-    installed module supplies the paths and jobs; its blobs are only a release
+    installed module supplies the paths; its blobs are only a release
     snapshot and go stale when a packet re-pins a source as it lands.
+    #3108: the base also supplies the jobs, added to the installed ones, so a
+    job added by a re-pinned workflow is required from the next cut instead
+    of the next deployment. The installed jobs stay a floor: a job the base
+    removed is still required until a deployment audits the lower contract.
+    The jobs expression must stay statically readable (constants, tuples,
+    star unpacking, single `range` comprehensions, `%` formatting).
     """
     return (Workflow(
         path=".github/workflows/paquet.yml",
