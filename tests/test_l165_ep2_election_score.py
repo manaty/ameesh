@@ -635,6 +635,22 @@ class RunnerWiringTest(_RoleCase):
         self.assertFalse(allowed)
         self.assertIn("handover", reason)
 
+    def test_le_premier_claim_relit_la_marque_de_bascule(self):
+        # B1 de la relecture #3099 : le tout premier claim d'un Runner neuf
+        # relit `role_handover` sans passer par `handover_wait_s` ni par un
+        # autre préchargement, sinon la marge durable est ignorée au
+        # redémarrage.
+        self.standings_for_handover()
+        obj = self.runner()
+        obj.note_handover_release("pilote", "atelier", 0.0)
+        again = self.runner()
+        self.assertFalse(again._handover_loaded)
+        again._election_free_since["pilote"] = again.clock.monotonic() - 21.0
+        allowed, reason, _ = again.election_claim_allowed(self.role_row)
+        self.assertFalse(allowed)
+        self.assertIn("handover", reason)
+        self.assertTrue(again._handover_loaded)
+
     def test_le_refroidissement_survit_au_redemarrage(self):
         # #3099 : la marque échue devient le refroidissement du challenger ;
         # un exécuteur repris ne redonne pas le rôle au même challenger mort.

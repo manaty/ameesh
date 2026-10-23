@@ -8786,6 +8786,10 @@ class Runner:
         if self.dry_run or getattr(self, "mediated", False):
             return True, "", None
         from . import election
+        # B1 de la relecture #3099 : un exécuteur neuf a la carte vide ; le
+        # premier claim doit relire la base avant de la consulter, sinon la
+        # marque écrite avant de rendre le bail est ignorée au redémarrage.
+        self._load_handover_state()
         name = agent["name"]
         now = self.clock.monotonic()
         released = self._handover_released.get(name)
