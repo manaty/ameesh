@@ -461,6 +461,13 @@ the runner.
 the runner — example unit `deploy/systemd/ameesh-notify.service`,
 configuration and secrets in [EXPLOITATION.md](EXPLOITATION.md#alertes-poussées--ameesh-notify).
 
+**macOS** (L65): the same two user services are launchd **LaunchAgents**,
+written and loaded by `ameesh service install` (the host runner and
+`ameesh notify`, or one runner per agent with `--agent`); `ameesh service
+status` reads launchd, `ameesh service uninstall` removes them. The
+installation guide is
+[site/docs/guides/install.md](../site/docs/guides/install.md#macos-remote-database-launchd-services-and-keychain).
+
 **ameesh-approve [P]**, a system service under its own user, never the
 agents' user:
 
