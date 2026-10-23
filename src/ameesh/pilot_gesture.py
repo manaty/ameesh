@@ -41,7 +41,10 @@ host uses (`policy.lease_ttl` of its Host card, else the executor
 configuration — the runner's own rule) and never below the expiry currently
 held. Renewing below that TTL would make the lease expire before the runner's
 next heartbeat (`lease_ttl / 3`) and elect another pilot for a mere gesture
-(#3115).
+(#3115). It also does not hold the role longer than that rule: on a volatile
+host (90 s), the 300 s default would keep a disappeared host's pilot alive
+for 300 s and delay the election by as much; `ttl_s` only covers a host with
+no known rule, and an external call's margin still wins (#3123).
 
 The event is the durable trace of the authorization; the effect follows it.
 A human or the bureau has no agent lease to fence and passes through, as does
@@ -68,7 +71,8 @@ GESTURES = ("merge", "queue", "assign", "packet", "decision")
 #: event type written in `ameesh_events` (append-only, one year by default)
 EVENT = "pilot.gesture"
 #: minimum lease duration used to hold the role while the gesture runs (the
-#: runner's own default); `Gate.lease_ttl` raises it to the host's rule
+#: runner's own default) when no Host card rules it; a Host card rule replaces
+#: it (`Gate.host_lease_ttl`), so a volatile host is not held 300 s (#3123)
 DEFAULT_TTL_S = 300.0
 #: extra time added to a lease renewed for an external call whose timeout is
 #: `margin_s`: the call must have the whole margin left, not exactly it
@@ -98,6 +102,11 @@ class Gate:
     #: of its Host card, else the executor configuration): `hold` never renews
     #: below it, so a gesture cannot shorten the lease the runner renews
     lease_ttl: float = DEFAULT_TTL_S
+    #: the Host card's own rule when it declares one, else None: `hold` uses
+    #: it instead of `ttl_s`, which only covers hosts with no known rule
+    #: (holding the 300 s default on a volatile host would delay its failover,
+    #: #3123)
+    host_lease_ttl: float | None = None
 
     def hold(self, db, *, ttl_s: float = DEFAULT_TTL_S, margin_s: float = 0.0) -> int:
         """Renew the lease and journal the gesture, in the same transaction.
@@ -105,9 +114,9 @@ class Gate:
         A stale epoch cannot write the receipt: `registry.renew` is fenced by
         `(owner, epoch)` and locks the agent row, so an election that commits
         between this session's last renewal and this call is seen here. The
-        effect may then run: the lease is live again for at least `ttl_s` and
-        the host's own TTL (`lease_ttl`), and a claim only takes a free or
-        expired lease (EP1). Returns the event id.
+        effect may then run: the lease is live again for at least the host's
+        own TTL (`lease_ttl`), or `ttl_s` when the host has no known rule, and
+        a claim only takes a free or expired lease (EP1). Returns the event id.
 
         The renewal also never shortens an expiry already held: `renew` keeps
         the later of the current expiry and the new one under the row lock
@@ -115,6 +124,14 @@ class Gate:
         since the claim, or a heartbeat renewing between our read and the lock
         must not make the lease expire before the runner's next heartbeat and
         elect another pilot (#3115).
+
+        `ttl_s` is the minimum to hold while the gesture runs when no Host
+        card rules the duration (the executor configuration, 300 s by
+        default). When one does (`host_lease_ttl`), the rule is what the
+        runner's next heartbeat renews: holding the generic default on top of
+        it would keep the role alive after a volatile host disappears and
+        delay the election by as much (#3123). Only an external call's margin
+        can then extend beyond the rule.
 
         `margin_s` is the worst-case duration of an external call (a push, a
         `gh pr merge`, its read-back) made right after this transaction. The
@@ -125,8 +142,14 @@ class Gate:
         and the target lease remain the last guards.
         """
         margin = max(0.0, float(margin_s))
-        ttl = max(float(ttl_s), float(self.lease_ttl or 0.0),
-                  margin + RENEW_GRACE_S)
+        held = margin + RENEW_GRACE_S
+        if self.host_lease_ttl is not None:
+            # #3123: renew to the host's rule, not to the 300 s default, so a
+            # gesture cannot keep a volatile host's role for 300 s after it
+            # disappears; the next heartbeat renews the same rule.
+            ttl = max(float(self.host_lease_ttl), held)
+        else:
+            ttl = max(float(ttl_s), float(self.lease_ttl or 0.0), held)
         with db.transaction() as tx:
             before = registry.get(tx, self.agent) or {}
             if before.get("status") == "stopped":
@@ -195,8 +218,8 @@ def _positive(value, fallback: float) -> float:
     return number if number > 0 else fallback
 
 
-def effective_ttl(cfg, host: str) -> float:
-    """The lease TTL the runner of `host` applies, so a gesture never shortens it.
+def effective_ttl(cfg, host: str) -> tuple[float, float | None]:
+    """The lease TTL the runner of `host` applies, and the Host card rule.
 
     The runner renews with `policy.lease_ttl` of the host's Host card (the
     shortest of the canons), `policy.volatile` (90 s), else the executor
@@ -206,23 +229,31 @@ def effective_ttl(cfg, host: str) -> float:
     lease expire before that heartbeat and elect another pilot for a mere
     gesture (#3115). A canon that cannot be read leaves the configuration as
     the fallback; `Gate.hold` also keeps the expiry it already found.
+
+    The second element is the Host card's own rule when one is known, else
+    None: `Gate.hold` keeps the generic `ttl_s` for a host with no rule, and
+    applies the rule instead otherwise, so a gesture does not hold a volatile
+    host's role beyond its 90 s (#3123).
     """
     default = _positive(getattr(cfg, "lease_ttl", None), DEFAULT_TTL_S)
     if cfg is None:
-        return DEFAULT_TTL_S
+        return DEFAULT_TTL_S, None
     try:
         from . import canon as canon_mod
         canons = canon_mod.load_configured(cfg)
     except Exception:  # noqa: BLE001 - the configuration remains the fallback
         canons = ()
     try:
-        from .mediated_executor.host_gate import lease_ttl_for
+        from .mediated_executor.host_gate import lease_ttl_rule
     except Exception:  # noqa: BLE001 - the configuration remains the fallback
-        return default
+        return default, None
     try:
-        return _positive(lease_ttl_for(canons, host, default), default)
+        rule = _positive(lease_ttl_rule(canons, host), 0.0)
     except Exception:  # noqa: BLE001 - the configuration remains the fallback
-        return default
+        return default, None
+    if not rule:
+        return default, None
+    return rule, rule
 
 
 def _claims_lease() -> bool:
@@ -318,9 +349,10 @@ def _role_gate(cfg, db, role: str, gesture: str, ref: str,
                               host=str(row.get("host") or ""), role=canonical,
                               reason=reason)))
     host = str(row.get("host") or "")
+    ttl, rule = effective_ttl(_cfg(db, cfg), host)
     return Gate(canonical, current_owner, epoch, gesture, (ref or "").strip(),
                 project, host=host, role=canonical,
-                lease_ttl=effective_ttl(_cfg(db, cfg), host))
+                lease_ttl=ttl, host_lease_ttl=rule)
 
 
 def gate(cfg, db, gesture: str, ref: str, *, project: str | None = None) -> Gate | None:
@@ -383,11 +415,12 @@ def gate(cfg, db, gesture: str, ref: str, *, project: str | None = None) -> Gate
         raise GestureRefused(
             "gesture %s refused: session names %s, the lease belongs to %s"
             % (gesture, name, binding.name))
+    host = str(row.get("host") or "")
+    ttl, rule = effective_ttl(_cfg(db, cfg), host)
     return Gate(canonical, binding.runner_id, int(binding.epoch), gesture,
-                (ref or "").strip(), project, host=str(row.get("host") or ""),
+                (ref or "").strip(), project, host=host,
                 reason=binding.reason,
-                lease_ttl=effective_ttl(_cfg(db, cfg),
-                                        str(row.get("host") or "")))
+                lease_ttl=ttl, host_lease_ttl=rule)
 
 
 def guard(cfg, db, gesture: str, ref: str, *, project: str | None = None,
