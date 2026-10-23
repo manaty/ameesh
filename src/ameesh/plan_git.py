@@ -985,12 +985,17 @@ def _wake_retention(db, row: dict, retention: dict, *, entry: dict, target: str)
             or recipient == work_mod.SYSTEM_SENDER:
         return
     ref = str(entry.get("ref") or entry.get("sha") or "")
+    lift = ("lift the hold (a state change or an `unhold:` note) and the next "
+            "content sweep will close it")
+    if retention.get("what") == "production":
+        # #3022 : c'est la présence sur la branche de prod qui ferme
+        lift = ("it closes once the fix reaches the production branch (release or "
+                "incident fix); a wrong mark is lifted by a `prod-gate lifted:` note")
     body = ("Lot #%d \"%s\": its frozen content is merged into %s (%s, %s), but the "
-            "closure is withheld: %s. The lot stays %s; lift the hold (a state change "
-            "or an `unhold:` note) and the next content sweep will close it."
+            "closure is withheld: %s. The lot stays %s; %s."
             % (int(row["id"]), row.get("title") or "", target,
                entry.get("how") or "?", ref[:12] or "?", retention["motif"],
-               row.get("state") or "?"))
+               row.get("state") or "?", lift))
     try:
         mail.send(db, work_mod.SYSTEM_SENDER, recipient, body, kind="event",
                   work_item_id=str(int(row["id"])),
