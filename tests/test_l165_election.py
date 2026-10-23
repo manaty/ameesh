@@ -71,6 +71,200 @@ class ElectionValidationTest(test_canon._TmpMixin, unittest.TestCase):
         self.assertIn("agent-candidats-ignored", codes(canon.validate(self.load()), canon.WARNING))
 
 
+class ElectionMaxAgentsTest(test_canon._TmpMixin, unittest.TestCase):
+    """#3101 : une admission de rôle élu ne prend qu'une place dans le maillage,
+    sur l'un de ses candidats, et non une sur chaque hôte candidat."""
+
+    def setUp(self) -> None:
+        self.root = self.example_copy()
+        write(self.root, "agents/relecteur.md", election_agent())
+        write(self.root, "placements/relecteur-atelier.md", election_admission())
+
+    def hosts(self, atelier: int, banc: int,
+              atelier_harnesses=("claude", "codex", "deepseek")) -> None:
+        # orchestre est épinglé sur atelier, ouvrier sur banc
+        write(self.root, "hotes/atelier.md", host_card(
+            "atelier", harnesses=list(atelier_harnesses),
+            providers=["anthropic", "openai", "deepseek"],
+            credential_modes=["api-key", "subscription"],
+            work_roots="{acme-web: ~/acme/acme-web}", max_agents=str(atelier)))
+        write(self.root, "hotes/banc.md", host_card(
+            "banc", "human:alice", harnesses=["deepseek", "codex"],
+            providers=["deepseek", "openai"], credential_modes=["api-key"],
+            work_roots="{acme-web: /srv/acme/acme-web}", max_agents=str(banc)))
+
+    def load(self):
+        return canon.load(self.root, untrusted=True)
+
+    def test_le_role_elu_compte_une_fois(self):
+        # atelier est plein de ses épinglés ; le rôle s'assoit sur banc
+        self.hosts(atelier=1, banc=2)
+        self.assertEqual(codes(canon.validate(self.load()), canon.ERROR), set())
+        # `ameesh hosts` compte le rôle sur son seul siège
+        from ameesh import mesh_cli
+        loaded = self.load()
+        self.assertEqual({h: mesh_cli._host_admissions(loaded, h) for h in ("atelier", "banc")},
+                         {"atelier": 1, "banc": 2})
+
+    def test_aucune_place_chez_aucun_candidat(self):
+        self.hosts(atelier=1, banc=1)
+        findings = canon.validate(self.load())
+        self.assertIn("agent-election-max-agents", codes(findings, canon.ERROR))
+        self.assertNotIn("host-max-agents", codes(findings))
+        blocking = canon.blocking(findings)
+        self.assertIn("relecteur", blocking.by_agent)
+        self.assertNotIn("atelier", blocking.by_host)
+
+    def test_candidat_plein_ne_reclame_pas(self):
+        """B1 (relecture cx2) : le verdict d'un candidat suit sa place."""
+        from ameesh import placement
+        self.hosts(atelier=1, banc=2)
+        loaded = self.load()
+        atelier = placement.evaluate(loaded, "relecteur", "atelier")
+        self.assertIs(atelier.ok, False)
+        self.assertIn("host atelier full: 1 placement(s) for max_agents = 1", atelier.diagnostic)
+        self.assertIs(placement.evaluate(loaded, "relecteur", "banc").ok, True)
+        # place libre des deux côtés : les deux candidats restent ouverts
+        self.hosts(atelier=2, banc=2)
+        loaded = self.load()
+        self.assertEqual([placement.evaluate(loaded, "relecteur", h).ok
+                          for h in ("atelier", "banc")], [True, True])
+
+    def test_admission_par_alias_comptee_une_fois(self):
+        """B3 (relecture cx2) : l'admission écrite sous un alias est celle du rôle."""
+        from ameesh import placement
+        write(self.root, "agents/relecteur.md", election_agent(aliases=["elu"]))
+        write(self.root, "placements/relecteur-atelier.md", fiche(
+            type="Placement", title="elu@candidats", agent="elu",
+            hosts=["atelier", "banc"], credential_mode="api-key"))
+        self.hosts(atelier=1, banc=2)
+        loaded = self.load()
+        self.assertEqual(codes(canon.validate(loaded), canon.ERROR), set())
+        self.assertEqual(placement.host_load(loaded)[1], {"relecteur": "banc"})
+        for name in ("relecteur", "elu"):
+            self.assertIs(placement.evaluate(loaded, name, "banc").ok, True, name)
+            self.assertIs(placement.evaluate(loaded, name, "atelier").ok, False, name)
+
+    def test_role_assis_garde_sa_place_face_au_role_sans_place(self):
+        """B4 (relecture dev5) : un rôle sans place ne ferme pas le candidat
+        d'un rôle assis ; seule sa propre fiche est en erreur."""
+        from ameesh import placement
+        write(self.root, "agents/relecteur2.md", election_agent(title="relecteur2"))
+        write(self.root, "placements/relecteur2.md", fiche(
+            type="Placement", title="relecteur2@candidats", agent="relecteur2",
+            hosts=["atelier", "banc"], credential_mode="api-key"))
+        self.hosts(atelier=2, banc=1)
+        loaded = self.load()
+        findings = canon.validate(loaded)
+        self.assertEqual({f.agent for f in findings
+                          if f.code == "agent-election-max-agents"}, {"relecteur2"})
+        self.assertEqual(placement.host_load(loaded)[1],
+                         {"relecteur": "atelier", "relecteur2": None})
+        verdict = placement.evaluate(loaded, "relecteur", "atelier")
+        self.assertIs(verdict.ok, True, verdict.diagnostic)
+        choix = {c["host"]: c for c in placement.proposals(loaded, "relecteur")}
+        self.assertNotIn("full", " ".join(choix["atelier"]["reasons"]))
+        # le rôle sans place ne prend pas celle du rôle assis
+        verdict = placement.evaluate(loaded, "relecteur2", "atelier")
+        self.assertIs(verdict.ok, False)
+        self.assertIn("elected role(s) relecteur would find no place", verdict.diagnostic)
+        # une place de plus : les deux rôles sont assis, chacun sur un candidat
+        self.hosts(atelier=3, banc=1)
+        loaded = self.load()
+        self.assertEqual(codes(canon.validate(loaded), canon.ERROR), set())
+        self.assertEqual([placement.evaluate(loaded, r, "atelier").ok
+                          for r in ("relecteur", "relecteur2")], [True, True])
+
+    def test_role_sans_place_ne_se_substitue_pas_a_un_role_assis(self):
+        """B5 (relecture cx2) : trois rôles ; placer un rôle assis ailleurs ne
+        doit pas déloger un rôle assis au profit d'un rôle sans place."""
+        from ameesh import placement
+        write(self.root, "agents/relecteur.md", election_agent(candidats=["atelier"]))
+        for name in ("relecteur2", "relecteur3"):
+            write(self.root, "agents/%s.md" % name, election_agent(title=name))
+            write(self.root, "placements/%s.md" % name, fiche(
+                type="Placement", title="%s@candidats" % name, agent=name,
+                hosts=["atelier", "banc"], credential_mode="api-key"))
+        self.hosts(atelier=2, banc=2)
+        loaded = self.load()
+        self.assertEqual(placement.host_load(loaded)[1],
+                         {"relecteur": "atelier", "relecteur2": "banc", "relecteur3": None})
+        self.assertEqual({f.agent for f in canon.validate(loaded)
+                          if f.code == "agent-election-max-agents"}, {"relecteur3"})
+        verdict = placement.evaluate(loaded, "relecteur2", "atelier")
+        self.assertIs(verdict.ok, False)
+        self.assertIn("elected role(s) relecteur would find no place", verdict.diagnostic)
+        self.assertIs(placement.evaluate(loaded, "relecteur2", "banc").ok, True)
+        self.assertIs(placement.evaluate(loaded, "relecteur", "atelier").ok, True)
+        for host in ("atelier", "banc"):
+            self.assertIs(placement.evaluate(loaded, "relecteur3", host).ok, False, host)
+
+    def test_candidat_refuse_par_sa_politique_n_assoit_pas(self):
+        """B2 (relecture cx2) : un candidat qui refuse le harnais n'offre pas de place."""
+        from ameesh import placement
+        self.hosts(atelier=2, banc=1, atelier_harnesses=("claude", "deepseek"))
+        loaded = self.load()
+        findings = canon.validate(loaded)
+        self.assertIn("agent-election-max-agents", codes(findings, canon.ERROR))
+        self.assertIn("relecteur", canon.blocking(findings).by_agent)
+        self.assertEqual(placement.host_load(loaded)[1], {"relecteur": None})
+        banc = placement.evaluate(loaded, "relecteur", "banc")
+        self.assertIs(banc.ok, False)
+        self.assertIn("host banc full", banc.diagnostic)
+
+    def test_executeur_reserve_les_places_epinglees(self):
+        """B1 : un rôle élu ne prend que les places laissées par les épinglés."""
+        import threading
+        import types
+        from ameesh import runner as runner_mod
+
+        class Fil:
+            def __init__(self, **agent):
+                self.agent = agent
+
+            def is_alive(self):
+                return True
+
+        runner = types.SimpleNamespace(lock=threading.Lock(), _host_max_agents=3,
+                                       _host_pinned_admissions=2,
+                                       workers={"x": Fil(), "r1": Fil(releve="election")})
+        admits = lambda row: runner_mod.Runner.admits_new_worker(runner, row)  # noqa: E731
+        self.assertFalse(admits({"name": "r2", "releve": "election"}))  # 3 - 2 = 1 place, prise
+        self.assertTrue(admits({"name": "y"}))                           # place épinglée libre
+        del runner.workers["r1"]
+        self.assertTrue(admits({"name": "r2", "releve": "election"}))
+        runner._host_pinned_admissions = None                             # serveur : inconnu
+        runner.workers["r1"] = Fil(releve="election")
+        self.assertTrue(admits({"name": "r2", "releve": "election"}))
+
+    def test_les_epingles_comptent_toujours_partout(self):
+        self.hosts(atelier=0, banc=2)
+        self.assertIn("host-max-agents", codes(canon.validate(self.load()), canon.ERROR))
+
+    def test_couplage_deplace_un_role_deja_assis(self):
+        seats = canon.seat_elected({"a": 1, "b": 1, "c": None},
+                                   {"r1": ["a", "b"], "r2": ["a"], "r3": ["c"]})
+        self.assertEqual(seats, {"r1": "b", "r2": "a", "r3": "c"})
+        seats = canon.seat_elected({"a": 1, "b": 0}, {"r1": ["a", "b"], "r2": ["a"]})
+        self.assertEqual(set(seats.values()), {"a", None})
+
+    def test_proposition_ne_deloge_pas_un_role_elu(self):
+        from ameesh import placement
+        # relecteur n'a qu'atelier pour candidat : la dernière place y est la sienne
+        write(self.root, "agents/relecteur.md", election_agent(candidats=["atelier"]))
+        self.hosts(atelier=2, banc=2)
+        self.assertEqual(codes(canon.validate(self.load()), canon.ERROR), set())
+        choix = {c["host"]: c for c in placement.proposals(self.load(), "ouvrier")}
+        self.assertFalse(choix["atelier"]["admissible"])
+        self.assertIn("elected role(s) relecteur would find no place",
+                      " ".join(choix["atelier"]["reasons"]))
+        # candidat aussi sur banc : relecteur y glisse, atelier n'est plus plein
+        # (ouvrier n'y reste refusé que faute d'admission)
+        write(self.root, "agents/relecteur.md", election_agent())
+        choix = {c["host"]: c for c in placement.proposals(self.load(), "ouvrier")}
+        self.assertNotIn("full", " ".join(choix["atelier"]["reasons"]))
+
+
 class ElectionSyncTest(test_canon._CanonDbCase):
     def setUp(self) -> None:
         super().setUp()

@@ -468,10 +468,8 @@ def _host_parts(cfg: Config, db, canons, only: str | None, history: int) -> list
         parts.append({
             "name": name, "fiches": fiches, "physical": physical, "latest": latest,
             "host": fiches[0][1] if fiches else None,
-            "admissions": {
-                canon.id: sum(1 for p in canon.placements if p.agent and name in
-                              placement_mod.admitted_hosts(canon, p))
-                for canon, _fiche in fiches},
+            "admissions": {canon.id: _host_admissions(canon, name)
+                           for canon, _fiche in fiches},
             "verdict": (res.pressure(latest, limits=physical["limits"])
                         if latest is not None else None),
             "history": res.history(db, name, history),
@@ -1021,6 +1019,14 @@ def cmd_menage(cfg: Config, args: argparse.Namespace) -> int:
     """`ameesh menage` (L73), déprécié (L148) : alias caché de `housekeeping`."""
     sys.stderr.write("menage is deprecated, use housekeeping\n")
     return cmd_housekeeping(cfg, args)
+
+
+def _host_admissions(canon, name: str) -> int:
+    """Admissions de `name` dans un canon : les épinglées, plus les rôles élus
+    qui y tiennent leur siège (#3101 : un rôle élu ne compte qu'une fois)."""
+    from . import placement as placement_mod
+    pinned, seats = placement_mod.host_load(canon)
+    return pinned.get(name, 0) + sum(1 for seat in seats.values() if seat == name)
 
 
 def _print_host_fiches(fiches: list, physical: dict, admissions: dict, *, many: bool) -> None:
