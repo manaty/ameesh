@@ -152,6 +152,9 @@ class NoClaimAfterStaleTest(unittest.TestCase):
         )
         fake._gate_settled.set()
         fake.expire_delegations_once = lambda: None
+        # L165 (EP2) : `sweep` publie aussi les scores de rôles de l'hôte ;
+        # cette doublure n'a ni horloge ni registre, comme pour #508.
+        fake.role_evaluation_once = lambda: None
         # #508 : `sweep` publie la preuve de vie avant la moisson ; ce témoin
         # L790 n'a ni horloge ni registre, la doublure la neutralise.
         fake.report_liveness = lambda *args, **kwargs: None

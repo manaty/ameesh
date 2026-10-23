@@ -220,7 +220,14 @@ class RunnerStandbyTest(_ElectionCase):
         cfg = dataclasses.replace(
             self.cfg, host=host, runner_id="runner-%s" % host,
             state_dir=os.path.join(self.tmp, "state-%s" % host))
-        return Runner(cfg, self.db, once=True, agents=["relecteur"])
+        runner = Runner(cfg, self.db, once=True, agents=["relecteur"])
+        # EP2 (score, rang, hystérésis) a sa propre suite ; les témoins EP3
+        # commencent APRÈS sa porte, quand le candidat peut tenter le CAS.
+        gate = mock.patch.object(Runner, "election_claim_allowed",
+                                 return_value=(True, "", None))
+        gate.start()
+        self.addCleanup(gate.stop)
+        return runner
 
     def test_le_standby_ne_lance_aucun_tour_pendant_le_bail(self):
         self.sync_both()

@@ -39,7 +39,12 @@ and the winner becomes the holder. `canon sync` writes the placement verdict
 of **each** candidate host, so the host policy and visibility rule are still
 checked on the host that claims. Such a role is not moved by L232e: there is
 no local work to publish, and the lease epoch fences the former holder. The
-repository note `docs/HOST-HANDOFFS.md` has the full election rules.
+repository note `docs/HOST-HANDOFFS.md` has the full election rules. The
+best *ready* candidate wins, with a short per-rank delay before the claim
+(0 s, 20 s, 40 s…); availability over seven days decides, capacity only breaks
+ties, and a holder is replaced only after a challenger has stayed 5 points
+ahead for an hour, at the end of the holder's turn. `ameesh role status` shows
+the holder, the epoch and the ranking.
 
 A candidate runner takes **no turn before the lease**: the worker is created
 only after the claim, renews the lease before each turn, and its harness is
