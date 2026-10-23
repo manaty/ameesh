@@ -250,3 +250,150 @@ class DeletedPriorContentCommitTest(_DeletedFileFixture):
         self.repo.git("reset", "--hard", self.author)
         self.assertFalse(review_authors._commit_survives(
             self.repo.root, self.author, self.review_doc, {}, self.base))
+
+
+class _MixedCopyFixture(_RewriteFixture):
+    """La garde copiée par le correcteur existe dans policy.py et dans gate.py."""
+
+    def _build_head_a(self):
+        self.repo.write("src/ameesh/policy.py",
+                        "require_session_identity()\n")
+        self.repo.write("src/ameesh/gate.py", "# gate\n")
+        self.base = self.repo.commit("base")
+        self.repo.write("src/ameesh/gate.py",
+                        "# gate\nrequire_session_identity()\n")
+        self.repo.write(DOC, DOC_TEXT)
+        self.review_doc = self.repo.commit(
+            "cx3: copie la garde et documente", agent="cx3")
+        self.receipt("cx3", "codex", [self.review_doc])
+        self.head_a = self.review_doc
+        self.db.execute("UPDATE work_items SET branch_target = %s WHERE id = %s",
+                        (self.base, self.lot))
+        self.freeze(self.head_a)
+
+
+class MixedCopyTest(_MixedCopyFixture):
+    """B/P1 cx2 : une copie encore à son chemin garde l'auteur (#2977)."""
+
+    def setUp(self):
+        super().setUp()
+        self.repo.git("reset", "--hard", self.base)
+        self.repo.write("src/ameesh/gate.py",
+                        "# gate\nrequire_session_identity()\n")
+        self.head_b = self.repo.commit(
+            "impl: copie conservée, document omis", agent="impl")
+        self.receipt("impl", "deepseek", [self.head_b])
+        self.freeze_b = self.freeze(self.head_b)
+        self.milestone = {"id": int(self.freeze_b["id"]), "sha": self.head_b,
+                          "actor": "impl", "at_ts": self.freeze_b.get("at_ts")}
+
+    def test_the_copy_still_at_its_path_keeps_the_corrector(self):
+        authors, unknown, correctors = self.reading(
+            self.milestone, [self.head_b], self.base, self.head_b)
+        self.assertEqual(unknown, [])
+        self.assertEqual({row["name"]: row["family"] for row in authors},
+                         {"impl": "deepseek", "cx3": "codex"})
+        self.assertIn("cx3", {row["name"] for row in correctors})
+
+    def test_the_gate_refuses_the_corrector_with_a_surviving_copy(self):
+        klass = {"class": "sensitive", "doubt": False,
+                 "files": [{"path": "src/ameesh/gate.py",
+                            "class": "sensitive",
+                            "rule": ["src/ameesh/gate.py"]}],
+                 "repo": self.repo.root, "target": self.base,
+                 "base_sha": self.base}
+        for actor in ("cx3", "dev1"):
+            self.verdict(actor, self.head_b)
+        out = merge_queue.review_gate(
+            self.db, work.milestones(self.db, self.lot), self.head_b,
+            repo=self.repo.root, klass=klass, item=self.lot_item(), required=2)
+        self.assertFalse(out.get("error"), out)
+        self.assertFalse(out["ok"], out["why"])
+        self.assertEqual([entry["actor"] for entry in out["accepted"]],
+                         ["dev1"], out)
+        self.assertIn("cx3", {row["name"] for row in out["authors"]})
+
+
+class _WholeFileDeletionFixture(_RewriteFixture):
+    """Le correcteur supprime un fichier entier et ajoute un document."""
+
+    def _build_head_a(self):
+        self.repo.write("src/ameesh/legacy_bypass.py",
+                        "allow_all_users_without_check()\n")
+        self.repo.write("src/ameesh/gate.py", "# gate\n")
+        self.base = self.repo.commit("base")
+        self.repo.git("rm", "-q", "src/ameesh/legacy_bypass.py")
+        self.repo.write(DOC, DOC_TEXT)
+        self.review_doc = self.repo.commit(
+            "cx3: retire le contournement et documente", agent="cx3")
+        self.receipt("cx3", "codex", [self.review_doc])
+        self.head_a = self.review_doc
+        self.db.execute("UPDATE work_items SET branch_target = %s WHERE id = %s",
+                        (self.base, self.lot))
+        self.freeze(self.head_a)
+
+
+class DeletedWholeFileTest(_WholeFileDeletionFixture):
+    """B/P1 dev2 : la suppression du fichier par le correcteur subsiste."""
+
+    def setUp(self):
+        super().setUp()
+        self.repo.git("reset", "--hard", self.base)
+        self.repo.git("rm", "-q", "src/ameesh/legacy_bypass.py")
+        self.head_b = self.repo.commit(
+            "impl: suppression conservée, document omis", agent="impl")
+        self.receipt("impl", "deepseek", [self.head_b])
+        self.freeze_b = self.freeze(self.head_b)
+        self.milestone = {"id": int(self.freeze_b["id"]), "sha": self.head_b,
+                          "actor": "impl", "at_ts": self.freeze_b.get("at_ts")}
+
+    def test_the_corrector_deletion_still_counts(self):
+        authors, unknown, correctors = self.reading(
+            self.milestone, [self.head_b], self.base, self.head_b)
+        self.assertEqual(unknown, [])
+        self.assertEqual({row["name"]: row["family"] for row in authors},
+                         {"impl": "deepseek", "cx3": "codex"})
+        self.assertIn("cx3", {row["name"] for row in correctors})
+
+
+class _InheritedHeadingFixture(_RewriteFixture):
+    """Un autre document de la base porte la ligne d'en-tête du document ajouté."""
+
+    def _build_head_a(self):
+        self.repo.write("src/ameesh/runner.py", "base\n")
+        self.repo.write("docs/review/other.md",
+                        "# #3211 — avis Codex R2 : OK\n")
+        self.base = self.repo.commit("base")
+        self.repo.write("src/ameesh/runner.py", "base\nlot\n")
+        self.author = self.repo.commit("impl: lot", agent="impl")
+        self.receipt("impl", "deepseek", [self.author])
+        self.repo.write(DOC, DOC_TEXT)
+        self.review_doc = self.repo.commit("cx3: avis #3211", agent="cx3")
+        self.receipt("cx3", "codex", [self.review_doc])
+        self.head_a = self.review_doc
+        self.db.execute("UPDATE work_items SET branch_target = %s WHERE id = %s",
+                        (self.base, self.lot))
+        self.freeze(self.head_a)
+
+
+class InheritedHeadingInDeletedDocTest(_InheritedHeadingFixture):
+    """B3 garde #3216 : l'en-tête hérité ne garde pas l'auteur du doc supprimé."""
+
+    def setUp(self):
+        super().setUp()
+        self.repo.git("reset", "--hard", self.base)
+        self.repo.write("src/ameesh/runner.py", "base\nlot\n")
+        self.head_b = self.repo.commit(
+            "impl: document omis", agent="impl")
+        self.receipt("impl", "deepseek", [self.head_b])
+        self.freeze_b = self.freeze(self.head_b)
+        self.milestone = {"id": int(self.freeze_b["id"]), "sha": self.head_b,
+                          "actor": "impl", "at_ts": self.freeze_b.get("at_ts")}
+
+    def test_the_inherited_heading_does_not_carry_the_deleted_doc_author(self):
+        authors, unknown, correctors = self.reading(
+            self.milestone, [self.head_b], self.base, self.head_b)
+        self.assertEqual(unknown, [])
+        self.assertEqual({row["name"]: row["family"] for row in authors},
+                         {"impl": "deepseek"})
+        self.assertEqual(correctors, [])

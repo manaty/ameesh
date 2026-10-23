@@ -655,20 +655,17 @@ def _commit_survives(repo: str, head: str, sha: str, cache: dict,
     leur ancien chemin.
 
     #3220 : si aucune de ces lignes ne subsiste nulle part, le contenu n'a pas
-    # forcément disparu : la lecture examine encore les lignes retirées. Un
-    # retrait conservé (la ligne n'est plus dans la tête au chemin d'origine)
-    # est une partie du contenu du commit et garde l'auteur. Quand le commit a
-    # des additions propres et qu'elles ont toutes disparu, un retrait ne
-    # compte qu'à un chemin encore présent dans la tête : à un chemin absent,
-    # la suppression du fichier a pu emporter l'édition entière, ce n'est plus
-    # une preuve de survie (#3220 B2, revue dev2). Ce n'est qu'après ce
-    # contrôle, quand rien ne subsiste, qu'un commit à additions propres est
-    # tenu pour disparu. Les **copies** ne comptent que lorsque toutes les
-    # additions sont héritées (#2977) : leur bloc traite un chemin absent comme
-    # un doute, et une ligne d'en-tête commune héritée garderait sinon l'auteur
-    # d'un fichier supprimé (#3216, revue mesh-design). Une lecture impossible
-    # reste un doute (`_any_line_in_head` rend True), jamais une preuve de
-    # suppression.
+    forcément disparu : la lecture examine encore les lignes retirées. Un
+    retrait conservé (la ligne n'est plus dans la tête au chemin d'origine)
+    garde l'auteur, sauf quand le commit a des additions propres qui ont toutes
+    disparu et que le chemin était encore présent après le commit : une
+    suppression ultérieure a pu emporter l'édition entière (#3220 B2, revue
+    dev2). Les copies se lisent ensuite : une copie encore à son chemin, avec
+    une occurrence de plus que dans le parent, garde l'auteur (#2977) ; une
+    copie à un chemin prouvé absent ne le garde pas dans ce même cas, sinon une
+    ligne d'en-tête commune rouvrirait #3216 (revue mesh-design). Sans addition
+    propre, un chemin absent reste le doute B8. Une lecture impossible reste un
+    doute (`_any_line_in_head` rend True), jamais une preuve de suppression.
 
     #2977 : une ligne ajoutée qui existait déjà avant le correctif (parent du
     commit, ou base de fusion de la tête et de `base`) n'est pas propre au
@@ -677,8 +674,9 @@ def _commit_survives(repo: str, head: str, sha: str, cache: dict,
     que le commit retire aussi ailleurs (un déplacement) reste une preuve,
     comme avant. Sans ligne propre, la lecture passe aux lignes retirées,
     puis aux lignes copiées, cherchées à leur seul chemin (un chemin absent
-    conserve l'auteur) : une copie retirée ne garde pas son correcteur (B1).
-    Un diff sans ligne significative conserve l'auteur."""
+    reste un doute, sauf le cas #3220 B2 ci-dessus) : une copie retirée ne
+    garde pas son correcteur (B1). Un diff sans ligne significative conserve
+    l'auteur."""
     parsed = _commit_lines(repo, sha)
     if parsed is None:
         return True
@@ -716,37 +714,37 @@ def _commit_survives(repo: str, head: str, sha: str, cache: dict,
         for path, row in removed:
             lines = _head_lines(repo, head, path, cache)
             if lines is None:
-                # #3220 B2 (revue dev2) : quand les additions propres du
-                # commit ont toutes disparu, un chemin **prouvé absent** ne
-                # distingue plus le retrait appliqué de la suppression qui a
-                # emporté l'édition entière. Une lecture impossible reste un
-                # doute, et sans addition propre le doute B8 garde l'auteur
-                # d'un retrait (fichier réellement supprimé).
-                if added and _path_absent(repo, head, path, cache) is True:
+                # #3220 B2 (revues dev2 + cx2) : quand les additions propres
+                # du commit ont toutes disparu, un chemin absent ne vaut
+                # preuve que si le commit ne l'a pas supprimé lui-même. S'il
+                # existait après le commit, une suppression ultérieure a pu
+                # emporter l'édition entière ; une lecture impossible reste
+                # un doute.
+                if (added and _path_absent(repo, head, path, cache) is True
+                        and _path_absent(repo, sha, path, cache) is False):
                     continue
                 return True
             if row.strip() not in lines:
                 return True
-    if added:
-        # #3220 : les additions propres du commit ont toutes disparu, et aucun
-        # retrait ne subsiste. Les copies ne sont pas une preuve ici : leur
-        # lecture d'un chemin absent est un doute qui garderait l'auteur du
-        # fichier supprimé (#3216, revue mesh-design). Elles ne se lisent que
-        # quand toutes les additions du commit sont héritées (#2977).
-        return False
     if copied:
-        # #2977 B1 : des additions significatives, toutes héritées. La copie
-        # ne subsiste qu'à son propre chemin (pas de recherche dans l'arbre :
-        # l'original y est toujours) ; un chemin absent reste un doute. B2 : au
-        # même chemin, l'original peut déjà y figurer ; seule une occurrence de
-        # plus que dans le parent prouve la copie (parent sans ce chemin : 0).
+        # #2977 B1/B2 et #3220 B2 (revue cx2) : une copie ne subsiste qu'à
+        # son chemin. Une occurrence de plus que dans le parent la prouve ;
+        # un chemin absent ne la prouve pas quand des additions propres ont
+        # disparu (sinon une ligne d'en-tête commune rouvrirait #3216). Sans
+        # addition propre, un chemin absent reste le doute B8.
         for path, row in copied:
             present = _path_line_counts(repo, head, path, cache)
             if present is None:
+                if added and _path_absent(repo, head, path, cache) is True:
+                    continue
                 return True
             before = _path_line_counts(repo, str(sha) + "^", path, cache) or {}
             if present.get(row.strip(), 0) > before.get(row.strip(), 0):
                 return True
+        return False
+    if added:
+        # #3220 : les additions propres du commit ont toutes disparu, et aucun
+        # retrait ni copie ne subsiste.
         return False
     # Un commit sans addition significative (purs retraits, ou diff trivial) :
     # il survit tant que ses retraits ne sont pas tous annulés dans la tête.
