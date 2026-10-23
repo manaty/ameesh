@@ -2,6 +2,7 @@
 """#2446 : un seul hôte exécute le service de train, sous bail exclusif."""
 from __future__ import annotations
 
+import contextlib
 import threading
 import types
 import unittest
@@ -97,6 +98,13 @@ class FakeLease:
         self.epoch = None
         return True
 
+    def close(self, db, *, timeout=None):
+        return self.release(db) if self.epoch is not None else False
+
+    @contextlib.contextmanager
+    def effect(self):
+        yield
+
 
 class ServiceLeaseTest(unittest.TestCase):
     def service(self, lease, clock):
@@ -165,6 +173,73 @@ class ServiceLeaseTest(unittest.TestCase):
         self.assertIsNone(lease.epoch)
 
 
+class LeaseFenceTest(unittest.TestCase):
+    """#3134 : la fermeture attend l'effet en vol, puis refuse tous les suivants."""
+
+    def setUp(self):
+        self.ops = Ops()
+        self.storage = mock.patch("ameesh.train_runner.storage.of",
+                                  return_value=types.SimpleNamespace(work=self.ops))
+        self.storage.start()
+        self.addCleanup(self.storage.stop)
+        self.cfg = types.SimpleNamespace(runner="runner-a@host-a", host="host-a")
+
+    def test_close_waits_for_the_effect_in_flight_then_fences_and_frees(self):
+        lease = train_runner.HostLease(self.cfg, ttl=900)
+        self.assertTrue(lease.acquire(object(), now=1000))
+        inside, leave = threading.Event(), threading.Event()
+
+        def push():
+            with lease.effect():
+                inside.set()
+                leave.wait(5)
+
+        thread = threading.Thread(target=push)
+        thread.start()
+        self.assertTrue(inside.wait(5))
+        # A push in flight keeps the lease: it is never released under a write.
+        self.assertIsNone(lease.close(object(), timeout=0.05))
+        self.assertIn("train-service", self.ops.locks)
+        leave.set()
+        thread.join(5)
+        self.assertTrue(lease.close(object(), timeout=1))
+        self.assertNotIn("train-service", self.ops.locks)
+        with self.assertRaises(train.TrainError):
+            with lease.effect():
+                self.fail("effect after the close")
+        self.assertFalse(lease.acquire(object(), now=1100))
+        other = train_runner.HostLease(self.cfg, ttl=900)
+        self.assertTrue(other.acquire(object(), now=1100))
+
+    def test_fenced_runtime_refuses_every_write_after_the_close(self):
+        lease = train_runner.HostLease(self.cfg, ttl=900)
+        self.assertTrue(lease.acquire(object(), now=1000))
+        calls = []
+
+        def port(names):
+            port = types.SimpleNamespace()
+            for name in names:
+                setattr(port, name, lambda *a, name=name, **k: calls.append(name) or name)
+            return port
+
+        runtime, ledger, repository = train_runner._FENCED
+        fenced = port(runtime + ("load", "ci"))
+        fenced.ledger = port(ledger + ("load",))
+        fenced.repository = port(repository + ("target",))
+        self.assertIs(train_runner._fenced(fenced, lease.effect), fenced)
+        self.assertEqual(fenced.save(), "save")
+        self.assertTrue(lease.close(object()))
+        for owner, names in ((fenced, runtime), (fenced.ledger, ledger),
+                             (fenced.repository, repository)):
+            for name in names:
+                with self.assertRaises(train.TrainError):
+                    getattr(owner, name)(None)
+        self.assertEqual(calls, ["save"])
+        # Reads stay open: only the old holder's writes are fenced.
+        self.assertEqual((fenced.load(), fenced.ci(), fenced.ledger.load(),
+                          fenced.repository.target()), ("load", "ci", "load", "target"))
+
+
 class HostLeaseSqlTest(PgTestCase):
     """La sémantique réelle de `merge_locks` : même runner, incarnations distinctes."""
 
@@ -197,6 +272,65 @@ class HostLeaseSqlTest(PgTestCase):
                         " + interval '10 minutes' WHERE target = %s", ("train-service",))
         self.assertFalse(second.acquire(self.db, now=1100))
         self.assertTrue(first.renew(self.db, now=1100))
+
+
+class RunnerShutdownSqlTest(PgTestCase):
+    """#3134 : l'arrêt de l'exécuteur rend le bail même si une passe dure."""
+
+    def setUp(self):
+        super().setUp()
+        self.db.execute("TRUNCATE merge_locks RESTART IDENTITY CASCADE")
+
+    def test_shutdown_during_a_passage_frees_the_row_and_fences_the_old_holder(self):
+        lease = train_runner.HostLease(self.cfg, ttl=900)
+        entered, leave, done = threading.Event(), threading.Event(), threading.Event()
+        writes = []
+
+        class Passage:
+            policy = types.SimpleNamespace(enabled=True)
+
+            def scheduled_step(self, db, now):
+                entered.set()
+                try:
+                    leave.wait(10)  # a CI read or a push still running
+                    with self.guard():
+                        writes.append("save")
+                    return {"result": "idle"}, now + 3600
+                finally:
+                    done.set()
+
+        runner = Runner.__new__(Runner)
+        runner.stop, runner.wake_all = threading.Event(), threading.Event()
+        runner.listener = runner.listener_thread = None
+        runner.lock, runner.workers, runner.turns = threading.Lock(), {}, 0
+        runner.background = mock.Mock()
+        report = mock.Mock()
+        service = runner.train_service = train_runner.Service(
+            self.cfg, [Passage()], stop=runner.stop, report=report, lease=lease)
+        service.start()
+        self.assertTrue(entered.wait(10))
+        row = self.db.query("SELECT owner FROM merge_locks WHERE target = %s",
+                            ("train-service",))
+        self.assertEqual(row[0]["owner"], lease.owner)
+        with mock.patch("ameesh.runner.log_async"):
+            runner.shutdown()
+        # The thread is still alive: `_sortie_sure` would exit immediately.
+        self.assertIn(service.thread, runner.stopped_threads)
+        self.assertTrue(service.thread.is_alive())
+        row = self.db.query("SELECT owner FROM merge_locks WHERE target = %s",
+                            ("train-service",))
+        self.assertIsNone(row[0]["owner"])
+        second = train_runner.HostLease(self.cfg, ttl=900)
+        self.assertTrue(second.acquire(self.db, now=1000))
+        leave.set()
+        self.assertTrue(done.wait(10))
+        service.thread.join(10)
+        self.assertEqual(writes, [])
+        self.assertTrue(any("stale train effect refused" in str(call.args[0])
+                            for call in report.call_args_list))
+        row = self.db.query("SELECT owner FROM merge_locks WHERE target = %s",
+                            ("train-service",))
+        self.assertEqual(row[0]["owner"], second.owner)
 
 
 class RunnerWiringTest(unittest.TestCase):
