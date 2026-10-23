@@ -132,6 +132,23 @@ _FORGE_REFS = "refs/remotes/origin/"
 CLONE_LOCK_WAIT_S = float(os.environ.get("AMEESH_CLONE_LOCK_WAIT", "60"))
 
 
+def _local_from(repo: str, url: str) -> str:
+    """#3001 : `url` lue depuis `repo` ; un chemin local relatif devient absolu.
+
+    La règle de Git (`url_is_local_not_ssh`) : sans `://`, une adresse est un
+    chemin local s'il n'y a pas de `:` ou si un `/` le précède ; sinon c'est
+    la syntaxe scp d'une forge distante."""
+    url = (url or "").strip()
+    if not url or "://" in url:
+        return url
+    colon, slash = url.find(":"), url.find("/")
+    if colon >= 0 and (slash < 0 or colon < slash):
+        return url                      # git@hôte:chemin
+    if os.path.isabs(url):
+        return url
+    return os.path.normpath(os.path.join(os.path.abspath(repo), url))
+
+
 def ref_name(lot: int, other: int) -> str:
     return "%s%d/%d" % (REF_PREFIX, lot, other)
 
@@ -1066,8 +1083,15 @@ class Replayer:
 
     def forge_url(self) -> str:
         """#3001 : la forge du projet, l'URL `origin` du checkout source ; vide
-        quand le checkout n'en a pas (il est alors la seule copie)."""
-        return plan_git._out(self.repo, "remote", "get-url", "origin") or ""
+        quand le checkout n'en a pas (il est alors la seule copie).
+
+        Un chemin local relatif (`../forge.git`) se lit depuis le checkout,
+        comme Git le lit là-bas : relu depuis le clone, il viserait une autre
+        forge, ou un homonyme voisin du clone. Les URL (`ssh://`, `https://`,
+        `file://`) et la syntaxe scp (`git@hôte:chemin`) restent telles quelles ;
+        la configuration du checkout n'est jamais touchée."""
+        url = plan_git._out(self.repo, "remote", "get-url", "origin") or ""
+        return _local_from(self.repo, url)
 
     def _tracks_forge(self, url: str) -> bool:
         return (plan_git._out(self.path, "remote", "get-url", "origin") == url
@@ -1298,7 +1322,7 @@ class Replayer:
         specs = ("+%s*:%s*" % (REF_PREFIX, REF_PREFIX),
                  "+refs/heads/%s*:refs/ameesh/resolve/*" % BRANCH_PREFIX)
         _run(self.path, "fetch", "--quiet", self.repo, *specs, timeout=FETCH_TIMEOUT)
-        url = plan_git._out(self.repo, "remote", "get-url", "origin")
+        url = self.forge_url()
         if url:
             _run(self.path, "fetch", "--quiet", url, *specs, timeout=FETCH_TIMEOUT)
         try:

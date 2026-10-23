@@ -222,6 +222,57 @@ class CloneFollowsForgeTest(unittest.TestCase):
         with self.assertRaises(plan_git.MergeProbeError):
             plan_git.default_target(self.clone)
 
+    def _relative_origin_with_decoy(self) -> str:
+        """Relecture ameesh-cx2 (P2) : `origin = ../forge.git` vaut depuis le
+        checkout ; relu depuis `radar/`, il viserait un homonyme voisin."""
+        _git(self.repo, "remote", "set-url", "origin", "../forge.git")
+        decoy = os.path.join(self.tmp, "radar", "forge.git")
+        os.makedirs(os.path.dirname(decoy), exist_ok=True)
+        _git(self.tmp, "clone", "-q", "--bare", self.forge, decoy)
+        other = os.path.join(self.tmp, "decoy-work")
+        _git(self.tmp, "clone", "-q", "--branch", "develop", decoy, other)
+        _git(other, "config", "user.name", "leurre")
+        _git(other, "config", "user.email", "leurre@example.invalid")
+        _commit(other, "d.txt", "decoy\n", "decoy")
+        _git(other, "push", "-q", "origin", "develop")
+        return _git(other, "rev-parse", "HEAD")
+
+    def test_relative_forge_path_is_read_from_the_checkout_at_creation(self) -> None:
+        decoy = self._relative_origin_with_decoy()
+        replayer = self._replayer()
+        replayer.ensure()
+        self.assertEqual(replayer.target_doubt, "")
+        self.assertEqual(_git(self.clone, "remote", "get-url", "origin"),
+                         os.path.normpath(self.forge))
+        self.assertEqual(self._tracked("develop"), self.published)
+        self.assertNotEqual(self._tracked("develop"), decoy)
+        # la configuration du checkout n'a pas bougé
+        self.assertEqual(_git(self.repo, "remote", "get-url", "origin"), "../forge.git")
+
+    def test_relative_forge_path_is_read_from_the_checkout_at_migration(self) -> None:
+        os.makedirs(os.path.dirname(self.clone))
+        _git(os.path.dirname(self.clone), "clone", "-q", "--shared", "--no-checkout",
+             self.repo, self.clone)
+        _git(self.clone, "checkout", "-q", "-f", "--detach", self.base)
+        decoy = self._relative_origin_with_decoy()
+        replayer = self._replayer()
+        replayer.ensure()
+        self.assertEqual(replayer.target_doubt, "")
+        self.assertEqual(self._tracked("develop"), self.published)
+        self.assertNotEqual(self._tracked("develop"), decoy)
+        self.assertEqual(plan_git.default_target(self.clone), "origin/develop")
+
+    def test_remote_urls_are_left_as_written(self) -> None:
+        for url in ("git@github.com:manaty/nexlink.git", "ssh://git@host/x.git",
+                    "https://github.com/manaty/nexlink.git", "file:///srv/forge.git",
+                    "/srv/forge.git"):
+            with self.subTest(url=url):
+                self.assertEqual(resolutions._local_from(self.repo, url), url)
+        self.assertEqual(resolutions._local_from(self.repo, "../forge.git"),
+                         os.path.normpath(os.path.join(self.repo, "..", "forge.git")))
+        self.assertEqual(resolutions._local_from(self.repo, "./a:b"),
+                         os.path.join(self.repo, "a:b"))
+
     def test_checkout_without_origin_keeps_its_branches(self) -> None:
         alone = os.path.join(self.tmp, "alone")
         _git(self.tmp, "init", "-q", "-b", "main", alone)
