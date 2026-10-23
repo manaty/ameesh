@@ -755,6 +755,99 @@ class VerdictsTest(unittest.TestCase):
         self.assertEqual(status["base"], "main")
         self.assertEqual(status["head"], HEAD)
 
+    def agents2(self, checkout, *, clone="/home/ameesh/work/ameesh-packets", same=True,
+                fetch_error=""):
+        """#3175 : l'hôte du passage n'a ni le dossier de l'assigné (sur un
+        autre hôte) ni `radar.projects` ; seul `packet_watch` déclare un clone."""
+        row, ms = {"id": LOT, "assignee": "mty-amh-impl-01"}, [{"kind": "frozen", "sha": HEAD}]
+        with mock.patch.object(fire, "_repo_of", return_value=None), \
+                mock.patch.object(fire, "_project", return_value=None), \
+                mock.patch.object(fire, "_checkout", return_value=clone) as root, \
+                mock.patch.object(fire, "_same_repository", return_value=same), \
+                mock.patch.object(packet_automerge, "_fetch_into",
+                                  return_value=fetch_error) as self.fetch, \
+                mock.patch.object(fire, "ready_verdicts",
+                                  return_value=(True, "", {})) as gate:
+            out = packet_automerge._verdicts("cfg", "db", row, ms, slug=SLUG, base="main",
+                                             checkout=checkout,
+                                             branch="integration/paquet-h-20261023-1600")
+        return out, gate, root, row, ms
+
+    def test_3175_the_pass_clone_backs_the_review_gate(self):
+        out, gate, root, row, ms = self.agents2("~/work/ameesh-packets")
+        self.assertEqual(out, (True, "", None))
+        root.assert_called_once_with("~/work/ameesh-packets")
+        self.fetch.assert_called_once_with("/home/ameesh/work/ameesh-packets",
+                                           ("integration/paquet-h-20261023-1600", "main"))
+        gate.assert_called_once_with("cfg", "db", row, ms,
+                                     repo="/home/ameesh/work/ameesh-packets",
+                                     project=None, target="main")
+
+    def test_3175_a_clone_that_cannot_be_refreshed_refuses_with_its_reason(self):
+        (ok, why, _project), gate, *_ = self.agents2("/clone", fetch_error="HTTP 503")
+        self.assertFalse(ok)
+        self.assertIn("cannot be refreshed", why)
+        self.assertIn("HTTP 503", why)
+        gate.assert_not_called()
+
+    def test_3175_fetch_into_brings_the_objects_without_moving_a_branch(self):
+        def git(*args, cwd):
+            return subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True,
+                                  text=True).stdout.strip()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            origin, clone = Path(tmp, "origin"), Path(tmp, "clone")
+            origin.mkdir()
+            git("init", "-q", "-b", "main", cwd=origin)
+            git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty",
+                "-m", "base", cwd=origin)
+            git("clone", "-q", str(origin), str(clone), cwd=tmp)
+            git("checkout", "-q", "-b", "integration/paquet", cwd=origin)
+            git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty",
+                "-m", "head", cwd=origin)
+            head = git("rev-parse", "HEAD", cwd=origin)
+            refs = git("for-each-ref", "refs/heads", cwd=clone)
+            self.assertEqual(packet_automerge._fetch_into(
+                str(clone), ("integration/paquet", "main")), "")
+            self.assertEqual(git("cat-file", "-t", head, cwd=clone), "commit")
+            self.assertEqual(git("for-each-ref", "refs/heads", cwd=clone), refs)
+            self.assertIn("integration/absente", packet_automerge._fetch_into(
+                str(clone), ("integration/absente",)))
+
+    def test_3175_a_host_without_any_clone_says_so(self):
+        for checkout, clone, same in (("", None, True), ("/nulle/part", None, True),
+                                      ("/autre-depot", "/autre-depot", False)):
+            with self.subTest(checkout=checkout):
+                (ok, why, _project), gate, _root, _row, _ms = self.agents2(
+                    checkout, clone=clone, same=same)
+                self.assertFalse(ok)
+                self.assertIn("no checkout of %s on this host" % SLUG, why)
+                self.assertIn("packet_watch.projects.<p>.repo", why)
+                gate.assert_not_called()
+
+    def test_3175_the_pass_hands_its_clone_to_the_gate(self):
+        seen = {}
+
+        def verdicts(cfg, db, row, ms, **kw):
+            seen.update(kw)
+            return False, "stop", None
+
+        with mock.patch.object(packet_automerge, "open_carriers", return_value=[LOT]), \
+                mock.patch.object(packet_automerge, "_verdicts", verdicts), \
+                mock.patch.object(packet_automerge, "marks", return_value=[{
+                    "id": 1, "state": "armed", "repo": SLUG, "pr": NUM, "sha": HEAD,
+                    "base": "main", "required": ("tests",), "why": ""}]), \
+                mock.patch.object(packet_automerge, "_lock", return_value="bail"), \
+                mock.patch.object(packet_automerge, "_unlock"), \
+                mock.patch.object(packet_automerge, "_note_fenced"), \
+                mock.patch.object(fire, "_fresh", return_value=(
+                    {"id": LOT, "app": "ameesh"},
+                    [{"id": 1, "kind": "frozen", "sha": HEAD, "at_ts": 1.0}])):
+            rows = packet_automerge.watch(None, None, "ameesh", gh=FakeGh(tests="success"),
+                                          checkout="/clone")
+        self.assertEqual(rows[0]["result"], "pending", rows)
+        self.assertEqual(seen.get("checkout"), "/clone")
+
     def test_an_unreadable_gate_refuses(self):
         with mock.patch.object(fire, "_repo_of", side_effect=RuntimeError("registre")):
             ok, why, project = packet_automerge._verdicts(None, None, {"id": LOT}, [],
@@ -864,7 +957,8 @@ class TickTest(unittest.TestCase):
         out, watch = self.tick([{"lot": LOT, "result": "pending"},
                                 {"lot": 9, "result": "idle"}])
         self.assertEqual([r["result"] for r in out], ["grace"])
-        watch.assert_called_once_with(mock.ANY, None, "ameesh", gh="gh", dry_run=False)
+        watch.assert_called_once_with(mock.ANY, None, "ameesh", gh="gh", dry_run=False,
+                                      checkout=mock.ANY)
 
     def test_a_merge_a_disarm_and_an_error_are_reported(self):
         out, _watch = self.tick([{"lot": LOT, "result": "merged", "pr": NUM},

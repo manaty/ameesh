@@ -418,15 +418,25 @@ def merge_into(slug: str, target: str, sha: str, *, number: int, branch: str, ti
 
 
 def _verdicts(cfg, db, row: dict, milestones: list, *, slug: str, base: str,
-              base_sha: str = "") -> tuple:
+              base_sha: str = "", checkout: str = "", branch: str = "") -> tuple:
     """`fire.ready_verdicts` sur le porteur, avec le dépôt et le projet que le
     feu résout (dossier de l'assigné s'il porte ce dépôt, sinon le clone
-    déclaré du projet). Rend `(ok, raison, projet)` ; le projet résolu sert
-    ensuite à toute la porte de CI (R2, cx3). Une erreur refuse.
+    déclaré du projet, sinon `checkout`, le clone que le passage de l'hôte
+    déclare, `packet_watch.projects.<p>.repo`). Rend `(ok, raison, projet)` ;
+    le projet résolu sert ensuite à toute la porte de CI (R2, cx3). Une
+    erreur refuse.
 
     `base_sha` (#3091) est la cible résolue lue sur la PR (`baseRefOid`) :
     elle prouve la base de composition au lieu de dépendre de la fraîcheur de
-    la ref locale du checkout."""
+    la ref locale du checkout.
+
+    #3175 : sur ameesh-agents-2, le dossier de l'assigné (sur agents-1) est
+    absent et aucun `radar.projects` n'est déclaré ; la porte lisait git sans
+    dépôt et refusait chaque tour (« cannot read the composition members: git
+    not found »). Le clone du passage sert de repli, et un hôte sans aucun
+    clone le dit. Ce clone n'est celui d'aucun agent : la tête du porteur
+    (`branch`) et la cible y sont lues fraîches (`_fetch_into`) avant la
+    porte, qui ne fetch pas elle-même."""
     try:
         repo = fire._repo_of(db, row)
         if repo is not None and not fire._same_repository(repo, slug):
@@ -434,6 +444,20 @@ def _verdicts(cfg, db, row: dict, milestones: list, *, slug: str, base: str,
         project = fire._project(cfg, repo, slug)
         if repo is None:
             repo = fire._project_checkout(project)
+        if repo is None and checkout:
+            repo = fire._checkout(checkout)
+            if repo is not None and not fire._same_repository(repo, slug):
+                repo = None
+            if repo is not None:
+                error = _fetch_into(repo, (branch, base))
+                if error:
+                    return (False, "the pass clone %s cannot be refreshed for the review "
+                                   "gate: %s" % (repo, error), project)
+        if repo is None:
+            return (False, "no checkout of %s on this host to read the review gate: the "
+                           "assignee's folder is not here, and neither radar.projects.<p>.repo "
+                           "nor packet_watch.projects.<p>.repo names a clone of it" % slug,
+                    project)
         extra = {"base_sha": base_sha} if str(base_sha or "").strip() else {}
         ok, why, _klass = fire.ready_verdicts(cfg, db, row, milestones, repo=repo,
                                               project=project, target=base, **extra)
@@ -441,6 +465,24 @@ def _verdicts(cfg, db, row: dict, milestones: list, *, slug: str, base: str,
         return (False, "the review gate cannot be read: %s: %s" % (type(exc).__name__, exc),
                 None)
     return ok, why, project
+
+
+def _fetch_into(repo: str, branches) -> str:
+    """Rapatrie les objets des branches `branches` d'`origin` dans `repo`
+    (aucune branche locale déplacée, seules les refs de suivi `origin/*` ;
+    aucun `--depth`, canon §7) ; rend l'erreur, ou "" (#3175)."""
+    refs = ["refs/heads/%s" % name for name in branches if name]
+    if not refs:
+        return ""
+    try:
+        proc = subprocess.run(["git", "-C", repo, "fetch", "--quiet", "--no-tags",
+                               "origin"] + refs, capture_output=True, text=True,
+                              timeout=120)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return str(exc)
+    if proc.returncode != 0:
+        return (proc.stderr or proc.stdout or "exit %d" % proc.returncode).strip()[:300]
+    return ""
 
 
 def open_carriers(db, app: str) -> list[int]:
@@ -454,7 +496,7 @@ def open_carriers(db, app: str) -> list[int]:
 
 
 def check(cfg, db, lot: int, *, gh, dry_run: bool = False,
-          actor: str = work.SYSTEM_SENDER) -> dict:
+          actor: str = work.SYSTEM_SENDER, checkout: str = "") -> dict:
     """Un porteur armé : le désarme si sa tête ou sa cible a changé, le
     fusionne si ses checks requis sont verts sur la tête publiée.
 
@@ -476,7 +518,7 @@ def check(cfg, db, lot: int, *, gh, dry_run: bool = False,
         return {"lot": lot, "result": "busy"}
     try:
         return _check_locked(cfg, db, lot, gh=gh, dry_run=dry_run, actor=actor,
-                             handle=handle, fence=fence)
+                             handle=handle, fence=fence, checkout=checkout)
     finally:
         if handle is not None:
             _unlock(handle)
@@ -487,14 +529,14 @@ REFUSALS = ("pending", "error")
 
 
 def _check_locked(cfg, db, lot: int, *, gh, dry_run: bool, actor: str,
-                  handle=None, fence=None) -> dict:
+                  handle=None, fence=None, checkout: str = "") -> dict:
     # relu sous le bail : une publication a pu réarmer depuis la première lecture
     rows = marks(db, lot)
     mine = active(rows)
     if mine is None:
         return {"lot": lot, "result": "idle"}
     out = _gate_locked(cfg, db, lot, mine, gh=gh, dry_run=dry_run, actor=actor,
-                       handle=handle, fence=fence)
+                       handle=handle, fence=fence, checkout=checkout)
     if out.get("result") in REFUSALS and not dry_run:
         _held(db, lot, mine, rows, out, actor=actor, fence=fence)
     return out
@@ -524,7 +566,7 @@ def _held(db, lot: int, mine: dict, rows, out: dict, *, actor: str, fence=None) 
 
 
 def _gate_locked(cfg, db, lot: int, mine: dict, *, gh, dry_run: bool, actor: str,
-                 handle=None, fence=None) -> dict:
+                 handle=None, fence=None, checkout: str = "") -> dict:
     slug, number, sha, base = mine["repo"], mine["pr"], mine["sha"], mine["base"]
     out = {"lot": lot, "pr": number, "sha": sha, "base": base}
     try:
@@ -584,6 +626,8 @@ def _gate_locked(cfg, db, lot: int, mine: dict, *, gh, dry_run: bool, actor: str
     # paquet ; la ref locale du checkout de l'assigné peut être en retard.
     base_oid = str(view.get("base_oid") or "").strip().lower()
     extra = {"base_sha": base_oid} if base_oid else {}
+    if checkout:
+        extra.update(checkout=checkout, branch=view.get("branch") or "")
     ok, why, project = _verdicts(cfg, db, row, milestones, slug=slug, base=base,
                                  **extra)
     if not ok:
@@ -645,13 +689,17 @@ def _gate_locked(cfg, db, lot: int, mine: dict, *, gh, dry_run: bool, actor: str
     return dict(out, result="merged", commit=commit)
 
 
-def watch(cfg, db, app: str, *, gh=None, dry_run: bool = False) -> list[dict]:
-    """Tous les porteurs ouverts de `app` ; un porteur ne fait pas tomber l'autre."""
+def watch(cfg, db, app: str, *, gh=None, dry_run: bool = False,
+          checkout: str = "") -> list[dict]:
+    """Tous les porteurs ouverts de `app` ; un porteur ne fait pas tomber l'autre.
+
+    `checkout` : le clone que le passage de l'hôte déclare pour ce projet
+    (`packet_watch.projects.<p>.repo`), repli de la porte des avis (#3175)."""
     gh = gh or land._gh
     results = []
     for lot in open_carriers(db, app):
         try:
-            results.append(check(cfg, db, lot, gh=gh, dry_run=dry_run))
+            results.append(check(cfg, db, lot, gh=gh, dry_run=dry_run, checkout=checkout))
         except Exception as exc:  # noqa: BLE001 - un porteur ne fait pas tomber l'autre
             results.append({"lot": lot, "result": "error",
                             "error": "%s: %s" % (type(exc).__name__, exc)})
