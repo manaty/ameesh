@@ -40,10 +40,9 @@ Ce module porte la règle seule :
   dépôts et toutes les têtes, attribuerait le lot d'un autre paquet.
 
 Le relevé Git/API (commits de l'atterrissage) reste chez `ci` : ce module ne
-parle ni à GitHub ni au réseau. Limite connue : deux passages **concurrents**
-(deux hôtes dans la même fenêtre) peuvent ouvrir deux incidents pour la même
-exécution, faute de verrou partagé sur le run ; les passages successifs, eux,
-sont idempotents par `issue_ref`.
+parle ni à GitHub ni au réseau. Deux passages **concurrents** (deux hôtes dans
+la même fenêtre) sont sérialisés par `work.add(unique_ref=True)` : un seul lot
+par exécution, les passages suivants restant idempotents par `issue_ref`.
 """
 from __future__ import annotations
 
@@ -468,6 +467,14 @@ def open_incident(db, *, repo: str, branch: str, run_id: int, head_sha: str = ""
     rapport commun lu par `diagnosis_of` : il est versé au corps comme fait,
     sans désigner de lot.
 
+    Ref `ci-incident:<repo>:<run>` identifie l'exécution **une seule fois**,
+    quel que soit l'état du lot : deux watchers concurrents (deux hôtes) ne
+    peuvent plus ouvrir deux lots P1. La création passe par `work.add` avec
+    `unique_ref` (#2954) : verrou consultatif de transaction sur la référence
+    puis relecture, toutes états confondus ; le perdant reçoit `DbError` et
+    relit le gagnant ci-dessous. Une fois la course perdue, il ne désigne ni
+    n'assigne l'auteur du second lot — le gagnant garde la file.
+
     Le lot est créé `bug` priorité 1, **sans assigné** (une création assignée
     refuserait un auteur non réveillable et perdrait l'incident), puis l'auteur
     du lot **candidat** (`unique`) est assigné si le registre l'accepte ;
@@ -502,7 +509,7 @@ def open_incident(db, *, repo: str, branch: str, run_id: int, head_sha: str = ""
                          workflow=workflow, url=url, modules=attribution["modules"],
                          tests=tests, attribution=attribution, author=author,
                          diagnosis=diagnosis),
-            issue_ref=ref, actor=actor)
+            issue_ref=ref, actor=actor, unique_ref=True)
     except Exception as exc:  # noqa: BLE001 - l'incident ne fait jamais tomber le relevé
         existing = _open(ops, ref)
         if existing is not None:

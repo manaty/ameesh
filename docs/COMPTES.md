@@ -156,6 +156,14 @@ dans le canon :
   (`.credentials.json` pour Claude, `auth.json` pour Codex : présence
   seulement) ; fichier de clé **0600** ; variable de clé présente. Un compte
   qui échoue n'est jamais choisi, et `ameesh accounts list` dit pourquoi.
+  Sur macOS (L65), Claude Code range ses identifiants OAuth dans le
+  **trousseau** : la présence y est vérifiée par
+  `security find-generic-password` (sans `-w`, jamais le secret), sur
+  l'entrée globale `Claude Code-credentials` d'un compte par défaut ou sur
+  l'entrée namespacée `Claude Code-credentials-<sha256(dossier)[:8]>` d'un
+  compte déclaré avec `path` (Claude Code 2.1.56 et suivants) ; le fichier
+  `.credentials.json` reste une preuve quand il existe. Codex garde
+  `auth.json` sur macOS.
 * `hourly_usd` : plafond horaire du compte (dépense des tours attribués au
   compte). Il est propre à l'hôte et s'ajoute aux plafonds du mesh, qui se
   règlent en base pour toutes les machines par `ameesh budget set` (L70,
@@ -279,6 +287,22 @@ puis une seule réconciliation. Si une fenêtre attendue reste introuvable
 dans un échantillon tronqué, le compte est refusé comme relevé incomplet :
 une limite de lecture ne doit pas masquer une fenêtre saturée. Le forfait
 pro peut ne publier que la semaine.
+
+#3044 : un compte non-pro **au repos** — aucun relevé plus récent que sa
+fenêtre courte (5 h) — ne peut plus produire de courte vivante. Quand une
+courte a été retenue, échue, elle compte pour 0 % (L71) et le relevé est
+accepté au lieu d'être refusé pour toujours : jamais choisi, le compte ne
+serait jamais rafraîchi. La relaxation est bornée : un relevé récent (moins
+d'une fenêtre courte) sans courte vivante, ou un échantillon sans aucune
+courte, garde le refus #2843 — une courte saturée peut se cacher hors de
+l'échantillon borné, et le format n'est pas prouvé sans courte observée.
+
+#3122 : ce repos ne se prouve que sur les journaux **lus**. Un journal écarté
+du scan (33e par date), un préfixe tronqué (> 256 Kio) ou un journal illisible
+peut porter une courte vivante : sa date de fichier borne ce qu'il a pu
+observer, et le repos n'est accepté que si le plus récent de ces journaux est
+plus vieux qu'une fenêtre courte. Une date inconnue interdit le repos, même
+quand le reste de l'échantillon est au repos.
 
 Depuis la tranche 3 de #1580 (15/10/2026), les jauges d'un compte Claude
 peuvent venir du fichier du widget omarchy (`~/.local/state/omarchy/agents/

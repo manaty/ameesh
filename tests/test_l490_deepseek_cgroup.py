@@ -13,7 +13,7 @@ from pathlib import Path
 from unittest import mock
 
 from . import support  # isolate the host's agent environment
-from ameesh import adapters, deepseek_cgroup, harnesses
+from ameesh import adapters, deepseek_cgroup, harnesses, platform
 from ameesh.runner import AgentWorker
 
 
@@ -55,6 +55,8 @@ class EnvironmentTest(unittest.TestCase):
 
 
 @unittest.skipUnless(NODE, "Node is required for the preload contract")
+@unittest.skipUnless(platform.is_linux(),
+                     "L490 : le garde cgroup ne s'installe que sous Linux (process.platform)")
 class PreloadTest(unittest.TestCase):
     def run_node(self, code, env=None):
         result = subprocess.run([NODE, "--input-type=module", "-e", code],

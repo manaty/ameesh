@@ -227,12 +227,12 @@ class EntryTest(_Base):
         self.assertEqual((row["target"], row["frozen_sha"], row["state"]),
                          ("main", self.tip(1), "queued"))
         self.assertIn("PR #7 green", self.fake.notes[-1][1])
-        # an absent CI status is not a green one: a team that merges locally
-        # without a PR, or a reader that answers nothing, is refused
-        # (revue #544 r1)
+        # #3080: no PR falls back to commit CI; absent commit CI still refuses.
         self.ready(2)
-        with self.assertRaisesRegex(merge_queue.QueueError, "no CI status"):
-            self.enter(2, ci=lambda branch: None)
+        with self.assertRaisesRegex(merge_queue.QueueError, "no run"):
+            self.enter(2, ci=lambda branch: None,
+                       commit_ci=lambda sha: {"runs": 0, "green": False,
+                                              "pending": [], "failed": []})
         with self.assertRaisesRegex(merge_queue.QueueError, "no CI reader"):
             self.enter(2, ci=None)
         self.assertEqual(set(self.fake.queue_rows), {1})

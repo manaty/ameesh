@@ -29,6 +29,10 @@ class RunnerLivenessTest(PgTestCase):
         r._gate_settled = threading.Event()  # aucune admission possible
         r.lock, r.workers = threading.Lock(), {}
         r.expire_delegations_once = lambda: []
+        # L165 (EP2) : `sweep` publie aussi les scores de rôles de l'hôte ;
+        # la doublure n'a ni horloge ni registre de rôles, elle neutralise
+        # cette passe comme `expire_delegations_once`.
+        r.role_evaluation_once = lambda: None
         # main : sweep passe aussi par la rétention du journal (L85) ; le stub
         # porte l'état de cette passe, comme __init__ le pose.
         r._events_pruned_at, r._events_prune_error = None, None

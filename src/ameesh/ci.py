@@ -123,7 +123,7 @@ import time
 from datetime import datetime
 from urllib.parse import quote
 
-from . import packet_guard, storage
+from . import packet_guard, role_run, storage
 
 #: workflows suivis par défaut (nom du fichier), quand le dépôt publie le
 #: workflow des tests L161 : comportement historique, compatible ameesh.
@@ -890,7 +890,7 @@ class Watcher:
         settings = self.settings()
         if settings is None:
             return []  # déjà journalisé par la projection des issues
-        if not settings.projects or settings.host != getattr(self.cfg, "host", None):
+        if not settings.projects or not role_run.host_authorized(self.cfg, settings.host):
             return []
         return sorted(set(settings.projects.values()))
 

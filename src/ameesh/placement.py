@@ -23,6 +23,7 @@ Le SQL est dans le stockage (`storage.of(db).placements`, spec §10).
 """
 from __future__ import annotations
 
+from collections import defaultdict
 from dataclasses import dataclass
 
 from . import canon as canon_mod
@@ -74,6 +75,71 @@ def admission_of(canon: Canon, agent: str):
     found = canon.placements_of(agent)
     return found[0] if len(found) == 1 else None
 
+
+def covered_by_host(canon: Canon, *, without: str | None = None) -> dict[str, list]:
+    """Hôte -> admissions qui le couvrent (#3101), hors celles de `without`.
+
+    L'exclusion suit l'identité résolue (titre ou alias) ; une admission dont
+    l'agent est inconnu du canon reste comptée.
+    """
+    target = canon.agent(without) if without else None
+    covered: dict[str, list] = defaultdict(list)
+    for admission in canon.placements:
+        if not admission.agent or admission.agent == without:
+            continue
+        if target is not None and canon.agent(admission.agent) is target:
+            continue
+        for name in admitted_hosts(canon, admission):
+            covered[name].append(admission)
+    return covered
+
+
+def host_load(canon: Canon) -> tuple[dict[str, int], dict[str, str | None]]:
+    """Admissions épinglées par hôte et siège de chaque rôle élu (#3101)."""
+    return canon_mod.admission_load(canon, covered_by_host(canon))
+
+
+def capacity_baseline(canon: Canon, agent: str) -> tuple[dict[str, list], set[str]]:
+    """Admissions sans `agent`, et rôles élus assis AVANT de le placer.
+
+    #3101 (B4) : la référence est le canon tel qu'il est. Un rôle élu y
+    concourt déjà pour sa place : la référence est le canon complet. Un agent
+    épinglé, lui, est déplacé par la proposition : la référence est le canon
+    sans lui. L'agent lui-même n'est pas dans les rôles assis rendus.
+    """
+    covered = covered_by_host(canon, without=agent)
+    fiche = canon.agent(agent)
+    elected = fiche is not None and fiche.releve == "election" and bool(fiche.candidats)
+    seats = (host_load(canon) if elected else canon_mod.admission_load(canon, covered))[1]
+    title = fiche.title if fiche is not None else agent
+    return covered, {role for role, seat in seats.items() if seat is not None and role != title}
+
+
+def capacity_reason(canon: Canon, agent: str, host: str,
+                    baseline: tuple[dict[str, list], set[str]] | None = None) -> str | None:
+    """Pourquoi `host` n'a pas de place pour `agent` sous `max_agents`, ou None.
+
+    #3101 : les admissions épinglées des autres agents remplissent l'hôte, ou
+    y placer l'agent ferait perdre sa place à un rôle élu assis dans le canon
+    tel qu'il est (`capacity_baseline`, à passer quand l'appelant juge
+    plusieurs hôtes). Seuls ces rôles assis sont rassis (B5) : un rôle déjà
+    sans place ne prend la place de personne, et ne ferme le candidat de
+    personne ; sa propre fiche seule est en erreur.
+    """
+    fiche = next((h for h in canon.hosts if h.title == host), None)
+    limit = fiche.policy.max_agents if fiche is not None else None
+    if limit is None:
+        return None
+    covered, seated = baseline if baseline is not None else capacity_baseline(canon, agent)
+    pinned, with_agent = canon_mod.admission_load(canon, covered, extra=host, only=seated)
+    if pinned.get(host, 0) > limit:
+        return "host %s full: %d placement(s) for max_agents = %d" % (
+            host, pinned[host] - 1, limit)
+    lost = sorted(role for role, seat in with_agent.items() if seat is None)
+    if lost:
+        return "host %s full: elected role(s) %s would find no place for max_agents = %d" % (
+            host, ", ".join(lost), limit)
+    return None
 
 
 @dataclass
@@ -157,6 +223,12 @@ def evaluate(canon: Canon, agent: str, host: str) -> Verdict:
             host, agent, ", ".join(admis) or "none")
         return verdict
     reasons = canon_mod.placement_violations(fiche, hosts[0], admission)
+    if not reasons and fiche.releve == "election" and fiche.candidats:
+        # #3101 : un rôle élu ne prend qu'une place, sur un candidat qui en a
+        # une ; un candidat sans place ne réclame pas le bail.
+        full = capacity_reason(canon, agent, host)
+        if full:
+            reasons.append(full)
     verdict.ok = not reasons
     verdict.diagnostic = "; ".join(reasons)
     return verdict
@@ -197,6 +269,7 @@ def proposals(canon: Canon, agent: str,
     block = canon_mod.blocking(findings)
     admission = admission_of(canon, agent)
     admis = set(admitted_hosts(canon, admission))
+    baseline = capacity_baseline(canon, agent)
     out = []
     for title in sorted({h.title for h in canon.hosts}):
         hosts = [h for h in canon.hosts if h.title == title]
@@ -218,11 +291,9 @@ def proposals(canon: Canon, agent: str,
             modes = None if policy.credential_modes is None else list(policy.credential_modes)
             if modes == []:
                 reasons.append("no credential mode admitted by host %s" % title)
-            others = [p for p in canon.placements if p.agent != agent
-                      and title in admitted_hosts(canon, p)]
-            if policy.max_agents is not None and len(others) >= policy.max_agents:
-                reasons.append("host %s full: %d placement(s) for max_agents = %d"
-                               % (title, len(others), policy.max_agents))
+            full = capacity_reason(canon, agent, title, baseline)
+            if full:
+                reasons.append(full)
         for finding in block.by_host.get(title, []):
             reasons.append("Host card in error: %s (%s)" % (finding.code, finding.where()))
         if modes is None:
