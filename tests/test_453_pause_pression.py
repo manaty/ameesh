@@ -5,6 +5,7 @@ process groups; no database."""
 from __future__ import annotations
 
 import os
+import signal
 import subprocess
 import sys
 import tempfile
@@ -13,19 +14,17 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
-from ameesh import heavy
+from ameesh import heavy, platform
+
+#: le plafond des suites s'appuie sur pidfd : sans cette interface (macOS,
+#: Windows), la fonctionnalité est éteinte et ses témoins n'ont rien à voir.
+PIDFD = hasattr(os, "pidfd_open") and hasattr(signal, "pidfd_send_signal")
 
 
 def _alive(pid: int) -> bool:
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    try:
-        with open("/proc/%d/stat" % pid, encoding="ascii") as fh:
-            return fh.read().rsplit(")", 1)[1].split()[0] != "Z"
-    except OSError:
-        return True
+    """Vivant (un zombie ne compte pas), par la couche plateforme (L63/L68) :
+    psutil, sinon le repli /proc, jamais une lecture directe dans le test."""
+    return platform.alive(pid)
 
 
 class HeavyCapTest(unittest.TestCase):
@@ -94,14 +93,6 @@ class HeavyCapTest(unittest.TestCase):
         self.assertIn("invalid --max-duration", out.stderr)
 
 
-def _state(pid: int) -> str | None:
-    try:
-        with open("/proc/%d/stat" % pid, encoding="ascii") as fh:
-            return fh.read().rsplit(")", 1)[1].split()[0]
-    except OSError:
-        return None
-
-
 def _wait(predicate, timeout=10.0) -> bool:
     fin = time.monotonic() + timeout
     while time.monotonic() < fin:
@@ -112,7 +103,8 @@ def _wait(predicate, timeout=10.0) -> bool:
 
 
 def _gone(pid: int) -> bool:
-    return _state(pid) in (None, "Z")
+    """Parti, ou zombie : la couche plateforme tranche (psutil sur macOS)."""
+    return not platform.alive(pid)
 
 
 class SuiteRecognitionTest(unittest.TestCase):
@@ -180,7 +172,7 @@ time.sleep(120)
 """
 
 
-@unittest.skipUnless(os.path.isdir("/proc"), "Linux /proc")
+@unittest.skipUnless(PIDFD, "suite cap: pidfd (Linux)")
 class SuiteCapTest(unittest.TestCase):
     def setUp(self):
         from ameesh import suite_cap
@@ -340,7 +332,7 @@ class SuiteCapTest(unittest.TestCase):
         self.assertFalse(_gone(self.propre))
 
 
-@unittest.skipUnless(os.path.isdir("/proc"), "Linux /proc")
+@unittest.skipUnless(PIDFD, "suite cap: pidfd (Linux)")
 class HandleTest(unittest.TestCase):
     def test_a_handle_is_only_opened_on_the_process_seen_in_the_table(self):
         from ameesh import platform

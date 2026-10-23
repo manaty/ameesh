@@ -27,6 +27,12 @@ packet's exact manifest at the last first-parent commit before the cutoff; a
 later enrichment or an inherited manifest proves nothing, and the lot then
 stays an extra ("porteur inconnu"). A missing shadow plan for a packet is not
 an explained difference; it is recorded as such.
+
+#2965: the cutoff filter is the active train's own — `Admissions.admitted` for
+a queue row (the admission instant of the freeze and the gate for a row the
+train enrolled itself, the queue instant for a manual admission) and the same
+`admitted_ts` of the preparation for a candidate not yet enrolled. The shadow
+never dates a member by `queued_ts` alone.
 """
 from __future__ import annotations
 
@@ -257,6 +263,12 @@ class Passage:
         rows = [row for row in admissions.entries()
                 if merge_queue._remote_branch(row["target"]) == target]
         deferred, entries = [], []
+        # #2965 (B3) : la même règle que l'actif, par le même lecteur —
+        # l'instant d'admissibilité du gel et de la porte pour une ligne que le
+        # train a lui-même enrôlée, le `queued_ts` pour une admission
+        # manuelle. La file seule ne suffit plus.
+        admissible = {train.identity(row) for row in
+                      admissions.admitted(rows, slot, base)}
         # Every queued admission is already in the queue: the candidate
         # inventory must not present it again, even when it is deferred here.
         prepared_ids = {row["work_item_id"] for row in rows}
@@ -294,15 +306,29 @@ class Passage:
                         "active enrollment would refuse"))
                     continue
                 prepared = decision["prepared"]
+                # #2965 : l'actif enrôle le candidat puis filtre sur son
+                # instant d'admissibilité (gel + porte). Une préparation dont
+                # la porte s'est ouverte après le cutoff serait classée late
+                # à l'enrôlement : l'ombre applique le même instant.
+                instant = ((prepared.get("history") or {}).get("reviews")
+                           or {}).get("admitted_ts")
+                try:
+                    late = not float(instant) <= float(slot)
+                except (TypeError, ValueError):
+                    late = True
+                if late:
+                    deferred.append(_deferred(
+                        lot, "candidate",
+                        "late admission: not admissible at the cutoff"))
+                    continue
                 # Active enrollment inserts the candidate with rank NULL and
                 # an increasing queued_ts. A candidate is not enrolled at the
                 # tick: the inventory lists lots already ready at the cutoff,
                 # which the service enrolls on an earlier event. Its synthetic
-                # timestamp stays just below the cutoff (so the single late
-                # filter below does not discard it) and increases in inventory
-                # order; ``generation`` is part of the admission identity used
-                # by compose, and the shadow fabricates no queue row, so it
-                # uses one neutral value throughout.
+                # timestamp stays just below the cutoff and increases in
+                # inventory order; ``generation`` is part of the admission
+                # identity used by compose, and the shadow fabricates no queue
+                # row, so it uses one neutral value throughout.
                 item = admissions.ops.get(lot)
                 subject = dict(
                     prepared["subject"], generation=0,
@@ -314,17 +340,16 @@ class Passage:
                 prepared_ids.add(lot)
                 enrolled += 1
         # The active engine drops a late admission before ordering (train.py,
-        # build_beta), and its dependents wait with it. Apply that filter once,
-        # on the combined list: it names the queued admissions only, since the
-        # candidate timestamps were placed below the cutoff above.
+        # build_beta), and its dependents wait with it. Apply the same
+        # admissibility rule on the queued admissions (#2965); the candidate
+        # instants were checked in the inventory loop above.
         entries = [entry for entry in entries
                    if entry["origin"] == "candidate"
-                   or float(entry["row"].get("queued_ts") or 0) <= slot]
-        late = [row for row in rows
-                if float(row.get("queued_ts") or 0) > slot]
+                   or train.identity(entry["row"]) in admissible]
+        late = [row for row in rows if train.identity(row) not in admissible]
         for row in late:
             deferred.append(_deferred(row["work_item_id"], "queued",
-                                      "late admission: queued after the cutoff"))
+                                      "late admission: not admissible at the cutoff"))
         if entries:
             # One ordering pass over the queued admissions and the candidates,
             # as the engine does after enrollment: a queued dependent of a

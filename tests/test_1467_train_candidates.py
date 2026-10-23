@@ -127,6 +127,9 @@ class PreparationTest(history_tests.HistoryFixture, PgTestCase):
         proof = self.prepare()
         self.assertEqual(proof["subject"]["frozen_sha"], self.head)
         self.assertTrue(proof["history"]["reviews"]["gate"]["ok"])
+        # #2965: the shared admissibility instant is published with the
+        # preparation proof, so the shadow can apply the active late filter.
+        self.assertIsInstance(proof["history"]["reviews"]["admitted_ts"], float)
         self.assertNotIn("generation", proof["subject"])
         self.assertNotIn("admission", proof["history"])
         self.assertEqual(self.candidate, before)
