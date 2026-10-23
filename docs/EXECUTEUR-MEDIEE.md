@@ -23,7 +23,7 @@ en silence.
 
 | Fichier | Rôle |
 |---|---|
-| `src/ameesh/mediated_executor/contract.json` | la table fermée des 72 opérations et la liste des 411 refusées |
+| `src/ameesh/mediated_executor/contract.json` | la table fermée des 72 opérations et la liste des 412 refusées |
 | `src/ameesh/mediated_executor/contract.py` | chargeur (`load()`), enveloppes, idempotence, erreurs, vérificateur de schémas |
 | `src/ameesh/mediated_executor/events.py` | flux SSE, attente longue, curseurs |
 | `src/ameesh/mediated_executor/gate.py` | `HostGate`, `ameesh-host-state/1`, `ameesh-host-ack/1` |
@@ -71,7 +71,7 @@ Comptes : 72 opérations, dont 29 lectures et 43 écritures. 62 passent par
 lignes de `op` sont marquées `session: true` (contrats 1.1, 1.2, 1.3, 1.5 et
 1.6) : elles sont servies aussi par `session/op`. Le test
 vérifie que chaque ligne existe dans `storage.interface` avec la même
-signature et les mêmes types. Il vérifie aussi que l'interface entière (483
+signature et les mêmes types. Il vérifie aussi que l'interface entière (484
 opérations) est classée, admise ou refusée. Toute opération ajoutée à
 l'interface fait donc échouer le test tant qu'elle n'est pas classée.
 
@@ -430,6 +430,25 @@ L'ajout est compatible : la version passe à `1.6.0`, aucune opération n'est
 retirée ni modifiée. Déployer le serveur avant les nouveaux exécuteurs : un
 ancien serveur refuse `mailbox.unread_human_page` ; le runner médié garde les
 humains déjà trouvés et lit comme avant, sans tuer le fil de l'agent.
+
+## Contrat 1.7 : attribution des messages au grand livre (#288/L80b)
+
+Un tour résident peut servir plusieurs messages (consigne groupée, steer) :
+son coût est celui du **tour**, partagé par ses entrées. L'opération
+`turn_costs.insert` gagne un mot-clé facultatif `inputs` : un tableau de
+chaînes (ou `null`) portant les identifiants des messages réellement servis.
+La ligne `turn_costs.inputs` les conserve (`jsonb`, migration 0472) et
+`ameesh cost turns --message ID` rend les tours qui les ont servis — le `usd`
+affiché est celui du tour entier, jamais divisé.
+
+L'ajout est compatible : la version passe à `1.7.0`, aucune opération n'est
+retirée ni modifiée ; `inputs` est facultatif (`null` par défaut) et les
+lignes antérieures restent `null`. Un client 1.6 n'envoie pas le paramètre.
+Un **serveur 1.6** refuse un appel qui le porte (`bad_args`) : l'exécuteur
+réessaie alors sans `inputs` — le tour reste compté, l'attribution est perdue
+et journalisée ; la comptabilité n'est jamais suspendue pour autant. Déployer
+le serveur avant les exécuteurs n'est pas nécessaire, mais le fait donne
+l'attribution dès le premier tour.
 
 ## Porte d'hôte
 

@@ -237,7 +237,15 @@ session humaine sans exécuteur (`mode=externe`, dont le propriétaire porte-cl�
 boîte morte ni comme souffrance : son courrier est listé dans `canal_humain`,
 avec l’humain responsable, l’alerte poussée (`stopped_with_mail` ou
 `idle_with_mail`) et la lecture sans marquage (`agent-mail inbox <nom>`) ; ce
-courrier ne bloque pas la séquence.
+courrier ne bloque pas la séquence. Un profil sans responsable déclaré prend le
+canal humain du propriétaire, lu dans le registre (`key_role=owner`) : le
+rapport ne laisse plus `canal: "human:?"` quand le propriétaire est connu. Une
+session de chat (`chat-<humain>`) reste un canal humain, mais elle lit son
+courrier à l’ouverture de la conversation : son entrée porte `canal: "chat"` et
+`alerte: null`, jamais `idle_with_mail`/`stopped_with_mail` qu’aucune alerte
+poussée ne couvre (#2957). Les profils humains sont aussi exclus de
+`sans_executeur`, même si une ligne `mode=execute` portait `key_role=owner` ou
+`harness=none` : ils ne sont jamais comptés deux fois (#2957).
 
 ## Signal « staging actif » (#1323)
 
@@ -250,6 +258,14 @@ attestation durable sous
 rapporteurs déclarés avec `--lots "917 988"` et
 `--rapporteurs "mty-amh-docs-01"` (ou `LOTS_VERIF` / `RAPPORTEURS_VERIF` dans
 `BASCULE_ENV`).
+
+Sur le poste, `redemarrer` et `retour` passent par des unités transitoires
+`poste-maj-staging-<pid>-<action>` (`systemd-run --user --collect --wait --pipe`,
+#3039). Le staging attend leur résultat et conserve leur sortie dans son
+journal ; un échec suit le retour automatique puis la notification habituels.
+Cette enveloppe dans `staging.sh` couvre aussi le retour depuis le tick
+`ameesh-release.service`, sans modifier la garde #2950 de `poste.sh` qui
+refuse les appels directs depuis une unité `ameesh-*`.
 
 Le courrier nomme les hôtes, le commit **relu actif** sur chacun après la
 séquence, les preuves `installer`/`redemarrer`/`controler`/`sante` et les lots

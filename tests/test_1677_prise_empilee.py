@@ -90,9 +90,14 @@ class _Prise(_Base):
                     if r["name"] == name)
 
     def juge(self, item_id, *, sha=SHA, verdict="ok"):
-        """Un verdict déclaré sur le lot (sans gel, pour le cas B2)."""
-        return work.milestone(self.db, item_id, "verdict", verdict=verdict, sha=sha,
-                              actor="test")
+        """Un verdict déclaré sur le lot (sans gel, pour le cas B2).
+
+        #2962 : un SHA complet doit se résoudre, même sur un lot jamais gelé ;
+        ce témoin simule le dépôt qui porte le commit, le cas B2 restant celui
+        d'un verdict sans gel (le sujet est la prise, pas la tête relue)."""
+        with patch("ameesh.freeze_checks.commit_in", return_value=sha):
+            return work.milestone(self.db, item_id, "verdict", verdict=verdict,
+                                  sha=sha, actor="test")
 
     def regeler(self, item_id, sha):
         """Un nouveau gel, plus récent que le précédent (B1), avec la marque de

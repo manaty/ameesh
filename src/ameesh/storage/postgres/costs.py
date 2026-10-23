@@ -67,7 +67,7 @@ class TurnCosts(interface.TurnCosts):
                spend_key=None, source=None, executor=None, lease_owner=None,
                lease_epoch=None, void_reason=None, price_fallback=None,
                cache_write_tokens=None, work_item_id=None, started_at=None,
-               turn_id=None) -> bool:
+               turn_id=None, inputs=None) -> bool:
         cols = ["agent", "harness", "turn", "model", "session", "usd",
                 "input_tokens", "cached_input_tokens", "output_tokens",
                 "cum_usd", "cum_input_tokens", "cum_cached_input_tokens",
@@ -112,6 +112,10 @@ class TurnCosts(interface.TurnCosts):
             # ressources (`turn_resources.turn_id`)
             cols.append("turn_id")
             values.append(str(turn_id))
+        if inputs is not None:
+            # L80b (0472) : les messages servis par ce tour, en JSON array.
+            cols.append("inputs")
+            values.append(json.dumps([str(i) for i in inputs], ensure_ascii=False))
         suffix = ""
         if spend_key is not None:
             # L60 (migration 0041) : un marqueur comptable n'écrit qu'une ligne,
@@ -120,7 +124,8 @@ class TurnCosts(interface.TurnCosts):
             values.append(spend_key)
             suffix = " on conflict (spend_key) do nothing"
         sql = ("insert into turn_costs (" + ", ".join(cols) + ") values ("
-               + ", ".join("to_timestamp(%s)" if c == "started_at" else "%s"
+               + ", ".join("to_timestamp(%s)" if c == "started_at"
+                           else "%s::jsonb" if c == "inputs" else "%s"
                            for c in cols) + ")")
         if not suffix:
             self.db.execute(sql, tuple(values))

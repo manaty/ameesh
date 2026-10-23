@@ -267,6 +267,35 @@ class SelectionTest(unittest.TestCase):
         # Un seul candidat par famille (le moins chargé) : jamais deux fois la même.
         self.assertEqual(len({r["family"] for r in two["reviewers"]}), 2)
 
+    def test_the_pending_reviews_of_the_load_are_named_in_the_why(self):
+        # #3004, témoin (a) : même famille, même rythme ; `claude-queue` a 0 lot
+        # assigné mais 5 avis en attente, `claude-busy` 2 lots assignés et 0 avis.
+        # La charge (`_loads`) tranche pour le second, et la marque du gel dit la
+        # charge retenue de chaque candidat choisi.
+        pool = candidates(
+            row("claude-queue", harness="claude", session="claude"),
+            row("claude-busy", harness="claude", session="claude"),
+            loads={"claude-queue": 5, "claude-busy": 2})
+        one = rd.select(families=FAMILIES, required=1,
+                        authors=[{"name": "impl-02", "family": "deepseek"}],
+                        candidates=pool)
+        self.assertEqual([r["name"] for r in one["reviewers"]], ["claude-busy"])
+        self.assertIn("load: claude-busy 2", one["why"])
+        self.assertNotIn("claude-queue 5", one["why"])
+        pool = candidates(
+            row("claude-queue", harness="claude", session="claude"),
+            row("claude-busy", harness="claude", session="claude"),
+            row("codex-one", harness="codex", session="codex"),
+            loads={"claude-queue": 5, "claude-busy": 2, "codex-one": 0})
+        two = rd.select(families=FAMILIES, required=2,
+                        authors=[{"name": "impl-02", "family": "deepseek"}],
+                        candidates=pool)
+        self.assertEqual([r["name"] for r in two["reviewers"]],
+                         ["codex-one", "claude-busy"])
+        self.assertIn("load:", two["why"])
+        self.assertIn("codex-one 0", two["why"])
+        self.assertIn("claude-busy 2", two["why"])
+
     def test_family_comes_from_the_session_never_from_the_name(self):
         pool = candidates(
             row("codex3", harness="deepseek", session="claude"),

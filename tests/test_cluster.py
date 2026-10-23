@@ -159,6 +159,11 @@ FERMEES = {
     "github_watch_cursors": {"project", "repo", "scanned_through"},
     "github_watch_events": {"project", "repo", "kind", "object_id", "digest"},
     "github_watch_scans": {"project", "repo", "progress"},
+    # #288 (L80b, 0472) : attribution des messages servis par un tour résident
+    # (`turn_costs.inputs`), consommée par le rapport local
+    # `ameesh cost turns --message` ; le contrat des rôles superviseur reste
+    # inchangé : colonne fermée aux deux rôles, aucun GRANT modifié.
+    "turn_costs": {"inputs"},
 }
 #: L232b (0417) : l'état interne du contrôleur de release reste hors contrat,
 #: sauf `host_release_fences.host`, lu par `ameesh_host_gate_state` (l.314).

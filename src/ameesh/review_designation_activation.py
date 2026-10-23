@@ -746,19 +746,96 @@ def corrections_of_head(db, item: Mapping, milestone: Optional[Mapping],
 # --------------------------------------------------------------------------
 
 def _loads(db) -> dict:
-    """Open lots per agent (the load of the selection), in one read."""
+    """Open lots per agent (the load of the selection), in **one** read.
+
+    The charge of a reviewer is every open lot they carry: the lots assigned to
+    them, plus the lots where the **last freeze designates them** without a
+    verdict of theirs on that head (#3004). The second part is what was
+    missing: a reviewer with an empty assignment queue but a full review queue
+    looked free, so every freeze of their family picked them again.
+
+    The designation is the effective journal mark of the lot's latest freeze
+    (`review-designation:` for a selection, `review-designation-carried:` for a
+    carried report), the authoritative mark `_sync_reviewers` derives the
+    gate's `reviewers` column from — not the column itself, which is synced
+    **after** the selection and would charge the old head while a new freeze
+    designates. Only a verdict naming
+    the frozen head discharges the review — full or abbreviated SHA, the same
+    `_same_freeze` rule as the designation itself; a `blocked` verdict counts,
+    the reviewer has rendered it. A closed, merged or promoted lot is no longer
+    a charge, and an unreadable read is zero, as before: never a guess and
+    never a failed freeze. A lot where the agent is both assignee and
+    designated reviewer counts once: `charges` is a set of (lot, agent).
+    """
     try:
         rows = db.query(
-            "SELECT assignee, count(*) AS load FROM work_items"
-            " WHERE assignee IS NOT NULL AND assignee <> ''"
-            "   AND state NOT IN ('merged', 'promoted', 'closed')"
-            " GROUP BY assignee")
+            """
+            WITH open_items AS (
+                SELECT id, assignee
+                  FROM work_items
+                 WHERE state NOT IN ('merged', 'promoted', 'closed')
+            ), latest_freeze AS (
+                SELECT DISTINCT ON (m.work_item_id)
+                       m.work_item_id AS lot, m.id AS freeze_id, m.sha AS sha, m.at AS at
+                  FROM work_item_milestones m
+                  JOIN open_items o ON o.id = m.work_item_id
+                 WHERE m.kind = 'frozen'
+                 ORDER BY m.work_item_id, m.at DESC, m.id DESC
+            ), latest_mark AS (
+                SELECT f.lot, f.sha,
+                       (SELECT e.note
+                          FROM work_item_events e
+                         WHERE e.work_item_id = f.lot
+                           AND e.created_at >= f.at
+                           AND (starts_with(e.note,
+                                            'review-designation:' || f.lot
+                                            || ':' || f.freeze_id || ':')
+                                OR starts_with(e.note,
+                                               'review-designation-carried:' || f.lot
+                                               || ':' || f.freeze_id || ':'))
+                         ORDER BY e.id DESC
+                         LIMIT 1) AS note
+                  FROM latest_freeze f
+            ), designees AS (
+                SELECT f.lot, f.sha, btrim(r.value->>'name') AS name
+                  FROM latest_mark f
+                  CROSS JOIN LATERAL jsonb_array_elements(
+                      (substring(f.note from position(': ' in f.note) + 2))::jsonb
+                      -> 'reviewers') AS r(value)
+                 WHERE f.note IS NOT NULL
+            ), charges AS (
+                SELECT id AS lot, assignee AS name
+                  FROM open_items
+                 WHERE assignee IS NOT NULL AND assignee <> ''
+                UNION
+                SELECT d.lot, d.name
+                  FROM designees d
+                 WHERE d.name <> ''
+                   AND btrim(d.sha) <> ''
+                   AND NOT EXISTS (
+                        SELECT 1
+                          FROM work_item_milestones v
+                         WHERE v.work_item_id = d.lot
+                           AND v.kind = 'verdict'
+                           AND lower(btrim(v.actor)) = lower(d.name)
+                           AND (lower(btrim(v.sha)) = lower(btrim(d.sha))
+                                OR (length(btrim(v.sha)) >= 7
+                                    AND starts_with(lower(btrim(d.sha)),
+                                                    lower(btrim(v.sha))))
+                                OR (length(btrim(d.sha)) >= 7
+                                    AND starts_with(lower(btrim(v.sha)),
+                                                    lower(btrim(d.sha))))))
+            )
+            SELECT name, count(*)::int AS load
+              FROM charges
+             GROUP BY name
+            """)
     except Exception:  # noqa: BLE001 - unreadable load: zero, never a guess
         return {}
     out = {}
     for row in rows or ():
         try:
-            out[str(row["assignee"])] = int(row["load"])
+            out[str(row["name"])] = int(row["load"])
         except (KeyError, TypeError, ValueError):
             continue
     return out

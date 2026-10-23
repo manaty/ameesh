@@ -14,6 +14,7 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -60,6 +61,13 @@ if [ "$(basename "$0")" = vm.sh ]; then
   fi
 fi
 action=${1:-}
+if [ "$host" = pc-smichea ]; then
+  case "$action" in
+    redemarrer|retour)
+      . "$state/garde.sh"
+      verifier_hors_agent || exit 1 ;;
+  esac
+fi
 printf 'call host=%s action=%s args=%s\n' "$host" "$action" "$*" >> "$state/calls.log"
 if grep -qx "ko=$host:$action" "$state/scenario" 2>/dev/null; then
   grep -vx "ko=$host:$action" "$state/scenario" > "$state/scenario.tmp" || true
@@ -116,6 +124,49 @@ printf 'ssh %s\n' "$*" >> "${FAKE_STATE:?}/calls.log"
 exit 255
 '''
 
+SYSTEMD_RUN = r'''
+import json, os, subprocess, sys
+from pathlib import Path
+args = iter(sys.argv[1:])
+env = dict(os.environ)
+# Le gestionnaire ne transmet pas l'environnement de l'appelant.
+for name in ('BASCULE_ENV', 'AMEESH_CONFIG'):
+    env.pop(name, None)
+unit = cwd = None
+flags = []
+for arg in args:
+    if arg in ('--user', '--collect', '--wait', '--pipe'):
+        flags.append(arg)
+    elif arg == '--unit':
+        unit = next(args)
+    elif arg == '--working-directory':
+        cwd = next(args)
+    elif arg.startswith('--setenv='):
+        name, value = arg.removeprefix('--setenv=').split('=', 1)
+        env[name] = value
+    else:
+        command = [arg, *args]
+        break
+assert set(flags) == {'--user', '--collect', '--wait', '--pipe'}
+assert unit.startswith('poste-maj-') and cwd
+env['FAKE_CGROUP'] = '0::/user.slice/app.slice/' + unit + '.service'
+state = Path(env['FAKE_STATE'])
+with (state / 'units.jsonl').open('a') as log:
+    log.write(json.dumps(dict(unit=unit, cwd=cwd, command=command,
+                             bascule=env.get('BASCULE_ENV'),
+                             config=env.get('AMEESH_CONFIG'))) + '\n')
+if ('unit-ko=' + command[-1]) in (state / 'scenario').read_text().splitlines():
+    sys.exit(23)
+sys.exit(subprocess.run(command, env=env, cwd=cwd).returncode)
+'''
+
+CAT = r'''#!/bin/sh
+case "$1" in
+  /proc/*/cgroup) printf '%s\n' "${FAKE_CGROUP:-0::/user.slice/session.scope}" ;;
+  *) exec /usr/bin/cat "$@" ;;
+esac
+'''
+
 
 class StagingTest(unittest.TestCase):
     maxDiff = None
@@ -127,6 +178,10 @@ class StagingTest(unittest.TestCase):
         self.state = self.root / 'state'; self.state.mkdir()
         (self.state / 'calls.log').touch()
         (self.state / 'scenario').write_text('')
+        # La vraie garde #2950, sans lancer les gestes du dispatcher poste.
+        poste = (DEPLOY / 'poste.sh').read_text()
+        garde = poste.split('verifier_hors_agent() {', 1)[1].split('\nredemarrer() {', 1)[0]
+        (self.state / 'garde.sh').write_text('verifier_hors_agent() {' + garde)
         self.home = self.root / 'home'; self.home.mkdir()
         self.repo = self.root / 'repo'
         self.script_dir = self.repo / 'deploy/mise-a-jour'
@@ -138,9 +193,11 @@ class StagingTest(unittest.TestCase):
             path.write_text(source)
             path.chmod(0o755)
         self.bin = self.root / 'bin'; self.bin.mkdir()
-        for name in ('ssh',):
+        (self.bin / 'python3').symlink_to(sys.executable)
+        for name, source in (('ssh', SSH), ('cat', CAT),
+                             ('systemd-run', '#!' + sys.executable + '\n' + SYSTEMD_RUN)):
             path = self.bin / name
-            path.write_text(SSH)
+            path.write_text(source)
             path.chmod(0o755)
         venv = self.home / '.local/share/ameesh/venv/bin'; venv.mkdir(parents=True)
         for name, source in (('python', VENV_PYTHON), ('ameesh', VENV_AMEESH)):
@@ -333,6 +390,55 @@ class StagingTest(unittest.TestCase):
                                 and t['verdict'] == 'ok' for t in traces), traces)
         self.assertEqual((self.home / '.local/state/ameesh/mise-a-jour').stat().st_mode & 0o777, 0o700)
         self.assertEqual(list(self.script_dir.glob('staging-*.env')), [])
+
+    def units(self):
+        return [json.loads(line) for line in
+                (self.state / 'units.jsonl').read_text().splitlines()]
+
+    def test_release_cgroup_restarts_and_rolls_back_in_separate_units(self):
+        self.env['FAKE_CGROUP'] = '0::/user.slice/app.slice/ameesh-release.service'
+        # Un chemin relatif avec espaces exige aussi le bon cwd dans l'unite.
+        relative = Path(os.path.relpath(self.config, Path.cwd())).with_name('bascule test.env')
+        self.config.rename(relative)
+        self.env['BASCULE_ENV'] = str(relative)
+        self.env['AMEESH_CONFIG'] = 'config test.json'
+        (self.state / 'scenario').write_text('ko=sante:pc-smichea\n')
+        p = self.run_staging()
+        self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
+        units = self.units()
+        self.assertEqual([u['command'][-1] for u in units], ['redemarrer', 'retour'])
+        self.assertNotEqual(units[0]['unit'], units[1]['unit'])
+        for unit in units:
+            self.assertEqual(unit['cwd'], str(Path.cwd()))
+            self.assertEqual(unit['bascule'], str(relative))
+            self.assertEqual(unit['config'], 'config test.json')
+        self.assertIn(('pc-smichea', 'redemarrer'), self.actions())
+        self.assertIn(('pc-smichea', 'retour'), self.actions())
+        self.assertTrue(any(t['etape'] == 'retour' and t['verdict'] == 'ok'
+                            for t in self.traces()))
+
+    def test_transient_failure_attempts_rollback_then_notifies(self):
+        self.env['FAKE_CGROUP'] = '0::/user.slice/app.slice/ameesh-release.service'
+        for rollback_fails in (False, True):
+            with self.subTest(rollback_fails=rollback_fails):
+                (self.state / 'calls.log').write_text('')
+                (self.state / 'units.jsonl').write_text('')
+                scenario = 'unit-ko=redemarrer\n'
+                if rollback_fails:
+                    scenario += 'unit-ko=retour\n'
+                (self.state / 'scenario').write_text(scenario)
+                p = self.run_staging()
+                self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
+                self.assertEqual([u['command'][-1] for u in self.units()],
+                                 ['redemarrer', 'retour'])
+                # Aucun repli direct apres l'echec de systemd-run.
+                self.assertNotIn(('pc-smichea', 'redemarrer'), self.actions())
+                notifications = [l for l in self.calls() if l.startswith('venv-python - ')]
+                self.assertEqual(len(notifications), 1)
+                expected = 'retour de pc-smichea en ECHEC' if rollback_fails else 'retour effectue'
+                self.assertIn(expected, notifications[0])
+                self.assertEqual(('pc-smichea', 'retour') in self.actions(),
+                                 not rollback_fails)
 
     def test_failure_stops_sequence_and_rolls_back_host(self):
         (self.state / 'scenario').write_text('ko=manaty-mesh-1:controler\n')
@@ -795,6 +901,37 @@ class SanteCourrierTest(unittest.TestCase):
             self.assertEqual(self.mod.sans_executeur(object(), rows, 0.0, 1000.0), [])
         unread.assert_not_called()
 
+    def test_sans_executeur_exclut_le_profil_humain_meme_en_mode_execute(self):
+        """#2957 : une ligne humaine (cle owner / harness none) n'est pas un
+        executant a relancer : elle reste dans canal_humain, jamais comptee
+        deux fois."""
+        rows = [{'name': 'smichea', 'status': 'idle', 'mode': 'execute',
+                 'key_role': 'owner', 'harness': 'none',
+                 'responsible': 'human:smichea'},
+                {'name': 'orchestrateur', 'status': 'idle'}]
+        with mock.patch.object(self.mod.mail, 'unread_active',
+                               return_value=[{'id': 1, 'created_ts': 900.0}]), \
+             mock.patch.object(self.mod.mail, 'maybe_redelivered', return_value=False):
+            self.assertEqual(
+                [e['destinataire'] for e in
+                 self.mod.sans_executeur(object(), rows, 0.0, 1000.0)],
+                ['orchestrateur'])
+            self.assertEqual(
+                [e['destinataire'] for e in
+                 self.mod.canal_humain(object(), 'h', 1000.0, rows)],
+                ['smichea'])
+
+    def test_sans_executeur_lit_le_prefixe_de_pause_budget(self):
+        """#2957 : la pause budget se lit avec budget.PAUSE_PREFIX, pas un
+        litteral qui deriverait si le prefixe changeait."""
+        rows = [{'name': 'budget', 'status': 'blocked',
+                 'status_text': 'pause : compte epuise'}]
+        with mock.patch.object(self.mod.budget, 'PAUSE_PREFIX', 'pause : '):
+            with mock.patch.object(self.mod.mail, 'unread_active') as unread:
+                self.assertEqual(
+                    self.mod.sans_executeur(object(), rows, 0.0, 1000.0), [])
+            unread.assert_not_called()
+
     def test_sans_executeur_nomme_un_bloque_avec_erreur(self):
         """#2899 : un bloque sans bail et hors pause budget garde sa cause et
         son courrier ; il n'est plus invisible."""
@@ -858,9 +995,26 @@ class SanteCourrierTest(unittest.TestCase):
                   'alerte': 'stopped_with_mail',
                   'lecture': 'agent-mail inbox smichea'},
                  {'destinataire': 'chat-smichea', 'n': 1, 'plus_ancien_s': 10.0,
+                  'responsable': 'human:smichea', 'canal': 'chat',
+                  'alerte': None,
+                  'lecture': 'agent-mail inbox chat-smichea'}])
+
+    def test_canal_humain_fallback_owner_pour_un_profil_sans_responsable(self):
+        """#2957 : un profil externe sans responsable prend le canal humain du
+        proprietaire, lu au registre ; le rapport ne laisse pas 'human:?'."""
+        rows = [{'name': 'veille', 'host': 'h', 'status': 'idle',
+                 'mode': 'externe', 'harness': 'other'}]
+        owner = [{'name': 'smichea', 'key_role': 'owner',
+                  'responsible': 'human:smichea', 'host': 'h'}]
+        with mock.patch.object(self.mod.registry, 'overview', return_value=owner), \
+             mock.patch.object(self.mod.mail, 'unread_active',
+                               return_value=[{'id': 4, 'created_ts': 990.0}]):
+            self.assertEqual(
+                self.mod.canal_humain(object(), 'h', 1000.0, rows),
+                [{'destinataire': 'veille', 'n': 1, 'plus_ancien_s': 10.0,
                   'responsable': 'human:smichea', 'canal': 'human:smichea',
                   'alerte': 'idle_with_mail',
-                  'lecture': 'agent-mail inbox chat-smichea'}])
+                  'lecture': 'agent-mail inbox veille'}])
 
     def test_main_sans_executeur_sort_ko_avec_sa_cause(self):
         """#2899 : un destinataire operationnel sans bail vivant est un KO

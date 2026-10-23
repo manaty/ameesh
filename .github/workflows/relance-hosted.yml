@@ -6,11 +6,11 @@
 # tentatives (« The job was not acquired by Runner of type hosted », contrainte
 # de capacité macOS arm64 : run 38428931108, job 115427733668, 13/10/2026). Le
 # job `platform-macos` de « tests » conclut alors `cancelled` sans qu'une seule
-# étape tourne ; l'agrégat requis `tests` le refuse (needs.platform-macos.result
-# == success), donc le check requis rougit sans défaut de code. L'API refuse de
-# rejouer le job tant que l'exécution tourne : la reprise doit venir d'ici,
-# APRÈS la conclusion — d'où le déclencheur `workflow_run`, et non une étape de
-# « tests ».
+# étape tourne ; il n'est pas encore requis par l'agrégat `tests` (décision de
+# la revue #393), mais une annulation de capacité doit rester visible et reprise.
+# L'API refuse de rejouer le job tant que l'exécution tourne : la reprise doit
+# venir d'ici, APRÈS la conclusion — d'où le déclencheur `workflow_run`, et non
+# une étape de « tests ».
 #
 # Un groupe de runners auto-hébergés peut aussi disparaître en cours de part
 # (incident du 21/10/2026, run 39554271532 : huit parts de `ameesh-ci-1`

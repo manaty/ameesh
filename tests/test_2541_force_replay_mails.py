@@ -10,7 +10,7 @@ rejeu qui les désigne après un report refusé doit bien leur écrire pour ce g
 """
 from __future__ import annotations
 
-from ameesh import registry
+from ameesh import registry, work
 from ameesh import review_designation_activation as act
 
 from .test_2487_designation_carry import _Fixture
@@ -73,6 +73,13 @@ class ForceReplayMailTest(_Fixture):
                             cwd=self.repo.root, status="idle")
             self.db.execute(
                 "UPDATE agent_registry SET team = 'ameesh' WHERE name = %s", (name,))
+        # #3004 : rev3 is eligible for the same family as rev1 but already
+        # carries an open lot; rev1 (one pending review) wins the load tie by
+        # name, so the witness still exercises the already-mailed seat.
+        extra = work.add(self.db, title="charge rev3", app="ameesh")
+        work.move(self.db, int(extra["id"]), "build")
+        self.db.execute("UPDATE work_items SET assignee = 'rev3' WHERE id = %s",
+                        (int(extra["id"]),))
         applied = act.designate(self.cfg, self.db, self.lot, force=True)
         self.assertEqual(applied["state"], "designated", applied)
         self.assertEqual(sorted(r["name"] for r in applied["reviewers"]),

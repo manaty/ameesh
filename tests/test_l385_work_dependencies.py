@@ -623,8 +623,10 @@ class LandingTest(PgTestCase):
         work.milestone(self.db, lot, "verdict", verdict="blocked", sha=sha, actor="test")
         self.assertIn("acquired ok verdict", self.cli(str(lot), "--vehicle", str(self.vehicle),
                                                       "--until", until, ok=False).stderr)
-        # un verdict ok d'une AUTRE tête ne vaut pas pour le dernier gel
-        work.milestone(self.db, lot, "verdict", verdict="ok", sha="f" * 40, actor="test")
+        # un verdict ok d'une AUTRE tête ne vaut pas pour le dernier gel (avis
+        # ancien, écrit avant que la porte #2962 ne refuse une tête inconnue)
+        storage.of(self.db).work.add_milestone(
+            lot, "verdict", sha="f" * 40, actor="test", verdict="ok", note="")
         self.assertIn("acquired ok verdict", self.cli(str(lot), "--vehicle", str(self.vehicle),
                                                       "--until", until, ok=False).stderr)
         work.milestone(self.db, lot, "verdict", verdict="ok", sha=sha, actor="test")

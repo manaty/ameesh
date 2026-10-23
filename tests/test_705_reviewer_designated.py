@@ -166,6 +166,14 @@ class ReviewerDesignationTest(PgTestCase):
         return self.mesh("work", "move", str(lot["id"]), "qa", *args, "--actor", "chef",
                          env=self._env())
 
+    def _freeze_at(self, lot, sha):
+        """#2962 : un SHA complet non résolu ne gèle plus par la porte ; ces
+        témoins posent la tête gelée au stockage (#2962 a ses propres témoins
+        d'écriture du gel)."""
+        self.db.execute(
+            "INSERT INTO work_item_milestones (work_item_id, kind, sha, actor)"
+            " VALUES (%s, 'frozen', %s, 'chef')", (lot["id"], sha))
+
     def _stale(self, lot):
         """Vieillit la ligne, les transitions, les jalons et le courrier (7 h).
 
@@ -602,6 +610,7 @@ class ReviewerDesignationTest(PgTestCase):
         lot = self._lot(app="ameesh")
         proc = self._qa(lot)
         self.assertEqual(proc.returncode, 0, proc.stderr)
+        self._freeze_at(lot, "a" * 40)
         work.milestone(self.db, lot["id"], "verdict", verdict="blocked",
                        sha="a" * 40, actor="chef")
 
@@ -617,9 +626,10 @@ class ReviewerDesignationTest(PgTestCase):
         lot = self._lot(app="ameesh")
         proc = self._qa(lot)
         self.assertEqual(proc.returncode, 0, proc.stderr)
+        self._freeze_at(lot, "a" * 40)
         work.milestone(self.db, lot["id"], "verdict", verdict="blocked",
                        sha="a" * 40, actor="chef")
-        work.milestone(self.db, lot["id"], "frozen", sha="b" * 40, actor="chef")
+        self._freeze_at(lot, "b" * 40)
 
         proc = self.mesh("work", "reviewer", str(lot["id"]), "--no-verdict",
                          "--actor", "chef", env=self._env())

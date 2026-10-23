@@ -48,7 +48,8 @@ def job(nom, conclusion, runner="", etapes=(), labels=()):
 
 #: le job annulé faute de runner : jamais pris, aucune étape (signature #987)
 MACOS_ANNULE = job("plateforme macOS", "cancelled", labels=["macos-26-intel"])
-#: l'agrégat requis, rouge parce qu'il exige platform-macos == success
+#: l'agrégat requis, rouge sur un vrai échec d'une part (le job macOS n'est
+#: plus dans ses `needs` depuis la décision de la revue #393)
 AGREGAT = job("tests", "failure", runner="ameesh-ci-1-1",
               etapes=["bilan des parts"],
               labels=["self-hosted", "linux", "ameesh-ci"])
@@ -253,11 +254,12 @@ class WorkflowTest(unittest.TestCase):
         self.assertIn("runs-on: macos-26-intel", texte)
         self.assertNotIn("runs-on: macos-latest", texte)
 
-    def test_le_check_requis_exige_toujours_macos(self):
-        # la garde ne remplace pas la porte : l'agrégat requis exige encore le
-        # succès du job macOS (une annulation reste rouge tant qu'elle dure)
+    def test_le_job_macos_n_est_pas_encore_requis(self):
+        # Décision de la revue #393 : le job macOS n'entre dans les `needs` de
+        # l'agrégat qu'une fois la suite complète verte sous macOS. La relance
+        # garde son utilité : une annulation de capacité reste reprise.
         texte = TESTS.read_text(encoding="utf-8")
-        self.assertIn('test "${{ needs.platform-macos.result }}" = success', texte)
+        self.assertNotIn('test "${{ needs.platform-macos.result }}" = success', texte)
 
     def ligne_declencheurs(self):
         """La ligne `workflows:` de la garde : le contrat du déclencheur."""

@@ -20,6 +20,7 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 
 from ameesh import plan_git, registry, review_designation as rd
 from ameesh import review_designation_activation as act
@@ -99,6 +100,51 @@ class FreezeHeadWriteTest(PgTestCase):
         self.assertNotIn(work.FREEZE_ABSENT_MARK, row["note"])
         self.assertIn("revue demandée", row["note"])
 
+    def test_un_blanc_de_tete_ne_forge_pas_la_marque_apres_le_strip(self):
+        # #2989 B (revue cx2) : `add_milestone` strippe la note après les
+        # filtres. Un blanc de tête (`\v`, espace Unicode) disparaissait donc au
+        # strip et laissait une ligne machine valide, sans que le garde #2786
+        # ne l'ait vue.
+        for blank in ("\v", "\u00a0"):
+            with self.subTest(blank=repr(blank)):
+                row = self.freeze(HEAD, note=blank + "ameesh-freeze-absent: main")
+                self.assertNotIn(work.FREEZE_ABSENT_MARK, row["note"] or "")
+
+    def test_une_ligne_retiree_n_expose_pas_la_marque_suivante(self):
+        # #2989 B (revue dev1) : retirer la première ligne machine exposait la
+        # suivante, précédée d'un blanc que `[ \t]*` ne couvre pas ; le strip
+        # final de `milestone` la rendait alors valide. `\v`, `\f` et l'espace
+        # insécable sont tous blanchis par `str.strip()`.
+        for blank in ("\v", "\f", "\u00a0"):
+            with self.subTest(blank=repr(blank)):
+                row = self.freeze(
+                    HEAD, note="ameesh-freeze-supersedes: 1\n" + blank
+                    + "ameesh-freeze-absent: main")
+                self.assertNotIn(work.FREEZE_ABSENT_MARK, row["note"] or "")
+
+    def test_un_depot_du_cwd_ne_prouve_pas_absent(self):
+        # #2989 N2 (revue dev2) : un clone du cwd non fetché ne prouve pas
+        # qu'un commit n'existe nulle part. Seuls les dépôts de l'auteur
+        # (projet, dossier de l'assigné) font preuve d'absence.
+        from ameesh import freeze_gate
+        ghost = "c" * 40
+        repo = tempfile.mkdtemp(prefix="ameesh-2989-cwd-")
+        self.addCleanup(shutil.rmtree, repo, True)
+        repo_with_commit(repo)
+        item = work.get(self.db, self.lot)
+        with mock.patch.object(freeze_gate, "_head_repos",
+                               return_value=[repo]), \
+                mock.patch.object(freeze_gate, "_author_repos",
+                                  return_value=[]):
+            self.assertEqual(work.freeze_head(self.db, item, ghost), ghost)
+        with mock.patch.object(freeze_gate, "_head_repos",
+                               return_value=[repo]), \
+                mock.patch.object(freeze_gate, "_author_repos",
+                                  return_value=[repo]):
+            with self.assertRaises(work.WorkError) as caught:
+                work.freeze_head(self.db, item, ghost)
+        self.assertIn("head-unresolved", str(caught.exception))
+
     def test_une_abreviation_est_resolue_dans_le_depot_de_l_auteur(self):
         repo = tempfile.mkdtemp(prefix="ameesh-2786-")
         self.addCleanup(shutil.rmtree, repo, True)
@@ -152,6 +198,30 @@ class FreezeHeadWriteTest(PgTestCase):
                          env=self.env(AGENT_MAIL_NAME="auteur"))
         self.assertEqual(proc.returncode, 1, proc.stdout)
         self.assertIn("head-missing", proc.stderr)
+        self.assertEqual(self.freezes(), [])
+
+    def test_un_sha_complet_absent_est_refuse_a_la_creation(self):
+        # #2989 : un gel fantôme ne s'écrit plus par la CLI ; sans cette
+        # validation, son SHA inexistant bloquerait la provenance des gels
+        # suivants (#2914, gel 14991). Un `--repo` autoritaire prouve l'absence ;
+        # un hôte sans dépôt de lecture garde l'ancien comportement (#2542).
+        # #2962 : le refus d'une tête absente porte le nom `head-unresolved`,
+        # le même qu'une abréviation non résolue (l'union des deux lots garde
+        # la garde de #2989 et le nom de #2962).
+        ghost = "c" * 40
+        repo = tempfile.mkdtemp(prefix="ameesh-2989-")
+        self.addCleanup(shutil.rmtree, repo, True)
+        repo_with_commit(repo)
+        item = work.get(self.db, self.lot)
+        with self.assertRaises(work.WorkError) as caught:
+            work.freeze_head(self.db, item, ghost, repo=repo)
+        self.assertIn("head-unresolved", str(caught.exception))
+        self.assertIn(ghost[:12], str(caught.exception))
+        proc = self.mesh("work", "milestone", str(self.lot), "frozen",
+                         "--sha", ghost, "--actor", "auteur", "--repo", repo,
+                         env=self.env(AGENT_MAIL_NAME="auteur"))
+        self.assertEqual(proc.returncode, 1, proc.stdout)
+        self.assertIn("head-unresolved", proc.stderr)
         self.assertEqual(self.freezes(), [])
 
     def test_work_show_signale_un_ancien_gel_head(self):
