@@ -90,13 +90,17 @@ class MigrationPinningTest(unittest.TestCase):
             '*) exit 97 ;; esac ;;\n'
             '*) exit 98 ;; esac\n')
         (bin_dir / "systemctl").chmod(0o755)
+        # #3042 : macOS n'a pas /usr/bin/sha256sum (coreutils le fournit dans
+        # libexec/gnubin). Résoudre le vrai binaire AVANT d'ajouter `bin_dir`
+        # au PATH, sinon le faux se rappelle lui-même.
+        vrai_sha256sum = shutil.which("sha256sum") or "/usr/bin/sha256sum"
         (bin_dir / "sha256sum").write_text(
             '#!/bin/sh\n'
             'if [ "${FAKE_SHA256_BAD:-0}" = 1 ]; then\n'
             '  printf "%064d  %s\\n" 0 "${2:-}"\n'
             '  exit 0\n'
             'fi\n'
-            'exec /usr/bin/sha256sum "$@"\n')
+            'exec ' + shlex.quote(vrai_sha256sum) + ' "$@"\n')
         (bin_dir / "sha256sum").chmod(0o755)
         (bin_dir / "sleep").write_text("#!/bin/sh\nexit 0\n")
         (bin_dir / "sleep").chmod(0o755)
