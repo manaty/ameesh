@@ -584,6 +584,8 @@ class ReviewFixesTests(_Base):
         self.assertEqual(len(deps.gc_node_modules(self.cache, now=later,
                                                   holders=lambda _p: [])), 1)
 
+    @unittest.skipUnless(deps.platform.is_linux(),
+                         "les fichiers projetés se lisent dans /proc/<pid>/maps (Linux)")
     def test_6_holders_see_mapped_files(self):
         import sys
         exe_dir = os.path.dirname(os.path.realpath(sys.executable))

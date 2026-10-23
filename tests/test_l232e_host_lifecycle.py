@@ -171,7 +171,8 @@ class HostLifecycleTest(PgTestCase):
         registry.release(self.db, "dev", "runner", self.lease["lease_epoch"])
         found = self.detect_loss()[0]
         self.api.hosts.record({"host": "source", "gate_state": "available"})
-        self.assertEqual(self.api.hosts.latest("source")["gate_state"], "draining")
+        # #3035: the diagnostic names the actual bound, not the generic drain.
+        self.assertEqual(self.api.hosts.latest("source")["gate_state"], "lost")
         self.assertEqual(self.api.host_lifecycle.get("source"), found)
         self.assertIsNone(registry.claim(self.db, "dev", "old", ttl_seconds=300))
         with self.assertRaisesRegex(ValueError, "verified recovery"):

@@ -176,6 +176,11 @@ def set_estimate(db, item_id: int, estimate, *, source: str | None = None,
     return row
 
 
+#: #3162 : le début de la ligne de journal du début mesuré (`mark_started`) ;
+#: le SLO `intake_started` la lit comme un fait de début.
+START_NOTE = "start measured: "
+
+
 def mark_started(db, agent: str, lots) -> list[int]:
     """L'exécuteur : un tour de `agent` commence sur ces lots. Ceux qui lui
     sont assignés, ouverts et sans début mesuré, reçoivent leur début."""
@@ -184,7 +189,7 @@ def mark_started(db, agent: str, lots) -> list[int]:
     if not ids:
         return []
     return storage.of(db).work.mark_started(
-        agent, ids, "start measured: first turn of %s on the lot" % agent)
+        agent, ids, START_NOTE + "first turn of %s on the lot" % agent)
 
 
 # --------------------------------------------------------------------------

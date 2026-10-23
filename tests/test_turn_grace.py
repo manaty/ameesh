@@ -261,6 +261,8 @@ class KillVerdictTest(unittest.TestCase):
         self._expire(PermissionError(1, "EPERM")).assert_called_once_with(
             "t" * 32, orphan=True, containers=None)
 
+    @unittest.skipUnless(platform.is_linux(),
+                         "sous-moissonneur pidfd (Linux) : la propriété du groupe est incertaine hors Linux")
     def test_groupe_disparu_ferme_non_orphelin(self):
         self._expire(ProcessLookupError(3, "ESRCH")).assert_called_once_with(
             "t" * 32, orphan=False, containers=None)
@@ -270,6 +272,8 @@ class KillVerdictTest(unittest.TestCase):
         self._expire(PermissionError(1, "EPERM"), shutdown=True).assert_called_once_with(
             "t" * 32, orphan=True, containers=None)
 
+    @unittest.skipUnless(platform.is_linux(),
+                         "sous-moissonneur pidfd (Linux) : la propriété du groupe est incertaine hors Linux")
     def test_shutdown_vanished_process_closes_without_orphan(self):
         self._expire(ProcessLookupError(3, "ESRCH"), shutdown=True).assert_called_once_with(
             "t" * 32, orphan=False, containers=None)
@@ -399,6 +403,8 @@ class GraceTest(_Base):
             except ProcessLookupError:
                 pass
 
+    @unittest.skipUnless(platform.is_linux(),
+                         "cgroup de tour et pidfds (Linux)")
     def test_failed_handoff_preserves_child_migrated_to_another_turn(self):
         runner, worker = self._worker("fond-migrated")
         pidfile = os.path.join(self.tmp, "migrated.pid")
@@ -497,6 +503,8 @@ class GraceTest(_Base):
         # dit une fois
         self.assertNotIn("Background work", self._tour(worker, "encore"))
 
+    @unittest.skipUnless(platform.is_linux(),
+                         "nettoyage par pidfd/sous-moissonneur (Linux)")
     def test_echeance_de_la_grace_reglee_par_agent(self):
         runner, worker = self._worker("fond-long", turn_grace_seconds=1)
         self.assertEqual(worker.turn_grace_seconds(), 1)
@@ -524,6 +532,8 @@ class GraceTest(_Base):
         self.assertIsNotNone(ligne["ended_ts"])
         self.assertNotEqual(ligne["status"], "running")
 
+    @unittest.skipUnless(platform.is_linux(),
+                         "nettoyage par pidfd/sous-moissonneur (Linux)")
     def test_tour_clos_au_point_sur_garde_le_travail_de_fond(self):
         runner, worker = self._worker("fond-clos", turn_max_seconds=1)
         pidfile = os.path.join(self.tmp, "clos.pid")

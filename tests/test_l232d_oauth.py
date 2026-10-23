@@ -198,6 +198,7 @@ class FakeCliTest(unittest.TestCase):
 
 
 class SupervisorTest(FakeCliTest):
+    @unittest.skipUnless(login.PEEK_EXIT, "requires waitid(WNOWAIT); fallback tested below")
     def test_le_groupe_est_tue_meme_si_son_chef_est_deja_sorti(self):
         """N1 : la sortie est observée SANS récolter, donc le zombie garde le
         PID (et le pgid) pendant le killpg de nettoyage."""
@@ -592,6 +593,7 @@ class SupervisorClosureRaceTest(unittest.TestCase):
         self.assertEqual(invalidated, [remote_id])
         self.assertEqual(request.link, "")
 
+    @unittest.skipUnless(login.PEEK_EXIT, "requires waitid(WNOWAIT); fallback tested below")
     def test_done_nettoie_le_groupe_apres_sortie_reussie_du_chef(self):
         sup = login.Supervisor(health=lambda _request: "healthy", grace=0)
         request = sup.registry.open(host="h", harness="gh", account="a")

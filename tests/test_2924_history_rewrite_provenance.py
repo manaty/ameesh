@@ -468,18 +468,24 @@ class MissingPriorFreezeTest(_RewriteFixture):
         self.scratch.git("remote", "add", "origin", self.repo.root)
         self.scratch.git("fetch", "-q", "origin", self.head_b)
 
-    def test_the_reader_without_recovery_refuses_closed(self):
-        # B5 : un lecteur direct qui ne peut pas récupérer le gel absent ne
-        # devine aucune famille ; la porte, elle, tente la récupération (B7).
-        with self.assertRaises(review_provenance.ProvenanceError):
-            review_authors.reading(
-                self.db, self.lot_item(), self.milestone, [self.head_b],
-                self.scratch.root, FAMILIES, base=self.base, head=self.head_b,
-                strict=True)
-        _authors, unknown, _correctors = review_authors.reading(
+    def test_the_reader_recovers_the_missing_freeze_without_a_caller_hook(self):
+        # #3147 : le lecteur direct n'a plus besoin d'un `recover` d'appelant ;
+        # il demande le gel absent à la forge du clone (`origin`) par SHA exact.
+        #
+        # Avant #3147, ce lecteur refusait fermé : `recover_one` rendait False
+        # sans hook, même quand l'origine servait le commit. C'est ce qui
+        # faisait dépendre la porte du clone (packet_candidates, packet_watch,
+        # train, merge_queue lisent tous `review_authors`).
+        authors, unknown, correctors = review_authors.reading(
             self.db, self.lot_item(), self.milestone, [self.head_b],
-            self.scratch.root, FAMILIES, base=self.base, head=self.head_b)
-        self.assertEqual(unknown, [self.head_a[:12]])
+            self.scratch.root, FAMILIES, base=self.base, head=self.head_b,
+            strict=True)
+        self.assertEqual(unknown, [])
+        self.assertEqual({row["name"]: row["family"] for row in authors},
+                         {"impl": "deepseek", "cx3": "codex"})
+        self.assertIn("cx3", {row["name"] for row in correctors})
+        # Le gel récupéré est bien devenu lisible dans le clone de lecture.
+        self.scratch.git("cat-file", "-e", self.head_a + "^{commit}")
 
     def test_the_gate_recovers_the_missing_freeze(self):
         # B7 : le gel antérieur n'est pas dans le dépôt de la porte, mais son

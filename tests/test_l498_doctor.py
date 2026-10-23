@@ -43,6 +43,12 @@ class TurnCgroupLinesTest(unittest.TestCase):
         self.addCleanup(served.stop)
 
     def lines(self, run, root=None):
+        # Le contrôle réel (systemd, cgroup v2) n'existe que sous Linux ; les
+        # faux fichiers ci-dessous exercent sa lecture sous macOS aussi, et
+        # `test_pas_d_agent_ou_hors_linux` garde la porte hors Linux.
+        linux = mock.patch.object(hostcheck.platform, "is_linux", return_value=True)
+        linux.start()
+        self.addCleanup(linux.stop)
         patches = [mock.patch.object(hostcheck, "CGROUP_ROOT", root)] if root else []
         for item in patches:
             item.start()
