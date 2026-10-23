@@ -542,6 +542,20 @@ def _head_lines(repo: str, head: str, path: str, cache: dict):
     return cache[path]
 
 
+def _path_absent(repo: str, head: str, path: str, cache: dict):
+    """Le chemin est-il absent de la tête ? None si la lecture est impossible.
+
+    #3220 B2 : `_head_lines` rend None pour un chemin absent comme pour un
+    blob illisible. `git ls-tree` distingue les deux : une sortie vide (rc 0)
+    prouve l'absence, une lecture impossible rend None. La preuve de retrait
+    ne retire l'auteur que sur une absence prouvée ; le doute garde."""
+    key = ("absent", head, path)
+    if key not in cache:
+        text = plan_git._out(repo, "ls-tree", "--name-only", head, "--", path)
+        cache[key] = None if text is None else not str(text).strip()
+    return cache[key]
+
+
 def _path_line_counts(repo: str, rev: str, path: str, cache: dict):
     """Le nombre d'occurrences de chaque ligne (dépouillée) de `path` dans
     `rev`, ou None si le chemin y est absent ou illisible (#2977 B2)."""
@@ -557,112 +571,51 @@ def _path_line_counts(repo: str, rev: str, path: str, cache: dict):
     return cache[key]
 
 
-def _raw_out(repo: str, *args: str) -> Optional[str]:
-    """La sortie de git **telle quelle**, ou None en cas d'échec.
-
-    `plan_git._out` dépouille la sortie : le blanc initial de la première
-    ligne d'un fichier disparaît, et un hunk indenté ne s'y retrouve plus
-    (#2994 B1 cx2/impl-04 sur e127e8d4)."""
-    proc = plan_git._git(repo, *args)
-    if proc.returncode != 0:
-        return None
-    return proc.stdout.decode("utf-8", "replace")
-
-
-def _hunks_survive(repo: str, head: str, sha: str, path: str,
-                   cache: dict) -> bool:
-    """Un hunk de `sha` dans `path` subsiste-t-il **tel quel** dans la tête ?
-
-    Un réordre ou une réindentation ne change ni les lignes dépouillées ni
-    leurs comptes : sa trace est la version du hunk après le commit (ses
-    lignes ajoutées et une ligne de contexte de part et d'autre, indentation
-    comprise). Le hunk subsiste si la tête la contient d'un seul tenant. Un
-    diff ou un chemin illisible est un doute : l'auteur est conservé (#2994)."""
-    key = ("hunks", sha, path)
-    if key not in cache:
-        text = _raw_out(repo, "diff", "--no-renames", "--no-color",
-                        "--unified=1", str(sha) + "^", str(sha), "--", path)
-        blocks = None
-        if text is not None:
-            blocks, block, added = [], [], False
-            for line in str(text).splitlines() + ["@@"]:
-                if line.startswith("@@"):
-                    if block and added:
-                        blocks.append(block)
-                    block, added = [], False
-                elif line[:1] in (" ", "+") and not line.startswith("+++ "):
-                    block.append(line[1:].rstrip())
-                    added = added or line.startswith("+")
-        cache[key] = blocks
-    blocks = cache[key]
-    text = _raw_out(repo, "show", "%s:%s" % (head, path))
-    if blocks is None or text is None:
-        return True
-    now = [line.rstrip() for line in str(text).splitlines()]
-    return any(now[at:at + len(block)] == block
-               for block in blocks
-               for at in range(len(now) - len(block) + 1))
-
-
 def _any_line_in_head(repo: str, head: str, lines: Sequence[str]) -> bool:
     """Une des lignes apparaît-elle **quelque part** dans l'arbre de la tête ?
 
     Utilisé seulement quand le chemin d'origine ne porte plus la ligne : un
     fichier peut avoir été déplacé ou son contenu regroupé ailleurs (#2924
     B8). `git grep` lit l'arbre entier en un appel ; une lecture impossible
-    est un doute, jamais une preuve de réécriture.
-
-    #2994 : seule une ligne **égale** à la ligne cherchée (à l'indentation
-    près) compte, comme dans `_lines_in_tree` ; une ligne plus longue qui la
-    contient (`self.assertIsNone(self.pick(worker), …)` pour
-    `self.assertIsNone(self.pick(worker),`) n'en est pas la trace. Un fichier
-    binaire est lu comme du texte : la ligne propre qu'il porte reste une
-    preuve, comme avant l'égalité de ligne."""
-    found = _tree_lines(repo, head, lines, binary=True)
-    return True if found is None else bool(found)
-
-
-def _tree_lines(repo: str, rev: str, lines: Sequence[str], *,
-                binary: bool = False) -> Optional[set]:
-    """Les lignes (dépouillées) de `lines` égales à une ligne de l'arbre de
-    `rev` (à l'indentation près), ou None si la lecture est impossible.
-
-    `git grep -F` trouve les lignes qui *contiennent* un motif ; seules celles
-    qui lui sont égales une fois dépouillées sont rendues. Le format de sortie
-    est fixé (ni couleur, ni numéro, ni colonne) : la configuration Git du
-    dépôt ou de l'hôte (`grep.lineNumber`, `color.grep=always`…) ne doit pas
-    changer la lecture (#2994 B1 cx1). `binary=True` lit aussi les fichiers
-    binaires comme du texte (`-a`) ; sinon ils sont ignorés (`-I`)."""
-    wanted = {str(line).strip() for line in lines or () if str(line).strip()}
-    if not wanted:
-        return set()
-    if not repo or not rev:
-        return None
+    est un doute, jamais une preuve de réécriture."""
+    patterns = "\n".join(str(line).strip() for line in lines or ()
+                         if str(line).strip())
+    if not patterns:
+        return False
     try:
-        proc = plan_git._git(repo, "grep", "--no-color", "--no-line-number",
-                             "--no-column", "-h", "-a" if binary else "-I",
-                             "-F", "-f", "-", rev,
-                             stdin=("\n".join(sorted(wanted)) + "\n").encode("utf-8"))
+        proc = plan_git._git(repo, "grep", "-F", "-q", "-f", "-", head,
+                             stdin=(patterns + "\n").encode("utf-8"))
     except Exception:  # noqa: BLE001 - lecture impossible : doute
-        return None
+        return True
+    if proc.returncode == 0:
+        return True
     if proc.returncode == 1:
-        return set()
-    if proc.returncode != 0:
-        return None
-    found = {line.strip() for line in
-             proc.stdout.decode("utf-8", "replace").splitlines()}
-    return wanted & found
+        return False
+    return True
 
 
 def _lines_in_tree(repo: str, rev: str, lines: Sequence[str]) -> set:
     """Les lignes (dépouillées) de `lines` présentes **telles quelles** dans
     l'arbre de `rev`, à l'indentation près.
 
-    Seules les lignes égales comptent (`_tree_lines`), pour qu'une ligne propre
+    `git grep -F` trouve les lignes qui *contiennent* un motif ; seules celles
+    qui lui sont égales une fois dépouillées comptent, pour qu'une ligne propre
     au correcteur ne soit jamais écartée parce qu'une ligne plus longue de la
     base la contient. Une lecture impossible rend l'ensemble vide : rien n'est
     écarté, le doute conserve l'auteur (#2977)."""
-    return _tree_lines(repo, rev, lines) or set()
+    wanted = {str(line).strip() for line in lines or () if str(line).strip()}
+    if not repo or not rev or not wanted:
+        return set()
+    try:
+        proc = plan_git._git(repo, "grep", "-h", "-I", "-F", "-f", "-", rev,
+                             stdin=("\n".join(sorted(wanted)) + "\n").encode("utf-8"))
+    except Exception:  # noqa: BLE001 - lecture impossible : rien d'écarté
+        return set()
+    if proc.returncode != 0:
+        return set()
+    found = {line.strip() for line in
+             proc.stdout.decode("utf-8", "replace").splitlines()}
+    return wanted & found
 
 
 def _inherited_lines(repo: str, head: str, sha: str, base: str,
@@ -701,25 +654,31 @@ def _commit_survives(repo: str, head: str, sha: str, cache: dict,
     significatives du commit dans tout l'arbre de la tête, pas seulement à
     leur ancien chemin.
 
-    #3220 : si aucune de ces lignes ne subsiste nulle part, le contenu a
-    réellement disparu (fichier supprimé, ou toutes ses lignes retirées) et
-    l'auteur n'est pas reporté. Un chemin absent n'est plus, à lui seul, un
-    doute qui garderait l'auteur ; un fichier déplacé avec ses lignes, lui,
-    le garde. Une lecture impossible reste un doute (`_any_line_in_head`
-    rend True), jamais une preuve de suppression.
+    #3220 : si aucune de ces lignes ne subsiste nulle part, le contenu n'a pas
+    # forcément disparu : la lecture examine encore les lignes retirées. Un
+    # retrait conservé (la ligne n'est plus dans la tête au chemin d'origine)
+    # est une partie du contenu du commit et garde l'auteur. Quand le commit a
+    # des additions propres et qu'elles ont toutes disparu, un retrait ne
+    # compte qu'à un chemin encore présent dans la tête : à un chemin absent,
+    # la suppression du fichier a pu emporter l'édition entière, ce n'est plus
+    # une preuve de survie (#3220 B2, revue dev2). Ce n'est qu'après ce
+    # contrôle, quand rien ne subsiste, qu'un commit à additions propres est
+    # tenu pour disparu. Les **copies** ne comptent que lorsque toutes les
+    # additions sont héritées (#2977) : leur bloc traite un chemin absent comme
+    # un doute, et une ligne d'en-tête commune héritée garderait sinon l'auteur
+    # d'un fichier supprimé (#3216, revue mesh-design). Une lecture impossible
+    # reste un doute (`_any_line_in_head` rend True), jamais une preuve de
+    # suppression.
 
     #2977 : une ligne ajoutée qui existait déjà avant le correctif (parent du
     commit, ou base de fusion de la tête et de `base`) n'est pas propre au
     correcteur et ne prouve rien ; seules ses lignes propres sont cherchées,
     avec la même prudence (chemin d'origine, puis tout l'arbre, B8). Une ligne
     que le commit retire aussi ailleurs (un déplacement) reste une preuve,
-    comme avant. #2994 : seul un déplacement **entre chemins** est exempté ;
-    une ligne retirée puis rajoutée dans le même fichier (un réordonnancement)
-    est une ligne héritée comme une autre. Sans ligne propre, la lecture passe
-    aux lignes retirées, puis aux lignes copiées, cherchées à leur seul chemin
-    (un chemin absent conserve l'auteur) : une copie retirée ne garde pas son
-    correcteur (B1) ; un réordre ne subsiste que si la tête garde un de ses
-    hunks tel quel (#2994). Un diff sans ligne significative conserve l'auteur."""
+    comme avant. Sans ligne propre, la lecture passe aux lignes retirées,
+    puis aux lignes copiées, cherchées à leur seul chemin (un chemin absent
+    conserve l'auteur) : une copie retirée ne garde pas son correcteur (B1).
+    Un diff sans ligne significative conserve l'auteur."""
     parsed = _commit_lines(repo, sha)
     if parsed is None:
         return True
@@ -729,22 +688,15 @@ def _commit_survives(repo: str, head: str, sha: str, cache: dict,
     added = [(path, row) for path, rows in adds.items() for row in rows
              if _meaningful_line(row)]
     copied: list = []
-    removed_from: dict = {}
     if added:
-        for path, rows in removes.items():
-            for row in rows:
-                removed_from.setdefault(row.strip(), set()).add(path)
-
-        def moved(path, row) -> bool:
-            return bool(removed_from.get(row.strip(), set()) - {path})
-
+        moved = {row.strip() for rows in removes.values() for row in rows}
         inherited = _inherited_lines(
             repo, head, sha, base,
-            [row for path, row in added if not moved(path, row)], cache)
+            [row for _path, row in added if row.strip() not in moved], cache)
         copied = [(path, row) for path, row in added
-                  if not moved(path, row) and row.strip() in inherited]
+                  if row.strip() in inherited]
         added = [(path, row) for path, row in added
-                 if moved(path, row) or row.strip() not in inherited]
+                 if row.strip() not in inherited]
     if added:
         for path, row in added:
             lines = _head_lines(repo, head, path, cache)
@@ -755,16 +707,33 @@ def _commit_survives(repo: str, head: str, sha: str, cache: dict,
         # évite d'effacer le correcteur sur un simple déplacement (#2924 B8).
         if _any_line_in_head(repo, head, [row for _path, row in added]):
             return True
-        # #3220 : aucune ligne propre au commit ne subsiste nulle part. Le
-        # contenu est réellement supprimé (fichier retiré, ou toutes ses lignes
-        # réécrites) : un chemin absent ne garde plus l'auteur à lui seul.
-        return False
+        # #3220 B1 (revue cx2) : des additions propres ont disparu, mais le
+        # commit peut encore avoir retiré des lignes dont le retrait subsiste.
+        # La conclusion « contenu disparu » attend ce contrôle.
     removed = [(path, row) for path, rows in removes.items() for row in rows
                if _meaningful_line(row)]
-    if removed and any(
-            row.strip() not in (_head_lines(repo, head, path, cache) or set())
-            for path, row in removed):
-        return True
+    if removed:
+        for path, row in removed:
+            lines = _head_lines(repo, head, path, cache)
+            if lines is None:
+                # #3220 B2 (revue dev2) : quand les additions propres du
+                # commit ont toutes disparu, un chemin **prouvé absent** ne
+                # distingue plus le retrait appliqué de la suppression qui a
+                # emporté l'édition entière. Une lecture impossible reste un
+                # doute, et sans addition propre le doute B8 garde l'auteur
+                # d'un retrait (fichier réellement supprimé).
+                if added and _path_absent(repo, head, path, cache) is True:
+                    continue
+                return True
+            if row.strip() not in lines:
+                return True
+    if added:
+        # #3220 : les additions propres du commit ont toutes disparu, et aucun
+        # retrait ne subsiste. Les copies ne sont pas une preuve ici : leur
+        # lecture d'un chemin absent est un doute qui garderait l'auteur du
+        # fichier supprimé (#3216, revue mesh-design). Elles ne se lisent que
+        # quand toutes les additions du commit sont héritées (#2977).
+        return False
     if copied:
         # #2977 B1 : des additions significatives, toutes héritées. La copie
         # ne subsiste qu'à son propre chemin (pas de recherche dans l'arbre :
@@ -778,13 +747,9 @@ def _commit_survives(repo: str, head: str, sha: str, cache: dict,
             before = _path_line_counts(repo, str(sha) + "^", path, cache) or {}
             if present.get(row.strip(), 0) > before.get(row.strip(), 0):
                 return True
-        # #2994 : un réordre (ou une réindentation) dans le même fichier
-        # n'ajoute aucune occurrence ; sa trace est le hunk tel que le commit
-        # l'a laissé, s'il subsiste dans la tête.
-        reordered = {path for path, row in copied
-                     if path in removed_from.get(row.strip(), set())}
-        return any(_hunks_survive(repo, head, sha, path, cache)
-                   for path in sorted(reordered))
+        return False
+    # Un commit sans addition significative (purs retraits, ou diff trivial) :
+    # il survit tant que ses retraits ne sont pas tous annulés dans la tête.
     return not removed
 
 
