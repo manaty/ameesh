@@ -523,6 +523,18 @@ def _path_line_counts(repo: str, rev: str, path: str, cache: dict):
     return cache[key]
 
 
+def _raw_out(repo: str, *args: str) -> Optional[str]:
+    """La sortie de git **telle quelle**, ou None en cas d'échec.
+
+    `plan_git._out` dépouille la sortie : le blanc initial de la première
+    ligne d'un fichier disparaît, et un hunk indenté ne s'y retrouve plus
+    (#2994 B1 cx2/impl-04 sur e127e8d4)."""
+    proc = plan_git._git(repo, *args)
+    if proc.returncode != 0:
+        return None
+    return proc.stdout.decode("utf-8", "replace")
+
+
 def _hunks_survive(repo: str, head: str, sha: str, path: str,
                    cache: dict) -> bool:
     """Un hunk de `sha` dans `path` subsiste-t-il **tel quel** dans la tête ?
@@ -534,9 +546,8 @@ def _hunks_survive(repo: str, head: str, sha: str, path: str,
     diff ou un chemin illisible est un doute : l'auteur est conservé (#2994)."""
     key = ("hunks", sha, path)
     if key not in cache:
-        text = plan_git._out(repo, "diff", "--no-renames", "--no-color",
-                             "--unified=1", str(sha) + "^", str(sha),
-                             "--", path)
+        text = _raw_out(repo, "diff", "--no-renames", "--no-color",
+                        "--unified=1", str(sha) + "^", str(sha), "--", path)
         blocks = None
         if text is not None:
             blocks, block, added = [], [], False
@@ -550,7 +561,7 @@ def _hunks_survive(repo: str, head: str, sha: str, path: str,
                     added = added or line.startswith("+")
         cache[key] = blocks
     blocks = cache[key]
-    text = plan_git._out(repo, "show", "%s:%s" % (head, path))
+    text = _raw_out(repo, "show", "%s:%s" % (head, path))
     if blocks is None or text is None:
         return True
     now = [line.rstrip() for line in str(text).splitlines()]

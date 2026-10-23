@@ -143,6 +143,21 @@ class CommitSurvivesTest(TestCase):
         head = self.squash(base, {"a.py": parent})
         self.assertFalse(self.survives(head, fix, base))
 
+    def test_a_kept_reindentation_at_the_top_of_the_file_keeps_the_corrector(self):
+        # B1 cx2/impl-04 sur e127e8d4 : le contexte du hunk est la première
+        # ligne du fichier, indentée ; lu par `plan_git._out`, le blob de tête
+        # perdait ce blanc initial (strip) et le hunk ne s'y retrouvait plus.
+        parent = "    # module explanation\n    corrected_action()\n"
+        fixed = "    # module explanation\ncorrected_action()\n"
+        self.repo.write("a.py", parent)
+        base = self.repo.commit("base")
+        self.repo.write("a.py", fixed)
+        fix = self.repo.commit("fix", agent="cx3")
+        head = self.squash(base, {"a.py": fixed})
+        self.assertTrue(self.survives(head, fix, base))
+        head = self.squash(base, {"a.py": parent})
+        self.assertFalse(self.survives(head, fix, base))
+
     def test_a_kept_reorder_of_repeated_lines_keeps_the_corrector(self):
         # B1 (b) : même comptes, mêmes paires de lignes voisines.
         names = {"A": "alpha_line()", "B": "beta_line()", "C": "gamma_line()"}
