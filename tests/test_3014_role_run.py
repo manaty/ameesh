@@ -432,7 +432,7 @@ class TrainRoleTest(unittest.TestCase):
 
     def test_service_waits_without_the_role_and_schedules_with_it(self):
         service = train_runner.Service(
-            mock.Mock(host="banc"), [object()], stop=mock.Mock(), report=mock.Mock(),
+            mock.Mock(host="banc"), [SimpleNamespace(guard=None, lease=None)], stop=mock.Mock(), report=mock.Mock(),
             role="pilote")
         fake = mock.Mock()
         with mock.patch("ameesh.scoped_db.ScopedDb", return_value=fake), \
@@ -447,7 +447,7 @@ class TrainRoleTest(unittest.TestCase):
 
     def test_service_without_a_role_keeps_the_old_behaviour(self):
         service = train_runner.Service(
-            mock.Mock(host="banc"), [object()], stop=mock.Mock(), report=mock.Mock())
+            mock.Mock(host="banc"), [SimpleNamespace(guard=None, lease=None)], stop=mock.Mock(), report=mock.Mock())
         self.assertTrue(service._role_ready())
 
 

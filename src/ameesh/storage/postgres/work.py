@@ -2498,6 +2498,56 @@ class WorkItems(interface.WorkItems):
                 " RETURNING revision", (json.dumps(document), key, int(revision)))
             return dict(document, revision=int(rows[0]["revision"])) if rows else None
 
+    def train_adopt(self, key, owner, *, revision, previous, service, ttl_s) -> dict | None:
+        if not owner.startswith("train:") or key == service[0]:
+            return None
+        with self.db.transaction() as tx:
+            # Service lease first, then the target: no writer locks them in
+            # the other order (train_save only locks the target row).
+            if not tx.query("SELECT 1 FROM merge_locks WHERE target = %s AND owner = %s"
+                            " AND epoch = %s AND expires_at > clock_timestamp() FOR SHARE",
+                            (service[0], service[1], int(service[2]))):
+                return None
+            held = tx.query("SELECT owner, epoch FROM merge_locks WHERE target = %s FOR UPDATE",
+                            (key,))
+            if not held or not (held[0]["owner"] or "").startswith("train:") \
+                    or held[0]["owner"] == owner:
+                return None
+            before = (held[0]["owner"], int(held[0]["epoch"]))
+            if previous is not None and before != (previous[0], int(previous[1])):
+                return None
+            rows = tx.query("SELECT revision, document FROM integration_trains"
+                            " WHERE target_key = %s FOR UPDATE", (key,))
+            if (int(rows[0]["revision"]) if rows else 0) != int(revision):
+                return None
+            document = rows[0]["document"] if rows else None
+            if isinstance(document, str):
+                document = json.loads(document)
+            ticket = (document or {}).get("reservation")
+            # A ticket naming the held epoch moves with it, whoever asked:
+            # left behind, it would bind the plan to the fenced holder.
+            if not isinstance(ticket, dict) \
+                    or (ticket.get("owner"), ticket.get("epoch")) != before:
+                if previous is not None:
+                    return None
+                document = None
+            # The target or document lock may have waited: recheck the
+            # service lease against wall time after every lock, like train_save.
+            if not tx.query("SELECT 1 FROM merge_locks WHERE target = %s AND owner = %s"
+                            " AND epoch = %s AND expires_at > clock_timestamp()",
+                            (service[0], service[1], int(service[2]))):
+                return None
+            epoch = int(tx.query(
+                "UPDATE merge_locks SET owner = %s, epoch = epoch + 1,"
+                " expires_at = clock_timestamp() + %s * interval '1 second'"
+                " WHERE target = %s RETURNING epoch", (owner, float(ttl_s), key))[0]["epoch"])
+            if document is not None:
+                document["reservation"] = dict(document["reservation"], owner=owner, epoch=epoch)
+                tx.execute("UPDATE integration_trains SET revision = revision + 1,"
+                           " document = %s::jsonb, updated_at = clock_timestamp()"
+                           " WHERE target_key = %s", (json.dumps(document), key))
+            return {"epoch": epoch, "previous_owner": before[0], "previous_epoch": before[1]}
+
     @staticmethod
     def _train_fire(rows):
         if not rows:
