@@ -965,9 +965,13 @@ def gauges_of(book, profile: Profile, items: list[Profile], environ=None, *,
         # $CODEX_HOME/sessions > ~/.codex/sessions. Un compte qui désigne un
         # dossier (déclaré, ou synthétique avec `path`) lit SES sessions ; le
         # profil synthétique sans dossier garde le mécanisme de l'exécuteur.
+        # #3034 : son `auth.json` nomme le forfait vivant, pour ignorer les
+        # relevés d'un ancien forfait restés dans le même dossier de sessions.
         if profile.declared or profile.path:
+            from .codex_gauges import live_plan
+            home = profile.home(environ)
             return book.codex_gauges(
-                sessions=os.path.join(profile.home(environ), "sessions"))
+                sessions=os.path.join(home, "sessions"), plan=live_plan(home))
         return book.codex_gauges()
     return []
 

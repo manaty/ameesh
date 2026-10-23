@@ -22,6 +22,15 @@ A blocked verdict on an earlier head is not read by the gate: only the frozen
 head's verdicts count (canon §2). The same-head rule is unchanged — a block on
 the freeze is lifted only by that reviewer's later `ok` on the freeze.
 
+#2965: `admitted_ts` is the instant the frozen candidate became admissible —
+# the start of the gate's current open period, replayed chronologically by the
+# gate itself and never before the effective freeze. The train uses it to date
+# its own enrollment instead of the queue insertion it just wrote; a manual
+# queue insertion is never re-dated by it. A redundant `ok` does not re-date an
+# already open gate; a same-head block closes it, and the lift dates the
+# reopening even when no verdict is required. Without a required verdict and
+# without a block, the gate is open from the freeze.
+
 The caller supplies the audited review requirement (count and classified
 files). This reader neither classifies a lot nor infers missing authors. It
 works on fetched Git objects, never on a mutable checkout's diff.
@@ -31,6 +40,35 @@ from __future__ import annotations
 from . import (merge_queue, resolutions, review_authors, review_lot,
                review_provenance, storage, train_review)
 from .train import TrainError, identity
+
+
+def admitted_ts(freeze: dict, gate: dict) -> float:
+    """#2965: the instant the frozen candidate became admissible.
+
+    `gate` is the exact object admission used (`merge_queue.review_gate`):
+    since #2965 it replays its own chronology and publishes `completed_ts`,
+    the start of the gate's current open period. An `ok` repeated while the
+    gate is open never re-dates it (B1); a same-head block closes the gate and
+    its later lift dates the reopening, even when no review is required or the
+    pilot waived it (B2). The admission instant is that start, never before
+    the effective freeze; without a block, a gate open from the freeze keeps
+    the freeze as its instant.
+    """
+    try:
+        stamp = float(freeze["at_ts"])
+    except (KeyError, TypeError, ValueError) as exc:
+        raise TrainError("unreadable effective freeze date") from exc
+    completed = gate.get("completed_ts")
+    if completed is None:
+        required = gate.get("required")
+        if type(required) is not int or required < 0:
+            raise TrainError("unreadable review requirement")
+        if required > 0 and not gate.get("waived"):
+            raise TrainError("review gate published no completion date")
+        return stamp
+    if isinstance(completed, bool) or not isinstance(completed, (int, float)):
+        raise TrainError("unreadable review gate completion date")
+    return max(stamp, float(completed))
 
 
 class Recorded:
@@ -153,7 +191,8 @@ class Recorded:
         if not gate.get("ok"):
             raise TrainError(gate.get("why") or "review gate refused the frozen head")
         reviews = dict(schema="ameesh-train-review-gate/1", head=head,
-                       required=gate.get("required"), gate=gate, authors=authors)
+                       required=gate.get("required"), gate=gate, authors=authors,
+                       admitted_ts=admitted_ts(freeze, gate))
         return dict(schema="ameesh-train-subject-history/1", base=base,
                     subject={key: row[key] for key in
                              ("work_item_id", "frozen_id", "frozen_sha")},

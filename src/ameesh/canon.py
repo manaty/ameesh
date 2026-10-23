@@ -1886,6 +1886,25 @@ def parse_scope(value: Any) -> tuple[list[str] | None, str | None]:
     return out, None
 
 
+def process_path_ok(relpath: str, scope: Iterable[str] | None = None) -> bool:
+    """#538, #2973 : le chemin (relatif au bundle) d'une fiche Process est-il
+    celui d'une règle ? `processus/…` à la racine du bundle, ou
+    `<dossier>/processus/…` quand `<dossier>` est un dossier déclaré du
+    périmètre ameesh du membre (la fédération roote le membre à `.` et lit le
+    périmètre comme un filtre) ; jamais un autre dossier."""
+    chemin = relpath.replace("\\", "/").split("/")
+    if len(chemin) >= 2 and chemin[0] == PROCESS_DIR:
+        return True
+    for dossier in scope or ():
+        if not dossier:
+            continue                # `.` : la racine, déjà jugée
+        parts = dossier.split("/")
+        reste = chemin[len(parts):]
+        if chemin[:len(parts)] == parts and len(reste) >= 2 and reste[0] == PROCESS_DIR:
+            return True
+    return False
+
+
 def in_scope(relpath: str, scope: Iterable[str] | None) -> bool:
     """Le chemin (relatif au bundle) est-il dans le périmètre ? None = tout."""
     if scope is None:
@@ -3117,14 +3136,20 @@ class _Loader:
         Le chemin est contraint, RELATIF AU BUNDLE : `type: Process` dans
         `agents/…` n'est pas une règle (constat, jamais injecté), mais un canon
         imbriqué (`knowledge/`) garde ses `processus/*.md` (verdict codex
-        #510 r2, P2). Le texte est rendu encodable en UTF-8 (un surrogate YAML
+        #510 r2, P2). #2973 : dans un bundle à périmètre ameesh déclaré
+        (`extensions.ameesh.scope`), `<dossier>/processus/*.md` est aussi une
+        règle quand `<dossier>` est l'un des dossiers du périmètre — rien
+        au-delà. Le texte est rendu encodable en UTF-8 (un surrogate YAML
         isolé ne doit pas faire échouer le brief ni un envoi)."""
         subject = {"process": fiche.title}
-        chemin = (fiche.bundle_path or fiche.path).replace("\\", "/").split("/")
-        if len(chemin) < 2 or chemin[0] != PROCESS_DIR:
+        if not process_path_ok(fiche.bundle_path or fiche.path,
+                               self.canon.scopes.get(fiche.member)):
+            scope = [d for d in self.canon.scopes.get(fiche.member) or () if d]
+            dossiers = "`, `".join([PROCESS_DIR + "/"]
+                                   + ["%s/%s/" % (d, PROCESS_DIR) for d in scope])
             self.add("process-path", ERROR,
-                     "Process card outside `%s/`: %s (never injected as a working "
-                     "rule)" % (PROCESS_DIR, fiche.path), **where, **subject)
+                     "Process card outside `%s`: %s (never injected as a working "
+                     "rule)" % (dossiers, fiche.path), **where, **subject)
             fiche = dataclasses.replace(fiche, title=_utf8_safe(fiche.title))
             self.canon.processes.append(Process(
                 fiche=fiche, description=_utf8_safe(_text(fiche.data.get("description")) or ""),

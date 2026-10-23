@@ -6302,50 +6302,102 @@ class AgentWorker(threading.Thread):
                 return
         self.stop_group_now(raison, group=False)
 
-    def _resident_result(self, rp, tour, voulu: bool) -> tuple[int, str | None, str | None]:
-        """Code, erreur et session d'un tour résident fini (`voulu` : clos par
-        l'exécuteur, une interruption n'est pas un échec).
+    def _served_message_ids(self, initial_ids=()) -> tuple[str, ...]:
+        """L80b : les messages que ce tour résident a réellement servis.
+
+        Les messages de la consigne (`initial_ids`, ceux du spec) et les
+        remises steer acceptées — même condition que `_solde_steers` : tour
+        achevé et `input_id` présent dans le `TurnResult`. Les uuids de
+        corrélation ne sortent jamais : le grand livre reçoit des identifiants
+        de messages (mail id / human_message id), pas des jetons internes."""
+        from . import resident as resident_mod
+        ids = {str(i) for i in (initial_ids or ()) if i is not None}
+        with self.lock:
+            generation = self._turn_generation
+            pending = list(self._steer_pending)
+        for _jeton, mail_ids, gen, turn, input_id in pending:
+            if gen != generation or turn is None:
+                continue
+            result = getattr(turn, "result", None)
+            if getattr(result, "status", "") != resident_mod.COMPLETED \
+                    or input_id not in (getattr(result, "inputs", ()) or ()):
+                continue
+            ids.update(str(i) for i in (mail_ids or ()) if i is not None)
+        return tuple(sorted(ids))
+
+    def _resident_result(self, rp, tour, voulu: bool,
+                         ) -> tuple[int, str | None, str | None, object | None]:
+        """Code, erreur, session et `TurnResult` d'un tour résident fini
+        (`voulu` : clos par l'exécuteur, une interruption n'est pas un échec).
 
         Le `TurnResult` est aussi la seule source d'usage du tour pour le grand
         livre quand le flux brut ne la porte pas (Codex app-server, ACP) : il
-        est écrit une fois dans `events.jsonl` (L80a), avant la comptabilité.
-        Si le flux refuse l'écriture, l'événement est d'abord confié au
-        marqueur comptable : un worker de remplacement pourra réparer le tour
-        sans dépendre de la mémoire de celui-ci."""
-        from . import resident, resident_runner
+        est écrit une fois dans `events.jsonl` (L80a), après la barrière steer
+        de `_resident_turn_end` et avant la comptabilité — par
+        `_resident_usage_final`, qui rend le `TurnResult` pour que sa mesure et
+        ses entrées soient lues au même point de clôture."""
+        from . import resident
         if tour is None:
-            return 1, None, rp.session  # pas lancé : l'erreur est déjà notée
+            return 1, None, rp.session, None  # pas lancé : l'erreur est déjà notée
         fin = tour.wait(RESIDENT_END_WAIT_S)
         if fin is None:
-            return 1, "resident turn did not end", rp.session
+            return 1, "resident turn did not end", rp.session, None
         # L81 (étude §6.1) : la mesure continue d'un tour résident — contexte
         # courant, fenêtre, relu du tour et relu cumulé de la session.
         rp.record_turn(fin)
         self._resident_reread_keep(rp)
-        evenement = resident_runner.usage_event(
-            rp.driver.protocol, fin, turn=self._turn_id or "")
         session = fin.session or rp.session
-        if evenement is not None and not resident_runner.write_usage_event(
-                self._path("events.jsonl"), evenement):
-            # L80a B2 : la mesure passe d'abord dans le marqueur comptable
-            # (durable) ; à défaut elle reste en mémoire pour ce worker. Le
-            # tour n'est pas comptablement complet et le marqueur ne sera pas
-            # soldé tant que le flux ne porte pas la mesure.
-            travail = getattr(self, "_compta_travail", None)
-            if self._resident_usage_marker(evenement, travail):
-                if travail is not None:
-                    self._compta_travail = dict(travail, resident_usage=evenement)
-            else:
-                self._resident_usage_pending.append(evenement)
-                self._compta_en_echec = True
-            return 1, "resident usage event not written", session
         if fin.status == resident.COMPLETED:
-            self._resident_failures = 0     # T2 : la série d'échecs est close
-            return 0, None, session
+            # N1 (#288) : la série est close par `_resident_usage_final`, une
+            # fois la mesure écrite — pas ici, avant l'écriture.
+            return 0, None, session, fin
         if fin.status == resident.INTERRUPTED:
-            return ((0, None, session) if voulu
-                    else (1, "resident turn interrupted", session))
-        return 1, fin.error or "resident turn failed", session
+            return ((0, None, session, fin) if voulu
+                    else (1, "resident turn interrupted", session, fin))
+        return 1, fin.error or "resident turn failed", session, fin
+
+    def _resident_usage_final(self, rp, fin, served_ids=()) -> tuple[bool, str | None]:
+        """Écrit la mesure et les entrées du tour résident (L80a/L80b).
+
+        Appelé **après** `_resident_turn_end`, dont la barrière `_steer_lock`
+        ferme la génération : un ACK de steer accepté pendant la clôture est
+        alors dans `_steer_pending`, donc compté dans les messages servis
+        (L80b B2). Les protocoles à usage natif (Claude) n'écrivent pas de
+        `resident.turn` ; leurs entrées partent dans `resident.inputs`, dont
+        l'échec ne fait jamais échouer le tour (le coût est déjà dans le flux).
+        """
+        from . import resident, resident_runner
+        inputs = self._served_message_ids(served_ids)
+        evenement = resident_runner.usage_event(
+            rp.driver.protocol, fin, turn=self._turn_id or "", inputs=inputs)
+        if evenement is not None:
+            if not resident_runner.write_usage_event(
+                    self._path("events.jsonl"), evenement):
+                # L80a B2 : la mesure passe d'abord dans le marqueur comptable
+                # (durable) ; à défaut elle reste en mémoire pour ce worker. Le
+                # tour n'est pas comptablement complet et le marqueur ne sera
+                # pas soldé tant que le flux ne porte pas la mesure.
+                travail = getattr(self, "_compta_travail", None)
+                if self._resident_usage_marker(evenement, travail):
+                    if travail is not None:
+                        self._compta_travail = dict(travail, resident_usage=evenement)
+                else:
+                    self._resident_usage_pending.append(evenement)
+                    self._compta_en_echec = True
+                return False, "resident usage event not written"
+        else:
+            attribution = resident_runner.inputs_event(
+                rp.driver.protocol, fin, turn=self._turn_id or "", inputs=inputs)
+            if attribution is not None and not resident_runner.write_usage_event(
+                    self._path("events.jsonl"), attribution):
+                log_async("[%s] resident inputs event not written: message "
+                          "attribution lost for this turn" % self.name)
+        # N1 (#288) : la série d'échecs n'est close qu'une fois la mesure
+        # ÉCRITE ; un échec d'écriture garde la série (avant, `_resident_result`
+        # la remettait à zéro avant même de tenter l'écriture).
+        if getattr(fin, "status", "") == resident.COMPLETED:
+            self._resident_failures = 0
+        return True, None
 
     def _resident_turn_end(self, rp) -> None:
         """Fin d'un tour résident : dépublié ; le processus reste pour le tour
@@ -6975,6 +7027,8 @@ class AgentWorker(threading.Thread):
             account=compte.name if compte is not None else None, cwd=cwd, env=env)
         rp = None
         tour_resident = None
+        #: L80b : le `TurnResult` du tour résident, écrit après la barrière steer
+        fin_resident = None
         #: #210 : l'empreinte du jeton qui part avec le tour, lue au lancement —
         #: le propriétaire peut se reconnecter sur un autre jeton pendant le tour
         empreinte = sentinel.launch_fingerprint(harness, compte, env)
@@ -7258,8 +7312,9 @@ class AgentWorker(threading.Thread):
                             background_handles[pid] = handle
                 result_code = proc.wait()
             else:
-                result_code, erreur_resident, session_resident = self._resident_result(
-                    rp, tour_resident, clos or self.host_yield is not None)
+                result_code, erreur_resident, session_resident, fin_resident = \
+                    self._resident_result(
+                        rp, tour_resident, clos or self.host_yield is not None)
                 error = error or erreur_resident
                 # L80a : un tour résident Codex/ACP n'annonce sa session que
                 # dans son `TurnResult` (le flux brut est du JSON-RPC) ; sans
@@ -7283,6 +7338,15 @@ class AgentWorker(threading.Thread):
             pgid = self.pgid
             if rp is not None:
                 self._resident_turn_end(rp)
+                # L80b B2 : la mesure et les entrées se lisent APRÈS la
+                # barrière steer de `_resident_turn_end` — un ACK accepté
+                # pendant la clôture du tour compte dans ce tour.
+                if fin_resident is not None:
+                    ecrit, erreur_flux = self._resident_usage_final(
+                        rp, fin_resident, spec.get("ids") or ())
+                    if not ecrit:
+                        error = error or erreur_flux
+                        result_code = result_code or 1
             # L498 : les descripteurs du READY ne survivent pas au tour (le
             # descripteur d'écriture est déjà fermé après le Popen).
             if ready_r is not None:

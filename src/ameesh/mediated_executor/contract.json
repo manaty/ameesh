@@ -1,6 +1,6 @@
 {
  "schema": "ameesh-exec-contract/1",
- "version": "1.6.0",
+ "version": "1.7.0",
  "prefix": "/api/exec/v1",
  "description": "Contrat de l'API d'exécuteur médiée (L107) : la liste FERMÉE des opérations de storage.interface qu'un exécuteur d'appareil peut appeler, leur portée et leur fencing. Référence : docs/EXECUTEUR-MEDIEE.md.",
  "scopes": {
@@ -2318,6 +2318,21 @@
      },
      "required": false,
      "default": null
+    },
+    {
+     "name": "inputs",
+     "kind": "keyword",
+     "schema": {
+      "type": [
+       "array",
+       "null"
+      ],
+      "items": {
+       "type": "string"
+      }
+     },
+     "required": false,
+     "default": null
     }
    ],
    "result": {
@@ -4593,6 +4608,7 @@
     "observe_runners",
     "open_run",
     "prune_guard_runs",
+    "prune_queue",
     "queued_oldest",
     "reopen_run",
     "run",

@@ -1,0 +1,611 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+"""L480 (#480) : la veille du chat — décisions et courrier servis entre deux
+messages du propriétaire.
+
+Aucune horloge murale n'est la vérité : `observe`, `due` et `note_human`
+reçoivent leur `now` (monotone injecté) et l'âge des décisions son `wall`. Le
+proxy du terminal est exercé sur un vrai pty et des tubes, sans TTY : c'est le
+relais (frappes → harnais, sortie → écran, ligne de veille → harnais) qui est
+testé.
+"""
+from __future__ import annotations
+
+import contextlib
+import io
+import json
+import os
+import pty
+import select
+import shutil
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import types
+import unittest
+from unittest import mock
+
+from ameesh import chat, cli, decisions, mail, registry, work
+
+from .support import PgTestCase
+
+HUMAN = "human:alice"
+
+
+def _decision(i, *, urgent=False, overdue=False, due_ts=None, created=0.0):
+    return {"id": i, "urgent": urgent, "overdue": overdue, "due_ts": due_ts,
+            "created_ts": created, "age_s": 0}
+
+
+def _mail(i, *, urgent=False, created=0.0):
+    return {"id": i, "sender": "agent", "created_ts": created,
+            "payload": {"urgent": True} if urgent else {}}
+
+
+class _Clock:
+    def __init__(self, start=1000.0):
+        self.t = float(start)
+
+    def __call__(self):
+        return self.t
+
+
+class VeilleLineTest(unittest.TestCase):
+    def test_rien_de_nouveau_ne_sert_rien(self):
+        self.assertIsNone(chat.veille_line([], set(), [], set(), human="h", now=1000.0))
+        self.assertIsNone(chat.veille_line([_decision(1)], {1}, [_mail(9)], {9},
+                                           human="h", now=1000.0))
+
+    def test_decisions_et_courrier_en_une_ligne(self):
+        now = 10_000.0
+        line = chat.veille_line(
+            [_decision(1, created=now - 7200), _decision(2, urgent=True)],
+            set(), [_mail(9, urgent=True, created=now - 30)], set(),
+            human="human:h", now=now)
+        self.assertTrue(line.startswith("[veille ameesh]"))
+        self.assertIn("2 nouvelles décisions", line)
+        self.assertIn("dont 1 urgente ou à échéance proche", line)
+        self.assertIn("la plus ancienne il y a 2h", line)
+        self.assertIn("1 nouveau courrier (dont 1 urgent)", line)
+        self.assertIn("présente-les à human:h", line)
+        self.assertIn("ameesh decisions", line)
+        # elle demande de présenter : jamais de réponse
+        self.assertNotIn("ameesh decide ", line)
+
+    def test_echeance_proche_et_retard_sont_pressants(self):
+        now = 10_000.0
+        due = chat.veille_line([_decision(3, due_ts=now + 600)], set(), [], set(),
+                               human="h", now=now)
+        self.assertIn("dont 1 urgente ou à échéance proche", due)
+        late = chat.veille_line([_decision(4, overdue=True)], set(), [], set(),
+                                human="h", now=now)
+        self.assertIn("dont 1 urgente ou à échéance proche", late)
+
+    def test_singulier_et_pluriel(self):
+        now = 10_000.0
+        one = chat.veille_line([_decision(5, created=now)], set(), [], set(),
+                               human="h", now=now)
+        self.assertIn("1 nouvelle décision", one)
+        self.assertNotIn("la plus ancienne", one)      # moins d'une minute
+        two = chat.veille_line([_decision(5, created=now), _decision(6, created=now)],
+                               set(), [], set(), human="h", now=now)
+        self.assertIn("2 nouvelles décisions", two)
+        one_mail = chat.veille_line([], set(), [_mail(7)], set(), human="h", now=now)
+        self.assertIn("1 nouveau courrier", one_mail)
+        self.assertNotIn("urgent", one_mail)
+
+    def test_seul_le_nouveau_compte(self):
+        now = 10_000.0
+        line = chat.veille_line([_decision(1), _decision(2)], {1}, [], set(),
+                                human="h", now=now)
+        self.assertIn("1 nouvelle décision", line)
+
+
+class VeilleSchedulingTest(unittest.TestCase):
+    def setUp(self):
+        self.clock = _Clock()
+        self.veille = chat.Veille(object(), "human:h", "chat-h", now=self.clock,
+                                  log=lambda text: None,
+                                  phase=lambda: chat.PHASE_STOP)
+
+    def observe(self, pending=(), inbox=()):
+        return self.veille.observe(list(pending), list(inbox))
+
+    def test_la_premiere_lecture_est_un_repere(self):
+        self.clock.t = 1000.0
+        self.assertIsNone(self.observe([_decision(1)], [_mail(2)]))
+        self.assertIsNone(self.veille.due())          # rien de nouveau
+        self.assertIsNone(self.observe([_decision(1)], [_mail(2)]))
+
+    def test_une_nouvelle_decision_est_servie_apres_la_frappe(self):
+        self.observe()
+        self.clock.t = 1000.0
+        self.assertIn("1 nouvelle décision", self.observe([_decision(1)]))
+        self.veille.note_human(self.clock.t)
+        self.assertIsNone(self.veille.due())                  # $human écrit
+        self.clock.t += chat.VEILLE_IDLE_S + 0.1
+        line = self.veille.due()
+        self.assertIn("1 nouvelle décision", line)
+        self.assertIsNone(self.veille.due())                  # servie une fois
+
+    def test_deux_services_ne_se_suivent_pas_de_trop_pres(self):
+        self.observe()
+        self.clock.t = 1000.0
+        self.observe([_decision(1)])
+        self.clock.t += chat.VEILLE_IDLE_S + 0.1
+        self.assertIsNotNone(self.veille.due())
+        self.clock.t += 1.0
+        self.observe([_decision(1), _decision(2)])
+        self.clock.t += chat.VEILLE_IDLE_S + 0.1
+        self.assertIsNone(self.veille.due())                  # trop tôt
+        self.clock.t += chat.VEILLE_MIN_INTERVAL_S
+        self.assertIn("1 nouvelle décision", self.veille.due())
+
+    def test_une_session_occupee_ne_doit_pas_affamer_la_veille(self):
+        self.observe()
+        self.clock.t = 1000.0
+        self.observe([_decision(1)])
+        first_news_at = self.clock.t
+        self.clock.t += 1.0
+        self.observe([_decision(1), _decision(2)])
+        news_at = self.clock.t
+        self.assertLess(news_at, first_news_at + chat.VEILLE_MIN_INTERVAL_S)
+        # $human tape sans arrêt : la ligne attend, puis passe au-delà du délai
+        self.clock.t = news_at + chat.VEILLE_MAX_DEFER_S - 1.0
+        self.veille.note_human(self.clock.t)
+        self.assertIsNone(self.veille.due())
+        self.clock.t = news_at + chat.VEILLE_MAX_DEFER_S + 0.1
+        self.veille.note_human(self.clock.t)
+        self.assertIn("1 nouvelle décision", self.veille.due())
+
+    def test_les_repères_suivent_les_lectures(self):
+        self.observe()
+        self.clock.t = 1000.0
+        self.observe([_decision(1)])
+        self.clock.t += chat.VEILLE_IDLE_S + 0.1
+        self.veille.due()
+        # la décision 1 reste en attente (non répondue) : elle n'est plus neuve
+        self.clock.t += 1.0
+        self.assertIsNone(self.observe([_decision(1)]))
+        self.assertIsNone(self.veille.due())
+
+
+class VeillePhaseGuardTest(unittest.TestCase):
+    """L480 : pas d'écriture sans un marqueur `Stop` explicite (échec fermé)."""
+
+    def setUp(self):
+        self.clock = _Clock()
+        self.phase = chat.PHASE_STOP
+        self.veille = chat.Veille(object(), "human:h", "chat-h", now=self.clock,
+                                  log=lambda text: None, phase=lambda: self.phase)
+        self.veille.observe([], [])
+        self.clock.t = 1000.0
+        self.veille.observe([_decision(1)], [])
+        self.clock.t += chat.VEILLE_IDLE_S + 0.1
+
+    def test_marqueur_stop_ecrit(self):
+        self.assertIn("1 nouvelle décision", self.veille.due())
+
+    def test_marqueur_absent_n_ecrit_rien_et_garde_la_ligne(self):
+        self.phase = None
+        self.assertIsNone(self.veille.due())
+        self.assertIsNotNone(self.veille.pending_text())
+        self.phase = chat.PHASE_STOP
+        self.assertIn("1 nouvelle décision", self.veille.due())
+
+    def test_marqueur_busy_ou_permission_n_ecrit_rien(self):
+        for phase in (chat.PHASE_BUSY, "permission", "stop", "Stop\n", ""):
+            with self.subTest(phase=phase):
+                self.phase = phase
+                self.assertIsNone(self.veille.due())
+                self.assertIsNotNone(self.veille.pending_text())
+        self.phase = chat.PHASE_STOP
+        self.assertIn("1 nouvelle décision", self.veille.due())
+
+    def test_le_marqueur_est_relu_juste_avant_l_ecriture(self):
+        calls = []
+
+        def phase():
+            calls.append(1)
+            return chat.PHASE_BUSY if len(calls) < 3 else chat.PHASE_STOP
+        self.veille.phase = phase
+        self.assertIsNone(self.veille.due())
+        self.assertIsNone(self.veille.due())
+        self.assertIn("1 nouvelle décision", self.veille.due())
+        self.assertEqual(len(calls), 3)
+
+
+class VeilleDraftGuardTest(unittest.TestCase):
+    """B2 : un brouillon humain ouvert ne est jamais recouvert par la veille."""
+
+    def setUp(self):
+        self.clock = _Clock()
+        self.veille = chat.Veille(object(), "human:h", "chat-h", now=self.clock,
+                                  log=lambda text: None,
+                                  phase=lambda: chat.PHASE_STOP)
+        self.veille.observe([], [])
+        self.clock.t = 1000.0
+        self.veille.observe([_decision(1)], [])
+        self.clock.t += chat.VEILLE_IDLE_S + 0.1
+
+    def test_brouillon_ouvert_ne_sert_pas_meme_apres_max_defer(self):
+        self.veille.note_human(self.clock.t, "réponds a à la 116".encode("utf-8"))
+        self.clock.t += chat.VEILLE_MAX_DEFER_S + 10.0
+        self.assertIsNone(self.veille.due())
+        self.assertIsNotNone(self.veille.pending_text())   # la ligne reste
+
+    def test_entree_ferme_le_brouillon(self):
+        self.veille.note_human(self.clock.t, "réponds a à la 116".encode("utf-8"))
+        self.veille.note_human(self.clock.t, b"\r")
+        self.clock.t += chat.VEILLE_IDLE_S + 0.1
+        self.assertIn("1 nouvelle décision", self.veille.due())
+
+    def test_ctrl_c_abandonne_le_brouillon(self):
+        self.veille.note_human(self.clock.t, b"brouillon")
+        self.veille.note_human(self.clock.t, b"\x03")
+        self.clock.t += chat.VEILLE_IDLE_S + 0.1
+        self.assertIn("1 nouvelle décision", self.veille.due())
+
+    def test_ctrl_j_insere_un_saut_de_ligne(self):
+        self.veille.note_human(self.clock.t, b"ligne")
+        self.veille.note_human(self.clock.t, b"\n")
+        self.clock.t += chat.VEILLE_MAX_DEFER_S + 10.0
+        self.assertIsNone(self.veille.due())
+
+    def test_antislash_entree_insere_un_saut_de_ligne(self):
+        self.veille.note_human(self.clock.t, b"ligne")
+        self.veille.note_human(self.clock.t, b"\\\r")
+        self.clock.t += chat.VEILLE_MAX_DEFER_S + 10.0
+        self.assertIsNone(self.veille.due())
+
+    def test_alt_entree_insere_un_saut_de_ligne(self):
+        self.veille.note_human(self.clock.t, b"ligne")
+        self.veille.note_human(self.clock.t, b"\x1b\r")
+        self.clock.t += chat.VEILLE_MAX_DEFER_S + 10.0
+        self.assertIsNone(self.veille.due())
+
+    def test_antislash_entree_en_deux_lectures(self):
+        self.veille.note_human(self.clock.t, b"ligne")
+        self.veille.note_human(self.clock.t, b"\\")
+        self.veille.note_human(self.clock.t, b"\r")
+        self.clock.t += chat.VEILLE_MAX_DEFER_S + 10.0
+        self.assertIsNone(self.veille.due())
+
+    def test_alt_entree_en_deux_lectures(self):
+        self.veille.note_human(self.clock.t, b"ligne")
+        self.veille.note_human(self.clock.t, b"\x1b")
+        self.veille.note_human(self.clock.t, b"\r")
+        self.clock.t += chat.VEILLE_MAX_DEFER_S + 10.0
+        self.assertIsNone(self.veille.due())
+
+    def test_texte_puis_entree_en_deux_lectures_soumet(self):
+        self.veille.note_human(self.clock.t, b"ligne")
+        self.veille.note_human(self.clock.t, b"\r")
+        self.clock.t += chat.VEILLE_IDLE_S + 0.1
+        self.assertIn("1 nouvelle décision", self.veille.due())
+
+    def test_une_frappe_apres_entree_rouvre_un_brouillon(self):
+        self.veille.note_human(self.clock.t, b"\r")
+        self.veille.note_human(self.clock.t, b"a")
+        self.clock.t += chat.VEILLE_MAX_DEFER_S + 10.0
+        self.assertIsNone(self.veille.due())
+
+
+class PhaseFileTest(unittest.TestCase):
+    """Le marqueur d'état : écrit et relu, absent ou illisible = fermé."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="l480-phase-")
+        self.cfg = types.SimpleNamespace(state_dir=self.tmp)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_ecrit_et_relit(self):
+        self.assertTrue(chat.write_phase(self.cfg, "chat-a", chat.PHASE_STOP))
+        self.assertEqual(chat.read_phase(self.cfg, "chat-a"), chat.PHASE_STOP)
+        self.assertTrue(chat.write_phase(self.cfg, "chat-a", chat.PHASE_BUSY))
+        self.assertEqual(chat.read_phase(self.cfg, "chat-a"), chat.PHASE_BUSY)
+
+    def test_absent_ou_vide_est_none(self):
+        self.assertIsNone(chat.read_phase(self.cfg, "chat-b"))
+        self.assertTrue(chat.write_phase(self.cfg, "chat-b", ""))
+        self.assertIsNone(chat.read_phase(self.cfg, "chat-b"))
+
+    def test_illisible_est_none(self):
+        path = chat.phase_path(self.cfg, "chat-d")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "wb") as fh:
+            fh.write(b"\xff\xfe")
+        self.assertIsNone(chat.read_phase(self.cfg, "chat-d"))
+
+    def test_marqueur_prive(self):
+        self.assertTrue(chat.write_phase(self.cfg, "chat-c", chat.PHASE_STOP))
+        mode = os.stat(chat.phase_path(self.cfg, "chat-c")).st_mode & 0o777
+        self.assertEqual(mode, 0o600)
+
+    def test_hook_phase(self):
+        self.assertEqual(chat.hook_phase("Stop"), chat.PHASE_STOP)
+        for event in ("SessionStart", "UserPromptSubmit", "PostToolUse", "Inconnu"):
+            self.assertEqual(chat.hook_phase(event), chat.PHASE_BUSY)
+
+
+class ChatPhaseHookTest(PgTestCase):
+    """Le hook `agent-mail` tient le marqueur d'état que la veille relit."""
+
+    NAME = "chat-phase"
+
+    def setUp(self):
+        super().setUp()
+        registry.upsert(self.db, "orch", harness="claude", host=self.cfg.host)
+        try:
+            os.unlink(chat.phase_path(self.cfg, self.NAME))
+        except OSError:
+            pass
+
+    def _hook(self, event):
+        payload = json.dumps({"hook_event_name": event, "cwd": self.tmp})
+        out = io.StringIO()
+        env = dict(os.environ)
+        for key in decisions.RUNNER_ENV + decisions.LEASE_ENV:
+            env.pop(key, None)
+        env["AGENT_MAIL_NAME"] = self.NAME
+        with mock.patch.object(sys, "stdin", io.StringIO(payload)), \
+                mock.patch.dict(os.environ, env, clear=True), \
+                contextlib.redirect_stdout(out):
+            code = cli.cmd_hook(self.cfg, "claude")
+        return code, out.getvalue()
+
+    def test_stop_ecrit_stop(self):
+        code, _ = self._hook("Stop")
+        self.assertEqual(code, 0)
+        self.assertEqual(chat.read_phase(self.cfg, self.NAME), chat.PHASE_STOP)
+
+    def test_les_autres_evenements_ecrivent_busy(self):
+        for event in ("SessionStart", "UserPromptSubmit", "PostToolUse"):
+            with self.subTest(event=event):
+                self._hook("Stop")
+                self.assertEqual(chat.read_phase(self.cfg, self.NAME), chat.PHASE_STOP)
+                self._hook(event)
+                self.assertEqual(chat.read_phase(self.cfg, self.NAME), chat.PHASE_BUSY)
+
+    def test_un_stop_qui_bloque_ecrit_busy(self):
+        mail.send(self.db, "orch", self.NAME, "un message pour le chat")
+        code, out = self._hook("Stop")
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(out)["decision"], "block")
+        self.assertEqual(chat.read_phase(self.cfg, self.NAME), chat.PHASE_BUSY)
+
+
+class VeilleArmingTest(unittest.TestCase):
+    def _args(self, **kw):
+        args = chat.build_parser().parse_args([])
+        for key, value in kw.items():
+            setattr(args, key, value)
+        return args
+
+    def test_arme_seulement_avec_un_terminal(self):
+        args = self._args()
+        self.assertIsNone(args.veille)
+        with mock.patch.object(sys, "stdin", _Fake(True)), \
+                mock.patch.object(sys, "stdout", _Fake(True)):
+            self.assertTrue(chat.veille_armed(args))
+        with mock.patch.object(sys, "stdin", _Fake(False)), \
+                mock.patch.object(sys, "stdout", _Fake(True)):
+            self.assertFalse(chat.veille_armed(args))
+
+    def test_no_veille_et_popen_refusent(self):
+        args = self._args(veille=False)
+        with mock.patch.object(sys, "stdin", _Fake(True)), \
+                mock.patch.object(sys, "stdout", _Fake(True)):
+            self.assertFalse(chat.veille_armed(args))
+            self.assertFalse(chat.veille_armed(self._args(), popen=object()))
+
+    def test_delais_par_defaut(self):
+        args = self._args()
+        self.assertEqual(args.veille_every, chat.VEILLE_EVERY_S)
+        self.assertLess(chat.VEILLE_IDLE_S, chat.VEILLE_MIN_INTERVAL_S)
+        self.assertLess(chat.VEILLE_MIN_INTERVAL_S, chat.VEILLE_MAX_DEFER_S)
+
+
+class _Fake:
+    def __init__(self, tty):
+        self._tty = tty
+
+    def isatty(self):
+        return self._tty
+
+
+class _FakeVeille:
+    """La veille vue par le proxy : une ligne prête, puis plus rien."""
+
+    def __init__(self):
+        self.text = None
+        self.notes = []
+        self.inputs = []
+
+    def note_human(self, now=None, data=None):
+        self.notes.append(now)
+        self.inputs.append(data)
+
+    def due(self, now=None):
+        text, self.text = self.text, None
+        return text
+
+
+class ServePtyTest(unittest.TestCase):
+    """Le relais du terminal : frappes, sortie et ligne de veille, sur un pty."""
+
+    def _read_until(self, fd, needle, timeout=10.0):
+        data = b""
+        deadline = time.monotonic() + timeout
+        while needle not in data:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                break
+            ready, _, _ = select.select([fd], [], [], min(0.2, left))
+            if not ready:
+                continue
+            chunk = os.read(fd, 65536)
+            if not chunk:
+                break
+            data += chunk
+        return data
+
+    def test_relais_des_frappes_de_la_sortie_et_de_la_veille(self):
+        master, slave = pty.openpty()
+        script = ("import sys\n"
+                  "for line in sys.stdin:\n"
+                  "    print('ECHO:' + line.strip(), flush=True)\n"
+                  "    if line.strip() == 'quit':\n"
+                  "        break\n")
+        proc = subprocess.Popen([sys.executable, "-c", script], stdin=slave,
+                                stdout=slave, stderr=slave, start_new_session=True)
+        os.close(slave)
+        in_r, in_w = os.pipe()
+        out_r, out_w = os.pipe()
+        veille = _FakeVeille()
+        errors: list = []
+
+        def relais():
+            try:
+                chat.serve_pty(proc, master, veille=veille, stdin_fd=in_r,
+                               stdout_fd=out_w, poll=0.02)
+            except Exception as exc:  # noqa: BLE001 — remonté au test
+                errors.append(exc)
+        thread = threading.Thread(target=relais, daemon=True)
+        thread.start()
+        try:
+            os.write(in_w, b"bonjour\n")
+            self.assertIn(b"ECHO:bonjour", self._read_until(out_r, b"ECHO:bonjour"))
+            self.assertTrue(veille.notes)                 # la frappe est notée
+            self.assertIn(b"bonjour\n", veille.inputs)    # avec son contenu (garde B2)
+            veille.text = "[veille ameesh] 1 nouvelle décision"
+            seen = self._read_until(out_r, b"ECHO:[veille ameesh]")
+            self.assertIn(b"ECHO:[veille ameesh] 1 nouvelle d", seen)
+            # pas de \r en tête : aucun tour vide ni brouillon soumis avant la ligne
+            self.assertNotIn(b"ECHO:\r\nECHO:", seen)
+            os.write(in_w, b"quit\n")
+            thread.join(timeout=10)
+            self.assertFalse(thread.is_alive())
+            self.assertEqual(errors, [])
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait(timeout=5)
+            for fd in (master, in_r, in_w, out_r, out_w):
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+
+    def test_la_sortie_du_harnais_n_est_pas_perdue(self):
+        master, slave = pty.openpty()
+        proc = subprocess.Popen([sys.executable, "-c",
+                                 "print('dernier mot', flush=True)"],
+                                stdin=slave, stdout=slave, stderr=slave,
+                                start_new_session=True)
+        os.close(slave)
+        in_r, in_w = os.pipe()
+        out_r, out_w = os.pipe()
+        try:
+            chat.serve_pty(proc, master, veille=None, stdin_fd=in_r,
+                           stdout_fd=out_w, poll=0.02)
+            self.assertIn(b"dernier mot", self._read_until(out_r, b"dernier mot"))
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait(timeout=5)
+            for fd in (master, in_r, in_w, out_r, out_w):
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+
+
+class PtyExitTest(unittest.TestCase):
+    """B1 : à la sortie du proxy (SIGHUP/SIGTERM), un harnais encore vivant
+    ne doit pas faire bloquer le wait du lanceur."""
+
+    def test_harnais_vivant_est_tue_apres_la_sortie_du_proxy(self):
+        master, slave = pty.openpty()
+        proc = subprocess.Popen(["sh", "-c", "trap '' HUP TERM; sleep 30"],
+                                stdin=slave, stdout=slave, stderr=slave,
+                                start_new_session=True)
+        os.close(slave)
+        try:
+            self.assertIsNone(proc.poll())
+            started = time.monotonic()
+            remaining = chat._finish_pty(proc, master)
+            self.assertIsNone(remaining)                 # le maître a été fermé
+            self.assertLess(time.monotonic() - started, 10.0)
+            with self.assertRaises(OSError):
+                os.write(master, b"x")                   # plus de maître ouvert
+            self.assertIsNotNone(proc.wait(timeout=1))
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait(timeout=5)
+            try:
+                os.close(master)
+            except OSError:
+                pass
+
+    def test_harnais_deja_sorti_laisse_le_maitre_au_final(self):
+        master, slave = pty.openpty()
+        proc = subprocess.Popen([sys.executable, "-c", "pass"], stdin=slave,
+                                stdout=slave, stderr=slave, start_new_session=True)
+        os.close(slave)
+        try:
+            self.assertEqual(proc.wait(timeout=5), 0)
+            self.assertIs(chat._finish_pty(proc, master), master)
+        finally:
+            try:
+                os.close(master)
+            except OSError:
+                pass
+
+
+class VeilleDbTest(PgTestCase):
+    """Les lignes réelles (décision, courrier) alimentent la veille : le
+    contrat de champs est celui de `decisions.pending` et `mail.unread_active`."""
+
+    def setUp(self):
+        super().setUp()
+        registry.upsert(self.db, "orch", harness="claude", host=self.cfg.host)
+        self.db.execute("UPDATE agent_registry SET responsible = %s WHERE name = 'orch'",
+                        (HUMAN,))
+        lot = work.add(self.db, title="L480 : veille du chat", assignee="orch")
+        work.move(self.db, lot["id"], "build")
+        self.lot = lot
+
+    def _veille(self):
+        return chat.Veille(self.cfg, HUMAN, "chat-alice", log=lambda text: None,
+                           phase=lambda: chat.PHASE_STOP)
+
+    def test_une_decision_reelle_devient_une_ligne(self):
+        decisions.ask(self.cfg, self.db, requester="orch", question="On fusionne ?",
+                      options=["a=oui, fusionner", "b=non, attendre"],
+                      lot=str(self.lot["id"]))
+        pending = decisions.pending(self.db, human=HUMAN)
+        self.assertTrue(pending)
+        veille = self._veille()
+        self.assertIsNone(veille.observe([], []))            # repère
+        line = veille.observe(pending, [])
+        self.assertIn("[veille ameesh]", line)
+        self.assertIn("1 nouvelle décision", line)
+        self.assertIn("ameesh decisions", line)
+
+    def test_le_courrier_reel_devient_une_ligne(self):
+        mail.send(self.db, "orch", "chat-alice", "le lot 12 est prêt")
+        inbox = mail.unread_active(self.db, "chat-alice")
+        self.assertTrue(inbox)
+        veille = self._veille()
+        veille.observe([], [])
+        line = veille.observe([], inbox)
+        self.assertIn("1 nouveau courrier", line)
+
+
+if __name__ == "__main__":
+    unittest.main()

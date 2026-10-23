@@ -1191,21 +1191,26 @@ class InstallPilotTest(unittest.TestCase):
             self.assertNotIn("record 'guest-tree", res.stdout)
 
     def test_mounts_beneath_a_tree_are_seen(self):
-        # codex #383 r2 P1: a bind mount under a recorded tree stops its purge
+        # codex #383 r2 P1: a bind mount under a recorded tree stops its purge.
+        # L68: a mountinfo of the test's own, never this host's /proc — the
+        # witness runs under macOS too, where /proc does not exist.
         with open(self.SCRIPT, encoding="utf-8") as fh:
             text = fh.read()
         func = text[text.index("mounts_under() {"):]
         func = func[:func.index("\n}\n") + 3]
-        def under(path):
-            return subprocess.run(["bash", "-c", "MOUNTINFO=/proc/self/mountinfo\n" + func
-                                   + 'mounts_under "$1"', "-", path],
-                                  stdin=subprocess.DEVNULL, timeout=30).returncode
-        self.assertEqual(under("/proc"), 0)          # /proc itself
-        if os.path.ismount("/dev/shm"):
-            self.assertEqual(under("/dev"), 0)       # /dev/shm beneath
         with tempfile.TemporaryDirectory() as tmp:
-            self.assertEqual(under(tmp), 1)
-        self.assertEqual(under("/pro"), 1)           # a prefix is not a parent
+            tree = os.path.join(os.path.realpath(tmp), "work")
+            mount = os.path.join(tree, "data")
+            elsewhere = os.path.join(os.path.realpath(tmp), "elsewhere")
+            info = self.mountinfo(tmp, mount)
+            def under(path):
+                return subprocess.run(["bash", "-c", func + 'mounts_under "$1"', "-", path],
+                                      stdin=subprocess.DEVNULL, timeout=30,
+                                      env=dict(os.environ, MOUNTINFO=info)).returncode
+            self.assertEqual(under(mount), 0)        # the mount itself
+            self.assertEqual(under(tree), 0)         # a mount beneath the tree
+            self.assertEqual(under(elsewhere), 1)    # another tree
+            self.assertEqual(under(tree + "-prefix"), 1)  # a prefix is not a parent
 
     def test_a_volume_bigger_than_disk_max_is_refused(self):
         # codex #383 r2 P2: nothing but the volume's size holds disk_max

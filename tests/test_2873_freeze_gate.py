@@ -39,6 +39,10 @@ class ReexportTest(unittest.TestCase):
         self.assertIs(work._frozen_head, freeze_gate.frozen_head)
         self.assertIs(work.FREEZE_ABSENT_MARK, freeze_gate.FREEZE_ABSENT_MARK)
         self.assertIs(work.FREEZE_ABSENT_LINE, freeze_gate.FREEZE_ABSENT_LINE)
+        self.assertIs(work.FREEZE_UNPUBLISHED_MARK,
+                      freeze_gate.FREEZE_UNPUBLISHED_MARK)
+        self.assertIs(work.FREEZE_UNVERIFIED_MARK,
+                      freeze_gate.FREEZE_UNVERIFIED_MARK)
         self.assertEqual(work.REVIEWED_HEAD_MIN, freeze_gate.REVIEWED_HEAD_MIN)
         self.assertEqual(work.FROZEN_HEAD_MIN, freeze_gate.FROZEN_HEAD_MIN)
         self.assertEqual(work.MILESTONE_KINDS, freeze_gate.MILESTONE_KINDS)
@@ -59,9 +63,12 @@ class HeadTest(unittest.TestCase):
             self.assertEqual(
                 freeze_gate.freeze_head(object(), {"id": 1}, HEAD), HEAD)
 
-    def test_a_full_reviewed_head_is_accepted(self):
-        self.assertEqual(
-            freeze_gate.reviewed_head(object(), {"id": 1}, OTHER), OTHER)
+    def test_a_full_reviewed_head_is_accepted_when_it_is_the_frozen_head(self):
+        # #2962 : une tête complète doit se résoudre, ou nommer la tête gelée
+        # courante — c'est le cas d'un relecteur qui n'a pas le dépôt.
+        with mock.patch.object(freeze_gate, "frozen_head", return_value=OTHER):
+            self.assertEqual(
+                freeze_gate.reviewed_head(object(), {"id": 1}, OTHER), OTHER)
 
     def test_a_verdict_without_head_is_refused_with_the_gate_error(self):
         with mock.patch.object(freeze_gate, "frozen_head", return_value=""):
