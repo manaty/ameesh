@@ -804,8 +804,13 @@ class Leases(interface.Leases):
                                       'then check the mesh state (lots, mail, decisions, '
                                       'alerts) before acting.', __R5__)
                        ELSE __R5__ END,
-                   current_prompt   = CASE WHEN __TAKEOVER__ THEN NULL
-                       ELSE __R5__ END,
+                   current_prompt   = CASE
+                       WHEN __TAKEOVER__ THEN NULL
+                       WHEN r.lease_owner IS DISTINCT FROM %s
+                            OR r.lease_expires_at IS NULL
+                            OR r.lease_expires_at < clock_timestamp()
+                       THEN NULL
+                       ELSE r.current_prompt END,
                    -- L165 (EP3) : briefing persisté de la relève, consommé par
                    -- le nouveau détenteur ; aucune session ne traverse un hôte.
                    election_brief   = CASE WHEN __TAKEOVER__ THEN p.brief
