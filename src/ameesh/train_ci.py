@@ -74,10 +74,11 @@ class Workflow:
     # A workflow-changing lot needs a newly audited contract, never a green
     # job with the same display name and different execution conditions.
     sources: tuple[tuple[str, str], ...] = ()
-    #: #3098: the repository file that declares these pins. The installed
-    #: module is a release snapshot; the target's base commit is reviewed and
-    #: landed code, so its own declared pins are the reference for a packet
-    #: head (see `versioned_sources`). Empty for a contract that pins nothing.
+    #: #3098: the repository file that declares these pins and jobs. The
+    #: installed module is a release snapshot; the target's base commit is
+    #: reviewed and landed code, so its own declared pins and jobs are the
+    #: reference for a packet head (see `versioned_contract`). Empty for a
+    #: contract that pins nothing.
     pins_at: str = ""
 
     def __post_init__(self):
@@ -187,12 +188,19 @@ def audited_sources(workflows):
     return sources
 
 
-def _declared_pins(text, path):
-    """The ``sources`` literal a contract module declares for one workflow.
+class _NotStatic(Exception):
+    """A contract expression outside the statically readable subset (#3108)."""
+
+
+#: #3108: bound on the jobs a static contract expression may produce.
+_MAX_STATIC_JOBS = 4096
+
+
+def _contract_call(text, path):
+    """The ``Workflow(...)`` call a contract module declares for one path.
 
     Read as a syntax tree, never executed: the base commit is landed code, but
     the train does not run the target's contract to learn what it should check.
-    Only a full literal is accepted; anything else refuses by name below.
     """
     try:
         tree = ast.parse(text)
@@ -210,71 +218,180 @@ def _declared_pins(text, path):
             continue
         try:
             declared_path = ast.literal_eval(keywords["path"])
-            sources = ast.literal_eval(keywords["sources"])
         except (ValueError, SyntaxError):
             continue
-        if declared_path != path:
-            continue
-        if not isinstance(sources, (tuple, list)) or not sources or not all(
-                isinstance(item, (tuple, list)) and len(item) == 2
-                and all(isinstance(part, str) for part in item) for item in sources):
-            raise TrainError("the base contract pins malformed sources: %s" % path)
-        pins = {}
-        for pin_path, pin_blob in sources:
-            if not re.fullmatch(r"[\w./-]+", pin_path) or any(
-                    part in ("", ".", "..") for part in pin_path.split("/")):
-                raise TrainError("the base contract pins a malformed source path: %s"
-                                 % pin_path)
-            if not re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", pin_blob):
-                raise TrainError("the base contract pins a malformed blob: %s" % pin_path)
-            if pin_path in pins and pins[pin_path] != pin_blob:
-                raise TrainError("the base contract pins %s twice differently" % pin_path)
-            pins[pin_path] = pin_blob
-        return pins
+        if declared_path == path:
+            return keywords
     return None
 
 
-def versioned_sources(repo, base, workflows):
-    """#3098: the pins declared at the target's base commit, else installed.
+def _declared_pins(keywords, path):
+    """The ``sources`` literal one contract call declares.
 
-    The installed module is the executed contract: its paths and jobs are the
-    ones this engine knows. Its blobs are a snapshot of the release, though,
-    and a packet that changes a shared CI source re-pins the target's own
-    contract file when it lands (the CI-unblock lane, canon §11 bis). Until
-    the next deploy the installed blobs are stale, so every cut would fail
-    until the release lands; the base commit is reviewed, landed code and is
-    the reference for the packet head. A packet that moves a source under the
-    base pins is still refused.
+    Only a full literal is accepted; anything else refuses by name below.
+    """
+    try:
+        sources = ast.literal_eval(keywords["sources"])
+    except (ValueError, SyntaxError):
+        raise TrainError("the base contract pins malformed sources: %s" % path) from None
+    if not isinstance(sources, (tuple, list)) or not sources or not all(
+            isinstance(item, (tuple, list)) and len(item) == 2
+            and all(isinstance(part, str) for part in item) for item in sources):
+        raise TrainError("the base contract pins malformed sources: %s" % path)
+    pins = {}
+    for pin_path, pin_blob in sources:
+        if not re.fullmatch(r"[\w./-]+", pin_path) or any(
+                part in ("", ".", "..") for part in pin_path.split("/")):
+            raise TrainError("the base contract pins a malformed source path: %s"
+                             % pin_path)
+        if not re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", pin_blob):
+            raise TrainError("the base contract pins a malformed blob: %s" % pin_path)
+        if pin_path in pins and pins[pin_path] != pin_blob:
+            raise TrainError("the base contract pins %s twice differently" % pin_path)
+        pins[pin_path] = pin_blob
+    return pins
+
+
+def _static_items(value):
+    """The iterable values a static contract expression may unpack."""
+    if isinstance(value, (tuple, list, range)):
+        return value
+    raise _NotStatic()
+
+
+def _static_comprehension(node, names):
+    """One ``range``-bound comprehension of the static jobs expression."""
+    if len(node.generators) != 1:
+        raise _NotStatic()
+    generator = node.generators[0]
+    if generator.is_async or generator.ifs or not isinstance(generator.target, ast.Name):
+        raise _NotStatic()
+    scope = dict(names or {})
+    produced = 0
+    for value in _static_items(_static_value(generator.iter, names)):
+        produced += 1
+        if produced > _MAX_STATIC_JOBS:
+            raise _NotStatic()
+        scope[generator.target.id] = value
+        yield _static_value(node.elt, scope)
+
+
+def _static_value(node, names=None):
+    """Read one allowlisted expression of a contract's ``Workflow(...)`` call.
+
+    #3108: a contract declares its job matrix with comprehensions
+    (``*("psycopg %d/8" % n for n in range(1, 9))``). The train must know the
+    expanded names without executing the base commit's module, so only
+    constants, tuples/lists, star unpacking, single ``range`` comprehensions
+    and ``%`` formatting are read; anything else raises ``_NotStatic`` and is
+    refused at the call site.
+    """
+    if isinstance(node, ast.Constant) and (isinstance(node.value, str)
+                                           or type(node.value) is int):
+        return node.value
+    if isinstance(node, ast.Name) and names is not None and node.id in names:
+        return names[node.id]
+    if isinstance(node, (ast.Tuple, ast.List)):
+        values = []
+        for element in node.elts:
+            if isinstance(element, ast.Starred):
+                values.extend(_static_items(_static_value(element.value, names)))
+            else:
+                values.append(_static_value(element, names))
+            if len(values) > _MAX_STATIC_JOBS:
+                raise _NotStatic()
+        return tuple(values)
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Mod):
+        return _static_value(node.left, names) % _static_value(node.right, names)
+    if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) \
+            and node.func.id == "range" and not node.keywords:
+        arguments = [_static_value(argument, names) for argument in node.args]
+        if not arguments or len(arguments) > 3 \
+                or not all(type(argument) is int for argument in arguments) \
+                or len(range(*arguments)) > _MAX_STATIC_JOBS:
+            raise _NotStatic()
+        return range(*arguments)
+    if isinstance(node, (ast.GeneratorExp, ast.ListComp)):
+        return tuple(_static_comprehension(node, names))
+    raise _NotStatic()
+
+
+def _declared_jobs(keywords, path):
+    """The expanded ``jobs`` literal one contract call declares (#3108).
+
+    The installed module supplied the whole job list before: a base that
+    re-pinned a workflow and added a job was only read at the next deployment,
+    so the new job stayed unrequired for a release window. The base commit is
+    reviewed, landed code; its declared jobs are read statically (never
+    executed) and added to the installed set at read time. A job the base
+    removed stays required by the installed set: that floor does not shrink
+    before a deployment.
+    """
+    node = keywords.get("jobs")
+    if node is None:
+        raise TrainError("the base contract does not declare the audited jobs: %s" % path)
+    try:
+        jobs = _static_value(node)
+    except (_NotStatic, ArithmeticError, LookupError, TypeError, ValueError):
+        raise TrainError("the base contract declares jobs that cannot be read "
+                         "statically: %s" % path) from None
+    if not isinstance(jobs, tuple) or not jobs or not all(
+            isinstance(job, str) and job for job in jobs) or len(set(jobs)) != len(jobs):
+        raise TrainError("the base contract declares malformed jobs: %s" % path)
+    return jobs
+
+
+def versioned_contract(repo, base, workflows):
+    """#3098/#3108: the base contract's pins and jobs, else installed.
+
+    The installed module is the executed contract: its paths are the ones this
+    engine knows and its jobs are a floor. Its blobs are a snapshot of the
+    release, though, and a packet that changes a shared CI source re-pins the
+    target's own contract file when it lands (the CI-unblock lane, canon
+    §11 bis). Until the next deploy the installed blobs are stale, so every
+    cut would fail until the release lands; the base commit is reviewed,
+    landed code and is the reference for the packet head. A packet that moves
+    a source under the base pins is still refused.
 
     #3098 relecture cx2 : la base peut épingler une source que la version
     installée ne connaît pas encore (le paquet qui l'a ajoutée a atterri par
     « déblocage CI »). Toutes les sources déclarées par la base sont donc
     vérifiées et rendues immuables pour la tête ; s'arrêter aux seules sources
     installées laisserait la tête déplacer une épingle de la base sans refus.
+
+    #3108 : les jobs déclarés par la base s'ajoutent à ceux du module installé.
+    Un job ajouté par un workflow ré-épinglé est ainsi exigé dès la coupure
+    suivante, sans attendre le déploiement ; un job retiré reste exigé par
+    l'ensemble installé (plancher), donc une baisse du contrat n'est pas
+    exploitable avant la release.
     """
     installed = audited_sources(workflows)
+    installed_jobs = {workflow.path: workflow.jobs for workflow in workflows}
     if not any(getattr(workflow, "pins_at", "") for workflow in workflows):
-        return installed
+        return installed, installed_jobs
     if not base:
         raise TrainError("the base commit is required to read the versioned CI contract")
     versioned = {}
+    jobs = {path: tuple(names) for path, names in installed_jobs.items()}
     for workflow in workflows:
         if not getattr(workflow, "pins_at", ""):
             continue
         proc = resolutions._run(repo, "show", "%s:%s" % (base, workflow.pins_at))
         if proc.returncode:
             # Bootstrap: a base that predates the versioned contract keeps the
-            # installed pins, exactly as before #3098. A base commit absent
-            # from the clone is not a bootstrap: fail closed rather than fall
-            # back to the release snapshot.
+            # installed pins and jobs, exactly as before #3098. A base commit
+            # absent from the clone is not a bootstrap: fail closed rather than
+            # fall back to the release snapshot.
             probe = resolutions._run(repo, "cat-file", "-e", "%s^{commit}" % base)
             if probe.returncode:
                 raise TrainError("the base commit cannot be read for the versioned CI contract")
             continue
-        declared = _declared_pins(resolutions._text(proc), workflow.path)
-        if declared is None:
+        keywords = _contract_call(resolutions._text(proc), workflow.path)
+        if keywords is None:
             raise TrainError("the base contract does not declare the audited workflow: %s"
                              % workflow.path)
+        declared = _declared_pins(keywords, workflow.path)
+        declared_jobs = _declared_jobs(keywords, workflow.path)
         own = [path for path, _blob in workflow.sources]
         missing = sorted(set(own) - set(declared))
         if missing:
@@ -289,8 +406,18 @@ def versioned_sources(repo, base, workflows):
             if path in versioned and versioned[path] != declared[path]:
                 raise TrainError("conflicting versioned audited CI sources: %s" % path)
             versioned[path] = declared[path]
+        merged = list(jobs.get(workflow.path, ()))
+        for name in declared_jobs:
+            if name not in merged:
+                merged.append(name)
+        jobs[workflow.path] = tuple(merged)
     installed.update(versioned)
-    return installed
+    return installed, jobs
+
+
+def versioned_sources(repo, base, workflows):
+    """#3098: the pins declared at the target's base commit, else installed."""
+    return versioned_contract(repo, base, workflows)[0]
 
 
 def contract_digest(workflows):
@@ -427,6 +554,9 @@ class GitHub:
         #: static contract ignores both; a dynamic contract resolves its due
         #: suites from the repository's own selector at each plan.
         self.repo, self.cache = repo, cache
+        #: #3108: the base contract's jobs do not depend on the head; a long
+        #: packet CI must not re-read the base contract at every poll.
+        self._jobs_cache = None
 
     def _due(self, plan):
         """The workflows this plan makes due (all of a static contract)."""
@@ -453,6 +583,30 @@ class GitHub:
             return versioned_sources(self.repo, plan.get("base", ""), self.workflows)
         return audited_sources(self.workflows)
 
+    def _required_jobs(self, plan):
+        """#3108: the installed jobs plus the jobs the base contract declares.
+
+        The installed module is a release snapshot: a workflow re-pinned at the
+        base may add a job this engine does not know yet. The base commit is
+        reviewed, landed code, so its declared jobs are required at the packet
+        head immediately; the installed jobs stay a floor, so a job the base
+        removed is still required until the next deployment. A static contract
+        without a clone keeps the installed snapshot, like `_sources`.
+        """
+        base = plan.get("base", "")
+        cached = self._jobs_cache
+        if cached is not None and cached[0] == base:
+            return cached[1]
+        if callable(getattr(self.workflows, "resolve", None)):
+            jobs = {}
+        elif self.repo and any(getattr(workflow, "pins_at", "")
+                               for workflow in self.workflows):
+            jobs = versioned_contract(self.repo, base, self.workflows)[1]
+        else:
+            jobs = {workflow.path: workflow.jobs for workflow in self.workflows}
+        self._jobs_cache = (base, jobs)
+        return jobs
+
     def _api(self, path):
         proc = self.gh(["api", "--paginate", "--slurp", "repos/%s/%s" % (self.slug, path)])
         if proc.returncode and _slurp_unsupported(proc):
@@ -472,8 +626,9 @@ class GitHub:
         This is read-only and performed before dispatch and before using CI.
         A long packet CI re-reads the same plan; the successful check of an
         exact (head, base) is remembered on the contract, never re-fetched per
-        poll. The base is part of the key: the due set and its sources are
-        resolved against it (#2503, N1), so a changed base is a new proof.
+        poll. The base is part of the key: the due set, its sources and its
+        jobs are resolved against it (#2503, #3098, #3108), so a changed base
+        is a new proof.
         """
         verified = getattr(self.workflows, "verified_heads", None)
         key = (plan["head"], plan["base"]) if verified is not None else None
@@ -570,7 +725,7 @@ class GitHub:
                              if not _plumbing_job(job["name"], workflow.context))
             else:
                 failed = False
-                for required in workflow.jobs:
+                for required in self._required_jobs(plan).get(workflow.path, workflow.jobs):
                     found = required_job(required, jobs)
                     if len(found) != 1 or found[0].get("status") != "completed" \
                             or found[0].get("conclusion") not in ("success", "failure"):
