@@ -385,8 +385,8 @@ database time; the observer's wall clock is only used to order samples.
 | P2 | Never two holders | every observer sample carries at most one `lease_owner`; `lease_epoch` only grows; the old holder's renew is refused; no turn of the old holder survives the claim | exactly 1 holder in every sample that has one; 0 during the expiry window is expected |
 | P3 | Epoch fence | one same-value fenced gesture from the old holder (`work assign` on the witness lot to its current assignee) must be refused, naming the current holder and epoch; no row changes and no `pilot.gesture` event for it | 100 % refused |
 | P4 | Return to standby | after the host (or its executors) comes back while another holder is live: no claim, no turn, same holder and epoch for 5 min; the returning runner logs standby | yes |
-| P5 | Continuity | the new holder starts a turn, consumes a mail addressed to the role and, when EP5 timers are installed, the next `ameesh role run` tick runs under its epoch | `T_turn - T0 < 5 min`; no gap > 5 min |
-| P6 | No double effect | one `turn.started` per transition; no duplicated mail, wake, `pilot.gesture`, packet or landing in the window; the witness lot is **not** merged | 0 |
+| P5 | Continuity | the new holder starts a turn and consumes a mail addressed to the role; the first hourly packet after the switch, containing the witness lot, is composed and merged by the elected pilot with no gesture from the stopped host; when EP5 timers are installed, the next `ameesh role run` tick runs under its epoch | `T_turn - T0 < 5 min`; the witness packet merges at the first hourly cutoff after the switch |
+| P6 | No double effect | one `turn.started` per transition; exactly one merge in the window (the witness lot); no duplicated mail, wake, `pilot.gesture`, packet or landing; no other lot merged | 0 duplicate; 1 witness merge |
 
 "Never two holders" is not "never zero": during the lease TTL after `T0`
 there is no holder, and that is the designed window.
@@ -451,8 +451,13 @@ and does not present A′/B′ as a hardware-loss or network-partition proof.
   an assumption; if the target host is not the holder, either run the drill
   on the actual holder or wait for a planned handover.
 - A quiet window: no real packet in CI, no release in progress. A witness
-  lot (docs-only, frozen and reviewed, no production effect) and a witness
-  packet are designated by the pilot; the drill never merges them.
+  lot (docs-only, light, no production effect) is created at drill start and
+  assigned to an agent that runs on a candidate VM; it is frozen and reviewed
+  **before the switch**, so the post-switch packet depends only on the elected
+  pilot/composer, not on the stopped host. Its packet is the first hourly
+  packet after the switch, composed by the elected pilot. It must merge with
+  no gesture from the stopped host, and no other lot is merged in the
+  window.
 - Owner go for the stop or the network cut (bureau delegation, canon §10);
   the bureau executes the host gesture and writes `T0` on the host.
 
@@ -472,13 +477,15 @@ the exercise is blocked, not failed.
 
 ### Procedure
 
-0. **Prepare.** Designate the witness lot and the witness packet; pin the
-   two candidate hosts; check no packet is in CI. Keep a shell on a
-   **surviving** host (a VM that is not the holder) for the observer.
+0. **Prepare.** Create the witness lot now (docs-only, light, estimate a
+   few minutes), assign it to an agent that runs on a candidate VM, freeze
+   it and get its review **before the switch**; pin the two candidate hosts;
+   check no packet is in CI. Keep a shell on a **surviving** host (a VM that
+   is not the holder) for the observer.
 1. **Baseline.** On the surviving host, record `date -u`, `ameesh role
    status <ROLE> --json`, the role's row (`host`, `lease_owner`,
-   `lease_epoch`, `lease_expires_ts`) and `ameesh list`. Send a mail to the
-   role so P5 has a witness, and note its id.
+   `lease_epoch`, `lease_expires_ts`) and `ameesh list`. Note the witness
+   lot id. Send a mail to the role so P5 has a witness, and note its id.
 2. **Observer.** On the surviving host, in `$TMPDIR` or under
    `~/.local/state/ameesh/drills/`, sample the role every 5 s and prefix
    each line with the time:
@@ -500,7 +507,10 @@ the exercise is blocked, not failed.
 4. **First turn (P1, P5).** As soon as the new holder is visible, send it a
    short mail (or check the one sent at step 1). `T_turn` is the first
    `turn.started` for the role after the claim, read from `ameesh events
-   --json`. The new holder must process the mail within 5 min.
+   --json`. The new holder must process the mail within 5 min. Once it is
+   live, the elected pilot (or the packet composer it delegates to) composes
+   the first hourly packet with the witness lot; it must merge with no
+   gesture from the stopped host. Record the merge time and the actor.
 5. **Fence (P3).** From any surviving shell, present the old epoch the way
    an EP5 timer would and run the same-value canary:
 
@@ -524,8 +534,9 @@ the exercise is blocked, not failed.
 7. **Return (P4, P6).** Restart the stopped host while the new holder is
    live. For 5 min the observer must show the same holder and epoch; the
    returning runner logs standby and opens no turn. Then compare the events
-   of the window: one transition, no duplicated mail, wake, `pilot.gesture`,
-   packet or landing. The witness lot stays unmerged.
+   of the window: one transition, exactly one merge (the witness lot), no
+   duplicated mail, wake, `pilot.gesture`, packet or landing, and no other
+   lot merged.
 8. **Report.** Save the observer JSONL, the `ameesh events --json` slice,
    the two `journalctl --user -u ameesh-runner-agent@<role>` excerpts (old
    and new holder) and the operator timeline. The lot carries a three-line
@@ -540,11 +551,12 @@ blindly: two holders observed; an old-epoch gesture accepted; a duplicated
 mail, wake, landing, fire or packet; any production effect; no new holder
 5 min after `T0` on two consecutive attempts; go withdrawn. A failure is a
 result: record it, leave the current holder in place (the lease decides) and
-do not merge the witness to "unblock" anything.
+do not force the witness merge to "unblock" anything.
 
 ### Scope
 
-This drill does not deploy, migrate, merge, publish or spend. The Nexlink
-pilot runs the same procedure under lot `#3024` and
-`docs/ops/election-pilote-nexlink.md`; the two drills may share one window
-but never one holder.
+This drill does not deploy, migrate, publish or spend. The only merge is
+the witness lot, docs-only, through the normal packet path by the elected
+pilot; no other lot is merged. The Nexlink pilot runs the same procedure
+under lot `#3024` and `docs/ops/election-pilote-nexlink.md`; the two drills
+may share one window but never one holder.
