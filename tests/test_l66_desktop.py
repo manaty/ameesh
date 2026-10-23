@@ -2,7 +2,13 @@
 """L66 : la notification de bureau suit l'OS — `notify-send` sous Linux,
 `osascript` sous macOS, toast Windows par `powershell.exe` sous WSL2 ; Windows
 natif refuse (L67). Sans base, sauf la ligne `desktop` de `doctor
---notify-test` (schéma de test)."""
+--notify-test` (schéma de test).
+
+Les classes qui passent par la route réelle de CET OS suivent
+`ameesh.platform.SYSTEM` (#3131) : le faux backend est posé pour Linux
+(`notify-send`) comme pour macOS (`osascript`), et les assertions portent sur
+le titre, le corps et l'urgence reçus, pas sur la forme d'argv propre à un
+seul OS."""
 from __future__ import annotations
 
 import base64
@@ -21,7 +27,8 @@ from unittest import mock
 from ameesh import cli, config, notify
 from ameesh.platform import notify as pnotify
 
-from .support import PgTestCase
+from .support import (DESKTOP_BACKEND, DESKTOP_MACOS, DESKTOP_MISSING, DESKTOP_VAR,
+                      PgTestCase, desktop_backend_env, desktop_received)
 
 _FAKE = '''#!/usr/bin/env python3
 import json, os, sys
@@ -60,6 +67,12 @@ class _Banc(unittest.TestCase):
             return []
         with open(self.log, encoding="utf-8") as fh:
             return [json.loads(line) for line in fh if line.strip()]
+
+    def desktop_env(self, **extra) -> dict:
+        """Le faux backend de bureau de CET OS : aucun affichage réel."""
+        env = desktop_backend_env(self.fake(DESKTOP_BACKEND), **self.env)
+        env.update(extra)
+        return env
 
     def toast_xml(self, script: str) -> str:
         """Le XML du toast, decode depuis le base64 porte par le script."""
@@ -204,26 +217,32 @@ class CanalDesktopTest(_Banc):
     """Le canal `desktop` de `notify` passe par la couche plateforme (L66)."""
 
     def test_le_canal_suit_le_backend(self):
-        env = dict(self.env, AMEESH_NOTIFY_SEND_BIN=self.fake("notify-send"))
+        env = self.desktop_env()
         notify.Sender(env=env).send(notify.Channel("desktop", "desktop"),
                                     notify.Message("titre", "corps", urgent=True))
-        self.assertIn("--urgency=critical", self.entries()[0]["argv"])
+        self.assertEqual(desktop_received(self.entries()[0]["argv"])[2], "critical")
 
     def test_le_canal_desktop_garde_les_textes_a_tiret(self):
         """Le canal reste vert avec un titre et un corps commencant par « - »."""
-        env = dict(self.env, AMEESH_NOTIFY_SEND_BIN=self.fake("notify-send"))
+        env = self.desktop_env()
         notify.Sender(env=env).send(notify.Channel("desktop", "desktop"),
                                     notify.Message("--titre", "-corps"))
         argv = self.entries()[0]["argv"]
-        self.assertEqual(argv[-3:], ["--", "--titre", "-corps"])
+        titre, corps, _urgence = desktop_received(argv)
+        self.assertEqual((titre, corps), ("--titre", "-corps"))
+        if not DESKTOP_MACOS:
+            # le « -- » qui protège l'argv de notify-send reste vérifié ici ;
+            # sous macOS, l'échappement AppleScript a son propre témoin
+            # (PlatformNotifyTest.test_macos_osascript).
+            self.assertEqual(argv[-3:], ["--", "--titre", "-corps"])
 
     def test_erreur_permanente_du_backend(self):
-        env = dict(self.env, AMEESH_NOTIFY_SEND_BIN=os.path.join(self.tmp, "absent"))
+        env = self.desktop_env(**{DESKTOP_VAR: os.path.join(self.tmp, "absent")})
         with self.assertRaises(notify.ChannelError) as ctx:
             notify.Sender(env=env).send(notify.Channel("desktop", "desktop"),
                                         notify.Message("t", "c"))
         self.assertTrue(ctx.exception.permanent)
-        self.assertIn("notify-send not found", str(ctx.exception))
+        self.assertIn(DESKTOP_MISSING, str(ctx.exception))
 
 
 class DesktopProbeTest(_Banc):
@@ -234,10 +253,10 @@ class DesktopProbeTest(_Banc):
                                    state_dir=tempfile.gettempdir(), **kw)
 
     def test_sans_route_desktop(self):
-        env = dict(self.env, AMEESH_NOTIFY_SEND_BIN=self.fake("notify-send"))
+        env = self.desktop_env()
         ok, line = notify.desktop_probe(self.cfg(), env=env)
         self.assertTrue(ok)
-        self.assertIn("notify-send", line)
+        self.assertIn(DESKTOP_BACKEND, line)
         self.assertIn("no `desktop` route configured", line)
         self.assertEqual(self.entries(), [])
 
@@ -246,13 +265,13 @@ class DesktopProbeTest(_Banc):
         env = {"PATH": self.empty}
         ok, line = notify.desktop_probe(self.cfg(), env=env)
         self.assertTrue(ok)
-        self.assertIn("notify-send not found", line)
+        self.assertIn(DESKTOP_MISSING, line)
         self.assertIn("no `desktop` route configured, nothing sent", line)
 
     def test_route_desktop_envoie_le_test(self):
         cfg = self.cfg(notify={"default_human": "human:test",
                                "default": ["desktop"]})
-        env = dict(self.env, AMEESH_NOTIFY_SEND_BIN=self.fake("notify-send"))
+        env = self.desktop_env()
         ok, line = notify.desktop_probe(cfg, env=env)
         self.assertTrue(ok)
         self.assertIn("test displayed to human:test", line)
@@ -262,7 +281,7 @@ class DesktopProbeTest(_Banc):
         """N1 : `notify.timeout` reaches the probe's sender, not the default."""
         cfg = self.cfg(notify={"default_human": "human:test",
                                "default": ["desktop"], "timeout": 2.5})
-        env = dict(self.env, AMEESH_NOTIFY_SEND_BIN=self.fake("notify-send"))
+        env = self.desktop_env()
         with mock.patch.object(notify, "Sender") as sender, \
                 mock.patch.object(notify, "send_test", return_value=[]) as send:
             ok, _line = notify.desktop_probe(cfg, env=env)
@@ -276,7 +295,7 @@ class DesktopProbeTest(_Banc):
         ok, line = notify.desktop_probe(cfg, env=env)
         self.assertFalse(ok)
         self.assertIn("KO", line)
-        self.assertIn("notify-send not found", line)
+        self.assertIn(DESKTOP_MISSING, line)
 
     def test_macos_et_wsl_dits(self):
         with mock.patch.object(pnotify, "SYSTEM", "macos"):

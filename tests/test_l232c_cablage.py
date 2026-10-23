@@ -19,7 +19,8 @@ import tempfile
 import unittest
 from unittest import mock
 
-from tests.test_l232c_coffre import CANARY, HOST, REFERENCE, UTILISATEUR, Materiel, Transport, coffre
+from tests.test_l232c_coffre import (CANARY, GROUPE_ROOT, HOST, REFERENCE, UTILISATEUR,
+                                     Materiel, Transport, coffre)
 
 DEPLOY = Path(__file__).resolve().parents[1] / 'deploy/mise-a-jour'
 
@@ -200,7 +201,7 @@ class IntentionTest(Materiel):
         self.assertFalse((self.journal.root / 'rotations.jsonl').exists())
 
     def test_groupe_root_refuse_au_pont(self):
-        document = self.destination_document(group='root')
+        document = self.destination_document(group=GROUPE_ROOT)
         helper = dict(self.helper_document, destinations=[document])
         installeur = coffre.Installeur(helper, read_as=None, uid=0, isolate=True)
         payload, _ = self.trame(destination=document)

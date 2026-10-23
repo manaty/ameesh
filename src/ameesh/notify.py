@@ -2,7 +2,8 @@
 """Alerts pushed to the responsible human (lot L38, decision 0030 point 4).
 
   ameesh notify [--once] [--dry-run] [--json] [--interval S]
-                [--long-turn S] [--idle-mail S] [--dead-grace S]
+                [--only alerts|take|issues|github-watch|ci] [--long-turn S]
+                [--idle-mail S] [--dead-grace S]
                 [--session-tokens N] [--stale-lot S] [--orphan-lot S]
                 [--take-idle S] [--take-max-per-hour N]
                 [--take-lot-idle S] [--take-lot-max-per-hour N]
@@ -108,6 +109,11 @@ from .platform import notify as platform_notify
 NOTIFY_SCHEMA = "ameesh-notify/1"
 STATE_SCHEMA = "ameesh-notify-state/1"
 
+#: L165 (EP5): the mechanical passes a role timer may run alone.
+#: `alerts` owns the delivery state and its lock; `take` observes the alerts
+#: but writes no state; `issues`, `github-watch` and `ci` are independent.
+ONLY_PASSES = ("alerts", "take", "issues", "github-watch", "ci")
+
 #: L38 (0030) : types envoyés par défaut. `delegation_expired` arrive avec L40 :
 #: il est accepté ici sans dépendre de son code (un type absent n'est jamais
 #: levé, c'est tout).
@@ -146,6 +152,8 @@ DEFAULT_TYPES = ("stopped_with_mail", "orphan_lot", "dead_runner", "idle_with_ma
                  "host_disk_soon_full",
                  # #2022 : des zombies s'accumulent sur un hôte
                  "host_zombies",
+                 # #3103 : un pont Docker capte le réseau local de l'hôte (#3092)
+                 "host_network_overlap",
                  # L225 : des tours sans tarif au barème échappent à la dépense
                  "turn_unpriced",
                  # L226b : un agent attend un compte authentifié sain
@@ -264,6 +272,7 @@ TYPE_LABELS = {
     "host_disk_low": "btrfs disk almost full",
     "host_disk_soon_full": "disk almost full, or filling up",
     "host_zombies": "zombie processes piling up on a host",
+    "host_network_overlap": "container network overlapping a host route",
     "docker_orphan_volumes": "Docker orphan volumes accumulating",
     "docker_build_cache": "Docker reclaimable build cache above threshold",
     "docker_storage_unavailable": "Docker storage inventory unavailable",
@@ -297,7 +306,8 @@ URGENT_TYPES = ("stopped_with_mail", "orphan_lot", "dead_runner", "delegation_ex
                 "mail_undeliverable", "ci_main_red", "auth_blocked",
                 "credential_failing", "critical_budget_pause", "critical_turn_failures",
                 "owner_key_registered",
-                "land_uncertain", "db_connections_high", "pgbouncer_pool_waiting")
+                "land_uncertain", "db_connections_high", "pgbouncer_pool_waiting",
+                "host_network_overlap")
 #: L124 : types dont la résolution n'est pas envoyée — une décision se résout
 #: parce que l'humain y a répondu (ou que le demandeur l'a retirée) : le lui
 #: redire serait du bruit. La résolution est journalisée.
@@ -530,6 +540,25 @@ class Message:
     @property
     def text(self) -> str:
         return "%s\n%s" % (self.title, self.body)
+
+
+def _only_set(values) -> frozenset | None:
+    """Validate ``--only``; None means the historical full pass."""
+    if values is None:
+        return None
+    if isinstance(values, str):
+        values = [values]
+    selected = set()
+    for value in values:
+        for part in str(value).split(","):
+            part = part.strip()
+            if not part:
+                continue
+            if part not in ONLY_PASSES:
+                raise ValueError("unknown pass %r (known: %s)"
+                                 % (part, ", ".join(ONLY_PASSES)))
+            selected.add(part)
+    return frozenset(selected) if selected else None
 
 
 def _clean(text, limit: int = 300) -> str:
@@ -1169,8 +1198,11 @@ class Notifier:
     def __init__(self, cfg: Config, ncfg: NotifyConfig, state: dict | None = None, *,
                  sender=None, dry_run: bool = False, emit=None, log=None, clock=None,
                  take: dict | None = None, handoff: dict | None = None,
-                 wip: dict | None = None):
+                 wip: dict | None = None, only=None):
         self.cfg, self.ncfg = cfg, ncfg
+        #: L165 (EP5) : passages demandés par une minuterie de rôle ; None =
+        #: le passage complet historique.
+        self.only = _only_set(only)
         #: L119 : réglages de la prise automatique (`backlog.auto_take`) ; None la coupe
         self.take = take
         #: L233b : réglages de la reprise sur pause budget
@@ -1193,20 +1225,25 @@ class Notifier:
 
     # -- passage --------------------------------------------------------------
     def run_pass(self, db, current: list | None = None, thresholds: dict | None = None,
-                 ) -> list:
+                 only=None) -> list:
         from . import alert_ack
         from .mediated_executor import availability
-        observed_ts = storage.of(db).alert_acknowledgements.clock() if db is not None else None
+        selected = self.only if only is None else _only_set(only)
         now = float(self.clock())
-        # #3007 : ce passage prouve, pour tout le maillage, que CE notificateur
-        # joint ses humains. Un poste sain ne lève donc plus d'alerte de voie
-        # depuis les VM ; son silence, lui, se voit partout.
+        if selected is not None and "alerts" not in selected:
+            return self._run_tail(db, now, selected)
+        # #3007 : ce passage (complet ou `--only alerts`) prouve, pour tout le
+        # maillage, que CE notificateur joint ses humains. Un poste sain ne
+        # lève donc plus d'alerte de voie depuis les VM ; son silence, lui, se
+        # voit partout. Les minuteries `--only` mécaniques d'EP5 ne livrent
+        # aucune alerte : elles ne battent pas (ce serait un faux vivant).
         if db is not None and not self.dry_run:
             try:
                 notify_gap.beat(self.cfg, db, self.ncfg, now=now)
             except Exception as exc:  # noqa: BLE001 — un battement ne fait pas le passage
                 self.log("[%s] heartbeat not recorded (%s)"
                          % (notify_gap.GAP_TYPE, exc))
+        observed_ts = storage.of(db).alert_acknowledgements.clock() if db is not None else None
         #: #1901 : familles qu'une passe n'a pas pu lire du tout (porte d'hôte
         #: au registre illisible) ; une alerte absente d'un relevé incomplet
         #: n'est pas résolue pour autant.
@@ -1389,15 +1426,19 @@ class Notifier:
             if not self._pending(entry):
                 del self.state["resolved"][key]
         self._summaries(now)
-        if self.handoff:
+        take = selected is None or "take" in selected
+        if take and self.handoff:
             self._budget_handoff(db, now)
-        if self.take:
+        if take and self.take:
             self._auto_take(db, current, now)
-        if self.wip:
+        if take and self.wip:
             self._wip_sweep(db, now)
-        self._github_issues(db, now)
-        self._github_inputs(db, now)
-        self._ci_failures(db)
+        if selected is None or "issues" in selected:
+            self._github_issues(db, now)
+        if selected is None or "github-watch" in selected:
+            self._github_inputs(db, now)
+        if selected is None or "ci" in selected:
+            self._ci_failures(db)
         for human in list(self.state["rate"]):
             window = [t for t in self.state["rate"][human] if now - t < RATE_WINDOW_S]
             if window:
@@ -1405,6 +1446,35 @@ class Notifier:
             else:
                 del self.state["rate"][human]
         self._prune_notified(now)
+        return records
+
+    def _run_tail(self, db, now: float, selected) -> list:
+        """The independent mechanical passes, without the alert delivery.
+
+        `--only github-watch`, `--only ci` and `--only issues` are the role
+        timers of EP5: they write no notify state and take no state lock, so
+        two of them may share a host with the alert producer. `--only take`
+        still observes the alerts first, because auto-take uses them.
+        """
+        records: list = []
+        self._records = records
+        if "take" in selected:
+            from . import alert_ack
+            thresholds = alert_ack.default_thresholds()
+            current = exploitation.alerts(self.cfg, db, now=now, local_pool=False,
+                                          **thresholds)
+            if self.handoff:
+                self._budget_handoff(db, now)
+            if self.take:
+                self._auto_take(db, current, now)
+            if self.wip:
+                self._wip_sweep(db, now)
+        if "issues" in selected:
+            self._github_issues(db, now)
+        if "github-watch" in selected:
+            self._github_inputs(db, now)
+        if "ci" in selected:
+            self._ci_failures(db)
         return records
 
     def run_local_pass(self, now: float | None = None) -> list:
@@ -1794,24 +1864,61 @@ class Notifier:
                         continue
                 del sent[key]
         due = []
+        dead_only = set()
         for key, alert in alive.items():
             entry = sent.get(key)
             if entry is None or alert.get("type") == "slo_breach":
                 due.append((key, alert, entry))
-            elif entry.get("dead") or entry.get("pending"):
-                # #3036 : des destinataires avaient été écartés (bail mort,
-                # hôte aux claims fermés) ou une remise a échoué ; la passe
-                # réévalue pour remettre à qui est revenu, sans redéposer
-                # chez les morts ni oublier l'échec transitoire.
+            elif entry.get("pending"):
+                # #3036 : une remise a échoué ; la passe la retente.
                 due.append((key, alert, entry))
             elif not entry.get("reminded") and now - float(entry["sent_ts"]) \
                     >= alert_briefs.REMIND_AFTER_S:
                 due.append((key, alert, entry))
+            elif entry.get("dead"):
+                # #3036 : des destinataires avaient été écartés (bail mort,
+                # hôte aux claims fermés) ; la passe réévalue pour remettre à
+                # qui est revenu, sans redéposer chez les morts. #3057 :
+                # seulement si l'un d'eux a changé (filtre plus bas).
+                due.append((key, alert, entry))
+                dead_only.add(key)
         if not due:
             return
         from . import mail, work
         try:
             listing = storage.of(db).operations.listing()
+            # #3036 : un agent dont le bail est mort ou dont l'hôte a les
+            # claims fermés ne lira pas ; la résolution des destinataires
+            # l'écarte au lieu de compter une remise perdue.
+            closed = alert_briefs.claims_closed_hosts(db)
+            # #3057 : un bail rendu depuis quelques secondes (redémarrage)
+            # compte vivant pour le routage, mais rien ne lui est remis avant
+            # son retour ou la fin de la grâce.
+            listing, held = alert_briefs.lease_grace(
+                listing, closed, self.state.setdefault("leaseless_since", {}), now)
+            by_name = {row["name"]: row for row in listing}
+
+            def down(entry: dict) -> list:
+                # les destinataires d'une entrée (remis ou écartés) qui ne
+                # liraient pas à cette passe ; le fil n'a pas de bail
+                names = set(entry.get("to") or ()) | set(entry.get("dead") or ())
+                return sorted(n for n in names if not n.startswith("thread:") and (
+                    n not in by_name or alert_briefs._unavailable(by_name[n], closed)))
+
+            # #3057 : un destinataire mort qui le reste (agent arrêté des
+            # jours) ne refait pas, à chaque passe, briefs et titres du lot.
+            # L'entrée est réévaluée dès que l'un des écartés revient (ou est
+            # en grâce) ou quitte le registre, et dès que l'ensemble des
+            # indisponibles change depuis la dernière évaluation — un
+            # destinataire déjà servi qui tombe peut appeler le repli.
+            due = [(key, alert, entry) for key, alert, entry in due
+                   if key not in dead_only
+                   or entry.get("down") != down(entry)
+                   or any(name not in by_name
+                          or not alert_briefs._unavailable(by_name[name], closed)
+                          for name in entry["dead"])]
+            if not due:
+                return
             from . import canon as canon_mod
             try:
                 canons = canon_mod.load_configured(self.cfg) if self.cfg.canon else []
@@ -1821,19 +1928,42 @@ class Notifier:
             module_auditors = alert_briefs.auditors(listing, canons, explicit_only=True)
             from . import sous_utilisation
             module_orchestrators = sous_utilisation.role_orchestrators(canons)
-            # #3036 : un agent dont le bail est mort ou dont l'hôte a les
-            # claims fermés ne lira pas ; la résolution des destinataires
-            # l'écarte au lieu de compter une remise perdue.
-            closed = alert_briefs.claims_closed_hosts(db)
         except Exception as exc:  # noqa: BLE001
             self.log("mail to agents not prepared (%s)" % exc)
             return
+        unevaluated: set = set()
         for key, alert, entry in due:
             kind = alert.get("type")
             # #3036 : les destinataires écartés par la vivacité, pour que les
             # passes suivantes sachent qu'il reste quelqu'un à remettre.
             dead: dict = {}
-            is_reminder = entry is not None and kind != "slo_breach"
+            # les destinataires qui reçoivent la relance (les autres, le brief
+            # initial), et si la relance de 6 h est échue à cette passe
+            reminders: set = set()
+            remind_due = False
+            covered: set = set()
+            if kind == "slo_breach":
+                # One successful delivery per recipient and escalation
+                # level. Failed deliveries and newly designated pilots retry.
+                # #3036 : une entrée écrite par l'ancien notificateur peut
+                # nommer des destinataires dont la remise était allée sur un
+                # hôte perdu. On ne se fie à son `to` que pour un destinataire
+                # encore vivant ; un nom mort à cette passe est retiré, pour
+                # être remis quand il revient — sans rafale vers les vivants.
+                # #3100 : une entrée de ce notificateur (`live_routed`) n'a
+                # remis qu'à des vivants ; son `to` fait foi même si un bail
+                # cligne (redémarrage d'exécuteur, clôture de release) — le
+                # courrier est dans la boîte, lu au retour — et couvre le
+                # palier : ni second courrier ni escalade.
+                previous = {name: "" for name in (entry or {}).get("to") or ()}
+                if entry is not None and not entry.get("live_routed"):
+                    by_name = {row["name"]: row for row in listing}
+                    still_live, gone = alert_briefs._split_live(previous, by_name, closed)
+                    entry["to"] = sorted(still_live)
+                    entry["dead"] = sorted(gone)
+                    covered = set(still_live)
+                else:
+                    covered = set(previous)
             try:
                 titles = {}
                 for lot in (alert.get("lots") or ())[:12]:
@@ -1844,10 +1974,16 @@ class Notifier:
                     alert, listing, titles,
                     module_auditors if kind == "module_deviation" else auditors,
                     orchestrator_names=module_orchestrators,
-                    closed_hosts=closed, dead_out=dead)
+                    closed_hosts=closed, dead_out=dead, covered=covered)
             except Exception as exc:  # noqa: BLE001 - l'alerte part quand même
                 self.log("[%s] mail to agents not prepared (%s)" % (kind, exc))
+                unevaluated.add(key)
                 continue
+            for name in held & set(briefs):
+                # #3057 : bail rendu il y a moins de la grâce ; ni remise ni
+                # escalade, la passe suivante remet à son retour.
+                briefs.pop(name)
+                dead[name] = "lease returned, grace"
             if kind == "slo_breach" and "bureau" in (alert.get("targets") or ()) \
                     and any(
                         row.get("name") == "bureau" and row.get("mode") == "externe"
@@ -1859,20 +1995,7 @@ class Notifier:
                 # palier effectivement visé, avec ses absents nommés.
                 briefs.setdefault("thread:bureau", alert_briefs._slo_breach(alert))
             if kind == "slo_breach":
-                # One successful delivery per recipient and escalation
-                # level. Failed deliveries and newly designated pilots retry.
-                # #3036 : une entrée écrite par l'ancien notificateur peut
-                # nommer des destinataires dont la remise était allée sur un
-                # hôte perdu. On ne se fie à `to` que pour un destinataire
-                # encore vivant ; un nom mort à cette passe est retiré, pour
-                # être remis quand il revient — sans rafale vers les vivants.
-                by_name = {row["name"]: row for row in listing}
-                previous = {name: "" for name in (entry or {}).get("to") or ()}
-                still_live, gone = alert_briefs._split_live(previous, by_name, closed)
-                if entry is not None:
-                    entry["to"] = sorted(still_live)
-                    entry["dead"] = sorted(gone)
-                briefs = {n: t for n, t in briefs.items() if n not in still_live}
+                briefs = {n: t for n, t in briefs.items() if n not in covered}
             if not briefs:
                 # #3036 : une remise en attente sans destinataire à cette
                 # passe ne doit pas faire tourner les passages à vide ; les
@@ -1890,21 +2013,27 @@ class Notifier:
                 # une relance), et rien n'est redéposé chez les morts.
                 already = {str(n) for n in entry.get("to") or ()}
                 fresh = {n: t for n, t in briefs.items() if n not in already}
-                if fresh:
-                    briefs = fresh
-                    is_reminder = False
-                elif entry.get("reminded") or now - float(entry["sent_ts"]) \
-                        < alert_briefs.REMIND_AFTER_S:
-                    entry["dead"] = sorted(dead)
-                    continue
-                else:
+                remind_due = not entry.get("reminded") and now - float(
+                    entry["sent_ts"]) >= alert_briefs.REMIND_AFTER_S
+                if remind_due:
+                    # #3057 : la relance échue part dans la même passe que le
+                    # brief initial d'un destinataire revenu, et la relance
+                    # est alors consommée : il ne la reçoit pas à la passe
+                    # suivante, quelques minutes après le brief initial.
                     raised = float(entry["sent_ts"])
-                    briefs = {n: alert_briefs.reminder(t, raised, now)
-                              for n, t in briefs.items() if n in already}
-                    if not briefs:
-                        entry["dead"] = sorted(dead)
-                        continue
-            payload = {"alert": kind, "reminder": is_reminder}
+                    reminders = {n for n in briefs if n in already}
+                    briefs = {**fresh, **{n: alert_briefs.reminder(briefs[n], raised, now)
+                                          for n in reminders}}
+                else:
+                    briefs = fresh
+                if not briefs:
+                    entry["dead"] = sorted(dead)
+                    # #3057 : un `pending` encore destinataire serait dans
+                    # `fresh` ; ce qui reste a quitté les briefs ou a été
+                    # remis depuis : oublié, la passe ne tourne pas à vide.
+                    entry["pending"] = []
+                    continue
+            payload = {"alert": kind, "reminder": False}
             # #789 t2 (canon §9) : l'urgence portée par l'alerte elle-même
             # (un P1) est propagée au courrier d'agent ; le type reste la
             # règle générale (L242b (5) : le point de l'auditeur).
@@ -1932,6 +2061,7 @@ class Notifier:
                 if self.dry_run:
                     self.log("[%s] mail to %s (dry run): %s" % (kind, name, text))
                     continue
+                meta = dict(payload, reminder=name in reminders)
                 try:
                     if name == "thread:bureau":
                         # #3036 : la route humaine — le fil lisible du lot,
@@ -1939,17 +2069,17 @@ class Notifier:
                         if fil.record(self.cfg, db, sender=work.SYSTEM_SENDER,
                                       recipients=["bureau"], text=text,
                                       project=alert.get("project"), lot=alert.get("lot"),
-                                      meta=payload) is None:
+                                      meta=meta) is None:
                             continue
                     elif kind == "module_deviation":
-                        if not self._send_module_brief(db, alert, name, text, payload):
+                        if not self._send_module_brief(db, alert, name, text, meta):
                             continue
                     else:
                         mail.send(db, work.SYSTEM_SENDER, name, text, kind="event",
-                                  payload=payload)
+                                  payload=meta)
                     delivered.append(name)
                     self.log("[%s] %s delivered to %s" % (
-                        kind, "reminder" if payload["reminder"] else "mail", name))
+                        kind, "reminder" if meta["reminder"] else "mail", name))
                 except Exception as exc:  # noqa: BLE001
                     self.log("[%s] mail to %s not delivered (%s)" % (kind, name, exc))
             # #3036 : une remise qui n'a pas eu lieu (destinataire filtré,
@@ -1974,6 +2104,9 @@ class Notifier:
                                  # actual assignee or an absent pass resends.
                                  "agent": alert.get("agent") or alert.get("responsible"),
                                  "reminded": True,
+                                 # #3100 : remis par ce notificateur, aux
+                                 # seuls vivants ; `to` fait foi ensuite.
+                                 "live_routed": True,
                                  "to": sorted(set((entry or {}).get("to") or ()) | set(delivered))}
             elif entry is None:
                 sent[key] = {"type": kind, "sent_ts": now,
@@ -1991,8 +2124,16 @@ class Notifier:
                 entry["to"] = sorted(set(entry.get("to") or ()) | set(delivered))
                 entry["dead"] = sorted(dead)
                 entry["pending"] = sorted(set(briefs) - set(delivered) - set(dead))
-                if is_reminder:
+                if remind_due:
                     entry["reminded"] = True
+        # #3057 : l'état des destinataires vu à cette évaluation, pour que les
+        # passes suivantes sachent si quelque chose a changé ; une entrée non
+        # évaluée (préparation en échec) garde l'ancien et sera reprise.
+        for key, _alert, _entry in due:
+            entry = sent.get(key)
+            if entry is not None and entry.get("type") != "slo_breach" \
+                    and key not in unevaluated:
+                entry["down"] = down(entry)
 
     def _send_module_brief(self, db, alert, name, text, payload):
         """Reauthorize under a recipient row lock, held through mailbox commit.
@@ -2549,6 +2690,11 @@ def build_parser() -> argparse.ArgumentParser:
                              "AMEESH_NOTIFY_INTERVAL, else 30)")
     parser.add_argument("--test", metavar="human:ID", default=None,
                         help="send a test message on each of this human's channels")
+    parser.add_argument("--only", action="append", metavar="PASS[,PASS]",
+                        default=None,
+                        help="L165: run only these passes (%s; repeatable, "
+                             "comma-separated); requires --once"
+                             % ", ".join(ONLY_PASSES))
     exploitation.add_threshold_arguments(parser)
     # L119 (0037) : prise automatique dans la file d'amélioration
     from . import backlog, handoff
@@ -2689,18 +2835,31 @@ def cmd_test(cfg: Config, ncfg: NotifyConfig, args) -> int:
 
 
 def cmd_notify(cfg: Config, ncfg: NotifyConfig, args) -> int:
-    if not ncfg.configured:
+    try:
+        only = _only_set(getattr(args, "only", None))
+    except ValueError as exc:
+        print("ameesh notify: %s" % exc, file=sys.stderr)
+        return 2
+    if only is not None and not args.once:
+        print("ameesh notify: --only requires --once", file=sys.stderr)
+        return 2
+    #: L165: the alert delivery owns the local state file and its lock. The
+    #: mechanical passes (`issues`, `github-watch`, `ci`) use database state
+    #: only, so a role timer can run them beside the alert producer.
+    alerts_pass = only is None or "alerts" in only
+    if alerts_pass and not ncfg.configured:
         _stderr_log("no channel configured (`notify` key of the host configuration: "
                     "routes, default): alerts will be logged, not sent")
     path = state_path(cfg)
     lock = None
-    if not args.dry_run:
+    if alerts_pass and not args.dry_run:
         lock = _Lock(path + ".lock")
         if not lock.acquire():
             print("ameesh notify: another `ameesh notify` already holds %s.lock" % path,
                   file=sys.stderr)
             return 1
-    state = load_state(path, log=_stderr_log, move_aside=not args.dry_run)
+    state = (load_state(path, log=_stderr_log, move_aside=not args.dry_run)
+             if alerts_pass else empty_state())
 
     def emit(record):
         if args.json:
@@ -2710,7 +2869,7 @@ def cmd_notify(cfg: Config, ncfg: NotifyConfig, args) -> int:
 
     notifier = Notifier(cfg, ncfg, state, dry_run=args.dry_run, emit=emit,
                         take=take_settings(args), handoff=handoff_settings(args),
-                        wip=wip_settings(args))
+                        wip=wip_settings(args), only=only)
     seuils = exploitation.thresholds(args)
     interval = _interval(args, ncfg)
     db = None
@@ -2719,15 +2878,16 @@ def cmd_notify(cfg: Config, ncfg: NotifyConfig, args) -> int:
             # #532 : la console du pool local se lit depuis `cfg` seule, avant
             # la base — c'est ce qui fait survivre l'alerte au refus qu'elle
             # signale, puisque la base passe par ce même pool.
-            notifier.run_local_pass()
-            if not args.dry_run:
-                save_state(path, notifier.state)
+            if alerts_pass:
+                notifier.run_local_pass()
+                if not args.dry_run:
+                    save_state(path, notifier.state)
             try:
                 if db is None:
                     db = db_mod.connect(cfg)
                     db_mod.require_schema(db)
                 notifier.run_pass(db, thresholds=seuils)
-                if not args.dry_run:
+                if alerts_pass and not args.dry_run:
                     save_state(path, notifier.state)
             except db_mod.SchemaMissing:
                 raise
@@ -2766,6 +2926,9 @@ def main(argv: list | None = None) -> int:
         return cmd_test(cfg, ncfg, args)
     try:
         return cmd_notify(cfg, ncfg, args)
+    except ValueError as exc:
+        print("ameesh notify: %s" % exc, file=sys.stderr)
+        return 2
     except db_mod.SchemaMissing as exc:
         print("error: %s" % exc, file=sys.stderr)
         return 1

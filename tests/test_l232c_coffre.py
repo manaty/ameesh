@@ -38,6 +38,9 @@ def charger():
 coffre = charger()
 UTILISATEUR = pwd.getpwuid(os.geteuid()).pw_name
 GROUPE = grp.getgrgid(os.getegid()).gr_name
+#: Le groupe de gid 0 s'appelle « root » sous Linux et « wheel » sous macOS :
+#: les cas qui visent le groupe privilégié passent par son nom réel.
+GROUPE_ROOT = grp.getgrgid(0).gr_name
 
 
 class ReferenceTest(unittest.TestCase):
@@ -794,7 +797,8 @@ class CompteIsoleTest(Materiel):
     """B1 R2 dev4 : root n'agit pas par chemin dans le répertoire du compte.
 
     Hors root, le fils abandonne ses droits vers le même compte : le chemin
-    réel (fork, setresuid, reçu par tube) est exercé sans privilège.
+    réel (fork, abandon setres*/setre* selon l'OS, reçu par tube) est exercé
+    sans privilège.
     """
 
     def setUp(self):
@@ -849,7 +853,7 @@ class CompteIsoleTest(Materiel):
 
     def test_compte_root_refuse(self):
         document = self.destination_document(account="root", owner="root",
-                                             group="root")
+                                             group=GROUPE_ROOT)
         helper = dict(self.helper_document, destinations=[document])
         # uid injecté à 0 : le refus tombe avant le fils et avant tout effet.
         installeur = coffre.Installeur(helper, read_as=None, uid=0, isolate=True)

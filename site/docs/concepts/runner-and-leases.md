@@ -38,8 +38,11 @@ every candidate; any of them may take the lease when it is free or expired,
 and the winner becomes the holder. `canon sync` writes the placement verdict
 of **each** candidate host, so the host policy and visibility rule are still
 checked on the host that claims. Such a role is not moved by L232e: there is
-no local work to publish, and the lease epoch fences the former holder. The
-repository note `docs/HOST-HANDOFFS.md` has the full election rules. The
+no local work to publish, and the lease epoch fences the former holder. A
+planned `host drain` returns the holder's lease at once (epoch incremented in
+the drain transaction), so a candidate can take over without waiting for the
+expiry; an unplanned stop waits for the lease to expire. The repository note
+`docs/HOST-HANDOFFS.md` has the full election rules. The
 best *ready* candidate wins, with a short per-rank delay before the claim
 (0 s, 20 s, 40 s…); availability over seven days decides, capacity only breaks
 ties, and a holder is replaced only after a challenger has stayed 5 points

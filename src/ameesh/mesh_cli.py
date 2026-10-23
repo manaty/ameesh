@@ -1489,7 +1489,7 @@ def _print_assignment(check: dict | None) -> None:
 
 #: sous-commandes `work` dont `--actor` a son propre sens (le délégant de
 #: `delegate`) ou son propre défaut non vide (relevés, échéances)
-_OWN_ACTOR = ("delegate", "expire-delegations", "sync-branches")
+_OWN_ACTOR = ("delegate", "expire-delegations", "sync-branches", "device-gates")
 
 
 def _work_actor(cfg: Config, db, args: argparse.Namespace) -> None:
@@ -1669,6 +1669,11 @@ def work_detail(cfg: Config, db, lot_id: int, repo: str | None = None,
         # L317c: the auditor's automatic deep analysis and its measured delay
         from . import deep_analysis
         item["deep_analysis"] = deep_analysis.status(db, lot_id, cfg=cfg)
+        # #3070 (canon §12): a blocked lot waiting for a device session
+        from . import device_gates
+        item["device_gate"] = device_gates.of_item(
+            db, item, canons=work.configured_canons(cfg)) \
+            if item.get("state") == "blocked" else None
         return item
 
     # L61/L521: the detail's independent reads travel together (one query per
@@ -1904,6 +1909,29 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
             if out.get("warning"):
                 print("warning: %s" % out["warning"], file=sys.stderr)
             return 0
+        if args.work_command == "device-gates":
+            # #3070 (canon §12) : séances sur un appareil indisponible
+            from . import device_gates
+            canons = work.configured_canons(cfg)
+            if args.apply:
+                rows = device_gates.lift(db, canons=canons,
+                                         actor=args.actor or device_gates.ACTOR)
+            else:
+                rows = device_gates.candidates(db, canons=canons)
+            if args.json:
+                print(json.dumps(rows, ensure_ascii=False, indent=2, default=str))
+                return 0
+            if not rows:
+                print("no lot lifted" if args.apply
+                      else "no blocked lot declares a device session")
+                return 0
+            for row in rows:
+                if args.apply:
+                    print("lot #%d → %s (%s, verification lot #%d)" % (
+                        row["lot"], row["state"], device_gates.TRACE, row["verify"]))
+                else:
+                    print("lot #%d: %s" % (row["lot"], device_gates.label(row)))
+            return 0
         if args.work_command == "expire-delegations":
             rows = work.expire_delegations(db, actor=args.actor or work.SYSTEM_SENDER,
                                            dry_run=args.dry_run)
@@ -2072,6 +2100,9 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                     " (%s)" % q["reason"] if q.get("reason") else ""))
             if item.get("waiting_for"):
                 print("waiting  : %s" % item["waiting_for"]["label"])
+            if item.get("device_gate"):
+                from . import device_gates
+                print("device   : %s" % device_gates.label(item["device_gate"]))
             if item.get("delegation"):
                 delegation = item["delegation"]
                 print("delegated: %s (on %s%s)" % (
@@ -2144,7 +2175,17 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                         or "<migrations>/%s_<name>.sql" % row["label"]))
             return 0
         if args.work_command == "move":
-            item = work.move(db, args.id, args.state, note=args.note or "", actor=args.actor,
+            note = args.note or ""
+            if args.device:
+                # #3070 : la séance attendue sur un appareil, déclarée en note
+                from . import device_gates
+                if args.state != "blocked":
+                    print("ameesh work move: --device declares the device session a "
+                          "blocked lot waits for: ameesh work move %s blocked --device "
+                          "<device>" % args.id, file=sys.stderr)
+                    return 2
+                note = device_gates.session_note(args.device, note)
+            item = work.move(db, args.id, args.state, note=note, actor=args.actor,
                              correct=args.correct, reviewer=args.reviewer)
             print("lot #%d → %s (loops %s)%s%s" % (
                 item["id"], item["state"], item["loops"],
@@ -3368,6 +3409,11 @@ def build_parser() -> argparse.ArgumentParser:
                               "when moving to qa: waiting(), the progress view and the stale_lot "
                               "alert name them before any verdict; a reviewer of the author's "
                               "declared harness warns (indicative, #800)")
+    pw_move.add_argument("--device", action="append", default=None, metavar="DEVICE",
+                         help="#3070: with blocked, the device (canon Host fiche) whose "
+                              "session the lot waits for (repeatable); --note then names the "
+                              "cases not played. Declared unavailable (canon §12), the gate "
+                              "lifts by itself: see ameesh work device-gates")
     pw_move.set_defaults(func=cmd_work)
     pw_reviewer = work_sub.add_parser(
         "reviewer",
@@ -3484,6 +3530,16 @@ def build_parser() -> argparse.ArgumentParser:
     pw_expire.add_argument("--json", action="store_true")
     pw_expire.add_argument("--actor", default="")
     pw_expire.set_defaults(func=cmd_work)
+    pw_gates = work_sub.add_parser(
+        "device-gates",
+        help="#3070 (canon §12): blocked lots waiting for a session on a device; a device "
+             "declared unavailable lifts the gate (also done by the runner)")
+    pw_gates.add_argument("--apply", action="store_true",
+                          help="lift the gates: trace, verification lot, back to the state "
+                               "before blocked")
+    pw_gates.add_argument("--json", action="store_true")
+    pw_gates.add_argument("--actor", default="")
+    pw_gates.set_defaults(func=cmd_work)
 
     pw_note = work_sub.add_parser(
         "note", help="journal note; a `hold:`/lift note claiming a pilot is authenticated")

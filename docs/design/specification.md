@@ -160,6 +160,8 @@ responsible: human:smichea       # REQUIS
 tags: [perso, prod]              # étiquettes visées par les admissions (L31)
 admins: [human:alice]            # administrateurs : règle de visibilité (L31)
 occupants: [human:anna]          # accès physique sans administrer (L110) ; absent = aucun
+indisponible_jusqu_au: 2026-10-30 # appareil indisponible, jour inclus (#3070, canon §12)
+indisponible_motif: "en déplacement"
 policy:
   harnesses: [claude, codex, deepseek]   # absent = tous
   providers: [anthropic, openai, deepseek]
@@ -177,6 +179,16 @@ policy:
   work_roots: {acme-web: ~/acme/acme-web, nexlink: "~/dev/nexlink-{agent}"}   # par projet (L31)
   work_root: ~/src               # défaut : work_root/<projet>
 ```
+
+**Appareil indisponible** (#3070, canon §12) : `indisponible_jusqu_au` (jour
+ISO, inclus) et `indisponible_motif` déclarent l'appareil indisponible ; une
+séance qu'il porte ne retarde ni paquet, ni release, ni prod (voir
+[EXPLOITATION](../EXPLOITATION.md), « Appareil indisponible »). Un appareil
+physique sans agent (Mac, PC de recette) a sa fiche `hotes/` avec
+`policy.max_agents: 0`. Une date illisible est une erreur
+(`host-unavailable-invalid`) qui ne déclare rien ; un motif sans date, un
+avertissement ; une date passée, une information (`host-unavailable-past`) :
+la règle a cessé d'elle-même.
 
 **Dossier de travail d'un agent sur l'hôte** (L31, 0029 ; L35) : c'est un
 réglage de l'hôte, jamais de la persona. Ordre de résolution, le premier qui

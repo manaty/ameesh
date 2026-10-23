@@ -25,6 +25,7 @@ from ameesh import config as config_mod
 from ameesh import db as db_mod
 from ameesh import migrations
 from ameesh import work as work_mod
+from ameesh.platform import SYSTEM as PLATFORM_SYSTEM
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SRC = os.path.join(REPO, "src")
@@ -306,6 +307,57 @@ def child_env(**extra: str) -> dict:
     env.pop("AMEESH_CODEX_SESSIONS", None)   # isolement par CODEX_HOME (ci-dessus)
     env.update({k: str(v) for k, v in extra.items() if v is not None})
     return env
+
+
+#: L66/#3131 : la route de notification de bureau de CET OS. Un banc qui
+#: remplace le backend pose les DEUX surcharges explicites (la couche
+#: plateforme choisit selon `SYSTEM`) et ses assertions suivent cette route :
+#: sous Linux `notify-send`, sous macOS `osascript`.
+DESKTOP_MACOS = PLATFORM_SYSTEM == "macos"
+DESKTOP_VAR = "AMEESH_OSASCRIPT_BIN" if DESKTOP_MACOS else "AMEESH_NOTIFY_SEND_BIN"
+DESKTOP_BACKEND = "osascript" if DESKTOP_MACOS else "notify-send"
+DESKTOP_MISSING = DESKTOP_BACKEND + " not found"
+
+
+def desktop_backend_env(binary: str, **extra) -> dict:
+    """Environnement d'un faux backend de bureau, pour CET OS.
+
+    Les deux surcharges pointent le même faux binaire : quelle que soit la
+    route choisie par `ameesh.platform`, le banc n'affiche jamais rien et
+    journalise ce qu'il aurait affiché."""
+    env = {"AMEESH_NOTIFY_SEND_BIN": binary, "AMEESH_OSASCRIPT_BIN": binary}
+    env.update({k: str(v) for k, v in extra.items() if v is not None})
+    return env
+
+
+def desktop_received(argv: list) -> tuple:
+    """(titre, corps, urgence) reçus par le faux backend de cet OS.
+
+    Linux : `notify-send --urgency=… -- titre corps`. macOS : `osascript -e
+    'display notification "corps" with title "titre" [sound name "Basso"]'`
+    (pas de niveau d'urgence : le son signale le critique, L66)."""
+    if DESKTOP_MACOS:
+        script = argv[-1]
+        match = re.search(
+            r'display notification ("(?:[^"\\]|\\.)*") with title '
+            r'("(?:[^"\\]|\\.)*")', script)
+        if match is None:
+            raise AssertionError("script AppleScript sans notification : %r" % script)
+        return (_applescript_text(match.group(2)), _applescript_text(match.group(1)),
+                "critical" if 'sound name "Basso"' in script else "normal")
+    urgency = "normal"
+    for argument in argv:
+        if argument.startswith("--urgency="):
+            urgency = argument.split("=", 1)[1]
+    return argv[-2], argv[-1], urgency
+
+
+def _applescript_text(quoted: str) -> str:
+    """Le texte d'une chaîne AppleScript entre guillemets (cf.
+    `platform.notify._applescript_string`) : `\\`, `"` et les sauts de ligne."""
+    escaped = {"n": "\n", "\\": "\\", '"': '"'}
+    return re.sub(r"\\(.)", lambda m: escaped.get(m.group(1), m.group(1)),
+                  quoted[1:-1])
 
 
 #: L161e : dossier de mesure de la carte test → code (vide : pas de mesure)

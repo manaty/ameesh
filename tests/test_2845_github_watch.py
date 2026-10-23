@@ -971,6 +971,65 @@ class CollectionTest(unittest.TestCase):
                          set(range(1, 101)) | {201})
         self.assertEqual(until, NOW - watch.INDEX_LAG)
 
+    def test_3096_clean_page_edited_after_its_last_read_is_rechecked(self):
+        # #3096 (review of #2955): page 1 is clean at its read and at its
+        # re-read as the anchor of page 2; page 2 is all deferred, so its
+        # snapshot is empty. #1 is then edited and caught up with #3/#4: #5
+        # recedes from page 3 into page 1, below the first live page (2).
+        for kind in ("issue", "comment"):
+            with self.subTest(kind=kind):
+                with mock.patch.object(watch, "PAGE_SIZE", 2):
+                    rows = ([issue(n) for n in range(1, 6)] if kind == "issue"
+                            else [comment(n) for n in range(10, 15)])
+                    ids = [row["id"] for row in rows]
+                    for n, row in enumerate(rows, start=1):
+                        row["key"] = row["updated_at"] = watch.iso(NOW - 2500 + n)
+                    for row in rows[2:4]:
+                        row["updated_at"] = watch.iso(NOW - 1)
+                    api = (LagApi(rows, []) if kind == "issue"
+                           else LagApi(comments=rows))
+                    get = api.get
+                    caught = []
+
+                    def mutate(path, **kw):
+                        page = int(parse_qs(urlsplit(path).query)["page"][0])
+                        if page == 3 and not caught:
+                            caught.append(True)
+                            rows[0]["updated_at"] = watch.iso(NOW + 1)
+                            for row in (rows[0], rows[2], rows[3]):
+                                row["key"] = row["updated_at"]
+                        return get(path, **kw)
+
+                    with mock.patch.object(api, "get", side_effect=mutate):
+                        events, until = self.finish(api, NOW - 3600, NOW)
+                self.assertEqual({e["object_id"] for e in events},
+                                 {ids[0], ids[1], ids[4]})
+                self.assertEqual(until, NOW - watch.INDEX_LAG)
+
+    def test_3096_pending_legacy_recheck_also_reaches_page_one(self):
+        for kind in ("issue", "comment"):
+            for pending in ({"from": 2, "to": 3, "index": 0},
+                            {"from": 2, "to": 3, "index": 2},
+                            {"pages": [2, 3], "index": 1}):
+                with self.subTest(kind=kind, pending=pending):
+                    make = issue if kind == "issue" else comment
+                    rows = [make(n) for n in (2, 5, 3, 4, 1)]
+                    for row in rows[2:]:
+                        row["updated_at"] = watch.iso(NOW - 1)
+                    scan = dict(since=NOW - 3600, window_since=NOW - 3600,
+                                until=NOW, settled=NOW - watch.INDEX_LAG,
+                                kind=kind, page=3, recheck_from=2, recheck_to=3,
+                                recheck=dict(pending, then=("comments"
+                                             if kind == "issue" else "done")))
+                    before = deepcopy(scan)
+                    api = (Api(rows) if kind == "issue" else Api(comments=rows))
+                    with mock.patch.object(watch, "PAGE_SIZE", 2), \
+                            mock.patch.object(watch, "PAGES_PER_TICK", 1):
+                        events, until = self.finish(api, NOW - 3600, NOW, scan)
+                    self.assertIn(5, {event["object_id"] for event in events})
+                    self.assertEqual(until, NOW - watch.INDEX_LAG)
+                    self.assertEqual(scan, before)
+
     def test_b6_anchor_must_be_an_accepted_row(self):
         # B6 #2955: #6 is deferred (> U) but its old key sits at the end of the
         # page. When #1..#5 move and #6 catches up its key, the re-read page is

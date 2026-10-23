@@ -224,15 +224,18 @@ increments `lease_epoch`; the former holder is fenced from renewing, ending
 its turn or reclaiming. The holder is the one that renews, so only it takes
 turns.
 
-These roles are outside L232e: `host drain`, loss detection and handoff
-planning skip them, and a pending `handoff_fenced` does not close their claim.
-There is nothing to publish from a local worktree — the pilot's state lives in
-the mesh database, the canon and GitHub — so the L232e source proof does not
-apply. A stopped host loses the role when its lease expires (the L232e timing,
-180 s by default); a returning host goes back to standby until the lease is
-
-free again. This lot only makes the cross-host claim possible; EP2 decides
-which candidate wins and when (next section).
+These roles are outside L232e's handoff: loss detection and handoff planning
+skip them, and a pending `handoff_fenced` does not close their claim. There is
+nothing to publish from a local worktree — the pilot's state lives in the mesh
+database, the canon and GitHub — so the L232e source proof does not apply. A
+planned `host drain` still returns the holder's lease immediately, in the same
+transaction as the drain and with `lease_epoch` incremented: a standby can
+claim without waiting for the TTL, the drained host cannot claim again, and the
+former holder is fenced from renewing, ending its turn or reclaiming. An
+unplanned stop loses the role when its lease expires (the L232e timing, 180 s
+by default); a returning host goes back to standby until the lease is free
+again. This lot only makes the cross-host claim and the planned-drain release
+possible; EP2 decides which candidate wins and when (next section).
 
 ## Candidate score, rank delay and hysteresis (L165/EP2)
 
@@ -265,8 +268,14 @@ when a challenger has stayed at least 5 availability points above the holder
 for a full hour (standing history, no hole beyond the freshness threshold)
 and both are fresh and ready: the holder releases at the end of its turn
 (epoch++), and does not reclaim for the challenger's rank delay plus 60 s, so
-a challenger that dies after the release does not leave the role free. A
-workstation that boots therefore does not take the role back from a VM.
+a challenger that dies after the release does not leave the role free. The
+release mark is durable (`role_handover`, migration 0478): an executor restart
+does not let the resumed holder reclaim early or hand the role again to a
+challenger that did not claim — the failed challenger stays out of the
+handovers for an hour, even across the restart. A runner publishes standings
+only for the agents it can claim (`agents_filter`): it never advertises a
+readiness it will not act on. A workstation that boots therefore does not take
+the role back from a VM.
 `ameesh role status [ROLE] [--json]` prints the holder, the epoch and the
 ranked candidates with the diagnostic of each refusal.
 
@@ -314,7 +323,13 @@ the epoch it was opened with is refused, and the message names the current
 holder, its host and its epoch. The gate renews the lease and writes a
 `pilot.gesture` event in the same database transaction, so a stale epoch
 cannot even journal the gesture; the effect follows. The event carries the
-agent, gesture, ref, epoch and host — never a token or a secret.
+agent, gesture, ref, epoch and host — never a token or a secret. The renewal
+never shortens the lease: it keeps at least the TTL of the agent's host
+(`policy.lease_ttl` or `volatile` of its Host card, else `AMEESH_LEASE_TTL`
+— the runner's own rule), and the locked renewal keeps the later of the
+current expiry and the new one (`GREATEST`, not a pre-read), so a gesture
+cannot make the lease expire before the next heartbeat and elect another
+pilot (#3115).
 
 An EP5 timer (`ameesh role run`) may carry no agent identity but passes
 `AMEESH_ROLE` and the epoch it entered with. That pair is fenced too: a role
