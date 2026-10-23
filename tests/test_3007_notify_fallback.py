@@ -37,7 +37,9 @@ HOST = "pc-smichea"
 
 
 def _pending(ids=(7, 8), owner=ALICE, *, now=1000.0):
-    return [{"id": ident, "owner": owner, "created_ts": now - 600.0 + ident,
+    # Plus vieille que la grâce ALIVE_S (600 s) : une demande établie, pas la
+    # course d'une demande qui vient de naître (N2, dev4).
+    return [{"id": ident, "owner": owner, "created_ts": now - 900.0 + ident,
              "overdue": ident == ids[0]} for ident in ids]
 
 
@@ -80,8 +82,19 @@ class GapsTest(unittest.TestCase):
         (gap,) = notify_gap.gaps_for(vieille, rows, 1000.0)
         self.assertEqual((gap["human"], gap["reason"]), (ALICE, "uncovered"))
 
+    def test_une_demande_neuve_ne_rouvre_pas_un_battement_perime(self):
+        # N2 (dev4) : un humain couvert seulement par default, absent des noms
+        # et des routes, dont la ligne a péri pendant une accalmie : la demande
+        # neuve laisse le prochain battement la rafraîchir.
+        rows = [_row(human=ALICE, seen_ts=300.0)]
+        neuve = [{"id": 9, "owner": ALICE, "created_ts": 995.0, "overdue": False}]
+        self.assertEqual(notify_gap.gaps_for(neuve, rows, 1000.0), [])
+        vieille = [{"id": 9, "owner": ALICE, "created_ts": 300.0, "overdue": False}]
+        (gap,) = notify_gap.gaps_for(vieille, rows, 1000.0)
+        self.assertEqual(gap["reason"], "notifier_stale")
+
     def test_un_autre_humain_couvert_ne_couvre_pas_alice(self):
-        (gap,) = notify_gap.gaps_for(_pending(now=700.0),
+        (gap,) = notify_gap.gaps_for(_pending(),
                                      [_row(human=BOB, seen_ts=900.0)], 1000.0)
         self.assertEqual((gap["reason"], gap["last_host"], gap["last_seen"]),
                          ("uncovered", None, None))
@@ -93,8 +106,7 @@ class GapsTest(unittest.TestCase):
                                              [_row(seen_ts=100.0)], 1000.0), [])
 
     def test_deux_humains_deux_ecarts_ordre_stable(self):
-        pending = _pending(ids=(7,), owner=BOB) + _pending(ids=(8,), owner=ALICE,
-                                                          now=700.0)
+        pending = _pending(ids=(7,), owner=BOB) + _pending(ids=(8,), owner=ALICE)
         gaps = notify_gap.gaps_for(pending, [_row(human=BOB, seen_ts=100.0)], 1000.0)
         self.assertEqual([g["human"] for g in gaps], [ALICE, BOB])
 
@@ -153,7 +165,8 @@ class AlertesTest(PgTestCase):
         # échue : l'échéance passe en base, comme #789 (`due_ts` refusé passé)
         self.db.execute(
             "UPDATE agent_mailbox SET payload = jsonb_set(payload, '{decision,due_ts}',"
-            " to_jsonb(%s::float8)) WHERE id = %s",
+            " to_jsonb(%s::float8)), created_at = now() - interval '20 minutes'"
+            " WHERE id = %s",
             (time.time() - 60, view["id"]))
         return decisions.get(self.db, view["id"])
 
@@ -204,6 +217,16 @@ class AlertesTest(PgTestCase):
         ncfg = notify.parse_config({"default": ["app"]})
         notify_gap.beat(self.cfg, self.db, ncfg, now=now)
         self.assertEqual(self.alerts(now=now), [])
+
+    def test_les_humains_de_config_sont_lus_comme_des_noms(self):
+        # B2 (cx1, dev4) : cfg.humans est une chaîne CSV ; le battement doit
+        # lire cfg.human_names, pas itérer les caractères.
+        fake = types.SimpleNamespace(host=self.cfg.host, humans="alice,bob",
+                                     human_names=frozenset({"alice", "bob"}))
+        ncfg = notify.parse_config({"default": ["app"]})
+        notify_gap.beat(fake, self.db, ncfg)
+        humans = {row["human"] for row in storage.of(self.db).notify_liveness.latest()}
+        self.assertEqual(humans, {"human:alice", "human:bob"})
 
     def test_le_brief_suit_les_orchestrateurs_declares(self):
         # N1 de dev4 : les destinataires du brief sont ceux de l'alerte

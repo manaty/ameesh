@@ -130,12 +130,14 @@ def gaps_for(pending, rows, now: float, *, alive_s: float = ALIVE_S) -> list[dic
         overdue = [int(v["id"]) for v in views if v.get("overdue")]
         oldest = float(views[0].get("created_ts") or 0.0)
         age = max(0.0, now - oldest) if oldest else 0.0
-        last = _last(rows, human)
-        if last is None and oldest and now - oldest < alive_s:
+        if oldest and now - oldest < alive_s:
             # Une demande toute neuve peut précéder le prochain battement du
             # notificateur (30 s) : laisser à un notificateur vivant le temps
             # de la couvrir avant de dire qu'aucun ne l'a jamais couverte.
+            # Vaut aussi quand une ligne périmée existe (N2, dev4) : elle ne
+            # rouvre pas `notifier_stale` à la naissance d'une demande.
             continue
+        last = _last(rows, human)
         if last is None:
             prefix = ("no notifier has ever reported covering %s while another "
                       "notifier is alive" % human)
@@ -208,7 +210,9 @@ def beat(cfg, db, ncfg, now: float | None = None) -> int:
     from . import decisions, notify, storage
     now = time.time() if now is None else float(now)
     humans = set()
-    for raw in getattr(cfg, "humans", ()) or ():
+    # `cfg.humans` est la chaîne CSV de la configuration ; `human_names` en
+    # donne les noms (revue #3007, B2 : itérer la chaîne battait « a », « l »…).
+    for raw in getattr(cfg, "human_names", ()) or ():
         human = notify.normalize_human(raw)
         if human:
             humans.add(human)
