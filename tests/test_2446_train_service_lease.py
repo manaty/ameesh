@@ -213,6 +213,51 @@ class LeaseFenceTest(unittest.TestCase):
         other = train_runner.HostLease(self.cfg, ttl=900)
         self.assertTrue(other.acquire(object(), now=1100))
 
+    def test_a_close_during_a_promotion_lets_its_nested_writes_finish(self):
+        # Relecture mty-amh-impl-01 de 2d9f6837fc10 : promote -> ledger.acquire
+        # et migrations.landed, tous deux fencés, après la fermeture.
+        lease = train_runner.HostLease(self.cfg, ttl=900)
+        self.assertTrue(lease.acquire(object(), now=1000))
+        inside, leave = threading.Event(), threading.Event()
+        calls, errors = [], []
+        runtime = types.SimpleNamespace(
+            ledger=types.SimpleNamespace(acquire=lambda epoch: calls.append("acquire") or epoch),
+            repository=types.SimpleNamespace(promote=lambda: calls.append("push")),
+            migrations=types.SimpleNamespace(landed=lambda: calls.append("landed")))
+
+        def promote(epoch):
+            inside.set()
+            leave.wait(5)
+            if runtime.ledger.acquire(epoch) != epoch:
+                raise train.TrainError("target reservation lost before promotion")
+            runtime.repository.promote()
+            runtime.migrations.landed()
+
+        runtime.promote = promote
+        train_runner._fenced(runtime, lease.effect)
+
+        def run():
+            try:
+                runtime.promote(1)
+            except Exception as exc:  # pragma: no cover - the failure under test
+                errors.append(exc)
+
+        thread = threading.Thread(target=run)
+        thread.start()
+        self.assertTrue(inside.wait(5))
+        self.assertIsNone(lease.close(object(), timeout=0))
+        leave.set()
+        self.assertTrue(lease.close(object(), timeout=5))
+        thread.join(5)
+        self.assertEqual((errors, calls), ([], ["acquire", "push", "landed"]))
+        self.assertNotIn("train-service", self.ops.locks)
+        # A new top-level effect, nested writes included, stays refused.
+        for write in (lambda: runtime.promote(1), lambda: runtime.ledger.acquire(1),
+                      runtime.migrations.landed):
+            with self.assertRaises(train.TrainError):
+                write()
+        self.assertEqual(calls, ["acquire", "push", "landed"])
+
     #: The writes of a passage, named here rather than read from `_FENCED`.
     WRITES = {
         "runtime": (train_runtime.Runtime, ("save", "release", "enroll", "quarantine",

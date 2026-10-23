@@ -61,9 +61,13 @@ class HostLease:
         # thread may still be inside a passage. Every train effect of a
         # passage runs under this lock (`effect`): the close waits for the
         # effect in flight, and every later effect is refused. A closed lease
-        # is never acquired again by this incarnation.
+        # is never acquired again by this incarnation. `depth` counts the
+        # effects open on the thread holding the lock: an effect nested in
+        # the one in flight (promote -> ledger.acquire, publish -> reserve)
+        # finishes it; only a new top-level effect is refused.
         self.lock = threading.RLock()
         self.closed = False
+        self.depth = 0
 
     def acquire(self, db, now=None):
         """Take the service lease; False when another host holds it."""
@@ -105,9 +109,13 @@ class HostLease:
     def effect(self):
         """#3134: one train effect, under the held lease; refused once closed or lost."""
         with self.lock:
-            if self.closed or self.epoch is None:
+            if self.depth == 0 and (self.closed or self.epoch is None):
                 raise train.TrainError("train service lease released; stale train effect refused")
-            yield
+            self.depth += 1
+            try:
+                yield
+            finally:
+                self.depth -= 1
 
     def close(self, db, *, timeout=None):
         """#3134: fence every later effect, then release the lease.
