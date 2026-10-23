@@ -107,6 +107,8 @@ class HostReconcileTest(PgTestCase):
         self.assertLessEqual(event["data"]["first_fresh_ts"], event["data"]["fresh_ts"])
         self.assertGreater(event["data"]["first_fresh_ts"], event["data"]["lost_ts"])
         self.assertEqual(event["data"]["readings"], 3)
+        self.assertEqual(event["data"]["readings_since_loss"], 3)
+        self.assertEqual(event["data"]["suffix_start_ts"], event["data"]["first_fresh_ts"])
         self.assertEqual(event["data"]["checks"],
                          ["fresh_reading", "sustained_readings", "no_reading_gap",
                           "agents_home", "no_live_lease", "no_active_handoff",
@@ -144,6 +146,9 @@ class HostReconcileTest(PgTestCase):
         result = self.reconcile()
         self.assertTrue(result["reconciled"], result)
         self.assertEqual(result["evidence"]["readings"], 3)
+        self.assertEqual(result["evidence"]["readings_since_loss"], 4)
+        self.assertGreater(result["evidence"]["suffix_start_ts"],
+                           result["evidence"]["first_fresh_ts"])
         self.assertGreaterEqual(result["evidence"]["coverage_s"], 180)
 
     def test_coverage_is_measured_between_the_suffix_readings(self):

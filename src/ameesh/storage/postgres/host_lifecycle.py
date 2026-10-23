@@ -304,9 +304,13 @@ class HostLifecycle(interface.HostLifecycle):
                 "via": "returning",
                 "to": "available",
                 "lost_ts": lost_ts,
-                "first_fresh_ts": times[start],
+                # The issue measures the outage from the first reading after
+                # the loss; the stable suffix is the proof, not that start.
+                "first_fresh_ts": times[0],
+                "suffix_start_ts": times[start],
                 "fresh_ts": now["latest_ts"],
                 "readings": len(times) - start,
+                "readings_since_loss": len(times),
                 "coverage_s": covered,
                 "agents": [row["name"] for row in origins],
                 "checks": ["fresh_reading", "sustained_readings", "no_reading_gap",
