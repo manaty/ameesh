@@ -377,6 +377,29 @@ def _verdicts(cfg, db, row: dict, milestones: list, *, slug: str, base: str) -> 
     return ok, why, project
 
 
+def _required_ci(view: dict, required, project) -> dict:
+    """#3066 : la CI du paquet porte sur les exigences, pas le rollup entier.
+
+    Garder les noms exacts imposés par la forge et le projet, les statuts
+    requis par préfixe et la preuve du portier (#2876). `ready_pr` contrôle
+    ensuite leur présence, leur succès et leur provenance sur la tête gelée.
+    Un macOS facultatif en attente ou rouge ne retient pas la fusion.
+    """
+    from . import radar
+    names = {name for name, _app in fire._required_pairs(required)}
+    prefixes = radar.required_statuses(project, view.get("branch"))
+    rollup = []
+    for entry in view.get("rollup") or ():
+        context = (entry.get("__typename") == "StatusContext"
+                   or "state" in entry and "conclusion" not in entry)
+        name = entry.get("context" if context else "name") or ""
+        if (name in names or context and name.startswith(prefixes)
+                or entry.get("workflowName") == "paquet"
+                or name == "paquet (run proof unavailable)"):
+            rollup.append(entry)
+    return dict(view, rollup=rollup, ci="green" if radar.ci_green(rollup) else "pending")
+
+
 def open_carriers(db, app: str) -> list[int]:
     """Les porteurs ouverts du projet `app`."""
     st = storage.of(db).work
@@ -479,7 +502,8 @@ def _check_locked(cfg, db, lot: int, *, gh, dry_run: bool, actor: str,
         return dict(out, result="error", error=(
             "%s no longer enforces %s: nothing proves the CI the publication relied on, "
             "nothing merged" % (base, ", ".join(dropped) or "any required check")))
-    ok, why = fire.ready_pr(view, target=base, project=project, frozen=sha,
+    ok, why = fire.ready_pr(_required_ci(view, required, project),
+                            target=base, project=project, frozen=sha,
                             required=required, slug=slug, gh=gh)
     if not ok:
         return dict(out, result="pending", why=why)
