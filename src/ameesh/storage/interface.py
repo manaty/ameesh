@@ -4464,6 +4464,43 @@ class GithubWatch(Domain):
         """Persist or clear partial progress atomically with mailbox delivery."""
 
 
+class NotifyLiveness(Domain):
+    """#3007 : preuve partagée que le notificateur joint un humain.
+
+    Le seul notificateur à canaux peut tomber avec son poste ; les autres
+    hôtes lisent ces battements dans la base au lieu de conclure de leur
+    propre configuration. `human = '*'` dit que `notify.default` couvre tout
+    humain. Un battement est un fait d'hôte, jamais un secret : hôte,
+    `human:<id>` et instant.
+    """
+
+    @abc.abstractmethod
+    def beat(self, host: str, humans: Sequence[str], *,
+             now: float | None = None) -> int:
+        """Écrit (ou rafraîchit) un battement par humain couvert ; rend le
+        nombre de lignes. Une liste vide n'écrit rien."""
+
+    @abc.abstractmethod
+    def latest(self) -> list[dict]:
+        """Tous les battements connus — les périmés compris : l'appelant juge
+        la fraîcheur (`host`, `human`, `seen_ts`)."""
+
+    @abc.abstractmethod
+    def claim_brief(self, recipient: str, human: str, *, since: float,
+                    now: float | None = None) -> dict:
+        """Réclame atomiquement le brief de `(recipient, human)` si son dernier
+        envoi est plus ancien que `since` (epoch) ; rend
+        `{"claimed": bool, "previous_ts": float | None}`. `previous_ts` est
+        l'envoi précédent quand la réclamation est prise (None au premier), ce
+        qui permet d'écrire la relance. La transaction est terminée au retour :
+        l'appelant envoie ensuite le courrier, et `release_brief` le rend en
+        cas d'échec."""
+
+    @abc.abstractmethod
+    def release_brief(self, recipient: str, human: str) -> None:
+        """Rend une réclamation dont le courrier n'a pas pu être déposé."""
+
+
 class Storage(abc.ABC):
     """Les domaines du stockage, liés à une connexion ou une transaction."""
 
@@ -4487,6 +4524,7 @@ class Storage(abc.ABC):
     events: Events
     mailbox: Mailbox
     github_watch: GithubWatch
+    notify_liveness: NotifyLiveness
     wakeups: Wakeups
     keys: Keys
     approvals: Approvals

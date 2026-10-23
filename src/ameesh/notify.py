@@ -102,7 +102,7 @@ from dataclasses import dataclass, field
 
 from . import config as config_mod
 from . import db as db_mod
-from . import alert_briefs, exploitation, fil, sous_utilisation, storage
+from . import alert_briefs, exploitation, fil, notify_gap, sous_utilisation, storage
 from .config import Config
 from .platform import notify as platform_notify
 
@@ -251,6 +251,8 @@ TYPE_LABELS = {
     "host_power_low": "host battery low",
     "backlog_empty": "improvement backlog empty",
     "mail_undeliverable": "undeliverable mail",
+    # #3007: cet hôte n'a aucune route pour l'humain — rien ne lui est poussé
+    "notify_undeliverable": "human not reachable by the notifier",
     "decision_pending": "decision pending",
     "decision_overdue": "decision unanswered by its deadline",
     "host_unavailable": "host unavailable",
@@ -1228,6 +1230,17 @@ class Notifier:
         from .mediated_executor import availability
         selected = self.only if only is None else _only_set(only)
         now = float(self.clock())
+        # #3007 : ce passage prouve, pour tout le maillage, que CE notificateur
+        # joint ses humains. Un poste sain ne lève donc plus d'alerte de voie
+        # depuis les VM ; son silence, lui, se voit partout. Le battement précède
+        # la passe restreinte d'une minuterie de rôle (#3057) : il prouve le
+        # notificateur, pas le périmètre observé.
+        if db is not None and not self.dry_run:
+            try:
+                notify_gap.beat(self.cfg, db, self.ncfg, now=now)
+            except Exception as exc:  # noqa: BLE001 — un battement ne fait pas le passage
+                self.log("[%s] heartbeat not recorded (%s)"
+                         % (notify_gap.GAP_TYPE, exc))
         if selected is not None and "alerts" not in selected:
             return self._run_tail(db, now, selected)
         observed_ts = storage.of(db).alert_acknowledgements.clock() if db is not None else None
@@ -1820,7 +1833,12 @@ class Notifier:
         puis remet à qui est revenu. Indépendant de `notify.types` (qui ne règle
         que l'humain). Jamais fatal au passage."""
         sent = self.state["briefs"]
-        alive = {key_of(a): a for a in current if a.get("type") in alert_briefs.BRIEFED_TYPES}
+        # #3007 : le brief de `notify_undeliverable` dépend de la vie de CE
+        # notificateur ; c'est `notify_gap.brief_once`, au ménage du runner,
+        # qui le porte hors du poste (aucune duplication : réclamation en base).
+        alive = {key_of(a): a for a in current
+                 if a.get("type") in alert_briefs.BRIEFED_TYPES
+                 and a.get("type") not in alert_briefs.NOTIFIER_EXCLUDED}
         open_lots = None
         for key in list(sent):
             if key not in alive:
@@ -2798,8 +2816,11 @@ def cmd_test(cfg: Config, ncfg: NotifyConfig, args) -> int:
         print("ameesh notify --test: `human:<id>` expected", file=sys.stderr)
         return 2
     if not ncfg.channels_for(human):
-        print("ameesh notify --test: no channel for %s (notify.routes, notify.default)"
-              % human, file=sys.stderr)
+        print("ameesh notify --test: no channel for %s (notify.routes, notify.default) — "
+              "this host cannot push anything to that human (no decision, no alert); "
+              "restore the notifier on the host that holds the routes, or configure a "
+              "fallback route on a healthy host (docs/EXPLOITATION.md, "
+              "\"Alertes poussées\")" % human, file=sys.stderr)
         return 2
     results = send_test(ncfg, human, cfg.host)
     for name, error in results:
