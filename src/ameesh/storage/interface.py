@@ -2644,6 +2644,24 @@ class Canon(Domain):
         que la réclamation depuis cet hôte soit jugée sur SA politique."""
 
     @abc.abstractmethod
+    def candidate_names(self, host: str, canon: str = "") -> list[str]:
+        """L165 (EP1) : noms des agents qui ont un verdict de candidat sur
+        `host`, pour que le sync de CET hôte voie aussi les fiches retirées
+        dont la ligne est encore chez un autre détenteur."""
+
+    @abc.abstractmethod
+    def close_candidates(self, name: str, *, canon: str, diagnostic: str) -> None:
+        """L165 (EP1) : ferme TOUS les verdicts candidats d'un agent dont la
+        fiche est en erreur (responsable non résolu, candidat non admis…),
+        quel que soit l'hôte qui l'a constaté. Laisse `releve` intact ; une
+        synchronisation ultérieure rouvrira les hôtes valides."""
+
+    @abc.abstractmethod
+    def clear_candidate(self, name: str, host: str, *, canon: str) -> None:
+        """L165 (EP1) : retire le verdict candidat de `name` sur `host` (hôte
+        qui n'est plus admis), sans toucher aux autres candidats."""
+
+    @abc.abstractmethod
     def clear_responsible(self, name: str, host: str,
                           owner: tuple[str, bool] | None = None) -> None:
         """Vide le responsable d'un agent non éphémère de l'hôte ; `owner`
@@ -2691,11 +2709,15 @@ class Canon(Domain):
 
     @abc.abstractmethod
     def stop_removed(self, name: str, host: str, *, pending_text: str,
-                     stop_text: str, owner: tuple[str, bool] | None = None) -> dict | None:
+                     stop_text: str, owner: tuple[str, bool] | None = None,
+                     expected_lease_epoch: int | None = None) -> dict | None:
         """Arrête un agent retiré du canon (sauf en plein tour : arrêt demandé) ;
         rend name et status, ou None s'il n'y avait rien à faire. `owner` (L42) :
         (id, défaut) du canon auquel la ligne doit appartenir — jamais celle
-        d'un autre canon."""
+        d'un autre canon. `expected_lease_epoch` (L165) : le retrait constaté
+        sur un AUTRE hôte que celui de la ligne ne s'applique que si le bail
+        n'a pas changé depuis la lecture (aucune réclamation concurrente
+        n'est tuée)."""
 
 
 class Ephemerals(Domain):

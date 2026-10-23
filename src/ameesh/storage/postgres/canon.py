@@ -363,6 +363,28 @@ class Canon(interface.Canon):
             (name, host, canon, cwd, ok, diagnostic or "", ref,
              host, harness, provider, model, credential_mode))
 
+    def candidate_names(self, host, canon="") -> list[str]:
+        rows = self.db.query(
+            "SELECT name FROM agent_candidates WHERE host = %s AND canon = %s"
+            " ORDER BY name", (host, canon))
+        return [row["name"] for row in rows]
+
+    def close_candidates(self, name, *, canon, diagnostic) -> None:
+        self.db.execute(
+            """
+            UPDATE agent_candidates
+               SET placement_ok = false, placement_diagnostic = %s,
+                   updated_at = now()
+             WHERE name = %s AND canon = %s
+               AND (placement_ok IS DISTINCT FROM false
+                    OR placement_diagnostic IS DISTINCT FROM %s)
+            """, (diagnostic, name, canon, diagnostic))
+
+    def clear_candidate(self, name, host, *, canon) -> None:
+        self.db.execute(
+            "DELETE FROM agent_candidates WHERE name = %s AND host = %s AND canon = %s",
+            (name, host, canon))
+
     def clear_responsible(self, name, host, owner=None) -> None:
         guard, params = _owner(owner)
         self.db.execute(
@@ -482,8 +504,11 @@ class Canon(interface.Canon):
         return rows[0] if rows else None
 
     def stop_removed(self, name, host, *, pending_text, stop_text,
-                     owner=None) -> dict | None:
+                     owner=None, expected_lease_epoch=None) -> dict | None:
         guard, params = _owner(owner)
+        epoch, epoch_params = "", ()
+        if expected_lease_epoch is not None:
+            epoch, epoch_params = " AND lease_epoch = %s", (expected_lease_epoch,)
         stopped = self.db.query(
             """
             UPDATE agent_registry
@@ -496,10 +521,10 @@ class Canon(interface.Canon):
                    stop_reason = 'retire_du_canon',
                    updated_at = now()
              WHERE name = %s AND host = %s AND status <> 'stopped'
-               AND NOT ephemeral AND canon_ref IS NOT NULL __OWNER__
+               AND NOT ephemeral AND canon_ref IS NOT NULL __EPOCH__ __OWNER__
             RETURNING name, status
-            """.replace("__OWNER__", guard),
-            (pending_text, stop_text, name, host) + params,
+            """.replace("__EPOCH__", epoch).replace("__OWNER__", guard),
+            (pending_text, stop_text, name, host) + epoch_params + params,
         )
         return stopped[0] if stopped else None
 

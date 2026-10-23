@@ -164,6 +164,47 @@ class ElectionSyncTest(test_canon._CanonDbCase):
         self.assertIsNone(registry.claim(self.db, "relecteur", "runner-banc", 600, host="banc"))
         self.assertIn("relecteur", [r["name"] for r in registry.claimable(self.db, "atelier")])
 
+    def test_fiche_invalide_ferme_le_secours_meme_si_le_detenteur_ne_synchronise_pas(self):
+        self.sync("atelier")
+        self.sync("banc")
+        # le responsable ne résout plus : la fiche est fautive partout, pas
+        # seulement sur l'hôte qui la relit.
+        write(self.root, "agents/relecteur.md", election_agent(responsible="human:inconnu"))
+        self.sync("banc")
+        self.assertIsNone(self.row("relecteur")["responsible"])
+        self.assertEqual({row["placement_ok"] for row in self.candidates().values()}, {False})
+        self.assertNotIn("relecteur", [r["name"] for r in registry.claimable(self.db, "banc")])
+        self.assertIsNone(registry.claim(self.db, "relecteur", "runner-banc", 600, host="banc"))
+
+    def test_fiches_retirees_ferment_le_secours_depuis_un_autre_candidat(self):
+        self.sync("atelier")
+        self.sync("banc")
+        write(self.root, "agents/relecteur.md", None)
+        write(self.root, "placements/relecteur-atelier.md", None)
+        self.sync("banc")
+        self.assertEqual(self.candidates(), {})
+        row = self.row("relecteur")
+        self.assertEqual((row["releve"], row["status"]), ("hote", "stopped"))
+        self.assertNotIn("relecteur", [r["name"] for r in registry.claimable(self.db, "banc")])
+        self.assertIsNone(registry.claim(self.db, "relecteur", "runner-banc", 600, host="banc"))
+        self.assertNotIn("relecteur", [r["name"] for r in registry.claimable(self.db, "atelier")])
+
+    def test_placement_retire_ferme_les_candidats_sans_arret_du_detenteur(self):
+        self.sync("atelier")
+        self.sync("banc")
+        write(self.root, "placements/relecteur-atelier.md", None)
+        self.sync("banc")
+        self.assertEqual({row["placement_ok"] for row in self.candidates().values()}, {False})
+        self.assertIsNone(registry.claim(self.db, "relecteur", "runner-banc", 600, host="banc"))
+
+    def test_retrait_croise_ne_tue_pas_un_bail_change_depuis_la_lecture(self):
+        self.sync("atelier")
+        row = self.row("relecteur")
+        self.assertIsNone(storage.of(self.db).canon.stop_removed(
+            "relecteur", row["host"], pending_text="p", stop_text="s",
+            expected_lease_epoch=int(row["lease_epoch"]) + 1))
+        self.assertNotEqual(self.row("relecteur")["status"], "stopped")
+
     def test_pas_de_preuve_source_l232e(self):
         self.sync("atelier")
         self.sync("banc")

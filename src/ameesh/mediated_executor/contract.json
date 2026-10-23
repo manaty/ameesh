@@ -4571,9 +4571,12 @@
     "put"
    ],
    "canon": [
+    "candidate_names",
     "claim_commit",
+    "clear_candidate",
     "clear_pending_stop",
     "clear_responsible",
+    "close_candidates",
     "close_others",
     "flag_default",
     "host_rows",
