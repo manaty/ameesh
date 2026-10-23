@@ -1112,6 +1112,7 @@ class CostBook:
             except OSError:
                 # Journal sauté : sa date reste une borne de ce qu'il a pu
                 # observer (#3122).
+                truncated = True
                 unread(read_at)
                 continue
             readings.extend(sample)

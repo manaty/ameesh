@@ -96,6 +96,32 @@ class UnreadBoundTest(Sandbox, unittest.TestCase):
         self.assertIn("incomplete Codex account reading", result.reason)
         self.assertIn("short window", result.reason)
 
+    def test_an_unreadable_journal_below_the_file_limit_prevents_rest(self):
+        # Deux journaux suffisent : l'échec de lecture doit rendre le relevé
+        # incomplet même quand recent_files a pu retenir tous les fichiers.
+        sessions, profile = self._declared("team")
+        journal(sessions, "team-rest",
+                team_event(self.now - 11 * HOUR, short=6, week=6),
+                mtime=self.now - 11 * HOUR)
+        broken = journal(
+            sessions, "illisible",
+            team_event(self.now - 60, short=100, week=50,
+                       short_reset=self.now + HOUR),
+            mtime=self.now - 60)
+        real_read = codex_gauges._read_journal_tail
+
+        def read(path, *args, **kwargs):
+            if path == broken:
+                raise OSError("journal illisible")
+            return real_read(path, *args, **kwargs)
+
+        with mock.patch.object(codex_gauges, "_read_journal_tail", side_effect=read):
+            result = self._evaluate(profile)
+
+        self.assertFalse(result.ok)
+        self.assertTrue(result.hard)
+        self.assertIn("short window", result.reason)
+
     def test_an_unreadable_journal_prevents_rest(self):
         # Le journal est dans l'échantillon mais sa lecture échoue : sa date
         # reste une borne dans la fenêtre courte, le repos n'est pas prouvé.
