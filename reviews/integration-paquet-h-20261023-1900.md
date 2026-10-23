@@ -62,6 +62,13 @@ battement de #3007 **après** le retour restreint de #3057, avec le témoin
 `test_une_passe_restreinte_ne_bat_pas` ; le gel et la suite complète portent
 sur la tête qui la contient.
 
+Correction après CI rouge : la suite de `23046acde` a signalé deux classements
+croisés, corrigés sans code produit. `tests/test_cluster.py` ferme aux rôles
+superviseur les tables `notify_liveness` et `notify_briefs` de `0474` (#3007) ;
+`tests/test_l159f_host_gate.py` donne `placements=[]` au faux canon du sync
+partiel, que `refresh_host_limits` parcourt pour les admissions épinglées
+(#3101). Aucun GRANT modifié ; la nouvelle tête porte sa propre suite complète.
+
 ## Résolutions de composition
 
 **#3007 × main** (`7a9c2d855`, corrigé par `6234551d4`) : `notify.py` garde la

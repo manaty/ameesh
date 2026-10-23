@@ -180,6 +180,12 @@ FERMEES = {
     # détenteur, relue par l'exécuteur au redémarrage ; état interne fermé aux
     # deux rôles superviseur, aucun GRANT modifié.
     "role_handover": {"host", "name", "challenger", "released_until", "updated_at"},
+    # #3007 (0474) : battement partagé du notificateur et réclamation des
+    # briefs par (destinataire, humain). État interne lu par l'exécuteur, les
+    # alertes et les décisions, pas par le rôle superviseur ; tables fermées
+    # aux deux rôles, aucun GRANT modifié.
+    "notify_liveness": {"host", "human", "seen_at"},
+    "notify_briefs": {"recipient", "human", "sent_at"},
 }
 #: L232b (0417) : l'état interne du contrôleur de release reste hors contrat,
 #: sauf `host_release_fences.host`, lu par `ameesh_host_gate_state` (l.314).
