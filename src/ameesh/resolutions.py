@@ -270,16 +270,63 @@ def _empty_files(objects: str, git_dir: str | None) -> list[str]:
     return sorted(found)
 
 
+def _move_ref(source: str, target: str) -> str:
+    """Déplace la ref libre `source` vers `target` sous le verrou de Git
+    (`<ref>.lock` créé en O_EXCL, comme `update-ref`) : aucun écrivain ne
+    peut la remplacer entre la relecture de sa taille et le déplacement. Rend
+    pourquoi elle reste en place, vide si elle a été déplacée."""
+    lock = source + ".lock"
+    try:
+        fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+    except FileExistsError:
+        return "a git writer holds %s" % lock
+    try:
+        if os.lstat(source).st_size != 0:
+            return "no longer empty"
+        os.rename(source, target)
+        return ""
+    finally:
+        os.close(fd)
+        os.unlink(lock)
+
+
+def _move_object(source: str, target: str) -> str:
+    """Déplace l'objet libre `source` vers `target`, puis relit ce qui a été
+    déplacé : un écrivain qui l'aurait remplacé entre-temps par un objet
+    complet (`core.createObject=rename`) le retrouve aussitôt à son chemin,
+    remis par un lien qui n'écrase rien. Git ne remplace jamais un objet
+    existant par défaut (`link()`, EEXIST = présent) : la fenêtre ne s'ouvre
+    qu'avec ce réglage. Rend pourquoi l'objet reste en place, vide s'il a été
+    déplacé."""
+    if os.lstat(source).st_size != 0:
+        return "no longer empty"
+    os.rename(source, target)
+    if os.lstat(target).st_size == 0:
+        return ""
+    try:
+        os.link(target, source)
+    except FileExistsError:
+        # un autre écrivain l'a déjà réécrit : la copie déplacée reste en
+        # quarantaine (rien n'est supprimé), le chemin porte un objet
+        return "replaced concurrently, rewritten again at its path; copy kept in %s" % target
+    os.unlink(target)
+    return "replaced concurrently, restored at its path"
+
+
 def quarantine_empty(path: str) -> list[str]:
     """#3181 : déplace les objets libres de 0 octet du clone `path` et de ses
     alternates, et ses refs libres de 0 octet, vers
-    `<.git>/ameesh-quarantine/<date UTC>/` du dépôt qui les portait.
+    `<.git>/ameesh-quarantine/<date UTC>-<unique>/` du dépôt qui les portait.
 
     Un fichier vide n'est jamais un objet ni une ref valides : c'est le reste
     d'une écriture coupée (coupure de courant), que Git prend pour un objet
     présent et ne redemande pas. Rien n'est supprimé, aucun fichier non vide
-    n'est touché, ni `gc` ni `prune`. Chaque déplacement est journalisé
-    (`moved.log` de la quarantaine, et stderr). Rend les chemins déplacés."""
+    n'est déplacé, ni `gc` ni `prune` : une ref est relue sous son verrou Git
+    (`_move_ref`), un objet relu après déplacement et remis s'il ne l'était
+    plus (`_move_object`). Chaque appel a son propre dossier de quarantaine :
+    deux passes de la même seconde n'écrasent aucune preuve. Chaque
+    déplacement (ou refus) est journalisé (`moved.log` de la quarantaine, et
+    stderr). Rend les chemins déplacés."""
     common = plan_git._out(path, "rev-parse", "--path-format=absolute", "--git-common-dir")
     if not common or not os.path.isdir(common):
         return []
@@ -288,22 +335,36 @@ def quarantine_empty(path: str) -> list[str]:
     moved: list[str] = []
     for objects in _object_dirs(os.path.join(common, "objects")):
         git_dir = os.path.dirname(objects)
-        for source in _empty_files(objects, common if git_dir == common else None):
-            relative = os.path.relpath(source, git_dir)
-            target = os.path.join(git_dir, QUARANTINE_DIR, stamp, relative)
+        found = _empty_files(objects, common if git_dir == common else None)
+        if not found:
+            continue
+        try:
+            os.makedirs(os.path.join(git_dir, QUARANTINE_DIR), exist_ok=True)
+            box = tempfile.mkdtemp(prefix=stamp + "-", dir=os.path.join(git_dir, QUARANTINE_DIR))
+        except OSError as exc:
+            print("ameesh: #3181 cannot open a quarantine in %s: %s" % (git_dir, exc),
+                  file=sys.stderr)
+            continue
+        refs = os.path.join(git_dir, "refs") + os.sep
+        for source in found:
+            target = os.path.join(box, os.path.relpath(source, git_dir))
             try:
                 os.makedirs(os.path.dirname(target), exist_ok=True)
-                os.rename(source, target)
-                with open(os.path.join(git_dir, QUARANTINE_DIR, stamp, "moved.log"),
-                          "a", encoding="utf-8") as log:
-                    log.write("%s -> %s\n" % (source, target))
+                move = _move_ref if source.startswith(refs) else _move_object
+                kept = move(source, target)
             except OSError as exc:
-                print("ameesh: #3181 cannot quarantine empty %s: %s" % (source, exc),
-                      file=sys.stderr)
-                continue
-            print("ameesh: #3181 quarantined empty %s -> %s" % (source, target),
-                  file=sys.stderr)
-            moved.append(source)
+                kept = "error: %s" % exc
+            line = ("%s -> %s" % (source, target) if not kept
+                    else "%s left in place: %s" % (source, kept))
+            try:
+                with open(os.path.join(box, "moved.log"), "a", encoding="utf-8") as log:
+                    log.write(line + "\n")
+            except OSError:
+                pass
+            print("ameesh: #3181 %s %s" % ("quarantined empty" if not kept else "not moved",
+                                           line), file=sys.stderr)
+            if not kept:
+                moved.append(source)
     return moved
 
 

@@ -19,6 +19,7 @@ import shutil
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 
 from ameesh import merge_queue, resolutions
 
@@ -161,6 +162,94 @@ class CorruptedCloneTest(unittest.TestCase):
         self.assertEqual(resolutions.quarantine_empty(self.clone.path), [])
         self.assertTrue(os.path.isfile(os.path.join(
             self.agents, ".git", "objects", tip[:2], tip[2:])))
+
+    def empty_ref(self, name: str) -> str:
+        ref = os.path.join(self.clone.path, ".git", "refs", "remotes", "origin", name)
+        os.makedirs(os.path.dirname(ref), exist_ok=True)
+        open(ref, "w").close()
+        return ref
+
+    def test_a_ref_made_valid_after_discovery_stays_in_place(self):
+        # B1 (relecture) : la ref est vue vide au scan, puis `update-ref`
+        # l'écrit avant le déplacement ; relue sous son verrou, elle reste.
+        ref = self.empty_ref("course")
+        main = _git(self.agents, "rev-parse", "main")
+        real = resolutions._empty_files
+
+        def scan_then_write(objects, git_dir):
+            found = real(objects, git_dir)
+            if ref in found:
+                # l'écriture de Git : `<ref>.lock` puis renommage (update-ref
+                # refuse une ref vide, le banc écrit comme lui)
+                with open(ref + ".lock", "w", encoding="utf-8") as handle:
+                    handle.write(main + "\n")
+                os.rename(ref + ".lock", ref)
+            return found
+        with mock.patch.object(resolutions, "_empty_files", side_effect=scan_then_write):
+            self.assertEqual(resolutions.quarantine_empty(self.clone.path), [])
+        with open(ref, encoding="utf-8") as handle:
+            self.assertEqual(handle.read().strip(), main)
+        self.assertFalse(os.path.exists(ref + ".lock"))
+
+    def test_a_ref_locked_by_a_git_writer_is_not_moved(self):
+        ref = self.empty_ref("verrou")
+        open(ref + ".lock", "w").close()
+        self.assertEqual(resolutions.quarantine_empty(self.clone.path), [])
+        self.assertTrue(os.path.exists(ref))
+        self.assertTrue(os.path.exists(ref + ".lock"))  # le verrou d'autrui reste
+
+    def test_an_object_made_valid_after_discovery_stays_in_place(self):
+        tip = self.publish("lot/d")
+        obj = _loose(self.agents, tip)
+        with open(obj, "rb") as handle:
+            valid = handle.read()
+        open(obj, "w").close()
+        real = resolutions._empty_files
+
+        def scan_then_write(objects, git_dir):
+            found = real(objects, git_dir)
+            if obj in found:
+                with open(obj, "wb") as handle:
+                    handle.write(valid)
+            return found
+        with mock.patch.object(resolutions, "_empty_files", side_effect=scan_then_write):
+            self.assertEqual(resolutions.quarantine_empty(self.clone.path), [])
+        with open(obj, "rb") as handle:
+            self.assertEqual(handle.read(), valid)
+
+    def test_an_object_replaced_during_the_move_is_restored(self):
+        # l'écrivain (`core.createObject=rename`) remplace l'objet vide entre
+        # la relecture et le déplacement : l'objet complet revient à son chemin
+        tip = self.publish("lot/e")
+        obj = _loose(self.agents, tip)
+        with open(obj, "rb") as handle:
+            valid = handle.read()
+        open(obj, "w").close()
+        real_rename = os.rename
+
+        def replace_then_rename(source, target):
+            if source == obj:
+                fresh = obj + ".tmp_obj_banc"
+                with open(fresh, "wb") as handle:
+                    handle.write(valid)
+                real_rename(fresh, obj)
+            return real_rename(source, target)
+        with mock.patch("os.rename", side_effect=replace_then_rename):
+            self.assertEqual(resolutions.quarantine_empty(self.clone.path), [])
+        with open(obj, "rb") as handle:
+            self.assertEqual(handle.read(), valid)
+        _git(self.agents, "cat-file", "-e", tip)
+
+    def test_two_quarantines_in_the_same_second_keep_both_proofs(self):
+        first = self.empty_ref("une")
+        with mock.patch.object(resolutions.time, "strftime", return_value="20261023T152000Z"):
+            self.assertEqual(resolutions.quarantine_empty(self.clone.path), [first])
+            self.empty_ref("une")
+            self.assertEqual(resolutions.quarantine_empty(self.clone.path), [first])
+        proofs = self.quarantined(os.path.join(self.clone.path, ".git"))
+        self.assertEqual(len([p for p in proofs if p.endswith("refs/remotes/origin/une")]), 2,
+                         proofs)
+        self.assertEqual(len([p for p in proofs if p.endswith("moved.log")]), 2, proofs)
 
     def test_an_unreachable_forge_still_says_remote(self):
         _git(self.agents, "remote", "set-url", "origin", os.path.join(self.tmp, "absent.git"))
