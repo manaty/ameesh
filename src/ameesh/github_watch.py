@@ -213,11 +213,15 @@ def collect_batch(api, sub, since, now, scan):
     previous page, one earlier page is read; if it is still absent, the scan
     restarts at page 1 with the same ``since`` (durable digests make replay
     harmless). A full page with no settled row is recent and skipped within
-    the pass; the cursor is not committed there. Before ending the stream or
-    advancing ``since``, every skipped page is re-read last-to-first: a
-    settled row has a final key, so it cannot move forward, but lagging keys
-    catching up ahead of it can push it back into a page already skipped.
-    Only a surely indexed row past U, or the end of the list, ends the stream.
+    the pass; the cursor is not committed there. A page that still holds a
+    deferred row keeps its keys live too, even when it is accepted with an
+    anchor: a settled row from a later page can recede into it once those keys
+    catch up (B11). Before ending the stream or advancing ``since``, every page
+    from the first page that held a deferred row through the last page read is
+    re-read last-to-first: a settled row has a final key, so it cannot move
+    forward, but lagging keys catching up ahead of it can push it back into an
+    earlier page. Only a surely indexed row past U, or the end of the list,
+    ends the stream.
     """
     lag = getattr(sub, "index_lag", INDEX_LAG)
     if scan is not None:
@@ -229,8 +233,18 @@ def collect_batch(api, sub, since, now, scan):
             # under the new model instead of trusting partial snapshots.
             state.update(page=1, settled=state["until"] - lag)
             for key in ("snap_prev", "snap_cur", "boundary", "boundary_since",
-                        "last", "replayed"):
+                        "last", "replayed", "recheck", "recheck_pages",
+                        "recheck_from", "recheck_to"):
                 state.pop(key, None)
+        if "recheck_from" not in state:
+            # Checkpoint written before B11: the old list only named skipped
+            # pages. Migrate it to the contiguous range, or nothing was to be
+            # rechecked.
+            old_pages = [int(page) for page in state.pop("recheck_pages", []) or []]
+            if old_pages:
+                state["recheck_from"] = min(old_pages)
+                state["recheck_to"] = max([int(state.get("page", 1)) - 1]
+                                          + old_pages)
     else:
         state = dict(since=since, window_since=since, until=now,
                      settled=now - lag, kind="issue", page=1)
@@ -303,19 +317,30 @@ def collect_batch(api, sub, since, now, scan):
         return found
 
     while True:
-        # #2955 B10: a page with no settled row is skipped, but a settled row
-        # can later recede into it when lagging keys catch up ahead of it.
-        # Re-read every skipped page before ending the stream or advancing
-        # `since`: the row cannot move forward (its key is final) and the
-        # durable digest makes a duplicate harmless. Descending order keeps
-        # the recheck safe while other keys catch up: a row that recedes again
-        # moves to a page still to be re-read, never past one already read.
+        # #2955 B10/B11: a page with deferred rows has live keys, so a settled
+        # row from a later page can recede into it when those keys catch up
+        # (whether the page was skipped or accepted with an anchor). Re-read
+        # every page from the first such page through the last one read before
+        # ending the stream or advancing `since`: the row cannot move forward
+        # (its key is final) and the durable digest makes a duplicate harmless.
+        # Descending order keeps the recheck safe while other keys catch up: a
+        # row that recedes again moves to a page still to be re-read, never
+        # past one already read.
         if state.get("recheck"):
             recheck = state["recheck"]
-            pages = list(reversed(recheck.get("pages") or []))
             index = recheck.get("index", 0)
-            if index < len(pages):
-                rows = read(pages[index])
+            pages = recheck.get("pages")
+            if pages is not None:
+                # Checkpoint written before B11: a list of skipped pages.
+                pages = list(reversed(pages))
+                page = pages[index] if index < len(pages) else None
+            else:
+                first = int(recheck.get("from") or 0)
+                last = int(recheck.get("to") or 0)
+                page = (last - index if first and index <= last - first
+                        else None)
+            if page is not None:
+                rows = read(page)
                 events.extend(events_from(
                     sub, state["kind"], [row for row in rows if inside(row)]))
                 recheck["index"] = index + 1
@@ -325,6 +350,8 @@ def collect_batch(api, sub, since, now, scan):
             then = recheck.get("then")
             state.pop("recheck", None)
             state.pop("recheck_pages", None)
+            state.pop("recheck_from", None)
+            state.pop("recheck_to", None)
             if then == "resume":
                 state["since"] = max(state["since"],
                                      state["last_settled"] - 1)
@@ -345,6 +372,15 @@ def collect_batch(api, sub, since, now, scan):
         rows = read(state["page"])
         full = len(rows) == PAGE_SIZE
         settled_rows = [row for row in rows if inside(row)]
+        # #2955 B11: any page holding a deferred row has live keys. A settled
+        # row from a later page can recede into it (or into a page between it
+        # and the reader), so the recheck starts at the first such page and
+        # covers every page up to the last one read.
+        if len(settled_rows) < len(rows):
+            first = state.get("recheck_from")
+            state["recheck_from"] = state["page"] if first is None else min(
+                first, state["page"])
+        state["recheck_to"] = state["page"]
 
         # A row is surely indexed once its stamp is at least INDEX_LAG old at
         # this read: its key is then its stamp. If such a row is past U, every
@@ -364,16 +400,16 @@ def collect_batch(api, sub, since, now, scan):
             # budget at a safe timestamp position (never at a page offset,
             # which keys that catch up can invalidate) and keep the cursor.
             state["blank"] = state.get("blank", 0) + 1
-            state.setdefault("recheck_pages", []).append(state["page"])
             state["page"] += 1
             progressed = (state.get("last_settled") is not None
                           and state["last_settled"] != settled_at_start)
             if progressed and calls >= PAGES_PER_TICK:
-                if state.get("recheck_pages"):
+                if state.get("recheck_from") is not None:
                     state["recheck"] = {
-                        "pages": list(state.pop("recheck_pages")),
+                        "from": state["recheck_from"],
+                        "to": state["recheck_to"],
                         "index": 0, "then": "resume"}
-                    continue
+                    return events, state, settled
                 # A settled row accepted in this pass is the proof needed to
                 # resume safely: keep it as a timestamp position, never a page
                 # offset that later key catch-up can invalidate.
@@ -414,6 +450,8 @@ def collect_batch(api, sub, since, now, scan):
                     state["page"] = 1
                     state.pop("snap_prev", None)
                     state.pop("recheck_pages", None)
+                    state.pop("recheck_from", None)
+                    state.pop("recheck_to", None)
                     state["blank"] = 0
                     return events, state, settled
                 recovered = recovered_rows(previous, snapshot, position)
@@ -440,10 +478,13 @@ def collect_batch(api, sub, since, now, scan):
 
         if stop_after or not full:
             then = "comments" if state["kind"] == "issue" else "done"
-            if state.get("recheck_pages"):
+            if state.get("recheck_from") is not None:
                 state["recheck"] = {
-                    "pages": list(state.pop("recheck_pages")),
+                    "from": state["recheck_from"],
+                    "to": state["recheck_to"],
                     "index": 0, "then": then}
+                if calls >= PAGES_PER_TICK:
+                    return events, state, settled
                 continue
             if then == "comments":
                 state.update(kind="comment", page=1, since=state["window_since"],
