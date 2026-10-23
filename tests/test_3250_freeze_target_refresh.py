@@ -85,6 +85,28 @@ class TargetRefreshTest(unittest.TestCase):
         with self.assertRaisesRegex(review_target.TargetError, "cannot refresh target"):
             review_target.resolve(self.reader.root, "develop")
 
+    def test_repository_without_remotes_uses_its_local_target_without_fetching(self):
+        self.reader.git("remote", "remove", "origin")
+        self.reader.git("update-ref", "refs/heads/develop", self.base)
+        with mock.patch.object(canon, "_git", wraps=canon._git) as git:
+            for ref in ("develop", "refs/heads/develop"):
+                for fetch in (True, False):
+                    with self.subTest(ref=ref, fetch=fetch):
+                        self.assertEqual(review_target.resolve(self.reader.root, ref,
+                                                               fetch=fetch), self.base)
+        self.assertFalse(any("fetch" in call.args for call in git.call_args_list))
+
+    def test_repository_without_remotes_still_refuses_an_unreadable_target(self):
+        self.reader.git("remote", "remove", "origin")
+        with self.assertRaisesRegex(review_target.TargetError, "not an exact commit"):
+            review_target.resolve(self.reader.root, "missing")
+
+    def test_unreadable_remotes_are_not_treated_as_a_repository_without_remotes(self):
+        self.reader.git("update-ref", "refs/heads/develop", self.base)
+        with mock.patch.object(canon, "_git_out", return_value=None):
+            with self.assertRaisesRegex(review_target.TargetError, "cannot read remotes"):
+                review_target.resolve(self.reader.root, "develop")
+
     def test_transaction_never_fetches_or_accepts_an_uncertified_branch(self):
         with mock.patch.object(canon, "_git", wraps=canon._git) as git:
             with self.assertRaisesRegex(review_target.TargetError, "outside the freeze"):
