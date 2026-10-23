@@ -281,7 +281,12 @@ class Agents(Domain):
     @abc.abstractmethod
     def claimable(self, host: str, names: Sequence[str] | None, *,
                   require_responsible: bool) -> list[dict]:
-        """Agents de l'hôte sans bail vivant, réclamables (mêmes règles que `claim`)."""
+        """Agents de l'hôte sans bail vivant, réclamables (mêmes règles que `claim`).
+
+        L165 (EP3) : pour un agent `releve: election` rendu sur un hôte
+        candidat, `host` est l'hôte qui réclame et `previous_host` l'hôte de la
+        ligne (l'ancien détenteur, ou l'hôte de la dernière synchronisation) ;
+        `session_id` est encore la session de cet ancien détenteur."""
 
     @abc.abstractmethod
     def runner_seen(self, host: str, owner: str, names: Sequence[str] | None) -> None:
@@ -370,12 +375,21 @@ class Leases(Domain):
 
     @abc.abstractmethod
     def claim(self, name: str, owner: str, ttl_seconds: float, *,
-              require_responsible: bool, host: str | None = None) -> dict | None:
+              require_responsible: bool, host: str | None = None,
+              election_brief: str | None = None) -> dict | None:
         """Prend le bail s'il est libre ou expiré ; rend la ligne, sinon None.
 
         `host` (L165, EP1) : l'hôte qui réclame, pour un agent
         `releve: election`. None : l'hôte de la ligne (comportement d'un agent
-        épinglé). Le serveur médié force cet argument à l'hôte de l'exécuteur."""
+        épinglé). Le serveur médié force cet argument à l'hôte de l'exécuteur.
+
+        `election_brief` (L165, EP3) : appliqué seulement sur une relève
+        croisée d'un agent élu (la ligne était chez un autre hôte) — la même
+        instruction oublie la session de l'ancien hôte, laisse son compte au
+        choix de cet hôte et écrit le brief comme résumé de la session neuve.
+        Ignoré sur le même hôte et pour un agent `hote`. Une relève croisée
+        SANS brief est **refusée** (le CAS ne déplace pas la ligne), cas d'un
+        exécuteur médié (contrat 1.9 : valeur forcée à null côté appareil)."""
 
     @abc.abstractmethod
     def attach_claim(self, name: str, owner: str, ttl_seconds: float, *,
