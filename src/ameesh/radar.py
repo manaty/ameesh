@@ -1640,6 +1640,15 @@ CI_INCONCLUSIVE = frozenset(("SKIPPED", "NEUTRAL", "CANCELLED", "TIMED_OUT",
 CI_INCONCLUSIVE_STATES = frozenset(("ERROR",))
 
 
+def nonconclusive_source(app: str, entry: str) -> str:
+    """#3209 : la clé du lot de correction d'un check non concluant — l'app
+    et le **nom du check**, sans l'état consigné (`tests (CANCELLED)` →
+    `tests`) ni la tête : le même check au paquet suivant ou à la release
+    retrouve le lot encore ouvert (`work.add_or_note`)."""
+    name = re.sub(r"\s*\([^()]*\)\s*$", "", str(entry or "")).strip()
+    return "nonconclusive:%s:%s" % (app, name or str(entry or "").strip())
+
+
 def conclusion_result(status, conclusion) -> str:
     """#3085 : classe un run ou un check brut (`status`, `conclusion`, casse
     libre) en `green` / `negative` / `inconclusive` / `waiting`.
@@ -1736,6 +1745,34 @@ def packet_proof_entries(rollup) -> list:
     return out
 
 
+#: #3209 : les jobs du portier `paquet` (.github/workflows/paquet.yml)
+PACKET_COVERAGE = "couverture (PR ouverte sur cette tête)"
+PACKET_SUITE = "suite complète du paquet"
+
+
+def packet_suite_covered(entry, entries) -> bool:
+    """#3209 : `entry` est la suite complète que le portier `paquet` a
+    sautée **par construction** — une PR ouverte porte déjà la tête, sa suite
+    tourne dans le run `pull_request` (check requis `tests`, lu à part).
+
+    La preuve est le job `couverture` vert du même run (même `checkSuiteId`
+    quand les deux le portent) : c'est lui qui décide du saut. Sans cette
+    preuve, ou si la suite est annulée, expirée ou rouge, rien ne change :
+    le non concluant se consigne (#3085) et le rouge bloque."""
+    name = str(entry.get("name") or "")
+    if (str(entry.get("conclusion") or "").upper() != "SKIPPED"
+            or not (name == PACKET_SUITE or name.startswith(PACKET_SUITE + " / "))):
+        return False
+    suite = entry.get("checkSuiteId")
+    return any(str(other.get("name") or "") == PACKET_COVERAGE
+               and str(other.get("workflowName") or "") == "paquet"
+               and str(other.get("status") or "").upper() == "COMPLETED"
+               and str(other.get("conclusion") or "").upper() == "SUCCESS"
+               and (suite is None or other.get("checkSuiteId") is None
+                    or other.get("checkSuiteId") == suite)
+               for other in entries)
+
+
 def ci_state(rollup) -> str:
     """#3085 : l'état de la CI d'un rollup sous la règle du 23/10 — un non
     concluant ne bloque pas (voir `ci_result`).
@@ -1795,6 +1832,20 @@ def github_ci(project: Project, gh=None, *, strict: bool = False):
 CI_PASSING = ("success", "skipped", "neutral")
 
 
+def run_result(run) -> str:
+    """#3209 : classe un run de `gh run list` comme `conclusion_result`, sauf
+    la garde déclenchée par `workflow_run` (`relance hosted`, `flux
+    orphelins`) et sautée : sa condition `if:` dit que le run observé n'a pas
+    échoué, elle n'avait rien à faire. Ce n'est pas un test qui n'a pas
+    conclu — rien à consigner ; il passe, comme `CI_PASSING` le lisait déjà.
+    Annulée, expirée ou rouge, elle garde sa classe."""
+    if (str(run.get("event") or "") == "workflow_run"
+            and str(run.get("status") or "").lower() == "completed"
+            and str(run.get("conclusion") or "").lower() == "skipped"):
+        return CI_GREEN_RESULT
+    return conclusion_result(run.get("status"), run.get("conclusion"))
+
+
 def commit_ci(project: Project, sha: str, gh=None, *, branch: str | None = None) -> dict:
     """L160g (#473, `ci_required`): GitHub's CI on the commit `sha` itself
     (Actions, external app checks and commit statuses), the latest activity
@@ -1823,7 +1874,7 @@ def commit_ci(project: Project, sha: str, gh=None, *, branch: str | None = None)
     gh = gh or plan_github.Gh()
     rows = plan_github._json(gh, ["run", "list", "--repo", slug, "--commit", sha, "--limit",
                                   "100", "--json",
-                                  "workflowDatabaseId,workflowName,name,status,conclusion,createdAt,startedAt,updatedAt,headSha"])
+                                  "workflowDatabaseId,workflowName,name,status,conclusion,createdAt,startedAt,updatedAt,headSha,event"])
     if not isinstance(rows, list) or not all(isinstance(r, dict) for r in rows):
         raise plan_github.GithubError("gh run list: unexpected output")
     if len(rows) >= 100:
@@ -1859,7 +1910,7 @@ def commit_ci(project: Project, sha: str, gh=None, *, branch: str | None = None)
     #: pour que la porte de release ne prenne pas un job annulé ou sauté pour
     #: un défaut prouvé.
     results: list[tuple[str, str]] = [
-        (label(identity, run), conclusion_result(run.get("status"), run.get("conclusion")))
+        (label(identity, run), run_result(run))  # #3209 : garde workflow_run sautée
         for identity, run in latest.items()]
     # L1651 (#1650): what the frozen commit carries, label by label. A due
     # part is proven by a context that exists here and is terminal-success; a

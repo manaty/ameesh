@@ -447,6 +447,40 @@ def add(
                    unique_ref=unique_ref, team_queue=True)
 
 
+#: #3209 : les états d'un lot encore ouvert, lus par `open_with_source`
+OPEN_STATES = tuple(s for s in STATES if s not in TERMINAL and s not in MERGED_STATES)
+
+
+def open_with_source(db: Db, source: str, *, limit: int = 1000) -> dict | None:
+    """#3209 : le plus ancien lot ouvert qui porte exactement `source`, ou
+    None. Lecture bornée par état : au-delà, un doublon peut s'ouvrir, jamais
+    un suivi se perdre."""
+    found = None
+    for state in OPEN_STATES:
+        for item in storage.of(db).work.items(state=state, assignee=None, limit=limit):
+            if (item.get("source") or "") == source and (
+                    found is None or int(item["id"]) < int(found["id"])):
+                found = item
+    return found
+
+
+def add_or_note(db: Db, *, source: str, occurrence: str, actor: str = "",
+                **fields) -> dict:
+    """#3209 : un seul lot ouvert par `source` — un suivi automatique (lot de
+    correction d'un check non concluant) qui revient à chaque paquet ou
+    release est noté sur le lot déjà ouvert (`occurrence`) au lieu d'en
+    ouvrir un autre. Une lecture impossible ouvre le lot : mieux vaut un
+    doublon qu'un suivi perdu."""
+    try:
+        existing = open_with_source(db, source)
+    except Exception:  # noqa: BLE001 - lecture impossible : on ouvre
+        existing = None
+    if existing is not None:
+        note(db, int(existing["id"]), occurrence, actor=actor)
+        return dict(existing, noted=True)
+    return add(db, source=source, actor=actor, **fields)
+
+
 def _decision_lot(db: Db, *, title: str, requester: str, app: str, cfg=None) -> dict:
     """#540 : le lot de la question de `requester` (`decisions.ask`), à son
     nom même s'il a déjà un lot non démarré : il attend la réponse, ce lot
