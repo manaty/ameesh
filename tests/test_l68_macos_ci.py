@@ -183,9 +183,11 @@ class CiMacosCoexistenceTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         with open(WORKFLOW, encoding="utf-8") as fh:
-            cls.tests = canon.load_yaml(fh.read())["jobs"]
+            cls.tests_doc = canon.load_yaml(fh.read())
         with open(MACOS, encoding="utf-8") as fh:
-            cls.macos = canon.load_yaml(fh.read())["jobs"]
+            cls.macos_doc = canon.load_yaml(fh.read())
+        cls.tests = cls.tests_doc["jobs"]
+        cls.macos = cls.macos_doc["jobs"]
 
     @staticmethod
     def _eval(field, ctx):
@@ -195,6 +197,13 @@ class CiMacosCoexistenceTest(unittest.TestCase):
         # l'interpréteur de #1468 ne connaît que les fonctions de routage
         text = text.replace("always()", "true").replace("cancelled()", "false")
         return evaluate(text, ctx)
+
+    @classmethod
+    def _template(cls, field, ctx):
+        """Un scalaire mêlant littéral et un ou plusieurs `${{ … }}`."""
+        def repl(match):
+            return str(cls._eval("${{ %s }}" % match.group(1), ctx))
+        return re.sub(r"\$\{\{(.*?)\}\}", repl, str(field))
 
     @staticmethod
     def _context(event, label, *, plan_result, outputs):
@@ -268,6 +277,20 @@ class CiMacosCoexistenceTest(unittest.TestCase):
         condition = self.macos["suite"]["if"]
         self.assertTrue(bool(self._eval(condition, ci)))
         self.assertFalse(bool(self._eval(condition, gel)))
+
+    def test_a_freeze_label_cannot_cancel_a_running_macos_suite(self):
+        # Une étiquette ci-lot/ci-full arrive souvent pendant que la suite
+        # ci-macos tourne : son groupe de concurrence doit être distinct et
+        # elle ne doit rien annuler.
+        ci = self._context("pull_request_target", "ci-macos",
+                           plan_result="skipped", outputs={})
+        gel = self._context("pull_request_target", "ci-lot-" + "a" * 40,
+                            plan_result="skipped", outputs={})
+        concurrence = self.macos_doc["concurrency"]
+        self.assertNotEqual(self._template(concurrence["group"], ci),
+                            self._template(concurrence["group"], gel))
+        self.assertTrue(bool(self._eval(concurrence["cancel-in-progress"], ci)))
+        self.assertFalse(bool(self._eval(concurrence["cancel-in-progress"], gel)))
 
 
 class BenchTmpdirTest(unittest.TestCase):

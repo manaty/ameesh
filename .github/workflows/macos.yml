@@ -50,10 +50,13 @@ permissions:
   contents: read
 
 # Une étiquette `ci-macos` posée deux fois remplace la suite de la même PR ;
-# le nocturne n'est jamais annulé par le suivant (il attend son tour).
+# le nocturne n'est jamais annulé par le suivant (il attend son tour). Le nom
+# de l'étiquette est dans le groupe : une étiquette de gel `ci-lot`/`ci-full`
+# crée son propre groupe et ne peut donc pas annuler une suite `ci-macos` en
+# cours (elle est sautée par le `if` du job).
 concurrency:
-  group: macos-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request_target' }}
+  group: macos-${{ github.event.pull_request.number || github.ref }}-${{ github.event.label.name || github.event_name }}
+  cancel-in-progress: ${{ github.event.label.name == 'ci-macos' }}
 
 jobs:
   suite:
