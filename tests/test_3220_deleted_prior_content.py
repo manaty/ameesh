@@ -160,6 +160,89 @@ class ConflictedRewriteTest(_ConflictedFixture):
         self.assertEqual(correctors, [])
 
 
+class _SurvivingRemovalFixture(_RewriteFixture):
+    """Gel A : le correcteur retire une garde et ajoute un document."""
+
+    def _build_head_a(self):
+        self.repo.write("src/ameesh/gate.py",
+                        "allow_all_users_without_check()\n"
+                        "require_session_identity()\n")
+        self.base = self.repo.commit("base")
+        self.repo.write("src/ameesh/gate.py", "require_session_identity()\n")
+        self.repo.write(DOC, DOC_TEXT)
+        self.review_doc = self.repo.commit(
+            "cx3: retire la garde et documente", agent="cx3")
+        self.receipt("cx3", "codex", [self.review_doc])
+        self.head_a = self.review_doc
+        self.db.execute("UPDATE work_items SET branch_target = %s WHERE id = %s",
+                        (self.base, self.lot))
+        self.freeze(self.head_a)
+
+
+class SurvivingRemovalTest(_SurvivingRemovalFixture):
+    """B1 (revue cx2) : la suppression du correcteur subsiste, son document non."""
+
+    def setUp(self):
+        super().setUp()
+        self.repo.git("reset", "--hard", self.base)
+        self.repo.write("src/ameesh/gate.py", "require_session_identity()\n")
+        self.head_b = self.repo.commit(
+            "impl: garde retirée, document omis", agent="impl")
+        self.receipt("impl", "deepseek", [self.head_b])
+        self.freeze_b = self.freeze(self.head_b)
+        self.milestone = {"id": int(self.freeze_b["id"]), "sha": self.head_b,
+                          "actor": "impl", "at_ts": self.freeze_b.get("at_ts")}
+
+    def test_the_surviving_removal_keeps_the_corrector(self):
+        authors, unknown, correctors = self.reading(
+            self.milestone, [self.head_b], self.base, self.head_b)
+        self.assertEqual(unknown, [])
+        self.assertEqual({row["name"]: row["family"] for row in authors},
+                         {"impl": "deepseek", "cx3": "codex"})
+        self.assertIn("cx3", {row["name"] for row in correctors})
+
+    def test_the_gate_refuses_the_corrector_with_a_surviving_removal(self):
+        klass = {"class": "sensitive", "doubt": False,
+                 "files": [{"path": "src/ameesh/gate.py",
+                            "class": "sensitive",
+                            "rule": ["src/ameesh/gate.py"]}],
+                 "repo": self.repo.root, "target": self.base,
+                 "base_sha": self.base}
+        for actor in ("cx3", "dev1"):
+            self.verdict(actor, self.head_b)
+        out = merge_queue.review_gate(
+            self.db, work.milestones(self.db, self.lot), self.head_b,
+            repo=self.repo.root, klass=klass, item=self.lot_item(), required=2)
+        self.assertFalse(out.get("error"), out)
+        self.assertFalse(out["ok"], out["why"])
+        self.assertEqual([entry["actor"] for entry in out["accepted"]],
+                         ["dev1"], out)
+        self.assertIn("cx3", {row["name"] for row in out["authors"]})
+
+
+class EditedThenDeletedTest(_SurvivingRemovalFixture):
+    """B2 (revue dev2) : l'édition d'un fichier ensuite supprimé ne le garde pas."""
+
+    def setUp(self):
+        super().setUp()
+        self.repo.git("reset", "--hard", self.base)
+        self.repo.git("rm", "-q", "src/ameesh/gate.py")
+        self.head_b = self.repo.commit(
+            "impl: fichier édité puis supprimé", agent="impl")
+        self.receipt("impl", "deepseek", [self.head_b])
+        self.freeze_b = self.freeze(self.head_b)
+        self.milestone = {"id": int(self.freeze_b["id"]), "sha": self.head_b,
+                          "actor": "impl", "at_ts": self.freeze_b.get("at_ts")}
+
+    def test_the_edit_in_the_deleted_file_does_not_carry_the_corrector(self):
+        authors, unknown, correctors = self.reading(
+            self.milestone, [self.head_b], self.base, self.head_b)
+        self.assertEqual(unknown, [])
+        self.assertEqual({row["name"]: row["family"] for row in authors},
+                         {"impl": "deepseek"})
+        self.assertEqual(correctors, [])
+
+
 class DeletedPriorContentCommitTest(_DeletedFileFixture):
     """La preuve de contenu, commit par commit, sur le fichier supprimé."""
 

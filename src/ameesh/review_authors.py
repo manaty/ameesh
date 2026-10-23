@@ -542,6 +542,20 @@ def _head_lines(repo: str, head: str, path: str, cache: dict):
     return cache[path]
 
 
+def _path_absent(repo: str, head: str, path: str, cache: dict):
+    """Le chemin est-il absent de la tête ? None si la lecture est impossible.
+
+    #3220 B2 : `_head_lines` rend None pour un chemin absent comme pour un
+    blob illisible. `git ls-tree` distingue les deux : une sortie vide (rc 0)
+    prouve l'absence, une lecture impossible rend None. La preuve de retrait
+    ne retire l'auteur que sur une absence prouvée ; le doute garde."""
+    key = ("absent", head, path)
+    if key not in cache:
+        text = plan_git._out(repo, "ls-tree", "--name-only", head, "--", path)
+        cache[key] = None if text is None else not str(text).strip()
+    return cache[key]
+
+
 def _path_line_counts(repo: str, rev: str, path: str, cache: dict):
     """Le nombre d'occurrences de chaque ligne (dépouillée) de `path` dans
     `rev`, ou None si le chemin y est absent ou illisible (#2977 B2)."""
@@ -640,12 +654,21 @@ def _commit_survives(repo: str, head: str, sha: str, cache: dict,
     significatives du commit dans tout l'arbre de la tête, pas seulement à
     leur ancien chemin.
 
-    #3220 : si aucune de ces lignes ne subsiste nulle part, le contenu a
-    réellement disparu (fichier supprimé, ou toutes ses lignes retirées) et
-    l'auteur n'est pas reporté. Un chemin absent n'est plus, à lui seul, un
-    doute qui garderait l'auteur ; un fichier déplacé avec ses lignes, lui,
-    le garde. Une lecture impossible reste un doute (`_any_line_in_head`
-    rend True), jamais une preuve de suppression.
+    #3220 : si aucune de ces lignes ne subsiste nulle part, le contenu n'a pas
+    # forcément disparu : la lecture examine encore les lignes retirées. Un
+    # retrait conservé (la ligne n'est plus dans la tête au chemin d'origine)
+    # est une partie du contenu du commit et garde l'auteur. Quand le commit a
+    # des additions propres et qu'elles ont toutes disparu, un retrait ne
+    # compte qu'à un chemin encore présent dans la tête : à un chemin absent,
+    # la suppression du fichier a pu emporter l'édition entière, ce n'est plus
+    # une preuve de survie (#3220 B2, revue dev2). Ce n'est qu'après ce
+    # contrôle, quand rien ne subsiste, qu'un commit à additions propres est
+    # tenu pour disparu. Les **copies** ne comptent que lorsque toutes les
+    # additions sont héritées (#2977) : leur bloc traite un chemin absent comme
+    # un doute, et une ligne d'en-tête commune héritée garderait sinon l'auteur
+    # d'un fichier supprimé (#3216, revue mesh-design). Une lecture impossible
+    # reste un doute (`_any_line_in_head` rend True), jamais une preuve de
+    # suppression.
 
     #2977 : une ligne ajoutée qui existait déjà avant le correctif (parent du
     commit, ou base de fusion de la tête et de `base`) n'est pas propre au
@@ -684,16 +707,33 @@ def _commit_survives(repo: str, head: str, sha: str, cache: dict,
         # évite d'effacer le correcteur sur un simple déplacement (#2924 B8).
         if _any_line_in_head(repo, head, [row for _path, row in added]):
             return True
-        # #3220 : aucune ligne propre au commit ne subsiste nulle part. Le
-        # contenu est réellement supprimé (fichier retiré, ou toutes ses lignes
-        # réécrites) : un chemin absent ne garde plus l'auteur à lui seul.
-        return False
+        # #3220 B1 (revue cx2) : des additions propres ont disparu, mais le
+        # commit peut encore avoir retiré des lignes dont le retrait subsiste.
+        # La conclusion « contenu disparu » attend ce contrôle.
     removed = [(path, row) for path, rows in removes.items() for row in rows
                if _meaningful_line(row)]
-    if removed and any(
-            row.strip() not in (_head_lines(repo, head, path, cache) or set())
-            for path, row in removed):
-        return True
+    if removed:
+        for path, row in removed:
+            lines = _head_lines(repo, head, path, cache)
+            if lines is None:
+                # #3220 B2 (revue dev2) : quand les additions propres du
+                # commit ont toutes disparu, un chemin **prouvé absent** ne
+                # distingue plus le retrait appliqué de la suppression qui a
+                # emporté l'édition entière. Une lecture impossible reste un
+                # doute, et sans addition propre le doute B8 garde l'auteur
+                # d'un retrait (fichier réellement supprimé).
+                if added and _path_absent(repo, head, path, cache) is True:
+                    continue
+                return True
+            if row.strip() not in lines:
+                return True
+    if added:
+        # #3220 : les additions propres du commit ont toutes disparu, et aucun
+        # retrait ne subsiste. Les copies ne sont pas une preuve ici : leur
+        # lecture d'un chemin absent est un doute qui garderait l'auteur du
+        # fichier supprimé (#3216, revue mesh-design). Elles ne se lisent que
+        # quand toutes les additions du commit sont héritées (#2977).
+        return False
     if copied:
         # #2977 B1 : des additions significatives, toutes héritées. La copie
         # ne subsiste qu'à son propre chemin (pas de recherche dans l'arbre :
@@ -708,6 +748,8 @@ def _commit_survives(repo: str, head: str, sha: str, cache: dict,
             if present.get(row.strip(), 0) > before.get(row.strip(), 0):
                 return True
         return False
+    # Un commit sans addition significative (purs retraits, ou diff trivial) :
+    # il survit tant que ses retraits ne sont pas tous annulés dans la tête.
     return not removed
 
 
