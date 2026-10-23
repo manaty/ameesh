@@ -1699,6 +1699,20 @@ def _refetch_tip_objects(where: str, url: str, branch: str) -> str:
     return resolutions._err(proc)[:300] if proc.returncode else ""
 
 
+def _fetch_refusal(where: str, error: str) -> str:
+    """#3181 : la suite du refus d'un fetch, selon sa cause. Une corruption
+    locale (objet ou ref vides après une coupure de courant) ne se résorbe pas
+    en attendant la forge : `resolutions._run` a déjà mis en quarantaine les
+    fichiers vides et refait le fetch une fois, l'erreur restante se répare à
+    la main dans le clone."""
+    from . import resolutions
+    if resolutions.local_corruption(error):
+        return ("(%s): repair the clone %s and its alternates by hand (git fsck), "
+                "waiting for the remote will not fix it"
+                % (resolutions.fetch_failure(error)[:300], where))
+    return "(%s): try again once the remote answers" % error[:300]
+
+
 def _clone_base(where: str, base: str | None) -> str | None:
     """Le commit de cible dont les objets sont vérifiés avec ceux des têtes.
 
@@ -1788,9 +1802,8 @@ def _verified_tips(clone, url: str, names, tips: dict, base: str | None) -> dict
         repaired.add(_remote_branch(branch))
         error = _refetch_tip_objects(clone.path, url, branch)
         if error:
-            raise QueueError(
-                "cannot fetch %s from origin for the objects of its head %s (%s): "
-                "try again once the remote answers" % (branch, tip[:12], error))
+            raise QueueError("cannot fetch %s from origin for the objects of its head %s %s"
+                             % (branch, tip[:12], _fetch_refusal(clone.path, error)))
         fresh = plan_git._commit(clone.path, QUEUE_REF + _remote_branch(branch)) or tip
         for name in names:
             if _remote_branch(name) == _remote_branch(branch):
@@ -1866,8 +1879,8 @@ def fetch_fresh(repo: str, names, clone=None,
     except (GitError, OSError) as exc:
         failed = str(exc)
     if failed is not None:
-        raise QueueError("cannot fetch %s from origin (%s): try again once the remote answers"
-                         % (what, failed[:300]))
+        raise QueueError("cannot fetch %s from origin %s"
+                         % (what, _fetch_refusal(clone.path, failed)))
     tips = {n: plan_git._commit(clone.path, QUEUE_REF + remote[n]) if remote[n] in present
             else None for n in names}
     return _guarantee_tip_objects(clone, url, names, tips, base), clone.path

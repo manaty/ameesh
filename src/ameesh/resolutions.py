@@ -62,6 +62,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -168,7 +169,142 @@ def branch_name(lot: int, other: int) -> str:
 def _run(cwd: str, *args: str, timeout: float = GIT_TIMEOUT,
          stdin: bytes | None = None,
          env_extra: dict | None = None) -> subprocess.CompletedProcess:
-    return _git(cwd, *args, stdin=stdin, timeout=timeout, env_extra=env_extra)
+    """git dans `cwd`. #3181 : un fetch que fait échouer une corruption locale
+    (`local_corruption`) est refait une fois, après la mise en quarantaine des
+    fichiers vides du clone (`quarantine_empty`) ; si rien n'a été déplacé ou
+    si l'erreur persiste, l'échec est rendu tel quel, à lire par
+    `fetch_failure`."""
+    proc = _git(cwd, *args, stdin=stdin, timeout=timeout, env_extra=env_extra)
+    if (proc.returncode and _subcommand(args) == "fetch"
+            and local_corruption(_err(proc)) and quarantine_empty(cwd)):
+        proc = _git(cwd, *args, stdin=stdin, timeout=timeout, env_extra=env_extra)
+    return proc
+
+
+#: #3181 : ce que Git écrit quand le clone ou ses alternates portent un objet
+#: ou une ref abîmés (coupure de courant pendant une écriture) ; jamais une
+#: forge injoignable, et une attente ne le résorbe pas.
+_LOCAL_CORRUPTION = re.compile(
+    r"object file \S+ is empty|bad object (?:refs/|HEAD)|badRefContent"
+    r"|loose object \S+ .*is corrupt|did not send all necessary objects")
+#: un objet libre (`objects/xx/<reste du SHA-1 ou SHA-256>`) ; les fichiers
+#: temporaires de Git (`tmp_obj_*`) ne le sont pas
+_LOOSE_OBJECT = re.compile(r"[0-9a-f]{38}|[0-9a-f]{62}")
+#: où vont les fichiers vides retirés, sous le dossier `.git` qui les portait
+QUARANTINE_DIR = "ameesh-quarantine"
+
+
+def _subcommand(args) -> str:
+    """La sous-commande git de `args`, après les `-c clé=valeur` et options."""
+    it = iter(args)
+    for arg in it:
+        if arg in ("-c", "-C"):
+            next(it, None)
+        elif not arg.startswith("-"):
+            return arg
+    return ""
+
+
+def local_corruption(message: str) -> bool:
+    """#3181 : l'échec de Git vient-il d'un objet ou d'une ref abîmés du clone ?"""
+    return bool(_LOCAL_CORRUPTION.search(message or ""))
+
+
+def fetch_failure(message: str) -> str:
+    """#3181 : l'échec d'un fetch, nommé : une corruption locale n'est jamais
+    lue comme une forge qui ne répond pas."""
+    if local_corruption(message):
+        return "local clone corrupted (unclean shutdown?): %s" % message
+    return message
+
+
+def _object_dirs(objects: str) -> list[str]:
+    """`objects` et ses alternates (récursivement) : un clone `--shared` lit
+    les objets du checkout, et un objet vide chez celui-ci casse le fetch du
+    clone comme le sien propre."""
+    seen: list[str] = []
+    todo = [os.path.realpath(objects)]
+    while todo:
+        current = todo.pop(0)
+        if current in seen or not os.path.isdir(current):
+            continue
+        seen.append(current)
+        try:
+            with open(os.path.join(current, "info", "alternates"), encoding="utf-8") as fh:
+                lines = fh.read().splitlines()
+        except OSError:
+            continue
+        for line in lines:
+            line = line.strip()
+            if line and not line.startswith("#"):
+                todo.append(os.path.realpath(os.path.join(current, line)))
+    return seen
+
+
+def _empty_files(objects: str, git_dir: str | None) -> list[str]:
+    """Les objets libres de 0 octet de `objects`, et les refs libres de
+    0 octet de `git_dir` (le clone seul : jamais les refs d'un alternate).
+    Un fichier non vide n'est jamais rendu, même illisible."""
+    found = []
+    try:
+        fans = [e for e in os.scandir(objects)
+                if len(e.name) == 2 and e.is_dir(follow_symlinks=False)]
+    except OSError:
+        fans = []
+    for fan in fans:
+        try:
+            entries = list(os.scandir(fan.path))
+        except OSError:
+            continue
+        found += [e.path for e in entries
+                  if _LOOSE_OBJECT.fullmatch(e.name) and e.is_file(follow_symlinks=False)
+                  and e.stat(follow_symlinks=False).st_size == 0]
+    if git_dir:
+        for root, _dirs, files in os.walk(os.path.join(git_dir, "refs")):
+            for name in files:
+                path = os.path.join(root, name)
+                # une ref en cours d'écriture passe par `<ref>.lock`
+                if not name.endswith(".lock") and not os.path.islink(path) \
+                        and os.path.getsize(path) == 0:
+                    found.append(path)
+    return sorted(found)
+
+
+def quarantine_empty(path: str) -> list[str]:
+    """#3181 : déplace les objets libres de 0 octet du clone `path` et de ses
+    alternates, et ses refs libres de 0 octet, vers
+    `<.git>/ameesh-quarantine/<date UTC>/` du dépôt qui les portait.
+
+    Un fichier vide n'est jamais un objet ni une ref valides : c'est le reste
+    d'une écriture coupée (coupure de courant), que Git prend pour un objet
+    présent et ne redemande pas. Rien n'est supprimé, aucun fichier non vide
+    n'est touché, ni `gc` ni `prune`. Chaque déplacement est journalisé
+    (`moved.log` de la quarantaine, et stderr). Rend les chemins déplacés."""
+    common = plan_git._out(path, "rev-parse", "--path-format=absolute", "--git-common-dir")
+    if not common or not os.path.isdir(common):
+        return []
+    common = os.path.realpath(common)
+    stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+    moved: list[str] = []
+    for objects in _object_dirs(os.path.join(common, "objects")):
+        git_dir = os.path.dirname(objects)
+        for source in _empty_files(objects, common if git_dir == common else None):
+            relative = os.path.relpath(source, git_dir)
+            target = os.path.join(git_dir, QUARANTINE_DIR, stamp, relative)
+            try:
+                os.makedirs(os.path.dirname(target), exist_ok=True)
+                os.rename(source, target)
+                with open(os.path.join(git_dir, QUARANTINE_DIR, stamp, "moved.log"),
+                          "a", encoding="utf-8") as log:
+                    log.write("%s -> %s\n" % (source, target))
+            except OSError as exc:
+                print("ameesh: #3181 cannot quarantine empty %s: %s" % (source, exc),
+                      file=sys.stderr)
+                continue
+            print("ameesh: #3181 quarantined empty %s -> %s" % (source, target),
+                  file=sys.stderr)
+            moved.append(source)
+    return moved
 
 
 def _text(proc) -> str:
@@ -1144,7 +1280,9 @@ class Replayer:
             self.target_doubt = "the forge %s is unreadable: %s" % (url, exc)
             return False
         if proc.returncode:
-            self.target_doubt = "the forge %s is unreadable: %s" % (url, _err(proc)[-300:])
+            error = _err(proc)
+            self.target_doubt = (fetch_failure(error)[:300] if local_corruption(error)
+                                 else "the forge %s is unreadable: %s" % (url, error[-300:]))
             return False
         _check(_run(self.path, "remote", "set-url", "origin", url), "remote set-url")
         _check(_run(self.path, "config", "--replace-all", "remote.origin.fetch",
@@ -1211,17 +1349,21 @@ class Replayer:
             raise StaleTarget("origin/%s: %s: doubt, the target is not read" % (
                 branch, "the forge does not publish it" if listing.returncode == 2
                 else "the forge is unreadable (%s)" % (_err(listing)[-200:] or "no answer")))
+        error = ""
         if plan_git._commit(self.path, ref) != published:
             try:
-                _run(self.path, "fetch", "--quiet", "--no-tags", url,
-                     "+refs/heads/%s:%s" % (branch, ref), timeout=FETCH_TIMEOUT)
+                proc = _run(self.path, "fetch", "--quiet", "--no-tags", url,
+                            "+refs/heads/%s:%s" % (branch, ref), timeout=FETCH_TIMEOUT)
+                error = _err(proc) if proc.returncode else ""
             except GitError:
                 pass
         held = plan_git._commit(self.path, ref)
         if held != published:
             raise StaleTarget("origin/%s is at %s, the forge publishes %s: an older "
-                              "target is refused, not read"
-                              % (branch, (held or "nothing")[:12], published[:12]))
+                              "target is refused, not read%s"
+                              % (branch, (held or "nothing")[:12], published[:12],
+                                 " (%s)" % fetch_failure(error)[:300]
+                                 if local_corruption(error) else ""))
         return published
 
     def _declared_ref(self) -> str:
