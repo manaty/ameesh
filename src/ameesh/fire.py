@@ -241,23 +241,30 @@ def _give_locked(db, lot: int, *, sha: str, actor: str, note: str = "",
             target = plan_git.default_target(repo) or ""
         except plan_git.MergeProbeError:
             target = ""
-    try:
-        packet_guard.check_merge(db, lot, item.get("branch") or "", target, frozen,
-                                 exception=exception, reason=reason, actor=actor)
-    except packet_guard.PacketGuardError as exc:
-        raise FireError(str(exc)) from exc
     full = merge_queue.pinned(repo, wanted) if repo else None
+
+    def check(database):
+        try:
+            packet_guard.check_merge(database, lot, item.get("branch") or "", target,
+                                     frozen, exception=exception, reason=reason,
+                                     actor=actor)
+        except packet_guard.PacketGuardError as exc:
+            raise FireError(str(exc)) from exc
+
     if fence is None:
+        check(db)
         return work.milestone(db, lot, FIRE, sha=full or wanted, actor=actor,
                               note=(note or "").strip())
-    # L165 (EP4) : le hold et l'écriture du jalon sont dans la même
-    # transaction, après les lectures de préparation (revue cx2 B3).
+    # L165 (EP4) : la déclaration `--exception` de `check_merge` et le jalon
+    # sont des écritures du même geste ; hold, déclaration et jalon partagent
+    # la transaction gardée après les lectures de préparation (revue cx2 B3).
     from . import pilot_gesture
     with db.transaction() as tx:
         try:
             fence.hold(tx)
         except pilot_gesture.GestureRefused as exc:
             raise FireError(str(exc)) from exc
+        check(tx)
         return work.milestone(tx, lot, FIRE, sha=full or wanted, actor=actor,
                               note=(note or "").strip())
 

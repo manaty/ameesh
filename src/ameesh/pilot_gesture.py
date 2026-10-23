@@ -279,8 +279,9 @@ def gate(cfg, db, gesture: str, ref: str, *, project: str | None = None) -> Gate
         return None
     try:
         row = registry.get(db, name)
-    except Exception as exc:  # noqa: BLE001 - a claimed lease must fail closed
-        if _claims_lease():
+    except Exception as exc:  # noqa: BLE001 - only a database failure fails closed
+        from .db import DbError
+        if isinstance(exc, DbError) and _claims_lease():
             raise GestureRefused(
                 "gesture %s refused for %s: cannot read the registry to verify the "
                 "lease epoch (%s)"
@@ -290,10 +291,13 @@ def gate(cfg, db, gesture: str, ref: str, *, project: str | None = None) -> Gate
         return None
     try:
         binding = identity.resolve_binding(_cfg(db, cfg), db)
-    except Exception as exc:  # noqa: BLE001 - it claims a lease: fail closed
-        raise GestureRefused(
-            "gesture %s refused for %s: cannot verify the lease epoch (%s)"
-            % (gesture, name, " ".join(str(exc).split())[:160])) from exc
+    except Exception as exc:  # noqa: BLE001 - a database failure fails closed
+        from .db import DbError
+        if isinstance(exc, DbError):
+            raise GestureRefused(
+                "gesture %s refused for %s: cannot verify the lease epoch (%s)"
+                % (gesture, name, " ".join(str(exc).split())[:160])) from exc
+        return None
     # `registry.get` resolves aliases: the lease is read under the canonical
     # name, not the spelling the caller's environment happens to use.
     canonical = str(row.get("name") or name)

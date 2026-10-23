@@ -29,6 +29,7 @@ from ameesh import (
     merge_pr,
     merge_queue,
     packet_automerge,
+    packet_guard,
     packet_link,
     pilot_gesture,
     registry,
@@ -454,6 +455,50 @@ class GestureFenceTest(PgTestCase):
                     sha="a" * 40, target="main", gh=lambda *a, **k: None)
         self.assertEqual(out["state"], "error")
         self.assertIn("fenced", out["why"])
+
+    def test_auto_merge_armed_marker_ne_survit_pas_a_une_bascule(self):
+        lot = self.new_lot()
+        old = self.epoch
+        original = fire.required_checks
+
+        def steal(*args, **kwargs):
+            registry.release(self.db, self.name, "runner-h1", old)
+            registry.claim(self.db, self.name, "runner-h2", 600, host="h2")
+            return [("tests", "app")]
+
+        with self.identity_env(name=self.name, runner="runner-h1", epoch=old):
+            with mock.patch.object(fire, "required_checks", side_effect=steal), \
+                    mock.patch.object(packet_automerge, "pr_status",
+                                      return_value={"state": "OPEN", "head": "a" * 40,
+                                                    "base": "main", "auto": False,
+                                                    "number": 1}):
+                out = packet_automerge.arm(
+                    self.cfg, self.db, lot, slug="manaty/ameesh", number=1,
+                    sha="a" * 40, target="main", gh=lambda *a, **k: None)
+        self.assertEqual(out["state"], "error")
+        self.assertIn("lease", out["why"])
+        self.assertIsNone(packet_automerge.active(packet_automerge.marks(
+            self.db, lot)))
+
+    def test_fire_exception_declaration_ne_survit_pas_a_une_bascule(self):
+        lot = int(work.add(self.db, title="exception 3013", app="ameesh",
+                           branch="lot/3013-exception",
+                           branch_target="main")["id"])
+        work.milestone(self.db, lot, "frozen", sha="a" * 40, actor=self.name)
+        old = self.epoch
+
+        def steal(*args, **kwargs):
+            registry.release(self.db, self.name, "runner-h1", old)
+            registry.claim(self.db, self.name, "runner-h2", 600, host="h2")
+            return True
+
+        with self.identity_env(name=self.name, runner="runner-h1", epoch=old):
+            with mock.patch.object(fire, "same_commit", side_effect=steal):
+                with self.assertRaises(fire.FireError) as caught:
+                    fire.give(self.db, lot, sha="a" * 40, actor=self.name,
+                              exception="incident", reason="test residu B3")
+        self.assertIn("fenced", str(caught.exception))
+        self.assertIsNone(packet_guard.declared(self.db, lot, "a" * 40))
 
     def test_fire_stale_refuse_avant_le_jalon(self):
         lot = self.new_lot()

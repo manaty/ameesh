@@ -144,6 +144,39 @@ def _note(db, lot: int, state: str, slug: str, number: int, sha: str, rest: str,
               % (state, slug, int(number), sha, rest.strip()), actor=actor)
 
 
+def _fenced_hold(db, fence, *, margin_s: float = 0.0) -> bool:
+    """L165 (EP4) : renouvelle la garde si elle existe ; False si perdue."""
+    if fence is None:
+        return True
+    from . import pilot_gesture
+    try:
+        fence.hold(db, margin_s=margin_s)
+    except pilot_gesture.GestureRefused:
+        return False
+    return True
+
+
+def _note_fenced(db, fence, lot: int, state: str, slug: str, number: int, sha: str,
+                 rest: str, actor: str, *, margin_s: float = 0.0) -> bool:
+    """Écrit la marque dans la même transaction que le hold du bail élu.
+
+    Sans garde (exécuteur/humain), c'est la note simple. Avec une garde, une
+    époque périmée n'écrit pas la marque : c'est la correction B1 de la
+    relecture cx2 (le marqueur `armed` ne doit pas survivre à une bascule).
+    """
+    if fence is None:
+        _note(db, lot, state, slug, number, sha, rest, actor)
+        return True
+    from . import pilot_gesture
+    with db.transaction() as tx:
+        try:
+            fence.hold(tx, margin_s=margin_s)
+        except pilot_gesture.GestureRefused:
+            return False
+        _note(tx, lot, state, slug, number, sha, rest, actor)
+        return True
+
+
 def _lock(db, lot: int):
     """Le bail `auto-merge:<lot>`, ou None si un autre le tient.
 
@@ -249,12 +282,10 @@ def arm(cfg, db, lot: int, *, slug: str, number: int, sha: str, target: str, gh,
         from . import pilot_gesture
         try:
             fence = pilot_gesture.gate(cfg, db, "merge", "auto-merge arm #%d" % lot)
-            if fence is not None:
-                fence.hold(db, margin_s=AUTOMERGE_CALL_MARGIN_S)
         except pilot_gesture.GestureRefused as exc:
             return {"state": "error", "why": str(exc)}
         out = _arm_locked(db, lot, slug=slug, number=number, sha=sha, target=target,
-                          gh=gh, actor=actor, handle=handle)
+                          gh=gh, actor=actor, handle=handle, fence=fence)
         if out["state"] in ("armed", "already-armed"):
             # une composition déjà verte fusionne tout de suite, sous le même bail
             out["merge"] = _check_locked(cfg, db, lot, gh=gh, dry_run=False, actor=actor,
@@ -265,12 +296,13 @@ def arm(cfg, db, lot: int, *, slug: str, number: int, sha: str, target: str, gh,
 
 
 def _arm_locked(db, lot: int, *, slug: str, number: int, sha: str, target: str, gh,
-                actor: str, handle=None) -> dict:
+                actor: str, handle=None, fence=None) -> dict:
     lost = {"state": "error", "why": "the auto-merge lease of lot #%d was lost: rerun "
                                      "`ameesh ci run %d --full`" % (lot, lot)}
 
     def refuse(state: str, why: str) -> dict:
-        _note(db, lot, "not-armed", slug, number, sha, "— %s" % why, actor)
+        _note_fenced(db, fence, lot, "not-armed", slug, number, sha, "— %s" % why,
+                         actor)
         return {"state": state, "why": why}
 
     if not target:
@@ -304,6 +336,9 @@ def _arm_locked(db, lot: int, *, slug: str, number: int, sha: str, target: str, 
         # prochaine tête poussée ; ameesh fusionne lui-même, sur la tête publiée.
         if not _renew(handle):
             return lost
+        if not _fenced_hold(db, fence, margin_s=AUTOMERGE_CALL_MARGIN_S):
+            return {"state": "error", "why": "the elected pilot lease was lost before "
+                                             "disarming the GitHub auto-merge: nothing armed"}
         error = land.pr_disable_auto(slug, number, gh=gh)
         if error is not None:
             return refuse("error", "the GitHub auto-merge armed on PR #%d could not be "
@@ -318,10 +353,13 @@ def _arm_locked(db, lot: int, *, slug: str, number: int, sha: str, target: str, 
                                    for context, _app in required))
     if not _renew(handle):
         return lost
-    _note(db, lot, "armed", slug, number, sha,
-          "base=%s method=%s required=%s — ameesh merges this head into %s once its "
-          "required checks are green; a new push or a retarget disarms it"
-          % (target, METHOD, names, target), actor)
+    if not _note_fenced(db, fence, lot, "armed", slug, number, sha,
+                        "base=%s method=%s required=%s — ameesh merges this head into %s "
+                        "once its required checks are green; a new push or a retarget "
+                        "disarms it" % (target, METHOD, names, target), actor,
+                        margin_s=AUTOMERGE_CALL_MARGIN_S):
+        return {"state": "error", "why": "the elected pilot lease was lost before "
+                                         "arming: nothing armed"}
     return {"state": "armed", "why": "ameesh merges %s into %s once %s is green"
             % (sha[:12], target, names)}
 
@@ -461,18 +499,30 @@ def _check_locked(cfg, db, lot: int, *, gh, dry_run: bool, actor: str,
             return dict(out, result="would-disarm")
         if not _renew(handle):
             return dict(out, result="busy")
+        if not _fenced_hold(db, fence, margin_s=AUTOMERGE_CALL_MARGIN_S):
+            return dict(out, result="error",
+                        error="the elected pilot lease was lost before disarming: "
+                              "nothing disarmed")
         if view["auto"]:
             error = land.pr_disable_auto(slug, number, gh=gh)
             if error is not None:
                 return dict(out, result="error", error="disarm: %s" % error)
-        _note(db, lot, "disarmed", slug, number, sha,
-              "base=%s %s — the PR changed since its publication; `ameesh ci run %d "
-              "--full` re-arms on the new head" % (base, " ".join(moved), int(lot)), actor)
+        if not _note_fenced(db, fence, lot, "disarmed", slug, number, sha,
+                            "base=%s %s — the PR changed since its publication; `ameesh "
+                            "ci run %d --full` re-arms on the new head"
+                            % (base, " ".join(moved), int(lot)), actor):
+            return dict(out, result="error",
+                        error="the elected pilot lease was lost before journaling "
+                              "the disarm")
         return dict(out, result="disarmed")
     if view["auto"] and not dry_run:
         # armée à la main depuis la publication : ameesh reste seul à fusionner
         if not _renew(handle):
             return dict(out, result="busy")
+        if not _fenced_hold(db, fence, margin_s=AUTOMERGE_CALL_MARGIN_S):
+            return dict(out, result="error",
+                        error="the elected pilot lease was lost before disarming: "
+                              "nothing disarmed")
         error = land.pr_disable_auto(slug, number, gh=gh)
         if error is not None:
             return dict(out, result="error", error="disarm: %s" % error)
