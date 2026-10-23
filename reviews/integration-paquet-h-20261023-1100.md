@@ -63,8 +63,32 @@ reste disponible pour l'autre paire.
   #3035 (`491`/`419`) dans `docs/EXECUTEUR-MEDIEE.md` ; le contenu du lot est
   bien porté, seule la valeur d'union diffère.
 
-Aucune autre adaptation de code ou de banc n'a été nécessaire : les 10 autres
-unités se sont composées sans conflit.
+Aucune autre adaptation de code ou de banc n'a été nécessaire à la composition :
+les 10 autres unités se sont composées sans conflit. La réparation de la CI
+ci-dessous est un correctif de bancs, de classement et d'ordre du help, pas un
+retrait d'unité.
+
+## CI rouge sur 018272ca94 (23/10 09:33Z) — réparation de composition
+
+La première suite complète a échoué sur 15 témoins distincts (29 occurrences
+sur les deux dorsales). Aucune unité n'est retirée : les écarts sont des bancs
+non adaptés aux comportements relus, un classement de colonnes et l'ordre du
+help racine.
+
+| unités | symptôme | correctif |
+|---|---|---|
+| #3011 × bancs de `sweep` (#508, #L790, #1425, #2339) | `Runner.sweep` publie les scores de rôles (`role_evaluation_once`) et purge les libertés d'élection (`_election_free_since`) ; les doublures n'avaient ni horloge ni ces attributs | les faux exécuteurs neutralisent la passe et partent sans liberté observée |
+| #3011 × `test_cluster` | `role_standings` (0476) non classée : ses 9 colonnes restaient refusées au rôle superviseur | classée fermée dans `FERMEES` — état interne d'élection, comme `agent_candidates` ; aucun GRANT modifié |
+| #3011 × `test_2179` | `role status` inséré entre `host enroll` et `hosts`, help racine non alphabétique | ligne déplacée entre `review-class` et `run` |
+| #3091 × #2505 | le feu nomme la cible déclarée et épingle la ref lue dans `base_sha` ; le témoin attendait l'ancien libellé `origin/main` | témoin adapté : `target=main`, `base_sha=origin/main`, diff toujours lu depuis `origin/main` (léger, README seul) |
+
+Ciblés rejoués le 23/10 : 2505 4/4, 508 8/8, L790 24/24, 1425+2339 17/17,
+`test_cluster` classement 1/1, 2179 help 1/1. Aucun avis supplémentaire n'est
+requis : le porteur est dispensé (#1979) et ces changements ne touchent que des
+bancs, le classement d'une colonne et l'ordre du help.
+
+Correctif : `b9b9ae185` (7 fichiers, +31/−4). La tête de la branche devient le
+commit qui porte ce manifeste ; la suite complète unique est relancée sur elle.
 
 ## Écartés (ce véhicule)
 
