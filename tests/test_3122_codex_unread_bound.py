@@ -11,6 +11,7 @@ est plus vieux qu'une fenêtre courte.
 """
 from __future__ import annotations
 
+import builtins
 import json
 import os
 import unittest
@@ -120,6 +121,24 @@ class UnreadBoundTest(Sandbox, unittest.TestCase):
         self.assertFalse(result.ok)
         self.assertTrue(result.hard)
         self.assertIn("short window", result.reason)
+
+    def test_a_read_failure_is_not_an_empty_journal(self):
+        # `cost._read_tail` avalait l'OSError et rendait "" : un journal
+        # illisible passait pour un journal lu et vide, et le repos se
+        # prouvait à tort. La lecture Codex doit signaler l'échec.
+        path = journal(self.codex, "illisible",
+                       team_event(self.now - 5 * 60, short=100, week=50),
+                       mtime=self.now - 5 * 60)
+        real_open = builtins.open
+
+        def only(pathname, *args, **kwargs):
+            if os.fspath(pathname) == path:
+                raise OSError("journal illisible")
+            return real_open(pathname, *args, **kwargs)
+
+        with mock.patch("builtins.open", side_effect=only):
+            with self.assertRaises(OSError):
+                codex_gauges.session_reading(path, self.now)
 
     def test_a_journal_without_a_readable_mtime_prevents_rest(self):
         # Un journal que `recent_files` ne peut pas dater n'a pas de borne :
