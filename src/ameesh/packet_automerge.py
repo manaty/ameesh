@@ -222,12 +222,12 @@ def _error(proc) -> str:
 
 def pr_status(slug: str, number: int, *, gh) -> dict:
     """La PR `number`, dans la forme que lit `fire.ready_pr` (état, tête,
-    cible, brouillon, CI, rollup, branche) plus `auto` ; `land.LandError`
-    sinon."""
+    cible, brouillon, CI, rollup, branche) plus `auto` et la cible résolue
+    (`base_oid`, #3091) ; `land.LandError` sinon."""
     from . import radar
     proc = gh(["pr", "view", str(int(number)), "--repo", slug, "--json",
-               "state,headRefOid,headRefName,baseRefName,isDraft,autoMergeRequest,"
-               "statusCheckRollup,title"])
+               "state,headRefOid,headRefName,baseRefName,baseRefOid,isDraft,"
+               "autoMergeRequest,statusCheckRollup,title"])
     if proc.returncode != 0:
         raise land.LandError("gh pr view %d: %s" % (int(number), _error(proc)))
     try:
@@ -245,6 +245,9 @@ def pr_status(slug: str, number: int, *, gh) -> dict:
     return {"number": int(number), "state": str(data.get("state") or "").upper(),
             "head": str(data.get("headRefOid") or "").strip().lower(),
             "base": str(data.get("baseRefName") or "").strip(),
+            # #3091 : la cible résolue de la PR, la seule lecture fraîche que
+            # la porte des avis puisse opposer à la ref locale du checkout.
+            "base_oid": str(data.get("baseRefOid") or "").strip().lower(),
             "branch": str(data.get("headRefName") or "").strip(),
             "draft": bool(data.get("isDraft")), "ci": ci, "rollup": rollup,
             "auto": data.get("autoMergeRequest") is not None,
@@ -410,11 +413,16 @@ def merge_into(slug: str, target: str, sha: str, *, number: int, branch: str, ti
     return commit, None
 
 
-def _verdicts(cfg, db, row: dict, milestones: list, *, slug: str, base: str) -> tuple:
+def _verdicts(cfg, db, row: dict, milestones: list, *, slug: str, base: str,
+              base_sha: str = "") -> tuple:
     """`fire.ready_verdicts` sur le porteur, avec le dépôt et le projet que le
     feu résout (dossier de l'assigné s'il porte ce dépôt, sinon le clone
     déclaré du projet). Rend `(ok, raison, projet)` ; le projet résolu sert
-    ensuite à toute la porte de CI (R2, cx3). Une erreur refuse."""
+    ensuite à toute la porte de CI (R2, cx3). Une erreur refuse.
+
+    `base_sha` (#3091) est la cible résolue lue sur la PR (`baseRefOid`) :
+    elle prouve la base de composition au lieu de dépendre de la fraîcheur de
+    la ref locale du checkout."""
     try:
         repo = fire._repo_of(db, row)
         if repo is not None and not fire._same_repository(repo, slug):
@@ -422,8 +430,9 @@ def _verdicts(cfg, db, row: dict, milestones: list, *, slug: str, base: str) -> 
         project = fire._project(cfg, repo, slug)
         if repo is None:
             repo = fire._project_checkout(project)
+        extra = {"base_sha": base_sha} if str(base_sha or "").strip() else {}
         ok, why, _klass = fire.ready_verdicts(cfg, db, row, milestones, repo=repo,
-                                              project=project, target=base)
+                                              project=project, target=base, **extra)
     except Exception as exc:  # noqa: BLE001 - une porte illisible ne fusionne pas
         return (False, "the review gate cannot be read: %s: %s" % (type(exc).__name__, exc),
                 None)
@@ -529,7 +538,12 @@ def _check_locked(cfg, db, lot: int, *, gh, dry_run: bool, actor: str,
     # R1 B1 (cx3) : la porte complète des verdicts, comme le feu (classe,
     # avis requis et indépendants sur la tête gelée, membres d'un porteur et
     # delta, #2766), avant toute lecture de CI et tout geste de fusion.
-    ok, why, project = _verdicts(cfg, db, row, milestones, slug=slug, base=base)
+    # #3091 : la cible résolue de la PR prouve la base de composition du
+    # paquet ; la ref locale du checkout de l'assigné peut être en retard.
+    base_oid = str(view.get("base_oid") or "").strip().lower()
+    extra = {"base_sha": base_oid} if base_oid else {}
+    ok, why, project = _verdicts(cfg, db, row, milestones, slug=slug, base=base,
+                                 **extra)
     if not ok:
         return dict(out, result="pending", why=why)
     # R1 B2 (cx3) : au geste, au moins un check imposé par la forge, et tous

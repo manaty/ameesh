@@ -728,7 +728,7 @@ def _disarm_auto(slug: str, status: dict, *, gh) -> tuple:
 # --------------------------------------------------------------------------
 
 def ready_verdicts(cfg, db, row: dict, marks: list, *, repo: str | None,
-                   project, target: str) -> tuple:
+                   project, target: str, base_sha: str | None = None) -> tuple:
     """La première porte, celle qui ne doit rien déclencher (#1374, B) : la
     classe du lot et les **avis requis** sur la tête gelée, comptés et
     indépendants (`merge_queue.review_gate`). Rend `(ok, raison, classe)`.
@@ -743,6 +743,12 @@ def ready_verdicts(cfg, db, row: dict, marks: list, *, repo: str | None,
     retard y ajouterait des commits déjà fusionnés, dont des chemins
     sensibles, et surclasserait le lot au-dessus de ses vrais avis.
 
+    #3091 : `base_sha` est la cible **déjà résolue** par l'appelant (le
+    `baseRefOid` de la PR pour l'auto-fusion d'un paquet). Elle sert de
+    révision de classe et de preuve de la base de composition ; la ref locale
+    peut être en retard, jamais cette lecture. Sans elle, la ref résolue par
+    `_class_base` fait foi, comme avant.
+
     Cette porte s'évalue **avant** toute PR, toute entrée en file et toute CI :
     un feu peut être enregistré au gel, mais rien ne part avant les avis."""
     lot = int(row["id"])
@@ -752,9 +758,12 @@ def ready_verdicts(cfg, db, row: dict, marks: list, *, repo: str | None,
     base = target or None
     if repo and target:
         base = merge_queue._class_base(repo, target) or target
-    base_sha = merge_queue.pinned(repo, base) if (repo and base) else None
+    class_sha = str(base_sha or "").strip() or None
+    if class_sha and repo:
+        class_sha = merge_queue.pinned(repo, class_sha) or class_sha
+    resolved = class_sha or (merge_queue.pinned(repo, base) if (repo and base) else None)
     klass = lot_class.of_lot(db, lot, cfg=cfg, item=row, repo=repo or None,
-                             base=base, base_sha=base_sha, head=head)
+                             base=target, base_sha=resolved or base, head=head)
     if str(klass.get("class") or "") == lot_class.RELEASE:
         return False, ("class: release (%s) — the release procedure belongs to the pilot: "
                        "a fire never arms an automatic merge on a release"
@@ -786,8 +795,11 @@ def ready_verdicts(cfg, db, row: dict, marks: list, *, repo: str | None,
                     % (frozen[:12], klass.get("class") or "?", exc)), klass
             gate_authors = {"authors": authors, "families": families,
                             "authors_complete": True}
+    # #3091 : la base de composition du véhicule est prouvée sur cette cible
+    # résolue, jamais sur la ref du checkout.
     gate = merge_queue.review_gate(db, marks, frozen, repo=repo, klass=klass,
-                                   item=row, cfg=cfg, target=base, **gate_authors)
+                                   item=row, cfg=cfg, target=resolved or base,
+                                   **gate_authors)
     if not gate["ok"]:
         return False, gate["why"], klass
     return True, "", klass
@@ -848,6 +860,38 @@ def _required_pairs(required) -> tuple:
     return tuple(pairs)
 
 
+def _latest_runs(runs) -> list:
+    """#3008 : les derniers check runs par (application, suite, nom), comme
+    `radar.latest_rollup` pour le rollup (#2524) : un re-run vert sur la même
+    tête remplace l'ancien run rouge de sa suite.
+
+    Seule une date strictement plus récente remplace une entrée. Suite
+    inconnue, date absente, invalide ou ex aequo : toutes les entrées
+    ambiguës restent, afin de ne jamais masquer un échec sur la foi de
+    l'ordre reçu."""
+    from datetime import datetime
+
+    groups = {}
+    for index, run in enumerate(runs or ()):
+        suite = run.get("check_suite_id")
+        key = (("suite", run.get("app_id"), suite, _rollup_name(run))
+               if suite is not None else ("unknown", index))
+        try:
+            stamp = datetime.fromisoformat(run.get("started_at").replace("Z", "+00:00"))
+            stamp = stamp.timestamp() if stamp.tzinfo is not None else None
+        except (AttributeError, TypeError, ValueError, OverflowError):
+            stamp = None
+        groups.setdefault(key, []).append((run, stamp))
+    latest = []
+    for entries in groups.values():
+        if any(stamp is None for _, stamp in entries):
+            latest.extend(run for run, _ in entries)
+        else:
+            newest = max(stamp for _, stamp in entries)
+            latest.extend(run for run, stamp in entries if stamp == newest)
+    return latest
+
+
 def _required_gap(required, rollup, provenance=None) -> list:
     """Les checks requis que `rollup` et `provenance` ne prouvent pas.
 
@@ -873,8 +917,9 @@ def _required_gap(required, rollup, provenance=None) -> list:
             if bad:
                 gaps.append("%s (%s)" % (name, ", ".join(bad)))
             continue
-        runs = [entry for entry in provenance or ()
-                if _rollup_name(entry) == name and entry.get("app_id") == app_id]
+        runs = _latest_runs([entry for entry in provenance or ()
+                             if _rollup_name(entry) == name
+                             and entry.get("app_id") == app_id])
         if not runs:
             providers = sorted({str(entry.get("app_id")) for entry in provenance or ()
                                 if _rollup_name(entry) == name
@@ -1037,10 +1082,18 @@ def _head_check_runs(slug: str | None, sha: str, *, gh) -> list:
             if app_id is not None and (isinstance(app_id, bool)
                                        or not isinstance(app_id, int)):
                 raise land.LandError("gh api %s: malformed check run app" % path)
+            # #3008 : la date et la suite départagent un re-run sur la même tête
+            suite = run.get("check_suite")
+            suite_id = suite.get("id") if isinstance(suite, dict) else None
+            if isinstance(suite_id, bool) or not isinstance(suite_id, int):
+                suite_id = None
+            started = run.get("started_at")
             runs.append({"name": run["name"],
                          "status": str(run.get("status") or ""),
                          "conclusion": str(run.get("conclusion") or ""),
-                         "app_id": app_id})
+                         "app_id": app_id,
+                         "started_at": started if isinstance(started, str) else None,
+                         "check_suite_id": suite_id})
     return runs
 
 
@@ -1280,8 +1333,13 @@ def required_on_head(project, target: str, sha: str, *, gh) -> list:
         return []
     runs = _head_check_runs(slug, sha, gh=gh)
     statuses = _head_statuses(slug, sha, gh=gh)
-    rollup = ([{"__typename": "CheckRun", "name": run["name"], "status": run["status"],
-                "conclusion": run["conclusion"]} for run in runs] + statuses)
+    # #3008 : la date ne sert que si la suite est connue — sans elle,
+    # `latest_rollup` regrouperait deux workflows homonymes par le seul nom
+    rollup = ([dict({"__typename": "CheckRun", "name": run["name"],
+                     "status": run["status"], "conclusion": run["conclusion"]},
+                    **({"startedAt": run["started_at"], "checkSuiteId": run["check_suite_id"]}
+                       if run.get("check_suite_id") is not None else {}))
+               for run in runs] + statuses)
     return _required_gap(required, rollup, runs)
 
 
