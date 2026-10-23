@@ -351,15 +351,30 @@ def _store_lock(git_dir: str) -> int | None:
 
 
 def _replacing_writer(git_dir: str) -> bool:
-    """Git de `git_dir` écrit-il ses objets par `rename()` (qui remplace un
-    fichier présent) plutôt que par `link()` ? Illisible : oui (refus fermé)."""
+    """Un écrivain Git de ce dépôt écrit-il ses objets par `rename()` (qui
+    remplace un fichier présent) plutôt que par `link()` ? Le magasin d'objets
+    est partagé par le dépôt et tous ses worktrees liés : la configuration
+    effective de **chacun** est lue (`config.worktree` avec
+    `extensions.worktreeConfig`, includes, global, système). Un seul `rename`,
+    une lecture impossible ou un worktree illisible : oui (refus fermé)."""
+    gitdirs = [git_dir]
+    worktrees = os.path.join(git_dir, "worktrees")
     try:
-        proc = _git(git_dir, "--git-dir", git_dir, "config", "--get", "core.createObject")
-    except GitError:
+        names = sorted(os.listdir(worktrees)) if os.path.isdir(worktrees) else []
+    except OSError:
         return True
-    if proc.returncode not in (0, 1):
-        return True
-    return _text(proc).lower() == "rename"
+    gitdirs += [os.path.join(worktrees, n) for n in names
+                if os.path.isdir(os.path.join(worktrees, n))]
+    for one in gitdirs:
+        try:
+            proc = _git(git_dir, "--git-dir", one, "config", "--get-all", "core.createObject")
+        except GitError:
+            return True
+        if proc.returncode not in (0, 1):
+            return True
+        if any(v.strip().lower() == "rename" for v in _text(proc).splitlines()):
+            return True
+    return False
 
 
 def quarantine_empty(path: str) -> list[str]:

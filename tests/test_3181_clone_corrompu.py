@@ -286,6 +286,23 @@ class CorruptedCloneTest(unittest.TestCase):
         self.assertEqual(resolutions.quarantine_empty(self.clone.path), [])
         self.assertTrue(os.path.exists(obj))
 
+    def test_a_linked_worktree_writing_by_rename_refuses_the_object_repair(self):
+        # relecture cx2 (gel #16631) : `config.worktree` d'un worktree lié,
+        # invisible depuis le dépôt commun, partage pourtant les objets
+        tip = self.publish("lot/w")
+        obj = _loose(self.agents, tip)
+        open(obj, "w").close()
+        linked = os.path.join(self.tmp, "lie")
+        _git(self.agents, "worktree", "add", "-q", "--detach", linked, "main")
+        _git(self.agents, "config", "extensions.worktreeConfig", "true")
+        _git(linked, "config", "--worktree", "core.createObject", "rename")
+        # le dépôt commun seul ne le voit pas
+        self.assertEqual(subprocess.run(["git", "-C", self.agents, "config", "--get",
+                                         "core.createObject"]).returncode, 1)
+        self.assertTrue(resolutions._replacing_writer(os.path.join(self.agents, ".git")))
+        self.assertEqual(resolutions.quarantine_empty(self.clone.path), [])
+        self.assertTrue(os.path.exists(obj))
+
     def test_a_failed_restore_names_where_the_valid_object_is(self):
         tip = self.publish("lot/h")
         obj = _loose(self.agents, tip)
