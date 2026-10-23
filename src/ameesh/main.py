@@ -103,6 +103,10 @@
   ameesh notify [--once] [--dry-run] [--interval S] [--json] | --test human:ID
         alerts PUSHED to the responsible human (desktop, ntfy, Slack;
         `notify` key of the host configuration; L38);
+  ameesh service install|uninstall|status [--agent A]... [--no-runner]
+        [--no-notify] [--dry-run] [--json]
+        user services (launchd on macOS, L65): the host runner and
+        `ameesh notify`, or one runner per agent; `status` reads launchd;
   ameesh offload run [--profile P] [--fallback local|none] -- <command…>
         | status [<job>] | cancel <job>
         heavy suites run on a lending VM over SSH (L159b, AMEESH_OFFLOAD_HOST);
@@ -347,6 +351,10 @@ def _dispatch(argv: list[str] | None) -> int:
         # L38 (0030) : l'envoi des alertes au responsable humain
         from . import notify
         return notify.main(rest)
+    if command == "service":
+        # L65 : services utilisateur (launchd sur macOS)
+        from . import service
+        return service.main(rest)
     if command == "provenance":
         # #1465 : preuve exacte d'origine d'un commit ou d'un jalon
         from . import review_provenance
