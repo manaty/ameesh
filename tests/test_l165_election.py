@@ -71,6 +71,77 @@ class ElectionValidationTest(test_canon._TmpMixin, unittest.TestCase):
         self.assertIn("agent-candidats-ignored", codes(canon.validate(self.load()), canon.WARNING))
 
 
+class ElectionMaxAgentsTest(test_canon._TmpMixin, unittest.TestCase):
+    """#3101 : une admission de rôle élu ne prend qu'une place dans le maillage,
+    sur l'un de ses candidats, et non une sur chaque hôte candidat."""
+
+    def setUp(self) -> None:
+        self.root = self.example_copy()
+        write(self.root, "agents/relecteur.md", election_agent())
+        write(self.root, "placements/relecteur-atelier.md", election_admission())
+
+    def hosts(self, atelier: int, banc: int) -> None:
+        # orchestre est épinglé sur atelier, ouvrier sur banc
+        write(self.root, "hotes/atelier.md", host_card(
+            "atelier", harnesses=["claude", "codex", "deepseek"],
+            providers=["anthropic", "openai", "deepseek"],
+            credential_modes=["api-key", "subscription"],
+            work_roots="{acme-web: ~/acme/acme-web}", max_agents=str(atelier)))
+        write(self.root, "hotes/banc.md", host_card(
+            "banc", "human:alice", harnesses=["deepseek", "codex"],
+            providers=["deepseek", "openai"], credential_modes=["api-key"],
+            work_roots="{acme-web: /srv/acme/acme-web}", max_agents=str(banc)))
+
+    def load(self):
+        return canon.load(self.root, untrusted=True)
+
+    def test_le_role_elu_compte_une_fois(self):
+        # atelier est plein de ses épinglés ; le rôle s'assoit sur banc
+        self.hosts(atelier=1, banc=2)
+        self.assertEqual(codes(canon.validate(self.load()), canon.ERROR), set())
+        # `ameesh hosts` compte le rôle sur son seul siège
+        from ameesh import mesh_cli
+        loaded = self.load()
+        self.assertEqual({h: mesh_cli._host_admissions(loaded, h) for h in ("atelier", "banc")},
+                         {"atelier": 1, "banc": 2})
+
+    def test_aucune_place_chez_aucun_candidat(self):
+        self.hosts(atelier=1, banc=1)
+        findings = canon.validate(self.load())
+        self.assertIn("agent-election-max-agents", codes(findings, canon.ERROR))
+        self.assertNotIn("host-max-agents", codes(findings))
+        blocking = canon.blocking(findings)
+        self.assertIn("relecteur", blocking.by_agent)
+        self.assertNotIn("atelier", blocking.by_host)
+
+    def test_les_epingles_comptent_toujours_partout(self):
+        self.hosts(atelier=0, banc=2)
+        self.assertIn("host-max-agents", codes(canon.validate(self.load()), canon.ERROR))
+
+    def test_couplage_deplace_un_role_deja_assis(self):
+        seats = canon.seat_elected({"a": 1, "b": 1, "c": None},
+                                   {"r1": ["a", "b"], "r2": ["a"], "r3": ["c"]})
+        self.assertEqual(seats, {"r1": "b", "r2": "a", "r3": "c"})
+        seats = canon.seat_elected({"a": 1, "b": 0}, {"r1": ["a", "b"], "r2": ["a"]})
+        self.assertEqual(set(seats.values()), {"a", None})
+
+    def test_proposition_ne_deloge_pas_un_role_elu(self):
+        from ameesh import placement
+        # relecteur n'a qu'atelier pour candidat : la dernière place y est la sienne
+        write(self.root, "agents/relecteur.md", election_agent(candidats=["atelier"]))
+        self.hosts(atelier=2, banc=2)
+        self.assertEqual(codes(canon.validate(self.load()), canon.ERROR), set())
+        choix = {c["host"]: c for c in placement.proposals(self.load(), "ouvrier")}
+        self.assertFalse(choix["atelier"]["admissible"])
+        self.assertIn("elected role(s) relecteur would find no place",
+                      " ".join(choix["atelier"]["reasons"]))
+        # candidat aussi sur banc : relecteur y glisse, atelier n'est plus plein
+        # (ouvrier n'y reste refusé que faute d'admission)
+        write(self.root, "agents/relecteur.md", election_agent())
+        choix = {c["host"]: c for c in placement.proposals(self.load(), "ouvrier")}
+        self.assertNotIn("full", " ".join(choix["atelier"]["reasons"]))
+
+
 class ElectionSyncTest(test_canon._CanonDbCase):
     def setUp(self) -> None:
         super().setUp()

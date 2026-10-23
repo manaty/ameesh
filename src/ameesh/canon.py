@@ -54,7 +54,7 @@ import subprocess
 import threading
 from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import Any, Iterable, Mapping
+from typing import Any, Iterable, Mapping, Sequence
 
 from . import harnesses
 from . import review as review_mod
@@ -1369,6 +1369,98 @@ class Canon:
             "ameesh_scope_unread": sorted(self.scope_unread),
             "out_of_scope": dict(sorted(self.out_of_scope.items())),
         }
+
+
+# ==========================================================================
+# Charge d'admissions d'un hôte (`max_agents`) — #3101 (suite d'EP1, L165)
+# ==========================================================================
+
+def elected_candidates(canon: Canon, placement: Any, covered: Iterable[str]) -> list[str] | None:
+    """Hôtes où l'admission d'un rôle élu peut tenir le bail, ou None (épinglé).
+
+    Un agent `releve: election` avec `candidats` ne tourne que là où il tient
+    le bail : son admission ne prend qu'UNE place dans tout le maillage, sur
+    l'un de ses candidats couverts par l'admission. Tout autre agent (et un
+    rôle élu sans candidat, déjà en erreur) occupe une place sur chaque hôte
+    couvert.
+    """
+    agent = canon.agent(placement.agent) if placement.agent else None
+    if agent is None or agent.releve != "election" or not agent.candidats:
+        return None
+    covered = set(covered)
+    return [name for name in agent.candidats if name in covered]
+
+
+def seat_elected(free: Mapping[str, int | None],
+                 roles: Mapping[str, Sequence[str]]) -> dict[str, str | None]:
+    """Asseoir chaque rôle élu sur un seul de ses candidats (#3101).
+
+    `free` : places laissées par les admissions épinglées (None = sans
+    maximum) ; `roles` : rôle -> candidats, dans l'ordre déclaré. Couplage
+    maximal par chemins augmentants : un rôle déjà assis cède sa place s'il
+    peut s'asseoir ailleurs. Rend rôle -> hôte, ou None si aucune place ne
+    reste ; déterministe (rôles triés, candidats dans l'ordre).
+    """
+    seat: dict[str, str | None] = {}
+    occupants: dict[str, list[str]] = defaultdict(list)
+
+    def room(host: str) -> bool:
+        cap = free.get(host)
+        return cap is None or len(occupants[host]) < cap
+
+    def place(role: str, seen: set[str]) -> bool:
+        for host in roles[role]:
+            if host in seen:
+                continue
+            seen.add(host)
+            if room(host):
+                occupants[host].append(role)
+                seat[role] = host
+                return True
+            for other in list(occupants[host]):
+                if place(other, seen):
+                    occupants[host].remove(other)
+                    occupants[host].append(role)
+                    seat[role] = host
+                    return True
+        return False
+
+    for role in sorted(roles):
+        if not place(role, set()):
+            seat[role] = None
+    return seat
+
+
+def admission_load(canon: Canon, covered: Mapping[str, Iterable[Any]],
+                   extra: str | None = None) -> tuple[dict[str, int], dict[str, str | None]]:
+    """Admissions épinglées par hôte et siège de chaque rôle élu (#3101).
+
+    `covered` : hôte -> admissions qui le couvrent ; `extra` : un hôte où
+    compter une admission épinglée de plus (proposition de placement).
+    """
+    pinned: dict[str, int] = defaultdict(int)
+    hosts_of: dict[int, set[str]] = defaultdict(set)
+    by_id: dict[int, Any] = {}
+    for host, admissions in covered.items():
+        for admission in admissions:
+            hosts_of[id(admission)].add(host)
+            by_id[id(admission)] = admission
+    roles: dict[str, list[str]] = {}
+    for key, admission in by_id.items():
+        candidates = elected_candidates(canon, admission, hosts_of[key])
+        if candidates is None:
+            for host in hosts_of[key]:
+                pinned[host] += 1
+        else:
+            seats = roles.setdefault(canon.agent(admission.agent).title, [])
+            seats += [host for host in candidates if host not in seats]
+    if extra is not None:
+        pinned[extra] += 1
+    free: dict[str, int | None] = {}
+    for host in canon.hosts:
+        limit = host.policy.max_agents
+        free[host.title] = None if limit is None else max(limit - pinned[host.title], 0)
+    return dict(pinned), seat_elected(free, roles)
 
 
 # ==========================================================================
@@ -3831,11 +3923,23 @@ def validate(canon: Canon, known_projects: Iterable[str] | None = None) -> list[
                 add("host-work-dir-agent-unknown", WARNING,
                     "policy of host %s: `work_dirs.%s` names no agent of the canon"
                     % (host.title, name), host.fiche, host=host.title)
+    # #3101 : une admission épinglée prend une place sur chaque hôte couvert ;
+    # un rôle élu n'en prend qu'une, sur l'un de ses candidats (seul l'hôte
+    # du bail le fait tourner).
+    pinned, seats = admission_load(
+        canon, {name: group.values() for name, group in by_host.items()})
+    for host in canon.hosts:
         limit = host.policy.max_agents
-        if limit is not None and len(by_host.get(host.title, {})) > limit:
+        if limit is not None and pinned.get(host.title, 0) > limit:
             add("host-max-agents", ERROR,
                 "host %s: %d admissions for max_agents = %d"
-                % (host.title, len(by_host[host.title]), limit), host.fiche, host=host.title)
+                % (host.title, pinned[host.title], limit), host.fiche, host=host.title)
+    for role, seat in sorted(seats.items()):
+        if seat is None:
+            agent = canon.agent(role)
+            add("agent-election-max-agents", ERROR,
+                "elected agent %s: no candidate (%s) has a free place under max_agents"
+                % (role, ", ".join(agent.candidats)), agent.fiche, agent=role)
 
     # -- politique de revue par classe (décision 0018 point 1, R19) ------------
     # La déclaration vit dans `federation.yaml`, sous `review_policies.classes`,

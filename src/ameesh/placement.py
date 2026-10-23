@@ -23,6 +23,7 @@ Le SQL est dans le stockage (`storage.of(db).placements`, spec §10).
 """
 from __future__ import annotations
 
+from collections import defaultdict
 from dataclasses import dataclass
 
 from . import canon as canon_mod
@@ -197,6 +198,13 @@ def proposals(canon: Canon, agent: str,
     block = canon_mod.blocking(findings)
     admission = admission_of(canon, agent)
     admis = set(admitted_hosts(canon, admission))
+    others: dict[str, list] = defaultdict(list)
+    for other in canon.placements:
+        if other.agent != agent:
+            for name in admitted_hosts(canon, other):
+                others[name].append(other)
+    pinned, seats = canon_mod.admission_load(canon, others)
+    unseated = {r for r, s in seats.items() if s is None}
     out = []
     for title in sorted({h.title for h in canon.hosts}):
         hosts = [h for h in canon.hosts if h.title == title]
@@ -218,11 +226,19 @@ def proposals(canon: Canon, agent: str,
             modes = None if policy.credential_modes is None else list(policy.credential_modes)
             if modes == []:
                 reasons.append("no credential mode admitted by host %s" % title)
-            others = [p for p in canon.placements if p.agent != agent
-                      and title in admitted_hosts(canon, p)]
-            if policy.max_agents is not None and len(others) >= policy.max_agents:
+            # #3101 : les rôles élus ne comptent qu'une fois, sur un candidat ;
+            # l'hôte est plein si l'agent n'y tient pas sans déloger un rôle
+            # élu que nul autre candidat ne peut accueillir.
+            _, with_agent = canon_mod.admission_load(canon, others, extra=title)
+            lost = {r for r, s in with_agent.items() if s is None}
+            if policy.max_agents is not None and pinned.get(title, 0) >= policy.max_agents:
                 reasons.append("host %s full: %d placement(s) for max_agents = %d"
-                               % (title, len(others), policy.max_agents))
+                               % (title, pinned.get(title, 0), policy.max_agents))
+            elif len(lost) > len(unseated):
+                reasons.append("host %s full: elected role(s) %s would find no place"
+                               " for max_agents = %d"
+                               % (title, ", ".join(sorted(lost - unseated)),
+                                  policy.max_agents))
         for finding in block.by_host.get(title, []):
             reasons.append("Host card in error: %s (%s)" % (finding.code, finding.where()))
         if modes is None:
