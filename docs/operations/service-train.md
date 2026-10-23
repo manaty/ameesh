@@ -179,11 +179,13 @@ planificateurs (`test-plan.py`, `test-parts.py`, `ci-flow.py`, `map.py`). La
 preuve est le run `push` de `paquet.yml` à la tête exacte : il doit référencer
 `tests.yml` au même SHA et porter les jobs appelés, préfixés par le job
 appelant (`suite complète du paquet / plan`, `… / psycopg 4/8`, `… / tests`) :
-la matrice complète 8 psycopg + 16 psql, le job `plateforme macOS` et l'agrégat
-`tests`. Une PR ouverte laisse `suite` sauté : les jobs appelés sont absents et
-le train ne s'en sert jamais. Une modification d'un de ces fichiers exige un
-nouveau contrat audité : le témoin `tests/test_2446_train_contract.py` compare
-les blobs au commit.
+la matrice complète 8 psycopg + 16 psql, le job **court** `plateforme macOS`
+(L63/L66, #3198) et l'agrégat `tests`. La suite complète sous macOS n'est plus
+dans ce contrat : elle vit dans `.github/workflows/macos.yml` (nocturne sur
+`main`, `ci-macos` sur une PR) et ne retient plus le paquet. Une PR ouverte
+laisse `suite` sauté : les jobs appelés sont absents et le train ne s'en sert
+jamais. Une modification d'un de ces fichiers exige un nouveau contrat audité :
+le témoin `tests/test_2446_train_contract.py` compare les blobs au commit.
 
 #3098 : les blobs de référence ne sont pas lus dans le module installé, qui
 reste l'instantané de la release, mais dans `src/ameesh/train_contracts.py` au
