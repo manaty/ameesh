@@ -7,6 +7,7 @@ run can stand in for complete CI. This adapter does not poll or rerun.
 """
 from __future__ import annotations
 
+import ast
 from dataclasses import asdict, dataclass
 import json
 import re
@@ -73,6 +74,11 @@ class Workflow:
     # A workflow-changing lot needs a newly audited contract, never a green
     # job with the same display name and different execution conditions.
     sources: tuple[tuple[str, str], ...] = ()
+    #: #3098: the repository file that declares these pins. The installed
+    #: module is a release snapshot; the target's base commit is reviewed and
+    #: landed code, so its own declared pins are the reference for a packet
+    #: head (see `versioned_sources`). Empty for a contract that pins nothing.
+    pins_at: str = ""
 
     def __post_init__(self):
         if self.event not in ("push", "workflow_dispatch", "workflow_call"):
@@ -95,6 +101,9 @@ class Workflow:
                 raise ValueError("repository-relative audited source path expected")
             if not re.fullmatch(r"(?:[0-9a-f]{40}|[0-9a-f]{64})", blob):
                 raise ValueError("full audited source blob expected")
+        if self.pins_at and (not re.fullmatch(r"[\w./-]+", self.pins_at) or any(
+                part in ("", ".", "..") for part in self.pins_at.split("/"))):
+            raise ValueError("repository-relative contract pin path expected")
 
 
 #: #2503: the identified plumbing jobs every lot suite carries. A reusable
@@ -178,6 +187,87 @@ def audited_sources(workflows):
     return sources
 
 
+def _declared_pins(text, path):
+    """The ``sources`` literal a contract module declares for one workflow.
+
+    Read as a syntax tree, never executed: the base commit is landed code, but
+    the train does not run the target's contract to learn what it should check.
+    Only a full literal is accepted; anything else refuses by name below.
+    """
+    try:
+        tree = ast.parse(text)
+    except SyntaxError as exc:
+        raise TrainError("the base contract cannot be read: %s" % exc) from exc
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        func = node.func
+        name = func.attr if isinstance(func, ast.Attribute) else getattr(func, "id", "")
+        if name != "Workflow":
+            continue
+        keywords = {kw.arg: kw.value for kw in node.keywords if kw.arg}
+        if "path" not in keywords or "sources" not in keywords:
+            continue
+        try:
+            declared_path = ast.literal_eval(keywords["path"])
+            sources = ast.literal_eval(keywords["sources"])
+        except (ValueError, SyntaxError):
+            continue
+        if declared_path != path:
+            continue
+        if not isinstance(sources, (tuple, list)) or not sources or not all(
+                isinstance(item, (tuple, list)) and len(item) == 2
+                and all(isinstance(part, str) for part in item) for item in sources):
+            raise TrainError("the base contract pins malformed sources: %s" % path)
+        return dict(sources)
+    return None
+
+
+def versioned_sources(repo, base, workflows):
+    """#3098: the pins declared at the target's base commit, else installed.
+
+    The installed module is the executed contract: its paths and jobs are the
+    ones this engine knows. Its blobs are a snapshot of the release, though,
+    and a packet that changes a shared CI source re-pins the target's own
+    contract file when it lands (the CI-unblock lane, canon §11 bis). Until
+    the next deploy the installed blobs are stale, so every cut would fail
+    until the release lands; the base commit is reviewed, landed code and is
+    the reference for the packet head. A packet that moves a source under the
+    base pins is still refused: the base is what it is based on, and its own
+    contract is not widened by an unknown file.
+    """
+    installed = audited_sources(workflows)
+    if not any(getattr(workflow, "pins_at", "") for workflow in workflows):
+        return installed
+    if not base:
+        raise TrainError("the base commit is required to read the versioned CI contract")
+    for workflow in workflows:
+        if not getattr(workflow, "pins_at", ""):
+            continue
+        proc = resolutions._run(repo, "show", "%s:%s" % (base, workflow.pins_at))
+        if proc.returncode:
+            # Bootstrap: a base that predates the versioned contract keeps the
+            # installed pins, exactly as before #3098.
+            continue
+        declared = _declared_pins(resolutions._text(proc), workflow.path)
+        if declared is None:
+            raise TrainError("the base contract does not declare the audited workflow: %s"
+                             % workflow.path)
+        own = [path for path, _blob in workflow.sources]
+        missing = sorted(set(own) - set(declared))
+        if missing:
+            raise TrainError("the base contract no longer pins the audited sources: %s"
+                             % ", ".join(missing))
+        for path in sorted(own):
+            proc = resolutions._run(repo, "ls-tree", base, "--", path)
+            fields = resolutions._text(proc).strip().split()
+            if proc.returncode or len(fields) != 4 or fields[0] not in ("100644", "100755") \
+                    or fields[1] != "blob" or fields[2] != declared[path] or fields[3] != path:
+                raise TrainError("the base contract pins %s differently from its tree" % path)
+            installed[path] = declared[path]
+    return installed
+
+
 def contract_digest(workflows):
     """The stable identity of a CI contract for the packet reservation.
 
@@ -189,7 +279,11 @@ def contract_digest(workflows):
     digest_method = getattr(workflows, "digest", None)
     if callable(digest_method):
         return digest_method()
-    return digest([asdict(workflow) for workflow in workflows])
+    # #3098: `pins_at` is where the blobs are versioned, not part of the
+    # audited execution contract: the digest (and a reservation made with it)
+    # must not change when only the pin location is declared.
+    return digest([{key: value for key, value in asdict(workflow).items()
+                    if key != "pins_at"} for workflow in workflows])
 
 
 def parts_cache(cfg):
@@ -261,8 +355,12 @@ def verify_local(path, plan, workflows):
     part of this packet's proof.
     """
     sources_for = getattr(workflows, "sources_for", None)
-    sources = (sources_for(plan, repo=path) if callable(sources_for)
-               else audited_sources(workflows))
+    if callable(sources_for):
+        sources = sources_for(plan, repo=path)
+    elif any(getattr(workflow, "pins_at", "") for workflow in workflows):
+        sources = versioned_sources(path, plan.get("base", ""), workflows)
+    else:
+        sources = audited_sources(workflows)
     for source, blob in sorted(sources.items()):
         proc = resolutions._run(path, "ls-tree", plan["head"], "--", source)
         fields = resolutions._text(proc).strip().split()
@@ -317,11 +415,18 @@ class GitHub:
     def _sources(self, plan):
         """The audited sources of the parts this plan actually executes."""
         sources_for = getattr(self.workflows, "sources_for", None)
-        if not callable(sources_for):
-            return audited_sources(self.workflows)
-        if not self.repo:
-            raise TrainError("dynamic CI contract requires the train repository")
-        return sources_for(plan, repo=self.repo, cache=self.cache)
+        if callable(sources_for):
+            if not self.repo:
+                raise TrainError("dynamic CI contract requires the train repository")
+            return sources_for(plan, repo=self.repo, cache=self.cache)
+        if any(getattr(workflow, "pins_at", "") for workflow in self.workflows):
+            if not self.repo:
+                # Read-only previews and unit contracts without a clone can
+                # only read the installed snapshot; the runner always hands
+                # its private clone, where the base pins are available.
+                return audited_sources(self.workflows)
+            return versioned_sources(self.repo, plan.get("base", ""), self.workflows)
+        return audited_sources(self.workflows)
 
     def _api(self, path):
         proc = self.gh(["api", "--paginate", "--slurp", "repos/%s/%s" % (self.slug, path)])
