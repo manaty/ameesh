@@ -99,35 +99,49 @@ def host_load(canon: Canon) -> tuple[dict[str, int], dict[str, str | None]]:
     return canon_mod.admission_load(canon, covered_by_host(canon))
 
 
+def capacity_baseline(canon: Canon, agent: str) -> tuple[dict[str, list], set[str]]:
+    """Admissions sans `agent`, et rôles élus sans place AVANT de le placer.
+
+    #3101 (B4) : la référence est le canon tel qu'il est. Un rôle élu y
+    concourt déjà pour sa place : la référence est le canon complet. Un agent
+    épinglé, lui, est déplacé par la proposition : la référence est le canon
+    sans lui.
+    """
+    covered = covered_by_host(canon, without=agent)
+    fiche = canon.agent(agent)
+    elected = fiche is not None and fiche.releve == "election" and bool(fiche.candidats)
+    seats = (host_load(canon) if elected else canon_mod.admission_load(canon, covered))[1]
+    return covered, {role for role, seat in seats.items() if seat is None}
+
+
 def capacity_reason(canon: Canon, agent: str, host: str,
-                    covered: dict[str, list] | None = None,
-                    unseated: set[str] | None = None) -> str | None:
+                    baseline: tuple[dict[str, list], set[str]] | None = None) -> str | None:
     """Pourquoi `host` n'a pas de place pour `agent` sous `max_agents`, ou None.
 
     #3101 : les admissions épinglées des autres agents remplissent l'hôte, ou
-    l'y asseoir ferait perdre sa place à un rôle élu que nul autre candidat
-    ne peut accueillir. `covered`/`unseated` : le calcul sans l'agent, quand
-    l'appelant juge plusieurs hôtes.
+    y placer l'agent laisserait sans place plus de rôles élus que le canon
+    tel qu'il est (`capacity_baseline`, à passer quand l'appelant juge
+    plusieurs hôtes). Un rôle déjà sans place ne ferme donc pas le candidat
+    d'un autre : seule sa propre fiche est en erreur.
     """
     fiche = next((h for h in canon.hosts if h.title == host), None)
     limit = fiche.policy.max_agents if fiche is not None else None
     if limit is None:
         return None
-    if covered is None:
-        covered = covered_by_host(canon, without=agent)
-    if unseated is None:
-        seats = canon_mod.admission_load(canon, covered)[1]
-        unseated = {role for role, seat in seats.items() if seat is None}
+    covered, unseated = baseline if baseline is not None else capacity_baseline(canon, agent)
     pinned, with_agent = canon_mod.admission_load(canon, covered, extra=host)
     if pinned.get(host, 0) > limit:
         return "host %s full: %d placement(s) for max_agents = %d" % (
             host, pinned[host] - 1, limit)
+    # l'agent placé sur l'hôte n'est plus un rôle à asseoir ; s'il était
+    # lui-même sans place, il ne prend celle d'aucun rôle assis (les sièges
+    # de `canon check` font foi, sa fiche seule est en erreur)
+    title = canon.agent(agent).title if canon.agent(agent) else agent
     lost = {role for role, seat in with_agent.items() if seat is None}
-    if len(lost) > len(unseated):
+    if len(lost) > len(unseated - {title}):
         return "host %s full: elected role(s) %s would find no place for max_agents = %d" % (
             host, ", ".join(sorted(lost - unseated)), limit)
     return None
-
 
 
 @dataclass
@@ -257,9 +271,7 @@ def proposals(canon: Canon, agent: str,
     block = canon_mod.blocking(findings)
     admission = admission_of(canon, agent)
     admis = set(admitted_hosts(canon, admission))
-    others = covered_by_host(canon, without=agent)
-    seats = canon_mod.admission_load(canon, others)[1]
-    unseated = {role for role, seat in seats.items() if seat is None}
+    baseline = capacity_baseline(canon, agent)
     out = []
     for title in sorted({h.title for h in canon.hosts}):
         hosts = [h for h in canon.hosts if h.title == title]
@@ -281,7 +293,7 @@ def proposals(canon: Canon, agent: str,
             modes = None if policy.credential_modes is None else list(policy.credential_modes)
             if modes == []:
                 reasons.append("no credential mode admitted by host %s" % title)
-            full = capacity_reason(canon, agent, title, others, unseated)
+            full = capacity_reason(canon, agent, title, baseline)
             if full:
                 reasons.append(full)
         for finding in block.by_host.get(title, []):

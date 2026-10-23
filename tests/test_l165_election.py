@@ -145,6 +145,36 @@ class ElectionMaxAgentsTest(test_canon._TmpMixin, unittest.TestCase):
             self.assertIs(placement.evaluate(loaded, name, "banc").ok, True, name)
             self.assertIs(placement.evaluate(loaded, name, "atelier").ok, False, name)
 
+    def test_role_assis_garde_sa_place_face_au_role_sans_place(self):
+        """B4 (relecture dev5) : un rôle sans place ne ferme pas le candidat
+        d'un rôle assis ; seule sa propre fiche est en erreur."""
+        from ameesh import placement
+        write(self.root, "agents/relecteur2.md", election_agent(title="relecteur2"))
+        write(self.root, "placements/relecteur2.md", fiche(
+            type="Placement", title="relecteur2@candidats", agent="relecteur2",
+            hosts=["atelier", "banc"], credential_mode="api-key"))
+        self.hosts(atelier=2, banc=1)
+        loaded = self.load()
+        findings = canon.validate(loaded)
+        self.assertEqual({f.agent for f in findings
+                          if f.code == "agent-election-max-agents"}, {"relecteur2"})
+        self.assertEqual(placement.host_load(loaded)[1],
+                         {"relecteur": "atelier", "relecteur2": None})
+        verdict = placement.evaluate(loaded, "relecteur", "atelier")
+        self.assertIs(verdict.ok, True, verdict.diagnostic)
+        choix = {c["host"]: c for c in placement.proposals(loaded, "relecteur")}
+        self.assertNotIn("full", " ".join(choix["atelier"]["reasons"]))
+        # le rôle sans place ne prend pas celle du rôle assis
+        verdict = placement.evaluate(loaded, "relecteur2", "atelier")
+        self.assertIs(verdict.ok, False)
+        self.assertIn("elected role(s) relecteur would find no place", verdict.diagnostic)
+        # une place de plus : les deux rôles sont assis, chacun sur un candidat
+        self.hosts(atelier=3, banc=1)
+        loaded = self.load()
+        self.assertEqual(codes(canon.validate(loaded), canon.ERROR), set())
+        self.assertEqual([placement.evaluate(loaded, r, "atelier").ok
+                          for r in ("relecteur", "relecteur2")], [True, True])
+
     def test_candidat_refuse_par_sa_politique_n_assoit_pas(self):
         """B2 (relecture cx2) : un candidat qui refuse le harnais n'offre pas de place."""
         from ameesh import placement
