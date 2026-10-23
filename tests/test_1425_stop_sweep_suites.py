@@ -145,6 +145,9 @@ class SweepAfterGuardsTest(_Base):
         # h-0115 : `sweep` publie aussi la vivacité ; le faux runner de ce
         # témoin ne l'exerce pas, seul l'ordre release/claim compte.
         fake.report_liveness = lambda: None
+        # #3070 : `sweep` lève les portes d'appareil restées fermées ; cette
+        # doublure n'a ni porte ni horloge, la passe est neutralisée.
+        fake.lift_device_gates_once = lambda: None
         fake.release_stopped_lots_once = mock.Mock(return_value=[])
         for key, value in kwargs.items():
             setattr(fake, key, value)

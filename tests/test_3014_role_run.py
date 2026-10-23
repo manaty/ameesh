@@ -343,7 +343,10 @@ class RoleHostGateTest(unittest.TestCase):
         cfg = self.cfg()
         fake = mock.Mock()
         fake.work.issue_feed.return_value = []
-        projector = plan_github.Projector(cfg, dry_run=True)
+        # Le témoin ne porte que la porte d'hôte : un `gh` factice le rend
+        # hermétique (sans binaire `gh`, `Projector.tick` reculerait avant
+        # d'appeler la projection et le second passage rendrait []).
+        projector = plan_github.Projector(cfg, dry_run=True, gh=mock.Mock())
         projector._journal = mock.Mock()
         with mock.patch.object(plan_github.storage, "of", return_value=fake), \
                 mock.patch.object(plan_github, "project_lots",

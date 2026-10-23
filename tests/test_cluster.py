@@ -176,6 +176,10 @@ FERMEES = {
     # superviseur ; table interne fermée aux deux rôles, aucun GRANT ajouté.
     "role_standings": {"id", "name", "host", "evaluated_at", "availability",
                        "capacity", "score", "ready", "diagnostic"},
+    # #3099 (0478) : marque de libération d'une bascule de rôle élu, côté hôte
+    # détenteur, relue par l'exécuteur au redémarrage ; état interne fermé aux
+    # deux rôles superviseur, aucun GRANT modifié.
+    "role_handover": {"host", "name", "challenger", "released_until", "updated_at"},
 }
 #: L232b (0417) : l'état interne du contrôleur de release reste hors contrat,
 #: sauf `host_release_fences.host`, lu par `ameesh_host_gate_state` (l.314).
