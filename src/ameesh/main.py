@@ -73,6 +73,8 @@
         durable withdrawal, return and lost-host recovery (L232e);
   ameesh host enroll|revoke|list|show   enroll lending devices (L110,
         authorized human only);
+  ameesh role status [ROLE] [--json]   elected roles: holder, epoch, ranked
+                                        candidates (L165); the runners publish;
   ameesh hosts [--json] [HOST]          host resources (L31);
   ameesh hosts HOST --hold --until 2h --reason R | --release
                                         the owner holds a host on purpose: its
@@ -321,6 +323,10 @@ def _dispatch(argv: list[str] | None) -> int:
     if command == "host" and rest and rest[0] in ("drain", "undrain", "status"):
         from . import host_lifecycle
         return host_lifecycle.main(rest)
+    if command == "role":
+        # L165 (EP2) : détenteur, époque et candidats classés d'un rôle élu
+        from . import role
+        return role.main(rest)
     if command == "plan":
         # L96 : feuille de route (engagements, propositions, Gantt)
         from . import roadmap
