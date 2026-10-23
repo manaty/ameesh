@@ -684,15 +684,31 @@ def direct_merge(slug: str, pr: int, head: str, *, lot: int, repo: str, db=None,
         raise MergePrError(str(exc)) from exc
     if branch and _branch_name(branch) != _branch_name(target):
         raise MergePrError("PR #%d targets %s, not %s" % (pr, branch, target))
-    # #2333 (canon §11 bis): the packet rule is checked before any scratch
-    # clone, GitHub mutation or write — the `already MERGED` declaration too.
-    # N1 (#1003): `--dry-run` validates an exception but never journals it.
-    try:
-        packet_guard.check_merge(None if dry_run and exception else db, lot,
-                                 view.get("headRefName") or "", target, head,
-                                 exception=exception, reason=reason, actor=actor)
-    except packet_guard.PacketGuardError as exc:
-        raise MergePrError(str(exc)) from exc
+    # #2333 (canon §11 bis): the packet rule is checked after the PR read and
+    # before any scratch clone, GitHub mutation or write — the `already
+    # MERGED` declaration too. L165 (EP4) : une exception explicite est une
+    # écriture durable ; elle partage la transaction du hold élu, sinon une
+    # bascule pendant `pr_view` laisserait une autorisation hors paquet à
+    # l'ancien détenteur (revue cx2 B3). N1 (#1003): `--dry-run` validates an
+    # exception but never journals it.
+    def declare(database):
+        try:
+            packet_guard.check_merge(database, lot, view.get("headRefName") or "",
+                                     target, head, exception=exception, reason=reason,
+                                     actor=actor)
+        except packet_guard.PacketGuardError as exc:
+            raise MergePrError(str(exc)) from exc
+
+    if fence is not None and exception and not dry_run:
+        from . import pilot_gesture
+        with db.transaction() as tx:
+            try:
+                fence.hold(tx)
+            except pilot_gesture.GestureRefused as exc:
+                raise MergePrError(str(exc)) from exc
+            declare(tx)
+    else:
+        declare(None if dry_run and exception else db)
 
     owner = work_dir or _scratch()
     reservation = None

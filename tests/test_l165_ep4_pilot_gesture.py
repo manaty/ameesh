@@ -356,6 +356,42 @@ class GestureFenceTest(PgTestCase):
                                 cfg=self.cfg)
         self.assertEqual(work.get(self.db, lot)["state"], "intake")
 
+    def test_gate_ferme_sur_une_vraie_base_illisible(self):
+        class BrokenDb:
+            def query(self, *args, **kwargs):
+                raise RuntimeError("boom")
+
+            def execute(self, *args, **kwargs):
+                raise RuntimeError("boom")
+
+        with self.live():
+            with self.assertRaises(pilot_gesture.GestureRefused) as caught:
+                pilot_gesture.gate(self.cfg, BrokenDb(), "assign", "#1")
+        self.assertIn("cannot read the registry", str(caught.exception))
+
+    def test_merge_pr_exception_ne_survit_pas_a_une_bascule(self):
+        lot = self.new_lot()
+        head = "a" * 40
+        old = self.epoch
+
+        def steal(*args, **kwargs):
+            registry.release(self.db, self.name, "runner-h1", old)
+            registry.claim(self.db, self.name, "runner-h2", 600, host="h2")
+            return {"state": "MERGED", "baseRefName": "main",
+                    "headRefName": "lot/3013-exception", "headRefOid": head,
+                    "mergeCommit": {"oid": head}}
+
+        with self.identity_env(name=self.name, runner="runner-h1", epoch=old):
+            with mock.patch.object(merge_pr, "pr_view", side_effect=steal), \
+                    mock.patch.object(merge_pr, "_bind_repo_identity"):
+                with self.assertRaises(merge_pr.MergePrError) as caught:
+                    merge_pr.direct_merge("manaty/ameesh", 7, head, lot=lot,
+                                          repo=self.tmp, db=self.db, cfg=self.cfg,
+                                          exception="incident",
+                                          reason="test residu merge-pr")
+        self.assertIn("fenced", str(caught.exception))
+        self.assertIsNone(packet_guard.declared(self.db, lot, head))
+
     def test_merge_pr_stale_refuse_avant_github(self):
         old = self.epoch
         registry.release(self.db, self.name, "runner-h1", old)

@@ -174,6 +174,11 @@ def _claims_lease() -> bool:
                 "AMEESH_LEASE_EPOCH", "AGENT_MESH_LEASE_EPOCH"))
 
 
+def _is_database(db) -> bool:
+    """A connection or transaction, not a test double without `query`/`execute`."""
+    return callable(getattr(db, "query", None)) and callable(getattr(db, "execute", None))
+
+
 def _role_gate(cfg, db, role: str, gesture: str, ref: str,
                project: str | None) -> Gate:
     """`AMEESH_ROLE` (EP5 `ameesh role run`): the epoch in the environment is
@@ -265,7 +270,10 @@ def gate(cfg, db, gesture: str, ref: str, *, project: str | None = None) -> Gate
     non-elected agent, an unknown agent, or no database at all. Raises
     `GestureRefused` for a session whose named agent is elected but not the
     current lease-holder, for an `AMEESH_ROLE` command whose epoch is missing
-    or stale, or whose identity cannot be read while it claims a lease.
+    or stale, or whose identity cannot be read while it claims a lease. A real
+    database failure (`DbError`, or an exception on a connection with
+    `query`/`execute`) fails closed; a test double without them is not a
+    database and is not fenced.
     """
     if gesture not in GESTURES:
         raise ValueError("unknown pilot gesture %r (%s)" % (gesture, " | ".join(GESTURES)))
@@ -279,9 +287,9 @@ def gate(cfg, db, gesture: str, ref: str, *, project: str | None = None) -> Gate
         return None
     try:
         row = registry.get(db, name)
-    except Exception as exc:  # noqa: BLE001 - only a database failure fails closed
+    except Exception as exc:  # noqa: BLE001 - a real database failure fails closed
         from .db import DbError
-        if isinstance(exc, DbError) and _claims_lease():
+        if _claims_lease() and (isinstance(exc, DbError) or _is_database(db)):
             raise GestureRefused(
                 "gesture %s refused for %s: cannot read the registry to verify the "
                 "lease epoch (%s)"
@@ -291,9 +299,9 @@ def gate(cfg, db, gesture: str, ref: str, *, project: str | None = None) -> Gate
         return None
     try:
         binding = identity.resolve_binding(_cfg(db, cfg), db)
-    except Exception as exc:  # noqa: BLE001 - a database failure fails closed
+    except Exception as exc:  # noqa: BLE001 - a real database failure fails closed
         from .db import DbError
-        if isinstance(exc, DbError):
+        if isinstance(exc, DbError) or _is_database(db):
             raise GestureRefused(
                 "gesture %s refused for %s: cannot verify the lease epoch (%s)"
                 % (gesture, name, " ".join(str(exc).split())[:160])) from exc
