@@ -141,3 +141,24 @@ class CommitSurvivesTest(TestCase):
                 self.skipTest("témoins #2614 absents de ce clone")
         self.assertFalse(review_authors._commit_survives(
             REPO, REAL_HEAD, REAL_REVIEW, {}, REAL_BASE))
+
+    def test_a_surviving_removal_block_precedes_a_copied_heading(self):
+        # B1 (cx3/auditeur) : le doc du correctif porte une en-tête héritée,
+        # donc `copied` n'est pas vide ; un retrait survivant dans un autre
+        # fichier ne doit pas être conclu « disparu » par cette branche.
+        context = "".join("context_line_%d()\n" % index
+                          for index in range(1, 7))
+        self.repo.write("gate.py",
+                        "allow_all_users_without_check()\n" + context)
+        self.repo.write("docs/other.md", "shared review heading\n")
+        base = self.repo.commit("base")
+        self.repo.write("gate.py", context)
+        self.repo.write("docs/review.md", "shared review heading\n"
+                                         "own review line\n")
+        fix = self.repo.commit("fix", agent="cx3")
+        self.repo.git("reset", "-q", "--hard", base)
+        self.repo.git("rm", "-q", "gate.py")
+        self.repo.write("relocated/gate.py", context + "rewritten_rest()\n")
+        self.repo.write("docs/review.md", "rewritten doc line\n")
+        head = self.repo.commit("impl: retrait regroupé", agent="impl")
+        self.assertTrue(self.survives(head, fix, base))
