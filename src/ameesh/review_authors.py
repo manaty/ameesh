@@ -303,13 +303,39 @@ def change(repo: str, sha: str) -> Optional[tuple[int, bool]]:
     return lines, design
 
 
-def commit_actor(repo: str, sha: str) -> tuple[str, float]:
+def _registered(db, name: str) -> bool:
+    if db is None or not name:
+        return False
+    try:
+        return registry.get(db, name) is not None
+    except Exception:  # noqa: BLE001 - registre illisible : inconnu
+        return False
+
+
+def _agent_of_email(db, email: str, stamp: float) -> str:
+    """L'agent d'une adresse de commit, ou "" (#3111).
+
+    `<nom>@ameesh.invalid` comme avant ; l'ancien `<nom>@ameesh.local` d'un
+    commit d'avant la convention (`identity.LEGACY_GIT_EMAIL_UNTIL`) seulement
+    vers un agent du registre, même quand il est la référence. La famille se
+    prouve ensuite comme pour tout commit sans reçu : journal des tours."""
+    from . import identity
+
+    name = identity.agent_of_git_email(email, stamp, legacy=False)
+    if name:
+        return name
+    name = identity.agent_of_git_email(email, stamp)
+    return name if name and _registered(db, name) else ""
+
+
+def commit_actor(repo: str, sha: str, db=None) -> tuple[str, float]:
     """`(acteur, instant)` du committer d'adresse d'agent, sinon ("", 0).
 
     Le committer est l'agent qui a créé l'objet (un rebase le réécrit) ; le nom
     Git seul ne prouve rien, l'adresse `<nom>@ameesh.invalid` est celle du
-    runner. L'instant sert au journal des tours, jamais à une proximité
-    arbitraire."""
+    runner. L'ancienne adresse `<nom>@ameesh.local` n'est lue qu'avec `db`,
+    datée d'avant la convention et vers un agent du registre (#3111).
+    L'instant sert au journal des tours, jamais à une proximité arbitraire."""
     text = plan_git._out(repo, "show", "-s", "--format=%ce%x1f%ct", sha)
     if text is None:
         return "", 0.0
@@ -321,38 +347,40 @@ def commit_actor(repo: str, sha: str) -> tuple[str, float]:
         stamp = float(raw_ts)
     except ValueError:
         return "", 0.0
-    from .identity import GIT_EMAIL_DOMAIN
-    suffix = "@" + GIT_EMAIL_DOMAIN
-    if not email.endswith(suffix):
+    actor = _agent_of_email(db, email, stamp)
+    if not actor:
         return "", 0.0
-    return email[:-len(suffix)], stamp
+    return actor, stamp
 
 
-def commits_written_by(repo: str, commits: Sequence[str], name: str) -> Optional[bool]:
+def commits_written_by(repo: str, commits: Sequence[str], name: str,
+                       db=None) -> Optional[bool]:
     """Un commit de la plage porte `name` comme **auteur Git** (`%ae`).
 
     L'auteur Git est la signature du contenu ; le committer (`commit_actor`)
     est l'agent qui a créé l'objet. Un amend ou un rebase conserve l'auteur
     d'origine et change le committer : les deux ont écrit la plage (#2808).
     Le nom Git seul ne prouve rien : l'adresse `<nom>@ameesh.invalid` est
-    exigée, comme pour le committer."""
+    exigée, comme pour le committer, ou l'ancienne `<nom>@ameesh.local` datée
+    (`%at`) d'avant la convention, vers un agent du registre (#3111)."""
     if not repo or not name:
         return False
     shas = [str(sha).strip() for sha in commits or () if str(sha).strip()]
     if not shas:
         return False
-    text = plan_git._out(repo, "log", "--no-walk", "--format=%H%x1f%ae", *shas)
+    text = plan_git._out(repo, "log", "--no-walk", "--format=%H%x1f%ae%x1f%at", *shas)
     if text is None or len(str(text).splitlines()) != len(set(shas)):
         return None                     # unreadable is not proof of absence
-    from .identity import GIT_EMAIL_DOMAIN
-    suffix = "@" + GIT_EMAIL_DOMAIN
     wanted = str(name).strip().lower()
     for line in str(text).splitlines():
-        _sha, separator, email = line.partition("\x1f")
-        if not separator:
+        fields = line.split("\x1f")
+        if len(fields) != 3:
             return None
-        email = email.strip().lower()
-        if email.endswith(suffix) and email[:-len(suffix)] == wanted:
+        try:
+            stamp = float(fields[2].strip())
+        except ValueError:
+            return None
+        if _agent_of_email(db, fields[1], stamp) == wanted:
             return True
     return False
 
@@ -752,7 +780,7 @@ def _prior_reading(db, item: Mapping, freeze: Mapping, commits: Sequence[str],
             unknown.append(sha[:12])
             continue
         if receipt is None:
-            actor, stamp = commit_actor(repo, sha)
+            actor, stamp = commit_actor(repo, sha, db)
             if not actor:
                 unknown.append(sha[:12])
                 continue
@@ -1222,7 +1250,7 @@ def reading(db, item: Mapping, milestone: Optional[Mapping],
             unknown.append(sha[:12])
             continue
         if receipt is None:
-            actor, stamp = commit_actor(repo, sha)
+            actor, stamp = commit_actor(repo, sha, db)
             if not actor:
                 unknown.append(sha[:12])
                 continue
@@ -1278,7 +1306,7 @@ def reading(db, item: Mapping, milestone: Optional[Mapping],
         authored = next((name for name in by_name
                          if name.lower() == author_name.lower()), "")
         if not authored:
-            written = commits_written_by(repo, commits, author_name)
+            written = commits_written_by(repo, commits, author_name, db)
             if written is None:
                 unknown.extend(str(sha)[:12] for sha in commits if str(sha)[:12] not in unknown)
             elif written:
