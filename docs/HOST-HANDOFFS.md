@@ -334,7 +334,12 @@ never shortens the lease: it keeps at least the TTL of the agent's host
 — the runner's own rule), and the locked renewal keeps the later of the
 current expiry and the new one (`GREATEST`, not a pre-read), so a gesture
 cannot make the lease expire before the next heartbeat and elect another
-pilot (#3115).
+pilot (#3115). It also does not extend past that host rule: the 300 s
+default of a gesture only applies to a host whose card rules no TTL. On a
+volatile host (90 s), holding 300 s after a gesture would keep a disappeared
+host's pilot alive for 300 s instead of 90 s and delay the election by as
+much; an external call's margin still extends the lease when it needs to
+(#3123).
 
 An EP5 timer (`ameesh role run`) may carry no agent identity but passes
 `AMEESH_ROLE` and the epoch it entered with. That pair is fenced too: a role
