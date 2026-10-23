@@ -704,7 +704,11 @@ def direct_merge(slug: str, pr: int, head: str, *, lot: int, repo: str, db=None,
             # the lot/freeze/branch/target link; nothing is written otherwise.
             # L165 (EP4) : la déclaration est un effet, fence-la même sans push.
             if fence is not None:
-                fence.hold(db)
+                from . import pilot_gesture
+                try:
+                    fence.hold(db)
+                except pilot_gesture.GestureRefused as exc:
+                    raise MergePrError(str(exc)) from exc
             _already_lot_links(db, lot, head, view, target, repo, cfg)
             return _already(slug, pr, head, view, target=target, fetch_url=fetch_url,
                             owner=owner)
@@ -859,7 +863,11 @@ def direct_merge(slug: str, pr: int, head: str, *, lot: int, repo: str, db=None,
         # avec la marge du push et de sa lecture ; refus si le bail renouvelé
         # n'a pas cette marge (course résiduelle documentée).
         if fence is not None:
-            fence.hold(db, margin_s=PILOT_CALL_MARGIN_S)
+            from . import pilot_gesture
+            try:
+                fence.hold(db, margin_s=PILOT_CALL_MARGIN_S)
+            except pilot_gesture.GestureRefused as exc:
+                raise MergePrError(str(exc)) from exc
         try:
             proc = _run(owner, "push", "--quiet", "--no-verify",
                         "--force-with-lease=%s:%s" % (ref, tip), push_url,

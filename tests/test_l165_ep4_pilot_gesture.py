@@ -352,9 +352,10 @@ class GestureFenceTest(PgTestCase):
         registry.release(self.db, self.name, "runner-h1", old)
         registry.claim(self.db, self.name, "runner-h2", 600, host="h2")
         with self.identity_env(name=self.name, runner="runner-h1", epoch=old):
-            with self.assertRaises(pilot_gesture.GestureRefused):
+            with self.assertRaises(decisions.DecisionError) as caught:
                 decisions.ask(self.cfg, self.db, requester=self.name,
                               question="Quelle option ?", lot=str(lot))
+        self.assertIn("fenced", str(caught.exception))
         self.assertEqual(self.db.query("SELECT count(*) AS n FROM agent_mailbox")[0]["n"], 0)
         self.assertEqual(work.get(self.db, lot)["state"], "intake")
 
@@ -373,8 +374,9 @@ class GestureFenceTest(PgTestCase):
         registry.release(self.db, self.name, "runner-h1", old)
         registry.claim(self.db, self.name, "runner-h2", 600, host="h2")
         with self.identity_env(name=self.name, runner="runner-h1", epoch=old):
-            with self.assertRaises(pilot_gesture.GestureRefused):
+            with self.assertRaises(fire.FireError) as caught:
                 fire.give(self.db, lot, sha="a" * 40, actor=self.name)
+        self.assertIn("fenced", str(caught.exception))
         marks = work.milestones(self.db, lot)
         self.assertFalse([m for m in marks if m.get("kind") == fire.FIRE])
 

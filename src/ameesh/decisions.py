@@ -631,14 +631,17 @@ def ask(cfg: Config, db, *, requester: str, question: str, options=(), lot: str 
     # hors base (elle ouvre un tour et déplace le lot). Le bail élu est
     # vérifié et journalisé avant la première écriture.
     from . import pilot_gesture
-    fence = pilot_gesture.gate(cfg, db, "decision", "decision lot #%d" % lot_id,
-                               project=decision.get("project"))
-    if fence is None:
-        row, decision_id, lot_state = write(db)
-    else:
-        with db.transaction() as tx:
-            fence.hold(tx)
-            row, decision_id, lot_state = write(tx)
+    try:
+        fence = pilot_gesture.gate(cfg, db, "decision", "decision lot #%d" % lot_id,
+                                   project=decision.get("project"))
+        if fence is None:
+            row, decision_id, lot_state = write(db)
+        else:
+            with db.transaction() as tx:
+                fence.hold(tx)
+                row, decision_id, lot_state = write(tx)
+    except pilot_gesture.GestureRefused as exc:
+        raise DecisionError(str(exc)) from exc
     out = get(db, decision_id, now) or {"id": decision_id}
     out["lot_state"] = lot_state
     return out

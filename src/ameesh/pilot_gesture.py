@@ -68,7 +68,7 @@ DEFAULT_TTL_S = 300.0
 RENEW_GRACE_S = 30.0
 
 
-class GestureRefused(RuntimeError):
+class GestureRefused(ValueError):
     """The session no longer holds its elected role at the epoch it was opened with."""
 
 
