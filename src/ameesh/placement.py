@@ -76,6 +76,51 @@ def admission_of(canon: Canon, agent: str):
     return found[0] if len(found) == 1 else None
 
 
+def covered_by_host(canon: Canon, *, without: str | None = None) -> dict[str, list]:
+    """Hôte -> admissions qui le couvrent (#3101), hors celle de `without`."""
+    covered: dict[str, list] = defaultdict(list)
+    for admission in canon.placements:
+        if admission.agent and admission.agent != without:
+            for name in admitted_hosts(canon, admission):
+                covered[name].append(admission)
+    return covered
+
+
+def host_load(canon: Canon) -> tuple[dict[str, int], dict[str, str | None]]:
+    """Admissions épinglées par hôte et siège de chaque rôle élu (#3101)."""
+    return canon_mod.admission_load(canon, covered_by_host(canon))
+
+
+def capacity_reason(canon: Canon, agent: str, host: str,
+                    covered: dict[str, list] | None = None,
+                    unseated: set[str] | None = None) -> str | None:
+    """Pourquoi `host` n'a pas de place pour `agent` sous `max_agents`, ou None.
+
+    #3101 : les admissions épinglées des autres agents remplissent l'hôte, ou
+    l'y asseoir ferait perdre sa place à un rôle élu que nul autre candidat
+    ne peut accueillir. `covered`/`unseated` : le calcul sans l'agent, quand
+    l'appelant juge plusieurs hôtes.
+    """
+    fiche = next((h for h in canon.hosts if h.title == host), None)
+    limit = fiche.policy.max_agents if fiche is not None else None
+    if limit is None:
+        return None
+    if covered is None:
+        covered = covered_by_host(canon, without=agent)
+    if unseated is None:
+        seats = canon_mod.admission_load(canon, covered)[1]
+        unseated = {role for role, seat in seats.items() if seat is None}
+    pinned, with_agent = canon_mod.admission_load(canon, covered, extra=host)
+    if pinned.get(host, 0) > limit:
+        return "host %s full: %d placement(s) for max_agents = %d" % (
+            host, pinned[host] - 1, limit)
+    lost = {role for role, seat in with_agent.items() if seat is None}
+    if len(lost) > len(unseated):
+        return "host %s full: elected role(s) %s would find no place for max_agents = %d" % (
+            host, ", ".join(sorted(lost - unseated)), limit)
+    return None
+
+
 
 @dataclass
 class Verdict:
@@ -158,6 +203,12 @@ def evaluate(canon: Canon, agent: str, host: str) -> Verdict:
             host, agent, ", ".join(admis) or "none")
         return verdict
     reasons = canon_mod.placement_violations(fiche, hosts[0], admission)
+    if not reasons and fiche.releve == "election" and fiche.candidats:
+        # #3101 : un rôle élu ne prend qu'une place, sur un candidat qui en a
+        # une ; un candidat sans place ne réclame pas le bail.
+        full = capacity_reason(canon, agent, host)
+        if full:
+            reasons.append(full)
     verdict.ok = not reasons
     verdict.diagnostic = "; ".join(reasons)
     return verdict
@@ -198,13 +249,9 @@ def proposals(canon: Canon, agent: str,
     block = canon_mod.blocking(findings)
     admission = admission_of(canon, agent)
     admis = set(admitted_hosts(canon, admission))
-    others: dict[str, list] = defaultdict(list)
-    for other in canon.placements:
-        if other.agent != agent:
-            for name in admitted_hosts(canon, other):
-                others[name].append(other)
-    pinned, seats = canon_mod.admission_load(canon, others)
-    unseated = {r for r, s in seats.items() if s is None}
+    others = covered_by_host(canon, without=agent)
+    seats = canon_mod.admission_load(canon, others)[1]
+    unseated = {role for role, seat in seats.items() if seat is None}
     out = []
     for title in sorted({h.title for h in canon.hosts}):
         hosts = [h for h in canon.hosts if h.title == title]
@@ -226,19 +273,9 @@ def proposals(canon: Canon, agent: str,
             modes = None if policy.credential_modes is None else list(policy.credential_modes)
             if modes == []:
                 reasons.append("no credential mode admitted by host %s" % title)
-            # #3101 : les rôles élus ne comptent qu'une fois, sur un candidat ;
-            # l'hôte est plein si l'agent n'y tient pas sans déloger un rôle
-            # élu que nul autre candidat ne peut accueillir.
-            _, with_agent = canon_mod.admission_load(canon, others, extra=title)
-            lost = {r for r, s in with_agent.items() if s is None}
-            if policy.max_agents is not None and pinned.get(title, 0) >= policy.max_agents:
-                reasons.append("host %s full: %d placement(s) for max_agents = %d"
-                               % (title, pinned.get(title, 0), policy.max_agents))
-            elif len(lost) > len(unseated):
-                reasons.append("host %s full: elected role(s) %s would find no place"
-                               " for max_agents = %d"
-                               % (title, ", ".join(sorted(lost - unseated)),
-                                  policy.max_agents))
+            full = capacity_reason(canon, agent, title, others, unseated)
+            if full:
+                reasons.append(full)
         for finding in block.by_host.get(title, []):
             reasons.append("Host card in error: %s (%s)" % (finding.code, finding.where()))
         if modes is None:

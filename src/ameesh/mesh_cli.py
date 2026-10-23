@@ -1023,14 +1023,8 @@ def cmd_menage(cfg: Config, args: argparse.Namespace) -> int:
 def _host_admissions(canon, name: str) -> int:
     """Admissions de `name` dans un canon : les épinglées, plus les rôles élus
     qui y tiennent leur siège (#3101 : un rôle élu ne compte qu'une fois)."""
-    from . import canon as canon_mod
     from . import placement as placement_mod
-    covered: dict[str, list] = {}
-    for p in canon.placements:
-        if p.agent:
-            for host in placement_mod.admitted_hosts(canon, p):
-                covered.setdefault(host, []).append(p)
-    pinned, seats = canon_mod.admission_load(canon, covered)
+    pinned, seats = placement_mod.host_load(canon)
     return pinned.get(name, 0) + sum(1 for seat in seats.values() if seat == name)
 
 

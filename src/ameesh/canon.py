@@ -1380,15 +1380,18 @@ def elected_candidates(canon: Canon, placement: Any, covered: Iterable[str]) -> 
 
     Un agent `releve: election` avec `candidats` ne tourne que là où il tient
     le bail : son admission ne prend qu'UNE place dans tout le maillage, sur
-    l'un de ses candidats couverts par l'admission. Tout autre agent (et un
-    rôle élu sans candidat, déjà en erreur) occupe une place sur chaque hôte
-    couvert.
+    l'un de ses candidats couverts par l'admission et dont la politique
+    l'admet (un candidat refusé ne peut pas tenir le bail). Tout autre agent
+    (et un rôle élu sans candidat, déjà en erreur) occupe une place sur chaque
+    hôte couvert.
     """
     agent = canon.agent(placement.agent) if placement.agent else None
     if agent is None or agent.releve != "election" or not agent.candidats:
         return None
     covered = set(covered)
-    return [name for name in agent.candidats if name in covered]
+    return [name for name in agent.candidats if name in covered
+            and canon.host(name) is not None
+            and not placement_violations(agent, canon.host(name), placement)]
 
 
 def seat_elected(free: Mapping[str, int | None],

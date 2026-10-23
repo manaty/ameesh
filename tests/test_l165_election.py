@@ -80,10 +80,11 @@ class ElectionMaxAgentsTest(test_canon._TmpMixin, unittest.TestCase):
         write(self.root, "agents/relecteur.md", election_agent())
         write(self.root, "placements/relecteur-atelier.md", election_admission())
 
-    def hosts(self, atelier: int, banc: int) -> None:
+    def hosts(self, atelier: int, banc: int,
+              atelier_harnesses=("claude", "codex", "deepseek")) -> None:
         # orchestre est épinglé sur atelier, ouvrier sur banc
         write(self.root, "hotes/atelier.md", host_card(
-            "atelier", harnesses=["claude", "codex", "deepseek"],
+            "atelier", harnesses=list(atelier_harnesses),
             providers=["anthropic", "openai", "deepseek"],
             credential_modes=["api-key", "subscription"],
             work_roots="{acme-web: ~/acme/acme-web}", max_agents=str(atelier)))
@@ -113,6 +114,59 @@ class ElectionMaxAgentsTest(test_canon._TmpMixin, unittest.TestCase):
         blocking = canon.blocking(findings)
         self.assertIn("relecteur", blocking.by_agent)
         self.assertNotIn("atelier", blocking.by_host)
+
+    def test_candidat_plein_ne_reclame_pas(self):
+        """B1 (relecture cx2) : le verdict d'un candidat suit sa place."""
+        from ameesh import placement
+        self.hosts(atelier=1, banc=2)
+        loaded = self.load()
+        atelier = placement.evaluate(loaded, "relecteur", "atelier")
+        self.assertIs(atelier.ok, False)
+        self.assertIn("host atelier full: 1 placement(s) for max_agents = 1", atelier.diagnostic)
+        self.assertIs(placement.evaluate(loaded, "relecteur", "banc").ok, True)
+        # place libre des deux côtés : les deux candidats restent ouverts
+        self.hosts(atelier=2, banc=2)
+        loaded = self.load()
+        self.assertEqual([placement.evaluate(loaded, "relecteur", h).ok
+                          for h in ("atelier", "banc")], [True, True])
+
+    def test_candidat_refuse_par_sa_politique_n_assoit_pas(self):
+        """B2 (relecture cx2) : un candidat qui refuse le harnais n'offre pas de place."""
+        from ameesh import placement
+        self.hosts(atelier=2, banc=1, atelier_harnesses=("claude", "deepseek"))
+        loaded = self.load()
+        findings = canon.validate(loaded)
+        self.assertIn("agent-election-max-agents", codes(findings, canon.ERROR))
+        self.assertIn("relecteur", canon.blocking(findings).by_agent)
+        self.assertEqual(placement.host_load(loaded)[1], {"relecteur": None})
+        banc = placement.evaluate(loaded, "relecteur", "banc")
+        self.assertIs(banc.ok, False)
+        self.assertIn("host banc full", banc.diagnostic)
+
+    def test_executeur_reserve_les_places_epinglees(self):
+        """B1 : un rôle élu ne prend que les places laissées par les épinglés."""
+        import threading
+        import types
+        from ameesh import runner as runner_mod
+
+        class Fil:
+            def __init__(self, **agent):
+                self.agent = agent
+
+            def is_alive(self):
+                return True
+
+        runner = types.SimpleNamespace(lock=threading.Lock(), _host_max_agents=3,
+                                       _host_pinned_admissions=2,
+                                       workers={"x": Fil(), "r1": Fil(releve="election")})
+        admits = lambda row: runner_mod.Runner.admits_new_worker(runner, row)  # noqa: E731
+        self.assertFalse(admits({"name": "r2", "releve": "election"}))  # 3 - 2 = 1 place, prise
+        self.assertTrue(admits({"name": "y"}))                           # place épinglée libre
+        del runner.workers["r1"]
+        self.assertTrue(admits({"name": "r2", "releve": "election"}))
+        runner._host_pinned_admissions = None                             # serveur : inconnu
+        runner.workers["r1"] = Fil(releve="election")
+        self.assertTrue(admits({"name": "r2", "releve": "election"}))
 
     def test_les_epingles_comptent_toujours_partout(self):
         self.hosts(atelier=0, banc=2)

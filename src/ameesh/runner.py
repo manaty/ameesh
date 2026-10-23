@@ -8458,6 +8458,7 @@ class Runner:
         maximum = limits.get("max_agents")
         self._host_max_agents = int(maximum) if maximum is not None else None
         self._host_limits_origin = {"max_agents": "serveur"}
+        self._host_pinned_admissions = None
         self.relocate = False
 
 
@@ -10456,6 +10457,11 @@ class Runner:
                     self._handoff_limits[h.title] = dict(effective["limits"], max_agents=effective["max_agents"])
         self._host_max_agents = mine["max_agents"]
         self._host_limits_origin = mine["origin"]
+        # #3101 : places des admissions épinglées sur cet hôte (tous les
+        # canons) ; un rôle élu ne prend que celles qu'elles laissent libres
+        from . import placement as placement_mod
+        self._host_pinned_admissions = sum(
+            placement_mod.host_load(one)[0].get(self.host, 0) for one in canons)
         # L159f : un hôte prêteur (offre `policy.lend`) a une porte fermée
         # par défaut
         sync_gate = getattr(self, "_sync_host_gate", None)
@@ -10523,17 +10529,28 @@ class Runner:
         fiches Host de tous les canons) borne le nombre de personas que cet
         exécuteur fait tourner à la fois. Les éphémères n'y comptent pas (ils
         n'ont pas d'admission ; `max_agents` compte des admissions). Sans
-        maximum déclaré : pas de borne."""
+        maximum déclaré : pas de borne.
+
+        #3101 : un rôle élu (`releve: election`) ne prend que les places que
+        les admissions épinglées de l'hôte laissent libres ; sinon il reste
+        réclamable par ses autres candidats."""
         if getattr(self, "mediated", False) and not self._gate_admits(agent):
             return False  # L112 : `caps.max_concurrent` de la porte
         cap = getattr(self, "_host_max_agents", None)
         if cap is None or (agent or {}).get("ephemeral"):
             return True
         with self.lock:
-            running = sum(1 for name, worker in self.workers.items()
-                          if name != (agent or {}).get("name") and worker.is_alive()
-                          and not (getattr(worker, "agent", None) or {}).get("ephemeral"))
-        return running < cap
+            others = [(getattr(worker, "agent", None) or {})
+                      for name, worker in self.workers.items()
+                      if name != (agent or {}).get("name") and worker.is_alive()
+                      and not (getattr(worker, "agent", None) or {}).get("ephemeral")]
+        if len(others) >= cap:
+            return False
+        pinned = getattr(self, "_host_pinned_admissions", None)
+        if (agent or {}).get("releve") != "election" or pinned is None:
+            return True
+        elected = sum(1 for other in others if other.get("releve") == "election")
+        return elected < cap - pinned
 
     def host_limits_for(self, host: str) -> dict | None:
         """Seuils connus d'un hôte (dernier `canon sync`), ou None."""
