@@ -6,7 +6,8 @@ détenteur ne peut pas faire (owner, bureau, paquet) : il n'est pas `sans_tour`.
 Même lecture que `stale_lot` et le SLO (`planned_waits.pilot_holds`) : une
 levée (`unhold:`) ou un changement d'état la finit, et `arrete` reste vrai
 sous retenue. La retenue de l'assigné lui-même (#2764) tient 24 h, puis
-l'alerte revient en la citant ; celle d'un tiers ordinaire ne compte pas.
+l'alerte revient en la citant ; elle finit aussi par sa levée, de lui-même
+ou d'un pilote. Celle d'un tiers ordinaire ne compte pas.
 """
 from __future__ import annotations
 
@@ -80,6 +81,22 @@ class OrphanLotHoldTest(PgTestCase):
         self.assertEqual(self._alerts(), [])
         self._note("unhold: gestes faits", "human:proprio", hours=2)
         self.assertEqual(self._alerts(), [(self.lot["id"], "sans_tour")])
+
+    def test_levee_d_un_pilote_finit_la_retenue_de_l_assigne(self):
+        """B cx2 : seul un pilote peut écrire `unhold:` (`work.check_wait_note`) ;
+        sa levée finit la retenue de l'assigné avant son terme."""
+        self._vieillir(3)
+        self._note("hold: j'attends la fusion du paquet 99", "dort", hours=3)
+        self.assertEqual(self._alerts(), [])
+        self._note("unhold: paquet 99 fusionné", "human:proprio", hours=2)
+        self.assertEqual(self._alerts(), [(self.lot["id"], "sans_tour")])
+
+    def test_levee_d_un_tiers_ne_finit_pas_la_retenue_de_l_assigne(self):
+        self.register("voisin", "claude", cwd=self.tmp)
+        self._vieillir(3)
+        self._note("hold: j'attends la fusion du paquet 99", "dort", hours=3)
+        self._note("unhold: je crois que c'est bon", "voisin", hours=2)
+        self.assertEqual(self._alerts(), [])
 
     def test_arrete_reste_vrai_sous_retenue(self):
         self._vieillir()
