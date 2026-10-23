@@ -7,7 +7,7 @@ import os
 import types
 from unittest import mock
 
-from ameesh import train, train_cli, work
+from ameesh import train, train_cli, train_fire, train_store, work
 from . import test_1467_train_fire as fixture
 from .support import PgTestCase
 
@@ -202,3 +202,26 @@ class TrainCommandTest(PgTestCase):
             self.assertEqual(self.ledger.load()["phase"], "publishing")
         finally:
             self.ledger.release(epoch)
+
+    def test_abandon_command_refuses_a_grant_committed_after_its_read(self):
+        # B1 cx2 (#3138): the command checks the fire, then takes the lease.
+        # A give that commits in that window must not lead to invalidating an
+        # authorized plan: the terminal write rechecks under the SQL lock that
+        # give itself takes.
+        item, document = self.unfired()
+        real_acquire = train_store.Ledger.acquire
+        granted = []
+        def grant_then_acquire(ledger, epoch):
+            if not granted:
+                granted.append(True)
+                with mock.patch.object(work, "corrector", return_value="pilot"):
+                    train_fire.Fires(None, ledger).give(item, actor="pilot")
+            return real_acquire(ledger, epoch)
+        with mock.patch.object(train_store.Ledger, "acquire", grant_then_acquire), \
+                mock.patch.object(work, "corrector", return_value="pilot"):
+            with self.assertRaisesRegex(train.TrainError, "fire changed"):
+                self.execute("abandon", manifest=item)
+        self.assertEqual(self.ledger.load()["phase"], "publishing")
+        self.assertEqual(self.db.query(
+            "SELECT state FROM integration_train_fires WHERE plan_id = %s", (item["id"],)),
+            [{"state": "active"}])
