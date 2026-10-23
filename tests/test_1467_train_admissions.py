@@ -101,6 +101,13 @@ class TrainAdmissionsTest(PgTestCase):
         self.assertEqual(self.admissions.admitted([packet], slot, BASE, proofs=proofs), [])
         proofs["admitted"][0]["proof"]["members"][0]["history"]["reviews"]["admitted_ts"] = 3000.0
         self.assertEqual(self.admissions.admitted([packet], slot, BASE, proofs=proofs), [])
+        # B2 (cx1) : c'est la période ouverte courante qui classe au cutoff ;
+        # 1050 est tard pour le cutoff 1000, 800 ne l'est pas.
+        proofs["admitted"][0]["proof"]["members"][0]["history"]["reviews"]["admitted_ts"] = 1050.0
+        self.assertEqual(self.admissions.admitted([packet], 1000.0, BASE, proofs=proofs), [])
+        proofs["admitted"][0]["proof"]["members"][0]["history"]["reviews"]["admitted_ts"] = 800.0
+        self.assertEqual(self.admissions.admitted([packet], 1000.0, BASE, proofs=proofs),
+                         [packet])
 
     def test_waiting_lot_and_changed_project_target_or_branch_refuse(self):
         item = self.entry["work_item_id"]

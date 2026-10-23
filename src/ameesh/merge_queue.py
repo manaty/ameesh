@@ -244,48 +244,60 @@ def _mark_order(mark: dict) -> tuple:
 
 def _gate_completed_ts(on_freeze, eligible: dict, *, required: int,
                       waived: bool, distinct_families: bool):
-    """#2965 : premier instant où la porte s'est ouverte, relu chronologiquement.
+    """#2965 : début de la période ouverte courante, relu chronologiquement.
 
     La porte ne retient que le **dernier** verdict de chaque acteur ; relire
-    son état final ne dit donc pas quand elle s'est ouverte pour la première
-    fois. On rejoue ici sa chronologie exacte, du plus ancien au plus récent :
-    un blocage courant ferme la porte jusqu'au `ok` du même acteur, et le
-    premier instant où plus aucun blocage ne court et où les avis requis sont
-    réunis est l'instant d'admissibilité. Un `ok` répété après coup ne
-    redate pas une porte déjà ouverte ; un blocage avant le `ok` la retarde.
+    son état final ne dit donc pas quand la période ouverte courante a
+    commencé. On rejoue ici sa chronologie exacte, du plus ancien au plus
+    récent : un blocage courant ferme la porte jusqu'au `ok` du même acteur,
+    et l'instant d'admissibilité est celui du verdict qui a **rouvert** la
+    porte après la dernière fermeture. Un `ok` redondant sur une porte déjà
+    ouverte ne la redate pas.
+
+    Sans avis requis ni blocage, la porte est ouverte dès le gel : la fonction
+    rend `None` pour que l'appelant conserve le gel, même si un `ok` arrive
+    plus tard. Un blocage, lui, la referme et sa levée date l'ouverture.
 
     `eligible` associe le nom (casefold) d'un relecteur dont l'avis `ok` est
     retenu par la porte à sa famille ; les avis des auteurs, des correcteurs
-    et des familles non prouvées n'y sont pas. Rend `None` quand aucun verdict
-    ne date l'ouverture (la porte s'ouvre alors au gel seul).
+    et des familles non prouvées n'y sont pas.
     """
     state: dict = {}
+    open_ = bool(waived) or required == 0
+    opened_at = None
     for mark in sorted(on_freeze, key=_mark_order):
         actor = str(mark.get("actor") or "").strip().casefold()
         state[actor] = mark
         if any((other.get("verdict") or "") == "blocked" for other in state.values()):
+            open_ = False
             continue
         if waived or required == 0:
-            return float(mark.get("at_ts") or 0.0)
-        retained = []
-        for other in state.values():
-            if (other.get("verdict") or "") != "ok":
-                continue
-            name = str(other.get("actor") or "").strip().casefold()
-            if name not in eligible:
-                continue
-            retained.append((_mark_order(other), eligible[name]))
-        retained.sort()
-        if required >= 2 and distinct_families:
-            families = []
-            for _order, family in retained:
-                if family not in families:
-                    families.append(family)
-            if len(families) >= required:
-                return float(mark.get("at_ts") or 0.0)
-        elif len(retained) >= required:
-            return float(mark.get("at_ts") or 0.0)
-    return None
+            complete = True
+        else:
+            retained = []
+            for other in state.values():
+                if (other.get("verdict") or "") != "ok":
+                    continue
+                name = str(other.get("actor") or "").strip().casefold()
+                if name not in eligible:
+                    continue
+                retained.append((_mark_order(other), eligible[name]))
+            retained.sort()
+            if required >= 2 and distinct_families:
+                families = []
+                for _order, family in retained:
+                    if family not in families:
+                        families.append(family)
+                complete = len(families) >= required
+            else:
+                complete = len(retained) >= required
+        if not complete:
+            open_ = False
+            continue
+        if not open_:
+            open_ = True
+            opened_at = float(mark.get("at_ts") or 0.0)
+    return opened_at if open_ else None
 
 
 def _same_sha(a, b, repo: str | None = None) -> bool:
@@ -602,12 +614,12 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
     `blocked`, et sa famille ne peut plus faire passer la porte. Les verdicts
     écartés sont rendus dans `unproven`.
 
-    #2965 : `completed_ts` publie le premier instant où la porte s'est
-    ouverte, relu chronologiquement (dernier verdict de chaque acteur, blocage
-    levé par le `ok` du même acteur) : un `ok` redondant ne redate pas une
-    porte déjà ouverte, un blocage retarde l'ouverture. Sans verdict à dater,
-    il vaut None (la porte s'ouvre au gel). C'est l'instant d'admissibilité du
-    train, pas une nouvelle règle pour la file.
+    #2965 : `completed_ts` publie le début de la période ouverte courante,
+    # relu chronologiquement (dernier verdict de chaque acteur, blocage levé
+    # par le `ok` du même acteur) : un `ok` redondant ne redate pas une porte
+    # déjà ouverte, un blocage la referme et sa levée date la réouverture. Sans
+    # blocage ni avis requis, il vaut None (la porte est ouverte au gel). C'est
+    # l'instant d'admissibilité du train, pas une nouvelle règle pour la file.
 
     Rend `{ok, why, class, required, accepted, blocked, waived, author,
     author_family, authors, corrections, on_freeze, unproven, completed_ts,
@@ -743,9 +755,9 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
                           str(m.get("actor") or "relecteur sans nom") for m in blocked))))
         return out
     if waived or required == 0:
-        # #2965 : même sans avis requis, un blocage courant ferme la porte
-        # jusqu'à sa levée ; l'instant d'admissibilité est alors celui du
-        # `ok` qui la rouvre, jamais le gel (B2).
+        # #2965 : sans avis requis, la porte est ouverte dès le gel ; un
+        # blocage courant la referme jusqu'à sa levée, et c'est alors le `ok`
+        # qui la rouvre qui date l'admissibilité, jamais le gel (B2).
         out["completed_ts"] = _gate_completed_ts(
             on_freeze, {}, required=required, waived=waived,
             distinct_families=distinct_families)
@@ -1010,10 +1022,11 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
                 continue                  # la famille d'un auteur ne compte pas
         accepted.append({"actor": actor, "family": family, "id": mark.get("id"),
                          "at_ts": mark.get("at_ts")})
-    # #2965 : l'instant d'ouverture se lit sur **tous** les avis retenus, pas
-    # seulement sur les `required` premiers choisis pour la famille : un avis
-    # d'une troisième famille tombé plus tôt a bien ouvert la porte à ce
-    # moment-là. On le calcule avant la troncature ci-dessous.
+    # #2965 : la période ouverte courante se lit sur **tous** les avis
+    # retenus, pas seulement sur les `required` premiers choisis pour la
+    # famille : un avis d'une troisième famille peut être celui qui a rouvert
+    # la porte après un blocage, et la troncature ci-dessous l'écarterait. On
+    # calcule donc avant la troncature.
     out["completed_ts"] = _gate_completed_ts(
         on_freeze,
         {str(entry["actor"] or "").strip().casefold(): entry["family"]

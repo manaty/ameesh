@@ -23,12 +23,13 @@ head's verdicts count (canon §2). The same-head rule is unchanged — a block o
 the freeze is lifted only by that reviewer's later `ok` on the freeze.
 
 #2965: `admitted_ts` is the instant the frozen candidate became admissible —
-# the first instant the gate opened, replayed chronologically by the gate
-# itself and never before the effective freeze. The train uses it to date its
-# own enrollment instead of the queue insertion it just wrote; a manual queue
-# insertion is never re-dated by it. A redundant `ok` does not re-date an
-# already open gate, and a same-head block delays the opening to its lift,
-# even when no verdict is required.
+# the start of the gate's current open period, replayed chronologically by the
+# gate itself and never before the effective freeze. The train uses it to date
+# its own enrollment instead of the queue insertion it just wrote; a manual
+# queue insertion is never re-dated by it. A redundant `ok` does not re-date an
+# already open gate; a same-head block closes it, and the lift dates the
+# reopening even when no verdict is required. Without a required verdict and
+# without a block, the gate is open from the freeze.
 
 The caller supplies the audited review requirement (count and classified
 files). This reader neither classifies a lot nor infers missing authors. It
@@ -46,11 +47,12 @@ def admitted_ts(freeze: dict, gate: dict) -> float:
 
     `gate` is the exact object admission used (`merge_queue.review_gate`):
     since #2965 it replays its own chronology and publishes `completed_ts`,
-    the first instant the gate was open. An `ok` repeated after that opening
-    never re-dates it (B1); a same-head block delays it until that reviewer's
-    later `ok`, even when no review is required or the pilot waived it (B2).
-    The admission instant is that opening, never before the effective freeze;
-    with no verdict to date an open gate, the freeze itself is the instant.
+    the start of the gate's current open period. An `ok` repeated while the
+    gate is open never re-dates it (B1); a same-head block closes the gate and
+    its later lift dates the reopening, even when no review is required or the
+    pilot waived it (B2). The admission instant is that start, never before
+    the effective freeze; without a block, a gate open from the freeze keeps
+    the freeze as its instant.
     """
     try:
         stamp = float(freeze["at_ts"])

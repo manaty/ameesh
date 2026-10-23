@@ -507,6 +507,57 @@ class AdmittedInstantTest(unittest.TestCase):
             [dict(kind="verdict", sha=self.SHA, **mark) for mark in verdicts], {},
             required=1, waived=True, distinct_families=True), 140.0)
 
+    def test_an_ok_does_not_date_a_gate_open_from_the_freeze(self):
+        """B1 (cx1) : sans avis requis ni blocage, garder le gel, même sous waived."""
+        gate = self.gate([dict(actor="r1", verdict="ok", at_ts=1050.0, id=2)],
+                         required=0,
+                         klass={"class": "light", "files": ()})
+        self.assertTrue(gate["ok"], gate)
+        self.assertIsNone(gate["completed_ts"])
+        self.assertEqual(train_history.admitted_ts({"at_ts": 800.0}, gate), 800.0)
+        # Un OK ne date pas davantage une porte ouverte par dispense.
+        self.assertIsNone(merge_queue._gate_completed_ts(
+            [dict(kind="verdict", sha=self.SHA, actor="r1", verdict="ok",
+                  at_ts=1050.0, id=2)], {},
+            required=1, waived=True, distinct_families=True))
+
+    def test_a_late_block_closes_an_open_gate_and_its_lift_dates_admission(self):
+        """B2 (cx1) : dater la période ouverte courante après la dernière fermeture."""
+        # required=2 : porte ouverte à 900, refermée à 950, rouverte à 1050.
+        gate = self.gate([
+            dict(actor="r1", verdict="ok", at_ts=850.0, id=2),
+            dict(actor="r2", verdict="ok", at_ts=900.0, id=3),
+            dict(actor="r1", verdict="blocked", at_ts=950.0, id=4),
+            dict(actor="r1", verdict="ok", at_ts=1050.0, id=5)])
+        self.assertTrue(gate["ok"], gate)
+        self.assertEqual(gate["completed_ts"], 1050.0)
+        instant = train_history.admitted_ts({"at_ts": 800.0}, gate)
+        self.assertEqual(instant, 1050.0)
+        self.assertGreater(instant, 1000.0)   # late au cutoff 1000
+        # required=0 : ouverte au gel, fermée à 950, rouverte à 1050 ; le
+        # premier OK de 850 ne doit pas arrêter le rejeu avant la fermeture.
+        gate = self.gate([
+            dict(actor="r1", verdict="ok", at_ts=850.0, id=2),
+            dict(actor="r1", verdict="blocked", at_ts=950.0, id=3),
+            dict(actor="r1", verdict="ok", at_ts=1050.0, id=4)],
+            required=0, klass={"class": "light", "files": ()})
+        self.assertEqual(gate["completed_ts"], 1050.0)
+        self.assertEqual(train_history.admitted_ts({"at_ts": 800.0}, gate), 1050.0)
+        # Même chronologie sous waived.
+        waived = [dict(kind="verdict", sha=self.SHA, actor="r1", verdict="ok",
+                       at_ts=850.0, id=2),
+                  dict(kind="verdict", sha=self.SHA, actor="r1", verdict="blocked",
+                       at_ts=950.0, id=3),
+                  dict(kind="verdict", sha=self.SHA, actor="r1", verdict="ok",
+                       at_ts=1050.0, id=4)]
+        self.assertEqual(merge_queue._gate_completed_ts(
+            waived, {}, required=1, waived=True, distinct_families=True), 1050.0)
+        # Un OK redondant après la levée ne redate pas la porte.
+        self.assertEqual(merge_queue._gate_completed_ts(
+            waived + [dict(kind="verdict", sha=self.SHA, actor="r1", verdict="ok",
+                           at_ts=1100.0, id=5)], {},
+            required=1, waived=True, distinct_families=True), 1050.0)
+
     def test_admission_is_never_before_the_effective_freeze(self):
         gate = self.gate([
             dict(actor="r1", verdict="ok", at_ts=110.0, id=2),
