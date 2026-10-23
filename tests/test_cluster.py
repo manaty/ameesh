@@ -146,6 +146,12 @@ FERMEES = {
     # interne borné au tour (réparation d'un worker mort), pas un état de
     # supervision ; colonne fermée aux deux rôles, aucun GRANT modifié.
     "spend_pending": {"resident_usage"},
+    # L165 (EP1, 0473) : verdicts de placement par hôte candidat, lus par la
+    # condition de réclamation et non par le rôle superviseur ; table interne
+    # fermée aux deux rôles, aucun GRANT ajouté.
+    "agent_candidates": {"name", "host", "canon", "cwd", "placement_ok",
+                         "placement_diagnostic", "placement_ref",
+                         "placement_profile", "updated_at"},
     # #2443 (0465) : appartenance d'une unité à un paquet, écrite à la
     # composition (porteur, commit de composition, gel effectif). État interne
     # lu par `work show` et `sync-merges` ; fermé aux deux rôles superviseur,

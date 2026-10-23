@@ -370,8 +370,12 @@ class Leases(Domain):
 
     @abc.abstractmethod
     def claim(self, name: str, owner: str, ttl_seconds: float, *,
-              require_responsible: bool) -> dict | None:
-        """Prend le bail s'il est libre ou expiré ; rend la ligne, sinon None."""
+              require_responsible: bool, host: str | None = None) -> dict | None:
+        """Prend le bail s'il est libre ou expiré ; rend la ligne, sinon None.
+
+        `host` (L165, EP1) : l'hôte qui réclame, pour un agent
+        `releve: election`. None : l'hôte de la ligne (comportement d'un agent
+        épinglé). Le serveur médié force cet argument à l'hôte de l'exécuteur."""
 
     @abc.abstractmethod
     def attach_claim(self, name: str, owner: str, ttl_seconds: float, *,
@@ -2624,6 +2628,40 @@ class Canon(Domain):
         si le CAS refuse une lecture périmée : la politique n'est pas appliquée."""
 
     @abc.abstractmethod
+    def set_election(self, name: str, releve: str, candidats: Sequence[str] | None,
+                     *, canon: str) -> None:
+        """L165 (EP1) : écrit `releve` / `candidats` de la ligne du canon et
+        retire les verdicts de candidats qui ne sont plus des candidats (ou
+        tous si le rôle redevient `hote`). Ne déplace jamais l'agent."""
+
+    @abc.abstractmethod
+    def write_candidate(self, name: str, host: str, *, canon: str, cwd: str | None,
+                        ok: bool | None, diagnostic: str, ref: str | None,
+                        harness: str | None, provider: str | None,
+                        model: str | None, credential_mode: str | None) -> None:
+        """L165 (EP1) : inscrit le verdict de placement de `name` sur l'hôte
+        candidat `host` (profil évalué calculé dans la même instruction), pour
+        que la réclamation depuis cet hôte soit jugée sur SA politique."""
+
+    @abc.abstractmethod
+    def candidate_names(self, host: str, canon: str = "") -> list[str]:
+        """L165 (EP1) : noms des agents qui ont un verdict de candidat sur
+        `host`, pour que le sync de CET hôte voie aussi les fiches retirées
+        dont la ligne est encore chez un autre détenteur."""
+
+    @abc.abstractmethod
+    def close_candidates(self, name: str, *, canon: str, diagnostic: str) -> None:
+        """L165 (EP1) : ferme TOUS les verdicts candidats d'un agent dont la
+        fiche est en erreur (responsable non résolu, candidat non admis…),
+        quel que soit l'hôte qui l'a constaté. Laisse `releve` intact ; une
+        synchronisation ultérieure rouvrira les hôtes valides."""
+
+    @abc.abstractmethod
+    def clear_candidate(self, name: str, host: str, *, canon: str) -> None:
+        """L165 (EP1) : retire le verdict candidat de `name` sur `host` (hôte
+        qui n'est plus admis), sans toucher aux autres candidats."""
+
+    @abc.abstractmethod
     def clear_responsible(self, name: str, host: str,
                           owner: tuple[str, bool] | None = None) -> None:
         """Vide le responsable d'un agent non éphémère de l'hôte ; `owner`
@@ -2671,11 +2709,15 @@ class Canon(Domain):
 
     @abc.abstractmethod
     def stop_removed(self, name: str, host: str, *, pending_text: str,
-                     stop_text: str, owner: tuple[str, bool] | None = None) -> dict | None:
+                     stop_text: str, owner: tuple[str, bool] | None = None,
+                     expected_lease_epoch: int | None = None) -> dict | None:
         """Arrête un agent retiré du canon (sauf en plein tour : arrêt demandé) ;
         rend name et status, ou None s'il n'y avait rien à faire. `owner` (L42) :
         (id, défaut) du canon auquel la ligne doit appartenir — jamais celle
-        d'un autre canon."""
+        d'un autre canon. `expected_lease_epoch` (L165) : le retrait constaté
+        sur un AUTRE hôte que celui de la ligne ne s'applique que si le bail
+        n'a pas changé depuis la lecture (aucune réclamation concurrente
+        n'est tuée)."""
 
 
 class Ephemerals(Domain):
