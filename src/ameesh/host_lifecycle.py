@@ -58,9 +58,11 @@ def reconcile(cfg, db, host, *, actor=None):
 
     The proof is database state read under the host gate lock (readings in
     database time covering one detection window without a hole, origins home
-    and unfenced, no live lease, no active handoff, no recovery attempt),
-    never the returning machine's own declaration. A refusal names the missing
-    proof instead of forcing the host open.
+    and unfenced, no active handoff, no recovery attempt since the loss),
+    never the returning machine's own declaration. A live lease of an agent
+    that is home is the returning host's own runner and does not block the
+    proof (#3180); a recovery that moved the agent elsewhere still closes it.
+    A refusal names the missing proof instead of forcing the host open.
     """
     if not isinstance(host, str) or not NAME_RE.fullmatch(host):
         raise ValueError("invalid host name")

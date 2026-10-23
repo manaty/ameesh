@@ -41,6 +41,7 @@
       "default_home": "~/.claude",
       "session_store": "projects",
       "credentials": ".credentials.json",
+      "keychain_service": "Claude Code-credentials",
       "key_env": "ANTHROPIC_API_KEY"
     },
     "backup": {"session_files": ["projects/*/{session}.jsonl", "projects/*/{session}"]},

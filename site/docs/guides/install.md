@@ -14,12 +14,12 @@ instead.
     No packaged or signed executable is provided for now (owner answer
     #9416, 2026-10-12).
 
-## Platform support in v1.10.0
+## Platform support in v1.17.1
 
 | Platform | State |
 |---|---|
 | **Linux** | The reference platform; the full suite runs in CI. Install and run. |
-| **macOS** | **Not supported yet.** The platform layer of L63 is merged (psutil, guarantees that refuse instead of passing) and, since L68, CI runs the full suite on macOS against a PostgreSQL installed in the CI step (the job is not a required check until that suite is green there). The launchd service and the Keychain credentials check (L65) are not delivered. Use a **remote database only** (owner answer #9414). |
+| **macOS** | **Supported for a workstation, with a remote database only** (owner answers #9414 and #9416). Install, point the DSN at the mesh's remote database, then install the launchd services with `ameesh service install` (runner and `ameesh notify`); Claude Code credentials are checked in the login Keychain. Since L68, CI also runs the full suite on macOS against a PostgreSQL installed in the CI step (the job is not a required check until that suite is green there). |
 | **Windows** | **WSL2 only.** Native Windows is deferred (owner answer #9411; lot L67), and ameesh does not start there. Inside WSL2 it is a Linux, so the Linux instructions below apply, with one constraint: the **harness must run inside WSL too**, because ameesh cannot see Windows processes and cannot verify that a session is closed. |
 
 ## Requirements
@@ -28,8 +28,9 @@ instead.
 - Python **3.9 or later** — `uv` can install one for you;
 - `git`, to install from the repository;
 - a PostgreSQL database reachable from the workstation; `psycopg` comes with
-  the package, so no `psql` binary is required (on macOS, not supported yet,
-  only a remote database applies — see the table above);
+  the package, so no `psql` binary is required. On macOS, **only a remote
+  database applies**: no local PostgreSQL is installed nor documented (owner
+  answer #9414);
 - the harness binaries (`claude`, `codex`, `dsh`) are installed separately.
 
 ## 1. Install uv
@@ -96,6 +97,105 @@ Then declare the host, its agents and their placements in the canon
 ([Operate agents](operate-agents.md)). A container profile for a single
 isolated agent is described in [Cluster profile](cluster-profile.md).
 
+### macOS: remote database, launchd services and Keychain
+
+macOS has no local PostgreSQL: use the **remote database** the mesh already
+runs. The host configuration carries no secret; the password comes from
+`~/.pgpass` (mode `0600`), from `PGPASSWORD`, or from the host environment
+file below.
+
+```bash
+mkdir -p ~/.config/ameesh
+chmod 700 ~/.config/ameesh
+
+# ~/.config/ameesh/config.json: no password in this file
+cat > ~/.config/ameesh/config.json <<'JSON'
+{
+  "dsn": "host=db.example.net dbname=ameesh user=ameesh",
+  "host": "macbook-smichea"
+}
+JSON
+
+# The launchd services source this file (0600); it is also the place for
+# AMEESH_DSN with a password, PGPASSWORD and GH_TOKEN.
+install -m 0600 /dev/null ~/.config/ameesh/env
+$EDITOR ~/.config/ameesh/env
+set -a; . ~/.config/ameesh/env; set +a
+
+ameesh migrate
+ameesh doctor
+```
+
+`~/.config/ameesh/env` is a **shell fragment** sourced by `/bin/sh`, not a
+systemd `EnvironmentFile=`: quote values that contain spaces, `&`, `$` or
+other shell metacharacters (`AMEESH_DSN='host=… user=… password=…'`), or the
+line will not reach the service as written. `ameesh notify` also sources
+`~/.config/ameesh/notify.env` (mode `0600`) for its channel secrets
+(`AMEESH_SLACK_WEBHOOK`, `AMEESH_NTFY_TOKEN`), like its systemd unit; the
+runner does not read that file.
+
+Install the services (launchd, user session):
+
+```bash
+ameesh service install                    # one runner for the host + ameesh notify
+ameesh service status
+```
+
+`ameesh service install` writes `~/Library/LaunchAgents/ameesh-runner.plist`
+and `~/Library/LaunchAgents/ameesh-notify.plist`, loads them in
+`gui/$(id -u)`, and creates `~/Library/Logs/ameesh/` (mode `0700`). The
+services start at login and restart after a failure; their output goes to
+`~/Library/Logs/ameesh/runner.log` (or `.err`) and `notify.log` (or `.err`).
+The plists contain **no secret**: each service sources
+`~/.config/ameesh/env` before `exec`uting ameesh.
+
+Stopping a service does not kill a running turn: the runner plist sets
+launchd's `ExitTimeOut` to 35 min, so a reinstall or an uninstall lets the
+turn drain (30 min by default, `AMEESH_DRAIN_SECONDS`) and clean up before
+launchd sends SIGKILL — the same bound as the systemd units'
+`TimeoutStopSec=35min`. `ameesh service install` and `uninstall` therefore
+wait for that stop, as `systemctl restart` does.
+
+On a workstation that runs one process per agent (the model of
+`deploy/systemd/ameesh-runner-agent@.service`), name the agents instead of
+installing the host runner:
+
+```bash
+ameesh service install --agent coord --agent reviewer
+ameesh service status --agent coord --agent reviewer
+```
+
+The two models are exclusive: before switching from the host runner to
+per-agent runners, remove the host runner with
+`ameesh service uninstall --no-notify`. The service's `PATH` already covers
+mise, `~/.local/bin`, Homebrew (`/opt/homebrew/bin`) and the system
+directories; if a harness lives elsewhere, add its directory to `PATH` in
+`~/.config/ameesh/env`, or name the binary with `harness_bins` / `AMEESH_BIN`.
+
+Read the launchd state directly with
+`launchctl print gui/$(id -u)/ameesh.runner` (or `ameesh.runner.<agent>`),
+and remove the services with `ameesh service uninstall` (the same `--agent`
+selection as the install). `ameesh service install --dry-run` prints the
+plists without writing anything; it works on Linux too, to review what macOS
+would receive.
+
+Claude Code on macOS stores its OAuth credentials in the **login Keychain**
+(service `Claude Code-credentials`), not in `~/.claude/.credentials.json`.
+`ameesh accounts list` checks that the item exists, and never reads the
+secret (`security find-generic-password` without `-w`). A secondary account
+declared with a `path` uses Claude Code's namespaced item
+(`Claude Code-credentials-<sha256(dir)[:8]>`, Claude Code 2.1.56 and later):
+log in once for that account with `CLAUDE_CONFIG_DIR=<path> claude`, then
+declare it in the `accounts` key of the host configuration. Codex keeps its
+`auth.json` file on macOS, so its check is unchanged. If the host keeps its
+own `claude.json` harness descriptor
+(`~/.config/ameesh/harnesses/claude.json`), keep the
+`ameesh.accounts.keychain_service` key: it names the Keychain service, and a
+descriptor without it falls back to the old file check.
+
+`ameesh doctor --notify-test` also proves the desktop channel this OS uses
+(`osascript` on macOS, L66).
+
 ## 4. Upgrade
 
 ```bash
@@ -128,17 +228,21 @@ is in
 the mesh's staging update is the step-by-step `deploy/mise-a-jour/` procedure
 described in `docs/BASCULE.md` (in French).
 
-## What v1.10.0 does not provide
+## What v1.17.1 does not provide
 
-- no PyPI package, and no signed or notarized executable;
+- no PyPI package, and no signed or notarized executable (L69);
 - no native Windows (WSL2 only);
-- on macOS, no service manager and no Keychain credentials check, and a CI
-  part limited to the platform tests.
+- on macOS, the full suite runs in CI since L68, but that job is not a
+  required check yet; local PostgreSQL is not supported nor documented
+  (remote database only, owner answer #9414).
 
 ## How this page was verified
 
 The Linux commands above were executed for this page (lot #394, `uv` 0.13.0,
 ameesh 1.10.0 at `b85777c1e`): install from a local clone, install from
 `git+…@main`, `--editable`, `uv tool upgrade`, and `ameesh --version` on the
-installed tool. macOS and WSL2 were not executed by the project; the table
-above is the measured state of v1.10.0.
+installed tool. The macOS launchd plists and the Keychain lookup are exercised
+by the macOS CI part (L65); a full install on a real Mac was not executed by
+the project, and `launchctl bootstrap` and the Keychain login itself were not.
+WSL2 was not executed either; the table above is the measured state of
+v1.17.1.

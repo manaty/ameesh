@@ -179,16 +179,18 @@ planificateurs (`test-plan.py`, `test-parts.py`, `ci-flow.py`, `map.py`). La
 preuve est le run `push` de `paquet.yml` à la tête exacte : il doit référencer
 `tests.yml` au même SHA et porter les jobs appelés, préfixés par le job
 appelant (`suite complète du paquet / plan`, `… / psycopg 4/8`, `… / tests`) :
-la matrice complète 8 psycopg + 16 psql, le job `plateforme macOS` et l'agrégat
-`tests`. Une PR ouverte laisse `suite` sauté : les jobs appelés sont absents et
-le train ne s'en sert jamais. Une modification d'un de ces fichiers exige un
-nouveau contrat audité : le témoin `tests/test_2446_train_contract.py` compare
-les blobs au commit.
+la matrice complète 8 psycopg + 16 psql, le job **court** `plateforme macOS`
+(L63/L66, #3198) et l'agrégat `tests`. La suite complète sous macOS n'est plus
+dans ce contrat : elle vit dans `.github/workflows/macos.yml` (nocturne sur
+`main`, `ci-macos` sur une PR) et ne retient plus le paquet. Une PR ouverte
+laisse `suite` sauté : les jobs appelés sont absents et le train ne s'en sert
+jamais. Une modification d'un de ces fichiers exige un nouveau contrat audité :
+le témoin `tests/test_2446_train_contract.py` compare les blobs au commit.
 
 #3098 : les blobs de référence ne sont pas lus dans le module installé, qui
 reste l'instantané de la release, mais dans `src/ameesh/train_contracts.py` au
 **commit de base** de la cible — code relu et atterri. Le module installé
-fournit toujours les chemins et les jobs du contrat. Un paquet qui change une
+fournit les chemins et un **plancher** de jobs. Un paquet qui change une
 source est donc refusé, et une fois ce paquet atterri par la voie « déblocage
 CI » (§11 bis) avec son ré-épinglage, la coupure suivante repart immédiatement,
 sans attendre la release et le déploiement suivants. **Toutes** les sources
@@ -197,6 +199,15 @@ connaît pas encore : la tête ne peut pas les déplacer. Une base dont les épi
 ne correspondent pas à son propre arbre, qui omet une source auditée, ou dont le
 commit est absent du clone, est refusée par un message nommé. Témoins :
 `tests/test_3098_train_contract_pins.py`.
+
+#3108 : les jobs déclarés par la base s'ajoutent à ceux du module installé.
+Un job ajouté par un workflow ré-épinglé est ainsi exigé dès la coupure
+suivante, sans attendre le déploiement ; un job retiré reste exigé par le
+plancher installé, donc une baisse du contrat n'est pas exploitable avant la
+release. L'expression `jobs=` de la base est lue statiquement — constantes,
+tuples, étoilement, compréhensions `range` et formatage `%`, jamais exécutée ;
+toute autre forme est refusée nommément. Témoins :
+`tests/test_3108_train_contract_jobs.py`.
 
 ### Nexlink — les parts dues (#2503)
 

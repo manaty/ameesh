@@ -148,6 +148,10 @@
   ameesh serve [--port 8780] [--token-file F] [--human human:ID] | --openapi
         the read API /api/v1 on 127.0.0.1, Bearer token in a 0600 file (L84,
         docs/api/openapi-v1.json); GET /api/v1/events streams the event log (L85);
+  ameesh service install|uninstall|status [--agent A]... [--no-runner]
+        [--no-notify] [--dry-run] [--json]
+        user services (launchd on macOS, L65): the host runner and
+        `ameesh notify`, or one runner per agent; `status` reads launchd;
   ameesh session list|backup|restore <agent>   off-device session backups (L53);
   ameesh sessions <persona> [--limit N] [--json]  current and past sessions (L52);
   ameesh set <agent> model=… effort=… tier=… session_policy=par-lot|taille|jamais
@@ -362,6 +366,10 @@ def _dispatch(argv: list[str] | None) -> int:
         # L38 (0030) : l'envoi des alertes au responsable humain
         from . import notify
         return notify.main(rest)
+    if command == "service":
+        # L65 : services utilisateur (launchd sur macOS)
+        from . import service
+        return service.main(rest)
     if command == "provenance":
         # #1465 : preuve exacte d'origine d'un commit ou d'un jalon
         from . import review_provenance

@@ -40,6 +40,10 @@
 # (discussion community 72631). La décision du script, elle, est générique sur
 # les jobs du run : aucun nom de workflow n'y est en dur.
 #
+# #3198 : « macos » (suite complète nocturne et `ci-macos`) tourne aussi sur
+# un runner hébergé ; une annulation de capacité y est reprise de la même
+# façon, sans quoi la preuve macOS de la nuit serait simplement perdue.
+#
 # Ce workflow s'exécute depuis la branche par défaut (le fichier doit y être
 # pour que `workflow_run` se déclenche) ; `actions/checkout` y prend donc le
 # code de la branche par défaut, jamais celui de la PR : le jeton `actions:
@@ -50,7 +54,7 @@ name: relance hosted
 
 on:
   workflow_run:
-    workflows: ["tests", "paquet"]
+    workflows: ["tests", "paquet", "macos"]
     types: [completed]
 
 permissions:

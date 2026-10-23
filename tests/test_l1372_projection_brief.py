@@ -12,8 +12,9 @@ budgets à 19 000 / 14 600 octets, réserve texte inchangée à 4 000, et prévi
 dès 90 % du budget de projection.
 
 Diagnostic docs-01 #42432 (15/10/2026 00:00) : carte home de 33 472 octets,
-`BRIEF_MAX_BYTES` = 16 000 moins la part réservée au texte (min 4 000) → la
-coupe tombait dans §7 ; §12 et §14 n'étaient jamais injectés.
+`BRIEF_MAX_BYTES` valait alors 16 000 (19 000 depuis #3126) moins la part
+réservée au texte (min 4 000) → la coupe tombait dans §7 ; §12 et §14
+n'étaient jamais injectés.
 """
 from __future__ import annotations
 
@@ -21,7 +22,7 @@ import dataclasses
 import os
 import unittest
 
-from ameesh import canon, config as config_mod, reprise
+from ameesh import adapters, canon, config as config_mod, mail, reprise
 
 from .support import PgTestCase
 from .test_canon import _TmpMixin, codes, commit_all, write
@@ -169,7 +170,10 @@ class ProjectionLectureTest(_TmpMixin, unittest.TestCase):
         self.assertEqual(loaded.processes[0].projection_error, "")
 
     def test_le_preavis_a_90_pourcent_compte_les_octets_utf8(self):
-        seuil = canon.PROCESS_PROJECTION_MAX * 9 // 10
+        # #3137 : le prédicat du code est `proj * 10 >= MAX * 9`, soit
+        # `proj >= ⌈9·MAX/10⌉` ; `MAX*9//10` (plancher) rate la borne d'un
+        # octet quand le budget est impair.
+        seuil = (canon.PROCESS_PROJECTION_MAX * 9 + 9) // 10
         for taille in (seuil - 1, seuil, seuil + 1, 13352):
             with self.subTest(octets=taille):
                 texte = "é" * (taille // 2) + "a" * (taille % 2)
@@ -351,10 +355,26 @@ class ProjectionBriefTest(_TmpMixin, PgTestCase):
         bloc.encode("utf-8").decode("utf-8")
 
     def test_les_budgets_gardent_la_meme_reserve_texte(self):
-        # #3126 : décision mesh-design, lot et courrier #127249 du 23/10/2026.
+        # #3126 : hausse de budget décidée par mesh-design (courrier #127249
+        # du 23/10/2026), compétence mesh-design/bureau confirmée par l'avis
+        # auditeur #127227 — pas une décision owner.
         self.assertEqual(reprise.BRIEF_MAX_BYTES, 19000)
         self.assertEqual(canon.PROCESS_PROJECTION_MAX, 14600)
         self.assertEqual(reprise.BRIEF_TEXT_MIN_BYTES, 4000)
+
+    def test_le_plafond_nominal_de_consigne_et_le_pire_cas_sont_documentes(self):
+        # #3137 : un brief plein (BRIEF_MAX_BYTES) et son cadre de reprise
+        # dépassent déjà le plafond nominal AMEESH_PROMPT_MAIL_MAX (20 000 o) ;
+        # PROMPT_MIN_BYTES garantit alors au courrier de quoi porter un message.
+        # docs/EXPLOITATION.md documente le pire cas (~22 045 o) : une hausse
+        # d'un budget ou du cadre rouvre ce calcul, jamais une coupe silencieuse.
+        cadre = mail.octets(adapters.resume_prompt(""))
+        pire = reprise.BRIEF_MAX_BYTES + cadre + mail.PROMPT_MIN_BYTES
+        self.assertEqual(mail.PROMPT_MAX_BYTES, 20000)
+        self.assertEqual(config_mod.Config().prompt_mail_max, 20000)
+        self.assertEqual(cadre, 1045)
+        self.assertEqual(pire, 22045)
+        self.assertGreater(pire, mail.PROMPT_MAX_BYTES)
 
     def test_la_projection_de_13352_octets_garde_le_paragraphe_15(self):
         fin = "\n### §15 Staging et prod de Nexlink\n- prod = release + go owner."

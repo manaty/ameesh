@@ -52,13 +52,17 @@ def workflow() -> str:
     return WORKFLOW.read_text(encoding="utf-8")
 
 
-def aggregate_name(event: str) -> str:
+def aggregate_name(event: str, label: str = "") -> str:
     name = workflow().split("\n  tests:\n", 1)[1].split("    name: ", 1)[1].splitlines()[0]
     if not name.startswith("${{"):
         return name
     expression = name[3:-2].strip().replace("github.event_name", "event_name")
+    # #3198 : l'agrégat se renomme sur l'étiquette ci-macos ; ce témoin
+    # n'évaluait que l'évènement et ne connaissait pas encore ce contexte.
+    expression = expression.replace("github.event.label.name", "label_name")
     expression = expression.replace("&&", "and").replace("||", "or")
-    return eval(expression, {"__builtins__": {}}, {"event_name": event})
+    return eval(expression, {"__builtins__": {}},
+                {"event_name": event, "label_name": label})
 
 
 def step(name: str) -> str:
@@ -213,6 +217,14 @@ class RequiredCheckTest(unittest.TestCase):
         for event in ("pull_request", "push"):
             with self.subTest(event=event):
                 self.assertEqual(aggregate_name(event), "tests")
+
+    def test_the_ci_macos_label_does_not_publish_the_required_context(self):
+        # #3198 : l'étiquette ci-macos renomme l'agrégat ; toute autre
+        # étiquette de gel garde le contexte requis `tests`.
+        self.assertEqual(aggregate_name("pull_request", "ci-macos"),
+                         "tests (ci-macos, hors gel)")
+        self.assertEqual(aggregate_name("pull_request", "ci-lot-" + "a" * 40),
+                         "tests")
 
     def test_lot_branch_dispatch_is_red(self):
         ref_ok = run_ref_step("refs/heads/lot/1211-ci-impactes-contrat").returncode == 0
