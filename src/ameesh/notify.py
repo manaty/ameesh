@@ -1091,6 +1091,34 @@ def key_of(alert: dict) -> str:
     return json.dumps(key, ensure_ascii=False)
 
 
+#: #3236 : les alertes de jauge datent leur fenêtre de `resets_at - window_s`.
+#: Le fournisseur fait giguer `resets_at` d'une seconde entre deux relevés ;
+#: `key_of` arrondit à la seconde et cette gigue créait une alerte neuve,
+#: donc un brief neuf pour la même fenêtre. Le brief arrondit cette date à la
+#: minute : une fenêtre de forfait dure des heures, la minute suffit à la
+#: reconnaître, et deux fenêtres voisines ne se confondent pas.
+BRIEF_WINDOW_BUCKET_S = 60.0
+
+
+def brief_key_of(alert: dict) -> str:
+    """Identité d'un brief d'agent : une alerte et une fenêtre (#3236).
+
+    Les autres alertes gardent `key_of`. Pour une alerte de jauge
+    (`plan_underused` porte `gauge` et `since`), le début de fenêtre est
+    arrondi à la minute et `reason` n'entre pas dans la clé : `fin_de_fenetre`
+    et `sous_rythme` décrivent la même fenêtre et appellent le même geste.
+    Une gigue d'une seconde de `resets_at`, un clignotement de la raison ou
+    une disparition d'une passe ne refont donc pas briefer la même fenêtre."""
+    since = alert.get("since")
+    if alert.get("gauge") is None or since is None:
+        return key_of(alert)
+    try:
+        bucket = round(float(since) / BRIEF_WINDOW_BUCKET_S)
+    except (TypeError, ValueError):
+        return key_of(alert)
+    return key_of(dict(alert, since=bucket, reason=None))
+
+
 def _notification_id(key, severity, human, since=None) -> str:
     """Identité du registre `notified` : clé, sévérité, humain, `since`. Les
     résumés de débit s'en servent aussi pour leurs membres (#2395 B2), d'où la
@@ -1833,13 +1861,16 @@ class Notifier:
         périodique ; une absence transitoire ne l'oublie pas. #3036 : un agent
         sans bail vivant (ou sur un hôte aux claims fermés) n'est pas un
         destinataire ; sa remise ne compte pas, et la passe suivante réévalue
-        puis remet à qui est revenu. Indépendant de `notify.types` (qui ne règle
-        que l'humain). Jamais fatal au passage."""
+        puis remet à qui est revenu. #3236 : un brief par alerte et par
+        fenêtre — la clé d'une jauge est stable à la minute, et une disparition
+        d'une passe (perte projetée qui oscille autour du seuil) ne refait pas
+        briefer la même fenêtre avant la relance de 6 h. Indépendant de
+        `notify.types` (qui ne règle que l'humain). Jamais fatal au passage."""
         sent = self.state["briefs"]
         # #3007 : le brief de `notify_undeliverable` dépend de la vie de CE
         # notificateur ; c'est `notify_gap.brief_once`, au ménage du runner,
         # qui le porte hors du poste (aucune duplication : réclamation en base).
-        alive = {key_of(a): a for a in current
+        alive = {brief_key_of(a): a for a in current
                  if a.get("type") in alert_briefs.BRIEFED_TYPES
                  and a.get("type") not in alert_briefs.NOTIFIER_EXCLUDED}
         open_lots = None
@@ -1850,6 +1881,13 @@ class Notifier:
                         < alert_briefs.REMIND_AFTER_S:
                     # #2602: brief gaps in available capacity are not a fresh
                     # reason to wake the pilots every few minutes.
+                    continue
+                if entry.get("type") == "plan_underused" \
+                        and now - float(entry["sent_ts"]) < alert_briefs.REMIND_AFTER_S:
+                    # #3236 : la perte projetée d'une jauge oscille autour du
+                    # seuil (50 % par défaut) ; l'alerte disparaît d'une passe
+                    # puis revient. C'est la même fenêtre, déjà briefée : garder
+                    # l'entrée évite un courrier par retour avant la relance.
                     continue
                 if entry.get("type") == "slo_breach" and entry.get("lot"):
                     # #2602: a planned wait or a clock crossing below a

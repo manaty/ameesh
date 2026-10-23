@@ -4,10 +4,11 @@
 #
 # GitHub annule un job hébergé quand aucun runner ne l'a pris après plusieurs
 # tentatives (« The job was not acquired by Runner of type hosted », contrainte
-# de capacité macOS arm64 : run 38428931108, job 115427733668, 13/10/2026). Le
-# job `platform-macos` de « tests » conclut alors `cancelled` sans qu'une seule
-# étape tourne ; il n'est pas encore requis par l'agrégat `tests` (décision de
-# la revue #393), mais une annulation de capacité doit rester visible et reprise.
+# de capacité macOS arm64 : run 38428931108, job 115427733668, 13/10/2026). Les
+# job `platform-macos` de « tests » (verdict court macOS) conclut alors
+# `cancelled` sans qu'une seule étape tourne ; depuis L68b (#3026) l'agrégat
+# `tests` l'exige, et une annulation de capacité doit rester visible et reprise.
+# La suite longue de `macos.yml` est reprise par la même garde.
 # L'API refuse de rejouer le job tant que l'exécution tourne : la reprise doit
 # venir d'ici, APRÈS la conclusion — d'où le déclencheur `workflow_run`, et non
 # une étape de « tests ».
@@ -40,6 +41,10 @@
 # (discussion community 72631). La décision du script, elle, est générique sur
 # les jobs du run : aucun nom de workflow n'y est en dur.
 #
+# #3198 : « macos » (suite complète nocturne et `ci-macos`) tourne aussi sur
+# un runner hébergé ; une annulation de capacité y est reprise de la même
+# façon, sans quoi la preuve macOS de la nuit serait simplement perdue.
+#
 # Ce workflow s'exécute depuis la branche par défaut (le fichier doit y être
 # pour que `workflow_run` se déclenche) ; `actions/checkout` y prend donc le
 # code de la branche par défaut, jamais celui de la PR : le jeton `actions:
@@ -50,7 +55,7 @@ name: relance hosted
 
 on:
   workflow_run:
-    workflows: ["tests", "paquet"]
+    workflows: ["tests", "paquet", "macos"]
     types: [completed]
 
 permissions:

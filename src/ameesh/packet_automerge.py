@@ -643,23 +643,32 @@ def _open_correction(db, row: dict, *, slug: str, number: int, sha: str, base: s
                      consigned: list, actor: str):
     """#3085 : ouvre le lot de correction d'un check requis non concluant qui
     n'a pas retenu la fusion. Le lot est journalisé, sans assigné (file de
-    l'équipe) ; son ouverture ne défait jamais la fusion déjà écrite."""
-    text = ", ".join(consigned)
-    try:
-        return work.add(
-            db,
-            title="CI non concluante sur %s@%s : corriger %s" % (slug, sha[:12], text),
-            type="bug", priority=2, app=str(row.get("app") or ""),
-            source="nonconclusive:%s#%d@%s" % (slug, int(number), sha),
-            body=("Le check requis n'a pas conclu (ni vert ni négatif) sur la tête %s "
-                  "du paquet %s#%d (base %s) : %s.\n\nRègle owner du 23/10 (canon home "
-                  "§3) : un résultat non concluant ne bloque pas la fusion ; il se "
-                  "consigne et ouvre ce lot de correction. Rejouer ou réparer le "
-                  "check, sans relire le paquet déjà fusionné."
-                  % (sha, slug, int(number), base, text)),
-            actor=actor)
-    except Exception:  # noqa: BLE001 - la fusion est écrite, le lot est un suivi
-        return None
+    l'équipe) ; son ouverture ne défait jamais la fusion déjà écrite.
+    #3209 : un lot par check tant qu'il est ouvert (`radar.nonconclusive_source`) ;
+    le même check au paquet suivant est noté sur ce lot."""
+    from . import radar
+    app = str(row.get("app") or "")
+    out = []
+    for text in consigned:
+        try:
+            out.append(work.add_or_note(
+                db,
+                title="CI non concluante sur %s@%s : corriger %s" % (slug, sha[:12], text),
+                type="bug", priority=2, app=app,
+                source=radar.nonconclusive_source(app or slug, text),
+                occurrence=("de nouveau non concluant sur la tête %s du paquet %s#%d "
+                            "(base %s) : %s" % (sha[:12], slug, int(number), base, text)),
+                body=("Le check requis n'a pas conclu (ni vert ni négatif) sur la tête %s "
+                      "du paquet %s#%d (base %s) : %s.\n\nRègle owner du 23/10 (canon home "
+                      "§3) : un résultat non concluant ne bloque pas la fusion ; il se "
+                      "consigne et ouvre ce lot de correction. Rejouer ou réparer le "
+                      "check, sans relire le paquet déjà fusionné. Tant que ce lot est "
+                      "ouvert, les occurrences suivantes y sont notées."
+                      % (sha, slug, int(number), base, text)),
+                actor=actor))
+        except Exception:  # noqa: BLE001 - la fusion est écrite, le lot est un suivi
+            continue
+    return out
 
 
 def watch(cfg, db, app: str, *, gh=None, dry_run: bool = False) -> list[dict]:

@@ -27,8 +27,12 @@ runner hors du poste le porte (`notify_gap.brief_once`), et
 Chaque courrier dit l'action attendue, avec la commande exacte. Une alerte
 part une fois à sa levée, puis une seule relance si elle dure encore
 `REMIND_AFTER_S` (6 h) plus tard ; les SLO ne repartent qu'au palier suivant
-ou après changement d'état (#2602). Ce module rend les textes ; l'envoi et le
-dédoublonnage sont dans `notify.Notifier`.
+ou après changement d'état (#2602). Pour une alerte de jauge
+(`plan_underused`), c'est une fois par **fenêtre** : son début est arrondi à
+la minute et `reason` n'entre pas dans la clé, pour qu'une perte projetée qui
+oscille autour du seuil ne refasse pas briefer à chaque retour (#3236). Ce
+module rend les textes ; l'envoi et le dédoublonnage sont dans
+`notify.Notifier`.
 """
 
 from __future__ import annotations

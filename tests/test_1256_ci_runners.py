@@ -1550,11 +1550,9 @@ class WorkflowRoutingTest(unittest.TestCase):
                           "%s downloads the plan artifact without checking its digest" % job)
             self.assertIn("sha256sum -c", body)
         self.assertEqual(set(consumers), {"psycopg", "psql", "fs-class"})
-        # L68 : le job macOS, indépendant du check requis depuis la revue #393,
-        # vérifie lui aussi l'empreinte avant d'exécuter le plan.
-        macos = jobs["platform-macos"]
-        self.assertIn("plan.outputs.plan_sha256", structure_text(macos))
-        self.assertIn("sha256sum -c", structure_text(macos))
+        # #3198 : le job macOS de tests.yml est le verdict court de la couche
+        # plateforme (L63/L66), sans plan ni base : il ne consomme pas
+        # l'artefact `plan`. La suite complète macOS vit dans macos.yml.
 
     def test_the_required_check_stays_on_the_fleet(self):
         jobs = self.workflows()["tests.yml"]["jobs"]
@@ -1569,7 +1567,8 @@ class WorkflowRoutingTest(unittest.TestCase):
             self.assertEqual(name, self.REQUIRED)
         closure = self.needs_closure(jobs, self.REQUIRED) | {self.REQUIRED}
         self.assertEqual(closure, {"plan", "version", "psycopg", "psql",
-                                   "doc-readers", "fs-class", "tests"})
+                                   "platform-macos", "doc-readers", "fs-class",
+                                   "tests"})
         for job in sorted(closure):
             self.assertNotIn("AMEESH_LENT_RUNS_ON", str(jobs[job].get("runs-on", "")),
                              "%s is part of the required path" % job)

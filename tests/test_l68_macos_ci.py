@@ -1,22 +1,30 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""L68 : la CI exécute la suite sous macOS, PostgreSQL installé dans une étape.
+"""L63/L66/L68 : macOS dans la CI — verdict court par PR, suite en nocturne.
 
-Le job `platform-macos` de `tests.yml` est le seul à tourner sous macOS. Avant
-L68 il n'exécutait que la couche plateforme ; il porte désormais la sélection
-du plan (toute la suite sur main/release/**/paquet, les impactés d'une PR de
-lot) avec le pilote psycopg. macOS n'a pas de conteneurs de service : la base
-est installée et démarrée dans une étape, jamais par `services:`.
+#3198 : le job `platform-macos` de `tests.yml` exécutait la suite complète du
+plan sous macOS (8 parts psycopg, PostgreSQL installé dans une étape) ; elle
+durait jusqu'à 3 h 50 et retenait tout le rollup de fusion (`fire.ready_pr` et
+`packet_automerge` attendent tous les checks). Ce job est désormais **court**
+(L63/L66, sans base, 20 min au plus) et la suite complète vit dans
+`.github/workflows/macos.yml` : nocturne sur main, à la main, et à la demande
+par l'étiquette `ci-macos` sur une PR. Ce workflow utilise
+`pull_request_target` pour ne pas entrer dans le workflow de gel `tests.yml`
+(où `labeled` est déjà le déclencheur du check requis) ni dans le rollup de la
+PR.
 
-Décision de la revue #393 (23/10) : tant que la suite complète n'a pas tourné
-verte sous macOS, ce job reste **indépendant** du check requis `tests` —
-l'exiger ferait rougir le premier paquet pour tous les lots (§11 bis). Il
-entre dans les `needs` de `tests` quand cette preuve existe (lot de suite).
+macOS n'a pas de conteneurs de service : la base est installée et démarrée
+dans une étape, jamais par `services:`.
 
-Ces témoins lisent le workflow (sous-ensemble de texte, pas de PyYAML), les
+Depuis #3026 (L68b), le job court `platform-macos` est REQUIS : il entre dans
+les `needs` de `tests`. La suite longue de `macos.yml` reste un nocturne hors
+du chemin du paquet ; elle n'est pas encore verte sous macOS (les correctifs
+de portabilité sont suivis par lots séparés).
+
+Ces témoins lisent les workflows (sous-ensemble de texte, pas de PyYAML), les
 tests `/proc` réécrits et les témoins Linux-only gardés par
-`platform.is_linux()` (#3132) : une régression du job, un retour à une lecture
-directe de `/proc`, ou un témoin Linux-only non gardé rougit ici, sans
-attendre un runner macOS.
+`platform.is_linux()` (#3132) : une régression du job, un retour de la suite
+longue dans le chemin du paquet, une lecture directe de `/proc`, ou un témoin
+Linux-only non gardé rougit ici, sans attendre un runner macOS.
 """
 from __future__ import annotations
 
@@ -28,9 +36,13 @@ import sys
 import tempfile
 import unittest
 
+from ameesh import canon
+
 from .support import REPO
+from .test_1468_ci_prio import evaluate
 
 WORKFLOW = os.path.join(REPO, ".github", "workflows", "tests.yml")
+MACOS = os.path.join(REPO, ".github", "workflows", "macos.yml")
 
 #: tests réécrits par L68 pour lire l'OS par `ameesh.platform`.
 REWRITTEN = (
@@ -42,7 +54,9 @@ REWRITTEN = (
 )
 
 
-class MacosSuiteJobTest(unittest.TestCase):
+class MacosShortJobTest(unittest.TestCase):
+    """Le job macOS des PR de paquet : la couche plateforme, sans la suite."""
+
     @classmethod
     def setUpClass(cls):
         with open(WORKFLOW, encoding="utf-8") as fh:
@@ -52,24 +66,91 @@ class MacosSuiteJobTest(unittest.TestCase):
         fin = text.index("\n  doc-readers:\n", debut)
         cls.job = text[debut:fin]
 
-    def test_the_full_suite_comes_from_the_plan(self):
-        # same selection as the Linux psycopg parts: full on the full-suite
-        # lanes, impacted + contract on a lot PR (#1211).
+    def test_the_job_is_short_and_carries_no_suite(self):
+        # #3198 : 20 min au plus, sans base ; la suite complète est partie
+        # dans macos.yml, sinon elle retient tout le rollup du paquet.
+        self.assertIn("timeout-minutes: 20", self.job)
+        self.assertIn('AMEESH_REQUIRE_DB: "0"', self.job)
+        self.assertNotIn("services:", self.job)
+        self.assertNotIn("test-parts.py run", self.job)
+        self.assertNotIn("psycopg[binary]", self.job)
+        self.assertNotIn("actions/download-artifact", self.job)
+
+    def test_the_platform_contract_still_runs_on_macos(self):
+        for nom in ("tests.test_l63_platform.PlatformTest",
+                    "tests.test_l63_platform.LintTest",
+                    "tests.test_l63_platform.GuaranteeTest",
+                    "tests.test_l66_desktop.PlatformNotifyTest"):
+            self.assertIn(nom, self.job)
+        self.assertIn("psutil", self.job)
+        self.assertIn("osascript", self.job)
+
+    def test_the_runner_is_the_standard_x64_image(self):
+        # #987 : pas de `macos-latest` arm64, qui n'obtenait pas de capacité.
+        self.assertIn("runs-on: macos-26-intel", self.job)
+
+    def test_the_short_job_is_required(self):
+        # L68b (#3026) : #3198 a sorti la suite longue du chemin du paquet ;
+        # c'est le verdict court macOS qui est requis.
+        debut = self.text.index("\n  tests:\n")
+        aggregate = self.text[debut:]
+        needs = re.search(r"(?m)^    needs: \[(.*)\]$", aggregate)
+        self.assertIsNotNone(needs, "job tests : ligne needs introuvable")
+        self.assertIn("platform-macos", needs.group(1).split(", "))
+        self.assertIn('test "${{ needs.platform-macos.result }}" = success',
+                      aggregate)
+        self.assertNotIn("continue-on-error: true", self.job)
+
+
+class MacosFullSuiteWorkflowTest(unittest.TestCase):
+    """La suite complète sous macOS, hors du chemin du paquet (#3198)."""
+
+    @classmethod
+    def setUpClass(cls):
+        with open(MACOS, encoding="utf-8") as fh:
+            cls.text = fh.read()
+        debut = cls.text.index("\n  suite:\n")
+        cls.job = cls.text[debut:]
+
+    def test_it_runs_nightly_on_main(self):
+        self.assertRegex(self.text, r"(?m)^  schedule:\n")
+        self.assertRegex(self.text, r"(?m)^    - cron: \"[0-9 ]+ \* \* \*\"$")
+
+    def test_it_runs_by_hand_and_on_the_ci_macos_label(self):
+        self.assertRegex(self.text, r"(?m)^  workflow_dispatch:\n")
+        self.assertRegex(self.text, r"(?m)^  pull_request_target:\n")
+        self.assertIn("types: [labeled]", self.text)
+        self.assertIn("github.event.label.name == 'ci-macos'", self.job)
+
+    def test_the_macos_workflow_is_not_the_freeze_workflow(self):
+        # Le workflow macOS ne doit pas être un second `pull_request` : les
+        # étiquettes de gel `ci-lot`/`ci-full` le réveilleraient pour rien.
+        self.assertIn("pull_request_target:", self.text)
+        self.assertNotRegex(self.text, r"(?m)^  pull_request:")
+        with open(WORKFLOW, encoding="utf-8") as fh:
+            tests = fh.read()
+        self.assertIn("types: [labeled]", tests)
+
+    def test_only_a_head_of_the_repository_runs(self):
+        self.assertIn(
+            "github.event.pull_request.head.repo.full_name == github.repository",
+            self.job)
+
+    def test_its_permissions_are_read_only(self):
+        self.assertIn("permissions:\n  contents: read", self.text)
+        self.assertNotRegex(self.text, r"(?m):\s+write(?:-only|-all)?\s*$")
+
+    def test_it_runs_the_whole_plan_under_macos(self):
+        self.assertIn("test-plan.py plan", self.job)
+        self.assertIn("--mode full", self.job)
         self.assertIn("test-parts.py run --plan", self.job)
         self.assertIn("--driver psycopg", self.job)
-        self.assertIn("plan.outputs.plan_sha256", self.job)
-        self.assertIn("sha256sum -c -", self.job)
-
-    def test_every_part_runs_before_the_job_fails(self):
-        # N1 de la revue #393 : sous `set -e`, une première part rouge
-        # arrêtait la boucle et masquait les suivantes.
+        # N1 de la revue #393 : toutes les parts tournent avant l'échec.
         self.assertIn("rc=0", self.job)
         self.assertIn("|| rc=1", self.job)
         self.assertIn('exit "$rc"', self.job)
 
     def test_postgresql_is_installed_and_started_in_a_step(self):
-        # `services:` runs Linux containers only: on macOS the database is a
-        # step, and the suite must not silently skip its database tests.
         self.assertNotIn("services:", self.job)
         self.assertIn("brew install postgresql@17", self.job)
         self.assertIn("initdb -D", self.job)
@@ -84,48 +165,135 @@ class MacosSuiteJobTest(unittest.TestCase):
                       self.job)
         self.assertIn("$(brew --prefix findutils)/libexec/gnubin", self.job)
 
-    def test_the_platform_contract_still_runs_on_macos(self):
-        for nom in ("tests.test_l63_platform.PlatformTest",
-                    "tests.test_l63_platform.LintTest",
-                    "tests.test_l63_platform.GuaranteeTest",
-                    "tests.test_l66_desktop.PlatformNotifyTest"):
-            self.assertIn(nom, self.job)
-        self.assertIn("osascript", self.job)
-
     def test_the_runner_is_the_standard_x64_image(self):
-        # #987 : pas de `macos-latest` arm64, qui n'obtenait pas de capacité.
         self.assertIn("runs-on: macos-26-intel", self.job)
-        # N1 de la revue #393 : 8 parts en série sous macOS, ~90 min mesuré
-        # sous Linux ; plafond provisoire, resserré après la première mesure.
+        # La suite complète reste bornée (jusqu'à 3 h 50 mesuré), hors du
+        # chemin du paquet : le plafond de 240 min ne bloque aucune fusion.
         self.assertIn("timeout-minutes: 240", self.job)
 
-    def test_the_git_identity_step_is_taken_from_the_linux_jobs(self):
-        # B2 de la revue #393 : un runner hébergé macOS n'a pas d'identité git
-        # globale ; les dépôts temporaires des tests en ont besoin.
-        self.assertIn("- *git", self.job)
-        self.assertIn("GIT_CONFIG_GLOBAL=", self.text)
 
-    def test_the_job_is_not_required_before_its_first_full_green_run(self):
-        # Décision de conception de la revue #393 : aucun paquet ne doit
-        # rougir pour un job macOS qui n'a jamais exécuté le plan complet.
-        debut = self.text.index("\n  tests:\n")
-        aggregate = self.text[debut:]
-        needs = re.search(r"(?m)^    needs: \[(.*)\]$", aggregate)
-        self.assertIsNotNone(needs, "job tests : ligne needs introuvable")
-        self.assertNotIn("platform-macos", needs.group(1))
-        self.assertIn("platform-macos n'est pas encore requis", aggregate)
+class CiMacosCoexistenceTest(unittest.TestCase):
+    """#3198 : poser `ci-macos` ne publie pas le check requis `tests`.
 
-    def test_the_plan_guard_is_outside_the_tolerated_step(self):
-        # #3048 (N de la revue #3030) : `continue-on-error` de #3042 ne
-        # tolère que la portabilité de la suite ; la garde « aucune part
-        # psycopg » est une étape à part, sans tolérance, avant la suite.
-        garde = self.job.index("- name: le plan donne des parts psycopg (L68)")
-        suite = self.job.index("- name: suite du plan (L68, pilote psycopg)")
-        self.assertLess(garde, suite)
-        etape = self.job[garde:suite]
-        self.assertIn("aucune part psycopg", etape)
-        self.assertIn("exit 1", etape)
-        self.assertNotIn("continue-on-error", etape)
+    L'évènement `labeled` réveille les **deux** workflows (tests.yml écoute
+    tous les labels, macos.yml seulement `ci-macos`). Ce témoin évalue les
+    `if:` et le `name:` réellement livrés avec l'interpréteur d'expressions de
+    #1468, sous deux contextes : étiquette `ci-macos` (tests.yml doit être
+    entièrement silencieux et son agrégat renommé) et gel `ci-lot-<sha>`
+    (tests.yml publie bien `tests`).
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        with open(WORKFLOW, encoding="utf-8") as fh:
+            cls.tests_doc = canon.load_yaml(fh.read())
+        with open(MACOS, encoding="utf-8") as fh:
+            cls.macos_doc = canon.load_yaml(fh.read())
+        cls.tests = cls.tests_doc["jobs"]
+        cls.macos = cls.macos_doc["jobs"]
+
+    @staticmethod
+    def _eval(field, ctx):
+        text = str(field).strip()
+        if not text.startswith("${{"):
+            text = "${{ %s }}" % text
+        # l'interpréteur de #1468 ne connaît que les fonctions de routage
+        text = text.replace("always()", "true").replace("cancelled()", "false")
+        return evaluate(text, ctx)
+
+    @classmethod
+    def _template(cls, field, ctx):
+        """Un scalaire mêlant littéral et un ou plusieurs `${{ … }}`."""
+        def repl(match):
+            return str(cls._eval("${{ %s }}" % match.group(1), ctx))
+        return re.sub(r"\$\{\{(.*?)\}\}", repl, str(field))
+
+    @staticmethod
+    def _context(event, label, *, plan_result, outputs):
+        return {
+            "github": {
+                "event_name": event,
+                "repository": REPO,
+                "ref": "refs/heads/main",
+                "ref_name": "main",
+                "base_ref": "",
+                "head_ref": "",
+                "event": {
+                    "label": {"name": label} if label else {},
+                    "pull_request": {
+                        "number": 42,
+                        "head": {"repo": {"full_name": REPO}},
+                    },
+                },
+            },
+            "needs": {"plan": {"result": plan_result, "outputs": outputs}},
+            "vars": {},
+        }
+
+    def _ci_macos(self):
+        return self._context("pull_request", "ci-macos",
+                             plan_result="skipped", outputs={})
+
+    def _freeze(self):
+        return self._context(
+            "pull_request", "ci-lot-" + "a" * 40, plan_result="success",
+            outputs={"psycopg": "[1]", "psql": "[1]", "code": "true",
+                     "docs_only": "false", "version_only": "false",
+                     "release": "false"})
+
+    def test_the_label_really_wakes_both_workflows(self):
+        with open(WORKFLOW, encoding="utf-8") as fh:
+            tests = fh.read()
+        self.assertIn("pull_request:\n    types: [labeled]", tests)
+        self.assertIn("pull_request_target:\n    types: [labeled]", self.text_macos())
+
+    def text_macos(self):
+        with open(MACOS, encoding="utf-8") as fh:
+            return fh.read()
+
+    def test_ci_macos_silences_every_tests_job(self):
+        ctx = self._ci_macos()
+        for job, spec in self.tests.items():
+            with self.subTest(job=job):
+                self.assertFalse(
+                    bool(self._eval(spec.get("if", "true"), ctx)),
+                    "tests.yml/%s tournerait sur l'étiquette ci-macos" % job)
+
+    def test_ci_macos_renames_the_required_aggregate(self):
+        ctx = self._ci_macos()
+        nom = self._eval(self.tests["tests"]["name"], ctx)
+        self.assertNotEqual(nom, "tests",
+                            "le check requis tests serait publié sans tests")
+        self.assertIn("ci-macos", str(nom))
+
+    def test_a_freeze_still_publishes_the_required_tests_check(self):
+        ctx = self._freeze()
+        self.assertTrue(bool(self._eval(self.tests["plan"].get("if", "true"), ctx)))
+        self.assertTrue(bool(self._eval(self.tests["tests"]["if"], ctx)))
+        self.assertEqual(self._eval(self.tests["tests"]["name"], ctx), "tests")
+
+    def test_the_macos_suite_follows_only_ci_macos(self):
+        ci = self._context("pull_request_target", "ci-macos",
+                           plan_result="skipped", outputs={})
+        gel = self._context("pull_request_target", "ci-lot-" + "a" * 40,
+                            plan_result="skipped", outputs={})
+        condition = self.macos["suite"]["if"]
+        self.assertTrue(bool(self._eval(condition, ci)))
+        self.assertFalse(bool(self._eval(condition, gel)))
+
+    def test_a_freeze_label_cannot_cancel_a_running_macos_suite(self):
+        # Une étiquette ci-lot/ci-full arrive souvent pendant que la suite
+        # ci-macos tourne : son groupe de concurrence doit être distinct et
+        # elle ne doit rien annuler.
+        ci = self._context("pull_request_target", "ci-macos",
+                           plan_result="skipped", outputs={})
+        gel = self._context("pull_request_target", "ci-lot-" + "a" * 40,
+                            plan_result="skipped", outputs={})
+        concurrence = self.macos_doc["concurrency"]
+        self.assertNotEqual(self._template(concurrence["group"], ci),
+                            self._template(concurrence["group"], gel))
+        self.assertTrue(bool(self._eval(concurrence["cancel-in-progress"], ci)))
+        self.assertFalse(bool(self._eval(concurrence["cancel-in-progress"], gel)))
 
 
 class BenchTmpdirTest(unittest.TestCase):

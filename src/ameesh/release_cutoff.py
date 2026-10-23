@@ -1212,25 +1212,32 @@ def build_plan(cfg, project: ProjectRelease, *, now: float,
 def _open_correction(db, project: "ProjectRelease", plan: "Plan"):
     """#3085 : ouvre le lot de correction d'un check non concluant qui n'a pas
     retenu la release (règle owner du 23/10). Suivi seulement : la release
-    n'en dépend pas, et un échec d'écriture ne la défait pas."""
+    n'en dépend pas, et un échec d'écriture ne la défait pas.
+    #3209 : un lot par check tant qu'il est ouvert, clé partagée avec le
+    paquet (`radar.nonconclusive_source`) ; une nouvelle occurrence y est notée."""
     from . import work
-    text = ", ".join(plan.ci.get("inconclusive") or ())
-    try:
-        return work.add(
-            db,
-            title="CI non concluante sur %s@%s : corriger %s"
-                  % (project.name, plan.head[:12], text),
-            type="bug", priority=2, app=project.name,
-            source="nonconclusive:%s@%s" % (project.name, plan.head),
-            body=("Les checks suivants n'ont pas conclu (ni verts ni négatifs) sur la "
-                  "tête %s releasée en %s : %s.\n\nRègle owner du 23/10 (canon home "
-                  "§3) : un résultat non concluant ne bloque pas la release ; il se "
-                  "consigne et ouvre ce lot de correction. Rejouer ou réparer le "
-                  "check, sans refaire la release."
-                  % (plan.head, plan.version, text)),
-            actor="ameesh")
-    except Exception:  # noqa: BLE001 - la release est écrite, le lot est un suivi
-        return None
+    out = []
+    for text in plan.ci.get("inconclusive") or ():
+        try:
+            out.append(work.add_or_note(
+                db,
+                title="CI non concluante sur %s@%s : corriger %s"
+                      % (project.name, plan.head[:12], text),
+                type="bug", priority=2, app=project.name,
+                source=radar.nonconclusive_source(project.name, text),
+                occurrence=("de nouveau non concluant sur la tête %s releasée en %s : %s"
+                            % (plan.head[:12], plan.version, text)),
+                body=("Le check suivant n'a pas conclu (ni vert ni négatif) sur la "
+                      "tête %s releasée en %s : %s.\n\nRègle owner du 23/10 (canon home "
+                      "§3) : un résultat non concluant ne bloque pas la release ; il se "
+                      "consigne et ouvre ce lot de correction. Rejouer ou réparer le "
+                      "check, sans refaire la release. Tant que ce lot est ouvert, les "
+                      "occurrences suivantes y sont notées."
+                      % (plan.head, plan.version, text)),
+                actor="ameesh"))
+        except Exception:  # noqa: BLE001 - la release est écrite, le lot est un suivi
+            continue
+    return out
 
 
 def _worktree(repo: str, sha: str) -> tuple[str, str]:

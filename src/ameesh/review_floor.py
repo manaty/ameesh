@@ -121,9 +121,10 @@ def set_floor(cfg, db, lot: int, floor: int, *, reason: str = "",
               actor: Optional[str] = None) -> dict:
     """Pose (ou retire, `floor=0`) le plancher d'avis du lot, journalisé.
 
-    Rend `{lot, floor, previous, actor, changed}`. WorkError si l'acteur n'est
-    pas pilote, si le lot est fermé, ou si un plancher posé par un humain
-    serait baissé par un agent."""
+    Rend `{lot, floor, previous, actor, changed}` ; `changed` est vrai dès
+    qu'une ligne est écrite, y compris une recharge humaine à valeur égale.
+    WorkError si l'acteur n'est pas pilote, si le lot est fermé, ou si un
+    plancher posé par un humain serait baissé par un agent."""
     if type(floor) is not int or not 0 <= floor <= MAX_FLOOR:
         raise work.WorkError("review floor must be 0, 1 or 2, not %r" % (floor,))
     who = work.corrector(cfg, db, actor, what="review floor", history=False)
@@ -136,12 +137,18 @@ def set_floor(cfg, db, lot: int, floor: int, *, reason: str = "",
         raise work.WorkError("review floor refused: a mediated session cannot write "
                              "it; the pilot sets it from its own host")
     previous = of_lot(db, lot, cfg=cfg)
-    if floor < previous["human_floor"] and not who.startswith(work.HUMAN_PREFIX):
+    human = who.startswith(work.HUMAN_PREFIX)
+    if floor < previous["human_floor"] and not human:
         raise work.WorkError(
             "review floor refused: a human set the floor %d; only a human lowers it"
             % previous["human_floor"])
+    # #3196 : une recharge humaine de la même valeur doit écrire sa ligne.
+    # Sans elle, `human_floor` restait à 0 et un pilote pouvait ensuite poser
+    # 0 sur un plancher que l'humain venait de confirmer.
     out = {"lot": int(lot), "floor": floor, "previous": previous["floor"],
-           "actor": who, "changed": floor != previous["floor"]}
+           "actor": who,
+           "changed": floor != previous["floor"]
+                      or (human and floor > previous["human_floor"])}
     if not out["changed"]:
         return out
     text = "%s %d" % (PREFIX, floor)
