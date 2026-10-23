@@ -83,6 +83,21 @@ class BriefsLivenessTest(unittest.TestCase):
         self.assertIn("auditeur (no live lease)", briefs["bureau"])
         self.assertNotIn("Escalated", briefs["bureau"])
 
+    def test_niveau_1_assigne_mort_passe_au_pilote(self):
+        # Assigné sans bail au niveau 1 : le pilote (palier 2) reçoit, pas
+        # l'auditeur ; un lot sans assigné ne laisse pas une liste vide.
+        listing = [_row("dev1", lease=False), _row("orch"), _row("auditeur")]
+        briefs = alert_briefs.briefs(
+            _slo(level=1, targets=("assignee",)), listing,
+            auditor_names=["auditeur"])
+        self.assertEqual(list(briefs), ["orch"])
+        self.assertIn("dev1 (no live lease). Escalated from level 1 to level 2",
+                      briefs["orch"])
+        briefs = alert_briefs.briefs(
+            _slo(level=1, targets=("assignee",), agent=None), listing,
+            auditor_names=["auditeur"])
+        self.assertIn("No live recipient: none designated.", briefs["orch"])
+
     def test_agent_arrete_ecarte_meme_si_le_bail_court_encore(self):
         # Un agent `stopped` peut garder son bail quelques secondes (fin de
         # tour) : il ne prendra plus de tour, le brief ne doit pas y rester.

@@ -111,8 +111,8 @@ def _escalation_note(dead: dict, from_level: int, to_level: int) -> str:
     """#3036 : le palier visé n'avait personne qui lise ; on le dit et on
     adresse le palier suivant."""
     return ("No live recipient: %s. Escalated from level %d to level %d. "
-            % (", ".join("%s (%s)" % (name, why) for name, why in sorted(dead.items())),
-               int(from_level), int(to_level)))
+            % (", ".join("%s (%s)" % (name, why) for name, why in sorted(dead.items()))
+               or "none designated", int(from_level), int(to_level)))
 
 
 def _split_live(out: dict, by_name: dict, closed: set) -> tuple[dict, dict]:
