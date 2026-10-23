@@ -412,6 +412,9 @@ class EntryTest(_Base):
         agents = os.path.join(self.tmp, "agents")
         _git(self.tmp, "clone", "-q", self.repo, agents)
         clone = resolutions.Replayer(agents, os.path.join(self.tmp, "state", "p.clone"))
+        # #3001 : le clone du radar existe déjà (sa migration vers la forge,
+        # faite une fois à la création, n'est pas l'aller-retour d'admission)
+        clone.ensure()
         self.ready(1)
         calls = []
         real = resolutions._run
@@ -909,7 +912,10 @@ class ClassOfFreshTargetGitTest(unittest.TestCase):
                 _git(agents, "fetch", "-q", "origin")
                 clone = self.clone(agents, target)
                 merge_queue.fetch_fresh(agents, ["lot/light"], clone)
-                self.assertEqual(_git(clone.path, "rev-parse", "origin/" + target), a)
+                # #3001 : l'origin du clone est la forge (B), plus la copie du
+                # local A des agents ; la classe ne lit que QUEUE_REF
+                self.assertEqual(_git(clone.path, "rev-parse", "origin/" + target), b)
+                self.assertNotEqual(_git(clone.path, "rev-parse", "origin/" + target), a)
                 self.lot(target)
                 out = merge_queue._class_of(None, 1, self.row, agents, clone.path,
                                             target, c, cfg=None)

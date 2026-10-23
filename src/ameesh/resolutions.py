@@ -33,7 +33,8 @@ the resolution commit R(lot, other) is the version WITH it.
 
 Validity, at each radar pass: in its private clone of the project
 (`<state_dir>/radar/<project>.clone`, `git clone --shared`: objects read
-from the agents' repository, nothing written to it), the radar replays the
+from the agents' repository, nothing written to it; its `origin` is the
+forge, never the checkout's local branches, #3001), the radar replays the
 merge of the two current tips with an `rr-cache` holding the pair's own
 resolution only (trained once per resolution commit with git's
 `rerere-train.sh`, contrib, or a port of the same loop when the script is
@@ -106,12 +107,23 @@ class ResolveError(RuntimeError):
     """A resolution that cannot be opened or recorded: actionable message."""
 
 
+class StaleTarget(GitError):
+    """#3001 : la cible du clone radar n'est pas la pointe de la forge — forge
+    illisible, ou ref récupérée plus ancienne que celle que publie
+    `git ls-remote`. La cible est refusée, jamais lue à la place."""
+
+
 class CloneBusy(GitError):
     """The radar clone's worktree is held by another operation (#2428).
 
     Nothing was read nor written: the caller defers to its next pass. A
     stacked trial that finds the clone busy is not an ejection, and an
     operation it could not run is never cached as a result."""
+
+
+#: #3001 : le suivi du clone radar quand il lit la forge (son `origin`)
+FORGE_REFSPEC = "+refs/heads/*:refs/remotes/origin/*"
+_FORGE_REFS = "refs/remotes/origin/"
 
 
 #: how long an operation waits for the clone's worktree before deferring.
@@ -680,7 +692,7 @@ def _replay_into(repo: str, path: str, commit: str, lot_tip: str, other_tip: str
     `attributes_tree`: the target's, as `open_resolution` merges (#2189)."""
     scratch = tempfile.mkdtemp(prefix="ameesh-resolve-")
     try:
-        replayer = Replayer(repo, os.path.join(scratch, "clone"))
+        replayer = Replayer(repo, os.path.join(scratch, "clone"), follow_forge=False)
         replayer.ensure()
         if replayer.prime([commit], attributes_tree=attributes_tree):
             return []
@@ -999,13 +1011,18 @@ class Replayer:
     sees the pair's resolution only, never another pair's nor a replaced one."""
 
     def __init__(self, repo: str, path: str, *, script: str | None = "auto",
-                 target: str = "") -> None:
+                 target: str = "", follow_forge: bool = True) -> None:
         self.repo, self.path, self.script = repo, path, script
+        #: #3001 : le clone suit la forge (`track_forge`) ; un clone jetable
+        #: qui ne rejoue que des résolutions (`rerere`) s'en passe
+        self.follow_forge = follow_forge
         #: #2673: la cible déclarée du projet (`radar.projects.target`) que le
         #: clone doit porter ; vide : sa branche par défaut.
         self.target = (target or "").strip()
         #: attribute keys already read, per target tree (`attributes_key`)
         self._attr_keys: dict = {}
+        #: #3001 : pourquoi la cible du clone n'est pas certifiée par la forge
+        self.target_doubt = ""
 
     @contextmanager
     def locked(self, *, wait: float | None = None):
@@ -1043,7 +1060,130 @@ class Replayer:
                 _check(_run(self.path, "checkout", "-q", "-f", "--detach", head), "checkout")
             else:
                 _run(self.path, "reset", "-q", "--hard")
+            self.track_forge()
             self.declare_target()
+            self.refresh_target()
+
+    def forge_url(self) -> str:
+        """#3001 : la forge du projet, l'URL `origin` du checkout source ; vide
+        quand le checkout n'en a pas (il est alors la seule copie)."""
+        return plan_git._out(self.repo, "remote", "get-url", "origin") or ""
+
+    def _tracks_forge(self, url: str) -> bool:
+        return (plan_git._out(self.path, "remote", "get-url", "origin") == url
+                and plan_git._out(self.path, "config", "--get-all",
+                                  "remote.origin.fetch") == FORGE_REFSPEC)
+
+    def _drop_refs(self, prefix: str, *, keep: str = "") -> None:
+        listing = _text(_run(self.path, "for-each-ref", "--format=%(refname)", prefix))
+        doomed = [r for r in listing.splitlines() if r and r != keep]
+        if doomed:
+            _check(_run(self.path, "update-ref", "--no-deref", "--stdin",
+                        stdin="".join("delete %s\n" % r for r in doomed).encode()),
+                   "update-ref")
+
+    def track_forge(self) -> bool:
+        """#3001 : le clone suit la forge, jamais les branches du checkout.
+
+        `git clone --shared <checkout>` donne au clone le checkout pour
+        `origin` : ses `refs/remotes/origin/*` sont les branches **locales** du
+        checkout, figées ou divergentes (nexlink : `origin/develop` au 11/10).
+        Le choix : l'`origin` du clone devient l'URL de la forge (celle du
+        checkout), les objets restent lus du checkout par les alternates de
+        `--shared`. Importer `refs/remotes/origin/*` du checkout dépendrait
+        d'un checkout rafraîchi, ce que rien ne garantit.
+
+        Un clone qui ne suit pas encore la forge (création, ou clone existant
+        à l'ancienne URL ou refspec) est migré sans être recloné : ses refs
+        copiées du checkout (`refs/remotes/origin/*`, branches locales hors
+        celle de HEAD) sont effacées, toutes les branches de la forge sont
+        récupérées, puis l'URL et la refspec sont réécrites. Une forge
+        illisible laisse l'URL à migrer au passage suivant, sans aucune ref du
+        checkout à lire entre-temps. Rend True si le clone suit la forge."""
+        url = self.forge_url()
+        if (not self.follow_forge or not url
+                or os.path.realpath(self.path) == os.path.realpath(self.repo)):
+            return False
+        if self._tracks_forge(url):
+            return True
+        head = plan_git._out(self.path, "symbolic-ref", "--quiet", "HEAD") or ""
+        self._drop_refs(_FORGE_REFS)
+        self._drop_refs("refs/heads/", keep=head)
+        try:
+            proc = _run(self.path, "fetch", "--quiet", "--prune", "--no-tags", url,
+                        FORGE_REFSPEC, timeout=FETCH_TIMEOUT)
+        except GitError as exc:
+            self.target_doubt = "the forge %s is unreadable: %s" % (url, exc)
+            return False
+        if proc.returncode:
+            self.target_doubt = "the forge %s is unreadable: %s" % (url, _err(proc)[-300:])
+            return False
+        _check(_run(self.path, "remote", "set-url", "origin", url), "remote set-url")
+        _check(_run(self.path, "config", "--replace-all", "remote.origin.fetch",
+                    FORGE_REFSPEC), "config")
+        # `origin/HEAD` suit la branche par défaut de la forge ; illisible, il
+        # reste absent et la cible déclarée (`ameesh.target`) fait foi
+        _run(self.path, "remote", "set-head", "origin", "--auto", timeout=FETCH_TIMEOUT)
+        return True
+
+    def _target_branch(self) -> str:
+        for name in (self.target, plan_git.declared_target(self.path) or "",
+                     plan_git._out(self.path, "symbolic-ref", "--quiet", "--short",
+                                   _FORGE_REFS + "HEAD") or ""):
+            branch = plan_git.short_branch(name)
+            if branch and branch != "HEAD" and not plan_git._SHA_RE.match(branch):
+                return branch
+        return ""
+
+    def refresh_target(self) -> str:
+        """#3001 : `refs/remotes/origin/<cible>` du clone est la pointe que la
+        forge publie (`git ls-remote`), récupérée au besoin. Une cible que la
+        forge ne certifie pas — forge illisible, ref restée plus ancienne — est
+        effacée du clone et le doute noté (`target_doubt`) : un lecteur trouve
+        une cible absente, jamais une pointe périmée ni la branche locale du
+        checkout. Rend la pointe certifiée ; vide sans forge ou sans cible."""
+        url = self.forge_url()
+        branch = self._target_branch()
+        if not url or not branch or not self._tracks_forge(url):
+            return ""
+        try:
+            return self.forge_tip(branch)
+        except StaleTarget as exc:
+            self.target_doubt = str(exc)
+            _run(self.path, "update-ref", "-d", _FORGE_REFS + branch)
+            return ""
+
+    def forge_tip(self, branch: str) -> str:
+        """La pointe de `branch` à la forge, amenée sous
+        `refs/remotes/origin/<branch>` du clone ; StaleTarget sinon."""
+        url = self.forge_url()
+        ref = _FORGE_REFS + branch
+        try:
+            listing = _run(self.path, "ls-remote", "--exit-code", url,
+                           "refs/heads/" + branch, timeout=FETCH_TIMEOUT)
+        except GitError as exc:
+            raise StaleTarget("origin/%s: the forge is unreadable (%s): doubt, the "
+                              "target is not read" % (branch, exc)) from exc
+        published = _text(listing).split()[0] if not listing.returncode and _text(listing) \
+            else ""
+        if not plan_git._SHA_RE.match(published):
+            # `--exit-code` : 2 = la forge répond sans cette branche
+            raise StaleTarget("origin/%s: %s: doubt, the target is not read" % (
+                branch, "the forge does not publish it" if listing.returncode == 2
+                else "the forge is unreadable (%s)" % (_err(listing)[-200:] or "no answer")))
+        if plan_git._commit(self.path, ref) != published:
+            try:
+                _run(self.path, "fetch", "--quiet", "--no-tags", url,
+                     "+refs/heads/%s:%s" % (branch, ref), timeout=FETCH_TIMEOUT)
+            except GitError:
+                pass
+        held = plan_git._commit(self.path, ref)
+        if held != published:
+            raise StaleTarget("origin/%s is at %s, the forge publishes %s: an older "
+                              "target is refused, not read"
+                              % (branch, (held or "nothing")[:12], published[:12]))
+        self.target_doubt = ""
+        return published
 
     def _declared_ref(self) -> str:
         """La branche à déclarer dans le clone : la cible du projet quand elle
