@@ -16,8 +16,9 @@ from __future__ import annotations
 
 import time
 import unittest
+from unittest import mock
 
-from ameesh import alert_briefs, fil, notify, registry
+from ameesh import alert_briefs, fil, mail, notify, registry
 
 from .support import PgTestCase
 
@@ -86,16 +87,19 @@ class BriefsLivenessTest(unittest.TestCase):
     def test_niveau_1_assigne_mort_passe_au_pilote(self):
         # Assigné sans bail au niveau 1 : le pilote (palier 2) reçoit, pas
         # l'auditeur ; un lot sans assigné ne laisse pas une liste vide.
+        # L'alerte ne porte pas `orchestrators` à ce niveau : le brief reprend
+        # les rôles vivants fournis par le notificateur (revert du correctif
+        # exploitation.py, cf. note du lot).
         listing = [_row("dev1", lease=False), _row("orch"), _row("auditeur")]
         briefs = alert_briefs.briefs(
-            _slo(level=1, targets=("assignee",)), listing,
-            auditor_names=["auditeur"])
+            _slo(level=1, targets=("assignee",), orchestrators=()), listing,
+            auditor_names=["auditeur"], orchestrator_names=("orch",))
         self.assertEqual(list(briefs), ["orch"])
         self.assertIn("dev1 (no live lease). Escalated from level 1 to level 2",
                       briefs["orch"])
         briefs = alert_briefs.briefs(
-            _slo(level=1, targets=("assignee",), agent=None), listing,
-            auditor_names=["auditeur"])
+            _slo(level=1, targets=("assignee",), agent=None, orchestrators=()),
+            listing, auditor_names=["auditeur"], orchestrator_names=("orch",))
         self.assertIn("No live recipient: none designated.", briefs["orch"])
 
     def test_agent_arrete_ecarte_meme_si_le_bail_court_encore(self):
@@ -275,6 +279,73 @@ class NotifierLivenessTest(PgTestCase):
         notifier.run_pass(self.db, current=[alert])
         self.assertEqual(len(self.mails("orch")), 1)
         self.assertEqual(len(self.mails("auditeur")), 1)
+
+    def test_ledger_ancien_remet_au_destinataire_revenu(self):
+        # #3036 B/P1 cx3 : une entrée de l'ancien notificateur compte une
+        # remise faite sur un hôte perdu. La passe où le destinataire est mort
+        # doit le retirer de `to` ; son retour reçoit alors un courrier.
+        notifier = self.notifier()
+        alert = _slo(level=3, targets=("bureau", "auditeur"))
+        key = notify.key_of(alert)
+        notifier.state["briefs"][key] = {
+            "type": "slo_breach", "sent_ts": self.now, "lot": 42,
+            "lot_state": "build", "agent": "dev1", "reminded": True,
+            "to": ["bureau", "auditeur"]}
+        self.dead("bureau", "auditeur")
+        notifier.run_pass(self.db, current=[alert])
+        self.assertEqual(self.mails("auditeur"), [])
+        self.assertEqual(self.mails("bureau"), [])
+        self.assertNotIn("auditeur", notifier.state["briefs"][key]["to"])
+        self.assertNotIn("bureau", notifier.state["briefs"][key]["to"])
+        # retour de l'auditeur : la passe remet, le bureau resté mort non
+        self.lease("auditeur")
+        self.now += 60.0
+        notifier.run_pass(self.db, current=[alert])
+        [sent] = self.mails("auditeur")
+        self.assertIn("SLO breach, level 3", sent["body"])
+        self.assertEqual(self.mails("bureau"), [])
+        self.assertIn("auditeur", notifier.state["briefs"][key]["to"])
+        self.assertNotIn("bureau", notifier.state["briefs"][key]["to"])
+
+    def test_mail_undeliverable_echec_transitoire_est_retente(self):
+        # #3036 B/P1 cx3 : un envoi en échec entre deux réussites ne doit pas
+        # être oublié ; la passe suivante le remet, sans doubler les réussites.
+        registry.upsert(self.db, "orch2", harness="claude", host=self.cfg.host)
+        self.db.execute("UPDATE agent_registry SET team = 'ameesh'"
+                        " WHERE name = 'orch2'")
+        self.lease("orch2")
+        alert = {"type": "mail_undeliverable", "agent": "claude3", "value": 1,
+                 "threshold": 900, "reason": "arrete", "senders": ["claude1"],
+                 "orchestrators": ["orch", "orch2"], "since": self.now - 1200,
+                 "detail": "undeliverable", "urgent": True}
+        notifier = self.notifier()
+        real_send = mail.send
+
+        def flaky(db, sender, to, *args, **kwargs):
+            if to == "orch":
+                raise RuntimeError("temporarily unavailable")
+            return real_send(db, sender, to, *args, **kwargs)
+
+        with mock.patch.object(mail, "send", side_effect=flaky):
+            notifier.run_pass(self.db, current=[alert])
+        self.assertEqual(self.mails("orch"), [])
+        [sent] = self.mails("orch2")
+        self.assertIn("Undeliverable mail:", sent["body"])
+        [entry] = notifier.state["briefs"].values()
+        self.assertEqual(entry["to"], ["orch2"])
+        self.assertEqual(entry["pending"], ["orch"])
+        # l'erreur disparaît : le destinataire en échec reçoit, une seule fois
+        self.now += 60.0
+        notifier.run_pass(self.db, current=[alert])
+        self.assertEqual(len(self.mails("orch")), 1)
+        self.assertEqual(len(self.mails("orch2")), 1)
+        [entry] = notifier.state["briefs"].values()
+        self.assertEqual(entry["pending"], [])
+        # rien de plus à la passe suivante
+        self.now += 60.0
+        notifier.run_pass(self.db, current=[alert])
+        self.assertEqual(len(self.mails("orch")), 1)
+        self.assertEqual(len(self.mails("orch2")), 1)
 
 
 if __name__ == "__main__":

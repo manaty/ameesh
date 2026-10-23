@@ -1782,10 +1782,11 @@ class Notifier:
             entry = sent.get(key)
             if entry is None or alert.get("type") == "slo_breach":
                 due.append((key, alert, entry))
-            elif entry.get("dead"):
+            elif entry.get("dead") or entry.get("pending"):
                 # #3036 : des destinataires avaient été écartés (bail mort,
-                # hôte aux claims fermés) ; la passe réévalue pour remettre à
-                # qui est revenu, sans redéposer chez les morts.
+                # hôte aux claims fermés) ou une remise a échoué ; la passe
+                # réévalue pour remettre à qui est revenu, sans redéposer
+                # chez les morts ni oublier l'échec transitoire.
                 due.append((key, alert, entry))
             elif not entry.get("reminded") and now - float(entry["sent_ts"]) \
                     >= alert_briefs.REMIND_AFTER_S:
@@ -1841,16 +1842,30 @@ class Notifier:
                 # #3036 : `setdefault` — un repli a pu y placer le texte du
                 # palier effectivement visé, avec ses absents nommés.
                 briefs.setdefault("thread:bureau", alert_briefs._slo_breach(alert))
-            if not briefs:
-                continue        # personne à prévenir : on réessaie au passage suivant
             if kind == "slo_breach":
                 # One successful delivery per recipient and escalation
                 # level. Failed deliveries and newly designated pilots retry.
-                keep = set((entry or {}).get("to") or ())
-                briefs = {n: t for n, t in briefs.items() if n not in keep}
-                if not briefs:
-                    continue
-            elif entry is not None:
+                # #3036 : une entrée écrite par l'ancien notificateur peut
+                # nommer des destinataires dont la remise était allée sur un
+                # hôte perdu. On ne se fie à `to` que pour un destinataire
+                # encore vivant ; un nom mort à cette passe est retiré, pour
+                # être remis quand il revient — sans rafale vers les vivants.
+                by_name = {row["name"]: row for row in listing}
+                previous = {name: "" for name in (entry or {}).get("to") or ()}
+                still_live, gone = alert_briefs._split_live(previous, by_name, closed)
+                if entry is not None:
+                    entry["to"] = sorted(still_live)
+                    entry["dead"] = sorted(gone)
+                briefs = {n: t for n, t in briefs.items() if n not in still_live}
+            if not briefs:
+                # #3036 : une remise en attente sans destinataire à cette
+                # passe ne doit pas faire tourner les passages à vide ; les
+                # morts restent nommés dans `dead`.
+                if entry is not None and kind != "slo_breach":
+                    entry["dead"] = sorted(dead)
+                    entry["pending"] = []
+                continue        # personne à prévenir : on réessaie au passage suivant
+            if kind != "slo_breach" and entry is not None:
                 # #1787 N1 : la relance repart aux destinataires de la levée,
                 # pas à ceux que l'état vivant désignerait maintenant (le brief
                 # d'un lot sans assigné est atomique, #1026).
@@ -1928,6 +1943,11 @@ class Notifier:
             if not delivered and not self.dry_run:
                 if entry is not None:
                     entry["dead"] = sorted(dead)
+                    if kind != "slo_breach":
+                        # #3036 : l'échec transitoire d'un destinataire reste
+                        # à tenter ; il n'est ni dans `to` (réussi) ni dans
+                        # `dead` (écarté).
+                        entry["pending"] = sorted(set(briefs) - set(dead))
                 continue
             if kind == "slo_breach":
                 if delivered:
@@ -1947,11 +1967,14 @@ class Notifier:
                              "reminded": kind == "mail_undeliverable",
                              "to": sorted(set(delivered)),
                              # #3036 : les écartés, pour réévaluer la passe
-                             # suivante et remettre à qui est revenu.
-                             "dead": sorted(dead)}
+                             # suivante et remettre à qui est revenu, et les
+                             # remises en échec, distinctes des réussies.
+                             "dead": sorted(dead),
+                             "pending": sorted(set(briefs) - set(delivered) - set(dead))}
             else:
                 entry["to"] = sorted(set(entry.get("to") or ()) | set(delivered))
                 entry["dead"] = sorted(dead)
+                entry["pending"] = sorted(set(briefs) - set(delivered) - set(dead))
                 if is_reminder:
                     entry["reminded"] = True
 

@@ -729,7 +729,11 @@ def briefs(alert: dict, listing: list, lot_titles: dict | None = None,
         # hôte aux claims fermés ne lira pas ; le palier suivant prend le
         # relais, et le brief dit qui manquait.
         teams = _projects(by_name, alert.get("agent"))
-        return _slo_briefs(alert, by_name, orchestras, teams, auditor_names, closed)
+        # #3036 : le pilote se résout ici aussi quand l'alerte ne porte pas
+        # `orchestrators` (niveau 1 d'une passe sans autre lot de niveau 2) ;
+        # le notificateur fournit les rôles vivants du canon.
+        return _slo_briefs(alert, by_name, orchestras or orchestrator_names,
+                           teams, auditor_names, closed)
     else:
         extra: dict[str, str] = {}
         no_reviewer = False

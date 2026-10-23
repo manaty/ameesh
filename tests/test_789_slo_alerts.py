@@ -152,9 +152,6 @@ class AlerteTest(_Base):
                          (self.lot["id"], "dev1", False, False))
         self.assertEqual(alert["threshold"], 3600)
         self.assertAlmostEqual(alert["value"], 1.5 * HEURE - 3600, delta=5)
-        # #3036 : le pilote est résolu dès le niveau 1 — un assigné sans bail
-        # vivant fait passer le brief au pilote, pas directement à l'auditeur
-        self.assertEqual(alert["orchestrators"], ["orch"])
         self.assertIn("slo_breach", exploitation.ALERT_TYPES)
         self.assertIn("slo_breach", notify.TYPE_LABELS)
         self.assertIn("slo_breach", alert_briefs.BRIEFED_TYPES)
