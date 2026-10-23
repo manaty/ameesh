@@ -9201,9 +9201,11 @@ class Runner:
         for name in list(self._election_free_since):
             if name not in free:
                 del self._election_free_since[name]
-        for name in list(self._handover_released):
-            if name not in free:
-                del self._handover_released[name]
+        # `_handover_released` n'est PAS purgé ici : le worker pose la marque
+        # juste avant de rendre le bail (`finally`), donc un balayage
+        # concurrent verrait encore le bail vivant, conclurait « pas libre »
+        # et effacerait la marge de reprise. La marque s'efface d'elle-même
+        # à l'échéance dans `handover_wait_s` ; une entrée périmée est inerte.
 
     #: `--once` : intervalle des nouveaux essais d'un bail non rendu
     RELEASE_RETRY_S = 5.0
