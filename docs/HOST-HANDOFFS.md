@@ -415,6 +415,27 @@ planned stop, same procedure); the workstation claiming a free lease is the
 normal rank-delay path, not a violation. Then run B with the workstation
 holding again. Do not transfer the lease by hand at any point.
 
+### Staging variants accepted for the first run
+
+The workstation's owner uses `pc-smichea` during the day, and the bureau has
+no root network filter. The first exercise therefore uses two named variants,
+recorded as such in the report; they exercise the election and the fence, not
+a hardware loss or a network partition:
+
+- **A′ — executors only.** `systemctl --user stop
+  'ameesh-runner-agent@*'` on the holder (all of its ameesh executors; never
+  the `ameesh-runner-ima`/TPK units) at `T0`; the host stays up. The lease
+  follows its TTL, exactly as in A.
+- **B′ — process freeze.** `SIGSTOP` the role's runners for more than the
+  lease TTL (240 s is enough), then `SIGCONT`: no renewal, expiry, another
+  claim; on resume the old process must be refused by epoch and go back to
+  standby. This is not a network cut; it proves the same no-renewal and
+  stale-epoch paths (P2, P3, P4).
+
+The nominal A (whole host off) and B (root network cut) stay on the list for
+a later window with the owner's agreement. The report says which variant ran
+and does not present A′/B′ as a hardware-loss or network-partition proof.
+
 ### Preconditions
 
 - EP1–EP6 are **deployed by a release**, not merely merged:
