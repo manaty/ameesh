@@ -20,9 +20,11 @@ from __future__ import annotations
 import argparse
 import contextlib
 import io
+import os
 import time
 import types
 import unittest
+from unittest import mock
 
 from ameesh import actions_cli, alert_briefs, decisions, exploitation, mail, notify, \
     notify_gap, registry, storage, work
@@ -66,10 +68,6 @@ class GapsTest(unittest.TestCase):
 
     def test_un_battement_frais_ferme_l_ecart(self):
         self.assertEqual(notify_gap.gaps_for(_pending(), [_row(seen_ts=900.0)],
-                                             1000.0), [])
-
-    def test_default_couvre_tout_humain(self):
-        self.assertEqual(notify_gap.gaps_for(_pending(), [_row(human="*", seen_ts=900.0)],
                                              1000.0), [])
 
     def test_un_autre_humain_couvert_ne_couvre_pas_alice(self):
@@ -176,6 +174,35 @@ class AlertesTest(PgTestCase):
         self.ask()
         now = self.beat()
         self.assertEqual(self.alerts(now=now), [])
+
+    def test_une_route_vide_exclut_meme_avec_default(self):
+        # B1 de dev4/cx1 : channels_for(ALICE)=[] alors que le default existe ;
+        # le battement ne doit pas déclarer ALICE couverte.
+        self.ask()
+        now = self.beat(age=3600)       # le poste perdu l'avait couverte
+        ncfg = notify.parse_config({"routes": {ALICE: []}, "default": ["app"]})
+        self.assertEqual(ncfg.channels_for(ALICE), [])
+        notify_gap.beat(self.cfg, self.db, ncfg, now=now)
+        (alert,) = self.alerts(now=now)
+        self.assertEqual((alert["human"], alert["reason"]), (ALICE, "notifier_stale"))
+
+    def test_default_couvre_un_humain_sans_route(self):
+        self.ask()
+        now = self.beat(age=3600)
+        ncfg = notify.parse_config({"default": ["app"]})
+        notify_gap.beat(self.cfg, self.db, ncfg, now=now)
+        self.assertEqual(self.alerts(now=now), [])
+
+    def test_le_brief_suit_les_orchestrateurs_declares(self):
+        # N1 de dev4 : les destinataires du brief sont ceux de l'alerte
+        # (`alert_orchestrators`, y compris AMEESH_ALERT_ORCHESTRATORS).
+        self.ask()
+        now = self.beat(age=3600)
+        with mock.patch.dict(os.environ,
+                             {"AMEESH_ALERT_ORCHESTRATORS": "orch"}):
+            report = notify_gap.brief_once(self.cfg, self.db, now=now)
+        self.assertIn("orch", {entry["recipient"] for entry in report["sent"]})
+        self.assertIn("auditeur", {entry["recipient"] for entry in report["sent"]})
 
     def test_un_battement_perime_leve_l_alerte(self):
         view = self.ask()

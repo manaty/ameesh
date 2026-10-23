@@ -3,11 +3,11 @@
 -- Le seul notificateur à canaux peut tomber avec son poste ; les hôtes sains
 -- n'en savent rien, et une décision en attente reste sans poussée. Le
 -- notificateur bat donc en base à chaque passage (`notify_liveness`), par
--- hôte et par humain qu'il joint (`*` : `notify.default`, qui couvre tout
--- humain). `exploitation.alerts` et `ameesh decisions` lisent ces battements
--- partagés : une alerte ne se lève que si AUCUN notificateur vivant ne couvre
--- l'humain, jamais sur la seule absence de route locale (faux positif
--- permanent des VM).
+-- hôte et par humain que `NotifyConfig.channels_for` joint vraiment : une route
+-- vide exclut l'humain, même avec `notify.default`. `exploitation.alerts` et
+-- `ameesh decisions` lisent ces battements partagés : une alerte ne se lève
+-- que si AUCUN notificateur vivant ne couvre l'humain, jamais sur la seule
+-- absence de route locale (faux positif permanent des VM).
 --
 -- `notify_briefs` réclame le courrier d'alerte aux agents (orchestrateurs,
 -- auditeur) : la passe qui le porte tourne sur les VM (ménage du runner), pas
@@ -33,6 +33,6 @@ create index if not exists notify_briefs_sent_idx
     on notify_briefs (sent_at);
 
 comment on table notify_liveness is
-    '#3007 : battement de chaque notificateur, par hôte et humain joint (* = défaut)';
+    '#3007 : battement de chaque notificateur, par hôte et humain que channels_for joint';
 comment on table notify_briefs is
     '#3007 : dernier brief notify_undeliverable par destinataire et humain (relance 6 h)';

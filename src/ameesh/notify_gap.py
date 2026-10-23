@@ -15,13 +15,15 @@ on the VMs, so "no channel on THIS host" is not a gap: it raised a permanent
 false alert while the post was healthy, and it said nothing the day the post
 was lost (review of #3007, 2026-10-23). The notifier therefore records a
 heartbeat in the shared base (`notify_liveness`, migration 0474) at every
-pass, per host and per human it covers (`*` for `notify.default`). This module
-reads that snapshot: a gap is a pending-decision owner that **no heartbeat
-fresh within `ALIVE_S`** covers. A stale heartbeat names the lost host and its
-silence; a human no heartbeat ever named is reported uncovered while another
-notifier lives. With no heartbeat recorded at all, nothing is proven and no
-alert is raised (a fresh install, the CI bench): the signal appears with the
-first notifier pass and disappears with its last.
+pass, per host and per human `NotifyConfig.channels_for` **actually** reaches:
+an empty route (`routes: {"human:x": []}`) excludes that human even when
+`notify.default` exists, exactly as the push path does. This module reads that
+snapshot: a gap is a pending-decision owner that **no heartbeat fresh within
+`ALIVE_S`** covers. A stale heartbeat names the lost host and its silence; a
+human no heartbeat ever named is reported uncovered while another notifier
+lives. With no heartbeat recorded at all, nothing is proven and no alert is
+raised (a fresh install, the CI bench): the signal appears with the first
+notifier pass and disappears with its last.
 
 `exploitation.alerts` turns each gap into a `notify_undeliverable` alert (so
 it is in `ameesh alerts`, the API and the embedded interface), and
@@ -41,6 +43,7 @@ an operator gesture, documented in docs/EXPLOITATION.md, « Alertes poussées »
 """
 from __future__ import annotations
 
+import os
 import time
 
 #: type d'alerte (déclaré dans `exploitation.ALERT_TYPES`, étiqueté dans
@@ -66,10 +69,14 @@ def _span(seconds: float) -> str:
 
 
 def _fresh(rows, human, now: float, alive_s: float) -> dict | None:
-    """Le battement frais le plus récent qui couvre `human` (None sinon)."""
+    """Le battement frais le plus récent de `human` (None sinon).
+
+    Une route vide n'écrit aucun battement (`beat` filtre par
+    `channels_for`) : il n'y a donc pas de sentinelle d'exclusion à relire.
+    """
     best = None
     for row in rows:
-        if row.get("human") not in (human, "*"):
+        if row.get("human") != human:
             continue
         seen = float(row.get("seen_ts") or 0.0)
         if seen < now - alive_s:
@@ -80,10 +87,10 @@ def _fresh(rows, human, now: float, alive_s: float) -> dict | None:
 
 
 def _last(rows, human) -> dict | None:
-    """Le dernier battement qui couvre `human`, même périmé (pour le détail)."""
+    """Le dernier battement de `human`, même périmé (pour le détail)."""
     best = None
     for row in rows:
-        if row.get("human") not in (human, "*"):
+        if row.get("human") != human:
             continue
         if best is None or float(row.get("seen_ts") or 0.0) > float(
                 best.get("seen_ts") or 0.0):
@@ -134,10 +141,9 @@ def gaps_for(pending, rows, now: float, *, alive_s: float = ALIVE_S) -> list[dic
             last_seen = float(last["seen_ts"])
             last_host = str(last.get("host") or "") or None
             last_human = str(last.get("human") or "") or None
-            covered = " (via notify.default)" if last_human == "*" else ""
-            prefix = ("no living notifier covers %s: last heartbeat from host %s%s "
+            prefix = ("no living notifier covers %s: last heartbeat from host %s "
                       "was %s ago" % (human, last_host or "?",
-                                      covered, _span(now - last_seen)))
+                                      _span(now - last_seen)))
             since = last_seen
             reason = "notifier_stale"
         detail = (
@@ -184,15 +190,36 @@ def alert_of(gap: dict, orchestrators=None) -> dict:
 
 
 def beat(cfg, db, ncfg, now: float | None = None) -> int:
-    """Le battement de CE notificateur : ses routes + `*` si `notify.default`."""
-    humans = sorted(str(human) for human in (ncfg.routes or {}) if human)
-    if ncfg.default:
-        humans.append("*")
-    if not humans:
+    """Le battement de CE notificateur : les humains que `channels_for` joint.
+
+    Une route vide (`routes: {"human:x": []}`) exclut explicitement l'humain,
+    même quand `notify.default` existe : c'est la règle du push, et la preuve
+    partagée doit la refléter, sinon un notificateur sain sans canal pour cet
+    humain masquerait indéfiniment la perte du poste (revue #3007, B1).
+    Les humains connus viennent de la configuration de l'hôte, des clés de
+    `notify.routes` et des demandes de décision en attente ; `channels_for`
+    tranche pour chacun.
+    """
+    from . import decisions, notify, storage
+    now = time.time() if now is None else float(now)
+    humans = set()
+    for raw in getattr(cfg, "humans", ()) or ():
+        human = notify.normalize_human(raw)
+        if human:
+            humans.add(human)
+    humans.update(str(human) for human in (ncfg.routes or {}) if human)
+    try:
+        for view in decisions.pending(db, now):
+            owner = view.get("owner")
+            if owner:
+                humans.add(str(owner))
+    except Exception:  # noqa: BLE001 — un battement ne dépend pas des demandes
+        pass
+    covered = sorted(human for human in humans if ncfg.channels_for(human))
+    if not covered:
         return 0
-    from . import storage
     host = str(getattr(cfg, "host", "") or "?")
-    return storage.of(db).notify_liveness.beat(host, humans, now=now)
+    return storage.of(db).notify_liveness.beat(host, covered, now=now)
 
 
 def brief_once(cfg, db, now: float | None = None) -> dict:
@@ -221,7 +248,15 @@ def brief_once(cfg, db, now: float | None = None) -> dict:
         except Exception:  # noqa: BLE001 — sans canon, l'auditeur par son nom suffit
             canons = []
         auditors = alert_briefs.auditors(listing, canons)
-        orchestrators = sorted(sous_utilisation.role_orchestrators(canons))
+        # #3007 N1 (dev4) : les destinataires du brief sont ceux de l'alerte,
+        # orchestrateurs DÉCLARÉS (`AMEESH_ALERT_ORCHESTRATORS`, défaut de
+        # `--orchestrators`) et rôles du canon, pas les seuls rôles du canon.
+        declared = tuple(
+            name.strip() for name in
+            (os.environ.get("AMEESH_ALERT_ORCHESTRATORS") or "").split(",")
+            if name.strip())
+        orchestrators = sorted(sous_utilisation.alert_orchestrators(
+            cfg, db, listing, declared=declared, canons=canons))
         since = now - alert_briefs.REMIND_AFTER_S
         for gap in gaps:
             alert = alert_of(gap, orchestrators)
