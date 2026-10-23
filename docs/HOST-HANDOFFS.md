@@ -422,15 +422,34 @@ no root network filter. The first exercise therefore uses two named variants,
 recorded as such in the report; they exercise the election and the fence, not
 a hardware loss or a network partition:
 
-- **A′ — executors only.** `systemctl --user stop
-  'ameesh-runner-agent@*'` on the holder (all of its ameesh executors; never
-  the `ameesh-runner-ima`/TPK units) at `T0`; the host stays up. The lease
-  follows its TTL, exactly as in A.
+- **A′ — executors only.** On the holder, at `T0`, stop the role's executor
+  with an immediate kill — never a plain `systemctl stop`, which drains the
+  running turn for up to 30 min and keeps renewing the lease:
+
+  ```sh
+  systemctl --user stop --no-block 'ameesh-runner-agent@<ROLE>'
+  systemctl --user kill --signal=KILL 'ameesh-runner-agent@<ROLE>'
+  systemctl --user stop 'ameesh-runner-agent@<ROLE>'
+  systemctl --user is-active 'ameesh-runner-agent@<ROLE>'   # must be inactive
+  ```
+
+  The scope is the role's executor(s) on the holder. All executors of the
+  host may be stopped instead only when every governance role they serve has
+  a live standby on another host; otherwise the others would lose their
+  holder for nothing. The report names the scope. The host stays up; the
+  lease follows its TTL, exactly as in A. Never the `ameesh-runner-ima`/TPK
+  units.
 - **B′ — process freeze.** `SIGSTOP` the role's runners for more than the
   lease TTL (240 s is enough), then `SIGCONT`: no renewal, expiry, another
   claim; on resume the old process must be refused by epoch and go back to
   standby. This is not a network cut; it proves the same no-renewal and
   stale-epoch paths (P2, P3, P4).
+
+  ```sh
+  systemctl --user kill --kill-whom=all --signal=STOP 'ameesh-runner-agent@<ROLE>'
+  sleep 240
+  systemctl --user kill --kill-whom=all --signal=CONT 'ameesh-runner-agent@<ROLE>'
+  ```
 
 The nominal A (whole host off) and B (root network cut) stay on the list for
 a later window with the owner's agreement. The report says which variant ran
@@ -500,10 +519,12 @@ the exercise is blocked, not failed.
 
    Record the observer start and stop times. Also read the last
    `lease_expires_ts` before `T0`: it is `T_expiry` for P1.
-3. **Gesture A.** The bureau stops the holder (or all of its executors) at
-   `T0`, written down on the host and repeated on the lot thread. Do not
-   touch the database. Watch the observer: the lease must expire, then one
-   candidate must claim with a new epoch.
+3. **Gesture A or A′.** The bureau runs the A′ stop command above on the
+   holder (or stops the whole host when that is the agreed variant) at `T0`,
+   written down on the host and repeated on the lot thread. A plain
+   `systemctl stop` is not a host loss: it drains the turn and keeps the lease
+   alive for up to 30 min. Do not touch the database. Watch the observer: the
+   lease must expire, then one candidate must claim with a new epoch.
 4. **First turn (P1, P5).** As soon as the new holder is visible, send it a
    short mail (or check the one sent at step 1). `T_turn` is the first
    `turn.started` for the role after the claim, read from `ameesh events
@@ -525,15 +546,17 @@ the exercise is blocked, not failed.
    the new epoch — this proves the refusal was not vacuous. Never attempt
    `fire`, `land`, `merge`, `queue remove` or a decision creation as a drill
    gesture: an accepted one would be a real effect.
-6. **Scenario B.** Hand the role back (stop the VM holder, let the
-   workstation claim on the free lease), then cut the workstation's database
-   path — the tunnel or the DB endpoint only, never the LAN, with an
-   automatic rollback timer. Record `T0`; check expiry, claim, the new
-   epoch and, when the path returns, that the old holder is refused and
-   stays standby.
-7. **Return (P4, P6).** Restart the stopped host while the new holder is
-   live. For 5 min the observer must show the same holder and epoch; the
-   returning runner logs standby and opens no turn. Then compare the events
+6. **Scenario B or B′.** Hand the role back (stop the VM holder, let the
+   workstation claim on the free lease). Then either cut the workstation's
+   database path — the tunnel or the DB endpoint only, never the LAN, with an
+   automatic rollback timer — or, when root is unavailable, run the B′
+   `SIGSTOP`/`SIGCONT` above. Record `T0`; check expiry, claim, the new epoch
+   and, when the path or the process returns, that the old holder is refused
+   and stays standby.
+7. **Return (P4, P6).** Restart the stopped executors
+   (`systemctl --user start 'ameesh-runner-agent@<ROLE>'`) or the host while
+   the new holder is live. For 5 min the observer must show the same holder
+   and epoch; the returning runner logs standby and opens no turn. Then compare the events
    of the window: one transition, exactly one merge (the witness lot), no
    duplicated mail, wake, `pilot.gesture`, packet or landing, and no other
    lot merged.
