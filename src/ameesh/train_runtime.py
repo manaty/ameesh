@@ -7,8 +7,10 @@ There is no fallback to a current registry, last verdict or journal note.
 """
 from __future__ import annotations
 
+import time
+
 from . import land, merge_queue, radar, train_diagnosis
-from .train import TrainError, digest, identity, ordered
+from .train import SCHEMA, TrainError, digest, identity, ordered
 
 
 class Runtime:
@@ -49,8 +51,53 @@ class Runtime:
         self.enrollment_result = self.enrollment.enroll_many(candidates, self.target(),
             actor=self.ledger.owner, lease=(self.ledger.key, self.ledger.owner, epoch))
         self._held(epoch)
-        if self.enrollment_result["deferred"]:
-            self.notify("candidate enrollment deferred", self.enrollment_result)
+        deferred = self.enrollment_result["deferred"]
+        # #3139: a refusal is a fact about a lot, not a generic notice. Persist
+        # it in the train document and journal it lot by lot, or the pilot sees
+        # only "candidate enrollment deferred" and cannot tell why a ready lot
+        # never entered the packet.
+        self._record_enrollment(deferred, epoch)
+        for row in deferred:
+            self.notify(
+                "candidate enrollment deferred: lot #%s (gel %s) — %s"
+                % (row.get("work_item_id"), (row.get("frozen_sha") or "?")[:12],
+                   row.get("reason") or "no reason"), row)
+
+    def _record_enrollment(self, deferred, epoch):
+        """Persist this pass's refusals in the exact target train document.
+
+        A train with no document yet still needs the record: an empty
+        enrollment is precisely why a cutoff had nothing to compose. The
+        container is a terminal ("empty") state, so the next pass reads it,
+        enrolls again and replaces the record; a composed packet keeps the
+        current record with its plan. An empty list clears stale refusals.
+        """
+        state = self.load()
+        if state is None and not deferred:
+            return
+        checked = time.time()
+        rows = [dict(lot=row.get("work_item_id"),
+                     branch=row.get("branch") or "",
+                     frozen_sha=row.get("frozen_sha") or "",
+                     frozen_id=row.get("frozen_id"),
+                     candidate_sha=row.get("candidate_sha") or "",
+                     candidate_origin=row.get("candidate_origin") or "",
+                     reason=row.get("reason") or "",
+                     checked_ts=checked) for row in deferred]
+        expected = 0
+        if state is None:
+            state = dict(schema=SCHEMA, source=self.repository.source,
+                         target=self.target_branch, phase="empty")
+        else:
+            expected = int(state.get("revision", 0))
+        state = dict(state, enrollment_deferred=rows,
+                     enrollment_checked_ts=checked)
+        try:
+            self.save(state, expected, epoch)
+        except TrainError as exc:
+            # The refusal itself is still true and already qualified; losing
+            # the record must not hide it from the journal.
+            self.notify("candidate enrollment record not persisted: %s" % exc, state)
 
     def acquire(self, epoch):
         return self.ledger.acquire(epoch)
