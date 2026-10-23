@@ -220,8 +220,45 @@ There is nothing to publish from a local worktree — the pilot's state lives in
 the mesh database, the canon and GitHub — so the L232e source proof does not
 apply. A stopped host loses the role when its lease expires (the L232e timing,
 180 s by default); a returning host goes back to standby until the lease is
-free again. Candidate ranking, rank delays and hysteresis are EP2; this lot
-only makes the cross-host claim possible.
+
+free again. This lot only makes the cross-host claim possible; EP2 decides
+which candidate wins and when (next section).
+
+## Candidate score, rank delay and hysteresis (L165/EP2)
+
+Each candidate host publishes, once a minute, a standing for every elected
+role it may hold (`role_standings`, migration 0476): seven-day availability
+from `host_resources`, a capacity tie-break, and **only the local part** of
+readiness — harness present, no known failing credential, and
+`account_turn.turn_hold` empty (account pause/ceiling, mesh and agent budget).
+Placement, host gate (`host_lifecycle`, `host_holds`, the gate state of the
+latest reading), canon state and freshness are recomputed by every reader
+from the database; a host's own word never covers them.
+
+**Availability** is the share of the last seven days covered by a fresh
+reading. A reading stands for the host's own staleness threshold —
+`host_lifecycle.staleness_s`: `max(180 s, 3 × its reading cadence)` — never a
+fixed window, and readings or standings dated in the future are refused. The
+denominator is always seven days, even for a host that appeared an hour ago:
+a newcomer has to prove itself before it beats an old VM. **Capacity** (load
+and memory headroom, 0..1) only orders equal availabilities; it never enters
+the five-point margin.
+
+Ranking keeps only fresh, fully ready candidates: a dead better candidate
+does not make the second wait. The best ready candidate claims with no delay,
+the second waits 20 s, the third 40 s… from the first time its runner saw the
+lease free. The delay is client-side and polite — `registry.claim` remains
+the only arbiter, so two hosts that try together still produce one holder.
+
+A holder keeps the role while it renews. A **planned handover** happens only
+when a challenger has stayed at least 5 availability points above the holder
+for a full hour (standing history, no hole beyond the freshness threshold)
+and both are fresh and ready: the holder releases at the end of its turn
+(epoch++), and does not reclaim for the challenger's rank delay plus 60 s, so
+a challenger that dies after the release does not leave the role free. A
+workstation that boots therefore does not take the role back from a VM.
+`ameesh role status [ROLE] [--json]` prints the holder, the epoch and the
+ranked candidates with the diagnostic of each refusal.
 
 ## Fencing the elected pilot's gestures outside the database (L165/EP4)
 
