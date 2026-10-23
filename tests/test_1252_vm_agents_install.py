@@ -476,6 +476,15 @@ class VmAgentsInstallTest(VmAgentsHarness):
         self.assertFalse((self.parts / 'installation-en-cours').exists())
         self.assertIn('installé depuis src-', p.stdout)
         self.assertIn('redemarrer', p.stdout)
+        # #3042 : le venv versionné porte le préambule /bin/sh de pip, pas un
+        # shebang imbriqué que seul Linux accepterait.
+        courant = self.parts / 'venv-courant'
+        cible = os.readlink(courant)
+        vivant = Path(cible) if cible.startswith('/') else self.parts / cible
+        lignes = (vivant / 'bin/ameesh').read_text().splitlines()
+        self.assertEqual(lignes[0], '#!/bin/sh')
+        self.assertTrue(lignes[1].startswith("'''exec' "), lignes[1])
+        self.assertEqual(lignes[2], "' '''")
 
     def test_install_does_not_restart_the_runners(self):
         p = self.run_vm('installer', self.target)
