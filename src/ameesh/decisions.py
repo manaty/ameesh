@@ -544,84 +544,112 @@ def ask(cfg: Config, db, *, requester: str, question: str, options=(), lot: str 
         due_ts = now + DEFAULT_DUE_S
     elif float(due_ts) <= now:
         raise DecisionError("deadline already passed (%s)" % _local(due_ts))
-    requester_row = registry.get(db, requester)
-    if parent_lot is not None and new_lot is None:
-        raise DecisionError("--parent-lot goes with --new-lot")
-    if new_lot is not None:
-        title = " ".join(new_lot.split())
-        if not title:
-            raise DecisionError("--new-lot: empty title")
-        try:
-            from . import assignments, work_projects
-            project = work_projects.creation_project(cfg, db, requester)
-            if not project:
-                parent_ref = parent_lot or mail_lot
-                parent = None
-                if parent_ref:
-                    number = str(parent_ref).strip().lstrip("#")
-                    # A follow-up may inherit from a completed lot. It reads
-                    # its project; it does not assign or reopen that lot.
-                    parent = (work.get(db, int(number)) if number.isdigit()
-                              else assignments.resolve_lot(db, parent_ref))
-                    if parent is None:
-                        raise DecisionError("parent work item %s not found" % parent_ref)
-                project = work_projects.creation_project(cfg, db, requester, parent=parent)
-            # #540 : le lot de sa propre question reste au demandeur, qui
-            # attend la réponse (jamais dans la file d'équipe)
-            item = work._decision_lot(db, title=title, requester=requester, app=project,
-                                      cfg=cfg)
-            # #1391 : une question de décision est une demande légitime
-            # (humaine) — pas d'avertissement de route ici, même si le titre
-            # ressemble à une suite. La route du canon §2 est rendue par les
-            # deux points d'entrée de création de travail (`work add`, `mail
-            # --new-lot`), où le flux de suites de relecture a été observé.
-        except work.WorkError as exc:
-            raise DecisionError("work item not created — %s" % exc) from exc
-        except assignments.AssignmentError as exc:
-            raise DecisionError(str(exc)) from exc
-    else:
-        from . import assignments
-        try:
-            item = assignments.resolve_lot(db, lot)
-        except assignments.AssignmentError as exc:
-            raise DecisionError(str(exc)) from exc
-        if item is None:
-            raise DecisionError("work item %s not found: an open work item number, a unique "
-                                "reference, or --new-lot \"title\"" % lot)
-    owner, source = resolve_owner(cfg, db, requester_row, item)
-    lot_id = int(item["id"])
-    previous = item["state"]
-    if previous == "waiting_human":
-        # une autre demande tient déjà le lot : son état d'avant est le bon
-        inherited = [view_of(r, now).get("previous_state")
-                     for r in storage.of(db).decisions.pending_for_lot(str(lot_id))]
-        previous = next((p for p in inherited if p), None)
-    decision = {
-        "v": 1, "state": "pending", "question": question, "options": opts,
-        "recommend": recommend, "why": why, "urgent": bool(urgent),
-        "due_ts": round(float(due_ts), 3), "needs_signature": bool(needs_signature),
-        "owner_source": source, "project": _project(db, item, requester_row),
-        "lot": lot_id, "lot_title": item.get("title") or "", "previous_state": previous,
-    }
-    if source_mail is not None:
-        decision["source_mail"] = int(source_mail)
-    row = storage.of(db).decisions.create(
-        sender=requester, recipient=owner or OWNER_ANY,
-        body=request_text(decision, requester=requester, owner=owner),
-        payload={PAYLOAD_KEY: decision}, work_item_id=str(lot_id), host=cfg.host)
-    decision_id = int(row["id"])
-    fil.record(cfg, db, sender=requester, recipients=[owner or OWNER_ANY],
-               text=request_text(decision, requester=requester, owner=owner,
-                                 decision_id=decision_id),
-               ts=row.get("created_ts"), project=fil.project_for(cfg, row.get("sender_project")),
-               lot=lot_id, mailbox_ids=[decision_id],
-               meta={"kind": KIND, "decision": decision_id, "urgent": True if urgent else None,
-                     "signature": "exigée" if needs_signature else None})
-    lot_state = _hold_lot(db, item, actor=requester, note="decision #%d requested from %s: %s" % (
-        decision_id, _owner_label(owner), fil.excerpt(question, 160)))
-    out = get(db, decision_id, now) or {"id": decision_id}
-    out["lot_state"] = lot_state
-    return out
+
+    def body(db):
+        requester_row = registry.get(db, requester)
+        if parent_lot is not None and new_lot is None:
+            raise DecisionError("--parent-lot goes with --new-lot")
+        if new_lot is not None:
+            title = " ".join(new_lot.split())
+            if not title:
+                raise DecisionError("--new-lot: empty title")
+            try:
+                from . import assignments, work_projects
+                project = work_projects.creation_project(cfg, db, requester)
+                if not project:
+                    parent_ref = parent_lot or mail_lot
+                    parent = None
+                    if parent_ref:
+                        number = str(parent_ref).strip().lstrip("#")
+                        # A follow-up may inherit from a completed lot. It reads
+                        # its project; it does not assign or reopen that lot.
+                        parent = (work.get(db, int(number)) if number.isdigit()
+                                  else assignments.resolve_lot(db, parent_ref))
+                        if parent is None:
+                            raise DecisionError("parent work item %s not found" % parent_ref)
+                    project = work_projects.creation_project(cfg, db, requester, parent=parent)
+                # #540 : le lot de sa propre question reste au demandeur, qui
+                # attend la réponse (jamais dans la file d'équipe)
+                item = work._decision_lot(db, title=title, requester=requester, app=project,
+                                          cfg=cfg)
+                # #1391 : une question de décision est une demande légitime
+                # (humaine) — pas d'avertissement de route ici, même si le titre
+                # ressemble à une suite. La route du canon §2 est rendue par les
+                # deux points d'entrée de création de travail (`work add`, `mail
+                # --new-lot`), où le flux de suites de relecture a été observé.
+            except work.WorkError as exc:
+                raise DecisionError("work item not created — %s" % exc) from exc
+            except assignments.AssignmentError as exc:
+                raise DecisionError(str(exc)) from exc
+        else:
+            from . import assignments
+            try:
+                item = assignments.resolve_lot(db, lot)
+            except assignments.AssignmentError as exc:
+                raise DecisionError(str(exc)) from exc
+            if item is None:
+                raise DecisionError("work item %s not found: an open work item number, a unique "
+                                    "reference, or --new-lot \"title\"" % lot)
+        owner, source = resolve_owner(cfg, db, requester_row, item)
+        lot_id = int(item["id"])
+        previous = item["state"]
+        if previous == "waiting_human":
+            # une autre demande tient déjà le lot : son état d'avant est le bon
+            inherited = [view_of(r, now).get("previous_state")
+                         for r in storage.of(db).decisions.pending_for_lot(str(lot_id))]
+            previous = next((p for p in inherited if p), None)
+        decision = {
+            "v": 1, "state": "pending", "question": question, "options": opts,
+            "recommend": recommend, "why": why, "urgent": bool(urgent),
+            "due_ts": round(float(due_ts), 3), "needs_signature": bool(needs_signature),
+            "owner_source": source, "project": _project(db, item, requester_row),
+            "lot": lot_id, "lot_title": item.get("title") or "", "previous_state": previous,
+        }
+        if source_mail is not None:
+            decision["source_mail"] = int(source_mail)
+
+        def write(tx):
+            row = storage.of(tx).decisions.create(
+                sender=requester, recipient=owner or OWNER_ANY,
+                body=request_text(decision, requester=requester, owner=owner),
+                payload={PAYLOAD_KEY: decision}, work_item_id=str(lot_id), host=cfg.host)
+            decision_id = int(row["id"])
+            fil.record(cfg, tx, sender=requester, recipients=[owner or OWNER_ANY],
+                       text=request_text(decision, requester=requester, owner=owner,
+                                         decision_id=decision_id),
+                       ts=row.get("created_ts"),
+                       project=fil.project_for(cfg, row.get("sender_project")),
+                       lot=lot_id, mailbox_ids=[decision_id],
+                       meta={"kind": KIND, "decision": decision_id,
+                             "urgent": True if urgent else None,
+                             "signature": "exigée" if needs_signature else None})
+            state = _hold_lot(tx, item, actor=requester,
+                              note="decision #%d requested from %s: %s" % (
+                                  decision_id, _owner_label(owner),
+                                  fil.excerpt(question, 160)))
+            return row, decision_id, state
+
+        row, decision_id, lot_state = write(db)
+        out = get(db, decision_id, now) or {"id": decision_id}
+        out["lot_state"] = lot_state
+        return out
+
+    # L165 (EP4) : router une décision vers un humain est un geste du pilote
+    # hors base (elle ouvre un tour et déplace le lot). Le bail élu est
+    # vérifié et journalisé AVANT la création du lot ou la première écriture ;
+    # les deux sont dans la même transaction que le hold.
+    from . import pilot_gesture
+    ref = ("decision new lot: %s" % " ".join(new_lot.split())
+           if new_lot is not None else "decision lot #%s" % str(lot).lstrip("#"))
+    try:
+        fence = pilot_gesture.gate(cfg, db, "decision", ref)
+        if fence is None:
+            return body(db)
+        with db.transaction() as tx:
+            fence.hold(tx)
+            return body(tx)
+    except pilot_gesture.GestureRefused as exc:
+        raise DecisionError(str(exc)) from exc
 
 
 # --------------------------------------------------------------------------

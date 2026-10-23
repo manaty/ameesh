@@ -120,6 +120,12 @@ POLL_S = float(os.environ.get("AMEESH_MERGE_PR_POLL_S", "5"))
 ATTEMPTS = int(os.environ.get("AMEESH_MERGE_PR_ATTEMPTS", "12"))
 #: short `git ls-remote`/`rev-parse` calls; fetch and push use FETCH_TIMEOUT
 SHORT_TIMEOUT = 60.0
+#: L165 (EP4) : marge de bail renouvelée juste avant le push externe. Elle
+#: couvre le pire cas du push (`FETCH_TIMEOUT`) et une lecture de la PR après
+#: (`SHORT_TIMEOUT`). La course résiduelle (un réseau qui bloque au-delà) est
+#: documentée dans `docs/HOST-HANDOFFS.md` ; le CAS de la cible et
+#: `--match-head-commit` restent les dernières gardes.
+PILOT_CALL_MARGIN_S = FETCH_TIMEOUT + SHORT_TIMEOUT
 FULL_SHA = re.compile(r"^[0-9a-f]{40}$")
 _HTTPS = re.compile(r"^https?://", re.I)
 #: a URL carrying credentials (`https://user:token@…`): never shown as such,
@@ -657,6 +663,15 @@ def direct_merge(slug: str, pr: int, head: str, *, lot: int, repo: str, db=None,
         slug = slug_ident[1]
     fetch_url = (fetch_url or "").strip() or ("https://github.com/%s.git" % slug)
     push_url = check_push_url(push_url or ("git@github.com:%s.git" % slug))
+    # L165 (EP4) : la fusion hors API est un geste du pilote hors base. Le bail
+    # élu est vérifié avant la première lecture GitHub ; il est renouvelé juste
+    # avant le push avec la marge de l'appel. Un `--dry-run` n'agit pas et n'a
+    # rien à fencer.
+    fence = None
+    if not dry_run:
+        from . import pilot_gesture
+        fence = pilot_gesture.gate(cfg, db, "merge",
+                                   "merge-pr #%d (lot #%d)" % (pr, lot))
     # #1003 B/P1: one repository identity, verified before the first read; a
     # divergence writes nothing and admits nothing.
     _bind_repo_identity(repo, slug, fetch_url, push_url)
@@ -669,15 +684,31 @@ def direct_merge(slug: str, pr: int, head: str, *, lot: int, repo: str, db=None,
         raise MergePrError(str(exc)) from exc
     if branch and _branch_name(branch) != _branch_name(target):
         raise MergePrError("PR #%d targets %s, not %s" % (pr, branch, target))
-    # #2333 (canon §11 bis): the packet rule is checked before any scratch
-    # clone, GitHub mutation or write — the `already MERGED` declaration too.
-    # N1 (#1003): `--dry-run` validates an exception but never journals it.
-    try:
-        packet_guard.check_merge(None if dry_run and exception else db, lot,
-                                 view.get("headRefName") or "", target, head,
-                                 exception=exception, reason=reason, actor=actor)
-    except packet_guard.PacketGuardError as exc:
-        raise MergePrError(str(exc)) from exc
+    # #2333 (canon §11 bis): the packet rule is checked after the PR read and
+    # before any scratch clone, GitHub mutation or write — the `already
+    # MERGED` declaration too. L165 (EP4) : une exception explicite est une
+    # écriture durable ; elle partage la transaction du hold élu, sinon une
+    # bascule pendant `pr_view` laisserait une autorisation hors paquet à
+    # l'ancien détenteur (revue cx2 B3). N1 (#1003): `--dry-run` validates an
+    # exception but never journals it.
+    def declare(database):
+        try:
+            packet_guard.check_merge(database, lot, view.get("headRefName") or "",
+                                     target, head, exception=exception, reason=reason,
+                                     actor=actor)
+        except packet_guard.PacketGuardError as exc:
+            raise MergePrError(str(exc)) from exc
+
+    if fence is not None and exception and not dry_run:
+        from . import pilot_gesture
+        with db.transaction() as tx:
+            try:
+                fence.hold(tx)
+            except pilot_gesture.GestureRefused as exc:
+                raise MergePrError(str(exc)) from exc
+            declare(tx)
+    else:
+        declare(None if dry_run and exception else db)
 
     owner = work_dir or _scratch()
     reservation = None
@@ -687,6 +718,13 @@ def direct_merge(slug: str, pr: int, head: str, *, lot: int, repo: str, db=None,
         if state == "MERGED":
             # N1 (#1003): an already-MERGED PR does not declare a lot without
             # the lot/freeze/branch/target link; nothing is written otherwise.
+            # L165 (EP4) : la déclaration est un effet, fence-la même sans push.
+            if fence is not None:
+                from . import pilot_gesture
+                try:
+                    fence.hold(db)
+                except pilot_gesture.GestureRefused as exc:
+                    raise MergePrError(str(exc)) from exc
             _already_lot_links(db, lot, head, view, target, repo, cfg)
             return _already(slug, pr, head, view, target=target, fetch_url=fetch_url,
                             owner=owner)
@@ -837,6 +875,15 @@ def direct_merge(slug: str, pr: int, head: str, *, lot: int, repo: str, db=None,
 
         ref = "refs/heads/%s" % target
         reservation.refresh()
+        # L165 (EP4) : renouvellement du bail élu juste avant l'appel externe,
+        # avec la marge du push et de sa lecture ; refus si le bail renouvelé
+        # n'a pas cette marge (course résiduelle documentée).
+        if fence is not None:
+            from . import pilot_gesture
+            try:
+                fence.hold(db, margin_s=PILOT_CALL_MARGIN_S)
+            except pilot_gesture.GestureRefused as exc:
+                raise MergePrError(str(exc)) from exc
         try:
             proc = _run(owner, "push", "--quiet", "--no-verify",
                         "--force-with-lease=%s:%s" % (ref, tip), push_url,

@@ -42,6 +42,10 @@ from .canon import FETCH_TIMEOUT, GitError
 LOCK_TTL_S = float(os.environ.get("AMEESH_LAND_LOCK_TTL", "1800"))
 #: one gate at most
 GATE_TIMEOUT_S = float(os.environ.get("AMEESH_LAND_GATE_TIMEOUT", "1800"))
+#: L165 (EP4) : marge du bail élu renouvelée juste avant un push/merge externe
+#: (`FETCH_TIMEOUT` du push + marge de lecture). La course résiduelle est
+#: documentée dans `docs/HOST-HANDOFFS.md`.
+AGENT_CALL_MARGIN_S = FETCH_TIMEOUT + 60.0
 #: lines of a failed gate's output kept in the ejection
 GATE_TAIL = 20
 TRAILER = "ameesh-work"
@@ -541,7 +545,7 @@ class _Landing:
     once, at the end (`land_head`)."""
 
     def __init__(self, db, project, row, key, owner, epoch, locks, projects=(),
-                 cfg=None, clone=None, replayer=None, parts=None):
+                 cfg=None, clone=None, replayer=None, parts=None, fence=None):
         self.db, self.project, self.row = db, project, row
         self.lot = int(row["work_item_id"])
         self.ops = storage.of(db).work
@@ -549,6 +553,9 @@ class _Landing:
         self.release = False
         self.projects = projects
         self.cfg, self.clone = cfg, clone
+        #: L165 (EP4) : garde du bail élu, appliquée juste avant chaque effet
+        #: externe (push de la cible, push de la branche, fusion de la PR).
+        self.fence = fence
         #: L1651 : le clone radar (pour relire la source de sélection versionnée
         #: de la cible) et les parts dues déjà requalifiées par l'appelant
         #: (§12 : le manifeste de paquet remplace la CI individuelle)
@@ -598,6 +605,21 @@ class _Landing:
             return True
         self.locks.pop(self.key, None)
         return False
+
+    def fence_hold(self) -> None:
+        """L165 (EP4) : renouvelle le bail élu juste avant l'effet externe.
+
+        Refusé (`LandError`) si l'époque a changé, si le bail n'a pas la marge
+        de l'appel, ou si le rôle s'est arrêté. L'effet externe n'est alors
+        jamais atteint ; `land_head` journalise l'erreur et rend la ligne.
+        """
+        if self.fence is None:
+            return
+        from . import pilot_gesture
+        try:
+            self.fence.hold(self.db, margin_s=AGENT_CALL_MARGIN_S)
+        except pilot_gesture.GestureRefused as exc:
+            raise LandError(str(exc)) from exc
 
     def write(self, **kw) -> bool:
         return self.ops.queue_update(self.lot, lease=self.lease, entry=self.entry, **kw) is not None
@@ -742,6 +764,16 @@ def land_head(cfg, db, project, row: dict, *, owner: str, replayer=None, locks=N
             "queue source %s does not match project %s repository; select the source "
             "project (or requeue a legacy entry without a source)"
             % (source or "<missing>", project.name))}
+    # L165 (EP4) : faire atterrir la file est un geste du pilote hors base (le
+    # push suit). Un passage radar n'a pas d'identité de session : sans bail
+    # élu à vérifier, `gate` ne fait rien. Le bail est renouvelé juste avant
+    # chaque push/merge dans `_Landing.fence_hold`.
+    from . import pilot_gesture
+    try:
+        fence = pilot_gesture.gate(cfg, db, "queue", "land #%d" % lot,
+                                   project=project.name)
+    except pilot_gesture.GestureRefused as exc:
+        return {"lot": lot, "result": "error", "error": str(exc)}
     projects = tuple(radar.settings_of(cfg).projects.values())
     key = lock_key(project, row["target"])
     ops = storage.of(db).work
@@ -758,7 +790,7 @@ def land_head(cfg, db, project, row: dict, *, owner: str, replayer=None, locks=N
                                         target=project.target)
     landing = _Landing(db, project, row, key, owner, epoch, locks, projects,
                        cfg=cfg, clone=getattr(replayer, "path", None), replayer=replayer,
-                       parts=parts)
+                       parts=parts, fence=fence)
     slug = radar.github_slug(project) if project.land == "pr" else None
     try:
         try:
@@ -928,6 +960,8 @@ def _land(landing: _Landing, replayer, slug, gh) -> dict:
         stopped = _fire_guard(landing, gh=gh)
         if stopped is not None:
             return stopped
+        # L165 (EP4) : bail élu renouvelé juste avant le push externe.
+        landing.fence_hold()
         # #194 r6: one atomic push, two compare-and-swaps that the server
         # checks: the target on the base seen, the lease ref on the value this
         # holder wrote — moved to a child commit, so git sends that update
@@ -968,6 +1002,8 @@ def _land(landing: _Landing, replayer, slug, gh) -> dict:
     stopped = _fire_guard(landing, gh=gh)
     if stopped is not None:
         return stopped
+    # L165 (EP4) : bail élu renouvelé juste avant le push de la branche.
+    landing.fence_hold()
     # #194 r4: compare and swap on the freeze (see `local`)
     branch_ref = "refs/heads/%s" % row["branch"]
     proc = resolutions._run(replayer.path, "push", "--quiet", "--no-verify",
@@ -1161,6 +1197,9 @@ def _follow_pr(landing: _Landing, slug, *, gh, replayer) -> dict:
     stopped = _fire_guard(landing, gh=gh)
     if stopped is not None:
         return stopped
+    # L165 (EP4) : bail élu renouvelé juste avant `gh pr merge` ; la fusion
+    # GitHub n'est pas dans la transaction, d'où la marge.
+    landing.fence_hold()
     error = pr_merge(slug, status["number"], row["landing_sha"], project.merge_method, gh=gh)
     # #194 r8: past this call, the PR may be merged: nothing raises any more,
     # and every outcome is read back from GitHub
