@@ -405,7 +405,8 @@ class Leases(Domain):
 
     @abc.abstractmethod
     def renew(self, name: str, owner: str, epoch: int, ttl_seconds: float) -> float | None:
-        """Prolonge le bail ; rend la nouvelle échéance, None si on ne le détient plus."""
+        """Prolonge le bail sans raccourcir son échéance ; rend la nouvelle
+        échéance, None si on ne le détient plus."""
 
     @abc.abstractmethod
     def release(self, name: str, owner: str, epoch: int) -> bool:
