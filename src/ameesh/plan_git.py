@@ -65,10 +65,12 @@ ou qu'une note `hold:` n'est pas levée (le contenu fusionné est constaté, le
 journal le dit, le détenteur est réveillé, le lot reste ouvert) ; le contrôle
 et la fermeture partagent le verrou de ligne du lot avec les notes hold/lift
 (`work.close_merged(content_guard=…)`), et une lecture du journal en erreur
-retient aussi. #3219 : la retenue ordinaire de l'assigné (règle 1) ne retient
-pas — le contenu prouvé la lève et la note de fusion garde la trace ; celles
-d'un pilote ou d'un autre acteur retiennent. `sync-branches` et les unités de
-paquet (`sync-packets`) portent la même garde.
+retient aussi. #3219 : les retenues ordinaires de l'assigné (règle 1) ne
+retiennent pas — le contenu prouvé les lève et la note de fusion garde la
+trace ; celles d'un pilote ou d'un autre acteur retiennent, même recouvertes
+par celle de l'assigné et après sa levée (les holds sont un ensemble, pas une
+pile). `sync-branches` et les unités de paquet (`sync-packets`) portent la
+même garde.
 
 Un lot absorbé par un autre ou remplacé se clôt par
 `ameesh work close <id> --superseded-by <id>` ; jamais de réouverture d'un
@@ -877,12 +879,14 @@ def content_retention(st, row: dict) -> dict | None:
     journal qui échoue rend une retenue `unreadable` : une erreur ne doit
     jamais autoriser une fermeture. Rend `{what, motif, by, since}`, ou None.
 
-    #3219 : la retenue ordinaire de l'assigné (règle 1, non comptée par
-    `planned_waits.pilot_holds`) ne retient plus la fermeture — son auteur la
-    lèverait lui-même, mais le contenu prouvé est déjà la livraison ; la passe
-    la lève et `work.close_merged` écrit la levée dans sa note de fusion
-    (`lift: True`). Un hold de pilote, ou d'un autre acteur que l'assigné,
-    retient toujours : sa levée reste un geste autorisé (règle #1664)."""
+    #3219 : les retenues ordinaires de l'assigné (règle 1, non comptées par
+    `planned_waits.pilot_holds`) ne retiennent plus la fermeture — son auteur
+    les lèverait lui-même, mais le contenu prouvé est déjà la livraison ; la
+    passe les lève et `work.close_merged` écrit la levée dans sa note de
+    fusion (`lift: True`). Les retenues d'un pilote ou d'un autre acteur
+    restent actives et retiennent : les holds sont un ensemble, pas une pile,
+    donc un hold de pilote recouvert par celui de l'assigné garde son effet.
+    Sa levée reste un geste autorisé (règle #1664)."""
     row = row or {}
     try:
         lot = int(row["id"])
@@ -903,31 +907,42 @@ def content_retention(st, row: dict) -> dict | None:
         return {"what": "blocked", "motif": "état %s" % state, "by": by,
                 "since": last.get("created_ts")}
     db = getattr(st, "db", None)
-    held = planned_waits.current_holds(db, events,
-                                       cfg=getattr(db, "cfg", None)).get(lot)
-    if held:
-        by = str(held.get("by") or "")
-        reason = ""
-        for event in reversed(events):
-            text = str(event.get("note") or "").strip()
-            if planned_waits.is_hold_note(text):
-                reason = " ".join(text.split())
-                if reason[:5].lower() == "hold:":
-                    reason = reason[5:].strip()
-                reason = reason[:160]
-                break
-        if by and by == str(row.get("assignee") or "") and not held.get("pilot"):
-            lift = "levée du hold de l'assigné %s" % by
+    holds = planned_waits.active_holds(db, events,
+                                       cfg=getattr(db, "cfg", None)).get(lot) or {}
+    if holds:
+        assignee = str(row.get("assignee") or "")
+        own, retained = [], []
+        for hold in holds.values():
+            if hold.get("by") == assignee and not hold.get("pilot"):
+                own.append(hold)
+            else:
+                retained.append(hold)
+        if own and not retained:
+            last = max(own, key=lambda hold: float(hold.get("since") or 0.0))
+            lift = "levée du hold de l'assigné %s" % assignee
+            reason = _hold_reason(last)
             if reason:
                 lift += " : %s" % reason
-            return {"what": "hold", "lift": True, "motif": lift, "by": by,
-                    "since": held.get("since")}
+            return {"what": "hold", "lift": True, "motif": lift, "by": assignee,
+                    "since": last.get("since")}
+        chosen = max(retained or own,
+                     key=lambda hold: float(hold.get("since") or 0.0))
+        by = str(chosen.get("by") or "")
         motif = "hold" + (" de %s" % by if by else "")
+        reason = _hold_reason(chosen)
         if reason:
             motif += " : %s" % reason
         return {"what": "hold", "motif": motif, "by": by,
-                "since": held.get("since")}
+                "since": chosen.get("since")}
     return None
+
+
+def _hold_reason(hold: dict) -> str:
+    """Le motif d'une retenue (`hold: <raison>`), sur une ligne."""
+    reason = " ".join(str((hold or {}).get("note") or "").split())
+    if reason[:5].lower() == "hold:":
+        reason = reason[5:].strip()
+    return reason[:160]
 
 
 def _retention_text(retention: dict, entry: dict, target: str) -> str:

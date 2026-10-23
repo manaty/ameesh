@@ -199,11 +199,13 @@ all idempotent, which set the lot to `merged` with its `merged` milestone
    `contenu fusionné, fermeture retenue : <motif>`, the hold holder (or the
    agent who blocked the lot) is woken, and the lot stays open. An `unhold:`
    note or a state change lifts the hold; the next sweep closes. #3219: the
-   assignee's own rule-1 hold (not a pilot's hold) does not withhold the
-   closure — the proven content is the delivery, so the sweep lifts it and the
-   merge note says `levée du hold de l'assigné <agent>`; a hold of a pilot or
-   of another actor still withholds, and its author may lift it themself. The
-   check and the closure share the lot's row lock — hold/lift notes and state
+   assignee's own rule-1 holds (not a pilot's holds) do not withhold the
+   closure — the proven content is the delivery, so the sweep lifts them and
+   the merge note says `levée du hold de l'assigné <agent>`. The holds of a
+   lot are a set: a hold of a pilot or of another actor still withholds even
+   when the assignee's hold covers it and after the assignee lifts theirs
+   (its author or a pilot may lift it). The check and the closure share the
+   lot's row lock — hold/lift notes (`--wake-at` included), moves and state
    changes take it too — so a retention cannot slip between the journal read
    and the close. A journal read error is an explicit `error` (the lot stays
    open, never closes), not a silent hold. The same guard covers

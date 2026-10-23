@@ -84,23 +84,29 @@ A lot is stale when it is open and inactive beyond the configured threshold
   (`AMEESH_ALERT_ORCHESTRATORS`, or the `orchestrateur`/`conception` role on its
   Agent card in the canon), the same authority as a state correction. It
   carries the gate no open lot represents — an operator window, a human
-  decision with no open request. The hold is attributed and dated (`by`,
-  `since`) and only an explicit lift (`unhold:`, `hold lifted:`,
-  `hold released:`, `hold cleared:`) or a state change ends it: an ordinary
-  note (triage, status report) does not, and a later `hold:` note re-arms it.
+  decision with no open request. The holds of a lot are a **set**, not a stack:
+  each active hold is attributed and dated (`by`, `since`) and retains by
+  itself. An explicit lift (`unhold:`, `hold lifted:`, `hold released:`,
+  `hold cleared:`) removes only its author's hold; a pilot's lift removes them
+  all, and a state change ends every hold. An ordinary note (triage, status
+  report) ends nothing, and a later `hold:` note adds a hold (or re-arms its
+  author's).
   The write path authenticates the claim: `ameesh work note` and
   `ameesh work move --note` refuse a `hold:`/lift note that claims a pilot
   identity the writing session cannot prove (same guard as a state
-  correction, `history=False`). A lift is not reserved to a pilot: the actor
-  who posed the hold — the exact author recorded on it — may lift it, if its
-  session proves that identity (`--actor` spoofed is refused); anyone else
-  needs a pilot, so the hold of another actor stays reserved (#3219). The
-  runner wake keeps its own, older convention (`LotSessions.HOLD_PREFIX`, last
-  non-empty note decides): any assignee may write a plain `hold:` to stop its
-  own wake, but such a hold is not a pilot's and does not defer this alert; the
-  two conventions are deliberately separate. A closure by content does not
-  wait for that rule-1 hold of the assignee either (see
-  [the work plan](PLAN-DE-TRAVAIL.md)): the proven content lifts it and the
+  correction, `history=False`). A lift is not reserved to a pilot: the author
+  of an active hold may lift their own, if the session proves that identity
+  (`--actor` spoofed is refused); the **other** active holds remain, so a
+  pilot's, human's or third party's hold stays reserved to a pilot (#3219).
+  The reader and the write are one step under the lot's row lock — `work note`
+  with or without `--wake-at`, and `work move --note` — so a hold interleaved
+  between the check and the write cannot be erased. The runner wake keeps its
+  own, older convention (`LotSessions.HOLD_PREFIX`, last non-empty note
+  decides): any assignee may write a plain `hold:` to stop its own wake, but
+  such a hold is not a pilot's and does not defer this alert; the two
+  conventions are deliberately separate. A closure by content does not wait
+  for the rule-1 holds of the assignee when no other hold is active (see
+  [the work plan](PLAN-DE-TRAVAIL.md)): the proven content lifts them and the
   merge note records the lift.
 
 Grouped views (`work list`, `progress --json`, the stale alert, the dependency

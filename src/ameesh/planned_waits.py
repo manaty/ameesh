@@ -83,7 +83,7 @@ def is_lift_note(text) -> bool:
 
 
 def explicit_holds(events, *, allowed=None) -> dict[int, dict]:
-    """Les holds lus dans le journal d'un lot (#1664).
+    """Les holds lus dans le journal d'un lot (#1664) — la **dernière** retenue.
 
     Un hold tient tant que le lot ne change pas d'état et qu'aucune note de
     levée (`unhold:`, `hold lifted:`…) ne suit ; les notes ordinaires (triage,
@@ -91,7 +91,12 @@ def explicit_holds(events, *, allowed=None) -> dict[int, dict]:
     hold : un prédicat (nom → bool) ou un ensemble de noms ; None = lecture
     brute, sans contrôle d'auteur. Les transitions d'état sont lues dans
     l'ordre d'écriture `(created_ts, id)` du journal. Le dernier hold posé
-    porte l'auteur et la date affichés."""
+    porte l'auteur et la date affichés.
+
+    #3219 : c'est une lecture d'affichage, pas l'ensemble des retenues actives
+    — un hold couvert par celui d'un autre auteur reste actif et continue de
+    retenir. La lecture d'autorité (levée, fermeture par le contenu) est
+    `active_holds`."""
     ordered: dict[int, list[dict]] = {}
     for event in events or ():
         ordered.setdefault(int(event["work_item_id"]), []).append(event)
@@ -148,6 +153,58 @@ def _pilot_allowed(db, cfg):
     return allowed
 
 
+def active_holds(db, events, *, cfg=None) -> dict[int, dict[str, dict]]:
+    """#3219 : les retenues actives de chaque lot, par auteur.
+
+    Les holds d'un lot forment un **ensemble**, pas une pile dont on ne lirait
+    que le dernier : chaque hold actif retient de lui-même. Un hold tient
+    jusqu'à une levée ou un changement d'état ; une levée ne retire que le
+    hold de son propre auteur — sauf celle d'un pilote (humain, orchestrateur
+    ou conception), qui lève toute la retenue du lot (#1664). Un hold posé
+    avant ou après celui d'un autre auteur continue donc de retenir, même
+    après la levée du sien.
+
+    `pilot` dit si l'auteur est un pilote **à la lecture** (`_pilot_allowed`,
+    la même autorisation que la stagnation). `note` est le texte de la pose
+    (motif), pour citer la retenue sans relire le journal.
+
+    Rend `{lot: {auteur: {what, by, since, note, pilot}}}`."""
+    ordered: dict[int, list[dict]] = {}
+    for event in events or ():
+        ordered.setdefault(int(event["work_item_id"]), []).append(event)
+    if not ordered or not any(is_hold_note(event.get("note"))
+                              for event in events or ()):
+        return {}
+    cfg = getattr(db, "cfg", None) if cfg is None else cfg
+    allowed = _pilot_allowed(db, cfg)
+    out: dict[int, dict[str, dict]] = {}
+    for ident, lot_events in ordered.items():
+        held: dict[str, dict] = {}
+        previous = None
+        for event in sorted(lot_events, key=lambda e: (float(e.get("created_ts") or 0.0),
+                                                       int(e.get("id") or 0))):
+            state = event.get("state")
+            if previous is not None and state != previous:
+                held = {}                   # le lot a repris : tout est fini
+            previous = state
+            text = str(event.get("note") or "").strip()
+            if not text:
+                continue
+            who = event.get("actor") or ""
+            if is_hold_note(text):
+                held[who] = {"what": "hold", "by": who or None,
+                             "since": event.get("created_ts"), "note": text,
+                             "pilot": bool(allowed(who))}
+            elif is_lift_note(text):
+                if allowed(who):
+                    held = {}               # un pilote lève toute la retenue
+                else:
+                    held.pop(who, None)     # l'auteur ne lève que la sienne
+        if held:
+            out[ident] = held
+    return out
+
+
 def pilot_holds(db, events, *, cfg=None) -> dict[int, dict]:
     """Les holds posés par un pilote (#1664) — les seuls comptés par la
     stagnation.
@@ -155,38 +212,20 @@ def pilot_holds(db, events, *, cfg=None) -> dict[int, dict]:
     `events` est le flux ciblé lu par le stockage
     (`Progress.lot_hold_events` : transitions d'état + notes hold/levée), ou
     un journal complet ; les deux donnent le même hold. La lecture
-    d'autorisation est celle de `_pilot_allowed`."""
+    d'autorisation est celle de `_pilot_allowed`. #3219 : un hold de pilote
+    reste actif même recouvert par le hold ordinaire d'un autre auteur ; le
+    dernier hold de pilote actif porte l'auteur et la date affichés."""
     events = list(events or ())
     if not any(is_hold_note(event.get("note")) for event in events):
         return {}
-    cfg = getattr(db, "cfg", None) if cfg is None else cfg
-    return explicit_holds(events, allowed=_pilot_allowed(db, cfg))
-
-
-def current_holds(db, events, *, cfg=None) -> dict[int, dict]:
-    """#3219 : la retenue courante de chaque lot, et son autorité.
-
-    Même lecture que `explicit_holds` (dernière retenue non levée), avec
-    `pilot` : le hold courant est-il aussi un hold de pilote
-    (`pilot_holds`, même auteur et même instant) ? C'est la seule question
-    que posent la levée (#3219 : son auteur, ou un pilote) et la fermeture
-    par le contenu (#2744 : la règle 1 de l'assigné ne retient pas) ; les
-    deux chemins lisent donc la même réponse. `pilot_holds` ignore un hold
-    ordinaire posé par-dessus un hold de pilote : l'instant et l'auteur
-    évitent de confondre les deux.
-
-    Rend `{lot: {what, by, since, pilot}}`."""
-    events = list(events or ())
-    held = explicit_holds(events)
-    if not held:
-        return {}
-    pilots = pilot_holds(db, events, cfg=cfg)
     out: dict[int, dict] = {}
-    for lot, hold in held.items():
-        pilot = pilots.get(lot) or {}
-        out[lot] = dict(hold, pilot=bool(
-            (pilot.get("by"), pilot.get("since"))
-            == (hold.get("by"), hold.get("since"))))
+    for lot, holds in active_holds(db, events, cfg=cfg).items():
+        pilots = [hold for hold in holds.values() if hold.get("pilot")]
+        if not pilots:
+            continue
+        chosen = max(pilots, key=lambda hold: float(hold.get("since") or 0.0))
+        out[lot] = {"what": "hold", "by": chosen.get("by"),
+                    "since": chosen.get("since")}
     return out
 
 

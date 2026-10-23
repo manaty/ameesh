@@ -250,43 +250,38 @@ def claims_pilot(cfg, db, who: str) -> bool:
                                        history=False)
 
 
-def _current_hold(db, item_id: int | None) -> tuple[dict | None, dict | None]:
-    """#3219 : la retenue courante d'un lot, et le hold de pilote s'il en est un.
+def _active_holds(db, item_id: int | None) -> dict[str, dict]:
+    """#3219 : les retenues actives d'un lot, par auteur ({} sans retenue).
 
-    Rend `(held, pilot)` : `held` est la retenue lue par
-    `planned_waits.current_holds` (None sans retenue), `pilot` le même hold
-    quand il compte aussi comme hold de pilote (`planned_waits.pilot_holds`,
-    même autorisation que la stagnation). Une retenue ordinaire (règle 1) n'a
-    pas de `pilot` : seul son auteur peut la lever.
-
-    La lecture est la lecture groupée ciblée (`lot_hold_events`), la même que
+    Chaque hold actif retient de lui-même (`planned_waits.active_holds`) : le
+    hold d'un pilote ou d'un tiers reste actif sous celui de l'assigné, et la
+    levée de l'assigné ne retire que le sien. La lecture est la lecture
+    groupée ciblée (`lot_hold_events`), la même que
     `plan_git.content_retention` : les notes ordinaires ne sont pas lues. Sur
     une connexion d'exécuteur médié (#109), `progress` n'est pas au contrat :
     le journal reste au serveur et une levée ordinaire y est refusée comme
     avant #3219."""
     if item_id is None or storage.is_remote(db):
-        return None, None
+        return {}
     from . import planned_waits
 
     lot = int(item_id)
     events = storage.of(db).progress.lot_hold_events(
         [lot], planned_waits.HOLD_NOTE_PATTERNS)
-    held = planned_waits.current_holds(db, events).get(lot)
-    if not held:
-        return None, None
-    return held, (held if held.get("pilot") else None)
+    return planned_waits.active_holds(db, events).get(lot) or {}
 
 
-def _own_hold_lift(cfg, db, actor: str, held: dict) -> str:
-    """#3219 : l'auteur d'un hold ordinaire lève le sien — et lui seul.
+def _own_hold_lift(cfg, db, actor: str, holds: dict[str, dict]) -> str:
+    """#3219 : l'auteur d'une retenue active lève la sienne — et lui seul.
 
-    La levée ordinaire est permise à l'acteur qui a posé la retenue, à
-    condition qu'il la prouve : la session liée n'écrit qu'en son nom
-    (`--actor` usurpé refusé, comme `forcer`/`milestone_actor`), une session
-    sans liaison ne nomme qu'un humain (qui est pilote, et passe donc par
-    `corrector`), et un tiers ordinaire est refusé. Un hold de pilote ne passe
-    jamais par ici : `check_wait_note` le réserve à `corrector` (#1664 r2 B1
-    inchangé)."""
+    La levée ordinaire est permise à l'acteur qui a posé une retenue encore
+    active, à condition qu'il la prouve : la session liée n'écrit qu'en son
+    nom (`--actor` usurpé refusé, comme `forcer`/`milestone_actor`), une
+    session sans liaison ne nomme qu'un humain (qui est pilote, et passe donc
+    par `corrector`), et un tiers ordinaire est refusé. Les autres retenues
+    du lot — pilote, humain, QA — ne sont pas effacées par cette levée
+    (`planned_waits.active_holds`) : seule une levée de pilote les lève
+    toutes (#1664 r2 B1)."""
     from . import identity
 
     what = "hold lift"
@@ -295,17 +290,16 @@ def _own_hold_lift(cfg, db, actor: str, held: dict) -> str:
                            or os.environ.get("AGENT_MAIL_NAME")):
         raise WorkError("%s refused: invalid session identity (%s)"
                         % (what, binding.reason or "unbound identity"))
-    by = str((held or {}).get("by") or "")
     if binding.name:
         if actor != binding.name:
             raise WorkError(
                 "%s refused: this session belongs to %s, it does not act on behalf "
                 "of %s" % (what, binding.name, actor or UNKNOWN_ACTOR))
-        if by != actor:
+        if actor not in holds:
             raise WorkError(
-                "%s refused: the hold was posed by %s, not by %s; only its author "
-                "or a pilot (human, orchestrator or design) can lift it"
-                % (what, by or "?", actor))
+                "%s refused: %s holds no active hold on this lot (held by %s); only "
+                "the author of a hold or a pilot (human, orchestrator or design) can "
+                "lift it" % (what, actor, _hold_holders(holds)))
         return actor
     # sans liaison, seuls les gestes d'un terminal humain sont attribuables ;
     # un humain est pilote et n'arrive donc pas ici en pratique, mais la règle
@@ -313,14 +307,20 @@ def _own_hold_lift(cfg, db, actor: str, held: dict) -> str:
     if not (actor.startswith(HUMAN_PREFIX) and len(actor) > len(HUMAN_PREFIX)):
         raise WorkError(
             "%s refused: %s is not a human and this session has no bound agent "
-            "identity; only the hold's author or a pilot can lift it"
+            "identity; only the author of a hold or a pilot can lift it"
             % (what, actor or UNKNOWN_ACTOR))
-    if by != actor:
+    if actor not in holds:
         raise WorkError(
-            "%s refused: the hold was posed by %s, not by %s; only its author or a "
-            "pilot (human, orchestrator or design) can lift it"
-            % (what, by or "?", actor))
+            "%s refused: %s holds no active hold on this lot (held by %s); only "
+            "the author of a hold or a pilot (human, orchestrator or design) can "
+            "lift it" % (what, actor, _hold_holders(holds)))
     return actor
+
+
+def _hold_holders(holds: dict[str, dict]) -> str:
+    """Les auteurs des retenues actives, pour un message actionnable."""
+    names = sorted({str(hold.get("by") or "?") for hold in (holds or {}).values()})
+    return ", ".join(names) or "?"
 
 
 def check_wait_note(cfg, db, actor: str, text: str, *,
@@ -337,23 +337,23 @@ def check_wait_note(cfg, db, actor: str, text: str, *,
     compte pas pour la stagnation (`planned_waits.pilot_holds`).
 
     #3219 : une levée (`unhold:`…) n'est plus toujours un geste de pilote.
-    L'auteur d'un hold ordinaire peut lever le sien (la passe de contenu
-    #2744 le lui demande) ; le hold d'un pilote reste levable par un pilote
-    seulement, et un tiers ordinaire ne lève pas le hold d'un autre. Sans
-    lot lu (`item_id` absent), la levée reste réservée au pilote."""
+    L'auteur d'une retenue active peut lever la sienne (la passe de contenu
+    #2744 le lui demande) ; les retenues des autres — pilote, humain, QA —
+    restent actives et ne sont levées que par un pilote. Sans lot lu
+    (`item_id` absent), la levée reste réservée au pilote."""
     text = (text or "").strip()
     if not text:
         return actor
     from . import planned_waits
 
     if planned_waits.is_lift_note(text):
-        held, pilot = _current_hold(db, item_id)
-        # hold de pilote, retenue absente (connexion médiée, lot sans hold),
-        # ou acteur qui se dit pilote : la garde #1664 r2 (B1) s'applique
-        # telle quelle.
-        if held is None or pilot is not None or claims_pilot(cfg, db, actor):
+        holds = _active_holds(db, item_id)
+        # retenue absente (connexion médiée, lot sans hold), acteur qui se dit
+        # pilote, ou acteur sans retenue active à lui : la garde #1664 r2 (B1)
+        # s'applique telle quelle.
+        if not holds or claims_pilot(cfg, db, actor) or actor not in holds:
             return corrector(cfg, db, actor, what="hold lift", history=False)
-        return _own_hold_lift(cfg, db, actor, held)
+        return _own_hold_lift(cfg, db, actor, holds)
     if planned_waits.is_hold_note(text) and claims_pilot(cfg, db, actor):
         return corrector(cfg, db, actor, what="hold", history=False)
     return actor
@@ -3211,15 +3211,31 @@ def move(db: Db, item_id: int, state: str, *, note: str = "", actor: str = "",
     # elle s'authentifie au même titre que `work note`. Elle se stocke nette,
     # comme `work note` : la lecture groupée ciblée (`lot_hold_events`) lit le
     # motif des retenues sans dépendre des blancs Unicode du texte écrit.
+    # #3219 (B2) : le contrôle et la transition se font sous le même verrou de
+    # ligne, comme `work note` ; un hold intercalé ne peut pas être effacé.
     note = (note or "").strip()
-    actor = check_wait_note(getattr(db, "cfg", None), db, actor, note,
-                            item_id=item_id)
     text = note or ("%s → %s" % (current, state))
     if reviewer:
         text = "%s — reviewer %s" % (text, reviewer)
-    row = storage.of(db).work.move(
-        item_id, state, current=current, loops=1 if returning_loop else 0,
-        note=text, actor=actor, held=held)
+    from . import planned_waits
+    guarded = (planned_waits.is_hold_note(note)
+               or planned_waits.is_lift_note(note))
+    if guarded and not storage.is_remote(db):
+        with db.transaction() as tx:
+            locked = storage.of(tx).work.lock(item_id)
+            if locked is None:
+                raise WorkError("lot %s not found" % item_id)
+            actor = check_wait_note(getattr(db, "cfg", None), tx, actor, note,
+                                    item_id=item_id)
+            row = storage.of(tx).work.move(
+                item_id, state, current=current, loops=1 if returning_loop else 0,
+                note=text, actor=actor, held=held)
+    else:
+        actor = check_wait_note(getattr(db, "cfg", None), db, actor, note,
+                                item_id=item_id)
+        row = storage.of(db).work.move(
+            item_id, state, current=current, loops=1 if returning_loop else 0,
+            note=text, actor=actor, held=held)
     if row is None:
         if held and not storage.of(db).decisions.pending_for_lot(str(item_id)):
             # the request was answered or withdrawn meanwhile
@@ -3285,14 +3301,22 @@ def note(db: Db, item_id: int, text: str, *, actor: str = "", once: bool = False
         # commande du pilote l'écrit, après contrôle de son autorité.
         raise WorkError("note refused: `%s` is reserved to the review floor; use "
                         "ameesh work reviewer %s --floor N" % (review_floor.PREFIX, item_id))
-    actor = check_wait_note(getattr(db, "cfg", None), db, actor, text,
-                            item_id=item_id)
+    from . import planned_waits
+    note_text = text
+    # #3219 (B2) : le détenteur est lu, l'auteur autorisé et la note écrite
+    # dans la même transaction, sous le verrou de ligne du lot (le même que
+    # `move`, `close_merged` et les autres notes hold/lift). Un hold intercalé
+    # entre le contrôle et l'écriture ne peut donc plus être effacé.
+    guarded = (planned_waits.is_hold_note(note_text)
+               or planned_waits.is_lift_note(note_text))
+    cfg = getattr(db, "cfg", None)
     token_ts = _note_wake_at(text)
     if wake_ts is not None and token_ts is not None:
         raise WorkError("give the wake deadline once: --wake-at/--wake-in or "
                         "wake_at= in the note")
     if token_ts is not None:
         wake_ts = token_ts
+    locked = not storage.is_remote(db)
     if wake_ts is not None:
         if once:
             raise WorkError("a scheduled wake goes with a regular note, not `once`")
@@ -3301,24 +3325,32 @@ def note(db: Db, item_id: int, text: str, *, actor: str = "", once: bool = False
         # #2466 : la note porte elle-même son échéance de reprise (témoin
         # lisible dans le journal) ; la colonne `wake_at` la rend exécutoire.
         text = "%s [réveil programmé: %s]" % (text, _wake_moment(float(wake_ts)))
-        storage.of(db).work.note_with_wake(item_id, item["state"], text, actor,
-                                           float(wake_ts))
+        if guarded and locked:
+            with db.transaction() as tx:
+                row = storage.of(tx).work.lock(item_id)
+                if row is None:
+                    raise WorkError("lot %s not found" % item_id)
+                if row["state"] in ("merged", "promoted", "closed"):
+                    raise WorkError("lot %s is %s: no wake to schedule"
+                                    % (item_id, row["state"]))
+                actor = check_wait_note(cfg, tx, actor, note_text, item_id=item_id)
+                storage.of(tx).work.note_with_wake(item_id, row["state"], text,
+                                                   actor, float(wake_ts))
+        else:
+            actor = check_wait_note(cfg, db, actor, note_text, item_id=item_id)
+            storage.of(db).work.note_with_wake(item_id, item["state"], text, actor,
+                                               float(wake_ts))
     else:
         options = {"once": True} if once else {}
-        from . import planned_waits
-        # #2744 : une retenue (hold/levée) prend le verrou de ligne avant son
-        # écriture, commun avec la fermeture par contenu (work.close_merged).
-        # Jamais sur une connexion médiée : `note` y est une opération du
-        # contrat, sans ce verrou (la fermeture par contenu est serveur).
-        if (planned_waits.is_hold_note(text) or planned_waits.is_lift_note(text)) \
-                and not storage.is_remote(db):
+        if guarded and locked:
             with db.transaction() as tx:
-                locked = storage.of(tx).work.lock(item_id)
-                if locked is None:
+                row = storage.of(tx).work.lock(item_id)
+                if row is None:
                     raise WorkError("lot %s not found" % item_id)
-                storage.of(tx).work.note(item_id, locked["state"], text, actor,
-                                         **options)
+                actor = check_wait_note(cfg, tx, actor, note_text, item_id=item_id)
+                storage.of(tx).work.note(item_id, row["state"], text, actor, **options)
         else:
+            actor = check_wait_note(cfg, db, actor, note_text, item_id=item_id)
             storage.of(db).work.note(item_id, item["state"], text, actor, **options)
     return True
 
