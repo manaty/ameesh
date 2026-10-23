@@ -624,6 +624,130 @@ class CollectionTest(unittest.TestCase):
             events += more
             self.assertEqual({e["object_id"] for e in events}, set(range(1, 33)))
 
+    def test_b10_settled_row_pushed_into_a_skipped_page_is_recovered(self):
+        # B10 #2955 (cx1): page 1 is full of recent rows whose index keys still
+        # lag, so it has no settled row and is skipped. Before page 2 is read
+        # their keys catch up: #4 (settled) recedes from page 2 to page 1 and
+        # page 2 becomes [3]. Concluding on the short page without re-reading
+        # the skipped page loses #4, whose updated_at is older than
+        # U - OVERLAP and would never be read again.
+        with mock.patch.object(watch, "PAGE_SIZE", 3):
+            rows = [issue(n) for n in range(1, 5)]
+            for n, row in enumerate(rows):
+                row["key"] = watch.iso(NOW - 1000 + n)
+            for row in rows[:3]:
+                row["updated_at"] = watch.iso(NOW - 1)
+            rows[3]["key"] = rows[3]["updated_at"] = watch.iso(NOW - 997)
+            api = LagApi(rows, [])
+            get = api.get
+            mutated = []
+
+            def mutate(path, **kw):
+                if "page=2" in path and not mutated:
+                    mutated.append(True)
+                    for row in rows[:3]:
+                        row["key"] = row["updated_at"]
+                return get(path, **kw)
+
+            with mock.patch.object(api, "get", side_effect=mutate):
+                events, until = self.finish(api, NOW - 3600, NOW)
+            self.assertEqual({e["object_id"] for e in events}, {4})
+            self.assertEqual(until, NOW - watch.INDEX_LAG)
+            for row in rows[:3]:
+                row["key"] = row["updated_at"]
+            more, _ = self.finish(api, until - watch.OVERLAP, NOW + 400, None)
+            events += more
+            self.assertEqual({e["object_id"] for e in events}, set(range(1, 5)))
+
+    def test_b10_comment_stream_recovers_a_settled_comment_pushed_into_a_skipped_page(self):
+        # B10 #2955, comment stream: same receding row as the issue case.
+        with mock.patch.object(watch, "PAGE_SIZE", 3):
+            rows = [comment(n) for n in range(10, 14)]
+            for n, row in enumerate(rows):
+                row["key"] = watch.iso(NOW - 1000 + n)
+            for row in rows[:3]:
+                row["updated_at"] = watch.iso(NOW - 1)
+            rows[3]["key"] = rows[3]["updated_at"] = watch.iso(NOW - 997)
+            api = LagApi(comments=rows)
+            get = api.get
+            mutated = []
+
+            def mutate(path, **kw):
+                if "page=2" in path and not mutated:
+                    mutated.append(True)
+                    for row in rows[:3]:
+                        row["key"] = row["updated_at"]
+                return get(path, **kw)
+
+            with mock.patch.object(api, "get", side_effect=mutate):
+                events, until = self.finish(api, NOW - 3600, NOW)
+            self.assertEqual({e["object_id"] for e in events}, {13})
+            for row in rows[:3]:
+                row["key"] = row["updated_at"]
+            more, _ = self.finish(api, until - watch.OVERLAP, NOW + 400, None)
+            events += more
+            self.assertEqual({e["object_id"] for e in events}, set(range(10, 14)))
+
+    def test_b10_real_page_size_recovers_the_row_pushed_into_the_skipped_page(self):
+        # B10 #2955 at the real page size: 100 recent rows fill page 1; #101
+        # recedes into it when their keys catch up before page 2 is read.
+        with mock.patch.object(watch, "PAGE_SIZE", 100):
+            rows = [issue(n) for n in range(1, 102)]
+            for n, row in enumerate(rows):
+                row["key"] = watch.iso(NOW - 2000 + n)
+            for row in rows[:100]:
+                row["updated_at"] = watch.iso(NOW - 1)
+            rows[100]["key"] = rows[100]["updated_at"] = watch.iso(NOW - 1500)
+            api = LagApi(rows, [])
+            get = api.get
+            mutated = []
+
+            def mutate(path, **kw):
+                if "page=2" in path and not mutated:
+                    mutated.append(True)
+                    for row in rows[:100]:
+                        row["key"] = row["updated_at"]
+                return get(path, **kw)
+
+            with mock.patch.object(api, "get", side_effect=mutate):
+                events, until = self.finish(api, NOW - 3600, NOW)
+            self.assertEqual({e["object_id"] for e in events}, {101})
+            self.assertEqual(until, NOW - watch.INDEX_LAG)
+
+    def test_b10_skipped_pages_are_rechecked_last_to_first(self):
+        # B10 #2955: #101 recedes from page 3 to page 2 when the keys of page 2
+        # catch up, then from page 2 to page 1 while the skipped pages are
+        # re-read. Ascending order would read page 1 before the second move
+        # and miss #101; last-to-first catches it on page 1 after reading
+        # page 2.
+        with mock.patch.object(watch, "PAGE_SIZE", 3):
+            rows = [issue(n) for n in range(1, 7)]
+            for n, row in enumerate(rows):
+                row["key"] = watch.iso(NOW - 2500 + n)
+                row["updated_at"] = watch.iso(NOW - 1)
+            stable = issue(101)
+            stable["key"] = stable["updated_at"] = watch.iso(NOW - 1000)
+            api = LagApi(rows + [stable], [])
+            get = api.get
+            moved = []
+
+            def mutate(path, **kw):
+                page = int(parse_qs(urlsplit(path).query)["page"][0])
+                if page == 3 and not moved:
+                    moved.append("to-page-2")
+                    for row in rows[3:]:
+                        row["key"] = row["updated_at"]
+                elif page == 2 and moved:
+                    moved.append("to-page-1")
+                    for row in rows[:3]:
+                        row["key"] = row["updated_at"]
+                return get(path, **kw)
+
+            with mock.patch.object(api, "get", side_effect=mutate):
+                events, until = self.finish(api, NOW - 3600, NOW)
+        self.assertEqual({e["object_id"] for e in events}, {101})
+        self.assertEqual(until, NOW - watch.INDEX_LAG)
+
     def test_b6_anchor_must_be_an_accepted_row(self):
         # B6 #2955: #6 is deferred (> U) but its old key sits at the end of the
         # page. When #1..#5 move and #6 catches up its key, the re-read page is

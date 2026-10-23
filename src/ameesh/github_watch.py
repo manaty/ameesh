@@ -212,9 +212,11 @@ def collect_batch(api, sub, since, now, scan):
     previous page, one earlier page is read; if it is still absent, the scan
     restarts at page 1 with the same ``since`` (durable digests make replay
     harmless). A full page with no settled row is recent and skipped within
-    the pass; the scan suspends on the call budget without committing the
-    cursor and resumes next tick. Only a surely indexed row past U, or the end
-    of the list, ends the stream.
+    the pass; the cursor is not committed there. Before ending the stream or
+    advancing ``since``, every skipped page is re-read last-to-first: a
+    settled row has a final key, so it cannot move forward, but lagging keys
+    catching up ahead of it can push it back into a page already skipped.
+    Only a surely indexed row past U, or the end of the list, ends the stream.
     """
     lag = getattr(sub, "index_lag", INDEX_LAG)
     if scan is not None:
@@ -298,6 +300,45 @@ def collect_batch(api, sub, since, now, scan):
         return found
 
     while True:
+        # #2955 B10: a page with no settled row is skipped, but a settled row
+        # can later recede into it when lagging keys catch up ahead of it.
+        # Re-read every skipped page before ending the stream or advancing
+        # `since`: the row cannot move forward (its key is final) and the
+        # durable digest makes a duplicate harmless. Descending order keeps
+        # the recheck safe while other keys catch up: a row that recedes again
+        # moves to a page still to be re-read, never past one already read.
+        if state.get("recheck"):
+            recheck = state["recheck"]
+            pages = list(reversed(recheck.get("pages") or []))
+            index = recheck.get("index", 0)
+            if index < len(pages):
+                rows = read(pages[index])
+                events.extend(events_from(
+                    sub, state["kind"], [row for row in rows if inside(row)]))
+                recheck["index"] = index + 1
+                if calls >= PAGES_PER_TICK:
+                    return events, state, settled
+                continue
+            then = recheck.get("then")
+            state.pop("recheck", None)
+            state.pop("recheck_pages", None)
+            if then == "resume":
+                state["since"] = max(state["since"],
+                                     state["last_settled"] - 1)
+                state["page"] = 1
+                state["blank"] = 0
+                state.pop("snap_prev", None)
+                return events, state, settled
+            if then == "comments":
+                state.update(kind="comment", page=1,
+                             since=state["window_since"], blank=0,
+                             last_settled=None)
+                state.pop("snap_prev", None)
+                if calls >= PAGES_PER_TICK:
+                    return events, state, settled
+                continue
+            return events, None, settled
+
         rows = read(state["page"])
         full = len(rows) == PAGE_SIZE
         settled_rows = [row for row in rows if inside(row)]
@@ -320,10 +361,16 @@ def collect_batch(api, sub, since, now, scan):
             # budget at a safe timestamp position (never at a page offset,
             # which keys that catch up can invalidate) and keep the cursor.
             state["blank"] = state.get("blank", 0) + 1
+            state.setdefault("recheck_pages", []).append(state["page"])
             state["page"] += 1
             progressed = (state.get("last_settled") is not None
                           and state["last_settled"] != settled_at_start)
             if progressed and calls >= PAGES_PER_TICK:
+                if state.get("recheck_pages"):
+                    state["recheck"] = {
+                        "pages": list(state.pop("recheck_pages")),
+                        "index": 0, "then": "resume"}
+                    continue
                 # A settled row accepted in this pass is the proof needed to
                 # resume safely: keep it as a timestamp position, never a page
                 # offset that later key catch-up can invalidate.
@@ -363,6 +410,7 @@ def collect_batch(api, sub, since, now, scan):
                     # is safe. Durable digests make the replay harmless.
                     state["page"] = 1
                     state.pop("snap_prev", None)
+                    state.pop("recheck_pages", None)
                     state["blank"] = 0
                     return events, state, settled
                 recovered = recovered_rows(previous, snapshot, position)
@@ -388,7 +436,13 @@ def collect_batch(api, sub, since, now, scan):
                 state["last_settled"] = ts
 
         if stop_after or not full:
-            if state["kind"] == "issue":
+            then = "comments" if state["kind"] == "issue" else "done"
+            if state.get("recheck_pages"):
+                state["recheck"] = {
+                    "pages": list(state.pop("recheck_pages")),
+                    "index": 0, "then": then}
+                continue
+            if then == "comments":
                 state.update(kind="comment", page=1, since=state["window_since"],
                              blank=0, last_settled=None)
                 state.pop("snap_prev", None)
