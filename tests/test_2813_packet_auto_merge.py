@@ -241,9 +241,13 @@ class ArmTest(Journal):
         self.assertEqual(out["merge"]["result"], "pending", out)
         self.assertEqual(gh.auto_arms(), [])
         self.assertEqual(gh.merges(), [])
-        self.assertTrue(self.notes()[-1].startswith(
+        self.assertTrue(self.notes()[0].startswith(
             "auto-merge armed repo=%s pr=%d sha=%s base=main method=merge required=tests"
             % (SLUG, NUM, HEAD)), self.notes())
+        # #3175 : la tentative immédiate qui attend la CI laisse son motif
+        self.assertTrue(self.notes()[1].startswith(
+            "auto-merge held repo=%s pr=%d sha=%s base=main — the CI of PR #%d is pending"
+            % (SLUG, NUM, HEAD, NUM)), self.notes())
         self.assertEqual((self.active()["sha"], self.active()["base"]), (HEAD, "main"))
 
     def test_a_composition_already_green_merges_at_once_on_its_head(self):
@@ -757,6 +761,87 @@ class VerdictsTest(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIsNone(project)
         self.assertIn("registre", why)
+
+
+class HeldTest(Journal):
+    """#3175 : sur #2409 (h-1500), armé à 13:47Z, le passage n'a laissé aucune
+    trace jusqu'à la fusion manuelle du bureau ; un refus du passage est
+    toujours consigné au lot, avec son motif, une fois par motif."""
+
+    def check(self, gh, **kw):
+        return packet_automerge.check(None, None, LOT, gh=gh, **kw)
+
+    def holds(self) -> list[str]:
+        return [n for n in self.notes() if n.startswith("auto-merge held ")]
+
+    def test_a_refusal_of_the_pass_is_journaled_with_its_reason(self):
+        self.armed()
+        out = self.check(FakeGh(tests="pending"))
+        self.assertEqual(out["result"], "pending", out)
+        self.assertEqual(self.holds(), [
+            "auto-merge held repo=%s pr=%d sha=%s base=main — %s" % (SLUG, NUM, HEAD,
+                                                                     out["why"])])
+        self.assertIsNotNone(self.active())
+
+    def test_the_same_reason_is_journaled_once_a_new_one_again(self):
+        self.armed()
+        for _ in range(3):
+            self.check(FakeGh(tests="pending"))
+        self.assertEqual(len(self.holds()), 1, self.notes())
+        out = self.check(FakeGh(tests="failure"))
+        self.assertEqual(out["result"], "pending", out)
+        self.assertEqual(len(self.holds()), 2, self.notes())
+        self.assertIn(" ".join(out["why"].split()), self.holds()[-1])
+        self.check(FakeGh(tests="pending"))
+        self.assertEqual(len(self.holds()), 3, self.notes())
+
+    def test_a_new_arming_journals_its_refusal_again(self):
+        self.armed()
+        self.check(FakeGh(tests="pending"))
+        self.armed()
+        self.check(FakeGh(tests="pending"))
+        self.assertEqual(len(self.holds()), 2, self.notes())
+
+    def test_a_refused_review_gate_names_its_reason(self):
+        self.armed()
+        self.gate = (False, "2 independent reviews missing on 1111111111", None)
+        self.check(FakeGh(tests="success"))
+        self.assertTrue(self.holds()[-1].endswith(
+            "— 2 independent reviews missing on 1111111111"), self.notes())
+
+    def test_an_error_of_the_pass_is_journaled_as_such(self):
+        self.armed()
+        out = self.check(FakeGh(tests="success",
+                                protection={"required_status_checks": None}))
+        self.assertEqual(out["result"], "error", out)
+        self.assertIn("— error: main no longer enforces", self.holds()[-1])
+
+    def test_a_merge_a_dry_run_or_a_busy_lease_journal_no_refusal(self):
+        self.armed()
+        self.assertEqual(self.check(FakeGh(tests="pending"), dry_run=True)["result"],
+                         "pending")
+        self.assertEqual(self.holds(), [])
+        self.held.add(LOT)
+        self.assertEqual(self.check(FakeGh(tests="pending"))["result"], "busy")
+        self.assertEqual(self.holds(), [])
+        self.held.discard(LOT)
+        self.assertEqual(self.check(FakeGh(tests="success"))["result"], "merged")
+        self.assertEqual(self.holds(), [])
+
+    def test_a_journal_failure_never_changes_the_outcome(self):
+        self.armed()
+        with mock.patch.object(packet_automerge, "_note_fenced",
+                               side_effect=RuntimeError("base injoignable")):
+            out = self.check(FakeGh(tests="pending"))
+        self.assertEqual(out["result"], "pending", out)
+
+    def test_a_held_mark_is_parsed_and_never_closes_the_arming(self):
+        self.armed()
+        self._note(None, LOT, "auto-merge held repo=%s pr=%d sha=%s base=main — a — b"
+                              % (SLUG, NUM, HEAD))
+        rows = packet_automerge.marks(None, LOT)
+        self.assertEqual((rows[-1]["state"], rows[-1]["why"]), ("held", "a — b"))
+        self.assertEqual(self.active()["state"], "armed")
 
 
 class TickTest(unittest.TestCase):

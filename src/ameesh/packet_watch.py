@@ -332,7 +332,8 @@ def tick(cfg, db, *, now: float, rules_of, dry_run: bool = False,
     #2813 : le même passage fusionne au vert un porteur publié, ou le désarme
     si sa tête ou sa cible a changé depuis la publication
     (`packet_automerge.watch`) ; seuls une fusion, un désarmement et une
-    erreur sont rendus, un porteur en attente ne dit rien."""
+    erreur sont rendus, un porteur en attente ne dit rien ici (son motif est
+    au journal du lot, `auto-merge held …`, #3175)."""
     declared = projects(cfg)
     if only:
         if only not in declared:

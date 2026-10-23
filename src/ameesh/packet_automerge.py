@@ -49,7 +49,10 @@ repos/<slug>/merges`, `base=<cible épinglée>`, `head=<tête publiée>`)
   chemin.
 
 La trace est le journal du lot (aucun état local) : `auto-merge armed …`,
-`disarmed …`, `merged …` et `not-armed …`, avec dépôt, PR, tête et cible. La
+`disarmed …`, `merged …`, `not-armed …` et `held …`, avec dépôt, PR, tête et
+cible. #3175 : un refus du passage (`pending`, `error`) n'est jamais muet ;
+`held …` en porte le motif, une fois par motif et par armement (le passage
+suivant qui refuse pour la même raison n'écrit rien). La
 publication et le passage d'un même porteur se sérialisent sous le bail
 `auto-merge:<lot>` ; le passage relit les marques sous ce bail.
 """
@@ -79,10 +82,10 @@ LOCK_TTL_S = 300.0
 AUTOMERGE_CALL_MARGIN_S = 180.0
 #: une marque du journal du lot ; un armement porte toujours sa cible
 MARK_RE = re.compile(
-    r"^auto-merge (?P<state>armed|disarmed|merged|not-armed) "
+    r"^auto-merge (?P<state>armed|disarmed|merged|not-armed|held) "
     r"repo=(?P<repo>[\w.-]+/[\w.-]+) pr=(?P<pr>\d+) sha=(?P<sha>[0-9a-f]{40})"
     r"(?: base=(?P<base>[\w./-]+))?(?: method=[a-z]+)?(?: required=(?P<required>\S+))?"
-    r"(?:\s|$)")
+    r"(?:\s|$)(?: *— *(?P<why>.*))?", re.S)
 #: marques qui referment un armement de la même PR
 CLOSING = ("disarmed", "merged")
 _SHA = re.compile(r"[0-9a-f]{40}")
@@ -117,7 +120,8 @@ def marks(db, lot: int, *, limit: int = 200) -> list[dict]:
                         "repo": m.group("repo"), "pr": int(m.group("pr")),
                         "sha": m.group("sha"), "base": m.group("base") or "",
                         "required": tuple(unquote(name) for name in
-                                          (m.group("required") or "").split(",") if name)})
+                                          (m.group("required") or "").split(",") if name),
+                        "why": (m.group("why") or "").strip()})
     return sorted(out, key=lambda m: m["id"])
 
 
@@ -484,7 +488,8 @@ def check(cfg, db, lot: int, *, gh, dry_run: bool = False,
     `result` : `idle` (rien d'armé), `pending` (checks pas encore verts),
     `closed` (PR fusionnée ou fermée ailleurs), `disarmed`/`would-disarm`,
     `merged`/`would-merge`, `busy` (une publication tient le bail : au passage
-    suivant) ou `error`."""
+    suivant) ou `error` ; un `pending` ou un `error` d'un porteur armé laisse
+    son motif au journal du lot (`held …`, #3175)."""
     if not active(marks(db, lot)):
         return {"lot": lot, "result": "idle"}
     from . import pilot_gesture
@@ -504,12 +509,49 @@ def check(cfg, db, lot: int, *, gh, dry_run: bool = False,
             _unlock(handle)
 
 
+#: les issues du passage qui refusent la fusion d'un porteur armé (#3175)
+REFUSALS = ("pending", "error")
+
+
 def _check_locked(cfg, db, lot: int, *, gh, dry_run: bool, actor: str,
                   handle=None, fence=None) -> dict:
     # relu sous le bail : une publication a pu réarmer depuis la première lecture
-    mine = active(marks(db, lot))
+    rows = marks(db, lot)
+    mine = active(rows)
     if mine is None:
         return {"lot": lot, "result": "idle"}
+    out = _gate_locked(cfg, db, lot, mine, gh=gh, dry_run=dry_run, actor=actor,
+                       handle=handle, fence=fence)
+    if out.get("result") in REFUSALS and not dry_run:
+        _held(db, lot, mine, rows, out, actor=actor, fence=fence)
+    return out
+
+
+def _held(db, lot: int, mine: dict, rows, out: dict, *, actor: str, fence=None) -> None:
+    """#3175 : consigne au lot le motif d'un refus du passage, une fois par
+    motif et par armement. Sur #2409 (h-1500), le passage refusait à chaque
+    tour sans rien écrire, et le bureau a fusionné à la main sans trace du
+    pourquoi. Le journal est une trace : son échec ne change pas l'issue."""
+    why = " ".join(str(out.get("why") or out.get("error") or "no reason given").split())
+    if out["result"] == "error":
+        why = "error: " + why
+    last = None
+    for row in rows or ():
+        if row["id"] < mine["id"]:
+            continue
+        if row["state"] == "held" and row["pr"] == mine["pr"] and row["sha"] == mine["sha"]:
+            last = row["why"]
+    if last == why:
+        return
+    try:
+        _note_fenced(db, fence, lot, "held", mine["repo"], mine["pr"], mine["sha"],
+                     "base=%s — %s" % (mine["base"], why), actor)
+    except Exception:  # noqa: BLE001 - la trace ne fait jamais tomber le passage
+        pass
+
+
+def _gate_locked(cfg, db, lot: int, mine: dict, *, gh, dry_run: bool, actor: str,
+                 handle=None, fence=None) -> dict:
     slug, number, sha, base = mine["repo"], mine["pr"], mine["sha"], mine["base"]
     out = {"lot": lot, "pr": number, "sha": sha, "base": base}
     try:
