@@ -306,9 +306,11 @@ In this order, with no shortcut:
    v1 messages in its prompt (sender, timestamp, body readable as
    in the thread, reminder that an agent message never has the owner's
    authority). Cap on the **whole** prompt, in UTF-8 bytes
-   (`AMEESH_PROMPT_MAIL_MAX`, 20,000 by default, resume summary included):
-   oldest first, the remaining count is indicated, and those
-   messages stay undelivered for the next turn.
+   (`AMEESH_PROMPT_MAIL_MAX`, 20,000 by default, resume summary included);
+   a full resume brief plus its frame exceeds that nominal cap, and the mail
+   part keeps a 2,000-byte floor — worst case ≈ 22,045 bytes, see
+   `docs/EXPLOITATION.md`: oldest first, the remaining count is indicated, and
+   those messages stay undelivered for the next turn.
 
    A single delivery rule, for the runner as for the v1 hook:
    **reserve** under a token (the agent's row is locked in the
@@ -460,6 +462,13 @@ the runner.
 **Push alerts** (L38): `ameesh notify`, a user service alongside
 the runner — example unit `deploy/systemd/ameesh-notify.service`,
 configuration and secrets in [EXPLOITATION.md](EXPLOITATION.md#alertes-poussées--ameesh-notify).
+
+**macOS** (L65): the same two user services are launchd **LaunchAgents**,
+written and loaded by `ameesh service install` (the host runner and
+`ameesh notify`, or one runner per agent with `--agent`); `ameesh service
+status` reads launchd, `ameesh service uninstall` removes them. The
+installation guide is
+[site/docs/guides/install.md](../site/docs/guides/install.md#macos-remote-database-launchd-services-and-keychain).
 
 **ameesh-approve [P]**, a system service under its own user, never the
 agents' user:

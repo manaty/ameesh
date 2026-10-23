@@ -101,7 +101,7 @@ Un seul des trois réglages peut être livré par fichier.
 | `cost` | `{"source": "stream"\|"api"\|"none", "gauges": "transcript"\|"sessions"\|"balance"\|"none", "paid_per_token": bool}` — `paid_per_token` alimente le plafond horaire de 0019 §2 |
 | `permissions` | politique de permission ACP : `{"default": "deny"\|"allow", "allow_kinds": [...], "deny_kinds": [...]}` (kinds ACP : `read`, `edit`, `delete`, `move`, `search`, `execute`, `think`, `fetch`, `switch_mode`, `other`) |
 | `acp` | `{"auth_method": "…", "config": {"model": "…", "effort": "…", "tier": "…"}}` : méthode d'authentification et identifiants d'options de configuration |
-| `accounts` | comptes multiples (L30) : `{"config_env", "default_home", "session_store", "credentials", "key_env"}` |
+| `accounts` | comptes multiples (L30, L65) : `{"config_env", "default_home", "session_store", "credentials", "keychain_service", "key_env"}` — `keychain_service` nomme le service du trousseau macOS (Claude Code) |
 | `install` | note déclarative d'installation (la distribution signée est L17) |
 | `resident` | L75, resident mode (decision 0035): see [Resident mode](#resident-mode-l75) |
 

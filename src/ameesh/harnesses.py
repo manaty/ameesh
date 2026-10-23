@@ -86,7 +86,8 @@ ALWAYS_EXPLICIT_PERMISSION_MODES = ("bypassPermissions",)
 #: Known off-device session backup descriptor keys (L53).
 BACKUP_KEYS = ("session_files",)
 #: clés connues de `ameesh.accounts` (L30 : comptes multiples par fournisseur)
-ACCOUNT_KEYS = ("config_env", "default_home", "session_store", "credentials", "key_env")
+ACCOUNT_KEYS = ("config_env", "default_home", "session_store", "credentials",
+                "keychain_service", "key_env")
 #: clés connues au premier niveau du manifeste
 MANIFEST_KEYS = ("id", "name", "version", "schema_version", "description",
                  "repository", "license", "authors", "icon", "capabilities",

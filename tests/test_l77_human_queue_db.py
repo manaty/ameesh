@@ -231,16 +231,29 @@ class PickHumanFirstTest(PgTestCase):
         real_unread = lot_workdir.mail.unread
         real_human = lot_workdir.mail.unread_human
         real_page = lot_workdir.mail.unread_human_page
+        # #2940 : borner aussi le secours `active` — sinon il trouve humain:carol
+        # directement derrière les 200 retenus et le curseur humain n'est pas
+        # exercé (fausse régression verte).
+        real_active = lot_workdir.mail.unread_active
+        curseur = []
+
+        def page_suivie(*args, **kwargs):
+            curseur.append(1)
+            return _capped(real_page)(*args, **kwargs)
 
         with mock.patch.object(lot_workdir.mail, "unread",
                                side_effect=_capped(real_unread)), \
+                mock.patch.object(lot_workdir.mail, "unread_active",
+                                  side_effect=_capped(real_active)), \
                 mock.patch.object(lot_workdir.mail, "unread_human",
                                   side_effect=_capped(real_human)), \
                 mock.patch.object(lot_workdir.mail, "unread_human_page",
-                                  side_effect=_capped(real_page)), \
+                                  side_effect=page_suivie), \
                 mock.patch.object(lot_workdir, "deliverable", side_effect=garder):
             spec = worker._pick()
             again = worker._pick()
+        self.assertTrue(curseur,
+                        "le curseur humain (unread_human_page) n'a pas ete exerce")
         self.assertIsNotNone(spec)
         self.assertEqual(spec["kind"], "mail",
                          "200 retained humans filled the page before human 201")
@@ -275,20 +288,35 @@ class PickHumanFirstTest(PgTestCase):
         real_unread = lot_workdir.mail.unread
         real_human = lot_workdir.mail.unread_human
         real_page = lot_workdir.mail.unread_human_page
+        # #2940 : même borne du secours `active` qu'au cas 200 ; deux picks
+        # rendent le même humain sans livraison.
+        real_active = lot_workdir.mail.unread_active
+        curseur = []
+
+        def page_suivie(*args, **kwargs):
+            curseur.append(1)
+            return _capped(real_page)(*args, **kwargs)
 
         with mock.patch.object(lot_workdir.mail, "unread",
                                side_effect=_capped(real_unread)), \
+                mock.patch.object(lot_workdir.mail, "unread_active",
+                                  side_effect=_capped(real_active)), \
                 mock.patch.object(lot_workdir.mail, "unread_human",
                                   side_effect=_capped(real_human)), \
                 mock.patch.object(lot_workdir.mail, "unread_human_page",
-                                  side_effect=_capped(real_page)), \
+                                  side_effect=page_suivie), \
                 mock.patch.object(lot_workdir, "deliverable", side_effect=garder):
             spec = worker._pick()
+            again = worker._pick()
+        self.assertTrue(curseur,
+                        "le curseur humain (unread_human_page) n'a pas ete exerce")
         self.assertIsNotNone(spec)
         self.assertEqual(spec["kind"], "mail",
                          "more than 200 retained humans hid the deliverable human")
         self.assertTrue(spec.get("human"))
         self.assertEqual(spec["ids"], [human])
+        self.assertIsNotNone(again)
+        self.assertEqual((again["kind"], again["ids"]), ("mail", [human]))
 
     def test_human_after_a_truncated_page_is_served(self):
         """B14 : une page bornée (médié, 200 lignes) ne referme pas la recherche.

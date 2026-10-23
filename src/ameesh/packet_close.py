@@ -273,11 +273,13 @@ def sync(db, repo_dir: str, *, target: str | None = None, dry_run: bool = False,
             if dry_run:
                 retention = plan_git.dry_run_retention(db, st, row, sha=unit,
                                                        repo=repo_dir)
-                if retention is not None:
+                if retention is not None and not retention.get("lift"):
                     plan_git.mark_retained(entry, retention, target=target,
                                            dry_run=True)
                     results.append(entry)
                     continue
+                if retention is not None:
+                    plan_git.mark_lifted(entry, retention)
                 entry["result"] = "would-merge"
                 results.append(entry)
                 continue
@@ -310,10 +312,12 @@ def sync(db, repo_dir: str, *, target: str | None = None, dry_run: bool = False,
         if dry_run:
             retention = plan_git.dry_run_retention(db, st, row,
                                                    sha=found["ref"] or sha, repo=repo_dir)
-            if retention is not None:
+            if retention is not None and not retention.get("lift"):
                 plan_git.mark_retained(entry, retention, target=target, dry_run=True)
                 results.append(entry)
                 continue
+            if retention is not None:
+                plan_git.mark_lifted(entry, retention)
             entry["result"] = "would-merge"
             results.append(entry)
             continue
