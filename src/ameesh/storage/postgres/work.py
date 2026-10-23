@@ -2536,6 +2536,14 @@ class WorkItems(interface.WorkItems):
     def train_adopt(self, key, owner, *, revision, previous, service, ttl_s) -> dict | None:
         if not owner.startswith("train:") or key == service[0]:
             return None
+        # L165 (EP4) × #3142, B cx2 : une clé de service liée à un rôle porte
+        # l'époque du rôle (`train-service:<rôle>:<époque>`). Elle survit à sa
+        # tenure par le TTL de service (900 s) : l'adoption doit aussi prouver
+        # que cette époque est le bail vivant courant du rôle, sinon l'ancien
+        # élu reprendrait la réservation au nouvel élu.
+        parts = str(service[0] or "").split(":")
+        role = (parts[1], int(parts[2])) if (len(parts) == 3 and parts[1]
+                and parts[0] == "train-service" and parts[2].isdigit()) else None
         with self.db.transaction() as tx:
             # Service lease first, then the target: no writer locks them in
             # the other order (train_save only locks the target row).
@@ -2543,6 +2551,16 @@ class WorkItems(interface.WorkItems):
                             " AND epoch = %s AND expires_at > clock_timestamp() FOR SHARE",
                             (service[0], service[1], int(service[2]))):
                 return None
+            if role is not None:
+                current = tx.query(
+                    "SELECT lease_epoch, status,"
+                    " lease_expires_at > clock_timestamp() AS live"
+                    " FROM agent_registry WHERE name = %s FOR SHARE", (role[0],))
+                if not current or current[0]["lease_epoch"] is None \
+                        or int(current[0]["lease_epoch"]) != role[1] \
+                        or not current[0]["live"] \
+                        or str(current[0]["status"] or "") == "stopped":
+                    return None
             held = tx.query("SELECT owner, epoch FROM merge_locks WHERE target = %s FOR UPDATE",
                             (key,))
             if not held or not (held[0]["owner"] or "").startswith("train:") \

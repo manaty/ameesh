@@ -1765,13 +1765,16 @@ class WorkItems(Domain):
         reservation another `train:*` owner left behind.
 
         In one transaction: ``service`` (key, owner, epoch) must be the live
-        service lease; the target row must be held by another `train:*`
-        owner (at ``previous`` (owner, epoch) when given, expired or not);
-        the train document must still be at ``revision``. The row passes to
-        ``owner`` at the next epoch, so every write of the old epoch is
-        refused afterwards. A reservation ticket of the document naming the
-        held (owner, epoch) is rewritten to the new ones; with ``previous``,
-        it must exist.
+        service lease; a key bound to a role
+        (``train-service:<role>:<epoch>``) also requires that role's live
+        lease at that exact epoch, so an old election's still-live service
+        key cannot adopt the reservation back from the new holder; the target
+        row must be held by another `train:*` owner (at ``previous``
+        (owner, epoch) when given, expired or not); the train document must
+        still be at ``revision``. The row passes to ``owner`` at the next
+        epoch, so every write of the old epoch is refused afterwards. A
+        reservation ticket of the document naming the held (owner, epoch) is
+        rewritten to the new ones; with ``previous``, it must exist.
         Never takes an ordinary (non-`train:*`) reservation. Returns
         {epoch, previous_owner, previous_epoch}, or None.
         """

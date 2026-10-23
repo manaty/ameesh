@@ -7,8 +7,8 @@ import threading
 import time
 import types
 
-from ameesh import (land, packet_reservation, storage, train, train_reservation,
-                    train_runner, train_store)
+from ameesh import (land, packet_reservation, registry, storage, train,
+                    train_reservation, train_runner, train_store)
 from .support import PgTestCase
 from .test_1467_train import MemoryPorts, row
 
@@ -205,6 +205,44 @@ class AdoptionTest(PgTestCase):
         self.assertEqual(self.lock(), ("train:runner-b@host-b", epoch + 1))
         self.assertIsNone(self.ops.land_lock(self.key, "train:runner-a@host-a", 1800,
                                              epoch=epoch))
+
+    def test_an_old_role_epoch_never_adopts_the_new_holders_reservation(self):
+        """#3142 × #3014 (B cx2) : la clé de service d'une ancienne élection
+        survit 900 s ; l'adoption prouve l'époque du rôle vivante, sinon
+        l'ancien élu reprendrait la cible au nouvel élu."""
+        role = "mesh-design"
+        registry.upsert(self.db, role, chantier="ameesh", harness="claude",
+                        host="host-b", cwd="/tmp", session_id=None, status="idle",
+                        status_text="", model=None, budget_usd=None)
+        self.db.execute(
+            "UPDATE agent_registry SET releve = 'election', lease_owner = 'runner-b',"
+            " lease_epoch = 2, lease_expires_at = clock_timestamp() + interval '10 minutes'"
+            " WHERE name = %s", (role,))
+        old_key, new_key = ("train-service:%s:1" % role, "train-service:%s:2" % role)
+        old_owner, new_owner = "train-service:runner-a:old", "train-service:runner-b:new"
+        self.assertEqual(self.ops.land_lock(old_key, old_owner, 900), 1)
+        self.assertEqual(self.ops.land_lock(new_key, new_owner, 900), 1)
+        held = self.ops.land_lock(self.key, "train:runner-a@host-a", 1800)
+        # L'ancien élu (époque de rôle 1) ne reprend pas la cible du nouvel
+        # élu (époque de rôle 2) : la clé de service est vivante, le rôle non.
+        self.assertIsNone(self.ops.train_adopt(
+            self.key, "train:runner-b@host-b", revision=0, previous=None,
+            service=(old_key, old_owner, 1), ttl_s=1800))
+        self.assertEqual(self.lock(), ("train:runner-a@host-a", held))
+        # Le nouvel élu, lui, adopte.
+        adopted = self.ops.train_adopt(
+            self.key, "train:runner-b@host-b", revision=0, previous=None,
+            service=(new_key, new_owner, 1), ttl_s=1800)
+        self.assertEqual((adopted["previous_owner"], adopted["epoch"]),
+                         ("train:runner-a@host-a", held + 1))
+        self.assertEqual(self.lock(), ("train:runner-b@host-b", held + 1))
+        # Le bail de rôle expiré ne prouve plus l'époque : rien ne s'adopte.
+        self.db.execute("UPDATE agent_registry SET lease_expires_at = clock_timestamp()"
+                        " - interval '1 second' WHERE name = %s", (role,))
+        self.assertIsNone(self.ops.train_adopt(
+            self.key, "train:runner-a@host-a", revision=0, previous=None,
+            service=(new_key, new_owner, 1), ttl_s=1800))
+        self.assertEqual(self.lock(), ("train:runner-b@host-b", held + 1))
 
 
 if __name__ == "__main__":
