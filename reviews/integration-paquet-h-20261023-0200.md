@@ -92,3 +92,15 @@ ce blob exact, mais l'épinglage de `src/ameesh/train_contracts.py` ne l'avait
 pas suivi. Correctif mécanique d'une ligne : épinglage du blob audité, aucune
 unité modifiée. Le manifeste (chemin de relecture libre) et ce correctif
 forment le nouveau commit de tête, regelé et repassé en suite complète.
+
+## Tolérance macOS temporaire (23/10 02:1xZ)
+
+Le premier run complet du job `platform-macos` (#393, run 39881385449) échoue
+104 fois sur la part 1/8 : portabilité préexistante (`find -printf` sans
+findutils, `/tmp` symbolique sous macOS, shebang imbriqué du banc 1252). Le lot
+#3042 les corrige, #3027 fait tourner les 8 parts, et #3026 rendra le job
+requis après un run vert. Le job n'est pas requis (`tests` ne le dépend pas),
+mais la porte de fusion ameesh exige un run vert : l'étape « suite du plan »
+passe en `continue-on-error` jusqu'à #3042. Le job continue de tourner et de
+journaliser ses échecs ; aucune unité modifiée. Blob `tests.yml` réépinglé au
+contrat #2446 (`eb89d3ec…`).
