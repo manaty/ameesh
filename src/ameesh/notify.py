@@ -152,6 +152,8 @@ DEFAULT_TYPES = ("stopped_with_mail", "orphan_lot", "dead_runner", "idle_with_ma
                  "host_disk_soon_full",
                  # #2022 : des zombies s'accumulent sur un hôte
                  "host_zombies",
+                 # #3103 : un pont Docker capte le réseau local de l'hôte (#3092)
+                 "host_network_overlap",
                  # L225 : des tours sans tarif au barème échappent à la dépense
                  "turn_unpriced",
                  # L226b : un agent attend un compte authentifié sain
@@ -268,6 +270,7 @@ TYPE_LABELS = {
     "host_disk_low": "btrfs disk almost full",
     "host_disk_soon_full": "disk almost full, or filling up",
     "host_zombies": "zombie processes piling up on a host",
+    "host_network_overlap": "container network overlapping a host route",
     "docker_orphan_volumes": "Docker orphan volumes accumulating",
     "docker_build_cache": "Docker reclaimable build cache above threshold",
     "docker_storage_unavailable": "Docker storage inventory unavailable",
@@ -301,7 +304,8 @@ URGENT_TYPES = ("stopped_with_mail", "orphan_lot", "dead_runner", "delegation_ex
                 "mail_undeliverable", "ci_main_red", "auth_blocked",
                 "credential_failing", "critical_budget_pause", "critical_turn_failures",
                 "owner_key_registered",
-                "land_uncertain", "db_connections_high", "pgbouncer_pool_waiting")
+                "land_uncertain", "db_connections_high", "pgbouncer_pool_waiting",
+                "host_network_overlap")
 #: L124 : types dont la résolution n'est pas envoyée — une décision se résout
 #: parce que l'humain y a répondu (ou que le demandeur l'a retirée) : le lui
 #: redire serait du bruit. La résolution est journalisée.
