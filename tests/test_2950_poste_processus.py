@@ -95,6 +95,8 @@ esac
 
     def test_agent_cgroup_refuses_before_any_systemctl_action(self):
         for cgroup in (
+            "0::/user.slice/app.slice/ameesh-release.service\n",
+            "0::/user.slice/ameesh-runner@x.service\n",
             "0::/user.slice/ameesh-runner-agent@dev9.service\n",
             "0::/user.slice/ameesh-runner-agent@dev9.service/turn.scope\n",
             "0::/user.slice/ameesh-dev9.service\n",
