@@ -4885,6 +4885,7 @@
     "land_unlock",
     "train_read",
     "train_save",
+    "train_adopt",
     "train_fire_read",
     "train_fire_give",
     "train_fire_change",

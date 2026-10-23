@@ -27,6 +27,8 @@ from . import (merge_queue, radar, resolutions, storage, train, train_admissions
 #: when a passage outlives the stop (the process then exits immediately); the
 #: TTL only covers a crash. 900 s is kept: the lease is renewed between
 #: passages only, and a passage (prevalidation, CI read) may exceed 300 s.
+#: #3142: its holder adopts the target reservations a previous holder's
+#: runner left behind (`train_store.Ledger.adopt`), fenced by a new epoch.
 SERVICE_LEASE_KEY = "train-service"
 SERVICE_LEASE_TTL_S = 900.0
 SERVICE_LEASE_RETRY_S = 60.0
@@ -189,13 +191,24 @@ class Passage:
         self.epoch = None
         #: #3134: the service lease's `effect`, set by `Service`; None outside it.
         self.guard = None
+        #: #3142: the service lease itself, set by `Service`: its holder adopts
+        #: the target reservation another runner's train left behind.
+        self.lease = None
+
+    def held_lease(self):
+        """#3142: (key, owner, epoch) of the service lease this process holds, or None."""
+        lease = self.lease
+        epoch = getattr(lease, "epoch", None)
+        if lease is None or epoch is None or getattr(lease, "closed", False):
+            return None
+        return lease.key, lease.owner, epoch
 
     def reservation_ledger(self, db):
         if self.reservation is None:
             raise train.TrainError("explicit qualified packet reservation required")
         return self.reservation.bind(db, self.project,
             merge_queue._remote_branch(self.project.target), self.owner,
-            train_ci.contract_digest(self.workflows))
+            train_ci.contract_digest(self.workflows), service=self.held_lease)
 
     def maintain(self, db, now):
         with (self.guard() if self.guard is not None else contextlib.nullcontext()):
@@ -275,7 +288,8 @@ class Passage:
         repository = train_git.Repository(self.project, clone, transports=transports,
                                           migrations=migrations)
         ledger = (self.reservation_ledger(db) if self.reservation is not None else
-                  train_store.Ledger(db, self.project, target, self.owner))
+                  train_store.Ledger(db, self.project, target, self.owner,
+                                     service=self.held_lease))
         authority = fires(self.cfg, ledger) if rules.merge_named_fire else fires(ledger, rules)
         history = train_history.Recorded(db, clone.path, provider=self.provider, review_rules=rules)
         admissions = train_admissions.Admissions(db, self.project, history, policy=requirement)
@@ -337,6 +351,11 @@ class Passage:
         engine.epoch = self.epoch
         try:
             result = engine.step(now)
+            adopted = getattr(runtime.ledger, "adopted", None)
+            if adopted:
+                self.notify("train reservation adopted from %s (epoch %s -> %s)" % (
+                    adopted["previous_owner"], adopted["previous_epoch"], adopted["epoch"]),
+                    adopted)
             if runtime.enrollment_result is not None:
                 result["enrollment"] = runtime.enrollment_result
             return result
@@ -359,6 +378,7 @@ class Service:
         self.lease = lease
         for passage in self.passages:
             passage.guard = lease.effect if lease is not None else None
+            passage.lease = lease
         self.condition = threading.Condition()
         self.pending = set(range(len(self.passages)))
         self.deadlines = {}
