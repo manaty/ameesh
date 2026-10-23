@@ -1409,19 +1409,32 @@ class UnreadableMarkTest(_ActivationFixture, PgTestCase):
     journaled with its lot and note id, and the freeze continues.
     """
 
-    def pending_lot(self, reviewer: str, sha: str) -> int:
+    def head(self, label: str) -> str:
+        """A real commit for a benchmark lot: #2989 resolves every frozen head."""
+        self.repo.git("commit", "--allow-empty", "-qm", "pending %s" % label)
+        return self.repo.git("rev-parse", "HEAD")
+
+    def pending_lot(self, reviewer: str, label: str) -> int:
         """An open lot whose last freeze designates `reviewer`, no verdict yet.
 
         The same direct state as #3004's `PendingLoadTest`: the freeze hook
         writes the journal mark and the `reviewers` column in one transaction,
-        the benchmark writes them without the hook.
+        the benchmark writes them without the hook. The head is a real commit:
+        since #2989 a freeze refuses a SHA its repository cannot resolve.
         """
-        item = work.add(self.db, title="pending %s" % sha[:8], app="ameesh",
+        sha = self.head(label)
+        item = work.add(self.db, title="pending %s" % label, app="ameesh",
                         assignee="author")
         lot = int(item["id"])
         work.move(self.db, lot, "build")
         work.move(self.db, lot, "qa")
+        # #2989: the head must not be an ancestor of the target; the fixture's
+        # base commit is the target of the benchmark lot, its pending head is
+        # a real commit on top of it.
+        self.db.execute("UPDATE work_items SET branch_target = %s WHERE id = %s",
+                        (self.base, lot))
         row = work.milestone(self.db, lot, "frozen", sha=sha, actor="author",
+                             repo=self.repo.root,
                              on_frozen=lambda tx, milestone, threads: None,
                              after_commit=[])
         note = pg._mark_note(lot, int(row["id"]), state=rd.DESIGNATED,
@@ -1440,6 +1453,12 @@ class UnreadableMarkTest(_ActivationFixture, PgTestCase):
             " AND kind = 'frozen' ORDER BY at DESC, id DESC LIMIT 1",
             (int(lot),))[0]["id"])
 
+    def frozen_sha(self, lot: int) -> str:
+        return str(self.db.query(
+            "SELECT sha FROM work_item_milestones WHERE work_item_id = %s"
+            " AND kind = 'frozen' ORDER BY at DESC, id DESC LIMIT 1",
+            (int(lot),))[0]["sha"])
+
     def unreadable_mark(self, lot: int, freeze_id: int) -> int:
         """Write a mark with a valid prefix and invalid JSON, return its id."""
         text = "review-designation:%d:%d: {not json" % (int(lot), int(freeze_id))
@@ -1457,7 +1476,7 @@ class UnreadableMarkTest(_ActivationFixture, PgTestCase):
         # the oldest failure of the lot: `prepare` runs in the freeze
         # transaction, so the cast error left it aborted and NO freeze of the
         # mesh could be written while this lot stayed open.
-        other = self.pending_lot("r1", "%040x" % 21)
+        other = self.pending_lot("r1", "21")
         note_id = self.unreadable_mark(other, self.latest_freeze(other))
         row, out = self.freeze()
         self.assertEqual(row["kind"], "frozen")
@@ -1476,8 +1495,8 @@ class UnreadableMarkTest(_ActivationFixture, PgTestCase):
                          self.notes())
 
     def test_a_valid_mark_is_still_read_next_to_an_unreadable_one(self):
-        self.pending_lot("r1", "%040x" % 31)
-        bad = self.pending_lot("r2", "%040x" % 32)
+        self.pending_lot("r1", "31")
+        bad = self.pending_lot("r2", "32")
         self.unreadable_mark(bad, self.latest_freeze(bad))
         loads = act._loads(self.db)
         # the valid mark still counts, the invalid one counts for nobody
@@ -1487,8 +1506,8 @@ class UnreadableMarkTest(_ActivationFixture, PgTestCase):
     def test_a_carried_designation_is_still_read(self):
         # the Python read keeps both prefixes of #3004: a report copied by
         # `verdict_carry` is as authoritative as a direct selection
-        sha = "%040x" % 41
-        lot = self.pending_lot("r1", sha)
+        lot = self.pending_lot("r1", "41")
+        sha = self.frozen_sha(lot)
         carried = verdict_carry.carried_mark_note(
             lot, {"id": self.latest_freeze(lot), "sha": sha},
             {"carried": [{"actor": "r1"}]})
