@@ -255,10 +255,36 @@ class BareTargetTest(_TargetFixture):
         super().setUp()
         self.repo.git("update-ref", "refs/remotes/origin/main", self.target)
         self.repo.git("update-ref", "refs/heads/main", self.new_fix)
+        # B3 cx2 : une branche locale homonyme masque le nom court
+        # `origin/main` (git résout refs/heads avant refs/remotes).
+        self.repo.git("update-ref", "refs/heads/origin/main", self.new_fix)
 
     def test_target_commit_prefers_the_remote_ref(self):
         self.assertEqual(review_authors.target_commit(self.repo.root, "main"),
                          self.target)
+
+    def test_a_short_target_survives_a_local_origin_branch(self):
+        # B3 cx2 : refs/heads/origin/main masque origin/main ; la lecture doit
+        # passer par refs/remotes/... (qualifiée), sinon le correcteur sort.
+        authors, unknown, _correctors = self.reading(
+            [self.new_lot, self.new_fix], target="main")
+        self.assertEqual(unknown, [])
+        self.assertEqual(self.names(authors).get("cx"), "codex")
+
+    def test_a_qualified_remote_ref_is_read_exactly(self):
+        self.assertEqual(
+            review_authors.target_commit(self.repo.root,
+                                         "refs/remotes/origin/main"),
+            self.target)
+
+    def test_a_local_tag_does_not_mask_a_qualified_ref(self):
+        self.repo.git("update-ref", "refs/tags/origin/main", self.new_fix)
+        self.assertEqual(review_authors.target_commit(self.repo.root, "main"),
+                         self.target)
+        self.assertEqual(
+            review_authors.target_commit(self.repo.root,
+                                         "refs/remotes/origin/main"),
+            self.target)
 
     def test_a_bare_target_keeps_the_unmerged_corrector(self):
         authors, unknown, _correctors = self.reading(
