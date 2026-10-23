@@ -295,6 +295,66 @@ class ElectionSyncTest(test_canon._CanonDbCase):
         self.assertIsNotNone(lease)
         self.assertFalse(self.row("relecteur")["handoff_fenced"])
 
+    def test_drain_rend_le_bail_elu_sans_attendre_le_ttl(self):
+        self.sync("atelier")
+        self.sync("banc")
+        lease = registry.claim(self.db, "relecteur", "runner-atelier", 600,
+                               host="atelier")
+        self.assertIsNotNone(lease)
+        self.assertEqual(self.row("relecteur")["host"], "atelier")
+        # Tant que le bail est vivant, le secours ne peut pas le prendre.
+        self.assertNotIn("relecteur", [r["name"] for r in
+                                       registry.claimable(self.db, "banc")])
+        self.assertIsNone(registry.claim(self.db, "relecteur", "runner-banc", 600,
+                                         host="banc"))
+        drained = storage.of(self.db).host_lifecycle.drain(
+            "atelier", actor="human:alice", duration=3600)
+        row = self.row("relecteur")
+        # Le bail est rendu tout de suite, sans déplacer la fiche : le secours
+        # le prendra depuis son propre candidat, sans attendre l'échéance.
+        self.assertIsNone(row["lease_owner"])
+        self.assertIsNone(row["lease_expires_ts"])
+        self.assertEqual(row["host"], "atelier")
+        self.assertEqual(row["status"], "idle")
+        self.assertGreater(row["lease_epoch"], lease["lease_epoch"])
+        # L'ancien détenteur est fencé par l'epoch, pas seulement par le TTL.
+        self.assertIsNone(registry.renew(self.db, "relecteur", "runner-atelier",
+                                         lease["lease_epoch"], 600))
+        self.assertFalse(registry.begin_turn(self.db, "relecteur", "runner-atelier",
+                                             lease["lease_epoch"], "après drain"))
+        self.assertFalse(registry.end_turn(self.db, "relecteur", "runner-atelier",
+                                           lease["lease_epoch"], status="idle"))
+        # Le secours réclame immédiatement ; l'hôte drainé ne peut pas
+        # reprendre, donc un seul détenteur.
+        replacement = registry.claim(self.db, "relecteur", "runner-banc", 600,
+                                     host="banc", election_brief="brief-banc")
+        self.assertIsNotNone(replacement)
+        self.assertGreater(replacement["lease_epoch"], row["lease_epoch"])
+        row = self.row("relecteur")
+        self.assertEqual((row["host"], row["lease_owner"]), ("banc", "runner-banc"))
+        self.assertIsNone(registry.claim(self.db, "relecteur", "runner-atelier", 600,
+                                         host="atelier", election_brief="brief-atelier"))
+        self.assertNotIn("relecteur", [r["name"] for r in
+                                       registry.claimable(self.db, "atelier")])
+        # Rien à déplacer par L232e : le journal de l'hôte ne le porte pas.
+        self.assertNotIn("relecteur", [r["agent"] for r in
+                                       storage.of(self.db).host_lifecycle.agents(
+                                           "atelier", drained["generation"])])
+
+    def test_drain_d_un_autre_hote_laisse_le_bail_elu(self):
+        self.sync("atelier")
+        self.sync("banc")
+        lease = registry.claim(self.db, "relecteur", "runner-atelier", 600,
+                               host="atelier")
+        self.assertIsNotNone(lease)
+        storage.of(self.db).host_lifecycle.drain("banc", actor="human:alice",
+                                                 duration=3600)
+        row = self.row("relecteur")
+        self.assertEqual((row["host"], row["lease_owner"], row["lease_epoch"]),
+                         ("atelier", "runner-atelier", lease["lease_epoch"]))
+        self.assertIsNotNone(registry.renew(self.db, "relecteur", "runner-atelier",
+                                            lease["lease_epoch"], 600))
+
     def test_perte_d_hote_sans_role_elu_ne_cree_pas_de_perte(self):
         self.sync("atelier")
         api = storage.of(self.db)
