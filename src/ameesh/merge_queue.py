@@ -210,7 +210,22 @@ def required_verdicts(klass) -> int:
     avis que le canon ne demande pas.
     Un lot release n'est jamais léger : il garde un avis (la procédure de
     release et la protection de cible restent au pilote ; le feu, lui, refuse
-    la classe release avant tout compte)."""
+    la classe release avant tout compte).
+    #3183 : le plancher posé par un pilote (`reviews_floor`, lu par la classe)
+    relève ce compte, jamais ne l'abaisse ; un lot sans chemin changé reste à
+    zéro. Un journal illisible (`reviews_floor_unreadable`) vaut deux avis :
+    un plancher qu'on ne lit pas ne se suppose pas absent."""
+    base = _scale_verdicts(klass)
+    klass = klass or {}
+    if base == 0 and not klass.get("files"):
+        return 0
+    if klass.get("reviews_floor_unreadable"):
+        return max(base, CRITICAL_REVIEWS)
+    return max(base, int(klass.get("reviews_floor") or 0))
+
+
+def _scale_verdicts(klass) -> int:
+    """Le compte du barème seul (classe et chemins), sans plancher de pilote."""
     from . import lot_class
     klass = klass or {}
     cls = str(klass.get("class") or lot_class.SENSITIVE)

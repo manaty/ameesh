@@ -466,6 +466,20 @@ def of_lot(db, lot: int, *, cfg=None, item: Optional[dict] = None,
            repo: Optional[str] = None, base: Optional[str] = None,
            head: Optional[str] = None, milestones: Optional[list] = None,
            canons=None, base_sha: Optional[str] = None) -> dict:
+    """La classe du lot `lot` (`_of_lot`) et le plancher d'avis posé par un
+    pilote (#3183, `review_floor`) : `reviews_floor` ne reclasse jamais, il
+    relève le compte de `merge_queue.required_verdicts` pour tous ses
+    lecteurs (porte, désignation au gel, `paquet-candidats`)."""
+    from . import review_floor
+    out = _of_lot(db, lot, cfg=cfg, item=item, repo=repo, base=base, head=head,
+                  milestones=milestones, canons=canons, base_sha=base_sha)
+    return review_floor.apply(out, db, lot, cfg=cfg)
+
+
+def _of_lot(db, lot: int, *, cfg=None, item: Optional[dict] = None,
+            repo: Optional[str] = None, base: Optional[str] = None,
+            head: Optional[str] = None, milestones: Optional[list] = None,
+            canons=None, base_sha: Optional[str] = None) -> dict:
     """La classe du lot `lot` ; ne lève jamais (tout doute rend `sensitive`).
 
     `item` évite une lecture de la base ; `repo`, `base` et `head` sont ceux
