@@ -230,6 +230,7 @@ There is nothing to publish from a local worktree — the pilot's state lives in
 the mesh database, the canon and GitHub — so the L232e source proof does not
 apply. A stopped host loses the role when its lease expires (the L232e timing,
 180 s by default); a returning host goes back to standby until the lease is
+
 free again. This lot only makes the cross-host claim possible; EP2 decides
 which candidate wins and when (next section).
 
@@ -268,3 +269,82 @@ a challenger that dies after the release does not leave the role free. A
 workstation that boots therefore does not take the role back from a VM.
 `ameesh role status [ROLE] [--json]` prints the holder, the epoch and the
 ranked candidates with the diagnostic of each refusal.
+
+## Standby executors and the election briefing (L165/EP3)
+
+Every candidate host runs the role's runner, and none of them takes a turn
+before the claim: the runner only creates a worker after `registry.claim`
+returns a live lease, the worker renews it before each turn, and a lost lease
+kills the harness before any further turn. Standby costs no tokens and opens
+no session.
+
+When the winner is a DIFFERENT host from the previous holder, no session
+crosses hosts. The same claim resets the session, its account and its lot
+(`session_reset_at` set durably) and persists the resume briefing built by
+the winner in `agent_registry.election_brief`. The new holder consumes it as
+the resume summary of its new session; the first turn is a short "you are
+elected" instruction framed by that briefing. The briefing is deterministic
+and built from the last persisted state (role card and canon, assigned and
+takeable lots, unread mail, pending decisions, alerts, GitHub observation per
+repository); it names the previous holder, the epoch and the session left
+behind. A same-host re-claim (runner restart) keeps the local session: it is
+not an election. A cross-host claim **without** the brief is refused (the CAS
+writes nothing): a mediated executor, whose brief is forced to null, therefore
+stays on standby. The brief is dropped with its session (`set_session`,
+`clear_session`) so it never resurfaces in a later session. The first turn
+after an election may open a lot session: the lot's minimal brief then
+completes the election briefing, it never replaces it (the role state is not
+lost when the first turn is a lot turn).
+## Fencing the elected pilot's gestures outside the database (L165/EP4)
+
+The epoch fences more than the runner's own writes. The effects a pilot
+prepares outside the database check the epoch first:
+
+| gesture | entry point |
+|---|---|
+| merge | `ameesh work fire` / `work merged` / `work merge-pr` / the automatic packet merge (`packet_automerge` arm and check) |
+| merge queue | `ameesh work queue add\|remove` / `work land` |
+| assignment | `ameesh work assign` / an assigned `work add` (and mail assignment through it) |
+| packet | `ameesh work packet record` / the packet train fire |
+| decision routing | `ameesh decide ask` |
+
+For an agent whose card says `releve: election`, `pilot_gesture.gate` reads
+the session's bound identity. A session that is not the live lease-holder at
+the epoch it was opened with is refused, and the message names the current
+holder, its host and its epoch. The gate renews the lease and writes a
+`pilot.gesture` event in the same database transaction, so a stale epoch
+cannot even journal the gesture; the effect follows. The event carries the
+agent, gesture, ref, epoch and host — never a token or a secret.
+
+An EP5 timer (`ameesh role run`) may carry no agent identity but passes
+`AMEESH_ROLE` and the epoch it entered with. That pair is fenced too: a role
+without `AMEESH_LEASE_EPOCH` is refused, and the transmitted epoch is
+compared to the live lease in the same transaction (its owner is checked when
+the wrapper declares one). A timer therefore never passes as a human.
+
+For an external call — `work merge-pr`'s push, `land`'s push or `gh pr
+merge`, the fire's merge, and the packet auto-merge's `POST /merges` — the
+database transaction cannot cover GitHub. The pilot's lease is renewed just
+before the call with a margin at least the call's worst case (push timeout
+plus read-back), and the call is refused if the renewed lease does not have
+that margin left. The residual race remains: a call that blocks beyond its
+own timeout can outlive the renewed lease, and another candidate may then
+take the role. The target lease, the compare-and-swap on the target and
+GitHub's `--match-head-commit` are the last guards; a failed renewal refuses
+the effect before it starts, and an uncertain outcome is reported and
+reconciled, never silently retried.
+
+The guard is never a committed pre-check followed by a later write. The long
+preparation (proof reads, CI, packet checks) comes first; `Gate.hold` and the
+database write are then in the same transaction: `work assign`, an assigned
+`work add`, `work merged`, `decisions ask` (including its `--new-lot`
+creation), `fire`, the train fire, the packet auto-merge. A refusal, or an
+election that wins in between, rolls the preparation back — no orphan lot,
+marker or decision is left behind.
+
+Humans, the bureau, host-pinned agents (`releve: hote`) and runner-internal
+sweeps without `AMEESH_ROLE` are unchanged. This does not replace the target
+lease (`merge_locks`) or GitHub's compare-and-swap: it stops a pilot that
+lost the election from starting the gesture at all. The packet composition
+itself is local git work; what is fenced is the composition record the pilot
+writes and the train fire that follows it.

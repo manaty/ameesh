@@ -2376,6 +2376,13 @@ def enter(db, lot: int, *, repo: str, actor: str = "", ci="github", project=None
     `parts` is `readiness`'s (L1651): the caller that requalifies a lot (§12
     package manifest) passes the due contexts it vouches for, `()` to disable
     the per-lot proof for that gesture."""
+    # L165 (EP4) : l'entrée en file est un geste du pilote hors base (la file
+    # poussera). Le bail élu est vérifié avant les lectures de préparation et
+    # journalisé dans la transaction de l'écriture ; le radar et un humain ne
+    # sont pas concernés (`gate` rend None).
+    from . import pilot_gesture
+    fence = pilot_gesture.gate(cfg, db, "queue", "queue add #%d" % lot,
+                               project=getattr(project, "name", None))
     if ci == "github":
         from . import radar
         ci = radar.github_ci(project or radar.Project(name="", repo=repo), strict=True)
@@ -2396,13 +2403,24 @@ def enter(db, lot: int, *, repo: str, actor: str = "", ci="github", project=None
     if ready.get("waived"):
         waived_note = ", verdict waived by %s (#1979)" % (
             ready.get("waived_by") or "pilot")
-    row = storage.of(db).work.queue_add(
-        lot, target=ready["target"], frozen_sha=ready["frozen_sha"], frozen_id=ready["frozen_id"],
-        source=source_of(repo), note="merge queue of %s: queued at %s%s, class %s%s%s%s" % (
-            ready["target"], ready["frozen_sha"][:12],
-            ", PR #%s green" % ready["pr"] if ready["pr"] else "",
-            ready.get("class") or "?", " (%s)" % ready["class_why"]
-            if ready.get("class_why") else "", parts_note, waived_note), actor=actor)
+
+    def add(tx):
+        return storage.of(tx).work.queue_add(
+            lot, target=ready["target"], frozen_sha=ready["frozen_sha"],
+            frozen_id=ready["frozen_id"], source=source_of(repo),
+            note="merge queue of %s: queued at %s%s, class %s%s%s%s" % (
+                ready["target"], ready["frozen_sha"][:12],
+                ", PR #%s green" % ready["pr"] if ready["pr"] else "",
+                ready.get("class") or "?", " (%s)" % ready["class_why"]
+                if ready.get("class_why") else "", parts_note, waived_note),
+            actor=actor)
+
+    if fence is None:
+        row = add(db)
+    else:
+        with db.transaction() as tx:
+            fence.hold(tx)
+            row = add(tx)
     if row is None:
         raise QueueError("lot #%d is no longer open" % lot)
     # L539 : la classe lue à l'entrée, rendue avec la ligne de file (lecture)
@@ -2413,9 +2431,17 @@ def enter(db, lot: int, *, repo: str, actor: str = "", ci="github", project=None
 
 
 def leave(db, lot: int, *, actor: str = "", reason: str = "") -> bool:
-    return storage.of(db).work.queue_remove(
-        lot, note="merge queue: taken out%s" % (" (%s)" % reason if reason else ""),
-        actor=actor)
+    from . import pilot_gesture
+    fence = pilot_gesture.gate(None, db, "queue", "queue remove #%d" % lot)
+    if fence is None:
+        return storage.of(db).work.queue_remove(
+            lot, note="merge queue: taken out%s" % (" (%s)" % reason if reason else ""),
+            actor=actor)
+    with db.transaction() as tx:
+        fence.hold(tx)
+        return storage.of(tx).work.queue_remove(
+            lot, note="merge queue: taken out%s" % (" (%s)" % reason if reason else ""),
+            actor=actor)
 
 
 # --------------------------------------------------------------------------

@@ -22,6 +22,8 @@ alike); the insertion emits `pg_notify('ameesh_events', id)`. Types:
   approval.recorded    a signed decision of ameesh-approve (mesh_approvals)
   alert.raised         an alert raised, seen by `ameesh notify` (no table: written
   alert.resolved       by the notifier, outside any transaction of the change)
+  pilot.gesture        an elected pilot's gesture (merge, queue, assign,
+                       packet, decision), in the transaction of its lease check
 
 `data` holds identifiers and states, never free text: the client rereads the
 object through the API.
@@ -69,7 +71,8 @@ from . import storage
 CHANNEL = "ameesh_events"
 TYPES = ("lot.updated", "turn.started", "turn.ended", "agent.updated", "cost.recorded",
          "thread.entry", "decision.created", "decision.closed", "action.updated",
-         "receipt.attached", "approval.recorded", "alert.raised", "alert.resolved")
+         "receipt.attached", "approval.recorded", "alert.raised", "alert.resolved",
+         "pilot.gesture")
 RETENTION_ENV = "AMEESH_EVENTS_RETENTION_DAYS"
 RETENTION_DAYS = 365
 #: the table refuses to delete an event younger than this (migration 0396)
