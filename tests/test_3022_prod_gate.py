@@ -105,6 +105,11 @@ class ProdGateCloseTest(_PlanDb):
 
     def test_un_lot_de_porte_fusionne_sur_develop_reste_en_attente_prod(self):
         item = self.on_develop("ota", mark="ne pas déclencher kind=ota profile=production")
+        dry = plan_git.sync_merges(self.db, self.repo, target="develop", dry_run=True)
+        [entry] = [r for r in dry["results"] if r["work_item"] == item["id"]]
+        self.assertEqual((entry["result"], entry["retention"]["what"]),
+                         ("would-withhold", "production"))
+        self.assertEqual(mail.unread(self.db, "orchestrateur"), [])
         result = self.run_sync()[item["id"]]
         self.assertEqual((result["result"], result["retention"]["what"]),
                          ("withheld", "production"))

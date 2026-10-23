@@ -914,6 +914,18 @@ def content_retention(st, row: dict) -> dict | None:
     return None
 
 
+def dry_run_retention(db, st, row: dict, *, sha: str, repo: str | None) -> dict | None:
+    """La retenue qu'un relevé à blanc annonce : #2744 (blocked, hold), puis
+    #3022 (porte de production hors de la branche de prod) — la même que
+    `work.close_merged` appliquerait, sans verrou ni écriture."""
+    retention = content_retention(st, row)
+    if retention is None:
+        from . import prod_gate
+        retention = prod_gate.check(st, row, sha=sha, repo=repo,
+                                    cfg=getattr(db, "cfg", None))["retention"]
+    return retention
+
+
 def _retention_text(retention: dict, entry: dict, target: str) -> str:
     """La ligne de journal d'une fermeture retenue (#2744)."""
     ref = str(entry.get("ref") or entry.get("sha") or "")
@@ -1133,7 +1145,8 @@ def sync_merges(db, repo_dir: str, *, target: str | None = None, dry_run: bool =
                                       "unit": member["unit_sha"]})
             if dry_run:
                 # #2744 : la même retenue que la fermeture par le gel.
-                retention = content_retention(st, row)
+                retention = dry_run_retention(db, st, row, sha=entry["ref"] or "",
+                                              repo=repo_dir)
                 if retention is not None:
                     mark_retained(entry, retention, target=composition["target"],
                                   dry_run=True)
@@ -1230,7 +1243,8 @@ def sync_merges(db, repo_dir: str, *, target: str | None = None, dry_run: bool =
                      ref=found_proof["ref"], sha=sha, result="open",
                      detail=found_proof["detail"])
         if dry_run:
-            retention = content_retention(st, row)
+            retention = dry_run_retention(db, st, row, sha=entry["ref"] or "",
+                                          repo=repo_dir)
             if retention is not None:
                 mark_retained(entry, retention, target=found_target, dry_run=True)
                 results.append(entry)
@@ -3010,7 +3024,7 @@ def sync_branches(db, *, host: str | None = None, agents=None, dry_run: bool = F
             results.append(entry)
             continue
         if dry_run:
-            retention = content_retention(st, row)
+            retention = dry_run_retention(db, st, row, sha=found["ref"] or "", repo=repo)
             if retention is not None:
                 mark_retained(entry, retention, target=target, dry_run=True)
                 results.append(entry)
