@@ -129,6 +129,13 @@ class ReadyPrTest(unittest.TestCase):
                                  f2271._check("macOS", "FAILURE")], ci="red")
         self.assertTrue(ok, why)
 
+    def test_an_optional_pending_check_does_not_gate_a_green_required_one(self):
+        # #3085 (3) : le check facultatif encore en cours (macOS) n'est pas un
+        # check requis ; les requis ayant conclu, la porte ne l'attend pas.
+        ok, why, _ = self.ready([f2271._check("tests"),
+                                 f2271._check("macOS", None, "IN_PROGRESS")])
+        self.assertTrue(ok, why)
+
 
 class PacketTest(banc.Journal):
     """`packet_automerge` : la tête publiée aux requis non concluants fusionne,
