@@ -1230,19 +1230,22 @@ class Notifier:
         from .mediated_executor import availability
         selected = self.only if only is None else _only_set(only)
         now = float(self.clock())
+        # #3057 : la passe restreinte d'une minuterie de rôle ne livre aucune
+        # alerte humaine (`_run_tail`). Elle rend donc AVANT le battement de
+        # #3007 : sinon une minuterie vivante rafraîchirait `notify_liveness`
+        # et masquerait indéfiniment un vrai notificateur arrêté (B/P1 cx2,
+        # auditeur, #3202).
+        if selected is not None and "alerts" not in selected:
+            return self._run_tail(db, now, selected)
         # #3007 : ce passage prouve, pour tout le maillage, que CE notificateur
         # joint ses humains. Un poste sain ne lève donc plus d'alerte de voie
-        # depuis les VM ; son silence, lui, se voit partout. Le battement précède
-        # la passe restreinte d'une minuterie de rôle (#3057) : il prouve le
-        # notificateur, pas le périmètre observé.
+        # depuis les VM ; son silence, lui, se voit partout.
         if db is not None and not self.dry_run:
             try:
                 notify_gap.beat(self.cfg, db, self.ncfg, now=now)
             except Exception as exc:  # noqa: BLE001 — un battement ne fait pas le passage
                 self.log("[%s] heartbeat not recorded (%s)"
                          % (notify_gap.GAP_TYPE, exc))
-        if selected is not None and "alerts" not in selected:
-            return self._run_tail(db, now, selected)
         observed_ts = storage.of(db).alert_acknowledgements.clock() if db is not None else None
         #: #1901 : familles qu'une passe n'a pas pu lire du tout (porte d'hôte
         #: au registre illisible) ; une alerte absente d'un relevé incomplet

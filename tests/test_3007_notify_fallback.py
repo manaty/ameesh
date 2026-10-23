@@ -374,6 +374,18 @@ class AlertesTest(PgTestCase):
                       [(r["host"], r["human"]) for r in rows])
         self.assertEqual(self.alerts(), [])
 
+    def test_une_passe_restreinte_ne_bat_pas(self):
+        # B/P1 cx2, auditeur (#3202) : `_run_tail` ne livre aucune alerte
+        # humaine ; une minuterie de rôle ne doit donc pas rafraîchir
+        # `notify_liveness`, sinon un vrai notificateur arrêté resterait masqué.
+        ncfg = notify.parse_config({"routes": {ALICE: ["app"]}})
+        for only in ({"ci"}, {"take"}):
+            notifier = notify.Notifier(
+                self.cfg, ncfg, notify.empty_state(), sender=notify.DrySender(),
+                log=lambda text: None)
+            notifier.run_pass(self.db, only=only)
+            self.assertEqual(storage.of(self.db).notify_liveness.latest(), [], only)
+
     def test_le_brief_est_unique_puis_relance(self):
         self.ask()
         now = self.beat(age=3600)
