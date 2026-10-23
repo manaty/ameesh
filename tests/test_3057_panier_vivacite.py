@@ -19,7 +19,7 @@ from __future__ import annotations
 import unittest
 from unittest import mock
 
-from ameesh import alert_briefs, notify
+from ameesh import alert_briefs, notify, registry
 
 from .support import PgTestCase
 from .test_3036_alert_liveness import LivenessFixture, _row, _slo
@@ -111,6 +111,40 @@ class PanierNotifierTest(LivenessFixture, PgTestCase):
             self.assertEqual(spy.call_count, 1)
         [mail] = self.mails("auditeur")
         self.assertFalse(mail["payload"]["reminder"])
+        self.assertEqual(len(self.mails("orch")), 1)
+
+    def test_destinataire_servi_qui_tombe_appelle_le_repli(self):
+        # B/P1 cx2 sur 42709a9e : orch servi, orch2 écarté ; orch s'arrête à
+        # son tour. L'entrée ne doit pas être tenue pour inchangée parce
+        # qu'orch2 reste mort : le repli sur l'auditeur part.
+        registry.upsert(self.db, "orch2", harness="claude", host=self.cfg.host)
+        self.db.execute("UPDATE agent_registry SET team = 'ameesh',"
+                        " status = 'stopped' WHERE name = 'orch2'")
+        alert = {"type": "mail_undeliverable", "agent": "claude3", "value": 1,
+                 "threshold": 900, "reason": "arrete", "senders": ["claude1"],
+                 "orchestrators": ["orch", "orch2"], "since": self.now - 1200,
+                 "detail": "undeliverable", "urgent": True}
+        notifier = self.notifier()
+        notifier.run_pass(self.db, current=[alert])
+        [entry] = notifier.state["briefs"].values()
+        self.assertEqual((entry["to"], entry["dead"]), (["orch"], ["orch2"]))
+        self.assertEqual(self.mails("auditeur"), [])
+        self.now += 30.0
+        notifier.run_pass(self.db, current=[alert])
+        self.assertEqual(self.mails("auditeur"), [])
+        self.db.execute("UPDATE agent_registry SET status = 'stopped'"
+                        " WHERE name = 'orch'")
+        self.now += 30.0
+        notifier.run_pass(self.db, current=[alert])
+        [sent] = self.mails("auditeur")
+        self.assertIn("orch (status stopped)", sent["body"])
+        # l'état se stabilise : plus de recalcul tant que rien ne bouge
+        with mock.patch.object(alert_briefs, "briefs",
+                               wraps=alert_briefs.briefs) as spy:
+            self.now += 7 * 3600.0
+            notifier.run_pass(self.db, current=[alert])
+            self.assertEqual(spy.call_count, 0)
+        self.assertEqual(len(self.mails("auditeur")), 1)
         self.assertEqual(len(self.mails("orch")), 1)
 
     def test_relance_et_retour_dans_la_meme_passe_sans_double(self):

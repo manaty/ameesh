@@ -1811,15 +1811,26 @@ class Notifier:
             listing, held = alert_briefs.lease_grace(
                 listing, closed, self.state.setdefault("leaseless_since", {}), now)
             by_name = {row["name"]: row for row in listing}
+
+            def down(entry: dict) -> list:
+                # les destinataires d'une entrée (remis ou écartés) qui ne
+                # liraient pas à cette passe ; le fil n'a pas de bail
+                names = set(entry.get("to") or ()) | set(entry.get("dead") or ())
+                return sorted(n for n in names if not n.startswith("thread:") and (
+                    n not in by_name or alert_briefs._unavailable(by_name[n], closed)))
+
             # #3057 : un destinataire mort qui le reste (agent arrêté des
-            # jours) ne refait pas, à chaque passe, briefs et titres du lot ;
-            # l'entrée est réévaluée dès que l'un revient ou quitte le
-            # registre.
+            # jours) ne refait pas, à chaque passe, briefs et titres du lot.
+            # L'entrée est réévaluée dès que l'un des écartés revient (ou est
+            # en grâce) ou quitte le registre, et dès que l'ensemble des
+            # indisponibles change depuis la dernière évaluation — un
+            # destinataire déjà servi qui tombe peut appeler le repli.
             due = [(key, alert, entry) for key, alert, entry in due
-                   if key not in dead_only or any(
-                       name not in by_name
-                       or not alert_briefs._unavailable(by_name[name], closed)
-                       for name in entry["dead"])]
+                   if key not in dead_only
+                   or entry.get("down") != down(entry)
+                   or any(name not in by_name
+                          or not alert_briefs._unavailable(by_name[name], closed)
+                          for name in entry["dead"])]
             if not due:
                 return
             from . import canon as canon_mod
@@ -1834,6 +1845,7 @@ class Notifier:
         except Exception as exc:  # noqa: BLE001
             self.log("mail to agents not prepared (%s)" % exc)
             return
+        unevaluated: set = set()
         for key, alert, entry in due:
             kind = alert.get("type")
             # #3036 : les destinataires écartés par la vivacité, pour que les
@@ -1856,6 +1868,7 @@ class Notifier:
                     closed_hosts=closed, dead_out=dead)
             except Exception as exc:  # noqa: BLE001 - l'alerte part quand même
                 self.log("[%s] mail to agents not prepared (%s)" % (kind, exc))
+                unevaluated.add(key)
                 continue
             for name in held & set(briefs):
                 # #3057 : bail rendu il y a moins de la grâce ; ni remise ni
@@ -2013,6 +2026,14 @@ class Notifier:
                 entry["pending"] = sorted(set(briefs) - set(delivered) - set(dead))
                 if remind_due:
                     entry["reminded"] = True
+        # #3057 : l'état des destinataires vu à cette évaluation, pour que les
+        # passes suivantes sachent si quelque chose a changé ; une entrée non
+        # évaluée (préparation en échec) garde l'ancien et sera reprise.
+        for key, _alert, _entry in due:
+            entry = sent.get(key)
+            if entry is not None and entry.get("type") != "slo_breach" \
+                    and key not in unevaluated:
+                entry["down"] = down(entry)
 
     def _send_module_brief(self, db, alert, name, text, payload):
         """Reauthorize under a recipient row lock, held through mailbox commit.
