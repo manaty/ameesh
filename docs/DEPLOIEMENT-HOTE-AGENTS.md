@@ -44,12 +44,14 @@ le démarrage. Un nouvel échec pendant l’arrêt n’est jamais effacé.
 
 Quand `DRAIN_ATTENTE` est supérieur à 0 (0 par défaut : désactivé), c’est un
 interrupteur, pas un délai : au début du balayage de l’hôte, tous les agents
-vus en tour reçoivent une pause opérateur courte et nommée (drain, #2152).
-Les fins de tour se chevauchent : l’attente dépend du plus long tour restant,
-puis des arrêts et contrôles séquentiels, au lieu de leur somme (#3114).
-Aucun nouveau tour ne commence sous pause ; celle-ci reste en place jusqu’au
-démarrage de la persona. Chaque arrêt journalise sa durée d’attente. Un tour
-commencé après la première passe reçoit aussi son drain juste avant l’arrêt.
+en tour ou au repos (`idle`, `queued`) reçoivent une pause opérateur courte et
+nommée (drain, #2152). Les fins de tour se chevauchent : l’attente dépend du
+plus long tour restant, puis des arrêts et contrôles séquentiels, au lieu de
+leur somme (#3114). Une persona au repos mise en pause avant son premier tour
+n’ajoute pas ce tour à l’attente du balayage (#3120/N2). Aucun nouveau tour ne
+commence sous pause ; celle-ci reste en place jusqu’au démarrage de la persona.
+Chaque arrêt journalise sa durée d’attente. Un tour commencé après la première
+passe reçoit aussi son drain juste avant l’arrêt.
 `--not-after` est recalculé à chaque pose : il borne l’admission de la pause,
 sans faire expirer une pause déjà posée. La valeur ne mesure plus une attente d’un
 créneau « idle » ; aucune fenêtre « idle » n’est attendue. Le mesh journalise

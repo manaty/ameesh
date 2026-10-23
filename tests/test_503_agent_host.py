@@ -101,19 +101,21 @@ elif sys.argv[1] == 'show':
     row = dict(row, lease_owner='runner-' + name + '@host-agents', lease_epoch=7, lease_expires_ts=time.time()+300)
     pause = state / ('pause-' + name)
     motif = state / ('motif-' + name)
-    if scenario == 'pause-coupee-etat-perdu' and pause.exists() \
+    if scenario == 'pause-coupee-etat-perdu' and name == 'dev9' and pause.exists() \
             and not (state / 'lecture-perdue').exists():
         (state / 'lecture-perdue').touch()
         sys.exit(1)
     # R1 B1 : après notre pose et avant notre reprise, le monde extérieur lève
     # notre drain puis pose une NOUVELLE pause (humaine, étrangère).
-    if scenario == 'drain-remplace' and motif.exists() and '#2152' in motif.read_text() \
+    if scenario == 'drain-remplace' and name == 'dev9' and motif.exists() \
+            and '#2152' in motif.read_text() \
             and not (state / 'remplace-fait').exists():
         motif.write_text('pause humaine etrangere')
         (state / 'remplace-fait').touch()
     # N5 B2 : levée humaine de notre premier drain, l'agent restant en tour :
     # le second drain doit seul rester suivi (aucune entrée périmée).
-    if scenario == 'chaines-relance' and motif.exists() and '#2152' in motif.read_text() \
+    if scenario == 'chaines-relance' and name == 'dev9' and motif.exists() \
+            and '#2152' in motif.read_text() \
             and not (state / 'levee-humaine').exists():
         pause.unlink(); motif.unlink(missing_ok=True)
         (state / 'levee-humaine').touch()
@@ -193,7 +195,7 @@ elif sys.argv[1] in ('pause', 'resume'):
                               'changed': False, 'event_id': None,
                               'refusal': 'not_after'}))
             sys.exit(0)
-        if scenario == 'chaines-pause-error': sys.exit(1)
+        if scenario == 'chaines-pause-error' and name == 'dev9': sys.exit(1)
         if scenario == 'drain-refuse-identite':
             # Geste d'opérateur refusé : vm.sh tourne dans une session liée à
             # un agent (bad_actor), le CLI refuse AVANT toute mutation.
@@ -204,7 +206,7 @@ elif sys.argv[1] in ('pause', 'resume'):
             # R1 B2 : réponse perdue, la pose n'a PAS abouti.
             print('{bad-json')
             sys.exit(0)
-        if scenario == 'pause-expiree-tardive':
+        if scenario == 'pause-expiree-tardive' and name == 'dev9':
             # Timeout de l'appel (rc 124) : la pose n'est pas encore commitée.
             # Le créateur tardif rejouera cette commande avec la même échéance.
             (state / ('motif-tardif-' + name)).write_text(
@@ -236,7 +238,7 @@ elif sys.argv[1] in ('pause', 'resume'):
         if (state / 'sans-expect-reason').exists() and '--expect-reason' in args:
             sys.exit(2)
         if scenario == 'chaines-resume-error': sys.exit(1)
-        if scenario == 'resume-error-deux-fois':
+        if scenario == 'resume-error-deux-fois' and name == 'dev9':
             # #2198/N3 : les deux premières levées échouent (celle de la boucle
             # puis la première passe du trap) ; la seconde passe réussit.
             compteur = state / 'resume-compte'

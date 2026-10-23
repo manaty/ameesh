@@ -18,14 +18,15 @@
 #                atomique du venv (#1969) ; refuse tant que la base du mesh
 #                n'a pas toutes les migrations de REF
 #   redemarrer   ameesh-runner@<persona>, une par une : arrêt prouvé
-#                (SIGTERM, drainage borné) puis démarrage ; si l'agent est
-#                en tour et DRAIN_ATTENTE > 0, une pause opérateur courte
-#                (drain #2152) est posée au début du balayage puis
-#                levée après le démarrage — aucun tour interrompu ; geste
-#                d'opérateur : à lancer hors session liée à un agent (le CLI
-#                local refuse bad_actor), sinon le drain est refusé et le
-#                redémarrage de cet agent s'arrête sans tour interrompu ;
-#                refuse tant que les migrations du code installé manquent
+#                (SIGTERM, drainage borné) puis démarrage ; si
+#                DRAIN_ATTENTE > 0, une pause opérateur courte (drain #2152)
+#                est posée au début du balayage pour les agents en tour ou au
+#                repos (idle/queued), puis levée après le démarrage — aucun
+#                tour interrompu ; geste d'opérateur : à lancer hors session
+#                liée à un agent (le CLI local refuse bad_actor), sinon le
+#                drain est refusé et le redémarrage de cet agent s'arrête sans
+#                tour interrompu ; refuse tant que les migrations du code
+#                installé manquent
 #   controler    unités actives, journal récent, ameesh doctor sur le serveur
 #   retour       bascule en arrière vers le venv précédent conservé, puis
 #                redémarre
@@ -51,8 +52,8 @@
 # par le serveur ; liste vide admise, un hôte sans exécutant). Aucun secret
 # n'est lu ni affiché. DRAIN_ATTENTE (0 = jamais, défaut) ne mesure plus une
 # attente : c'est un interrupteur. > 0 pose la pause opérateur #2152
-# au début du balayage pour tous les agents en tour, puis la lève après le
-# démarrage ; 0 l'arrêt prouvé #1152 sans pause.
+# au début du balayage pour tous les agents en tour ou au repos (idle/queued),
+# puis la lève après le démarrage ; 0 l'arrêt prouvé #1152 sans pause.
 set -euo pipefail
 shopt -s inherit_errexit
 
@@ -456,8 +457,10 @@ echec_agent() {
 # --- #2152 : drain d'un agent qui enchaîne les tours -------------------------
 # Attendre qu'un agent enchaînant les tours de continuation rende la main ne
 # finit jamais (16-17/10 : 57 min, puis de nouveau). Avec DRAIN_ATTENTE > 0, le
-# redémarrage pose d'abord les pauses de tous les agents en tour (#3114),
-# puis arrête les unités une par une : les fins de tour se chevauchent.
+# redémarrage pose d'abord les pauses de tous les agents en tour ou au repos
+# (#3114, #3120), puis arrête les unités une par une : les fins de tour se
+# chevauchent et une persona idle ne peut plus commencer un tour pendant le
+# balayage.
 # L'arrêt prouvé prend ensuite la suite ; l'unité est redémarrée, puis la pause
 # est levée — jamais un tour interrompu. Le mesh journalise la pose et la levée
 # (operator_pause_events).
@@ -658,7 +661,7 @@ drain_secours() {  # $1 persona, $2 motif : geste exact si la levée a échoué
   [ "$MODE" = agents ] && echo "  (sur $HOTE_AGENTS, compte ameesh)" >&2
   return 0
 }
-poser_drain() {  # $1 persona : pause immédiate d'un agent en tour
+poser_drain() {  # $1 persona : pause immédiate (en tour ou au repos)
   local motif sortie change etat pose raison rc=0 refusal
   local echeance_abs echeance_locale
   motif=$(drain_motif "$(drain_jeton)")
@@ -674,7 +677,7 @@ poser_drain() {  # $1 persona : pause immédiate d'un agent en tour
   # Track the intent before the call: both its reply and the reconciliation
   # read can fail after commit. EXIT still attempts the conditional cleanup.
   DRAINS+=("$1"$'\t'"$motif"$'\t'"$echeance_locale"$'\t'1)
-  echo "$1 : en tour — pose immédiate d'une pause opérateur (drain #2152)"
+  echo "$1 : admission fermée — pose immédiate d'une pause opérateur (drain #2152)"
   sortie=$(pause_operateur "$1" "$motif" "$echeance_abs") || rc=$?
   if [ "$rc" = 0 ]; then
     if change=$(json_champ changed <<<"$sortie") && [ -n "$change" ]; then
@@ -858,6 +861,9 @@ drains_non_leves_relus() {  # #2498 : passe du trap avant le verdict
 }
 
 # #3114 : fermer l'admission de tous les tours avant le premier arrêt lent.
+# #3120/N2 : inclure les personas au repos (idle/queued). Sinon l'une d'elles
+# peut commencer un tour pendant l'arrêt lent d'une autre et son drain de
+# rattrapage, posé juste avant son propre arrêt, ajoute ce tour à l'attente.
 # Ne pas mettre cette passe dans une substitution : DRAINS et les refus doivent
 # rester dans le shell qui porte le trap EXIT. Relire ensuite chaque placement
 # dans la boucle d'arrêt ; une persona peut avoir été déplacée ou arrêtée.
@@ -869,11 +875,15 @@ preparer_drains() {  # personas dans l'ordre du balayage
     etat=$(etat_agent "$p") \
       || { echo "$p : registre illisible pendant le pré-drain — aucun arrêt" >&2; return 1; }
     IFS='|' read -r st deja_pause detail <<<"$etat"
-    if [ "$st" = running ] && [ "$deja_pause" != 1 ]; then
-      # --not-after borne la POSE, pas la durée de la pause. Son échéance est
-      # recalculée dans poser_drain pour chaque appel, même en fin de passe.
-      if ! poser_drain "$p"; then drain_marque_indisponible "$p"; fi
-    fi
+    case "$st" in
+      running|idle|queued)
+        if [ "$deja_pause" != 1 ]; then
+          # --not-after borne la POSE, pas la durée de la pause. Son échéance
+          # est recalculée dans poser_drain pour chaque appel, même en fin de
+          # passe. Une pause étrangère n'est ni doublée ni levée.
+          if ! poser_drain "$p"; then drain_marque_indisponible "$p"; fi
+        fi ;;
+    esac
   done
 }
 
