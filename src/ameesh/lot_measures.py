@@ -97,7 +97,12 @@ LS_REMOTE_TIMEOUT_S = 8.0
 CI_RUN_LIMIT = 100
 
 _SHA_RE = re.compile(r"^[0-9a-f]{7,64}$")
-#: published tips read during one measure pass, see `_remote_tip` (#3038)
+#: how long a published tip read by `ls-remote` is reused (s): a measure pass
+#: clears it anyway, but `review_lot.class_at_merge` reads it from a
+#: long-lived process and must not see a tip older than this (#3056)
+PUBLISHED_TIP_TTL_S = 60.0
+#: published tips read recently, `(repo, remote, branch)` → `(read_at, (kind,
+#: sha))`, see `_remote_tip` (#3038, #3056)
 _PUBLISHED_TIPS: dict = {}
 _SHORTSTAT_RE = {
     "files": re.compile(r"(\d+) files? changed"),
@@ -305,10 +310,11 @@ def _remote_tip(repo: str, remote: str, branch: str) -> tuple[str, str | None]:
     `('absent', None)` when the forge does not carry the branch, `('error',
     None)` when it cannot be read (network, credentials, timeout): the caller
     then doubts, never concludes. One read per (repo, remote, branch) and per
-    measure pass."""
+    measure pass, reused at most `PUBLISHED_TIP_TTL_S` seconds (#3056)."""
     key = (repo, remote, branch)
-    if key in _PUBLISHED_TIPS:
-        return _PUBLISHED_TIPS[key]
+    cached = _PUBLISHED_TIPS.get(key)
+    if cached is not None and time.monotonic() - cached[0] < PUBLISHED_TIP_TTL_S:
+        return cached[1]
     if remote not in _remotes(repo):
         out = ("local", None)
     else:
@@ -324,8 +330,18 @@ def _remote_tip(repo: str, remote: str, branch: str) -> tuple[str, str | None]:
             out = ("sha", words[0])
         else:
             out = ("error", None)
-    _PUBLISHED_TIPS[key] = out
+    _PUBLISHED_TIPS[key] = (time.monotonic(), out)
     return out
+
+
+def _forge_unreadable(repos) -> bool:
+    """True when a recent `ls-remote` of one of `repos` failed (#3056): a
+    doubt read then is transient, not a fact about the lot."""
+    now = time.monotonic()
+    wanted = set(repos or ())
+    return any(key[0] in wanted and now - read_at < PUBLISHED_TIP_TTL_S
+               and out[0] == "error"
+               for key, (read_at, out) in list(_PUBLISHED_TIPS.items()))
 
 
 def _published_ref(repo: str, name: str) -> str | None:
@@ -614,10 +630,17 @@ def _repo_for(sha: str | None, repos) -> str | None:
     return None
 
 
-def measure_one(db, cand: dict, *, repos=(), ci=gh_ci_runs) -> dict:
+def measure_one(db, cand: dict, *, repos=(), ci=gh_ci_runs,
+                replace_size: bool = False) -> dict:
     """Measures one delivered lot (a row of `measure_candidates`) and stores
     it. `repos`: repositories where the merge commit may be; `ci(repo,
-    branch)`: its CI runs, or None (`ci=None`: not read)."""
+    branch)`: its CI runs, or None (`ci=None`: not read).
+
+    A stored size is kept when this measure cannot read one (another host may
+    hold what this one lacks). `replace_size` (a measure asked again by id):
+    a repository holds the merge commit and the size doubts, the forge being
+    readable — the stored size is cleared, never left to show a value the
+    current rule refutes (#3056)."""
     st = storage.of(db).work
     item_id = int(cand["id"])
     events = st.events(item_id, 1000)
@@ -656,6 +679,8 @@ def measure_one(db, cand: dict, *, repos=(), ci=gh_ci_runs) -> dict:
                declared_size=cand.get("change_size") or None)
     if stat is not None:
         out.update(stat)
+    elif replace_size and holding and not _forge_unreadable(holding):
+        out["size_doubt"] = True
     return st.save_measure(item_id, out)
 
 
@@ -664,7 +689,9 @@ def measure(db, ids=None, *, repos=(), ci=gh_ci_runs, limit: int = PASS_LIMIT,
             errors: list | None = None) -> list[dict]:
     """Measures the given delivered lots (`ids`, measured again), or those
     still to measure (`ids` None; merged less than `since_s` ago when
-    given), the most recent first. Returns the stored measures.
+    given), the most recent first. Returns the stored measures. A lot named
+    in `ids` is measured again for good: a size that now doubts is cleared
+    (`measure_one(replace_size=True)`, #3056).
 
     A lot that fails is skipped (`(id, exception)` appended to `errors`)
     and the next one measured; past `budget_s` seconds, the pass stops (the
@@ -684,7 +711,8 @@ def measure(db, ids=None, *, repos=(), ci=gh_ci_runs, limit: int = PASS_LIMIT,
             if ids is None and cand["measured"] and not _repo_for(cand.get("merge_sha"),
                                                                   repos):
                 continue
-            out.append(measure_one(db, cand, repos=repos, ci=ci))
+            out.append(measure_one(db, cand, repos=repos, ci=ci,
+                                   replace_size=ids is not None))
         except Exception as exc:  # noqa: BLE001 - one lot never blocks the others
             if errors is not None:
                 errors.append((int(cand["id"]), exc))

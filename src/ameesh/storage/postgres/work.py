@@ -3622,13 +3622,14 @@ class WorkItems(interface.WorkItems):
             " AND work_item_measures.ci_minutes IS NOT NULL"
             " THEN work_item_measures.agent_source ELSE excluded.agent_source END,"
             "  merge_sha = coalesce(excluded.merge_sha, work_item_measures.merge_sha),"
-            "  diff_files = coalesce(excluded.diff_files, work_item_measures.diff_files),"
-            "  diff_insertions = coalesce(excluded.diff_insertions,"
-            "                             work_item_measures.diff_insertions),"
-            "  diff_deletions = coalesce(excluded.diff_deletions,"
-            "                            work_item_measures.diff_deletions),"
-            "  measured_size = coalesce(excluded.measured_size,"
-            "                           work_item_measures.measured_size),"
+            # a measure that could not read a size keeps the stored one, unless
+            # it doubts for good (`size_doubt`, #3056): the old size is then
+            # cleared, not shown as measured
+            + ", ".join(
+                "  %s = %s" % (c, "NULL" if m.get("size_doubt") else
+                               "coalesce(excluded.%s, work_item_measures.%s)" % (c, c))
+                for c in ("diff_files", "diff_insertions", "diff_deletions",
+                          "measured_size")) + ","
             "  declared_size = excluded.declared_size"
             " RETURNING " + self._MEASURE_COLUMNS,
             (int(item_id), float(m["started_ts"]), float(m["merged_ts"]),
