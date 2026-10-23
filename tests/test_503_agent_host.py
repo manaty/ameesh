@@ -195,7 +195,7 @@ elif sys.argv[1] in ('pause', 'resume'):
                               'changed': False, 'event_id': None,
                               'refusal': 'not_after'}))
             sys.exit(0)
-        if scenario == 'chaines-pause-error' and name == 'dev9': sys.exit(1)
+        if scenario == 'chaines-pause-error': sys.exit(1)
         if scenario == 'drain-refuse-identite':
             # Geste d'opérateur refusé : vm.sh tourne dans une session liée à
             # un agent (bad_actor), le CLI refuse AVANT toute mutation.
@@ -739,6 +739,18 @@ class AgentHostTest(unittest.TestCase):
         self.assertIn('--user start ameesh-runner-agent@dev8.service', self.units())
         self.assertEqual([l for l in self.units().splitlines() if '@dev9.' in l], [])
         self.assertNotIn('resume dev9', self.operateur())
+        self.assertFalse((self.state / 'pause-dev9').exists())
+
+    def test_refused_operator_identity_restarts_idle_personas_without_drain(self):
+        """#3120/B1 : un refus global de pose ne condamne pas les personas au
+        repos : elles n'ont pas besoin du drain et redémarrent sans lui."""
+        self.env['DRAIN_ATTENTE'] = '1'
+        p = self.run_vm(scenario='drain-refuse-identite')
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn('dev8 : au repos, drain non posé', p.stderr)
+        self.assertIn('--user start ameesh-runner-agent@dev8.service', self.units())
+        self.assertEqual([l for l in self.units().splitlines() if '@dev9.' in l], [])
+        self.assertFalse((self.state / 'pause-dev8').exists())
         self.assertFalse((self.state / 'pause-dev9').exists())
 
     def test_non_execute_agent_is_skipped_before_restart(self):

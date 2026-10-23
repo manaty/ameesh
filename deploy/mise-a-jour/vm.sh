@@ -881,7 +881,16 @@ preparer_drains() {  # personas dans l'ordre du balayage
           # --not-after borne la POSE, pas la durée de la pause. Son échéance
           # est recalculée dans poser_drain pour chaque appel, même en fin de
           # passe. Une pause étrangère n'est ni doublée ni levée.
-          if ! poser_drain "$p"; then drain_marque_indisponible "$p"; fi
+          if ! poser_drain "$p"; then
+            # Une persona au repos n'a pas besoin du drain : un échec ne la
+            # condamne pas (#2184/N2, #3120/B1). La boucle d'arrêt pose le
+            # drain de rattrapage si elle est entrée en tour depuis.
+            if [ "$st" = running ]; then
+              drain_marque_indisponible "$p"
+            else
+              echo "$p : au repos, drain non posé — arrêt prouvé sans drain s'il le reste" >&2
+            fi
+          fi
         fi ;;
     esac
   done

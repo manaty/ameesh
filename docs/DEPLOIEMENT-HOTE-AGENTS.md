@@ -73,9 +73,11 @@ conditionnelle de levée manuelle. Pose et levée sont des gestes d’opérateur
 le CLI local refuse une session liée à un agent (`bad_actor`), donc `vm.sh`
 doit être lancé hors session d’agent ; l’acteur d’audit consigné est
 l’opérateur du poste (`--human`), jamais le compte `ameesh` de la VM
-(#2184/N6). Si la pose est refusée, cet agent est laissé en l’état sans
-redémarrage et les autres agents du balayage continuent ; un échec de levée
-est consigné, retenté à la sortie, et le code de retour le signale
+(#2184/N6). Si la pose est refusée, une persona en tour est laissée en
+l’état sans redémarrage et les autres agents du balayage continuent ; une
+persona au repos, qui n’a pas besoin du drain, redémarre sans lui (arrêt
+prouvé) et le script le dit (#3120/B1) ; un échec de levée est consigné,
+retenté à la sortie, et le code de retour le signale
 (#2184/N2) ; le verdict « NON levé » n’est écrit qu’après la dernière
 tentative (#2198/N3). Un CLI de
 cible antérieur à #2152 (sans `--expect-reason`) ou à #2184/R3 (sans
