@@ -111,8 +111,12 @@ class FileGateTest(unittest.TestCase):
             ecrit_etat(self.path, d)
             self.assertEqual(g.state().state, "stopped")
 
-    def _changement(self, **kw):
+    def _changement(self, *, require_inotify=False, **kw):
         g = self.gate(**kw)
+        if require_inotify:
+            g._watch()
+            if g._inotify is None:
+                self.skipTest("inotify unavailable; polling is tested separately")
         ecrit_etat(self.path, etat("available", 1))
         self.assertEqual(g.wait_change(0.1).seq, 1)
         self.assertEqual(g.wait_change(0.1).seq, 1)  # inchangé : rendu au délai
@@ -124,7 +128,7 @@ class FileGateTest(unittest.TestCase):
     @unittest.skipUnless(platform.is_linux(),
                          "L112 : inotify est Linux ; macOS sonde (test suivant)")
     def test_changement_vu_par_inotify(self):
-        st, duree = self._changement(poll=30.0)  # sans inotify, rien avant 30 s
+        st, duree = self._changement(require_inotify=True, poll=30.0)
         self.assertEqual((st.state, st.seq), ("draining", 2))
         self.assertLess(duree, 2.0)
 
