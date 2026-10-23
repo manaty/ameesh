@@ -17,7 +17,7 @@ import tempfile
 import unittest
 from unittest import mock
 
-from ameesh import plan_git, resolutions
+from ameesh import plan_git, resolutions, review_designation_activation
 
 
 def _git(repo: str, *args: str) -> str:
@@ -162,6 +162,39 @@ class CloneFollowsForgeTest(unittest.TestCase):
             replayer.ensure()
         self.assertIn("older target is refused", replayer.target_doubt)
         self.assertIsNone(self._tracked("develop"))
+
+    def test_merge_gate_range_reads_the_forge_target(self) -> None:
+        """Témoin réel du 23/10 (#3025) : la porte (`lot_class` base `develop`,
+        puis `review_designation_activation._resolve_base`) lisait
+        `origin/develop` du clone radar, copie figée du checkout : la plage
+        gelée portait 3201 commits au lieu d'un."""
+        _git(self.repo, "branch", "develop", self.base)     # local figé du checkout
+        os.makedirs(os.path.dirname(self.clone))
+        _git(os.path.dirname(self.clone), "clone", "-q", "--shared", "--no-checkout",
+             self.repo, self.clone)
+        _git(self.clone, "checkout", "-q", "-f", "--detach", self.base)
+        for n in range(5):                                 # d'autres auteurs
+            _commit(self.pusher, "b.txt", "other %d\n" % n, "other %d" % n)
+        _git(self.pusher, "checkout", "-q", "-b", "lot/9-x")
+        head = _commit(self.pusher, "c.txt", "lot\n", "the lot's own commit")
+        _git(self.pusher, "push", "-q", "origin", "develop", "lot/9-x")
+        _git(self.clone, "fetch", "-q", self.forge, "lot/9-x")  # la tête gelée lue
+        _start, _paths, before = review_designation_activation._range(
+            self.clone, "develop", head)
+        self.assertEqual(len(before), 7)                   # la copie du checkout
+        self._replayer().ensure()
+        self.assertEqual(review_designation_activation._resolve_base(self.clone, "develop"),
+                         "origin/develop")
+        _start, _paths, after = review_designation_activation._range(
+            self.clone, "develop", head)
+        self.assertEqual(after, [head])
+        # un fetch ultérieur par le nom `origin` (passage radar, `_fetch_frozen`)
+        # lit la forge : la branche locale du checkout ne revient pas
+        _git(self.clone, "fetch", "-q", "origin")
+        self.assertEqual(self._tracked("develop"), _git(self.pusher, "rev-parse", "develop"))
+        _start, _paths, again = review_designation_activation._range(
+            self.clone, "develop", head)
+        self.assertEqual(again, [head])
 
     def test_checkout_without_origin_keeps_its_branches(self) -> None:
         alone = os.path.join(self.tmp, "alone")
