@@ -9827,11 +9827,24 @@ class Runner:
         from . import handoffs, host_lifecycle
         try:
             api = storage.of(db).host_lifecycle
-            api.detect_losses(actor=self.runner_id,
-                              older_than=max(180, int(self.cfg.resource_interval * 3)),
+            older_than = max(180, int(self.cfg.resource_interval * 3))
+            api.detect_losses(actor=self.runner_id, older_than=older_than,
                               critical=host_lifecycle.critical_names(self.cfg, db))
             api.expire_returns()
-            for control in api.listing():
+            controls = api.listing()
+            # #3035: a lost host that publishes fresh readings again is reopened
+            # only on the database proof (origins home, no live lease, no active
+            # handoff or recovery since the loss). Any healthy runner may make
+            # that decision; the returning machine's own heartbeat is not it.
+            for control in controls:
+                if control["mode"] != "lost":
+                    continue
+                result = host_lifecycle.reconcile(self.cfg, db, control["host"],
+                                                  actor=self.runner_id)
+                if result.get("reconciled"):
+                    log_async("[%s] lost host %s reconciled (generation %s)"
+                              % (self.runner_id, control["host"], result.get("generation")))
+            for control in controls:
                 if control["mode"] in ("draining", "returning", "lost"):
                     host_lifecycle.advance_host(
                         db, control["host"], limits_for=self.handoff_limits_for,

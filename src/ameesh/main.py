@@ -69,8 +69,8 @@
   ameesh harness list|show|check|versions  harnesses (L16, L120);
   ameesh heavy [--nice N] -- <command> | --status [--json]
         heavy suite (tests, build) in one of the host's capped slots (L131);
-  ameesh host drain HOST [--for 8h] | undrain HOST | status [HOST]
-        durable withdrawal, return and lost-host recovery (L232e);
+  ameesh host drain HOST [--for 8h] | undrain HOST | reconcile HOST | status [HOST]
+        durable withdrawal, return and verified lost-host recovery (L232e);
   ameesh host enroll|revoke|list|show   enroll lending devices (L110,
         authorized human only);
   ameesh hosts [--json] [HOST]          host resources (L31);
@@ -318,7 +318,7 @@ def _dispatch(argv: list[str] | None) -> int:
         # L85: the event log of `GET /api/v1/events`
         from . import events
         return events.main(rest)
-    if command == "host" and rest and rest[0] in ("drain", "undrain", "status"):
+    if command == "host" and rest and rest[0] in ("drain", "undrain", "reconcile", "status"):
         from . import host_lifecycle
         return host_lifecycle.main(rest)
     if command == "plan":

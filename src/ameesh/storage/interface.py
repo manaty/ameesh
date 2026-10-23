@@ -3624,6 +3624,19 @@ class HostLifecycle(Domain):
                       critical: Sequence[str] = ()) -> list[dict]:
         """Close stale known hosts atomically; loss is not a quiescence proof."""
 
+    @abc.abstractmethod
+    def reconcile_loss(self, host: str, *, actor: str, fresh_within: int) -> dict:
+        """Reopen a lost host only on a verified proof.
+
+        Readings in database time must cover at least `fresh_within` without a
+        hole that large, with no reading dated in the future; every origin
+        agent must still be home and unfenced, with no live lease, no active
+        handoff and no `recover_source` attempt since the loss. The transition
+        `lost -> returning -> available` is atomic and leaves its actor and
+        evidence in `ameesh_events`. Returns `{"host", "mode", "reconciled",
+        "missing", ...}`; a refusal names the missing proof.
+        """
+
 
 class HostResources(Domain):
     """Relevés des ressources d'un hôte (état d'exécution, jamais canon).
