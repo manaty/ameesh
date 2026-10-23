@@ -141,6 +141,13 @@ services start at login and restart after a failure; their output goes to
 The plists contain **no secret**: each service sources
 `~/.config/ameesh/env` before `exec`uting ameesh.
 
+Stopping a service does not kill a running turn: the runner plist sets
+launchd's `ExitTimeOut` to 35 min, so a reinstall or an uninstall lets the
+turn drain (30 min by default, `AMEESH_DRAIN_SECONDS`) and clean up before
+launchd sends SIGKILL — the same bound as the systemd units'
+`TimeoutStopSec=35min`. `ameesh service install` and `uninstall` therefore
+wait for that stop, as `systemctl restart` does.
+
 On a workstation that runs one process per agent (the model of
 `deploy/systemd/ameesh-runner-agent@.service`), name the agents instead of
 installing the host runner:

@@ -47,8 +47,22 @@ SERVICE_PATH = ("~/.local/share/mise/shims", "~/.local/bin",
                 "/usr/local/sbin", "/usr/local/bin", "/usr/bin", "/bin")
 #: délai minimal entre deux relances (secondes) : le `RestartSec` de systemd
 DEFAULT_THROTTLE_S = 10
-#: une commande launchctl ne bloque pas un tour
+#: une commande launchctl de lecture ou de chargement ne bloque pas un tour
 LAUNCHCTL_TIMEOUT_S = 30.0
+#: borne d'arrêt du processus par launchd (secondes) : après le SIGTERM,
+#: launchd envoie SIGKILL quand `ExitTimeOut` expire ; son défaut de 20 s
+#: tuerait l'exécuteur au milieu d'un drainage. 35 min = drainage (30 min par
+#: défaut) + 5 min de nettoyage, la même borne que `TimeoutStopSec=35min` des
+#: unités systemd.
+EXIT_TIMEOUT_S = 35 * 60
+#: `ameesh notify` n'a pas de tour à drainer : la borne systemd par défaut
+NOTIFY_EXIT_TIMEOUT_S = 90
+#: `bootout` et `unload` attendent la sortie du job (au plus `ExitTimeOut`) :
+#: borner le client plus court tuerait launchctl avant l'arrêt du service.
+LAUNCHCTL_STOP_TIMEOUT_S = EXIT_TIMEOUT_S + 30.0
+#: messages de launchd qui confirment qu'un service n'est pas chargé
+NOT_LOADED_MARKERS = ("could not find service", "no such process",
+                      "service not found", "not loaded")
 
 
 class ServiceError(RuntimeError):
@@ -70,6 +84,8 @@ class Service:
     throttle: int = DEFAULT_THROTTLE_S
     #: label launchd explicite (`ameesh.runner.<agent>`) ; vide = `ameesh.<name>`
     label_name: str = ""
+    #: borne d'arrêt du job (secondes), portée dans le plist (`ExitTimeOut`)
+    exit_timeout: int = EXIT_TIMEOUT_S
 
     @property
     def label(self) -> str:
@@ -149,6 +165,8 @@ def payload(service: Service, ameesh_bin: str,
         # (le `Restart=on-failure` des unités systemd)
         "KeepAlive": {"SuccessfulExit": False},
         "ThrottleInterval": int(service.throttle),
+        # le drainage d'un tour peut dépasser largement le défaut de 20 s
+        "ExitTimeOut": int(service.exit_timeout),
         "ProcessType": "Background",
         "EnvironmentVariables": {
             "PATH": service_path(env),
@@ -189,15 +207,40 @@ def _output(result) -> str:
     return " ".join(text.split())[:300]
 
 
+def _not_loaded(result) -> bool:
+    """launchd confirme-t-il que le service n'est pas chargé ?"""
+    text = _output(result).lower()
+    return any(marker in text for marker in NOT_LOADED_MARKERS)
+
+
 def _bootout(service: Service, run: Callable, env: Mapping[str, str] | None) -> None:
-    """Décharge le service s'il l'est déjà (l'échec est normal s'il ne l'est pas).
+    """Décharge le service s'il est chargé ; ne tolère qu'une absence confirmée.
 
     `bootout` est la forme moderne ; `unload -w` reste le repli des macOS
-    anciens (et le chargement symétrique plus bas).
+    anciens (et le chargement symétrique plus bas). Un échec réel (droits,
+    launchd injoignable, délai dépassé) lève : le plist reste, pour qu'un
+    `status` et une seconde tentative voient encore le job. Le repli ne
+    décharge que **notre** plist : un agent d'un autre label ne doit pas être
+    arrêté avant le refus de suppression.
     """
-    result = _launchctl(run, "bootout", "%s/%s" % (_domain(), service.label))
-    if result.returncode != 0:
-        _launchctl(run, "unload", "-w", plist_path(service, env))
+    path = plist_path(service, env)
+    result = _launchctl(run, "bootout", "%s/%s" % (_domain(), service.label),
+                        timeout=LAUNCHCTL_STOP_TIMEOUT_S)
+    if result.returncode == 0 or _not_loaded(result):
+        return
+    if not os.path.exists(path):
+        raise ServiceError("launchctl bootout %s/%s: %s (no plist to unload)"
+                           % (_domain(), service.label, _output(result)))
+    if not _ours(path, service):
+        raise ServiceError(
+            "%s is not the launchd agent of %s (label mismatch): not unloaded"
+            % (path, service.label))
+    legacy = _launchctl(run, "unload", "-w", path,
+                        timeout=LAUNCHCTL_STOP_TIMEOUT_S)
+    if legacy.returncode != 0 and not _not_loaded(legacy):
+        raise ServiceError(
+            "launchctl bootout %s/%s: %s; launchctl unload %s: %s"
+            % (_domain(), service.label, _output(result), path, _output(legacy)))
 
 
 def _write(service: Service, ameesh_bin: str,
@@ -257,18 +300,21 @@ def uninstall(service: Service, *, run: Callable = subprocess.run,
               env: Mapping[str, str] | None = None) -> bool:
     """Décharge et supprime le plist ; rend False s'il n'était pas installé.
 
-    Un fichier qui n'est pas le nôtre (label différent, plist illisible) n'est
-    jamais supprimé : le service lève, le fichier reste.
+    Un fichier qui n'est pas le nôtre (label différent, plist illisible) est
+    refusé **avant** tout déchargement : le service lève, le fichier reste.
+    Un échec réel de `launchctl` lève aussi et garde le plist : un job encore
+    chargé sans son fichier serait invisible de `status`.
     """
     _require_macos()
     path = plist_path(service, env)
-    _bootout(service, run, env)
-    if not os.path.exists(path):
-        return False
-    if not _ours(path, service):
+    installed = os.path.exists(path)
+    if installed and not _ours(path, service):
         raise ServiceError(
             "%s is not the launchd agent of %s (label mismatch): not removed"
             % (path, service.label))
+    _bootout(service, run, env)
+    if not installed:
+        return False
     os.unlink(path)
     return True
 

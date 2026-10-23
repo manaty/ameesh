@@ -107,7 +107,7 @@ def services(agents: list[str], *, runner: bool = True, notify: bool = True,
         out.append(launchd.Service(
             name="notify", args=("notify", "--interval", "30"),
             description="ameesh notify — alertes poussées au responsable humain",
-            throttle=10))
+            throttle=10, exit_timeout=launchd.NOTIFY_EXIT_TIMEOUT_S))
     return out
 
 

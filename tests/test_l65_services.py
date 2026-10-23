@@ -38,9 +38,11 @@ def _fake_run(codes: dict | None = None):
     """
     codes = codes or {}
     calls: list[list[str]] = []
+    kwargs_seen: list[dict] = []
 
-    def run(argv, **_kwargs):
+    def run(argv, **kwargs):
         calls.append(list(argv))
+        kwargs_seen.append(dict(kwargs))
         if argv and argv[0] == "launchctl" and len(argv) > 1:
             action = argv[1]
             return _result(codes.get(action, 0),
@@ -49,6 +51,7 @@ def _fake_run(codes: dict | None = None):
         return _result(0)
 
     run.calls = calls
+    run.kwargs = kwargs_seen
     return run
 
 
@@ -92,6 +95,24 @@ class ServicePayloadTest(unittest.TestCase):
         self.assertEqual(runner["StandardErrorPath"],
                          os.path.join(self.tmp, "Logs", "runner.err"))
         self.assertEqual(runner["ThrottleInterval"], 10)
+
+    def test_exit_timeout_couvre_le_drainage(self):
+        """B1 de la revue #390 : sans `ExitTimeOut`, launchd tue le runner au
+        bout de 20 s, alors que son drainage dure jusqu'à 30 min."""
+        selected = service_cli.services([], hostname="mac")
+        runner = launchd.payload(selected[0], "/opt/ameesh", self.env)
+        notify = launchd.payload(selected[1], "/opt/ameesh", self.env)
+        self.assertEqual(runner["ExitTimeOut"], 35 * 60)
+        self.assertGreater(runner["ExitTimeOut"], 1800)  # AMEESH_DRAIN_SECONDS
+        self.assertEqual(notify["ExitTimeOut"], launchd.NOTIFY_EXIT_TIMEOUT_S)
+        # le client launchctl attend l'arrêt du job, pas moins que launchd
+        self.assertGreater(launchd.LAUNCHCTL_STOP_TIMEOUT_S,
+                           launchd.EXIT_TIMEOUT_S)
+        for agent in service_cli.services(["coord"], hostname="mac"):
+            if agent.name.startswith("runner"):
+                self.assertEqual(
+                    launchd.payload(agent, "/opt/ameesh", self.env)["ExitTimeOut"],
+                    launchd.EXIT_TIMEOUT_S)
 
     def test_un_executeur_par_agent(self):
         selected = service_cli.services(["coord", "review"], hostname="mac")
@@ -204,6 +225,16 @@ class ServiceInstallTest(unittest.TestCase):
                          ["launchctl", "bootstrap", "gui/%d" % os.getuid()])
         self.assertEqual(run.calls[1][3], self.path)
 
+    def test_bootout_attend_la_borne_de_drainage(self):
+        """B1 de la revue #390 : le client launchctl ne doit pas expirer avant
+        que launchd ait fini d'arrêter le job (au plus `ExitTimeOut`)."""
+        run = _fake_run()
+        self.assertEqual(self._install(run)[0], 0)
+        bootout = next(kw for call, kw in zip(run.calls, run.kwargs)
+                       if call[1] == "bootout")
+        self.assertEqual(bootout["timeout"], launchd.LAUNCHCTL_STOP_TIMEOUT_S)
+        self.assertGreater(bootout["timeout"], launchd.EXIT_TIMEOUT_S)
+
     def test_recharge_un_service_deja_charge(self):
         run = _fake_run()
         self.assertEqual(self._install(run)[0], 0)
@@ -255,14 +286,74 @@ class ServiceInstallTest(unittest.TestCase):
         os.makedirs(os.path.dirname(self.path), exist_ok=True)
         with open(self.path, "wb") as handle:
             plistlib.dump({"Label": "autre.service"}, handle)
+        run = _fake_run()
         err = io.StringIO()
         with mock.patch.object(platform, "SYSTEM", "macos"), \
                 contextlib.redirect_stderr(err):
             code = service_cli.main(["uninstall", "--no-notify"],
-                                    env=self.env, run=_fake_run())
+                                    env=self.env, run=run)
         self.assertEqual(code, 1)
         self.assertIn("label mismatch", err.getvalue())
         self.assertTrue(os.path.isfile(self.path))
+        # B2 de la revue #390 : le refus précède tout déchargement.
+        self.assertEqual(run.calls, [])
+
+    def test_uninstall_garde_le_plist_si_le_dechargement_echoue(self):
+        """B2 de la revue #390 : un bootout réel en échec ne doit pas laisser
+        croire que le service est retiré alors que le job tourne encore."""
+        self._install(_fake_run())
+        run = _fake_run({"bootout": 1,
+                         "bootout:err": "Operation not permitted",
+                         "unload": 1,
+                         "unload:err": "Operation not permitted"})
+        err = io.StringIO()
+        with mock.patch.object(platform, "SYSTEM", "macos"), \
+                contextlib.redirect_stderr(err):
+            code = service_cli.main(["uninstall", "--no-notify"],
+                                    env=self.env, run=run)
+        self.assertEqual(code, 1)
+        self.assertIn("Operation not permitted", err.getvalue())
+        self.assertTrue(os.path.isfile(self.path))
+        self.assertEqual([call[1] for call in run.calls], ["bootout", "unload"])
+
+    def test_uninstall_tolere_une_absence_confirmee(self):
+        self._install(_fake_run())
+        run = _fake_run({
+            "bootout": 1,
+            "bootout:err": 'Could not find service "ameesh.runner" in domain'})
+        out = io.StringIO()
+        with mock.patch.object(platform, "SYSTEM", "macos"), \
+                contextlib.redirect_stdout(out):
+            code = service_cli.main(["uninstall", "--no-notify"],
+                                    env=self.env, run=run)
+        self.assertEqual(code, 0)
+        self.assertIn("removed", out.getvalue())
+        self.assertFalse(os.path.exists(self.path))
+        self.assertEqual([call[1] for call in run.calls], ["bootout"])
+
+    def test_uninstall_replie_unload_si_bootout_inconnu(self):
+        """Le repli des anciens macOS ne vaut que si `bootout` est inconnu."""
+        self._install(_fake_run())
+        run = _fake_run({"bootout": 1,
+                         "bootout:err": "Unrecognized subcommand: bootout",
+                         "unload": 0})
+        out = io.StringIO()
+        with mock.patch.object(platform, "SYSTEM", "macos"), \
+                contextlib.redirect_stdout(out):
+            code = service_cli.main(["uninstall", "--no-notify"],
+                                    env=self.env, run=run)
+        self.assertEqual(code, 0)
+        self.assertFalse(os.path.exists(self.path))
+        self.assertEqual([call[1] for call in run.calls], ["bootout", "unload"])
+
+    def test_install_tolere_un_bootout_non_charge(self):
+        run = _fake_run({
+            "bootout": 1,
+            "bootout:err": 'Could not find service "ameesh.runner" in domain'})
+        code, run = self._install(run)
+        self.assertEqual(code, 0)
+        self.assertTrue(os.path.isfile(self.path))
+        self.assertEqual([call[1] for call in run.calls], ["bootout", "bootstrap"])
 
     def test_status_lit_launchd(self):
         self._install(_fake_run())
