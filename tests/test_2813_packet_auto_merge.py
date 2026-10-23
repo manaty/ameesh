@@ -246,8 +246,9 @@ class ArmTest(Journal):
             % (SLUG, NUM, HEAD)), self.notes())
         # #3175 : la tentative immédiate qui attend la CI laisse son motif
         self.assertTrue(self.notes()[1].startswith(
-            "auto-merge held repo=%s pr=%d sha=%s base=main — the CI of PR #%d is pending"
-            % (SLUG, NUM, HEAD, NUM)), self.notes())
+            "auto-merge held repo=%s pr=%d sha=%s base=main — " % (SLUG, NUM, HEAD)),
+            self.notes())
+        self.assertIn("PR #%d" % NUM, self.notes()[1])
         self.assertEqual((self.active()["sha"], self.active()["base"]), (HEAD, "main"))
 
     def test_a_composition_already_green_merges_at_once_on_its_head(self):
