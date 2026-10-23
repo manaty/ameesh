@@ -223,12 +223,13 @@ class ServiceInstallTest(unittest.TestCase):
         self.assertEqual(stat.S_IMODE(os.stat(self.env[launchd.LOG_DIR_ENV]).st_mode),
                          0o700)
         actions = [call[1] for call in run.calls]
-        self.assertEqual(actions, ["bootout", "bootstrap"])
+        self.assertEqual(actions, ["bootout", "bootstrap", "print"])
         self.assertEqual(run.calls[0],
                          ["launchctl", "bootout", "gui/%d/ameesh.runner" % os.getuid()])
         self.assertEqual(run.calls[1][:3],
                          ["launchctl", "bootstrap", "gui/%d" % os.getuid()])
         self.assertEqual(run.calls[1][3], self.path)
+        self.assertEqual(run.calls[2], ["launchctl", "print", "gui/%d/ameesh.runner" % os.getuid()])
 
     def test_bootout_attend_la_borne_de_drainage(self):
         """B1 de la revue #390 : le client launchctl ne doit pas expirer avant
@@ -245,24 +246,94 @@ class ServiceInstallTest(unittest.TestCase):
         self.assertEqual(self._install(run)[0], 0)
         self.assertEqual(self._install(run)[0], 0)
         self.assertEqual([call[1] for call in run.calls],
-                         ["bootout", "bootstrap", "bootout", "bootstrap"])
+                         ["bootout", "bootstrap", "print",
+                          "bootout", "bootstrap", "print"])
 
-    def test_repli_sur_load_quand_bootstrap_echoue(self):
-        run = _fake_run({"bootstrap": 1, "load": 0})
+    def test_repli_sur_load_quand_bootstrap_inconnu(self):
+        run = _fake_run({"bootstrap": 1,
+                         "bootstrap:err": "Unrecognized subcommand: bootstrap",
+                         "load": 0})
         code, run = self._install(run)
         self.assertEqual(code, 0)
         self.assertIn(["launchctl", "load", "-w", self.path], run.calls)
+        self.assertEqual([call[1] for call in run.calls],
+                         ["bootout", "bootstrap", "load", "print"])
 
-    def test_echec_des_deux_chemins(self):
+    def test_echec_reel_du_bootstrap_ne_tente_pas_load(self):
+        """B4 de la revue #390 : un bootstrap réel en échec (I/O) ne doit pas
+        être masqué par un `load` qui rend 0 après avoir journalisé l'échec."""
+        run = _fake_run({
+            "bootstrap": 1,
+            "bootstrap:err": "Bootstrap failed: 5: Input/output error",
+            "load": 0,
+            "load:err": "Operation not permitted",
+            "print": 113,
+            "print:err": 'Could not find service "ameesh.runner"'})
         err = io.StringIO()
-        with contextlib.redirect_stderr(err):
-            code, run = self._install(_fake_run(
-                {"bootstrap": 1, "load": 1, "bootstrap:err": "Bootstrap failed: 5"}))
+        with mock.patch.object(platform, "SYSTEM", "macos"), \
+                contextlib.redirect_stderr(err):
+            code = service_cli.main(["install", "--no-notify"],
+                                    env=self.env, run=run)
         self.assertEqual(code, 1)
         self.assertIn("Bootstrap failed: 5", err.getvalue())
         # le plist reste écrit : l'utilisateur peut recharger à la main
         self.assertTrue(os.path.isfile(self.path))
-        self.assertIn(["launchctl", "load", "-w", self.path], run.calls)
+        # le repli load n'est pas tenté, encore moins annoncé comme succès
+        self.assertEqual([call[1] for call in run.calls], ["bootout", "bootstrap"])
+
+    def test_echec_du_repli_load(self):
+        run = _fake_run({
+            "bootstrap": 1,
+            "bootstrap:err": "Unrecognized subcommand: bootstrap",
+            "load": 1,
+            "load:err": "Load failed: 1: Operation not permitted",
+            "print": 113,
+            "print:err": 'Could not find service "ameesh.runner"'})
+        err = io.StringIO()
+        with mock.patch.object(platform, "SYSTEM", "macos"), \
+                contextlib.redirect_stderr(err):
+            code = service_cli.main(["install", "--no-notify"],
+                                    env=self.env, run=run)
+        self.assertEqual(code, 1)
+        self.assertIn("not loaded", err.getvalue())
+        self.assertTrue(os.path.isfile(self.path))
+        self.assertEqual([call[1] for call in run.calls],
+                         ["bootout", "bootstrap", "load", "print"])
+
+    def test_repli_load_qui_rend_0_mais_ne_charge_rien_est_refuse(self):
+        """B4 : `launchctl load` rend 0 après un échec journalisé ; `print` dit
+        que le job n'est pas chargé."""
+        run = _fake_run({
+            "bootstrap": 1,
+            "bootstrap:err": "Unrecognized subcommand: bootstrap",
+            "load": 0,
+            "load:err": "Operation not permitted",
+            "print": 113,
+            "print:err": 'Could not find service "ameesh.runner"'})
+        err = io.StringIO()
+        with mock.patch.object(platform, "SYSTEM", "macos"), \
+                contextlib.redirect_stderr(err):
+            code = service_cli.main(["install", "--no-notify"],
+                                    env=self.env, run=run)
+        self.assertEqual(code, 1)
+        self.assertIn("not loaded", err.getvalue())
+        self.assertTrue(os.path.isfile(self.path))
+        self.assertEqual([call[1] for call in run.calls],
+                         ["bootout", "bootstrap", "load", "print"])
+
+    def test_install_confirme_le_chargement_meme_si_bootstrap_rend_0(self):
+        run = _fake_run({"print": 113,
+                         "print:err": 'Could not find service "ameesh.runner"'})
+        err = io.StringIO()
+        with mock.patch.object(platform, "SYSTEM", "macos"), \
+                contextlib.redirect_stderr(err):
+            code = service_cli.main(["install", "--no-notify"],
+                                    env=self.env, run=run)
+        self.assertEqual(code, 1)
+        self.assertIn("not loaded", err.getvalue())
+        self.assertTrue(os.path.isfile(self.path))
+        self.assertEqual([call[1] for call in run.calls],
+                         ["bootout", "bootstrap", "print"])
 
     def test_desinstalle_et_decharge(self):
         run = _fake_run()
@@ -406,7 +477,8 @@ class ServiceInstallTest(unittest.TestCase):
         code, run = self._install(run)
         self.assertEqual(code, 0)
         self.assertTrue(os.path.isfile(self.path))
-        self.assertEqual([call[1] for call in run.calls], ["bootout", "bootstrap"])
+        self.assertEqual([call[1] for call in run.calls],
+                         ["bootout", "bootstrap", "print"])
 
     def test_bootout_113_est_une_absence(self):
         """B3 de la revue #390 : `bootout` récent dit « Boot-out failed: 113:
@@ -443,7 +515,8 @@ class ServiceInstallTest(unittest.TestCase):
         code, run = self._install(run)
         self.assertEqual(code, 0)
         self.assertTrue(os.path.isfile(self.path))
-        self.assertEqual([call[1] for call in run.calls], ["bootout", "bootstrap"])
+        self.assertEqual([call[1] for call in run.calls],
+                         ["bootout", "bootstrap", "print"])
 
     def test_status_lit_launchd(self):
         self._install(_fake_run())

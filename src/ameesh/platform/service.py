@@ -70,10 +70,10 @@ NOT_LOADED_MARKERS = ("could not find service", "could not find specified servic
                       "no such process", "service not found", "not loaded")
 #: code de sortie de launchd pour un service absent (`bootout`/`print`)
 NOT_LOADED_CODES = (113,)
-#: messages d'un `bootout` inconnu des anciens macOS : seul cas où le repli
-#: `unload -w` est légitime. Un autre échec (droits, I/O) est réel : le repli
-#: ne doit pas le masquer.
-LEGACY_BOOTOUT_MARKERS = ("unrecognized subcommand", "unknown subcommand",
+#: messages d'une commande inconnue des anciens launchctl (`bootout`,
+#: `bootstrap`) : seul cas où le repli `unload -w`/`load -w` est légitime. Un
+#: autre échec (droits, I/O) est réel : le repli ne doit pas le masquer.
+LEGACY_COMMAND_MARKERS = ("unrecognized subcommand", "unknown subcommand",
                           "invalid subcommand")
 
 
@@ -232,13 +232,13 @@ def _not_loaded(result) -> bool:
     return any(marker in text for marker in NOT_LOADED_MARKERS)
 
 
-def _bootout_unknown(result) -> bool:
-    """`bootout` est-il simplement inconnu de ce launchctl (ancien macOS) ?"""
+def _command_unknown(result) -> bool:
+    """La sous-commande est-elle inconnue de ce launchctl (ancien macOS) ?"""
     text = _output(result).lower()
-    return any(marker in text for marker in LEGACY_BOOTOUT_MARKERS)
+    return any(marker in text for marker in LEGACY_COMMAND_MARKERS)
 
 
-def _stop_state(service: Service, run: Callable) -> tuple[bool, object]:
+def _job_state(service: Service, run: Callable) -> tuple[bool, object]:
     """Relit l'état réel du job : `(chargé, résultat de print)`."""
     result = _launchctl(run, "print", "%s/%s" % (_domain(), service.label))
     return result.returncode == 0, result
@@ -263,7 +263,7 @@ def _bootout(service: Service, run: Callable, env: Mapping[str, str] | None) -> 
                         timeout=LAUNCHCTL_STOP_TIMEOUT_S)
     if result.returncode == 0 or _not_loaded(result):
         return
-    if not _bootout_unknown(result):
+    if not _command_unknown(result):
         raise ServiceError("launchctl bootout %s/%s: %s"
                            % (_domain(), service.label, _output(result)))
     if not os.path.exists(path):
@@ -277,7 +277,7 @@ def _bootout(service: Service, run: Callable, env: Mapping[str, str] | None) -> 
                         timeout=LAUNCHCTL_STOP_TIMEOUT_S)
     if _not_loaded(legacy):
         return
-    loaded, state = _stop_state(service, run)
+    loaded, state = _job_state(service, run)
     if loaded:
         raise ServiceError(
             "launchctl unload %s: service still loaded (%s; bootout: %s)"
@@ -317,19 +317,30 @@ def install(service: Service, ameesh_bin: str, *,
     """Écrit le plist et charge le service ; rend son chemin.
 
     Idempotent : un service déjà chargé est déchargé puis rechargé, pour que
-    le plist modifié soit celui que launchd exécute. Si `bootstrap` échoue
-    (macOS ancien, session sans domaine `gui`), `load -w` est essayé ; les
-    deux échecs sont une erreur, le plist restant écrit.
+    le plist modifié soit celui que launchd exécute. Un échec réel de
+    `bootstrap` lève : le repli `load -w` n'est tenté que si `bootstrap` est
+    inconnu (ancien macOS). Comme `launchctl load` peut rendre 0 après avoir
+    journalisé un échec (source Apple, `load_and_unload_cmd`), le chargement
+    est relu par `launchctl print` avant d'annoncer le succès (B4, revue #390).
+    Le plist reste écrit en cas d'échec, pour une nouvelle tentative.
     """
     _require_macos()
     path = _write(service, ameesh_bin, env)
     _bootout(service, run, env)
     result = _launchctl(run, "bootstrap", _domain(), path)
+    legacy = None
     if result.returncode != 0:
+        if not _command_unknown(result):
+            raise ServiceError("launchctl bootstrap %s %s: %s"
+                               % (_domain(), path, _output(result)))
         legacy = _launchctl(run, "load", "-w", path)
-        if legacy.returncode != 0:
-            raise ServiceError(
-                "launchctl bootstrap %s %s: %s" % (_domain(), path, _output(result)))
+    loaded, state = _job_state(service, run)
+    if not loaded:
+        detail = _output(state) or (legacy is not None and _output(legacy)) \
+            or _output(result)
+        raise ServiceError(
+            "launchctl bootstrap %s %s: service not loaded after install (%s)"
+            % (_domain(), path, detail))
     return path
 
 
