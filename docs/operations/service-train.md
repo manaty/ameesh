@@ -61,6 +61,18 @@ reprendre le bail l'un de l'autre (le SQL autorise le même propriétaire à
 prendre un nouvel epoch). Après un arrêt brutal, le successeur attend donc
 l'expiration du TTL ; un arrêt propre le libère tout de suite.
 
+Les réservations de cible (`<projet>:<cible>`, propriétaire `train:<exécuteur>`)
+ne suivent pas le bail de service : un exécuteur arrêté laisse les siennes
+posées. Le nouveau porteur du bail les adopte (#3142) au lieu d'attendre leur
+TTL de 30 min : dans une même transaction, son bail de service vivant est
+vérifié, la réservation passe à son propriétaire `train:` à l'epoch suivant, et
+le ticket du plan en vol est réécrit. L'ancien epoch est ensuite refusé partout
+(sauvegarde du train, renouvellement, publication, revendication de
+promotion, libération). Le plan reprend où il était : une publication
+incertaine est republiée à l'identique (idempotente), une promotion incertaine
+passe par la réconciliation. Une réservation ordinaire (fusion d'un lot seul)
+n'est jamais adoptée, ni un ticket dont l'epoch ne correspond plus à la ligne.
+
 ## Modes
 
 ### `shadow` — le plan calculé, sans effet
