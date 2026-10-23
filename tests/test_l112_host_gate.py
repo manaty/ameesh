@@ -27,7 +27,8 @@ import time
 import unittest
 from unittest import mock
 
-from ameesh import canon, config as config_mod, db as db_mod, exploitation, notify, registry
+from ameesh import (canon, config as config_mod, db as db_mod, exploitation, notify,
+                    platform, registry)
 from ameesh.mediated_executor import availability as D
 from ameesh.mediated_executor import gate as P
 from ameesh.mediated_executor import host_gate as H
@@ -120,6 +121,8 @@ class FileGateTest(unittest.TestCase):
         st = g.wait_change(5.0)
         return st, time.monotonic() - debut
 
+    @unittest.skipUnless(platform.is_linux(),
+                         "L112 : inotify est Linux ; macOS sonde (test suivant)")
     def test_changement_vu_par_inotify(self):
         st, duree = self._changement(poll=30.0)  # sans inotify, rien avant 30 s
         self.assertEqual((st.state, st.seq), ("draining", 2))
