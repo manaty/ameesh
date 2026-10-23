@@ -403,6 +403,22 @@ class AlertesTest(PgTestCase):
                          [("auditeur", ALICE)])
         self.assertEqual(len(self.gap_mails()), 1)
 
+    def test_un_passage_only_ci_n_ecrit_pas_de_battement(self):
+        # B mesh-design : les minuteries --only d'EP5 ne livrent aucune alerte ;
+        # un battement y serait un faux « notificateur vivant » (classe #3006).
+        ncfg = notify.parse_config({"routes": {ALICE: ["app"]}})
+        notifier = notify.Notifier(
+            self.cfg, ncfg, notify.empty_state(), sender=notify.DrySender(),
+            log=lambda text: None)
+        self.db.execute("DELETE FROM notify_liveness")
+        notifier.run_pass(self.db, current=[], only="ci")
+        self.assertEqual(storage.of(self.db).notify_liveness.latest(), [])
+        notifier.run_pass(self.db, current=[], only="alerts")
+        self.assertTrue(storage.of(self.db).notify_liveness.latest())
+        self.db.execute("DELETE FROM notify_liveness")
+        notifier.run_pass(self.db, current=[])
+        self.assertTrue(storage.of(self.db).notify_liveness.latest())
+
     def test_la_reclamation_de_brief_est_partagee_et_relachee(self):
         liveness = storage.of(self.db).notify_liveness
         first = liveness.claim_brief("orch", ALICE, since=1000.0, now=1000.0)
