@@ -723,9 +723,10 @@ class Leases(interface.Leases):
         l'hôte qui gagne une relève CROISÉE (l'ancien détenteur est un autre
         hôte). La même instruction oublie la session de l'ancien hôte
         (`session_id`, `session_work_item`, `session_account`, `session_reset_at`),
-        met le brief EN TÊTE de `pending_prompt` et passe l'agent `queued` :
-        aucun état « bail pris sans briefing » n'est visible, et l'ancien
-        détenteur reste fencé par l'epoch. Même hôte (redémarrage de
+        écrit le brief dans `election_brief` (résumé de la session neuve),
+        met une consigne courte EN TÊTE de `pending_prompt` et passe l'agent
+        `queued` : aucun état « bail pris sans briefing » n'est visible, et
+        l'ancien détenteur reste fencé par l'epoch. Même hôte (redémarrage de
         l'exécuteur) ou agent `hote` : le brief est ignoré, la session est
         gardée. Rend en plus `previous_host`, `previous_owner`,
         `previous_epoch`, `previous_session` et `elected` (vrai seulement si

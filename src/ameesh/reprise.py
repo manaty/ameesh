@@ -922,14 +922,12 @@ def election_brief(cfg: Config, db, row: dict | None, *, previous_host: str,
                if previous_session else "it leaves no session here")
     election = [
         "## Election",
-        "- you have just been elected on host %s; the lease epoch is %s."
-        % (host, row.get("lease_epoch") or "?"),
+        "- you have just been elected on host %s." % host,
         "- previous holder: host %s, %s%s. No session is transferred: %s and is "
         "never resumed or written by this host." % (previous_host, owner, epoch, session),
         "- your state is the mesh database, the canon and GitHub, not a local "
         "worktree. Check it before acting: open lots, mail, pending decisions, "
         "alerts and the GitHub observation below.",
-        "",
     ]
     consigne = consigne or (
         "You have just been elected: this briefing is the persisted state of the "
@@ -940,8 +938,6 @@ def election_brief(cfg: Config, db, row: dict | None, *, previous_host: str,
                           % (host, owner, epoch, previous_host)),
         consigne=consigne, election=election,
         extra_sections=_election_state_sections(cfg, db, row, now=now))
-
-
 
 
 # --------------------------------------------------------------------------
