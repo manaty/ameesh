@@ -82,6 +82,16 @@ $human ──frappes──► lanceur ──pty maître──► harnais interac
   `Stop` : marqueur absent, illisible ou différent, rien n'est écrit et la
   ligne reste en attente pour le tour suivant (échec fermé). Le lanceur
   invalide au démarrage le marqueur d'une session précédente.
+* **Garde de brouillon** : une frappe de `$human` qui ne se termine pas par
+  `Entrée` (`\r`/`\n`) ni par `Ctrl-C` (`\x03`) laisse un brouillon ouvert ;
+  la veille ne sert alors rien, même au-delà des 15 min, pour ne jamais coller
+  sa ligne au début d'un message humain non validé. `Entrée` soumet, `Ctrl-C`
+  abandonne ; la garde est volontairement conservatrice (une flèche ou un
+  effacement ne la referment pas).
+* **Fermeture** : si le proxy du terminal rend la main alors que le harnais
+  vit encore (SIGHUP/SIGTERM à la fermeture du terminal, erreur du pty), le
+  lanceur ferme le maître du pty et tue le groupe du harnais avant d'attendre :
+  sans cela `proc.wait()` ne rend jamais et la session reste ancrée.
 * **Recul** : la veille ne s'arme que si l'entrée et la sortie sont un
   terminal, et seulement dans le lanceur (jamais dans le client L79). Sans
   terminal, ou avec `--no-veille`, le lancement est exactement celui
@@ -102,6 +112,10 @@ $human ──frappes──► lanceur ──pty maître──► harnais interac
   concurrent. La ligne part alors au tout début du tour, sans autorité ; c'est
   le seul écart que la garde ne ferme pas. Le risque de dialogue de permission,
   lui, est fermé : un dialogue n'existe qu'au milieu d'un tour, marqué `busy` ;
+* **N1 (non bloquant)** : la ligne de veille part en un seul `write` `texte +
+  \\r` ; dans un vrai terminal Claude Code, un collage peut transformer le `\\r`
+  en saut de ligne. À vérifier en TUI réelle ; sinon écrire le `\\r` séparément,
+  après un court délai.
 * pas de service quand la session est fermée (le propriétaire reste seul juge
   de ce qu'il garde ouvert) ;
 * le lanceur porte du code de terminal (pty, redimensionnement, nettoyage) :

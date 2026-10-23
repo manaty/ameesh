@@ -856,6 +856,13 @@ def write_phase(cfg: Config, name: str, phase: str) -> bool:
         return False
 
 
+def _draft_submitted(data: bytes) -> bool:
+    """La dernière frappe soumet-elle le brouillon (`\\r`/`\\n`) ou l'abandonne-t-elle
+    (`Ctrl-C`, `\\x03`) ? Toute autre frappe laisse un brouillon ouvert, que la
+    veille ne doit jamais recouvrir (échec fermé)."""
+    return bool(data) and data[-1:] in (b"\r", b"\n", b"\x03")
+
+
 class Veille:
     """L480 : la veille d'une session de chat.
 
@@ -892,6 +899,7 @@ class Veille:
         self._baseline = False
         self._text: str | None = None
         self._text_at: float | None = None
+        self._draft_open = False
         self._last_human = 0.0
         self._last_served: float | None = None
         self._stop = threading.Event()
@@ -916,9 +924,17 @@ class Veille:
                 self._text, self._text_at = text, self.now()
             return text
 
-    def note_human(self, now: float | None = None) -> None:
-        """`$human` vient de taper : on ne lui écrit pas par-dessus."""
+    def note_human(self, now: float | None = None, data: bytes | None = None) -> None:
+        """`$human` vient de taper : on ne lui écrit pas par-dessus.
+
+        `data` sont les octets lus sur l'entrée du terminal. Un brouillon
+        reste ouvert tant que la dernière frappe ne le soumet pas (`\\r`/`\\n`)
+        ni ne l'abandonne (`Ctrl-C`, `\\x03`) : la veille ne sert alors rien,
+        même au-delà de `max_defer`, pour ne jamais coller sa ligne au début
+        d'un message humain non validé."""
         self._last_human = self.now() if now is None else float(now)
+        if data:
+            self._draft_open = not _draft_submitted(data)
 
     def due(self, now: float | None = None) -> str | None:
         """La ligne à servir maintenant, ou None (rien de nouveau, frappe
@@ -929,6 +945,10 @@ class Veille:
         with self._lock:
             text = self._text
             if not text:
+                return None
+            # brouillon humain ouvert : on ne l'écrase pas, même au-delà de
+            # `max_defer` ; il se ferme sur Entrée ou Ctrl-C
+            if self._draft_open:
                 return None
             age = now - (self._text_at if self._text_at is not None else now)
             if age < self.max_defer:
@@ -1112,7 +1132,7 @@ def serve_pty(proc, master, *, veille=None, stdin_fd=None, stdout_fd=None,
                         except OSError:
                             break
                         if veille is not None:
-                            veille.note_human(now)
+                            veille.note_human(now, data)
                 if master in ready:
                     try:
                         data = os.read(master, 65536)
@@ -1168,6 +1188,24 @@ def _kill_group(proc) -> None:
         proc.wait(timeout=5)
     except subprocess.TimeoutExpired:
         pass
+
+
+def _finish_pty(proc, master):
+    """Le proxy a rendu la main alors que le harnais vit encore (terminal
+    fermé sur SIGHUP/SIGTERM, erreur du pty) : fermer le maître puis tuer son
+    groupe avant d'attendre, sinon `proc.wait()` bloque pour toujours — le
+    harnais est dans sa propre session, sur un pty dont le maître resterait
+    ouvert. Rend le maître à fermer (None s'il a été fermé ici)."""
+    if proc.poll() is not None:
+        return master
+    if master is not None:
+        try:
+            os.close(master)
+        except OSError:
+            pass
+        master = None
+    _kill_group(proc)
+    return master
 
 
 # --------------------------------------------------------------------------
@@ -1360,6 +1398,10 @@ def run(cfg: Config, args, *, chain=None, environ_of=None, popen=None) -> int:
             if veille is not None:
                 veille.start()
                 serve_pty(proc, master, veille=veille)
+                # le proxy a rendu la main : si le harnais vit encore (terminal
+                # fermé, erreur du pty), fermer le maître et tuer son groupe
+                # avant d'attendre — sinon ce wait ne rend jamais
+                master = _finish_pty(proc, master)
                 code = proc.wait()
             else:
                 code = proc.wait()

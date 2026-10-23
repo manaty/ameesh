@@ -216,6 +216,44 @@ class VeillePhaseGuardTest(unittest.TestCase):
         self.assertEqual(len(calls), 3)
 
 
+class VeilleDraftGuardTest(unittest.TestCase):
+    """B2 : un brouillon humain ouvert ne est jamais recouvert par la veille."""
+
+    def setUp(self):
+        self.clock = _Clock()
+        self.veille = chat.Veille(object(), "human:h", "chat-h", now=self.clock,
+                                  log=lambda text: None,
+                                  phase=lambda: chat.PHASE_STOP)
+        self.veille.observe([], [])
+        self.clock.t = 1000.0
+        self.veille.observe([_decision(1)], [])
+        self.clock.t += chat.VEILLE_IDLE_S + 0.1
+
+    def test_brouillon_ouvert_ne_sert_pas_meme_apres_max_defer(self):
+        self.veille.note_human(self.clock.t, "réponds a à la 116".encode("utf-8"))
+        self.clock.t += chat.VEILLE_MAX_DEFER_S + 10.0
+        self.assertIsNone(self.veille.due())
+        self.assertIsNotNone(self.veille.pending_text())   # la ligne reste
+
+    def test_entree_ferme_le_brouillon(self):
+        self.veille.note_human(self.clock.t, "réponds a à la 116".encode("utf-8"))
+        self.veille.note_human(self.clock.t, b"\r")
+        self.clock.t += chat.VEILLE_IDLE_S + 0.1
+        self.assertIn("1 nouvelle décision", self.veille.due())
+
+    def test_ctrl_c_abandonne_le_brouillon(self):
+        self.veille.note_human(self.clock.t, b"brouillon")
+        self.veille.note_human(self.clock.t, b"\x03")
+        self.clock.t += chat.VEILLE_IDLE_S + 0.1
+        self.assertIn("1 nouvelle décision", self.veille.due())
+
+    def test_une_frappe_apres_entree_rouvre_un_brouillon(self):
+        self.veille.note_human(self.clock.t, b"\r")
+        self.veille.note_human(self.clock.t, b"a")
+        self.clock.t += chat.VEILLE_MAX_DEFER_S + 10.0
+        self.assertIsNone(self.veille.due())
+
+
 class PhaseFileTest(unittest.TestCase):
     """Le marqueur d'état : écrit et relu, absent ou illisible = fermé."""
 
@@ -347,9 +385,11 @@ class _FakeVeille:
     def __init__(self):
         self.text = None
         self.notes = []
+        self.inputs = []
 
-    def note_human(self, now=None):
+    def note_human(self, now=None, data=None):
         self.notes.append(now)
+        self.inputs.append(data)
 
     def due(self, now=None):
         text, self.text = self.text, None
@@ -402,6 +442,7 @@ class ServePtyTest(unittest.TestCase):
             os.write(in_w, b"bonjour\n")
             self.assertIn(b"ECHO:bonjour", self._read_until(out_r, b"ECHO:bonjour"))
             self.assertTrue(veille.notes)                 # la frappe est notée
+            self.assertIn(b"bonjour\n", veille.inputs)    # avec son contenu (garde B2)
             veille.text = "[veille ameesh] 1 nouvelle décision"
             seen = self._read_until(out_r, b"ECHO:[veille ameesh]")
             self.assertIn(b"ECHO:[veille ameesh] 1 nouvelle d", seen)
@@ -443,6 +484,49 @@ class ServePtyTest(unittest.TestCase):
                     os.close(fd)
                 except OSError:
                     pass
+
+
+class PtyExitTest(unittest.TestCase):
+    """B1 : à la sortie du proxy (SIGHUP/SIGTERM), un harnais encore vivant
+    ne doit pas faire bloquer le wait du lanceur."""
+
+    def test_harnais_vivant_est_tue_apres_la_sortie_du_proxy(self):
+        master, slave = pty.openpty()
+        proc = subprocess.Popen(["sh", "-c", "trap '' HUP TERM; sleep 30"],
+                                stdin=slave, stdout=slave, stderr=slave,
+                                start_new_session=True)
+        os.close(slave)
+        try:
+            self.assertIsNone(proc.poll())
+            started = time.monotonic()
+            remaining = chat._finish_pty(proc, master)
+            self.assertIsNone(remaining)                 # le maître a été fermé
+            self.assertLess(time.monotonic() - started, 10.0)
+            with self.assertRaises(OSError):
+                os.write(master, b"x")                   # plus de maître ouvert
+            self.assertIsNotNone(proc.wait(timeout=1))
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait(timeout=5)
+            try:
+                os.close(master)
+            except OSError:
+                pass
+
+    def test_harnais_deja_sorti_laisse_le_maitre_au_final(self):
+        master, slave = pty.openpty()
+        proc = subprocess.Popen([sys.executable, "-c", "pass"], stdin=slave,
+                                stdout=slave, stderr=slave, start_new_session=True)
+        os.close(slave)
+        try:
+            self.assertEqual(proc.wait(timeout=5), 0)
+            self.assertIs(chat._finish_pty(proc, master), master)
+        finally:
+            try:
+                os.close(master)
+            except OSError:
+                pass
 
 
 class VeilleDbTest(PgTestCase):
