@@ -405,7 +405,8 @@ class Leases(Domain):
 
     @abc.abstractmethod
     def renew(self, name: str, owner: str, epoch: int, ttl_seconds: float) -> float | None:
-        """Prolonge le bail ; rend la nouvelle échéance, None si on ne le détient plus."""
+        """Prolonge le bail sans raccourcir son échéance ; rend la nouvelle
+        échéance, None si on ne le détient plus."""
 
     @abc.abstractmethod
     def release(self, name: str, owner: str, epoch: int) -> bool:
@@ -1742,6 +1743,40 @@ class WorkItems(Domain):
         revision=0 creates it. Every write locks and then rechecks the lease
         against wall time, and compares the previous document revision.
         A stale holder cannot overwrite a newer train. No remote API grant.
+        """
+
+    @abc.abstractmethod
+    def train_abandon(self, key: str, plan_id: str, document: dict, *, revision: int,
+                      owner: str, epoch: int) -> dict | None:
+        """#3138: terminal write of one exact never-fired train plan.
+
+        Same lease/epoch and revision checks as `train_save`, plus in the same
+        transaction: the persisted plan id is still `plan_id`, its phase is not
+        terminal or `promoting`, and no active/promoting/landed fire receipt
+        exists for it. A concurrent fire grant is serialized on the target
+        lease, so a plan cannot be abandoned between the grant's check and its
+        insertion. Returns the new document, None on any mismatch.
+        """
+
+    @abc.abstractmethod
+    def train_adopt(self, key: str, owner: str, *, revision: int,
+                    previous: tuple | None, service: tuple, ttl_s: float) -> dict | None:
+        """#3142: the train service's current holder takes over the target
+        reservation another `train:*` owner left behind.
+
+        In one transaction: ``service`` (key, owner, epoch) must be the live
+        service lease; a key bound to a role
+        (``train-service:<role>:<epoch>``) also requires that role's live
+        lease at that exact epoch, so an old election's still-live service
+        key cannot adopt the reservation back from the new holder; the target
+        row must be held by another `train:*` owner (at ``previous``
+        (owner, epoch) when given, expired or not); the train document must
+        still be at ``revision``. The row passes to ``owner`` at the next
+        epoch, so every write of the old epoch is refused afterwards. A
+        reservation ticket of the document naming the held (owner, epoch) is
+        rewritten to the new ones; with ``previous``, it must exist.
+        Never takes an ordinary (non-`train:*`) reservation. Returns
+        {epoch, previous_owner, previous_epoch}, or None.
         """
 
     @abc.abstractmethod
@@ -3606,7 +3641,13 @@ class HostLifecycle(Domain):
     @abc.abstractmethod
     def drain(self, host: str, *, actor: str, duration: int | None = None,
               critical: Sequence[str] = ()) -> dict:
-        """Close claims/enable atomically and retain agents' original host."""
+        """Close claims/enable atomically and retain agents' original host.
+
+        #3029: an elected role holding its lease on this host is returned in
+        the same transaction, with its epoch bumped, so another candidate can
+        claim at once instead of waiting for the TTL. It stays out of the
+        L232e handoff journal (there is no local work to publish).
+        """
 
     @abc.abstractmethod
     def undrain(self, host: str, *, actor: str) -> dict | None:

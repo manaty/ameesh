@@ -1683,6 +1683,49 @@ def _not_ready(db, row: dict, status, out: dict, why: str, *, gh, slug: str,
     return out
 
 
+def _queue_landing(cfg, db, row: dict, fire: dict, freeze: dict, status: dict, *,
+                   repo: str | None, project, target: str, path: str) -> bool:
+    """#3080: only the queue's clean two-parent landing preserves the fire.
+
+    Recompute its tree without checking out any branch. Remote objects and
+    the target are fetched into the radar clone; an unreadable proof raises
+    QueueError, so a transient read never withdraws an otherwise valid fire.
+    Conflict resolutions or extra edits require a new freeze and review.
+    """
+    if path != "queue" or not repo or getattr(project, "land", "pr") != "pr" \
+            or status.get("base") != land._branch_of(target):
+        return False
+    entry = next((r for r in storage.of(db).work.queue()
+                  if int(r["work_item_id"]) == int(row["id"])), None)
+    if not entry or entry.get("state") != "landing" \
+            or entry.get("target") != target \
+            or entry.get("source") != merge_queue.source_of(repo) \
+            or entry.get("frozen_id") != freeze.get("id") \
+            or not same_commit(entry.get("frozen_sha"), fire.get("sha"), repo) \
+            or not same_commit(entry.get("landing_sha"), status.get("head"), repo):
+        return False
+    from . import radar, resolutions
+    name = project.name if project is not None else os.path.basename(repo.rstrip("/"))
+    clone = resolutions.Replayer(repo, radar.clone_dir(cfg, name), target=target)
+    tips, where = merge_queue.fetch_fresh(repo, [row["branch"], target], clone, base=target)
+    head = merge_queue.pinned(where, status.get("head"))
+    frozen = merge_queue.pinned(where, fire.get("sha"))
+    if not head or not frozen or tips.get(row["branch"]) != head or not tips.get(target):
+        return False
+    parents = plan_git._out(where, "show", "-s", "--format=%P", head)
+    if parents is None:
+        raise merge_queue.QueueError("cannot read the queue landing's parents")
+    if parents.split() != [tips[target], frozen]:
+        return False
+    merged = resolutions._run(where, "merge-tree", "--write-tree", tips[target], frozen)
+    if merged.returncode not in (0, 1):
+        raise merge_queue.QueueError("cannot prove the queue landing's clean merge tree")
+    tree = plan_git._out(where, "show", "-s", "--format=%T", head)
+    if tree is None:
+        raise merge_queue.QueueError("cannot read the queue landing's tree")
+    return merged.returncode == 0 and resolutions._text(merged).strip() == tree
+
+
 def _act(cfg, db, row: dict, marks: list, *, gh, dry_run: bool, repo: str | None,
          cache: dict, handle=None) -> dict:
     lot = int(row["id"])
@@ -1754,17 +1797,23 @@ def _act(cfg, db, row: dict, marks: list, *, gh, dry_run: bool, repo: str | None
                            % (_norm((freeze or {}).get("sha"))[:12] or "—",
                               _norm(fire.get("sha"))[:12]),
                            status=status, gh=gh, slug=slug, dry_run=dry_run, handle=handle)
-    if status is not None and status.get("head") \
-            and not same_commit(status.get("head"), fire.get("sha"), work_repo):
-        return _invalidate(db, row, marks, fire,
-                           "the PR head moved to %s, the fire covers %s"
-                           % (status["head"][:12], _norm(fire.get("sha"))[:12]),
-                           status=status, gh=gh, slug=slug, dry_run=dry_run, handle=handle)
-
     info = _repo_info(slug, gh=gh, cache=cache)
     target = _target(row, project, work_repo, info)
     path, landing_why = landing_path(cfg, db, project, work_repo, slug)
     out["landing"] = path
+    if status is not None and status.get("head") \
+            and not same_commit(status.get("head"), fire.get("sha"), work_repo):
+        try:
+            landing = _queue_landing(cfg, db, row, fire, freeze, status, repo=work_repo,
+                                     project=project, target=target, path=path)
+        except merge_queue.QueueError as exc:
+            return _not_ready(db, row, status, out, str(exc), gh=gh, slug=slug,
+                              dry_run=dry_run, handle=handle)
+        if not landing:
+            return _invalidate(db, row, marks, fire,
+                               "the PR head moved to %s, the fire covers %s"
+                               % (status["head"][:12], _norm(fire.get("sha"))[:12]),
+                               status=status, gh=gh, slug=slug, dry_run=dry_run, handle=handle)
 
     # #2333 (canon §11 bis) : aucune fusion de lot directe hors paquet, même
     # pour un feu donné avant la garde ou avec une auto-fusion déjà armée. La

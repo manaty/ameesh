@@ -140,9 +140,10 @@ class RepoCandidatesTest(unittest.TestCase):
         from ameesh import lot_measures as mesures
         with mock.patch.object(
                 mesures, "lot_diff_range",
-                side_effect=mesures.UnprovenLotDiff("gel hors fusion")), \
+                side_effect=mesures.UnprovenLotDiff("gel hors fusion")) as lecture, \
                 mock.patch.object(mesures, "diff_range") as repli:
             out, of_lot = self._class()
+        lecture.assert_called_once()
         self.assertEqual(out.get("doubt"), True)
         self.assertEqual(out.get("class"), "sensitive")
         self.assertFalse(of_lot.called)

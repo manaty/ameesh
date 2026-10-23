@@ -227,7 +227,10 @@ def renew(db: Db, name: str, owner: str, epoch: int, ttl_seconds: float) -> floa
 
     Verrou pris d'abord, échéance recontrôlée avec `clock_timestamp()` dans
     l'écriture : un renouvellement qui a attendu le verrou au-delà de
-    l'expiration est refusé (grille codex3).
+    l'expiration est refusé (grille codex3). Le renouvellement ne raccourcit
+    jamais l'échéance : l'écriture garde le plus tardif de l'échéance tenue et
+    de la nouvelle (`GREATEST`, sous le verrou de ligne) — un renouvellement
+    concurrent ne peut pas être écrasé par une lecture antérieure (#3115).
     """
     from .agent_names import resolve as resolve_agent_name
     name = resolve_agent_name(name, db=db, operation="registry.renew")

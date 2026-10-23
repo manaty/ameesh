@@ -20,7 +20,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from urllib.parse import urlencode
 
-from . import canon, mail, plan_github, storage
+from . import canon, mail, plan_github, role_run, storage
 from .config import NAME_RE
 from .fil import UnreadableBody, unreadable_reason
 
@@ -216,12 +216,14 @@ def collect_batch(api, sub, since, now, scan):
     the pass; the cursor is not committed there. A page that still holds a
     deferred row keeps its keys live too, even when it is accepted with an
     anchor: a settled row from a later page can recede into it once those keys
-    catch up (B11). Before ending the stream or advancing ``since``, every page
-    from the first page that held a deferred row through the last page read is
-    re-read last-to-first: a settled row has a final key, so it cannot move
-    forward, but lagging keys catching up ahead of it can push it back into an
-    earlier page. Only a surely indexed row past U, or the end of the list,
-    ends the stream.
+    catch up (B11). Once any page held a deferred row, every page from page 1
+    through the last page read is re-read last-to-first before ending the
+    stream or advancing ``since``: a settled row has a final key, so it cannot
+    move forward, but lagging keys catching up ahead of it can push it back
+    into an earlier page. The floor is page 1, not the first live page: a row
+    of a page read clean can be edited after its last read and exit, pushing a
+    settled row below that first live page (#3096). Only a surely indexed row
+    past U, or the end of the list, ends the stream.
     """
     lag = getattr(sub, "index_lag", INDEX_LAG)
     if scan is not None:
@@ -238,13 +240,23 @@ def collect_batch(api, sub, since, now, scan):
                 state.pop(key, None)
         if "recheck_from" not in state:
             # Checkpoint written before B11: the old list only named skipped
-            # pages. Migrate it to the contiguous range, or nothing was to be
+            # pages. Migrate it to the range from page 1, or nothing was to be
             # rechecked.
             old_pages = [int(page) for page in state.pop("recheck_pages", []) or []]
             if old_pages:
-                state["recheck_from"] = min(old_pages)
+                state["recheck_from"] = 1
                 state["recheck_to"] = max([int(state.get("page", 1)) - 1]
                                           + old_pages)
+        # #3096: an already scheduled recheck must also reach page 1.
+        if state.get("recheck_from") is not None:
+            state["recheck_from"] = 1
+        pending = state.get("recheck")
+        if pending:
+            if "pages" in pending:
+                pending["to"] = max([int(state.get("page", 1))]
+                                    + [int(page) for page in pending.pop("pages")])
+                pending["index"] = 0
+            pending["from"] = 1
     else:
         state = dict(since=since, window_since=since, until=now,
                      settled=now - lag, kind="issue", page=1)
@@ -293,11 +305,14 @@ def collect_batch(api, sub, since, now, scan):
         The current page, the previous-page anchor read and the one-page
         fallback are all reads of the window: a row edited since the page was
         first read is deferred there now, and a settled row can later recede
-        into that page. Extend the recheck floor to it.
+        into that page. #3096: the recheck then starts at page 1. A page read
+        clean can still become live after its last read (an edit caught up
+        before the next page), and when the anchor chain is broken (a skipped
+        page or an empty snapshot) nothing measures that shift: a settled row
+        can recede below any later floor.
         """
         if any(not inside(row) for row in rows):
-            first = state.get("recheck_from")
-            state["recheck_from"] = page if first is None else min(first, page)
+            state["recheck_from"] = 1
             state["recheck_to"] = max(state.get("recheck_to") or page, page)
 
     def anchor_position(previous, snapshot):
@@ -333,7 +348,7 @@ def collect_batch(api, sub, since, now, scan):
         # #2955 B10/B11: a page with deferred rows has live keys, so a settled
         # row from a later page can recede into it when those keys catch up
         # (whether the page was skipped or accepted with an anchor). Re-read
-        # every page from the first such page through the last one read before
+        # every page from page 1 (#3096) through the last one read before
         # ending the stream or advancing `since`: the row cannot move forward
         # (its key is final) and the durable digest makes a duplicate harmless.
         # Descending order keeps the recheck safe while other keys catch up: a
@@ -386,9 +401,9 @@ def collect_batch(api, sub, since, now, scan):
         full = len(rows) == PAGE_SIZE
         settled_rows = [row for row in rows if inside(row)]
         # #2955 B11: any page holding a deferred row has live keys. A settled
-        # row from a later page can recede into it (or into a page between it
-        # and the reader), so the recheck starts at the first such page and
-        # covers every page up to the last one read.
+        # row from a later page can recede into it (or, after an edit, into an
+        # earlier page), so the recheck covers every page from page 1 up to
+        # the last one read (#3096).
         note_live(rows, state["page"])
         state["recheck_to"] = state["page"]
 
@@ -684,7 +699,7 @@ class Watcher:
 
     def tick(self, db, now):
         settings = plan_github.settings_of(self.cfg)
-        if not settings.host or settings.host != self.cfg.host:
+        if not role_run.host_authorized(self.cfg, settings.host):
             return []
         declared = (self.declarations if self.declarations is not None else
                     subscriptions(canon.load_configured(self.cfg), self._warn))

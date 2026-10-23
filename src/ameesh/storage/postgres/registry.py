@@ -964,7 +964,13 @@ class Leases(interface.Leases):
     def renew(self, name, owner, epoch, ttl_seconds) -> float | None:
         """Verrou pris d'abord, échéance recontrôlée avec `clock_timestamp()`
         dans l'écriture : un renouvellement qui a attendu le verrou au-delà de
-        l'expiration est refusé (grille codex3)."""
+        l'expiration est refusé (grille codex3).
+
+        Le renouvellement ne raccourcit jamais l'échéance : `GREATEST` avec
+        l'échéance tenue, calculé sous le verrou de ligne, garde le plus tardif
+        des deux (#3115). Une lecture faite avant le verrou (ou avec l'horloge
+        de l'hôte) ne peut donc plus écraser un renouvellement concurrent.
+        """
         rows = self.db.query(
             """
             WITH verrou AS (
@@ -972,7 +978,9 @@ class Leases(interface.Leases):
                   FROM agent_registry WHERE name = %s FOR UPDATE
             )
             UPDATE agent_registry AS r
-               SET lease_expires_at = clock_timestamp() + make_interval(secs => %s),
+               SET lease_expires_at = GREATEST(
+                       r.lease_expires_at,
+                       clock_timestamp() + make_interval(secs => %s)),
                    last_seen        = now(),
                    updated_at       = now()
               FROM verrou

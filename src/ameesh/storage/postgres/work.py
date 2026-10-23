@@ -2498,6 +2498,121 @@ class WorkItems(interface.WorkItems):
                 " RETURNING revision", (json.dumps(document), key, int(revision)))
             return dict(document, revision=int(rows[0]["revision"])) if rows else None
 
+    def train_abandon(self, key, plan_id, document, *, revision, owner, epoch) -> dict | None:
+        with self.db.transaction() as tx:
+            held = tx.query("SELECT owner, epoch"
+                            " FROM merge_locks WHERE target = %s FOR UPDATE", (key,))
+            if not held or held[0]["owner"] != owner or int(held[0]["epoch"]) != epoch:
+                return None
+            live = tx.query("SELECT 1 FROM merge_locks WHERE target = %s"
+                            " AND expires_at > clock_timestamp()", (key,))
+            if not live:
+                return None
+            # The target row lock is also taken by train_fire_give: a grant is
+            # either committed before this read (seen just below and refused),
+            # or waits and then finds the terminal phase this write leaves.
+            rows = tx.query("SELECT document FROM integration_trains"
+                            " WHERE target_key = %s FOR UPDATE", (key,))
+            if not rows:
+                return None
+            current = rows[0]["document"]
+            if isinstance(current, str):
+                current = json.loads(current)
+            phase = current.get("phase")
+            if phase in ("landed", "empty", "paused", "invalidated") or phase == "promoting" \
+                    or (current.get("plan") or {}).get("id") != plan_id:
+                return None
+            fire = WorkItems(tx).train_fire_read(key, plan_id)
+            if fire and fire.get("state") in ("active", "promoting", "landed"):
+                return None
+            if (document.get("plan") or {}).get("id") != plan_id:
+                return None
+            updated = tx.query(
+                "UPDATE integration_trains SET revision = revision + 1, document = %s::jsonb,"
+                " updated_at = clock_timestamp() WHERE target_key = %s AND revision = %s"
+                " RETURNING revision", (json.dumps(document), key, int(revision)))
+            return dict(document, revision=int(updated[0]["revision"])) if updated else None
+
+    def train_adopt(self, key, owner, *, revision, previous, service, ttl_s) -> dict | None:
+        if not owner.startswith("train:") or key == service[0]:
+            return None
+        # L165 (EP4) × #3142, B cx2 : une clé de service liée à un rôle porte
+        # l'époque du rôle (`train-service:<rôle>:<époque>`). Elle survit à sa
+        # tenure par le TTL de service (900 s) : l'adoption doit aussi prouver
+        # que cette époque est le bail vivant courant du rôle, sinon l'ancien
+        # élu reprendrait la réservation au nouvel élu.
+        parts = str(service[0] or "").split(":")
+        role = (parts[1], int(parts[2])) if (len(parts) == 3 and parts[1]
+                and parts[0] == "train-service" and parts[2].isdigit()) else None
+        with self.db.transaction() as tx:
+            # Service lease first, then the target: no writer locks them in
+            # the other order (train_save only locks the target row).
+            if not tx.query("SELECT 1 FROM merge_locks WHERE target = %s AND owner = %s"
+                            " AND epoch = %s AND expires_at > clock_timestamp() FOR SHARE",
+                            (service[0], service[1], int(service[2]))):
+                return None
+            if role is not None:
+                current = tx.query(
+                    "SELECT lease_epoch, status,"
+                    " lease_expires_at > clock_timestamp() AS live"
+                    " FROM agent_registry WHERE name = %s FOR SHARE", (role[0],))
+                if not current or current[0]["lease_epoch"] is None \
+                        or int(current[0]["lease_epoch"]) != role[1] \
+                        or not current[0]["live"] \
+                        or str(current[0]["status"] or "") == "stopped":
+                    return None
+            held = tx.query("SELECT owner, epoch FROM merge_locks WHERE target = %s FOR UPDATE",
+                            (key,))
+            if not held or not (held[0]["owner"] or "").startswith("train:") \
+                    or held[0]["owner"] == owner:
+                return None
+            before = (held[0]["owner"], int(held[0]["epoch"]))
+            if previous is not None and before != (previous[0], int(previous[1])):
+                return None
+            rows = tx.query("SELECT revision, document FROM integration_trains"
+                            " WHERE target_key = %s FOR UPDATE", (key,))
+            if (int(rows[0]["revision"]) if rows else 0) != int(revision):
+                return None
+            document = rows[0]["document"] if rows else None
+            if isinstance(document, str):
+                document = json.loads(document)
+            ticket = (document or {}).get("reservation")
+            # A ticket naming the held epoch moves with it, whoever asked:
+            # left behind, it would bind the plan to the fenced holder.
+            if not isinstance(ticket, dict) \
+                    or (ticket.get("owner"), ticket.get("epoch")) != before:
+                if previous is not None:
+                    return None
+                document = None
+            # The target or document lock may have waited: recheck the
+            # service lease against wall time after every lock, like train_save.
+            if not tx.query("SELECT 1 FROM merge_locks WHERE target = %s AND owner = %s"
+                            " AND epoch = %s AND expires_at > clock_timestamp()",
+                            (service[0], service[1], int(service[2]))):
+                return None
+            # The role lease can also expire while those locks wait: FOR SHARE
+            # blocks a claim, not time. Recheck the exact epoch, liveness and
+            # status after every lock, next to the final service check
+            # (B/P1 cx2, #3142×#3014).
+            if role is not None:
+                current = tx.query(
+                    "SELECT 1 FROM agent_registry WHERE name = %s AND lease_epoch = %s"
+                    " AND lease_expires_at > clock_timestamp()"
+                    " AND coalesce(status, '') <> 'stopped' FOR SHARE",
+                    (role[0], role[1]))
+                if not current:
+                    return None
+            epoch = int(tx.query(
+                "UPDATE merge_locks SET owner = %s, epoch = epoch + 1,"
+                " expires_at = clock_timestamp() + %s * interval '1 second'"
+                " WHERE target = %s RETURNING epoch", (owner, float(ttl_s), key))[0]["epoch"])
+            if document is not None:
+                document["reservation"] = dict(document["reservation"], owner=owner, epoch=epoch)
+                tx.execute("UPDATE integration_trains SET revision = revision + 1,"
+                           " document = %s::jsonb, updated_at = clock_timestamp()"
+                           " WHERE target_key = %s", (json.dumps(document), key))
+            return {"epoch": epoch, "previous_owner": before[0], "previous_epoch": before[1]}
+
     @staticmethod
     def _train_fire(rows):
         if not rows:
