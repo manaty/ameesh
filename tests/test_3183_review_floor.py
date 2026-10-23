@@ -196,6 +196,45 @@ class FloorGateTest(PgTestCase):
         self.verdict("r_codex")
         self.assertFalse(self.gate()["ok"])
 
+    def test_a_move_note_claiming_a_pilot_does_not_lower_the_floor(self):
+        # B1 cx2 : `work.move(..., note=…, actor="pilot")` écrit sans contrôle
+        # d'autorité ; l'acteur revendiqué ne suffit pas, la ligne n'a pas de
+        # preuve structurée.
+        self.as_session("pilot")
+        self.floor(2)
+        self.as_session("author")
+        work.move(self.db, self.lot, "build", note="reviews-floor: 0", actor="pilot")
+        self.ops.note(self.lot, "build", "reviews-floor: 0", "human:smichea")
+        found = review_floor.of_lot(self.db, self.lot, cfg=self.cfg)
+        self.assertEqual((found["floor"], found["actor"]), (2, "pilot"))
+        self.verdict("r_codex")
+        self.assertFalse(self.gate()["ok"])
+
+    def test_an_identical_copy_does_not_take_over_a_human_floor(self):
+        # B2 cx2 : la copie identique de l'assigné ne remplace pas le
+        # détenteur humain ; le pilote ne peut toujours pas le baisser.
+        self.as_session("")
+        self.floor(2, actor="human:smichea")
+        self.ops.note(self.lot, "build", "reviews-floor: 2", "author")
+        found = review_floor.of_lot(self.db, self.lot, cfg=self.cfg)
+        self.assertEqual((found["floor"], found["actor"]), (2, "human:smichea"))
+        self.as_session("pilot")
+        with self.assertRaises(work.WorkError) as caught:
+            self.floor(0)
+        self.assertIn("only a human lowers it", str(caught.exception))
+        self.assertEqual(review_floor.of_lot(self.db, self.lot)["floor"], 2)
+
+    def test_a_pilot_raise_keeps_the_human_minimum(self):
+        self.as_session("")
+        self.floor(1, actor="human:smichea")
+        self.as_session("pilot")
+        self.floor(2)
+        with self.assertRaises(work.WorkError):
+            self.floor(0)
+        self.floor(1)
+        found = review_floor.of_lot(self.db, self.lot)
+        self.assertEqual((found["floor"], found["human_floor"]), (1, 1))
+
     def test_work_note_refuses_the_reserved_prefix(self):
         with self.assertRaises(work.WorkError) as caught:
             work.note(self.db, self.lot, "reviews-floor: 0", actor="author")

@@ -17,11 +17,13 @@ véhicule ; sur un véhicule, il s'applique à son delta propre
 
 Autorité : celle de `--actor` des corrections (humain, orchestrateur ou agent
 de conception déclaré, `history=False`). Un plancher posé par un humain ne se
-baisse que par un humain. Le préfixe est refusé à `work note` : seule cette
-commande l'écrit.
+baisse que par un humain. Seule cette commande écrit une ligne qui compte :
+elle porte une preuve structurée (`evidence`) qu'aucune écriture à texte libre
+du journal ne pose ; `work note` refuse en outre le préfixe.
 """
 from __future__ import annotations
 
+import json
 import re
 from typing import Optional
 
@@ -29,6 +31,9 @@ from . import storage, work
 
 #: le préfixe réservé de la ligne de journal
 PREFIX = "reviews-floor:"
+#: la preuve structurée d'une ligne écrite par `set_floor` (colonne
+#: `work_item_events.evidence`, 0452) ; sans elle, la ligne ne compte pas
+EVIDENCE_SCHEMA = "ameesh-review-floor/1"
 #: le plus haut plancher : deux familles distinctes (canon §2)
 MAX_FLOOR = 2
 _LINE = re.compile(r"^reviews-floor:\s*(\d+)\b")
@@ -49,38 +54,48 @@ def parse(text) -> Optional[int]:
 
 
 def of_lot(db, lot: int, *, cfg=None) -> dict:
-    """Le plancher courant du lot : `{floor, actor, at_ts, note}`.
+    """Le plancher courant du lot : `{floor, actor, at_ts, note, human_floor}`.
 
-    Les lignes se lisent dans l'ordre du journal ; une ligne illisible est
-    ignorée. Un relèvement compte toujours (il n'ôte aucun avis). Une baisse
-    ne compte que si son acteur est pilote (`work.claims_pilot`), et humain
-    quand le plancher courant a été posé par un humain : d'autres écritures
-    du journal (`move --note`, `assign`…) portent un texte libre, et une
-    ligne copiée par l'assigné ne lève pas la porte. Lève si le journal est
-    illisible : l'appelant décide (la classe échoue fermée)."""
+    Seule compte une ligne **authentifiée** : écrite par `set_floor`, elle
+    porte la preuve structurée `evidence` (`EVIDENCE_SCHEMA`, même plancher,
+    même acteur) dans la colonne que les écritures à texte libre du journal
+    (`move --note`, `add`, `assign`…) ne remplissent jamais ; une copie du
+    texte, quel que soit l'acteur revendiqué, est ignorée (B1 cx2).
+    Les lignes se lisent dans l'ordre du journal : une même valeur ne change
+    pas de détenteur (B2 cx2), et un agent ne descend jamais sous le dernier
+    plancher posé par un humain (`human_floor`). `cfg` est gardé pour les
+    appelants. Lève si le journal est illisible : l'appelant décide (la
+    classe échoue fermée)."""
     rows = storage.of(db).work.events_noted(PREFIX, 0.0, ids=[int(lot)]) or []
-    current = {"floor": 0, "actor": "", "at_ts": None, "note": ""}
+    current = {"floor": 0, "actor": "", "at_ts": None, "note": "", "human_floor": 0}
     for row in sorted(rows, key=lambda r: int(r.get("id") or 0)):
         value = parse(row.get("note"))
-        if value is None:
-            continue
         actor = str(row.get("actor") or "").strip()
-        if value < current["floor"] and not _may_lower(cfg, db, actor, current["actor"]):
+        if value is None or not _authentic(row.get("evidence"), value, actor):
             continue
-        current = {"floor": value, "actor": actor, "at_ts": row.get("created_ts"),
-                   "note": str(row.get("note") or "")}
+        human = actor.startswith(work.HUMAN_PREFIX)
+        if not human and value < current["human_floor"]:
+            continue
+        if human:
+            current["human_floor"] = value
+        if value == current["floor"] and not human:
+            continue
+        current.update(floor=value, actor=actor, at_ts=row.get("created_ts"),
+                       note=str(row.get("note") or ""))
     return current
 
 
-def _may_lower(cfg, db, actor: str, holder: str) -> bool:
-    """Vrai si `actor` peut baisser un plancher posé par `holder`."""
-    if holder.startswith(work.HUMAN_PREFIX):
-        return actor.startswith(work.HUMAN_PREFIX)
-    try:
-        return work.claims_pilot(cfg if cfg is not None else getattr(db, "cfg", None),
-                                 db, actor)
-    except Exception:  # noqa: BLE001 - autorité illisible : la baisse ne compte pas
-        return False
+def _authentic(evidence, value: int, actor: str) -> bool:
+    """Vrai si `evidence` est la preuve écrite par `set_floor` pour cette ligne."""
+    if isinstance(evidence, str):
+        try:
+            evidence = json.loads(evidence)
+        except ValueError:
+            return False
+    return (isinstance(evidence, dict)
+            and evidence.get("schema") == EVIDENCE_SCHEMA
+            and type(evidence.get("floor")) is int and evidence["floor"] == value
+            and str(evidence.get("actor") or "") == actor and bool(actor))
 
 
 def apply(klass: dict, db, lot: int, *, cfg=None) -> dict:
@@ -121,11 +136,10 @@ def set_floor(cfg, db, lot: int, floor: int, *, reason: str = "",
         raise work.WorkError("review floor refused: a mediated session cannot write "
                              "it; the pilot sets it from its own host")
     previous = of_lot(db, lot, cfg=cfg)
-    if floor < previous["floor"] and previous["actor"].startswith(work.HUMAN_PREFIX) \
-            and not who.startswith(work.HUMAN_PREFIX):
+    if floor < previous["human_floor"] and not who.startswith(work.HUMAN_PREFIX):
         raise work.WorkError(
-            "review floor refused: the floor %d was set by %s; only a human lowers it"
-            % (previous["floor"], previous["actor"]))
+            "review floor refused: a human set the floor %d; only a human lowers it"
+            % previous["human_floor"])
     out = {"lot": int(lot), "floor": floor, "previous": previous["floor"],
            "actor": who, "changed": floor != previous["floor"]}
     if not out["changed"]:
@@ -134,5 +148,12 @@ def set_floor(cfg, db, lot: int, floor: int, *, reason: str = "",
     why = " ".join((reason or "").split())
     if why:
         text += " — " + why
-    storage.of(db).work.note(int(lot), item["state"], text, who)
+    # #3183 (B1 cx2) : la preuve structurée authentifie la ligne ; aucune
+    # écriture à texte libre du journal ne remplit `evidence`.
+    evidence = {"schema": EVIDENCE_SCHEMA, "floor": floor, "actor": who}
+    with db.transaction() as tx:
+        tx.execute("INSERT INTO work_item_events (work_item_id, state, note, actor, evidence)"
+                   " VALUES (%s, %s, %s, %s, %s::jsonb)",
+                   (int(lot), item["state"], text, who, json.dumps(evidence)))
+        tx.execute("UPDATE work_items SET updated_at = now() WHERE id = %s", (int(lot),))
     return out
