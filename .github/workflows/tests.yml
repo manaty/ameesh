@@ -241,6 +241,13 @@ jobs:
   # (release PRs keep the full suite) and the plan of the run, from the map
   plan:
     name: plan
+    # #3198 : l'étiquette `ci-macos` (suite complète macOS dans macos.yml) est
+    # un évènement `labeled` comme un gel. Elle doit laisser ce workflow
+    # entièrement silencieux : sans cette garde, la porte de gel refuserait
+    # l'étiquette étrangère et le check requis `tests` rougirait sur une PR
+    # par ailleurs verte. Tous les jobs la portent ; le job `tests` change en
+    # plus de nom, pour ne jamais publier le contexte requis sans tests.
+    if: github.event.label.name != 'ci-macos'
     runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON(vars.AMEESH_CI_PRIO == 'on' && (startsWith(github.ref, 'refs/heads/integration/') || startsWith(github.ref, 'refs/heads/release/') || startsWith(github.base_ref, 'integration/') || startsWith(github.base_ref, 'release/') || startsWith(github.head_ref, 'integration/') || startsWith(github.head_ref, 'release/') || (github.event_name == 'pull_request' && contains(fromJSON(vars.AMEESH_CI_PRIO_PRS || '[]'), github.event.pull_request.number))) && '["self-hosted", "linux", "ameesh-ci-pool"]' || '["self-hosted", "linux", "ameesh-ci"]') || 'ubuntu-latest' }}
     timeout-minutes: 5
     # #1635 : dispatch-guard.py lit les PR ouvertes
@@ -436,7 +443,7 @@ jobs:
   psycopg:
     name: psycopg ${{ matrix.part }}/${{ needs.plan.outputs.psycopg_parts }}
     needs: plan
-    if: needs.plan.outputs.psycopg != '[]'
+    if: needs.plan.outputs.psycopg != '[]' && github.event.label.name != 'ci-macos'
     runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON(vars.AMEESH_CI_PRIO == 'on' && (startsWith(github.ref, 'refs/heads/integration/') || startsWith(github.ref, 'refs/heads/release/') || startsWith(github.base_ref, 'integration/') || startsWith(github.base_ref, 'release/') || startsWith(github.head_ref, 'integration/') || startsWith(github.head_ref, 'release/') || (github.event_name == 'pull_request' && contains(fromJSON(vars.AMEESH_CI_PRIO_PRS || '[]'), github.event.pull_request.number))) && '["self-hosted", "linux", "ameesh-ci-pool"]' || '["self-hosted", "linux", "ameesh-ci"]') || 'ubuntu-latest' }}
     # #2292 : à 4 parts, 14,3-30,5 min sous saturation sur les cinq derniers
     # paquets, et les parts 4/4 de h-1800 puis 1/4 de h-1900 ont été coupées à
@@ -607,7 +614,7 @@ jobs:
   psql:
     name: psql ${{ matrix.part }}/${{ needs.plan.outputs.psql_parts }}
     needs: plan
-    if: needs.plan.outputs.psql != '[]'
+    if: needs.plan.outputs.psql != '[]' && github.event.label.name != 'ci-macos'
     runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON(vars.AMEESH_CI_PRIO == 'on' && (startsWith(github.ref, 'refs/heads/integration/') || startsWith(github.ref, 'refs/heads/release/') || startsWith(github.base_ref, 'integration/') || startsWith(github.base_ref, 'release/') || startsWith(github.head_ref, 'integration/') || startsWith(github.head_ref, 'release/') || (github.event_name == 'pull_request' && contains(fromJSON(vars.AMEESH_CI_PRIO_PRS || '[]'), github.event.pull_request.number))) && '["self-hosted", "linux", "ameesh-ci-pool"]' || '["self-hosted", "linux", "ameesh-ci"]') || 'ubuntu-latest' }}
     # #880 : sur une PR, la part psql est une seule part « pilote » ; mesurée
     # 21,7-26,1 min au repos et 30,4-31,0 min sous saturation (8/8 runners),
@@ -696,7 +703,8 @@ jobs:
       needs.plan.outputs.code == 'true' &&
       (github.event_name == 'workflow_dispatch' ||
        (github.event_name == 'push' && startsWith(github.ref_name, 'release/')) ||
-       needs.plan.outputs.release == 'true')
+       needs.plan.outputs.release == 'true') &&
+      github.event.label.name != 'ci-macos'
     runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON(vars.AMEESH_CI_PRIO == 'on' && (startsWith(github.ref, 'refs/heads/integration/') || startsWith(github.ref, 'refs/heads/release/') || startsWith(github.base_ref, 'integration/') || startsWith(github.base_ref, 'release/') || startsWith(github.head_ref, 'integration/') || startsWith(github.head_ref, 'release/') || (github.event_name == 'pull_request' && contains(fromJSON(vars.AMEESH_CI_PRIO_PRS || '[]'), github.event.pull_request.number))) && '["self-hosted", "linux", "ameesh-ci-pool"]' || '["self-hosted", "linux", "ameesh-ci"]') || 'ubuntu-latest' }}
     timeout-minutes: 45
     strategy:
@@ -850,7 +858,7 @@ jobs:
   platform-macos:
     name: plateforme macOS
     needs: plan
-    if: needs.plan.outputs.code == 'true'
+    if: needs.plan.outputs.code == 'true' && github.event.label.name != 'ci-macos'
     runs-on: macos-26-intel
     timeout-minutes: 20
     env:
@@ -887,7 +895,7 @@ jobs:
   doc-readers:
     name: lecteurs de la doc
     needs: plan
-    if: needs.plan.outputs.docs_only == 'true'
+    if: needs.plan.outputs.docs_only == 'true' && github.event.label.name != 'ci-macos'
     runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON(vars.AMEESH_CI_PRIO == 'on' && (startsWith(github.ref, 'refs/heads/integration/') || startsWith(github.ref, 'refs/heads/release/') || startsWith(github.base_ref, 'integration/') || startsWith(github.base_ref, 'release/') || startsWith(github.head_ref, 'integration/') || startsWith(github.head_ref, 'release/') || (github.event_name == 'pull_request' && contains(fromJSON(vars.AMEESH_CI_PRIO_PRS || '[]'), github.event.pull_request.number))) && '["self-hosted", "linux", "ameesh-ci-pool"]' || '["self-hosted", "linux", "ameesh-ci"]') || 'ubuntu-latest' }}
     timeout-minutes: 10
     env:
@@ -910,7 +918,7 @@ jobs:
     name: bilan des impactés
     # #876 : « always() » seul recrée le job après l'annulation de l'exécution
     # (il reste queued des heures, puis la conclut en rouge) ; !cancelled() le saute.
-    if: always() && !cancelled() && needs.plan.result == 'success' && needs.plan.outputs.code == 'true'
+    if: always() && !cancelled() && needs.plan.result == 'success' && needs.plan.outputs.code == 'true' && github.event.label.name != 'ci-macos'
     needs: [plan, psycopg, psql]
     # Union #1256 x #1468 : le pool prioritaire d'abord, puis l'hôte prêté
     # quand un prêt est armé, puis la flotte ordinaire. `bilan` est hors de la
@@ -959,7 +967,7 @@ jobs:
   # regardé.
   version:
     name: version number
-    if: github.event_name == 'pull_request'
+    if: github.event_name == 'pull_request' && github.event.label.name != 'ci-macos'
     runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON(vars.AMEESH_CI_PRIO == 'on' && (startsWith(github.ref, 'refs/heads/integration/') || startsWith(github.ref, 'refs/heads/release/') || startsWith(github.base_ref, 'integration/') || startsWith(github.base_ref, 'release/') || startsWith(github.head_ref, 'integration/') || startsWith(github.head_ref, 'release/') || (github.event_name == 'pull_request' && contains(fromJSON(vars.AMEESH_CI_PRIO_PRS || '[]'), github.event.pull_request.number))) && '["self-hosted", "linux", "ameesh-ci-pool"]' || '["self-hosted", "linux", "ameesh-ci"]') || 'ubuntu-latest' }}
     timeout-minutes: 5
     steps:
@@ -984,13 +992,18 @@ jobs:
   tests:
     # Une PR peut être ouverte sur ce SHA après la garde ou la fin du run :
     # un dispatch ne doit jamais publier le contexte requis de cette PR.
-    name: ${{ github.event_name == 'workflow_dispatch' && 'tests (dispatch)' || 'tests' }}
+    # #3198 : l'étiquette `ci-macos` ne publie jamais le contexte requis
+    # `tests` (job sauté) ; son check porte un autre nom. Le check `tests` de
+    # la demande de gel reste seul à porter le nom requis sur ce SHA.
+    name: ${{ github.event.label.name == 'ci-macos' && 'tests (ci-macos, hors gel)' || (github.event_name == 'workflow_dispatch' && 'tests (dispatch)' || 'tests') }}
     # #876 : seul check requis ; `always() && !cancelled()` le ferait passer
     # skipped sur une exécution annulée, et GitHub compte un job sauté comme un
     # succès — la PR redeviendrait fusionnable sans aucun test. Il garde donc
     # `always()` (une exécution annulée le conclut en rouge) ; l'attente en file
     # de cet agrégat après annulation est la saturation des runners (lot #828).
-    if: always()
+    # #3198 : hors demande de gel (étiquette `ci-macos`), il saute et change de
+    # nom — jamais de `tests` vert sans tests.
+    if: always() && github.event.label.name != 'ci-macos'
     needs: [plan, version, psycopg, psql, doc-readers, fs-class]
     runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON(vars.AMEESH_CI_PRIO == 'on' && (startsWith(github.ref, 'refs/heads/integration/') || startsWith(github.ref, 'refs/heads/release/') || startsWith(github.base_ref, 'integration/') || startsWith(github.base_ref, 'release/') || startsWith(github.head_ref, 'integration/') || startsWith(github.head_ref, 'release/') || (github.event_name == 'pull_request' && contains(fromJSON(vars.AMEESH_CI_PRIO_PRS || '[]'), github.event.pull_request.number))) && '["self-hosted", "linux", "ameesh-ci-pool"]' || '["self-hosted", "linux", "ameesh-ci"]') || 'ubuntu-latest' }}
     timeout-minutes: 5

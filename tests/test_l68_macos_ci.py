@@ -35,7 +35,10 @@ import sys
 import tempfile
 import unittest
 
+from ameesh import canon
+
 from .support import REPO
+from .test_1468_ci_prio import evaluate
 
 WORKFLOW = os.path.join(REPO, ".github", "workflows", "tests.yml")
 MACOS = os.path.join(REPO, ".github", "workflows", "macos.yml")
@@ -116,10 +119,9 @@ class MacosFullSuiteWorkflowTest(unittest.TestCase):
         self.assertIn("types: [labeled]", self.text)
         self.assertIn("github.event.label.name == 'ci-macos'", self.job)
 
-    def test_the_label_run_does_not_enter_the_freeze_workflow(self):
-        # `pull_request` + `labeled` est déjà le déclencheur du gel dans
-        # tests.yml, qui refuse toute étiquette étrangère : la suite macOS
-        # passe par `pull_request_target`, jamais par cet évènement.
+    def test_the_macos_workflow_is_not_the_freeze_workflow(self):
+        # Le workflow macOS ne doit pas être un second `pull_request` : les
+        # étiquettes de gel `ci-lot`/`ci-full` le réveilleraient pour rien.
         self.assertIn("pull_request_target:", self.text)
         self.assertNotRegex(self.text, r"(?m)^  pull_request:")
         with open(WORKFLOW, encoding="utf-8") as fh:
@@ -165,6 +167,107 @@ class MacosFullSuiteWorkflowTest(unittest.TestCase):
         # La suite complète reste bornée (jusqu'à 3 h 50 mesuré), hors du
         # chemin du paquet : le plafond de 240 min ne bloque aucune fusion.
         self.assertIn("timeout-minutes: 240", self.job)
+
+
+class CiMacosCoexistenceTest(unittest.TestCase):
+    """#3198 : poser `ci-macos` ne publie pas le check requis `tests`.
+
+    L'évènement `labeled` réveille les **deux** workflows (tests.yml écoute
+    tous les labels, macos.yml seulement `ci-macos`). Ce témoin évalue les
+    `if:` et le `name:` réellement livrés avec l'interpréteur d'expressions de
+    #1468, sous deux contextes : étiquette `ci-macos` (tests.yml doit être
+    entièrement silencieux et son agrégat renommé) et gel `ci-lot-<sha>`
+    (tests.yml publie bien `tests`).
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        with open(WORKFLOW, encoding="utf-8") as fh:
+            cls.tests = canon.load_yaml(fh.read())["jobs"]
+        with open(MACOS, encoding="utf-8") as fh:
+            cls.macos = canon.load_yaml(fh.read())["jobs"]
+
+    @staticmethod
+    def _eval(field, ctx):
+        text = str(field).strip()
+        if not text.startswith("${{"):
+            text = "${{ %s }}" % text
+        # l'interpréteur de #1468 ne connaît que les fonctions de routage
+        text = text.replace("always()", "true").replace("cancelled()", "false")
+        return evaluate(text, ctx)
+
+    @staticmethod
+    def _context(event, label, *, plan_result, outputs):
+        return {
+            "github": {
+                "event_name": event,
+                "repository": REPO,
+                "ref": "refs/heads/main",
+                "ref_name": "main",
+                "base_ref": "",
+                "head_ref": "",
+                "event": {
+                    "label": {"name": label} if label else {},
+                    "pull_request": {
+                        "number": 42,
+                        "head": {"repo": {"full_name": REPO}},
+                    },
+                },
+            },
+            "needs": {"plan": {"result": plan_result, "outputs": outputs}},
+            "vars": {},
+        }
+
+    def _ci_macos(self):
+        return self._context("pull_request", "ci-macos",
+                             plan_result="skipped", outputs={})
+
+    def _freeze(self):
+        return self._context(
+            "pull_request", "ci-lot-" + "a" * 40, plan_result="success",
+            outputs={"psycopg": "[1]", "psql": "[1]", "code": "true",
+                     "docs_only": "false", "version_only": "false",
+                     "release": "false"})
+
+    def test_the_label_really_wakes_both_workflows(self):
+        with open(WORKFLOW, encoding="utf-8") as fh:
+            tests = fh.read()
+        self.assertIn("pull_request:\n    types: [labeled]", tests)
+        self.assertIn("pull_request_target:\n    types: [labeled]", self.text_macos())
+
+    def text_macos(self):
+        with open(MACOS, encoding="utf-8") as fh:
+            return fh.read()
+
+    def test_ci_macos_silences_every_tests_job(self):
+        ctx = self._ci_macos()
+        for job, spec in self.tests.items():
+            with self.subTest(job=job):
+                self.assertFalse(
+                    bool(self._eval(spec.get("if", "true"), ctx)),
+                    "tests.yml/%s tournerait sur l'étiquette ci-macos" % job)
+
+    def test_ci_macos_renames_the_required_aggregate(self):
+        ctx = self._ci_macos()
+        nom = self._eval(self.tests["tests"]["name"], ctx)
+        self.assertNotEqual(nom, "tests",
+                            "le check requis tests serait publié sans tests")
+        self.assertIn("ci-macos", str(nom))
+
+    def test_a_freeze_still_publishes_the_required_tests_check(self):
+        ctx = self._freeze()
+        self.assertTrue(bool(self._eval(self.tests["plan"].get("if", "true"), ctx)))
+        self.assertTrue(bool(self._eval(self.tests["tests"]["if"], ctx)))
+        self.assertEqual(self._eval(self.tests["tests"]["name"], ctx), "tests")
+
+    def test_the_macos_suite_follows_only_ci_macos(self):
+        ci = self._context("pull_request_target", "ci-macos",
+                           plan_result="skipped", outputs={})
+        gel = self._context("pull_request_target", "ci-lot-" + "a" * 40,
+                            plan_result="skipped", outputs={})
+        condition = self.macos["suite"]["if"]
+        self.assertTrue(bool(self._eval(condition, ci)))
+        self.assertFalse(bool(self._eval(condition, gel)))
 
 
 class BenchTmpdirTest(unittest.TestCase):

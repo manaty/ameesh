@@ -16,13 +16,15 @@
 #
 # `pull_request_target` et non `pull_request` (décision #3198) : l'évènement
 # `labeled` de `pull_request` est déjà le déclencheur de la CI de gel de
-# tests.yml, et toute autre étiquette y est refusée (le check requis `tests`
-# rougit). `pull_request_target` n'entre pas dans ce workflow-là, n'ajoute
-# aucun check au rollup de la PR et ne peut donc pas retarder la fusion ; le
-# job vérifie lui-même que la tête appartient au dépôt (jamais une fourche),
-# part du code de la branche de base pour le déclencheur, ne demande que
-# `contents: read` et n'utilise aucun secret. Le seul code exécuté est celui
-# de la PR, comme dans tests.yml pour une PR du dépôt.
+# tests.yml, et toute autre étiquette y est refusée. Poser `ci-macos` réveille
+# donc AUSSI tests.yml : ses jobs portent tous `github.event.label.name !=
+# 'ci-macos'`, et son agrégat change de nom sur cette étiquette — le check
+# requis `tests` n'est ni rougi ni verdi sans tests, le check de la demande de
+# gel reste seul à porter ce nom (témoin `CiMacosCoexistenceTest`). Le
+# déclencheur `pull_request_target` évite en plus que ce workflow soit réveillé
+# par une étiquette de gel `ci-lot`/`ci-full`. La tête doit appartenir au
+# dépôt (jamais une fourche), le code exécuté est celui de la PR, le jeton est
+# `contents: read` et aucun secret n'est utilisé.
 #
 # Le job court `platform-macos` de tests.yml (couche plateforme L63/L66, sans
 # base, borné à 20 min) reste le verdict rapide de chaque PR de paquet ;
