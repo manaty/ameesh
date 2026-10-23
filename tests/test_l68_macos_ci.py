@@ -20,6 +20,9 @@ from __future__ import annotations
 
 import os
 import re
+import subprocess
+import sys
+import tempfile
 import unittest
 
 from .support import REPO
@@ -108,6 +111,29 @@ class MacosSuiteJobTest(unittest.TestCase):
         self.assertIsNotNone(needs, "job tests : ligne needs introuvable")
         self.assertNotIn("platform-macos", needs.group(1))
         self.assertIn("platform-macos n'est pas encore requis", aggregate)
+
+
+class BenchTmpdirTest(unittest.TestCase):
+    """#3042 : le banc résout TMPDIR avant de créer ses bacs jetables."""
+
+    def test_a_symlinked_tmpdir_is_resolved_before_the_fixtures(self):
+        # Sous macOS /tmp et /var sont des liens : un bac créé sous le TMPDIR
+        # lexical fait refuser ses ancêtres symboliques par les gardes de
+        # déploiement. Le sous-processus importe le paquet `tests` (qui résout)
+        # puis rend le répertoire que tempfile utilisera.
+        with tempfile.TemporaryDirectory(prefix="ameesh-l68-tmp-") as base:
+            real = os.path.join(base, "real")
+            link = os.path.join(base, "link")
+            os.mkdir(real)
+            os.symlink(real, link)
+            env = dict(os.environ, TMPDIR=link,
+                       PYTHONPATH=os.path.join(REPO, "src"))
+            done = subprocess.run(
+                [sys.executable, "-c",
+                 "import tempfile, tests; print(tempfile.gettempdir())"],
+                cwd=REPO, env=env, capture_output=True, text=True, timeout=60)
+            self.assertEqual(done.returncode, 0, done.stderr)
+            self.assertEqual(done.stdout.strip(), os.path.realpath(link))
 
 
 class LinuxOnlyWitnessesAreBoundedTest(unittest.TestCase):
