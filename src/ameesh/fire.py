@@ -491,14 +491,18 @@ def _pr_status(slug: str, branch: str, *, gh) -> dict | None:
     from . import radar
     rollup = radar.merge_rollup(row.get("statusCheckRollup"), slug=slug,
                                 head=_norm(row.get("headRefOid")), branch=branch, gh=gh)
+    # `ci` garde son sens strict (« tous les checks verts »), que lisent la
+    # file et l'affichage ; `ci_rule` porte la règle owner du 23/10 (#3085) —
+    # un non concluant n'y bloque pas — pour la seule porte `ready_pr`.
     pending = any((c.get("status") or "COMPLETED") != "COMPLETED"
                   or (c.get("state") or "") == "PENDING" for c in rollup)
     ci = "green" if radar.ci_green(rollup) else "pending" if pending or not rollup else "red"
+    ci_rule = radar.ci_state(rollup)
     commit = row.get("mergeCommit") or {}
     return {
         "number": row.get("number"), "state": str(row.get("state") or "").upper(),
         "head": _norm(row.get("headRefOid")), "base": str(row.get("baseRefName") or ""),
-        "draft": bool(row.get("isDraft")), "ci": ci,
+        "draft": bool(row.get("isDraft")), "ci": ci, "ci_rule": ci_rule,
         "merged": str(row.get("state") or "").upper() == "MERGED",
         "merge_commit": _norm(commit.get("oid") if isinstance(commit, dict) else ""),
         "armed": row.get("autoMergeRequest") is not None, "url": row.get("url") or "",
@@ -805,7 +809,7 @@ def _required_pairs(required) -> tuple:
     return tuple(pairs)
 
 
-def _required_gap(required, rollup, provenance=None) -> list:
+def _required_gate(required, rollup, provenance=None, *, strict: bool = False) -> tuple:
     """Les checks requis que `rollup` et `provenance` ne prouvent pas.
 
     `provenance` porte les check runs de la tête exacte avec leur application
@@ -815,10 +819,46 @@ def _required_gap(required, rollup, provenance=None) -> list:
     application imposée (`app_id` à `None`), tout check ou statut du nom exigé
     compte après sélection des derniers checks du rollup (#2524). Un même
     nom encore porté par plusieurs workflows ou sources n'est vert que si
-    tous le sont : le doute ne verdit pas la porte."""
+    tous le sont : le doute ne verdit pas la porte.
+
+    #3085 (règle owner du 23/10) : rend `(gaps, consigned)`.
+
+    * `gaps` : ce qui bloque encore — un check **négatif** (`FAILURE`), absent,
+      d'une autre source, ou encore en cours. Un check requis absent ne se
+      suppose pas vert : la porte ne fusionne pas sur une preuve manquante.
+    * `consigned` : les résultats **non concluants** (sauté, annulé, expiré,
+      démarrage raté, statut en erreur) d'un check requis. Ils ne bloquent
+      pas et sont journalisés ; la correction s'ouvre à part.
+
+    `strict=True` garde l'ancienne preuve (tout ce qui n'est pas `SUCCESS`
+    manque), pour les lecteurs qui n'ont pas reçu la règle du 23/10 (file de
+    fusion, `merge-pr`)."""
     from . import radar
     rollup = radar.latest_rollup(rollup)
-    gaps = []
+    gaps, consigned = [], []
+
+    def classify(name: str, states: list) -> None:
+        """Trie les états d'un même nom : négatif, puis attente, puis non
+        concluant, puis vert ; `strict` remet tous les non-SUCCESS en gaps."""
+        results = {state: radar.rollup_state_result(state) for state in states}
+        negative = sorted({state for state, result in results.items()
+                           if result == radar.CI_NEGATIVE_RESULT})
+        waiting = sorted({state for state, result in results.items()
+                          if result == radar.CI_WAITING_RESULT})
+        inconclusive = sorted({state for state, result in results.items()
+                               if result == radar.CI_INCONCLUSIVE_RESULT})
+        if strict:
+            bad = sorted({state or "?" for state in states if state != "SUCCESS"})
+            if bad:
+                gaps.append("%s (%s)" % (name, ", ".join(bad)))
+            return
+        if negative:
+            gaps.append("%s (%s)" % (name, ", ".join(negative)))
+        elif waiting:
+            gaps.append("%s (%s)" % (name, ", ".join(waiting)))
+        elif inconclusive:
+            consigned.append("%s (%s)" % (name, ", ".join(inconclusive)))
+
     for name, app_id in _required_pairs(required):
         if app_id is None:
             states = [_rollup_state(entry) for entry in rollup or ()
@@ -826,9 +866,7 @@ def _required_gap(required, rollup, provenance=None) -> list:
             if not states:
                 gaps.append("%s (absent)" % name)
                 continue
-            bad = sorted({state or "?" for state in states if state != "SUCCESS"})
-            if bad:
-                gaps.append("%s (%s)" % (name, ", ".join(bad)))
+            classify(name, states)
             continue
         runs = [entry for entry in provenance or ()
                 if _rollup_name(entry) == name and entry.get("app_id") == app_id]
@@ -845,11 +883,32 @@ def _required_gap(required, rollup, provenance=None) -> list:
             else:
                 gaps.append("%s (absent)" % name)
             continue
-        bad = sorted({_rollup_state(entry) or "?" for entry in runs
-                      if _rollup_state(entry) != "SUCCESS"})
-        if bad:
-            gaps.append("%s (%s)" % (name, ", ".join(bad)))
-    return gaps
+        classify(name, [_rollup_state(entry) for entry in runs])
+    return gaps, consigned
+
+
+def _required_gap(required, rollup, provenance=None) -> list:
+    """L'ancienne preuve stricte (file de fusion, `merge-pr`) : les checks
+    requis que `rollup` et `provenance` ne prouvent pas. #3085 : `ready_pr`
+    passe par `_required_gate(strict=False)`, qui consigne un non concluant
+    au lieu de le compter comme un manque."""
+    return _required_gate(required, rollup, provenance, strict=True)[0]
+
+
+def _packet_proof_gate(rollup) -> tuple:
+    """#2876/#3066 : la preuve du portier `paquet` reste **stricte**.
+
+    Ce n'est pas un test dont un résultat non concluant pourrait être
+    consigné : c'est la preuve que la suite complète de la tête a bien tourné
+    (ou a été remplacée par une preuve équivalente). Un check sauté, annulé,
+    expiré ou encore en cours y bloque donc encore, comme avant #3085.
+    Rend `(gaps, consigned)` : `consigned` est toujours vide."""
+    from . import radar
+    entries = [entry for entry in radar.packet_proof_entries(rollup)]
+    bad = sorted({(_rollup_state(entry) or "?") for entry in entries
+                  if radar.check_result(entry) != radar.CI_GREEN_RESULT})
+    gaps = (["paquet (%s)" % ", ".join(bad)] if bad else [])
+    return gaps, []
 
 
 #: #2306 : les codes HTTP qui disent « réessaie » plutôt que « c'est prouvé ».
@@ -1243,7 +1302,7 @@ def required_on_head(project, target: str, sha: str, *, gh) -> list:
 
 
 def ready_pr(status: dict, *, target: str, project, frozen: str, required=None,
-             slug: str | None = None, gh=None) -> tuple:
+             slug: str | None = None, gh=None, report: dict | None = None) -> tuple:
     """Les portes qui dépendent de la PR : brouillon, cible, CI verte sur la
     tête gelée, **checks requis de la branche cible** présents et `SUCCESS`
     sur cette tête (protection de la forge ou déclaration du projet), CI du
@@ -1256,7 +1315,15 @@ def ready_pr(status: dict, *, target: str, project, frozen: str, required=None,
 
     `required` remplace la lecture (tests, appelant qui l'a déjà faite) ;
     `slug`/`gh` la permettent. Sans l'un ou l'autre, la porte refuse : un
-    check requis inconnu ne se suppose pas vert."""
+    check requis inconnu ne se suppose pas vert.
+
+    #3085 (règle owner du 23/10) : la porte lit les **checks requis** et
+    classe chaque résultat. Un `FAILURE`, un check absent ou encore en cours
+    bloque ; un résultat non concluant (sauté, annulé pour quota, expiré,
+    démarrage raté, statut en erreur) est **consigné** et ne bloque pas. Un
+    check facultatif ne gate jamais (il n'est pas dans `required`). Sans check
+    requis connu, l'ancienne preuve `ci == green` reste la seule porte.
+    `report`, s'il est fourni, reçoit `{"consigned": [...]}` pour la trace."""
     if status.get("draft"):
         return False, "PR #%s is a draft" % status.get("number")
     if target and status.get("base") and status["base"] != target:
@@ -1266,9 +1333,6 @@ def ready_pr(status: dict, *, target: str, project, frozen: str, required=None,
     if head and frozen_head and not _same_head(head, frozen_head):
         return False, ("PR #%s is on %s, not the freeze %s"
                        % (status.get("number"), head[:12], frozen_head[:12]))
-    if status.get("ci") != "green":
-        return False, "the CI of PR #%s is %s on the freeze %s" % (
-            status.get("number"), status.get("ci"), frozen[:12])
     if required is None:
         try:
             required = required_checks(slug, target, project, gh=gh)
@@ -1276,30 +1340,56 @@ def ready_pr(status: dict, *, target: str, project, frozen: str, required=None,
             return False, ("the required checks of %s on the freeze %s cannot be proven: %s"
                            % (target or "the target", frozen[:12], exc))
     pairs = _required_pairs(required)
-    provenance = None
-    if any(app_id is not None for _, app_id in pairs):
-        try:
-            provenance = _head_check_runs(slug, head or frozen_head, gh=gh)
-        except land.LandError as exc:
-            return False, ("the source of the required checks of %s on the freeze %s "
-                           "cannot be proven: %s"
-                           % (target or "the target", frozen[:12], exc))
-    gaps = _required_gap(pairs, status.get("rollup") or (), provenance)
-    if gaps:
-        return False, ("PR #%s does not prove the required checks of %s on the freeze %s: %s"
-                       % (status.get("number"), target or "the target", frozen[:12],
-                          ", ".join(gaps)))
+    rollup = status.get("rollup") or ()
+    if pairs:
+        provenance = None
+        if any(app_id is not None for _, app_id in pairs):
+            try:
+                provenance = _head_check_runs(slug, head or frozen_head, gh=gh)
+            except land.LandError as exc:
+                return False, ("the source of the required checks of %s on the freeze %s "
+                               "cannot be proven: %s"
+                               % (target or "the target", frozen[:12], exc))
+        gaps, consigned = _required_gate(pairs, rollup, provenance, strict=False)
+        # #2876/#3066 : la preuve du portier `paquet` n'est jamais un check
+        # facultatif — un rouge ou une preuve indisponible bloque ; un non
+        # concluant du portier se consigne.
+        proof_gaps, proof_consigned = _packet_proof_gate(rollup)
+        gaps += proof_gaps
+        consigned += proof_consigned
+        if report is not None:
+            report.update({"consigned": consigned,
+                           "required": [name for name, _app in pairs]})
+        if gaps:
+            return False, ("PR #%s does not prove the required checks of %s on the freeze %s: %s"
+                           % (status.get("number"), target or "the target", frozen[:12],
+                              ", ".join(gaps)))
+    else:
+        # aucun check requis connu : l'ancienne preuve « CI verte » reste la
+        # seule porte ; `ci_rule` applique la règle du 23/10 (#3085), `ci` le
+        # sens strict des lecteurs qui ne la portent pas.
+        state = status.get("ci_rule") or status.get("ci")
+        if state != "green":
+            return False, "the CI of PR #%s is %s on the freeze %s" % (
+                status.get("number"), state, frozen[:12])
     from . import radar
     # #1748 (a): a head of a declared branch is green only with a `success`
-    # status of each required prefix; an unknown branch gets them all
+    # status of each required prefix; an unknown branch gets them all.
+    # #3085 : seuls les statuts de commit portent ces préfixes ; un check
+    # facultatif ne retient pas la porte.
     statuses = radar.required_statuses(project, status.get("branch"))
-    if statuses and not radar.ci_green(status.get("rollup") or [], statuses):
-        return False, "PR #%s carries no successful %s status on the freeze %s " \
-            "(required_statuses)" % (status.get("number"),
-                                     " / ".join("%s*" % p for p in statuses), frozen[:12])
+    if statuses:
+        entries = [c for c in rollup
+                   if isinstance(c, dict) and (c.get("__typename") == "StatusContext"
+                                               or "state" in c and "conclusion" not in c)]
+        if not radar.ci_green(entries, statuses):
+            return False, "PR #%s carries no successful %s status on the freeze %s " \
+                "(required_statuses)" % (status.get("number"),
+                                         " / ".join("%s*" % p for p in statuses), frozen[:12])
     if project is not None and getattr(project, "ci_required", False):
         try:
-            merge_queue._required_ci(project, frozen, branch=status.get("branch"))
+            merge_queue._required_ci(project, frozen, branch=status.get("branch"),
+                                     allow_inconclusive=True)
         except merge_queue.QueueError as exc:
             return False, str(exc)
     return True, ""
@@ -1795,8 +1885,9 @@ def _merge_direct(cfg, db, row: dict, marks: list, fire: dict, status: dict, *, 
     le gel et les verdicts sont relus juste avant le geste (P1-3)."""
     lot = int(row["id"])
     frozen = _norm((freeze_of(marks) or {}).get("sha"))
+    report: dict = {}
     ok, why = ready_pr(status, target=target, project=project, frozen=frozen,
-                       slug=slug, gh=gh)
+                       slug=slug, gh=gh, report=report)
     if not ok:
         return _not_ready(db, row, status, out, why, gh=gh, slug=slug, dry_run=dry_run,
                           handle=handle)
@@ -1853,6 +1944,17 @@ def _merge_direct(cfg, db, row: dict, marks: list, fire: dict, status: dict, *, 
                               default=str(info.get("default_branch") or ""))
         if ok:
             out.update(result="merged", detail=error, sha=head)
+            # #3085 : la trace du non concluant qui n'a pas retenu la fusion.
+            consigned = list(report.get("consigned") or ())
+            if consigned:
+                out["consigned"] = consigned
+                try:
+                    work.note(db, lot,
+                              "merged with non-conclusive required checks (owner rule "
+                              "23/10, consigned): %s" % ", ".join(consigned),
+                              actor="ameesh", once=True)
+                except Exception:  # noqa: BLE001 - la fusion est faite, la trace au mieux
+                    pass
             try:
                 after = _pr_status(slug, branch, gh=gh)
             except land.LandError:
