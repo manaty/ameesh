@@ -13,6 +13,7 @@ test_l1124_explorations  # docs/design/explorations and plan/roadmap/lot cards (
 test_l159a_capacity_guard  # docs/schemas (JSON schemas of the capacity guard, L159a)
 test_l162_tmpfs  # docs/ORCHESTRATEUR.md (consigne $TMPDIR)
 test_l233_decide_only  # docs/ORCHESTRATEUR.md (decision rule: decide ask only)
+test_l3166_executor_image_publish  # docs/IMAGE-EXECUTEUR.md (publication de l'image executeur, #3166)
 test_l33_chatbot  # docs/design et site/docs (index du chatbot), site/landing
 test_l84_serve  # docs/api/openapi-v1.json (OpenAPI contract of the read API, L84)
 test_l953_image_approve  # docs/IMAGE-APPROVE.md (politique de publication de l'image approve, #953)

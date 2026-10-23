@@ -158,4 +158,7 @@ class SloDeliveryTest(unittest.TestCase):
     def test_external_bureau_cannot_be_reintroduced_as_pilot(self):
         self.alert.update(level=3, targets=["pilot", "bureau"], orchestrators=["bureau"])
         out = alert_briefs.briefs(self.alert, self.listing)
-        self.assertEqual(out, {})
+        # #3036 : aucun agent vivant au palier -> copie au fil lisible ; le
+        # bureau externe ne reçoit jamais de courrier, même listé pilote.
+        self.assertEqual(list(out), ["thread:bureau"])
+        self.assertNotIn("bureau", out)

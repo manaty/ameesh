@@ -127,6 +127,25 @@ class PacketCloseTest(_PlanDb):
         # idempotent : les lots sont déjà fusionnés, plus rien à examiner
         self.assertEqual(self.sync()["results"], [])
 
+    def test_le_balayage_transmet_le_depot_a_la_relecture(self):
+        """#3201 : la fermeture par manifeste de paquet passe le dépôt du
+        relevé à `close_merged`. La classe et la relecture §2 du lot léger
+        sont lues sur ce dépôt, même sur un hôte sans dossier d'assigné ni
+        projet radar — le défaut laissait « dépôt inconnu » (#3011, #3105)."""
+        from ameesh import review_lot, storage
+
+        item = self.item("unité relue")
+        unit = self.package([item])[0]
+        self.freeze(item, unit["source"])
+        with mock.patch.object(review_lot.lot_class, "of_lot",
+                               return_value={"class": "light", "why": "témoin"}) as klass:
+            report = self.by_lot(self.sync())
+        self.assertEqual(report[item["id"]]["result"], "merged", report)
+        klass.assert_called_once()
+        self.assertEqual(klass.call_args.kwargs["repo"], self.repo)
+        rows = storage.of(self.db).work.by_issue_ref(review_lot.ref_of(item["id"]))
+        self.assertEqual(len(rows), 1, rows)
+
     def test_un_lot_absent_d_une_liste_d_items_tronquee_est_ferme(self):
         """#2508 : la fermeture lit les lots du manifeste par leur id, pas la
         liste globale `items(limit=1000)` ; une unité absente d'une liste

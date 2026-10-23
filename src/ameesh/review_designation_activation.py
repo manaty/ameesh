@@ -70,14 +70,16 @@ import os
 import re
 import subprocess
 import time
+import dataclasses
 from dataclasses import dataclass, field
 from typing import Mapping, Optional, Sequence
 
 from . import canon as canon_mod
+from . import db as db_mod
 from . import lot_class, mechanics, plan_git, projects, registry, review
 from . import review_designation as rd
 from . import review_designation_pg as pg
-from . import review_authors, storage, work
+from . import review_authors, review_floor, storage, work
 
 #: the sender of the journal notes and automatic mails
 SENDER = pg.SENDER
@@ -85,6 +87,9 @@ SENDER = pg.SENDER
 UNAVAILABLE_PREFIX = "review-designation-unavailable:"
 #: journal prefix of a light/no-review outcome: one note per freeze (#2561)
 NONE_PREFIX = "review-designation-none:"
+#: journal prefix of an unreadable mark ignored by the reviewer load (#3047):
+#: the line names the offending lot and the id of the note it ignored
+UNREADABLE_PREFIX = "review-designation-unreadable:"
 #: the first release that carries `ameesh work reviewers` (#2447)
 RECOVERY_FROM = "1.12.0"
 #: why a light lot keeps no pre-merge reviewer (canon §2, full table)
@@ -745,7 +750,43 @@ def corrections_of_head(db, item: Mapping, milestone: Optional[Mapping],
 # the candidates: real session family, availability, open-lot load
 # --------------------------------------------------------------------------
 
-def _loads(db) -> dict:
+def _mark_reviewers(note: str) -> Optional[list]:
+    """The reviewer names a latest designation mark carries, or None.
+
+    The JSON is parsed **in Python**, before any cast: a hand-written note with
+    a valid mark prefix and invalid JSON is an unreadable mark, not a database
+    error that aborts the freeze transaction (#3047). `designation_of` refuses
+    an unreadable selection mark and `carried_mark_of` returns None; both are
+    the same refusal here, and the caller journals it.
+    """
+    from . import verdict_carry
+
+    text = str(note or "")
+    if text.startswith(pg.MARK_PREFIX):
+        try:
+            payload = pg.designation_of(text)
+        except rd.DesignationError:
+            return None
+    elif text.startswith(verdict_carry.CARRIED_MARK_PREFIX):
+        payload = verdict_carry.carried_mark_of(text)
+    else:
+        return []
+    if not isinstance(payload, dict):
+        return None
+    reviewers = payload.get("reviewers")
+    if reviewers is None:
+        return []
+    if not isinstance(reviewers, (list, tuple)):
+        return None
+    names = []
+    for row in reviewers:
+        if not isinstance(row, dict):
+            return None
+        names.append(str(row.get("name") or "").strip())
+    return names
+
+
+def _loads(db, *, unreadable: Optional[list] = None) -> dict:
     """Open lots per agent (the load of the selection), in **one** read.
 
     The charge of a reviewer is every open lot they carry: the lots assigned to
@@ -766,6 +807,12 @@ def _loads(db) -> dict:
     a charge, and an unreadable read is zero, as before: never a guess and
     never a failed freeze. A lot where the agent is both assignee and
     designated reviewer counts once: `charges` is a set of (lot, agent).
+
+    #3047: the mark is read as **text** and its JSON is parsed in Python
+    (`_mark_reviewers`), never cast by PostgreSQL. A note with a valid prefix
+    and invalid JSON charges nobody and is reported in `unreadable` as
+    `(lot, note id)`; the caller journals it. No bad note can abort the freeze
+    transaction any more, while a valid mark next to it is still read.
     """
     try:
         rows = db.query(
@@ -782,63 +829,118 @@ def _loads(db) -> dict:
                  WHERE m.kind = 'frozen'
                  ORDER BY m.work_item_id, m.at DESC, m.id DESC
             ), latest_mark AS (
-                SELECT f.lot, f.sha,
-                       (SELECT e.note
-                          FROM work_item_events e
-                         WHERE e.work_item_id = f.lot
-                           AND e.created_at >= f.at
-                           AND (starts_with(e.note,
-                                            'review-designation:' || f.lot
-                                            || ':' || f.freeze_id || ':')
-                                OR starts_with(e.note,
-                                               'review-designation-carried:' || f.lot
-                                               || ':' || f.freeze_id || ':'))
-                         ORDER BY e.id DESC
-                         LIMIT 1) AS note
+                SELECT f.lot, f.sha, mark.id AS note_id, mark.note
                   FROM latest_freeze f
-            ), designees AS (
-                SELECT f.lot, f.sha, btrim(r.value->>'name') AS name
-                  FROM latest_mark f
-                  CROSS JOIN LATERAL jsonb_array_elements(
-                      (substring(f.note from position(': ' in f.note) + 2))::jsonb
-                      -> 'reviewers') AS r(value)
-                 WHERE f.note IS NOT NULL
-            ), charges AS (
-                SELECT id AS lot, assignee AS name
-                  FROM open_items
-                 WHERE assignee IS NOT NULL AND assignee <> ''
-                UNION
-                SELECT d.lot, d.name
-                  FROM designees d
-                 WHERE d.name <> ''
-                   AND btrim(d.sha) <> ''
-                   AND NOT EXISTS (
-                        SELECT 1
-                          FROM work_item_milestones v
-                         WHERE v.work_item_id = d.lot
-                           AND v.kind = 'verdict'
-                           AND lower(btrim(v.actor)) = lower(d.name)
-                           AND (lower(btrim(v.sha)) = lower(btrim(d.sha))
-                                OR (length(btrim(v.sha)) >= 7
-                                    AND starts_with(lower(btrim(d.sha)),
-                                                    lower(btrim(v.sha))))
-                                OR (length(btrim(d.sha)) >= 7
-                                    AND starts_with(lower(btrim(v.sha)),
-                                                    lower(btrim(d.sha))))))
+                  LEFT JOIN LATERAL (
+                      SELECT e.id, e.note
+                        FROM work_item_events e
+                       WHERE e.work_item_id = f.lot
+                         AND e.created_at >= f.at
+                         AND (starts_with(e.note,
+                                          'review-designation:' || f.lot
+                                          || ':' || f.freeze_id || ':')
+                              OR starts_with(e.note,
+                                             'review-designation-carried:' || f.lot
+                                             || ':' || f.freeze_id || ':'))
+                       ORDER BY e.id DESC
+                       LIMIT 1
+                  ) mark ON true
             )
-            SELECT name, count(*)::int AS load
-              FROM charges
-             GROUP BY name
+            SELECT o.id AS lot, o.assignee,
+                   m.sha AS freeze_sha, m.note, m.note_id,
+                   v.actor AS verdict_actor, v.sha AS verdict_sha
+              FROM open_items o
+              LEFT JOIN latest_mark m ON m.lot = o.id
+              LEFT JOIN work_item_milestones v
+                     ON v.work_item_id = o.id
+                    AND v.kind = 'verdict'
             """)
     except Exception:  # noqa: BLE001 - unreadable load: zero, never a guess
         return {}
-    out = {}
+    charges: set = set()
+    verdicts: dict = {}
+    marks: dict = {}
     for row in rows or ():
         try:
-            out[str(row["name"])] = int(row["load"])
+            lot_id = int(row["lot"])
         except (KeyError, TypeError, ValueError):
             continue
+        assignee = str(row.get("assignee") or "").strip()
+        if assignee:
+            charges.add((lot_id, assignee))
+        actor = str(row.get("verdict_actor") or "").strip()
+        sha = str(row.get("verdict_sha") or "").strip()
+        if actor and sha:
+            verdicts.setdefault(lot_id, []).append((actor, sha))
+        if lot_id not in marks and row.get("note") is not None:
+            marks[lot_id] = (str(row.get("freeze_sha") or "").strip(),
+                             row.get("note_id"), str(row.get("note") or ""))
+    for lot_id, (frozen_sha, note_id, note) in marks.items():
+        names = _mark_reviewers(note)
+        if names is None:
+            if unreadable is not None:
+                unreadable.append((lot_id, note_id))
+            continue
+        if not frozen_sha:
+            continue
+        rendered = verdicts.get(lot_id) or ()
+        for name in names:
+            if not name:
+                continue
+            lowered = name.lower()
+            discharged = any(
+                str(actor).strip().lower() == lowered
+                and rd._same_freeze(frozen_sha, sha)
+                for actor, sha in rendered)
+            if not discharged:
+                charges.add((lot_id, name))
+    out: dict = {}
+    for _lot_id, name in charges:
+        out[name] = out.get(name, 0) + 1
     return out
+
+
+def _note_unreadable(db, lot: int, state: str,
+                     unreadable: Sequence[tuple]) -> None:
+    """Journal unreadable designation marks once, without failing a freeze.
+
+    The trace is written on the lot whose load observed the mark, the row the
+    freeze transaction already holds: writing on the foreign lot would take a
+    second lot's lock and two concurrent freezes could journal on each other.
+    The line names the offending lot and the note id (#3047). The write is
+    best effort, under a savepoint when a transaction is open: a failed trace
+    must never abort the freeze it explains.
+    """
+    if not unreadable:
+        return
+    in_tx = db_mod.in_transaction(db)
+    for bad_lot, note_id in unreadable:
+        try:
+            bad_lot, note_id = int(bad_lot), int(note_id)
+        except (TypeError, ValueError):
+            continue
+        prefix = "%s%d:%d:" % (UNREADABLE_PREFIX, bad_lot, note_id)
+        text = ("%s unreadable review designation mark ignored in the reviewer"
+                " load (lot #%d, note #%s)" % (prefix, bad_lot, note_id))
+        try:
+            if storage.of(db).work.events_noted(prefix, 0.0, ids=[int(lot)]):
+                continue
+        except Exception:  # noqa: BLE001 - no duplicate proof: write the trace
+            pass
+        try:
+            if in_tx:
+                db.execute("SAVEPOINT review_designation_load_trace")
+            try:
+                storage.of(db).work.note(int(lot), state, text, SENDER)
+            except Exception:  # noqa: BLE001 - a trace never blocks a freeze
+                if in_tx:
+                    db.execute("ROLLBACK TO SAVEPOINT review_designation_load_trace")
+                    db.execute("RELEASE SAVEPOINT review_designation_load_trace")
+                continue
+            if in_tx:
+                db.execute("RELEASE SAVEPOINT review_designation_load_trace")
+        except Exception:  # noqa: BLE001 - best effort only
+            continue
 
 
 def _advances(db) -> dict:
@@ -1050,11 +1152,22 @@ def prepare(cfg, db, lot: int, *, freeze: Optional[Mapping] = None,
     policy = _policy(cfg, db, project, paths)
     if isinstance(policy, Unavailable):
         return policy
+    # #3183 : le plancher posé par un pilote (`review_floor`) relève le compte
+    # de la désignation comme celui de la porte ; un journal illisible attend.
+    floor = review_floor.apply({}, db, int(lot), cfg=cfg)
+    if floor.get("reviews_floor_unreadable"):
+        return Unavailable("review floor unreadable: %s" % floor["reviews_floor_unreadable"])
+    if int(floor.get("reviews_floor") or 0) > policy.required:
+        policy = dataclasses.replace(policy, required=int(floor["reviews_floor"]))
     listing = registry.overview(db)
     notify = _notify(cfg, db, project, listing)
     families = policy.families
+    unreadable: list = []
     candidates = rd.candidates_from_registry(
-        listing, loads=_loads(db), project=project, families=families)
+        listing, loads=_loads(db, unreadable=unreadable), project=project,
+        families=families)
+    if unreadable:
+        _note_unreadable(db, int(lot), str(item.get("state") or ""), unreadable)
     if notify:
         # the pilot receives the capacity alert; the review stays with the
         # project's agents, so the two roles never collapse into one mail

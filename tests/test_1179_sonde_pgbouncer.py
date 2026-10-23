@@ -50,7 +50,7 @@ class OrdinaryPass(unittest.TestCase):
                                log=lambda text: None, clock=lambda: 100.0)
 
     def patched(self):
-        return mock.patch.multiple(notify.Notifier, _brief_orchestrators=mock.DEFAULT,
+        return mock.patch.multiple(notify.Notifier,
                                    _brief_agents=mock.DEFAULT, _github_issues=mock.DEFAULT,
                                    _ci_failures=mock.DEFAULT)
 

@@ -26,7 +26,10 @@ auteurs, avec les mêmes exceptions du canon §2 :
   contenu subsiste restent auteurs de la tête. Une consolidation sur une cible
   avancée, un squash à arbre identique ou le report des lignes significatives
   d'un correctif gardent donc sa famille exclue ; un contenu réellement réécrit
-  ne la reprend pas, et le doute conserve toujours l'auteur ;
+  ne la reprend pas, et le doute conserve toujours l'auteur. Un gel antérieur
+  absent du clone de lecture est demandé à la forge (`origin`) par SHA exact,
+  quel que soit l'appelant (#3147) : le résultat de la porte ne dépend pas du
+  clone ;
 * quand le reçu exact manque (commit restauré par rebase, correction poussée
   hors du hook), le commit est attribué à la famille de session de son
   committer, lue au journal des tours (`turn_costs`, `_turns_harness`) : un
@@ -300,13 +303,39 @@ def change(repo: str, sha: str) -> Optional[tuple[int, bool]]:
     return lines, design
 
 
-def commit_actor(repo: str, sha: str) -> tuple[str, float]:
+def _registered(db, name: str) -> bool:
+    if db is None or not name:
+        return False
+    try:
+        return registry.get(db, name) is not None
+    except Exception:  # noqa: BLE001 - registre illisible : inconnu
+        return False
+
+
+def _agent_of_email(db, email: str, stamp: float) -> str:
+    """L'agent d'une adresse de commit, ou "" (#3111).
+
+    `<nom>@ameesh.invalid` comme avant ; l'ancien `<nom>@ameesh.local` d'un
+    commit d'avant la convention (`identity.LEGACY_GIT_EMAIL_UNTIL`) seulement
+    vers un agent du registre, même quand il est la référence. La famille se
+    prouve ensuite comme pour tout commit sans reçu : journal des tours."""
+    from . import identity
+
+    name = identity.agent_of_git_email(email, stamp, legacy=False)
+    if name:
+        return name
+    name = identity.agent_of_git_email(email, stamp)
+    return name if name and _registered(db, name) else ""
+
+
+def commit_actor(repo: str, sha: str, db=None) -> tuple[str, float]:
     """`(acteur, instant)` du committer d'adresse d'agent, sinon ("", 0).
 
     Le committer est l'agent qui a créé l'objet (un rebase le réécrit) ; le nom
     Git seul ne prouve rien, l'adresse `<nom>@ameesh.invalid` est celle du
-    runner. L'instant sert au journal des tours, jamais à une proximité
-    arbitraire."""
+    runner. L'ancienne adresse `<nom>@ameesh.local` n'est lue qu'avec `db`,
+    datée d'avant la convention et vers un agent du registre (#3111).
+    L'instant sert au journal des tours, jamais à une proximité arbitraire."""
     text = plan_git._out(repo, "show", "-s", "--format=%ce%x1f%ct", sha)
     if text is None:
         return "", 0.0
@@ -318,38 +347,40 @@ def commit_actor(repo: str, sha: str) -> tuple[str, float]:
         stamp = float(raw_ts)
     except ValueError:
         return "", 0.0
-    from .identity import GIT_EMAIL_DOMAIN
-    suffix = "@" + GIT_EMAIL_DOMAIN
-    if not email.endswith(suffix):
+    actor = _agent_of_email(db, email, stamp)
+    if not actor:
         return "", 0.0
-    return email[:-len(suffix)], stamp
+    return actor, stamp
 
 
-def commits_written_by(repo: str, commits: Sequence[str], name: str) -> Optional[bool]:
+def commits_written_by(repo: str, commits: Sequence[str], name: str,
+                       db=None) -> Optional[bool]:
     """Un commit de la plage porte `name` comme **auteur Git** (`%ae`).
 
     L'auteur Git est la signature du contenu ; le committer (`commit_actor`)
     est l'agent qui a créé l'objet. Un amend ou un rebase conserve l'auteur
     d'origine et change le committer : les deux ont écrit la plage (#2808).
     Le nom Git seul ne prouve rien : l'adresse `<nom>@ameesh.invalid` est
-    exigée, comme pour le committer."""
+    exigée, comme pour le committer, ou l'ancienne `<nom>@ameesh.local` datée
+    (`%at`) d'avant la convention, vers un agent du registre (#3111)."""
     if not repo or not name:
         return False
     shas = [str(sha).strip() for sha in commits or () if str(sha).strip()]
     if not shas:
         return False
-    text = plan_git._out(repo, "log", "--no-walk", "--format=%H%x1f%ae", *shas)
+    text = plan_git._out(repo, "log", "--no-walk", "--format=%H%x1f%ae%x1f%at", *shas)
     if text is None or len(str(text).splitlines()) != len(set(shas)):
         return None                     # unreadable is not proof of absence
-    from .identity import GIT_EMAIL_DOMAIN
-    suffix = "@" + GIT_EMAIL_DOMAIN
     wanted = str(name).strip().lower()
     for line in str(text).splitlines():
-        _sha, separator, email = line.partition("\x1f")
-        if not separator:
+        fields = line.split("\x1f")
+        if len(fields) != 3:
             return None
-        email = email.strip().lower()
-        if email.endswith(suffix) and email[:-len(suffix)] == wanted:
+        try:
+            stamp = float(fields[2].strip())
+        except ValueError:
+            return None
+        if _agent_of_email(db, fields[1], stamp) == wanted:
             return True
     return False
 
@@ -749,7 +780,7 @@ def _prior_reading(db, item: Mapping, freeze: Mapping, commits: Sequence[str],
             unknown.append(sha[:12])
             continue
         if receipt is None:
-            actor, stamp = commit_actor(repo, sha)
+            actor, stamp = commit_actor(repo, sha, db)
             if not actor:
                 unknown.append(sha[:12])
                 continue
@@ -840,6 +871,41 @@ def _superseded_freeze_ids(freezes: Sequence[Mapping]) -> set[int]:
     return out
 
 
+def _forge_fetch(repo: str, sha: str) -> bool:
+    """Rapatrie le commit exact `sha` depuis la forge du clone (`origin`).
+
+    #3147 : la forge sert encore par SHA un commit devenu inaccessible après un
+    push forcé ; un clone récent ne l'a pas dans ses objets. La lecture de
+    provenance ne doit donc pas dépendre du clone : elle demande le seul commit
+    exact à `origin`, sans déplacer aucune ref et sans écrire `FETCH_HEAD`.
+    Un SHA abrégé ne se demande pas (Git exige l'identifiant complet), un
+    dépôt sans `origin` n'a pas de forge, et un objet que la forge ne sert pas
+    laisse l'absence : le refus fermé de #2924 B5 reste la règle.
+    """
+    text = plan_git.full_commit_id(sha)
+    if not text:
+        return False
+    try:
+        if plan_git.local_commit(repo, text):
+            return True
+    except Exception:  # noqa: BLE001 - dépôt illisible : aucune récupération
+        return False
+    try:
+        if plan_git._out(repo, "remote", "get-url", "origin") is None:
+            return False
+        proc = plan_git._git(
+            repo, "fetch", "--quiet", "--no-tags", "--no-write-fetch-head",
+            "--", "origin", text, timeout=plan_git.FETCH_TIMEOUT)
+    except Exception:  # noqa: BLE001 - forge injoignable : absence
+        return False
+    if proc.returncode != 0:
+        return False
+    try:
+        return bool(plan_git.local_commit(repo, text))
+    except Exception:  # noqa: BLE001 - lecture impossible : absence
+        return False
+
+
 def _carried_from_previous(db, item: Mapping, milestone: Optional[Mapping],
                            commits: Sequence[str], repo: str, families, *,
                            base: str = "", head: str = "", provider=None,
@@ -854,12 +920,11 @@ def _carried_from_previous(db, item: Mapping, milestone: Optional[Mapping],
     plage courante ajoute un inconnu : l'appelant strict refuse, la désignation
     attend (jamais de famille supposée).
 
-    #2924 B7 : `recover(sha)` est le seul moyen autorisé de réparer un gel
-    antérieur absent du dépôt de lecture (le clone scratch de `merge-pr` ne
-    porte que la cible et la tête). Il est appelé **avant** de déclarer le gel
-    illisible ; s'il échoue, le refus fermé de B5 reste la règle. Le lecteur
-    direct (sans `recover`) garde le refus : une absence non réparée ne prouve
-    jamais l'absence d'un correcteur.
+    #2924 B7 : `recover(sha)` est une source de réparation supplémentaire du
+    # gel antérieur absent (le dépôt de l'agent, une autre origine) ; #3147
+    # ajoute la forge du clone (`origin`), tentée par SHA exact **quel que soit
+    # l'appelant**. Une forge qui ne sert pas l'objet laisse le refus fermé de
+    # B5 : une absence non réparée ne prouve jamais l'absence d'un correcteur.
 
     #2989 : un gel **déclaré remplacé** par un gel postérieur et dont le SHA
     est absent (même après `recover`) est ignoré : c'est un gel fantôme, son
@@ -954,13 +1019,27 @@ def _carried_from_previous(db, item: Mapping, milestone: Optional[Mapping],
             return False
 
     def recover_one(commit: str) -> bool:
-        """Tente de rapatrier un gel absent ; True seulement s'il est lisible."""
-        if recover is None:
-            return False
+        """Tente de rapatrier un gel absent ; True seulement s'il est lisible.
+
+        #3147 : la forge du clone est **toujours** tentée par SHA exact, même
+        sans `recover` d'appelant ; `recover` reste une source supplémentaire
+        (dépôt de l'agent, autre origine) essayée d'abord quand elle est
+        fournie. Un hook qui échoue ne prive pas la forge de sa tentative ;
+        une forge qui ne sert pas l'objet laisse le refus fermé.
+        """
         try:
             if present(commit):
                 return True
-            return bool(recover(commit)) and present(commit)
+        except Exception:  # noqa: BLE001 - dépôt illisible : absence
+            return False
+        if recover is not None:
+            try:
+                if recover(commit) and present(commit):
+                    return True
+            except Exception:  # noqa: BLE001 - source en échec : la forge reste
+                pass
+        try:
+            return _forge_fetch(repo, commit) and present(commit)
         except Exception:  # noqa: BLE001 - récupération en échec : absence
             return False
 
@@ -1135,9 +1214,11 @@ def reading(db, item: Mapping, milestone: Optional[Mapping],
     `head` (la tête lue) permettent la preuve de contenu ; sans eux, le gel le
     plus récent présent dans `commits` tient lieu de tête. Un contenu
     réellement réécrit n'est pas repris ; le doute conserve l'auteur.
-    `recover(sha)` (#2924 B7) permet à la porte de rapatrier un gel antérieur
-    absent de son clone scratch avant de refuser ; sans lui, le lecteur garde
-    le refus fermé de B5. Un acteur prouvé sous plusieurs familles dans un gel
+    `recover(sha)` (#2924 B7) est une source supplémentaire pour rapatrier un
+    gel antérieur absent du clone de lecture ; #3147 fait en sorte que la forge
+    du clone (`origin`) soit **toujours** tentée par SHA exact, même sans
+    `recover`. Un objet que la forge ne sert pas garde le refus fermé de B5. Un
+    acteur prouvé sous plusieurs familles dans un gel
     antérieur garde tout l'ensemble (`families_out`), jamais la seule famille
     du reçu courant.
     """
@@ -1169,7 +1250,7 @@ def reading(db, item: Mapping, milestone: Optional[Mapping],
             unknown.append(sha[:12])
             continue
         if receipt is None:
-            actor, stamp = commit_actor(repo, sha)
+            actor, stamp = commit_actor(repo, sha, db)
             if not actor:
                 unknown.append(sha[:12])
                 continue
@@ -1225,7 +1306,7 @@ def reading(db, item: Mapping, milestone: Optional[Mapping],
         authored = next((name for name in by_name
                          if name.lower() == author_name.lower()), "")
         if not authored:
-            written = commits_written_by(repo, commits, author_name)
+            written = commits_written_by(repo, commits, author_name, db)
             if written is None:
                 unknown.extend(str(sha)[:12] for sha in commits if str(sha)[:12] not in unknown)
             elif written:

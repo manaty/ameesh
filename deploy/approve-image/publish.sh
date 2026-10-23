@@ -46,9 +46,17 @@ api="https://$registry/v2/$repo"
 accept='application/vnd.oci.image.manifest.v1+json, application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.v2+json, application/vnd.docker.distribution.manifest.list.v2+json'
 
 work="$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/ameesh-approve-publish.XXXXXX")"
+# B1 de la relecture #3166 (auditeur, 23/10/2026) : `docker login` ecrit ses
+# identifiants dans $DOCKER_CONFIG/config.json. Sans configuration propre, il
+# ecrirait le jeton `packages:write` dans le ~/.docker partage de
+# l'utilisateur, lisible par les jobs concurrents des autres runners, et
+# `docker logout` les deconnecterait. La configuration vit donc sous $work
+# (0700) et disparait avec lui.
+export DOCKER_CONFIG="$work/docker"
+mkdir -m 700 "$DOCKER_CONFIG"
 cleanup() {
-  rm -rf "$work"
   docker logout "$registry" >/dev/null 2>&1 || true
+  rm -rf "$work"
 }
 trap cleanup EXIT
 

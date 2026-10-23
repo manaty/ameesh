@@ -452,11 +452,14 @@ def from_config(cfg, *, log: Callable[[str], None] | None = None) -> Optional[Ho
 # bail d'un hôte volatil
 # --------------------------------------------------------------------------
 
-def lease_ttl_for(canons, host: str, default: float) -> float:
-    """Durée du bail des agents de `host` : `policy.lease_ttl` de sa fiche
-    Host (le plus court de tous les canons), sinon 90 s si une fiche le dit
-    volatil (`policy.volatile`), sinon `default` (configuration de l'hôte).
-    Le serveur (L108, `GET /host`) applique la même règle."""
+def lease_ttl_rule(canons, host: str) -> float | None:
+    """Durée que la fiche Host de `host` impose, ou None si aucune ne la règle.
+
+    `policy.lease_ttl` de sa fiche (le plus court de tous les canons), sinon
+    90 s si une fiche le dit volatil (`policy.volatile`). None veut dire
+    « aucune règle connue » : l'appelant applique alors sa configuration
+    (`lease_ttl_for`). #3123 : la porte du pilote distingue les deux cas.
+    """
     declared: list[float] = []
     volatile = False
     for canon in canons or ():
@@ -472,7 +475,15 @@ def lease_ttl_for(canons, host: str, default: float) -> float:
         return min(declared)
     if volatile:
         return VOLATILE_LEASE_TTL_S
-    return float(default)
+    return None
+
+
+def lease_ttl_for(canons, host: str, default: float) -> float:
+    """Durée du bail des agents de `host` : `lease_ttl_rule` si une fiche
+    Host la règle, sinon `default` (configuration de l'hôte).
+    Le serveur (L108, `GET /host`) applique la même règle."""
+    rule = lease_ttl_rule(canons, host)
+    return float(default) if rule is None else rule
 
 
 # --------------------------------------------------------------------------

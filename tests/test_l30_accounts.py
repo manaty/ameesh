@@ -98,7 +98,21 @@ class ProfilsTest(unittest.TestCase):
         bon = _dossier(os.path.join(self.tmp, "bon"), creds=".credentials.json")
         p = lambda chemin: accounts.Profile("claude", "x", path=chemin)  # noqa: E731
         self.assertTrue(any("not private" in m for m in accounts.check(p(ouvert))))
-        self.assertTrue(any("credentials missing" in m for m in accounts.check(p(sans))))
+        # macOS can keep Claude credentials in the keychain instead of this
+        # file (L65): the absence is still a problem there, read from the
+        # keychain; Codex keeps its `auth.json` file check. Exercise both
+        # contracts regardless of the host running the suite.
+        for macos in (False, True):
+            for harness in ("claude", "codex"):
+                with self.subTest(macos=macos, harness=harness), mock.patch.object(
+                        accounts.platform, "is_macos", return_value=macos):
+                    profile = accounts.Profile(harness, "x", path=sans)
+                    problems = accounts.check(profile)
+                    if macos and harness == "claude":
+                        self.assertTrue(any("Keychain" in m for m in problems), problems)
+                    else:
+                        self.assertTrue(any("credentials missing" in m for m in problems),
+                                        problems)
         self.assertEqual(accounts.check(p(bon)), [])
         self.assertTrue(accounts.check(p(os.path.join(self.tmp, "absent"))))
         codex = accounts.Profile("codex", "c", path=_dossier(

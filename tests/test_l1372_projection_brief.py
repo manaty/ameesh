@@ -7,12 +7,14 @@ fin du canon (§12 paquets, §14 staging) n'est plus mangée par le début.
 
 Sans projection utilisable, la perte n'est plus silencieuse : le brief dit que
 seul le début est injecté ; `canon check` signale la carte (projection absente,
-illisible ou au-delà de son budget) sans bloquer aucun agent. Le budget du brief
-(`BRIEF_MAX_BYTES`) ne change pas.
+illisible ou au-delà de son budget) sans bloquer aucun agent. #3126 relève les
+budgets à 19 000 / 14 600 octets, réserve texte inchangée à 4 000, et prévient
+dès 90 % du budget de projection.
 
 Diagnostic docs-01 #42432 (15/10/2026 00:00) : carte home de 33 472 octets,
-`BRIEF_MAX_BYTES` = 16 000 moins la part réservée au texte (min 4 000) → la
-coupe tombait dans §7 ; §12 et §14 n'étaient jamais injectés.
+`BRIEF_MAX_BYTES` valait alors 16 000 (19 000 depuis #3126) moins la part
+réservée au texte (min 4 000) → la coupe tombait dans §7 ; §12 et §14
+n'étaient jamais injectés.
 """
 from __future__ import annotations
 
@@ -20,7 +22,7 @@ import dataclasses
 import os
 import unittest
 
-from ameesh import canon, config as config_mod, reprise
+from ameesh import adapters, canon, config as config_mod, mail, reprise
 
 from .support import PgTestCase
 from .test_canon import _TmpMixin, codes, commit_all, write
@@ -29,7 +31,7 @@ from .test_l538_process_inject import RACINE, TITRE, _canon_approuve, carte
 DEBUT = canon.PROCESS_PROJECTION_START
 FIN = canon.PROCESS_PROJECTION_END
 
-#: une règle bavarde : le corps dépasse la part de règles d'un brief (≈ 11 900
+#: une règle bavarde : le corps dépasse la part de règles d'un brief (≈ 14 900
 #: octets), comme la carte home — sans projection, §12 et §14 tombent.
 BAVARD = "- une règle très bavarde et répétée\n"
 
@@ -151,11 +153,12 @@ class ProjectionLectureTest(_TmpMixin, unittest.TestCase):
                            canon.PROCESS_PROJECTION_MAX)
         findings = canon.validate(loaded)
         self.assertIn("process-projection-too-long", codes(findings))
+        self.assertNotIn("process-projection-near-limit", codes(findings))
         self.assertNotIn("process-too-long", codes(findings))
         self.assertEqual(canon.blocking(findings).global_errors, [])
 
     def test_une_projection_au_budget_est_valide(self):
-        # la borne haute est INCLUSIVE : au budget exact, aucun constat
+        # La borne haute est inclusive : préavis, mais aucune coupe.
         exacte = "a" * canon.PROCESS_PROJECTION_MAX
         loaded = self.charge(carte_longue(exacte))
         self.assertEqual(len(loaded.processes[0].projection.encode()),
@@ -163,7 +166,28 @@ class ProjectionLectureTest(_TmpMixin, unittest.TestCase):
         findings = canon.validate(loaded)
         self.assertNotIn("process-too-long", codes(findings))
         self.assertNotIn("process-projection-too-long", codes(findings))
+        self.assertIn("process-projection-near-limit", codes(findings))
         self.assertEqual(loaded.processes[0].projection_error, "")
+
+    def test_le_preavis_a_90_pourcent_compte_les_octets_utf8(self):
+        # #3137 : le prédicat du code est `proj * 10 >= MAX * 9`, soit
+        # `proj >= ⌈9·MAX/10⌉` ; `MAX*9//10` (plancher) rate la borne d'un
+        # octet quand le budget est impair.
+        seuil = (canon.PROCESS_PROJECTION_MAX * 9 + 9) // 10
+        for taille in (seuil - 1, seuil, seuil + 1, 13352):
+            with self.subTest(octets=taille):
+                texte = "é" * (taille // 2) + "a" * (taille % 2)
+                loaded = self.charge(carte_longue(texte))
+                findings = canon.validate(loaded)
+                preavis = [f for f in findings
+                           if f.code == "process-projection-near-limit"]
+                self.assertEqual(bool(preavis), taille >= seuil)
+                self.assertNotIn("process-projection-too-long", codes(findings))
+                if preavis:
+                    self.assertEqual(preavis[0].severity, canon.WARNING)
+                    self.assertIn(str(taille), preavis[0].message)
+                    self.assertIn(str(canon.PROCESS_PROJECTION_MAX), preavis[0].message)
+                self.assertEqual(canon.blocking(findings).global_errors, [])
 
     def test_la_projection_est_exposee_dans_show_json(self):
         loaded = self.charge(carte_longue())
@@ -330,11 +354,42 @@ class ProjectionBriefTest(_TmpMixin, PgTestCase):
         self.assertNotIn("\ufffd", bloc)
         bloc.encode("utf-8").decode("utf-8")
 
-    def test_le_budget_du_brief_ne_change_pas(self):
-        # #1372 : la correction passe par la projection, pas par une hausse du
-        # budget ; toute hausse exige une décision owner distincte
-        self.assertEqual(reprise.BRIEF_MAX_BYTES, 16000)
+    def test_les_budgets_gardent_la_meme_reserve_texte(self):
+        # #3126 : hausse de budget décidée par mesh-design (courrier #127249
+        # du 23/10/2026), compétence mesh-design/bureau confirmée par l'avis
+        # auditeur #127227 — pas une décision owner.
+        self.assertEqual(reprise.BRIEF_MAX_BYTES, 19000)
+        self.assertEqual(canon.PROCESS_PROJECTION_MAX, 14600)
         self.assertEqual(reprise.BRIEF_TEXT_MIN_BYTES, 4000)
+
+    def test_le_plafond_nominal_de_consigne_et_le_pire_cas_sont_documentes(self):
+        # #3137 : un brief plein (BRIEF_MAX_BYTES) et son cadre de reprise
+        # dépassent déjà le plafond nominal AMEESH_PROMPT_MAIL_MAX (20 000 o) ;
+        # PROMPT_MIN_BYTES garantit alors au courrier de quoi porter un message.
+        # docs/EXPLOITATION.md documente le pire cas (~22 045 o) : une hausse
+        # d'un budget ou du cadre rouvre ce calcul, jamais une coupe silencieuse.
+        cadre = mail.octets(adapters.resume_prompt(""))
+        pire = reprise.BRIEF_MAX_BYTES + cadre + mail.PROMPT_MIN_BYTES
+        self.assertEqual(mail.PROMPT_MAX_BYTES, 20000)
+        self.assertEqual(config_mod.Config().prompt_mail_max, 20000)
+        self.assertEqual(cadre, 1045)
+        self.assertEqual(pire, 22045)
+        self.assertGreater(pire, mail.PROMPT_MAX_BYTES)
+
+    def test_la_projection_de_13352_octets_garde_le_paragraphe_15(self):
+        fin = "\n### §15 Staging et prod de Nexlink\n- prod = release + go owner."
+        taille = 13352
+        proj = "a" * (taille - len(fin.encode("utf-8"))) + fin
+        write(self.clone, RACINE, carte_longue(proj))
+        commit_all(self.clone, "projection de 13 352 octets avec fin de §15")
+        texte = reprise.with_process_rules(
+            self.cfg, "b" * reprise.BRIEF_TEXT_MIN_BYTES,
+            agent="ouvrier", host=self.cfg.host)
+        self.assertIn(proj, texte)
+        self.assertIn("b" * reprise.BRIEF_TEXT_MIN_BYTES, texte)
+        self.assertNotIn("[…]", texte)
+        self.assertNotIn("too long", texte)
+        self.assertLessEqual(len(texte.encode()), reprise.BRIEF_MAX_BYTES)
 
     def test_une_projection_a_son_budget_est_injectee_entiere(self):
         # borne haute : une projection de exactement `PROCESS_PROJECTION_MAX`

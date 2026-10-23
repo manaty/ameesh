@@ -875,15 +875,22 @@ class AgentHostTest(unittest.TestCase):
         self.assertFalse((self.state / 'pause-dev9').exists())
 
     def test_human_lift_before_the_resume_leaves_no_stale_drain(self):
-        """N5 B2 : notre drain est levé par un humain après la pose ; la levée
-        conditionnelle ne retrouve plus la nôtre et ne pose rien de périmé."""
+        """N5 B2 / #3114 : le drain initial est levé par un humain ; le tour
+        toujours actif reçoit un nouveau drain avant l'arrêt. Seul ce dernier
+        motif est repris, aucune entrée périmée ne reste suivie."""
         self.env['DRAIN_ATTENTE'] = '1'
         p = self.run_vm(scenario='chaines-relance')
         self.assertEqual(p.returncode, 0, p.stderr)
         self.assertNotIn('toujours en tour', p.stderr)
         self.assertTrue((self.state / 'levee-humaine').exists())
         poses = [l for l in self.operateur().splitlines() if l.startswith('pause dev9')]
-        self.assertEqual(len(poses), 1)
+        self.assertEqual(len(poses), 2)
+        motifs = [l.split('--reason ', 1)[1].split(' --human ', 1)[0] for l in poses]
+        self.assertNotEqual(motifs[0], motifs[1])
+        reprises = [l for l in self.operateur().splitlines() if l.startswith('resume dev9')]
+        self.assertEqual(len(reprises), 1)
+        self.assertIn('--expect-reason ' + motifs[1], reprises[0])
+        self.assertNotIn('--expect-reason ' + motifs[0], reprises[0])
         self.assertIn('stop ameesh-runner-agent@dev9.service', self.units())
         self.assertIn('start ameesh-runner-agent@dev9.service', self.units())
         self.assertFalse((self.state / 'pause-dev9').exists())
