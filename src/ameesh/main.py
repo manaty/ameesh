@@ -134,6 +134,10 @@
         turn's account can resume it, otherwise a deterministic resume brief;
   ameesh review-class [--project P] [--diff REF | FILE ...]
         review class of the changed files from the project's policy;
+  ameesh role run <agent> [--min-left S] [--dry-run] [--json] -- <commande…>
+        L165 (EP5) : une minuterie mécanique ne tourne que sur l'hôte qui
+        détient le bail vivant de ce rôle (composeur, veille GitHub, guet CI) ;
+        l'époque du bail est passée à la commande pour la garde EP4 ;
   ameesh role status [ROLE] [--json]   elected roles: holder, epoch, ranked
                                         candidates (L165); the runners publish;
   ameesh run [options]        the machine's runner; `agent-runner` remains
@@ -265,6 +269,11 @@ def _dispatch(argv: list[str] | None) -> int:
         print(__doc__)
         return 0
     command, rest = argv[0], argv[1:]
+    if command == "role" and rest[:1] == ["run"]:
+        # L165 (EP5) : minuterie gardée par le bail du rôle. Routé avant
+        # `role status` (EP2) : les deux sous-commandes vivent dans `role`.
+        from . import role_run
+        return role_run.main(rest[1:])
     if command == "module":
         from . import modules
         return modules.main(rest)

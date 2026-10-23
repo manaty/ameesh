@@ -1745,6 +1745,24 @@ class WorkItems(Domain):
         """
 
     @abc.abstractmethod
+    def train_adopt(self, key: str, owner: str, *, revision: int,
+                    previous: tuple | None, service: tuple, ttl_s: float) -> dict | None:
+        """#3142: the train service's current holder takes over the target
+        reservation another `train:*` owner left behind.
+
+        In one transaction: ``service`` (key, owner, epoch) must be the live
+        service lease; the target row must be held by another `train:*`
+        owner (at ``previous`` (owner, epoch) when given, expired or not);
+        the train document must still be at ``revision``. The row passes to
+        ``owner`` at the next epoch, so every write of the old epoch is
+        refused afterwards. A reservation ticket of the document naming the
+        held (owner, epoch) is rewritten to the new ones; with ``previous``,
+        it must exist.
+        Never takes an ordinary (non-`train:*`) reservation. Returns
+        {epoch, previous_owner, previous_epoch}, or None.
+        """
+
+    @abc.abstractmethod
     def train_fire_read(self, key: str, plan_id: str) -> dict | None:
         """#1467: latest persisted fire receipt, including withdrawn history."""
 
