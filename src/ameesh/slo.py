@@ -150,11 +150,37 @@ def targets(level_: int, *, critical: bool = False) -> tuple:
 # mesure depuis les événements du lot
 # --------------------------------------------------------------------------
 
-def _first_event(events: Iterable[dict], state: str) -> float | None:
-    """Le premier instant où le lot est vu dans cet état (transition ou note)."""
-    stamps = [ev.get("created_ts") for ev in events if ev.get("state") == state]
-    stamps = [float(s) for s in stamps if s is not None]
+def start_ts(events: Iterable[dict]) -> float | None:
+    """L'instant mesuré du début du lot : le premier passage en `build`, ou le
+    début mesuré (premier tour du porteur, `estimates.START_NOTE`) s'il est
+    antérieur (#3162). Un lot dont le porteur travaille déjà reste parfois en
+    intake : le début mesuré conclut alors `intake_started`. `None` sans
+    aucun de ces faits."""
+    from . import estimates
+
+    stamps = [float(ev["created_ts"]) for ev in events
+              if ev.get("created_ts") is not None
+              and (ev.get("state") == "build"
+                   or (ev.get("note") or "").startswith(estimates.START_NOTE))]
     return min(stamps) if stamps else None
+
+
+def begun(events: Iterable[dict], jalons: dict | None = None) -> bool:
+    """Le lot porte une preuve de début sans date de début (#3162) : une
+    branche associée (`work.set_branch`, `attach_implicit_branch` : note
+    `branch … (before: …)`, hors détachement) ou un gel (`jalons["frozen"]`).
+    Il n'est plus « prêt, pas démarré » — aucune alerte —, mais l'instant de
+    son début reste inconnu : aucune durée n'est inventée (#1982)."""
+    from . import work
+
+    if (jalons or {}).get("frozen") is not None:
+        return True
+    for ev in events:
+        note = ev.get("note") or ""
+        if (note.startswith("branch ") and " (before: " in note
+                and not note.startswith(work.DETACH_NOTE)):
+            return True
+    return False
 
 
 def assigned_ts(item: dict, events: Iterable[dict]) -> float | None:
@@ -412,7 +438,9 @@ def lot_steps(item: dict, jalons: dict, events: Iterable[dict], *,
         else:
             out.append(_row(step, requested, now=now, critical=critical))
 
-    started = _first_event(events, "build")
+    # #3162 : le début mesuré conclut l'étape comme le passage en build, même
+    # quand le lot est resté en intake.
+    started = start_ts(events)
     if requested is not None and state not in ("merged", "promoted", "closed"):
         step = step_of("intake_started")
         ready = intake_ready_ts(assigned, requested, dependencies, started=started)
@@ -443,6 +471,10 @@ def lot_steps(item: dict, jalons: dict, events: Iterable[dict], *,
             out.append(_row(step, ready, now=now, critical=critical,
                             done_ts=round(started, 3),
                             elapsed_s=int(max(0.0, started - float(ready)))))
+        elif begun(events, jalons):
+            # #3162 : branche associée ou gel — le lot est commencé, mais son
+            # début n'est pas daté : ni retard ni durée inventés (#1982).
+            pass
         elif state == "intake" and now >= float(ready):
             # prêt, pas encore démarré : le délai court depuis que le lot est
             # prêt. Passé intake sans événement `build` (#1982), la phase est
