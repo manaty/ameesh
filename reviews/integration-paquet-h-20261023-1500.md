@@ -41,7 +41,39 @@ pas dans ce paquet d'urgence : ils passent au créneau suivant. Sont reportés
 #3012 est inclus : son hold de 13:03Z peut être levé par impl-04 ; il n'est pas
 exclu des candidats.
 
+Le créneau suivant (14:00Z, audit 13:37Z) prend **#3126 en tête**, puis les
+prêts restants listés par mesh-design (#127546) : #3029, #3099, #3098, #3135,
+#3138. #3057 et #3007 sont en conflit connu : un seul des deux passe, l'autre
+au créneau d'après.
+
+## Contrôles
+
+- **Prévalidation** : indisponible (`card-stale` : carte vieille de 141 h au
+  23/10 13:33Z) ; non bloquant, motif consigné (canon §3).
+- **Tests ciblés** : `tests.test_l165_ep4_pilot_gesture` 36/36 verts sur la
+  tête de composition après l'adaptation de banc ci-dessous (23/10 13:42Z).
+
+## CI rouge sur `b15617324` — adaptation de banc (EP3 × EP4)
+
+La première suite complète (run `39962178242`) échoue d'abord sur deux témoins
+EP4 :
+
+- `GestureFenceTest.test_ancienne_epoque_refusee_et_nomme_le_detenteur`
+- `GestureFenceTest.test_role_timer_epoque_perimee_refusee`
+
+Cause : ces bancs font une relève croisée (`registry.release` puis
+`registry.claim(..., host="h2")`) ; avec EP3 (#3012) cette relève exige
+`election_brief`, sinon le CAS refuse et `claim` rend `None`, d'où
+`assertIsNotNone(lease)`. Les témoins EP4 (#3013) ont été écrits sur une base
+sans EP3. Aucun défaut produit : adaptation de banc seule, aucun avis requis
+(§2). Les deux claims reçoivent `election_brief="brief-h2"` ; les 16 autres
+relèves croisées du même fichier sont adaptées à l'identique afin de continuer
+d'exercer la garde d'époque (sans le brief, elles retombaient sur « pas de
+bail »). Aucun autre fichier touché.
+
 ## CI
 
-Suite complète sur la tête finale : en cours (`scripts/test.sh` via
-`ameesh heavy`). Le manifeste est complété avec le verdict CI avant la fusion.
+La suite complète unique est relancée sur la tête finale qui porte ce
+manifeste (étiquette `ci-full-<tête>`, auto-merge armé vers `main`) ; le
+verdict est le run de la PR sur cette tête. La tête `b15617324`, remplacée, est
+abandonnée (run annulé).
