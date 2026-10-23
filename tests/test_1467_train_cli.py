@@ -27,9 +27,29 @@ class TrainCommandTest(PgTestCase):
         before = self.ledger.load()
         result = self.execute("show")
         self.assertEqual(result, dict(phase="ci", revision=before["revision"],
-                                     plan=self.plan, fire=self.fire))
+                                     plan=self.plan, fire=self.fire,
+                                     enrollment_deferred=[],
+                                     enrollment_checked_ts=None))
         self.assertEqual(self.ledger.load(), before)
         self.assertEqual(self.fires.ops.train_fire_read(self.ledger.key, self.plan["id"]), self.fire)
+
+    def test_show_names_each_deferred_enrollment_without_a_plan(self):
+        # #3139: a train that could not enroll a single candidate has no plan
+        # but still carries the per-lot refusal the pilot must read.
+        deferred = [dict(lot=3012, branch="lot/3012-election-standby-brief",
+                         frozen_sha="a" * 40, frozen_id=16279,
+                         reason="prior freeze c5d4348160c5 is absent",
+                         checked_ts=1792759301.5)]
+        self.ledger.save(dict(schema=train.SCHEMA, source="github.com/o/r",
+                              target="main", phase="empty",
+                              enrollment_deferred=deferred,
+                              enrollment_checked_ts=1792759301.5),
+                         self.document["revision"], self.epoch)
+        result = self.execute("show")
+        self.assertEqual(result["plan"], {})
+        self.assertIsNone(result["fire"])
+        self.assertEqual(result["enrollment_checked_ts"], 1792759301.5)
+        self.assertEqual(result["enrollment_deferred"], deferred)
 
     def test_withdrawal_and_regrant_bind_session_and_exact_receipt(self):
         with mock.patch.object(work, "corrector", return_value="pilot") as guard:

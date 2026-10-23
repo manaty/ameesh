@@ -26,10 +26,17 @@ def execute(cfg, db, project, action, *, manifest=None, receipt=None):
         state = ledger.load()
         if state is None:
             raise TrainError("no persisted train for this project target")
-        plan = state.get("plan", {})
-        train_fire.binding(plan)
+        plan = state.get("plan") or {}
+        fire = None
+        if plan:
+            train_fire.binding(plan)
+            fire = ledger.ops.train_fire_read(ledger.key, plan["id"])
+        # #3139: a train may hold only the enrollment record (no packet yet).
+        # The pilot reads the refusals here, lot by lot, without the code.
         return dict(phase=state["phase"], revision=state["revision"], plan=plan,
-                    fire=ledger.ops.train_fire_read(ledger.key, plan["id"]))
+                    fire=fire,
+                    enrollment_deferred=state.get("enrollment_deferred") or [],
+                    enrollment_checked_ts=state.get("enrollment_checked_ts"))
     if action not in ("give", "withdraw"):
         raise TrainError("train command: show | give | withdraw expected")
     train_fire.binding(manifest)
