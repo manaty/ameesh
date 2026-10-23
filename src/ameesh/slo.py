@@ -150,11 +150,37 @@ def targets(level_: int, *, critical: bool = False) -> tuple:
 # mesure depuis les événements du lot
 # --------------------------------------------------------------------------
 
-def _first_event(events: Iterable[dict], state: str) -> float | None:
-    """Le premier instant où le lot est vu dans cet état (transition ou note)."""
-    stamps = [ev.get("created_ts") for ev in events if ev.get("state") == state]
-    stamps = [float(s) for s in stamps if s is not None]
+def start_ts(events: Iterable[dict]) -> float | None:
+    """L'instant mesuré du début du lot : le premier passage en `build`, ou le
+    début mesuré (premier tour du porteur, `estimates.START_NOTE`) s'il est
+    antérieur (#3162). Un lot dont le porteur travaille déjà reste parfois en
+    intake : le début mesuré conclut alors `intake_started`. `None` sans
+    aucun de ces faits."""
+    from . import estimates
+
+    stamps = [float(ev["created_ts"]) for ev in events
+              if ev.get("created_ts") is not None
+              and (ev.get("state") == "build"
+                   or (ev.get("note") or "").startswith(estimates.START_NOTE))]
     return min(stamps) if stamps else None
+
+
+def begun(events: Iterable[dict], jalons: dict | None = None) -> bool:
+    """Le lot porte une preuve de début sans date de début (#3162) : une
+    branche associée (`work.set_branch`, `attach_implicit_branch` : note
+    `branch … (before: …)`, hors détachement) ou un gel (`jalons["frozen"]`).
+    Il n'est plus « prêt, pas démarré » — aucune alerte —, mais l'instant de
+    son début reste inconnu : aucune durée n'est inventée (#1982)."""
+    from . import work
+
+    if (jalons or {}).get("frozen") is not None:
+        return True
+    for ev in events:
+        note = ev.get("note") or ""
+        if (note.startswith("branch ") and " (before: " in note
+                and not note.startswith(work.DETACH_NOTE)):
+            return True
+    return False
 
 
 def assigned_ts(item: dict, events: Iterable[dict]) -> float | None:
@@ -223,6 +249,44 @@ def handover_ts(item: dict, events: Iterable[dict]) -> float | None:
         if at is not None and (last is None or float(at) > last):
             last = float(at)
     return last
+
+
+#: #2916 : les états de retenue (`work.WAITING`), où le lot n'attend pas un
+#: exécutant mais la levée de la retenue. Le délai intake ne court pas
+#: pendant une retenue.
+HOLDS = ("blocked", "waiting_human")
+
+
+def hold_release_ts(events: Iterable[dict], *,
+                    started: float | None = None) -> float | None:
+    """Le dernier instant où le lot est sorti d'une retenue (#2916).
+
+    Un lot `blocked` ou `waiting_human` n'attend pas un preneur : il attend la
+    levée de sa retenue (déblocage, décision de l'owner). Le temps passé sous
+    retenue n'est donc pas un retard intake ; au retour en intake, l'horloge
+    repart de ce retour, comme de la levée d'une dépendance (#2551).
+
+    Les transitions sont lues dans l'ordre d'écriture `(created_ts, id)` : une
+    note qui répète l'état n'est pas une transition. `None` sans retenue. Un
+    lot déjà démarré garde sa mesure : seules les levées antérieures au début
+    comptent, une retenue ajoutée après le début ne réécrit pas le passé.
+    """
+    ordered = sorted(events or (),
+                     key=lambda ev: (float(ev.get("created_ts") or 0.0),
+                                     int(ev.get("id") or 0)))
+    released = None
+    previous = None
+    for event in ordered:
+        state = event.get("state")
+        at = event.get("created_ts")
+        if previous in HOLDS and state not in HOLDS and at is not None:
+            stamp = float(at)
+            # #2921 : une levée postérieure au premier build ne réécrit pas la
+            # mesure acquise — on garde la dernière levée antérieure au début.
+            if started is None or stamp <= float(started):
+                released = stamp
+        previous = state
+    return released
 
 
 def intake_ready_ts(assigned: float | None, requested: float | None,
@@ -298,7 +362,8 @@ def _row(step: Step, start, *, now: float, critical: bool, done_ts=None,
 def lot_steps(item: dict, jalons: dict, events: Iterable[dict], *,
               now: float | None = None, packet_slot: float | None = None,
               dependencies: Iterable[dict] = (), packet: bool = False,
-              p80_s: float | None = None, outside_packet: bool = False) -> list:
+              p80_s: float | None = None, outside_packet: bool = False,
+              hold_releases: Iterable[float] = ()) -> list:
     """Les étapes mesurables d'un lot, une ligne par étape applicable.
 
     `jalons` vient de `progress._work_item_milestones` — le SEUL lecteur des
@@ -345,6 +410,16 @@ def lot_steps(item: dict, jalons: dict, events: Iterable[dict], *,
     clôture du bloqueur — par l'appelant). Une dépendance bloquante ouverte ne
     produit pas de ligne `intake_started` ; toutes satisfaites, le départ est
     la levée du dernier bloqueur (`intake_ready_ts`).
+
+    #2916 : une retenue (`blocked`, `waiting_human`) suspend le délai intake,
+    comme une dépendance ouverte : au retour en intake, l'horloge repart de
+    la dernière sortie de retenue (`hold_release_ts`), pas de l'attribution
+    d'origine. Sinon une décision de l'owner rendue après deux jours faisait
+    crier « réattribuer maintenant » sur un lot que son porteur reprenait.
+    #2916/#1225 : `hold_releases` porte les levées des holds explicites de
+    pilote (`hold:`/`unhold:`, #1664), autorisées par l'appelant
+    (`planned_waits.pilot_hold_releases`) — un cas réel nexlink. Le temps
+    parqué sous un hold de pilote n'est pas un retard du porteur.
     """
     events = list(events)
     now = time.time() if now is None else float(now)
@@ -363,10 +438,25 @@ def lot_steps(item: dict, jalons: dict, events: Iterable[dict], *,
         else:
             out.append(_row(step, requested, now=now, critical=critical))
 
-    started = _first_event(events, "build")
+    # #3162 : le début mesuré conclut l'étape comme le passage en build, même
+    # quand le lot est resté en intake.
+    started = start_ts(events)
     if requested is not None and state not in ("merged", "promoted", "closed"):
         step = step_of("intake_started")
         ready = intake_ready_ts(assigned, requested, dependencies, started=started)
+        # #2916 : le temps passé sous retenue n'est pas un retard intake ; au
+        # retour, l'horloge repart de la levée (dernière sortie de retenue).
+        # #1225 : les holds explicites de pilote (#1664) comptent aussi ; leurs
+        # levées sont autorisées par l'appelant et filtrées par `started` ici.
+        released = hold_release_ts(events, started=started)
+        for stamp in hold_releases or ():
+            value = float(stamp)
+            if started is not None and value > float(started):
+                continue
+            if released is None or value > float(released):
+                released = value
+        if ready is not None and released is not None:
+            ready = max(float(ready), released)
         # #2562 : un report planifié ne constitue pas un retard intake.
         from .plan import day_start_ts
         planned = day_start_ts(item.get("planned_start"))
@@ -381,6 +471,10 @@ def lot_steps(item: dict, jalons: dict, events: Iterable[dict], *,
             out.append(_row(step, ready, now=now, critical=critical,
                             done_ts=round(started, 3),
                             elapsed_s=int(max(0.0, started - float(ready)))))
+        elif begun(events, jalons):
+            # #3162 : branche associée ou gel — le lot est commencé, mais son
+            # début n'est pas daté : ni retard ni durée inventés (#1982).
+            pass
         elif state == "intake" and now >= float(ready):
             # prêt, pas encore démarré : le délai court depuis que le lot est
             # prêt. Passé intake sans événement `build` (#1982), la phase est

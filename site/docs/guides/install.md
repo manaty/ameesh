@@ -19,7 +19,7 @@ instead.
 | Platform | State |
 |---|---|
 | **Linux** | The reference platform; the full suite runs in CI. Install and run. |
-| **macOS** | **Supported for a workstation, with a remote database only** (owner answers #9414 and #9416). Install, point the DSN at the mesh's remote database, then install the launchd services with `ameesh service install` (runner and `ameesh notify`); Claude Code credentials are checked in the login Keychain. The full suite is not yet run on macOS in CI (L68): the macOS CI part covers the platform layer, the generated plists and the Keychain lookup. |
+| **macOS** | **Supported for a workstation, with a remote database only** (owner answers #9414 and #9416). Install, point the DSN at the mesh's remote database, then install the launchd services with `ameesh service install` (runner and `ameesh notify`); Claude Code credentials are checked in the login Keychain. Since L68, CI also runs the full suite on macOS against a PostgreSQL installed in the CI step (the job is not a required check until that suite is green there). |
 | **Windows** | **WSL2 only.** Native Windows is deferred (owner answer #9411; lot L67), and ameesh does not start there. Inside WSL2 it is a Linux, so the Linux instructions below apply, with one constraint: the **harness must run inside WSL too**, because ameesh cannot see Windows processes and cannot verify that a session is closed. |
 
 ## Requirements
@@ -217,10 +217,9 @@ described in `docs/BASCULE.md` (in French).
 
 - no PyPI package, and no signed or notarized executable (L69);
 - no native Windows (WSL2 only);
-- on macOS, no full test suite in CI yet (L68): the macOS CI part covers the
-  platform layer, the generated launchd plists and the Keychain lookup, not
-  the whole suite. Local PostgreSQL is not supported nor documented (remote
-  database only, owner answer #9414).
+- on macOS, the full suite runs in CI since L68, but that job is not a
+  required check yet; local PostgreSQL is not supported nor documented
+  (remote database only, owner answer #9414).
 
 ## How this page was verified
 

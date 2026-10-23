@@ -118,8 +118,13 @@ def due(rows: list[dict], now: float, policy: Policy, *, last_started: float = 0
     if not rows:
         return False
     if policy.build_beta:
+        # `rows` is already the admissible set for the cutoff: the engine
+        # filters by the candidate's admissibility instant, not by the queue
+        # insertion its own enrollment wrote after the cutoff (#2965). `due`
+        # must not re-apply the queue timestamp, or that rescued row would
+        # still skip the packet.
         slot = policy.cutoff(now)
-        return last_started < slot and any(float(r["queued_ts"]) <= slot for r in rows)
+        return last_started < slot and bool(rows)
     # First train: at most an hour from the oldest admitted lot. Subsequent
     # trains: at most an hour since the preceding train, never an idle burst.
     since = max(last_started, min(float(r["queued_ts"]) for r in rows))
@@ -133,9 +138,13 @@ class Ports(Protocol):
     unresolved B/P2-sensitive, delta reviews, protected/release targets, fire
     (including withdrawal) and targeted CI only in that policy mode. It
     returns JSON evidence, not a boolean inferred from the latest verdict.
-    `authorize` binds (source,target,base,head,tree,members,proof) to the
-    compiled merge policy, or to a named pilot fire when that policy requires
-    one. Named-fire withdrawal is serialized with `promote`.
+    `admitted` (#2965, optional) filters the queue rows to those admissible at
+    a packet cutoff: the rows the train enrolled itself are dated by the
+    admissibility instant of their admission proof, every other admission by
+    its own queue instant. `authorize` binds
+    (source,target,base,head,tree,members,proof) to the compiled merge policy,
+    or to a named pilot fire when that policy requires one. Named-fire
+    withdrawal is serialized with `promote`.
     """
     def acquire(self, epoch: int | None) -> int | None: ...
     def release(self, epoch: int) -> None: ...
@@ -143,6 +152,7 @@ class Ports(Protocol):
     def save(self, state: dict, expected: int, epoch: int) -> dict: ...
     def target(self) -> str: ...
     def entries(self) -> list[dict]: ...
+    def admitted(self, rows: list[dict], slot: float) -> list[dict]: ...
     def dependencies(self, rows: list[dict]) -> list[dict]: ...
     def qualify(self, rows: list[dict], base: str, mode: str) -> dict: ...
     def sync(self, base: str) -> dict | None: ...
@@ -292,12 +302,22 @@ class Engine:
                 if callable(enroll):
                     enroll(epoch)
                     self._held()
+                    # #3139: enrollment persists its per-lot refusals in the
+                    # same document. Reload its exact revision before this
+                    # pass writes anything (a stale revision would refuse).
+                    state = self.ports.load()
                 rows = self.ports.entries()
                 if self.policy.build_beta:
                     # A late admission belongs to the next packet, even if
                     # this cutoff was empty or the executor has restarted.
+                    # #2965: the instant is the candidate's admissibility,
+                    # read by the admission reader — not the queue insertion
+                    # this train itself just wrote after the cutoff. A manual
+                    # admission keeps its own queue instant and stays late.
                     slot = self.policy.cutoff(now)
-                    rows = [r for r in rows if float(r["queued_ts"]) <= slot]
+                    admitted = getattr(self.ports, "admitted", None)
+                    rows = (admitted(rows, slot) if callable(admitted)
+                            else [r for r in rows if float(r["queued_ts"]) <= slot])
                 rows = ordered(rows, self.ports.dependencies(rows))
                 if not due(rows, now, self.policy,
                            last_started=float((state or {}).get("started_ts", 0))):
@@ -307,7 +327,10 @@ class Engine:
                              revision=int((state or {}).get("revision", 0)), phase="composing",
                              base=self.ports.target(), members=rows, started_ts=now,
                              stamp=datetime.fromtimestamp(now, timezone.utc).strftime("%Y%m%d-%H%M"),
-                             attempts=[], failures=0, pending=[], excluded=[], good=[], deferred=[])
+                             attempts=[], failures=0, pending=[], excluded=[], good=[], deferred=[],
+                             enrollment_deferred=copy.deepcopy(
+                                 (state or {}).get("enrollment_deferred") or []),
+                             enrollment_checked_ts=(state or {}).get("enrollment_checked_ts"))
                 state = self._save(state)
             if self.policy.build_beta and (state.get("plan") or {}).get("diagnostic"):
                 raise TrainError("diagnostic CI is disabled during build/beta")

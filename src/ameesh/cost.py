@@ -48,6 +48,7 @@ import json
 import os
 import re
 import math
+import sys
 import time
 from dataclasses import dataclass, replace
 from typing import Callable, Iterable, Iterator, Sequence
@@ -56,7 +57,18 @@ from . import config as config_mod
 from . import harnesses
 from . import storage
 from .gauge_cache import CLAUDE_GAUGES
+from .resident import INPUTS_EVENT as RESIDENT_INPUTS_EVENT
 from .resident import USAGE_EVENT as RESIDENT_USAGE_EVENT
+
+
+def log(message: str) -> None:
+    """Journal de la comptabilité : un échec d'écriture ne lève jamais."""
+    try:
+        sys.stderr.write("[cost] %s\n" % message)
+        sys.stderr.flush()
+    except (OSError, ValueError):
+        pass
+
 
 #: Barème par défaut du poste de travail (reprise de l'outil de comptage
 #: existant). USD par million de jetons : [entrée, entrée en cache, sortie].
@@ -1062,11 +1074,18 @@ class CostBook:
         """Le dernier relevé connu de chaque jauge d'un compte (#1132)."""
         return storage.of(self.db).operations.gauge_latest(harness=harness, account=account)
 
-    def codex_gauges(self, sessions: str | None = None) -> list:
+    def codex_gauges(self, sessions: str | None = None, *, plan: str | None = None) -> list:
         """Les fenêtres `rate_limits` des journaux récents du compte.
 
         #2839 : une lecture partielle ne masque aucune fenêtre ; des relevés
         vivants contradictoires refusent le compte au lieu de choisir au mtime.
+        #3034 : `plan` est le forfait du compte vivant (`auth.json`) ; quand il
+        est connu et l'identité unique, les relevés d'un autre forfait sont
+        ignorés au lieu de rendre le compte ambigu.
+        #3122 : la date du plus récent journal non lu (écarté du scan borné,
+        # préfixe tronqué, lecture en échec) borne ce qu'il a pu observer ;
+        `reconcile` ne prouve le repos #3044 que si elle est plus vieille
+        qu'une fenêtre courte.
 
         Lecture **JSON structurée**, pas une expression régulière : l'ordre des clés
         n'est pas garanti (`plan_type` peut précéder `primary`), `secondary` peut
@@ -1078,17 +1097,30 @@ class CostBook:
         racine = sessions if sessions is not None else self.codex_sessions
         from .codex_gauges import recent_files, reconcile, session_reading
 
-        files, truncated = recent_files(racine)
+        files, truncated, unread_before = recent_files(racine)
+
+        def unread(stamp):
+            nonlocal unread_before
+            if unread_before is None or stamp > unread_before:
+                unread_before = stamp
+
         now = self.clock()
         readings = []
         for read_at, path in files:
             try:
                 sample = session_reading(path, read_at)
-                readings.extend(sample)
-                truncated = truncated or sample.truncated
             except OSError:
+                # Journal sauté : sa date reste une borne de ce qu'il a pu
+                # observer (#3122).
+                truncated = True
+                unread(read_at)
                 continue
-        return reconcile(readings, now, truncated=truncated)
+            readings.extend(sample)
+            if sample.truncated:
+                truncated = True
+                unread(read_at)
+        return reconcile(readings, now, truncated=truncated, plan=plan,
+                         unread_before=unread_before)
 
     def gauges(self, harness: str | None = None, *, record: bool = True) -> Gauges:
         """Les jauges de forfait, par **source déclarée** dans les descripteurs (L16).
@@ -1663,6 +1695,30 @@ class CostBook:
                          input_tokens=tin, cached_input_tokens=tcache, output_tokens=tout,
                          **(marque if tin or tcache or tout else {}))
 
+    def _insert_turn_cost(self, *, inputs=None, **kwargs) -> None:
+        """Écrit la ligne du tour ; l'attribution de messages est facultative.
+
+        L80b : un exécuteur médié peut parler à un serveur **1.6**, dont la
+        table ne connaît pas `inputs`. Le refus (`bad_args`) ne doit jamais
+        suspendre la comptabilité : on réessaie sans l'attribution — le coût du
+        tour reste compté, l'attribution est perdue et journalisée. Sans
+        `inputs`, le paramètre n'est pas transmis du tout (compatible 1.6)."""
+        insert = dict(kwargs)
+        if inputs is not None:
+            insert["inputs"] = inputs
+        try:
+            storage.of(self.db).turn_costs.insert(**insert)
+        except Exception as exc:  # noqa: BLE001 - réessai limité au refus 1.6
+            from . import db as db_mod
+            texte = str(exc)
+            if inputs is None or not isinstance(exc, db_mod.DbError) \
+                    or ("bad_args" not in texte and "paramètre inconnu" not in texte):
+                raise
+            log("serveur médié sans `inputs` (%s) : tour compté sans attribution "
+                "de messages" % texte[:160])
+            insert.pop("inputs", None)
+            storage.of(self.db).turn_costs.insert(**insert)
+
     def record(self, agent: str, start: int = 0, turn: str | None = None,
                session: str | None = None, model: str | None = None,
                key: str | None = None, ended: float | None = None,
@@ -1733,7 +1789,19 @@ class CostBook:
         row = usage.row()
         row["turn"] = turn or usage.turn
         row["session"] = session_id
-        storage.of(self.db).turn_costs.insert(
+        # L80b : les messages servis par ce tour, quand le flux résident les
+        # porte. Codex/ACP les mettent dans `resident.turn.inputs` ; Claude,
+        # dont le flux porte déjà l'usage, dans l'événement séparé
+        # `resident.inputs`. Aucun autre chemin n'en produit : les tours non
+        # résidents gardent la colonne non écrite.
+        attribution = resident if resident is not None \
+            else _resident_inputs_event(events)
+        inputs = None
+        if attribution is not None \
+                and isinstance(attribution.get("inputs"), (list, tuple)):
+            inputs = tuple(str(i) for i in attribution["inputs"] if i is not None)
+        self._insert_turn_cost(
+            inputs=inputs,
             agent=row["agent"], harness=row["harness"], turn=row["turn"],
             model=row["model"], session=row["session"], usd=row["usd"],
             input_tokens=row["input_tokens"], cached_input_tokens=row["cached_input_tokens"],
@@ -2468,6 +2536,20 @@ def _resident_event(events: Iterable[dict]) -> dict | None:
     found = None
     for event in events:
         if event.get("type") == RESIDENT_USAGE_EVENT:
+            found = event
+    return found
+
+
+def _resident_inputs_event(events: Iterable[dict]) -> dict | None:
+    """L'événement `resident.inputs` de la tranche, s'il y en a un (L80b).
+
+    Le flux de Claude porte lui-même l'usage du tour, donc il n'écrit pas de
+    `resident.turn` ; les messages servis voyagent dans cet événement, écrit
+    après la barrière steer. C'est une attribution seule — l'usage reste celui
+    du flux."""
+    found = None
+    for event in events:
+        if event.get("type") == RESIDENT_INPUTS_EVENT:
             found = event
     return found
 

@@ -43,11 +43,15 @@ antérieur avant `stop`. Un échec de cette remise à zéro ou du drainage, un
 le démarrage. Un nouvel échec pendant l’arrêt n’est jamais effacé.
 
 Quand `DRAIN_ATTENTE` est supérieur à 0 (0 par défaut : désactivé), c’est un
-interrupteur, pas un délai : un agent vu en tour reçoit **immédiatement**,
-avant l’arrêt prouvé ci-dessus, une pause opérateur courte et nommée (drain,
-#2152) : le tour en cours se termine — aucun tour n’est interrompu —, plus
-aucun ne commence, puis le redémarrage procède à l’arrêt prouvé et la pause
-est levée après le démarrage. La valeur ne mesure plus une attente d’un
+interrupteur, pas un délai : au début du balayage de l’hôte, tous les agents
+vus en tour reçoivent une pause opérateur courte et nommée (drain, #2152).
+Les fins de tour se chevauchent : l’attente dépend du plus long tour restant,
+puis des arrêts et contrôles séquentiels, au lieu de leur somme (#3114).
+Aucun nouveau tour ne commence sous pause ; celle-ci reste en place jusqu’au
+démarrage de la persona. Chaque arrêt journalise sa durée d’attente. Un tour
+commencé après la première passe reçoit aussi son drain juste avant l’arrêt.
+`--not-after` est recalculé à chaque pose : il borne l’admission de la pause,
+sans faire expirer une pause déjà posée. La valeur ne mesure plus une attente d’un
 créneau « idle » ; aucune fenêtre « idle » n’est attendue. Le mesh journalise
 la pose et la levée (`operator_pause_events`) ; une pause déjà posée par un
 autre acteur n’est ni doublée ni levée, et aucune pause posée par le script ne
@@ -258,6 +262,14 @@ attestation durable sous
 rapporteurs déclarés avec `--lots "917 988"` et
 `--rapporteurs "mty-amh-docs-01"` (ou `LOTS_VERIF` / `RAPPORTEURS_VERIF` dans
 `BASCULE_ENV`).
+
+Sur le poste, `redemarrer` et `retour` passent par des unités transitoires
+`poste-maj-staging-<pid>-<action>` (`systemd-run --user --collect --wait --pipe`,
+#3039). Le staging attend leur résultat et conserve leur sortie dans son
+journal ; un échec suit le retour automatique puis la notification habituels.
+Cette enveloppe dans `staging.sh` couvre aussi le retour depuis le tick
+`ameesh-release.service`, sans modifier la garde #2950 de `poste.sh` qui
+refuse les appels directs depuis une unité `ameesh-*`.
 
 Le courrier nomme les hôtes, le commit **relu actif** sur chacun après la
 séquence, les preuves `installer`/`redemarrer`/`controler`/`sante` et les lots

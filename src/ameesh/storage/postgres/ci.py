@@ -355,6 +355,23 @@ class CiResults(interface.CiResults):
              ORDER BY repo
             """)
 
+    def prune_queue(self, repos) -> None:
+        """#2957 : les relevés des dépôts hors du périmètre actif sont retirés.
+
+        Sans cette purge, un dépôt sorti de `github.projects` garde sa ligne
+        `ci_queue_state` : le repli de `github_observation` sur un hôte sans
+        configuration continue de le surveiller et alerte à jamais de son
+        silence. Sans périmètre, rien n'est retiré (on ne sait pas si les
+        dépôts ont été retirés ou si la configuration locale est seulement
+        absente)."""
+        keys = sorted({str(repo).strip().casefold() for repo in repos
+                       if str(repo).strip()})
+        if not keys:
+            return
+        self.db.execute(
+            "DELETE FROM ci_queue_state WHERE lower(repo) NOT IN (%s)"
+            % ", ".join(["%s"] * len(keys)), tuple(keys))
+
     # -- #845 (revue N/P2 2328) : fenêtre et cache du relevé ----------------
     def claim_guard_scan(self, repo, *, now, window_s) -> bool:
         """Revendique la fenêtre du relevé de `repo`, atomiquement.

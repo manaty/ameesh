@@ -199,9 +199,14 @@ class TrainRunnerTest(PgTestCase):
     def test_passage_intake_replays_real_generation_at_next_cutoff_then_keeps_active_manifest(self):
         original, reader = self.packet_intake()
         rules = FixtureMechanics(self.publisher, self.base, self.project.name)
-        # Observe the cutoff before allocation rather than assuming today's
-        # SQL time falls after the fixture's historical calendar date.
-        slot = self.db.query("SELECT extract(epoch from clock_timestamp())::float8 AS ts")[0]["ts"]
+        # #2965: anchor the cutoff before the effective freeze. The candidate
+        # is then really late (its admission instant is after the cutoff), so
+        # the generation replay is observed on the next cutoff, not because
+        # the train's own queue insertion happens to be after the cutoff.
+        freeze_at = next(mark["at_ts"] for mark in
+                         self.ops.milestones(original["work_item_id"], None)
+                         if mark["id"] == original["frozen_id"])
+        slot = freeze_at - 1
         rules.last_packet = lambda now: slot
         self.mechanics.load.side_effect = None
         self.mechanics.load.return_value = rules
@@ -213,7 +218,6 @@ class TrainRunnerTest(PgTestCase):
         self.assertEqual(result["enrollment"]["deferred"], [])
         self.assertEqual(self.api_calls, [])
         self.assertIsNone(self.ops.train_read(self.key))
-        slot = entry["queued_ts"] - 1
         rules.last_packet = lambda now: slot if now < slot + 3600 else slot + 3600
         shutil.rmtree(passage.repository_path())
         other_db = db_mod.connect(self.__class__.cfg)
@@ -233,6 +237,8 @@ class TrainRunnerTest(PgTestCase):
         self.assertNotIn("enrollment", result)
         reader.assert_not_called()
         self.assertEqual(train.digest(self.ops.train_read(self.key)["plan"]), train.digest(plan))
+        # #3139: the composed packet keeps the enrollment record of its pass.
+        self.assertEqual(self.ops.train_read(self.key)["enrollment_deferred"], [])
         self.assertEqual(len(self.ops.train_read(self.key)["attempts"]), 1)
         self.assertEqual(self.ops.queue(None)[0]["generation"], entry["generation"])
         self.assertEqual(self.notices, [])
@@ -246,10 +252,30 @@ class TrainRunnerTest(PgTestCase):
         refused = result["enrollment"]["deferred"]
         self.assertEqual([row["work_item_id"] for row in refused], [original["work_item_id"]])
         self.assertIn("queue-history-unknown", refused[0]["reason"])
+        # #3139: the refusal names the lot and its freeze, and the journal
+        # carries the same facts lot by lot instead of one generic line.
+        self.assertEqual(refused[0]["frozen_sha"], self.head)
+        self.assertEqual(refused[0]["frozen_id"], original["frozen_id"])
+        self.assertEqual(len(self.notices), 1)
+        self.assertIn("lot #%d" % original["work_item_id"], self.notices[0])
+        self.assertIn(self.head[:12], self.notices[0])
+        self.assertIn("queue-history-unknown", self.notices[0])
+        state = self.ops.train_read(self.key)
+        self.assertEqual(state["phase"], "empty")
+        self.assertEqual([row["lot"] for row in state["enrollment_deferred"]],
+                         [original["work_item_id"]])
+        self.assertEqual(state["enrollment_deferred"][0]["frozen_sha"], self.head)
+        self.assertIn("queue-history-unknown",
+                      state["enrollment_deferred"][0]["reason"])
+        self.assertIsInstance(state["enrollment_checked_ts"], float)
         self.assertEqual(self.ops.queue(None), [])
         self.assertEqual(work.events(self.db, original["work_item_id"]), before)
         self.assertEqual(self.api_calls, [])
-        self.assertEqual(self.notices, ["candidate enrollment deferred"])
+        # A second pass replaces the record instead of stacking stale refusals.
+        self.passage(candidate=reader).step(self.db, self.now + 1)
+        replay = self.ops.train_read(self.key)
+        self.assertGreater(replay["revision"], state["revision"])
+        self.assertEqual(len(replay["enrollment_deferred"]), 1)
 
     def test_competing_passage_cannot_read_candidates_or_allocate_without_target_reservation(self):
         _, reader = self.packet_intake()
@@ -333,9 +359,10 @@ class TrainRunnerTest(PgTestCase):
         self.assertEqual(self.ops.milestones(item_id, None), marks)
         self.assertEqual(self.api_calls, [])
 
-        # Anchor decision times to the returned SQL fact, never wall-clock
-        # progress. The allocation is one second after this fixture cutoff.
-        slot = entry["queued_ts"] - 1
+        # #2965: anchor the cutoff before the effective freeze so the
+        # candidate is late by its own admission instant, never merely by the
+        # queue insertion the train just wrote after the cutoff.
+        slot = freeze["at_ts"] - 1
         rules = FixtureMechanics(self.publisher, self.base, self.project.name)
         rules.last_packet = lambda now: slot if now < slot + 3600 else slot + 3600
         self.mechanics.load.side_effect = None
@@ -377,6 +404,73 @@ class TrainRunnerTest(PgTestCase):
             (item_id,))
         self.assertEqual(receipts, [dict(generation=entry["generation"], kind="packet")])
         self.assertEqual(self.notices, [])
+
+    def test_candidate_admissible_before_the_cutoff_is_composed_at_that_cutoff(self):
+        """#2965 (a): the train's own enrollment is not a late admission."""
+        _, reader = self.packet_intake()
+        slot = self.db.query(
+            "SELECT extract(epoch from clock_timestamp())::float8 AS ts")[0]["ts"]
+        rules = FixtureMechanics(self.publisher, self.base, self.project.name)
+        rules.last_packet = lambda now: slot
+        self.mechanics.load.side_effect = None
+        self.mechanics.load.return_value = rules
+        passage = self.passage(candidate=reader, initial=lambda db, **context: True)
+        result = passage.step(self.db, slot)
+        self.assertEqual(result["result"], "ci", result)
+        entry = result["enrollment"]["admitted"][0]["entry"]
+        # The queue insertion is after the cutoff; only the admission proof,
+        # completed before it, admits the candidate into this packet.
+        self.assertGreater(entry["queued_ts"], slot)
+        self.assertLess(
+            result["enrollment"]["admitted"][0]["proof"]["members"][0]["history"]
+            ["reviews"]["admitted_ts"], slot)
+        self.assertEqual([train.identity(row) for row in result["plan"]["members"]],
+                         [train.identity(entry)])
+        self.assertEqual(self.git(self.origin, "rev-parse", result["plan"]["branch"]),
+                         result["plan"]["head"])
+
+    def test_last_verdict_after_the_cutoff_makes_the_candidate_late(self):
+        """#2965 (b): the completing verdict is dated, not the enrollment."""
+        original, reader = self.packet_intake()
+        item_id = original["work_item_id"]
+        marks = self.ops.milestones(item_id, None)
+        verdicts = sorted((mark for mark in marks if mark["kind"] == "verdict"),
+                          key=lambda mark: (mark["at_ts"], mark["id"]))
+        self.assertEqual(len(verdicts), 2)
+        self.assertLess(verdicts[0]["at_ts"], verdicts[1]["at_ts"])
+        slot = (verdicts[0]["at_ts"] + verdicts[1]["at_ts"]) / 2
+        rules = FixtureMechanics(self.publisher, self.base, self.project.name)
+        rules.last_packet = lambda now: slot if now < slot + 3600 else slot + 3600
+        self.mechanics.load.side_effect = None
+        self.mechanics.load.return_value = rules
+        passage = self.passage(candidate=reader, initial=lambda db, **context: True)
+        result = passage.step(self.db, slot)
+        self.assertEqual(result["result"], "idle", result)
+        entry = result["enrollment"]["admitted"][0]["entry"]
+        self.assertIsNone(self.ops.train_read(self.key))
+        result = passage.step(self.db, slot + 3600)
+        self.assertEqual(result["result"], "ci", result)
+        self.assertEqual([train.identity(row) for row in result["plan"]["members"]],
+                         [train.identity(entry)])
+
+    def test_manual_queue_admission_after_the_cutoff_stays_late(self):
+        """#2965 (d): a hand-queued admission is never re-dated by its gate."""
+        original = self.ops.queue(None)[0]
+        slot = self.db.query(
+            "SELECT extract(epoch from clock_timestamp())::float8 AS ts")[0]["ts"]
+        self.db.execute("UPDATE merge_queue SET queued_at = to_timestamp(%s)"
+                        " WHERE work_item_id = %s", (slot + 60, original["work_item_id"]))
+        rules = FixtureMechanics(self.publisher, self.base, self.project.name)
+        rules.last_packet = lambda now: slot if now < slot + 3600 else slot + 3600
+        self.mechanics.load.side_effect = None
+        self.mechanics.load.return_value = rules
+        passage = self.passage()
+        self.assertEqual(passage.step(self.db, slot + 1), {"result": "idle"})
+        self.assertIsNone(self.ops.train_read(self.key))
+        result = passage.step(self.db, slot + 3600)
+        self.assertEqual(result["result"], "ci", result)
+        self.assertEqual([row["work_item_id"] for row in result["plan"]["members"]],
+                         [original["work_item_id"]])
 
     def test_scheduled_passage_uses_compiled_calendar_with_real_sql_and_reservation(self):
         rules = FixtureMechanics(self.publisher, self.base, self.project.name)

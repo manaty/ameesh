@@ -166,6 +166,14 @@ class ReviewerDesignationTest(PgTestCase):
         return self.mesh("work", "move", str(lot["id"]), "qa", *args, "--actor", "chef",
                          env=self._env())
 
+    def _freeze_at(self, lot, sha):
+        """#2962 : un SHA complet non résolu ne gèle plus par la porte ; ces
+        témoins posent la tête gelée au stockage (#2962 a ses propres témoins
+        d'écriture du gel)."""
+        self.db.execute(
+            "INSERT INTO work_item_milestones (work_item_id, kind, sha, actor)"
+            " VALUES (%s, 'frozen', %s, 'chef')", (lot["id"], sha))
+
     def _stale(self, lot):
         """Vieillit la ligne, les transitions, les jalons et le courrier (7 h).
 
@@ -188,6 +196,10 @@ class ReviewerDesignationTest(PgTestCase):
         return next(a for a in alertes if a["type"] == "stale_lot" and a["lot"] == lot)
 
     def _briefs(self, alert):
+        # #3036 : un brief ne part plus à un agent sans bail vivant ; ce banc
+        # simule les runners qui tiennent les agents enregistrés.
+        self.db.execute("UPDATE agent_registry SET lease_owner = 'runner-' || name,"
+                        " lease_expires_at = now() + interval '1 hour'")
         return alert_briefs.briefs(alert, storage.of(self.db).operations.listing())
 
     def test_relecteur_designe_nomme_avant_tout_verdict(self):
@@ -336,6 +348,10 @@ class ReviewerDesignationTest(PgTestCase):
         self._stale(lot["id"])
 
         alert = self._stale_alert(lot["id"])
+        # #3036 : le brief n'est plus déposé à un agent sans bail vivant.
+        self.db.execute("UPDATE agent_registry SET lease_owner = 'runner-' || name,"
+                        " lease_expires_at = now() + interval '1 hour'"
+                        " WHERE name IN ('relecteur', 'orchestrateur')")
         ncfg = notify.parse_config({"default": []})
         notifier = notify.Notifier(self.cfg, ncfg, sender=object(), log=lambda t: None)
         notifier.run_pass(self.db, current=[alert])
@@ -602,6 +618,7 @@ class ReviewerDesignationTest(PgTestCase):
         lot = self._lot(app="ameesh")
         proc = self._qa(lot)
         self.assertEqual(proc.returncode, 0, proc.stderr)
+        self._freeze_at(lot, "a" * 40)
         work.milestone(self.db, lot["id"], "verdict", verdict="blocked",
                        sha="a" * 40, actor="chef")
 
@@ -617,9 +634,10 @@ class ReviewerDesignationTest(PgTestCase):
         lot = self._lot(app="ameesh")
         proc = self._qa(lot)
         self.assertEqual(proc.returncode, 0, proc.stderr)
+        self._freeze_at(lot, "a" * 40)
         work.milestone(self.db, lot["id"], "verdict", verdict="blocked",
                        sha="a" * 40, actor="chef")
-        work.milestone(self.db, lot["id"], "frozen", sha="b" * 40, actor="chef")
+        self._freeze_at(lot, "b" * 40)
 
         proc = self.mesh("work", "reviewer", str(lot["id"]), "--no-verdict",
                          "--actor", "chef", env=self._env())

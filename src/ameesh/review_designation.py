@@ -190,11 +190,11 @@ class Candidate:
 
     `family` is the **real** family of the session
     (`registry.live_harness`); `available`, `load` and `model` come from the
-    registry and from the number of open lots. `model` is only used to choose
-    the model-scoped gauges that apply to this reviewer (#2668); it never
-    changes the family or the eligibility. The module completes nothing: an
-    empty family or a harness outside the known families makes the candidate
-    ineligible.
+    registry and from the charge computed by the caller (assigned open lots and
+    pending reviews, #3004). `model` is only used to choose the model-scoped
+    gauges that apply to this reviewer (#2668); it never changes the family or
+    the eligibility. The module completes nothing: an empty family or a harness
+    outside the known families makes the candidate ineligible.
     """
 
     name: str
@@ -246,12 +246,14 @@ def is_available(row: Mapping) -> bool:
 
 def candidates_from_registry(rows: Iterable[Mapping], *, loads: Optional[Mapping] = None,
                              project: str = "", families) -> list[Candidate]:
-    """The candidates of a project: real family, availability, load of open lots.
+    """The candidates of a project: real family, availability, caller's charge.
 
-    `loads` maps a name to the number of open lots (`build`/`qa`); when absent,
-    the load is zero. `project` (the lot's `app`) restricts to agents of the
-    same team: an ameesh lot is reviewed by an ameesh agent. An empty project
-    does not filter — the caller knows what it is doing.
+    `loads` maps a name to the agent's charge (`review_designation_activation.
+    _loads`: open lots assigned to them plus the reviews they still owe,
+    #3004); when absent, the load is zero. `project` (the lot's `app`)
+    restricts to agents of the same team: an ameesh lot is reviewed by an
+    ameesh agent. An empty project does not filter — the caller knows what it
+    is doing.
     """
     loads = loads or {}
     wanted = (project or "").strip()
@@ -461,7 +463,9 @@ def select(*, required: int, authors: Iterable = (), candidates: Iterable = (),
       family: two opinions still take two distinct families;
     - the load of the agent only breaks a pace tie (least loaded first), then
       the name: the same order chooses the family's representative and orders
-      the families; the selection is deterministic;
+      the families; the selection is deterministic. The load is the caller's
+      charge (`Candidate.load`), which counts the agent's open lots **and** the
+      reviews they still owe (#3004);
     - `already` names the manual reviewers already designated (#2627). The ones
       that prove an independent family cover a seat; only the **missing** seats
       are designated, never a manual reviewer removed or overridden;
@@ -560,6 +564,11 @@ def select(*, required: int, authors: Iterable = (), candidates: Iterable = (),
                    for c in chosen if c.family.strip().lower() in pace]
         if reading:
             why += " (plan pace: %s)" % ", ".join(reading)
+    # #3004: the journal (why) keeps the load each chosen reviewer was retained
+    # with, so a designation can be audited against the reviewer's real queue.
+    if chosen:
+        why += " (load: %s)" % ", ".join(
+            "%s %d" % (c.name, max(int(c.load or 0), 0)) for c in chosen)
     out.update({"state": DESIGNATED, "why": why})
     return out
 

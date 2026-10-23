@@ -214,6 +214,10 @@ class NotifierBriefsTest(PgTestCase):
             registry.upsert(self.db, name, harness="claude", host=self.cfg.host)
             self.db.execute("UPDATE agent_registry SET team = %s WHERE name = %s",
                             (team, name))
+        # #3036 : le brief n'est plus déposé à un agent sans bail vivant ;
+        # ces agents simulent un runner qui les tient (le régime normal).
+        self.db.execute("UPDATE agent_registry SET lease_owner = 'runner-' || name,"
+                        " lease_expires_at = now() + interval '1 hour'")
         self.now = time.time()
 
     def mails(self, name):

@@ -227,12 +227,12 @@ class EntryTest(_Base):
         self.assertEqual((row["target"], row["frozen_sha"], row["state"]),
                          ("main", self.tip(1), "queued"))
         self.assertIn("PR #7 green", self.fake.notes[-1][1])
-        # an absent CI status is not a green one: a team that merges locally
-        # without a PR, or a reader that answers nothing, is refused
-        # (revue #544 r1)
+        # #3080: no PR falls back to commit CI; absent commit CI still refuses.
         self.ready(2)
-        with self.assertRaisesRegex(merge_queue.QueueError, "no CI status"):
-            self.enter(2, ci=lambda branch: None)
+        with self.assertRaisesRegex(merge_queue.QueueError, "no run"):
+            self.enter(2, ci=lambda branch: None,
+                       commit_ci=lambda sha: {"runs": 0, "green": False,
+                                              "pending": [], "failed": []})
         with self.assertRaisesRegex(merge_queue.QueueError, "no CI reader"):
             self.enter(2, ci=None)
         self.assertEqual(set(self.fake.queue_rows), {1})
@@ -412,6 +412,9 @@ class EntryTest(_Base):
         agents = os.path.join(self.tmp, "agents")
         _git(self.tmp, "clone", "-q", self.repo, agents)
         clone = resolutions.Replayer(agents, os.path.join(self.tmp, "state", "p.clone"))
+        # #3001 : le clone du radar existe déjà (sa migration vers la forge,
+        # faite une fois à la création, n'est pas l'aller-retour d'admission)
+        clone.ensure()
         self.ready(1)
         calls = []
         real = resolutions._run
@@ -909,7 +912,10 @@ class ClassOfFreshTargetGitTest(unittest.TestCase):
                 _git(agents, "fetch", "-q", "origin")
                 clone = self.clone(agents, target)
                 merge_queue.fetch_fresh(agents, ["lot/light"], clone)
-                self.assertEqual(_git(clone.path, "rev-parse", "origin/" + target), a)
+                # #3001 : l'origin du clone est la forge (B), plus la copie du
+                # local A des agents ; la classe ne lit que QUEUE_REF
+                self.assertEqual(_git(clone.path, "rev-parse", "origin/" + target), b)
+                self.assertNotEqual(_git(clone.path, "rev-parse", "origin/" + target), a)
                 self.lot(target)
                 out = merge_queue._class_of(None, 1, self.row, agents, clone.path,
                                             target, c, cfg=None)

@@ -897,6 +897,11 @@ class StagingSignalTest(unittest.TestCase):
         self.bin = self.root / 'bin'; self.bin.mkdir()
         (self.bin / 'ssh').write_text(SSH)
         (self.bin / 'ssh').chmod(0o755)
+        # #3039 : le staging passe les gestes du poste par systemd-run ; le
+        # banc le remplace par un lanceur direct (le vrai exigerait un bus
+        # utilisateur et le cgroup du service de release).
+        (self.bin / 'systemd-run').write_text(SYSTEMD_RUN)
+        (self.bin / 'systemd-run').chmod(0o755)
         venv = self.home / '.local/share/ameesh/venv/bin'; venv.mkdir(parents=True)
         for name, source in (('python', VENV_PYTHON), ('ameesh', VENV_AMEESH)):
             path = venv / name
@@ -1175,6 +1180,36 @@ SSH = r'''#!/usr/bin/env bash
 printf 'stub %s %s\n' "$0" "$*" >> "${FAKE_STATE:?}/calls.log"
 printf 'ssh %s\n' "$*" >> "${FAKE_STATE:?}/calls.log"
 exit 255
+'''
+
+#: #3039 : `staging.sh` enveloppe `redemarrer`/`retour` du poste dans
+#: `systemd-run --user`. Le banc tient le meme contrat (options, cwd, setenv)
+#: et lance la commande directement, sans bus systemd.
+SYSTEMD_RUN = r'''#!/usr/bin/env python3
+import os
+import subprocess
+import sys
+
+args = list(sys.argv[1:])
+env = dict(os.environ)
+cwd = None
+index = 0
+while index < len(args):
+    arg = args[index]
+    if arg in ('--user', '--collect', '--wait', '--pipe'):
+        index += 1
+    elif arg == '--unit':
+        index += 2
+    elif arg == '--working-directory':
+        cwd = args[index + 1]
+        index += 2
+    elif arg.startswith('--setenv='):
+        name, value = arg[len('--setenv='):].split('=', 1)
+        env[name] = value
+        index += 1
+    else:
+        break
+raise SystemExit(subprocess.run(args[index:], cwd=cwd, env=env).returncode)
 '''
 
 

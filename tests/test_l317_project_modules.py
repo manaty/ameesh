@@ -14,7 +14,7 @@ from unittest import mock
 
 from tests import support  # isolate host config before module tests
 from tests.support import PgTestCase
-from ameesh import canon, canon_sync, db as db_mod, identity, modules, work
+from ameesh import canon, canon_sync, db as db_mod, identity, modules, storage, work
 from ameesh.modules import it
 from ameesh.modules.it.execution import OUTPUT_BYTES, digest, execute
 from ameesh.modules.storage import ModuleStore
@@ -460,6 +460,11 @@ class LifecycleGateTest(PgTestCase):
         self.artifact = Path(self.tmp, "artifact.py")
         self.artifact.write_text("print('delivered executable smoke passed')\n")
         self.lot = work.add(self.db, title="Publication", type="release", app="acme")["id"]
+        # Ce témoin isole la porte IT après un gel réel : la tête gelée est
+        # posée au stockage (la porte d'écriture du gel a ses propres témoins,
+        # #2962).
+        storage.of(self.db).work.add_milestone(
+            self.lot, "frozen", sha="a" * 40, actor="auteur", verdict=None, note="")
         self.store = ModuleStore(self.db)
 
     def prove(self):

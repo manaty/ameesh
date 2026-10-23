@@ -14,7 +14,7 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
-from ameesh import adapters, heavy
+from ameesh import adapters, heavy, platform
 
 SRC = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src")
 
@@ -139,20 +139,15 @@ class RunChildTest(unittest.TestCase):
 
     @staticmethod
     def _gone(pid: int, timeout: float = 10.0) -> bool:
+        """Parti, ou zombie : `waitpid` pour nos enfants, puis la couche
+        plateforme (L63/L68), qui lit psutil ou le repli /proc selon l'OS."""
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             try:
                 waited, _ = os.waitpid(pid, os.WNOHANG)
             except ChildProcessError:
                 waited = 0          # not ours: probe it
-                try:
-                    os.kill(pid, 0)
-                    with open("/proc/%d/stat" % pid, encoding="utf-8") as fh:
-                        if fh.read().split(") ")[-1].startswith("Z"):
-                            return True
-                except (ProcessLookupError, FileNotFoundError):
-                    return True
-            if waited:
+            if waited or not platform.alive(pid):
                 return True
             time.sleep(0.05)
         return False
@@ -198,14 +193,18 @@ class RunChildTest(unittest.TestCase):
         self.assertIsNotNone(got)
         heavy.release(got[1])
 
+    @unittest.skipUnless(platform.is_linux(),
+                         "L131c : waitid(WNOWAIT) et zombie du chef de groupe (Linux)")
     def test_a_worker_ignoring_sigterm_keeps_the_slot_until_sigkill(self):
         proc, (suite, worker) = self._wrapper(self.SUITE % "1", grace=1.5, pids=2)
         proc.send_signal(signal.SIGTERM)
         self.assertTrue(self._gone(suite))
         # codex r3: the command stays unreaped while its group drains — its
-        # zombie keeps the group's number from being reused
-        with open("/proc/%d/stat" % suite, encoding="utf-8") as fh:
-            self.assertEqual(fh.read().rsplit(") ", 1)[-1].split()[0], "Z")
+        # zombie keeps the group's number from being reused (L68: the state
+        # comes from the platform layer, never from a direct /proc read)
+        row = next((p for p in platform.process_table() if p["pid"] == suite), None)
+        self.assertIsNotNone(row, "le chef de groupe doit rester visible en zombie")
+        self.assertTrue(row["zombie"], "le numéro du chef doit rester réservé (zombie)")
         # the suite is gone, its worker is not: the slot stays held
         self.assertFalse(self._gone(worker, timeout=0.3))
         self.assertIsNone(proc.poll())
@@ -231,6 +230,8 @@ class RunChildTest(unittest.TestCase):
         self.assertIsNotNone(got)
         heavy.release(got[1])
 
+    @unittest.skipUnless(platform.is_linux(),
+                         "L131c : waitid(WNOWAIT) et contrôle de terminal (Linux)")
     def test_a_suite_on_a_terminal_can_read_it(self):
         # codex r3: on a controlling terminal the command's group gets the
         # foreground; input() would otherwise stop on SIGTTIN, the wrapper
@@ -346,6 +347,8 @@ class RunChildTest(unittest.TestCase):
                     break
         return out
 
+    @unittest.skipUnless(platform.is_linux(),
+                         "L131c : waitid(WNOWAIT) et contrôle de terminal (Linux)")
     def test_reads_dev_tty_with_stdin_redirected(self):
         # L131c (codex r4): stdin is /dev/null, the command opens /dev/tty
         proc, master = self._on_pty(
@@ -356,6 +359,8 @@ class RunChildTest(unittest.TestCase):
         self.assertEqual(proc.wait(timeout=20), 0)
         self.assertIn(b"got yes", self._read_until(master, b"got yes", 5))
 
+    @unittest.skipUnless(platform.is_linux(),
+                         "L131c : waitid(WNOWAIT) et contrôle de terminal (Linux)")
     def test_ctrl_z_suspends_the_wrapper_and_fg_resumes(self):
         # L131c (codex r4): Ctrl-Z stops the command's group; the wrapper
         # stops too (the shell gets its prompt), and SIGCONT (`fg`) resumes
@@ -374,6 +379,8 @@ class RunChildTest(unittest.TestCase):
         self.assertEqual(proc.wait(timeout=20), 0)
         self.assertIn(b"got yes", self._read_until(master, b"got yes", 5))
 
+    @unittest.skipUnless(platform.is_linux(),
+                         "L131c : sous-moissonneur (Linux) — un setsid s'échappe ailleurs")
     def test_a_fork_chain_and_setsid_cannot_outlive_the_slot(self):
         # L131c (codex r4): W1 forks W2 and exits, W2 leaves the group
         # (setsid), forks W3 and exits; W3 runs on — the wrapper, a

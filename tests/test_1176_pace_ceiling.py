@@ -50,7 +50,7 @@ class _Book:
     def claude_gauges(self, account=None, primary=None):
         return self._claude
 
-    def codex_gauges(self, sessions=None):
+    def codex_gauges(self, sessions=None, *, plan=None):
         return self._codex.get(sessions, [])
 
     def record_gauges(self, gauges, account=None):

@@ -174,6 +174,12 @@ def new_id() -> str:
 #: several turns cannot count the same tokens twice.
 USAGE_EVENT = "resident.turn"
 
+#: L80b: the message ids a native-usage resident turn actually served (Claude's
+#: stream already carries the turn's usage, so it writes no `resident.turn`).
+#: Written after the steer barrier; read by the ledger for attribution only,
+#: never as a measure.
+INPUTS_EVENT = "resident.inputs"
+
 
 @dataclass
 class TurnResult:

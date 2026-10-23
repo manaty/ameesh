@@ -13,9 +13,10 @@ import os
 import subprocess
 import tempfile
 import types
+import unittest
 
-from ameesh import (registry, review_authors, review_provenance, storage, train,
-                    train_history, work)
+from ameesh import (merge_queue, registry, review_authors, review_provenance,
+                    storage, train, train_history, work)
 from .support import PgTestCase
 
 
@@ -150,6 +151,12 @@ class HistoryFixture:
         frozen = self.freeze(head)
         return dict(self.entry, frozen_id=frozen["id"], frozen_sha=head)
 
+    def dated(self, *marks):
+        """#2965 : des jalons à des instants exacts, pour relire la chronologie."""
+        for stamp, mark in marks:
+            self.db.execute("UPDATE work_item_milestones SET at = to_timestamp(%s)"
+                            " WHERE id = %s", (stamp, mark["id"]))
+
 
 class RecordedHistoryTest(HistoryFixture, PgTestCase):
     def test_every_commit_is_read_on_the_frozen_head_with_the_gate(self):
@@ -161,6 +168,38 @@ class RecordedHistoryTest(HistoryFixture, PgTestCase):
         self.assertEqual(reviews["gate"]["required"], 2)
         self.assertEqual({row["name"] for row in reviews["authors"]},
                          {"author"})
+
+    def test_admission_ignores_a_redundant_ok_after_the_gate_opened(self):
+        """B1 (relecture cx1) : le gel effectif, pas le dernier ok répété."""
+        extra = self.verdict(self.head, "r1", "claude")
+        self.dated((900.0, self.frozen), (1000.0, self.r1),
+                   (1100.0, self.r2), (1200.0, extra))
+        proof = self.qualify()
+        self.assertTrue(proof["reviews"]["gate"]["ok"], proof["reviews"]["gate"])
+        # La porte était ouverte à 1100 (r1 claude + r2 codex) ; le second ok
+        # de r1 à 1200 ne redate pas l'admission.
+        self.assertEqual(proof["reviews"]["admitted_ts"], 1100.0)
+
+    def test_a_lifted_block_dates_an_admission_that_needs_no_review(self):
+        """B2 (relecture cx1) : blocage puis levée, même à zéro avis requis."""
+        head = self.commit("post freeze fix", actor="author")
+        self.receipt_commit(head, "author", "deepseek")
+        self.turn("author", "deepseek")
+        frozen = self.freeze(head)
+        blocked = self.verdict(head, "r1", "claude", status="blocked")
+        lifted = self.verdict(head, "r1", "claude", status="ok")
+        # Le nouveau gel doit rester le plus récent des gels : on date après
+        # le gel du fixture, pas dans un passé qui le rendrait fantôme.
+        now = self.db.query(
+            "SELECT extract(epoch from clock_timestamp())::float8 AS ts")[0]["ts"]
+        self.dated((now + 1, frozen), (now + 2, blocked), (now + 3, lifted))
+        entry = dict(self.entry, frozen_id=frozen["id"], frozen_sha=head)
+        proof = self.qualify(entry=entry, required=0,
+                             klass={"class": "light", "files": ()})
+        gate = proof["reviews"]["gate"]
+        self.assertTrue(gate["ok"], gate)
+        self.assertEqual(gate["required"], 0)
+        self.assertEqual(proof["reviews"]["admitted_ts"], now + 3)
 
     def test_the_compiled_family_flags_drive_the_train_gate(self):
         # #2726 : le train passe `exclude_author_family` et `distinct_families`
@@ -413,3 +452,129 @@ class CompleteMilestonesTest(PgTestCase):
         marks = ops.milestones(item["id"], None)
         self.assertEqual(len(marks), before + 110)
         self.assertEqual(sum(m["verdict"] == "blocked" for m in marks), 1)
+
+
+class AdmittedInstantTest(unittest.TestCase):
+    """#2965 : l'instant d'admissibilité, relu par la porte elle-même."""
+
+    SHA = "a" * 40
+    FAMILIES = {"author": "human", "r1": "claude", "r2": "codex",
+                "r3": "deepseek"}
+
+    def gate(self, verdicts, *, required=2, waived=False, klass=None):
+        marks = [dict(kind="frozen", sha=self.SHA, actor="author", verdict=None,
+                      at_ts=100.0, id=1)]
+        marks.extend(dict(kind="verdict", sha=self.SHA, **mark)
+                     for mark in verdicts)
+        return merge_queue.review_gate(
+            None, marks, self.SHA,
+            klass=klass or {"class": "normal", "files": []},
+            item=None, required=required,
+            authors=[{"name": "author", "family": "human"}],
+            authors_complete=True,
+            family_of=lambda name: self.FAMILIES.get(name, ""))
+
+    def test_a_redundant_ok_does_not_redate_the_open_gate(self):
+        """B1 : r1 ok 110, r2 ok 120, r1 ok 130 -> ouvert à 120, pas 130."""
+        gate = self.gate([
+            dict(actor="r1", verdict="ok", at_ts=110.0, id=2),
+            dict(actor="r2", verdict="ok", at_ts=120.0, id=3),
+            dict(actor="r1", verdict="ok", at_ts=130.0, id=4)])
+        self.assertTrue(gate["ok"], gate)
+        self.assertEqual(gate["completed_ts"], 120.0)
+        self.assertEqual(train_history.admitted_ts({"at_ts": 100.0}, gate), 120.0)
+        # Le `ok` répété de r1 à 130 ne doit pas effacer son `ok` de 110 :
+        # la porte était déjà ouverte à 115 par r1 (claude) + r3 (deepseek).
+        gate = self.gate([
+            dict(actor="r1", verdict="ok", at_ts=110.0, id=2),
+            dict(actor="r3", verdict="ok", at_ts=115.0, id=3),
+            dict(actor="r1", verdict="ok", at_ts=130.0, id=4)])
+        self.assertEqual(gate["completed_ts"], 115.0)
+        self.assertEqual(train_history.admitted_ts({"at_ts": 100.0}, gate), 115.0)
+
+    def test_a_block_delays_admission_even_without_required_review(self):
+        """B2 : gel 100, blocage 110, ok 140 ; aucun avis requis."""
+        verdicts = [dict(actor="r1", verdict="blocked", at_ts=110.0, id=2),
+                    dict(actor="r1", verdict="ok", at_ts=140.0, id=3)]
+        gate = self.gate(verdicts, required=0,
+                         klass={"class": "light", "files": ()})
+        self.assertTrue(gate["ok"], gate)
+        self.assertEqual(gate["completed_ts"], 140.0)
+        self.assertEqual(train_history.admitted_ts({"at_ts": 100.0}, gate), 140.0)
+        # Même chronologie sous dispense du pilote (waived) : le blocage
+        # courant ferme la porte avant la dispense, le ok le rouvre à 140.
+        self.assertEqual(merge_queue._gate_completed_ts(
+            [dict(kind="verdict", sha=self.SHA, **mark) for mark in verdicts], {},
+            required=1, waived=True, distinct_families=True), 140.0)
+
+    def test_an_ok_does_not_date_a_gate_open_from_the_freeze(self):
+        """B1 (cx1) : sans avis requis ni blocage, garder le gel, même sous waived."""
+        gate = self.gate([dict(actor="r1", verdict="ok", at_ts=1050.0, id=2)],
+                         required=0,
+                         klass={"class": "light", "files": ()})
+        self.assertTrue(gate["ok"], gate)
+        self.assertIsNone(gate["completed_ts"])
+        self.assertEqual(train_history.admitted_ts({"at_ts": 800.0}, gate), 800.0)
+        # Un OK ne date pas davantage une porte ouverte par dispense.
+        self.assertIsNone(merge_queue._gate_completed_ts(
+            [dict(kind="verdict", sha=self.SHA, actor="r1", verdict="ok",
+                  at_ts=1050.0, id=2)], {},
+            required=1, waived=True, distinct_families=True))
+
+    def test_a_late_block_closes_an_open_gate_and_its_lift_dates_admission(self):
+        """B2 (cx1) : dater la période ouverte courante après la dernière fermeture."""
+        # required=2 : porte ouverte à 900, refermée à 950, rouverte à 1050.
+        gate = self.gate([
+            dict(actor="r1", verdict="ok", at_ts=850.0, id=2),
+            dict(actor="r2", verdict="ok", at_ts=900.0, id=3),
+            dict(actor="r1", verdict="blocked", at_ts=950.0, id=4),
+            dict(actor="r1", verdict="ok", at_ts=1050.0, id=5)])
+        self.assertTrue(gate["ok"], gate)
+        self.assertEqual(gate["completed_ts"], 1050.0)
+        instant = train_history.admitted_ts({"at_ts": 800.0}, gate)
+        self.assertEqual(instant, 1050.0)
+        self.assertGreater(instant, 1000.0)   # late au cutoff 1000
+        # required=0 : ouverte au gel, fermée à 950, rouverte à 1050 ; le
+        # premier OK de 850 ne doit pas arrêter le rejeu avant la fermeture.
+        gate = self.gate([
+            dict(actor="r1", verdict="ok", at_ts=850.0, id=2),
+            dict(actor="r1", verdict="blocked", at_ts=950.0, id=3),
+            dict(actor="r1", verdict="ok", at_ts=1050.0, id=4)],
+            required=0, klass={"class": "light", "files": ()})
+        self.assertEqual(gate["completed_ts"], 1050.0)
+        self.assertEqual(train_history.admitted_ts({"at_ts": 800.0}, gate), 1050.0)
+        # Même chronologie sous waived.
+        waived = [dict(kind="verdict", sha=self.SHA, actor="r1", verdict="ok",
+                       at_ts=850.0, id=2),
+                  dict(kind="verdict", sha=self.SHA, actor="r1", verdict="blocked",
+                       at_ts=950.0, id=3),
+                  dict(kind="verdict", sha=self.SHA, actor="r1", verdict="ok",
+                       at_ts=1050.0, id=4)]
+        self.assertEqual(merge_queue._gate_completed_ts(
+            waived, {}, required=1, waived=True, distinct_families=True), 1050.0)
+        # Un OK redondant après la levée ne redate pas la porte.
+        self.assertEqual(merge_queue._gate_completed_ts(
+            waived + [dict(kind="verdict", sha=self.SHA, actor="r1", verdict="ok",
+                           at_ts=1100.0, id=5)], {},
+            required=1, waived=True, distinct_families=True), 1050.0)
+
+    def test_admission_is_never_before_the_effective_freeze(self):
+        gate = self.gate([
+            dict(actor="r1", verdict="ok", at_ts=110.0, id=2),
+            dict(actor="r2", verdict="ok", at_ts=120.0, id=3)])
+        self.assertEqual(train_history.admitted_ts({"at_ts": 500.0}, gate), 500.0)
+
+    def test_an_open_gate_without_a_verdict_keeps_the_freeze(self):
+        gate = self.gate([], required=0,
+                         klass={"class": "light", "files": ()})
+        self.assertTrue(gate["ok"], gate)
+        self.assertIsNone(gate["completed_ts"])
+        self.assertEqual(train_history.admitted_ts({"at_ts": 100.0}, gate), 100.0)
+
+    def test_a_gate_never_completed_is_refused(self):
+        gate = self.gate([dict(actor="r1", verdict="ok", at_ts=110.0, id=2)],
+                         required=2)
+        self.assertFalse(gate["ok"], gate)
+        self.assertIsNone(gate.get("completed_ts"))
+        with self.assertRaises(train.TrainError):
+            train_history.admitted_ts({"at_ts": 100.0}, gate)
