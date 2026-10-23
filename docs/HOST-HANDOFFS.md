@@ -422,7 +422,10 @@ holding again. Do not transfer the lease by hand at any point.
   candidates on the deployed hosts.
 - At least two candidates of the role are ready: placement admitted, host
   gate open, canon `ok`, fresh standing, and the role's **standby runner**
-  installed and running on each (a standby takes no turn and costs no token).
+  installed and running on each (`systemctl --user enable --now
+  ameesh-runner-agent@<ROLE>` on the candidate; never `agent-runner
+  register` there, which would move the registry row to that host instead of
+  standing by). A standby takes no turn and costs no token.
 - The drill starts from the holder named by `ameesh role status`, never from
   an assumption; if the target host is not the holder, either run the drill
   on the actual holder or wait for a planned handover.
