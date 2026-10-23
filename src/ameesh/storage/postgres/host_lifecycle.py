@@ -11,6 +11,27 @@ _ROW = ("host, mode, generation, actor, "
         "extract(epoch from return_at)::float8 AS return_ts")
 
 
+def _release_elected(tx, host):
+    """#3029 : un drain planifié rend le bail d'un rôle élu tout de suite.
+
+    Le drain verrouille toutes les lignes d'agents de l'hôte (rôles élus
+    compris), donc cette écriture sérialise avec un `renew` ou une
+    réclamation concurrente. L'epoch avance : l'ancien détenteur est fencé
+    (`renew`, `begin_turn`, `end_turn` refusés) et le bail libre est
+    réclamable par un autre candidat sans attendre le TTL. La ligne garde son
+    hôte jusqu'à cette réclamation ; l'hôte drainé, lui, ne peut plus
+    réclamer. Mêmes colonnes que `release` : rien d'autre n'est effacé.
+    """
+    return tx.query(
+        "UPDATE agent_registry SET lease_owner = NULL, lease_expires_at = NULL, "
+        "lease_epoch = lease_epoch + 1, "
+        "status = CASE WHEN status = 'running' THEN 'idle' ELSE status END, "
+        "updated_at = now() "
+        "WHERE host = %s AND mode = 'execute' AND releve = 'election' "
+        "AND lease_owner IS NOT NULL "
+        "RETURNING name", (host,))
+
+
 class HostLifecycle(interface.HostLifecycle):
     def detect_losses(self, *, actor, older_than, critical=()):
         if isinstance(older_than, bool) or not isinstance(older_than, int) or older_than < 60:
@@ -26,8 +47,12 @@ class HostLifecycle(interface.HostLifecycle):
             host = candidate["host"]
             with self.db.transaction() as tx:
                 Hosts._lock_gate(tx, host)
+                # L165 (EP1) : un rôle élu n'est pas déplacé par L232e ; son
+                # bail expiré est repris par un autre candidat, sans preuve de
+                # source. Il n'entre donc pas dans le journal de l'hôte perdu.
                 agents = tx.query("SELECT name FROM agent_registry WHERE host=%s "
-                                  "AND mode='execute' ORDER BY name FOR UPDATE", (host,))
+                                  "AND mode='execute' AND releve <> 'election' "
+                                  "ORDER BY name FOR UPDATE", (host,))
                 old = HostLifecycle(tx).get(host)
                 if not agents or (old and old["mode"] == "lost"):
                     continue
@@ -72,10 +97,19 @@ class HostLifecycle(interface.HostLifecycle):
             Hosts._lock_gate(tx, host)
             # A claim or turn that wins this lock finishes before withdrawal;
             # a waiter reevaluates the volatile claim predicate afterwards.
-            agents = tx.query("SELECT name FROM agent_registry WHERE host=%s "
+            # L165 (EP1) : un rôle élu n'entre pas dans le journal de L232e
+            # (rien à déplacer), mais sa ligne est verrouillée ici pour que le
+            # drain rende son bail sans course avec un renew ou une
+            # réclamation (#3029).
+            agents = tx.query("SELECT name, releve FROM agent_registry WHERE host=%s "
                               "AND mode='execute' ORDER BY name FOR UPDATE", (host,))
             old = HostLifecycle(tx).get(host)
             if old and old["mode"] in ("draining", "lost"):
+                # Un drain déjà posé reste idempotent ; s'il est toujours
+                # planifié, un bail élu réapparu entre-temps est rendu lui
+                # aussi. Un hôte perdu garde la règle du TTL.
+                if old["mode"] == "draining":
+                    _release_elected(tx, host)
                 return old
             rows = tx.query(
                 "INSERT INTO host_lifecycle(host,mode,actor,return_at) "
@@ -87,9 +121,12 @@ class HostLifecycle(interface.HostLifecycle):
                 (host, actor, duration, duration))
             row = rows[0]
             for agent in agents:
+                if agent["releve"] == "election":
+                    continue
                 tx.execute("INSERT INTO host_lifecycle_agents(host,generation,agent,critical) "
                            "VALUES (%s,%s,%s,%s)",
                            (host, row["generation"], agent["name"], agent["name"] in critical))
+            _release_elected(tx, host)
             return row
 
     def undrain(self, host, *, actor):
