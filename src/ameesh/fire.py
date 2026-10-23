@@ -193,18 +193,18 @@ def give(db, lot: int, *, sha: str, actor: str, note: str = "", repo: str | None
         # fusion) ; l'époque du bail élu est vérifiée et journalisée avant.
         from . import pilot_gesture
         try:
-            pilot_gesture.guard(None, db, "merge", "fire #%d" % lot)
+            fence = pilot_gesture.gate(None, db, "merge", "fire #%d" % lot)
         except pilot_gesture.GestureRefused as exc:
             raise FireError(str(exc)) from exc
         return _give_locked(db, lot, sha=sha, actor=actor, note=note, repo=repo,
-                            exception=exception, reason=reason)
+                            exception=exception, reason=reason, fence=fence)
     finally:
         _unlock(handle)
 
 
 def _give_locked(db, lot: int, *, sha: str, actor: str, note: str = "",
                  repo: str | None = None, exception: str = "",
-                 reason: str = "") -> dict:
+                 reason: str = "", fence=None) -> dict:
     item = work.get(db, lot)
     if item is None:
         raise FireError("lot #%d not found" % lot)
@@ -247,8 +247,19 @@ def _give_locked(db, lot: int, *, sha: str, actor: str, note: str = "",
     except packet_guard.PacketGuardError as exc:
         raise FireError(str(exc)) from exc
     full = merge_queue.pinned(repo, wanted) if repo else None
-    return work.milestone(db, lot, FIRE, sha=full or wanted, actor=actor,
-                          note=(note or "").strip())
+    if fence is None:
+        return work.milestone(db, lot, FIRE, sha=full or wanted, actor=actor,
+                              note=(note or "").strip())
+    # L165 (EP4) : le hold et l'écriture du jalon sont dans la même
+    # transaction, après les lectures de préparation (revue cx2 B3).
+    from . import pilot_gesture
+    with db.transaction() as tx:
+        try:
+            fence.hold(tx)
+        except pilot_gesture.GestureRefused as exc:
+            raise FireError(str(exc)) from exc
+        return work.milestone(tx, lot, FIRE, sha=full or wanted, actor=actor,
+                              note=(note or "").strip())
 
 
 def withdraw(db, lot: int, *, actor: str, note: str = "", repo: str | None = None) -> dict:
@@ -261,7 +272,7 @@ def withdraw(db, lot: int, *, actor: str, note: str = "", repo: str | None = Non
     try:
         from . import pilot_gesture
         try:
-            pilot_gesture.guard(None, db, "merge", "unfire #%d" % lot)
+            fence = pilot_gesture.gate(None, db, "merge", "unfire #%d" % lot)
         except pilot_gesture.GestureRefused as exc:
             raise FireError(str(exc)) from exc
         item = work.get(db, lot)
@@ -270,8 +281,17 @@ def withdraw(db, lot: int, *, actor: str, note: str = "", repo: str | None = Non
         fire = active(work.milestones(db, lot))
         if fire is None:
             raise FireError("lot #%d carries no active fire: nothing to withdraw" % lot)
-        return work.milestone(db, lot, UNFIRE, sha=_norm(fire.get("sha")), actor=actor,
-                              note=(note or "withdrawn by %s" % actor).strip())
+        if fence is None:
+            return work.milestone(db, lot, UNFIRE, sha=_norm(fire.get("sha")), actor=actor,
+                                  note=(note or "withdrawn by %s" % actor).strip())
+        with db.transaction() as tx:
+            try:
+                fence.hold(tx)
+            except pilot_gesture.GestureRefused as exc:
+                raise FireError(str(exc)) from exc
+            return work.milestone(tx, lot, UNFIRE, sha=_norm(fire.get("sha")),
+                                  actor=actor,
+                                  note=(note or "withdrawn by %s" % actor).strip())
     finally:
         _unlock(handle)
 

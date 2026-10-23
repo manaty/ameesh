@@ -472,15 +472,18 @@ def _create(db: Db, *, title, type="evolution", source="", app="",  # noqa: A002
             raise WorkError("--parent-lot: a positive lot number")
         if get(db, parent_lot) is None:
             raise WorkError("parent lot #%d not found" % parent_lot)
+    fence = None
     if assignee:
         # L165 (EP4) : créer un lot déjà attribué est une attribution (le
         # destinataire sera réveillé) ; un lot de décision (`team_queue=False`,
-        # assigné à son demandeur) n'est pas ce geste. Un humain ou un
-        # exécuteur sans session liée n'est pas concerné.
+        # assigné à son demandeur) n'est pas ce geste. La garde ne fait que
+        # lire ici : `hold` et l'écriture sont dans la même transaction plus
+        # bas, sinon une prise du rôle entre `check_assignee` et `work.add`
+        # laisserait créer sous l'ancienne époque (revue cx2 B3).
         if team_queue:
             from . import pilot_gesture
-            pilot_gesture.guard(cfg, db, "assign",
-                                "add for %s" % assignee, project=(app or None))
+            fence = pilot_gesture.gate(cfg, db, "assign",
+                                       "add for %s" % assignee, project=(app or None))
         # L46 : l'assigné enregistré est celui que la garde a normalisé
         check = check_assignee(db, assignee, externe=externe, cfg=cfg)
         assignee = check["assignee"]
@@ -492,19 +495,28 @@ def _create(db: Db, *, title, type="evolution", source="", app="",  # noqa: A002
     created = ("created" + (" (plan: %s)" % package if package else "")
                + ("; estimate: %s" % span(minutes * 60) if minutes else "")
                + ("; %s" % note if note else ""))
-    item = storage.of(db).work.add(
-        type=type, source=source, app=app, title=title.strip(), body=body,
-        issue_ref=issue_ref, workstream=workstream, assignee=assignee,
-        budget_usd=budget_usd, note=created,
-        actor=actor, package_id=fiche["id"] if fiche else None,
-        package_parent=fiche.get("parent") if fiche else None,
-        branch=branch, branch_target=branch_target, priority=priority,
-        estimate_minutes=minutes,
-        estimate_source=(" ".join(str(estimate_source or "").split()) or None)
-        if minutes else None, change_size=size or None,
-        queued_note=queued and _queued_note(queued, created),
-        forced_note=queued and _forced_note(queued, created, force, actor),
-        mark_item_id=mark_item_id, mark_note=mark_note, parent_lot=parent_lot)
+
+    def create(tx):
+        return storage.of(tx).work.add(
+            type=type, source=source, app=app, title=title.strip(), body=body,
+            issue_ref=issue_ref, workstream=workstream, assignee=assignee,
+            budget_usd=budget_usd, note=created,
+            actor=actor, package_id=fiche["id"] if fiche else None,
+            package_parent=fiche.get("parent") if fiche else None,
+            branch=branch, branch_target=branch_target, priority=priority,
+            estimate_minutes=minutes,
+            estimate_source=(" ".join(str(estimate_source or "").split()) or None)
+            if minutes else None, change_size=size or None,
+            queued_note=queued and _queued_note(queued, created),
+            forced_note=queued and _forced_note(queued, created, force, actor),
+            mark_item_id=mark_item_id, mark_note=mark_note, parent_lot=parent_lot)
+
+    if fence is None:
+        item = create(db)
+    else:
+        with db.transaction() as tx:
+            fence.hold(tx)
+            item = create(tx)
     if item.get("queued_behind") is not None:
         item["queue_warning"] = queue_warning(db, item, assignee)
     # L317c : un bug de priorité 1 ouvert par un humain (ou son chat) réveille
@@ -2496,14 +2508,15 @@ def merged(db: Db, item_id: int, *, sha: str = "", note: str = "", actor: str = 
     proof_guard = {}
     # Preserve idempotency and the closed-lot diagnostic without requiring
     # that an old clone or object still be available.
+    fence = None
     if item["state"] not in (*MERGED_STATES, "closed"):
         # L165 (EP4) : déclarer une fusion faite à la main est un geste du
-        # pilote hors base (le constat ferme le lot). Le bail élu est vérifié
-        # avant toute lecture de preuve ; un balayage automatique n'a pas de
-        # session liée et n'est pas concerné.
+        # pilote hors base (le constat ferme le lot). La garde ne fait que lire
+        # ici : la preuve peut être longue (GitHub), le hold et l'écriture de
+        # `close_merged` sont dans la même transaction plus bas (revue cx2 B3).
         from . import pilot_gesture
-        pilot_gesture.guard(cfg, db, "merge", "merged #%d" % item_id,
-                            project=(item.get("app") or None))
+        fence = pilot_gesture.gate(cfg, db, "merge", "merged #%d" % item_id,
+                                   project=(item.get("app") or None))
         if pr_text:
             text, pr_ref, frozen_id = _merged_pr(
                 item, pr_text, sha=text, db=db, announce=announce)
@@ -2527,9 +2540,17 @@ def merged(db: Db, item_id: int, *, sha: str = "", note: str = "", actor: str = 
                 item["migration"])
         extra = "%s — %s" % (extra, mention) if extra else mention
     try:
-        done = close_merged(db, item_id, sha=text, actor=actor,
-                            source=actor or UNKNOWN_ACTOR, declared=True, extra=extra,
-                            landed=landed, pr_ref=pr_ref, **proof_guard)
+        if fence is None:
+            done = close_merged(db, item_id, sha=text, actor=actor,
+                                source=actor or UNKNOWN_ACTOR, declared=True, extra=extra,
+                                landed=landed, pr_ref=pr_ref, **proof_guard)
+        else:
+            with db.transaction() as tx:
+                fence.hold(tx)
+                done = close_merged(tx, item_id, sha=text, actor=actor,
+                                    source=actor or UNKNOWN_ACTOR, declared=True,
+                                    extra=extra, landed=landed, pr_ref=pr_ref,
+                                    **proof_guard)
     except DbError as exc:
         # #1567 : course perdue sur l'index unique (dépôt, numéro atterri) —
         # message lisible plutôt que la DbError brute ; la pré-vérification a

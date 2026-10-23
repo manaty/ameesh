@@ -230,9 +230,9 @@ prepares outside the database check the epoch first:
 
 | gesture | entry point |
 |---|---|
-| merge | `ameesh work fire` / `work merged` / `work merge-pr` |
+| merge | `ameesh work fire` / `work merged` / `work merge-pr` / the automatic packet merge (`packet_automerge` arm and check) |
 | merge queue | `ameesh work queue add\|remove` / `work land` |
-| assignment | `ameesh work assign` (and mail assignment through it) |
+| assignment | `ameesh work assign` / an assigned `work add` (and mail assignment through it) |
 | packet | `ameesh work packet record` / the packet train fire |
 | decision routing | `ameesh decide ask` |
 
@@ -251,15 +251,24 @@ compared to the live lease in the same transaction (its owner is checked when
 the wrapper declares one). A timer therefore never passes as a human.
 
 For an external call — `work merge-pr`'s push, `land`'s push or `gh pr
-merge`, and the fire's merge — the database transaction cannot cover GitHub.
-The pilot's lease is renewed just before the call with a margin at least the
-call's worst case (push timeout plus read-back), and the call is refused if
-the renewed lease does not have that margin left. The residual race remains:
-a call that blocks beyond its own timeout can outlive the renewed lease, and
-another candidate may then take the role. The target lease, the
-compare-and-swap on the target and GitHub's `--match-head-commit` are the
-last guards; a failed renewal refuses the effect before it starts, and an
-uncertain outcome is reported and reconciled, never silently retried.
+merge`, the fire's merge, and the packet auto-merge's `POST /merges` — the
+database transaction cannot cover GitHub. The pilot's lease is renewed just
+before the call with a margin at least the call's worst case (push timeout
+plus read-back), and the call is refused if the renewed lease does not have
+that margin left. The residual race remains: a call that blocks beyond its
+own timeout can outlive the renewed lease, and another candidate may then
+take the role. The target lease, the compare-and-swap on the target and
+GitHub's `--match-head-commit` are the last guards; a failed renewal refuses
+the effect before it starts, and an uncertain outcome is reported and
+reconciled, never silently retried.
+
+The guard is never a committed pre-check followed by a later write. The long
+preparation (proof reads, CI, packet checks) comes first; `Gate.hold` and the
+database write are then in the same transaction: `work assign`, an assigned
+`work add`, `work merged`, `decisions ask` (including its `--new-lot`
+creation), `fire`, the train fire, the packet auto-merge. A refusal, or an
+election that wins in between, rolls the preparation back — no orphan lot,
+marker or decision is left behind.
 
 Humans, the bureau, host-pinned agents (`releve: hote`) and runner-internal
 sweeps without `AMEESH_ROLE` are unchanged. This does not replace the target

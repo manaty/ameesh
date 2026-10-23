@@ -73,6 +73,10 @@ OPEN_STATES = ("intake", "build", "qa", "blocked", "waiting_human")
 #: durée du bail `auto-merge:<lot>` qui sérialise la publication et le passage ;
 #: il est renouvelé avant chaque geste (B4 : plusieurs appels `gh` de 60 à 120 s)
 LOCK_TTL_S = 300.0
+#: L165 (EP4) : marge du bail élu avant `merge_into` (POST /merges, 120 s de
+#: timeout + lecture) ; la course résiduelle est documentée dans
+#: docs/HOST-HANDOFFS.md.
+AUTOMERGE_CALL_MARGIN_S = 180.0
 #: une marque du journal du lot ; un armement porte toujours sa cible
 MARK_RE = re.compile(
     r"^auto-merge (?P<state>armed|disarmed|merged|not-armed) "
@@ -238,12 +242,23 @@ def arm(cfg, db, lot: int, *, slug: str, number: int, sha: str, target: str, gh,
         return {"state": "error", "why": "another auto-merge operation holds lot #%d: "
                                          "rerun `ameesh ci run %d --full`" % (lot, lot)}
     try:
+        # L165 (EP4) : l'armement est un geste de fusion du pilote (il ouvre
+        # le chemin de `merge_into`) ; sans identité de rôle, `gate` rend None
+        # et le passage d'exécuteur reste inchangé. Le merge immédiat reçoit
+        # la même garde et la renouvelle juste avant l'appel.
+        from . import pilot_gesture
+        try:
+            fence = pilot_gesture.gate(cfg, db, "merge", "auto-merge arm #%d" % lot)
+            if fence is not None:
+                fence.hold(db, margin_s=AUTOMERGE_CALL_MARGIN_S)
+        except pilot_gesture.GestureRefused as exc:
+            return {"state": "error", "why": str(exc)}
         out = _arm_locked(db, lot, slug=slug, number=number, sha=sha, target=target,
                           gh=gh, actor=actor, handle=handle)
         if out["state"] in ("armed", "already-armed"):
             # une composition déjà verte fusionne tout de suite, sous le même bail
             out["merge"] = _check_locked(cfg, db, lot, gh=gh, dry_run=False, actor=actor,
-                                         handle=handle)
+                                         handle=handle, fence=fence)
         return out
     finally:
         _unlock(handle)
@@ -398,19 +413,25 @@ def check(cfg, db, lot: int, *, gh, dry_run: bool = False,
     suivant) ou `error`."""
     if not active(marks(db, lot)):
         return {"lot": lot, "result": "idle"}
+    from . import pilot_gesture
+    try:
+        fence = (None if dry_run else
+                 pilot_gesture.gate(cfg, db, "merge", "auto-merge check #%d" % lot))
+    except pilot_gesture.GestureRefused as exc:
+        return {"lot": lot, "result": "error", "error": str(exc)}
     handle = None if dry_run else _lock(db, lot)
     if handle is None and not dry_run:
         return {"lot": lot, "result": "busy"}
     try:
         return _check_locked(cfg, db, lot, gh=gh, dry_run=dry_run, actor=actor,
-                             handle=handle)
+                             handle=handle, fence=fence)
     finally:
         if handle is not None:
             _unlock(handle)
 
 
 def _check_locked(cfg, db, lot: int, *, gh, dry_run: bool, actor: str,
-                  handle=None) -> dict:
+                  handle=None, fence=None) -> dict:
     # relu sous le bail : une publication a pu réarmer depuis la première lecture
     mine = active(marks(db, lot))
     if mine is None:
@@ -499,6 +520,15 @@ def _check_locked(cfg, db, lot: int, *, gh, dry_run: bool, actor: str,
                fresh["base"] or "?")))
     if not _renew(handle):
         return dict(out, result="busy")
+    # L165 (EP4) : renouvellement du bail élu juste avant `POST /merges`, avec
+    # la marge de l'appel ; sans rôle/identité, `fence` est None et le passage
+    # d'exécuteur reste inchangé.
+    if fence is not None:
+        from . import pilot_gesture
+        try:
+            fence.hold(db, margin_s=AUTOMERGE_CALL_MARGIN_S)
+        except pilot_gesture.GestureRefused as exc:
+            return dict(out, result="error", error=str(exc))
     commit, error = merge_into(slug, base, sha, number=number, branch=fresh["branch"],
                                title=fresh.get("title") or "", gh=gh)
     if error is not None:

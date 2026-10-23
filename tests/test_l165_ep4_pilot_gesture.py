@@ -28,6 +28,7 @@ from ameesh import (
     fire,
     merge_pr,
     merge_queue,
+    packet_automerge,
     packet_link,
     pilot_gesture,
     registry,
@@ -301,6 +302,46 @@ class GestureFenceTest(PgTestCase):
                              ("attribué par un pilote",))
         self.assertEqual(rows, [])
 
+    def test_work_add_race_apres_check_assignee_ne_cree_rien(self):
+        worker = "worker-%s" % self.name
+        registry.upsert(self.db, worker, harness="claude", host="h1",
+                        cwd=self.tmp, status="idle")
+        old = self.epoch
+        original = work.check_assignee
+
+        def steal(*args, **kwargs):
+            check = original(*args, **kwargs)
+            registry.release(self.db, self.name, "runner-h1", old)
+            registry.claim(self.db, self.name, "runner-h2", 600, host="h2")
+            return check
+
+        title = "attribué pendant la course 3013"
+        with self.identity_env(name=self.name, runner="runner-h1", epoch=old):
+            with mock.patch.object(work, "check_assignee", side_effect=steal):
+                with self.assertRaises(pilot_gesture.GestureRefused):
+                    work.add(self.db, title=title, assignee=worker, app="ameesh",
+                             cfg=self.cfg)
+        self.assertEqual(self.db.query(
+            "SELECT id FROM work_items WHERE title = %s", (title,)), [])
+
+    def test_work_merged_race_apres_la_preuve_ne_declare_rien(self):
+        lot = self.new_lot()
+        old = self.epoch
+
+        def steal(*args, **kwargs):
+            registry.release(self.db, self.name, "runner-h1", old)
+            registry.claim(self.db, self.name, "runner-h2", 600, host="h2")
+            return "a" * 40
+
+        with self.identity_env(name=self.name, runner="runner-h1", epoch=old):
+            with mock.patch.object(work, "_declared_merge_commit", side_effect=steal):
+                with mock.patch.object(work, "close_merged",
+                                       side_effect=AssertionError("déclaration atteinte")):
+                    with self.assertRaises(pilot_gesture.GestureRefused):
+                        work.merged(self.db, lot, sha="a" * 40, actor=self.name,
+                                    cfg=self.cfg)
+        self.assertEqual(work.get(self.db, lot)["state"], "intake")
+
     def test_work_merged_stale_refuse_avant_la_preuve(self):
         lot = self.new_lot()
         old = self.epoch
@@ -359,6 +400,21 @@ class GestureFenceTest(PgTestCase):
         self.assertEqual(self.db.query("SELECT count(*) AS n FROM agent_mailbox")[0]["n"], 0)
         self.assertEqual(work.get(self.db, lot)["state"], "intake")
 
+    def test_decision_new_lot_stale_ne_cree_rien(self):
+        old = self.epoch
+        registry.release(self.db, self.name, "runner-h1", old)
+        registry.claim(self.db, self.name, "runner-h2", 600, host="h2")
+        with self.identity_env(name=self.name, runner="runner-h1", epoch=old):
+            with self.assertRaises(decisions.DecisionError):
+                decisions.ask(self.cfg, self.db, requester=self.name,
+                              question="Quelle option ?",
+                              new_lot="orphelin de décision 3013")
+        self.assertEqual(self.db.query(
+            "SELECT id FROM work_items WHERE title = %s",
+            ("orphelin de décision 3013",)), [])
+        self.assertEqual(self.db.query(
+            "SELECT count(*) AS n FROM agent_mailbox")[0]["n"], 0)
+
     def test_decision_live_cree_la_demande_et_le_geste(self):
         lot = self.new_lot()
         with self.live():
@@ -367,6 +423,37 @@ class GestureFenceTest(PgTestCase):
         self.assertEqual(out["lot_state"], "waiting_human")
         rows = self.events(ref="decision lot #%d" % lot)
         self.assertEqual([row["data"]["gesture"] for row in rows], ["decision"])
+
+    def test_auto_merge_check_stale_refuse_avant_merge_into(self):
+        lot = self.new_lot()
+        work.note(self.db, lot,
+                  "auto-merge armed repo=manaty/ameesh pr=1 sha=%s base=main "
+                  "required=tests" % ("a" * 40), actor=self.name)
+        old = self.epoch
+        registry.release(self.db, self.name, "runner-h1", old)
+        registry.claim(self.db, self.name, "runner-h2", 600, host="h2")
+        called = []
+        with self.identity_env(name=self.name, runner="runner-h1", epoch=old):
+            with mock.patch.object(packet_automerge, "merge_into",
+                                   side_effect=lambda *a, **k: called.append(1)):
+                out = packet_automerge.check(self.cfg, self.db, lot, gh=lambda *a, **k: None)
+        self.assertEqual(out["result"], "error")
+        self.assertIn("fenced", out["error"])
+        self.assertEqual(called, [])
+
+    def test_auto_merge_arm_stale_refuse_avant_armement(self):
+        lot = self.new_lot()
+        old = self.epoch
+        registry.release(self.db, self.name, "runner-h1", old)
+        registry.claim(self.db, self.name, "runner-h2", 600, host="h2")
+        with self.identity_env(name=self.name, runner="runner-h1", epoch=old):
+            with mock.patch.object(packet_automerge, "_arm_locked",
+                                   side_effect=AssertionError("armement atteint")):
+                out = packet_automerge.arm(
+                    self.cfg, self.db, lot, slug="manaty/ameesh", number=1,
+                    sha="a" * 40, target="main", gh=lambda *a, **k: None)
+        self.assertEqual(out["state"], "error")
+        self.assertIn("fenced", out["why"])
 
     def test_fire_stale_refuse_avant_le_jalon(self):
         lot = self.new_lot()
