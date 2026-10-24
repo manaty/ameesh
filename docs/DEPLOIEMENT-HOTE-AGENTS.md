@@ -369,8 +369,14 @@ n’avait que `ameesh`), après sauvegarde `config.json.role-timers.bak` et sans
 depuis la configuration de l’observateur historique : le relevé CI de Nexlink a
 besoin de `base: [develop]`. Ce n’est pas un secret ; le jeton `GH_TOKEN` reste
 dans `notify.env`. Le drop-in posé fait exclure à `ameesh-notify` les passes
-mécaniques (`--skip issues,github-watch,ci`) : alertes et prise restent dans le
-service, GitHub et la CI passent par la minuterie du rôle.
+portées par les minuteries (`--skip issues,github-watch,ci,alerts`) : la prise
+reste dans le service, GitHub, la CI et la livraison des alertes passent par
+la minuterie du rôle. #3383 : la minuterie `alerts` exige sur chaque candidat
+la clé `notify` de l’owner (route `ntfy`, jeton dans `notify.env` en 0600),
+identique d’un candidat à l’autre : le responsable du rôle et
+`notify.default_human` doivent y avoir un canal `ntfy` ou `slack` utilisable
+(`desktop` et `app` ne comptent pas) ; sinon `timers` sort en `1` et
+`controler` échoue en nommant l’humain et la raison.
 
 `controler` (`vm.sh agents controler`, `poste.sh controler`) exécute
 `ameesh role timers --check` et échoue sur une minuterie absente, désactivée,
@@ -459,6 +465,15 @@ après l'ajout :
 ameesh release packet-watch --dry-run      # grace, busy, served, nothing-ready, would-alert… ; jamais error
 journalctl --user -u ameesh-release -n 5   # une ligne « packet-watch ameesh: … » par tick
 ```
+
+**Retirer le coupeur d'un hôte** : retirer son bloc `release`, jamais couper
+`ameesh-release.timer`. Le packet-watch tourne dans le tick même sans bloc
+`release` (le tick affiche `release: off` puis exécute le packet-watch seul) ;
+désactiver la minuterie arrête aussi la fusion automatique des paquets — le
+geste du 24/10 14:31Z sur agents-2. `ameesh doctor` signale un hôte
+`packet_watch` dont `ameesh-release.timer` n'est pas actif, ainsi qu'un dépôt
+`radar.projects.<projet>.repo` auquel il manque une tête gelée (checkout non
+fetché, désignation au gel impossible).
 
 **Ce que fait un tick** : il prend `B`, la tête de la cible si la CI du
 commit exact est verte, sinon le plus récent commit vert de la chaîne

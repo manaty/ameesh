@@ -669,6 +669,7 @@ def pending_review_lines(db, name: str, *, now: float | None = None) -> list[str
     cette tête. La désignation est un courrier lu une fois ; cette liste est
     ce qui la fait survivre aux rotations. Une lecture illisible le dit, elle
     ne rend jamais une file vide."""
+    from . import freeze_gate
     from . import review_designation_activation as activation
     from .sous_utilisation import _duration
     try:
@@ -687,7 +688,9 @@ def pending_review_lines(db, name: str, *, now: float | None = None) -> list[str
                    "`ameesh work milestone %s verdict ok|blocked --sha %s`" % (
                        row["lot"], row.get("state") or "?",
                        fil.excerpt(row.get("title") or "", 100), row["sha"][:12], age,
-                       row["lot"], row["sha"]))
+                       row["lot"],
+                       freeze_gate.verdict_sha(db, row["lot"], row["sha"])
+                       or "<frozen head>"))
     if len(rows) > REVIEWS_MAX:
         out.append("- … and %d more: `ameesh work pending-reviews %s`"
                    % (len(rows) - REVIEWS_MAX, name))

@@ -38,8 +38,10 @@ in `notify_briefs` so two hosts do not duplicate and the reminder comes after
 deposited. The alert resolves by itself when a heartbeat covers the human
 again, or when no request is pending.
 
-The fallback itself — a second notifier with a route on a healthy host — stays
-an operator gesture, documented in docs/EXPLOITATION.md, « Alertes poussées ».
+#3383: the delivery itself is no longer one host's service: the `alerts` pass
+is a role timer (`ameesh role timers`), run by the lease holder on its own
+routes. This alert then names a candidate without a route, or a lost holder
+not yet replaced (docs/EXPLOITATION.md, « Alertes poussées »).
 """
 from __future__ import annotations
 
@@ -155,10 +157,10 @@ def gaps_for(pending, rows, now: float, *, alive_s: float = ALIVE_S) -> list[dic
             reason = "notifier_stale"
         detail = (
             "%s: %d decision request(s) pending (%d overdue, oldest #%d, %s) — "
-            "nothing is pushed to %s; restore ameesh-notify on the host that holds "
-            "the routes, or configure a fallback route on a healthy host and start "
-            "it (docs/EXPLOITATION.md, \"Alertes poussées\"); the requests stay "
-            "readable with `ameesh decisions`"
+            "nothing is pushed to %s; the alerts role timer runs on the lease "
+            "holder: declare this human's notify route on every candidate and run "
+            "`ameesh role timers --install` there (docs/EXPLOITATION.md, \"Alertes "
+            "poussées\"); the requests stay readable with `ameesh decisions`"
             % (prefix, len(ids), len(overdue), ids[0], _span(age), human))
         out.append({"human": human, "last_host": last_host,
                     "last_seen": last_seen, "last_human": last_human,

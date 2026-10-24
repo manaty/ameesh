@@ -139,7 +139,7 @@ class PendingReviewsTest(t2447._ActivationFixture, PgTestCase):
         worker = types.SimpleNamespace(db=self.db, name="r1",
                                        _idle_pilot=lambda: "")
         prompt = runner.AgentWorker._idle_prompt(worker)
-        self.assertTrue(prompt.startswith(adapters.IDLE_PROMPT_NO_PILOT))
+        self.assertTrue(prompt.endswith(adapters.IDLE_PROMPT_NO_PILOT))
         self.assertIn(adapters.IDLE_REVIEWS_HEADER, prompt)
         self.assertIn("#%d" % lot, prompt)
         self.assertIn(sha, prompt)

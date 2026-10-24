@@ -2134,6 +2134,14 @@ def cmd_doctor(cfg: Config, notify_test: bool, probe: bool = False,
         # inscriptible) — lecture seule, sans changer le verdict
         for line in hostcheck.turn_cgroup_lines(cfg, db):
             print(line)
+        # #3364 : le packet-watch tourne dans `ameesh release tick` ; sans
+        # minuterie active, l'alerte de créneau et la fusion automatique
+        # s'arrêtent sans bruit. Et un dépôt radar non fetché fait échouer la
+        # désignation au gel (« no repository holds the frozen head »).
+        for line in hostcheck.packet_watch_lines(cfg):
+            print(line)
+        for line in hostcheck.radar_repo_lines(cfg, db):
+            print(line)
     except db_mod.DbError:
         pass
     verdict = 0

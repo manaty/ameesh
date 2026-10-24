@@ -62,7 +62,7 @@ class GapsTest(unittest.TestCase):
         for texte in ("no living notifier covers human:alice",
                       "last heartbeat from host pc-smichea",
                       "15min ago", "nothing is pushed to human:alice",
-                      "fallback route", "ameesh decisions"):
+                      "role timers --install", "ameesh decisions"):
             self.assertIn(texte, gap["detail"])
         # deux demandes du même humain ne font qu'un écart
         self.assertEqual(len(notify_gap.gaps_for(_pending(ids=(7, 8, 9)),
@@ -132,7 +132,7 @@ class GapsTest(unittest.TestCase):
         briefs = alert_briefs.briefs(alert, listing, auditor_names=("auditeur",),
                                      orchestrator_names=("orch",))
         self.assertEqual(sorted(briefs), ["auditeur", "orch"])
-        self.assertIn("fallback route", briefs["orch"])
+        self.assertIn("role timers --install", briefs["orch"])
         self.assertIn("no living notifier", briefs["orch"])
 
     def test_notify_test_nomme_le_repli(self):
@@ -143,7 +143,7 @@ class GapsTest(unittest.TestCase):
         with contextlib.redirect_stderr(err):
             self.assertEqual(notify.cmd_test(cfg, ncfg, args), 2)
         self.assertIn("no channel for human:alice", err.getvalue())
-        self.assertIn("fallback route", err.getvalue())
+        self.assertIn("role timers --install", err.getvalue())
 
 
 class AlertesTest(PgTestCase):
