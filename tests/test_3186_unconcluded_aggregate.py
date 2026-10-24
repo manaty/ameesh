@@ -484,10 +484,11 @@ class PacketTest(banc.Journal):
         self.assertEqual(gh.reruns(), [])
 
 
-def _actions_check(name, conclusion, *, run=300, status="completed", check_id=1):
+def _actions_check(name, conclusion, *, run=300, status="completed", check_id=1, suite=None):
     """Un check run Actions du commit, tel que `commits/<sha>/check-runs` le rend."""
     return {"id": check_id, "name": name, "head_sha": "a" * 40, "status": status,
             "conclusion": conclusion, "app": {"id": 15368, "slug": "github-actions"},
+            "check_suite": {"id": run if suite is None else suite},
             "details_url": "https://github.com/o/nexlink/actions/runs/%d/job/9" % run,
             "started_at": "2026-10-12T20:00:00Z", "completed_at": "2026-10-12T20:05:00Z"}
 
@@ -548,6 +549,28 @@ class CommitCiTest(unittest.TestCase):
                         [_actions_check("tests", "cancelled", check_id=1),
                          _actions_check("tests", None, status="in_progress", check_id=2)])
         self.assertFalse(out["acceptable"])
+        self.assertEqual(out["unconcluded"], [])
+
+    def test_a_green_workflow_does_not_hide_another_workflow_that_never_concluded(self):
+        # R3 cx2 : deux workflows portent un check `tests` (suites distinctes) ;
+        # le vert de l'un ne rachète pas l'agrégat annulé de l'autre, quel que
+        # soit l'ordre reçu — la porte du paquet refuse le même cas (#3008).
+        cancelled = _actions_check("tests", "cancelled", run=300, check_id=1)
+        green = _actions_check("tests", "success", run=301, check_id=2)
+        for a_run in ("cancelled", "success"):  # le repro de cx2, puis un run qui se dit vert
+            runs = [l160g._run("A", conclusion=a_run), l160g._run("B")]
+            for checks in ([cancelled, green], [green, cancelled]):
+                with self.subTest(run_a=a_run, order=[c["conclusion"] for c in checks]):
+                    out = self.read(runs, checks, required=(("tests", 15368),))
+                    self.assertFalse(out["acceptable"])
+                    self.assertFalse(out["green"])
+                    self.assertEqual(out["unconcluded"],
+                                     [{"check": "tests", "databaseId": 300}])
+                    self.assertFalse(release_cutoff.reading_is_green(out))
+        # deux essais de la même suite : le dernier l'emporte toujours
+        rerun = _actions_check("tests", "success", run=300, check_id=2)
+        out = self.read([l160g._run("A")], [cancelled, rerun], required=(("tests", 15368),))
+        self.assertTrue(out["acceptable"])
         self.assertEqual(out["unconcluded"], [])
 
     def test_an_app_scoped_requirement_reads_only_its_application(self):

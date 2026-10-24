@@ -2140,8 +2140,14 @@ def commit_ci(project: Project, sha: str, gh=None, *, branch: str | None = None,
             raise plan_github.GithubError("commit checks: invalid identity or frozen SHA")
         if any(check["name"] == name and app_id in (None, check["app"]["id"])
                for name, app_id in wanted):
-            # le dernier essai l'emporte ; un essai inachevé n'est jamais masqué
-            key = (check["app"]["id"], check["name"])
+            # le dernier essai l'emporte ; un essai inachevé n'est jamais masqué.
+            # R3 cx2 : la suite (un run de workflow) entre dans la clé, comme au
+            # rollup du paquet (#3008) — un workflow vert ne masque pas
+            # l'agrégat homonyme jamais conclu d'un autre workflow ; seuls les
+            # essais d'une même suite se remplacent.
+            suite = check.get("check_suite")
+            suite = suite.get("id") if isinstance(suite, dict) else None
+            key = (check["app"]["id"], suite if type(suite) is int else -1, check["name"])
             rank = (check.get("status") != "completed", check["id"])
             if key not in required_latest or rank > required_latest[key][0]:
                 required_latest[key] = (rank, check)
@@ -2232,7 +2238,8 @@ def commit_ci(project: Project, sha: str, gh=None, *, branch: str | None = None,
                        if result == CI_NEGATIVE_RESULT})
     unconcluded = []
     for name, app_id in wanted:
-        rows = [check for (app, check_name), (_rank, check) in sorted(required_latest.items())
+        rows = [check for (app, _suite, check_name), (_rank, check)
+                in sorted(required_latest.items())
                 if check_name == name and app_id in (None, app)]
         if any(conclusion_result(c.get("status"), c.get("conclusion")) == CI_NEGATIVE_RESULT
                for c in rows):
@@ -2247,7 +2254,10 @@ def commit_ci(project: Project, sha: str, gh=None, *, branch: str | None = None,
                            if result == CI_INCONCLUSIVE_RESULT} - absent)
     acceptable = bool(count) and not pending and not negative and not missing \
         and not unconcluded
-    return {"runs": count, "green": bool(count) and not pending and not failed and not missing,
+    # un agrégat requis jamais conclu n'est jamais vert, même dans un run
+    # qui se dit vert (R3 cx2) ; sans `required`, `green` est inchangé.
+    return {"runs": count, "green": bool(count) and not pending and not failed and not missing
+            and not unconcluded,
             "acceptable": acceptable, "negative": negative, "inconclusive": inconclusive,
             "unconcluded": unconcluded,
             "pending": sorted(pending), "failed": sorted(failed), "missing": missing,
