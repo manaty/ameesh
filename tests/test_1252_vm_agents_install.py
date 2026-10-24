@@ -22,6 +22,8 @@ import subprocess
 import sys
 import tempfile
 import unittest
+
+from ameesh import platform
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -865,6 +867,7 @@ class VmAgentsInstallTest(VmAgentsHarness):
         for call in self.pip_calls():
             self.assertIn('src-' + self.target[:7], call)
 
+    @unittest.skipUnless(platform.is_linux(), "preuve du venv vivant via /proc : Linux")
     def test_failed_install_keeps_previous_sha_and_retour_returns_to_the_left_code(self):
         plus_ancien = self.plus_ancien
         (self.parts / 'previous-sha').write_text(plus_ancien + '\n')
@@ -889,6 +892,7 @@ class VmAgentsInstallTest(VmAgentsHarness):
             self.assertIn('src-' + self.old[:7], call)
             self.assertNotIn('src-' + plus_ancien[:7], call)
 
+    @unittest.skipUnless(platform.is_linux(), "preuve du venv vivant via /proc : Linux")
     def test_failed_first_install_leaves_a_journal_and_retour_returns_to_the_left_code(self):
         # Première utilisation : aucun previous-sha, le journal seul permet le retour.
         (self.parts / 'previous-sha').unlink()
@@ -927,6 +931,7 @@ class VmAgentsInstallTest(VmAgentsHarness):
         self.assertFalse((self.parts / ('src-' + self.target[:7])).exists())
         self.assertEqual(self.pip_calls(), [])
 
+    @unittest.skipUnless(platform.is_linux(), "preuve du venv vivant via /proc : Linux")
     def test_relaunching_install_keeps_the_original_recovery_target(self):
         # A→B, la préparation échoue : #1969 laisse la version ACTIVE intacte
         # (direct_url.json pointe encore A, plus de pip dans le venv vivant).
@@ -955,6 +960,7 @@ class VmAgentsInstallTest(VmAgentsHarness):
             self.assertIn('src-' + self.old[:7], call)
             self.assertNotIn('src-' + self.target[:7], call)
 
+    @unittest.skipUnless(platform.is_linux(), "preuve du venv vivant via /proc : Linux")
     def test_relaunching_first_install_keeps_the_recovery_journal(self):
         # Même cas sans previous-sha : le journal seul porte la récupération, et
         # la version active reste intacte après l'échec de préparation (#1969).
@@ -975,6 +981,7 @@ class VmAgentsInstallTest(VmAgentsHarness):
         self.assertEqual(self.head(self.src), self.old)
         self.assertEqual((self.parts / 'previous-sha').read_text().strip(), self.old)
 
+    @unittest.skipUnless(platform.is_linux(), "preuve du venv vivant via /proc : Linux")
     def test_relaunching_install_on_the_installed_sha_keeps_the_return_target(self):
         # A→B réussi (previous-sha = A), puis relance de « installer B » : la
         # cible de retour reste A. Sans la garde, previous-sha serait réécrit à
@@ -1064,6 +1071,7 @@ class VmAgentsInstallTest(VmAgentsHarness):
         self.assertEqual(self.head(self.src), self.old)
         self.assertEqual(self.pip_calls(), [])
 
+    @unittest.skipUnless(platform.is_linux(), "preuve du venv vivant via /proc : Linux")
     def test_retour_reinstalls_the_previous_code_then_restarts_and_controls(self):
         self._clone_at_old(self.target)
         self._write_direct_url(self.target)
@@ -1087,6 +1095,7 @@ class VmAgentsInstallTest(VmAgentsHarness):
         self.assertEqual(q.returncode, 0, q.stderr)
         self.assertEqual(self.head(self.src), self.old)
 
+    @unittest.skipUnless(platform.is_linux(), "preuve du venv vivant via /proc : Linux")
     def test_control_reports_the_installed_code_without_restarting(self):
         p = self.run_vm('controler')
         self.assertEqual(p.returncode, 0, p.stderr)
@@ -1157,6 +1166,7 @@ class VmAgentsBundleInstallTest(VmAgentsHarness):
         self.assertEqual(self.head(self.src), self.target)
         self.assertEqual((self.parts / 'previous-sha').read_text().strip(), self.old)
 
+    @unittest.skipUnless(platform.is_linux(), "preuve du venv vivant via /proc : Linux")
     def test_retour_sends_a_bundle_for_an_ancestor_of_main_missing_on_the_vm(self):
         # Ancêtre de main visé pour le retour, absent de la VM : même cas vide.
         self._origin_main()
