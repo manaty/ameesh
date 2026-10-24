@@ -181,13 +181,14 @@ class ReviewDueTest(unittest.TestCase):
             self.assertEqual(report[key], [], key)
 
     def test_reouverture_dernier_etat_et_retour_terminal(self):
-        for state in ("intake", "build", "qa", "merged", "closed"):
+        open_states = ("intake", "build", "qa", "blocked", "waiting_human")
+        for state in open_states + ("merged", "closed"):
             with self.subTest(state=state):
                 events = [event(1, 3, T + 3, "dernier", state=state),
                           event(1, 1, T, "fusion", state="merged"),
                           event(1, 2, T + 3, "correction", state="build")]
                 self.assertEqual(debit._reopened(events, T),
-                                 state in ("intake", "build", "qa"))
+                                 state in open_states)
         self.assertFalse(debit._reopened(events, None))
         self.assertFalse(debit._reopened([event(1, 1, T, "note")], T))
 

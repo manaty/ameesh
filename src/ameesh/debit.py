@@ -357,11 +357,16 @@ def _terminal_at(milestones: list[dict]) -> float | None:
     return max(moments) if moments else None
 
 
+#: états d'un lot ouvert : une réouverture qui finit sur l'un d'eux tient
+_OPEN_STATES = ("intake", "build", "qa", "blocked", "waiting_human")
+
+
 def _reopened(events: list[dict], terminal_ts: float | None) -> bool:
     """Le dernier état après le jalon décide de la réouverture.
 
     Une note concurrente peut porter qa après la fusion (#1982), puis les
-    notes suivantes merged. Un retour à merged annule une réouverture.
+    notes suivantes merged. Un retour à merged annule une réouverture ; un lot
+    rouvert puis retenu (blocked, waiting_human) reste ouvert.
     """
     if terminal_ts is None:
         return False
@@ -371,7 +376,7 @@ def _reopened(events: list[dict], terminal_ts: float | None) -> bool:
         return False
     latest = max(later, key=lambda e: (float(e.get("at_ts") or 0.0),
                                        int(e.get("id") or 0)))
-    return str(latest["state"]) in ("intake", "build", "qa")
+    return str(latest["state"]) in _OPEN_STATES
 
 
 def _current_state(events: list[dict]) -> str | None:
