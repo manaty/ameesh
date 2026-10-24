@@ -74,7 +74,7 @@ _LABEL = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 _SHA = re.compile(r"^([0-9a-f]{40}|[0-9a-f]{64})$")
 
 _DOCUMENT_KEYS = ("schema", "timezone", "cutoffs", "packets", "build", "ci", "reviews",
-                  "merge", "prevalidation", "backlog", "projects")
+                  "merge", "prevalidation", "backlog", "staging", "projects")
 _OVERRIDE_KEYS = ("timezone", "cutoffs", "packets", "build", "ci")
 _PACKETS_KEYS = ("cutoffs",)
 #: classes du plan L161f qu'un bloc `prevalidation` peut sélectionner
@@ -145,6 +145,20 @@ class Prevalidation:
 
 
 @dataclass(frozen=True)
+class Staging:
+    """#3291: optional canon rule for staging outside the release cutoffs."""
+
+    waiting_lots_min: int
+    before_cutoff_seconds: int
+    before_packet_seconds: int
+
+    def to_dict(self) -> dict:
+        return {"waiting_lots_min": self.waiting_lots_min,
+                "before_cutoff_seconds": self.before_cutoff_seconds,
+                "before_packet_seconds": self.before_packet_seconds}
+
+
+@dataclass(frozen=True)
 class Document:
     """Le document global compilé et validé, sans politique de revue."""
 
@@ -172,6 +186,7 @@ class Document:
     prevalidation: Prevalidation | None = None
     #: #2584 : seuil de lot d'un défaut non bloquant ; None = bloc absent
     backlog_lot_min_value: int | None = None
+    staging: Staging | None = None
 
     def override(self, project: str) -> ProjectOverride | None:
         for item in self.overrides:
@@ -205,6 +220,8 @@ class Document:
             payload["prevalidation"] = self.prevalidation.to_dict()
         if self.backlog_lot_min_value is not None:
             payload["backlog"] = {"lot_min_value": self.backlog_lot_min_value}
+        if self.staging is not None:
+            payload["staging"] = self.staging.to_dict()
         return payload
 
 
@@ -254,6 +271,7 @@ class Mechanics:
     source: str = ""
     #: #2584 : seuil de lot d'un défaut non bloquant ; None = bloc absent
     backlog_lot_min_value: int | None = None
+    staging: Staging | None = None
 
     # -- coupures -----------------------------------------------------------
 
@@ -422,6 +440,8 @@ class Mechanics:
             payload["prevalidation"] = self.prevalidation.to_dict()
         if self.backlog_lot_min_value is not None:
             payload["backlog"] = {"lot_min_value": self.backlog_lot_min_value}
+        if self.staging is not None:
+            payload["staging"] = self.staging.to_dict()
         if self.source:
             payload["source"] = self.source
         return payload
@@ -674,6 +694,14 @@ def _overrides(value, where: str) -> tuple[ProjectOverride, ...]:
     return tuple(out)
 
 
+def _staging(value, where: str) -> Staging:
+    data = _mapping(value, where, ("waiting_lots_min", "before_cutoff_seconds",
+                                  "before_packet_seconds"))
+    return Staging(*(_positive_int(data.get(key), where + "." + key)
+                     for key in ("waiting_lots_min", "before_cutoff_seconds",
+                                 "before_packet_seconds")))
+
+
 def compile_document(text: str, *, source: str = PATH) -> Document:
     """Compile le document global. Strict : toute règle manquante ou inconnue refuse."""
     try:
@@ -739,6 +767,8 @@ def compile_document(text: str, *, source: str = PATH) -> Document:
         prevalidation=(_prevalidation(parsed["prevalidation"],
                                       source + ".prevalidation") if has_block else None),
         backlog_lot_min_value=lot_min_value,
+        staging=(_staging(parsed["staging"], source + ".staging")
+                 if "staging" in parsed else None),
     )
 
 
@@ -1001,4 +1031,5 @@ def load(repo: str, commit: str, project: str, *,
         prevalidation=document.prevalidation,
         source="%s@%s:%s" % (repo, commit, PATH),
         backlog_lot_min_value=document.backlog_lot_min_value,
+        staging=document.staging,
     )

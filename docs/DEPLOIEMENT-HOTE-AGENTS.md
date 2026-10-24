@@ -330,6 +330,10 @@ clone et `previous-sha` avant les unités.
 
 ## Release automatique aux coupures (#2448)
 
+Pour les correctifs fusionnés qui retiennent plusieurs lots entre deux
+coupures, voir [le relevé et le geste staging hors créneau](STAGING-ATTENTES.md).
+La coupure conserve le contenu actif si sa candidate verte est plus ancienne.
+
 À 11:00 et 23:00 (Europe/Paris), la tête de `main` est taguée et déployée en
 staging sans agent. Le calendrier n'est pas écrit dans une unité systemd : il
 vient du bloc mécanique du canon compilé (`processus/mecanique.yaml`,
