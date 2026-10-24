@@ -3697,7 +3697,7 @@ def reap_dsh_scopes(db, host: str, *, dry_run: bool = False, now: float | None =
                     scan=None, terminate=None) -> dict:
     """#3226 : les scopes systemd `dsh-subprocess-*` laissés par un tour clos
     (dsh sans la garde #490) sont tués — SIGTERM, puis SIGKILL — après
-    `DSH_SCOPE_GRACE_S`, journalisés (`dsh_scope`, `killed`) ; ceux qu'on ne
+    `DSH_SCOPE_GRACE_S`, par pidfd, journalisés (`dsh_scope`, `killed`) ; ceux qu'on ne
     sait pas attribuer sont gardés et signalés (`signaled`, re-signalé au
     plus toutes les `DSH_SCOPE_REFRESH_S`, `gone` quand ils disparaissent).
     `scan`/`terminate` : ceux de `platform.dsh_scopes` (surchargés par les
@@ -3745,8 +3745,9 @@ def reap_dsh_scopes(db, host: str, *, dry_run: bool = False, now: float | None =
                 out["entries"].append(dict(base, action="killed", data=data,
                                            detail="%s: SIGTERM then SIGKILL" % why))
                 continue
-            why = "%s: %d process(es) survived SIGKILL (%s)" % (
-                why, len(left), ", ".join(str(m["pid"]) for m in left))
+            why = "%s: %d process(es) not killed (%s)" % (
+                why, len(left), ", ".join("%d %s" % (m["pid"], m.get("why") or "alive")
+                                          for m in left))
         else:
             out["plan"].append(dict(base, action="signalé", detail=why))
             if dry_run:

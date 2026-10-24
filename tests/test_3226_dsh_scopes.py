@@ -14,6 +14,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from ameesh import exploitation, menage, storage
 from ameesh.platform import dsh_scopes, is_linux
@@ -156,6 +157,38 @@ class ReleveEtSignalTest(unittest.TestCase):
         self.assertEqual(docile.wait(5), -15)
         self.assertEqual(tetu.wait(5), -9)
 
+    def test_pid_repris_n_est_jamais_signale(self):
+        """cx1 B2 : un pid repris par un autre processus après le relevé ne
+        reçoit aucun signal (pidfd validé par l'heure de démarrage)."""
+        repris = self.spawn(["sleep", "60"])
+        time.sleep(0.1)
+        membre = {"pid": repris.pid, "start": dsh_scopes.process.start_time(repris.pid) - 100,
+                  "turn": TURN, "unread": False}
+        self.assertEqual(dsh_scopes.terminate([membre], term_wait=0.2, kill_wait=0.2), [])
+        self.assertIsNone(repris.poll())
+
+    def test_identite_non_tenue_aucun_signal(self):
+        """cx1 B1 : heure illisible ou pidfd indisponible pour UN membre :
+        aucun membre du scope n'est signalé, tous sont rendus avec la raison."""
+        from ameesh.platform import signals
+        a = self.spawn(["sleep", "60"])
+        b = self.spawn(["sleep", "60"])
+        time.sleep(0.1)
+        membres = [{"pid": p.pid, "start": dsh_scopes.process.start_time(p.pid),
+                    "turn": TURN, "unread": False} for p in (a, b)]
+        sans_heure = [membres[0], dict(membres[1], start=None)]
+        left = dsh_scopes.terminate(sans_heure, term_wait=0.2, kill_wait=0.2)
+        self.assertEqual([(m["pid"], m["why"]) for m in left],
+                         [(b.pid, "identity not held")])
+        vrai_open = signals.ProcessHandle.open
+        with mock.patch.object(signals.ProcessHandle, "open",
+                               side_effect=lambda pid, start: None if pid == b.pid
+                               else vrai_open(pid, start)):
+            left = dsh_scopes.terminate(membres, term_wait=0.2, kill_wait=0.2)
+        self.assertEqual([m["pid"] for m in left], [b.pid])
+        self.assertIsNone(a.poll())
+        self.assertIsNone(b.poll())
+
     def test_sans_gestionnaire_rien_n_est_vu(self):
         self.assertIsNone(dsh_scopes.scan(uid=self.uid + 1, root_dir=self.tmp.name))
 
@@ -225,7 +258,7 @@ class RecolteJournalAlerteTest(PgTestCase):
             self.db, HOST, now=time.time() + 2 * menage.DSH_SCOPE_GRACE_S,
             scan=lambda: [_scope()], terminate=lambda members: members)
         self.assertEqual([e["action"] for e in out["entries"]], ["signaled"])
-        self.assertIn("survived SIGKILL", out["entries"][0]["detail"])
+        self.assertIn("not killed", out["entries"][0]["detail"])
 
     def test_sans_releve_rien(self):
         self.assertEqual(menage.reap_dsh_scopes(self.db, HOST, scan=lambda: None),

@@ -11,7 +11,7 @@ et survit à la fin du tour (agents-2, 13/10 : quatre scopes du tour
 Ce module ne fait que RELEVER ces scopes et signaler leurs processus ; le
 verdict (tour clos, délai de grâce, doute) est celui du ménage
 (`housekeeping.reap_dsh_scopes`). Le signal vise des processus identifiés par
-(pid, heure de démarrage), jamais un pid seul ; rien n'est écrit dans la
+pidfd validé par son heure de démarrage, jamais par un pid nu ; rien n'est écrit dans la
 hiérarchie cgroup (le gestionnaire retire lui-même un scope vidé).
 """
 from __future__ import annotations
@@ -132,31 +132,32 @@ def scan(*, uid: int | None = None, root_dir: str = CGROUP_ROOT) -> list[dict] |
     return out
 
 
-def _still_there(members: list[dict]) -> list[dict]:
-    left = []
+def _hold(members: list[dict]) -> tuple[list, list[dict]]:
+    """Un pidfd par membre, ouvert PUIS validé par son heure de démarrage
+    (`ProcessHandle.open`) : les signaux passent par ce descripteur, jamais par
+    un pid nu qu'un autre processus aurait repris. Rend (poignées, refusés) ;
+    un membre parti, ou dont le pid a été repris, n'est ni l'un ni l'autre."""
+    from .signals import ProcessHandle
+    handles, refused = [], []
     for m in members:
+        handle = ProcessHandle.open(m["pid"], m.get("start"))
+        if handle is not None:
+            handles.append((m, handle))
+            continue
         try:
-            start = process.start_time(m["pid"])
+            now = process.start_time(m["pid"])
         except NotAvailable:
-            left.append(m)
-            continue
-        if process.same_start(m["start"], start) and process.alive(m["pid"]):
-            left.append(m)
-    return left
+            now = m.get("start")
+        if m.get("start") is not None and (now is None or not process.same_start(m["start"], now)):
+            continue  # parti, ou pid repris par un autre processus
+        refused.append(dict(m, why="identity not held"))
+    return handles, refused
 
 
-def _signal(members: list[dict], sig: int) -> None:
-    for m in members:
-        try:
-            os.kill(int(m["pid"]), sig)
-        except (ProcessLookupError, PermissionError):
-            continue
-
-
-def _wait(members: list[dict], timeout: float) -> list[dict]:
+def _wait(handles: list, timeout: float) -> list:
     deadline = time.monotonic() + max(0.0, float(timeout))
     while True:
-        left = _still_there(members)
+        left = [(m, h) for m, h in handles if h.live()]
         if not left or time.monotonic() >= deadline:
             return left
         time.sleep(0.05)
@@ -165,15 +166,20 @@ def _wait(members: list[dict], timeout: float) -> list[dict]:
 def terminate(members: list[dict], *, term_wait: float = TERM_WAIT_S,
               kill_wait: float = KILL_WAIT_S) -> list[dict]:
     """SIGTERM aux membres relevés, attente bornée, puis SIGKILL à ceux qui
-    restent. Seul un membre au même (pid, heure de démarrage) est visé : un
-    pid recyclé entre-temps est laissé. Rend les membres encore vivants."""
-    members = [m for m in members if m.get("start") is not None]
-    left = _still_there(members)
-    if not left:
-        return []
-    _signal(left, signal_mod.SIGTERM)
-    left = _wait(left, term_wait)
-    if not left:
-        return []
-    _signal(left, signal_mod.SIGKILL)
-    return _wait(left, kill_wait)
+    restent, par pidfd (cf. `_hold`). Si l'identité d'un seul membre ne peut
+    être tenue (heure illisible, pidfd indisponible), AUCUN signal n'est
+    envoyé : le scope est gardé et signalé. Rend les membres non tués, avec
+    leur raison (`why`)."""
+    handles, refused = _hold(members)
+    try:
+        if refused:
+            return refused
+        for _m, handle in handles:
+            handle.send(signal_mod.SIGTERM)
+        left = _wait(handles, term_wait)
+        for _m, handle in left:
+            handle.send(signal_mod.SIGKILL)
+        return [dict(m, why="alive after SIGKILL") for m, _h in _wait(left, kill_wait)]
+    finally:
+        for _m, handle in handles:
+            handle.close()
