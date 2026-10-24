@@ -11,14 +11,22 @@ datées, candidate verte et lots que cette candidate peut débloquer. Les
 dépendants peuvent appartenir à Nexlink : c'est le projet du correctif qui
 détermine le staging d'ameesh.
 
-La lecture utilise les dépendances explicites et les notes `hold:` encore
-actives, avec leur référence `#lot` ou `migration N`. Une description de lot,
-un ancien hold levé ou un jalon de fusion annulé ne créent pas d'attente. Les
+La lecture n'utilise que les notes `hold:` encore actives : une dépendance
+explicite est satisfaite par la fusion et ne dit pas que le correctif doit être
+actif sur les hôtes. Dans une note, seules les références `#lot` ou
+`migration N` d'une phrase qui nomme une attente de déploiement comptent
+(« attendre #3111 », « #3111 non actif », « la release doit porter #2994 ») ;
+un numéro de PR, de ticket, de paquet, de gel, ou une référence citée dans un
+conflit ou une relecture, n'est pas une attente. Une description de lot, un
+ancien hold levé ou un jalon de fusion annulé ne créent pas d'attente. Les
 commits actifs viennent de la dernière attestation de chaque hôte
 (`mise-a-jour/actif-<commit>.json`), dont la date est rendue dans le relevé.
-Sans cette preuve, l'attente apparaît dans `unknown` et ne compte pas dans le
-seuil. La commande ne prétend pas réaliser une nouvelle sonde distante ; la
-séquence de staging garde ses contrôles réels par hôte.
+Une référence fusionnée absente du clone de release, comme un commit actif
+qu'il ne contient pas, apparaît dans `unknown` et ne compte pas dans le seuil :
+le relevé reste lisible. Une preuve active illisible empêche en plus de
+déclarer la candidate prête, puisque son déploiement ne peut pas être comparé
+au contenu actif. La commande ne prétend pas réaliser une nouvelle sonde
+distante ; la séquence de staging garde ses contrôles réels par hôte.
 
 Le lecteur mécanique accepte ce bloc optionnel de `processus/mecanique.yaml` :
 

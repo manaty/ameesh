@@ -233,10 +233,16 @@ def _error(proc) -> str:
 def pr_status(slug: str, number: int, *, gh) -> dict:
     """La PR `number`, dans la forme que lit `fire.ready_pr` (état, tête,
     cible, brouillon, CI, rollup, branche) plus `auto` et la cible résolue
-    (`base_oid`, #3091) ; `land.LandError` sinon."""
+    (`base_oid`, #3091) ; `land.LandError` sinon.
+
+    #3308 : `baseRefOid` n'existe pas dans `gh pr view --json` avant gh 2.46
+    (le poste h-05 a 2.45) ; demander ce champ faisait échouer toute la
+    lecture et l'armement. La branche de base se lit sans champ optionnel,
+    puis `land.base_oid` la résout par l'API. Un ref illisible refuse :
+    aucune cible n'est devinée."""
     from . import radar
     proc = gh(["pr", "view", str(int(number)), "--repo", slug, "--json",
-               "state,headRefOid,headRefName,baseRefName,baseRefOid,isDraft,"
+               "state,headRefOid,headRefName,baseRefName,isDraft,"
                "autoMergeRequest,statusCheckRollup,title"])
     if proc.returncode != 0:
         raise land.LandError("gh pr view %d: %s" % (int(number), _error(proc)))
@@ -246,6 +252,12 @@ def pr_status(slug: str, number: int, *, gh) -> dict:
         raise land.LandError("gh pr view %d: unreadable output" % int(number)) from exc
     if not isinstance(data, dict):
         raise land.LandError("gh pr view %d: unexpected output" % int(number))
+    base = str(data.get("baseRefName") or "").strip()
+    state = str(data.get("state") or "").upper()
+    # #3091 : la cible résolue de la PR, la seule lecture fraîche que la porte
+    # des avis puisse opposer à la ref locale du checkout. Une PR fermée ou
+    # fusionnée ne fusionnera plus : sa base n'a pas à être résolue.
+    base_oid = land.base_oid(slug, base, gh=gh) if state == "OPEN" else ""
     rollup = radar.merge_rollup(data.get("statusCheckRollup"), slug=slug,
                                 head=data.get("headRefOid") or "",
                                 branch=data.get("headRefName") or "", gh=gh)
@@ -255,12 +267,9 @@ def pr_status(slug: str, number: int, *, gh) -> dict:
                   or (c.get("state") or "") == "PENDING" for c in rollup)
     ci = "green" if radar.ci_green(rollup) else "pending" if pending or not rollup else "red"
     ci_rule = radar.ci_state(rollup)
-    return {"number": int(number), "state": str(data.get("state") or "").upper(),
+    return {"number": int(number), "state": state,
             "head": str(data.get("headRefOid") or "").strip().lower(),
-            "base": str(data.get("baseRefName") or "").strip(),
-            # #3091 : la cible résolue de la PR, la seule lecture fraîche que
-            # la porte des avis puisse opposer à la ref locale du checkout.
-            "base_oid": str(data.get("baseRefOid") or "").strip().lower(),
+            "base": base, "base_oid": base_oid,
             "branch": str(data.get("headRefName") or "").strip(),
             "draft": bool(data.get("isDraft")), "ci": ci, "ci_rule": ci_rule,
             "rollup": rollup,
@@ -436,9 +445,10 @@ def _verdicts(cfg, db, row: dict, milestones: list, *, slug: str, base: str,
     le projet résolu sert ensuite à toute la porte de CI (R2, cx3). Une
     erreur refuse.
 
-    `base_sha` (#3091) est la cible résolue lue sur la PR (`baseRefOid`) :
-    elle prouve la base de composition au lieu de dépendre de la fraîcheur de
-    la ref locale du checkout.
+    `base_sha` (#3091) est la cible résolue par `land.base_oid` (#3308, la
+    branche `baseRefName` de la PR résolue par l'API) : elle prouve la base
+    de composition au lieu de dépendre de la fraîcheur de la ref locale du
+    checkout.
 
     #3175 : sur ameesh-agents-2, le dossier de l'assigné (sur agents-1) est
     absent et aucun `radar.projects` n'est déclaré ; la porte lisait git sans

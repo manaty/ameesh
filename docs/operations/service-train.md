@@ -171,6 +171,38 @@ agents) et journalise le premier refus :
 - `deadline_minutes` absente, nulle ou non finie ;
 - `candidate: true` sans `initial_since` (ou l'inverse).
 
+### Canon épinglé ≠ canon de la porte (#2914)
+
+À chaque passage, le train compare `canon_commit` au commit de canon que lisent
+la porte de fusion et la désignation sur l'hôte (`canon_state.last_good_commit`,
+`canon_sync.audited_commit`), choisi comme la désignation le choisit : premier
+canon configuré dont la politique du projet se charge
+(`review_designation_activation.policy_sources`) ; sinon les deux ne demandent
+pas le même nombre d'avis pour un même lot. Un écart, un canon de la porte
+illisible, plusieurs canons applicables à des commits différents (le choix
+dépendrait alors des chemins du lot), ou, à commit égal, une autre lecture
+de la porte différente du commit épinglé (`train_canon.gate_rules_gap`) :
+
+- classes et barèmes (`lot_class.of_lot`) : chaque canon configuré qui déclare
+  le projet, lu à sa **référence configurée** (pas au commit audité), doit
+  être au commit épinglé ;
+- plancher léger et drapeaux de famille : le plus strict de **tous** les
+  canons configurés, applicables au projet ou non
+  (`lot_class._light_reviews`, `_review_flags`) ;
+- familles de modèle (`review_lot.compiled_families`, premier canon lisible).
+
+Dans tous ces cas :
+
+- `shadow` : le plan porte la lecture (`plan.canon` : `pin`, `gate`, `state`) ;
+  le journal la nomme et l'orchestrateur du projet reçoit un courrier, une fois
+  par lecture distincte et par processus ;
+- `active` : refus nommé de composer un nouveau paquet (`canon-drift`), même
+  courrier ; un paquet déjà en vol va au bout (CI, promotion ou vidange), un
+  train en pause reste en pause.
+
+L'épingle ne suit jamais la porte d'elle-même (#1467) : qualifier le commit de
+la porte, puis le poser dans `canon_commit` et redémarrer l'exécuteur.
+
 ## Contrat CI
 
 `train_contracts.ameesh()` épingle les blobs de `.github/workflows/paquet.yml`

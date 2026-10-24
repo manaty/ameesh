@@ -247,6 +247,7 @@ ameesh canon show  [--json] …                                     # cards read
 ameesh canon sync  [--host H] [--json] …                          # canon → registry of host H
 ameesh agent name  --role R [--project P …] [--json]              # next free <org>-<repo>-<role>-<seq>
 ameesh agent spawn [name] --by <creator> --ttl 2h [--role R] [--project P …] [--cwd DIR] [--prompt TEXT]
+ameesh agent move  NOM --to HOST [--keep-session] [--actor A] [--json]   # manual move of a `releve: hote` agent (#3299)
 ameesh canon agent name|spawn …                                   # same commands, canonical place (L243, #468)
 ```
 

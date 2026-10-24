@@ -10,6 +10,7 @@ import shutil
 import tempfile
 import time
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 
 from ameesh import menage, platform, storage
@@ -30,10 +31,6 @@ def _write(path: str, size: int, age_s: float = 0.0) -> None:
     if age_s:
         moment = time.time() - age_s
         os.utime(path, (moment, moment))
-
-
-def _real_free(root: str) -> int:
-    return shutil.disk_usage(root).free
 
 
 class EvictAtLeastTest(unittest.TestCase):
@@ -86,6 +83,16 @@ class CachePressionTest(PgTestCase):
         # le plus ancien de l'éviction du suivant
         self.cfgl = _Cfg(os.path.join(self.tmp, "state-%s" % self._testMethodName))
         self.cfgl.host = self.cfg.host
+        # #3293 : le témoin ne dépend plus de l'espace libre réel de l'hôte
+        # (une autre écriture peut le faire varier entre la cible et la mesure).
+        # On fixe l'espace libre ; la cible en dérive et le déficit est constant.
+        self.free = 10 * 1024 ** 3
+        patcher = mock.patch.object(
+            shutil, "disk_usage",
+            return_value=SimpleNamespace(total=self.free * 2, used=self.free,
+                                         free=self.free))
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def _cache(self, nom: str) -> str:
         """Le dossier de cache `nom`, créé par un tour (marqueur posé)."""
@@ -104,8 +111,8 @@ class CachePressionTest(PgTestCase):
             self.addCleanup(patcher.stop)
 
     def _pression(self) -> int:
-        """Une cible d'espace libre juste au-dessus de l'actuel : un déficit."""
-        return _real_free(menage.cache_root(self.cfgl, menage.Policy())) + 4096
+        """Une cible d'espace libre juste au-dessus du fixé : un déficit."""
+        return self.free + 4096
 
     def _rapport(self, **kw):
         return menage.run_pass(self.cfgl, self.db, menage.Policy(), host="pc",

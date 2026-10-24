@@ -4,6 +4,7 @@ actionnable, sur Postgres (`agent_lot_sessions`, migration 0384)."""
 from __future__ import annotations
 
 import datetime as _dt
+import time
 
 from .. import interface
 from .work import has_wake_at
@@ -185,51 +186,56 @@ class LotSessions(interface.LotSessions):
             (name, float(now), float(claim_ttl_s)))
 
     def claim_wake(self, name, lot, now, claim_ttl_s=120.0):
-        """#2466 : bail de livraison du réveil ; l'échéance reste armée."""
+        """#2466 : bail de livraison du réveil ; l'échéance reste armée.
+
+        #2614 : le claim n'écrit plus rien au journal — un claim non consommé
+        (drainage, report) ne laisse pas de ligne `wake:` ; c'est
+        `consume_wake` qui l'écrit. `claim_ttl_s=0` renouvelle le bail du
+        détenteur (battement du tour, `Worker._renew_wake_claim`)."""
         if not has_wake_at(self.db):
             return None
-        lot = int(lot)
-        with self.db.transaction() as tx:
-            rows = tx.query(
-                "SELECT id, state, title,"
-                "       extract(epoch from wake_at)::float8 AS wake_ts"
-                "  FROM work_items"
-                " WHERE id = %s AND assignee = %s"
-                "   AND state NOT IN " + _CLOSED +
-                "   AND wake_at IS NOT NULL AND wake_at <= to_timestamp(%s)"
-                "   AND (wake_claim_at IS NULL"
-                "        OR wake_claim_at < clock_timestamp() - make_interval(secs => %s))"
-                " FOR NO KEY UPDATE",
-                (lot, name, float(now), float(claim_ttl_s)))
-            if not rows:
-                return None
-            row = rows[0]
-            now_ts = float(now)
-            tx.execute("UPDATE work_items SET wake_claim_at = clock_timestamp()"
-                       " WHERE id = %s", (lot,))
-            tx.execute(
-                "INSERT INTO work_item_events (work_item_id, state, note, actor)"
-                " VALUES (%s, %s, %s, %s)",
-                (lot, row["state"],
-                 "wake: scheduled wake delivered at %s (due %s)"
-                 % (_moment(now_ts), _moment(row["wake_ts"])),
-                 "ameesh"))
-            return {"id": row["id"], "state": row["state"], "title": row["title"],
-                    "wake_ts": float(row["wake_ts"])}
+        rows = self.db.query(
+            "UPDATE work_items SET wake_claim_at = clock_timestamp()"
+            " WHERE id = %s AND assignee = %s"
+            "   AND state NOT IN " + _CLOSED +
+            "   AND wake_at IS NOT NULL AND wake_at <= to_timestamp(%s)"
+            "   AND (wake_claim_at IS NULL"
+            "        OR wake_claim_at < clock_timestamp() - make_interval(secs => %s))"
+            " RETURNING id, state, title,"
+            "           extract(epoch from wake_at)::float8 AS wake_ts",
+            (int(lot), name, float(now), float(claim_ttl_s)))
+        if not rows:
+            return None
+        row = rows[0]
+        return {"id": row["id"], "state": row["state"], "title": row["title"],
+                "wake_ts": float(row["wake_ts"])}
 
     def consume_wake(self, name, lot, wake_ts):
         """#2466 : le harnais du tour est lancé — l'échéance réclamée est
-        consommée ; une échéance reposée entre-temps est conservée."""
+        consommée ; une échéance reposée entre-temps est conservée.
+
+        #2614 : la ligne `wake: scheduled wake delivered` est écrite ici, dans
+        la même transaction, une seule fois par réveil réellement délivré."""
         if not has_wake_at(self.db):
             return False
-        rows = self.db.query(
-            "UPDATE work_items SET wake_at = NULL, wake_claim_at = NULL,"
-            "       updated_at = now()"
-            " WHERE id = %s AND assignee = %s"
-            "   AND abs(extract(epoch from wake_at) - %s::float8) < 0.001"
-            "   AND wake_claim_at IS NOT NULL"
-            " RETURNING id", (int(lot), name, float(wake_ts)))
-        return bool(rows)
+        with self.db.transaction() as tx:
+            rows = tx.query(
+                "UPDATE work_items SET wake_at = NULL, wake_claim_at = NULL,"
+                "       updated_at = now()"
+                " WHERE id = %s AND assignee = %s"
+                "   AND abs(extract(epoch from wake_at) - %s::float8) < 0.001"
+                "   AND wake_claim_at IS NOT NULL"
+                " RETURNING id, state", (int(lot), name, float(wake_ts)))
+            if not rows:
+                return False
+            tx.execute(
+                "INSERT INTO work_item_events (work_item_id, state, note, actor)"
+                " VALUES (%s, %s, %s, %s)",
+                (int(lot), rows[0]["state"],
+                 "wake: scheduled wake delivered at %s (due %s)"
+                 % (_moment(time.time()), _moment(wake_ts)),
+                 "ameesh"))
+            return True
 
     def purge(self, name=None):
         """Supprime les lignes des lots fusionnés, livrés ou fermés, ou qui ne
