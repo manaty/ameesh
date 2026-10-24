@@ -2899,28 +2899,42 @@ class _ReseatPort(_ForcedPort):
     stays in the written mark, before the replacements, and receives no new
     mail. Under the lock of the lot row, the effective mark must still be the
     one the pass read (`mark_id`): a concurrent pass (another host) that
-    already moved the seats makes this one write nothing. Without a
+    already moved the seats makes this one write nothing. Every seat the pass
+    examined (kept and dead) must also still be in the reviewer column: a
+    pilot's `work reviewer --remove` writes no mark, and `prepare` can take
+    seconds, so a removal in that window would otherwise be written back
+    (review of impl-02 on #3367). Without a
     replacement (`waiting`), no mark is written: a waiting mark would retire
     the live seats from the column, so the designation stays as it is and the
     caller alerts the pilot.
     """
 
-    def __init__(self, port, *, kept: Sequence[Mapping], mark_id: int) -> None:
+    def __init__(self, port, *, kept: Sequence[Mapping], mark_id: int,
+                 dead: Sequence[str] = ()) -> None:
         super().__init__(port)
         self.kept = [{"name": str((seat or {}).get("name") or "").strip(),
                       "family": str((seat or {}).get("family") or "").strip()}
                      for seat in kept or () if str((seat or {}).get("name") or "").strip()]
         self.mark_id = int(mark_id)
+        self.seats = ({seat["name"] for seat in self.kept}
+                      | {str(name or "").strip() for name in dead or ()
+                         if str(name or "").strip()})
 
     def commit(self, lot: int, **kwargs) -> dict:
         db = self.port.db
         freeze = dict(kwargs.get("freeze") or {})
-        db.query("SELECT id FROM work_items WHERE id = %s FOR NO KEY UPDATE",
-                 (int(lot),))
+        rows = db.query("SELECT reviewers FROM work_items WHERE id = %s"
+                        " FOR NO KEY UPDATE", (int(lot),))
         effective = _effective_mark(db, int(lot), int(freeze.get("id") or 0))
         if effective is None or int(effective[0]) != self.mark_id:
             raise _SeatsMoved("the designation of freeze #%s moved during the pass:"
                               " nothing written" % (freeze.get("id"),))
+        column = {str(name or "").strip()
+                  for name in ((rows[0].get("reviewers") if rows else None) or ())}
+        gone = sorted(self.seats - column)
+        if gone:
+            raise _SeatsMoved("reviewer column changed during the pass (%s no longer"
+                              " designated): nothing written" % ", ".join(gone))
         if kwargs.get("state") == rd.WAITING:
             return {"state": rd.WAITING, "required": int(kwargs.get("required") or 0),
                     "reviewers": [], "missing": int(kwargs.get("missing") or 0),
@@ -3001,7 +3015,8 @@ def reseat(cfg, db, lot: int, *, freeze: Mapping, kept: Sequence[Mapping],
             return unchanged(rd.NONE, LIGHT_WHY if inputs.paths else NO_PATH_WHY)
         with db.transaction() as tx:
             port = _ReseatPort(pg.PgPort(tx, after_commit=threads, at_freeze=False),
-                               kept=kept, mark_id=mark_id)
+                               kept=kept, mark_id=mark_id,
+                               dead=[name for name, _why in dead or ()])
             out = _selection(inputs, port, kept=port.kept)
             if out.get("state") == "manual" and port.kept:
                 out = port.commit(

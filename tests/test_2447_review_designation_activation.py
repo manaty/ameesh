@@ -1551,6 +1551,29 @@ class UnreachableDesignationTest(_ActivationFixture, PgTestCase):
         self.assertIn("designation unchanged: no repository holds",
                       self.notes(act.REASSIGN_PREFIX)[-1])
 
+    def test_a_pilot_removal_during_the_pass_is_not_written_back(self):
+        # Relecture de impl-02 (#3367) : le pilote retire r2 pendant que la
+        # passe lit le dépôt (`prepare`) ; `work reviewer --remove` n'écrit
+        # aucune marque, `mark_id` est inchangé. Sous le verrou, la colonne
+        # ne nomme plus un siège examiné : rien n'est écrit, r2 ne revient pas.
+        self._agent("r3", "claude")
+        self.freeze()
+        self._move_to_lost("r1")
+        self._lose_host()
+        freeze = act._latest_freeze(self.db, self.lot)
+        mark = act._effective_mark(self.db, self.lot, int(freeze["id"]))
+        self.db.execute("UPDATE work_items SET reviewers = ARRAY['r1'] WHERE id = %s",
+                        (self.lot,))
+        marks, mails = len(self.marks()), len(self.mailbox())
+        out = act.reseat(self.cfg, self.db, self.lot, freeze=freeze,
+                         kept=[{"name": "r2", "family": "codex"}],
+                         dead=[("r1", "host pc-smichea: claims closed")],
+                         mark_id=int(mark[0]))
+        self.assertEqual(out["state"], "stale", out)
+        self.assertNotIn("r2", self._column(), out)
+        self.assertEqual(len(self.marks()), marks)
+        self.assertEqual(len(self.mailbox()), mails)
+
     def test_a_mark_moved_by_another_pass_writes_nothing(self):
         # Deux hôtes passent en même temps : celui qui arrive second lit une
         # marque qui n'est plus la marque effective, et n'écrit rien.
