@@ -239,6 +239,7 @@ TYPE_LABELS = {
     "tmp_unowned": "temporary directory without owner file (kept)",
     "tmp_unremovable": "temporary directory over quota with files it cannot remove",
     "tmp_unscanned": "temporary directory too large to scan; nothing evicted",
+    "tmp_over_quota": "temporary directory over quota, not managed by this mesh",
     "plan_underused": "underused plan",
     "idle_capacity": "idle capacity",
     "orchestrator_held": "orchestrator held by a session",
