@@ -469,7 +469,7 @@ export interface paths {
             path?: never;
             cookie?: never;
         };
-        /** Timeline of a project: its lots and window only (#3395) */
+        /** Timeline of a project: its lots, window and rendering cut (#3395, #3401) */
         get: operations["projects_project_timeline"];
         put?: never;
         post?: never;
@@ -709,6 +709,7 @@ export interface components {
             lots: Record<string, never>[];
             /** @constant */
             schema: "ameesh-timeline/1";
+            truncated?: Record<string, never>;
             window: Record<string, never>;
         };
     };
@@ -2813,7 +2814,7 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description Timeline of a project: its lots and window only (#3395) */
+            /** @description Timeline of a project: its lots, window and rendering cut (#3395, #3401) */
             200: {
                 headers: {
                     [name: string]: unknown;

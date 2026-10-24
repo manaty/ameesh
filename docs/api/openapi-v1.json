@@ -785,6 +785,9 @@
             "const": "ameesh-timeline/1",
             "type": "string"
           },
+          "truncated": {
+            "type": "object"
+          },
           "window": {
             "type": "object"
           }
@@ -3489,7 +3492,7 @@
                 }
               }
             },
-            "description": "Timeline of a project: its lots and window only (#3395)"
+            "description": "Timeline of a project: its lots, window and rendering cut (#3395, #3401)"
           },
           "400": {
             "content": {
@@ -3532,7 +3535,7 @@
             "description": "database unavailable"
           }
         },
-        "summary": "Timeline of a project: its lots and window only (#3395)"
+        "summary": "Timeline of a project: its lots, window and rendering cut (#3395, #3401)"
       }
     },
     "/api/v1/threads/{project}": {

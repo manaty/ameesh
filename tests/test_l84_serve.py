@@ -345,7 +345,11 @@ class ServePgTest(ServerMixin, PgTestCase):
         self.assertEqual(status, 200)
         status, light = self.get_json("/api/v1/projects/demo/timeline?since=2d")
         self.assertEqual(status, 200)
-        self.assertEqual(set(light), {"schema", "generated_ts", "project", "window", "lots"})
+        self.assertEqual(set(light),
+                         {"schema", "generated_ts", "project", "window", "lots",
+                          "truncated"})
+        self.assertEqual(light["truncated"].get("lots"),
+                         full["truncated"].get("lots"))
         self.assertEqual([lot["id"] for lot in light["lots"]],
                          [lot["id"] for lot in full["lots"]])
         self.assertEqual([(lot["state"], (lot.get("waiting_for") or {}).get("what"))
