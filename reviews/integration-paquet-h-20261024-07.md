@@ -88,19 +88,50 @@ venu pendant la composition (base `bf1925787dd2` figée).
   `test_l233b_budget_handoff` : 248).
 - **Compilation** : `compileall src tests` verte.
 - **Contrôles statiques** : 6/6 verts (`scripts/freeze-checks.py`).
-- **Diff** : 53 fichiers, +5045/−263 (manifeste non compris) ;
-  `git diff --check` vert ; les onze commits de composition portent leur
-  trailer `ameesh-work:`.
+- **Diff** : 54 fichiers, +5179/−263 (manifeste et correctif compris ;
+  composition seule : 53 fichiers, +5045/−263) ; `git diff --check` vert ;
+  les onze commits de composition portent leur trailer `ameesh-work:`.
 - **Migrations** : aucune (aucun fichier SQL ni migration).
 - **Prévalidation** : demandée au gel ; carte périmée (`card-stale`) attendue,
   non bloquante (§3), motif consigné.
-- **Suite complète** : une seule suite par tête poussée, par la CI de la PR
-  (`ci-full-<sha>`) après les avis requis ; aucune CI de lot. Les onze unités
-  gardent leurs verdicts acquis sur leurs têtes gelées ; le porteur #3334 est
-  gelé sur la tête finale et ses relecteurs rendent leurs avis sur cette tête.
+- **Suite complète** : une suite par tête poussée, par la CI de la PR
+  (`ci-full-<sha>`) ; aucune CI de lot. Le run `40086912356` de la tête
+  `73a0d17bb` est rouge sur l'intégration #3311 × #3327 (section ci-dessous) ;
+  la tête corrigée est regelée puis redemandée en `ci-full`, avec `--avis 0`
+  (correctif mécanique §2/§11 bis, le manifeste est la revue du paquet), fusion
+  automatique réarmée. Les onze unités gardent leurs verdicts acquis sur leurs
+  têtes gelées.
 - **Fusion** : sous garde de tête (`--match-head-commit`), dès le vert, par le
   pilote ou le bureau ; tout rouge non infra isole le lot fautif sans relire
   le reste.
+
+## Correction après CI rouge (tête `73a0d17bb`, run `40086912356`)
+
+La suite complète de `73a0d17bb` a rendu six échecs, tous dans les bancs de
+déploiement qui exécutent `vm.sh controler` : trois dans `test_1252`
+(`test_control_reports_the_installed_code_without_restarting`,
+`test_failed_first_install_leaves_a_journal_and_retour_returns_to_the_left_code`,
+`test_retour_sends_a_bundle_for_an_ancestor_of_main_missing_on_the_vm`) et
+trois dans `test_503` (`test_check_accepts_held_lease_and_is_read_only`,
+`test_check_visits_every_registered_agent`,
+`test_controler_prouve_le_venv_du_runner_vivant`), parts `psycopg 1/8` et
+`psql 10/16`.
+
+Cause d'intégration #3311 × #3327 : la nouvelle étape `role timers --check`
+(et `--install` pour `vm.sh agents timers`) appelait le CLI directement sous
+`runuser`, sans l'`EnvironmentFile` du service que #3311 fait lire au CLI ;
+sur un hôte sain le contrôle échouait donc faute de DSN (« contrôles en
+échec »).
+
+Correctif `8eb727eef` (3 fichiers, +18/−3) : les deux appels passent par
+`ameesh_agents` (systemd-run + `EnvironmentFile`), comme `doctor` ; les faux
+CLI des bancs #1252 et #503 acceptent `role timers` et journalisent l'appel,
+sans affaiblir d'assertion. Correctif d'intégration mécanique, sans avis
+(§2/§11 bis).
+
+Ciblés verts sur la tête corrigée : `test_1252_vm_agents_install`,
+`test_503_agent_host`, `test_3311_preuve_venv`, `test_3327_role_timers`
+(144/144).
 
 ## Écartés (ce véhicule)
 
@@ -113,7 +144,7 @@ venu pendant la composition (base `bf1925787dd2` figée).
 
 | lot | motif |
 |---|---|
-| #3022 | `verdicts-missing` sur la tête `b40d6fde` (1 famille, ameesh-cx1) ; revue deepseek en cours après h-07 ; conflit `src/ameesh/mechanics.py`. |
+| #3022 | verdicts 2/2 acquis sur `b40d6fde` (ameesh-cx1, mty-amh-impl-05 ok le 24/10) ; entre au paquet suivant, conflit `src/ameesh/mechanics.py` à résoudre par son composeur. |
 | #3318 | `freeze-after-verdict` : la tête gelée courante doit être refaite. |
 | #3324 | `verdicts-missing` : 1 seule famille, ameesh-cx1. |
 | #3186 | `freeze-after-verdict` ; conflit `src/ameesh/release_cutoff.py`. |
