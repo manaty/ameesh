@@ -439,15 +439,22 @@ a hardware loss or a network partition:
   holder for nothing. The report names the scope. The host stays up; the
   lease follows its TTL, exactly as in A. Never the `ameesh-runner-ima`/TPK
   units.
-- **B′ — process freeze.** `SIGSTOP` the role's runners for more than the
-  lease TTL (240 s is enough), then `SIGCONT`: no renewal, expiry, another
-  claim; on resume the old process must be refused by epoch and go back to
-  standby. This is not a network cut; it proves the same no-renewal and
-  stale-epoch paths (P2, P3, P4).
+- **B′ — process freeze.** `SIGSTOP` the role's runners and hold them
+  frozen until a **new holder with a higher epoch is observed**, not for a
+  fixed sleep: `SIGCONT` must never precede the expiry, or no takeover
+  happens and the exercise proves nothing. The wait is bounded by the
+  effective TTL plus 180 s (one election pass, the rank delay and a margin);
+  if the bound expires without a takeover, `SIGCONT` and stop the exercise
+  (restore on a surviving host) — that is a failed run, not a drill. On
+  resume the old process must be refused by epoch and go back to standby.
+  This is not a network cut; it proves the same no-renewal and stale-epoch
+  paths (P2, P3, P4).
 
   ```sh
   systemctl --user kill --kill-whom=all --signal=STOP 'ameesh-runner-agent@<ROLE>'
-  sleep 240
+  # poll `ameesh role status <ROLE> --json` every 5 s; stop at the first
+  # sample with another holder and a higher epoch, or at
+  # effective_ttl + 180 s (the bound), whichever comes first
   systemctl --user kill --kill-whom=all --signal=CONT 'ameesh-runner-agent@<ROLE>'
   ```
 
@@ -466,10 +473,13 @@ and does not present A′/B′ as a hardware-loss or network-partition proof.
   ameesh-runner-agent@<ROLE>` on the candidate; never `agent-runner
   register` there, which would move the registry row to that host instead of
   standing by). A standby takes no turn and costs no token.
-- The effective lease TTL is the 180 s of the study, or the 5-minute target
-  is measured from the expiry and the drift is recorded: `lease_ttl` is a
-  parameter, and the code default is **300 s**. A 300 s lease plus one 60 s
-  election pass and the rank delay can exceed 5 minutes after the stop.
+- The effective lease TTL is the 180 s of the study. `lease_ttl` is a
+  parameter and the code default is **300 s**: a 300 s lease plus one 60 s
+  election pass and the rank delay can exceed 5 minutes after `T0`, so the
+  target may be missed. Verify the effective value before `T0`. If it exceeds
+  180 s, either set it to 180 s first (decision A) or run at 300 s and record
+  the drift and the missed target as a result (decision B); the criterion is
+  never re-based on the expiry — the delay from expiry stays diagnostic.
 - The drill starts from the holder named by `ameesh role status`, never from
   an assumption; if the target host is not the holder, either run the drill
   on the actual holder or wait for a planned handover.
