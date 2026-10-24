@@ -3776,10 +3776,12 @@ def build_parser() -> argparse.ArgumentParser:
                             "(scripts/freeze-checks.py); the reason goes in the note")
     pw_ms.add_argument("--supersedes", type=int, action="append", default=[],
                        metavar="FROZEN_ID",
-                       help="#2989: frozen only: a prior freeze of the same lot this "
-                            "freeze replaces (repeatable); only a freeze whose commit "
-                            "is absent from every known repository (a proven ghost) can "
-                            "be replaced, and the note keeps the machine trace")
+                       help="#2989/#3399: frozen only: a prior freeze of the same "
+                            "lot this freeze replaces (repeatable); only a freeze "
+                            "absent from every known repository or left out of every "
+                            "ref by a force-push (a proven ghost, dangling in the "
+                            "object database) can be replaced, and the note keeps "
+                            "the machine trace")
     pw_ms.set_defaults(func=cmd_work)
     from . import plan_cli
     plan_cli.add_parsers(work_sub, cmd_work)  # plan de travail (L29)

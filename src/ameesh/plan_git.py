@@ -85,8 +85,8 @@ import tempfile
 from . import planned_waits
 from . import storage
 from . import work as work_mod
-from .canon import (FETCH_TIMEOUT, GitError, NO_LAZY_FETCH, _git, _norm_url,
-                    git_fetch)
+from .canon import (FETCH_TIMEOUT, GIT_TIMEOUT, GitError, NO_LAZY_FETCH, _git,
+                    _norm_url, git_fetch)
 
 #: cible historique du relevé de contenu (`--target` explicite) ; sans lui,
 #: c'est la cible déclarée du lot ou du dépôt qui fait foi (#1005)
@@ -198,6 +198,42 @@ def local_commit(repo: str, rev: str, *,
     if proc.returncode != 0:
         return None
     return proc.stdout.decode("utf-8", "replace").strip()
+
+
+#: #3399 : borner le relevé d'accessibilité d'un gel (revwalk sur les refs).
+REACHABLE_TIMEOUT_S = 30.0
+
+
+def ref_reachable(repo: str, rev: str, *,
+                  timeout: float | None = REACHABLE_TIMEOUT_S) -> bool | None:
+    """`rev` est-il contenu par une **ref** de `repo` (#3399) ?
+
+    `True` : au moins une ref (`refs/heads`, `refs/remotes`, `refs/tags`...)
+    contient le commit. `False` : l'objet est présent mais aucune ref ne le
+    contient — un « pendant » laissé par un force-push, qui n'est plus
+    accessible par une ref. `None` : dépôt ou SHA illisible (objet absent au
+    sens de git, git en échec, délai dépassé) : l'appelant ne conclut pas (le
+    gate refuse, la lecture garde le doute).
+
+    #2989 N1 distinguait la présence de l'objet (`freeze_checks.commit_in`,
+    un `rev-parse` qui lit un objet pendant) de son accessibilité. #3399 : un
+    force-push retire le commit de toute ref sans l'élaguer ; le remplacer ne
+    doit donc plus être refusé par la seule présence dans l'ODB. La lecture
+    est locale et sans fetch paresseux (`for-each-ref --contains`, un seul
+    processus) ; un délai ou un dépôt illisible rend `None`, jamais `False`.
+    """
+    rev = str(rev or "").strip()
+    if not repo or not rev or rev.startswith("-") or not os.path.isdir(repo):
+        return None
+    bound = {} if timeout is None else {"timeout": timeout}
+    try:
+        proc = _git(repo, "for-each-ref", "--contains=" + rev,
+                    "--format=%(refname)", env_extra=NO_LAZY_FETCH, **bound)
+    except (GitError, OSError):
+        return None
+    if proc.returncode != 0:
+        return None
+    return bool(proc.stdout.strip())
 
 
 def _patch_ids(repo: str, *log_args: str) -> dict[str, str]:

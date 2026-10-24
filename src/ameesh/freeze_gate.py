@@ -68,12 +68,13 @@ FREEZE_ABSENT_LINE = re.compile(r"(?m)^[ \t]*ameesh-freeze-absent:[^\n]*(?:\n|$)
 #: cacher la marque (#2971, revue impl-05 — même classe que #2989 B).
 FREEZE_MACHINE_LINE = re.compile(r"ameesh-freeze-[a-z0-9-]+:")
 #: #2989 : la ligne machine d'un gel qui déclare un gel antérieur **remplacé**
-#: (typiquement un gel fantôme dont le SHA n'existe nulle part). Elle n'est
-#: écrite que par `work milestone frozen --supersedes <id>`, jamais recopiée
-#: d'une note d'appelant : la porte ignore alors le gel remplacé, avec la note
-#: du nouveau gel comme trace. Sans elle, un gel antérieur absent bloque la
-#: provenance (refus fermé de #2924 B5). Le filtre `--note` est celui, générique,
-#: de #2971 ci-dessus.
+#: (un gel fantôme dont le SHA n'existe nulle part, ou un gel devenu objet
+#: pendant après un force-push, hors de toute ref — #3399). Elle n'est écrite
+#: que par `work milestone frozen --supersedes <id>`, jamais recopiée d'une note
+#: d'appelant : la porte ignore alors le gel remplacé, avec la note du nouveau
+#: gel comme trace. Sans elle, un gel antérieur absent bloque la provenance
+#: (refus fermé de #2924 B5). Le filtre `--note` est celui, générique, de #2971
+#: ci-dessus.
 FREEZE_SUPERSEDES_MARK = "ameesh-freeze-supersedes:"
 FREEZE_SUPERSEDES_RE = re.compile(
     r"(?m)^ameesh-freeze-supersedes:\s*(\d+)\s*$")
@@ -589,15 +590,18 @@ def milestone(
     `origin/<branche>` après rafraîchissement est accepté avec la note
     [`FREEZE_UNPUBLISHED_MARK`] (geler puis pousser dans le même tour).
 
-    `supersedes` (#2989) nomme un ou des gels antérieurs du même lot que ce
-    gel **remplace** ; la note reçoit alors la ligne machine
+    `supersedes` (#2989, #3399) nomme un ou des gels antérieurs du même lot que
+    ce gel **remplace** ; la note reçoit alors la ligne machine
     [`FREEZE_SUPERSEDES_MARK`]. La lecture des auteurs (`review_authors`) ignore
-    un gel remplacé quand son SHA est absent du dépôt : c'est la réparation
-    d'un gel fantôme (un SHA erroné écrit avant la validation de la CLI). Le
-    remplacement est refusé si le SHA nommé se résout encore dans un dépôt
-    connu : la marque ne vaut que pour un fantôme prouvé, et un gel réellement
-    lisible ne s'efface pas. Une ligne de note fournie par l'appelant est
-    retirée : la marque ne se contourne pas. Seul `frozen` accepte `supersedes`.
+    un gel remplacé quand son commit n'est plus contenu par une ref du dépôt de
+    lecture : c'est la réparation d'un gel fantôme (un SHA erroné écrit avant la
+    validation de la CLI) ou d'un gel devenu objet pendant après un force-push
+    (#3399). Le remplacement est refusé si le SHA nommé est encore **contenu par
+    une ref** d'un dépôt connu : la marque ne vaut que pour un fantôme prouvé,
+    et un gel encore accessible ne s'efface pas. Un objet seulement présent
+    dans l'ODB, hors de toute ref, n'est plus un refus (#3399). Une ligne de
+    note fournie par l'appelant est retirée : la marque ne se contourne pas.
+    Seul `frozen` accepte `supersedes`.
 
     `on_frozen` (facultatif, #1617) : le callback du gel, appelé dans la
     transaction du jalon `frozen` avec `(tx, milestone, after_commit)`. Il
@@ -687,16 +691,17 @@ def milestone(
         # balayage ne confonde pas une livraison (avance rapide) avec un gel
         # déjà dans la cible. C'est une preuve machine : une ligne fournie par
         # l'appelant (`--note`) est ignorée et refaite ici (#2786, avis dev4).
-        # #2989 : la marque de remplacement est écrite ici, après le filtre
-        # générique de #2971 qui a déjà retiré toute marque fournie par `--note`
-        # (blanc de tête compris). `replaced` ne porte que des gels fantômes
-        # prouvés absents, vérifiés ci-dessous.
+        # #2989/#3399 : la marque de remplacement est écrite ici, après le
+        # filtre générique de #2971 qui a déjà retiré toute marque fournie par
+        # `--note` (blanc de tête compris). `replaced` ne porte que des gels
+        # fantômes (SHA absent) ou devenus objets pendants après un force-push
+        # (présents dans l'ODB mais hors de toute ref), vérifiés ci-dessous.
         if replaced:
             # #2989 : la déclaration ne vaut que pour un gel antérieur du même
             # lot (la ligne machine est écrite ici, jamais recopiée).
             prior = {int(row.get("id") or 0): row
                      for row in milestones(db, item_id, None)}
-            from . import freeze_checks
+            from . import freeze_checks, plan_git
             known = ([repo] if repo else []) + _head_repos(db, item)
             for freeze_id in replaced:
                 row = prior.get(freeze_id)
@@ -706,21 +711,45 @@ def milestone(
                         % (freeze_id, item_id))
                 replaced_sha = str(row.get("sha") or "").strip()
                 # #2989 (N1 de la revue dev2) : la marque ne vaut que pour un
-                # fantôme **prouvé**. Un gel encore lisible dans un dépôt connu
-                # ne se remplace pas : la lecture le relit de toute façon, mais
-                # si sa récupération échouait un jour (objets élagués, source
-                # injoignable), la marque le ferait disparaître au lieu du
-                # refus fermé B5. On refuse donc à l'écriture : la preuve est
-                # positive (le commit existe), pas une absence devinée.
+                # fantôme **prouvé**. #3399 : la présence de l'objet dans l'ODB
+                # n'est pas une preuve d'accessibilité — un force-push laisse le
+                # commit hors de toute ref. On refuse tant qu'une ref d'un dépôt
+                # connu le contient encore (le refus fermé B5 garde sa force
+                # pour un gel accessible) ; sinon le remplacement est permis.
                 if not replaced_sha:
                     continue
                 for where in known:
-                    if where and freeze_checks.commit_in(where, replaced_sha):
+                    if not where or not freeze_checks.commit_in(where, replaced_sha):
+                        continue
+                    reachable = plan_git.ref_reachable(where, replaced_sha)
+                    if reachable is False and plan_git._out(
+                            where, "remote", "get-url", "origin"):
+                        # Une ref distante non rapatriée ne prouve pas
+                        # l'absence : on rafraîchit une fois avant de conclure.
+                        errors = plan_git.refresh_clone(where, "", refreshed)
+                        if errors.get("origin"):
+                            raise WorkError(
+                                "--supersedes %s: freeze %s is present in %s but "
+                                "its remote refs cannot be refreshed (%s) — cannot "
+                                "prove it is out of every ref (#2989/#3399)"
+                                % (freeze_id, replaced_sha[:12], where,
+                                   errors.get("origin")))
+                        reachable = plan_git.ref_reachable(where, replaced_sha)
+                    if reachable is False:
+                        continue
+                    if reachable is None:
                         raise WorkError(
-                            "--supersedes %s: freeze %s is readable in %s — only a "
-                            "freeze absent from every known repository (a proven "
-                            "ghost) can be replaced (#2989)"
+                            "--supersedes %s: freeze %s is present in %s and its "
+                            "refs cannot be read — cannot prove it is out of every "
+                            "ref; refusing to replace a freeze that may still be "
+                            "accessible (#2989/#3399)"
                             % (freeze_id, replaced_sha[:12], where))
+                    raise WorkError(
+                        "--supersedes %s: freeze %s is still reachable from a ref "
+                        "of %s — only a freeze absent from every known repository "
+                        "or kept out of every ref after a force-push (a proven "
+                        "ghost) can be replaced (#2989/#3399)"
+                        % (freeze_id, replaced_sha[:12], where))
             note = (note + "\n" if note else "") + "\n".join(
                 "%s %d" % (FREEZE_SUPERSEDES_MARK, freeze_id)
                 for freeze_id in replaced)
