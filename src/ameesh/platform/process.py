@@ -687,11 +687,7 @@ def holders(path: str | None, needle: str | None = None, exclude=(), *,
     `allow` (L230) : noms des processus de l'utilisateur dont l'illisibilité
     n'est PAS un doute — le choix explicite de l'owner de l'hôte, vide par
     défaut ; le `comm` ET le nom de base d'`argv[0]` doivent s'y trouver
-    (même règle que `user_paths`), sinon le refus reste un doute. #3195 : un
-    agent de clés lancé par le gestionnaire de services comme son unité
-    (`key_agent_paths`, par cgroup et parent, jamais par nom, et par la
-    configuration que le gestionnaire en lit) n'en est pas un non plus tant
-    qu'aucun de ses chemins configurés n'est dans `path`. Un détenteur
+    (même règle que `user_paths`), sinon le refus reste un doute. Un détenteur
     CONSTATÉ (fichier ouvert, dossier courant, `needle`) reste rapporté, même
     si son nom est dans `allow` : l'allow ne lève que le doute, jamais une
     observation."""
@@ -803,18 +799,13 @@ def _allowed_proc(pid, allow) -> bool:
     return bool(name) and name in allow and os.path.basename(argv0) in allow
 
 
-def _doubt_proc(pid, uid: int, managers, allow=(), inside=None,
-                proof=None) -> str | None:
+def _doubt_proc(pid, uid: int, managers, allow=()) -> str | None:
     """L63b: why a process whose open files were denied leaves the answer
     unknown, read on /proc; None when it cannot hold anything of the user's:
     gone, a zombie (no files left), running as another user (effective uid:
     a setuid helper such as sudo is root's), the user's service manager
-    (`managers()`, by PID), a key agent run as its unit by that manager
-    whose configured paths (`key_agent_paths`, #3195) are none `inside` the
-    path looked for and whose open files there `proof()` rules out (R4:
-    `open_files_proof`, '' when nothing is open; no proof, no exemption), or
-    a process named by `allow` (L230, `comm` and `argv[0]`; an unreadable
-    status is a doubt)."""
+    (`managers()`, by PID), or a process named by `allow` (L230, `comm` and
+    `argv[0]`; an unreadable status is a doubt)."""
     try:
         status = _proc_status(pid)
     except OSError as exc:
@@ -827,11 +818,6 @@ def _doubt_proc(pid, uid: int, managers, allow=(), inside=None,
     if int(uids[1]) != uid or int(pid) in managers():
         return None
     if _allowed_proc(pid, allow):
-        return None
-    configured = key_agent_paths(pid, uid, managers, status)
-    if (configured is not None and proof is not None
-            and not any((inside or (lambda _p: False))(path) for path in configured)
-            and not proof()):
         return None
     return "%s %s" % (pid, " ".join(status.get("Name") or ["?"]))
 
@@ -1020,12 +1006,8 @@ def _holders_psutil(ps, real, is_dir, needle, exclude, mapped=False,
     if _proc_ok():   # Linux: the same reading of a doubt as the /proc way
         uid, managers = os.getuid(), _once(service_managers)
 
-        proof = _once(lambda: open_files_proof(real))
-
         def doubt(pid):
-            return _doubt_proc(pid, uid, managers, allow,
-                               lambda path: _inside(os.path.realpath(path), real, is_dir),
-                               proof)
+            return _doubt_proc(pid, uid, managers, allow)
     else:
         def doubt(pid):
             return _doubt_psutil(ps, pid, user, allow)
@@ -1128,10 +1110,6 @@ def _holders_proc(real, is_dir, needle, exclude, mapped=False, session=False,
                            "open files unreadable even for this process (%s)"
                            % exc) from None
     uid, managers = os.getuid(), _once(service_managers)
-
-    def inside(path: str) -> bool:
-        return _inside(os.path.realpath(path), real, is_dir)
-    proof = _once(lambda: open_files_proof(real))
     found = []
     doubts: dict = {}
     for pid in pids:
@@ -1174,13 +1152,13 @@ def _holders_proc(real, is_dir, needle, exclude, mapped=False, session=False,
         if row:
             found.append(row)
         elif refused:
-            who = _doubt_proc(pid, uid, managers, allow, inside, proof)
+            who = _doubt_proc(pid, uid, managers, allow)
             if who:
                 doubts[pid] = who
     # L63b : même règle que la voie psutil — un détenteur vérifié ne se jette
     # pas parce qu'un tiers du même utilisateur refuse ses fichiers ouverts.
     if not found:
-        _settle(doubts, lambda pid: _doubt_proc(pid, uid, managers, allow, inside, proof))
+        _settle(doubts, lambda pid: _doubt_proc(pid, uid, managers, allow))
     return found
 
 
@@ -1191,338 +1169,18 @@ def _holders_proc(real, is_dir, needle, exclude, mapped=False, session=False,
 #: never readable (not dumpable) and never inside a worktree: the user's
 #: service manager (`systemd --user`, cwd `/`)
 SERVICE_MANAGER = frozenset({"systemd", "(sd-pam)"})
-#: #3195: the key agents are not dumpable on purpose (their memory holds
-#: keys). Run as these units of the user's service manager (`gpg-agent
-#: --supervised`, socket-activated), their working directory is the unit's
-#: (the home by default), never a worktree. On ameesh-agents-1 and -2, one
-#: such `gpg-agent`, alive since 13/10, held back every deletion of build
-#: output for ten days. Told by cgroup and parent, never by name (B1 cx2): a
-#: `gpg-agent` a test starts inside a worktree keeps the cgroup of its
-#: launcher, even once the manager has reaped it as an orphan: a doubt.
-#: R3: `gpg-agent` only — its paths are read from the live process itself
-#: (`_gpg_agent_query`); an `ssh-agent` cannot be asked: it stays a doubt.
-KEY_AGENT_UNITS = frozenset({"gpg-agent.service"})
-#: #3195 R2 (cx1, cx2): the unit's identity does not prove its paths — any
-#: unit can set `WorkingDirectory=` (systemd.exec). A key agent is let
-#: through only when the manager reads its unit from these root-owned vendor
-#: directories, without a drop-in nor `RootDirectory=`: the package's file,
-#: which the user cannot have pointed at a worktree.
-VENDOR_UNIT_DIRS = ("/usr/lib/systemd/user/", "/lib/systemd/user/",
-                    "/usr/share/systemd/user/")
-UNIT_PROPERTIES = ("Id", "MainPID", "FragmentPath", "DropInPaths",
-                   "WorkingDirectory", "RootDirectory")
-#: #3195 R3 (cx1 B2): the GnuPG home is the one of the live agent, asked on
-#: the socket the manager passes it (`%t/gnupg/S.gpg-agent` of the vendor
-#: socket unit): the manager's environment now is not the one the agent
-#: inherited (`systemctl --user unset-environment` after its start).
-GPG_AGENT_SOCKET = "/run/user/%d/gnupg/S.gpg-agent"
-#: GPG_ERR_NOT_FOUND, the answer of `GETINFO getenv` to an unset variable;
-#: any other error is a doubt
-GPG_ERR_NOT_FOUND = 27
-
-
-def _unit_show(unit: str) -> dict:
-    """#3195 R2: the user's service manager's reading of `unit`
-    (`systemctl --user show`), `{}` when it cannot be read."""
-    import subprocess
-    try:
-        done = subprocess.run(["systemctl", "--user", "show", unit,
-                               "--property=" + ",".join(UNIT_PROPERTIES)],
-                              capture_output=True, text=True, timeout=5)
-    except (OSError, subprocess.SubprocessError):
-        return {}
-    if done.returncode != 0:
-        return {}
-    return dict(line.split("=", 1) for line in done.stdout.splitlines() if "=" in line)
-
-
-def _assuan_data(raw: bytes) -> bytes:
-    """An Assuan data line (`D …`), its `%XX` escapes decoded."""
-    import re
-    return re.sub(rb"%([0-9A-Fa-f]{2})", lambda m: bytes((int(m.group(1), 16),)), raw)
-
-
-def _gpg_agent_query(uid: int, commands, timeout: float = 5.0) -> list | None:
-    """#3195 R3: the answers of the user's `gpg-agent` (`GPG_AGENT_SOCKET`)
-    to the Assuan `commands`, one per command: its data (`str`) after `OK`,
-    or the error code (`int`) of an `ERR`. None when the socket cannot be
-    reached or the dialogue goes astray (an inquiry, a cut): a doubt."""
-    import socket
-    try:
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as conn:
-            conn.settimeout(timeout)
-            conn.connect(GPG_AGENT_SOCKET % uid)
-            stream = conn.makefile("rwb")
-            if not stream.readline().startswith(b"OK"):
-                return None
-            out = []
-            for command in commands:
-                stream.write(command.encode("utf-8") + b"\n")
-                stream.flush()
-                data = []
-                while True:
-                    line = stream.readline()
-                    if not line.endswith(b"\n"):
-                        return None
-                    line = line[:-1]
-                    if line.startswith(b"D "):
-                        data.append(_assuan_data(line[2:]))
-                    elif line == b"OK" or line.startswith(b"OK "):
-                        out.append(b"".join(data).decode("utf-8", "surrogateescape"))
-                        break
-                    elif line.startswith(b"ERR "):
-                        out.append(int(line.split()[1]))
-                        break
-                    elif not (line.startswith(b"S ") or line.startswith(b"#")):
-                        return None
-            return out
-    except (OSError, ValueError, IndexError):
-        return None
-
-
-def _home_of(uid: int) -> str:
-    try:
-        import pwd
-        return pwd.getpwuid(uid).pw_dir
-    except (ImportError, KeyError):
-        return ""
-
-
-def _gpg_agent_home(pid, uid: int, query=None) -> str | None:
-    """#3195 R3 (cx1 B2): the GnuPG home of the live `gpg-agent` `pid`, read
-    from the process itself: its command line is the vendor unit's
-    (`<dir>/gpg-agent --supervised`: no `--homedir`, no `gpgconf.ctl` beside
-    it), the agent on the user's socket answers `GETINFO pid` with `pid`,
-    then `GETINFO getenv` gives its own `GNUPGHOME`, else its `HOME`
-    (`~/.gnupg`, GnuPG's default). Its other open files (a `log-file` read
-    at its start, R4) are not told by anything: `open_files_proof`.
-    Anything unreadable, unexpected or not proven: None (the doubt stays)."""
-    argv = _read_text(os.path.join(PROC, str(pid), "cmdline")).split("\0")
-    argv = argv[:-1] if argv and argv[-1] == "" else argv
-    if (len(argv) != 2 or argv[1] != "--supervised" or not os.path.isabs(argv[0])
-            or os.path.basename(argv[0]) != "gpg-agent"
-            or os.path.lexists(os.path.join(os.path.dirname(argv[0]), "gpgconf.ctl"))):
-        return None
-    try:
-        answers = (query or _gpg_agent_query)(
-            uid, ("GETINFO pid", "GETINFO getenv GNUPGHOME", "GETINFO getenv HOME"))
-    except Exception:  # noqa: BLE001 - the agent could not be asked: a doubt
-        return None
-    if not isinstance(answers, list) or len(answers) != 3 or answers[0] != str(pid):
-        return None
-    values = []
-    for answer in answers[1:]:
-        if isinstance(answer, int) and answer & 0xFFFF == GPG_ERR_NOT_FOUND:
-            values.append("")
-        elif isinstance(answer, str):
-            values.append(answer)
-        else:
-            return None
-    gnupghome, home = values
-    if not gnupghome:
-        home = home or _home_of(uid)
-        gnupghome = os.path.join(home, ".gnupg") if home else ""
-    if not os.path.isabs(gnupghome):
-        return None
-    return gnupghome
-
-
-#: #3195 R4: the kernel's answer, once per process, to "does a write lease
-#: see every other reader?" ('' yes, else why not)
-_LEASE_SELF_TEST: list = []
-
-
-def _lease_refused(fd) -> str:
-    """'' when the kernel grants then releases a write lease on `fd`: no
-    other open file description — read, write or a mapping — references its
-    inode, on the whole host (fcntl(2) F_SETLEASE). Else why not."""
-    import errno
-    import fcntl
-    try:
-        fcntl.fcntl(fd, fcntl.F_SETLEASE, fcntl.F_WRLCK)
-    except OSError as exc:
-        if exc.errno in (errno.EAGAIN, errno.EBUSY):
-            return "open elsewhere"
-        return "no lease (%s)" % (exc.strerror or exc)
-    try:
-        fcntl.fcntl(fd, fcntl.F_SETLEASE, fcntl.F_UNLCK)
-    except OSError:
-        pass   # closing the descriptor releases it all the same
-    return ""
-
-
-def _lease_self_test() -> str:
-    """#3195 R4: '' when this kernel's write lease is refused while another
-    descriptor reads the file and granted once it is closed (the readers are
-    counted: CONFIG_IMA), else why the lease proves nothing here."""
-    if not _LEASE_SELF_TEST:
-        import tempfile
-        why = ""
-        try:
-            fd, path = tempfile.mkstemp(prefix="ameesh-lease-")
-            try:
-                os.close(fd)
-                mine = os.open(path, os.O_RDONLY)
-                other = os.open(path, os.O_RDONLY)
-                try:
-                    if _lease_refused(mine) != "open elsewhere":
-                        why = "a write lease does not see another reader on this kernel"
-                finally:
-                    os.close(other)
-                if not why:
-                    why = _lease_refused(mine) and "a write lease is refused on a free file"
-                os.close(mine)
-            finally:
-                os.unlink(path)
-        except OSError as exc:
-            why = "lease self-test failed: %s" % (exc.strerror or exc)
-        _LEASE_SELF_TEST.append(why or "")
-    return _LEASE_SELF_TEST[0]
-
-
-def open_files_proof(root: str) -> str:
-    """#3195 R4 (cx1, cx2): '' when no file under `root` is open anywhere on
-    the host, proven by the kernel: every regular file takes a write lease
-    (`_lease_refused`), opened without following a link nor touching its
-    access time. That is the runtime proof of the open files of a process
-    whose descriptors cannot be read (a `log-file` a `gpg-agent` opened at
-    its start, whatever its configuration says now). What cannot be proven
-    is the reason returned: a lease refused or unavailable (another owner, a
-    file system without leases), another kind of file (FIFO, socket,
-    device), a walk that cannot be completed, a kernel whose lease does not
-    count the readers (`_lease_self_test`). An absent `root` holds nothing.
-    A descriptor opened with `O_PATH` cannot read nor write a file: it is not
-    counted, nor needed."""
-    import stat
-    why = _lease_self_test()
-    if why:
-        return why
-    flags = (os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
-             | getattr(os, "O_NOATIME", 0))
-
-    def one(path: str) -> str:
-        try:
-            mode = os.lstat(path).st_mode
-        except FileNotFoundError:
-            return ""
-        except OSError as exc:
-            return "%s: %s" % (path, exc.strerror or exc)
-        if stat.S_ISLNK(mode) or stat.S_ISDIR(mode):
-            return ""
-        if not stat.S_ISREG(mode):
-            return "%s: not a regular file" % path
-        try:
-            fd = os.open(path, flags)
-        except FileNotFoundError:
-            return ""
-        except OSError as exc:
-            return "%s: %s" % (path, exc.strerror or exc)
-        try:
-            if not stat.S_ISREG(os.fstat(fd).st_mode):
-                return "%s: not a regular file" % path
-            refused = _lease_refused(fd)
-            return "%s: %s" % (path, refused) if refused else ""
-        finally:
-            os.close(fd)
-
-    try:
-        if not os.path.isdir(root) or os.path.islink(root):
-            return one(root)
-    except OSError as exc:
-        return "%s: %s" % (root, exc.strerror or exc)
-    errors: list = []
-    for top, dirs, files in os.walk(root, onerror=errors.append, followlinks=False):
-        for name in files:
-            why = one(os.path.join(top, name))
-            if why:
-                return why
-        if errors:
-            break
-    if errors:
-        return "walk incomplete: %s" % errors[0]
-    return ""
-
-
-def key_agent_paths(pid, uid: int, managers, status: dict | None = None, *,
-                    show=None, query=None) -> list[str] | None:
-    """#3195: the paths a key agent run by the user's service manager as its
-    unit (`KEY_AGENT_UNITS`) may hold; None when that is not proven (the
-    doubt stays).
-
-    Its parent is the manager (`managers()`, PIDs from `service_managers`)
-    and its cgroup is that unit, under `user@<uid>.service` through slices
-    only (a sub-cgroup of a delegated unit is not the unit) — both readable
-    on a process that is not dumpable. R2 (cx1, cx2): the manager's reading
-    of the unit (`show(unit)`, `_unit_show`) names this process as its
-    `MainPID`, from a vendor file (`VENDOR_UNIT_DIRS`), without a drop-in nor
-    a `RootDirectory=`. The paths are its `WorkingDirectory` as the manager
-    reports it (`~` or empty: the home) and, R3 (cx1 B2), its GnuPG home
-    read from the live
-    agent (`_gpg_agent_home`, `query`: `_gpg_agent_query`), never from the
-    manager's environment now. The caller records them as observed paths, so
-    a worktree that contains one stays held. R4 (cx1, cx2): they are its
-    directories, not its open files — no configuration tells those; the
-    caller asks the kernel (`open_files_proof`) for each path to delete.
-    Anything unreadable (B1: a failed reading is never an empty one): None.
-    `status`: its `_proc_status`, when already read."""
-    try:
-        status = _proc_status(pid) if status is None else status
-        ppid = int(((status or {}).get("PPid") or ["0"])[0])
-    except (OSError, ValueError):
-        return None
-    if ppid <= 1 or ppid not in managers():
-        return None
-    lines = _read_text(os.path.join(PROC, str(pid), "cgroup")).splitlines()
-    # the hierarchy systemd tracks: `name=systemd` (cgroup v1, hybrid), else
-    # the unified one (cgroup v2, `0::/…`)
-    path = next((line.split(":", 2)[2] for line in lines
-                 if line.count(":") >= 2 and line.split(":", 2)[1] == "name=systemd"), None)
-    if path is None:
-        path = next((line[3:] for line in lines if line.startswith("0::")), "")
-    parts = path.strip().strip("/").split("/")
-    manager = "user@%d.service" % uid
-    if manager not in parts[:-1]:
-        return None
-    between = parts[parts.index(manager) + 1:-1]
-    unit = parts[-1]
-    if unit not in KEY_AGENT_UNITS or not all(p.endswith(".slice") for p in between):
-        return None
-    try:
-        props = (show or _unit_show)(unit) or {}
-    except Exception:  # noqa: BLE001 - the manager's reading failed: a doubt
-        return None
-    fragment = os.path.normpath(props.get("FragmentPath") or "/")
-    if (props.get("Id") != unit or props.get("MainPID") != str(pid)
-            or not any(fragment.startswith(d) for d in VENDOR_UNIT_DIRS)
-            or (props.get("DropInPaths") or "").strip()
-            or (props.get("RootDirectory") or "").strip()):
-        return None
-    home = _home_of(uid)
-    # `!` (missing directory allowed) and `-` prefix the reported directory
-    workdir = (props.get("WorkingDirectory") or "").lstrip("!-") or "~"
-    workdir = home if workdir == "~" else workdir
-    if not workdir or not os.path.isabs(workdir):
-        return None
-    gnupghome = _gpg_agent_home(pid, uid, query)
-    if gnupghome is None:
-        return None
-    return [workdir, gnupghome]
 
 
 class UserPaths:
     """Snapshot of the user's processes: real paths of their cwd, executable,
     open and mapped files (`paths`: path -> "pid name"), the processes that
     could not be read (`unreadable`), those of them let through by name
-    (`allowed`), and whether the table could be read at all (`available`).
-    #3195 R4: `unproven` names the key agents whose directories are proven
-    (`key_agent_paths`) but whose open files are not: `holders(root)` names
-    them unless `open_files_proof(root)` proves nothing under it is open."""
+    (`allowed`), and whether the table could be read at all (`available`)."""
 
     def __init__(self, available: bool = True):
         self.paths: dict = {}
         self.unreadable: list = []
         self.allowed: list = []
-        self.unproven: list = []
         self.available = available
 
     def doubt(self) -> str:
@@ -1536,14 +1194,8 @@ class UserPaths:
     def holders(self, root: str) -> list:
         root = os.path.realpath(root).rstrip(os.sep)
         prefix = root + os.sep
-        found = {who for path, who in self.paths.items()
-                 if path == root or path.startswith(prefix)}
-        if self.unproven:
-            why = open_files_proof(root)
-            if why:
-                found |= {"%s (open files not ruled out: %s)" % (who, why)
-                          for who in self.unproven}
-        return sorted(found)
+        return sorted({who for path, who in self.paths.items()
+                       if path == root or path.startswith(prefix)})
 
 
 def _read_text(path: str) -> str:
@@ -1596,21 +1248,15 @@ def user_paths(uid: int | None = None, allow=()) -> UserPaths:
     A process gone meanwhile is ignored, and so is a zombie (`_zombie`, #1678):
     it holds nothing anymore. One that cannot be read (not dumpable: setuid,
     file capabilities) is a doubt, unless its name (`comm`) AND the base name
-    of its `argv[0]` are both in `allow` (listed in `allowed`) or both name
-    the service manager (not listed): its `exe` link is unreadable too, its
-    command line is not. Nor is a key agent run as its unit by the service
-    manager (`key_agent_paths`, #3195): its proven directories are recorded
-    as its own, and it is listed in `unproven` (R4): `holders(root)` names
-    it unless the kernel proves no file under `root` is open
-    (`open_files_proof`). What was read before a refusal (a `cwd`, an
-    `exe`) is recorded all the same (#3195 R2): an observation is never
-    dropped for what could not be read after it.
+    of its `argv[0]` are both in `allow` or the service manager: its `exe` link
+    is unreadable too, its command line is not. What was read before a
+    refusal (a `cwd`, an `exe`) is recorded all the same (#3195 R2): an
+    observation is never dropped for what could not be read after it.
     Without `/proc` (other OS), `available` is false."""
     if not _proc_ok():
         return UserPaths(available=False)
     uid = os.getuid() if uid is None else uid
     allow = SERVICE_MANAGER | set(allow or ())
-    managers = _once(lambda: service_managers(uid))
     out = UserPaths()
     try:
         pids = [p for p in os.listdir(PROC) if p.isdigit()]
@@ -1629,7 +1275,6 @@ def user_paths(uid: int | None = None, allow=()) -> UserPaths:
         name = _read_text(os.path.join(base, "comm")).strip() or "?"
         who = "%s %s" % (pid, name)
         found = []
-        refused = False
         try:
             found.append(_link(os.path.join(base, "cwd")))
             for link in ("exe", "root"):
@@ -1652,22 +1297,12 @@ def user_paths(uid: int | None = None, allow=()) -> UserPaths:
         except (FileNotFoundError, ProcessLookupError):
             continue   # gone meanwhile
         except OSError:
-            refused = True
-        if refused:
             argv0 = _read_text(os.path.join(base, "cmdline")).split("\0", 1)[0]
-            configured = None
             if name in allow and os.path.basename(argv0) in allow:
                 if name not in SERVICE_MANAGER:
                     out.allowed.append(who)
             else:
-                configured = key_agent_paths(pid, uid, managers)
-                if configured is None:
-                    out.unreadable.append(who)
-                else:   # R4: its open files still need the kernel's proof
-                    out.unproven.append(who)
-            # #3195 R2: what was read before the refusal stays observed, and
-            # a key agent's configured paths are its own
-            found += configured or []
+                out.unreadable.append(who)
         for path in found:
             # `root` is `/` for every process: it only tells a chroot apart
             if path and path != "/":

@@ -5,7 +5,6 @@ and removes after 24 h a worktree kept although its lot is merged. Offline:
 temporary git trees, a fake /proc, a fake store."""
 from __future__ import annotations
 
-import contextlib
 import os
 import shutil
 import subprocess
@@ -19,10 +18,6 @@ from ameesh import build_artifacts as ba
 from ameesh import housekeeping_discovery as hd
 from ameesh import menage, platform
 from ameesh.platform import process
-
-#: #3195 R3: gpg-agent's `ERR` to `GETINFO getenv` of an unset name
-#: (GPG_ERR_SOURCE_GPGAGENT << 24 | GPG_ERR_NOT_FOUND)
-NOT_FOUND = (4 << 24) | 27
 
 DAY = 24 * 3600.0
 #: a ctime cannot be set back: the tests move "now" forward instead
@@ -64,22 +59,11 @@ class _Base(unittest.TestCase):
 
     def fake_process(self, pid: int, *, cwd: str = "/", fds=(), maps=(), comm: str = "bash",
                      argv0: str | None = None, state: str = "S",
-                     threads=(), unreadable: bool = False, ppid: int = 1,
-                     cgroup: str | None = None) -> None:
+                     threads=(), unreadable: bool = False) -> None:
         d = os.path.join(self.proc, str(pid))
         os.makedirs(os.path.join(d, "fd"))
         _write(os.path.join(d, "comm"), text=comm + "\n")
-        if cgroup is not None:
-            # #3195: what a process that is not dumpable still shows
-            uid = os.getuid()
-            _write(os.path.join(d, "status"),
-                   text="Name:\t%s\nState:\t%s (x)\nPPid:\t%d\nUid:\t%d\t%d\t%d\t%d\n"
-                        % (comm, state, ppid, uid, uid, uid, uid))
-            _write(os.path.join(d, "cgroup"), text=cgroup)
-        # #3195 R3: a `gpg-agent` runs as the vendor unit's command line
-        flag = "--supervised" if comm == "gpg-agent" and argv0 is None else "--flag"
-        _write(os.path.join(d, "cmdline"),
-               text="%s\0%s\0" % (argv0 or "/usr/bin/" + comm, flag))
+        _write(os.path.join(d, "cmdline"), text="%s\0--flag\0" % (argv0 or "/usr/bin/" + comm))
         # état du processus (`Z` = zombie, #1678) : /proc/<pid>/stat, champ 3
         _write(os.path.join(d, "stat"),
                text="%d (%s) %s 1 %d 1 0 -1 0 0 0 0 0 0 0 0 0 0 0 0 100\n"
@@ -98,39 +82,6 @@ class _Base(unittest.TestCase):
         if unreadable:
             os.chmod(os.path.join(d, "fd"), 0)
             self.addCleanup(os.chmod, os.path.join(d, "fd"), 0o700)
-
-    def units(self, pids, environment=None, *, query=None, **props):
-        """#3195 R2: the user's service manager's reading of the key agent
-        units — the package's file, `pids` (`{unit: MainPID}`), the home as
-        working directory; `props` overrides a field. R3: the live agent's
-        answers on its socket — its pid, then its `environment` (a HOME of
-        its own by default, a None value unset); `query` replaces them."""
-        home = os.path.expanduser("~")
-
-        def show(unit):
-            if unit not in pids:
-                return {}
-            row = {"Id": unit, "MainPID": str(pids[unit]),
-                   "FragmentPath": "/usr/lib/systemd/user/" + unit, "DropInPaths": "",
-                   "WorkingDirectory": "!" + home, "RootDirectory": ""}
-            row.update(props)
-            return row
-        env = {"GNUPGHOME": None, "HOME": os.path.join(self.base, "agent-home")}
-        env.update(environment or {})
-
-        def answers(uid, commands):
-            out = [str(pids.get("gpg-agent.service"))]
-            for command in commands[1:]:
-                value = env.get(command.split()[-1])
-                out.append(NOT_FOUND if value is None else value)
-            return out
-        stack = contextlib.ExitStack()
-        stack.enter_context(mock.patch.object(process, "_unit_show", side_effect=show))
-        stack.enter_context(mock.patch.object(process, "_gpg_agent_query",
-                                              side_effect=query or answers))
-        stack.enter_context(mock.patch.object(process, "service_managers",
-                                              return_value=frozenset({7})))
-        return stack
 
     def worktree(self, name: str = "wt") -> str:
         """A worktree: sources, node_modules (two levels), a Rust target
@@ -233,104 +184,20 @@ class UserPathsTest(_Base):
             self.assertIn("unreadable", platform.user_paths().doubt())
 
     @unittest.skipIf(os.getuid() == 0, "root reads everything")
-    def test_3195_key_agents_only_as_units_of_the_manager(self):
-        """#3195: `gpg-agent --supervised` (not dumpable) held back every
-        deletion on ameesh-agents-1 and -2 for ten days. A key agent the
-        service manager runs as its unit is no doubt; told by cgroup and
-        parent, never by name (B1 cx2: a `gpg-agent` whose cwd is in a
-        `node_modules` stays one)."""
-        uid = os.getuid()
-        user = "/user.slice/user-%d.slice/user@%d.service" % (uid, uid)
-        self.fake_process(40, comm="gpg-agent", unreadable=True, ppid=7,
-                          cgroup="0::%s/app.slice/gpg-agent.service\n" % user)
-        self.fake_process(41, comm="ssh-agent", unreadable=True, ppid=7,
-                          cgroup="1:name=systemd:%s/ssh-agent.service\n0::/\n" % user)
-        managers = mock.patch.object(process, "service_managers", return_value=frozenset({7}))
-        with self.units({"gpg-agent.service": 40, "ssh-agent.service": 41}):
-            scan = platform.user_paths()
-        # R3: an `ssh-agent` cannot be asked for its paths: it stays a doubt;
-        # R4: the gpg-agent's open files still need the kernel's proof
-        self.assertEqual((scan.unreadable, scan.allowed, scan.unproven),
-                         (["41 ssh-agent"], [], ["40 gpg-agent"]))
-        with mock.patch.object(process, "service_managers", return_value=frozenset()):
-            self.assertIn("40 gpg-agent", platform.user_paths().doubt())
-        inside = os.path.join(self.base, "wt", "node_modules")
-        cases = (("started by a test, reaped by the manager", 7,
-                  "0::%s/ameesh.slice/ameesh-runner-agent@dev2.service\n" % user),
-                 ("in the unit, not run by the manager", 40,
-                  "0::%s/app.slice/gpg-agent.service\n" % user),
-                 ("a sub-cgroup of a delegated unit", 7,
-                  "0::%s/app.slice/runner.service/gpg-agent.service\n" % user),
-                 ("the unit of another user's manager", 7,
-                  "0::/user.slice/user-1.slice/user@1.service/gpg-agent.service\n"),
-                 ("its name alone", 7, ""))
-        for pid, (name, ppid, cgroup) in enumerate(cases, start=50):
-            with self.subTest(name):
-                self.fake_process(pid, comm="gpg-agent", cwd=inside, unreadable=True,
-                                  ppid=ppid, cgroup=cgroup)
-                with managers, self.units({"gpg-agent.service": pid}):
-                    self.assertIn("%d gpg-agent" % pid, platform.user_paths().unreadable)
-
-    @unittest.skipIf(os.getuid() == 0, "root reads everything")
-    def test_3195_r2_only_the_package_unit_is_let_through(self):
-        """R2 (cx1, cx2): the unit's identity does not prove its paths — any
-        unit can set `WorkingDirectory=`. Only the manager's reading of the
-        package's file (vendor directory, no drop-in, no `RootDirectory=`,
-        this process as its `MainPID`) lets a key agent through."""
-        uid = os.getuid()
-        user = "/user.slice/user-%d.slice/user@%d.service" % (uid, uid)
-        cases = (("the user's own unit file", {"FragmentPath": os.path.expanduser(
-                    "~/.config/systemd/user/gpg-agent.service")}),
-                 ("a drop-in", {"DropInPaths": os.path.expanduser(
-                    "~/.config/systemd/user/gpg-agent.service.d/x.conf")}),
-                 ("a RootDirectory", {"RootDirectory": "/srv/jail"}),
-                 ("another MainPID", {"MainPID": "999"}),
-                 ("another unit answers", {"Id": "other.service"}),
-                 ("a relative working directory", {"WorkingDirectory": "node_modules"}))
-        for pid, (name, props) in enumerate(cases, start=60):
-            with self.subTest(name):
-                self.fake_process(pid, comm="gpg-agent", unreadable=True, ppid=7,
-                                  cgroup="0::%s/app.slice/gpg-agent.service\n" % user)
-                with self.units({"gpg-agent.service": pid}, **props):
-                    self.assertIn("%d gpg-agent" % pid, platform.user_paths().unreadable)
-        # R3 (cx1 B1, B2): its GnuPG home is read from the live agent; any
-        # reading that fails or does not prove it keeps the doubt
-        asked = (("the agent cannot be asked (B1)", {},
-                  lambda pid: lambda uid, commands: None),
-                 ("the asking raises", {},
-                  lambda pid: mock.Mock(side_effect=OSError("refused"))),
-                 ("another agent answers on the socket", {},
-                  lambda pid: lambda uid, commands: ["999", NOT_FOUND, "/home/x"]),
-                 ("another error than not found", {},
-                  lambda pid: lambda uid, commands: [str(pid), (4 << 24) | 1, "/home/x"]),
-                 ("a short answer", {}, lambda pid: lambda uid, commands: [str(pid)]),
-                 ("a relative GnuPG home", {"GNUPGHOME": ".gnupg"}, None),
-                 ("no home at all", {"HOME": None}, None))
-        for pid, (name, environment, query) in enumerate(asked, start=80):
-            with self.subTest(name):
-                self.fake_process(pid, comm="gpg-agent", unreadable=True, ppid=7,
-                                  cgroup="0::%s/app.slice/gpg-agent.service\n" % user)
-                with self.units({"gpg-agent.service": pid}, environment,
-                                query=query and query(pid)), \
-                        mock.patch.object(process, "_home_of", return_value=""):
-                    self.assertIn("%d gpg-agent" % pid, platform.user_paths().unreadable)
-        argvs = (("a --homedir of its own", "/usr/bin/gpg-agent\0--supervised\0--homedir\0/x\0"),
-                 ("a daemon, not supervised", "/usr/bin/gpg-agent\0--daemon\0"),
-                 ("a relative command", "gpg-agent\0--supervised\0"),
-                 ("another program", "/usr/bin/gpg-agentx\0--supervised\0"))
-        for pid, (name, cmdline) in enumerate(argvs, start=90):
-            with self.subTest(name):
-                self.fake_process(pid, comm="gpg-agent", unreadable=True, ppid=7,
-                                  cgroup="0::%s/app.slice/gpg-agent.service\n" % user)
-                _write(os.path.join(self.proc, str(pid), "cmdline"), text=cmdline)
-                with self.units({"gpg-agent.service": pid}):
-                    self.assertIn("%d gpg-agent" % pid, platform.user_paths().unreadable)
-        self.fake_process(70, comm="gpg-agent", unreadable=True, ppid=7,
-                          cgroup="0::%s/app.slice/gpg-agent.service\n" % user)
-        with self.units({"gpg-agent.service": 70}):
-            self.assertNotIn("70 gpg-agent", platform.user_paths().unreadable)
-        with self.units({}):  # the manager cannot be read
-            self.assertIn("70 gpg-agent", platform.user_paths().unreadable)
+    def test_3195_r2_what_was_read_before_a_refusal_is_kept(self):
+        """#3195 R2 (cx1, cx2 witness): a process let through by its name,
+        its cwd readable in a worktree but its descriptors refused, still
+        holds that worktree: an observation is never dropped for what could
+        not be read after it."""
+        wt = self.worktree()
+        self.fake_process(23, comm="btop", cwd=os.path.join(wt, "node_modules"),
+                          unreadable=True)
+        scan = platform.user_paths(allow=["btop"])
+        self.assertEqual((scan.doubt(), scan.allowed), ("", ["23 btop"]))
+        self.assertEqual(scan.holders(wt), ["23 btop"])
+        out = self.go(wt, allow=["btop"])
+        self.assertEqual(out["entries"], [])
+        self.assertIn("process inside (23 btop)", " ".join(out["skipped"]))
 
     @unittest.skipIf(os.getuid() == 0, "root reads everything")
     def test_a_zombie_is_not_a_doubt(self):
@@ -445,80 +312,6 @@ class RunTest(_Base):
         self.assertIn("artifacts: nothing deleted, process(es) of the user unreadable: 23 btop",
                       out["skipped"])
         self.assertTrue(os.path.isdir(os.path.join(wt, "node_modules")))
-
-    @unittest.skipIf(os.getuid() == 0, "root reads everything")
-    def test_3195_a_key_agent_inside_the_worktree_deletes_nothing(self):
-        """B1 cx2: a real `gpg-agent` can work in the directory to clean (its
-        cwd unreadable: `holders` would not see it). Out of its unit, it
-        holds back the deletion."""
-        uid = os.getuid()
-        user = "/user.slice/user-%d.slice/user@%d.service" % (uid, uid)
-        wt = self.worktree()
-        self.fake_process(23, comm="gpg-agent", cwd=os.path.join(wt, "node_modules"),
-                          unreadable=True, ppid=7,
-                          cgroup="0::%s/ameesh.slice/ameesh-runner-agent@dev2.service\n" % user)
-        with self.units({"gpg-agent.service": 23}):
-            out = self.go(wt)
-        self.assertEqual((out["entries"], out["plan"]), ([], []))
-        self.assertIn("artifacts: nothing deleted, process(es) of the user unreadable: "
-                      "23 gpg-agent", out["skipped"])
-        self.assertTrue(os.path.isdir(os.path.join(wt, "node_modules")))
-
-    @unittest.skipIf(os.getuid() == 0, "root reads everything")
-    def test_3195_r2_the_unit_keeps_what_was_read_and_what_it_is_configured_for(self):
-        """R2 (cx1, cx2 witness): parent = manager, cgroup = gpg-agent.service,
-        cwd = <wt>/node_modules readable, fd unreadable: the cwd read is kept,
-        the worktree is held. With its cwd unreadable too, its paths are the
-        ones the manager's reading gives: the home by default (deleted), but a
-        `WorkingDirectory=` or a GnuPG home inside the worktree holds it."""
-        uid = os.getuid()
-        unit = "0::/user.slice/user-%d.slice/user@%d.service/app.slice/gpg-agent.service\n" \
-            % (uid, uid)
-        pids = {"gpg-agent.service": 23}
-        wt = self.worktree()
-        self.fake_process(23, comm="gpg-agent", cwd=os.path.join(wt, "node_modules"),
-                          unreadable=True, ppid=7, cgroup=unit)
-        with self.units(pids):
-            out = self.go(wt)
-        self.assertEqual(out["entries"], [])
-        self.assertIn("process inside (23 gpg-agent)", " ".join(out["skipped"]))
-        # its cwd unreadable as well (not dumpable): readlink refused
-        os.remove(os.path.join(self.proc, "23", "cwd"))
-        os.makedirs(os.path.join(self.proc, "23", "cwd"))
-        inside = os.path.join(wt, "node_modules")
-        # R3 (cx1 B2 witness): the manager's environment now says nothing of
-        # the agent's; only the live agent's own GNUPGHOME or HOME counts
-        held = (("a WorkingDirectory in the worktree", {"WorkingDirectory": inside}, {}),
-                ("its GNUPGHOME in the worktree", {}, {"GNUPGHOME": inside + "/.gnupg"}),
-                ("its HOME in the worktree", {}, {"HOME": inside}))
-        for name, props, environment in held:
-            with self.subTest(name), self.units(pids, environment, **props):
-                out = self.go(wt)
-                self.assertEqual(out["entries"], [])
-                self.assertIn("process inside (23 gpg-agent)", " ".join(out["skipped"]))
-        # B1 witness: the agent cannot be asked: a doubt, nothing deleted
-        with self.units(pids, query=lambda uid, commands: None):
-            out = self.go(wt)
-        self.assertEqual(out["entries"], [])
-        self.assertIn("process(es) of the user unreadable: 23 gpg-agent",
-                      " ".join(out["skipped"]))
-        # R4 (cx1, cx2 witness): a file the agent may hold open — a log-file
-        # read at its start, its configuration since deleted — holds the
-        # worktree, as any holder does; once the kernel proves it free, the
-        # pass deletes
-        log = os.path.join(wt, "node_modules", "left-pad", "index.js")
-        held_open = os.open(log, os.O_RDONLY)
-        try:
-            with self.units(pids):
-                out = self.go(wt)
-        finally:
-            os.close(held_open)
-        self.assertEqual(out["entries"], [])
-        self.assertIn("23 gpg-agent (open files not ruled out: %s: open elsewhere)"
-                      % os.path.realpath(log), " ".join(out["skipped"]))
-        self.assertTrue(os.path.exists(log))
-        with self.units(pids):
-            self.assertEqual(len(self.go(wt)["entries"]), 3)
 
     def test_3195_keep_holds_an_idle_worktree(self):
         wt = self.worktree()

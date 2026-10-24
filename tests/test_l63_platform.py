@@ -24,9 +24,6 @@ from ameesh import platform
 
 from .support import PgTestCase
 
-#: #3195 R3 : l'`ERR` de gpg-agent à `GETINFO getenv` d'un nom absent
-INTROUVABLE = (4 << 24) | 27
-
 SRC = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                    "src", "ameesh")
 
@@ -280,12 +277,10 @@ class PlatformTest(unittest.TestCase):
                 platform.holders(__file__, "x")
 
     def _faux_proc(self, comm: str, uids: str, *, state: str = "S",
-                   lien_refuse: bool = False, status_illisible: bool = False,
-                   ppid: int = 1, cgroup: str = "") -> str:
+                   lien_refuse: bool = False, status_illisible: bool = False) -> str:
         """Un /proc minimal : ce processus-ci (lisible) et le pid 4242
-        (`uids` : réel effectif …, `ppid` son parent, `cgroup` le contenu de
-        son /proc/<pid>/cgroup), dont `fd` refuse la lecture (non dumpable)
-        ou, avec `lien_refuse`, se liste mais pas ses liens."""
+        (`uids` : réel effectif …), dont `fd` refuse la lecture (non
+        dumpable) ou, avec `lien_refuse`, se liste mais pas ses liens."""
         import tempfile
         racine = tempfile.mkdtemp()
         autre = os.path.join(racine, "4242")
@@ -298,14 +293,9 @@ class PlatformTest(unittest.TestCase):
         with open(os.path.join(autre, "comm"), "w") as fh:
             fh.write(comm + "\n")
         with open(os.path.join(autre, "status"), "w") as fh:
-            fh.write("Name:\t%s\nState:\t%s (x)\nPPid:\t%d\nUid:\t%s\n"
-                     % (comm, state, ppid, uids))
+            fh.write("Name:\t%s\nState:\t%s (x)\nUid:\t%s\n" % (comm, state, uids))
         with open(os.path.join(autre, "cmdline"), "w") as fh:
-            # #3195 R3 : un gpg-agent tourne avec la commande de l'unité du paquet
-            fh.write("/usr/bin/gpg-agent\0--supervised\0" if comm == "gpg-agent"
-                     else comm + "\0")
-        with open(os.path.join(autre, "cgroup"), "w") as fh:
-            fh.write(cgroup)
+            fh.write(comm + "\0")
         if status_illisible:
             os.chmod(os.path.join(autre, "status"), 0)
         if lien_refuse:   # readlink d'un fichier ordinaire : EINVAL, pas de cible
@@ -352,17 +342,16 @@ class PlatformTest(unittest.TestCase):
         """L230 : un processus illisible dont le `comm` ET l'`argv[0]` sont
         dans `allow` n'est plus un doute (le ménage de /tmp peut conclure que
         personne ne tient l'entrée) ; un nom emprunté d'un seul côté, ou
-        absent de la liste, reste un doute. #3195 (B1 cx2) : un agent de clés
-        n'est pas exempté par son seul nom (voir le test suivant)."""
+        absent de la liste, reste un doute."""
         if os.geteuid() == 0:
             self.skipTest("root lit tout : pas de refus de lecture à simuler")
         uid = "%d %d %d %d" % ((os.getuid(),) * 4)
-        cas = (("nommé et annoncé", "btop", None, ("btop",), False),
-               ("nom absent de la liste", "btop", None, ("htop",), True),
-               ("argv emprunté", "btop", "/usr/bin/malveillant", ("btop",), True),
-               ("comm emprunté", "node", "/usr/bin/btop", ("btop",), True),
-               ("allow vide", "btop", None, (), True),
-               ("agent de clés par son seul nom, allow vide", "gpg-agent", None, (), True))
+        cas = (("nommé et annoncé", "gpg-agent", None, ("gpg-agent",), False),
+               ("nom absent de la liste", "gpg-agent", None, ("ssh-agent",), True),
+               ("argv emprunté", "gpg-agent", "/usr/bin/malveillant",
+                ("gpg-agent",), True),
+               ("comm emprunté", "node", "/usr/bin/gpg-agent", ("gpg-agent",), True),
+               ("allow vide", "gpg-agent", None, (), True))
         for nom, comm, argv0, allow, doute in cas:
             with self.subTest(nom):
                 racine = self._faux_proc(comm, uid)
@@ -380,277 +369,6 @@ class PlatformTest(unittest.TestCase):
                             platform.holders(__file__, "x", allow=allow)
                     else:
                         self.assertEqual(platform.holders(__file__, "x", allow=allow), [])
-
-    def test_3195_agent_de_cles_seulement_comme_unite_du_gestionnaire(self):
-        """#3195 : un agent de clés que le gestionnaire de services lance comme
-        son unité (`gpg-agent.service`, `ssh-agent.service` sous
-        user@<uid>.service, le gestionnaire pour parent) n'est pas un doute :
-        son dossier courant est celui de l'unité. B1 cx2 : par cgroup et
-        parent, jamais par nom ; un `gpg-agent` lancé par un test dans un
-        worktree garde le cgroup de son lanceur, même recueilli par le
-        gestionnaire, et reste un doute."""
-        if os.geteuid() == 0:
-            self.skipTest("root lit tout : pas de refus de lecture à simuler")
-        moi = os.getuid()
-        uid = "%d %d %d %d" % ((moi,) * 4)
-        user = "/user.slice/user-%d.slice/user@%d.service" % (moi, moi)
-        unite = "0::%s/app.slice/gpg-agent.service\n" % user
-        cas = (("unité du gestionnaire", "gpg-agent", 7, unite, {7}, False),
-               ("hiérarchie systemd v1", "gpg-agent", 7,
-                "1:name=systemd:%s/app.slice/gpg-agent.service\n0::/\n" % user, {7}, False),
-               # R3 : un ssh-agent ne peut être interrogé sur ses chemins
-               ("unité ssh-agent", "ssh-agent", 7,
-                "0::%s/app.slice/ssh-agent.service\n" % user, {7}, True),
-               ("gestionnaire inconnu", "gpg-agent", 7, unite, set(), True),
-               ("parent autre que le gestionnaire", "gpg-agent", 99, unite, {7}, True),
-               ("lancé par un test, recueilli par le gestionnaire", "gpg-agent", 7,
-                "0::%s/ameesh.slice/ameesh-runner-agent@dev2.service\n" % user, {7}, True),
-               ("sous-cgroup d'une unité déléguée", "gpg-agent", 7,
-                "0::%s/app.slice/x.service/gpg-agent.service\n" % user, {7}, True),
-               ("unité d'un autre utilisateur", "gpg-agent", 7,
-                "0::/user.slice/user-1.slice/user@1.service/gpg-agent.service\n", {7}, True),
-               ("cgroup illisible", "gpg-agent", 7, "", {7}, True))
-        for nom, comm, ppid, cgroup, gestionnaires, doute in cas:
-            with self.subTest(nom):
-                racine = self._faux_proc(comm, uid, ppid=ppid, cgroup=cgroup)
-                with mock.patch.object(platform, "psutil", None), \
-                        mock.patch.object(platform.process, "PROC", racine), \
-                        mock.patch.object(platform.process, "DOUBT_RETRY_S", 0), \
-                        mock.patch.object(platform.process, "service_managers",
-                                          return_value=frozenset(gestionnaires)), \
-                        self._unite(), \
-                        mock.patch.object(platform, "SYSTEM", "linux"):
-                    if doute:
-                        with self.assertRaises(platform.NotAvailable):
-                            platform.holders(__file__, "x")
-                    else:
-                        self.assertEqual(platform.holders(__file__, "x"), [])
-
-    def _unite(self, environnement=None, **champs):
-        """#3195 R2 : la lecture que le gestionnaire fait de l'unité du pid
-        4242 — le fichier du paquet, le home pour dossier ; `champs` remplace
-        un champ. R3 : les réponses de l'agent vivant sur son socket — son
-        pid, puis son `environnement` (un HOME à lui par défaut)."""
-        import contextlib
-        import tempfile
-
-        def show(unite):
-            ligne = {"Id": unite, "MainPID": "4242",
-                     "FragmentPath": "/usr/lib/systemd/user/" + unite, "DropInPaths": "",
-                     "WorkingDirectory": "!" + os.path.expanduser("~"),
-                     "RootDirectory": ""}
-            ligne.update(champs)
-            return ligne
-        env = {"GNUPGHOME": None, "HOME": tempfile.mkdtemp()}
-        self.addCleanup(shutil.rmtree, env["HOME"], True)
-        env.update(environnement or {})
-
-        def reponses(uid, commandes):
-            return ["4242"] + [INTROUVABLE if env.get(c.split()[-1]) is None
-                               else env[c.split()[-1]] for c in commandes[1:]]
-        pile = contextlib.ExitStack()
-        pile.enter_context(mock.patch.object(platform.process, "_unit_show", side_effect=show))
-        pile.enter_context(mock.patch.object(platform.process, "_gpg_agent_query",
-                                             side_effect=reponses))
-        return pile
-
-    def test_3195_r2_les_chemins_configures_de_l_unite_comptent(self):
-        """#3195 R2 (cx1, cx2) : l'identité de l'unité ne prouve pas ses
-        chemins. `holders(dossier)` garde le doute quand le dossier de travail
-        ou le home de clés que le gestionnaire lui donne est dans le dossier,
-        ou quand l'unité n'est pas le fichier du paquet ; il conclut sinon."""
-        if os.geteuid() == 0:
-            self.skipTest("root lit tout : pas de refus de lecture à simuler")
-        import tempfile
-        moi = os.getuid()
-        uid = "%d %d %d %d" % ((moi,) * 4)
-        unite = "0::/user.slice/user-%d.slice/user@%d.service/app.slice/gpg-agent.service\n" \
-            % (moi, moi)
-        dossier = tempfile.mkdtemp()
-        self.addCleanup(shutil.rmtree, dossier, True)
-        dedans = os.path.join(dossier, "node_modules")
-        cas = (("le fichier du paquet, le home", {}, {}, False),
-               ("WorkingDirectory dans le dossier", {"WorkingDirectory": dedans}, {}, True),
-               # R3 (cx1 B2) : le GNUPGHOME de l'agent vivant, pas celui du
-               # gestionnaire maintenant
-               ("GNUPGHOME de l'agent dans le dossier", {},
-                {"GNUPGHOME": dedans + "/.gnupg"}, True),
-               ("HOME de l'agent dans le dossier", {}, {"HOME": dedans}, True),
-               # R4 : un fichier ouvert sous le dossier, que l'agent peut tenir
-               ("un fichier ouvert dans le dossier", {}, {}, "ouvert"),
-               ("un fichier d'unité de l'utilisateur",
-                {"FragmentPath": os.path.expanduser(
-                    "~/.config/systemd/user/gpg-agent.service")}, {}, True),
-               ("un drop-in", {"DropInPaths": "/etc/systemd/user/gpg-agent.service.d/x.conf"},
-                {}, True),
-               ("un autre MainPID", {"MainPID": "1234"}, {}, True))
-        for nom, champs, environnement, doute in cas:
-            with self.subTest(nom):
-                racine = self._faux_proc("gpg-agent", uid, ppid=7, cgroup=unite)
-                with mock.patch.object(platform, "psutil", None), \
-                        mock.patch.object(platform.process, "PROC", racine), \
-                        mock.patch.object(platform.process, "DOUBT_RETRY_S", 0), \
-                        mock.patch.object(platform.process, "service_managers",
-                                          return_value=frozenset({7})), \
-                        self._unite(environnement, **champs), \
-                        mock.patch.object(platform, "SYSTEM", "linux"):
-                    ouvert = None
-                    if doute == "ouvert":
-                        journal = os.path.join(dedans, "gpg.log")
-                        os.makedirs(dedans, exist_ok=True)
-                        open(journal, "w").close()
-                        ouvert = os.open(journal, os.O_RDONLY)
-                    try:
-                        if doute:
-                            with self.assertRaises(platform.NotAvailable):
-                                platform.holders(dossier, "x")
-                        else:
-                            self.assertEqual(platform.holders(dossier, "x"), [])
-                    finally:
-                        if ouvert is not None:
-                            os.close(ouvert)
-                            shutil.rmtree(dedans)
-
-    def _agent_assuan(self, script):
-        """#3195 R3 : un serveur Assuan d'une connexion sur un vrai socket,
-        à la place de celui de gpg-agent : `script(fichier)` lui répond."""
-        import socket
-        import tempfile
-        import threading
-        dossier = tempfile.mkdtemp()
-        self.addCleanup(shutil.rmtree, dossier, True)
-        chemin = os.path.join(dossier, "S.%d")
-        serveur = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        serveur.bind(chemin % os.getuid())
-        serveur.listen(1)
-        self.addCleanup(serveur.close)
-
-        def servir():
-            conn, _ = serveur.accept()
-            with conn, conn.makefile("rwb") as flux:
-                script(flux)
-        fil = threading.Thread(target=servir, daemon=True)
-        fil.start()
-        self.addCleanup(fil.join, 5)
-        return mock.patch.object(platform.process, "GPG_AGENT_SOCKET", chemin)
-
-    def test_3195_r3_dialogue_assuan_avec_l_agent(self):
-        """#3195 R3 : `_gpg_agent_query` parle Assuan à l'agent vivant :
-        données décodées (`%XX`), lignes d'état et commentaires ignorés,
-        `ERR` rendu par son code ; une coupure, une demande (`INQUIRE`), un
-        accueil refusé ou un socket absent rendent None (le doute)."""
-        process = platform.process
-        commandes = ("GETINFO pid", "GETINFO getenv GNUPGHOME", "GETINFO getenv HOME")
-
-        def normal(flux):
-            flux.write(b"OK Pleased to meet you\n")
-            flux.flush()
-            for reponse in (b"D 4242\nOK\n",
-                            b"S PROGRESS x\nERR 67108891 Not found <GPG Agent>\n",
-                            b"# un commentaire\nD /home/a%25b\nD /c\nOK\n"):
-                flux.readline()
-                flux.write(reponse)
-                flux.flush()
-        with self._agent_assuan(normal):
-            self.assertEqual(process._gpg_agent_query(os.getuid(), commandes),
-                             ["4242", INTROUVABLE, "/home/a%b/c"])
-
-        def coupe(flux):
-            flux.write(b"OK\n")
-            flux.flush()
-            flux.readline()
-            flux.write(b"D 4242\n")
-            flux.flush()
-
-        def demande(flux):
-            flux.write(b"OK\n")
-            flux.flush()
-            flux.readline()
-            flux.write(b"INQUIRE PINENTRY\n")
-            flux.flush()
-
-        def refus(flux):
-            flux.write(b"ERR 1 refus\n")
-            flux.flush()
-        for nom, script in (("coupure", coupe), ("INQUIRE", demande), ("accueil", refus)):
-            with self.subTest(nom), self._agent_assuan(script):
-                self.assertIsNone(process._gpg_agent_query(os.getuid(), commandes, timeout=5))
-        with mock.patch.object(process, "GPG_AGENT_SOCKET", "/nonexistent/S.%d"):
-            self.assertIsNone(process._gpg_agent_query(os.getuid(), commandes))
-
-    def test_3195_r3_le_home_gnupg_de_l_agent_vivant(self):
-        """#3195 R3 (cx1 B2) : le home GnuPG est celui que l'agent vivant
-        donne (`GNUPGHOME`, sinon `HOME`/.gnupg, sinon celui de passwd)."""
-        import tempfile
-        process = platform.process
-        moi = os.getuid()
-        racine = self._faux_proc("gpg-agent", "%d %d %d %d" % ((moi,) * 4))
-        home = tempfile.mkdtemp()
-        self.addCleanup(shutil.rmtree, home, True)
-
-        def agent(gnupghome=INTROUVABLE, maison=home):
-            return lambda uid, commandes: ["4242", gnupghome, maison]
-        with mock.patch.object(process, "PROC", racine):
-            self.assertEqual(process._gpg_agent_home(4242, moi, agent()),
-                             os.path.join(home, ".gnupg"))
-            self.assertEqual(process._gpg_agent_home(4242, moi, agent("/srv/cles")),
-                             "/srv/cles")
-            with mock.patch.object(process, "_home_of", return_value="/home/passwd"):
-                self.assertEqual(process._gpg_agent_home(4242, moi, agent(maison=INTROUVABLE)),
-                                 "/home/passwd/.gnupg")
-
-    def test_3195_r4_preuve_noyau_des_fichiers_ouverts(self):
-        """#3195 R4 (cx1, cx2) : aucune configuration ne dit les fichiers
-        qu'un agent illisible a ouverts (un `log-file` lu au démarrage, la
-        configuration supprimée depuis). `open_files_proof` les fait prouver
-        par le noyau : un bail en écriture n'est accordé que si aucune autre
-        description ouverte — lecture, écriture, projection — ne vise le
-        fichier. Ce qui ne se prouve pas est une raison, donc un doute."""
-        import mmap
-        import tempfile
-        process = platform.process
-        dossier = tempfile.mkdtemp()
-        self.addCleanup(shutil.rmtree, dossier, True)
-        journal = os.path.join(dossier, "node_modules", "gpg.log")
-        os.makedirs(os.path.dirname(journal))
-        with open(journal, "w") as fh:
-            fh.write("x" * 16)
-        self.assertEqual(process.open_files_proof(dossier), "")
-        self.assertEqual(process.open_files_proof(os.path.join(dossier, "absent")), "")
-        lecteur = os.open(journal, os.O_RDONLY)
-        try:
-            self.assertEqual(process.open_files_proof(dossier),
-                             "%s: open elsewhere" % journal)
-            self.assertEqual(process.open_files_proof(journal),
-                             "%s: open elsewhere" % journal)
-        finally:
-            os.close(lecteur)
-        with open(journal, "r+b") as fh:
-            projection = mmap.mmap(fh.fileno(), 16)
-        try:   # descripteur fermé, projection vivante : toujours tenu
-            self.assertIn("open elsewhere", process.open_files_proof(dossier))
-        finally:
-            projection.close()
-        # un lien n'est pas suivi : la cible ouverte ailleurs n'est pas sous `dossier`
-        dehors = tempfile.NamedTemporaryFile()
-        self.addCleanup(dehors.close)
-        os.symlink(dehors.name, os.path.join(dossier, "lien"))
-        self.assertEqual(process.open_files_proof(dossier), "")
-        os.mkfifo(os.path.join(dossier, "tube"))
-        self.assertIn("not a regular file", process.open_files_proof(dossier))
-        os.remove(os.path.join(dossier, "tube"))
-        if os.geteuid() != 0:
-            ferme = os.path.join(dossier, "ferme")
-            os.makedirs(ferme)
-            os.chmod(ferme, 0)
-            self.addCleanup(os.chmod, ferme, 0o700)
-            self.assertIn("walk incomplete", process.open_files_proof(dossier))
-            os.chmod(ferme, 0o700)
-        # un noyau dont le bail ne compte pas les lecteurs ne prouve rien
-        with mock.patch.object(process, "_LEASE_SELF_TEST", []), \
-                mock.patch.object(process, "_lease_refused", return_value=""):
-            self.assertIn("does not see another reader", process.open_files_proof(dossier))
-        self.assertEqual(process.open_files_proof(dossier), "")
 
     def test_allow_ne_cache_pas_un_detenteur_constate(self):
         """L230 : `allow` ne lève que le DOUTE ; un processus lisible qui tient
