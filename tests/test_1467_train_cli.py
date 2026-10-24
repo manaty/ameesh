@@ -101,6 +101,39 @@ class TrainCommandTest(PgTestCase):
         self.assertEqual(json.loads(output.getvalue())["state"], "revoked")
         db.close.assert_called_once_with()
 
+    def test_requalify_command_is_pilot_gated_and_closes_its_connection(self):
+        cfg = types.SimpleNamespace()
+        db = mock.Mock(wraps=self.db)
+        with mock.patch.object(train_cli.config, "load", return_value=cfg), \
+                mock.patch.object(train_cli.db_mod, "open_db", return_value=db), \
+                mock.patch.object(train_cli, "_pilot", return_value="pilot") as pilot, \
+                mock.patch.object(train_cli.train_requalify, "execute",
+                                  return_value={"state": "requalified"}) as execute, \
+                contextlib.redirect_stdout(io.StringIO()) as output:
+            result = train_cli.main(["--project", "ameesh", "requalify",
+                                     "--lot", "3366"])
+        self.assertEqual(result, 0)
+        self.assertEqual(json.loads(output.getvalue()), {"state": "requalified"})
+        pilot.assert_called_once_with(cfg, db, "train requalify")
+        execute.assert_called_once_with(cfg, db, "ameesh", lot=3366,
+                                        actor="pilot", dry_run=False)
+        db.close.assert_called_once_with()
+
+    def test_requalify_dry_run_passes_the_flag(self):
+        cfg = types.SimpleNamespace()
+        db = mock.Mock(wraps=self.db)
+        with mock.patch.object(train_cli.config, "load", return_value=cfg), \
+                mock.patch.object(train_cli.db_mod, "open_db", return_value=db), \
+                mock.patch.object(train_cli, "_pilot", return_value="pilot"), \
+                mock.patch.object(train_cli.train_requalify, "execute",
+                                  return_value={"state": "requalified",
+                                                "dry_run": True}) as execute, \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(train_cli.main(["--project", "ameesh", "requalify",
+                                             "--lot", "3366", "--dry-run"]), 0)
+        execute.assert_called_once_with(cfg, db, "ameesh", lot=3366,
+                                        actor="pilot", dry_run=True)
+
     def test_abandon_terminates_an_unfired_plan_and_frees_the_lease(self):
         item, document = self.unfired()
         with mock.patch.object(work, "corrector", return_value="pilot") as guard:

@@ -13,6 +13,7 @@ import subprocess
 import tempfile
 import types
 import unittest
+from unittest import mock
 from ameesh import (config, review_provenance, train, train_assembly, train_canon,
                     train_contracts, train_reservation, train_runner, train_shadow)
 
@@ -285,6 +286,77 @@ class AssemblyTest(unittest.TestCase):
         project.pop("deadline_minutes")
         with self.assertRaisesRegex(train.TrainError, "missing key"):
             self.assemble(train=dict(self.config, projects={"ameesh": project}))
+
+    def test_live_reload_follows_the_effective_pin_and_refuses_a_bad_one(self):
+        """#3366: the service re-reads the pin without a runner restart."""
+        self.canon.write("docs/guide.md", "guide\n")
+        new = self.canon.commit("docs only")
+        result = self.assemble()
+        passage, = result.passages
+        self.assertTrue(callable(result.refresh))
+        fresh = types.SimpleNamespace(
+            host="host-a", train=dict(self.config, projects={
+                "ameesh": dict(self.config["projects"]["ameesh"], canon_commit=new)}))
+        with mock.patch.object(train_assembly.config_mod, "load", return_value=fresh):
+            changes = result.refresh()
+        self.assertEqual(changes, [{"project": "ameesh", "previous": self.commit,
+                                    "pin": new, "canon": self.canon.root}])
+        self.assertEqual(passage.policy_commit, new)
+        self.assertEqual(passage.canon.pin, new)
+        # the next passage reads the gate at the new pin; its rules follow it
+        passage.canon.reader = lambda db: (new, "")
+        with mock.patch.object(train_canon, "gate_rules_gap", return_value="") as gap:
+            self.assertEqual(passage.canon.rules(object()), "")
+            self.assertTrue(passage.canon.read(None).aligned)
+        self.assertEqual(gap.call_args.args[2], "ameesh")
+        self.assertEqual(gap.call_args.kwargs["pin"], new)
+        self.assertEqual(gap.call_args.kwargs["canon_path"], self.canon.root)
+        # a non-pin assembly change is a restart, never a silent half-reload
+        changed = types.SimpleNamespace(
+            host="host-a", train=dict(self.config, mode="active", projects={
+                "ameesh": dict(self.config["projects"]["ameesh"], canon_commit=new)}))
+        with mock.patch.object(train_assembly.config_mod, "load", return_value=changed):
+            with self.assertRaisesRegex(train.TrainError, "restart the runner"):
+                result.refresh()
+        self.assertEqual(passage.policy_commit, new)
+        # an unreadable pin is a named refusal, never a silent fallback
+        broken = types.SimpleNamespace(
+            host="host-a", train=dict(self.config, projects={
+                "ameesh": dict(self.config["projects"]["ameesh"], canon_commit="a" * 40)}))
+        with self.assertRaisesRegex(train.TrainError, "commit not found"):
+            train_assembly.reload(result.passages, load=lambda: broken)
+        self.assertEqual(passage.policy_commit, new)
+        # a service asked from another host refuses the configuration
+        with self.assertRaisesRegex(train.TrainError, "designates host-a"):
+            train_assembly.reload(result.passages, load=lambda: fresh,
+                                  host="host-b")
+
+    def test_refresh_reads_the_profile_on_disk_without_a_restart(self):
+        """#3366: the effective file (host + profile) is what the service rereads."""
+        self.canon.write("docs/guide.md", "guide\n")
+        new = self.canon.commit("docs only")
+        host = os.path.join(self.tmp.name, "host-config.json")
+        profile = os.path.join(self.tmp.name, "critiques.json")
+        with open(host, "w", encoding="utf-8") as target:
+            json.dump({"host": "host-a", "train": self.config}, target)
+        with open(profile, "w", encoding="utf-8") as target:
+            json.dump({"inherit": host, "train": {"projects": {
+                "ameesh": {"canon_commit": new}}}}, target)
+        cfg = types.SimpleNamespace(**dict(vars(self.cfg), config_path=profile,
+                                           config_base=host))
+        result = train_assembly.assemble(cfg)
+        passage, = result.passages
+        self.assertEqual(passage.policy_commit, self.commit)
+        changes = result.refresh()
+        self.assertEqual(changes, [{"project": "ameesh", "previous": self.commit,
+                                    "pin": new, "canon": self.canon.root}])
+        self.assertEqual(passage.policy_commit, new)
+        # a mode change read from the same file still needs the runner restart
+        with open(profile, "w", encoding="utf-8") as target:
+            json.dump({"inherit": host, "train": {"mode": "active"}}, target)
+        with self.assertRaisesRegex(train.TrainError, "restart the runner"):
+            result.refresh()
+        self.assertEqual(passage.policy_commit, new)
 
     def test_config_load_carries_the_raw_train_key(self):
         path = os.path.join(self.tmp.name, "config.json")
