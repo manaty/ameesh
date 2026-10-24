@@ -184,6 +184,22 @@ class UserPathsTest(_Base):
             self.assertIn("unreadable", platform.user_paths().doubt())
 
     @unittest.skipIf(os.getuid() == 0, "root reads everything")
+    def test_3195_r2_what_was_read_before_a_refusal_is_kept(self):
+        """#3195 R2 (cx1, cx2 witness): a process let through by its name,
+        its cwd readable in a worktree but its descriptors refused, still
+        holds that worktree: an observation is never dropped for what could
+        not be read after it."""
+        wt = self.worktree()
+        self.fake_process(23, comm="btop", cwd=os.path.join(wt, "node_modules"),
+                          unreadable=True)
+        scan = platform.user_paths(allow=["btop"])
+        self.assertEqual((scan.doubt(), scan.allowed), ("", ["23 btop"]))
+        self.assertEqual(scan.holders(wt), ["23 btop"])
+        out = self.go(wt, allow=["btop"])
+        self.assertEqual(out["entries"], [])
+        self.assertIn("process inside (23 btop)", " ".join(out["skipped"]))
+
+    @unittest.skipIf(os.getuid() == 0, "root reads everything")
     def test_a_zombie_is_not_a_doubt(self):
         """#1678 : un zombie (état Z) n'est plus qu'une entrée de table — ses
         liens /proc illisibles ne sont pas un doute (constat #1665 :
@@ -281,6 +297,37 @@ class RunTest(_Base):
         self.assertEqual(len(out["plan"]), 3)
         self.assertTrue(all(p["bytes"] > 0 and p["action"] == "suppression" for p in out["plan"]))
         self.assertTrue(os.path.isdir(os.path.join(wt, "node_modules")))
+
+    @unittest.skipIf(os.getuid() == 0, "root reads everything")
+    def test_3195_dry_run_under_a_doubt_still_lists_the_plan(self):
+        wt = self.worktree()
+        self.fake_process(23, comm="btop", unreadable=True)
+        out = self.go(wt, dry_run=True)
+        self.assertEqual(len(out["plan"]), 3)
+        self.assertIn("artifacts: --apply would delete nothing, process(es) of the user "
+                      "unreadable: 23 btop",
+                      out["skipped"])
+        out = self.go(wt)
+        self.assertEqual((out["entries"], out["plan"]), ([], []))
+        self.assertIn("artifacts: nothing deleted, process(es) of the user unreadable: 23 btop",
+                      out["skipped"])
+        self.assertTrue(os.path.isdir(os.path.join(wt, "node_modules")))
+
+    def test_3195_keep_holds_an_idle_worktree(self):
+        wt = self.worktree()
+        out = self.go(wt, keep=lambda candidate: "lot #12 qa")
+        self.assertEqual((out["entries"], out["plan"]), ([], []))
+        self.assertIn("artifacts: 1 idle worktree(s) kept (open lot or turn in progress): "
+                      "%s: lot #12 qa" % wt, out["skipped"])
+
+        def unreadable(candidate):
+            raise RuntimeError("db down")
+
+        out = self.go(wt, keep=unreadable)
+        self.assertEqual(out["entries"], [])
+        self.assertIn("open lot not ruled out (RuntimeError)", " ".join(out["skipped"]))
+        self.assertTrue(os.path.isdir(os.path.join(wt, "node_modules")))
+        self.assertEqual(len(self.go(wt, keep=lambda candidate: "")["entries"]), 3)
 
     def test_shared_link_and_read_only_dirs(self):
         wt = self.worktree()
@@ -930,20 +977,75 @@ class MergedKeptTest(_Repo):
 
 
 class ArtifactPassTest(_Repo):
+    def artifact_pass(self, lots, *, running=(), dry_run=False, rows=()) -> dict:
+        with mock.patch.object(menage.storage, "of", return_value=_Store(list(rows), lots)):
+            return menage._artifact_pass(None, "pc", menage.Policy(),
+                                         cwd_of={"dev2": self.main}, dry_run=dry_run,
+                                         now=time.time() + LATER,
+                                         lock_path=os.path.join(self.base, "a.lock"),
+                                         journal_path=self.journal_path,
+                                         running=running, known_agents=("dev1", "dev2"))
+
     def test_pass_covers_agents_repositories_and_owner(self):
         wt = self.add_worktree("lot-5")
         _write(os.path.join(wt, "node_modules", "a.js"))
         _write(os.path.join(self.main, "node_modules", "main.js"))
-        store = _Store([], {})
-        with mock.patch.object(menage.storage, "of", return_value=store):
-            out = menage._artifact_pass(None, "pc", menage.Policy(),
-                                        cwd_of={"dev2": self.main}, dry_run=False,
-                                        now=time.time() + LATER,
-                                        lock_path=os.path.join(self.base, "a.lock"),
-                                        journal_path=self.journal_path)
+        out = self.artifact_pass({})
+        # #3195: a worktree of the clone dev2 works in is dev2's
         self.assertEqual([(os.path.realpath(e["path"]), e["agent"]) for e in out["entries"]],
-                         [(os.path.realpath(os.path.join(wt, "node_modules")), None)])
+                         [(os.path.realpath(os.path.join(wt, "node_modules")), "dev2")])
         self.assertTrue(os.path.exists(os.path.join(self.main, "node_modules", "main.js")))
+
+    def test_3195_idle_worktree_purged_open_lot_or_turn_kept(self):
+        """The lot's witness: an idle worktree with node_modules is purged, the
+        worktree of an open lot (named by its directory or its branch) and the
+        worktrees of an agent in turn are not; the dry run lists them."""
+        ended = self.add_worktree("lot-5")
+        named = self.add_worktree("lot-6")
+        branch = os.path.join(self.base, "copy")
+        _git("worktree", "add", "-q", "-b", "lot/7-slug", branch, cwd=self.main)
+        for wt in (ended, named, branch):
+            _write(os.path.join(wt, "node_modules", "a.js"))
+        lots = {5: "merged", 6: "qa", 7: "intake"}
+        out = self.artifact_pass(lots, running={"dev2"})
+        self.assertEqual(out["entries"], [])
+        self.assertIn("3 idle worktree(s) kept", " ".join(out["skipped"]))
+        self.assertIn("turn in progress for dev2", " ".join(out["skipped"]))
+        out = self.artifact_pass(lots, running={"dev1"}, dry_run=True)
+        self.assertEqual([os.path.realpath(p["path"]) for p in out["plan"]],
+                         [os.path.realpath(os.path.join(ended, "node_modules"))])
+        out = self.artifact_pass(lots, running={"dev1"})
+        self.assertEqual([os.path.realpath(e["path"]) for e in out["entries"]],
+                         [os.path.realpath(os.path.join(ended, "node_modules"))])
+        self.assertFalse(os.path.lexists(os.path.join(ended, "node_modules")))
+        skipped = " ".join(out["skipped"])
+        self.assertIn("lot #6 qa", skipped)
+        self.assertIn("lot #7 intake", skipped)
+        for wt in (named, branch):
+            self.assertTrue(os.path.exists(os.path.join(wt, "node_modules", "a.js")))
+
+    def test_3195_r2_the_recorded_lot_of_a_tracked_worktree_keeps_it(self):
+        """R2 B2 (cx1): a tracked worktree whose branch and directory name no
+        lot (`scratch`) keeps its build output while the lot it was
+        registered for is open; an unreadable record keeps it too; once the
+        lot is merged, the output goes."""
+        scratch = os.path.join(self.base, "scratch")
+        _git("worktree", "add", "-q", "-b", "scratch", scratch, cwd=self.main)
+        _write(os.path.join(scratch, "node_modules", "a.js"))
+
+        def row(lot):
+            return {"id": 9, "path": scratch, "agent": "dev2", "lot": lot,
+                    "repo": menage.common_dir(self.main), "status": "active",
+                    "branch": "scratch", "detail": ""}
+        out = self.artifact_pass({123: "qa"}, running={"dev1"}, rows=[row("123")])
+        self.assertEqual(out["entries"], [])
+        self.assertIn("lot #123 qa", " ".join(out["skipped"]))
+        out = self.artifact_pass({}, running={"dev1"}, rows=[row("#12x")])
+        self.assertEqual(out["entries"], [])
+        self.assertIn("recorded lot '#12x' unreadable", " ".join(out["skipped"]))
+        out = self.artifact_pass({123: "merged"}, running={"dev1"}, rows=[row("123")])
+        self.assertEqual([os.path.realpath(e["path"]) for e in out["entries"]],
+                         [os.path.realpath(os.path.join(scratch, "node_modules"))])
 
 
 if __name__ == "__main__":
