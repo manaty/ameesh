@@ -88,6 +88,10 @@ class ModuleConfigurationTest(unittest.TestCase):
 
     def test_module_refusal_is_per_lot_but_other_database_errors_propagate(self):
         store = mock.Mock()
+        # #3022 : la garde de porte de production lit la marque du lot sous
+        # son verrou de ligne ; un lot sans marque ne lit rien d'autre.
+        store.work.lock.return_value = {"id": 1, "state": "qa", "app": "acme"}
+        store.progress.lot_hold_events.return_value = []
         # MagicMock : la fermeture ouvre sa transaction (et prend le verrou de
         # graphe) avant l'écriture du stockage.
         with mock.patch.object(work, "get", return_value={"id": 1, "state": "qa"}), \

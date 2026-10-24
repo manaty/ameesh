@@ -2322,6 +2322,10 @@ def close_merged(db: Db, item_id: int, *, sha: str = "", actor: str = "", source
     `landed` (#1567) : `(numéro, dépôt)` du numéro réellement atterri, écrit
     dans la transaction de la fusion ; l'appelant l'a validé et réservé.
 
+    #3022 (canon §5) : sous le même verrou, un lot marqué `prod-gate:` n'est
+    fermé que si son correctif est sur la branche de prod de son projet
+    (`prod_gate.check`) ; sinon `withheld`, motif « en attente prod ».
+
     `content_guard` (#2744) : callable `(storage, row) -> retention | None`,
     appelé **sous le verrou de ligne du lot**, juste avant la fermeture ; une
     retenue rend `withheld` sans rien écrire. Une retenue `lift: True` (#3219,
@@ -2393,10 +2397,24 @@ def close_merged(db: Db, item_id: int, *, sha: str = "", actor: str = "", source
             with db.transaction() as tx:
                 work_dependencies.lock(tx)
                 closure_note = note
-                if content_guard is not None and not storage.is_remote(db):
+                if not storage.is_remote(db):
                     locked = storage.of(tx).work.lock(item_id)
                     if locked is not None:
-                        retention = content_guard(storage.of(tx), locked)
+                        retention = (content_guard(storage.of(tx), locked)
+                                     if content_guard is not None else None)
+                        if retention is None or retention.get("lift"):
+                            # #3022 (canon §5) : un lot de porte de production
+                            # ne se ferme que présent sur la branche de prod,
+                            # quelle que soit la voie du constat — y compris
+                            # quand le contenu lève le hold de l'assigné (#3219).
+                            from . import prod_gate
+                            gate = prod_gate.check(storage.of(tx), locked, sha=sha,
+                                                   repo=repo, cfg=getattr(db, "cfg", None))
+                            if gate["retention"] is not None:
+                                retention = gate["retention"]
+                            if gate["proof"] is not None:
+                                closure_note = "%s — %s" % (
+                                    closure_note, prod_gate.proof_text(gate["proof"]))
                         if retention is not None:
                             if retention.get("what") == "unreadable":
                                 return {"id": int(item_id), "result": "error",
@@ -2411,7 +2429,7 @@ def close_merged(db: Db, item_id: int, *, sha: str = "", actor: str = "", source
                             # ordinaire de l'assigné ; la note de fusion dit
                             # la levée (le journal garde la trace).
                             closure_note = "%s — %s" % (
-                                note, retention.get("motif")
+                                closure_note, retention.get("motif")
                                 or "hold de l'assigné levé par le contenu")
                 row = storage.of(tx).work.close_merged(
                     item_id, current=state, sha=sha, actor=actor, note=closure_note,
