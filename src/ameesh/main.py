@@ -46,6 +46,11 @@
         decisions waiting for a human, across all projects: agent requests
         (L124, oldest first), gated actions; apart, decisions written in prose
         in mail and work items waiting with no question (L233, not requests);
+  ameesh debit [--json] [--check] [--hours N] [--threshold 2h]
+        débit mesuré sur les jalons (canon 24/10/2026) : lots en qa/blocked par
+        âge, avis dus par relecteur, avis bloquants non traités, holds et
+        réveils, agents au repos avec du travail dû, tours et fusions par
+        heure, durée de CI par job ; `--check` sort 2 sur une attente > seuil ;
   ameesh deps link|local|unlink|status|entries node_modules shared per lockfile (#248);
   ameesh device enroll|challenge|show   device-side enrollment, in the VM (L110);
   ameesh doctor               schema and diagnostics;
@@ -308,6 +313,11 @@ def _dispatch(argv: list[str] | None) -> int:
     if command == "progress":
         from . import progress
         return progress.main(rest)
+    if command == "debit":
+        # canon 24/10/2026 : l'auditeur commence chaque passage par le débit,
+        # mesuré sur les jalons (jamais sur les colonnes d'un lot).
+        from . import debit
+        return debit.main(rest)
     if command == "process":
         # #2225 : vérifier le bloc `workflow:` d'une carte Process du canon
         from . import process_card

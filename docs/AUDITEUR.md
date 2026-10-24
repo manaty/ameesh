@@ -64,6 +64,27 @@ Au plus une dizaine de commandes de lecture, les gestes permis, puis le
 rapport. Un passage court ne code pas et ne creuse pas : un incident notable
 (voir « Analyse profonde ») y ouvre une analyse profonde.
 
+### Débit d'abord
+
+Chaque passage court commence par le débit, avant la liste de contrôle :
+`ameesh debit --json` (le tableau court s'affiche sans `--json`). La mesure
+est lue **sur les jalons** — gels, avis, fusions, runs de CI, journal — et
+jamais sur les colonnes d'un lot (`state`, `reviewer`/`reviewers`, `wake_at`,
+`updated_at`), qui peuvent être périmées : l'erreur du bureau du 24/10 à
+03:20Z a annoncé des avis dus depuis la colonne `reviewer`. Le rapport porte
+les lots en `qa` et en avis bloquant par âge depuis le dernier gel, les avis
+dus par relecteur, les holds et réveils avec leur cause, les holds sur un
+appareil déclaré indisponible (interdits, canon §12), les lots retenus par un
+correctif fusionné non déployé, les agents au repos avec du travail dû, les
+tours et fusions par heure, et la durée des runs de CI par workflow puis par
+job.
+
+Toute attente de plus de 2 h qui ne dépend pas d'un humain est traitée dans
+l'heure, par lui (niveau 1) ou par le pilote nommé ; le rapport cite pour
+chacune le geste fait. `ameesh debit --check` sort 2 quand une telle attente
+existe : un passage qui conclut « rien à signaler » avec une attente de plus
+de 2 h est un défaut de son travail.
+
 ### Liste de contrôle
 
 Chaque commande accepte `--json` quand elle est indiquée ainsi ; l'auditeur lit
@@ -71,6 +92,7 @@ le JSON plutôt que le texte.
 
 | # | Point | Commandes | Signe d'un problème |
 |---|---|---|---|
+| 0 | **Débit (en premier)** | `ameesh debit --json` (`--check` pour le code de sortie) | `slow_waits` non vide (attente de plus de 2 h sans geste) ; `device_holds` ou `undeployed_holds` non vides ; `reviews_by_reviewer` (avis dus) ; `idle_agents_with_work` ; `ci.slow_runs` et `ci.slow_jobs` (le job macOS de 3 à 4 h avant #3198) |
 | 1 | Agents bloqués, arrêtés ou à vide | `ameesh list`, `ameesh show <agent>`, `ameesh alerts --json` | `stopped_with_mail`, `idle_with_mail`, `dead_runner`, `host_not_ready` ; agent au repos avec un lot actionnable (`idle_actionable_lot`, niveau 1 : il relance) ; `critical_budget_pause` (urgent, L242b) : un orchestrateur, l'agent de conception ou un auditeur en pause budget |
 | 2 | Tours longs, sessions qui grossissent | `ameesh alerts --json`, `ameesh cost turns` | `long_turn`, `session_too_big`, `stale_lot` |
 | 3 | Forfaits | `ameesh accounts list` | capacité perdue à la prochaine remise à zéro (`plan_underused`), compte au seuil de rythme, compte forcé depuis longtemps |
@@ -648,6 +670,11 @@ FIN
 | « Idle capacity: … » qui cite des lots ouverts sans agent, toujours vrai à son passage 30 min ou plus après le courrier (L165b) | `ameesh work assign <lot> <agent>` (un agent au repos de l'équipe du lot, le lot le plus prioritaire d'abord), puis `agent-mail send <agent> "…" --lot <lot>` pour le réveiller | `ameesh work assign <lot> <autre>` |
 | dépense au-dessus de l'estimation | `ameesh budget set --per-hour X [--per-day Y] [--agent A]`, **uniquement vers le bas**, et seulement si la dépense de la fenêtre en cours reste sous le nouveau plafond | `ameesh budget set` à l'ancienne valeur, par un humain |
 | CI en file, réserve arrêtée ; ou réserve inactive | `"$AUDITEUR_RESERVE_DIR"/demarrer-reserve.sh` ou `arreter-reserve.sh` | le script inverse |
+| avis dû depuis plus de 2 h sur la tête gelée (`reviews_by_reviewer`) | relancer le relecteur avec la liste de ses avis dus (le débit la porte : `agent-mail send <relecteur> "…" --lot <lot>`) ; au repos, `ameesh resume <relecteur>` | le verdict rendu, ou la redésignation |
+| relecteur au repos, surchargé ou muet depuis plus de 2 h | redésigner un agent de l'autre famille au repos : `ameesh work reviewer <lot> <agent>` ; retirer l'ancien : `ameesh work reviewer <lot> --remove <ancien>` | redésigner l'ancien |
+| goulot mesuré : le débit montre que cet agent porte le plus d'avis dus ou la plus vieille attente | accélérer **cet** agent : `ameesh set <agent> model=<modèle plus rapide> effort=<niveau>`, **dans les forfaits existants**, jamais sous `medium`, jamais de changement de famille d'un rôle critique ; relever l'ancien réglage (`ameesh show <agent> --json`) et le rétablir dès que le goulot est levé | `ameesh set <agent>` aux anciennes valeurs |
+| avis bloquant non traité : l'auteur travaille ailleurs depuis plus de 2 h (`blocked_reviews`) | relancer l'auteur sur le correctif et le gel dû ; sans mouvement, le pilote réassigne (canon §9 ×2) | le nouveau gel de l'auteur |
+| hold sans objet : appareil déclaré indisponible (`device_holds`) ou correctif fusionné non déployé (`undeployed_holds`) | demander au pilote (`agent-mail send mesh-design …`) la levée du hold et, pour un correctif non déployé, le staging hors créneau (canon §11 bis) | le hold reposé avec sa cause |
 
 *Hors tour* : `ameesh show <agent> --json` ne dit pas `running`. Un agent en tour
 qui tourne en rond, une dépense qu'il faudrait couper tout de suite : il alerte
@@ -863,7 +890,10 @@ le fil du projet que lit le propriétaire.
 * **Chaque passage court** : un rapport court, en langage courant :
   `agent-mail send mesh-design "Audit 14:00 : …" --kind event`. Trois parties
   au plus : ce qui va mal, ce qu'il a fait (avec l'inverse), ce qu'il propose.
-  Rien à signaler : une ligne (« Audit 14:00 : rien à signaler »).
+  Il **commence par le tableau de débit** (`ameesh debit`) et, pour chaque
+  attente de plus de 2 h, par le geste fait (niveau 1) ou le pilote nommé.
+  « Rien à signaler » avec une attente de plus de 2 h est un défaut ; sans
+  aucune attente, une ligne (« Audit 14:00 : rien à signaler »).
 * **Chaque analyse profonde** : dix lignes au plus,
   `agent-mail send mesh-design "Analyse profonde du 2026-10-11 (24 h) : …"
   --kind event`. Le temps perdu trouvé ; les causes racines, une ligne chacune
