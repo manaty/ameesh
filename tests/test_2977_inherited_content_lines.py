@@ -198,9 +198,14 @@ class CommitSurvivesTest(TestCase):
 
     def test_only_inherited_additions_fall_back_to_the_removed_lines(self):
         # Le correctif ne fait que recopier une ligne de la base et retirer une
-        # ligne : la lecture passe aux lignes retirées.
-        self.repo.write("a.py", "existing_call_here()\nremoved_by_fix()\n")
+        # ligne du lot (absente de la base de fusion) : la lecture passe aux
+        # lignes retirées, et ce retrait vacant ne garde pas l'auteur quand la
+        # tête repart du lot sans la copie. (Un retrait effectif et pur, lui,
+        # garde l'auteur même réintroduit : arbitrage B11/B12, cf. #3220.)
+        self.repo.write("a.py", "existing_call_here()\n")
         base = self.repo.commit("base")
+        self.repo.write("a.py", "existing_call_here()\nremoved_by_fix()\n")
+        self.repo.commit("lot: contenu antérieur")
         self.repo.write("a.py", "existing_call_here()\n")
         self.repo.write("b.py", "existing_call_here()\n")
         fix = self.repo.commit("fix", agent="cx3")

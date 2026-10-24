@@ -1091,18 +1091,18 @@ def _inherited_lines(repo: str, head: str, sha: str, base: str,
 
 
 def _removal_proves_survival(repo: str, head: str, sha: str, path: str,
-                             row: str, added, base: str,
+                             row: str, base: str,
                              cache: dict) -> bool:
-    """Un retrait prouve-t-il la survie quand les ajouts propres ont disparu ?
+    """Un retrait est-il **effectif** et **pur**, donc tenu pour conservé ?
 
-    #2994/#2614 (revue dev7, précisé par mesh-design) : non, si la ligne
-    retirée n'existe pas dans la base de fusion de la tête et de la cible au
-    même chemin **ou au chemin renommé `R`** : une tête repartie de la base ne
-    l'a jamais reçue, son absence ne dit rien du correctif. Non aussi quand
-    elle est le côté retiré d'une modification dont les ajouts propres ont
-    disparu (le retrait n'est alors que l'autre moitié d'une réécriture). Une
-    lecture impossible reste un doute : le retrait compte (l'auteur est
-    conservé)."""
+    mesh-design (arbitrage B11) : un retrait effectif par rapport à la base de
+    fusion (la ligne y existait au même chemin, ou au chemin renommé `R`) et
+    pur (son hunk n'ajoute aucune ligne) est tenu pour conservé, même si la
+    tête a réintroduit les lignes ; c'est une sur-rétention acceptée, dans le
+    sens sûr. #2994/#2614 : un retrait vacant (la base ne l'a jamais porté) ou
+    le côté retiré d'une modification (le hunk ajoute une ligne, même héritée :
+    un réordre n'est pas un retrait pur) ne prouve rien. Une lecture impossible
+    reste un doute : le retrait compte (l'auteur est conservé)."""
     if not base:
         return True
     key = ("merge-base", head, base)
@@ -1135,11 +1135,10 @@ def _removal_proves_survival(repo: str, head: str, sha: str, path: str,
     blocks = _removal_hunks(repo, sha, path, cache)
     if blocks is None:
         return True
-    own = {line.strip() for other, line in added if other == path}
     for block in blocks:
         if row.strip() not in {value.strip() for value in block["removed"]}:
             continue
-        if any(value.strip() in own for value in block.get("added", ())):
+        if block.get("added"):
             return False                # côté retiré d'une modification
     return True
 
@@ -1163,11 +1162,14 @@ def _commit_survives(repo: str, head: str, sha: str, cache: dict,
 
     #3220 : si aucune de ces lignes ne subsiste nulle part, le contenu n'a pas
     forcément disparu : la lecture examine encore les lignes retirées. Un
-    retrait conservé (la ligne n'est plus dans la tête au chemin d'origine)
-    garde l'auteur, sauf quand le commit a des additions propres qui ont toutes
-    disparu et que le chemin était encore présent après le commit : une
-    suppression ultérieure a pu emporter l'édition entière (#3220 B2, revue
-    dev2). Les copies se lisent ensuite : une copie encore à son chemin, avec
+    retrait **effectif** par rapport à la base de fusion et **pur** garde
+    l'auteur, même si la tête a réintroduit la ligne au même chemin (#3220
+    B12, arbitrage mesh-design : sur-rétention acceptée) ; la présence de la
+    ligne ne défait pas le retrait. Sinon, un retrait conservé (la ligne n'est
+    plus dans la tête au chemin d'origine) garde l'auteur, sauf quand le commit
+    a des additions propres qui ont toutes disparu et que le chemin était
+    encore présent après le commit : une suppression ultérieure a pu emporter
+    l'édition entière (#3220 B2, revue dev2). Les copies se lisent ensuite : une copie encore à son chemin, avec
     une occurrence de plus que dans le parent, garde l'auteur (#2977) ; une
     copie à un chemin prouvé absent ne le garde pas dans ce même cas, sinon une
     ligne d'en-tête commune rouvrirait #3216 (revue mesh-design). Quand des
@@ -1264,7 +1266,7 @@ def _commit_survives(repo: str, head: str, sha: str, cache: dict,
             allow_removal = (lambda block_path, block_row:
                              _removal_proves_survival(
                                  repo, head, sha, block_path, block_row,
-                                 added, base, cache))
+                                 base, cache))
             if path_removed and not all(
                     allow_removal(path, row) for row in path_removed):
                 # #2994/#2614 : le contenu du fichier peut être celui de la
@@ -1331,12 +1333,21 @@ def _commit_survives(repo: str, head: str, sha: str, cache: dict,
                 # #2994/#2614 (revue dev7) : quand les ajouts propres du
                 # commit ont tous disparu, un retrait ne prouve la survie que
                 # s'il portait sur une ligne déjà dans la base de fusion au
-                # même chemin, et s'il n'est pas le côté retiré d'une
-                # modification dont les ajouts ont disparu. Sinon la tête,
-                # repartie de la base, n'a jamais reçu cette ligne.
+                # même chemin, et si c'est un retrait pur (pas le côté retiré
+                # d'une modification). Sinon la tête, repartie de la base, n'a
+                # jamais reçu cette ligne.
                 if added and not _removal_proves_survival(
-                        repo, head, sha, path, row, added, base, cache):
+                        repo, head, sha, path, row, base, cache):
                     continue
+                return True
+            # B12 (revues auditeur + cx3) : la ligne retirée est revenue **au
+            # même chemin** (tête repartie de la base, correctif non rejoué).
+            # mesh-design (arbitrage B11) : un retrait effectif par rapport à
+            # la base de fusion et pur est tenu pour conservé, même annulé ;
+            # la présence de la ligne ne le défait pas. Sans cette lecture, la
+            # boucle laissait tomber le retrait et la fin rendait False.
+            if _removal_proves_survival(
+                    repo, head, sha, path, row, base, cache):
                 return True
     if added:
         # #3220/mesh-design (2) : le blob exact peut avoir changé (contenu
@@ -1349,8 +1360,7 @@ def _commit_survives(repo: str, head: str, sha: str, cache: dict,
         # `False` à la branche `copied` alors qu'un retrait survit.
         allow = (lambda block_path, block_row:
                  _removal_proves_survival(
-                     repo, head, sha, block_path, block_row, added, base,
-                     cache))
+                     repo, head, sha, block_path, block_row, base, cache))
         if _removal_block_survives(
                 repo, head, sha, {path for path, _row in removed}, cache,
                 allow=allow):

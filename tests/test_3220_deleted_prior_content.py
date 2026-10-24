@@ -220,6 +220,50 @@ class SurvivingRemovalTest(_SurvivingRemovalFixture):
         self.assertIn("cx3", {row["name"] for row in out["authors"]})
 
 
+class SamePathReintroducedRemovalTest(_SurvivingRemovalFixture):
+    """B12 (revues auditeur + cx3) : la tête repart de la base, la garde
+    retirée revient **au même chemin** et le document propre du correctif est
+    omis. Le retrait effectif et pur reste une preuve, même annulé : cx3 garde
+    son statut d'auteur (sur-rétention acceptée de l'arbitrage mesh-design)."""
+
+    def setUp(self):
+        super().setUp()
+        self.repo.git("reset", "--hard", self.base)
+        self.repo.write("src/ameesh/runner.py", "base\nmain\n")
+        self.head_b = self.repo.commit(
+            "impl: base reprise, document omis", agent="impl")
+        self.receipt("impl", "deepseek", [self.head_b])
+        self.freeze_b = self.freeze(self.head_b)
+        self.milestone = {"id": int(self.freeze_b["id"]), "sha": self.head_b,
+                          "actor": "impl", "at_ts": self.freeze_b.get("at_ts")}
+
+    def test_the_reintroduced_removal_keeps_the_corrector(self):
+        authors, unknown, correctors = self.reading(
+            self.milestone, [self.head_b], self.base, self.head_b)
+        self.assertEqual(unknown, [])
+        self.assertEqual({row["name"]: row["family"] for row in authors},
+                         {"impl": "deepseek", "cx3": "codex"})
+        self.assertIn("cx3", {row["name"] for row in correctors})
+
+    def test_the_gate_refuses_the_corrector_with_a_reintroduced_removal(self):
+        klass = {"class": "sensitive", "doubt": False,
+                 "files": [{"path": "src/ameesh/gate.py",
+                            "class": "sensitive",
+                            "rule": ["src/ameesh/gate.py"]}],
+                 "repo": self.repo.root, "target": self.base,
+                 "base_sha": self.base}
+        for actor in ("cx3", "dev1"):
+            self.verdict(actor, self.head_b)
+        out = merge_queue.review_gate(
+            self.db, work.milestones(self.db, self.lot), self.head_b,
+            repo=self.repo.root, klass=klass, item=self.lot_item(), required=2)
+        self.assertFalse(out.get("error"), out)
+        self.assertFalse(out["ok"], out["why"])
+        self.assertEqual([entry["actor"] for entry in out["accepted"]],
+                         ["dev1"], out)
+        self.assertIn("cx3", {row["name"] for row in out["authors"]})
+
+
 class EditedThenDeletedTest(_SurvivingRemovalFixture):
     """B2 (revue dev2) : l'édition d'un fichier ensuite supprimé ne le garde pas."""
 

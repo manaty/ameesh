@@ -314,6 +314,78 @@ class CommitSurvivesTest(TestCase):
         head = self.repo.commit("impl: garde réintroduite", agent="impl")
         self.assertTrue(self.survives(head, fix, base))
 
+    def test_a_reintroduced_removal_at_the_same_path_keeps_the_corrector(self):
+        # B12 (revues auditeur + cx3) : la tête repart de la base sans rejouer
+        # le correctif ; la garde retirée est donc revenue **au même chemin**,
+        # et le document propre du correctif a disparu. Le retrait effectif et
+        # pur reste une preuve : l'auteur est conservé, même sans ajout
+        # survivant (sur-rétention acceptée de l'arbitrage mesh-design).
+        self.repo.write("gate.py",
+                        "def corrected():\n"
+                        "    allow_all_users_without_check()\n"
+                        "    require_session_identity()\n")
+        base = self.repo.commit("base")
+        self.repo.write("gate.py",
+                        "def corrected():\n"
+                        "    require_session_identity()\n")
+        self.repo.write("docs/review.md", "review own line\n")
+        fix = self.repo.commit("fix", agent="cx3")
+        self.repo.git("reset", "-q", "--hard", base)
+        self.repo.write("other.py", "main line\n")
+        head = self.repo.commit("impl: base + autre fichier", agent="impl")
+        self.assertTrue(self.survives(head, fix, base))
+
+    def test_a_reintroduced_removal_beside_an_identical_line_keeps_the_corrector(self):
+        # B12 (revue cx3) : `return None` est revenu au site corrigé **et**
+        # existe dans une fonction indépendante de la tête. La présence de la
+        # ligne ailleurs ne défait pas un retrait effectif et pur : l'auteur
+        # reste (sur-rétention acceptée), au lieu de dépendre du compte de
+        # lignes du fichier.
+        self.repo.write("gate.py",
+                        "def corrected(user):\n"
+                        "    if user.is_admin:\n"
+                        "        return None\n"
+                        "    guard_line_1()\n"
+                        "    guard_line_2()\n"
+                        "    guard_line_3()\n"
+                        "    guard_line_4()\n")
+        base = self.repo.commit("base")
+        self.repo.write("gate.py",
+                        "def corrected(user):\n"
+                        "    guard_line_1()\n"
+                        "    guard_line_2()\n"
+                        "    guard_line_3()\n"
+                        "    guard_line_4()\n")
+        self.repo.write("docs/review.md", "review own line\n")
+        fix = self.repo.commit("fix", agent="cx3")
+        self.repo.git("reset", "-q", "--hard", base)
+        self.repo.write("gate.py",
+                        "def corrected(user):\n"
+                        "    if user.is_admin:\n"
+                        "        return None\n"
+                        "    guard_line_1()\n"
+                        "    guard_line_2()\n"
+                        "    guard_line_3()\n"
+                        "    guard_line_4()\n"
+                        "def independent():\n"
+                        "    return None\n")
+        head = self.repo.commit("impl: garde réintroduite", agent="impl")
+        self.assertTrue(self.survives(head, fix, base))
+
+    def test_a_pure_reorder_does_not_keep_a_rewritten_corrector(self):
+        # B12 garde #2614 : un réordre pur n'ajoute aucune ligne (les deux
+        # lignes sont héritées du parent) ; ce n'est pas un retrait pur. La
+        # tête repartie de la base ne le reprend donc pas, même si les lignes
+        # réordonnées sont présentes à leur chemin.
+        self.repo.write("a.py", "alpha_line()\nbeta_line()\n")
+        base = self.repo.commit("base")
+        self.repo.write("a.py", "beta_line()\nalpha_line()\n")
+        fix = self.repo.commit("fix", agent="dev3")
+        self.repo.git("reset", "-q", "--hard", base)
+        self.repo.write("other.py", "main line\n")
+        head = self.repo.commit("impl: base + autre fichier", agent="impl")
+        self.assertFalse(self.survives(head, fix, base))
+
     def test_a_reintroduced_removal_keeps_the_corrector(self):
         # B9/B10/B11 (arbitrage mesh-design) : la tête réintroduit la garde
         # exactement à sa place. Le retrait effectif et pur garde son auteur ;
