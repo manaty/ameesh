@@ -1173,7 +1173,11 @@ def _carried_from_previous(db, item: Mapping, milestone: Optional[Mapping],
                     "its authors cannot be carried" % (sha[:12], lot))
             unknown.append(sha[:12])
             continue
-        earlier = _commits_between(repo, start, sha)
+        # #3283 : la plage est `cible..gel`, pas `merge-base..gel`. Sur une
+        # histoire croisée (lot posé sur une branche fusionnée depuis dans la
+        # cible), git rend UNE des bases de fusion et la plage reprendrait des
+        # commits déjà entrés dans la cible — leurs auteurs avec eux.
+        earlier = _commits_between(repo, base or head_sha, sha)
         if earlier is None:
             if strict:
                 raise review_provenance.ProvenanceError(
