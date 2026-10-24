@@ -15,6 +15,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import socket
 import stat
 import subprocess
@@ -86,7 +87,7 @@ os.execvp(sys.argv[4], sys.argv[4:])
 ID = '#!/bin/sh\necho 1001\n'
 
 SYSTEMCTL = r'''#!/usr/bin/env python3
-import os, sys
+import os, subprocess, sys
 from pathlib import Path
 state = Path(os.environ['FAKE_STATE'])
 args = sys.argv[1:]
@@ -97,6 +98,39 @@ with (state / 'systemctl.log').open('a') as f:
     f.write(' '.join(args) + '\n')
 def stopped():
     return (state / ('stopped-' + name)).exists()
+def live_pid():
+    """#3311 : un vrai processus par venv vivant, lancé depuis son `bin/`.
+
+    Son argv[0] est le chemin concret fixé par le lanceur #1969 ; le témoin de
+    `controler` le lit dans /proc/<pid>/cmdline, comme en production.
+    """
+    parts = Path(os.environ['HOME']) / '.local/share/ameesh'
+    courant = parts / 'venv-courant'
+    if courant.is_symlink():
+        cible = Path(os.readlink(courant))
+        if not cible.is_absolute():
+            cible = parts / cible
+    else:
+        cible = parts / 'venv'
+    cible = cible.resolve()
+    cache = state / 'mainpid'
+    try:
+        pid = int(cache.read_text())
+        argv0 = (Path('/proc') / str(pid) / 'cmdline').read_bytes().split(b'\0')[0]
+        if os.fsdecode(argv0) and Path(os.fsdecode(argv0)).parent.resolve() == cible / 'bin':
+            return pid
+    except (OSError, ValueError):
+        pass
+    lien = cible / 'bin/python3'
+    if not lien.exists():
+        lien.symlink_to(sys.executable)
+    enfant = subprocess.Popen([str(lien), '-c', 'import time; time.sleep(120)'],
+                              stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                              stderr=subprocess.DEVNULL, start_new_session=True)
+    cache.write_text(str(enfant.pid) + '\n')
+    with (state / 'mainpids').open('a') as f:
+        f.write(str(enfant.pid) + '\n')
+    return enfant.pid
 def reload_epoch():
     # un runner redémarré reprend son bail à une époque supérieure
     epoch = state / ('lease-epoch-' + name)
@@ -116,7 +150,7 @@ elif 'show' in args:
     if 'ActiveState' in args:
         print('inactive' if stopped() else 'active')
     elif 'MainPID' in args:
-        print('0' if stopped() else '123')
+        print('0' if stopped() else live_pid())
     else:
         print('{ path=/bin/runner ; argv[]=/bin/runner run --runner-id '
               'runner-' + name + '@host-agents ; }')
@@ -273,6 +307,7 @@ class VmAgentsHarness(unittest.TestCase):
         # Exerce aussi la séparation des chemins locaux/distants sur tout hôte.
         self.tmp = tempfile.TemporaryDirectory(prefix='ameesh-1252-~')
         self.addCleanup(self.tmp.cleanup)
+        self.addCleanup(self._arreter_venvs)
         self.root = Path(self.tmp.name)
         self.state = self.root / 'state'
         self.state.mkdir()
@@ -358,6 +393,17 @@ class VmAgentsHarness(unittest.TestCase):
     def head(self, where):
         return self.git(where, 'rev-parse', 'HEAD')
 
+    def _arreter_venvs(self):
+        """#3311 : arrête les processus vivants simulés par le faux systemctl."""
+        chemin = self.state / 'mainpids'
+        if not chemin.exists():
+            return
+        for ligne in chemin.read_text().split():
+            try:
+                os.kill(int(ligne), signal.SIGTERM)
+            except (OSError, ValueError):
+                pass
+
     def _build_origin(self):
         """Un dépôt d'origine à trois commits, indépendant de l'historique du
         checkout : la CI ne fournit que la tête (clone en profondeur 1)."""
@@ -372,6 +418,9 @@ class VmAgentsHarness(unittest.TestCase):
         # l'installe dans son dépôt d'origine comme les autres pièces.
         shutil.copy2(ROOT / 'deploy/mise-a-jour/bascule.py',
                      self.origin / 'deploy/mise-a-jour/bascule.py')
+        # #3311 : vm.sh lit ce helper sur stdin pour prouver le venv du MainPID.
+        shutil.copy2(ROOT / 'deploy/mise-a-jour/venv-processus.py',
+                     self.origin / 'deploy/mise-a-jour/venv-processus.py')
         shutil.copy2(ROOT / '.gitignore', self.origin / '.gitignore')
         (self.origin / 'src/ameesh/migrations').mkdir(parents=True)
         (self.origin / 'src/ameesh/__init__.py').write_text('# origine\n')

@@ -30,7 +30,8 @@
 #                démarrage), puis notify, puis les exécuteurs de l'ancienne base
 #                refusé depuis une unité ameesh-* (risque de tuer le script)
 #   controler    doctor, budget, accounts list, projects, alerts ; vérifie aussi
-#                le venv réellement exécuté par le MainPID de notify
+#                le venv réellement exécuté par le MainPID de notify et de
+#                chaque exécuteur (#2950, #3311)
 #   retour       bascule en arrière vers le venv précédent conservé (sans pip),
 #                puis redémarre (sans toucher aux bases : 0041 à 0047 sont
 #                additives)
@@ -647,10 +648,29 @@ controler_notify() {
   local pid apres
   systemctl --user is-active --quiet ameesh-notify.service || return 1
   pid=$(systemctl --user show -p MainPID --value ameesh-notify.service) || return 1
-  python3 "$ICI/notify-venv.py" "$pid" "$VENV" || return 1
+  python3 "$ICI/venv-processus.py" "$pid" "$VENV" ameesh-notify || return 1
   apres=$(systemctl --user show -p MainPID --value ameesh-notify.service) || return 1
   [ "$pid" = "$apres" ] \
     || { echo "ameesh-notify : MainPID changé pendant le contrôle, relancer controler" >&2; return 1; }
+}
+
+# #3311 : le lanceur stable (#1969) ne prouve rien pour un exécuteur déjà
+# lancé — après une bascule, il peut rester sur l'ancien venv et l'hôte
+# paraître sain. Chaque MainPID vivant doit exécuter le venv courant.
+controler_executeurs() {
+  local u pid apres echec=0
+  while IFS= read -r u; do
+    [ -n "$u" ] || continue
+    pid=$(systemctl --user show -p MainPID --value "$u") \
+      || { echo "$u : MainPID illisible — venv non prouvé" >&2; echec=1; continue; }
+    python3 "$ICI/venv-processus.py" "$pid" "$VENV" "$u" \
+      || { echec=1; continue; }
+    apres=$(systemctl --user show -p MainPID --value "$u") \
+      || { echo "$u : MainPID illisible après la preuve, relancer controler" >&2; echec=1; continue; }
+    [ "$pid" = "$apres" ] \
+      || { echo "$u : MainPID changé pendant le contrôle, relancer controler" >&2; echec=1; }
+  done < <(unites_mesh)
+  [ "$echec" = 0 ]
 }
 
 controler() {
@@ -662,6 +682,7 @@ controler() {
   verif "$AMEESH" projects
   verif "$AMEESH" alerts
   verif controler_notify
+  verif controler_executeurs
   etape "exécuteurs en échec"
   systemctl --user list-units 'ameesh-*' --state=failed --plain --no-legend || true
   if ancienne; then

@@ -113,6 +113,62 @@ class ScrubTest(Banc):
             again = venv_guard.scrub(dict(env), str(shims))
         self.assertEqual(env, again)
 
+    def test_shims_visent_le_lanceur_stable_et_ne_dependent_pas_du_runner(self):
+        """#3311 : deux runners de versions différentes écrivent le même shim.
+
+        Le shim vise le lanceur stable `venv/bin/<nom>`, qui résout
+        `venv-courant` à chaque appel : le dernier runner qui démarre un tour
+        ne décide plus de la version des outils du tour.
+        """
+        self.assertEqual(bascule.LAUNCHERS, venv_guard.BASCULE_MARKER)
+        (self.stable / venv_guard.BASCULE_MARKER).write_text("{}", encoding="utf-8")
+        (self.share / "venv-courant").symlink_to(self.vivant.name)
+        appele = self.base / "appele"
+        (self.stable / "bin/ameesh").write_text(
+            "#!/bin/sh\nprintf '%%s' \"$0\" > %s\n" % appele,
+            encoding="utf-8")
+        (self.stable / "bin/ameesh").chmod(0o755)
+        shims = self.base / "state" / ".menage" / venv_guard.SHIM_DIR
+        with self.en_venv(self.vivant):
+            env = venv_guard.scrub(self.env(), str(shims))
+        textes = {}
+        for nom in venv_guard.SHIMMED:
+            texte = (shims / nom).read_text(encoding="utf-8")
+            textes[nom] = texte
+            self.assertIn(str(self.stable / "bin" / nom), texte)
+            self.assertNotIn(str(self.vivant), texte)
+        # le shim exécute bien le lanceur stable
+        import shutil
+        trouve = shutil.which("ameesh", path=env["PATH"])
+        self.assertEqual(str(shims / "ameesh"), trouve)
+        subprocess.run([trouve], check=True, timeout=10)
+        self.assertEqual(str(self.stable / "bin/ameesh"),
+                         appele.read_text(encoding="utf-8"))
+        # un second runner, autre venv versionné, écrit exactement le même shim
+        autre = self.share / "venv-def5678"
+        for nom in venv_guard.SHIMMED:
+            _executable(autre / "bin" / nom)
+        env2 = {"VIRTUAL_ENV": str(autre),
+                "PATH": os.pathsep.join(
+                    [str(autre / "bin"), str(self.autre), "/usr/bin"])}
+        with self.en_venv(autre):
+            venv_guard.scrub(env2, str(shims))
+        for nom in venv_guard.SHIMMED:
+            self.assertEqual(textes[nom],
+                             (shims / nom).read_text(encoding="utf-8"))
+
+    def test_lanceur_stable_absent_retombe_sur_le_venv_du_runner(self):
+        """#3311 : le repli par point d'entrée garde `agent-mail` joignable."""
+        (self.stable / venv_guard.BASCULE_MARKER).write_text("{}", encoding="utf-8")
+        (self.stable / "bin/agent-mail").unlink()
+        shims = self.base / "state" / ".menage" / venv_guard.SHIM_DIR
+        with self.en_venv(self.vivant):
+            venv_guard.scrub(self.env(), str(shims))
+        self.assertIn(str(self.stable / "bin/ameesh"),
+                      (shims / "ameesh").read_text(encoding="utf-8"))
+        self.assertIn(str(self.vivant / "bin/agent-mail"),
+                      (shims / "agent-mail").read_text(encoding="utf-8"))
+
     def test_sans_dossier_de_shims_le_path_est_seulement_nettoye(self):
         with self.en_venv(self.vivant):
             env = venv_guard.scrub(self.env())

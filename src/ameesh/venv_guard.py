@@ -16,7 +16,12 @@ Ce module retire de l'environnement d'un tour :
 
 et rend au tour les deux seuls points d'entrée dont il a besoin, `ameesh` et
 `agent-mail`, par des shims qui exécutent le binaire du venv par chemin
-absolu. Un échec d'écriture des shims ne rouvre jamais le PATH de production
+absolu. Quand le venv du runner est versionné (`venv-<sha7>`, #1969) et que
+le venv stable voisin porte ses lanceurs, le shim vise le **lanceur stable**
+(`venv/bin/ameesh`) : il résout `venv-courant` à chaque appel, donc la
+version des outils d'un tour ne dépend plus du dernier runner qui a écrit le
+dossier de shims partagé (#3311). Un échec d'écriture des shims ne rouvre
+jamais le PATH de production
 (#2772) : les `bin/` cachés restent retirés, le tour peut perdre les deux
 points d'entrée s'ils ne viennent pas d'un autre dossier du PATH. Les tests
 d'une branche passent par `PYTHONPATH=src` ou par un venv du worktree, jamais
@@ -41,6 +46,8 @@ LOG = logging.getLogger(__name__)
 #: points d'entrée rendus au tour (les hooks des harnais appellent agent-mail)
 SHIMMED = ("ameesh", "agent-mail")
 SHIM_DIR = "bin-ameesh"
+#: marqueur des lanceurs du venv stable, écrit par `bascule.py` (#1969)
+BASCULE_MARKER = ".bascule-lanceurs"
 SHIM = """#!/bin/sh
 # #2763 : point d'entrée d'ameesh pour un tour, sans exposer le venv de
 # production (ni pip, ni python3) dans le PATH du tour.
@@ -61,6 +68,26 @@ def running_venv() -> str:
     if sys.prefix == getattr(sys, "base_prefix", sys.prefix):
         return ""
     return sys.prefix
+
+
+def stable_launcher(prefix: str | None = None) -> str:
+    """Le venv stable (#1969) voisin du venv du runner, s'il en est un.
+
+    Un runner démarre dans un venv versionné (`venv-<sha7>`) : deux runners de
+    versions différentes écrivaient chacun leur binaire dans le même dossier
+    de shims, et la version des outils d'un tour dépendait du dernier runner
+    qui avait démarré (#3311). Le venv stable voisin ne porte que des lanceurs
+    qui lisent `venv-courant` à chaque appel : son chemin ne dépend d'aucun
+    runner. Absent (venv d'outils, worktree, CI), on garde le venv vivant.
+    """
+    courant = _real(prefix if prefix is not None else running_venv())
+    if not courant:
+        return ""
+    candidat = os.path.join(os.path.dirname(courant), "venv")
+    if _real(candidat) == courant or not os.path.isfile(
+            os.path.join(candidat, BASCULE_MARKER)):
+        return ""
+    return candidat
 
 
 def hidden_venvs(env) -> set:
@@ -90,10 +117,15 @@ def install_shims(directory: str) -> str:
     courant = running_venv()
     if not courant:
         return ""
+    stable = stable_launcher(courant)
     import shlex
     os.makedirs(directory, mode=0o700, exist_ok=True)
     for nom in SHIMMED:
-        reel = os.path.join(courant, "bin", nom)
+        # #3311 : le lanceur stable ne dépend pas du runner qui écrit le shim ;
+        # à défaut (venv d'outils, lanceur absent de la version), le venv vivant.
+        reel = os.path.join(stable or courant, "bin", nom)
+        if stable and not os.access(reel, os.X_OK):
+            reel = os.path.join(courant, "bin", nom)
         if not os.access(reel, os.X_OK):
             continue
         texte = SHIM % shlex.quote(reel)
