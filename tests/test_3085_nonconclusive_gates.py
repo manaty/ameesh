@@ -74,10 +74,12 @@ class ClassificationTest(unittest.TestCase):
         self.assertEqual(radar.ci_result(rows)["state"], "red")
 
     def test_commit_ci_exposes_negative_acceptable_and_inconclusive(self):
+        # #3186 : un run annulé n'a jamais conclu (preuve absente, voir
+        # test_3186) ; le non concluant témoin est un run en attente d'action.
         project = radar.Project("n", "/r", github="o/nexlink", ci_required=True)
         sha = "a" * 40
         out = radar.commit_ci(project, sha, gh=l160g._Gh([
-            l160g._run("ci", conclusion="cancelled")]))
+            l160g._run("ci", conclusion="action_required")]))
         self.assertFalse(out["green"])
         self.assertTrue(out["acceptable"])
         self.assertEqual(out["negative"], [])
@@ -110,10 +112,13 @@ class ReadyPrTest(unittest.TestCase):
         self.assertTrue(ok, why)
         self.assertEqual(report["consigned"], ["tests (SKIPPED)"])
 
-    def test_a_cancelled_required_check_does_not_block_and_is_consigned(self):
+    def test_a_cancelled_required_check_blocks_as_absent_proof(self):
+        # #3186 (décision owner #128512) : l'agrégat requis annulé n'a jamais
+        # conclu — preuve absente, bloquant ; il n'est pas consigné.
         ok, why, report = self.ready([f2271._check("tests", "CANCELLED")])
-        self.assertTrue(ok, why)
-        self.assertEqual(report["consigned"], ["tests (CANCELLED)"])
+        self.assertFalse(ok)
+        self.assertIn("never concluded", why)
+        self.assertEqual(report["consigned"], [])
 
     def test_an_app_scoped_skipped_check_does_not_block(self):
         gh = f2271.FakeGh(check_runs=[f2271._run("tests", conclusion="skipped")])
@@ -291,12 +296,15 @@ class PacketTest(banc.Journal):
         self.assertIn(banc.HEAD, self.created[0]["body"])
         self.assertEqual(self.created[0]["type"], "bug")
 
-    def test_a_cancelled_required_check_merges_and_opens_the_correction(self):
+    def test_a_cancelled_required_check_never_merges(self):
+        # #3186 (décision owner #128512) : preuve absente, la porte attend ;
+        # la relance du run est témoignée dans test_3186.
         self.armed()
-        out = self.check(banc.FakeGh(tests="cancelled"))
-        self.assertEqual(out["result"], "merged", out)
-        self.assertEqual(out["consigned"], ["tests (CANCELLED)"])
-        self.assertEqual(len(self.created), 1)
+        gh = banc.FakeGh(tests="cancelled")
+        out = self.check(gh)
+        self.assertEqual(out["result"], "pending", out)
+        self.assertEqual(gh.merges(), [])
+        self.assertEqual(self.created, [])
 
     def test_a_failed_required_check_never_merges_nor_opens_a_lot(self):
         self.armed()

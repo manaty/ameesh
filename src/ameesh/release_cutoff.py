@@ -471,7 +471,12 @@ def reading_is_green(reading: dict) -> bool:
     s'ouvre) et ne retient pas la release. Un check encore en cours, un rouge
     prouvé, un préfixe requis absent ou une tête sans aucun check ne sont
     jamais verts (`acceptable` est alors faux). Une lecture sans clé
-    `acceptable` garde l'ancien sens strict."""
+    `acceptable` garde l'ancien sens strict.
+
+    #3186 (décision owner #128512) : un run terminé sans avoir conclu
+    lui-même (`unconcluded` : annulé, expiré, démarrage raté) est une preuve
+    absente, pas un non concluant — `acceptable` est faux et la tête ne
+    l'est pas ; `rerun_head` relance ce run une fois."""
     if reading.get("green"):
         return True
     if "acceptable" in reading:
@@ -1240,6 +1245,38 @@ def _open_correction(db, project: "ProjectRelease", plan: "Plan"):
     return out
 
 
+def _unconcluded_deviation(plan: "Plan", reruns) -> list:
+    """#3186 : la ligne d'écart d'une tête dont un run n'a jamais conclu."""
+    rows = plan.ci.get("unconcluded") or ()
+    if not rows:
+        return []
+    return ["tête %s: run(s) jamais conclu(s) (%s) — preuve absente, tête non verte "
+            "(décision owner #128512) ; %s"
+            % (plan.head[:12], ", ".join(row.get("check") or "?" for row in rows),
+               radar.describe_reruns(reruns) or "aucune relance")]
+
+
+def rerun_head(project: "ProjectRelease", plan: "Plan") -> list:
+    """#3186 (décision owner #128512 du 23/10) : les runs de la tête terminés
+    sans avoir conclu (`plan.ci["unconcluded"]`) sont relancés une fois
+    (`radar.rerun_unconcluded`) ; la release de cette coupure prend le dernier
+    vert, la coupure suivante trouve la preuve. Une relance impossible est
+    rapportée, elle ne retient ni ne défait la release."""
+    rows = plan.ci.get("unconcluded") or ()
+    if not rows:
+        return []
+    try:
+        slug = github_slug(project)
+        return radar.rerun_unconcluded(
+            slug, plan.head, [(row.get("check") or "?", radar.actions_run_id(slug, row))
+                              for row in rows],
+            gh=plan_github.Gh())
+    except (ReleaseError, plan_github.GithubError, OSError) as exc:
+        return [{"check": row.get("check") or "?", "run": row.get("databaseId"),
+                 "result": "error", "detail": "rerun unavailable: %s" % exc}
+                for row in rows]
+
+
 def _worktree(repo: str, sha: str) -> tuple[str, str]:
     folder = tempfile.mkdtemp(prefix="ameesh-release-", dir=os.path.dirname(repo) or None)
     path = os.path.join(folder, "worktree")
@@ -1879,6 +1916,9 @@ def _execute_locked(cfg, db, project: ProjectRelease, *, now: float, force: bool
                       previous, None, staging, no_staging)
 
     plan = build_plan(cfg, project, now=now, version=version)
+    # #3186 : un run de la tête jamais conclu n'est pas une preuve ; il est
+    # relancé une fois, la release suit le dernier vert.
+    reruns = rerun_head(project, plan)
     if not plan.green and not plan.last_green:
         state_slot["last_cutoff"] = at
         state_slot["last_result"] = "refused-no-green"
@@ -1888,8 +1928,11 @@ def _execute_locked(cfg, db, project: ProjectRelease, *, now: float, force: bool
                   "project": project.name, "version": plan.version,
                   "target_head": plan.head, "cutoff_at": at, "label": label,
                   "ci": plan.ci, "started_at": started,
-                  "deviations": ["no green first-parent commit: nothing to tag"],
+                  "deviations": ["no green first-parent commit: nothing to tag"]
+                  + _unconcluded_deviation(plan, reruns),
                   "canon_commit": plan.canon_commit}
+        if reruns:
+            report["reruns"] = reruns
         report["completed_at"] = time.time()
         report["duration_s"] = round(report["completed_at"] - started, 1)
         report["report_path"] = write_report(cfg, project, report)
@@ -1914,8 +1957,11 @@ def _execute_locked(cfg, db, project: ProjectRelease, *, now: float, force: bool
                   "base": plan.base, "cutoff_at": at, "label": label, "ci": plan.ci,
                   "started_at": started,
                   "deviations": ["nothing new since %s: no tag, no staging"
-                                 % plan.previous["tag"]],
+                                 % plan.previous["tag"]]
+                  + _unconcluded_deviation(plan, reruns),
                   "canon_commit": plan.canon_commit}
+        if reruns:
+            report["reruns"] = reruns
         report["completed_at"] = time.time()
         report["duration_s"] = round(report["completed_at"] - started, 1)
         report["report_path"] = write_report(cfg, project, report)
@@ -1929,7 +1975,7 @@ def _execute_locked(cfg, db, project: ProjectRelease, *, now: float, force: bool
                         report)
         return report
 
-    deviations = []
+    deviations = _unconcluded_deviation(plan, reruns)
     if plan.ci.get("inconclusive"):
         deviations.append(
             "tête %s: checks non concluants non bloquants (%s) — consignés, lot de "
@@ -2011,6 +2057,8 @@ def _execute_locked(cfg, db, project: ProjectRelease, *, now: float, force: bool
               "notes": plan.notes, "staging": staging, "started_at": started,
               "tree_green": plan.tree_green,
               "deviations": deviations}
+    if reruns:
+        report["reruns"] = reruns
     return finish(cfg, db, project, report, state, state_slot, at, label, rules,
                   plan.previous, plan, staging, no_staging)
 

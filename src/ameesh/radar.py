@@ -1638,6 +1638,20 @@ CI_INCONCLUSIVE = frozenset(("SKIPPED", "NEUTRAL", "CANCELLED", "TIMED_OUT",
                              "STALE", "STARTUP_FAILURE", "ACTION_REQUIRED"))
 #: états (statut de commit) qui ne prouvent rien
 CI_INCONCLUSIVE_STATES = frozenset(("ERROR",))
+#: #3186 (décision owner #128512 du 23/10) : les conclusions d'un check qui
+#: n'a pas conclu **lui-même** — exécution annulée, expirée, démarrage raté,
+#: abandonnée par GitHub (`STALE` : restée incomplète quatorze jours). Sur un
+#: check requis (l'agrégat `tests`, #876) ou sur un run entier lu par la
+#: release, ce n'est pas un test non concluant : aucune preuve n'existe, la
+#: porte bloque et relance le run une fois (`rerun_unconcluded`). Une part ou
+#: un check facultatif ainsi conclu reste non concluant (#3085).
+CI_NEVER_CONCLUDED = frozenset(("CANCELLED", "TIMED_OUT", "STARTUP_FAILURE", "STALE"))
+
+
+def never_concluded(state) -> bool:
+    """#3186 : la conclusion `state` (check ou run, casse libre) dit que le
+    check n'a pas conclu lui-même — ni vert, ni rouge, ni sauté."""
+    return str(state or "").strip().upper() in CI_NEVER_CONCLUDED
 
 
 #: #3221 : les états qu'une porte écrit entre parenthèses après le nom consigné
@@ -1843,6 +1857,110 @@ def ci_state(rollup) -> str:
     return ci_result(rollup)["state"]
 
 
+def actions_run_id(slug: str, entry) -> int | None:
+    """#3186 : le run GitHub Actions d'un check — `detailsUrl` d'une entrée de
+    rollup, `details_url` d'un check run REST (`…/<slug>/actions/runs/<id>/
+    job/<id>`), ou `databaseId` d'une ligne de `gh run list`. None pour un
+    statut de commit, un check d'une autre application ou d'un autre dépôt :
+    rien à relancer."""
+    if not isinstance(entry, dict):
+        return None
+    identity = entry.get("databaseId")
+    if type(identity) is int and identity > 0:
+        return identity
+    url = entry.get("detailsUrl") or entry.get("details_url") or ""
+    if not isinstance(url, str) or not slug:
+        return None
+    match = re.fullmatch(r"https://github[.]com/" + re.escape(slug)
+                         + r"/actions/runs/([1-9][0-9]*)/job/[1-9][0-9]*", url)
+    return int(match.group(1)) if match else None
+
+
+def _gh_call(gh, argv: list) -> tuple:
+    """`(code, out, err)` d'un `gh` des deux formes en usage : `plan_github.Gh`
+    (`run(argv)` → tuple) ou l'appelable de `land`/`fire` (→ CompletedProcess)."""
+    if hasattr(gh, "run"):
+        code, out, err = gh.run(list(argv))
+        return code, out or "", err or ""
+    proc = gh(list(argv))
+    return proc.returncode, proc.stdout or "", proc.stderr or ""
+
+
+def rerun_unconcluded(slug: str, head: str, runs, *, gh, dry_run: bool = False) -> list:
+    """#3186 (décision owner #128512 du 23/10) : « agrégat requis jamais conclu
+    = preuve absente, donc bloquant : on relance le seul run (coût : une
+    relance) ».
+
+    `runs` : des paires `(libellé, run_id | None)`. Chaque run est relu
+    (`actions/runs/<id>`) puis relancé — `gh run rerun <id> --failed` : ses
+    jobs non conclus et leurs dépendants, l'agrégat compris — seulement s'il
+    porte la tête `head`, s'il est terminé et à son premier essai. Un run déjà
+    relancé (essai ≥ 2, par ameesh ou par `relance hosted`) ne l'est plus :
+    la relance a coûté sa fois, la preuve manque toujours et le dire suffit.
+    Aucune issue ne rouvre la porte : seule une conclusion la rouvre.
+
+    Rend `[{check, run, result, detail}]`, `result` parmi `rerun`,
+    `would-rerun`, `running` (déjà relancé, en cours), `spent` (relance déjà
+    faite), `unknown` (aucun run Actions à relancer), `refused` (run d'une
+    autre tête) et `error` (lecture ou relance impossible)."""
+    out, seen = [], set()
+    for label, run_id in runs or ():
+        if run_id in seen and run_id is not None:
+            continue
+        seen.add(run_id)
+        row = {"check": label, "run": run_id}
+        if run_id is None:
+            out.append(dict(row, result="unknown",
+                            detail="no GitHub Actions run to rerun"))
+            continue
+        try:
+            code, text, err = _gh_call(gh, ["api", "repos/%s/actions/runs/%d" % (slug, run_id)])
+            data = json.loads(text) if not code else None
+        except (OSError, ValueError, TypeError) as exc:
+            code, data, err = 1, None, str(exc)
+        if code or not isinstance(data, dict) or data.get("id") != run_id:
+            out.append(dict(row, result="error",
+                            detail="run %d unreadable: %s" % (run_id, (err or "?").strip()[:200])))
+            continue
+        attempt = data.get("run_attempt")
+        attempt = attempt if type(attempt) is int and attempt > 0 else 1
+        if str(data.get("head_sha") or "").lower() != str(head or "").lower():
+            out.append(dict(row, result="refused", detail="run %d is on %s, not %s"
+                            % (run_id, str(data.get("head_sha") or "?")[:12], head[:12])))
+        elif data.get("status") != "completed":
+            out.append(dict(row, result="running", attempt=attempt,
+                            detail="run %d is %s (attempt %d)"
+                            % (run_id, data.get("status") or "?", attempt)))
+        elif attempt > 1:
+            out.append(dict(row, result="spent", attempt=attempt,
+                            detail="run %d already rerun once (attempt %d, %s): the "
+                                   "proof is still missing" % (
+                                       run_id, attempt, data.get("conclusion") or "?")))
+        elif dry_run:
+            out.append(dict(row, result="would-rerun", attempt=attempt,
+                            detail="run %d would be rerun" % run_id))
+        else:
+            try:
+                code, _text, err = _gh_call(gh, ["run", "rerun", str(run_id), "--failed",
+                                                 "--repo", slug])
+            except (OSError, ValueError, TypeError) as exc:
+                code, err = 1, str(exc)
+            if code:
+                out.append(dict(row, result="error", attempt=attempt,
+                                detail="rerun of run %d refused: %s"
+                                % (run_id, (err or "?").strip()[:200])))
+            else:
+                out.append(dict(row, result="rerun", attempt=attempt,
+                                detail="run %d rerun (once)" % run_id))
+    return out
+
+
+def describe_reruns(reruns) -> str:
+    """#3186 : une ligne lisible des issues de `rerun_unconcluded`."""
+    return "; ".join("%s: %s" % (row.get("check") or "?", row.get("detail") or row["result"])
+                     for row in reruns or ())
+
+
 def github_ci(project: Project, gh=None, *, strict: bool = False):
     """La fonction `branche -> {number, url, head, green, draft} | None` du
     projet (PR ouverte de la branche, `head` : son commit de tête), lue avec
@@ -1914,7 +2032,12 @@ def commit_ci(project: Project, sha: str, gh=None, *, branch: str | None = None)
     N1 de #1666 : `contexts` mêle les libellés des trois espaces (runs,
     checks, statuts). Les parts dues d'un projet (`ci_parts`) sont des
     **statuts de commit** : `statuses` les rend seuls, pour qu'un run ou un
-    check portant le nom d'une part ne puisse pas en tenir lieu."""
+    check portant le nom d'une part ne puisse pas en tenir lieu.
+
+    #3085/#3186 : `acceptable` (aucun négatif, rien en cours ni absent) porte
+    la règle du 23/10 ; `inconclusive` liste les non concluants consignés ;
+    `unconcluded` (`[{check, databaseId}]`) les runs Actions terminés sans
+    avoir conclu eux-mêmes — preuve absente, jamais `acceptable`."""
     from datetime import datetime
     from . import plan_github
     slug = github_slug(project)
@@ -1923,7 +2046,7 @@ def commit_ci(project: Project, sha: str, gh=None, *, branch: str | None = None)
     gh = gh or plan_github.Gh()
     rows = plan_github._json(gh, ["run", "list", "--repo", slug, "--commit", sha, "--limit",
                                   "100", "--json",
-                                  "workflowDatabaseId,workflowName,name,status,conclusion,createdAt,startedAt,updatedAt,headSha,event"])
+                                  "workflowDatabaseId,workflowName,name,status,conclusion,createdAt,startedAt,updatedAt,headSha,event,databaseId"])
     if not isinstance(rows, list) or not all(isinstance(r, dict) for r in rows):
         raise plan_github.GithubError("gh run list: unexpected output")
     if len(rows) >= 100:
@@ -1961,6 +2084,15 @@ def commit_ci(project: Project, sha: str, gh=None, *, branch: str | None = None)
     results: list[tuple[str, str]] = [
         (label(identity, run), run_result(run))  # #3209 : garde workflow_run sautée
         for identity, run in latest.items()]
+    #: #3186 (décision owner #128512) : un run terminé sans avoir conclu
+    #: lui-même (annulé, expiré, démarrage raté) est l'agrégat de ses jobs
+    #: jamais conclu — une preuve absente, pas un non concluant : la tête
+    #: n'est pas `acceptable`, et le run (`databaseId`) peut être relancé.
+    unconcluded = sorted(
+        ({"check": label(identity, run), "databaseId": run.get("databaseId")}
+         for identity, run in latest.items()
+         if (run.get("status") or "") == "completed" and never_concluded(run.get("conclusion"))),
+        key=lambda row: row["check"])
     # L1651 (#1650): what the frozen commit carries, label by label. A due
     # part is proven by a context that exists here and is terminal-success; a
     # part absent from this map was never dispatched, which is exactly the
@@ -2078,11 +2210,14 @@ def commit_ci(project: Project, sha: str, gh=None, *, branch: str | None = None)
     # consigné. `green` garde son sens strict, `acceptable` porte la règle.
     negative = sorted({name for name, result in results
                        if result == CI_NEGATIVE_RESULT})
+    absent = {row["check"] for row in unconcluded}
     inconclusive = sorted({name for name, result in results
-                           if result == CI_INCONCLUSIVE_RESULT})
-    acceptable = bool(count) and not pending and not negative and not missing
+                           if result == CI_INCONCLUSIVE_RESULT} - absent)
+    acceptable = bool(count) and not pending and not negative and not missing \
+        and not unconcluded
     return {"runs": count, "green": bool(count) and not pending and not failed and not missing,
             "acceptable": acceptable, "negative": negative, "inconclusive": inconclusive,
+            "unconcluded": unconcluded,
             "pending": sorted(pending), "failed": sorted(failed), "missing": missing,
             "contexts": contexts, "statuses": status_contexts}
 
