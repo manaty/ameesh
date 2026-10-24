@@ -123,7 +123,13 @@ def live_pid():
         pass
     lien = cible / 'bin/python3'
     if not lien.exists():
-        lien.symlink_to(sys.executable)
+        # #3311 x CI : le python du venv CI (.venv-ci/bin/python) est lui-même
+        # un lanceur de venv ; un lien placé hors de son préfixe ne retrouve
+        # pas `encodings` sur les runners (« init_fs_encoding »), et la preuve
+        # lit alors un processus mort. Le python de base, complet, est le
+        # vivant à prouver : l'argv[0] reste celui du venv.
+        base = getattr(sys, '_base_executable', None) or sys.executable
+        lien.symlink_to(Path(base).resolve())
     enfant = subprocess.Popen([str(lien), '-c', 'import time; time.sleep(120)'],
                               stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                               stderr=subprocess.DEVNULL, start_new_session=True)
