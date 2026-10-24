@@ -92,7 +92,7 @@ state = Path(os.environ['FAKE_STATE'])
 args = sys.argv[1:]
 assert args[0] == '--user', args
 unit = args[-1]
-name = unit.split('@')[1].removesuffix('.service')
+name = unit.split('@')[1].removesuffix('.service') if '@' in unit else unit
 with (state / 'systemctl.log').open('a') as f:
     f.write(' '.join(args) + '\n')
 def stopped():
@@ -101,7 +101,13 @@ def reload_epoch():
     # un runner redémarré reprend son bail à une époque supérieure
     epoch = state / ('lease-epoch-' + name)
     epoch.write_text(str(int(epoch.read_text()) + 2 if epoch.exists() else 9))
-if 'stop' in args:
+if 'mask' in args:
+    # #3320 : masquage des sockets GnuPG de l'agent (aucun arrêt de runner).
+    for masked in [a for a in args if a.endswith(('.socket', '.service'))]:
+        (state / ('masked-' + masked)).touch()
+    with (state / 'events.log').open('a') as f:
+        f.write('mask\n')
+elif 'stop' in args:
     # #1152 : l'arrêt prouvé précède tout nouveau démarrage.
     (state / ('stopped-' + name)).touch()
 elif 'start' in args:
@@ -130,6 +136,14 @@ elif 'is-active' in args:
 
 JOURNALCTL = '#!/bin/sh\nexit 0\n'
 SLEEP = '#!/bin/sh\nexit 0\n'
+# #3320 : le testament de l'agent GnuPG est tué via gpgconf, sur la VM.
+GPGCONF = r'''#!/usr/bin/env python3
+import os, sys
+from pathlib import Path
+state = Path(os.environ['FAKE_STATE'])
+with (state / 'gpgconf.log').open('a') as f:
+    f.write(' '.join(sys.argv[1:]) + '\n')
+'''
 
 SYSTEMD_RUN = r'''#!/usr/bin/env python3
 import json, os, sys
@@ -204,6 +218,9 @@ state = Path(os.environ['FAKE_STATE'])
 log = state / 'pip.log'
 with log.open('a') as f:
     f.write(' '.join(sys.argv[1:]) + '\n')
+# #3320 : ordre des gestes de l'installation (pip avant le masquage GnuPG).
+with (state / 'events.log').open('a') as f:
+    f.write('pip\n')
 fail_at = int((state / 'pip-fail-at').read_text()) if (state / 'pip-fail-at').exists() else 0
 if fail_at and len(log.read_text().splitlines()) >= fail_at:
     sys.exit('pip failure (test)')
@@ -309,7 +326,8 @@ class VmAgentsHarness(unittest.TestCase):
         (self.bin / 'python3').chmod(0o755)
         for name, text in [('ssh', SSH), ('scp', SCP), ('runuser', RUNUSER), ('id', ID),
                            ('systemctl', SYSTEMCTL), ('journalctl', JOURNALCTL),
-                           ('sleep', SLEEP), ('systemd-run', SYSTEMD_RUN),
+                           ('sleep', SLEEP), ('gpgconf', GPGCONF),
+                           ('systemd-run', SYSTEMD_RUN),
                            ('ameesh', AMEESH), ('db-python', DB_PYTHON)]:
             path = self.bin / name
             path.write_text(text)
@@ -489,7 +507,12 @@ class VmAgentsInstallTest(VmAgentsHarness):
     def test_install_does_not_restart_the_runners(self):
         p = self.run_vm('installer', self.target)
         self.assertEqual(p.returncode, 0, p.stderr)
-        self.assertFalse((self.state / 'systemctl.log').exists())
+        # #3320 : l'installation masque les sockets GnuPG de l'agent ; elle ne
+        # touche jamais aux unités des exécuteurs.
+        log = ((self.state / 'systemctl.log').read_text()
+               if (self.state / 'systemctl.log').exists() else '')
+        self.assertNotIn('restart', log)
+        self.assertNotIn('ameesh-runner', log)
 
     def test_a_stopped_persona_active_unit_is_reloaded_into_the_new_code(self):
         # #1131/#1633 : la persona arrêtée par le propriétaire n'est pas

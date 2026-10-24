@@ -184,6 +184,18 @@ disque est haché et comparé aux objets du commit, sans passer par l’index :
 absent, en trop ou au mauvais mode fait refuser l’instantané, qui n’est jamais
 écrasé — le retirer à la main pour le reconstruire.
 
+Après une installation réussie, et seulement en mode agents, `installer` retire
+l’agent GnuPG inutile de la VM : si `~/.gnupg/private-keys-v1.d` est absent ou
+vide, il masque les sockets utilisateur `gpg-agent.socket`,
+`gpg-agent-ssh.socket`, `gpg-agent-extra.socket`, `gpg-agent-browser.socket` et
+`keyboxd.socket` (`systemctl --user mask --now`) puis tue l’agent (`gpgconf
+--kill gpg-agent`). Une clé privée présente, ou un état illisible, laisse tout
+en place et le journalise : le doute reste. L’étape est idempotente (une
+relance d’`installer` la rejoue) et vient après l’installation du code : #3195,
+dont ce lot dépend, garde les worktrees de lots ouverts avant que ce retrait ne
+débloque le ménage des sorties de build. `poste.sh` n’y touche jamais : sur le
+poste de l’owner, `gpg-agent` tient ses clés.
+
 `previous-sha` n’est publié qu’après une installation réussie, et seulement
 quand le code installé change : relancer `installer` sur le SHA déjà en place le
 laisse intact (sans `previous-sha`, on n’en invente pas un — pas de faux

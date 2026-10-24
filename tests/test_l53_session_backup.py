@@ -306,6 +306,26 @@ class OwnerHomeTest(_Tmp):
         self.assertEqual(len(sb.list_keys(self.conf(), "pc/")), 1)
 
 
+class EncryptArgvTest(unittest.TestCase):
+    """#3320: encryption to public keys must not start a GnuPG agent."""
+
+    def test_encrypt_does_not_autostart_an_agent(self):
+        calls = []
+
+        def run(argv, **kwargs):
+            calls.append(argv)
+            return types.SimpleNamespace(returncode=0, stdout=b"ciphertext", stderr=b"")
+
+        with mock.patch.object(sb.subprocess, "run", side_effect=run):
+            self.assertEqual(sb.encrypt(b"plain", ["key@example"]), b"ciphertext")
+        self.assertEqual(len(calls), 1)
+        argv = calls[0]
+        self.assertEqual(argv[0], "gpg")
+        self.assertIn("--no-autostart", argv)
+        self.assertIn("--encrypt", argv)
+        self.assertLess(argv.index("--no-autostart"), argv.index("--encrypt"))
+
+
 @unittest.skipUnless(shutil.which("gpg"), "gpg missing")
 class EncryptionTest(_Tmp):
     def setUp(self) -> None:
