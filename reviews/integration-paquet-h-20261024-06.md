@@ -123,6 +123,10 @@ Correctif `ae3476a7f` :
   426→427 refusées et 498→499 opérations d'interface ;
 - `tests/test_l790_outdated_restart.py` : la doublure lie `_run_turn_or_defer`.
 
+Le libellé d'aide de #3299 est ensuite conservé à l'identique (`741bd3c64`) :
+seule sa place change, pour que le contrôle d'inclusion retrouve le contenu
+composé.
+
 Ciblés verts sur la tête corrigée : `test_2179_roadmap_cli`,
 `test_l107_executor_contract`, `test_l790_outdated_restart` (67/67), contrôles
 statiques 6/6. Nouvelle tête gelée et nouvelle demande `ci-full-<sha>` ; les
