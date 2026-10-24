@@ -181,7 +181,8 @@ class FakeGh(Forge):
 
 
 class Journal(unittest.TestCase):
-    """Le faux journal du lot (`work.events`, `work.note`) et le bail."""
+    """Le faux journal du lot (`work.events`/`events_noted`, `work.note`) et
+    le bail."""
 
     def setUp(self) -> None:
         self.events: dict[int, list[dict]] = {}
@@ -189,6 +190,8 @@ class Journal(unittest.TestCase):
         stack = contextlib.ExitStack()
         self.addCleanup(stack.close)
         stack.enter_context(mock.patch.object(work, "events", self._events))
+        stack.enter_context(mock.patch.object(work, "events_noted",
+                                              self._events_noted))
         stack.enter_context(mock.patch.object(work, "note", self._note))
         #: le bail `auto-merge:<lot>` : libre, sauf quand un témoin le prend
         self.held: set[int] = set()
@@ -211,7 +214,15 @@ class Journal(unittest.TestCase):
             packet_automerge, "_verdicts", lambda *a, **k: self.gate))
 
     def _events(self, db, item_id, limit=100):
-        return list(reversed(self.events.get(int(item_id), [])))
+        # #3279 : le vrai `work.events` fenêtre ; le faux doit le faire aussi,
+        # sinon les notes `held` ne peuvent pas évincer la marque d'armement.
+        rows = list(reversed(self.events.get(int(item_id), [])))
+        return rows if limit is None else rows[:int(limit)]
+
+    def _events_noted(self, db, item_id, prefix, since_ts=0.0):
+        return [event for event in self.events.get(int(item_id), [])
+                if (event.get("note") or "").startswith(prefix)
+                and float(event.get("created_ts") or 0) >= float(since_ts)]
 
     def _note(self, db, item_id, text, **kw):
         self.events.setdefault(int(item_id), []).append(
@@ -260,6 +271,21 @@ class ArmTest(Journal):
         out = self.arm(gh)
         self.assertEqual(out["state"], "already-armed", out)
         self.assertEqual(len([n for n in self.notes() if " armed " in n]), 1)
+
+    def test_held_notes_do_not_evict_the_armed_mark(self):
+        # #3279 : un porteur qui refuse à chaque passage écrit des notes
+        # `held` (motifs alternés A/B/A, non dédupliquées par le journal).
+        # Au-delà de la fenêtre réelle de `work.events` (200), l'armement
+        # disparaissait : il ne doit plus être chassé par ses propres traces.
+        self.armed()
+        for index in range(250):
+            self._note(None, LOT, "auto-merge held repo=%s pr=%d sha=%s base=main "
+                                  "— motif %d" % (SLUG, NUM, HEAD, index % 2))
+        self.assertEqual(len(work.events(None, LOT, limit=200)), 200)
+        self.assertIn("armed", [row["state"]
+                                for row in packet_automerge.marks(None, LOT)])
+        self.assertIsNotNone(self.active())
+        self.assertEqual(self.active()["sha"], HEAD)
 
     def test_a_github_auto_merge_is_disarmed_never_armed(self):
         gh = FakeGh(auto=True)

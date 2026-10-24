@@ -106,11 +106,17 @@ def gh_of(runner):
 # journal
 # --------------------------------------------------------------------------
 
-def marks(db, lot: int, *, limit: int = 200) -> list[dict]:
+def marks(db, lot: int) -> list[dict]:
     """Les marques de fusion automatique du lot, de la plus ancienne à la plus
-    récente."""
+    récente.
+
+    La lecture porte sur les seules notes `auto-merge …` (#3279) : les notes
+    `held` d'un porteur armé pouvaient remplir la fenêtre de 200 événements de
+    `work.events` et en chasser la marque d'armement, faisant croire que rien
+    n'était armé. Une marque de contrôle ne dépend jamais du nombre de notes
+    qui la suivent."""
     out = []
-    for ev in work.events(db, int(lot), limit=limit) or ():
+    for ev in work.events_noted(db, int(lot), "auto-merge ", 0.0) or ():
         m = MARK_RE.match((ev.get("note") or "").strip())
         if m:
             out.append({"id": int(ev.get("id") or 0), "state": m.group("state"),
