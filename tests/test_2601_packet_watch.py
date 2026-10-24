@@ -14,7 +14,7 @@ from datetime import datetime, timedelta, timezone
 from unittest import mock
 from zoneinfo import ZoneInfo
 
-from ameesh import packet_watch, release
+from ameesh import merge_queue, packet_watch, release
 
 PARIS = ZoneInfo("Europe/Paris")
 
@@ -183,7 +183,8 @@ class CompositionBeforePush(unittest.TestCase):
         for phase in ("intake", "build", "qa"):
             with self.subTest(phase=phase), tempfile.TemporaryDirectory() as tmp:
                 row = {"id": 3404, "title": "Paquet horaire h-11 — composition",
-                       "branch": None, "app": "ameesh", "assignee": "impl-05"}
+                       "branch": None, "app": "ameesh", "assignee": "impl-05",
+                       "created_ts": at(4, 5)}
                 store = types.SimpleNamespace(
                     items=lambda state, assignee, limit: [row] if state == phase else [])
                 inventory, send = mock.Mock(), mock.Mock()
@@ -196,6 +197,50 @@ class CompositionBeforePush(unittest.TestCase):
                 self.assertEqual(result["carriers"]["open"], [3404])
                 inventory.assert_not_called()
                 send.assert_not_called()
+
+    def test_title_only_carrier_is_bounded_to_its_slot_and_the_previous_one(self):
+        # #3407 N2: at 04:2x the current slot is 04:00, the previous 03:00.
+        # A title-only composition from an older slot (dead composer) or of
+        # unknown age must not silence the watch for good.
+        for created, expected in ((at(3), "busy"), (at(2, 59), "alerted"),
+                                  (None, "alerted")):
+            with self.subTest(created=created), tempfile.TemporaryDirectory() as tmp:
+                row = {"id": 3404, "title": "Paquet horaire h-11 — composition",
+                       "branch": None, "app": "ameesh", "assignee": "impl-05",
+                       "created_ts": created}
+                store = types.SimpleNamespace(
+                    items=lambda state, assignee, limit: [row] if state == "build" else [])
+                inventory, send = mock.Mock(return_value=payload()), mock.Mock()
+                cfg = cfg_with(tmp)
+                with mock.patch("ameesh.storage.of", return_value=types.SimpleNamespace(work=store)):
+                    result = packet_watch.check(
+                        cfg, None, packet_watch.projects(cfg)["ameesh"], Hourly(),
+                        now=at(4, 20), state={}, inventory=inventory, send=send)
+                self.assertEqual(result["result"], expected)
+                if expected == "busy":
+                    inventory.assert_not_called()
+                    send.assert_not_called()
+                else:
+                    self.assertEqual(send.call_count, 2)
+
+    def test_radar_profile_error_falls_back_to_target_and_still_alerts(self):
+        # #3407 N3: an incompatible radar profile must not turn the watch into
+        # result=error; the configured target is the fallback.
+        inventory, send = mock.Mock(return_value=payload()), mock.Mock()
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch("ameesh.merge_queue.declared_projects",
+                           side_effect=merge_queue.QueueError("bad radar profile")), \
+                mock.patch("ameesh.storage.of",
+                           return_value=types.SimpleNamespace(
+                               work=types.SimpleNamespace(
+                                   items=lambda state, assignee, limit: []))):
+            cfg = cfg_with(tmp)
+            result = packet_watch.check(
+                cfg, None, packet_watch.projects(cfg)["ameesh"], Hourly(),
+                now=at(4, 20), state={}, inventory=inventory, send=send)
+        self.assertEqual(result["result"], "alerted")
+        self.assertIn("QueueError", result["config_error"])
+        self.assertEqual(send.call_count, 2)
 
     def test_title_is_anchored_and_project_and_explicit_target_are_respected(self):
         row = {"title": "Paquet horaire h-11", "app": "ameesh"}
