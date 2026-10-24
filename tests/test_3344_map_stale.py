@@ -93,6 +93,17 @@ class MapStaleTest(PgTestCase):
         self.assertIsNotNone(self.row())
         self.watcher(_Api(workflows=("tests.yml",)))._map(self.db, REPO, ("main",))
         self.assertIsNone(self.row())
+        # aucun workflow actif : découverte réussie, le relevé part aussi
+        self.watcher(_Api(runs=[]))._map(self.db, REPO, ("main",))
+        self.watcher(_Api(workflows=()))._map(self.db, REPO, ("main",))
+        self.assertIsNone(self.row())
+
+    def test_failed_discovery_keeps_the_reading(self):
+        self.watcher(_Api(runs=[]))._map(self.db, REPO, ("main",))
+        watcher = self.watcher(_Api())
+        with mock.patch.object(watcher, "discovered_workflows", return_value=None):
+            watcher._map(self.db, REPO, ("main",))
+        self.assertIsNotNone(self.row())
 
     def test_no_successful_run_is_recorded_without_a_date(self):
         self.watcher(_Api(runs=[]))._map(self.db, REPO, ("main",))

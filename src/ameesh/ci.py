@@ -1174,9 +1174,11 @@ class Watcher:
         from . import plan_github
         found = self.discovered_workflows(repo)
         if not found or MAP_WORKFLOW not in found:
-            if found:
-                # le dépôt ne publie plus de carte : son dernier relevé ne doit
-                # pas vieillir en une alerte perpétuelle (relecture #3344 cx1)
+            if found is not None:
+                # découverte réussie (même sans aucun workflow actif) : le
+                # dépôt ne publie plus de carte, son dernier relevé ne doit pas
+                # vieillir en une alerte perpétuelle (relecture #3344 cx1) ;
+                # None, échec de découverte, garde le relevé
                 storage.of(db).ci.forget_map(repo)
             return
         st = storage.of(db)
