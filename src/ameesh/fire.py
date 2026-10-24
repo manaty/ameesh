@@ -747,11 +747,12 @@ def ready_verdicts(cfg, db, row: dict, marks: list, *, repo: str | None,
     retard y ajouterait des commits déjà fusionnés, dont des chemins
     sensibles, et surclasserait le lot au-dessus de ses vrais avis.
 
-    #3091 : `base_sha` est la cible **déjà résolue** par l'appelant (le
-    `baseRefOid` de la PR pour l'auto-fusion d'un paquet). Elle sert de
-    révision de classe et de preuve de la base de composition ; la ref locale
-    peut être en retard, jamais cette lecture. Sans elle, la ref résolue par
-    `_class_base` fait foi, comme avant.
+    #3091 : `base_sha` est la cible **déjà résolue** par l'appelant (la
+    branche `baseRefName` de la PR, résolue en commit par `land.base_oid`,
+    pour l'auto-fusion d'un paquet ; #3308). Elle sert de révision de classe
+    et de preuve de la base de composition ; la ref locale peut être en
+    retard, jamais cette lecture. Sans elle, la ref résolue par `_class_base`
+    fait foi, comme avant.
 
     Cette porte s'évalue **avant** toute PR, toute entrée en file et toute CI :
     un feu peut être enregistré au gel, mais rien ne part avant les avis."""
@@ -1007,6 +1008,33 @@ def _packet_proof_gate(rollup) -> tuple:
             consigned.append("%s (%s)" % (name, state))
         elif result != radar.CI_GREEN_RESULT:
             gaps.append("%s (%s)" % (name, state))
+    return gaps, consigned
+
+
+def _aggregate_detail_gate(rollup) -> tuple:
+    """#3251 : le détail de l'agrégat requis `tests` (décision owner #128512).
+
+    Le check requis `tests` conclut vert quand l'agrégat a conclu malgré une
+    annulation interne (part annulée pour capacité, runner perdu) ; le check
+    de détail `tests (bilan des parts)`, publié par la même étape, porte alors
+    `neutral` et l'état de la part. Il n'est pas requis par la forge : sans
+    cette lecture, la fusion passerait sans consigner l'annulation.
+
+    Un `neutral` se consigne (non bloquant, canon §3) ; un `failure` bloque
+    (l'agrégat est rouge de toute façon) ; un check en cours attend ; absent,
+    il n'y a rien à consigner (projet sans cet agrégat). Rend
+    `(gaps, consigned)`."""
+    from . import radar
+    gaps, consigned = [], []
+    for entry in radar.aggregate_detail_entries(rollup):
+        state = _rollup_state(entry) or "?"
+        result = radar.check_result(entry)
+        if result == radar.CI_INCONCLUSIVE_RESULT:
+            consigned.append("%s (%s)" % (radar.AGGREGATE_DETAIL_CHECK, state))
+        elif result == radar.CI_WAITING_RESULT:
+            gaps.append("%s (%s)" % (radar.AGGREGATE_DETAIL_CHECK, state))
+        elif result == radar.CI_NEGATIVE_RESULT:
+            gaps.append("%s (%s)" % (radar.AGGREGATE_DETAIL_CHECK, state))
     return gaps, consigned
 
 
@@ -1466,7 +1494,10 @@ def ready_pr(status: dict, *, target: str, project, frozen: str, required=None,
     par la lecture globale `ci_required` quand les checks requis sont déjà
     prouvés. Sans check requis connu, l'ancienne preuve `ci == green` reste
     la seule porte. `report`, s'il est fourni, reçoit `{"consigned": [...]}`
-    pour la trace."""
+    pour la trace.
+    #3251 (décision owner #128512) : le check de détail de l'agrégat `tests`
+    est lu en plus des checks requis — une part interne annulée laisse
+    `tests` vert et se consigne par ce canal."""
     if status.get("draft"):
         return False, "PR #%s is a draft" % status.get("number")
     if target and status.get("base") and status["base"] != target:
@@ -1500,6 +1531,11 @@ def ready_pr(status: dict, *, target: str, project, frozen: str, required=None,
         proof_gaps, proof_consigned = _packet_proof_gate(rollup)
         gaps += proof_gaps
         consigned += proof_consigned
+        # #3251 : le détail de l'agrégat `tests` (décision owner #128512) —
+        # une part interne annulée se consigne, elle ne retient pas la fusion.
+        detail_gaps, detail_consigned = _aggregate_detail_gate(rollup)
+        gaps += detail_gaps
+        consigned += detail_consigned
         if report is not None:
             report.update({"consigned": consigned,
                            "required": [name for name, _app in pairs]})

@@ -16,7 +16,8 @@ script (il porte les motifs et les exemptions). Pour chaque clé du schéma
 `ameesh-mechanics` elle refuse les motifs littéraux connus — coupures et
 fuseau, cadence des paquets, plafond de lots en build, politique CI, familles
 et indépendance des avis, politique de fusion, seuils et plafonds de
-prévalidation, seuil de lot du backlog (#2584) — et exige une exemption nommée et datée pour un littéral
+prévalidation, seuil de lot du backlog (#2584), seuil et marges du staging
+hors créneau (#3291) — et exige une exemption nommée et datée pour un littéral
 historique.
 
 Une exemption vit dans `EXEMPTIONS` ci-dessous : chemin, paramètre, littéral
@@ -63,10 +64,10 @@ MECHANICS_REL = "src/ameesh/mechanics.py"
 #: suites et artefacts de relecture : ni code de production ni consommateur
 EXCLUDED_PREFIXES = ("tests/", "reviews/")
 
-#: les clés du schéma `ameesh-mechanics` (document global, surcharges et
-#: prévalidation). Maintien : `tests/test_2449_garde_mecanique.py` compare
-#: cette liste aux constantes du lecteur `src/ameesh/mechanics.py` ; une clé
-#: ajoutée ou retirée là-bas sans la garde fait rougir le témoin.
+#: les clés du schéma `ameesh-mechanics` (document global, surcharges,
+#: prévalidation et staging). Maintien : `tests/test_2449_garde_mecanique.py`
+#: compare cette liste aux constantes du lecteur `src/ameesh/mechanics.py` ;
+#: une clé ajoutée ou retirée là-bas sans la garde fait rougir le témoin.
 SCHEMA_KEYS = (
     "schema",
     "timezone",
@@ -91,6 +92,9 @@ SCHEMA_KEYS = (
     "prevalidation.parts_script",
     "prevalidation.timeout_seconds",
     "backlog.lot_min_value",
+    "staging.waiting_lots_min",
+    "staging.before_cutoff_seconds",
+    "staging.before_packet_seconds",
     "projects",
 )
 
@@ -134,6 +138,9 @@ BINDINGS = {
     "parts_script": "prevalidation.parts_script",
     "timeout_seconds": "prevalidation.timeout_seconds",
     "lot_min_value": "backlog.lot_min_value",
+    "waiting_lots_min": "staging.waiting_lots_min",
+    "before_cutoff_seconds": "staging.before_cutoff_seconds",
+    "before_packet_seconds": "staging.before_packet_seconds",
 }
 
 #: constantes d'implémentation historiques dont le nom ne porte pas la clé
@@ -172,6 +179,9 @@ DICT_BINDINGS = {
     "timezone": "timezone",
     "schema": "schema",
     "lot_min_value": "backlog.lot_min_value",
+    "waiting_lots_min": "staging.waiting_lots_min",
+    "before_cutoff_seconds": "staging.before_cutoff_seconds",
+    "before_packet_seconds": "staging.before_packet_seconds",
 }
 #: clés du bloc `prevalidation` dans un mapping, seulement dans un fichier
 #: qui parle de prévalidation
@@ -454,6 +464,9 @@ def _valid_binding(key: str, value, name: str, train_context: bool,
     if key == "backlog.lot_min_value":
         # #2584 : un score de valeur (1 à 100), le seuil d'un lot du canon §2
         return type(value) is int and 1 <= value <= 100
+    if key.startswith("staging."):
+        # #3291 : un seuil de lots ou une marge en secondes, entiers positifs
+        return type(value) is int and value > 0
     return False
 
 

@@ -24,7 +24,7 @@ import pathlib
 import subprocess
 import unittest
 
-from tests.test_940_agregat_bash import run_script, scenario
+from tests.test_940_agregat_bash import agregat
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
 WORKFLOW = REPO / ".github" / "workflows" / "tests.yml"
@@ -130,8 +130,11 @@ class WorkflowStepsTest(unittest.TestCase):
         self.assertFalse((REPO / "pwned").exists())
 
     def test_a_failed_plan_reddens_the_aggregate(self):
-        self.assertIn('test "${{ needs.plan.result }}" = success',
-                      workflow()[workflow().index("\n  tests:\n"):])
+        # #3251 : la garde vit dans scripts/ci-agregat.py, qui reçoit le
+        # résultat du plan ; un plan refusé reste un négatif de l'agrégat
+        # (tests/test_3251_agregat_annulation.py).
+        tests_job = workflow()[workflow().index("\n  tests:\n"):]
+        self.assertIn('--plan "${{ needs.plan.result }}"', tests_job)
 
 
 class GuardTest(unittest.TestCase):
@@ -199,9 +202,15 @@ class RequiredCheckTest(unittest.TestCase):
     même run (plan réussi, parts vertes) le rendait vert."""
 
     def aggregate(self, plan_result: str) -> int:
-        return run_script(scenario(**{"needs.plan.result": plan_result,
-                                      "github.event_name": "workflow_dispatch",
-                                      "needs.version.result": "skipped"})).returncode
+        # #3251 : la classification de l'agrégat vit dans scripts/ci-agregat.py
+        # (l'ancien script bash ne fait plus foi) ; même entrée qu'un
+        # workflow_dispatch, sans publication de check.
+        return agregat.main([
+            "--event", "workflow_dispatch", "--plan", plan_result,
+            "--version", "skipped", "--version-only", "false",
+            "--docs-only", "false", "--doc-readers", "skipped",
+            "--psycopg", "success", "--psycopg-parts", "[1]",
+            "--psql", "skipped", "--psql-parts", "[]"])
 
     def test_without_guard_the_dispatch_was_green(self):
         self.assertEqual(self.aggregate("success"), 0)

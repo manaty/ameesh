@@ -899,6 +899,9 @@ class Agent:
     #: by the agent's Placement card, so a claim can only happen on a host
     #: whose current placement verdict admits the agent.
     candidats: list[str] | None = None
+    #: #3185: the other projects whose lots this agent may review (`relit:`),
+    #: beside its own; only declared projects (`validate`). None: none.
+    relit: list[str] | None = None
 
     @property
     def is_persona(self) -> bool:
@@ -1368,6 +1371,7 @@ class Canon:
             "agents": [dict(title=a.title, aliases=a.aliases or [], type=a.fiche.type, responsible=a.responsible, team=a.team,
                             capabilities=a.capabilities, harness=a.harness, model=a.model,
                             harnesses=a.harnesses, roles=a.roles, projects=a.projects,
+                            relit=a.relit,
                             provider=a.provider, credential_mode=a.credential_mode,
                             budget_usd_per_day=a.budget_usd_per_day, tools=a.tools,
                             reviewers=a.reviewers, priority=a.priority,
@@ -2969,6 +2973,18 @@ class _Loader:
         candidats = self._list(fiche, "candidats", where, "agent-candidats-invalid", **subject)
         if candidats is not None:
             candidats = list(dict.fromkeys(c for c in candidats if c))
+        # #3185 : projets relus hors équipe ; une liste seulement, comme
+        # `projects` (`relit: a, b` est une chaîne, jamais deux projets)
+        if fiche.data.get("relit") is not None \
+                and not isinstance(fiche.data.get("relit"), list):
+            self.add("agent-relit-invalid", ERROR,
+                     "`relit`: list expected (`relit: [a, b]`), not %r"
+                     % (fiche.data.get("relit"),), **where, **subject)
+            relit = None
+        else:
+            relit = self._list(fiche, "relit", where, "agent-relit-invalid", **subject)
+        if relit is not None:
+            relit = list(dict.fromkeys(p for p in relit if p))
         self.canon.agents.append(Agent(
             title=fiche.title,
             responsible=_text(fiche.data.get("responsible")),
@@ -2991,6 +3007,7 @@ class _Loader:
             aliases=agent_aliases,
             releve=releve,
             candidats=candidats,
+            relit=relit,
         ))
 
     def _build_persona(self, fiche: Fiche, where: dict) -> None:
@@ -3752,6 +3769,8 @@ def validate(canon: Canon, known_projects: Iterable[str] | None = None) -> list[
     known_harnesses = set(harnesses.known_ids())
     known = None if known_projects is None else (
         set(known_projects) | {p.team for p in canon.packages if p.team})
+    declared_projects = {p.team for p in canon.packages if p.team} | {
+        project for agent in canon.agents for project in agent.effective_projects}
     for agent in canon.agents:
         f = agent.fiche
         if not NAME_RE.match(agent.title):
@@ -3827,6 +3846,16 @@ def validate(canon: Canon, known_projects: Iterable[str] | None = None) -> list[
                         "unknown projects for %s: %s (neither a work package's team, "
                         "`github.projects` nor a lot's project)"
                         % (agent.title, ", ".join(unknown)), f, agent=agent.title)
+        # #3185 : `relit` ne nomme que des projets déclarés — ceux du canon
+        # (équipes des paquets, projets des fiches) et, avec une base, les
+        # projets connus ; une faute de frappe désignerait un relecteur nulle part
+        if agent.relit:
+            declared = (known or set()) | declared_projects
+            stray = [p for p in agent.relit if p not in declared]
+            if stray:
+                add("agent-relit-unknown", ERROR,
+                    "`relit` of %s names undeclared projects: %s"
+                    % (agent.title, ", ".join(stray)), f, agent=agent.title)
 
     # -- human deputies and superiors (L51, 0032 §2, 0033 §7) --------------------
     for member in canon.members:

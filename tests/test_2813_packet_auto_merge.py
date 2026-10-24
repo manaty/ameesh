@@ -72,14 +72,15 @@ class Forge:
     def __init__(self, *, protection=PROTECTED, protection_error="", head=HEAD,
                  state="OPEN", base="main", auto=False, tests="pending", app=APP,
                  merge_error="", disarm_error="", view_error="", sticky=False,
-                 branch="integration/paquet-h-20261020-0500", base_oid=HEAD):
+                 branch="integration/paquet-h-20261020-0500", base_oid=HEAD,
+                 ref_error=""):
         self.protection, self.protection_error = protection, protection_error
         self.head, self.state, self.base, self.auto = head, state, base, auto
         self.tests, self.app, self.branch = tests, app, branch
         self.merge_error, self.disarm_error = merge_error, disarm_error
         self.view_error = view_error
-        #: la cible résolue publiée par la PR (`baseRefOid`, #3091)
-        self.base_oid = base_oid
+        #: la cible résolue, lue par `gh api git/ref/heads/<base>` (#3308)
+        self.base_oid, self.ref_error = base_oid, ref_error
         #: plusieurs PR partagent ce faux : un geste ne vaut pas pour l'autre
         self.sticky = sticky
         self.calls: list[list[str]] = []
@@ -100,6 +101,12 @@ class Forge:
             return 0, json.dumps({"id": 200, "head_sha": self.head, "head_branch": self.branch,
                                   "event": "pull_request", "path": ".github/workflows/tests.yml",
                                   "status": "completed", "conclusion": "success"}), ""
+        if args[:1] == ["api"] and "/git/ref/heads/" in path:
+            if self.ref_error:
+                return 1, "", self.ref_error
+            return 0, json.dumps({"ref": "refs/heads/%s" % self.base,
+                                  "object": {"type": "commit",
+                                             "sha": self.base_oid}}), ""
         if args[:3] == ["api", "-X", "POST"] and args[3].endswith("/merges"):
             fields = dict(a.split("=", 1) for a in args[4:] if a != "-f")
             if self.merge_error:
@@ -137,8 +144,7 @@ class Forge:
                 return 1, "", self.view_error
             return 0, json.dumps({
                 "state": self.state, "headRefOid": self.head, "headRefName": self.branch,
-                "baseRefName": self.base, "baseRefOid": self.base_oid,
-                "isDraft": False,
+                "baseRefName": self.base, "isDraft": False,
                 "autoMergeRequest": {"enabledAt": "2026-10-20T03:00:00Z"} if self.auto
                 else None, "statusCheckRollup": rollup(self.tests)}), ""
         if args[:2] == ["pr", "merge"] and "--disable-auto" in args:
@@ -181,7 +187,8 @@ class FakeGh(Forge):
 
 
 class Journal(unittest.TestCase):
-    """Le faux journal du lot (`work.events`, `work.note`) et le bail."""
+    """Le faux journal du lot (`work.events`/`events_noted`, `work.note`) et
+    le bail."""
 
     def setUp(self) -> None:
         self.events: dict[int, list[dict]] = {}
@@ -189,6 +196,8 @@ class Journal(unittest.TestCase):
         stack = contextlib.ExitStack()
         self.addCleanup(stack.close)
         stack.enter_context(mock.patch.object(work, "events", self._events))
+        stack.enter_context(mock.patch.object(work, "events_noted",
+                                              self._events_noted))
         stack.enter_context(mock.patch.object(work, "note", self._note))
         #: le bail `auto-merge:<lot>` : libre, sauf quand un témoin le prend
         self.held: set[int] = set()
@@ -211,7 +220,15 @@ class Journal(unittest.TestCase):
             packet_automerge, "_verdicts", lambda *a, **k: self.gate))
 
     def _events(self, db, item_id, limit=100):
-        return list(reversed(self.events.get(int(item_id), [])))
+        # #3279 : le vrai `work.events` fenêtre ; le faux doit le faire aussi,
+        # sinon les notes `held` ne peuvent pas évincer la marque d'armement.
+        rows = list(reversed(self.events.get(int(item_id), [])))
+        return rows if limit is None else rows[:int(limit)]
+
+    def _events_noted(self, db, item_id, prefix, since_ts=0.0):
+        return [event for event in self.events.get(int(item_id), [])
+                if (event.get("note") or "").startswith(prefix)
+                and float(event.get("created_ts") or 0) >= float(since_ts)]
 
     def _note(self, db, item_id, text, **kw):
         self.events.setdefault(int(item_id), []).append(
@@ -241,9 +258,14 @@ class ArmTest(Journal):
         self.assertEqual(out["merge"]["result"], "pending", out)
         self.assertEqual(gh.auto_arms(), [])
         self.assertEqual(gh.merges(), [])
-        self.assertTrue(self.notes()[-1].startswith(
+        self.assertTrue(self.notes()[0].startswith(
             "auto-merge armed repo=%s pr=%d sha=%s base=main method=merge required=tests"
             % (SLUG, NUM, HEAD)), self.notes())
+        # #3175 : la tentative immédiate qui attend la CI laisse son motif
+        self.assertTrue(self.notes()[1].startswith(
+            "auto-merge held repo=%s pr=%d sha=%s base=main — " % (SLUG, NUM, HEAD)),
+            self.notes())
+        self.assertIn("PR #%d" % NUM, self.notes()[1])
         self.assertEqual((self.active()["sha"], self.active()["base"]), (HEAD, "main"))
 
     def test_a_composition_already_green_merges_at_once_on_its_head(self):
@@ -260,6 +282,21 @@ class ArmTest(Journal):
         out = self.arm(gh)
         self.assertEqual(out["state"], "already-armed", out)
         self.assertEqual(len([n for n in self.notes() if " armed " in n]), 1)
+
+    def test_held_notes_do_not_evict_the_armed_mark(self):
+        # #3279 : un porteur qui refuse à chaque passage écrit des notes
+        # `held` (motifs alternés A/B/A, non dédupliquées par le journal).
+        # Au-delà de la fenêtre réelle de `work.events` (200), l'armement
+        # disparaissait : il ne doit plus être chassé par ses propres traces.
+        self.armed()
+        for index in range(250):
+            self._note(None, LOT, "auto-merge held repo=%s pr=%d sha=%s base=main "
+                                  "— motif %d" % (SLUG, NUM, HEAD, index % 2))
+        self.assertEqual(len(work.events(None, LOT, limit=200)), 200)
+        self.assertIn("armed", [row["state"]
+                                for row in packet_automerge.marks(None, LOT)])
+        self.assertIsNotNone(self.active())
+        self.assertEqual(self.active()["sha"], HEAD)
 
     def test_a_github_auto_merge_is_disarmed_never_armed(self):
         gh = FakeGh(auto=True)
@@ -612,7 +649,9 @@ class PassTest(Journal):
     def test_r1_b1_a_refused_review_gate_never_merges(self):
         """cx3 R1 : la porte des verdicts (classe, avis, membres et delta d'un
         porteur) passe avant la lecture des protections et tout geste de fusion.
-        La lecture du statut CI inclut la preuve de run du portier (#2876)."""
+        La lecture du statut CI inclut la preuve de run du portier (#2876) ; la
+        cible résolue (`git/ref`, #3308) est lue pour cette porte, pas une
+        protection."""
         self.armed()
         self.gate = (False, "2 independent reviews missing on 1111111111", None)
         gh = FakeGh(tests="success")
@@ -621,7 +660,8 @@ class PassTest(Journal):
         self.assertIn("reviews missing", out["why"])
         self.assertEqual(gh.merges(), [])
         self.assertEqual([c for c in gh.calls if c[:1] == ["api"]
-                          and "/actions/" not in c[1]], [])
+                          and "/actions/" not in c[1]
+                          and "/git/ref/heads/" not in c[1]], [])
 
     def test_r1_b2_a_protection_emptied_after_publication_never_merges(self):
         self.armed()
@@ -750,6 +790,99 @@ class VerdictsTest(unittest.TestCase):
         self.assertEqual(status["base"], "main")
         self.assertEqual(status["head"], HEAD)
 
+    def agents2(self, checkout, *, clone="/home/ameesh/work/ameesh-packets", same=True,
+                fetch_error=""):
+        """#3175 : l'hôte du passage n'a ni le dossier de l'assigné (sur un
+        autre hôte) ni `radar.projects` ; seul `packet_watch` déclare un clone."""
+        row, ms = {"id": LOT, "assignee": "mty-amh-impl-01"}, [{"kind": "frozen", "sha": HEAD}]
+        with mock.patch.object(fire, "_repo_of", return_value=None), \
+                mock.patch.object(fire, "_project", return_value=None), \
+                mock.patch.object(fire, "_checkout", return_value=clone) as root, \
+                mock.patch.object(fire, "_same_repository", return_value=same), \
+                mock.patch.object(packet_automerge, "_fetch_into",
+                                  return_value=fetch_error) as self.fetch, \
+                mock.patch.object(fire, "ready_verdicts",
+                                  return_value=(True, "", {})) as gate:
+            out = packet_automerge._verdicts("cfg", "db", row, ms, slug=SLUG, base="main",
+                                             checkout=checkout,
+                                             branch="integration/paquet-h-20261023-1600")
+        return out, gate, root, row, ms
+
+    def test_3175_the_pass_clone_backs_the_review_gate(self):
+        out, gate, root, row, ms = self.agents2("~/work/ameesh-packets")
+        self.assertEqual(out, (True, "", None))
+        root.assert_called_once_with("~/work/ameesh-packets")
+        self.fetch.assert_called_once_with("/home/ameesh/work/ameesh-packets",
+                                           ("integration/paquet-h-20261023-1600", "main"))
+        gate.assert_called_once_with("cfg", "db", row, ms,
+                                     repo="/home/ameesh/work/ameesh-packets",
+                                     project=None, target="main")
+
+    def test_3175_a_clone_that_cannot_be_refreshed_refuses_with_its_reason(self):
+        (ok, why, _project), gate, *_ = self.agents2("/clone", fetch_error="HTTP 503")
+        self.assertFalse(ok)
+        self.assertIn("cannot be refreshed", why)
+        self.assertIn("HTTP 503", why)
+        gate.assert_not_called()
+
+    def test_3175_fetch_into_brings_the_objects_without_moving_a_branch(self):
+        def git(*args, cwd):
+            return subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True,
+                                  text=True).stdout.strip()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            origin, clone = Path(tmp, "origin"), Path(tmp, "clone")
+            origin.mkdir()
+            git("init", "-q", "-b", "main", cwd=origin)
+            git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty",
+                "-m", "base", cwd=origin)
+            git("clone", "-q", str(origin), str(clone), cwd=tmp)
+            git("checkout", "-q", "-b", "integration/paquet", cwd=origin)
+            git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty",
+                "-m", "head", cwd=origin)
+            head = git("rev-parse", "HEAD", cwd=origin)
+            refs = git("for-each-ref", "refs/heads", cwd=clone)
+            self.assertEqual(packet_automerge._fetch_into(
+                str(clone), ("integration/paquet", "main")), "")
+            self.assertEqual(git("cat-file", "-t", head, cwd=clone), "commit")
+            self.assertEqual(git("for-each-ref", "refs/heads", cwd=clone), refs)
+            self.assertIn("integration/absente", packet_automerge._fetch_into(
+                str(clone), ("integration/absente",)))
+
+    def test_3175_a_host_without_any_clone_says_so(self):
+        for checkout, clone, same in (("", None, True), ("/nulle/part", None, True),
+                                      ("/autre-depot", "/autre-depot", False)):
+            with self.subTest(checkout=checkout):
+                (ok, why, _project), gate, _root, _row, _ms = self.agents2(
+                    checkout, clone=clone, same=same)
+                self.assertFalse(ok)
+                self.assertIn("no checkout of %s on this host" % SLUG, why)
+                self.assertIn("packet_watch.projects.<p>.repo", why)
+                gate.assert_not_called()
+
+    def test_3175_the_pass_hands_its_clone_to_the_gate(self):
+        seen = {}
+
+        def verdicts(cfg, db, row, ms, **kw):
+            seen.update(kw)
+            return False, "stop", None
+
+        with mock.patch.object(packet_automerge, "open_carriers", return_value=[LOT]), \
+                mock.patch.object(packet_automerge, "_verdicts", verdicts), \
+                mock.patch.object(packet_automerge, "marks", return_value=[{
+                    "id": 1, "state": "armed", "repo": SLUG, "pr": NUM, "sha": HEAD,
+                    "base": "main", "required": ("tests",), "why": ""}]), \
+                mock.patch.object(packet_automerge, "_lock", return_value="bail"), \
+                mock.patch.object(packet_automerge, "_unlock"), \
+                mock.patch.object(packet_automerge, "_note_fenced"), \
+                mock.patch.object(fire, "_fresh", return_value=(
+                    {"id": LOT, "app": "ameesh"},
+                    [{"id": 1, "kind": "frozen", "sha": HEAD, "at_ts": 1.0}])):
+            rows = packet_automerge.watch(None, None, "ameesh", gh=FakeGh(tests="success"),
+                                          checkout="/clone")
+        self.assertEqual(rows[0]["result"], "pending", rows)
+        self.assertEqual(seen.get("checkout"), "/clone")
+
     def test_an_unreadable_gate_refuses(self):
         with mock.patch.object(fire, "_repo_of", side_effect=RuntimeError("registre")):
             ok, why, project = packet_automerge._verdicts(None, None, {"id": LOT}, [],
@@ -757,6 +890,89 @@ class VerdictsTest(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIsNone(project)
         self.assertIn("registre", why)
+
+
+class HeldTest(Journal):
+    """#3175 : sur #2409 (h-1500), armé à 13:47Z, le passage n'a laissé aucune
+    trace jusqu'à la fusion manuelle du bureau ; un refus du passage est
+    toujours consigné au lot, avec son motif, une fois par motif."""
+
+    def check(self, gh, **kw):
+        return packet_automerge.check(None, None, LOT, gh=gh, **kw)
+
+    def holds(self) -> list[str]:
+        return [n for n in self.notes() if n.startswith("auto-merge held ")]
+
+    def test_a_refusal_of_the_pass_is_journaled_with_its_reason(self):
+        self.armed()
+        out = self.check(FakeGh(tests="pending"))
+        self.assertEqual(out["result"], "pending", out)
+        self.assertEqual(self.holds(), [
+            "auto-merge held repo=%s pr=%d sha=%s base=main — %s" % (SLUG, NUM, HEAD,
+                                                                     out["why"])])
+        self.assertIsNotNone(self.active())
+
+    def test_the_same_reason_is_journaled_once_a_new_one_again(self):
+        self.armed()
+        for _ in range(3):
+            self.check(FakeGh(tests="pending"))
+        self.assertEqual(len(self.holds()), 1, self.notes())
+        self.gate = (False, "2 independent reviews missing on 1111111111", None)
+        out = self.check(FakeGh(tests="pending"))
+        self.assertEqual(out["result"], "pending", out)
+        self.assertEqual(len(self.holds()), 2, self.notes())
+        self.assertIn(" ".join(out["why"].split()), self.holds()[-1])
+        self.gate = (True, "", None)
+        self.check(FakeGh(tests="pending"))
+        self.assertEqual(len(self.holds()), 3, self.notes())
+
+    def test_a_new_arming_journals_its_refusal_again(self):
+        self.armed()
+        self.check(FakeGh(tests="pending"))
+        self.armed()
+        self.check(FakeGh(tests="pending"))
+        self.assertEqual(len(self.holds()), 2, self.notes())
+
+    def test_a_refused_review_gate_names_its_reason(self):
+        self.armed()
+        self.gate = (False, "2 independent reviews missing on 1111111111", None)
+        self.check(FakeGh(tests="success"))
+        self.assertTrue(self.holds()[-1].endswith(
+            "— 2 independent reviews missing on 1111111111"), self.notes())
+
+    def test_an_error_of_the_pass_is_journaled_as_such(self):
+        self.armed()
+        out = self.check(FakeGh(tests="success",
+                                protection={"required_status_checks": None}))
+        self.assertEqual(out["result"], "error", out)
+        self.assertIn("— error: main no longer enforces", self.holds()[-1])
+
+    def test_a_merge_a_dry_run_or_a_busy_lease_journal_no_refusal(self):
+        self.armed()
+        self.assertEqual(self.check(FakeGh(tests="pending"), dry_run=True)["result"],
+                         "pending")
+        self.assertEqual(self.holds(), [])
+        self.held.add(LOT)
+        self.assertEqual(self.check(FakeGh(tests="pending"))["result"], "busy")
+        self.assertEqual(self.holds(), [])
+        self.held.discard(LOT)
+        self.assertEqual(self.check(FakeGh(tests="success"))["result"], "merged")
+        self.assertEqual(self.holds(), [])
+
+    def test_a_journal_failure_never_changes_the_outcome(self):
+        self.armed()
+        with mock.patch.object(packet_automerge, "_note_fenced",
+                               side_effect=RuntimeError("base injoignable")):
+            out = self.check(FakeGh(tests="pending"))
+        self.assertEqual(out["result"], "pending", out)
+
+    def test_a_held_mark_is_parsed_and_never_closes_the_arming(self):
+        self.armed()
+        self._note(None, LOT, "auto-merge held repo=%s pr=%d sha=%s base=main — a — b"
+                              % (SLUG, NUM, HEAD))
+        rows = packet_automerge.marks(None, LOT)
+        self.assertEqual((rows[-1]["state"], rows[-1]["why"]), ("held", "a — b"))
+        self.assertEqual(self.active()["state"], "armed")
 
 
 class TickTest(unittest.TestCase):
@@ -778,7 +994,8 @@ class TickTest(unittest.TestCase):
         out, watch = self.tick([{"lot": LOT, "result": "pending"},
                                 {"lot": 9, "result": "idle"}])
         self.assertEqual([r["result"] for r in out], ["grace"])
-        watch.assert_called_once_with(mock.ANY, None, "ameesh", gh="gh", dry_run=False)
+        watch.assert_called_once_with(mock.ANY, None, "ameesh", gh="gh", dry_run=False,
+                                      checkout=mock.ANY)
 
     def test_a_merge_a_disarm_and_an_error_are_reported(self):
         out, _watch = self.tick([{"lot": LOT, "result": "merged", "pr": NUM},
@@ -808,6 +1025,7 @@ class ArmingGh(LabelGh):
                 argv[:3] == ["api", "-X", "POST"] and argv[3].endswith("/merges")) or (
                 argv[:1] == ["api"] and (path.endswith("/protection")
                                          or "/rules/branches/" in path
+                                         or "/git/ref/heads/" in path
                                          or "/check-runs" in path)):
             self.calls.append(list(argv))
             return self.forge.answer(argv)

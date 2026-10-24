@@ -3180,10 +3180,14 @@ class WorkItems(interface.WorkItems):
         else:
             where = "state NOT IN %s" % _CLOSED
         if ready_only:
+            # #3296 : le début prévu (jour local du processus, comme
+            # `lot_takeable` et `_pending`) — un élément à venir attend sa date.
+            where += " AND (planned_start IS NULL OR planned_start <= %s)"
             where += (" AND NOT EXISTS (SELECT 1 FROM work_item_dependencies d"
                       "                      JOIN work_items b ON b.id = d.blocker_id"
                       "                     WHERE d.work_item_id = work_items.id"
                       "                       AND b.state NOT IN %s)" % _CLOSED)
+            params += (_dt.date.today().isoformat(),)
         sql = ("SELECT " + item_columns(self.db) + " FROM work_items"
                " WHERE type = 'improvement' AND " + where
                + " ORDER BY coalesce(priority, 2), value_score DESC NULLS LAST, id"
@@ -3622,13 +3626,14 @@ class WorkItems(interface.WorkItems):
             " AND work_item_measures.ci_minutes IS NOT NULL"
             " THEN work_item_measures.agent_source ELSE excluded.agent_source END,"
             "  merge_sha = coalesce(excluded.merge_sha, work_item_measures.merge_sha),"
-            "  diff_files = coalesce(excluded.diff_files, work_item_measures.diff_files),"
-            "  diff_insertions = coalesce(excluded.diff_insertions,"
-            "                             work_item_measures.diff_insertions),"
-            "  diff_deletions = coalesce(excluded.diff_deletions,"
-            "                            work_item_measures.diff_deletions),"
-            "  measured_size = coalesce(excluded.measured_size,"
-            "                           work_item_measures.measured_size),"
+            # a measure that could not read a size keeps the stored one, unless
+            # it doubts for good (`size_doubt`, #3056): the old size is then
+            # cleared, not shown as measured
+            + ", ".join(
+                "  %s = %s" % (c, "NULL" if m.get("size_doubt") else
+                               "coalesce(excluded.%s, work_item_measures.%s)" % (c, c))
+                for c in ("diff_files", "diff_insertions", "diff_deletions",
+                          "measured_size")) + ","
             "  declared_size = excluded.declared_size"
             " RETURNING " + self._MEASURE_COLUMNS,
             (int(item_id), float(m["started_ts"]), float(m["merged_ts"]),

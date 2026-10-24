@@ -421,6 +421,32 @@ class NamedLotsTest(unittest.TestCase):
         self.assertEqual(clones.named_lots("nexlink-0.2.10", agents), [])
         self.assertEqual(clones.named_lots("foo-2026.10.19-665", agents), [665])
 
+    def test_a_sha_fragment_is_not_a_lot(self):
+        """#3266 (relecture) : un nombre collé à des lettres est un fragment
+        de SHA, pas un lot ; un nombre nommé par un marqueur (`wt3220`,
+        `.work-1392`) reste un lot."""
+        agents = {"deepseek4", "mty-amh-impl-04", "a1"}
+        self.assertEqual(clones.named_lots("review-3220-ab1234cd", agents), [3220])
+        self.assertEqual(clones.named_lots("wt3220-ca47", agents), [3220])
+        self.assertEqual(clones.named_lots("copy-1234abcd", agents), [])
+        self.assertEqual(clones.named_lots("wt3220", agents), [3220])
+        self.assertEqual(clones.named_lots(".work-1392", agents), [1392])
+        self.assertEqual(clones.named_lots("wt-432-433", agents), [432, 433])
+
+    def test_a_diag_directory_names_its_lot_and_a_date_names_none(self):
+        """#3277 : `diag462` (tmp d'agent) nomme #462 ; une date n'est jamais
+        un lot, collée à `diag` ou non."""
+        agents = {"codex2", "a1"}
+        self.assertEqual(clones.named_lots("diag462", agents), [462])
+        self.assertEqual(clones.named_lots("diag462-fix", agents), [462])
+        self.assertEqual(clones.named_lots("pre-diag462", agents), [462])
+        self.assertEqual(clones.named_lots("diagnostic462", agents), [])
+        self.assertEqual(clones.named_lots("diag2024-10-24", agents), [])
+        self.assertEqual(clones.named_lots("diag462-20261024", agents), [462])
+        self.assertEqual(clones.named_lots("diag462-2026-10-24", agents), [462])
+        self.assertEqual(clones.named_lots("wt3220-20261024", agents), [3220])
+        self.assertEqual(clones.named_lots("diag462-463", agents), [462, 463])
+
 
 if __name__ == "__main__":
     unittest.main()

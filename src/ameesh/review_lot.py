@@ -1243,7 +1243,10 @@ def class_at_merge(db, lot: int, *, item: Optional[dict] = None,
     y lire le diff du lot. On retient le premier qui porte le commit de fusion
     ou le gel **et** dont le delta est lisible : un répertoire qui n'est pas un
     dépôt git, un clone partiel ou un diff illisible laisse la place au
-    suivant (#2968). `target` la cible déjà résolue.
+    suivant (#2968). `target` la cible déjà résolue. Avant la lecture, chaque
+    candidat qui ne prouve pas encore le commit rafraîchit sa cible exacte puis
+    le commit (`lot_measures.refresh_target`, #3275) : un clone partagé non
+    fetché depuis la fusion n'est pas un trou de fusion.
 
     Sans intervalle **prouvé** (aucun candidat ne contient le commit, diff
     illisible, ni gel ni commit), la classe n'est pas demandée à `of_lot` : son
@@ -1288,6 +1291,12 @@ def class_at_merge(db, lot: int, *, item: Optional[dict] = None,
         unproven = ""
         for candidate in candidates:
             reason = ""
+            # #3275 : un clone partagé n'est frais que de son dernier fetch ;
+            # une fusion poussée depuis y est absente (Nexlink #3268). La
+            # cible exacte, puis le commit de fusion, sont rafraîchis avant la
+            # lecture ; un commit encore absent reste un doute nommé, que le
+            # rattrapage retente au balayage suivant.
+            refreshed = lot_measures.refresh_target(candidate, target or None, tips)
             # le commit de la fusion constatée d'abord ; à défaut le gel (fusion
             # déclarée sans commit lisible, `ameesh work merged` à la main)
             for tip in tips:
@@ -1303,8 +1312,19 @@ def class_at_merge(db, lot: int, *, item: Optional[dict] = None,
                     if rng is None:
                         rng = lot_measures.diff_range(candidate, tip, target or None)
                     if not rng:
-                        reason = "le dépôt %s ne contient pas le commit %s" % (
-                            candidate, tip[:12])
+                        # #3056 : un dépôt qui porte le commit doute sur sa
+                        # cible publiée (illisible, absente ou pointe non
+                        # récupérée), il ne « manque » pas le commit
+                        if lot_measures.has_commit(candidate, tip):
+                            reason = ("le dépôt %s porte le commit %s, mais aucune "
+                                      "cible publiée lisible ne situe sa fusion "
+                                      "(cible absente, ls-remote illisible ou pointe "
+                                      "non récupérée)" % (candidate, tip[:12]))
+                        else:
+                            reason = "le dépôt %s ne contient pas le commit %s" % (
+                                candidate, tip[:12])
+                        if refreshed:
+                            reason += " (après %s)" % refreshed
                         continue
                     paths = lot_measures.diff_paths(candidate, *rng)
                 except lot_measures.UnprovenLotDiff as exc:

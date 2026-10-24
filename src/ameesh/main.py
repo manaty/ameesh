@@ -10,6 +10,9 @@
   ameesh adopt <agent> --session ID --harness claude|codex|deepseek [--account C]
         [--cwd D] [--brief FILE|-] [--force]
         an existing (closed) interactive session moves under the runner (L39);
+  ameesh agent move NOM --to HOST [--keep-session]   manual move of a pinned agent
+        to another admitted host, without a live lease when the source executor
+        is stopped (#3299);
   ameesh agent peek <name> [--limit N] [--json]   responsible human's work summary;
   ameesh agent spawn <name> --by <creator> --ttl <duration>   ephemeral agent;
   ameesh alerts [--follow] [--json]     operational alerts (one object per line);
@@ -33,6 +36,11 @@
   ameesh conflicts [--all] [--json]     conflict radar between work items (L160b);
   ameesh cost …               turn cost, per-turn usage, gauges and their
         history, pay-per-token provider balance (`cost turns|gauges|balance`);
+  ameesh debit [--json] [--check] [--hours N] [--threshold 2h]
+        débit mesuré sur les jalons (canon 24/10/2026) : lots en qa/blocked par
+        âge, avis dus par relecteur, avis bloquants non traités, holds et
+        réveils, agents au repos avec du travail dû, tours et fusions par
+        heure, durée de CI par job ; `--check` sort 2 sur une attente > seuil ;
   ameesh decide <id> <option | "free text"> [--key FILE | --signed]
         | withdraw <id> | show <id>
         the human's answer (never an agent's), sent back to the requester by
@@ -308,6 +316,11 @@ def _dispatch(argv: list[str] | None) -> int:
     if command == "progress":
         from . import progress
         return progress.main(rest)
+    if command == "debit":
+        # canon 24/10/2026 : l'auditeur commence chaque passage par le débit,
+        # mesuré sur les jalons (jamais sur les colonnes d'un lot).
+        from . import debit
+        return debit.main(rest)
     if command == "process":
         # #2225 : vérifier le bloc `workflow:` d'une carte Process du canon
         from . import process_card

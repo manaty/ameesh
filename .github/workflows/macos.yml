@@ -88,21 +88,27 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-          cache: pip
-          cache-dependency-path: pyproject.toml
+          # #3207 : pas de cache pip — sous `pull_request_target`,
+          # setup-python écrirait un cache dans la portée de la branche de
+          # base à partir du pyproject de la PR (l'auditeur de #3198 l'a
+          # écarté ; une suite par nuit ou à la demande n'en a pas besoin).
       - name: PostgreSQL et outils GNU (Homebrew)
         env:
           HOMEBREW_NO_AUTO_UPDATE: "1"
           HOMEBREW_NO_INSTALL_CLEANUP: "1"
         run: |
           set -euo pipefail
-          brew install postgresql@17 bash coreutils gnu-sed findutils
+          # #3130 : `flock` (staging.sh, verrou d'opérateur unique #2448) est
+          # util-linux, absent de macOS ; la formule `flock` fournit la même
+          # commande (flock(2), `-n` sur un descripteur) dans son bin/.
+          brew install postgresql@17 bash coreutils gnu-sed findutils flock
           {
             echo "$(brew --prefix postgresql@17)/bin"
             echo "$(brew --prefix bash)/bin"
             echo "$(brew --prefix coreutils)/libexec/gnubin"
             echo "$(brew --prefix gnu-sed)/libexec/gnubin"
             echo "$(brew --prefix findutils)/libexec/gnubin"
+            echo "$(brew --prefix flock)/bin"
           } >> "$GITHUB_PATH"
       - name: base jetable (PostgreSQL dans une étape, pas un service)
         run: |

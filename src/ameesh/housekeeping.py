@@ -27,17 +27,25 @@ l'humain. Chaque famille a sa règle :
   `<cache_root>/<nom>`. Partagés entre agents (un store pnpm par agent
   multiplierait le disque), bornés par un quota global, évincés du plus
   ancien au plus récent, et jamais pendant un tour de l'hôte (un store pnpm
-  modifié sous une installation casse l'installation). Une variable déjà
-  posée dans l'environnement de l'exécuteur est respectée : c'est un choix
-  de l'hôte.
+  modifié sous une installation casse l'installation) — sauf le cache npm,
+  fait de copies, qui peut partir pendant un tour quand aucun npm ne tourne
+  et que rien ne le tient (#3293). Sous pression disque (espace libre sous le
+  `min_disk_free` de l'hôte), l'éviction libère en plus le déficit, même
+  sous le quota. Une variable déjà posée dans l'environnement de l'exécuteur
+  est respectée : c'est un choix de l'hôte.
 * **Worktrees** : ceux qui APPARAISSENT pendant un tour (diff de `git
   worktree list` avant/après, sous-agents compris) sont enregistrés avec
   l'agent, le tour et le lot — s'ils sont sous le dossier de travail de
   l'agent, ou si leur branche (`lot/<id>`, `agent/<nom>-<id>`,
   `review/<nom>-<id>`) ou leur dossier (`<nom>-<id>`) nomme un lot assigné à
-  cet agent (#1665). Ceux d'ailleurs que rien ne rattache à lui (un autre
-  agent qui travaille sur le même dépôt) sont suivis « non attribués »
-  (L73b) : ils ne partent que par la règle des orphelins ci-dessous. À la fin
+  cet agent (#1665). #3266 : un worktree suivi sans lot est relu à chaque
+  passage (pas seulement ceux marqués « non attribué ») et le dossier le
+  rattache par les mêmes conventions que les clones (#2743) — préfixe de
+  projet (`nexlink-<agent>-<lot>`), `.wt<lot>`, `<agent>.wt<lot>` — puis
+  l'attribution est persistée ; aucune règle de suppression nouvelle. Ceux
+  d'ailleurs que rien ne rattache à lui (un autre agent qui travaille sur le
+  même dépôt) sont suivis « non attribués » (L73b) : ils ne partent que par la
+  règle des orphelins ci-dessous. À la fin
   du lot (fusion ou fermeture), ils sont retirés par `git worktree remove`
   (jamais forcé) s'ils sont propres, non verrouillés, âgés d'au moins une
   heure, sans tour en cours de leur agent ni processus dedans, et que leur
@@ -77,6 +85,14 @@ l'humain. Chaque famille a sa règle :
   existants sont conservés) ; `docker volume rm` refuse de lui-même un volume
   encore monté.
 
+* **Scopes systemd `dsh-subprocess-*`** (#3226, [`reap_dsh_scopes`]) : sans
+  la garde #490, dsh lance ses outils dans des scopes du gestionnaire
+  utilisateur, hors du groupe et du cgroup du tour, qui survivent au tour.
+  Un scope dont le processus dsh n'existe plus et dont tous les processus
+  portent l'`AMEESH_TURN_ID` d'un tour clos de cet hôte est tué (SIGTERM puis
+  SIGKILL) une heure après la fin du tour ; dsh vivant ou tour en cours :
+  gardé ; attribution impossible : gardé et signalé (alerte `dsh_scope`).
+
 * **Entrées de `/tmp` apparues pendant un tour** (L162 : clone de relecture,
   `--cacheDirectory` explicite, image `docker save`) : elles sont signalées
   (`tmp_orphan`) avec la commande à lancer, NON ATTRIBUÉES (#222 : `/tmp` est
@@ -107,6 +123,7 @@ from __future__ import annotations
 
 import getpass
 import json
+import math
 import os
 import shlex
 import re
@@ -150,6 +167,10 @@ WORKTREE_MIN_AGE_S = 3600.0
 UNATTRIBUTED = "unattributed"
 #: the same prefix as written before L232 (rows already stored)
 UNATTRIBUTED_LEGACY = "non attribué"
+#: #3266 : détail d'un worktree rattaché à son lot par le nom de son dossier
+ATTRIBUTED_DETAIL = "attributed from the worktree name: lot #%s (assigned to %s)"
+#: #3266 : le dossier nomme l'agent, mais aucun lot ne lui est assigné
+OWNER_DETAIL = "owner from the worktree name: %s (lot not proved)"
 #: borne d'un parcours de taille (fichiers) : au-delà, la taille est un minimum
 WALK_LIMIT = 300_000
 #: délai maximal d'une commande git (secondes)
@@ -247,7 +268,7 @@ POLICY_KEYS = ("tmp_root", "cache_root", "tmp_quota", "cache_quota", "tmpfs_aler
                "orphan_cleanup", "orphan_idle", "deps", "deps_idle", "artifacts",
                "artifact_idle", "unreadable_ok", "docker_orphan_volumes_alert",
                "docker_build_cache_alert", "docker_volumes", "docker_volume_idle",
-               "events_quota")
+               "events_quota", "former_mesh_keys")
 #: racines refusées : le ménage n'y supprimerait que ses sous-dossiers, mais
 #: un dossier partagé par tout le système n'est pas un dossier GÉRÉ
 FORBIDDEN_ROOTS = ("/", "~", "/tmp", "/var/tmp", "/dev/shm", "/home", "/root")
@@ -297,6 +318,10 @@ class Policy:
     #: #2820 : taille du flux `events.jsonl` d'un agent au-delà de laquelle il
     #: tourne au début du tour suivant (`events_rotation`)
     events_quota: int = DEFAULT_EVENTS_QUOTA
+    #: #3277 : anciennes clés de CE mesh sur cet hôte (une route vers la même
+    #: base, avant un changement de DSN : #532, 10.77.0.1:5432 → pgbouncer) ;
+    #: leurs dossiers temporaires sont à nous, `housekeeping_stale` les range
+    former_mesh_keys: tuple = ()
     #: #2180: discovery roots derived from Host work_root/work_roots, never
     #: deletion roots. Not a separate housekeeping setting.
     worktree_roots: tuple = ()
@@ -380,6 +405,14 @@ def parse_policy(raw) -> tuple[dict, list[str], list[str]]:
             problems.append("`unreadable_ok` : %s" % problem)
         else:
             parsed["unreadable_ok"] = names
+    if raw.get("former_mesh_keys") is not None:
+        keys = raw["former_mesh_keys"]
+        if not isinstance(keys, list) or not all(
+                isinstance(k, str) and re.fullmatch(r"[0-9a-f]{16}", k) for k in keys):
+            problems.append("`former_mesh_keys`: list of 16-hex mesh keys expected "
+                            "(the owner files of `.menage/tmp`)")
+        else:
+            parsed["former_mesh_keys"] = tuple(sorted(set(keys)))
     for key in ("redirect", "xdg_cache", "worktrees", "orphan_cleanup", "deps",
                 "docker_volumes"):
         if raw.get(key) is None:
@@ -435,6 +468,12 @@ def effective(canons, host: str) -> Policy:
         label = getattr(canon, "id", "") or "?"
         for key, value in declared.items():
             if key not in POLICY_KEYS:
+                continue
+            if key == "former_mesh_keys":
+                # #3277 : une clé déclarée par une fiche est une ancienne route
+                # de ce mesh : l'union des fiches
+                values[key] = tuple(sorted(set(values.get(key, ())) | set(value)))
+                origin.setdefault(key, label)
                 continue
             if key not in values:
                 values[key], origin[key] = value, label
@@ -515,6 +554,28 @@ def agent_tmp(cfg, policy: Policy, agent: str) -> str:
 
 def cache_names(policy: Policy) -> list[tuple[str, tuple[str, ...]]]:
     return list(CACHES) + ([XDG_CACHE] if policy.xdg_cache else [])
+
+
+#: gestionnaires de paquets dont le cache est partagé (le titre de leur
+#: processus les nomme : « npm install … », « pnpm add … »)
+PACKAGE_MANAGERS = ("npm", "pnpm", "yarn")
+
+
+def package_managers_running() -> set[str]:
+    """#3293: les gestionnaires de paquets qui tournent sur l'hôte, d'après le
+    titre de leur processus (`process.title` : `npm install …`, tronqué à 15
+    caractères par le noyau). Un relevé illisible est un doute : tous sont
+    dits en cours, et rien n'est évincé sous un tour."""
+    try:
+        rows = platform.process_table()
+    except Exception:  # noqa: BLE001 - un passage de ménage ne lève jamais
+        return set(PACKAGE_MANAGERS)
+    found: set[str] = set()
+    for row in rows:
+        head = (row.get("name") or "").strip().split(" ", 1)[0].lower()
+        if head in PACKAGE_MANAGERS:
+            found.add(head)
+    return found
 
 
 def _conninfo_fields(dsn: str) -> dict[str, str]:
@@ -1320,12 +1381,20 @@ def _removable(path: str, uid: int | None, writable: dict) -> bool:
 
 
 def evict_lru(directories: list[str], root: str, quota: int, *, now: float | None = None,
-              min_age: float = EVICT_MIN_AGE_S, dry_run: bool = False) -> dict:
+              min_age: float = EVICT_MIN_AGE_S, dry_run: bool = False,
+              evict_at_least: int = 0) -> dict:
     """Éviction du plus ancien (mtime) au plus récent, jusqu'au quota.
 
     Un fichier modifié depuis moins de `min_age` n'est jamais évincé (il est
     peut-être en écriture) : le quota peut donc rester dépassé, et c'est dit
     (`over_quota`).
+
+    #3293 : `evict_at_least` évince aussi jusqu'à libérer au moins ces
+    octets, même quand le total tient déjà dans le quota — une pression
+    disque se traite en libérant ce qu'il faut, pas seulement au-delà d'un
+    plafond. L'éviction s'arrête quand les deux conditions tiennent (quota
+    respecté et octets libérés) ; un fichier trop récent ou irrécupérable
+    l'arrête comme avant, et `over_quota` ne dit que le quota.
 
     #500: only what this pass can remove counts toward the quota (owned by
     us, directory writable, outside a git work tree); the rest is reported
@@ -1414,16 +1483,18 @@ def evict_lru(directories: list[str], root: str, quota: int, *, now: float | Non
             else:
                 candidates.append(item)
         counted = before - unremovable
-    if not truncated and before > quota:
+    if not truncated and (before > quota or evict_at_least > 0):
         if not dry_run and not _managed(root):
             raise RefusedDeletion("%s is not a directory managed by ameesh" % root)
-        blocked = unremovable > quota
+        # #3293 : sous pression disque, des octets irrécupérables au-delà du
+        # quota n'interdisent pas de libérer ce qui peut l'être (le déficit).
+        blocked = unremovable > quota and evict_at_least <= 0
         protected: list[str] = []      # #500 r3: subtrees a stale candidate protects
         uncounted: set = set()         # #500 r5: candidates already out of `counted`
         handled: set = set()          # #1190: dry-run inodes already processed
         order = sorted(candidates, key=lambda item: item[2])
         for index, (path, size, mtime, st) in enumerate(order):
-            if blocked or counted <= quota:
+            if blocked or (counted <= quota and evicted >= evict_at_least):
                 break
             if any(_in_subtree(path, d) for d in protected):
                 # #500 r4 (codex P2 r3): the subtree became protected during
@@ -1847,7 +1918,8 @@ def _bare_git_copy(path: str) -> bool:
         and os.path.isdir(os.path.join(path, "refs"))
 
 
-def _git_copies_report(path: str, limit: int | None = None) -> tuple[list[str], str]:
+def _git_copies_report(path: str, limit: int | None = None,
+                       skip=()) -> tuple[list[str], str]:
     """(copies git de l'entrée, doute). Une copie est reconnue par son `.git`
     (dossier, ou fichier d'un worktree) ou sa signature de dépôt nu, à toute
     profondeur ; un lien symbolique n'est ni suivi ni ouvert, et le dedans
@@ -1858,9 +1930,14 @@ def _git_copies_report(path: str, limit: int | None = None) -> tuple[list[str], 
     illisible, budget épuisé — pour que l'appelant garde l'entrée au lieu de
     conclure à tort qu'il n'y a rien. Les copies à arbre de travail passent
     avant les dépôts nus : leurs gardes sont plus précises, un dépôt nu n'est
-    qu'un doute conservateur (#2525)."""
+    qu'un doute conservateur (#2525).
+
+    #3277 : `skip`, les dossiers d'un AUTRE utilisateur que celui-ci ne peut
+    pas lire (relevés par `housekeeping_stale.walk`) : ni ouverts ni comptés
+    comme doute — l'appelant ne peut pas plus les supprimer que les lire."""
     if os.path.islink(path) or not os.path.isdir(path):
         return [], ""
+    skip = frozenset(skip or ())
     limit = WALK_LIMIT if limit is None else limit
     trees: list[str] = []
     bare: list[str] = []
@@ -1874,6 +1951,8 @@ def _git_copies_report(path: str, limit: int | None = None) -> tuple[list[str], 
         if _bare_git_copy(current):
             bare.append(current)
             continue          # le dedans d'un dépôt nu ne cache pas d'arbre de travail
+        if current in skip:
+            continue
         if os.path.lexists(os.path.join(current, ".git")):
             trees.append(current)
         try:
@@ -2628,6 +2707,13 @@ def owns_worktree(path: str, cwd: str | None, other_cwds) -> bool:
 #: en décimal, `#2`, jamais `#02`).
 CITED_LOT = re.compile(r"^(lot|work|agent|review)/(.+)$")
 
+#: #3266 : marqueurs d'un nom de dossier de worktree (`wt`, `work`, `review`…)
+#: suivis d'un numéro ; sans agent nommé ni marqueur, un nombre du dossier
+#: n'est pas un lot (une date `release-2026-10-23`, un SHA).
+WORKTREE_NAME = re.compile(
+    r"(?:^|[._-])(?:wt|work|lot|review|prep|tmp|scratch|agent|paquet)[._-]?\d",
+    re.IGNORECASE)
+
 
 def branch_agent(branch: str, agents=()) -> str:
     """#2182 : l'agent que nomme une branche `agent/<agent>-…` ou
@@ -2688,8 +2774,56 @@ def named_lot(name: str, agent: str) -> int | None:
     return int(found.group(1)) if found else None
 
 
+def worktree_named_lots(path: str, agents=()) -> tuple[str, list[int]]:
+    """#3266 : (agent que nomme le dossier, lots qu'il nomme), pour un
+    worktree découvert ou déjà suivi.
+
+    La convention stricte `<agent>-<id>` (#1665) vient d'abord ; les suivantes
+    sont celles que le ménage des clones connaît déjà (#2743) : préfixe de
+    projet (`nexlink-<agent>-<id>`), nom de grattage de l'agent (`.wt<id>`,
+    `<agent>.wt<id>`, `.work-<id>`), groupes numériques d'un dossier de lot.
+    L'agent nommé est le plus long des noms du registre présents comme jeton
+    (`<agent>-`, `-<agent>-`, `-<agent>` ou `<agent>.`) : un dossier qui nomme
+    un AUTRE agent ne prouve rien pour celui qui le suit. Le lot est le
+    dernier groupe numérique (`.wt1349-r1` = #1349, pas #1), comme sous
+    `agent/`/`review/` (#1694).
+
+    Rien n'est attribué ici : `lot_of_worktree` vérifie que le lot est bien
+    assigné à l'agent. Aucun agent nommé rend `("", …)` ; un nom inconnu rend
+    `("", [])` — il reste non attribué. Un nom sans agent et sans convention
+    de worktree (`wt`, `work`, `lot`, `review`, `prep`, `tmp`, `scratch`,
+    `agent`, `paquet`) n'est pas lu : une date (`release-2026-10-23`) n'est
+    pas une suite de lots.
+
+    La convention stricte `<agent>-<id>` garde sa priorité : `a1-431-22`
+    nomme #431, le `-22` est un suffixe, jamais un second lot (#3266,
+    relecture). Les autres conventions rendent tous leurs groupes, du
+    dernier au premier, pour que l'appelant les vérifie tous."""
+    name = os.path.basename(os.path.normpath(path))
+    owner = ""
+    for candidate in sorted((n for n in agents or () if n), key=len, reverse=True):
+        # Un nom qui se termine par `-<agent>` n'est pas une preuve : un
+        # dossier de relecture `relecture-a2` nommerait a2 sans le prouver
+        # (#3266, suite L73b). Le préfixe de projet est couvert par le
+        # marqueur `-<agent>-` ; le dossier de travail d'un agent est protégé.
+        if (name == candidate or name.startswith(candidate + "-")
+                or name.startswith(candidate + ".")
+                or ("-" + candidate + "-") in name
+                or ("-" + candidate + ".") in name):
+            owner = candidate
+            break
+    if not owner and not WORKTREE_NAME.search(name):
+        return "", []
+    if owner:
+        strict = named_lot(name, owner)
+        if strict is not None:
+            return owner, [strict]
+    from . import housekeeping_clones
+    return owner, list(reversed(housekeeping_clones.named_lots(name, agents)))
+
+
 def lot_of_worktree(db, agent: str, path: str, branch: str = "",
-                    branch_owner: str = "") -> str | None:
+                    branch_owner: str = "", agents=()) -> str | None:
     """#1665 : le lot qu'un worktree SERT, quand c'est prouvable : sa branche
     ou, à défaut, son dossier nomment l'id, et ce lot est assigné à CET agent.
     Sinon None : le worktree reste non attribué (jamais retiré à ce titre, il
@@ -2700,13 +2834,33 @@ def lot_of_worktree(db, agent: str, path: str, branch: str = "",
     lot owned by the agent wins; the folder name is only read when the branch
     cites no number (the #1665 rule). #2182: `branch_owner` — the agent named
     at the head of an `agent/`/`review/` branch — is not a lot candidate
-    (else `review/reviewer-02-459` could wrongly attach to lot #2)."""
+    (else `review/reviewer-02-459` could wrongly attach to lot #2).
+
+    #3266: the folder is read with the shared conventions of
+    `worktree_named_lots` (`nexlink-<agent>-<lot>`, `.wt<lot>`), not only
+    `<agent>-<lot>`; a folder naming ANOTHER agent of `agents` proves nothing
+    for this one (the caller keeps it as a foreign copy). When the folder
+    names a lot the branch does not cite, the two must agree on exactly one
+    lot: a disagreement (`nexlink-a2-431` with the current branch `lot/432`)
+    or several named lots is a doubt, None here — the caller verifies every
+    candidate of the branch AND the folder before a removal (`wt-432-433`
+    must not follow #433 alone, #432 being open)."""
     if not agent:
         return None
     idents = cited_lots(branch, agent=branch_owner or agent)
+    owner, folder_idents = worktree_named_lots(path, agents or (agent,))
+    if owner and owner != agent:
+        return None
+    # Le dossier n'ajoute un candidat que s'il nomme un lot que la branche ne
+    # cite pas : là seulement, branche et dossier doivent s'accorder sur un
+    # seul lot. Un dossier qui ne fait que répéter une branche multi-lots
+    # garde l'ordre #1694 (premier lot assigné à l'agent).
+    if any(ident not in idents for ident in folder_idents):
+        idents = list(dict.fromkeys(idents + folder_idents))
+        if len(idents) != 1:
+            return None
     if not idents:
-        nom = named_lot(os.path.basename(os.path.normpath(path)), agent)
-        idents = [nom] if nom is not None else []
+        return None
     for ident in idents:
         try:
             row = storage.of(db).work.get(ident)
@@ -2728,6 +2882,18 @@ def worktree_in_use(path: str, allow=()) -> bool:
         return bool(platform.holders(_real(path), allow=allow))
     except platform.NotAvailable:
         return True
+
+
+def current_branch(path: str) -> tuple[bool, str]:
+    """(lisible, branche) de HEAD du worktree, "" s'il est détaché.
+
+    Un Git indisponible, ou un chemin qui n'est pas un worktree, est un
+    doute : False, l'appelant garde le worktree au lieu de l'attribuer sur la
+    branche enregistrée, qui peut être périmée (#3266, relecture cx3)."""
+    proc = _git(["symbolic-ref", "-q", "--short", "HEAD"], path)
+    if proc is None or proc.returncode not in (0, 1):
+        return False, ""
+    return True, proc.stdout.strip() if proc.returncode == 0 else ""
 
 
 def remove_worktree(path: str, repo: str) -> tuple[bool, str]:
@@ -3023,6 +3189,12 @@ def _worktree_pass(db, host: str, *, dry_run: bool,
     how: `_remove_kept_worktree` (host lock `lock_path`, journal
     `journal_path`, managed roots `skip_roots`).
 
+    #3266 : l'attribution persistée est une trace, pas la branche courante :
+    avant tout retrait, la branche ACTUELLE est relue et tous les lots
+    qu'elle nomme, plus le lot persisté et ceux du dossier, doivent avoir
+    fini (un lot ouvert, inconnu, ou une branche illisible garde le
+    worktree).
+
     #1665 : un worktree orphelin — aucun lot nommé par sa branche ou son
     dossier — suit la même fin, mais après `ORPHAN_WORKTREE_IDLE_S` (24 h)
     d'inactivité, propre et poussé (la branche reste) ; c'est le ménage que
@@ -3037,17 +3209,11 @@ def _worktree_pass(db, host: str, *, dry_run: bool,
     for row in store.worktrees(host, ("active", "kept"), limit=None):
         path, lot = row["path"], row.get("lot")
         branch = row.get("branch") or ""
+        branch_checked = False
         # #2182: the agent at the head of an `agent/`/`review/` branch is
         # known from the registry (else from the recorded agent), so its own
         # number is not read as a cited lot (`review/reviewer-02-1234`).
         branch_owner = branch_agent(branch, known_agents) or (row.get("agent") or "")
-        if (row.get("detail") or "").startswith((UNATTRIBUTED, UNATTRIBUTED_LEGACY)):
-            # #1665 : la branche (ou, à défaut, le dossier) d'un worktree
-            # frère nomme le lot qu'il sert ; si ce lot est assigné à l'agent
-            # qui l'a vu apparaître, il suit la fin de son lot au lieu de
-            # rester « non attribué » à jamais.
-            lot = lot_of_worktree(db, row.get("agent") or "", path, branch,
-                                  branch_owner=branch_owner)
         base = {"kind": "worktree", "path": path, "agent": row["agent"], "lot": lot}
         if not os.path.isdir(path):
             plan.append(dict(base, action="disparu", detail=UNATTRIBUTED))
@@ -3058,20 +3224,79 @@ def _worktree_pass(db, host: str, *, dry_run: bool,
                 entries.append(dict(base, action="gone", detail="directory gone; "
                                     "git worktree prune (%s)" % UNATTRIBUTED))
             continue
-        named = cited_lot(branch, agent=branch_owner) or named_lot(
-            os.path.basename(os.path.normpath(path)), row.get("agent") or "")
+        # #1665/#3266 : tout worktree suivi sans lot est relu — pas seulement
+        # ceux marqués « non attribué » : la branche a pu citer le lot après
+        # l'enregistrement, ou le dossier le nommer par une convention que le
+        # registre d'alors ne lisait pas (`nexlink-<agent>-<lot>`, `.wt<lot>`,
+        # #2743). L'attribution est PERSISTÉE pour que le registre dise ce que
+        # le passage a prouvé ; la politique de fin de lot, elle, ne change
+        # pas (aucune règle de suppression nouvelle, #3266).
+        if lot is None:
+            # Un processus dans le worktree : inutile de lire Git, on attend
+            # (le test #2167 exige qu'aucune lecture Git ne soit faite).
+            if worktree_in_use(path, allow=allow):
+                plan.append(dict(base, action="attend",
+                                 detail="a process is working in it"))
+                continue
+            # La branche enregistrée est une trace, pas la vérité : un
+            # worktree change de branche après la découverte (`topic` puis
+            # `lot/432`). Relire la branche ACTUELLE avant toute attribution ;
+            # illisible = doute, on garde (#3266, relecture cx3).
+            readable, branch = current_branch(path)
+            branch_checked = True
+            if not readable:
+                plan.append(dict(base, action="garde",
+                                 detail="current branch unreadable; kept"))
+                continue
+            branch_owner = branch_agent(branch, known_agents) or (row.get("agent") or "")
+            # Le dossier peut nommer un AUTRE agent que celui qui a vu
+            # apparaître le worktree (`work/<agent>-<lot>` d'un voisin, le
+            # dépôt commun étant partagé) : l'agent nommé fait foi et reste,
+            # lot prouvé ou non (relecture #3266) ; un lot assigné ailleurs
+            # laisse lot=None et suit la garde des copies étrangères.
+            owner, _candidates = worktree_named_lots(
+                path, known_agents or (row.get("agent") or "",))
+            owner_detail = ""
+            if owner and owner != (row.get("agent") or ""):
+                row = dict(row, agent=owner)
+                owner_detail = OWNER_DETAIL % owner
+            lot = lot_of_worktree(db, row.get("agent") or "", path, branch,
+                                  branch_owner=branch_owner, agents=known_agents)
+            if lot is not None:
+                detail = ATTRIBUTED_DETAIL % (lot, row.get("agent") or "?")
+                if not dry_run:
+                    store.set_worktree_attribution(row["id"], row.get("agent") or "",
+                                                   lot, detail)
+                    entries.append({"kind": "worktree", "action": "attributed",
+                                    "path": path, "agent": row.get("agent"), "lot": lot,
+                                    "detail": detail})
+            elif owner_detail and not dry_run:
+                store.set_worktree_attribution(row["id"], row.get("agent") or "",
+                                               None, owner_detail)
+                entries.append({"kind": "worktree", "action": "attributed",
+                                "path": path, "agent": row.get("agent"), "lot": None,
+                                "detail": owner_detail})
+            base = {"kind": "worktree", "path": path, "agent": row["agent"], "lot": lot}
+        # #3266 : TOUS les lots que la branche et le dossier nomment, y
+        # compris inconnus, sont vérifiés avant le moindre retrait : un lot
+        # fini ne prouve rien des autres encore servis (`wt-432-433` avec #432
+        # ouvert, `wt-999999-433` avec #999999 absent). Le ménage des clones
+        # applique déjà cette règle (#2743).
+        idents = cited_lots(branch, agent=branch_owner)
+        _owner, folder_idents = worktree_named_lots(
+            path, known_agents or (row.get("agent") or "",))
+        idents = list(dict.fromkeys(idents + folder_idents))
+        named = cited_lot(branch, agent=branch_owner)
+        if named is None:
+            named = folder_idents[0] if folder_idents else None
         # #2174: a named lot that cannot be attributed (another agent's: a
-        # review copy, a reassigned lot) follows the orphan rule once that lot
-        # has ended — 24 h idle, clean and pushed; open, unknown or unreadable,
-        # it proves nothing and the worktree stays (agents-1, 17/10: 205 of
-        # 221 such copies named a merged or closed lot, kept forever).
+        # review copy, a reassigned lot) follows the orphan rule once every
+        # named lot has ended — 24 h idle, clean and pushed; an open, unknown
+        # or unreadable lot proves nothing and the worktree stays.
         foreign = lot is None and named is not None
         if foreign:
             try:
-                # #1694: review branches can cite several candidates. One
-                # ended lot proves nothing about the others still served.
-                states = [_lot_state(db, ident) for ident in
-                          (cited_lots(branch, agent=branch_owner) or [named])]
+                states = [_lot_state(db, ident) for ident in idents]
             except Exception:  # registre illisible : rien n'est prouvé
                 states = [None]
             if any(state not in LOT_ENDED for state in states):
@@ -3113,6 +3338,43 @@ def _worktree_pass(db, host: str, *, dry_run: bool,
         if worktree_in_use(path, allow=allow):
             plan.append(dict(base, action="attend",
                              detail="%s; a process is working in it" % why))
+            continue
+        # #3266 (relecture cx3) : une attribution persistée n'est qu'une trace,
+        # comme `row.branch` : la branche a pu changer depuis (`topic` →
+        # `lot/432`). Avant CHAQUE décision de retrait, la branche ACTUELLE est
+        # relue si elle ne l'a pas déjà été, et TOUS les lots qu'elle nomme,
+        # PLUS le lot persisté et le dossier, sont vérifiés : un lot ouvert,
+        # inconnu ou illisible prouve que le worktree sert encore. Lire la
+        # branche pour attribuer ne dispense pas de cette vérification
+        # (#3266, relecture cx3 : `nexlink-a2-431` sur `lot/431-432` attribue
+        # #431, #432 restant en construction). La base (f71414d8), qui
+        # n'attribuait jamais, n'avait rien à relire : ce garde protège
+        # l'attribution persistée, il ne change pas la règle de fin de lot.
+        if not branch_checked:
+            readable, branch = current_branch(path)
+            if not readable:
+                plan.append(dict(base, action="garde",
+                                 detail="current branch unreadable; kept"))
+                continue
+            branch_checked = True
+            branch_owner = branch_agent(branch, known_agents) or (row.get("agent") or "")
+        branch_idents = cited_lots(branch, agent=branch_owner)
+        _named_owner, folder_idents = worktree_named_lots(
+            path, known_agents or (row.get("agent") or "",))
+        idents = list(dict.fromkeys(branch_idents + folder_idents + (
+            [str(lot)] if lot is not None else [])))
+        try:
+            states = [_lot_state(db, ident) for ident in idents]
+        except Exception:  # registre illisible : rien n'est prouvé
+            states = [None]
+        still = [(ident, state) for ident, state in zip(idents, states)
+                 if state not in LOT_ENDED]
+        if still:
+            ident, state = still[0]
+            detail = ("current branch names lot #%s %s; kept" % (
+                ident, state or "unknown") if ident != str(lot) else
+                "persisted lot #%s %s; kept" % (ident, state or "unknown"))
+            plan.append(dict(base, action="garde", detail=detail))
             continue
         # #2180: a reused tracked path may now be a clone, a symlink or a
         # worktree of another repository. Old metadata never authorises it.
@@ -3633,6 +3895,158 @@ def reap_volumes(runtime, db, host: str, policy: Policy, *, dry_run: bool = Fals
     return out
 
 
+#: #3226 : délai après la fin du tour avant de récolter un scope dsh laissé
+DSH_SCOPE_GRACE_S = 3600.0
+#: #3226 : un scope gardé (non attribuable) est re-signalé au plus si souvent
+DSH_SCOPE_REFRESH_S = 12 * 3600.0
+_MENAGE_TMP = "/%s/tmp/" % MANAGED_DIR
+
+
+def _tmpdir_agent(tmpdir: str | None) -> str | None:
+    """L'agent d'un TMPDIR `…/.menage/tmp/<agent>[/…]`, pour le seul constat."""
+    if not tmpdir or _MENAGE_TMP not in tmpdir:
+        return None
+    return tmpdir.split(_MENAGE_TMP, 1)[1].split("/", 1)[0] or None
+
+
+def dsh_scope_verdict(scope: dict, row: dict | None, host: str,
+                      now: float) -> tuple[str, str, str | None]:
+    """#3226 : (action, raison, tour) d'un scope `dsh-subprocess-*` relevé par
+    `platform.dsh_scopes.scan` ; action `kill`, `wait` ou `signal`.
+
+    Récolté seulement si le processus dsh qui l'a lancé n'existe plus, que
+    TOUS ses processus portent le même `AMEESH_TURN_ID`, que ce tour est connu
+    de CET hôte, clos (`done`, `orphan`) et fini depuis `DSH_SCOPE_GRACE_S`.
+    dsh vivant, tour `running` : attente. Liste, heure de démarrage du dsh ou
+    environnement illisible, aucun tour ou plusieurs, tour inconnu ici, fin de
+    tour illisible : gardé et signalé (comme `_orphan_verdict`) — un doute ne
+    se tait jamais et une grâce non mesurable ne se remplace pas par le
+    démarrage du processus."""
+    members = scope["members"]
+    if scope["unreadable"] or scope.get("owner_unread"):
+        return "signal", "process list or dsh start time unreadable: not attributable", None
+    if any(m.get("unread") for m in members):
+        return "signal", "process start or environment unreadable: not attributable", None
+    if scope["owner_alive"]:
+        return "wait", "dsh pid %d alive" % scope["dsh_pid"], None
+    turns = {m["turn"] for m in members}
+    if turns == {None}:
+        return "signal", "no AMEESH_TURN_ID: not attributable", None
+    if len(turns) != 1:
+        return "signal", "several turns (%s): not attributable" % ", ".join(
+            sorted(t[:8] if t else "none" for t in turns)), None
+    turn = turns.pop()
+    if row is None or (row.get("host") or "") != (host or ""):
+        return "signal", "turn %s unknown on this host: not attributable" % turn[:8], turn
+    status = row.get("status")
+    if status == "running":
+        return "wait", "turn %s not closed" % turn[:8], turn
+    if status not in ("done", "orphan"):
+        return "signal", "turn %s status %r: not attributable" % (
+            turn[:8], status), turn
+    try:
+        since = float(row.get("ended_ts"))
+        if not math.isfinite(since):
+            raise ValueError("not finite")
+    except (TypeError, ValueError):
+        return "signal", "turn %s closed but end time unreadable: not attributable" % (
+            turn[:8]), turn
+    if now - since < DSH_SCOPE_GRACE_S:
+        return "wait", "turn %s closed %ds ago (grace %ds)" % (
+            turn[:8], int(now - since), int(DSH_SCOPE_GRACE_S)), turn
+    return "kill", "turn %s %s, dsh pid %d gone" % (
+        turn[:8], status, scope["dsh_pid"]), turn
+
+
+def reap_dsh_scopes(db, host: str, *, dry_run: bool = False, now: float | None = None,
+                    scan=None, terminate=None) -> dict:
+    """#3226 : les scopes systemd `dsh-subprocess-*` laissés par un tour clos
+    (dsh sans la garde #490) sont tués — SIGTERM, puis SIGKILL — après
+    `DSH_SCOPE_GRACE_S`, par pidfd, journalisés (`dsh_scope`, `killed`) ; ceux qu'on ne
+    sait pas attribuer sont gardés et signalés (`signaled`, re-signalé au
+    plus toutes les `DSH_SCOPE_REFRESH_S`, `gone` quand ils disparaissent).
+    `scan`/`terminate` : ceux de `platform.dsh_scopes` (surchargés par les
+    tests). Un scope dont le traitement échoue est signalé sans interrompre
+    les suivants ; un scope dont tous les processus ont disparu avant le
+    signal est `gone`, jamais `killed`. Rend `{entries, plan}`."""
+    from .platform import dsh_scopes
+    scan = dsh_scopes.scan if scan is None else scan
+    terminate = dsh_scopes.terminate if terminate is None else terminate
+    now = time.time() if now is None else float(now)
+    out: dict = {"entries": [], "plan": []}
+    try:
+        scopes = scan()
+    except (OSError, platform.NotAvailable):
+        scopes = None
+    if scopes is None:
+        return out
+    hk = storage.of(db).housekeeping
+    turns = storage.of(db).turn_resources
+    last = {row["path"]: row for row in hk.latest_by_path(host, "dsh_scope")}
+    seen = set()
+    for scope in scopes:
+        unit = (scope or {}).get("unit") or ""
+        seen.add(unit)
+        try:
+            members = scope["members"]
+            turn_ids = {m["turn"] for m in members if m.get("turn")}
+            row = turns.get(next(iter(turn_ids))) if len(turn_ids) == 1 else None
+            action, why, turn = dsh_scope_verdict(scope, row, host, now)
+            agent = (row or {}).get("agent") or next(
+                (a for a in (_tmpdir_agent(m.get("tmpdir")) for m in members) if a), None)
+            previous = last.get(unit) or {}
+            data = {"dsh_pid": scope["dsh_pid"], "turn": turn,
+                    "pids": [m["pid"] for m in members],
+                    "commands": [m["command"] for m in members[:3]],
+                    "first_seen": ((previous.get("data") or {}).get("first_seen")
+                                   if previous.get("action") == "signaled" else None) or now}
+            base = {"kind": "dsh_scope", "path": unit, "agent": agent}
+            if action == "wait":
+                out["plan"].append(dict(base, action="attend", detail=why))
+                continue
+            if action == "kill":
+                out["plan"].append(dict(base, action="suppression", detail=why))
+                if dry_run:
+                    continue
+                if not members:
+                    out["entries"].append(dict(base, action="gone", detail=(
+                        "%s: empty scope gone, nothing to signal" % why)))
+                    continue
+                left = terminate(members)
+                if not left:
+                    out["entries"].append(dict(base, action="killed", data=data,
+                                               detail="%s: SIGTERM then SIGKILL" % why))
+                    continue
+                if (len(left) == len(members)
+                        and all((m.get("why") or "") == "gone before signal" for m in left)):
+                    out["entries"].append(dict(base, action="gone", detail=(
+                        "%s: every process gone before signal" % why)))
+                    continue
+                why = "%s: %d process(es) not killed (%s)" % (
+                    why, len(left), ", ".join("%d %s" % (m["pid"], m.get("why") or "alive")
+                                              for m in left))
+            else:
+                out["plan"].append(dict(base, action="signalé", detail=why))
+                if dry_run:
+                    continue
+            fresh = (previous.get("action") == "signaled" and previous.get("detail") == why
+                     and now - float(previous.get("at_ts") or 0) < DSH_SCOPE_REFRESH_S)
+            if not fresh:
+                out["entries"].append(dict(base, action="signaled", detail=why, data=data))
+        except Exception as exc:  # un scope ne doit pas perdre les suivants
+            out["entries"].append({"kind": "dsh_scope", "path": unit,
+                                   "action": "signaled",
+                                   "detail": "scope pass failed (%s): not attributable"
+                                             % type(exc).__name__})
+    if not dry_run:
+        for unit, previous in last.items():
+            if unit not in seen and previous.get("action") == "signaled":
+                out["entries"].append({"kind": "dsh_scope", "action": "gone", "path": unit,
+                                       "agent": previous.get("agent"),
+                                       "detail": "dsh scope gone"})
+    return out
+
+
 def tmp_problem(path: str, owner: str | None, key: str, *, registered: bool,
                 idle_after: float, now: float) -> str:
     """L219: why the pass keeps the temporary directory `path` of an agent
@@ -3660,13 +4074,19 @@ def tmp_problem(path: str, owner: str | None, key: str, *, registered: bool,
 def run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool = False,
              busy: bool = False, agents_in_turn: set | None = None,
              now: float | None = None,
-             runtime=None, artifact_scan: bool = True, min_interval_s: float = 0.0) -> dict:
+             runtime=None, artifact_scan: bool = True, min_interval_s: float = 0.0,
+             free_target: int = 0) -> dict:
     """One host pass across all runners and the CLI, without waiting.
 
     Periodic callers share the last completed pass's timestamp, under the
     same stable OS lock. An explicit or pressure-triggered pass bypasses the
     interval; dry runs never postpone real cleanup. Nothing is cached about
     whether a path may be deleted.
+
+    #3293: `free_target` is the free space (bytes) the cache's filesystem
+    should keep — the host's `min_disk_free`, the pause threshold. Under it,
+    the caches are evicted enough to free the deficit, the npm cache even
+    during a turn when no npm runs.
     """
     from .platform import session_lock
 
@@ -3701,7 +4121,8 @@ def run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool = 
                                % min_interval_s)
         report = _run_pass(cfg, db, policy, host=host, actor=actor, dry_run=dry_run,
                            busy=busy, agents_in_turn=agents_in_turn, now=now,
-                           runtime=runtime, artifact_scan=artifact_scan)
+                           runtime=runtime, artifact_scan=artifact_scan,
+                           free_target=free_target)
         if not dry_run and not report.get("disabled"):
             completed_passes[key] = time.time() if now is None else float(now)
             lock.seek(0)
@@ -3716,13 +4137,17 @@ def run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool = 
 def _run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool = False,
               busy: bool = False, agents_in_turn: set | None = None,
               now: float | None = None,
-              runtime=None, artifact_scan: bool = True) -> dict:
+              runtime=None, artifact_scan: bool = True,
+              free_target: int = 0) -> dict:
     """Un passage de ménage sur CET hôte ; rend le rapport.
 
     * dossiers temporaires : quota par agent (sauf agent en tour) ; dossier
       d'un agent absent du registre supprimé ;
     * caches partagés : éviction jusqu'au quota, seulement si aucun tour ne
-      tourne (`busy` faux) ;
+      tourne (`busy` faux) — sauf le cache npm pendant un tour, quand aucun
+      npm ne tourne et que rien ne le tient (#3293) ; sous pression disque
+      (`free_target`, espace libre à préserver), l'éviction libère en plus le
+      déficit ;
     * worktrees suivis dont le lot est fini : retirés s'ils sont propres et
       intégrés (garde-fous de `_worktree_pass`), sinon gardés et signalés ;
       #1665 : un worktree orphelin (aucun lot nommé, ou lot fini sans
@@ -3737,6 +4162,9 @@ def _run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool =
       mesh a déclarés jetables (`ameesh.bench=disposable`) sont récoltés après
       `docker_volume_idle` d'absence continue, les autres signalés avec leur
       commande, jamais supprimés ;
+    * scopes systemd `dsh-subprocess-*` d'un tour clos (#3226,
+      `reap_dsh_scopes`), tués après `DSH_SCOPE_GRACE_S` ; non attribuables :
+      gardés et signalés ;
     * entrées de /tmp signalées pendant un tour : jamais supprimées si non
       attribuées (#222) ; un signalement attribué d'avant #222, supprimé si
       abandonné (garde-fous de `_orphan_verdict`, L162) ; sinon dites avec la
@@ -3790,13 +4218,19 @@ def _run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool =
     # #2493 : dernier signalement d'un dossier sans propriétaire, pour ne pas
     # le répéter dans `skipped` à chaque passe (un constat persistant suffit).
     last_unowned: dict[str, dict] = {}
+    # #3277 : dernier constat `over_quota` d'un dossier qu'un autre mesh (ou
+    # une ancienne clé de celui-ci) possède, levé par `resolved` ou `gone`
+    last_over: dict[str, dict] = {}
     try:
         for row in storage.of(db).housekeeping.latest_by_path(host, "tmp"):
             if row.get("action") == "unowned":
                 last_unowned[row["path"]] = row
+            elif row.get("action") == "over_quota":
+                last_over[row["path"]] = row
     except Exception:  # journal illisible : on signale, sans doublon garanti
-        last_unowned = {}
+        last_unowned, last_over = {}, {}
     seen_unowned: set[str] = set()
+    seen_over: set[str] = set()
     if os.path.isdir(troot) and _managed(troot):
         for name in sorted(os.listdir(troot)):
             full = os.path.join(troot, name)
@@ -3805,7 +4239,21 @@ def _run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool =
             owner = read_owner(troot, name)
             if owner is not None and owner != key:
                 # L219: another mesh of this host (same state directory)
-                # manages it: never deleted nor evicted here
+                # manages it: never deleted nor evicted here. #3277 : mais
+                # mesuré, et signalé au-delà du quota ; une ancienne clé de CE
+                # mesh (`former_mesh_keys`) range ses entrées de lots clos.
+                if FALLBACK_SEP in name:
+                    continue
+                from . import housekeeping_stale
+                seen_over.add(full)
+                found = housekeeping_stale.check(
+                    db, troot=troot, name=name, agent=tmp_agent(name, owner),
+                    owner=owner, key=key, policy=policy, now=now, dry_run=dry_run,
+                    previous=last_over.get(full), agents=sorted(registered or ()),
+                    holder=held_by_user)
+                entries += found["entries"]
+                plan += found["plan"]
+                skipped += found["skipped"]
                 continue
             agent = tmp_agent(name, key)
             if registered is None and owner is None:
@@ -3989,34 +4437,89 @@ def _run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool =
                     continue
                 entries.append({"kind": "tmp", "action": "gone", "path": path,
                                 "detail": "unowned temporary directory gone"})
+            for path in last_over:
+                if path in seen_over or os.path.lexists(path):
+                    continue
+                entries.append({"kind": "tmp", "action": "gone", "path": path,
+                                "detail": "temporary directory over quota gone"})
     # 2. caches partagés
-    directories = [os.path.join(croot, name) for name, _v in cache_names(policy)]
-    if busy:
-        skipped.append("caches: a turn is in progress on the host, eviction postponed")
-    elif os.path.isdir(croot) and _managed(croot):
-        result = evict_lru(directories, croot, policy.cache_quota, now=now, dry_run=dry_run)
-        if result["files"]:
-            plan.append({"kind": "cache", "path": croot, "action": "éviction",
-                         "bytes": result["evicted"],
-                         "detail": "%d file(s), quota %s" % (
-                             result["files"], resources_mod.fmt_value("q", policy.cache_quota))})
-            if not dry_run:
-                entries.append({"kind": "cache", "action": "evicted", "path": croot,
-                                "bytes": result["evicted"],
-                                "detail": "quota %s: %d oldest file(s) evicted"
-                                          % (resources_mod.fmt_value("q", policy.cache_quota),
-                                             result["files"])})
-        if result.get("mounts_unreadable"):
-            skipped.append("caches: mount table unreadable (platform layer), "
-                           "nothing evicted")
-        elif result["truncated"]:
-            skipped.append("caches: listing truncated (%s file limit), nothing evicted"
-                           % WALK_LIMIT)
-        elif result["blocked"]:
-            skipped.append("caches: quota held by %s this pass cannot remove, nothing evicted"
-                           % resources_mod.fmt_value("q", result["unremovable"]))
-        elif result["over_quota"]:
-            skipped.append("caches: quota still exceeded (files less than an hour old)")
+    # #3293 : sous pression disque (moins que `free_target` libre sur le
+    # système du cache), libérer au moins le déficit — et, pour le cache npm
+    # (copies, pas un store à liens durs), sans attendre qu'aucun tour ne
+    # tourne : il suffit qu'aucun npm ne tourne et que rien ne le tienne.
+    deficit = 0
+    free = None
+    if free_target > 0 and os.path.isdir(croot):
+        try:
+            free = shutil.disk_usage(croot).free
+        except OSError:
+            free = None
+        if free is not None and free < int(free_target):
+            deficit = int(free_target) - int(free)
+    directories: list[str] = []
+    if os.path.isdir(croot) and _managed(croot):
+        managers = None
+        busy_said = False
+        for name, _variables in cache_names(policy):
+            full = os.path.join(croot, name)
+            if not os.path.isdir(full) or os.path.islink(full):
+                continue
+            if name == "npm":
+                if managers is None:
+                    managers = package_managers_running()
+                if "npm" in managers:
+                    skipped.append("cache npm kept: npm is running on the host")
+                    continue
+                held = held_by_user(full)
+                if held:
+                    skipped.append("cache npm kept: %s (no eviction)" % held)
+                    continue
+                directories.append(full)
+            elif busy:
+                if not busy_said:
+                    skipped.append("caches: a turn is in progress on the host, "
+                                   "eviction postponed")
+                    busy_said = True
+            else:
+                directories.append(full)
+        if directories:
+            result = evict_lru(directories, croot, policy.cache_quota, now=now,
+                               dry_run=dry_run, evict_at_least=deficit)
+            detail = "%d file(s), quota %s" % (
+                result["files"], resources_mod.fmt_value("q", policy.cache_quota))
+            if deficit:
+                detail += ", %s freed under disk pressure (%s needed)" % (
+                    resources_mod.fmt_value("q", result["evicted"]),
+                    resources_mod.fmt_value("q", deficit))
+            if result["files"]:
+                plan.append({"kind": "cache", "path": croot, "action": "éviction",
+                             "bytes": result["evicted"], "detail": detail})
+                if not dry_run:
+                    entries.append({"kind": "cache", "action": "evicted", "path": croot,
+                                    "bytes": result["evicted"],
+                                    "detail": "quota %s: %d oldest file(s) evicted%s"
+                                              % (resources_mod.fmt_value("q", policy.cache_quota),
+                                                 result["files"],
+                                                 " (disk pressure)" if deficit else "")})
+            if result.get("mounts_unreadable"):
+                skipped.append("caches: mount table unreadable (platform layer), "
+                               "nothing evicted")
+            elif result["truncated"]:
+                skipped.append("caches: listing truncated (%s file limit), nothing evicted"
+                               % WALK_LIMIT)
+            elif result["blocked"]:
+                skipped.append("caches: quota held by %s this pass cannot remove, nothing evicted"
+                               % resources_mod.fmt_value("q", result["unremovable"]))
+            elif result["over_quota"]:
+                skipped.append("caches: quota still exceeded (files less than an hour old)")
+            if deficit and not (result.get("mounts_unreadable") or result["truncated"]
+                                or result["evicted"] >= deficit):
+                # ce qui reste libre après l'éviction, pour dire l'écart
+                left = (free + result["evicted"]) if free is not None else 0
+                skipped.append("caches: disk pressure persists (%s free under %s target), "
+                               "%s freed" % (resources_mod.fmt_value("q", left),
+                                             resources_mod.fmt_value("q", int(free_target)),
+                                             resources_mod.fmt_value("q", result["evicted"])))
     # 2b. #248: node_modules shared per lockfile, entries no worktree links to
     if policy.deps and registered is None:
         skipped.append("deps: registry unreadable, worktrees unknown, nothing deleted")
@@ -4106,6 +4609,16 @@ def _run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool =
     volumes = reap_volumes(runtime, db, host, policy, dry_run=dry_run, now=now)
     entries += volumes["entries"]
     plan += volumes["plan"]
+    # 4c. #3226 : scopes systemd `dsh-subprocess-*` laissés par un tour clos
+    #     (dsh sans la garde #490) : tués après le délai de grâce ; ceux qu'on
+    #     ne sait pas attribuer gardés et signalés
+    try:
+        scopes = reap_dsh_scopes(db, host, dry_run=dry_run, now=now)
+    except Exception as exc:  # jamais fatal pour le passage
+        scopes = {"entries": [], "plan": []}
+        skipped.append("dsh scopes: pass failed (%s)" % type(exc).__name__)
+    entries += scopes["entries"]
+    plan += scopes["plan"]
     # 5. /tmp entries signaled during a turn (L162): unattributed ones are
     #    never deleted (#222), an attributed one (before #222) is deleted once
     #    abandoned (`_orphan_verdict` guards), the others are told
@@ -4337,6 +4850,10 @@ def cmd_housekeeping(cfg, args) -> int:
         except Exception:
             canons = []
         policy = effective(canons, host)
+        try:
+            limits = resources_mod.host_limits(canons, host)["limits"]
+        except Exception:  # un canon illisible ne bloque pas la commande
+            limits = {}
         busy = False
         if apply:
             try:
@@ -4347,6 +4864,9 @@ def cmd_housekeeping(cfg, args) -> int:
         from . import containers as containers_mod
         report = run_pass(cfg, db, policy, host=host, actor=actor, dry_run=not apply,
                           busy=busy,
+                          # #3293 : le seuil de pause disque de l'hôte
+                          # déclenche l'éviction des caches sous pression.
+                          free_target=int(limits.get("min_disk_free") or 0),
                           runtime=containers_mod.Runtime.from_config(cfg))
         if getattr(args, "json", False):
             print(json.dumps(dict(report, schema="ameesh-menage/1"), ensure_ascii=False,

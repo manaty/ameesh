@@ -7,8 +7,10 @@ appellent un geste qu'un agent sait faire : `idle_capacity` (L118),
 * aux orchestrateurs (ceux de l'alerte, de l'équipe concernée quand elle est
   connue), qui répartissent le travail ;
 * à l'auditeur interne ([AUDITEUR.md](../../docs/AUDITEUR.md)), qui les suit
-  — sauf `stale_lot` (L713) : ce courrier ne le réveille plus, il lit les lots
-  stagnants à sa passe (`ameesh alerts --json`).
+  — sauf `stale_lot` (L713) et `plan_underused` (#3274) : ces courriers ne le
+  réveillent plus, il lit les lots stagnants et les forfaits sous-utilisés à
+  sa passe (`ameesh alerts --json`) ; si plus aucun orchestrateur n'est
+  vivant, le forfait sous-utilisé lui revient en relais (#3036).
 
 #705 : pour un lot en `qa`, `stale_lot` va au relecteur DÉSIGNÉ (le verdict
 lui est dû) ; sans relecteur désigné, l'alerte part aux orchestrateurs du
@@ -476,7 +478,8 @@ def _slo_breach(alert: dict, *, level: int | None = None) -> str:
                alert.get("lot_state") or "?", step,
                sous_utilisation._duration(alert.get("value") or 0),
                sous_utilisation._duration(alert.get("threshold") or 0),
-               ", assigned to %s" % who if who else ", unassigned"))
+               (", owed by reviewer %s" % who if alert.get("step") == "green_verdict"
+                else ", assigned to %s" % who if who else ", unassigned")))
     # #2016 : quand la commande est proposée, elle porte le titulaire lu
     # (`--if-holder`) : le pilote ou le bureau parti de ce brief est refusé si
     # le lot a changé de main entre-temps, au lieu d'écraser le premier geste.
@@ -547,6 +550,26 @@ def _slo_breach(alert: dict, *, level: int | None = None) -> str:
             move = ("pilot: the lot is `blocked` and waits for its unblock/decision — "
                     "do not reassign its holder; unblock it or record the decision "
                     "(ameesh work note %d \"hold: <reason>\")" % lot)
+    elif alert.get("step") == "green_verdict":
+        # #3033 : l'avis est dû par le relecteur désigné, pas par le porteur ;
+        # le geste est de rendre le verdict, puis de remplacer le relecteur.
+        sha = str(alert.get("sha") or "")
+        verdict = "ameesh work milestone %d verdict ok|blocked --sha %s" % (
+            lot, sha or "<frozen sha>")
+        if level >= 3:
+            move = ("bureau or auditor: the pilot has not replaced reviewer %s — designate "
+                    "another reviewer of an independent family now (ameesh work reviewer "
+                    "%d <agent>, then ameesh work reviewer %d %s --remove)"
+                    % (who or "?", lot, lot, who or "<reviewer>"))
+        elif level >= 2:
+            move = ("pilot: reviewer %s has not delivered the verdict — nudge them, or "
+                    "designate another reviewer of an independent family (ameesh work "
+                    "reviewer %d <agent>, then ameesh work reviewer %d %s --remove); do not "
+                    "reassign the lot's holder" % (who or "?", lot, lot, who or "<reviewer>"))
+        else:
+            move = ("reviewer %s: review the frozen head and render your verdict now (%s); "
+                    "if you cannot, tell the pilot so another reviewer is designated"
+                    % (who or "?", verdict))
     elif level >= 3:
         move = ("bureau or auditor: reassign it now to a free agent (ameesh work assign "
                 "%d <agent>%s, then agent-mail send <agent> \"…\" --lot %d); do not wait "
@@ -555,8 +578,14 @@ def _slo_breach(alert: dict, *, level: int | None = None) -> str:
         move = ("pilot: reassign it or unblock it (ameesh work assign %d <agent>%s, then "
                 "agent-mail send <agent> \"…\" --lot %d)" % (lot, holder, lot))
     else:
+        # #3274 : un `hold:` de l'assigné n'arrête que `sans_tour` (24 h,
+        # `exploitation.ORPHAN_SELF_HOLD_S`) ; seule la retenue d'un pilote
+        # suspend le SLO (#1664, `planned_waits.pilot_holds`). Le texte le dit,
+        # sinon l'assigné croit l'horloge arrêtée et ne voit pas l'escalade.
         move = ("assignee: act on it, or record why it cannot advance (ameesh work note "
-                "%d \"hold: <reason>\") — a silent lot is not a hold" % lot)
+                "%d \"hold: <reason>\") — a silent lot is not a hold. Your own hold only "
+                "postpones the `sans_tour` reminder for 24 h; it does not suspend this "
+                "SLO clock — only a pilot's hold does" % lot)
     if alert.get("critical"):
         move += ("; the lot is P1: the bureau handles it with the auditor (canon §9, "
                  "niveau 4), and no SLO delay is notified to the owner — nothing waits "
@@ -769,9 +798,10 @@ def briefs(alert: dict, listing: list, lot_titles: dict | None = None,
     l'estimateur lui-même s'il est un agent du registre. `module_deviation` :
     rôle explicite et projet, sans repli. `stale_lot` d'un lot en qa : le
     relecteur DÉSIGNÉ reçoit en outre le verdict qui lui est dû (#705).
-    Auditeurs : pour tous les types sauf `stale_lot` (L713 : lu à la passe de
-    l'auditeur, sans réveil). Un agent à la fois orchestrateur et auditeur
-    reçoit un seul texte.
+    Auditeurs : pour tous les types sauf `stale_lot` (L713) et
+    `plan_underused` (#3274) — lus à la passe de l'auditeur, sans réveil ;
+    sans aucun orchestrateur vivant, `plan_underused` se replie sur l'auditeur
+    (#3036). Un agent à la fois orchestrateur et auditeur reçoit un seul texte.
 
     #3036 : `closed_hosts` (les hôtes de `claims_closed_hosts`) et le champ
     `lease_live` des lignes du registre écartent les destinataires qui ne
@@ -898,8 +928,11 @@ def briefs(alert: dict, listing: list, lot_titles: dict | None = None,
     # L713 : le lot stagnant ne réveille plus l'auditeur par courrier ; il le
     # lit à sa passe (`ameesh alerts --json`). Les orchestrateurs gardent
     # l'avis, et un auditeur qui est aussi orchestrateur de l'équipe le reçoit
-    # par cette voie (un seul texte).
-    if kind != "stale_lot":
+    # par cette voie (un seul texte). #3274 : `plan_underused` aussi est lu à
+    # la passe de l'auditeur — donner du travail aux agents au repos est le
+    # geste des orchestrateurs, pas le sien ; s'il ne reste aucun orchestrateur
+    # vivant, l'auditeur prend le relais plus bas (#3036).
+    if kind not in ("stale_lot", "plan_underused"):
         for name in auditor_names or ():
             out.setdefault(name, audit_text)
     if kind in ("critical_budget_pause", "budget_pause_long"):
@@ -911,6 +944,14 @@ def briefs(alert: dict, listing: list, lot_titles: dict | None = None,
     # s'il est `externe`) ; `stale_lot` excepté, qui ne réveille pas
     # l'auditeur (L713) et attend le retour d'un orchestrateur.
     live, dead = _split_live(out, by_name, closed)
+    if kind == "plan_underused" and not live:
+        # #3274 : plus aucun orchestrateur vivant — l'auditeur prend le relais
+        # (#3036), puis le bureau ou le fil par le repli commun. Avec un
+        # orchestrateur vivant, le forfait sous-utilisé attend la passe de
+        # l'auditeur, qui le lit sans être réveillé.
+        relay = {name: audit_text for name in auditor_names or ()}
+        live, more = _split_live(relay, by_name, closed)
+        dead.update(more)
     if live:
         if dead_out is not None:
             dead_out.update(dead)

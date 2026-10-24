@@ -850,6 +850,20 @@ class AttentePorteurTest(_Base):
         self.assertIn("assignee: act on it", text)
         self.assertNotIn("do not reassign its holder", text)
 
+    def test_niveau_1_dit_que_seul_un_hold_de_pilote_arrete_le_slo(self):
+        """#3274 : la retenue de l'assigné n'éteint que `sans_tour` (24 h) ;
+        l'horloge SLO ne s'arrête que sur un hold de pilote (#1664). Sans cette
+        précision, l'assigné croyait avoir parqué le lot et l'escalade
+        surprenait."""
+        alert = {"lot": self.lot["id"], "level": 1, "step": "intake_started",
+                 "waiting": {}, "agent": "dev1", "value": 5400, "threshold": 3600}
+        text = alert_briefs._slo_breach(alert)
+        self.assertIn("assignee: act on it", text)
+        self.assertIn('ameesh work note %d "hold: <reason>"' % self.lot["id"], text)
+        self.assertIn("only postpones the `sans_tour` reminder for 24 h", text)
+        self.assertIn("does not suspend this SLO clock", text)
+        self.assertIn("only a pilot's hold does", text)
+
 
 class AttenteDecisionTest(_Base):
     """#2378 : un lot `waiting_human` à demande de décision ouverte attend son
