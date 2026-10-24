@@ -213,12 +213,70 @@ class DanglingSupersedeWithRemoteTest(_DanglingSupersededFreezeFixture):
             self.supersede()
         self.assertIn("remote ref", str(caught.exception))
 
+    def archive_descendant(self, bare, ref, *, parent=None):
+        """Pose dans `bare` un descendant de `parent` sous une ref d'archive.
+
+        L'ancien gel n'est poussé que le temps de créer l'enfant (le seed est
+        supprimé ensuite) : la seule ref qui garde l'ancien gel est celle du
+        descendant, ce que l'égalité exacte ne voit pas."""
+        parent = parent or self.op
+        seed = "refs/archive/seed-%s" % parent[:8]
+        self.repo.git("push", "-q", "origin", "%s:%s" % (parent, seed))
+        tree = self.repo.git("rev-parse", parent + "^{tree}")
+        child = self.bare_git(bare, "commit-tree", tree, "-p", parent,
+                              "-m", "descendant", env=self.env("impl"))
+        self.bare_git(bare, "update-ref", ref, child)
+        self.bare_git(bare, "update-ref", "-d", seed)
+        return child
+
+    def test_a_remote_archive_descendant_of_the_freeze_refuses(self):
+        # Témoin cx1 (22:42Z) : `refs/archive/…` pointe un DESCENDANT du gel.
+        # L'égalité exacte ne suffit pas ; l'ascendance doit être lue, sinon
+        # le gate autorise un remplacement alors que le gel est accessible.
+        bare = self.add_remote()
+        child = self.archive_descendant(bare, "refs/archive/kept-descendant")
+        self.assertNotEqual(child, self.op)
+        self.assertFalse(plan_git.ref_reachable(self.repo.root, self.op))
+        self.assertTrue(plan_git.remote_reachable(self.repo.root, self.op))
+        with self.assertRaises(work.WorkError) as caught:
+            self.supersede()
+        self.assertIn("remote ref", str(caught.exception))
+
+    def test_a_remote_pull_descendant_of_the_freeze_refuses(self):
+        # Même preuve pour `refs/pull/N/head`, forme GitHub d'une PR fermée
+        # puis recréée après force-push.
+        bare = self.add_remote()
+        self.archive_descendant(bare, "refs/pull/9/head")
+        self.assertFalse(plan_git.ref_reachable(self.repo.root, self.op))
+        self.assertTrue(plan_git.remote_reachable(self.repo.root, self.op))
+        with self.assertRaises(work.WorkError) as caught:
+            self.supersede()
+        self.assertIn("remote ref", str(caught.exception))
+
+    def test_an_extra_ref_over_budget_is_a_doubt_not_an_absence(self):
+        # #3399 B1 : une ref non lue ne donne jamais un False. Budget extra
+        # épuisé -> None (refus), même si le descendant est bien là.
+        bare = self.add_remote()
+        self.archive_descendant(bare, "refs/archive/kept-descendant")
+        self.assertIsNone(plan_git.remote_reachable(
+            self.repo.root, self.op, extra_budget=0))
+
+    def test_an_unrelated_archive_descendant_still_proves_absence(self):
+        # Contrôle négatif : une ref d'archive hors de l'ascendance du gel ne
+        # doit pas faire refuser le remplacement (preuve d'absence réelle).
+        bare = self.add_remote()
+        self.archive_descendant(bare, "refs/archive/unrelated",
+                                parent=self.base)
+        self.assertFalse(plan_git.remote_reachable(self.repo.root, self.op))
+        row = self.supersede()
+        self.assertIn("ameesh-freeze-supersedes: %d" % int(self.op_freeze["id"]),
+                      row["note"])
+
     def test_many_pull_refs_do_not_exhaust_the_ancestry_budget(self):
-        # #3399 B2 : l'égalité exacte couvre toutes les refs, mais le budget
-        # d'ascendance ne compte que heads/tags. 20 refs/pull non locales ne
-        # doivent pas faire refuser la vérification : seule `keep/later`,
-        # descendante de l'ancien gel, demande un rapatriement et prouve
-        # l'accessibilité.
+        # #3399 B1 : les refs/pull inconnues passent par le budget « autres
+        # refs » (512), pas par celui de heads/tags (16). 20 refs/pull non
+        # locales ne doivent pas faire refuser la vérification ; seule
+        # `keep/later`, descendante de l'ancien gel, prouve l'accessibilité.
         bare = self.add_remote()
         self.repo.git("config", "remote.origin.fetch",
                       "+refs/heads/master:refs/remotes/origin/master")

@@ -202,9 +202,16 @@ def local_commit(repo: str, rev: str, *,
 
 #: #3399 : borner le relevé d'accessibilité d'un gel (revwalk sur les refs).
 REACHABLE_TIMEOUT_S = 30.0
-#: #3399 B1 : nombre de pointes distantes non locales qu'on accepte de
+#: #3399 B1 : nombre de pointes heads/tags non locales qu'on accepte de
 #: rapatrier pour prouver l'absence ; au-delà, la preuve est impossible.
 REMOTE_TIP_FETCH_BUDGET = 16
+#: #3399 B1 (cx1) : les autres refs annoncées (`refs/archive/…`,
+#: `refs/pull/N/head`, résolutions) gardent aussi des descendants d'un gel
+#: après un force-push. Leur ascendance se prouve donc aussi, avec un budget
+#: séparé : une forge en annonce des milliers, et au-delà de ce nombre la
+#: preuve d'absence reste impossible (`None`, jamais un `False` déduit des
+#: refs ignorées).
+REMOTE_EXTRA_TIP_FETCH_BUDGET = 512
 
 
 def ref_reachable(repo: str, rev: str, *,
@@ -226,8 +233,8 @@ def ref_reachable(repo: str, rev: str, *,
     processus) ; un délai ou un dépôt illisible rend `None`, jamais `False`.
 
     Ne voit que les refs **locales** : les refs distantes non rapatriées
-    (tags, refspec restreint) sont couvertes par [`remote_reachable`] (#3399
-    B1)."""
+    (toute l'annonce : tags, branches hors refspec, `refs/archive/…`,
+    `refs/pull/N/head`) sont couvertes par [`remote_reachable`] (#3399 B1)."""
     rev = str(rev or "").strip()
     if not repo or not rev or rev.startswith("-") or not os.path.isdir(repo):
         return None
@@ -269,10 +276,12 @@ def _remote_tips(repo: str, remote: str, *,
     Les tags annotés sont remplacés par leur cible pelée (`^{}`).
 
     Rend `(toutes, heads_tags)` : `toutes` sert à l'égalité exacte de pointe
-    sur l'annonce entière (sans fetch) ; `heads_tags` borne l'**ascendance**
-    aux refs qui s'y prêtent, pour que les milliers de `refs/pull` d'une
-    forge n'épuisent pas le budget de rapatriement (#3399 B2). `None` si
-    l'annonce est illisible : la preuve d'absence est alors impossible."""
+    et à l'**ascendance** sur l'annonce entière (sans fetch pour l'égalité) ;
+    `heads_tags` distingue les refs à l'ancien budget d'ascendance (16) des
+    autres (`refs/pull`, `refs/archive`, résolutions), qui ont le leur (#3399
+    B1 cx1) : une forge en annonce des milliers, et une preuve d'absence ne se
+    déduit jamais d'une ref ignorée. `None` si l'annonce est illisible : la
+    preuve d'absence est alors impossible."""
     try:
         proc = _git(repo, "ls-remote", "--", remote, timeout=timeout)
     except (GitError, OSError):
@@ -293,20 +302,26 @@ def _remote_tips(repo: str, remote: str, *,
         else:
             refs.append((sha, ref))
     all_tips: list[str] = []
+    all_seen: set[str] = set()
     heads_tags: list[str] = []
+    heads_seen: set[str] = set()
     for sha, ref in refs:
         tip = peeled.get(ref, sha)
-        if tip not in all_tips:
+        if tip not in all_seen:
+            all_seen.add(tip)
             all_tips.append(tip)
         if ref.startswith(("refs/heads/", "refs/tags/")) \
-                and tip not in heads_tags:
+                and tip not in heads_seen:
+            heads_seen.add(tip)
             heads_tags.append(tip)
     return all_tips, heads_tags
 
 
 def remote_reachable(repo: str, rev: str, remote: str = "origin", *,
                      timeout: float | None = FETCH_TIMEOUT,
-                     budget: int = REMOTE_TIP_FETCH_BUDGET) -> bool | None:
+                     budget: int = REMOTE_TIP_FETCH_BUDGET,
+                     extra_budget: int = REMOTE_EXTRA_TIP_FETCH_BUDGET
+                     ) -> bool | None:
     """`rev` est-il contenu par une **ref distante** de `remote` ?
 
     #3399 : `refresh_clone` ne rapatrie que le refspec configuré et jamais
@@ -317,12 +332,18 @@ def remote_reachable(repo: str, rev: str, remote: str = "origin", *,
     - une pointe (ou un tag pelé) **égale** au commit prouve qu'il est
       accessible, même sans l'objet local — sur **toutes** les refs annoncées,
       `refs/pull/N/head` et `refs/archive/…` comprises ;
-    - pour les seules refs `heads`/`tags`, une pointe locale est jugée par
-      `merge-base --is-ancestor`, une pointe absente est rapatriée par SHA
-      exact (`--no-tags`, sans écrire de ref) dans la limite de `budget` ;
-    - un nombre de pointes heads/tags à rapatrier au-delà du budget, un
-      `ls-remote` ou un fetch illisible, un dépôt shallow/partiel : `None`
-      (preuve impossible, l'appelant refuse).
+    - l'**ascendance** se prouve sur **toutes** les pointes annoncées : une
+      pointe locale est jugée par `merge-base --is-ancestor` ; une pointe
+      absente est rapatriée par SHA exact (`--no-tags`, sans écrire de ref),
+      dans la limite de `budget` pour heads/tags et de `extra_budget` pour les
+      autres refs (`refs/pull`, `refs/archive`, résolutions). Une ref hors
+      heads/tags qui pointe un **descendant** du gel le rend donc accessible
+      (#3399 B1 cx1) ;
+    - un nombre de pointes à rapatrier au-delà de son budget, un `ls-remote`
+      ou un fetch illisible, un dépôt shallow/partiel : `None` (preuve
+      impossible, l'appelant refuse). Aucune ref annoncée n'est ignorée sans
+      que le doute soit rendu : l'absence n'est jamais déduite d'une ref non
+      lue.
 
     Rend True (accessible), False (aucune ref distante ne le contient, prouvé)
     ou None (vérification impossible)."""
@@ -332,15 +353,15 @@ def remote_reachable(repo: str, rev: str, remote: str = "origin", *,
     found = _remote_tips(repo, remote, timeout=timeout)
     if found is None:
         return None
-    all_tips, ancestry_tips = found
+    all_tips, heads_tags = found
     if full in all_tips:
         return True
     if not _history_complete(repo):
         return None                 # l'ascendance ne se prouve pas
     # Une pointe déjà pointée par une ref locale est couverte par
     # `ref_reachable` (False ici) : inutile de la rejouer, et une forge peut
-    # annoncer des milliers de branches. On ne juge ensuite que les pointes
-    # heads/tags hors de ces refs (tags, refspec restreint).
+    # annoncer des milliers de branches. Les autres pointes, **toutes refs
+    # confondues**, sont jugées par leur ascendance.
     try:
         listing = _out(repo, "for-each-ref",
                        "--format=%(objectname) %(*objectname)")
@@ -351,11 +372,12 @@ def remote_reachable(repo: str, rev: str, remote: str = "origin", *,
     local: set[str] = set()
     for line in str(listing).splitlines():
         local.update(line.split())
-    candidates = [tip for tip in ancestry_tips if tip not in local]
+    candidates = [tip for tip in all_tips if tip not in local]
     if not candidates:
         return False
     # Présence locale en un seul processus (`cat-file --batch-check`), puis
-    # ascendance. Un objet absent est rapatrié par SHA exact, dans la limite.
+    # ascendance. Un objet absent est rapatrié par SHA exact, dans la limite
+    # de son budget (heads/tags ou autres refs).
     try:
         proc = _git(repo, "cat-file", "--batch-check",
                     stdin=("\n".join(candidates) + "\n").encode())
@@ -368,18 +390,20 @@ def remote_reachable(repo: str, rev: str, remote: str = "origin", *,
         fields = line.split()
         if len(fields) >= 2:
             kinds[fields[0].strip().lower()] = fields[1].strip()
-    pending: list[str] = []
+    heads_set = set(heads_tags)
+    pending_heads: list[str] = []
+    pending_extra: list[str] = []
     for tip in candidates:
         kind = kinds.get(tip)
         if kind is None:
             return None             # réponse incohérente : preuve impossible
         if kind == "missing":
-            pending.append(tip)
+            (pending_heads if tip in heads_set else pending_extra).append(tip)
             continue
         if kind == "tag":
             commit = local_commit(repo, tip)
             if commit is None:
-                pending.append(tip)
+                (pending_heads if tip in heads_set else pending_extra).append(tip)
                 continue
         elif kind == "commit":
             commit = tip
@@ -387,12 +411,15 @@ def remote_reachable(repo: str, rev: str, remote: str = "origin", *,
             continue                # arbre/blob : ne contient aucun commit
         if commit == full or _is_ancestor(repo, full, commit):
             return True
-    if not pending:
+    if not pending_heads and not pending_extra:
         return False
-    if len(pending) > budget:
-        return None                 # trop de pointes inconnues : preuve impossible
-    for start in range(0, len(pending), 8):
-        chunk = pending[start:start + 8]
+    if len(pending_heads) > budget:
+        return None                 # trop de pointes heads/tags inconnues
+    if len(pending_extra) > extra_budget:
+        return None                 # trop d'autres refs inconnues : doute
+    pending = pending_heads + pending_extra
+    for start in range(0, len(pending), 64):
+        chunk = pending[start:start + 64]
         try:
             proc = _git(repo, "fetch", "--quiet", "--no-tags",
                         "--no-write-fetch-head", "--", remote, *chunk,
