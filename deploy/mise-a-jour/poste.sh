@@ -656,6 +656,11 @@ controler_notify() {
 controler() {
   local echecs=()
   verif() { etape "$*"; "$@" || echecs+=("$*"); }
+  # #3345 : les profils des runners de ce poste (orchestrateur, mesh-design,
+  # auditeur) doivent s'accorder avec config.json sur train, github, release ;
+  # un profil resté en shadow ou sans github faisait tourner ces runners à
+  # côté du reste de l'hôte. Contrôle sans base, avant le doctor complet.
+  verif "$AMEESH" doctor --profiles
   verif "$AMEESH" doctor
   verif "$AMEESH" budget
   verif "$AMEESH" accounts list

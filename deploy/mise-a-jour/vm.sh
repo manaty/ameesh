@@ -1397,6 +1397,11 @@ controler_agents() {
       && bail_valide 0 "$attendu" "$heure" <<<"$ligne" \
       || { echec_agent "$p" "bail absent, étranger ou expiré, ou preuve illisible"; echec=1; }
   done <<<"$noms"
+  # #3345 : un profil de runner peut diverger de config.json sans bruit (train
+  # resté en shadow, github absent). Contrôle léger, sans base, avant le doctor
+  # complet : il nomme le profil et la feuille divergente.
+  etape "profils de runner contre config.json (#3345)"
+  ameesh_agents doctor --profiles || echec=1
   etape "ameesh doctor sur $HOTE_AGENTS"
   ameesh_agents doctor || echec=1
   [ "$echec" = 0 ] || { echo "contrôles en échec" >&2; return 1; }
@@ -1726,6 +1731,9 @@ controler() {
     ssh_vm "systemctl is-active ameesh-runner@$p && journalctl -u ameesh-runner@$p -n 15 --no-pager" || echec=1
     "$AMEESH" show "$p" | head -4 || echec=1
   done
+  # #3345 : mêmes profils de runner que côté agents, sur le serveur.
+  etape "profils de runner contre config.json (#3345)"
+  ssh_vm "runuser -l ameesh -c 'ameesh doctor --profiles'" || echec=1
   etape "ameesh doctor sur le serveur"
   ssh_vm "runuser -l ameesh -c 'ameesh doctor' | tail -8" || echec=1
   [ "$echec" = 0 ] || { echo "contrôles en échec" >&2; exit 1; }
