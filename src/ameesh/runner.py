@@ -2596,13 +2596,23 @@ class AgentWorker(threading.Thread):
         """Le lot (`work_item`) d'un tour, ou None s'il n'est pas déductible.
 
         1. Les messages du tour : s'ils portent UN seul lot (`--lot`), c'est
-           lui ; plusieurs lots distincts = ambigu, None.
+           lui ; plusieurs lots distincts = ambigu, None — sauf un lot tenu
+           par un AUTRE agent, qui ne choisit pas le tour (#3325).
         2. Sinon, l'unique lot ouvert assigné à l'agent ; plusieurs = None.
         Un tour dont le lot est inconnu ne déclenche jamais de rotation.
 
         #2527 : un message seulement informatif (`_informative_message`) ne
         porte pas le lot du tour : un avis sur le lot d'un autre n'ouvre ni
         ne met de côté aucune session.
+
+        #3325 (régression de #2410) : un courrier threadé sur le lot d'un
+        AUTRE agent — le destinataire n'y est ni assigné ni relecteur désigné
+        — ne choisit pas le lot du tour, donc n'ouvre ni ne met de côté
+        aucune session. Le tour revient aux lots que l'agent porte (ou reste
+        sans lot) ; le courrier reste livré dans la consigne. Un lot sans
+        agent (non assigné, tenu par un humain, inconnu) garde le comportement
+        d'avant : il n'appartient à aucun autre agent, et son dossier porte le
+        courrier primaire (#811).
         """
         ops = storage.of(self.db).operations
         try:
@@ -2617,6 +2627,9 @@ class AgentWorker(threading.Thread):
             elif ids:
                 lots = ops.message_lots(ids)
             if rows or ids:
+                # #3325 : le lot d'un AUTRE agent ne dédie pas la session ;
+                # il est retiré avant l'arbitrage « un seul / ambigu ».
+                lots = [lot for lot in lots if not self._turn_lot_foreign(lot)]
                 if len(lots) == 1:
                     return lots[0]
                 if len(lots) > 1:
@@ -2633,6 +2646,32 @@ class AgentWorker(threading.Thread):
         if len(actifs) == 1:
             return str(actifs[0]["id"])
         return None
+
+    def _turn_lot_foreign(self, lot: str) -> bool:
+        """#3325 : ce lot est-il tenu par un AUTRE agent (donc pas le tour) ?
+
+        Seul un lot assigné à un autre agent est écarté. Un lot sans agent
+        (non assigné, tenu par un humain, inconnu) n'appartient à personne
+        d'autre : il garde son rôle de dossier du courrier primaire (#811), et
+        une session qui lui serait dédiée ne prive aucun autre agent de son
+        lot. Un relecteur désigné porte le lot : il n'est pas « d'un autre ».
+        Une base illisible lève `DbError`, que `turn_lot` traite comme avant :
+        aucun tour ne part sur une lecture incertaine."""
+        from . import work as work_mod
+        from .work_reviewers import designated
+
+        lot = str(lot or "").strip()
+        if not lot.isdigit():
+            return False
+        item = work_mod.get(self.db, int(lot))
+        if item is None:
+            return False
+        assignee = str(item.get("assignee") or "").strip()
+        if not assignee or assignee == self.name:
+            return False
+        if assignee.startswith(work_mod.HUMAN_PREFIX):
+            return False
+        return self.name not in designated(item)
 
     def _informative_message(self, row: dict) -> bool:
         """#2527 : ce message n'est qu'un avis, il ne choisit pas le lot du
