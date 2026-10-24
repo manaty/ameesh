@@ -134,14 +134,16 @@ class PendingReviewsTest(t2447._ActivationFixture, PgTestCase):
         # The « available » answer comes from the idle relaunch : it now names
         # the reviews still owed, and stays the plain prompt without any.
         lot, sha = self.pending_lot("r1")
-        worker = types.SimpleNamespace(db=self.db, name="r1")
+        worker = types.SimpleNamespace(db=self.db, name="r1",
+                                       _idle_pilot=lambda: "pilote")
         prompt = runner.AgentWorker._idle_prompt(worker)
-        self.assertTrue(prompt.startswith(adapters.IDLE_PROMPT))
+        self.assertTrue(prompt.startswith(adapters.idle_prompt("pilote")))
         self.assertIn(adapters.IDLE_REVIEWS_HEADER, prompt)
         self.assertIn("#%d" % lot, prompt)
         self.assertIn(sha, prompt)
-        free = types.SimpleNamespace(db=self.db, name="r2")
-        self.assertEqual(runner.AgentWorker._idle_prompt(free), adapters.IDLE_PROMPT)
+        free = types.SimpleNamespace(db=self.db, name="r2", _idle_pilot=lambda: "")
+        self.assertEqual(runner.AgentWorker._idle_prompt(free),
+                         adapters.IDLE_PROMPT_NO_PILOT)
 
 
 class GreenVerdictStepTest(unittest.TestCase):

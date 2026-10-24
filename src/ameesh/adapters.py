@@ -250,11 +250,28 @@ ATTACH_RESUME_PROMPT = (
     "continue your lot. If you were waiting for a human decision, say so "
     "with agent-mail send to your manager and stop."
 )
+#: #3273 : la relance d'inactivité nomme le pilote de l'équipe de l'agent
+#: (`AgentWorker._idle_pilot`, même règle que les briefs), jamais un
+#: destinataire écrit en dur : « orchestrateur » faisait écrire les agents
+#: ameesh au pilote Nexlink, qui ne peut ni assigner ni suivre leurs lots.
 IDLE_PROMPT = (
     "Resuming: if your lot is neither frozen nor merged, continue it; otherwise "
     "take up your assignment (board, workstream). If you have nothing to do, "
-    "say so with agent-mail send orchestrateur, then stop."
+    "say so with agent-mail send %s, then stop."
 )
+#: sans pilote connu, la consigne ne fait écrire personne : l'alerte de
+#: capacité inemployée (L165b) signale déjà l'agent au repos
+IDLE_PROMPT_NO_PILOT = (
+    "Resuming: if your lot is neither frozen nor merged, continue it; otherwise "
+    "take up your assignment (board, workstream). If you have nothing to do, "
+    "stop."
+)
+
+
+def idle_prompt(pilot: str) -> str:
+    """#3273 : la relance d'inactivité, adressée au pilote `pilot` (ou à personne)."""
+    pilot = (pilot or "").strip()
+    return IDLE_PROMPT % pilot if pilot else IDLE_PROMPT_NO_PILOT
 #: #3033 : l'en-tête des avis dus, ajouté à `IDLE_PROMPT` quand il y en a —
 #: un agent qui en doit un n'est pas « disponible »
 IDLE_REVIEWS_HEADER = (
