@@ -55,6 +55,8 @@ TURN_CGROUP_SUBGROUP = "runner"
 
 #: `systemctl` à utiliser ; VIDE, les unités ne sont pas vérifiées (tests)
 SYSTEMCTL_ENV = "AMEESH_SYSTEMCTL"
+#: #3364 : la minuterie qui porte le packet-watch (`ameesh release tick`)
+RELEASE_TIMER = "ameesh-release.timer"
 
 
 def _systemctl(*args: str) -> str | None:
@@ -429,6 +431,117 @@ def runner_coverage(names: list[str], run=_systemctl, *, db=None) -> dict | None
                 out[name] = unit
                 break
     return out
+
+
+def packet_watch_lines(cfg, run=_systemctl) -> list[str]:
+    """#3364 : le packet-watch tourne dans `ameesh release tick`.
+
+    L'arrêt de `ameesh-release.timer` sur un hôte désigné par `packet_watch`
+    arrête donc aussi la fusion automatique des paquets (agents-2, 24/10
+    14:31Z). Le taire serait l'incident que ce lot ferme ; on nomme le geste
+    correct : retirer le bloc `release` pour retirer le coupeur, jamais couper
+    la minuterie. Le verdict du doctor ne change pas (avertissement)."""
+    try:
+        from . import packet_watch
+        declared = packet_watch.projects(cfg)
+    except Exception as exc:  # noqa: BLE001 - une lecture ne casse pas le doctor
+        return ["warning    : packet_watch configuration unreadable: %s"
+                % (" ".join(str(exc).split())[:200],)]
+    if not declared:
+        return []
+    state = run("show", RELEASE_TIMER, "-p", "ActiveState", "--value")
+    if state is None:
+        return ["packet-watch: systemd unavailable — %s state not checked"
+                % RELEASE_TIMER]
+    state = (state or "").strip() or "unknown"
+    if state == "active":
+        return ["packet-watch: %s active — packet watch (missed slot, automatic "
+                "merge) runs on its tick" % RELEASE_TIMER]
+    return [
+        "warning    : packet_watch is declared for this host but %s is not active "
+        "(%s): the packet watch (missed slot, automatic merge) is stopped"
+        % (RELEASE_TIMER, state),
+        "             systemctl --user enable --now %s" % RELEASE_TIMER,
+        "             a single cutter elsewhere: remove this host's `release` block, "
+        "never disable the timer",
+    ]
+
+
+def radar_repo_lines(cfg, db, present=None) -> list[str]:
+    """#3364 : les têtes gelées absentes du dépôt radar de cet hôte.
+
+    Le gel d'un lot est désigné en lisant sa tête dans un dépôt local ; un
+    checkout `radar.projects.<projet>.repo` que personne n'a fetché ne la
+    contient pas, et la désignation répond « no repository holds the frozen
+    head » (#3223, #3314, #3317, #3333, #3340, #3341, 24/10). Le radar et le
+    packet-watch ne fetchent pas ce checkout d'ensemble : le contrôle le rend
+    visible au lieu d'attendre la panne. `present(repo, sha)` remplace la
+    lecture git dans les tests."""
+    from . import freeze_checks, plan_git, radar, storage
+    if present is None:
+        present = freeze_checks.commit_in
+    try:
+        settings = radar.settings_of(cfg)
+    except Exception as exc:  # noqa: BLE001 - une lecture ne casse pas le doctor
+        return ["warning    : radar settings unreadable: %s"
+                % (" ".join(str(exc).split())[:200],)]
+    projects = getattr(settings, "projects", None) or {}
+    if not projects:
+        return []
+    try:
+        rows = storage.of(db).work.open_for_sweep(plan_git.MAX_BRANCH_LOTS)
+    except Exception as exc:  # noqa: BLE001 - base illisible : déjà dit ailleurs
+        return ["radar-repo : lots not read (%s)"
+                % (" ".join(str(exc).split())[:120],)]
+    if not rows:
+        return []
+    ids = [int(row["id"]) for row in rows]
+    try:
+        marks = storage.of(db).progress.lot_milestones(ids)
+    except Exception:  # noqa: BLE001 - pas de jalon : rien à vérifier
+        return []
+    frozen: dict[int, str] = {}
+    for mark in marks:
+        if (mark.get("kind") or "") != "frozen":
+            continue
+        sha = str(mark.get("sha") or "").strip().lower()
+        if len(sha) in (40, 64) and all(c in "0123456789abcdef" for c in sha):
+            frozen[int(mark["work_item_id"])] = sha
+    if not frozen:
+        return []
+    lines: list[str] = []
+    for name, project in sorted(projects.items()):
+        relevant = []
+        for row in rows:
+            if (row.get("app") or "") != name:
+                continue
+            sha = frozen.get(int(row["id"]))
+            if sha is not None:
+                relevant.append((int(row["id"]), sha))
+        if not relevant:
+            continue
+        repo = str(getattr(project, "repo", "") or "").strip()
+        if not repo:
+            continue
+        if not os.path.isdir(repo):
+            lines.append(
+                "warning    : radar repo %s is not a directory: the freeze "
+                "designation cannot read the frozen heads; restore the checkout or "
+                "fix radar.projects.%s.repo" % (repo, name))
+            continue
+        missing = ["#%d (%s)" % (lot, sha[:12])
+                   for lot, sha in relevant if not present(repo, sha)]
+        if not missing:
+            continue
+        shown = ", ".join(missing[:5])
+        if len(missing) > 5:
+            shown += " and %d more" % (len(missing) - 5)
+        lines.append(
+            "warning    : radar repo %s lacks the frozen head of %s: the freeze "
+            "designation will answer \"no repository holds the frozen head\"; "
+            "push the lot branch, then run git -C %s fetch origin"
+            % (repo, shown, repo))
+    return lines
 
 
 def missing_runner_lines(cfg, db, run=_systemctl) -> list[str]:

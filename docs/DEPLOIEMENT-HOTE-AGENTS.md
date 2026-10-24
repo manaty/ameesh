@@ -460,6 +460,15 @@ ameesh release packet-watch --dry-run      # grace, busy, served, nothing-ready,
 journalctl --user -u ameesh-release -n 5   # une ligne « packet-watch ameesh: … » par tick
 ```
 
+**Retirer le coupeur d'un hôte** : retirer son bloc `release`, jamais couper
+`ameesh-release.timer`. Le packet-watch tourne dans le tick même sans bloc
+`release` (le tick affiche `release: off` puis exécute le packet-watch seul) ;
+désactiver la minuterie arrête aussi la fusion automatique des paquets — le
+geste du 24/10 14:31Z sur agents-2. `ameesh doctor` signale un hôte
+`packet_watch` dont `ameesh-release.timer` n'est pas actif, ainsi qu'un dépôt
+`radar.projects.<projet>.repo` auquel il manque une tête gelée (checkout non
+fetché, désignation au gel impossible).
+
 **Ce que fait un tick** : il prend `B`, la tête de la cible si la CI du
 commit exact est verte, sinon le plus récent commit vert de la chaîne
 first-parent (un commit de release `[skip ci]` hérite de l'état de son premier
