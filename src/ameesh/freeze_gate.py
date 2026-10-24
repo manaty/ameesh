@@ -741,7 +741,11 @@ def milestone(
             # n'appelle pas de nouvelle désignation. Le plan est lu avant la
             # transaction du jalon (lectures git/réseau hors verrou de ligne).
             carried = activation.carried_plan(cfg, db, item_id, sha)
-            on_frozen = activation.hook(cfg, outcome, carried=carried)
+            # #3250: a locally present head does not certify a fresh target.
+            # Pin the exact published target before taking the lot's lock.
+            target = (None if carried else
+                      activation.prepare_target(cfg, db, item, sha))
+            on_frozen = activation.hook(cfg, outcome, carried=carried, target=target)
             if after_commit is None:
                 after_commit = []
                 drain = after_commit

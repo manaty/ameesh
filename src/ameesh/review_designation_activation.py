@@ -21,7 +21,8 @@ Inputs, all from machine sources (never a note, an assignment or a name):
   process cwd, then (#2561) a worktree tracked by housekeeping or a sibling of
   those paths named after the lot/agent — the freeze command may run from the
   agent's session directory, another repository. The exact SHA and the issue's
-  repository origin decide;
+  repository origin decide. The exact target branch is refreshed outside the
+  freeze transaction and pinned to a commit for the whole reading (#3250);
 - **authors**: the lot's assignee at freeze (`review_lot._author_at_freeze`,
   the historical turn trace, the same reference family as the merge gate) and
   every commit of the frozen range through its exact provenance receipt
@@ -79,7 +80,7 @@ from . import db as db_mod
 from . import lot_class, mechanics, plan_git, projects, registry, review
 from . import review_designation as rd
 from . import review_designation_pg as pg
-from . import review_authors, review_floor, storage, work
+from . import review_authors, review_floor, review_target, storage, work
 
 #: the sender of the journal notes and automatic mails
 SENDER = pg.SENDER
@@ -1081,12 +1082,38 @@ def _manual_covers(inputs: Inputs) -> bool:
 # the inputs of one freeze
 # --------------------------------------------------------------------------
 
+@dataclass(frozen=True)
+class Target:
+    """The target certified outside the transaction, for one frozen head."""
+    repo: str
+    declared: str
+    sha: str
+    head: str
+
+
+def prepare_target(cfg, db, item: Mapping, head: str, *,
+                   fetch: bool = True) -> Target | Unavailable:
+    repo = _repository(db, cfg, item, head, fetch=fetch)
+    if not repo:
+        return Unavailable("no repository holds the frozen head %s: cannot read the"
+                           " frozen diff" % head[:12])
+    base = lot_class.default_base(cfg, item, repo)
+    if not base:
+        return Unavailable("no target branch known for lot #%d" % int(item["id"]))
+    try:
+        sha = review_target.resolve(repo, base, fetch=fetch)
+    except (review_target.TargetError, canon_mod.GitError) as exc:
+        return Unavailable(str(exc))
+    return Target(repo, base, sha, head)
+
+
 def prepare(cfg, db, lot: int, *, freeze: Optional[Mapping] = None,
-            fetch: bool = True) -> Inputs | Unavailable:
+            fetch: bool = True, target=None) -> Inputs | Unavailable:
     """Reads the machine inputs of a freeze; an expected refusal is `Unavailable`.
 
     `fetch=False` keeps the read local (no `git fetch`), as the freeze
-    transaction requires."""
+    transaction requires. A branch target then needs the `target` snapshot
+    prepared outside the transaction; otherwise the read is unavailable."""
     item = work.get(db, int(lot))
     if item is None:
         return Unavailable("lot #%d not found" % int(lot))
@@ -1111,13 +1138,14 @@ def prepare(cfg, db, lot: int, *, freeze: Optional[Mapping] = None,
             "resolves a ref in its own clone — freeze again with the full head "
             "(`ameesh work milestone %d frozen --sha <commit>`)"
             % (freeze.get("id"), frozen_sha, int(lot)))
-    repo = _repository(db, cfg, item, frozen_sha, fetch=fetch)
-    if not repo:
-        return Unavailable("no repository holds the frozen head %s: cannot read the"
-                           " frozen diff" % frozen_sha[:12])
-    base = lot_class.default_base(cfg, item, repo)
-    if not base:
-        return Unavailable("no target branch known for lot #%d" % int(lot))
+    if target is None:
+        target = prepare_target(cfg, db, item, frozen_sha, fetch=fetch)
+    if isinstance(target, Unavailable):
+        return target
+    if (target.head != frozen_sha
+            or target.declared != lot_class.default_base(cfg, item, target.repo)):
+        return Unavailable("the target changed since refresh: retry outside the freeze transaction")
+    repo, base = target.repo, target.sha
     from . import packet_reviews
 
     try:
@@ -1784,7 +1812,7 @@ def _manual_unavailable(cfg, tx, item: Mapping, freeze: Mapping,
 
 def _designate_in_transaction(cfg, tx, lot: int, *, milestone: Optional[Mapping],
                               threads: list, carried: Optional[Mapping] = None,
-                              reading: Optional[dict] = None) -> dict:
+                              reading: Optional[dict] = None, target=None) -> dict:
     """The `on_frozen` body: all writes stay in the freeze's transaction.
 
     `carried` (#2487) : le plan du report quand il couvre la tête gelée ; la
@@ -1820,7 +1848,7 @@ def _designate_in_transaction(cfg, tx, lot: int, *, milestone: Optional[Mapping]
         return _carried_in_transaction(tx, item, freeze, carried)
     try:
         # no network read inside the freeze transaction (see the docstring)
-        inputs = prepare(cfg, tx, int(lot), freeze=freeze, fetch=False)
+        inputs = prepare(cfg, tx, int(lot), freeze=freeze, fetch=False, target=target)
     except Exception as exc:  # noqa: BLE001 - recorded below, never guessed
         if manual:
             return _manual_unavailable(
@@ -2012,7 +2040,8 @@ def _notify_superseded_blocks(db, item: Mapping, freeze: Mapping, outcome: Mappi
 
 
 def designate_in_transaction(cfg, tx, lot: int, *, milestone: Optional[Mapping],
-                             threads: list, carried: Optional[Mapping] = None) -> dict:
+                             threads: list, carried: Optional[Mapping] = None,
+                             target=None) -> dict:
     """The `on_frozen` body, plus the superseded-block notification (#2681).
 
     The notification is best-effort: it runs after the designation writes, and
@@ -2022,7 +2051,7 @@ def designate_in_transaction(cfg, tx, lot: int, *, milestone: Optional[Mapping],
     reading: dict = {}
     result = _designate_in_transaction(cfg, tx, lot, milestone=milestone,
                                        threads=threads, carried=carried,
-                                       reading=reading)
+                                       reading=reading, target=target)
     try:
         item = work.get(tx, int(lot)) or {"id": int(lot)}
         _notify_superseded_blocks(tx, item, milestone or {}, result, threads,
@@ -2032,18 +2061,21 @@ def designate_in_transaction(cfg, tx, lot: int, *, milestone: Optional[Mapping],
     return result
 
 
-def hook(cfg, outcome: Optional[dict] = None, *, carried: Optional[Mapping] = None):
+def hook(cfg, outcome: Optional[dict] = None, *, carried: Optional[Mapping] = None,
+         target=None):
     """The callback installed on the CLI's `frozen` milestone.
 
     `outcome`, when given, receives the designation shape for the command's
     message; the callback itself has no other return channel. `carried` is the
     read-only plan of the verdict carry when it covers the head being frozen
     (#2487): the callback then keeps the reported reviewers and mails nobody.
+    `target` (#3250) is prepared before opening the transaction; without it a
+    branch target defers to recovery instead of trusting the clone's old ref.
     """
     def on_frozen(tx, milestone, threads):
         result = designate_in_transaction(cfg, tx, int(milestone["work_item_id"]),
                                           milestone=milestone, threads=threads,
-                                          carried=carried)
+                                          carried=carried, target=target)
         if outcome is not None:
             outcome.clear()
             outcome.update(result)
