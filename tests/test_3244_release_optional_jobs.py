@@ -52,6 +52,47 @@ class OptionalJobReadingTest(unittest.TestCase):
         self.assertEqual(reading["inconclusive"], [])
         self.assertEqual(release._run_evidence(data["runs"][0])["inconclusive"], [])
 
+    def test_separate_macos_workflow_is_consigned_without_blocking(self):
+        for conclusion in (None, "cancelled", "timed_out", "startup_failure"):
+            with self.subTest(conclusion=conclusion):
+                data = suite(mac="success")
+                data["runs"].append(fixture._run(700, [fixture._job(
+                    "suite macOS complète", conclusion or "",
+                    "completed" if conclusion else "in_progress")],
+                    workflow="macos", conclusion=conclusion or ""))
+                reading = self.read(data, {
+                    **rollup(), "negative": [], "failed": [],
+                    "pending": [] if conclusion else ["macos"],
+                    "inconclusive": ["macos"] if conclusion else [],
+                })
+                self.assertTrue(reading["green"], reading)
+                self.assertEqual(reading["pending"], [])
+                self.assertEqual(reading["inconclusive"], [
+                    "suite macOS complète (%s; https://github.com/manaty/ameesh/actions/runs/700)"
+                    % (conclusion or "in_progress")])
+                self.assertEqual(release._full_suite_run(data)["id"], 600)
+
+    def test_separate_macos_workflow_failure_still_blocks(self):
+        data = suite(mac="success")
+        data["runs"].append(fixture._run(700, [
+            fixture._job("suite macOS complète", "failure")],
+            workflow="macos", conclusion="failure"))
+        reading = self.read(data, {**rollup(), "negative": ["macos"]})
+        self.assertFalse(reading["green"], reading)
+        self.assertTrue(any("suite macOS complète (failure;" in name
+                            for name in reading["negative"]))
+
+    def test_separate_macos_workflow_never_certifies_a_non_conclusive_aggregate(self):
+        data = suite(mac="success", tests="cancelled")
+        data["runs"].append(fixture._run(700, [fixture._job(
+            "suite macOS complète", "", "in_progress")],
+            workflow="macos", conclusion=""))
+        reading = self.read(data, {
+            **rollup(), "negative": [], "pending": ["macos"],
+        })
+        self.assertFalse(reading["green"], reading)
+        self.assertTrue(any("agrégat tests non validé" in name for name in reading["pending"]))
+
     def test_optional_failure_excludes_the_candidate(self):
         reading = self.read(suite(mac="failure"))
         self.assertFalse(release.reading_is_green(reading))

@@ -442,9 +442,10 @@ def ci_reading(project: "ProjectRelease", sha: str) -> dict:
         suite = suite_reading(project, sha)
         run = _suite_attempt(suite)
         aggregate_ok = run is not None and _aggregate_success(run)
-        # These workflows are reclassified job by job below. The newest
-        # workflow rollup may describe an auxiliary ci-macos label run.
-        managed = {"tests", "paquet"}
+        # These workflows are reclassified job by job below, including the
+        # separate macOS suite (#3198). Its unfinished rollup must not block
+        # a successful tests aggregate; a job FAILURE still blocks below.
+        managed = {"tests", "paquet", "macos"}
         negative = [name for name in reading.get("negative", ()) if name not in managed]
         pending = [name for name in reading.get("pending", ()) if name not in managed]
         inconclusive = [name for name in reading.get("inconclusive", ()) if name not in managed]
