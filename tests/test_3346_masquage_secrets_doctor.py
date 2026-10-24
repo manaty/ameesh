@@ -150,6 +150,59 @@ class AuditTest(Banc):
         self.assertIn("config.json %s" % config.MASKED_SECRET, lignes)
         self.assertNotIn(SECRET_BASE, lignes)
 
+    def test_un_sous_objet_ajoute_ne_laisse_pas_fuir_son_jeton(self):
+        """avis dev7 : `_config_diff` rend le sous-arbre `github.auth` entier ;
+        son `token` imbriqué ne doit pas sortir en clair."""
+        secret = "ghp_sous_objet_0123456789"
+        self._write(self.critiques, {"github": {
+            "host": "pc-smichea",
+            "projects": BASE["github"]["projects"],
+            "auth": {"token": secret},
+        }})
+        audit = self.audit()
+        self.assertIn("github.auth", [d.path for d in audit.divergences])
+        lignes = "\n".join(audit.lines())
+        self.assertIn('"token": "%s"' % config.MASKED_SECRET, lignes)
+        self.assertNotIn(secret, lignes)
+
+    def test_un_github_absent_de_la_base_ne_laisse_pas_fuir_son_jeton(self):
+        """avis cx1 : `github` ajouté en entier (clé absente de la base) est
+        rendu comme un conteneur, pas feuille par feuille."""
+        self._write(self.host, {k: v for k, v in BASE.items() if k != "github"})
+        secret = "FAKE_SECRET_3346"
+        self._write(self.critiques, {"github": {"token": secret}})
+        audit = self.audit()
+        self.assertEqual([d.path for d in audit.divergences], ["github"])
+        lignes = "\n".join(audit.lines())
+        self.assertIn("github", lignes)
+        self.assertIn('"token": "%s"' % config.MASKED_SECRET, lignes)
+        self.assertNotIn(secret, lignes)
+
+    def test_un_github_remplace_par_null_ne_laisse_pas_fuir_le_jeton(self):
+        """avis cx1 : un changement de type rend le conteneur de la base d'un
+        bloc ; le jeton qu'il porte est masqué."""
+        self._write(self.critiques, {"github": None})
+        audit = self.audit()
+        self.assertEqual([d.path for d in audit.divergences], ["github"])
+        lignes = "\n".join(audit.lines())
+        self.assertIn("github", lignes)
+        self.assertIn('"token": "%s"' % config.MASKED_SECRET, lignes)
+        self.assertNotIn(SECRET_BASE, lignes)
+
+    def test_une_liste_d_objets_ne_laisse_pas_fuir_ses_jetons(self):
+        """avis cx1 : une liste rendue en bloc est parcourue, ses objets aussi."""
+        secret = "ghp_liste_0123456789"
+        self._write(self.critiques, {"github": {
+            "host": "pc-smichea",
+            "projects": BASE["github"]["projects"],
+            "hooks": [{"name": "a", "secret": secret}],
+        }})
+        audit = self.audit()
+        self.assertIn("github.hooks", [d.path for d in audit.divergences])
+        lignes = "\n".join(audit.lines())
+        self.assertIn('"secret": "%s"' % config.MASKED_SECRET, lignes)
+        self.assertNotIn(secret, lignes)
+
     def test_un_ecart_non_secret_reste_lisible(self):
         """Le masquage ne cache pas les feuilles ordinaires : `doctor` continue
         de nommer la valeur attendue et la valeur du profil."""

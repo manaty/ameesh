@@ -701,15 +701,34 @@ def _secret_leaf(path: str) -> bool:
     return any(marker in path.lower() for marker in SECRET_LEAF_MARKERS)
 
 
+def _masked(value, path: str):
+    """Copie affichable de `value` : toute feuille secrète devient `***`.
+
+    `_config_diff` rend un sous-arbre entier quand une clé n'existe que d'un
+    côté, disparaît ou change de type ; ce conteneur peut porter un secret
+    imbriqué (`github.auth.token` ajouté, `github` remplacé par `null`, liste
+    d'objets…). Le masquage descend donc dans les objets et les listes au lieu
+    de ne regarder que le chemin de la divergence (#3346, avis dev7/cx1)."""
+    if _secret_leaf(path):
+        return MASKED_SECRET
+    if isinstance(value, dict):
+        return {key: _masked(child, "%s.%s" % (path, key) if path else str(key))
+                for key, child in value.items()}
+    if isinstance(value, list):
+        return [_masked(item, path) for item in value]
+    return value
+
+
 def _shown(value, path: str) -> str:
     """Une valeur de configuration en une ligne courte, jamais un secret :
     seules les clés partagées (train, github, release) passent par ici ; une
-    feuille dont le nom ressemble à un secret (#3346) s'affiche masquée."""
+    feuille dont le nom ressemble à un secret (#3346) s'affiche masquée, y
+    compris sous un objet ou dans une liste rendue en bloc."""
     if value is _MISSING:
         return "<absent>"
     if _secret_leaf(path):
         return MASKED_SECRET
-    texte = json.dumps(value, ensure_ascii=False, sort_keys=True)
+    texte = json.dumps(_masked(value, path), ensure_ascii=False, sort_keys=True)
     return texte if len(texte) <= 120 else texte[:117] + "..."
 
 
