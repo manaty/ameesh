@@ -32,10 +32,14 @@ auteurs, avec les mêmes exceptions du canon §2 :
   supprimé, un réordre réécrit ou des lignes toutes disparues ne le gardent
   pas ; une ligne retirée ne prouve que si la base de fusion l'a portée au
   même chemin (#2994/#2614) ; une lecture impossible, elle, conserve toujours
-  l'auteur. Un gel antérieur
-  absent du clone de lecture est demandé à la forge (`origin`) par SHA exact,
-  quel que soit l'appelant (#3147) : le résultat de la porte ne dépend pas du
-  clone ;
+  l'auteur. Un gel antérieur absent du clone de lecture est demandé à la forge
+  (`origin`) par SHA exact, quel que soit l'appelant (#3147) : le résultat de
+  la porte ne dépend pas du clone ;
+* un commit **déjà dans la cible** au moment de la lecture ne compte ni comme
+  auteur ni comme tiers du lot (#3116) : la plage reportée d'un ancien gel,
+  calculée avant un rebase, peut contenir du develop déjà relu sous son propre
+  lot ; un inconnu d'un gel antérieur qui n'est plus ancêtre de la tête et dont
+  le contenu ne survit pas ne bloque pas non plus (#3116) ;
 * un ancien commit sans reçu et sans attribution ne bloque plus quand son
   contenu a disparu, ou quand le même auteur l'a réémis avec reçu exact et
   patch-id verbatim identique dans la plage courante (#3301, constat
@@ -458,6 +462,84 @@ def _is_ancestor(repo: str, before: str, after: str) -> Optional[bool]:
     if proc.returncode == 1:
         return False
     return None
+
+
+def target_commit(repo: str, target: str) -> str:
+    """Le commit qu'une cible nomme dans `repo`, ou "" (#3116).
+
+    La cible peut être un commit complet ou une ref (`origin/develop`) : c'est
+    la cible **au moment de la lecture**. Une cible illisible rend "" et le
+    lecteur garde son comportement d'avant (aucun commit n'est écarté) : le
+    doute ne retire jamais un auteur.
+
+    #3116 B2 : une cible NUE (`main`) se résout sur sa ref **distante**
+    (`origin/main`) en priorité — même règle que `_resolve_base` et
+    `_delta_base`. Une branche locale peut porter un commit non fusionné (le
+    correcteur) et masquer la cible réelle ; la lire écarterait ce correcteur
+    de la provenance. Une cible explicitement qualifiée est gardée telle
+    quelle."""
+    text = str(target or "").strip()
+    if not repo or not text:
+        return ""
+    remote = None
+    try:
+        from . import canon as canon_mod
+        remote = canon_mod.remote_branch(repo, text)
+    except Exception:  # noqa: BLE001 - résolution distante impossible : ref nue
+        remote = None
+    for ref in ([remote] if remote else []) + [text]:
+        try:
+            found = plan_git._commit(repo, ref) or ""
+        except Exception:  # noqa: BLE001 - cible illisible : pas d'écart
+            found = ""
+        if found:
+            return found
+    return ""
+
+
+def _not_in_target(repo: str, commits, target: str) -> list:
+    """Les commits de la liste qui ne sont PAS atteignables depuis `target`.
+
+    #3116 : un commit déjà dans la cible a été relu sous son propre lot ; il
+    ne compte ni comme auteur ni comme tiers du lot, qu'il vienne de la plage
+    courante ou du report d'un gel antérieur (#2924). La lecture se fait en un
+    seul `git rev-list ... --not <cible>`, sans une sonde par commit ; une
+    lecture impossible garde la liste entière (le doute ne retire jamais un
+    auteur, il ne le compte pas non plus dans la cible)."""
+    wanted = [str(commit).strip() for commit in commits or ()
+              if str(commit).strip()]
+    if not wanted or not target:
+        return wanted
+    try:
+        text = plan_git._out(repo, "rev-list", *wanted, "--not", str(target))
+    except Exception:  # noqa: BLE001 - lecture impossible : aucun écart
+        return wanted
+    if text is None:
+        return wanted
+    outside = {line.strip() for line in str(text).splitlines() if line.strip()}
+    return [commit for commit in wanted if commit in outside]
+
+
+def _survives_rewrite(repo: str, head: str, sha: str, cache: dict,
+                      base: str = "", target: str = "") -> bool:
+    """Un commit d'un gel antérieur compte-t-il encore pour la tête lue ?
+
+    #3116 : un commit déjà dans la cible ne compte ni comme auteur ni comme
+    tiers. Hors cible, un commit qui n'est plus ancêtre de la tête **et** dont
+    le contenu ne survit pas (preuve de contenu #2924/#2977) a été réellement
+    réécrit : il ne bloque pas la lecture. Un commit encore ancêtre de la tête
+    reste lu comme avant ; une lecture impossible est un doute, qui garde."""
+    if not head:
+        return True
+    if target and _is_ancestor(repo, sha, target) is True:
+        return False
+    if _is_ancestor(repo, sha, head) is True:
+        return True
+    # #3116 B1 : la preuve de réécriture cherche le contenu DÉPLACÉ (un
+    # fichier renommé garde ses lignes) et garde le doute quand un chemin a
+    # disparu — les drapeaux stricts réservés aux lignes génériques faisaient
+    # disparaître un inconnu dont le contenu subsistait dans un autre fichier.
+    return _commit_survives(repo, head, sha, cache, base)
 
 
 def _tree_of(repo: str, rev: str) -> Optional[str]:
@@ -1585,7 +1667,8 @@ def _freeze_reference(db, item: Mapping, freeze: Mapping, families) -> dict:
 
 def _prior_reading(db, item: Mapping, freeze: Mapping, commits: Sequence[str],
                    repo: str, families, *, provider=None,
-                   strict: bool = False, ignore_missing=None
+                   strict: bool = False, ignore_missing=None, target: str = "",
+                   head: str = "", base: str = "", cache: Optional[dict] = None
                    ) -> tuple[dict, dict, dict, list]:
     """`(auteurs, commits_écrits, corrections, inconnus)` d'un gel antérieur.
 
@@ -1597,7 +1680,11 @@ def _prior_reading(db, item: Mapping, freeze: Mapping, commits: Sequence[str],
     premier tour » se fait dans `_prior_correctors` (#2888).
 
     `ignore_missing(sha)` (#3301) ne dispense que les commits sans reçu et
-    sans attribution : jamais un auteur prouvé ou un reçu contradictoire."""
+    sans attribution : jamais un auteur prouvé ou un reçu contradictoire.
+    #3116 : `target` est la cible au moment de la lecture. Ses commits ne
+    comptent ni comme auteurs ni comme tiers. Hors cible, un inconnu qui n'est
+    plus ancêtre de `head` et dont le contenu ne survit pas ne bloque plus
+    (`_survives_rewrite`) ; `cache` partage la preuve de contenu."""
     reference = _freeze_reference(db, item, freeze, families)
     author_name = str(reference.get("name") or "").strip()
     author_family = str(reference.get("family") or "")
@@ -1606,10 +1693,23 @@ def _prior_reading(db, item: Mapping, freeze: Mapping, commits: Sequence[str],
     written: dict[str, list] = {}
     review_commits: dict[str, list] = {}
     unknown: list[str] = []
+    cache = {} if cache is None else cache
+    commits = _not_in_target(repo, commits, target)
 
-    def missing(sha: str) -> None:
-        if ignore_missing is None or not ignore_missing(sha):
-            unknown.append(sha[:12])
+    def record_unknown(value: str) -> None:
+        """Un inconnu ne bloque que s'il compte encore pour la tête (#3116),
+        et qu'il n'est pas dispensé comme obsolete (#3301)."""
+        if not _survives_rewrite(repo, head, value, cache, base, target):
+            return
+        if ignore_missing is not None and ignore_missing(value):
+            return
+        unknown.append(str(value)[:12])
+
+    def record_unreadable(value: str) -> None:
+        """Un reçu contradictoire ou vide n'est jamais dispensé par #3301 ;
+        #3116 écarte seulement ce qui ne compte plus pour la tête."""
+        if _survives_rewrite(repo, head, value, cache, base, target):
+            unknown.append(str(value)[:12])
 
     for raw in commits or ():
         sha = str(raw or "").strip()
@@ -1620,12 +1720,12 @@ def _prior_reading(db, item: Mapping, freeze: Mapping, commits: Sequence[str],
         except review_provenance.ProvenanceError:
             if strict:
                 raise
-            unknown.append(sha[:12])
+            record_unreadable(sha)
             continue
         if receipt is None:
             actor, stamp = commit_actor(repo, sha, db)
             if not actor:
-                missing(sha)
+                record_unknown(sha)
                 continue
             if actor != author_name:
                 try:
@@ -1633,7 +1733,7 @@ def _prior_reading(db, item: Mapping, freeze: Mapping, commits: Sequence[str],
                 except Exception:  # noqa: BLE001 - registre illisible : inconnu
                     known = False
                 if not known:
-                    missing(sha)
+                    record_unknown(sha)
                     continue
             if actor == author_name:
                 proven = actor_family(db, actor, stamp, families) or author_family
@@ -1645,11 +1745,11 @@ def _prior_reading(db, item: Mapping, freeze: Mapping, commits: Sequence[str],
                 review_commits.setdefault(actor, []).append((sha, proven))
                 written.setdefault(actor, []).append(sha)
                 continue
-            missing(sha)
+            record_unknown(sha)
             continue
         actor = str(receipt.get("actor") or "").strip()
         if not actor:
-            unknown.append(sha[:12])
+            record_unreadable(sha)
             continue
         proven = _family(receipt.get("harness"), families)
         by_name.setdefault(actor, set()).add(proven)
@@ -1794,7 +1894,7 @@ def _forge_fetch(repo: str, sha: str) -> bool:
 def _carried_from_previous(db, item: Mapping, milestone: Optional[Mapping],
                            commits: Sequence[str], repo: str, families, *,
                            base: str = "", head: str = "", provider=None,
-                           strict: bool = False,
+                           strict: bool = False, target: str = "",
                            recover=None) -> tuple[list, list, list]:
     """Auteurs/correcteurs des gels antérieurs dont le contenu subsiste (#2924).
 
@@ -1822,7 +1922,13 @@ def _carried_from_previous(db, item: Mapping, milestone: Optional[Mapping],
     même auteur Git d'agent doit porter un reçu exact de cet auteur et le même
     patch-id verbatim dans la plage courante. Cela n'atteste jamais le vieux
     committer et ne retire aucun auteur déjà prouvé ; une contradiction reste
-    refusée. Un contenu prouvé disparu n'ajoute plus d'inconnu non plus."""
+    refusée. Un contenu prouvé disparu n'ajoute plus d'inconnu non plus.
+    #3116 : `target` est la cible au moment de la lecture (un commit ou une
+    ref). Un commit qui y est déjà entré a été relu sous son propre lot : il ne
+    compte ni comme auteur ni comme tiers, même s'il apparaît dans la plage
+    d'un gel antérieur calculée avant un rebase. Un gel entièrement contenu
+    dans la cible n'est pas relu. Sans `target` lisible, `base` (toujours un
+    ancêtre de la cible) sert de borne sûre."""
     item = dict(item or {})
     if db is None or not repo or packet_composer(item):
         return [], [], []
@@ -1869,6 +1975,7 @@ def _carried_from_previous(db, item: Mapping, milestone: Optional[Mapping],
                            None)
     if not head_sha:
         return [], [], []
+    target_sha = target_commit(repo, target) or target_commit(repo, base)
     if current is not None:
         prior = [row for row in freezes
                  if int(row.get("id") or 0) < int(current.get("id") or 0)]
@@ -2004,7 +2111,10 @@ def _carried_from_previous(db, item: Mapping, milestone: Optional[Mapping],
             recover_one(base)
         if head_sha and not present(head_sha):
             recover_one(head_sha)
-        # le contenu d'un gel déjà entré dans la cible n'est pas relu
+        # le contenu d'un gel déjà entré dans la cible n'est pas relu (#3116) :
+        # ses commits ont été relus sous leur propre lot, jamais sous celui-ci.
+        if target_sha and _is_ancestor(repo, sha, target_sha) is True:
+            continue
         if base and _is_ancestor(repo, sha, base) is True:
             continue
         # un gel plus récent déjà traité couvre celui-ci (même histoire)
@@ -2019,6 +2129,8 @@ def _carried_from_previous(db, item: Mapping, milestone: Optional[Mapping],
             unknown.append(sha[:12])
             continue
         earlier = _commits_between(repo, start, sha)
+        if earlier is not None:
+            earlier = _not_in_target(repo, earlier, target_sha)
         if earlier is None:
             if strict:
                 raise review_provenance.ProvenanceError(
@@ -2036,7 +2148,8 @@ def _carried_from_previous(db, item: Mapping, milestone: Optional[Mapping],
         try:
             by_name, written, review_commits, unreadable = _prior_reading(
                 db, item, row, earlier, repo, families,
-                provider=provider, strict=strict,
+                provider=provider, strict=strict, target=target_sha,
+                head=head_sha, base=base, cache=file_cache,
                 ignore_missing=lambda commit: obsolete_missing(commit, stored=stored))
         except Exception as exc:  # noqa: BLE001 - un gel antérieur illisible
             if strict:
@@ -2076,7 +2189,8 @@ def reading(db, item: Mapping, milestone: Optional[Mapping],
             reference_families: Optional[Mapping] = None, provider=None,
             strict: bool = False, trace: bool = False,
             families_out: Optional[dict] = None,
-            base: str = "", head: str = "", recover=None) -> tuple[list, list, list]:
+            base: str = "", head: str = "", target: str = "",
+            recover=None) -> tuple[list, list, list]:
     """`(auteurs, inconnus, correcteurs)` de la plage gelée, même lecture pour tous.
 
     `reference` est l'auteur de référence déjà lu (`reference_author`) : la
@@ -2144,9 +2258,18 @@ def reading(db, item: Mapping, milestone: Optional[Mapping],
     acteur prouvé sous plusieurs familles dans un gel
     antérieur garde tout l'ensemble (`families_out`), jamais la seule famille
     du reçu courant.
+
+    #3116 : `target` est la cible au moment de la lecture (commit ou ref). Un
+    commit qui y est déjà entré ne compte ni comme auteur ni comme tiers du
+    lot, qu'il vienne de la plage courante ou du report d'un gel antérieur :
+    il a été relu sous son propre lot. Sans `target`, `base` — toujours un
+    ancêtre de la cible — sert de borne sûre ; sans l'un ni l'autre, la
+    lecture garde son comportement d'avant (aucun commit écarté).
     """
     item = dict(item or {})
     packet = bool(packet_composer(item))
+    target_sha = target_commit(repo, target) or target_commit(repo, base)
+    commits = _not_in_target(repo, commits, target_sha)
     proven_reference: dict = dict(reference_families or {})
     if reference is None:
         reference = reference_author(db, item, milestone, families,
@@ -2265,7 +2388,7 @@ def reading(db, item: Mapping, milestone: Optional[Mapping],
     # pas ; un contenu réellement réécrit n'est pas repris (le doute conserve).
     carried, carried_unknown, carried_correctors = _carried_from_previous(
         db, item, milestone, commits, repo, families, base=base, head=head,
-        provider=provider, strict=strict, recover=recover)
+        provider=provider, strict=strict, target=target_sha, recover=recover)
     unknown.extend(carried_unknown)
     for row in carried:
         values = row.get("families")
@@ -2333,13 +2456,13 @@ def authors(db, item: Mapping, milestone: Optional[Mapping],
             *, reference: Optional[Mapping] = None,
             reference_families: Optional[Mapping] = None, provider=None,
             strict: bool = False, trace: bool = False,
-            base: str = "", head: str = "",
+            base: str = "", head: str = "", target: str = "",
             recover=None) -> tuple[list, list]:
     """`(auteurs, inconnus)` — la lecture partagée, sans les correcteurs."""
     authors_, unknown, _correctors = reading(
         db, item, milestone, commits, repo, families, reference=reference,
         reference_families=reference_families, provider=provider,
-        strict=strict, trace=trace, base=base, head=head,
+        strict=strict, trace=trace, base=base, head=head, target=target,
         recover=recover)
     return authors_, unknown
 
