@@ -11,8 +11,10 @@ Ce module est l'option courte du lot : il ne compose rien, il **réveille**. À
 chaque créneau compilé (`mechanics.last_packet`, bloc `packets.cutoffs` du
 canon), une fois le délai de grâce passé et jusqu'au créneau suivant :
 
-* la cible est-elle libre ? — aucun lot « Paquet horaire h-… » (même sans branche)
-  ni porteur `integration/paquet*` ouvert pour
+* la cible est-elle libre ? — aucun lot « Paquet horaire h-… » (même sans
+  branche ; titre seul borné au créneau courant ou précédent, pour qu'un
+  composeur mort ne taise pas les créneaux suivants) ni porteur
+  `integration/paquet*` ouvert pour
   le projet (un paquet en composition ou en CI occupe la cible, §12), et aucun
   porteur fusionné depuis moins que la grâce (le composeur enchaîne), ni
   paquet déjà fusionné pendant le créneau surveillé ;
@@ -33,7 +35,9 @@ Configuration de l'hôte (clé `packet_watch`, à côté de `release`) ::
 
 Le dépôt, la cible et le clone viennent de `radar.projects.<nom>` (la lecture
 de `paquet-candidats`) ; `target` et `app` peuvent les remplacer, et `repo`
-nomme le dépôt local d'un hôte sans radar (clone jetable, comme le script). Sans bloc,
+nomme le dépôt local d'un hôte sans radar (clone jetable, comme le script). Un
+profil radar illisible (`QueueError`) ne fait pas tomber la veille : la cible
+`target` sert de repli et l'erreur est consignée (`config_error`). Sans bloc,
 rien ne tourne ; sans cadence de paquets au canon, rien n'est inventé.
 """
 from __future__ import annotations
@@ -162,19 +166,35 @@ def _carrier(row, app: str, target: str = "", *, composing: bool = False) -> boo
 
 
 def carriers(db, app: str, now: float, grace_s: float, *, slot_at: float,
-             target: str = "") -> dict:
+             target: str = "", previous_at: float | None = None) -> dict:
     """Porteurs ouverts, fusions récentes et créneau déjà servi.
 
     Une fusion dans [slot_at, now] sert le créneau jusqu'au suivant, même
     après la grâce et après un redémarrage du watcher. Seul le jalon effectif
     de fusion fait foi ; modifier un ancien porteur ne sert pas un créneau.
+
+    #3407 N2 : un lot de composition reconnu par son seul titre (aucune
+    branche `integration/paquet*`) n'occupe que son créneau. Passé le créneau
+    précédent, il ne compte plus comme porteur : un composeur mort ne peut
+    donc pas éteindre les créneaux suivants. Un âge illisible est traité de
+    même (jamais de silence indéfini).
     """
     from . import storage
     st = storage.of(db).work
     opened = []
     for state in OPEN_STATES:
-        opened += [int(row["id"]) for row in st.items(state=state, assignee=None, limit=None)
-                   if _carrier(row, app, target, composing=True)]
+        for row in st.items(state=state, assignee=None, limit=None):
+            if not _carrier(row, app, target, composing=True):
+                continue
+            if previous_at is not None \
+                    and not str(row.get("branch") or "").startswith(CARRIER_PREFIX):
+                try:
+                    created = float(row.get("created_ts"))
+                except (TypeError, ValueError):
+                    continue
+                if created < float(previous_at):
+                    continue
+            opened.append(int(row["id"]))
     merged_ids = [int(row["id"])
                   for row in st.items(state="merged", assignee=None, limit=RECENT_MERGED)
                   if _carrier(row, app, target)]
@@ -313,9 +333,21 @@ def check(cfg, db, watch: ProjectWatch, rules, *, now: float, state: dict,
     if float(mine.get("last_alert_slot") or 0) >= at["at"]:
         return dict(out, result="already-alerted")
     from . import merge_queue
-    project = merge_queue.declared_projects(cfg).get(watch.name)
+    config_error = ""
+    try:
+        project = merge_queue.declared_projects(cfg).get(watch.name)
+    except merge_queue.QueueError as exc:
+        # #3407 N3 : un profil radar incompatible ne fait plus tomber la
+        # veille en `result=error` ; la cible explicite reste le repli.
+        project = None
+        config_error = "QueueError: %s" % exc
+    if config_error:
+        out["config_error"] = config_error
     target = watch.target or (getattr(project, "target", "") if project else "")
-    held = carriers(db, app, now, watch.grace_s, slot_at=at["at"], target=target)
+    previous_at = float(rules.last_packet(at["at"] - 1)) \
+        if getattr(rules, "packet_cutoffs", None) else None
+    held = carriers(db, app, now, watch.grace_s, slot_at=at["at"], target=target,
+                    previous_at=previous_at)
     if held["served"]:
         return dict(out, result="served", carriers=held)
     if held["open"] or held["recent"]:
