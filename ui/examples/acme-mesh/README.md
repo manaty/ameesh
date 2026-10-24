@@ -27,7 +27,7 @@ toolbar belongs to the host page, not to the components:
 | `app.mjs` | browser glue: imports the served module `/ui/ameesh-ui.js`, mounts, wires the toolbar |
 | `mount.mjs` | binds the host object to the page (`connectHost`); the proof calls the same wiring |
 | `host.mjs` | the host object: `getToken`, `openApproval`, `notify`, `meshes`, `open`, theme, language |
-| `fixtures.mjs` | the fictional mesh: discovery, projects, progress, agents, alerts, hosts, budget, threads |
+| `fixtures.mjs` | the fictional mesh: discovery, projects, progress, timeline, agents, alerts, hosts, budget, threads |
 | `fixtures-server.mjs` | stdlib HTTP server: the page, `/ui/ameesh-ui.js`, the fixtures, the event stream, the approval fixture |
 | `electron/` | a reference Electron host (main, preload, renderer), see its README |
 | `../../test/example.test.mjs` | the targeted proof: the page opens the fixtures in jsdom, the server answers like a mesh |
