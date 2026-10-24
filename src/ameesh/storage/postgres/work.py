@@ -513,6 +513,30 @@ class WorkItems(interface.WorkItems):
                                  "type %r → %r" % (current, type), actor)
             return rows[0]
 
+    @_retry_deadlock
+    def set_priority(self, item_id, priority, *, current, reason, actor) -> dict | None:
+        """#3370 : priorité journalée, conditionnée à la valeur lue (NULL inclus)."""
+        with self.db.transaction() as tx:
+            rows = tx.query("SELECT %s FROM work_items WHERE id = %%s FOR NO KEY UPDATE"
+                            % item_columns(self.db), (int(item_id),))
+            if not rows or rows[0].get("priority") != current:
+                return None
+            if current == priority:
+                return rows[0]
+            rows = tx.query(
+                "UPDATE work_items SET priority = %%s, updated_at = now()"
+                " WHERE id = %%s AND priority IS NOT DISTINCT FROM %%s RETURNING %s"
+                % item_columns(self.db),
+                (int(priority), int(item_id), current))
+            if not rows:
+                return None
+            note = "priority %s → %s" % (
+                "none" if current is None else current, priority)
+            if reason:
+                note += " — %s" % reason
+            WorkItems(tx)._event(int(item_id), rows[0]["state"], note, actor)
+            return rows[0]
+
     def without_project(self) -> list[dict]:
         return self.db.query("SELECT %s FROM work_items WHERE btrim(coalesce(app, '')) = ''"
                              " AND state NOT IN %s ORDER BY id" % (item_columns(self.db), _CLOSED))
