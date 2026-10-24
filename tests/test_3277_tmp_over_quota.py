@@ -20,7 +20,7 @@ import unittest
 from unittest import mock
 
 from ameesh import (exploitation, housekeeping as hk, housekeeping_stale as stale,
-                    menage, registry, work)
+                    menage, registry, storage, work)
 
 from .support import PgTestCase
 
@@ -214,6 +214,76 @@ class OverQuotaTest(PgTestCase):
         stale.clear_cache()
         self._pass(pol, later=LATER + 60)
         self.assertFalse(os.path.exists(os.path.join(self.old, "diag%d" % lot)))
+
+    def _former(self):
+        return dataclasses.replace(self.pol, former_mesh_keys=(menage.mesh_key(self.former),))
+
+    def _diag(self) -> tuple[int, str]:
+        lot = self.ended_lot()
+        target = os.path.join(self.old, "diag%d" % lot, "nested", "result")
+        _write(target, 6 * BIG)
+        _age(self.old, 2 * DAY)
+        return lot, target
+
+    def test_a_deep_write_after_the_cached_measure_keeps_the_entry(self):
+        # codex r1 B1: the first-level signature does not see a deep write;
+        # the activity proof is a fresh walk right before the removal
+        _lot, target = self._diag()
+        at = time.time() + LATER
+        stale.measure(self.old, now=at)                       # cached, idle
+        with open(target, "ab") as fh:
+            fh.write(b"fresh work")
+        os.utime(target, (at - 60, at - 60))                  # a minute before the pass
+        self._pass(self._former(), later=LATER)
+        self.assertTrue(os.path.exists(target))
+        over = self._over_any()
+        self.assertIn("active", over["data"]["top"][0]["kept"])
+
+    def _over_any(self) -> dict:
+        rows = [r for r in storage.of(self.db).housekeeping.latest_by_path("pc", "tmp")
+                if r.get("path") == self.old]
+        self.assertEqual([r["action"] for r in rows], ["over_quota"])
+        return rows[0]
+
+    def test_a_bind_mount_or_an_unreadable_mount_table_keeps_the_entry(self):
+        # codex r1 B2: a bind mount on the same file system keeps its st_dev
+        _lot, target = self._diag()
+        mounted = os.path.dirname(target)
+        with mock.patch.object(stale.hk, "_mount_points", return_value={mounted}):
+            self._pass(self._former(), later=LATER)
+        self.assertTrue(os.path.exists(target))
+        self.assertIn("mount point", self._over_any()["data"]["top"][0]["kept"])
+        stale.clear_cache()
+        with mock.patch.object(stale.hk, "_mount_points", return_value=None):
+            self._pass(self._former(), later=LATER + 60)
+        self.assertTrue(os.path.exists(target))
+
+    def test_a_key_former_on_host_a_is_current_on_host_b(self):
+        # mesh-design 24/10: 14c7cf1a is pc-smichea's former route and
+        # agents-2's live key. The declaration is read per host only, and a
+        # current key is never former, even if a card listed it.
+        key = menage.mesh_key(self.former)
+
+        class Canon:
+            id = "c"
+
+            def host(self, name):
+                keys = [key] if name == "A" else []
+                return type("H", (), {"policy": type("P", (), {
+                    "housekeeping": {"former_mesh_keys": tuple(keys)} if keys else {},
+                    "work_root": None, "work_roots": None})()})()
+
+        self.assertEqual(hk.effective([Canon()], "A").former_mesh_keys, (key,))
+        self.assertEqual(hk.effective([Canon()], "B").former_mesh_keys, ())
+        _lot, target = self._diag()
+        troot = hk.tmp_root(self.mine, self.pol)
+        report = stale.check(self.db, troot=troot, name="codex2", agent="codex2",
+                             owner=key, key=key, policy=self._former(),
+                             now=time.time() + LATER, dry_run=False, previous=None,
+                             agents=["codex2"], holder=lambda _p: "")
+        self.assertTrue(os.path.exists(target))
+        self.assertEqual([e for e in report["entries"] if e["action"] == "deleted"], [])
+        self.assertEqual(report["plan"], [])
 
     @unittest.skipIf(os.getuid() == 0, "root reads every directory")
     def test_a_subtree_of_another_user_is_left_out_not_a_doubt(self):

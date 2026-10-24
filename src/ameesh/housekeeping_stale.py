@@ -144,48 +144,66 @@ def measure(path: str, *, now: float) -> dict:
     return result
 
 
-def verdict(db, child: dict, agent: str, *, agents, now: float, holder) -> tuple[str, str]:
-    """('', lots) when the first-level entry `child` of a former directory of
-    `agent` may be removed, else (why it is kept, lots)."""
+def verdict(db, child: dict, agent: str, *, agents, now: float, holder,
+            mounts=None) -> tuple[str, str, dict]:
+    """('', lots, fresh) when the first-level entry `child` of a former
+    directory of `agent` may be removed, else (why it is kept, lots, fresh).
+
+    #3277 r1 (codex B1) : l'activité ne se lit jamais dans la mesure en cache
+    (un écrit profond ne change pas la signature de premier niveau) : `fresh`
+    est un parcours neuf, fait ici, juste avant la suppression, sous le verrou
+    de l'appelant ; ses octets sont ceux qui seront comptés.
+    #3277 r1 (codex B2) : `mounts`, les points de montage sous la racine
+    (`housekeeping._mount_points`) ; un bind mount sur le même système de
+    fichiers garde son `st_dev`. Une entrée qui est ou contient un point de
+    montage, ou une table illisible (None), n'est jamais supprimée."""
+    fresh: dict = {}
     ids = hc.named_lots(child["name"], agents)
     if not ids:
-        return "no lot named: unattributed, never removed automatically", ""
+        return "no lot named: unattributed, never removed automatically", "", fresh
     lots = ",".join("#%s" % ident for ident in ids)
     rows = []
     try:
         for ident in dict.fromkeys(ids):
             row = storage.of(db).work.get(ident)
             if row is None:
-                return "lot #%s unknown" % ident, lots
+                return "lot #%s unknown" % ident, lots, fresh
             rows.append(row)
     except Exception:  # noqa: BLE001 - registre illisible : on garde
-        return "lot state unreadable", lots
+        return "lot state unreadable", lots, fresh
     for row in rows:
         if row.get("assignee") != agent:
-            return "lot #%s is not %s's" % (row.get("id"), agent), lots
+            return "lot #%s is not %s's" % (row.get("id"), agent), lots, fresh
         if str(row.get("state") or "") not in hk.LOT_ENDED:
-            return "lot #%s %s, not ended" % (row.get("id"), row.get("state")), lots
+            return "lot #%s %s, not ended" % (row.get("id"), row.get("state")), lots, fresh
         ended = hc._lot_end(row)
         if ended is None:
-            return "lot #%s ended but its end time is unreadable" % row.get("id"), lots
+            return "lot #%s ended but its end time is unreadable" % row.get("id"), lots, fresh
         if now - ended < hc.CLONE_IDLE_S:
             return "lot #%s ended %s ago (waits %s)" % (
-                row.get("id"), _ago(now - ended), hk.fmt_idle(hc.CLONE_IDLE_S)), lots
-    if not child["complete"]:
-        return "activity not verifiable (%s)" % child["why"], lots
-    if child["latest"] is None or now - child["latest"] < hc.CLONE_IDLE_S:
-        return "active %s ago" % _ago(now - (child["latest"] or now)), lots
+                row.get("id"), _ago(now - ended), hk.fmt_idle(hc.CLONE_IDLE_S)), lots, fresh
+    if mounts is None:
+        return "mount table unreadable", lots, fresh
+    real = os.path.realpath(child["path"])
+    inside = sorted(m for m in mounts if hk._in_subtree(m, real))
+    if inside:
+        return "mount point %s: never removed" % inside[0], lots, fresh
+    fresh = dict(walk(child["path"]), name=child["name"], path=child["path"])
+    if not fresh["complete"]:
+        return "activity not verifiable (%s)" % fresh["why"], lots, fresh
+    if fresh["latest"] is None or now - fresh["latest"] < hc.CLONE_IDLE_S:
+        return "active %s ago" % _ago(now - (fresh["latest"] or now)), lots, fresh
     held = holder(child["path"])
     if held:
-        return held, lots
+        return held, lots, fresh
     if os.path.isdir(child["path"]) and not os.path.islink(child["path"]):
-        copies, doubt = hk._git_copies_report(child["path"], skip=child["foreign"])
+        copies, doubt = hk._git_copies_report(child["path"], skip=fresh["foreign"])
         if doubt:
-            return "git copies not fully inspected (%s)" % doubt, lots
+            return "git copies not fully inspected (%s)" % doubt, lots, fresh
         if copies:
             return "git copy inside (%s); inspect with: %s" % (
-                copies[0], hk.tmp_recovery_command(child["path"])), lots
-    return "", lots
+                copies[0], hk.tmp_recovery_command(child["path"])), lots, fresh
+    return "", lots, fresh
 
 
 def _ago(seconds: float) -> str:
@@ -230,7 +248,9 @@ def check(db, *, troot: str, name: str, agent: str, owner: str, key: str,
 
     Returns `entries` (journal), `plan` (dry run) and `skipped`."""
     full = os.path.join(troot, name)
-    former = owner in policy.former_mesh_keys
+    # mesh-design 24/10 : une clé n'est ancienne que sur l'hôte dont la fiche
+    # la déclare (`effective(canons, host)`), et jamais la clé courante
+    former = owner != key and owner in policy.former_mesh_keys
     entries: list[dict] = []
     plan: list[dict] = []
     skipped: list[str] = []
@@ -244,12 +264,14 @@ def check(db, *, troot: str, name: str, agent: str, owner: str, key: str,
             kept = {c["name"]: "in turn (lock held)" for c in found["children"]}
         else:
             try:
+                mounts = hk._mount_points(troot)
                 for child in found["children"]:
-                    why, lots = verdict(db, child, agent, agents=agents, now=now,
-                                        holder=holder)
+                    why, lots, fresh = verdict(db, child, agent, agents=agents, now=now,
+                                               holder=holder, mounts=mounts)
                     if why:
                         kept[child["name"]] = why
                         continue
+                    child = fresh
                     detail = ("former key %s of this mesh: lot %s ended, idle %s"
                               % (owner, lots, _ago(now - child["latest"])))
                     plan.append({"kind": "tmp", "path": child["path"], "agent": agent,
