@@ -389,6 +389,12 @@ def check_wait_note(cfg, db, actor: str, text: str, *,
         if not holds or claims_pilot(cfg, db, actor) or actor not in holds:
             return corrector(cfg, db, actor, what="hold lift", history=False)
         return _own_hold_lift(cfg, db, actor, holds)
+    if planned_waits.is_hold_lookalike(text):
+        raise WorkError(
+            "note looks like a hold but is not one: write exactly "
+            "\"hold: <reason>\" to hold (or \"unhold: <reason>\" to lift); "
+            "variants such as \"hold :\", \"hold (pilote) :\" or \"Hold —\" "
+            "stay ordinary notes and stop nothing (#3373)")
     if planned_waits.is_hold_note(text) and claims_pilot(cfg, db, actor):
         return corrector(cfg, db, actor, what="hold", history=False)
     return actor
