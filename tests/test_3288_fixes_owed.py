@@ -268,7 +268,7 @@ class BriefAndIdleTest(_Base):
         worker = types.SimpleNamespace(db=self.db, name="author",
                                        _idle_pilot=lambda: "")
         prompt = runner.AgentWorker._idle_prompt(worker)
-        self.assertTrue(prompt.startswith(adapters.IDLE_PROMPT_NO_PILOT))
+        self.assertTrue(prompt.endswith(adapters.IDLE_PROMPT_NO_PILOT))
         self.assertIn(adapters.IDLE_FIXES_HEADER, prompt)
         self.assertIn("#%d" % lot, prompt)
         free = types.SimpleNamespace(db=self.db, name="other",
