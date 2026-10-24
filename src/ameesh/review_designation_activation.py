@@ -585,6 +585,18 @@ def _resolve_base(repo: str, base: str) -> str:
     return ""
 
 
+def _target_tip(repo: str, base: str) -> str:
+    """Le commit de la cible au moment de la lecture (#3116), ou "".
+
+    `base` est la cible déclarée (`develop`, `origin/main`, un commit) ; on la
+    résout d'abord comme `_range` (la ref distante fait foi) puis en commit.
+    Une cible illisible rend "" : la lecture garde son comportement d'avant."""
+    resolved = _resolve_base(repo, base)
+    if not resolved:
+        return ""
+    return review_authors.target_commit(repo, resolved)
+
+
 def _range(repo: str, base: str, head: str, *, bounded: bool = True) -> tuple[str, list, list]:
     """`(start, paths, commits)` of the lot's own frozen change."""
     base = _resolve_base(repo, base)
@@ -723,7 +735,8 @@ def _designated_reviewers(db, item: Mapping, milestone: Optional[Mapping],
 def attribution_of_head(db, item: Mapping, milestone: Optional[Mapping],
                         repo: str, base: str, head: str, *, families=(),
                         commits=None, strict: bool = False,
-                        families_out: Optional[dict] = None) -> tuple[list, list, list]:
+                        families_out: Optional[dict] = None,
+                        target: str = "") -> tuple[list, list, list]:
     """`(auteurs, inconnus, correcteurs)` de la plage gelée `base..head` (#2681/#2739).
 
     La même lecture partagée que la désignation (`review_authors.reading`),
@@ -751,7 +764,7 @@ def attribution_of_head(db, item: Mapping, milestone: Optional[Mapping],
     return review_authors.reading(db, item, milestone, commits, repo,
                                   families=families, strict=strict,
                                   families_out=families_out,
-                                  base=base, head=head)
+                                  base=base, head=head, target=target)
 
 
 def corrections_of_head(db, item: Mapping, milestone: Optional[Mapping],
@@ -1294,6 +1307,9 @@ def prepare(cfg, db, lot: int, *, freeze: Optional[Mapping] = None,
     repo, base = target.repo, target.sha
     from . import packet_reviews
 
+    # #3250 : `base` est déjà la cible exacte épinglée hors transaction ; c'est
+    # elle que la lecture de provenance reçoit (#3116), sans la re-résoudre.
+    read_target = base
     try:
         start, paths, commits = _range(repo, base, frozen_sha,
                                        bounded=not packet_reviews.is_vehicle(item))
@@ -1343,7 +1359,7 @@ def prepare(cfg, db, lot: int, *, freeze: Optional[Mapping] = None,
         _note_unreadable(db, int(lot), str(item.get("state") or ""), unreadable)
     authors, unknown, correctors = review_authors.reading(
         db, item, freeze, commits, repo, families=policy.families, trace=True,
-        base=start, head=frozen_sha)
+        base=start, head=frozen_sha, target=read_target)
     return Inputs(item=item, freeze=freeze, repo=repo, base=start, paths=paths,
                   commits=commits, policy=policy, authors=authors,
                   unknown_authors=unknown, correctors=correctors,
@@ -2082,7 +2098,7 @@ def _excluded_on_freeze(cfg, db, item: Mapping, freeze: Mapping) -> set[str]:
         _start, _paths, commits = _range(repo, base, sha)
         authors, _unknown, correctors = review_authors.reading(
             db, item, dict(freeze or {}), commits, repo, families=(),
-            base=base, head=sha)
+            base=base, head=sha, target=_target_tip(repo, base))
     except Exception:  # noqa: BLE001 - plage illisible : comportement historique
         return set()
     return {str(row.get("name") or "").strip().lower()
