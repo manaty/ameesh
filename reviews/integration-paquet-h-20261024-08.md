@@ -72,16 +72,42 @@ calcul provisoire (diff vide) — c'est celle-ci qui est poussée.
   `test_2446_train_contract` et `test_3098_train_contract_pins`.
 - **Compilation** : `compileall src tests` verte.
 - **Contrôles statiques** : 6/6 verts (`scripts/freeze-checks.py`).
-- **Diff** : 37 fichiers, +2230/−110 (manifeste compris) ; les sept commits de
-  composition portent leur trailer `ameesh-work:`.
+- **Diff** : 39 fichiers, +2271/−112 (manifeste compris) ; les sept commits de composition
+  portent leur trailer `ameesh-work:`.
 - **Migrations** : aucune (aucun fichier SQL ni migration).
 - **Prévalidation** : demandée au gel ; carte périmée (`card-stale`) attendue,
   non bloquante (§3), motif consigné.
-- **Suite complète** : une seule `ci-full` sur la tête finale, en mode paquet
-  (16 parts psql) ; demande `--avis 0 --full` (le manifeste tient lieu de revue
-  unitaire du paquet, §12), puis avis delta des deux relecteurs désignés au gel sur la tête.
+- **Suite complète** : le run `40103108858` de la tête `7b75c6364` est rouge
+  (défaut d'intégration #3022 × garde mécanique, corrigé ci-dessous) ; la tête
+  corrigée est regelée et une seule nouvelle `ci-full` est demandée, en mode
+  paquet (16 parts psql), `--avis 0 --full` (le manifeste tient lieu de revue
+  unitaire du paquet, §12), puis avis delta des deux relecteurs désignés au
+  gel sur la tête corrigée.
 - **Fusion** : sous garde de tête (`--match-head-commit`), dès le vert et les
   deux avis ; staging = bureau (passage unique après h-07).
+
+## Correctif après CI rouge (tête `7b75c6364`, run `40103108858`)
+
+La `ci-full` a rougi sur
+`tests.test_2449_garde_mecanique.SchemaCoverageTest.test_the_guard_keys_are_the_reader_keys`
+(part `psql 14/16`) : le bloc `production.branch` ajouté par #3022 au lecteur
+strict (`mechanics._OVERRIDE_KEYS`) n'était couvert ni par la garde mécanique
+(`scripts/garde-mecanique.py`, `SCHEMA_KEYS`/`BINDINGS`) ni par le témoin de
+couverture. Défaut d'intégration de #3022, révélé par la suite complète (le
+ciblé du composeur ne contenait pas ce témoin).
+
+Correctif mécanique (§2/§11 bis) : `production.branch` entre dans
+`SCHEMA_KEYS` (la garde couvre les clés du lecteur), `production_branch` dans
+`BINDINGS` avec validation d'une ref simple (une branche de prod ne se
+recopie pas en dur), et le témoin dérive `production.branch` de
+`_PRODUCTION_KEYS` ; l'invariant `_OVERRIDE_KEYS ⊆ document` devient
+`⊆ document ∪ {production}` (bloc par projet, jamais ajouté au schéma du
+document global). Delta du correctif : 2 fichiers, +15/−2.
+
+Tests après correctif : `test_2449_garde_mecanique` **22/22**,
+`test_3022_prod_gate` **13/13**, compilation verte, contrôles statiques
+**6/6**. Les sept unités gardent leurs verdicts acquis ; les avis delta des
+deux relecteurs désignés au gel sont redemandés sur la tête corrigée.
 
 ## Écartés (ce véhicule)
 

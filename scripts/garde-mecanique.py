@@ -95,6 +95,7 @@ SCHEMA_KEYS = (
     "staging.waiting_lots_min",
     "staging.before_cutoff_seconds",
     "staging.before_packet_seconds",
+    "production.branch",
     "projects",
 )
 
@@ -141,6 +142,7 @@ BINDINGS = {
     "waiting_lots_min": "staging.waiting_lots_min",
     "before_cutoff_seconds": "staging.before_cutoff_seconds",
     "before_packet_seconds": "staging.before_packet_seconds",
+    "production_branch": "production.branch",
 }
 
 #: constantes d'implémentation historiques dont le nom ne porte pas la clé
@@ -467,6 +469,10 @@ def _valid_binding(key: str, value, name: str, train_context: bool,
     if key.startswith("staging."):
         # #3291 : un seuil de lots ou une marge en secondes, entiers positifs
         return type(value) is int and value > 0
+    if key == "production.branch":
+        # #3022 : la branche de prod d'un projet se lit dans le canon
+        # (`projects.<projet>.production.branch`), jamais recopiée en dur.
+        return isinstance(value, str) and bool(value.strip())
     return False
 
 

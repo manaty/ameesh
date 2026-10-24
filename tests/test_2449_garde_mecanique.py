@@ -52,7 +52,10 @@ def reader_keys() -> set[str]:
             ("merge", mechanics._MERGE_KEYS),
             ("prevalidation", mechanics._PREVALIDATION_KEYS),
             ("backlog", mechanics._BACKLOG_KEYS),
-            ("staging", mechanics._STAGING_KEYS)):
+            ("staging", mechanics._STAGING_KEYS),
+            # #3022 : `production.branch` est un bloc **par projet**, pas un
+            # bloc du document global ; la garde doit le voir comme les autres.
+            ("production", mechanics._PRODUCTION_KEYS)):
         keys |= {"%s.%s" % (block, name) for name in names}
     return keys
 
@@ -70,8 +73,11 @@ class SchemaCoverageTest(unittest.TestCase):
                          {"schema", "timezone", "cutoffs", "packets", "build",
                           "ci", "reviews", "merge", "prevalidation", "backlog",
                           "staging", "projects"})
+        # #3022 : les surcharges par projet peuvent porter un bloc qui n'est
+        # pas un bloc du document global (`production`) ; il reste couvert par
+        # `production.branch` ci-dessus, jamais ajouté au schéma du document.
         self.assertLessEqual(set(mechanics._OVERRIDE_KEYS),
-                             set(mechanics._DOCUMENT_KEYS))
+                             set(mechanics._DOCUMENT_KEYS) | {"production"})
 
     def test_every_key_has_a_working_detector(self):
         self.assertEqual(set(POSITIVE), set(garde.SCHEMA_KEYS))
@@ -118,6 +124,7 @@ POSITIVE = {
     "staging.before_cutoff_seconds": "BEFORE_CUTOFF_SECONDS = 1200\n",
     "staging.before_packet_seconds": "BEFORE_PACKET_SECONDS = 600\n",
     "projects": 'PROJECT_OVERRIDES = {"ameesh": {"build": {"max_in_build": 3}}}\n',
+    "production.branch": 'production_branch = "main"\n',
 }
 
 
