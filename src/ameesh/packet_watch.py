@@ -11,7 +11,8 @@ Ce module est l'option courte du lot : il ne compose rien, il **réveille**. À
 chaque créneau compilé (`mechanics.last_packet`, bloc `packets.cutoffs` du
 canon), une fois le délai de grâce passé et jusqu'au créneau suivant :
 
-* la cible est-elle libre ? — aucun porteur `integration/paquet*` ouvert pour
+* la cible est-elle libre ? — aucun lot « Paquet horaire » (même sans branche)
+  ni porteur `integration/paquet*` ouvert pour
   le projet (un paquet en composition ou en CI occupe la cible, §12), et aucun
   porteur fusionné depuis moins que la grâce (le composeur enchaîne), ni
   paquet déjà fusionné pendant le créneau surveillé ;
@@ -19,7 +20,9 @@ canon), une fois le délai de grâce passé et jusqu'au créneau suivant :
   `scripts/paquet-candidats.py`) rend-elle au moins un lot prêt ?
 
 Si oui, une alerte urgente part, une seule fois par créneau, aux destinataires
-déclarés (le composeur et le pilote). Aucune écriture hors de l'état local
+déclarés (le premier est le seul composeur désigné, les autres sont informés).
+Le repli attend au moins la grâce après l’alerte (15 min minimum), sans réponse,
+et vérifie en base qu’aucune composition n’a commencé avant de prendre le relais. Aucune écriture hors de l'état local
 (`<state_dir>/packet-watch/state.json`) et du courrier.
 
 Configuration de l'hôte (clé `packet_watch`, à côté de `release`) ::
@@ -40,6 +43,7 @@ import dataclasses
 import datetime as _dt
 import json
 import os
+import re
 import shutil
 import tempfile
 import types
@@ -143,12 +147,22 @@ def slot(rules, now: float, grace_s: float) -> dict | None:
 # porteurs
 # --------------------------------------------------------------------------
 
-def _carrier(row, app: str) -> bool:
+def _carrier(row, app: str, target: str = "", *, composing: bool = False) -> bool:
+    from .merge_queue import _remote_branch
+    if (row.get("app") or "") != app:
+        return False
+    declared = str(row.get("branch_target") or "")
+    if target and declared and _remote_branch(declared) != _remote_branch(target):
+        return False
+    # Anchored title: a bug about packets is not a composition vehicle.
     return (str(row.get("branch") or "").startswith(CARRIER_PREFIX)
-            and (row.get("app") or "") == app)
+            or (composing and re.match(r"^paquet\s+horaire\b",
+                                       str(row.get("title") or "").strip(), re.I)
+                is not None))
 
 
-def carriers(db, app: str, now: float, grace_s: float, *, slot_at: float) -> dict:
+def carriers(db, app: str, now: float, grace_s: float, *, slot_at: float,
+             target: str = "") -> dict:
     """Porteurs ouverts, fusions récentes et créneau déjà servi.
 
     Une fusion dans [slot_at, now] sert le créneau jusqu'au suivant, même
@@ -160,10 +174,10 @@ def carriers(db, app: str, now: float, grace_s: float, *, slot_at: float) -> dic
     opened = []
     for state in OPEN_STATES:
         opened += [int(row["id"]) for row in st.items(state=state, assignee=None, limit=None)
-                   if _carrier(row, app)]
+                   if _carrier(row, app, target, composing=True)]
     merged_ids = [int(row["id"])
                   for row in st.items(state="merged", assignee=None, limit=RECENT_MERGED)
-                  if _carrier(row, app)]
+                  if _carrier(row, app, target)]
     recent, served = [], []
     for row in st.delays(RECENT_MERGED, ids=merged_ids) if merged_ids else ():
         try:
@@ -250,11 +264,11 @@ def _inventory(cfg, db, watch: ProjectWatch, app: str) -> dict:
             shutil.rmtree(scratch, ignore_errors=True)
 
 
-def body(watch: ProjectWatch, at: dict, payload: dict) -> str:
+def body(watch: ProjectWatch, at: dict, payload: dict, *, now: float | None = None) -> str:
     by_id = {entry["work_item"]: entry for entry in payload.get("candidates") or ()}
     lines = [
         "Créneau de paquet %s manqué (%s) : cible %s @ %s libre, aucun porteur "
-        "integration/paquet* ouvert, %d lot(s) prêt(s)."
+        "integration/paquet* ni lot Paquet horaire ouvert, %d lot(s) prêt(s)."
         % (at["label"], watch.name, payload.get("target"),
            str(payload.get("base") or "")[:12], len(payload.get("ready") or ())),
         "",
@@ -267,9 +281,18 @@ def body(watch: ProjectWatch, at: dict, payload: dict) -> str:
     if payload.get("errors"):
         lines += ["", "Lectures impossibles (liste incomplète) :"]
         lines += ["  %s" % error for error in payload["errors"]]
-    lines += ["", "Geste : composer integration/paquet-h-%s maintenant depuis "
+    fallback_at = _dt.datetime.fromtimestamp(
+        (now if now is not None else float(at["at"]) + watch.grace_s)
+        + max(watch.grace_s, GRACE_S), _dt.timezone.utc).isoformat()
+    lines += ["", "Composeur désigné : %s (premier destinataire notify)." % watch.notify[0],
+              "Les autres destinataires ne composent pas en parallèle. Repli seulement "
+              "après %s, sans réponse du composeur, et après vérification en base "
+              "qu'aucun lot de composition n'est ouvert ; le pilote désigne alors "
+              "un seul remplaçant." % fallback_at,
+              "Geste pour %s : composer integration/paquet-h-%s maintenant depuis "
                   "`scripts/paquet-candidats.py` (canon §11 bis, §12), écarts motivés "
-                  "au manifeste. Une seule alerte par créneau (#2601)." % at["stamp"]]
+                  "au manifeste. Une seule alerte par créneau (#2601)."
+              % (watch.notify[0], at["stamp"])]
     return "\n".join(lines)
 
 
@@ -289,7 +312,10 @@ def check(cfg, db, watch: ProjectWatch, rules, *, now: float, state: dict,
     mine = state.setdefault("projects", {}).setdefault(watch.name, {})
     if float(mine.get("last_alert_slot") or 0) >= at["at"]:
         return dict(out, result="already-alerted")
-    held = carriers(db, app, now, watch.grace_s, slot_at=at["at"])
+    from . import merge_queue
+    project = merge_queue.declared_projects(cfg).get(watch.name)
+    target = watch.target or (getattr(project, "target", "") if project else "")
+    held = carriers(db, app, now, watch.grace_s, slot_at=at["at"], target=target)
     if held["served"]:
         return dict(out, result="served", carriers=held)
     if held["open"] or held["recent"]:
@@ -300,7 +326,7 @@ def check(cfg, db, watch: ProjectWatch, rules, *, now: float, state: dict,
                base=payload.get("base"))
     if not ready:
         return dict(out, result="nothing-ready")
-    text = body(watch, at, payload)
+    text = body(watch, at, payload, now=now)
     if dry_run:
         return dict(out, result="would-alert", body=text, notify=list(watch.notify))
     deliver = send or (lambda to, message, data: mail.send(
