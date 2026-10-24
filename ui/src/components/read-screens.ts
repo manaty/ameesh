@@ -60,7 +60,10 @@ export class AmeeshTimeline extends ReadView {
   protected content(data: Row) {
     const lots = rows(data.lots);
     if (!lots.length) return this.empty();
-    return html`<p>${this.t("timeline.legend")}</p><div class="scroll" tabindex="0" role="region" aria-label=${this.t("timeline.table")}>
+    // #3401: a bounded timeline says so instead of looking complete.
+    const cut = object(object(data.truncated).lots);
+    const limit = number(cut.limit);
+    return html`<p>${this.t("timeline.legend")}</p>${limit === null ? nothing : html`<p role="status" class="critical">${this.t("timeline.truncated", { shown: number(cut.shown) ?? 0, total: number(cut.total) ?? 0, limit })}</p>`}<div class="scroll" tabindex="0" role="region" aria-label=${this.t("timeline.table")}>
       <table><caption>${this.project} · ${this.date(object(data.window).from_ts)} – ${this.date(object(data.window).to_ts ?? data.generated_ts)}</caption>
       <thead><tr>${["lot", "state", "assignee", "requested", "frozen", "verdict", "merged"].map((key) => html`<th scope="col">${this.t("field." + key)}</th>`)}</tr></thead>
       <tbody>${lots.map((lot) => html`<tr><th scope="row"><button class="link" @click=${() => this.open("lot", { project: this.project, lot: lot.id })}>#${label(lot.id)} ${label(lot.title)}</button>${this.#track(lot, data)}</th>
