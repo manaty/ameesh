@@ -596,6 +596,103 @@ class PaquetTest(_Base):
             (run_id, "0" * 40, self.GO - 600.0,
              self.GO - 600.0 + float(minutes) * 60.0))
 
+    def _ci_on_head(self, head, at, *, status="success", workflow="tests.yml",
+                    run_id=None):
+        """Une exécution suivie sur la tête `head`, conclue à `at` (#3341).
+
+        `status='running'` laisse `concluded_at` nul (CI encore en cours)."""
+        if not hasattr(self, "_ci_seq"):
+            self._ci_seq = 0
+        self._ci_seq += 1
+        self.db.execute(
+            "INSERT INTO ci_runs (repo, run_id, head_sha, branch, event, base,"
+            " work_item_id, status, url, workflow, first_seen_at, concluded_at)"
+            " VALUES ('manaty/ameesh', %s, %s, 'lot/3341-slo-test', 'pull_request',"
+            " 'main', %s, %s, 'u', %s, to_timestamp(%s), to_timestamp(%s))",
+            (int(run_id or self._ci_seq), head, self.lot["id"], status, workflow,
+             float(at) - 60.0, None if status == "running" else float(at)))
+
+    def _outside_packet(self, head, *, priority=1):
+        """Lot hors paquet déclaré (#2919/#3341), la tête de branche `head`.
+
+        Le jalon de gel n'est pas posé : `lot_steps` retombe sur la tête de
+        branche que l'exception nomme ; le gel exact et ses témoins sont
+        couverts par `CIHeadTest`."""
+        if priority is not None:
+            self.db.execute("UPDATE work_items SET priority = %s WHERE id = %s",
+                            (priority, self.lot["id"]))
+        self.db.execute("UPDATE work_items SET branch_head = %s WHERE id = %s",
+                        (head, self.lot["id"]))
+        packet_guard.declare(self.db, self.lot["id"], "incident",
+                             "cible rouge", head, actor="dev1")
+
+    def test_hors_paquet_le_vert_de_la_ci_fixe_le_depart(self):
+        # #3341 : GO à 23:05, CI verte à 23:45 (40 min). L'horloge P1 (15 min)
+        # part du vert : silence à 23:59, niveau 1 à 00:01 — pas à 23:20
+        # pendant que la CI tourne encore.
+        self.qa_at(self.GO)
+        head = "d" * 40
+        self._outside_packet(head)
+        green = self.GO + 40 * 60
+        self._ci_on_head(head, green)
+        self.now = self.GO + 54 * 60
+        self.assertEqual([a for a in self.slo() if a["step"] == "verdict_merge"], [])
+        self.now = self.GO + 56 * 60
+        alerts = [a for a in self.slo() if a["step"] == "verdict_merge"]
+        self.assertEqual([(a["level"], a["threshold"]) for a in alerts], [(1, 900)])
+        self.assertAlmostEqual(alerts[0]["since"], green, delta=1)
+        self.assertEqual(alerts[0]["value"], 16 * 60 - 15 * 60)
+
+    def test_hors_paquet_vert_avant_le_go_part_du_go(self):
+        # Témoin : la CI verte avant le GO ne fait pas remonter le départ ;
+        # l'horloge reste celle d'aujourd'hui (15 min après le GO en P1).
+        self.qa_at(self.GO)
+        head = "a" * 40
+        self._outside_packet(head)
+        self._ci_on_head(head, self.GO - 20 * 60)
+        self.now = self.GO + 14 * 60
+        self.assertEqual([a for a in self.slo() if a["step"] == "verdict_merge"], [])
+        self.now = self.GO + 16 * 60
+        alerts = [a for a in self.slo() if a["step"] == "verdict_merge"]
+        self.assertEqual([(a["level"], a["threshold"]) for a in alerts], [(1, 900)])
+        self.assertAlmostEqual(alerts[0]["since"], self.GO, delta=1)
+
+    def test_hors_paquet_ci_absente_ne_fait_pas_partir_l_horloge(self):
+        # Témoin : sans exécution suivie sur la tête gelée, pas de vert, pas
+        # d'horloge — aucune alerte `verdict_merge`, même deux heures après.
+        self.qa_at(self.GO)
+        self._outside_packet("c" * 40)
+        self.now = self.GO + 2 * HEURE
+        self.assertEqual([a for a in self.slo() if a["step"] == "verdict_merge"], [])
+
+    def test_hors_paquet_ci_rouge_ne_fait_pas_partir_l_horloge(self):
+        # Témoin : une CI rouge sur la tête gelée ne fait pas partir l'horloge ;
+        # l'alerte GO → fusion ne doit pas réclamer la fusion avant un vert.
+        self.qa_at(self.GO)
+        head = "e" * 40
+        self._outside_packet(head)
+        self._ci_on_head(head, self.GO + 20 * 60, status="failure")
+        self.now = self.GO + 2 * HEURE
+        self.assertEqual([a for a in self.slo() if a["step"] == "verdict_merge"], [])
+
+    def test_hors_paquet_ci_en_cours_ne_fait_pas_partir_l_horloge(self):
+        # Témoin : la CI tourne encore (conclue à `None`) — l'horloge attend.
+        self.qa_at(self.GO)
+        head = "f" * 40
+        self._outside_packet(head)
+        self._ci_on_head(head, self.GO + 10 * 60, status="running")
+        self.now = self.GO + 2 * HEURE
+        self.assertEqual([a for a in self.slo() if a["step"] == "verdict_merge"], [])
+
+    def test_hors_paquet_le_vert_d_une_autre_tete_ne_compte_pas(self):
+        # La tête gelée exacte : un vert sur une autre tête ne prouve rien.
+        self.qa_at(self.GO)
+        head = "1" * 40
+        self._outside_packet(head)
+        self._ci_on_head("2" * 40, self.GO + 20 * 60)
+        self.now = self.GO + 2 * HEURE
+        self.assertEqual([a for a in self.slo() if a["step"] == "verdict_merge"], [])
+
     def test_unite_de_paquet_mesuree_contre_le_p80_sans_alerte(self):
         # #2919 : la cible est le p80 réel de la CI du paquet (7 jours) ; la
         # ligne est mesurée, jamais alertée (aucune cible d'escalade propre).
@@ -660,15 +757,12 @@ class PaquetTest(_Base):
 
     def test_exception_p1_garde_15_min_depuis_le_go(self):
         # Hors paquet déclaré : la cible de table (15 min en P1) court depuis
-        # le GO, sans le report au créneau de paquet.
+        # le GO quand la CI était déjà verte avant lui, sans le report au
+        # créneau de paquet.
         self.qa_at(self.GO)
-        self.db.execute("UPDATE work_items SET priority = 1 WHERE id = %s",
-                        (self.lot["id"],))
         head = "c" * 40
-        self.db.execute("UPDATE work_items SET branch_head = %s WHERE id = %s",
-                        (head, self.lot["id"]))
-        packet_guard.declare(self.db, self.lot["id"], "unblock",
-                             "CI bloquée", head, actor="dev1")
+        self._outside_packet(head)
+        self._ci_on_head(head, self.GO - 10 * 60)
         self.now = self.GO + 16 * 60
         alerts = self.slo()
         self.assertEqual([(a["step"], a["level"], a["threshold"]) for a in alerts],
@@ -678,14 +772,13 @@ class PaquetTest(_Base):
 
     def test_exception_declaree_sort_du_paquet_et_alerte(self):
         # #2919 : une exception `packet-exception incident` pour la tête
-        # courante ramène la cible de la table (30 min) et l'escalade.
+        # courante ramène la cible de la table (30 min) et l'escalade ; la CI
+        # verte sur cette tête date le départ (#3341).
         self.qa_at(self.GO)
         head = "a" * 40
-        self.db.execute("UPDATE work_items SET branch_head = %s WHERE id = %s",
-                        (head, self.lot["id"]))
+        self._outside_packet(head, priority=None)
+        self._ci_on_head(head, self.GO - 10 * 60)
         self.packet(body="unités : #%d @ %s" % (self.lot["id"], head))
-        packet_guard.declare(self.db, self.lot["id"], "incident",
-                             "cible rouge", head, actor="dev1")
         self.now = self.GO + 50 * 60
         alerts = self.slo()
         self.assertEqual([(a["step"], a["level"], a["targets"]) for a in alerts],
@@ -707,6 +800,117 @@ class PaquetTest(_Base):
         with mock.patch.object(exploitation, "_project_github",
                                return_value="manaty/ameesh"):
             self.assertEqual(self.slo(), [])
+
+
+class CIHeadTest(unittest.TestCase):
+    """#3341 : la lecture du vert de la CI sur la tête gelée exacte.
+
+    `_ci_green_on_head` est le seul lecteur : il rend l'instant de conclusion
+    de la dernière exécution verte de chaque workflow, ou None sans vert. Une
+    CI rouge, en cours, annulée, absente ou lue sur une autre tête ne prouve
+    rien.
+    """
+
+    class _Ci:
+        def __init__(self, rows=None, error=None):
+            self.rows = rows or []
+            self.error = error
+
+        def for_lot(self, lot, limit):
+            if self.error is not None:
+                raise self.error
+            return self.rows
+
+    class _St:
+        def __init__(self, rows=None, error=None):
+            self.ci = CIHeadTest._Ci(rows, error)
+
+    @staticmethod
+    def _run(head, status, at, *, run_id=1, workflow="tests.yml", attempt=1):
+        return {"repo": "manaty/ameesh", "run_id": run_id, "head_sha": head,
+                "status": status, "concluded_ts": at, "run_attempt": attempt,
+                "workflow": workflow}
+
+    def test_le_gel_prime_sur_la_tete_de_branche(self):
+        head = "a" * 40
+        marks = [{"kind": "frozen", "sha": head[:12], "at_ts": 1}]
+        row = {"id": 1, "branch_head": "b" * 40}
+        self.assertEqual(exploitation._ci_green_on_head(
+            self._St([self._run(head, "success", 120.0)]), row, marks), 120.0)
+        # Le vert de la tête de branche ne vaut pas pour le gel exact.
+        self.assertIsNone(exploitation._ci_green_on_head(
+            self._St([self._run("b" * 40, "success", 120.0)]), row, marks))
+
+    def test_sans_gel_la_tete_de_branche_de_l_exception(self):
+        head = "c" * 40
+        row = {"id": 1, "branch_head": head}
+        self.assertEqual(exploitation._ci_green_on_head(
+            self._St([self._run(head, "success", 240.0)]), row, []), 240.0)
+        # Un jalon de gel symbolique ne prouve aucune tête : la branche fait foi.
+        self.assertEqual(exploitation._ci_green_on_head(
+            self._St([self._run(head, "success", 240.0)]), row,
+            [{"kind": "frozen", "sha": "HEAD", "at_ts": 1}]), 240.0)
+
+    def test_dernier_essai_du_workflow_l_emporte(self):
+        # Une relance verte après un premier rouge : la dernière exécution du
+        # workflow dit le vert (une nouvelle exécution, pas un rerun).
+        head = "d" * 40
+        rows = [self._run(head, "failure", 60.0, run_id=1),
+                self._run(head, "success", 180.0, run_id=2)]
+        self.assertEqual(exploitation._ci_green_on_head(
+            self._St(rows), {"id": 1, "branch_head": head}, []), 180.0)
+
+    def test_une_ci_rouge_en_cours_ou_annulee_ne_prouve_pas_le_vert(self):
+        head = "e" * 40
+        for status in ("failure", "running", "cancelled", "superseded"):
+            with self.subTest(status=status):
+                rows = [self._run(head, "success", 60.0, run_id=1),
+                        self._run(head, status, 120.0, run_id=2)]
+                self.assertIsNone(exploitation._ci_green_on_head(
+                    self._St(rows), {"id": 1, "branch_head": head}, []))
+
+    def test_un_workflow_annule_n_est_pas_masque_par_un_autre_vert(self):
+        # B1 (#3341, relecture cx1) : chaque workflow retenu doit être vert et
+        # conclu. Un succès de `tests.yml` ne vaut pas un vert si `sql.yml` est
+        # annulé sur la même tête.
+        head = "7" * 40
+        rows = [self._run(head, "success", 100.0, run_id=1, workflow="tests.yml"),
+                self._run(head, "cancelled", 200.0, run_id=2, workflow="sql.yml")]
+        self.assertIsNone(exploitation._ci_green_on_head(
+            self._St(rows), {"id": 1, "branch_head": head}, []))
+        rows[1] = self._run(head, "success", 200.0, run_id=2, workflow="sql.yml")
+        self.assertEqual(exploitation._ci_green_on_head(
+            self._St(rows), {"id": 1, "branch_head": head}, []), 200.0)
+
+    def test_un_nouveau_run_prime_sur_un_ancien_run_relance(self):
+        # B2 (#3341, relecture cx1) : l'attempt est local au run_id. Un ancien
+        # run_id=1 relancé (attempt=2, vert) ne doit pas masquer le nouveau
+        # run_id=2 (attempt=1, encore en cours) : la chronologie est le run_id.
+        head = "8" * 40
+        rows = [self._run(head, "success", 100.0, run_id=1, attempt=2),
+                self._run(head, "running", None, run_id=2, attempt=1)]
+        self.assertIsNone(exploitation._ci_green_on_head(
+            self._St(rows), {"id": 1, "branch_head": head}, []))
+        rows[1] = self._run(head, "success", 200.0, run_id=2, attempt=1)
+        self.assertEqual(exploitation._ci_green_on_head(
+            self._St(rows), {"id": 1, "branch_head": head}, []), 200.0)
+
+    def test_deux_workflows_le_vert_est_la_derniere_conclusion(self):
+        head = "f" * 40
+        rows = [self._run(head, "success", 100.0, run_id=1, workflow="tests.yml"),
+                self._run(head, "success", 300.0, run_id=2, workflow="sql.yml")]
+        self.assertEqual(exploitation._ci_green_on_head(
+            self._St(rows), {"id": 1, "branch_head": head}, []), 300.0)
+        rows[1] = self._run(head, "running", None, run_id=2, workflow="sql.yml")
+        self.assertIsNone(exploitation._ci_green_on_head(
+            self._St(rows), {"id": 1, "branch_head": head}, []))
+
+    def test_lecture_en_echec_ou_tete_absente_ne_prouve_rien(self):
+        self.assertIsNone(exploitation._ci_green_on_head(
+            self._St(error=RuntimeError("db")), {"id": 1, "branch_head": "a" * 40}, []))
+        self.assertIsNone(exploitation._ci_green_on_head(
+            self._St([self._run("a" * 40, "success", 60.0)]),
+            {"id": 1, "branch_head": ""}, []))
 
 
 class BriefsTest(_Base):
