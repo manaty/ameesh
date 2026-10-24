@@ -12,6 +12,9 @@
         an existing (closed) interactive session moves under the runner (L39);
   ameesh agent peek <name> [--limit N] [--json]   responsible human's work summary;
   ameesh agent spawn <name> --by <creator> --ttl <duration>   ephemeral agent;
+  ameesh agent move NOM --to HOST [--keep-session]   manual move of a pinned agent
+        to another admitted host, without a live lease when the source executor
+        is stopped (#3299);
   ameesh alerts [--follow] [--json]     operational alerts (one object per line);
   ameesh approvals            list signed approvals;
   ameesh approve              sign an approval;

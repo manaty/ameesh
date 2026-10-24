@@ -28,6 +28,14 @@
                                          prochain nom libre <org>-<repo>-<role>-<seq>
                                          (L243, #468) : fiches, registre et rôles du
                                          nommage du canon
+  ameesh agent move NOM --to HÔTE [--keep-session] [--actor A] [--json]
+                                         déplacement MANUEL d'un agent `releve: hote`
+                                         vers un autre hôte admis (#3299) : mêmes
+                                         gardes que le déplacement automatique, sans
+                                         bail vivant exigé quand l'exécuteur de départ
+                                         est arrêté ; journal `agent.moved` sur l'agent,
+                                         puis canon sync de l'hôte d'arrivée déclenché
+                                         (si la commande y tourne) ou rappelé
   ameesh canon agent spawn|name …        mêmes commandes sous `canon` (L243, #468) ;
                                          la place canonique du nommage
 
@@ -867,6 +875,96 @@ def cmd_spawn(cfg: Config, args: argparse.Namespace) -> int:
     return 0
 
 
+def _sync_namespace(host: str, *, json_output: bool) -> argparse.Namespace:
+    """Les options de `canon sync` pour l'hôte d'arrivée (#3299)."""
+    return argparse.Namespace(host=host, json=json_output, canon=None, ref=None,
+                              fetch=False, bootstrap_ref=None)
+
+
+def _sync_arrival_json(cfg: Config, host: str) -> dict:
+    """#3299 : `canon sync` de l'hôte d'arrivée, sortie capturée pour `--json`.
+
+    Rend `{triggered, code, report}` ; un refus (canon illisible, code plus
+    vieux, base) est rapporté, jamais confondu avec l'échec du déplacement.
+    """
+    import contextlib
+    import io
+
+    out, err = io.StringIO(), io.StringIO()
+    try:
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = cmd_sync(cfg, _sync_namespace(host, json_output=True))
+    except (canon_mod.CanonError, canon_sync.CanonUnreadable,
+            canon_sync.CanonStale, db_mod.DbError) as exc:
+        return {"triggered": True, "code": 1, "error": str(exc)}
+    text = out.getvalue().strip()
+    try:
+        report = json.loads(text) if text else None
+    except ValueError:
+        report = {"output": text} if text else None
+    result = {"triggered": True, "code": code, "report": report}
+    if err.getvalue().strip():
+        result["stderr"] = err.getvalue().strip()
+    return result
+
+
+def cmd_move(cfg: Config, args: argparse.Namespace) -> int:
+    """#3299 : `ameesh agent move NOM --to HÔTE`, déplacement manuel fencé."""
+    from . import relocation
+    from . import work as work_mod
+
+    db = db_mod.connect(cfg)
+    try:
+        db_mod.require_schema(db)
+        actor, warning = work_mod.resolve_actor(cfg, db, args.actor)
+        if warning:
+            print(warning, file=sys.stderr)
+        result = relocation.move_manual(
+            cfg, db, args.name, args.to,
+            keep_session=bool(args.keep_session), actor=actor)
+    except relocation.MoveError as exc:
+        print("move refused: %s" % exc, file=sys.stderr)
+        return 1
+    finally:
+        db.close()
+    arrival = result["to"]
+    local = bool(getattr(cfg, "host", "")) and cfg.host == arrival
+    if args.json:
+        sync = (_sync_arrival_json(cfg, arrival) if local else {
+            "triggered": False,
+            "reminder": ("run \"ameesh canon sync --host %s\" on %s before %s is "
+                         "claimable there" % (arrival, arrival, result["agent"]))})
+        payload = dict(result, actor=actor, canon_sync=sync)
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return 0
+    print("%s moved from %s to %s%s" % (
+        result["agent"], result["from"], arrival,
+        " (native session kept)" if result["keep_session"]
+        else " (native session forgotten; a resume brief is queued)"))
+    print("journal: agent.moved #%d%s" % (
+        result["event"],
+        " (source executor proven stopped)" if result["source_stopped"] else ""))
+    if local:
+        print("canon sync on %s (arrival host):" % arrival)
+        try:
+            code = cmd_sync(cfg, _sync_namespace(arrival, json_output=False))
+        except (ValueError, db_mod.DbError) as exc:
+            # le déplacement est fait : un sync d'arrivée qui échoue est un
+            # avertissement, pas un échec de la commande
+            code = 1
+            print("warning: canon sync on %s failed: %s"
+                  % (arrival, " ".join(str(exc).split())[:200]), file=sys.stderr)
+        if code != 0:
+            print("warning: canon sync on %s failed (code %d): %s is not claimable "
+                  "there until it succeeds (ameesh canon sync --host %s)"
+                  % (arrival, code, result["agent"], arrival), file=sys.stderr)
+    else:
+        print("%s is not claimable on %s until that host's canon sync runs: "
+              "ameesh canon sync --host %s (on %s; the runner also syncs periodically)"
+              % (result["agent"], arrival, arrival, arrival))
+    return 0
+
+
 def _canon_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--canon", default=None,
                         help="id of a configured canon (L42; otherwise all for "
@@ -879,12 +977,15 @@ def _canon_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--json", action="store_true")
 
 
-def _add_agent_parsers(parent) -> None:
+def _add_agent_parsers(parent, *, move: bool = False) -> None:
     """`agent spawn|name` (L243, #468), branché aux DEUX endroits.
 
     `ameesh canon agent …` est la place canonique (le nommage est une
     propriété du canon) ; `ameesh agent …` reste branché pour les scripts et
-    la documentation existants. Codex r1 (#452) : le premier chemin manquait."""
+    la documentation existants. Codex r1 (#452) : le premier chemin manquait.
+
+    `move` (#3299) n'est branché que sous `ameesh agent …` : le déplacement
+    manuel est une opération d'exploitation, pas une propriété du canon."""
     p_agent = parent.add_parser("agent", help="ephemeral agents, and names (L243)")
     agent_sub = p_agent.add_subparsers(dest="agent_command")
     p_spawn = agent_sub.add_parser(
@@ -909,6 +1010,23 @@ def _add_agent_parsers(parent) -> None:
     p_name.add_argument("--project", action="append", default=None,
                         help="project the agent works on; repeat for a multi-project agent")
     p_name.set_defaults(func=cmd_agent_name)
+
+    if move:
+        p_move = agent_sub.add_parser(
+            "move", help="move a `releve: hote` agent to another admitted host by "
+                         "hand (#3299, fenced operator command)")
+        p_move.add_argument("name", help="agent to move")
+        p_move.add_argument("--to", required=True, metavar="HOST",
+                            help="arrival host; it must already belong to the agent's "
+                                 "admitted hosts")
+        p_move.add_argument("--keep-session", action="store_true",
+                            help="keep the native session (shared session storage); "
+                                 "otherwise it is forgotten and a resume brief is queued")
+        p_move.add_argument("--actor", default=None,
+                            help="who moves the agent (agent name or human:<id>); "
+                                 "otherwise this session's identity")
+        p_move.add_argument("--json", action="store_true")
+        p_move.set_defaults(func=cmd_move)
 
 
 def add_parsers(sub) -> None:
@@ -943,4 +1061,4 @@ def add_parsers(sub) -> None:
     p_pcheck.add_argument("--agent", default=None, help="a single agent (otherwise all)")
     p_pcheck.set_defaults(func=cmd_placement_check)
 
-    _add_agent_parsers(sub)
+    _add_agent_parsers(sub, move=True)
