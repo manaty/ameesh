@@ -16,6 +16,7 @@ import unittest
 from unittest import mock
 
 from ameesh import exploitation, housekeeping as hk, platform, registry, resources, storage, work
+from ameesh.platform import process
 from ameesh.platform.process import HoldersUnreadable
 
 from .support import PgTestCase
@@ -24,6 +25,7 @@ from .test_l73_housekeeping import _Cfg, _age_tree, _git, _repo
 
 GIB = 1024 ** 3
 HOUR = 3600.0
+SECRET = "s3cr3t-3403"
 DOUBT = ("holders unreadable: 23223 gpg-agent; "
          "policy.housekeeping.unreadable_ok if it is a daemon")
 
@@ -57,7 +59,19 @@ class HoldersDetailTest(unittest.TestCase):
             held, detail = hk.worktree_holders(self.wt)
             self.assertTrue(hk.worktree_in_use(self.wt))
         self.assertTrue(held)
-        self.assertEqual(detail, "processes inside (42 sleep 30)")
+        self.assertEqual(detail, "processes inside (42 sleep)")
+
+    def test_the_detail_never_carries_the_argv(self):
+        """#3403 : pid et base d'argv[0] ; ni identifiant de session ni secret
+        passé en argument dans le détail qui part au journal partagé."""
+        argv = ["/usr/bin/psql", "postgresql://u:" + SECRET + "@db/x",
+                "--resume", "sess-" + SECRET]
+        found = [process._verdict(42, "working directory", argv, None, ())]
+        with mock.patch.object(platform, "holders", return_value=found):
+            held, detail = hk.worktree_holders(self.wt)
+        self.assertTrue(held)
+        self.assertEqual(detail, "processes inside (42 psql)")
+        self.assertNotIn(SECRET, detail)
 
 
 class HousekeepingBlockedTest(PgTestCase):
@@ -134,13 +148,29 @@ class HousekeepingBlockedTest(PgTestCase):
 
     def test_an_observed_holder_is_not_a_housekeeping_block(self):
         path = self._ended_worktree()
-        observed = "processes inside (42 sleep 30)"
+        observed = "processes inside (42 sleep)"
         with mock.patch.object(hk, "worktree_holders", return_value=(True, observed)):
             report = self._pass(time.time())
         plan = next(row for row in report["plan"] if row["path"] == path)
         self.assertEqual(plan["action"], "attend")
         self.assertIn(observed, plan["detail"])
         self.assertNotIn("worktrees_blocked", report["measure"])
+
+    def test_a_secret_on_the_holder_argv_stays_out_of_the_journal(self):
+        """#3403 (témoin) : un détenteur constaté dont l'argv porte un faux
+        secret ; ni le plan ni le journal partagé ne le contiennent."""
+        path = self._ended_worktree()
+        argv = ["curl", "-H", "Authorization: Bearer " + SECRET, "https://x"]
+        found = [process._verdict(42, "working directory", argv, None, ())]
+        with mock.patch.object(platform, "holders", return_value=found):
+            report = self._pass(time.time())
+        plan = next(row for row in report["plan"] if row["path"] == path)
+        self.assertEqual(plan["action"], "attend")
+        self.assertIn("processes inside (42 curl)", plan["detail"])
+        self.assertNotIn(SECRET, repr(report))
+        rows = self.db.query("SELECT * FROM housekeeping_log")
+        self.assertNotIn(SECRET, repr(rows))
+        self.assertTrue(os.path.isdir(path))
 
     def test_alert_only_after_six_hours_and_names_process_and_key(self):
         self._measure({"count": 3, "since": time.time() - HOUR, "detail": DOUBT})

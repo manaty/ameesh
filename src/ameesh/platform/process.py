@@ -672,7 +672,9 @@ def holders(path: str | None, needle: str | None = None, exclude=(), *,
     séparé ou lié par `=`) ; le même identifiant CITÉ dans un brief, un
     message ou un chemin n'est pas un détenteur (#1283). #248 : avec `mapped`,
     aussi l'exécutable et les fichiers projetés en mémoire (module natif
-    `.node`, binaire electron). Chaque détenteur : `{"pid", "why", "cmd"}`.
+    `.node`, binaire electron). Chaque détenteur : `{"pid", "why", "cmd",
+    "name"}` — `cmd` est l'argv, à ne jamais écrire en base (#3403) ; `name`
+    sa base d'argv[0].
 
     Les processus illisibles (autre utilisateur, disparus) sont ignorés, mais
     si ce processus-ci ne peut même pas lire SES fichiers ouverts, si l'OS
@@ -1001,7 +1003,11 @@ def _verdict(pid: int, hit: str, argv: list[str], needle, exclude,
         elif any(needle in a for a in argv[1:]):
             hit = "session id on the command line"
     if hit:
-        return {"pid": pid, "why": hit, "cmd": " ".join(argv)[:160]}
+        # #3403 : `name` (base de argv[0]) est ce qui peut s'écrire au journal
+        # partagé ; `cmd` porte l'argv (identifiant de session, secret passé
+        # en argument possibles) et reste à l'usage local de l'appelant.
+        return {"pid": pid, "why": hit, "cmd": " ".join(argv)[:160],
+                "name": os.path.basename(argv[0]) if argv else ""}
     return None
 
 

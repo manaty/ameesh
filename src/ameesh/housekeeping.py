@@ -2194,7 +2194,18 @@ def tmp_holder(path: str, allow=()) -> str:
     if "command line" in why or "ligne de commande" in why:
         why = "path on the command line"
     return "held by process %s (%s: %s)" % (first.get("pid"), why,
-                                           (first.get("cmd") or "")[:80])
+                                           holder_name(first))
+
+
+def holder_name(holder: dict) -> str:
+    """Le nom d'un détenteur de `platform.holders`, bon pour le journal
+    partagé : la base de son argv[0], jamais l'argv (#3403 : identifiant de
+    session, DSN avec mot de passe, en-tête curl passés en argument)."""
+    name = holder.get("name")
+    if not name:
+        words = (holder.get("cmd") or "").split(None, 1)
+        name = os.path.basename(words[0]) if words else ""
+    return name or holder.get("why") or "?"
 
 
 def tmp_user_holder(path: str, procs=None) -> str:
@@ -2898,9 +2909,7 @@ def worktree_holders(path: str, allow=()) -> tuple[bool, str]:
     if not found:
         return False, ""
     return True, "processes inside (%s)" % ", ".join(
-        "%s %s" % (holder.get("pid"),
-                   (holder.get("cmd") or holder.get("why") or "").strip())
-        for holder in found[:3])
+        "%s %s" % (holder.get("pid"), holder_name(holder)) for holder in found[:3])
 
 
 def worktree_in_use(path: str, allow=()) -> bool:
