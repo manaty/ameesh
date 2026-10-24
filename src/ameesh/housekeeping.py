@@ -3271,12 +3271,15 @@ def _worktree_pass(db, host: str, *, dry_run: bool,
             continue
         # #3266 (relecture cx3) : une attribution persistée n'est qu'une trace,
         # comme `row.branch` : la branche a pu changer depuis (`topic` →
-        # `lot/432`). Avant CHAQUE décision de retrait, relire la branche
-        # ACTUELLE et vérifier tous les lots qu'elle nomme, PLUS le lot
-        # persisté et le dossier ; un lot ouvert, inconnu ou illisible prouve
-        # que le worktree sert encore. La base (f71414d8), qui n'attribuait
-        # jamais, n'avait rien à relire : ce garde protège l'attribution
-        # persistée, il ne change pas la règle de fin de lot.
+        # `lot/432`). Avant CHAQUE décision de retrait, la branche ACTUELLE est
+        # relue si elle ne l'a pas déjà été, et TOUS les lots qu'elle nomme,
+        # PLUS le lot persisté et le dossier, sont vérifiés : un lot ouvert,
+        # inconnu ou illisible prouve que le worktree sert encore. Lire la
+        # branche pour attribuer ne dispense pas de cette vérification
+        # (#3266, relecture cx3 : `nexlink-a2-431` sur `lot/431-432` attribue
+        # #431, #432 restant en construction). La base (f71414d8), qui
+        # n'attribuait jamais, n'avait rien à relire : ce garde protège
+        # l'attribution persistée, il ne change pas la règle de fin de lot.
         if not branch_checked:
             readable, branch = current_branch(path)
             if not readable:
@@ -3285,24 +3288,24 @@ def _worktree_pass(db, host: str, *, dry_run: bool,
                 continue
             branch_checked = True
             branch_owner = branch_agent(branch, known_agents) or (row.get("agent") or "")
-            branch_idents = cited_lots(branch, agent=branch_owner)
-            _named_owner, folder_idents = worktree_named_lots(
-                path, known_agents or (row.get("agent") or "",))
-            idents = list(dict.fromkeys(branch_idents + folder_idents + (
-                [str(lot)] if lot is not None else [])))
-            try:
-                states = [_lot_state(db, ident) for ident in idents]
-            except Exception:  # registre illisible : rien n'est prouvé
-                states = [None]
-            still = [(ident, state) for ident, state in zip(idents, states)
-                     if state not in LOT_ENDED]
-            if still:
-                ident, state = still[0]
-                detail = ("current branch names lot #%s %s; kept" % (
-                    ident, state or "unknown") if ident != str(lot) else
-                    "persisted lot #%s %s; kept" % (ident, state or "unknown"))
-                plan.append(dict(base, action="garde", detail=detail))
-                continue
+        branch_idents = cited_lots(branch, agent=branch_owner)
+        _named_owner, folder_idents = worktree_named_lots(
+            path, known_agents or (row.get("agent") or "",))
+        idents = list(dict.fromkeys(branch_idents + folder_idents + (
+            [str(lot)] if lot is not None else [])))
+        try:
+            states = [_lot_state(db, ident) for ident in idents]
+        except Exception:  # registre illisible : rien n'est prouvé
+            states = [None]
+        still = [(ident, state) for ident, state in zip(idents, states)
+                 if state not in LOT_ENDED]
+        if still:
+            ident, state = still[0]
+            detail = ("current branch names lot #%s %s; kept" % (
+                ident, state or "unknown") if ident != str(lot) else
+                "persisted lot #%s %s; kept" % (ident, state or "unknown"))
+            plan.append(dict(base, action="garde", detail=detail))
+            continue
         # #2180: a reused tracked path may now be a clone, a symlink or a
         # worktree of another repository. Old metadata never authorises it.
         from .housekeeping_discovery import _marker

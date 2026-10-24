@@ -1719,6 +1719,43 @@ class MenageDbTest(PgTestCase):
             self.assertEqual(hk.worktrees("pc")[0]["lot"], str(fini))
             self.assertTrue(os.path.isdir(wt))
 
+    def test_premiere_attribution_verifie_tous_les_lots_avant_retrait(self):
+        """#3266 (relecture cx3) : à la PREMIÈRE attribution, la branche est
+        lue pour attribuer ; cette lecture ne dispense pas de vérifier tous
+        les lots qu'elle nomme avant un retrait. `nexlink-a2-431` sur la
+        branche `lot/431-432` attribue #431 (fermé), mais #432 est encore en
+        construction : le worktree est gardé, aucune suppression. Le contrôle
+        (lot #431 déjà persisté, deux passes) passait déjà ; c'est
+        l'attribution de la même passe qui sautait la vérification."""
+        _sans_processus(self)
+        main = _repo(self.tmp)
+        registry.upsert(self.db, "a2", harness="claude", host="pc",
+                        cwd=os.path.join(self.tmp, "a2"))
+        fini = self._lot("fini")
+        work.assign(self.db, fini, "a2")
+        work.close(self.db, fini, abandoned=True)
+        ouvert = self._lot("ouvert")
+        work.assign(self.db, ouvert, "a2")
+        wt = os.path.join(self.tmp, "nexlink-a2-%d" % fini)
+        _git("worktree", "add", "-q", wt, "-b",
+             "lot/%d-%d" % (fini, ouvert), cwd=main)
+        hk = storage.of(self.db).housekeeping
+        row = hk.register_worktree(
+            host="pc", path=wt, repo=menage.common_dir(main), agent="a2",
+            lot=None, turn_id="t", branch="topic", head="")
+        hk.set_worktree_status(row["id"], "active", menage.UNATTRIBUTED)
+        interdit = AssertionError("aucune suppression Git dans ce témoin")
+        with mock.patch.object(menage, "remove_worktree", side_effect=interdit), \
+                mock.patch.object(menage, "_remove_kept_worktree", side_effect=interdit):
+            _entries, plan = menage._worktree_pass(
+                self.db, "pc", dry_run=False, protected=set(), running=set(),
+                now=time.time() + 2 * 3600, known_agents=("a2",))
+        plan = {p["path"]: p for p in plan if p.get("kind") == "worktree"}
+        self.assertEqual(plan[wt]["action"], "garde", plan[wt])
+        self.assertIn(str(ouvert), plan[wt]["detail"])
+        self.assertTrue(os.path.isdir(wt))
+        self.assertEqual(hk.worktrees("pc")[0]["lot"], str(fini))
+
     def test_worktrees_suivis_sans_plafond_pour_le_menage(self):
         """#2174 : `limit=None` rend tous les worktrees suivis de l'hôte (le
         ménage), le plafond par défaut reste pour les autres lectures."""
