@@ -79,6 +79,7 @@
   "budget.chooseProject": "Choisir un projet pour charger les jauges des forfaits.",
   "app.show": "Afficher",
   "timeline.legend": "Chronologie : développement, relecture, puis approbation à fusion. Les dates figurent aussi dans le tableau.",
+  "timeline.truncated": "Chronologie tronquée : {shown} lots sur {total} affichés (borne {limit}).",
   "state.intake": "À faire",
   "state.build": "En développement",
   "state.qa": "Relecture",

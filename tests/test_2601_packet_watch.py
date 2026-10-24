@@ -178,6 +178,55 @@ class Carriers(unittest.TestCase):
         self.assertEqual(found, {"open": [2608], "recent": [2590], "served": [2590]})
 
 
+class CompositionBeforePush(unittest.TestCase):
+    def test_unpublished_composition_silences_alert_in_each_open_state(self):
+        for phase in ("intake", "build", "qa"):
+            with self.subTest(phase=phase), tempfile.TemporaryDirectory() as tmp:
+                row = {"id": 3404, "title": "Paquet horaire h-11 — composition",
+                       "branch": None, "app": "ameesh", "assignee": "impl-05"}
+                store = types.SimpleNamespace(
+                    items=lambda state, assignee, limit: [row] if state == phase else [])
+                inventory, send = mock.Mock(), mock.Mock()
+                cfg = cfg_with(tmp)
+                with mock.patch("ameesh.storage.of", return_value=types.SimpleNamespace(work=store)):
+                    result = packet_watch.check(
+                        cfg, None, packet_watch.projects(cfg)["ameesh"], Hourly(),
+                        now=at(4, 20), state={}, inventory=inventory, send=send)
+                self.assertEqual(result["result"], "busy")
+                self.assertEqual(result["carriers"]["open"], [3404])
+                inventory.assert_not_called()
+                send.assert_not_called()
+
+    def test_title_is_anchored_and_project_and_explicit_target_are_respected(self):
+        row = {"title": "Paquet horaire h-11", "app": "ameesh"}
+        self.assertTrue(packet_watch._carrier(row, "ameesh", "main", composing=True))
+        self.assertFalse(packet_watch._carrier(row, "nexlink", "main", composing=True))
+        self.assertFalse(packet_watch._carrier(dict(row, title="packet-watch : Paquet horaire"),
+                                              "ameesh", "main", composing=True))
+        # #3406 N1: a bug title must not silence every subsequent slot.
+        self.assertFalse(packet_watch._carrier(
+            dict(row, title="Paquet horaire : corriger une alerte"),
+            "ameesh", "main", composing=True))
+        for branch in (None, "integration/paquet-h-11"):
+            other = dict(row, branch=branch, branch_target="origin/develop")
+            self.assertFalse(packet_watch._carrier(other, "ameesh", "main", composing=True))
+            self.assertTrue(packet_watch._carrier(other, "ameesh", "refs/heads/develop",
+                                                 composing=True))
+        # A title alone never proves a merge served a slot.
+        self.assertFalse(packet_watch._carrier(row, "ameesh", "main"))
+
+    def test_one_composer_and_delayed_fallback_even_when_alert_is_late(self):
+        watch = packet_watch.ProjectWatch("ameesh", ("impl-01", "impl-05", "pilot"))
+        text = packet_watch.body(watch, packet_watch.slot(Hourly(), at(4, 50), 900),
+                                 payload(), now=at(4, 50))
+        self.assertIn("Composeur désigné : impl-01", text)
+        self.assertIn("Geste pour impl-01", text)
+        deadline = datetime.fromtimestamp(at(5, 5), timezone.utc).isoformat()
+        self.assertIn("après " + deadline, text)
+        self.assertIn("sans réponse", text)
+        self.assertIn("un seul remplaçant", text)
+
+
 class ServedSlot(unittest.TestCase):
     def test_early_merge_silences_whole_slot_but_not_the_next(self):
         rows = {"merged": [{"id": 2639, "branch": "integration/paquet-h-20261019-0600",

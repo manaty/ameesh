@@ -527,11 +527,18 @@ paquet.
 Un créneau manqué ne reste pas muet (#2601) : sur l'hôte opérateur, chaque
 `ameesh release tick` (minuteur de 5 min) relit la cadence compilée
 (`packets.cutoffs`) ; passé la grâce (15 min par défaut), si aucun porteur
-`integration/paquet*` n'est ouvert ni tout juste fusionné pour le projet,
+`integration/paquet*` ni lot au titre commençant par « Paquet horaire h- »
+n’est ouvert (même sans branche) pour le projet et la cible, ni tout juste fusionné,
 qu'aucun paquet n'a déjà fusionné pendant le créneau et que la liste calculée
 rend au moins un lot prêt, une alerte urgente part, une fois
 par créneau, aux destinataires de `packet_watch.projects.<projet>.notify` (le
-composeur et le pilote). `ameesh release packet-watch --dry-run` montre ce qui
+composeur et le pilote). Le **premier destinataire** est le seul composeur
+désigné ; les suivants sont informés. Le repli attend sans réponse au moins
+la grâce après l’alerte (15 min minimum), puis vérifie en base qu’aucun lot
+de composition n’est ouvert ; le pilote désigne alors un seul remplaçant
+(#3406, constat mesh-design du 24/10/2026). Une cible explicite différente
+exclut le porteur ; sans cible explicite, le lot occupe conservativement le
+projet. `ameesh release packet-watch --dry-run` montre ce qui
 partirait.
 
 La composition **part d'une liste calculée**, jamais des seuls courriers

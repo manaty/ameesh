@@ -1030,16 +1030,23 @@ def timeline(db, cfg=None, *, since: str | None = None, project: str | None = No
 
     Même construction que `snapshot` (`_lots_view`), sans les agents, la
     feuille de route, les versions, le budget ni les décisions — c'est ce
-    qu'un écran qui ne dessine que les lots payait (1,1 Mo, 39–48 s)."""
+    qu'un écran qui ne dessine que les lots payait (1,1 Mo, 39–48 s).
+
+    #3401 : la borne de rendu (`max_lots`) est dite, comme dans `snapshot` —
+    sans elle la Chronologie laisserait croire à une liste complète."""
     now = time.time() if now is None else float(now)
     since_ts = parse_since(since, now)
     threshold = stagnation.stale_after() if stale_after is None else float(stale_after)
     view = _lots_view(db, storage.of(db).progress, cfg, since_ts=since_ts,
                       project=project, now=now, max_lots=max_lots, threshold=threshold)
+    truncated = {}
+    cut = _truncation(view["items"], max_lots)
+    if cut:
+        truncated["lots"] = cut
     return {"schema": TIMELINE_SCHEMA, "generated_ts": _round(now),
             "project": project or None,
             "window": {"from_ts": _round(since_ts), "to_ts": _round(now)},
-            "lots": view["lots"]}
+            "lots": view["lots"], "truncated": truncated}
 
 
 def snapshot(db, cfg=None, *, since: str | None = None, project: str | None = None,

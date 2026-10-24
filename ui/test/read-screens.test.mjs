@@ -151,6 +151,14 @@ test("the timeline does not restart its load at every event (#3395)", async () =
   el.remove();
 });
 
+test("the timeline says when its lot list is cut (#3401)", async () => {
+  const [status, complete] = routes["/api/v1/projects/ameesh/timeline"];
+  const cut = { ...complete, truncated: { lots: { shown: 1, total: 42, limit: 1 } } };
+  const { client } = fixture({ "/api/v1/projects/ameesh/timeline": [status, cut] });
+  const el = await mount("ameesh-timeline", client, { project: "ameesh" });
+  assert.match(text(el), /Timeline truncated: 1 of 42 lots shown \(limit 1\)/);
+});
+
 test("the app assembles all nine screens and navigates project → lot thread internally", async () => {
   const { client } = fixture(); const app = await mount("ameesh-app", client);
   assert.equal(app.shadowRoot.querySelectorAll("nav button").length, 9);

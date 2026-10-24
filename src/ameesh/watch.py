@@ -530,7 +530,58 @@ def disable(cfg: Config, db, agent: str, *, run: Callable = subprocess.run,
     return warnings
 
 
-def send(cfg: Config, db, agent: str, *, mail_send: Callable | None = None) -> str:
+def foreign_pin(cfg: Config, env: dict | None = None) -> str:
+    """#3408: this machine's host when the environment pins ANOTHER host,
+    else "". The environment file of a watch (or a wake) pins `AMEESH_HOST`
+    for the host that wrote it (#303); copied as is to another host, it made
+    the copy pass for the holder there (three duplicate instructions to the
+    orchestrator, agents-1, 2026-10-24). The machine's host is the one the
+    host-wide environment file declares (`HOST_ENV_FILE`, loaded by every
+    unit before the watch's own file), else its configuration without the pin
+    (`host` key, else the machine name). No pin, or an unreadable
+    configuration: "" (a doubt blocks nothing)."""
+    source = dict(os.environ if env is None else env)
+    names = PINNED_ENV["AMEESH_HOST"]
+    if not any(source.get(name) for name in names):
+        return ""
+    own = _host_env_value(source, names)
+    if not own:
+        bare = {key: value for key, value in source.items() if key not in names}
+        try:
+            own = config_mod.load(bare).host or ""
+        except (Exception, SystemExit):  # noqa: BLE001 — a doubt blocks nothing
+            return ""
+    return own if own and own != (cfg.host or "") else ""
+
+
+def _host_env_value(source: dict, names: tuple[str, ...]) -> str:
+    """The first of `names` set in the host-wide environment file, or ""."""
+    home = source.get("HOME") or os.path.expanduser("~")
+    path = HOST_ENV_FILE.replace("%h", home)
+    try:
+        with open(path, encoding="utf-8") as fh:
+            lines = fh.read().splitlines()
+    except OSError:
+        return ""
+    found: dict[str, str] = {}
+    for line in lines:
+        key, sep, value = line.strip().partition("=")
+        if sep and key.strip() in names:
+            found[key.strip()] = value.strip().strip('"').strip("'")
+    return next((found[name] for name in names if found.get(name)), "")
+
+
+def _refuse_foreign(cfg: Config, env: dict | None, what: str, regenerate: str) -> None:
+    own = foreign_pin(cfg, env)
+    if own:
+        raise WatchError(
+            "%s refused: its environment pins host %s, but this machine is %s "
+            "(an environment file copied from another host, #3408); nothing sent. "
+            "Regenerate it on this host: %s" % (what, cfg.host, own, regenerate))
+
+
+def send(cfg: Config, db, agent: str, *, mail_send: Callable | None = None,
+         env: dict | None = None) -> str:
     """One firing: the instruction to `agent` when its watch is recorded for
     this host; else nothing (disabled, or moved). The host check, the message
     and `last_sent_ts` are one transaction on the watch row (codex r1 and r2,
@@ -539,6 +590,8 @@ def send(cfg: Config, db, agent: str, *, mail_send: Callable | None = None) -> s
     next one never sends a second copy. `mail_send(tx, agent, text)` drops the
     message in the transaction (tests). What happened, in words."""
     from . import mail, undeliverable
+    _refuse_foreign(cfg, env, "watch of %s" % agent,
+                    "ameesh watch enable --agent %s" % agent)
     host = cfg.host or ""
     text = instruction(agent)
     rows = storage.of(db).watches.list(agent)
@@ -705,6 +758,9 @@ def fire(cfg: Config, db, agent: str, slug: str, *,
             "wake %s of %s refused: %s=%r — a wake unit carries %s=%s "
             "(ameesh watch at); without it the message is lost at the deadline (#1020)"
             % (slug, agent, IDENTITY_ENV, identity, IDENTITY_ENV, agent))
+    _refuse_foreign(cfg, env, "wake %s of %s" % (slug, agent),
+                    "ameesh watch at --agent %s --wake %s --in <delay> --message <text>"
+                    % (agent, slug))
     directory = unit_dir(env)
     state_path = os.path.join(directory, wake_name(agent, slug, "wake.json"))
     try:
