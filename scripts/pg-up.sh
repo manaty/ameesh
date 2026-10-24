@@ -73,12 +73,13 @@ recouvre() {
     || [ "${1#"$2"/}" != "$1" ] || [ "${2#"$1"/}" != "$2" ]
 }
 # forme canonique d'une source (`/srv/pg-data/` ou un lien vers ce dossier
-# désignent le même répertoire) ; telle quelle si realpath échoue
+# désignent le même répertoire). Python accepte les composants inexistants
+# sur Linux comme sur macOS, dont le realpath BSD ne connaît pas `-m`.
 canon() {
   local src
   while IFS= read -r src; do
     [ -n "$src" ] || continue
-    realpath -m -- "$src" 2>/dev/null || printf '%s\n' "$src"
+    python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "$src"
   done <<<"$1"
 }
 # refus si un autre conteneur (ceux que liste `docker ps $1`) monte un

@@ -138,6 +138,7 @@ esac
                 self.assertEqual(done.returncode, 0, done.stdout + done.stderr)
                 self.assertIn("--user restart ameesh-notify.service", self.log.read_text())
 
+    @unittest.skipUnless(platform.is_linux(), "preuve du venv vivant via /proc : Linux")
     def test_notify_current_process_passes(self):
         self.process(self.current)
         done = self.run_poste("controler")
@@ -165,6 +166,7 @@ esac
                 self.assertNotEqual(done.returncode, 0)
                 self.assertNotIn("contrôles verts", done.stdout)
 
+    @unittest.skipUnless(platform.is_linux(), "preuve du venv vivant via /proc : Linux")
     def test_notify_mainpid_change_fails(self):
         self.process(self.current)
         other = self.root / "other-pid"
@@ -175,6 +177,7 @@ esac
         self.assertIn("MainPID changé", done.stderr)
         self.assertNotIn("contrôles verts", done.stdout)
 
+    @unittest.skipUnless(platform.is_linux(), "preuve du venv vivant via /proc : Linux")
     def test_notify_before_first_versioned_venv(self):
         (self.share / "venv-courant").unlink()
         (self.venv / "bin/python").symlink_to(sys.executable)

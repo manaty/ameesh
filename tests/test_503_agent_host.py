@@ -13,6 +13,8 @@ import tempfile
 import time
 import unittest
 
+from ameesh import platform
+
 from tests import support  # isolate the workstation environment
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -532,6 +534,7 @@ class AgentHostTest(unittest.TestCase):
         self.assertEqual(self.units(), '')
         self.assertFalse((self.state / 'systemd-run.log').exists())
 
+    @unittest.skipUnless(platform.is_linux(), "preuve du venv vivant via /proc : Linux")
     def test_systemd_supplies_literal_environment(self):
         expected = 'postgresql://test@invalid/mesh_$USER"quoted"#fragment'
         (self.state / 'runner.env').write_text(
@@ -547,6 +550,7 @@ class AgentHostTest(unittest.TestCase):
         self.assertIn('EnvironmentFile=' + str(self.state / 'runner.env'), log)
         self.assertNotIn('%h', log)
 
+    @unittest.skipUnless(platform.is_linux(), "preuve du venv vivant via /proc : Linux")
     def test_controler_prouve_le_venv_du_runner_vivant(self):
         """#3311 : `controler` lit l'argv[0] concret du MainPID, pas ExecStart."""
         p = self.run_vm('controler')
@@ -554,6 +558,7 @@ class AgentHostTest(unittest.TestCase):
         self.assertIn('MainPID vivant sur le venv courant', p.stdout)
         self.assertIn('contrôles verts', p.stdout)
 
+    @unittest.skipUnless(platform.is_linux(), "preuve du venv vivant via /proc : Linux")
     def test_controler_refuse_un_runner_reste_sur_l_ancien_venv(self):
         """#3311, panne d'agents-2 : venv-courant à jour, exécuteur vivant sur
         l'ancien venv — l'hôte n'est pas sain et le dit."""
@@ -1105,6 +1110,7 @@ class AgentHostTest(unittest.TestCase):
         self.assertIn('WARNING: 2 persona(s) not checked', p.stdout)
         self.assertIn('start ameesh-runner-agent@dev8.service', self.units())
 
+    @unittest.skipUnless(platform.is_linux(), "preuve du venv vivant via /proc : Linux")
     def test_runner_id_forms_and_default_are_accepted(self):
         for scenario in ['equals-owner', 'abbreviated-owner', 'last-owner', 'default-owner']:
             with self.subTest(scenario=scenario):
@@ -1141,6 +1147,7 @@ class AgentHostTest(unittest.TestCase):
         self.assertNotEqual(p.returncode, 0)
         self.assertIn('bail', p.stderr)
 
+    @unittest.skipUnless(platform.is_linux(), "preuve du venv vivant via /proc : Linux")
     def test_check_accepts_held_lease_and_is_read_only(self):
         p = self.run_vm('controler')
         self.assertEqual(p.returncode, 0, p.stderr)
@@ -1148,6 +1155,7 @@ class AgentHostTest(unittest.TestCase):
         self.assertNotIn('restart', self.units())
         self.assertNotIn('start', self.units())
 
+    @unittest.skipUnless(platform.is_linux(), "preuve du venv vivant via /proc : Linux")
     def test_check_visits_every_registered_agent(self):
         """#1455: the client must not eat the list shared with the `while read`."""
         p = self.run_vm('controler')

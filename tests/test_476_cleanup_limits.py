@@ -66,7 +66,7 @@ class CleanupLimitsTest(unittest.TestCase):
         tracker.log = notes.append
         handle = ProcessHandle(7001, 123)
         target.send.side_effect = handle.send
-        with mock.patch.object(signal, "pidfd_send_signal", side_effect=[
+        with mock.patch.object(signal, "pidfd_send_signal", create=True, side_effect=[
                 OSError(errno.EINTR, "interrupted"), OSError(errno.EPERM, "refused")]) as send:
             tracker._signal_handles(entry, signal.SIGTERM)
         self.assertEqual(send.call_args_list,

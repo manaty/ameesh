@@ -18,6 +18,8 @@ import sys
 import tempfile
 import unittest
 
+from ameesh import platform
+
 from tests import support  # noqa: F401 — environnement isolé du poste
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -51,6 +53,7 @@ sys.exit(0)
 AMEESH = '#!/bin/sh\nexit 0\n'
 
 
+@unittest.skipUnless(platform.is_linux(), "preuve du venv vivant via /proc : Linux")
 class ControlerVenvTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(prefix="ameesh-3311-")
@@ -154,6 +157,7 @@ sys.exit(0)
 '''
 
 
+@unittest.skipUnless(platform.is_linux(), "preuve du venv vivant via /proc : Linux")
 class ControlerServeurTest(unittest.TestCase):
     """`vm.sh controler` (mode serveur) prouve le venv de `ameesh-runner@<p>`."""
 
