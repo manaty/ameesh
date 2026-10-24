@@ -2206,7 +2206,22 @@ def _carried_from_previous(db, item: Mapping, milestone: Optional[Mapping],
             continue
         unknown.extend(unreadable)
         for actor, proven in by_name.items():
-            if not survives(written, stored, actor):
+            # #3335 (auditeur B1) : un relecteur promu auteur d'un gel antérieur
+            # (#2924 B4) ne garde pas le raccourci d'ascendance (`stored`) : un
+            # gel postérieur a pu retirer son correctif. La même preuve de
+            # contenu que la trace « correcteur » décide, et un commit déjà
+            # couvert par la plage courante est laissé à la lecture de cette
+            # tête (qui l'a déjà filtré). Le titulaire non relecteur garde le
+            # raccourci : son contenu est attribué par la plage courante.
+            if actor in review_commits:
+                actor_commits = [str(value) for value in written.get(actor) or ()]
+                if actor_commits and all(
+                        plan_git.full_commit_id(value) in current_set
+                        for value in actor_commits):
+                    continue
+                if not survives(written, stored, actor, content=True):
+                    continue
+            elif not survives(written, stored, actor):
                 continue
             carried.setdefault(actor, set()).update(
                 value for value in proven if value)

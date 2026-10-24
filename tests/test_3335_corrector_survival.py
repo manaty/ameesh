@@ -103,6 +103,35 @@ class PartlySurvivingCorrectorTest(_RemovedCorrectorFixture):
         self.assertEqual([row["name"] for row in correctors], ["cx3"])
 
 
+class SquashedRemovedCorrectorTest(_RemovedCorrectorFixture):
+    """Le retrait consolidé à arbre identique ne ressuscite pas le correcteur.
+
+    Témoin B1 de l'auditeur : le gel B est ancêtre par son arbre (squash sur
+    la base, arbre identique) et `stored` est vrai ; la promotion en auteur
+    d'un relecteur (#2924 B4) doit pourtant suivre la survie du contenu, pas
+    l'ascendance. Sans cela, cx3 revient auteur et la famille codex est
+    exclue sur un arbre qui ne contient plus son correctif.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.remove_corrector()
+        tree = self.repo.git("rev-parse", self.head_b + "^{tree}")
+        self.head_c = self.squash(tree, self.base,
+                                  "impl: retrait consolidé")
+        self.freeze_c = self.freeze(self.head_c)
+        self.milestone = {"id": int(self.freeze_c["id"]), "sha": self.head_c,
+                          "actor": "impl", "at_ts": self.freeze_c.get("at_ts")}
+
+    def test_the_squashed_removal_does_not_revive_the_corrector(self):
+        authors, unknown, correctors = self.reading(
+            self.milestone, [self.head_c], self.base, self.head_c)
+        self.assertEqual(unknown, [])
+        self.assertEqual({row["name"]: row["family"] for row in authors},
+                         {"impl": "deepseek"})
+        self.assertEqual(correctors, [])
+
+
 class UnreadableCorrectorContentTest(_RewriteFixture):
     """La lecture de contenu échoue : le correcteur reste exclu."""
 
