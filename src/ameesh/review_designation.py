@@ -57,8 +57,15 @@ NONE = "none"
 REQUEST_KIND = "request"
 #: a harness that is not a model family (registry without a session)
 PLACEHOLDER_FAMILIES = frozenset(("", "none", "other", "unknown", "inconnu"))
-#: the registry states that forbid designation
-UNAVAILABLE_STATUS = frozenset(("stopped", "paused"))
+#: the registry states of an agent that no longer lives: the lease reaper
+#: writes `dead`, and a `stopped` agent waits for a human. Read by the
+#: automatic designation (#3415) and by the reassignment scan of
+#: `review_designation_activation` (#3328), so the two never disagree.
+NON_LIVE_STATUS = frozenset(("stopped", "dead"))
+#: the registry states that forbid designation: the non-live ones, plus the
+#: legacy `paused` state. An operator pause is a **column**, read by
+#: `is_available` (#3415), not a status: the row keeps `idle`.
+UNAVAILABLE_STATUS = NON_LIVE_STATUS | frozenset(("paused",))
 #: the `status_text` prefixes of an operations or budget pause
 PAUSE_PREFIXES = ("paused", "budget : ")
 #: a commit SHA (full or abbreviated): a branch name is not a freeze
@@ -226,23 +233,31 @@ def live_family(row: Mapping, *, families) -> str:
 
 
 def is_available(row: Mapping, *, closed_hosts: Iterable[str] = ()) -> bool:
-    """Availability in the registry: neither stopped, nor paused, nor a human
-    session, nor on a host whose claims are closed (#3328).
+    """Availability in the registry: neither stopped, nor dead, nor paused, nor
+    under an operator pause, nor a human session, nor on a host whose claims
+    are closed (#3328, #3415).
 
     An agent in a turn remains available: the mail waits for it and opens its
-    next turn. Unavailable are a `stopped`/`paused` agent, an `external` session
-    (never run by the executor, L46), an operations or budget pause
-    (`status_text` "paused…" or "budget : …"), and — #3328 — an agent whose
-    host is `draining`/`lost` (claims closed): the request deposited there is
-    not read until the host comes back, so the seat would stay blocked while
-    the freeze waits. The host evidence is the one agent-mail uses
-    (`alert_briefs.claims_closed_hosts`, #3036); an unreadable host state closes
-    nothing, and a missing lease is not read: an idle reviewer is woken by the
-    request mail, so it is still a candidate. A row with no readable mode or
-    status is refused: doubt designates nobody.
+    next turn. Unavailable are a `stopped`/`dead`/`paused` agent (#3415: a
+    reaped lease writes `dead`), an `external` session (never run by the
+    executor, L46), an operations or budget pause (`status_text` "paused…" or
+    "budget : …"), an operator pause (`operator_paused`, a column: the row keeps
+    `status` `idle` and its text "last turn: …", so the status and the prefixes
+    never see it), and — #3328 — an agent whose host is `draining`/`lost`
+    (claims closed): the request deposited there is not read until the host
+    comes back, so the seat would stay blocked while the freeze waits. The host
+    evidence is the one agent-mail uses (`alert_briefs.claims_closed_hosts`,
+    #3036); an unreadable host state closes nothing, and a missing lease is not
+    read: an idle reviewer is woken by the request mail, so it is still a
+    candidate. A row with no readable mode or status is refused: doubt
+    designates nobody.
     """
     row = dict(row or {})
     if (row.get("mode") or "execute") != "execute":
+        return False
+    # #3415: an operator pause is a human "no new turn" (#2200): the seat would
+    # wait for a resume, so the designation never deposits a request there.
+    if row.get("operator_paused"):
         return False
     status = str(row.get("status") or "").strip().lower()
     if not status or status in UNAVAILABLE_STATUS:

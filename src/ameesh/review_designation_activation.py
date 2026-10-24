@@ -2779,7 +2779,9 @@ def _unreachable_reviewer(row: Optional[Mapping], closed_hosts: set) -> str:
     if (row.get("mode") or "execute") != "execute":
         return "mode %s" % (row.get("mode"),)
     status = str(row.get("status") or "").strip().lower()
-    if status in ("stopped", "dead"):
+    # #3415 : le même ensemble que la désignation (`NON_LIVE_STATUS`), pour
+    # qu'un statut non vivant ne soit ni désigné ni laissé en siège mort.
+    if status in rd.NON_LIVE_STATUS:
         return "status %s" % status
     host = str(row.get("host") or "").strip()
     if host and host in closed_hosts:
