@@ -102,7 +102,10 @@ venu pendant la composition (base `bf1925787dd2` figée).
   (correctif mécanique §2/§11 bis, le manifeste est la revue du paquet), fusion
   automatique réarmée. Le deuxième tour ne change qu'un banc (#1252) : nouvelle
   tête, `ci-full` et avis sur le seul delta de test. Les onze unités gardent
-  leurs verdicts acquis sur leurs têtes gelées.
+  leurs verdicts acquis sur leurs têtes gelées. La `ci-full` demandée sur
+  `b1ae015a71` a été annulée avant démarrage (run `40089199903`) : cette tête
+  allait changer (recomposition sur le `main` de #3336), une seule suite
+  complète est consommée sur la tête finale.
 - **Fusion** : sous garde de tête (`--match-head-commit`), dès le vert, par le
   pilote ou le bureau ; tout rouge non infra isole le lot fautif sans relire
   le reste.
@@ -143,9 +146,24 @@ pointait sur `sys.executable` du venv CI, qui, hors de son préfixe, ne retrouve
 pas sa bibliothèque ; la preuve lisait alors un processus mort. Correctif
 `f38773b2e` (test seul, 1 fichier +7/−1) : le banc spawne
 `sys._base_executable` (python de base complet), l'argv[0] reste celui du venv
-et la preuve est inchangée. `test_1252` **48/48** verts en local. Le delta étant
-uniquement un banc, la nouvelle tête est demandée en `ci-full --avis 0` ; les
-deux verdicts de composition sur `36a835e46` restent acquis.
+et la preuve est inchangée. `test_1252` **48/48** verts en local. La `ci-full`
+du `b1ae015a71` (run `40089294066`) a été remplacée par la recomposition : le
+pilote a ordonné de laisser passer l'incident #3336 sur `main` avant de
+recomposer h-07. Ce run confirme le diagnostic (le python enfant meurt,
+`controler` ne prouve plus le MainPID vivant).
+
+Recomposition sur le `main` de #3336 (incident `ci-flow`, PR #2516) et
+correctif final `a018c5708` (test seul, 1 fichier +5/−8) : `f38773b2e`
+masquait la cause. Le `pyvenv.cfg` du faux venv était écrit avec
+`home = dirname(sys.executable)` (= `.venv-ci/bin` en CI, dossier sans
+stdlib) ; un vrai venv y nomme le préfixe de l'interpréteur de base. Le banc
+écrit `home = sys.base_prefix/bin` et respawne `sys.executable` comme avant
+(l'argv[0] reste dans `venv/bin`, la preuve est inchangée). `test_1252`
+**48/48** verts en local, y compris en lançant le banc sous un interpréteur de
+venv (`sys.executable` dans un venv, `base_prefix = /usr`), condition qui
+reproduisait le rouge CI ; la CI reste la preuve. La tête finale est demandée
+en `ci-full` ; les onze verdicts d'unité restent acquis, seuls les avis delta
+(auditeur + ameesh-cx1) portent sur la recomposition et ce correctif.
 
 ## Écartés (ce véhicule)
 
