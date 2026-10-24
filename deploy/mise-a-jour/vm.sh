@@ -27,7 +27,8 @@
 #                drain est refusé et le redémarrage de cet agent s'arrête sans
 #                tour interrompu ; refuse tant que les migrations du code
 #                installé manquent
-#   controler    unités actives, journal récent, ameesh doctor sur le serveur
+#   controler    unités actives, journal récent, venv du MainPID vivant,
+#                ameesh doctor sur le serveur
 #   retour       bascule en arrière vers le venv précédent conservé, puis
 #                redémarre
 #
@@ -88,6 +89,8 @@ DEPOT="$(git -C "$ICI" rev-parse --show-toplevel)"
 AMEESH="$HOME/.local/share/ameesh/venv/bin/ameesh"   # celui du poste, pour lire les statuts
 SRC=/opt/ameesh/src
 VENV=/opt/ameesh/venv
+#: venv stable du compte runner sur une VM d'agents (`ExecStart` le vise)
+VENV_AGENTS=/home/ameesh/.local/share/ameesh/venv
 PRECEDENT=/opt/ameesh/precedent
 TRAVAIL="$HOME/.local/state/ameesh/mise-a-jour"
 # #2152 : quand un agent est en tour, une pause opérateur courte (drain) peut
@@ -236,13 +239,17 @@ paquet_git() {
 # -n : le client consomme son entrée standard même quand la commande distante
 # ne la lit pas. Sans lui, la boucle `while read` de controler_agents lui livre
 # la liste des agents et n'en contrôle qu'un seul (#1455).
+# #3311 : ENTREE_STDIN=1 (via utilisateur_agents_stdin) transmet au contraire
+# l'entrée standard, pour faire lire le helper de preuve du venv sur la cible.
 ssh_agents() {
+  local opts=("${SSH_OPTS[@]}")
+  [ "${ENTREE_STDIN:-}" = 1 ] || opts+=(-n)
   if [ "${BORNE_APPEL_DRAIN:-}" = 1 ]; then
     # #2198/N2 : la borne locale (BORNE_APPEL_LOCAL) dépasse toujours la borne
     # distante, pour laisser le `timeout` distant rendre son code.
     appel_drain "${BORNE_APPEL_LOCAL:-$DRAIN_APPEL_DELAI}" \
-      ssh -n "${SSH_OPTS[@]}" "$AGENTS_SSH" "$@"
-  else ssh -n "${SSH_OPTS[@]}" "$AGENTS_SSH" "$@"; fi
+      ssh "${opts[@]}" "$AGENTS_SSH" "$@"
+  else ssh "${opts[@]}" "$AGENTS_SSH" "$@"; fi
 }
 utilisateur_agents() {
   local commande; printf -v commande '%q ' "$@"
@@ -250,6 +257,10 @@ utilisateur_agents() {
     uid=\$(id -u ameesh)
     runuser -u ameesh -- env HOME=/home/ameesh XDG_RUNTIME_DIR=/run/user/\$uid \
       DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/\$uid/bus $commande"
+}
+# #3311 : même environnement que utilisateur_agents, entrée standard ouverte.
+utilisateur_agents_stdin() {
+  ENTREE_STDIN=1 utilisateur_agents "$@"
 }
 commande_agents() {
   # Use the runner's systemd EnvironmentFile parser, including literal $/#.
@@ -1443,6 +1454,25 @@ exiger_migrations_agents() {
   exit 1
 }
 
+# #3311 : le lanceur ExecStart est stable (#1969) : un exécuteur déjà lancé
+# peut rester sur l'ancien venv après une bascule, et l'hôte paraître sain. Le
+# helper est lu sur stdin, donc il ne dépend pas de la version installée sur la
+# cible ; il prouve l'argv[0] concret du MainPID (/proc, après bascule).
+preuve_venv_agents() {  # persona → 0 si le MainPID vivant exécute le venv installé
+  local p=$1 u pid
+  u=$(unite_agents "$p")
+  pid=$(utilisateur_agents systemctl --user show -p MainPID --value "$u") \
+    || { echo "$u : MainPID illisible — venv non prouvé" >&2; return 1; }
+  [[ $pid =~ ^[0-9]+$ ]] \
+    || { echo "$u : MainPID invalide ($pid) — venv non prouvé" >&2; return 1; }
+  if [ ! -r "$ICI/venv-processus.py" ]; then
+    echo "venv-processus.py introuvable : $ICI/venv-processus.py" >&2
+    return 1
+  fi
+  utilisateur_agents_stdin python3 - "$pid" "$VENV_AGENTS" "$u" \
+    < "$ICI/venv-processus.py"
+}
+
 controler_agents() {
   local noms p ligne heure attendu echec=0
   etape "code installé sur $HOTE_AGENTS"
@@ -1453,6 +1483,8 @@ controler_agents() {
     utilisateur_agents systemctl --user is-active --quiet "$(unite_agents "$p")" \
       && utilisateur_agents journalctl --user -u "$(unite_agents "$p")" -n 15 --no-pager \
       || { echec_agent "$p" "unité inactive ou journal inaccessible"; echec=1; }
+    preuve_venv_agents "$p" \
+      || { echec_agent "$p" "le MainPID vivant n'exécute pas le venv installé"; echec=1; }
     ligne=$(lire_bail "$p") && heure=$(heure_base) && attendu=$(proprietaire_de "$p") \
       && bail_valide 0 "$attendu" "$heure" <<<"$ligne" \
       || { echec_agent "$p" "bail absent, étranger ou expiré, ou preuve illisible"; echec=1; }
@@ -1787,11 +1819,27 @@ redemarrer() {
   fi
 }
 
+# #3311 : comme preuve_venv_agents, sur le serveur (`ameesh-runner@<p>`,
+# ExecStart /opt/ameesh/venv/bin/ameesh). Le helper arrive par stdin.
+preuve_venv_vm() {  # persona → 0 si le MainPID vivant exécute le venv installé
+  local u=ameesh-runner@$1 pid
+  pid=$(ssh_vm "systemctl show -p MainPID --value $u") \
+    || { echo "$u : MainPID illisible — venv non prouvé" >&2; return 1; }
+  [[ $pid =~ ^[0-9]+$ ]] \
+    || { echo "$u : MainPID invalide ($pid) — venv non prouvé" >&2; return 1; }
+  if [ ! -r "$ICI/venv-processus.py" ]; then
+    echo "venv-processus.py introuvable : $ICI/venv-processus.py" >&2
+    return 1
+  fi
+  ssh_vm "python3 - '$pid' '$VENV' '$u'" < "$ICI/venv-processus.py"
+}
+
 controler() {
   local echec=0
   for p in $PERSONAS_VM; do
     etape "$p"
     ssh_vm "systemctl is-active ameesh-runner@$p && journalctl -u ameesh-runner@$p -n 15 --no-pager" || echec=1
+    preuve_venv_vm "$p" || echec=1
     "$AMEESH" show "$p" | head -4 || echec=1
   done
   etape "ameesh doctor sur le serveur"

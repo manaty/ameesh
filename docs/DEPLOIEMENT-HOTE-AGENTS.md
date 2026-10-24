@@ -8,6 +8,14 @@ une par une, arrêt prouvé avant chaque démarrage. `agents controler` (ou
 `agents installer [REF]` installe une révision gelée dans le layout du compte
 et `agents retour` réinstalle la précédente (#1252).
 
+`agents controler` prouve aussi que **chaque exécuteur vivant tourne sur le
+venv installé** : le lanceur `ExecStart` est stable (#1969) et résout
+`venv-courant` au démarrage, si bien qu'un processus déjà lancé garde l'ancien
+venv après une bascule. Le contrôle lit l'`argv[0]` concret du MainPID dans
+`/proc/<pid>/cmdline` et le compare au venv vivant ; un écart nomme l'unité et
+rend le contrôle rouge. Sans cela, un hôte dont seul le CLI avait changé de
+venv passait pour sain (staging du 24/10/2026, #3311).
+
 Dans le fichier privé `$BASCULE_ENV` (par défaut
 `~/.config/ameesh/bascule.env`), renseigner la cible SSH **root** et le nom
 exact de l’hôte dans le registre :
