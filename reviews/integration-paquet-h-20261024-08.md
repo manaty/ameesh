@@ -79,7 +79,7 @@ calcul provisoire (diff vide) — c'est celle-ci qui est poussée.
   non bloquante (§3), motif consigné.
 - **Suite complète** : une seule `ci-full` sur la tête finale, en mode paquet
   (16 parts psql) ; demande `--avis 0 --full` (le manifeste tient lieu de revue
-  unitaire du paquet, §12), puis avis delta auditeur + ameesh-cx1 sur la tête.
+  unitaire du paquet, §12), puis avis delta des deux relecteurs désignés au gel sur la tête.
 - **Fusion** : sous garde de tête (`--match-head-commit`), dès le vert et les
   deux avis ; staging = bureau (passage unique après h-07).
 
