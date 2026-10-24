@@ -386,6 +386,64 @@ class CommitSurvivesTest(TestCase):
         head = self.repo.commit("impl: base + autre fichier", agent="impl")
         self.assertFalse(self.survives(head, fix, base))
 
+    def test_a_pure_removal_hunk_survives_a_mixed_hunk_elsewhere(self):
+        # B13 (revue cx3) : `return None` est retiré par un hunk **pur** dans
+        # corrected() et par un hunk **mixte** dans independent() (remplacé par
+        # raise …). Les deux hunks sont séparés par plus de contexte que la
+        # fenêtre de diff : le hunk pur prouve la survie, le hunk mixte qui
+        # retire le même texte ailleurs ne le disqualifie pas.
+        self.repo.write("gate.py",
+                        "def corrected(user):\n"
+                        "    guard_a_1()\n"
+                        "    guard_a_2()\n"
+                        "    return None\n"
+                        "    guard_a_3()\n"
+                        "    guard_a_4()\n"
+                        "def before_check_7():\n"
+                        "    check_seven()\n"
+                        "def independent(user):\n"
+                        "    guard_b_1()\n"
+                        "    guard_b_2()\n"
+                        "    return None\n"
+                        "    guard_b_3()\n"
+                        "    guard_b_4()\n")
+        base = self.repo.commit("base")
+        self.repo.write("gate.py",
+                        "def corrected(user):\n"
+                        "    guard_a_1()\n"
+                        "    guard_a_2()\n"
+                        "    guard_a_3()\n"
+                        "    guard_a_4()\n"
+                        "def before_check_7():\n"
+                        "    check_seven()\n"
+                        "def independent(user):\n"
+                        "    guard_b_1()\n"
+                        "    guard_b_2()\n"
+                        "    raise corrected_rejection()\n"
+                        "    guard_b_3()\n"
+                        "    guard_b_4()\n")
+        self.repo.write("docs/review.md", "review own line\n")
+        fix = self.repo.commit("fix", agent="cx3")
+        self.repo.git("reset", "-q", "--hard", base)
+        self.repo.write("gate.py",
+                        "def corrected(user):\n"
+                        "    guard_a_1()\n"
+                        "    guard_a_2()\n"
+                        "    return None\n"
+                        "    guard_a_3()\n"
+                        "    guard_a_4()\n"
+                        "def before_check_7():\n"
+                        "    updated_check_seven()\n"
+                        "def independent(user):\n"
+                        "    guard_b_1()\n"
+                        "    guard_b_2()\n"
+                        "    return None\n"
+                        "    guard_b_3()\n"
+                        "    guard_b_4()\n")
+        head = self.repo.commit("impl: retrait conservé, remplacement omis",
+                                agent="impl")
+        self.assertTrue(self.survives(head, fix, base))
+
     def test_a_reintroduced_removal_keeps_the_corrector(self):
         # B9/B10/B11 (arbitrage mesh-design) : la tête réintroduit la garde
         # exactement à sa place. Le retrait effectif et pur garde son auteur ;

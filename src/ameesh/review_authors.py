@@ -1101,8 +1101,10 @@ def _removal_proves_survival(repo: str, head: str, sha: str, path: str,
     tête a réintroduit les lignes ; c'est une sur-rétention acceptée, dans le
     sens sûr. #2994/#2614 : un retrait vacant (la base ne l'a jamais porté) ou
     le côté retiré d'une modification (le hunk ajoute une ligne, même héritée :
-    un réordre n'est pas un retrait pur) ne prouve rien. Une lecture impossible
-    reste un doute : le retrait compte (l'auteur est conservé)."""
+    un réordre n'est pas un retrait pur) ne prouve rien. Le retrait se juge
+    hunk par hunk (B13) : un hunk pur suffit, même si un autre hunk, séparé
+    par du contexte, retire le même texte dans une modification. Une lecture
+    impossible reste un doute : le retrait compte (l'auteur est conservé)."""
     if not base:
         return True
     key = ("merge-base", head, base)
@@ -1135,12 +1137,14 @@ def _removal_proves_survival(repo: str, head: str, sha: str, path: str,
     blocks = _removal_hunks(repo, sha, path, cache)
     if blocks is None:
         return True
+    mixed = False
     for block in blocks:
         if row.strip() not in {value.strip() for value in block["removed"]}:
             continue
-        if block.get("added"):
-            return False                # côté retiré d'une modification
-    return True
+        if not block.get("added"):
+            return True                 # un hunk pur suffit (B13)
+        mixed = True
+    return not mixed
 
 
 def _commit_survives(repo: str, head: str, sha: str, cache: dict,
