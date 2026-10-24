@@ -456,6 +456,15 @@ def lot_steps(item: dict, jalons: dict, events: Iterable[dict], *,
     une réassignation ne doit pas déclencher une nouvelle demande de
     réassignation dans la minute. Une correction livrée (nouveau gel) ou
     annulée par un verdict inverse du même relecteur retire la ligne.
+
+    #3333 : une retenue suspend `blocked_freeze` comme le délai intake
+    (#2916). Tant que le lot est `blocked` ou `waiting_human`, son assigné
+    n'a pas de correction à livrer : il attend la levée, aucune ligne ne
+    court. Une fois la retenue levée (`hold_release_ts`, ou un hold de pilote
+    levé et passé par `hold_releases`), l'horloge repart de la levée si elle
+    suit le blocage. Le temps passé sous retenue n'est donc pas un retard du
+    porteur, et un lot parqué volontairement ne fait plus crier « réassigner
+    maintenant » vers le bureau à la levée.
     """
     events = list(events)
     now = time.time() if now is None else float(now)
@@ -577,17 +586,27 @@ def lot_steps(item: dict, jalons: dict, events: Iterable[dict], *,
                 continue
             out.append(_row(step, since, now=now, critical=critical, reviewer=name))
 
-    if state not in ("merged", "promoted", "closed"):
+    if state not in ("merged", "promoted", "closed") and state not in HOLDS:
         step = step_of("blocked_freeze")
+        # #3333 : la dernière levée de retenue (état ou hold de pilote).
+        lifted = hold_release_ts(events)
+        for stamp in hold_releases or ():
+            if lifted is None or float(stamp) > lifted:
+                lifted = float(stamp)
         for fix in fixes or ():
             since = fix.get("blocked_ts")
             if since is None:
                 continue
+            extra = {}
+            if lifted is not None and lifted > float(since):
+                # #3333 : le temps parqué n'est pas un retard de la correction.
+                extra["hold_released_ts"] = round(lifted, 3)
+                since = lifted
             # #3288 : le débiteur est l'assigné ; `blocked_by` et `sha` servent
             # le texte de l'alerte, pas la cible de l'escalade.
             out.append(_row(step, since, now=now, critical=critical,
                             blocked_by=str(fix.get("blocked_by") or ""),
-                            sha=str(fix.get("sha") or "")))
+                            sha=str(fix.get("sha") or ""), **extra))
 
     handover = handover_ts(item, events)
     if handover is not None and state not in ("merged", "promoted", "closed"):

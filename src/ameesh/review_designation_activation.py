@@ -1148,6 +1148,18 @@ def due_fixes(db, agent: Optional[str] = None) -> list:
     return [row for row in fixes if row["name"].lower() == wanted]
 
 
+def owed_work(db) -> tuple[list, list]:
+    """`(pending, fixes)` of `_owed_read`, both halves in **one** read (#3333).
+
+    For a caller that needs the reviews still owed and the fixes due together
+    (the §9 pass: `green_verdict` and `blocked_freeze`): the rows are those of
+    `pending_reviews` and `due_fixes` without an agent filter, from a single
+    query instead of two. The read raises when the base cannot be read.
+    """
+    _lots, pending, fixes = _owed_read(db)
+    return pending, fixes
+
+
 def _note_unreadable(db, lot: int, state: str,
                      unreadable: Sequence[tuple]) -> None:
     """Journal unreadable designation marks once, without failing a freeze.
