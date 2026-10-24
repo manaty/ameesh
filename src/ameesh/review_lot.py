@@ -1303,8 +1303,17 @@ def class_at_merge(db, lot: int, *, item: Optional[dict] = None,
                     if rng is None:
                         rng = lot_measures.diff_range(candidate, tip, target or None)
                     if not rng:
-                        reason = "le dépôt %s ne contient pas le commit %s" % (
-                            candidate, tip[:12])
+                        # #3056 : un dépôt qui porte le commit doute sur sa
+                        # cible publiée (illisible, absente ou pointe non
+                        # récupérée), il ne « manque » pas le commit
+                        if lot_measures.has_commit(candidate, tip):
+                            reason = ("le dépôt %s porte le commit %s, mais aucune "
+                                      "cible publiée lisible ne situe sa fusion "
+                                      "(cible absente, ls-remote illisible ou pointe "
+                                      "non récupérée)" % (candidate, tip[:12]))
+                        else:
+                            reason = "le dépôt %s ne contient pas le commit %s" % (
+                                candidate, tip[:12])
                         continue
                     paths = lot_measures.diff_paths(candidate, *rng)
                 except lot_measures.UnprovenLotDiff as exc:
