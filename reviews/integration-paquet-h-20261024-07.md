@@ -160,7 +160,6 @@ deux verdicts de composition sur `36a835e46` restent acquis.
 
 | lot | motif |
 |---|---|
-| #3022 | verdicts 2/2 acquis sur `b40d6fde` (ameesh-cx1, mty-amh-impl-05 ok le 24/10) ; entre au paquet suivant, conflit `src/ameesh/mechanics.py` à résoudre par son composeur. |
 | #3318 | `freeze-after-verdict` : la tête gelée courante doit être refaite. |
 | #3324 | `verdicts-missing` : 1 seule famille, ameesh-cx1. |
 | #3186 | `freeze-after-verdict` ; conflit `src/ameesh/release_cutoff.py`. |
