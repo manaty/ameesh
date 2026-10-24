@@ -1496,6 +1496,112 @@ class UnreachableDesignationTest(_ActivationFixture, PgTestCase):
         self.assertEqual(sorted(r["name"] for r in self._designated()["reviewers"]),
                          ["r2", "r3"])
 
+    # -- #3377: a rendered verdict keeps its seat ---------------------------
+
+    def _verdict(self, actor, verdict="ok"):
+        """A verdict of `actor` on the frozen head (the seat is discharged)."""
+        return work.milestone(self.db, self.lot, "verdict", sha=self.frozen,
+                              actor=actor, verdict=verdict, repo=self.repo.root,
+                              after_commit=[])
+
+    def test_two_rendered_verdicts_are_not_reassigned_on_the_same_freeze(self):
+        # #3377 : cx3 (ici r1) perd son hôte APRÈS avoir rendu son avis sur la
+        # tête gelée. La relève ne remplace jamais un siège qui a voté : la
+        # désignation reste, aucun courrier ne part, aucune note de relève.
+        self.freeze()
+        self._verdict("r1")
+        self._verdict("r2")
+        self._move_to_lost("r1")
+        self._lose_host()
+        mails = len(self.mailbox())
+        report = act.reassign_unreachable(self.cfg, self.db)
+        self.assertEqual(report["examined"], 0, report)
+        self.assertEqual(report["reassigned"], 0, report)
+        self.assertEqual(len(self.mailbox()), mails)
+        self.assertFalse(self.notes(act.REASSIGN_PREFIX))
+        self.assertEqual(sorted(r["name"] for r in self._designated()["reviewers"]),
+                         ["r1", "r2"])
+        self.assertEqual(sorted(designated(work.get(self.db, self.lot))),
+                         ["r1", "r2"])
+        # `--apply` (le rejeu hors gel de la même tête) les garde aussi : la
+        # désignation enregistrée est rendue telle quelle, sans nouvel avis.
+        shown = act.reviewers(self.cfg, self.db, self.lot, apply=True)
+        self.assertEqual(shown["applied"]["state"], rd.DESIGNATED, shown)
+        self.assertEqual(sorted(r["name"] for r in shown["applied"]["reviewers"]),
+                         ["r1", "r2"])
+        self.assertEqual(len(self.mailbox()), mails)
+
+    def test_only_the_silent_seat_is_replaced_beside_a_rendered_verdict(self):
+        # #3377 : r2 a rendu son ok ; r1 (claude) est muet et injoignable.
+        # Seul le siège muet est remplacé, par r3 (même famille) : r2 reste
+        # désigné même si la sélection, seule, préférerait r4 (codex moins
+        # chargé). Aucune nouvelle demande n'est déposée pour r2.
+        self._agent("r3", "claude")
+        self._agent("r4", "codex")
+        self.freeze()
+        self._verdict("r2")
+        for index in range(3):
+            extra = work.add(self.db, title="charge r2 %d" % index, app="ameesh",
+                             assignee="r2")
+            work.move(self.db, extra["id"], "build")
+        self._move_to_lost("r1")
+        self._lose_host()
+        before = len(self.mailbox())
+        report = act.reassign_unreachable(self.cfg, self.db)
+        self.assertEqual(report["examined"], 1, report)
+        self.assertEqual(report["reassigned"], 1, report)
+        noted = self._designated()
+        self.assertEqual(noted["state"], rd.DESIGNATED, noted)
+        self.assertEqual(sorted(r["name"] for r in noted["reviewers"]),
+                         ["r2", "r3"], noted)
+        column = self.db.query(
+            "SELECT reviewers FROM work_items WHERE id = %s", (self.lot,))[0]["reviewers"]
+        self.assertEqual(sorted(column), ["r2", "r3"])
+        after = self.mailbox()[before:]
+        self.assertEqual([(m["recipient"], m["kind"]) for m in after],
+                         [("r3", "request")], after)
+        self.assertIn("r1 (host %s: claims closed)" % self.LOST,
+                      self.notes(act.REASSIGN_PREFIX)[-1])
+
+    def test_a_waiting_reassignment_keeps_the_rendered_seat(self):
+        # #3377 : aucune famille de remplacement (r3 absent) : la relève
+        # attend, mais le siège qui a voté (r2) reste désigné et dans la
+        # colonne. Le journal ne parle pas d'une « tête précédente » : la
+        # tête n'a pas bougé.
+        self.freeze()
+        self._verdict("r2")
+        self._move_to_lost("r1")
+        self._lose_host()
+        report = act.reassign_unreachable(self.cfg, self.db)
+        self.assertEqual(report["waiting"], 1, report)
+        noted = self._designated()
+        self.assertEqual(noted["state"], rd.WAITING, noted)
+        self.assertEqual(noted["reviewers"], [])
+        column = self.db.query(
+            "SELECT reviewers FROM work_items WHERE id = %s", (self.lot,))[0]["reviewers"]
+        self.assertEqual(list(column), ["r2"])
+        self.assertFalse([note for note in self.notes()
+                          if "cleared (previous head)" in note])
+        self.assertTrue([note for note in self.notes()
+                         if "superseded on the same head" in note])
+        # La capacité revient (r3, claude) : le rejeu hors gel retrouve le
+        # siège gardé r2 par la marque d'attente et ne redésigne que le siège
+        # muet ; aucune seconde demande n'est déposée pour r2.
+        self._agent("r3", "claude")
+        before = len(self.mailbox())
+        shown = act.reviewers(self.cfg, self.db, self.lot, apply=True)
+        self.assertEqual(shown["applied"]["state"], rd.DESIGNATED, shown)
+        self.assertEqual(sorted(r["name"] for r in shown["applied"]["reviewers"]),
+                         ["r2", "r3"], shown)
+        after = self.mailbox()[before:]
+        self.assertEqual([(m["recipient"], m["kind"]) for m in after],
+                         [("r3", "request")], after)
+        # Le siège gardé occupe le rang 1 : la nouvelle demande est le 2e avis.
+        self.assertIn("review 2/2", after[0]["body"])
+        column = self.db.query(
+            "SELECT reviewers FROM work_items WHERE id = %s", (self.lot,))[0]["reviewers"]
+        self.assertEqual(sorted(column), ["r2", "r3"])
+
 
 class PendingLoadTest(_ActivationFixture, PgTestCase):
     """#3004: the load of a reviewer counts the reviews they still owe.

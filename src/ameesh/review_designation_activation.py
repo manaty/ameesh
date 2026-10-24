@@ -66,7 +66,11 @@ an older pilot installation is no obstacle. #3328: the same runner pass
 reattributes a seat whose designated reviewer became unreachable (host closed,
 stopped/dead): the same freeze is replayed with the host evidence, the move is
 journaled once per (freeze, unreachable names), and the pilot gets the capacity
-alert when no replacement family can be designated.
+alert when no replacement family can be designated. #3377: that relief never
+moves a seat that **already rendered its verdict** on the frozen head
+(`_same_freeze`, ok or blocked): only silent seats are replaced, one by one,
+and a rendered seat survives even a waiting outcome so its opinion keeps
+counting for the gate.
 """
 from __future__ import annotations
 
@@ -1787,7 +1791,82 @@ def _lock_current_freeze(db, lot: int, freeze: Mapping) -> bool:
         return False
 
 
-def _sync_reviewers(db, item: Mapping, freeze: Mapping, names, *, text: str = "") -> None:
+def _verdicts_on_freeze(db, lot: int, frozen_sha: str) -> set:
+    """The primary actor names that rendered a verdict on this exact head.
+
+    `_same_freeze` reads the milestone SHA: a full or abbreviated commit id is
+    the same head, a verdict on an earlier head is not (#3377). A `blocked`
+    verdict counts — the reviewer has rendered its opinion, the fix is the
+    assignee's (`_owed_read`, #3288).
+    """
+    rows = storage.of(db).work.milestones(int(lot), pg.MILESTONES)
+    rendered: set = set()
+    for row in rows or ():
+        if str((row or {}).get("kind") or "") != "verdict":
+            continue
+        if not rd._same_freeze(frozen_sha, str((row or {}).get("sha") or "")):
+            continue
+        name = str((row or {}).get("actor") or "").strip().lower()
+        if name:
+            rendered.add(name)
+    return rendered
+
+
+def _settled_reviewers(db, item: Mapping, freeze: Mapping) -> list:
+    """The reviewers of this freeze who already rendered a verdict.
+
+    #3377: a relief (unreachable host, stopped/dead reviewer) replaces only a
+    seat that has **not** voted. A seat whose verdict names the frozen head is
+    kept: its opinion counts for the gate, so moving it would erase an acquired
+    verdict. The seat must still be in the reviewer column (a pilot's removal is
+    final, #3311/#3312) and must have been designated on this freeze, by any of
+    its marks (a selection, or a carried report): a `waiting` mark names nobody,
+    but the seat kept from the earlier selection of the same freeze still
+    counts. An unreadable verdict read keeps every such seat (fail closed: never
+    move a possible verdict on a doubt); the next pass retries.
+    """
+    lot = int((item or {}).get("id") or 0)
+    freeze_id = int((freeze or {}).get("id") or 0)
+    frozen_sha = str((freeze or {}).get("sha") or "").strip().lower()
+    if not lot or not freeze_id or not frozen_sha:
+        return []
+    column = {str(name or "").strip()
+              for name in (item or {}).get("reviewers") or () if str(name or "").strip()}
+    if not column:
+        return []
+    try:
+        rendered = _verdicts_on_freeze(db, lot, frozen_sha)
+    except Exception:  # noqa: BLE001 - unreadable verdicts: keep every seat
+        rendered = None
+    marks = _marks(db, lot, freeze_id=freeze_id,
+                   since_ts=float((freeze or {}).get("at_ts") or 0.0))
+    seated: list = []
+    if marks is None:
+        # Illisible : on ne prouve pas l'absence de verdict, on garde les noms
+        # de la colonne qui ont voté (le prochain passage relira).
+        seated = [{"name": name, "family": ""} for name in column]
+    else:
+        for _row_id, _kind, noted, _ts in marks:
+            for reviewer in (noted or {}).get("reviewers") or ():
+                name = str((reviewer or {}).get("name") or "").strip()
+                if name and name in column:
+                    seated.append({"name": name,
+                                   "family": str((reviewer or {}).get("family") or "")})
+    settled = []
+    seen: set = set()
+    for reviewer in seated:
+        name = reviewer["name"]
+        if name in seen:
+            continue
+        if rendered is not None and name.lower() not in rendered:
+            continue
+        seen.add(name)
+        settled.append(reviewer)
+    return settled
+
+
+def _sync_reviewers(db, item: Mapping, freeze: Mapping, names, *, text: str = "",
+                    keep=()) -> None:
     """Makes the automatic designation visible to the gate and to progress.
 
     The journal mark is the authoritative record, but the reviewers read by
@@ -1798,6 +1877,11 @@ def _sync_reviewers(db, item: Mapping, freeze: Mapping, names, *, text: str = ""
     late carry therefore removes the selection it supersedes, even in the same
     freeze. A name that never appeared in a mark is a manual designation and is
     preserved. A manual waiver (`-none`) is never overridden.
+
+    `keep` names the seats that must survive a waiting outcome (#3377): a
+    reviewer who already rendered a verdict on this frozen head is not moved
+    by a relief, even when no replacement family is available and the mark is
+    a `waiting` one that names nobody.
 
     `text`, when given, is the journal line of this sync (a verdict carry keeps
     the reported reviewers instead of designating, #2487)."""
@@ -1821,41 +1905,62 @@ def _sync_reviewers(db, item: Mapping, freeze: Mapping, names, *, text: str = ""
         return
     names = [str(name or "").strip() for name in names or ()]
     names = [name for name in names if name]
+    kept_names = [str((row or {}).get("name") or "").strip()
+                  for row in keep or ()]
+    # Un siège retiré par le pilote ne revient pas par la relève : seuls les
+    # noms encore présents dans la colonne sont maintenus.
+    kept_names = [name for name in kept_names if name and name in current]
     marks = _marks(db, lot)
     if marks is None:
         return                    # journal illisible : aucun nom retiré
     effective = _effective_mark(db, lot, freeze_id) if names else None
     keep_marks = {effective[0]} if effective else set()
-    retired = set()
+    # #3377 : la note ne dit « tête précédente » que si un nom retiré vient
+    # d'un AUTRE gel. Un rejeu du même gel (relève, attente) supersède une
+    # désignation de la même tête ; il ne la présente pas comme périmée.
+    retired_same: set = set()
+    retired_previous: set = set()
     for row_id, _kind, noted, _ts in marks:
         if row_id in keep_marks:
             continue
+        try:
+            noted_freeze = int((noted.get("freeze") or {}).get("id") or 0)
+        except (TypeError, ValueError):
+            noted_freeze = 0
+        retired = retired_previous if noted_freeze != freeze_id else retired_same
         for reviewer in noted.get("reviewers") or ():
             name = str((reviewer or {}).get("name") or "").strip()
             if name:
                 retired.add(name)
-    keep = [name for name in current if name not in retired]
+    survivors = [name for name in current
+                 if name not in retired_same and name not in retired_previous]
     wanted = [str((reviewer or {}).get("name") or "").strip()
               for reviewer in (effective[2].get("reviewers") or () if effective else ())]
     wanted.extend(names)
+    wanted.extend(kept_names)
     for name in wanted:
-        if name and name not in keep:
-            keep.append(name)
-    if keep == current:
+        if name and name not in survivors:
+            survivors.append(name)
+    if survivors == current:
         return
     db.query(
         "UPDATE work_items SET reviewers ="
         " ARRAY(SELECT jsonb_array_elements_text(%s::jsonb)) WHERE id = %s"
         " RETURNING reviewers",
-        (json.dumps(keep), lot))
+        (json.dumps(survivors), lot))
     if names:
         text = text or "reviewers designated automatically at freeze #%d: %s" % (
             freeze_id, ", ".join(names))
     elif text:
         pass
-    elif retired:
+    elif retired_previous:
         text = ("automatic reviewer designation of freeze #%d cleared"
-                " (previous head): %s" % (freeze_id, ", ".join(sorted(retired))))
+                " (previous head): %s"
+                % (freeze_id, ", ".join(sorted(retired_previous | retired_same))))
+    elif retired_same:
+        text = ("automatic reviewer designation of freeze #%d superseded"
+                " on the same head: %s"
+                % (freeze_id, ", ".join(sorted(retired_same))))
     else:
         return
     storage.of(db).work.note(lot, str((item or {}).get("state") or ""), text, SENDER)
@@ -1919,7 +2024,7 @@ class _ForcedPort:
         return self.port.commit(lot, force=True, **kwargs)
 
 
-def _selection(inputs: Inputs, port, *, force: bool = False) -> dict:
+def _selection(inputs: Inputs, port, *, force: bool = False, keep=()) -> dict:
     """The `apply` call, shared by the hook and the recovery path."""
     if force:
         port = _ForcedPort(port)
@@ -1931,7 +2036,8 @@ def _selection(inputs: Inputs, port, *, force: bool = False) -> dict:
         notify=inputs.notify, unknown_authors=inputs.unknown_authors,
         families=inputs.policy.families,
         already=inputs.manual_seats, fixers=inputs.correctors,
-        required=inputs.policy.required, advances=inputs.advances)
+        required=inputs.policy.required, advances=inputs.advances,
+        keep=keep)
 
 
 def carried_plan(cfg, db, lot: int, sha: str) -> Optional[dict]:
@@ -2030,7 +2136,7 @@ def _carried_in_transaction(tx, item: Mapping, freeze: Mapping,
 
 def _manual_outcome(db, item: Mapping, freeze: Mapping, manual: Sequence[str], *,
                     waiver: bool = False, unknown: str = "",
-                    note: bool = True) -> dict:
+                    note: bool = True, keep=()) -> dict:
     """The explicit manual no-op: keep the manual reviewers, add nobody (#2627).
 
     The note says why no automatic reviewer was added. The column is synced
@@ -2063,14 +2169,14 @@ def _manual_outcome(db, item: Mapping, freeze: Mapping, manual: Sequence[str], *
         why = "manual reviewer designation"
     if note:
         storage.of(db).work.note(lot, str((item or {}).get("state") or ""), text, SENDER)
-    _sync_reviewers(db, item, freeze, [])
+    _sync_reviewers(db, item, freeze, [], keep=keep)
     return {"state": "manual", "reviewers": [], "freeze": dict(freeze or {}),
             "why": why}
 
 
 def _manual_unavailable(cfg, tx, item: Mapping, freeze: Mapping,
                         manual: Sequence[str], threads: list, why: str, *,
-                        silent: bool = False) -> dict:
+                        silent: bool = False, keep=()) -> dict:
     """Keep the manual reviewers when the selection cannot compute coverage.
 
     #2637: with manual seats present, an unavailable policy or a `prepare`
@@ -2081,8 +2187,8 @@ def _manual_unavailable(cfg, tx, item: Mapping, freeze: Mapping,
     stays mail-free, and its manual note carries the unknown coverage reason.
     """
     if silent:
-        return _manual_outcome(tx, item, freeze, manual, unknown=why)
-    out = _manual_outcome(tx, item, freeze, manual, unknown=why, note=False)
+        return _manual_outcome(tx, item, freeze, manual, unknown=why, keep=keep)
+    out = _manual_outcome(tx, item, freeze, manual, unknown=why, note=False, keep=keep)
     coverage = ("manual reviewer(s) kept (%s); their coverage of the required"
                 " review(s) is unknown: %s" % (", ".join(manual), why))
     notify = _notify(cfg, tx, str((item or {}).get("app") or ""),
@@ -2386,7 +2492,7 @@ def _stale(freeze: Mapping, why: str = "") -> dict:
 
 
 def designate(cfg, db, lot: int, *, freeze: Optional[Mapping] = None,
-              force: bool = False) -> dict:
+              force: bool = False, relief: bool = False) -> dict:
     """Replays the latest freeze outside the hook (recovery, CLI).
 
     The selection's mark, its mails and the reviewer column are written in ONE
@@ -2401,6 +2507,15 @@ def designate(cfg, db, lot: int, *, freeze: Optional[Mapping] = None,
     doivent être désignés). Sans lui, une désignation reportée déjà écrite est
     rendue telle quelle, et un plan de report encore valable garde les
     relecteurs reportés sans courrier.
+
+    #3377 : sur la même tête, un rejeu garde tout siège qui a déjà rendu son
+    verdict (`_settled_reviewers`) : seuls les sièges muets peuvent être
+    remplacés, et le siège gardé survit même à une attente (`_sync_reviewers`
+    `keep`), pour que son avis acquis continue de compter à la porte. Un
+    `force` ordinaire (#2487, reprise après un report tardif) n'est PAS une
+    relève : il supersède la marque reportée et rejoue la sélection réelle.
+    `relief=True` (la relève d'un siège injoignable, #3328/#3377) applique la
+    règle des sièges rendus au rejeu forcé.
     """
     item = work.get(db, int(lot)) or {"id": int(lot), "state": "", "title": "",
                                       "app": ""}
@@ -2443,6 +2558,11 @@ def designate(cfg, db, lot: int, *, freeze: Optional[Mapping] = None,
                 if not _lock_current_freeze(tx, int(lot), freeze):
                     return _stale(freeze)
                 return _carried_in_transaction(tx, item, freeze, plan)
+    # #3377 : les sièges qui ont déjà voté sur cette tête ne sont jamais
+    # déplacés par une relève ; seuls les muets peuvent être redésignés. Un
+    # `force` ordinaire (#2487) reste une reprise de sélection, pas une relève.
+    keep = (_settled_reviewers(db, item, freeze)
+            if (relief or not force) else [])
     threads = _threads()
     checkpoint = len(threads)
     try:
@@ -2454,7 +2574,7 @@ def designate(cfg, db, lot: int, *, freeze: Optional[Mapping] = None,
                         return _stale(freeze)
                     out = _manual_unavailable(cfg, tx, item, freeze, manual,
                                               threads, inputs.why,
-                                              silent=inputs.silent)
+                                              silent=inputs.silent, keep=keep)
                 _drain(db, threads)
                 return out
             if not inputs.silent:
@@ -2464,7 +2584,7 @@ def designate(cfg, db, lot: int, *, freeze: Optional[Mapping] = None,
                     if not _lock_current_freeze(tx, int(lot), freeze):
                         return _stale(freeze)
                     _note_unavailable(tx, item, freeze, inputs.why, threads, notify)
-                    _sync_reviewers(tx, item, freeze, [])
+                    _sync_reviewers(tx, item, freeze, [], keep=keep)
                 _drain(db, threads)
             return {"state": "unavailable", "reviewers": [], "freeze": freeze,
                     "why": inputs.why}
@@ -2478,15 +2598,17 @@ def designate(cfg, db, lot: int, *, freeze: Optional[Mapping] = None,
                 if not _lock_current_freeze(tx, int(lot), freeze):
                     return _stale(freeze)
                 _note_none(tx, item, freeze, why)
-                _sync_reviewers(tx, item, freeze, [])
+                _sync_reviewers(tx, item, freeze, [], keep=keep)
             return {"state": rd.NONE, "required": 0, "reviewers": [],
                     "freeze": freeze, "why": why}
         with db.transaction() as tx:
             out = _selection(inputs, pg.PgPort(tx, after_commit=threads,
-                                                at_freeze=False), force=force)
+                                                at_freeze=False), force=force,
+                             keep=keep)
             names = ([r.get("name") for r in out.get("reviewers") or ()]
                      if out.get("state") == rd.DESIGNATED else [])
-            _sync_reviewers(tx, item, freeze, names)
+            _sync_reviewers(tx, item, freeze, names,
+                            keep=out.get("kept") or keep)
             try:
                 _notify_superseded_blocks(tx, item, freeze, out, threads)
             except Exception:  # noqa: BLE001 - une notification ne perd rien
@@ -2506,7 +2628,7 @@ def designate(cfg, db, lot: int, *, freeze: Optional[Mapping] = None,
             _note_unavailable(tx, item, freeze, str(exc), threads,
                               _notify(cfg, db, str(item.get("app") or ""),
                                       registry.overview(db)))
-            _sync_reviewers(tx, item, freeze, [])
+            _sync_reviewers(tx, item, freeze, [], keep=keep)
         _drain(db, threads)
         return {"state": "unavailable", "reviewers": [], "freeze": freeze,
                 "why": str(exc)}
@@ -2851,6 +2973,13 @@ def reassign_unreachable(cfg, db, *, limit: int = RETRY_LIMIT) -> dict:
     that later dies is a new loss and is handled again; a pass that cannot
     replace the same names does not loop.
 
+    #3377 : a relief **never moves a seat that already rendered its verdict on
+    the frozen head** (`_same_freeze`, `ok` or `blocked`): only silent seats
+    are replaced, one by one, and the others stay in the mark and in the
+    reviewer column (a waiting outcome keeps them too). A lot whose every
+    unreachable seat has voted is not examined at all: no forced replay, no
+    new mail, no relief note.
+
     The pass reads only machine evidence (registry, host lifecycle, journal)
     and never raises: the runner logs the summary. It does not touch a manual
     designation, a name the pilot already removed from the reviewer column, a
@@ -2929,11 +3058,17 @@ def reassign_unreachable(cfg, db, *, limit: int = RETRY_LIMIT) -> dict:
             dead = []
             column = {str(name or "").strip()
                       for name in (row.get("reviewers") or ()) if str(name or "").strip()}
+            # #3377 : relever un siège qui a déjà rendu son verdict sur cette
+            # tête effacerait un avis acquis. Seuls les sièges MUETS et
+            # injoignables sont remplacés ; les autres restent à leur place.
+            rendered = _verdicts_on_freeze(db, lot, str(freeze.get("sha") or ""))
             for reviewer in (mark[2] or {}).get("reviewers") or ():
                 name = str((reviewer or {}).get("name") or "").strip()
                 if not name or name not in column:
                     # The pilot already removed the seat from the column: the
                     # mark is history, not a live designation to move.
+                    continue
+                if name.lower() in rendered:
                     continue
                 why = _unreachable_reviewer(by_name.get(name), closed)
                 if why:
@@ -2949,7 +3084,8 @@ def reassign_unreachable(cfg, db, *, limit: int = RETRY_LIMIT) -> dict:
                 out["skipped"] += 1
                 continue
             attempted += 1
-            result = designate(cfg, db, lot, freeze=freeze, force=True)
+            result = designate(cfg, db, lot, freeze=freeze, force=True,
+                               relief=True)
         except Exception as exc:  # noqa: BLE001 - one lot never stops the pass
             out["errors"].append("#%d: %s: %s"
                                  % (lot, type(exc).__name__, str(exc)[:160]))

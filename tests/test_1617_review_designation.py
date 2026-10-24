@@ -434,6 +434,47 @@ class SelectionTest(unittest.TestCase):
         self.assertEqual(len(candidates(*rows, project="ameesh")), 1)
         self.assertEqual(len(candidates(*rows, project="")), 3)
 
+    def test_a_kept_seat_that_voted_is_never_replaced(self):
+        # #3377 : le siège gardé (verdict déjà rendu) couvre son avis, reste
+        # dans la désignation et sa famille est fermée au nouveau siège.
+        pool = candidates(
+            row("claude-one", harness="claude", session="claude"),
+            row("codex-one", harness="codex", session="codex"),
+            row("codex-two", harness="codex", session="codex"),
+        )
+        picked = rd.select(families=FAMILIES, required=2,
+                           authors=[{"name": "impl-02", "family": "deepseek"}],
+                           candidates=pool,
+                           keep=[{"name": "codex-one", "family": "codex"}])
+        self.assertEqual(picked["state"], rd.DESIGNATED)
+        self.assertEqual([r["name"] for r in picked["reviewers"]],
+                         ["codex-one", "claude-one"])
+        self.assertEqual([r["name"] for r in picked["kept"]], ["codex-one"])
+        # Les deux sièges sont déjà rendus : aucune nouvelle désignation.
+        full = rd.select(families=FAMILIES, required=2,
+                         authors=[{"name": "impl-02", "family": "deepseek"}],
+                         candidates=pool,
+                         keep=[{"name": "claude-one", "family": "claude"},
+                               {"name": "codex-one", "family": "codex"}])
+        self.assertEqual(full["state"], rd.DESIGNATED)
+        self.assertEqual([r["name"] for r in full["reviewers"]],
+                         ["claude-one", "codex-one"])
+        self.assertEqual(full["missing"], 0)
+
+    def test_a_waiting_selection_still_returns_its_kept_seats(self):
+        # #3377 : aucune famille de remplacement, mais le siège qui a voté est
+        # rendu dans `kept` : l'appelant le maintient dans la colonne même si
+        # la marque d'attente ne nomme personne.
+        picked = rd.select(families=FAMILIES, required=2,
+                           authors=[{"name": "impl-02", "family": "deepseek"}],
+                           candidates=candidates(
+                               row("codex-one", harness="codex", session="codex")),
+                           keep=[{"name": "codex-one", "family": "codex"}])
+        self.assertEqual(picked["state"], rd.WAITING)
+        self.assertEqual(picked["reviewers"], [])
+        self.assertEqual([r["name"] for r in picked["kept"]], ["codex-one"])
+        self.assertEqual(picked["missing"], 1)
+
 
 class NexlinkPolicyTest(unittest.TestCase):
     """La politique est par projet : Nexlink a ses propres règles (PR85)."""
