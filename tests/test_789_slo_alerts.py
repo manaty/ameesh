@@ -869,6 +869,32 @@ class CIHeadTest(unittest.TestCase):
                 self.assertIsNone(exploitation._ci_green_on_head(
                     self._St(rows), {"id": 1, "branch_head": head}, []))
 
+    def test_un_workflow_annule_n_est_pas_masque_par_un_autre_vert(self):
+        # B1 (#3341, relecture cx1) : chaque workflow retenu doit être vert et
+        # conclu. Un succès de `tests.yml` ne vaut pas un vert si `sql.yml` est
+        # annulé sur la même tête.
+        head = "7" * 40
+        rows = [self._run(head, "success", 100.0, run_id=1, workflow="tests.yml"),
+                self._run(head, "cancelled", 200.0, run_id=2, workflow="sql.yml")]
+        self.assertIsNone(exploitation._ci_green_on_head(
+            self._St(rows), {"id": 1, "branch_head": head}, []))
+        rows[1] = self._run(head, "success", 200.0, run_id=2, workflow="sql.yml")
+        self.assertEqual(exploitation._ci_green_on_head(
+            self._St(rows), {"id": 1, "branch_head": head}, []), 200.0)
+
+    def test_un_nouveau_run_prime_sur_un_ancien_run_relance(self):
+        # B2 (#3341, relecture cx1) : l'attempt est local au run_id. Un ancien
+        # run_id=1 relancé (attempt=2, vert) ne doit pas masquer le nouveau
+        # run_id=2 (attempt=1, encore en cours) : la chronologie est le run_id.
+        head = "8" * 40
+        rows = [self._run(head, "success", 100.0, run_id=1, attempt=2),
+                self._run(head, "running", None, run_id=2, attempt=1)]
+        self.assertIsNone(exploitation._ci_green_on_head(
+            self._St(rows), {"id": 1, "branch_head": head}, []))
+        rows[1] = self._run(head, "success", 200.0, run_id=2, attempt=1)
+        self.assertEqual(exploitation._ci_green_on_head(
+            self._St(rows), {"id": 1, "branch_head": head}, []), 200.0)
+
     def test_deux_workflows_le_vert_est_la_derniere_conclusion(self):
         head = "f" * 40
         rows = [self._run(head, "success", 100.0, run_id=1, workflow="tests.yml"),
