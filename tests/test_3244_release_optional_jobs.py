@@ -82,6 +82,71 @@ class OptionalJobReadingTest(unittest.TestCase):
         self.assertTrue(any("suite macOS complète (failure;" in name
                             for name in reading["negative"]))
 
+    def test_only_a_newer_job_success_clears_an_earlier_macos_failure(self):
+        for separate in (True, False):
+            for conclusion in (None, "cancelled", "timed_out", "startup_failure",
+                               "skipped", "success"):
+                data = suite(mac="success")
+                if separate:
+                    old = fixture._run(700, [fixture._job("suite macOS complète", "failure")],
+                                       workflow="macos", conclusion="failure")
+                    new = fixture._run(800, [fixture._job(
+                        "suite macOS complète", conclusion or "",
+                        "completed" if conclusion else "in_progress")],
+                        workflow="macos", conclusion=conclusion or "")
+                else:
+                    old = suite(mac="failure", run_id=700)["runs"][0]
+                    new = suite(mac=conclusion, run_id=800)["runs"][0]
+                for history in ([old, new], [new, old]):
+                    with self.subTest(separate=separate, conclusion=conclusion,
+                                      order=[run["id"] for run in history]):
+                        candidate = {"runs": data["runs"] + history}
+                        reading = self.read(candidate, {**rollup(), "negative": []})
+                        repaired = conclusion == "success"
+                        self.assertEqual(reading["green"], repaired, reading)
+                        self.assertEqual(release._suite_proof(data, candidate) is not None,
+                                         repaired)
+                        self.assertEqual(release._full_suite_run(candidate) is not None, repaired)
+                        if not repaired:
+                            self.assertIsNone(release._suite_proof(candidate, data))
+                            self.assertTrue(any("actions/runs/700" in text
+                                                for text in reading["negative"]), reading)
+
+    def test_a_different_successful_job_does_not_clear_the_failure(self):
+        data = suite(mac="success")
+        data["runs"] += [fixture._run(700, [
+            fixture._job("suite macOS complète", "failure"),
+            fixture._job("lint macOS", "failure"),
+        ], workflow="macos", conclusion="failure"), fixture._run(800, [
+            fixture._job("suite macOS complète"),
+            fixture._job("lint macOS", "cancelled"),
+        ], workflow="macos", conclusion="cancelled")]
+        reading = self.read(data)
+        self.assertEqual(reading["negative"], [
+            "lint macOS (failure; https://github.com/manaty/ameesh/actions/runs/700)"])
+        self.assertIsNone(release._suite_proof(suite(mac="success"), data))
+
+    def test_a_successful_repair_is_not_undone_by_a_later_non_conclusion(self):
+        data = suite(mac="success")
+        data["runs"] += [fixture._run(run_id, [fixture._job(
+            "suite macOS complète", conclusion)], workflow="macos", conclusion=conclusion)
+            for run_id, conclusion in ((700, "failure"), (750, "success"), (800, "cancelled"))]
+        reading = self.read(data)
+        self.assertTrue(reading["green"], reading)
+        self.assertEqual(reading["negative"], [])
+        self.assertIsNotNone(release._suite_proof(suite(mac="success"), data))
+
+    def test_a_newer_packet_suite_can_repair_the_same_full_suite_jobs(self):
+        data = suite(mac="failure", tests="failure", run_id=700)
+        new = suite(mac="success", run_id=800)["runs"][0]
+        new["workflow"] = "paquet"
+        for job in new["jobs"]:
+            job["name"] = "suite complète du paquet / " + job["name"]
+        data["runs"].append(new)
+        self.assertTrue(self.read(data)["green"])
+        self.assertEqual(release._full_suite_run(data)["id"], 800)
+        self.assertIsNotNone(release._suite_proof(suite(mac="success"), data))
+
     def test_separate_macos_workflow_never_certifies_a_non_conclusive_aggregate(self):
         data = suite(mac="success", tests="cancelled")
         data["runs"].append(fixture._run(700, [fixture._job(

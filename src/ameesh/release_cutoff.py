@@ -1098,7 +1098,12 @@ def _suite_attempt(suite: dict) -> dict | None:
 
 
 def _suite_runs(suite: dict, attempt: dict | None) -> list[dict]:
-    """The suite and latest auxiliary jobs; no superseded suite jobs."""
+    """Latest jobs, plus failures not repaired by a newer job success.
+
+    A cancelled or unfinished retry supplies no evidence that an earlier
+    failure was fixed. Historical runs contribute only those failures,
+    never successful jobs a newer suite omitted from its proof.
+    """
     latest = {}
     for run in suite.get("runs", ()):
         if run.get("conclusion") == "skipped":
@@ -1109,7 +1114,31 @@ def _suite_runs(suite: dict, attempt: dict | None) -> list[dict]:
     auxiliaries = [run for run in latest.values()
                    if run is not attempt and not _aggregates(run)
                    and (attempt is None or run.get("workflow") != attempt.get("workflow"))]
-    return ([attempt] if attempt is not None else []) + auxiliaries
+    selected = ([attempt] if attempt is not None else []) + auxiliaries
+
+    def source(run, job):
+        workflow, name = run.get("workflow"), job["name"]
+        if workflow in ("tests", "paquet"):
+            workflow = "tests"
+            for prefix in _JOB_PREFIXES:
+                name = name.removeprefix(prefix)
+            if name == "tests (dispatch)":
+                name = "tests"
+        return workflow, name
+
+    repaired = set()
+    for run in sorted(suite.get("runs", ()), key=lambda row: int(row["id"]), reverse=True):
+        if run.get("conclusion") == "skipped":
+            continue
+        failures = [job for job in run.get("jobs", ())
+                    if _job_negative(job) and source(run, job) not in repaired]
+        if run not in selected and failures:
+            selected.append(dict(run, jobs=failures))
+        groups = {}
+        for job in run.get("jobs", ()):
+            groups.setdefault(source(run, job), []).append(job)
+        repaired.update(key for key, jobs in groups.items() if all(_job_success(job) for job in jobs))
+    return selected
 
 
 def _job_negative(job: dict) -> bool:
@@ -1129,7 +1158,7 @@ def _full_suite_run(suite: dict) -> dict | None:
     run = _suite_attempt(suite)
     if run is None or not _aggregate_success(run):
         return None
-    if any(_job_negative(job) for job in run["jobs"]):
+    if any(_job_negative(job) for evidence in _suite_runs(suite, run) for job in evidence["jobs"]):
         return None
     return run
 
