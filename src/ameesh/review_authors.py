@@ -601,6 +601,60 @@ def _hunks_survive(repo: str, head: str, sha: str, path: str,
                for at in range(len(now) - len(block) + 1))
 
 
+def _unique_positions(repo: str, rev: str, path: str, cache: dict):
+    """`{ligne dépouillée: position}` des lignes significatives qui
+    n'apparaissent qu'une fois dans `path` à `rev`, ou None si illisible."""
+    key = ("unique", rev, path)
+    if key not in cache:
+        text = _raw_out(repo, "show", "%s:%s" % (rev, path))
+        positions = None
+        if text is not None:
+            counts: dict = {}
+            first: dict = {}
+            for at, line in enumerate(str(text).splitlines()):
+                value = line.strip()
+                counts[value] = counts.get(value, 0) + 1
+                first.setdefault(value, at)
+            positions = {value: at for value, at in first.items()
+                         if counts[value] == 1 and _meaningful_line(value)}
+        cache[key] = positions
+    return cache[key]
+
+
+def _order_survives(repo: str, head: str, sha: str, path: str,
+                    moved: Sequence[str], cache: dict) -> Optional[bool]:
+    """Le réordre de `sha` dans `path` subsiste-t-il dans l'ordre de la tête ?
+
+    #3003 : le hunk tel quel (`_hunks_survive`) exige ses lignes d'un seul
+    tenant ; une ligne insérée par la tête entre deux lignes réordonnées le
+    défait alors que le réordre subsiste. Ici, seul l'ordre relatif compte :
+    pour chaque ligne déplacée, les paires dont le commit a inversé l'ordre
+    (parent → commit) ; le réordre subsiste si la tête garde l'ordre du commit
+    pour l'une d'elles. Seules les lignes significatives présentes une seule
+    fois dans le parent, le commit et la tête ont une position sûre. None :
+    rien à décider (chemin illisible, ligne répétée ou absente, aucune paire
+    inversée) — le hunk tel quel reste alors la preuve."""
+    before = _unique_positions(repo, str(sha) + "^", path, cache)
+    after = _unique_positions(repo, str(sha), path, cache)
+    now = _unique_positions(repo, head, path, cache)
+    if before is None or after is None or now is None:
+        return None
+    decided = None
+    for line in {str(row).strip() for row in moved}:
+        if line not in before or line not in after or line not in now:
+            continue
+        for other, at in after.items():
+            if other == line or other not in before or other not in now:
+                continue
+            ahead = after[line] < at
+            if (before[line] < before[other]) == ahead:
+                continue                    # paire que le commit n'inverse pas
+            if (now[line] < now[other]) == ahead:
+                return True
+            decided = False
+    return decided
+
+
 def _any_line_in_head(repo: str, head: str, lines: Sequence[str]) -> bool:
     """Une des lignes apparaît-elle **quelque part** dans l'arbre de la tête ?
 
@@ -709,7 +763,9 @@ def _commit_survives(repo: str, head: str, sha: str, cache: dict,
     aux lignes retirées, puis aux lignes copiées, cherchées à leur seul chemin
     (un chemin absent conserve l'auteur) : une copie retirée ne garde pas son
     correcteur (B1) ; un réordre ne subsiste que si la tête garde un de ses
-    hunks tel quel (#2994). Un diff sans ligne significative conserve l'auteur."""
+    hunks tel quel (#2994), ou l'ordre d'une paire de lignes qu'il inverse,
+    même séparées par une ligne insérée (#3003). Un diff sans ligne
+    significative conserve l'auteur."""
     parsed = _commit_lines(repo, sha)
     if parsed is None:
         return True
@@ -770,11 +826,15 @@ def _commit_survives(repo: str, head: str, sha: str, cache: dict,
                 return True
         # #2994 : un réordre (ou une réindentation) dans le même fichier
         # n'ajoute aucune occurrence ; sa trace est le hunk tel que le commit
-        # l'a laissé, s'il subsiste dans la tête.
-        reordered = {path for path, row in copied
-                     if path in removed_from.get(row.strip(), set())}
-        return any(_hunks_survive(repo, head, sha, path, cache)
-                   for path in sorted(reordered))
+        # l'a laissé, s'il subsiste dans la tête. #3003 : ou l'ordre relatif
+        # de ses lignes, quand la tête a inséré une ligne au milieu.
+        reordered: dict = {}
+        for path, row in copied:
+            if path in removed_from.get(row.strip(), set()):
+                reordered.setdefault(path, []).append(row)
+        return any(_order_survives(repo, head, sha, path, rows, cache)
+                   or _hunks_survive(repo, head, sha, path, cache)
+                   for path, rows in sorted(reordered.items()))
     return not removed
 
 
