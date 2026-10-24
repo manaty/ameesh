@@ -123,13 +123,7 @@ def live_pid():
         pass
     lien = cible / 'bin/python3'
     if not lien.exists():
-        # #3311 x CI : le python du venv CI (.venv-ci/bin/python) est lui-même
-        # un lanceur de venv ; un lien placé hors de son préfixe ne retrouve
-        # pas `encodings` sur les runners (« init_fs_encoding »), et la preuve
-        # lit alors un processus mort. Le python de base, complet, est le
-        # vivant à prouver : l'argv[0] reste celui du venv.
-        base = getattr(sys, '_base_executable', None) or sys.executable
-        lien.symlink_to(Path(base).resolve())
+        lien.symlink_to(sys.executable)
     enfant = subprocess.Popen([str(lien), '-c', 'import time; time.sleep(120)'],
                               stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                               stderr=subprocess.DEVNULL, start_new_session=True)
@@ -388,7 +382,10 @@ class VmAgentsHarness(unittest.TestCase):
         # #1969 : un venv réel porte son pyvenv.cfg ; la première conversion
         # l'adopte (lib réutilisée) sans pip et exige cette pièce.
         (self.venv / 'pyvenv.cfg').write_text(
-            'home = %s\n' % os.path.dirname(sys.executable))
+            # #3311 x CI : un vrai venv écrit le préfixe de l'interpréteur de
+            # base ; `dirname(sys.executable)` vaut .venv-ci/bin en CI, où il
+            # n'y a pas de stdlib (init_fs_encoding / « encodings » absent).
+            'home = %s\n' % os.path.join(sys.base_prefix, 'bin'))
         self.workhome = self.root / 'home'
         self.workhome.mkdir()
         config = self.root / 'bascule.env'
