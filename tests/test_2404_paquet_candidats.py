@@ -13,6 +13,7 @@ import importlib.util
 import json
 import os
 import pathlib
+import re
 import shutil
 import subprocess
 import sys
@@ -21,7 +22,8 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
-from ameesh import lot_class, merge_queue, packet_candidates, resolutions, storage, work
+from ameesh import (assignments, canon, lot_class, merge_queue, packet_candidates,
+                    planned_waits, resolutions, sous_utilisation, storage, work)
 
 from .support import patch_families
 
@@ -73,13 +75,25 @@ class FakeWork:
 
 
 class FakeProgress:
-    def __init__(self, marks: dict[int, list[dict]]):
+    def __init__(self, marks: dict[int, list[dict]], holds: dict[int, list[dict]] | None = None):
         self.marks = marks
+        self.holds = holds if holds is not None else {}
 
     def lot_milestones(self, ids):
         out = []
         for lot in ids:
             out.extend(self.marks.get(int(lot), []))
+        return out
+
+    def lot_hold_events(self, ids, patterns):
+        """#3375 : le flux ciblé du stockage (transitions + notes hold/levée)."""
+        compiled = tuple(re.compile(pattern, re.I) for pattern in patterns)
+        out = []
+        for lot in ids:
+            for event in self.holds.get(int(lot), ()):
+                note = str(event.get("note") or "").strip()
+                if note and any(rx.match(note) for rx in compiled):
+                    out.append(dict(event))
         return out
 
 
@@ -182,8 +196,14 @@ class InventoryTest(unittest.TestCase):
         _git(self.repo, "push", "-q", "origin", "--all")
         self.clone = resolutions.Replayer(self.repo, os.path.join(self.tmp, "clone"))
         self.rows = rows
+        # #3375 : le journal ciblé des holds, alimenté par les témoins
+        self.holds: dict[int, list[dict]] = {}
+        self.hold_clock = 10000
+        # #3375 : l'autorité de pilote est simulée ; une panne doit lever.
+        self.role_error: Exception | None = None
+        self.role_verdicts: dict[str, bool] = {}
         self.store = mock.Mock(work=FakeWork(rows),
-                               progress=FakeProgress(self.marks))
+                               progress=FakeProgress(self.marks, self.holds))
         self.classes = {
             1: "normal", 2: "normal", 3: "sensitive", 4: "normal", 5: "light",
             6: "light", 7: "normal", 8: "normal", 9: "light", 12: "sensitive",
@@ -221,12 +241,19 @@ class InventoryTest(unittest.TestCase):
         def fake_family(db, name, **kw):
             return self.families.get(name, "")
 
+        def fake_orchestrator(cfg, db, name, **kw):
+            if self.role_error is not None:
+                raise self.role_error
+            return bool(self.role_verdicts.get(name, False))
+
         with mock.patch.object(storage, "of", return_value=self.store), \
                 mock.patch.object(work, "get",
                                   side_effect=lambda db, lot: next(
                                       (dict(row) for row in self.rows
                                        if row["id"] == int(lot)), None)), \
                 mock.patch.object(lot_class, "of_lot", side_effect=fake_class), \
+                mock.patch.object(assignments, "is_orchestrator",
+                                  side_effect=fake_orchestrator), \
                 mock.patch.object(merge_queue, "actor_family",
                                   side_effect=family or fake_family):
             return packet_candidates.inventory(
@@ -245,6 +272,123 @@ class InventoryTest(unittest.TestCase):
         self.assertEqual(entry["frozen_sha"], self.tips[1])
         self.assertIn(1, payload["ready"])
         self.assertEqual(payload["errors"], [])
+
+    # ------------------------------------------------------------------
+    # #3375 : un hold de pilote actif exclut le lot de la liste calculée
+    # ------------------------------------------------------------------
+
+    def hold(self, lot: int, note: str, *, actor: str = "human:smichea") -> dict:
+        """Ajoute un événement hold/levée au journal ciblé simulé."""
+        self.hold_clock += 1
+        event = {"id": self.hold_clock, "work_item_id": int(lot), "state": "qa",
+                 "actor": actor, "note": note,
+                 "created_ts": float(self.hold_clock)}
+        self.holds.setdefault(int(lot), []).append(event)
+        return event
+
+    def test_pilot_hold_excludes_a_frozen_and_reviewed_lot(self):
+        """Le témoin #3375 : gelé, avisé, sans conflit — et pourtant pas candidat.
+
+        #3231 était exactement dans cet état sous le hold du pilote du 24/10
+        03:18Z ; le calcul le proposait quand même, et le composeur l'a mis
+        dans h-09. Le motif doit être « hold pilote » pour la table
+        « Écartés » du manifeste.
+        """
+        self.role_verdicts["mesh-design"] = True
+        self.hold(1, "hold: témoin EP7, premier paquet après T0", actor="mesh-design")
+        payload = self.inventory()
+        entry = self.by_id(payload)[1]
+        self.assertTrue(entry["freeze"]["sha"], entry["freeze"])
+        self.assertFalse(entry["ready"])
+        self.assertEqual([cause["code"] for cause in entry["causes"]], ["pilot-hold"])
+        self.assertIn("hold pilote", entry["causes"][0]["detail"])
+        self.assertIn("mesh-design", entry["causes"][0]["detail"])
+        self.assertEqual(entry["pilot_hold"]["by"], "mesh-design")
+        self.assertNotIn(1, payload["ready"])
+        self.assertIn(1, payload["waiting"])
+        self.assertIn("pilot-hold", candidates_script.render(payload))
+        self.assertIn("hold pilote", candidates_script.render(payload))
+
+    def test_unreadable_pilot_authority_is_a_read_error_not_a_free_lot(self):
+        """B1 (#3375) : une autorité de pilote illisible ne vaut pas « non ».
+
+        Tant que `_pilot_allowed` avalait l'erreur, un hold de mesh-design
+        devenait invisible et le lot repassait prêt : la porte du paquet doit
+        refuser de conclure, et l'appelant retirer sa liste prête.
+        """
+        self.role_verdicts["mesh-design"] = True
+        self.hold(1, "hold: témoin EP7, premier paquet après T0", actor="mesh-design")
+        self.role_error = RuntimeError("registry unavailable")
+        with self.assertRaises(packet_candidates.CandidateError) as caught:
+            self.inventory()
+        self.assertIn("pilot holds", str(caught.exception))
+        self.assertIn("registry unavailable", str(caught.exception))
+
+    def test_unreadable_authority_does_not_hide_a_human_hold(self):
+        """L'humain est pilote sans lire le registre : la panne ne l'efface pas."""
+        self.role_error = RuntimeError("registry unavailable")
+        self.hold(1, "hold: décision humaine", actor="human:smichea")
+        entry = self.by_id(self.inventory())[1]
+        self.assertFalse(entry["ready"])
+        self.assertEqual([cause["code"] for cause in entry["causes"]], ["pilot-hold"])
+        self.assertEqual(entry["pilot_hold"]["by"], "human:smichea")
+
+    def test_unhold_gives_the_lot_back_to_the_candidates(self):
+        """Le même lot, après le `unhold:` du pilote, redevient candidat."""
+        self.role_verdicts["mesh-design"] = True
+        self.hold(1, "hold: témoin EP7, premier paquet après T0", actor="mesh-design")
+        self.assertFalse(self.by_id(self.inventory())[1]["ready"])
+        self.hold(1, "unhold: décision du pilote (premier paquet post-T0 atteint)",
+                  actor="mesh-design")
+        entry = self.by_id(self.inventory())[1]
+        self.assertTrue(entry["ready"], entry["causes"])
+        self.assertNotIn("pilot-hold", [cause["code"] for cause in entry["causes"]])
+
+    def test_an_assignee_hold_is_not_a_pilot_hold(self):
+        """Un `hold:` ordinaire (règle 1 du réveil) ne réserve pas le paquet.
+
+        L'autorité est lue (le registre répond « non pilote ») : c'est un
+        « non » certain, pas une panne.
+        """
+        self.hold(1, "hold: je reprends demain", actor="ameesh-dev5")
+        entry = self.by_id(self.inventory())[1]
+        self.assertTrue(entry["ready"], entry["causes"])
+        self.assertIsNone(entry["pilot_hold"])
+
+    def test_hold_override_lifts_only_the_hold_and_is_labelled(self):
+        """Le geste explicite du composeur : le hold tombe, les autres refus restent."""
+        self.role_verdicts["mesh-design"] = True
+        self.hold(1, "hold: témoin EP7, premier paquet après T0", actor="mesh-design")
+        payload = self.inventory(hold_overrides={1: "premier paquet post-T0 atteint"})
+        entry = self.by_id(payload)[1]
+        self.assertTrue(entry["ready"], entry["causes"])
+        self.assertEqual(entry["hold_override"], "premier paquet post-T0 atteint")
+        self.assertNotIn("pilot-hold", [cause["code"] for cause in entry["causes"]])
+        self.assertIn(1, payload["ready"])
+        self.assertIn("hold pilote surchargé", candidates_script.render(payload))
+        # le hold n'est pas levé : la liste sans surcharge l'écarte encore
+        self.assertFalse(self.by_id(self.inventory())[1]["ready"])
+
+    def test_hold_override_does_not_bypass_another_refusal(self):
+        """Une surcharge ne lève que le hold : #2 garde son gel en retard."""
+        self.role_verdicts["mesh-design"] = True
+        self.hold(2, "hold: témoin", actor="mesh-design")
+        entry = self.by_id(self.inventory(hold_overrides={2: "raison"}))[2]
+        self.assertFalse(entry["ready"])
+        self.assertEqual(entry["hold_override"], "raison")
+        self.assertIn("freeze-not-head", [cause["code"] for cause in entry["causes"]])
+
+    def test_hold_override_needs_an_active_hold_and_a_reason(self):
+        with self.assertRaises(packet_candidates.HoldOverrideError):
+            self.inventory(hold_overrides={1: "sans hold actif"})
+        self.role_verdicts["mesh-design"] = True
+        self.hold(1, "hold: témoin", actor="mesh-design")
+        with self.assertRaises(packet_candidates.HoldOverrideError):
+            self.inventory(hold_overrides={1: "   "})
+        with self.assertRaises(packet_candidates.HoldOverrideError):
+            self.inventory(hold_overrides={99: "lot inconnu"})
+        with self.assertRaises(packet_candidates.HoldOverrideError):
+            self.inventory(hold_overrides={1: "raison", "x": "raison"})
 
     def test_assigned_lots_are_read_not_filtered(self):
         # Régression #2404 : un filtre d'assigné (ou une page) cacherait les
@@ -604,6 +748,73 @@ class RemiseTest(InventoryTest):
             "refs/ameesh/resolutions/4/develop-1", 4, "main"))
 
 
+class StrictPilotAuthorityTest(unittest.TestCase):
+    """#3375 (B1) : autorité de pilote lue en strict.
+
+    Le contrat partagé garde son défaut tolérant (alertes, stagnation) ; la
+    porte du paquet demande `strict=True` pour distinguer un acteur « non
+    pilote » d'une autorité **indéterminée** (registre, canon, alias).
+    """
+
+    cfg = SimpleNamespace(canon_entries=(), canon="", canon_ref="",
+                          canon_untrusted=False)
+
+    def _resolve(self):
+        return mock.patch("ameesh.agent_names.resolve",
+                          side_effect=lambda name, **kw: name)
+
+    def test_strict_orchestrator_propagates_a_registry_failure(self):
+        with mock.patch.dict(os.environ, {assignments.ORCHESTRATORS_ENV: ""}), \
+                mock.patch("ameesh.agent_names.resolve",
+                           side_effect=RuntimeError("registry unavailable")):
+            with self.assertRaises(RuntimeError) as caught:
+                assignments.is_orchestrator(self.cfg, object(), "mesh-design",
+                                            history=False, strict=True)
+            self.assertIn("registry unavailable", str(caught.exception))
+            # défaut inchangé : une panne ne fait pas taire les alertes
+            self.assertFalse(assignments.is_orchestrator(
+                self.cfg, object(), "mesh-design", history=False))
+
+    def test_strict_orchestrator_propagates_an_unloaded_canon(self):
+        with mock.patch.dict(os.environ, {assignments.ORCHESTRATORS_ENV: ""}), \
+                self._resolve(), \
+                mock.patch.object(canon, "configured", return_value=(object(),)), \
+                mock.patch.object(canon, "load_configured", return_value=[]):
+            with self.assertRaises(RuntimeError) as caught:
+                assignments.is_orchestrator(self.cfg, object(), "mesh-design",
+                                            history=False, strict=True)
+        self.assertIn("canon unreadable", str(caught.exception))
+
+    def test_strict_orchestrator_propagates_a_partially_read_canon(self):
+        with mock.patch.dict(os.environ, {assignments.ORCHESTRATORS_ENV: ""}), \
+                self._resolve(), \
+                mock.patch.object(canon, "configured", return_value=(object(),)), \
+                mock.patch.object(canon, "load_configured", return_value=[object()]), \
+                mock.patch.object(sous_utilisation, "fully_read", return_value=False):
+            with self.assertRaises(RuntimeError) as caught:
+                assignments.is_orchestrator(self.cfg, object(), "mesh-design",
+                                            history=False, strict=True)
+        self.assertIn("canon partially read", str(caught.exception))
+
+    def test_pilot_predicate_propagates_only_in_strict_mode(self):
+        with mock.patch.object(assignments, "is_orchestrator",
+                               side_effect=RuntimeError("registry unavailable")):
+            with self.assertRaises(RuntimeError):
+                planned_waits._pilot_allowed(object(), None, strict=True)("mesh-design")
+            self.assertFalse(planned_waits._pilot_allowed(object(), None)("mesh-design"))
+
+    def test_active_holds_strict_refuses_an_unreadable_pilot_authority(self):
+        events = [{"id": 1, "work_item_id": 7, "state": "qa",
+                   "actor": "mesh-design", "note": "hold: témoin",
+                   "created_ts": 1.0}]
+        with mock.patch.object(assignments, "is_orchestrator",
+                               side_effect=RuntimeError("registry unavailable")):
+            with self.assertRaises(RuntimeError):
+                planned_waits.active_holds(object(), events, strict=True)
+            held = planned_waits.active_holds(object(), events)
+        self.assertFalse(held[7]["mesh-design"]["pilot"])
+
+
 class ReadyOutTest(unittest.TestCase):
     """Relecture cx2 B3 : un inventaire incomplet ne laisse jamais d'export."""
 
@@ -668,6 +879,132 @@ class ReadyOutTest(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertFalse(self.path.exists())
         conn.close.assert_called_once()
+
+    def test_script_exits_1_and_clears_ready_out_on_a_pilot_authority_error(self):
+        """#3375 B1 : une autorité illisible ne peut pas laisser une liste prête."""
+        self.path.write_text("#100\n", encoding="utf-8")
+        project = SimpleNamespace(name="ameesh", target="main")
+        conn = mock.Mock()
+        error = packet_candidates.CandidateError(
+            "cannot read the active pilot holds: registry unavailable")
+        with mock.patch.object(candidates_script.config, "load",
+                               return_value=object()), \
+                mock.patch.object(candidates_script, "resolve_project",
+                                  return_value=(project, True)), \
+                mock.patch.object(candidates_script.db, "connect", return_value=conn), \
+                mock.patch.object(candidates_script.merge_queue, "working_clone",
+                                  return_value=(self.tmp, None)), \
+                mock.patch.object(candidates_script.packet_candidates, "inventory",
+                                  side_effect=error):
+            code = candidates_script.main(
+                ["--repo", self.tmp, "--project", "ameesh", "--target", "main",
+                 "--ready-out", str(self.path)])
+        self.assertEqual(code, 1)
+        self.assertFalse(self.path.exists())
+        conn.close.assert_called_once()
+
+
+class HoldOverrideJournalTest(unittest.TestCase):
+    """#3375 : le drapeau et sa raison sont journalisés sur le lot.
+
+    La sélection reste en lecture seule ; seule la surcharge explicite écrit,
+    et uniquement quand elle a réellement rendu le lot prêt.
+    """
+
+    def test_reason_is_required_with_the_flag(self):
+        with self.assertRaises(candidates_script.HoldOverrideError):
+            candidates_script.parse_hold_overrides([7], None)
+        with self.assertRaises(candidates_script.HoldOverrideError):
+            candidates_script.parse_hold_overrides([7], "   ")
+        with self.assertRaises(candidates_script.HoldOverrideError):
+            candidates_script.parse_hold_overrides(None, "raison sans surcharge")
+        self.assertEqual(
+            candidates_script.parse_hold_overrides([7, 7], " premier  paquet "),
+            {7: "premier paquet"})
+
+    def payload(self, *, ready=True, hold_override="premier paquet post-T0"):
+        entry = {"work_item": 7, "ready": ready, "hold_override": hold_override,
+                 "pilot_hold": {"by": "mesh-design", "since": 1.0,
+                                "note": "hold: témoin"},
+                 "source": "b" * 40, "published_head": "b" * 40,
+                 "branch": "lot/7", "assignee": "author", "review_class": None,
+                 "causes": [] if ready else [{"code": "freeze-not-head",
+                                              "detail": "gel en retard"}]}
+        return {"project": "ameesh", "target": "main", "base": "a" * 40,
+                "base_source": "target", "target_head": "a" * 40,
+                "candidates": [entry], "ready": [7] if ready else [],
+                "waiting": [] if ready else [7], "errors": []}
+
+    def test_the_reason_is_written_on_the_lot(self):
+        conn = mock.Mock()
+        with mock.patch.object(candidates_script.work, "note") as note:
+            written = candidates_script.journal_hold_overrides(
+                conn, self.payload(), {7: "premier paquet post-T0"},
+                actor="mty-amh-impl-01")
+        note.assert_called_once()
+        called = note.call_args
+        self.assertEqual(called.args[1], 7)
+        self.assertIn("hold-override", called.args[2])
+        self.assertIn("hold pilote", called.args[2])
+        self.assertIn("premier paquet post-T0", called.args[2])
+        self.assertIn("mesh-design", called.args[2])
+        self.assertEqual(called.kwargs["actor"], "mty-amh-impl-01")
+        # la note de surcharge ne doit ni poser ni lever un hold : sinon le
+        # journal du geste effacerait la retenue qu'il prétend surcharger.
+        self.assertFalse(planned_waits.is_hold_note(called.args[2]))
+        self.assertFalse(planned_waits.is_lift_note(called.args[2]))
+        self.assertEqual(written, [{"lot": 7, "note": called.args[2]}])
+
+    def test_a_surcharge_without_effect_writes_nothing(self):
+        conn = mock.Mock()
+        with mock.patch.object(candidates_script.work, "note") as note:
+            with self.assertRaises(candidates_script.HoldOverrideError):
+                candidates_script.journal_hold_overrides(
+                    conn, self.payload(ready=False), {7: "raison"})
+        note.assert_not_called()
+        with mock.patch.object(candidates_script.work, "note") as note:
+            with self.assertRaises(candidates_script.HoldOverrideError):
+                candidates_script.journal_hold_overrides(
+                    conn, self.payload(hold_override=""), {7: "raison"})
+        note.assert_not_called()
+
+    def test_main_refuses_without_reason_and_clears_the_export(self):
+        tmp = tempfile.mkdtemp(prefix="ameesh-3375-")
+        self.addCleanup(shutil.rmtree, tmp, True)
+        path = pathlib.Path(tmp) / "prets.txt"
+        path.write_text("#1\n", encoding="utf-8")
+        code = candidates_script.main(["--repo", tmp, "--hold-override", "7",
+                                       "--ready-out", str(path)])
+        self.assertEqual(code, 2)
+        self.assertFalse(path.exists())
+
+    def test_main_journals_the_override_before_exporting_the_lot(self):
+        tmp = tempfile.mkdtemp(prefix="ameesh-3375-")
+        self.addCleanup(shutil.rmtree, tmp, True)
+        path = pathlib.Path(tmp) / "prets.txt"
+        project = SimpleNamespace(name="ameesh", target="main")
+        conn = mock.Mock()
+        with mock.patch.object(candidates_script.config, "load",
+                               return_value=object()), \
+                mock.patch.object(candidates_script, "resolve_project",
+                                  return_value=(project, True)), \
+                mock.patch.object(candidates_script.db, "connect", return_value=conn), \
+                mock.patch.object(candidates_script.merge_queue, "working_clone",
+                                  return_value=(tmp, None)), \
+                mock.patch.object(candidates_script.packet_candidates, "inventory",
+                                  return_value=self.payload()), \
+                mock.patch.object(candidates_script, "hold_actor",
+                                  return_value="mty-amh-impl-01"), \
+                mock.patch.object(candidates_script.work, "note") as note:
+            code = candidates_script.main(
+                ["--repo", tmp, "--project", "ameesh", "--target", "main",
+                 "--hold-override", "7",
+                 "--hold-reason", "premier paquet post-T0",
+                 "--ready-out", str(path)])
+        self.assertEqual(code, 0)
+        note.assert_called_once()
+        self.assertIn("hold-override", note.call_args.args[2])
+        self.assertIn("#7", path.read_text(encoding="utf-8"))
 
 
 if __name__ == "__main__":
