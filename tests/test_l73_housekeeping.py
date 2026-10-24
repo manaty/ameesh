@@ -1671,6 +1671,54 @@ class MenageDbTest(PgTestCase):
             self.assertEqual((row["action"], row["lot"]), ("garde", None), row)
             self.assertIn("not attributable", row["detail"])
 
+    def test_attribution_persistee_relit_la_branche_avant_retrait(self):
+        """#3266 (relecture cx3) : la passe 1 attribue #431 (fermé) par le
+        dossier `nexlink-a2-431` et garde le worktree modifié. À la passe 2,
+        après `checkout -b lot/432` (ouvert), le lot persisté ne dispense pas
+        de relire la branche ACTUELLE : #432 est un candidat, le worktree est
+        gardé et l'attribution reste. La base f71414d8 attendait aux deux
+        passes (aucune attribution) ; retirer la ligne persistée est le défaut
+        que ce témoin couvre. Deux passes, Git jetable, registre réel."""
+        _sans_processus(self)
+        main = _repo(self.tmp)
+        registry.upsert(self.db, "a2", harness="claude", host="pc",
+                        cwd=os.path.join(self.tmp, "a2"))
+        fini = self._lot("fini")
+        work.assign(self.db, fini, "a2")
+        work.close(self.db, fini, abandoned=True)
+        ouvert = self._lot("ouvert")
+        work.assign(self.db, ouvert, "a2")
+        wt = os.path.join(self.tmp, "nexlink-a2-%d" % fini)
+        _git("worktree", "add", "-q", wt, "-b", "topic", cwd=main)
+        _write(os.path.join(wt, "non-suivi"), 10)
+        hk = storage.of(self.db).housekeeping
+        row = hk.register_worktree(
+            host="pc", path=wt, repo=menage.common_dir(main), agent="a2",
+            lot=None, turn_id="t", branch="topic", head="")
+        hk.set_worktree_status(row["id"], "active", "")
+        now = time.time() + 2 * 3600
+        interdit = AssertionError("aucune suppression Git dans ce témoin")
+        with mock.patch.object(menage, "remove_worktree", side_effect=interdit), \
+                mock.patch.object(menage, "_remove_kept_worktree", side_effect=interdit):
+            _entries, plan = menage._worktree_pass(
+                self.db, "pc", dry_run=False, protected=set(), running=set(),
+                now=now, known_agents=("a2",))
+            plan = {p["path"]: p for p in plan if p.get("kind") == "worktree"}
+            self.assertEqual((plan[wt]["action"], plan[wt]["lot"]),
+                             ("garde", str(fini)), plan[wt])
+            self.assertEqual(hk.worktrees("pc")[0]["lot"], str(fini))
+            # la branche passe au lot encore ouvert ; le worktree devient propre
+            os.unlink(os.path.join(wt, "non-suivi"))
+            _git("checkout", "-q", "-b", "lot/%d" % ouvert, cwd=wt)
+            _entries, plan = menage._worktree_pass(
+                self.db, "pc", dry_run=True, protected=set(), running=set(),
+                now=now, known_agents=("a2",))
+            plan = {p["path"]: p for p in plan if p.get("kind") == "worktree"}
+            self.assertEqual(plan[wt]["action"], "garde", plan[wt])
+            self.assertIn(str(ouvert), plan[wt]["detail"])
+            self.assertEqual(hk.worktrees("pc")[0]["lot"], str(fini))
+            self.assertTrue(os.path.isdir(wt))
+
     def test_worktrees_suivis_sans_plafond_pour_le_menage(self):
         """#2174 : `limit=None` rend tous les worktrees suivis de l'hôte (le
         ménage), le plafond par défaut reste pour les autres lectures."""

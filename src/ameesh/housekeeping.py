@@ -3119,6 +3119,12 @@ def _worktree_pass(db, host: str, *, dry_run: bool,
     how: `_remove_kept_worktree` (host lock `lock_path`, journal
     `journal_path`, managed roots `skip_roots`).
 
+    #3266 : l'attribution persistée est une trace, pas la branche courante :
+    avant tout retrait, la branche ACTUELLE est relue et tous les lots
+    qu'elle nomme, plus le lot persisté et ceux du dossier, doivent avoir
+    fini (un lot ouvert, inconnu, ou une branche illisible garde le
+    worktree).
+
     #1665 : un worktree orphelin — aucun lot nommé par sa branche ou son
     dossier — suit la même fin, mais après `ORPHAN_WORKTREE_IDLE_S` (24 h)
     d'inactivité, propre et poussé (la branche reste) ; c'est le ménage que
@@ -3133,6 +3139,7 @@ def _worktree_pass(db, host: str, *, dry_run: bool,
     for row in store.worktrees(host, ("active", "kept"), limit=None):
         path, lot = row["path"], row.get("lot")
         branch = row.get("branch") or ""
+        branch_checked = False
         # #2182: the agent at the head of an `agent/`/`review/` branch is
         # known from the registry (else from the recorded agent), so its own
         # number is not read as a cited lot (`review/reviewer-02-1234`).
@@ -3166,6 +3173,7 @@ def _worktree_pass(db, host: str, *, dry_run: bool,
             # `lot/432`). Relire la branche ACTUELLE avant toute attribution ;
             # illisible = doute, on garde (#3266, relecture cx3).
             readable, branch = current_branch(path)
+            branch_checked = True
             if not readable:
                 plan.append(dict(base, action="garde",
                                  detail="current branch unreadable; kept"))
@@ -3261,6 +3269,40 @@ def _worktree_pass(db, host: str, *, dry_run: bool,
             plan.append(dict(base, action="attend",
                              detail="%s; a process is working in it" % why))
             continue
+        # #3266 (relecture cx3) : une attribution persistée n'est qu'une trace,
+        # comme `row.branch` : la branche a pu changer depuis (`topic` →
+        # `lot/432`). Avant CHAQUE décision de retrait, relire la branche
+        # ACTUELLE et vérifier tous les lots qu'elle nomme, PLUS le lot
+        # persisté et le dossier ; un lot ouvert, inconnu ou illisible prouve
+        # que le worktree sert encore. La base (f71414d8), qui n'attribuait
+        # jamais, n'avait rien à relire : ce garde protège l'attribution
+        # persistée, il ne change pas la règle de fin de lot.
+        if not branch_checked:
+            readable, branch = current_branch(path)
+            if not readable:
+                plan.append(dict(base, action="garde",
+                                 detail="current branch unreadable; kept"))
+                continue
+            branch_checked = True
+            branch_owner = branch_agent(branch, known_agents) or (row.get("agent") or "")
+            branch_idents = cited_lots(branch, agent=branch_owner)
+            _named_owner, folder_idents = worktree_named_lots(
+                path, known_agents or (row.get("agent") or "",))
+            idents = list(dict.fromkeys(branch_idents + folder_idents + (
+                [str(lot)] if lot is not None else [])))
+            try:
+                states = [_lot_state(db, ident) for ident in idents]
+            except Exception:  # registre illisible : rien n'est prouvé
+                states = [None]
+            still = [(ident, state) for ident, state in zip(idents, states)
+                     if state not in LOT_ENDED]
+            if still:
+                ident, state = still[0]
+                detail = ("current branch names lot #%s %s; kept" % (
+                    ident, state or "unknown") if ident != str(lot) else
+                    "persisted lot #%s %s; kept" % (ident, state or "unknown"))
+                plan.append(dict(base, action="garde", detail=detail))
+                continue
         # #2180: a reused tracked path may now be a clone, a symlink or a
         # worktree of another repository. Old metadata never authorises it.
         from .housekeeping_discovery import _marker
