@@ -97,8 +97,11 @@ class MacosShortJobTest(unittest.TestCase):
         needs = re.search(r"(?m)^    needs: \[(.*)\]$", aggregate)
         self.assertIsNotNone(needs, "job tests : ligne needs introuvable")
         self.assertIn("platform-macos", needs.group(1).split(", "))
-        self.assertIn('test "${{ needs.platform-macos.result }}" = success',
-                      aggregate)
+        # #3251 : le résultat du job est lu par le classifieur de l'agrégat
+        # (une annulation se consigne, un échec rougit), pas par une garde
+        # bash `= success`.
+        self.assertIn(
+            '--plateforme-macos "${{ needs.platform-macos.result }}"', aggregate)
         self.assertNotIn("continue-on-error: true", self.job)
 
 
@@ -140,6 +143,15 @@ class MacosFullSuiteWorkflowTest(unittest.TestCase):
         self.assertIn("permissions:\n  contents: read", self.text)
         self.assertNotRegex(self.text, r"(?m):\s+write(?:-only|-all)?\s*$")
 
+    def test_it_does_not_cache_pip_under_pull_request_target(self):
+        # #3207 : sous `pull_request_target`, `cache: pip` de setup-python
+        # écrirait un cache dans la portée de la branche de base à partir du
+        # pyproject de la PR (N de sécurité de la revue #3198). La suite
+        # tourne une fois par nuit ou à la demande : le cache n'est pas
+        # nécessaire, et le remettre rouvrirait l'exposition.
+        self.assertNotIn("cache: pip", self.text)
+        self.assertNotIn("cache-dependency-path", self.text)
+
     def test_it_runs_the_whole_plan_under_macos(self):
         self.assertIn("test-plan.py plan", self.job)
         self.assertIn("--mode full", self.job)
@@ -164,6 +176,13 @@ class MacosFullSuiteWorkflowTest(unittest.TestCase):
         self.assertIn("brew install postgresql@17 bash coreutils gnu-sed findutils",
                       self.job)
         self.assertIn("$(brew --prefix findutils)/libexec/gnubin", self.job)
+
+    def test_the_flock_of_the_staging_lock_is_installed(self):
+        # #3130 : staging.sh prend son verrou d'opérateur unique (#2448) par
+        # `flock -n 9` (util-linux) ; macOS n'a pas cette commande et le banc
+        # du staging sortait en « flock: command not found ».
+        self.assertIn("gnu-sed findutils flock\n", self.job)
+        self.assertIn('echo "$(brew --prefix flock)/bin"', self.job)
 
     def test_the_runner_is_the_standard_x64_image(self):
         self.assertIn("runs-on: macos-26-intel", self.job)

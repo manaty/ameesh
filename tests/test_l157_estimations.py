@@ -196,10 +196,12 @@ class VersionOnlyTest(unittest.TestCase):
         self.assertIn("if: needs.plan.outputs.psycopg != '[]'", text)
         self.assertIn("if: needs.plan.outputs.psql != '[]'", text)
         self.assertIn("if: needs.plan.outputs.code == 'true'", text)
-        self.assertIn('if [ "${{ needs.plan.outputs.version_only }}" = "true" ]', text)
-        self.assertIn(
-            "needs: [plan, version, psycopg, psql, platform-macos, "
-            "doc-readers, fs-class]", text)
+        # #3251 : la voie version seule est lue par scripts/ci-agregat.py,
+        # appelé par l'étape « bilan des parts » ; il ne demande aucune part
+        # et reste vert hors demande de gel (tests/test_3251_...).
+        self.assertIn('--version-only "${{ needs.plan.outputs.version_only }}"', text)
+        self.assertIn("needs: [plan, version, psycopg, psql, platform-macos, "
+                      "doc-readers, fs-class]", text)
 
 
 class EstimatesPgTest(PgTestCase):

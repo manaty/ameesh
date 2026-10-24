@@ -3209,13 +3209,15 @@ class WorkflowTest(unittest.TestCase):
         for driver in ("psycopg", "psql"):
             self.assertIn(f"part: ${{{{ fromJSON(needs.plan.outputs.{driver}) }}}}", self.text)
             self.assertIn(f"if: needs.plan.outputs.{driver} != '[]'", self.text)
-        # L161f review (2): with code changed, an empty psycopg matrix is an error
-        skipped = ("test '${{{{ needs.plan.outputs.{0} }}}}' = '[]' && test "
-                   "\"${{{{ needs.{0}.result }}}}\" = skipped")
+        # L161f review (2): with code changed, an empty psycopg matrix is an
+        # error. #3251 : le classifieur de l'agrégat porte la règle (psql sans
+        # part = saut légitime, psycopg vide = négatif) ; l'étape lui passe les
+        # deux listes de parts et les deux résultats.
         job = self.text[self.text.index("\n  tests:\n"):]
-        self.assertIn(skipped.format("psql"), job)
-        self.assertNotIn(skipped.format("psycopg"), job)
-        self.assertIn('test "${{ needs.psycopg.result }}" = success\n', job)
+        self.assertIn("--psql-parts '${{ needs.plan.outputs.psql }}'", job)
+        self.assertIn('--psycopg "${{ needs.psycopg.result }}"', job)
+        self.assertIn('--psql "${{ needs.psql.result }}"', job)
+        self.assertNotRegex(job, r'test\s+"\$\{\{\s*needs\.psycopg\.result')
 
     def test_leaks_job_never_required(self):
         job = self.text[self.text.index("\n  bilan:\n"):self.text.index("\n  tests:\n")]
@@ -3325,11 +3327,13 @@ class WorkflowTest(unittest.TestCase):
         # plan en produisait une, l'agrégat requis rougit au lieu de verdir
         # sans tests.
         job = self.text[self.text.index("\n  tests:\n"):]
-        # #940 : l'agrégat n'admet que les expressions de son contrat et garde
-        # `github.event_name` dans le script (pas d'`env:` intercalé).
-        self.assertIn('if [ "${{ github.event_name }}" = pull_request ]; then', job)
-        self.assertIn('test "${{ needs.plan.outputs.version_only }}" = "false"', job)
-        self.assertIn('test "${{ needs.plan.outputs.docs_only }}" = "false"', job)
+        # #3251 : la règle vit dans scripts/ci-agregat.py, qui reçoit
+        # l'événement et les deux drapeaux ; il refuse ces voies sur une
+        # demande de gel (tests/test_3251_agregat_annulation.py) et l'étape
+        # n'ajoute aucune expression hors de son contrat.
+        self.assertIn('--event "${{ github.event_name }}"', job)
+        self.assertIn('--version-only "${{ needs.plan.outputs.version_only }}"', job)
+        self.assertIn('--docs-only "${{ needs.plan.outputs.docs_only }}"', job)
 
     def test_run_name_carries_the_freeze_request(self):
         # #1343 : le titre du run porte la PR, l'étiquette (mode et SHA) et la
