@@ -242,6 +242,79 @@ class CommitSurvivesTest(TestCase):
         head = self.repo.commit("impl: contenu regroupé", agent="impl")
         self.assertTrue(self.survives(head, fix, base))
 
+    def test_a_duplicate_pre_image_is_not_an_annulment(self):
+        # B11 (revues cx2, cx3, auditeur) : la pré-image du retrait existe déjà
+        # intacte, dans la base, au fichier de reprise. Sa seule présence ne
+        # prouve pas que le retrait a été annulé ; seule une occurrence de plus
+        # que dans le même fichier au commit corrigé le prouve.
+        pre = ("    shared_before_1()\n"
+               "    shared_before_2()\n"
+               "    shared_before_3()\n"
+               "    return None\n"
+               "    shared_after_1()\n"
+               "    shared_after_2()\n"
+               "    shared_after_3()\n")
+        self.repo.write("gate.py", "def corrected():\n" + pre)
+        self.repo.write("relocated/gate.py",
+                        "def old_feature():\n" + pre + "    old_line()\n")
+        base = self.repo.commit("base")
+        self.repo.write("gate.py",
+                        "def corrected():\n"
+                        "    shared_before_1()\n"
+                        "    shared_before_2()\n"
+                        "    shared_before_3()\n"
+                        "    shared_after_1()\n"
+                        "    shared_after_2()\n"
+                        "    shared_after_3()\n")
+        self.repo.write("docs/review.md", "own review line\n")
+        fix = self.repo.commit("fix", agent="cx3")
+        self.repo.git("reset", "-q", "--hard", base)
+        self.repo.git("rm", "-q", "gate.py")
+        self.repo.write("relocated/gate.py",
+                        "def corrected():\n"
+                        "    shared_before_1()\n"
+                        "    shared_before_2()\n"
+                        "    shared_before_3()\n"
+                        "    shared_after_1()\n"
+                        "    shared_after_2()\n"
+                        "    shared_after_3()\n"
+                        "def old_feature():\n" + pre + "    old_line()\n")
+        head = self.repo.commit("impl: contenu corrigé regroupé", agent="impl")
+        self.assertTrue(self.survives(head, fix, base))
+
+    def test_a_reintroduced_pre_image_beside_a_duplicate_is_an_annulment(self):
+        # B11 : la pré-image existe déjà dans une fonction indépendante, mais
+        # la tête la réintroduit aussi au site corrigé (une occurrence de plus
+        # que dans le fichier corrigé) : le retrait est bien annulé.
+        pre = ("    shared_before_1()\n"
+               "    shared_before_2()\n"
+               "    shared_before_3()\n"
+               "    return None\n"
+               "    shared_after_1()\n"
+               "    shared_after_2()\n"
+               "    shared_after_3()\n")
+        self.repo.write("gate.py", "def corrected():\n" + pre)
+        self.repo.write("relocated/gate.py",
+                        "def old_feature():\n" + pre + "    old_line()\n")
+        base = self.repo.commit("base")
+        self.repo.write("gate.py",
+                        "def corrected():\n"
+                        "    shared_before_1()\n"
+                        "    shared_before_2()\n"
+                        "    shared_before_3()\n"
+                        "    shared_after_1()\n"
+                        "    shared_after_2()\n"
+                        "    shared_after_3()\n")
+        self.repo.write("docs/review.md", "own review line\n")
+        fix = self.repo.commit("fix", agent="cx3")
+        self.repo.git("reset", "-q", "--hard", base)
+        self.repo.git("rm", "-q", "gate.py")
+        self.repo.write("relocated/gate.py",
+                        "def corrected():\n" + pre
+                        + "def old_feature():\n" + pre + "    old_line()\n")
+        head = self.repo.commit("impl: garde réintroduite", agent="impl")
+        self.assertFalse(self.survives(head, fix, base))
+
     def test_a_reintroduced_removal_pre_image_is_an_annulment(self):
         # B9/B10 : l'annulation n'est prouvée que par la pré-image localisée
         # du hunk (contexte + lignes retirées) retrouvée d'un seul tenant. Ici

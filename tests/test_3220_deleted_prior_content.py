@@ -712,27 +712,27 @@ class _UnrelatedCommonLineFixture(_RewriteFixture):
     du témoin B10."""
 
     EXTRA = ""
+    GATE_BASE = ("def gate(user):\n"
+                 "    if user.is_admin:\n"
+                 "        return None\n"
+                 "    guard_line_1()\n"
+                 "    guard_line_2()\n"
+                 "    guard_line_3()\n"
+                 "    guard_line_4()\n")
+    GATE_FIXED = ("def gate(user):\n"
+                  "    guard_line_1()\n"
+                  "    guard_line_2()\n"
+                  "    guard_line_3()\n"
+                  "    guard_line_4()\n")
+    OLD_FEATURE = ("def old_feature():\n"
+                   "    return None\n"
+                   "    old_line()\n")
 
     def _build_head_a(self):
-        self.repo.write("gate.py",
-                        "def gate(user):\n"
-                        "    if user.is_admin:\n"
-                        "        return None\n"
-                        "    guard_line_1()\n"
-                        "    guard_line_2()\n"
-                        "    guard_line_3()\n"
-                        "    guard_line_4()\n")
-        self.repo.write("relocated/gate.py",
-                        "def old_feature():\n"
-                        "    return None\n"
-                        "    old_line()\n")
+        self.repo.write("gate.py", self.GATE_BASE)
+        self.repo.write("relocated/gate.py", self.OLD_FEATURE)
         self.base = self.repo.commit("base")
-        self.repo.write("gate.py",
-                        "def gate(user):\n"
-                        "    guard_line_1()\n"
-                        "    guard_line_2()\n"
-                        "    guard_line_3()\n"
-                        "    guard_line_4()\n")
+        self.repo.write("gate.py", self.GATE_FIXED)
         self.repo.write(DOC, DOC_TEXT)
         self.review_doc = self.repo.commit(
             "cx3: retire la garde admin et documente", agent="cx3")
@@ -746,14 +746,7 @@ class _UnrelatedCommonLineFixture(_RewriteFixture):
         self.repo.git("reset", "--hard", self.base)
         self.repo.git("rm", "-q", "gate.py")
         self.repo.write("relocated/gate.py",
-                        "def gate(user):\n"
-                        "    guard_line_1()\n"
-                        "    guard_line_2()\n"
-                        "    guard_line_3()\n"
-                        "    guard_line_4()\n"
-                        "def old_feature():\n"
-                        "    return None\n"
-                        "    old_line()\n" + self.EXTRA)
+                        self.GATE_FIXED + self.OLD_FEATURE + self.EXTRA)
         self.head_b = self.repo.commit(
             "impl: garde corrigée regroupée, document omis", agent="impl")
         self.receipt("impl", "deepseek", [self.head_b])
@@ -817,3 +810,36 @@ class CommonLineControlTest(_UnrelatedCommonLineFixture):
         self.assertEqual({row["name"]: row["family"] for row in authors},
                          {"impl": "deepseek", "cx3": "codex"})
         self.assertIn("cx3", {row["name"] for row in correctors})
+
+
+class DuplicatePreImageTest(UnrelatedCommonLineTest):
+    """B11 (revues cx2 + cx3, auditeur) : la pré-image du retrait existe déjà,
+    intacte, dans une fonction indépendante du fichier de reprise. Sa présence
+    ne prouve pas l'annulation : seule une occurrence de plus que dans le
+    fichier corrigé la prouve ; le compte garde cx3 et la porte refuse."""
+
+    EXTRA = ""
+    GATE_BASE = ("def gate(user):\n"
+                 "    shared_before_1()\n"
+                 "    shared_before_2()\n"
+                 "    shared_before_3()\n"
+                 "    return None\n"
+                 "    shared_after_1()\n"
+                 "    shared_after_2()\n"
+                 "    shared_after_3()\n")
+    GATE_FIXED = ("def gate(user):\n"
+                  "    shared_before_1()\n"
+                  "    shared_before_2()\n"
+                  "    shared_before_3()\n"
+                  "    shared_after_1()\n"
+                  "    shared_after_2()\n"
+                  "    shared_after_3()\n")
+    OLD_FEATURE = ("def old_feature():\n"
+                   "    shared_before_1()\n"
+                   "    shared_before_2()\n"
+                   "    shared_before_3()\n"
+                   "    return None\n"
+                   "    shared_after_1()\n"
+                   "    shared_after_2()\n"
+                   "    shared_after_3()\n"
+                   "    old_line()\n")
