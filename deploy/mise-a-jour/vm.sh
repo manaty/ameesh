@@ -1362,9 +1362,22 @@ reinstaller_agents() {
 # d'« installer » rejoue l'étape (masquer un socket déjà masqué réussit).
 etat_cle_gpg_agents() {  # → absente | vide | cle | doute
   utilisateur_agents bash -c 'set -euo pipefail
-    d=$HOME/.gnupg/private-keys-v1.d
-    if [ ! -e "$d" ] && [ ! -L "$d" ]; then echo absente; exit 0; fi
-    if [ -L "$d" ] || [ ! -d "$d" ]; then echo doute; exit 0; fi
+    h=$HOME/.gnupg
+    # « Absent » ne se prouve que sur une traversée prouvée : sans le bit x,
+    # test -e et test -L échouent aussi (EACCES), et un home GnuPG illisible
+    # passerait pour absent (#3320 B1 : masquage dans le doute).
+    if [ ! -d "$HOME" ] || [ ! -x "$HOME" ]; then echo doute; exit 0; fi
+    if [ -L "$h" ]; then
+      if [ ! -d "$h" ] || [ ! -x "$h" ]; then echo doute; exit 0; fi
+    elif [ ! -e "$h" ]; then
+      echo absente; exit 0
+    elif [ ! -d "$h" ] || [ ! -x "$h" ]; then
+      echo doute; exit 0
+    fi
+    d=$h/private-keys-v1.d
+    if [ -L "$d" ]; then echo doute; exit 0; fi
+    if [ ! -e "$d" ]; then echo absente; exit 0; fi
+    if [ ! -d "$d" ] || [ ! -x "$d" ]; then echo doute; exit 0; fi
     if ! premier=$(find "$d" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null); then
       echo doute; exit 0
     fi
@@ -1395,7 +1408,7 @@ masquer_agent_gpg_agents() {
       echo "clé privée dans ~/.gnupg/private-keys-v1.d : sockets GnuPG laissés en place (doute conservé)"
       ;;
     *)
-      echo "état de ~/.gnupg/private-keys-v1.d inattendu ($etat) : rien touché (doute conservé)" >&2
+      echo "état de ~/.gnupg/private-keys-v1.d non prouvé ($etat) : rien touché (doute conservé)" >&2
       ;;
   esac
 }

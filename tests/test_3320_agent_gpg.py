@@ -9,6 +9,8 @@ workstation (`poste.sh`).
 """
 from __future__ import annotations
 
+import os
+import unittest
 from pathlib import Path
 
 from tests.test_1252_vm_agents_install import VmAgentsHarness
@@ -71,6 +73,41 @@ class AgentGpgTest(VmAgentsHarness):
     def test_an_unexpected_private_key_path_keeps_the_doubt(self):
         self.private_keys().parent.mkdir(parents=True)
         self.private_keys().write_text('not a directory')
+        p = self.run_vm('installer', self.target)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertNotIn('mask', self.systemctl_log())
+        self.assertEqual(self.gpgconf_calls(), [])
+        self.assertIn('doute conservé', p.stderr)
+
+    def test_a_gnupg_home_that_is_not_a_directory_keeps_the_doubt(self):
+        (self.vmhome / '.gnupg').write_text('not a directory')
+        p = self.run_vm('installer', self.target)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertNotIn('mask', self.systemctl_log())
+        self.assertEqual(self.gpgconf_calls(), [])
+        self.assertIn('doute conservé', p.stderr)
+
+    @unittest.skipIf(os.geteuid() == 0, "root ignore le bit de traversée")
+    def test_an_unreadable_gnupg_home_keeps_the_doubt(self):
+        # #3320 B1 : ~/.gnupg en 000 avec une clé dessous. « test -e » et
+        # « test -L » échouent en EACCES et feraient conclure « absent ».
+        self.private_keys().mkdir(parents=True)
+        (self.private_keys() / 'secret.key').write_text('private')
+        gnupg = self.private_keys().parent
+        gnupg.chmod(0o000)
+        self.addCleanup(gnupg.chmod, 0o700)
+        p = self.run_vm('installer', self.target)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertNotIn('mask', self.systemctl_log())
+        self.assertEqual(self.gpgconf_calls(), [])
+        self.assertIn('doute conservé', p.stderr)
+
+    @unittest.skipIf(os.geteuid() == 0, "root ignore le bit de traversée")
+    def test_an_unreadable_private_keys_directory_keeps_the_doubt(self):
+        self.private_keys().mkdir(parents=True)
+        (self.private_keys() / 'secret.key').write_text('private')
+        self.private_keys().chmod(0o000)
+        self.addCleanup(self.private_keys().chmod, 0o700)
         p = self.run_vm('installer', self.target)
         self.assertEqual(p.returncode, 0, p.stderr)
         self.assertNotIn('mask', self.systemctl_log())
