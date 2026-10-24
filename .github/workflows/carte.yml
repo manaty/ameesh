@@ -50,9 +50,21 @@ name: carte
 # #2116 — suspension temporaire des mesures automatiques (16/10/2026) :
 # quota d'artefacts et mesures répétées sans carte publiée. Le run 38931568303
 # a ses dix mesures vertes ; l'assemblage échoue sur doublons/hors-part (#1632).
-# Réactiver push/main et pull_request après correction de #1632 et un run
-# manuel complet : carte publiée liée à sa base exacte et coût mesuré.
+# #3343 (24/10/2026) — réactivation : #1632 est corrigé et fusionné, un run
+# manuel complet a publié la carte du 17/10 (996f7180, 15 min d'assemblage),
+# et la rétention des artefacts est passée à 1 jour (mesures) / 3 jours
+# (carte) (#2520). Reprennent les poussées sur main et les PR qui touchent la
+# mesure ; une carte de plus de 48 h est signalée par le plan (#3343).
 on:
+  push:
+    branches: [main]
+  pull_request:
+    paths:
+      - scripts/map.py
+      - scripts/map_measure.py
+      - scripts/test-parts.py
+      - tests/support.py
+      - .github/workflows/carte.yml
   workflow_dispatch:
 
 # #1314 — une carte de main n'est jamais annulée par la poussée suivante : la
@@ -249,9 +261,11 @@ jobs:
     runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted", "linux", "ameesh-ci"]') || 'ubuntu-latest' }}
     # #2175 : l'assemblage d'une carte complète (10 parts) coûte ~11 min à 100 % CPU
     # localement ; à 15 min il a été annulé à 15m20 au run 38985327391 alors que les
-    # 10 parts étaient vertes, sans publier de carte. Plafond porté à 30 min,
-    # sous la borne de 60 de #755 ; matrice 6/4 inchangée (plafond des mesures : #2224).
-    timeout-minutes: 30
+    # 10 parts étaient vertes, sans publier de carte.
+    # #3343 : le 19/10 (run 39223265159), l'assemblage tournait encore à 30 min
+    # alors que les dix parts étaient vertes ; le run du 17/10 avait pris 15m30.
+    # Porté à la borne de 60 de #755 : la marge couvre la charge de l'hôte.
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
