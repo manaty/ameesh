@@ -585,6 +585,13 @@ demande n'est pas une journée, c'est un contrat. Le lot #3309 devrait devenir
 la **note + décision** puis être scindé en E1–E4 (ou porter au minimum E1+E2
 dans une session dédiée).
 
+**Intégration.** E1–E4 passent par un **paquet** (§12), pas par une CI de lot
+entre deux coupures ; les migrations sont **additives** et appliquées en
+staging **avant** de relancer les exécuteurs (§11 bis) ; E1, E2 et E3 sont
+sensibles (SQL, droits, argent, concurrence) et exigent deux familles
+distinctes, E4 est léger. Aucune action de staging ou de production n'est
+incluse dans cette note.
+
 # Alternatives écartées
 
 - **Harnais externe piloté par le runner (option b)** : le runner ouvre le
