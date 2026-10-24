@@ -13,7 +13,7 @@ import subprocess
 import tempfile
 import types
 import unittest
-from ameesh import (config, review_provenance, train, train_assembly,
+from ameesh import (config, review_provenance, train, train_assembly, train_canon,
                     train_contracts, train_reservation, train_runner, train_shadow)
 
 MECHANICS = """schema: ameesh-mechanics/1
@@ -192,6 +192,18 @@ class AssemblyTest(unittest.TestCase):
         self.assertIsInstance(passage.reservation, train_reservation.Reservation)
         self.assertAlmostEqual(passage.reservation.deadline({"x": 1}, 1000.0), 8200.0)
         self.assertEqual(passage.policy_commit, self.commit)
+
+    def test_each_passage_compares_its_pin_with_the_gate_canon(self):
+        """#2914: the pin is compared with the gate's canon, never replaced."""
+        for mode in ("shadow", "active"):
+            passage, = self.assemble(train=dict(self.config, mode=mode)).passages
+            self.assertIsInstance(passage.canon, train_canon.Watch)
+            self.assertEqual(passage.canon.pin, self.commit)
+            # this fixture host configures no canon for the gate: unknown, named
+            reading = passage.canon.read(None)
+            self.assertEqual(reading.state, train_canon.UNKNOWN)
+            self.assertIn("no canon configured", reading.why)
+            self.assertEqual(passage.policy_commit, self.commit)
 
     def test_candidate_enrollment_requires_an_activation_boundary(self):
         project = dict(self.config["projects"]["ameesh"], candidate=True)

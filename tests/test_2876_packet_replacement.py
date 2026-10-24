@@ -49,6 +49,13 @@ def packet_run(id=100, *, status="completed", conclusion="cancelled"):
 def gh_for(rows, *, single=False, runs=None, pr_run=None, api_error=False):
     def gh(argv, **kwargs):
         if argv[0] == "api":
+            if "/git/ref/heads/" in argv[1]:
+                # #3308 : la cible résolue se lit par l'API, pas par un champ
+                # `pr view --json` absent de gh 2.45.
+                return types.SimpleNamespace(
+                    returncode=0, stderr="",
+                    stdout=json.dumps({"ref": "refs/heads/main",
+                                       "object": {"type": "commit", "sha": SHA}}))
             if api_error:
                 return types.SimpleNamespace(returncode=1, stderr="unavailable", stdout="")
             if "/actions/runs?" in argv[1]:

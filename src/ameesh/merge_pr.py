@@ -765,7 +765,6 @@ def direct_merge(slug: str, pr: int, head: str, *, lot: int, repo: str, db=None,
                 raise MergePrError(str(exc)) from exc
             reservation = packet_reservation.WriterLease(db, lease_project, ready["target"])
             reservation.acquire()
-        api_base = (view.get("baseRefOid") or "").lower()
         merge_state = (view.get("mergeStateStatus") or "").upper()
 
         tip, fetched = _fetch(owner, fetch_url, target, pr)
@@ -819,7 +818,10 @@ def direct_merge(slug: str, pr: int, head: str, *, lot: int, repo: str, db=None,
             raise MergePrError("the merge commit %s does not have (%s, %s) as parents: %s"
                                % (merge_sha[:12], tip[:12], head[:12], " ".join(parents)))
         evidence = {"pr": pr, "url": view.get("url") or "", "target": target,
-                    "frozen": head, "tip": tip, "api_base": api_base, "merge": merge_sha,
+                    "frozen": head, "tip": tip,
+                    # #3308 : gh 2.45 n'expose pas `baseRefOid` dans `pr view` ;
+                    # la cible résolue est le tip rapatrié et vérifié plus haut.
+                    "api_base": tip, "merge": merge_sha,
                     "tree": tree, "frozen_tree": frozen_tree,
                     "workflow_files": touched, "changed_files": len(files),
                     "merge_state": merge_state,

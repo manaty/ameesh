@@ -1,9 +1,12 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """#3291: merged fixes that still hold work because staging has not caught up.
 
-Only active holds and explicit dependency edges count. Mentioning a lot in a
-description is not a dependency. Evidence is dated: the last attestation of
-each host, not a tag, a package version number or the lot's branch head.
+Only active holds count (#3297). An explicit dependency is satisfied by the
+merge and says nothing about staging, so it is not a deployment wait. A hold
+is prose: a `#N` or `migration N` is read only in a clause that names a
+deployment wait — a conflict, a PR, a package, a freeze or a review is not
+one. Evidence is dated: the last attestation of each host, not a tag, a
+package version number or the lot's branch head.
 """
 from __future__ import annotations
 
@@ -19,6 +22,56 @@ SCHEMA = "ameesh-staging-pending/1"
 _SHA = re.compile(r"^[0-9a-f]{7,40}$")
 _LOT = re.compile(r"(?<![\w/])#([1-9][0-9]*)\b")
 _MIGRATION = re.compile(r"\bmigration\s+0*([1-9][0-9]*)\b", re.I)
+
+#: #3297: a hold note is free prose. Clauses end on sentence marks; the dots
+#: of a version (`1.20.0`) do not end one.
+_CLAUSE = re.compile(r"[;!?\n]+|(?<!\d)\.(?!\d)")
+#: A reference is a deployment wait only in a clause that says so. A bare
+#: `#3266` in "conflit avec #3266" is not a wait, and neither is a reference
+#: to a PR, a ticket, a package or a review. Explicit wait words count
+#: ("attendre #3111"); "bloqué par #X" does not — it states an execution
+#: dependency, which is satisfied at merge.
+_WAIT = re.compile(
+    r"\battend(?:s|re|u)?\b|\battente\b|\bwait(?:ing)?\b|"
+    r"\bdéploiement\b|\bdéploy[ée]e?s?\b|\bdeploy(?:ed|ment|s|ing)?\b(?!-)|"
+    r"\bstaging\b|\brelease\b|\bmise\s+à\s+jour\b|"
+    r"\b(?:pas|non)\s+(?:encore\s+)?(?:actif|active|déployé|déployée|"
+    r"appliqué|appliquée)\b|"
+    r"\bn'est\s+pas\s+(?:encore\s+)?(?:actif|active|déployé|déployée|dans)\b|"
+    r"\babsent\w*\b|\bmanque\w*\b|\bne\s+contient\b|\bdoit\s+porter\b|"
+    r"\bdans\s+le\s+tag\b|\bdans\s+la\s+release\b|\bdans\s+la\s+version\b",
+    re.I)
+#: What makes a `#N` something else than a lot to deploy. Read in a short
+#: window before the reference (the form "ticket IMA #796" is also caught
+#: after it by `_NOT_A_LOT_AFTER`).
+_NOT_A_LOT = re.compile(
+    r"\b(?:conflit|écart[ée]e?s?|exclu[es]?|remplac[ée]e?s?|pas\s+le\s+lot|"
+    r"relu\s+par|relecture|verdict|"
+    r"PR|pull\s+request|issue|ticket|paquet|package|panier|basket|unit|"
+    r"véhicule|vehicle|décision|decision|approval|gel|freeze|note|commit|"
+    r"migration)\b", re.I)
+_NOT_A_LOT_AFTER = re.compile(r"^\s*\(\s*(?:ticket|issue|PR|pull)\b", re.I)
+
+
+def _deployment_refs(note) -> tuple[set[int], set[int]]:
+    """Lots and migrations a hold really waits for at staging (#3297).
+
+    Every `#N` of a hold note used to count, so a conflict (#3266), a PR, a
+    package, a freeze or a review reference inflated the threshold. Only a
+    reference inside a clause that ties it to a deployment wait counts.
+    """
+    lots, migrations = set(), set()
+    for clause in _CLAUSE.split(str(note or "")):
+        if not _WAIT.search(clause):
+            continue
+        for match in _LOT.finditer(clause):
+            before = clause[max(0, match.start() - 32):match.start()]
+            after = clause[match.end():match.end() + 24]
+            if _NOT_A_LOT.search(before) or _NOT_A_LOT_AFTER.search(after):
+                continue
+            lots.add(int(match.group(1)))
+        migrations.update(int(number) for number in _MIGRATION.findall(clause))
+    return lots, migrations
 
 
 def active_hosts() -> dict[str, dict]:
@@ -51,18 +104,29 @@ def active_hosts() -> dict[str, dict]:
     return out
 
 
-def regressions(project, candidate: str, active=None) -> dict[str, str]:
+def regressions(project, candidate: str, active=None, *, unknown=None) -> dict[str, str]:
     """Hosts whose attested content would be lost by deploying candidate.
 
     An unresolvable attestation refuses the action rather than permitting a
-    rollback because this clone has not fetched that commit yet.
+    rollback because this clone has not fetched that commit yet. The read-only
+    report passes `unknown` to record that host instead of failing every tick
+    (#3297); the release and staging paths keep the default refusal.
     """
     from . import release_cutoff as rc
     out = {}
     if project.name != "ameesh":
         return out
     for host, evidence in (active_hosts() if active is None else active).items():
-        sha = rc.commit_of(project.repo, evidence["sha"])
+        try:
+            sha = rc.commit_of(project.repo, evidence["sha"])
+        except rc.TransientReleaseError:
+            raise
+        except rc.ReleaseError:
+            if unknown is None:
+                raise
+            unknown.append({"host": host, "active": evidence["sha"],
+                            "reason": "active commit absent from the release clone"})
+            continue
         result = rc._git(project.repo, "merge-base", "--is-ancestor", sha, candidate)
         if result.returncode not in (0, 1):
             raise rc.TransientReleaseError("cannot compare active %s to candidate %s"
@@ -90,10 +154,9 @@ def waiting(db, project, *, active=None) -> dict:
     ids = [int(r["id"]) for r in candidates]
     holds = planned_waits.active_holds(
         db, st.progress.lot_hold_events(ids, planned_waits.HOLD_NOTE_PATTERNS))
-    edges = st.work_dependencies.for_items(ids)
+    # #3297: an explicit dependency is satisfied by the merge; it does not say
+    # that the blocker must be active on the hosts. Only active holds are read.
     refs: dict[int, set[int]] = {}
-    for edge in edges:
-        refs.setdefault(int(edge["work_item_id"]), set()).add(int(edge["blocker_id"]))
     # A migration reference is resolved only against declared reservations of
     # this project. No bare integer or ticket number can become a migration.
     migrations = {}
@@ -107,33 +170,58 @@ def waiting(db, project, *, active=None) -> dict:
             migrations.setdefault(reservation["number"], set()).add(int(row["id"]))
     for ident, by_actor in holds.items():
         for hold in by_actor.values():
-            note = hold["note"]
-            refs.setdefault(ident, set()).update(int(m) for m in _LOT.findall(note))
-            for number in _MIGRATION.findall(note):
-                refs[ident].update(migrations.get(int(number), ()))
+            lots, numbers = _deployment_refs(hold["note"])
+            refs.setdefault(ident, set()).update(lots)
+            for number in numbers:
+                refs[ident].update(migrations.get(number, ()))
     active = active_hosts() if active is None else active
-    needed, unknown, cache = [], [], {}
+    needed, unknown = [], []
+    milestones: dict[int, dict | None] = {}
+    commits: dict[str, str | None] = {}
+
+    def commit(ref):
+        # #3297: a merged head absent from this clone (squashed or unfetched
+        # branch) is unknown evidence, not an unreadable report on every tick.
+        if ref not in commits:
+            try:
+                commits[ref] = rc.commit_of(project.repo, ref)
+            except rc.TransientReleaseError:
+                raise
+            except rc.ReleaseError:
+                commits[ref] = None
+        return commits[ref]
+
     for ident, blockers in sorted(refs.items()):
         for blocker in sorted(blockers):
             source = rows.get(blocker)
             if not source or source.get("app") != project.name or blocker == ident:
                 continue
-            if blocker not in cache:
-                cache[blocker] = _merged(st.work.milestones(blocker, limit=None))
-            merged = cache[blocker]
+            if blocker not in milestones:
+                milestones[blocker] = _merged(st.work.milestones(blocker, limit=None))
+            merged = milestones[blocker]
             if not merged:
                 continue
-            sha = rc.commit_of(project.repo, merged["sha"])
+            sha = commit(merged["sha"])
+            if sha is None:
+                unknown.append({"lot": ident, "blocker": blocker, "sha": merged["sha"],
+                                "reason": "merged commit absent from the release clone"})
+                continue
             missing_hosts = []
             for host, evidence in active.items():
-                current = rc.commit_of(project.repo, evidence["sha"])
+                current = commit(evidence["sha"])
+                if current is None:
+                    unknown.append({"lot": ident, "blocker": blocker, "sha": sha,
+                                    "host": host, "active": evidence["sha"],
+                                    "reason": "active commit absent from the release clone"})
+                    continue
                 check = rc._git(project.repo, "merge-base", "--is-ancestor", sha, current)
                 if check.returncode not in (0, 1):
                     raise rc.TransientReleaseError("unreadable staging ancestry")
                 if check.returncode:
                     missing_hosts.append(host)
             if not active:
-                unknown.append({"lot": ident, "blocker": blocker, "sha": sha})
+                unknown.append({"lot": ident, "blocker": blocker, "sha": sha,
+                                "reason": "no active host attestation"})
             elif missing_hosts:
                 needed.append({"lot": ident, "app": rows[ident].get("app"),
                                "blocker": blocker, "sha": sha,
@@ -170,7 +258,11 @@ def inspect(cfg, db, project, *, now: float) -> dict:
         project.repo, head, project)
     report["candidate"] = candidate
     report.update(_window(rules, now))
-    report["regressions"] = regressions(project, candidate, report["active"]) if candidate else {}
+    unresolved = []
+    report["regressions"] = (regressions(project, candidate, report["active"],
+                                         unknown=unresolved) if candidate else {})
+    if unresolved:
+        report["unknown"].extend(unresolved)
     # A last-green commit before the merged fix would deploy nothing useful.
     missing = set()
     for row in report["waiting"]:
@@ -178,7 +270,8 @@ def inspect(cfg, db, project, *, now: float) -> dict:
                                     row["sha"], candidate).returncode != 0:
             missing.add(row["lot"])
     report["candidate_unblocks"] = sorted(set(report["lots"]) - missing)
-    report["candidate_ready"] = len(report["candidate_unblocks"]) >= policy.waiting_lots_min
+    report["candidate_ready"] = (len(report["candidate_unblocks"]) >= policy.waiting_lots_min
+                                 and not unresolved)
     return report
 
 

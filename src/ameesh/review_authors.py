@@ -40,6 +40,11 @@ auteurs, avec les mêmes exceptions du canon §2 :
   calculée avant un rebase, peut contenir du develop déjà relu sous son propre
   lot ; un inconnu d'un gel antérieur qui n'est plus ancêtre de la tête et dont
   le contenu ne survit pas ne bloque pas non plus (#3116) ;
+* un ancien commit sans reçu et sans attribution ne bloque plus quand son
+  contenu a disparu, ou quand le même auteur l'a réémis avec reçu exact et
+  patch-id verbatim identique dans la plage courante (#3301, constat
+  mesh-design du 24/10/2026 sur #3033). Cela ne crée aucun reçu tardif et ne
+  retire jamais un auteur historique prouvé ;
 * quand le reçu exact manque (commit restauré par rebase, correction poussée
   hors du hook), le commit est attribué à la famille de session de son
   committer, lue au journal des tours (`turn_costs`, `_turns_harness`) : un
@@ -1671,8 +1676,8 @@ def _freeze_reference(db, item: Mapping, freeze: Mapping, families) -> dict:
 
 def _prior_reading(db, item: Mapping, freeze: Mapping, commits: Sequence[str],
                    repo: str, families, *, provider=None,
-                   strict: bool = False, target: str = "", head: str = "",
-                   base: str = "", cache: Optional[dict] = None
+                   strict: bool = False, ignore_missing=None, target: str = "",
+                   head: str = "", base: str = "", cache: Optional[dict] = None
                    ) -> tuple[dict, dict, dict, list]:
     """`(auteurs, commits_écrits, corrections, inconnus)` d'un gel antérieur.
 
@@ -1683,6 +1688,8 @@ def _prior_reading(db, item: Mapping, freeze: Mapping, commits: Sequence[str],
     les commits des relecteurs désignés ; leur qualification de « correctif de
     premier tour » se fait dans `_prior_correctors` (#2888).
 
+    `ignore_missing(sha)` (#3301) ne dispense que les commits sans reçu et
+    sans attribution : jamais un auteur prouvé ou un reçu contradictoire.
     #3116 : `target` est la cible au moment de la lecture. Ses commits ne
     comptent ni comme auteurs ni comme tiers. Hors cible, un inconnu qui n'est
     plus ancêtre de `head` et dont le contenu ne survit pas ne bloque plus
@@ -1699,7 +1706,17 @@ def _prior_reading(db, item: Mapping, freeze: Mapping, commits: Sequence[str],
     commits = _not_in_target(repo, commits, target)
 
     def record_unknown(value: str) -> None:
-        """Un inconnu ne bloque que s'il compte encore pour la tête (#3116)."""
+        """Un inconnu ne bloque que s'il compte encore pour la tête (#3116),
+        et qu'il n'est pas dispensé comme obsolete (#3301)."""
+        if not _survives_rewrite(repo, head, value, cache, base, target):
+            return
+        if ignore_missing is not None and ignore_missing(value):
+            return
+        unknown.append(str(value)[:12])
+
+    def record_unreadable(value: str) -> None:
+        """Un reçu contradictoire ou vide n'est jamais dispensé par #3301 ;
+        #3116 écarte seulement ce qui ne compte plus pour la tête."""
         if _survives_rewrite(repo, head, value, cache, base, target):
             unknown.append(str(value)[:12])
 
@@ -1712,7 +1729,7 @@ def _prior_reading(db, item: Mapping, freeze: Mapping, commits: Sequence[str],
         except review_provenance.ProvenanceError:
             if strict:
                 raise
-            record_unknown(sha)
+            record_unreadable(sha)
             continue
         if receipt is None:
             actor, stamp = commit_actor(repo, sha, db)
@@ -1741,7 +1758,7 @@ def _prior_reading(db, item: Mapping, freeze: Mapping, commits: Sequence[str],
             continue
         actor = str(receipt.get("actor") or "").strip()
         if not actor:
-            record_unknown(sha)
+            record_unreadable(sha)
             continue
         proven = _family(receipt.get("harness"), families)
         by_name.setdefault(actor, set()).add(proven)
@@ -1758,6 +1775,48 @@ def _prior_reading(db, item: Mapping, freeze: Mapping, commits: Sequence[str],
             if proven:
                 by_name[actor].add(proven)
     return by_name, written, review_commits, unknown
+
+
+def _authored_patch(db, repo: str, sha: str, cache: dict):
+    """`(auteur Git d'agent, patch-id verbatim)`, ou None si non prouvé.
+
+    #3301 : ce n'est pas un reçu du commit. La paire ne sert qu'à reconnaître
+    une copie sans reçu réémise **par son auteur** avec un reçu exact. Le
+    patch-id verbatim conserve les espaces ; un diff vide ou illisible ne
+    peut donc pas acheter cette équivalence."""
+    if sha not in cache:
+        cache[sha] = None
+        try:
+            text = plan_git._out(repo, "show", "-s", "--format=%ae%x1f%at", sha)
+            fields = str(text or "").split("\x1f")
+            if len(fields) != 2:
+                return None
+            author = _agent_of_email(db, fields[0], float(fields[1]))
+            if not author:
+                return None
+            patch = plan_git._diff_patch_id(repo, sha + "^", sha)
+            if patch:
+                cache[sha] = (author.casefold(), patch)
+        except Exception:  # noqa: BLE001 - comparaison impossible : inconnu
+            pass
+    return cache[sha]
+
+
+def _received_patch_authors(db, repo: str, commits: Sequence[str], families,
+                            cache: dict, *, provider=None) -> set:
+    """Les patches réémis par leur auteur avec reçu exact dans la plage lue."""
+    out = set()
+    for sha in commits:
+        try:
+            receipt = _commit_receipt(provider, db, sha, strict=True)
+        except review_provenance.ProvenanceError:
+            continue                    # une preuve invalide n'excuse rien
+        if not receipt or not _family(receipt.get("harness"), families):
+            continue
+        pair = _authored_patch(db, repo, sha, cache)
+        if pair and pair[0] == str(receipt["actor"]).strip().casefold():
+            out.add(pair)
+    return out
 
 
 def _prior_correctors(repo: str, review_commits: Mapping) -> dict:
@@ -1867,6 +1926,12 @@ def _carried_from_previous(db, item: Mapping, milestone: Optional[Mapping],
     La note du gel remplaçant porte la trace de la déclaration. Un gel remplacé
     mais encore lisible est lu comme avant (B5).
 
+    #3301 : un commit antérieur sans reçu et sans attribution ne reste inconnu
+    que si son contenu subsiste sans équivalent reçu. Une réémission par le
+    même auteur Git d'agent doit porter un reçu exact de cet auteur et le même
+    patch-id verbatim dans la plage courante. Cela n'atteste jamais le vieux
+    committer et ne retire aucun auteur déjà prouvé ; une contradiction reste
+    refusée. Un contenu prouvé disparu n'ajoute plus d'inconnu non plus.
     #3116 : `target` est la cible au moment de la lecture (un commit ou une
     ref). Un commit qui y est déjà entré a été relu sous son propre lot : il ne
     compte ni comme auteur ni comme tiers, même s'il apparaît dans la plage
@@ -1937,6 +2002,26 @@ def _carried_from_previous(db, item: Mapping, milestone: Optional[Mapping],
     processed: list[str] = []
     survival: dict[str, bool] = {}
     file_cache: dict = {}
+    patch_cache: dict = {}
+    received_patches = None
+
+    def obsolete_missing(commit: str, *, stored: bool) -> bool:
+        nonlocal received_patches
+        if plan_git.full_commit_id(commit) in current_set:
+            return False                # aucune dispense de la plage courante
+        if not stored:
+            if commit not in survival:
+                survival[commit] = _commit_survives(
+                    repo, head_sha, commit, file_cache, base)
+            if not survival[commit]:
+                return True             # ce contenu n'est plus dans la tête
+        pair = _authored_patch(db, repo, commit, patch_cache)
+        if pair is None:
+            return False
+        if received_patches is None:
+            received_patches = _received_patch_authors(
+                db, repo, commits, families, patch_cache, provider=provider)
+        return pair in received_patches
 
     def survives(written: Mapping, stored: bool, actor: str, *,
                  every: bool = False) -> bool:
@@ -2066,11 +2151,15 @@ def _carried_from_previous(db, item: Mapping, milestone: Optional[Mapping],
         if not earlier or all(plan_git.full_commit_id(value) in current_set
                               for value in earlier):
             continue                     # déjà attribué par la plage courante
+        ancestor = _is_ancestor(repo, sha, head_sha)
+        stored = (True if ancestor is True
+                  else _freeze_content_preserved(repo, sha, head_sha, base))
         try:
             by_name, written, review_commits, unreadable = _prior_reading(
                 db, item, row, earlier, repo, families,
                 provider=provider, strict=strict, target=target_sha,
-                head=head_sha, base=base, cache=file_cache)
+                head=head_sha, base=base, cache=file_cache,
+                ignore_missing=lambda commit: obsolete_missing(commit, stored=stored))
         except Exception as exc:  # noqa: BLE001 - un gel antérieur illisible
             if strict:
                 raise review_provenance.ProvenanceError(
@@ -2079,9 +2168,6 @@ def _carried_from_previous(db, item: Mapping, milestone: Optional[Mapping],
             unknown.append(sha[:12])
             continue
         unknown.extend(unreadable)
-        ancestor = _is_ancestor(repo, sha, head_sha)
-        stored = (True if ancestor is True
-                  else _freeze_content_preserved(repo, sha, head_sha, base))
         for actor, proven in by_name.items():
             if not survives(written, stored, actor):
                 continue

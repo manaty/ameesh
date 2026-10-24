@@ -44,6 +44,8 @@
         [--full] [--sha S] [--force] [--dry-run]        on the frozen commit (#1343)
   agent-mesh ci cancel <item> [--all] [--dry-run]       cancel the stale runs of a lot
   agent-mesh agent spawn <name> --by <creator> --ttl 2h   ephemeral agent (R14)
+  agent-mesh agent move NOM --to HOST [--keep-session]   manual move of a `releve: hote`
+                                                          agent, fenced (#3299)
 
 The owner's authority is never inferred from text: it is proven by an Ed25519
 signature whose public key is in agent_registry, bound to the content and to
@@ -2374,6 +2376,37 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                 print("lot #%d: %s — %s" % (row["id"], row["status"],
                                            row.get("project") or row.get("reason", "changed concurrently")))
             return 0
+        if args.work_command == "pending-reviews":
+            # #3033 : les avis qu'un agent doit encore rendre (le calcul de la
+            # charge de désignation, #3004) ; l'agent lié par défaut.
+            from . import review_designation_activation as activation
+            agent = None if args.all else (args.agent or "").strip()
+            if agent == "":
+                # `identity` est local à `cmd_work` (import de la branche `add`) :
+                # le nom du module n'est pas lié ici (relecture dev3, B).
+                from .identity import resolve_binding
+                binding = resolve_binding(cfg, db)
+                if not binding.ok:
+                    print("ameesh work pending-reviews: give AGENT or --all (no bound "
+                          "identity)", file=sys.stderr)
+                    return 2
+                agent = binding.name
+            rows = activation.pending_reviews(db, agent)
+            if args.json:
+                print(json.dumps(rows, ensure_ascii=False, indent=2, default=str))
+                return 0
+            if not rows:
+                print("no pending review%s" % (" for %s" % agent if agent else ""))
+                return 0
+            from .sous_utilisation import _duration
+            now = time.time()
+            for row in rows:
+                since = row.get("designated_ts")
+                print("#%d [%s] %s — %s, head %s, designated %s ago" % (
+                    row["lot"], row["state"] or "?", row["title"], row["name"],
+                    row["sha"][:12],
+                    _duration(now - since) if since is not None else "?"))
+            return 0
         if args.work_command == "reviewers":
             from . import review_designation_activation as activation
             out = activation.reviewers(cfg, db, args.id, apply=args.apply)
@@ -3479,6 +3512,16 @@ def build_parser() -> argparse.ArgumentParser:
     pw_reviewer.add_argument("--reason", default="",
                              help="#3183: why the floor (journaled with it)")
     pw_reviewer.set_defaults(func=cmd_work)
+    pw_pending = work_sub.add_parser(
+        "pending-reviews",
+        help="#3033: the reviews an agent still owes — open lots whose latest freeze "
+             "designates them without a verdict of theirs on that head")
+    pw_pending.add_argument("agent", nargs="?", metavar="AGENT",
+                            help="default: the session's bound identity")
+    pw_pending.add_argument("--all", action="store_true",
+                            help="every reviewer's pending reviews")
+    pw_pending.add_argument("--json", action="store_true")
+    pw_pending.set_defaults(func=cmd_work)
     pw_reviewers = work_sub.add_parser(
         "reviewers",
         help="#2447: read the automatic reviewer designation of the latest freeze, "

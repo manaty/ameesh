@@ -655,6 +655,45 @@ def _lots(db, name: str) -> list[str]:
     return out
 
 
+#: #3033 : bornes de la liste des avis dus dans un brief ou un tour au repos
+REVIEWS_MAX = 20
+NO_PENDING_REVIEW = "No review is waiting for your verdict."
+
+
+def pending_review_lines(db, name: str, *, now: float | None = None) -> list[str]:
+    """#3033 : les avis que l'agent doit encore rendre, une ligne par lot.
+
+    La lecture est `review_designation_activation.pending_reviews`, le seul
+    calcul d'un avis dû (le même que la charge de la désignation, #3004) : un
+    lot ouvert dont le dernier gel le désigne sans verdict de sa part sur
+    cette tête. La désignation est un courrier lu une fois ; cette liste est
+    ce qui la fait survivre aux rotations. Une lecture illisible le dit, elle
+    ne rend jamais une file vide."""
+    from . import review_designation_activation as activation
+    from .sous_utilisation import _duration
+    try:
+        rows = activation.pending_reviews(db, name)
+    except Exception as exc:  # noqa: BLE001 - illisible : dit, jamais « aucun avis »
+        return ["(pending reviews unreadable: %s — `ameesh work pending-reviews`)"
+                % fil.excerpt(str(exc), 120)]
+    if not rows:
+        return [NO_PENDING_REVIEW]
+    now = time.time() if now is None else float(now)
+    out = []
+    for row in rows[:REVIEWS_MAX]:
+        since = row.get("designated_ts")
+        age = (" for %s" % _duration(now - float(since))) if since is not None else ""
+        out.append("- #%s [%s] %s — frozen head %s, designated%s: "
+                   "`ameesh work milestone %s verdict ok|blocked --sha %s`" % (
+                       row["lot"], row.get("state") or "?",
+                       fil.excerpt(row.get("title") or "", 100), row["sha"][:12], age,
+                       row["lot"], row["sha"]))
+    if len(rows) > REVIEWS_MAX:
+        out.append("- … and %d more: `ameesh work pending-reviews %s`"
+                   % (len(rows) - REVIEWS_MAX, name))
+    return out
+
+
 def _fil(cfg: Config, project: str) -> tuple[list[str], int]:
     """Les derniers échanges du fil du projet, bornés en nombre et en octets."""
     try:
@@ -756,6 +795,10 @@ def deterministic_brief(cfg: Config, db, row: dict | None, *, session: str | Non
                     "it and do not write to it.", ""]
     fin = ["## Instructions", (consigne or DEFAULT_RESUME).strip()]
     lots_sec = ["## Work items assigned to you"] + lots + [""]
+    # #3033 : les avis dus survivent à la rotation (la désignation est un
+    # courrier déjà lu) ; ils passent avant le fil, qui prend le reste.
+    lots_sec += ["## Reviews you owe (designated, no verdict on the frozen head)"] \
+        + pending_review_lines(db, name) + [""]
     fixe = "\n".join(head + ident + election_sec + [""] + lots_sec + courrier
                      + [""] + extra + ancienne + fin)
     reste = BRIEF_MAX_BYTES - _octets(fixe) - 200
