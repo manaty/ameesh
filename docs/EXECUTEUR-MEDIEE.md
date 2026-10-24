@@ -26,7 +26,7 @@ en silence.
 
 | Fichier | Rôle |
 |---|---|
-| `src/ameesh/mediated_executor/contract.json` | la table fermée des 72 opérations et la liste des 425 refusées |
+| `src/ameesh/mediated_executor/contract.json` | la table fermée des 72 opérations et la liste des 426 refusées |
 | `src/ameesh/mediated_executor/contract.py` | chargeur (`load()`), enveloppes, idempotence, erreurs, vérificateur de schémas |
 | `src/ameesh/mediated_executor/events.py` | flux SSE, attente longue, curseurs |
 | `src/ameesh/mediated_executor/gate.py` | `HostGate`, `ameesh-host-state/1`, `ameesh-host-ack/1` |
@@ -74,7 +74,7 @@ Comptes : 72 opérations, dont 29 lectures et 43 écritures. 62 passent par
 lignes de `op` sont marquées `session: true` (contrats 1.1, 1.2, 1.3, 1.5 et
 1.6) : elles sont servies aussi par `session/op`. Le test
 vérifie que chaque ligne existe dans `storage.interface` avec la même
-signature et les mêmes types. Il vérifie aussi que l'interface entière (497
+signature et les mêmes types. Il vérifie aussi que l'interface entière (498
 opérations) est classée, admise ou refusée. Toute opération ajoutée à
 l'interface fait donc échouer le test tant qu'elle n'est pas classée.
 
@@ -86,8 +86,8 @@ cette lecture pour protéger les processus migrés dans un autre tour vivant.
 Sans agent admis, la lecture rend `forbidden_scope`, plutôt qu'une liste vide
 qui ferait croire au Tracker qu'aucun autre tour n'a de propriétaire.
 
-Les 22 opérations ajoutées à l'interface par la 1.6.x sont refusées à
-l'appareil : les 7 opérations du ménage `housekeeping.*` (L73), les 8 de
+Les 23 opérations ajoutées à l'interface par la 1.6.x sont refusées à
+l'appareil : les 8 opérations du ménage `housekeeping.*` (L73), les 8 de
 `roadmap.*` (feuille de route, L96), `turn_costs.correct`, `ledger`,
 `spent_between` (grand livre, L95), `operations.assigners`, `latest_gauges`
 (sous-utilisation, L94), `hosts.usage` et `turn_resources.get`.

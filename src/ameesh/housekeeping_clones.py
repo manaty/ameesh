@@ -105,20 +105,51 @@ def _strip_agents(name: str, agents) -> str:
     return rest
 
 
+#: a number glued to one of these tokens still names a lot (`wt3220`,
+#: `.work-1392`) ; glued to any other letters it is a SHA fragment
+#: (`review-3220-ab1234cd` names #3220, not #1234 ; `wt3220-ca47` not #47).
+NAME_TOKEN = re.compile(
+    r"(?:^|[._-])(wt|work|lot|review|prep|tmp|scratch|agent|paquet)$",
+    re.IGNORECASE)
+
+
+def _named_numbers(rest: str) -> list[str]:
+    """The numbers a name carries, with the conventions that make one a lot.
+
+    A version (`0.2.10`) is not a lot: a number touching a dot is out. A
+    number glued to letters is a SHA fragment, not a lot, unless a
+    worktree/clone token names it. A zero-padded group (`-02`) is never a lot
+    (#2182). A one-digit group is an agent number when the name also carries
+    a longer number (`ds4-749-review` is #749)."""
+    found = []
+    for match in re.finditer(r"\d+", rest):
+        start, end = match.span()
+        before = rest[start - 1] if start else ""
+        after = rest[end] if end < len(rest) else ""
+        if before == "." or after == ".":
+            continue
+        if (before.isalpha() or after.isalpha()) \
+                and not NAME_TOKEN.search(rest[:start]):
+            continue
+        part = match.group()
+        if len(part) > 1 and part.startswith("0"):
+            continue
+        found.append(part)
+    if any(len(part) > 1 for part in found):
+        found = [part for part in found if len(part) > 1]
+    return found
+
+
 def named_lots(name: str, agents=()) -> list[int]:
     """Lot ids named by a clone's directory name.
 
     A one-digit group is read as an agent number when the name carries a
     longer number too (`ds4-749-review` is lot 749). When it is the only
-    number it may be a lot (`lot-1`), so it is kept.
+    number it may be a lot (`lot-1`), so it is kept. `_named_numbers` states
+    the rest of the convention (versions, SHA fragments, zero padding).
     """
     rest = _strip_agents(name or "", agents)
-    # A version (`0.2.10`) is not a lot: a group surrounded by dots is not a
-    # candidate. `-665-`, `_665`, a trailing `665` are.
-    groups = re.findall(r"(?<![0-9.])([0-9]+)(?![0-9.])", rest)
-    if any(len(part) > 1 for part in groups):
-        groups = [part for part in groups if len(part) > 1]
-    return [int(part) for part in groups]
+    return [int(part) for part in _named_numbers(rest)]
 
 
 def _branch_lots(path: str) -> list[int] | None:

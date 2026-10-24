@@ -181,3 +181,11 @@ class Housekeeping(interface.Housekeeping):
             " WHERE id = %s RETURNING " + WORKTREE_COLUMNS,
             (status, detail or "", status, int(worktree_id)))
         return rows[0] if rows else None
+
+    def set_worktree_attribution(self, worktree_id, agent, lot, detail) -> dict | None:
+        rows = self.db.query(
+            "UPDATE managed_worktrees SET agent = %s, lot = %s, detail = %s,"
+            " checked_at = now() WHERE id = %s RETURNING " + WORKTREE_COLUMNS,
+            (agent or "", None if lot is None else str(lot), detail or "",
+             int(worktree_id)))
+        return rows[0] if rows else None
