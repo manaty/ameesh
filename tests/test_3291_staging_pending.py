@@ -59,14 +59,13 @@ class WaitingTest(ReleaseFixtureMixin, unittest.TestCase):
         self.active = {"vm": {"sha": self.old, "at": 1}}
         self.rows = [{"id": 3111, "app": "ameesh", "state": "merged",
                       "migrations": [{"number": 477, "repo": "manaty/ameesh"}]}]
-        self.events, self.edges = [], []
+        self.events = []
         self.milestones = {3111: [{"id": 10, "kind": "merged", "sha": self.head,
                                   "at_ts": 5, "at": "2026-10-24T04:00:00Z"}]}
         self.st = types.SimpleNamespace(
             work=types.SimpleNamespace(items=lambda **kw: self.rows,
                                        milestones=lambda ident, **kw: self.milestones.get(ident, [])),
-            progress=types.SimpleNamespace(lot_hold_events=lambda *a: self.events),
-            work_dependencies=types.SimpleNamespace(for_items=lambda ids: self.edges))
+            progress=types.SimpleNamespace(lot_hold_events=lambda *a: self.events))
         patch = mock.patch.object(staging_pending.storage, "of", return_value=self.st)
         patch.start()
         self.addCleanup(patch.stop)
@@ -109,15 +108,99 @@ class WaitingTest(ReleaseFixtureMixin, unittest.TestCase):
         self.milestones[3111][0]["annulled"] = True
         self.assertEqual(self.scan()["lots"], [])
 
-    def test_explicit_dependency_and_migration_only_hold(self):
+    def test_satisfied_dependency_and_migration_only_hold(self):
+        # #3297: an explicit dependency is satisfied at merge and is not a
+        # deployment wait; the storage graph is not even read. Only an active
+        # hold that states the wait counts.
         self.rows.append({"id": 1, "app": "nexlink", "state": "qa"})
-        self.edges.append({"work_item_id": 1, "blocker_id": 3111})
+        self.st.work_dependencies = types.SimpleNamespace(for_items=mock.Mock(
+            return_value=[{"work_item_id": 1, "blocker_id": 3111, "blocking": False}]))
         self.hold(2, "hold: migration 0477 pas encore active")
-        self.assertEqual(self.scan()["lots"], [1, 2])
+        self.assertEqual(self.scan()["lots"], [2])
+        self.st.work_dependencies.for_items.assert_not_called()
         self.active = {}
         result = self.scan()
         self.assertEqual(result["lots"], [])
-        self.assertEqual(len(result["unknown"]), 2)
+        self.assertEqual(len(result["unknown"]), 1)
+        self.assertEqual(result["unknown"][0]["blocker"], 3111)
+        self.assertIn("no active host", result["unknown"][0]["reason"])
+
+    def test_conflict_pr_package_freeze_and_review_are_not_deployment_waits(self):
+        # #3297: the reviewer's real examples — "conflit avec #3266", a PR
+        # number, a package, a freeze id and a review reference. Each clause
+        # also carries a deployment word, so only the context filter rejects
+        # them.
+        for ident, note in enumerate((
+                "hold: écarté de h-03 : conflit sémantique avec #3111, pas déployé",
+                "hold: PR #3111 pas déployée",
+                "hold: paquet #3111 pas déployé",
+                "hold: gel #3111 pas déployé",
+                "hold: relu par #3111, pas déployé",
+                "hold: ticket IMA #3111, pas déployé",
+                "hold: pas le lot ameesh #3111, pas déployé"), start=1):
+            self.hold(ident, note)
+        self.assertEqual(self.scan()["lots"], [])
+        self.hold(9, "hold: #3111 n'est pas déployé sur les hôtes")
+        self.assertEqual(self.scan()["lots"], [9])
+
+    def test_explicit_wait_words_count_without_a_deployment_word(self):
+        self.hold(1, "hold: attendre #3111")
+        self.hold(2, "hold: la version 1.21.0 doit porter #3111")
+        self.assertEqual(self.scan()["lots"], [1, 2])
+
+    def test_missing_merged_commit_goes_to_unknown_without_hiding_others(self):
+        # #3297 N2: one merged head absent from the release clone used to make
+        # the whole report unreadable at every tick.
+        self.hold(1, "hold: #3111 pas encore déployé")
+        self.rows.append({"id": 3112, "app": "ameesh", "state": "merged"})
+        self.milestones[3112] = [{"id": 11, "kind": "merged", "sha": "b" * 40,
+                                  "at_ts": 6}]
+        self.hold(2, "hold: #3112 pas encore déployé")
+        result = self.scan()
+        self.assertEqual(result["lots"], [1])
+        self.assertEqual(len(result["unknown"]), 1)
+        self.assertEqual(result["unknown"][0]["lot"], 2)
+        self.assertEqual(result["unknown"][0]["blocker"], 3112)
+        self.assertIn("merged commit", result["unknown"][0]["reason"])
+
+    def test_missing_active_commit_is_unknown_and_other_hosts_still_read(self):
+        # #3297 N2: an attestation whose commit is not in this clone is
+        # unknown evidence for that host, not an unreadable report.
+        self.hold(1, "hold: #3111 pas encore déployé")
+        self.active = {"good": {"sha": self.old, "at": 1},
+                       "lost": {"sha": "c" * 40, "at": 1}}
+        result = self.scan()
+        self.assertEqual(result["lots"], [1])
+        self.assertEqual(len(result["unknown"]), 1)
+        self.assertEqual(result["unknown"][0]["host"], "lost")
+        self.assertIn("active commit", result["unknown"][0]["reason"])
+
+    def test_transient_release_error_is_not_swallowed_as_unknown(self):
+        # A transient git failure is retried at the next tick, not recorded as
+        # a durable unknown.
+        self.hold(1, "hold: #3111 pas encore déployé")
+        with mock.patch.object(release_cutoff, "commit_of",
+                               side_effect=release_cutoff.TransientReleaseError("retry")):
+            with self.assertRaises(release_cutoff.TransientReleaseError):
+                self.scan()
+
+    def test_unresolvable_active_host_blocks_the_candidate_without_failing(self):
+        # #3297 N2: the candidate check must not turn a partial report into an
+        # unreadable tick; it refuses the candidate instead.
+        for ident in range(1, 4):
+            self.hold(ident, "hold: #3111 non actif")
+        self.active = {"good": {"sha": self.old, "at": 1},
+                       "lost": {"sha": "c" * 40, "at": 1}}
+        rules = types.SimpleNamespace(staging=mechanics.Staging(3, 1200, 600),
+                                      next_cutoff=lambda now: _paris(23),
+                                      next_packet=lambda now: _paris(23))
+        with mock.patch.object(release_cutoff, "compiled_rules", return_value=(rules, None)), \
+             mock.patch.object(staging_pending, "active_hosts", return_value=self.active), \
+             mock.patch.object(release_cutoff, "commit_is_green", return_value=True):
+            report = staging_pending.inspect(self.cfg, None, self.project, now=_paris(22, 30))
+        self.assertEqual(report["result"], "needed")
+        self.assertFalse(report["candidate_ready"])
+        self.assertTrue(any(item.get("host") == "lost" for item in report["unknown"]))
 
     def test_threshold_and_cutoff_margin_are_compiled(self):
         rules = types.SimpleNamespace(staging=mechanics.Staging(3, 1200, 600),
