@@ -401,7 +401,7 @@ class SeparateGitDirTest(unittest.TestCase):
             dependents, doubt = clones._dependents(copies, [source])
             self.assertEqual(doubt, "")
             self.assertIn(other, dependents[source])
-            with mock.patch.object(hk, "worktree_in_use", return_value=""), \
+            with mock.patch.object(hk, "worktree_holders", return_value=(False, "")), \
                     mock.patch.object(hk, "_git_copy_work", return_value=""):
                 self.assertIn("alternate dependent", clones._removal_check(
                     source, cfg, (), (), (root,), {}))
