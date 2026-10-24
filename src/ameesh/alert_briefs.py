@@ -7,8 +7,10 @@ appellent un geste qu'un agent sait faire : `idle_capacity` (L118),
 * aux orchestrateurs (ceux de l'alerte, de l'équipe concernée quand elle est
   connue), qui répartissent le travail ;
 * à l'auditeur interne ([AUDITEUR.md](../../docs/AUDITEUR.md)), qui les suit
-  — sauf `stale_lot` (L713) : ce courrier ne le réveille plus, il lit les lots
-  stagnants à sa passe (`ameesh alerts --json`).
+  — sauf `stale_lot` (L713) et `plan_underused` (#3274) : ces courriers ne le
+  réveillent plus, il lit les lots stagnants et les forfaits sous-utilisés à
+  sa passe (`ameesh alerts --json`) ; si plus aucun orchestrateur n'est
+  vivant, le forfait sous-utilisé lui revient en relais (#3036).
 
 #705 : pour un lot en `qa`, `stale_lot` va au relecteur DÉSIGNÉ (le verdict
 lui est dû) ; sans relecteur désigné, l'alerte part aux orchestrateurs du
@@ -555,8 +557,14 @@ def _slo_breach(alert: dict, *, level: int | None = None) -> str:
         move = ("pilot: reassign it or unblock it (ameesh work assign %d <agent>%s, then "
                 "agent-mail send <agent> \"…\" --lot %d)" % (lot, holder, lot))
     else:
+        # #3274 : un `hold:` de l'assigné n'arrête que `sans_tour` (24 h,
+        # `exploitation.ORPHAN_SELF_HOLD_S`) ; seule la retenue d'un pilote
+        # suspend le SLO (#1664, `planned_waits.pilot_holds`). Le texte le dit,
+        # sinon l'assigné croit l'horloge arrêtée et ne voit pas l'escalade.
         move = ("assignee: act on it, or record why it cannot advance (ameesh work note "
-                "%d \"hold: <reason>\") — a silent lot is not a hold" % lot)
+                "%d \"hold: <reason>\") — a silent lot is not a hold. Your own hold only "
+                "postpones the `sans_tour` reminder for 24 h; it does not suspend this "
+                "SLO clock — only a pilot's hold does" % lot)
     if alert.get("critical"):
         move += ("; the lot is P1: the bureau handles it with the auditor (canon §9, "
                  "niveau 4), and no SLO delay is notified to the owner — nothing waits "
@@ -769,9 +777,10 @@ def briefs(alert: dict, listing: list, lot_titles: dict | None = None,
     l'estimateur lui-même s'il est un agent du registre. `module_deviation` :
     rôle explicite et projet, sans repli. `stale_lot` d'un lot en qa : le
     relecteur DÉSIGNÉ reçoit en outre le verdict qui lui est dû (#705).
-    Auditeurs : pour tous les types sauf `stale_lot` (L713 : lu à la passe de
-    l'auditeur, sans réveil). Un agent à la fois orchestrateur et auditeur
-    reçoit un seul texte.
+    Auditeurs : pour tous les types sauf `stale_lot` (L713) et
+    `plan_underused` (#3274) — lus à la passe de l'auditeur, sans réveil ;
+    sans aucun orchestrateur vivant, `plan_underused` se replie sur l'auditeur
+    (#3036). Un agent à la fois orchestrateur et auditeur reçoit un seul texte.
 
     #3036 : `closed_hosts` (les hôtes de `claims_closed_hosts`) et le champ
     `lease_live` des lignes du registre écartent les destinataires qui ne
@@ -898,8 +907,11 @@ def briefs(alert: dict, listing: list, lot_titles: dict | None = None,
     # L713 : le lot stagnant ne réveille plus l'auditeur par courrier ; il le
     # lit à sa passe (`ameesh alerts --json`). Les orchestrateurs gardent
     # l'avis, et un auditeur qui est aussi orchestrateur de l'équipe le reçoit
-    # par cette voie (un seul texte).
-    if kind != "stale_lot":
+    # par cette voie (un seul texte). #3274 : `plan_underused` aussi est lu à
+    # la passe de l'auditeur — donner du travail aux agents au repos est le
+    # geste des orchestrateurs, pas le sien ; s'il ne reste aucun orchestrateur
+    # vivant, l'auditeur prend le relais plus bas (#3036).
+    if kind not in ("stale_lot", "plan_underused"):
         for name in auditor_names or ():
             out.setdefault(name, audit_text)
     if kind in ("critical_budget_pause", "budget_pause_long"):
@@ -911,6 +923,14 @@ def briefs(alert: dict, listing: list, lot_titles: dict | None = None,
     # s'il est `externe`) ; `stale_lot` excepté, qui ne réveille pas
     # l'auditeur (L713) et attend le retour d'un orchestrateur.
     live, dead = _split_live(out, by_name, closed)
+    if kind == "plan_underused" and not live:
+        # #3274 : plus aucun orchestrateur vivant — l'auditeur prend le relais
+        # (#3036), puis le bureau ou le fil par le repli commun. Avec un
+        # orchestrateur vivant, le forfait sous-utilisé attend la passe de
+        # l'auditeur, qui le lit sans être réveillé.
+        relay = {name: audit_text for name in auditor_names or ()}
+        live, more = _split_live(relay, by_name, closed)
+        dead.update(more)
     if live:
         if dead_out is not None:
             dead_out.update(dead)
