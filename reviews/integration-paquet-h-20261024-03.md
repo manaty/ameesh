@@ -53,6 +53,25 @@ Chaque commit de composition a le lot en second parent, son sujet nomme le lot
 et sa tête, et il porte un trailer `ameesh-work:`. Aucun commit de `main`
 n'est venu pendant la composition.
 
+## Correction après CI rouge (tête `ecdae3432407`, run `40054851733`)
+
+La suite complète a rendu le même échec dans les parts `psycopg 3/8` et
+`psql 6/16` :
+`tests.test_3236_brief_fenetre.PlanUnderusedBriefWindowTest.test_clignotement_ne_refait_pas_briefer_la_meme_fenetre`
+attendait un courrier `auditeur` (1) alors que #3274 (`03af1779b`) cesse
+volontairement de réveiller l'auditeur pour `plan_underused` tant qu'un
+orchestrateur vit : le forfait se lit à sa passe, et le relais sans
+orchestrateur vivant est déjà couvert par `tests/test_3036_alert_liveness.py`.
+
+Correctif `b55c9c0a5` (`tests/test_3236_brief_fenetre.py`) : l'assertion
+passe à 0 avec le motif #3274 ; le reste du test (dédup par fenêtre) porte sur
+le canal orchestrateur et reste valable. Adaptation de test, sans avis
+(§2/§11 bis) ; aucun code produit ne change.
+
+Ciblés verts sur `b55c9c0a5` : `test_3236_brief_fenetre`,
+`test_3036_alert_liveness`, `test_l132_alert_briefs`, `test_789_slo_alerts`
+(101/101).
+
 ## Écartés (ce véhicule)
 
 | lot | motif |
@@ -81,13 +100,16 @@ tête publiée ou hold) : aucun n'était prêt à la coupure.
   `test_l161g_ci_gel`.
 - **Tests ciblés de l'arbre intégré** : 482/482 verts (tests neufs de #3003,
   #3175, #3266, #3273 et #3274, plus les fichiers voisins).
-- **Diff** : 26 fichiers, +1479/−92 sur `c0eab9eb6` ; `git diff --check`
-  propre ; les six commits de composition portent leur trailer `ameesh-work:` ;
-  aucun marqueur de conflit ni de saut de CI.
+- **Diff** : 28 fichiers, +1599/−93 sur `b55c9c0a5` (correctif et manifeste
+  inclus) ; `git diff --check` propre ; les six commits de composition portent
+  leur trailer `ameesh-work:` ; aucun marqueur de conflit ni de saut de CI.
 - **Migrations** : aucune (aucun fichier SQL, `deploy/`, migration) ; aucun
   geste de base dans ce paquet.
 - **Prévalidation** : indisponible (`card-stale`, carte de sélection de plus
   de 48 h), non bloquant (§3), motif consigné.
-- **Suite complète** : demandée une fois sur la tête poussée, par la CI de la
-  PR (§12), `--avis 2` (le diff touche la porte de fusion : `review_authors.py`,
-  `packet_automerge.py`, `packet_watch.py`). Aucune CI de lot.
+- **Suite complète** : une seule suite par tête poussée, par la CI de la PR
+  (§12), `--avis 0` — la revue unitaire du paquet est ce manifeste, et
+  l'adaptation de test du correctif est sans avis (§2/§11 bis) ; les six
+  unités ont leurs verdicts acquis sur leurs têtes gelées. Le correctif
+  `b55c9c0a5` remplace la tête rouge : nouvelle demande `ci-full` et fusion
+  automatique réarmée sur cette tête. Aucune CI de lot.
