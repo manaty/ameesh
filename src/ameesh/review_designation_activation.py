@@ -816,11 +816,12 @@ def _mark_reviewers(note: str) -> Optional[list]:
 
 
 #: #3033 / #3047: the journal facts of every open lot that the pending-review
-#: calculation (`_pending_read`) needs, in **one** statement: the latest freeze,
-#: its latest mark, every designation mark of the lot, the manual designations
-#: since that freeze and the verdicts. Every note comes back as **text** and is
-#: parsed in Python: no note is ever cast by PostgreSQL, so no bad note can
-#: abort the freeze transaction this read runs in.
+#: and fix calculation (`_owed_read`) needs, in **one** statement: the latest
+#: freeze, its latest mark, every designation mark of the lot, the manual
+#: designations since that freeze and the verdicts (actor, head, verdict and
+#: instant — #3288 reads the blocks from the same rows). Every note comes back
+#: as **text** and is parsed in Python: no note is ever cast by PostgreSQL, so
+#: no bad note can abort the freeze transaction this read runs in.
 _PENDING_FACTS_SQL = """
     WITH open_items AS (
         SELECT id, assignee, reviewers, title, state, app
@@ -857,7 +858,9 @@ _PENDING_FACTS_SQL = """
     ), verdicts AS (
         SELECT v.work_item_id AS lot,
                array_agg(v.actor ORDER BY v.id) AS actors,
-               array_agg(v.sha ORDER BY v.id) AS shas
+               array_agg(v.sha ORDER BY v.id) AS shas,
+               array_agg(v.verdict ORDER BY v.id) AS kinds,
+               array_agg(extract(epoch FROM v.at)::float8 ORDER BY v.id) AS ts
           FROM work_item_milestones v
           JOIN latest_freeze f ON f.lot = v.work_item_id
          WHERE v.kind = 'verdict'
@@ -868,7 +871,8 @@ _PENDING_FACTS_SQL = """
            mark.id AS note_id, extract(epoch FROM mark.created_at)::float8 AS mark_ts,
            mk.ids AS mark_ids, mk.notes AS mark_notes,
            mn.notes AS manual_notes, mn.ts AS manual_ts,
-           vd.actors AS verdict_actors, vd.shas AS verdict_shas
+           vd.actors AS verdict_actors, vd.shas AS verdict_shas,
+           vd.kinds AS verdict_kinds, vd.ts AS verdict_ts
       FROM open_items o
       LEFT JOIN latest_freeze f ON f.lot = o.id
       LEFT JOIN LATERAL (
@@ -891,16 +895,20 @@ _PENDING_FACTS_SQL = """
 """
 
 
-def _pending_read(db, *, unreadable: Optional[list] = None) -> tuple[list, list]:
-    """The open lots and the reviews still owed, in **one** read (#3033).
+def _owed_read(db, *, unreadable: Optional[list] = None) -> tuple[list, list, list]:
+    """The open lots, the reviews still owed and the fixes due, in **one** read.
 
-    It is the **only** calculation of a pending review: the selection load
-    (`_loads`, #3004), the reading of an agent's queue (`pending_reviews`:
-    resume brief, idle turn) and the §9 `green_verdict` relaunch all read it,
-    so they cannot disagree. Returns `(lots, pending)`: `lots` is every open
-    lot as `(lot, assignee)`; `pending` one row per (lot, reviewer) — `lot`,
-    `name`, `sha` (the frozen head), `designated_ts`, `title`, `state`, `app`
-    — oldest designation first.
+    It is the **only** calculation of a pending review (#3033) and of the fix
+    that follows a blocking verdict (#3288): the selection load (`_loads`,
+    #3004), the reading of an agent's queue (`pending_reviews`,
+    `due_fixes`: resume brief, idle turn) and the §9 `green_verdict` /
+    `blocked_freeze` relaunches all read it, so they cannot disagree. Returns
+    `(lots, pending, fixes)`: `lots` is every open lot as `(lot, assignee)`;
+    `pending` one row per (lot, reviewer) — `lot`, `name`, `sha` (the frozen
+    head), `designated_ts`, `title`, `state`, `app` — oldest designation
+    first; `fixes` one row per (lot, debtor) — `lot`, `name` (the assignee),
+    `sha`, `blocked_ts` (earliest still-standing block), `blocked_by`,
+    `title`, `state`, `app` — oldest block first.
 
     A review is pending when an open lot's **latest** freeze designates the
     agent and no verdict of theirs names that head. The designees are the
@@ -926,6 +934,18 @@ def _pending_read(db, *, unreadable: Optional[list] = None) -> tuple[list, list]
     designated for this head (latest of the freeze, the mark naming them, a
     manual designation since the freeze): the start of the §9 clock.
 
+    #3288: a fix is due when the latest freeze carries a `blocked` verdict
+    that no later verdict of the **same actor** on the same head cancelled,
+    and no newer freeze moved the head (a re-freeze of the same SHA is the
+    same content: the block still stands). The debtor is the assignee, and
+    `blocked_ts` is the **earliest** still-standing block — « blocking
+    verdict → new freeze » starts at the first one, not at the last. With
+    designated seats, only a designated reviewer's block counts and a later GO
+    from another reviewer does not erase it (#2231); without a seat (empty
+    column or `-none`), the head's **last** verdict decides, exactly as
+    `progress._work_item_milestones` reads it. The block that discharges a
+    review (`pending`) is the one that opens its fix clock.
+
     #3047: the marks are read as **text** and parsed by `_mark_reviewers`.
     An unreadable mark carries no name — the latest one designates nobody, an
     older one proves no automatic name — and is reported in `unreadable` as
@@ -936,15 +956,18 @@ def _pending_read(db, *, unreadable: Optional[list] = None) -> tuple[list, list]
     rows = db.query(_PENDING_FACTS_SQL)
     lots: list = []
     pending: list = []
+    fixes: list = []
     for row in rows or ():
         try:
             lot_id = int(row["lot"])
         except (KeyError, TypeError, ValueError):
             continue
-        lots.append((lot_id, str(row.get("assignee") or "").strip()))
+        assignee = str(row.get("assignee") or "").strip()
+        lots.append((lot_id, assignee))
         frozen_sha = str(row.get("freeze_sha") or "").strip()
         if not frozen_sha:
             continue
+        freeze_ts = row.get("freeze_ts")
         marks: dict = {}
         for note_id, note in zip(row.get("mark_ids") or (), row.get("mark_notes") or ()):
             names = _mark_reviewers(note)
@@ -959,7 +982,11 @@ def _pending_read(db, *, unreadable: Optional[list] = None) -> tuple[list, list]
         for note, ts in zip(row.get("manual_notes") or (), row.get("manual_ts") or ()):
             name = str(note or "")[len("reviewer "):-len(" designated")]
             manual[name] = max(float(ts), manual.get(name, float(ts)))
-        rendered = list(zip(row.get("verdict_actors") or (), row.get("verdict_shas") or ()))
+        verdicts = list(zip(row.get("verdict_actors") or (),
+                            row.get("verdict_shas") or (),
+                            row.get("verdict_kinds") or (),
+                            row.get("verdict_ts") or ()))
+        rendered = [(actor, sha) for actor, sha, _kind, _at in verdicts]
         seen: set = set()
         for raw in row.get("reviewers") or ():
             name = str(raw or "").strip()
@@ -973,7 +1000,7 @@ def _pending_read(db, *, unreadable: Optional[list] = None) -> tuple[list, list]
                    for actor, sha in rendered):
                 continue
             since = [float(ts) for ts in (
-                row.get("freeze_ts"),
+                freeze_ts,
                 row.get("mark_ts") if name in effective else None,
                 manual.get(name)) if ts is not None]
             pending.append({"lot": lot_id, "name": name, "sha": frozen_sha,
@@ -981,8 +1008,52 @@ def _pending_read(db, *, unreadable: Optional[list] = None) -> tuple[list, list]
                             "title": row.get("title") or "",
                             "state": row.get("state") or "",
                             "app": row.get("app") or ""})
+        # #3288 : la correction due, calculée sur les mêmes verdicts.
+        if not assignee:
+            continue
+        latest: dict = {}
+        overall = None
+        for actor, sha, kind, at in verdicts:
+            actor = str(actor or "").strip()
+            if not actor:
+                continue
+            at = float(at) if at is not None else None
+            sha = str(sha or "").strip()
+            applies = (rd._same_freeze(frozen_sha, sha) if sha
+                       else (freeze_ts is not None and at is not None
+                             and at >= float(freeze_ts)))
+            if not applies:
+                continue
+            latest[actor.lower()] = (actor, kind, at)
+            overall = (actor, kind, at)
+        seats = {str(name or "").strip().lower()
+                 for name in (row.get("reviewers") or ())
+                 if str(name or "").strip() not in ("", "-none")}
+        if seats:
+            blockers = [v for key, v in latest.items()
+                        if key in seats
+                        and str(v[1] or "").strip().lower() == "blocked"]
+        else:
+            blockers = ([overall] if overall is not None
+                        and str(overall[1] or "").strip().lower() == "blocked"
+                        else [])
+        if blockers:
+            first = min(blockers, key=lambda v: (v[2] is None, v[2] or 0.0, v[0]))
+            fixes.append({"lot": lot_id, "name": assignee, "sha": frozen_sha,
+                          "blocked_ts": first[2], "blocked_by": first[0],
+                          "title": row.get("title") or "",
+                          "state": row.get("state") or "",
+                          "app": row.get("app") or ""})
     pending.sort(key=lambda r: (r["designated_ts"] is None, r["designated_ts"] or 0.0,
                                 r["lot"], r["name"]))
+    fixes.sort(key=lambda r: (r["blocked_ts"] is None, r["blocked_ts"] or 0.0,
+                              r["lot"]))
+    return lots, pending, fixes
+
+
+def _pending_read(db, *, unreadable: Optional[list] = None) -> tuple[list, list]:
+    """`(lots, pending)` of `_owed_read`, the reviews side (#3033)."""
+    lots, pending, _fixes = _owed_read(db, unreadable=unreadable)
     return lots, pending
 
 
@@ -1029,6 +1100,26 @@ def pending_reviews(db, agent: Optional[str] = None) -> list:
         return pending
     wanted = str(agent).strip().lower()
     return [row for row in pending if row["name"].lower() == wanted]
+
+
+def due_fixes(db, agent: Optional[str] = None) -> list:
+    """The fixes still owed after a blocking verdict, oldest block first (#3288).
+
+    One row per (lot, debtor): `lot`, `name` (the assignee who owes the fix),
+    `sha` (the frozen head that was blocked), `blocked_ts` (epoch of the
+    earliest still-standing block), `blocked_by` (its author), `title`,
+    `state`, `app`. `agent` restricts to one debtor (names compared without
+    case). The calculation is the `fixes` half of `_owed_read`, the same read
+    as the pending reviews (#3033): a block discharges the reviewer's queue
+    and opens the assignee's fix clock, one source for both. The read raises
+    when the base cannot be read: the caller says « unreadable », it never
+    shows an empty queue.
+    """
+    _lots, _pending, fixes = _owed_read(db)
+    if agent is None:
+        return fixes
+    wanted = str(agent).strip().lower()
+    return [row for row in fixes if row["name"].lower() == wanted]
 
 
 def _note_unreadable(db, lot: int, state: str,
