@@ -40,6 +40,11 @@ auteurs, avec les mêmes exceptions du canon §2 :
   calculée avant un rebase, peut contenir du develop déjà relu sous son propre
   lot ; un inconnu d'un gel antérieur qui n'est plus ancêtre de la tête et dont
   le contenu ne survit pas ne bloque pas non plus (#3116) ;
+* un correctif de relecteur ne pèse que s'il survit dans la tête (#3335) :
+  la promotion en auteur (#2888) et la trace « correcteur » suivent la même
+  preuve de contenu que #3220, y compris pour un commit de la plage courante
+  retiré par un commit postérieur. Une ligne qui survit suffit ; une lecture
+  impossible garde l'exclusion ;
 * un ancien commit sans reçu et sans attribution ne bloque plus quand son
   contenu a disparu, ou quand le même auteur l'a réémis avec reçu exact et
   patch-id verbatim identique dans la plage courante (#3301, constat
@@ -1613,6 +1618,40 @@ def _commit_survives(repo: str, head: str, sha: str, cache: dict,
     return not removed
 
 
+def _surviving_review_commits(repo: str, head: str, base: str,
+                              review_commits: Mapping,
+                              cache: dict) -> dict:
+    """Les commits de relecteur dont le contenu survit encore dans la tête (#3335).
+
+    La trace « correcteur » et la promotion en auteur (#2888) suivent la même
+    preuve de contenu que #3220 : un commit de relecteur dont aucune ligne
+    significative ne subsiste dans la tête gelée n'est plus une correction de
+    cette tête, et sa famille redevient éligible. Une ligne qui survit suffit
+    (`_commit_survives`) ; une lecture impossible conserve le commit, donc
+    l'exclusion (le doute ne retire jamais une famille). Sans `head` (ou sans
+    dépôt), l'appelant n'a pas fourni de tête à prouver : rien n'est filtré.
+
+    Un correcteur peut avoir plusieurs commits : chacun est jugé séparément,
+    et l'acteur ne reste trace que si au moins un survit.
+    """
+    if not repo or not head:
+        return dict(review_commits or {})
+    out: dict = {}
+    for actor, entries in (review_commits or {}).items():
+        kept = []
+        for entry in entries or ():
+            sha = str(entry[0] if isinstance(entry, (tuple, list)) else entry)
+            try:
+                survives = _commit_survives(repo, head, sha, cache, base)
+            except Exception:  # noqa: BLE001 - lecture impossible : doute
+                survives = True
+            if survives:
+                kept.append(entry)
+        if kept:
+            out[actor] = kept
+    return out
+
+
 def _freeze_content_preserved(repo: str, freeze_sha: str, head_sha: str,
                               base: str = "") -> bool:
     """Le contenu du gel est-il encore celui de la tête (même arbre) ?
@@ -2015,18 +2054,25 @@ def _carried_from_previous(db, item: Mapping, milestone: Optional[Mapping],
         return pair in received_patches
 
     def survives(written: Mapping, stored: bool, actor: str, *,
-                 every: bool = False) -> bool:
+                 every: bool = False, content: bool = False) -> bool:
         """Le contenu écrit par `actor` dans ce gel subsiste-t-il dans la tête ?
 
         #3220 : un commit déjà présent dans la plage courante est attribué par
         la lecture de cette tête ; le re-prouver par le contenu serait
         redondant, et un gros commit gelé coûterait un `git grep` complet sur
         tout l'arbre. Seuls les commits du gel antérieur que la plage courante
-        ne couvre pas demandent la preuve de contenu."""
+        ne couvre pas demandent la preuve de contenu.
+
+        #3335 : `content=True` (la trace « correcteur ») ne se contente plus de
+        l'ascendance (`stored`) : un commit postérieur de la tête peut avoir
+        retiré le correctif. La preuve de contenu de #3220 s'applique alors aux
+        commits que la plage courante ne couvre pas ; ceux qu'elle couvre sont
+        filtrés par `_surviving_review_commits`. Une lecture impossible rend
+        `True` (le doute garde l'exclusion)."""
         shas = written.get(actor) or []
         if not shas:
             return False
-        if stored:
+        if stored and not content:
             return True
         shas = [commit for commit in shas
                 if plan_git.full_commit_id(commit) not in current_set]
@@ -2160,16 +2206,50 @@ def _carried_from_previous(db, item: Mapping, milestone: Optional[Mapping],
             continue
         unknown.extend(unreadable)
         for actor, proven in by_name.items():
-            if not survives(written, stored, actor):
+            # #3335 (auditeur B1) : un relecteur promu auteur d'un gel antérieur
+            # (#2924 B4) ne garde pas le raccourci d'ascendance (`stored`) : un
+            # gel postérieur a pu retirer son correctif. La même preuve de
+            # contenu que la trace « correcteur » décide, et un commit déjà
+            # couvert par la plage courante est laissé à la lecture de cette
+            # tête (qui l'a déjà filtré). Le titulaire non relecteur garde le
+            # raccourci : son contenu est attribué par la plage courante.
+            if actor in review_commits:
+                actor_commits = [str(value) for value in written.get(actor) or ()]
+                if actor_commits and all(
+                        plan_git.full_commit_id(value) in current_set
+                        for value in actor_commits):
+                    continue
+                if not survives(written, stored, actor, content=True):
+                    continue
+            elif not survives(written, stored, actor):
                 continue
             carried.setdefault(actor, set()).update(
                 value for value in proven if value)
         for actor in review_commits:
-            if not survives(written, stored, actor, every=True):
+            # #3335 : la trace « correcteur » exige la preuve de contenu même
+            # quand le gel antérieur est un ancêtre de la tête (stored) ; un
+            # commit postérieur a pu retirer la correction. Les commits déjà
+            # couverts par la plage courante sont filtrés par la lecture de
+            # cette tête : quand ils y sont tous, elle a déjà statué et le gel
+            # antérieur ne doit pas réintroduire un correcteur qu'elle a écarté.
+            actor_commits = [str(value) for value in written.get(actor) or ()]
+            if actor_commits and all(
+                    plan_git.full_commit_id(value) in current_set
+                    for value in actor_commits):
+                continue
+            if not survives(written, stored, actor, every=True, content=True):
                 continue
             if actor in correctors:
                 continue
-            correctors.update(_prior_correctors(repo, {actor: review_commits[actor]}))
+            # Mesure le seuil sur les correctifs que la plage courante ne
+            # couvre pas : ceux qu'elle couvre ont déjà été jugés par
+            # `_surviving_review_commits` (#3335).
+            prior_entries = [
+                entry for entry in review_commits[actor]
+                if plan_git.full_commit_id(str(
+                    entry[0] if isinstance(entry, (tuple, list)) else entry))
+                not in current_set]
+            correctors.update(_prior_correctors(repo, {actor: prior_entries}))
     authors = []
     for actor in sorted(carried):
         proven = {value for value in carried[actor] if value}
@@ -2220,6 +2300,10 @@ def reading(db, item: Mapping, milestone: Optional[Mapping],
     (provenance réelle) pour l'exclusion personnelle ; ce n'est plus une
     éligibilité de famille. Un correctif au-delà du seuil ou de conception est
     aussi un auteur, mais n'est pas un « correcteur » de premier tour.
+    #3335 : cette promotion et la trace « correcteur » suivent la survie du
+    contenu (#3220). Un correctif de relecteur dont aucune ligne significative
+    ne subsiste plus dans la tête n'exclut plus sa famille ; une ligne qui
+    survit, ou une lecture de contenu impossible, la garde exclue.
 
     #2721 : la famille d'un commit sans reçu vient du journal des tours **à
     l'instant du commit** (le harnais qui a réellement tourné, harnais emprunté
@@ -2339,6 +2423,13 @@ def reading(db, item: Mapping, milestone: Optional[Mapping],
             review_commits.setdefault(actor, []).append((sha, proven))
         else:
             by_name.setdefault(actor, set()).add(proven)
+    # #3335 : un correctif de relecteur ne pèse que s'il est encore dans la
+    # tête. La promotion en auteur (#2888) et la trace « correcteur » suivent la
+    # survie du contenu (#3220) : un commit de relecteur dont aucune ligne ne
+    # subsiste (retiré par un commit postérieur de la même plage) n'exclut plus
+    # sa famille. Une lecture impossible garde le commit, donc l'exclusion.
+    review_commits = _surviving_review_commits(
+        repo, head, base, review_commits, {})
     # #2808 : le titulaire n'est un auteur que par un commit de la plage.
     # Quand il en a écrit un (reçu/committer, ou auteur Git conservé par un
     # amend), sa famille de gel reste une preuve historique, en plus de celle
