@@ -1,10 +1,19 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """L165 (EP5) — install the mechanical role timers on a candidate host.
 
-The packet composer, the GitHub watch and the CI watches are code. Their
-timers are installed on **every candidate host** of an elected role; only the
-host that holds the live lease runs the command, through ``ameesh role run``.
-This module renders those user units and can install, check or remove them.
+The packet composer, the GitHub watch, the CI watches and the alert delivery
+are code. Their timers are installed on **every candidate host** of an elected
+role; only the host that holds the live lease runs the command, through
+``ameesh role run``. This module renders those user units and can install,
+check or remove them.
+
+#3383: the alert delivery (owner pushes, decision requests, agent briefs) was
+left in the full ``ameesh-notify`` service, whose routes lived on one host
+only (``pc-smichea``): when it was off, nothing was pushed (three times on
+2026-10-24). The ``alerts`` pass is now a role timer too; a candidate that
+cannot push to the role's responsible (and ``notify.default_human``) through
+a remote channel (ntfy, slack) is refused (``--check`` fails) instead of
+standing by as a holder that would push nothing.
 
 The role carried by default is ``mesh-design``: it is already elected on
 several hosts and its lease is the one that moves when a host stops. The
@@ -21,10 +30,11 @@ Two consequences are made explicit instead of silent:
   than left running every minute and reading nothing — the failure that #3327
   recurses on. ``--check`` fails on that gap, naming the missing project;
 * when the timers are installed, the full ``ameesh-notify`` service skips the
-  three mechanical passes (``--skip issues,github-watch,ci``) by a drop-in:
+  passes they carry (``--skip issues,github-watch,ci,alerts``) by a drop-in:
   the same GitHub work must not be done by both the service and the role timer
-  (double reading), and every other pass — alerts, take, budget handoff, WIP
-  sweep — is kept by default.
+  (double reading), two delivery states must not push the same alert twice,
+  and every other pass — take, budget handoff, WIP sweep — is kept by
+  default. ``alerts`` is skipped only where its timer is installed.
 
 The units are user units, like ``ameesh-release.timer``. This module never
 runs ``systemctl`` during rendering; ``--install``/``--remove``/``--check``
@@ -59,6 +69,12 @@ SYSTEMD_DIR_ENV = "AMEESH_SYSTEMD_DIR"
 MAX_OBSERVATION_INTERVAL_S = 90
 #: systemd accepts ``OnUnitActiveSec=90s`` but not a bare float
 _MIN_INTERVAL_S = 60
+#: #3383: the alert delivery keeps the cadence of the full service it
+#: replaces (``notify --interval 30``); a decision request is pushed within a
+#: tick of the holder, whatever host the owner's post is.
+ALERTS_INTERVAL_S = 30
+#: the passes the full service always leaves to the role timers (#3327)
+_OBSERVATION_PASSES = ("issues", "github-watch", "ci")
 
 
 class TimerError(RuntimeError):
@@ -261,15 +277,88 @@ def is_candidate(row: dict, host: str) -> bool:
     return str(row.get("host") or "") == host
 
 
+#: the secrets file the role units load after ``env`` (see render_service)
+NOTIFY_ENV = "~/.config/ameesh/notify.env"
+
+
+def unit_env(path: str | None = None) -> dict:
+    """The environment of a role unit: this process's, then ``notify.env``.
+
+    ``EnvironmentFile`` semantics, enough for a check: ``KEY=VALUE`` lines,
+    comments and blank lines ignored, one pair of surrounding quotes removed.
+    A missing file is the optional ``EnvironmentFile=-`` of the unit. Values
+    are never printed.
+    """
+    env = dict(os.environ)
+    try:
+        text = Path(os.path.expanduser(path or NOTIFY_ENV)).read_text(encoding="utf-8")
+    except OSError:
+        return env
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line[0] in "#;":
+            continue
+        key, sep, value = line.partition("=")
+        if not sep or not key.strip():
+            continue
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1]
+        env[key.strip()] = value
+    return env
+
+
+def notify_reach(cfg, *, responsible=None, env: dict | None = None) -> tuple[list[str], str]:
+    """#3383: the humans the alerts timer must push to, or the gap.
+
+    The holder pushes on its own routes, whichever candidate it is. The
+    humans required are the role's responsible and ``notify.default_human``;
+    each needs, through ``channels_for`` (an empty route excludes, #3007), a
+    remote push channel (``ntfy``, ``slack``) whose secret resolves in the
+    unit's environment. ``desktop`` (the holder's graphical session) and
+    ``app`` (nothing pushed) do not count. Any gap is named; a candidate that
+    would hold the lease and push nothing is the silence #3383 reports.
+    """
+    from . import notify as notify_mod
+    try:
+        ncfg = notify_mod.parse_config(getattr(cfg, "notify", None))
+    except notify_mod.NotifyConfigError as exc:
+        return [], "invalid notify configuration: %s" % " ".join(str(exc).split())[:200]
+    required = []
+    for value in (responsible, ncfg.default_human):
+        human = notify_mod.normalize_human(value)
+        if human and human not in required:
+            required.append(human)
+    if not required:
+        return [], "no human to reach: neither a responsible of the role nor notify.default_human"
+    env = unit_env() if env is None else env
+    gaps = []
+    for human in required:
+        channels = ncfg.channels_for(human)
+        if not channels:
+            gaps.append("%s has no route on this host" % human)
+            continue
+        problems = [notify_mod.remote_push_problem(channel, env) for channel in channels]
+        if all(problems):
+            gaps.append("%s has no usable remote push (ntfy, slack): %s"
+                        % (human, "; ".join(problems)))
+    if gaps:
+        return [], " ".join("; ".join(gaps).split())[:400]
+    return required, ""
+
+
 def plan(*, host: str, role: str, row: dict, settings, watch_intervals,
-         watch_error: str = "", expected_projects=None) -> dict:
+         watch_error: str = "", expected_projects=None, notify_humans=None,
+         notify_error: str = "") -> dict:
     """The timers this host should run, without touching the filesystem.
 
     ``row`` is the role's ``agent_registry`` row: an elected role is a
     candidate only when the host is in ``candidats``; a pinned role only on
     its host. A non-candidate gets no units at all. ``expected_projects`` is
     the canon's ``{project: repo}`` mapping; a project missing from the local
-    ``github.projects`` is reported, never silently ignored.
+    ``github.projects`` is reported, never silently ignored. ``notify_humans``
+    and ``notify_error`` come from :func:`notify_reach`: without a remote push
+    to every required human, the ``alerts`` pass is blocked (#3383).
     """
     declared = candidates(row)
     candidate = is_candidate(row, host)
@@ -324,6 +413,19 @@ def plan(*, host: str, role: str, row: dict, settings, watch_intervals,
             reported.append(TimerSpec(
                 name, name, _MIN_INTERVAL_S, description,
                 blocked="github.projects missing on this host", detail=detail))
+
+    description = "ameesh — alert delivery under the elected role lease (#3383)"
+    if notify_error or not notify_humans:
+        reported.append(TimerSpec(
+            "alerts", "alerts", ALERTS_INTERVAL_S, description,
+            blocked=notify_error or "no human to reach on this host",
+            detail=("the lease holder pushes on its own routes: declare the notify "
+                    "key (the owner's ntfy route, secrets in notify.env) as on the "
+                    "other candidates (see EXPLOITATION, Alertes poussées)")))
+    else:
+        reported.append(TimerSpec(
+            "alerts", "alerts", ALERTS_INTERVAL_S, description,
+            detail="reaches %s" % ", ".join(notify_humans)))
     report["timers"] = [item.as_json() for item in reported]
     return report
 
@@ -381,21 +483,36 @@ def render_timer(spec: TimerSpec) -> str:
     ))
 
 
-def render_notify_dropin(bin_path: str = DEFAULT_BIN) -> str:
+def dropin_skips(report: dict) -> tuple[str, ...]:
+    """The passes the full service leaves to this host's role timers.
+
+    The three observation passes always (#3327: a blocked one reads nothing
+    in the service either, the check names it); ``alerts`` only when its timer
+    is installed here — otherwise the service keeps delivering (#3383).
+    """
+    installed = {item["name"] for item in report.get("timers") or ()
+                 if not item.get("blocked")}
+    return _OBSERVATION_PASSES + (("alerts",) if "alerts" in installed else ())
+
+
+def render_notify_dropin(bin_path: str = DEFAULT_BIN,
+                         skip: tuple = _OBSERVATION_PASSES) -> str:
     """Exclude the role-timer passes from the full notifier.
 
-    The role timers carry ``issues``, ``github-watch`` and ``ci``; the full
-    service keeps every other pass, including alert delivery and the ``take``
-    work that nothing else runs (auto-take, budget handoff, WIP sweep). An
-    exclusion is safer than an allow-list: a new pass is kept by default.
+    The role timers carry ``issues``, ``github-watch``, ``ci`` and, where a
+    route exists, ``alerts``; the full service keeps every other pass,
+    including the ``take`` work that nothing else runs (auto-take, budget
+    handoff, WIP sweep). An exclusion is safer than an allow-list: a new pass
+    is kept by default.
     """
     return "\n".join((
-        "# generated by `ameesh role timers` — GitHub and CI are carried by the",
-        "# role timers; the full service keeps alerts, take and every other pass",
+        "# generated by `ameesh role timers` — %s carried by the role timers;"
+        % ", ".join(skip),
+        "# the full service keeps every other pass (take, budget handoff, WIP sweep)",
         "[Service]",
         "ExecStart=",
-        "ExecStart=%s notify --interval 30 --skip issues,github-watch,ci"
-        % _check_bin(bin_path),
+        "ExecStart=%s notify --interval 30 --skip %s"
+        % (_check_bin(bin_path), ",".join(skip)),
         "",
     ))
 
@@ -488,7 +605,7 @@ def install(report: dict, *, directory: Path, bin_path: str = DEFAULT_BIN,
 
     dropin = directory / "ameesh-notify.service.d" / "10-role-timers.conf"
     if timers and _notify_unit(directory):
-        if _write(dropin, render_notify_dropin(bin_path)):
+        if _write(dropin, render_notify_dropin(bin_path, dropin_skips(report))):
             installed.append(str(dropin.relative_to(directory)))
     elif dropin.exists():
         # no role timer runs here (or the full service disappeared): limiting
@@ -551,7 +668,8 @@ def check(report: dict, *, directory: Path, apply: bool = True,
         if not dropin.is_file():
             problems.append("ameesh-notify.service: missing the --skip drop-in; "
                             "GitHub would be read twice")
-        elif dropin.read_text(encoding="utf-8") != render_notify_dropin(bin_path):
+        elif dropin.read_text(encoding="utf-8") != render_notify_dropin(
+                bin_path, dropin_skips(report)):
             problems.append("ameesh-notify.service: the --skip drop-in is out of "
                             "date; rerun `ameesh role timers --install`")
     return problems
@@ -685,9 +803,11 @@ def main(argv: list[str] | None = None) -> int:
                 except plan_github.SettingsError as exc:
                     raise TimerError("configuration invalid after adding projects: %s"
                                      % exc) from None
+        humans, notify_error = notify_reach(cfg, responsible=row.get("responsible"))
         report = plan(host=host, role=args.role,
                       row=row, settings=settings, watch_intervals=intervals,
-                      watch_error=watch_error, expected_projects=expected)
+                      watch_error=watch_error, expected_projects=expected,
+                      notify_humans=humans, notify_error=notify_error)
         if sync is not None:
             report["github_sync"] = sync
         directory = systemd_dir(args.systemd_dir)
