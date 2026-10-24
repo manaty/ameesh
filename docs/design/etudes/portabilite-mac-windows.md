@@ -282,12 +282,16 @@ The [proposed plan](#proposed-lot-plan) above is kept as written on
 2026-10-10. Measured since then: L63 merged (`6fafe37`); L159d and L159e
 already route host memory, swap, load and pressure through
 `ameesh.platform` (psutil, `None` for load without `os.getloadavg`); the
-`platform-macos` job now runs the suite selected by the CI plan against a
-PostgreSQL installed in its own step (L68), with the `/proc` tests going
-through the platform layer. It is not a required check yet: the full plan has
-not run green under macOS, and requiring it would redden the first package
-for every lot (§11 bis); it joins `tests` once that proof exists. WSL2 is a
-Linux: what runs on Linux runs there, except reaching the Windows desktop.
+macOS suite runs the CI plan against a PostgreSQL installed in its own step
+(L68), with the `/proc` tests going through the platform layer. #3198 split
+it: `tests.yml` keeps only a short platform-layer verdict (L63/L66, no
+database, 20 minutes), while the full suite lives in
+`.github/workflows/macos.yml` — nightly on `main` and on the `ci-macos`
+label — outside the packet's merge path. Since #3026 (L68b) the short job is
+a required check (it joins `tests`'s needs); the full suite remains nightly
+and outside the packet gate, and is not green under macOS yet (run
+39919541641: 182 failures, fixes tracked by separate lots). WSL2 is a Linux:
+what runs on Linux runs there, except reaching the Windows desktop.
 
 | Lot | Content after the answers | Depends on | Estimate |
 |---|---|---|---|

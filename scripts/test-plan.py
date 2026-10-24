@@ -230,7 +230,8 @@ ALWAYS_TRIGGERS = (MIGRATIONS_DIR, "src/ameesh/db.py", "deploy/sql/",
 #: test infrastructure: the map cannot judge a change there
 FOUNDATION = ("tests/support.py", "tests/__init__.py", "tests/fakebin/", ".github/",
               "scripts/test-parts.py", "scripts/test-plan.py", "scripts/map.py",
-              "scripts/map_measure.py", "scripts/ci-flow.py", "scripts/version-only.py")
+              "scripts/map_measure.py", "scripts/ci-flow.py", "scripts/version-only.py",
+              "scripts/ci-agregat.py")
 #: a migration that is not purely additive impacts every database test
 #: (any `drop`, `alter table t drop c` included; `create or replace` rewrites)
 _NOT_ADDITIVE = re.compile(

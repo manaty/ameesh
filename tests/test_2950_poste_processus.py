@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -12,6 +13,9 @@ import unittest
 from tests import support  # noqa: F401 — environnement isolé du poste
 
 from ameesh import platform
+
+# #3129 : le vrai cat, résolu avant les faux bancs (/usr/bin/cat sous Linux, /bin/cat sous macOS).
+REAL_CAT = shutil.which("cat") or "/bin/cat"
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -50,10 +54,10 @@ class PosteProcessusTest(unittest.TestCase):
         self.write_script(self.bin / "sleep", "#!/bin/sh\nexit 0\n")
         # Ne jamais arrêter une vraie unité depuis un test : systemctl est
         # toujours simulé, le cgroup décrit uniquement le contexte du scénario.
-        self.write_script(self.bin / "cat", '''#!/bin/sh
+        self.write_script(self.bin / "cat", f'''#!/bin/sh
 case "$1" in
-  /proc/*/cgroup) exec /usr/bin/cat "$TEST_CGROUP" ;;
-  *) exec /usr/bin/cat "$@" ;;
+  /proc/*/cgroup) exec {REAL_CAT} "$TEST_CGROUP" ;;
+  *) exec {REAL_CAT} "$@" ;;
 esac
 ''')
         self.cgroup = self.root / "cgroup"

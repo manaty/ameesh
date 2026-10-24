@@ -7,8 +7,10 @@ appellent un geste qu'un agent sait faire : `idle_capacity` (L118),
 * aux orchestrateurs (ceux de l'alerte, de l'équipe concernée quand elle est
   connue), qui répartissent le travail ;
 * à l'auditeur interne ([AUDITEUR.md](../../docs/AUDITEUR.md)), qui les suit
-  — sauf `stale_lot` (L713) : ce courrier ne le réveille plus, il lit les lots
-  stagnants à sa passe (`ameesh alerts --json`).
+  — sauf `stale_lot` (L713) et `plan_underused` (#3274) : ces courriers ne le
+  réveillent plus, il lit les lots stagnants et les forfaits sous-utilisés à
+  sa passe (`ameesh alerts --json`) ; si plus aucun orchestrateur n'est
+  vivant, le forfait sous-utilisé lui revient en relais (#3036).
 
 #705 : pour un lot en `qa`, `stale_lot` va au relecteur DÉSIGNÉ (le verdict
 lui est dû) ; sans relecteur désigné, l'alerte part aux orchestrateurs du
@@ -16,11 +18,23 @@ projet du lot et demande d'en désigner un (`ameesh work reviewer <id>
 <agent>` — le lot est déjà en qa). La désignation à l'entrée en qa se fait,
 elle, par `ameesh work move <id> qa --reviewer <agent>`.
 
+#3007 : `notify_undeliverable` ne demande pas un geste sur un lot — elle dit
+qu'aucun notificateur VIVANT ne couvre l'humain qui a des décisions en
+attente. Elle part aux orchestrateurs de l'alerte et à l'auditeur, avec le
+repli (canal de secours ou retour du notificateur). Son brief n'est **pas**
+envoyé par le notificateur (ce serait le disparu qui parle) : la passe du
+runner hors du poste le porte (`notify_gap.brief_once`), et
+`NOTIFIER_EXCLUDED` l'en écarte côté `ameesh notify`.
+
 Chaque courrier dit l'action attendue, avec la commande exacte. Une alerte
 part une fois à sa levée, puis une seule relance si elle dure encore
 `REMIND_AFTER_S` (6 h) plus tard ; les SLO ne repartent qu'au palier suivant
-ou après changement d'état (#2602). Ce module rend les textes ; l'envoi et le
-dédoublonnage sont dans `notify.Notifier`.
+ou après changement d'état (#2602). Pour une alerte de jauge
+(`plan_underused`), c'est une fois par **fenêtre** : son début est arrondi à
+la minute et `reason` n'entre pas dans la clé, pour qu'une perte projetée qui
+oscille autour du seuil ne refasse pas briefer à chaque retour (#3236). Ce
+module rend les textes ; l'envoi et le dédoublonnage sont dans
+`notify.Notifier`.
 """
 
 from __future__ import annotations
@@ -40,9 +54,20 @@ BRIEFED_TYPES = ("idle_capacity", "stale_lot", "plan_underused", "estimate_bias"
                  # #3036 : le courrier en souffrance part aux orchestrateurs
                  # VIVANTS ; le brief est ainsi suivi et re-tenté comme les
                  # autres, au lieu d'une remise unique à un hôte perdu.
-                 "mail_undeliverable")
+                 "mail_undeliverable",
+                 # #3007 : aucun notificateur vivant ne couvre l'humain qui a
+                 # des décisions en attente — les agents doivent le savoir
+                 "notify_undeliverable")
+#: #3007 : types qu'un notificateur ne briefe jamais lui-même — leur brief
+#: dépend de sa propre liveness, il est porté par `notify_gap.brief_once`
+#: (ménage du runner) pour survivre à la chute du poste.
+NOTIFIER_EXCLUDED = ("notify_undeliverable",)
 #: une relance, si l'alerte dure encore 6 h après le premier courrier
 REMIND_AFTER_S = 6 * 3600.0
+#: #3057 : un bail rendu depuis moins de ce délai (redémarrage d'exécuteur,
+#: quelques secondes) n'est pas encore une perte : le brief attend, sans
+#: escalade ni copie au fil ; trois passes du notificateur (30 s)
+LEASE_GRACE_S = 90.0
 #: rôles d'une fiche Agent du canon qui désignent l'auditeur
 AUDITOR_ROLES = ("auditeur", "auditor")
 #: nom de la persona de l'auditeur (docs/AUDITEUR.md, « Mise en service »)
@@ -80,10 +105,13 @@ def _unavailable(row: dict, closed: set) -> str:
 
     Trois preuves : son hôte a les claims fermés ; il est `stopped`/`dead` (il
     ne prendra plus de tour) ; ou son bail n'est plus vivant (le runner qui le
-    lisait est mort ou l'a rendu). Un état `queued` n'est pas consulté : un
-    agent qui attend un créneau a un runner vivant et lira. Une ligne sans
-    information de bail (appel hors base, test) n'est pas déclarée morte : on
-    ne remplace pas une preuve absente par une supposition."""
+    lisait est mort ou l'a rendu). L'état `queued` n'est pas une preuve en
+    soi, seul le bail compte : un `queued` qui tient son bail lira, un
+    `queued` sans bail vivant (hôte plein, `max_agents`, porte fermée) est
+    écarté comme tout agent sans bail — rien ne dit quand il prendra un tour.
+    Une ligne sans information de bail (appel hors base, test) n'est pas
+    déclarée morte : on ne remplace pas une preuve absente par une
+    supposition."""
     host = str(row.get("host") or "")
     if host and host in closed:
         return "host %s: claims closed" % host
@@ -93,6 +121,39 @@ def _unavailable(row: dict, closed: set) -> str:
     if "lease_live" in row and not row.get("lease_live"):
         return "no live lease"
     return ""
+
+
+def lease_grace(listing: list, closed: set, since: dict, now: float) -> tuple[list, set]:
+    """#3057 : la grâce d'un bail tout juste rendu.
+
+    Un exécuteur qui redémarre rend ses baux quelques secondes ; sans grâce,
+    les briefs de cette fenêtre partent au palier suivant ou au fil du bureau,
+    puis au destinataire à son retour (deux remises pour une absence de
+    secondes). `since` (état du notificateur, nom → première passe vue sans
+    bail) date l'absence. Rend le registre où un agent sans bail depuis moins
+    de `LEASE_GRACE_S` compte vivant pour le routage, et l'ensemble de ces
+    agents `held` : l'appelant ne leur remet rien encore. Seule l'absence de
+    bail a une grâce : un hôte aux claims fermés ou un agent `stopped` est une
+    perte prouvée. Une perte réelle n'est retardée que de la grâce."""
+    out: list = []
+    held: set = set()
+    for row in listing:
+        name = row["name"]
+        if "lease_live" not in row or row.get("lease_live") \
+                or _unavailable(dict(row, lease_live=True), closed):
+            since.pop(name, None)
+            out.append(row)
+            continue
+        first = float(since.setdefault(name, now))
+        if now - first < LEASE_GRACE_S:
+            held.add(name)
+            out.append(dict(row, lease_live=True))
+        else:
+            out.append(row)
+    names = {row["name"] for row in listing}
+    for name in [n for n in since if n not in names]:
+        del since[name]
+    return out, held
 
 
 def _dead_note(dead: dict) -> str:
@@ -115,14 +176,16 @@ def _escalation_note(dead: dict, from_level: int, to_level: int) -> str:
                or "none designated", int(from_level), int(to_level)))
 
 
-def _split_live(out: dict, by_name: dict, closed: set) -> tuple[dict, dict]:
+def _split_live(out: dict, by_name: dict, closed: set,
+                covered=()) -> tuple[dict, dict]:
     """#3036 : sépare les briefs des destinataires vivants de ceux qui ne
     liront pas. Un nom hors registre (les pseudo-destinataires `thread:…`)
-    n'est pas filtré : il n'a pas de bail à contrôler."""
+    n'est pas filtré : il n'a pas de bail à contrôler. #3100 : un nom de
+    `covered` (déjà remis) non plus : son courrier l'attend."""
     live: dict = {}
     dead: dict = {}
     for name, text in out.items():
-        if name.startswith("thread:"):
+        if name.startswith("thread:") or name in covered:
             live[name] = text
             continue
         row = by_name.get(name)
@@ -494,8 +557,14 @@ def _slo_breach(alert: dict, *, level: int | None = None) -> str:
         move = ("pilot: reassign it or unblock it (ameesh work assign %d <agent>%s, then "
                 "agent-mail send <agent> \"…\" --lot %d)" % (lot, holder, lot))
     else:
+        # #3274 : un `hold:` de l'assigné n'arrête que `sans_tour` (24 h,
+        # `exploitation.ORPHAN_SELF_HOLD_S`) ; seule la retenue d'un pilote
+        # suspend le SLO (#1664, `planned_waits.pilot_holds`). Le texte le dit,
+        # sinon l'assigné croit l'horloge arrêtée et ne voit pas l'escalade.
         move = ("assignee: act on it, or record why it cannot advance (ameesh work note "
-                "%d \"hold: <reason>\") — a silent lot is not a hold" % lot)
+                "%d \"hold: <reason>\") — a silent lot is not a hold. Your own hold only "
+                "postpones the `sans_tour` reminder for 24 h; it does not suspend this "
+                "SLO clock — only a pilot's hold does" % lot)
     if alert.get("critical"):
         move += ("; the lot is P1: the bureau handles it with the auditor (canon §9, "
                  "niveau 4), and no SLO delay is notified to the owner — nothing waits "
@@ -520,6 +589,20 @@ def _budget_pause_long(alert: dict) -> str:
             "config.json); free an account, fix the profile, or have the runner restart, "
             "then `ameesh resume` the agent if its runner is not live."
             % (alert.get("detail") or "?"))
+
+
+def _notify_undeliverable(alert: dict) -> str:
+    """#3007 : aucun notificateur vivant ne couvre l'humain qui a des décisions
+    en attente. Aux orchestrateurs et à l'auditeur : la poussée n'a pas eu
+    lieu, le geste de repli est un canal de secours ou le retour du
+    notificateur. Le brief est porté hors du poste (`notify_gap.brief_once`)."""
+    return ("No living notifier covers the human with pending decisions: %s. Expected "
+            "action: restore ameesh-notify (and its routes) on the host that holds them, "
+            "or configure a fallback route on a healthy host and start it there; keep "
+            "the pending requests visible in the lot threads meanwhile — no agent can "
+            "push them without a channel. This alert resolves by itself when a notifier "
+            "beats again for that human, or when nothing is pending."
+            % (alert.get("detail") or "no notifier heartbeat"))
 
 
 def _for_auditor(alert: dict) -> str:
@@ -565,7 +648,7 @@ def _target_names(role: str, alert: dict, by_name: dict, orchestras, teams: set,
 
 
 def _slo_briefs(alert: dict, by_name: dict, orchestras, teams: set,
-                auditor_names, closed: set) -> dict:
+                auditor_names, closed: set, covered=()) -> dict:
     """#3036 : destinataires d'un `slo_breach`, filtrés par vivacité, avec
     passage au palier suivant quand le palier atteint n'a personne qui lise.
 
@@ -573,7 +656,20 @@ def _slo_briefs(alert: dict, by_name: dict, orchestras, teams: set,
     palier suivant de l'échelle §9 (assigné → pilote → bureau/auditeur), puis
     la route humaine (copie au fil du bureau). Le brief dit toujours qui
     manquait (« No live recipient: X (no live lease). ») et le texte du geste
-    est celui du palier qui reçoit, pas celui du palier muet."""
+    est celui du palier qui reçoit, pas celui du palier muet.
+
+    #3057 (route voulue) : un lot sans assigné, ou assigné au bureau
+    `externe` qui ne lit pas sa boîte, n'a personne au palier 1 ; il part au
+    pilote dès le niveau 1, comme un assigné mort. Un palier 1 muet laisserait
+    le lot sans lecteur jusqu'au double du délai, et le pilote est celui qui
+    peut l'affecter (§9 : assigné → pilote). Le brief nomme le bureau externe
+    parmi les absents au lieu de « none designated ».
+
+    #3100 : `covered` (les destinataires déjà remis, `to` du registre des
+    briefs) compte comme vivant : le courrier est dans leur boîte, lu au
+    retour ; un bail qui cligne (redémarrage d'exécuteur, clôture de release)
+    ne fait ni escalader ni nommer absent un palier déjà prévenu."""
+    covered = set(covered or ())
     roles = set(alert.get("targets") or ("assignee",))
     text = _slo_breach(alert)
     raw: dict = {}
@@ -581,7 +677,10 @@ def _slo_briefs(alert: dict, by_name: dict, orchestras, teams: set,
         for name in _target_names(role, alert, by_name, orchestras, teams,
                                   auditor_names):
             raw.setdefault(name, role)
-    live, dead = _split_live({name: text for name in raw}, by_name, closed)
+    live, dead = _split_live({name: text for name in raw}, by_name, closed, covered)
+    if "assignee" in roles and alert.get("agent") == "bureau" \
+            and _bureau_externe(by_name):
+        dead.setdefault("bureau", "external desk, reads the lot thread")
     if live:
         note = _dead_note(dead)
         return {name: note + body for name, body in live.items()}
@@ -598,7 +697,7 @@ def _slo_briefs(alert: dict, by_name: dict, orchestras, teams: set,
                      + _target_names("auditeur", alert, by_name, orchestras, teams,
                                      auditor_names))
         candidates = {name: next_text for name in dict.fromkeys(names)}
-        live, more = _split_live(candidates, by_name, closed)
+        live, more = _split_live(candidates, by_name, closed, covered)
         dead.update(more)
         if live:
             note = _escalation_note(dead, current, next_level)
@@ -611,7 +710,7 @@ def _slo_briefs(alert: dict, by_name: dict, orchestras, teams: set,
     # bureau), en nommant les absents. Sans bureau, rien n'est inventé — le
     # passage suivant réessaiera (l'alerte reste dans `ameesh alerts`).
     fallback = _fallback_bureau(by_name, _slo_breach(alert, level=3))
-    live, more = _split_live(fallback, by_name, closed)
+    live, more = _split_live(fallback, by_name, closed, covered)
     dead.update(more)
     if live:
         note = _dead_note(dead)
@@ -665,7 +764,7 @@ def _mail_undeliverable_briefs(alert: dict, by_name: dict, auditor_names,
 
 def briefs(alert: dict, listing: list, lot_titles: dict | None = None,
            auditor_names=(), *, orchestrator_names=(),
-           closed_hosts=(), dead_out: dict | None = None) -> dict:
+           closed_hosts=(), dead_out: dict | None = None, covered=()) -> dict:
     """`{agent: texte}` pour une alerte de `BRIEFED_TYPES` (vide sinon).
 
     Orchestrateurs : `idle_capacity`, ceux de L118 ; `stale_lot`, ceux de
@@ -678,9 +777,10 @@ def briefs(alert: dict, listing: list, lot_titles: dict | None = None,
     l'estimateur lui-même s'il est un agent du registre. `module_deviation` :
     rôle explicite et projet, sans repli. `stale_lot` d'un lot en qa : le
     relecteur DÉSIGNÉ reçoit en outre le verdict qui lui est dû (#705).
-    Auditeurs : pour tous les types sauf `stale_lot` (L713 : lu à la passe de
-    l'auditeur, sans réveil). Un agent à la fois orchestrateur et auditeur
-    reçoit un seul texte.
+    Auditeurs : pour tous les types sauf `stale_lot` (L713) et
+    `plan_underused` (#3274) — lus à la passe de l'auditeur, sans réveil ;
+    sans aucun orchestrateur vivant, `plan_underused` se replie sur l'auditeur
+    (#3036). Un agent à la fois orchestrateur et auditeur reçoit un seul texte.
 
     #3036 : `closed_hosts` (les hôtes de `claims_closed_hosts`) et le champ
     `lease_live` des lignes du registre écartent les destinataires qui ne
@@ -689,7 +789,9 @@ def briefs(alert: dict, listing: list, lot_titles: dict | None = None,
     auditeurs puis au bureau. Le brief nomme les absents ("No live recipient:
     …") pour que les vivants couvrent le geste. `dead_out`, quand l'appelant
     le fournit, reçoit ces absents (nom → raison) : le notificateur garde la
-    liste pour réévaluer à la passe suivante et remettre à qui est revenu."""
+    liste pour réévaluer à la passe suivante et remettre à qui est revenu.
+    `covered` (#3100, `slo_breach`) : les destinataires déjà remis, comptés
+    vivants pour le palier même si leur bail cligne à cette passe."""
     kind = alert.get("type")
     if kind not in BRIEFED_TYPES:
         return {}
@@ -733,7 +835,7 @@ def briefs(alert: dict, listing: list, lot_titles: dict | None = None,
         # `orchestrators` (niveau 1 d'une passe sans autre lot de niveau 2) ;
         # le notificateur fournit les rôles vivants du canon.
         return _slo_briefs(alert, by_name, orchestras or orchestrator_names,
-                           teams, auditor_names, closed)
+                           teams, auditor_names, closed, covered)
     else:
         extra: dict[str, str] = {}
         no_reviewer = False
@@ -770,6 +872,11 @@ def briefs(alert: dict, listing: list, lot_titles: dict | None = None,
         elif kind == "budget_pause_long":
             text = _budget_pause_long(alert)
             teams = _projects(by_name, alert.get("agent"))
+        elif kind == "notify_undeliverable":
+            # #3007 : aucun notificateur vivant ne couvre l'humain ; tous les
+            # orchestrateurs de l'alerte et l'auditeur la reçoivent.
+            text = _notify_undeliverable(alert)
+            teams = set()
         else:
             text = _plan_underused(alert)
             teams = {p for n in alert.get("idle_agents") or ()
@@ -800,8 +907,11 @@ def briefs(alert: dict, listing: list, lot_titles: dict | None = None,
     # L713 : le lot stagnant ne réveille plus l'auditeur par courrier ; il le
     # lit à sa passe (`ameesh alerts --json`). Les orchestrateurs gardent
     # l'avis, et un auditeur qui est aussi orchestrateur de l'équipe le reçoit
-    # par cette voie (un seul texte).
-    if kind != "stale_lot":
+    # par cette voie (un seul texte). #3274 : `plan_underused` aussi est lu à
+    # la passe de l'auditeur — donner du travail aux agents au repos est le
+    # geste des orchestrateurs, pas le sien ; s'il ne reste aucun orchestrateur
+    # vivant, l'auditeur prend le relais plus bas (#3036).
+    if kind not in ("stale_lot", "plan_underused"):
         for name in auditor_names or ():
             out.setdefault(name, audit_text)
     if kind in ("critical_budget_pause", "budget_pause_long"):
@@ -813,6 +923,14 @@ def briefs(alert: dict, listing: list, lot_titles: dict | None = None,
     # s'il est `externe`) ; `stale_lot` excepté, qui ne réveille pas
     # l'auditeur (L713) et attend le retour d'un orchestrateur.
     live, dead = _split_live(out, by_name, closed)
+    if kind == "plan_underused" and not live:
+        # #3274 : plus aucun orchestrateur vivant — l'auditeur prend le relais
+        # (#3036), puis le bureau ou le fil par le repli commun. Avec un
+        # orchestrateur vivant, le forfait sous-utilisé attend la passe de
+        # l'auditeur, qui le lit sans être réveillé.
+        relay = {name: audit_text for name in auditor_names or ()}
+        live, more = _split_live(relay, by_name, closed)
+        dead.update(more)
     if live:
         if dead_out is not None:
             dead_out.update(dead)

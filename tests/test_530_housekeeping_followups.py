@@ -311,6 +311,8 @@ class EpisodeTest(PgTestCase):
 
     # -- point 5 (#718) ---------------------------------------------------
 
+    @unittest.skipUnless(platform.is_linux(),
+                         "#718 : mountinfo est Linux ; hors Linux, vide par conception")
     def test_mount_table_unreadable_is_journaled_and_alerted(self):
         tmp = menage.turn_env(self.mine, self.pol, "codex3", {})["TMPDIR"]
         ours = os.path.join(tmp, "out.txt")
@@ -329,6 +331,8 @@ class EpisodeTest(PgTestCase):
         self.assertIn("mount table unreadable", alerts[0]["detail"])
         self.assertEqual(self._alerts("tmp_unremovable"), [])
 
+    @unittest.skipUnless(platform.is_linux(),
+                         "#718 : mountinfo est Linux ; hors Linux, vide par conception")
     def test_mount_table_unreadable_never_resolves_an_unremovable_episode(self):
         # quota 2 blocks, 3 foreign blocks: nothing can be evicted and the
         # quota is held by bytes the pass cannot remove -> a blocked
@@ -358,6 +362,8 @@ class EpisodeTest(PgTestCase):
         self.assertEqual(len(unscanned), 1)
         self.assertEqual(unscanned[0]["since"], first[0]["since"])
 
+    @unittest.skipUnless(platform.is_linux(),
+                         "#718 : mountinfo est Linux ; hors Linux, vide par conception")
     def test_mount_table_readable_again_lifts_the_unscanned_alert(self):
         tmp = menage.turn_env(self.mine, self.pol, "codex3", {})["TMPDIR"]
         ours = os.path.join(tmp, "out.txt")

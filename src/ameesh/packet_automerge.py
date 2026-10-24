@@ -49,7 +49,10 @@ repos/<slug>/merges`, `base=<cible épinglée>`, `head=<tête publiée>`)
   chemin.
 
 La trace est le journal du lot (aucun état local) : `auto-merge armed …`,
-`disarmed …`, `merged …` et `not-armed …`, avec dépôt, PR, tête et cible. La
+`disarmed …`, `merged …`, `not-armed …` et `held …`, avec dépôt, PR, tête et
+cible. #3175 : un refus du passage (`pending`, `error`) n'est jamais muet ;
+`held …` en porte le motif, une fois par motif et par armement (le passage
+suivant qui refuse pour la même raison n'écrit rien). La
 publication et le passage d'un même porteur se sérialisent sous le bail
 `auto-merge:<lot>` ; le passage relit les marques sous ce bail.
 """
@@ -73,12 +76,16 @@ OPEN_STATES = ("intake", "build", "qa", "blocked", "waiting_human")
 #: durée du bail `auto-merge:<lot>` qui sérialise la publication et le passage ;
 #: il est renouvelé avant chaque geste (B4 : plusieurs appels `gh` de 60 à 120 s)
 LOCK_TTL_S = 300.0
+#: L165 (EP4) : marge du bail élu avant `merge_into` (POST /merges, 120 s de
+#: timeout + lecture) ; la course résiduelle est documentée dans
+#: docs/HOST-HANDOFFS.md.
+AUTOMERGE_CALL_MARGIN_S = 180.0
 #: une marque du journal du lot ; un armement porte toujours sa cible
 MARK_RE = re.compile(
-    r"^auto-merge (?P<state>armed|disarmed|merged|not-armed) "
+    r"^auto-merge (?P<state>armed|disarmed|merged|not-armed|held) "
     r"repo=(?P<repo>[\w.-]+/[\w.-]+) pr=(?P<pr>\d+) sha=(?P<sha>[0-9a-f]{40})"
     r"(?: base=(?P<base>[\w./-]+))?(?: method=[a-z]+)?(?: required=(?P<required>\S+))?"
-    r"(?:\s|$)")
+    r"(?:\s|$)(?: *— *(?P<why>.*))?", re.S)
 #: marques qui referment un armement de la même PR
 CLOSING = ("disarmed", "merged")
 _SHA = re.compile(r"[0-9a-f]{40}")
@@ -102,18 +109,25 @@ def gh_of(runner):
 # journal
 # --------------------------------------------------------------------------
 
-def marks(db, lot: int, *, limit: int = 200) -> list[dict]:
+def marks(db, lot: int) -> list[dict]:
     """Les marques de fusion automatique du lot, de la plus ancienne à la plus
-    récente."""
+    récente.
+
+    La lecture porte sur les seules notes `auto-merge …` (#3279) : les notes
+    `held` d'un porteur armé pouvaient remplir la fenêtre de 200 événements de
+    `work.events` et en chasser la marque d'armement, faisant croire que rien
+    n'était armé. Une marque de contrôle ne dépend jamais du nombre de notes
+    qui la suivent."""
     out = []
-    for ev in work.events(db, int(lot), limit=limit) or ():
+    for ev in work.events_noted(db, int(lot), "auto-merge ", 0.0) or ():
         m = MARK_RE.match((ev.get("note") or "").strip())
         if m:
             out.append({"id": int(ev.get("id") or 0), "state": m.group("state"),
                         "repo": m.group("repo"), "pr": int(m.group("pr")),
                         "sha": m.group("sha"), "base": m.group("base") or "",
                         "required": tuple(unquote(name) for name in
-                                          (m.group("required") or "").split(",") if name)})
+                                          (m.group("required") or "").split(",") if name),
+                        "why": (m.group("why") or "").strip()})
     return sorted(out, key=lambda m: m["id"])
 
 
@@ -138,6 +152,39 @@ def _note(db, lot: int, state: str, slug: str, number: int, sha: str, rest: str,
           actor: str) -> None:
     work.note(db, int(lot), "auto-merge %s repo=%s pr=%d sha=%s %s"
               % (state, slug, int(number), sha, rest.strip()), actor=actor)
+
+
+def _fenced_hold(db, fence, *, margin_s: float = 0.0) -> bool:
+    """L165 (EP4) : renouvelle la garde si elle existe ; False si perdue."""
+    if fence is None:
+        return True
+    from . import pilot_gesture
+    try:
+        fence.hold(db, margin_s=margin_s)
+    except pilot_gesture.GestureRefused:
+        return False
+    return True
+
+
+def _note_fenced(db, fence, lot: int, state: str, slug: str, number: int, sha: str,
+                 rest: str, actor: str, *, margin_s: float = 0.0) -> bool:
+    """Écrit la marque dans la même transaction que le hold du bail élu.
+
+    Sans garde (exécuteur/humain), c'est la note simple. Avec une garde, une
+    époque périmée n'écrit pas la marque : c'est la correction B1 de la
+    relecture cx2 (le marqueur `armed` ne doit pas survivre à une bascule).
+    """
+    if fence is None:
+        _note(db, lot, state, slug, number, sha, rest, actor)
+        return True
+    from . import pilot_gesture
+    with db.transaction() as tx:
+        try:
+            fence.hold(tx, margin_s=margin_s)
+        except pilot_gesture.GestureRefused:
+            return False
+        _note(tx, lot, state, slug, number, sha, rest, actor)
+        return True
 
 
 def _lock(db, lot: int):
@@ -185,12 +232,12 @@ def _error(proc) -> str:
 
 def pr_status(slug: str, number: int, *, gh) -> dict:
     """La PR `number`, dans la forme que lit `fire.ready_pr` (état, tête,
-    cible, brouillon, CI, rollup, branche) plus `auto` ; `land.LandError`
-    sinon."""
+    cible, brouillon, CI, rollup, branche) plus `auto` et la cible résolue
+    (`base_oid`, #3091) ; `land.LandError` sinon."""
     from . import radar
     proc = gh(["pr", "view", str(int(number)), "--repo", slug, "--json",
-               "state,headRefOid,headRefName,baseRefName,isDraft,autoMergeRequest,"
-               "statusCheckRollup,title"])
+               "state,headRefOid,headRefName,baseRefName,baseRefOid,isDraft,"
+               "autoMergeRequest,statusCheckRollup,title"])
     if proc.returncode != 0:
         raise land.LandError("gh pr view %d: %s" % (int(number), _error(proc)))
     try:
@@ -202,14 +249,21 @@ def pr_status(slug: str, number: int, *, gh) -> dict:
     rollup = radar.merge_rollup(data.get("statusCheckRollup"), slug=slug,
                                 head=data.get("headRefOid") or "",
                                 branch=data.get("headRefName") or "", gh=gh)
+    # `ci` garde son sens strict (file/affichage) ; `ci_rule` porte la règle
+    # owner du 23/10 (#3085) que lit `fire.ready_pr`.
     pending = any((c.get("status") or "COMPLETED") != "COMPLETED"
                   or (c.get("state") or "") == "PENDING" for c in rollup)
     ci = "green" if radar.ci_green(rollup) else "pending" if pending or not rollup else "red"
+    ci_rule = radar.ci_state(rollup)
     return {"number": int(number), "state": str(data.get("state") or "").upper(),
             "head": str(data.get("headRefOid") or "").strip().lower(),
             "base": str(data.get("baseRefName") or "").strip(),
+            # #3091 : la cible résolue de la PR, la seule lecture fraîche que
+            # la porte des avis puisse opposer à la ref locale du checkout.
+            "base_oid": str(data.get("baseRefOid") or "").strip().lower(),
             "branch": str(data.get("headRefName") or "").strip(),
-            "draft": bool(data.get("isDraft")), "ci": ci, "rollup": rollup,
+            "draft": bool(data.get("isDraft")), "ci": ci, "ci_rule": ci_rule,
+            "rollup": rollup,
             "auto": data.get("autoMergeRequest") is not None,
             "title": str(data.get("title") or "")}
 
@@ -238,24 +292,34 @@ def arm(cfg, db, lot: int, *, slug: str, number: int, sha: str, target: str, gh,
         return {"state": "error", "why": "another auto-merge operation holds lot #%d: "
                                          "rerun `ameesh ci run %d --full`" % (lot, lot)}
     try:
+        # L165 (EP4) : l'armement est un geste de fusion du pilote (il ouvre
+        # le chemin de `merge_into`) ; sans identité de rôle, `gate` rend None
+        # et le passage d'exécuteur reste inchangé. Le merge immédiat reçoit
+        # la même garde et la renouvelle juste avant l'appel.
+        from . import pilot_gesture
+        try:
+            fence = pilot_gesture.gate(cfg, db, "merge", "auto-merge arm #%d" % lot)
+        except pilot_gesture.GestureRefused as exc:
+            return {"state": "error", "why": str(exc)}
         out = _arm_locked(db, lot, slug=slug, number=number, sha=sha, target=target,
-                          gh=gh, actor=actor, handle=handle)
+                          gh=gh, actor=actor, handle=handle, fence=fence)
         if out["state"] in ("armed", "already-armed"):
             # une composition déjà verte fusionne tout de suite, sous le même bail
             out["merge"] = _check_locked(cfg, db, lot, gh=gh, dry_run=False, actor=actor,
-                                         handle=handle)
+                                         handle=handle, fence=fence)
         return out
     finally:
         _unlock(handle)
 
 
 def _arm_locked(db, lot: int, *, slug: str, number: int, sha: str, target: str, gh,
-                actor: str, handle=None) -> dict:
+                actor: str, handle=None, fence=None) -> dict:
     lost = {"state": "error", "why": "the auto-merge lease of lot #%d was lost: rerun "
                                      "`ameesh ci run %d --full`" % (lot, lot)}
 
     def refuse(state: str, why: str) -> dict:
-        _note(db, lot, "not-armed", slug, number, sha, "— %s" % why, actor)
+        _note_fenced(db, fence, lot, "not-armed", slug, number, sha, "— %s" % why,
+                         actor)
         return {"state": state, "why": why}
 
     if not target:
@@ -289,6 +353,9 @@ def _arm_locked(db, lot: int, *, slug: str, number: int, sha: str, target: str, 
         # prochaine tête poussée ; ameesh fusionne lui-même, sur la tête publiée.
         if not _renew(handle):
             return lost
+        if not _fenced_hold(db, fence, margin_s=AUTOMERGE_CALL_MARGIN_S):
+            return {"state": "error", "why": "the elected pilot lease was lost before "
+                                             "disarming the GitHub auto-merge: nothing armed"}
         error = land.pr_disable_auto(slug, number, gh=gh)
         if error is not None:
             return refuse("error", "the GitHub auto-merge armed on PR #%d could not be "
@@ -303,10 +370,13 @@ def _arm_locked(db, lot: int, *, slug: str, number: int, sha: str, target: str, 
                                    for context, _app in required))
     if not _renew(handle):
         return lost
-    _note(db, lot, "armed", slug, number, sha,
-          "base=%s method=%s required=%s — ameesh merges this head into %s once its "
-          "required checks are green; a new push or a retarget disarms it"
-          % (target, METHOD, names, target), actor)
+    if not _note_fenced(db, fence, lot, "armed", slug, number, sha,
+                        "base=%s method=%s required=%s — ameesh merges this head into %s "
+                        "once its required checks are green; a new push or a retarget "
+                        "disarms it" % (target, METHOD, names, target), actor,
+                        margin_s=AUTOMERGE_CALL_MARGIN_S):
+        return {"state": "error", "why": "the elected pilot lease was lost before "
+                                         "arming: nothing armed"}
     return {"state": "armed", "why": "ameesh merges %s into %s once %s is green"
             % (sha[:12], target, names)}
 
@@ -357,11 +427,26 @@ def merge_into(slug: str, target: str, sha: str, *, number: int, branch: str, ti
     return commit, None
 
 
-def _verdicts(cfg, db, row: dict, milestones: list, *, slug: str, base: str) -> tuple:
+def _verdicts(cfg, db, row: dict, milestones: list, *, slug: str, base: str,
+              base_sha: str = "", checkout: str = "", branch: str = "") -> tuple:
     """`fire.ready_verdicts` sur le porteur, avec le dépôt et le projet que le
     feu résout (dossier de l'assigné s'il porte ce dépôt, sinon le clone
-    déclaré du projet). Rend `(ok, raison, projet)` ; le projet résolu sert
-    ensuite à toute la porte de CI (R2, cx3). Une erreur refuse."""
+    déclaré du projet, sinon `checkout`, le clone que le passage de l'hôte
+    déclare, `packet_watch.projects.<p>.repo`). Rend `(ok, raison, projet)` ;
+    le projet résolu sert ensuite à toute la porte de CI (R2, cx3). Une
+    erreur refuse.
+
+    `base_sha` (#3091) est la cible résolue lue sur la PR (`baseRefOid`) :
+    elle prouve la base de composition au lieu de dépendre de la fraîcheur de
+    la ref locale du checkout.
+
+    #3175 : sur ameesh-agents-2, le dossier de l'assigné (sur agents-1) est
+    absent et aucun `radar.projects` n'est déclaré ; la porte lisait git sans
+    dépôt et refusait chaque tour (« cannot read the composition members: git
+    not found »). Le clone du passage sert de repli, et un hôte sans aucun
+    clone le dit. Ce clone n'est celui d'aucun agent : la tête du porteur
+    (`branch`) et la cible y sont lues fraîches (`_fetch_into`) avant la
+    porte, qui ne fetch pas elle-même."""
     try:
         repo = fire._repo_of(db, row)
         if repo is not None and not fire._same_repository(repo, slug):
@@ -369,12 +454,68 @@ def _verdicts(cfg, db, row: dict, milestones: list, *, slug: str, base: str) -> 
         project = fire._project(cfg, repo, slug)
         if repo is None:
             repo = fire._project_checkout(project)
+        if repo is None and checkout:
+            repo = fire._checkout(checkout)
+            if repo is not None and not fire._same_repository(repo, slug):
+                repo = None
+            if repo is not None:
+                error = _fetch_into(repo, (branch, base))
+                if error:
+                    return (False, "the pass clone %s cannot be refreshed for the review "
+                                   "gate: %s" % (repo, error), project)
+        if repo is None:
+            return (False, "no checkout of %s on this host to read the review gate: the "
+                           "assignee's folder is not here, and neither radar.projects.<p>.repo "
+                           "nor packet_watch.projects.<p>.repo names a clone of it" % slug,
+                    project)
+        extra = {"base_sha": base_sha} if str(base_sha or "").strip() else {}
         ok, why, _klass = fire.ready_verdicts(cfg, db, row, milestones, repo=repo,
-                                              project=project, target=base)
+                                              project=project, target=base, **extra)
     except Exception as exc:  # noqa: BLE001 - une porte illisible ne fusionne pas
         return (False, "the review gate cannot be read: %s: %s" % (type(exc).__name__, exc),
                 None)
     return ok, why, project
+
+
+def _fetch_into(repo: str, branches) -> str:
+    """Rapatrie les objets des branches `branches` d'`origin` dans `repo`
+    (aucune branche locale déplacée, seules les refs de suivi `origin/*` ;
+    aucun `--depth`, canon §7) ; rend l'erreur, ou "" (#3175)."""
+    refs = ["refs/heads/%s" % name for name in branches if name]
+    if not refs:
+        return ""
+    try:
+        proc = subprocess.run(["git", "-C", repo, "fetch", "--quiet", "--no-tags",
+                               "origin"] + refs, capture_output=True, text=True,
+                              timeout=120)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return str(exc)
+    if proc.returncode != 0:
+        return (proc.stderr or proc.stdout or "exit %d" % proc.returncode).strip()[:300]
+    return ""
+
+
+def _required_ci(view: dict, required, project) -> dict:
+    """#3066 : la CI du paquet porte sur les exigences, pas le rollup entier.
+
+    Garder les noms exacts imposés par la forge et le projet, les statuts
+    requis par préfixe et la preuve du portier (#2876). `ready_pr` contrôle
+    ensuite leur présence, leur succès et leur provenance sur la tête gelée.
+    Un macOS facultatif en attente ou rouge ne retient pas la fusion.
+    """
+    from . import radar
+    names = {name for name, _app in fire._required_pairs(required)}
+    prefixes = radar.required_statuses(project, view.get("branch"))
+    rollup = []
+    for entry in view.get("rollup") or ():
+        context = (entry.get("__typename") == "StatusContext"
+                   or "state" in entry and "conclusion" not in entry)
+        name = entry.get("context" if context else "name") or ""
+        if (name in names or context and name.startswith(prefixes)
+                or entry.get("workflowName") == "paquet"
+                or name == "paquet (run proof unavailable)"):
+            rollup.append(entry)
+    return dict(view, rollup=rollup, ci="green" if radar.ci_green(rollup) else "pending")
 
 
 def open_carriers(db, app: str) -> list[int]:
@@ -388,33 +529,77 @@ def open_carriers(db, app: str) -> list[int]:
 
 
 def check(cfg, db, lot: int, *, gh, dry_run: bool = False,
-          actor: str = work.SYSTEM_SENDER) -> dict:
+          actor: str = work.SYSTEM_SENDER, checkout: str = "") -> dict:
     """Un porteur armé : le désarme si sa tête ou sa cible a changé, le
     fusionne si ses checks requis sont verts sur la tête publiée.
 
     `result` : `idle` (rien d'armé), `pending` (checks pas encore verts),
     `closed` (PR fusionnée ou fermée ailleurs), `disarmed`/`would-disarm`,
     `merged`/`would-merge`, `busy` (une publication tient le bail : au passage
-    suivant) ou `error`."""
+    suivant) ou `error` ; un `pending` ou un `error` d'un porteur armé laisse
+    son motif au journal du lot (`held …`, #3175)."""
     if not active(marks(db, lot)):
         return {"lot": lot, "result": "idle"}
+    from . import pilot_gesture
+    try:
+        fence = (None if dry_run else
+                 pilot_gesture.gate(cfg, db, "merge", "auto-merge check #%d" % lot))
+    except pilot_gesture.GestureRefused as exc:
+        return {"lot": lot, "result": "error", "error": str(exc)}
     handle = None if dry_run else _lock(db, lot)
     if handle is None and not dry_run:
         return {"lot": lot, "result": "busy"}
     try:
         return _check_locked(cfg, db, lot, gh=gh, dry_run=dry_run, actor=actor,
-                             handle=handle)
+                             handle=handle, fence=fence, checkout=checkout)
     finally:
         if handle is not None:
             _unlock(handle)
 
 
+#: les issues du passage qui refusent la fusion d'un porteur armé (#3175)
+REFUSALS = ("pending", "error")
+
+
 def _check_locked(cfg, db, lot: int, *, gh, dry_run: bool, actor: str,
-                  handle=None) -> dict:
+                  handle=None, fence=None, checkout: str = "") -> dict:
     # relu sous le bail : une publication a pu réarmer depuis la première lecture
-    mine = active(marks(db, lot))
+    rows = marks(db, lot)
+    mine = active(rows)
     if mine is None:
         return {"lot": lot, "result": "idle"}
+    out = _gate_locked(cfg, db, lot, mine, gh=gh, dry_run=dry_run, actor=actor,
+                       handle=handle, fence=fence, checkout=checkout)
+    if out.get("result") in REFUSALS and not dry_run:
+        _held(db, lot, mine, rows, out, actor=actor, fence=fence)
+    return out
+
+
+def _held(db, lot: int, mine: dict, rows, out: dict, *, actor: str, fence=None) -> None:
+    """#3175 : consigne au lot le motif d'un refus du passage, une fois par
+    motif et par armement. Sur #2409 (h-1500), le passage refusait à chaque
+    tour sans rien écrire, et le bureau a fusionné à la main sans trace du
+    pourquoi. Le journal est une trace : son échec ne change pas l'issue."""
+    why = " ".join(str(out.get("why") or out.get("error") or "no reason given").split())
+    if out["result"] == "error":
+        why = "error: " + why
+    last = None
+    for row in rows or ():
+        if row["id"] < mine["id"]:
+            continue
+        if row["state"] == "held" and row["pr"] == mine["pr"] and row["sha"] == mine["sha"]:
+            last = row["why"]
+    if last == why:
+        return
+    try:
+        _note_fenced(db, fence, lot, "held", mine["repo"], mine["pr"], mine["sha"],
+                     "base=%s — %s" % (mine["base"], why), actor)
+    except Exception:  # noqa: BLE001 - la trace ne fait jamais tomber le passage
+        pass
+
+
+def _gate_locked(cfg, db, lot: int, mine: dict, *, gh, dry_run: bool, actor: str,
+                 handle=None, fence=None, checkout: str = "") -> dict:
     slug, number, sha, base = mine["repo"], mine["pr"], mine["sha"], mine["base"]
     out = {"lot": lot, "pr": number, "sha": sha, "base": base}
     try:
@@ -440,25 +625,44 @@ def _check_locked(cfg, db, lot: int, *, gh, dry_run: bool, actor: str,
             return dict(out, result="would-disarm")
         if not _renew(handle):
             return dict(out, result="busy")
+        if not _fenced_hold(db, fence, margin_s=AUTOMERGE_CALL_MARGIN_S):
+            return dict(out, result="error",
+                        error="the elected pilot lease was lost before disarming: "
+                              "nothing disarmed")
         if view["auto"]:
             error = land.pr_disable_auto(slug, number, gh=gh)
             if error is not None:
                 return dict(out, result="error", error="disarm: %s" % error)
-        _note(db, lot, "disarmed", slug, number, sha,
-              "base=%s %s — the PR changed since its publication; `ameesh ci run %d "
-              "--full` re-arms on the new head" % (base, " ".join(moved), int(lot)), actor)
+        if not _note_fenced(db, fence, lot, "disarmed", slug, number, sha,
+                            "base=%s %s — the PR changed since its publication; `ameesh "
+                            "ci run %d --full` re-arms on the new head"
+                            % (base, " ".join(moved), int(lot)), actor):
+            return dict(out, result="error",
+                        error="the elected pilot lease was lost before journaling "
+                              "the disarm")
         return dict(out, result="disarmed")
     if view["auto"] and not dry_run:
         # armée à la main depuis la publication : ameesh reste seul à fusionner
         if not _renew(handle):
             return dict(out, result="busy")
+        if not _fenced_hold(db, fence, margin_s=AUTOMERGE_CALL_MARGIN_S):
+            return dict(out, result="error",
+                        error="the elected pilot lease was lost before disarming: "
+                              "nothing disarmed")
         error = land.pr_disable_auto(slug, number, gh=gh)
         if error is not None:
             return dict(out, result="error", error="disarm: %s" % error)
     # R1 B1 (cx3) : la porte complète des verdicts, comme le feu (classe,
     # avis requis et indépendants sur la tête gelée, membres d'un porteur et
     # delta, #2766), avant toute lecture de CI et tout geste de fusion.
-    ok, why, project = _verdicts(cfg, db, row, milestones, slug=slug, base=base)
+    # #3091 : la cible résolue de la PR prouve la base de composition du
+    # paquet ; la ref locale du checkout de l'assigné peut être en retard.
+    base_oid = str(view.get("base_oid") or "").strip().lower()
+    extra = {"base_sha": base_oid} if base_oid else {}
+    if checkout:
+        extra.update(checkout=checkout, branch=view.get("branch") or "")
+    ok, why, project = _verdicts(cfg, db, row, milestones, slug=slug, base=base,
+                                 **extra)
     if not ok:
         return dict(out, result="pending", why=why)
     # R1 B2 (cx3) : au geste, au moins un check imposé par la forge, et tous
@@ -479,8 +683,10 @@ def _check_locked(cfg, db, lot: int, *, gh, dry_run: bool, actor: str,
         return dict(out, result="error", error=(
             "%s no longer enforces %s: nothing proves the CI the publication relied on, "
             "nothing merged" % (base, ", ".join(dropped) or "any required check")))
-    ok, why = fire.ready_pr(view, target=base, project=project, frozen=sha,
-                            required=required, slug=slug, gh=gh)
+    report: dict = {}
+    ok, why = fire.ready_pr(_required_ci(view, required, project),
+                            target=base, project=project, frozen=sha,
+                            required=required, slug=slug, gh=gh, report=report)
     if not ok:
         return dict(out, result="pending", why=why)
     if dry_run:
@@ -499,23 +705,75 @@ def _check_locked(cfg, db, lot: int, *, gh, dry_run: bool, actor: str,
                fresh["base"] or "?")))
     if not _renew(handle):
         return dict(out, result="busy")
+    # L165 (EP4) : renouvellement du bail élu juste avant `POST /merges`, avec
+    # la marge de l'appel ; sans rôle/identité, `fence` est None et le passage
+    # d'exécuteur reste inchangé.
+    if fence is not None:
+        from . import pilot_gesture
+        try:
+            fence.hold(db, margin_s=AUTOMERGE_CALL_MARGIN_S)
+        except pilot_gesture.GestureRefused as exc:
+            return dict(out, result="error", error=str(exc))
     commit, error = merge_into(slug, base, sha, number=number, branch=fresh["branch"],
                                title=fresh.get("title") or "", gh=gh)
     if error is not None:
         return dict(out, result="error", error="merge: %s" % error)
-    _note(db, lot, "merged", slug, number, sha,
-          "base=%s commit=%s — merged by ameesh into %s at its published head, gates green"
-          % (base, commit or "already-contained", base), actor)
-    return dict(out, result="merged", commit=commit)
+    consigned = list(report.get("consigned") or ())
+    note = ("base=%s commit=%s — merged by ameesh into %s at its published head, gates green"
+            % (base, commit or "already-contained", base))
+    if consigned:
+        note += ("; required checks non concluants consignés (règle owner 23/10) : %s"
+                 % ", ".join(consigned))
+    _note(db, lot, "merged", slug, number, sha, note, actor)
+    if consigned:
+        _open_correction(db, row, slug=slug, number=number, sha=sha, base=base,
+                         consigned=consigned, actor=actor)
+    return dict(out, result="merged", commit=commit, consigned=consigned)
 
 
-def watch(cfg, db, app: str, *, gh=None, dry_run: bool = False) -> list[dict]:
-    """Tous les porteurs ouverts de `app` ; un porteur ne fait pas tomber l'autre."""
+def _open_correction(db, row: dict, *, slug: str, number: int, sha: str, base: str,
+                     consigned: list, actor: str):
+    """#3085 : ouvre le lot de correction d'un check requis non concluant qui
+    n'a pas retenu la fusion. Le lot est journalisé, sans assigné (file de
+    l'équipe) ; son ouverture ne défait jamais la fusion déjà écrite.
+    #3209 : un lot par check tant qu'il est ouvert (`radar.nonconclusive_source`) ;
+    le même check au paquet suivant est noté sur ce lot."""
+    from . import radar
+    app = str(row.get("app") or "")
+    out = []
+    for text in consigned:
+        try:
+            out.append(work.add_or_note(
+                db,
+                title="CI non concluante sur %s@%s : corriger %s" % (slug, sha[:12], text),
+                type="bug", priority=2, app=app,
+                source=radar.nonconclusive_source(app or slug, text),
+                occurrence=("de nouveau non concluant sur la tête %s du paquet %s#%d "
+                            "(base %s) : %s" % (sha[:12], slug, int(number), base, text)),
+                body=("Le check requis n'a pas conclu (ni vert ni négatif) sur la tête %s "
+                      "du paquet %s#%d (base %s) : %s.\n\nRègle owner du 23/10 (canon home "
+                      "§3) : un résultat non concluant ne bloque pas la fusion ; il se "
+                      "consigne et ouvre ce lot de correction. Rejouer ou réparer le "
+                      "check, sans relire le paquet déjà fusionné. Tant que ce lot est "
+                      "ouvert, les occurrences suivantes y sont notées."
+                      % (sha, slug, int(number), base, text)),
+                actor=actor))
+        except Exception:  # noqa: BLE001 - la fusion est écrite, le lot est un suivi
+            continue
+    return out
+
+
+def watch(cfg, db, app: str, *, gh=None, dry_run: bool = False,
+          checkout: str = "") -> list[dict]:
+    """Tous les porteurs ouverts de `app` ; un porteur ne fait pas tomber l'autre.
+
+    `checkout` : le clone que le passage de l'hôte déclare pour ce projet
+    (`packet_watch.projects.<p>.repo`), repli de la porte des avis (#3175)."""
     gh = gh or land._gh
     results = []
     for lot in open_carriers(db, app):
         try:
-            results.append(check(cfg, db, lot, gh=gh, dry_run=dry_run))
+            results.append(check(cfg, db, lot, gh=gh, dry_run=dry_run, checkout=checkout))
         except Exception as exc:  # noqa: BLE001 - un porteur ne fait pas tomber l'autre
             results.append({"lot": lot, "result": "error",
                             "error": "%s: %s" % (type(exc).__name__, exc)})

@@ -160,12 +160,43 @@ class BriefsLivenessTest(unittest.TestCase):
         self.assertEqual(alert_briefs.briefs(alert, listing,
                                              auditor_names=["auditeur"]), {})
 
+    # #3274 : `plan_underused` se lit à la passe de l'auditeur, comme
+    # `stale_lot` ; il ne le réveille que si le pilotage n'a plus personne.
+    PLAN = {"type": "plan_underused", "harness": "claude", "account": "pro",
+            "detail": "account claude/pro, window 7d: 20 % used",
+            "idle_agents": ["dev1"], "orchestrators": ["orch"]}
 
-class NotifierLivenessTest(PgTestCase):
-    """La livraison réelle : pas de dépôt chez un mort, remise au retour."""
+    def test_plan_underused_ne_reveille_pas_l_auditeur_avec_un_pilote_vivant(self):
+        listing = [_row("dev1"), _row("orch"), _row("auditeur")]
+        briefs = alert_briefs.briefs(self.PLAN, listing, auditor_names=["auditeur"])
+        self.assertEqual(list(briefs), ["orch"])
+        self.assertIn("Underused plan:", briefs["orch"])
+
+    def test_plan_underused_sans_pilote_vivant_replie_sur_l_auditeur(self):
+        listing = [_row("dev1"), _row("orch", lease=False), _row("auditeur")]
+        briefs = alert_briefs.briefs(self.PLAN, listing, auditor_names=["auditeur"])
+        self.assertEqual(list(briefs), ["auditeur"])
+        self.assertIn("Underused plan:", briefs["auditeur"])
+        self.assertIn("No live recipient: orch (no live lease)", briefs["auditeur"])
+
+    def test_plan_underused_sans_vivant_replie_sur_le_bureau(self):
+        listing = [_row("dev1"), _row("orch", lease=False),
+                   _row("auditeur", lease=False), _row("bureau")]
+        briefs = alert_briefs.briefs(self.PLAN, listing, auditor_names=["auditeur"])
+        self.assertEqual(list(briefs), ["bureau"])
+        self.assertIn("No live recipient:", briefs["bureau"])
+        self.assertIn("orch (no live lease)", briefs["bureau"])
+        self.assertIn("auditeur (no live lease)", briefs["bureau"])
+
+
+class LivenessFixture:
+    """Registre, baux et notificateur des témoins de livraison (repris par
+    #3057) ; à placer avant `PgTestCase`."""
 
     def setUp(self):
         super().setUp()
+        self.notifiers = []
+        self.long_dead = set()
         for name in ("dev1", "orch", "bureau", "auditeur", "claude3"):
             registry.upsert(self.db, name, harness="claude", host=self.cfg.host)
             self.db.execute("UPDATE agent_registry SET team = 'ameesh'"
@@ -175,21 +206,38 @@ class NotifierLivenessTest(PgTestCase):
 
     def lease(self, *names):
         for name in names:
+            self.long_dead.discard(name)
             self.db.execute(
                 "UPDATE agent_registry SET lease_owner = 'runner-' || name,"
                 " lease_expires_at = now() + interval '1 hour' WHERE name = %s",
                 (name,))
 
     def dead(self, *names):
+        """Une perte qui dure : le notificateur a déjà vu ces agents sans bail
+        au-delà de la grâce de #3057 (`release` pour un bail tout juste rendu)."""
+        self.release(*names)
+        self.long_dead.update(names)
+        for notifier in self.notifiers:
+            self._seen_dead(notifier)
+
+    def release(self, *names):
         for name in names:
             self.db.execute(
                 "UPDATE agent_registry SET lease_owner = NULL,"
                 " lease_expires_at = NULL WHERE name = %s", (name,))
 
+    def _seen_dead(self, notifier):
+        since = notifier.state.setdefault("leaseless_since", {})
+        for name in self.long_dead:
+            since[name] = self.now - HEURE
+
     def notifier(self):
-        return notify.Notifier(self.cfg, notify.parse_config({"default": []}),
-                               sender=object(), log=lambda text: None,
-                               clock=lambda: self.now)
+        notifier = notify.Notifier(self.cfg, notify.parse_config({"default": []}),
+                                   sender=object(), log=lambda text: None,
+                                   clock=lambda: self.now)
+        self._seen_dead(notifier)
+        self.notifiers.append(notifier)
+        return notifier
 
     def mails(self, name):
         return self.db.query("SELECT body, payload FROM agent_mailbox"
@@ -197,6 +245,11 @@ class NotifierLivenessTest(PgTestCase):
 
     def thread(self, project, lot):
         return fil.transport_for(self.cfg).read(fil.ThreadRef(project, lot))
+
+
+
+class NotifierLivenessTest(LivenessFixture, PgTestCase):
+    """La livraison réelle : pas de dépôt chez un mort, remise au retour."""
 
     def test_agent_mort_sur_hote_perdu_ne_recoit_rien_et_est_nomme(self):
         self.dead("orch")
@@ -346,6 +399,51 @@ class NotifierLivenessTest(PgTestCase):
         notifier.run_pass(self.db, current=[alert])
         self.assertEqual(len(self.mails("orch")), 1)
         self.assertEqual(len(self.mails("orch2")), 1)
+
+    def test_bail_qui_cligne_ne_redouble_ni_n_escalade(self):
+        # #3100 : remis au pilote, puis son bail meurt une passe (redémarrage
+        # d'exécuteur) et revient. Le courrier était dans sa boîte : un seul
+        # courrier, et ni le bureau ni l'auditeur ne reçoivent d'escalade.
+        notifier = self.notifier()
+        alert = _slo(level=2, targets=("pilot",))
+        notifier.run_pass(self.db, current=[alert])
+        self.assertEqual(len(self.mails("orch")), 1)
+        self.dead("orch")
+        self.now += 60.0
+        notifier.run_pass(self.db, current=[alert])
+        self.lease("orch")
+        self.now += 60.0
+        notifier.run_pass(self.db, current=[alert])
+        self.assertEqual(len(self.mails("orch")), 1)
+        self.assertEqual(self.mails("bureau"), [])
+        self.assertEqual(self.mails("auditeur"), [])
+        self.assertEqual(self.thread("ameesh", 42), [])
+        [entry] = notifier.state["briefs"].values()
+        self.assertEqual(entry["to"], ["orch"])
+
+    def test_cloture_de_release_de_l_hote_ne_redouble_rien(self):
+        # #3100 : une clôture de release ferme les claims de l'hôte pour tous
+        # ses agents à la fois ; les paliers déjà prévenus restent couverts.
+        notifier = self.notifier()
+        alerts = [_slo(level=1, targets=("assignee",)),
+                  _slo(level=2, targets=("pilot",), lot=43, agent="dev1")]
+        notifier.run_pass(self.db, current=alerts)
+        self.assertEqual(len(self.mails("dev1")), 1)
+        self.assertEqual(len(self.mails("orch")), 1)
+        self.db.execute("INSERT INTO host_lifecycle(host, mode, actor)"
+                        " VALUES (%s, 'draining', 'test')"
+                        " ON CONFLICT (host) DO UPDATE SET mode = 'draining'",
+                        (self.cfg.host,))
+        self.now += 60.0
+        notifier.run_pass(self.db, current=alerts)
+        self.db.execute("UPDATE host_lifecycle SET mode = 'available'"
+                        " WHERE host = %s", (self.cfg.host,))
+        self.now += 60.0
+        notifier.run_pass(self.db, current=alerts)
+        self.assertEqual(len(self.mails("dev1")), 1)
+        self.assertEqual(len(self.mails("orch")), 1)
+        self.assertEqual(self.mails("bureau"), [])
+        self.assertEqual(self.mails("auditeur"), [])
 
 
 if __name__ == "__main__":

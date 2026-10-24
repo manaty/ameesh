@@ -178,8 +178,10 @@ class TargetCommitTest(_TargetFixture):
         authors, unknown, _correctors = self.reading(
             [self.new_lot, self.new_fix], target=self.base, strict=False)
         self.assertIn(self.target1[:12], unknown)
-        # un commit de cible AVEC reçu était même promu auteur du lot
-        self.assertIn("tgt", self.names(authors))
+        # #3220 : même avec reçu, un commit de cible dont le contenu ne survit
+        # pas dans la tête n'est plus promu auteur (l'ancien comportement que
+        # ce témoin constatait est corrigé).
+        self.assertNotIn("tgt", self.names(authors))
 
 
 class RewrittenUnknownTest(_TargetFixture):

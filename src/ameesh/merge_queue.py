@@ -210,7 +210,22 @@ def required_verdicts(klass) -> int:
     avis que le canon ne demande pas.
     Un lot release n'est jamais léger : il garde un avis (la procédure de
     release et la protection de cible restent au pilote ; le feu, lui, refuse
-    la classe release avant tout compte)."""
+    la classe release avant tout compte).
+    #3183 : le plancher posé par un pilote (`reviews_floor`, lu par la classe)
+    relève ce compte, jamais ne l'abaisse ; un lot sans chemin changé reste à
+    zéro. Un journal illisible (`reviews_floor_unreadable`) vaut deux avis :
+    un plancher qu'on ne lit pas ne se suppose pas absent."""
+    base = _scale_verdicts(klass)
+    klass = klass or {}
+    if base == 0 and not klass.get("files"):
+        return 0
+    if klass.get("reviews_floor_unreadable"):
+        return max(base, CRITICAL_REVIEWS)
+    return max(base, int(klass.get("reviews_floor") or 0))
+
+
+def _scale_verdicts(klass) -> int:
+    """Le compte du barème seul (classe et chemins), sans plancher de pilote."""
     from . import lot_class
     klass = klass or {}
     cls = str(klass.get("class") or lot_class.SENSITIVE)
@@ -1702,6 +1717,20 @@ def _refetch_tip_objects(where: str, url: str, branch: str) -> str:
     return resolutions._err(proc)[:300] if proc.returncode else ""
 
 
+def _fetch_refusal(where: str, error: str) -> str:
+    """#3181 : la suite du refus d'un fetch, selon sa cause. Une corruption
+    locale (objet ou ref vides après une coupure de courant) ne se résorbe pas
+    en attendant la forge : `resolutions._run` a déjà mis en quarantaine les
+    fichiers vides et refait le fetch une fois, l'erreur restante se répare à
+    la main dans le clone."""
+    from . import resolutions
+    if resolutions.local_corruption(error):
+        return ("(%s): repair the clone %s and its alternates by hand (git fsck), "
+                "waiting for the remote will not fix it"
+                % (resolutions.fetch_failure(error)[:300], where))
+    return "(%s): try again once the remote answers" % error[:300]
+
+
 def _clone_base(where: str, base: str | None) -> str | None:
     """Le commit de cible dont les objets sont vérifiés avec ceux des têtes.
 
@@ -1791,9 +1820,8 @@ def _verified_tips(clone, url: str, names, tips: dict, base: str | None) -> dict
         repaired.add(_remote_branch(branch))
         error = _refetch_tip_objects(clone.path, url, branch)
         if error:
-            raise QueueError(
-                "cannot fetch %s from origin for the objects of its head %s (%s): "
-                "try again once the remote answers" % (branch, tip[:12], error))
+            raise QueueError("cannot fetch %s from origin for the objects of its head %s %s"
+                             % (branch, tip[:12], _fetch_refusal(clone.path, error)))
         fresh = plan_git._commit(clone.path, QUEUE_REF + _remote_branch(branch)) or tip
         for name in names:
             if _remote_branch(name) == _remote_branch(branch):
@@ -1869,8 +1897,8 @@ def fetch_fresh(repo: str, names, clone=None,
     except (GitError, OSError) as exc:
         failed = str(exc)
     if failed is not None:
-        raise QueueError("cannot fetch %s from origin (%s): try again once the remote answers"
-                         % (what, failed[:300]))
+        raise QueueError("cannot fetch %s from origin %s"
+                         % (what, _fetch_refusal(clone.path, failed)))
     tips = {n: plan_git._commit(clone.path, QUEUE_REF + remote[n]) if remote[n] in present
             else None for n in names}
     return _guarantee_tip_objects(clone, url, names, tips, base), clone.path
@@ -1951,13 +1979,11 @@ def readiness(db, lot: int, repo: str, *, ci=None, clone=None, project=None,
     classe, indépendants (familles distinctes, aucune celle de l'auteur) et
     sans blocage non levé ; la même porte que le feu du pilote.
 
-    The CI is required **explicitly**: for a project without `ci_required`,
-    `ci=None` (no reader) and a reader that answers nothing are refused, like
-    a red CI — an absent status is not a green one (revue #544 r1). A project
-    with `ci_required` may instead certify admission with GitHub's CI on the
-    frozen commit when no PR vouches for it (`ci=None`, or a reader that
-    answers nothing because there is no open PR): a green commit CI is not
-    blocked by the absence of a PR (revue #544 r2).
+    The CI is required **explicitly**: `ci=None` without `ci_required` is
+    refused (no reader). When the PR reader reports no PR, the frozen
+    commit's CI certifies admission instead (#3080), including the declared
+    statuses and due parts. An unreadable PR, a moved head or a red PR never
+    falls back to a green commit.
 
     L1651 (#1650): a project that declares `ci_parts` also proves the
     **completeness** of the frozen CI — the exact set of parts the change set
@@ -2105,9 +2131,9 @@ def readiness(db, lot: int, repo: str, *, ci=None, clone=None, project=None,
         except plan_github.GithubError as exc:
             raise QueueError("cannot read the CI of branch %s on GitHub (%s): try again once "
                              "gh works" % (row["branch"], exc)) from exc
-        if not status and not needs_commit_ci:
-            raise QueueError("no CI status for branch %s (lot #%d): a green CI on the frozen "
-                             "head %s is required" % (row["branch"], lot, tip[:12]))
+        if not status:
+            # #3080: commit statuses (e.g. lot/*) do not need an open PR.
+            needs_commit_ci = True
     if status:
         if not _same(status.get("head"), tip):
             raise QueueError("PR #%s is at %s, not at the freeze %s: its CI does not "
@@ -2121,6 +2147,7 @@ def readiness(db, lot: int, repo: str, *, ci=None, clone=None, project=None,
                              "from a non-draft PR" % status.get("number"))
     proof = None
     if needs_commit_ci:
+        project = project or radar.Project(name=os.path.basename(repo), repo=repo)
         if parts is None and getattr(project, "ci_parts", None):
             parts = _parts_reader(project, repo, target, tip, clone, cfg=cfg)
         _required_ci(project, tip, commit_ci, parts=parts, branch=row["branch"])
@@ -2269,9 +2296,16 @@ def _parts_reader(project, repo: str, target: str, sha: str, clone, cfg=None):
 
 
 def _required_ci(project, sha: str, commit_ci=None, *, parts=None,
-                 branch: str | None = None) -> None:
-    """L160g (#473): `ci_required` — GitHub's CI green on the frozen commit
-    `sha` itself; QueueError otherwise (no run, running, red, unreadable).
+                 branch: str | None = None,
+                 allow_inconclusive: bool = False) -> None:
+    """GitHub CI on frozen `sha`: `ci_required` or no PR (#3080).
+    QueueError otherwise (no run, running, red, unreadable).
+
+    #3085 (règle owner du 23/10) : `allow_inconclusive` n'est passé que par
+    la porte du feu/paquet (`fire.ready_pr`) — une lecture `acceptable` (tous
+    les checks ont conclu, aucun négatif) suffit alors, un job sauté ou
+    annulé pour quota est consigné au lieu de bloquer. La file et `merge-pr`
+    gardent la preuve stricte (défaut).
 
     L1651 (#1650): `parts` (a callable returning the due contexts, or a
     sequence; None: none) closes the completeness hole. Each due part must
@@ -2284,14 +2318,21 @@ def _required_ci(project, sha: str, commit_ci=None, *, parts=None,
     commit — the reader is pinned to `sha` — can stand for a part of this
     one."""
     from . import plan_github, radar
+    requirement = "ci_required" if getattr(project, "ci_required", False) else "no PR"
     try:
         runs = (commit_ci or (lambda s: radar.commit_ci(project, s, branch=branch)))(sha)
     except plan_github.GithubError as exc:
-        raise QueueError("project %s requires CI on the frozen commit (ci_required), "
-                         "unreadable (%s): try again once gh works" % (project.name, exc)) from exc
+        raise QueueError("project %s requires CI on the frozen commit (%s), "
+                         "unreadable (%s): try again once gh works"
+                         % (project.name, requirement, exc)) from exc
     if not runs["runs"]:
-        raise QueueError("project %s requires CI on the frozen commit (ci_required): no run "
-                         "on %s yet (push it, let the workflows run)" % (project.name, sha[:12]))
+        raise QueueError("project %s requires CI on the frozen commit (%s): no run "
+                         "on %s yet (push it, let the workflows run)"
+                         % (project.name, requirement, sha[:12]))
+    if allow_inconclusive and parts is None and runs.get("acceptable"):
+        # #3085 : tous les checks ont conclu, aucun n'est négatif ; les non
+        # concluants se consignent, la porte du feu/paquet ne les attend pas.
+        return
     if runs["pending"]:
         raise QueueError("the CI on the frozen commit %s is still running (%s)"
                          % (sha[:12], ", ".join(runs["pending"])))
@@ -2379,6 +2420,13 @@ def enter(db, lot: int, *, repo: str, actor: str = "", ci="github", project=None
     `parts` is `readiness`'s (L1651): the caller that requalifies a lot (§12
     package manifest) passes the due contexts it vouches for, `()` to disable
     the per-lot proof for that gesture."""
+    # L165 (EP4) : l'entrée en file est un geste du pilote hors base (la file
+    # poussera). Le bail élu est vérifié avant les lectures de préparation et
+    # journalisé dans la transaction de l'écriture ; le radar et un humain ne
+    # sont pas concernés (`gate` rend None).
+    from . import pilot_gesture
+    fence = pilot_gesture.gate(cfg, db, "queue", "queue add #%d" % lot,
+                               project=getattr(project, "name", None))
     if ci == "github":
         from . import radar
         ci = radar.github_ci(project or radar.Project(name="", repo=repo), strict=True)
@@ -2399,13 +2447,24 @@ def enter(db, lot: int, *, repo: str, actor: str = "", ci="github", project=None
     if ready.get("waived"):
         waived_note = ", verdict waived by %s (#1979)" % (
             ready.get("waived_by") or "pilot")
-    row = storage.of(db).work.queue_add(
-        lot, target=ready["target"], frozen_sha=ready["frozen_sha"], frozen_id=ready["frozen_id"],
-        source=source_of(repo), note="merge queue of %s: queued at %s%s, class %s%s%s%s" % (
-            ready["target"], ready["frozen_sha"][:12],
-            ", PR #%s green" % ready["pr"] if ready["pr"] else "",
-            ready.get("class") or "?", " (%s)" % ready["class_why"]
-            if ready.get("class_why") else "", parts_note, waived_note), actor=actor)
+
+    def add(tx):
+        return storage.of(tx).work.queue_add(
+            lot, target=ready["target"], frozen_sha=ready["frozen_sha"],
+            frozen_id=ready["frozen_id"], source=source_of(repo),
+            note="merge queue of %s: queued at %s%s, class %s%s%s%s" % (
+                ready["target"], ready["frozen_sha"][:12],
+                ", PR #%s green" % ready["pr"] if ready["pr"] else "",
+                ready.get("class") or "?", " (%s)" % ready["class_why"]
+                if ready.get("class_why") else "", parts_note, waived_note),
+            actor=actor)
+
+    if fence is None:
+        row = add(db)
+    else:
+        with db.transaction() as tx:
+            fence.hold(tx)
+            row = add(tx)
     if row is None:
         raise QueueError("lot #%d is no longer open" % lot)
     # L539 : la classe lue à l'entrée, rendue avec la ligne de file (lecture)
@@ -2416,9 +2475,17 @@ def enter(db, lot: int, *, repo: str, actor: str = "", ci="github", project=None
 
 
 def leave(db, lot: int, *, actor: str = "", reason: str = "") -> bool:
-    return storage.of(db).work.queue_remove(
-        lot, note="merge queue: taken out%s" % (" (%s)" % reason if reason else ""),
-        actor=actor)
+    from . import pilot_gesture
+    fence = pilot_gesture.gate(None, db, "queue", "queue remove #%d" % lot)
+    if fence is None:
+        return storage.of(db).work.queue_remove(
+            lot, note="merge queue: taken out%s" % (" (%s)" % reason if reason else ""),
+            actor=actor)
+    with db.transaction() as tx:
+        fence.hold(tx)
+        return storage.of(tx).work.queue_remove(
+            lot, note="merge queue: taken out%s" % (" (%s)" % reason if reason else ""),
+            actor=actor)
 
 
 # --------------------------------------------------------------------------

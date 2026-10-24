@@ -189,7 +189,8 @@ def _proof_repo(db: Db, item: dict, sha: str,
     dépôt, `proof_for_current_turn` ne résout pas le commit, n'écrit aucun
     reçu, et la porte sensible refuse désormais ce verdict : la preuve se
     résout donc là où le commit existe. Rend None quand aucun dépôt ne le
-    connaît : le jalon s'écrit alors sans preuve, comme avant."""
+    connaît : un verdict de tour managé sera alors refusé (#3104), les autres
+    déclarations gardent leur preuve facultative."""
     text = str(sha or "").strip().lower()
     if not text:
         return None
@@ -286,7 +287,8 @@ def reviewed_head(db: Db, item: dict, sha: str, *, repo: str | None = None) -> s
     raise _head_refusal(
         db, item,
         "verdict refused (head-unresolved): %s does not resolve to a commit here and "
-        "does not name the current frozen head" % text, repo=repo)
+        "does not name the current frozen head; pass --repo <clone> pointing to "
+        "the repository holding this commit" % text, repo=repo)
 
 
 def _freeze_refusal_target(repo: str, item: dict, refreshed: dict | None = None) -> str:
@@ -563,6 +565,9 @@ def milestone(
     refusé avec la tête gelée courante proposée ; un avis qui ne peut pas
     compter à la porte n'est plus accepté en silence. `repo` (facultatif) est
     le dépôt nommé par `--repo`, où la tête doit alors se résoudre.
+    Dans un tour managé (#3104), le verdict exige aussi sa preuve exacte :
+    une tête gelée sans commit lisible ou une identité de provenance invalide
+    refuse le verdict avant toute écriture, avec la cause et le remède.
 
     `frozen` (#2786, #2962) exige une tête **immuable** : le `sha` est vérifié
     par [`freeze_head`] avant toute écriture — commit complet **résolu** dans
@@ -736,7 +741,11 @@ def milestone(
             # n'appelle pas de nouvelle désignation. Le plan est lu avant la
             # transaction du jalon (lectures git/réseau hors verrou de ligne).
             carried = activation.carried_plan(cfg, db, item_id, sha)
-            on_frozen = activation.hook(cfg, outcome, carried=carried)
+            # #3250: a locally present head does not certify a fresh target.
+            # Pin the exact published target before taking the lot's lock.
+            target = (None if carried else
+                      activation.prepare_target(cfg, db, item, sha))
+            on_frozen = activation.hook(cfg, outcome, carried=carried, target=target)
             if after_commit is None:
                 after_commit = []
                 drain = after_commit
@@ -747,8 +756,12 @@ def milestone(
     # #2928 : la preuve se résout dans le dépôt qui porte la tête (le canon
     # pour un lot `canon/**`), pas seulement dans le répertoire courant.
     from . import review_provenance
-    proof = review_provenance.proof_for_current_turn(
-        db, actor=actor, sha=sha, cwd=_proof_repo(db, item, sha, repo))
+    try:
+        proof = review_provenance.proof_for_current_turn(
+            db, actor=actor, sha=sha, cwd=_proof_repo(db, item, sha, repo),
+            required=kind == "verdict" and bool(os.environ.get("AMEESH_TURN_ID", "").strip()))
+    except review_provenance.ProvenanceError as exc:
+        raise WorkError("verdict refused (provenance-missing): %s" % exc) from exc
     if proof and not actor:
         actor = proof["actor"]
     row = storage.of(db).work.add_milestone(

@@ -54,7 +54,7 @@ import subprocess
 import threading
 from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import Any, Iterable, Mapping
+from typing import Any, Iterable, Mapping, Sequence
 
 from . import harnesses
 from . import review as review_mod
@@ -73,6 +73,9 @@ PROFILE_TYPES = ("Agent", "Persona", "Host", "Placement", "Member", "WorkPackage
                  "Process")
 #: #538 : une fiche Process (`processus/*.md`) porte les règles de travail.
 PROCESS_TYPE = "Process"
+#: #3070 (canon §12) : clés d'une fiche Host déclarant l'appareil indisponible
+UNAVAILABLE_UNTIL_KEY = "indisponible_jusqu_au"
+UNAVAILABLE_REASON_KEY = "indisponible_motif"
 #: #538 : dossier du canon où vivent les fiches Process ; un `type: Process`
 #: posé ailleurs n'est pas une règle de travail et n'est jamais injecté.
 PROCESS_DIR = "processus"
@@ -87,12 +90,12 @@ PROCESS_BODY_MAX = 6000
 #: carte, par le même responsable).
 PROCESS_PROJECTION_START = "<!-- projection courte : début -->"
 PROCESS_PROJECTION_END = "<!-- projection courte : fin -->"
-#: #1372 : budget d'une projection (octets UTF-8). La part de règles d'un brief
-#: est GARANTIE à ≈ 11 900 octets (`BRIEF_MAX_BYTES` 16 000, moins la part texte
-#: réservée 4 000 et l'en-tête/le pied du bloc, 80) : 11 600 gardent la marge du
-#: bloc (diagnostics, autre fiche courte). Une projection au-delà est signalée
-#: et coupée à ce budget, jamais silencieusement.
-PROCESS_PROJECTION_MAX = 11600
+#: #1372, #3126 : budget d'une projection (octets UTF-8). `BRIEF_MAX_BYTES`
+#: 19 000 - réserve texte 4 000 - en-tête/pied 80 - marge du bloc 320 = 14 600.
+#: La marge garde la place des diagnostics et d'une autre fiche courte. Une
+#: projection au-delà est signalée et coupée à ce budget, jamais silencieusement ;
+#: dès 90 % du budget, `canon check` prévient avant la coupe.
+PROCESS_PROJECTION_MAX = 14600
 #: les sortes de fiches WorkPackage (plan de travail, L29) et les parents admis
 PACKAGE_KINDS = ("milestone", "epic", "lot")
 #: L96 : dates d'une fiche WorkPackage (`date` = date d'un jalon, alias de `delivery`)
@@ -896,6 +899,9 @@ class Agent:
     #: by the agent's Placement card, so a claim can only happen on a host
     #: whose current placement verdict admits the agent.
     candidats: list[str] | None = None
+    #: #3185: the other projects whose lots this agent may review (`relit:`),
+    #: beside its own; only declared projects (`validate`). None: none.
+    relit: list[str] | None = None
 
     @property
     def is_persona(self) -> bool:
@@ -1052,6 +1058,24 @@ class Host:
     #: responsable et des admins — seules les personas lisibles par eux
     #: partent sur la machine (défaut sûr : rien n'est supposé de plus).
     occupants: list[str] | None = None
+    #: #3070 (canon §12) : l'appareil est déclaré indisponible jusqu'à ce
+    #: jour ISO inclus (`indisponible_jusqu_au`), avec son motif
+    #: (`indisponible_motif`). Une séance qui l'attend ne retarde rien
+    #: (`device_gates`) ; passé ce jour, la déclaration cesse d'elle-même.
+    unavailable_until: str | None = None
+    unavailable_reason: str | None = None
+
+    def unavailable_end(self) -> float | None:
+        """Fin de l'indisponibilité (minuit local du lendemain), ou None."""
+        if not self.unavailable_until:
+            return None
+        day = _dt.date.fromisoformat(self.unavailable_until) + _dt.timedelta(days=1)
+        return float(_dt.datetime.combine(day, _dt.time()).timestamp())
+
+    def unavailable_at(self, now: float) -> bool:
+        """L'appareil est-il indisponible à l'instant `now` (epoch) ?"""
+        end = self.unavailable_end()
+        return end is not None and float(now) < end
 
 
 @dataclass
@@ -1340,11 +1364,14 @@ class Canon:
                         for m in self.members],
             "hosts": [dict(title=h.title, responsible=h.responsible, tags=h.tags,
                            admins=h.admins, occupants=h.occupants,
+                           unavailable_until=h.unavailable_until,
+                           unavailable_reason=h.unavailable_reason,
                            policy=h.policy.__dict__.copy(), **fiche(h.fiche))
                       for h in self.hosts],
             "agents": [dict(title=a.title, aliases=a.aliases or [], type=a.fiche.type, responsible=a.responsible, team=a.team,
                             capabilities=a.capabilities, harness=a.harness, model=a.model,
                             harnesses=a.harnesses, roles=a.roles, projects=a.projects,
+                            relit=a.relit,
                             provider=a.provider, credential_mode=a.credential_mode,
                             budget_usd_per_day=a.budget_usd_per_day, tools=a.tools,
                             reviewers=a.reviewers, priority=a.priority,
@@ -1369,6 +1396,106 @@ class Canon:
             "ameesh_scope_unread": sorted(self.scope_unread),
             "out_of_scope": dict(sorted(self.out_of_scope.items())),
         }
+
+
+# ==========================================================================
+# Charge d'admissions d'un hôte (`max_agents`) — #3101 (suite d'EP1, L165)
+# ==========================================================================
+
+def elected_candidates(canon: Canon, placement: Any, covered: Iterable[str]) -> list[str] | None:
+    """Hôtes où l'admission d'un rôle élu peut tenir le bail, ou None (épinglé).
+
+    Un agent `releve: election` avec `candidats` ne tourne que là où il tient
+    le bail : son admission ne prend qu'UNE place dans tout le maillage, sur
+    l'un de ses candidats couverts par l'admission et dont la politique
+    l'admet (un candidat refusé ne peut pas tenir le bail). Tout autre agent
+    (et un rôle élu sans candidat, déjà en erreur) occupe une place sur chaque
+    hôte couvert.
+    """
+    agent = canon.agent(placement.agent) if placement.agent else None
+    if agent is None or agent.releve != "election" or not agent.candidats:
+        return None
+    covered = set(covered)
+    return [name for name in agent.candidats if name in covered
+            and canon.host(name) is not None
+            and not placement_violations(agent, canon.host(name), placement)]
+
+
+def seat_elected(free: Mapping[str, int | None],
+                 roles: Mapping[str, Sequence[str]]) -> dict[str, str | None]:
+    """Asseoir chaque rôle élu sur un seul de ses candidats (#3101).
+
+    `free` : places laissées par les admissions épinglées (None = sans
+    maximum) ; `roles` : rôle -> candidats, dans l'ordre déclaré. Couplage
+    maximal par chemins augmentants : un rôle déjà assis cède sa place s'il
+    peut s'asseoir ailleurs. Rend rôle -> hôte, ou None si aucune place ne
+    reste ; déterministe (rôles triés, candidats dans l'ordre).
+    """
+    seat: dict[str, str | None] = {}
+    occupants: dict[str, list[str]] = defaultdict(list)
+
+    def room(host: str) -> bool:
+        cap = free.get(host)
+        return cap is None or len(occupants[host]) < cap
+
+    def place(role: str, seen: set[str]) -> bool:
+        for host in roles[role]:
+            if host in seen:
+                continue
+            seen.add(host)
+            if room(host):
+                occupants[host].append(role)
+                seat[role] = host
+                return True
+            for other in list(occupants[host]):
+                if place(other, seen):
+                    occupants[host].remove(other)
+                    occupants[host].append(role)
+                    seat[role] = host
+                    return True
+        return False
+
+    for role in sorted(roles):
+        if not place(role, set()):
+            seat[role] = None
+    return seat
+
+
+def admission_load(canon: Canon, covered: Mapping[str, Iterable[Any]],
+                   extra: str | None = None, only: Iterable[str] | None = None,
+                   ) -> tuple[dict[str, int], dict[str, str | None]]:
+    """Admissions épinglées par hôte et siège de chaque rôle élu (#3101).
+
+    `covered` : hôte -> admissions qui le couvrent ; `extra` : un hôte où
+    compter une admission épinglée de plus (proposition de placement) ;
+    `only` : les seuls rôles élus à asseoir (les autres ne prennent rien).
+    """
+    pinned: dict[str, int] = defaultdict(int)
+    hosts_of: dict[int, set[str]] = defaultdict(set)
+    by_id: dict[int, Any] = {}
+    for host, admissions in covered.items():
+        for admission in admissions:
+            hosts_of[id(admission)].add(host)
+            by_id[id(admission)] = admission
+    roles: dict[str, list[str]] = {}
+    for key, admission in by_id.items():
+        candidates = elected_candidates(canon, admission, hosts_of[key])
+        if candidates is None:
+            for host in hosts_of[key]:
+                pinned[host] += 1
+        else:
+            seats = roles.setdefault(canon.agent(admission.agent).title, [])
+            seats += [host for host in candidates if host not in seats]
+    if extra is not None:
+        pinned[extra] += 1
+    if only is not None:
+        keep = set(only)
+        roles = {role: hosts for role, hosts in roles.items() if role in keep}
+    free: dict[str, int | None] = {}
+    for host in canon.hosts:
+        limit = host.policy.max_agents
+        free[host.title] = None if limit is None else max(limit - pinned[host.title], 0)
+    return dict(pinned), seat_elected(free, roles)
 
 
 # ==========================================================================
@@ -2846,6 +2973,18 @@ class _Loader:
         candidats = self._list(fiche, "candidats", where, "agent-candidats-invalid", **subject)
         if candidats is not None:
             candidats = list(dict.fromkeys(c for c in candidats if c))
+        # #3185 : projets relus hors équipe ; une liste seulement, comme
+        # `projects` (`relit: a, b` est une chaîne, jamais deux projets)
+        if fiche.data.get("relit") is not None \
+                and not isinstance(fiche.data.get("relit"), list):
+            self.add("agent-relit-invalid", ERROR,
+                     "`relit`: list expected (`relit: [a, b]`), not %r"
+                     % (fiche.data.get("relit"),), **where, **subject)
+            relit = None
+        else:
+            relit = self._list(fiche, "relit", where, "agent-relit-invalid", **subject)
+        if relit is not None:
+            relit = list(dict.fromkeys(p for p in relit if p))
         self.canon.agents.append(Agent(
             title=fiche.title,
             responsible=_text(fiche.data.get("responsible")),
@@ -2868,6 +3007,7 @@ class _Loader:
             aliases=agent_aliases,
             releve=releve,
             candidats=candidats,
+            relit=relit,
         ))
 
     def _build_persona(self, fiche: Fiche, where: dict) -> None:
@@ -2996,10 +3136,47 @@ class _Loader:
         tags = self._list(fiche, "tags", where, "host-tags-invalid", **subject)
         admins = self._list(fiche, "admins", where, "host-admins-invalid", **subject)
         occupants = self._list(fiche, "occupants", where, "host-occupants-invalid", **subject)
+        until, reason = self._host_unavailability(fiche, where, subject)
         self.canon.hosts.append(Host(title=fiche.title,
                                      responsible=_text(fiche.data.get("responsible")),
                                      policy=policy, tags=tags, admins=admins,
-                                     occupants=occupants, fiche=fiche))
+                                     occupants=occupants, fiche=fiche,
+                                     unavailable_until=until, unavailable_reason=reason))
+
+    def _host_unavailability(self, fiche: Fiche, where: dict,
+                             subject: dict) -> tuple[str | None, str | None]:
+        """#3070 : `indisponible_jusqu_au` (jour ISO) et `indisponible_motif`.
+
+        Une date illisible est une erreur et ne déclare rien (une faute de
+        frappe ne lève aucune porte) ; un motif sans date est signalé ; une
+        date passée est une simple information : la règle a cessé d'elle-même,
+        la ligne peut être retirée de la fiche."""
+        raw = fiche.data.get(UNAVAILABLE_UNTIL_KEY)
+        reason = _text(fiche.data.get(UNAVAILABLE_REASON_KEY))
+        if raw is None:
+            if reason:
+                self.add("host-unavailable-invalid", WARNING,
+                         "`%s` without `%s`: the device is not declared unavailable"
+                         % (UNAVAILABLE_REASON_KEY, UNAVAILABLE_UNTIL_KEY),
+                         **where, **subject)
+            return None, None
+        if isinstance(raw, _dt.datetime):
+            raw = raw.date()
+        try:
+            day = (raw if isinstance(raw, _dt.date)
+                   else _dt.date.fromisoformat(str(raw).strip()))
+        except ValueError:
+            day = None
+        if day is None:
+            self.add("host-unavailable-invalid", ERROR,
+                     "`%s`: ISO day expected (YYYY-MM-DD), got %r"
+                     % (UNAVAILABLE_UNTIL_KEY, raw), **where, **subject)
+            return None, None
+        if day < _dt.date.today():
+            self.add("host-unavailable-past", INFO,
+                     "`%s` %s is past: the device is available again, the line can go"
+                     % (UNAVAILABLE_UNTIL_KEY, day.isoformat()), **where, **subject)
+        return day.isoformat(), reason
 
     def _host_resources(self, raw, where: dict, subject: dict) -> dict | None:
         """Seuils `policy.resources` validés, ou None si rien n'est déclaré.
@@ -3592,6 +3769,8 @@ def validate(canon: Canon, known_projects: Iterable[str] | None = None) -> list[
     known_harnesses = set(harnesses.known_ids())
     known = None if known_projects is None else (
         set(known_projects) | {p.team for p in canon.packages if p.team})
+    declared_projects = {p.team for p in canon.packages if p.team} | {
+        project for agent in canon.agents for project in agent.effective_projects}
     for agent in canon.agents:
         f = agent.fiche
         if not NAME_RE.match(agent.title):
@@ -3667,6 +3846,16 @@ def validate(canon: Canon, known_projects: Iterable[str] | None = None) -> list[
                         "unknown projects for %s: %s (neither a work package's team, "
                         "`github.projects` nor a lot's project)"
                         % (agent.title, ", ".join(unknown)), f, agent=agent.title)
+        # #3185 : `relit` ne nomme que des projets déclarés — ceux du canon
+        # (équipes des paquets, projets des fiches) et, avec une base, les
+        # projets connus ; une faute de frappe désignerait un relecteur nulle part
+        if agent.relit:
+            declared = (known or set()) | declared_projects
+            stray = [p for p in agent.relit if p not in declared]
+            if stray:
+                add("agent-relit-unknown", ERROR,
+                    "`relit` of %s names undeclared projects: %s"
+                    % (agent.title, ", ".join(stray)), f, agent=agent.title)
 
     # -- human deputies and superiors (L51, 0032 §2, 0033 §7) --------------------
     for member in canon.members:
@@ -3831,11 +4020,23 @@ def validate(canon: Canon, known_projects: Iterable[str] | None = None) -> list[
                 add("host-work-dir-agent-unknown", WARNING,
                     "policy of host %s: `work_dirs.%s` names no agent of the canon"
                     % (host.title, name), host.fiche, host=host.title)
+    # #3101 : une admission épinglée prend une place sur chaque hôte couvert ;
+    # un rôle élu n'en prend qu'une, sur l'un de ses candidats (seul l'hôte
+    # du bail le fait tourner).
+    pinned, seats = admission_load(
+        canon, {name: group.values() for name, group in by_host.items()})
+    for host in canon.hosts:
         limit = host.policy.max_agents
-        if limit is not None and len(by_host.get(host.title, {})) > limit:
+        if limit is not None and pinned.get(host.title, 0) > limit:
             add("host-max-agents", ERROR,
                 "host %s: %d admissions for max_agents = %d"
-                % (host.title, len(by_host[host.title]), limit), host.fiche, host=host.title)
+                % (host.title, pinned[host.title], limit), host.fiche, host=host.title)
+    for role, seat in sorted(seats.items()):
+        if seat is None:
+            agent = canon.agent(role)
+            add("agent-election-max-agents", ERROR,
+                "elected agent %s: no candidate (%s) has a free place under max_agents"
+                % (role, ", ".join(agent.candidats)), agent.fiche, agent=role)
 
     # -- politique de revue par classe (décision 0018 point 1, R19) ------------
     # La déclaration vit dans `federation.yaml`, sous `review_policies.classes`,
@@ -4005,6 +4206,11 @@ def _validate_processes(canon: Canon, add) -> None:
                 "Process card %s: short projection of %d bytes (limit %s) — a "
                 "brief cuts its end" % (process.title, proj, PROCESS_PROJECTION_MAX),
                 where, **subject)
+        elif process.projection and proj * 10 >= PROCESS_PROJECTION_MAX * 9:
+            add("process-projection-near-limit", WARNING,
+                "Process card %s: short projection of %d bytes (limit %s) — at "
+                "least 90%% of its budget; shorten it before a brief cuts its end"
+                % (process.title, proj, PROCESS_PROJECTION_MAX), where, **subject)
         elif not process.projection and taille > PROCESS_BODY_MAX:
             add("process-too-long", WARNING,
                 "Process card %s: %d bytes of rules (limit %s, about two pages); "

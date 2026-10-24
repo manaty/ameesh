@@ -101,19 +101,21 @@ elif sys.argv[1] == 'show':
     row = dict(row, lease_owner='runner-' + name + '@host-agents', lease_epoch=7, lease_expires_ts=time.time()+300)
     pause = state / ('pause-' + name)
     motif = state / ('motif-' + name)
-    if scenario == 'pause-coupee-etat-perdu' and pause.exists() \
+    if scenario == 'pause-coupee-etat-perdu' and name == 'dev9' and pause.exists() \
             and not (state / 'lecture-perdue').exists():
         (state / 'lecture-perdue').touch()
         sys.exit(1)
     # R1 B1 : après notre pose et avant notre reprise, le monde extérieur lève
     # notre drain puis pose une NOUVELLE pause (humaine, étrangère).
-    if scenario == 'drain-remplace' and motif.exists() and '#2152' in motif.read_text() \
+    if scenario == 'drain-remplace' and name == 'dev9' and motif.exists() \
+            and '#2152' in motif.read_text() \
             and not (state / 'remplace-fait').exists():
         motif.write_text('pause humaine etrangere')
         (state / 'remplace-fait').touch()
     # N5 B2 : levée humaine de notre premier drain, l'agent restant en tour :
     # le second drain doit seul rester suivi (aucune entrée périmée).
-    if scenario == 'chaines-relance' and motif.exists() and '#2152' in motif.read_text() \
+    if scenario == 'chaines-relance' and name == 'dev9' and motif.exists() \
+            and '#2152' in motif.read_text() \
             and not (state / 'levee-humaine').exists():
         pause.unlink(); motif.unlink(missing_ok=True)
         (state / 'levee-humaine').touch()
@@ -131,6 +133,13 @@ elif sys.argv[1] == 'show':
     if scenario == 'mode-change-apres-drain' and name == 'dev9' and pause.exists():
         row['mode'] = 'externe'
     if scenario == 'always-busy': row['status'] = 'running'
+    # #3120/B2 : une première pose incertaine (rc124) peut encore aboutir ;
+    # l'agent est alors vu en tour et sans pause à la relecture.
+    if scenario in ('pose-incertaine', 'pose-incertaine-inverse'):
+        agent_marque = state / 'pose-incertaine-agent'
+        if agent_marque.exists() and name == agent_marque.read_text().strip() \
+                and (state / 'pose-incertaine-attente').exists() and not pause.exists():
+            row['status'] = 'running'
     # #2152 : un agent qui enchaîne les tours ne rend la main qu'une fois
     # drainé ; « chaines-toujours » ne la rend jamais.
     if name == 'dev9' and scenario in ('chaines', 'chaines-pause-error',
@@ -153,6 +162,22 @@ elif sys.argv[1] == 'show':
     if scenario == 'busy-once' and name == 'dev9' and not (state / 'busy-seen').exists():
         (state / 'busy-seen').touch(); row['status'] = 'running'
     print(json.dumps(row))
+    # #3120/B3 : si la barrière d'une requête incertaine n'est pas tenue, elle
+    # aboutit après la lecture de reprise et repose le motif, sans reprise.
+    if scenario == 'pose-incertaine-inverse':
+        agent_marque = state / 'pose-incertaine-agent'
+        if agent_marque.exists() and name == agent_marque.read_text().strip() \
+                and (state / ('pose-incertaine-resume-fait-' + name)).exists() \
+                and not (state / 'pose-incertaine-late-fait').exists():
+            hf = os.environ.get('HORLOGE_FICHIER')
+            maintenant = float(Path(hf).read_text()) if hf and Path(hf).exists() else time.time()
+            premiere = float((state / 'echeance-incertaine').read_text())
+            if maintenant < premiere:
+                motif.write_text((state / 'motif-incertain').read_text())
+                pause.write_text('')
+                with (state / 'sequence.log').open('a') as f:
+                    f.write('pause %s\n' % name)
+                (state / 'pose-incertaine-late-fait').touch()
     # #2184/R3 : un créateur tardif indépendant (systemd-run retardé) rejoue
     # la pose APRÈS la relecture. La base doit la refuser au-delà de
     # --not-after ; sinon la pause resterait orpheline.
@@ -185,6 +210,29 @@ elif sys.argv[1] in ('pause', 'resume'):
             echeance = float(args[args.index('--not-after') + 1])
         hf = os.environ.get('HORLOGE_FICHIER')
         maintenant = float(Path(hf).read_text()) if hf and Path(hf).exists() else time.time()
+        # #3120/B2 : la première pose a expiré (rc124) sans muter ; elle peut
+        # encore aboutir. Le rattrapage doit retrouver ce motif et le lever.
+        if scenario in ('pose-incertaine', 'pose-incertaine-inverse'):
+            agent_marque = state / 'pose-incertaine-agent'
+            if agent_marque.exists() and name == agent_marque.read_text().strip():
+                attente = state / 'pose-incertaine-attente'
+                if not attente.exists():
+                    (state / 'motif-incertain').write_text(
+                        args[args.index('--reason') + 1])
+                    (state / 'echeance-incertaine').write_text(str(echeance))
+                    attente.touch()
+                    sys.exit(124)
+                if scenario == 'pose-incertaine' and not pause.exists():
+                    premiere = float((state / 'echeance-incertaine').read_text())
+                    if maintenant < premiere:
+                        motif.write_text((state / 'motif-incertain').read_text())
+                        pause.write_text('')
+                        with (state / 'sequence.log').open('a') as f:
+                            f.write('pause %s\n' % name)
+                        print(json.dumps({'agent': name, 'mode': 'execute',
+                                          'operator_paused': True,
+                                          'changed': False, 'event_id': None}))
+                        sys.exit(0)
         if echeance is not None and maintenant >= echeance:
             with (state / 'refus-tardif.log').open('a') as f:
                 f.write('%s not_after\n' % name)
@@ -204,7 +252,7 @@ elif sys.argv[1] in ('pause', 'resume'):
             # R1 B2 : réponse perdue, la pose n'a PAS abouti.
             print('{bad-json')
             sys.exit(0)
-        if scenario == 'pause-expiree-tardive':
+        if scenario == 'pause-expiree-tardive' and name == 'dev9':
             # Timeout de l'appel (rc 124) : la pose n'est pas encore commitée.
             # Le créateur tardif rejouera cette commande avec la même échéance.
             (state / ('motif-tardif-' + name)).write_text(
@@ -236,7 +284,7 @@ elif sys.argv[1] in ('pause', 'resume'):
         if (state / 'sans-expect-reason').exists() and '--expect-reason' in args:
             sys.exit(2)
         if scenario == 'chaines-resume-error': sys.exit(1)
-        if scenario == 'resume-error-deux-fois':
+        if scenario == 'resume-error-deux-fois' and name == 'dev9':
             # #2198/N3 : les deux premières levées échouent (celle de la boucle
             # puis la première passe du trap) ; la seconde passe réussit.
             compteur = state / 'resume-compte'
@@ -248,6 +296,8 @@ elif sys.argv[1] in ('pause', 'resume'):
         raison = motif.read_text() if motif.exists() else ''
         if pause.exists() and (attendu is None or raison == attendu):
             pause.unlink(); motif.unlink(missing_ok=True)
+            if scenario == 'pose-incertaine-inverse':
+                (state / ('pose-incertaine-resume-fait-' + name)).touch()
             print(json.dumps({'agent': name, 'mode': 'execute', 'operator_paused': False,
                               'changed': True, 'event_id': 2}))
         else:
@@ -739,6 +789,18 @@ class AgentHostTest(unittest.TestCase):
         self.assertNotIn('resume dev9', self.operateur())
         self.assertFalse((self.state / 'pause-dev9').exists())
 
+    def test_refused_operator_identity_restarts_idle_personas_without_drain(self):
+        """#3120/B1 : un refus global de pose ne condamne pas les personas au
+        repos : elles n'ont pas besoin du drain et redémarrent sans lui."""
+        self.env['DRAIN_ATTENTE'] = '1'
+        p = self.run_vm(scenario='drain-refuse-identite')
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn('dev8 : au repos, drain non posé', p.stderr)
+        self.assertIn('--user start ameesh-runner-agent@dev8.service', self.units())
+        self.assertEqual([l for l in self.units().splitlines() if '@dev9.' in l], [])
+        self.assertFalse((self.state / 'pause-dev8').exists())
+        self.assertFalse((self.state / 'pause-dev9').exists())
+
     def test_non_execute_agent_is_skipped_before_restart(self):
         """#2184/N1 : un agent passé en mode non-execute pendant le drain
         n'est ni drainé ni redémarré ; le motif du skip le nomme."""
@@ -875,15 +937,22 @@ class AgentHostTest(unittest.TestCase):
         self.assertFalse((self.state / 'pause-dev9').exists())
 
     def test_human_lift_before_the_resume_leaves_no_stale_drain(self):
-        """N5 B2 : notre drain est levé par un humain après la pose ; la levée
-        conditionnelle ne retrouve plus la nôtre et ne pose rien de périmé."""
+        """N5 B2 / #3114 : le drain initial est levé par un humain ; le tour
+        toujours actif reçoit un nouveau drain avant l'arrêt. Seul ce dernier
+        motif est repris, aucune entrée périmée ne reste suivie."""
         self.env['DRAIN_ATTENTE'] = '1'
         p = self.run_vm(scenario='chaines-relance')
         self.assertEqual(p.returncode, 0, p.stderr)
         self.assertNotIn('toujours en tour', p.stderr)
         self.assertTrue((self.state / 'levee-humaine').exists())
         poses = [l for l in self.operateur().splitlines() if l.startswith('pause dev9')]
-        self.assertEqual(len(poses), 1)
+        self.assertEqual(len(poses), 2)
+        motifs = [l.split('--reason ', 1)[1].split(' --human ', 1)[0] for l in poses]
+        self.assertNotEqual(motifs[0], motifs[1])
+        reprises = [l for l in self.operateur().splitlines() if l.startswith('resume dev9')]
+        self.assertEqual(len(reprises), 1)
+        self.assertIn('--expect-reason ' + motifs[1], reprises[0])
+        self.assertNotIn('--expect-reason ' + motifs[0], reprises[0])
         self.assertIn('stop ameesh-runner-agent@dev9.service', self.units())
         self.assertIn('start ameesh-runner-agent@dev9.service', self.units())
         self.assertFalse((self.state / 'pause-dev9').exists())

@@ -227,7 +227,8 @@ class RunsOnTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.jobs = runs_on_by_job(WORKFLOW.read_text(encoding="utf-8"))
-        cls.linux = {j: e for j, e in cls.jobs.items() if j != "platform-macos"}
+        cls.linux = {j: e for j, e in cls.jobs.items()
+                     if not j.startswith("platform-macos")}
         cls.expr = next(iter(cls.linux.values()))
 
     def route(self, ctx):
@@ -246,7 +247,7 @@ class RunsOnTest(unittest.TestCase):
             """'["self-hosted", "linux", "ameesh-ci"]'""",
             """vars.AMEESH_LENT_RUNS_ON || '["self-hosted", "linux", "ameesh-ci"]'"""),
             self.linux["bilan"])
-        # #987 x #1468 : le job requis tourne sur l'image x64 standard
+        # #987 x #1468 : les jobs requis tournent sur l'image x64 standard
         # (`macos-26-intel`) ; `macos-latest` (macOS 26 arm64) n'obtenait pas
         # de capacité hébergée et était annulé sans qu'une étape ne tourne.
         # Le littéral reste épinglé : toute dérive de l'image est vue.

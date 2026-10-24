@@ -441,10 +441,17 @@ class WorkflowTest(unittest.TestCase):
     def test_version_job_gates_the_required_check(self):
         text = (ROOT / ".github" / "workflows" / "tests.yml").read_text(encoding="utf-8")
         self.assertIn("python3 scripts/version-level.py pr HEAD^1 HEAD", text)
-        self.assertIn("needs: [plan, version, psycopg, psql, doc-readers, fs-class]", text)
-        # checked before the early exits of version-only and documentation-only PRs
-        self.assertLess(text.index('test "${{ needs.version.result }}" = success'),
-                        text.index("PR de version seule"))
+        # #3251 : la garde de version vit dans scripts/ci-agregat.py, appelé
+        # par l'étape « bilan des parts » ; le job `version` reste une
+        # dépendance du check requis, comme toutes les parts lues par le bilan.
+        self.assertIn("needs: [plan, version, psycopg, psql, platform-macos, "
+                      "doc-readers, fs-class]", text)
+        self.assertIn('--version "${{ needs.version.result }}"', text)
+        # La version est lue avant les voies version seule et doc seule : le
+        # classifieur la vérifie avant ses sorties anticipées
+        # (tests/test_3251_agregat_annulation.py, témoin dédié).
+        self.assertLess(text.index('--version "${{ needs.version.result }}"'),
+                        text.index("--version-only"))
 
 
 if __name__ == "__main__":

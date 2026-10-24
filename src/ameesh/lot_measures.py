@@ -36,6 +36,17 @@ after the merge, and stores them in `work_item_measures` (migration 0056):
   `SIZE_S_MAX` changed lines, `m` up to `SIZE_M_MAX`, `l` beyond) compared
   with the size DECLARED at creation (`work add --size`).
 
+  The target it is read against is the **published** one (#3038): the
+  remote-tracking ref (`origin/<branch>`), never a local branch when the
+  clone has a remote; a declared target is authoritative, otherwise the
+  repository's default target is tried and then the other published
+  integration refs (`develop`, `main`, …, `release/*`), the first that
+  carries the merged commit winning. When no readable ref carries it, or
+  when the published tip of the target for a rebase-merged lot cannot be
+  proven (`ls-remote` unreadable, tip not fetched), the measure **doubts**:
+  no size, rather than the history between a stale ref and the commit
+  (the #2999 measure: 654430 lines for 332).
+
 The runner measures the lots delivered in the last `PENDING_WINDOW_S` and
 not measured yet, after its branch sweep (`measure_pending`): the repository is the working directory of
 an agent of its host that holds the merge commit. A lot measured without a
@@ -78,10 +89,21 @@ PASS_LIMIT = 50
 PASS_BUDGET_S = 60.0
 #: timeout of one git or gh call (s)
 CALL_TIMEOUT_S = 20
+#: timeout of a `git ls-remote` read of the published target (s): short, the
+#: runner's measure pass has a budget and a forge that does not answer must
+#: not eat it (#3038)
+LS_REMOTE_TIMEOUT_S = 8.0
 #: CI runs read at most for one branch
 CI_RUN_LIMIT = 100
 
 _SHA_RE = re.compile(r"^[0-9a-f]{7,64}$")
+#: how long a published tip read by `ls-remote` is reused (s): a measure pass
+#: clears it anyway, but `review_lot.class_at_merge` reads it from a
+#: long-lived process and must not see a tip older than this (#3056)
+PUBLISHED_TIP_TTL_S = 60.0
+#: published tips read recently, `(repo, remote, branch)` → `(read_at, (kind,
+#: sha))`, see `_remote_tip` (#3038, #3056)
+_PUBLISHED_TIPS: dict = {}
 _SHORTSTAT_RE = {
     "files": re.compile(r"(\d+) files? changed"),
     "insertions": re.compile(r"(\d+) insertions?\(\+\)"),
@@ -209,11 +231,12 @@ def size_class(changed_lines: int | None) -> str | None:
     return "m" if changed_lines <= SIZE_M_MAX else "l"
 
 
-def _git(repo: str, *args: str, env_extra: dict | None = None) -> str | None:
+def _git(repo: str, *args: str, env_extra: dict | None = None,
+         timeout: float = CALL_TIMEOUT_S) -> str | None:
     env = {**os.environ, **env_extra} if env_extra else None
     try:
         proc = subprocess.run(["git", "-C", repo, *args], capture_output=True, text=True,
-                              timeout=CALL_TIMEOUT_S, env=env)
+                              timeout=timeout, env=env)
     except (OSError, subprocess.SubprocessError):
         return None
     return proc.stdout if proc.returncode == 0 else None
@@ -247,14 +270,163 @@ def _is_ancestor(repo: str, a: str, b: str) -> bool:
                 env_extra=NO_LAZY_FETCH) is not None
 
 
-def _target(repo: str, target: str | None) -> str | None:
+def _remotes(repo: str) -> list[str]:
+    """The declared remotes of `repo` (empty for a local-only repository)."""
+    return (_git(repo, "remote") or "").split()
+
+
+def _remote_branch(repo: str, ref: str | None) -> tuple[str, str] | None:
+    """(remote, branch) named by `ref`, None for a commit SHA (#3038)."""
+    text = (ref or "").strip()
+    if not text or _SHA_RE.match(text):
+        return None
+    if text.startswith("refs/remotes/"):
+        remote, _, branch = text[len("refs/remotes/"):].partition("/")
+        if not remote or not branch:
+            return None
+    elif text.startswith("refs/heads/"):
+        remote, branch = "origin", text[len("refs/heads/"):]
+    elif text == "HEAD":
+        remote, branch = "origin", "HEAD"
+    elif "/" in text and text.partition("/")[0] in _remotes(repo):
+        remote, _, branch = text.partition("/")
+    else:
+        remote, branch = "origin", text
+    if branch == "HEAD":
+        symbolic = (_git(repo, "symbolic-ref", "--quiet",
+                         "refs/remotes/%s/HEAD" % remote) or "").strip()
+        prefix = "refs/remotes/%s/" % remote
+        if not symbolic.startswith(prefix) or len(symbolic) == len(prefix):
+            return None
+        branch = symbolic[len(prefix):]
+    return remote, branch
+
+
+def _remote_tip(repo: str, remote: str, branch: str) -> tuple[str, str | None]:
+    """The published tip of `branch` on `remote`, read now with `ls-remote`
+    (#3038), or `('local', None)` when the repository has no such remote: the
+    clone is then the only reference.
+
+    `('absent', None)` when the forge does not carry the branch, `('error',
+    None)` when it cannot be read (network, credentials, timeout): the caller
+    then doubts, never concludes. One read per (repo, remote, branch) and per
+    measure pass, reused at most `PUBLISHED_TIP_TTL_S` seconds (#3056)."""
+    key = (repo, remote, branch)
+    cached = _PUBLISHED_TIPS.get(key)
+    if cached is not None and time.monotonic() - cached[0] < PUBLISHED_TIP_TTL_S:
+        return cached[1]
+    if remote not in _remotes(repo):
+        out = ("local", None)
+    else:
+        text = _git(repo, "ls-remote", "--heads", remote,
+                    "refs/heads/" + branch, timeout=LS_REMOTE_TIMEOUT_S,
+                    env_extra={"GIT_TERMINAL_PROMPT": "0"})
+        words = (text or "").split()
+        if text is None:
+            out = ("error", None)
+        elif not words:
+            out = ("absent", None)
+        elif len(words) >= 1 and _SHA_RE.match(words[0]):
+            out = ("sha", words[0])
+        else:
+            out = ("error", None)
+    _PUBLISHED_TIPS[key] = (time.monotonic(), out)
+    return out
+
+
+def _forge_unreadable(repos) -> bool:
+    """True when a recent `ls-remote` of one of `repos` failed (#3056): a
+    doubt read then is transient, not a fact about the lot."""
+    now = time.monotonic()
+    wanted = set(repos or ())
+    return any(key[0] in wanted and now - read_at < PUBLISHED_TIP_TTL_S
+               and out[0] == "error"
+               for key, (read_at, out) in list(_PUBLISHED_TIPS.items()))
+
+
+def _published_ref(repo: str, name: str) -> str | None:
+    """The PUBLISHED ref that `name` designates (#3038), or None.
+
+    `plan_git.published_target` maps `develop` to `origin/develop`; a local
+    branch is never read when the clone has a remote: it can be days behind
+    the forge (the #2999 measure, 654430 lines for 332)."""
     from . import plan_git
 
-    for name in (target, plan_git.default_target(repo)):
-        if name and _git(repo, "rev-parse", "--verify", "-q", "%s^{commit}" % name,
-                         env_extra=NO_LAZY_FETCH):
-            return name
-    return None
+    ref = plan_git.published_target(repo, name)
+    if not _git(repo, "rev-parse", "--verify", "-q", "%s^{commit}" % ref,
+                env_extra=NO_LAZY_FETCH):
+        return None
+    local = (_git(repo, "rev-parse", "--symbolic-full-name", ref,
+                  env_extra=NO_LAZY_FETCH) or "").strip().startswith("refs/heads/")
+    if local and _remotes(repo):
+        return None
+    return ref
+
+
+def _fresh_target(repo: str, ref: str) -> str | None:
+    """The commit of `ref` to measure against when the merge is not in it, or
+    None when that commit is not the published tip (#3038).
+
+    `ref` may be a stale remote-tracking ref; `ls-remote` gives the forge tip
+    read now. The local commit is kept when it is that tip, or the published
+    one when the clone holds it; otherwise the tip is not fetched and the
+    caller doubts instead of reading `merge-base` on an unknown base."""
+    tip = (_git(repo, "rev-parse", "--verify", "-q", "%s^{commit}" % ref,
+                env_extra=NO_LAZY_FETCH) or "").strip()
+    if not tip:
+        return None
+    split = _remote_branch(repo, ref)
+    if split is None:
+        return tip                     # an explicit commit: nothing to confront
+    kind, sha = _remote_tip(repo, split[0], split[1])
+    if kind == "local":
+        return tip                     # no remote: the clone is the reference
+    if kind != "sha" or not sha:
+        return None                    # unreadable or absent: doubt
+    if sha == tip:
+        return tip
+    return sha if has_commit(repo, sha) else None
+
+
+def _target(repo: str, target: str | None, sha: str) -> str | None:
+    """The published integration ref to measure `sha` against (#3038).
+
+    A target declared by the lot is authoritative: only its published ref is
+    read, and it is returned even when it does not carry `sha` (a rebase or
+    squash merge leaves no merge commit there). Without one, the repository's
+    default target is tried, then the other published integration refs
+    (`develop`, `main`, …, `release/*`), and the first that carries `sha`
+    wins. When none carries it, the repository's DECLARED target
+    (`ameesh.target`) is the only fallback — the branch the project says it
+    integrates into; the clone's `origin/HEAD` alone (often `main` while the
+    project integrates on `develop`) would measure against the wrong branch.
+    None otherwise: the caller then doubts."""
+    from . import plan_git
+
+    explicit = str(target or "").strip()
+    if explicit:
+        return _published_ref(repo, explicit)
+    names: list[str] = []
+    try:
+        default = plan_git.default_target(repo)
+    except Exception:                  # cible déclarée introuvable : on essaie les refs
+        default = None
+    if default:
+        names.append(default)
+    try:
+        names += plan_git.target_candidates(repo, default)
+    except Exception:
+        pass
+    seen = set()
+    for name in names:
+        ref = _published_ref(repo, name)
+        if not ref or ref in seen:
+            continue
+        seen.add(ref)
+        if _is_ancestor(repo, sha, ref):
+            return ref
+    declared = plan_git.declared_target(repo)
+    return _published_ref(repo, declared) if declared else None
 
 
 def diff_range(repo: str, sha: str, target: str | None = None) -> tuple[str, str] | None:
@@ -267,15 +439,25 @@ def diff_range(repo: str, sha: str, target: str | None = None) -> tuple[str, str
        brought it in through a second parent, first parent → that merge;
        none (squash or single commit on the first-parent chain): sha^1 → sha;
     3. `sha` is not in the target (merged by rebase, as a patch):
-       merge-base(target, sha) → sha.
-    None when the repository does not hold `sha`."""
+       merge-base(target, sha) → sha — but only when the target is the
+       PUBLISHED tip (`_fresh_target`): on a stale ref that base would sweep
+       in the history accumulated since it (#3038).
+    None when the repository does not hold `sha`, when no readable target
+    carries it and none is declared, or when the published tip cannot be
+    proven: the measure then doubts and stores no size."""
     if not has_commit(repo, sha):
         return None
     empty = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"      # the empty tree
     parents = _parents(repo, sha)
     if len(parents) >= 2:
         return parents[0], sha
-    tgt = _target(repo, target)
+    tgt = _target(repo, target, sha)
+    if tgt and not _is_ancestor(repo, sha, tgt):
+        # the remote-tracking ref may be behind the forge (#3038): read the
+        # published tip before concluding « merged by rebase » or doubting
+        tgt = _fresh_target(repo, tgt)
+        if tgt is None:
+            return None
     if tgt and _is_ancestor(repo, sha, tgt):
         merges = (_git(repo, "rev-list", "--ancestry-path", "--merges", "--reverse",
                        "%s..%s" % (sha, tgt), env_extra=NO_LAZY_FETCH) or "").split()
@@ -287,9 +469,8 @@ def diff_range(repo: str, sha: str, target: str | None = None) -> tuple[str, str
     if tgt:
         base = (_git(repo, "merge-base", tgt, sha,
                      env_extra=NO_LAZY_FETCH) or "").strip()
-        if base:
-            return base, sha
-    return (parents[0] if parents else empty), sha
+        return (base, sha) if base else None
+    return None
 
 
 class UnprovenLotDiff(ValueError):
@@ -334,9 +515,9 @@ def lot_diff_range(repo: str, sha: str, target: str | None = None,
     if sha != (frozen or "").strip() and len(_parents(repo, sha)) >= 2:
         merge = sha
     else:
-        tgt = _target(repo, target)
+        tgt = _target(repo, target, sha)
         if tgt and not _is_ancestor(repo, sha, tgt):
-            alt = _target(repo, None)
+            alt = _target(repo, None, sha)
             if alt and alt != tgt and _is_ancestor(repo, sha, alt):
                 tgt = alt
         if tgt and _is_ancestor(repo, sha, tgt):
@@ -381,8 +562,13 @@ def diff_stat(repo: str, sha: str, target: str | None = None) -> dict | None:
     diff_insertions, diff_deletions, measured_size}`, or None when the
     repository does not hold the commit."""
     rng = diff_range(repo, sha, target)
-    if rng is None:
-        return None
+    return None if rng is None else _range_stat(repo, rng)
+
+
+def _range_stat(repo: str, rng: tuple[str, str]) -> dict | None:
+    """The size of the proven range `rng`, or None when `git diff` cannot read
+    it (an incomplete clone, a missing object): a read failure, not a doubt
+    about the range (#3056)."""
     text = _git(repo, "diff", "--shortstat", "--no-renames", rng[0], rng[1])
     if text is None:
         return None
@@ -449,15 +635,46 @@ def _repo_for(sha: str | None, repos) -> str | None:
     return None
 
 
-def measure_one(db, cand: dict, *, repos=(), ci=gh_ci_runs) -> dict:
+def measure_one(db, cand: dict, *, repos=(), ci=gh_ci_runs,
+                replace_size: bool = False) -> dict:
     """Measures one delivered lot (a row of `measure_candidates`) and stores
     it. `repos`: repositories where the merge commit may be; `ci(repo,
-    branch)`: its CI runs, or None (`ci=None`: not read)."""
+    branch)`: its CI runs, or None (`ci=None`: not read).
+
+    A stored size is kept when this measure cannot read one (another host may
+    hold what this one lacks). `replace_size` (a measure asked again by id):
+    repositories hold the merge commit but none proves its range, the forge
+    being readable — the stored size is cleared, never left to show a value
+    the current rule refutes (#3056). A proven range whose `git diff` fails
+    is a read failure: the size stays."""
     st = storage.of(db).work
     item_id = int(cand["id"])
     events = st.events(item_id, 1000)
     milestones = st.milestones(item_id, 1000)
-    repo = _repo_for(cand.get("merge_sha"), repos)
+    holding = [repo for repo in repos or ()
+               if repo and os.path.isdir(repo) and cand.get("merge_sha")
+               and has_commit(repo, cand["merge_sha"])]
+    repo = holding[0] if holding else None
+    # #3038 : le premier checkout qui porte le commit peut ne pas porter la
+    # cible publiée ; un suivant le fait. On ne conclut au doute qu'après.
+    stat = None
+    # #3056 : la taille stockée n'est effacée que si AUCUN dépôt porteur ne
+    # prouve de plage (cible publiée illisible ou absente) et que la forge a
+    # répondu. Une plage prouvée dont `git diff` échoue est un échec de
+    # lecture : la taille reste. Décidé ici, avant la lecture de la CI, dont
+    # l'attente pourrait faire expirer une erreur ls-remote en cache.
+    proven = False
+    for candidate in holding:
+        rng = diff_range(candidate, cand["merge_sha"], cand.get("branch_target"))
+        if rng is None:
+            continue
+        proven = True
+        stat = _range_stat(candidate, rng)
+        if stat is not None:
+            repo = candidate
+            break
+    size_doubt = (replace_size and bool(holding) and not proven
+                  and not _forge_unreadable(holding))
     # the CI runs are read in the repository that holds the merge commit
     runs = ci(repo, cand.get("branch")) if ci and repo else None
     # #796 : les tours que le grand livre attribue au lot ; vide = inconnu
@@ -478,8 +695,10 @@ def measure_one(db, cand: dict, *, repos=(), ci=gh_ci_runs) -> dict:
     out.update(started_ts=debut, merged_ts=cand["merged_ts"],
                merge_sha=cand.get("merge_sha") or None,
                declared_size=cand.get("change_size") or None)
-    if repo:
-        out.update(diff_stat(repo, cand["merge_sha"], cand.get("branch_target")) or {})
+    if stat is not None:
+        out.update(stat)
+    elif size_doubt:
+        out["size_doubt"] = True
     return st.save_measure(item_id, out)
 
 
@@ -488,12 +707,15 @@ def measure(db, ids=None, *, repos=(), ci=gh_ci_runs, limit: int = PASS_LIMIT,
             errors: list | None = None) -> list[dict]:
     """Measures the given delivered lots (`ids`, measured again), or those
     still to measure (`ids` None; merged less than `since_s` ago when
-    given), the most recent first. Returns the stored measures.
+    given), the most recent first. Returns the stored measures. A lot named
+    in `ids` is measured again for good: a size that now doubts is cleared
+    (`measure_one(replace_size=True)`, #3056).
 
     A lot that fails is skipped (`(id, exception)` appended to `errors`)
     and the next one measured; past `budget_s` seconds, the pass stops (the
     rest waits for the next pass)."""
     started = time.monotonic()
+    _PUBLISHED_TIPS.clear()          # one read of each published tip per pass
     cands = storage.of(db).work.measure_candidates(
         ids=None if ids is None else [int(i) for i in ids], retry_diff_s=RETRY_DIFF_S,
         since_s=since_s, limit=limit)
@@ -507,7 +729,8 @@ def measure(db, ids=None, *, repos=(), ci=gh_ci_runs, limit: int = PASS_LIMIT,
             if ids is None and cand["measured"] and not _repo_for(cand.get("merge_sha"),
                                                                   repos):
                 continue
-            out.append(measure_one(db, cand, repos=repos, ci=ci))
+            out.append(measure_one(db, cand, repos=repos, ci=ci,
+                                   replace_size=ids is not None))
         except Exception as exc:  # noqa: BLE001 - one lot never blocks the others
             if errors is not None:
                 errors.append((int(cand["id"]), exc))
@@ -579,9 +802,15 @@ def describe_phases(v: dict) -> str:
 
 
 def describe_size(v: dict) -> str:
-    """« declared m · measured l (612 lines, 9 files) — differs »."""
+    """« declared m · measured l (612 lines, 9 files) — differs ».
+
+    Sans taille, le doute dit sa cause (#3038) : commit de fusion introuvable
+    dans les dépôts de l'hôte, ou cible publiée illisible / non récupérée."""
     declared = v.get("declared_size") or "—"
     if v.get("measured_size") is None:
+        if v.get("merge_sha"):
+            return ("declared %s · measured: unknown (published target "
+                    "unreadable or not fetched)" % declared)
         return "declared %s · measured: unknown (merge commit not found)" % declared
     text = "declared %s · measured %s (%d lines, %d files)" % (
         declared, v["measured_size"], int(v["diff_insertions"] or 0)

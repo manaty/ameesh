@@ -113,6 +113,9 @@ TERMINAL_PREFIX = "review-after-merge:closed:#"
 #: confirmée : lecture impossible, dépôt absent) avant sa marque terminale.
 #: Un non-light confirmé, lui, est terminal dès la première lecture.
 CATCH_UP_MAX_ATTEMPTS = 3
+#: le nombre de lots nommés dans un avertissement aux pilotes (#3201), le
+#: reste restant lisible au journal des lots.
+WARN_LIMIT = 15
 #: l'échéance du canon §2 : le jour même de la fusion, heure de Paris
 TZ = "Europe/Paris"
 HOUR = "23:59"
@@ -1300,8 +1303,17 @@ def class_at_merge(db, lot: int, *, item: Optional[dict] = None,
                     if rng is None:
                         rng = lot_measures.diff_range(candidate, tip, target or None)
                     if not rng:
-                        reason = "le dépôt %s ne contient pas le commit %s" % (
-                            candidate, tip[:12])
+                        # #3056 : un dépôt qui porte le commit doute sur sa
+                        # cible publiée (illisible, absente ou pointe non
+                        # récupérée), il ne « manque » pas le commit
+                        if lot_measures.has_commit(candidate, tip):
+                            reason = ("le dépôt %s porte le commit %s, mais aucune "
+                                      "cible publiée lisible ne situe sa fusion "
+                                      "(cible absente, ls-remote illisible ou pointe "
+                                      "non récupérée)" % (candidate, tip[:12]))
+                        else:
+                            reason = "le dépôt %s ne contient pas le commit %s" % (
+                                candidate, tip[:12])
                         continue
                     paths = lot_measures.diff_paths(candidate, *rng)
                 except lot_measures.UnprovenLotDiff as exc:
@@ -1455,6 +1467,64 @@ def merged_sha(db, lot: int) -> str:
     return str(last.get("sha") or "").strip()
 
 
+def _warn_unopened(db, entries: list[dict]) -> str:
+    """#3201 : les relectures manquantes faute de dépôt, dites aux pilotes.
+
+    Un simple journal ne se lit pas. La **première** tentative d'un lot sans
+    dépôt connu envoie un courrier durable aux pilotes déclarés, qui nomme les
+    lots et le geste de reprise (`ameesh work merged <id> --sha <merge>
+    --repo <clone>`, idempotent). Best effort : sans pilote déclaré ou sans
+    dépôt de courrier, le journal reste et le compte rendu le dit — un
+    avertissement ne casse jamais le relevé. Rend une ligne lisible."""
+    try:
+        from . import mail, registry, sous_utilisation
+        cfg = getattr(db, "cfg", None)
+        listing = registry.overview(db)
+        names = sous_utilisation.alert_orchestrators(
+            cfg, db, listing,
+            declared=sous_utilisation.declared_orchestrators())
+    except Exception as exc:  # noqa: BLE001 - un avertissement n'arrête rien
+        return "aucun pilote joignable : %s: %s" % (
+            type(exc).__name__, str(exc)[:120])
+    if not names:
+        return "aucun pilote déclaré : avertissement laissé au journal"
+    shown = entries[:WARN_LIMIT]
+    lines = [
+        "Relecture après fusion (canon §2) impossible : aucun dépôt lisible.",
+        "",
+        "Ces lots fusionnés n'ont pas pu être classés, faute de dépôt connu :",
+    ]
+    for entry in shown:
+        lines.append("- #%s « %s » (fusion %s)" % (
+            entry["lot"],
+            " ".join(str(entry.get("title") or "").split())[:80],
+            (entry.get("sha") or "?")[:12]))
+    if len(entries) > len(shown):
+        lines.append("… et %d autre(s), au journal des lots."
+                     % (len(entries) - len(shown)))
+    lines += [
+        "",
+        "Un lot léger doit être relu après fusion ; sans dépôt, la relecture",
+        "n'est jamais ouverte. Reprendre chaque lot avec le clone qui porte la",
+        "fusion (la déclaration est idempotente) :",
+        "  ameesh work merged <id> --sha <commit de fusion> --repo <clone>",
+        "Ou corriger `radar.projects.<projet>.repo` (ou le dossier de l'assigné)",
+        "sur l'hôte du rattrapage.",
+    ]
+    body = "\n".join(lines)
+    sent, failed = [], []
+    for name in names:
+        try:
+            mail.send(db, work.SYSTEM_SENDER, name, body,
+                      work_item_id=(str(entries[0]["lot"]) if len(entries) == 1 else None))
+            sent.append(name)
+        except Exception as exc:  # noqa: BLE001 - le journal reste, rien d'autre
+            failed.append("%s: %s" % (name, str(exc)[:80]))
+    if sent:
+        return "avertissement envoyé à %s" % ", ".join(sent)
+    return "avertissement non remis (%s)" % "; ".join(failed)
+
+
 def catch_up(db, *, repo: str = "", target: str = "",
              limit: int = CATCH_UP_LIMIT,
              retry_s: float = ATTEMPT_RETRY_S,
@@ -1490,12 +1560,15 @@ def catch_up(db, *, repo: str = "", target: str = "",
     retenté à chaque balayage — la relecture est rendue, pas manquante.
 
     Ne lève jamais ; rend `{examined, missing, opened, already, reviewed,
-    attempted, terminal, failed, bound}` (`attempted` : tentatives sans
-    création marquées, `already` : relecture ouverte entre la sélection et le
-    geste, `reviewed` : avis déjà rendu sur la tête fusionnée, `terminal` :
-    candidats clos par la marque terminale)."""
+    attempted, terminal, failed, bound, unopened, warning}` (`attempted` :
+    tentatives sans création marquées, `already` : relecture ouverte entre la
+    sélection et le geste, `reviewed` : avis déjà rendu sur la tête fusionnée,
+    `terminal` : candidats clos par la marque terminale, `unopened` : lots de
+    la première tentative restés sans dépôt — #3201, `warning` : ce qui a été
+    fait de l'avertissement aux pilotes)."""
     out = {"examined": 0, "missing": 0, "opened": 0, "already": 0,
-           "reviewed": 0, "attempted": 0, "terminal": 0, "failed": 0, "bound": ""}
+           "reviewed": 0, "attempted": 0, "terminal": 0, "failed": 0, "bound": "",
+           "unopened": [], "warning": ""}
     try:
         ops = storage.of(db).work
         bound = ops.review_catch_up_bound()
@@ -1550,7 +1623,8 @@ def catch_up(db, *, repo: str = "", target: str = "",
             if _open(ops, ref_of(lot)) is not None:
                 continue
             out["missing"] += 1
-            done = open_for_merge(db, lot, merged_sha=merged_sha(db, lot), repo=repo,
+            sha = merged_sha(db, lot)
+            done = open_for_merge(db, lot, merged_sha=sha, repo=repo,
                                   target=target or str(row.get("branch_target") or ""))
             if done.get("created"):
                 out["opened"] += 1
@@ -1592,10 +1666,20 @@ def catch_up(db, *, repo: str = "", target: str = "",
                 terminal(lot, state, "doute après %d tentatives" % seen)
             else:
                 out["attempted"] += 1
-                mark(lot, state, "sans ouverture: %s" % (done.get("why") or "?"))
+                why = str(done.get("why") or "?")
+                mark(lot, state, "sans ouverture: %s" % why)
+                # #3201 : la première fois qu'un lot reste sans dépôt, le
+                # pilote reçoit un avertissement (une fois par lot, agrégé en
+                # fin de passe) — le journal seul ne se lit pas.
+                if seen == 1 and why.startswith("dépôt inconnu"):
+                    out["unopened"].append({
+                        "lot": lot, "why": why, "state": state,
+                        "title": row.get("title") or "", "sha": sha or ""})
         except Exception:  # noqa: BLE001 - un lot en panne n'arrête pas le rattrapage
             out["failed"] += 1
             mark(lot, state, "erreur")
+    if out["unopened"]:
+        out["warning"] = _warn_unopened(db, out["unopened"])
     return out
 
 

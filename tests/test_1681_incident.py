@@ -394,6 +394,8 @@ class TestOuverture(unittest.TestCase):
             self.assertEqual(out["id"], 9001)
             self.assertTrue(out["assigned"])
             self.assertEqual(add.call_args.kwargs["issue_ref"], "ci-incident:manaty/nexlink:77")
+            self.assertTrue(add.call_args.kwargs["unique_ref"],
+                            "#2954 : la création de l'incident est unique par exécution")
             self.assertEqual(add.call_args.kwargs["priority"], 1)
             self.assertIsNone(add.call_args.kwargs.get("assignee"))
             assign.assert_called_once()
