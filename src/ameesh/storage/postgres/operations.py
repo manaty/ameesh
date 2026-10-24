@@ -143,6 +143,7 @@ class Operations(interface.Operations):
         return self.db.query(
             """
             SELECT r.name, r.chantier, r.team, r.projects, r.harness, r.host, r.model,
+                   r.ephemeral,  -- #3411 : la prise automatique ne sert pas un éphémère
                    r.effort, r.tier,
                    r.cwd,  -- L73b : dossiers de travail protégés par le ménage
                    r.session_policy, r.lot_wake, r.context_max_tokens, r.turn_max_seconds, r.turn_mail_max,
