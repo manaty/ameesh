@@ -9,6 +9,7 @@ import os
 import shutil
 import tempfile
 import time
+import types
 import unittest
 from unittest import mock
 
@@ -30,10 +31,6 @@ def _write(path: str, size: int, age_s: float = 0.0) -> None:
     if age_s:
         moment = time.time() - age_s
         os.utime(path, (moment, moment))
-
-
-def _real_free(root: str) -> int:
-    return shutil.disk_usage(root).free
 
 
 class EvictAtLeastTest(unittest.TestCase):
@@ -104,8 +101,26 @@ class CachePressionTest(PgTestCase):
             self.addCleanup(patcher.stop)
 
     def _pression(self) -> int:
-        """Une cible d'espace libre juste au-dessus de l'actuel : un déficit."""
-        return _real_free(menage.cache_root(self.cfgl, menage.Policy())) + 4096
+        """Une cible d'espace libre au-dessus d'un espace libre simulé nul :
+        un déficit de 4 KiB, le même sur tout hôte.
+
+        #3316 : la cible était calculée depuis `shutil.disk_usage` réel
+        (+4 KiB). Une écriture concurrente sur l'hôte de CI faisait remonter
+        l'espace libre au-dessus de la cible, le déficit tombait à zéro et le
+        cache n'était plus évincé. L'espace libre est maintenant injecté pour
+        le seul dossier du cache, les autres lectures restant réelles."""
+        croot = os.path.realpath(menage.cache_root(self.cfgl, menage.Policy()))
+        real = shutil.disk_usage
+
+        def disk_usage(path, *args, **kwargs):
+            if os.path.realpath(path) == croot:
+                return types.SimpleNamespace(total=0, used=0, free=0)
+            return real(path, *args, **kwargs)
+
+        patcher = mock.patch.object(menage.shutil, "disk_usage", disk_usage)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return 4096
 
     def _rapport(self, **kw):
         return menage.run_pass(self.cfgl, self.db, menage.Policy(), host="pc",
