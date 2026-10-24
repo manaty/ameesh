@@ -444,7 +444,7 @@ def _mark(event: dict) -> dict | None:
         document = json.loads(match.group(3))
     except (ValueError, TypeError):
         return {"lot": int(match.group(1)), "freeze": int(match.group(2)),
-                "names": [], "unreadable": True}
+                "names": [], "authors": [], "unreadable": True}
     names = []
     for reviewer in document.get("reviewers") or ():
         if isinstance(reviewer, Mapping):
@@ -453,8 +453,18 @@ def _mark(event: dict) -> dict | None:
             name = str(reviewer or "").strip()
         if name and name != "-none":
             names.append(name)
+    # Les auteurs de la tête (dont un relecteur qui a poussé un correctif,
+    # #2888/#2739) ne peuvent pas la relire : la marque les nomme déjà.
+    authors = []
+    for author in document.get("authors") or ():
+        if isinstance(author, Mapping):
+            name = str(author.get("name") or "").strip()
+        else:
+            name = str(author or "").strip()
+        if name:
+            authors.append(name)
     return {"lot": int(match.group(1)), "freeze": int(match.group(2)),
-            "names": names, "unreadable": False,
+            "names": names, "authors": authors, "unreadable": False,
             "at": float(event.get("at_ts") or 0.0)}
 
 
@@ -472,6 +482,8 @@ def designations(milestones: list[dict], events: list[dict]) -> dict:
       qui survivent aux rotations : un nom jamais porté par une marque compte
       tant qu'il n'est pas retiré ; un nom déjà porté par une marque ne compte
       sur la nouvelle tête que s'il a été redésigné depuis le gel (#3033) ;
+      un auteur ou correcteur de la tête, nommé par la marque du dernier gel,
+      ne compte jamais (#2888/#2739) ;
     * les verdicts qui nomment la tête gelée : un `blocked` rendu compte
       l'avis (le relecteur a rendu), un verdict d'une autre tête ne compte pas.
     """
@@ -511,11 +523,15 @@ def designations(milestones: list[dict], events: list[dict]) -> dict:
                                    "kind": manual_match.group(2),
                                    "at": float(event.get("at_ts") or 0.0)}
     auto = list(latest_mark["names"]) if latest_mark else []
+    # Un auteur de la tête — dont le relecteur qui y a poussé un correctif
+    # (#2888/#2739) — ne peut pas la relire. La marque du gel courant le dit ;
+    # une désignation manuelle antérieure ne doit pas le réintroduire.
+    authors = {_norm(name) for name in (latest_mark or {}).get("authors") or ()}
     designees: list[tuple[str, float]] = []
     seen: set[str] = set()
     for name in auto:
         key = _norm(name)
-        if key in seen:
+        if key in seen or key in authors:
             continue
         # Le retrait manuel depuis la marque retire aussi un nom automatique
         # (#3033 : le pilote a retiré dev1, dev2 désigné).
@@ -529,7 +545,7 @@ def designations(milestones: list[dict], events: list[dict]) -> dict:
             designated = max(designated, float(latest_mark.get("at") or 0.0))
         designees.append((name, designated))
     for key, choice in manual.items():
-        if choice["kind"] != "designated" or key in seen:
+        if choice["kind"] != "designated" or key in seen or key in authors:
             continue
         if key in ever and choice["at"] < freeze_at and key not in {_norm(n) for n in auto}:
             # #3033 : un nom déjà porté par une marque ne vaut sur la nouvelle

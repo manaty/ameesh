@@ -44,6 +44,15 @@ def mark(ident, freeze_id, names):
         ident, freeze_id, json.dumps({"reviewers": [{"name": n} for n in names]}))
 
 
+def mark_authors(ident, freeze_id, names, authors):
+    """Une marque réelle : le gel nomme aussi les auteurs de la tête."""
+    import json
+    return 'review-designation:%d:%d: %s' % (
+        ident, freeze_id,
+        json.dumps({"reviewers": [{"name": n} for n in names],
+                    "authors": [{"name": n, "family": ""} for n in authors]}))
+
+
 def run(**extra):
     values = dict(items=[], milestones=[], events=[], agents=[], turns=[],
                   merges=[], ci_runs=[], jobs=[], now=T, installed="1.20.0",
@@ -125,6 +134,26 @@ class ReviewDueTest(unittest.TestCase):
                           actor="mesh-design")])
         self.assertEqual([row["reviewer"] for row in report["reviews_due"]],
                          ["ameesh-cx1"])
+
+    def test_un_ancien_relecteur_devenu_auteur_n_est_plus_du(self):
+        # #3292, constat cx1 sur 8c25d6eb : dev1, correcteur de la tête, est
+        # nommé auteur par la marque du gel #17456, qui ne requiert que cx1.
+        # Sa désignation manuelle antérieure ne doit pas le réintroduire ; un
+        # manuel qui n'est pas auteur reste dû.
+        report = run(
+            items=[item(3292)],
+            milestones=[frozen(3292, 17456, T - 10 * 60, sha="e" * 40)],
+            events=[event(3292, 1, T - 2 * H, "reviewer ameesh-dev1 designated",
+                          actor="mesh-design"),
+                    event(3292, 2, T - 2 * H + 1, "reviewer ameesh-dev3 designated",
+                          actor="mesh-design"),
+                    event(3292, 3, T - 9 * 60,
+                          mark_authors(3292, 17456, ["ameesh-cx1"],
+                                       ["ameesh-dev1", "ameesh-dev5"]),
+                          actor="ameesh")])
+        self.assertEqual(sorted(row["reviewer"] for row in report["reviews_due"]),
+                         ["ameesh-cx1", "ameesh-dev3"])
+        self.assertFalse(report["qa"][0]["ready"])
 
     def test_lot_termine_ne_reclame_aucun_avis(self):
         report = run(
