@@ -120,6 +120,7 @@ from __future__ import annotations
 
 import getpass
 import json
+import math
 import os
 import shlex
 import re
@@ -3855,14 +3856,18 @@ def dsh_scope_verdict(scope: dict, row: dict | None, host: str,
     Récolté seulement si le processus dsh qui l'a lancé n'existe plus, que
     TOUS ses processus portent le même `AMEESH_TURN_ID`, que ce tour est connu
     de CET hôte, clos (`done`, `orphan`) et fini depuis `DSH_SCOPE_GRACE_S`.
-    dsh vivant, tour `running` : attente. Liste ou environnement illisible,
-    aucun tour ou plusieurs, tour inconnu ici : gardé et signalé (comme
-    `_orphan_verdict`)."""
+    dsh vivant, tour `running` : attente. Liste, heure de démarrage du dsh ou
+    environnement illisible, aucun tour ou plusieurs, tour inconnu ici, fin de
+    tour illisible : gardé et signalé (comme `_orphan_verdict`) — un doute ne
+    se tait jamais et une grâce non mesurable ne se remplace pas par le
+    démarrage du processus."""
+    members = scope["members"]
+    if scope["unreadable"] or scope.get("owner_unread"):
+        return "signal", "process list or dsh start time unreadable: not attributable", None
+    if any(m.get("unread") for m in members):
+        return "signal", "process start or environment unreadable: not attributable", None
     if scope["owner_alive"]:
         return "wait", "dsh pid %d alive" % scope["dsh_pid"], None
-    members = scope["members"]
-    if scope["unreadable"] or any(m["unread"] for m in members):
-        return "signal", "process list or environment unreadable: not attributable", None
     turns = {m["turn"] for m in members}
     if turns == {None}:
         return "signal", "no AMEESH_TURN_ID: not attributable", None
@@ -3872,18 +3877,24 @@ def dsh_scope_verdict(scope: dict, row: dict | None, host: str,
     turn = turns.pop()
     if row is None or (row.get("host") or "") != (host or ""):
         return "signal", "turn %s unknown on this host: not attributable" % turn[:8], turn
-    if row.get("status") == "running":
+    status = row.get("status")
+    if status == "running":
         return "wait", "turn %s not closed" % turn[:8], turn
-    ended = row.get("ended_ts")
+    if status not in ("done", "orphan"):
+        return "signal", "turn %s status %r: not attributable" % (
+            turn[:8], status), turn
     try:
-        since = float(ended)
+        since = float(row.get("ended_ts"))
+        if not math.isfinite(since):
+            raise ValueError("not finite")
     except (TypeError, ValueError):
-        since = max(float(m["start"]) for m in members)
+        return "signal", "turn %s closed but end time unreadable: not attributable" % (
+            turn[:8]), turn
     if now - since < DSH_SCOPE_GRACE_S:
         return "wait", "turn %s closed %ds ago (grace %ds)" % (
             turn[:8], int(now - since), int(DSH_SCOPE_GRACE_S)), turn
     return "kill", "turn %s %s, dsh pid %d gone" % (
-        turn[:8], row.get("status") or "closed", scope["dsh_pid"]), turn
+        turn[:8], status, scope["dsh_pid"]), turn
 
 
 def reap_dsh_scopes(db, host: str, *, dry_run: bool = False, now: float | None = None,
@@ -3894,7 +3905,9 @@ def reap_dsh_scopes(db, host: str, *, dry_run: bool = False, now: float | None =
     sait pas attribuer sont gardés et signalés (`signaled`, re-signalé au
     plus toutes les `DSH_SCOPE_REFRESH_S`, `gone` quand ils disparaissent).
     `scan`/`terminate` : ceux de `platform.dsh_scopes` (surchargés par les
-    tests). Rend `{entries, plan}`."""
+    tests). Un scope dont le traitement échoue est signalé sans interrompre
+    les suivants ; un scope dont tous les processus ont disparu avant le
+    signal est `gone`, jamais `killed`. Rend `{entries, plan}`."""
     from .platform import dsh_scopes
     scan = dsh_scopes.scan if scan is None else scan
     terminate = dsh_scopes.terminate if terminate is None else terminate
@@ -3911,44 +3924,59 @@ def reap_dsh_scopes(db, host: str, *, dry_run: bool = False, now: float | None =
     last = {row["path"]: row for row in hk.latest_by_path(host, "dsh_scope")}
     seen = set()
     for scope in scopes:
-        unit = scope["unit"]
+        unit = (scope or {}).get("unit") or ""
         seen.add(unit)
-        members = scope["members"]
-        turn_ids = {m["turn"] for m in members if m.get("turn")}
-        row = turns.get(next(iter(turn_ids))) if len(turn_ids) == 1 else None
-        action, why, turn = dsh_scope_verdict(scope, row, host, now)
-        agent = (row or {}).get("agent") or next(
-            (a for a in (_tmpdir_agent(m.get("tmpdir")) for m in members) if a), None)
-        previous = last.get(unit) or {}
-        data = {"dsh_pid": scope["dsh_pid"], "turn": turn,
-                "pids": [m["pid"] for m in members],
-                "commands": [m["command"] for m in members[:3]],
-                "first_seen": ((previous.get("data") or {}).get("first_seen")
-                               if previous.get("action") == "signaled" else None) or now}
-        base = {"kind": "dsh_scope", "path": unit, "agent": agent}
-        if action == "wait":
-            out["plan"].append(dict(base, action="attend", detail=why))
-            continue
-        if action == "kill":
-            out["plan"].append(dict(base, action="suppression", detail=why))
-            if dry_run:
+        try:
+            members = scope["members"]
+            turn_ids = {m["turn"] for m in members if m.get("turn")}
+            row = turns.get(next(iter(turn_ids))) if len(turn_ids) == 1 else None
+            action, why, turn = dsh_scope_verdict(scope, row, host, now)
+            agent = (row or {}).get("agent") or next(
+                (a for a in (_tmpdir_agent(m.get("tmpdir")) for m in members) if a), None)
+            previous = last.get(unit) or {}
+            data = {"dsh_pid": scope["dsh_pid"], "turn": turn,
+                    "pids": [m["pid"] for m in members],
+                    "commands": [m["command"] for m in members[:3]],
+                    "first_seen": ((previous.get("data") or {}).get("first_seen")
+                                   if previous.get("action") == "signaled" else None) or now}
+            base = {"kind": "dsh_scope", "path": unit, "agent": agent}
+            if action == "wait":
+                out["plan"].append(dict(base, action="attend", detail=why))
                 continue
-            left = terminate(members)
-            if not left:
-                out["entries"].append(dict(base, action="killed", data=data,
-                                           detail="%s: SIGTERM then SIGKILL" % why))
-                continue
-            why = "%s: %d process(es) not killed (%s)" % (
-                why, len(left), ", ".join("%d %s" % (m["pid"], m.get("why") or "alive")
-                                          for m in left))
-        else:
-            out["plan"].append(dict(base, action="signalé", detail=why))
-            if dry_run:
-                continue
-        fresh = (previous.get("action") == "signaled" and previous.get("detail") == why
-                 and now - float(previous.get("at_ts") or 0) < DSH_SCOPE_REFRESH_S)
-        if not fresh:
-            out["entries"].append(dict(base, action="signaled", detail=why, data=data))
+            if action == "kill":
+                out["plan"].append(dict(base, action="suppression", detail=why))
+                if dry_run:
+                    continue
+                if not members:
+                    out["entries"].append(dict(base, action="gone", detail=(
+                        "%s: empty scope gone, nothing to signal" % why)))
+                    continue
+                left = terminate(members)
+                if not left:
+                    out["entries"].append(dict(base, action="killed", data=data,
+                                               detail="%s: SIGTERM then SIGKILL" % why))
+                    continue
+                if (len(left) == len(members)
+                        and all((m.get("why") or "") == "gone before signal" for m in left)):
+                    out["entries"].append(dict(base, action="gone", detail=(
+                        "%s: every process gone before signal" % why)))
+                    continue
+                why = "%s: %d process(es) not killed (%s)" % (
+                    why, len(left), ", ".join("%d %s" % (m["pid"], m.get("why") or "alive")
+                                              for m in left))
+            else:
+                out["plan"].append(dict(base, action="signalé", detail=why))
+                if dry_run:
+                    continue
+            fresh = (previous.get("action") == "signaled" and previous.get("detail") == why
+                     and now - float(previous.get("at_ts") or 0) < DSH_SCOPE_REFRESH_S)
+            if not fresh:
+                out["entries"].append(dict(base, action="signaled", detail=why, data=data))
+        except Exception as exc:  # un scope ne doit pas perdre les suivants
+            out["entries"].append({"kind": "dsh_scope", "path": unit,
+                                   "action": "signaled",
+                                   "detail": "scope pass failed (%s): not attributable"
+                                             % type(exc).__name__})
     if not dry_run:
         for unit, previous in last.items():
             if unit not in seen and previous.get("action") == "signaled":
