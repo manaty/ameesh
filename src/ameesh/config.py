@@ -605,6 +605,192 @@ def _inherit_base(cfg_path: str, raw: dict) -> str:
     return base
 
 
+#: #3345 : réglages qui valent pour TOUS les exécuteurs d'un hôte — le service
+#: de train (`train`), la projection GitHub des lots (`github`) et les coupures
+#: de release (`release`). Un profil qui en surcharge une partie fait diverger
+#: les exécuteurs du même hôte sans le dire : le 24/10, les trois runners
+#: critiques lisaient un profil resté en `train.mode: shadow` et sans `github`
+#: alors que `config.json` était en train actif. Ces clés ne sont pas des
+#: réglages de profil : `ameesh doctor` et le contrôle de déploiement les
+#: signalent.
+SHARED_CONFIG_KEYS = ("train", "github", "release")
+
+
+#: sentinelle d'une clé absente d'un côté d'une comparaison de configuration
+_MISSING = object()
+
+#: #3345 : les seuls objets dont un profil peut surcharger une feuille sans
+#: recopier le bloc. `train` et `release` portent des sous-réglages que les
+#: profils ajustent légitimement (mode du train, hôte de coupure) ; partout
+#: ailleurs la superposition reste de **premier niveau** (#1466) : une clé
+#: déclarée remplace la valeur de la base en entier, y compris `accounts`
+#: (isolation), `github`, `radar`, `packet_watch`, `notify`… (décision
+#: mesh-design #133247 du 24/10 13:53Z : liste d'autorisation, pas exclusion).
+RECURSIVE_CONFIG_KEYS = ("train", "release")
+
+
+def _merge_config(base: dict, overlay: dict, *, recursive: bool = False) -> dict:
+    """Superpose `overlay` (un profil) sur `base` (config.json), clé par clé.
+
+    #3345 : un profil ne porte que ce qu'il surcharge. Une clé absente de
+    l'overlay est héritée de la base ; une clé déclarée la remplace en entier,
+    **sauf `train` et `release`** (`RECURSIVE_CONFIG_KEYS`) dont les objets se
+    fusionnent feuille à feuille, à toute profondeur : `{"train": {"mode":
+    "shadow"}}` garde le `host` et les `projects` de `config.json`, et un
+    `train.projects.ameesh` partiel garde son `repo`/`target` et les autres
+    projets. La liste d'autorisation ne vaut qu'au **premier niveau** : une
+    fois dans `train` ou `release`, `recursive` est vrai et tous leurs objets
+    se fusionnent. Tout autre objet déclaré (`radar`, `packet_watch`, `github`,
+    `notify`, `accounts`…) remplace la valeur de la base en entier (un
+    `notify: {}` vide bien les routes héritées). La récursion générale de la
+    première version de #3345 faisait hériter en silence les sous-clés
+    d'objets que le profil voulait restreindre."""
+    merged = dict(base)
+    for key, value in overlay.items():
+        old = merged.get(key, _MISSING)
+        if (isinstance(old, dict) and isinstance(value, dict)
+                and (recursive or key in RECURSIVE_CONFIG_KEYS)):
+            merged[key] = _merge_config(old, value, recursive=True)
+        else:
+            merged[key] = value
+    return merged
+
+
+def _config_diff(base, value, path: str) -> list[tuple[str, object, object]]:
+    """Feuilles qui diffèrent entre `base` et `value`, avec leur chemin pointé.
+
+    Les objets JSON sont parcourus récursivement (un projet, un mode) pour que
+    le constat nomme `train.mode` plutôt que le bloc `train` entier ; une liste
+    ou un scalaire est comparé d'un bloc."""
+    if isinstance(base, dict) and isinstance(value, dict):
+        out: list[tuple[str, object, object]] = []
+        for key in sorted(set(base) | set(value)):
+            child = "%s.%s" % (path, key)
+            if key not in value:
+                out.append((child, _MISSING, base[key]))
+            elif key not in base:
+                out.append((child, value[key], _MISSING))
+            else:
+                out.extend(_config_diff(base[key], value[key], child))
+        return out
+    if base is _MISSING and value is _MISSING:
+        return []
+    if base != value:
+        return [(path, value, base)]
+    return []
+
+
+def _shown(value) -> str:
+    """Une valeur de configuration en une ligne courte, jamais un secret :
+    seules les clés partagées (train, github, release) passent par ici."""
+    if value is _MISSING:
+        return "<absent>"
+    texte = json.dumps(value, ensure_ascii=False, sort_keys=True)
+    return texte if len(texte) <= 120 else texte[:117] + "..."
+
+
+@dataclass(frozen=True)
+class ProfileDivergence:
+    """Une feuille d'une clé partagée où un profil diffère de `config.json`."""
+
+    profile: str
+    key: str
+    path: str
+    value: object
+    base: object
+
+
+@dataclass(frozen=True)
+class ProfileAudit:
+    """#3345 : état des profils d'exécuteur d'un hôte face à `config.json`."""
+
+    directory: str
+    host: str
+    profiles: tuple[str, ...] = ()
+    divergences: tuple[ProfileDivergence, ...] = ()
+    errors: tuple[str, ...] = ()
+
+    @property
+    def ok(self) -> bool:
+        return not self.divergences and not self.errors
+
+    def lines(self) -> list[str]:
+        out = ["profiles   : ERROR %s" % error for error in self.errors]
+        for divergence in self.divergences:
+            out.append("profiles   : DIVERGENCE %s: %s (profile %s, config.json %s)"
+                       % (os.path.basename(divergence.profile), divergence.path,
+                          _shown(divergence.value), _shown(divergence.base)))
+        if self.ok:
+            out.append("profiles   : %d checked in %s; %s match %s"
+                       % (len(self.profiles), self.directory,
+                          ", ".join(SHARED_CONFIG_KEYS), self.host))
+        return out
+
+
+def audit_profiles(extra=(), directory: str | None = None,
+                   host: str | None = None) -> ProfileAudit:
+    """#3345 : audite les profils héritant de `config.json`.
+
+    Tout fichier `*.json` du dossier des profils qui hérite du `config.json`
+    de l'hôte (le cas normal) est fusionné comme `load` le ferait, puis ses
+    clés partagées (`SHARED_CONFIG_KEYS`) sont comparées à celles de la base.
+    `extra` ajoute le profil que le processus courant lit lui-même, même rangé
+    ailleurs (`"inherit": true`). Un profil `"inherit": false`, ou qui hérite
+    d'une AUTRE base, est autonome par déclaration : il n'est pas comparé.
+
+    Ne lève pas : un profil illisible devient une ligne d'erreur, pour que le
+    diagnostic ne casse jamais et que le déploiement puisse refuser."""
+    directory = _expand(directory) if directory else _config_dir_default()
+    host = _expand(host) if host else _expand(DEFAULT_CONFIG)
+    errors: list[str] = []
+    candidates: list[str] = []
+    try:
+        names = sorted(os.listdir(directory))
+    except FileNotFoundError:
+        names = []
+    except OSError as exc:
+        return ProfileAudit(directory, host, (),
+                            errors=("%s unreadable (%s)" % (directory, exc),))
+    for name in names:
+        if name.endswith(".json"):
+            path = os.path.join(directory, name)
+            if os.path.isfile(path):
+                candidates.append(path)
+    for path in extra:
+        if path and os.path.isfile(_expand(path)):
+            candidates.append(_expand(path))
+    seen: set[str] = set()
+    profiles: list[str] = []
+    divergences: list[ProfileDivergence] = []
+    for path in candidates:
+        ident = os.path.abspath(path)
+        if ident in seen:
+            continue
+        seen.add(ident)
+        try:
+            raw = _read_json_object(path)
+            base_path = _inherit_base(path, raw)
+            # autonome, ou base explicitement différente de l'hôte : hors du
+            # contrat « un profil surcharge config.json »
+            if not base_path or os.path.abspath(base_path) != os.path.abspath(host):
+                continue
+            base_raw = _read_json_object(base_path)
+        except SystemExit as exc:
+            errors.append("%s: %s" % (os.path.basename(path), exc))
+            continue
+        profiles.append(path)
+        merged = _merge_config(base_raw, raw)
+        for key in SHARED_CONFIG_KEYS:
+            if key not in base_raw and key not in merged:
+                continue
+            for chemin, value, base_value in _config_diff(
+                    base_raw.get(key, _MISSING), merged.get(key, _MISSING), key):
+                divergences.append(ProfileDivergence(
+                    profile=path, key=key, path=chemin, value=value, base=base_value))
+    return ProfileAudit(directory=directory, host=host, profiles=tuple(profiles),
+                        divergences=tuple(divergences), errors=tuple(errors))
+
+
 def load(env: dict | None = None) -> Config:
     env = dict(os.environ if env is None else env)
     cfg = Config()
@@ -635,18 +821,21 @@ def load(env: dict | None = None) -> Config:
         raw = _read_json_object(cfg_path)
         # #1466 : un profil (fichier rangé sous le dossier de la configuration
         # de l'hôte) hérite de `config.json` ; ses propres clés l'emportent.
-        # L'héritage est une superposition de clés de premier niveau : une clé
-        # déclarée par le profil (par exemple `accounts`) remplace entièrement
-        # celle de la base, elle ne fusionne pas avec elle. Les clés ainsi
-        # remplacées et différentes de la base sont retenues : c'est l'écart
-        # qu'un profil périmé creuse, et il doit rester lisible.
+        # #3345 : la récursion ne s'ouvre qu'au premier niveau, et seulement
+        # pour `train` et `release` (RECURSIVE_CONFIG_KEYS) ; dans ces deux
+        # blocs, tous les objets se fusionnent à toute profondeur. Toute autre
+        # clé déclarée remplace la valeur de la base en entier. Les clés de
+        # premier niveau dont la valeur effective diffère de la base sont
+        # retenues : c'est l'écart qu'un profil périmé creuse, et il doit
+        # rester lisible.
         base_path = _inherit_base(cfg_path, raw)
         if base_path:
             base_raw = _read_json_object(base_path)
+            merged = _merge_config(base_raw, raw)
             shadowed = tuple(sorted(
                 key for key in raw
-                if key in base_raw and raw[key] != base_raw[key]))
-            raw = {**base_raw, **raw}
+                if key in base_raw and merged.get(key, _MISSING) != base_raw[key]))
+            raw = merged
         known = {f for f in Config.__dataclass_fields__}  # type: ignore[attr-defined]
         known.discard("extra_canons")   # `canons` (liste) ci-dessous, jamais tel quel
         known.discard("budget_explicit")  # calculé, jamais lu tel quel
@@ -931,7 +1120,9 @@ def fresh_radar(cfg: Config) -> Config:
     (`config_file` vide), `cfg` tel quel.
 
     Un profil (#1466) hérite de sa base comme dans `load` : un `radar` déclaré
-    seulement dans le `config.json` de l'hôte vaut pour le profil."""
+    seulement dans le `config.json` de l'hôte vaut pour le profil, et un
+    `radar` déclaré dans le profil le remplace en entier (la récursion de
+    #3345 ne s'ouvre que sur `train` et `release`)."""
     if not cfg.config_file:
         return cfg
     # `_read_json_object` et `_inherit_base` refusent par SystemExit, qui
@@ -940,7 +1131,7 @@ def fresh_radar(cfg: Config) -> Config:
         raw = _read_json_object(cfg.config_file)
         base_path = _inherit_base(cfg.config_file, raw)
         if base_path:
-            raw = {**_read_json_object(base_path), **raw}
+            raw = _merge_config(_read_json_object(base_path), raw)
     except SystemExit as exc:
         raise ValueError(str(exc)) from None
     radar = raw.get("radar")

@@ -2717,7 +2717,8 @@ def cmd_migrate(cfg: Config, args: argparse.Namespace) -> int:
 def cmd_doctor(cfg: Config, args: argparse.Namespace) -> int:
     from . import cli
     return cli.cmd_doctor(cfg, notify_test=args.notify_test, probe=args.probe,
-                          harness=getattr(args, "harness", False))
+                          harness=getattr(args, "harness", False),
+                          profiles=getattr(args, "profiles", False))
 
 
 # --------------------------------------------------------------------------
@@ -3930,6 +3931,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_doc.add_argument("--harness", action="store_true",
                        help="harness binaries served by the host (path, provenance, "
                             "interpreter) and runner units (L106)")
+    p_doc.add_argument("--profiles", action="store_true",
+                       help="#3345: runner profiles against the host config.json; "
+                            "non-zero on a divergence of train, github or release "
+                            "(database-free, for deployment checks)")
     p_doc.set_defaults(func=cmd_doctor)
 
     from . import canon_cli

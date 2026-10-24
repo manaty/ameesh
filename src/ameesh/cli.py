@@ -1967,10 +1967,51 @@ def host_measures_line(cfg: Config, reading: dict | None = None) -> str:
                                                                ", ".join(missing), note)
 
 
+def _profile_audit(cfg: Config):
+    """#3345 : les profils d'exécuteur de l'hôte face à `config.json`.
+
+    Rend un `config.ProfileAudit`, ou None si l'audit lui-même a échoué (un
+    diagnostic ne casse jamais). Le profil que CE processus lit est ajouté
+    même rangé hors du dossier (`"inherit": true`), pour que `ameesh doctor`
+    lancé sur un profil dise aussi sa divergence."""
+    extra = (cfg.config_path,) if cfg.config_base and cfg.config_path else ()
+    try:
+        return config_mod.audit_profiles(extra=extra)
+    except Exception:  # noqa: BLE001 — le doctor continue
+        return None
+
+
+def _print_profile_audit(audit) -> bool:
+    """Imprime les lignes `profiles` ; vrai si l'audit est en défaut."""
+    if audit.profiles or audit.errors or audit.divergences:
+        for line in audit.lines():
+            print(line)
+    if audit.ok:
+        return False
+    print("warning    : runner profile(s) under %s diverge from %s on the shared keys "
+          "(%s); keep only what a profile overrides, or align it"
+          % (audit.directory, audit.host, ", ".join(config_mod.SHARED_CONFIG_KEYS)))
+    return True
+
+
 def cmd_doctor(cfg: Config, notify_test: bool, probe: bool = False,
-               harness: bool = False) -> int:
+               harness: bool = False, profiles: bool = False) -> int:
     if probe:
         return cmd_probe(cfg)
+    if profiles:
+        # #3345 : contrôle léger et sans base, pour le déploiement
+        # (`deploy/mise-a-jour/{vm,poste}.sh`) : tout profil qui hérite de
+        # config.json doit s'accorder avec lui sur train, github et release.
+        audit = _profile_audit(cfg)
+        if audit is None:
+            print("profiles   : not checked (audit failed)")
+            return 1
+        if audit.profiles or audit.errors or audit.divergences:
+            ko = _print_profile_audit(audit)
+        else:
+            print("profiles   : none under %s" % audit.directory)
+            ko = False
+        return 1 if ko else 0
     if harness:
         # L106 : binaires des harnais et unités d'exécuteur de l'hôte
         from . import hostcheck
@@ -1994,6 +2035,14 @@ def cmd_doctor(cfg: Config, notify_test: bool, probe: bool = False,
         print("warning    : the configuration read here overrides the host `accounts` "
               "(%s); other runners of the host may use different accounts — a stale "
               "profile diverges silently" % cfg.config_path)
+    # #3345 : les autres profils de l'hôte, même si ce processus lit
+    # config.json — c'est le runner d'à côté qui divergeait en silence.
+    audit = _profile_audit(cfg)
+    profile_ko = False
+    if audit is None:
+        print("profiles   : not checked (audit failed)")
+    else:
+        profile_ko = _print_profile_audit(audit)
     from . import persona_memory
     from . import canon as canon_mod
     memory_note = ""
@@ -2088,6 +2137,10 @@ def cmd_doctor(cfg: Config, notify_test: bool, probe: bool = False,
     except db_mod.DbError:
         pass
     verdict = 0
+    # #3345 : un profil de l'hôte qui diverge sur train, github ou release
+    # n'est pas un état vert — le runner d'à côté ne fait pas la même chose.
+    if profile_ko:
+        verdict = 1
     # #2763 : installation éditable, ou ameesh chargé hors du venv déployé
     from . import venv_guard
     for problem in venv_guard.installation_problems():
@@ -2157,7 +2210,8 @@ def main(argv: list[str] | None = None) -> int:
                                additive_only="--additive-only" in rest)
         if command == "doctor":
             return cmd_doctor(cfg, notify_test="--notify-test" in rest,
-                              probe="--probe" in rest, harness="--harness" in rest)
+                              probe="--probe" in rest, harness="--harness" in rest,
+                              profiles="--profiles" in rest)
         if command == "statusline":
             return cmd_statusline(cfg)
         if command == "alias":
