@@ -1,0 +1,12 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Lot #3312: the drain pass every five minutes. An idle runner pass costs one
+# `needrestart -b` reading; a busy one is left alone until its job ends.
+[Unit]
+Description=ameesh CI: drain pass of outdated runners (#3312)
+
+[Timer]
+OnBootSec=5min
+OnUnitInactiveSec=5min
+
+[Install]
+WantedBy=timers.target
