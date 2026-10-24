@@ -200,18 +200,29 @@ def _audited_commit(db, cfg, canon, source) -> str:
     return canon_sync.audited_commit(db, cfg, canon, source)
 
 
-def _policy(cfg, db, project: str, paths: Sequence[str]) -> Policy | Unavailable:
-    """The first configured canon that declares a usable policy for `project`."""
+class NoCanon(RuntimeError):
+    """No configured canon can be read: the policy sources are unknown."""
+
+
+def policy_sources(cfg, db, project: str, errors: list):
+    """The configured canons whose compiled policy for `project` loads.
+
+    Yields `(source, commit, loaded)` in the designation's order: the
+    configured canons, the default one first, each Git source at its audited
+    commit. A refused source is named in `errors` and skipped. Raises
+    `NoCanon` (with the waiting reason) when no canon can be read at all.
+    The train's canon watch (#2914) reads the same sources, so the commit it
+    compares with its pin is the one the designation reads.
+    """
     if cfg is None or not str(getattr(cfg, "canon", "") or "").strip():
-        return Unavailable("no canon configured: no automatic designation", silent=True)
-    errors = []
+        raise NoCanon("no canon configured: no automatic designation")
     try:
         canons = canon_mod.load_configured(cfg)
     except Exception as exc:  # noqa: BLE001 - no readable canon: explicit wait
-        return Unavailable("cannot read the configured canon: %s: %s"
-                           % (type(exc).__name__, str(exc)[:200]))
+        raise NoCanon("cannot read the configured canon: %s: %s"
+                      % (type(exc).__name__, str(exc)[:200])) from exc
     if not canons:
-        return Unavailable("no readable canon configured: no review policy")
+        raise NoCanon("no readable canon configured: no review policy")
     for canon in canons:
         for source in getattr(canon, "sources", ()) or ():
             if source.mode != "git" or not source.repo or not source.commit:
@@ -233,6 +244,21 @@ def _policy(cfg, db, project: str, paths: Sequence[str]) -> Policy | Unavailable
                 continue
             try:
                 loaded = mechanics.load(source.repo, commit, project)
+            except (mechanics.MechanicsError, canon_mod.CanonError) as exc:
+                errors.append("%s@%s: %s" % (source.repo, commit[:12],
+                                             str(exc)[:240]))
+                continue
+            yield source, commit, loaded
+
+
+def _policy(cfg, db, project: str, paths: Sequence[str]) -> Policy | Unavailable:
+    """The first configured canon that declares a usable policy for `project`."""
+    if cfg is None or not str(getattr(cfg, "canon", "") or "").strip():
+        return Unavailable("no canon configured: no automatic designation", silent=True)
+    errors = []
+    try:
+        for source, commit, loaded in policy_sources(cfg, db, project, errors):
+            try:
                 need = loaded.reviews_for(paths)
                 # #2627 : le plancher critique de la porte de fusion
                 # (`merge_queue.required_verdicts`) fait partie du besoin. Un
@@ -260,6 +286,8 @@ def _policy(cfg, db, project: str, paths: Sequence[str]) -> Policy | Unavailable
                           ref=str(getattr(loaded, "source", "") or
                                   "%s@%s" % (source.repo, commit)),
                           commit=commit, source=source.repo)
+    except NoCanon as exc:
+        return Unavailable(str(exc))
     why = "; ".join(errors[:4]) or "no canon declares a review policy for %r" % (project,)
     return Unavailable("review policy unavailable at the audited canon commit: %s" % why)
 
