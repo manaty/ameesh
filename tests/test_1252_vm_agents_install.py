@@ -218,6 +218,12 @@ elif sys.argv[1] == 'show':
     print(json.dumps(row))
 elif sys.argv[1] == 'doctor':
     print('doctor ok')
+elif sys.argv[1:3] == ['role', 'timers']:
+    # #3311 x #3327 : `controler` vérifie les minuteries de rôle sous
+    # l'environnement du service (ameesh_agents) ; le banc l'accepte.
+    with (state / 'role-timers.log').open('a') as f:
+        f.write(' '.join(sys.argv[1:]) + '\n')
+    print('minuteries de rôle ok')
 else:
     sys.exit(2)
 '''

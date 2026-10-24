@@ -1498,8 +1498,10 @@ controler_agents() {
   # #3327 : un hôte candidat sans minuterie de rôle laisse le relevé GitHub
   # muet ; le contrôle échoue au lieu d'attendre la prochaine panne.
   etape "minuteries de rôle (EP5) sur $HOTE_AGENTS"
-  utilisateur_agents /home/ameesh/.local/share/ameesh/venv/bin/ameesh role timers --check \
-    || echec=1
+  # #3311 × #3327 : le CLI lit son DSN dans l'EnvironmentFile du service ; un
+  # appel direct sous runuser n'a pas cet environnement et échoue sur un hôte
+  # sain. `ameesh_agents` passe par systemd-run + EnvironmentFile, comme doctor.
+  ameesh_agents role timers --check || echec=1
   [ "$echec" = 0 ] || { echo "contrôles en échec" >&2; return 1; }
   echo "contrôles verts"
 }
@@ -1509,7 +1511,8 @@ timers_agents() {
   # hôte s'il est candidat du rôle élu. `role timers` refuse explicitement les
   # passes qui dépendent de `github.projects` quand la clé locale manque.
   etape "minuteries de rôle (EP5) sur $HOTE_AGENTS"
-  utilisateur_agents /home/ameesh/.local/share/ameesh/venv/bin/ameesh role timers --install
+  # #3311 × #3327 : même environnement que le service (DSN, canon, github).
+  ameesh_agents role timers --install
 }
 
 installer_agents() {
