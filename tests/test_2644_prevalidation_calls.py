@@ -807,6 +807,8 @@ class MapTest(unittest.TestCase):
 
         def runner(argv, **kw):
             if argv[:3] == ["gh", "run", "list"]:
+                self.assertIn("--branch", argv)
+                self.assertEqual(argv[argv.index("--branch") + 1], "main")
                 return SimpleNamespace(returncode=0, stdout='[{"databaseId": 42}]')
             if argv[:3] == ["gh", "run", "download"]:
                 target = argv[argv.index("-D") + 1]
@@ -821,6 +823,25 @@ class MapTest(unittest.TestCase):
         self.assertTrue(os.path.isfile(path))
         self.assertTrue(cleanup)
         shutil.rmtree(cleanup, ignore_errors=True)
+
+    def test_carte_artifact_is_only_read_from_main(self):
+        """#3352 : un run carte de PR ne fournit jamais la carte de la cible."""
+        root = tempfile.mkdtemp(prefix="ameesh-2644-map-")
+        self.addCleanup(shutil.rmtree, root, True)
+        seen = []
+
+        def runner(argv, **kw):
+            seen.append(list(argv))
+            if argv[:3] == ["gh", "run", "list"]:
+                return SimpleNamespace(returncode=0, stdout="[]")
+            raise AssertionError(argv)
+
+        self.assertEqual(calls.map_for("manaty/ameesh", root, runner=runner),
+                         ("", ""))
+        self.assertEqual(seen, [[
+            "gh", "run", "list", "--repo", "manaty/ameesh", "--workflow",
+            "carte.yml", "--branch", "main", "--status", "success",
+            "--limit", "1", "--json", "databaseId"]])
 
     def test_no_map_is_not_an_error(self):
         self.assertEqual(calls.map_for("", ""), ("", ""))
