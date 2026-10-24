@@ -544,8 +544,9 @@ def _removal_check(path: str, cfg, rules, allow, roots, agents) -> str:
     inventory is a doubt, never a proof that no clone depends on the
     candidate.
     """
-    if hk.worktree_in_use(path, allow=allow):
-        return "a process is working in it"
+    in_use, holder_detail = hk.worktree_holders(path, allow=allow)
+    if in_use:
+        return holder_detail
     saved = hk._git_copy_work(path, path, rules)
     if saved:
         return saved
@@ -746,8 +747,9 @@ def reap(db, host: str, cfg, *, roots, agents: dict, protected, dry_run: bool,
             if not dry_run:
                 entries.append(dict(base, action="signaled", detail=detail))
             continue
-        if hk.worktree_in_use(path, allow=allow):
-            detail = "a process is working in it; kept"
+        in_use, holder_detail = hk.worktree_holders(path, allow=allow)
+        if in_use:
+            detail = "%s; kept" % holder_detail
             plan.append(dict(base, action="garde", detail=detail))
             if not dry_run:
                 entries.append(dict(base, action="signaled", detail=detail))

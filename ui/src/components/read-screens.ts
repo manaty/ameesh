@@ -31,8 +31,11 @@ export class AmeeshProjects extends ReadView {
 export class AmeeshTimeline extends ReadView {
   headingKey = "view.timeline";
   protected override required = "project" as const;
+  // #3395: the light endpoint is cheap, but the screen is event-driven; do not
+  // restart a load at every event.
+  protected override minRefreshMs = 5000;
   protected load(client: Client, signal: AbortSignal) {
-    return client.get("/api/v1/projects/{project}/progress", { path: { project: this.project }, signal });
+    return client.get("/api/v1/projects/{project}/timeline", { path: { project: this.project }, signal });
   }
   #track(lot: Row, data: Row) {
     const m = object(lot.milestones), window = object(data.window);

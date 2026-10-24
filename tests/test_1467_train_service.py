@@ -73,6 +73,38 @@ class TrainServiceTest(unittest.TestCase):
         connect.assert_not_called()
         passage.scheduled_step.assert_not_called()
 
+    def test_a_live_pin_reload_is_reported_and_runs_before_the_passage(self):
+        """#3366: the service reloads the effective pin before composing."""
+        order = []
+
+        def refresh():
+            order.append("refresh")
+            return [{"project": "ameesh", "previous": "a" * 40, "pin": "b" * 40}]
+
+        passage = mock.Mock()
+
+        def step(db, now):
+            order.append("passage")
+            return {"result": "ci"}, 200
+        passage.scheduled_step.side_effect = step
+        service = self.service(passage, refresh=refresh)
+        with mock.patch("ameesh.scoped_db.ScopedDb", return_value=mock.Mock()):
+            self.assertEqual(service.pass_once(0, 100), 200)
+        self.assertEqual(order, ["refresh", "passage"])
+        self.assertIn("pin reloaded", service.report.call_args.args[0])
+
+    def test_a_bad_pin_reload_retries_without_a_passage(self):
+        passage = mock.Mock()
+
+        def broken():
+            raise RuntimeError("bad pin")
+        service = self.service(passage, clock=lambda: 100, refresh=broken)
+        with mock.patch("ameesh.scoped_db.ScopedDb") as connect:
+            self.assertEqual(service.pass_once(0, 100), 100 + train_runner.RELOAD_RETRY_S)
+        connect.assert_not_called()
+        passage.scheduled_step.assert_not_called()
+        self.assertIn("not reloaded", service.report.call_args.args[0])
+
     def test_cutoff_wait_uses_compiled_deadline_and_event_wakes_without_polling(self):
         service = self.service(mock.Mock(), clock=lambda: 100)
         seen = []
@@ -198,6 +230,7 @@ class TrainServiceTest(unittest.TestCase):
         passage = types.SimpleNamespace(policy=train.Policy(enabled=True), reservation=object())
         runner.train_passages, runner.train_service = [passage], None
         runner.cfg, runner.stop = object(), threading.Event()
+        runner.train_refresh = refresh = object()
         runner.once = runner.dry_run = runner.mediated = False
         with mock.patch.object(train_runner, "Service") as service:
             for guard in ("once", "dry_run", "mediated"):
@@ -215,4 +248,5 @@ class TrainServiceTest(unittest.TestCase):
             runner.start_train_service()
             runner.start_train_service()
             service.assert_called_once()
+            self.assertIs(service.call_args.kwargs["refresh"], refresh)
             service.return_value.start.assert_called_once_with()

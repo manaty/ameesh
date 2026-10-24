@@ -22,7 +22,9 @@ over every configured canon, and the compiled model families.
   already in flight runs to its terminal outcome.
 
 The pin never follows the gate by itself: a new commit must be qualified and
-configured by the pilot (#1467). The gate's commit is read, never written.
+configured by the pilot (#1467). The service re-reads the configured pin at
+each passage (#3366), so a requalified pin needs no runner restart. The
+gate's commit is read, never written.
 """
 from __future__ import annotations
 
@@ -260,7 +262,11 @@ class Watch:
                       "changer, qualifier un nouveau canon (#1467).")
         else:
             follow = ("- Aucun suivi automatique (#1467) : qualifier le commit de "
-                      "la porte, puis l'épingler dans la configuration de l'hôte.")
+                      "la porte, puis l'épingler dans la configuration de l'hôte.\n"
+                      "- Requalification mécanique si le diff pin..porte ne touche ni "
+                      "`processus/mecanique.yaml` ni `federation.yaml` : "
+                      "python -m ameesh.train_cli --project %s requalify --lot <lot>."
+                      % self.project)
         body = "\n".join([
             "Train %s (%s) : %s." % (self.project, mode, reading.describe()),
             "",

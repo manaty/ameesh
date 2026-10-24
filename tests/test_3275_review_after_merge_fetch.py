@@ -99,6 +99,19 @@ class RefreshBeforeMergeIntervalTest(unittest.TestCase):
         self.assertEqual(of_lot.call_args.kwargs.get("head"), frozen)
         self.assertEqual(_git(shared, "rev-parse", "origin/develop"), merged)
 
+    def test_3384_commit_absent_puis_rapatrie_a_la_passe_suivante(self):
+        shared = self._shared()
+        frozen, merged = self._merge_lot()
+        with mock.patch.object(lot_measures, "refresh_target", return_value="fetch indisponible"):
+            first, of_lot = self._class(shared, frozen=frozen, merged=merged)
+        self.assertTrue(first.get("doubt"), first)
+        of_lot.assert_not_called()
+        self.assertFalse(lot_measures.has_commit(shared, merged))
+        second, of_lot = self._class(shared, frozen=frozen, merged=merged)
+        self.assertFalse(second.get("doubt"), second)
+        self.assertTrue(lot_measures.has_commit(shared, merged))
+        of_lot.assert_called_once()
+
     def test_2_clone_a_une_branche_la_refspec_explicite_rapporte_la_cible(self):
         shared = self._shared("--single-branch", "--branch", "main")
         frozen, merged = self._merge_lot()
