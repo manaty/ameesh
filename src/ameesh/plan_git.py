@@ -2280,35 +2280,59 @@ def _was_ancestor_at_seen(repo: str, sha: str, target: str, when) -> bool:
     return False
 
 
-def _published_target_containing(repo: str, sha: str, target: str,
-                                 cache: dict) -> str | None:
-    """#3326 : la pointe `sha` est-elle déjà livrée dans la cible publiée ?
+def _published_target_state(repo: str, sha: str, target: str,
+                            cache: dict) -> tuple[str, str | None]:
+    """#3326 : la pointe `sha` est-elle dans la cible publiée ?
 
     Vérifié avant d'enregistrer `branch_head` : si la forge porte déjà la
     pointe, ce n'est pas un travail propre de la branche, même quand la ref
-    du clone est en retard (fetch best-effort). Lecture `git ls-remote` au
-    plus une fois par relevé et par (dépôt, branche) via `cache` ; forge
-    illisible, ou commit absent du clone : None, pas de conclusion."""
+    du clone est en retard (fetch best-effort). Trois réponses, jamais deux :
+    `("contained", ref)`, `("absent", None)` quand l'absence est **prouvée**,
+    ou `("unknown", pourquoi)` quand elle ne l'est pas (forge illisible, tête
+    publiée absente du clone) — l'appelant ne doit alors rien enregistrer :
+    une cible qu'on n'a pas pu lire n'est pas une preuve de non-appartenance
+    (relecture cx1 : forge C, clone A, pointe B présente, C absente).
+
+    Lecture `git ls-remote` au plus une fois par relevé et par (dépôt,
+    branche) via `cache` ; la tête publiée manquante est rapatriée par le
+    fetch borné de #1772 quand le clone est partiel, puis relue."""
     name = _target_branch(target)
     if not name:
-        return None
+        return "unknown", "the target %r names no branch" % target
     for ref in _target_refs(repo, target):
         if ref == target:
             continue
         tip = _commit(repo, ref)
         if tip and _is_ancestor(repo, sha, tip):
-            return ref
+            return "contained", ref
     key = (repo, name)
     if key not in cache:
         kind, value = _remote_head(repo, name)
-        cache[key] = value if kind == "sha" else None
-    published = cache[key]
-    if not published:
-        return None
+        cache[key] = (kind, value)
+    kind, published = cache[key]
+    if kind == "local":
+        # pas de forge : la cible locale est la référence, et la pointe en est
+        # déjà absente (l'appelant est dans la branche « en avance »).
+        return "absent", None
+    if kind == "absent":
+        if str(target).startswith(("refs/remotes/", "origin/")):
+            return "unknown", ("origin/%s is absent from the forge while the clone "
+                               "still names it" % name)
+        return "absent", None
+    if kind == "error":
+        return "unknown", published
+    if published == sha:
+        return "contained", "origin/" + name
     tip = _commit(repo, published)
-    if published == sha or (tip and _is_ancestor(repo, sha, tip)):
-        return "origin/" + name
-    return None
+    if tip is None:
+        _fetch_missing(repo, published, target)
+        tip = _commit(repo, published)
+    if tip is None:
+        return "unknown", ("the published head %s of %s is absent from the clone"
+                           % (published[:12], name))
+    if _is_ancestor(repo, sha, tip):
+        return "contained", "origin/" + name
+    return "absent", None
 
 
 def _content_ancestor(repo: str, sha: str, target: str, *,
@@ -3174,14 +3198,25 @@ def sync_branches(db, *, host: str | None = None, agents=None, dry_run: bool = F
                 # #3326 : une cible en retard (fetch best-effort) fait voir en
                 # avance une pointe que la forge porte déjà : ce n'est pas un
                 # travail propre, rien n'est enregistré, le lot reste ouvert.
-                delivered = _published_target_containing(
+                # Une cible illisible ou une tête publiée absente du clone ne
+                # prouve pas l'absence : l'observation n'est pas enregistrée
+                # (relecture cx1 : distinguer « absent » de « inconnu »).
+                state, detail = _published_target_state(
                     repo, found["tip"], target, fresh_heads)
-                if delivered:
-                    entry.update(
-                        how="no-work",
-                        detail="%s (%s) is already in %s, read fresh: no work of "
-                               "its own (the clone's target %s is behind)"
-                               % (branch, found["tip"][:12], delivered, target))
+                if state == "contained":
+                    entry["how"] = "no-work"
+                    if entry["result"] != "off-target":
+                        entry["detail"] = (
+                            "%s (%s) is already in %s, read fresh: no work of "
+                            "its own (the clone's target %s is behind)"
+                            % (branch, found["tip"][:12], detail, target))
+                elif state == "unknown":
+                    entry["how"] = "unverified"
+                    if entry["result"] != "off-target":
+                        entry["detail"] = (
+                            "%s (%s) is not recorded: the published target %s "
+                            "cannot be read (%s)"
+                            % (branch, found["tip"][:12], target, detail))
                 elif not dry_run:
                     # #346 r2 : une pointe inchangée relevée avant la fusion
                     # partielle l'est de nouveau, puisqu'elle est encore là

@@ -585,6 +585,46 @@ class BranchMergeTest(_Base):
         self.assertIn("no work of its own", second["detail"])
         self.assertEqual(work.get(self.db, lot["id"])["state"], "intake")
 
+    def test_tete_publiee_absente_du_clone_n_est_pas_enregistree(self):
+        """#3326 (relecture cx1) : la forge est à C, le clone à A, la branche
+        naît sur B — présent localement, C absent. Un fetch refusé ne permet
+        pas de prouver que B n'est pas dans la cible publiée : rien n'est
+        enregistré, et la cible rafraîchie ne ferme pas le lot."""
+        _bare, other = self.origin()
+        _git(other, "checkout", "-q", "-B", "develop", "origin/develop")
+        # B part sur une ref séparée, puis la forge avance à C sur develop.
+        with open(os.path.join(other, "b"), "w") as fh:
+            fh.write("b\n")
+        _git(other, "add", "b")
+        _git(other, "commit", "-qm", "B")
+        b = _git(other, "rev-parse", "HEAD")
+        _git(other, "push", "-q", "origin", "HEAD:refs/heads/bonly")
+        with open(os.path.join(other, "c"), "w") as fh:
+            fh.write("c\n")
+        _git(other, "add", "c")
+        _git(other, "commit", "-qm", "C")
+        c = _git(other, "rev-parse", "HEAD")
+        _git(other, "push", "-q", "origin", "HEAD:refs/heads/develop")
+        # le clone récupère B seulement ; C reste absent de son dépôt.
+        _git(self.repo, "fetch", "-q", "origin", "bonly:refs/tmp/b")
+        self.assertEqual(b, _git(self.repo, "rev-parse", "refs/tmp/b"))
+        self.assertNotEqual(b, _git(self.repo, "rev-parse", "origin/develop"))
+        with self.assertRaises(AssertionError):
+            _git(self.repo, "cat-file", "-e", c)
+        _git(self.repo, "branch", "agent/dev1-publiee-absente", "refs/tmp/b")
+        lot = self.lot("agent/dev1-publiee-absente")
+        # la ref de cible du clone est en retard et le fetch du relevé échoue.
+        with mock.patch.object(plan_git, "git_fetch", return_value="fetch refused"):
+            first = self.sync()["results"][0]
+        self.assertEqual(first["result"], "open", first)
+        self.assertIn("not recorded", first["detail"])
+        self.assertIsNone(work.get(self.db, lot["id"])["branch_head"])
+        # la cible rafraîchie ne prouve aucun travail propre.
+        second = self.sync()["results"][0]
+        self.assertEqual(second["result"], "open", second)
+        self.assertIn("no work of its own", second["detail"])
+        self.assertEqual(work.get(self.db, lot["id"])["state"], "intake")
+
     def test_avance_rapide_apres_un_releve(self):
         self.branch("agent/dev1-ff", "f1")
         lot = self.lot("agent/dev1-ff")
