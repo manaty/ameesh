@@ -305,12 +305,17 @@ class AssemblyTest(unittest.TestCase):
         self.assertEqual(passage.canon.pin, new)
         # the next passage reads the gate at the new pin; its rules follow it
         passage.canon.reader = lambda db: (new, "")
+        db = object()
         with mock.patch.object(train_canon, "gate_rules_gap", return_value="") as gap:
-            self.assertEqual(passage.canon.rules(object()), "")
+            self.assertEqual(passage.canon.rules(db), "")
             self.assertTrue(passage.canon.read(None).aligned)
-        self.assertEqual(gap.call_args.args[2], "ameesh")
-        self.assertEqual(gap.call_args.kwargs["pin"], new)
-        self.assertEqual(gap.call_args.kwargs["canon_path"], self.canon.root)
+        # the first call is the passage's rules closure: (db, cfg, project, ...)
+        first = gap.call_args_list[0]
+        self.assertIs(first.args[0], db)
+        self.assertIs(first.args[1], passage.cfg)
+        self.assertEqual(first.args[2], "ameesh")
+        self.assertEqual(first.kwargs["pin"], new)
+        self.assertEqual(first.kwargs["canon_path"], self.canon.root)
         # a non-pin assembly change is a restart, never a silent half-reload
         changed = types.SimpleNamespace(
             host="host-a", train=dict(self.config, mode="active", projects={

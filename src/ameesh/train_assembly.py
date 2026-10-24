@@ -503,7 +503,7 @@ def _passage(cfg, spec: ProjectConfig, mode, report):
             reservation=reservation, candidate=candidate, initial=initial, canon=canon)
 
     def rules(db, passage=passage):
-        return train_canon.gate_rules_gap(cfg, db, spec.name,
+        return train_canon.gate_rules_gap(db, cfg, spec.name,
                                           canon_path=passage.policy_path,
                                           pin=passage.canon.pin)
     canon.rules = rules
