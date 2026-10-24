@@ -109,6 +109,21 @@ class PendingReviewsTest(t2447._ActivationFixture, PgTestCase):
                        after_commit=[])
         self.assertEqual(act.pending_reviews(self.db, "r1"), [])
 
+    def test_the_command_defaults_to_the_bound_identity(self):
+        # B de la relecture dev3 : sans AGENT, la commande lit l'identité liée
+        # (elle levait UnboundLocalError) ; AGENT et --all restent possibles.
+        lot, sha = self.pending_lot("r1")
+        out = self.mesh("work", "pending-reviews", env=self.env(AGENT_MAIL_NAME="r1"))
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn("#%d [qa]" % lot, out.stdout)
+        self.assertIn(sha[:12], out.stdout)
+        out = self.mesh("work", "pending-reviews", "r2")
+        self.assertEqual((out.returncode, out.stdout.strip()),
+                         (0, "no pending review for r2"), out.stderr)
+        out = self.mesh("work", "pending-reviews", "--all", "--json")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn('"name": "r1"', out.stdout)
+
     def test_an_unreadable_queue_is_said_never_empty(self):
         with mock.patch.object(self.db, "query", side_effect=RuntimeError("boom")):
             lines = reprise.pending_review_lines(self.db, "r1")
