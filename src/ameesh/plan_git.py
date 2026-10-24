@@ -409,7 +409,12 @@ def remote_reachable(repo: str, rev: str, remote: str = "origin", *,
             commit = tip
         else:
             continue                # arbre/blob : ne contient aucun commit
-        if commit == full or _is_ancestor(repo, full, commit):
+        if commit == full:
+            return True
+        ancestor = _is_ancestor_checked(repo, full, commit)
+        if ancestor is None:
+            return None             # histoire illisible : doute, jamais absence
+        if ancestor:
             return True
     if not pending_heads and not pending_extra:
         return False
@@ -430,8 +435,14 @@ def remote_reachable(repo: str, rev: str, remote: str = "origin", *,
             return None
     for tip in pending:
         commit = local_commit(repo, tip)
-        if commit is not None and (
-                commit == full or _is_ancestor(repo, full, commit)):
+        if commit is None:
+            return None             # pointe rapatriée illisible : doute
+        if commit == full:
+            return True
+        ancestor = _is_ancestor_checked(repo, full, commit)
+        if ancestor is None:
+            return None             # histoire illisible après fetch : doute
+        if ancestor:
             return True
     return False
 
@@ -2444,6 +2455,20 @@ def _off_target_citations(repo: str, lot: int, row: dict, all_merges: list,
 def _is_ancestor(repo: str, sha: str, ref: str) -> bool:
     """`git merge-base --is-ancestor` : une commande, sans lecture d'objet."""
     return _git(repo, "merge-base", "--is-ancestor", sha, ref).returncode == 0
+
+
+def _is_ancestor_checked(repo: str, sha: str, ref: str) -> bool | None:
+    """`merge-base --is-ancestor` en trois états : True, False, None.
+
+    Git sort **1** aussi bien pour « pas ancêtre » que pour une histoire
+    illisible (objet manquant) ; dans le second cas il écrit sur stderr
+    (`error: Could not read <objet>`). Le code seul confondrait donc absence
+    et panne de lecture (#3399 B2 cx1). Toute sortie d'erreur, tout code hors
+    0/1, est un doute : l'appelant refuse au lieu de conclure à l'absence."""
+    proc = _git(repo, "merge-base", "--is-ancestor", sha, ref)
+    if proc.stderr.strip() or proc.returncode not in (0, 1):
+        return None
+    return proc.returncode == 0
 
 
 def _target_tip_at(repo: str, target: str, when) -> str | None:

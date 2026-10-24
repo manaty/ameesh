@@ -261,6 +261,41 @@ class DanglingSupersedeWithRemoteTest(_DanglingSupersededFreezeFixture):
         self.assertIsNone(plan_git.remote_reachable(
             self.repo.root, self.op, extra_budget=0))
 
+    def test_an_unreadable_ancestry_is_a_doubt_not_an_absence(self):
+        # Témoin cx1 (23:08Z) : base -> A -> M -> C, C poussé sous archive,
+        # reset local sur base puis objet M supprimé du clone. `merge-base
+        # A C` sort 1 AVEC stderr « Could not read M » : ce n'est pas une
+        # absence, et le remplacement doit être refusé (None).
+        self.add_remote()
+        tree = self.repo.git("rev-parse", self.op + "^{tree}")
+        middle = self.repo.git("commit-tree", tree, "-p", self.op,
+                               "-m", "middle", env=self.env("impl"))
+        child = self.repo.git("commit-tree", tree, "-p", middle,
+                              "-m", "child", env=self.env("impl"))
+        self.repo.git("push", "-q", "origin",
+                      "%s:refs/archive/kept-descendant" % child)
+        self.repo.git("reset", "--hard", self.base)
+        gitdir = self.repo.git("rev-parse", "--git-dir")
+        if not os.path.isabs(gitdir):
+            gitdir = os.path.join(self.repo.root, gitdir)
+        os.remove(os.path.join(gitdir, "objects", middle[:2], middle[2:]))
+        self.assertTrue(plan_git._history_complete(self.repo.root))
+        self.assertFalse(plan_git.ref_reachable(self.repo.root, self.op))
+        self.assertIsNone(plan_git.remote_reachable(self.repo.root, self.op))
+        with self.assertRaises(work.WorkError) as caught:
+            self.supersede()
+        self.assertIn("cannot", str(caught.exception))
+
+    def test_an_unreadable_ancestry_after_fetch_is_a_doubt(self):
+        # Même doute sur la passe après rapatriement : la pointe est lue,
+        # mais son ascendance ne l'est pas. Le code ne doit pas la sauter.
+        bare = self.add_remote()
+        self.archive_descendant(bare, "refs/archive/kept-descendant")
+        with mock.patch.object(plan_git, "_is_ancestor_checked",
+                               return_value=None):
+            self.assertIsNone(
+                plan_git.remote_reachable(self.repo.root, self.op))
+
     def test_an_unrelated_archive_descendant_still_proves_absence(self):
         # Contrôle négatif : une ref d'archive hors de l'ascendance du gel ne
         # doit pas faire refuser le remplacement (preuve d'absence réelle).
