@@ -8,15 +8,16 @@ from . import plan_github, storage
 def _observer_hint(settings) -> str:
     """Où regarder, sans faire passer la configuration locale pour l'observateur.
 
-    Sur une VM qui ne porte pas la clé `github`, `settings.host` est vide :
-    écrire « github.host (not designated) » laisserait croire que c'est cet
-    hôte-là qui devait relever, alors que la lecture est partagée et faite
-    ailleurs (#2957).
+    #3327 : l'observation est portée par la minuterie d'un rôle élu, installée
+    sur chaque candidat. `github.host` reste le repère historique : sur une VM
+    qui ne porte pas la clé `github`, il est vide, et l'absence de cette clé ne
+    décrit pas l'hôte qui relève (#2957).
     """
+    timer = "the elected role's timer (`ameesh role timers --check`)"
     if settings.host:
-        return "github.host (%s)" % settings.host
-    return ("github.host on the designated observer (not set in this host's "
-            "local configuration; the reading is shared)")
+        return "%s and the designated observer github.host (%s)" % (timer, settings.host)
+    return ("%s; github.host on the designated observer is not set in this host's "
+            "local configuration (the reading is shared)" % timer)
 
 
 def alerts(cfg, db, now: float, *, fresh_s: float) -> list[dict]:
@@ -51,7 +52,7 @@ def alerts(cfg, db, now: float, *, fresh_s: float) -> list[dict]:
             "github_observation_stale", None, seen,
             round(age) if age is not None else None, round(fresh_s),
             "GitHub observation of %s: last complete reading %s; expected within "
-            "%d min. Check %s, ameesh-notify on that host, and the gh "
+            "%d min. Check %s, ameesh-notify on the observer host, and the gh "
             "token/authentication" % (
                 repo, last, fresh_s // 60, _observer_hint(settings)),
             repo=repo, reason=key, last_seen_ts=seen))

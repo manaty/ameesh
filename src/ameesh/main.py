@@ -140,6 +140,10 @@
         l'époque du bail est passée à la commande pour la garde EP4 ;
   ameesh role status [ROLE] [--json]   elected roles: holder, epoch, ranked
                                         candidates (L165); the runners publish;
+  ameesh role timers [--role R] [--install|--check|--remove] [--no-apply] [--no-sync] [--json]
+        L165 (EP5) : pose (ou vérifie) les minuteries mécaniques de la veille
+        GitHub sur cet hôte, s'il est candidat du rôle élu ; sans clé `github`,
+        les passes CI et issues sont refusées explicitement (§9) ;
   ameesh run [options]        the machine's runner; `agent-runner` remains
         an alias;
   ameesh serve --exec-only --auth-file FILE [--listen HOST:PORT] …
@@ -278,6 +282,10 @@ def _dispatch(argv: list[str] | None) -> int:
         # `role status` (EP2) : les deux sous-commandes vivent dans `role`.
         from . import role_run
         return role_run.main(rest[1:])
+    if command == "role" and rest[:1] == ["timers"]:
+        # L165 (EP5) : pose des minuteries mécaniques sur un hôte candidat.
+        from . import role_timers
+        return role_timers.main(rest[1:])
     if command == "module":
         from . import modules
         return modules.main(rest)

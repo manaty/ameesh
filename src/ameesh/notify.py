@@ -1670,9 +1670,14 @@ class Notifier:
             self.log("GitHub issues: pass failed (%s)" % _clean(exc, 200))
 
     def _github_inputs(self, db, now: float) -> None:
-        """#2845: feed external issues/comments to the canonical watcher."""
-        if not getattr(self.cfg, "github", None):
-            return
+        """#2845: feed external issues/comments to the canonical watcher.
+
+        The watched repositories and cadences come from the canon's
+        ``github_watch`` cards, not from the host's ``github`` key: a role
+        timer on a candidate host must collect them even when that key is
+        absent (#3327). The watcher's own host gate (``role_run``) decides
+        whether this host may run.
+        """
         from . import github_watch
         try:
             if self._github_watcher is None:

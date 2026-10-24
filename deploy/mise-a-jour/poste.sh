@@ -29,8 +29,13 @@
 #   redemarrer   exécuteurs du poste un par un (arrêt prouvé avant chaque
 #                démarrage), puis notify, puis les exécuteurs de l'ancienne base
 #                refusé depuis une unité ameesh-* (risque de tuer le script)
+#   timers       pose les minuteries mécaniques EP5 (veille GitHub, CI,
+#                projection) sur cet hôte s'il est candidat du rôle élu ;
+#                refuse explicitement les passes dont la clé `github` manque
+#                (#3327)
 #   controler    doctor, budget, accounts list, projects, alerts ; vérifie aussi
-#                le venv réellement exécuté par le MainPID de notify
+#                le venv réellement exécuté par le MainPID de notify et les
+#                minuteries de rôle
 #   retour       bascule en arrière vers le venv précédent conservé (sans pip),
 #                puis redémarre (sans toucher aux bases : 0041 à 0047 sont
 #                additives)
@@ -653,6 +658,13 @@ controler_notify() {
     || { echo "ameesh-notify : MainPID changé pendant le contrôle, relancer controler" >&2; return 1; }
 }
 
+timers() {
+  # #3327 : le poste est candidat du rôle élu ; ses minuteries mécaniques
+  # remplacent les passes GitHub du service complet, limité aux alertes.
+  etape "minuteries de rôle (EP5)"
+  "$AMEESH" role timers --install
+}
+
 controler() {
   local echecs=()
   verif() { etape "$*"; "$@" || echecs+=("$*"); }
@@ -662,6 +674,7 @@ controler() {
   verif "$AMEESH" projects
   verif "$AMEESH" alerts
   verif controler_notify
+  verif "$AMEESH" role timers --check
   etape "exécuteurs en échec"
   systemctl --user list-units 'ameesh-*' --state=failed --plain --no-legend || true
   if ancienne; then
@@ -882,6 +895,7 @@ case "${1:-}" in
   installer) installer "${2:-HEAD}" ;;
   migrer) shift; migrer "$@" ;;
   role) role ;;
+  timers) timers ;;
   redemarrer) redemarrer ;;
   controler) controler ;;
   retour) retour ;;
