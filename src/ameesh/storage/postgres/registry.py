@@ -441,6 +441,13 @@ class Agents(interface.Agents):
                    (SELECT r.relit FROM agent_registry r WHERE r.name=o.name) AS relit,
                    chantier, harness, host, cwd, session_id, status, status_text,
                    model, budget_usd, spent_usd, turns, pending_prompt, last_error,
+                   -- #3337 : un message déposé est un signe de vie distinct de
+                   -- `last_seen` (hook/exécuteur). L'index (sender, id desc)
+                   -- rend la lecture ponctuelle ; une identité `externe` écrit
+                   -- sans exécuteur, son `last_seen` ne bouge donc pas.
+                   (SELECT extract(epoch from m.created_at)::float8
+                      FROM agent_mailbox m WHERE m.sender = o.name
+                     ORDER BY m.id DESC LIMIT 1) AS last_mail_ts,
                    lease_owner, lease_epoch, lease_expires_ts, last_seen_ts, last_turn_ts,
                    public_key_fingerprint, key_role, key_ready, has_owner_key, unread,
                    passive_unread,
