@@ -141,7 +141,7 @@ class Recorded:
                 self.db, item, freeze, commits, self.path, self.families,
                 reference=reference, reference_families=reference_families,
                 provider=self.provider, strict=True,
-                base=base, head=head)
+                base=base, head=head, target=base)
             if unknown:
                 raise TrainError("unknown historical author for commit %s" % unknown[0])
             missing_family = [entry for entry in authors if not entry["family"]]
