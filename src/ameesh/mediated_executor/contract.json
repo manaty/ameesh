@@ -4406,7 +4406,7 @@
     "natural": false
    },
    "rules": [
-    "Delivery lease of a due scheduled wake: wake_claim_at is set and a 'wake: scheduled wake delivered' journal line is written; the due date stays armed until consume_wake, and a claim not consumed expires after claim_ttl_s."
+    "Delivery lease of a due scheduled wake: wake_claim_at is set, nothing is journaled; the due date stays armed until consume_wake, a claim not consumed expires after claim_ttl_s, and the holder renews it with claim_ttl_s=0 while the launch is prepared."
    ]
   },
   {
@@ -4454,7 +4454,7 @@
     "natural": false
    },
    "rules": [
-    "Clears the claimed due date only when it is still the same wake_ts; a deadline re-armed in the meantime is preserved."
+    "Clears the claimed due date only when it is still the same wake_ts; a deadline re-armed in the meantime is preserved. The consumption writes the single 'wake: scheduled wake delivered' journal line in the same transaction."
    ]
   }
  ],

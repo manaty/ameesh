@@ -248,6 +248,9 @@ class RelectureConfigTest(unittest.TestCase):
         worker.apply_restart_if_requested = lambda: None
         worker._apply_pending_config = lambda: AgentWorker._apply_pending_config(worker)
         worker.rotate_for_lot = lambda spec: spec
+        # #2614 : le choix du tour passe par `_pick_for_turn` (pick + bascule)
+        worker._pick_for_turn = lambda: AgentWorker._pick_for_turn(worker)
+        worker._forget_wake_claim = lambda: None
         worker._moved_before_turn = lambda spec: False
         observations = []
         # Les gardes de rotation et de sélection lisent les comptes AVANT
