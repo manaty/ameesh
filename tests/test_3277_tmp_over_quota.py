@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import dataclasses
 import os
+import stat
 import time
 import unittest
 from unittest import mock
@@ -291,6 +292,21 @@ class OverQuotaTest(PgTestCase):
         self.assertTrue(os.path.exists(target))
         self.assertEqual([e for e in report["entries"] if e["action"] == "deleted"], [])
         self.assertEqual(report["plan"], [])
+
+    def test_a_symlinked_entry_never_opens_its_target(self):
+        # codex cx1 r3 B1: `os.walk` follows a starting path that is a link
+        lot = self.ended_lot()
+        outside = os.path.join(self.state, "outside", "readonly")
+        _write(os.path.join(outside, "keep"))
+        os.chmod(outside, 0o500)
+        self.addCleanup(os.chmod, outside, 0o700)
+        _write(os.path.join(self.old, "scratch", "f"), 6 * BIG)
+        os.symlink(outside, os.path.join(self.old, "diag%d" % lot))
+        _age(self.old, 2 * DAY)
+        self._pass(self._former(), later=LATER)
+        self.assertFalse(os.path.lexists(os.path.join(self.old, "diag%d" % lot)))
+        self.assertEqual(stat.S_IMODE(os.stat(outside).st_mode), 0o500)
+        self.assertTrue(os.path.exists(os.path.join(outside, "keep")))
 
     @unittest.skipIf(os.getuid() == 0, "root reads every directory")
     def test_a_subtree_of_another_user_is_left_out_not_a_doubt(self):

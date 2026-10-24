@@ -284,7 +284,11 @@ def check(db, *, troot: str, name: str, agent: str, owner: str, key: str,
                                  "detail": detail})
                     if dry_run:
                         continue
-                    hk._make_owned_dirs_writable(child["path"])
+                    # #3277 r3 (codex cx1 B1) : `os.walk` suit un chemin de
+                    # départ qui est un lien, même `followlinks=False` : un
+                    # lien n'est jamais ouvert en écriture, seul le lien part
+                    if not os.path.islink(child["path"]):
+                        hk._make_owned_dirs_writable(child["path"])
                     try:
                         hk._safe_rmtree(child["path"], troot)
                     except (OSError, hk.RefusedDeletion) as exc:
