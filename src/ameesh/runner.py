@@ -1511,10 +1511,17 @@ class AgentWorker(threading.Thread):
             listing = registry.overview(self.db)
             row = next((r for r in listing if r.get("name") == self.name),
                        self.agent or {})
+            by_name = {r["name"]: r for r in listing}
             for project in projects_mod.agent_projects(row or {}):
                 for pilot in alert_briefs.project_pilots(project, listing,
                                                          cfg=self.cfg, db=self.db):
-                    if pilot and pilot != self.name:
+                    pilot_row = by_name.get(pilot) or {}
+                    # project_pilots se replie sur tous les pilotes pour une
+                    # base rouge ; une relance au repos reste dans le projet.
+                    matches = (project in projects_mod.agent_projects(pilot_row)
+                               or project == (pilot_row.get("workstream")
+                                              or pilot_row.get("chantier") or ""))
+                    if pilot and pilot != self.name and matches:
                         return pilot
         except Exception:  # noqa: BLE001 - une relance ne casse jamais le choix du tour
             return ""

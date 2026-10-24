@@ -71,6 +71,25 @@ class IdlePilotTest(TestCase):
     def test_an_agent_without_project_writes_to_nobody(self):
         self.assertEqual(self.pilot_of("nobody"), "")
 
+    def test_no_cross_project_fallback_with_the_real_pilot_router(self):
+        listing = [{"name": "ameesh-dev2", "projects": ["ameesh"]},
+                   {"name": "orchestrateur", "projects": ["nexlink"]}]
+        with mock.patch.object(registry, "overview", return_value=listing), \
+                mock.patch("ameesh.sous_utilisation.alert_orchestrators",
+                           return_value=["orchestrateur"]):
+            pilot = runner.AgentWorker._idle_pilot(_worker("ameesh-dev2"))
+        self.assertEqual(pilot, "")
+        self.assertNotIn("agent-mail send", adapters.idle_prompt(pilot))
+
+    def test_a_secondary_project_is_tried_if_the_primary_has_no_pilot(self):
+        listing = [{"name": "both", "projects": ["other", "ameesh"]},
+                   {"name": "mesh-design", "projects": ["ameesh"]},
+                   {"name": "orchestrateur", "projects": ["nexlink"]}]
+        with mock.patch.object(registry, "overview", return_value=listing), \
+                mock.patch("ameesh.sous_utilisation.alert_orchestrators",
+                           return_value=["orchestrateur", "mesh-design"]):
+            self.assertEqual(runner.AgentWorker._idle_pilot(_worker("both")), "mesh-design")
+
     def test_an_unreadable_registry_writes_to_nobody(self):
         with mock.patch.object(registry, "overview", side_effect=RuntimeError("db down")):
             self.assertEqual(runner.AgentWorker._idle_pilot(_worker("ameesh-dev2")), "")
