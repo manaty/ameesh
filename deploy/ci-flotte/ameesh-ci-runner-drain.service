@@ -1,0 +1,13 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# Lot #3312: restart, between two jobs, the GitHub Actions runners that
+# needrestart deferred after an unattended upgrade (needrestart-ameesh-ci.conf).
+# Installed by deploy/ci-flotte/install.sh; started by its timer.
+[Unit]
+Description=ameesh CI: restart outdated runners only between two jobs (#3312)
+After=apt-daily-upgrade.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/ameesh-ci-runner-drain --needrestart
+# 3 = runners still busy: kept until their job ends, the next pass takes them
+SuccessExitStatus=3
