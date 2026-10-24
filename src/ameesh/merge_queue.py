@@ -809,6 +809,32 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
             name, family = str(entry or "").strip(), ""
         if name and family:
             provided.setdefault(name.lower(), family)
+    # #3397 : la porte se ferme sans lire la plage gelée quand les `ok` de la
+    # tête sont déjà trop peu nombreux pour atteindre le compte requis, quels
+    # que soient leurs auteurs. `_attribution_on_freeze` lit Git sur chaque
+    # fichier de la plage (des dizaines de secondes sur un gros lot sensible)
+    # et la passe d'alertes (`_review_gate_open`) l'appelait pour rendre ce
+    # refus. Compter les `ok` par acteur suffit : la lecture des auteurs ne
+    # peut qu'en écarter, jamais en ajouter. Sans connexion (banc, porte
+    # appelée sans base), la lecture est de toute façon impossible : le chemin
+    # historique garde son message d'échec fermé.
+    latest_ok = [mark for mark in latest.values()
+                 if (mark.get("verdict") or "") == "ok"]
+    if len(latest_ok) < required and callable(getattr(db, "query", None)):
+        accepted = [{"actor": str(mark.get("actor") or ""),
+                     "family": _family_of(mark.get("actor")),
+                     "id": mark.get("id"), "at_ts": mark.get("at_ts")}
+                    for mark in sorted(latest_ok, key=_mark_order)]
+        out["accepted"] = accepted
+        need = ("two independent verdicts from different model families, neither from "
+                "an author's" if required >= 2 else "one verdict from another agent")
+        got = ", ".join("%s (%s)" % (entry["actor"] or "?",
+                                     entry["family"] or "famille inconnue")
+                        for entry in accepted) or "aucun"
+        out["why"] = ("no review verdict ok on the freeze %s (class: %s): %d independent "
+                      "review verdict(s) required, %s; got %s"
+                      % (frozen[:12], cls, required, need, got))
+        return out
     # #2726 : la porte lit elle-même la plage gelée quand l'appelant ne passe
     # pas les auteurs — le feu, la file et le paquet, qui ne les lisaient pas.
     # La même lecture rend les correcteurs (#2739) et échoue fermé quand la
