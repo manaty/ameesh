@@ -640,14 +640,16 @@ class SupersededGhostFreezeTest(_RewriteFixture):
 
     def test_supersedes_a_present_freeze_is_refused(self):
         # #2989 N1 (revue dev2) : la marque ne vaut que pour un fantôme prouvé.
-        # Le gel de la tête A est encore lisible : le remplacer effacerait ses
-        # auteurs si sa récupération venait à échouer (refus fermé B5).
+        # Le gel de la tête A est encore accessible par une ref : le remplacer
+        # effacerait ses auteurs si sa récupération venait à échouer (refus
+        # fermé B5). #3399 : c'est l'accessibilité par une ref qui décide, pas
+        # la seule présence de l'objet dans l'ODB.
         present = next(row for row in work.milestones(self.db, self.lot)
                        if row.get("kind") == "frozen"
                        and row.get("sha") == self.head_a)
         with self.assertRaises(work.WorkError) as caught:
             self.freeze(self.head_b, supersedes=[present["id"]])
-        self.assertIn("readable", str(caught.exception))
+        self.assertIn("reachable from a ref", str(caught.exception))
         self.assertIn("proven ghost", str(caught.exception))
 
     def test_supersedes_is_refused_for_a_verdict(self):
