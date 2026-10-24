@@ -79,6 +79,7 @@
   "budget.chooseProject": "Choose a project to load plan gauges.",
   "app.show": "Show",
   "timeline.legend": "Timeline: development, review, then approved to merge. Dates are also shown in the table.",
+  "timeline.truncated": "Timeline truncated: {shown} of {total} lots shown (limit {limit}).",
   "state.intake": "To do",
   "state.build": "In progress",
   "state.qa": "Review",

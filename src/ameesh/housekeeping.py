@@ -207,6 +207,9 @@ VOLUMES_TOP = 20
 #: entrée ; l'hôte qui a déclaré des processus illisibles sans doute
 #: (`unreadable_ok`) repose alors la question avec son allow
 HOLDERS_UNREADABLE = "holders unreadable"
+#: #3396 : la clé du canon qui excuse un démon par son nom ; dite dans le plan
+#: pour que l'opérateur sache quoi déclarer quand gpg-agent retient tout
+UNREADABLE_OK_HINT = "policy.housekeeping.unreadable_ok if it is a daemon"
 #: L162 : systèmes de fichiers en mémoire — jamais une racine gérée
 MEMORY_FS = ("tmpfs", "ramfs")
 #: L162 : l'action attendue quand le tmpfs se remplit (alertes, journal)
@@ -2135,8 +2138,9 @@ def tmp_git_work(path: str, rules=(), *,
         work = _git_copy_work(copy, path, rules)
         if work:
             return work
-        if worktree_in_use(copy):
-            return "%s: a process is working in it" % copy
+        in_use, detail = worktree_holders(copy)
+        if in_use:
+            return "%s: %s" % (copy, detail)
     if doubt:
         return "copies not fully inspected (%s)" % doubt
     return ""
@@ -2190,7 +2194,18 @@ def tmp_holder(path: str, allow=()) -> str:
     if "command line" in why or "ligne de commande" in why:
         why = "path on the command line"
     return "held by process %s (%s: %s)" % (first.get("pid"), why,
-                                           (first.get("cmd") or "")[:80])
+                                           holder_name(first))
+
+
+def holder_name(holder: dict) -> str:
+    """Le nom d'un détenteur de `platform.holders`, bon pour le journal
+    partagé : la base de son argv[0], jamais l'argv (#3403 : identifiant de
+    session, DSN avec mot de passe, en-tête curl passés en argument)."""
+    name = holder.get("name")
+    if not name:
+        words = (holder.get("cmd") or "").split(None, 1)
+        name = os.path.basename(words[0]) if words else ""
+    return name or holder.get("why") or "?"
 
 
 def tmp_user_holder(path: str, procs=None) -> str:
@@ -2872,17 +2887,48 @@ def lot_of_worktree(db, agent: str, path: str, branch: str = "",
     return None
 
 
-def worktree_in_use(path: str, allow=()) -> bool:
-    """Un processus de l'hôte travaille-t-il dans ce worktree (dossier courant
-    ou fichier ouvert dedans) ? Lu par la couche plateforme (L63). Si l'OS ne
-    permet pas de le savoir, la réponse est OUI (fail-closed) : le worktree
-    attend plutôt que d'être retiré sous les pieds d'un agent. `allow` (L230) :
-    noms des processus dont l'illisibilité n'est pas un doute — le choix de
-    l'hôte, vide par défaut ; un détenteur CONSTATÉ reste rapporté."""
+def worktree_holders(path: str, allow=()) -> tuple[bool, str]:
+    """(tenu, détail) d'un worktree : un détenteur CONSTATÉ, ou le doute qui
+    nomme les processus illisibles (#3396).
+
+    Lu par la couche plateforme (L63). Si l'OS ne permet pas de le savoir, la
+    réponse est OUI (fail-closed) : le worktree attend plutôt que d'être retiré
+    sous les pieds d'un agent ; le détail le dit, au lieu du « a process is
+    working in it » qui faisait passer un doute pour une observation. `allow`
+    (L230) : noms des processus dont l'illisibilité n'est pas un doute — le
+    choix de l'hôte, vide par défaut ; un détenteur CONSTATÉ reste rapporté."""
     try:
-        return bool(platform.holders(_real(path), allow=allow))
-    except platform.NotAvailable:
-        return True
+        found = platform.holders(_real(path), allow=allow)
+    except platform.NotAvailable as exc:
+        names = getattr(exc, "holders", None)
+        if names:
+            return True, "%s: %s; %s" % (HOLDERS_UNREADABLE, ", ".join(names),
+                                         UNREADABLE_OK_HINT)
+        return True, "%s (%s)" % (HOLDERS_UNREADABLE,
+                                  getattr(exc, "reason", str(exc)))
+    if not found:
+        return False, ""
+    return True, "processes inside (%s)" % ", ".join(
+        "%s %s" % (holder.get("pid"), holder_name(holder)) for holder in found[:3])
+
+
+def worktree_in_use(path: str, allow=()) -> bool:
+    """Un processus de l'hôte travaille-t-il dans ce worktree ? Fail-closed :
+    un doute répond OUI. `worktree_holders` dit lequel des deux (#3396)."""
+    return worktree_holders(path, allow=allow)[0]
+
+
+def _blocked_by_holders(blocked: dict, detail: str) -> None:
+    """#3396 : un doute sur les processus retient un worktree d'un lot FINI.
+
+    `blocked` compte ces worktrees et garde le premier détail — celui qui
+    nomme les processus illisibles et la clé du canon — pour le relevé de
+    l'hôte (`housekeeping_blocked`). Un détenteur constaté n'est pas un doute
+    et ne compte pas."""
+    if not detail.startswith(HOLDERS_UNREADABLE):
+        return
+    blocked["count"] = int(blocked.get("count") or 0) + 1
+    blocked.setdefault("detail", detail)
 
 
 def current_branch(path: str) -> tuple[bool, str]:
@@ -3170,7 +3216,8 @@ def _worktree_pass(db, host: str, *, dry_run: bool,
                    protected: set[str], now: float,
                    running: set | None = None, artifacts=None,
                    allow=(), lock_path: str | None = None, journal_path: str | None = None,
-                   skip_roots=(), known_agents=()) -> tuple[list[dict], list[dict]]:
+                   skip_roots=(), known_agents=(),
+                   blocked: dict | None = None) -> tuple[list[dict], list[dict]]:
     """Fin de lot des worktrees suivis : (lignes du journal, plan lisible).
 
     Garde-fous (L73b) avant tout retrait : worktree attribué à l'agent du
@@ -3199,9 +3246,15 @@ def _worktree_pass(db, host: str, *, dry_run: bool,
     #1665 : un worktree orphelin — aucun lot nommé par sa branche ou son
     dossier — suit la même fin, mais après `ORPHAN_WORKTREE_IDLE_S` (24 h)
     d'inactivité, propre et poussé (la branche reste) ; c'est le ménage que
-    l'owner a demandé le 15/10 14:50."""
+    l'owner a demandé le 15/10 14:50.
+
+    `blocked` (#3396) : le dict que le passage remplit quand un doute sur les
+    processus retient le retrait de worktrees de lots FINIS — `count` et le
+    premier `detail` (qui nomme les processus et la clé du canon) ; le relevé
+    d'hôte en fait l'alerte `housekeeping_blocked` après six heures."""
     entries: list[dict] = []
     plan: list[dict] = []
+    blocked = blocked if blocked is not None else {}
     running = set(running or ())
     store = storage.of(db).housekeeping
     # #2174: every tracked worktree — with the 500 oldest stuck, a capped
@@ -3235,9 +3288,9 @@ def _worktree_pass(db, host: str, *, dry_run: bool,
         if lot is None:
             # Un processus dans le worktree : inutile de lire Git, on attend
             # (le test #2167 exige qu'aucune lecture Git ne soit faite).
-            if worktree_in_use(path, allow=allow):
-                plan.append(dict(base, action="attend",
-                                 detail="a process is working in it"))
+            in_use, holder_detail = worktree_holders(path, allow=allow)
+            if in_use:
+                plan.append(dict(base, action="attend", detail=holder_detail))
                 continue
             # La branche enregistrée est une trace, pas la vérité : un
             # worktree change de branche après la découverte (`topic` puis
@@ -3336,9 +3389,12 @@ def _worktree_pass(db, host: str, *, dry_run: bool,
             continue
         # #2167: holders (including unreadable processes) can retain the
         # whole host's worktrees; do not pay for Git before that decision.
-        if worktree_in_use(path, allow=allow):
+        in_use, holder_detail = worktree_holders(path, allow=allow)
+        if in_use:
+            if ended:
+                _blocked_by_holders(blocked, holder_detail)
             plan.append(dict(base, action="attend",
-                             detail="%s; a process is working in it" % why))
+                             detail="%s; %s" % (why, holder_detail)))
             continue
         # #3266 (relecture cx3) : une attribution persistée n'est qu'une trace,
         # comme `row.branch` : la branche a pu changer depuis (`topic` →
@@ -3410,9 +3466,12 @@ def _worktree_pass(db, host: str, *, dry_run: bool,
                     "command": "git -C %s status ; git -C %s log --all --not --remotes"
                                % (shlex.quote(path), shlex.quote(path))}))
             continue
-        if worktree_in_use(path, allow=allow):
+        in_use, holder_detail = worktree_holders(path, allow=allow)
+        if in_use:
+            if ended:
+                _blocked_by_holders(blocked, holder_detail)
             plan.append(dict(base, action="attend",
-                             detail="%s; a process is working in it" % why))
+                             detail="%s; %s" % (why, holder_detail)))
             continue
         detail = "%s: kept — %s" % (why, st["reason"])
         # L230: a worktree kept although its lot is merged goes once kept
@@ -3446,9 +3505,15 @@ def _worktree_pass(db, host: str, *, dry_run: bool,
             else:
                 procs = platform.user_paths(allow=allow)
                 held = procs.holders(path)
-                hold = procs.doubt() or (
-                    "processes inside (%s)" % ", ".join(held[:3]) if held else "")
+                doubt = procs.doubt()
+                if doubt:
+                    hold = "%s (%s)" % (HOLDERS_UNREADABLE, doubt)
+                else:
+                    hold = ("processes inside (%s)" % ", ".join(held[:3])
+                            if held else "")
             if hold:
+                if ended:
+                    _blocked_by_holders(blocked, hold)
                 plan.append(dict(base, action="garde", detail="%s; %s" % (detail, hold)))
                 continue
             why = "%s; %s, clean and pushed" % (
@@ -4589,6 +4654,8 @@ def _run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool =
     # L230: one deleting pass at a time on the host, and the journal of its trash dirs
     lock_path = os.path.join(cfg.state_dir, MANAGED_DIR, "artifacts.lock")
     journal_path = os.path.join(cfg.state_dir, MANAGED_DIR, "artifacts.journal")
+    #: #3396 : worktrees de lots finis qu'un doute sur les processus retient
+    wt_blocked: dict = {}
     # 3. worktrees
     if policy.worktrees and registered is None:
         # sans registre, ni dossiers d'agents ni tours en cours connus
@@ -4610,7 +4677,8 @@ def _run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool =
                                              journal_path=journal_path,
                                              skip_roots=(troot, croot, cfg.state_dir)
                                              + _shared_roots(),
-                                             known_agents=registered or ())
+                                             known_agents=registered or (),
+                                             blocked=wt_blocked)
         entries += wt_entries
         plan += wt_plan
         # 3c. #2743: ad-hoc clones of ended lots (dry run by default);
@@ -4704,6 +4772,15 @@ def _run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool =
     except Exception as exc:
         report_measure["docker_network"] = None
         skipped.append("docker networks: not read (%s)" % type(exc).__name__)
+    if wt_blocked:
+        # #3396 : le doute tient des worktrees de lots finis. Le relevé le dit,
+        # et l'épisode garde son début d'un passage à l'autre (alerte
+        # `housekeeping_blocked` après HOUSEKEEPING_BLOCKED_S).
+        previous = storage.of(db).housekeeping.last_measure(host)
+        old = ((previous[0].get("data") or {}).get("worktrees_blocked")
+               if previous else None)
+        since = float(old.get("since")) if old and old.get("since") else now
+        report_measure["worktrees_blocked"] = dict(wt_blocked, since=since)
     if not dry_run:
         entries.append({"kind": "mesure", "action": "measured", "path": troot,
                         "bytes": report_measure["tmp_bytes"] + report_measure["cache_bytes"],

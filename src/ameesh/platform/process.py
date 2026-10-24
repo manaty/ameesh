@@ -672,7 +672,9 @@ def holders(path: str | None, needle: str | None = None, exclude=(), *,
     séparé ou lié par `=`) ; le même identifiant CITÉ dans un brief, un
     message ou un chemin n'est pas un détenteur (#1283). #248 : avec `mapped`,
     aussi l'exécutable et les fichiers projetés en mémoire (module natif
-    `.node`, binaire electron). Chaque détenteur : `{"pid", "why", "cmd"}`.
+    `.node`, binaire electron). Chaque détenteur : `{"pid", "why", "cmd",
+    "name"}` — `cmd` est l'argv, à ne jamais écrire en base (#3403) ; `name`
+    sa base d'argv[0].
 
     Les processus illisibles (autre utilisateur, disparus) sont ignorés, mais
     si ce processus-ci ne peut même pas lire SES fichiers ouverts, si l'OS
@@ -862,10 +864,24 @@ def _owner(proc):
     return uids.effective
 
 
+class HoldersUnreadable(NotAvailable):
+    """#3396 : des processus du même utilisateur refusent la lecture de leurs
+    fichiers ouverts, et aucun détenteur n'a été constaté. `holders` nomme
+    « pid nom » ceux qui restent après les relectures : le doute se dit, il ne
+    se déguise pas en « un processus travaille dedans »."""
+
+    def __init__(self, holders) -> None:
+        self.holders = [str(holder) for holder in holders]
+        super().__init__("file holders",
+                         "open files of process(es) of this user unreadable: %s"
+                         % ", ".join(self.holders[:5]))
+
+
 def _settle(doubts: dict, again) -> None:
     """L63b: `doubts` (pid -> who) read again by `again(pid)` (who, or None)
     until none is left or `DOUBT_RETRIES` is spent; what is left is
-    `NotAvailable`: an empty list would say "nobody holds it" unchecked."""
+    `HoldersUnreadable` (#3396, a `NotAvailable` that names them): an empty
+    list would say "nobody holds it" unchecked."""
     import time
     for _ in range(DOUBT_RETRIES):
         if not doubts:
@@ -873,9 +889,7 @@ def _settle(doubts: dict, again) -> None:
         time.sleep(DOUBT_RETRY_S)
         doubts = {pid: who for pid in doubts for who in [again(pid)] if who}
     if doubts:
-        raise NotAvailable("file holders",
-                           "open files of process(es) of this user unreadable: %s"
-                           % ", ".join(list(doubts.values())[:5]))
+        raise HoldersUnreadable(list(doubts.values()))
 
 
 #: Sélecteurs de session d'une ligne de commande : une reprise en cours nomme
@@ -989,7 +1003,11 @@ def _verdict(pid: int, hit: str, argv: list[str], needle, exclude,
         elif any(needle in a for a in argv[1:]):
             hit = "session id on the command line"
     if hit:
-        return {"pid": pid, "why": hit, "cmd": " ".join(argv)[:160]}
+        # #3403 : `name` (base de argv[0]) est ce qui peut s'écrire au journal
+        # partagé ; `cmd` porte l'argv (identifiant de session, secret passé
+        # en argument possibles) et reste à l'usage local de l'appelant.
+        return {"pid": pid, "why": hit, "cmd": " ".join(argv)[:160],
+                "name": os.path.basename(argv[0]) if argv else ""}
     return None
 
 

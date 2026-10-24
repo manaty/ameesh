@@ -23,6 +23,7 @@ from pathlib import Path
 from ameesh import db as db_mod
 from ameesh import fil, httpkit, mesh_cli, registry, serve, storage, work
 from ameesh import resources as res
+from ameesh import version as package_version
 
 from .support import PgTestCase
 from .test_l159a_capacity_guard import errors as schema_errors
@@ -138,6 +139,9 @@ class DefencesTest(ServerMixin, unittest.TestCase):
         self.assertEqual(schema_errors(serve.SCHEMAS["ameesh-discovery/1"], data), [])
         self.assertEqual((data["organisation"], data["api"], data["approve_url"]),
                          ("Example", "/api/v1", "https://approve.example"))
+        # #3394: the discovery version is the package version, not the frozen
+        # ACP protocol number of `ameesh.__version__`.
+        self.assertEqual(data["version"], package_version())
         status, data = self.get_json("/api/v1/openapi.json", auth=False)
         self.assertEqual((status, data), (200, serve.openapi()))
 
@@ -301,6 +305,7 @@ class ServePgTest(ServerMixin, PgTestCase):
             "/api/v1/me": "/api/v1/me",
             "/api/v1/projects": "/api/v1/projects",
             "/api/v1/projects/{project}/progress": "/api/v1/projects/demo/progress?since=2d",
+            "/api/v1/projects/{project}/timeline": "/api/v1/projects/demo/timeline?since=2d",
             "/api/v1/agents": "/api/v1/agents",
             "/api/v1/agents/{agent}": "/api/v1/agents/a1",
             "/api/v1/agents/{agent}/peek": "/api/v1/agents/a1/peek",
@@ -332,6 +337,27 @@ class ServePgTest(ServerMixin, PgTestCase):
             schema = components["schemas"][route.schema.replace("/", "-")]
             self.assertEqual(schema_errors(schema, data), [], route.path)
             self.assertEqual(data["schema"], route.schema)
+
+    def test_timeline_is_the_light_progress_view(self):
+        # #3395: the Chronologie endpoint says the same lots as the progress
+        # snapshot without the sections it never reads (1.1 MB, 39-48 s).
+        status, full = self.get_json("/api/v1/projects/demo/progress?since=2d")
+        self.assertEqual(status, 200)
+        status, light = self.get_json("/api/v1/projects/demo/timeline?since=2d")
+        self.assertEqual(status, 200)
+        self.assertEqual(set(light),
+                         {"schema", "generated_ts", "project", "window", "lots",
+                          "truncated"})
+        self.assertEqual(light["truncated"].get("lots"),
+                         full["truncated"].get("lots"))
+        self.assertEqual([lot["id"] for lot in light["lots"]],
+                         [lot["id"] for lot in full["lots"]])
+        self.assertEqual([(lot["state"], (lot.get("waiting_for") or {}).get("what"))
+                          for lot in light["lots"]],
+                         [(lot["state"], (lot.get("waiting_for") or {}).get("what"))
+                          for lot in full["lots"]])
+        status, data = self.get_json("/api/v1/projects/demo/timeline?since=never")
+        self.assertEqual((status, data["error"]), (400, "bad_query"))
 
     def test_same_serialisation_as_the_cli(self):
         def cli(*argv):

@@ -849,6 +849,13 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
         out["why"] = ("no review verdict ok on the freeze %s (class: %s): %d independent "
                       "review verdict(s) required, %s; got %s"
                       % (frozen[:12], cls, required, need, got))
+        # #3397 : le retour anticipé garde le diagnostic du chemin historique
+        # (#2928) : les verdicts écartés faute de reçu exact sont déjà lus
+        # ci-dessus, sans Git ; sans ce suffixe, la porte refusée pour un
+        # verdict sensible sans reçu ne disait plus pourquoi il ne comptait pas.
+        if unproven:
+            out["why"] += ("; %d verdict(s) without an exact provenance receipt were "
+                           "not counted (sensitive class, #2928)" % len(unproven))
         if unfiltered:
             out["why"] += ("; these %d ok verdict(s) are not proven independent "
                            "(no author reading)" % len(unfiltered))

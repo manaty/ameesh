@@ -11,12 +11,15 @@ const progress = { schema: "ameesh-progress/1", generated_ts: stamp,
     accounts: [{ harness: "codex", account: "primary", active: true, gauges: [{ key: "5h", used: 0.4, pace_cap: 0.6, resets_ts: stamp + 500 }] }],
     real: [{ provider: "deepseek", real_spent: 0.12, currency: "USD", period: "24h" }], plans: [],
   } };
+const timeline = { schema: "ameesh-timeline/1", generated_ts: stamp,
+  window: { from_ts: stamp - 400, to_ts: stamp }, lots: [lot] };
 const routes = {
   "/.well-known/ameesh": [200, { organisation: "Acme", version: "1.11", mode: "local" }],
   "/api/v1/me": [200, { human: "human:ada", language: "en" }],
   "/api/v1/projects": [200, { projects: [project] }],
   "/api/v1/projects?project=ameesh": [200, { projects: [project] }],
   "/api/v1/projects/ameesh/progress": [200, progress],
+  "/api/v1/projects/ameesh/timeline": [200, timeline],
   "/api/v1/agents/ada": [200, { agent: { name: "ada", key_ready: true } }],
   "/api/v1/alerts": [200, { alerts: [{ type: "stale", agent: "ada", responsible: "human:ada", detail: "Needs attention" }] }],
   "/api/v1/hosts": [200, { hosts: [{ host: "laptop", max_agents: 4, responsible: "human:ada",

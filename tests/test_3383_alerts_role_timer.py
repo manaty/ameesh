@@ -167,9 +167,11 @@ class AlertsTimerTest(unittest.TestCase):
         # would silence this host's local delivery and briefs
         text = self.dropin.read_text(encoding="utf-8")
         self.assertIn("--skip issues,github-watch,ci\n", text)
-        problems = role_timers.check(report, directory=self.dir, apply=False)
+        # #3402: named, but a missing secret no longer fails --check
+        self.assertEqual(role_timers.check(report, directory=self.dir, apply=False), [])
+        notes = role_timers.warnings(report)
         self.assertTrue(any(p.startswith("alerts: human:owner has no route")
-                            and "notify key" in p for p in problems), problems)
+                            and "notify key" in p for p in notes), notes)
 
     def test_a_route_added_later_updates_the_dropin_and_check_sees_the_old_one(self):
         role_timers.install(plan(notify_humans=[]), directory=self.dir, apply=False)

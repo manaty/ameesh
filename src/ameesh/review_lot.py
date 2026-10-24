@@ -1481,7 +1481,7 @@ def merged_sha(db, lot: int) -> str:
 def _warn_unopened(db, entries: list[dict]) -> str:
     """#3201 : les relectures manquantes faute de dépôt, dites aux pilotes.
 
-    Un simple journal ne se lit pas. La **première** tentative d'un lot sans
+    Un simple journal ne se lit pas. La **deuxième** tentative d'un lot sans
     dépôt connu envoie un courrier durable aux pilotes déclarés, qui nomme les
     lots et le geste de reprise (`ameesh work merged <id> --sha <merge>
     --repo <clone>`, idempotent). Best effort : sans pilote déclaré ou sans
@@ -1575,7 +1575,7 @@ def catch_up(db, *, repo: str = "", target: str = "",
     tentatives sans création marquées, `already` : relecture ouverte entre la
     sélection et le geste, `reviewed` : avis déjà rendu sur la tête fusionnée,
     `terminal` : candidats clos par la marque terminale, `unopened` : lots de
-    la première tentative restés sans dépôt — #3201, `warning` : ce qui a été
+    la deuxième tentative restés sans dépôt — #3384, `warning` : ce qui a été
     fait de l'avertissement aux pilotes)."""
     out = {"examined": 0, "missing": 0, "opened": 0, "already": 0,
            "reviewed": 0, "attempted": 0, "terminal": 0, "failed": 0, "bound": "",
@@ -1679,13 +1679,15 @@ def catch_up(db, *, repo: str = "", target: str = "",
                 out["attempted"] += 1
                 why = str(done.get("why") or "?")
                 mark(lot, state, "sans ouverture: %s" % why)
-                # #3201 : la première fois qu'un lot reste sans dépôt, le
-                # pilote reçoit un avertissement (une fois par lot, agrégé en
-                # fin de passe) — le journal seul ne se lit pas.
-                if seen == 1 and why.startswith("dépôt inconnu"):
-                    out["unopened"].append({
-                        "lot": lot, "why": why, "state": state,
-                        "title": row.get("title") or "", "sha": sha or ""})
+            # #3384 : laisser une passe au clone pour devenir lisible.
+            # Une classe confirmée au passage suivant sort plus haut, sans
+            # courrier. La deuxième tentative avertit une seule fois, même
+            # si elle épuise la borne configurée.
+            why = str(done.get("why") or "?")
+            if seen == 2 and why.startswith("dépôt inconnu"):
+                out["unopened"].append({
+                    "lot": lot, "why": why, "state": state,
+                    "title": row.get("title") or "", "sha": sha or ""})
         except Exception:  # noqa: BLE001 - un lot en panne n'arrête pas le rattrapage
             out["failed"] += 1
             mark(lot, state, "erreur")

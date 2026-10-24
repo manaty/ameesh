@@ -6,7 +6,8 @@ import time
 import unittest
 from unittest import mock
 
-from ameesh import housekeeping as hk, housekeeping_clones as clones, registry, storage, work
+from ameesh import housekeeping as hk, housekeeping_clones as clones, platform, registry, storage, work
+from ameesh.platform import process
 from tests.support import PgTestCase
 from tests.test_l73_housekeeping import _Cfg, _git, _repo, _sans_processus
 
@@ -350,6 +351,25 @@ class CloneReapTest(PgTestCase):
         mixed = self.clone("a1-%s" % lot)
         self.assertEqual(self.plan_for(mixed)["action"], "retrait")
 
+    def test_a_secret_on_the_holder_argv_stays_out_of_the_journal(self):
+        """#3403 (témoin) : l'entrée « signaled » du journal partagé nomme le
+        détenteur par pid et base d'argv[0], jamais par son argv."""
+        _sans_processus(self)
+        secret = "s3cr3t-3403"
+        lot = self.ended_lot()
+        path = self.clone("copy-%s-x" % lot)
+        argv = ["/usr/bin/psql", "postgresql://u:%s@db/x" % secret,
+                "--resume", "sess-" + secret]
+        found = [process._verdict(42, "working directory", argv, None, ())]
+        with mock.patch.object(platform, "holders", return_value=found):
+            entries, plan, skipped = self.reap(dry_run=False)
+        signaled = [e for e in entries if e["path"] == path]
+        self.assertEqual([e["action"] for e in signaled], ["signaled"])
+        self.assertIn("processes inside (42 psql)", signaled[0]["detail"])
+        self.assertNotIn(secret, repr(entries))
+        self.assertNotIn(secret, repr(plan))
+        self.assertTrue(os.path.isdir(path))
+
     def test_recent_activity_keeps_the_clone(self):
         _sans_processus(self)
         lot = self.ended_lot()
@@ -401,7 +421,7 @@ class SeparateGitDirTest(unittest.TestCase):
             dependents, doubt = clones._dependents(copies, [source])
             self.assertEqual(doubt, "")
             self.assertIn(other, dependents[source])
-            with mock.patch.object(hk, "worktree_in_use", return_value=""), \
+            with mock.patch.object(hk, "worktree_holders", return_value=(False, "")), \
                     mock.patch.object(hk, "_git_copy_work", return_value=""):
                 self.assertIn("alternate dependent", clones._removal_check(
                     source, cfg, (), (), (root,), {}))

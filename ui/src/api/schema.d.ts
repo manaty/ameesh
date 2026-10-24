@@ -462,6 +462,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/v1/projects/{project}/timeline": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Timeline of a project: its lots, window and rendering cut (#3395, #3401) */
+        get: operations["projects_project_timeline"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/v1/threads/{project}": {
         parameters: {
             query?: never;
@@ -686,6 +703,14 @@ export interface components {
             project: string;
             /** @constant */
             schema: "ameesh-thread/1";
+        };
+        "ameesh-timeline-1": {
+            generated_ts: number;
+            lots: Record<string, never>[];
+            /** @constant */
+            schema: "ameesh-timeline/1";
+            truncated?: Record<string, never>;
+            window: Record<string, never>;
         };
     };
     responses: never;
@@ -2735,6 +2760,67 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["ameesh-progress-1"];
+                };
+            };
+            /** @description bad request */
+            400: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-error-1"];
+                };
+            };
+            /** @description token missing or refused */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-error-1"];
+                };
+            };
+            /** @description not found */
+            404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-error-1"];
+                };
+            };
+            /** @description database unavailable */
+            503: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-error-1"];
+                };
+            };
+        };
+    };
+    projects_project_timeline: {
+        parameters: {
+            query?: {
+                /** @description window: 90m, 24h, 2d or an ISO date */
+                since?: string;
+            };
+            header?: never;
+            path: {
+                project: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Timeline of a project: its lots, window and rendering cut (#3395, #3401) */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ameesh-timeline-1"];
                 };
             };
             /** @description bad request */

@@ -1469,6 +1469,13 @@ class WorkItems(Domain):
         `current` (compare-and-set, no lost concurrent correction)."""
 
     @abc.abstractmethod
+    def set_priority(self, item_id: int, priority: int, *, current: int | None,
+                     reason: str, actor: str) -> dict | None:
+        """#3370: journaled priority correction, if the lot still carries
+        `current` (compare-and-set, NULL included, no lost concurrent
+        correction)."""
+
+    @abc.abstractmethod
     def without_project(self) -> list[dict]:
         """L118c: open lots with empty app, once per id, including waiting_human."""
 
@@ -3490,8 +3497,10 @@ class Operations(Domain):
         « aujourd'hui » : `today`, jour ISO, par défaut le jour local de
         l'hôte, jamais celui du fuseau de la base),
         dernier tour du grand livre (`last_turn_reread_tokens` = entrée +
-        entrée en cache, `last_turn_session`, `last_turn_recorded_ts`) et
-        demande de redémarrage (`restart_requested_ts`)."""
+        entrée en cache, `last_turn_session`, `last_turn_recorded_ts`),
+        demande de redémarrage (`restart_requested_ts`) et `ephemeral`
+        (#3411 : un agent éphémère ne prend jamais de travail
+        automatiquement)."""
 
     @abc.abstractmethod
     def request_restart(self, name: str, brief: str) -> dict | None:

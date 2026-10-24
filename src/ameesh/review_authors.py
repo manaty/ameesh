@@ -2095,7 +2095,12 @@ def _carried_from_previous(db, item: Mapping, milestone: Optional[Mapping],
         retiré le correctif. La preuve de contenu de #3220 s'applique alors aux
         commits que la plage courante ne couvre pas ; ceux qu'elle couvre sont
         filtrés par `_surviving_review_commits`. Une lecture impossible rend
-        `True` (le doute garde l'exclusion)."""
+        `True` (le doute garde l'exclusion).
+
+        `every=True` exige que toutes les corrections de l'acteur survivent ;
+        `every=False` (défaut) en exige une. #3338 : la trace « correcteur »
+        d'un gel antérieur suit la règle de `_surviving_review_commits`, une
+        correction qui survit suffit."""
         shas = written.get(actor) or []
         if not shas:
             return False
@@ -2264,7 +2269,11 @@ def _carried_from_previous(db, item: Mapping, milestone: Optional[Mapping],
                     plan_git.full_commit_id(value) in current_set
                     for value in actor_commits):
                 continue
-            if not survives(written, stored, actor, every=True, content=True):
+            # #3338 : une correction qui survit suffit, comme dans
+            # `_surviving_review_commits` (la docstring le dit déjà) ; exiger
+            # `every=True` retirait la trace d'un correcteur dont une seule
+            # correction survit.
+            if not survives(written, stored, actor, content=True):
                 continue
             if actor in correctors:
                 continue

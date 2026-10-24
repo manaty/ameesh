@@ -79,6 +79,8 @@ from . import versions as versions_mod
 from . import work as work_mod
 
 SCHEMA = "ameesh-progress/1"
+#: la Chronologie de /ui/ (#3395) : les lots et leur fenêtre, rien de plus
+TIMELINE_SCHEMA = "ameesh-timeline/1"
 DEFAULT_SINCE = "24h"
 #: bornes de lecture : une vue, pas un export complet de la base
 MAX_LOTS = 500
@@ -941,25 +943,13 @@ def build_overview(projects: list[dict], lots: list[dict], milestones: list[dict
     return cards
 
 
-def snapshot(db, cfg=None, *, since: str | None = None, project: str | None = None,
-             book: cost_mod.CostBook | None = None, now: float | None = None,
-             max_lots: int = MAX_LOTS, max_actions: int = MAX_ACTIONS,
-             stale_after: float | None = None, gantt: bool = True,
-             github: "versions_mod.Reader | None" = None) -> dict:
-    """L'instantané `ameesh-progress/1` (voir docs/PROGRESS.md).
+def _lots_view(db, st, cfg, *, since_ts, project, now, max_lots, threshold):
+    """Les lots d'un instantané, et les tables dont ils dépendent.
 
-    Les bornes (`max_lots`, `max_actions`) ne limitent que le RENDU : les
-    lots ouverts passent avant les fusionnés, et les jalons et l'état d'un
-    lot affiché sont lus sans borne (son journal complet, toutes ses
-    actions). Toute coupure est dite dans `truncated`.
-
-    `github` (L160f) : le lecteur GitHub des versions, partagé par `--serve`
-    (cache) ; None : les versions ne sont pas lues, la vue le dit.
-    """
-    now = time.time() if now is None else float(now)
-    since_ts = parse_since(since, now)
-    store = storage.of(db)
-    st = store.progress
+    `snapshot` et `timeline` passent par ici : les deux vues disent donc le
+    même état, les mêmes jalons et le même `waiting_for`. C'est la partie
+    coûteuse d'un instantané (une lecture par lot) ; la Chronologie ne
+    demande qu'elle (#3395)."""
     items = st.lots(since_ts=since_ts, project=project, limit=max_lots)
     items.sort(key=lambda i: (i.get("created_ts") or 0, int(i["id"])))
     ids = [int(i["id"]) for i in items]
@@ -976,7 +966,6 @@ def snapshot(db, cfg=None, *, since: str | None = None, project: str | None = No
     declared = _declared_milestones(st, ids)
     package_rows = st.packages()
     packages = {p["id"]: p for p in package_rows}
-    threshold = stagnation.stale_after() if stale_after is None else float(stale_after)
     messages = {int(r["work_item_id"]): r.get("last_ts") for r in st.lot_messages(ids)}
     all_agents = st.agents(None)
     states, externals = stagnation.availability_of(all_agents)
@@ -988,11 +977,17 @@ def snapshot(db, cfg=None, *, since: str | None = None, project: str | None = No
     dependencies = work_dependencies.grouped(db, ids)
     # #1664 : le flux ciblé du stockage (transitions + notes hold/levée) ;
     # jamais le journal entier ni le texte des notes ordinaires.
+    # #3395 : l'autorisation d'un hold charge le canon ; hors fenêtre de
+    # cache, `pilot_holds` le relisait à chaque note (633 lectures pour un
+    # instantané de 146 lots). Une fenêtre par passage.
+    from . import canon as canon_mod
+    with canon_mod.configured_cache():
+        holds = planned_waits.pilot_holds(
+            db, st.lot_hold_events(ids, planned_waits.HOLD_NOTE_PATTERNS), cfg=cfg)
     waits = planned_waits.read(
         db, items, now=now, packages=packages,
         dependencies=[e for edges in dependencies.values() for e in edges],
-        holds=planned_waits.pilot_holds(
-            db, st.lot_hold_events(ids, planned_waits.HOLD_NOTE_PATTERNS), cfg=cfg))
+        holds=holds)
     lots = [build_lot(item, events.get(int(item["id"]), []),
                       by_item.get(int(item["id"]), []), declared.get(int(item["id"])),
                       packages=packages, now=now, stale_after=threshold,
@@ -1023,6 +1018,61 @@ def snapshot(db, cfg=None, *, since: str | None = None, project: str | None = No
                                             or {}).get("responsible"),
                                review_class=cls),
             states, externals)
+    return {"items": items, "lots": lots, "packages": packages,
+            "package_rows": package_rows}
+
+
+def timeline(db, cfg=None, *, since: str | None = None, project: str | None = None,
+             now: float | None = None, max_lots: int = MAX_LOTS,
+             stale_after: float | None = None) -> dict:
+    """La Chronologie de /ui/ (#3395) : `ameesh-timeline/1`, les lots et leur
+    fenêtre, rien de plus.
+
+    Même construction que `snapshot` (`_lots_view`), sans les agents, la
+    feuille de route, les versions, le budget ni les décisions — c'est ce
+    qu'un écran qui ne dessine que les lots payait (1,1 Mo, 39–48 s).
+
+    #3401 : la borne de rendu (`max_lots`) est dite, comme dans `snapshot` —
+    sans elle la Chronologie laisserait croire à une liste complète."""
+    now = time.time() if now is None else float(now)
+    since_ts = parse_since(since, now)
+    threshold = stagnation.stale_after() if stale_after is None else float(stale_after)
+    view = _lots_view(db, storage.of(db).progress, cfg, since_ts=since_ts,
+                      project=project, now=now, max_lots=max_lots, threshold=threshold)
+    truncated = {}
+    cut = _truncation(view["items"], max_lots)
+    if cut:
+        truncated["lots"] = cut
+    return {"schema": TIMELINE_SCHEMA, "generated_ts": _round(now),
+            "project": project or None,
+            "window": {"from_ts": _round(since_ts), "to_ts": _round(now)},
+            "lots": view["lots"], "truncated": truncated}
+
+
+def snapshot(db, cfg=None, *, since: str | None = None, project: str | None = None,
+             book: cost_mod.CostBook | None = None, now: float | None = None,
+             max_lots: int = MAX_LOTS, max_actions: int = MAX_ACTIONS,
+             stale_after: float | None = None, gantt: bool = True,
+             github: "versions_mod.Reader | None" = None) -> dict:
+    """L'instantané `ameesh-progress/1` (voir docs/PROGRESS.md).
+
+    Les bornes (`max_lots`, `max_actions`) ne limitent que le RENDU : les
+    lots ouverts passent avant les fusionnés, et les jalons et l'état d'un
+    lot affiché sont lus sans borne (son journal complet, toutes ses
+    actions). Toute coupure est dite dans `truncated`.
+
+    `github` (L160f) : le lecteur GitHub des versions, partagé par `--serve`
+    (cache) ; None : les versions ne sont pas lues, la vue le dit.
+    """
+    now = time.time() if now is None else float(now)
+    since_ts = parse_since(since, now)
+    store = storage.of(db)
+    st = store.progress
+    threshold = stagnation.stale_after() if stale_after is None else float(stale_after)
+    view = _lots_view(db, st, cfg, since_ts=since_ts, project=project, now=now,
+                      max_lots=max_lots, threshold=threshold)
+    items, lots = view["items"], view["lots"]
+    packages, package_rows = view["packages"], view["package_rows"]
     package_items = st.package_items()
     plan = plan_mod.summarize(package_rows, package_items)
     action_rows = st.actions(since_ts=since_ts, project=project, limit=max_actions)

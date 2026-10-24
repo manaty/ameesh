@@ -620,6 +620,22 @@ class ProgressPgTest(PgTestCase):
         self.assertEqual(len(small["lots"]), 3)
         self.assertIn("TRUNCATED: 3 of 501 lots shown", progress.format_text(small, 60))
 
+    def test_timeline_dit_sa_troncature(self):
+        """#3401 : la Chronologie dit la borne de rendu au lieu de faire croire
+        à une liste complète, comme l'instantané `progress`."""
+        self.db.execute(
+            "INSERT INTO work_items (title, state, created_at, updated_at)"
+            " SELECT 'vieux-' || n, 'merged', now() - interval '2 hours', now()"
+            " FROM generate_series(1, 500) n")
+        new = work.add(self.db, title="LOT COURANT", app="demo")
+        cut = progress.timeline(self.db, self.cfg, max_lots=3)
+        self.assertEqual(cut["truncated"],
+                         {"lots": {"shown": 3, "total": 501, "limit": 3}})
+        self.assertIn(new["id"], [x["id"] for x in cut["lots"]])   # l'ouvert d'abord
+        self.assertEqual(len(cut["lots"]), 3)
+        plain = progress.timeline(self.db, self.cfg, max_lots=1000)
+        self.assertEqual(plain["truncated"], {})
+
     def test_approbation_non_perdue_dans_la_borne_des_actions(self):
         """Sonde codex3 B1 : 500 actions sans lot ne masquent pas
         l'approbation de fusion d'un lot affiché."""
