@@ -2812,7 +2812,27 @@ def _reviewer_rows(listing: Iterable[Mapping]) -> dict:
     return by_name
 
 
-def _head_voters(db, lot: int, sha: str, by_name: Mapping) -> set:
+def _exact_receipts_required(cfg, db, lot: int, sha: str) -> bool:
+    """Whether the merge gate counts only verdicts with their exact receipt (#3369).
+
+    In a **sensitive** class the gate filters out a verdict without its #1465
+    proof (`merge_queue.review_gate`), so that verdict cannot keep a seat: the
+    seat would stay dead and the head would wait for an opinion the gate will
+    never read. The class is the one the gate reads (`lot_class.of_lot`): a
+    doubt and an unreadable class are sensitive, exactly like the gate.
+    """
+    try:
+        item = work.get(db, int(lot))
+        reading = lot_class.of_lot(db, int(lot), cfg=cfg, item=item,
+                                   head=str(sha or "").strip())
+    except Exception:  # noqa: BLE001 - an unreadable class is a doubt: sensitive
+        return True
+    if not isinstance(reading, Mapping) or reading.get("doubt"):
+        return True
+    return str(reading.get("class") or "") == lot_class.SENSITIVE
+
+
+def _head_voters(cfg, db, lot: int, sha: str, by_name: Mapping) -> set:
     """The names whose verdict names the exact frozen head, case-folded (#3367).
 
     A seat whose reviewer already gave its verdict (`ok` or `blocked`) on the
@@ -2822,11 +2842,17 @@ def _head_voters(db, lot: int, sha: str, by_name: Mapping) -> set:
     characters): a verdict on an earlier head, or without a commit, leaves the
     seat to replace. An actor known by an alias also counts under its
     registry name.
+
+    #3369: in a sensitive class the seat is kept only on a verdict the gate
+    will actually count, i.e. one carrying its exact #1465 receipt (the gate
+    discards an unproven one). Keeping such a seat would leave a dead seat
+    that is never replaced.
     """
     head = str(sha or "").strip().lower()
     voters: set = set()
     if not head:
         return voters
+    rows = []
     for row in storage.of(db).work.milestones(int(lot), None) or ():
         if row.get("kind") != "verdict":
             continue
@@ -2834,8 +2860,17 @@ def _head_voters(db, lot: int, sha: str, by_name: Mapping) -> set:
         if not noted or not (noted == head
                              or (len(noted) >= 7 and head.startswith(noted))):
             continue
+        if not str(row.get("actor") or "").strip():
+            continue
+        rows.append(row)
+    if not rows:
+        return voters
+    from .merge_queue import _exact_verdict_receipt
+    exact = _exact_receipts_required(cfg, db, int(lot), head)
+    for row in rows:
         actor = str(row.get("actor") or "").strip()
-        if not actor:
+        if exact and not actor.startswith(work.HUMAN_PREFIX) \
+                and _exact_verdict_receipt(db, row) is None:
             continue
         voters.add(actor.casefold())
         primary = str((by_name.get(actor) or {}).get("name") or "").strip()
@@ -2904,6 +2939,31 @@ class _SeatsMoved(Exception):
     """#3367 : the mark the pass read is no longer the freeze's effective mark."""
 
 
+class _AlreadyNoted(Exception):
+    """#3369 : a concurrent pass already journaled this reassignment."""
+
+
+def _reassign_prefix(lot: int, freeze_id: int, dead: Sequence[tuple]) -> str:
+    """The journal prefix that makes one reassignment pass idempotent (#3328).
+
+    It names the examined dead seats, so a later loss of a replacement is a
+    new reassignment while a pass that cannot replace the same names never
+    loops.
+    """
+    return "%s%d:%d:%s:" % (REASSIGN_PREFIX, int(lot), int(freeze_id),
+                            ",".join(sorted(name for name, _why in dead or ())))
+
+
+def _reassign_note(lot: int, freeze_id: int, dead: Sequence[tuple], tail: str,
+                   kept: Sequence[str] = ()) -> str:
+    """The journal note of a reassignment, shared by every outcome (#3369)."""
+    why_text = "; ".join("%s (%s)" % (name, why) for name, why in dead or ())
+    if kept:
+        tail += "; kept: %s" % ", ".join(kept)
+    return ("%s reviewer(s) unreachable: %s; %s"
+            % (_reassign_prefix(lot, freeze_id, dead), why_text, tail))
+
+
 class _ReseatPort(_ForcedPort):
     """#3367 : the port of a reassignment, which replaces only the dead seats.
 
@@ -2916,9 +2976,11 @@ class _ReseatPort(_ForcedPort):
     pilot's `work reviewer --remove` writes no mark, and `prepare` can take
     seconds, so a removal in that window would otherwise be written back
     (review of impl-02 on #3367). Without a
-    replacement (`waiting`), no mark is written: a waiting mark would retire
-    the live seats from the column, so the designation stays as it is and the
-    caller alerts the pilot.
+    replacement (`waiting`), no **designation** mark is written: a waiting mark
+    would retire the live seats from the column, so the designation stays as
+    it is. The journal note of that waiting outcome is written under this same
+    lock (#3369), before the caller alerts the pilot, so a second host's
+    concurrent pass sees it and sends nothing.
     """
 
     def __init__(self, port, *, kept: Sequence[Mapping], mark_id: int,
@@ -3004,7 +3066,8 @@ def reseat(cfg, db, lot: int, *, freeze: Mapping, kept: Sequence[Mapping],
     cannot be read, no review due, or a freeze that moved returns the outcome
     with the designation untouched — the former replay cleared the whole
     column in that case. Without a replacement, the designation is unchanged
-    and the pilot gets one alert.
+    and the pilot gets one alert, its journal note written under the lot lock
+    before the mail (#3369).
     """
     freeze = dict(freeze or {})
 
@@ -3041,11 +3104,32 @@ def reseat(cfg, db, lot: int, *, freeze: Mapping, kept: Sequence[Mapping],
                 _sync_reviewers(tx, item, freeze,
                                 [r.get("name") for r in out.get("reviewers") or ()])
             elif out.get("state") == rd.WAITING:
+                # #3369: a waiting outcome writes no designation mark (it would
+                # retire the live seats from the column), so the journal note
+                # is its only dedup mark. It is written **under the lot lock**
+                # taken by the port's commit, before the pilot's alert: a
+                # concurrent pass on another host then sees it and stays
+                # silent instead of alerting and noting twice.
+                if storage.of(tx).work.events_noted(
+                        _reassign_prefix(lot, int(freeze.get("id") or 0), dead),
+                        float(freeze.get("at_ts") or 0.0), ids=[int(lot)]):
+                    raise _AlreadyNoted(
+                        "the waiting alert of freeze #%s was already journaled"
+                        " by a concurrent pass: nothing written"
+                        % (freeze.get("id"),))
+                tail = ("no replacement: %s; designation unchanged"
+                        % (out.get("why") or "waiting"))
+                storage.of(tx).work.note(
+                    int(lot), str(item.get("state") or ""),
+                    _reassign_note(int(lot), int(freeze.get("id") or 0), dead, tail,
+                                   [seat["name"] for seat in port.kept]),
+                    SENDER)
                 _reseat_alert(tx, item, freeze, inputs.notify, port.kept, dead, out,
                               threads)
+                out["noted"] = True
         _drain(db, threads)
         return out
-    except (_SeatsMoved, rd.StaleFreeze) as exc:
+    except (_AlreadyNoted, _SeatsMoved, rd.StaleFreeze) as exc:
         return unchanged("stale", str(exc))
     except rd.DesignationError as exc:
         return unchanged("unavailable", str(exc))
@@ -3069,6 +3153,10 @@ def reassign_unreachable(cfg, db, *, limit: int = RETRY_LIMIT) -> dict:
     unreachable reviewer whose verdict is acquired on the exact frozen head
     keeps its seat (`_head_voters`): the 15:54Z pass of 24/10 had re-designated
     the whole set of 10 lots whose two families had already approved the head.
+
+    #3369 : in a sensitive class a seat is kept only on a verdict that carries
+    the exact #1465 receipt the gate requires; a waiting outcome writes its
+    journal note under the lot lock, so two concurrent hosts alert once.
 
     The pass reads only machine evidence (registry, host lifecycle, journal)
     and never raises: the runner logs the summary. It does not touch a manual
@@ -3158,8 +3246,8 @@ def reassign_unreachable(cfg, db, *, limit: int = RETRY_LIMIT) -> dict:
                 why = _unreachable_reviewer(by_name.get(name), closed)
                 if why:
                     if voters is None:
-                        voters = _head_voters(db, lot, str(freeze.get("sha") or ""),
-                                              by_name)
+                        voters = _head_voters(cfg, db, lot,
+                                              str(freeze.get("sha") or ""), by_name)
                     if not _acquired(name, voters, by_name):
                         dead.append((name, why))
                         continue
@@ -3170,8 +3258,7 @@ def reassign_unreachable(cfg, db, *, limit: int = RETRY_LIMIT) -> dict:
             if not dead:
                 out["skipped"] += 1
                 continue
-            names = ",".join(sorted(name for name, _why in dead))
-            prefix = "%s%d:%d:%s:" % (REASSIGN_PREFIX, lot, freeze_id, names)
+            prefix = _reassign_prefix(lot, freeze_id, dead)
             since = float(freeze.get("at_ts") or 0.0)
             if storage.of(db).work.events_noted(prefix, since, ids=[lot]):
                 out["skipped"] += 1
@@ -3195,7 +3282,6 @@ def reassign_unreachable(cfg, db, *, limit: int = RETRY_LIMIT) -> dict:
         added = [str((reviewer or {}).get("name") or "").strip()
                  for reviewer in (result or {}).get("reviewers") or ()
                  if str((reviewer or {}).get("name") or "").strip() not in kept_names]
-        why_text = "; ".join("%s (%s)" % (name, why) for name, why in dead)
         if outcome == rd.DESIGNATED:
             out["reassigned"] += 1
             tail = ("replaced by %s" % ", ".join(added) if added
@@ -3206,13 +3292,13 @@ def reassign_unreachable(cfg, db, *, limit: int = RETRY_LIMIT) -> dict:
                     % (result.get("why") or "waiting"))
         else:
             tail = "designation unchanged: %s" % (result.get("why") or outcome)
-        if kept_names:
-            tail += "; kept: %s" % ", ".join(kept_names)
+        if (result or {}).get("noted"):
+            # #3369: the waiting note was written under the lot lock, with its
+            # single alert; a concurrent pass never reaches this point twice.
+            continue
         try:
             storage.of(db).work.note(
-                lot, state,
-                "%s%d:%d:%s: reviewer(s) unreachable: %s; %s"
-                % (REASSIGN_PREFIX, lot, freeze_id, names, why_text, tail),
+                lot, state, _reassign_note(lot, freeze_id, dead, tail, kept_names),
                 SENDER)
         except Exception as exc:  # noqa: BLE001 - the mark is already written
             out["errors"].append("#%d note: %s: %s"
