@@ -257,9 +257,12 @@ class WorkflowTest(unittest.TestCase):
     def test_le_job_macos_court_est_requis(self):
         # L68b (#3026) : le job court macOS entre dans les `needs` de `tests` ;
         # la suite longue vit dans macos.yml, hors du chemin du paquet (#3198).
-        # La relance garde son utilité : une annulation de capacité reste reprise.
+        # #3251 : c'est le classifieur de l'agrégat qui lit son résultat (un
+        # échec rougit, une annulation se consigne) ; la relance garde son
+        # utilité pour un job hébergé annulé faute de runner.
         texte = TESTS.read_text(encoding="utf-8")
-        self.assertIn('test "${{ needs.platform-macos.result }}" = success', texte)
+        self.assertIn(
+            '--plateforme-macos "${{ needs.platform-macos.result }}"', texte)
         self.assertNotIn("platform-macos n'est pas encore requis", texte)
 
     def ligne_declencheurs(self):

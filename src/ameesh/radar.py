@@ -1644,6 +1644,38 @@ CI_INCONCLUSIVE_STATES = frozenset(("ERROR",))
 CI_CONSIGNED_STATES = (CI_INCONCLUSIVE | CI_INCONCLUSIVE_STATES | CI_NEGATIVE
                        | frozenset(("SUCCESS", "PENDING", "EXPECTED", "?")))
 
+#: #3251 : check de détail publié par l'étape « bilan des parts » de
+#: `.github/workflows/tests.yml` (scripts/ci-agregat.py), à chaque exécution.
+#: `success` quand toutes les parts ont conclu, `neutral` quand au moins une
+#: part interne a été annulée (non concluant, canon §3), `failure` sur un
+#: négatif. Il porte la distinction que le run ne porte pas : le check requis
+#: `tests` reste vert quand l'agrégat a conclu malgré une annulation interne.
+AGGREGATE_DETAIL_CHECK = "tests (bilan des parts)"
+
+
+def aggregate_detail_entries(rollup) -> list:
+    """#3251 : les derniers checks de détail de l'agrégat requis.
+
+    Une liste vide signifie « aucun signal » (projet sans cet agrégat, ou tête
+    antérieure à #3251) : la porte ne consigne rien et ne bloque rien de plus.
+
+    Le même nom peut venir de deux workflows sur une même tête (`tests` du run
+    de la PR, `paquet` du portier qui a appelé la suite) : le regroupement de
+    `latest_rollup` par (workflow, suite) les garderait tous les deux. On
+    normalise la clé pour ne garder que le plus récent des deux — sinon un
+    `neutral` d'un essai antérieur consignerait une tête redevenue verte.
+    Dates absentes ou ex aequo : toutes les entrées restent (jamais masquer un
+    négatif)."""
+    rows = []
+    for entry in rollup or ():
+        if str(entry.get("name") or entry.get("context") or "")                 != AGGREGATE_DETAIL_CHECK:
+            continue
+        row = dict(entry)
+        row.pop("workflowName", None)
+        row.pop("checkSuiteId", None)
+        rows.append(row)
+    return latest_rollup(rows)
+
 
 def nonconclusive_source(app: str, entry: str) -> str:
     """#3209 : la clé du lot de correction d'un check non concluant — l'app
@@ -1751,6 +1783,11 @@ def packet_proof_entries(rollup) -> list:
     out = []
     for entry in latest_rollup(rollup) or ():
         name = str(entry.get("name") or entry.get("context") or "")
+        # #3251 : le détail de l'agrégat `tests` n'est pas une preuve du
+        # portier, même quand `tests.yml` est appelé par `paquet` (le check est
+        # alors associé au workflow appelant) : il a sa propre porte.
+        if name == AGGREGATE_DETAIL_CHECK:
+            continue
         if str(entry.get("workflowName") or "") == "paquet" \
                 or name == "paquet (run proof unavailable)":
             out.append(entry)
@@ -1956,7 +1993,13 @@ def commit_ci(project: Project, sha: str, gh=None, *, branch: str | None = None)
                 or type(check["app"].get("id")) is not int
                 or type(check.get("id")) is not int or not check.get("name")):
             raise plan_github.GithubError("commit checks: invalid identity or frozen SHA")
-        if check["app"].get("slug") == "github-actions":
+        # #3251 : le check de détail de l'agrégat est le seul check Actions qui
+        # porte une information absente du run (une part interne annulée alors
+        # que l'agrégat a conclu) ; il passe par la lecture commune ci-dessous.
+        # Les autres checks Actions sont couverts par leur exécution (les jobs
+        # du run), pas par une seconde lecture.
+        if (check["app"].get("slug") == "github-actions"
+                and check["name"] != AGGREGATE_DETAIL_CHECK):
             continue  # workflow attempts above account for all their jobs
         try:
             stamps = [datetime.fromisoformat(check["started_at"].replace("Z", "+00:00"))]
@@ -1976,7 +2019,11 @@ def commit_ci(project: Project, sha: str, gh=None, *, branch: str | None = None)
         if key not in activity or at > activity[key]:
             activity[key], external[key] = at, check
     for check in external.values():
-        label = "%s/%s" % (check["app"]["id"], check["name"])
+        # Le check de détail garde son nom seul : la clé du lot de correction
+        # (#3209, `nonconclusive_source`) doit être la même au paquet et à la
+        # release, sans identifiant d'application devant.
+        label = (check["name"] if check["name"] == AGGREGATE_DETAIL_CHECK
+                 else "%s/%s" % (check["app"]["id"], check["name"]))
         results.append((label, conclusion_result(check.get("status"),
                                                  check.get("conclusion"))))
         if check.get("status") != "completed":

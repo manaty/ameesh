@@ -98,10 +98,12 @@ class WorkflowTest(unittest.TestCase):
         self.assertIn("if: needs.plan.outputs.code == 'true'", self.text)
         self.assertIn("if: needs.plan.outputs.docs_only == 'true'", self.text)
         self.assertIn("python -m unittest -v ${{ needs.plan.outputs.doc_readers }}", self.text)
-        self.assertIn(
-            "needs: [plan, version, psycopg, psql, platform-macos, "
-            "doc-readers, fs-class]", self.text)
-        self.assertIn('test "${{ needs.doc-readers.result }}" = success', self.text)
+        # #3251 : la garde des lecteurs vit dans le classifieur de l'agrégat
+        # (scripts/ci-agregat.py) ; l'étape lui passe les deux sorties.
+        self.assertIn("needs: [plan, version, psycopg, psql, platform-macos, "
+                      "doc-readers, fs-class]", self.text)
+        self.assertIn('--docs-only "${{ needs.plan.outputs.docs_only }}"', self.text)
+        self.assertIn('--doc-readers "${{ needs.doc-readers.result }}"', self.text)
 
     def test_main_en_cours_preservee_et_file_bornee(self):
         # #824, décision owner #17605 : pushes main regroupés, un seul pending.
