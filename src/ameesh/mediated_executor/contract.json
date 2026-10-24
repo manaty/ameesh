@@ -4952,6 +4952,7 @@
     "set_estimate",
     "set_issue_ref",
     "set_partial_seen",
+    "set_priority",
     "set_type",
     "timeline",
     "turn_spans",

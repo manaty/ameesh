@@ -696,7 +696,8 @@ class OrphanGuardsTest(unittest.TestCase):
                     # guards are too (their own witnesses use real worktrees)
                     with mock.patch.object(menage.storage, "of", return_value=store), \
                             mock.patch.object(menage, "worktree_state", return_value=git), \
-                            mock.patch.object(menage, "worktree_in_use", return_value=False), \
+                            mock.patch.object(menage, "worktree_holders",
+                                              return_value=(False, "")), \
                             mock.patch.object(menage, "current_branch",
                                               return_value=(True, row["branch"])), \
                             mock.patch.object(menage, "ignored_leftovers", return_value=[]), \
@@ -757,7 +758,7 @@ class MergedKeptTest(_Repo):
         store = _Store(rows, lots)
         _age(rows[0]["path"], 2 * 3600)
         with mock.patch.object(menage.storage, "of", return_value=store), \
-                mock.patch.object(menage, "worktree_in_use", return_value=False):
+                mock.patch.object(menage, "worktree_holders", return_value=(False, "")):
             entries, plan = menage._worktree_pass(
                 None, "pc", dry_run=dry_run, protected=set(),
                 now=time.time(), allow=allow,

@@ -862,10 +862,24 @@ def _owner(proc):
     return uids.effective
 
 
+class HoldersUnreadable(NotAvailable):
+    """#3396 : des processus du même utilisateur refusent la lecture de leurs
+    fichiers ouverts, et aucun détenteur n'a été constaté. `holders` nomme
+    « pid nom » ceux qui restent après les relectures : le doute se dit, il ne
+    se déguise pas en « un processus travaille dedans »."""
+
+    def __init__(self, holders) -> None:
+        self.holders = [str(holder) for holder in holders]
+        super().__init__("file holders",
+                         "open files of process(es) of this user unreadable: %s"
+                         % ", ".join(self.holders[:5]))
+
+
 def _settle(doubts: dict, again) -> None:
     """L63b: `doubts` (pid -> who) read again by `again(pid)` (who, or None)
     until none is left or `DOUBT_RETRIES` is spent; what is left is
-    `NotAvailable`: an empty list would say "nobody holds it" unchecked."""
+    `HoldersUnreadable` (#3396, a `NotAvailable` that names them): an empty
+    list would say "nobody holds it" unchecked."""
     import time
     for _ in range(DOUBT_RETRIES):
         if not doubts:
@@ -873,9 +887,7 @@ def _settle(doubts: dict, again) -> None:
         time.sleep(DOUBT_RETRY_S)
         doubts = {pid: who for pid in doubts for who in [again(pid)] if who}
     if doubts:
-        raise NotAvailable("file holders",
-                           "open files of process(es) of this user unreadable: %s"
-                           % ", ".join(list(doubts.values())[:5]))
+        raise HoldersUnreadable(list(doubts.values()))
 
 
 #: Sélecteurs de session d'une ligne de commande : une reprise en cours nomme

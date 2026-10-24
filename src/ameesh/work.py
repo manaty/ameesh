@@ -1268,6 +1268,61 @@ def set_type(db: Db, item_id: int, type: str, *, actor: str = "", cfg=None) -> d
     return updated
 
 
+def set_priority(db: Db, item_id: int, priority: int, *, reason: str = "",
+                 actor: str = "", cfg=None) -> dict:
+    """#3370 : change la priorité d'un lot **ouvert**, avec une ligne de journal.
+
+    Un lot mal classé (cas de #3358, P1 alors que le pilote le juge non
+    urgent) se corrige sans le recréer : `work set-priority <lot> 1|2|3
+    --reason "<motif>"`. Même garde que `set-type` et `set-app` (humain,
+    orchestrateur ou agent de conception ; une session liée agit en son nom
+    et ne peut pas usurper un autre acteur). Le motif est obligatoire : une
+    priorité décide des escalades §9, elle ne change pas sans dire pourquoi.
+
+    Compare-and-set sur la priorité lue (NULL — « sans priorité » — inclus) :
+    deux corrections concurrentes ne s'écrasent pas. L'état **ouvert** est
+    revérifié sous le même verrou de ligne que l'écriture : une promotion,
+    fusion ou fermeture intercalée ne peut pas recevoir la priorité.
+    Répéter la même priorité n'écrit rien. La ligne de journal est
+    `priority 1 → 2 — <motif>`.
+    Seuls les lots ouverts se corrigent : un lot fusionné, promu ou fermé
+    n'a plus d'escalade à régler.
+
+    Les lecteurs (file d'attente, planification, alertes §9, étiquette
+    `ameesh:pN` du ticket miroir) lisent la priorité du lot, jamais une
+    copie : ils suivent à la prochaine lecture/projection.
+    """
+    item = get(db, item_id)
+    if item is None:
+        raise WorkError("lot %s not found" % item_id)
+    if type(priority) is not int or priority not in PRIORITIES:
+        raise WorkError("priority 1 (high), 2 (normal) or 3 (low): %r" % (priority,))
+    actor = corrector(cfg, db, actor, what="priority correction")
+    if item["state"] not in OPEN_STATES:
+        raise WorkError("lot %s is %s: priority changes on an open lot only"
+                        % (item_id, item["state"]))
+    reason = " ".join((reason or "").split())
+    if not reason:
+        raise WorkError("a priority change needs a reason (--reason)")
+    current = item.get("priority")
+    if current == priority:
+        return item
+    updated = storage.of(db).work.set_priority(
+        item_id, priority, current=current, reason=reason, actor=actor)
+    if updated is None:
+        # #3370 (relecture cx2) : le stockage refuse sous le verrou de ligne un
+        # lot qui n'est plus ouvert. Une transition intercalée entre la
+        # lecture ci-dessus et l'écriture ne doit pas écrire une priorité sur
+        # un lot promu, fusionné ou fermé : on relit pour dire pourquoi.
+        again = get(db, item_id)
+        if again is not None and again.get("priority") == current \
+                and again["state"] not in OPEN_STATES:
+            raise WorkError("lot %s is %s: priority changes on an open lot only"
+                            % (item_id, again["state"]))
+        raise WorkError("lot %s: priority changed meanwhile, retry" % item_id)
+    return updated
+
+
 def open_lots(db: Db, assignee: str) -> list[dict]:
     """L118 : les lots ouverts d'un assigné (ni livrés, ni fermés)."""
     from .agent_names import resolve as resolve_agent_name

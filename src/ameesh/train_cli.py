@@ -2,10 +2,16 @@
 """Explicit pilot commands for #1467; no runner installation or activation.
 
 Run with ``python -m ameesh.train_cli --project NAME
-show|give|withdraw|abandon``. The pilot reviews the JSON manifest returned by
-show and supplies that exact file to give/withdraw/abandon. Reading a new
-current plan never silently grants it. Withdrawal needs neither the canon
-loader nor a functioning CI/Git adapter.
+show|give|withdraw|abandon|requalify``. The pilot reviews the JSON manifest
+returned by show and supplies that exact file to give/withdraw/abandon.
+Reading a new current plan never silently grants it. Withdrawal needs neither
+the canon loader nor a functioning CI/Git adapter.
+
+``requalify`` (#3366) is the mechanical pin gesture: when the canon moved and
+its diff does not touch ``processus/mecanique.yaml`` or ``federation.yaml``,
+it writes the gate's audited commit to every configuration file that declares
+``train.projects.<p>.canon_commit`` and traces the move on the lot named by
+``--lot``. A rules diff refuses.
 
 A persisted plan that was never fired has no receipt to withdraw: ``abandon``
 is its terminal gesture. It refuses an active/uncertain fire (withdraw or
@@ -20,17 +26,18 @@ import json
 import sys
 import time
 
-from . import config, db as db_mod, merge_queue, radar, train_fire, train_store, work
+from . import (config, db as db_mod, merge_queue, radar, train_fire,
+               train_requalify, train_store, work)
 from .train import TERMINAL, TrainError, digest
 
 
-def _pilot(cfg, db):
+def _pilot(cfg, db, action="train abandon"):
     """The declared pilot of the bound session, never a caller-supplied actor."""
     try:
         return work.corrector(cfg, db, None, history=False)
     except work.WorkError as exc:
-        raise TrainError("train abandon requires a pilot with a declared role: %s"
-                         % exc) from exc
+        raise TrainError("%s requires a pilot with a declared role: %s"
+                         % (action, exc)) from exc
 
 
 def _abandon(ledger, plan, *, actor, reason, now):
@@ -115,6 +122,12 @@ def main(argv=None):
     parser.add_argument("--project", required=True)
     commands = parser.add_subparsers(dest="action", required=True)
     commands.add_parser("show", help="print persisted plan and current fire receipt")
+    requalify = commands.add_parser(
+        "requalify", help="mechanically move the train canon pin to the gate commit")
+    requalify.add_argument("--lot", type=int, required=True,
+                           help="lot receiving the journal trace of the move")
+    requalify.add_argument("--dry-run", action="store_true",
+                           help="print the move; write nothing")
     for action in ("give", "withdraw", "abandon"):
         command = commands.add_parser(action)
         command.add_argument("--manifest", required=True,
@@ -127,6 +140,17 @@ def main(argv=None):
     args = parser.parse_args(argv)
     try:
         cfg = config.load()
+        if args.action == "requalify":
+            db = db_mod.open_db(cfg)
+            try:
+                actor = _pilot(cfg, db, "train requalify")
+                result = train_requalify.execute(
+                    cfg, db, args.project, lot=args.lot, actor=actor,
+                    dry_run=args.dry_run)
+            finally:
+                db.close()
+            print(json.dumps(result, ensure_ascii=False, indent=2))
+            return 0
         project = radar.settings_of(cfg).projects.get(args.project)
         if project is None:
             raise TrainError("project absent from radar.projects: %s" % args.project)
@@ -144,7 +168,8 @@ def main(argv=None):
             db.close()
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return 0
-    except (TrainError, db_mod.DbError, radar.SettingsError, ValueError, OSError) as exc:
+    except (TrainError, db_mod.DbError, radar.SettingsError, ValueError, OSError,
+            work.WorkError) as exc:
         print("error: %s" % exc, file=sys.stderr)
         return 1
 

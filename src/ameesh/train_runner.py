@@ -34,6 +34,9 @@ SERVICE_LEASE_TTL_S = 900.0
 SERVICE_LEASE_RETRY_S = 60.0
 #: L165 (EP5): how often a host without the elected role looks again.
 ROLE_RETRY_S = 60.0
+#: #3366: how long the service waits after a canon-pin reload refusal (an
+#: unreadable or invalid configuration): it retries instead of composing.
+RELOAD_RETRY_S = 60.0
 #: #3134: how long the runner's shutdown waits for a train effect still in
 #: flight (push, promotion, SQL write) before releasing the lease. Far below
 #: the runner units' `TimeoutStopSec`; past it the lease expires with its TTL.
@@ -441,10 +444,13 @@ class Service:
     Connections and runtime ports never survive a passage.
     """
     def __init__(self, cfg, passages, *, stop, report, clock=time.time, lease=None,
-                 role=None):
+                 role=None, refresh=None):
         self.cfg, self.passages = cfg, tuple(passages)
         self.stop, self.report, self.clock = stop, report, clock
         self.lease = lease
+        #: #3366: reload the effective canonical pin before each passage;
+        #: None keeps the historical startup pin (bench, direct callers).
+        self.refresh = refresh
         #: L165 (EP5): elected role (agent name) whose lease gates the passages;
         #: None keeps the historical `train.host` pin only.
         self.role = role
@@ -481,10 +487,34 @@ class Service:
             self.condition.notify_all()
         return True
 
+    def _reload_pin(self):
+        """#3366: reload the pin before this passage, or give a retry delay.
+
+        A configuration that cannot be re-read or validated is a named refusal,
+        never a silent fallback to the startup pin: the service reports it and
+        retries shortly. A changed pin is logged once per change."""
+        if self.refresh is None:
+            return None
+        try:
+            changes = self.refresh()
+        except (Exception, SystemExit) as exc:  # noqa: BLE001 - a bad config never stops the runner
+            self.report("train canon pin not reloaded (%s: %s)"
+                        % (type(exc).__name__, exc))
+            return self.clock() + RELOAD_RETRY_S
+        for change in changes or ():
+            self.report("train canon pin reloaded for %s: %s -> %s"
+                        % (change.get("project") or "?",
+                           str(change.get("previous") or "")[:12] or "?",
+                           str(change.get("pin") or "")[:12] or "?"))
+        return None
+
     def pass_once(self, index, now):
         from .scoped_db import ScopedDb
         if self.stop.is_set():
             return None
+        retry = self._reload_pin()
+        if retry is not None:
+            return retry
         db = ScopedDb(self.cfg)
         try:
             result, deadline = self.passages[index].scheduled_step(db, now)

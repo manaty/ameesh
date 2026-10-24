@@ -9,16 +9,18 @@ a guessed reviewer; the recovery path replays the same freeze.
 """
 from __future__ import annotations
 
+import concurrent.futures
 import dataclasses
 import json
 import os
 import shutil
 import subprocess
+import threading
 import time
 import types
 from unittest import mock
 
-from ameesh import mail, registry, review_authors, review_designation as rd
+from ameesh import lot_class, mail, registry, review_authors, review_designation as rd
 from ameesh import review_designation_activation as act
 from ameesh import review_designation_pg as pg
 from ameesh import review_provenance as prov
@@ -1425,9 +1427,22 @@ class UnreachableDesignationTest(_ActivationFixture, PgTestCase):
             (self.lot,))[0]["reviewers"] or [])
 
     def _verdict(self, actor, sha=None, verdict="ok"):
-        work.milestone(self.db, self.lot, "verdict", sha=sha or self.frozen,
-                       actor=actor, verdict=verdict, repo=self.repo.root,
-                       after_commit=[])
+        return work.milestone(self.db, self.lot, "verdict", sha=sha or self.frozen,
+                              actor=actor, verdict=verdict, repo=self.repo.root,
+                              after_commit=[])
+
+    def _verdict_receipt(self, mark, actor, harness):
+        """The exact #1465 receipt the sensitive gate requires (#3369).
+
+        The tests run outside a managed turn, where `work.milestone` writes the
+        fact without a proof; a witness of the sensitive class adds it here.
+        """
+        self.db.execute(
+            "INSERT INTO provenance_receipts"
+            " (subject, sha, actor, session, turn, harness, work_item_id)"
+            " VALUES (%s, %s, %s, %s, 't', %s, %s)",
+            ("milestone:" + str(int(mark["id"])), self.frozen, actor,
+             "s-" + harness, harness, self.lot))
 
     def _requests(self, name):
         return [m for m in self.mailbox()
@@ -1440,8 +1455,8 @@ class UnreachableDesignationTest(_ActivationFixture, PgTestCase):
         self._agent("r3", "claude")
         _, out = self.freeze()
         self.assertEqual(sorted(r["name"] for r in out["reviewers"]), ["r1", "r2"])
-        self._verdict("r1", sha=self.frozen[:12])
-        self._verdict("r2")
+        self._verdict_receipt(self._verdict("r1", sha=self.frozen[:12]), "r1", "claude")
+        self._verdict_receipt(self._verdict("r2"), "r2", "codex")
         self._move_to_lost("r1")
         self._lose_host()
         marks, mails = len(self.marks()), len(self.mailbox())
@@ -1458,12 +1473,59 @@ class UnreachableDesignationTest(_ActivationFixture, PgTestCase):
         # remplaçant ne lèverait pas le blocage, il faut une nouvelle tête.
         self._agent("r3", "claude")
         self.freeze()
-        self._verdict("r1", verdict="blocked")
+        self._verdict_receipt(self._verdict("r1", verdict="blocked"), "r1", "claude")
         self._move_to_lost("r1")
         self._lose_host()
         report = act.reassign_unreachable(self.cfg, self.db)
         self.assertEqual(report["examined"], 0, report)
         self.assertEqual(sorted(self._column()), ["r1", "r2"])
+
+    def test_an_unproven_verdict_does_not_keep_a_sensitive_seat(self):
+        # #3369 : la porte sensible écarte un verdict sans son reçu exact
+        # (#1465). Garder le siège sur ce verdict laisserait un siège mort que
+        # la porte ne compterait jamais : le remplaçant doit être désigné.
+        self._agent("r3", "claude")
+        self.freeze()
+        klass = lot_class.of_lot(self.db, self.lot, cfg=self.cfg,
+                                 head=self.frozen)
+        self.assertEqual(klass["class"], lot_class.SENSITIVE, klass)
+        self._verdict("r1")  # pas de reçu : un avis que la porte écarte
+        self._move_to_lost("r1")
+        self._lose_host()
+        report = act.reassign_unreachable(self.cfg, self.db)
+        self.assertEqual(report["reassigned"], 1, report)
+        self.assertEqual(sorted(self._column()), ["r2", "r3"])
+        self.assertIn("replaced by r3", self.notes(act.REASSIGN_PREFIX)[-1])
+
+    def test_two_concurrent_waiting_passes_alert_once(self):
+        # #3369 : le chemin d'attente n'écrit aucune marque de désignation,
+        # donc sa note de journal est sa seule déduplication. Deux hôtes qui
+        # passent en même temps doivent produire une seule alerte pilote et
+        # une seule note : la note est écrite sous le verrou de la ligne.
+        self.freeze()
+        self._move_to_lost("r1")
+        self._lose_host()
+        barrier = threading.Barrier(2)
+        original = act._selection
+
+        def together(inputs, port, **kwargs):
+            barrier.wait(timeout=20)
+            return original(inputs, port, **kwargs)
+
+        def run():
+            db = self.connect()
+            try:
+                return act.reassign_unreachable(self.cfg, db)
+            finally:
+                db.close()
+
+        with mock.patch.object(act, "_selection", side_effect=together):
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+                tasks = [pool.submit(run) for _ in range(2)]
+                reports = [task.result(timeout=40) for task in tasks]
+        self.assertEqual(sum(int(r["waiting"]) for r in reports), 1, reports)
+        self.assertEqual(len([m for m in self.mailbox() if m["recipient"] == "pilot"]), 1)
+        self.assertEqual(len(self.notes(act.REASSIGN_PREFIX)), 1)
 
     def test_a_verdict_on_an_earlier_head_does_not_keep_the_seat(self):
         # Le vrai trou (#3340) : r1 a relu une autre tête, pas celle du gel.

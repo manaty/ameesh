@@ -24,6 +24,7 @@
   agent-mesh work migration <id> [--number N] [--release [--number N]] [--skip-branch B]   reserve one of the work item's migration numbers (L122, #2481)
   agent-mesh work issue-ref <id> owner/repo#N | --none   correct the issue reference, journaled (#1603)
   agent-mesh work set-type <id> bug|evolution   retype a lot, journaled (#2954)
+  agent-mesh work set-priority <id> 1|2|3 --reason "…"   change an open lot's priority, journaled (#3370)
   agent-mesh work resolve <id> --with <other> [--done | --abort]   prepared conflict resolution (L160d)
   agent-mesh work queue add|remove <id> | show [--target T]   merge queue per target (L160e)
   agent-mesh work land <id> [--project P]   land the queue head now (L160e2)
@@ -1532,7 +1533,8 @@ def _work_actor(cfg: Config, db, args: argparse.Namespace) -> None:
                   "\"%s\"; pass --actor human:<id>" % work.UNKNOWN_ACTOR,
                   file=sys.stderr)
         return
-    if args.work_command in (*_OWN_ACTOR, "set-app", "set-type", "issue-ref", "backfill-app") or getattr(args, "actor", None) is None:
+    if args.work_command in (*_OWN_ACTOR, "set-app", "set-type", "set-priority",
+                            "issue-ref", "backfill-app") or getattr(args, "actor", None) is None:
         return
     args.actor, warning = work.resolve_actor(cfg, db, args.actor)
     if warning:
@@ -2365,6 +2367,16 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                 print(json.dumps(item, ensure_ascii=False, indent=2))
             else:
                 print("lot #%d: type %s" % (item["id"], item["type"]))
+            return 0
+        if args.work_command == "set-priority":
+            item = work.set_priority(db, args.id, args.priority, reason=args.reason,
+                                     actor=args.actor, cfg=cfg)
+            if args.json:
+                print(json.dumps(item, ensure_ascii=False, indent=2))
+            else:
+                print("lot #%d: priority %s (%s)" % (
+                    item["id"], item.get("priority"),
+                    work.PRIORITY_LABELS.get(item.get("priority"), "?")))
             return 0
         if args.work_command == "issue-ref":
             if bool(args.ref) == bool(args.none):
@@ -3723,6 +3735,17 @@ def build_parser() -> argparse.ArgumentParser:
     pw_type.add_argument("--actor", default="",
                          help="human, orchestrator or design agent; default: bound session")
     pw_type.set_defaults(func=cmd_work)
+    pw_priority = work_sub.add_parser(
+        "set-priority", help="change an open lot's priority (1/2/3), with a journal entry")
+    pw_priority.add_argument("id", type=int)
+    pw_priority.add_argument("priority", type=int, choices=list(work.PRIORITIES),
+                             help="1 high, 2 normal, 3 low")
+    pw_priority.add_argument("--reason", default="",
+                             help="why the priority changes (required, journaled)")
+    pw_priority.add_argument("--json", action="store_true")
+    pw_priority.add_argument("--actor", default="",
+                             help="human, orchestrator or design agent; default: bound session")
+    pw_priority.set_defaults(func=cmd_work)
     pw_iref = work_sub.add_parser(
         "issue-ref", help="correct a lot's issue reference (owner/repo#N), with a journal entry")
     pw_iref.add_argument("id", type=int)

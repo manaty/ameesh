@@ -1105,3 +1105,43 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: timeout 120 python3 scripts/ci-flow.py sweep --max-duration 100
+
+  # #3380 : témoin du Python du poste, sans base et hors agrégat requis.
+  # Reste facultatif tant que sa fiabilité et son coût ne sont pas établis.
+  python314:
+    name: Python 3.14 smoke (optional)
+    continue-on-error: true
+    needs: plan
+    if: github.event.label.name != 'ci-macos' && needs.plan.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    env:
+      PYTHONPATH: src
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+      - name: installation
+        run: python -m pip install '.[crypto]'
+      - name: compilation
+        run: python -m compileall -q src
+      - name: import de tous les modules
+        run: |
+          python - <<'PY'
+          import importlib
+          from pathlib import Path
+
+          paths = sorted(Path('src/ameesh').rglob('*.py'))
+          for path in paths:
+              parts = path.relative_to('src').with_suffix('').parts
+              name = '.'.join(parts[:-1] if parts[-1] == '__init__' else parts)
+              importlib.import_module(name)
+          print(f'{len(paths)} modules importés')
+          PY
+      - name: aide des parseurs (#3379)
+        run: python -m unittest tests.test_3379_argparse_help -v
+      - name: aide de la commande installée
+        run: ameesh --help

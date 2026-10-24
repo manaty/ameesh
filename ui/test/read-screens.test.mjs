@@ -138,6 +138,19 @@ test("an event during a request schedules a fresh snapshot after that request", 
   assert.equal(calls, 2);
 });
 
+test("the timeline does not restart its load at every event (#3395)", async () => {
+  const { client, streams } = fixture({}, { live: true }); let calls = 0;
+  const wrapped = { ...client, get: (path, opts) => { calls++; return client.get(path, opts); } };
+  const el = await mount("ameesh-timeline", wrapped, { project: "ameesh" });
+  const first = calls;
+  streams[0].send("lot.updated"); streams[0].send("thread.entry");
+  await new Promise((resolve) => setTimeout(resolve, 1100)); await settle(el);
+  // minRefreshMs = 5000 on this screen: a burst of events does not start a
+  // second load one second after the first one.
+  assert.equal(calls, first);
+  el.remove();
+});
+
 test("the app assembles all nine screens and navigates project → lot thread internally", async () => {
   const { client } = fixture(); const app = await mount("ameesh-app", client);
   assert.equal(app.shadowRoot.querySelectorAll("nav button").length, 9);
