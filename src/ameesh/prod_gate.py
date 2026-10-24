@@ -20,9 +20,13 @@ la voie de constat (contenu, branche, paquet, PR, déclaration) :
 * lot marqué : la branche de prod de son projet vient du canon compilé
   (`projects.<app>.production.branch`, `mechanics`) — absente ou mal formée,
   la fermeture est retenue, aucune branche n'est supposée ; le dernier gel du
-  lot (sinon le commit constaté) doit être entré dans `origin/<branche>`
-  (`plan_git.probe` : ancêtre, patch-id, squash, revert compris). Sinon le lot
-  reste ouvert, « en attente prod », la garde nommée dans son journal.
+  lot doit être entré dans `origin/<branche>` (`plan_git.probe` : ancêtre,
+  patch-id, squash, revert compris). Le gel prime seul quand il existe : le
+  commit constaté n'est cherché que pour un lot jamais gelé, et un journal
+  des gels illisible retient (cx1, B2). Seule la branche publiée compte : une
+  branche locale homonyme, un correctif non poussé, ne prouve rien (cx1, B1).
+  Sinon le lot reste ouvert, « en attente prod », la garde nommée dans son
+  journal.
 
 Quand la présence est prouvée, la note de fusion nomme la voie et le commit
 de la branche de prod. Une lecture en erreur retient toujours : elle
@@ -90,12 +94,12 @@ def _repository(item: dict, repo: str | None, cfg) -> str:
 
 
 def _production_ref(repo: str, branch: str) -> str | None:
-    """La ref publiée de la branche de prod (`origin/<b>`), la locale à défaut."""
+    """La ref publiée de la branche de prod (`origin/<b>`), None sans elle :
+    la branche locale homonyme n'est jamais lue (cx1, B1 : un correctif local
+    non publié ne ferme pas le lot)."""
     from . import plan_git
-    for ref in ("refs/remotes/origin/" + branch, "refs/heads/" + branch):
-        if plan_git._commit(repo, ref):
-            return ref
-    return None
+    ref = "refs/remotes/origin/" + branch
+    return ref if plan_git._commit(repo, ref) else None
 
 
 def check(st, item: dict, *, sha: str = "", repo: str | None = None, cfg=None) -> dict:
@@ -131,18 +135,28 @@ def check(st, item: dict, *, sha: str = "", repo: str | None = None, cfg=None) -
             "production", "porte de production%s : branche de prod inconnue (%s), "
             "fermeture refusée" % (_guarded(mark), " ".join(str(exc).split())[:160]),
             mark), "proof": None}
-    candidates = []
+    waiting = "en attente prod : %s" % branch
     try:
         marks = st.progress.lot_milestones([lot])
         freeze = plan_git.latest_freeze(
             [m for m in marks if int(m["work_item_id"]) == lot])
-        frozen = plan_git.full_commit_id((freeze or {}).get("sha"))
-    except Exception:  # noqa: BLE001 — sans gel lisible, le commit constaté seul
-        frozen = ""
-    for value in (frozen, plan_git.full_commit_id(sha)):
-        if value and value not in candidates:
-            candidates.append(value)
-    waiting = "en attente prod : %s" % branch
+    except Exception as exc:  # noqa: BLE001 — cx1 B2 : un gel illisible retient
+        return {"retention": _retention(
+            "production", "porte de production%s : %s, gels du lot illisibles (%s: %s)"
+            % (_guarded(mark), waiting, type(exc).__name__,
+               " ".join(str(exc).split())[:120]), mark), "proof": None}
+    # cx1 B2 : le gel prime seul quand il existe ; le commit constaté ne sert
+    # qu'au lot jamais gelé (un commit ancien déjà en prod ne prouve rien)
+    if freeze is not None:
+        frozen = plan_git.full_commit_id(freeze.get("sha"))
+        if not frozen:
+            return {"retention": _retention(
+                "production", "porte de production%s : %s, gel sans commit lisible (%r)"
+                % (_guarded(mark), waiting, str(freeze.get("sha") or "")[:40]), mark),
+                "proof": None}
+        candidates = [frozen]
+    else:
+        candidates = [c for c in (plan_git.full_commit_id(sha),) if c]
     if not candidates:
         return {"retention": _retention(
             "production", "porte de production%s : %s, aucun commit à y chercher"

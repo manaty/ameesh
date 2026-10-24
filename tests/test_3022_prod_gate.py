@@ -66,8 +66,9 @@ class ProdGateCloseTest(_PlanDb):
         self.repo = os.path.join(self.make_tmp(), "nexlink")
         os.makedirs(self.repo)
         git(self.repo, "init", "-q", "-b", "main")
-        self.commit("README", "nexlink\n", "initial")
+        self.initial = self.commit("README", "nexlink\n", "initial")
         git(self.repo, "branch", "-q", "develop")
+        self.publish()
         patcher = mock.patch.object(mechanics, "configured",
                                     return_value=mechanics.compile_document(NEXLINK))
         self.configured = patcher.start()
@@ -98,8 +99,14 @@ class ProdGateCloseTest(_PlanDb):
             work.note(self.db, item["id"], "prod-gate: %s" % mark, actor="orchestrateur")
         return item
 
-    def release(self) -> None:
+    def publish(self) -> None:
+        """La branche de prod publiée : `origin/main`, comme après un fetch."""
+        git(self.repo, "update-ref", "refs/remotes/origin/main", "main")
+
+    def release(self, *, published: bool = True) -> None:
         git(self.repo, "merge", "-q", "--no-ff", "-m", "release", "develop")
+        if published:
+            self.publish()
 
     def run_sync(self) -> dict:
         report = plan_git.sync_merges(self.db, self.repo, target="develop")
@@ -187,6 +194,49 @@ class ProdGateCloseTest(_PlanDb):
         merged = [m for m in work.milestones(self.db, item["id"]) if m["kind"] == "merged"]
         self.assertIn("porte de production : présent sur main", merged[0]["note"])
         self.assertIn("levée du hold de l'assigné dev-a", merged[0]["note"])
+
+    def test_b1_un_correctif_local_non_publie_ne_ferme_pas(self):
+        """cx1 B1 : la branche de prod locale n'est jamais lue ; seule
+        `origin/<branche>` prouve la présence, et son absence retient."""
+        item = self.on_develop("local", mark="porte OTA")
+        self.release(published=False)          # sur main local, pas sur origin/main
+        result = self.run_sync()[item["id"]]
+        self.assertEqual((result["result"], result["retention"]["what"]),
+                         ("withheld", "production"))
+        self.assertEqual(work.get(self.db, item["id"])["state"], "qa")
+        git(self.repo, "update-ref", "-d", "refs/remotes/origin/main")
+        result = self.run_sync()[item["id"]]
+        self.assertEqual(result["result"], "withheld")
+        self.assertIn("présence non prouvée", result["detail"])
+        self.publish()
+        self.assertEqual(self.run_sync()[item["id"]]["result"], "merged")
+
+    def test_b2_le_gel_prime_sur_le_commit_constate(self):
+        """cx1 B2 : un lot gelé n'est cherché en prod que par son gel ; un
+        commit constaté déjà sur origin/main (ici le commit initial) ne le
+        ferme pas, et un journal des gels illisible retient."""
+        item = self.on_develop("gel", mark="porte OTA")
+        st = storage.of(self.db)
+        done = prod_gate.check(st, work.get(self.db, item["id"]), sha=self.initial,
+                               repo=self.repo)
+        self.assertEqual((done["retention"]["what"], done["proof"]), ("production", None))
+        self.assertIn("absent de main", done["retention"]["motif"])
+        with mock.patch.object(st.progress, "lot_milestones",
+                               side_effect=RuntimeError("base indisponible")):
+            done = prod_gate.check(st, work.get(self.db, item["id"]), sha=self.initial,
+                                   repo=self.repo)
+        self.assertIn("gels du lot illisibles", done["retention"]["motif"])
+        # un lot jamais gelé se cherche par le commit constaté
+        bare = work.add(self.db, title="sans gel", app="nexlink")
+        work.note(self.db, bare["id"], "prod-gate: porte OTA", actor="orchestrateur")
+        done = prod_gate.check(st, work.get(self.db, bare["id"]), sha=self.initial,
+                               repo=self.repo)
+        self.assertIsNone(done["retention"])
+        self.assertEqual(done["proof"]["commit"], self.initial)
+        self.release()
+        done = prod_gate.check(st, work.get(self.db, item["id"]), sha=self.initial,
+                               repo=self.repo)
+        self.assertIsNone(done["retention"])
 
 
 if __name__ == "__main__":
