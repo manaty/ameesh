@@ -23,9 +23,11 @@ Sortie : un schéma stable `ameesh-debit/1` en `--json`, un tableau court en
 texte. `--check` sort 2 quand une attente de plus de `--threshold` (2 h par
 défaut) **qui ne dépend pas d'un humain** reste sans geste : le passage de
 l'auditeur ne peut pas dire « rien à signaler » dans ce cas. Les attentes
-humaines (owner, décision signée, geste owner, lot `waiting_human`) sont
-listées à part et ne font pas sortir 2 : le canon ne vise que les attentes
-d'agent.
+humaines explicites (geste owner, go encore requis, décision owner due ou non
+signée, retour de l'owner, login/2FA, lot `waiting_human`) sont listées à part
+et ne font pas sortir 2 : le canon ne vise que les attentes d'agent. Une
+simple mention d'une règle ou d'une consigne de l'owner ne suffit pas, et un
+`hold_undeployed` n'est jamais humain.
 """
 from __future__ import annotations
 
@@ -376,16 +378,52 @@ def _current_state(events: list[dict]) -> str | None:
     return state
 
 
-#: une attente qui dépend d'un humain (owner, propriétaire, décision signée,
-#: geste owner, lot `waiting_human`) n'est pas un goulot d'agent : le canon ne
-#: vise que les attentes non humaines (`processus/lots.md`, `agents/auditeur.md`).
-_HUMAN_WAIT_RE = re.compile(
-    r"\bowner\b|\bpropri[ée]taire\b|\bhumain(?:e|s)?\b|\bhuman\b|waiting_human",
-    re.I)
+#: Formules d'attente **explicites** d'un humain : un geste, un login/2FA, un go
+#: ou une décision encore requis, un retour ou une demande à l'owner. Une
+#: simple mention d'une règle, d'une consigne ou d'une décision déjà signée de
+#: l'owner ne classe PAS l'attente humaine : les agents les citent sans cesse
+#: (revue dev1 du 24/10, B1). Le statut `waiting_human` reste un signal à part.
+_HUMAN_WAIT_PATTERNS = (
+    # un geste, un login ou une 2FA que seul l'owner peut faire
+    r"\bgeste\s+(?:de\s+l'|de\s+la\s+|du\s+|d'|des\s+)?(?:owner|propri[ée]taire)\b",
+    r"\b(?:login|connexion|2fa|double\s+authentification|mot\s+de\s+passe|"
+    r"identifiants?|credentials?)\b[^.;]{0,30}\b(?:owner|propri[ée]taire)\b",
+    r"\b(?:owner|propri[ée]taire)\b[^.;]{0,30}\b(?:login|connexion|2fa|"
+    r"double\s+authentification|mot\s+de\s+passe|identifiants?|credentials?)\b",
+    # un go, un accord ou une signature encore requis
+    r"\b(?:go|accord|feu\s+vert|validation|signature)\s+(?:de\s+l'|de\s+la\s+|"
+    r"du\s+|d')?(?:owner|propri[ée]taire)\b[^.;]{0,60}\b(?:requis|requise|"
+    r"à\s+demander|demand[ée]e?|attendu|en\s+attente|à\s+obtenir|à\s+donner|"
+    r"à\s+signer|non\s+sign[ée]e?|pas\s+sign[ée]e?)\b",
+    # une décision encore due ou non signée (une décision signée ne l'est plus)
+    r"\bd[ée]cision\s+(?:de\s+l'|de\s+la\s+|du\s+|d')?(?:owner|propri[ée]taire)\b"
+    r"[^.;]{0,60}\b(?:due|attendue|à\s+prendre|à\s+demander|à\s+signer|"
+    r"non\s+sign[ée]e?|pas\s+sign[ée]e?)\b",
+    # la reprise dépend d'une décision de l'owner
+    r"\b(?:reprise|reprendre|d[ée]pend)\b[^.;]{0,30}\b(?:de|sur|d')\s+"
+    r"(?:la\s+)?d[ée]cision\s+(?:de\s+l'|de\s+la\s+|du\s+|d')?"
+    r"(?:owner|propri[ée]taire)\b",
+    # retour, attente ou demande à l'owner
+    r"\b(?:retour|attente|attendre|attend|demand[ée]e?|demander)\b[^.;]{0,30}"
+    r"\b(?:de\s+l'|de\s+la\s+|du\s+|d')?(?:owner|propri[ée]taire)\b",
+    r"\b(?:owner|propri[ée]taire)\b[^.;]{0,30}\b(?:doit|devra|est\s+attendu|"
+    r"attend|reviendra|signera|donnera|validera|fournira|transmettra|"
+    r"r[ée]pondra)\b",
+    # gestes réservés au bureau ou au propriétaire, non réassignables à un agent
+    r"\br[ée]serv[ée]s?\s+(?:au|à\s+la|à\s+l'|aux)\s+(?:bureau\s+ou\s+au\s+)?"
+    r"(?:owner|propri[ée]taire)\b",
+    r"\bnon\s+r[ée]assignable\s+à\s+un\s+agent\b",
+)
+_HUMAN_WAIT_RE = re.compile("|".join(_HUMAN_WAIT_PATTERNS), re.I)
 
 
 def _human_wait(state: str | None, *texts: Any) -> bool:
-    """Cette attente dépend-elle d'un humain ? (`--check` l'exclut)."""
+    """Cette attente dépend-elle d'un humain ? (`--check` l'exclut).
+
+    Seul un état `waiting_human` ou une formule d'attente explicite compte ;
+    une règle ou une consigne de l'owner citée au passage ne suffit pas. Un
+    `hold_undeployed` n'est jamais humain (canon §11 bis) — l'appelant le
+    tranche avant d'appeler ce prédicat."""
     if state == "waiting_human":
         return True
     return any(_HUMAN_WAIT_RE.search(str(text or "")) for text in texts)
@@ -780,7 +818,11 @@ def build(*, items: Iterable[Mapping[str, Any]],
                  human=_human_wait(state_by_lot.get(int(row["lot"]))))
     for row in holds_out:
         state = state_by_lot.get(int(row["lot"]))
-        human = _human_wait(state, row.get("cause"))
+        # canon §11 bis : un correctif fusionné non déployé se traite sans
+        # l'owner ; même une note qui cite une règle ou un go de l'owner ne
+        # rend pas cette attente humaine (revue dev1 du 24/10, B1).
+        human = False if row.get("undeployed") else _human_wait(
+            state, row.get("cause"))
         if row.get("device"):
             add_wait("hold_device", row, row["since_ts"], row.get("by") or "?",
                      GESTURES["hold_device"], level=2, device=row["device"],

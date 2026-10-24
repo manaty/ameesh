@@ -83,10 +83,14 @@ Toute attente de plus de 2 h qui ne dépend pas d'un humain est traitée dans
 l'heure, par lui (niveau 1) ou par le pilote nommé ; le rapport cite pour
 chacune le geste fait. `ameesh debit --check` sort 2 quand une telle attente
 existe : un passage qui conclut « rien à signaler » avec une attente de plus
-de 2 h est un défaut de son travail. Les attentes qui dépendent d'un humain
-(owner, décision signée, geste owner, lot `waiting_human`) sont listées à part
-et ne font pas sortir 2 : elles ont leur propre relance (décision due), et le
-canon ne demande pas à l'auditeur de traiter un goulot d'agent à leur place.
+de 2 h est un défaut de son travail. Les attentes humaines **explicites**
+(geste owner, go encore requis, décision owner due ou non signée, retour de
+l'owner, login/2FA, lot `waiting_human`) sont listées à part et ne font pas
+sortir 2 : elles ont leur propre relance (décision due), et le canon ne
+demande pas à l'auditeur de traiter un goulot d'agent à leur place. Une simple
+mention d'une règle ou d'une consigne de l'owner, ou d'une décision déjà
+signée, ne classe pas l'attente humaine ; un `hold_undeployed` ne l'est jamais
+(canon §11 bis).
 
 ### Liste de contrôle
 

@@ -490,12 +490,69 @@ class VersionEtAttentesHumainesTest(unittest.TestCase):
         report = run(
             items=[item(1783, assignee="orchestrateur")],
             events=[event(1783, 1, T - 3 * H,
-                          "hold: report décidé par l'owner (décision signée #75418)")])
+                          "hold: report décidé par l'owner (décision signée #75418) ; "
+                          "reprise sur décision owner.")])
         self.assertEqual(report["slow_waits"], [])
         self.assertEqual(report["totals"]["slow_waits"], 0)
         self.assertEqual(report["totals"]["human_waits"], 1)
         self.assertEqual([row["lot"] for row in report["human_waits"]], [1783])
         self.assertIn("hors --check", debit.format_text(report))
+
+    def test_consigne_owner_n_est_pas_humaine(self):
+        # Revue dev1 B1 : « consigne owner 24/10 » est une simple mention ;
+        # l'attente (#3033) est tenue par le bureau, pas par l'owner.
+        report = run(
+            items=[item(3033)],
+            events=[event(3033, 1, T - 3 * H,
+                          "hold: la branche est tenue par le bureau (consigne owner "
+                          "24/10 transmise par le bureau)")])
+        self.assertEqual([row["lot"] for row in report["slow_waits"]], [3033])
+        self.assertEqual(report["human_waits"], [])
+
+    def test_decision_owner_signee_n_est_pas_humaine(self):
+        report = run(
+            items=[item(2267)],
+            events=[event(2267, 1, T - 3 * H,
+                          "hold: décision owner #124654 = b (signée, approval #77) — "
+                          "attendre et regrouper avec #2878")])
+        self.assertEqual([row["lot"] for row in report["slow_waits"]], [2267])
+        self.assertEqual(report["human_waits"], [])
+
+    def test_regle_owner_n_est_pas_humaine(self):
+        report = run(
+            items=[item(2376)],
+            events=[event(2376, 1, T - 3 * H,
+                          "hold: attendre la remise à zéro du quota le 1/11 "
+                          "(règle owner 23/10)")])
+        self.assertEqual([row["lot"] for row in report["slow_waits"]], [2376])
+        self.assertEqual(report["human_waits"], [])
+
+    def test_go_owner_requis_est_humain(self):
+        report = run(
+            items=[item(2878)],
+            events=[event(2878, 1, T - 3 * H,
+                          "hold: go owner signé requis (à demander au retour de l'owner)")])
+        self.assertEqual(report["slow_waits"], [])
+        self.assertEqual([row["lot"] for row in report["human_waits"]], [2878])
+
+    def test_decision_owner_due_est_humaine(self):
+        report = run(
+            items=[item(9001)],
+            events=[event(9001, 1, T - 3 * H,
+                          "hold: décision owner due pour le go de production")])
+        self.assertEqual([row["lot"] for row in report["human_waits"]], [9001])
+
+    def test_hold_undeployed_jamais_humain(self):
+        # Canon §11 bis : même en waiting_human et avec un « owner » dans la
+        # note, un correctif fusionné non déployé est une attente d'agent.
+        report = run(
+            items=[item(3024)],
+            events=[event(3024, 1, T - 3 * H,
+                          "hold: 1.21.0 pas déployé, décision owner due",
+                          state="waiting_human")])
+        self.assertEqual([row["lot"] for row in report["slow_waits"]], [3024])
+        self.assertEqual(report["human_waits"], [])
+        self.assertEqual([row["lot"] for row in report["undeployed_holds"]], [3024])
 
     def test_hold_agent_reste_dans_les_attentes(self):
         report = run(
