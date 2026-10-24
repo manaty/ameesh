@@ -243,6 +243,10 @@ _HELD = """
 
 #: états de lot terminés (une délégation n'y a plus d'objet)
 _CLOSED = "('merged', 'promoted', 'closed')"
+#: #3370 : états d'un lot qui n'est plus ouvert — la correction de priorité
+#: les refuse, relus sous le verrou de ligne (une transition intercalée entre
+#: le contrôle de `work.set_priority` et l'écriture ne passe plus).
+_CLOSED_PRIORITY = ("merged", "promoted", "closed")
 #: L165b : un lot qui attend un autre que son agent (`qa`, `waiting_human`,
 #: `blocked`) ne l'occupe pas — même liste que `operations.listing` et
 #: `sous_utilisation.LOTS_WAITING_ON_OTHERS`
@@ -515,11 +519,14 @@ class WorkItems(interface.WorkItems):
 
     @_retry_deadlock
     def set_priority(self, item_id, priority, *, current, reason, actor) -> dict | None:
-        """#3370 : priorité journalée, conditionnée à la valeur lue (NULL inclus)."""
+        """#3370 : priorité journalée, conditionnée à la valeur lue (NULL inclus)
+        et à un lot encore ouvert, relu sous le verrou de ligne."""
         with self.db.transaction() as tx:
             rows = tx.query("SELECT %s FROM work_items WHERE id = %%s FOR NO KEY UPDATE"
                             % item_columns(self.db), (int(item_id),))
             if not rows or rows[0].get("priority") != current:
+                return None
+            if rows[0].get("state") in _CLOSED_PRIORITY:
                 return None
             if current == priority:
                 return rows[0]

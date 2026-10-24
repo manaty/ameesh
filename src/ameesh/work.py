@@ -1274,8 +1274,11 @@ def set_priority(db: Db, item_id: int, priority: int, *, reason: str = "",
     priorité décide des escalades §9, elle ne change pas sans dire pourquoi.
 
     Compare-and-set sur la priorité lue (NULL — « sans priorité » — inclus) :
-    deux corrections concurrentes ne s'écrasent pas. Répéter la même priorité
-    n'écrit rien. La ligne de journal est `priority 1 → 2 — <motif>`.
+    deux corrections concurrentes ne s'écrasent pas. L'état **ouvert** est
+    revérifié sous le même verrou de ligne que l'écriture : une promotion,
+    fusion ou fermeture intercalée ne peut pas recevoir la priorité.
+    Répéter la même priorité n'écrit rien. La ligne de journal est
+    `priority 1 → 2 — <motif>`.
     Seuls les lots ouverts se corrigent : un lot fusionné, promu ou fermé
     n'a plus d'escalade à régler.
 
@@ -1301,6 +1304,15 @@ def set_priority(db: Db, item_id: int, priority: int, *, reason: str = "",
     updated = storage.of(db).work.set_priority(
         item_id, priority, current=current, reason=reason, actor=actor)
     if updated is None:
+        # #3370 (relecture cx2) : le stockage refuse sous le verrou de ligne un
+        # lot qui n'est plus ouvert. Une transition intercalée entre la
+        # lecture ci-dessus et l'écriture ne doit pas écrire une priorité sur
+        # un lot promu, fusionné ou fermé : on relit pour dire pourquoi.
+        again = get(db, item_id)
+        if again is not None and again.get("priority") == current \
+                and again["state"] not in OPEN_STATES:
+            raise WorkError("lot %s is %s: priority changes on an open lot only"
+                            % (item_id, again["state"]))
         raise WorkError("lot %s: priority changed meanwhile, retry" % item_id)
     return updated
 

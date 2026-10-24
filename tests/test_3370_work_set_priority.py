@@ -5,12 +5,15 @@ Un lot mal classé (cas #3358, P1 alors que le pilote le juge non urgent) se
 corrige sans le recréer, avec un motif obligatoire et une ligne de journal.
 Le geste est réservé aux correcteurs (humain, orchestrateur ou agent de
 conception), idempotent, et conditionné à la priorité lue : deux corrections
-concurrentes ne s'écrasent pas. La priorité est lue par les files, les
-alertes §9 et la projection GitHub ; aucune copie à mettre à jour.
+concurrentes ne s'écrasent pas. L'état ouvert est revérifié sous le verrou de
+ligne de l'écriture : une transition intercalée (promotion, fusion, fermeture)
+ne reçoit pas la priorité. La priorité est lue par les files, les alertes §9
+et la projection GitHub ; aucune copie à mettre à jour.
 """
 from __future__ import annotations
 
 import json
+from unittest import mock
 
 from ameesh import storage, work
 from .test_l118_assignments import _Base
@@ -120,6 +123,48 @@ class WorkSetPriorityTest(_Base):
         self.assertEqual(work.get(self.db, item["id"])["priority"], 1)
         updated = api.set_priority(item["id"], 2, current=1, reason="x", actor="orch")
         self.assertEqual(updated["priority"], 2)
+
+    def test_storage_refuses_a_finished_lot_under_the_lock(self):
+        item = self.lot(priority=1)
+        api = storage.of(self.db).work
+        for state in ("promoted", "merged", "closed"):
+            with self.subTest(state=state):
+                sql = "UPDATE work_items SET state = %s WHERE id = %s"
+                if state == "closed":
+                    sql = ("UPDATE work_items SET state = %s,"
+                           " close_reason = 'abandoned' WHERE id = %s")
+                self.db.execute(sql, (state, item["id"]))
+                self.assertIsNone(api.set_priority(
+                    item["id"], 2, current=1, reason="x", actor="orch"))
+                self.assertEqual(work.get(self.db, item["id"])["priority"], 1)
+                self.assertEqual([
+                    event for event in work.events(self.db, item["id"])
+                    if (event.get("note") or "").startswith("priority ")], [])
+
+    def test_interleaved_transition_is_refused(self):
+        # relecture cx2 : la transition passe entre la lecture de work.py (qui
+        # voit le lot ouvert) et l'écriture du stockage ; la garde d'état sous
+        # FOR NO KEY UPDATE doit refuser la priorité et le journal.
+        item = self.lot(priority=1)
+        stale = dict(work.get(self.db, item["id"]))
+        self.db.execute("UPDATE work_items SET state = 'promoted' WHERE id = %s",
+                        (item["id"],))
+        real_get = work.get
+        calls = []
+
+        def racing_get(db, item_id, *args, **kwargs):
+            calls.append(item_id)
+            return stale if len(calls) == 1 else real_get(db, item_id, *args, **kwargs)
+
+        with mock.patch.object(work, "get", side_effect=racing_get):
+            with self.assertRaises(work.WorkError) as raised:
+                work.set_priority(self.db, item["id"], 2, reason="x",
+                                  actor="human:owner")
+        self.assertIn("open lot", str(raised.exception))
+        self.assertEqual(work.get(self.db, item["id"])["priority"], 1)
+        self.assertEqual([
+            event for event in work.events(self.db, item["id"])
+            if (event.get("note") or "").startswith("priority ")], [])
 
     def test_missing_lot_is_refused(self):
         proc = self.mesh("work", "set-priority", "999999", "2",
