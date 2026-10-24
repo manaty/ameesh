@@ -238,6 +238,25 @@ class DiscoveryTest(PgTestCase):
             now=row["created_ts"] + 2 * 3600)
         self.assertEqual(next(p["action"] for p in plan if p["path"] == path), "retrait")
 
+    def test_a_folder_naming_another_agent_does_not_lend_its_lot(self):
+        """#3266 (relecture) : `nexlink-a2-431` avec #431 assigné à a1 garde
+        l'agent a2 et lot=None ; la passe vérifie le tour de a2 avant tout
+        retrait, jamais celui de l'assigné."""
+        _sans_processus(self)
+        lot = work.add(self.db, title="a1-lot", assignee="a1")["id"]
+        work.close(self.db, lot, abandoned=True)
+        self.agents["a2"] = os.path.join(self.tmp, "a2")
+        path = self.linked("nexlink-a2-%d" % lot, "topic")
+        self.discover()
+        row = next(r for r in self.store.worktrees("pc") if r["path"] == path)
+        self.assertEqual((row["agent"], row["lot"]), ("a2", None))
+        _entries, plan = hk._worktree_pass(
+            self.db, "pc", dry_run=True, protected={self.main},
+            running={"a2"}, now=row["created_ts"] + 25 * 3600)
+        tour = next(p for p in plan if p["path"] == path)
+        self.assertEqual(tour["action"], "attend")
+        self.assertIn("turn in progress for a2", tour["detail"])
+
     def test_scratch_wt_under_the_agent_directory_is_attributed(self):
         """#3266 : le nom de grattage `.wt<lot>` sous le dossier de travail de
         l'agent nomme le lot ; `_attribution` le lit (le dossier est dans le

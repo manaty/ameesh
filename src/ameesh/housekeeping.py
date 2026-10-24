@@ -157,6 +157,8 @@ UNATTRIBUTED = "unattributed"
 UNATTRIBUTED_LEGACY = "non attribué"
 #: #3266 : détail d'un worktree rattaché à son lot par le nom de son dossier
 ATTRIBUTED_DETAIL = "attributed from the worktree name: lot #%s (assigned to %s)"
+#: #3266 : le dossier nomme l'agent, mais aucun lot ne lui est assigné
+OWNER_DETAIL = "owner from the worktree name: %s (lot not proved)"
 #: borne d'un parcours de taille (fichiers) : au-delà, la taille est un minimum
 WALK_LIMIT = 300_000
 #: délai maximal d'une commande git (secondes)
@@ -2721,19 +2723,31 @@ def worktree_named_lots(path: str, agents=()) -> tuple[str, list[int]]:
     `("", [])` — il reste non attribué. Un nom sans agent et sans convention
     de worktree (`wt`, `work`, `lot`, `review`, `prep`, `tmp`, `scratch`,
     `agent`, `paquet`) n'est pas lu : une date (`release-2026-10-23`) n'est
-    pas une suite de lots."""
+    pas une suite de lots.
+
+    La convention stricte `<agent>-<id>` garde sa priorité : `a1-431-22`
+    nomme #431, le `-22` est un suffixe, jamais un second lot (#3266,
+    relecture). Les autres conventions rendent tous leurs groupes, du
+    dernier au premier, pour que l'appelant les vérifie tous."""
     name = os.path.basename(os.path.normpath(path))
     owner = ""
     for candidate in sorted((n for n in agents or () if n), key=len, reverse=True):
+        # Un nom qui se termine par `-<agent>` n'est pas une preuve : un
+        # dossier de relecture `relecture-a2` nommerait a2 sans le prouver
+        # (#3266, suite L73b). Le préfixe de projet est couvert par le
+        # marqueur `-<agent>-` ; le dossier de travail d'un agent est protégé.
         if (name == candidate or name.startswith(candidate + "-")
                 or name.startswith(candidate + ".")
-                or name.endswith("-" + candidate)
                 or ("-" + candidate + "-") in name
                 or ("-" + candidate + ".") in name):
             owner = candidate
             break
     if not owner and not WORKTREE_NAME.search(name):
         return "", []
+    if owner:
+        strict = named_lot(name, owner)
+        if strict is not None:
+            return owner, [strict]
     from . import housekeeping_clones
     return owner, list(reversed(housekeeping_clones.named_lots(name, agents)))
 
@@ -2755,13 +2769,17 @@ def lot_of_worktree(db, agent: str, path: str, branch: str = "",
     #3266: the folder is read with the shared conventions of
     `worktree_named_lots` (`nexlink-<agent>-<lot>`, `.wt<lot>`), not only
     `<agent>-<lot>`; a folder naming ANOTHER agent of `agents` proves nothing
-    for this one (the caller keeps it as a foreign copy)."""
+    for this one (the caller keeps it as a foreign copy). A folder that names
+    SEVERAL lots is a doubt: None here, the caller verifies every candidate
+    before a removal (`wt-432-433` must not follow #433 alone)."""
     if not agent:
         return None
     idents = cited_lots(branch, agent=branch_owner or agent)
     if not idents:
         owner, idents = worktree_named_lots(path, agents or (agent,))
         if owner and owner != agent:
+            return None
+        if len(idents) != 1:
             return None
     for ident in idents:
         try:
@@ -3048,19 +3066,6 @@ def _lot_state(db, lot) -> str | None:
     return row.get("state") if row else None
 
 
-def _known_lot(db, lot) -> bool:
-    """#3266 : le lot existe-t-il ? Un registre illisible rend True (doute :
-    le nom reste une piste à garder, jamais une raison de conclure)."""
-    try:
-        ident = int(str(lot).lstrip("#"))
-    except (TypeError, ValueError):
-        return False
-    try:
-        return storage.of(db).work.get(ident) is not None
-    except Exception:
-        return True
-
-
 def _mtime(path: str) -> float | None:
     try:
         return os.stat(path).st_mtime
@@ -3120,19 +3125,17 @@ def _worktree_pass(db, host: str, *, dry_run: bool,
         if lot is None:
             # Le dossier peut nommer un AUTRE agent que celui qui a vu
             # apparaître le worktree (`work/<agent>-<lot>` d'un voisin, le
-            # dépôt commun étant partagé) : si le lot est bien assigné à cet
-            # agent, l'attribution corrige aussi l'agent.
+            # dépôt commun étant partagé) : l'agent nommé fait foi et reste,
+            # lot prouvé ou non (relecture #3266) ; un lot assigné ailleurs
+            # laisse lot=None et suit la garde des copies étrangères.
             owner, _candidates = worktree_named_lots(
                 path, known_agents or (row.get("agent") or "",))
+            owner_detail = ""
             if owner and owner != (row.get("agent") or ""):
-                served = lot_of_worktree(db, owner, path, branch,
-                                         branch_owner=branch_owner, agents=known_agents)
-                if served is not None:
-                    row = dict(row, agent=owner)
-                    lot = served
-            if lot is None:
-                lot = lot_of_worktree(db, row.get("agent") or "", path, branch,
-                                      branch_owner=branch_owner, agents=known_agents)
+                row = dict(row, agent=owner)
+                owner_detail = OWNER_DETAIL % owner
+            lot = lot_of_worktree(db, row.get("agent") or "", path, branch,
+                                  branch_owner=branch_owner, agents=known_agents)
             if lot is not None:
                 detail = ATTRIBUTED_DETAIL % (lot, row.get("agent") or "?")
                 if not dry_run:
@@ -3141,6 +3144,12 @@ def _worktree_pass(db, host: str, *, dry_run: bool,
                     entries.append({"kind": "worktree", "action": "attributed",
                                     "path": path, "agent": row.get("agent"), "lot": lot,
                                     "detail": detail})
+            elif owner_detail and not dry_run:
+                store.set_worktree_attribution(row["id"], row.get("agent") or "",
+                                               None, owner_detail)
+                entries.append({"kind": "worktree", "action": "attributed",
+                                "path": path, "agent": row.get("agent"), "lot": None,
+                                "detail": owner_detail})
         base = {"kind": "worktree", "path": path, "agent": row["agent"], "lot": lot}
         if not os.path.isdir(path):
             plan.append(dict(base, action="disparu", detail=UNATTRIBUTED))
@@ -3151,28 +3160,26 @@ def _worktree_pass(db, host: str, *, dry_run: bool,
                 entries.append(dict(base, action="gone", detail="directory gone; "
                                     "git worktree prune (%s)" % UNATTRIBUTED))
             continue
+        # #3266 : TOUS les lots que la branche et le dossier nomment, y
+        # compris inconnus, sont vérifiés avant le moindre retrait : un lot
+        # fini ne prouve rien des autres encore servis (`wt-432-433` avec #432
+        # ouvert, `wt-999999-433` avec #999999 absent). Le ménage des clones
+        # applique déjà cette règle (#2743).
+        idents = cited_lots(branch, agent=branch_owner)
+        _owner, folder_idents = worktree_named_lots(
+            path, known_agents or (row.get("agent") or "",))
+        idents = list(dict.fromkeys(idents + folder_idents))
         named = cited_lot(branch, agent=branch_owner)
         if named is None:
-            # #3266 : le dossier peut nommer le lot d'un autre agent (copie de
-            # revue, lot réassigné) par les mêmes conventions ; il suit alors
-            # la règle des copies étrangères, pas celle des orphelins. Un
-            # numéro qui ne correspond à AUCUN lot reste une convention
-            # inconnue : le worktree garde la règle des orphelins.
-            _owner, candidates = worktree_named_lots(
-                path, known_agents or (row.get("agent") or "",))
-            named = next((c for c in candidates if _known_lot(db, c)), None)
+            named = folder_idents[0] if folder_idents else None
         # #2174: a named lot that cannot be attributed (another agent's: a
-        # review copy, a reassigned lot) follows the orphan rule once that lot
-        # has ended — 24 h idle, clean and pushed; open, unknown or unreadable,
-        # it proves nothing and the worktree stays (agents-1, 17/10: 205 of
-        # 221 such copies named a merged or closed lot, kept forever).
+        # review copy, a reassigned lot) follows the orphan rule once every
+        # named lot has ended — 24 h idle, clean and pushed; an open, unknown
+        # or unreadable lot proves nothing and the worktree stays.
         foreign = lot is None and named is not None
         if foreign:
             try:
-                # #1694: review branches can cite several candidates. One
-                # ended lot proves nothing about the others still served.
-                states = [_lot_state(db, ident) for ident in
-                          (cited_lots(branch, agent=branch_owner) or [named])]
+                states = [_lot_state(db, ident) for ident in idents]
             except Exception:  # registre illisible : rien n'est prouvé
                 states = [None]
             if any(state not in LOT_ENDED for state in states):

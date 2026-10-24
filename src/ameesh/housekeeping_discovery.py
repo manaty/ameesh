@@ -47,21 +47,30 @@ def _attribution(db, path: str, branch: str, agents: dict, witness: str):
             name = owners[0]
             return name, hk.lot_of_worktree(db, name, path, branch, agents=agents)
         return witness, None
+    # #3266: the folder may name an agent (`nexlink-<agent>-<lot>`, `.wt<lot>`)
+    # and its lot. The named agent stays the owner (#3266 relecture): a lot
+    # assigned elsewhere is not attributed to it. The lot is proved only when
+    # branch and folder name exactly one, assigned to that owner; several
+    # named lots are a doubt — the pass verifies every candidate before a
+    # removal (`wt-432-433` must not follow #433 alone).
+    owner, named = hk.worktree_named_lots(path, agents)
+    if owner:
+        if owner not in agents:
+            return witness, None
+        branch_owner = hk.branch_agent(branch, agents) or owner
+        idents = list(dict.fromkeys(hk.cited_lots(branch, agent=branch_owner) + named))
+        if len(idents) == 1:
+            row = storage.of(db).work.get(idents[0])
+            if row and row.get("assignee") == owner:
+                return owner, str(idents[0])
+        return owner, None
     candidates = hk.cited_lots(branch)
     if not candidates:
-        # #3266: the folder may carry a project prefix
-        # (`nexlink-<agent>-<lot>`) or name one of the agents; the shared
-        # conventions of the clone housekeeping (#2743) say which lot. A
-        # folder naming another agent is that agent's, never the witness's.
-        owner, named = hk.worktree_named_lots(path, agents)
-        if owner in agents:
-            candidates, witness = named, owner
-        elif not owner:
-            for name in agents:
-                ident = hk.named_lot(os.path.basename(path), name)
-                if ident is not None:
-                    candidates.append(ident)
-                    witness = name
+        for name in agents:
+            ident = hk.named_lot(os.path.basename(path), name)
+            if ident is not None:
+                candidates.append(ident)
+                witness = name
     for ident in candidates:
         row = storage.of(db).work.get(ident)
         if row and row.get("assignee") in agents:

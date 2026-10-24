@@ -369,16 +369,25 @@ class WorktreeEtatTest(_Tmp):
     def test_le_dossier_nomme_le_lot_par_les_conventions_des_clones(self):
         """#3266 : le dossier d'un worktree se lit avec les conventions du
         ménage des clones (#2743), au-delà de `<agent>-<id>` : préfixe de
-        projet (`nexlink-<agent>-<lot>`), `.wt<lot>`, `<agent>.wt<lot>`. Le
-        dernier groupe l'emporte ; un nom inconnu ne nomme rien."""
+        projet (`nexlink-<agent>-<lot>`), `.wt<lot>`, `<agent>.wt<lot>`. La
+        convention stricte garde sa priorité (un suffixe n'est pas un lot) ;
+        un fragment de SHA n'est pas un lot ; un nom inconnu ne nomme rien."""
         self.assertEqual(menage.worktree_named_lots("/w/nexlink-a1-431", ("a1",)),
                          ("a1", [431]))
         self.assertEqual(menage.worktree_named_lots("/w/a1-431", ("a1",)), ("a1", [431]))
+        # `a1-431-22` nomme #431 (convention stricte), pas #22
+        self.assertEqual(menage.worktree_named_lots("/w/a1-431-22", ("a1",)),
+                         ("a1", [431]))
         self.assertEqual(menage.worktree_named_lots("/w/mty-amh-impl-08.wt3219",
                                                     ("mty-amh-impl-08",)),
                          ("mty-amh-impl-08", [3219]))
         self.assertEqual(menage.worktree_named_lots("/w/.wt1349-r1", ("a1",)),
                          ("", [1349]))
+        # un nombre collé à un fragment de SHA n'est pas un lot (relecture)
+        self.assertEqual(menage.worktree_named_lots("/w/wt3220-ca47", ("a1",)),
+                         ("", [3220]))
+        self.assertEqual(menage.worktree_named_lots("/w/review-3220-ab1234cd", ("a1",)),
+                         ("", [3220]))
         self.assertEqual(menage.worktree_named_lots("/w/nexlink-a2-431", ("a1", "a2")),
                          ("a2", [431]))
         self.assertEqual(menage.worktree_named_lots("/w/inconnu", ("a1",)), ("", []))
@@ -395,7 +404,9 @@ class WorktreeEtatTest(_Tmp):
         au lot SEULEMENT si ce lot est assigné à l'agent ; un dossier qui
         nomme un autre agent du registre ne prouve rien pour celui-ci."""
         class _Registre:
-            ROWS = {1132: {"assignee": "a1"}, 999: {"assignee": "a2"}}
+            ROWS = {1132: {"assignee": "a1"}, 999: {"assignee": "a2"},
+                    431: {"assignee": "a1"}, 22: {"assignee": "a1"},
+                    432: {"assignee": "a1"}, 433: {"assignee": "a1"}}
 
             def get(self, ident):
                 return self.ROWS.get(ident)
@@ -414,6 +425,12 @@ class WorktreeEtatTest(_Tmp):
                 None, "a1", "/w/nexlink-a2-1132", "", agents=("a1", "a2")))
             self.assertIsNone(menage.lot_of_worktree(
                 None, "a1", "/w/a1/inconnu", ""))
+            # convention stricte : `a1-431-22` suit #431, pas #22
+            self.assertEqual(menage.lot_of_worktree(
+                None, "a1", "/w/a1-431-22", ""), "431")
+            # plusieurs lots nommés : doute, la passe vérifie tous les candidats
+            self.assertIsNone(menage.lot_of_worktree(
+                None, "a1", "/w/wt-432-433", ""))
 
     def test_cited_lots_are_tried_in_order(self):
         """#1694: a branch citing several numeric groups lists its candidates
@@ -1567,6 +1584,61 @@ class MenageDbTest(PgTestCase):
         rows = storage.of(self.db).housekeeping.worktrees("pc")
         self.assertEqual((rows[0]["agent"], rows[0]["lot"], rows[0]["status"]),
                          ("a1", str(fini), "removed"))
+
+    def test_relecture_tous_les_candidats_du_dossier_avant_retrait(self):
+        """#3266 (relecture) : la convention stricte garde la priorité
+        (`a1-431-22` suit #431) ; un dossier qui nomme plusieurs lots, dont un
+        ouvert ou inconnu, n'autorise aucun retrait ; le propriétaire nommé
+        reste l'agent même quand le lot est assigné ailleurs (tour en cours)."""
+        registry.upsert(self.db, "a1", harness="claude", host="pc",
+                        cwd=os.path.join(self.tmp, "a1"))
+        registry.upsert(self.db, "a2", harness="claude", host="pc",
+                        cwd=os.path.join(self.tmp, "a2"))
+        # a1 : un lot fini (étranger), un lot fini (strict), un lot ouvert
+        etranger = self._lot("etranger")
+        work.assign(self.db, etranger, "a1")
+        work.close(self.db, etranger, abandoned=True)
+        strict_fini = self._lot("strict-fini")
+        work.assign(self.db, strict_fini, "a1")
+        work.close(self.db, strict_fini, abandoned=True)
+        strict_ouvert = self._lot("strict-ouvert")
+        work.assign(self.db, strict_ouvert, "a1")
+        # a2 : un lot fini (multiple), puis un lot ouvert (multiple)
+        multi_fini = self._lot("multi-fini")
+        work.assign(self.db, multi_fini, "a2")
+        work.close(self.db, multi_fini, abandoned=True)
+        multi_ouvert = self._lot("multi-ouvert")
+        work.assign(self.db, multi_ouvert, "a2")
+        rows = {}
+        for agent, name in (
+                ("a1", "a1-%d-%d" % (strict_ouvert, strict_fini)),
+                ("a2", "nexlink-a2-%d" % etranger),
+                ("a2", "wt-%d-%d" % (multi_fini, multi_ouvert)),
+                ("a2", "wt-999999-%d" % multi_fini)):
+            path = os.path.join(self.tmp, name)
+            os.makedirs(path)
+            row = storage.of(self.db).housekeeping.register_worktree(
+                host="pc", path=path, repo="", agent=agent, lot=None,
+                turn_id="t", branch="", head="")
+            storage.of(self.db).housekeeping.set_worktree_status(row["id"], "active", "")
+            rows[name] = path
+        _entries, plan = menage._worktree_pass(
+            self.db, "pc", dry_run=True, protected=set(), running={"a2"},
+            now=time.time() + 25 * 3600, known_agents=("a1", "a2"))
+        plan = {p["path"]: p for p in plan if p.get("kind") == "worktree"}
+        strict = plan[rows["a1-%d-%d" % (strict_ouvert, strict_fini)]]
+        self.assertEqual((strict["action"], strict["lot"]),
+                         ("attend", str(strict_ouvert)))
+        tour = plan[rows["nexlink-a2-%d" % etranger]]
+        self.assertEqual(tour["agent"], "a2")
+        self.assertIn("turn in progress for a2", tour["detail"])
+        kept = {r["path"]: r for r in storage.of(self.db).housekeeping.worktrees("pc")}
+        self.assertIsNone(kept[rows["nexlink-a2-%d" % etranger]]["lot"])
+        for name in ("wt-%d-%d" % (multi_fini, multi_ouvert),
+                     "wt-999999-%d" % multi_fini):
+            row = plan[rows[name]]
+            self.assertEqual((row["action"], row["lot"]), ("garde", None), row)
+            self.assertIn("not attributable", row["detail"])
 
     def test_worktrees_suivis_sans_plafond_pour_le_menage(self):
         """#2174 : `limit=None` rend tous les worktrees suivis de l'hôte (le
