@@ -91,6 +91,14 @@ ajoute le refus `pilot-hold`, dont le détail commence par « hold pilote ». Le
 composeur écrit ce motif dans la table « Écartés (ce véhicule) » : le lot
 n'entre pas dans `--ready-out`, et le calcul ne le propose plus comme unité.
 
+L'autorité de pilote est lue **en strict** (`assignments.is_orchestrator`
+avec `strict=True`, `planned_waits.active_holds` avec `strict=True`) : un
+registre, un canon ou un alias illisible lève au lieu de conclure « non
+pilote », et la liste est déclarée incomplète (`CandidateError`, rc `1`,
+`--ready-out` retiré). Un acteur dont l'autorité est effectivement lue et qui
+n'est pas pilote pose un hold ordinaire, qui ne réserve pas le paquet : les
+deux cas ne se confondent pas (B1 de la relecture #3375).
+
 Le composeur peut passer outre, explicitement et pour une raison :
 
 ```sh
@@ -109,14 +117,13 @@ reste en place : le calcul suivant écarte de nouveau le lot tant qu'un
 `unhold:` (ou un changement d'état) ne l'a pas levé.
 
 `paquet-candidats.py` ne compose rien et n'écrit dans aucun dépôt : il lit la
-base, les jalons et Git (clone privé du radar, ou clone jetable),
-et son code de retour est `1` si une lecture a échoué — une liste incomplète
-ne doit pas servir de base à un paquet. Il reste en lecture seule, sauf le
-geste explicite `--hold-override`, qui écrit sur le lot la note de la
-surcharge. Dans ce cas `--ready-out` est retiré,
-y compris un export d'une exécution précédente : `paquet-inclusion.py`
-s'arrête alors sur un fichier absent (code `2`) au lieu de lire une liste
-partielle. `--json` rend le schéma
+base, les jalons et Git (clone privé du radar, ou clone jetable). Son code de
+retour est `1` si une lecture a échoué — une liste incomplète ne doit pas
+servir de base à un paquet — et, dans ce cas, `--ready-out` est retiré, y
+compris un export d'une exécution précédente : `paquet-inclusion.py` s'arrête
+alors sur un fichier absent (code `2`) au lieu de lire une liste partielle. Le
+seul cas où il écrit en base est le geste explicite `--hold-override`, qui
+journalise la surcharge sur le lot. `--json` rend le schéma
 `ameesh-packet-candidates/1` avec, par lot, la tête publiée, le gel effectif,
 la classe, la porte des avis, l'essai de fusion et les **codes** de refus
 (`freeze-not-head`, `verdicts-missing`, `conflict`, `pilot-hold`,

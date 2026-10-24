@@ -127,14 +127,21 @@ def explicit_holds(events, *, allowed=None) -> dict[int, dict]:
     return out
 
 
-def _pilot_allowed(db, cfg):
+def _pilot_allowed(db, cfg, *, strict: bool = False):
     """Le prédicat d'autorisation d'un hold de pilote (#1664, #2916).
 
     Même autorisation que la correction d'état et la désignation du relecteur
     (`work.corrector`, rôles `work.CORRECTOR_ROLES`) : un humain, ou un agent
     orchestrateur/conception déclaré (`AMEESH_ALERT_ORCHESTRATORS`, fiche Agent
     du canon), sans l'historique des lots confiés. Un hold d'un autre acteur
-    garde son effet sur le réveil (règle 1) mais ne supprime pas l'alerte."""
+    garde son effet sur le réveil (règle 1) mais ne supprime pas l'alerte.
+
+    #3375 : `strict=True` distingue un acteur **non pilote** d'une **autorité
+    illisible**. Le défaut (`False`) garde la tolérance des alertes et de la
+    stagnation ; la porte du paquet lit en strict, car ignorer un hold de
+    pilote y ferait composer un lot réservé. En strict, une panne du registre,
+    du canon ou de la résolution d'alias lève, au lieu de conclure « non ».
+    """
     from . import assignments, work            # imports tardifs : pas de cycle
     verdict: dict[str, bool] = {}
 
@@ -145,15 +152,18 @@ def _pilot_allowed(db, cfg):
                     who.startswith(work.HUMAN_PREFIX)
                     or assignments.is_orchestrator(cfg, db, who,
                                                    roles=work.CORRECTOR_ROLES,
-                                                   history=False))
+                                                   history=False, strict=strict))
             except Exception:
-                verdict[who] = False           # autorisation illisible : pas de hold
+                if strict:
+                    raise                # autorité indéterminée : le doute refuse
+                verdict[who] = False     # autorisation illisible : pas de hold
         return verdict[who]
 
     return allowed
 
 
-def active_holds(db, events, *, cfg=None) -> dict[int, dict[str, dict]]:
+def active_holds(db, events, *, cfg=None,
+                 strict: bool = False) -> dict[int, dict[str, dict]]:
     """#3219 : les retenues actives de chaque lot, par auteur.
 
     Les holds d'un lot forment un **ensemble**, pas une pile dont on ne lirait
@@ -176,7 +186,7 @@ def active_holds(db, events, *, cfg=None) -> dict[int, dict[str, dict]]:
                               for event in events or ()):
         return {}
     cfg = getattr(db, "cfg", None) if cfg is None else cfg
-    allowed = _pilot_allowed(db, cfg)
+    allowed = _pilot_allowed(db, cfg, strict=strict)
     out: dict[int, dict[str, dict]] = {}
     for ident, lot_events in ordered.items():
         held: dict[str, dict] = {}
@@ -205,7 +215,8 @@ def active_holds(db, events, *, cfg=None) -> dict[int, dict[str, dict]]:
     return out
 
 
-def pilot_holds(db, events, *, cfg=None) -> dict[int, dict]:
+def pilot_holds(db, events, *, cfg=None,
+                strict: bool = False) -> dict[int, dict]:
     """Les holds posés par un pilote (#1664) — les seuls comptés par la
     stagnation.
 
@@ -214,12 +225,14 @@ def pilot_holds(db, events, *, cfg=None) -> dict[int, dict]:
     un journal complet ; les deux donnent le même hold. La lecture
     d'autorisation est celle de `_pilot_allowed`. #3219 : un hold de pilote
     reste actif même recouvert par le hold ordinaire d'un autre auteur ; le
-    dernier hold de pilote actif porte l'auteur et la date affichés."""
+    dernier hold de pilote actif porte l'auteur et la date affichés.
+    #3375 : `strict=True` propage une autorité illisible au lieu de conclure
+    « non pilote » (la porte du paquet lit ainsi)."""
     events = list(events or ())
     if not any(is_hold_note(event.get("note")) for event in events):
         return {}
     out: dict[int, dict] = {}
-    for lot, holds in active_holds(db, events, cfg=cfg).items():
+    for lot, holds in active_holds(db, events, cfg=cfg, strict=strict).items():
         pilots = [hold for hold in holds.values() if hold.get("pilot")]
         if not pilots:
             continue

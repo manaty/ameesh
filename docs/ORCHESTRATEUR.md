@@ -541,7 +541,9 @@ verdicts requis sur cette tête et un essai de fusion propre contre la cible. Un
 lot prêt absent du paquet doit figurer dans la table « Écartés (ce véhicule) »
 du manifeste avec un motif ; sinon il n'est ni composé ni visible. Un lot sous
 **hold de pilote actif** n'est pas prêt (`planned_waits`, #3375) : le calcul le
-rend `pilot-hold`, motif « hold pilote » au manifeste ; le composeur ne le
+rend `pilot-hold`, motif « hold pilote » au manifeste ; l'autorité de pilote est
+lue en strict, donc un registre ou un canon illisible rend la liste incomplète
+(rc 1, `--ready-out` retiré) au lieu de libérer le lot. Le composeur ne le
 passe qu'avec `--hold-override <lot> --hold-reason "…"`, la raison étant
 journalisée sur le lot. Si le calcul est incomplet (une lecture impossible),
 `--ready-out` est retiré, y compris un export précédent : le contrôle

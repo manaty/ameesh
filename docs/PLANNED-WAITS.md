@@ -130,6 +130,14 @@ lot (`hold-override: …`); the pilot's hold itself is unchanged, so the next
 calculation excludes the lot again until an `unhold:` or a state change lifts
 it (#3375).
 
+That path reads the authority **strictly** (`is_orchestrator(..., strict=True)`,
+`active_holds(..., strict=True)`): an unreadable registry, canon or alias raises
+instead of being classified "not a pilot", and the candidate list is declared
+incomplete — no composition on it. The tolerant default is unchanged for the
+alerts and the stagnation, where a registry outage must not silence everything.
+A readable "not a pilot" answer still makes an ordinary hold, which does not
+reserve the package.
+
 `merged`, `promoted` and `closed` blockers no longer defer the alert. Missing
 references, self references, proposed/done/cancelled commitments and free
 text such as “after #123 merges” do not suppress it. An unresolved package

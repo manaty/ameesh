@@ -45,6 +45,8 @@ pilote » — le motif que le composeur écrit dans sa table « Écartés ». Le
 composeur peut passer outre explicitement (`hold_overrides`), jamais par
 défaut : la surcharge ne lève que le hold, pas les autres refus (gel, avis,
 conflit). Le journal de la surcharge est écrit par l'appelant, sur le lot.
+L'autorité de pilote est lue **en strict** : un registre ou un canon illisible
+rend la liste incomplète (`CandidateError`), jamais un lot réputé libre.
 
 Un lot dont la préparation n'a pas pu être lue (branche, cible, classe, porte)
 n'est ni prêt ni écarté : il porte `error`, et l'appelant doit refuser de
@@ -485,8 +487,12 @@ def _pilot_holds(db, ids, cfg=None) -> dict[int, dict]:
     `planned_waits.active_holds`, dont l'autorisation de pilote est relue à
     l'instant (`human:*`, orchestrateur/conception). Un lot peut porter
     plusieurs holds ; on retient le plus récent hold de pilote actif, celui
-    qui porte le motif à citer. Une lecture impossible est une erreur de
-    liste, jamais un lot réputé libre.
+    qui porte le motif à citer.
+
+    Lecture **stricte** (`strict=True`, #3375) : une autorité de pilote
+    illisible (registre, canon absent/partiel, alias) est une erreur de liste,
+    jamais un acteur réputé non pilote. Ignorer le hold ferait composer un lot
+    réservé — c'est exactement le défaut B1 relevé en relecture.
     """
     from . import planned_waits        # import tardif : évite le cycle work/plan
 
@@ -496,7 +502,7 @@ def _pilot_holds(db, ids, cfg=None) -> dict[int, dict]:
     try:
         events = storage.of(db).progress.lot_hold_events(
             lot_ids, planned_waits.HOLD_NOTE_PATTERNS)
-        active = planned_waits.active_holds(db, events, cfg=cfg)
+        active = planned_waits.active_holds(db, events, cfg=cfg, strict=True)
     except Exception as exc:  # noqa: BLE001 - lecture impossible : liste incomplète
         raise CandidateError("cannot read the active pilot holds: %s" % exc) from exc
     out: dict[int, dict] = {}
