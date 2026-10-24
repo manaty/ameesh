@@ -238,6 +238,27 @@ class ProdGateCloseTest(_PlanDb):
                                repo=self.repo)
         self.assertIsNone(done["retention"])
 
+    def test_un_gel_reverte_sur_la_prod_ne_ferme_pas(self):
+        """impl-05 (relecture de 167ddd4a) : gel publié sur main puis reverté ;
+        la tête de main, constatée, ne rouvre pas la porte par le repli sur le
+        commit constaté. Sans revert, la même lecture ferme."""
+        item = self.on_develop("revert", mark="porte OTA")
+        [frozen] = [m["sha"] for m in work.milestones(self.db, item["id"])
+                    if m["kind"] == "frozen"]
+        self.release()
+        st = storage.of(self.db)
+        done = prod_gate.check(st, work.get(self.db, item["id"]),
+                               sha=git(self.repo, "rev-parse", "main"), repo=self.repo)
+        self.assertIsNone(done["retention"])
+        git(self.repo, "revert", "--no-edit", "-m", "1", "HEAD")
+        self.publish()
+        head = git(self.repo, "rev-parse", "main")
+        done = work.close_merged(self.db, item["id"], sha=head, actor="sync",
+                                 source="sync-github", repo=self.repo)
+        self.assertEqual((done["result"], done["retention"]["what"]),
+                         ("withheld", "production"), frozen)
+        self.assertEqual(work.get(self.db, item["id"])["state"], "qa")
+
 
 if __name__ == "__main__":
     unittest.main()
