@@ -155,8 +155,9 @@ def verdict(db, child: dict, agent: str, *, agents, now: float, holder,
     de l'appelant ; ses octets sont ceux qui seront comptés.
     #3277 r1 (codex B2) : `mounts`, les points de montage sous la racine
     (`housekeeping._mount_points`) ; un bind mount sur le même système de
-    fichiers garde son `st_dev`. Une entrée qui est ou contient un point de
-    montage, ou une table illisible (None), n'est jamais supprimée."""
+    fichiers garde son `st_dev`. Une entrée qui est, contient ou se trouve
+    sous un point de montage (le dossier de l'agent monté), ou une table
+    illisible (None), n'est jamais supprimée."""
     fresh: dict = {}
     ids = hc.named_lots(child["name"], agents)
     if not ids:
@@ -185,7 +186,11 @@ def verdict(db, child: dict, agent: str, *, agents, now: float, holder,
     if mounts is None:
         return "mount table unreadable", lots, fresh
     real = os.path.realpath(child["path"])
-    inside = sorted(m for m in mounts if hk._in_subtree(m, real))
+    # #3277 r2 (codex B2bis) : un montage DANS l'entrée, mais aussi au-dessus
+    # d'elle sous la racine (le dossier de l'agent lui-même monté) : son
+    # contenu n'est pas à nous
+    inside = sorted(m for m in mounts
+                    if hk._in_subtree(m, real) or hk._in_subtree(real, m))
     if inside:
         return "mount point %s: never removed" % inside[0], lots, fresh
     fresh = dict(walk(child["path"]), name=child["name"], path=child["path"])

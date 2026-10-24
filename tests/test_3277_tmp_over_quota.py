@@ -253,6 +253,13 @@ class OverQuotaTest(PgTestCase):
             self._pass(self._former(), later=LATER)
         self.assertTrue(os.path.exists(target))
         self.assertIn("mount point", self._over_any()["data"]["top"][0]["kept"])
+        # codex r2 B2bis: the agent directory itself mounted (an ancestor)
+        stale.clear_cache()
+        with mock.patch.object(stale.hk, "_mount_points",
+                               return_value={os.path.realpath(self.old)}):
+            self._pass(self._former(), later=LATER + 30)
+        self.assertTrue(os.path.exists(target))
+        self.assertIn("mount point", self._over_any()["data"]["top"][0]["kept"])
         stale.clear_cache()
         with mock.patch.object(stale.hk, "_mount_points", return_value=None):
             self._pass(self._former(), later=LATER + 60)
