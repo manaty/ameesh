@@ -98,7 +98,9 @@ class CanonPinRequalifyTest(PgTestCase):
 
     def write_profile(self, extra=None):
         extra = extra or {}
-        text = {"inherit": True, "train": {"projects": {
+        # inherit from THIS base, never from the host's ~/.config/ameesh:
+        # `inherit: true` resolves to that host file, absent on a CI runner.
+        text = {"inherit": os.path.abspath(self.base), "train": {"projects": {
             "ameesh": {"canon_commit": self.c0}}}}
         text.update(extra)
         with open(self.profile, "w", encoding="utf-8") as target:
@@ -170,7 +172,7 @@ class CanonPinRequalifyTest(PgTestCase):
     def test_divergent_canon_paths_refuse_before_writing(self):
         other = os.path.join(self.tmp.name, "other-canon")
         with open(self.profile, "w", encoding="utf-8") as target:
-            json.dump({"inherit": True, "train": {"projects": {"ameesh": {
+            json.dump({"inherit": os.path.abspath(self.base), "train": {"projects": {"ameesh": {
                 "canon": other, "canon_commit": self.c0}}}}, target)
         with self.assertRaisesRegex(requalify.RequalifyError, "disagree on .*canon"):
             requalify.plan(self.cfg, self.db, "ameesh",
@@ -210,7 +212,7 @@ class CanonPinRequalifyTest(PgTestCase):
 
     def test_an_inherited_pin_is_not_invented_in_the_profile(self):
         with open(self.profile, "w", encoding="utf-8") as target:
-            json.dump({"inherit": True}, target)
+            json.dump({"inherit": os.path.abspath(self.base)}, target)
         result = requalify.apply(self.cfg, self.db, "ameesh", lot=self.lot,
                                  actor="pilot", gate_reader=self.reader(self.c1))
         self.assertEqual(result["files"], [os.path.abspath(self.base)])
@@ -223,7 +225,7 @@ class CanonPinRequalifyTest(PgTestCase):
 
     def test_divergent_pins_refuse_instead_of_bypassing_the_guard(self):
         with open(self.profile, "w", encoding="utf-8") as target:
-            json.dump({"inherit": True, "train": {"projects": {"ameesh": {
+            json.dump({"inherit": os.path.abspath(self.base), "train": {"projects": {"ameesh": {
                 "canon_commit": self.c1}}}}, target)
         with self.assertRaisesRegex(requalify.RequalifyError, "disagree"):
             requalify.plan(self.cfg, self.db, "ameesh",
@@ -246,7 +248,7 @@ class CanonPinRequalifyTest(PgTestCase):
             json.dump({"train": {"schema": "ameesh-train-host/1", "host": "host-a",
                                  "mode": "shadow", "projects": {}}}, target)
         with open(self.profile, "w", encoding="utf-8") as target:
-            json.dump({"inherit": True}, target)
+            json.dump({"inherit": os.path.abspath(self.base)}, target)
         cfg = types.SimpleNamespace(
             host="host-a", config_path=self.profile, config_base=self.base,
             train={"schema": "ameesh-train-host/1", "host": "host-a",
