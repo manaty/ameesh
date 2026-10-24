@@ -365,6 +365,20 @@ def _open(ops, ref: str) -> Optional[dict]:
     return None
 
 
+def opened_for(db, lot: int) -> Optional[dict]:
+    """Le lot de relecture déjà écrit pour `lot`, quel que soit son état (#3413).
+
+    Même lecture que `open_for_merge` (idempotente) ; le chemin `already` de
+    `close_merged` la consulte avant la borne du rattrapage, pour dire
+    « relecture #N déjà ouverte » plutôt qu'un motif de refus trompeur quand
+    l'ouverture existe. Best effort : une panne de lecture rend None, la
+    reprise suit son cours habituel."""
+    try:
+        return _open(storage.of(db).work, ref_of(lot))
+    except Exception:  # noqa: BLE001 - l'appelant garde son chemin normal
+        return None
+
+
 def _noted(ops, lot: int, prefix: str) -> list:
     """Les notes du journal du lot `lot` qui commencent par `prefix`.
 
@@ -1484,7 +1498,10 @@ def _warn_unopened(db, entries: list[dict]) -> str:
     Un simple journal ne se lit pas. La **deuxième** tentative d'un lot sans
     dépôt connu envoie un courrier durable aux pilotes déclarés, qui nomme les
     lots et le geste de reprise (`ameesh work merged <id> --sha <merge>
-    --repo <clone>`, idempotent). Best effort : sans pilote déclaré ou sans
+    --repo <clone>`, idempotent). #3413 : ce geste relance réellement la
+    classification (le clone fourni n'attend ni le délai ni le plafond de
+    tentatives du balayage) — il répondait « already merged: nothing to do ».
+    Best effort : sans pilote déclaré ou sans
     dépôt de courrier, le journal reste et le compte rendu le dit — un
     avertissement ne casse jamais le relevé. Rend une ligne lisible."""
     try:
@@ -1517,7 +1534,8 @@ def _warn_unopened(db, entries: list[dict]) -> str:
         "",
         "Un lot léger doit être relu après fusion ; sans dépôt, la relecture",
         "n'est jamais ouverte. Reprendre chaque lot avec le clone qui porte la",
-        "fusion (la déclaration est idempotente) :",
+        "fusion : le clone fourni relance la classification, la fusion déjà",
+        "écrite n'est pas rouverte (la déclaration est idempotente) :",
         "  ameesh work merged <id> --sha <commit de fusion> --repo <clone>",
         "Ou corriger `radar.projects.<projet>.repo` (ou le dossier de l'assigné)",
         "sur l'hôte du rattrapage.",
@@ -1697,7 +1715,8 @@ def catch_up(db, *, repo: str = "", target: str = "",
 
 
 def catch_up_eligible(db, lot: int, *, retry_s: float = ATTEMPT_RETRY_S,
-                      max_attempts: int = CATCH_UP_MAX_ATTEMPTS) -> bool:
+                      max_attempts: int = CATCH_UP_MAX_ATTEMPTS,
+                      explicit: bool = False) -> bool:
     """L539 (#1104, B1 de la R1) : ce lot déjà fusionné serait-il encore
     sélectionné par le rattrapage borné (`catch_up`) ?
 
@@ -1708,7 +1727,16 @@ def catch_up_eligible(db, lot: int, *, retry_s: float = ATTEMPT_RETRY_S,
     `already` de `close_merged` : sans cette borne, chaque passage de
     `sync-github` relancerait l'ouverture pour les ~1019 fusions antérieures à
     l'activation (B1). Best effort : toute panne de lecture ferme la porte, le
-    lot reste au rattrapage et n'est jamais rouvert par ce chemin."""
+    lot reste au rattrapage et n'est jamais rouvert par ce chemin.
+
+    `explicit` (#3413) : un geste **explicite** qui fournit le clone manquant
+    (`ameesh work merged <id> --sha … --repo …`, le geste que conseille
+    l'avertissement) ne subit ni le délai de reprise ni le plafond de
+    tentatives du balayage. Ces marques disent qu'une passe automatique a
+    échoué, pas qu'un clone désormais lisible serait inutile ; les faire
+    respecter rendait l'avertissement inopérant pendant une heure, puis pour
+    toujours après la marque terminale. La borne d'activation reste lue dans
+    les deux cas : aucun historique antérieur n'est relu rétroactivement."""
     try:
         ops = storage.of(db).work
         bound = ops.review_catch_up_bound()
@@ -1717,6 +1745,8 @@ def catch_up_eligible(db, lot: int, *, retry_s: float = ATTEMPT_RETRY_S,
         reader = getattr(ops, "missing_ref_eligible", None)
         if reader is None:     # magasin d'une version antérieure : rien tenté
             return False
+        if explicit:
+            return bool(reader(int(lot), ref_prefix=PREFIX + "#", since=bound))
         return bool(reader(int(lot), ref_prefix=PREFIX + "#",
                            attempt_prefix=ATTEMPT_PREFIX, retry_s=float(retry_s),
                            terminal_prefix=TERMINAL_PREFIX,
