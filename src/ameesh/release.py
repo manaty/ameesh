@@ -251,9 +251,13 @@ def _dry_run(cfg, project, *, now, version, as_json: bool) -> int:
         "excluded": plan.excluded, "migrations": plan.migrations,
         "notes": plan.notes, "empty": plan.empty,
         "tree_green": plan.tree_green,
+        "kept_active": plan.kept_active,
     }
     if as_json:
         print(json.dumps(report, ensure_ascii=False, indent=2, default=str))
+    elif plan.kept_active:
+        print("actif conservé — candidate %s plus ancienne ou divergente : aucun tag, "
+              "aucun déploiement" % plan.base[:12])
     elif plan.empty:
         print("rien de nouveau — coupure %s — cible %s @ %s : base %s = %s, aucun tag"
               % (plan.cutoff_label, project.target, plan.head[:12], plan.base[:12],
@@ -334,6 +338,16 @@ def _release_tick(cfg, args, declared) -> int:
                     cfg, db, project, now=now, force=getattr(args, "force", False),
                     no_staging=getattr(args, "no_staging", False),
                     version=getattr(args, "version", None))
+                if args.release_command == "tick":
+                    from . import staging_pending
+                    try:
+                        report["staging_pending"] = staging_pending.tick(cfg, db, project, now=now)
+                    except Exception as exc:
+                        # An unreadable observation must not undo a completed
+                        # cutoff or suppress the packet watcher on this tick.
+                        print("staging-needed %s: %s" % (name, exc), file=sys.stderr)
+                        report["staging_pending"] = {"result": "unreadable", "error": str(exc)}
+                        status = 1
             except release_cutoff.TransientReleaseError as exc:
                 print("%s: %s" % (name, exc), file=sys.stderr)
                 status = 1
@@ -350,7 +364,8 @@ def _release_tick(cfg, args, declared) -> int:
                                     " (%s)" % report.get("version")
                                     if report.get("version") else ""))
             if report.get("result") not in ("released", "reconciled", "nothing-new",
-                                            "already-recorded", "not-due", "missed"):
+                                            "already-recorded", "not-due", "missed",
+                                            "kept-active"):
                 status = 1
         return status
     finally:
@@ -412,6 +427,26 @@ def run(cfg, args) -> int:
     """`ameesh release open|check|reason|cutoff|tick|calendar|packet-watch`."""
     from . import release_cutoff
     command = args.release_command
+    if command == "staging-needed":
+        from . import staging_pending
+        from .db import open_db
+        declared = release_cutoff.projects(cfg)
+        names = _project_names(cfg, args)
+        db = open_db(cfg)
+        try:
+            status = 0
+            for name in names:
+                if args.apply:
+                    report = staging_pending.apply(cfg, db, declared[name], now=time.time(),
+                                                   actor=args.actor)
+                    if report["result"] not in ("staged", "below-threshold"):
+                        status = 1
+                else:
+                    report = staging_pending.inspect(cfg, db, declared[name], now=time.time())
+                print(json.dumps(report, ensure_ascii=False, default=str, indent=2))
+            return status
+        finally:
+            db.close()
     if command == "calendar":
         declared = release_cutoff.projects(cfg)
         if not declared:
@@ -506,6 +541,14 @@ def add_parser(sub, func) -> None:
     tick_p.add_argument("--version", default=None)
     tick_p.add_argument("--json", action="store_true")
     tick_p.set_defaults(func=func)
+    staging_p = rel.add_parser(
+        "staging-needed", help="#3291: merged fixes holding lots before staging; "
+                               "--apply runs staging without a tag or version")
+    staging_p.add_argument("--project", default=None)
+    staging_p.add_argument("--apply", action="store_true")
+    staging_p.add_argument("--actor", default=None,
+                           help="identified pilot/bureau, or human:<id> at a human terminal")
+    staging_p.set_defaults(func=func)
     watch_p = rel.add_parser(
         "packet-watch", help="#2601: alert the composer and the pilot when a compiled "
                              "packet slot passes with ready lots and a free target "

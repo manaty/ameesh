@@ -9,9 +9,11 @@ from __future__ import annotations
 
 import dataclasses
 import os
+import shlex
 import shutil
 import signal
 import subprocess
+import sys
 import tempfile
 import time
 import types
@@ -149,7 +151,11 @@ class ReleaseFixtureMixin:
         (self.seed / "docs/versions").mkdir(parents=True)
         (self.seed / "docs/versions/1.11.7.md").write_text("old\n")
         (self.seed / "deploy/mise-a-jour").mkdir(parents=True)
-        (self.seed / "deploy/mise-a-jour/staging.sh").write_text(STAGING)
+        # The fixture changes HOME: a python3 shim (mise, pyenv) would then
+        # resolve a different installation or wait for a network download.
+        # Run the test interpreter, as the parent process already does.
+        (self.seed / "deploy/mise-a-jour/staging.sh").write_text(
+            STAGING.replace("\npython3 -", "\n%s -" % shlex.quote(sys.executable)))
         (self.seed / "scripts").mkdir()
         shutil.copyfile(Path(__file__).resolve().parents[1] / "scripts/version-level.py",
                         self.seed / "scripts/version-level.py")
