@@ -13,8 +13,11 @@ Témoins : gel A (avec un commit tiers non reçu), force-push qui laisse A
 pendant, nouveau gel B sur l'histoire réécrite — la désignation de B bloquait
 sur l'inconnu de A ; le gel C = B + `--supersedes A` la débloque en gardant les
 auteurs **connus** de B dont le contenu survit (correcteur #2924). Un tag
-distant ou une branche hors du refspec de fetch qui conserve A font refuser le
-remplacement ; l'ascendance se prouve par un fetch exact, sinon refus fermé.
+distant, une branche hors du refspec de fetch, une ref `refs/pull/N/head` ou
+`refs/archive/…` qui pointe exactement A font refuser le remplacement ;
+l'ascendance se prouve par un fetch exact des seules pointes heads/tags,
+sinon refus fermé ; le budget de rapatriement ne compte pas les milliers de
+refs/pull.
 """
 import os
 import subprocess
@@ -184,6 +187,62 @@ class DanglingSupersedeWithRemoteTest(_DanglingSupersededFreezeFixture):
         with self.assertRaises(work.WorkError) as caught:
             self.supersede()
         self.assertIn("remote ref", str(caught.exception))
+
+    def test_a_remote_archive_ref_keeping_the_freeze_refuses(self):
+        # #3399 B1 : l'annonce entière, pas seulement heads/tags. Une ref
+        # d'archive qui pointe exactement l'ancien gel le rend accessible.
+        bare = self.add_remote()
+        self.repo.git("push", "-q", "origin",
+                      "%s:refs/archive/retained-freeze" % self.op)
+        self.assertFalse(plan_git.ref_reachable(self.repo.root, self.op))
+        self.assertIn("refs/archive/retained-freeze",
+                      self.repo.git("ls-remote", bare))
+        with self.assertRaises(work.WorkError) as caught:
+            self.supersede()
+        self.assertIn("remote ref", str(caught.exception))
+        self.assertIn("origin", str(caught.exception))
+
+    def test_a_remote_pull_ref_keeping_the_freeze_refuses(self):
+        # Témoin auditeur : refs/pull/N/head d'une PR fermée puis recréée.
+        bare = self.add_remote()
+        self.repo.git("push", "-q", "origin",
+                      "%s:refs/pull/1/head" % self.op)
+        self.assertFalse(plan_git.ref_reachable(self.repo.root, self.op))
+        self.assertIn("refs/pull/1/head", self.repo.git("ls-remote", bare))
+        with self.assertRaises(work.WorkError) as caught:
+            self.supersede()
+        self.assertIn("remote ref", str(caught.exception))
+
+    def test_many_pull_refs_do_not_exhaust_the_ancestry_budget(self):
+        # #3399 B2 : l'égalité exacte couvre toutes les refs, mais le budget
+        # d'ascendance ne compte que heads/tags. 20 refs/pull non locales ne
+        # doivent pas faire refuser la vérification : seule `keep/later`,
+        # descendante de l'ancien gel, demande un rapatriement et prouve
+        # l'accessibilité.
+        bare = self.add_remote()
+        self.repo.git("config", "remote.origin.fetch",
+                      "+refs/heads/master:refs/remotes/origin/master")
+        self.repo.git("push", "-q", "origin",
+                      "%s:refs/heads/keep/old" % self.op)
+        tree = self.repo.git("rev-parse", self.base + "^{tree}")
+        for number in range(1, 21):
+            tip = self.bare_git(
+                bare, "commit-tree", tree, "-p", self.base,
+                "-m", "pull %d" % number, env=self.env("impl"))
+            self.bare_git(bare, "update-ref",
+                          "refs/pull/%d/head" % number, tip)
+        child = self.bare_git(bare, "commit-tree", tree, "-p", self.op,
+                              "-m", "later", env=self.env("impl"))
+        self.bare_git(bare, "update-ref", "refs/heads/keep/later", child)
+        self.bare_git(bare, "update-ref", "-d", "refs/heads/keep/old")
+        self.repo.git("fetch", "-q", "origin")
+        self.assertFalse(plan_git.ref_reachable(self.repo.root, self.op))
+        self.assertIn("keep/later", self.repo.git("ls-remote", "--heads", bare))
+        with self.assertRaises(work.WorkError) as caught:
+            self.supersede()
+        text = str(caught.exception)
+        self.assertIn("remote ref", text)
+        self.assertNotIn("cannot", text)
 
 
 class ForcePushSupersedesKeepsCorrectorTest(_RewriteFixture):

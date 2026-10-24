@@ -259,17 +259,22 @@ def _history_complete(repo: str) -> bool:
 
 
 def _remote_tips(repo: str, remote: str, *,
-                 timeout: float | None = FETCH_TIMEOUT) -> list[str] | None:
-    """Les pointes (commits, tags pelées) des refs distantes heads/tags.
+                 timeout: float | None = FETCH_TIMEOUT
+                 ) -> tuple[list[str], list[str]] | None:
+    """Les pointes (commits, tags pelées) de **toutes** les refs annoncées.
 
     `ls-remote` lit l'annonce de la forge, **indépendamment du refspec de
-    fetch local** : une ref non rapatriée (tag, branche hors refspec) reste
-    visible (#3399 B1). Les tags annotés sont remplacés par leur cible pelée
-    (`^{}`). Rend None si l'annonce est illisible : la preuve d'absence est
-    alors impossible."""
+    fetch local** : une ref non rapatriée (tag, branche hors refspec, mais
+    aussi `refs/pull/N/head`, `refs/archive/…`) reste visible (#3399).
+    Les tags annotés sont remplacés par leur cible pelée (`^{}`).
+
+    Rend `(toutes, heads_tags)` : `toutes` sert à l'égalité exacte de pointe
+    sur l'annonce entière (sans fetch) ; `heads_tags` borne l'**ascendance**
+    aux refs qui s'y prêtent, pour que les milliers de `refs/pull` d'une
+    forge n'épuisent pas le budget de rapatriement (#3399 B2). `None` si
+    l'annonce est illisible : la preuve d'absence est alors impossible."""
     try:
-        proc = _git(repo, "ls-remote", "--heads", "--tags", "--", remote,
-                    timeout=timeout)
+        proc = _git(repo, "ls-remote", "--", remote, timeout=timeout)
     except (GitError, OSError):
         return None
     if proc.returncode != 0:
@@ -287,49 +292,55 @@ def _remote_tips(repo: str, remote: str, *,
             peeled[ref[:-3]] = sha
         else:
             refs.append((sha, ref))
-    tips: list[str] = []
+    all_tips: list[str] = []
+    heads_tags: list[str] = []
     for sha, ref in refs:
         tip = peeled.get(ref, sha)
-        if tip not in tips:
-            tips.append(tip)
-    return tips
+        if tip not in all_tips:
+            all_tips.append(tip)
+        if ref.startswith(("refs/heads/", "refs/tags/")) \
+                and tip not in heads_tags:
+            heads_tags.append(tip)
+    return all_tips, heads_tags
 
 
 def remote_reachable(repo: str, rev: str, remote: str = "origin", *,
                      timeout: float | None = FETCH_TIMEOUT,
                      budget: int = REMOTE_TIP_FETCH_BUDGET) -> bool | None:
-    """`rev` est-il contenu par une **ref distante** heads/tags de `remote` ?
+    """`rev` est-il contenu par une **ref distante** de `remote` ?
 
-    #3399 B1 : `refresh_clone` ne rapatrie que le refspec configuré et jamais
+    #3399 : `refresh_clone` ne rapatrie que le refspec configuré et jamais
     les tags (`fetch --no-tags`) ; il ne prouve donc pas l'absence de toute
-    ref distante. On lit l'annonce complète (`ls-remote --heads --tags`,
-    indépendante du refspec), puis :
+    ref distante. On lit l'annonce **entière** (`ls-remote`, indépendante du
+    refspec), puis :
 
     - une pointe (ou un tag pelé) **égale** au commit prouve qu'il est
-      accessible, même sans l'objet local ;
-    - une pointe locale est jugée par `merge-base --is-ancestor` ;
-    - une pointe absente est rapatriée par SHA exact (`--no-tags`, sans écrire
-      de ref) dans la limite de `budget`, puis jugée ;
-    - un nombre de pointes à rapatrier au-delà du budget, un `ls-remote` ou un
-      fetch illisible, un dépôt shallow/partiel : `None` (preuve impossible,
-      l'appelant refuse).
+      accessible, même sans l'objet local — sur **toutes** les refs annoncées,
+      `refs/pull/N/head` et `refs/archive/…` comprises ;
+    - pour les seules refs `heads`/`tags`, une pointe locale est jugée par
+      `merge-base --is-ancestor`, une pointe absente est rapatriée par SHA
+      exact (`--no-tags`, sans écrire de ref) dans la limite de `budget` ;
+    - un nombre de pointes heads/tags à rapatrier au-delà du budget, un
+      `ls-remote` ou un fetch illisible, un dépôt shallow/partiel : `None`
+      (preuve impossible, l'appelant refuse).
 
     Rend True (accessible), False (aucune ref distante ne le contient, prouvé)
     ou None (vérification impossible)."""
     full = local_commit(repo, rev) or full_commit_id(rev)
     if not full:
         return None
-    tips = _remote_tips(repo, remote, timeout=timeout)
-    if tips is None:
+    found = _remote_tips(repo, remote, timeout=timeout)
+    if found is None:
         return None
-    if full in tips:
+    all_tips, ancestry_tips = found
+    if full in all_tips:
         return True
     if not _history_complete(repo):
         return None                 # l'ascendance ne se prouve pas
     # Une pointe déjà pointée par une ref locale est couverte par
     # `ref_reachable` (False ici) : inutile de la rejouer, et une forge peut
     # annoncer des milliers de branches. On ne juge ensuite que les pointes
-    # hors de ces refs (tags, refspec restreint).
+    # heads/tags hors de ces refs (tags, refspec restreint).
     try:
         listing = _out(repo, "for-each-ref",
                        "--format=%(objectname) %(*objectname)")
@@ -340,7 +351,7 @@ def remote_reachable(repo: str, rev: str, remote: str = "origin", *,
     local: set[str] = set()
     for line in str(listing).splitlines():
         local.update(line.split())
-    candidates = [tip for tip in tips if tip not in local]
+    candidates = [tip for tip in ancestry_tips if tip not in local]
     if not candidates:
         return False
     # Présence locale en un seul processus (`cat-file --batch-check`), puis
