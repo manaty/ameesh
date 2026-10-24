@@ -119,13 +119,14 @@ hôte `H` et un jeton d'accès. Il n'y a ni nouvelle clé, ni nouveau compte :
 - la révocation de l'exécuteur (jeton, porte, drain) refuse immédiatement
   toute opération (`executor_revoked`) ; c'est la révocation de dernier recours ;
 - un **jeton de tour** (`amt1.…`, jeton opaque haché dans `executor_tokens`,
-  même mécanisme que `issue_session_token`, nouveau `kind='turn'`) est émis à
-  l'ouverture, lié à `(executor_id, turn_id, epoch)`, d'audience
-  `/api/exec/v1/turn/*` et de TTL `min(deadline, heartbeat TTL)`. Il borne les
-  dégâts d'un jeton d'exécuteur volé et porte la « session » du tour. Le jeton
-  d'accès de l'appareil reste nécessaire pour `turn.open` ; le jeton de tour
-  suffit ensuite. Le jeton n'est jamais écrit dans un courrier, un journal ou
-  un résultat.
+  même mécanisme que `issue_session_token`, nouveau `kind='turn'` ; la
+  contrainte `executor_tokens.kind` reçoit la valeur par une migration
+  additive, E2) est émis à l'ouverture, lié à `(executor_id, turn_id, epoch)`,
+  d'audience `/api/exec/v1/turn/*` et de TTL `min(deadline, heartbeat TTL)`.
+  Il borne les dégâts d'un jeton d'exécuteur volé et porte la « session » du
+  tour. Le jeton d'accès de l'appareil reste nécessaire pour `turn.open` ; le
+  jeton de tour suffit ensuite. Le jeton n'est jamais écrit dans un courrier,
+  un journal ou un résultat.
 
 **Frontière de confiance.** L'exécuteur est *dans* le périmètre de sécurité du
 mesh (il détient un jeton d'appareil), pas un humain. Deux classes :
@@ -155,8 +156,10 @@ create table external_turns (
     host             text not null,
     session          text,                          -- session de l'exécuteur, jamais agent_registry.session_id
     request_ids      bigint[] not null default '{}',-- le sous-ensemble autorisé de requests[]
+    mail_token       text not null,                 -- jeton de réservation, jamais exposé
     work_item_id     bigint,
     spend_key        text not null unique,          -- opaque, le même que marqueur/grand livre
+    marker_created_at text not null,                -- identité exacte du marqueur (#2166)
     billing_account  text,
     reserved_usd     numeric(12,6) not null,
     max_usd          numeric(12,6) not null,        -- plafond dur du tour
@@ -204,13 +207,18 @@ le répartiteur) :
    admis sur `H` (`forbidden_scope`), ou si `spend_pending` porte déjà un
    marqueur non réclamé (`accounting_pending`) ;
 2. `claim` (owner `exec:…`, TTL borné), `begin_turn` ;
-3. `mailbox.reserve(recipient=agent, owner, epoch, token=<jeton serveur>,
-   ids=request_ids, porteur="external", ttl)` ; les lignes rendues forment
+3. `mailbox.reserve(recipient=agent, owner, epoch, token=<jeton de
+   réservation>, ids=request_ids, porteur="external", ttl)` ; le jeton est
+   aléatoire, stocké dans `external_turns.mail_token`, jamais exposé ; le TTL
+   couvre `deadline_ts` plus la grâce de clôture. Les lignes rendues forment
    `requests[]` ; une demande absente de `request_ids` n'est **pas** autorisée
    pour ce tour (#2167 : la présence dans `requests[]` est l'autorisation, pas
    `delivered_ts`) ;
-4. `pending_spend.put(agent, start_index=0, turn=<kind>, model, work_item_id,
-   turn_id)` — marqueur **avant** toute dépense (L13 B5) ;
+4. `pending_spend.put_get(agent, start_index=0, turn=<kind>, model,
+   work_item_id, turn_id)` — marqueur **avant** toute dépense (L13 B5) ; on
+   capture dans la même écriture son identité exacte (`created_at` texte à la
+   microseconde, #2166) et `spend_key`, tous deux stockés pour un effacement
+   conditionnel exact à la clôture ;
 5. `turn_resources.open_turn(turn_id, agent, H, pgid=null, label="external")` ;
 6. `storage.budgets.account_reserve(billing_account, agent, usd=max_usd,
    spend_key)` : `reserved_usd = max_usd` de la fiche ; si l'enveloppe du jour
@@ -436,7 +444,9 @@ transcript brut), et conservé 90 jours. Une transaction :
    (...) RETURNING`) ; perdant → reçu existant si même statut, sinon **409
    `turn_closed`** ;
 2. ligne `turn_costs` (ou zéro rapport → `usd=0`, `estimated=false`) ;
-3. `pending_spend.clear` conditionnel par `(agent, created_at, spend_key)` ;
+3. `pending_spend.clear` conditionnel par `(agent, marker_created_at,
+   spend_key)` — l'identité exacte capturée à l'ouverture, jamais un float
+   relu (#2166) ;
 4. si le courrier n'a pas déjà été remis au premier heartbeat, remise
    (`mailbox.deliver`) pour `succeeded`, sinon `mailbox.release` (le courrier
    redevient disponible) ;
@@ -461,7 +471,10 @@ statut → 409. Un `usage` après clôture → 409 sans écriture. Un `close` sa
 rapport final : la ligne de grand livre est à zéro **uniquement** si l'état
 est `failed`/`cancelled` avant tout travail ; sinon l'enveloppe est `kept`
 (issue inconnue) et le tour est `lost`/`expired`, pas `succeeded` — une
-clôture `succeeded` sans usage est refusée (`usage_required`).
+clôture `succeeded` sans usage est refusée (`usage_required`), sauf **rapport
+de zéro explicite** (`usage: []`, `zero_usage: true`) pour un tour qui n'a
+fait aucun appel de modèle : le reçu porte alors `usd=0`, `estimated=false`,
+et l'enveloppe est relâchée.
 
 ## 7. Machine à états
 
