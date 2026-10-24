@@ -53,11 +53,15 @@ name: carte
 # #3343 (24/10/2026) — réactivation : #1632 est corrigé et fusionné, un run
 # manuel complet a publié la carte du 17/10 (996f7180, 15 min d'assemblage),
 # et la rétention des artefacts est passée à 1 jour (mesures) / 3 jours
-# (carte) (#2520). Reprennent les poussées sur main et les PR qui touchent la
-# mesure ; une carte de plus de 48 h est signalée par le plan (#3343).
+# (carte) (#2520). Décision pilote : pas de poussée sur main — chaque fusion
+# lancerait dix jobs de mesure pendant 40 à 60 min contre la ci-full du paquet
+# suivant (contention du 24/10 13:07Z). Une mesure quotidienne à 03:30Z, loin
+# des coupures 09:00Z/21:00Z et des paquets de nuit, garde la carte sous 48 h ;
+# le dispatch manuel reste disponible, et les PR qui touchent la mesure sont
+# mesurées pour contrôle. Une carte de plus de 48 h est signalée par le plan.
 on:
-  push:
-    branches: [main]
+  schedule:
+    - cron: "30 3 * * *"
   pull_request:
     paths:
       - scripts/map.py

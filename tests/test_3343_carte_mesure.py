@@ -7,10 +7,12 @@ du 17/10 (996f7180) vieillissait : le plan de chaque CI de lot retombait sur la
 suite complète (`map … old: not used`), en 3 parts psql, et une part dépassait
 le plafond de 60 min (run 40089991398, psql 1/3 annulée à 61 min).
 
-Ce module tient les deux déclencheurs rétablis par #3343 (poussée sur main et
-PR qui touche la mesure) et le plafond du job d'assemblage, porté à la borne de
-60 de #755 : le 19/10 (run 39223265159), l'assemblage tournait encore à 30 min
-alors que les dix parts étaient vertes.
+Ce module tient les déclencheurs retenus par #3343 (mesure quotidienne à
+03:30Z, PR qui touche la mesure, dispatch manuel), l'absence de poussée sur
+main (décision pilote du 24/10 : dix jobs de mesure contre la ci-full du paquet
+suivant) et le plafond du job d'assemblage, porté à la borne de 60 de #755 :
+le 19/10 (run 39223265159), l'assemblage tournait encore à 30 min alors que les
+dix parts étaient vertes.
 
 Sans base : lecture du workflow.
 """
@@ -44,10 +46,14 @@ def _on_block() -> str:
 
 class ReactivationTest(unittest.TestCase):
 
-    def test_une_poussee_sur_main_relance_la_mesure(self):
-        # #2116 avait laissé `workflow_dispatch` seul ; la mesure de main doit
-        # repartir à chaque fusion pour que la carte ne vieillisse pas.
-        self.assertRegex(_on_block(), r"(?m)^  push:\n    branches: \[main\]$")
+    def test_pas_de_poussee_sur_main(self):
+        # Décision pilote (24/10) : chaque fusion lancerait dix jobs de mesure
+        # pendant 40 à 60 min contre la ci-full du paquet suivant (contention
+        # 13:07Z). La carte est rafraîchie par un run quotidien à 03:30Z.
+        block = _on_block()
+        self.assertNotRegex(block, r"(?m)^  push:")
+        self.assertRegex(block, r'(?m)^  schedule:\n    - cron: "30 3 \* \* \*"$')
+        self.assertIn("  workflow_dispatch:", block)
 
     def test_une_pr_qui_touche_la_mesure_est_mesuree(self):
         # même liste qu'avant #2116 : la PR produit une carte de contrôle.
