@@ -22,9 +22,10 @@ housekeeping pass frees what a build regenerates:
   not dumpable, lives in `/`) or the key agent that manager runs as its unit
   (`gpg-agent.service`: not dumpable, in the unit's directory; told by cgroup
   and parent, never by name, #3195; by the manager's reading of the
-  package's unit file, whose working directory counts as its path; and by
-  the live agent itself, asked on its socket for its GnuPG home, which
-  counts as its path too: `platform.key_agent_paths`).
+  package's unit file, whose working directory counts as its path; by the
+  live agent itself, asked on its socket for its GnuPG home, which counts as
+  its path too: `platform.key_agent_paths`; and, for its open files, by the
+  kernel: no file of the worktree open anywhere, `open_files_proof`).
 * **Never**: the main checkout of a repository, an agent's working directory
   or a directory that contains one, a worktree charged to an agent in turn or
   named (branch or directory) after a lot still open (#3195: `keep`), a

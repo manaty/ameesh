@@ -128,8 +128,6 @@ class _Base(unittest.TestCase):
         stack.enter_context(mock.patch.object(process, "_unit_show", side_effect=show))
         stack.enter_context(mock.patch.object(process, "_gpg_agent_query",
                                               side_effect=query or answers))
-        stack.enter_context(mock.patch.object(process, "start_time",
-                                              return_value=time.time()))
         stack.enter_context(mock.patch.object(process, "service_managers",
                                               return_value=frozenset({7})))
         return stack
@@ -250,8 +248,10 @@ class UserPathsTest(_Base):
         managers = mock.patch.object(process, "service_managers", return_value=frozenset({7}))
         with self.units({"gpg-agent.service": 40, "ssh-agent.service": 41}):
             scan = platform.user_paths()
-        # R3: an `ssh-agent` cannot be asked for its paths: it stays a doubt
-        self.assertEqual((scan.unreadable, scan.allowed), (["41 ssh-agent"], []))
+        # R3: an `ssh-agent` cannot be asked for its paths: it stays a doubt;
+        # R4: the gpg-agent's open files still need the kernel's proof
+        self.assertEqual((scan.unreadable, scan.allowed, scan.unproven),
+                         (["41 ssh-agent"], [], ["40 gpg-agent"]))
         with mock.patch.object(process, "service_managers", return_value=frozenset()):
             self.assertIn("40 gpg-agent", platform.user_paths().doubt())
         inside = os.path.join(self.base, "wt", "node_modules")
@@ -502,6 +502,21 @@ class RunTest(_Base):
         self.assertEqual(out["entries"], [])
         self.assertIn("process(es) of the user unreadable: 23 gpg-agent",
                       " ".join(out["skipped"]))
+        # R4 (cx1, cx2 witness): a file the agent may hold open — a log-file
+        # read at its start, its configuration since deleted — holds the
+        # worktree, as any holder does; once the kernel proves it free, the
+        # pass deletes
+        log = os.path.join(wt, "node_modules", "left-pad", "index.js")
+        held_open = os.open(log, os.O_RDONLY)
+        try:
+            with self.units(pids):
+                out = self.go(wt)
+        finally:
+            os.close(held_open)
+        self.assertEqual(out["entries"], [])
+        self.assertIn("23 gpg-agent (open files not ruled out: %s: open elsewhere)"
+                      % os.path.realpath(log), " ".join(out["skipped"]))
+        self.assertTrue(os.path.exists(log))
         with self.units(pids):
             self.assertEqual(len(self.go(wt)["entries"]), 3)
 

@@ -452,8 +452,6 @@ class PlatformTest(unittest.TestCase):
         pile.enter_context(mock.patch.object(platform.process, "_unit_show", side_effect=show))
         pile.enter_context(mock.patch.object(platform.process, "_gpg_agent_query",
                                              side_effect=reponses))
-        pile.enter_context(mock.patch.object(platform.process, "start_time",
-                                             return_value=time.time()))
         return pile
 
     def test_3195_r2_les_chemins_configures_de_l_unite_comptent(self):
@@ -478,6 +476,8 @@ class PlatformTest(unittest.TestCase):
                ("GNUPGHOME de l'agent dans le dossier", {},
                 {"GNUPGHOME": dedans + "/.gnupg"}, True),
                ("HOME de l'agent dans le dossier", {}, {"HOME": dedans}, True),
+               # R4 : un fichier ouvert sous le dossier, que l'agent peut tenir
+               ("un fichier ouvert dans le dossier", {}, {}, "ouvert"),
                ("un fichier d'unité de l'utilisateur",
                 {"FragmentPath": os.path.expanduser(
                     "~/.config/systemd/user/gpg-agent.service")}, {}, True),
@@ -494,11 +494,22 @@ class PlatformTest(unittest.TestCase):
                                           return_value=frozenset({7})), \
                         self._unite(environnement, **champs), \
                         mock.patch.object(platform, "SYSTEM", "linux"):
-                    if doute:
-                        with self.assertRaises(platform.NotAvailable):
-                            platform.holders(dossier, "x")
-                    else:
-                        self.assertEqual(platform.holders(dossier, "x"), [])
+                    ouvert = None
+                    if doute == "ouvert":
+                        journal = os.path.join(dedans, "gpg.log")
+                        os.makedirs(dedans, exist_ok=True)
+                        open(journal, "w").close()
+                        ouvert = os.open(journal, os.O_RDONLY)
+                    try:
+                        if doute:
+                            with self.assertRaises(platform.NotAvailable):
+                                platform.holders(dossier, "x")
+                        else:
+                            self.assertEqual(platform.holders(dossier, "x"), [])
+                    finally:
+                        if ouvert is not None:
+                            os.close(ouvert)
+                            shutil.rmtree(dedans)
 
     def _agent_assuan(self, script):
         """#3195 R3 : un serveur Assuan d'une connexion sur un vrai socket,
@@ -569,49 +580,77 @@ class PlatformTest(unittest.TestCase):
 
     def test_3195_r3_le_home_gnupg_de_l_agent_vivant(self):
         """#3195 R3 (cx1 B2) : le home GnuPG est celui que l'agent vivant
-        donne (`GNUPGHOME`, sinon `HOME`/.gnupg) ; sa configuration doit être
-        antérieure à son démarrage et sans `log-file` (un fichier qu'il tient
-        ouvert hors de son home) ; sinon le doute reste."""
+        donne (`GNUPGHOME`, sinon `HOME`/.gnupg, sinon celui de passwd)."""
         import tempfile
         process = platform.process
         moi = os.getuid()
         racine = self._faux_proc("gpg-agent", "%d %d %d %d" % ((moi,) * 4))
         home = tempfile.mkdtemp()
         self.addCleanup(shutil.rmtree, home, True)
-        gnupg = os.path.join(home, ".gnupg")
-        os.makedirs(gnupg)
 
         def agent(gnupghome=INTROUVABLE, maison=home):
             return lambda uid, commandes: ["4242", gnupghome, maison]
+        with mock.patch.object(process, "PROC", racine):
+            self.assertEqual(process._gpg_agent_home(4242, moi, agent()),
+                             os.path.join(home, ".gnupg"))
+            self.assertEqual(process._gpg_agent_home(4242, moi, agent("/srv/cles")),
+                             "/srv/cles")
+            with mock.patch.object(process, "_home_of", return_value="/home/passwd"):
+                self.assertEqual(process._gpg_agent_home(4242, moi, agent(maison=INTROUVABLE)),
+                                 "/home/passwd/.gnupg")
 
-        def lire(requete, depart=None):
-            with mock.patch.object(process, "PROC", racine), \
-                    mock.patch.object(process, "start_time",
-                                      return_value=time.time() + 60 if depart is None
-                                      else depart):
-                return process._gpg_agent_home(4242, moi, requete)
-        self.assertEqual(lire(agent()), gnupg)
-        self.assertEqual(lire(agent("/srv/cles")), "/srv/cles")
-        with mock.patch.object(process, "_home_of", return_value="/home/passwd"):
-            self.assertEqual(lire(agent(maison=INTROUVABLE)), "/home/passwd/.gnupg")
-        conf = os.path.join(gnupg, "gpg-agent.conf")
-        with open(conf, "w") as fh:
-            fh.write("# log-file /tmp/commente\ndefault-cache-ttl 600\n")
-        self.assertEqual(lire(agent()), gnupg)
-        with open(os.path.join(gnupg, "common.conf"), "w") as fh:
-            fh.write("log-file /srv/wt/node_modules/agent.log\n")
-        self.assertIsNone(lire(agent()))
-        os.remove(os.path.join(gnupg, "common.conf"))
-        # une configuration modifiée après son démarrage : ce qu'il a lu est inconnu
-        self.assertIsNone(lire(agent(), depart=os.stat(conf).st_mtime - 1))
-        with mock.patch.object(process, "start_time", side_effect=platform.NotAvailable(
-                "process start time", "x")), \
-                mock.patch.object(process, "PROC", racine):
-            self.assertIsNone(process._gpg_agent_home(4242, moi, agent()))
+    def test_3195_r4_preuve_noyau_des_fichiers_ouverts(self):
+        """#3195 R4 (cx1, cx2) : aucune configuration ne dit les fichiers
+        qu'un agent illisible a ouverts (un `log-file` lu au démarrage, la
+        configuration supprimée depuis). `open_files_proof` les fait prouver
+        par le noyau : un bail en écriture n'est accordé que si aucune autre
+        description ouverte — lecture, écriture, projection — ne vise le
+        fichier. Ce qui ne se prouve pas est une raison, donc un doute."""
+        import mmap
+        import tempfile
+        process = platform.process
+        dossier = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, dossier, True)
+        journal = os.path.join(dossier, "node_modules", "gpg.log")
+        os.makedirs(os.path.dirname(journal))
+        with open(journal, "w") as fh:
+            fh.write("x" * 16)
+        self.assertEqual(process.open_files_proof(dossier), "")
+        self.assertEqual(process.open_files_proof(os.path.join(dossier, "absent")), "")
+        lecteur = os.open(journal, os.O_RDONLY)
+        try:
+            self.assertEqual(process.open_files_proof(dossier),
+                             "%s: open elsewhere" % journal)
+            self.assertEqual(process.open_files_proof(journal),
+                             "%s: open elsewhere" % journal)
+        finally:
+            os.close(lecteur)
+        with open(journal, "r+b") as fh:
+            projection = mmap.mmap(fh.fileno(), 16)
+        try:   # descripteur fermé, projection vivante : toujours tenu
+            self.assertIn("open elsewhere", process.open_files_proof(dossier))
+        finally:
+            projection.close()
+        # un lien n'est pas suivi : la cible ouverte ailleurs n'est pas sous `dossier`
+        dehors = tempfile.NamedTemporaryFile()
+        self.addCleanup(dehors.close)
+        os.symlink(dehors.name, os.path.join(dossier, "lien"))
+        self.assertEqual(process.open_files_proof(dossier), "")
+        os.mkfifo(os.path.join(dossier, "tube"))
+        self.assertIn("not a regular file", process.open_files_proof(dossier))
+        os.remove(os.path.join(dossier, "tube"))
         if os.geteuid() != 0:
-            os.chmod(conf, 0)
-            self.addCleanup(os.chmod, conf, 0o600)
-            self.assertIsNone(lire(agent()))
+            ferme = os.path.join(dossier, "ferme")
+            os.makedirs(ferme)
+            os.chmod(ferme, 0)
+            self.addCleanup(os.chmod, ferme, 0o700)
+            self.assertIn("walk incomplete", process.open_files_proof(dossier))
+            os.chmod(ferme, 0o700)
+        # un noyau dont le bail ne compte pas les lecteurs ne prouve rien
+        with mock.patch.object(process, "_LEASE_SELF_TEST", []), \
+                mock.patch.object(process, "_lease_refused", return_value=""):
+            self.assertIn("does not see another reader", process.open_files_proof(dossier))
+        self.assertEqual(process.open_files_proof(dossier), "")
 
     def test_allow_ne_cache_pas_un_detenteur_constate(self):
         """L230 : `allow` ne lève que le DOUTE ; un processus lisible qui tient

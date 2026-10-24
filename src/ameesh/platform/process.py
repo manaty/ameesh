@@ -803,15 +803,18 @@ def _allowed_proc(pid, allow) -> bool:
     return bool(name) and name in allow and os.path.basename(argv0) in allow
 
 
-def _doubt_proc(pid, uid: int, managers, allow=(), inside=None) -> str | None:
+def _doubt_proc(pid, uid: int, managers, allow=(), inside=None,
+                proof=None) -> str | None:
     """L63b: why a process whose open files were denied leaves the answer
     unknown, read on /proc; None when it cannot hold anything of the user's:
     gone, a zombie (no files left), running as another user (effective uid:
     a setuid helper such as sudo is root's), the user's service manager
     (`managers()`, by PID), a key agent run as its unit by that manager
     whose configured paths (`key_agent_paths`, #3195) are none `inside` the
-    path looked for, or a process named by `allow` (L230, `comm` and
-    `argv[0]`; an unreadable status is a doubt)."""
+    path looked for and whose open files there `proof()` rules out (R4:
+    `open_files_proof`, '' when nothing is open; no proof, no exemption), or
+    a process named by `allow` (L230, `comm` and `argv[0]`; an unreadable
+    status is a doubt)."""
     try:
         status = _proc_status(pid)
     except OSError as exc:
@@ -826,8 +829,9 @@ def _doubt_proc(pid, uid: int, managers, allow=(), inside=None) -> str | None:
     if _allowed_proc(pid, allow):
         return None
     configured = key_agent_paths(pid, uid, managers, status)
-    if configured is not None and not any((inside or (lambda _p: False))(path)
-                                          for path in configured):
+    if (configured is not None and proof is not None
+            and not any((inside or (lambda _p: False))(path) for path in configured)
+            and not proof()):
         return None
     return "%s %s" % (pid, " ".join(status.get("Name") or ["?"]))
 
@@ -1016,9 +1020,12 @@ def _holders_psutil(ps, real, is_dir, needle, exclude, mapped=False,
     if _proc_ok():   # Linux: the same reading of a doubt as the /proc way
         uid, managers = os.getuid(), _once(service_managers)
 
+        proof = _once(lambda: open_files_proof(real))
+
         def doubt(pid):
             return _doubt_proc(pid, uid, managers, allow,
-                               lambda path: _inside(os.path.realpath(path), real, is_dir))
+                               lambda path: _inside(os.path.realpath(path), real, is_dir),
+                               proof)
     else:
         def doubt(pid):
             return _doubt_psutil(ps, pid, user, allow)
@@ -1124,6 +1131,7 @@ def _holders_proc(real, is_dir, needle, exclude, mapped=False, session=False,
 
     def inside(path: str) -> bool:
         return _inside(os.path.realpath(path), real, is_dir)
+    proof = _once(lambda: open_files_proof(real))
     found = []
     doubts: dict = {}
     for pid in pids:
@@ -1166,13 +1174,13 @@ def _holders_proc(real, is_dir, needle, exclude, mapped=False, session=False,
         if row:
             found.append(row)
         elif refused:
-            who = _doubt_proc(pid, uid, managers, allow, inside)
+            who = _doubt_proc(pid, uid, managers, allow, inside, proof)
             if who:
                 doubts[pid] = who
     # L63b : même règle que la voie psutil — un détenteur vérifié ne se jette
     # pas parce qu'un tiers du même utilisateur refuse ses fichiers ouverts.
     if not found:
-        _settle(doubts, lambda pid: _doubt_proc(pid, uid, managers, allow, inside))
+        _settle(doubts, lambda pid: _doubt_proc(pid, uid, managers, allow, inside, proof))
     return found
 
 
@@ -1211,9 +1219,6 @@ GPG_AGENT_SOCKET = "/run/user/%d/gnupg/S.gpg-agent"
 #: GPG_ERR_NOT_FOUND, the answer of `GETINFO getenv` to an unset variable;
 #: any other error is a doubt
 GPG_ERR_NOT_FOUND = 27
-#: the agent's configuration files in its home (GnuPG 2.4): a `log-file`
-#: there is a file it holds open, out of its home
-GPG_AGENT_CONFS = ("gpg-agent.conf", "common.conf")
 
 
 def _unit_show(unit: str) -> dict:
@@ -1289,8 +1294,8 @@ def _gpg_agent_home(pid, uid: int, query=None) -> str | None:
     (`<dir>/gpg-agent --supervised`: no `--homedir`, no `gpgconf.ctl` beside
     it), the agent on the user's socket answers `GETINFO pid` with `pid`,
     then `GETINFO getenv` gives its own `GNUPGHOME`, else its `HOME`
-    (`~/.gnupg`, GnuPG's default). Its configuration files there
-    (`GPG_AGENT_CONFS`) are older than its start and name no `log-file`.
+    (`~/.gnupg`, GnuPG's default). Its other open files (a `log-file` read
+    at its start, R4) are not told by anything: `open_files_proof`.
     Anything unreadable, unexpected or not proven: None (the doubt stays)."""
     argv = _read_text(os.path.join(PROC, str(pid), "cmdline")).split("\0")
     argv = argv[:-1] if argv and argv[-1] == "" else argv
@@ -1319,25 +1324,123 @@ def _gpg_agent_home(pid, uid: int, query=None) -> str | None:
         gnupghome = os.path.join(home, ".gnupg") if home else ""
     if not os.path.isabs(gnupghome):
         return None
-    try:
-        started = start_time(pid)
-    except NotAvailable:
-        return None
-    if started is None:
-        return None
-    for name in GPG_AGENT_CONFS:
-        conf = os.path.join(gnupghome, name)
-        try:
-            if os.stat(conf).st_mtime >= started:
-                return None   # changed since its start: what it read is unknown
-            with open(conf, encoding="utf-8", errors="replace") as fh:
-                if any(line.split()[:1] == ["log-file"] for line in fh):
-                    return None
-        except FileNotFoundError:
-            continue
-        except OSError:
-            return None
     return gnupghome
+
+
+#: #3195 R4: the kernel's answer, once per process, to "does a write lease
+#: see every other reader?" ('' yes, else why not)
+_LEASE_SELF_TEST: list = []
+
+
+def _lease_refused(fd) -> str:
+    """'' when the kernel grants then releases a write lease on `fd`: no
+    other open file description — read, write or a mapping — references its
+    inode, on the whole host (fcntl(2) F_SETLEASE). Else why not."""
+    import errno
+    import fcntl
+    try:
+        fcntl.fcntl(fd, fcntl.F_SETLEASE, fcntl.F_WRLCK)
+    except OSError as exc:
+        if exc.errno in (errno.EAGAIN, errno.EBUSY):
+            return "open elsewhere"
+        return "no lease (%s)" % (exc.strerror or exc)
+    try:
+        fcntl.fcntl(fd, fcntl.F_SETLEASE, fcntl.F_UNLCK)
+    except OSError:
+        pass   # closing the descriptor releases it all the same
+    return ""
+
+
+def _lease_self_test() -> str:
+    """#3195 R4: '' when this kernel's write lease is refused while another
+    descriptor reads the file and granted once it is closed (the readers are
+    counted: CONFIG_IMA), else why the lease proves nothing here."""
+    if not _LEASE_SELF_TEST:
+        import tempfile
+        why = ""
+        try:
+            fd, path = tempfile.mkstemp(prefix="ameesh-lease-")
+            try:
+                os.close(fd)
+                mine = os.open(path, os.O_RDONLY)
+                other = os.open(path, os.O_RDONLY)
+                try:
+                    if _lease_refused(mine) != "open elsewhere":
+                        why = "a write lease does not see another reader on this kernel"
+                finally:
+                    os.close(other)
+                if not why:
+                    why = _lease_refused(mine) and "a write lease is refused on a free file"
+                os.close(mine)
+            finally:
+                os.unlink(path)
+        except OSError as exc:
+            why = "lease self-test failed: %s" % (exc.strerror or exc)
+        _LEASE_SELF_TEST.append(why or "")
+    return _LEASE_SELF_TEST[0]
+
+
+def open_files_proof(root: str) -> str:
+    """#3195 R4 (cx1, cx2): '' when no file under `root` is open anywhere on
+    the host, proven by the kernel: every regular file takes a write lease
+    (`_lease_refused`), opened without following a link nor touching its
+    access time. That is the runtime proof of the open files of a process
+    whose descriptors cannot be read (a `log-file` a `gpg-agent` opened at
+    its start, whatever its configuration says now). What cannot be proven
+    is the reason returned: a lease refused or unavailable (another owner, a
+    file system without leases), another kind of file (FIFO, socket,
+    device), a walk that cannot be completed, a kernel whose lease does not
+    count the readers (`_lease_self_test`). An absent `root` holds nothing.
+    A descriptor opened with `O_PATH` cannot read nor write a file: it is not
+    counted, nor needed."""
+    import stat
+    why = _lease_self_test()
+    if why:
+        return why
+    flags = (os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
+             | getattr(os, "O_NOATIME", 0))
+
+    def one(path: str) -> str:
+        try:
+            mode = os.lstat(path).st_mode
+        except FileNotFoundError:
+            return ""
+        except OSError as exc:
+            return "%s: %s" % (path, exc.strerror or exc)
+        if stat.S_ISLNK(mode) or stat.S_ISDIR(mode):
+            return ""
+        if not stat.S_ISREG(mode):
+            return "%s: not a regular file" % path
+        try:
+            fd = os.open(path, flags)
+        except FileNotFoundError:
+            return ""
+        except OSError as exc:
+            return "%s: %s" % (path, exc.strerror or exc)
+        try:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                return "%s: not a regular file" % path
+            refused = _lease_refused(fd)
+            return "%s: %s" % (path, refused) if refused else ""
+        finally:
+            os.close(fd)
+
+    try:
+        if not os.path.isdir(root) or os.path.islink(root):
+            return one(root)
+    except OSError as exc:
+        return "%s: %s" % (root, exc.strerror or exc)
+    errors: list = []
+    for top, dirs, files in os.walk(root, onerror=errors.append, followlinks=False):
+        for name in files:
+            why = one(os.path.join(top, name))
+            if why:
+                return why
+        if errors:
+            break
+    if errors:
+        return "walk incomplete: %s" % errors[0]
+    return ""
 
 
 def key_agent_paths(pid, uid: int, managers, status: dict | None = None, *,
@@ -1357,9 +1460,11 @@ def key_agent_paths(pid, uid: int, managers, status: dict | None = None, *,
     read from the live
     agent (`_gpg_agent_home`, `query`: `_gpg_agent_query`), never from the
     manager's environment now. The caller records them as observed paths, so
-    a worktree that contains one stays held. Anything unreadable (B1: a
-    failed reading is never an empty one): None. `status`: its
-    `_proc_status`, when already read."""
+    a worktree that contains one stays held. R4 (cx1, cx2): they are its
+    directories, not its open files — no configuration tells those; the
+    caller asks the kernel (`open_files_proof`) for each path to delete.
+    Anything unreadable (B1: a failed reading is never an empty one): None.
+    `status`: its `_proc_status`, when already read."""
     try:
         status = _proc_status(pid) if status is None else status
         ppid = int(((status or {}).get("PPid") or ["0"])[0])
@@ -1408,12 +1513,16 @@ class UserPaths:
     """Snapshot of the user's processes: real paths of their cwd, executable,
     open and mapped files (`paths`: path -> "pid name"), the processes that
     could not be read (`unreadable`), those of them let through by name
-    (`allowed`), and whether the table could be read at all (`available`)."""
+    (`allowed`), and whether the table could be read at all (`available`).
+    #3195 R4: `unproven` names the key agents whose directories are proven
+    (`key_agent_paths`) but whose open files are not: `holders(root)` names
+    them unless `open_files_proof(root)` proves nothing under it is open."""
 
     def __init__(self, available: bool = True):
         self.paths: dict = {}
         self.unreadable: list = []
         self.allowed: list = []
+        self.unproven: list = []
         self.available = available
 
     def doubt(self) -> str:
@@ -1427,8 +1536,14 @@ class UserPaths:
     def holders(self, root: str) -> list:
         root = os.path.realpath(root).rstrip(os.sep)
         prefix = root + os.sep
-        return sorted({who for path, who in self.paths.items()
-                       if path == root or path.startswith(prefix)})
+        found = {who for path, who in self.paths.items()
+                 if path == root or path.startswith(prefix)}
+        if self.unproven:
+            why = open_files_proof(root)
+            if why:
+                found |= {"%s (open files not ruled out: %s)" % (who, why)
+                          for who in self.unproven}
+        return sorted(found)
 
 
 def _read_text(path: str) -> str:
@@ -1484,10 +1599,12 @@ def user_paths(uid: int | None = None, allow=()) -> UserPaths:
     of its `argv[0]` are both in `allow` (listed in `allowed`) or both name
     the service manager (not listed): its `exe` link is unreadable too, its
     command line is not. Nor is a key agent run as its unit by the service
-    manager (`key_agent_paths`, #3195, not listed): the paths its
-    configuration gives it are recorded as its own. What was read before a
-    refusal (a `cwd`, an `exe`) is recorded all the same (#3195 R2): an
-    observation is never dropped for what could not be read after it.
+    manager (`key_agent_paths`, #3195): its proven directories are recorded
+    as its own, and it is listed in `unproven` (R4): `holders(root)` names
+    it unless the kernel proves no file under `root` is open
+    (`open_files_proof`). What was read before a refusal (a `cwd`, an
+    `exe`) is recorded all the same (#3195 R2): an observation is never
+    dropped for what could not be read after it.
     Without `/proc` (other OS), `available` is false."""
     if not _proc_ok():
         return UserPaths(available=False)
@@ -1546,6 +1663,8 @@ def user_paths(uid: int | None = None, allow=()) -> UserPaths:
                 configured = key_agent_paths(pid, uid, managers)
                 if configured is None:
                     out.unreadable.append(who)
+                else:   # R4: its open files still need the kernel's proof
+                    out.unproven.append(who)
             # #3195 R2: what was read before the refusal stays observed, and
             # a key agent's configured paths are its own
             found += configured or []
