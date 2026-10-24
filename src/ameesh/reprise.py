@@ -694,6 +694,48 @@ def pending_review_lines(db, name: str, *, now: float | None = None) -> list[str
     return out
 
 
+#: #3288 : l'en-tête et les bornes de la liste des corrections dues
+FIXES_MAX = 20
+NO_FIX_OWED = "No blocking verdict waits for your fix."
+FIX_OWED_HEADER = "## Fixes you owe (blocking verdict on your frozen head)"
+
+
+def fixes_owed_lines(db, name: str, *, now: float | None = None) -> list[str]:
+    """#3288 : les corrections que l'agent doit encore livrer, une ligne par lot.
+
+    La lecture est `review_designation_activation.due_fixes`, l'autre moitié du
+    calcul unique des avis dus (#3033) : un lot ouvert dont le dernier gel porte
+    un verdict `blocked` non annulé, sans gel plus récent, dont l'agent est
+    l'assigné. C'est le travail qui passe avant tout autre : le blocage d'un
+    relecteur n'expire pas parce que son auteur travaille ailleurs. Une lecture
+    illisible le dit, elle ne rend jamais une liste vide."""
+    from . import review_designation_activation as activation
+    from .sous_utilisation import _duration
+    try:
+        rows = activation.due_fixes(db, name)
+    except Exception as exc:  # noqa: BLE001 - illisible : dit, jamais « rien dû »
+        return ["(fixes owed unreadable: %s)" % fil.excerpt(str(exc), 120)]
+    if not rows:
+        return [NO_FIX_OWED]
+    now = time.time() if now is None else float(now)
+    out = []
+    for row in rows[:FIXES_MAX]:
+        since = row.get("blocked_ts")
+        age = (" %s ago" % _duration(now - float(since))) if since is not None else ""
+        by = row.get("blocked_by") or "a reviewer"
+        out.append("- #%s [%s] %s — blocking verdict by %s%s on frozen head %s: "
+                   "fix, push and freeze the new head "
+                   "(`ameesh work milestone %s frozen --sha <new head>`); if you moved "
+                   "the lot to build, re-enter qa (`ameesh work move %s qa`)" % (
+                       row["lot"], row.get("state") or "?",
+                       fil.excerpt(row.get("title") or "", 100), by, age,
+                       str(row.get("sha") or "")[:12], row["lot"], row["lot"]))
+    if len(rows) > FIXES_MAX:
+        out.append("- … and %d more: `ameesh work fixes-owed %s`"
+                   % (len(rows) - FIXES_MAX, name))
+    return out
+
+
 def _fil(cfg: Config, project: str) -> tuple[list[str], int]:
     """Les derniers échanges du fil du projet, bornés en nombre et en octets."""
     try:
@@ -794,13 +836,16 @@ def deterministic_brief(cfg: Config, db, row: dict | None, *, session: str | Non
                     "You may READ this transcript to recover a detail; do not resume "
                     "it and do not write to it.", ""]
     fin = ["## Instructions", (consigne or DEFAULT_RESUME).strip()]
+    # #3288 : une correction due passe avant tout autre travail — section en
+    # tête, avant les lots assignés et avant les avis à rendre (#3033).
+    fixes_sec = [FIX_OWED_HEADER] + fixes_owed_lines(db, name) + [""]
     lots_sec = ["## Work items assigned to you"] + lots + [""]
     # #3033 : les avis dus survivent à la rotation (la désignation est un
     # courrier déjà lu) ; ils passent avant le fil, qui prend le reste.
     lots_sec += ["## Reviews you owe (designated, no verdict on the frozen head)"] \
         + pending_review_lines(db, name) + [""]
-    fixe = "\n".join(head + ident + election_sec + [""] + lots_sec + courrier
-                     + [""] + extra + ancienne + fin)
+    fixe = "\n".join(head + ident + [""] + fixes_sec + election_sec + [""]
+                     + lots_sec + courrier + [""] + extra + ancienne + fin)
     reste = BRIEF_MAX_BYTES - _octets(fixe) - 200
     fil_lines, total = _fil(cfg, project)
     fil_sec = ["## Latest exchanges in thread %s (%d of %d)" % (
@@ -810,8 +855,9 @@ def deterministic_brief(cfg: Config, db, row: dict | None, *, session: str | Non
             break
         reste -= _octets(line) + 1
         fil_sec.append(line)
-    text = "\n".join(head + ident + election_sec + [""] + lots_sec + fil_sec + [""]
-                     + courrier + [""] + extra + ancienne + fin)
+    text = "\n".join(head + ident + [""] + fixes_sec + election_sec + [""]
+                     + lots_sec + fil_sec + [""] + courrier + [""] + extra
+                     + ancienne + fin)
     return with_process_rules(cfg, _clip(text.replace("\x00", ""), BRIEF_MAX_BYTES),
                               agent=name, canon_id=row.get("canon"),
                               host=row.get("host") or "")
