@@ -321,6 +321,49 @@ class HandoffTest(_Handoff):
                          [("codex1", build["id"])])
         self.assertEqual(self.assignee(build), "codex1")
 
+    def test_preneur_critique_jamais_choisi(self):
+        """#1136 : `auditor.is_critical` filtre aussi les PRENEURS, pas
+        seulement les sources. Un Codex critique par son rôle dans son canon
+        propriétaire, ou par la surcharge `critical_agents`, n'est jamais
+        retenu ; le Codex non critique l'est."""
+        def canon(name, cards):
+            fake = types.SimpleNamespace(
+                readable=True, is_default=True, scope_unread=False, load_findings=[],
+                federation={},
+                agents=[types.SimpleNamespace(
+                    title=agent, fiche=types.SimpleNamespace(data={"roles": roles},
+                                                             path="", ref=""))
+                    for agent, roles in cards.items()],
+                owns=lambda c, name=name: (c or None) == name or not c,
+                agent=lambda n: None)
+            fake.agent = lambda n: next((a for a in fake.agents if a.title == n), None)
+            return fake
+
+        self.agent("claude1", team="nexlink")
+        self.pause("claude1")
+        # DeepSeek occupé : seuls les deux Codex sont candidats, dans l'ordre
+        # codex1 puis codex2 — sans le filtre, le critique codex1 partirait.
+        self.agent("deepseek1", "deepseek", team="nexlink", status="running")
+        self.agent("codex1", "codex", team="nexlink")
+        self.agent("codex2", "codex", team="nexlink")
+        self.db.execute("UPDATE agent_registry SET canon = 'A' WHERE name = 'codex1'")
+        build = self.lot("import", state="build", branch="lot/import")
+        with mock.patch.object(handoff, "lot_git", return_value=GIT_OK):
+            out = self.hand(canons=[canon("A", {"codex1": ["relecture"]})])
+        self.assertEqual([(m["agent"], m["item"]["id"]) for m in out],
+                         [("codex2", build["id"])])
+        self.assertEqual(self.assignee(build), "codex2")
+        # surcharge de configuration : le preneur resté non critique passe au
+        # second plan quand il devient critique à son tour
+        second = self.lot("import 2", state="build", branch="lot/import2")
+        cfg = dataclasses.replace(self.cfg, critical_agents=("codex1", "codex2"))
+        with mock.patch.object(handoff, "lot_git", return_value=GIT_OK):
+            out = handoff.budget_handoff(
+                cfg, self.db, now=self.now, canons=[canon("A", {})],
+                declared=(), orchestras=[self.orch], budget_check=lambda a: "")
+        self.assertEqual(out, [])
+        self.assertEqual(self.assignee(second), "claude1")
+
     def test_agent_critique_ou_pas_en_pause(self):
         self.team()
         intake = self.lot("export")
