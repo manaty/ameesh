@@ -444,6 +444,47 @@ class CommitSurvivesTest(TestCase):
                                 agent="impl")
         self.assertTrue(self.survives(head, fix, base))
 
+    def _trivial_addition_witness(self, added):
+        # B14 (revue dev1) : la base porte `return None` ; le correctif le
+        # remplace par un ajout **trivial** (`pass` ou une ligne vide) et
+        # ajoute un document ; la tête repart de la base, réécrit gate.py
+        # identique octet pour octet au fichier corrigé et omet le document.
+        # Le retrait effectif et pur garde l'auteur : un ajout trivial ne fait
+        # pas un hunk mixte (sur-rétention, dans le sens sûr).
+        self.repo.write("gate.py",
+                        "def corrected(user):\n"
+                        "    guard_line_1()\n"
+                        "    guard_line_2()\n"
+                        "    return None\n"
+                        "    guard_line_3()\n"
+                        "    guard_line_4()\n")
+        base = self.repo.commit("base")
+        self.repo.write("gate.py",
+                        "def corrected(user):\n"
+                        "    guard_line_1()\n"
+                        "    guard_line_2()\n"
+                        + added +
+                        "    guard_line_3()\n"
+                        "    guard_line_4()\n")
+        self.repo.write("docs/review.md", "review own line\n")
+        fix = self.repo.commit("fix", agent="cx3")
+        self.repo.git("reset", "-q", "--hard", base)
+        self.repo.write("gate.py",
+                        "def corrected(user):\n"
+                        "    guard_line_1()\n"
+                        "    guard_line_2()\n"
+                        "    guard_line_3()\n"
+                        "    guard_line_4()\n")
+        head = self.repo.commit("impl: retrait conservé, ajout trivial omis",
+                                agent="impl")
+        self.assertTrue(self.survives(head, fix, base))
+
+    def test_a_pass_addition_does_not_make_a_pure_removal_mixed(self):
+        self._trivial_addition_witness("    pass\n")
+
+    def test_a_blank_addition_does_not_make_a_pure_removal_mixed(self):
+        self._trivial_addition_witness("\n")
+
     def test_a_reintroduced_removal_keeps_the_corrector(self):
         # B9/B10/B11 (arbitrage mesh-design) : la tête réintroduit la garde
         # exactement à sa place. Le retrait effectif et pur garde son auteur ;

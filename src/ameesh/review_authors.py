@@ -1103,8 +1103,10 @@ def _removal_proves_survival(repo: str, head: str, sha: str, path: str,
     le côté retiré d'une modification (le hunk ajoute une ligne, même héritée :
     un réordre n'est pas un retrait pur) ne prouve rien. Le retrait se juge
     hunk par hunk (B13) : un hunk pur suffit, même si un autre hunk, séparé
-    par du contexte, retire le même texte dans une modification. Une lecture
-    impossible reste un doute : le retrait compte (l'auteur est conservé)."""
+    par du contexte, retire le même texte dans une modification. Une ligne
+    ajoutée **triviale** (vide, `pass`, `}`) ne fait pas une modification : un
+    hunk qui ne retire que des lignes reste pur (B14). Une lecture impossible
+    reste un doute : le retrait compte (l'auteur est conservé)."""
     if not base:
         return True
     key = ("merge-base", head, base)
@@ -1141,8 +1143,9 @@ def _removal_proves_survival(repo: str, head: str, sha: str, path: str,
     for block in blocks:
         if row.strip() not in {value.strip() for value in block["removed"]}:
             continue
-        if not block.get("added"):
-            return True                 # un hunk pur suffit (B13)
+        if not any(_meaningful_line(value)
+                   for value in block.get("added") or ()):
+            return True                 # un hunk pur suffit (B13/B14)
         mixed = True
     return not mixed
 
