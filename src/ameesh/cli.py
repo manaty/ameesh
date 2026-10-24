@@ -463,6 +463,10 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
             return 2
         if bk.kind == "pg":
             from . import undeliverable
+            if undeliverable.watch_sender(name):
+                print("copy refused — %s" % undeliverable.watch_sender_text(name),
+                      file=sys.stderr)
+                return 2
             if undeliverable.registry_rows(bk.db, [name])[name] is None:
                 print("copy refused: unknown agent: %s (nothing delivered)" % name,
                       file=sys.stderr)
