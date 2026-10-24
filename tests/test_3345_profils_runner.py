@@ -139,6 +139,14 @@ class ProfilTest(Banc):
         # les autres réglages de l'hôte restent hérités
         self.assertEqual(cfg.harness_bins, {"claude": "/usr/bin/claude"})
 
+    def test_les_comptes_restent_une_unite_d_isolation(self):
+        """#1466 : un profil qui declare ses comptes les remplace, il n'herite
+        pas des autres harnais de l'hote (quota et sessions partages)."""
+        self._write(self.critiques, {"accounts": {"codex": [{"name": "primaire"}]}})
+        cfg = self.load(self.critiques)
+        self.assertEqual(cfg.accounts, {"codex": [{"name": "primaire"}]})
+        self.assertEqual(cfg.config_shadowed, ("accounts",))
+
     def test_un_profil_fidele_n_ecrase_rien(self):
         """Déclarer une valeur égale à la base ne crée pas d'écart : le profil
         peut être une superposition sans bruit."""

@@ -619,6 +619,13 @@ SHARED_CONFIG_KEYS = ("train", "github", "release")
 #: sentinelle d'une clé absente d'un côté d'une comparaison de configuration
 _MISSING = object()
 
+#: clés qui restent des **unités d'isolation** : un profil qui en déclare une
+#: remplace celle de config.json, il n'hérite d'aucune sous-clé (#1466). Un
+#: groupe de runners qui déclare ses propres comptes ne doit pas hériter en
+#: silence des comptes des autres exécuteurs (quota et sessions partagés) :
+#: c'est le seul objet de configuration soustrait à la fusion récursive.
+ATOMIC_CONFIG_KEYS = ("accounts",)
+
 
 def _merge_config(base: dict, overlay: dict) -> dict:
     """Superpose `overlay` (un profil) sur `base` (config.json), objet par objet.
@@ -626,14 +633,15 @@ def _merge_config(base: dict, overlay: dict) -> dict:
     #3345 : un profil ne porte que ce qu'il surcharge. Les objets JSON se
     fusionnent récursivement — `{"train": {"mode": "shadow"}}` garde le `host`
     et les `projects` de `config.json` — tandis qu'une liste ou un scalaire
-    déclaré remplace la valeur de la base. Avant, la superposition était de
-    premier niveau : un profil qui ne voulait changer que `train.mode` devait
-    recopier tout le bloc `train`, et cette copie divergeait ensuite en
-    silence."""
+    déclaré remplace la valeur de la base. `accounts` fait exception
+    (`ATOMIC_CONFIG_KEYS`) : une isolation voulue se déclare en entier. Avant,
+    la superposition était de premier niveau : un profil qui ne voulait changer
+    que `train.mode` devait recopier tout le bloc `train`, et cette copie
+    divergeait ensuite en silence."""
     merged = dict(base)
     for key, value in overlay.items():
         old = merged.get(key, _MISSING)
-        if isinstance(old, dict) and isinstance(value, dict):
+        if key not in ATOMIC_CONFIG_KEYS and isinstance(old, dict) and isinstance(value, dict):
             merged[key] = _merge_config(old, value)
         else:
             merged[key] = value
