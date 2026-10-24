@@ -819,9 +819,11 @@ def direct_merge(slug: str, pr: int, head: str, *, lot: int, repo: str, db=None,
                                % (merge_sha[:12], tip[:12], head[:12], " ".join(parents)))
         evidence = {"pr": pr, "url": view.get("url") or "", "target": target,
                     "frozen": head, "tip": tip,
-                    # #3308 : gh 2.45 n'expose pas `baseRefOid` dans `pr view` ;
-                    # la cible résolue est le tip rapatrié et vérifié plus haut.
-                    "api_base": tip, "merge": merge_sha,
+                    # #3314 (#3308) : `api_base` laissait croire à une lecture
+                    # d'API ; `pr_view` ne demande pas `baseRefOid` (absent de
+                    # gh 2.45), et ce champ est le tip de la cible rapatrié et
+                    # vérifié plus haut — `tip` en est l'alias court.
+                    "target_tip": tip, "merge": merge_sha,
                     "tree": tree, "frozen_tree": frozen_tree,
                     "workflow_files": touched, "changed_files": len(files),
                     "merge_state": merge_state,

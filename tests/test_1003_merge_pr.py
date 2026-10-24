@@ -587,6 +587,15 @@ class MergeTest(_Base):
                       _git(self.origin, "log", "-1", "--format=%B", "main"))
         self.assertTrue(all(c[:2] == ["pr", "view"] for c in gh.calls), gh.calls)
 
+    def test_the_evidence_names_the_fetched_target_tip(self):
+        # #3314 : #3308 avait rempli `api_base` (toujours vide auparavant) avec
+        # le tip rapatrié ; le nom dit maintenant ce qu'il est, et l'évidence
+        # ne fait plus passer une copie de `tip` pour une lecture d'API.
+        out = self.merge(self.gh(), dry_run=True)
+        self.assertEqual(out["target_tip"], self.base)
+        self.assertEqual(out["target_tip"], out["tip"])
+        self.assertNotIn("api_base", out)
+
     def test_the_lot_trailer_names_the_lot(self):
         gh = self.gh()
         out = self.merge(gh, dry_run=True, lot=1003)
