@@ -67,6 +67,11 @@ _LIFT = re.compile(
 #: côté repli, ARE côté pilote PostgreSQL) : toutes les notes hold/levée,
 #: aucune note ordinaire. Le filtre exact reste ici.
 HOLD_NOTE_PATTERNS = (_HOLD.pattern, _LIFT.pattern)
+#: #3373 : le mot « hold » suivi d'un séparateur (`hold :`, `hold (pilote) :`,
+#: `Hold —`) — une retenue apparente qui n'en est pas une : le préfixe exact
+#: est `hold:` sans blanc. Un trait d'union collé (`hold-up:`) reste une note
+#: ordinaire, comme le veut le motif exact.
+_HOLD_LIKE = re.compile(r"^hold(?=[\s:(])", re.I)
 
 
 def is_hold_note(text) -> bool:
@@ -80,6 +85,19 @@ def is_lift_note(text) -> bool:
     """#1664 : la note qui lève explicitement une retenue (`unhold:`,
     `hold lifted:`/`released:`/`cleared:`)."""
     return bool(_LIFT.match(str(text or "").strip()))
+
+
+def is_hold_lookalike(text) -> bool:
+    """#3373 : une graphie de retenue qui n'en est pas une.
+
+    `hold :`, `hold (pilote) :`, `Hold —` ne portent pas le préfixe exact
+    `hold:` : rien ne s'arrête, et l'auteur croit pourtant le lot retenu. Le
+    chemin d'écriture refuse ces variantes avec la forme exacte ; les vraies
+    notes de retenue et de levée, et les notes ordinaires (`hold-up:`,
+    `holding pattern`), ne sont pas visées."""
+    value = str(text or "").strip()
+    return bool(_HOLD_LIKE.match(value)) and not is_hold_note(value) \
+        and not is_lift_note(value)
 
 
 def explicit_holds(events, *, allowed=None) -> dict[int, dict]:
