@@ -115,6 +115,24 @@ class HostWideDrainTest(unittest.TestCase):
         self.assertLessEqual(self.stop_waits(p)['dev2'], 5, p.stdout)
         self.assertEqual(self.operateur().count('pause dev2 '), 1)
 
+    def test_uncertain_prepose_is_reused_and_lifted(self):
+        # #3120/B2 : la première pose (rc124) peut aboutir plus tard. Le
+        # rattrapage doit réutiliser son motif, reconnaître la pause réelle et
+        # la lever ; l'ancienne intention ne doit pas être remplacée ni perdue.
+        self.configure_turns()
+        self.agents[1]['status'] = 'idle'
+        (self.state / 'pose-incertaine-agent').write_text('dev2')
+        p = self.run_vm(scenario='pose-incertaine')
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        poses = [l for l in self.operateur().splitlines() if l.startswith('pause dev2 ')]
+        reprises = [l for l in self.operateur().splitlines() if l.startswith('resume dev2 ')]
+        self.assertEqual(len(poses), 2, p.stdout + p.stderr)
+        self.assertEqual(len(reprises), 1, p.stdout + p.stderr)
+        motif = poses[0].split('--reason ', 1)[1].split(' --human ', 1)[0]
+        self.assertIn('--expect-reason ' + motif, reprises[0])
+        self.assertFalse((self.state / 'pause-dev2').exists())
+        self.assert_no_pause()
+
     def test_second_stop_failure_cleans_every_pause(self):
         self.configure_turns(fail_second=True)
         p = self.run_vm()

@@ -133,6 +133,13 @@ elif sys.argv[1] == 'show':
     if scenario == 'mode-change-apres-drain' and name == 'dev9' and pause.exists():
         row['mode'] = 'externe'
     if scenario == 'always-busy': row['status'] = 'running'
+    # #3120/B2 : une première pose incertaine (rc124) peut encore aboutir ;
+    # l'agent est alors vu en tour et sans pause à la relecture.
+    if scenario == 'pose-incertaine':
+        agent_marque = state / 'pose-incertaine-agent'
+        if agent_marque.exists() and name == agent_marque.read_text().strip() \
+                and (state / 'pose-incertaine-attente').exists() and not pause.exists():
+            row['status'] = 'running'
     # #2152 : un agent qui enchaîne les tours ne rend la main qu'une fois
     # drainé ; « chaines-toujours » ne la rend jamais.
     if name == 'dev9' and scenario in ('chaines', 'chaines-pause-error',
@@ -187,6 +194,29 @@ elif sys.argv[1] in ('pause', 'resume'):
             echeance = float(args[args.index('--not-after') + 1])
         hf = os.environ.get('HORLOGE_FICHIER')
         maintenant = float(Path(hf).read_text()) if hf and Path(hf).exists() else time.time()
+        # #3120/B2 : la première pose a expiré (rc124) sans muter ; elle peut
+        # encore aboutir. Le rattrapage doit retrouver ce motif et le lever.
+        if scenario == 'pose-incertaine':
+            agent_marque = state / 'pose-incertaine-agent'
+            if agent_marque.exists() and name == agent_marque.read_text().strip():
+                attente = state / 'pose-incertaine-attente'
+                if not attente.exists():
+                    (state / 'motif-incertain').write_text(
+                        args[args.index('--reason') + 1])
+                    (state / 'echeance-incertaine').write_text(str(echeance))
+                    attente.touch()
+                    sys.exit(124)
+                if not pause.exists():
+                    premiere = float((state / 'echeance-incertaine').read_text())
+                    if maintenant < premiere:
+                        motif.write_text((state / 'motif-incertain').read_text())
+                        pause.write_text('')
+                        with (state / 'sequence.log').open('a') as f:
+                            f.write('pause %s\n' % name)
+                        print(json.dumps({'agent': name, 'mode': 'execute',
+                                          'operator_paused': True,
+                                          'changed': False, 'event_id': None}))
+                        sys.exit(0)
         if echeance is not None and maintenant >= echeance:
             with (state / 'refus-tardif.log').open('a') as f:
                 f.write('%s not_after\n' % name)

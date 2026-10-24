@@ -607,6 +607,14 @@ drain_motif_de() {  # $1 persona → motif exact si ce drain est le nôtre (rc 1
   done
   return 1
 }
+drain_motif_incertain_de() {  # $1 persona → motif de l'intention encore incertaine (rc 1 sinon)
+  local e p m ech inc
+  for e in ${DRAINS[@]+"${DRAINS[@]}"}; do
+    IFS=$'\t' read -r p m ech inc <<<"$e"
+    if [ "$p" = "$1" ] && [ "$inc" = 1 ]; then printf '%s' "$m"; return 0; fi
+  done
+  return 1
+}
 drain_echeance_incertaine_de() {  # $1 persona → échéance locale si la pose est incertaine
   local e p m ech inc
   for e in ${DRAINS[@]+"${DRAINS[@]}"}; do
@@ -662,17 +670,26 @@ drain_secours() {  # $1 persona, $2 motif : geste exact si la levée a échoué
   return 0
 }
 poser_drain() {  # $1 persona : pause immédiate (en tour ou au repos)
-  local motif sortie change etat pose raison rc=0 refusal
+  local motif sortie change etat pose raison rc=0 refusal reuse=0
   local echeance_abs echeance_locale
-  motif=$(drain_motif "$(drain_jeton)")
+  # #3120/B2 : une intention incertaine antérieure peut encore aboutir. La
+  # conserver (même motif) : une nouvelle pose avec ce motif rend un
+  # changed=false reconnaissable comme le nôtre, et le trap pourra lever la
+  # pause si elle commitait entre-temps.
+  if motif=$(drain_motif_incertain_de "$1"); then
+    reuse=1
+    echo "$1 : intention de drain incertaine conservée (motif réutilisé)" >&2
+  else
+    motif=$(drain_motif "$(drain_jeton)")
+  fi
   # #2184/R3 : la pose porte une échéance absolue, comparée par la base sous
   # le verrou. Le nettoyage attend l'échéance locale (fenêtre + borne
   # d'instruction + dérive) avant de lire et de lever.
   echeance_abs=$(( $(horloge_epoque) + DRAIN_ECHEANCE ))
   echeance_locale=$(( $(horloge) + DRAIN_ECHEANCE + DRAIN_BORNE_INSTRUCTION + DRAIN_DERIVE ))
-  # R1 B2 : le motif courant remplace l'ancien — après une levée humaine, un
-  # re-drain ne doit pas garder une entrée périmée que drain_motif_de lirait
-  # en premier à la sortie (et laisserait la pause vivante orpheline).
+  # R1 B2 : une intention certaine périmée est remplacée ; une intention
+  # incertaine garde son motif (#3120/B2). L'entrée est réécrite avec la
+  # nouvelle échéance dans les deux cas.
   drain_retire "$1"
   # Track the intent before the call: both its reply and the reconciliation
   # read can fail after commit. EXIT still attempts the conditional cleanup.
@@ -693,6 +710,25 @@ poser_drain() {  # $1 persona : pause immédiate (en tour ou au repos)
         drain_retire "$1"
         echo "$1 : pose de pause refusée par l'échéance (not_after) — aucun drain, aucune attente" >&2
         return 1
+      fi
+      # changed=false : la pause en place peut être la nôtre si une intention
+      # incertaine antérieure a commité entre-temps (#3120/B2). L'état réel
+      # tranche avant de retirer l'intention.
+      if ! etat=$(pause_reelle "$1"); then
+        echo "$1 : pause déjà présente mais état illisible — intention conservée" >&2
+        return 1
+      fi
+      IFS='|' read -r pose raison <<<"$etat"
+      if [ "$pose" = 1 ] && [ "$raison" = "$motif" ]; then
+        drain_marque_certaine "$1"
+        echo "$1 : drain posé (confirmé par l'état réel) — le tour en cours se termine, aucun tour interrompu"
+        return 0
+      fi
+      if [ "$reuse" = 1 ]; then
+        # La première pose peut encore aboutir : garder son intention suivie ;
+        # le trap la lèvera ou constatera qu'elle a été refusée.
+        echo "$1 : pause en place sans notre motif — intention incertaine conservée" >&2
+        return 0
       fi
       # Posée entre notre lecture et la nôtre : elle n'est pas de ce script,
       # il ne la lèvera pas (on ne lève que la pause qu'on a posée).
