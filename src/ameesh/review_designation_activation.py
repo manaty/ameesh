@@ -939,7 +939,11 @@ def _owed_read(db, *, unreadable: Optional[list] = None) -> tuple[list, list, li
     and no newer freeze moved the head (a re-freeze of the same SHA is the
     same content: the block still stands). The debtor is the assignee, and
     `blocked_ts` is the **earliest** still-standing block — « blocking
-    verdict → new freeze » starts at the first one, not at the last. With
+    verdict → new freeze » starts at the first `blocked` of the actor's
+    uninterrupted run, not at the last (#17656 B1: a second `blocked` from
+    the same actor on the same head must not push the escalation back); an
+    `ok` (any non-`blocked` verdict) between two blocks restarts the clock at
+    the next one. With
     designated seats, only a designated reviewer's block counts and a later GO
     from another reviewer does not erase it (#2231); without a seat (empty
     column or `-none`), the head's **last** verdict decides, exactly as
@@ -1011,7 +1015,11 @@ def _owed_read(db, *, unreadable: Optional[list] = None) -> tuple[list, list, li
         # #3288 : la correction due, calculée sur les mêmes verdicts.
         if not assignee:
             continue
-        latest: dict = {}
+        # #17656 (B1) : le début du blocage est le premier `blocked` d'une
+        # série ininterrompue du même acteur sur la tête gelée ; un `ok`
+        # entre deux blocages repart l'horloge au blocage suivant. Le dernier
+        # verdict de chaque acteur tranche (un ok lève son blocage).
+        streaks: dict = {}
         overall = None
         for actor, sha, kind, at in verdicts:
             actor = str(actor or "").strip()
@@ -1024,23 +1032,36 @@ def _owed_read(db, *, unreadable: Optional[list] = None) -> tuple[list, list, li
                              and at >= float(freeze_ts)))
             if not applies:
                 continue
-            latest[actor.lower()] = (actor, kind, at)
+            kind = str(kind or "").strip().lower()
+            entry = streaks.setdefault(actor.lower(),
+                                       {"actor": actor, "kinds": [], "at": []})
+            entry["kinds"].append(kind)
+            entry["at"].append(at)
             overall = (actor, kind, at)
+
+        def _block_start(entry: dict) -> float | None:
+            """Premier `blocked` de la série finale de cet acteur."""
+            index = len(entry["kinds"]) - 1
+            while index > 0 and entry["kinds"][index - 1] == "blocked":
+                index -= 1
+            return entry["at"][index]
+
         seats = {str(name or "").strip().lower()
                  for name in (row.get("reviewers") or ())
                  if str(name or "").strip() not in ("", "-none")}
         if seats:
-            blockers = [v for key, v in latest.items()
-                        if key in seats
-                        and str(v[1] or "").strip().lower() == "blocked"]
+            blockers = [(_entry["actor"], _block_start(_entry))
+                        for key, _entry in streaks.items()
+                        if key in seats and _entry["kinds"][-1] == "blocked"]
         else:
-            blockers = ([overall] if overall is not None
-                        and str(overall[1] or "").strip().lower() == "blocked"
+            blockers = ([(streaks[overall[0].lower()]["actor"],
+                          _block_start(streaks[overall[0].lower()]))]
+                        if overall is not None and overall[1] == "blocked"
                         else [])
         if blockers:
-            first = min(blockers, key=lambda v: (v[2] is None, v[2] or 0.0, v[0]))
+            first = min(blockers, key=lambda v: (v[1] is None, v[1] or 0.0, v[0]))
             fixes.append({"lot": lot_id, "name": assignee, "sha": frozen_sha,
-                          "blocked_ts": first[2], "blocked_by": first[0],
+                          "blocked_ts": first[1], "blocked_by": first[0],
                           "title": row.get("title") or "",
                           "state": row.get("state") or "",
                           "app": row.get("app") or ""})

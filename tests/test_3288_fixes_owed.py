@@ -161,6 +161,32 @@ class DueFixesTest(_Base):
                          [(lot, "reviewer")])
         self.assertGreater(time.time() - rows[0]["blocked_ts"], 2 * H)
 
+    def test_two_blocks_of_the_same_reviewer_keep_the_first_start(self):
+        # B1 de #17656 : deux `blocked` du même relecteur sur la même tête ne
+        # repoussent pas l'horloge ; le début du blocage continu est le
+        # premier (l'escalade partait du dernier).
+        lot, _sha = self.blocked(age=3 * H)
+        self.db.execute("UPDATE work_items SET reviewers = ARRAY[%s] WHERE id = %s",
+                        ("reviewer", lot))
+        self.verdict(lot, kind="blocked", age=1 * H)
+        rows = activation.due_fixes(self.db)
+        self.assertEqual([(r["lot"], r["blocked_by"]) for r in rows],
+                         [(lot, "reviewer")])
+        self.assertGreater(time.time() - rows[0]["blocked_ts"], 2 * H)
+
+    def test_an_ok_between_two_blocks_restarts_the_clock(self):
+        # Un `ok` entre deux blocages repart l'horloge au blocage suivant :
+        # le début du blocage continu n'est pas le premier `blocked` du lot.
+        lot, _sha = self.blocked(age=3 * H)
+        self.verdict(lot, kind="ok", age=2 * H)
+        self.verdict(lot, kind="blocked", age=1 * H)
+        rows = activation.due_fixes(self.db)
+        self.assertEqual([(r["lot"], r["blocked_by"]) for r in rows],
+                         [(lot, "reviewer")])
+        age = time.time() - rows[0]["blocked_ts"]
+        self.assertGreater(age, 0.5 * H)
+        self.assertLess(age, 2 * H)
+
     def test_without_a_designation_the_last_verdict_decides(self):
         # Sans siège (colonne vide ou -none), le dernier verdict de la tête
         # tranche, comme `progress._work_item_milestones` : un GO postérieur
