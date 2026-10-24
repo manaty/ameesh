@@ -698,6 +698,8 @@ class ResidentRunnerTest(PgTestCase):
         fil.join(10)
         self.assertIsNone(worker.resident)
 
+    @unittest.skipUnless(all(hasattr(os, name) for name in ("waitid", "WNOWAIT", "P_PID")),
+                         "leader réservé par waitid(WNOWAIT)")
     def test_kill_now_kills_an_idle_group(self):
         _runner, worker = self._worker()
         self.assertTrue(self._turn(worker, "un"))
