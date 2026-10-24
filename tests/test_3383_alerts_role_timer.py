@@ -43,28 +43,91 @@ NTFY = {"routes": {"human:owner": ["ntfy"]},
 
 
 class NotifyReachTest(unittest.TestCase):
-    def reach(self, raw):
-        return role_timers.notify_reach(SimpleNamespace(notify=raw))
+    """The owner must be reachable from ANY holder (review cx2, b199db53de2c)."""
 
-    def test_a_push_route_reaches_its_human(self):
+    def reach(self, raw, *, responsible="human:owner", env=None):
+        return role_timers.notify_reach(SimpleNamespace(notify=raw),
+                                        responsible=responsible,
+                                        env={} if env is None else env)
+
+    def test_a_push_route_reaches_the_role_responsible(self):
         self.assertEqual(self.reach(NTFY), (["human:owner"], ""))
 
-    def test_no_key_is_a_named_gap(self):
-        self.assertEqual(self.reach(None), ([], "no notify route that pushes on this host"))
+    def test_default_human_is_required_too(self):
+        raw = dict(NTFY, default_human="human:other")
+        humans, error = self.reach(raw)
+        self.assertEqual(humans, [])
+        self.assertIn("human:other has no route", error)
 
-    def test_an_app_only_route_pushes_nothing(self):
-        # `app` records the alert in the event log; a holder with only that
-        # route would beat for the owner and push nothing
-        self.assertEqual(self.reach({"routes": {"human:owner": ["app"]}})[0], [])
+    def test_no_key_names_the_responsible(self):
+        self.assertEqual(self.reach(None), ([], "human:owner has no route on this host"))
 
-    def test_an_empty_route_excludes_its_human_but_default_still_reaches(self):
-        humans, error = self.reach({"routes": {"human:owner": []}, "default": ["slack"]})
-        self.assertEqual((humans, error), (["notify.default"], ""))
+    def test_without_any_required_human_nothing_is_proven(self):
+        humans, error = self.reach(NTFY, responsible=None)
+        self.assertEqual(humans, [])
+        self.assertIn("no human to reach", error)
+
+    def test_an_empty_owner_route_is_not_saved_by_the_default(self):
+        # B/P1 cx2: routes {owner: []} + default [ntfy] reached nobody yet
+        # passed the guard as "notify.default"
+        raw = {"routes": {"human:owner": []}, "default": ["ntfy"],
+               "channels": NTFY["channels"]}
+        humans, error = self.reach(raw)
+        self.assertEqual(humans, [])
+        self.assertIn("human:owner has no route", error)
+
+    def test_another_human_route_does_not_cover_the_owner(self):
+        raw = {"routes": {"human:other": ["ntfy"]}, "channels": NTFY["channels"]}
+        self.assertEqual(self.reach(raw)[0], [])
+
+    def test_desktop_and_app_only_do_not_count(self):
+        for names in (["desktop"], ["app"], ["desktop", "app"]):
+            with self.subTest(names=names):
+                humans, error = self.reach({"routes": {"human:owner": names}})
+                self.assertEqual(humans, [])
+                self.assertIn("is not a remote push", error)
+
+    def test_a_declared_ntfy_token_must_resolve_and_is_never_shown(self):
+        raw = {"routes": {"human:owner": ["ntfy"]},
+               "channels": {"ntfy": {"url": "https://ntfy.example", "topic": "t",
+                                     "token_env": "AMEESH_NTFY_TOKEN"}}}
+        humans, error = self.reach(raw)
+        self.assertEqual(humans, [])
+        self.assertIn("AMEESH_NTFY_TOKEN", error)
+        self.assertEqual(self.reach(raw, env={"AMEESH_NTFY_TOKEN": "tk-secret"}),
+                         (["human:owner"], ""))
+        humans, error = self.reach(raw, env={"AMEESH_NTFY_TOKEN": "tk-secret # note"})
+        self.assertEqual(humans, [])
+        self.assertNotIn("tk-secret", error)
+
+    def test_slack_needs_its_webhook(self):
+        raw = {"routes": {"human:owner": ["slack"]}}
+        self.assertIn("AMEESH_SLACK_WEBHOOK", self.reach(raw)[1])
+        self.assertEqual(self.reach(raw, env={
+            "AMEESH_SLACK_WEBHOOK": "https://hooks.slack.example/T/B/x"})[0], ["human:owner"])
+
+    def test_one_usable_channel_is_enough_beside_desktop(self):
+        raw = dict(NTFY, routes={"human:owner": ["desktop", "ntfy"]})
+        self.assertEqual(self.reach(raw), (["human:owner"], ""))
 
     def test_an_invalid_key_is_named(self):
         humans, error = self.reach({"routes": {"human:owner": ["ntfy"]}})
         self.assertEqual(humans, [])
         self.assertIn("invalid notify configuration", error)
+
+
+class UnitEnvTest(unittest.TestCase):
+    def test_notify_env_is_read_like_the_unit_does(self):
+        with tempfile.TemporaryDirectory(prefix="3383-env-") as tmp:
+            path = Path(tmp) / "notify.env"
+            path.write_text("# secrets\n\nAMEESH_NTFY_TOKEN='tk'\nGH_TOKEN=gh\nbroken\n",
+                            encoding="utf-8")
+            env = role_timers.unit_env(str(path))
+            self.assertEqual((env["AMEESH_NTFY_TOKEN"], env["GH_TOKEN"]), ("tk", "gh"))
+            self.assertNotIn("broken", env)
+            # the optional EnvironmentFile=-: a missing file is no error
+            self.assertNotIn("AMEESH_NTFY_TOKEN_X",
+                             role_timers.unit_env(str(Path(tmp) / "absent")))
 
 
 class AlertsTimerTest(unittest.TestCase):
@@ -96,7 +159,7 @@ class AlertsTimerTest(unittest.TestCase):
     def test_a_candidate_without_a_route_is_refused_and_keeps_delivering(self):
         stale = self.dir / "ameesh-role-alerts.timer"
         stale.write_text("old", encoding="utf-8")
-        report = plan(notify_humans=[], notify_error="no notify route that pushes on this host")
+        report = plan(notify_humans=[], notify_error="human:owner has no route on this host")
         result = role_timers.install(report, directory=self.dir, apply=False)
         self.assertFalse(stale.exists())
         self.assertIn("ameesh-role-alerts.timer", result["removed"])
@@ -105,8 +168,8 @@ class AlertsTimerTest(unittest.TestCase):
         text = self.dropin.read_text(encoding="utf-8")
         self.assertIn("--skip issues,github-watch,ci\n", text)
         problems = role_timers.check(report, directory=self.dir, apply=False)
-        self.assertTrue(any(p.startswith("alerts: no notify route") and "notify key" in p
-                            for p in problems), problems)
+        self.assertTrue(any(p.startswith("alerts: human:owner has no route")
+                            and "notify key" in p for p in problems), problems)
 
     def test_a_route_added_later_updates_the_dropin_and_check_sees_the_old_one(self):
         role_timers.install(plan(notify_humans=[]), directory=self.dir, apply=False)
@@ -119,6 +182,7 @@ class AlertsTimerTest(unittest.TestCase):
     def test_main_reads_the_host_notify_key(self):
         cfg = SimpleNamespace(host="agents-a", notify=NTFY, config_path="", config_base="",
                               github={"projects": {"ameesh": "manaty/ameesh"}})
+        role_row = dict(row(), responsible="human:owner")
         fake_db = mock.Mock()
         captured = {}
 
@@ -128,7 +192,8 @@ class AlertsTimerTest(unittest.TestCase):
 
         with mock.patch.object(role_timers.config_mod, "load", return_value=cfg), \
                 mock.patch.object(role_timers.db_mod, "connect", return_value=fake_db), \
-                mock.patch.object(role_timers.registry, "get", return_value=row()), \
+                mock.patch.object(role_timers.registry, "get", return_value=role_row), \
+                mock.patch.object(role_timers, "unit_env", return_value={}), \
                 mock.patch.object(role_timers.plan_github, "settings_of",
                                   return_value=settings()), \
                 mock.patch.object(role_timers, "_watch_declarations",
@@ -137,7 +202,7 @@ class AlertsTimerTest(unittest.TestCase):
                 mock.patch("sys.stdout"):
             self.assertEqual(role_timers.main(["--check", "--no-apply"]), 0)
         alerts = next(item for item in captured["timers"] if item["name"] == "alerts")
-        self.assertEqual(alerts["blocked"], "")
+        self.assertEqual((alerts["blocked"], alerts["detail"]), ("", "reaches human:owner"))
 
 
 class ServiceBesideTimerTest(unittest.TestCase):

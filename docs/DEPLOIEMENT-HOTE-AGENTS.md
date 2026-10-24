@@ -373,8 +373,10 @@ portées par les minuteries (`--skip issues,github-watch,ci,alerts`) : la prise
 reste dans le service, GitHub, la CI et la livraison des alertes passent par
 la minuterie du rôle. #3383 : la minuterie `alerts` exige sur chaque candidat
 la clé `notify` de l’owner (route `ntfy`, jeton dans `notify.env` en 0600),
-identique d’un candidat à l’autre ; sans elle, `timers` sort en `1` et
-`controler` échoue en nommant le manque.
+identique d’un candidat à l’autre : le responsable du rôle et
+`notify.default_human` doivent y avoir un canal `ntfy` ou `slack` utilisable
+(`desktop` et `app` ne comptent pas) ; sinon `timers` sort en `1` et
+`controler` échoue en nommant l’humain et la raison.
 
 `controler` (`vm.sh agents controler`, `poste.sh controler`) exécute
 `ameesh role timers --check` et échoue sur une minuterie absente, désactivée,

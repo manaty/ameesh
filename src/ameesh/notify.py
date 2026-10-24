@@ -830,6 +830,36 @@ def channel_secrets(channel: Channel, env: dict | None = None) -> tuple:
     return tuple(out)
 
 
+#: #3383: the channel kinds that reach a human from ANY host. The alerts role
+#: timer pushes from whichever candidate holds the lease: `desktop` needs that
+#: host's graphical session, `app` only records the alert in the event log.
+REMOTE_PUSH_KINDS = ("ntfy", "slack")
+
+
+def remote_push_problem(channel: Channel, env: dict | None = None) -> str:
+    """'' when ``channel`` can push from this environment, else why.
+
+    The secret is resolved exactly as `Sender` does (file or environment
+    variable, then L46's value check); the reason names the variable or the
+    file, never the value.
+    """
+    if channel.kind not in REMOTE_PUSH_KINDS:
+        return "%s: %s is not a remote push" % (channel.name, channel.kind)
+    env = dict(os.environ if env is None else env)
+    try:
+        if channel.kind == "slack":
+            value = _secret(channel, env, "webhook_env", "webhook_file",
+                            DEFAULT_SLACK_ENV, True)
+            check_secret_value(value, "channel %s: %s" % (channel.name, SECRET_URL_INVALID))
+        else:
+            value = _secret(channel, env, "token_env", "token_file", None, False)
+            if value:
+                check_secret_value(value, "channel %s: ntfy token" % channel.name)
+    except ChannelError as exc:
+        return str(exc)
+    return ""
+
+
 def _post(url: str, data: bytes, headers: dict, timeout: float, *, show_url: bool,
           secrets: tuple = ()) -> None:
     """`show_url=False` : l'URL est un secret — aucun message d'erreur ne la

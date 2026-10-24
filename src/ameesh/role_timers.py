@@ -10,8 +10,9 @@ check or remove them.
 #3383: the alert delivery (owner pushes, decision requests, agent briefs) was
 left in the full ``ameesh-notify`` service, whose routes lived on one host
 only (``pc-smichea``): when it was off, nothing was pushed (three times on
-2026-10-24). The ``alerts`` pass is now a role timer too; a candidate whose
-``notify`` key reaches nobody is refused (``--check`` fails) instead of
+2026-10-24). The ``alerts`` pass is now a role timer too; a candidate that
+cannot push to the role's responsible (and ``notify.default_human``) through
+a remote channel (ntfy, slack) is refused (``--check`` fails) instead of
 standing by as a holder that would push nothing.
 
 The role carried by default is ``mesh-design``: it is already elected on
@@ -276,31 +277,74 @@ def is_candidate(row: dict, host: str) -> bool:
     return str(row.get("host") or "") == host
 
 
-def notify_reach(cfg) -> tuple[list[str], str]:
-    """#3383: the humans this host's ``notify`` key can push to, or the gap.
+#: the secrets file the role units load after ``env`` (see render_service)
+NOTIFY_ENV = "~/.config/ameesh/notify.env"
 
-    The alerts timer pushes on the routes of whichever candidate holds the
-    lease: a candidate that reaches nobody would hold the lease and push
-    nothing, which is the silence #3383 reports. An invalid key is the same
-    gap, named.
+
+def unit_env(path: str | None = None) -> dict:
+    """The environment of a role unit: this process's, then ``notify.env``.
+
+    ``EnvironmentFile`` semantics, enough for a check: ``KEY=VALUE`` lines,
+    comments and blank lines ignored, one pair of surrounding quotes removed.
+    A missing file is the optional ``EnvironmentFile=-`` of the unit. Values
+    are never printed.
+    """
+    env = dict(os.environ)
+    try:
+        text = Path(os.path.expanduser(path or NOTIFY_ENV)).read_text(encoding="utf-8")
+    except OSError:
+        return env
+    for line in text.splitlines():
+        line = line.strip()
+        if not line or line[0] in "#;":
+            continue
+        key, sep, value = line.partition("=")
+        if not sep or not key.strip():
+            continue
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1]
+        env[key.strip()] = value
+    return env
+
+
+def notify_reach(cfg, *, responsible=None, env: dict | None = None) -> tuple[list[str], str]:
+    """#3383: the humans the alerts timer must push to, or the gap.
+
+    The holder pushes on its own routes, whichever candidate it is. The
+    humans required are the role's responsible and ``notify.default_human``;
+    each needs, through ``channels_for`` (an empty route excludes, #3007), a
+    remote push channel (``ntfy``, ``slack``) whose secret resolves in the
+    unit's environment. ``desktop`` (the holder's graphical session) and
+    ``app`` (nothing pushed) do not count. Any gap is named; a candidate that
+    would hold the lease and push nothing is the silence #3383 reports.
     """
     from . import notify as notify_mod
     try:
         ncfg = notify_mod.parse_config(getattr(cfg, "notify", None))
     except notify_mod.NotifyConfigError as exc:
         return [], "invalid notify configuration: %s" % " ".join(str(exc).split())[:200]
-
-    def pushes(names) -> bool:
-        # an empty route excludes its human, as `channels_for` does (#3007);
-        # `app` only records the alert in the event log: nothing is pushed
-        return any(ncfg.channels[name].kind != "app" for name in names)
-
-    reached = sorted(human for human, names in ncfg.routes.items() if pushes(names))
-    if pushes(ncfg.default):
-        reached.append("notify.default")
-    if not reached:
-        return [], "no notify route that pushes on this host"
-    return reached, ""
+    required = []
+    for value in (responsible, ncfg.default_human):
+        human = notify_mod.normalize_human(value)
+        if human and human not in required:
+            required.append(human)
+    if not required:
+        return [], "no human to reach: neither a responsible of the role nor notify.default_human"
+    env = unit_env() if env is None else env
+    gaps = []
+    for human in required:
+        channels = ncfg.channels_for(human)
+        if not channels:
+            gaps.append("%s has no route on this host" % human)
+            continue
+        problems = [notify_mod.remote_push_problem(channel, env) for channel in channels]
+        if all(problems):
+            gaps.append("%s has no usable remote push (ntfy, slack): %s"
+                        % (human, "; ".join(problems)))
+    if gaps:
+        return [], " ".join("; ".join(gaps).split())[:400]
+    return required, ""
 
 
 def plan(*, host: str, role: str, row: dict, settings, watch_intervals,
@@ -313,8 +357,8 @@ def plan(*, host: str, role: str, row: dict, settings, watch_intervals,
     its host. A non-candidate gets no units at all. ``expected_projects`` is
     the canon's ``{project: repo}`` mapping; a project missing from the local
     ``github.projects`` is reported, never silently ignored. ``notify_humans``
-    and ``notify_error`` come from :func:`notify_reach`: without a route, the
-    ``alerts`` pass is blocked (#3383).
+    and ``notify_error`` come from :func:`notify_reach`: without a remote push
+    to every required human, the ``alerts`` pass is blocked (#3383).
     """
     declared = candidates(row)
     candidate = is_candidate(row, host)
@@ -374,7 +418,7 @@ def plan(*, host: str, role: str, row: dict, settings, watch_intervals,
     if notify_error or not notify_humans:
         reported.append(TimerSpec(
             "alerts", "alerts", ALERTS_INTERVAL_S, description,
-            blocked=notify_error or "no notify route that pushes on this host",
+            blocked=notify_error or "no human to reach on this host",
             detail=("the lease holder pushes on its own routes: declare the notify "
                     "key (the owner's ntfy route, secrets in notify.env) as on the "
                     "other candidates (see EXPLOITATION, Alertes poussées)")))
@@ -759,7 +803,7 @@ def main(argv: list[str] | None = None) -> int:
                 except plan_github.SettingsError as exc:
                     raise TimerError("configuration invalid after adding projects: %s"
                                      % exc) from None
-        humans, notify_error = notify_reach(cfg)
+        humans, notify_error = notify_reach(cfg, responsible=row.get("responsible"))
         report = plan(host=host, role=args.role,
                       row=row, settings=settings, watch_intervals=intervals,
                       watch_error=watch_error, expected_projects=expected,
