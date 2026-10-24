@@ -143,6 +143,15 @@ class MacosFullSuiteWorkflowTest(unittest.TestCase):
         self.assertIn("permissions:\n  contents: read", self.text)
         self.assertNotRegex(self.text, r"(?m):\s+write(?:-only|-all)?\s*$")
 
+    def test_it_does_not_cache_pip_under_pull_request_target(self):
+        # #3207 : sous `pull_request_target`, `cache: pip` de setup-python
+        # écrirait un cache dans la portée de la branche de base à partir du
+        # pyproject de la PR (N de sécurité de la revue #3198). La suite
+        # tourne une fois par nuit ou à la demande : le cache n'est pas
+        # nécessaire, et le remettre rouvrirait l'exposition.
+        self.assertNotIn("cache: pip", self.text)
+        self.assertNotIn("cache-dependency-path", self.text)
+
     def test_it_runs_the_whole_plan_under_macos(self):
         self.assertIn("test-plan.py plan", self.job)
         self.assertIn("--mode full", self.job)
