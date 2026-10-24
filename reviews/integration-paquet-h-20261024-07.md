@@ -88,9 +88,10 @@ venu pendant la composition (base `bf1925787dd2` figée).
   `test_l233b_budget_handoff` : 248).
 - **Compilation** : `compileall src tests` verte.
 - **Contrôles statiques** : 6/6 verts (`scripts/freeze-checks.py`).
-- **Diff** : 54 fichiers, +5179/−263 (manifeste et correctif compris ;
-  composition seule : 53 fichiers, +5045/−263) ; `git diff --check` vert ;
-  les onze commits de composition portent leur trailer `ameesh-work:`.
+- **Diff** : 54 fichiers, +5216/−263 (manifeste et deux correctifs compris ;
+  composition seule : 53 fichiers, +5045/−263 ; correctifs : 3 fichiers
+  +18/−3 puis 1 fichier +7/−1) ; `git diff --check` vert ; les onze commits de
+  composition portent leur trailer `ameesh-work:`.
 - **Migrations** : aucune (aucun fichier SQL ni migration).
 - **Prévalidation** : demandée au gel ; carte périmée (`card-stale`) attendue,
   non bloquante (§3), motif consigné.
@@ -99,8 +100,9 @@ venu pendant la composition (base `bf1925787dd2` figée).
   `73a0d17bb` est rouge sur l'intégration #3311 × #3327 (section ci-dessous) ;
   la tête corrigée est regelée puis redemandée en `ci-full`, avec `--avis 0`
   (correctif mécanique §2/§11 bis, le manifeste est la revue du paquet), fusion
-  automatique réarmée. Les onze unités gardent leurs verdicts acquis sur leurs
-  têtes gelées.
+  automatique réarmée. Le deuxième tour ne change qu'un banc (#1252) : nouvelle
+  tête, `ci-full` et avis sur le seul delta de test. Les onze unités gardent
+  leurs verdicts acquis sur leurs têtes gelées.
 - **Fusion** : sous garde de tête (`--match-head-commit`), dès le vert, par le
   pilote ou le bureau ; tout rouge non infra isole le lot fautif sans relire
   le reste.
@@ -132,6 +134,18 @@ sans affaiblir d'assertion. Correctif d'intégration mécanique, sans avis
 Ciblés verts sur la tête corrigée : `test_1252_vm_agents_install`,
 `test_503_agent_host`, `test_3311_preuve_venv`, `test_3327_role_timers`
 (144/144).
+
+Deuxième tour (run `40088134512`, tête `36a835e46`) : les six échecs des bancs
+#503 sont réparés ; restent six échecs `test_1252`, tous sur la preuve de venv.
+Le détail CI montre le python **enfant** du banc qui meurt à l'initialisation
+(`init_fs_encoding`, `No module named 'encodings'`) : le lien `bin/python3`
+pointait sur `sys.executable` du venv CI, qui, hors de son préfixe, ne retrouve
+pas sa bibliothèque ; la preuve lisait alors un processus mort. Correctif
+`f38773b2e` (test seul, 1 fichier +7/−1) : le banc spawne
+`sys._base_executable` (python de base complet), l'argv[0] reste celui du venv
+et la preuve est inchangée. `test_1252` **48/48** verts en local. Le delta étant
+uniquement un banc, la nouvelle tête est demandée en `ci-full --avis 0` ; les
+deux verdicts de composition sur `36a835e46` restent acquis.
 
 ## Écartés (ce véhicule)
 
