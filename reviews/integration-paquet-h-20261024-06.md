@@ -100,6 +100,36 @@ venu pendant la composition (base `6495881f4a05` figée).
 - **Coupe 1.21.0** : aucune coupe demandée par ce véhicule ; la fusion du
   paquet sur `main` ne dépend pas de la coupure.
 
+## Correction après CI rouge (tête `e80de71bc58c`, run `40077173517`)
+
+La suite complète a rendu trois échecs réels, répétés dans les parts psycopg
+5/7/8 et psql 10/13 :
+
+- `tests.test_2179_roadmap_cli.RoadmapHelpTest.test_root_help_is_alphabetical_and_keeps_routes_visible` :
+  l'aide racine n'était plus alphabétique (`agent move` de #3299 et `debit` de
+  #3292 mal placés) ;
+- `tests.test_l107_executor_contract.TableTest.test_l_interface_entiere_est_classee` :
+  `canon.relocate_operator` (#3299), ajouté à l'interface, n'était pas classé
+  dans `contract.json` ;
+- `tests.test_l790_outdated_restart.SelectedTurnRefusedTest.test_run_turn_remet_la_consigne_et_refuse` :
+  la doublure de `run_turn` ne portait pas la nouvelle enveloppe
+  `_run_turn_or_defer` de #2614.
+
+Correctif `ae3476a7f` :
+
+- `src/ameesh/main.py` : `agent move` et `debit` remis dans l'ordre alphabétique ;
+- `src/ameesh/mediated_executor/contract.json` : `canon.relocate_operator`
+  refusé (le canon n'est jamais lu ni écrit par l'appareil), compteurs de doc
+  426→427 refusées et 498→499 opérations d'interface ;
+- `tests/test_l790_outdated_restart.py` : la doublure lie `_run_turn_or_defer`.
+
+Ciblés verts sur la tête corrigée : `test_2179_roadmap_cli`,
+`test_l107_executor_contract`, `test_l790_outdated_restart` (67/67), contrôles
+statiques 6/6. Nouvelle tête gelée et nouvelle demande `ci-full-<sha>` ; les
+avis requis sur le delta propre du porteur sont désignés au gel. Les parts du
+run `40077173517` encore en cours à 08:52Z ne sont pas un verdict : la nouvelle
+suite complète les couvre.
+
 ## Écartés (ce véhicule)
 
 | lot | motif |
