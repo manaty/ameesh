@@ -348,8 +348,9 @@ n’avait que `ameesh`), après sauvegarde `config.json.role-timers.bak` et sans
 `github` (`workflows`, `base`, `exclude_terms`) reste à copier à l’identique
 depuis la configuration de l’observateur historique : le relevé CI de Nexlink a
 besoin de `base: [develop]`. Ce n’est pas un secret ; le jeton `GH_TOKEN` reste
-dans `notify.env`. Le drop-in posé limite `ameesh-notify` à `--only alerts`,
-pour qu’il ne relève pas GitHub en double.
+dans `notify.env`. Le drop-in posé fait exclure à `ameesh-notify` les passes
+mécaniques (`--skip issues,github-watch,ci`) : alertes et prise restent dans le
+service, GitHub et la CI passent par la minuterie du rôle.
 
 `controler` (`vm.sh agents controler`, `poste.sh controler`) exécute
 `ameesh role timers --check` et échoue sur une minuterie absente, désactivée,

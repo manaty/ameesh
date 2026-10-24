@@ -8,8 +8,11 @@ hosts share one lease so only the holder's timer runs (`ameesh role run`).
 """
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import os
+import shlex
 import stat
 import tempfile
 import unittest
@@ -115,7 +118,7 @@ class RenderTest(unittest.TestCase):
     def test_notify_dropin_removes_the_full_service_execstart(self):
         text = role_timers.render_notify_dropin("/opt/ameesh/bin/ameesh")
         self.assertIn("[Service]\nExecStart=\nExecStart=/opt/ameesh/bin/ameesh "
-                      "notify --interval 30 --only alerts\n", text)
+                      "notify --interval 30 --skip issues,github-watch,ci\n", text)
 
     def test_a_binary_path_with_whitespace_is_refused(self):
         with self.assertRaises(role_timers.TimerError):
@@ -142,7 +145,7 @@ class InstallTest(unittest.TestCase):
             self.assertTrue((self.dir / ("ameesh-role-%s.service" % name)).is_file())
             self.assertTrue((self.dir / ("ameesh-role-%s.timer" % name)).is_file())
         dropin = self.dir / "ameesh-notify.service.d" / "10-role-timers.conf"
-        self.assertIn("--only alerts", dropin.read_text(encoding="utf-8"))
+        self.assertIn("--skip issues,github-watch,ci", dropin.read_text(encoding="utf-8"))
         self.assertEqual(role_timers.check(self.report, directory=self.dir, apply=False), [])
 
     def test_install_is_idempotent(self):
@@ -167,7 +170,7 @@ class InstallTest(unittest.TestCase):
         (self.dir / "ameesh-notify.service.d" / "10-role-timers.conf").unlink()
         problems = role_timers.check(self.report, directory=self.dir, apply=False)
         self.assertTrue(any("missing ameesh-role-ci.timer" in text for text in problems))
-        self.assertTrue(any("--only alerts" in text for text in problems))
+        self.assertTrue(any("--skip" in text for text in problems))
 
     def test_check_flags_a_unit_from_another_configuration(self):
         role_timers.install(self.report, directory=self.dir, apply=False)
@@ -246,6 +249,17 @@ class SyncProjectsTest(unittest.TestCase):
         written = json.loads(self.path.read_text(encoding="utf-8"))
         self.assertEqual(written["github"]["projects"]["nexlink"], "acme/other")
 
+    def test_a_long_form_mapping_keeps_its_base(self):
+        self.path.write_text(json.dumps({"github": {"projects": {
+            "ameesh": "manaty/ameesh",
+            "nexlink": {"repo": "manaty/nexlink", "base": ["develop"]}}}}),
+            encoding="utf-8")
+        result = role_timers.sync_github_projects(self.cfg, self.declarations)
+        self.assertEqual(result["added"], [])
+        written = json.loads(self.path.read_text(encoding="utf-8"))
+        self.assertEqual(written["github"]["projects"]["nexlink"],
+                         {"repo": "manaty/nexlink", "base": ["develop"]})
+
     def test_an_unreadable_projects_value_is_refused(self):
         self.path.write_text(json.dumps({"github": {"projects": []}}), encoding="utf-8")
         with self.assertRaises(role_timers.TimerError):
@@ -276,6 +290,52 @@ class SyncProjectsTest(unittest.TestCase):
         problems = role_timers.check(report, directory=Path(self.tmp.name), apply=False)
         self.assertTrue(any("github.projects lacks nexlink (manaty/nexlink)" in text
                             for text in problems))
+
+
+class DropinCommandTest(unittest.TestCase):
+    def test_the_dropin_runs_a_real_restricted_loop_and_keeps_take(self):
+        text = role_timers.render_notify_dropin("/opt/ameesh/bin/ameesh")
+        line = next(item for item in text.splitlines()
+                    if item.startswith("ExecStart=") and "notify" in item)
+        argv = shlex.split(line.split("=", 1)[1])[2:]  # drop the binary and `notify`
+        args = notify.build_parser().parse_args(argv + ["--dry-run"])
+        self.assertEqual(args.skip, ["issues,github-watch,ci"])
+        self.assertIsNone(args.only)
+        self.assertFalse(args.once)
+        fake_notifier = mock.Mock()
+        fake_db = mock.Mock()
+        cfg = SimpleNamespace(state_dir=tempfile.mkdtemp(prefix="3327-dropin-"))
+        with mock.patch.object(notify, "Notifier", return_value=fake_notifier) as ctor, \
+                mock.patch.object(notify.db_mod, "connect", return_value=fake_db), \
+                mock.patch.object(notify.db_mod, "require_schema"), \
+                mock.patch.object(notify, "load_state", return_value=notify.empty_state()), \
+                mock.patch.object(notify.time, "sleep", side_effect=KeyboardInterrupt):
+            rc = notify.cmd_notify(cfg, SimpleNamespace(configured=True), args)
+        self.assertEqual(rc, 0, "the drop-in command must not be refused")
+        self.assertEqual(ctor.call_args.kwargs["skip"],
+                         frozenset({"issues", "github-watch", "ci"}))
+        fake_notifier.run_local_pass.assert_called_once()
+        fake_notifier.run_pass.assert_called_once()
+
+
+class CandidateMutationTest(unittest.TestCase):
+    def test_a_non_candidate_is_checked_before_any_config_sync(self):
+        cfg = SimpleNamespace(host="agents-c", config_path="/does/not/exist",
+                              config_base="", github={})
+        row = {"releve": "election", "host": "agents-a",
+               "candidats": ["agents-a", "agents-b"]}
+        fake_db = mock.Mock()
+        with mock.patch.object(role_timers.config_mod, "load", return_value=cfg), \
+                mock.patch.object(role_timers.db_mod, "connect", return_value=fake_db), \
+                mock.patch.object(role_timers.registry, "get", return_value=row), \
+                mock.patch.object(role_timers, "sync_github_projects") as sync, \
+                mock.patch.object(role_timers, "_watch_declarations") as declarations, \
+                contextlib.redirect_stdout(io.StringIO()):
+            rc = role_timers.main(["--install", "--no-apply", "--json"])
+        self.assertEqual(rc, 0)
+        sync.assert_not_called()
+        declarations.assert_not_called()
+        fake_db.close.assert_called_once()
 
 
 class NotifyGateTest(unittest.TestCase):
