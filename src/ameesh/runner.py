@@ -5231,23 +5231,32 @@ class AgentWorker(threading.Thread):
         return None
 
     def _idle_prompt(self) -> str:
-        """#3033 + #3273 : la relance d'inactivité porte les avis que l'agent
-        doit encore rendre, et nomme le pilote de son équipe (#3273). Sans
-        elle, un relecteur dont la demande de désignation était un courrier
-        déjà lu se déclarait « disponible » à l'orchestrateur pendant que son
-        avis attendait (#3004, 1 j 14 h). Une file illisible ne change pas la
-        relance : le brief de reprise la dit, et un tour au repos ne part pas
-        sur une lecture ratée."""
+        """#3033/#3288/#3273 : la relance d'inactivité porte les corrections et
+        les avis que l'agent doit encore rendre, et nomme le pilote de son
+        équipe (#3273). Sans elle, un relecteur dont la demande de désignation
+        était un courrier déjà lu se déclarait « disponible » à
+        l'orchestrateur pendant que son avis attendait (#3004, 1 j 14 h), et
+        un auteur bloqué continuait sur d'autres lots (#3033 22 h, #3195 9 h).
+        La correction due passe en premier : c'est elle qui débloque la revue.
+        Une file illisible ne change pas la relance : le brief de reprise la
+        dit, et un tour au repos ne part pas sur une lecture ratée."""
         from . import reprise
-        prompt = adapters.idle_prompt(self._idle_pilot())
+        parts = [adapters.idle_prompt(self._idle_pilot())]
+        try:
+            fixes = reprise.fixes_owed_lines(self.db, self.name)
+        except Exception:  # noqa: BLE001 - la relance part quand même
+            fixes = []
+        if (fixes and fixes != [reprise.NO_FIX_OWED]
+                and not fixes[0].startswith("(fixes owed unreadable")):
+            parts += ["", adapters.IDLE_FIXES_HEADER] + fixes
         try:
             lines = reprise.pending_review_lines(self.db, self.name)
         except Exception:  # noqa: BLE001 - la relance part quand même
-            return prompt
-        if (not lines or lines == [reprise.NO_PENDING_REVIEW]
-                or lines[0].startswith("(pending reviews unreadable")):
-            return prompt
-        return "\n".join([prompt, "", adapters.IDLE_REVIEWS_HEADER] + lines)
+            lines = []
+        if (lines and lines != [reprise.NO_PENDING_REVIEW]
+                and not lines[0].startswith("(pending reviews unreadable")):
+            parts += ["", adapters.IDLE_REVIEWS_HEADER] + lines
+        return "\n".join(parts)
 
     #: #408 : intervalle minimal entre deux lectures des lots actionnables
     LOT_WAKE_CHECK_S = 30.0

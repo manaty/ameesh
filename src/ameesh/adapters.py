@@ -259,6 +259,12 @@ IDLE_PROMPT = (
     "take up your assignment (board, workstream). If you have nothing to do, "
     "say so with agent-mail send %s, then stop."
 )
+#: #3288 : l'en-tête des corrections dues, ajouté à la relance d'inactivité
+#: quand il y en a — une correction bloquante passe avant tout autre travail
+IDLE_FIXES_HEADER = (
+    "Fixes you owe (a blocking verdict sits on your frozen head): correct it and "
+    "freeze the new head before any other work."
+)
 #: #3033 : l'en-tête des avis dus, ajouté à la relance d'inactivité quand il y
 #: en a — un agent qui en doit un n'est pas « disponible »
 IDLE_REVIEWS_HEADER = (

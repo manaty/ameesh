@@ -2405,6 +2405,36 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                     row["sha"][:12],
                     _duration(now - since) if since is not None else "?"))
             return 0
+        if args.work_command == "fixes-owed":
+            # #3288 : les corrections dues après un avis bloquant — l'autre
+            # moitié du calcul des avis dus (#3033) ; l'agent lié par défaut.
+            from . import review_designation_activation as activation
+            agent = None if args.all else (args.agent or "").strip()
+            if agent == "":
+                from .identity import resolve_binding
+                binding = resolve_binding(cfg, db)
+                if not binding.ok:
+                    print("ameesh work fixes-owed: give AGENT or --all (no bound "
+                          "identity)", file=sys.stderr)
+                    return 2
+                agent = binding.name
+            rows = activation.due_fixes(db, agent)
+            if args.json:
+                print(json.dumps(rows, ensure_ascii=False, indent=2, default=str))
+                return 0
+            if not rows:
+                print("no fix owed%s" % (" by %s" % agent if agent else ""))
+                return 0
+            from .sous_utilisation import _duration
+            now = time.time()
+            for row in rows:
+                since = row.get("blocked_ts")
+                print("#%d [%s] %s — fix owed by %s, blocked by %s, head %s, "
+                      "blocked %s ago" % (
+                          row["lot"], row["state"] or "?", row["title"], row["name"],
+                          row.get("blocked_by") or "?", row["sha"][:12],
+                          _duration(now - since) if since is not None else "?"))
+            return 0
         if args.work_command == "reviewers":
             from . import review_designation_activation as activation
             out = activation.reviewers(cfg, db, args.id, apply=args.apply)
@@ -3520,6 +3550,16 @@ def build_parser() -> argparse.ArgumentParser:
                             help="every reviewer's pending reviews")
     pw_pending.add_argument("--json", action="store_true")
     pw_pending.set_defaults(func=cmd_work)
+    pw_fixes = work_sub.add_parser(
+        "fixes-owed",
+        help="#3288: the fixes still owed after a blocking verdict — open lots whose "
+             "latest freeze carries a blocked verdict no later freeze replaced")
+    pw_fixes.add_argument("agent", nargs="?", metavar="AGENT",
+                          help="default: the session's bound identity")
+    pw_fixes.add_argument("--all", action="store_true",
+                          help="every assignee's owed fixes")
+    pw_fixes.add_argument("--json", action="store_true")
+    pw_fixes.set_defaults(func=cmd_work)
     pw_reviewers = work_sub.add_parser(
         "reviewers",
         help="#2447: read the automatic reviewer designation of the latest freeze, "
