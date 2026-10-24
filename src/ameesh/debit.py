@@ -21,8 +21,11 @@ sur la tête gelée — la même règle que #3033, sans sa colonne.
 
 Sortie : un schéma stable `ameesh-debit/1` en `--json`, un tableau court en
 texte. `--check` sort 2 quand une attente de plus de `--threshold` (2 h par
-défaut) reste sans geste humain : le passage de l'auditeur ne peut pas dire
-« rien à signaler » dans ce cas.
+défaut) **qui ne dépend pas d'un humain** reste sans geste : le passage de
+l'auditeur ne peut pas dire « rien à signaler » dans ce cas. Les attentes
+humaines (owner, décision signée, geste owner, lot `waiting_human`) sont
+listées à part et ne font pas sortir 2 : le canon ne vise que les attentes
+d'agent.
 """
 from __future__ import annotations
 
@@ -125,10 +128,16 @@ def _versions(text: str) -> list[tuple[int, int, int]]:
 
 
 def installed_version() -> str:
-    """La version du paquet qui exécute la commande (`ameesh --version`)."""
+    """La version du paquet qui exécute la commande (`ameesh --version`).
+
+    `from . import version` rend la FONCTION `version()` de `__init__.py` (il
+    n'y a pas de module `ameesh/version.py`) : l'appeler, jamais
+    `version_mod.version()` — sinon l'AttributeError était avalée, la version
+    restait « unknown » et `_version_gt` ne comparait jamais (#3292, constat
+    auditeur du 24/10)."""
     try:
-        from . import version as version_mod
-        return str(version_mod.version())
+        from . import version
+        return str(version())
     except Exception:  # noqa: BLE001 - une version illisible ne bloque pas
         return "unknown"
 
@@ -356,6 +365,30 @@ def _reopened(events: list[dict], terminal_ts: float | None) -> bool:
         if str(event.get("state") or "") in ("intake", "build", "qa"):
             return True
     return False
+
+
+def _current_state(events: list[dict]) -> str | None:
+    """L'état courant lu dans le journal (dernier événement), jamais la colonne."""
+    state = None
+    for event in events or ():
+        if event.get("state"):
+            state = str(event["state"])
+    return state
+
+
+#: une attente qui dépend d'un humain (owner, propriétaire, décision signée,
+#: geste owner, lot `waiting_human`) n'est pas un goulot d'agent : le canon ne
+#: vise que les attentes non humaines (`processus/lots.md`, `agents/auditeur.md`).
+_HUMAN_WAIT_RE = re.compile(
+    r"\bowner\b|\bpropri[ée]taire\b|\bhumain(?:e|s)?\b|\bhuman\b|waiting_human",
+    re.I)
+
+
+def _human_wait(state: str | None, *texts: Any) -> bool:
+    """Cette attente dépend-elle d'un humain ? (`--check` l'exclut)."""
+    if state == "waiting_human":
+        return True
+    return any(_HUMAN_WAIT_RE.search(str(text or "")) for text in texts)
 
 
 def _mark(event: dict) -> dict | None:
@@ -590,6 +623,8 @@ def build(*, items: Iterable[Mapping[str, Any]],
         events_by_lot.setdefault(int(row["work_item_id"]), []).append(row)
     for values in events_by_lot.values():
         values.sort(key=lambda r: (float(r.get("at_ts") or 0.0), int(r.get("id") or 0)))
+    state_by_lot = {ident: _current_state(values)
+                    for ident, values in events_by_lot.items()}
     if holds is None:
         holds = {ident: _holds_from_events(values)
                  for ident, values in events_by_lot.items()}
@@ -707,7 +742,7 @@ def build(*, items: Iterable[Mapping[str, Any]],
     # -- tableau des attentes de plus de 2 h --------------------------------
     waits: list[dict] = []
 
-    def add_wait(kind, entry, since, who, gesture, level=1, **extra):
+    def add_wait(kind, entry, since, who, gesture, level=1, human=False, **extra):
         age = _age(now, since)
         if age is None or age < wait_s:
             return
@@ -716,47 +751,61 @@ def build(*, items: Iterable[Mapping[str, Any]],
                            "app": entry.get("app") or None,
                            "since_ts": since, "since": _iso(since),
                            "age_s": age, "who": who, "gesture": gesture,
-                           "level": level}, **extra))
+                           "level": level, "human": bool(human)}, **extra))
 
     for row in qa:
         if row.get("held"):
             continue                    # la retenue active porte already sa cause
+        state = state_by_lot.get(int(row["lot"]))
         reviewers = row["pending_reviewers"]
         if reviewers:
             add_wait("qa", row, row["frozen_ts"], ", ".join(reviewers),
                      ", ".join(GESTURES["review"].format(who=name, lot=row["lot"])
-                               for name in reviewers))
+                               for name in reviewers),
+                     human=_human_wait(state))
         elif row.get("blocked_verdict"):
             continue                    # l'avis bloquant a son attente dédiée
         elif row.get("missing_reviewer"):
             add_wait("qa", row, row["frozen_ts"], "aucun relecteur",
-                     GESTURES["no_reviewer"].format(lot=row["lot"]))
+                     GESTURES["no_reviewer"].format(lot=row["lot"]),
+                     human=_human_wait(state))
         else:
             add_wait("qa_merge", row, row["frozen_ts"], "paquet",
-                     GESTURES["qa_merge"], level=2)
+                     GESTURES["qa_merge"], level=2, human=_human_wait(state))
     for row in blocked_reviews:
         add_wait("blocking_review", row, row["blocked_ts"],
                  row.get("assignee") or row.get("reviewer") or "auteur",
                  GESTURES["blocking_review"].format(
-                     who=row.get("assignee") or "l'auteur"), level=1)
+                     who=row.get("assignee") or "l'auteur"), level=1,
+                 human=_human_wait(state_by_lot.get(int(row["lot"]))))
     for row in holds_out:
+        state = state_by_lot.get(int(row["lot"]))
+        human = _human_wait(state, row.get("cause"))
         if row.get("device"):
             add_wait("hold_device", row, row["since_ts"], row.get("by") or "?",
-                     GESTURES["hold_device"], level=2, device=row["device"])
+                     GESTURES["hold_device"], level=2, device=row["device"],
+                     human=human)
         elif row.get("undeployed"):
             add_wait("hold_undeployed", row, row["since_ts"], row.get("by") or "?",
                      GESTURES["hold_undeployed"], level=2,
-                     version=row.get("version"))
+                     version=row.get("version"), human=human)
         else:
             add_wait("hold", row, row["since_ts"], row.get("by") or "?",
-                     GESTURES["hold"].format(who=row.get("by") or "?"), level=2)
+                     GESTURES["hold"].format(who=row.get("by") or "?"), level=2,
+                     human=human)
     for row in wakes_out:
         if row.get("overdue"):
             add_wait("wake_overdue", row, row["due_ts"],
                      row.get("assignee") or "?",
-                     GESTURES["wake_overdue"], level=1)
+                     GESTURES["wake_overdue"], level=1,
+                     human=_human_wait(state_by_lot.get(int(row["lot"])),
+                                       row.get("why")))
     waits.sort(key=lambda row: (-float(row["age_s"]), str(row["kind"]),
                                 int(row["lot"] or 0)))
+    #: le canon ne vise que les attentes qui ne dépendent pas d'un humain :
+    #: celles de l'owner sont listées à part et ne font pas sortir `--check` 2.
+    slow_waits = [row for row in waits if not row["human"]]
+    human_waits = [row for row in waits if row["human"]]
 
     # -- avis dus par relecteur ---------------------------------------------
     per_reviewer: dict[str, dict] = {}
@@ -896,7 +945,8 @@ def build(*, items: Iterable[Mapping[str, Any]],
         "device_holds": len(device_holds),
         "undeployed_holds": len(undeployed_holds),
         "idle_with_work": len(idle_with_work),
-        "slow_waits": len(waits),
+        "slow_waits": len(slow_waits),
+        "human_waits": len(human_waits),
         "slow_ci_runs": len([run for run in runs
                              if float(run["duration_s"]) > ci_slow_s]),
     }
@@ -911,7 +961,8 @@ def build(*, items: Iterable[Mapping[str, Any]],
                     "sources": list(devices.get("sources") or ()),
                     "unreadable": list(devices.get("unreadable") or ())},
         "totals": totals,
-        "slow_waits": waits,
+        "slow_waits": slow_waits,
+        "human_waits": human_waits,
         "qa": sorted(qa, key=lambda row: (-float(row["age_s"] or 0.0), row["lot"])),
         "blocked_reviews": sorted(blocked_reviews,
                                   key=lambda row: (-float(row["age_s"] or 0.0),
@@ -1181,7 +1232,8 @@ def format_text(report: Mapping[str, Any]) -> str:
     waits = report.get("slow_waits") or []
     if waits:
         lines.append("")
-        lines.append("Attentes de plus de %s (%d) — le geste fait est dû pour chacune :"
+        lines.append("Attentes de plus de %s hors humain (%d) — le geste fait est dû "
+                     "pour chacune :"
                      % (_duration(report.get("wait_s")), len(waits)))
         for row in waits[:40]:
             lines.append("  #%-6d %-16s %8s  %-22s %s"
@@ -1192,7 +1244,20 @@ def format_text(report: Mapping[str, Any]) -> str:
             lines.append("         → %s" % row.get("gesture"))
     else:
         lines.append("")
-        lines.append("Attentes de plus de %s : aucune." % _duration(report.get("wait_s")))
+        lines.append("Attentes de plus de %s hors humain : aucune."
+                     % _duration(report.get("wait_s")))
+    human = report.get("human_waits") or []
+    if human:
+        lines.append("")
+        lines.append("Attentes humaines, hors --check (%d) :" % len(human))
+        for row in human[:20]:
+            lines.append("  #%-6d %-16s %8s  %-22s %s"
+                         % (int(row.get("lot") or 0), str(row.get("kind")),
+                            _duration(row.get("age_s")),
+                            str(row.get("who") or "?")[:22],
+                            str(row.get("title") or "")[:48]))
+    else:
+        lines.append("Attentes humaines, hors --check : aucune.")
     reviews = report.get("reviews_by_reviewer") or []
     lines.append("")
     lines.append("Avis dus par relecteur : %s" % (
@@ -1256,7 +1321,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-jobs", action="store_true",
                         help="ne pas lire les jobs GitHub (durée par workflow seulement)")
     parser.add_argument("--check", action="store_true",
-                        help="sortir 2 si une attente dépasse le seuil (aucun « rien à signaler »)")
+                        help="sortir 2 si une attente non humaine dépasse le seuil "
+                             "(aucun « rien à signaler »)")
     parser.add_argument("--canon", action="append", default=None,
                         help="racine d'un canon à lire pour les appareils (répétable)")
     parser.add_argument("--installed", default=None,

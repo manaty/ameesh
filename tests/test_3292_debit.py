@@ -466,5 +466,53 @@ class WitnessTest(PgTestCase):
         self.assertTrue(report["totals"]["slow_waits"] >= 5)
 
 
+class VersionEtAttentesHumainesTest(unittest.TestCase):
+    """Constats de l'auditeur du 24/10 (#3292) : version toujours « unknown »,
+    attentes humaines mêlées aux attentes d'agent dans `--check`."""
+
+    def test_version_lue_sans_option(self):
+        from ameesh import version
+        self.assertEqual(debit.installed_version(), version())
+        self.assertNotEqual(debit.installed_version(), "unknown")
+
+    def test_hold_sur_version_superieure_sans_installed(self):
+        # Sans `installed=`, le rapport doit comparer à la version du paquet,
+        # pas à « unknown » : sinon `_version_gt` ne compare jamais.
+        report = run(
+            installed=None,
+            items=[item(3015)],
+            events=[event(3015, 1, T - 3 * H,
+                          "hold: attend la 999.0.0, correctif fusionné non déployé")])
+        self.assertEqual([row["lot"] for row in report["undeployed_holds"]], [3015])
+        self.assertEqual(report["totals"]["undeployed_holds"], 1)
+
+    def test_hold_owner_hors_check(self):
+        report = run(
+            items=[item(1783, assignee="orchestrateur")],
+            events=[event(1783, 1, T - 3 * H,
+                          "hold: report décidé par l'owner (décision signée #75418)")])
+        self.assertEqual(report["slow_waits"], [])
+        self.assertEqual(report["totals"]["slow_waits"], 0)
+        self.assertEqual(report["totals"]["human_waits"], 1)
+        self.assertEqual([row["lot"] for row in report["human_waits"]], [1783])
+        self.assertIn("hors --check", debit.format_text(report))
+
+    def test_hold_agent_reste_dans_les_attentes(self):
+        report = run(
+            items=[item(2381)],
+            events=[event(2381, 1, T - 3 * H,
+                          "hold: attend un paquet Nexlink réel coupé par le train ameesh")])
+        self.assertEqual([row["lot"] for row in report["slow_waits"]], [2381])
+        self.assertEqual(report["human_waits"], [])
+
+    def test_lot_waiting_human_hors_check(self):
+        report = run(
+            items=[item(666, assignee="orchestrateur")],
+            events=[event(666, 1, T - 3 * H, "hold: attends la réponse",
+                          state="waiting_human")])
+        self.assertEqual(report["slow_waits"], [])
+        self.assertEqual([row["lot"] for row in report["human_waits"]], [666])
+
+
 if __name__ == "__main__":
     unittest.main()
