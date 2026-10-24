@@ -2325,15 +2325,15 @@ def _retry_resolved(db, lot: int, freeze: Mapping) -> bool:
     return str((effective[2] or {}).get("state") or "") in (rd.DESIGNATED, rd.NONE)
 
 
-def _retry_cursor_path(cfg) -> str:
-    """The retry cursor file, under the host state directory (never a repo)."""
+def _cursor_path(cfg, name: str) -> str:
+    """A cursor file, under the host state directory (never a repo)."""
     state = str(getattr(cfg, "state_dir", "") or "").strip()
-    return os.path.join(state, RETRY_CURSOR) if state else ""
+    return os.path.join(state, name) if state else ""
 
 
-def _read_retry_cursor(cfg) -> int:
-    """The last unavailable note examined, or 0 when absent/unreadable."""
-    path = _retry_cursor_path(cfg)
+def _read_cursor(cfg, name: str) -> int:
+    """The last id examined for this cursor, or 0 when absent/unreadable."""
+    path = _cursor_path(cfg, name)
     if not path:
         return 0
     try:
@@ -2344,9 +2344,9 @@ def _read_retry_cursor(cfg) -> int:
     return max(0, value)
 
 
-def _write_retry_cursor(cfg, cursor: int) -> None:
-    """Atomically records the cursor; a state problem never fails the retry."""
-    path = _retry_cursor_path(cfg)
+def _write_cursor(cfg, name: str, cursor: int) -> None:
+    """Atomically records the cursor; a state problem never fails the pass."""
+    path = _cursor_path(cfg, name)
     if not path:
         return
     tmp = "%s.%d.tmp" % (path, os.getpid())
@@ -2407,7 +2407,7 @@ def retry_pending(cfg, db, *, limit: int = RETRY_LIMIT) -> dict:
         limit = max(0, int(limit))
     except (TypeError, ValueError):
         limit = RETRY_LIMIT
-    cursor = _read_retry_cursor(cfg)
+    cursor = _read_cursor(cfg, RETRY_CURSOR)
     try:
         rows = _retry_notes(db, cursor)
         if not rows and cursor:
@@ -2467,7 +2467,7 @@ def retry_pending(cfg, db, *, limit: int = RETRY_LIMIT) -> dict:
     # Always move past what this pass examined, even when no lot was attempted:
     # the next pass must not re-read the same resolved/stale notes.
     if last > cursor or cursor == 0:
-        _write_retry_cursor(cfg, last)
+        _write_cursor(cfg, RETRY_CURSOR, last)
     out["summary"] = ("%d attempted: %d designated, %d waiting, %d none,"
                       " %d unavailable, %d manual, %d stale, %d skipped"
                       % (attempted, out["designated"], out["waiting"],
@@ -2483,6 +2483,10 @@ def retry_pending(cfg, db, *, limit: int = RETRY_LIMIT) -> dict:
 REASSIGN_PREFIX = "review-designation-reassign:"
 #: #3328 : the bounded scan of lots whose automatic designation is examined.
 REASSIGN_SCAN = 200
+#: #3328 : the reassignment scan's cursor, under the host state directory. A
+#: pass resumes after the last lot examined and wraps once at the end, so a
+#: backlog of non-actionable seats cannot pin the bounded window.
+REASSIGN_CURSOR = "review-designation-reassign.cursor"
 
 
 def _unreachable_reviewer(row: Optional[Mapping], closed_hosts: set) -> str:
@@ -2532,6 +2536,49 @@ def _reviewer_rows(listing: Iterable[Mapping]) -> dict:
     return by_name
 
 
+def _unreachable_lots(db, *, after: int, hosts: Sequence[str],
+                      scan: int = REASSIGN_SCAN) -> list:
+    """Open lots whose reviewer column names an unreachable agent (#3328).
+
+    The filter runs **before** the bounded window: 200 older healthy lots
+    cannot hide the 201st whose seat is lost. Each name of the column is
+    unnested, so a name absent from the registry is seen even beside a live
+    one — the former `r.name = ANY(w.reviewers)` join kept the live row and
+    never produced the missing one. A name is reachable when a registry row
+    (or one of its aliases) is `execute`, not `stopped`/`dead`, on a host
+    whose claims are open.
+
+    The window is ordered by lot id and starts after `after`; the caller
+    wraps to 0 at the end and persists the last examined id, so a backlog of
+    rows that need no action cannot starve the rows behind it.
+    """
+    host_sql = ""
+    params: list = [int(after)]
+    hosts = [str(host).strip() for host in hosts or () if str(host).strip()]
+    if hosts:
+        host_sql = (" AND r.host NOT IN (%s)"
+                    % ", ".join(["%s"] * len(hosts)))
+        params.extend(hosts)
+    params.append(int(scan))
+    return db.query(
+        "SELECT w.id, w.state, w.reviewers FROM work_items w"
+        " WHERE w.state NOT IN ('merged', 'promoted', 'closed')"
+        "   AND w.reviewers IS NOT NULL AND cardinality(w.reviewers) > 0"
+        "   AND w.id > %s"
+        "   AND EXISTS ("
+        "     SELECT 1 FROM unnest(w.reviewers) AS rv(name)"
+        "     WHERE NOT EXISTS ("
+        "       SELECT 1 FROM agent_registry r"
+        "       WHERE (r.name = rv.name"
+        "              OR rv.name = ANY(coalesce(r.aliases, '{}'::text[])))"
+        "         AND r.status NOT IN ('stopped', 'dead')"
+        "         AND r.mode = 'execute'"
+        + host_sql +
+        "     )"
+        "   )"
+        " ORDER BY w.id ASC LIMIT %s", tuple(params))
+
+
 def reassign_unreachable(cfg, db, *, limit: int = RETRY_LIMIT) -> dict:
     """Replays the designation of a lot whose reviewer became unreachable.
 
@@ -2556,6 +2603,11 @@ def reassign_unreachable(cfg, db, *, limit: int = RETRY_LIMIT) -> dict:
     out = {"examined": 0, "reassigned": 0, "waiting": 0, "skipped": 0,
            "errors": [], "summary": ""}
     try:
+        limit = max(0, int(limit))
+    except (TypeError, ValueError):
+        limit = RETRY_LIMIT
+    cursor = _read_cursor(cfg, REASSIGN_CURSOR)
+    try:
         from .storage.postgres.work import has_reviewers
         if not has_reviewers(db):
             out["summary"] = "no reviewer column: nothing to reassign"
@@ -2566,35 +2618,28 @@ def reassign_unreachable(cfg, db, *, limit: int = RETRY_LIMIT) -> dict:
             return out
         by_name = _reviewer_rows(listing)
         closed = alert_briefs.claims_closed_hosts(db)
-        # One cheap probe before the per-lot scan: is any current seat held by
-        # an unreachable agent? Without one, every read below would conclude
-        # nothing. The probe joins the reviewer column to the registry, so it
-        # says nothing about a lot whose seat was already removed.
         hosts = [str(host).strip() for host in closed if str(host).strip()]
-        host_sql = (" OR r.host IN (%s)" % ", ".join(["%s"] * len(hosts))
-                    if hosts else "")
-        probe = db.query(
-            "SELECT 1 FROM work_items w"
-            " LEFT JOIN agent_registry r ON r.name = ANY(w.reviewers)"
-            " WHERE w.state NOT IN ('merged', 'promoted', 'closed')"
-            "   AND w.reviewers IS NOT NULL AND cardinality(w.reviewers) > 0"
-            "   AND (r.name IS NULL OR r.status IN ('stopped', 'dead')"
-            "        OR r.mode <> 'execute'" + host_sql + ")"
-            " LIMIT 1", tuple(hosts))
-        if not probe:
+        # #3328 (relecture) : le filtre est dans la requête, AVANT la fenêtre
+        # bornée. Les 200 lots anciens sains ne peuvent plus masquer le 201e
+        # dont le siège est perdu ; le curseur fait avancer une passe dont les
+        # lignes examinées ne demandent rien, puis se replie une fois au bout.
+        rows = _unreachable_lots(db, after=cursor, hosts=hosts)
+        if not rows and cursor:
+            cursor = 0
+            rows = _unreachable_lots(db, after=0, hosts=hosts)
+        if not rows:
+            if cursor:
+                # The queue is empty: the next pass starts at the oldest lot
+                # again instead of re-reading an exhausted window.
+                _write_cursor(cfg, REASSIGN_CURSOR, 0)
             out["summary"] = "no unreachable evidence"
             return out
-        rows = db.query(
-            "SELECT id, state, reviewers FROM work_items"
-            " WHERE state NOT IN ('merged', 'promoted', 'closed')"
-            "   AND reviewers IS NOT NULL AND cardinality(reviewers) > 0"
-            " ORDER BY updated_at ASC NULLS FIRST, id ASC LIMIT %s",
-            (int(REASSIGN_SCAN),))
     except Exception as exc:  # noqa: BLE001 - the pass never breaks the caller
         out["errors"].append("%s: %s" % (type(exc).__name__, str(exc)[:200]))
         out["summary"] = "no reassignment: inputs unreadable"
         return out
     attempted = 0
+    last = cursor
     for row in rows or ():
         try:
             lot = int(row.get("id") or 0)
@@ -2603,6 +2648,14 @@ def reassign_unreachable(cfg, db, *, limit: int = RETRY_LIMIT) -> dict:
             continue
         if not lot:
             continue
+        if attempted >= limit:
+            # budget spent: the cursor stops before this row, which the next
+            # pass examines first instead of starving behind it.
+            break
+        # The cursor moves over every row a pass examines, including a row
+        # that raises: a poison seat is retried after the wrap, never at the
+        # cost of the rows behind it.
+        last = max(last, lot)
         try:
             freeze = _latest_freeze(db, lot)
             if freeze is None:
@@ -2637,8 +2690,6 @@ def reassign_unreachable(cfg, db, *, limit: int = RETRY_LIMIT) -> dict:
             if storage.of(db).work.events_noted(prefix, since, ids=[lot]):
                 out["skipped"] += 1
                 continue
-            if attempted >= limit:
-                break
             attempted += 1
             result = designate(cfg, db, lot, freeze=freeze, force=True)
         except Exception as exc:  # noqa: BLE001 - one lot never stops the pass
@@ -2665,6 +2716,11 @@ def reassign_unreachable(cfg, db, *, limit: int = RETRY_LIMIT) -> dict:
         except Exception as exc:  # noqa: BLE001 - the mark is already written
             out["errors"].append("#%d note: %s: %s"
                                  % (lot, type(exc).__name__, str(exc)[:160]))
+    # Move past what the pass examined even when nothing was attempted: the
+    # next pass starts after it and wraps once at the end, so a backlog of
+    # non-actionable seats cannot pin the window forever.
+    if last > cursor or cursor == 0:
+        _write_cursor(cfg, REASSIGN_CURSOR, last)
     out["summary"] = ("%d examined: %d reassigned, %d waiting, %d skipped"
                       % (out["examined"], out["reassigned"], out["waiting"],
                          out["skipped"]))

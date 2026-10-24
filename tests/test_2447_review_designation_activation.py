@@ -1412,6 +1412,90 @@ class UnreachableDesignationTest(_ActivationFixture, PgTestCase):
         self.assertEqual(again["examined"], 0, again)
         self.assertEqual(len(self.mailbox()), mails)
 
+    def test_two_hundred_older_healthy_lots_do_not_hide_the_lost_seat(self):
+        # Relecture #132625 (1) : la fenêtre bornée lisait les 200 lots
+        # ouverts les plus anciens, sains, et ne voyait jamais le 201e dont
+        # le siège est perdu. Le filtre des injoignables passe avant la
+        # fenêtre : les lots sains ne sont plus des candidats.
+        self._agent("r3", "claude")
+        _, out = self.freeze()
+        self.assertEqual(sorted(r["name"] for r in out["reviewers"]), ["r1", "r2"])
+        for index in range(act.REASSIGN_SCAN):
+            self.db.execute(
+                "INSERT INTO work_items (title, app, state, assignee, reviewers,"
+                " updated_at) VALUES (%s, 'ameesh', 'qa', 'author',"
+                " ARRAY['r2'], now() - interval '2 days')",
+                ("healthy %d" % index,))
+        self.db.execute("UPDATE work_items SET updated_at = now() WHERE id = %s",
+                        (self.lot,))
+        self._move_to_lost("r1")
+        self._lose_host()
+        report = act.reassign_unreachable(self.cfg, self.db)
+        self.assertEqual(report["examined"], 1, report)
+        self.assertEqual(report["reassigned"], 1, report)
+        noted = self._designated()
+        self.assertEqual(sorted(r["name"] for r in noted["reviewers"]), ["r2", "r3"])
+
+    def test_a_missing_reviewer_beside_a_live_one_is_reassigned(self):
+        # Relecture #132625 (2) : la sonde joignait la colonne au registre.
+        # Avec un nom vivant et un nom absent, la jointure ne rendait que le
+        # vivant et l'absence restait invisible. Chaque nom est désormais
+        # déroulé : `ghost` est vu à côté de `r2`, qui est sain.
+        self._agent("r3", "claude")
+        row, out = self.freeze()
+        self.assertEqual(sorted(r["name"] for r in out["reviewers"]), ["r1", "r2"])
+        freeze_id = int(row["id"])
+        self.db.execute(
+            "UPDATE work_items SET reviewers = ARRAY['r2', 'ghost'] WHERE id = %s",
+            (self.lot,))
+        note = pg._mark_note(
+            self.lot, freeze_id, state=rd.DESIGNATED, required=2,
+            reviewers=[{"name": "r2", "family": "codex"},
+                       {"name": "ghost", "family": "claude"}],
+            missing=0, why="test: missing beside live", authors=[],
+            policy_ref="", sha=self.frozen)
+        storage.of(self.db).work.note(self.lot, "build", note, "test")
+        # `r1` revient au registre comme candidat sain : on le perd aussi pour
+        # que le remplacement soit `r3`, et non le nom absent retiré de la
+        # colonne.
+        self._move_to_lost("r1")
+        self._lose_host()
+        report = act.reassign_unreachable(self.cfg, self.db)
+        self.assertEqual(report["examined"], 1, report)
+        self.assertEqual(report["reassigned"], 1, report)
+        noted = self._designated()
+        names = [r["name"] for r in noted["reviewers"]]
+        self.assertNotIn("ghost", names, noted)
+        self.assertEqual(sorted(names), ["r2", "r3"], noted)
+        self.assertIn("ghost (absent from the registry)",
+                      self.notes(act.REASSIGN_PREFIX)[-1])
+
+    def test_a_window_of_non_actionable_seats_wraps_to_the_lost_one(self):
+        # Relecture #132625 (1) : un curseur fait avancer une passe dont les
+        # candidats ne demandent rien (ici deux sièges sans gel), puis se
+        # replie au bout. Sans lui, la même fenêtre pouvait être relue à
+        # chaque passe et le siège perdu, plus ancien, ne jamais revenir.
+        self._agent("r3", "claude")
+        self.freeze()
+        self._move_to_lost("r1")
+        self._lose_host()
+        for index in range(2):
+            self.db.execute(
+                "INSERT INTO work_items (title, app, state, assignee, reviewers)"
+                " VALUES (%s, 'ameesh', 'qa', 'author', ARRAY['r1'])",
+                ("stale %d" % index,))
+        act._write_cursor(self.cfg, act.REASSIGN_CURSOR, self.lot)
+        with mock.patch.object(act, "REASSIGN_SCAN", 2):
+            first = act.reassign_unreachable(self.cfg, self.db)
+            self.assertEqual(first["reassigned"], 0, first)
+            self.assertEqual(act._read_cursor(self.cfg, act.REASSIGN_CURSOR),
+                             self.lot + 2, first)
+            second = act.reassign_unreachable(self.cfg, self.db)
+        self.assertEqual(second["examined"], 1, second)
+        self.assertEqual(second["reassigned"], 1, second)
+        self.assertEqual(sorted(r["name"] for r in self._designated()["reviewers"]),
+                         ["r2", "r3"])
+
 
 class PendingLoadTest(_ActivationFixture, PgTestCase):
     """#3004: the load of a reviewer counts the reviews they still owe.
