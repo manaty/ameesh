@@ -1469,6 +1469,13 @@ class WorkItems(Domain):
         `current` (compare-and-set, no lost concurrent correction)."""
 
     @abc.abstractmethod
+    def set_priority(self, item_id: int, priority: int, *, current: int | None,
+                     reason: str, actor: str) -> dict | None:
+        """#3370: journaled priority correction, if the lot still carries
+        `current` (compare-and-set, NULL included, no lost concurrent
+        correction)."""
+
+    @abc.abstractmethod
     def without_project(self) -> list[dict]:
         """L118c: open lots with empty app, once per id, including waiting_human."""
 
@@ -2767,6 +2774,42 @@ class Canon(Domain):
         l'agent n'est pas en tour, et que `target` figure encore dans les
         hôtes admis. Rend la ligne (`name`, `host`), ou None (worker périmé,
         tour en cours, destination plus admise)."""
+
+    @abc.abstractmethod
+    def relocate_operator(self, name: str, host: str, *, target: str, canon_ref: str,
+                          diagnostic: str, ref: str | None, keep_session: bool,
+                          runner_stale_s: float, summary: str = "",
+                          source_stopped: bool = False) -> dict | None:
+        """Déplacement MANUEL d'un agent `releve: hote` entre deux hôtes admis
+        (lot #3299), sans bail vivant de l'appelant.
+
+        Mêmes gardes que `relocate` (hôte d'arrivée dans `admitted_hosts`,
+        aucun tour en cours, aucun handoff ouvert, aucun `host_hold` sur
+        l'arrivée), sauf le bail : il n'est pas exigé quand l'exécuteur de
+        départ est arrêté — `runner_seen_at` plus vieux que `runner_stale_s`
+        (horloge de la base), `runner_seen_host` d'un autre hôte, ou
+        `source_stopped` (preuve locale : l'unité de l'exécuteur est
+        inactive, et le dernier relevé vient bien de l'unité DE CET agent,
+        `runner_seen_owner` = `runner-<nom>@…` ; le gabarit systemd répond
+        `inactive` pour tout nom jamais instancié). Un bail VIVANT n'est
+        accepté que dans ce cas : un exécuteur qui sert encore l'agent n'est
+        jamais dépossédé en silence. Un agent `releve: election` est refusé
+        (son élection déplace son bail).
+
+        `host` est l'hôte attendu (recontrôlé sous le verrou). `keep_session`
+        garde la session native et la consigne ; sinon la session est oubliée,
+        `session_reset_at` posé, le statut remis à `queued` (sauf `stopped`,
+        conservé) et `summary` ouvre la consigne en attente.
+
+        Le bail de la source est **révoqué dans la même écriture**, même avec
+        `keep_session` : `lease_owner` et `lease_expires_at` vidés,
+        `lease_epoch` incrémenté. `renew` et `begin_turn` ne contrôlent que
+        owner/epoch, pas l'hôte ; sans cette révocation, un exécuteur de départ
+        encore vivant garderait l'agent et l'arrivée ne pourrait pas le
+        réclamer (B1 des deux relectures, #3299). Rend la ligne (`name`,
+        `host`, et le bail révoqué `previous_lease_owner` /
+        `previous_lease_epoch`), ou None si une garde a changé depuis la
+        lecture."""
 
     @abc.abstractmethod
     def stop_removed(self, name: str, host: str, *, pending_text: str,
@@ -4143,19 +4186,22 @@ class LotSessions(Domain):
     def claim_wake(self, name: str, lot: int, now: float,
                    claim_ttl_s: float = 120.0) -> dict | None:
         """#2466 : réclame le réveil programmé échu du lot (bail de livraison),
-        dans une transaction : `wake_claim_at` est posé et le journal reçoit
-        une ligne `wake: … delivered …` (témoin de la délivrance). Rend
-        `{id, state, title, wake_ts}` ou None si le lot n'a plus de réveil
-        échu, est déjà réclamé, n'est plus assigné à `name` ou est fini.
-        L'échéance n'est pas effacée : `consume_wake` le fera au lancement du
-        tour, un claim non consommé expirant après `claim_ttl_s`."""
+        en une écriture atomique : `wake_claim_at` est posé, rien n'est écrit
+        au journal (#2614). Rend `{id, state, title, wake_ts}` ou None si le
+        lot n'a plus de réveil échu, est déjà réclamé depuis moins de
+        `claim_ttl_s`, n'est plus assigné à `name` ou est fini. L'échéance
+        n'est pas effacée : `consume_wake` le fera au lancement du tour, un
+        claim non consommé expirant après `claim_ttl_s`. Le détenteur renouvelle
+        son bail avec `claim_ttl_s=0` tant que le lancement se prépare (#2614)."""
 
     @abc.abstractmethod
     def consume_wake(self, name: str, lot: int, wake_ts: float) -> bool:
         """#2466 : consomme le réveil programmé délivré : efface `wake_at` et
         `wake_claim_at` (une seule fois), **seulement** si l'échéance est
         encore celle qui a été réclamée (`wake_ts`) et sous claim — une
-        nouvelle échéance posée entre-temps est conservée. Rend False sinon."""
+        nouvelle échéance posée entre-temps est conservée. Rend False sinon.
+        #2614 : la consommation écrit au journal, dans la même transaction, la
+        ligne `wake: … delivered …` — un témoin par réveil réellement délivré."""
 
     @abc.abstractmethod
     def purge(self, name: str | None = None) -> list[dict]:
@@ -4314,6 +4360,30 @@ class CiResults(Domain):
         ligne qui fonderait une alerte de silence perpétuelle sur les autres
         hôtes (#2957). Un périmètre vide ne purge rien : il ne prouve pas que
         des dépôts ont été retirés."""
+
+    # -- #3344 : âge de la carte de mesure ----------------------------------
+    @abc.abstractmethod
+    def observe_map(self, repo: str, *, branch: str, run_id: int | None,
+                    head_sha: str | None, published_at: str | None) -> None:
+        """Enregistre la dernière exécution réussie de `carte.yml` vue sur la
+        branche de base `branch` du dépôt (`published_at` : son `updated_at`
+        GitHub ; tout à None si aucune n'a été trouvée). La date du relevé est
+        celle de la base."""
+
+    @abc.abstractmethod
+    def maps(self) -> list[dict]:
+        """Le dernier relevé de carte par dépôt : `{repo, branch, run_id,
+        head_sha, published_ts, seen_ts}` (`published_ts` NULL : aucune
+        exécution réussie trouvée)."""
+
+    @abc.abstractmethod
+    def forget_map(self, repo: str) -> None:
+        """Retire le relevé de carte d'un dépôt qui ne porte plus `carte.yml`."""
+
+    @abc.abstractmethod
+    def prune_maps(self, repos: Sequence[str]) -> None:
+        """Retire les relevés de carte des dépôts hors du périmètre actif
+        `repos` (comme `prune_queue`) ; un périmètre vide ne purge rien."""
 
     # -- #845 (revue N/P2 2328) : fenêtre et cache du relevé ----------------
     @abc.abstractmethod

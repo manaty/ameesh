@@ -197,6 +197,43 @@ class PublicationTest(unittest.TestCase):
         self.assertEqual([a[0] for a in gh.appels], ["create", "update"])
         self.assertEqual(gh.appels[-1][3], "cancelled")  # pas de ligne `fin`
 
+    def test_deux_ecrivains_de_l_etat_ne_se_volent_pas_le_temporaire(self):
+        """#3336 : `publish` (arrière-plan) et `close` (`if: always()`) écrivent
+        l'état de la même part. Avec un temporaire à nom fixe, le renommage de
+        l'un consommait le fichier de l'autre : `close` échouait en
+        FileNotFoundError (main, run 40084134277) et rougissait la part alors
+        que ses 920 tests étaient verts. Chaque écrivain garde son propre
+        temporaire jusqu'à son propre renommage."""
+        a = ciflux.Publication(str(self.flux), "tests (flux) p 1/1", FauxGitHub())
+        b = ciflux.Publication(str(self.flux), "tests (flux) p 1/1", FauxGitHub())
+        vrai_replace = ciflux.os.replace
+        passe = []
+
+        def replace_avec_l_autre(src, dst):
+            if not passe:
+                passe.append(1)
+                # l'autre écrivain écrit puis renomme *entre* notre écriture et
+                # notre renommage : c'est l'entrelacement qui a rougi la CI.
+                b._keep()
+            return vrai_replace(src, dst)
+
+        with mock.patch.object(ciflux.os, "replace", side_effect=replace_avec_l_autre):
+            a._keep()
+        self.assertEqual(json.loads((self.dossier / "flux.jsonl.check").read_text()),
+                         a.etat)
+
+    def test_etat_non_ecrit_ne_rougit_pas_l_etape(self):
+        """#3336 : la publication d'un check run n'échoue jamais la part, même
+        contrat que le refus de GitHub : un état non écrit est consigné."""
+        self.ecrire(ev_test("tests.test_a.T.test_ko"))
+        gh = FauxGitHub()
+        err = io.StringIO()
+        with mock.patch.object(ciflux.Publication, "_keep",
+                               side_effect=OSError("disque plein")):
+            with contextlib.redirect_stderr(err):
+                self.assertEqual(ciflux.close(self.args(), gh=gh), 0)
+        self.assertIn("non écrit", err.getvalue())
+
     def test_refus_jamais_bloquant(self):
         gh = FauxGitHub(refus=True)
         err = io.StringIO()
@@ -2285,6 +2322,37 @@ class WatcherTest(PgTestCase):
         self.assertIn("tests.test_b.T.test_2", mails[0]["body"])
         self.assertEqual(watcher.tick(self.db), [])
         self.assertEqual(len(self.mails("dev-a")), 1)
+
+    def test_echec_deja_inscrit_non_resignale_si_inherited_change(self):
+        """#1786 N1 : la référence de base peut changer entre deux passes ; une
+        ligne de l'attempt courant déjà inscrite sans message ne change pas de
+        classe (`add_failure` ne met pas à jour le même attempt). Elle n'est
+        donc pas resignalée comme échec propre : le message et la base
+        resteraient divergents."""
+        watcher = ci.Watcher(self.cfg_ci, api=self.api, clock=lambda: self.NOW)
+        sha = "74" * 20
+        st = storage.of(self.db)
+        st.ci.open_run(DEPOT, 1033, head_sha=sha, branch="lot/1-un",
+                       event="pull_request", base="main",
+                       work_item_id=self.lot["id"], url=None, workflow="tests.yml")
+        # la ligne a d'abord été vue héritée (main rouge sur ce test), sans
+        # message ; la référence de main est maintenant verte.
+        st.ci.add_failure(DEPOT, 1033, run_attempt=1, part="psycopg 1/4",
+                          test="tests.test_a.T.test_1", module="tests.test_a",
+                          status="echec", inherited=True, excerpt="", replay="",
+                          duration_s=None, failed_at=None)
+        self.api.live = [run_view(1033, sha, "lot/1-un")]
+        self.api.checks[sha] = [check_run([ev_test("tests.test_a.T.test_1",
+                                                   execution=1033)])]
+        self.assertEqual(watcher.tick(self.db), [])
+        self.assertEqual(self.mails("dev-a"), [])
+        failures = st.ci.failures(DEPOT, 1033)
+        self.assertEqual([(f["test"], f["inherited"], f["message_id"])
+                          for f in failures],
+                         [("tests.test_a.T.test_1", True, None)])
+        # le passage suivant ne double rien : la ligne reste sans message.
+        self.assertEqual(watcher.tick(self.db), [])
+        self.assertEqual(self.mails("dev-a"), [])
 
     def test_echec_sans_destinataire_journalise_une_seule_fois(self):
         """#1573 R2 : une exécution sans lot (main) n'envoie aucun message ;

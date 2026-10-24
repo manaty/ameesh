@@ -203,6 +203,10 @@ class SelectedTurnRefusedTest(unittest.TestCase):
         # la doublure porte la vraie logique de tour et une enveloppe inerte.
         worker._run_guarded_turn = types.MethodType(
             runner_mod.AgentWorker._run_guarded_turn, worker)
+        # #2614 : `run_turn` est l'enveloppe du claim de réveil ; la doublure
+        # porte aussi le tour réel, appelé par cette enveloppe.
+        worker._run_turn_or_defer = types.MethodType(
+            runner_mod.AgentWorker._run_turn_or_defer, worker)
         # #1462 : run_turn lit d’abord la pause opérateur dans le registre —
         # agent non pausé ici, la doublure de base ne porte pas de requêtes.
         with mock.patch.object(registry, "restore_prompt", return_value=True) as restore, \

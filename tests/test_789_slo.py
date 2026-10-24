@@ -31,12 +31,13 @@ def _jalons(item, events):
 class TableTest(unittest.TestCase):
     """La table est celle du canon §9, avec ses deux colonnes de délai."""
 
-    def test_les_neuf_etapes_du_canon(self):
-        self.assertEqual(len(slo.STEPS), 9)
+    def test_les_dix_etapes_du_canon(self):
+        # #3288 : « avis bloquant → nouveau gel » s'ajoute au §9.
+        self.assertEqual(len(slo.STEPS), 10)
         self.assertEqual([s.key for s in slo.STEPS], [
             "signal_assigned", "intake_started", "build_quiet", "green_verdict",
-            "verdict_merge", "merge_prod", "prod_verified", "ci_queue",
-            "agent_paused"])
+            "blocked_freeze", "verdict_merge", "merge_prod", "prod_verified",
+            "ci_queue", "agent_paused"])
 
     def test_delais_du_canon(self):
         attendus = {
@@ -44,6 +45,7 @@ class TableTest(unittest.TestCase):
             "intake_started": (3600, 900),
             "build_quiet": (7200, 3600),
             "green_verdict": (7200, 1800),
+            "blocked_freeze": (7200, 3600),
             "verdict_merge": (1800, 900),
             "merge_prod": (86400, 14400),
             "prod_verified": (7200, 3600),
@@ -57,8 +59,11 @@ class TableTest(unittest.TestCase):
 
     def test_seules_les_etapes_des_evenements_sont_mesurees(self):
         mesurees = {s.key for s in slo.STEPS if s.measured}
+        # #3033 : `green_verdict` est mesurée depuis la désignation au gel
+        # #3288 : `blocked_freeze` l'est depuis le premier avis bloquant
         self.assertEqual(mesurees, {"signal_assigned", "intake_started",
-                                    "build_quiet", "verdict_merge"})
+                                    "build_quiet", "green_verdict",
+                                    "blocked_freeze", "verdict_merge"})
         for step in slo.STEPS:
             if not step.measured:
                 self.assertEqual(step.source, slo.EXTERNAL, step.key)
@@ -556,17 +561,77 @@ class PaquetTest(unittest.TestCase):
 
     def test_exception_p1_garde_15_min_et_l_escalade(self):
         # Incident/déblocage CI déclaré (`outside_packet`) : la cible de la
-        # table reprend sa colonne P1 (15 min) et l'escalade depuis le GO.
+        # table reprend sa colonne P1 (15 min) et l'escalade depuis le GO —
+        # ici une CI verte antérieure au GO, donc le départ reste le GO.
         item, jalons, events = self._qa(priority=1)
         rows = slo.lot_steps(item, jalons, events, now=T0 + 1800 + 1000,
-                             outside_packet=True)
+                             outside_packet=True, ci_green_ts=T0 + 600)
         row = self._row(rows, "verdict_merge")
         self.assertEqual(row["target_s"], 900)
         self.assertEqual(row["level"], 1)
         self.assertEqual(row["targets"],
                          ("assignee", "bureau", "auditeur"))
         self.assertEqual(row["target_source"], "table")
+        self.assertEqual(row["started_ts"], T0 + 1800)
         self.assertNotIn("packet", row)
+
+    def test_hors_paquet_le_vert_de_la_ci_fixe_le_depart(self):
+        # #3341 : GO à T0+1800, CI verte à T0+4200 (40 min après le GO).
+        # L'horloge P1 (15 min) part du vert : rien avant T0+5100, niveau 1 à
+        # T0+5100 — pas à GO+15 min pendant que la CI tourne encore.
+        item, jalons, events = self._qa(priority=1)
+        green = T0 + 4200.0
+        before = slo.lot_steps(item, jalons, events, now=green + 899,
+                               outside_packet=True, ci_green_ts=green)
+        row = self._row(before, "verdict_merge")
+        self.assertEqual(row["started_ts"], green)
+        self.assertEqual(row["elapsed_s"], 899)
+        self.assertEqual(row["level"], 0)
+        self.assertEqual(row["ci_green_ts"], green)
+        at = slo.lot_steps(item, jalons, events, now=green + 900,
+                           outside_packet=True, ci_green_ts=green)
+        row = self._row(at, "verdict_merge")
+        self.assertEqual(row["started_ts"], green)
+        self.assertEqual(row["level"], 1)
+        self.assertEqual(row["overdue_s"], 0)
+        self.assertEqual(row["targets"], ("assignee", "bureau", "auditeur"))
+
+    def test_hors_paquet_vert_avant_le_go_part_du_go(self):
+        # Témoin : une CI verte avant le GO ne fait pas remonter le départ
+        # avant le GO — max(GO, vert) = GO, comme aujourd'hui.
+        item, jalons, events = self._qa(priority=1)
+        green = T0 + 600.0
+        rows = slo.lot_steps(item, jalons, events, now=T0 + 1800 + 899,
+                             outside_packet=True, ci_green_ts=green)
+        row = self._row(rows, "verdict_merge")
+        self.assertEqual(row["started_ts"], T0 + 1800)
+        self.assertEqual(row["level"], 0)
+        rows = slo.lot_steps(item, jalons, events, now=T0 + 1800 + 900,
+                             outside_packet=True, ci_green_ts=green)
+        self.assertEqual(self._row(rows, "verdict_merge")["level"], 1)
+
+    def test_hors_paquet_sans_ci_verte_aucune_horloge(self):
+        # Témoin : une CI absente, encore en cours ou rouge ne fait pas partir
+        # l'horloge ; hors paquet sans vert, aucune ligne `verdict_merge` (donc
+        # aucune alerte), même longtemps après le GO.
+        item, jalons, events = self._qa(priority=1)
+        rows = slo.lot_steps(item, jalons, events, now=T0 + 1800 + 10 * 3600,
+                             outside_packet=True)
+        self.assertEqual([r for r in rows if r["step"] == "verdict_merge"], [])
+        self.assertEqual(slo.breaches(rows), [])
+
+    def test_hors_paquet_la_ci_ne_change_pas_le_chemin_paquet(self):
+        # Le chemin paquet (#2335) garde son créneau et sa cible : un vert de
+        # CI plus tardif ne le décale pas, et une mesure absente ne le tait
+        # pas.
+        item, jalons, events = self._qa()
+        rows = slo.lot_steps(item, jalons, events, now=T0 + 1800 + 5400,
+                             packet_slot=T0 + 7200, packet=True, p80_s=2700,
+                             ci_green_ts=T0 + 9000)
+        row = self._row(rows, "verdict_merge")
+        self.assertEqual(row["started_ts"], T0 + 7200)
+        self.assertEqual(row["target_s"], 2700)
+        self.assertEqual(row["level"], 0)
 
     def test_paquet_fusionne_garde_la_duree_et_le_p80(self):
         item, jalons, events = self._qa()

@@ -401,7 +401,7 @@ class SeparateGitDirTest(unittest.TestCase):
             dependents, doubt = clones._dependents(copies, [source])
             self.assertEqual(doubt, "")
             self.assertIn(other, dependents[source])
-            with mock.patch.object(hk, "worktree_in_use", return_value=""), \
+            with mock.patch.object(hk, "worktree_holders", return_value=(False, "")), \
                     mock.patch.object(hk, "_git_copy_work", return_value=""):
                 self.assertIn("alternate dependent", clones._removal_check(
                     source, cfg, (), (), (root,), {}))
@@ -432,6 +432,20 @@ class NamedLotsTest(unittest.TestCase):
         self.assertEqual(clones.named_lots("wt3220", agents), [3220])
         self.assertEqual(clones.named_lots(".work-1392", agents), [1392])
         self.assertEqual(clones.named_lots("wt-432-433", agents), [432, 433])
+
+    def test_a_diag_directory_names_its_lot_and_a_date_names_none(self):
+        """#3277 : `diag462` (tmp d'agent) nomme #462 ; une date n'est jamais
+        un lot, collée à `diag` ou non."""
+        agents = {"codex2", "a1"}
+        self.assertEqual(clones.named_lots("diag462", agents), [462])
+        self.assertEqual(clones.named_lots("diag462-fix", agents), [462])
+        self.assertEqual(clones.named_lots("pre-diag462", agents), [462])
+        self.assertEqual(clones.named_lots("diagnostic462", agents), [])
+        self.assertEqual(clones.named_lots("diag2024-10-24", agents), [])
+        self.assertEqual(clones.named_lots("diag462-20261024", agents), [462])
+        self.assertEqual(clones.named_lots("diag462-2026-10-24", agents), [462])
+        self.assertEqual(clones.named_lots("wt3220-20261024", agents), [3220])
+        self.assertEqual(clones.named_lots("diag462-463", agents), [462, 463])
 
 
 if __name__ == "__main__":

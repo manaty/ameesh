@@ -228,7 +228,7 @@ class RunsOnTest(unittest.TestCase):
     def setUpClass(cls):
         cls.jobs = runs_on_by_job(WORKFLOW.read_text(encoding="utf-8"))
         cls.linux = {j: e for j, e in cls.jobs.items()
-                     if not j.startswith("platform-macos")}
+                     if not j.startswith("platform-macos") and j != "python314"}
         cls.expr = next(iter(cls.linux.values()))
 
     def route(self, ctx):
@@ -252,6 +252,8 @@ class RunsOnTest(unittest.TestCase):
         # de capacité hébergée et était annulé sans qu'une étape ne tourne.
         # Le littéral reste épinglé : toute dérive de l'image est vue.
         self.assertEqual(self.jobs["platform-macos"], "macos-26-intel")
+        # #3380: the optional interpreter smoke runs on GitHub, outside the fleet.
+        self.assertEqual(self.jobs["python314"], "ubuntu-latest")
 
     def test_switch_off_keeps_previous_routing(self):
         for vars_ in ({}, {"AMEESH_CI_PRIO": "off"}, {"AMEESH_CI_PRIO": ""},

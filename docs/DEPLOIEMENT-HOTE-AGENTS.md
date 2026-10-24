@@ -8,6 +8,14 @@ une par une, arrêt prouvé avant chaque démarrage. `agents controler` (ou
 `agents installer [REF]` installe une révision gelée dans le layout du compte
 et `agents retour` réinstalle la précédente (#1252).
 
+`agents controler` prouve aussi que **chaque exécuteur vivant tourne sur le
+venv installé** : le lanceur `ExecStart` est stable (#1969) et résout
+`venv-courant` au démarrage, si bien qu'un processus déjà lancé garde l'ancien
+venv après une bascule. Le contrôle lit l'`argv[0]` concret du MainPID dans
+`/proc/<pid>/cmdline` et le compare au venv vivant ; un écart nomme l'unité et
+rend le contrôle rouge. Sans cela, un hôte dont seul le CLI avait changé de
+venv passait pour sain (staging du 24/10/2026, #3311).
+
 Dans le fichier privé `$BASCULE_ENV` (par défaut
 `~/.config/ameesh/bascule.env`), renseigner la cible SSH **root** et le nom
 exact de l’hôte dans le registre :
@@ -184,6 +192,18 @@ disque est haché et comparé aux objets du commit, sans passer par l’index :
 absent, en trop ou au mauvais mode fait refuser l’instantané, qui n’est jamais
 écrasé — le retirer à la main pour le reconstruire.
 
+Après une installation réussie, et seulement en mode agents, `installer` retire
+l’agent GnuPG inutile de la VM : si `~/.gnupg/private-keys-v1.d` est absent ou
+vide, il masque les sockets utilisateur `gpg-agent.socket`,
+`gpg-agent-ssh.socket`, `gpg-agent-extra.socket`, `gpg-agent-browser.socket` et
+`keyboxd.socket` (`systemctl --user mask --now`) puis tue l’agent (`gpgconf
+--kill gpg-agent`). Une clé privée présente, ou un état illisible, laisse tout
+en place et le journalise : le doute reste. L’étape est idempotente (une
+relance d’`installer` la rejoue) et vient après l’installation du code : #3195,
+dont ce lot dépend, garde les worktrees de lots ouverts avant que ce retrait ne
+débloque le ménage des sorties de build. `poste.sh` n’y touche jamais : sur le
+poste de l’owner, `gpg-agent` tient ses clés.
+
 `previous-sha` n’est publié qu’après une installation réussie, et seulement
 quand le code installé change : relancer `installer` sur le SHA déjà en place le
 laisse intact (sans `previous-sha`, on n’en invente pas un — pas de faux
@@ -328,7 +348,47 @@ page sont à exécuter par le responsable du déploiement après revue et
 validation CI, une VM à la fois ; `controler` affiche le code installé, le
 clone et `previous-sha` avant les unités.
 
+## Minuteries de rôle de l’observation GitHub (#3327)
+
+L’observation GitHub (veille des tickets, relevé CI, projection des issues) est
+portée par la minuterie d’un rôle élu, `mesh-design` par défaut, et non plus par
+le seul service `ameesh-notify` de l’hôte désigné. Après `installer`, poser les
+minuteries sur chaque VM candidate :
+
+```sh
+deploy/mise-a-jour/vm.sh agents timers
+deploy/mise-a-jour/poste.sh timers        # sur le poste, autre candidat
+```
+
+`ameesh role timers --install` n’écrit rien sur un hôte qui n’est pas candidat.
+Sur un candidat, il complète les seuls couples projet→dépôt manquants depuis
+les cartes `github_watch` du canon (`nexlink` → `manaty/nexlink` sur une VM qui
+n’avait que `ameesh`), après sauvegarde `config.json.role-timers.bak` et sans
+écraser un mapping existant ; `--no-sync` le désactive. Le reste de la clé
+`github` (`workflows`, `base`, `exclude_terms`) reste à copier à l’identique
+depuis la configuration de l’observateur historique : le relevé CI de Nexlink a
+besoin de `base: [develop]`. Ce n’est pas un secret ; le jeton `GH_TOKEN` reste
+dans `notify.env`. Le drop-in posé fait exclure à `ameesh-notify` les passes
+portées par les minuteries (`--skip issues,github-watch,ci,alerts`) : la prise
+reste dans le service, GitHub, la CI et la livraison des alertes passent par
+la minuterie du rôle. #3383 : la minuterie `alerts` exige sur chaque candidat
+la clé `notify` de l’owner (route `ntfy`, jeton dans `notify.env` en 0600),
+identique d’un candidat à l’autre : le responsable du rôle et
+`notify.default_human` doivent y avoir un canal `ntfy` ou `slack` utilisable
+(`desktop` et `app` ne comptent pas) ; sinon `timers` et `controler`
+nomment l’humain et la raison en avertissement, sans échouer (#3402, canon
+§3 : un secret absent ne fait pas retomber le staging en arrière).
+
+`controler` (`vm.sh agents controler`, `poste.sh controler`) exécute
+`ameesh role timers --check` et échoue sur une minuterie absente, désactivée,
+hors d’état (contenu différent) ou un drop-in manquant. Voir
+[EXPLOITATION.md, « Pose automatique »](EXPLOITATION.md#pose-automatique--ameesh-role-timers-3327).
+
 ## Release automatique aux coupures (#2448)
+
+Pour les correctifs fusionnés qui retiennent plusieurs lots entre deux
+coupures, voir [le relevé et le geste staging hors créneau](STAGING-ATTENTES.md).
+La coupure conserve le contenu actif si sa candidate verte est plus ancienne.
 
 À 11:00 et 23:00 (Europe/Paris), la tête de `main` est taguée et déployée en
 staging sans agent. Le calendrier n'est pas écrit dans une unité systemd : il
@@ -406,6 +466,15 @@ après l'ajout :
 ameesh release packet-watch --dry-run      # grace, busy, served, nothing-ready, would-alert… ; jamais error
 journalctl --user -u ameesh-release -n 5   # une ligne « packet-watch ameesh: … » par tick
 ```
+
+**Retirer le coupeur d'un hôte** : retirer son bloc `release`, jamais couper
+`ameesh-release.timer`. Le packet-watch tourne dans le tick même sans bloc
+`release` (le tick affiche `release: off` puis exécute le packet-watch seul) ;
+désactiver la minuterie arrête aussi la fusion automatique des paquets — le
+geste du 24/10 14:31Z sur agents-2. `ameesh doctor` signale un hôte
+`packet_watch` dont `ameesh-release.timer` n'est pas actif, ainsi qu'un dépôt
+`radar.projects.<projet>.repo` auquel il manque une tête gelée (checkout non
+fetché, désignation au gel impossible).
 
 **Ce que fait un tick** : il prend `B`, la tête de la cible si la CI du
 commit exact est verte, sinon le plus récent commit vert de la chaîne

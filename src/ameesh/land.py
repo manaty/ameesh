@@ -34,6 +34,7 @@ import shutil
 import subprocess
 import time
 import warnings
+from urllib.parse import quote
 
 from . import merge_queue, plan_git, storage, work
 from .canon import FETCH_TIMEOUT, GitError
@@ -385,6 +386,34 @@ def pr_status(slug: str, branch: str, gh=_gh, *, project=None) -> dict | None:
     return {"number": rows[0]["number"], "head": rows[0].get("headRefOid"),
             "base": rows[0].get("baseRefName"), "ci": ci,
             "auto": bool(rows[0].get("autoMergeRequest"))}
+
+
+def base_oid(slug: str, base: str, gh=_gh) -> str:
+    """The resolved head of `base`, read through the REST API (#3308).
+
+    `gh pr view --json baseRefOid` does not exist on gh 2.45 (the host still
+    runs it): asking for that field makes the whole PR read fail. The branch
+    is resolved with `git/ref/heads/<base>`, which every gh version exposes.
+    The target is never guessed: a missing or unreadable ref raises
+    `LandError`, and an answer that is not a full commit id is refused.
+    """
+    slug = str(slug or "").strip()
+    base = str(base or "").strip()
+    if not slug or not base:
+        raise LandError("no base branch to resolve in %s: nothing guessed"
+                        % (slug or "the repository"))
+    path = "repos/%s/git/ref/heads/%s" % (slug, quote(base, safe=""))
+    proc = gh(["api", path])
+    if proc.returncode != 0:
+        detail = (proc.stderr or proc.stdout or "").strip()[:300] \
+            or "exit %d" % proc.returncode
+        raise LandError("gh api %s: %s" % (path, detail))
+    data = _json(proc, "gh api %s" % path, dict)
+    obj = data.get("object")
+    oid = str((obj or {}).get("sha") or "").strip().lower() if isinstance(obj, dict) else ""
+    if not re.fullmatch(r"[0-9a-f]{40}", oid):
+        raise LandError("gh api %s: no resolved commit (got %r)" % (path, oid))
+    return oid
 
 
 def pr_disable_auto(slug: str, number, gh=_gh) -> str | None:

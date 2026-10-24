@@ -52,6 +52,10 @@ class TextTest(unittest.TestCase):
         self.assertIn("a new package waits for the previous one", text)
         self.assertNotIn("about ten lots", text)
         self.assertNotIn("next cut", text)
+        # #3342 : l'identité d'émission `veille` n'a pas de lecteur ; le texte
+        # dit où déposer le compte rendu, au lieu de renvoyer à `veille`.
+        self.assertIn("Never reply to `veille`", text)
+        self.assertIn("ameesh fil", text)
         self.assertIsNone(fil.unreadable_reason(text))
 
     def test_units(self):

@@ -21,7 +21,10 @@ Les parades, appelées par `ameesh mail send|forward`, `ameesh alerts` /
   (`stopped` : ni en pause, ni au repos) est refusé sauf `--queue`, avec
   depuis quand, la raison, le responsable et l'agent qui a repris son
   travail s'il est connu ; une identité d'expéditeur arrêtée est refusée,
-  avec l'identité liée à la session (`agent-mail whoami`) ;
+  avec l'identité liée à la session (`agent-mail whoami`) ; un courrier
+  adressé à l'identité d'ÉMISSION de la veille (`watch.SENDER`, « veille »)
+  est refusé : elle n'a pas de lecteur, les comptes rendus qu'on lui
+  envoyait s'y perdaient (#3342) ;
 * `alerts` : `mail_undeliverable`, du courrier en attente depuis plus de
   15 min chez un agent arrêté ou inexistant, pour le responsable humain et,
   par courrier (`orchestrator_briefs`), les orchestrateurs de l'équipe ;
@@ -263,6 +266,28 @@ def successor(db, row: dict | None, *, bindings: list | None = None) -> list[str
 # à l'envoi (`agent-mail send`)
 # --------------------------------------------------------------------------
 
+def watch_sender(name: str) -> bool:
+    """L'identité qui ÉMET la consigne de veille (`watch.SENDER`, « veille »)
+    n'a pas de boîte lue : un courrier qui lui est adressé est perdu (#3342).
+
+    Nom comparé à `watch.SENDER`, importé ici : `watch` importe ce module
+    depuis `send()`, un import de module serait circulaire."""
+    from . import watch
+    return name == watch.SENDER
+
+
+def watch_sender_text(name: str) -> str:
+    """Le refus d'un courrier adressé à l'identité d'émission de la veille,
+    avec le geste qui, lui, laisse une trace lisible."""
+    return "\n  ".join([
+        "%s is the sender of the `ameesh watch` instruction: nobody reads its "
+        "mailbox, so a reply sent to it is lost." % name,
+        "write what you did in the readable thread instead: report to your pilot or "
+        "orchestrator (`agent-mail send <pilot> …` lands in `ameesh fil`), and send "
+        "anything that needs a decision there — never to %s" % name,
+    ])
+
+
 def unknown_text(cfg, db, dest: str, rows: list | None = None, *, sender: str | None = None,
                  canons=None) -> str:
     """Le refus d'un destinataire absent du registre, avec les noms proches."""
@@ -397,12 +422,14 @@ def check_send(cfg, db, *, sender: str, dest: str, queue: bool = False,
 
     Lève `Refused` (rien n'est déposé, aucun agent créé) : identité
     d'expéditeur arrêtée ; destinataire absent du registre ; destinataire
-    arrêté sans `queue`. Rend les avertissements à dire (destinataire arrêté
-    avec `queue` ; #858 : destinataire inscrit mais non réveillable à
-    l'instant — le message part quand même, le réveil attend). `explicit` :
-    l'expéditeur vient de `--from` ; `binding` : l'identité déjà résolue de la
-    session, s'il y en a une. « all » ne contrôle que l'expéditeur (la
-    diffusion écarte elle-même les arrêtés)."""
+    arrêté sans `queue` ; courrier adressé à l'identité d'émission de la
+    veille (`veille`, qui ne lit aucune boîte — #3342). Rend les
+    avertissements à dire (destinataire arrêté avec `queue` ; #858 :
+    destinataire inscrit mais non réveillable à l'instant — le message part
+    quand même, le réveil attend). `explicit` : l'expéditeur vient de
+    `--from` ; `binding` : l'identité déjà résolue de la session, s'il y en a
+    une. « all » ne contrôle que l'expéditeur (la diffusion écarte elle-même
+    les arrêtés)."""
     names = [sender] if dest in ("all", sender) else [sender, dest]
     rows = registry_rows(db, names)
     row = rows.get(sender)
@@ -411,6 +438,8 @@ def check_send(cfg, db, *, sender: str, dest: str, queue: bool = False,
                                           now=now))
     if dest == "all":
         return []
+    if watch_sender(dest):
+        raise Refused(watch_sender_text(dest))
     row = rows.get(dest)
     if row is None:
         raise Refused(unknown_text(cfg, db, dest, sender=sender))

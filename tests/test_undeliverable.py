@@ -46,6 +46,14 @@ class FonctionsTest(unittest.TestCase):
         for name in ("orc", "claude1", "chef"):
             self.assertIsNone(undeliverable.role_of(name), name)
 
+    def test_identite_d_emission_de_la_veille(self):
+        # #3342 : `watch.SENDER` n'a pas de lecteur ; tout autre nom reste un agent
+        self.assertTrue(undeliverable.watch_sender("veille"))
+        self.assertFalse(undeliverable.watch_sender("mesh-design"))
+        text = undeliverable.watch_sender_text("veille")
+        self.assertIn("nobody reads its mailbox", text)
+        self.assertIn("ameesh fil", text)
+
     def test_noms_proches(self):
         rows = [{"name": n, "team": t, "status": s} for n, t, s in (
             ("orchestrateur", "manaty", "idle"), ("claude1", "manaty", "idle"),
@@ -207,6 +215,31 @@ class EnvoiRefuseTest(_Base):
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(self.send("human:proprio", "x", AGENT_MAIL_NAME="claude1").returncode,
                          2)
+
+    def test_courrier_a_l_identite_de_veille_refuse(self):
+        """#3342 : `veille` n'ÉMET que la consigne de veille ; les comptes rendus
+        des agents réveillés s'y perdaient (221 non-lus, 13,6 j). Refus avant
+        dépôt, avec le geste utile ; `--queue` ne range pas dans une boîte morte,
+        et une copie ne contourne pas le refus."""
+        self.agent("veille", team="", harness="other", mode="externe")
+        proc = self.send("veille", "Veille 12:30 faite (mesh-design), rien à signaler.",
+                         AGENT_MAIL_NAME="claude1")
+        self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+        self.assertIn("message not delivered — veille is the sender of the "
+                      "`ameesh watch` instruction", proc.stderr)
+        self.assertIn("nobody reads its mailbox", proc.stderr)
+        self.assertIn("ameesh fil", proc.stderr)
+        self.assertEqual(self.pending("veille"), [])
+        proc = self.send("veille", "Compte rendu.", "--queue", AGENT_MAIL_NAME="claude1")
+        self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+        self.assertEqual(self.pending("veille"), [])
+        # une copie non plus : elle partirait dans la même boîte sans lecteur
+        proc = self.send("orchestrateur", "Point d'équipe.",
+                         "--cc", "veille", AGENT_MAIL_NAME="claude1")
+        self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+        self.assertIn("copy refused", proc.stderr)
+        self.assertEqual(self.pending("veille"), [])
+        self.assertEqual(self.pending("orchestrateur"), [])
 
     def test_destinataire_non_reveillable_le_message_part_avec_avertissement(self):
         """#858 : agent inscrit mais non réveillable à l'instant (profil divergé,

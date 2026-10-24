@@ -3,6 +3,10 @@
 tours quand l'hôte courant est sous pression, testé avec deux hôtes simulés."""
 from __future__ import annotations
 
+import dataclasses
+import json
+from unittest import mock
+
 from ameesh import registry, relocation, storage
 
 from . import test_canon
@@ -55,6 +59,8 @@ class _TwoHosts(test_canon._CanonDbCase):
         super().setUp()
         self.db.execute("DELETE FROM host_resources")
         self.db.execute("DELETE FROM visibility_checks")
+        # #3299 : une pause d'hôte posée par un test ne doit pas fuir au suivant
+        self.db.execute("TRUNCATE host_holds, host_hold_events")
         write(self.root, "hotes/atelier.md", ATELIER % self.tmp)
         write(self.root, "hotes/banc.md", BANC % self.tmp)
         write(self.root, "placements/ouvrier-banc.md", ADMISSION)
@@ -238,3 +244,302 @@ class RunnerRelocationTest(_MoveCase):
         self.assertIn("consigne en attente", row["pending_prompt"])
         self.assertIsNone(storage.of(self.db).handoffs.active("ouvrier"))
         self.assertFalse(self.turns(), proc.stdout)
+
+
+class OperatorMoveTest(_MoveCase):
+    """#3299 : déplacement MANUEL d'un agent `releve: hote`, sans bail vivant
+    de l'appelant quand l'exécuteur de départ est arrêté."""
+
+    def _move(self, **kwargs):
+        kwargs.setdefault("actor", "human:alice")
+        return relocation.move_manual(self.cfg, self.db, "ouvrier", "banc", **kwargs)
+
+    def _event(self, event_id):
+        return self.db.query(
+            "SELECT type, object, data FROM ameesh_events WHERE id = %s",
+            (event_id,))[0]
+
+    def test_accepte_executeur_arrete_et_journalise(self):
+        self._prepare()
+        result = self._move()
+        row = registry.get(self.db, "ouvrier")
+        self.assertEqual(row["host"], "banc")
+        self.assertEqual(row["status"], "queued")
+        self.assertIsNone(row["session_id"])
+        verdict = self.db.query(
+            "SELECT placement_ok FROM agent_registry WHERE name = 'ouvrier'")[0]
+        self.assertIsNone(verdict["placement_ok"])      # à réévaluer sur banc
+        self.assertIn("Resuming after a move from host atelier to banc",
+                      row["pending_prompt"])
+        self.assertIn("consigne en attente", row["pending_prompt"])
+        event = self._event(result["event"])
+        self.assertEqual((event["type"], event["object"]),
+                         ("agent.moved", "agent:ouvrier"))
+        self.assertEqual((event["data"]["from"], event["data"]["to"]),
+                         ("atelier", "banc"))
+        self.assertEqual(event["data"]["actor"], "human:alice")
+        self.assertFalse(event["data"]["source_stopped"])
+        self.assertFalse(event["data"]["lease_held"])
+        self.assertEqual(event["data"]["revoked_lease_owner"], "")
+        self.assertEqual(event["data"]["lease_epoch"],
+                         int(event["data"]["revoked_lease_epoch"]) + 1)
+
+    def test_claimable_apres_sync_de_l_arrivee(self):
+        self._prepare()
+        self._move()
+        self.sync("banc")
+        self.assertIn("ouvrier", [r["name"] for r in registry.claimable(self.db, "banc")])
+        self.assertNotIn("ouvrier", [r["name"] for r in registry.claimable(self.db, "atelier")])
+
+    def test_refuse_en_tour(self):
+        _row, owner, epoch = self._pret()
+        self.assertTrue(registry.begin_turn(self.db, "ouvrier", owner, epoch, "tour"))
+        with self.assertRaisesRegex(relocation.MoveError, "turn in progress"):
+            self._move()
+        self.assertEqual(registry.get(self.db, "ouvrier")["host"], "atelier")
+
+    def test_refuse_un_running_perime_avec_reprise(self):
+        # N de la relecture #3299 : un statut `running` sans bail vivant n'est
+        # pas un tour ; le refus dit comment le solder (reap ou reprise).
+        _row, owner, epoch = self._pret()
+        self.db.execute("UPDATE agent_registry SET status = 'running', "
+                        "lease_expires_at = clock_timestamp() - interval '1 minute' "
+                        "WHERE name = 'ouvrier'")
+        with self.assertRaisesRegex(relocation.MoveError, "ameesh resume"):
+            self._move()
+        self.assertEqual(registry.get(self.db, "ouvrier")["host"], "atelier")
+
+    def test_refuse_hote_non_admis(self):
+        self._prepare()
+        self.db.execute("UPDATE agent_registry SET admitted_hosts = ARRAY['atelier'] "
+                        "WHERE name = 'ouvrier'")
+        with self.assertRaisesRegex(relocation.MoveError, "not admitted"):
+            self._move()
+        self.assertEqual(registry.get(self.db, "ouvrier")["host"], "atelier")
+
+    def test_refuse_hote_en_pause(self):
+        self._prepare()
+        storage.of(self.db).hosts.hold("banc", seconds=600, reason="test",
+                                       author="human:alice")
+        with self.assertRaisesRegex(relocation.MoveError, "on hold"):
+            self._move()
+        self.assertEqual(registry.get(self.db, "ouvrier")["host"], "atelier")
+
+    def test_refuse_bail_vivant_executeur_encore_frais(self):
+        _row, owner, epoch = self._pret()
+        registry.runner_seen(self.db, "atelier", "runner-a", ["ouvrier"])
+        with self.assertRaisesRegex(relocation.MoveError, "live lease"):
+            self._move()
+        self.assertEqual(registry.get(self.db, "ouvrier")["host"], "atelier")
+
+    def test_accepte_bail_vivant_executeur_arrete(self):
+        # B1 auditeur + cx1 : le bail de la source est révoqué atomiquement,
+        # même quand un bail vivant a été accepté (exécuteur source arrêté).
+        _row, owner, epoch = self._pret()
+        registry.runner_seen(self.db, "atelier", "runner-a", ["ouvrier"])
+        self.db.execute("UPDATE agent_registry SET runner_seen_at = "
+                        "clock_timestamp() - interval '1 hour' WHERE name = 'ouvrier'")
+        result = self._move()
+        self.assertEqual(result["to"], "banc")
+        row = registry.get(self.db, "ouvrier")
+        self.assertEqual(row["host"], "banc")
+        self.assertIsNone(row["lease_owner"])
+        self.assertIsNone(row["lease_expires_ts"])
+        self.assertEqual(row["lease_epoch"], int(epoch) + 1)
+        self.assertEqual(result["revoked_lease_owner"], owner)
+        self.assertEqual(result["revoked_lease_epoch"], int(epoch))
+        event = self._event(result["event"])["data"]
+        self.assertTrue(event["lease_held"])
+        self.assertEqual(event["revoked_lease_owner"], owner)
+        self.assertEqual(event["revoked_lease_epoch"], int(epoch))
+        # l'ancien exécuteur ne peut plus renouveler ni ouvrir un tour
+        self.assertIsNone(registry.renew(self.db, "ouvrier", owner, epoch, 600))
+        self.assertFalse(registry.begin_turn(self.db, "ouvrier", owner, epoch, "tour"))
+        # l'arrivée peut réclamer après son sync
+        self.sync("banc")
+        self.assertIsNotNone(registry.claim(self.db, "ouvrier", "runner-b", 600))
+
+    def test_session_conservee_revoque_aussi_le_bail(self):
+        _row, owner, epoch = self._pret()
+        registry.runner_seen(self.db, "atelier", "runner-a", ["ouvrier"])
+        self.db.execute("UPDATE agent_registry SET runner_seen_at = "
+                        "clock_timestamp() - interval '1 hour' WHERE name = 'ouvrier'")
+        self._move(keep_session=True)
+        row = registry.get(self.db, "ouvrier")
+        self.assertEqual(row["session_id"], "sess-1")
+        self.assertIsNone(row["lease_owner"])
+        self.assertEqual(row["lease_epoch"], int(epoch) + 1)
+        self.assertIsNone(registry.renew(self.db, "ouvrier", owner, epoch, 600))
+
+    def test_unite_inactive_prouve_l_executeur_arrete(self):
+        _row, owner, epoch = self._pret()
+        # l'unité DE cet agent a relevé le dernier passage (runner-<nom>@…)
+        registry.runner_seen(self.db, "atelier", "runner-ouvrier@atelier", ["ouvrier"])
+        cfg = dataclasses.replace(self.cfg, host="atelier")
+        with mock.patch.object(relocation, "unit_stopped", return_value=True):
+            result = relocation.move_manual(cfg, self.db, "ouvrier", "banc",
+                                            actor="human:alice")
+        self.assertTrue(result["source_stopped"])
+        row = registry.get(self.db, "ouvrier")
+        self.assertEqual(row["host"], "banc")
+        self.assertIsNone(row["lease_owner"])
+        self.assertEqual(row["lease_epoch"], int(epoch) + 1)
+
+    def test_unite_inactive_d_un_autre_runner_ne_prouve_rien(self):
+        # le gabarit `ameesh-runner-agent@<nom>.service` répond loaded/inactive
+        # pour tout nom jamais instancié : si le dernier relevé vient d'une
+        # AUTRE unité (coordinateur partagé), la preuve locale ne vaut pas et
+        # le bail vivant doit refuser (B de la relecture #3299).
+        _row, owner, epoch = self._pret()
+        registry.runner_seen(self.db, "atelier", "runner-ima@atelier", ["ouvrier"])
+        cfg = dataclasses.replace(self.cfg, host="atelier")
+        with mock.patch.object(relocation, "unit_stopped", return_value=True):
+            with self.assertRaisesRegex(relocation.MoveError, "live lease"):
+                relocation.move_manual(cfg, self.db, "ouvrier", "banc",
+                                       actor="human:alice")
+        row = registry.get(self.db, "ouvrier")
+        self.assertEqual(row["host"], "atelier")
+        self.assertEqual(row["lease_owner"], owner)
+        self.assertEqual(row["lease_epoch"], int(epoch))
+
+    def test_unite_inactive_lue_sur_systemd(self):
+        # le repli systemd ne lit QUE sur l'hôte source, et une unité chargée
+        # inactive est une preuve ; le test ne touche pas à la base sous le mock
+        # (subprocess.run est le module partagé par le pilote psql)
+        cfg = dataclasses.replace(self.cfg, host="atelier")
+        proc = mock.Mock(returncode=0, stderr="",
+                         stdout="LoadState=loaded\nActiveState=inactive\n")
+        with mock.patch.object(relocation.subprocess, "run", return_value=proc):
+            self.assertIs(relocation.unit_stopped(cfg, "ouvrier", "atelier"), True)
+            self.assertIsNone(relocation.unit_stopped(
+                dataclasses.replace(cfg, host="banc"), "ouvrier", "atelier"))
+
+    def test_unite_active_ne_prouve_pas_l_arret(self):
+        _row, owner, epoch = self._pret()
+        registry.runner_seen(self.db, "atelier", "runner-a", ["ouvrier"])
+        cfg = dataclasses.replace(self.cfg, host="atelier")
+        with mock.patch.object(relocation, "unit_stopped", return_value=False):
+            with self.assertRaisesRegex(relocation.MoveError, "live lease"):
+                relocation.move_manual(cfg, self.db, "ouvrier", "banc")
+
+    def test_session_conservee(self):
+        self._prepare()
+        before = registry.get(self.db, "ouvrier")
+        self._move(keep_session=True)
+        row = registry.get(self.db, "ouvrier")
+        self.assertEqual(row["session_id"], "sess-1")
+        self.assertEqual(row["pending_prompt"], "consigne en attente")
+        self.assertEqual(row["status"], before["status"])
+
+    def test_refuse_un_role_elu(self):
+        self._prepare()
+        self.db.execute("UPDATE agent_registry SET releve = 'election', "
+                        "candidats = ARRAY['banc'] WHERE name = 'ouvrier'")
+        with self.assertRaisesRegex(relocation.MoveError, "elected role"):
+            self._move()
+        self.assertEqual(registry.get(self.db, "ouvrier")["host"], "atelier")
+
+    def test_un_agent_arrete_reste_arrete(self):
+        self._prepare()
+        self.db.execute(
+            "UPDATE agent_registry SET status = 'stopped', "
+            "status_text = 'arrêté par son propriétaire (motif gardé)' "
+            "WHERE name = 'ouvrier'")
+        self._move()
+        row = registry.get(self.db, "ouvrier")
+        self.assertEqual((row["host"], row["status"]), ("banc", "stopped"))
+        self.assertIn("motif gardé", row["status_text"])
+
+    def test_agent_inscrit_a_la_main_garde_son_responsable(self):
+        registry.upsert(self.db, "manuel", harness="deepseek", host="atelier",
+                        cwd=self.tmp)
+        self.db.execute("UPDATE agent_registry SET responsible = 'human:bruno', "
+                        "admitted_hosts = ARRAY['atelier','banc'] "
+                        "WHERE name = 'manuel'")
+        relocation.move_manual(self.cfg, self.db, "manuel", "banc",
+                               actor="human:alice")
+        row = registry.get(self.db, "manuel")
+        self.assertEqual(row["host"], "banc")
+        self.assertEqual(row["responsible"], "human:bruno")
+
+
+class OperatorMoveFenceTest(_MoveCase):
+    """#3299 : les gardes sont recontrôlées DANS l'écriture, sous le verrou —
+    un appel direct au stockage ne peut pas les contourner."""
+
+    def _relocate(self, **kwargs):
+        params = dict(target="banc", canon_ref="", diagnostic="test", ref=None,
+                      keep_session=False, summary="", runner_stale_s=120)
+        params.update(kwargs)
+        return storage.of(self.db).canon.relocate_operator("ouvrier", "atelier", **params)
+
+    def test_refuse_un_tour_en_cours(self):
+        _row, owner, epoch = self._pret()
+        self.assertTrue(registry.begin_turn(self.db, "ouvrier", owner, epoch, "tour"))
+        self.assertIsNone(self._relocate())
+        self.assertEqual(registry.get(self.db, "ouvrier")["host"], "atelier")
+
+    def test_refuse_une_destination_plus_admise(self):
+        self._prepare()
+        self.db.execute("UPDATE agent_registry SET admitted_hosts = ARRAY['atelier'] "
+                        "WHERE name = 'ouvrier'")
+        self.assertIsNone(self._relocate())
+        self.assertEqual(registry.get(self.db, "ouvrier")["host"], "atelier")
+
+    def test_refuse_un_hote_en_pause(self):
+        self._prepare()
+        storage.of(self.db).hosts.hold("banc", seconds=600, reason="test",
+                                       author="human:alice")
+        self.assertIsNone(self._relocate())
+        self.assertEqual(registry.get(self.db, "ouvrier")["host"], "atelier")
+
+    def test_refuse_un_bail_vivant_executeur_frais(self):
+        _row, owner, epoch = self._pret()
+        registry.runner_seen(self.db, "atelier", "runner-a", ["ouvrier"])
+        self.assertIsNone(self._relocate())
+        self.assertEqual(registry.get(self.db, "ouvrier")["host"], "atelier")
+
+    def test_accepte_executeur_arrete(self):
+        _row, owner, epoch = self._pret()
+        registry.runner_seen(self.db, "atelier", "runner-a", ["ouvrier"])
+        self.db.execute("UPDATE agent_registry SET runner_seen_at = "
+                        "clock_timestamp() - interval '1 hour' WHERE name = 'ouvrier'")
+        moved = self._relocate()
+        self.assertIsNotNone(moved)
+        self.assertEqual(moved["previous_lease_owner"], owner)
+        self.assertEqual(moved["previous_lease_epoch"], int(epoch))
+        row = registry.get(self.db, "ouvrier")
+        self.assertEqual(row["host"], "banc")
+        self.assertIsNone(row["lease_owner"])
+        self.assertEqual(row["lease_epoch"], int(epoch) + 1)
+        self.assertIsNone(registry.renew(self.db, "ouvrier", owner, epoch, 600))
+
+
+class OperatorMoveCliTest(_MoveCase):
+    """#3299 : la commande déclenche le canon sync de l'hôte d'arrivée quand
+    elle y tourne (sinon elle le rappelle)."""
+
+    def test_cli_move_declenche_le_sync_de_l_arrivee(self):
+        self._prepare()
+        env = self.env(AMEESH_CANON=self.root, AMEESH_CANON_UNTRUSTED="1",
+                       AMEESH_HOST="banc")
+        proc = self.mesh("agent", "move", "ouvrier", "--to", "banc",
+                         "--actor", "human:alice", "--json", env=env)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        payload = json.loads(proc.stdout)
+        self.assertEqual((payload["from"], payload["to"]), ("atelier", "banc"))
+        self.assertTrue(payload["canon_sync"]["triggered"])
+        self.assertEqual(payload["canon_sync"]["code"], 0, proc.stdout + proc.stderr)
+        self.assertEqual(registry.get(self.db, "ouvrier")["host"], "banc")
+        self.assertIn("ouvrier", [r["name"] for r in registry.claimable(self.db, "banc")])
+
+    def test_cli_move_rappelle_le_sync_si_l_arrivee_est_ailleurs(self):
+        self._prepare()
+        env = self.env(AMEESH_CANON=self.root, AMEESH_CANON_UNTRUSTED="1",
+                       AMEESH_HOST="atelier")
+        proc = self.mesh("agent", "move", "ouvrier", "--to", "banc",
+                         "--actor", "human:alice", "--json", env=env)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        payload = json.loads(proc.stdout)
+        self.assertFalse(payload["canon_sync"]["triggered"])
+        self.assertIn("canon sync --host banc", payload["canon_sync"]["reminder"])

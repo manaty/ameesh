@@ -104,9 +104,10 @@ who, it says so ("relecteur non désigné" (reviewer not assigned)) instead of g
 The reviewer of a review can be **designated on entry to `qa`** (#705):
 `ameesh work move <id> qa --reviewer <agent>` — a registry name, or a human
 (`human:…`). A lot already in `qa` gets its reviewer with `ameesh work reviewer
-<id> <agent>`, without a build/`qa` round trip; only a human, an orchestrator or
-a design agent designates, never the lot's assignee. The wait then names that
-reviewer before any verdict, and the `stale_lot` alert reaches them; a `qa` lot
+<id> <agent>`, without a build/`qa` round trip; only a human, an orchestrator,
+a design agent or the auditor designates (#3324, auditor card of 24/10, level
+1), never the lot's assignee. The wait then names that reviewer before any
+verdict, and the `stale_lot` alert reaches them; a `qa` lot
 with no designated reviewer alerts the project's orchestrators, who must
 designate one. A reviewer whose **declared harness** is the author's (claude,
 codex and deepseek are distinct families) gets an indicative warning on

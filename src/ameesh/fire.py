@@ -747,11 +747,12 @@ def ready_verdicts(cfg, db, row: dict, marks: list, *, repo: str | None,
     retard y ajouterait des commits déjà fusionnés, dont des chemins
     sensibles, et surclasserait le lot au-dessus de ses vrais avis.
 
-    #3091 : `base_sha` est la cible **déjà résolue** par l'appelant (le
-    `baseRefOid` de la PR pour l'auto-fusion d'un paquet). Elle sert de
-    révision de classe et de preuve de la base de composition ; la ref locale
-    peut être en retard, jamais cette lecture. Sans elle, la ref résolue par
-    `_class_base` fait foi, comme avant.
+    #3091 : `base_sha` est la cible **déjà résolue** par l'appelant (la
+    branche `baseRefName` de la PR, résolue en commit par `land.base_oid`,
+    pour l'auto-fusion d'un paquet ; #3308). Elle sert de révision de classe
+    et de preuve de la base de composition ; la ref locale peut être en
+    retard, jamais cette lecture. Sans elle, la ref résolue par `_class_base`
+    fait foi, comme avant.
 
     Cette porte s'évalue **avant** toute PR, toute entrée en file et toute CI :
     un feu peut être enregistré au gel, mais rien ne part avant les avis."""

@@ -24,6 +24,7 @@
   agent-mesh work migration <id> [--number N] [--release [--number N]] [--skip-branch B]   reserve one of the work item's migration numbers (L122, #2481)
   agent-mesh work issue-ref <id> owner/repo#N | --none   correct the issue reference, journaled (#1603)
   agent-mesh work set-type <id> bug|evolution   retype a lot, journaled (#2954)
+  agent-mesh work set-priority <id> 1|2|3 --reason "…"   change an open lot's priority, journaled (#3370)
   agent-mesh work resolve <id> --with <other> [--done | --abort]   prepared conflict resolution (L160d)
   agent-mesh work queue add|remove <id> | show [--target T]   merge queue per target (L160e)
   agent-mesh work land <id> [--project P]   land the queue head now (L160e2)
@@ -44,6 +45,8 @@
         [--full] [--sha S] [--force] [--dry-run]        on the frozen commit (#1343)
   agent-mesh ci cancel <item> [--all] [--dry-run]       cancel the stale runs of a lot
   agent-mesh agent spawn <name> --by <creator> --ttl 2h   ephemeral agent (R14)
+  agent-mesh agent move NOM --to HOST [--keep-session]   manual move of a `releve: hote`
+                                                          agent, fenced (#3299)
 
 The owner's authority is never inferred from text: it is proven by an Ed25519
 signature whose public key is in agent_registry, bound to the content and to
@@ -285,7 +288,7 @@ def cmd_list(cfg: Config, args: argparse.Namespace) -> int:
         # à 9, la ligne entière se décalait d'un caractère.
         print("%-20s %-12s %-10s %-10s %-11s %-22s %-8s %-5s %-5s %-13s %-4s %s" % (
             "NAME", "PROJECT", "HARNESS", "HOST", "STATUS", "LEASE", "UNREAD", "ITEMS",
-            "BUILD", "BUDGET", "KEY", "SEEN"))
+            "BUILD", "BUDGET", "KEY", "ACTIVITY"))
         session_differs = False
         for row in rows:
             status = row.get("status") or "?"
@@ -310,6 +313,13 @@ def cmd_list(cfg: Config, args: argparse.Namespace) -> int:
             if starred:
                 session_differs = True
             wip = build_by_agent.get(row["name"], 0)
+            # #3337 : la colonne dit le dernier signe de vie, pas seulement
+            # l'inscription au registre — une session `externe` qui écrit ne
+            # touche jamais `last_seen` et paraissait absente.
+            presence_ts, presence_source = registry.presence(row)
+            last = _fmt_age(now - presence_ts)
+            if presence_source == "wrote":
+                last = "wrote " + last
             print("%-20s %-12s %-10s %-10s %-11s %-22s %-8d %-5d %-5s %-13s %-4s %s" % (
                 row["name"][:20], project_label(agent_project_label(row))[:12],
                 ((live or "?")[:9] + ("*" if starred else "")),
@@ -319,7 +329,7 @@ def cmd_list(cfg: Config, args: argparse.Namespace) -> int:
                 "%d!" % wip if cap is not None and wip > cap else str(wip), _budget(row),
                 ("owner" if row.get("has_owner_key")
                  else "agent" if row.get("key_ready") else "—"),
-                _fmt_age(now - float(row.get("last_seen_ts") or 0)),
+                last,
             ))
         if session_differs:
             print("* session harness: the live session runs under another "
@@ -1523,7 +1533,8 @@ def _work_actor(cfg: Config, db, args: argparse.Namespace) -> None:
                   "\"%s\"; pass --actor human:<id>" % work.UNKNOWN_ACTOR,
                   file=sys.stderr)
         return
-    if args.work_command in (*_OWN_ACTOR, "set-app", "set-type", "issue-ref", "backfill-app") or getattr(args, "actor", None) is None:
+    if args.work_command in (*_OWN_ACTOR, "set-app", "set-type", "set-priority",
+                            "issue-ref", "backfill-app") or getattr(args, "actor", None) is None:
         return
     args.actor, warning = work.resolve_actor(cfg, db, args.actor)
     if warning:
@@ -2357,6 +2368,16 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
             else:
                 print("lot #%d: type %s" % (item["id"], item["type"]))
             return 0
+        if args.work_command == "set-priority":
+            item = work.set_priority(db, args.id, args.priority, reason=args.reason,
+                                     actor=args.actor, cfg=cfg)
+            if args.json:
+                print(json.dumps(item, ensure_ascii=False, indent=2))
+            else:
+                print("lot #%d: priority %s (%s)" % (
+                    item["id"], item.get("priority"),
+                    work.PRIORITY_LABELS.get(item.get("priority"), "?")))
+            return 0
         if args.work_command == "issue-ref":
             if bool(args.ref) == bool(args.none):
                 raise work.WorkError("issue-ref: pass owner/repo#N, or --none to clear")
@@ -2373,6 +2394,67 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
             for row in rows:
                 print("lot #%d: %s — %s" % (row["id"], row["status"],
                                            row.get("project") or row.get("reason", "changed concurrently")))
+            return 0
+        if args.work_command == "pending-reviews":
+            # #3033 : les avis qu'un agent doit encore rendre (le calcul de la
+            # charge de désignation, #3004) ; l'agent lié par défaut.
+            from . import review_designation_activation as activation
+            agent = None if args.all else (args.agent or "").strip()
+            if agent == "":
+                # `identity` est local à `cmd_work` (import de la branche `add`) :
+                # le nom du module n'est pas lié ici (relecture dev3, B).
+                from .identity import resolve_binding
+                binding = resolve_binding(cfg, db)
+                if not binding.ok:
+                    print("ameesh work pending-reviews: give AGENT or --all (no bound "
+                          "identity)", file=sys.stderr)
+                    return 2
+                agent = binding.name
+            rows = activation.pending_reviews(db, agent)
+            if args.json:
+                print(json.dumps(rows, ensure_ascii=False, indent=2, default=str))
+                return 0
+            if not rows:
+                print("no pending review%s" % (" for %s" % agent if agent else ""))
+                return 0
+            from .sous_utilisation import _duration
+            now = time.time()
+            for row in rows:
+                since = row.get("designated_ts")
+                print("#%d [%s] %s — %s, head %s, designated %s ago" % (
+                    row["lot"], row["state"] or "?", row["title"], row["name"],
+                    row["sha"][:12],
+                    _duration(now - since) if since is not None else "?"))
+            return 0
+        if args.work_command == "fixes-owed":
+            # #3288 : les corrections dues après un avis bloquant — l'autre
+            # moitié du calcul des avis dus (#3033) ; l'agent lié par défaut.
+            from . import review_designation_activation as activation
+            agent = None if args.all else (args.agent or "").strip()
+            if agent == "":
+                from .identity import resolve_binding
+                binding = resolve_binding(cfg, db)
+                if not binding.ok:
+                    print("ameesh work fixes-owed: give AGENT or --all (no bound "
+                          "identity)", file=sys.stderr)
+                    return 2
+                agent = binding.name
+            rows = activation.due_fixes(db, agent)
+            if args.json:
+                print(json.dumps(rows, ensure_ascii=False, indent=2, default=str))
+                return 0
+            if not rows:
+                print("no fix owed%s" % (" by %s" % agent if agent else ""))
+                return 0
+            from .sous_utilisation import _duration
+            now = time.time()
+            for row in rows:
+                since = row.get("blocked_ts")
+                print("#%d [%s] %s — fix owed by %s, blocked by %s, head %s, "
+                      "blocked %s ago" % (
+                          row["lot"], row["state"] or "?", row["title"], row["name"],
+                          row.get("blocked_by") or "?", row["sha"][:12],
+                          _duration(now - since) if since is not None else "?"))
             return 0
         if args.work_command == "reviewers":
             from . import review_designation_activation as activation
@@ -2647,7 +2729,8 @@ def cmd_migrate(cfg: Config, args: argparse.Namespace) -> int:
 def cmd_doctor(cfg: Config, args: argparse.Namespace) -> int:
     from . import cli
     return cli.cmd_doctor(cfg, notify_test=args.notify_test, probe=args.probe,
-                          harness=getattr(args, "harness", False))
+                          harness=getattr(args, "harness", False),
+                          profiles=getattr(args, "profiles", False))
 
 
 # --------------------------------------------------------------------------
@@ -3479,6 +3562,26 @@ def build_parser() -> argparse.ArgumentParser:
     pw_reviewer.add_argument("--reason", default="",
                              help="#3183: why the floor (journaled with it)")
     pw_reviewer.set_defaults(func=cmd_work)
+    pw_pending = work_sub.add_parser(
+        "pending-reviews",
+        help="#3033: the reviews an agent still owes — open lots whose latest freeze "
+             "designates them without a verdict of theirs on that head")
+    pw_pending.add_argument("agent", nargs="?", metavar="AGENT",
+                            help="default: the session's bound identity")
+    pw_pending.add_argument("--all", action="store_true",
+                            help="every reviewer's pending reviews")
+    pw_pending.add_argument("--json", action="store_true")
+    pw_pending.set_defaults(func=cmd_work)
+    pw_fixes = work_sub.add_parser(
+        "fixes-owed",
+        help="#3288: the fixes still owed after a blocking verdict — open lots whose "
+             "latest freeze carries a blocked verdict no later freeze replaced")
+    pw_fixes.add_argument("agent", nargs="?", metavar="AGENT",
+                          help="default: the session's bound identity")
+    pw_fixes.add_argument("--all", action="store_true",
+                          help="every assignee's owed fixes")
+    pw_fixes.add_argument("--json", action="store_true")
+    pw_fixes.set_defaults(func=cmd_work)
     pw_reviewers = work_sub.add_parser(
         "reviewers",
         help="#2447: read the automatic reviewer designation of the latest freeze, "
@@ -3632,6 +3735,17 @@ def build_parser() -> argparse.ArgumentParser:
     pw_type.add_argument("--actor", default="",
                          help="human, orchestrator or design agent; default: bound session")
     pw_type.set_defaults(func=cmd_work)
+    pw_priority = work_sub.add_parser(
+        "set-priority", help="change an open lot's priority (1/2/3), with a journal entry")
+    pw_priority.add_argument("id", type=int)
+    pw_priority.add_argument("priority", type=int, choices=list(work.PRIORITIES),
+                             help="1 high, 2 normal, 3 low")
+    pw_priority.add_argument("--reason", default="",
+                             help="why the priority changes (required, journaled)")
+    pw_priority.add_argument("--json", action="store_true")
+    pw_priority.add_argument("--actor", default="",
+                             help="human, orchestrator or design agent; default: bound session")
+    pw_priority.set_defaults(func=cmd_work)
     pw_iref = work_sub.add_parser(
         "issue-ref", help="correct a lot's issue reference (owner/repo#N), with a journal entry")
     pw_iref.add_argument("id", type=int)
@@ -3661,7 +3775,9 @@ def build_parser() -> argparse.ArgumentParser:
                             "of at least 12 hex characters resolved there; a symbolic "
                             "ref is refused. verdict: a full commit resolved, the "
                             "current frozen head, or an abbreviation of at least 12 "
-                            "hex characters resolved in a repository)")
+                            "hex characters resolved in a repository; the resolved "
+                            "commit is written complete, since the CI request compares "
+                            "the full head)")
     # le verdict est un positionnel (`work milestone 1 verdict ok`), comme la
     # frise se lit ; `frozen` n'en prend pas
     pw_ms.add_argument("verdict", nargs="?", choices=list(work.VERDICTS), default=None,
@@ -3838,6 +3954,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_doc.add_argument("--harness", action="store_true",
                        help="harness binaries served by the host (path, provenance, "
                             "interpreter) and runner units (L106)")
+    p_doc.add_argument("--profiles", action="store_true",
+                       help="#3345: runner profiles against the host config.json; "
+                            "non-zero on a divergence of train, github or release "
+                            "(database-free, for deployment checks)")
     p_doc.set_defaults(func=cmd_doctor)
 
     from . import canon_cli

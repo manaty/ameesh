@@ -1985,9 +1985,11 @@ class PlanTest(unittest.TestCase):
             self.skipTest("the checked out commit is a version or documentation change")
         pilot = parts.read_list(plan.PILOT_FILE, parts.modules())
         psql = p["parts"]["psql"]
-        # #947 : trois parts (PARTS), les modules pilotes une fois chacun
-        self.assertEqual([ps["part"] for ps in psql], [1, 2, 3])
-        self.assertEqual([ps["of"] for ps in psql], [3, 3, 3])
+        # #947 puis #3343 : pas de carte -> repli suite complète, donc les
+        # parts de main (16), les modules pilotes une fois chacun.
+        self.assertEqual([ps["part"] for ps in psql],
+                         list(range(1, plan.PARTS["psql"][1] + 1)))
+        self.assertEqual([ps["of"] for ps in psql], _full_suite_parts("psql"))
         seen = [m for ps in psql for m in ps["modules"]]
         self.assertEqual(len(seen), len(set(seen)), "un module dans deux parts")
         self.assertTrue(set(pilot) <= set(seen), sorted(set(pilot) - set(seen)))
@@ -2062,6 +2064,22 @@ class PlanTest(unittest.TestCase):
             "::notice file=src/ameesh/x.py,line=3,endLine=9,title=Changed lines without a "
             "test::f changed and no test executes it (map abcdef123456)"])
 
+    def test_stale_map_is_announced_in_annotations_and_summary(self):
+        # #3343 : une carte de plus de 48 h ne reste plus silencieuse — le
+        # plan porte un avertissement et le résumé le dit.
+        p = plan.make_plan("push", None, NOW)
+        p["map"] = {"commit": "a" * 40, "generated": "2026-10-17T16:02:49+00:00",
+                    "age_h": 163.0, "used": False,
+                    "problem": "map older than 48 h (163 h)"}
+        lines = plan.annotations(p)
+        self.assertTrue(lines and lines[0].startswith("::warning"), lines)
+        self.assertIn("163 h", lines[0])
+        self.assertIn("carte périmée", plan.summary(p))
+        fresh = dict(p, map={"commit": "b" * 40, "generated": NOW.isoformat(),
+                             "age_h": 2.0, "used": True, "problem": ""})
+        self.assertEqual(plan.annotations(fresh), [])
+        self.assertNotIn("carte périmée", plan.summary(fresh))
+
     def test_fallback_plan_lets_the_parts_split(self):
         # refs explicites : ne pas lire le GITHUB_* ambiant, où une tête de
         # paquet integration/** est une PR de release (canon §3)
@@ -2072,10 +2090,13 @@ class PlanTest(unittest.TestCase):
         self.assertIsNone(parts.read_plan(f, "psql", 1))
         self.assertTrue(parts._driver_plan(str(f)))
         self.assertEqual(json.loads(plan.outputs(p)["psycopg"]),
-                         list(range(1, plan.PARTS["psycopg"][0] + 1)))
-        # #947 : le plan de repli garde le découpage de la part psql d'une PR
-        self.assertEqual(json.loads(plan.outputs(p)["psql"]), [1, 2, 3])
-        self.assertEqual([ps["of"] for ps in p["parts"]["psql"]], [3, 3, 3])
+                         list(range(1, plan.PARTS["psycopg"][1] + 1)))
+        # #3343 : le repli d'une branche de lot est la suite complète, il prend
+        # donc le découpage de main (16 parts psql), pas les trois d'un lot.
+        self.assertEqual(json.loads(plan.outputs(p)["psql"]),
+                         list(range(1, plan.PARTS["psql"][1] + 1)))
+        self.assertEqual([ps["of"] for ps in p["parts"]["psql"]],
+                         _full_suite_parts("psql"))
 
     def test_each_module_in_exactly_one_part_with_the_map(self):
         mods = parts.modules()
@@ -2154,12 +2175,6 @@ def _full_suite_parts(driver: str) -> list[int]:
     composé du paquet 1700).
     """
     n = plan.PARTS[driver][1]
-    return [n] * n
-
-
-def _lot_request_parts(driver: str) -> list[int]:
-    """`of` de chaque part d'une demande de lot (voie rapide, `n_pr`)."""
-    n = plan.PARTS[driver][0]
     return [n] * n
 
 
@@ -2339,7 +2354,10 @@ class LotBranchTest(unittest.TestCase):
         self.assertFalse(any(ps.get("pilot_list") for ps in p["parts"]["psql"]))
         self.assertIn("release/**", p["selection"]["why"])
         lot = plan.fallback_plan("pull_request", "boom", base_ref="main", head_ref="lot/x")
-        self.assertEqual(json.loads(plan.outputs(lot)["psql"]), [1, 2, 3])
+        self.assertEqual(json.loads(plan.outputs(lot)["psycopg"]),
+                         list(range(1, plan.PARTS["psycopg"][1] + 1)))
+        self.assertEqual(json.loads(plan.outputs(lot)["psql"]),
+                         list(range(1, plan.PARTS["psql"][1] + 1)))
         self.assertTrue(any(ps.get("pilot_list") for ps in lot["parts"]["psql"]))
 
     def test_github_refs_default_to_the_environment(self):
@@ -3445,10 +3463,12 @@ class LotFreezePlanTest(unittest.TestCase):
     def test_repli_d_un_gel_garde_la_forme_du_lot(self):
         p = plan.fallback_plan("pull_request", "boom", mode="lot",
                                base_ref="main", head_ref="lot/x")
+        # #3343 : le repli reste la suite complète, même au gel d'un lot ; il
+        # prend les parts de main (16 psql, 8 psycopg), jamais les 3 d'un lot.
         self.assertEqual([ps["of"] for ps in p["parts"]["psycopg"]],
-                         _lot_request_parts("psycopg"))
+                         _full_suite_parts("psycopg"))
         self.assertEqual([ps["of"] for ps in p["parts"]["psql"]],
-                         _lot_request_parts("psql"))
+                         _full_suite_parts("psql"))
         self.assertTrue(all(ps.get("pilot_list") for ps in p["parts"]["psql"]))
 
     def test_repli_d_un_gel_release_garde_la_suite_complete(self):

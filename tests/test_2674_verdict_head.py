@@ -10,6 +10,10 @@ résolue dans un dépôt (ou dans la tête gelée courante) ; sans elle, le refu
 est nommé et propose la tête gelée. Les anciens avis sans SHA restent
 lisibles, et `work show` les signale une fois « avis non rattaché à une
 tête ».
+
+#3329 : l'abréviation acceptée est **résolue en tête complète** avant l'écriture
+(cas réel : verdict `b2b895887a26` sur #3319, compté 0 avis par la demande de
+CI qui compare au SHA complet du gel).
 """
 from __future__ import annotations
 
@@ -19,7 +23,7 @@ import subprocess
 import tempfile
 import unittest
 
-from ameesh import storage, work
+from ameesh import ci, storage, work
 
 from .support import PgTestCase
 
@@ -99,7 +103,10 @@ class ReviewedHeadTest(PgTestCase):
     def test_une_abreviation_sur_la_tete_gelee_est_acceptee(self):
         proc = self.milestone("ok", "--sha", FROZEN[:12])
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertEqual([m["sha"] for m in self.verdicts()], [FROZEN[:12]])
+        # #3329 : l'abréviation est résolue en tête complète avant l'écriture ;
+        # la demande de CI (comparaison exacte) compte alors l'avis.
+        self.assertEqual([m["sha"] for m in self.verdicts()], [FROZEN])
+        self.assertEqual(len(ci.latest_verdicts(self.db, self.lot, FROZEN, "auteur")), 1)
 
     def test_une_tete_complete_inconnue_est_refusee_sans_depot(self):
         # #2962 : la longueur ne prouve rien. Une tête complète qu'aucun dépôt
@@ -138,7 +145,8 @@ class ReviewedHeadTest(PgTestCase):
 
         proc = self.milestone("ok", "--sha", head[:12], "--repo", repo)
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertEqual([m["sha"] for m in self.verdicts()], [head[:12]])
+        # #3329 : le commit complet du dépôt est écrit, jamais l'abréviation.
+        self.assertEqual([m["sha"] for m in self.verdicts()], [head])
 
         proc = self.milestone("blocked", "--sha", "deadbeefdead", "--repo", repo)
         self.assertEqual(proc.returncode, 1, proc.stdout)

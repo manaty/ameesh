@@ -13,6 +13,8 @@ alike); the insertion emits `pg_notify('ameesh_events', id)`. Types:
   turn.started         an agent goes `running`
   turn.ended           an agent leaves `running`
   agent.updated        another change of status, lease, mode or stop reason
+  agent.moved          a manual move of a `releve: hote` agent to another
+                       admitted host (#3299, written with the move)
   cost.recorded        a priced turn (turn_costs)
   thread.entry         an entry in a thread (thread_index)
   decision.created     an action proposed (actions)
@@ -69,10 +71,10 @@ import time
 from . import storage
 
 CHANNEL = "ameesh_events"
-TYPES = ("lot.updated", "turn.started", "turn.ended", "agent.updated", "cost.recorded",
-         "thread.entry", "decision.created", "decision.closed", "action.updated",
-         "receipt.attached", "approval.recorded", "alert.raised", "alert.resolved",
-         "pilot.gesture")
+TYPES = ("lot.updated", "turn.started", "turn.ended", "agent.updated", "agent.moved",
+         "cost.recorded", "thread.entry", "decision.created", "decision.closed",
+         "action.updated", "receipt.attached", "approval.recorded", "alert.raised",
+         "alert.resolved", "pilot.gesture")
 RETENTION_ENV = "AMEESH_EVENTS_RETENTION_DAYS"
 RETENTION_DAYS = 365
 #: the table refuses to delete an event younger than this (migration 0396)

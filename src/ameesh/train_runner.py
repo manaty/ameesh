@@ -34,6 +34,9 @@ SERVICE_LEASE_TTL_S = 900.0
 SERVICE_LEASE_RETRY_S = 60.0
 #: L165 (EP5): how often a host without the elected role looks again.
 ROLE_RETRY_S = 60.0
+#: #3366: how long the service waits after a canon-pin reload refusal (an
+#: unreadable or invalid configuration): it retries instead of composing.
+RELOAD_RETRY_S = 60.0
 #: #3134: how long the runner's shutdown waits for a train effect still in
 #: flight (push, promotion, SQL write) before releasing the lease. Far below
 #: the runner units' `TimeoutStopSec`; past it the lease expires with its TTL.
@@ -198,9 +201,14 @@ def _fenced(runtime, guard):
 
 
 class Passage:
+    #: #2914: the canon watch; None (also for a passage built without
+    #: ``__init__`` on a bench) keeps the historical behaviour.
+    canon = None
+
     def __init__(self, cfg, project, *, owner, policy, policy_path,
                  policy_commit, workflows, provider, mechanics, notify, impact=None,
-                 reservation=None, transports=None, candidate=None, initial=None):
+                 reservation=None, transports=None, candidate=None, initial=None,
+                 canon=None):
         if not isinstance(owner, str) or not owner.strip():
             raise train.TrainError("explicit runner reservation owner required")
         if not isinstance(policy, train.Policy) or not callable(notify):
@@ -217,6 +225,9 @@ class Passage:
         self.reservation = reservation
         self.transports = transports
         self.candidate, self.initial = candidate, initial
+        #: #2914: the pinned commit against the gate's (``train_canon.Watch``);
+        #: None on a bench that builds the passage by hand.
+        self.canon = canon
         self.maintenance_at = None
         self.epoch = None
         #: #3134: the service lease's `effect`, set by `Service`; None outside it.
@@ -362,7 +373,8 @@ class Passage:
         if not self.policy.enabled:
             return {"result": "off"}
         runtime = self.runtime(db)
-        return self._step(runtime, now)
+        refused = self.canon_refusal(db, runtime)
+        return refused if refused is not None else self._step(runtime, now)
 
     def scheduled_step(self, db, now):
         """Use the very same compiled object for execution and the next wake."""
@@ -373,7 +385,36 @@ class Passage:
         if isinstance(deadline, bool) or not isinstance(deadline, (int, float)) \
                 or not math.isfinite(deadline) or deadline <= now:
             raise train.TrainError("compiled canon must provide a future packet cutoff")
-        return self._step(runtime, now), deadline
+        refused = self.canon_refusal(db, runtime)
+        return (refused if refused is not None else self._step(runtime, now)), deadline
+
+    def canon_refusal(self, db, runtime):
+        """#2914: refuse by name to compose while the pin differs from the gate.
+
+        A pinned commit that is not the gate's (or a gate commit that cannot be
+        read) would count reviews differently from the merge gate. No new
+        packet is composed; a packet already in flight keeps its terminal
+        path (CI, promotion or drain), and a paused train stays paused. The
+        pin never follows the gate by itself (#1467).
+        """
+        if self.canon is None:
+            return None
+        reading = self.canon.read(db)
+        if reading.aligned:
+            return None
+        state = runtime.load()
+        phase = (state or {}).get("phase")
+        in_flight = phase is not None and phase not in train.TERMINAL \
+            and phase != "composing"
+        if in_flight or phase == "paused":
+            self.notify("canon drift, %s train kept: %s" % (phase, reading.describe()),
+                        state)
+            self.canon.alert(db, reading, "active")
+            return None
+        reason = "composition refused: %s" % reading.describe()
+        self.notify(reason, state)
+        self.canon.alert(db, reading, "active")
+        return {"result": "canon-drift", "reason": reason, "canon": reading.to_json()}
 
     def _step(self, runtime, now):
         engine = train.Engine(runtime, source=runtime.repository.source,
@@ -403,10 +444,13 @@ class Service:
     Connections and runtime ports never survive a passage.
     """
     def __init__(self, cfg, passages, *, stop, report, clock=time.time, lease=None,
-                 role=None):
+                 role=None, refresh=None):
         self.cfg, self.passages = cfg, tuple(passages)
         self.stop, self.report, self.clock = stop, report, clock
         self.lease = lease
+        #: #3366: reload the effective canonical pin before each passage;
+        #: None keeps the historical startup pin (bench, direct callers).
+        self.refresh = refresh
         #: L165 (EP5): elected role (agent name) whose lease gates the passages;
         #: None keeps the historical `train.host` pin only.
         self.role = role
@@ -443,10 +487,34 @@ class Service:
             self.condition.notify_all()
         return True
 
+    def _reload_pin(self):
+        """#3366: reload the pin before this passage, or give a retry delay.
+
+        A configuration that cannot be re-read or validated is a named refusal,
+        never a silent fallback to the startup pin: the service reports it and
+        retries shortly. A changed pin is logged once per change."""
+        if self.refresh is None:
+            return None
+        try:
+            changes = self.refresh()
+        except (Exception, SystemExit) as exc:  # noqa: BLE001 - a bad config never stops the runner
+            self.report("train canon pin not reloaded (%s: %s)"
+                        % (type(exc).__name__, exc))
+            return self.clock() + RELOAD_RETRY_S
+        for change in changes or ():
+            self.report("train canon pin reloaded for %s: %s -> %s"
+                        % (change.get("project") or "?",
+                           str(change.get("previous") or "")[:12] or "?",
+                           str(change.get("pin") or "")[:12] or "?"))
+        return None
+
     def pass_once(self, index, now):
         from .scoped_db import ScopedDb
         if self.stop.is_set():
             return None
+        retry = self._reload_pin()
+        if retry is not None:
+            return retry
         db = ScopedDb(self.cfg)
         try:
             result, deadline = self.passages[index].scheduled_step(db, now)

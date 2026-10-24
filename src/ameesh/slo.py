@@ -77,9 +77,22 @@ STEPS: tuple = (
     Step("build_quiet",
          "lot started with no new event (commit, milestone, note)",
          7200, 3600, LOT_EVENTS, True),
+    # #3033 : mesurée depuis le journal du lot. Le canon (§3, §11 bis) place la
+    # relecture AVANT la CI : la tête « verte » d'ameesh est la tête gelée, et
+    # l'horloge de chaque relecteur part de sa désignation sur elle
+    # (`review_designation_activation.pending_reviews`), jusqu'à son verdict.
     Step("green_verdict",
-         "green PR → review verdict delivered",
-         7200, 1800, EXTERNAL, False),
+         "frozen head designated → reviewer's verdict delivered",
+         7200, 1800, LOT_EVENTS, True),
+    # #3288 : la correction d'un avis bloquant. Mesurée depuis le premier avis
+    # `blocked` encore en vigueur sur le dernier gel, jusqu'au nouveau gel
+    # (`review_designation_activation.due_fixes`, le même calcul que les avis
+    # dus de #3033) : un lot en qa avec un avis bloquant n'attend plus un
+    # relecteur, il attend la correction de son assigné. 2 h, 1 h en P1 ;
+    # escalade §9 : ×1 assigné, ×2 pilote qui réassigne, ×3 bureau/auditeur.
+    Step("blocked_freeze",
+         "blocking verdict → new freeze (fix)",
+         7200, 3600, LOT_EVENTS, True),
     Step("verdict_merge",
          "review GO → merge",
          1800, 900, LOT_EVENTS, True),
@@ -363,7 +376,10 @@ def lot_steps(item: dict, jalons: dict, events: Iterable[dict], *,
               now: float | None = None, packet_slot: float | None = None,
               dependencies: Iterable[dict] = (), packet: bool = False,
               p80_s: float | None = None, outside_packet: bool = False,
-              hold_releases: Iterable[float] = ()) -> list:
+              ci_green_ts: float | None = None,
+              hold_releases: Iterable[float] = (),
+              reviews: Iterable[dict] = (),
+              fixes: Iterable[dict] = ()) -> list:
     """Les étapes mesurables d'un lot, une ligne par étape applicable.
 
     `jalons` vient de `progress._work_item_milestones` — le SEUL lecteur des
@@ -377,6 +393,16 @@ def lot_steps(item: dict, jalons: dict, events: Iterable[dict], *,
     de fusionner un lot hors paquet : les 30 premières minutes après le GO ne
     sont pas un retard. La ligne porte `packet_slot` pour que l'alerte dise
     d'où part la mesure ; une fusion déjà faite garde sa durée réelle.
+
+    #3341 : hors paquet (exception `incident|unblock` déclarée), la fusion
+    attend aussi la CI verte sur la tête gelée exacte. `ci_green_ts` est
+    l'instant où cette CI est devenue verte (lu par l'appelant dans `ci_runs`,
+    jamais supposé ici) ; le départ est `max(GO, ci_green_ts)`. Une CI rouge,
+    encore en cours, annulée ou absente (pas de vert) ne fait pas partir
+    l'horloge : aucune ligne `verdict_merge`, donc aucune alerte — la mesure
+    ne pointe une attente que le porteur peut faire avancer. Une fusion déjà
+    faite garde sa durée réelle. Le chemin paquet garde son départ
+    (`packet_slot`/p80) : `ci_green_ts` ne le change pas.
 
     #2562 : le délai intake part au plus tôt du début planifié (minuit
     local). Avant cette date, aucune ligne intake en cours ne court.
@@ -420,6 +446,36 @@ def lot_steps(item: dict, jalons: dict, events: Iterable[dict], *,
     pilote (`hold:`/`unhold:`, #1664), autorisées par l'appelant
     (`planned_waits.pilot_hold_releases`) — un cas réel nexlink. Le temps
     parqué sous un hold de pilote n'est pas un retard du porteur.
+
+    #3033 : `reviews` sont les avis encore dus sur ce lot
+    (`review_designation_activation.pending_reviews` : `name`,
+    `designated_ts`). Chacun donne une ligne `green_verdict` en cours, au nom
+    de son relecteur (`reviewer`) : l'escalade vise le relecteur au premier
+    dépassement, puis le pilote, qui le relance ou en désigne un autre. Un
+    verdict rendu sur la tête gelée retire l'avis de la lecture, donc la
+    ligne ; un nouveau gel le remet, depuis la nouvelle désignation. La grâce
+    de prise en charge (#2217) ne s'y applique pas : elle protège le porteur
+    du lot, pas un relecteur.
+
+    #3288 : `fixes` sont les corrections dues après un avis bloquant
+    (`review_designation_activation.due_fixes` : `name` (le débiteur,
+    l'assigné), `blocked_ts`, `blocked_by`, `sha`). Chacune donne une ligne
+    `blocked_freeze` en cours, depuis le **premier** avis bloquant encore en
+    vigueur sur le dernier gel : l'escalade §9 vise l'assigné, puis le pilote
+    qui réassigne, puis le bureau/l'auditeur. La grâce de prise en charge
+    s'applique ici en revanche : le débiteur est bien le porteur du lot, et
+    une réassignation ne doit pas déclencher une nouvelle demande de
+    réassignation dans la minute. Une correction livrée (nouveau gel) ou
+    annulée par un verdict inverse du même relecteur retire la ligne.
+
+    #3333 : une retenue suspend `blocked_freeze` comme le délai intake
+    (#2916). Tant que le lot est `blocked` ou `waiting_human`, son assigné
+    n'a pas de correction à livrer : il attend la levée, aucune ligne ne
+    court. Une fois la retenue levée (`hold_release_ts`, ou un hold de pilote
+    levé et passé par `hold_releases`), l'horloge repart de la levée si elle
+    suit le blocage. Le temps passé sous retenue n'est donc pas un retard du
+    porteur, et un lot parqué volontairement ne fait plus crier « réassigner
+    maintenant » vers le bureau à la levée.
     """
     events = list(events)
     now = time.time() if now is None else float(now)
@@ -524,20 +580,66 @@ def lot_steps(item: dict, jalons: dict, events: Iterable[dict], *,
                             target=target, escalate=not packet, **extra))
         elif state not in ("merged", "promoted", "closed"):
             start = float(verdict)
-            if packet_slot is not None and float(packet_slot) > start:
-                # #2335/A2 : la fusion ne peut entrer qu'au prochain paquet ;
-                # l'horloge GO → fusion part de ce créneau, pas du GO.
-                start = float(packet_slot)
-                extra["packet_slot"] = round(start, 3)
-            out.append(_row(step, start, now=now, critical=critical,
-                            target=target, escalate=not packet, **extra))
+            if outside_packet:
+                # #3341 : hors paquet, la CI de la tête gelée doit être verte
+                # avant que la fusion puisse avancer. Sans vert (absente,
+                # encore en cours, annulée ou rouge), l'horloge ne part pas et
+                # aucune ligne n'est produite : l'attente n'est pas imputable
+                # au porteur. Avec un vert, le départ est max(GO, vert).
+                if ci_green_ts is None:
+                    pass
+                else:
+                    green = float(ci_green_ts)
+                    start = max(start, green)
+                    extra["ci_green_ts"] = round(green, 3)
+                    out.append(_row(step, start, now=now, critical=critical,
+                                    target=target, escalate=not packet, **extra))
+            else:
+                if packet_slot is not None and float(packet_slot) > start:
+                    # #2335/A2 : la fusion ne peut entrer qu'au prochain paquet ;
+                    # l'horloge GO → fusion part de ce créneau, pas du GO.
+                    start = float(packet_slot)
+                    extra["packet_slot"] = round(start, 3)
+                out.append(_row(step, start, now=now, critical=critical,
+                                target=target, escalate=not packet, **extra))
+
+    if state not in ("merged", "promoted", "closed"):
+        step = step_of("green_verdict")
+        for review in reviews or ():
+            name = str(review.get("name") or "").strip()
+            since = review.get("designated_ts")
+            if not name or since is None:
+                continue
+            out.append(_row(step, since, now=now, critical=critical, reviewer=name))
+
+    if state not in ("merged", "promoted", "closed") and state not in HOLDS:
+        step = step_of("blocked_freeze")
+        # #3333 : la dernière levée de retenue (état ou hold de pilote).
+        lifted = hold_release_ts(events)
+        for stamp in hold_releases or ():
+            if lifted is None or float(stamp) > lifted:
+                lifted = float(stamp)
+        for fix in fixes or ():
+            since = fix.get("blocked_ts")
+            if since is None:
+                continue
+            extra = {}
+            if lifted is not None and lifted > float(since):
+                # #3333 : le temps parqué n'est pas un retard de la correction.
+                extra["hold_released_ts"] = round(lifted, 3)
+                since = lifted
+            # #3288 : le débiteur est l'assigné ; `blocked_by` et `sha` servent
+            # le texte de l'alerte, pas la cible de l'escalade.
+            out.append(_row(step, since, now=now, critical=critical,
+                            blocked_by=str(fix.get("blocked_by") or ""),
+                            sha=str(fix.get("sha") or ""), **extra))
 
     handover = handover_ts(item, events)
     if handover is not None and state not in ("merged", "promoted", "closed"):
         remaining = HANDOVER_GRACE_S - (now - handover)
         if 0 < remaining <= HANDOVER_GRACE_S:
             for row in out:
-                if int(row.get("level") or 0) < 1:
+                if int(row.get("level") or 0) < 1 or row.get("reviewer"):
                     continue
                 # #2217 : le retard a couru avant la prise en charge ; le
                 # nouveau porteur n'a pas à recevoir une demande de

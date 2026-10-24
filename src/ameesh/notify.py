@@ -2,7 +2,8 @@
 """Alerts pushed to the responsible human (lot L38, decision 0030 point 4).
 
   ameesh notify [--once] [--dry-run] [--json] [--interval S]
-                [--only alerts|take|issues|github-watch|ci] [--long-turn S]
+                [--only alerts|take|issues|github-watch|ci]
+                [--skip issues|github-watch|ci|alerts] [--long-turn S]
                 [--idle-mail S] [--dead-grace S]
                 [--session-tokens N] [--stale-lot S] [--orphan-lot S]
                 [--take-idle S] [--take-max-per-hour N]
@@ -113,6 +114,13 @@ STATE_SCHEMA = "ameesh-notify-state/1"
 #: `alerts` owns the delivery state and its lock; `take` observes the alerts
 #: but writes no state; `issues`, `github-watch` and `ci` are independent.
 ONLY_PASSES = ("alerts", "take", "issues", "github-watch", "ci")
+#: #3327: the passes a role timer carries. A full notifier may skip exactly
+#: these (and only these) from its loop; every other pass (take, budget
+#: handoff, WIP sweep) stays in the service. #3383: `alerts` joined them — the
+#: owner channel follows the elected lease instead of the one host that held
+#: the routes; a service that skips it takes no state lock, so the role timer
+#: of the same host can.
+SKIPPABLE_PASSES = ("issues", "github-watch", "ci", "alerts")
 
 #: L38 (0030) : types envoyés par défaut. `delegation_expired` arrive avec L40 :
 #: il est accepté ici sans dépendre de son code (un type absent n'est jamais
@@ -144,6 +152,9 @@ DEFAULT_TYPES = ("stopped_with_mail", "orphan_lot", "dead_runner", "idle_with_ma
                  # #845 : la garde de la CI — runner busy sans job (panne) et
                  # file au-delà du SLO de 15 min (capacité)
                  "ci_runner_stuck", "ci_queue_saturated",
+                 # #3344 : la carte de mesure a plus de 48 h (suite complète
+                 # pour chaque lot) — plus seulement une annotation CI
+                 "map_stale",
                  # #2951: every notifier reports a silent GitHub observer
                  "github_observation_stale",
                  # #246 : btrfs presque plein côté allocation (df ne le voit pas)
@@ -233,6 +244,8 @@ TYPE_LABELS = {
     "orphan_resource": "orphan resource",
     "tmpfs_full": "tmpfs almost full",
     "worktree_kept": "worktree kept at end of lot",
+    # #3396 : le doute sur les processus retient les retraits, l'hôte se remplit
+    "housekeeping_blocked": "housekeeping blocked by unreadable processes",
     # #2618 : le libellé dit l'apparition, pas l'imputation : le ménage ne
     # supprime jamais une entrée qu'il n'a pas attribuée (#222, #234).
     "tmp_orphan": "/tmp entry that appeared during a turn",
@@ -240,6 +253,7 @@ TYPE_LABELS = {
     "tmp_unremovable": "temporary directory over quota with files it cannot remove",
     "tmp_unscanned": "temporary directory too large to scan; nothing evicted",
     "dsh_scope": "dsh tool scope left by a closed turn",
+    "tmp_over_quota": "temporary directory over quota, not managed by this mesh",
     "plan_underused": "underused plan",
     "idle_capacity": "idle capacity",
     "orchestrator_held": "orchestrator held by a session",
@@ -268,6 +282,7 @@ TYPE_LABELS = {
     "ci_main_red": "CI red on main",
     "ci_runner_stuck": "CI runner busy with no job running",
     "ci_queue_saturated": "CI queue beyond its SLO",
+    "map_stale": "measured test map older than 48 h",
     "github_observation_stale": "GitHub observation missing or stale",
     "deep_analysis_overdue": "deep analysis without a report in time",
     "host_disk_low": "btrfs disk almost full",
@@ -562,6 +577,25 @@ def _only_set(values) -> frozenset | None:
     return frozenset(selected) if selected else None
 
 
+def _skip_set(values) -> frozenset | None:
+    """Validate ``--skip``; only the role-timer passes may be excluded."""
+    if values is None:
+        return None
+    if isinstance(values, str):
+        values = [values]
+    selected = set()
+    for value in values:
+        for part in str(value).split(","):
+            part = part.strip()
+            if not part:
+                continue
+            if part not in SKIPPABLE_PASSES:
+                raise ValueError("cannot skip pass %r (skippable: %s)"
+                                 % (part, ", ".join(SKIPPABLE_PASSES)))
+            selected.add(part)
+    return frozenset(selected) if selected else None
+
+
 def _clean(text, limit: int = 300) -> str:
     """Une ligne de texte : sans caractère de contrôle, bornée."""
     text = _CONTROL_RE.sub(" ", str(text or "")).replace("\n", " ").strip()
@@ -800,6 +834,36 @@ def channel_secrets(channel: Channel, env: dict | None = None) -> tuple:
         if value:
             out.append(value)
     return tuple(out)
+
+
+#: #3383: the channel kinds that reach a human from ANY host. The alerts role
+#: timer pushes from whichever candidate holds the lease: `desktop` needs that
+#: host's graphical session, `app` only records the alert in the event log.
+REMOTE_PUSH_KINDS = ("ntfy", "slack")
+
+
+def remote_push_problem(channel: Channel, env: dict | None = None) -> str:
+    """'' when ``channel`` can push from this environment, else why.
+
+    The secret is resolved exactly as `Sender` does (file or environment
+    variable, then L46's value check); the reason names the variable or the
+    file, never the value.
+    """
+    if channel.kind not in REMOTE_PUSH_KINDS:
+        return "%s: %s is not a remote push" % (channel.name, channel.kind)
+    env = dict(os.environ if env is None else env)
+    try:
+        if channel.kind == "slack":
+            value = _secret(channel, env, "webhook_env", "webhook_file",
+                            DEFAULT_SLACK_ENV, True)
+            check_secret_value(value, "channel %s: %s" % (channel.name, SECRET_URL_INVALID))
+        else:
+            value = _secret(channel, env, "token_env", "token_file", None, False)
+            if value:
+                check_secret_value(value, "channel %s: ntfy token" % channel.name)
+    except ChannelError as exc:
+        return str(exc)
+    return ""
 
 
 def _post(url: str, data: bytes, headers: dict, timeout: float, *, show_url: bool,
@@ -1227,11 +1291,14 @@ class Notifier:
     def __init__(self, cfg: Config, ncfg: NotifyConfig, state: dict | None = None, *,
                  sender=None, dry_run: bool = False, emit=None, log=None, clock=None,
                  take: dict | None = None, handoff: dict | None = None,
-                 wip: dict | None = None, only=None):
+                 wip: dict | None = None, only=None, skip=None):
         self.cfg, self.ncfg = cfg, ncfg
         #: L165 (EP5) : passages demandés par une minuterie de rôle ; None =
         #: le passage complet historique.
         self.only = _only_set(only)
+        #: #3327 : passes mécaniques retirées du passage complet (le service
+        #: complet garde alertes, take, budget handoff et wip sweep).
+        self.skip = _skip_set(skip)
         #: L119 : réglages de la prise automatique (`backlog.auto_take`) ; None la coupe
         self.take = take
         #: L233b : réglages de la reprise sur pause budget
@@ -1258,6 +1325,8 @@ class Notifier:
         from . import alert_ack
         from .mediated_executor import availability
         selected = self.only if only is None else _only_set(only)
+        if selected is None and self.skip:
+            selected = frozenset(ONLY_PASSES) - self.skip
         now = float(self.clock())
         # #3057 : la passe restreinte d'une minuterie de rôle ne livre aucune
         # alerte humaine (`_run_tail`). Elle rend donc AVANT le battement de
@@ -1669,9 +1738,14 @@ class Notifier:
             self.log("GitHub issues: pass failed (%s)" % _clean(exc, 200))
 
     def _github_inputs(self, db, now: float) -> None:
-        """#2845: feed external issues/comments to the canonical watcher."""
-        if not getattr(self.cfg, "github", None):
-            return
+        """#2845: feed external issues/comments to the canonical watcher.
+
+        The watched repositories and cadences come from the canon's
+        ``github_watch`` cards, not from the host's ``github`` key: a role
+        timer on a candidate host must collect them even when that key is
+        absent (#3327). The watcher's own host gate (``role_run``) decides
+        whether this host may run.
+        """
         from . import github_watch
         try:
             if self._github_watcher is None:
@@ -2737,6 +2811,11 @@ def build_parser() -> argparse.ArgumentParser:
                         help="L165: run only these passes (%s; repeatable, "
                              "comma-separated); requires --once"
                              % ", ".join(ONLY_PASSES))
+    parser.add_argument("--skip", action="append", metavar="PASS[,PASS]",
+                        default=None,
+                        help="L165/#3327: exclude these mechanical passes from "
+                             "a full pass (skippable: %s; repeatable, "
+                             "comma-separated)" % ", ".join(SKIPPABLE_PASSES))
     exploitation.add_threshold_arguments(parser)
     # L119 (0037) : prise automatique dans la file d'amélioration
     from . import backlog, handoff
@@ -2860,8 +2939,8 @@ def cmd_test(cfg: Config, ncfg: NotifyConfig, args) -> int:
     if not ncfg.channels_for(human):
         print("ameesh notify --test: no channel for %s (notify.routes, notify.default) — "
               "this host cannot push anything to that human (no decision, no alert); "
-              "restore the notifier on the host that holds the routes, or configure a "
-              "fallback route on a healthy host (docs/EXPLOITATION.md, "
+              "declare the route on every candidate of the role that carries the "
+              "alerts, then `ameesh role timers --install` (docs/EXPLOITATION.md, "
               "\"Alertes poussées\")" % human, file=sys.stderr)
         return 2
     results = send_test(ncfg, human, cfg.host)
@@ -2879,16 +2958,23 @@ def cmd_test(cfg: Config, ncfg: NotifyConfig, args) -> int:
 def cmd_notify(cfg: Config, ncfg: NotifyConfig, args) -> int:
     try:
         only = _only_set(getattr(args, "only", None))
+        skip = _skip_set(getattr(args, "skip", None))
     except ValueError as exc:
         print("ameesh notify: %s" % exc, file=sys.stderr)
         return 2
     if only is not None and not args.once:
         print("ameesh notify: --only requires --once", file=sys.stderr)
         return 2
+    if only is not None and skip:
+        print("ameesh notify: --only and --skip are exclusive", file=sys.stderr)
+        return 2
+    # #3327: a full service may skip the passes now carried by a role timer;
+    # every other pass (take, budget handoff, WIP sweep) stays. #3383: with
+    # `alerts` skipped, the local console pass and the state lock go too.
     #: L165: the alert delivery owns the local state file and its lock. The
     #: mechanical passes (`issues`, `github-watch`, `ci`) use database state
     #: only, so a role timer can run them beside the alert producer.
-    alerts_pass = only is None or "alerts" in only
+    alerts_pass = ("alerts" in only) if only is not None else not (skip and "alerts" in skip)
     if alerts_pass and not ncfg.configured:
         _stderr_log("no channel configured (`notify` key of the host configuration: "
                     "routes, default): alerts will be logged, not sent")
@@ -2911,7 +2997,7 @@ def cmd_notify(cfg: Config, ncfg: NotifyConfig, args) -> int:
 
     notifier = Notifier(cfg, ncfg, state, dry_run=args.dry_run, emit=emit,
                         take=take_settings(args), handoff=handoff_settings(args),
-                        wip=wip_settings(args), only=only)
+                        wip=wip_settings(args), only=only, skip=skip)
     seuils = exploitation.thresholds(args)
     interval = _interval(args, ncfg)
     db = None

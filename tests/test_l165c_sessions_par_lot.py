@@ -317,11 +317,14 @@ class StockageTest(_Base):
         self.assertEqual(self.st.due_wakes("aw", now + 61), [])
         self.assertIsNotNone(work.get(self.db, lot)["wake_ts"],
                              "l'échéance n'est pas consommée par la délivrance")
+        self.assertFalse(any(e["note"].startswith("wake:")
+                             for e in work.events(self.db, lot)),
+                         "#2614 : le claim seul n'écrit rien au journal")
+        self.assertTrue(self.st.consume_wake("aw", lot, taken["wake_ts"]))
+        self.assertIsNone(work.get(self.db, lot)["wake_ts"])
         event = work.events(self.db, lot)[0]
         self.assertEqual(event["actor"], "ameesh")
         self.assertTrue(event["note"].startswith("wake: scheduled wake delivered"))
-        self.assertTrue(self.st.consume_wake("aw", lot, taken["wake_ts"]))
-        self.assertIsNone(work.get(self.db, lot)["wake_ts"])
         self.assertFalse(self.st.consume_wake("aw", lot, taken["wake_ts"]),
                          "une seule consommation")
         self.assertNotIn(lot, [r["id"] for r in self.st.actionable("aw")],
@@ -361,6 +364,40 @@ class StockageTest(_Base):
         self.assertEqual([r["id"] for r in self.st.due_wakes("aw5", now,
                                                             claim_ttl_s=60)],
                          [lot], "claim expiré : délivré de nouveau")
+
+    def test_claim_renouvele_par_le_detenteur_sans_temoin(self):
+        """#2614 : le détenteur renouvelle son bail (`claim_ttl_s=0`) pendant
+        un lancement plus long que le bail — pas de seconde délivrance — et
+        ni le claim, ni son renouvellement, ni un claim expiré n'écrivent de
+        ligne `wake:` ; seule la consommation en écrit une."""
+        self.bail("aw7")
+        lot = work.add(self.db, title="séance owner", assignee="aw7",
+                       force=_FORCE)["id"]
+        now = time.time()
+        work.schedule_wake(self.db, lot, now - 1, text="", actor="pilot")
+        taken = self.st.claim_wake("aw7", lot, now, claim_ttl_s=60)
+        self.assertIsNotNone(taken)
+        self.db.execute("UPDATE work_items SET wake_claim_at ="
+                        " now() - interval '50 seconds' WHERE id = %s", (lot,))
+        renewed = self.st.claim_wake("aw7", lot, now, claim_ttl_s=0)
+        self.assertEqual(renewed["wake_ts"], taken["wake_ts"])
+        self.db.execute("UPDATE work_items SET wake_claim_at = wake_claim_at"
+                        " - interval '50 seconds' WHERE id = %s", (lot,))
+        self.assertEqual(self.st.due_wakes("aw7", now, claim_ttl_s=60), [],
+                         "100 s après le claim, le bail renouvelé tient encore")
+        self.assertIsNone(self.st.claim_wake("aw7", lot, now, claim_ttl_s=60))
+        self.db.execute("UPDATE work_items SET wake_claim_at ="
+                        " now() - interval '2 minutes' WHERE id = %s", (lot,))
+        self.assertIsNotNone(self.st.claim_wake("aw7", lot, now, claim_ttl_s=60),
+                             "non renouvelé, le bail expire : redélivrance")
+        def temoins():
+            return [e for e in work.events(self.db, lot)
+                    if e["note"].startswith("wake: scheduled wake delivered")]
+        self.assertEqual(temoins(), [], "aucun témoin sans consommation")
+        self.assertTrue(self.st.consume_wake("aw7", lot, taken["wake_ts"]))
+        self.assertEqual(len(temoins()), 1)
+        self.assertIsNone(self.st.claim_wake("aw7", lot, now, claim_ttl_s=0),
+                          "consommé : plus rien à renouveler")
 
     def test_consume_ne_detruit_pas_une_echeance_reposee(self):
         """#2466 : une échéance reposée entre le claim et le lancement n'est
@@ -1099,6 +1136,7 @@ class ReveilTest(_Base):
         worker.last_activity = time.monotonic() - 10_000   # au repos
         worker.nudged = True        # la relance d'inactivité unique (L11) est passée
         self.addCleanup(worker.watchdog_stop.set)
+        self.addCleanup(worker._forget_wake_claim)
         return worker
 
     def pick(self, worker):
@@ -1188,8 +1226,6 @@ class ReveilTest(_Base):
         self.assertIn("Scheduled wake", spec["prompt"])
         self.assertIsNotNone(work.get(self.db, lot)["wake_ts"],
                              "la délivrance ne consomme pas l'échéance")
-        self.assertTrue(work.events(self.db, lot)[0]["note"].startswith(
-            "wake: scheduled wake delivered"))
         worker._turn_launched = True
         worker._consume_scheduled_wake(spec)
         self.assertIsNone(work.get(self.db, lot)["wake_ts"])
@@ -1236,9 +1272,163 @@ class ReveilTest(_Base):
         again = worker._scheduled_wake_spec()
         self.assertIsNotNone(again, "claim expiré : le réveil revient")
         self.assertEqual(again["lot"], str(lot))
+        self.assertFalse(any(e["note"].startswith("wake:")
+                             for e in work.events(self.db, lot)),
+                         "#2614 : pas de témoin pour un claim non consommé")
+
+    def _reveil_reclame(self, name):
+        """Un réveil programmé échu, réclamé par `pick` : (worker, lot, spec)."""
+        worker = self._worker(name)
+        lot = work.add(self.db, title="séance owner", assignee=name,
+                       force=_FORCE)["id"]
+        work.note(self.db, lot, "hold: séance owner", actor=name,
+                  wake_ts=time.time() - 1)
+        spec = self.pick(worker)
+        self.assertEqual(spec["lot"], str(lot))
+        self.assertEqual(worker._wake_claim["lot"], lot)
+        return worker, lot, spec
+
+    def vieillit_claim(self, lot):
+        """Le claim a plus que le bail (120 s) : sans renouvellement, il a expiré."""
+        self.db.execute("UPDATE work_items SET wake_claim_at = now() - interval"
+                        " '150 seconds' WHERE id = %s", (lot,))
+
+    def claim_age(self, lot):
+        return self.db.query("SELECT extract(epoch from now() - wake_claim_at)::float8"
+                             " AS age FROM work_items WHERE id = %s", (lot,))[0]["age"]
+
+    def redelivre(self, worker):
+        worker._scheduled_wake_checked = float("-inf")
+        return worker._scheduled_wake_spec()
+
+    def test_reveil_programme_bail_renouvele_pendant_une_bascule_longue(self):
+        """#2614 : une bascule de session de lot plus longue que le bail (120 s)
+        ne laisse plus le claim expirer — il est renouvelé tant qu'il est tenu,
+        avant même le battement du tour ; aucun second choix ne délivre le
+        réveil. Consommé, le claim n'est plus tenu ; un seul témoin `wake:`."""
+        worker = self._worker("r7d")
+        worker.WAKE_CLAIM_RENEW_S = 0.05
+        lot = work.add(self.db, title="séance owner", assignee="r7d",
+                       force=_FORCE)["id"]
+        work.note(self.db, lot, "hold: séance owner", actor="r7d",
+                  wake_ts=time.time() - 1)
+        worker._scheduled_wake_checked = float("-inf")
+        worker._lot_wake_checked = float("-inf")
+
+        def bascule_longue(spec):
+            self.vieillit_claim(lot)
+            echeance = time.monotonic() + 10
+            while self.claim_age(lot) > 60 and time.monotonic() < echeance:
+                time.sleep(0.02)
+            return spec
+
+        with mock.patch.object(worker, "rotate_for_lot", side_effect=bascule_longue):
+            spec = worker._pick_for_turn()
+        self.assertEqual(spec["lot"], str(lot))
+        self.assertLess(self.claim_age(lot), 60, "bail renouvelé pendant la bascule")
+        self.assertIsNone(self.redelivre(worker), "bail renouvelé : pas de second réveil")
+        claim = worker._wake_claim
+        worker._turn_launched = True
+        worker._consume_scheduled_wake(spec)
+        self.assertIsNone(worker._wake_claim)
+        self.assertTrue(claim["done"].is_set(), "plus de renouvellement")
         delivered = [e for e in work.events(self.db, lot)
                      if e["note"].startswith("wake: scheduled wake delivered")]
-        self.assertEqual(len(delivered), 2, "chaque délivrance a son témoin")
+        self.assertEqual(len(delivered), 1, "un témoin, celui de la consommation")
+
+    def test_reveil_programme_renouvellement_cesse_si_l_echeance_change(self):
+        """#2614 : échéance annulée ou reposée pendant le claim — plus rien à
+        tenir, le renouvellement le dit."""
+        worker, lot, _spec = self._reveil_reclame("r7f")
+        self.assertTrue(worker._renew_wake_claim(worker._wake_claim))
+        work.note(self.db, lot, "hold: déplacé", actor="r7f",
+                  wake_ts=time.time() - 30)
+        self.assertFalse(worker._renew_wake_claim(worker._wake_claim))
+
+    def assert_claim_oublie(self, worker, lot, claim):
+        """Le claim oublié n'est plus renouvelé : il expire et le réveil revient
+        (#2466 B1) — jamais tenu sans fin par un tour ultérieur."""
+        self.assertIsNone(worker._wake_claim)
+        self.assertTrue(claim["done"].is_set(), "le fil de renouvellement s'arrête")
+        self.vieillit_claim(lot)
+        again = self.redelivre(worker)
+        self.assertIsNotNone(again, "claim expiré : le réveil revient")
+        self.assertEqual(again["lot"], str(lot))
+        self.assertFalse(any(e["note"].startswith("wake:")
+                             for e in work.events(self.db, lot)),
+                         "pas de témoin pour un claim non consommé")
+
+    def test_reveil_programme_tour_refuse_oublie_son_claim(self):
+        """#2614 : le tour qui porte le réveil oublie son claim en sortant sans
+        lancement (drainage)."""
+        worker, lot, spec = self._reveil_reclame("r7e")
+        claim = worker._wake_claim
+        worker.runner.draining.set()
+        self.assertFalse(worker.run_turn(spec))
+        self.assertIsNotNone(work.get(self.db, lot)["wake_ts"])
+        self.assert_claim_oublie(worker, lot, claim)
+
+    def test_reveil_programme_bascule_abandonnee_oublie_son_claim(self):
+        """#2614 : le réveil réclamé par `pick` ne part pas dans ce tour (bascule
+        de session abandonnée, ou base tombée pendant la bascule) : oublié."""
+        worker = self._worker("r7g")
+        lot = work.add(self.db, title="séance owner", assignee="r7g",
+                       force=_FORCE)["id"]
+        work.note(self.db, lot, "hold: séance owner", actor="r7g",
+                  wake_ts=time.time() - 1)
+        worker._scheduled_wake_checked = float("-inf")
+        worker._lot_wake_checked = float("-inf")
+        tenus = []
+
+        def abandon(spec):
+            tenus.append(worker._wake_claim)
+            return None
+
+        with mock.patch.object(worker, "rotate_for_lot", side_effect=abandon):
+            self.assertIsNone(worker._pick_for_turn())
+        self.assert_claim_oublie(worker, lot, tenus[0])
+
+        def panne(spec):
+            tenus.append(worker._wake_claim)
+            raise db_mod.Unavailable("base injoignable (témoin)")
+
+        self.vieillit_claim(lot)
+        worker._scheduled_wake_checked = float("-inf")
+        with mock.patch.object(worker, "rotate_for_lot", side_effect=panne):
+            with self.assertRaises(db_mod.Unavailable):
+                worker._pick_for_turn()
+        self.assertEqual(tenus[1]["lot"], lot)
+        self.assert_claim_oublie(worker, lot, tenus[1])
+
+    def test_reveil_programme_panne_au_controle_du_placement_oublie_son_claim(self):
+        """#2614 (complément bloquant de la relecture, 20/10 19:41-19:44) :
+        après le claim, `_moved_before_turn` lit le registre
+        (`placed_elsewhere`) ; une `db_mod.Unavailable` y est rattrapée par
+        `run()` (« choosing the turn »), qui continue. Le claim ne doit pas
+        rester posé : un tour ultérieur, sans réveil, ne le renouvelle pas."""
+        worker, lot, spec = self._reveil_reclame("r7h")
+        claim = worker._wake_claim
+        with mock.patch.object(registry, "get",
+                               side_effect=db_mod.Unavailable("base injoignable (témoin)")):
+            with self.assertRaises(db_mod.Unavailable):
+                worker._moved_before_turn(spec)
+        self.assert_claim_oublie(worker, lot, claim)
+
+    def test_reveil_programme_place_ailleurs_oublie_son_claim(self):
+        """#2614 : agent placé sur un autre hôte avant le tour — le worker rend
+        son bail, le réveil réclamé ici est oublié et revient."""
+        worker, lot, spec = self._reveil_reclame("r7i")
+        claim = worker._wake_claim
+        with mock.patch.object(worker, "placed_elsewhere", return_value="autre-hote"):
+            self.assertTrue(worker._moved_before_turn(spec))
+        self.assert_claim_oublie(worker, lot, claim)
+
+    def test_reveil_programme_place_ici_garde_son_claim(self):
+        worker, lot, spec = self._reveil_reclame("r7j")
+        claim = worker._wake_claim
+        self.assertFalse(worker._moved_before_turn(spec))
+        self.assertIs(worker._wake_claim, claim)
+        self.assertFalse(claim["done"].is_set())
 
     def test_reveil_programme_non_consomme_si_le_tour_n_est_pas_lance(self):
         """#2466 B1 (cx2, 2e tour) : tant que le harnais n'a pas démarré

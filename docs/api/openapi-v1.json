@@ -438,6 +438,7 @@
               "turn.started",
               "turn.ended",
               "agent.updated",
+              "agent.moved",
               "cost.recorded",
               "thread.entry",
               "decision.created",
@@ -766,6 +767,33 @@
           "project",
           "lot",
           "entries"
+        ],
+        "type": "object"
+      },
+      "ameesh-timeline-1": {
+        "properties": {
+          "generated_ts": {
+            "type": "number"
+          },
+          "lots": {
+            "items": {
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "schema": {
+            "const": "ameesh-timeline/1",
+            "type": "string"
+          },
+          "window": {
+            "type": "object"
+          }
+        },
+        "required": [
+          "schema",
+          "generated_ts",
+          "window",
+          "lots"
         ],
         "type": "object"
       }
@@ -3428,6 +3456,83 @@
           }
         },
         "summary": "Progress of a project (`ameesh progress --json --project`)"
+      }
+    },
+    "/api/v1/projects/{project}/timeline": {
+      "get": {
+        "operationId": "projects_project_timeline",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "project",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "window: 90m, 24h, 2d or an ISO date",
+            "in": "query",
+            "name": "since",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ameesh-timeline-1"
+                }
+              }
+            },
+            "description": "Timeline of a project: its lots and window only (#3395)"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ameesh-error-1"
+                }
+              }
+            },
+            "description": "bad request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ameesh-error-1"
+                }
+              }
+            },
+            "description": "token missing or refused"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ameesh-error-1"
+                }
+              }
+            },
+            "description": "not found"
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ameesh-error-1"
+                }
+              }
+            },
+            "description": "database unavailable"
+          }
+        },
+        "summary": "Timeline of a project: its lots and window only (#3395)"
       }
     },
     "/api/v1/threads/{project}": {

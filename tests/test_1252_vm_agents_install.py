@@ -15,6 +15,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import socket
 import stat
 import subprocess
@@ -86,22 +87,61 @@ os.execvp(sys.argv[4], sys.argv[4:])
 ID = '#!/bin/sh\necho 1001\n'
 
 SYSTEMCTL = r'''#!/usr/bin/env python3
-import os, sys
+import os, subprocess, sys
 from pathlib import Path
 state = Path(os.environ['FAKE_STATE'])
 args = sys.argv[1:]
 assert args[0] == '--user', args
 unit = args[-1]
-name = unit.split('@')[1].removesuffix('.service')
+name = unit.split('@')[1].removesuffix('.service') if '@' in unit else unit
 with (state / 'systemctl.log').open('a') as f:
     f.write(' '.join(args) + '\n')
 def stopped():
     return (state / ('stopped-' + name)).exists()
+def live_pid():
+    """#3311 : un vrai processus par venv vivant, lancé depuis son `bin/`.
+
+    Son argv[0] est le chemin concret fixé par le lanceur #1969 ; le témoin de
+    `controler` le lit dans /proc/<pid>/cmdline, comme en production.
+    """
+    parts = Path(os.environ['HOME']) / '.local/share/ameesh'
+    courant = parts / 'venv-courant'
+    if courant.is_symlink():
+        cible = Path(os.readlink(courant))
+        if not cible.is_absolute():
+            cible = parts / cible
+    else:
+        cible = parts / 'venv'
+    cible = cible.resolve()
+    cache = state / 'mainpid'
+    try:
+        pid = int(cache.read_text())
+        argv0 = (Path('/proc') / str(pid) / 'cmdline').read_bytes().split(b'\0')[0]
+        if os.fsdecode(argv0) and Path(os.fsdecode(argv0)).parent.resolve() == cible / 'bin':
+            return pid
+    except (OSError, ValueError):
+        pass
+    lien = cible / 'bin/python3'
+    if not lien.exists():
+        lien.symlink_to(sys.executable)
+    enfant = subprocess.Popen([str(lien), '-c', 'import time; time.sleep(120)'],
+                              stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                              stderr=subprocess.DEVNULL, start_new_session=True)
+    cache.write_text(str(enfant.pid) + '\n')
+    with (state / 'mainpids').open('a') as f:
+        f.write(str(enfant.pid) + '\n')
+    return enfant.pid
 def reload_epoch():
     # un runner redémarré reprend son bail à une époque supérieure
     epoch = state / ('lease-epoch-' + name)
     epoch.write_text(str(int(epoch.read_text()) + 2 if epoch.exists() else 9))
-if 'stop' in args:
+if 'mask' in args:
+    # #3320 : masquage des sockets GnuPG de l'agent (aucun arrêt de runner).
+    for masked in [a for a in args if a.endswith(('.socket', '.service'))]:
+        (state / ('masked-' + masked)).touch()
+    with (state / 'events.log').open('a') as f:
+        f.write('mask\n')
+elif 'stop' in args:
     # #1152 : l'arrêt prouvé précède tout nouveau démarrage.
     (state / ('stopped-' + name)).touch()
 elif 'start' in args:
@@ -116,7 +156,7 @@ elif 'show' in args:
     if 'ActiveState' in args:
         print('inactive' if stopped() else 'active')
     elif 'MainPID' in args:
-        print('0' if stopped() else '123')
+        print('0' if stopped() else live_pid())
     else:
         print('{ path=/bin/runner ; argv[]=/bin/runner run --runner-id '
               'runner-' + name + '@host-agents ; }')
@@ -130,6 +170,14 @@ elif 'is-active' in args:
 
 JOURNALCTL = '#!/bin/sh\nexit 0\n'
 SLEEP = '#!/bin/sh\nexit 0\n'
+# #3320 : le testament de l'agent GnuPG est tué via gpgconf, sur la VM.
+GPGCONF = r'''#!/usr/bin/env python3
+import os, sys
+from pathlib import Path
+state = Path(os.environ['FAKE_STATE'])
+with (state / 'gpgconf.log').open('a') as f:
+    f.write(' '.join(sys.argv[1:]) + '\n')
+'''
 
 SYSTEMD_RUN = r'''#!/usr/bin/env python3
 import json, os, sys
@@ -170,6 +218,12 @@ elif sys.argv[1] == 'show':
     print(json.dumps(row))
 elif sys.argv[1] == 'doctor':
     print('doctor ok')
+elif sys.argv[1:3] == ['role', 'timers']:
+    # #3311 x #3327 : `controler` vérifie les minuteries de rôle sous
+    # l'environnement du service (ameesh_agents) ; le banc l'accepte.
+    with (state / 'role-timers.log').open('a') as f:
+        f.write(' '.join(sys.argv[1:]) + '\n')
+    print('minuteries de rôle ok')
 else:
     sys.exit(2)
 '''
@@ -204,6 +258,9 @@ state = Path(os.environ['FAKE_STATE'])
 log = state / 'pip.log'
 with log.open('a') as f:
     f.write(' '.join(sys.argv[1:]) + '\n')
+# #3320 : ordre des gestes de l'installation (pip avant le masquage GnuPG).
+with (state / 'events.log').open('a') as f:
+    f.write('pip\n')
 fail_at = int((state / 'pip-fail-at').read_text()) if (state / 'pip-fail-at').exists() else 0
 if fail_at and len(log.read_text().splitlines()) >= fail_at:
     sys.exit('pip failure (test)')
@@ -273,6 +330,7 @@ class VmAgentsHarness(unittest.TestCase):
         # Exerce aussi la séparation des chemins locaux/distants sur tout hôte.
         self.tmp = tempfile.TemporaryDirectory(prefix='ameesh-1252-~')
         self.addCleanup(self.tmp.cleanup)
+        self.addCleanup(self._arreter_venvs)
         self.root = Path(self.tmp.name)
         self.state = self.root / 'state'
         self.state.mkdir()
@@ -309,7 +367,8 @@ class VmAgentsHarness(unittest.TestCase):
         (self.bin / 'python3').chmod(0o755)
         for name, text in [('ssh', SSH), ('scp', SCP), ('runuser', RUNUSER), ('id', ID),
                            ('systemctl', SYSTEMCTL), ('journalctl', JOURNALCTL),
-                           ('sleep', SLEEP), ('systemd-run', SYSTEMD_RUN),
+                           ('sleep', SLEEP), ('gpgconf', GPGCONF),
+                           ('systemd-run', SYSTEMD_RUN),
                            ('ameesh', AMEESH), ('db-python', DB_PYTHON)]:
             path = self.bin / name
             path.write_text(text)
@@ -323,7 +382,10 @@ class VmAgentsHarness(unittest.TestCase):
         # #1969 : un venv réel porte son pyvenv.cfg ; la première conversion
         # l'adopte (lib réutilisée) sans pip et exige cette pièce.
         (self.venv / 'pyvenv.cfg').write_text(
-            'home = %s\n' % os.path.dirname(sys.executable))
+            # #3311 x CI : un vrai venv écrit le préfixe de l'interpréteur de
+            # base ; `dirname(sys.executable)` vaut .venv-ci/bin en CI, où il
+            # n'y a pas de stdlib (init_fs_encoding / « encodings » absent).
+            'home = %s\n' % os.path.join(sys.base_prefix, 'bin'))
         self.workhome = self.root / 'home'
         self.workhome.mkdir()
         config = self.root / 'bascule.env'
@@ -358,6 +420,17 @@ class VmAgentsHarness(unittest.TestCase):
     def head(self, where):
         return self.git(where, 'rev-parse', 'HEAD')
 
+    def _arreter_venvs(self):
+        """#3311 : arrête les processus vivants simulés par le faux systemctl."""
+        chemin = self.state / 'mainpids'
+        if not chemin.exists():
+            return
+        for ligne in chemin.read_text().split():
+            try:
+                os.kill(int(ligne), signal.SIGTERM)
+            except (OSError, ValueError):
+                pass
+
     def _build_origin(self):
         """Un dépôt d'origine à trois commits, indépendant de l'historique du
         checkout : la CI ne fournit que la tête (clone en profondeur 1)."""
@@ -372,6 +445,9 @@ class VmAgentsHarness(unittest.TestCase):
         # l'installe dans son dépôt d'origine comme les autres pièces.
         shutil.copy2(ROOT / 'deploy/mise-a-jour/bascule.py',
                      self.origin / 'deploy/mise-a-jour/bascule.py')
+        # #3311 : vm.sh lit ce helper sur stdin pour prouver le venv du MainPID.
+        shutil.copy2(ROOT / 'deploy/mise-a-jour/venv-processus.py',
+                     self.origin / 'deploy/mise-a-jour/venv-processus.py')
         shutil.copy2(ROOT / '.gitignore', self.origin / '.gitignore')
         (self.origin / 'src/ameesh/migrations').mkdir(parents=True)
         (self.origin / 'src/ameesh/__init__.py').write_text('# origine\n')
@@ -489,7 +565,12 @@ class VmAgentsInstallTest(VmAgentsHarness):
     def test_install_does_not_restart_the_runners(self):
         p = self.run_vm('installer', self.target)
         self.assertEqual(p.returncode, 0, p.stderr)
-        self.assertFalse((self.state / 'systemctl.log').exists())
+        # #3320 : l'installation masque les sockets GnuPG de l'agent ; elle ne
+        # touche jamais aux unités des exécuteurs.
+        log = ((self.state / 'systemctl.log').read_text()
+               if (self.state / 'systemctl.log').exists() else '')
+        self.assertNotIn('restart', log)
+        self.assertNotIn('ameesh-runner', log)
 
     def test_a_stopped_persona_active_unit_is_reloaded_into_the_new_code(self):
         # #1131/#1633 : la persona arrêtée par le propriétaire n'est pas

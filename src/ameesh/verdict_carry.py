@@ -444,13 +444,23 @@ def _decided(notes, reviewed: str, frozen: str) -> bool:
 
 
 def _clone(cfg, row: dict, repo: str):
-    from . import radar, resolutions
+    """Le clone radar où lire la cible et la tête gelée.
+
+    #3331 : le clone suit le dépôt lu, pas l'`app` — un lot du canon se lit
+    dans un clone du canon, jamais dans celui du projet (`radar.clone_dir`
+    nomme le clone d'après le dépôt quand il diffère de celui du projet)."""
+    from . import plan_git, radar, resolutions
     name = str(row.get("app") or "").strip() or os.path.basename(repo.rstrip("/"))
     project = None
     try:
         project = radar.settings_of(cfg).projects.get(name)
     except Exception:  # noqa: BLE001 - réglages radar illisibles : cible par défaut
         project = None
+    slug = plan_git._repo_slug(repo)
+    if slug:
+        repo_name = slug.rsplit("/", 1)[-1]
+        if repo_name.casefold() != name.casefold():
+            name = repo_name
     return resolutions.Replayer(repo, radar.clone_dir(cfg, name),
                                 target=getattr(project, "target", "") or "")
 

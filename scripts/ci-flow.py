@@ -102,6 +102,7 @@ import os
 import pathlib
 import re
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -570,9 +571,24 @@ class Publication:
             self.etat = {}
 
     def _keep(self) -> None:
-        tmp = self.etat_chemin.with_suffix(".tmp")
-        tmp.write_text(json.dumps(self.etat), encoding="utf-8")
-        tmp.replace(self.etat_chemin)
+        """Écrit l'état par un temporaire propre à l'écrivain (#3336).
+
+        `publish` (arrière-plan) et `close` (`if: always()`) écrivent tous deux
+        l'état de la même part. Avec un nom fixe (`F.jsonl.tmp`), le renommage
+        de l'un consommait le temporaire de l'autre et l'étape échouait en
+        FileNotFoundError (main, run 40084134277) ; chaque écrivain garde donc
+        son propre temporaire, renommé atomiquement dans le même dossier."""
+        fd, tmp = tempfile.mkstemp(prefix=self.etat_chemin.name + ".", suffix=".tmp",
+                                   dir=str(self.etat_chemin.parent))
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                fh.write(json.dumps(self.etat))
+            os.replace(tmp, self.etat_chemin)
+        finally:
+            try:
+                os.unlink(tmp)
+            except FileNotFoundError:
+                pass
 
     def events(self) -> list[dict]:
         return read(self.flux)[0] if self.flux.is_file() else []
@@ -606,7 +622,12 @@ class Publication:
             self.etat["alerte"] = alerte
         if conclusion:
             self.etat["conclusion"] = conclusion
-        self._keep()
+        try:
+            self._keep()
+        except OSError as exc:
+            # #3336 : le check run est publié ; un état non écrit ne rougit pas
+            # la part (même contrat que le refus de GitHub), il est consigné.
+            self.log("ci-flow : état « %s » non écrit (%s)" % (self.etat_chemin, exc))
         return True
 
 

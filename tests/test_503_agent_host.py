@@ -50,6 +50,10 @@ with (state / 'ssh.log').open('a') as f:
     f.write(command + '\n')
 command = command.replace('/home/ameesh/.local/share/ameesh/venv/bin/ameesh', os.environ['FAKE_AMEESH'])
 command = command.replace('/home/ameesh/.local/share/ameesh/venv/bin/python', os.environ['FAKE_DB_PYTHON'])
+# #3311 : le helper de preuve reçoit le venv stable de la VM en argument ; le
+# banc le traduit vers son layout temporaire (les lanceurs ci-dessus sont déjà
+# remplacés, donc cette passe ne les touche plus).
+command = command.replace('/home/ameesh/.local/share/ameesh', os.environ['FAKE_SHARE'])
 command = command.replace('$HOME/.config/ameesh/env', str(state / 'runner.env'))
 env = dict(os.environ, FAKE_REMOTE='1')
 sys.exit(subprocess.run(['bash', '-c', command], env=env, input=stdin, text=True).returncode)
@@ -122,7 +126,14 @@ elif sys.argv[1] == 'show':
     if scenario == 'expired': row['lease_expires_ts'] = time.time()-1
     if scenario == 'no-lease': row['lease_owner'] = None
     if scenario == 'foreign-owner': row['lease_owner'] = 'another-runner'
-    if scenario == 'default-owner': row['lease_owner'] = 'host-agents:123'
+    if scenario == 'default-owner':
+        # #3311 : le propriétaire par défaut est host:MainPID ; le banc fournit
+        # un vrai processus vivant, plus le 123 historique.
+        try:
+            pid = (state / 'mainpid').read_text().strip()
+        except OSError:
+            pid = '123'
+        row['lease_owner'] = 'host-agents:' + pid
     if scenario == 'db-ahead': row['lease_expires_ts'] = time.time()+30
     if scenario == 'moved-before': row['host'] = 'elsewhere'
     # #2184/N1 : le mode peut changer entre la liste et la relecture ; dev9
@@ -306,6 +317,12 @@ elif sys.argv[1] in ('pause', 'resume'):
                               'event_id': None}))
 elif sys.argv[1] == 'doctor':
     print('doctor ok')
+elif sys.argv[1:3] == ['role', 'timers']:
+    # #3311 x #3327 : le contrôle du déploiement vérifie les minuteries de rôle
+    # sous l'environnement du service (ameesh_agents) ; le banc l'accepte.
+    with (state / 'role-timers.log').open('a') as f:
+        f.write(' '.join(sys.argv[1:]) + '\n')
+    print('minuteries de rôle ok')
 else: sys.exit(2)
 '''
 SYSTEMCTL = r'''#!/usr/bin/env python3
@@ -344,7 +361,18 @@ elif 'show' in args:
         if (state / ('failed-' + name)).exists(): print('failed')
         else: print('inactive' if stopped() else 'active')
     elif 'MainPID' in args:
-        print('0' if stopped() else '123')
+        if stopped():
+            print('0')
+        else:
+            # #3311 : un vrai processus dont le témoin lit /proc/<pid>/cmdline.
+            name = unit.split('@')[1].removesuffix('.service')
+            par_unite = state / ('mainpid-' + name)
+            if par_unite.exists():
+                print(par_unite.read_text().strip())
+            elif (state / 'mainpid').exists():
+                print((state / 'mainpid').read_text().strip())
+            else:
+                print('123')
     elif scenario == 'bad-execstart': print('unreadable')
     elif scenario == 'execstart-error': sys.exit(1)
     else:
@@ -424,6 +452,14 @@ class AgentHostTest(unittest.TestCase):
         self.bin = self.root / 'bin'; self.bin.mkdir()
         (self.bin / 'python3').symlink_to(sys.executable)
         self.home = self.root / 'home'; self.home.mkdir()
+        # #3311 : layout du venv stable de la VM, traduit depuis /home/ameesh.
+        self.share = self.home / '.local/share/ameesh'
+        self.venv_current = self.share / 'venv-aaa1111'
+        self.venv_old = self.share / 'venv-bbb2222'
+        for venv in (self.venv_current, self.venv_old):
+            (venv / 'bin').mkdir(parents=True)
+            (venv / 'bin/python').symlink_to(sys.executable)
+        (self.share / 'venv-courant').symlink_to(self.venv_current.name)
         self.config = self.root / 'bascule.env'
         self.config.write_text('AGENTS_SSH=root@vm.invalid\nHOTE_AGENTS=host-agents\nPERSONAS_VM=obsolete\n')
         for name, source in [('ssh', SSH), ('runuser', RUNUSER), ('ameesh', AMEESH),
@@ -434,6 +470,7 @@ class AgentHostTest(unittest.TestCase):
         self.env = dict(os.environ, HOME=str(self.home), BASCULE_ENV=str(self.config),
                         FAKE_STATE=str(self.state), FAKE_AMEESH=str(self.bin / 'ameesh'),
                         FAKE_DB_PYTHON=str(self.bin / 'db-python'),
+                        FAKE_SHARE=str(self.share),
                         PATH=str(self.bin) + os.pathsep + os.environ['PATH'])
         self.agents = [dict(name=n, host=h, mode=m, status=s) for n,h,m,s in [
             ('dev9', 'host-agents', 'execute', 'idle'),
@@ -443,10 +480,30 @@ class AgentHostTest(unittest.TestCase):
             ('stopped', 'host-agents', 'execute', 'stopped')]]
 
     def run_vm(self, action='redemarrer', scenario='lease', agents=None):
+        # #3311 : `controler` prouve le venv de chaque MainPID vivant ; sauf
+        # processus déjà posé par le test, le banc en fournit un sur le venv
+        # courant pour que les contrôles testés (bail, inactivité) restent
+        # seuls en cause.
+        if action == 'controler' and not (self.state / 'mainpid').exists():
+            self._processus_venv(self.venv_current)
         (self.state / 'scenario').write_text(scenario)
         (self.state / 'agents.json').write_text(json.dumps(self.agents if agents is None else agents))
         return subprocess.run(['bash', str(SCRIPT), 'agents', action], env=self.env,
                               capture_output=True, text=True, timeout=120)
+
+    def _processus_venv(self, venv, marque='mainpid'):
+        """#3311 : processus vivant dont l'argv[0] est le python concret du venv."""
+        enfant = subprocess.Popen([str(venv / 'bin/python'), '-c',
+                                    'import time; time.sleep(60)'])
+        self.addCleanup(self._arreter, enfant)
+        (self.state / marque).write_text(str(enfant.pid) + '\n')
+        return enfant
+
+    @staticmethod
+    def _arreter(enfant):
+        if enfant.poll() is None:
+            enfant.terminate()
+        enfant.communicate(timeout=5)
 
     def units(self):
         path = self.state / 'units.log'
@@ -489,6 +546,41 @@ class AgentHostTest(unittest.TestCase):
         # `%h` specifier is not expanded there and would fail the unit).
         self.assertIn('EnvironmentFile=' + str(self.state / 'runner.env'), log)
         self.assertNotIn('%h', log)
+
+    def test_controler_prouve_le_venv_du_runner_vivant(self):
+        """#3311 : `controler` lit l'argv[0] concret du MainPID, pas ExecStart."""
+        p = self.run_vm('controler')
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assertIn('MainPID vivant sur le venv courant', p.stdout)
+        self.assertIn('contrôles verts', p.stdout)
+
+    def test_controler_refuse_un_runner_reste_sur_l_ancien_venv(self):
+        """#3311, panne d'agents-2 : venv-courant à jour, exécuteur vivant sur
+        l'ancien venv — l'hôte n'est pas sain et le dit."""
+        self._processus_venv(self.venv_current)
+        self._processus_venv(self.venv_old, 'mainpid-dev9')
+        p = self.run_vm('controler', scenario='venv-old')
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn('ameesh-runner-agent@dev9.service : venv courant non prouvé',
+                      p.stderr)
+        self.assertIn("dev9 : le MainPID vivant n'exécute pas le venv installé",
+                      p.stderr)
+        # dev8, lui, vit bien sur le venv courant
+        self.assertNotIn('ameesh-runner-agent@dev8.service', p.stderr)
+        self.assertEqual(p.stdout.count('MainPID vivant sur le venv courant'), 1)
+        self.assertNotIn('contrôles verts', p.stdout)
+
+    def test_controler_refuse_un_mainpid_absent_ou_invalide(self):
+        for pid in ('0', 'abc'):
+            with self.subTest(pid=pid):
+                (self.state / 'mainpid').write_text(pid + '\n')
+                p = self.run_vm('controler', scenario='venv-ok')
+                self.assertNotEqual(p.returncode, 0)
+                if pid == '0':
+                    self.assertIn('venv courant non prouvé', p.stderr)
+                else:
+                    self.assertIn('MainPID invalide (abc)', p.stderr)
+                self.assertNotIn('contrôles verts', p.stdout)
 
     def test_restart_uses_remote_registry_and_user_units(self):
         p = self.run_vm()

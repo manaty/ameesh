@@ -207,6 +207,12 @@ def _proposed_head(db: Db, item: dict, frozen: str, repo: str | None = None) -> 
     Un gel ancien peut porter moins de 12 caractères : on le complète dans un
     dépôt quand l'un le connaît, sinon la proposition est vide (le refus dit
     alors de geler de nouveau avec la tête complète)."""
+    return _complete_head(db, item, frozen, repo)[:12]
+
+
+def _complete_head(db: Db, item: dict, frozen: str, repo: str | None = None) -> str:
+    """La tête gelée telle quelle si elle a 12+ caractères, sinon le commit
+    complet d'un dépôt qui la connaît, sinon "" (aucun `--sha` acceptable)."""
     head = frozen
     if head and len(head) < REVIEWED_HEAD_MIN:
         from . import freeze_checks
@@ -214,7 +220,25 @@ def _proposed_head(db: Db, item: dict, frozen: str, repo: str | None = None) -> 
             head = freeze_checks.commit_in(where, head) or head
             if len(head) >= REVIEWED_HEAD_MIN:
                 break
-    return head[:12] if len(head) >= REVIEWED_HEAD_MIN else ""
+    return head if len(head) >= REVIEWED_HEAD_MIN else ""
+
+
+def verdict_sha(db: Db, lot, frozen: str) -> str:
+    """#3307 : le `--sha` d'une commande de verdict proposée (reprise, SLO).
+
+    Le SHA du gel est repris tel quel quand `reviewed_head` l'accepte (12+
+    caractères) ; un gel historique plus court est complété dans un dépôt qui
+    le connaît, sinon la commande proposée ne porterait qu'un `--sha` refusé
+    (head-missing) : "" laisse l'appelant écrire `<frozen head>`."""
+    head = str(frozen or "").strip().lower()
+    if not head or len(head) >= REVIEWED_HEAD_MIN:
+        return head
+    try:
+        from . import work
+        item = work.get(db, int(lot)) or {"id": int(lot)}
+        return _complete_head(db, item, head)
+    except Exception:  # noqa: BLE001 - lot ou dépôt illisible : pas de --sha
+        return ""
 
 
 def _head_refusal(db: Db, item: dict, why: str, *,
@@ -237,7 +261,7 @@ def _head_refusal(db: Db, item: dict, why: str, *,
 
 
 def reviewed_head(db: Db, item: dict, sha: str, *, repo: str | None = None) -> str:
-    """Le `sha` d'un verdict, vérifié et normalisé (#2674).
+    """Le `sha` d'un verdict, vérifié et **résolu en tête complète** (#3329).
 
     Un avis ne compte à la porte (`merge_queue.review_gate`) que s'il nomme la
     tête relue : un commit **résolu** — dans `repo` (nommé par `--repo`, alors
@@ -247,7 +271,14 @@ def reviewed_head(db: Db, item: dict, sha: str, *, repo: str | None = None) -> s
     abréviation, ou nommer exactement la tête gelée (le relecteur peut ne pas
     avoir le dépôt). Un `sha` vide, trop court, non hexadécimal ou non résolu
     est refusé avec la tête gelée proposée : le jalon n'est pas écrit, plutôt
-    qu'un avis qui ne pourrait jamais franchir la porte."""
+    qu'un avis qui ne pourrait jamais franchir la porte.
+
+    #3329 : le SHA est écrit **complet**. Une abréviation acceptée parce
+    qu'elle préfixe la tête gelée était stockée telle quelle ; la demande de CI
+    compare au SHA complet du gel et ne comptait alors aucun avis (cas réel :
+    17614, `b2b895887a26`). Une abréviation résolue dans un dépôt rend le
+    commit complet de ce dépôt ; une abréviation de la tête gelée rend la tête
+    gelée elle-même. Le refus, lui, ne stocke rien."""
     text = str(sha or "").strip().lower()
     if not text:
         raise _head_refusal(
@@ -267,23 +298,25 @@ def reviewed_head(db: Db, item: dict, sha: str, *, repo: str | None = None) -> s
     # local ne la porte : la tête gelée fait foi, et `--repo` ne peut pas
     # l'effacer), sinon il faut un dépôt qui la résolve.
     full = bool(_FULL_HEAD.fullmatch(text))
-    frozen = frozen_head(db, item["id"]) if full else ""
+    frozen = frozen_head(db, item["id"])
     if full and frozen == text:
         return text
     if repo:
-        if freeze_checks.commit_in(repo, text):
-            return text
+        commit = freeze_checks.commit_in(repo, text)
+        if commit:
+            return commit
         raise _head_refusal(
             db, item,
             "verdict refused (head-unresolved): %s does not name a commit of %s"
             % (text, repo), repo=repo)
     for where in _head_repos(db, item):
-        if freeze_checks.commit_in(where, text):
-            return text
-    if not full:
-        frozen = frozen_head(db, item["id"])
-    if frozen and (frozen == text if full else frozen.startswith(text)):
-        return text
+        commit = freeze_checks.commit_in(where, text)
+        if commit:
+            return commit
+    if not full and frozen.startswith(text):
+        # #3329 : la tête gelée fait foi, et c'est **elle** qu'on écrit : une
+        # abréviation stockée ne serait comptée par aucune demande de CI.
+        return frozen
     raise _head_refusal(
         db, item,
         "verdict refused (head-unresolved): %s does not resolve to a commit here and "

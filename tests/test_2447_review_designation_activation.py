@@ -9,15 +9,18 @@ a guessed reviewer; the recovery path replays the same freeze.
 """
 from __future__ import annotations
 
+import concurrent.futures
 import dataclasses
+import json
 import os
 import shutil
 import subprocess
+import threading
 import time
 import types
 from unittest import mock
 
-from ameesh import mail, registry, review_authors, review_designation as rd
+from ameesh import lot_class, mail, registry, review_authors, review_designation as rd
 from ameesh import review_designation_activation as act
 from ameesh import review_designation_pg as pg
 from ameesh import review_provenance as prov
@@ -1250,8 +1253,8 @@ class ActivationTest(_ActivationFixture, PgTestCase):
         self.assertEqual(report["attempted"], 1, report)
 
     def test_the_runner_retries_after_a_successful_canon_sync(self):
-        # The runner's periodic pass calls the bounded retry; a failure there
-        # never fails the canon sync.
+        # The runner's periodic pass calls the bounded retry and the #3328
+        # reassignment; a failure there never fails the canon sync.
         from ameesh import runner as runner_mod
 
         fake = types.SimpleNamespace(cfg=self.cfg, mediated=False,
@@ -1259,14 +1262,482 @@ class ActivationTest(_ActivationFixture, PgTestCase):
         fake_db = mock.MagicMock()
         report = {"attempted": 1, "designated": 1,
                   "summary": "1 attempted: 1 designated"}
+        moved = {"examined": 1, "reassigned": 1,
+                 "summary": "1 examined: 1 reassigned"}
         with mock.patch("ameesh.scoped_db.ScopedDb", return_value=fake_db), \
                 mock.patch.object(act, "retry_pending", return_value=report) as retry, \
+                mock.patch.object(act, "reassign_unreachable",
+                                  return_value=moved) as reassign, \
                 mock.patch.object(runner_mod, "log_async") as log:
             runner_mod.Runner.retry_review_designations(fake)
         retry.assert_called_once_with(self.cfg, fake_db)
+        reassign.assert_called_once_with(self.cfg, fake_db)
         fake_db.close.assert_called_once()
         self.assertTrue(any("review designation retry" in str(call)
                             for call in log.call_args_list))
+        self.assertTrue(any("review designation reassign" in str(call)
+                            for call in log.call_args_list))
+
+
+class UnreachableDesignationTest(_ActivationFixture, PgTestCase):
+    """#3328 : un hôte perdu n'est ni désigné, ni laissé en siège mort.
+
+    Le constat : pc-smichea `lost`, agent-mail dit « claims closed », mais
+    `is_available` ne lisait que le registre et désignait ses agents. Les
+    témoins couvrent la désignation neuve (exclusion, repli de la même famille,
+    attente si la famille n'a que cet agent), le retour de l'hôte, et la
+    reprise d'une désignation déjà écrite par le passage du runner.
+    """
+
+    LOST = "pc-smichea"
+
+    def _agent(self, name, harness):
+        registry.upsert(self.db, name, harness=harness, host=self.cfg.host,
+                        cwd=self.repo.root, status="idle")
+        self.db.execute("UPDATE agent_registry SET team = 'ameesh' WHERE name = %s",
+                        (name,))
+
+    def _lose_host(self, host=None):
+        host = host or self.LOST
+        self.db.execute(
+            "INSERT INTO host_lifecycle(host, mode, actor) VALUES (%s, 'lost', 'test')"
+            " ON CONFLICT (host) DO UPDATE SET mode = 'lost'", (host,))
+        self.addCleanup(self.db.execute,
+                        "DELETE FROM host_lifecycle WHERE host = %s", (host,))
+
+    def _move_to_lost(self, name, host=None):
+        self.db.execute("UPDATE agent_registry SET host = %s WHERE name = %s",
+                        (host or self.LOST, name))
+
+    def _designated(self, lot=None):
+        shown = act.reviewers(self.cfg, self.db, lot or self.lot)
+        return shown["designation"]
+
+    def test_a_lost_host_is_excluded_and_the_family_falls_back(self):
+        # r1 (claude) est sur l'hôte perdu ; r3, même famille, est sain :
+        # la désignation prend r3, jamais r1.
+        self._agent("r3", "claude")
+        self._move_to_lost("r1")
+        self._lose_host()
+        _, out = self.freeze()
+        self.assertEqual(out["state"], rd.DESIGNATED, out)
+        self.assertEqual(sorted(r["name"] for r in out["reviewers"]), ["r2", "r3"])
+        self.assertNotIn("r1", [r["name"] for r in out["reviewers"]])
+        self.assertEqual(sorted(m["recipient"] for m in self.mailbox()), ["r2", "r3"])
+
+    def test_a_lost_host_alone_in_its_family_waits_and_alerts(self):
+        # Aucun autre claude : la désignation attend le second avis au lieu de
+        # déposer la demande chez un mort (aucune marque portant r1).
+        self._move_to_lost("r1")
+        self._lose_host()
+        _, out = self.freeze()
+        self.assertEqual(out["state"], rd.WAITING, out)
+        self.assertEqual(out["reviewers"], [])
+        self.assertEqual(out["missing"], 1)
+        self.assertEqual([m["recipient"] for m in self.mailbox()], ["pilot"])
+        noted = pg.designation_of(self.marks()[0])
+        self.assertEqual(noted["state"], rd.WAITING)
+        self.assertEqual(noted["reviewers"], [])
+        self.assertNotIn("r1", json.dumps(noted))
+
+    def test_an_undrained_host_is_designated_on_the_next_pass(self):
+        # Témoin (3) : l'hôte rouvert rend r1 candidat ; la marque d'attente du
+        # même gel est rejouée et désigne r1 avec r2.
+        self._move_to_lost("r1")
+        self._lose_host()
+        _, out = self.freeze()
+        self.assertEqual(out["state"], rd.WAITING, out)
+        self.db.execute("UPDATE host_lifecycle SET mode = 'available' WHERE host = %s",
+                        (self.LOST,))
+        again = act.designate(self.cfg, self.db, self.lot)
+        self.assertEqual(again["state"], rd.DESIGNATED, again)
+        self.assertEqual(sorted(r["name"] for r in again["reviewers"]), ["r1", "r2"])
+
+    def test_an_existing_designation_is_reassigned_when_its_host_is_lost(self):
+        # Une désignation écrite avant la perte est reprise au passage du
+        # runner : r1 est remplacé par r3 (même famille), la colonne et le
+        # journal suivent, et une seconde passe ne redésigne rien.
+        self._agent("r3", "claude")
+        _, out = self.freeze()
+        self.assertEqual(sorted(r["name"] for r in out["reviewers"]), ["r1", "r2"])
+        self._move_to_lost("r1")
+        self._lose_host()
+        report = act.reassign_unreachable(self.cfg, self.db)
+        self.assertEqual(report["examined"], 1, report)
+        self.assertEqual(report["reassigned"], 1, report)
+        noted = self._designated()
+        self.assertEqual(noted["state"], rd.DESIGNATED, noted)
+        self.assertEqual(sorted(r["name"] for r in noted["reviewers"]), ["r2", "r3"])
+        column = self.db.query(
+            "SELECT reviewers FROM work_items WHERE id = %s", (self.lot,))[0]["reviewers"]
+        self.assertEqual(sorted(column), ["r2", "r3"])
+        self.assertTrue(self.notes(act.REASSIGN_PREFIX))
+        self.assertIn("r1 (host %s: claims closed)" % self.LOST,
+                      self.notes(act.REASSIGN_PREFIX)[-1])
+        mails = len(self.mailbox())
+        again = act.reassign_unreachable(self.cfg, self.db)
+        self.assertEqual(again["reassigned"], 0, again)
+        self.assertEqual(again["examined"], 0, again)
+        self.assertEqual(len(self.mailbox()), mails)
+
+    def test_a_seat_the_pilot_already_removed_is_not_moved_again(self):
+        # Le pilote a retiré le relecteur mort de la colonne avant la passe
+        # (#3311/#3312) : la marque reste son histoire, mais la reprise ne
+        # rouvre pas le siège et n'envoie rien.
+        self._agent("r3", "claude")
+        _, out = self.freeze()
+        self.assertEqual(sorted(r["name"] for r in out["reviewers"]), ["r1", "r2"])
+        self.db.execute(
+            "UPDATE work_items SET reviewers = ARRAY[%s] WHERE id = %s",
+            ("r2", self.lot))
+        self._move_to_lost("r1")
+        self._lose_host()
+        mails = len(self.mailbox())
+        report = act.reassign_unreachable(self.cfg, self.db)
+        self.assertEqual(report["examined"], 0, report)
+        self.assertEqual(len(self.mailbox()), mails)
+        self.assertFalse(self.notes(act.REASSIGN_PREFIX))
+
+    def test_a_reassignment_without_a_replacement_waits_once(self):
+        # Seule la famille claude est disponible et son agent est mort : la
+        # reprise alerte le pilote, une seule fois, au lieu de réécrire le
+        # même siège mort à chaque passe. #3367 : la désignation reste telle
+        # quelle — une marque d'attente retirait aussi r2, vivant, de la
+        # colonne ; r1 garde sa demande et relira au retour de son hôte.
+        _, out = self.freeze()
+        self._move_to_lost("r1")
+        self._lose_host()
+        report = act.reassign_unreachable(self.cfg, self.db)
+        self.assertEqual(report["waiting"], 1, report)
+        noted = self._designated()
+        self.assertEqual(noted["state"], rd.DESIGNATED, noted)
+        self.assertEqual(sorted(r["name"] for r in noted["reviewers"]), ["r1", "r2"])
+        self.assertEqual(sorted(self._column()), ["r1", "r2"])
+        self.assertIn("pilot", [m["recipient"] for m in self.mailbox()])
+        self.assertIn("designation unchanged", self.notes(act.REASSIGN_PREFIX)[-1])
+        mails = len(self.mailbox())
+        again = act.reassign_unreachable(self.cfg, self.db)
+        self.assertEqual(again["examined"], 0, again)
+        self.assertEqual(len(self.mailbox()), mails)
+
+    # -- #3367 : seuls les sièges morts bougent -----------------------------
+    def _column(self):
+        return list(self.db.query(
+            "SELECT reviewers FROM work_items WHERE id = %s",
+            (self.lot,))[0]["reviewers"] or [])
+
+    def _verdict(self, actor, sha=None, verdict="ok"):
+        return work.milestone(self.db, self.lot, "verdict", sha=sha or self.frozen,
+                              actor=actor, verdict=verdict, repo=self.repo.root,
+                              after_commit=[])
+
+    def _verdict_receipt(self, mark, actor, harness):
+        """The exact #1465 receipt the sensitive gate requires (#3369).
+
+        The tests run outside a managed turn, where `work.milestone` writes the
+        fact without a proof; a witness of the sensitive class adds it here.
+        """
+        self.db.execute(
+            "INSERT INTO provenance_receipts"
+            " (subject, sha, actor, session, turn, harness, work_item_id)"
+            " VALUES (%s, %s, %s, %s, 't', %s, %s)",
+            ("milestone:" + str(int(mark["id"])), self.frozen, actor,
+             "s-" + harness, harness, self.lot))
+
+    def _requests(self, name):
+        return [m for m in self.mailbox()
+                if m["recipient"] == name and m["kind"] == rd.REQUEST_KIND]
+
+    def test_a_lost_seat_whose_verdict_is_acquired_on_the_head_is_kept(self):
+        # Témoin du lot : r1 a rendu son verdict sur la tête gelée exacte (même
+        # abrégé), puis son hôte se ferme. Le siège n'est pas perdu : aucune
+        # redésignation, aucun courrier, la marque et la colonne sont gardées.
+        self._agent("r3", "claude")
+        _, out = self.freeze()
+        self.assertEqual(sorted(r["name"] for r in out["reviewers"]), ["r1", "r2"])
+        self._verdict_receipt(self._verdict("r1", sha=self.frozen[:12]), "r1", "claude")
+        self._verdict_receipt(self._verdict("r2"), "r2", "codex")
+        self._move_to_lost("r1")
+        self._lose_host()
+        marks, mails = len(self.marks()), len(self.mailbox())
+        report = act.reassign_unreachable(self.cfg, self.db)
+        self.assertEqual(report["examined"], 0, report)
+        self.assertEqual(report["reassigned"], 0, report)
+        self.assertEqual(len(self.marks()), marks)
+        self.assertEqual(len(self.mailbox()), mails)
+        self.assertEqual(sorted(self._column()), ["r1", "r2"])
+        self.assertFalse(self.notes(act.REASSIGN_PREFIX))
+
+    def test_a_blocking_verdict_on_the_head_is_acquired_too(self):
+        # Un `blocked` sur la tête gelée est aussi un avis rendu : un
+        # remplaçant ne lèverait pas le blocage, il faut une nouvelle tête.
+        self._agent("r3", "claude")
+        self.freeze()
+        self._verdict_receipt(self._verdict("r1", verdict="blocked"), "r1", "claude")
+        self._move_to_lost("r1")
+        self._lose_host()
+        report = act.reassign_unreachable(self.cfg, self.db)
+        self.assertEqual(report["examined"], 0, report)
+        self.assertEqual(sorted(self._column()), ["r1", "r2"])
+
+    def test_an_unproven_verdict_does_not_keep_a_sensitive_seat(self):
+        # #3369 : la porte sensible écarte un verdict sans son reçu exact
+        # (#1465). Garder le siège sur ce verdict laisserait un siège mort que
+        # la porte ne compterait jamais : le remplaçant doit être désigné.
+        self._agent("r3", "claude")
+        self.freeze()
+        klass = lot_class.of_lot(self.db, self.lot, cfg=self.cfg,
+                                 head=self.frozen)
+        self.assertEqual(klass["class"], lot_class.SENSITIVE, klass)
+        self._verdict("r1")  # pas de reçu : un avis que la porte écarte
+        self._move_to_lost("r1")
+        self._lose_host()
+        report = act.reassign_unreachable(self.cfg, self.db)
+        self.assertEqual(report["reassigned"], 1, report)
+        self.assertEqual(sorted(self._column()), ["r2", "r3"])
+        self.assertIn("replaced by r3", self.notes(act.REASSIGN_PREFIX)[-1])
+
+    def test_two_concurrent_waiting_passes_alert_once(self):
+        # #3369 : le chemin d'attente n'écrit aucune marque de désignation,
+        # donc sa note de journal est sa seule déduplication. Deux hôtes qui
+        # passent en même temps doivent produire une seule alerte pilote et
+        # une seule note : la note est écrite sous le verrou de la ligne.
+        self.freeze()
+        self._move_to_lost("r1")
+        self._lose_host()
+        barrier = threading.Barrier(2)
+        original = act._selection
+
+        def together(inputs, port, **kwargs):
+            barrier.wait(timeout=20)
+            return original(inputs, port, **kwargs)
+
+        def run():
+            db = self.connect()
+            try:
+                return act.reassign_unreachable(self.cfg, db)
+            finally:
+                db.close()
+
+        with mock.patch.object(act, "_selection", side_effect=together):
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+                tasks = [pool.submit(run) for _ in range(2)]
+                reports = [task.result(timeout=40) for task in tasks]
+        self.assertEqual(sum(int(r["waiting"]) for r in reports), 1, reports)
+        self.assertEqual(len([m for m in self.mailbox() if m["recipient"] == "pilot"]), 1)
+        self.assertEqual(len(self.notes(act.REASSIGN_PREFIX)), 1)
+
+    def test_a_verdict_on_an_earlier_head_does_not_keep_the_seat(self):
+        # Le vrai trou (#3340) : r1 a relu une autre tête, pas celle du gel.
+        # Son siège est remplacé, r2 garde le sien.
+        self._agent("r3", "claude")
+        self.repo.write("docs/earlier.md", "earlier head\n")
+        earlier = self.repo.commit("earlier head")
+        self.freeze()
+        self._verdict("r1", sha=earlier)
+        self._move_to_lost("r1")
+        self._lose_host()
+        report = act.reassign_unreachable(self.cfg, self.db)
+        self.assertEqual(report["reassigned"], 1, report)
+        self.assertEqual(sorted(self._column()), ["r2", "r3"])
+
+    def test_a_live_seat_is_never_replaced(self):
+        # Le cas #3341 : r2 (codex) est vivant, r4 (codex) est moins chargé.
+        # L'ancien rejeu complet (force=True) reprenait r4 à la place de r2 ;
+        # seul le siège mort (r1) est remplacé, et seul r3 reçoit un courrier.
+        self._agent("r3", "claude")
+        self._agent("r4", "codex")
+        _, out = self.freeze()
+        self.assertEqual(sorted(r["name"] for r in out["reviewers"]), ["r1", "r2"])
+        self._move_to_lost("r1")
+        self._lose_host()
+        before = len(self._requests("r2"))
+        report = act.reassign_unreachable(self.cfg, self.db)
+        self.assertEqual(report["reassigned"], 1, report)
+        noted = self._designated()
+        self.assertEqual([r["name"] for r in noted["reviewers"]], ["r2", "r3"], noted)
+        self.assertEqual(sorted(self._column()), ["r2", "r3"])
+        self.assertEqual(len(self._requests("r2")), before)
+        self.assertEqual(len(self._requests("r3")), 1)
+        self.assertFalse(self._requests("r4"))
+        note = self.notes(act.REASSIGN_PREFIX)[-1]
+        self.assertIn("replaced by r3", note)
+        self.assertIn("kept: r2", note)
+
+    def test_kept_seats_that_cover_the_opinions_drop_the_dead_one(self):
+        # Trois sièges dont un mort : les deux vivants couvrent les deux
+        # familles requises. Le mort est retiré, personne n'est désigné ni
+        # prévenu.
+        self._agent("r5", "claude")
+        row, _out = self.freeze()
+        note = pg._mark_note(
+            self.lot, int(row["id"]), state=rd.DESIGNATED, required=2,
+            reviewers=[{"name": "r1", "family": "claude"},
+                       {"name": "r2", "family": "codex"},
+                       {"name": "r5", "family": "claude"}],
+            missing=0, why="test: three seats", authors=[], policy_ref="",
+            sha=self.frozen)
+        storage.of(self.db).work.note(self.lot, "build", note, "test")
+        self.db.execute(
+            "UPDATE work_items SET reviewers = ARRAY['r1', 'r2', 'r5'] WHERE id = %s",
+            (self.lot,))
+        self._move_to_lost("r1")
+        self._lose_host()
+        mails = len(self.mailbox())
+        report = act.reassign_unreachable(self.cfg, self.db)
+        self.assertEqual(report["reassigned"], 1, report)
+        noted = self._designated()
+        self.assertEqual([r["name"] for r in noted["reviewers"]], ["r2", "r5"], noted)
+        self.assertEqual(sorted(self._column()), ["r2", "r5"])
+        self.assertEqual(len(self.mailbox()), mails)
+        self.assertIn(act.COVERED_WHY, self.notes(act.REASSIGN_PREFIX)[-1])
+
+    def test_an_unreadable_head_never_clears_the_seats(self):
+        # #3341 à 15:56Z : le rejeu n'a trouvé aucun dépôt tenant la tête
+        # gelée, et le chemin « indisponible » a vidé la colonne (cx1, dev7).
+        # La reprise n'écrit plus rien quand elle ne peut pas conclure.
+        self._agent("r3", "claude")
+        self.freeze()
+        self._move_to_lost("r1")
+        self._lose_host()
+        marks, mails = len(self.marks()), len(self.mailbox())
+        unreadable = act.Unavailable(
+            "no repository holds the frozen head: cannot read the frozen diff")
+        with mock.patch.object(act, "prepare", return_value=unreadable):
+            report = act.reassign_unreachable(self.cfg, self.db)
+        self.assertEqual(report["reassigned"], 0, report)
+        self.assertEqual(sorted(self._column()), ["r1", "r2"])
+        self.assertEqual(len(self.marks()), marks)
+        self.assertEqual(len(self.mailbox()), mails)
+        self.assertFalse(self.notes(act.UNAVAILABLE_PREFIX))
+        self.assertIn("designation unchanged: no repository holds",
+                      self.notes(act.REASSIGN_PREFIX)[-1])
+
+    def test_a_pilot_removal_during_the_pass_is_not_written_back(self):
+        # Relecture de impl-02 (#3367) : le pilote retire r2 pendant que la
+        # passe lit le dépôt (`prepare`) ; `work reviewer --remove` n'écrit
+        # aucune marque, `mark_id` est inchangé. Sous le verrou, la colonne
+        # ne nomme plus un siège examiné : rien n'est écrit, r2 ne revient pas.
+        self._agent("r3", "claude")
+        self.freeze()
+        self._move_to_lost("r1")
+        self._lose_host()
+        freeze = act._latest_freeze(self.db, self.lot)
+        mark = act._effective_mark(self.db, self.lot, int(freeze["id"]))
+        self.db.execute("UPDATE work_items SET reviewers = ARRAY['r1'] WHERE id = %s",
+                        (self.lot,))
+        marks, mails = len(self.marks()), len(self.mailbox())
+        out = act.reseat(self.cfg, self.db, self.lot, freeze=freeze,
+                         kept=[{"name": "r2", "family": "codex"}],
+                         dead=[("r1", "host pc-smichea: claims closed")],
+                         mark_id=int(mark[0]))
+        self.assertEqual(out["state"], "stale", out)
+        self.assertNotIn("r2", self._column(), out)
+        self.assertEqual(len(self.marks()), marks)
+        self.assertEqual(len(self.mailbox()), mails)
+
+    def test_a_mark_moved_by_another_pass_writes_nothing(self):
+        # Deux hôtes passent en même temps : celui qui arrive second lit une
+        # marque qui n'est plus la marque effective, et n'écrit rien.
+        self._agent("r3", "claude")
+        row, _out = self.freeze()
+        self._move_to_lost("r1")
+        self._lose_host()
+        freeze = act._latest_freeze(self.db, self.lot)
+        stale_mark = act._effective_mark(self.db, self.lot, int(freeze["id"]))
+        storage.of(self.db).work.note(self.lot, "build", self.marks()[-1], "test")
+        marks, mails = len(self.marks()), len(self.mailbox())
+        out = act.reseat(self.cfg, self.db, self.lot, freeze=freeze,
+                         kept=[{"name": "r2", "family": "codex"}],
+                         dead=[("r1", "host lost")], mark_id=int(stale_mark[0]))
+        self.assertEqual(out["state"], "stale", out)
+        self.assertEqual(len(self.marks()), marks)
+        self.assertEqual(len(self.mailbox()), mails)
+        self.assertEqual(sorted(self._column()), ["r1", "r2"])
+
+    def test_two_hundred_older_healthy_lots_do_not_hide_the_lost_seat(self):
+        # Relecture #132625 (1) : la fenêtre bornée lisait les 200 lots
+        # ouverts les plus anciens, sains, et ne voyait jamais le 201e dont
+        # le siège est perdu. Le filtre des injoignables passe avant la
+        # fenêtre : les lots sains ne sont plus des candidats.
+        self._agent("r3", "claude")
+        _, out = self.freeze()
+        self.assertEqual(sorted(r["name"] for r in out["reviewers"]), ["r1", "r2"])
+        for index in range(act.REASSIGN_SCAN):
+            self.db.execute(
+                "INSERT INTO work_items (title, app, state, assignee, reviewers,"
+                " updated_at) VALUES (%s, 'ameesh', 'qa', 'author',"
+                " ARRAY['r2'], now() - interval '2 days')",
+                ("healthy %d" % index,))
+        self.db.execute("UPDATE work_items SET updated_at = now() WHERE id = %s",
+                        (self.lot,))
+        self._move_to_lost("r1")
+        self._lose_host()
+        report = act.reassign_unreachable(self.cfg, self.db)
+        self.assertEqual(report["examined"], 1, report)
+        self.assertEqual(report["reassigned"], 1, report)
+        noted = self._designated()
+        self.assertEqual(sorted(r["name"] for r in noted["reviewers"]), ["r2", "r3"])
+
+    def test_a_missing_reviewer_beside_a_live_one_is_reassigned(self):
+        # Relecture #132625 (2) : la sonde joignait la colonne au registre.
+        # Avec un nom vivant et un nom absent, la jointure ne rendait que le
+        # vivant et l'absence restait invisible. Chaque nom est désormais
+        # déroulé : `ghost` est vu à côté de `r2`, qui est sain.
+        self._agent("r3", "claude")
+        row, out = self.freeze()
+        self.assertEqual(sorted(r["name"] for r in out["reviewers"]), ["r1", "r2"])
+        freeze_id = int(row["id"])
+        self.db.execute(
+            "UPDATE work_items SET reviewers = ARRAY['r2', 'ghost'] WHERE id = %s",
+            (self.lot,))
+        note = pg._mark_note(
+            self.lot, freeze_id, state=rd.DESIGNATED, required=2,
+            reviewers=[{"name": "r2", "family": "codex"},
+                       {"name": "ghost", "family": "claude"}],
+            missing=0, why="test: missing beside live", authors=[],
+            policy_ref="", sha=self.frozen)
+        storage.of(self.db).work.note(self.lot, "build", note, "test")
+        # `r1` revient au registre comme candidat sain : on le perd aussi pour
+        # que le remplacement soit `r3`, et non le nom absent retiré de la
+        # colonne.
+        self._move_to_lost("r1")
+        self._lose_host()
+        report = act.reassign_unreachable(self.cfg, self.db)
+        self.assertEqual(report["examined"], 1, report)
+        self.assertEqual(report["reassigned"], 1, report)
+        noted = self._designated()
+        names = [r["name"] for r in noted["reviewers"]]
+        self.assertNotIn("ghost", names, noted)
+        self.assertEqual(sorted(names), ["r2", "r3"], noted)
+        self.assertIn("ghost (absent from the registry)",
+                      self.notes(act.REASSIGN_PREFIX)[-1])
+
+    def test_a_window_of_non_actionable_seats_wraps_to_the_lost_one(self):
+        # Relecture #132625 (1) : un curseur fait avancer une passe dont les
+        # candidats ne demandent rien (ici deux sièges sans gel), puis se
+        # replie au bout. Sans lui, la même fenêtre pouvait être relue à
+        # chaque passe et le siège perdu, plus ancien, ne jamais revenir.
+        self._agent("r3", "claude")
+        self.freeze()
+        self._move_to_lost("r1")
+        self._lose_host()
+        for index in range(2):
+            self.db.execute(
+                "INSERT INTO work_items (title, app, state, assignee, reviewers)"
+                " VALUES (%s, 'ameesh', 'qa', 'author', ARRAY['r1'])",
+                ("stale %d" % index,))
+        act._write_cursor(self.cfg, act.REASSIGN_CURSOR, self.lot)
+        with mock.patch.object(act, "REASSIGN_SCAN", 2):
+            first = act.reassign_unreachable(self.cfg, self.db)
+            self.assertEqual(first["reassigned"], 0, first)
+            self.assertEqual(act._read_cursor(self.cfg, act.REASSIGN_CURSOR),
+                             self.lot + 2, first)
+            second = act.reassign_unreachable(self.cfg, self.db)
+        self.assertEqual(second["examined"], 1, second)
+        self.assertEqual(second["reassigned"], 1, second)
+        self.assertEqual(sorted(r["name"] for r in self._designated()["reviewers"]),
+                         ["r2", "r3"])
 
 
 class PendingLoadTest(_ActivationFixture, PgTestCase):

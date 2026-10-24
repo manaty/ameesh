@@ -32,6 +32,7 @@ What v1 does (design: [`docs/design/specification.md`](docs/design/specification
 ```
 ameesh canon check | show | sync                  # canon → registry of this host
 agent-runner [--once]  |  ameesh attach <agent>   # the host's runner; interactive takeover
+ameesh role status [ROLE] [--json]                # elected roles: holder, epoch, ranked candidates (L165)
 ameesh mail send <agent> "<text>"                 # agent-mail, unchanged for the hooks
 ameesh fil list | show <project> [<lot>]          # readable threads
 ameesh action propose | execute | reconcile …     # the gate
@@ -147,7 +148,9 @@ agent-mail send <dest> <texte…> [--from NOM] [--lot ID [--assign]] [--kind req
                                                # (90 s), --urgent without delay, --ack and --cc without waking
                                                # --lot: thread label; hands over a free lot (L94
                                                # history, or --assign #964), never one held by an agent (#1066)
-agent-mail list                                # nom, outil, âge, non lus, dossier, hôte, bail
+agent-mail list                                # nom, outil, dernier signe de vie
+                                               # (seen/wrote, hors exécuteur), non lus,
+                                               # dossier, hôte, bail
 agent-mail inbox [NOM]                         # non lus, sans les marquer lus
 agent-mail whoami                              # identité liée (nom + source : runner, explicit,
                                                # session), jamais le dossier
@@ -247,6 +250,7 @@ ameesh canon show  [--json] …                                     # cards read
 ameesh canon sync  [--host H] [--json] …                          # canon → registry of host H
 ameesh agent name  --role R [--project P …] [--json]              # next free <org>-<repo>-<role>-<seq>
 ameesh agent spawn [name] --by <creator> --ttl 2h [--role R] [--project P …] [--cwd DIR] [--prompt TEXT]
+ameesh agent move  NOM --to HOST [--keep-session] [--actor A] [--json]   # manual move of a `releve: hote` agent (#3299)
 ameesh canon agent name|spawn …                                   # same commands, canonical place (L243, #468)
 ```
 

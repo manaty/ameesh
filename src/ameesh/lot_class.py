@@ -73,21 +73,157 @@ def _ref(canon) -> str:
     return str(getattr(sources[0], "commit", "") or "") if sources else ""
 
 
-def repository(cfg, item: dict) -> Optional[str]:
-    """Le chemin du dépôt du lot, par son projet (`radar.projects`), ou None.
+#: #3331 : les lots du canon nomment leur branche `canon/<lot>-…` (#2511).
+CANON_BRANCH_PREFIX = "canon/"
+#: #3331 : une PR de lot (`owner/repo#12`), même forme que la réf. d'issue.
+_PR_REF_RE = re.compile(r"^([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+)#\d+$")
 
-    Jamais d'exception : un hôte sans réglages radar n'a pas de dépôt à
-    proposer, et l'appelant rend un doute.
+
+def _pr_slug(item: dict) -> str:
+    """`owner/repo` (minuscules) de la PR du lot, ou "" (#3331)."""
+    match = _PR_REF_RE.match(str(item.get("pr_ref") or "").strip())
+    if not match:
+        return ""
+    return ("%s/%s" % (match.group(1), match.group(2))).casefold()
+
+
+#: #3331 : le clone du canon et son slug, lus une fois par chemin (un
+#: `repository` est appelé à chaque lot d'un relevé).
+_CANON_CHECKOUTS: dict[str, bool] = {}
+_CANON_SLUGS: dict[str, str] = {}
+
+
+def _canon_slug(path: str) -> str:
+    """`owner/repo` de l'`origin` du clone du canon, lu une fois, ou ""."""
+    if path not in _CANON_SLUGS:
+        _CANON_SLUGS[path] = plan_git._repo_slug(path) or ""
+    return _CANON_SLUGS[path]
+
+
+def _canon_checkout(path: str) -> bool:
+    """Le dossier est-il un dépôt git ? (positif mémorisé, le chemin est stable)."""
+    known = _CANON_CHECKOUTS.get(path)
+    if known is None:
+        known = bool(plan_git._out(path, "rev-parse", "--show-toplevel"))
+        if known:
+            _CANON_CHECKOUTS[path] = True
+    return known
+
+
+def canon_clones(cfg) -> list[tuple[str, str]]:
+    """Les clones **lisibles** des canons configurés, avec leur `owner/repo`.
+
+    #3350 : un hôte peut configurer plusieurs canons (L42) ; le dépôt d'un lot
+    du canon se choisit donc parmi TOUS ces clones, jamais sur le premier
+    lisible. Un canon dont le dossier n'est pas un dépôt git, ou dont
+    l'`origin` n'est pas exploitable, ne dit rien : il est écarté (le slug
+    vide ne correspond à aucune PR).
+    """
+    if cfg is None:
+        return []
+    try:
+        entries = canon_mod.configured(cfg)
+    except Exception:  # noqa: BLE001 - configuration illisible : pas de clone
+        return []
+    found: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for entry in entries:
+        path = os.path.expanduser(str(getattr(entry, "path", "") or ""))
+        if not path or path in seen or not os.path.isdir(path) \
+                or not _canon_checkout(path):
+            continue
+        seen.add(path)
+        found.append((path, _canon_slug(path)))
+    return found
+
+
+def canon_clone(cfg) -> Optional[str]:
+    """Le premier clone lisible du canon configuré (chemin de `ameesh canon show`).
+
+    #3331 : c'est là que vivent la branche et le gel d'un lot du canon, jamais
+    dans le clone du projet. None quand aucun canon n'est configuré ou que son
+    dossier n'est pas un dépôt lisible : l'appelant rend alors un doute.
+
+    #3350 : ce premier clone ne suffit pas à nommer le dépôt d'un lot quand
+    plusieurs canons sont configurés — `repository` choisit par la PR, sur
+    `canon_clones`.
+    """
+    clones = canon_clones(cfg)
+    return clones[0][0] if clones else None
+
+
+def _canon_lot(item: dict, clones: list[tuple[str, str]]) -> tuple[bool, Optional[str]]:
+    """(lot du canon, clone où le lire) — le clone est None dans le doute.
+
+    #3331 : un lot `canon/<lot>-…` (#2511) ou dont la PR est celle d'un canon
+    a son gel dans le clone du canon, pas dans celui de son `app`.
+    #3350 : la PR nomme le dépôt parmi TOUS les canons lisibles. Sans
+    correspondance, un lot `canon/…` est un doute explicite — jamais le
+    premier canon configuré. Une branche `canon/…` sans PR n'est lisible que
+    si un seul canon est configuré ; plusieurs canons laissent un doute.
+    """
+    canon_branch = any(str(item.get(key) or "").strip().startswith(CANON_BRANCH_PREFIX)
+                       for key in ("branch", "branch_target"))
+    pr = _pr_slug(item)
+    if pr:
+        for path, slug in clones:
+            if slug == pr:
+                return True, path
+        if not canon_branch:
+            return False, None
+        # La PR nomme un dépôt : sans clone lisible de CE dépôt, un lot
+        # `canon/…` ne se lit pas dans un autre canon (ni dans le projet).
+        # Un canon seul dont l'`origin` est illisible ne peut ni confirmer ni
+        # infirmer la PR : la branche le désigne encore (#3331 conservé).
+        if len(clones) == 1 and not clones[0][1]:
+            return True, clones[0][0]
+        return True, None
+    if not canon_branch:
+        return False, None
+    return True, (clones[0][0] if len(clones) == 1 else None)
+
+
+def repository(cfg, item: dict) -> Optional[str]:
+    """Le chemin du dépôt du lot, ou None.
+
+    #3331 : le dépôt suit la **PR** du lot quand elle vit dans le dépôt du
+    canon — un lot `canon/…` a son gel dans le clone du canon de l'hôte, pas
+    dans le clone de son `app` (ni dans le dossier de travail de son assigné).
+    Sans clone du canon lisible, None : un doute explicite rendu par
+    l'appelant, jamais le mauvais dépôt qui répète « ce commit n'est pas là ».
+
+    #3350 : plusieurs canons peuvent être configurés ; le dépôt se choisit sur
+    le slug de la PR parmi TOUS les clones lisibles, jamais le premier canon.
+    Une PR de canon sans clone correspondant est un doute, pas un autre canon.
+
+    Sinon le dépôt du projet (`radar.projects`), comme avant ; une PR qui
+    nomme un AUTRE dépôt que celui du projet et dont aucun clone lisible n'est
+    connu rend None (doute), jamais le clone du projet. Jamais d'exception :
+    un hôte sans réglages radar n'a pas de dépôt à proposer, et l'appelant
+    rend un doute.
     """
     from . import radar
+    if cfg is None:
+        return None
+    is_canon, clone = _canon_lot(item, canon_clones(cfg))
+    if is_canon:
+        return clone
     name = str(item.get("app") or "").strip()
-    if cfg is None or not name:
-        return None
-    try:
-        project = radar.settings_of(cfg).projects.get(name)
-    except Exception:  # noqa: BLE001 - réglages radar illisibles : pas de dépôt
-        return None
-    return getattr(project, "repo", None) or None
+    project_repo = None
+    if name:
+        try:
+            project = radar.settings_of(cfg).projects.get(name)
+        except Exception:  # noqa: BLE001 - réglages radar illisibles : pas de dépôt
+            project = None
+        project_repo = getattr(project, "repo", None) or None
+    pr = _pr_slug(item)
+    if pr and project_repo:
+        # #3331 : une PR dans un AUTRE dépôt que celui du projet (le canon)
+        # ne se lit pas dans ce clone ; sans clone de ce dépôt, c'est un doute.
+        slug = plan_git._repo_slug(project_repo)
+        if slug and slug != pr:
+            return None
+    return project_repo
 
 
 def default_base(cfg, item: dict, repo: str, *, declared_only: bool = False) -> Optional[str]:

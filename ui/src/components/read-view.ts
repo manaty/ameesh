@@ -60,6 +60,9 @@ export abstract class ReadView extends LitElement {
   #unsubscribe: (() => void) | null = null;
   #timer: ReturnType<typeof setTimeout> | null = null;
   #again = false;
+  #lastLoad = 0;
+  /** Minimum between two automatic refreshes; a manual refresh is immediate. */
+  protected minRefreshMs = 1000;
   #configChanged = () => { this.#signature = []; this.#sync(); };
 
   override connectedCallback(): void {
@@ -103,16 +106,21 @@ export abstract class ReadView extends LitElement {
   }
   #schedule(): void {
     if (this.#timer !== null) return;
-    // Coalesce bursts: one bounded refresh instead of one request per row/event.
+    // Coalesce bursts: one bounded refresh instead of one request per row/event,
+    // and never re-arm a heavy view before `minRefreshMs` (#3395: with a 40 s
+    // progress snapshot, each event started another one and the view never
+    // settled).
+    const wait = Math.max(1000, this.minRefreshMs - (Date.now() - this.#lastLoad));
     this.#timer = setTimeout(() => {
       this.#timer = null;
       if (this.isConnected) void this.refresh();
-    }, 1000);
+    }, wait);
   }
   async refresh(): Promise<void> {
     const client = this.api;
     if (!client || !this.isConnected || (this.required && !this[this.required])) return;
     if (this.#abort) { this.#again = true; return; }
+    this.#lastLoad = Date.now();
     const abort = this.#abort = new AbortController();
     this.loading = true; this.error = "";
     try {

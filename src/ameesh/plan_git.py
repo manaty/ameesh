@@ -937,6 +937,22 @@ def content_retention(st, row: dict) -> dict | None:
     return None
 
 
+def dry_run_retention(db, st, row: dict, *, sha: str, repo: str | None) -> dict | None:
+    """La retenue qu'un relevé à blanc annonce : #2744 (blocked, hold), puis
+    #3022 (porte de production hors de la branche de prod) — la même que
+    `work.close_merged` appliquerait, sans verrou ni écriture. Le hold de
+    l'assigné levé par le contenu (#3219, `lift: True`) n'exempte pas de la
+    porte : sa retenue prime, sinon la levée est rendue."""
+    retention = content_retention(st, row)
+    if retention is None or retention.get("lift"):
+        from . import prod_gate
+        gate = prod_gate.check(st, row, sha=sha, repo=repo,
+                               cfg=getattr(db, "cfg", None))["retention"]
+        if gate is not None:
+            retention = gate
+    return retention
+
+
 def _hold_reason(hold: dict) -> str:
     """Le motif d'une retenue (`hold: <raison>`), sur une ligne."""
     reason = " ".join(str((hold or {}).get("note") or "").split())
@@ -1027,12 +1043,17 @@ def _wake_retention(db, row: dict, retention: dict, *, entry: dict, target: str)
             or recipient == work_mod.SYSTEM_SENDER:
         return
     ref = str(entry.get("ref") or entry.get("sha") or "")
+    lift = ("lift the hold (a state change or an `unhold:` note) and the next "
+            "content sweep will close it")
+    if retention.get("what") == "production":
+        # #3022 : c'est la présence sur la branche de prod qui ferme
+        lift = ("it closes once the fix reaches the production branch (release or "
+                "incident fix); a wrong mark is lifted by a `prod-gate lifted:` note")
     body = ("Lot #%d \"%s\": its frozen content is merged into %s (%s, %s), but the "
-            "closure is withheld: %s. The lot stays %s; lift the hold (a state change "
-            "or an `unhold:` note) and the next content sweep will close it."
+            "closure is withheld: %s. The lot stays %s; %s."
             % (int(row["id"]), row.get("title") or "", target,
                entry.get("how") or "?", ref[:12] or "?", retention["motif"],
-               row.get("state") or "?"))
+               row.get("state") or "?", lift))
     try:
         mail.send(db, work_mod.SYSTEM_SENDER, recipient, body, kind="event",
                   work_item_id=str(int(row["id"])),
@@ -1171,7 +1192,8 @@ def sync_merges(db, repo_dir: str, *, target: str | None = None, dry_run: bool =
             if dry_run:
                 # #2744 : la même retenue que la fermeture par le gel ;
                 # #3219 : celle de l'assigné est levée par le contenu.
-                retention = content_retention(st, row)
+                retention = dry_run_retention(db, st, row, sha=entry["ref"] or "",
+                                              repo=repo_dir)
                 if retention is not None and not retention.get("lift"):
                     mark_retained(entry, retention, target=composition["target"],
                                   dry_run=True)
@@ -1270,7 +1292,8 @@ def sync_merges(db, repo_dir: str, *, target: str | None = None, dry_run: bool =
                      ref=found_proof["ref"], sha=sha, result="open",
                      detail=found_proof["detail"])
         if dry_run:
-            retention = content_retention(st, row)
+            retention = dry_run_retention(db, st, row, sha=entry["ref"] or "",
+                                          repo=repo_dir)
             if retention is not None and not retention.get("lift"):
                 mark_retained(entry, retention, target=found_target, dry_run=True)
                 results.append(entry)
@@ -1672,20 +1695,26 @@ def merge_mentioning(repo: str, branch: str, head: str,
 
 
 def branch_probe(repo: str, branch: str, target: str, *, seen_head: str | None = None,
+                 seen_at: float | None = None,
                  since_ts: float | None = None) -> dict:
     """La branche est-elle entrée dans `target` ? Rend `{merged, how, ref, tip,
     ahead, detail}` ; `ahead` : la pointe a du travail absent de la cible
     (l'appelant la retient comme `branch_head`).
 
     #2654 : une livraison prouvée par la branche (pointe du clone ou tête vue)
-    n'est rendue qu'après lecture de sa tête sur la forge (`_remote_moved`)."""
+    n'est rendue qu'après lecture de sa tête sur la forge (`_remote_moved`).
+
+    #3326 : `seen_at` est l'instant (horloge de la base) où `branch_head` a
+    été enregistré. Une tête qui était déjà dans la cible à cet instant n'a
+    aucun commit propre : le reflog des refs de la cible le dit, et la preuve
+    « vu-ancestor » est refusée (`_was_ancestor_at_seen`)."""
     head = _commit(repo, target)
     if head is None:
         raise MergeProbeError("target %r not found in %s" % (target, repo))
     tip = _tip(repo, branch)
     out = {"merged": False, "how": None, "ref": None, "tip": tip, "ahead": False}
     found = _branch_probe(repo, branch, target, head, tip, out, seen_head=seen_head,
-                          since_ts=since_ts)
+                          seen_at=seen_at, since_ts=since_ts)
     if found["merged"] and found["how"] != "message":
         # la citation par une fusion de la cible ne dépend pas de la pointe
         return _remote_moved(repo, branch, target, out, found)
@@ -1693,10 +1722,28 @@ def branch_probe(repo: str, branch: str, target: str, *, seen_head: str | None =
 
 
 def _branch_probe(repo: str, branch: str, target: str, head: str, tip: str | None,
-                  out: dict, *, seen_head: str | None, since_ts: float | None) -> dict:
+                  out: dict, *, seen_head: str | None, seen_at: float | None,
+                  since_ts: float | None) -> dict:
+    # #3326 : la tête vue était-elle déjà une ancêtre de la cible quand le
+    # relevé l'a vue ? Sa date de commit ne le dit pas (une avance rapide la
+    # rend ancêtre après coup) ; le reflog de la cible, si. Le reflog n'est
+    # lu qu'avant de conclure (pas pour une branche simplement en avance).
+    stale: list[bool | None] = [None]
+
+    def seen_stale() -> bool:
+        if stale[0] is None:
+            stale[0] = bool(seen_head and seen_at and _was_ancestor_at_seen(
+                repo, seen_head, target, seen_at))
+        return bool(stale[0])
+
+    def refusal() -> str | None:
+        if not seen_stale():
+            return None
+        return ("last commit seen ahead (%s) was already an ancestor of %s when the "
+                "sweep saw it: no work of its own" % (seen_head[:12], target))
 
     def seen() -> dict | None:
-        if not seen_head:
+        if not seen_head or seen_stale():
             return None
         found = probe(repo, seen_head, target, lot=branch_lot(branch))
         if found["merged"]:
@@ -1720,7 +1767,8 @@ def _branch_probe(repo: str, branch: str, target: str, head: str, tip: str | Non
         return dict(out, detail=why)
 
     if tip is None:
-        return seen() or mention("branch %s not found (neither local nor origin/)" % branch)
+        return seen() or mention(
+            refusal() or "branch %s not found (neither local nor origin/)" % branch)
     if _git(repo, "merge-base", "--is-ancestor", tip, head).returncode == 0:
         lot = branch_lot(branch)
         stopped = reverted_content(repo, tip, target, lot=lot, branch=branch)
@@ -1736,7 +1784,9 @@ def _branch_probe(repo: str, branch: str, target: str, head: str, tip: str | Non
             # « ancestor » n'est retenue que si cette pointe a déjà été vue en
             # avance pour le lot (`branch_head`), ou qu'une fusion de la cible
             # cite la branche ; sinon le lot ne bouge pas.
-            if seen_head and _commit(repo, seen_head) == tip:
+            # #3326 : une tête vue alors qu'elle était déjà dans la cible ne
+            # prouve rien non plus (cible périmée au relevé).
+            if seen_head and not seen_stale() and _commit(repo, seen_head) == tip:
                 return dict(out, merged=True, how="ancestor", ref=tip,
                             detail="%s (%s) entered %s through a merge commit; "
                                    "its tip was seen ahead for this lot"
@@ -1745,6 +1795,7 @@ def _branch_probe(repo: str, branch: str, target: str, head: str, tip: str | Non
             if found:
                 return found
             cited = mention(
+                refusal() or
                 "%s has no work of its own: its tip %s is an ancestor of %s through "
                 "a merge commit, but it was never seen ahead for this lot"
                 % (branch, tip[:12], target))
@@ -1755,8 +1806,9 @@ def _branch_probe(repo: str, branch: str, target: str, head: str, tip: str | Non
                             detail="%s (%s) entered %s through a merge commit "
                                    "that cites it" % (branch, tip[:12], target))
             return cited
-        return seen() or mention("%s has no work of its own: its tip %s is on the "
-                                 "line of %s" % (branch, tip[:12], target))
+        return seen() or mention(
+            refusal() or "%s has no work of its own: its tip %s is on the line of %s"
+                       % (branch, tip[:12], target))
     out["ahead"] = True
     found = probe(repo, tip, target, lot=branch_lot(branch))
     if found["merged"]:
@@ -2182,6 +2234,130 @@ def _was_ancestor_at(repo: str, sha: str, target: str, when) -> bool:
     return bool(tip) and _is_ancestor(repo, sha, tip)
 
 
+# ---------------------------------------------------------------------------
+# #3326 : une tête « vue en avance » contre une cible périmée
+# ---------------------------------------------------------------------------
+#
+# `branch_head` ne vaut que si la pointe de la branche n'était pas déjà dans
+# la cible quand le balayage l'a vue. Un clone peut lire une cible en retard
+# (fetch best-effort, ref locale figée) : la pointe est alors « en avance »
+# alors qu'elle n'est qu'un commit déjà livré de la cible. Une fois la cible
+# rafraîchie, `seen()` la voyait ancêtre et concluait « vu-ancestor » sans
+# qu'un commit propre n'ait jamais existé (#2410).
+
+
+def _target_refs(repo: str, target: str) -> list[str]:
+    """La cible et son homologue publié quand elle est locale (#3326).
+
+    `main` et `origin/main` désignent la même branche d'intégration : le
+    clone d'un agent peut avoir l'une en retard et l'autre à jour. Une cible
+    déjà `origin/…` n'a pas d'homologue local : la branche locale peut porter
+    des fusions non poussées, elle ne prouve rien."""
+    refs = [target]
+    name = _target_branch(target)
+    if not name or str(target).startswith(("refs/remotes/", "origin/")):
+        return refs
+    published = published_target(repo, target)
+    if published != target and _commit(repo, published):
+        refs.append(published)
+    return refs
+
+
+def _ref_value_at(repo: str, ref: str, when) -> str | None:
+    """Le commit de `ref` à l'instant `when` (epoch), d'après son reflog.
+
+    Une entrée datée de la même seconde que `when` n'est pas retenue : elle
+    peut avoir suivi l'observation (une avance rapide juste après le relevé).
+    None si le reflog ne remonte pas jusque-là : l'appelant ne conclut alors
+    rien de l'histoire de la ref."""
+    try:
+        stamp = int(float(when))
+    except (TypeError, ValueError):
+        return None
+    if stamp <= 0:
+        return None
+    out = _out(repo, "reflog", "show", "--date=unix", "--format=%H%x00%gd", ref)
+    for line in (out or "").splitlines():
+        sha, _sep, selector = line.partition("\x00")
+        match = re.search(r"@\{(\d+)\}", selector)
+        if not match or not _SHA_RE.match(sha):
+            continue
+        if int(match.group(1)) < stamp:
+            return sha
+    return None
+
+
+def _was_ancestor_at_seen(repo: str, sha: str, target: str, when) -> bool:
+    """#3326 : `sha` était-il déjà dans la cible quand elle a été vue ?
+
+    Même question que `_was_ancestor_at` (#2786) pour les gels, mais lue
+    dans le reflog et non par la date des commits : une avance rapide rend
+    rétroactivement la tête vue une ancêtre de la cible, et la date du commit
+    ne dit pas si elle y était AVANT l'observation. Le reflog, lui, date la
+    mise à jour de la ref. Une ref sans reflog, ou dont le reflog ne remonte
+    pas à `when`, ne conclut pas : le relevé garde son ancien comportement."""
+    for ref in _target_refs(repo, target):
+        was = _ref_value_at(repo, ref, when)
+        if was and _is_ancestor(repo, sha, was):
+            return True
+    return False
+
+
+def _published_target_state(repo: str, sha: str, target: str,
+                            cache: dict) -> tuple[str, str | None]:
+    """#3326 : la pointe `sha` est-elle dans la cible publiée ?
+
+    Vérifié avant d'enregistrer `branch_head` : si la forge porte déjà la
+    pointe, ce n'est pas un travail propre de la branche, même quand la ref
+    du clone est en retard (fetch best-effort). Trois réponses, jamais deux :
+    `("contained", ref)`, `("absent", None)` quand l'absence est **prouvée**,
+    ou `("unknown", pourquoi)` quand elle ne l'est pas (forge illisible, tête
+    publiée absente du clone) — l'appelant ne doit alors rien enregistrer :
+    une cible qu'on n'a pas pu lire n'est pas une preuve de non-appartenance
+    (relecture cx1 : forge C, clone A, pointe B présente, C absente).
+
+    Lecture `git ls-remote` au plus une fois par relevé et par (dépôt,
+    branche) via `cache` ; la tête publiée manquante est rapatriée par le
+    fetch borné de #1772 quand le clone est partiel, puis relue."""
+    name = _target_branch(target)
+    if not name:
+        return "unknown", "the target %r names no branch" % target
+    for ref in _target_refs(repo, target):
+        if ref == target:
+            continue
+        tip = _commit(repo, ref)
+        if tip and _is_ancestor(repo, sha, tip):
+            return "contained", ref
+    key = (repo, name)
+    if key not in cache:
+        kind, value = _remote_head(repo, name)
+        cache[key] = (kind, value)
+    kind, published = cache[key]
+    if kind == "local":
+        # pas de forge : la cible locale est la référence, et la pointe en est
+        # déjà absente (l'appelant est dans la branche « en avance »).
+        return "absent", None
+    if kind == "absent":
+        if str(target).startswith(("refs/remotes/", "origin/")):
+            return "unknown", ("origin/%s is absent from the forge while the clone "
+                               "still names it" % name)
+        return "absent", None
+    if kind == "error":
+        return "unknown", published
+    if published == sha:
+        return "contained", "origin/" + name
+    tip = _commit(repo, published)
+    if tip is None:
+        _fetch_missing(repo, published, target)
+        tip = _commit(repo, published)
+    if tip is None:
+        return "unknown", ("the published head %s of %s is absent from the clone"
+                           % (published[:12], name))
+    if _is_ancestor(repo, sha, tip):
+        return "contained", "origin/" + name
+    return "absent", None
+
+
 def _content_ancestor(repo: str, sha: str, target: str, *,
                       at_ts: float | None = None, absent=()) -> bool:
     """#1005 : le commit gelé est-il ancêtre de la cible ? C'est la preuve par
@@ -2329,6 +2505,7 @@ def _sweep_target(repo: str, lot: int, row: dict, branch: str | None, target: st
                  "detail": "no merge commit of %s delivers the lot" % target}
     elif branch:
         found = branch_probe(repo, branch, target, seen_head=row.get("branch_head"),
+                             seen_at=row.get("branch_head_ts"),
                              since_ts=row.get("created_ts"))
     if repo not in hashes:
         hashes[repo] = lot_ref_hash(repo)
@@ -2677,23 +2854,46 @@ def _repo_slug(repo: str) -> str | None:
 
 
 def _expected_repo(row: dict) -> tuple[str | None, str | None]:
-    """(slug attendu, nom de dépôt attendu) d'un lot, d'après sa référence
-    d'issue, sinon son `app`."""
-    ref = (row.get("issue_ref") or "").strip()
-    match = _ISSUE_SLUG_RE.match(ref) or _ISSUE_URL_RE.match(ref)
-    if match:
-        return ("%s/%s" % (match.group(1), match.group(2))).casefold(), \
-            match.group(2).casefold()
+    """(slug attendu, nom de dépôt attendu) d'un lot, d'après sa PR, sinon sa
+    référence d'issue, sinon son `app`.
+
+    #3331 : la PR dit où vivent la branche et le gel — un lot du canon
+    (`manaty/home#N`) a son issue dans ameesh et sa PR dans le dépôt du
+    canon ; lire l'issue d'abord faisait choisir le clone ameesh."""
+    for key in ("pr_ref", "issue_ref"):
+        ref = (row.get(key) or "").strip()
+        match = _ISSUE_SLUG_RE.match(ref) or _ISSUE_URL_RE.match(ref)
+        if match:
+            return ("%s/%s" % (match.group(1), match.group(2))).casefold(), \
+                match.group(2).casefold()
     app = (row.get("app") or "").strip().casefold()
     return None, app or None
 
 
 def _local_clones(db, host: str | None) -> list[tuple[str, str, dict]]:
     """Les clones git locaux connus du registre sur cet hôte (dossier, slug,
-    ligne d'agent), une lecture par relevé."""
+    ligne d'agent), plus le clone du canon configuré (#3331 : un lot du canon
+    se lit là, pas dans le dossier de travail de son assigné), une lecture par
+    relevé."""
     from . import registry
     found = []
     seen: set[str] = set()
+    cfg = getattr(db, "cfg", None)
+    local_host = str(getattr(cfg, "host", "") or "") if cfg is not None else ""
+    if cfg is not None and (host is None or not local_host or host == local_host):
+        from . import canon as canon_mod
+        try:
+            entries = canon_mod.configured(cfg)
+        except Exception:  # noqa: BLE001 - canon illisible : rien de plus à lire
+            entries = ()
+        for entry in entries:
+            cwd = os.path.expanduser(str(getattr(entry, "path", "") or ""))
+            if not cwd or cwd in seen or not os.path.isdir(cwd):
+                continue
+            slug = _repo_slug(cwd)
+            if slug:
+                seen.add(cwd)
+                found.append((cwd, slug, {}))
     for agent_row in registry.overview(db):
         if host is not None and (agent_row.get("host") or "") != host:
             continue
@@ -2838,6 +3038,7 @@ def sync_branches(db, *, host: str | None = None, agents=None, dry_run: bool = F
     regs: dict = {}                          # une lecture du registre par assigné
     bodies: dict = {}                        # (dépôt, PR) → corps, ou l'erreur
     refreshed: dict = {}                     # #2302 : (dépôt, remote) → erreur de fetch
+    fresh_heads: dict = {}                   # #3326 : (dépôt, branche) → tête publiée
     clones = None                            # #2302 : clones locaux, lus une fois
     sweep = {"reads": 0, "failed": set()}    # lectures de corps de ce relevé
     pr_body = pr_body or gh_pr_body
@@ -3038,21 +3239,44 @@ def sync_branches(db, *, host: str | None = None, agents=None, dry_run: bool = F
             stale = row.get("branch_head_ts") is None or (
                 row.get("partial_merge") and (row.get("partial_seen_ts") is None
                                               or row["branch_head_ts"] <= row["partial_seen_ts"]))
-            if branch and found["ahead"] and found["tip"] and not dry_run \
+            if branch and found["ahead"] and found["tip"] \
                     and (found["tip"] != row.get("branch_head") or stale):
-                # #346 r2 : une pointe inchangée relevée avant la fusion
-                # partielle l'est de nouveau, puisqu'elle est encore là
-                if implicit:
-                    # L118b : la branche implicite devient celle du lot (journal) ;
-                    # #2102 : sauf détachement ou branche posés pendant le relevé
-                    work_mod.attach_implicit_branch(
-                        db, lot, branch, actor=actor or "git:%s" % target,
-                        source="the merge sweep: lot/%d branch" % lot)
-                st.work.set_branch_head(lot, branch, found["tip"])
+                # #3326 : une cible en retard (fetch best-effort) fait voir en
+                # avance une pointe que la forge porte déjà : ce n'est pas un
+                # travail propre, rien n'est enregistré, le lot reste ouvert.
+                # Une cible illisible ou une tête publiée absente du clone ne
+                # prouve pas l'absence : l'observation n'est pas enregistrée
+                # (relecture cx1 : distinguer « absent » de « inconnu »).
+                state, detail = _published_target_state(
+                    repo, found["tip"], target, fresh_heads)
+                if state == "contained":
+                    entry["how"] = "no-work"
+                    if entry["result"] != "off-target":
+                        entry["detail"] = (
+                            "%s (%s) is already in %s, read fresh: no work of "
+                            "its own (the clone's target %s is behind)"
+                            % (branch, found["tip"][:12], detail, target))
+                elif state == "unknown":
+                    entry["how"] = "unverified"
+                    if entry["result"] != "off-target":
+                        entry["detail"] = (
+                            "%s (%s) is not recorded: the published target %s "
+                            "cannot be read (%s)"
+                            % (branch, found["tip"][:12], target, detail))
+                elif not dry_run:
+                    # #346 r2 : une pointe inchangée relevée avant la fusion
+                    # partielle l'est de nouveau, puisqu'elle est encore là
+                    if implicit:
+                        # L118b : la branche implicite devient celle du lot (journal) ;
+                        # #2102 : sauf détachement ou branche posés pendant le relevé
+                        work_mod.attach_implicit_branch(
+                            db, lot, branch, actor=actor or "git:%s" % target,
+                            source="the merge sweep: lot/%d branch" % lot)
+                    st.work.set_branch_head(lot, branch, found["tip"])
             results.append(entry)
             continue
         if dry_run:
-            retention = content_retention(st, row)
+            retention = dry_run_retention(db, st, row, sha=found["ref"] or "", repo=repo)
             if retention is not None and not retention.get("lift"):
                 mark_retained(entry, retention, target=target, dry_run=True)
                 results.append(entry)

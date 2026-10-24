@@ -85,7 +85,7 @@ class CleanupAlertIdentityTest(PgTestCase):
 
         def observe():
             _age_tree(path, 3 * 86400)
-            with mock.patch.object(hk, "worktree_in_use", return_value=""):
+            with mock.patch.object(hk, "worktree_holders", return_value=(False, "")):
                 entries, _plan = hk._worktree_pass(
                     self.db, "pc", dry_run=False, protected=set(), now=time.time())
             self.assertEqual([e["action"] for e in entries], ["kept"])

@@ -18,7 +18,10 @@ that caller:
   name, an absent piece or a malformed value refuses by name, never by a
   fallback;
 * the absolute reservation deadline is compiled from the configuration
-  (``deadline_minutes``), never from a hard-coded duration.
+  (``deadline_minutes``), never from a hard-coded duration;
+* each passage compares the pinned commit with the canon commit the gate reads
+  on this host (``train_canon``, #2914): a drift is recorded in the shadow
+  plan and alerted to the pilot, and refuses a new active composition.
 
 Two modes are assembled:
 
@@ -47,10 +50,10 @@ from dataclasses import dataclass
 from functools import partial
 from datetime import datetime
 
-from . import (mechanics, merge_queue, packet_reservation, plan_git, radar,
-               resolutions, review_provenance, train, train_contracts,
-               train_initial, train_policy, train_reservation, train_runner,
-               train_shadow)
+from . import (config as config_mod, mechanics, merge_queue, packet_reservation,
+               plan_git, radar, resolutions, review_provenance, train,
+               train_canon, train_contracts, train_initial, train_policy,
+               train_reservation, train_runner, train_shadow)
 from .config import NAME_RE
 
 #: schema of the host configuration's ``train`` block
@@ -238,6 +241,9 @@ class Assembly:
     reason: str
     #: L165 (EP5): the elected role whose lease gates every passage, or None.
     role: str | None = None
+    #: #3366: re-read the canonical pin from the host configuration. The
+    #: runner's train service calls it before each passage; None on a bench.
+    refresh: object | None = None
 
     @property
     def active(self):
@@ -266,8 +272,169 @@ def assemble(cfg, *, notify=None) -> Assembly:
                      for project in settings.projects)
     lease = train_runner.HostLease(cfg)
     gate = ("role %s" % settings.role) if settings.role else "host pin"
+
+    def refresh():
+        # #3366: read the same configuration file the service was assembled
+        # from, not whatever the ambient environment names later. The assembled
+        # settings stay the reference: anything but the pin changing is a
+        # restart, never a silent half-reload of a running service.
+        return reload(passages, expected=settings, host=cfg.host,
+                      config_path=getattr(cfg, "config_path", "") or "")
     return Assembly(settings, passages, lease, "%s mode, %d passage(s), %s"
-                    % (settings.mode, len(passages), gate), role=settings.role)
+                    % (settings.mode, len(passages), gate), role=settings.role,
+                    refresh=refresh)
+
+
+#: #3366: a canon diff touching one of these files changes the train's rules:
+#: the pin cannot be requalified mechanically, a pilot must review the change.
+REQUALIFY_GUARD = ("processus/mecanique.yaml", "federation.yaml")
+
+
+def project_of(cfg, name):
+    """The validated train project named ``name`` (refusal by name otherwise).
+
+    The host check is the assembly's: without an elected role, a command run
+    on another host would edit a configuration whose train service does not
+    execute here.
+    """
+    raw = getattr(cfg, "train", None) or {}
+    if not raw:
+        raise ConfigurationError("no `train` configuration")
+    settings = Settings.parse(raw)
+    if settings.role is None and (getattr(cfg, "host", "") or "").strip() != settings.host:
+        raise ConfigurationError("`train.host` designates %s, this host is %s"
+                                 % (settings.host, getattr(cfg, "host", "") or "?"))
+    for spec in settings.projects:
+        if spec.name == name:
+            return spec
+    raise ConfigurationError("`train.projects.%s`: absent from the configuration" % name)
+
+
+#: #3366: assembled inputs a running service never reloads. Only
+#: ``canon_commit`` moves at each passage; changing anything else is a
+#: restart, never a silent half-reload of a service that keeps composing.
+RESTART_FIELDS = ("repo", "target", "github", "canon", "ci_contract",
+                  "provenance", "reservation", "deadline_minutes", "candidate",
+                  "initial_since")
+
+
+def _restart(where, field, before, after):
+    raise ConfigurationError(
+        "`%s.%s` changed since the service started (%r -> %r): restart the "
+        "runner; only `canon_commit` is re-read at each passage"
+        % (where, field, before, after))
+
+
+def _same_assembly(expected, fresh):
+    """Refuse any assembly input changed since startup (#3366).
+
+    The pin is the only hot-reloaded value: a service that silently kept its
+    old mode, target or provider after a pilot edited the configuration would
+    compose a different train than the one declared. Each difference names
+    itself and requires a deliberate restart.
+    """
+    if fresh.mode != expected.mode:
+        _restart("train", "mode", expected.mode, fresh.mode)
+    if fresh.role != expected.role:
+        _restart("train", "role", expected.role, fresh.role)
+    if fresh.host != expected.host:
+        _restart("train", "host", expected.host, fresh.host)
+    before = {spec.name: spec for spec in expected.projects}
+    after = {spec.name: spec for spec in fresh.projects}
+    if set(before) != set(after):
+        added = sorted(set(after) - set(before))
+        removed = sorted(set(before) - set(after))
+        raise ConfigurationError(
+            "`train.projects` changed since the service started (added: %s; "
+            "removed: %s): restart the runner"
+            % (", ".join(added) or "none", ", ".join(removed) or "none"))
+    for name in sorted(before):
+        for field in RESTART_FIELDS:
+            old, new = getattr(before[name], field), getattr(after[name], field)
+            if old != new:
+                _restart("train.projects.%s" % name, field, old, new)
+
+
+def reload(passages, *, expected=None, load=None, host=None, config_path=None):
+    """#3366: re-read the effective ``train.projects.<p>.canon_commit``.
+
+    The service used to keep the pin assembled at startup, so a requalified pin
+    only took effect after a runner restart. Here the **effective** host
+    configuration is loaded again (profile inheritance included), its train
+    block is validated with the same rules as :func:`assemble`, and every
+    passage follows its project's exact commit. A pin that is no longer a
+    full commit resolvable with the two regular canon files refuses by name:
+    the old pin is never silently kept, and the caller retries.
+
+    Only ``canon_commit`` is refreshed. With ``expected`` (the settings the
+    service was assembled from), every other assembly input — repo, canon
+    path, target, mode, role, providers, deadline, project set — that changed
+    refuses by name and waits for a restart. The whole reload is validated
+    before any passage is mutated, so a refused reload leaves every passage
+    on its previous pin.
+    """
+    if load is None:
+        env = (dict(os.environ, AMEESH_CONFIG=config_path)
+               if config_path else None)
+        fresh = config_mod.load(env)
+    else:
+        fresh = load()
+    raw = getattr(fresh, "train", None) or {}
+    if not raw:
+        raise ConfigurationError("no `train` configuration")
+    settings = Settings.parse(raw)
+    this_host = str(host if host is not None else getattr(fresh, "host", "") or "").strip()
+    if settings.role is None and this_host != settings.host:
+        raise ConfigurationError("`train.host` designates %s, this host is %s"
+                                 % (settings.host, this_host or "?"))
+    if expected is not None:
+        _same_assembly(expected, settings)
+    by_name = {spec.name: spec for spec in settings.projects}
+    pending = []
+    for passage in passages or ():
+        project = getattr(passage, "project", None)
+        name = str(getattr(project, "name", "") or "").strip()
+        spec = by_name.get(name)
+        if spec is None:
+            raise ConfigurationError("`train.projects.%s`: project removed from the "
+                                     "configuration" % (name or "?"))
+        where = "train.projects.%s" % name
+        commit = _canon_commit(spec, where)
+        previous = str(getattr(passage, "policy_commit", "") or "")
+        if previous == commit and str(getattr(passage, "policy_path", "") or "") == spec.canon:
+            continue
+        pending.append((passage, name, spec.canon, commit, previous))
+    changes = []
+    for passage, name, canon_path, commit, previous in pending:
+        passage.policy_path = canon_path
+        passage.policy_commit = commit
+        canon = getattr(passage, "canon", None)
+        if canon is not None:
+            canon.pin = commit
+        changes.append({"project": name, "previous": previous, "pin": commit,
+                        "canon": canon_path})
+    return changes
+
+
+def canon_diff(canon, pin, gate):
+    """The paths changed by the canon between ``pin`` and ``gate``.
+
+    Both commits must resolve in ``canon``. The command uses the #3366 guard
+    on the result: a diff touching ``REQUALIFY_GUARD`` is never applied.
+    """
+    pin = str(pin or "").strip().lower()
+    gate = str(gate or "").strip().lower()
+    if not _FULL_SHA.fullmatch(pin) or not _FULL_SHA.fullmatch(gate):
+        raise ConfigurationError("canon requalification needs two full commit ids")
+    if not os.path.isdir(canon):
+        raise ConfigurationError("canon directory not found: %s" % canon)
+    proc = resolutions._run(canon, "diff", "--name-only", pin, gate)
+    if proc.returncode:
+        raise ConfigurationError(
+            "cannot read the canon diff %s..%s in %s: %s"
+            % (pin[:12], gate[:12], canon,
+               " ".join((proc.stderr or proc.stdout or "").split())[:240]))
+    return [line.strip() for line in resolutions._text(proc).splitlines() if line.strip()]
 
 
 def _passage(cfg, spec: ProjectConfig, mode, report):
@@ -314,16 +481,32 @@ def _passage(cfg, spec: ProjectConfig, mode, report):
                  if spec.candidate else None)
     initial = (INITIAL_HISTORY["activation-boundary"](spec.initial_since)
                if spec.candidate else None)
+    # #2914: at each passage, the pin is compared with the canon commit the
+    # gate reads on this host; never followed automatically (#1467).
+    # #3366: the rules closure follows the passage's live pin, not the commit
+    # frozen at assembly: a requalified pin must also requalify the rules.
+    canon = train_canon.Watch(spec.name, commit,
+                              partial(train_canon.gate_commit, cfg=cfg,
+                                      project=spec.name),
+                              pilot=train_canon.pilot_of(cfg, spec.name))
     if mode == "shadow":
-        return train_shadow.Passage(
+        passage = train_shadow.Passage(
             cfg, project, policy_path=spec.canon, policy_commit=commit,
             workflows=workflows, provider=provider, mechanics=mechanics,
-            repository=repo, candidate=candidate, initial=initial, notify=report)
-    passage = train_runner.Passage(
-        cfg, project, owner=cfg.runner, policy=train.Policy(enabled=True),
-        policy_path=spec.canon, policy_commit=commit, workflows=workflows,
-        provider=provider, mechanics=mechanics, notify=lambda reason, state: report(reason),
-        reservation=reservation, candidate=candidate, initial=initial)
+            repository=repo, candidate=candidate, initial=initial, notify=report,
+            canon=canon)
+    else:
+        passage = train_runner.Passage(
+            cfg, project, owner=cfg.runner, policy=train.Policy(enabled=True),
+            policy_path=spec.canon, policy_commit=commit, workflows=workflows,
+            provider=provider, mechanics=mechanics, notify=lambda reason, state: report(reason),
+            reservation=reservation, candidate=candidate, initial=initial, canon=canon)
+
+    def rules(db, passage=passage):
+        return train_canon.gate_rules_gap(db, cfg, spec.name,
+                                          canon_path=passage.policy_path,
+                                          pin=passage.canon.pin)
+    canon.rules = rules
     return passage
 
 

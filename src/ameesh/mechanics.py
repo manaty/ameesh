@@ -26,7 +26,14 @@ mécanique, ce que l'outillage exécute sans agent :
 - `backlog.lot_min_value` (#2584, bloc optionnel) : la valeur à partir de
   laquelle un défaut non bloquant devient un lot (canon §2 l.129, owner
   19/10/2026) ; en dessous, il rejoint le panier de son chantier. Bloc absent :
-  `None`, et la route du panier reste inactive — aucun seuil n'est supposé.
+  `None`, et la route du panier reste inactive — aucun seuil n'est supposé ;
+- `staging.waiting_lots_min`, `before_cutoff_seconds`, `before_packet_seconds`
+  (#3291, bloc optionnel) : le seuil de lots retenus et les marges d'un
+  déploiement staging hors créneau (canon §11 bis) ; bloc absent : `None`.
+- `projects.<projet>.production.branch` (#3022, canon §5, décision owner
+  #122895) : la branche de prod d'un projet, où un lot de porte de production
+  (`prod_gate`) doit être présent pour se fermer. Absente : un tel lot n'est
+  jamais fermé par une fusion constatée, aucune branche n'est supposée.
 
 Les classes sensibles et le nombre d'avis par chemin ne sont pas répétés : ils
 viennent de `federation.yaml` (`review_policies.risk_classes` et
@@ -74,8 +81,12 @@ _LABEL = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 _SHA = re.compile(r"^([0-9a-f]{40}|[0-9a-f]{64})$")
 
 _DOCUMENT_KEYS = ("schema", "timezone", "cutoffs", "packets", "build", "ci", "reviews",
-                  "merge", "prevalidation", "backlog", "projects")
-_OVERRIDE_KEYS = ("timezone", "cutoffs", "packets", "build", "ci")
+                  "merge", "prevalidation", "backlog", "staging", "projects")
+_OVERRIDE_KEYS = ("timezone", "cutoffs", "packets", "build", "ci", "production")
+_PRODUCTION_KEYS = ("branch",)
+#: un nom de branche Git simple (`main`, `release/prod`) : ni `..`, ni `@{`,
+#: ni fin en `/`, `.` ou `.lock` — jamais une ref arbitraire ni un commit
+_BRANCH = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]*$")
 _PACKETS_KEYS = ("cutoffs",)
 #: classes du plan L161f qu'un bloc `prevalidation` peut sélectionner
 PREVALIDATION_CLASSES = ("P0", "P1", "P2", "P3")
@@ -87,6 +98,9 @@ _REVIEWS_KEYS = ("families", "exclude_author_family", "distinct_families",
                  "light_reviews")
 _MERGE_KEYS = ("named_fire", "repeat_freeze", "on_green_packet", "post_merge_red")
 _BACKLOG_KEYS = ("lot_min_value",)
+#: #3291 : clés du bloc optionnel `staging` (déploiement hors créneau)
+_STAGING_KEYS = ("waiting_lots_min", "before_cutoff_seconds",
+                 "before_packet_seconds")
 #: bornes du score de valeur d'un élément de backlog (`backlog.add`)
 _VALUE_SCORE = (1, 100)
 
@@ -112,6 +126,8 @@ class ProjectOverride:
     ci_incident_label: str | None = None
     ci_environment_red: str | None = None
     ci_faulty_lot: str | None = None
+    #: #3022 : la branche de prod du projet (`production.branch`)
+    production_branch: str | None = None
 
 
 @dataclass(frozen=True)
@@ -145,6 +161,20 @@ class Prevalidation:
 
 
 @dataclass(frozen=True)
+class Staging:
+    """#3291: optional canon rule for staging outside the release cutoffs."""
+
+    waiting_lots_min: int
+    before_cutoff_seconds: int
+    before_packet_seconds: int
+
+    def to_dict(self) -> dict:
+        return {"waiting_lots_min": self.waiting_lots_min,
+                "before_cutoff_seconds": self.before_cutoff_seconds,
+                "before_packet_seconds": self.before_packet_seconds}
+
+
+@dataclass(frozen=True)
 class Document:
     """Le document global compilé et validé, sans politique de revue."""
 
@@ -172,12 +202,24 @@ class Document:
     prevalidation: Prevalidation | None = None
     #: #2584 : seuil de lot d'un défaut non bloquant ; None = bloc absent
     backlog_lot_min_value: int | None = None
+    staging: Staging | None = None
 
     def override(self, project: str) -> ProjectOverride | None:
         for item in self.overrides:
             if item.name == project:
                 return item
         return None
+
+    def production_branch(self, project: str) -> str:
+        """#3022 : la branche de prod déclarée du projet, sinon refuse.
+
+        Aucun repli : un projet sans `production.branch` n'a pas de branche de
+        prod connue, et le consommateur (`prod_gate`) retient la fermeture."""
+        override = self.override(project)
+        if override is None or not override.production_branch:
+            raise MechanicsError("%s: projects.%s.production.branch is not declared"
+                                 % (PATH, project))
+        return override.production_branch
 
     def to_dict(self) -> dict:
         payload = {
@@ -205,6 +247,8 @@ class Document:
             payload["prevalidation"] = self.prevalidation.to_dict()
         if self.backlog_lot_min_value is not None:
             payload["backlog"] = {"lot_min_value": self.backlog_lot_min_value}
+        if self.staging is not None:
+            payload["staging"] = self.staging.to_dict()
         return payload
 
 
@@ -254,6 +298,7 @@ class Mechanics:
     source: str = ""
     #: #2584 : seuil de lot d'un défaut non bloquant ; None = bloc absent
     backlog_lot_min_value: int | None = None
+    staging: Staging | None = None
 
     # -- coupures -----------------------------------------------------------
 
@@ -422,6 +467,8 @@ class Mechanics:
             payload["prevalidation"] = self.prevalidation.to_dict()
         if self.backlog_lot_min_value is not None:
             payload["backlog"] = {"lot_min_value": self.backlog_lot_min_value}
+        if self.staging is not None:
+            payload["staging"] = self.staging.to_dict()
         if self.source:
             payload["source"] = self.source
         return payload
@@ -624,6 +671,18 @@ def _backlog(value, where: str) -> int:
     return threshold
 
 
+def _production(value, where: str) -> str:
+    """Le bloc `production` d'un projet (#3022) : sa branche de prod, nom de
+    branche Git simple, jamais un commit ni une ref complète."""
+    data = _mapping(value, where, _PRODUCTION_KEYS)
+    branch = data.get("branch")
+    if (not isinstance(branch, str) or not _BRANCH.fullmatch(branch)
+            or ".." in branch or "//" in branch or branch.endswith((".", "/", ".lock"))
+            or branch.startswith(("refs/", "origin/")) or _SHA.fullmatch(branch)):
+        raise MechanicsError("%s.branch: a plain branch name is required" % where)
+    return branch
+
+
 def _families(value, where: str) -> tuple[str, ...]:
     if not isinstance(value, list) or not value:
         raise MechanicsError("%s: a non-empty list of families is required" % where)
@@ -652,6 +711,7 @@ def _overrides(value, where: str) -> tuple[ProjectOverride, ...]:
         packet_cutoffs = None
         max_in_build = None
         packet = label = environment = faulty = None
+        production = None
         if "timezone" in data:
             timezone = _timezone(data["timezone"], scope + ".timezone")
         if "cutoffs" in data:
@@ -665,13 +725,22 @@ def _overrides(value, where: str) -> tuple[ProjectOverride, ...]:
                                          scope + ".build.max_in_build")
         if "ci" in data:
             packet, label, environment, faulty = _ci(data["ci"], scope + ".ci")
+        if "production" in data:
+            production = _production(data["production"], scope + ".production")
         out.append(ProjectOverride(name=name, timezone=timezone, cutoffs=cutoffs,
                                    packet_cutoffs=packet_cutoffs,
                                    max_in_build=max_in_build, ci_packet=packet,
                                    ci_incident_label=label,
                                    ci_environment_red=environment,
-                                   ci_faulty_lot=faulty))
+                                   ci_faulty_lot=faulty,
+                                   production_branch=production))
     return tuple(out)
+
+
+def _staging(value, where: str) -> Staging:
+    data = _mapping(value, where, _STAGING_KEYS)
+    return Staging(*(_positive_int(data.get(key), where + "." + key)
+                     for key in _STAGING_KEYS))
 
 
 def compile_document(text: str, *, source: str = PATH) -> Document:
@@ -739,6 +808,8 @@ def compile_document(text: str, *, source: str = PATH) -> Document:
         prevalidation=(_prevalidation(parsed["prevalidation"],
                                       source + ".prevalidation") if has_block else None),
         backlog_lot_min_value=lot_min_value,
+        staging=(_staging(parsed["staging"], source + ".staging")
+                 if "staging" in parsed else None),
     )
 
 
@@ -1001,4 +1072,5 @@ def load(repo: str, commit: str, project: str, *,
         prevalidation=document.prevalidation,
         source="%s@%s:%s" % (repo, commit, PATH),
         backlog_lot_min_value=document.backlog_lot_min_value,
+        staging=document.staging,
     )

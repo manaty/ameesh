@@ -121,6 +121,23 @@ transition. The storage pre-selects on the same motifs as this module
 so no ordinary note is fetched, and a transition note is stored stripped —
 what was authenticated is what is stored and read.
 
+The packet candidates (`packet_candidates.inventory`, `scripts/paquet-candidats.py`)
+read these active **pilot** holds with the same authority: a held lot is not
+ready for the hourly package, and the candidate list gives `pilot-hold` as its
+motif (canon §11 bis). The composer can overtake it only with an explicit
+`--hold-override <lot> --hold-reason "…"`, and that gesture is journaled on the
+lot (`hold-override: …`); the pilot's hold itself is unchanged, so the next
+calculation excludes the lot again until an `unhold:` or a state change lifts
+it (#3375).
+
+That path reads the authority **strictly** (`is_orchestrator(..., strict=True)`,
+`active_holds(..., strict=True)`): an unreadable registry, canon or alias raises
+instead of being classified "not a pilot", and the candidate list is declared
+incomplete — no composition on it. The tolerant default is unchanged for the
+alerts and the stagnation, where a registry outage must not silence everything.
+A readable "not a pilot" answer still makes an ordinary hold, which does not
+reserve the package.
+
 `merged`, `promoted` and `closed` blockers no longer defer the alert. Missing
 references, self references, proposed/done/cancelled commitments and free
 text such as “after #123 merges” do not suppress it. An unresolved package
@@ -192,7 +209,11 @@ open packet has no escalation target of its own — the packet composer or the
 pilot carries the merge (canon §9, owner decision #103509 option a, home#147).
 A `packet-exception incident|unblock sha=… reason=…` declared for the current
 head takes the lot out of the packet: the table target (30 min; 15 min in P1)
-runs from the GO and the escalation applies.
+runs from `max(GO, CI green on that exact head)` (#3341) and the escalation
+applies. The green is read from the tracked run (`ci_runs`, the notifier's
+reading) on the frozen head — never assumed; a head with no green yet (absent,
+still running, cancelled) or with a red run starts no `verdict_merge` clock at
+all, so no alert asks for a merge the CI has not cleared.
 
 `planned_wait` is null when no explicit wait applies. While it applies,
 `stale` is null and no `stale_lot` is raised, so the notifier also stops its

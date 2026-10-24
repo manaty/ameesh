@@ -143,7 +143,11 @@ def archive(home: str, paths: list[str]) -> bytes:
 
 
 def encrypt(data: bytes, recipients) -> bytes:
-    argv = ["gpg", "--batch", "--yes", "--quiet", "--trust-model", "always", "--encrypt"]
+    # Encrypting to public keys needs no agent. On an agent VM, which holds no
+    # private key, autostart would recreate the very gpg-agent the deployment
+    # masks (#3320); decrypt keeps its own path and never asks for this.
+    argv = ["gpg", "--batch", "--yes", "--quiet", "--no-autostart",
+            "--trust-model", "always", "--encrypt"]
     for r in recipients:
         argv += ["--recipient", r]
     proc = subprocess.run(argv, input=data, capture_output=True, timeout=300)

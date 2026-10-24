@@ -106,11 +106,16 @@ def _strip_agents(name: str, agents) -> str:
 
 
 #: a number glued to one of these tokens still names a lot (`wt3220`,
-#: `.work-1392`) ; glued to any other letters it is a SHA fragment
-#: (`review-3220-ab1234cd` names #3220, not #1234 ; `wt3220-ca47` not #47).
+#: `.work-1392`, `diag462` #3277) ; glued to any other letters it is a SHA
+#: fragment (`review-3220-ab1234cd` names #3220, not #1234 ; `wt3220-ca47`
+#: not #47). `diag` holds `i` and `g`, out of hex: never a SHA fragment.
 NAME_TOKEN = re.compile(
-    r"(?:^|[._-])(wt|work|lot|review|prep|tmp|scratch|agent|paquet)$",
+    r"(?:^|[._-])(wt|work|lot|review|prep|tmp|scratch|agent|paquet|diag)$",
     re.IGNORECASE)
+
+#: a date (`2026-10-24`, `20261024`) names no lot (#3277): blanked before the
+#: numbers are read, so `diag2024-10-24` is not #2024, #10 and #24.
+NAME_DATE = re.compile(r"(?<!\d)(?:(?:19|20)\d\d-\d\d-\d\d|20\d{6})(?!\d)")
 
 
 def _named_numbers(rest: str) -> list[str]:
@@ -122,6 +127,7 @@ def _named_numbers(rest: str) -> list[str]:
     (#2182). A one-digit group is an agent number when the name also carries
     a longer number (`ds4-749-review` is #749)."""
     found = []
+    rest = NAME_DATE.sub(lambda match: "-" * len(match.group()), rest)
     for match in re.finditer(r"\d+", rest):
         start, end = match.span()
         before = rest[start - 1] if start else ""
@@ -538,8 +544,9 @@ def _removal_check(path: str, cfg, rules, allow, roots, agents) -> str:
     inventory is a doubt, never a proof that no clone depends on the
     candidate.
     """
-    if hk.worktree_in_use(path, allow=allow):
-        return "a process is working in it"
+    in_use, holder_detail = hk.worktree_holders(path, allow=allow)
+    if in_use:
+        return holder_detail
     saved = hk._git_copy_work(path, path, rules)
     if saved:
         return saved
@@ -740,8 +747,9 @@ def reap(db, host: str, cfg, *, roots, agents: dict, protected, dry_run: bool,
             if not dry_run:
                 entries.append(dict(base, action="signaled", detail=detail))
             continue
-        if hk.worktree_in_use(path, allow=allow):
-            detail = "a process is working in it; kept"
+        in_use, holder_detail = hk.worktree_holders(path, allow=allow)
+        if in_use:
+            detail = "%s; kept" % holder_detail
             plan.append(dict(base, action="garde", detail=detail))
             if not dry_run:
                 entries.append(dict(base, action="signaled", detail=detail))
