@@ -7,7 +7,7 @@
 # faite pour toute la base du mesh, qui est celle du serveur.
 #
 #   deploy/mise-a-jour/vm.sh <étape> [REF]
-#   deploy/mise-a-jour/vm.sh agents verifier|installer|redemarrer|controler|retour [REF]
+#   deploy/mise-a-jour/vm.sh agents verifier|installer|timers|redemarrer|controler|retour [REF]
 #     AGENTS_SSH=root@cible, HOTE_AGENTS=nom du registre dans BASCULE_ENV —
 #     un BASCULE_ENV par VM d'agents ; unités utilisateur sous ameesh, liste
 #     du registre lue sur la VM. Voir docs/DEPLOIEMENT-HOTE-AGENTS.md.
@@ -27,8 +27,12 @@
 #                drain est refusé et le redémarrage de cet agent s'arrête sans
 #                tour interrompu ; refuse tant que les migrations du code
 #                installé manquent
+#   timers       pose les minuteries mécaniques EP5 (veille GitHub, CI,
+#                projection) sur cet hôte s'il est candidat du rôle élu ;
+#                refuse explicitement les passes dont la clé `github` locale
+#                manque (#3327) ; sans effet sur un hôte non candidat
 #   controler    unités actives, journal récent, venv du MainPID vivant,
-#                ameesh doctor sur le serveur
+#                ameesh doctor et minuteries de rôle sur le serveur
 #   retour       bascule en arrière vers le venv précédent conservé, puis
 #                redémarre
 #
@@ -69,8 +73,8 @@ if [ "${1:-}" = agents ]; then MODE=agents; shift; fi
 ACTION=${1:-}
 if [ "$MODE" = agents ]; then
   case "$ACTION" in
-    redemarrer|controler|verifier|installer|retour) ;;
-    *) echo "mode agents : verifier, installer, redemarrer, controler ou retour attendu" >&2; exit 2 ;;
+    redemarrer|controler|verifier|installer|timers|retour) ;;
+    *) echo "mode agents : verifier, installer, timers, redemarrer, controler ou retour attendu" >&2; exit 2 ;;
   esac
   : "${AGENTS_SSH:?AGENTS_SSH manquant dans $BASCULE_ENV}" "${HOTE_AGENTS:?HOTE_AGENTS manquant dans $BASCULE_ENV}"
   [[ $AGENTS_SSH =~ ^[a-zA-Z0-9_.@:-]+$ && $AGENTS_SSH != -* ]] || { echo "AGENTS_SSH invalide" >&2; exit 2; }
@@ -1491,8 +1495,21 @@ controler_agents() {
   done <<<"$noms"
   etape "ameesh doctor sur $HOTE_AGENTS"
   ameesh_agents doctor || echec=1
+  # #3327 : un hôte candidat sans minuterie de rôle laisse le relevé GitHub
+  # muet ; le contrôle échoue au lieu d'attendre la prochaine panne.
+  etape "minuteries de rôle (EP5) sur $HOTE_AGENTS"
+  utilisateur_agents /home/ameesh/.local/share/ameesh/venv/bin/ameesh role timers --check \
+    || echec=1
   [ "$echec" = 0 ] || { echo "contrôles en échec" >&2; return 1; }
   echo "contrôles verts"
+}
+
+timers_agents() {
+  # #3327 : installe les minuteries mécaniques de la veille GitHub sur cet
+  # hôte s'il est candidat du rôle élu. `role timers` refuse explicitement les
+  # passes qui dépendent de `github.projects` quand la clé locale manque.
+  etape "minuteries de rôle (EP5) sur $HOTE_AGENTS"
+  utilisateur_agents /home/ameesh/.local/share/ameesh/venv/bin/ameesh role timers --install
 }
 
 installer_agents() {
@@ -1865,6 +1882,7 @@ if [ "$MODE" = agents ]; then
     redemarrer) redemarrer_agents ;;
     verifier|controler) controler_agents ;;
     installer) installer_agents "${2:-HEAD}" ;;
+    timers) timers_agents ;;
     retour) retour_agents ;;
   esac
   exit

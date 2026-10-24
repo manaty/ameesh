@@ -348,6 +348,35 @@ page sont à exécuter par le responsable du déploiement après revue et
 validation CI, une VM à la fois ; `controler` affiche le code installé, le
 clone et `previous-sha` avant les unités.
 
+## Minuteries de rôle de l’observation GitHub (#3327)
+
+L’observation GitHub (veille des tickets, relevé CI, projection des issues) est
+portée par la minuterie d’un rôle élu, `mesh-design` par défaut, et non plus par
+le seul service `ameesh-notify` de l’hôte désigné. Après `installer`, poser les
+minuteries sur chaque VM candidate :
+
+```sh
+deploy/mise-a-jour/vm.sh agents timers
+deploy/mise-a-jour/poste.sh timers        # sur le poste, autre candidat
+```
+
+`ameesh role timers --install` n’écrit rien sur un hôte qui n’est pas candidat.
+Sur un candidat, il complète les seuls couples projet→dépôt manquants depuis
+les cartes `github_watch` du canon (`nexlink` → `manaty/nexlink` sur une VM qui
+n’avait que `ameesh`), après sauvegarde `config.json.role-timers.bak` et sans
+écraser un mapping existant ; `--no-sync` le désactive. Le reste de la clé
+`github` (`workflows`, `base`, `exclude_terms`) reste à copier à l’identique
+depuis la configuration de l’observateur historique : le relevé CI de Nexlink a
+besoin de `base: [develop]`. Ce n’est pas un secret ; le jeton `GH_TOKEN` reste
+dans `notify.env`. Le drop-in posé fait exclure à `ameesh-notify` les passes
+mécaniques (`--skip issues,github-watch,ci`) : alertes et prise restent dans le
+service, GitHub et la CI passent par la minuterie du rôle.
+
+`controler` (`vm.sh agents controler`, `poste.sh controler`) exécute
+`ameesh role timers --check` et échoue sur une minuterie absente, désactivée,
+hors d’état (contenu différent) ou un drop-in manquant. Voir
+[EXPLOITATION.md, « Pose automatique »](EXPLOITATION.md#pose-automatique--ameesh-role-timers-3327).
+
 ## Release automatique aux coupures (#2448)
 
 Pour les correctifs fusionnés qui retiennent plusieurs lots entre deux
