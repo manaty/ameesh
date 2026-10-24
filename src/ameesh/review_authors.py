@@ -519,7 +519,14 @@ def _not_in_target(repo: str, commits, target: str) -> list:
     courante ou du report d'un gel antérieur (#2924). La lecture se fait en un
     seul `git rev-list ... --not <cible>`, sans une sonde par commit ; une
     lecture impossible garde la liste entière (le doute ne retire jamais un
-    auteur, il ne le compte pas non plus dans la cible)."""
+    auteur, il ne le compte pas non plus dans la cible).
+
+    #3323 : la sortie de `rev-list` est canonique (complète, minuscules) tandis
+    qu'un appelant peut passer une entrée abrégée ou en majuscules. Comparer
+    l'entrée telle quelle l'écartait alors comme « dans la cible », à l'envers
+    du doute : on ne retire désormais que l'entrée **prouvée** dans la cible,
+    et une entrée non résolue reste. Un identifiant complet est normalisé sans
+    sonde ; seule une forme non canonique est résolue localement."""
     wanted = [str(commit).strip() for commit in commits or ()
               if str(commit).strip()]
     if not wanted or not target:
@@ -531,7 +538,18 @@ def _not_in_target(repo: str, commits, target: str) -> list:
     if text is None:
         return wanted
     outside = {line.strip() for line in str(text).splitlines() if line.strip()}
-    return [commit for commit in wanted if commit in outside]
+    kept = []
+    for commit in wanted:
+        canonical = plan_git.full_commit_id(commit)
+        if not canonical:
+            canonical = plan_git.local_commit(repo, commit) or ""
+        # `outside` est la sortie de rev-list : les commits NON atteignables
+        # depuis la cible. Seule une entrée absente de cet ensemble est prouvée
+        # dans la cible ; non résolue, elle reste (le doute ne retire jamais).
+        if canonical and canonical not in outside:
+            continue
+        kept.append(canonical or commit)
+    return kept
 
 
 def _survives_rewrite(repo: str, head: str, sha: str, cache: dict,
