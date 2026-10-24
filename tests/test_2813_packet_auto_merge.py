@@ -72,14 +72,15 @@ class Forge:
     def __init__(self, *, protection=PROTECTED, protection_error="", head=HEAD,
                  state="OPEN", base="main", auto=False, tests="pending", app=APP,
                  merge_error="", disarm_error="", view_error="", sticky=False,
-                 branch="integration/paquet-h-20261020-0500", base_oid=HEAD):
+                 branch="integration/paquet-h-20261020-0500", base_oid=HEAD,
+                 ref_error=""):
         self.protection, self.protection_error = protection, protection_error
         self.head, self.state, self.base, self.auto = head, state, base, auto
         self.tests, self.app, self.branch = tests, app, branch
         self.merge_error, self.disarm_error = merge_error, disarm_error
         self.view_error = view_error
-        #: la cible résolue publiée par la PR (`baseRefOid`, #3091)
-        self.base_oid = base_oid
+        #: la cible résolue, lue par `gh api git/ref/heads/<base>` (#3308)
+        self.base_oid, self.ref_error = base_oid, ref_error
         #: plusieurs PR partagent ce faux : un geste ne vaut pas pour l'autre
         self.sticky = sticky
         self.calls: list[list[str]] = []
@@ -100,6 +101,12 @@ class Forge:
             return 0, json.dumps({"id": 200, "head_sha": self.head, "head_branch": self.branch,
                                   "event": "pull_request", "path": ".github/workflows/tests.yml",
                                   "status": "completed", "conclusion": "success"}), ""
+        if args[:1] == ["api"] and "/git/ref/heads/" in path:
+            if self.ref_error:
+                return 1, "", self.ref_error
+            return 0, json.dumps({"ref": "refs/heads/%s" % self.base,
+                                  "object": {"type": "commit",
+                                             "sha": self.base_oid}}), ""
         if args[:3] == ["api", "-X", "POST"] and args[3].endswith("/merges"):
             fields = dict(a.split("=", 1) for a in args[4:] if a != "-f")
             if self.merge_error:
@@ -137,8 +144,7 @@ class Forge:
                 return 1, "", self.view_error
             return 0, json.dumps({
                 "state": self.state, "headRefOid": self.head, "headRefName": self.branch,
-                "baseRefName": self.base, "baseRefOid": self.base_oid,
-                "isDraft": False,
+                "baseRefName": self.base, "isDraft": False,
                 "autoMergeRequest": {"enabledAt": "2026-10-20T03:00:00Z"} if self.auto
                 else None, "statusCheckRollup": rollup(self.tests)}), ""
         if args[:2] == ["pr", "merge"] and "--disable-auto" in args:
@@ -643,7 +649,9 @@ class PassTest(Journal):
     def test_r1_b1_a_refused_review_gate_never_merges(self):
         """cx3 R1 : la porte des verdicts (classe, avis, membres et delta d'un
         porteur) passe avant la lecture des protections et tout geste de fusion.
-        La lecture du statut CI inclut la preuve de run du portier (#2876)."""
+        La lecture du statut CI inclut la preuve de run du portier (#2876) ; la
+        cible résolue (`git/ref`, #3308) est lue pour cette porte, pas une
+        protection."""
         self.armed()
         self.gate = (False, "2 independent reviews missing on 1111111111", None)
         gh = FakeGh(tests="success")
@@ -652,7 +660,8 @@ class PassTest(Journal):
         self.assertIn("reviews missing", out["why"])
         self.assertEqual(gh.merges(), [])
         self.assertEqual([c for c in gh.calls if c[:1] == ["api"]
-                          and "/actions/" not in c[1]], [])
+                          and "/actions/" not in c[1]
+                          and "/git/ref/heads/" not in c[1]], [])
 
     def test_r1_b2_a_protection_emptied_after_publication_never_merges(self):
         self.armed()
@@ -1016,6 +1025,7 @@ class ArmingGh(LabelGh):
                 argv[:3] == ["api", "-X", "POST"] and argv[3].endswith("/merges")) or (
                 argv[:1] == ["api"] and (path.endswith("/protection")
                                          or "/rules/branches/" in path
+                                         or "/git/ref/heads/" in path
                                          or "/check-runs" in path)):
             self.calls.append(list(argv))
             return self.forge.answer(argv)
