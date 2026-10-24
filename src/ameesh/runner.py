@@ -5227,9 +5227,27 @@ class AgentWorker(threading.Thread):
             if reveil is not None:
                 return reveil
         if self.idle_due():
-            return {"kind": "idle", "prompt": adapters.idle_prompt(self._idle_pilot()),
-                    "ids": []}
+            return {"kind": "idle", "prompt": self._idle_prompt(), "ids": []}
         return None
+
+    def _idle_prompt(self) -> str:
+        """#3033 + #3273 : la relance d'inactivité porte les avis que l'agent
+        doit encore rendre, et nomme le pilote de son équipe (#3273). Sans
+        elle, un relecteur dont la demande de désignation était un courrier
+        déjà lu se déclarait « disponible » à l'orchestrateur pendant que son
+        avis attendait (#3004, 1 j 14 h). Une file illisible ne change pas la
+        relance : le brief de reprise la dit, et un tour au repos ne part pas
+        sur une lecture ratée."""
+        from . import reprise
+        prompt = adapters.idle_prompt(self._idle_pilot())
+        try:
+            lines = reprise.pending_review_lines(self.db, self.name)
+        except Exception:  # noqa: BLE001 - la relance part quand même
+            return prompt
+        if (not lines or lines == [reprise.NO_PENDING_REVIEW]
+                or lines[0].startswith("(pending reviews unreadable")):
+            return prompt
+        return "\n".join([prompt, "", adapters.IDLE_REVIEWS_HEADER] + lines)
 
     #: #408 : intervalle minimal entre deux lectures des lots actionnables
     LOT_WAKE_CHECK_S = 30.0
