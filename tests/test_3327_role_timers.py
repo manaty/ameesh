@@ -40,13 +40,14 @@ class PlanTest(unittest.TestCase):
         return role_timers.plan(
             host=host, role="mesh-design", row=row_value or row(),
             settings=value or settings(), watch_intervals=watch,
-            watch_error=watch_error)
+            watch_error=watch_error, notify_humans=["human:owner"])
 
-    def test_a_candidate_gets_the_three_mechanical_passes(self):
+    def test_a_candidate_gets_the_mechanical_passes(self):
         report = self.plan()
         self.assertTrue(report["candidate"])
+        # #3383: the alert delivery joined the three observation passes
         self.assertEqual([item["name"] for item in report["timers"]],
-                         ["github-watch", "issues", "ci"])
+                         ["github-watch", "issues", "ci", "alerts"])
         by_name = {item["name"]: item for item in report["timers"]}
         self.assertEqual(by_name["ci"]["interval_s"], 60)
         self.assertEqual(by_name["issues"]["interval_s"], 90)
@@ -133,19 +134,20 @@ class InstallTest(unittest.TestCase):
         (self.dir / "ameesh-notify.service").write_text("[Service]\n", encoding="utf-8")
         self.report = role_timers.plan(
             host="agents-a", role="mesh-design", row=row(), settings=settings(),
-            watch_intervals=[900])
+            watch_intervals=[900], notify_humans=["human:owner"])
 
     def tearDown(self):
         self.tmp.cleanup()
 
     def test_install_writes_the_units_and_limits_the_full_notifier(self):
         result = role_timers.install(self.report, directory=self.dir, apply=False)
-        self.assertEqual(len(result["installed"]), 7)  # 3 services + 3 timers + drop-in
-        for name in ("github-watch", "issues", "ci"):
+        self.assertEqual(len(result["installed"]), 9)  # 4 services + 4 timers + drop-in
+        for name in ("github-watch", "issues", "ci", "alerts"):
             self.assertTrue((self.dir / ("ameesh-role-%s.service" % name)).is_file())
             self.assertTrue((self.dir / ("ameesh-role-%s.timer" % name)).is_file())
         dropin = self.dir / "ameesh-notify.service.d" / "10-role-timers.conf"
-        self.assertIn("--skip issues,github-watch,ci", dropin.read_text(encoding="utf-8"))
+        self.assertIn("--skip issues,github-watch,ci,alerts",
+                      dropin.read_text(encoding="utf-8"))
         self.assertEqual(role_timers.check(self.report, directory=self.dir, apply=False), [])
 
     def test_install_is_idempotent(self):
@@ -190,7 +192,7 @@ class InstallTest(unittest.TestCase):
     def test_remove_deletes_the_units_and_the_dropin(self):
         role_timers.install(self.report, directory=self.dir, apply=False)
         result = role_timers.remove(self.report, directory=self.dir, apply=False)
-        self.assertEqual(len(result["removed"]), 7)
+        self.assertEqual(len(result["removed"]), 9)
         self.assertFalse((self.dir / "ameesh-role-ci.timer").exists())
         self.assertFalse((self.dir / "ameesh-notify.service.d" / "10-role-timers.conf").exists())
 

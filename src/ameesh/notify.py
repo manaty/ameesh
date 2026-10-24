@@ -3,7 +3,7 @@
 
   ameesh notify [--once] [--dry-run] [--json] [--interval S]
                 [--only alerts|take|issues|github-watch|ci]
-                [--skip issues|github-watch|ci] [--long-turn S]
+                [--skip issues|github-watch|ci|alerts] [--long-turn S]
                 [--idle-mail S] [--dead-grace S]
                 [--session-tokens N] [--stale-lot S] [--orphan-lot S]
                 [--take-idle S] [--take-max-per-hour N]
@@ -114,10 +114,13 @@ STATE_SCHEMA = "ameesh-notify-state/1"
 #: `alerts` owns the delivery state and its lock; `take` observes the alerts
 #: but writes no state; `issues`, `github-watch` and `ci` are independent.
 ONLY_PASSES = ("alerts", "take", "issues", "github-watch", "ci")
-#: #3327: the mechanical passes a role timer carries. A full notifier may skip
-#: exactly these (and only these) from its loop; every other pass (alerts,
-#: take, budget handoff, WIP sweep) stays in the service.
-SKIPPABLE_PASSES = ("issues", "github-watch", "ci")
+#: #3327: the passes a role timer carries. A full notifier may skip exactly
+#: these (and only these) from its loop; every other pass (take, budget
+#: handoff, WIP sweep) stays in the service. #3383: `alerts` joined them — the
+#: owner channel follows the elected lease instead of the one host that held
+#: the routes; a service that skips it takes no state lock, so the role timer
+#: of the same host can.
+SKIPPABLE_PASSES = ("issues", "github-watch", "ci", "alerts")
 
 #: L38 (0030) : types envoyés par défaut. `delegation_expired` arrive avec L40 :
 #: il est accepté ici sans dépendre de son code (un type absent n'est jamais
@@ -2900,8 +2903,8 @@ def cmd_test(cfg: Config, ncfg: NotifyConfig, args) -> int:
     if not ncfg.channels_for(human):
         print("ameesh notify --test: no channel for %s (notify.routes, notify.default) — "
               "this host cannot push anything to that human (no decision, no alert); "
-              "restore the notifier on the host that holds the routes, or configure a "
-              "fallback route on a healthy host (docs/EXPLOITATION.md, "
+              "declare the route on every candidate of the role that carries the "
+              "alerts, then `ameesh role timers --install` (docs/EXPLOITATION.md, "
               "\"Alertes poussées\")" % human, file=sys.stderr)
         return 2
     results = send_test(ncfg, human, cfg.host)
@@ -2930,11 +2933,12 @@ def cmd_notify(cfg: Config, ncfg: NotifyConfig, args) -> int:
         print("ameesh notify: --only and --skip are exclusive", file=sys.stderr)
         return 2
     # #3327: a full service may skip the passes now carried by a role timer;
-    # every other pass (alerts, take, budget handoff, WIP sweep) stays.
+    # every other pass (take, budget handoff, WIP sweep) stays. #3383: with
+    # `alerts` skipped, the local console pass and the state lock go too.
     #: L165: the alert delivery owns the local state file and its lock. The
     #: mechanical passes (`issues`, `github-watch`, `ci`) use database state
     #: only, so a role timer can run them beside the alert producer.
-    alerts_pass = only is None or "alerts" in only
+    alerts_pass = ("alerts" in only) if only is not None else not (skip and "alerts" in skip)
     if alerts_pass and not ncfg.configured:
         _stderr_log("no channel configured (`notify` key of the host configuration: "
                     "routes, default): alerts will be logged, not sent")
