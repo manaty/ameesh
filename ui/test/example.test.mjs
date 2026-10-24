@@ -67,7 +67,7 @@ test("example: opening a project shows the timeline of its lots", async () => {
   const timeline = await screen(app, "ameesh-timeline");
   assert.match(timeline, /#12 Panier d'achat/);
   assert.match(timeline, /#18 Facturation du portail/);
-  assert.ok(fetch.calls.some((call) => call.path === `/api/v1/projects/${PROJECT}/progress`));
+  assert.ok(fetch.calls.some((call) => call.path === `/api/v1/projects/${PROJECT}/timeline`));
   assert.equal(window.location.hash, `#/project/${PROJECT}`);
 });
 

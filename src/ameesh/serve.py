@@ -229,6 +229,18 @@ def _progress(ctx: Context, db, params, query) -> dict:
         raise ApiError(400, "bad_query", str(exc)) from exc
 
 
+def _timeline(ctx: Context, db, params, query) -> dict:
+    """#3395 : la Chronologie de /ui/, sans le reste du snapshot progress."""
+    from . import progress, stagnation
+    since = _checked(_one(query, "since"), _SINCE_RE, "since") or "24h"
+    try:
+        return db_mod.batched(db, lambda db: progress.timeline(
+            db, ctx.cfg, since=since, project=params["project"],
+            stale_after=stagnation.stale_after(None)))
+    except progress.ProgressError as exc:
+        raise ApiError(400, "bad_query", str(exc)) from exc
+
+
 def _agents(ctx: Context, db, params, query) -> dict:
     from . import mesh_cli
     return {"schema": "ameesh-agents/1", "agents": mesh_cli.agent_rows(ctx.cfg, db)}
@@ -369,6 +381,9 @@ ROUTES = (
     Route(API + "/projects/{project}/progress", "ameesh-progress/1",
           "Progress of a project (`ameesh progress --json --project`)", _progress,
           query=(("since", {"type": "string"}, "window: 90m, 24h, 2d or an ISO date"),)),
+    Route(API + "/projects/{project}/timeline", "ameesh-timeline/1",
+          "Timeline of a project: its lots and window only (#3395)", _timeline,
+          query=(("since", {"type": "string"}, "window: 90m, 24h, 2d or an ISO date"),)),
     Route(API + "/agents", "ameesh-agents/1", "Agents (`ameesh list --json`)", _agents),
     Route(API + "/agents/{agent}", "ameesh-agent-detail/1", "One agent (`ameesh show --json`)",
           _agent),
@@ -488,6 +503,8 @@ SCHEMAS = {
     "ameesh-projects/1": _obj("ameesh-projects/1", ["projects"], projects=_LIST),
     "ameesh-progress/1": _obj("ameesh-progress/1", ["generated_ts", "lots"],
                               generated_ts=_NUM, lots=_LIST),
+    "ameesh-timeline/1": _obj("ameesh-timeline/1", ["generated_ts", "window", "lots"],
+                              generated_ts=_NUM, window=_OBJ, lots=_LIST),
     "ameesh-agents/1": _obj("ameesh-agents/1", ["agents"], agents={
         "type": "array", "items": _obj(None, ["name"], name=_STR)}),
     "ameesh-agent-detail/1": _obj("ameesh-agent-detail/1", ["agent"],

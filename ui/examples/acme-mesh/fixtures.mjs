@@ -55,12 +55,19 @@ const progress = {
   },
 };
 
+const timeline = {
+  schema: "ameesh-timeline/1", generated_ts: stamp,
+  window: { from_ts: stamp - day, to_ts: stamp },
+  lots: [ada.lot, grace.lot],
+};
+
 /** Read routes of the fictional mesh: path → [status, body]. */
 export const routes = {
   "/.well-known/ameesh": [200, discovery],
   "/api/v1/me": [200, me],
   "/api/v1/projects": [200, { projects: [project] }],
   ["/api/v1/projects/" + PROJECT + "/progress"]: [200, progress],
+  ["/api/v1/projects/" + PROJECT + "/timeline"]: [200, timeline],
   "/api/v1/agents/ada": [200, { agent: { ...ada, key_ready: true } }],
   "/api/v1/agents/grace": [200, { agent: { ...grace, key_ready: true } }],
   "/api/v1/alerts": [200, { alerts: [
