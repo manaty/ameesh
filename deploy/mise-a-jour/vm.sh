@@ -1352,6 +1352,53 @@ reinstaller_agents() {
     python3 $BASCULE_AGENTS activer --venv \"\$V\" --version $court ${precedent:+--precedent $precedent}
     \"\$V/bin/python\" -c 'import psycopg, ameesh; print(\"psycopg\", psycopg.__version__)'"
 }
+# --- agent GnuPG des VM d'agents (#3320) -----------------------------------
+# Un hôte d'agents ne tient aucune clé privée : l'agent GnuPG n'y sert à rien
+# et, non dumpable, il retient le ménage des sorties de build (#3195). Après
+# une installation réussie, si ~/.gnupg/private-keys-v1.d est absent ou vide,
+# les sockets utilisateur sont masqués et l'agent tué ; une clé privée, ou un
+# état illisible, laisse tout en place et journalise le doute. Jamais dans
+# poste.sh : le poste de l'owner tient ses clés. Idempotent : une relance
+# d'« installer » rejoue l'étape (masquer un socket déjà masqué réussit).
+etat_cle_gpg_agents() {  # → absente | vide | cle | doute
+  utilisateur_agents bash -c 'set -euo pipefail
+    d=$HOME/.gnupg/private-keys-v1.d
+    if [ ! -e "$d" ] && [ ! -L "$d" ]; then echo absente; exit 0; fi
+    if [ -L "$d" ] || [ ! -d "$d" ]; then echo doute; exit 0; fi
+    if ! premier=$(find "$d" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null); then
+      echo doute; exit 0
+    fi
+    if [ -n "$premier" ]; then echo cle; else echo vide; fi'
+}
+masquer_agent_gpg_agents() {
+  local etat
+  if ! etat=$(etat_cle_gpg_agents); then
+    echo "état de ~/.gnupg/private-keys-v1.d illisible sur $HOTE_AGENTS : étape GnuPG non appliquée" >&2
+    return 1
+  fi
+  case "$etat" in
+    absente|vide)
+      etape "agent GnuPG de $HOTE_AGENTS : aucune clé privée ($etat), sockets utilisateur masqués"
+      if ! utilisateur_agents systemctl --user mask --now \
+          gpg-agent.socket gpg-agent-ssh.socket gpg-agent-extra.socket \
+          gpg-agent-browser.socket keyboxd.socket; then
+        echo "masquage des sockets GnuPG en échec sur $HOTE_AGENTS" >&2
+        return 1
+      fi
+      if ! utilisateur_agents gpgconf --kill gpg-agent; then
+        echo "gpgconf --kill gpg-agent en échec sur $HOTE_AGENTS" >&2
+        return 1
+      fi
+      echo "sockets GnuPG masqués et gpg-agent tué (aucune clé privée sur cet hôte)"
+      ;;
+    cle)
+      echo "clé privée dans ~/.gnupg/private-keys-v1.d : sockets GnuPG laissés en place (doute conservé)"
+      ;;
+    *)
+      echo "état de ~/.gnupg/private-keys-v1.d inattendu ($etat) : rien touché (doute conservé)" >&2
+      ;;
+  esac
+}
 releve_agents() {  # identité et pièces du bon hôte, avant tout geste
   local installe clone previous
   installe=$(installe_agents) || return 1
@@ -1493,6 +1540,14 @@ installer_agents() {
     echo "code ${sha:0:9} déjà installé : previous-sha inchangé (aucun faux retour)"
   fi
   effacer_journal_agents
+  # 10. #3320 : après l'installation du code, retirer l'agent GnuPG inutile.
+  # #3195, prérequis de ce lot, garde les worktrees de lots ouverts avant que
+  # ce retrait ne débloque le ménage des sorties de build.
+  # Idempotent : relancer « installer » rejoue l'étape, sockets déjà masqués.
+  if ! masquer_agent_gpg_agents; then
+    echo "étape GnuPG en échec : code ${sha:0:9} installé ; la relancer par « $0 agents installer ${sha:0:9} » (idempotente)" >&2
+    return 1
+  fi
   echo "installé depuis src-$court (avant $complet). Les exécuteurs tournent encore l'ancien code : « $0 agents redemarrer », puis « $0 agents controler »."
 }
 
