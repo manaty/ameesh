@@ -2380,7 +2380,10 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
             from . import review_designation_activation as activation
             agent = None if args.all else (args.agent or "").strip()
             if agent == "":
-                binding = identity.resolve_binding(cfg, db)
+                # `identity` est local à `cmd_work` (import de la branche `add`) :
+                # le nom du module n'est pas lié ici (relecture dev3, B).
+                from .identity import resolve_binding
+                binding = resolve_binding(cfg, db)
                 if not binding.ok:
                     print("ameesh work pending-reviews: give AGENT or --all (no bound "
                           "identity)", file=sys.stderr)
