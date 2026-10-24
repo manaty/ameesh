@@ -592,6 +592,11 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
     ('ci_queue_state', ARRAY[
         'repo', 'oldest_id', 'oldest_at', 'queued', 'seen_at'
     ]),
+    -- #3344 (0480) : dernière carte de mesure publiée (même nature :
+    -- identifiants, tête, horodatages, aucun contenu)
+    ('ci_map_state', ARRAY[
+        'repo', 'branch', 'run_id', 'head_sha', 'published_at', 'seen_at'
+    ]),
     -- #845 (0426, revue N/P2 2328) : la fenêtre du relevé de la garde, son
     -- coût réel et sa couverture (même nature : horodatages, comptages,
     -- codes) — l'état qui dit si la garde est aveugle, sans contenu

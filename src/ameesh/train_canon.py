@@ -250,6 +250,17 @@ class Watch:
         effect = ("le train refuse de composer un nouveau paquet"
                   if mode == "active" else
                   "le plan d'ombre porte l'écart ; aucun effet")
+        if reading.state == DRIFT and reading.gate == reading.pin:
+            # #3349: same commit, other rule readings. Nothing to requalify
+            # here; the gate's sources are what must be reconciled.
+            follow = ("- Commit identique à l'épingle : rien à requalifier. La "
+                      "porte lit d'autres règles d'avis (canons configurés à leur "
+                      "référence, plancher/drapeaux, familles compilées) ; aligner "
+                      "ces sources sur le canon épinglé, ou, si l'épingle doit "
+                      "changer, qualifier un nouveau canon (#1467).")
+        else:
+            follow = ("- Aucun suivi automatique (#1467) : qualifier le commit de "
+                      "la porte, puis l'épingler dans la configuration de l'hôte.")
         body = "\n".join([
             "Train %s (%s) : %s." % (self.project, mode, reading.describe()),
             "",
@@ -257,8 +268,7 @@ class Watch:
             "- Le train lit ses règles au commit épinglé (train.projects.%s."
             "canon_commit) ; la porte et la désignation lisent le canon audité "
             "de l'hôte." % self.project,
-            "- Aucun suivi automatique (#1467) : qualifier le commit de la porte, "
-            "puis l'épingler dans la configuration de l'hôte.",
+            follow,
         ])
         if self.mailer is not None:
             self.mailer(db, recipient, body, reading)

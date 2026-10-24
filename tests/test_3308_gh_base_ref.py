@@ -43,6 +43,20 @@ class Gh245(banc.FakeGh):
         return super().answer(args)
 
 
+class SlashedBaseGh(Gh245):
+    """Une cible à slash n'existe que sous sa forme encodée : le slash brut
+    répond 404, comme GitHub (#3314)."""
+
+    def answer(self, args):
+        if args[:1] == ["api"] and "/git/ref/heads/" in args[-1]:
+            self.calls.append(list(args))
+            if args[-1].endswith("/git/ref/heads/release%2F1.2.0"):
+                return 0, json.dumps({"ref": "refs/heads/release/1.2.0",
+                                      "object": {"type": "commit", "sha": BASE}}), ""
+            return 1, "", "gh: Not Found (HTTP 404)"
+        return super().answer(args)
+
+
 class BaseRefArmTest(banc.Journal):
     """L'armement du paquet passe sur un gh qui n'a pas `baseRefOid`."""
 
@@ -107,6 +121,18 @@ class BaseRefArmTest(banc.Journal):
         self.assertEqual(land.base_oid(SLUG, "release/1.2.0", gh=gh), HEAD)
         self.assertEqual(calls, [["api", "repos/%s/git/ref/heads/release%%2F1.2.0"
                                   % SLUG]])
+
+    def test_a_slashed_packet_target_resolves_through_the_encoded_ref(self):
+        # #3314 : la cible d'un paquet peut porter un slash (`release/…`) ; le
+        # consommateur réel (pr_status → land.base_oid) lit la forme encodée,
+        # là où le slash brut, que ce faux `gh` refuse, ferait 404.
+        gh = SlashedBaseGh(base="release/1.2.0")
+        status = packet_automerge.pr_status(SLUG, NUM, gh=gh)
+        self.assertEqual(status["base"], "release/1.2.0")
+        self.assertEqual(status["base_oid"], BASE)
+        self.assertEqual([call for call in gh.calls if call[:1] == ["api"]],
+                         [["api", "repos/%s/git/ref/heads/release%%2F1.2.0"
+                           % SLUG]])
 
 
 VIEW = {"number": NUM, "state": "OPEN", "isDraft": False, "baseRefName": "main",

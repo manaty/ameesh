@@ -680,12 +680,55 @@ def _config_diff(base, value, path: str) -> list[tuple[str, object, object]]:
     return []
 
 
-def _shown(value) -> str:
+#: #3346 : marqueurs d'un nom de feuille qui porte un secret. `ameesh doctor`
+#: ne montre jamais la valeur d'un jeton, d'une clé, d'un mot de passe ou d'un
+#: DSN : le constat nomme la feuille (`github.token`), pas le secret. Le test
+#: est sur le nom, jamais sur la valeur (une valeur secrète peut être courte).
+SECRET_LEAF_MARKERS = ("token", "secret", "key", "pass", "pwd", "dsn")
+
+#: ce qu'une valeur de feuille secrète affiche à la place d'elle-même
+MASKED_SECRET = "***"
+
+
+def _secret_leaf(path: str) -> bool:
+    """Vrai si le chemin nomme une feuille secrète (#3346).
+
+    Le test est sur le nom, insensible à la casse, à n'importe quel segment :
+    `github.token`, `github.api_key`, `train.password` et `release.dsn` sont
+    masqués ; `train.mode` ou `github.projects.ameesh.repo` restent lisibles.
+    Regarder tous les segments couvre aussi un objet rangé sous un nom secret
+    (`github.token.value`) : un jeton ne fuit pas par un sous-champ."""
+    return any(marker in path.lower() for marker in SECRET_LEAF_MARKERS)
+
+
+def _masked(value, path: str):
+    """Copie affichable de `value` : toute feuille secrète devient `***`.
+
+    `_config_diff` rend un sous-arbre entier quand une clé n'existe que d'un
+    côté, disparaît ou change de type ; ce conteneur peut porter un secret
+    imbriqué (`github.auth.token` ajouté, `github` remplacé par `null`, liste
+    d'objets…). Le masquage descend donc dans les objets et les listes au lieu
+    de ne regarder que le chemin de la divergence (#3346, avis dev7/cx1)."""
+    if _secret_leaf(path):
+        return MASKED_SECRET
+    if isinstance(value, dict):
+        return {key: _masked(child, "%s.%s" % (path, key) if path else str(key))
+                for key, child in value.items()}
+    if isinstance(value, list):
+        return [_masked(item, path) for item in value]
+    return value
+
+
+def _shown(value, path: str) -> str:
     """Une valeur de configuration en une ligne courte, jamais un secret :
-    seules les clés partagées (train, github, release) passent par ici."""
+    seules les clés partagées (train, github, release) passent par ici ; une
+    feuille dont le nom ressemble à un secret (#3346) s'affiche masquée, y
+    compris sous un objet ou dans une liste rendue en bloc."""
     if value is _MISSING:
         return "<absent>"
-    texte = json.dumps(value, ensure_ascii=False, sort_keys=True)
+    if _secret_leaf(path):
+        return MASKED_SECRET
+    texte = json.dumps(_masked(value, path), ensure_ascii=False, sort_keys=True)
     return texte if len(texte) <= 120 else texte[:117] + "..."
 
 
@@ -719,7 +762,8 @@ class ProfileAudit:
         for divergence in self.divergences:
             out.append("profiles   : DIVERGENCE %s: %s (profile %s, config.json %s)"
                        % (os.path.basename(divergence.profile), divergence.path,
-                          _shown(divergence.value), _shown(divergence.base)))
+                          _shown(divergence.value, divergence.path),
+                          _shown(divergence.base, divergence.path)))
         if self.ok:
             out.append("profiles   : %d checked in %s; %s match %s"
                        % (len(self.profiles), self.directory,

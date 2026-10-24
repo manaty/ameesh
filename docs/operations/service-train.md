@@ -201,7 +201,13 @@ Dans tous ces cas :
   train en pause reste en pause.
 
 L'épingle ne suit jamais la porte d'elle-même (#1467) : qualifier le commit de
-la porte, puis le poser dans `canon_commit` et redémarrer l'exécuteur.
+la porte, puis le poser dans `canon_commit` et redémarrer l'exécuteur. Quand le
+commit est le même et que seules les autres lectures des règles diffèrent
+(`gate_rules_gap`), il n'y a aucun commit à requalifier : aligner les sources
+de la porte sur le canon épinglé (références configurées, plancher/drapeaux,
+familles compilées), ou qualifier un nouveau canon si l'épingle doit changer.
+Le plan d'ombre suit la lecture à chaque passage : `plan.canon` est réécrit si
+l'écart apparaît (ou se résout) après l'enregistrement du plan du créneau.
 
 ## Contrat CI
 

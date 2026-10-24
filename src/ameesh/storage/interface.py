@@ -4354,6 +4354,30 @@ class CiResults(Domain):
         hôtes (#2957). Un périmètre vide ne purge rien : il ne prouve pas que
         des dépôts ont été retirés."""
 
+    # -- #3344 : âge de la carte de mesure ----------------------------------
+    @abc.abstractmethod
+    def observe_map(self, repo: str, *, branch: str, run_id: int | None,
+                    head_sha: str | None, published_at: str | None) -> None:
+        """Enregistre la dernière exécution réussie de `carte.yml` vue sur la
+        branche de base `branch` du dépôt (`published_at` : son `updated_at`
+        GitHub ; tout à None si aucune n'a été trouvée). La date du relevé est
+        celle de la base."""
+
+    @abc.abstractmethod
+    def maps(self) -> list[dict]:
+        """Le dernier relevé de carte par dépôt : `{repo, branch, run_id,
+        head_sha, published_ts, seen_ts}` (`published_ts` NULL : aucune
+        exécution réussie trouvée)."""
+
+    @abc.abstractmethod
+    def forget_map(self, repo: str) -> None:
+        """Retire le relevé de carte d'un dépôt qui ne porte plus `carte.yml`."""
+
+    @abc.abstractmethod
+    def prune_maps(self, repos: Sequence[str]) -> None:
+        """Retire les relevés de carte des dépôts hors du périmètre actif
+        `repos` (comme `prune_queue`) ; un périmètre vide ne purge rien."""
+
     # -- #845 (revue N/P2 2328) : fenêtre et cache du relevé ----------------
     @abc.abstractmethod
     def claim_guard_scan(self, repo: str, *, now: float, window_s: float) -> bool:

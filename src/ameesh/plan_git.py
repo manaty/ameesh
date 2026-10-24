@@ -2854,23 +2854,46 @@ def _repo_slug(repo: str) -> str | None:
 
 
 def _expected_repo(row: dict) -> tuple[str | None, str | None]:
-    """(slug attendu, nom de dépôt attendu) d'un lot, d'après sa référence
-    d'issue, sinon son `app`."""
-    ref = (row.get("issue_ref") or "").strip()
-    match = _ISSUE_SLUG_RE.match(ref) or _ISSUE_URL_RE.match(ref)
-    if match:
-        return ("%s/%s" % (match.group(1), match.group(2))).casefold(), \
-            match.group(2).casefold()
+    """(slug attendu, nom de dépôt attendu) d'un lot, d'après sa PR, sinon sa
+    référence d'issue, sinon son `app`.
+
+    #3331 : la PR dit où vivent la branche et le gel — un lot du canon
+    (`manaty/home#N`) a son issue dans ameesh et sa PR dans le dépôt du
+    canon ; lire l'issue d'abord faisait choisir le clone ameesh."""
+    for key in ("pr_ref", "issue_ref"):
+        ref = (row.get(key) or "").strip()
+        match = _ISSUE_SLUG_RE.match(ref) or _ISSUE_URL_RE.match(ref)
+        if match:
+            return ("%s/%s" % (match.group(1), match.group(2))).casefold(), \
+                match.group(2).casefold()
     app = (row.get("app") or "").strip().casefold()
     return None, app or None
 
 
 def _local_clones(db, host: str | None) -> list[tuple[str, str, dict]]:
     """Les clones git locaux connus du registre sur cet hôte (dossier, slug,
-    ligne d'agent), une lecture par relevé."""
+    ligne d'agent), plus le clone du canon configuré (#3331 : un lot du canon
+    se lit là, pas dans le dossier de travail de son assigné), une lecture par
+    relevé."""
     from . import registry
     found = []
     seen: set[str] = set()
+    cfg = getattr(db, "cfg", None)
+    local_host = str(getattr(cfg, "host", "") or "") if cfg is not None else ""
+    if cfg is not None and (host is None or not local_host or host == local_host):
+        from . import canon as canon_mod
+        try:
+            entries = canon_mod.configured(cfg)
+        except Exception:  # noqa: BLE001 - canon illisible : rien de plus à lire
+            entries = ()
+        for entry in entries:
+            cwd = os.path.expanduser(str(getattr(entry, "path", "") or ""))
+            if not cwd or cwd in seen or not os.path.isdir(cwd):
+                continue
+            slug = _repo_slug(cwd)
+            if slug:
+                seen.add(cwd)
+                found.append((cwd, slug, {}))
     for agent_row in registry.overview(db):
         if host is not None and (agent_row.get("host") or "") != host:
             continue
