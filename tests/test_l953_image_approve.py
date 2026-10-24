@@ -299,6 +299,13 @@ class ScriptInvariantsTest(unittest.TestCase):
         self.assertIn("config_value", self.text)
         self.assertIn("--password-stdin", self.text)
 
+    def test_config_docker_privee(self):
+        # B1 de la relecture #3166 (auditeur, 23/10/2026) : le login ne doit
+        # pas ecrire le jeton dans le ~/.docker partage de l'utilisateur, que
+        # les autres runners de l'hote lisent, ni les deconnecter au logout.
+        self.assertIn('export DOCKER_CONFIG="$work/docker"', self.text)
+        self.assertIn('mkdir -m 700 "$DOCKER_CONFIG"', self.text)
+
 
 class PublishBehaviourTest(unittest.TestCase):
     """B1/B2 exerces sur un faux registre : aucune suite, aucun reseau."""

@@ -374,6 +374,8 @@ class LimitesPhysiquesTest(_Canons, unittest.TestCase):
         self.assertEqual(runner._host_limits["min_mem_available"], GIB)
         self.assertEqual(runner._host_max_agents, 3)
         self.assertEqual(runner._host_limits_origin["max_agents"], ID_T)
+        # #3101 : admissions épinglées de l'hôte, une par canon
+        self.assertEqual(runner._host_pinned_admissions, 2)
 
     def test_max_agents_physique_borne_les_personas(self):
         class Fil:

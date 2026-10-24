@@ -72,12 +72,14 @@ class Forge:
     def __init__(self, *, protection=PROTECTED, protection_error="", head=HEAD,
                  state="OPEN", base="main", auto=False, tests="pending", app=APP,
                  merge_error="", disarm_error="", view_error="", sticky=False,
-                 branch="integration/paquet-h-20261020-0500"):
+                 branch="integration/paquet-h-20261020-0500", base_oid=HEAD):
         self.protection, self.protection_error = protection, protection_error
         self.head, self.state, self.base, self.auto = head, state, base, auto
         self.tests, self.app, self.branch = tests, app, branch
         self.merge_error, self.disarm_error = merge_error, disarm_error
         self.view_error = view_error
+        #: la cible résolue publiée par la PR (`baseRefOid`, #3091)
+        self.base_oid = base_oid
         #: plusieurs PR partagent ce faux : un geste ne vaut pas pour l'autre
         self.sticky = sticky
         self.calls: list[list[str]] = []
@@ -135,7 +137,8 @@ class Forge:
                 return 1, "", self.view_error
             return 0, json.dumps({
                 "state": self.state, "headRefOid": self.head, "headRefName": self.branch,
-                "baseRefName": self.base, "isDraft": False,
+                "baseRefName": self.base, "baseRefOid": self.base_oid,
+                "isDraft": False,
                 "autoMergeRequest": {"enabledAt": "2026-10-20T03:00:00Z"} if self.auto
                 else None, "statusCheckRollup": rollup(self.tests)}), ""
         if args[:2] == ["pr", "merge"] and "--disable-auto" in args:
@@ -205,7 +208,7 @@ class Journal(unittest.TestCase):
             [{"id": 1, "kind": "frozen", "sha": self.frozen, "at_ts": 1.0}]
             if self.frozen else [])))
         stack.enter_context(mock.patch.object(
-            packet_automerge, "_verdicts", lambda cfg, db, row, ms, slug, base: self.gate))
+            packet_automerge, "_verdicts", lambda *a, **k: self.gate))
 
     def _events(self, db, item_id, limit=100):
         return list(reversed(self.events.get(int(item_id), [])))
@@ -449,6 +452,22 @@ class PassTest(Journal):
             "auto-merge merged repo=%s pr=%d sha=%s base=main commit=%s"
             % (SLUG, NUM, HEAD, "3" * 40)))
         self.assertEqual(self.check(gh)["result"], "idle")
+
+    def test_the_pr_base_oid_proves_the_composition_base(self):
+        # #3091 : la cible résolue lue sur la PR (`baseRefOid`) est transmise
+        # à la porte des avis, au lieu de dépendre de la ref locale du clone.
+        self.armed()
+        seen = {}
+
+        def verdicts(cfg, db, row, ms, *, slug, base, base_sha=""):
+            seen.update(base=base, base_sha=base_sha)
+            return (True, "", None)
+
+        with mock.patch.object(packet_automerge, "_verdicts", verdicts):
+            out = self.check(FakeGh(tests="success", base_oid=NEW))
+        self.assertEqual(out["result"], "merged", out)
+        self.assertEqual(seen, {"base": "main", "base_sha": NEW})
+
 
     def test_b1_a_new_head_already_green_is_never_merged(self):
         """B1 : la tête poussée après la publication porte déjà un `tests` vert
@@ -709,6 +728,27 @@ class VerdictsTest(unittest.TestCase):
         resolve.assert_called_once_with("cfg", None, SLUG)
         gate.assert_called_once_with("cfg", "db", row, ms, repo="/clone", project=project,
                                      target="main")
+
+    def test_the_pr_base_oid_is_forwarded_to_the_fire_gate(self):
+        row, ms = {"id": LOT, "assignee": "composeur"}, [{"kind": "frozen", "sha": HEAD}]
+        project = types.SimpleNamespace(name="ameesh")
+        with mock.patch.object(fire, "_repo_of", return_value="/clone"), \
+                mock.patch.object(fire, "_same_repository", return_value=True), \
+                mock.patch.object(fire, "_project", return_value=project), \
+                mock.patch.object(fire, "ready_verdicts",
+                                  return_value=(True, "", {})) as gate:
+            out = packet_automerge._verdicts("cfg", "db", row, ms, slug=SLUG,
+                                             base="main", base_sha=NEW)
+        self.assertEqual(out, (True, "", project))
+        gate.assert_called_once_with("cfg", "db", row, ms, repo="/clone", project=project,
+                                     target="main", base_sha=NEW)
+
+    def test_pr_status_carries_the_resolved_base(self):
+        status = packet_automerge.pr_status(SLUG, NUM, gh=FakeGh(tests="success",
+                                                                 base_oid=NEW))
+        self.assertEqual(status["base_oid"], NEW)
+        self.assertEqual(status["base"], "main")
+        self.assertEqual(status["head"], HEAD)
 
     def test_an_unreadable_gate_refuses(self):
         with mock.patch.object(fire, "_repo_of", side_effect=RuntimeError("registre")):

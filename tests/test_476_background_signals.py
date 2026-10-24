@@ -196,6 +196,8 @@ class BackgroundSignalTest(unittest.TestCase):
         store.return_value.turn_resources.close_turn.assert_called_once_with(
             "unknown-child", orphan=True, containers=None)
 
+    @unittest.skipUnless(hasattr(os, "waitid"),
+                         "POSIX waitid(WNOWAIT) absent (macOS)")
     def test_capture_refuses_a_harness_already_reaped_by_another_poller(self):
         proc = SimpleNamespace(pid=7000, returncode=0, _waitpid_lock=threading.Lock())
         with mock.patch.object(os, "waitid") as wait, \
@@ -436,6 +438,7 @@ class BackgroundSignalTest(unittest.TestCase):
 
     def test_handle_rejects_snapshot_start_mismatch_and_closes_fd(self):
         with mock.patch.object(os, "pidfd_open", return_value=42, create=True), \
+                mock.patch.object(signal, "pidfd_send_signal", create=True), \
                 mock.patch("ameesh.platform.signals.start_time", return_value=11.0), \
                 mock.patch.object(os, "close") as close:
             self.assertIsNone(ProcessHandle.open(7001, 10.0))

@@ -20,7 +20,7 @@ import unittest
 import uuid
 from unittest import mock
 
-from ameesh import plan_git, process_registry, registry, review_lot, storage, work
+from ameesh import mail, plan_git, process_registry, registry, review_lot, storage, work
 
 from .support import PgTestCase
 
@@ -173,6 +173,7 @@ class _Witness(PgTestCase):
         proof = mock.patch.object(work, "_declared_merge_commit",
                                   side_effect=lambda item, sha, **kw: sha)
         proof.start()
+        self.proof_patcher = proof     # #3201 : un témoin lit la preuve réelle
         self.addCleanup(proof.stop)
         self.repo = os.path.join(self.tmp, "depot")
         os.makedirs(self.repo)
@@ -719,6 +720,37 @@ class CatchUpWitnessTest(_Witness):
                         review_lot.ATTEMPT_PREFIX + str(lot))]
         self.assertEqual(attempts, [], attempts)
 
+    def test_un_depot_inconnu_avertit_le_pilote(self):
+        """#3201 : une relecture qui ne peut pas s'ouvrir faute de dépôt n'est
+        plus seulement journalisée. La première tentative envoie un courrier
+        aux pilotes déclarés, qui nomme le lot et le geste de reprise ; les
+        tentatives suivantes ne le renvoient pas."""
+        lot = self.merged_lot("dépôt inconnu")
+        registry.upsert(self.db, "pilote", harness="claude", host=self.cfg.host,
+                        cwd=self.repo)
+        patches = (
+            mock.patch.dict(os.environ,
+                            {"AMEESH_ALERT_ORCHESTRATORS": "pilote"}),
+            mock.patch.object(review_lot, "_repo_of_agent", return_value=""),
+            mock.patch.object(review_lot.lot_class, "repository", return_value=None),
+        )
+        with patches[0], patches[1], patches[2]:
+            out = review_lot.catch_up(self.db)
+        self.assertEqual(out["attempted"], 1, out)
+        self.assertEqual([entry["lot"] for entry in out["unopened"]], [lot], out)
+        self.assertIn("avertissement envoyé", out["warning"], out)
+        messages = mail.unread_active(self.db, "pilote")
+        self.assertEqual(len(messages), 1, messages)
+        body = messages[0]["body"]
+        self.assertIn("#%d" % lot, body)
+        self.assertIn("ameesh work merged", body)
+        with mock.patch.object(review_lot, "_repo_of_agent", return_value=""), \
+                mock.patch.object(review_lot.lot_class, "repository", return_value=None):
+            again = review_lot.catch_up(self.db, retry_s=0)
+        self.assertEqual(again["unopened"], [], again)
+        self.assertEqual(len(mail.unread_active(self.db, "pilote")), 1,
+                         "l'avertissement est renvoyé à chaque tentative")
+
 
 class DeclaredMergeWitnessTest(_Witness):
     """`ameesh work merged` : une fusion déclarée, sans PR ni file."""
@@ -750,6 +782,56 @@ class DeclaredMergeWitnessTest(_Witness):
         self.assertEqual(work.merged(self.db, lot, sha="abcdef1234",
                                      actor="claude1")["result"], "merged")
         self.assertEqual(self.review_lots(lot), [])
+
+    def test_work_merged_transmet_le_depot_prouve_a_la_relecture(self):
+        """#3201 : la déclaration transmet à `close_merged` le clone où elle a
+        prouvé la fusion. Sur un hôte qui ne connaît ni le dossier de
+        l'assigné ni le projet radar — le rattrapage d'un exécuteur —, la
+        classe restait « dépôt inconnu » et la relecture §2 du lot léger ne
+        s'ouvrait jamais (#3029, #3011, #3105)."""
+        _git(self.repo, "remote", "add", "origin", "git@github.com:manaty/ameesh.git")
+        lot = work.add(self.db, title="lot 3201 dépôt prouvé", app="ameesh",
+                       issue_ref="manaty/ameesh#7", actor="orch")["id"]
+        self.frozen_on_branch(lot, "lot/3201-depot")
+        _git(self.repo, "checkout", "-q", "develop")
+        _git(self.repo, "merge", "-q", "--no-ff", "-m", "ameesh-work: %d" % lot,
+             "lot/3201-depot")
+        sha = _git(self.repo, "rev-parse", "HEAD")
+        self.proof_patcher.stop()      # la preuve git réelle, pas la doublure
+        self.addCleanup(self.proof_patcher.start)
+        with mock.patch.object(review_lot, "_repo_of_agent", return_value=""), \
+                mock.patch.object(review_lot.lot_class, "repository", return_value=None):
+            done = work.merged(self.db, lot, sha=sha, repo=self.repo, actor="claude1")
+        self.assertEqual(done["result"], "merged", done)
+        rows = self.review_lots(lot)
+        self.assertEqual(len(rows), 1, rows)
+        body = work.get(self.db, rows[0]["id"])["body"]
+        self.assertIn("Classe : light", body)
+        self.assertIn(sha[:12], body)
+
+    def test_un_lot_deja_fusionne_rejoue_sa_relecture_avec_le_depot(self):
+        """#3201 : la voie idempotente de `merged` rejoue une relecture
+        manquante sur un lot déjà fusionné quand l'appelant donne le clone —
+        le relevé réel des lots à rejouer (#3029 et suivants)."""
+        _git(self.repo, "remote", "add", "origin", "git@github.com:manaty/ameesh.git")
+        lot = work.add(self.db, title="lot 3201 rejeu", app="ameesh",
+                       issue_ref="manaty/ameesh#8", actor="orch")["id"]
+        self.frozen_on_branch(lot, "lot/3201-rejeu")
+        first = work.merged(self.db, lot, sha="abcdef1234", actor="claude1")
+        self.assertEqual(first["result"], "merged", first)
+        self.assertEqual(self.review_lots(lot), [], "classe inconnue sans dépôt")
+        _git(self.repo, "checkout", "-q", "develop")
+        _git(self.repo, "merge", "-q", "--no-ff", "-m", "ameesh-work: %d" % lot,
+             "lot/3201-rejeu")
+        sha = _git(self.repo, "rev-parse", "HEAD")
+        with mock.patch.object(review_lot, "_repo_of_agent", return_value=""), \
+                mock.patch.object(review_lot.lot_class, "repository", return_value=None):
+            done = work.merged(self.db, lot, sha=sha, repo=self.repo,
+                               actor="claude1")
+        self.assertEqual(done["result"], "already", done)
+        rows = self.review_lots(lot)
+        self.assertEqual(len(rows), 1, rows)
+        self.assertIn("Classe : light", work.get(self.db, rows[0]["id"])["body"])
 
 
 class CloseGuardWitnessTest(_Witness):

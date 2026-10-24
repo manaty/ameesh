@@ -21,7 +21,8 @@ Inputs, all from machine sources (never a note, an assignment or a name):
   process cwd, then (#2561) a worktree tracked by housekeeping or a sibling of
   those paths named after the lot/agent — the freeze command may run from the
   agent's session directory, another repository. The exact SHA and the issue's
-  repository origin decide;
+  repository origin decide. The exact target branch is refreshed outside the
+  freeze transaction and pinned to a commit for the whole reading (#3250);
 - **authors**: the lot's assignee at freeze (`review_lot._author_at_freeze`,
   the historical turn trace, the same reference family as the merge gate) and
   every commit of the frozen range through its exact provenance receipt
@@ -70,14 +71,16 @@ import os
 import re
 import subprocess
 import time
+import dataclasses
 from dataclasses import dataclass, field
 from typing import Mapping, Optional, Sequence
 
 from . import canon as canon_mod
+from . import db as db_mod
 from . import lot_class, mechanics, plan_git, projects, registry, review
 from . import review_designation as rd
 from . import review_designation_pg as pg
-from . import review_authors, storage, work
+from . import review_authors, review_floor, review_target, storage, work
 
 #: the sender of the journal notes and automatic mails
 SENDER = pg.SENDER
@@ -85,6 +88,9 @@ SENDER = pg.SENDER
 UNAVAILABLE_PREFIX = "review-designation-unavailable:"
 #: journal prefix of a light/no-review outcome: one note per freeze (#2561)
 NONE_PREFIX = "review-designation-none:"
+#: journal prefix of an unreadable mark ignored by the reviewer load (#3047):
+#: the line names the offending lot and the id of the note it ignored
+UNREADABLE_PREFIX = "review-designation-unreadable:"
 #: the first release that carries `ameesh work reviewers` (#2447)
 RECOVERY_FROM = "1.12.0"
 #: why a light lot keeps no pre-merge reviewer (canon §2, full table)
@@ -745,38 +751,51 @@ def corrections_of_head(db, item: Mapping, milestone: Optional[Mapping],
 # the candidates: real session family, availability, open-lot load
 # --------------------------------------------------------------------------
 
-#: #3033: the reviews an agent still owes, as SQL CTEs ending in `pending`
-#: (`lot`, `name`, `sha`, `designated_at`). It is the **only** calculation of
-#: a pending review: the selection load (`_loads`, #3004), the reading of an
-#: agent's queue (`pending_reviews`: resume brief, idle turn) and the §9
-#: `green_verdict` relaunch all read it, so they cannot disagree.
-#:
-#: A review is pending when an open lot's **latest** freeze designates the
-#: agent and no verdict of theirs names that head. The designees are the gate's
-#: `reviewers` column (what the merge gate waits for), restricted to the
-#: current head:
-#:
-#: - a name of the **effective** mark of the latest freeze
-#:   (`review-designation:` selection or `review-designation-carried:` report,
-#:   the last one in journal order — the mark `_sync_reviewers` derives the
-#:   column from);
-#: - a manual designation: a name that no automatic mark of the lot ever
-#:   carried (kept across freezes by `_sync_reviewers`), or one designated by
-#:   hand (`reviewer X designated`, `ameesh work reviewer`) since the latest
-#:   freeze.
-#:
-#: An automatic name of an older freeze is therefore not a pending review of
-#: the new head — including during the selection itself, when the column has
-#: not been synced yet (#3004) — and a reviewer the pilot removed (#3004:
-#: dev1 removed, dev2 designated) is no longer one. Only a verdict naming the
-#: frozen head discharges it, full or abbreviated SHA, the `_same_freeze`
-#: rule; a `blocked` verdict counts, the reviewer has rendered it. A closed,
-#: merged or promoted lot owes nothing. `designated_at` is when the agent was
-#: designated for this head (latest of the freeze, the mark naming them, a
-#: manual designation since the freeze): the start of the §9 clock.
-PENDING_REVIEWS_CTE = """
-    open_items AS (
-        SELECT id, assignee, reviewers
+def _mark_reviewers(note: str) -> Optional[list]:
+    """The reviewer names a designation mark carries, or None.
+
+    The JSON is parsed **in Python**, before any cast: a hand-written note with
+    a valid mark prefix and invalid JSON is an unreadable mark, not a database
+    error that aborts the freeze transaction (#3047). `designation_of` refuses
+    an unreadable selection mark and `carried_mark_of` returns None; both are
+    the same refusal here, and the caller journals it.
+    """
+    from . import verdict_carry
+
+    text = str(note or "")
+    if text.startswith(pg.MARK_PREFIX):
+        try:
+            payload = pg.designation_of(text)
+        except rd.DesignationError:
+            return None
+    elif text.startswith(verdict_carry.CARRIED_MARK_PREFIX):
+        payload = verdict_carry.carried_mark_of(text)
+    else:
+        return []
+    if not isinstance(payload, dict):
+        return None
+    reviewers = payload.get("reviewers")
+    if reviewers is None:
+        return []
+    if not isinstance(reviewers, (list, tuple)):
+        return None
+    names = []
+    for row in reviewers:
+        if not isinstance(row, dict):
+            return None
+        names.append(str(row.get("name") or "").strip())
+    return names
+
+
+#: #3033 / #3047: the journal facts of every open lot that the pending-review
+#: calculation (`_pending_read`) needs, in **one** statement: the latest freeze,
+#: its latest mark, every designation mark of the lot, the manual designations
+#: since that freeze and the verdicts. Every note comes back as **text** and is
+#: parsed in Python: no note is ever cast by PostgreSQL, so no bad note can
+#: abort the freeze transaction this read runs in.
+_PENDING_FACTS_SQL = """
+    WITH open_items AS (
+        SELECT id, assignee, reviewers, title, state, app
           FROM work_items
          WHERE state NOT IN ('merged', 'promoted', 'closed')
     ), latest_freeze AS (
@@ -786,120 +805,183 @@ PENDING_REVIEWS_CTE = """
           JOIN open_items o ON o.id = m.work_item_id
          WHERE m.kind = 'frozen'
          ORDER BY m.work_item_id, m.at DESC, m.id DESC
-    ), latest_mark AS (
-        SELECT f.lot, f.sha, f.at, mk.note, mk.created_at AS mark_at
-          FROM latest_freeze f
-          LEFT JOIN LATERAL (
-                SELECT e.note, e.created_at
-                  FROM work_item_events e
-                 WHERE e.work_item_id = f.lot
-                   AND e.created_at >= f.at
-                   AND (starts_with(e.note,
-                                    'review-designation:' || f.lot
-                                    || ':' || f.freeze_id || ':')
-                        OR starts_with(e.note,
-                                       'review-designation-carried:' || f.lot
-                                       || ':' || f.freeze_id || ':'))
-                 ORDER BY e.id DESC
-                 LIMIT 1) mk ON true
-    ), marked AS (
-        SELECT f.lot, btrim(r.value->>'name') AS name
-          FROM latest_mark f
-          CROSS JOIN LATERAL jsonb_array_elements(
-              (substring(f.note from position(': ' in f.note) + 2))::jsonb
-              -> 'reviewers') AS r(value)
-         WHERE f.note IS NOT NULL
-    ), ever_marked AS (
-        SELECT DISTINCT e.work_item_id AS lot, btrim(r.value->>'name') AS name
+    ), marks AS (
+        SELECT e.work_item_id AS lot,
+               array_agg(e.id ORDER BY e.id) AS ids,
+               array_agg(e.note ORDER BY e.id) AS notes
           FROM work_item_events e
-          JOIN open_items o ON o.id = e.work_item_id
-          CROSS JOIN LATERAL jsonb_array_elements(
-              (substring(e.note from position(': ' in e.note) + 2))::jsonb
-              -> 'reviewers') AS r(value)
+          JOIN latest_freeze f ON f.lot = e.work_item_id
          WHERE starts_with(e.note, 'review-designation:' || e.work_item_id || ':')
             OR starts_with(e.note, 'review-designation-carried:'
                                    || e.work_item_id || ':')
-    ), designees AS (
-        SELECT f.lot, f.sha, btrim(c.name) AS name,
-               greatest(f.at,
-                        CASE WHEN EXISTS (SELECT 1 FROM marked k
-                                           WHERE k.lot = f.lot
-                                             AND k.name = btrim(c.name))
-                             THEN f.mark_at END,
-                        (SELECT max(e.created_at)
-                           FROM work_item_events e
-                          WHERE e.work_item_id = f.lot
-                            AND e.created_at >= f.at
-                            AND e.note = 'reviewer ' || btrim(c.name)
-                                         || ' designated')) AS designated_at
-          FROM latest_mark f
-          JOIN open_items o ON o.id = f.lot
-          CROSS JOIN LATERAL unnest(coalesce(o.reviewers, ARRAY[]::text[])) AS c(name)
-         WHERE btrim(coalesce(c.name, '')) NOT IN ('', '-none')
-           AND btrim(f.sha) <> ''
-           AND (EXISTS (SELECT 1 FROM marked k
-                         WHERE k.lot = f.lot AND k.name = btrim(c.name))
-                OR NOT EXISTS (SELECT 1 FROM ever_marked k
-                                WHERE k.lot = f.lot AND k.name = btrim(c.name))
-                OR EXISTS (SELECT 1 FROM work_item_events e
-                            WHERE e.work_item_id = f.lot
-                              AND e.created_at >= f.at
-                              AND e.note = 'reviewer ' || btrim(c.name)
-                                           || ' designated'))
-    ), pending AS (
-        SELECT d.lot, d.name, d.sha, d.designated_at
-          FROM designees d
-         WHERE NOT EXISTS (
-                SELECT 1
-                  FROM work_item_milestones v
-                 WHERE v.work_item_id = d.lot
-                   AND v.kind = 'verdict'
-                   AND lower(btrim(v.actor)) = lower(d.name)
-                   AND (lower(btrim(v.sha)) = lower(btrim(d.sha))
-                        OR (length(btrim(v.sha)) >= 7
-                            AND starts_with(lower(btrim(d.sha)),
-                                            lower(btrim(v.sha))))
-                        OR (length(btrim(d.sha)) >= 7
-                            AND starts_with(lower(btrim(v.sha)),
-                                            lower(btrim(d.sha))))))
+         GROUP BY e.work_item_id
+    ), manual AS (
+        SELECT e.work_item_id AS lot,
+               array_agg(e.note ORDER BY e.id) AS notes,
+               array_agg(extract(epoch FROM e.created_at)::float8
+                         ORDER BY e.id) AS ts
+          FROM work_item_events e
+          JOIN latest_freeze f ON f.lot = e.work_item_id
+         WHERE e.created_at >= f.at
+           AND starts_with(e.note, 'reviewer ')
+           AND right(e.note, length(' designated')) = ' designated'
+         GROUP BY e.work_item_id
+    ), verdicts AS (
+        SELECT v.work_item_id AS lot,
+               array_agg(v.actor ORDER BY v.id) AS actors,
+               array_agg(v.sha ORDER BY v.id) AS shas
+          FROM work_item_milestones v
+          JOIN latest_freeze f ON f.lot = v.work_item_id
+         WHERE v.kind = 'verdict'
+         GROUP BY v.work_item_id
     )
+    SELECT o.id AS lot, o.assignee, o.reviewers, o.title, o.state, o.app,
+           f.sha AS freeze_sha, extract(epoch FROM f.at)::float8 AS freeze_ts,
+           mark.id AS note_id, extract(epoch FROM mark.created_at)::float8 AS mark_ts,
+           mk.ids AS mark_ids, mk.notes AS mark_notes,
+           mn.notes AS manual_notes, mn.ts AS manual_ts,
+           vd.actors AS verdict_actors, vd.shas AS verdict_shas
+      FROM open_items o
+      LEFT JOIN latest_freeze f ON f.lot = o.id
+      LEFT JOIN LATERAL (
+          SELECT e.id, e.created_at
+            FROM work_item_events e
+           WHERE e.work_item_id = f.lot
+             AND e.created_at >= f.at
+             AND (starts_with(e.note,
+                              'review-designation:' || f.lot
+                              || ':' || f.freeze_id || ':')
+                  OR starts_with(e.note,
+                                 'review-designation-carried:' || f.lot
+                                 || ':' || f.freeze_id || ':'))
+           ORDER BY e.id DESC
+           LIMIT 1
+      ) mark ON true
+      LEFT JOIN marks mk ON mk.lot = o.id
+      LEFT JOIN manual mn ON mn.lot = o.id
+      LEFT JOIN verdicts vd ON vd.lot = o.id
 """
 
 
-def _loads(db) -> dict:
+def _pending_read(db, *, unreadable: Optional[list] = None) -> tuple[list, list]:
+    """The open lots and the reviews still owed, in **one** read (#3033).
+
+    It is the **only** calculation of a pending review: the selection load
+    (`_loads`, #3004), the reading of an agent's queue (`pending_reviews`:
+    resume brief, idle turn) and the §9 `green_verdict` relaunch all read it,
+    so they cannot disagree. Returns `(lots, pending)`: `lots` is every open
+    lot as `(lot, assignee)`; `pending` one row per (lot, reviewer) — `lot`,
+    `name`, `sha` (the frozen head), `designated_ts`, `title`, `state`, `app`
+    — oldest designation first.
+
+    A review is pending when an open lot's **latest** freeze designates the
+    agent and no verdict of theirs names that head. The designees are the
+    gate's `reviewers` column (what the merge gate waits for), restricted to
+    the current head:
+
+    - a name of the **effective** mark of the latest freeze
+      (`review-designation:` selection or `review-designation-carried:`
+      report, the last one in journal order — the mark `_sync_reviewers`
+      derives the column from);
+    - a manual designation: a name that no automatic mark of the lot ever
+      carried (kept across freezes by `_sync_reviewers`), or one designated by
+      hand (`reviewer X designated`, `ameesh work reviewer`) since the latest
+      freeze.
+
+    An automatic name of an older freeze is therefore not a pending review of
+    the new head — including during the selection itself, when the column has
+    not been synced yet (#3004) — and a reviewer the pilot removed (#3004:
+    dev1 removed, dev2 designated) is no longer one. Only a verdict naming the
+    frozen head discharges it, full or abbreviated SHA, the `_same_freeze`
+    rule; a `blocked` verdict counts, the reviewer has rendered it. A closed,
+    merged or promoted lot owes nothing. `designated_ts` is when the agent was
+    designated for this head (latest of the freeze, the mark naming them, a
+    manual designation since the freeze): the start of the §9 clock.
+
+    #3047: the marks are read as **text** and parsed by `_mark_reviewers`.
+    An unreadable mark carries no name — the latest one designates nobody, an
+    older one proves no automatic name — and is reported in `unreadable` as
+    `(lot, note id)` for the caller to journal; a valid mark next to it is
+    still read. The read raises when the base cannot be read: each caller
+    decides (zero load, « unreadable » queue).
+    """
+    rows = db.query(_PENDING_FACTS_SQL)
+    lots: list = []
+    pending: list = []
+    for row in rows or ():
+        try:
+            lot_id = int(row["lot"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        lots.append((lot_id, str(row.get("assignee") or "").strip()))
+        frozen_sha = str(row.get("freeze_sha") or "").strip()
+        if not frozen_sha:
+            continue
+        marks: dict = {}
+        for note_id, note in zip(row.get("mark_ids") or (), row.get("mark_notes") or ()):
+            names = _mark_reviewers(note)
+            marks[int(note_id)] = names
+            if names is None and unreadable is not None:
+                unreadable.append((lot_id, int(note_id)))
+        effective = (set(marks.get(int(row["note_id"])) or ())
+                     if row.get("note_id") is not None else set())
+        ever = {name for names in marks.values() for name in names or ()}
+        # `reviewer X designated` since the freeze: X, at its latest line
+        manual: dict = {}
+        for note, ts in zip(row.get("manual_notes") or (), row.get("manual_ts") or ()):
+            name = str(note or "")[len("reviewer "):-len(" designated")]
+            manual[name] = max(float(ts), manual.get(name, float(ts)))
+        rendered = list(zip(row.get("verdict_actors") or (), row.get("verdict_shas") or ()))
+        seen: set = set()
+        for raw in row.get("reviewers") or ():
+            name = str(raw or "").strip()
+            if name in ("", "-none") or name in seen:
+                continue
+            seen.add(name)
+            if name not in effective and name in ever and name not in manual:
+                continue
+            if any(str(actor or "").strip().lower() == name.lower()
+                   and rd._same_freeze(frozen_sha, sha)
+                   for actor, sha in rendered):
+                continue
+            since = [float(ts) for ts in (
+                row.get("freeze_ts"),
+                row.get("mark_ts") if name in effective else None,
+                manual.get(name)) if ts is not None]
+            pending.append({"lot": lot_id, "name": name, "sha": frozen_sha,
+                            "designated_ts": max(since) if since else None,
+                            "title": row.get("title") or "",
+                            "state": row.get("state") or "",
+                            "app": row.get("app") or ""})
+    pending.sort(key=lambda r: (r["designated_ts"] is None, r["designated_ts"] or 0.0,
+                                r["lot"], r["name"]))
+    return lots, pending
+
+
+def _loads(db, *, unreadable: Optional[list] = None) -> dict:
     """Open lots per agent (the load of the selection), in **one** read.
 
     The charge of a reviewer is every open lot they carry: the lots assigned to
-    them, plus the reviews they still owe (#3004) — `PENDING_REVIEWS_CTE`, the
-    same calculation as their queue (`pending_reviews`, #3033). The second part
-    is what was missing: a reviewer with an empty assignment queue but a full
+    them, plus the reviews they still owe (#3004) — `_pending_read`, the same
+    calculation as their queue (`pending_reviews`, #3033). The second part is
+    what was missing: a reviewer with an empty assignment queue but a full
     review queue looked free, so every freeze of their family picked them
     again. An unreadable read is zero, as before: never a guess and never a
     failed freeze. A lot where the agent is both assignee and designated
     reviewer counts once: `charges` is a set of (lot, agent).
+
+    #3047: an unreadable mark charges nobody and is reported in `unreadable`
+    as `(lot, note id)`; the caller journals it (`_note_unreadable`).
     """
     try:
-        rows = db.query(
-            "WITH" + PENDING_REVIEWS_CTE + """
-            , charges AS (
-                SELECT id AS lot, assignee AS name
-                  FROM open_items
-                 WHERE assignee IS NOT NULL AND assignee <> ''
-                UNION
-                SELECT lot, name FROM pending
-            )
-            SELECT name, count(*)::int AS load
-              FROM charges
-             GROUP BY name
-            """)
+        lots, pending = _pending_read(db, unreadable=unreadable)
     except Exception:  # noqa: BLE001 - unreadable load: zero, never a guess
         return {}
-    out = {}
-    for row in rows or ():
-        try:
-            out[str(row["name"])] = int(row["load"])
-        except (KeyError, TypeError, ValueError):
-            continue
+    charges = {(lot_id, assignee) for lot_id, assignee in lots if assignee}
+    charges.update((row["lot"], row["name"]) for row in pending)
+    out: dict = {}
+    for _lot_id, name in charges:
+        out[name] = out.get(name, 0) + 1
     return out
 
 
@@ -909,31 +991,59 @@ def pending_reviews(db, agent: Optional[str] = None) -> list:
     One row per (lot, reviewer): `lot`, `name`, `sha` (the frozen head),
     `designated_ts` (epoch of the designation for this head), `title`,
     `state`, `app`. `agent` restricts to one reviewer (names compared without
-    case, like the verdict). The calculation is `PENDING_REVIEWS_CTE`, shared
-    with the selection load (#3004). The read raises when the base cannot be
-    read: the caller says « unreadable », it never shows an empty queue.
+    case, like the verdict). The calculation is `_pending_read`, shared with
+    the selection load (#3004); an unreadable mark designates nobody (#3047).
+    The read raises when the base cannot be read: the caller says
+    « unreadable », it never shows an empty queue.
     """
-    where, params = "", ()
-    if agent is not None:
-        where, params = " WHERE lower(p.name) = lower(btrim(%s))", (str(agent),)
-    rows = db.query(
-        "WITH" + PENDING_REVIEWS_CTE + """
-        SELECT p.lot, p.name, p.sha,
-               extract(epoch FROM p.designated_at)::float8 AS designated_ts,
-               w.title, w.state, w.app
-          FROM pending p
-          JOIN work_items w ON w.id = p.lot""" + where + """
-         ORDER BY p.designated_at, p.lot, p.name
-        """, params)
-    out = []
-    for row in rows or ():
-        out.append({"lot": int(row["lot"]), "name": str(row["name"]),
-                    "sha": str(row.get("sha") or ""),
-                    "designated_ts": (float(row["designated_ts"])
-                                      if row.get("designated_ts") is not None else None),
-                    "title": row.get("title") or "", "state": row.get("state") or "",
-                    "app": row.get("app") or ""})
-    return out
+    _lots, pending = _pending_read(db)
+    if agent is None:
+        return pending
+    wanted = str(agent).strip().lower()
+    return [row for row in pending if row["name"].lower() == wanted]
+
+
+def _note_unreadable(db, lot: int, state: str,
+                     unreadable: Sequence[tuple]) -> None:
+    """Journal unreadable designation marks once, without failing a freeze.
+
+    The trace is written on the lot whose load observed the mark, the row the
+    freeze transaction already holds: writing on the foreign lot would take a
+    second lot's lock and two concurrent freezes could journal on each other.
+    The line names the offending lot and the note id (#3047). The write is
+    best effort, under a savepoint when a transaction is open: a failed trace
+    must never abort the freeze it explains.
+    """
+    if not unreadable:
+        return
+    in_tx = db_mod.in_transaction(db)
+    for bad_lot, note_id in unreadable:
+        try:
+            bad_lot, note_id = int(bad_lot), int(note_id)
+        except (TypeError, ValueError):
+            continue
+        prefix = "%s%d:%d:" % (UNREADABLE_PREFIX, bad_lot, note_id)
+        text = ("%s unreadable review designation mark ignored in the reviewer"
+                " load (lot #%d, note #%s)" % (prefix, bad_lot, note_id))
+        try:
+            if storage.of(db).work.events_noted(prefix, 0.0, ids=[int(lot)]):
+                continue
+        except Exception:  # noqa: BLE001 - no duplicate proof: write the trace
+            pass
+        try:
+            if in_tx:
+                db.execute("SAVEPOINT review_designation_load_trace")
+            try:
+                storage.of(db).work.note(int(lot), state, text, SENDER)
+            except Exception:  # noqa: BLE001 - a trace never blocks a freeze
+                if in_tx:
+                    db.execute("ROLLBACK TO SAVEPOINT review_designation_load_trace")
+                    db.execute("RELEASE SAVEPOINT review_designation_load_trace")
+                continue
+            if in_tx:
+                db.execute("RELEASE SAVEPOINT review_designation_load_trace")
+        except Exception:  # noqa: BLE001 - best effort only
+            continue
 
 
 def _advances(db) -> dict:
@@ -975,6 +1085,22 @@ def _notify(cfg, db, project: str, listing: Sequence[Mapping]) -> str:
         if not wanted or wanted in projects.agent_projects(dict(row)):
             return name
     return ""
+
+
+def _candidates(listing: Sequence[Mapping], *, loads: Mapping, project: str, families,
+                pilot: str) -> list:
+    """The project's candidates, its pilot removed.
+
+    The project's agents plus the agents of another team that declare it under
+    `relit:` (#3185). The pilot receives the capacity alert; the review stays
+    with the others, so the two roles never collapse into one mail — even when
+    the pilot's card would make it a candidate.
+    """
+    candidates = rd.candidates_from_registry(listing, loads=loads, project=project,
+                                             families=families)
+    if pilot:
+        candidates = [candidate for candidate in candidates if candidate.name != pilot]
+    return candidates
 
 
 def _manual(db, item: Mapping) -> list:
@@ -1074,12 +1200,38 @@ def _manual_covers(inputs: Inputs) -> bool:
 # the inputs of one freeze
 # --------------------------------------------------------------------------
 
+@dataclass(frozen=True)
+class Target:
+    """The target certified outside the transaction, for one frozen head."""
+    repo: str
+    declared: str
+    sha: str
+    head: str
+
+
+def prepare_target(cfg, db, item: Mapping, head: str, *,
+                   fetch: bool = True) -> Target | Unavailable:
+    repo = _repository(db, cfg, item, head, fetch=fetch)
+    if not repo:
+        return Unavailable("no repository holds the frozen head %s: cannot read the"
+                           " frozen diff" % head[:12])
+    base = lot_class.default_base(cfg, item, repo)
+    if not base:
+        return Unavailable("no target branch known for lot #%d" % int(item["id"]))
+    try:
+        sha = review_target.resolve(repo, base, fetch=fetch)
+    except (review_target.TargetError, canon_mod.GitError) as exc:
+        return Unavailable(str(exc))
+    return Target(repo, base, sha, head)
+
+
 def prepare(cfg, db, lot: int, *, freeze: Optional[Mapping] = None,
-            fetch: bool = True) -> Inputs | Unavailable:
+            fetch: bool = True, target=None) -> Inputs | Unavailable:
     """Reads the machine inputs of a freeze; an expected refusal is `Unavailable`.
 
     `fetch=False` keeps the read local (no `git fetch`), as the freeze
-    transaction requires."""
+    transaction requires. A branch target then needs the `target` snapshot
+    prepared outside the transaction; otherwise the read is unavailable."""
     item = work.get(db, int(lot))
     if item is None:
         return Unavailable("lot #%d not found" % int(lot))
@@ -1104,13 +1256,14 @@ def prepare(cfg, db, lot: int, *, freeze: Optional[Mapping] = None,
             "resolves a ref in its own clone — freeze again with the full head "
             "(`ameesh work milestone %d frozen --sha <commit>`)"
             % (freeze.get("id"), frozen_sha, int(lot)))
-    repo = _repository(db, cfg, item, frozen_sha, fetch=fetch)
-    if not repo:
-        return Unavailable("no repository holds the frozen head %s: cannot read the"
-                           " frozen diff" % frozen_sha[:12])
-    base = lot_class.default_base(cfg, item, repo)
-    if not base:
-        return Unavailable("no target branch known for lot #%d" % int(lot))
+    if target is None:
+        target = prepare_target(cfg, db, item, frozen_sha, fetch=fetch)
+    if isinstance(target, Unavailable):
+        return target
+    if (target.head != frozen_sha
+            or target.declared != lot_class.default_base(cfg, item, target.repo)):
+        return Unavailable("the target changed since refresh: retry outside the freeze transaction")
+    repo, base = target.repo, target.sha
     from . import packet_reviews
 
     try:
@@ -1145,16 +1298,21 @@ def prepare(cfg, db, lot: int, *, freeze: Optional[Mapping] = None,
     policy = _policy(cfg, db, project, paths)
     if isinstance(policy, Unavailable):
         return policy
+    # #3183 : le plancher posé par un pilote (`review_floor`) relève le compte
+    # de la désignation comme celui de la porte ; un journal illisible attend.
+    floor = review_floor.apply({}, db, int(lot), cfg=cfg)
+    if floor.get("reviews_floor_unreadable"):
+        return Unavailable("review floor unreadable: %s" % floor["reviews_floor_unreadable"])
+    if int(floor.get("reviews_floor") or 0) > policy.required:
+        policy = dataclasses.replace(policy, required=int(floor["reviews_floor"]))
     listing = registry.overview(db)
     notify = _notify(cfg, db, project, listing)
     families = policy.families
-    candidates = rd.candidates_from_registry(
-        listing, loads=_loads(db), project=project, families=families)
-    if notify:
-        # the pilot receives the capacity alert; the review stays with the
-        # project's agents, so the two roles never collapse into one mail
-        candidates = [candidate for candidate in candidates
-                      if candidate.name != notify]
+    unreadable: list = []
+    candidates = _candidates(listing, loads=_loads(db, unreadable=unreadable),
+                             project=project, families=families, pilot=notify)
+    if unreadable:
+        _note_unreadable(db, int(lot), str(item.get("state") or ""), unreadable)
     authors, unknown, correctors = review_authors.reading(
         db, item, freeze, commits, repo, families=policy.families, trace=True,
         base=start, head=frozen_sha)
@@ -1766,7 +1924,7 @@ def _manual_unavailable(cfg, tx, item: Mapping, freeze: Mapping,
 
 def _designate_in_transaction(cfg, tx, lot: int, *, milestone: Optional[Mapping],
                               threads: list, carried: Optional[Mapping] = None,
-                              reading: Optional[dict] = None) -> dict:
+                              reading: Optional[dict] = None, target=None) -> dict:
     """The `on_frozen` body: all writes stay in the freeze's transaction.
 
     `carried` (#2487) : le plan du report quand il couvre la tête gelée ; la
@@ -1802,7 +1960,7 @@ def _designate_in_transaction(cfg, tx, lot: int, *, milestone: Optional[Mapping]
         return _carried_in_transaction(tx, item, freeze, carried)
     try:
         # no network read inside the freeze transaction (see the docstring)
-        inputs = prepare(cfg, tx, int(lot), freeze=freeze, fetch=False)
+        inputs = prepare(cfg, tx, int(lot), freeze=freeze, fetch=False, target=target)
     except Exception as exc:  # noqa: BLE001 - recorded below, never guessed
         if manual:
             return _manual_unavailable(
@@ -1994,7 +2152,8 @@ def _notify_superseded_blocks(db, item: Mapping, freeze: Mapping, outcome: Mappi
 
 
 def designate_in_transaction(cfg, tx, lot: int, *, milestone: Optional[Mapping],
-                             threads: list, carried: Optional[Mapping] = None) -> dict:
+                             threads: list, carried: Optional[Mapping] = None,
+                             target=None) -> dict:
     """The `on_frozen` body, plus the superseded-block notification (#2681).
 
     The notification is best-effort: it runs after the designation writes, and
@@ -2004,7 +2163,7 @@ def designate_in_transaction(cfg, tx, lot: int, *, milestone: Optional[Mapping],
     reading: dict = {}
     result = _designate_in_transaction(cfg, tx, lot, milestone=milestone,
                                        threads=threads, carried=carried,
-                                       reading=reading)
+                                       reading=reading, target=target)
     try:
         item = work.get(tx, int(lot)) or {"id": int(lot)}
         _notify_superseded_blocks(tx, item, milestone or {}, result, threads,
@@ -2014,18 +2173,21 @@ def designate_in_transaction(cfg, tx, lot: int, *, milestone: Optional[Mapping],
     return result
 
 
-def hook(cfg, outcome: Optional[dict] = None, *, carried: Optional[Mapping] = None):
+def hook(cfg, outcome: Optional[dict] = None, *, carried: Optional[Mapping] = None,
+         target=None):
     """The callback installed on the CLI's `frozen` milestone.
 
     `outcome`, when given, receives the designation shape for the command's
     message; the callback itself has no other return channel. `carried` is the
     read-only plan of the verdict carry when it covers the head being frozen
     (#2487): the callback then keeps the reported reviewers and mails nobody.
+    `target` (#3250) is prepared before opening the transaction; without it a
+    branch target defers to recovery instead of trusting the clone's old ref.
     """
     def on_frozen(tx, milestone, threads):
         result = designate_in_transaction(cfg, tx, int(milestone["work_item_id"]),
                                           milestone=milestone, threads=threads,
-                                          carried=carried)
+                                          carried=carried, target=target)
         if outcome is not None:
             outcome.clear()
             outcome.update(result)

@@ -326,6 +326,11 @@ class AlerteTest(_Base):
             self.agent(name, responsible="human:proprio")
         self.agent("claude3", responsible="human:resp3")
         self.agent("chef-b", team="beta")
+        # #3036 : un brief n'est plus déposé à un agent sans bail vivant.
+        self.db.execute(
+            "UPDATE agent_registry SET lease_owner = 'runner-' || name,"
+            " lease_expires_at = now() + interval '1 hour'"
+            " WHERE name IN ('orchestrateur', 'claude1', 'mesh-design', 'chef-b')")
 
     def vieillir(self, minutes=20):
         self.db.execute("UPDATE agent_mailbox SET created_at = now() - make_interval("

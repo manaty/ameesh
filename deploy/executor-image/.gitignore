@@ -1,2 +1,3 @@
-# binaire dsh fourni au moment de la construction (Containerfile), jamais versionné
+# Aucun binaire dsh n'est versionné : l'arbre vient de package.json +
+# package-lock.json, installé par `npm ci` à la construction (Containerfile).
 dsh

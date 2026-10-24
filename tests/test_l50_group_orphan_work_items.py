@@ -46,7 +46,6 @@ class GroupOrphanLotsTest(unittest.TestCase):
         notifier = notify.Notifier(cfg, ncfg, sender=sender, clock=lambda: 1000,
                                    log=lambda message: None)
         with patch.object(notify.Router, "resolve", return_value=("human:owner", "lot")), \
-             patch.object(notify.Notifier, "_brief_orchestrators"), \
              patch.object(notify.Notifier, "_brief_agents"):
             records = notifier.run_pass(None, [orphan(i) for i in (3, 9, 52)])
             self.assertEqual([(r["event"], r["type"]) for r in records], [("raised", "orphan_lot")])
@@ -68,7 +67,6 @@ class GroupOrphanLotsTest(unittest.TestCase):
                                    log=lambda message: None)
         with patch.object(notify.Router, "resolve", side_effect=lambda a: (
                 a.get("responsible") or ("human:a" if a["lot"] == 1 else "human:b"), "lot")), \
-             patch.object(notify.Notifier, "_brief_orchestrators"), \
              patch.object(notify.Notifier, "_brief_agents"):
             records = notifier.run_pass(None, [orphan(1), orphan(2)])
             self.assertEqual({r["human"] for r in records}, {"human:a", "human:b"})
@@ -82,7 +80,6 @@ class GroupOrphanLotsTest(unittest.TestCase):
                                    clock=lambda: 1000, log=lambda message: None)
         with patch.object(notify.Router, "resolve", side_effect=lambda a: (
                 a.get("responsible") or "human:owner", "lot")), \
-             patch.object(notify.Notifier, "_brief_orchestrators"), \
              patch.object(notify.Notifier, "_brief_agents"):
             yield notifier
 

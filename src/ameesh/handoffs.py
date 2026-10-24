@@ -92,6 +92,12 @@ def plan(db, agent, *, limits_for, queued=True, now=None, memory_bytes=4*GIB, di
     now = time.time() if now is None else now
     if agent.get("status") in ("stopped", "paused") or agent.get("mode") != "execute":
         return None
+    # L165 (EP1) : un rôle élu ne se déplace pas par handoff. Son bail expiré
+    # est repris par un autre hôte candidat, sans preuve de source : le travail
+    # qui compte est en base, dans le canon et sur GitHub, pas dans un
+    # worktree local.
+    if agent.get("releve") == "election":
+        return None
     api = storage.of(db)
     forced = demand is not None
     if forced and demand.get("reason") not in ("host_drain", "host_return", "host_loss"):

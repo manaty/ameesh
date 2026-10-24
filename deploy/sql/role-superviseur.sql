@@ -71,7 +71,8 @@
 --     plus (deploy/sql/role-superviseur-contenus.sql) :
 --       agent_mailbox.body, .payload, .meta
 --       agent_registry.pending_prompt, .current_prompt (et agent_mesh_overview),
---              .restart_brief (brief de `ameesh restart` en attente, L26)
+--              .restart_brief (brief de `ameesh restart` en attente, L26),
+--              .election_brief (brief de relève élue, L165/EP3)
 --       thread_index.last_excerpt
 --       actions.args, .last_note
 --       action_events.note
@@ -208,6 +209,9 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         'created_by', 'canon_ref', 'capabilities', 'last_event_at',
         'placement_ok', 'placement_diagnostic', 'placement_ref',
         'placement_profile',
+        -- L165 (EP1) : relève et hôtes candidats (des réglages et des noms,
+        -- pas de contenu), comme `mode` et `admitted_hosts`
+        'releve', 'candidats',
         -- #508 (0411) : preuve de vie du runner, sans contenu ni secret
         'runner_seen_at', 'runner_seen_host', 'runner_seen_owner',
         -- L232a (0371) : clôture de passage entre hôtes
@@ -239,6 +243,9 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         'canon',
         -- L243 (0388) : projets de l'agent (des noms, pas de contenu)
         'projects',
+        -- #3185 (0479) : projets dont l'agent relit les lots, hors de son
+        -- équipe (des noms, pas de contenu) — comme `projects` et `roles`
+        'relit',
         -- L148 (0410) : `workstream`, le nouveau nom de `chantier` (même donnée)
         'workstream',
         -- L244 (0427) : rôles déclarés d'une fiche Agent/Persona (des noms,

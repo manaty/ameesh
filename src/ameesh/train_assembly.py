@@ -51,6 +51,7 @@ from . import (mechanics, merge_queue, packet_reservation, plan_git, radar,
                resolutions, review_provenance, train, train_contracts,
                train_initial, train_policy, train_reservation, train_runner,
                train_shadow)
+from .config import NAME_RE
 
 #: schema of the host configuration's ``train`` block
 SCHEMA = "ameesh-train-host/1"
@@ -69,7 +70,7 @@ _FULL_SHA = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\Z")
 _GITHUB = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+\Z")
 _TARGET = re.compile(r"[A-Za-z0-9][A-Za-z0-9._/-]*\Z")
 
-_TOP_KEYS = {"schema", "host", "mode", "projects"}
+_TOP_KEYS = {"schema", "host", "mode", "projects", "role"}
 _PROJECT_KEYS = {"repo", "target", "github", "canon", "canon_commit",
                  "ci_contract", "provenance", "reservation", "deadline_minutes",
                  "candidate", "initial_since"}
@@ -108,6 +109,10 @@ class Settings:
     host: str
     mode: str
     projects: tuple[ProjectConfig, ...]
+    #: L165 (EP5): optional elected role (agent name) that gates every passage.
+    #: When set, `train.host` no longer pins the executing host: every host
+    #: assembles the service and only the role holder passes.
+    role: str | None = None
 
     @classmethod
     def parse(cls, raw) -> "Settings":
@@ -116,7 +121,7 @@ class Settings:
         unknown = sorted(set(raw) - _TOP_KEYS)
         if unknown:
             raise ConfigurationError("`train`: unknown key(s): %s" % ", ".join(unknown))
-        missing = sorted(_TOP_KEYS - set(raw))
+        missing = sorted({"schema", "host", "mode", "projects"} - set(raw))
         if missing:
             raise ConfigurationError("`train`: missing key(s): %s" % ", ".join(missing))
         if raw["schema"] != SCHEMA:
@@ -126,6 +131,11 @@ class Settings:
         if mode not in MODES:
             raise ConfigurationError("`train.mode`: %s expected (got %r)"
                                      % (" | ".join(MODES), mode))
+        role = raw.get("role")
+        if role is not None:
+            role = _text(role, "train.role")
+            if not NAME_RE.fullmatch(role):
+                raise ConfigurationError("`train.role`: an agent name is required")
         projects = raw["projects"]
         if not isinstance(projects, dict) or not projects:
             raise ConfigurationError("`train.projects`: a non-empty object is required")
@@ -135,7 +145,7 @@ class Settings:
                 raise ConfigurationError("`train.projects`: project names are non-empty "
                                          "untrimmed strings")
             parsed.append(_project(name, declaration))
-        return cls(host=host, mode=mode, projects=tuple(parsed))
+        return cls(host=host, mode=mode, projects=tuple(parsed), role=role)
 
 
 def _text(value, where):
@@ -226,6 +236,8 @@ class Assembly:
     passages: tuple
     lease: train_runner.HostLease | None
     reason: str
+    #: L165 (EP5): the elected role whose lease gates every passage, or None.
+    role: str | None = None
 
     @property
     def active(self):
@@ -245,7 +257,7 @@ def assemble(cfg, *, notify=None) -> Assembly:
     if not raw:
         return Assembly(None, (), None, "no `train` configuration")
     settings = Settings.parse(raw)
-    if (cfg.host or "").strip() != settings.host:
+    if settings.role is None and (cfg.host or "").strip() != settings.host:
         return Assembly(settings, (), None,
                         "`train.host` designates %s, this host is %s"
                         % (settings.host, cfg.host))
@@ -253,8 +265,9 @@ def assemble(cfg, *, notify=None) -> Assembly:
     passages = tuple(_passage(cfg, project, settings.mode, report)
                      for project in settings.projects)
     lease = train_runner.HostLease(cfg)
-    return Assembly(settings, passages, lease, "%s mode, %d passage(s)"
-                    % (settings.mode, len(passages)))
+    gate = ("role %s" % settings.role) if settings.role else "host pin"
+    return Assembly(settings, passages, lease, "%s mode, %d passage(s), %s"
+                    % (settings.mode, len(passages), gate), role=settings.role)
 
 
 def _passage(cfg, spec: ProjectConfig, mode, report):

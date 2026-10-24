@@ -1,6 +1,6 @@
 {
  "schema": "ameesh-exec-contract/1",
- "version": "1.7.0",
+ "version": "1.9.0",
  "prefix": "/api/exec/v1",
  "description": "Contrat de l'API d'exécuteur médiée (L107) : la liste FERMÉE des opérations de storage.interface qu'un exécuteur d'appareil peut appeler, leur portée et leur fencing. Référence : docs/EXECUTEUR-MEDIEE.md.",
  "scopes": {
@@ -686,7 +686,10 @@
    ],
    "fence": false,
    "param_agent": "name",
-   "forced": {},
+   "forced": {
+    "host": "executor_host",
+    "election_brief": null
+   },
    "params": [
     {
      "name": "name",
@@ -719,6 +722,30 @@
       "type": "boolean"
      },
      "required": true
+    },
+    {
+     "name": "host",
+     "kind": "keyword",
+     "schema": {
+      "type": [
+       "string",
+       "null"
+      ]
+     },
+     "required": false,
+     "default": null
+    },
+    {
+     "name": "election_brief",
+     "kind": "keyword",
+     "schema": {
+      "type": [
+       "string",
+       "null"
+      ]
+     },
+     "required": false,
+     "default": null
     }
    ],
    "result": {
@@ -735,7 +762,8 @@
    "rules": [
     "owner préfixé par exec:<executor_id>: sinon 403 forbidden_scope",
     "ttl_seconds borné par le lease_ttl de l'hôte (GET /host)",
-    "hôte indisponible : 403 host_unavailable"
+    "hôte indisponible : 403 host_unavailable",
+    "election_brief : natif seulement, forcé à null sur un appareil ; une relève croisée écrit le résumé de reprise de la session neuve, et une relève croisée sans ce brief est refusée (aucun déplacement de ligne)"
    ]
   },
   {
@@ -4474,7 +4502,8 @@
    "handoffs": "host handoff controller: mesh server only",
    "lot_sessions": "session parking and activity wake listing: runner of the mesh server only; scheduled lot wakes pass by lot_sessions.due_wakes/claim_wake/consume_wake",
    "host_lifecycle": "host withdrawal and loss recovery: mesh server only",
-   "github_watch": "GitHub intake cursors and deduplication: notifier host only"
+   "github_watch": "GitHub intake cursors and deduplication: notifier host only",
+   "notify_liveness": "notifier liveness and off-notifier brief claims (#3007): mesh server only"
   },
   "operations": {
    "accounts": [
@@ -4557,9 +4586,12 @@
     "put"
    ],
    "canon": [
+    "candidate_names",
     "claim_commit",
+    "clear_candidate",
     "clear_pending_stop",
     "clear_responsible",
+    "close_candidates",
     "close_others",
     "flag_default",
     "host_rows",
@@ -4574,10 +4606,12 @@
     "relocate",
     "revive",
     "set_default_id",
+    "set_election",
     "set_placement",
     "state",
     "states",
     "stop_removed",
+    "write_candidate",
     "write_declared"
    ],
    "catalog": [
@@ -4866,6 +4900,8 @@
     "land_unlock",
     "train_read",
     "train_save",
+    "train_abandon",
+    "train_adopt",
     "train_fire_read",
     "train_fire_give",
     "train_fire_change",
@@ -4910,6 +4946,7 @@
     "set_estimate",
     "set_issue_ref",
     "set_partial_seen",
+    "set_type",
     "timeline",
     "turn_spans",
     "unassign",
@@ -4965,6 +5002,7 @@
     "get",
     "listing",
     "progress",
+    "reconcile_loss",
     "undrain"
    ],
    "github_watch": [
@@ -4974,6 +5012,12 @@
     "lock",
     "remember",
     "scan"
+   ],
+   "notify_liveness": [
+    "beat",
+    "claim_brief",
+    "latest",
+    "release_brief"
    ]
   }
  },
