@@ -170,6 +170,12 @@ elif sys.argv[1] == 'show':
     if (state / ('restart-' + name)).exists():
         row['lease_epoch'] = 9 if scenario != 'stale-lease' else 7
         if scenario == 'moved': row['host'] = 'elsewhere'
+        # #3412 : le rôle élu de dev8 est repris par un autre hôte candidat
+        # (époque supérieure) ; ou son bail ne revient pas (vrai échec).
+        if scenario == 'elu-ailleurs' and name == 'dev8':
+            row['lease_owner'] = 'runner-dev8@other-host'
+        if scenario == 'bail-perdu' and name == 'dev8':
+            row['lease_epoch'] = 7
     if scenario == 'busy-once' and name == 'dev9' and not (state / 'busy-seen').exists():
         (state / 'busy-seen').touch(); row['status'] = 'running'
     print(json.dumps(row))
@@ -323,6 +329,14 @@ elif sys.argv[1:3] == ['role', 'timers']:
     with (state / 'role-timers.log').open('a') as f:
         f.write(' '.join(sys.argv[1:]) + '\n')
     print('minuteries de rôle ok')
+elif sys.argv[1:3] == ['role', 'status']:
+    # #3412 : rapport d'élection ; le banc le pose quand un rôle élu change
+    # d'hôte candidat pendant le redémarrage.
+    nom = sys.argv[3] if len(sys.argv) > 3 and not sys.argv[3].startswith('-') else None
+    if nom is None: sys.exit(0)
+    rapport = state / ('role-' + nom + '.json')
+    print(rapport.read_text() if rapport.exists()
+          else json.dumps({'name': nom, 'elected': False}))
 else: sys.exit(2)
 '''
 SYSTEMCTL = r'''#!/usr/bin/env python3
@@ -1096,7 +1110,43 @@ class AgentHostTest(unittest.TestCase):
                 self.assertNotEqual(p.returncode, 0)
                 self.assertIn('bail', p.stderr)
                 self.assertIn('journalctl --user', p.stderr)
-                self.assertNotIn('redémarré', p.stdout)
+                # #3412 : le balayage continue après un bail non repris ; les
+                # agents en échec sont nommés à la fin, pas un arrêt au premier.
+                self.assertNotIn('dev8 : redémarré', p.stdout)
+                self.assertIn('2 agent(s) sans bail repris : dev8 dev9', p.stdout)
+
+    def test_restart_elected_role_taken_by_other_host_is_a_warning(self):
+        """#3412 : la reprise par un autre hôte candidat est l'issue normale."""
+        agents = [dict(name=n, host='host-agents', mode='execute', status='idle')
+                  for n in ('dev7', 'dev8', 'dev9')]
+        (self.state / 'role-dev8.json').write_text(json.dumps({
+            'name': 'dev8', 'elected': True, 'holder': 'other-host',
+            'lease_owner': 'runner-dev8@other-host', 'epoch': 9,
+            'candidates': [{'host': 'other-host', 'ready': True},
+                           {'host': 'host-agents', 'ready': True}]}))
+        p = self.run_vm('redemarrer', 'elu-ailleurs', agents=agents)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn('WARNING dev8: bail du rôle élu repris par other-host '
+                      '(époque 9 > 7)', p.stdout)
+        self.assertNotIn('bail non repris', p.stderr)
+        starts = self.starts()
+        for n in ('dev7', 'dev8', 'dev9'):
+            self.assertIn('--user start ameesh-runner-agent@%s.service' % n, starts)
+
+    def test_restart_lease_failure_continues_the_sweep(self):
+        """#3412 : un vrai échec de bail ne stoppe que cet agent."""
+        agents = [dict(name=n, host='host-agents', mode='execute', status='idle')
+                  for n in ('dev7', 'dev8', 'dev9')]
+        p = self.run_vm('redemarrer', 'bail-perdu', agents=agents)
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn('dev8 : active, mais bail non repris', p.stderr)
+        self.assertIn('ERREUR: 1 agent(s) sans bail repris : dev8', p.stdout)
+        self.assertNotIn('dev8 : redémarré', p.stdout)
+        self.assertIn('dev7 : redémarré', p.stdout)
+        self.assertIn('dev9 : redémarré', p.stdout)
+        starts = self.starts()
+        for n in ('dev7', 'dev8', 'dev9'):
+            self.assertIn('--user start ameesh-runner-agent@%s.service' % n, starts)
 
     def test_restart_without_prior_lease_reports_warning(self):
         p = self.run_vm(scenario='no-lease')
