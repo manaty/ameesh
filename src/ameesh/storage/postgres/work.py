@@ -3180,10 +3180,14 @@ class WorkItems(interface.WorkItems):
         else:
             where = "state NOT IN %s" % _CLOSED
         if ready_only:
+            # #3296 : le début prévu (jour local du processus, comme
+            # `lot_takeable` et `_pending`) — un élément à venir attend sa date.
+            where += " AND (planned_start IS NULL OR planned_start <= %s)"
             where += (" AND NOT EXISTS (SELECT 1 FROM work_item_dependencies d"
                       "                      JOIN work_items b ON b.id = d.blocker_id"
                       "                     WHERE d.work_item_id = work_items.id"
                       "                       AND b.state NOT IN %s)" % _CLOSED)
+            params += (_dt.date.today().isoformat(),)
         sql = ("SELECT " + item_columns(self.db) + " FROM work_items"
                " WHERE type = 'improvement' AND " + where
                + " ORDER BY coalesce(priority, 2), value_score DESC NULLS LAST, id"

@@ -29,8 +29,10 @@ from . import process
 CGROUP_ROOT = "/sys/fs/cgroup"
 
 #: nom d'unité posé par dsh-subprocess-local 0.2.0-rc.2 (cf. `scopedBindings`
-#: de deepseek_cgroup.cjs) : le pid du processus dsh qui l'a lancée, puis un hex
-SCOPE_RE = re.compile(r"^dsh-subprocess-(?:probe-)?(\d+)-[0-9a-f]+\.scope$")
+#: de deepseek_cgroup.cjs) : le pid du processus dsh qui l'a lancée, puis un
+#: hex (accepté en minuscules comme en majuscules : rien ne garantit la casse
+#: d'une unité écrite par une autre version du fournisseur)
+SCOPE_RE = re.compile(r"^dsh-subprocess-(?:probe-)?(\d+)-[0-9a-fA-F]+\.scope$")
 
 #: attente bornée après SIGTERM, puis après SIGKILL
 TERM_WAIT_S = 10.0
@@ -70,48 +72,79 @@ def _member(pid: int) -> dict | None:
                 "command": process.command_line(pid)[:200], "unread": True}
     if start is None:
         return None
-    env = process.environ(pid)
-    if env is None and not process.alive(pid):
-        return None
+    try:
+        env = process.environ(pid)
+    except NotAvailable:
+        # environnement illisible : le doute est porté par `unread`, jamais une
+        # exception qui interromprait le relevé des autres scopes
+        env = None
+    if env is None:
+        try:
+            gone = not process.alive(pid)
+        except NotAvailable:
+            gone = False
+        if gone:
+            return None
     return {"pid": pid, "start": start,
             "turn": (env or {}).get("AMEESH_TURN_ID") or None,
             "tmpdir": (env or {}).get("TMPDIR") or None,
             "command": process.command_line(pid)[:200], "unread": env is None}
 
 
-def owner_alive(dsh_pid: int, members: list[dict]) -> bool:
-    """Le processus dsh nommé par le scope vit-il encore ? Un pid recyclé
-    (démarré APRÈS le plus ancien membre du scope) ne compte pas ; une heure
-    illisible, un membre sans heure : vivant (le doute garde)."""
+def owner_state(dsh_pid: int, members: list[dict]) -> tuple[bool, bool]:
+    """(vivant, heure illisible) du processus dsh nommé par le scope. Un pid
+    recyclé (démarré APRÈS le plus ancien membre du scope) ne compte pas ; une
+    heure de démarrage illisible, un membre sans heure : vivant (le doute
+    garde) et `unread` vrai pour le signaler plutôt que l'ignorer."""
     try:
         start = process.start_time(dsh_pid)
     except NotAvailable:
-        return True
+        return True, True
     if start is None:
-        return False
+        return False, False
     starts = [m["start"] for m in members]
     if not starts or any(s is None for s in starts):
-        return True
-    return start <= min(starts) + process.START_TOLERANCE_S
+        return True, False
+    return start <= min(starts) + process.START_TOLERANCE_S, False
+
+
+def owner_alive(dsh_pid: int, members: list[dict]) -> bool:
+    """Le processus dsh nommé par le scope vit-il encore ? (cf. `owner_state`,
+    dont ceci est la moitié booléenne)."""
+    return owner_state(dsh_pid, members)[0]
+
+
+def _entries(directory: Path, seen: set) -> list[Path]:
+    """Les entrées sous `directory`, en descendant TOUS les `.slice` (le
+    fournisseur range son scope à un niveau, mais une hiérarchie imbriquée ne
+    doit pas le rendre invisible) ; les inodes déjà vus coupent une éventuelle
+    boucle de liens. Lève OSError si un niveau est illisible."""
+    st = os.stat(directory)
+    ident = (st.st_dev, st.st_ino)
+    if ident in seen:
+        return []
+    seen.add(ident)
+    out: list[Path] = []
+    for entry in sorted(directory.iterdir(), key=lambda p: p.name):
+        if entry.name.endswith(".slice") and entry.is_dir():
+            out.extend(_entries(entry, seen))
+        else:
+            out.append(entry)
+    return out
 
 
 def scan(*, uid: int | None = None, root_dir: str = CGROUP_ROOT) -> list[dict] | None:
     """Les scopes `dsh-subprocess-*` non vides du gestionnaire de l'utilisateur,
-    par nom : `unit`, `path`, `dsh_pid`, `owner_alive`, `members` (cf.
-    `_member`), `unreadable` (liste des pids illisible). None sans
-    gestionnaire systemd lisible (hôte non Linux, cgroup v1, pas de session
-    utilisateur) : rien n'est vu, rien n'est conclu."""
+    par nom : `unit`, `path`, `dsh_pid`, `owner_alive`, `owner_unread` (heure
+    de démarrage du dsh illisible), `members` (cf. `_member`), `unreadable`
+    (liste des pids illisible). None sans gestionnaire systemd lisible (hôte
+    non Linux, cgroup v1, pas de session utilisateur) : rien n'est vu, rien
+    n'est conclu."""
     base = manager_dir(uid, root_dir)
     if not base.is_dir():
         return None
-    candidates = []
     try:
-        for entry in sorted(base.iterdir()):
-            # au niveau du gestionnaire, et une tranche plus bas (app.slice…)
-            if entry.name.endswith(".slice") and entry.is_dir():
-                candidates.extend(sorted(entry.iterdir()))
-            else:
-                candidates.append(entry)
+        candidates = _entries(base, set())
     except OSError:
         return None
     out = []
@@ -126,8 +159,9 @@ def scan(*, uid: int | None = None, root_dir: str = CGROUP_ROOT) -> list[dict] |
         if pids is not None and not members:
             continue  # tous partis pendant la lecture
         dsh_pid = int(match[1])
+        alive, owner_unread = owner_state(dsh_pid, members)
         out.append({"unit": path.name, "path": str(path), "dsh_pid": dsh_pid,
-                    "owner_alive": owner_alive(dsh_pid, members),
+                    "owner_alive": alive, "owner_unread": owner_unread,
                     "members": members, "unreadable": pids is None})
     return out
 
@@ -136,7 +170,9 @@ def _hold(members: list[dict]) -> tuple[list, list[dict]]:
     """Un pidfd par membre, ouvert PUIS validé par son heure de démarrage
     (`ProcessHandle.open`) : les signaux passent par ce descripteur, jamais par
     un pid nu qu'un autre processus aurait repris. Rend (poignées, refusés) ;
-    un membre parti, ou dont le pid a été repris, n'est ni l'un ni l'autre."""
+    un membre parti avant le signal est refusé avec « gone before signal », un
+    pid repris avec « pid reused before signal » : aucun des deux ne reçoit de
+    signal, et le passage ne peut donc pas les journaliser comme tués."""
     from .signals import ProcessHandle
     handles, refused = [], []
     for m in members:
@@ -144,13 +180,20 @@ def _hold(members: list[dict]) -> tuple[list, list[dict]]:
         if handle is not None:
             handles.append((m, handle))
             continue
+        if m.get("start") is None:
+            refused.append(dict(m, why="identity not held"))
+            continue
         try:
             now = process.start_time(m["pid"])
         except NotAvailable:
-            now = m.get("start")
-        if m.get("start") is not None and (now is None or not process.same_start(m["start"], now)):
-            continue  # parti, ou pid repris par un autre processus
-        refused.append(dict(m, why="identity not held"))
+            refused.append(dict(m, why="identity not held"))
+            continue
+        if now is None:
+            refused.append(dict(m, why="gone before signal"))
+        elif not process.same_start(m["start"], now):
+            refused.append(dict(m, why="pid reused before signal"))
+        else:
+            refused.append(dict(m, why="identity not held"))
     return handles, refused
 
 
@@ -169,17 +212,28 @@ def terminate(members: list[dict], *, term_wait: float = TERM_WAIT_S,
     restent, par pidfd (cf. `_hold`). Si l'identité d'un seul membre ne peut
     être tenue (heure illisible, pidfd indisponible), AUCUN signal n'est
     envoyé : le scope est gardé et signalé. Rend les membres non tués, avec
-    leur raison (`why`)."""
+    leur raison (`why`), y compris ceux partis ou dont le pid a été repris
+    avant tout signal ; un signal refusé par le noyau n'est jamais compté
+    comme délivré."""
     handles, refused = _hold(members)
     try:
         if refused:
             return refused
-        for _m, handle in handles:
-            handle.send(signal_mod.SIGTERM)
-        left = _wait(handles, term_wait)
+        unsent = []
+        live = []
+        for m, handle in handles:
+            if handle.send(signal_mod.SIGTERM):
+                live.append((m, handle))
+            else:
+                # le processus a disparu entre la poignée et le signal, ou le
+                # noyau a refusé : aucun `killed` ne doit être journalisé
+                unsent.append(dict(m, why="gone before signal" if not handle.live()
+                                   else "signal not delivered"))
+        left = _wait(live, term_wait)
         for _m, handle in left:
             handle.send(signal_mod.SIGKILL)
-        return [dict(m, why="alive after SIGKILL") for m, _h in _wait(left, kill_wait)]
+        return unsent + [dict(m, why="alive after SIGKILL")
+                         for m, _h in _wait(left, kill_wait)]
     finally:
         for _m, handle in handles:
             handle.close()

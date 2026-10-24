@@ -27,9 +27,12 @@ l'humain. Chaque famille a sa règle :
   `<cache_root>/<nom>`. Partagés entre agents (un store pnpm par agent
   multiplierait le disque), bornés par un quota global, évincés du plus
   ancien au plus récent, et jamais pendant un tour de l'hôte (un store pnpm
-  modifié sous une installation casse l'installation). Une variable déjà
-  posée dans l'environnement de l'exécuteur est respectée : c'est un choix
-  de l'hôte.
+  modifié sous une installation casse l'installation) — sauf le cache npm,
+  fait de copies, qui peut partir pendant un tour quand aucun npm ne tourne
+  et que rien ne le tient (#3293). Sous pression disque (espace libre sous le
+  `min_disk_free` de l'hôte), l'éviction libère en plus le déficit, même
+  sous le quota. Une variable déjà posée dans l'environnement de l'exécuteur
+  est respectée : c'est un choix de l'hôte.
 * **Worktrees** : ceux qui APPARAISSENT pendant un tour (diff de `git
   worktree list` avant/après, sous-agents compris) sont enregistrés avec
   l'agent, le tour et le lot — s'ils sont sous le dossier de travail de
@@ -120,6 +123,7 @@ from __future__ import annotations
 
 import getpass
 import json
+import math
 import os
 import shlex
 import re
@@ -264,7 +268,7 @@ POLICY_KEYS = ("tmp_root", "cache_root", "tmp_quota", "cache_quota", "tmpfs_aler
                "orphan_cleanup", "orphan_idle", "deps", "deps_idle", "artifacts",
                "artifact_idle", "unreadable_ok", "docker_orphan_volumes_alert",
                "docker_build_cache_alert", "docker_volumes", "docker_volume_idle",
-               "events_quota")
+               "events_quota", "former_mesh_keys")
 #: racines refusées : le ménage n'y supprimerait que ses sous-dossiers, mais
 #: un dossier partagé par tout le système n'est pas un dossier GÉRÉ
 FORBIDDEN_ROOTS = ("/", "~", "/tmp", "/var/tmp", "/dev/shm", "/home", "/root")
@@ -314,6 +318,10 @@ class Policy:
     #: #2820 : taille du flux `events.jsonl` d'un agent au-delà de laquelle il
     #: tourne au début du tour suivant (`events_rotation`)
     events_quota: int = DEFAULT_EVENTS_QUOTA
+    #: #3277 : anciennes clés de CE mesh sur cet hôte (une route vers la même
+    #: base, avant un changement de DSN : #532, 10.77.0.1:5432 → pgbouncer) ;
+    #: leurs dossiers temporaires sont à nous, `housekeeping_stale` les range
+    former_mesh_keys: tuple = ()
     #: #2180: discovery roots derived from Host work_root/work_roots, never
     #: deletion roots. Not a separate housekeeping setting.
     worktree_roots: tuple = ()
@@ -397,6 +405,14 @@ def parse_policy(raw) -> tuple[dict, list[str], list[str]]:
             problems.append("`unreadable_ok` : %s" % problem)
         else:
             parsed["unreadable_ok"] = names
+    if raw.get("former_mesh_keys") is not None:
+        keys = raw["former_mesh_keys"]
+        if not isinstance(keys, list) or not all(
+                isinstance(k, str) and re.fullmatch(r"[0-9a-f]{16}", k) for k in keys):
+            problems.append("`former_mesh_keys`: list of 16-hex mesh keys expected "
+                            "(the owner files of `.menage/tmp`)")
+        else:
+            parsed["former_mesh_keys"] = tuple(sorted(set(keys)))
     for key in ("redirect", "xdg_cache", "worktrees", "orphan_cleanup", "deps",
                 "docker_volumes"):
         if raw.get(key) is None:
@@ -452,6 +468,12 @@ def effective(canons, host: str) -> Policy:
         label = getattr(canon, "id", "") or "?"
         for key, value in declared.items():
             if key not in POLICY_KEYS:
+                continue
+            if key == "former_mesh_keys":
+                # #3277 : une clé déclarée par une fiche est une ancienne route
+                # de ce mesh : l'union des fiches
+                values[key] = tuple(sorted(set(values.get(key, ())) | set(value)))
+                origin.setdefault(key, label)
                 continue
             if key not in values:
                 values[key], origin[key] = value, label
@@ -532,6 +554,28 @@ def agent_tmp(cfg, policy: Policy, agent: str) -> str:
 
 def cache_names(policy: Policy) -> list[tuple[str, tuple[str, ...]]]:
     return list(CACHES) + ([XDG_CACHE] if policy.xdg_cache else [])
+
+
+#: gestionnaires de paquets dont le cache est partagé (le titre de leur
+#: processus les nomme : « npm install … », « pnpm add … »)
+PACKAGE_MANAGERS = ("npm", "pnpm", "yarn")
+
+
+def package_managers_running() -> set[str]:
+    """#3293: les gestionnaires de paquets qui tournent sur l'hôte, d'après le
+    titre de leur processus (`process.title` : `npm install …`, tronqué à 15
+    caractères par le noyau). Un relevé illisible est un doute : tous sont
+    dits en cours, et rien n'est évincé sous un tour."""
+    try:
+        rows = platform.process_table()
+    except Exception:  # noqa: BLE001 - un passage de ménage ne lève jamais
+        return set(PACKAGE_MANAGERS)
+    found: set[str] = set()
+    for row in rows:
+        head = (row.get("name") or "").strip().split(" ", 1)[0].lower()
+        if head in PACKAGE_MANAGERS:
+            found.add(head)
+    return found
 
 
 def _conninfo_fields(dsn: str) -> dict[str, str]:
@@ -1337,12 +1381,20 @@ def _removable(path: str, uid: int | None, writable: dict) -> bool:
 
 
 def evict_lru(directories: list[str], root: str, quota: int, *, now: float | None = None,
-              min_age: float = EVICT_MIN_AGE_S, dry_run: bool = False) -> dict:
+              min_age: float = EVICT_MIN_AGE_S, dry_run: bool = False,
+              evict_at_least: int = 0) -> dict:
     """Éviction du plus ancien (mtime) au plus récent, jusqu'au quota.
 
     Un fichier modifié depuis moins de `min_age` n'est jamais évincé (il est
     peut-être en écriture) : le quota peut donc rester dépassé, et c'est dit
     (`over_quota`).
+
+    #3293 : `evict_at_least` évince aussi jusqu'à libérer au moins ces
+    octets, même quand le total tient déjà dans le quota — une pression
+    disque se traite en libérant ce qu'il faut, pas seulement au-delà d'un
+    plafond. L'éviction s'arrête quand les deux conditions tiennent (quota
+    respecté et octets libérés) ; un fichier trop récent ou irrécupérable
+    l'arrête comme avant, et `over_quota` ne dit que le quota.
 
     #500: only what this pass can remove counts toward the quota (owned by
     us, directory writable, outside a git work tree); the rest is reported
@@ -1431,16 +1483,18 @@ def evict_lru(directories: list[str], root: str, quota: int, *, now: float | Non
             else:
                 candidates.append(item)
         counted = before - unremovable
-    if not truncated and before > quota:
+    if not truncated and (before > quota or evict_at_least > 0):
         if not dry_run and not _managed(root):
             raise RefusedDeletion("%s is not a directory managed by ameesh" % root)
-        blocked = unremovable > quota
+        # #3293 : sous pression disque, des octets irrécupérables au-delà du
+        # quota n'interdisent pas de libérer ce qui peut l'être (le déficit).
+        blocked = unremovable > quota and evict_at_least <= 0
         protected: list[str] = []      # #500 r3: subtrees a stale candidate protects
         uncounted: set = set()         # #500 r5: candidates already out of `counted`
         handled: set = set()          # #1190: dry-run inodes already processed
         order = sorted(candidates, key=lambda item: item[2])
         for index, (path, size, mtime, st) in enumerate(order):
-            if blocked or counted <= quota:
+            if blocked or (counted <= quota and evicted >= evict_at_least):
                 break
             if any(_in_subtree(path, d) for d in protected):
                 # #500 r4 (codex P2 r3): the subtree became protected during
@@ -1864,7 +1918,8 @@ def _bare_git_copy(path: str) -> bool:
         and os.path.isdir(os.path.join(path, "refs"))
 
 
-def _git_copies_report(path: str, limit: int | None = None) -> tuple[list[str], str]:
+def _git_copies_report(path: str, limit: int | None = None,
+                       skip=()) -> tuple[list[str], str]:
     """(copies git de l'entrée, doute). Une copie est reconnue par son `.git`
     (dossier, ou fichier d'un worktree) ou sa signature de dépôt nu, à toute
     profondeur ; un lien symbolique n'est ni suivi ni ouvert, et le dedans
@@ -1875,9 +1930,14 @@ def _git_copies_report(path: str, limit: int | None = None) -> tuple[list[str], 
     illisible, budget épuisé — pour que l'appelant garde l'entrée au lieu de
     conclure à tort qu'il n'y a rien. Les copies à arbre de travail passent
     avant les dépôts nus : leurs gardes sont plus précises, un dépôt nu n'est
-    qu'un doute conservateur (#2525)."""
+    qu'un doute conservateur (#2525).
+
+    #3277 : `skip`, les dossiers d'un AUTRE utilisateur que celui-ci ne peut
+    pas lire (relevés par `housekeeping_stale.walk`) : ni ouverts ni comptés
+    comme doute — l'appelant ne peut pas plus les supprimer que les lire."""
     if os.path.islink(path) or not os.path.isdir(path):
         return [], ""
+    skip = frozenset(skip or ())
     limit = WALK_LIMIT if limit is None else limit
     trees: list[str] = []
     bare: list[str] = []
@@ -1891,6 +1951,8 @@ def _git_copies_report(path: str, limit: int | None = None) -> tuple[list[str], 
         if _bare_git_copy(current):
             bare.append(current)
             continue          # le dedans d'un dépôt nu ne cache pas d'arbre de travail
+        if current in skip:
+            continue
         if os.path.lexists(os.path.join(current, ".git")):
             trees.append(current)
         try:
@@ -3855,14 +3917,18 @@ def dsh_scope_verdict(scope: dict, row: dict | None, host: str,
     Récolté seulement si le processus dsh qui l'a lancé n'existe plus, que
     TOUS ses processus portent le même `AMEESH_TURN_ID`, que ce tour est connu
     de CET hôte, clos (`done`, `orphan`) et fini depuis `DSH_SCOPE_GRACE_S`.
-    dsh vivant, tour `running` : attente. Liste ou environnement illisible,
-    aucun tour ou plusieurs, tour inconnu ici : gardé et signalé (comme
-    `_orphan_verdict`)."""
+    dsh vivant, tour `running` : attente. Liste, heure de démarrage du dsh ou
+    environnement illisible, aucun tour ou plusieurs, tour inconnu ici, fin de
+    tour illisible : gardé et signalé (comme `_orphan_verdict`) — un doute ne
+    se tait jamais et une grâce non mesurable ne se remplace pas par le
+    démarrage du processus."""
+    members = scope["members"]
+    if scope["unreadable"] or scope.get("owner_unread"):
+        return "signal", "process list or dsh start time unreadable: not attributable", None
+    if any(m.get("unread") for m in members):
+        return "signal", "process start or environment unreadable: not attributable", None
     if scope["owner_alive"]:
         return "wait", "dsh pid %d alive" % scope["dsh_pid"], None
-    members = scope["members"]
-    if scope["unreadable"] or any(m["unread"] for m in members):
-        return "signal", "process list or environment unreadable: not attributable", None
     turns = {m["turn"] for m in members}
     if turns == {None}:
         return "signal", "no AMEESH_TURN_ID: not attributable", None
@@ -3872,18 +3938,24 @@ def dsh_scope_verdict(scope: dict, row: dict | None, host: str,
     turn = turns.pop()
     if row is None or (row.get("host") or "") != (host or ""):
         return "signal", "turn %s unknown on this host: not attributable" % turn[:8], turn
-    if row.get("status") == "running":
+    status = row.get("status")
+    if status == "running":
         return "wait", "turn %s not closed" % turn[:8], turn
-    ended = row.get("ended_ts")
+    if status not in ("done", "orphan"):
+        return "signal", "turn %s status %r: not attributable" % (
+            turn[:8], status), turn
     try:
-        since = float(ended)
+        since = float(row.get("ended_ts"))
+        if not math.isfinite(since):
+            raise ValueError("not finite")
     except (TypeError, ValueError):
-        since = max(float(m["start"]) for m in members)
+        return "signal", "turn %s closed but end time unreadable: not attributable" % (
+            turn[:8]), turn
     if now - since < DSH_SCOPE_GRACE_S:
         return "wait", "turn %s closed %ds ago (grace %ds)" % (
             turn[:8], int(now - since), int(DSH_SCOPE_GRACE_S)), turn
     return "kill", "turn %s %s, dsh pid %d gone" % (
-        turn[:8], row.get("status") or "closed", scope["dsh_pid"]), turn
+        turn[:8], status, scope["dsh_pid"]), turn
 
 
 def reap_dsh_scopes(db, host: str, *, dry_run: bool = False, now: float | None = None,
@@ -3894,7 +3966,9 @@ def reap_dsh_scopes(db, host: str, *, dry_run: bool = False, now: float | None =
     sait pas attribuer sont gardés et signalés (`signaled`, re-signalé au
     plus toutes les `DSH_SCOPE_REFRESH_S`, `gone` quand ils disparaissent).
     `scan`/`terminate` : ceux de `platform.dsh_scopes` (surchargés par les
-    tests). Rend `{entries, plan}`."""
+    tests). Un scope dont le traitement échoue est signalé sans interrompre
+    les suivants ; un scope dont tous les processus ont disparu avant le
+    signal est `gone`, jamais `killed`. Rend `{entries, plan}`."""
     from .platform import dsh_scopes
     scan = dsh_scopes.scan if scan is None else scan
     terminate = dsh_scopes.terminate if terminate is None else terminate
@@ -3911,44 +3985,59 @@ def reap_dsh_scopes(db, host: str, *, dry_run: bool = False, now: float | None =
     last = {row["path"]: row for row in hk.latest_by_path(host, "dsh_scope")}
     seen = set()
     for scope in scopes:
-        unit = scope["unit"]
+        unit = (scope or {}).get("unit") or ""
         seen.add(unit)
-        members = scope["members"]
-        turn_ids = {m["turn"] for m in members if m.get("turn")}
-        row = turns.get(next(iter(turn_ids))) if len(turn_ids) == 1 else None
-        action, why, turn = dsh_scope_verdict(scope, row, host, now)
-        agent = (row or {}).get("agent") or next(
-            (a for a in (_tmpdir_agent(m.get("tmpdir")) for m in members) if a), None)
-        previous = last.get(unit) or {}
-        data = {"dsh_pid": scope["dsh_pid"], "turn": turn,
-                "pids": [m["pid"] for m in members],
-                "commands": [m["command"] for m in members[:3]],
-                "first_seen": ((previous.get("data") or {}).get("first_seen")
-                               if previous.get("action") == "signaled" else None) or now}
-        base = {"kind": "dsh_scope", "path": unit, "agent": agent}
-        if action == "wait":
-            out["plan"].append(dict(base, action="attend", detail=why))
-            continue
-        if action == "kill":
-            out["plan"].append(dict(base, action="suppression", detail=why))
-            if dry_run:
+        try:
+            members = scope["members"]
+            turn_ids = {m["turn"] for m in members if m.get("turn")}
+            row = turns.get(next(iter(turn_ids))) if len(turn_ids) == 1 else None
+            action, why, turn = dsh_scope_verdict(scope, row, host, now)
+            agent = (row or {}).get("agent") or next(
+                (a for a in (_tmpdir_agent(m.get("tmpdir")) for m in members) if a), None)
+            previous = last.get(unit) or {}
+            data = {"dsh_pid": scope["dsh_pid"], "turn": turn,
+                    "pids": [m["pid"] for m in members],
+                    "commands": [m["command"] for m in members[:3]],
+                    "first_seen": ((previous.get("data") or {}).get("first_seen")
+                                   if previous.get("action") == "signaled" else None) or now}
+            base = {"kind": "dsh_scope", "path": unit, "agent": agent}
+            if action == "wait":
+                out["plan"].append(dict(base, action="attend", detail=why))
                 continue
-            left = terminate(members)
-            if not left:
-                out["entries"].append(dict(base, action="killed", data=data,
-                                           detail="%s: SIGTERM then SIGKILL" % why))
-                continue
-            why = "%s: %d process(es) not killed (%s)" % (
-                why, len(left), ", ".join("%d %s" % (m["pid"], m.get("why") or "alive")
-                                          for m in left))
-        else:
-            out["plan"].append(dict(base, action="signalé", detail=why))
-            if dry_run:
-                continue
-        fresh = (previous.get("action") == "signaled" and previous.get("detail") == why
-                 and now - float(previous.get("at_ts") or 0) < DSH_SCOPE_REFRESH_S)
-        if not fresh:
-            out["entries"].append(dict(base, action="signaled", detail=why, data=data))
+            if action == "kill":
+                out["plan"].append(dict(base, action="suppression", detail=why))
+                if dry_run:
+                    continue
+                if not members:
+                    out["entries"].append(dict(base, action="gone", detail=(
+                        "%s: empty scope gone, nothing to signal" % why)))
+                    continue
+                left = terminate(members)
+                if not left:
+                    out["entries"].append(dict(base, action="killed", data=data,
+                                               detail="%s: SIGTERM then SIGKILL" % why))
+                    continue
+                if (len(left) == len(members)
+                        and all((m.get("why") or "") == "gone before signal" for m in left)):
+                    out["entries"].append(dict(base, action="gone", detail=(
+                        "%s: every process gone before signal" % why)))
+                    continue
+                why = "%s: %d process(es) not killed (%s)" % (
+                    why, len(left), ", ".join("%d %s" % (m["pid"], m.get("why") or "alive")
+                                              for m in left))
+            else:
+                out["plan"].append(dict(base, action="signalé", detail=why))
+                if dry_run:
+                    continue
+            fresh = (previous.get("action") == "signaled" and previous.get("detail") == why
+                     and now - float(previous.get("at_ts") or 0) < DSH_SCOPE_REFRESH_S)
+            if not fresh:
+                out["entries"].append(dict(base, action="signaled", detail=why, data=data))
+        except Exception as exc:  # un scope ne doit pas perdre les suivants
+            out["entries"].append({"kind": "dsh_scope", "path": unit,
+                                   "action": "signaled",
+                                   "detail": "scope pass failed (%s): not attributable"
+                                             % type(exc).__name__})
     if not dry_run:
         for unit, previous in last.items():
             if unit not in seen and previous.get("action") == "signaled":
@@ -3985,13 +4074,19 @@ def tmp_problem(path: str, owner: str | None, key: str, *, registered: bool,
 def run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool = False,
              busy: bool = False, agents_in_turn: set | None = None,
              now: float | None = None,
-             runtime=None, artifact_scan: bool = True, min_interval_s: float = 0.0) -> dict:
+             runtime=None, artifact_scan: bool = True, min_interval_s: float = 0.0,
+             free_target: int = 0) -> dict:
     """One host pass across all runners and the CLI, without waiting.
 
     Periodic callers share the last completed pass's timestamp, under the
     same stable OS lock. An explicit or pressure-triggered pass bypasses the
     interval; dry runs never postpone real cleanup. Nothing is cached about
     whether a path may be deleted.
+
+    #3293: `free_target` is the free space (bytes) the cache's filesystem
+    should keep — the host's `min_disk_free`, the pause threshold. Under it,
+    the caches are evicted enough to free the deficit, the npm cache even
+    during a turn when no npm runs.
     """
     from .platform import session_lock
 
@@ -4026,7 +4121,8 @@ def run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool = 
                                % min_interval_s)
         report = _run_pass(cfg, db, policy, host=host, actor=actor, dry_run=dry_run,
                            busy=busy, agents_in_turn=agents_in_turn, now=now,
-                           runtime=runtime, artifact_scan=artifact_scan)
+                           runtime=runtime, artifact_scan=artifact_scan,
+                           free_target=free_target)
         if not dry_run and not report.get("disabled"):
             completed_passes[key] = time.time() if now is None else float(now)
             lock.seek(0)
@@ -4041,13 +4137,17 @@ def run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool = 
 def _run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool = False,
               busy: bool = False, agents_in_turn: set | None = None,
               now: float | None = None,
-              runtime=None, artifact_scan: bool = True) -> dict:
+              runtime=None, artifact_scan: bool = True,
+              free_target: int = 0) -> dict:
     """Un passage de ménage sur CET hôte ; rend le rapport.
 
     * dossiers temporaires : quota par agent (sauf agent en tour) ; dossier
       d'un agent absent du registre supprimé ;
     * caches partagés : éviction jusqu'au quota, seulement si aucun tour ne
-      tourne (`busy` faux) ;
+      tourne (`busy` faux) — sauf le cache npm pendant un tour, quand aucun
+      npm ne tourne et que rien ne le tient (#3293) ; sous pression disque
+      (`free_target`, espace libre à préserver), l'éviction libère en plus le
+      déficit ;
     * worktrees suivis dont le lot est fini : retirés s'ils sont propres et
       intégrés (garde-fous de `_worktree_pass`), sinon gardés et signalés ;
       #1665 : un worktree orphelin (aucun lot nommé, ou lot fini sans
@@ -4118,13 +4218,19 @@ def _run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool =
     # #2493 : dernier signalement d'un dossier sans propriétaire, pour ne pas
     # le répéter dans `skipped` à chaque passe (un constat persistant suffit).
     last_unowned: dict[str, dict] = {}
+    # #3277 : dernier constat `over_quota` d'un dossier qu'un autre mesh (ou
+    # une ancienne clé de celui-ci) possède, levé par `resolved` ou `gone`
+    last_over: dict[str, dict] = {}
     try:
         for row in storage.of(db).housekeeping.latest_by_path(host, "tmp"):
             if row.get("action") == "unowned":
                 last_unowned[row["path"]] = row
+            elif row.get("action") == "over_quota":
+                last_over[row["path"]] = row
     except Exception:  # journal illisible : on signale, sans doublon garanti
-        last_unowned = {}
+        last_unowned, last_over = {}, {}
     seen_unowned: set[str] = set()
+    seen_over: set[str] = set()
     if os.path.isdir(troot) and _managed(troot):
         for name in sorted(os.listdir(troot)):
             full = os.path.join(troot, name)
@@ -4133,7 +4239,21 @@ def _run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool =
             owner = read_owner(troot, name)
             if owner is not None and owner != key:
                 # L219: another mesh of this host (same state directory)
-                # manages it: never deleted nor evicted here
+                # manages it: never deleted nor evicted here. #3277 : mais
+                # mesuré, et signalé au-delà du quota ; une ancienne clé de CE
+                # mesh (`former_mesh_keys`) range ses entrées de lots clos.
+                if FALLBACK_SEP in name:
+                    continue
+                from . import housekeeping_stale
+                seen_over.add(full)
+                found = housekeeping_stale.check(
+                    db, troot=troot, name=name, agent=tmp_agent(name, owner),
+                    owner=owner, key=key, policy=policy, now=now, dry_run=dry_run,
+                    previous=last_over.get(full), agents=sorted(registered or ()),
+                    holder=held_by_user)
+                entries += found["entries"]
+                plan += found["plan"]
+                skipped += found["skipped"]
                 continue
             agent = tmp_agent(name, key)
             if registered is None and owner is None:
@@ -4317,34 +4437,89 @@ def _run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool =
                     continue
                 entries.append({"kind": "tmp", "action": "gone", "path": path,
                                 "detail": "unowned temporary directory gone"})
+            for path in last_over:
+                if path in seen_over or os.path.lexists(path):
+                    continue
+                entries.append({"kind": "tmp", "action": "gone", "path": path,
+                                "detail": "temporary directory over quota gone"})
     # 2. caches partagés
-    directories = [os.path.join(croot, name) for name, _v in cache_names(policy)]
-    if busy:
-        skipped.append("caches: a turn is in progress on the host, eviction postponed")
-    elif os.path.isdir(croot) and _managed(croot):
-        result = evict_lru(directories, croot, policy.cache_quota, now=now, dry_run=dry_run)
-        if result["files"]:
-            plan.append({"kind": "cache", "path": croot, "action": "éviction",
-                         "bytes": result["evicted"],
-                         "detail": "%d file(s), quota %s" % (
-                             result["files"], resources_mod.fmt_value("q", policy.cache_quota))})
-            if not dry_run:
-                entries.append({"kind": "cache", "action": "evicted", "path": croot,
-                                "bytes": result["evicted"],
-                                "detail": "quota %s: %d oldest file(s) evicted"
-                                          % (resources_mod.fmt_value("q", policy.cache_quota),
-                                             result["files"])})
-        if result.get("mounts_unreadable"):
-            skipped.append("caches: mount table unreadable (platform layer), "
-                           "nothing evicted")
-        elif result["truncated"]:
-            skipped.append("caches: listing truncated (%s file limit), nothing evicted"
-                           % WALK_LIMIT)
-        elif result["blocked"]:
-            skipped.append("caches: quota held by %s this pass cannot remove, nothing evicted"
-                           % resources_mod.fmt_value("q", result["unremovable"]))
-        elif result["over_quota"]:
-            skipped.append("caches: quota still exceeded (files less than an hour old)")
+    # #3293 : sous pression disque (moins que `free_target` libre sur le
+    # système du cache), libérer au moins le déficit — et, pour le cache npm
+    # (copies, pas un store à liens durs), sans attendre qu'aucun tour ne
+    # tourne : il suffit qu'aucun npm ne tourne et que rien ne le tienne.
+    deficit = 0
+    free = None
+    if free_target > 0 and os.path.isdir(croot):
+        try:
+            free = shutil.disk_usage(croot).free
+        except OSError:
+            free = None
+        if free is not None and free < int(free_target):
+            deficit = int(free_target) - int(free)
+    directories: list[str] = []
+    if os.path.isdir(croot) and _managed(croot):
+        managers = None
+        busy_said = False
+        for name, _variables in cache_names(policy):
+            full = os.path.join(croot, name)
+            if not os.path.isdir(full) or os.path.islink(full):
+                continue
+            if name == "npm":
+                if managers is None:
+                    managers = package_managers_running()
+                if "npm" in managers:
+                    skipped.append("cache npm kept: npm is running on the host")
+                    continue
+                held = held_by_user(full)
+                if held:
+                    skipped.append("cache npm kept: %s (no eviction)" % held)
+                    continue
+                directories.append(full)
+            elif busy:
+                if not busy_said:
+                    skipped.append("caches: a turn is in progress on the host, "
+                                   "eviction postponed")
+                    busy_said = True
+            else:
+                directories.append(full)
+        if directories:
+            result = evict_lru(directories, croot, policy.cache_quota, now=now,
+                               dry_run=dry_run, evict_at_least=deficit)
+            detail = "%d file(s), quota %s" % (
+                result["files"], resources_mod.fmt_value("q", policy.cache_quota))
+            if deficit:
+                detail += ", %s freed under disk pressure (%s needed)" % (
+                    resources_mod.fmt_value("q", result["evicted"]),
+                    resources_mod.fmt_value("q", deficit))
+            if result["files"]:
+                plan.append({"kind": "cache", "path": croot, "action": "éviction",
+                             "bytes": result["evicted"], "detail": detail})
+                if not dry_run:
+                    entries.append({"kind": "cache", "action": "evicted", "path": croot,
+                                    "bytes": result["evicted"],
+                                    "detail": "quota %s: %d oldest file(s) evicted%s"
+                                              % (resources_mod.fmt_value("q", policy.cache_quota),
+                                                 result["files"],
+                                                 " (disk pressure)" if deficit else "")})
+            if result.get("mounts_unreadable"):
+                skipped.append("caches: mount table unreadable (platform layer), "
+                               "nothing evicted")
+            elif result["truncated"]:
+                skipped.append("caches: listing truncated (%s file limit), nothing evicted"
+                               % WALK_LIMIT)
+            elif result["blocked"]:
+                skipped.append("caches: quota held by %s this pass cannot remove, nothing evicted"
+                               % resources_mod.fmt_value("q", result["unremovable"]))
+            elif result["over_quota"]:
+                skipped.append("caches: quota still exceeded (files less than an hour old)")
+            if deficit and not (result.get("mounts_unreadable") or result["truncated"]
+                                or result["evicted"] >= deficit):
+                # ce qui reste libre après l'éviction, pour dire l'écart
+                left = (free + result["evicted"]) if free is not None else 0
+                skipped.append("caches: disk pressure persists (%s free under %s target), "
+                               "%s freed" % (resources_mod.fmt_value("q", left),
+                                             resources_mod.fmt_value("q", int(free_target)),
+                                             resources_mod.fmt_value("q", result["evicted"])))
     # 2b. #248: node_modules shared per lockfile, entries no worktree links to
     if policy.deps and registered is None:
         skipped.append("deps: registry unreadable, worktrees unknown, nothing deleted")
@@ -4675,6 +4850,10 @@ def cmd_housekeeping(cfg, args) -> int:
         except Exception:
             canons = []
         policy = effective(canons, host)
+        try:
+            limits = resources_mod.host_limits(canons, host)["limits"]
+        except Exception:  # un canon illisible ne bloque pas la commande
+            limits = {}
         busy = False
         if apply:
             try:
@@ -4685,6 +4864,9 @@ def cmd_housekeeping(cfg, args) -> int:
         from . import containers as containers_mod
         report = run_pass(cfg, db, policy, host=host, actor=actor, dry_run=not apply,
                           busy=busy,
+                          # #3293 : le seuil de pause disque de l'hôte
+                          # déclenche l'éviction des caches sous pression.
+                          free_target=int(limits.get("min_disk_free") or 0),
                           runtime=containers_mod.Runtime.from_config(cfg))
         if getattr(args, "json", False):
             print(json.dumps(dict(report, schema="ameesh-menage/1"), ensure_ascii=False,

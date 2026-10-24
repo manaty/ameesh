@@ -1013,6 +1013,8 @@ class Plan:
     #: #2692: the target head's CI is still in progress, but its tree is the
     #: packet head's green content; the evidence (head, runs) or None.
     tree_green: dict | None = None
+    #: #3291: this green candidate would discard content already active.
+    kept_active: dict[str, str] = dataclasses.field(default_factory=dict)
 
 
 def same_tree(repo: str, left: str, right: str) -> bool:
@@ -1299,6 +1301,17 @@ def build_plan(cfg, project: ProjectRelease, *, now: float,
     else:
         green_commit = head
     base = green_commit or head
+    from . import staging_pending
+    active = staging_pending.regressions(project, base)
+    if active:
+        current = version_at(project.repo, next(iter(active.values())))
+        return Plan(project=project, rules=rules, canon_commit=source.commit,
+                    cutoff_at=cutoff_at, cutoff_label=cutoff_label, head=head, ci=reading,
+                    green=green, last_green=green_commit, base=base,
+                    current_version=current, previous=None, version=current,
+                    floor="patch", floor_reason="keep the newer active content",
+                    packets=[], direct=[], migrations=[], included=[], excluded=[],
+                    notes="", empty=True, kept_active=active)
     current = version_at(project.repo, base)
     previous = latest_tag(project.repo, base)
     if previous and version_tuple(current) < version_tuple(previous["version"]):
@@ -2005,6 +2018,11 @@ def _execute_locked(cfg, db, project: ProjectRelease, *, now: float, force: bool
     recent = None if force else recent_tag(project.repo, recent_ref, at, now)
     if recent:
         release_sha, version_out = recent["commit"], recent["version"]
+        from . import staging_pending
+        active = staging_pending.regressions(project, release_sha)
+        if active:
+            return _kept_active(cfg, db, project, state, state_slot, at, label,
+                                release_sha, active, source.commit)
         older = [row for row in tags(project.repo, release_sha)
                  if row["tag"] != recent["tag"]]
         previous = older[0] if older else None
@@ -2038,6 +2056,9 @@ def _execute_locked(cfg, db, project: ProjectRelease, *, now: float, force: bool
                       previous, None, staging, no_staging)
 
     plan = build_plan(cfg, project, now=now, version=version)
+    if plan.kept_active:
+        return _kept_active(cfg, db, project, state, state_slot, at, label,
+                            plan.base, plan.kept_active, plan.canon_commit)
     if not plan.green and not plan.last_green:
         state_slot["last_cutoff"] = at
         state_slot["last_result"] = "refused-no-green"
@@ -2174,9 +2195,31 @@ def _execute_locked(cfg, db, project: ProjectRelease, *, now: float, force: bool
                   plan.previous, plan, staging, no_staging)
 
 
+def _kept_active(cfg, db, project, state, slot, at, label, candidate, active,
+                 canon_commit):
+    """Durable no-op: a cutoff never rolls staging back (#3291)."""
+    report = {"schema": SCHEMA, "result": "kept-active", "project": project.name,
+              "cutoff_at": at, "label": label, "candidate": candidate,
+              "active": active, "canon_commit": canon_commit,
+              "completed_at": time.time(),
+              "deviations": ["candidate does not contain the active hosts' content; "
+                             "no tag, no staging"]}
+    slot.update(last_cutoff=at, last_result="kept-active", last_label=label)
+    save_state(cfg, state)
+    report["report_path"] = write_report(cfg, project, dict(report, version="kept-active"))
+    if db is not None:
+        send_report(cfg, db, project,
+                    "Coupure %s : actif conservé, candidate %s plus ancienne ou divergente. "
+                    "Aucun tag, aucun déploiement." % (label, candidate[:12]), report)
+    return report
+
+
 def _staging_step(project: ProjectRelease, release_sha: str, included: list[int],
                   state_dir: str) -> dict:
     """Run staging; a lock conflict retries, a timeout is reported as a gap."""
+    from . import staging_pending
+    if staging_pending.regressions(project, release_sha):
+        raise ReleaseError("staging candidate would roll back active content (#3291)")
     try:
         result = maybe_staging(project, release_sha, included, state_dir)
     except ReleaseBusy:

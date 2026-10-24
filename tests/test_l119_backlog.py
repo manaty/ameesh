@@ -128,6 +128,38 @@ class PriseTest(_Base):
         self.assertEqual([t["item"]["id"] for t in self.take()], [item["id"]])
         self.assertIsNone(work.get(self.db, lot["id"])["assignee"])
 
+    def test_amelioration_planifiee_plus_tard_n_est_pas_prise(self):
+        # #3296 : la lecture prête ignore planned_start — un élément à début
+        # futur ne doit ni être proposé ni être pris ; le témoin positif (sans
+        # date) reste prenable. Dates relatives à l'horloge (AGENTS.md j).
+        from datetime import date, timedelta
+        self.agent("claude1")
+        futur = self.element("planifiee", 90)
+        self.db.execute(
+            "UPDATE work_items SET planned_start = %s WHERE id = %s",
+            (date.today() + timedelta(days=1), futur["id"]))
+        pret = self.element("prete", 50)
+
+        self.assertEqual(
+            [i["id"] for i in storage.of(self.db).work.backlog(
+                open_only=True, limit=10, ready_only=True)], [pret["id"]])
+        self.assertEqual([t["item"]["id"] for t in self.take()], [pret["id"]])
+        self.assertIsNone(work.get(self.db, futur["id"])["assignee"])
+
+    def test_amelioration_planifiee_date_passee_reste_prise(self):
+        # #3296 : un début prévu passé ne retient pas la prise.
+        from datetime import date, timedelta
+        self.agent("claude1")
+        passe = self.element("date passee", 70)
+        self.db.execute(
+            "UPDATE work_items SET planned_start = %s WHERE id = %s",
+            (date.today() - timedelta(days=1), passe["id"]))
+
+        self.assertEqual(
+            [i["id"] for i in storage.of(self.db).work.backlog(
+                open_only=True, limit=10, ready_only=True)], [passe["id"]])
+        self.assertEqual([t["item"]["id"] for t in self.take()], [passe["id"]])
+
     def test_lot_pret_a_cote_d_un_lot_planifie_garde_la_priorite(self):
         # #1625 : mixte — un lot démarrable suffit à fermer la porte (0037 §3).
         self.agent("claude1")
