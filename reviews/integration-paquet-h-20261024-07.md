@@ -153,6 +153,8 @@ deux verdicts de composition sur `36a835e46` restent acquis.
 |---|---|
 | #3231 | **prêt au calcul**, mais tenu hors paquet par le hold de mesh-design : témoin EP7, il n'entre qu'après la 1.21.0, absente. Gel `1af34785` et verdict ameesh-dev2 (claude) acquis ; le hold du 24/10 03:18Z tient. |
 | #3313 | **prêt au calcul à 10:16Z** (`92842fa2`, 2/2), mais le pilote a dit au 10:06Z qu'il entre « au paquet suivant, après son regel ». Le laisser à h-08 évite de mêler sa vidange du train au dernier paquet manuel ; aucun contenu n'est perdu, il reste prêt. |
+| #3022 | **devenu prêt pendant le paquet** : verdicts 2/2 sur `b40d6fde` (ameesh-cx1, mty-amh-impl-05 ok le 24/10). Il n'entre pas ici : son conflit `src/ameesh/mechanics.py` avec la cible revient au composeur du paquet suivant, et l'inclure changerait une composition déjà relue. |
+| #3336 | **incident CI main** (run 40084134277, P1) prêt après le calcul de 10:16Z ; il sort du paquet par la voie incident (§11 bis), porté par son assigné, pas dans le périmètre h-07. |
 
 ## En attente (calcul, hors paquet)
 
