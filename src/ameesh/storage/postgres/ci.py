@@ -399,6 +399,9 @@ class CiResults(interface.CiResults):
              ORDER BY repo
             """)
 
+    def forget_map(self, repo) -> None:
+        self.db.execute("DELETE FROM ci_map_state WHERE lower(repo) = lower(%s)", (repo,))
+
     def prune_maps(self, repos) -> None:
         """Comme `prune_queue` (#2957) : un dépôt sorti du périmètre actif
         ne garde pas une carte qui alerterait à jamais ; sans périmètre, rien

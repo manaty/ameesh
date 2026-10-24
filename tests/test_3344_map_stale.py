@@ -87,6 +87,13 @@ class MapStaleTest(PgTestCase):
         self.assertEqual(api.map_calls(), [])
         self.assertIsNone(self.row())
 
+    def test_map_workflow_removed_forgets_the_reading(self):
+        """Relecture cx1 : sans quoi le relevé vieillirait en alerte perpétuelle."""
+        self.watcher(_Api(runs=[]))._map(self.db, REPO, ("main",))
+        self.assertIsNotNone(self.row())
+        self.watcher(_Api(workflows=("tests.yml",)))._map(self.db, REPO, ("main",))
+        self.assertIsNone(self.row())
+
     def test_no_successful_run_is_recorded_without_a_date(self):
         self.watcher(_Api(runs=[]))._map(self.db, REPO, ("main",))
         row = self.row()
@@ -170,10 +177,18 @@ class MapStaleTest(PgTestCase):
         self.assertIsNone(alert["since"])
         self.assertIn("no successful carte.yml run", alert["detail"])
 
-    def test_old_reading_founds_nothing(self):
-        self.observe(time.time() - 10 * DAY)
-        self.age_reading(exploitation.MAP_READ_FRESH_S + 5)
-        self.assertEqual(self.alerts(), [])
+    def test_old_reading_alerts_with_an_unknown_age(self):
+        """Relecture cx1 (N/P2) : une erreur propre à carte.yml laisse la file
+        fraîche ; le relevé de carte vieilli ne doit pas taire l'alerte."""
+        for published in (time.time() - 10 * DAY, time.time() - 3600, None):
+            with self.subTest(published=published):
+                self.observe(published)
+                self.age_reading(exploitation.MAP_READ_FRESH_S + 5)
+                (alert,) = self.alerts()
+                self.assertEqual(alert["type"], "map_stale")
+                self.assertIsNone(alert["value"])
+                self.assertIn("map age unknown", alert["detail"])
+                self.assertIn("carte.yml errors", alert["detail"])
 
     def test_same_alert_from_one_pass_to_the_next(self):
         self.observe(time.time() - 3 * DAY)

@@ -4370,6 +4370,10 @@ class CiResults(Domain):
         exécution réussie trouvée)."""
 
     @abc.abstractmethod
+    def forget_map(self, repo: str) -> None:
+        """Retire le relevé de carte d'un dépôt qui ne porte plus `carte.yml`."""
+
+    @abc.abstractmethod
     def prune_maps(self, repos: Sequence[str]) -> None:
         """Retire les relevés de carte des dépôts hors du périmètre actif
         `repos` (comme `prune_queue`) ; un périmètre vide ne purge rien."""
