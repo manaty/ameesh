@@ -2286,6 +2286,37 @@ class WatcherTest(PgTestCase):
         self.assertEqual(watcher.tick(self.db), [])
         self.assertEqual(len(self.mails("dev-a")), 1)
 
+    def test_echec_deja_inscrit_non_resignale_si_inherited_change(self):
+        """#1786 N1 : la référence de base peut changer entre deux passes ; une
+        ligne de l'attempt courant déjà inscrite sans message ne change pas de
+        classe (`add_failure` ne met pas à jour le même attempt). Elle n'est
+        donc pas resignalée comme échec propre : le message et la base
+        resteraient divergents."""
+        watcher = ci.Watcher(self.cfg_ci, api=self.api, clock=lambda: self.NOW)
+        sha = "74" * 20
+        st = storage.of(self.db)
+        st.ci.open_run(DEPOT, 1033, head_sha=sha, branch="lot/1-un",
+                       event="pull_request", base="main",
+                       work_item_id=self.lot["id"], url=None, workflow="tests.yml")
+        # la ligne a d'abord été vue héritée (main rouge sur ce test), sans
+        # message ; la référence de main est maintenant verte.
+        st.ci.add_failure(DEPOT, 1033, run_attempt=1, part="psycopg 1/4",
+                          test="tests.test_a.T.test_1", module="tests.test_a",
+                          status="echec", inherited=True, excerpt="", replay="",
+                          duration_s=None, failed_at=None)
+        self.api.live = [run_view(1033, sha, "lot/1-un")]
+        self.api.checks[sha] = [check_run([ev_test("tests.test_a.T.test_1",
+                                                   execution=1033)])]
+        self.assertEqual(watcher.tick(self.db), [])
+        self.assertEqual(self.mails("dev-a"), [])
+        failures = st.ci.failures(DEPOT, 1033)
+        self.assertEqual([(f["test"], f["inherited"], f["message_id"])
+                          for f in failures],
+                         [("tests.test_a.T.test_1", True, None)])
+        # le passage suivant ne double rien : la ligne reste sans message.
+        self.assertEqual(watcher.tick(self.db), [])
+        self.assertEqual(self.mails("dev-a"), [])
+
     def test_echec_sans_destinataire_journalise_une_seule_fois(self):
         """#1573 R2 : une exécution sans lot (main) n'envoie aucun message ;
         ses échecs déjà inscrits ne sont pas rejournalisés à chaque passe."""

@@ -434,6 +434,13 @@ def budget_handoff(cfg, db, *, now: float | None = None,
                 if agent is None:
                     continue
                 agent = dict(row, **agent)
+                # #1136 : le filtre des sources s'applique aussi aux preneurs,
+                # jugé sur la ligne du registre (canon propriétaire) : un agent
+                # critique (conception, relecture, auditeur — même Codex) ne
+                # reprend pas un lot rendu.
+                if auditor_mod.is_critical(cfg, db, row["name"], canons,
+                                          declared=declared, agent=agent):
+                    continue
                 if not auditor_mod.may_take(agent, canons):
                     continue
                 auditors = auditor_mod.cards([agent], canons)
