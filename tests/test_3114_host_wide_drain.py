@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sys
 import time
 import unittest
@@ -50,6 +51,12 @@ class HostWideDrainTest(unittest.TestCase):
         for name in ('dev1', 'dev2', 'dev3'):
             self.assertIn('resume ' + name + ' --operator', self.operateur())
 
+    def stop_waits(self, p):
+        """Attente réellement journalisée par arrêt prouvé, par persona."""
+        return {m.group(1): int(m.group(2)) for m in re.finditer(
+            r'ameesh-runner-agent@(dev\d)\.service : arrêt prouvé — attente (\d+) s',
+            p.stdout)}
+
     def test_three_turns_overlap_instead_of_adding(self):
         self.configure_turns((10, 20, 30))
         start = time.monotonic()
@@ -58,13 +65,95 @@ class HostWideDrainTest(unittest.TestCase):
         self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
         self.assert_all_paused_before_stop()
         self.assert_no_pause()
-        print(f"#3114 tours 10/20/30 s : balayage {elapsed:.1f} s", flush=True)
+        waits = self.stop_waits(p)
+        self.assertEqual(set(waits), {'dev1', 'dev2', 'dev3'}, p.stdout)
+        print(f"#3114 tours 10/20/30 s : balayage {elapsed:.1f} s, "
+              f"attentes {waits['dev1']}/{waits['dev2']}/{waits['dev3']} s", flush=True)
         self.assertGreaterEqual(elapsed, 30)
-        # Allow process/SSH double overhead on busy CI hosts; serial = 60+ s.
-        self.assertLess(elapsed, 55, p.stdout)
-        for name in ('dev1', 'dev2', 'dev3'):
-            self.assertIn('ameesh-runner-agent@' + name + '.service : arrêt prouvé — attente ',
-                          p.stdout)
+        # Les pauses sont posées avant le premier arrêt : chaque arrêt
+        # n'attend que le reste de son tour (≈10 s), jamais le tour complet
+        # de 20/30 s que la somme des drains ajoutait. L'échéance d'un tour
+        # étant absolue, une charge retarde le début de l'arrêt et raccourcit
+        # cette attente : la borne haute ne dépend pas de la charge, au
+        # contraire d'une borne sur la durée totale du balayage.
+        self.assertLessEqual(waits['dev2'], 15, p.stdout)
+        self.assertLessEqual(waits['dev3'], 15, p.stdout)
+        self.assertLessEqual(sum(waits.values()), 45, p.stdout)
+
+    def test_idle_persona_is_drained_before_it_starts_a_turn(self):
+        # dev2 est idle au pré-drain puis commence un tour quand l'arrêt lent
+        # de dev1 démarre. La pause du pré-drain doit déjà être posée : sinon
+        # le drain de rattrapage attend ce tour et allonge le balayage.
+        self.configure_turns((10, 20, 30))
+        self.agents[1]['status'] = 'idle'
+        cli = self.bin / 'ameesh'
+        cli.write_text(
+            cli.read_text()
+            .replace(
+                "        duration = json.loads((state / 'durations.json').read_text())[name]\n",
+                "        duration = json.loads((state / 'durations.json').read_text())[name]\n"
+                "        if name == 'dev2' and not (state / 'sweep-started').exists():\n"
+                "            duration = 0\n")
+            .replace(
+                "    if scenario == 'always-busy': row['status'] = 'running'",
+                "    if scenario == 'always-busy' or (name == 'dev2'\n"
+                "            and (state / 'sweep-started').exists()\n"
+                "            and not pause.exists()):\n"
+                "        row['status'] = 'running'"))
+        unit = self.bin / 'systemctl'
+        unit.write_text(unit.read_text().replace(
+            "    with (state / 'sequence.log').open('a') as f:\n"
+            "        f.write('stop %s\\n' % name)",
+            "    with (state / 'sequence.log').open('a') as f:\n"
+            "        f.write('stop %s\\n' % name)\n"
+            "    if name == 'dev1':\n"
+            "        (state / 'sweep-started').touch()"))
+        p = self.run_vm()
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        self.assert_all_paused_before_stop()
+        self.assert_no_pause()
+        self.assertLessEqual(self.stop_waits(p)['dev2'], 5, p.stdout)
+        self.assertEqual(self.operateur().count('pause dev2 '), 1)
+
+    def test_uncertain_prepose_is_reused_and_lifted(self):
+        # #3120/B2 : la première pose (rc124) peut aboutir plus tard. Le
+        # rattrapage doit réutiliser son motif, reconnaître la pause réelle et
+        # la lever ; l'ancienne intention ne doit pas être remplacée ni perdue.
+        self.configure_turns()
+        self.agents[1]['status'] = 'idle'
+        (self.state / 'pose-incertaine-agent').write_text('dev2')
+        p = self.run_vm(scenario='pose-incertaine')
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        poses = [l for l in self.operateur().splitlines() if l.startswith('pause dev2 ')]
+        reprises = [l for l in self.operateur().splitlines() if l.startswith('resume dev2 ')]
+        self.assertEqual(len(poses), 2, p.stdout + p.stderr)
+        self.assertEqual(len(reprises), 1, p.stdout + p.stderr)
+        motif = poses[0].split('--reason ', 1)[1].split(' --human ', 1)[0]
+        self.assertIn('--expect-reason ' + motif, reprises[0])
+        self.assertFalse((self.state / 'pause-dev2').exists())
+        self.assert_no_pause()
+
+    def test_uncertain_prepose_barrier_survives_a_later_success(self):
+        # #3120/B3 : la seconde pose aboutit avant la première requête
+        # incertaine ; sa barrière doit rester tenue jusqu'à l'échéance, sinon
+        # la requête tardive repose le motif après la levée.
+        self.configure_turns()
+        self.agents[1]['status'] = 'idle'
+        (self.state / 'pose-incertaine-agent').write_text('dev2')
+        clock = self.state / 'horloge'
+        clock.write_text('100')
+        self.env.update(HORLOGE_FICHIER=str(clock), DRAIN_ECHEANCE='15',
+                        DRAIN_BORNE_INSTRUCTION='1', DRAIN_DERIVE='1')
+        p = self.run_vm(scenario='pose-incertaine-inverse')
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        poses = [l for l in self.operateur().splitlines() if l.startswith('pause dev2 ')]
+        reprises = [l for l in self.operateur().splitlines() if l.startswith('resume dev2 ')]
+        self.assertEqual(len(poses), 2, p.stdout + p.stderr)
+        self.assertEqual(len(reprises), 1, p.stdout + p.stderr)
+        self.assertFalse((self.state / 'pose-incertaine-late-fait').exists(),
+                         p.stdout + p.stderr)
+        self.assertFalse((self.state / 'pause-dev2').exists())
+        self.assert_no_pause()
 
     def test_second_stop_failure_cleans_every_pause(self):
         self.configure_turns(fail_second=True)
