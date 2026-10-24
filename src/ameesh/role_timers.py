@@ -618,7 +618,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--role", default=DEFAULT_ROLE,
                         help="elected role carrying the timers (default: %s)" % DEFAULT_ROLE)
     parser.add_argument("--bin", default=DEFAULT_BIN,
-                        help="ameesh binary in the units (default: %s)" % DEFAULT_BIN)
+                        help="ameesh binary in the units (default: %(default)s)")
     parser.add_argument("--systemd-dir", default=None,
                         help="user systemd directory (default: ~/.config/systemd/user)")
     parser.add_argument("--install", action="store_true", help="write and enable the timers")
