@@ -431,6 +431,11 @@ class WorktreeEtatTest(_Tmp):
             # plusieurs lots nommés : doute, la passe vérifie tous les candidats
             self.assertIsNone(menage.lot_of_worktree(
                 None, "a1", "/w/wt-432-433", ""))
+            # branche et dossier doivent nommer le MÊME lot unique
+            self.assertEqual(menage.lot_of_worktree(
+                None, "a1", "/w/nexlink-a1-431", "lot/431"), "431")
+            self.assertIsNone(menage.lot_of_worktree(
+                None, "a1", "/w/nexlink-a1-431", "lot/432"))
 
     def test_cited_lots_are_tried_in_order(self):
         """#1694: a branch citing several numeric groups lists its candidates
@@ -1586,15 +1591,18 @@ class MenageDbTest(PgTestCase):
                          ("a1", str(fini), "removed"))
 
     def test_relecture_tous_les_candidats_du_dossier_avant_retrait(self):
-        """#3266 (relecture) : la convention stricte garde la priorité
-        (`a1-431-22` suit #431) ; un dossier qui nomme plusieurs lots, dont un
-        ouvert ou inconnu, n'autorise aucun retrait ; le propriétaire nommé
-        reste l'agent même quand le lot est assigné ailleurs (tour en cours)."""
-        registry.upsert(self.db, "a1", harness="claude", host="pc",
-                        cwd=os.path.join(self.tmp, "a1"))
-        registry.upsert(self.db, "a2", harness="claude", host="pc",
-                        cwd=os.path.join(self.tmp, "a2"))
-        # a1 : un lot fini (étranger), un lot fini (strict), un lot ouvert
+        """#3266 (relecture) : la branche ACTUELLE est relue avant attribution
+        (une branche enregistrée périmée ne fait pas retirer) ; la convention
+        stricte garde la priorité (`a1-431-22` suit #431) ; un dossier qui
+        nomme plusieurs lots, dont un ouvert ou inconnu, n'autorise aucun
+        retrait ; le propriétaire nommé reste l'agent même quand le lot est
+        assigné ailleurs (tour en cours)."""
+        _sans_processus(self)
+        main = _repo(self.tmp)
+        for name in ("a1", "a2", "a3", "a4", "a5"):
+            registry.upsert(self.db, name, harness="claude", host="pc",
+                            cwd=os.path.join(self.tmp, name))
+        # a1 : lot fini (étranger), lot fini (strict), lot ouvert (strict)
         etranger = self._lot("etranger")
         work.assign(self.db, etranger, "a1")
         work.close(self.db, etranger, abandoned=True)
@@ -1603,28 +1611,48 @@ class MenageDbTest(PgTestCase):
         work.close(self.db, strict_fini, abandoned=True)
         strict_ouvert = self._lot("strict-ouvert")
         work.assign(self.db, strict_ouvert, "a1")
-        # a2 : un lot fini (multiple), puis un lot ouvert (multiple)
+        # a3 : lot fini puis lot ouvert, tous deux nommés par un dossier
         multi_fini = self._lot("multi-fini")
-        work.assign(self.db, multi_fini, "a2")
+        work.assign(self.db, multi_fini, "a3")
         work.close(self.db, multi_fini, abandoned=True)
         multi_ouvert = self._lot("multi-ouvert")
-        work.assign(self.db, multi_ouvert, "a2")
+        work.assign(self.db, multi_ouvert, "a3")
+        # a4 : branche périmée (topic) puis bascule vers lot/ouvert
+        stale_fini = self._lot("stale-fini")
+        work.assign(self.db, stale_fini, "a4")
+        work.close(self.db, stale_fini, abandoned=True)
+        stale_ouvert = self._lot("stale-ouvert")
+        work.assign(self.db, stale_ouvert, "a4")
+        # a5 : branche lot/fini, dossier qui nomme aussi un lot ouvert
+        disagree_fini = self._lot("disagree-fini")
+        work.assign(self.db, disagree_fini, "a5")
+        work.close(self.db, disagree_fini, abandoned=True)
+        disagree_ouvert = self._lot("disagree-ouvert")
+        work.assign(self.db, disagree_ouvert, "a5")
         rows = {}
-        for agent, name in (
-                ("a1", "a1-%d-%d" % (strict_ouvert, strict_fini)),
-                ("a2", "nexlink-a2-%d" % etranger),
-                ("a2", "wt-%d-%d" % (multi_fini, multi_ouvert)),
-                ("a2", "wt-999999-%d" % multi_fini)):
+
+        def add(name, agent, branch):
             path = os.path.join(self.tmp, name)
-            os.makedirs(path)
+            _git("worktree", "add", "-q", path, "-b", branch, cwd=main)
             row = storage.of(self.db).housekeeping.register_worktree(
-                host="pc", path=path, repo="", agent=agent, lot=None,
-                turn_id="t", branch="", head="")
+                host="pc", path=path, repo=menage.common_dir(main), agent=agent,
+                lot=None, turn_id="t", branch=branch, head="")
             storage.of(self.db).housekeeping.set_worktree_status(row["id"], "active", "")
             rows[name] = path
+            return path
+
+        add("a1-%d-%d" % (strict_ouvert, strict_fini), "a1", "topic-strict")
+        add("nexlink-a2-%d" % etranger, "a2", "topic-foreign")
+        add("wt-%d-%d" % (multi_fini, multi_ouvert), "a3", "topic-multi")
+        add("wt-999999-%d" % multi_fini, "a3", "topic-unknown")
+        stale = add("nexlink-a4-%d" % stale_fini, "a4", "topic-stale")
+        # la branche enregistrée est périmée : le worktree a basculé
+        _git("checkout", "-q", "-b", "lot/%d" % stale_ouvert, cwd=stale)
+        add("wt-%d-%d" % (disagree_ouvert, disagree_fini), "a5",
+            "lot/%d" % disagree_fini)
         _entries, plan = menage._worktree_pass(
             self.db, "pc", dry_run=True, protected=set(), running={"a2"},
-            now=time.time() + 25 * 3600, known_agents=("a1", "a2"))
+            now=time.time() + 25 * 3600, known_agents=("a1", "a2", "a3", "a4", "a5"))
         plan = {p["path"]: p for p in plan if p.get("kind") == "worktree"}
         strict = plan[rows["a1-%d-%d" % (strict_ouvert, strict_fini)]]
         self.assertEqual((strict["action"], strict["lot"]),
@@ -1634,8 +1662,11 @@ class MenageDbTest(PgTestCase):
         self.assertIn("turn in progress for a2", tour["detail"])
         kept = {r["path"]: r for r in storage.of(self.db).housekeeping.worktrees("pc")}
         self.assertIsNone(kept[rows["nexlink-a2-%d" % etranger]]["lot"])
+        self.assertIsNone(kept[rows["nexlink-a4-%d" % stale_fini]]["lot"])
         for name in ("wt-%d-%d" % (multi_fini, multi_ouvert),
-                     "wt-999999-%d" % multi_fini):
+                     "wt-999999-%d" % multi_fini,
+                     "nexlink-a4-%d" % stale_fini,
+                     "wt-%d-%d" % (disagree_ouvert, disagree_fini)):
             row = plan[rows[name]]
             self.assertEqual((row["action"], row["lot"]), ("garde", None), row)
             self.assertIn("not attributable", row["detail"])

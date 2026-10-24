@@ -650,6 +650,8 @@ class OrphanGuardsTest(unittest.TestCase):
                     with mock.patch.object(menage.storage, "of", return_value=store), \
                             mock.patch.object(menage, "worktree_state", return_value=git), \
                             mock.patch.object(menage, "worktree_in_use", return_value=False), \
+                            mock.patch.object(menage, "current_branch",
+                                              return_value=(True, row["branch"])), \
                             mock.patch.object(menage, "ignored_leftovers", return_value=[]), \
                             mock.patch.object(hd, "_marker", return_value="linked"), \
                             mock.patch.object(menage, "same_repository", return_value=True), \
