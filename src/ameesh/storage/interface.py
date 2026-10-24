@@ -111,7 +111,7 @@ Non implémenté ; liste de contrôle pour qui l'écrira.
    turn_resources  open_turn close_turn mark_orphan settle get open_by_agent orphans
                    stale_running churn
    housekeeping    log recent summary last_measure register_worktree worktrees
-                   set_worktree_status
+                   set_worktree_status set_worktree_attribution
 
 3. Atomicité et verrous. Postgres tient les garanties par des écritures
    conditionnelles en une instruction (`UPDATE … WHERE`, `INSERT … ON
@@ -3990,6 +3990,13 @@ class Housekeeping(Domain):
     def set_worktree_status(self, worktree_id: int, status: str, detail: str) -> dict | None:
         """Change le statut d'un worktree suivi (`ended_at` posé pour
         `removed` et `gone`) ; rend la ligne, ou None."""
+
+    @abc.abstractmethod
+    def set_worktree_attribution(self, worktree_id: int, agent: str, lot: str,
+                                 detail: str) -> dict | None:
+        """Rattache un worktree suivi à l'agent et au lot que son nom prouve
+        (#3266) : agent, lot et détail changent, le statut reste ; rend la
+        ligne, ou None."""
 
 
 class Visibility(Domain):

@@ -59,7 +59,11 @@ class PlanUnderusedBriefWindowTest(PgTestCase):
         alert = self.plan()
         notifier.run_pass(self.db, current=[alert])
         self.assertEqual(len(self.mails("orch")), 1)
-        self.assertEqual(len(self.mails("auditeur")), 1)
+        # #3274 : le forfait sous-utilisé ne réveille plus l'auditeur tant
+        # qu'un orchestrateur vit — il le lit à sa passe, sans courrier. Le
+        # relais sans orchestrateur vivant est couvert par
+        # test_3036_alert_liveness.
+        self.assertEqual(self.mails("auditeur"), [])
 
         # la perte projetée repasse sous le seuil : l'alerte est absente d'une
         # passe. Le notificateur ne doit pas oublier qu'il a déjà briefé.
