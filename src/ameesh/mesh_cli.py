@@ -3704,7 +3704,9 @@ def build_parser() -> argparse.ArgumentParser:
                             "of at least 12 hex characters resolved there; a symbolic "
                             "ref is refused. verdict: a full commit resolved, the "
                             "current frozen head, or an abbreviation of at least 12 "
-                            "hex characters resolved in a repository)")
+                            "hex characters resolved in a repository; the resolved "
+                            "commit is written complete, since the CI request compares "
+                            "the full head)")
     # le verdict est un positionnel (`work milestone 1 verdict ok`), comme la
     # frise se lit ; `frozen` n'en prend pas
     pw_ms.add_argument("verdict", nargs="?", choices=list(work.VERDICTS), default=None,
