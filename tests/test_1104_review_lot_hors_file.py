@@ -722,7 +722,7 @@ class CatchUpWitnessTest(_Witness):
 
     def test_un_depot_inconnu_avertit_le_pilote(self):
         """#3201 : une relecture qui ne peut pas s'ouvrir faute de dépôt n'est
-        plus seulement journalisée. La première tentative envoie un courrier
+        plus seulement journalisée. La deuxième tentative envoie un courrier
         aux pilotes déclarés, qui nomme le lot et le geste de reprise ; les
         tentatives suivantes ne le renvoient pas."""
         lot = self.merged_lot("dépôt inconnu")
@@ -737,6 +737,10 @@ class CatchUpWitnessTest(_Witness):
         with patches[0], patches[1], patches[2]:
             out = review_lot.catch_up(self.db)
         self.assertEqual(out["attempted"], 1, out)
+        self.assertEqual(out["unopened"], [], out)
+        self.assertEqual(mail.unread_active(self.db, "pilote"), [])
+        with patches[0], patches[1], patches[2]:
+            out = review_lot.catch_up(self.db, retry_s=0)
         self.assertEqual([entry["lot"] for entry in out["unopened"]], [lot], out)
         self.assertIn("avertissement envoyé", out["warning"], out)
         messages = mail.unread_active(self.db, "pilote")
@@ -750,6 +754,22 @@ class CatchUpWitnessTest(_Witness):
         self.assertEqual(again["unopened"], [], again)
         self.assertEqual(len(mail.unread_active(self.db, "pilote")), 1,
                          "l'avertissement est renvoyé à chaque tentative")
+
+    def test_depot_lisible_a_la_deuxieme_passe_sans_courrier(self):
+        """#3384 : absence transitoire puis classe sensible confirmée."""
+        lot = self.merged_lot("clone pas encore lisible")
+        with mock.patch.object(review_lot, "_warn_unopened") as warn:
+            with mock.patch.object(review_lot, "_repo_of_agent", return_value=""), \
+                    mock.patch.object(review_lot.lot_class, "repository", return_value=None):
+                first = review_lot.catch_up(self.db)
+            self.assertEqual(first["attempted"], 1, first)
+            with mock.patch.object(review_lot, "class_at_merge",
+                                   return_value={"class": "sensitive", "doubt": False}):
+                second = review_lot.catch_up(self.db, retry_s=0)
+            self.assertEqual(second["terminal"], 1, second)
+            self.assertEqual(second["unopened"], [], second)
+            warn.assert_not_called()
+        self.assertEqual(self.review_lots(lot), [])
 
 
 class DeclaredMergeWitnessTest(_Witness):
