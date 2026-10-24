@@ -75,7 +75,7 @@ Le bloc optionnel `staging` de #3291 (`7748b4649`) est lu par
 parité, qui interdit qu'un bloc entre au lecteur sans détecteur, a donc rougi
 sur la tête du paquet.
 
-Correctif `48ac257b7` : `mechanics._STAGING_KEYS` devient la source unique du
+Correctif `8a40de210` : `mechanics._STAGING_KEYS` devient la source unique du
 bloc (lecteur, `_staging`, témoin) ; la garde couvre
 `staging.waiting_lots_min`, `staging.before_cutoff_seconds` et
 `staging.before_packet_seconds` (clés, liaisons de variable et de mapping,
@@ -131,7 +131,7 @@ Ciblés verts sur la tête corrigée : `test_2449_garde_mecanique`,
   (§12). Les six unités ont leurs verdicts acquis sur leurs têtes gelées et
   leurs review-class lues par la porte ; le porteur #3305 est gelé sur la tête
   finale et ses relecteurs rendent leurs avis sur cette tête (aucune relecture
-  supplémentaire n'est déclarée due à l'avance). Le correctif `48ac257b7`
+  supplémentaire n'est déclarée due à l'avance). Le correctif `8a40de210`
   remplace la tête rouge : nouvelle demande `ci-full` et fusion sous garde de
   tête dès le vert. Son delta propre touche la garde mécanique et le lecteur
   (sensible, #2449) : la porte désigne le relecteur dû sur la nouvelle tête ;
