@@ -169,6 +169,11 @@ SCHEMA = "ameesh-test-event/1"
 #: `main` — Nexlink, dont la base est `develop` — la déclare dans
 #: `github.projects.<projet>.base` (#1483).
 BASE_BRANCHES = ("main",)
+#: #3344 : le workflow qui publie la carte de mesure (L161e), et la période
+#: de relecture de sa dernière exécution réussie — une requête par heure et par
+#: dépôt suffit à une alerte dont le seuil est de 48 h
+MAP_WORKFLOW = "carte.yml"
+MAP_READ_S = 3600.0
 #: #1483 : taille des pages de listes d'exécutions du veilleur (l'API GitHub
 #: plafonne à 100). À 50, une file de plus de 50 exécutions — tous workflows
 #: confondus — pouvait cacher une exécution suivie, que seul le rattrapage
@@ -1091,6 +1096,11 @@ class Watcher:
             except Exception as exc:  # noqa: BLE001 - cache seulement, jamais fatal
                 self.log("CI: queue rows outside the active perimeter not pruned (%s)"
                          % " ".join(str(exc).split())[:200])
+            try:
+                storage.of(db).ci.prune_maps(repos)
+            except Exception as exc:  # noqa: BLE001 - cache seulement, jamais fatal
+                self.log("CI: map rows outside the active perimeter not pruned (%s)"
+                         % " ".join(str(exc).split())[:200])
             return out
         finally:
             plan_github.flush_reads(getattr(self.cfg, "state_dir", None))
@@ -1148,7 +1158,45 @@ class Watcher:
         # runners coûte une requête par exécution non conclue (quelques
         # dizaines de secondes en saturation) et ne doit pas les retarder
         self._guard(db, repo)
+        self._map(db, repo, bases)
         return out
+
+    def _map(self, db, repo: str, bases=BASE_BRANCHES) -> None:
+        """#3344 : la dernière carte de mesure publiée sur la base du dépôt.
+
+        Le plan de tests (`scripts/test-plan.py`) n'utilise plus une carte de
+        plus de 48 h et le dit en annotation CI ; seule cette lecture permet à
+        `ameesh alerts` de le voir (`map_stale`). Un dépôt sans `carte.yml`
+        n'est pas lu ; la dernière exécution réussie de la base est relue au
+        plus toutes les `MAP_READ_S` (date du relevé précédent, dans la base :
+        plusieurs processus de relevé ne la repaient pas). Une erreur GitHub
+        est journalisée et laisse le relevé précédent vieillir."""
+        from . import plan_github
+        found = self.discovered_workflows(repo)
+        if not found or MAP_WORKFLOW not in found:
+            return
+        st = storage.of(db)
+        branch = (tuple(bases) or BASE_BRANCHES)[0]
+        now = float(self.clock())
+        known = next((r for r in st.ci.maps()
+                      if str(r.get("repo") or "").casefold() == repo.casefold()), None)
+        if known is not None and known.get("branch") == branch \
+                and now - float(known.get("seen_ts") or 0) < MAP_READ_S:
+            return
+        try:
+            data = self.api("repos/%s/actions/workflows/%s/runs?branch=%s&status=success"
+                            "&per_page=1" % (repo, MAP_WORKFLOW, quote(branch, safe=""))) or {}
+        except plan_github.GithubRateLimited:
+            raise
+        except Exception as exc:  # noqa: BLE001 - jamais fatal au relevé
+            self.log("CI %s: last %s run unreadable (%s)"
+                     % (repo, MAP_WORKFLOW, " ".join(str(exc).split())[:200]))
+            return
+        runs = list(data.get("workflow_runs") or ())
+        run = runs[0] if runs else {}
+        st.ci.observe_map(repo, branch=branch, run_id=run.get("id"),
+                          head_sha=run.get("head_sha"),
+                          published_at=run.get("updated_at") or None)
 
     def _catch_up(self, db, repo: str, lots: list[dict], followed: set[str],
                   bases=BASE_BRANCHES) -> list[dict]:

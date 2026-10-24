@@ -372,6 +372,45 @@ class CiResults(interface.CiResults):
             "DELETE FROM ci_queue_state WHERE lower(repo) NOT IN (%s)"
             % ", ".join(["%s"] * len(keys)), tuple(keys))
 
+    # -- #3344 : âge de la carte de mesure ----------------------------------
+    def observe_map(self, repo, *, branch, run_id, head_sha, published_at) -> None:
+        self.db.execute(
+            """
+            INSERT INTO ci_map_state AS m (repo, branch, run_id, head_sha,
+                                           published_at, seen_at)
+            VALUES (%s, %s, %s, %s, %s::timestamptz, now())
+            ON CONFLICT (repo) DO UPDATE SET
+                branch       = excluded.branch,
+                run_id       = excluded.run_id,
+                head_sha     = excluded.head_sha,
+                published_at = excluded.published_at,
+                seen_at      = now()
+            """,
+            (repo, branch, int(run_id) if run_id is not None else None,
+             head_sha or None, published_at or None))
+
+    def maps(self) -> list[dict]:
+        return self.db.query(
+            """
+            SELECT repo, branch, run_id, head_sha,
+                   extract(epoch from published_at)::float8 AS published_ts,
+                   extract(epoch from seen_at)::float8      AS seen_ts
+              FROM ci_map_state
+             ORDER BY repo
+            """)
+
+    def prune_maps(self, repos) -> None:
+        """Comme `prune_queue` (#2957) : un dépôt sorti du périmètre actif
+        ne garde pas une carte qui alerterait à jamais ; sans périmètre, rien
+        n'est retiré."""
+        keys = sorted({str(repo).strip().casefold() for repo in repos
+                       if str(repo).strip()})
+        if not keys:
+            return
+        self.db.execute(
+            "DELETE FROM ci_map_state WHERE lower(repo) NOT IN (%s)"
+            % ", ".join(["%s"] * len(keys)), tuple(keys))
+
     # -- #845 (revue N/P2 2328) : fenêtre et cache du relevé ----------------
     def claim_guard_scan(self, repo, *, now, window_s) -> bool:
         """Revendique la fenêtre du relevé de `repo`, atomiquement.
