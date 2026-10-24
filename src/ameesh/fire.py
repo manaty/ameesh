@@ -1004,22 +1004,20 @@ def relaunch_unconcluded(db, lot: int, slug: str, head: str, report: dict | None
     """#3186 (décision owner #128512 du 23/10) : la porte a trouvé un check
     requis jamais conclu (`report["unconcluded"]` de `ready_pr`) ; son run est
     relancé **une fois** (`radar.rerun_unconcluded`), la porte reste fermée
-    jusqu'à une conclusion. `guard()` (bail du geste) est relu juste avant la
-    relance : un détenteur périmé ne relance rien. Chaque issue utile est
-    notée au journal du lot, une seule fois. Rend les issues."""
+    jusqu'à une conclusion. `guard()` (bail du passage et garde du pilote
+    élu) est relu juste avant chaque relance : un détenteur périmé ne relance
+    rien. Chaque issue utile est notée au journal du lot, une seule fois.
+    Rend les issues."""
     from . import radar
     pairs = [(name, radar.actions_run_id(slug, entry))
              for name, entry in (report or {}).get("unconcluded") or ()]
     if not pairs:
         return []
-    if not dry_run and guard is not None and not guard():
-        return [{"check": name, "run": run, "result": "busy",
-                 "detail": "lease lost before the rerun: nothing rerun"}
-                for name, run in pairs]
-    reruns = radar.rerun_unconcluded(slug, head, pairs, gh=gh, dry_run=dry_run)
+    reruns = radar.rerun_unconcluded(slug, head, pairs, gh=gh, dry_run=dry_run,
+                                     guard=guard)
     if not dry_run:
         for row in reruns:
-            if row["result"] == "running":
+            if row["result"] in ("running", "busy"):
                 continue
             try:
                 work.note(db, int(lot),
@@ -2204,10 +2202,22 @@ def _merge_direct(cfg, db, row: dict, marks: list, fire: dict, status: dict, *, 
     ok, why = ready_pr(status, target=target, project=project, frozen=frozen,
                        slug=slug, gh=gh, report=report)
     if not ok:
-        # #3186 : un requis jamais conclu bloque ; son run est relancé une fois.
+        # #3186 : un requis jamais conclu bloque ; son run est relancé une fois,
+        # sous le bail du feu et la garde du pilote élu, comme la fusion.
+        def guard() -> bool:
+            if not _renew(handle):
+                return False
+            from . import pilot_gesture
+            try:
+                fence = pilot_gesture.gate(cfg, db, "merge", "fire rerun #%d" % lot,
+                                           project=(row.get("app") or None))
+                if fence is not None:
+                    fence.hold(db, margin_s=FIRE_CALL_MARGIN_S)
+            except pilot_gesture.GestureRefused:
+                return False
+            return True
         reruns = relaunch_unconcluded(db, lot, slug, status.get("head") or frozen, report,
-                                      gh=gh, dry_run=dry_run,
-                                      guard=lambda: _renew(handle))
+                                      gh=gh, dry_run=dry_run, guard=guard)
         if reruns:
             from . import radar
             out["reruns"] = reruns

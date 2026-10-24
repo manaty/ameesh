@@ -1886,7 +1886,8 @@ def _gh_call(gh, argv: list) -> tuple:
     return proc.returncode, proc.stdout or "", proc.stderr or ""
 
 
-def rerun_unconcluded(slug: str, head: str, runs, *, gh, dry_run: bool = False) -> list:
+def rerun_unconcluded(slug: str, head: str, runs, *, gh, dry_run: bool = False,
+                      guard=None) -> list:
     """#3186 (décision owner #128512 du 23/10) : « agrégat requis jamais conclu
     = preuve absente, donc bloquant : on relance le seul run (coût : une
     relance) ».
@@ -1898,11 +1899,14 @@ def rerun_unconcluded(slug: str, head: str, runs, *, gh, dry_run: bool = False) 
     relancé (essai ≥ 2, par ameesh ou par `relance hosted`) ne l'est plus :
     la relance a coûté sa fois, la preuve manque toujours et le dire suffit.
     Aucune issue ne rouvre la porte : seule une conclusion la rouvre.
+    `guard()` (bail du passage, garde du pilote élu) est relu juste avant
+    chaque relance : un détenteur périmé ne relance rien (`busy`).
 
     Rend `[{check, run, result, detail}]`, `result` parmi `rerun`,
     `would-rerun`, `running` (déjà relancé, en cours), `spent` (relance déjà
-    faite), `unknown` (aucun run Actions à relancer), `refused` (run d'une
-    autre tête) et `error` (lecture ou relance impossible)."""
+    faite), `busy` (garde perdue), `unknown` (aucun run Actions à relancer),
+    `refused` (run d'une autre tête) et `error` (lecture ou relance
+    impossible)."""
     out, seen = [], set()
     for label, run_id in runs or ():
         if run_id in seen and run_id is not None:
@@ -1939,6 +1943,10 @@ def rerun_unconcluded(slug: str, head: str, runs, *, gh, dry_run: bool = False) 
         elif dry_run:
             out.append(dict(row, result="would-rerun", attempt=attempt,
                             detail="run %d would be rerun" % run_id))
+        elif guard is not None and not guard():
+            out.append(dict(row, result="busy", attempt=attempt,
+                            detail="lease lost before the rerun of run %d: nothing rerun"
+                            % run_id))
         else:
             try:
                 code, _text, err = _gh_call(gh, ["run", "rerun", str(run_id), "--failed",
@@ -2013,7 +2021,8 @@ def run_result(run) -> str:
     return conclusion_result(run.get("status"), run.get("conclusion"))
 
 
-def commit_ci(project: Project, sha: str, gh=None, *, branch: str | None = None) -> dict:
+def commit_ci(project: Project, sha: str, gh=None, *, branch: str | None = None,
+              required=()) -> dict:
     """L160g (#473, `ci_required`): GitHub's CI on the commit `sha` itself
     (Actions, external app checks and commit statuses), the latest activity
     of each workflow database ID: `{runs,
@@ -2035,9 +2044,14 @@ def commit_ci(project: Project, sha: str, gh=None, *, branch: str | None = None)
     check portant le nom d'une part ne puisse pas en tenir lieu.
 
     #3085/#3186 : `acceptable` (aucun négatif, rien en cours ni absent) porte
-    la règle du 23/10 ; `inconclusive` liste les non concluants consignés ;
-    `unconcluded` (`[{check, databaseId}]`) les runs Actions terminés sans
-    avoir conclu eux-mêmes — preuve absente, jamais `acceptable`."""
+    la règle du 23/10 ; `inconclusive` liste les non concluants consignés.
+    `required` (paires `(nom, app_id | None)` ou noms : les checks requis de
+    la cible) désigne les agrégats requis, lus par leur nom sur les check
+    runs du commit, Actions comprises : un requis `FAILURE` est `negative`,
+    un requis qui n'a pas conclu lui-même est dans `unconcluded`
+    (`[{check, databaseId}]`, le run à relancer) — preuve absente, jamais
+    `acceptable` (décision owner #128512). Un run ou un check hors des requis
+    qui n'a pas conclu reste non concluant (§3)."""
     from datetime import datetime
     from . import plan_github
     slug = github_slug(project)
@@ -2046,7 +2060,7 @@ def commit_ci(project: Project, sha: str, gh=None, *, branch: str | None = None)
     gh = gh or plan_github.Gh()
     rows = plan_github._json(gh, ["run", "list", "--repo", slug, "--commit", sha, "--limit",
                                   "100", "--json",
-                                  "workflowDatabaseId,workflowName,name,status,conclusion,createdAt,startedAt,updatedAt,headSha,event,databaseId"])
+                                  "workflowDatabaseId,workflowName,name,status,conclusion,createdAt,startedAt,updatedAt,headSha,event"])
     if not isinstance(rows, list) or not all(isinstance(r, dict) for r in rows):
         raise plan_github.GithubError("gh run list: unexpected output")
     if len(rows) >= 100:
@@ -2084,15 +2098,14 @@ def commit_ci(project: Project, sha: str, gh=None, *, branch: str | None = None)
     results: list[tuple[str, str]] = [
         (label(identity, run), run_result(run))  # #3209 : garde workflow_run sautée
         for identity, run in latest.items()]
-    #: #3186 (décision owner #128512) : un run terminé sans avoir conclu
-    #: lui-même (annulé, expiré, démarrage raté) est l'agrégat de ses jobs
-    #: jamais conclu — une preuve absente, pas un non concluant : la tête
-    #: n'est pas `acceptable`, et le run (`databaseId`) peut être relancé.
-    unconcluded = sorted(
-        ({"check": label(identity, run), "databaseId": run.get("databaseId")}
-         for identity, run in latest.items()
-         if (run.get("status") or "") == "completed" and never_concluded(run.get("conclusion"))),
-        key=lambda row: row["check"])
+    #: #3186 (décision owner #128512) : les agrégats requis de la cible, lus
+    #: sur les check runs du commit (les derniers par application et nom).
+    wanted = []
+    for value in (required,) if isinstance(required, str) else tuple(required or ()):
+        name, app_id = (value, None) if isinstance(value, str) else tuple(value)
+        if str(name or "").strip():
+            wanted.append((str(name), app_id))
+    required_latest: dict = {}
     # L1651 (#1650): what the frozen commit carries, label by label. A due
     # part is proven by a context that exists here and is terminal-success; a
     # part absent from this map was never dispatched, which is exactly the
@@ -2125,6 +2138,13 @@ def commit_ci(project: Project, sha: str, gh=None, *, branch: str | None = None)
                 or type(check["app"].get("id")) is not int
                 or type(check.get("id")) is not int or not check.get("name")):
             raise plan_github.GithubError("commit checks: invalid identity or frozen SHA")
+        if any(check["name"] == name and app_id in (None, check["app"]["id"])
+               for name, app_id in wanted):
+            # le dernier essai l'emporte ; un essai inachevé n'est jamais masqué
+            key = (check["app"]["id"], check["name"])
+            rank = (check.get("status") != "completed", check["id"])
+            if key not in required_latest or rank > required_latest[key][0]:
+                required_latest[key] = (rank, check)
         # #3251 : le check de détail de l'agrégat est le seul check Actions qui
         # porte une information absente du run (une part interne annulée alors
         # que l'agrégat a conclu) ; il passe par la lecture commune ci-dessous.
@@ -2210,6 +2230,18 @@ def commit_ci(project: Project, sha: str, gh=None, *, branch: str | None = None)
     # consigné. `green` garde son sens strict, `acceptable` porte la règle.
     negative = sorted({name for name, result in results
                        if result == CI_NEGATIVE_RESULT})
+    unconcluded = []
+    for name, app_id in wanted:
+        rows = [check for (app, check_name), (_rank, check) in sorted(required_latest.items())
+                if check_name == name and app_id in (None, app)]
+        if any(conclusion_result(c.get("status"), c.get("conclusion")) == CI_NEGATIVE_RESULT
+               for c in rows):
+            negative = sorted(set(negative) | {name})
+        elif any(c.get("status") == "completed" and never_concluded(c.get("conclusion"))
+                 for c in rows):
+            unconcluded.extend(
+                {"check": name, "databaseId": actions_run_id(slug, c)} for c in rows
+                if c.get("status") == "completed" and never_concluded(c.get("conclusion")))
     absent = {row["check"] for row in unconcluded}
     inconclusive = sorted({name for name, result in results
                            if result == CI_INCONCLUSIVE_RESULT} - absent)

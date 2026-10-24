@@ -275,12 +275,28 @@ class RelaunchTest(unittest.TestCase):
         self.assertIn("#128512", text)
 
     def test_a_lost_lease_reruns_nothing(self):
+        # la garde est relue juste avant la mutation, après la lecture du run
         gh = RunsGh({200: _run_row()})
         out = fire.relaunch_unconcluded(object(), 7, SLUG, f2271.SHA, self.report(),
                                         gh=gh, guard=lambda: False)
         self.assertEqual([row["result"] for row in out], ["busy"])
-        self.assertEqual(gh.calls, [])
+        self.assertEqual(gh.reruns(), [])
         self.assertEqual(self.notes, [])
+
+    def test_the_guard_is_read_after_the_run_and_before_the_rerun(self):
+        events = []
+        gh = RunsGh({200: _run_row()})
+        inner = gh.__call__
+
+        def call(argv, **kw):
+            events.append(argv[0] if argv[0] == "api" else " ".join(argv[:2]))
+            return inner(argv, **kw)
+
+        def guard():
+            events.append("guard")
+            return True
+        radar.rerun_unconcluded(SLUG, f2271.SHA, [("tests", 200)], gh=call, guard=guard)
+        self.assertEqual(events, ["api", "guard", "run rerun"])
 
     def test_nothing_unconcluded_does_nothing(self):
         gh = RunsGh({})
@@ -293,6 +309,72 @@ class RelaunchTest(unittest.TestCase):
         out = fire.relaunch_unconcluded(object(), 7, SLUG, f2271.SHA, self.report(), gh=gh)
         self.assertEqual(out[0]["result"], "running")
         self.assertEqual(self.notes, [])
+
+
+class DirectGh(f2271.FakeGh):
+    """Le faux `gh` du feu (#2271), avec l'URL du job du check requis, la
+    lecture du run 200 et sa relance."""
+
+    def __init__(self, events):
+        run = dict(f2271._run("tests", conclusion="cancelled"), details_url=JOB_URL % 200)
+        super().__init__(check_runs=[run])
+        self.events = events
+
+    def __call__(self, argv, **kwargs):
+        if argv[:1] == ["api"] and argv[-1].endswith("/actions/runs/200"):
+            self.calls.append(list(argv))
+            return types.SimpleNamespace(returncode=0, stderr="", stdout=json.dumps(
+                dict(_run_row(), id=200)))
+        if argv[:2] == ["run", "rerun"]:
+            self.calls.append(list(argv))
+            self.events.append("rerun")
+            return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+        return super().__call__(argv, **kwargs)
+
+
+class MergeDirectTest(unittest.TestCase):
+    """B2 de la relecture cx2 : la relance du feu passe par la garde du
+    pilote élu, relue juste avant la mutation, comme la fusion."""
+
+    ROW = f2271.WiringTest.ROW
+    MARKS = [{"kind": "frozen", "sha": f2271.SHA, "actor": "pilote", "at_ts": 0.0, "id": 1},
+             {"kind": "fire", "sha": f2271.SHA, "actor": "pilote", "at_ts": 1.0, "id": 2}]
+
+    def merge(self, gate):
+        events: list = []
+        gh = DirectGh(events)
+        with mock.patch.object(fire.work, "note"), \
+                mock.patch("ameesh.pilot_gesture.gate",
+                           side_effect=lambda *a, **k: gate(events, *a, **k)):
+            result = fire._merge_direct(None, None, self.ROW, self.MARKS,
+                                        fire.active(self.MARKS),
+                                        f2271._status([_aggregate("CANCELLED")]), out={},
+                                        slug=SLUG, branch="lot/42-x", target="main",
+                                        info={}, repo=None, project=None, gh=gh,
+                                        dry_run=False, handle=None)
+        return result, events
+
+    def test_the_elected_guard_is_held_before_the_rerun(self):
+        fence = mock.Mock()
+
+        def gate(events, cfg, db, gesture, ref, **kw):
+            events.append("gate %s" % gesture)
+            return fence
+        result, events = self.merge(gate)
+        self.assertEqual(result["result"], "not-ready")
+        self.assertIn("never concluded", result["detail"])
+        self.assertEqual(events, ["gate merge", "rerun"])
+        fence.hold.assert_called_once()
+
+    def test_a_refused_elected_guard_reruns_nothing(self):
+        from ameesh import pilot_gesture
+
+        def gate(events, *a, **k):
+            events.append("gate")
+            raise pilot_gesture.GestureRefused("stale epoch")
+        result, events = self.merge(gate)
+        self.assertEqual(events, ["gate"])
+        self.assertEqual(result["reruns"][0]["result"], "busy")
 
 
 class ForgeRuns(banc.FakeGh):
@@ -402,32 +484,81 @@ class PacketTest(banc.Journal):
         self.assertEqual(gh.reruns(), [])
 
 
+def _actions_check(name, conclusion, *, run=300, status="completed", check_id=1):
+    """Un check run Actions du commit, tel que `commits/<sha>/check-runs` le rend."""
+    return {"id": check_id, "name": name, "head_sha": "a" * 40, "status": status,
+            "conclusion": conclusion, "app": {"id": 15368, "slug": "github-actions"},
+            "details_url": "https://github.com/o/nexlink/actions/runs/%d/job/9" % run,
+            "started_at": "2026-10-12T20:00:00Z", "completed_at": "2026-10-12T20:05:00Z"}
+
+
 class CommitCiTest(unittest.TestCase):
-    """`radar.commit_ci` : un run jamais conclu n'est pas `acceptable`."""
+    """`radar.commit_ci` : seul un agrégat **requis** jamais conclu est une
+    preuve absente (B1 de la relecture cx2) ; un workflow facultatif annulé
+    reste non concluant."""
 
     project = radar.Project("n", "/r", github="o/nexlink", ci_required=True)
 
-    def test_a_run_that_never_concluded_is_absent_proof(self):
-        for conclusion in ("cancelled", "timed_out", "startup_failure"):
+    def read(self, runs, checks, required=("tests",)):
+        return radar.commit_ci(self.project, "a" * 40, required=required,
+                               gh=l160g._Gh(runs, checks=checks))
+
+    def test_a_required_aggregate_that_never_concluded_is_absent_proof(self):
+        for conclusion in ("cancelled", "timed_out", "startup_failure", "stale"):
             with self.subTest(conclusion=conclusion):
-                row = dict(l160g._run("tests", conclusion=conclusion), databaseId=300)
-                out = radar.commit_ci(self.project, "a" * 40, gh=l160g._Gh([row]))
+                out = self.read([l160g._run("tests", conclusion="cancelled")],
+                                [_actions_check("tests", conclusion)])
                 self.assertFalse(out["acceptable"])
                 self.assertEqual(out["unconcluded"], [{"check": "tests", "databaseId": 300}])
                 self.assertEqual(out["inconclusive"], [])
                 self.assertFalse(release_cutoff.reading_is_green(out))
 
-    def test_a_skipped_or_waiting_for_action_run_stays_acceptable(self):
-        rows = [l160g._run("tests"), l160g._run("pages", conclusion="action_required")]
-        out = radar.commit_ci(self.project, "a" * 40, gh=l160g._Gh(rows))
+    def test_an_optional_cancelled_workflow_stays_non_conclusive(self):
+        # B1 : tests requis vert, workflow facultatif annulé → releasable
+        out = self.read([l160g._run("tests"), l160g._run("optional-pages", conclusion="cancelled")],
+                        [_actions_check("tests", "success"),
+                         _actions_check("optional-pages", "cancelled", run=301, check_id=2)])
         self.assertTrue(out["acceptable"])
         self.assertEqual(out["unconcluded"], [])
-        self.assertEqual(out["inconclusive"], ["pages"])
+        self.assertEqual(out["inconclusive"], ["optional-pages"])
 
-    def test_the_run_id_is_requested(self):
-        gh = l160g._Gh([l160g._run("tests")])
-        radar.commit_ci(self.project, "a" * 40, gh=gh)
-        self.assertIn("databaseId", gh.calls[0][-1])
+    def test_without_required_checks_a_cancelled_run_stays_non_conclusive(self):
+        out = self.read([l160g._run("tests", conclusion="cancelled")],
+                        [_actions_check("tests", "cancelled")], required=())
+        self.assertTrue(out["acceptable"])
+        self.assertEqual(out["unconcluded"], [])
+        self.assertEqual(out["inconclusive"], ["tests"])
+
+    def test_a_red_required_aggregate_in_a_cancelled_run_is_negative(self):
+        # l'agrégat `if: always()` rougit d'une part annulée ; le run, lui,
+        # se dit `cancelled` : la release lit le requis, pas seulement le run.
+        out = self.read([l160g._run("tests", conclusion="cancelled")],
+                        [_actions_check("tests", "failure")])
+        self.assertFalse(out["acceptable"])
+        self.assertEqual(out["negative"], ["tests"])
+        self.assertEqual(out["unconcluded"], [])
+
+    def test_the_latest_attempt_of_the_required_aggregate_counts(self):
+        out = self.read([l160g._run("tests")],
+                        [_actions_check("tests", "cancelled", check_id=1),
+                         _actions_check("tests", "success", check_id=2)])
+        self.assertTrue(out["acceptable"])
+        self.assertEqual(out["unconcluded"], [])
+        out = self.read([l160g._run("tests", status="in_progress", conclusion=None)],
+                        [_actions_check("tests", "cancelled", check_id=1),
+                         _actions_check("tests", None, status="in_progress", check_id=2)])
+        self.assertFalse(out["acceptable"])
+        self.assertEqual(out["unconcluded"], [])
+
+    def test_an_app_scoped_requirement_reads_only_its_application(self):
+        other = dict(_actions_check("tests", "cancelled"), app={"id": 99, "slug": "other"},
+                     details_url="https://ci.example/build/1")
+        out = self.read([l160g._run("tests")], [_actions_check("tests", "success"), other],
+                        required=(("tests", 15368),))
+        self.assertEqual(out["unconcluded"], [])
+        out = self.read([l160g._run("tests")], [_actions_check("tests", "success"), other],
+                        required=(("tests", 99),))
+        self.assertEqual(out["unconcluded"], [{"check": "tests", "databaseId": None}])
 
 
 class ReleaseTest(r2448.ReleaseFixtureMixin, unittest.TestCase):
@@ -447,7 +578,7 @@ class ReleaseTest(r2448.ReleaseFixtureMixin, unittest.TestCase):
         self.assertNotIn("Checks non concluants", plan.notes)
 
     def test_the_head_run_is_rerun_once_and_reported(self):
-        plan = types.SimpleNamespace(ci=self.READING, head="a" * 40)
+        plan = types.SimpleNamespace(ci=self.READING, head="a" * 40, project=self.project)
         calls = []
 
         def rerun(slug, head, runs, *, gh):
@@ -464,8 +595,51 @@ class ReleaseTest(r2448.ReleaseFixtureMixin, unittest.TestCase):
         self.assertIn("#128512", line)
         self.assertIn("run 300 rerun (once)", line)
 
+    def test_the_reading_carries_the_required_checks_of_the_target(self):
+        release_cutoff._REQUIRED.clear()
+        self.addCleanup(release_cutoff._REQUIRED.clear)
+        seen = []
+        with mock.patch.object(release_cutoff, "github_slug", return_value=SLUG), \
+                mock.patch.object(release_cutoff.plan_github, "Gh"), \
+                mock.patch.object(fire, "required_checks",
+                                  return_value=(("tests", 15368),)) as read, \
+                mock.patch.object(release_cutoff.radar, "commit_ci",
+                                  side_effect=lambda target, sha, **kw: seen.append(kw) or {}):
+            release_cutoff.ci_reading(self.project, "a" * 40)
+            release_cutoff.ci_reading(self.project, "b" * 40)
+        self.assertEqual(seen, [{"required": (("tests", 15368),)}] * 2)
+        read.assert_called_once()           # relue au plus toutes les 5 min
+
+    def test_unreadable_required_checks_are_transient(self):
+        release_cutoff._REQUIRED.clear()
+        self.addCleanup(release_cutoff._REQUIRED.clear)
+        with mock.patch.object(release_cutoff, "github_slug", return_value=SLUG), \
+                mock.patch.object(release_cutoff.plan_github, "Gh"), \
+                mock.patch.object(fire, "required_checks",
+                                  side_effect=fire.land.TransientLandError("HTTP 502")):
+            with self.assertRaises(release_cutoff.TransientReleaseError):
+                release_cutoff.ci_reading(self.project, "a" * 40)
+
+    def test_a_forbidden_protection_read_does_not_hold_the_release(self):
+        # §3 : un identifiant sans droits est un non concluant ; la tête est
+        # lue sans requis connus et le rapport le dit.
+        release_cutoff._REQUIRED.clear()
+        self.addCleanup(release_cutoff._REQUIRED.clear)
+        with mock.patch.object(release_cutoff, "github_slug", return_value=SLUG), \
+                mock.patch.object(release_cutoff.plan_github, "Gh"), \
+                mock.patch.object(fire, "required_checks",
+                                  side_effect=fire.land.ForbiddenLandError("HTTP 403")), \
+                mock.patch.object(release_cutoff.radar, "commit_ci",
+                                  side_effect=lambda target, sha, **kw: {"required": kw}):
+            reading = release_cutoff.ci_reading(self.project, "a" * 40)
+        self.assertEqual(reading["required"], {"required": ()})
+        self.assertTrue(reading["required_unread"])
+        plan = types.SimpleNamespace(ci=reading, head="a" * 40, project=self.project)
+        [line] = release_cutoff._unconcluded_deviation(plan, [])
+        self.assertIn("illisibles", line)
+
     def test_nothing_to_rerun_on_a_concluded_head(self):
-        plan = types.SimpleNamespace(ci={"green": True}, head="a" * 40)
+        plan = types.SimpleNamespace(ci={"green": True}, head="a" * 40, project=self.project)
         with mock.patch.object(release_cutoff.radar, "rerun_unconcluded") as rerun:
             self.assertEqual(release_cutoff.rerun_head(self.project, plan), [])
         rerun.assert_not_called()

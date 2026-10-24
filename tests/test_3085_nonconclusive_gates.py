@@ -74,12 +74,10 @@ class ClassificationTest(unittest.TestCase):
         self.assertEqual(radar.ci_result(rows)["state"], "red")
 
     def test_commit_ci_exposes_negative_acceptable_and_inconclusive(self):
-        # #3186 : un run annulé n'a jamais conclu (preuve absente, voir
-        # test_3186) ; le non concluant témoin est un run en attente d'action.
         project = radar.Project("n", "/r", github="o/nexlink", ci_required=True)
         sha = "a" * 40
         out = radar.commit_ci(project, sha, gh=l160g._Gh([
-            l160g._run("ci", conclusion="action_required")]))
+            l160g._run("ci", conclusion="cancelled")]))
         self.assertFalse(out["green"])
         self.assertTrue(out["acceptable"])
         self.assertEqual(out["negative"], [])
