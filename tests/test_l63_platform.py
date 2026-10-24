@@ -24,6 +24,9 @@ from ameesh import platform
 
 from .support import PgTestCase
 
+#: #3195 R3 : l'`ERR` de gpg-agent à `GETINFO getenv` d'un nom absent
+INTROUVABLE = (4 << 24) | 27
+
 SRC = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                    "src", "ameesh")
 
@@ -298,7 +301,9 @@ class PlatformTest(unittest.TestCase):
             fh.write("Name:\t%s\nState:\t%s (x)\nPPid:\t%d\nUid:\t%s\n"
                      % (comm, state, ppid, uids))
         with open(os.path.join(autre, "cmdline"), "w") as fh:
-            fh.write(comm + "\0")
+            # #3195 R3 : un gpg-agent tourne avec la commande de l'unité du paquet
+            fh.write("/usr/bin/gpg-agent\0--supervised\0" if comm == "gpg-agent"
+                     else comm + "\0")
         with open(os.path.join(autre, "cgroup"), "w") as fh:
             fh.write(cgroup)
         if status_illisible:
@@ -391,8 +396,11 @@ class PlatformTest(unittest.TestCase):
         user = "/user.slice/user-%d.slice/user@%d.service" % (moi, moi)
         unite = "0::%s/app.slice/gpg-agent.service\n" % user
         cas = (("unité du gestionnaire", "gpg-agent", 7, unite, {7}, False),
-               ("unité ssh-agent, hiérarchie systemd v1", "ssh-agent", 7,
-                "1:name=systemd:%s/ssh-agent.service\n0::/\n" % user, {7}, False),
+               ("hiérarchie systemd v1", "gpg-agent", 7,
+                "1:name=systemd:%s/app.slice/gpg-agent.service\n0::/\n" % user, {7}, False),
+               # R3 : un ssh-agent ne peut être interrogé sur ses chemins
+               ("unité ssh-agent", "ssh-agent", 7,
+                "0::%s/app.slice/ssh-agent.service\n" % user, {7}, True),
                ("gestionnaire inconnu", "gpg-agent", 7, unite, set(), True),
                ("parent autre que le gestionnaire", "gpg-agent", 99, unite, {7}, True),
                ("lancé par un test, recueilli par le gestionnaire", "gpg-agent", 7,
@@ -420,21 +428,32 @@ class PlatformTest(unittest.TestCase):
 
     def _unite(self, environnement=None, **champs):
         """#3195 R2 : la lecture que le gestionnaire fait de l'unité du pid
-        4242 — le fichier du paquet, le home pour dossier — et son
-        environnement ; `champs` remplace un champ."""
+        4242 — le fichier du paquet, le home pour dossier ; `champs` remplace
+        un champ. R3 : les réponses de l'agent vivant sur son socket — son
+        pid, puis son `environnement` (un HOME à lui par défaut)."""
         import contextlib
+        import tempfile
 
         def show(unite):
             ligne = {"Id": unite, "MainPID": "4242",
                      "FragmentPath": "/usr/lib/systemd/user/" + unite, "DropInPaths": "",
                      "WorkingDirectory": "!" + os.path.expanduser("~"),
-                     "RootDirectory": "", "Environment": ""}
+                     "RootDirectory": ""}
             ligne.update(champs)
             return ligne
+        env = {"GNUPGHOME": None, "HOME": tempfile.mkdtemp()}
+        self.addCleanup(shutil.rmtree, env["HOME"], True)
+        env.update(environnement or {})
+
+        def reponses(uid, commandes):
+            return ["4242"] + [INTROUVABLE if env.get(c.split()[-1]) is None
+                               else env[c.split()[-1]] for c in commandes[1:]]
         pile = contextlib.ExitStack()
         pile.enter_context(mock.patch.object(platform.process, "_unit_show", side_effect=show))
-        pile.enter_context(mock.patch.object(platform.process, "_manager_environment",
-                                             return_value=dict(environnement or {})))
+        pile.enter_context(mock.patch.object(platform.process, "_gpg_agent_query",
+                                             side_effect=reponses))
+        pile.enter_context(mock.patch.object(platform.process, "start_time",
+                                             return_value=time.time()))
         return pile
 
     def test_3195_r2_les_chemins_configures_de_l_unite_comptent(self):
@@ -454,10 +473,11 @@ class PlatformTest(unittest.TestCase):
         dedans = os.path.join(dossier, "node_modules")
         cas = (("le fichier du paquet, le home", {}, {}, False),
                ("WorkingDirectory dans le dossier", {"WorkingDirectory": dedans}, {}, True),
-               ("GNUPGHOME de l'unité dans le dossier",
-                {"Environment": "GNUPGHOME=%s/.gnupg" % dedans}, {}, True),
-               ("GNUPGHOME du gestionnaire dans le dossier", {},
+               # R3 (cx1 B2) : le GNUPGHOME de l'agent vivant, pas celui du
+               # gestionnaire maintenant
+               ("GNUPGHOME de l'agent dans le dossier", {},
                 {"GNUPGHOME": dedans + "/.gnupg"}, True),
+               ("HOME de l'agent dans le dossier", {}, {"HOME": dedans}, True),
                ("un fichier d'unité de l'utilisateur",
                 {"FragmentPath": os.path.expanduser(
                     "~/.config/systemd/user/gpg-agent.service")}, {}, True),
@@ -479,6 +499,119 @@ class PlatformTest(unittest.TestCase):
                             platform.holders(dossier, "x")
                     else:
                         self.assertEqual(platform.holders(dossier, "x"), [])
+
+    def _agent_assuan(self, script):
+        """#3195 R3 : un serveur Assuan d'une connexion sur un vrai socket,
+        à la place de celui de gpg-agent : `script(fichier)` lui répond."""
+        import socket
+        import tempfile
+        import threading
+        dossier = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, dossier, True)
+        chemin = os.path.join(dossier, "S.%d")
+        serveur = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        serveur.bind(chemin % os.getuid())
+        serveur.listen(1)
+        self.addCleanup(serveur.close)
+
+        def servir():
+            conn, _ = serveur.accept()
+            with conn, conn.makefile("rwb") as flux:
+                script(flux)
+        fil = threading.Thread(target=servir, daemon=True)
+        fil.start()
+        self.addCleanup(fil.join, 5)
+        return mock.patch.object(platform.process, "GPG_AGENT_SOCKET", chemin)
+
+    def test_3195_r3_dialogue_assuan_avec_l_agent(self):
+        """#3195 R3 : `_gpg_agent_query` parle Assuan à l'agent vivant :
+        données décodées (`%XX`), lignes d'état et commentaires ignorés,
+        `ERR` rendu par son code ; une coupure, une demande (`INQUIRE`), un
+        accueil refusé ou un socket absent rendent None (le doute)."""
+        process = platform.process
+        commandes = ("GETINFO pid", "GETINFO getenv GNUPGHOME", "GETINFO getenv HOME")
+
+        def normal(flux):
+            flux.write(b"OK Pleased to meet you\n")
+            flux.flush()
+            for reponse in (b"D 4242\nOK\n",
+                            b"S PROGRESS x\nERR 67108891 Not found <GPG Agent>\n",
+                            b"# un commentaire\nD /home/a%25b\nD /c\nOK\n"):
+                flux.readline()
+                flux.write(reponse)
+                flux.flush()
+        with self._agent_assuan(normal):
+            self.assertEqual(process._gpg_agent_query(os.getuid(), commandes),
+                             ["4242", INTROUVABLE, "/home/a%b/c"])
+
+        def coupe(flux):
+            flux.write(b"OK\n")
+            flux.flush()
+            flux.readline()
+            flux.write(b"D 4242\n")
+            flux.flush()
+
+        def demande(flux):
+            flux.write(b"OK\n")
+            flux.flush()
+            flux.readline()
+            flux.write(b"INQUIRE PINENTRY\n")
+            flux.flush()
+
+        def refus(flux):
+            flux.write(b"ERR 1 refus\n")
+            flux.flush()
+        for nom, script in (("coupure", coupe), ("INQUIRE", demande), ("accueil", refus)):
+            with self.subTest(nom), self._agent_assuan(script):
+                self.assertIsNone(process._gpg_agent_query(os.getuid(), commandes, timeout=5))
+        with mock.patch.object(process, "GPG_AGENT_SOCKET", "/nonexistent/S.%d"):
+            self.assertIsNone(process._gpg_agent_query(os.getuid(), commandes))
+
+    def test_3195_r3_le_home_gnupg_de_l_agent_vivant(self):
+        """#3195 R3 (cx1 B2) : le home GnuPG est celui que l'agent vivant
+        donne (`GNUPGHOME`, sinon `HOME`/.gnupg) ; sa configuration doit être
+        antérieure à son démarrage et sans `log-file` (un fichier qu'il tient
+        ouvert hors de son home) ; sinon le doute reste."""
+        import tempfile
+        process = platform.process
+        moi = os.getuid()
+        racine = self._faux_proc("gpg-agent", "%d %d %d %d" % ((moi,) * 4))
+        home = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, home, True)
+        gnupg = os.path.join(home, ".gnupg")
+        os.makedirs(gnupg)
+
+        def agent(gnupghome=INTROUVABLE, maison=home):
+            return lambda uid, commandes: ["4242", gnupghome, maison]
+
+        def lire(requete, depart=None):
+            with mock.patch.object(process, "PROC", racine), \
+                    mock.patch.object(process, "start_time",
+                                      return_value=time.time() + 60 if depart is None
+                                      else depart):
+                return process._gpg_agent_home(4242, moi, requete)
+        self.assertEqual(lire(agent()), gnupg)
+        self.assertEqual(lire(agent("/srv/cles")), "/srv/cles")
+        with mock.patch.object(process, "_home_of", return_value="/home/passwd"):
+            self.assertEqual(lire(agent(maison=INTROUVABLE)), "/home/passwd/.gnupg")
+        conf = os.path.join(gnupg, "gpg-agent.conf")
+        with open(conf, "w") as fh:
+            fh.write("# log-file /tmp/commente\ndefault-cache-ttl 600\n")
+        self.assertEqual(lire(agent()), gnupg)
+        with open(os.path.join(gnupg, "common.conf"), "w") as fh:
+            fh.write("log-file /srv/wt/node_modules/agent.log\n")
+        self.assertIsNone(lire(agent()))
+        os.remove(os.path.join(gnupg, "common.conf"))
+        # une configuration modifiée après son démarrage : ce qu'il a lu est inconnu
+        self.assertIsNone(lire(agent(), depart=os.stat(conf).st_mtime - 1))
+        with mock.patch.object(process, "start_time", side_effect=platform.NotAvailable(
+                "process start time", "x")), \
+                mock.patch.object(process, "PROC", racine):
+            self.assertIsNone(process._gpg_agent_home(4242, moi, agent()))
+        if os.geteuid() != 0:
+            os.chmod(conf, 0)
+            self.addCleanup(os.chmod, conf, 0o600)
+            self.assertIsNone(lire(agent()))
 
     def test_allow_ne_cache_pas_un_detenteur_constate(self):
         """L230 : `allow` ne lève que le DOUTE ; un processus lisible qui tient

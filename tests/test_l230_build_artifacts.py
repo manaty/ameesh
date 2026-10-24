@@ -20,6 +20,10 @@ from ameesh import housekeeping_discovery as hd
 from ameesh import menage, platform
 from ameesh.platform import process
 
+#: #3195 R3: gpg-agent's `ERR` to `GETINFO getenv` of an unset name
+#: (GPG_ERR_SOURCE_GPGAGENT << 24 | GPG_ERR_NOT_FOUND)
+NOT_FOUND = (4 << 24) | 27
+
 DAY = 24 * 3600.0
 #: a ctime cannot be set back: the tests move "now" forward instead
 LATER = 2 * DAY
@@ -72,7 +76,10 @@ class _Base(unittest.TestCase):
                    text="Name:\t%s\nState:\t%s (x)\nPPid:\t%d\nUid:\t%d\t%d\t%d\t%d\n"
                         % (comm, state, ppid, uid, uid, uid, uid))
             _write(os.path.join(d, "cgroup"), text=cgroup)
-        _write(os.path.join(d, "cmdline"), text="%s\0--flag\0" % (argv0 or "/usr/bin/" + comm))
+        # #3195 R3: a `gpg-agent` runs as the vendor unit's command line
+        flag = "--supervised" if comm == "gpg-agent" and argv0 is None else "--flag"
+        _write(os.path.join(d, "cmdline"),
+               text="%s\0%s\0" % (argv0 or "/usr/bin/" + comm, flag))
         # état du processus (`Z` = zombie, #1678) : /proc/<pid>/stat, champ 3
         _write(os.path.join(d, "stat"),
                text="%d (%s) %s 1 %d 1 0 -1 0 0 0 0 0 0 0 0 0 0 0 0 100\n"
@@ -92,10 +99,12 @@ class _Base(unittest.TestCase):
             os.chmod(os.path.join(d, "fd"), 0)
             self.addCleanup(os.chmod, os.path.join(d, "fd"), 0o700)
 
-    def units(self, pids, environment=None, **props):
+    def units(self, pids, environment=None, *, query=None, **props):
         """#3195 R2: the user's service manager's reading of the key agent
         units — the package's file, `pids` (`{unit: MainPID}`), the home as
-        working directory — and its environment; `props` overrides a field."""
+        working directory; `props` overrides a field. R3: the live agent's
+        answers on its socket — its pid, then its `environment` (a HOME of
+        its own by default, a None value unset); `query` replaces them."""
         home = os.path.expanduser("~")
 
         def show(unit):
@@ -103,13 +112,24 @@ class _Base(unittest.TestCase):
                 return {}
             row = {"Id": unit, "MainPID": str(pids[unit]),
                    "FragmentPath": "/usr/lib/systemd/user/" + unit, "DropInPaths": "",
-                   "WorkingDirectory": "!" + home, "RootDirectory": "", "Environment": ""}
+                   "WorkingDirectory": "!" + home, "RootDirectory": ""}
             row.update(props)
             return row
+        env = {"GNUPGHOME": None, "HOME": os.path.join(self.base, "agent-home")}
+        env.update(environment or {})
+
+        def answers(uid, commands):
+            out = [str(pids.get("gpg-agent.service"))]
+            for command in commands[1:]:
+                value = env.get(command.split()[-1])
+                out.append(NOT_FOUND if value is None else value)
+            return out
         stack = contextlib.ExitStack()
         stack.enter_context(mock.patch.object(process, "_unit_show", side_effect=show))
-        stack.enter_context(mock.patch.object(process, "_manager_environment",
-                                              return_value=dict(environment or {})))
+        stack.enter_context(mock.patch.object(process, "_gpg_agent_query",
+                                              side_effect=query or answers))
+        stack.enter_context(mock.patch.object(process, "start_time",
+                                              return_value=time.time()))
         stack.enter_context(mock.patch.object(process, "service_managers",
                                               return_value=frozenset({7})))
         return stack
@@ -230,7 +250,8 @@ class UserPathsTest(_Base):
         managers = mock.patch.object(process, "service_managers", return_value=frozenset({7}))
         with self.units({"gpg-agent.service": 40, "ssh-agent.service": 41}):
             scan = platform.user_paths()
-        self.assertEqual((scan.doubt(), scan.allowed), ("", []))
+        # R3: an `ssh-agent` cannot be asked for its paths: it stays a doubt
+        self.assertEqual((scan.unreadable, scan.allowed), (["41 ssh-agent"], []))
         with mock.patch.object(process, "service_managers", return_value=frozenset()):
             self.assertIn("40 gpg-agent", platform.user_paths().doubt())
         inside = os.path.join(self.base, "wt", "node_modules")
@@ -265,13 +286,44 @@ class UserPathsTest(_Base):
                  ("a RootDirectory", {"RootDirectory": "/srv/jail"}),
                  ("another MainPID", {"MainPID": "999"}),
                  ("another unit answers", {"Id": "other.service"}),
-                 ("a relative working directory", {"WorkingDirectory": "node_modules"}),
-                 ("a relative GnuPG home", {"Environment": "GNUPGHOME=.gnupg"}))
+                 ("a relative working directory", {"WorkingDirectory": "node_modules"}))
         for pid, (name, props) in enumerate(cases, start=60):
             with self.subTest(name):
                 self.fake_process(pid, comm="gpg-agent", unreadable=True, ppid=7,
                                   cgroup="0::%s/app.slice/gpg-agent.service\n" % user)
                 with self.units({"gpg-agent.service": pid}, **props):
+                    self.assertIn("%d gpg-agent" % pid, platform.user_paths().unreadable)
+        # R3 (cx1 B1, B2): its GnuPG home is read from the live agent; any
+        # reading that fails or does not prove it keeps the doubt
+        asked = (("the agent cannot be asked (B1)", {},
+                  lambda pid: lambda uid, commands: None),
+                 ("the asking raises", {},
+                  lambda pid: mock.Mock(side_effect=OSError("refused"))),
+                 ("another agent answers on the socket", {},
+                  lambda pid: lambda uid, commands: ["999", NOT_FOUND, "/home/x"]),
+                 ("another error than not found", {},
+                  lambda pid: lambda uid, commands: [str(pid), (4 << 24) | 1, "/home/x"]),
+                 ("a short answer", {}, lambda pid: lambda uid, commands: [str(pid)]),
+                 ("a relative GnuPG home", {"GNUPGHOME": ".gnupg"}, None),
+                 ("no home at all", {"HOME": None}, None))
+        for pid, (name, environment, query) in enumerate(asked, start=80):
+            with self.subTest(name):
+                self.fake_process(pid, comm="gpg-agent", unreadable=True, ppid=7,
+                                  cgroup="0::%s/app.slice/gpg-agent.service\n" % user)
+                with self.units({"gpg-agent.service": pid}, environment,
+                                query=query and query(pid)), \
+                        mock.patch.object(process, "_home_of", return_value=""):
+                    self.assertIn("%d gpg-agent" % pid, platform.user_paths().unreadable)
+        argvs = (("a --homedir of its own", "/usr/bin/gpg-agent\0--supervised\0--homedir\0/x\0"),
+                 ("a daemon, not supervised", "/usr/bin/gpg-agent\0--daemon\0"),
+                 ("a relative command", "gpg-agent\0--supervised\0"),
+                 ("another program", "/usr/bin/gpg-agentx\0--supervised\0"))
+        for pid, (name, cmdline) in enumerate(argvs, start=90):
+            with self.subTest(name):
+                self.fake_process(pid, comm="gpg-agent", unreadable=True, ppid=7,
+                                  cgroup="0::%s/app.slice/gpg-agent.service\n" % user)
+                _write(os.path.join(self.proc, str(pid), "cmdline"), text=cmdline)
+                with self.units({"gpg-agent.service": pid}):
                     self.assertIn("%d gpg-agent" % pid, platform.user_paths().unreadable)
         self.fake_process(70, comm="gpg-agent", unreadable=True, ppid=7,
                           cgroup="0::%s/app.slice/gpg-agent.service\n" % user)
@@ -434,18 +486,22 @@ class RunTest(_Base):
         os.remove(os.path.join(self.proc, "23", "cwd"))
         os.makedirs(os.path.join(self.proc, "23", "cwd"))
         inside = os.path.join(wt, "node_modules")
+        # R3 (cx1 B2 witness): the manager's environment now says nothing of
+        # the agent's; only the live agent's own GNUPGHOME or HOME counts
         held = (("a WorkingDirectory in the worktree", {"WorkingDirectory": inside}, {}),
-                ("a GnuPG home in the worktree, from the unit",
-                 {"Environment": "GNUPGHOME=%s/.gnupg" % inside}, {}),
-                ("a GnuPG home in the worktree, from the manager", {},
-                 {"GNUPGHOME": inside + "/.gnupg"}),
-                ("its socket in the worktree, from the manager", {},
-                 {"SSH_AUTH_SOCK": inside + "/S.agent"}))
+                ("its GNUPGHOME in the worktree", {}, {"GNUPGHOME": inside + "/.gnupg"}),
+                ("its HOME in the worktree", {}, {"HOME": inside}))
         for name, props, environment in held:
             with self.subTest(name), self.units(pids, environment, **props):
                 out = self.go(wt)
                 self.assertEqual(out["entries"], [])
                 self.assertIn("process inside (23 gpg-agent)", " ".join(out["skipped"]))
+        # B1 witness: the agent cannot be asked: a doubt, nothing deleted
+        with self.units(pids, query=lambda uid, commands: None):
+            out = self.go(wt)
+        self.assertEqual(out["entries"], [])
+        self.assertIn("process(es) of the user unreadable: 23 gpg-agent",
+                      " ".join(out["skipped"]))
         with self.units(pids):
             self.assertEqual(len(self.go(wt)["entries"]), 3)
 

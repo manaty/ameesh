@@ -1191,7 +1191,9 @@ SERVICE_MANAGER = frozenset({"systemd", "(sd-pam)"})
 #: output for ten days. Told by cgroup and parent, never by name (B1 cx2): a
 #: `gpg-agent` a test starts inside a worktree keeps the cgroup of its
 #: launcher, even once the manager has reaped it as an orphan: a doubt.
-KEY_AGENT_UNITS = frozenset({"gpg-agent.service", "ssh-agent.service"})
+#: R3: `gpg-agent` only — its paths are read from the live process itself
+#: (`_gpg_agent_query`); an `ssh-agent` cannot be asked: it stays a doubt.
+KEY_AGENT_UNITS = frozenset({"gpg-agent.service"})
 #: #3195 R2 (cx1, cx2): the unit's identity does not prove its paths — any
 #: unit can set `WorkingDirectory=` (systemd.exec). A key agent is let
 #: through only when the manager reads its unit from these root-owned vendor
@@ -1199,11 +1201,19 @@ KEY_AGENT_UNITS = frozenset({"gpg-agent.service", "ssh-agent.service"})
 #: which the user cannot have pointed at a worktree.
 VENDOR_UNIT_DIRS = ("/usr/lib/systemd/user/", "/lib/systemd/user/",
                     "/usr/share/systemd/user/")
-#: #3195 R2: the environment variables that place a key agent's files (its
-#: GnuPG home, its socket): what the manager passes is part of its paths
-KEY_AGENT_HOMES = ("GNUPGHOME", "SSH_AUTH_SOCK")
 UNIT_PROPERTIES = ("Id", "MainPID", "FragmentPath", "DropInPaths",
-                   "WorkingDirectory", "RootDirectory", "Environment")
+                   "WorkingDirectory", "RootDirectory")
+#: #3195 R3 (cx1 B2): the GnuPG home is the one of the live agent, asked on
+#: the socket the manager passes it (`%t/gnupg/S.gpg-agent` of the vendor
+#: socket unit): the manager's environment now is not the one the agent
+#: inherited (`systemctl --user unset-environment` after its start).
+GPG_AGENT_SOCKET = "/run/user/%d/gnupg/S.gpg-agent"
+#: GPG_ERR_NOT_FOUND, the answer of `GETINFO getenv` to an unset variable;
+#: any other error is a doubt
+GPG_ERR_NOT_FOUND = 27
+#: the agent's configuration files in its home (GnuPG 2.4): a `log-file`
+#: there is a file it holds open, out of its home
+GPG_AGENT_CONFS = ("gpg-agent.conf", "common.conf")
 
 
 def _unit_show(unit: str) -> dict:
@@ -1221,18 +1231,48 @@ def _unit_show(unit: str) -> dict:
     return dict(line.split("=", 1) for line in done.stdout.splitlines() if "=" in line)
 
 
-def _manager_environment() -> dict:
-    """#3195 R2: the environment the user's service manager passes to its
-    units (`systemctl --user show-environment`), `{}` when unreadable."""
-    import subprocess
+def _assuan_data(raw: bytes) -> bytes:
+    """An Assuan data line (`D …`), its `%XX` escapes decoded."""
+    import re
+    return re.sub(rb"%([0-9A-Fa-f]{2})", lambda m: bytes((int(m.group(1), 16),)), raw)
+
+
+def _gpg_agent_query(uid: int, commands, timeout: float = 5.0) -> list | None:
+    """#3195 R3: the answers of the user's `gpg-agent` (`GPG_AGENT_SOCKET`)
+    to the Assuan `commands`, one per command: its data (`str`) after `OK`,
+    or the error code (`int`) of an `ERR`. None when the socket cannot be
+    reached or the dialogue goes astray (an inquiry, a cut): a doubt."""
+    import socket
     try:
-        done = subprocess.run(["systemctl", "--user", "show-environment"],
-                              capture_output=True, text=True, timeout=5)
-    except (OSError, subprocess.SubprocessError):
-        return {}
-    if done.returncode != 0:
-        return {}
-    return dict(line.split("=", 1) for line in done.stdout.splitlines() if "=" in line)
+        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as conn:
+            conn.settimeout(timeout)
+            conn.connect(GPG_AGENT_SOCKET % uid)
+            stream = conn.makefile("rwb")
+            if not stream.readline().startswith(b"OK"):
+                return None
+            out = []
+            for command in commands:
+                stream.write(command.encode("utf-8") + b"\n")
+                stream.flush()
+                data = []
+                while True:
+                    line = stream.readline()
+                    if not line.endswith(b"\n"):
+                        return None
+                    line = line[:-1]
+                    if line.startswith(b"D "):
+                        data.append(_assuan_data(line[2:]))
+                    elif line == b"OK" or line.startswith(b"OK "):
+                        out.append(b"".join(data).decode("utf-8", "surrogateescape"))
+                        break
+                    elif line.startswith(b"ERR "):
+                        out.append(int(line.split()[1]))
+                        break
+                    elif not (line.startswith(b"S ") or line.startswith(b"#")):
+                        return None
+            return out
+    except (OSError, ValueError, IndexError):
+        return None
 
 
 def _home_of(uid: int) -> str:
@@ -1243,24 +1283,82 @@ def _home_of(uid: int) -> str:
         return ""
 
 
+def _gpg_agent_home(pid, uid: int, query=None) -> str | None:
+    """#3195 R3 (cx1 B2): the GnuPG home of the live `gpg-agent` `pid`, read
+    from the process itself: its command line is the vendor unit's
+    (`<dir>/gpg-agent --supervised`: no `--homedir`, no `gpgconf.ctl` beside
+    it), the agent on the user's socket answers `GETINFO pid` with `pid`,
+    then `GETINFO getenv` gives its own `GNUPGHOME`, else its `HOME`
+    (`~/.gnupg`, GnuPG's default). Its configuration files there
+    (`GPG_AGENT_CONFS`) are older than its start and name no `log-file`.
+    Anything unreadable, unexpected or not proven: None (the doubt stays)."""
+    argv = _read_text(os.path.join(PROC, str(pid), "cmdline")).split("\0")
+    argv = argv[:-1] if argv and argv[-1] == "" else argv
+    if (len(argv) != 2 or argv[1] != "--supervised" or not os.path.isabs(argv[0])
+            or os.path.basename(argv[0]) != "gpg-agent"
+            or os.path.lexists(os.path.join(os.path.dirname(argv[0]), "gpgconf.ctl"))):
+        return None
+    try:
+        answers = (query or _gpg_agent_query)(
+            uid, ("GETINFO pid", "GETINFO getenv GNUPGHOME", "GETINFO getenv HOME"))
+    except Exception:  # noqa: BLE001 - the agent could not be asked: a doubt
+        return None
+    if not isinstance(answers, list) or len(answers) != 3 or answers[0] != str(pid):
+        return None
+    values = []
+    for answer in answers[1:]:
+        if isinstance(answer, int) and answer & 0xFFFF == GPG_ERR_NOT_FOUND:
+            values.append("")
+        elif isinstance(answer, str):
+            values.append(answer)
+        else:
+            return None
+    gnupghome, home = values
+    if not gnupghome:
+        home = home or _home_of(uid)
+        gnupghome = os.path.join(home, ".gnupg") if home else ""
+    if not os.path.isabs(gnupghome):
+        return None
+    try:
+        started = start_time(pid)
+    except NotAvailable:
+        return None
+    if started is None:
+        return None
+    for name in GPG_AGENT_CONFS:
+        conf = os.path.join(gnupghome, name)
+        try:
+            if os.stat(conf).st_mtime >= started:
+                return None   # changed since its start: what it read is unknown
+            with open(conf, encoding="utf-8", errors="replace") as fh:
+                if any(line.split()[:1] == ["log-file"] for line in fh):
+                    return None
+        except FileNotFoundError:
+            continue
+        except OSError:
+            return None
+    return gnupghome
+
+
 def key_agent_paths(pid, uid: int, managers, status: dict | None = None, *,
-                    show=None, environment=None) -> list[str] | None:
+                    show=None, query=None) -> list[str] | None:
     """#3195: the paths a key agent run by the user's service manager as its
-    unit (`KEY_AGENT_UNITS`) may hold, by its configuration; None when that
-    is not proven (the doubt stays).
+    unit (`KEY_AGENT_UNITS`) may hold; None when that is not proven (the
+    doubt stays).
 
     Its parent is the manager (`managers()`, PIDs from `service_managers`)
     and its cgroup is that unit, under `user@<uid>.service` through slices
     only (a sub-cgroup of a delegated unit is not the unit) — both readable
-    on a process that is not dumpable. R2 (cx1, cx2): and the manager's
-    reading of the unit (`show(unit)`, `_unit_show`) names this process as
-    its `MainPID`, from a vendor file (`VENDOR_UNIT_DIRS`), without a drop-in
-    nor a `RootDirectory=`. The paths are its `WorkingDirectory` as the
-    manager reports it (`~` or empty: the home) and the key homes
-    (`KEY_AGENT_HOMES`) of the unit's environment then of the manager's
-    (`environment()`, `_manager_environment`), the GnuPG home defaulting to
-    `~/.gnupg`: the caller records them as observed paths, so a worktree
-    that contains one stays held. Anything unreadable: None. `status`: its
+    on a process that is not dumpable. R2 (cx1, cx2): the manager's reading
+    of the unit (`show(unit)`, `_unit_show`) names this process as its
+    `MainPID`, from a vendor file (`VENDOR_UNIT_DIRS`), without a drop-in nor
+    a `RootDirectory=`. The paths are its `WorkingDirectory` as the manager
+    reports it (`~` or empty: the home) and, R3 (cx1 B2), its GnuPG home
+    read from the live
+    agent (`_gpg_agent_home`, `query`: `_gpg_agent_query`), never from the
+    manager's environment now. The caller records them as observed paths, so
+    a worktree that contains one stays held. Anything unreadable (B1: a
+    failed reading is never an empty one): None. `status`: its
     `_proc_status`, when already read."""
     try:
         status = _proc_status(pid) if status is None else status
@@ -1300,28 +1398,10 @@ def key_agent_paths(pid, uid: int, managers, status: dict | None = None, *,
     workdir = home if workdir == "~" else workdir
     if not workdir or not os.path.isabs(workdir):
         return None
-    try:
-        passed = dict((environment or _manager_environment)() or {})
-    except Exception:  # noqa: BLE001 - its environment is unknown: a doubt
+    gnupghome = _gpg_agent_home(pid, uid, query)
+    if gnupghome is None:
         return None
-    try:
-        import shlex
-        items = shlex.split(props.get("Environment") or "")
-    except ValueError:  # an environment that cannot be read: a doubt
-        return None
-    passed.update(item.split("=", 1) for item in items if "=" in item)
-    paths = [workdir]
-    for name in KEY_AGENT_HOMES:
-        value = passed.get(name) or ""
-        if name == "SSH_AUTH_SOCK" and value:
-            value = os.path.dirname(value)
-        if name == "GNUPGHOME" and not value and home:
-            value = os.path.join(home, ".gnupg")
-        if value and not os.path.isabs(value):
-            return None
-        if value:
-            paths.append(value)
-    return paths
+    return [workdir, gnupghome]
 
 
 class UserPaths:
