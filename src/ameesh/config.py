@@ -629,24 +629,28 @@ _MISSING = object()
 RECURSIVE_CONFIG_KEYS = ("train", "release")
 
 
-def _merge_config(base: dict, overlay: dict) -> dict:
+def _merge_config(base: dict, overlay: dict, *, recursive: bool = False) -> dict:
     """Superpose `overlay` (un profil) sur `base` (config.json), clé par clé.
 
     #3345 : un profil ne porte que ce qu'il surcharge. Une clé absente de
     l'overlay est héritée de la base ; une clé déclarée la remplace en entier,
     **sauf `train` et `release`** (`RECURSIVE_CONFIG_KEYS`) dont les objets se
-    fusionnent feuille à feuille : `{"train": {"mode": "shadow"}}` garde le
-    `host` et les `projects` de `config.json`, tandis qu'un `radar`,
-    `packet_watch`, `github`, `notify` ou `accounts` déclaré remplace la
-    valeur de la base (un `notify: {}` vide bien les routes héritées). La
-    récursion générale de la première version de #3345 faisait hériter en
-    silence les sous-clés d'objets que le profil voulait restreindre."""
+    fusionnent feuille à feuille, à toute profondeur : `{"train": {"mode":
+    "shadow"}}` garde le `host` et les `projects` de `config.json`, et un
+    `train.projects.ameesh` partiel garde son `repo`/`target` et les autres
+    projets. La liste d'autorisation ne vaut qu'au **premier niveau** : une
+    fois dans `train` ou `release`, `recursive` est vrai et tous leurs objets
+    se fusionnent. Tout autre objet déclaré (`radar`, `packet_watch`, `github`,
+    `notify`, `accounts`…) remplace la valeur de la base en entier (un
+    `notify: {}` vide bien les routes héritées). La récursion générale de la
+    première version de #3345 faisait hériter en silence les sous-clés
+    d'objets que le profil voulait restreindre."""
     merged = dict(base)
     for key, value in overlay.items():
         old = merged.get(key, _MISSING)
-        if (key in RECURSIVE_CONFIG_KEYS
-                and isinstance(old, dict) and isinstance(value, dict)):
-            merged[key] = _merge_config(old, value)
+        if (isinstance(old, dict) and isinstance(value, dict)
+                and (recursive or key in RECURSIVE_CONFIG_KEYS)):
+            merged[key] = _merge_config(old, value, recursive=True)
         else:
             merged[key] = value
     return merged
@@ -817,11 +821,13 @@ def load(env: dict | None = None) -> Config:
         raw = _read_json_object(cfg_path)
         # #1466 : un profil (fichier rangé sous le dossier de la configuration
         # de l'hôte) hérite de `config.json` ; ses propres clés l'emportent.
-        # #3345 : la superposition ne descend que dans `train` et `release`
-        # (RECURSIVE_CONFIG_KEYS) ; toute autre clé déclarée remplace la
-        # valeur de la base en entier. Les clés de premier niveau dont la
-        # valeur effective diffère de la base sont retenues : c'est l'écart
-        # qu'un profil périmé creuse, et il doit rester lisible.
+        # #3345 : la récursion ne s'ouvre qu'au premier niveau, et seulement
+        # pour `train` et `release` (RECURSIVE_CONFIG_KEYS) ; dans ces deux
+        # blocs, tous les objets se fusionnent à toute profondeur. Toute autre
+        # clé déclarée remplace la valeur de la base en entier. Les clés de
+        # premier niveau dont la valeur effective diffère de la base sont
+        # retenues : c'est l'écart qu'un profil périmé creuse, et il doit
+        # rester lisible.
         base_path = _inherit_base(cfg_path, raw)
         if base_path:
             base_raw = _read_json_object(base_path)
@@ -1116,7 +1122,7 @@ def fresh_radar(cfg: Config) -> Config:
     Un profil (#1466) hérite de sa base comme dans `load` : un `radar` déclaré
     seulement dans le `config.json` de l'hôte vaut pour le profil, et un
     `radar` déclaré dans le profil le remplace en entier (la récursion de
-    #3345 ne vaut que pour `train` et `release`)."""
+    #3345 ne s'ouvre que sur `train` et `release`)."""
     if not cfg.config_file:
         return cfg
     # `_read_json_object` et `_inherit_base` refusent par SystemExit, qui

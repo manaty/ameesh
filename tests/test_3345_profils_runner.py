@@ -68,7 +68,10 @@ BASE = {
     },
     "release": {
         "host": "pc-smichea",
-        "projects": {"ameesh": {"repo": "manaty/ameesh", "target": "main"}},
+        "projects": {
+            "ameesh": {"repo": "manaty/ameesh", "target": "main"},
+            "nexlink": {"repo": "manaty/nexlink", "target": "main"},
+        },
     },
     "notify": {"types": ["decision_pending", "credential_failing"]},
     "harness_bins": {"claude": "/usr/bin/claude"},
@@ -144,6 +147,34 @@ class ProfilTest(Banc):
         cfg = self.load(self.critiques)
         self.assertEqual(cfg.release["host"], "autre-hote")
         self.assertEqual(cfg.release["projects"], BASE["release"]["projects"])
+
+    def test_train_projects_se_superpose_jusqu_aux_projets(self):
+        """B2 de cx1 : la liste d'autorisation ne vaut qu'au premier niveau.
+        Un `train.projects.ameesh` partiel garde ses autres champs et les
+        autres projets ; `projects` n'est pas une clé autorisée."""
+        self._write(self.critiques, {
+            "train": {"projects": {"ameesh": {"target": "develop"}}},
+        })
+        cfg = self.load(self.critiques)
+        ameesh = cfg.train["projects"]["ameesh"]
+        self.assertEqual(ameesh["target"], "develop")
+        self.assertEqual(ameesh["repo"], BASE["train"]["projects"]["ameesh"]["repo"])
+        self.assertEqual(ameesh["github"], "manaty/ameesh")
+        self.assertEqual(cfg.train["projects"]["nexlink"],
+                         BASE["train"]["projects"]["nexlink"])
+        self.assertEqual(cfg.train["host"], "pc-smichea")
+
+    def test_release_projects_se_superpose_jusqu_aux_projets(self):
+        """Même profondeur pour `release` : un projet partiel garde son dépôt
+        et la cible déclarée ; la liste d'autorisation ne se réapplique pas."""
+        self._write(self.critiques, {
+            "release": {"projects": {"ameesh": {"target": "hotfix"}}},
+        })
+        cfg = self.load(self.critiques)
+        self.assertEqual(cfg.release["projects"]["ameesh"],
+                         {"repo": "manaty/ameesh", "target": "hotfix"})
+        self.assertEqual(cfg.release["projects"]["nexlink"],
+                         BASE["release"]["projects"]["nexlink"])
 
     def test_une_liste_declaree_remplace_la_base_au_lieu_de_s_y_ajouter(self):
         self._write(self.critiques, {"notify": {"types": ["account_shared"]}})
