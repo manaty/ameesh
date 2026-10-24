@@ -197,6 +197,43 @@ class PublicationTest(unittest.TestCase):
         self.assertEqual([a[0] for a in gh.appels], ["create", "update"])
         self.assertEqual(gh.appels[-1][3], "cancelled")  # pas de ligne `fin`
 
+    def test_deux_ecrivains_de_l_etat_ne_se_volent_pas_le_temporaire(self):
+        """#3336 : `publish` (arrière-plan) et `close` (`if: always()`) écrivent
+        l'état de la même part. Avec un temporaire à nom fixe, le renommage de
+        l'un consommait le fichier de l'autre : `close` échouait en
+        FileNotFoundError (main, run 40084134277) et rougissait la part alors
+        que ses 920 tests étaient verts. Chaque écrivain garde son propre
+        temporaire jusqu'à son propre renommage."""
+        a = ciflux.Publication(str(self.flux), "tests (flux) p 1/1", FauxGitHub())
+        b = ciflux.Publication(str(self.flux), "tests (flux) p 1/1", FauxGitHub())
+        vrai_replace = ciflux.os.replace
+        passe = []
+
+        def replace_avec_l_autre(src, dst):
+            if not passe:
+                passe.append(1)
+                # l'autre écrivain écrit puis renomme *entre* notre écriture et
+                # notre renommage : c'est l'entrelacement qui a rougi la CI.
+                b._keep()
+            return vrai_replace(src, dst)
+
+        with mock.patch.object(ciflux.os, "replace", side_effect=replace_avec_l_autre):
+            a._keep()
+        self.assertEqual(json.loads((self.dossier / "flux.jsonl.check").read_text()),
+                         a.etat)
+
+    def test_etat_non_ecrit_ne_rougit_pas_l_etape(self):
+        """#3336 : la publication d'un check run n'échoue jamais la part, même
+        contrat que le refus de GitHub : un état non écrit est consigné."""
+        self.ecrire(ev_test("tests.test_a.T.test_ko"))
+        gh = FauxGitHub()
+        err = io.StringIO()
+        with mock.patch.object(ciflux.Publication, "_keep",
+                               side_effect=OSError("disque plein")):
+            with contextlib.redirect_stderr(err):
+                self.assertEqual(ciflux.close(self.args(), gh=gh), 0)
+        self.assertIn("non écrit", err.getvalue())
+
     def test_refus_jamais_bloquant(self):
         gh = FauxGitHub(refus=True)
         err = io.StringIO()
