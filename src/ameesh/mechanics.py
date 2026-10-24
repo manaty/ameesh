@@ -26,7 +26,10 @@ mécanique, ce que l'outillage exécute sans agent :
 - `backlog.lot_min_value` (#2584, bloc optionnel) : la valeur à partir de
   laquelle un défaut non bloquant devient un lot (canon §2 l.129, owner
   19/10/2026) ; en dessous, il rejoint le panier de son chantier. Bloc absent :
-  `None`, et la route du panier reste inactive — aucun seuil n'est supposé.
+  `None`, et la route du panier reste inactive — aucun seuil n'est supposé ;
+- `staging.waiting_lots_min`, `before_cutoff_seconds`, `before_packet_seconds`
+  (#3291, bloc optionnel) : le seuil de lots retenus et les marges d'un
+  déploiement staging hors créneau (canon §11 bis) ; bloc absent : `None`.
 
 Les classes sensibles et le nombre d'avis par chemin ne sont pas répétés : ils
 viennent de `federation.yaml` (`review_policies.risk_classes` et
@@ -87,6 +90,9 @@ _REVIEWS_KEYS = ("families", "exclude_author_family", "distinct_families",
                  "light_reviews")
 _MERGE_KEYS = ("named_fire", "repeat_freeze", "on_green_packet", "post_merge_red")
 _BACKLOG_KEYS = ("lot_min_value",)
+#: #3291 : clés du bloc optionnel `staging` (déploiement hors créneau)
+_STAGING_KEYS = ("waiting_lots_min", "before_cutoff_seconds",
+                 "before_packet_seconds")
 #: bornes du score de valeur d'un élément de backlog (`backlog.add`)
 _VALUE_SCORE = (1, 100)
 
@@ -695,11 +701,9 @@ def _overrides(value, where: str) -> tuple[ProjectOverride, ...]:
 
 
 def _staging(value, where: str) -> Staging:
-    data = _mapping(value, where, ("waiting_lots_min", "before_cutoff_seconds",
-                                  "before_packet_seconds"))
+    data = _mapping(value, where, _STAGING_KEYS)
     return Staging(*(_positive_int(data.get(key), where + "." + key)
-                     for key in ("waiting_lots_min", "before_cutoff_seconds",
-                                 "before_packet_seconds")))
+                     for key in _STAGING_KEYS))
 
 
 def compile_document(text: str, *, source: str = PATH) -> Document:

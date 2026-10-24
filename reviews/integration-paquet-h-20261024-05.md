@@ -65,6 +65,30 @@ de #3294 conservée, ligne `tmp_over_quota` de #3277 ajoutée ; aucun autre
 changement, aucun arbitrage sémantique. `git diff --check` ne signale sur ce
 fichier qu'une fin de fichier inchangée.
 
+## Correction après CI rouge (tête `639b4716dd`, run `40070593907`)
+
+La suite complète a rendu un échec dans la part `psql 2/16` :
+`tests.test_2449_garde_mecanique.SchemaCoverageTest.test_the_guard_keys_are_the_reader_keys`.
+Le bloc optionnel `staging` de #3291 (`7748b4649`) est lu par
+`mechanics._DOCUMENT_KEYS` et compilé (`Staging`), mais la garde mécanique
+`scripts/garde-mecanique.py` ne connaissait pas ses trois clés : le témoin de
+parité, qui interdit qu'un bloc entre au lecteur sans détecteur, a donc rougi
+sur la tête du paquet.
+
+Correctif `48ac257b7` : `mechanics._STAGING_KEYS` devient la source unique du
+bloc (lecteur, `_staging`, témoin) ; la garde couvre
+`staging.waiting_lots_min`, `staging.before_cutoff_seconds` et
+`staging.before_packet_seconds` (clés, liaisons de variable et de mapping,
+entiers positifs) ; le témoin ajoute les trois sources positives et le cas du
+mapping. Aucun paramètre de fond ne change : le canon §11 bis garde ses
+valeurs, mais leur recopie hors du canon est désormais refusée (#2449), comme
+pour les autres blocs.
+
+Ciblés verts sur la tête corrigée : `test_2449_garde_mecanique`,
+`test_3291_staging_pending`, `test_2448_release_cutoff` (76/76) ; puis
+`test_l1616_mechanics`, `test_2698_train_compiled_schema`,
+`test_2584_backlog_panier`, `test_1770_mechanics_prevalidation` (59/59).
+
 ## Écartés (ce véhicule)
 
 | lot | motif |
@@ -96,10 +120,10 @@ fichier qu'une fin de fichier inchangée.
   rouge par course sur l'espace libre (cible calculée à +4 KiB) ; vert seul et
   à la seconde passe complète — non concluant (§3), consigné, non bloquant.
 - **Contrôles statiques** : 6/6 verts (`scripts/freeze-checks.py`).
-- **Diff** : 25 fichiers, +2346/−144 (manifeste non compris) ; `git diff
-  --check` signale une fin de fichier (ligne vide finale de
-  `housekeeping_stale.py`, nouveau fichier), sans effet ; les six commits de
-  composition portent leur trailer `ameesh-work:`.
+- **Diff** : 27 fichiers, +2377/−152 (manifeste non compris, correctif de
+  garde compris) ; `git diff --check` signale une fin de fichier (ligne vide
+  finale de `housekeeping_stale.py`, nouveau fichier), sans effet ; les six
+  commits de composition portent leur trailer `ameesh-work:`.
 - **Migrations** : aucune (aucun fichier SQL ni migration).
 - **Prévalidation** : indisponible (`card-stale`, carte de sélection de plus
   de 48 h), non bloquant (§3), motif consigné.
@@ -107,7 +131,11 @@ fichier qu'une fin de fichier inchangée.
   (§12). Les six unités ont leurs verdicts acquis sur leurs têtes gelées et
   leurs review-class lues par la porte ; le porteur #3305 est gelé sur la tête
   finale et ses relecteurs rendent leurs avis sur cette tête (aucune relecture
-  supplémentaire n'est déclarée due à l'avance). Aucune CI de lot.
+  supplémentaire n'est déclarée due à l'avance). Le correctif `48ac257b7`
+  remplace la tête rouge : nouvelle demande `ci-full` et fusion sous garde de
+  tête dès le vert. Son delta propre touche la garde mécanique et le lecteur
+  (sensible, #2449) : la porte désigne le relecteur dû sur la nouvelle tête ;
+  les six unités gardent leurs avis acquis. Aucune CI de lot.
 - **Coupe 1.21.0** : non demandée ici. pc-smichea est éteint pour la journée
   (release.host) ; la fusion du paquet sur `main` ne dépend pas de la coupe.
   La CI de `main` au commit `ad1ab350` (run 40068028315) est rouge de jobs

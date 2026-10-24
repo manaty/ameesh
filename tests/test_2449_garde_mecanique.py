@@ -51,7 +51,8 @@ def reader_keys() -> set[str]:
             ("reviews", mechanics._REVIEWS_KEYS),
             ("merge", mechanics._MERGE_KEYS),
             ("prevalidation", mechanics._PREVALIDATION_KEYS),
-            ("backlog", mechanics._BACKLOG_KEYS)):
+            ("backlog", mechanics._BACKLOG_KEYS),
+            ("staging", mechanics._STAGING_KEYS)):
         keys |= {"%s.%s" % (block, name) for name in names}
     return keys
 
@@ -68,7 +69,7 @@ class SchemaCoverageTest(unittest.TestCase):
         self.assertEqual(set(mechanics._DOCUMENT_KEYS),
                          {"schema", "timezone", "cutoffs", "packets", "build",
                           "ci", "reviews", "merge", "prevalidation", "backlog",
-                          "projects"})
+                          "staging", "projects"})
         self.assertLessEqual(set(mechanics._OVERRIDE_KEYS),
                              set(mechanics._DOCUMENT_KEYS))
 
@@ -113,6 +114,9 @@ POSITIVE = {
         '# prevalidation\nparts_script = "scripts/test-parts.py"\n',
     "prevalidation.timeout_seconds": "# prevalidation\ntimeout_seconds = 7200\n",
     "backlog.lot_min_value": "BACKLOG_LOT_MIN_VALUE = 30\n",
+    "staging.waiting_lots_min": "WAITING_LOTS_MIN = 3\n",
+    "staging.before_cutoff_seconds": "BEFORE_CUTOFF_SECONDS = 1200\n",
+    "staging.before_packet_seconds": "BEFORE_PACKET_SECONDS = 600\n",
     "projects": 'PROJECT_OVERRIDES = {"ameesh": {"build": {"max_in_build": 3}}}\n',
 }
 
@@ -127,6 +131,8 @@ class RulesTest(unittest.TestCase):
             '# ci packet\nCI = {"packet": "full"}\n'))
         self.assertIn("schema", findings(
             'CONFIG = {"schema": "ameesh-mechanics/1"}\n'))
+        self.assertIn("staging.waiting_lots_min", findings(
+            'STAGING = {"waiting_lots_min": 3}\n'))
 
     def test_unrelated_literals_do_not_mordent(self):
         for source in (
