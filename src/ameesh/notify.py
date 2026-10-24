@@ -2,7 +2,8 @@
 """Alerts pushed to the responsible human (lot L38, decision 0030 point 4).
 
   ameesh notify [--once] [--dry-run] [--json] [--interval S]
-                [--only alerts|take|issues|github-watch|ci] [--long-turn S]
+                [--only alerts|take|issues|github-watch|ci]
+                [--skip issues|github-watch|ci] [--long-turn S]
                 [--idle-mail S] [--dead-grace S]
                 [--session-tokens N] [--stale-lot S] [--orphan-lot S]
                 [--take-idle S] [--take-max-per-hour N]
@@ -113,6 +114,10 @@ STATE_SCHEMA = "ameesh-notify-state/1"
 #: `alerts` owns the delivery state and its lock; `take` observes the alerts
 #: but writes no state; `issues`, `github-watch` and `ci` are independent.
 ONLY_PASSES = ("alerts", "take", "issues", "github-watch", "ci")
+#: #3327: the mechanical passes a role timer carries. A full notifier may skip
+#: exactly these (and only these) from its loop; every other pass (alerts,
+#: take, budget handoff, WIP sweep) stays in the service.
+SKIPPABLE_PASSES = ("issues", "github-watch", "ci")
 
 #: L38 (0030) : types envoyés par défaut. `delegation_expired` arrive avec L40 :
 #: il est accepté ici sans dépendre de son code (un type absent n'est jamais
@@ -559,6 +564,25 @@ def _only_set(values) -> frozenset | None:
             if part not in ONLY_PASSES:
                 raise ValueError("unknown pass %r (known: %s)"
                                  % (part, ", ".join(ONLY_PASSES)))
+            selected.add(part)
+    return frozenset(selected) if selected else None
+
+
+def _skip_set(values) -> frozenset | None:
+    """Validate ``--skip``; only the role-timer passes may be excluded."""
+    if values is None:
+        return None
+    if isinstance(values, str):
+        values = [values]
+    selected = set()
+    for value in values:
+        for part in str(value).split(","):
+            part = part.strip()
+            if not part:
+                continue
+            if part not in SKIPPABLE_PASSES:
+                raise ValueError("cannot skip pass %r (skippable: %s)"
+                                 % (part, ", ".join(SKIPPABLE_PASSES)))
             selected.add(part)
     return frozenset(selected) if selected else None
 
@@ -1228,11 +1252,14 @@ class Notifier:
     def __init__(self, cfg: Config, ncfg: NotifyConfig, state: dict | None = None, *,
                  sender=None, dry_run: bool = False, emit=None, log=None, clock=None,
                  take: dict | None = None, handoff: dict | None = None,
-                 wip: dict | None = None, only=None):
+                 wip: dict | None = None, only=None, skip=None):
         self.cfg, self.ncfg = cfg, ncfg
         #: L165 (EP5) : passages demandés par une minuterie de rôle ; None =
         #: le passage complet historique.
         self.only = _only_set(only)
+        #: #3327 : passes mécaniques retirées du passage complet (le service
+        #: complet garde alertes, take, budget handoff et wip sweep).
+        self.skip = _skip_set(skip)
         #: L119 : réglages de la prise automatique (`backlog.auto_take`) ; None la coupe
         self.take = take
         #: L233b : réglages de la reprise sur pause budget
@@ -1259,6 +1286,8 @@ class Notifier:
         from . import alert_ack
         from .mediated_executor import availability
         selected = self.only if only is None else _only_set(only)
+        if selected is None and self.skip:
+            selected = frozenset(ONLY_PASSES) - self.skip
         now = float(self.clock())
         # #3057 : la passe restreinte d'une minuterie de rôle ne livre aucune
         # alerte humaine (`_run_tail`). Elle rend donc AVANT le battement de
@@ -1670,9 +1699,14 @@ class Notifier:
             self.log("GitHub issues: pass failed (%s)" % _clean(exc, 200))
 
     def _github_inputs(self, db, now: float) -> None:
-        """#2845: feed external issues/comments to the canonical watcher."""
-        if not getattr(self.cfg, "github", None):
-            return
+        """#2845: feed external issues/comments to the canonical watcher.
+
+        The watched repositories and cadences come from the canon's
+        ``github_watch`` cards, not from the host's ``github`` key: a role
+        timer on a candidate host must collect them even when that key is
+        absent (#3327). The watcher's own host gate (``role_run``) decides
+        whether this host may run.
+        """
         from . import github_watch
         try:
             if self._github_watcher is None:
@@ -2738,6 +2772,11 @@ def build_parser() -> argparse.ArgumentParser:
                         help="L165: run only these passes (%s; repeatable, "
                              "comma-separated); requires --once"
                              % ", ".join(ONLY_PASSES))
+    parser.add_argument("--skip", action="append", metavar="PASS[,PASS]",
+                        default=None,
+                        help="L165/#3327: exclude these mechanical passes from "
+                             "a full pass (skippable: %s; repeatable, "
+                             "comma-separated)" % ", ".join(SKIPPABLE_PASSES))
     exploitation.add_threshold_arguments(parser)
     # L119 (0037) : prise automatique dans la file d'amélioration
     from . import backlog, handoff
@@ -2880,12 +2919,18 @@ def cmd_test(cfg: Config, ncfg: NotifyConfig, args) -> int:
 def cmd_notify(cfg: Config, ncfg: NotifyConfig, args) -> int:
     try:
         only = _only_set(getattr(args, "only", None))
+        skip = _skip_set(getattr(args, "skip", None))
     except ValueError as exc:
         print("ameesh notify: %s" % exc, file=sys.stderr)
         return 2
     if only is not None and not args.once:
         print("ameesh notify: --only requires --once", file=sys.stderr)
         return 2
+    if only is not None and skip:
+        print("ameesh notify: --only and --skip are exclusive", file=sys.stderr)
+        return 2
+    # #3327: a full service may skip the passes now carried by a role timer;
+    # every other pass (alerts, take, budget handoff, WIP sweep) stays.
     #: L165: the alert delivery owns the local state file and its lock. The
     #: mechanical passes (`issues`, `github-watch`, `ci`) use database state
     #: only, so a role timer can run them beside the alert producer.
@@ -2912,7 +2957,7 @@ def cmd_notify(cfg: Config, ncfg: NotifyConfig, args) -> int:
 
     notifier = Notifier(cfg, ncfg, state, dry_run=args.dry_run, emit=emit,
                         take=take_settings(args), handoff=handoff_settings(args),
-                        wip=wip_settings(args), only=only)
+                        wip=wip_settings(args), only=only, skip=skip)
     seuils = exploitation.thresholds(args)
     interval = _interval(args, ncfg)
     db = None

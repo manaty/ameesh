@@ -1249,8 +1249,10 @@ def user_paths(uid: int | None = None, allow=()) -> UserPaths:
     it holds nothing anymore. One that cannot be read (not dumpable: setuid,
     file capabilities) is a doubt, unless its name (`comm`) AND the base name
     of its `argv[0]` are both in `allow` or the service manager: its `exe` link
-    is unreadable too, its command line is not. Without `/proc` (other OS),
-    `available` is false."""
+    is unreadable too, its command line is not. What was read before a
+    refusal (a `cwd`, an `exe`) is recorded all the same (#3195 R2): an
+    observation is never dropped for what could not be read after it.
+    Without `/proc` (other OS), `available` is false."""
     if not _proc_ok():
         return UserPaths(available=False)
     uid = os.getuid() if uid is None else uid
@@ -1301,7 +1303,6 @@ def user_paths(uid: int | None = None, allow=()) -> UserPaths:
                     out.allowed.append(who)
             else:
                 out.unreadable.append(who)
-            continue
         for path in found:
             # `root` is `/` for every process: it only tells a chroot apart
             if path and path != "/":

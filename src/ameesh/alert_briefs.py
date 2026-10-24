@@ -467,7 +467,12 @@ def _slo_breach(alert: dict, *, level: int | None = None) -> str:
     #2378 : de même pour une demande de décision ouverte et échue
     (`waiting.decision`) : le geste est de vérifier l'échéance avec le
     demandeur (renouveler ou retirer la demande) ; le décideur a le rappel de
-    sa demande, l'alerte SLO ne le relance pas (canon §9, owner 18/10)."""
+    sa demande, l'alerte SLO ne le relance pas (canon §9, owner 18/10).
+
+    #3288 : `blocked_freeze` est due par l'assigné (le débiteur de la
+    correction), pas par le relecteur : ×1 l'assigné corrige et regel, ×2 le
+    pilote réassigne, ×3 le bureau/l'auditeur réassigne à un agent libre de la
+    famille de l'auteur."""
     lot = int(alert["lot"])
     title = alert.get("title")
     level = int(alert.get("level") or 1) if level is None else int(level)
@@ -479,6 +484,7 @@ def _slo_breach(alert: dict, *, level: int | None = None) -> str:
                sous_utilisation._duration(alert.get("value") or 0),
                sous_utilisation._duration(alert.get("threshold") or 0),
                (", owed by reviewer %s" % who if alert.get("step") == "green_verdict"
+                else ", fix owed by %s" % who if alert.get("step") == "blocked_freeze"
                 else ", assigned to %s" % who if who else ", unassigned")))
     # #2016 : quand la commande est proposée, elle porte le titulaire lu
     # (`--if-holder`) : le pilote ou le bureau parti de ce brief est refusé si
@@ -570,6 +576,30 @@ def _slo_breach(alert: dict, *, level: int | None = None) -> str:
             move = ("reviewer %s: review the frozen head and render your verdict now (%s); "
                     "if you cannot, tell the pilot so another reviewer is designated"
                     % (who or "?", verdict))
+    elif alert.get("step") == "blocked_freeze":
+        # #3288 : un avis bloquant n'attend pas un relecteur mais la correction
+        # de l'assigné ; le canon §9 escalade de l'assigné au pilote (qui
+        # réassigne), puis au bureau/à l'auditeur.
+        blocker = str(alert.get("blocked_by") or "a reviewer")
+        sha = str(alert.get("sha") or "")
+        if level >= 3:
+            move = ("bureau or auditor: the pilot has not reassigned the fix — reassign the "
+                    "lot now to a free agent of the author's family (the fix needs it): "
+                    "ameesh work assign %d <agent>%s, then agent-mail send <agent> \"…\" "
+                    "--lot %d; do not wait for the pilot if it is itself late"
+                    % (lot, holder, lot))
+        elif level >= 2:
+            move = ("pilot: the assignee has not corrected the blocking verdict of %s — "
+                    "reassign the lot to a free agent of the same family, or take the fix "
+                    "yourself (ameesh work assign %d <agent>%s, then agent-mail send "
+                    "<agent> \"…\" --lot %d)"
+                    % (blocker, lot, holder, lot))
+        else:
+            move = ("assignee: correct the blocking verdict of %s and freeze the new head "
+                    "(`ameesh work milestone %d frozen --sha <new head>`); if you moved "
+                    "the lot to build, re-enter qa (`ameesh work move %d qa`); if you "
+                    "cannot, say so (`ameesh work note %d \"hold: <reason>\"`) so the "
+                    "pilot hands the fix over" % (blocker, lot, lot, lot))
     elif level >= 3:
         move = ("bureau or auditor: reassign it now to a free agent (ameesh work assign "
                 "%d <agent>%s, then agent-mail send <agent> \"…\" --lot %d); do not wait "

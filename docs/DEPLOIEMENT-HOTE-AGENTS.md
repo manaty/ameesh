@@ -8,6 +8,14 @@ une par une, arrêt prouvé avant chaque démarrage. `agents controler` (ou
 `agents installer [REF]` installe une révision gelée dans le layout du compte
 et `agents retour` réinstalle la précédente (#1252).
 
+`agents controler` prouve aussi que **chaque exécuteur vivant tourne sur le
+venv installé** : le lanceur `ExecStart` est stable (#1969) et résout
+`venv-courant` au démarrage, si bien qu'un processus déjà lancé garde l'ancien
+venv après une bascule. Le contrôle lit l'`argv[0]` concret du MainPID dans
+`/proc/<pid>/cmdline` et le compare au venv vivant ; un écart nomme l'unité et
+rend le contrôle rouge. Sans cela, un hôte dont seul le CLI avait changé de
+venv passait pour sain (staging du 24/10/2026, #3311).
+
 Dans le fichier privé `$BASCULE_ENV` (par défaut
 `~/.config/ameesh/bascule.env`), renseigner la cible SSH **root** et le nom
 exact de l’hôte dans le registre :
@@ -184,6 +192,18 @@ disque est haché et comparé aux objets du commit, sans passer par l’index :
 absent, en trop ou au mauvais mode fait refuser l’instantané, qui n’est jamais
 écrasé — le retirer à la main pour le reconstruire.
 
+Après une installation réussie, et seulement en mode agents, `installer` retire
+l’agent GnuPG inutile de la VM : si `~/.gnupg/private-keys-v1.d` est absent ou
+vide, il masque les sockets utilisateur `gpg-agent.socket`,
+`gpg-agent-ssh.socket`, `gpg-agent-extra.socket`, `gpg-agent-browser.socket` et
+`keyboxd.socket` (`systemctl --user mask --now`) puis tue l’agent (`gpgconf
+--kill gpg-agent`). Une clé privée présente, ou un état illisible, laisse tout
+en place et le journalise : le doute reste. L’étape est idempotente (une
+relance d’`installer` la rejoue) et vient après l’installation du code : #3195,
+dont ce lot dépend, garde les worktrees de lots ouverts avant que ce retrait ne
+débloque le ménage des sorties de build. `poste.sh` n’y touche jamais : sur le
+poste de l’owner, `gpg-agent` tient ses clés.
+
 `previous-sha` n’est publié qu’après une installation réussie, et seulement
 quand le code installé change : relancer `installer` sur le SHA déjà en place le
 laisse intact (sans `previous-sha`, on n’en invente pas un — pas de faux
@@ -327,6 +347,35 @@ du code, selon la procédure de [BASCULE.md](BASCULE.md). Les commandes de cette
 page sont à exécuter par le responsable du déploiement après revue et
 validation CI, une VM à la fois ; `controler` affiche le code installé, le
 clone et `previous-sha` avant les unités.
+
+## Minuteries de rôle de l’observation GitHub (#3327)
+
+L’observation GitHub (veille des tickets, relevé CI, projection des issues) est
+portée par la minuterie d’un rôle élu, `mesh-design` par défaut, et non plus par
+le seul service `ameesh-notify` de l’hôte désigné. Après `installer`, poser les
+minuteries sur chaque VM candidate :
+
+```sh
+deploy/mise-a-jour/vm.sh agents timers
+deploy/mise-a-jour/poste.sh timers        # sur le poste, autre candidat
+```
+
+`ameesh role timers --install` n’écrit rien sur un hôte qui n’est pas candidat.
+Sur un candidat, il complète les seuls couples projet→dépôt manquants depuis
+les cartes `github_watch` du canon (`nexlink` → `manaty/nexlink` sur une VM qui
+n’avait que `ameesh`), après sauvegarde `config.json.role-timers.bak` et sans
+écraser un mapping existant ; `--no-sync` le désactive. Le reste de la clé
+`github` (`workflows`, `base`, `exclude_terms`) reste à copier à l’identique
+depuis la configuration de l’observateur historique : le relevé CI de Nexlink a
+besoin de `base: [develop]`. Ce n’est pas un secret ; le jeton `GH_TOKEN` reste
+dans `notify.env`. Le drop-in posé fait exclure à `ameesh-notify` les passes
+mécaniques (`--skip issues,github-watch,ci`) : alertes et prise restent dans le
+service, GitHub et la CI passent par la minuterie du rôle.
+
+`controler` (`vm.sh agents controler`, `poste.sh controler`) exécute
+`ameesh role timers --check` et échoue sur une minuterie absente, désactivée,
+hors d’état (contenu différent) ou un drop-in manquant. Voir
+[EXPLOITATION.md, « Pose automatique »](EXPLOITATION.md#pose-automatique--ameesh-role-timers-3327).
 
 ## Release automatique aux coupures (#2448)
 

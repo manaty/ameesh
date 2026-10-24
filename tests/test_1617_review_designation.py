@@ -250,6 +250,56 @@ class SelectionTest(unittest.TestCase):
                            candidates=pool)
         self.assertEqual([r["name"] for r in picked["reviewers"]], ["claude-busy"])
 
+    def test_a_reviewer_on_a_closed_host_is_not_a_candidate(self):
+        # #3328 : l'hôte aux claims fermés est la preuve que lit agent-mail ;
+        # le même témoin doit écarter le candidat de la désignation.
+        rows = [row("claude-lost", harness="claude", session="claude"),
+                row("claude-ok", harness="claude", session="claude"),
+                row("codex-ok", harness="codex", session="codex")]
+        rows[0]["host"] = "pc-smichea"
+        pool = rd.candidates_from_registry(rows, families=FAMILIES,
+                                           project="ameesh",
+                                           closed_hosts={"pc-smichea"})
+        self.assertEqual([c.name for c in pool if c.available],
+                         ["claude-ok", "codex-ok"])
+        picked = rd.select(families=FAMILIES, required=2,
+                           authors=[{"name": "impl-02", "family": "deepseek"}],
+                           candidates=pool)
+        self.assertEqual(picked["state"], rd.DESIGNATED)
+        self.assertEqual([r["name"] for r in picked["reviewers"]],
+                         ["claude-ok", "codex-ok"])
+
+    def test_a_family_only_on_a_closed_host_waits_instead_of_designating_it(self):
+        # #3328 : seul candidat de sa famille, mais sur un hôte perdu : le
+        # siège attend (alerte capacité) au lieu d'être déposé chez un mort.
+        rows = [row("claude-lost", harness="claude", session="claude"),
+                row("codex-ok", harness="codex", session="codex")]
+        rows[0]["host"] = "pc-smichea"
+        pool = rd.candidates_from_registry(rows, families=FAMILIES,
+                                           project="ameesh",
+                                           closed_hosts={"pc-smichea"})
+        picked = rd.select(families=FAMILIES, required=2,
+                           authors=[{"name": "impl-02", "family": "deepseek"}],
+                           candidates=pool)
+        self.assertEqual(picked["state"], rd.WAITING)
+        self.assertEqual(picked["reviewers"], [])
+        self.assertEqual(picked["missing"], 1)
+        self.assertEqual(picked["families"], ["codex"])
+
+    def test_an_undrained_host_is_a_candidate_again(self):
+        # #3328, témoin (3) : l'hôte rouvert rend le relecteur candidat, sans
+        # autre changement de registre.
+        rows = [row("claude-lost", harness="claude", session="claude")]
+        rows[0]["host"] = "pc-smichea"
+        closed = rd.candidates_from_registry(rows, families=FAMILIES,
+                                             project="ameesh",
+                                             closed_hosts={"pc-smichea"})
+        self.assertFalse(closed[0].available)
+        opened = rd.candidates_from_registry(rows, families=FAMILIES,
+                                             project="ameesh",
+                                             closed_hosts=())
+        self.assertTrue(opened[0].available)
+
     def test_load_orders_the_choice_and_is_deterministic(self):
         pool = candidates(
             row("claude-heavy", harness="claude", session="claude"),

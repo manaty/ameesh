@@ -7,7 +7,7 @@
 # faite pour toute la base du mesh, qui est celle du serveur.
 #
 #   deploy/mise-a-jour/vm.sh <étape> [REF]
-#   deploy/mise-a-jour/vm.sh agents verifier|installer|redemarrer|controler|retour [REF]
+#   deploy/mise-a-jour/vm.sh agents verifier|installer|timers|redemarrer|controler|retour [REF]
 #     AGENTS_SSH=root@cible, HOTE_AGENTS=nom du registre dans BASCULE_ENV —
 #     un BASCULE_ENV par VM d'agents ; unités utilisateur sous ameesh, liste
 #     du registre lue sur la VM. Voir docs/DEPLOIEMENT-HOTE-AGENTS.md.
@@ -27,7 +27,12 @@
 #                drain est refusé et le redémarrage de cet agent s'arrête sans
 #                tour interrompu ; refuse tant que les migrations du code
 #                installé manquent
-#   controler    unités actives, journal récent, ameesh doctor sur le serveur
+#   timers       pose les minuteries mécaniques EP5 (veille GitHub, CI,
+#                projection) sur cet hôte s'il est candidat du rôle élu ;
+#                refuse explicitement les passes dont la clé `github` locale
+#                manque (#3327) ; sans effet sur un hôte non candidat
+#   controler    unités actives, journal récent, venv du MainPID vivant,
+#                ameesh doctor et minuteries de rôle sur le serveur
 #   retour       bascule en arrière vers le venv précédent conservé, puis
 #                redémarre
 #
@@ -68,8 +73,8 @@ if [ "${1:-}" = agents ]; then MODE=agents; shift; fi
 ACTION=${1:-}
 if [ "$MODE" = agents ]; then
   case "$ACTION" in
-    redemarrer|controler|verifier|installer|retour) ;;
-    *) echo "mode agents : verifier, installer, redemarrer, controler ou retour attendu" >&2; exit 2 ;;
+    redemarrer|controler|verifier|installer|timers|retour) ;;
+    *) echo "mode agents : verifier, installer, timers, redemarrer, controler ou retour attendu" >&2; exit 2 ;;
   esac
   : "${AGENTS_SSH:?AGENTS_SSH manquant dans $BASCULE_ENV}" "${HOTE_AGENTS:?HOTE_AGENTS manquant dans $BASCULE_ENV}"
   [[ $AGENTS_SSH =~ ^[a-zA-Z0-9_.@:-]+$ && $AGENTS_SSH != -* ]] || { echo "AGENTS_SSH invalide" >&2; exit 2; }
@@ -88,6 +93,8 @@ DEPOT="$(git -C "$ICI" rev-parse --show-toplevel)"
 AMEESH="$HOME/.local/share/ameesh/venv/bin/ameesh"   # celui du poste, pour lire les statuts
 SRC=/opt/ameesh/src
 VENV=/opt/ameesh/venv
+#: venv stable du compte runner sur une VM d'agents (`ExecStart` le vise)
+VENV_AGENTS=/home/ameesh/.local/share/ameesh/venv
 PRECEDENT=/opt/ameesh/precedent
 TRAVAIL="$HOME/.local/state/ameesh/mise-a-jour"
 # #2152 : quand un agent est en tour, une pause opérateur courte (drain) peut
@@ -236,13 +243,17 @@ paquet_git() {
 # -n : le client consomme son entrée standard même quand la commande distante
 # ne la lit pas. Sans lui, la boucle `while read` de controler_agents lui livre
 # la liste des agents et n'en contrôle qu'un seul (#1455).
+# #3311 : ENTREE_STDIN=1 (via utilisateur_agents_stdin) transmet au contraire
+# l'entrée standard, pour faire lire le helper de preuve du venv sur la cible.
 ssh_agents() {
+  local opts=("${SSH_OPTS[@]}")
+  [ "${ENTREE_STDIN:-}" = 1 ] || opts+=(-n)
   if [ "${BORNE_APPEL_DRAIN:-}" = 1 ]; then
     # #2198/N2 : la borne locale (BORNE_APPEL_LOCAL) dépasse toujours la borne
     # distante, pour laisser le `timeout` distant rendre son code.
     appel_drain "${BORNE_APPEL_LOCAL:-$DRAIN_APPEL_DELAI}" \
-      ssh -n "${SSH_OPTS[@]}" "$AGENTS_SSH" "$@"
-  else ssh -n "${SSH_OPTS[@]}" "$AGENTS_SSH" "$@"; fi
+      ssh "${opts[@]}" "$AGENTS_SSH" "$@"
+  else ssh "${opts[@]}" "$AGENTS_SSH" "$@"; fi
 }
 utilisateur_agents() {
   local commande; printf -v commande '%q ' "$@"
@@ -250,6 +261,10 @@ utilisateur_agents() {
     uid=\$(id -u ameesh)
     runuser -u ameesh -- env HOME=/home/ameesh XDG_RUNTIME_DIR=/run/user/\$uid \
       DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/\$uid/bus $commande"
+}
+# #3311 : même environnement que utilisateur_agents, entrée standard ouverte.
+utilisateur_agents_stdin() {
+  ENTREE_STDIN=1 utilisateur_agents "$@"
 }
 commande_agents() {
   # Use the runner's systemd EnvironmentFile parser, including literal $/#.
@@ -1352,6 +1367,66 @@ reinstaller_agents() {
     python3 $BASCULE_AGENTS activer --venv \"\$V\" --version $court ${precedent:+--precedent $precedent}
     \"\$V/bin/python\" -c 'import psycopg, ameesh; print(\"psycopg\", psycopg.__version__)'"
 }
+# --- agent GnuPG des VM d'agents (#3320) -----------------------------------
+# Un hôte d'agents ne tient aucune clé privée : l'agent GnuPG n'y sert à rien
+# et, non dumpable, il retient le ménage des sorties de build (#3195). Après
+# une installation réussie, si ~/.gnupg/private-keys-v1.d est absent ou vide,
+# les sockets utilisateur sont masqués et l'agent tué ; une clé privée, ou un
+# état illisible, laisse tout en place et journalise le doute. Jamais dans
+# poste.sh : le poste de l'owner tient ses clés. Idempotent : une relance
+# d'« installer » rejoue l'étape (masquer un socket déjà masqué réussit).
+etat_cle_gpg_agents() {  # → absente | vide | cle | doute
+  utilisateur_agents bash -c 'set -euo pipefail
+    h=$HOME/.gnupg
+    # « Absent » ne se prouve que sur une traversée prouvée : sans le bit x,
+    # test -e et test -L échouent aussi (EACCES), et un home GnuPG illisible
+    # passerait pour absent (#3320 B1 : masquage dans le doute).
+    if [ ! -d "$HOME" ] || [ ! -x "$HOME" ]; then echo doute; exit 0; fi
+    if [ -L "$h" ]; then
+      if [ ! -d "$h" ] || [ ! -x "$h" ]; then echo doute; exit 0; fi
+    elif [ ! -e "$h" ]; then
+      echo absente; exit 0
+    elif [ ! -d "$h" ] || [ ! -x "$h" ]; then
+      echo doute; exit 0
+    fi
+    d=$h/private-keys-v1.d
+    if [ -L "$d" ]; then echo doute; exit 0; fi
+    if [ ! -e "$d" ]; then echo absente; exit 0; fi
+    if [ ! -d "$d" ] || [ ! -x "$d" ]; then echo doute; exit 0; fi
+    if ! premier=$(find "$d" -mindepth 1 -maxdepth 1 -print -quit 2>/dev/null); then
+      echo doute; exit 0
+    fi
+    if [ -n "$premier" ]; then echo cle; else echo vide; fi'
+}
+masquer_agent_gpg_agents() {
+  local etat
+  if ! etat=$(etat_cle_gpg_agents); then
+    echo "état de ~/.gnupg/private-keys-v1.d illisible sur $HOTE_AGENTS : étape GnuPG non appliquée" >&2
+    return 1
+  fi
+  case "$etat" in
+    absente|vide)
+      etape "agent GnuPG de $HOTE_AGENTS : aucune clé privée ($etat), sockets utilisateur masqués"
+      if ! utilisateur_agents systemctl --user mask --now \
+          gpg-agent.socket gpg-agent-ssh.socket gpg-agent-extra.socket \
+          gpg-agent-browser.socket keyboxd.socket; then
+        echo "masquage des sockets GnuPG en échec sur $HOTE_AGENTS" >&2
+        return 1
+      fi
+      if ! utilisateur_agents gpgconf --kill gpg-agent; then
+        echo "gpgconf --kill gpg-agent en échec sur $HOTE_AGENTS" >&2
+        return 1
+      fi
+      echo "sockets GnuPG masqués et gpg-agent tué (aucune clé privée sur cet hôte)"
+      ;;
+    cle)
+      echo "clé privée dans ~/.gnupg/private-keys-v1.d : sockets GnuPG laissés en place (doute conservé)"
+      ;;
+    *)
+      echo "état de ~/.gnupg/private-keys-v1.d non prouvé ($etat) : rien touché (doute conservé)" >&2
+      ;;
+  esac
+}
 releve_agents() {  # identité et pièces du bon hôte, avant tout geste
   local installe clone previous
   installe=$(installe_agents) || return 1
@@ -1383,6 +1458,25 @@ exiger_migrations_agents() {
   exit 1
 }
 
+# #3311 : le lanceur ExecStart est stable (#1969) : un exécuteur déjà lancé
+# peut rester sur l'ancien venv après une bascule, et l'hôte paraître sain. Le
+# helper est lu sur stdin, donc il ne dépend pas de la version installée sur la
+# cible ; il prouve l'argv[0] concret du MainPID (/proc, après bascule).
+preuve_venv_agents() {  # persona → 0 si le MainPID vivant exécute le venv installé
+  local p=$1 u pid
+  u=$(unite_agents "$p")
+  pid=$(utilisateur_agents systemctl --user show -p MainPID --value "$u") \
+    || { echo "$u : MainPID illisible — venv non prouvé" >&2; return 1; }
+  [[ $pid =~ ^[0-9]+$ ]] \
+    || { echo "$u : MainPID invalide ($pid) — venv non prouvé" >&2; return 1; }
+  if [ ! -r "$ICI/venv-processus.py" ]; then
+    echo "venv-processus.py introuvable : $ICI/venv-processus.py" >&2
+    return 1
+  fi
+  utilisateur_agents_stdin python3 - "$pid" "$VENV_AGENTS" "$u" \
+    < "$ICI/venv-processus.py"
+}
+
 controler_agents() {
   local noms p ligne heure attendu echec=0
   etape "code installé sur $HOTE_AGENTS"
@@ -1393,14 +1487,32 @@ controler_agents() {
     utilisateur_agents systemctl --user is-active --quiet "$(unite_agents "$p")" \
       && utilisateur_agents journalctl --user -u "$(unite_agents "$p")" -n 15 --no-pager \
       || { echec_agent "$p" "unité inactive ou journal inaccessible"; echec=1; }
+    preuve_venv_agents "$p" \
+      || { echec_agent "$p" "le MainPID vivant n'exécute pas le venv installé"; echec=1; }
     ligne=$(lire_bail "$p") && heure=$(heure_base) && attendu=$(proprietaire_de "$p") \
       && bail_valide 0 "$attendu" "$heure" <<<"$ligne" \
       || { echec_agent "$p" "bail absent, étranger ou expiré, ou preuve illisible"; echec=1; }
   done <<<"$noms"
   etape "ameesh doctor sur $HOTE_AGENTS"
   ameesh_agents doctor || echec=1
+  # #3327 : un hôte candidat sans minuterie de rôle laisse le relevé GitHub
+  # muet ; le contrôle échoue au lieu d'attendre la prochaine panne.
+  etape "minuteries de rôle (EP5) sur $HOTE_AGENTS"
+  # #3311 × #3327 : le CLI lit son DSN dans l'EnvironmentFile du service ; un
+  # appel direct sous runuser n'a pas cet environnement et échoue sur un hôte
+  # sain. `ameesh_agents` passe par systemd-run + EnvironmentFile, comme doctor.
+  ameesh_agents role timers --check || echec=1
   [ "$echec" = 0 ] || { echo "contrôles en échec" >&2; return 1; }
   echo "contrôles verts"
+}
+
+timers_agents() {
+  # #3327 : installe les minuteries mécaniques de la veille GitHub sur cet
+  # hôte s'il est candidat du rôle élu. `role timers` refuse explicitement les
+  # passes qui dépendent de `github.projects` quand la clé locale manque.
+  etape "minuteries de rôle (EP5) sur $HOTE_AGENTS"
+  # #3311 × #3327 : même environnement que le service (DSN, canon, github).
+  ameesh_agents role timers --install
 }
 
 installer_agents() {
@@ -1493,6 +1605,14 @@ installer_agents() {
     echo "code ${sha:0:9} déjà installé : previous-sha inchangé (aucun faux retour)"
   fi
   effacer_journal_agents
+  # 10. #3320 : après l'installation du code, retirer l'agent GnuPG inutile.
+  # #3195, prérequis de ce lot, garde les worktrees de lots ouverts avant que
+  # ce retrait ne débloque le ménage des sorties de build.
+  # Idempotent : relancer « installer » rejoue l'étape, sockets déjà masqués.
+  if ! masquer_agent_gpg_agents; then
+    echo "étape GnuPG en échec : code ${sha:0:9} installé ; la relancer par « $0 agents installer ${sha:0:9} » (idempotente)" >&2
+    return 1
+  fi
   echo "installé depuis src-$court (avant $complet). Les exécuteurs tournent encore l'ancien code : « $0 agents redemarrer », puis « $0 agents controler »."
 }
 
@@ -1719,11 +1839,27 @@ redemarrer() {
   fi
 }
 
+# #3311 : comme preuve_venv_agents, sur le serveur (`ameesh-runner@<p>`,
+# ExecStart /opt/ameesh/venv/bin/ameesh). Le helper arrive par stdin.
+preuve_venv_vm() {  # persona → 0 si le MainPID vivant exécute le venv installé
+  local u=ameesh-runner@$1 pid
+  pid=$(ssh_vm "systemctl show -p MainPID --value $u") \
+    || { echo "$u : MainPID illisible — venv non prouvé" >&2; return 1; }
+  [[ $pid =~ ^[0-9]+$ ]] \
+    || { echo "$u : MainPID invalide ($pid) — venv non prouvé" >&2; return 1; }
+  if [ ! -r "$ICI/venv-processus.py" ]; then
+    echo "venv-processus.py introuvable : $ICI/venv-processus.py" >&2
+    return 1
+  fi
+  ssh_vm "python3 - '$pid' '$VENV' '$u'" < "$ICI/venv-processus.py"
+}
+
 controler() {
   local echec=0
   for p in $PERSONAS_VM; do
     etape "$p"
     ssh_vm "systemctl is-active ameesh-runner@$p && journalctl -u ameesh-runner@$p -n 15 --no-pager" || echec=1
+    preuve_venv_vm "$p" || echec=1
     "$AMEESH" show "$p" | head -4 || echec=1
   done
   etape "ameesh doctor sur le serveur"
@@ -1749,6 +1885,7 @@ if [ "$MODE" = agents ]; then
     redemarrer) redemarrer_agents ;;
     verifier|controler) controler_agents ;;
     installer) installer_agents "${2:-HEAD}" ;;
+    timers) timers_agents ;;
     retour) retour_agents ;;
   esac
   exit

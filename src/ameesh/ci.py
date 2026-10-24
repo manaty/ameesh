@@ -1841,8 +1841,16 @@ class Watcher:
                 # une ligne de l'attempt précédent (check run pas encore
                 # republié par la relance) est enregistrée sous le sien, jamais
                 # imputée à l'attempt courant (#901)
+                # #1786 N1 : la référence de la base peut changer entre deux
+                # passes ; une ligne déjà inscrite sans message n'est
+                # resignalée que si sa classe `inherited` n'a pas bougé — sinon
+                # le message (calculé sur l'événement) et la ligne en base
+                # (`add_failure` ne met pas à jour le même attempt)
+                # divergeraient.
                 seen = recorded.get((failure["part"], failure["test"]))
-                if added or (seen is not None and not seen.get("message_id")):
+                if added or (seen is not None and not seen.get("message_id")
+                             and bool(seen.get("inherited"))
+                             == bool(failure["inherited"])):
                     new.append(failure)
                 if added:
                     fresh.add((failure["part"], failure["test"]))

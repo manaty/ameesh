@@ -2596,13 +2596,23 @@ class AgentWorker(threading.Thread):
         """Le lot (`work_item`) d'un tour, ou None s'il n'est pas déductible.
 
         1. Les messages du tour : s'ils portent UN seul lot (`--lot`), c'est
-           lui ; plusieurs lots distincts = ambigu, None.
+           lui ; plusieurs lots distincts = ambigu, None — sauf un lot tenu
+           par un AUTRE agent, qui ne choisit pas le tour (#3325).
         2. Sinon, l'unique lot ouvert assigné à l'agent ; plusieurs = None.
         Un tour dont le lot est inconnu ne déclenche jamais de rotation.
 
         #2527 : un message seulement informatif (`_informative_message`) ne
         porte pas le lot du tour : un avis sur le lot d'un autre n'ouvre ni
         ne met de côté aucune session.
+
+        #3325 (régression de #2410) : un courrier threadé sur le lot d'un
+        AUTRE agent — le destinataire n'y est ni assigné ni relecteur désigné
+        — ne choisit pas le lot du tour, donc n'ouvre ni ne met de côté
+        aucune session. Le tour revient aux lots que l'agent porte (ou reste
+        sans lot) ; le courrier reste livré dans la consigne. Un lot sans
+        agent (non assigné, tenu par un humain, inconnu) garde le comportement
+        d'avant : il n'appartient à aucun autre agent, et son dossier porte le
+        courrier primaire (#811).
         """
         ops = storage.of(self.db).operations
         try:
@@ -2617,6 +2627,9 @@ class AgentWorker(threading.Thread):
             elif ids:
                 lots = ops.message_lots(ids)
             if rows or ids:
+                # #3325 : le lot d'un AUTRE agent ne dédie pas la session ;
+                # il est retiré avant l'arbitrage « un seul / ambigu ».
+                lots = [lot for lot in lots if not self._turn_lot_foreign(lot)]
                 if len(lots) == 1:
                     return lots[0]
                 if len(lots) > 1:
@@ -2633,6 +2646,32 @@ class AgentWorker(threading.Thread):
         if len(actifs) == 1:
             return str(actifs[0]["id"])
         return None
+
+    def _turn_lot_foreign(self, lot: str) -> bool:
+        """#3325 : ce lot est-il tenu par un AUTRE agent (donc pas le tour) ?
+
+        Seul un lot assigné à un autre agent est écarté. Un lot sans agent
+        (non assigné, tenu par un humain, inconnu) n'appartient à personne
+        d'autre : il garde son rôle de dossier du courrier primaire (#811), et
+        une session qui lui serait dédiée ne prive aucun autre agent de son
+        lot. Un relecteur désigné porte le lot : il n'est pas « d'un autre ».
+        Une base illisible lève `DbError`, que `turn_lot` traite comme avant :
+        aucun tour ne part sur une lecture incertaine."""
+        from . import work as work_mod
+        from .work_reviewers import designated
+
+        lot = str(lot or "").strip()
+        if not lot.isdigit():
+            return False
+        item = work_mod.get(self.db, int(lot))
+        if item is None:
+            return False
+        assignee = str(item.get("assignee") or "").strip()
+        if not assignee or assignee == self.name:
+            return False
+        if assignee.startswith(work_mod.HUMAN_PREFIX):
+            return False
+        return self.name not in designated(item)
 
     def _informative_message(self, row: dict) -> bool:
         """#2527 : ce message n'est qu'un avis, il ne choisit pas le lot du
@@ -5264,23 +5303,32 @@ class AgentWorker(threading.Thread):
         return None
 
     def _idle_prompt(self) -> str:
-        """#3033 + #3273 : la relance d'inactivité porte les avis que l'agent
-        doit encore rendre, et nomme le pilote de son équipe (#3273). Sans
-        elle, un relecteur dont la demande de désignation était un courrier
-        déjà lu se déclarait « disponible » à l'orchestrateur pendant que son
-        avis attendait (#3004, 1 j 14 h). Une file illisible ne change pas la
-        relance : le brief de reprise la dit, et un tour au repos ne part pas
-        sur une lecture ratée."""
+        """#3033/#3288/#3273 : la relance d'inactivité porte les corrections et
+        les avis que l'agent doit encore rendre, et nomme le pilote de son
+        équipe (#3273). Sans elle, un relecteur dont la demande de désignation
+        était un courrier déjà lu se déclarait « disponible » à
+        l'orchestrateur pendant que son avis attendait (#3004, 1 j 14 h), et
+        un auteur bloqué continuait sur d'autres lots (#3033 22 h, #3195 9 h).
+        La correction due passe en premier : c'est elle qui débloque la revue.
+        Une file illisible ne change pas la relance : le brief de reprise la
+        dit, et un tour au repos ne part pas sur une lecture ratée."""
         from . import reprise
-        prompt = adapters.idle_prompt(self._idle_pilot())
+        parts = [adapters.idle_prompt(self._idle_pilot())]
+        try:
+            fixes = reprise.fixes_owed_lines(self.db, self.name)
+        except Exception:  # noqa: BLE001 - la relance part quand même
+            fixes = []
+        if (fixes and fixes != [reprise.NO_FIX_OWED]
+                and not fixes[0].startswith("(fixes owed unreadable")):
+            parts += ["", adapters.IDLE_FIXES_HEADER] + fixes
         try:
             lines = reprise.pending_review_lines(self.db, self.name)
         except Exception:  # noqa: BLE001 - la relance part quand même
-            return prompt
-        if (not lines or lines == [reprise.NO_PENDING_REVIEW]
-                or lines[0].startswith("(pending reviews unreadable")):
-            return prompt
-        return "\n".join([prompt, "", adapters.IDLE_REVIEWS_HEADER] + lines)
+            lines = []
+        if (lines and lines != [reprise.NO_PENDING_REVIEW]
+                and not lines[0].startswith("(pending reviews unreadable")):
+            parts += ["", adapters.IDLE_REVIEWS_HEADER] + lines
+        return "\n".join(parts)
 
     #: #408 : intervalle minimal entre deux lectures des lots actionnables
     LOT_WAKE_CHECK_S = 30.0
@@ -10344,8 +10392,10 @@ class Runner:
         """#2561: retry the freezes whose automatic designation was journaled
         unavailable. A canon publication/sync (or a worktree that became
         readable) can lift the cause after the freeze; the freeze is kept, so
-        the same head is replayed, never a newer one. Bounded and never fatal:
-        the canon sync must not fail because a designation retry did."""
+        the same head is replayed, never a newer one. #3328: the same pass
+        reattributes a seat whose designated reviewer became unreachable (host
+        closed, stopped/dead). Bounded and never fatal: the canon sync must not
+        fail because a designation retry did."""
         if getattr(self, "mediated", False):
             return
         if not getattr(self, "_designation_retry_ready", False):
@@ -10358,6 +10408,9 @@ class Runner:
             db = ScopedDb(self.cfg)
             try:
                 report = activation.retry_pending(self.cfg, db)
+                # #3328 : a seat whose reviewer's host vanished is reattributed
+                # on the same pass, on the same freeze. Bounded and never fatal.
+                moved = activation.reassign_unreachable(self.cfg, db)
             finally:
                 db.close()
             if report.get("attempted") or report.get("errors"):
@@ -10365,6 +10418,11 @@ class Runner:
                     " (%d error(s): %s)" % (len(report["errors"]), report["errors"][0]))
                 log_async("review designation retry: %s%s"
                           % (report.get("summary") or "", detail))
+            if moved.get("examined") or moved.get("errors"):
+                detail = "" if not moved.get("errors") else (
+                    " (%d error(s): %s)" % (len(moved["errors"]), moved["errors"][0]))
+                log_async("review designation reassign: %s%s"
+                          % (moved.get("summary") or "", detail))
         except Exception as exc:  # noqa: BLE001 - never fatal for the canon sync
             log_async("review designation retry failed: %s"
                       % " ".join(str(exc).split())[:200])

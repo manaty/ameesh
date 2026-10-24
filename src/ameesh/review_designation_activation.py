@@ -62,7 +62,11 @@ Outside the hook, the same inputs feed the recovery path used by
 capacity or canon problem fixed later can still designate the same head. The
 runner also retries the journaled unavailable freezes after a successful canon
 sync (`retry_pending`, bounded and idempotent), so the command is optional and
-an older pilot installation is no obstacle.
+an older pilot installation is no obstacle. #3328: the same runner pass
+reattributes a seat whose designated reviewer became unreachable (host closed,
+stopped/dead): the same freeze is replayed with the host evidence, the move is
+journaled once per (freeze, unreachable names), and the pilot gets the capacity
+alert when no replacement family can be designated.
 """
 from __future__ import annotations
 
@@ -75,6 +79,7 @@ import dataclasses
 from dataclasses import dataclass, field
 from typing import Mapping, Optional, Sequence
 
+from . import alert_briefs
 from . import canon as canon_mod
 from . import db as db_mod
 from . import lot_class, mechanics, plan_git, projects, registry, review
@@ -816,11 +821,12 @@ def _mark_reviewers(note: str) -> Optional[list]:
 
 
 #: #3033 / #3047: the journal facts of every open lot that the pending-review
-#: calculation (`_pending_read`) needs, in **one** statement: the latest freeze,
-#: its latest mark, every designation mark of the lot, the manual designations
-#: since that freeze and the verdicts. Every note comes back as **text** and is
-#: parsed in Python: no note is ever cast by PostgreSQL, so no bad note can
-#: abort the freeze transaction this read runs in.
+#: and fix calculation (`_owed_read`) needs, in **one** statement: the latest
+#: freeze, its latest mark, every designation mark of the lot, the manual
+#: designations since that freeze and the verdicts (actor, head, verdict and
+#: instant — #3288 reads the blocks from the same rows). Every note comes back
+#: as **text** and is parsed in Python: no note is ever cast by PostgreSQL, so
+#: no bad note can abort the freeze transaction this read runs in.
 _PENDING_FACTS_SQL = """
     WITH open_items AS (
         SELECT id, assignee, reviewers, title, state, app
@@ -857,7 +863,9 @@ _PENDING_FACTS_SQL = """
     ), verdicts AS (
         SELECT v.work_item_id AS lot,
                array_agg(v.actor ORDER BY v.id) AS actors,
-               array_agg(v.sha ORDER BY v.id) AS shas
+               array_agg(v.sha ORDER BY v.id) AS shas,
+               array_agg(v.verdict ORDER BY v.id) AS kinds,
+               array_agg(extract(epoch FROM v.at)::float8 ORDER BY v.id) AS ts
           FROM work_item_milestones v
           JOIN latest_freeze f ON f.lot = v.work_item_id
          WHERE v.kind = 'verdict'
@@ -868,7 +876,8 @@ _PENDING_FACTS_SQL = """
            mark.id AS note_id, extract(epoch FROM mark.created_at)::float8 AS mark_ts,
            mk.ids AS mark_ids, mk.notes AS mark_notes,
            mn.notes AS manual_notes, mn.ts AS manual_ts,
-           vd.actors AS verdict_actors, vd.shas AS verdict_shas
+           vd.actors AS verdict_actors, vd.shas AS verdict_shas,
+           vd.kinds AS verdict_kinds, vd.ts AS verdict_ts
       FROM open_items o
       LEFT JOIN latest_freeze f ON f.lot = o.id
       LEFT JOIN LATERAL (
@@ -891,16 +900,20 @@ _PENDING_FACTS_SQL = """
 """
 
 
-def _pending_read(db, *, unreadable: Optional[list] = None) -> tuple[list, list]:
-    """The open lots and the reviews still owed, in **one** read (#3033).
+def _owed_read(db, *, unreadable: Optional[list] = None) -> tuple[list, list, list]:
+    """The open lots, the reviews still owed and the fixes due, in **one** read.
 
-    It is the **only** calculation of a pending review: the selection load
-    (`_loads`, #3004), the reading of an agent's queue (`pending_reviews`:
-    resume brief, idle turn) and the §9 `green_verdict` relaunch all read it,
-    so they cannot disagree. Returns `(lots, pending)`: `lots` is every open
-    lot as `(lot, assignee)`; `pending` one row per (lot, reviewer) — `lot`,
-    `name`, `sha` (the frozen head), `designated_ts`, `title`, `state`, `app`
-    — oldest designation first.
+    It is the **only** calculation of a pending review (#3033) and of the fix
+    that follows a blocking verdict (#3288): the selection load (`_loads`,
+    #3004), the reading of an agent's queue (`pending_reviews`,
+    `due_fixes`: resume brief, idle turn) and the §9 `green_verdict` /
+    `blocked_freeze` relaunches all read it, so they cannot disagree. Returns
+    `(lots, pending, fixes)`: `lots` is every open lot as `(lot, assignee)`;
+    `pending` one row per (lot, reviewer) — `lot`, `name`, `sha` (the frozen
+    head), `designated_ts`, `title`, `state`, `app` — oldest designation
+    first; `fixes` one row per (lot, debtor) — `lot`, `name` (the assignee),
+    `sha`, `blocked_ts` (earliest still-standing block), `blocked_by`,
+    `title`, `state`, `app` — oldest block first.
 
     A review is pending when an open lot's **latest** freeze designates the
     agent and no verdict of theirs names that head. The designees are the
@@ -926,6 +939,22 @@ def _pending_read(db, *, unreadable: Optional[list] = None) -> tuple[list, list]
     designated for this head (latest of the freeze, the mark naming them, a
     manual designation since the freeze): the start of the §9 clock.
 
+    #3288: a fix is due when the latest freeze carries a `blocked` verdict
+    that no later verdict of the **same actor** on the same head cancelled,
+    and no newer freeze moved the head (a re-freeze of the same SHA is the
+    same content: the block still stands). The debtor is the assignee, and
+    `blocked_ts` is the **earliest** still-standing block — « blocking
+    verdict → new freeze » starts at the first `blocked` of the actor's
+    uninterrupted run, not at the last (#17656 B1: a second `blocked` from
+    the same actor on the same head must not push the escalation back); an
+    `ok` (any non-`blocked` verdict) between two blocks restarts the clock at
+    the next one. With
+    designated seats, only a designated reviewer's block counts and a later GO
+    from another reviewer does not erase it (#2231); without a seat (empty
+    column or `-none`), the head's **last** verdict decides, exactly as
+    `progress._work_item_milestones` reads it. The block that discharges a
+    review (`pending`) is the one that opens its fix clock.
+
     #3047: the marks are read as **text** and parsed by `_mark_reviewers`.
     An unreadable mark carries no name — the latest one designates nobody, an
     older one proves no automatic name — and is reported in `unreadable` as
@@ -936,15 +965,18 @@ def _pending_read(db, *, unreadable: Optional[list] = None) -> tuple[list, list]
     rows = db.query(_PENDING_FACTS_SQL)
     lots: list = []
     pending: list = []
+    fixes: list = []
     for row in rows or ():
         try:
             lot_id = int(row["lot"])
         except (KeyError, TypeError, ValueError):
             continue
-        lots.append((lot_id, str(row.get("assignee") or "").strip()))
+        assignee = str(row.get("assignee") or "").strip()
+        lots.append((lot_id, assignee))
         frozen_sha = str(row.get("freeze_sha") or "").strip()
         if not frozen_sha:
             continue
+        freeze_ts = row.get("freeze_ts")
         marks: dict = {}
         for note_id, note in zip(row.get("mark_ids") or (), row.get("mark_notes") or ()):
             names = _mark_reviewers(note)
@@ -959,7 +991,11 @@ def _pending_read(db, *, unreadable: Optional[list] = None) -> tuple[list, list]
         for note, ts in zip(row.get("manual_notes") or (), row.get("manual_ts") or ()):
             name = str(note or "")[len("reviewer "):-len(" designated")]
             manual[name] = max(float(ts), manual.get(name, float(ts)))
-        rendered = list(zip(row.get("verdict_actors") or (), row.get("verdict_shas") or ()))
+        verdicts = list(zip(row.get("verdict_actors") or (),
+                            row.get("verdict_shas") or (),
+                            row.get("verdict_kinds") or (),
+                            row.get("verdict_ts") or ()))
+        rendered = [(actor, sha) for actor, sha, _kind, _at in verdicts]
         seen: set = set()
         for raw in row.get("reviewers") or ():
             name = str(raw or "").strip()
@@ -973,7 +1009,7 @@ def _pending_read(db, *, unreadable: Optional[list] = None) -> tuple[list, list]
                    for actor, sha in rendered):
                 continue
             since = [float(ts) for ts in (
-                row.get("freeze_ts"),
+                freeze_ts,
                 row.get("mark_ts") if name in effective else None,
                 manual.get(name)) if ts is not None]
             pending.append({"lot": lot_id, "name": name, "sha": frozen_sha,
@@ -981,8 +1017,69 @@ def _pending_read(db, *, unreadable: Optional[list] = None) -> tuple[list, list]
                             "title": row.get("title") or "",
                             "state": row.get("state") or "",
                             "app": row.get("app") or ""})
+        # #3288 : la correction due, calculée sur les mêmes verdicts.
+        if not assignee:
+            continue
+        # #17656 (B1) : le début du blocage est le premier `blocked` d'une
+        # série ininterrompue du même acteur sur la tête gelée ; un `ok`
+        # entre deux blocages repart l'horloge au blocage suivant. Le dernier
+        # verdict de chaque acteur tranche (un ok lève son blocage).
+        streaks: dict = {}
+        overall = None
+        for actor, sha, kind, at in verdicts:
+            actor = str(actor or "").strip()
+            if not actor:
+                continue
+            at = float(at) if at is not None else None
+            sha = str(sha or "").strip()
+            applies = (rd._same_freeze(frozen_sha, sha) if sha
+                       else (freeze_ts is not None and at is not None
+                             and at >= float(freeze_ts)))
+            if not applies:
+                continue
+            kind = str(kind or "").strip().lower()
+            entry = streaks.setdefault(actor.lower(),
+                                       {"actor": actor, "kinds": [], "at": []})
+            entry["kinds"].append(kind)
+            entry["at"].append(at)
+            overall = (actor, kind, at)
+
+        def _block_start(entry: dict) -> float | None:
+            """Premier `blocked` de la série finale de cet acteur."""
+            index = len(entry["kinds"]) - 1
+            while index > 0 and entry["kinds"][index - 1] == "blocked":
+                index -= 1
+            return entry["at"][index]
+
+        seats = {str(name or "").strip().lower()
+                 for name in (row.get("reviewers") or ())
+                 if str(name or "").strip() not in ("", "-none")}
+        if seats:
+            blockers = [(_entry["actor"], _block_start(_entry))
+                        for key, _entry in streaks.items()
+                        if key in seats and _entry["kinds"][-1] == "blocked"]
+        else:
+            blockers = ([(streaks[overall[0].lower()]["actor"],
+                          _block_start(streaks[overall[0].lower()]))]
+                        if overall is not None and overall[1] == "blocked"
+                        else [])
+        if blockers:
+            first = min(blockers, key=lambda v: (v[1] is None, v[1] or 0.0, v[0]))
+            fixes.append({"lot": lot_id, "name": assignee, "sha": frozen_sha,
+                          "blocked_ts": first[1], "blocked_by": first[0],
+                          "title": row.get("title") or "",
+                          "state": row.get("state") or "",
+                          "app": row.get("app") or ""})
     pending.sort(key=lambda r: (r["designated_ts"] is None, r["designated_ts"] or 0.0,
                                 r["lot"], r["name"]))
+    fixes.sort(key=lambda r: (r["blocked_ts"] is None, r["blocked_ts"] or 0.0,
+                              r["lot"]))
+    return lots, pending, fixes
+
+
+def _pending_read(db, *, unreadable: Optional[list] = None) -> tuple[list, list]:
+    """`(lots, pending)` of `_owed_read`, the reviews side (#3033)."""
+    lots, pending, _fixes = _owed_read(db, unreadable=unreadable)
     return lots, pending
 
 
@@ -1029,6 +1126,26 @@ def pending_reviews(db, agent: Optional[str] = None) -> list:
         return pending
     wanted = str(agent).strip().lower()
     return [row for row in pending if row["name"].lower() == wanted]
+
+
+def due_fixes(db, agent: Optional[str] = None) -> list:
+    """The fixes still owed after a blocking verdict, oldest block first (#3288).
+
+    One row per (lot, debtor): `lot`, `name` (the assignee who owes the fix),
+    `sha` (the frozen head that was blocked), `blocked_ts` (epoch of the
+    earliest still-standing block), `blocked_by` (its author), `title`,
+    `state`, `app`. `agent` restricts to one debtor (names compared without
+    case). The calculation is the `fixes` half of `_owed_read`, the same read
+    as the pending reviews (#3033): a block discharges the reviewer's queue
+    and opens the assignee's fix clock, one source for both. The read raises
+    when the base cannot be read: the caller says « unreadable », it never
+    shows an empty queue.
+    """
+    _lots, _pending, fixes = _owed_read(db)
+    if agent is None:
+        return fixes
+    wanted = str(agent).strip().lower()
+    return [row for row in fixes if row["name"].lower() == wanted]
 
 
 def _note_unreadable(db, lot: int, state: str,
@@ -1116,16 +1233,19 @@ def _notify(cfg, db, project: str, listing: Sequence[Mapping]) -> str:
 
 
 def _candidates(listing: Sequence[Mapping], *, loads: Mapping, project: str, families,
-                pilot: str) -> list:
+                pilot: str, closed_hosts: Sequence[str] = ()) -> list:
     """The project's candidates, its pilot removed.
 
     The project's agents plus the agents of another team that declare it under
     `relit:` (#3185). The pilot receives the capacity alert; the review stays
     with the others, so the two roles never collapse into one mail — even when
-    the pilot's card would make it a candidate.
+    the pilot's card would make it a candidate. `closed_hosts` (#3328) is the
+    host liveness evidence: an agent on a `draining`/`lost` host is not a
+    candidate, like any recipient agent-mail cannot reach.
     """
     candidates = rd.candidates_from_registry(listing, loads=loads, project=project,
-                                             families=families)
+                                             families=families,
+                                             closed_hosts=closed_hosts)
     if pilot:
         candidates = [candidate for candidate in candidates if candidate.name != pilot]
     return candidates
@@ -1337,8 +1457,13 @@ def prepare(cfg, db, lot: int, *, freeze: Optional[Mapping] = None,
     notify = _notify(cfg, db, project, listing)
     families = policy.families
     unreadable: list = []
+    # #3328 : l'hôte perdu est la preuve de non-remise que lit agent-mail
+    # (#3036). Une lecture en échec ne ferme aucun hôte : on ne devine pas
+    # qu'un hôte est mort, et le doute ne désigne personne d'autre.
+    closed_hosts = alert_briefs.claims_closed_hosts(db)
     candidates = _candidates(listing, loads=_loads(db, unreadable=unreadable),
-                             project=project, families=families, pilot=notify)
+                             project=project, families=families, pilot=notify,
+                             closed_hosts=closed_hosts)
     if unreadable:
         _note_unreadable(db, int(lot), str(item.get("state") or ""), unreadable)
     authors, unknown, correctors = review_authors.reading(
@@ -2442,15 +2567,15 @@ def _retry_resolved(db, lot: int, freeze: Mapping) -> bool:
     return str((effective[2] or {}).get("state") or "") in (rd.DESIGNATED, rd.NONE)
 
 
-def _retry_cursor_path(cfg) -> str:
-    """The retry cursor file, under the host state directory (never a repo)."""
+def _cursor_path(cfg, name: str) -> str:
+    """A cursor file, under the host state directory (never a repo)."""
     state = str(getattr(cfg, "state_dir", "") or "").strip()
-    return os.path.join(state, RETRY_CURSOR) if state else ""
+    return os.path.join(state, name) if state else ""
 
 
-def _read_retry_cursor(cfg) -> int:
-    """The last unavailable note examined, or 0 when absent/unreadable."""
-    path = _retry_cursor_path(cfg)
+def _read_cursor(cfg, name: str) -> int:
+    """The last id examined for this cursor, or 0 when absent/unreadable."""
+    path = _cursor_path(cfg, name)
     if not path:
         return 0
     try:
@@ -2461,9 +2586,9 @@ def _read_retry_cursor(cfg) -> int:
     return max(0, value)
 
 
-def _write_retry_cursor(cfg, cursor: int) -> None:
-    """Atomically records the cursor; a state problem never fails the retry."""
-    path = _retry_cursor_path(cfg)
+def _write_cursor(cfg, name: str, cursor: int) -> None:
+    """Atomically records the cursor; a state problem never fails the pass."""
+    path = _cursor_path(cfg, name)
     if not path:
         return
     tmp = "%s.%d.tmp" % (path, os.getpid())
@@ -2524,7 +2649,7 @@ def retry_pending(cfg, db, *, limit: int = RETRY_LIMIT) -> dict:
         limit = max(0, int(limit))
     except (TypeError, ValueError):
         limit = RETRY_LIMIT
-    cursor = _read_retry_cursor(cfg)
+    cursor = _read_cursor(cfg, RETRY_CURSOR)
     try:
         rows = _retry_notes(db, cursor)
         if not rows and cursor:
@@ -2584,10 +2709,261 @@ def retry_pending(cfg, db, *, limit: int = RETRY_LIMIT) -> dict:
     # Always move past what this pass examined, even when no lot was attempted:
     # the next pass must not re-read the same resolved/stale notes.
     if last > cursor or cursor == 0:
-        _write_retry_cursor(cfg, last)
+        _write_cursor(cfg, RETRY_CURSOR, last)
     out["summary"] = ("%d attempted: %d designated, %d waiting, %d none,"
                       " %d unavailable, %d manual, %d stale, %d skipped"
                       % (attempted, out["designated"], out["waiting"],
                          out["none"], out["unavailable"], out["manual"],
                          out["stale"], out["skipped"]))
+    return out
+
+
+#: #3328 : journal prefix of a seat reattributed because its reviewer became
+#: unreachable (host closed, stopped/dead, absent). The examined names are in
+#: the prefix, so a later loss of the replacement is a new reassignment while a
+#: pass that could not replace the same names never loops.
+REASSIGN_PREFIX = "review-designation-reassign:"
+#: #3328 : the bounded scan of lots whose automatic designation is examined.
+REASSIGN_SCAN = 200
+#: #3328 : the reassignment scan's cursor, under the host state directory. A
+#: pass resumes after the last lot examined and wraps once at the end, so a
+#: backlog of non-actionable seats cannot pin the bounded window.
+REASSIGN_CURSOR = "review-designation-reassign.cursor"
+
+
+def _unreachable_reviewer(row: Optional[Mapping], closed_hosts: set) -> str:
+    """Why a designated reviewer will not read its request, or "" (#3328).
+
+    The evidence is the one agent-mail uses for a lost recipient
+    (`alert_briefs._unavailable`, #3036): the host's claims are closed, or the
+    agent is stopped/dead or no longer run by the executor. A missing lease is
+    deliberately not read: an idle reviewer is woken by the request mail. A
+    pause is not read either — the agent comes back and its seat is not lost.
+    """
+    if row is None:
+        return "absent from the registry"
+    if (row.get("mode") or "execute") != "execute":
+        return "mode %s" % (row.get("mode"),)
+    status = str(row.get("status") or "").strip().lower()
+    if status in ("stopped", "dead"):
+        return "status %s" % status
+    host = str(row.get("host") or "").strip()
+    if host and host in closed_hosts:
+        return "host %s: claims closed" % host
+    return ""
+
+
+def _reviewer_rows(listing: Iterable[Mapping]) -> dict:
+    """The registry rows by canonical name, aliases included (#3328).
+
+    An alias resolves to the current row: a renamed agent is still reachable
+    at its new host, and its old name in an old mark must not look dead."""
+    by_name: dict = {}
+    for row in listing or ():
+        row = dict(row or {})
+        name = str(row.get("name") or "").strip()
+        if not name:
+            continue
+        by_name.setdefault(name, row)
+        aliases = row.get("aliases") or ()
+        if isinstance(aliases, str):
+            aliases = [aliases]
+        try:
+            for alias in aliases:
+                alias = str(alias or "").strip()
+                if alias:
+                    by_name.setdefault(alias, row)
+        except TypeError:
+            continue
+    return by_name
+
+
+def _unreachable_lots(db, *, after: int, hosts: Sequence[str],
+                      scan: int = REASSIGN_SCAN) -> list:
+    """Open lots whose reviewer column names an unreachable agent (#3328).
+
+    The filter runs **before** the bounded window: 200 older healthy lots
+    cannot hide the 201st whose seat is lost. Each name of the column is
+    unnested, so a name absent from the registry is seen even beside a live
+    one — the former `r.name = ANY(w.reviewers)` join kept the live row and
+    never produced the missing one. A name is reachable when a registry row
+    (or one of its aliases) is `execute`, not `stopped`/`dead`, on a host
+    whose claims are open.
+
+    The window is ordered by lot id and starts after `after`; the caller
+    wraps to 0 at the end and persists the last examined id, so a backlog of
+    rows that need no action cannot starve the rows behind it.
+    """
+    host_sql = ""
+    params: list = [int(after)]
+    hosts = [str(host).strip() for host in hosts or () if str(host).strip()]
+    if hosts:
+        host_sql = (" AND r.host NOT IN (%s)"
+                    % ", ".join(["%s"] * len(hosts)))
+        params.extend(hosts)
+    params.append(int(scan))
+    return db.query(
+        "SELECT w.id, w.state, w.reviewers FROM work_items w"
+        " WHERE w.state NOT IN ('merged', 'promoted', 'closed')"
+        "   AND w.reviewers IS NOT NULL AND cardinality(w.reviewers) > 0"
+        "   AND w.id > %s"
+        "   AND EXISTS ("
+        "     SELECT 1 FROM unnest(w.reviewers) AS rv(name)"
+        "     WHERE NOT EXISTS ("
+        "       SELECT 1 FROM agent_registry r"
+        "       WHERE (r.name = rv.name"
+        "              OR rv.name = ANY(coalesce(r.aliases, '{}'::text[])))"
+        "         AND r.status NOT IN ('stopped', 'dead')"
+        "         AND r.mode = 'execute'"
+        + host_sql +
+        "     )"
+        "   )"
+        " ORDER BY w.id ASC LIMIT %s", tuple(params))
+
+
+def reassign_unreachable(cfg, db, *, limit: int = RETRY_LIMIT) -> dict:
+    """Replays the designation of a lot whose reviewer became unreachable.
+
+    #3328 : the freeze hook now excludes a closed host, but a designation
+    written before the host was lost keeps a dead seat: the request sits in a
+    mailbox nobody will read, and the freeze waits for a verdict that cannot
+    come. On the next runner pass, an open lot whose **effective automatic**
+    mark of its latest freeze names an unreachable reviewer is re-designated on
+    the same freeze (`force=True`), with the usual selection (another agent of
+    the same family, else an explicit wait and the pilot's capacity alert). The
+    seat is journaled once per `(freeze, unreachable names)`: a replacement
+    that later dies is a new loss and is handled again; a pass that cannot
+    replace the same names does not loop.
+
+    The pass reads only machine evidence (registry, host lifecycle, journal)
+    and never raises: the runner logs the summary. It does not touch a manual
+    designation, a name the pilot already removed from the reviewer column, a
+    carried verdict mark, a waiting mark, or a lot where the mark belongs to an
+    older freeze. A registry or journal read failure skips the pass instead of
+    moving seats on a doubt.
+    """
+    out = {"examined": 0, "reassigned": 0, "waiting": 0, "skipped": 0,
+           "errors": [], "summary": ""}
+    try:
+        limit = max(0, int(limit))
+    except (TypeError, ValueError):
+        limit = RETRY_LIMIT
+    cursor = _read_cursor(cfg, REASSIGN_CURSOR)
+    try:
+        from .storage.postgres.work import has_reviewers
+        if not has_reviewers(db):
+            out["summary"] = "no reviewer column: nothing to reassign"
+            return out
+        listing = registry.overview(db)
+        if not listing:
+            out["summary"] = "registry unreadable or empty: no reassignment"
+            return out
+        by_name = _reviewer_rows(listing)
+        closed = alert_briefs.claims_closed_hosts(db)
+        hosts = [str(host).strip() for host in closed if str(host).strip()]
+        # #3328 (relecture) : le filtre est dans la requête, AVANT la fenêtre
+        # bornée. Les 200 lots anciens sains ne peuvent plus masquer le 201e
+        # dont le siège est perdu ; le curseur fait avancer une passe dont les
+        # lignes examinées ne demandent rien, puis se replie une fois au bout.
+        rows = _unreachable_lots(db, after=cursor, hosts=hosts)
+        if not rows and cursor:
+            cursor = 0
+            rows = _unreachable_lots(db, after=0, hosts=hosts)
+        if not rows:
+            if cursor:
+                # The queue is empty: the next pass starts at the oldest lot
+                # again instead of re-reading an exhausted window.
+                _write_cursor(cfg, REASSIGN_CURSOR, 0)
+            out["summary"] = "no unreachable evidence"
+            return out
+    except Exception as exc:  # noqa: BLE001 - the pass never breaks the caller
+        out["errors"].append("%s: %s" % (type(exc).__name__, str(exc)[:200]))
+        out["summary"] = "no reassignment: inputs unreadable"
+        return out
+    attempted = 0
+    last = cursor
+    for row in rows or ():
+        try:
+            lot = int(row.get("id") or 0)
+            state = str(row.get("state") or "")
+        except (TypeError, ValueError):
+            continue
+        if not lot:
+            continue
+        if attempted >= limit:
+            # budget spent: the cursor stops before this row, which the next
+            # pass examines first instead of starving behind it.
+            break
+        # The cursor moves over every row a pass examines, including a row
+        # that raises: a poison seat is retried after the wrap, never at the
+        # cost of the rows behind it.
+        last = max(last, lot)
+        try:
+            freeze = _latest_freeze(db, lot)
+            if freeze is None:
+                out["skipped"] += 1
+                continue
+            freeze_id = int(freeze.get("id") or 0)
+            mark = _effective_mark(db, lot, freeze_id,
+                                   since_ts=float(freeze.get("at_ts") or 0.0))
+            if mark is None or mark[1] != "designation" \
+                    or str((mark[2] or {}).get("state") or "") != rd.DESIGNATED:
+                out["skipped"] += 1
+                continue
+            dead = []
+            column = {str(name or "").strip()
+                      for name in (row.get("reviewers") or ()) if str(name or "").strip()}
+            for reviewer in (mark[2] or {}).get("reviewers") or ():
+                name = str((reviewer or {}).get("name") or "").strip()
+                if not name or name not in column:
+                    # The pilot already removed the seat from the column: the
+                    # mark is history, not a live designation to move.
+                    continue
+                why = _unreachable_reviewer(by_name.get(name), closed)
+                if why:
+                    dead.append((name, why))
+            if not dead:
+                out["skipped"] += 1
+                continue
+            out["examined"] += 1
+            names = ",".join(sorted(name for name, _why in dead))
+            prefix = "%s%d:%d:%s:" % (REASSIGN_PREFIX, lot, freeze_id, names)
+            since = float(freeze.get("at_ts") or 0.0)
+            if storage.of(db).work.events_noted(prefix, since, ids=[lot]):
+                out["skipped"] += 1
+                continue
+            attempted += 1
+            result = designate(cfg, db, lot, freeze=freeze, force=True)
+        except Exception as exc:  # noqa: BLE001 - one lot never stops the pass
+            out["errors"].append("#%d: %s: %s"
+                                 % (lot, type(exc).__name__, str(exc)[:160]))
+            continue
+        replaced = [str((reviewer or {}).get("name") or "").strip()
+                    for reviewer in (result or {}).get("reviewers") or ()]
+        why_text = "; ".join("%s (%s)" % (name, why) for name, why in dead)
+        if str((result or {}).get("state") or "") == rd.DESIGNATED:
+            out["reassigned"] += 1
+            tail = "replaced by %s" % ", ".join(replaced)
+        elif str((result or {}).get("state") or "") == rd.WAITING:
+            out["waiting"] += 1
+            tail = "no replacement: %s" % (result.get("why") or "waiting")
+        else:
+            tail = "designation replayed: %s" % (result.get("why") or "unchanged")
+        try:
+            storage.of(db).work.note(
+                lot, state,
+                "%s%d:%d:%s: reviewer(s) unreachable: %s; %s"
+                % (REASSIGN_PREFIX, lot, freeze_id, names, why_text, tail),
+                SENDER)
+        except Exception as exc:  # noqa: BLE001 - the mark is already written
+            out["errors"].append("#%d note: %s: %s"
+                                 % (lot, type(exc).__name__, str(exc)[:160]))
+    # Move past what the pass examined even when nothing was attempted: the
+    # next pass starts after it and wraps once at the end, so a backlog of
+    # non-actionable seats cannot pin the window forever.
+    if last > cursor or cursor == 0:
+        _write_cursor(cfg, REASSIGN_CURSOR, last)
+    out["summary"] = ("%d examined: %d reassigned, %d waiting, %d skipped"
+                      % (out["examined"], out["reassigned"], out["waiting"],
+                         out["skipped"]))
     return out

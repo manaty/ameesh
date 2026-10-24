@@ -257,6 +257,44 @@ class NotifyOnlyTest(unittest.TestCase):
         args = Namespace(only=["ci"], once=False, dry_run=False)
         self.assertEqual(notify.cmd_notify(self._cfg(), notify.NotifyConfig(), args), 2)
 
+    def test_skip_is_accepted_in_a_service_loop_and_keeps_other_passes(self):
+        # #3327: the drop-in excludes the role-timer passes; the loop must
+        # accept it, and the notifier receives the exclusion.
+        args = notify.build_parser().parse_args(
+            ["--skip", "issues,github-watch,ci", "--dry-run"])
+        fake = mock.Mock()
+        fake.run_pass = mock.Mock(return_value=[])
+        fake.run_local_pass = mock.Mock()
+        with mock.patch.object(notify, "Notifier", return_value=fake) as ctor, \
+                mock.patch.object(notify.db_mod, "connect", return_value=fake), \
+                mock.patch.object(notify.db_mod, "require_schema"), \
+                mock.patch.object(notify.time, "sleep", side_effect=KeyboardInterrupt):
+            self.assertEqual(notify.cmd_notify(self._cfg(), notify.NotifyConfig(), args), 0)
+        self.assertEqual(ctor.call_args.kwargs["skip"],
+                         frozenset({"issues", "github-watch", "ci"}))
+        fake.run_pass.assert_called_once()
+
+    def test_skip_refuses_a_pass_without_a_role_timer(self):
+        args = notify.build_parser().parse_args(["--skip", "take", "--dry-run"])
+        self.assertEqual(notify.cmd_notify(self._cfg(), notify.NotifyConfig(), args), 2)
+
+    def test_skip_keeps_take_and_drops_only_the_role_timer_passes(self):
+        notifier = notify.Notifier(
+            self._cfg(), notify.NotifyConfig(), dry_run=True,
+            take={"enabled": True}, wip={"apply": False},
+            skip={"issues", "github-watch", "ci"})
+        with mock.patch.object(notifier, "_github_inputs") as github, \
+                mock.patch.object(notifier, "_github_issues") as issues, \
+                mock.patch.object(notifier, "_ci_failures") as ci, \
+                mock.patch.object(notifier, "_auto_take") as take, \
+                mock.patch.object(notifier, "_wip_sweep") as wip:
+            notifier.run_pass(None, current=[])
+        github.assert_not_called()
+        issues.assert_not_called()
+        ci.assert_not_called()
+        take.assert_called_once()
+        wip.assert_called_once()
+
     def test_only_ci_takes_no_state_lock_and_runs_no_alert_pass(self):
         args = notify.build_parser().parse_args(["--once", "--only", "ci"])
         fake = mock.Mock()

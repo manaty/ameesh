@@ -1065,7 +1065,11 @@ The `installer` step follows the same practice.
    to about 130 s.
 7. `poste.sh controler`: `ameesh doctor`, `ameesh budget`,
    `ameesh accounts list`, `ameesh projects`, `ameesh alerts`, failed
-   units, `doctor` of the old database.
+   units, `doctor` of the old database. It also proves that the live
+   `MainPID` of `ameesh-notify` and of **every active runner** really executes
+   the current venv, from its concrete `argv[0]` in `/proc`: the stable
+   `ExecStart` launcher (#1969) proves nothing for a process already started
+   before the switch (#3311).
 
 ### Server — `deploy/mise-a-jour/vm.sh` (from the workstation)
 
@@ -1088,6 +1092,7 @@ personas run under `ameesh-runner@<p>` (system service, user
    same lease check as `poste.sh redemarrer` (#502), the database clock and
    the unit's `--runner-id` being read on the server.
 4. `vm.sh controler`: active units, fifteen log lines per persona,
+   the live `MainPID`'s concrete `argv[0]` against the current venv (#3311),
    `ameesh show`, `ameesh doctor` on the server.
 
 `/opt/ameesh/src` only keeps the files of the installed commit. Since
@@ -1365,6 +1370,14 @@ path (`venv-<sha7>/lib/pythonX/site-packages`) — a process already running
 keeps importing from **its** version, whatever a later switch does (review
 B1 of 16/10: a process launched through a symlinked venv kept the symlink
 path and could mix old and new submodules).
+
+The per-turn `ameesh` / `agent-mail` shims (#2763) point at that same stable
+launcher when the `bascule.py` marker is present: they resolve `venv-courant`
+at each call instead of naming the runner's versioned venv. Two runners
+started on different versions therefore write the **same** shim instead of
+overwriting the shared directory with their own path; the tool version of a
+turn no longer depends on the last runner that started one (#3311). Without
+the marker (tools venv, worktree, CI) the shim keeps the running venv.
 
 `activer` only replaces the `venv-courant` symlink (temp + `rename()`), so
 there is no window without a live version. The **first** conversion of a real
