@@ -1,0 +1,32 @@
+retry: 3000
+
+: heartbeat
+
+id: 25509702-205862-6ac87b933f10954et00000001j30917e9fb26e449d
+event: lot.updated
+data: {"data": {"actor": "ameesh", "assignee": "mesh-design", "lot": 3393, "state": "intake"}, "id": 205862, "object": "lot:3393", "project": "ameesh", "ts": 1792868413.111786, "type": "lot.updated"}
+
+id: 25509702-205863-6ac87b933f10954et00000001j30917e9fb26e449d
+event: lot.updated
+data: {"data": {"actor": "ameesh", "assignee": "mesh-design", "lot": 3393, "state": "intake"}, "id": 205863, "object": "lot:3393", "project": "ameesh", "ts": 1792868413.111786, "type": "lot.updated"}
+
+id: 25509802-205864-6ac87b933f10954et00000001j30917e9fb26e449d
+event: thread.entry
+data: {"data": {"author": "agent:ameesh", "entry": "ameesh/3393#2968", "lot": "3393", "project": "ameesh"}, "id": 205864, "object": "thread:ameesh/3393", "project": "ameesh", "ts": 1792868419.820587, "type": "thread.entry"}
+
+id: 25509830-205865-6ac87b933f10954et00000001j30917e9fb26e449d
+event: lot.updated
+data: {"data": {"actor": "ameesh", "assignee": "mesh-design", "lot": 3393, "state": "intake"}, "id": 205865, "object": "lot:3393", "project": "ameesh", "ts": 1792868420.187174, "type": "lot.updated"}
+
+id: 25509847-205866-6ac87b933f10954et00000001j30917e9fb26e449d
+event: thread.entry
+data: {"data": {"author": "agent:ameesh-cx1", "entry": "ameesh/_projet#27659311", "lot": null, "project": "ameesh"}, "id": 205866, "object": "thread:ameesh", "project": "ameesh", "ts": 1792868420.726803, "type": "thread.entry"}
+
+id: 25509877-205867-6ac87b933f10954et00000001j30917e9fb26e449d
+event: turn.started
+data: {"data": {"agent": "ameesh-cx1", "host": "ameesh-agents-2", "leased": true, "lot": "3371", "mode": "execute", "previous": "idle", "status": "running"}, "id": 205867, "object": "agent:ameesh-cx1", "project": "ameesh", "ts": 1792868421.389434, "type": "turn.started"}
+
+id: 25509899-205868-6ac87b933f10954et00000001j30917e9fb26e449d
+event: lot.updated
+data: {"data": {"actor": "ameesh", "assignee": "ameesh-cx1", "lot": 3371, "state": "intake"}, "id": 205868, "object": "lot:3371", "project": "ameesh", "ts": 1792868422.798283, "type": "lot.updated"}
+

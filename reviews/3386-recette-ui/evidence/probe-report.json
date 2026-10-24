@@ -1,0 +1,173 @@
+{
+  "base": "http://127.0.0.1:8780",
+  "started": "2026-10-24T18:50:16.269Z",
+  "steps": [
+    {
+      "step": "page chargée",
+      "url": "http://127.0.0.1:8780/ui/",
+      "title": "ameesh"
+    },
+    {
+      "step": "connecté",
+      "header": "ameesh Connecté à human:smichea Maillage 0.1.0, mode local"
+    },
+    {
+      "step": "projets",
+      "state": {
+        "tag": "ameesh-projects",
+        "data": true,
+        "loading": false,
+        "live": "connected",
+        "error": "",
+        "rows": 62,
+        "text": "Projets En direct Actualiser ameesh Lots ouverts45 Dépense payante, 24 h20,5212 $US Usage estimé, 24 h439,2758 $US Non lus25 ameesh-dev3 — Au travail · #3333 Panier « #3288 » du 2026-10-24 : défauts non bloquants (N, P2, P3) ameesh-dev5 — Au travail · #3386 Feuille de route du 13/10 (U1) : recette live de /ui/ sur un hôte staging (projets, chronologie, agents, décisions, SSE) mesh-design — Au travail · #3392 Feuille de route du 13/10 (V1) : pilote de provisionnement réel (déplacement d'un agent "
+      }
+    },
+    {
+      "step": "agent",
+      "state": {
+        "tag": "ameesh-agent",
+        "data": true,
+        "loading": false,
+        "live": "connected",
+        "error": "",
+        "rows": 1,
+        "text": "Agent En direct Actualiser ameesh-dev5 ÉtatAu travail Motifevents turn (deepseek) Hôteameesh-agents-1 Harnaisdeepseek Depuis24 oct. 2026, 20:39 Non lus1 Dépense payante, 24 h2,6654 $US Usage estimé, 24 h2,6654 $US Lot#3386 Feuille de route du 13/10 (U1) : recette live de /ui/ sur un hôte staging (projets, chronologie, agents, décisions, SSE) Activité actuelleRecette live /ui/ #3386 — test SSE (message de test, sera lu au tour suivant)"
+      }
+    },
+    {
+      "step": "decisions",
+      "state": {
+        "tag": "ameesh-decisions",
+        "data": true,
+        "loading": false,
+        "live": "connected",
+        "error": "",
+        "rows": 54,
+        "text": "Décisions En direct Actualiser Demandes des agents Demande n°132239 · ameesh Tours d'exécution externe natifs (IMA #2480, suite #2202) : #120571 a écarté pour le pilote l'API qui ouvre le tour, et IMA demande maintenant que son exécuteur (Job Kubernetes / pod) ouvre lui-même le tour ameesh, déclare son usage par modèle et soit révoqué par heartbeat. Étude : docs/design/etudes/3309-external-execution-turns.md, branche lot/3309-external-execution-turns. Approuvez-vous la v2 de l'exécuteur médié (a"
+      }
+    },
+    {
+      "step": "chronologie",
+      "state": {
+        "tag": "ameesh-timeline",
+        "data": true,
+        "loading": false,
+        "live": "connected",
+        "error": "",
+        "rows": 153,
+        "text": "Chronologie En direct Actualiser Chronologie : développement, relecture, puis approbation à fusion. Les dates figurent aussi dans le tableau. ameesh · 23 oct. 2026, 20:51 – 24 oct. 2026, 20:51 LotÉtatResponsable du lotDemandéGeléReluFusionné #114 Cœur générique et modules métier (L97 à L104) — NON URGENT Fusionné ameesh-cx1 10 oct. 2026, 20:1219 oct. 2026, 00:2623 oct. 2026, 20:2224 oct. 2026, 00:16#390 L65: macOS launchd services (ameesh service install), install doc with remote database only, "
+      }
+    },
+    {
+      "step": "fil avant",
+      "state": {
+        "tag": "ameesh-thread",
+        "data": true,
+        "loading": false,
+        "live": "connected",
+        "error": "",
+        "rows": 6,
+        "text": "Fil En direct Actualiser agent:ameesh → agent:ameesh-dev5 24 oct. 2026, 20:39Lot #3386, taken on your own (L165): you were idle and this lot of your team had no taker: Feuille de route du 13/10 (U1) : recette live de /ui/ sur un hôte staging (projets, chronologie, agents, décisions, SSE) Lot U1 de l'inventaire #3378. Classe légère. Les lots L84–L93 sont fusionnés et actifs, mais aucune recette live n'a été faite. Fait quand : ameesh serve tourne sur un hôte staging (VM, pas pc-smichea), l'URL et"
+      }
+    },
+    {
+      "step": "fil après",
+      "delayMs": 974,
+      "sseEventsBefore": 15,
+      "sseEventsAfter": 19,
+      "state": {
+        "tag": "ameesh-thread",
+        "data": true,
+        "loading": false,
+        "live": "connected",
+        "error": "",
+        "rows": 8,
+        "text": "Fil En direct Actualiser agent:ameesh → agent:ameesh-dev5 24 oct. 2026, 20:39Lot #3386, taken on your own (L165): you were idle and this lot of your team had no taker: Feuille de route du 13/10 (U1) : recette live de /ui/ sur un hôte staging (projets, chronologie, agents, décisions, SSE) Lot U1 de l'inventaire #3378. Classe légère. Les lots L84–L93 sont fusionnés et actifs, mais aucune recette live n'a été faite. Fait quand : ameesh serve tourne sur un hôte staging (VM, pas pc-smichea), l'URL et"
+      }
+    }
+  ],
+  "errors": [],
+  "sse": {
+    "requests": 1,
+    "status": 200,
+    "bytes": 5771,
+    "frames": 11,
+    "events": [
+      "lot.updated",
+      "lot.updated",
+      "thread.entry",
+      "thread.entry",
+      "thread.entry",
+      "thread.entry",
+      "lot.updated",
+      "lot.updated",
+      "thread.entry",
+      "thread.entry",
+      "lot.updated",
+      "lot.updated",
+      "lot.updated",
+      "thread.entry",
+      "thread.entry",
+      "thread.entry",
+      "cost.recorded",
+      "thread.entry",
+      "thread.entry"
+    ],
+    "firstFrame": "retry: 3000\n\n",
+    "error": null
+  },
+  "apiCalls": [
+    {
+      "path": "/api/v1/me",
+      "status": 401
+    },
+    {
+      "path": "/api/v1/me",
+      "status": 200
+    },
+    {
+      "path": "/api/v1/events",
+      "status": 200
+    },
+    {
+      "path": "/api/v1/projects",
+      "status": 200
+    },
+    {
+      "path": "/api/v1/agents/ameesh-dev5",
+      "status": 200
+    },
+    {
+      "path": "/api/v1/projects",
+      "status": 200
+    },
+    {
+      "path": "/api/v1/decisions",
+      "status": 200
+    },
+    {
+      "path": "/api/v1/projects/ameesh/progress",
+      "status": 200
+    },
+    {
+      "path": "/api/v1/threads/ameesh/3386",
+      "status": 200
+    },
+    {
+      "path": "/api/v1/threads/ameesh/3386",
+      "status": 200
+    },
+    {
+      "path": "/api/v1/threads/ameesh/3386",
+      "status": 200
+    }
+  ],
+  "console": [
+    {
+      "type": "error",
+      "text": "Failed to load resource: the server responded with a status of 401 (Unauthorized)"
+    }
+  ],
+  "finished": "2026-10-24T18:51:22.409Z"
+}

@@ -1,0 +1,8 @@
+ameesh serve: token created in /home/ameesh/.config/ameesh/serve-token (0600)
+ameesh serve: http://127.0.0.1:8780/api/v1 for human:smichea (Bearer token in /home/ameesh/.config/ameesh/serve-token)
+ameesh serve: "GET /api/v1/alerts" 200 -
+ameesh serve: "GET /api/v1/decisions" 200 -
+ameesh serve: "GET /api/v1/agents" 200 -
+ameesh serve: "GET /api/v1/projects" 200 -
+ameesh serve: "GET /api/v1/alerts" 200 -
+ameesh serve: "GET /api/v1/alerts" 200 -

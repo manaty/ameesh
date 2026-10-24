@@ -1,0 +1,51 @@
+Recette live /ui/ #3386 — mesures
+Hôte            : ameesh-agents-1 (VM staging, pas pc-smichea)
+Version recettée: f71d2bd478dc49ead174416bece221c646586220 (venv-courant, ameesh 1.20.0)
+Serveur         : ameesh serve --port 8780 --human human:smichea (écoute 127.0.0.1 seulement)
+Date            : 2026-10-24 18:42–19:05Z
+Navigateur      : Chromium 156 headless (Playwright 1.64.1), viewport 1440×1000, fr-FR, Europe/Paris
+
+API (curl, token local 0600 ; temps et taille de réponse)
+  GET /api/v1/projects/ameesh/progress            39,64 s   1 135 464 o
+  GET /api/v1/projects/ameesh/progress (2e)       38,46 s   1 126 607 o
+  GET /api/v1/projects/nexlink/progress           39,89 s   1 023 840 o
+  GET /api/v1/projects/ameesh/progress?since=1h   48,07 s   1 002 018 o
+  GET /api/v1/projects/ameesh/progress?since=6h   44,24 s   1 034 086 o
+  GET /api/v1/projects                             2,16 s      52 149 o  (puis 0,70 s)
+  GET /api/v1/agents                               9,50 s     137 118 o  (puis 3,70 s)
+  GET /api/v1/decisions                            0,94 s      22 593 o
+  GET /api/v1/alerts                              93,10 s     152 162 o
+  GET /api/v1/alerts (2e)                          95,74 s     151 638 o
+  GET /api/v1/alerts (3e)                         101,68 s     152 090 o
+
+CLI (même base, même version)
+  ameesh progress --json --project ameesh --no-versions   31,00 s
+  ameesh progress --json --project ameesh                 45,25 s
+  ameesh alerts --json                                    72,20 s   156 323 o
+
+Répartition du snapshot progress (1,1 Mo)
+  agents      481 679 o
+  roadmap     393 909 o
+  lots        222 078 o
+  projects     26 667 o
+  epics        11 451 o
+  decisions    11 068 o
+  budget        7 954 o
+  (le reste < 1 ko chacun)
+
+Écrans /ui/ (Playwright, suite du 24/10)
+  connexion → Projets               ~5 s   (dont saisie du jeton)
+  Projets → Agent                   ~3 s
+  Agent → Décisions                 ~6 s
+  Décisions → Chronologie (données) ~48 s   (18:50:30 → 18:51:18)
+  Fil avant → après courrier         974 ms  (SSE, sans rechargement)
+
+Flux SSE (navigateur, une connexion partagée sur ~66 s)
+  GET /api/v1/events  200  text/event-stream
+  11 trames lues, 5 771 o, 19 événements : lot.updated, thread.entry, turn.started,
+  cost.recorded ; heartbeat ; id: <tx-id-cluster> ; retry: 3000.
+  Preuve directe : curl -N /api/v1/events (35 s) → sse-raw.txt + sse-headers.txt.
+
+Service : démarré pour la recette (il ne tournait pas avant), arrêté après.
+Port 8780 : 0 écoute après l'arrêt ; le processus est zombie (reap par l'init).
+Jeton créé au premier démarrage, supprimé après la recette.

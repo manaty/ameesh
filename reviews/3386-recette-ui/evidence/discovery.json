@@ -1,0 +1,1 @@
+{"api": "/api/v1", "approve_url": null, "languages": ["fr", "en"], "mode": "local", "oidc_issuer": null, "openapi": "/api/v1/openapi.json", "organisation": null, "schema": "ameesh-discovery/1", "version": "0.1.0", "versions": ["v1"]}
