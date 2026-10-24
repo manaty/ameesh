@@ -44,12 +44,14 @@ le démarrage. Un nouvel échec pendant l’arrêt n’est jamais effacé.
 
 Quand `DRAIN_ATTENTE` est supérieur à 0 (0 par défaut : désactivé), c’est un
 interrupteur, pas un délai : au début du balayage de l’hôte, tous les agents
-vus en tour reçoivent une pause opérateur courte et nommée (drain, #2152).
-Les fins de tour se chevauchent : l’attente dépend du plus long tour restant,
-puis des arrêts et contrôles séquentiels, au lieu de leur somme (#3114).
-Aucun nouveau tour ne commence sous pause ; celle-ci reste en place jusqu’au
-démarrage de la persona. Chaque arrêt journalise sa durée d’attente. Un tour
-commencé après la première passe reçoit aussi son drain juste avant l’arrêt.
+en tour ou au repos (`idle`, `queued`) reçoivent une pause opérateur courte et
+nommée (drain, #2152). Les fins de tour se chevauchent : l’attente dépend du
+plus long tour restant, puis des arrêts et contrôles séquentiels, au lieu de
+leur somme (#3114). Une persona au repos mise en pause avant son premier tour
+n’ajoute pas ce tour à l’attente du balayage (#3120/N2). Aucun nouveau tour ne
+commence sous pause ; celle-ci reste en place jusqu’au démarrage de la persona.
+Chaque arrêt journalise sa durée d’attente. Un tour commencé après la première
+passe reçoit aussi son drain juste avant l’arrêt.
 `--not-after` est recalculé à chaque pose : il borne l’admission de la pause,
 sans faire expirer une pause déjà posée. La valeur ne mesure plus une attente d’un
 créneau « idle » ; aucune fenêtre « idle » n’est attendue. Le mesh journalise
@@ -67,13 +69,20 @@ non-execute. Si la
 réponse de la pause se perd (SSH coupé, JSON illisible), le script réconcilie
 par l’état réel : motif identique, le drain continue ; sinon il ne redémarre
 ni ne lève rien et le dit, en nommant l’agent, le motif exact et la commande
-conditionnelle de levée manuelle. Pose et levée sont des gestes d’opérateur :
+conditionnelle de levée manuelle. Une intention de pose incertaine garde son
+motif : une pose de rattrapage le réutilise et un `changed=false` est relu par
+l’état réel (motif identique = la nôtre) au lieu d’être classé étranger
+(#3120/B2). Sa barrière reste tenue jusqu’à l’échéance même si une pose de
+rattrapage est confirmée, pour exclure tout écrivain tardif (#3120/B3). Pose
+et levée sont des gestes d’opérateur :
 le CLI local refuse une session liée à un agent (`bad_actor`), donc `vm.sh`
 doit être lancé hors session d’agent ; l’acteur d’audit consigné est
 l’opérateur du poste (`--human`), jamais le compte `ameesh` de la VM
-(#2184/N6). Si la pose est refusée, cet agent est laissé en l’état sans
-redémarrage et les autres agents du balayage continuent ; un échec de levée
-est consigné, retenté à la sortie, et le code de retour le signale
+(#2184/N6). Si la pose est refusée, une persona en tour est laissée en
+l’état sans redémarrage et les autres agents du balayage continuent ; une
+persona au repos, qui n’a pas besoin du drain, redémarre sans lui (arrêt
+prouvé) et le script le dit (#3120/B1) ; un échec de levée est consigné,
+retenté à la sortie, et le code de retour le signale
 (#2184/N2) ; le verdict « NON levé » n’est écrit qu’après la dernière
 tentative (#2198/N3). Un CLI de
 cible antérieur à #2152 (sans `--expect-reason`) ou à #2184/R3 (sans

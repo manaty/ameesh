@@ -2,7 +2,8 @@
 """L132 : `stale_lot`, `plan_underused` et `idle_capacity` partent aussi, par
 courrier `event`, aux orchestrateurs et à l'auditeur, avec l'action attendue ;
 une fois par alerte, une relance après 6 h. L713 : `stale_lot` ne réveille plus
-l'auditeur, qui le lit à sa passe (`ameesh alerts --json`)."""
+l'auditeur, qui le lit à sa passe (`ameesh alerts --json`). #3274 : de même
+pour `plan_underused`, sauf si plus aucun orchestrateur n'est vivant."""
 from __future__ import annotations
 
 import time
@@ -164,8 +165,10 @@ class BriefsTest(unittest.TestCase):
                          ["orch-b"])
 
     def test_plan_underused(self):
+        # #3274 : lu à la passe de l'auditeur (comme `stale_lot`, L713) ; avec
+        # un orchestrateur vivant, il ne le réveille plus.
         briefs = alert_briefs.briefs(PLAN, self.listing, auditor_names=["auditeur"])
-        self.assertEqual(sorted(briefs), ["auditeur", "orch-b"])
+        self.assertEqual(sorted(briefs), ["orch-b"])
         self.assertIn("idle agents (dev2)", briefs["orch-b"])
         self.assertIn("--lot <id>", briefs["orch-b"])
         no_idle = alert_briefs.briefs(dict(PLAN, idle_agents=[]), self.listing)

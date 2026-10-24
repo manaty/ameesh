@@ -49,7 +49,10 @@ repos/<slug>/merges`, `base=<cible épinglée>`, `head=<tête publiée>`)
   chemin.
 
 La trace est le journal du lot (aucun état local) : `auto-merge armed …`,
-`disarmed …`, `merged …` et `not-armed …`, avec dépôt, PR, tête et cible. La
+`disarmed …`, `merged …`, `not-armed …` et `held …`, avec dépôt, PR, tête et
+cible. #3175 : un refus du passage (`pending`, `error`) n'est jamais muet ;
+`held …` en porte le motif, une fois par motif et par armement (le passage
+suivant qui refuse pour la même raison n'écrit rien). La
 publication et le passage d'un même porteur se sérialisent sous le bail
 `auto-merge:<lot>` ; le passage relit les marques sous ce bail.
 """
@@ -79,10 +82,10 @@ LOCK_TTL_S = 300.0
 AUTOMERGE_CALL_MARGIN_S = 180.0
 #: une marque du journal du lot ; un armement porte toujours sa cible
 MARK_RE = re.compile(
-    r"^auto-merge (?P<state>armed|disarmed|merged|not-armed) "
+    r"^auto-merge (?P<state>armed|disarmed|merged|not-armed|held) "
     r"repo=(?P<repo>[\w.-]+/[\w.-]+) pr=(?P<pr>\d+) sha=(?P<sha>[0-9a-f]{40})"
     r"(?: base=(?P<base>[\w./-]+))?(?: method=[a-z]+)?(?: required=(?P<required>\S+))?"
-    r"(?:\s|$)")
+    r"(?:\s|$)(?: *— *(?P<why>.*))?", re.S)
 #: marques qui referment un armement de la même PR
 CLOSING = ("disarmed", "merged")
 _SHA = re.compile(r"[0-9a-f]{40}")
@@ -106,18 +109,25 @@ def gh_of(runner):
 # journal
 # --------------------------------------------------------------------------
 
-def marks(db, lot: int, *, limit: int = 200) -> list[dict]:
+def marks(db, lot: int) -> list[dict]:
     """Les marques de fusion automatique du lot, de la plus ancienne à la plus
-    récente."""
+    récente.
+
+    La lecture porte sur les seules notes `auto-merge …` (#3279) : les notes
+    `held` d'un porteur armé pouvaient remplir la fenêtre de 200 événements de
+    `work.events` et en chasser la marque d'armement, faisant croire que rien
+    n'était armé. Une marque de contrôle ne dépend jamais du nombre de notes
+    qui la suivent."""
     out = []
-    for ev in work.events(db, int(lot), limit=limit) or ():
+    for ev in work.events_noted(db, int(lot), "auto-merge ", 0.0) or ():
         m = MARK_RE.match((ev.get("note") or "").strip())
         if m:
             out.append({"id": int(ev.get("id") or 0), "state": m.group("state"),
                         "repo": m.group("repo"), "pr": int(m.group("pr")),
                         "sha": m.group("sha"), "base": m.group("base") or "",
                         "required": tuple(unquote(name) for name in
-                                          (m.group("required") or "").split(",") if name)})
+                                          (m.group("required") or "").split(",") if name),
+                        "why": (m.group("why") or "").strip()})
     return sorted(out, key=lambda m: m["id"])
 
 
@@ -418,15 +428,25 @@ def merge_into(slug: str, target: str, sha: str, *, number: int, branch: str, ti
 
 
 def _verdicts(cfg, db, row: dict, milestones: list, *, slug: str, base: str,
-              base_sha: str = "") -> tuple:
+              base_sha: str = "", checkout: str = "", branch: str = "") -> tuple:
     """`fire.ready_verdicts` sur le porteur, avec le dépôt et le projet que le
     feu résout (dossier de l'assigné s'il porte ce dépôt, sinon le clone
-    déclaré du projet). Rend `(ok, raison, projet)` ; le projet résolu sert
-    ensuite à toute la porte de CI (R2, cx3). Une erreur refuse.
+    déclaré du projet, sinon `checkout`, le clone que le passage de l'hôte
+    déclare, `packet_watch.projects.<p>.repo`). Rend `(ok, raison, projet)` ;
+    le projet résolu sert ensuite à toute la porte de CI (R2, cx3). Une
+    erreur refuse.
 
     `base_sha` (#3091) est la cible résolue lue sur la PR (`baseRefOid`) :
     elle prouve la base de composition au lieu de dépendre de la fraîcheur de
-    la ref locale du checkout."""
+    la ref locale du checkout.
+
+    #3175 : sur ameesh-agents-2, le dossier de l'assigné (sur agents-1) est
+    absent et aucun `radar.projects` n'est déclaré ; la porte lisait git sans
+    dépôt et refusait chaque tour (« cannot read the composition members: git
+    not found »). Le clone du passage sert de repli, et un hôte sans aucun
+    clone le dit. Ce clone n'est celui d'aucun agent : la tête du porteur
+    (`branch`) et la cible y sont lues fraîches (`_fetch_into`) avant la
+    porte, qui ne fetch pas elle-même."""
     try:
         repo = fire._repo_of(db, row)
         if repo is not None and not fire._same_repository(repo, slug):
@@ -434,6 +454,20 @@ def _verdicts(cfg, db, row: dict, milestones: list, *, slug: str, base: str,
         project = fire._project(cfg, repo, slug)
         if repo is None:
             repo = fire._project_checkout(project)
+        if repo is None and checkout:
+            repo = fire._checkout(checkout)
+            if repo is not None and not fire._same_repository(repo, slug):
+                repo = None
+            if repo is not None:
+                error = _fetch_into(repo, (branch, base))
+                if error:
+                    return (False, "the pass clone %s cannot be refreshed for the review "
+                                   "gate: %s" % (repo, error), project)
+        if repo is None:
+            return (False, "no checkout of %s on this host to read the review gate: the "
+                           "assignee's folder is not here, and neither radar.projects.<p>.repo "
+                           "nor packet_watch.projects.<p>.repo names a clone of it" % slug,
+                    project)
         extra = {"base_sha": base_sha} if str(base_sha or "").strip() else {}
         ok, why, _klass = fire.ready_verdicts(cfg, db, row, milestones, repo=repo,
                                               project=project, target=base, **extra)
@@ -441,6 +475,24 @@ def _verdicts(cfg, db, row: dict, milestones: list, *, slug: str, base: str,
         return (False, "the review gate cannot be read: %s: %s" % (type(exc).__name__, exc),
                 None)
     return ok, why, project
+
+
+def _fetch_into(repo: str, branches) -> str:
+    """Rapatrie les objets des branches `branches` d'`origin` dans `repo`
+    (aucune branche locale déplacée, seules les refs de suivi `origin/*` ;
+    aucun `--depth`, canon §7) ; rend l'erreur, ou "" (#3175)."""
+    refs = ["refs/heads/%s" % name for name in branches if name]
+    if not refs:
+        return ""
+    try:
+        proc = subprocess.run(["git", "-C", repo, "fetch", "--quiet", "--no-tags",
+                               "origin"] + refs, capture_output=True, text=True,
+                              timeout=120)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return str(exc)
+    if proc.returncode != 0:
+        return (proc.stderr or proc.stdout or "exit %d" % proc.returncode).strip()[:300]
+    return ""
 
 
 def _required_ci(view: dict, required, project) -> dict:
@@ -477,14 +529,15 @@ def open_carriers(db, app: str) -> list[int]:
 
 
 def check(cfg, db, lot: int, *, gh, dry_run: bool = False,
-          actor: str = work.SYSTEM_SENDER) -> dict:
+          actor: str = work.SYSTEM_SENDER, checkout: str = "") -> dict:
     """Un porteur armé : le désarme si sa tête ou sa cible a changé, le
     fusionne si ses checks requis sont verts sur la tête publiée.
 
     `result` : `idle` (rien d'armé), `pending` (checks pas encore verts),
     `closed` (PR fusionnée ou fermée ailleurs), `disarmed`/`would-disarm`,
     `merged`/`would-merge`, `busy` (une publication tient le bail : au passage
-    suivant) ou `error`."""
+    suivant) ou `error` ; un `pending` ou un `error` d'un porteur armé laisse
+    son motif au journal du lot (`held …`, #3175)."""
     if not active(marks(db, lot)):
         return {"lot": lot, "result": "idle"}
     from . import pilot_gesture
@@ -498,18 +551,55 @@ def check(cfg, db, lot: int, *, gh, dry_run: bool = False,
         return {"lot": lot, "result": "busy"}
     try:
         return _check_locked(cfg, db, lot, gh=gh, dry_run=dry_run, actor=actor,
-                             handle=handle, fence=fence)
+                             handle=handle, fence=fence, checkout=checkout)
     finally:
         if handle is not None:
             _unlock(handle)
 
 
+#: les issues du passage qui refusent la fusion d'un porteur armé (#3175)
+REFUSALS = ("pending", "error")
+
+
 def _check_locked(cfg, db, lot: int, *, gh, dry_run: bool, actor: str,
-                  handle=None, fence=None) -> dict:
+                  handle=None, fence=None, checkout: str = "") -> dict:
     # relu sous le bail : une publication a pu réarmer depuis la première lecture
-    mine = active(marks(db, lot))
+    rows = marks(db, lot)
+    mine = active(rows)
     if mine is None:
         return {"lot": lot, "result": "idle"}
+    out = _gate_locked(cfg, db, lot, mine, gh=gh, dry_run=dry_run, actor=actor,
+                       handle=handle, fence=fence, checkout=checkout)
+    if out.get("result") in REFUSALS and not dry_run:
+        _held(db, lot, mine, rows, out, actor=actor, fence=fence)
+    return out
+
+
+def _held(db, lot: int, mine: dict, rows, out: dict, *, actor: str, fence=None) -> None:
+    """#3175 : consigne au lot le motif d'un refus du passage, une fois par
+    motif et par armement. Sur #2409 (h-1500), le passage refusait à chaque
+    tour sans rien écrire, et le bureau a fusionné à la main sans trace du
+    pourquoi. Le journal est une trace : son échec ne change pas l'issue."""
+    why = " ".join(str(out.get("why") or out.get("error") or "no reason given").split())
+    if out["result"] == "error":
+        why = "error: " + why
+    last = None
+    for row in rows or ():
+        if row["id"] < mine["id"]:
+            continue
+        if row["state"] == "held" and row["pr"] == mine["pr"] and row["sha"] == mine["sha"]:
+            last = row["why"]
+    if last == why:
+        return
+    try:
+        _note_fenced(db, fence, lot, "held", mine["repo"], mine["pr"], mine["sha"],
+                     "base=%s — %s" % (mine["base"], why), actor)
+    except Exception:  # noqa: BLE001 - la trace ne fait jamais tomber le passage
+        pass
+
+
+def _gate_locked(cfg, db, lot: int, mine: dict, *, gh, dry_run: bool, actor: str,
+                 handle=None, fence=None, checkout: str = "") -> dict:
     slug, number, sha, base = mine["repo"], mine["pr"], mine["sha"], mine["base"]
     out = {"lot": lot, "pr": number, "sha": sha, "base": base}
     try:
@@ -569,6 +659,8 @@ def _check_locked(cfg, db, lot: int, *, gh, dry_run: bool, actor: str,
     # paquet ; la ref locale du checkout de l'assigné peut être en retard.
     base_oid = str(view.get("base_oid") or "").strip().lower()
     extra = {"base_sha": base_oid} if base_oid else {}
+    if checkout:
+        extra.update(checkout=checkout, branch=view.get("branch") or "")
     ok, why, project = _verdicts(cfg, db, row, milestones, slug=slug, base=base,
                                  **extra)
     if not ok:
@@ -682,13 +774,17 @@ def _open_correction(db, row: dict, *, slug: str, number: int, sha: str, base: s
     return out
 
 
-def watch(cfg, db, app: str, *, gh=None, dry_run: bool = False) -> list[dict]:
-    """Tous les porteurs ouverts de `app` ; un porteur ne fait pas tomber l'autre."""
+def watch(cfg, db, app: str, *, gh=None, dry_run: bool = False,
+          checkout: str = "") -> list[dict]:
+    """Tous les porteurs ouverts de `app` ; un porteur ne fait pas tomber l'autre.
+
+    `checkout` : le clone que le passage de l'hôte déclare pour ce projet
+    (`packet_watch.projects.<p>.repo`), repli de la porte des avis (#3175)."""
     gh = gh or land._gh
     results = []
     for lot in open_carriers(db, app):
         try:
-            results.append(check(cfg, db, lot, gh=gh, dry_run=dry_run))
+            results.append(check(cfg, db, lot, gh=gh, dry_run=dry_run, checkout=checkout))
         except Exception as exc:  # noqa: BLE001 - un porteur ne fait pas tomber l'autre
             results.append({"lot": lot, "result": "error",
                             "error": "%s: %s" % (type(exc).__name__, exc)})

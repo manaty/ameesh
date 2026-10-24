@@ -627,7 +627,8 @@ class ReleaseTest(r2448.ReleaseFixtureMixin, unittest.TestCase):
                 mock.patch.object(fire, "required_checks",
                                   return_value=(("tests", 15368),)) as read, \
                 mock.patch.object(release_cutoff.radar, "commit_ci",
-                                  side_effect=lambda target, sha, **kw: seen.append(kw) or {}):
+                                  side_effect=lambda target, sha, **kw: seen.append(kw) or {}), \
+                mock.patch.object(release_cutoff, "suite_reading", return_value={"runs": []}):
             release_cutoff.ci_reading(self.project, "a" * 40)
             release_cutoff.ci_reading(self.project, "b" * 40)
         self.assertEqual(seen, [{"required": (("tests", 15368),)}] * 2)
@@ -653,7 +654,8 @@ class ReleaseTest(r2448.ReleaseFixtureMixin, unittest.TestCase):
                 mock.patch.object(fire, "required_checks",
                                   side_effect=fire.land.ForbiddenLandError("HTTP 403")), \
                 mock.patch.object(release_cutoff.radar, "commit_ci",
-                                  side_effect=lambda target, sha, **kw: {"required": kw}):
+                                  side_effect=lambda target, sha, **kw: {"required": kw}), \
+                mock.patch.object(release_cutoff, "suite_reading", return_value={"runs": []}):
             reading = release_cutoff.ci_reading(self.project, "a" * 40)
         self.assertEqual(reading["required"], {"required": ()})
         self.assertTrue(reading["required_unread"])

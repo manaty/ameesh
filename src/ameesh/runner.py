@@ -1498,6 +1498,35 @@ class AgentWorker(threading.Thread):
     def idle_due(self) -> bool:
         return (not self.nudged) and (time.monotonic() - self.last_activity >= self.runner.idle_nudge)
 
+    def _idle_pilot(self) -> str:
+        """#3273 : le pilote à qui l'agent au repos dit qu'il n'a rien à faire.
+
+        Le premier pilote d'un projet de l'agent, projet primaire d'abord
+        (`alert_briefs.project_pilots`, la règle des briefs), jamais l'agent
+        lui-même. Agent sans projet,
+        registre illisible ou aucun pilote : "" — la relance ne fait alors
+        écrire personne (jamais un pilote d'une autre équipe par défaut)."""
+        try:
+            from . import alert_briefs, projects as projects_mod
+            listing = registry.overview(self.db)
+            row = next((r for r in listing if r.get("name") == self.name),
+                       self.agent or {})
+            by_name = {r["name"]: r for r in listing}
+            for project in projects_mod.agent_projects(row or {}):
+                for pilot in alert_briefs.project_pilots(project, listing,
+                                                         cfg=self.cfg, db=self.db):
+                    pilot_row = by_name.get(pilot) or {}
+                    # project_pilots se replie sur tous les pilotes pour une
+                    # base rouge ; une relance au repos reste dans le projet.
+                    matches = (project in projects_mod.agent_projects(pilot_row)
+                               or project == (pilot_row.get("workstream")
+                                              or pilot_row.get("chantier") or ""))
+                    if pilot and pilot != self.name and matches:
+                        return pilot
+        except Exception:  # noqa: BLE001 - une relance ne casse jamais le choix du tour
+            return ""
+        return ""
+
     def _moved_before_turn(self, spec: dict) -> bool:
         """L147b (codex r4 de #220, r1 de #283) : le placement est relu après
         `pick()`, juste avant le tour de travail — une rotation (taille, lot,
@@ -5198,7 +5227,8 @@ class AgentWorker(threading.Thread):
             if reveil is not None:
                 return reveil
         if self.idle_due():
-            return {"kind": "idle", "prompt": adapters.IDLE_PROMPT, "ids": []}
+            return {"kind": "idle", "prompt": adapters.idle_prompt(self._idle_pilot()),
+                    "ids": []}
         return None
 
     #: #408 : intervalle minimal entre deux lectures des lots actionnables
