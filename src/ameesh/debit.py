@@ -1090,14 +1090,28 @@ _ITEMS_SQL = """
                      WHERE m.work_item_id = w.id AND m.at > to_timestamp(%s))
          OR EXISTS (SELECT 1 FROM work_item_events e
                      WHERE e.work_item_id = w.id AND e.created_at > to_timestamp(%s)))
-       AND NOT EXISTS (
-             SELECT 1 FROM work_item_milestones t
-              WHERE t.work_item_id = w.id
-                AND t.kind IN ('merged', 'closed', 'delivered')
-                AND t.at > coalesce(
-                      (SELECT max(f.at) FROM work_item_milestones f
-                        WHERE f.work_item_id = w.id AND f.kind = 'frozen'),
-                      to_timestamp(0)))
+       AND (
+             NOT EXISTS (
+               SELECT 1 FROM work_item_milestones t
+                WHERE t.work_item_id = w.id
+                  AND t.kind IN ('merged', 'closed', 'delivered')
+                  AND t.at > coalesce(
+                        (SELECT max(f.at) FROM work_item_milestones f
+                          WHERE f.work_item_id = w.id AND f.kind = 'frozen'),
+                        to_timestamp(0)))
+             OR EXISTS (
+               -- B2 (cx1) : un lot fusionné peut encore porter un hold ou une
+               -- réouverture après son jalon terminal (correctif non déployé,
+               -- merged → build) ; `build` les lit, `read` doit le sélectionner.
+               SELECT 1 FROM work_item_events e2
+                WHERE e2.work_item_id = w.id
+                  AND e2.created_at > (
+                        SELECT max(t.at) FROM work_item_milestones t
+                         WHERE t.work_item_id = w.id
+                           AND t.kind IN ('merged', 'closed', 'delivered'))
+                  AND (lower(left(e2.note, 21)) LIKE 'hold:%%'
+                       OR lower(left(e2.note, 20)) LIKE 'wake:%%'
+                       OR e2.state IN ('intake', 'build', 'qa'))))
      ORDER BY w.id
      LIMIT %s
 """

@@ -465,6 +465,33 @@ class WitnessTest(PgTestCase):
         self.assertEqual(report["ci"]["slow_runs"][0]["run_id"], 42)
         self.assertEqual(report["unreadable"], [])
 
+    def test_read_garde_un_hold_apres_la_fusion(self):
+        # B2 (cx1) : frozen@10, merged@20, hold@30 « correctif non déployé ».
+        # `build` lisait ce hold, mais `read` écartait le lot par son jalon
+        # terminal ; même perte pour merged → build sans nouveau gel.
+        canons = self._seed()
+        self._item(6000, "ameesh-dev5")
+        self._milestone(6000, 26000, "frozen", T - 30 * H, sha="e" * 40)
+        self._milestone(6000, 26001, "merged", T - 20 * H, sha="e" * 40)
+        self._event(6000, 46000, T - 30 * H, "gel", state="qa")
+        self._event(6000, 46001, T - 20 * H, "merge seen", state="merged")
+        self._event(6000, 46002, T - 10 * H,
+                    "hold: attend la 1.21.0 (correctif fusionné pas déployé)",
+                    state="merged")
+        self._item(6001, "ameesh-dev5")
+        self._milestone(6001, 26002, "frozen", T - 30 * H, sha="f" * 40)
+        self._milestone(6001, 26003, "merged", T - 20 * H, sha="f" * 40)
+        self._event(6001, 46003, T - 30 * H, "gel", state="qa")
+        self._event(6001, 46004, T - 20 * H, "merge seen", state="merged")
+        self._event(6001, 46005, T - 10 * H, "correction: merged → build",
+                    state="build")
+        report = debit.read(self.db, cfg=self.cfg, now=T, canons=[canons],
+                            installed="1.20.0", jobs=False)
+        self.assertIn(6000, [row["lot"] for row in report["undeployed_holds"]])
+        self.assertIn((6000, "hold_undeployed"),
+                      [(row["lot"], row["kind"]) for row in report["slow_waits"]])
+        self.assertIn(6001, [row["lot"] for row in report["qa"]])
+
     def test_ci_par_job_lue_par_l_api_bornee(self):
         canons = self._seed()
         seen = []
