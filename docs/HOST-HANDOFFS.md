@@ -396,9 +396,9 @@ there is no holder, and that is the designed window.
 - **A — planned stop of the workstation.** The owner or the bureau stops the
   host that holds the role (or, when the host cannot be powered off, all of
   the role's executors on it; the report names which). The lease expires after
-  its TTL (180 s unless the host declares a shorter `lease_ttl`) and a
-  candidate claims. Restart the workstation only after the new holder is
-  live.
+  its effective TTL (180 s in the study; verify `lease_ttl`, the code default
+  is 300 s and can miss the 5-minute target) and a candidate claims. Restart
+  the workstation only after the new holder is live.
 - **B — network cut.** The holder stays alive but loses the database; it
   stops renewing and, after the lease TTL, another candidate claims. When the
   database path returns, the former holder is refused by epoch and goes back
@@ -466,6 +466,10 @@ and does not present A′/B′ as a hardware-loss or network-partition proof.
   ameesh-runner-agent@<ROLE>` on the candidate; never `agent-runner
   register` there, which would move the registry row to that host instead of
   standing by). A standby takes no turn and costs no token.
+- The effective lease TTL is the 180 s of the study, or the 5-minute target
+  is measured from the expiry and the drift is recorded: `lease_ttl` is a
+  parameter, and the code default is **300 s**. A 300 s lease plus one 60 s
+  election pass and the rank delay can exceed 5 minutes after the stop.
 - The drill starts from the holder named by `ameesh role status`, never from
   an assumption; if the target host is not the holder, either run the drill
   on the actual holder or wait for a planned handover.
