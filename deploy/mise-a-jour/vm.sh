@@ -368,6 +368,30 @@ if r.get("host") != sys.argv[1]: sys.exit("placement modifié")
 print(json.dumps(r))' "$HOTE_AGENTS"
   else "$AMEESH" show "$1" --json; fi
 }
+# #3412 : après un redémarrage, un rôle élu peut passer à un autre hôte
+# candidat ; l'élection le fait à une époque supérieure, c'est l'issue normale
+# de la gouvernance élue (§11), pas une perte de bail. Lit `role status` par le
+# CLI qui vient d'être basculé et rend le détail du transfert quand il est
+# légitime ; 1 sinon (le bail n'est pas repris par un autre hôte candidat).
+role_elu_repris_ailleurs() {  # persona epoch-before
+  local p=$1 avant=$2 rapport
+  rapport=$(ameesh_agents_lecture role status "$p" --json) || return 1
+  python3 -c 'import json,sys
+avant, hote = int(sys.argv[1]), sys.argv[2]
+try:
+    row = json.loads(sys.stdin.read().strip().splitlines()[0])
+except (ValueError, IndexError):
+    raise SystemExit(1)
+holder = row.get("holder")
+epoque = int(row.get("epoch") or 0)
+candidats = {c.get("host") for c in row.get("candidates") or ()}
+if not row.get("elected") or not holder or holder == hote:
+    raise SystemExit(1)
+if epoque <= avant or holder not in candidats:
+    raise SystemExit(1)
+print("bail du rôle élu repris par %s (époque %d > %d) — reprise normale"
+      % (holder, epoque, avant))' "$avant" "$HOTE_AGENTS" <<<"$rapport"
+}
 statut() { lire_bail "$1" | python3 -c 'import json,sys; print(json.load(sys.stdin).get("status") or "")'; }
 heure_base() {
   if [ "$MODE" = agents ]; then
@@ -975,7 +999,7 @@ preparer_drains() {  # personas dans l'ordre du balayage
 redemarrer_agents() {
   local noms p st avant ligne heure attendu tenu restantes
   local etat deja_pause detail
-  local non_verifiees=()
+  local non_verifiees=() echecs=()
   DRAINS_INDISPONIBLES=()
   DRAINS_NON_LEVES=()
   # #1633 : inclure les personas arrêtées pour recharger leur unité active.
@@ -1075,12 +1099,25 @@ redemarrer_agents() {
         echo "WARNING $p: not checked: no lease before the restart, no sign of life"
         non_verifiees+=("$p")
       elif ! attendu=$(proprietaire_de "$p") || ! attendre_bail "$avant" "$attendu" "$p"; then
-        echec_agent "$p" "active, mais bail non repris"; return 1
+        # #3412 : un rôle élu repris par un autre hôte candidat est une issue
+        # normale ; un vrai échec ne stoppe que cet agent, le balayage continue
+        # (#2184/N2) et la sortie nomme les échecs à la fin.
+        if detail=$(role_elu_repris_ailleurs "$p" "$avant"); then
+          echo "WARNING $p: $detail"
+        else
+          echec_agent "$p" "active, mais bail non repris"
+          echecs+=("$p")
+          continue
+        fi
       fi
       echo "$p : redémarré (était $st)"
   done
   if [ "${#non_verifiees[@]}" -gt 0 ]; then
     etape "WARNING: ${#non_verifiees[@]} persona(s) not checked (no lease before the restart, no sign of life): ${non_verifiees[*]}"
+  fi
+  if [ "${#echecs[@]}" -gt 0 ]; then
+    etape "ERREUR: ${#echecs[@]} agent(s) sans bail repris : ${echecs[*]} — balayage poursuivi, les autres redémarrés"
+    return 1
   fi
   if [ "${#DRAINS_INDISPONIBLES[@]}" -gt 0 ]; then
     etape "ERREUR: drain(s) indisponible(s) : ${DRAINS_INDISPONIBLES[*]} — agents laissés en l'état, balayage poursuivi"

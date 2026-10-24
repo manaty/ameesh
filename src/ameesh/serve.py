@@ -115,6 +115,13 @@ RETRY_MS = 3000
 POLL_S = 5.0
 #: an event held back by an open transaction is looked for again this often
 WAITING_POLL_S = 1.0
+#: #3397 : the alerts route shares one computed snapshot for this long. The
+#: UI refreshes a view on every event; without it each refresh relaunched the
+#: whole operations computation (90 s) and kept the screen unusable.
+ALERTS_TTL_S = 30.0
+#: one computation at a time, whoever asks: a burst waits for the first pass
+#: and then reads its snapshot instead of stacking a second one.
+_ALERTS_LOCK = threading.Lock()
 #: the standalone page (L88): its own files and the API, nothing inline
 UI = "/ui"
 # the package's directory, then ui/static opened one name at a time from it,
@@ -152,6 +159,10 @@ class Context:
     organisation: str | None = None
     #: the principal a deputy acts for (0033 §7, team mode L86); local mode: None
     on_behalf_of: str | None = None
+    #: #3397 : `{alerts, at}` snapshot of the alerts route, owned by this
+    #: server's context (a new server, a new context: never a shared cache).
+    alerts_cache: dict = dataclasses.field(default_factory=dict, compare=False,
+                                           repr=False, init=False)
 
     def sees(self, event: dict) -> bool:
         """Whether this human may see `event` (local mode: the owner sees
@@ -311,8 +322,20 @@ def _decisions(ctx: Context, db, params, query) -> dict:
 
 def _alerts(ctx: Context, db, params, query) -> dict:
     from . import alert_ack, exploitation
-    thresholds = exploitation.thresholds(exploitation.build_parser().parse_args(["alerts"]))
-    current = db_mod.batched(db, lambda db: exploitation.alerts(ctx.cfg, db, **thresholds))
+    cache = ctx.alerts_cache
+    now = time.monotonic()
+    # #3397 : hold one computation at a time and serve it for ALERTS_TTL_S.
+    # A second reader waits here instead of running the same 90 s pass on
+    # another connection (the UI refreshes on every event).
+    with _ALERTS_LOCK:
+        current = cache.get("alerts")
+        if current is None or now - float(cache.get("at") or 0.0) >= ALERTS_TTL_S:
+            thresholds = exploitation.thresholds(
+                exploitation.build_parser().parse_args(["alerts"]))
+            current = db_mod.batched(
+                db, lambda db: exploitation.alerts(ctx.cfg, db, **thresholds))
+            cache["alerts"] = current
+            cache["at"] = time.monotonic()
     return {"schema": "ameesh-alerts/1", "alerts": alert_ack.annotate(
         ctx.cfg, db, current, human=serve_actions.principal(ctx))}
 
@@ -382,7 +405,8 @@ ROUTES = (
           "Progress of a project (`ameesh progress --json --project`)", _progress,
           query=(("since", {"type": "string"}, "window: 90m, 24h, 2d or an ISO date"),)),
     Route(API + "/projects/{project}/timeline", "ameesh-timeline/1",
-          "Timeline of a project: its lots and window only (#3395)", _timeline,
+          "Timeline of a project: its lots, window and rendering cut (#3395, #3401)",
+          _timeline,
           query=(("since", {"type": "string"}, "window: 90m, 24h, 2d or an ISO date"),)),
     Route(API + "/agents", "ameesh-agents/1", "Agents (`ameesh list --json`)", _agents),
     Route(API + "/agents/{agent}", "ameesh-agent-detail/1", "One agent (`ameesh show --json`)",
@@ -504,7 +528,8 @@ SCHEMAS = {
     "ameesh-progress/1": _obj("ameesh-progress/1", ["generated_ts", "lots"],
                               generated_ts=_NUM, lots=_LIST),
     "ameesh-timeline/1": _obj("ameesh-timeline/1", ["generated_ts", "window", "lots"],
-                              generated_ts=_NUM, window=_OBJ, lots=_LIST),
+                              generated_ts=_NUM, window=_OBJ, lots=_LIST,
+                              truncated=_OBJ),
     "ameesh-agents/1": _obj("ameesh-agents/1", ["agents"], agents={
         "type": "array", "items": _obj(None, ["name"], name=_STR)}),
     "ameesh-agent-detail/1": _obj("ameesh-agent-detail/1", ["agent"],

@@ -58,6 +58,10 @@ pour les gardes et l'avertissement des orchestrateurs. Garde-fous :
   serveur de production, dépense engagée) ; l'agent le propose à un humain et
   s'arrête là. Le circuit du projet (relecture, intégration par qui en a le
   droit) reste le seul chemin vers la production ;
+* **jamais un agent éphémère** (`ameesh agent spawn --ttl`, #3411) : un agent
+  de mesure, vivant ou expiré, ne prend ni lot d'équipe (L165) ni élément de
+  la file (L119), et ne reçoit pas non plus de relecture proposée (#1677) ;
+  ce n'est pas un preneur de travail, c'est un instrument de mesure ;
 * les agents au forfait d'abord : ils prennent ce qui leur va, et les agents
   payés au token prennent ce qu'ils laissent, dans le même passage — jamais
   pendant une alerte `balance_low` ;
@@ -1368,6 +1372,12 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
             # #804 : un exécuteur ne fait prendre que ses propres agents ; les
             # autres restent dans `listing` pour les gardes et l'avertissement.
             if agents is not None and row["name"] not in agents:
+                continue
+            # #3411 : un éphémère (`ameesh agent spawn --ttl`) ne prend rien
+            # automatiquement — ni un lot d'équipe (L165), ni un élément de la
+            # file (L119, la prise de #3403), ni une relecture proposée
+            # (#1677). Vivant ou expiré : l'échéance ne le rend pas preneur.
+            if row.get("ephemeral"):
                 continue
             if row["name"] in skip or row["name"] in held \
                     or _awaited(row, waiting_free=waiting_free) or row.get("host") in blocked:
