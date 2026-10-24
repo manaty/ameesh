@@ -609,6 +609,66 @@ def select(*, required: int, authors: Iterable = (), candidates: Iterable = (),
     return out
 
 
+#: #3416: the warning a designated reviewer reads before pushing a correction
+#: that would leave too few independent families (canon §2)
+RETURN_TO_AUTHOR = "§2 : retour à l'auteur"
+#: `correction_room` states
+ROOM_OK = "ok"
+ROOM_SHORT = "short"
+ROOM_UNKNOWN = "unknown"
+
+
+def correction_room(*, required: int, corrector: Mapping, authors: Iterable = (),
+                    candidates: Iterable = (), families, already: Iterable = (),
+                    fixers: Iterable = ()) -> dict:
+    """#3416: would a first-round correction by `corrector` leave enough families?
+
+    A reviewer's correction makes the reviewer an author of the head (#2888):
+    its family joins the forbidden ones. This replays `select` on the same
+    inputs with `corrector` added to the `fixers`, before the push, so the
+    reviewer learns that canon §2 sends the correction back to the author
+    instead of finding a sensitive lot waiting with no eligible family (#3186:
+    claude author, two opinions required, the codex corrector left deepseek
+    alone).
+
+    Returns `{state, required, families, missing, why}`: `ok` when the
+    remaining families (manual seats included) still cover `required`, `short`
+    with the missing count otherwise, `unknown` when the corrector's family or
+    an author's family is not known — independence cannot be computed, and
+    doubt never says `ok`. `families` are the families that would remain
+    eligible for automatic designation.
+    """
+    corrector = dict(corrector or {})
+    name = str(corrector.get("name") or "").strip()
+    family = str(corrector.get("family") or "").strip().lower()
+    out = {"state": ROOM_OK, "required": int(required or 0), "families": [],
+           "missing": 0, "corrector": name, "why": ""}
+    if not required:
+        out["why"] = "no review required"
+        return out
+    if not family or family in PLACEHOLDER_FAMILIES:
+        out.update({"state": ROOM_UNKNOWN,
+                    "why": "family of corrector %s unknown: the remaining families "
+                           "cannot be computed" % (name or "?")})
+        return out
+    outcome = select(required=required, authors=authors, candidates=candidates,
+                     families=families, already=already,
+                     fixers=list(fixers or ()) + [{"name": name, "family": family}])
+    out["families"] = list(outcome.get("families") or ())
+    if outcome["state"] == DESIGNATED:
+        out["why"] = "%d eligible famil%s left (%s) for %d review(s)" % (
+            len(out["families"]), "y" if len(out["families"]) == 1 else "ies",
+            ", ".join(out["families"]) or "manual seats", required)
+        return out
+    if outcome["state"] == WAITING and unknown_families(authors):
+        out.update({"state": ROOM_UNKNOWN, "why": outcome.get("why") or ""})
+        return out
+    out.update({"state": ROOM_SHORT, "missing": int(outcome.get("missing") or 0),
+                "why": "%s: after a correction by %s (%s), %s" % (
+                    RETURN_TO_AUTHOR, name or "?", family, outcome.get("why") or "")})
+    return out
+
+
 # --------------------------------------------------------------------------
 # the mails: the exact head, or the missing capacity
 # --------------------------------------------------------------------------

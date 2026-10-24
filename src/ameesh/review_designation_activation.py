@@ -2533,6 +2533,72 @@ def designate(cfg, db, lot: int, *, freeze: Optional[Mapping] = None,
         raise
 
 
+def correction_check(cfg, db, lot: int, corrector: str, *, fetch: bool = True) -> dict:
+    """#3416: would a first-round correction by `corrector` still be receivable?
+
+    Read-only: the same inputs as the designation of the latest freeze
+    (`prepare`), then `review_designation.correction_room` with `corrector`
+    as an author of the head. `state` is `ok`, `short` (canon §2 sends the
+    correction back to the author), `unknown`, or `unavailable` when the
+    freeze inputs cannot be read. Never writes, never raises on an expected
+    refusal."""
+    name = str(corrector or "").strip()
+    inputs = prepare(cfg, db, int(lot), fetch=fetch)
+    if isinstance(inputs, Unavailable):
+        return {"state": "unavailable", "lot": int(lot), "corrector": name,
+                "families": [], "missing": 0, "why": inputs.why}
+    if inputs.unknown_authors:
+        return {"state": rd.ROOM_UNKNOWN, "lot": int(lot), "corrector": name,
+                "families": [], "missing": 0,
+                "why": "author provenance unknown for frozen commit(s): %s"
+                       % ", ".join(inputs.unknown_authors)}
+    family = ""
+    for candidate in inputs.candidates or ():
+        if candidate.name == name:
+            family = candidate.family
+            break
+    else:
+        for row in registry.overview(db):
+            if str((row or {}).get("name") or "").strip() == name:
+                family = rd.live_family(row, families=inputs.policy.families)
+                break
+    out = rd.correction_room(
+        required=inputs.policy.required, corrector={"name": name, "family": family},
+        authors=inputs.authors, candidates=inputs.candidates,
+        families=inputs.policy.families, already=inputs.manual_seats,
+        fixers=inputs.correctors)
+    out["lot"] = int(lot)
+    return out
+
+
+def correction_warning(cfg, db, lot: int, actor: str) -> str:
+    """#3416: the warning for a designated reviewer's blocked verdict, or "".
+
+    Only a designated reviewer of the latest freeze is concerned (the author
+    fixes its own lot freely). The read is local (`fetch=False`): the verdict
+    is never slowed by a fetch nor refused by this check; an unreadable input
+    says nothing — the designation of the next freeze stays the authority."""
+    name = str(actor or "").strip()
+    if not name:
+        return ""
+    try:
+        item = work.get(db, int(lot))
+        freeze = _latest_freeze(db, int(lot))
+        if item is None or freeze is None:
+            return ""
+        author = str(item.get("assignee") or "").strip()
+        if name not in _designated_reviewers(db, item, freeze, author):
+            return ""
+        room = correction_check(cfg, db, int(lot), name, fetch=False)
+    except Exception:  # noqa: BLE001 - a preview never blocks the verdict
+        return ""
+    if room.get("state") != rd.ROOM_SHORT:
+        return ""
+    return ("%s — do not push the correction yourself: hand it to the author "
+            "(preview: ameesh work reviewers %d --if-corrector %s)"
+            % (room.get("why") or rd.RETURN_TO_AUTHOR, int(lot), name))
+
+
 def reviewers(cfg, db, lot: int, *, apply: bool = False) -> dict:
     """Read the recorded designation of the latest freeze, optionally retrying it."""
     item = work.get(db, int(lot))
