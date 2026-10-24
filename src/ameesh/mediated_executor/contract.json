@@ -4604,6 +4604,7 @@
     "record_auth_state",
     "record_state",
     "relocate",
+    "relocate_operator",
     "revive",
     "set_default_id",
     "set_election",

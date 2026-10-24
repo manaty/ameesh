@@ -10,11 +10,11 @@
   ameesh adopt <agent> --session ID --harness claude|codex|deepseek [--account C]
         [--cwd D] [--brief FILE|-] [--force]
         an existing (closed) interactive session moves under the runner (L39);
+  ameesh agent move <agent> --to <host> [--keep-session]
+        manual move of a pinned agent to another admitted host, without a live
+        lease when the source executor is stopped (#3299);
   ameesh agent peek <name> [--limit N] [--json]   responsible human's work summary;
   ameesh agent spawn <name> --by <creator> --ttl <duration>   ephemeral agent;
-  ameesh agent move NOM --to HOST [--keep-session]   manual move of a pinned agent
-        to another admitted host, without a live lease when the source executor
-        is stopped (#3299);
   ameesh alerts [--follow] [--json]     operational alerts (one object per line);
   ameesh approvals            list signed approvals;
   ameesh approve              sign an approval;
@@ -36,6 +36,11 @@
   ameesh conflicts [--all] [--json]     conflict radar between work items (L160b);
   ameesh cost …               turn cost, per-turn usage, gauges and their
         history, pay-per-token provider balance (`cost turns|gauges|balance`);
+  ameesh debit [--json] [--check] [--hours N] [--threshold 2h]
+        débit mesuré sur les jalons (canon 24/10/2026) : lots en qa/blocked par
+        âge, avis dus par relecteur, avis bloquants non traités, holds et
+        réveils, agents au repos avec du travail dû, tours et fusions par
+        heure, durée de CI par job ; `--check` sort 2 sur une attente > seuil ;
   ameesh decide <id> <option | "free text"> [--key FILE | --signed]
         | withdraw <id> | show <id>
         the human's answer (never an agent's), sent back to the requester by
@@ -49,11 +54,6 @@
         decisions waiting for a human, across all projects: agent requests
         (L124, oldest first), gated actions; apart, decisions written in prose
         in mail and work items waiting with no question (L233, not requests);
-  ameesh debit [--json] [--check] [--hours N] [--threshold 2h]
-        débit mesuré sur les jalons (canon 24/10/2026) : lots en qa/blocked par
-        âge, avis dus par relecteur, avis bloquants non traités, holds et
-        réveils, agents au repos avec du travail dû, tours et fusions par
-        heure, durée de CI par job ; `--check` sort 2 sur une attente > seuil ;
   ameesh deps link|local|unlink|status|entries node_modules shared per lockfile (#248);
   ameesh device enroll|challenge|show   device-side enrollment, in the VM (L110);
   ameesh doctor               schema and diagnostics;
