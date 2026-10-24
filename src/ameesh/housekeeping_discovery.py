@@ -45,15 +45,23 @@ def _attribution(db, path: str, branch: str, agents: dict, witness: str):
         owners = [name for name, cwd in nested if len(hk._real(cwd)) == nearest]
         if len(owners) == 1:
             name = owners[0]
-            return name, hk.lot_of_worktree(db, name, path, branch)
+            return name, hk.lot_of_worktree(db, name, path, branch, agents=agents)
         return witness, None
     candidates = hk.cited_lots(branch)
     if not candidates:
-        for name in agents:
-            ident = hk.named_lot(os.path.basename(path), name)
-            if ident is not None:
-                candidates.append(ident)
-                witness = name
+        # #3266: the folder may carry a project prefix
+        # (`nexlink-<agent>-<lot>`) or name one of the agents; the shared
+        # conventions of the clone housekeeping (#2743) say which lot. A
+        # folder naming another agent is that agent's, never the witness's.
+        owner, named = hk.worktree_named_lots(path, agents)
+        if owner in agents:
+            candidates, witness = named, owner
+        elif not owner:
+            for name in agents:
+                ident = hk.named_lot(os.path.basename(path), name)
+                if ident is not None:
+                    candidates.append(ident)
+                    witness = name
     for ident in candidates:
         row = storage.of(db).work.get(ident)
         if row and row.get("assignee") in agents:

@@ -686,6 +686,11 @@ class _Store:
     def set_worktree_status(self, ident, status, detail):
         self.statuses.append((ident, status, detail))
 
+    def set_worktree_attribution(self, ident, agent, lot, detail):
+        # #3266 : la passe ne persiste une attribution que pour une ligne sans
+        # lot ; les scénarios de ce module partent tous d'un lot posé.
+        raise AssertionError("unexpected attribution of %s to lot %s" % (ident, lot))
+
 
 class MergedKeptTest(_Repo):
     def row(self, path, *, checked_ago, detail=None, lot="7"):

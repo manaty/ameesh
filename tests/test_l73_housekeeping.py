@@ -366,6 +366,55 @@ class WorktreeEtatTest(_Tmp):
         self.assertIsNone(menage.cited_lot("agent/nx-compute-runner-n-n"))
         self.assertIsNone(menage.cited_lot(""))
 
+    def test_le_dossier_nomme_le_lot_par_les_conventions_des_clones(self):
+        """#3266 : le dossier d'un worktree se lit avec les conventions du
+        ménage des clones (#2743), au-delà de `<agent>-<id>` : préfixe de
+        projet (`nexlink-<agent>-<lot>`), `.wt<lot>`, `<agent>.wt<lot>`. Le
+        dernier groupe l'emporte ; un nom inconnu ne nomme rien."""
+        self.assertEqual(menage.worktree_named_lots("/w/nexlink-a1-431", ("a1",)),
+                         ("a1", [431]))
+        self.assertEqual(menage.worktree_named_lots("/w/a1-431", ("a1",)), ("a1", [431]))
+        self.assertEqual(menage.worktree_named_lots("/w/mty-amh-impl-08.wt3219",
+                                                    ("mty-amh-impl-08",)),
+                         ("mty-amh-impl-08", [3219]))
+        self.assertEqual(menage.worktree_named_lots("/w/.wt1349-r1", ("a1",)),
+                         ("", [1349]))
+        self.assertEqual(menage.worktree_named_lots("/w/nexlink-a2-431", ("a1", "a2")),
+                         ("a2", [431]))
+        self.assertEqual(menage.worktree_named_lots("/w/inconnu", ("a1",)), ("", []))
+        # sans registre, aucun agent n'est nommé : les marqueurs de convention
+        # restent des candidats (vérifiés ensuite), mais un nom qui ne dit
+        # rien (`a1-431`, une date) n'est pas lu.
+        self.assertEqual(menage.worktree_named_lots("/w/wt-431", ()), ("", [431]))
+        self.assertEqual(menage.worktree_named_lots("/w/a1-431", ()), ("", []))
+        self.assertEqual(menage.worktree_named_lots("/w/release-2026-10-23", ("a1",)),
+                         ("", []))
+
+    def test_lot_of_worktree_reads_the_folder_conventions_only_when_assigned(self):
+        """#3266 : `.wt<lot>` et `nexlink-<agent>-<lot>` rattachent le worktree
+        au lot SEULEMENT si ce lot est assigné à l'agent ; un dossier qui
+        nomme un autre agent du registre ne prouve rien pour celui-ci."""
+        class _Registre:
+            ROWS = {1132: {"assignee": "a1"}, 999: {"assignee": "a2"}}
+
+            def get(self, ident):
+                return self.ROWS.get(ident)
+
+        class _Base:
+            work = _Registre()
+
+        with mock.patch.object(menage.storage, "of", return_value=_Base()):
+            self.assertEqual(menage.lot_of_worktree(
+                None, "a1", "/w/a1/.wt1132", ""), "1132")
+            self.assertIsNone(menage.lot_of_worktree(
+                None, "a1", "/w/a1/.wt999", ""))
+            self.assertEqual(menage.lot_of_worktree(
+                None, "a1", "/w/nexlink-a1-1132", "", agents=("a1", "a2")), "1132")
+            self.assertIsNone(menage.lot_of_worktree(
+                None, "a1", "/w/nexlink-a2-1132", "", agents=("a1", "a2")))
+            self.assertIsNone(menage.lot_of_worktree(
+                None, "a1", "/w/a1/inconnu", ""))
+
     def test_cited_lots_are_tried_in_order(self):
         """#1694: a branch citing several numeric groups lists its candidates
         in trial order — last group first under agent/review, first group
@@ -1437,6 +1486,87 @@ class MenageDbTest(PgTestCase):
         self.assertEqual(rows[0]["status"], "removed")
         journal = storage.of(self.db).housekeeping.recent("pc", 3600)
         self.assertIn(str(fini), [str(r.get("lot")) for r in journal])
+
+    def test_worktree_sans_lot_est_attribue_par_son_dossier(self):
+        """#3266 : un worktree suivi sans lot dont le dossier le nomme
+        (`nexlink-<agent>-<lot>`, `.wt<lot>`) est attribué à son lot — même
+        quand l'enregistrement n'a pas lu le nom — puis la politique existante
+        s'applique : lot fini, propre et intégré → retiré ; lot ouvert → gardé ;
+        nom inconnu → reste non attribué. Aucune règle de suppression n'est
+        ajoutée : l'orphelin inconnu attend ses 24 h."""
+        _sans_processus(self)
+        main = _repo(self.tmp)
+        registry.upsert(self.db, "a1", harness="claude", host="pc",
+                        cwd=os.path.join(self.tmp, "a1"))
+        registry.upsert(self.db, "a2", harness="claude", host="pc",
+                        cwd=os.path.join(self.tmp, "a2"))
+        fini, ouvert = self._lot("fini"), self._lot("ouvert")
+        work.assign(self.db, fini, "a1")
+        work.assign(self.db, ouvert, "a2")   # un lot non démarré par agent
+        nomme_fini = os.path.join(self.tmp, "nexlink-a1-%d" % fini)
+        _git("worktree", "add", "-q", nomme_fini, "-b", "copie-fini", cwd=main)
+        nomme_ouvert = os.path.join(self.tmp, ".wt%d" % ouvert)
+        _git("worktree", "add", "-q", nomme_ouvert, "-b", "copie-ouvert", cwd=main)
+        inconnu = os.path.join(self.tmp, "copie-inconnue")
+        _git("worktree", "add", "-q", inconnu, "-b", "copie-inconnue", cwd=main)
+        for path, agent in ((nomme_fini, "a1"), (nomme_ouvert, "a2"), (inconnu, "a1")):
+            row = storage.of(self.db).housekeeping.register_worktree(
+                host="pc", path=path, repo=menage.common_dir(main), agent=agent,
+                lot=None, turn_id="t", branch="", head="")
+            storage.of(self.db).housekeeping.set_worktree_status(row["id"], "active", "")
+        self.assertEqual(menage.lot_of_worktree(self.db, "a2", nomme_ouvert),
+                         str(ouvert))
+        work.close(self.db, fini, abandoned=True)
+        plus_tard = time.time() + 2 * 3600
+        essai = menage.run_pass(self.cfgl, self.db, menage.Policy(), host="pc", actor="t",
+                                dry_run=True, now=plus_tard)
+        plan = {p["path"]: p for p in essai["plan"] if p.get("kind") == "worktree"}
+        self.assertEqual(plan[nomme_fini]["action"], "retrait")
+        self.assertEqual(plan[nomme_fini]["lot"], str(fini))
+        self.assertEqual(plan[nomme_ouvert]["action"], "attend", plan[nomme_ouvert])
+        self.assertEqual(plan[nomme_ouvert]["lot"], str(ouvert))
+        self.assertIsNone(plan[inconnu]["lot"])
+        self.assertTrue(os.path.isdir(nomme_fini))   # l'essai n'écrit rien
+        menage.run_pass(self.cfgl, self.db, menage.Policy(), host="pc", actor="t",
+                        now=plus_tard)
+        self.assertFalse(os.path.exists(nomme_fini))
+        self.assertTrue(os.path.isdir(nomme_ouvert))
+        self.assertTrue(os.path.isdir(inconnu))
+        rows = {r["path"]: r for r in storage.of(self.db).housekeeping.worktrees("pc")}
+        self.assertEqual((rows[nomme_ouvert]["agent"], rows[nomme_ouvert]["lot"]),
+                         ("a2", str(ouvert)))
+        self.assertIsNone(rows[inconnu]["lot"])
+        journal = storage.of(self.db).housekeeping.recent("pc", 3600)
+        self.assertIn(("worktree", "attributed"),
+                      {(r["kind"], r["action"]) for r in journal})
+
+    def test_worktree_nommant_un_autre_agent_corrige_son_agent(self):
+        """#3266 : le dépôt commun fait voir à un agent le worktree d'un
+        voisin ; `work/<agent>-<lot>` nomme le vrai agent, et le lot lui est
+        assigné. L'attribution corrige l'agent ET le lot, puis la fin du lot
+        s'applique (le worktree est retiré)."""
+        _sans_processus(self)
+        main = _repo(self.tmp)
+        registry.upsert(self.db, "a1", harness="claude", host="pc",
+                        cwd=os.path.join(self.tmp, "a1"))
+        registry.upsert(self.db, "a2", harness="claude", host="pc",
+                        cwd=os.path.join(self.tmp, "a2"))
+        fini = self._lot("fini")
+        work.assign(self.db, fini, "a1")
+        wt = os.path.join(self.tmp, "a1-%d" % fini)
+        _git("worktree", "add", "-q", wt, "-b", "copie-a1", cwd=main)
+        row = storage.of(self.db).housekeeping.register_worktree(
+            host="pc", path=wt, repo=menage.common_dir(main), agent="a2",
+            lot=None, turn_id="t", branch="", head="")
+        storage.of(self.db).housekeeping.set_worktree_status(row["id"], "active", "")
+        work.close(self.db, fini, abandoned=True)
+        plus_tard = time.time() + 2 * 3600
+        menage.run_pass(self.cfgl, self.db, menage.Policy(), host="pc", actor="t",
+                        now=plus_tard)
+        self.assertFalse(os.path.exists(wt))
+        rows = storage.of(self.db).housekeeping.worktrees("pc")
+        self.assertEqual((rows[0]["agent"], rows[0]["lot"], rows[0]["status"]),
+                         ("a1", str(fini), "removed"))
 
     def test_worktrees_suivis_sans_plafond_pour_le_menage(self):
         """#2174 : `limit=None` rend tous les worktrees suivis de l'hôte (le
