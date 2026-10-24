@@ -358,15 +358,20 @@ def _terminal_at(milestones: list[dict]) -> float | None:
 
 
 def _reopened(events: list[dict], terminal_ts: float | None) -> bool:
-    """Une correction postérieure à la fusion rouvre le lot (journal)."""
+    """Le dernier état après le jalon décide de la réouverture.
+
+    Une note concurrente peut porter qa après la fusion (#1982), puis les
+    notes suivantes merged. Un retour à merged annule une réouverture.
+    """
     if terminal_ts is None:
         return False
-    for event in events or ():
-        if float(event.get("at_ts") or 0.0) <= terminal_ts:
-            continue
-        if str(event.get("state") or "") in ("intake", "build", "qa"):
-            return True
-    return False
+    later = [e for e in events or ()
+             if float(e.get("at_ts") or 0.0) > terminal_ts and e.get("state")]
+    if not later:
+        return False
+    latest = max(later, key=lambda e: (float(e.get("at_ts") or 0.0),
+                                       int(e.get("id") or 0)))
+    return str(latest["state"]) in ("intake", "build", "qa")
 
 
 def _current_state(events: list[dict]) -> str | None:

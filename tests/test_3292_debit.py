@@ -166,6 +166,31 @@ class ReviewDueTest(unittest.TestCase):
         self.assertEqual(report["reviews_due"], [])
         self.assertEqual(report["blocked_reviews"], [])
 
+    def test_note_qa_perimee_apres_fusion_1982(self):
+        merged_at = T - 203 * H
+        report = run(
+            items=[item(1982)],
+            milestones=[frozen(1982, 10, merged_at - H),
+                        {"work_item_id": 1982, "id": 11, "kind": "merged",
+                         "at_ts": merged_at}],
+            events=[event(1982, 1, merged_at - H,
+                          mark(1982, 10, ["ameesh-cx2"])),
+                    event(1982, 2, merged_at + 3, "note concurrente", state="qa"),
+                    event(1982, 3, merged_at + 10, "note", state="merged")])
+        for key in ("qa", "reviews_due", "slow_waits", "idle_agents_with_work"):
+            self.assertEqual(report[key], [], key)
+
+    def test_reouverture_dernier_etat_et_retour_terminal(self):
+        for state in ("intake", "build", "qa", "merged", "closed"):
+            with self.subTest(state=state):
+                events = [event(1, 3, T + 3, "dernier", state=state),
+                          event(1, 1, T, "fusion", state="merged"),
+                          event(1, 2, T + 3, "correction", state="build")]
+                self.assertEqual(debit._reopened(events, T),
+                                 state in ("intake", "build", "qa"))
+        self.assertFalse(debit._reopened(events, None))
+        self.assertFalse(debit._reopened([event(1, 1, T, "note")], T))
+
 
 class HoldsAndWakesTest(unittest.TestCase):
     def test_hold_et_releve(self):
