@@ -1469,6 +1469,13 @@ class WorkItems(Domain):
         `current` (compare-and-set, no lost concurrent correction)."""
 
     @abc.abstractmethod
+    def set_priority(self, item_id: int, priority: int, *, current: int | None,
+                     reason: str, actor: str) -> dict | None:
+        """#3370: journaled priority correction, if the lot still carries
+        `current` (compare-and-set, NULL included, no lost concurrent
+        correction)."""
+
+    @abc.abstractmethod
     def without_project(self) -> list[dict]:
         """L118c: open lots with empty app, once per id, including waiting_human."""
 
