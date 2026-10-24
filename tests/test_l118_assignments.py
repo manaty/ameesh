@@ -4,6 +4,7 @@ quand sa branche est fusionnée, avec ou sans PR ; `idle_capacity` part aussi
 à l'orchestrateur."""
 from __future__ import annotations
 
+import datetime
 import os
 import subprocess
 import tempfile
@@ -497,6 +498,92 @@ class BranchMergeTest(_Base):
         self.assertEqual(report["merged"], 1)
         self.assertEqual(report["results"][0]["how"], "ancestor")
         self.assertEqual(work.get(self.db, lot["id"])["state"], "merged")
+
+    def test_tete_hors_premiere_parente_vue_contre_une_cible_perimee_n_est_pas_livree(self):
+        """#3326 avec #2543 : une pointe entrée par une fusion (hors première
+        parente) ne prouve rien non plus si elle était déjà dans la cible
+        quand le relevé l'a vue."""
+        # le paquet entre dans develop par une fusion ; sa pointe est hors de
+        # la chaîne première-parente.
+        self.branch("paquet/3326", "paquet")
+        paquet = _git(self.repo, "rev-parse", "paquet/3326")
+        self.commit("apres-paquet")
+        _git(self.repo, "merge", "-q", "--no-ff", "-m", "Merge paquet/3326",
+             "paquet/3326")
+        # la branche du lot naît sur cette pointe, sans travail propre
+        _git(self.repo, "branch", "agent/dev1-paquet-3326", paquet)
+        lot = self.lot("agent/dev1-paquet-3326")
+        # l'observation d'un relevé passé, contre une cible encore en retard
+        time.sleep(1.1)                      # le reflog de develop date d'avant
+        storage.of(self.db).work.set_branch_head(
+            lot["id"], "agent/dev1-paquet-3326", paquet)
+        self.commit("cible-rafraichie")
+        entry = self.sync()["results"][0]
+        self.assertEqual(entry["result"], "open", entry)
+        self.assertIn("no work of its own", entry["detail"])
+        self.assertEqual(work.get(self.db, lot["id"])["state"], "intake")
+
+    def test_tete_deja_dans_la_cible_quand_elle_a_ete_vue_n_est_pas_livree(self):
+        """#3326 : un relevé qui a vu en avance, contre une cible périmée, une
+        tête déjà livrée n'a vu aucun travail propre. La cible rafraîchie, la
+        preuve « vu-ancestor » est refusée et le lot reste ouvert."""
+        # la tête de la cible avant le relevé, datée pour un reflog déterministe
+        with mock.patch.dict(os.environ, {
+                "GIT_AUTHOR_DATE": "2026-10-18T10:00:00+0000",
+                "GIT_COMMITTER_DATE": "2026-10-18T10:00:00+0000"}):
+            self.commit("deja-livre")
+        base = _git(self.repo, "rev-parse", "develop")
+        _git(self.repo, "branch", "agent/dev1-deja", "develop")
+        lot = self.lot("agent/dev1-deja")
+        seen = datetime.datetime(2026, 10, 18, 10, 2,
+                                 tzinfo=datetime.timezone.utc).timestamp()
+        # ce que le balayage de 10:02 avait enregistré : la pointe était un
+        # commit de la cible, pas un commit de la branche.
+        self.db.execute("UPDATE work_items SET branch_head = %s,"
+                        " branch_head_at = to_timestamp(%s) WHERE id = %s",
+                        (base, seen, lot["id"]))
+        # la cible avance et le clone la rafraîchit
+        with mock.patch.dict(os.environ, {
+                "GIT_AUTHOR_DATE": "2026-10-18T10:05:00+0000",
+                "GIT_COMMITTER_DATE": "2026-10-18T10:05:00+0000"}):
+            self.commit("cible-rafraichie")
+        entry = self.sync()["results"][0]
+        self.assertEqual(entry["result"], "open", entry)
+        self.assertIn("no work of its own", entry["detail"])
+        item = work.get(self.db, lot["id"])
+        self.assertEqual(item["state"], "intake")
+        self.assertEqual(item["branch_head"], base)   # l'observation reste, sans preuve
+
+    def test_une_tete_deja_publiee_n_est_pas_vue_en_avance(self):
+        """#3326 : la ref de la cible peut être en retard sur la forge (fetch
+        best-effort). Une pointe que la forge porte déjà n'est pas un travail
+        propre : elle n'est pas enregistrée, et la cible rafraîchie ne ferme
+        pas le lot."""
+        _bare, other = self.origin()
+        # la forge avance, le clone de l'assigné garde son origin/develop en
+        # retard : le fetch du relevé échoue.
+        stale = _git(self.repo, "rev-parse", "origin/develop")
+        tete = self.push_new_work(other, "develop", "livre")
+        _git(self.repo, "fetch", "-q", "origin", "develop:refs/tmp/tete")
+        # l'objet est là (pour la lecture fraîche), la ref du clone reste en
+        # retard (fetch best-effort en échec).
+        _git(self.repo, "update-ref", "refs/remotes/origin/develop", stale)
+        self.assertEqual(tete, _git(self.repo, "rev-parse", "refs/tmp/tete"))
+        self.assertNotEqual(tete, _git(self.repo, "rev-parse", "origin/develop"))
+        _git(self.repo, "branch", "agent/dev1-deja-publiee", "refs/tmp/tete")
+        lot = self.lot("agent/dev1-deja-publiee")
+        with mock.patch.object(plan_git, "git_fetch", return_value="fetch refused"):
+            first = self.sync()["results"][0]
+        self.assertEqual(first["result"], "open", first)
+        self.assertEqual(first["how"], "no-work", first)
+        self.assertIn("read fresh", first["detail"])
+        self.assertIsNone(work.get(self.db, lot["id"])["branch_head"])
+        # le relevé suivant rafraîchit la cible : la pointe n'a jamais eu de
+        # travail propre, rien ne prouve sa livraison.
+        second = self.sync()["results"][0]
+        self.assertEqual(second["result"], "open", second)
+        self.assertIn("no work of its own", second["detail"])
+        self.assertEqual(work.get(self.db, lot["id"])["state"], "intake")
 
     def test_avance_rapide_apres_un_releve(self):
         self.branch("agent/dev1-ff", "f1")
