@@ -63,9 +63,23 @@ class ReviewGateShortCircuitTest(unittest.TestCase):
         self.assertFalse(out["ok"])
         self.assertEqual(out["required"], 2)
         self.assertIn("no review verdict ok on the freeze", out["why"])
-        # Le verdict retenu reste lisible : la trace ne dépend pas de Git.
-        self.assertEqual([entry["actor"] for entry in out["accepted"]], ["r1"])
-        self.assertEqual(out["accepted"][0]["family"], "claude")
+        # #3400 : l'ok reste lisible, mais il n'est pas *accepté* : sans la
+        # lecture des auteurs, son indépendance n'est pas prouvée.
+        self.assertEqual(out["accepted"], [])
+        self.assertEqual([entry["actor"] for entry in out["accepted_unfiltered"]],
+                         ["r1"])
+        self.assertEqual(out["accepted_unfiltered"][0]["family"], "claude")
+
+    def test_the_author_s_own_ok_is_never_accepted_on_the_short_circuit(self):
+        """#3400 : l'auteur de la tête ne compte pas, même quand la porte ferme
+        sur le seul compte ; l'ancien `accepted` le listait sans filtre."""
+        with mock.patch.object(merge_queue, "_attribution_on_freeze",
+                               side_effect=AssertionError("frozen range read")):
+            out = self.gate([_mark("author")], db=_QueryDb())
+        self.assertFalse(out["ok"])
+        self.assertEqual(out["accepted"], [])
+        self.assertEqual([entry["actor"] for entry in out["accepted_unfiltered"]],
+                         ["author"])
 
     def test_enough_ok_verdicts_still_read_the_range(self):
         """Au compte requis, la porte garde sa lecture complète : on ne
@@ -76,6 +90,7 @@ class ReviewGateShortCircuitTest(unittest.TestCase):
         self.assertTrue(read.called)
         self.assertFalse(out["ok"])
         self.assertIn("frozen range cannot be read", out["why"])
+        self.assertEqual(out["accepted_unfiltered"], [])
 
 
 class AlertsRouteCacheTest(unittest.TestCase):
