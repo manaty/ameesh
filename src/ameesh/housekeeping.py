@@ -268,7 +268,7 @@ POLICY_KEYS = ("tmp_root", "cache_root", "tmp_quota", "cache_quota", "tmpfs_aler
                "orphan_cleanup", "orphan_idle", "deps", "deps_idle", "artifacts",
                "artifact_idle", "unreadable_ok", "docker_orphan_volumes_alert",
                "docker_build_cache_alert", "docker_volumes", "docker_volume_idle",
-               "events_quota")
+               "events_quota", "former_mesh_keys")
 #: racines refusées : le ménage n'y supprimerait que ses sous-dossiers, mais
 #: un dossier partagé par tout le système n'est pas un dossier GÉRÉ
 FORBIDDEN_ROOTS = ("/", "~", "/tmp", "/var/tmp", "/dev/shm", "/home", "/root")
@@ -318,6 +318,10 @@ class Policy:
     #: #2820 : taille du flux `events.jsonl` d'un agent au-delà de laquelle il
     #: tourne au début du tour suivant (`events_rotation`)
     events_quota: int = DEFAULT_EVENTS_QUOTA
+    #: #3277 : anciennes clés de CE mesh sur cet hôte (une route vers la même
+    #: base, avant un changement de DSN : #532, 10.77.0.1:5432 → pgbouncer) ;
+    #: leurs dossiers temporaires sont à nous, `housekeeping_stale` les range
+    former_mesh_keys: tuple = ()
     #: #2180: discovery roots derived from Host work_root/work_roots, never
     #: deletion roots. Not a separate housekeeping setting.
     worktree_roots: tuple = ()
@@ -401,6 +405,14 @@ def parse_policy(raw) -> tuple[dict, list[str], list[str]]:
             problems.append("`unreadable_ok` : %s" % problem)
         else:
             parsed["unreadable_ok"] = names
+    if raw.get("former_mesh_keys") is not None:
+        keys = raw["former_mesh_keys"]
+        if not isinstance(keys, list) or not all(
+                isinstance(k, str) and re.fullmatch(r"[0-9a-f]{16}", k) for k in keys):
+            problems.append("`former_mesh_keys`: list of 16-hex mesh keys expected "
+                            "(the owner files of `.menage/tmp`)")
+        else:
+            parsed["former_mesh_keys"] = tuple(sorted(set(keys)))
     for key in ("redirect", "xdg_cache", "worktrees", "orphan_cleanup", "deps",
                 "docker_volumes"):
         if raw.get(key) is None:
@@ -456,6 +468,12 @@ def effective(canons, host: str) -> Policy:
         label = getattr(canon, "id", "") or "?"
         for key, value in declared.items():
             if key not in POLICY_KEYS:
+                continue
+            if key == "former_mesh_keys":
+                # #3277 : une clé déclarée par une fiche est une ancienne route
+                # de ce mesh : l'union des fiches
+                values[key] = tuple(sorted(set(values.get(key, ())) | set(value)))
+                origin.setdefault(key, label)
                 continue
             if key not in values:
                 values[key], origin[key] = value, label
@@ -1900,7 +1918,8 @@ def _bare_git_copy(path: str) -> bool:
         and os.path.isdir(os.path.join(path, "refs"))
 
 
-def _git_copies_report(path: str, limit: int | None = None) -> tuple[list[str], str]:
+def _git_copies_report(path: str, limit: int | None = None,
+                       skip=()) -> tuple[list[str], str]:
     """(copies git de l'entrée, doute). Une copie est reconnue par son `.git`
     (dossier, ou fichier d'un worktree) ou sa signature de dépôt nu, à toute
     profondeur ; un lien symbolique n'est ni suivi ni ouvert, et le dedans
@@ -1911,9 +1930,14 @@ def _git_copies_report(path: str, limit: int | None = None) -> tuple[list[str], 
     illisible, budget épuisé — pour que l'appelant garde l'entrée au lieu de
     conclure à tort qu'il n'y a rien. Les copies à arbre de travail passent
     avant les dépôts nus : leurs gardes sont plus précises, un dépôt nu n'est
-    qu'un doute conservateur (#2525)."""
+    qu'un doute conservateur (#2525).
+
+    #3277 : `skip`, les dossiers d'un AUTRE utilisateur que celui-ci ne peut
+    pas lire (relevés par `housekeeping_stale.walk`) : ni ouverts ni comptés
+    comme doute — l'appelant ne peut pas plus les supprimer que les lire."""
     if os.path.islink(path) or not os.path.isdir(path):
         return [], ""
+    skip = frozenset(skip or ())
     limit = WALK_LIMIT if limit is None else limit
     trees: list[str] = []
     bare: list[str] = []
@@ -1927,6 +1951,8 @@ def _git_copies_report(path: str, limit: int | None = None) -> tuple[list[str], 
         if _bare_git_copy(current):
             bare.append(current)
             continue          # le dedans d'un dépôt nu ne cache pas d'arbre de travail
+        if current in skip:
+            continue
         if os.path.lexists(os.path.join(current, ".git")):
             trees.append(current)
         try:
@@ -4192,13 +4218,19 @@ def _run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool =
     # #2493 : dernier signalement d'un dossier sans propriétaire, pour ne pas
     # le répéter dans `skipped` à chaque passe (un constat persistant suffit).
     last_unowned: dict[str, dict] = {}
+    # #3277 : dernier constat `over_quota` d'un dossier qu'un autre mesh (ou
+    # une ancienne clé de celui-ci) possède, levé par `resolved` ou `gone`
+    last_over: dict[str, dict] = {}
     try:
         for row in storage.of(db).housekeeping.latest_by_path(host, "tmp"):
             if row.get("action") == "unowned":
                 last_unowned[row["path"]] = row
+            elif row.get("action") == "over_quota":
+                last_over[row["path"]] = row
     except Exception:  # journal illisible : on signale, sans doublon garanti
-        last_unowned = {}
+        last_unowned, last_over = {}, {}
     seen_unowned: set[str] = set()
+    seen_over: set[str] = set()
     if os.path.isdir(troot) and _managed(troot):
         for name in sorted(os.listdir(troot)):
             full = os.path.join(troot, name)
@@ -4207,7 +4239,21 @@ def _run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool =
             owner = read_owner(troot, name)
             if owner is not None and owner != key:
                 # L219: another mesh of this host (same state directory)
-                # manages it: never deleted nor evicted here
+                # manages it: never deleted nor evicted here. #3277 : mais
+                # mesuré, et signalé au-delà du quota ; une ancienne clé de CE
+                # mesh (`former_mesh_keys`) range ses entrées de lots clos.
+                if FALLBACK_SEP in name:
+                    continue
+                from . import housekeeping_stale
+                seen_over.add(full)
+                found = housekeeping_stale.check(
+                    db, troot=troot, name=name, agent=tmp_agent(name, owner),
+                    owner=owner, key=key, policy=policy, now=now, dry_run=dry_run,
+                    previous=last_over.get(full), agents=sorted(registered or ()),
+                    holder=held_by_user)
+                entries += found["entries"]
+                plan += found["plan"]
+                skipped += found["skipped"]
                 continue
             agent = tmp_agent(name, key)
             if registered is None and owner is None:
@@ -4391,6 +4437,11 @@ def _run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool =
                     continue
                 entries.append({"kind": "tmp", "action": "gone", "path": path,
                                 "detail": "unowned temporary directory gone"})
+            for path in last_over:
+                if path in seen_over or os.path.lexists(path):
+                    continue
+                entries.append({"kind": "tmp", "action": "gone", "path": path,
+                                "detail": "temporary directory over quota gone"})
     # 2. caches partagés
     # #3293 : sous pression disque (moins que `free_target` libre sur le
     # système du cache), libérer au moins le déficit — et, pour le cache npm
