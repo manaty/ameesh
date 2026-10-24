@@ -279,6 +279,10 @@ class OperatorMoveTest(_MoveCase):
                          ("atelier", "banc"))
         self.assertEqual(event["data"]["actor"], "human:alice")
         self.assertFalse(event["data"]["source_stopped"])
+        self.assertFalse(event["data"]["lease_held"])
+        self.assertEqual(event["data"]["revoked_lease_owner"], "")
+        self.assertEqual(event["data"]["lease_epoch"],
+                         int(event["data"]["revoked_lease_epoch"]) + 1)
 
     def test_claimable_apres_sync_de_l_arrivee(self):
         self._prepare()
@@ -318,13 +322,43 @@ class OperatorMoveTest(_MoveCase):
         self.assertEqual(registry.get(self.db, "ouvrier")["host"], "atelier")
 
     def test_accepte_bail_vivant_executeur_arrete(self):
+        # B1 auditeur + cx1 : le bail de la source est révoqué atomiquement,
+        # même quand un bail vivant a été accepté (exécuteur source arrêté).
         _row, owner, epoch = self._pret()
         registry.runner_seen(self.db, "atelier", "runner-a", ["ouvrier"])
         self.db.execute("UPDATE agent_registry SET runner_seen_at = "
                         "clock_timestamp() - interval '1 hour' WHERE name = 'ouvrier'")
         result = self._move()
         self.assertEqual(result["to"], "banc")
-        self.assertEqual(registry.get(self.db, "ouvrier")["host"], "banc")
+        row = registry.get(self.db, "ouvrier")
+        self.assertEqual(row["host"], "banc")
+        self.assertIsNone(row["lease_owner"])
+        self.assertIsNone(row["lease_expires_ts"])
+        self.assertEqual(row["lease_epoch"], int(epoch) + 1)
+        self.assertEqual(result["revoked_lease_owner"], owner)
+        self.assertEqual(result["revoked_lease_epoch"], int(epoch))
+        event = self._event(result["event"])["data"]
+        self.assertTrue(event["lease_held"])
+        self.assertEqual(event["revoked_lease_owner"], owner)
+        self.assertEqual(event["revoked_lease_epoch"], int(epoch))
+        # l'ancien exécuteur ne peut plus renouveler ni ouvrir un tour
+        self.assertIsNone(registry.renew(self.db, "ouvrier", owner, epoch, 600))
+        self.assertFalse(registry.begin_turn(self.db, "ouvrier", owner, epoch, "tour"))
+        # l'arrivée peut réclamer après son sync
+        self.sync("banc")
+        self.assertIsNotNone(registry.claim(self.db, "ouvrier", "runner-b", 600))
+
+    def test_session_conservee_revoque_aussi_le_bail(self):
+        _row, owner, epoch = self._pret()
+        registry.runner_seen(self.db, "atelier", "runner-a", ["ouvrier"])
+        self.db.execute("UPDATE agent_registry SET runner_seen_at = "
+                        "clock_timestamp() - interval '1 hour' WHERE name = 'ouvrier'")
+        self._move(keep_session=True)
+        row = registry.get(self.db, "ouvrier")
+        self.assertEqual(row["session_id"], "sess-1")
+        self.assertIsNone(row["lease_owner"])
+        self.assertEqual(row["lease_epoch"], int(epoch) + 1)
+        self.assertIsNone(registry.renew(self.db, "ouvrier", owner, epoch, 600))
 
     def test_unite_inactive_prouve_l_executeur_arrete(self):
         _row, owner, epoch = self._pret()
@@ -334,7 +368,10 @@ class OperatorMoveTest(_MoveCase):
             result = relocation.move_manual(cfg, self.db, "ouvrier", "banc",
                                             actor="human:alice")
         self.assertTrue(result["source_stopped"])
-        self.assertEqual(registry.get(self.db, "ouvrier")["host"], "banc")
+        row = registry.get(self.db, "ouvrier")
+        self.assertEqual(row["host"], "banc")
+        self.assertIsNone(row["lease_owner"])
+        self.assertEqual(row["lease_epoch"], int(epoch) + 1)
 
     def test_unite_inactive_lue_sur_systemd(self):
         # le repli systemd ne lit QUE sur l'hôte source, et une unité chargée
@@ -438,8 +475,15 @@ class OperatorMoveFenceTest(_MoveCase):
         registry.runner_seen(self.db, "atelier", "runner-a", ["ouvrier"])
         self.db.execute("UPDATE agent_registry SET runner_seen_at = "
                         "clock_timestamp() - interval '1 hour' WHERE name = 'ouvrier'")
-        self.assertIsNotNone(self._relocate())
-        self.assertEqual(registry.get(self.db, "ouvrier")["host"], "banc")
+        moved = self._relocate()
+        self.assertIsNotNone(moved)
+        self.assertEqual(moved["previous_lease_owner"], owner)
+        self.assertEqual(moved["previous_lease_epoch"], int(epoch))
+        row = registry.get(self.db, "ouvrier")
+        self.assertEqual(row["host"], "banc")
+        self.assertIsNone(row["lease_owner"])
+        self.assertEqual(row["lease_epoch"], int(epoch) + 1)
+        self.assertIsNone(registry.renew(self.db, "ouvrier", owner, epoch, 600))
 
 
 class OperatorMoveCliTest(_MoveCase):

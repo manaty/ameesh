@@ -2789,8 +2789,17 @@ class Canon(Domain):
         `host` est l'hôte attendu (recontrôlé sous le verrou). `keep_session`
         garde la session native et la consigne ; sinon la session est oubliée,
         `session_reset_at` posé, le statut remis à `queued` (sauf `stopped`,
-        conservé) et `summary` ouvre la consigne en attente. Rend la ligne
-        (`name`, `host`), ou None si une garde a changé depuis la lecture."""
+        conservé) et `summary` ouvre la consigne en attente.
+
+        Le bail de la source est **révoqué dans la même écriture**, même avec
+        `keep_session` : `lease_owner` et `lease_expires_at` vidés,
+        `lease_epoch` incrémenté. `renew` et `begin_turn` ne contrôlent que
+        owner/epoch, pas l'hôte ; sans cette révocation, un exécuteur de départ
+        encore vivant garderait l'agent et l'arrivée ne pourrait pas le
+        réclamer (B1 des deux relectures, #3299). Rend la ligne (`name`,
+        `host`, et le bail révoqué `previous_lease_owner` /
+        `previous_lease_epoch`), ou None si une garde a changé depuis la
+        lecture."""
 
     @abc.abstractmethod
     def stop_removed(self, name: str, host: str, *, pending_text: str,

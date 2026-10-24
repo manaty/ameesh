@@ -129,7 +129,10 @@ def move_manual(cfg, db, name: str, target: str, *, keep_session: bool = False,
     base, périmée au-delà de `runner_liveness_s(cfg)`) ou de l'unité systemd
     inactive quand la commande tourne sur l'hôte source. Le déplacement et son
     journal (`agent.moved`) sont une seule transaction ; les gardes sont
-    revérifiées sous le verrou par `storage.canon.relocate_operator`.
+    revérifiées sous le verrou par `storage.canon.relocate_operator`, qui
+    révoque aussi le bail de la source (owner/échéance NULL, époque +1) :
+    l'ancien exécuteur ne peut plus renouveler ni ouvrir un tour, même avec
+    `keep_session` (B1 #3299).
 
     Rend `{agent, from, to, keep_session, summary, event, source_stopped}` ;
     lève `MoveError` (message actionnable) si le déplacement est refusé."""
@@ -169,12 +172,6 @@ def move_manual(cfg, db, name: str, target: str, *, keep_session: bool = False,
     summary = "" if keep_session else FALLBACK_SUMMARY % (source, target)
     diagnostic = ("moved from %s by hand%s: placement to re-evaluate on %s"
                   % (source, " (%s)" % actor if actor else "", target))
-    data = {"agent": name, "from": source, "to": target,
-            "keep_session": bool(keep_session), "actor": actor or "",
-            "source_stopped": stopped is True,
-            "lease_held": bool(row.get("lease_owner")),
-            "runner_seen_ts": row.get("runner_seen_ts"),
-            "runner_seen_host": row.get("runner_seen_host") or ""}
     with db.transaction() as tx:
         moved = storage.of(tx).canon.relocate_operator(
             name, source, target=target, canon_ref=row.get("canon_ref") or "",
@@ -183,11 +180,26 @@ def move_manual(cfg, db, name: str, target: str, *, keep_session: bool = False,
             runner_stale_s=runner_liveness_s(cfg), source_stopped=stopped is True)
         if moved is None:
             raise MoveError(_manual_refusal(cfg, tx, name, source, target))
+        # le bail révoqué est celui lu sous le verrou, pas celui de la lecture
+        # préalable (une réclamation concurrente a pu le changer)
+        previous_owner = moved.get("previous_lease_owner") or ""
+        previous_epoch = int(moved.get("previous_lease_epoch") or 0)
+        data = {"agent": name, "from": source, "to": target,
+                "keep_session": bool(keep_session), "actor": actor or "",
+                "source_stopped": stopped is True,
+                "lease_held": bool(previous_owner),
+                "revoked_lease_owner": previous_owner,
+                "revoked_lease_epoch": previous_epoch,
+                "lease_epoch": previous_epoch + 1,
+                "runner_seen_ts": row.get("runner_seen_ts"),
+                "runner_seen_host": row.get("runner_seen_host") or ""}
         event = storage.of(tx).events.record(
             MANUAL_EVENT, "agent:%s" % name, None, data)
     return {"agent": name, "from": source, "to": target,
             "keep_session": bool(keep_session), "summary": summary,
-            "event": int(event), "source_stopped": stopped is True}
+            "event": int(event), "source_stopped": stopped is True,
+            "revoked_lease_owner": previous_owner,
+            "revoked_lease_epoch": previous_epoch}
 
 
 def _score(reading: dict, offer: dict | None = None) -> tuple:

@@ -1021,7 +1021,8 @@ def _add_agent_parsers(parent, *, move: bool = False) -> None:
                                  "admitted hosts")
         p_move.add_argument("--keep-session", action="store_true",
                             help="keep the native session (shared session storage); "
-                                 "otherwise it is forgotten and a resume brief is queued")
+                                 "otherwise it is forgotten and a resume brief is queued. "
+                                 "The source lease is revoked either way")
         p_move.add_argument("--actor", default=None,
                             help="who moves the agent (agent name or human:<id>); "
                                  "otherwise this session's identity")

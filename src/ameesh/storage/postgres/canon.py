@@ -520,6 +520,11 @@ class Canon(interface.Canon):
         `source_stopped` (unité de l'exécuteur inactive, prouvée par
         l'appelant). Un bail vivant et un exécuteur frais refusent : on ne
         dépossède pas un exécuteur qui sert encore l'agent.
+
+        Le bail de la source est révoqué dans cette même écriture (owner et
+        échéance vidés, époque +1), `keep_session` compris : `renew` et
+        `begin_turn` ne contrôlent que owner/epoch, jamais l'hôte, donc un
+        exécuteur de départ laissé vivant garderait l'agent (B1 #3299).
         """
         stale = float(runner_stale_s)
         if not stale > 0:
@@ -528,7 +533,7 @@ class Canon(interface.Canon):
             """
             WITH verrou AS (
                 SELECT name, host, status, releve, admitted_hosts, lease_owner,
-                       lease_expires_at, runner_seen_at, runner_seen_host
+                       lease_epoch, lease_expires_at, runner_seen_at, runner_seen_host
                   FROM agent_registry WHERE name = %s FOR UPDATE
             )
             UPDATE agent_registry AS r
@@ -555,6 +560,15 @@ class Canon(interface.Canon):
                                  ELSE 'queued' END,
                    status_text = CASE WHEN r.status = 'stopped' THEN r.status_text
                                       ELSE %s::text END,
+                   -- B1 des deux relectures (#3299) : l'ancien exécuteur ne
+                   -- doit plus pouvoir renouveler ni ouvrir un tour (renew et
+                   -- begin_turn ne contrôlent que owner/epoch, pas l'hôte).
+                   -- Même avec --keep-session, le bail de la source est révoqué
+                   -- dans CETTE écriture ; l'époque avance et l'arrivée peut
+                   -- réclamer après son sync.
+                   lease_owner = NULL,
+                   lease_expires_at = NULL,
+                   lease_epoch = r.lease_epoch + 1,
                    updated_at = now()
               FROM verrou
              WHERE r.name = verrou.name
@@ -577,7 +591,9 @@ class Canon(interface.Canon):
                             AND verrou.runner_seen_at IS NOT NULL
                             AND verrou.runner_seen_at >
                                 clock_timestamp() - (%s::float8 * interval '1 second')))
-              RETURNING r.name, r.host
+              RETURNING r.name, r.host,
+                        verrou.lease_owner AS previous_lease_owner,
+                        verrou.lease_epoch AS previous_lease_epoch
             """,
             (name, target, canon_ref, diagnostic, ref, bool(keep_session),
              bool(keep_session), bool(keep_session), bool(keep_session), summary, summary,
