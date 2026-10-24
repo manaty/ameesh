@@ -1919,8 +1919,13 @@ class _ForcedPort:
         return self.port.commit(lot, force=True, **kwargs)
 
 
-def _selection(inputs: Inputs, port, *, force: bool = False) -> dict:
-    """The `apply` call, shared by the hook and the recovery path."""
+def _selection(inputs: Inputs, port, *, force: bool = False,
+               kept: Sequence[Mapping] = ()) -> dict:
+    """The `apply` call, shared by the hook and the recovery path.
+
+    `kept` (#3367) : the seats a reassignment keeps (live, or verdict acquired
+    on the frozen head). They count like the manual seats: only the missing
+    seats are selected."""
     if force:
         port = _ForcedPort(port)
     return rd.apply(
@@ -1930,7 +1935,8 @@ def _selection(inputs: Inputs, port, *, force: bool = False) -> dict:
         risk=inputs.policy.risk, base=inputs.base, policy_ref=inputs.policy.ref,
         notify=inputs.notify, unknown_authors=inputs.unknown_authors,
         families=inputs.policy.families,
-        already=inputs.manual_seats, fixers=inputs.correctors,
+        already=list(inputs.manual_seats) + [dict(seat) for seat in kept or ()],
+        fixers=inputs.correctors,
         required=inputs.policy.required, advances=inputs.advances)
 
 
@@ -2794,6 +2800,46 @@ def _reviewer_rows(listing: Iterable[Mapping]) -> dict:
     return by_name
 
 
+def _head_voters(db, lot: int, sha: str, by_name: Mapping) -> set:
+    """The names whose verdict names the exact frozen head, case-folded (#3367).
+
+    A seat whose reviewer already gave its verdict (`ok` or `blocked`) on the
+    frozen head is not lost when its host closes: the gate reads that verdict,
+    and a replacement would only owe a second, useless one. Only a verdict on
+    that exact commit counts (the full id, or an abbreviation of at least 7
+    characters): a verdict on an earlier head, or without a commit, leaves the
+    seat to replace. An actor known by an alias also counts under its
+    registry name.
+    """
+    head = str(sha or "").strip().lower()
+    voters: set = set()
+    if not head:
+        return voters
+    for row in storage.of(db).work.milestones(int(lot), None) or ():
+        if row.get("kind") != "verdict":
+            continue
+        noted = str(row.get("sha") or "").strip().lower()
+        if not noted or not (noted == head
+                             or (len(noted) >= 7 and head.startswith(noted))):
+            continue
+        actor = str(row.get("actor") or "").strip()
+        if not actor:
+            continue
+        voters.add(actor.casefold())
+        primary = str((by_name.get(actor) or {}).get("name") or "").strip()
+        if primary:
+            voters.add(primary.casefold())
+    return voters
+
+
+def _acquired(name: str, voters: set, by_name: Mapping) -> bool:
+    """Whether `name` (or its registry name) is among the head's voters."""
+    if name.casefold() in voters:
+        return True
+    primary = str((by_name.get(name) or {}).get("name") or "").strip()
+    return bool(primary) and primary.casefold() in voters
+
+
 def _unreachable_lots(db, *, after: int, hosts: Sequence[str],
                       scan: int = REASSIGN_SCAN) -> list:
     """Open lots whose reviewer column names an unreachable agent (#3328).
@@ -2837,6 +2883,147 @@ def _unreachable_lots(db, *, after: int, hosts: Sequence[str],
         " ORDER BY w.id ASC LIMIT %s", tuple(params))
 
 
+#: #3367 : the journal reason of a reseat whose kept seats cover every opinion
+COVERED_WHY = ("unreachable seat(s) dropped: the kept seats cover the required"
+               " review(s)")
+
+
+class _SeatsMoved(Exception):
+    """#3367 : the mark the pass read is no longer the freeze's effective mark."""
+
+
+class _ReseatPort(_ForcedPort):
+    """#3367 : the port of a reassignment, which replaces only the dead seats.
+
+    `kept` (live seats, and seats whose verdict is acquired on the frozen head)
+    stays in the written mark, before the replacements, and receives no new
+    mail. Under the lock of the lot row, the effective mark must still be the
+    one the pass read (`mark_id`): a concurrent pass (another host) that
+    already moved the seats makes this one write nothing. Without a
+    replacement (`waiting`), no mark is written: a waiting mark would retire
+    the live seats from the column, so the designation stays as it is and the
+    caller alerts the pilot.
+    """
+
+    def __init__(self, port, *, kept: Sequence[Mapping], mark_id: int) -> None:
+        super().__init__(port)
+        self.kept = [{"name": str((seat or {}).get("name") or "").strip(),
+                      "family": str((seat or {}).get("family") or "").strip()}
+                     for seat in kept or () if str((seat or {}).get("name") or "").strip()]
+        self.mark_id = int(mark_id)
+
+    def commit(self, lot: int, **kwargs) -> dict:
+        db = self.port.db
+        freeze = dict(kwargs.get("freeze") or {})
+        db.query("SELECT id FROM work_items WHERE id = %s FOR NO KEY UPDATE",
+                 (int(lot),))
+        effective = _effective_mark(db, int(lot), int(freeze.get("id") or 0))
+        if effective is None or int(effective[0]) != self.mark_id:
+            raise _SeatsMoved("the designation of freeze #%s moved during the pass:"
+                              " nothing written" % (freeze.get("id"),))
+        if kwargs.get("state") == rd.WAITING:
+            return {"state": rd.WAITING, "required": int(kwargs.get("required") or 0),
+                    "reviewers": [], "missing": int(kwargs.get("missing") or 0),
+                    "why": str(kwargs.get("why") or ""), "freeze": freeze}
+        names = {seat["name"] for seat in self.kept}
+        kwargs["reviewers"] = self.kept + [
+            dict(row) for row in kwargs.get("reviewers") or ()
+            if str((row or {}).get("name") or "").strip() not in names]
+        return super().commit(lot, **kwargs)
+
+
+def _reseat_alert(db, item: Mapping, freeze: Mapping, notify: str,
+                  kept: Sequence[Mapping], dead: Sequence[tuple], out: Mapping,
+                  threads: list) -> None:
+    """Tells the pilot that a lost seat has no replacement (#3367)."""
+    if not notify or registry.get(db, notify) is None:
+        return
+    from . import mail
+
+    lot = int((item or {}).get("id") or 0)
+    body = "\n".join([
+        "Unreachable reviewer seat without a replacement (canon §2, #3328/#3367).",
+        "",
+        "Lot: #%s \"%s\"" % (lot, " ".join(str((item or {}).get("title") or "").split())),
+        "- Freeze: frozen milestone %s." % _freeze_label(freeze),
+        "- Unreachable: %s." % "; ".join("%s (%s)" % (name, why) for name, why in dead),
+        "- Kept: %s." % (", ".join(seat["name"] for seat in kept) or "none"),
+        "- No replacement: %s" % (out.get("why") or "no eligible reviewer"),
+        "",
+        "The designation is unchanged: the unreachable reviewer keeps its request",
+        "and reviews when its host comes back. To move the seat now:",
+        "  ameesh work reviewer %d <agent>" % lot,
+    ])
+    mail.send(db, SENDER, notify, body, work_item_id=str(lot),
+              payload={"review_designation": {
+                  "lot": lot, "freeze": int((freeze or {}).get("id") or 0),
+                  "sha": str((freeze or {}).get("sha") or ""),
+                  "state": rd.WAITING, "reassign": True}},
+              after_commit=threads)
+
+
+def reseat(cfg, db, lot: int, *, freeze: Mapping, kept: Sequence[Mapping],
+           dead: Sequence[tuple], mark_id: int) -> dict:
+    """Replaces only the dead seats of a freeze's designation (#3367).
+
+    `reassign_unreachable` used to replay the whole designation (`force`): a
+    live reviewer could lose its seat to a less loaded agent of its family, and
+    a seat whose verdict was already acquired on the frozen head was handed to
+    someone else. Here the `kept` seats count like manual seats, only the
+    missing ones are selected and mailed, and the new mark names the kept
+    seats then the replacements. When the kept seats already cover the
+    required opinions, the dead seats are simply dropped (no mail).
+
+    Nothing is written when the replay cannot conclude: a head or policy that
+    cannot be read, no review due, or a freeze that moved returns the outcome
+    with the designation untouched — the former replay cleared the whole
+    column in that case. Without a replacement, the designation is unchanged
+    and the pilot gets one alert.
+    """
+    freeze = dict(freeze or {})
+
+    def unchanged(state: str, why: str) -> dict:
+        return {"state": state, "reviewers": [], "freeze": freeze, "why": why}
+
+    if not _SHA_TEXT.fullmatch(str(freeze.get("sha") or "").strip().lower()):
+        return unchanged("unavailable", "freeze #%s names %r, not a full commit id"
+                         % (freeze.get("id"), str(freeze.get("sha") or "")))
+    item = work.get(db, int(lot)) or {"id": int(lot), "state": "", "title": "",
+                                      "app": ""}
+    if _waiver(item):
+        return unchanged("manual", "manual waiver (-none)")
+    threads = _threads()
+    try:
+        inputs = prepare(cfg, db, int(lot), freeze=freeze)
+        if isinstance(inputs, Unavailable):
+            return unchanged("unavailable", inputs.why)
+        if not inputs.paths or inputs.policy.required == 0:
+            return unchanged(rd.NONE, LIGHT_WHY if inputs.paths else NO_PATH_WHY)
+        with db.transaction() as tx:
+            port = _ReseatPort(pg.PgPort(tx, after_commit=threads, at_freeze=False),
+                               kept=kept, mark_id=mark_id)
+            out = _selection(inputs, port, kept=port.kept)
+            if out.get("state") == "manual" and port.kept:
+                out = port.commit(
+                    int(lot), freeze=out.get("freeze") or freeze,
+                    required=int(out.get("required") or 0), state=rd.DESIGNATED,
+                    reviewers=(), missing=0, why=COVERED_WHY, authors=inputs.authors,
+                    policy_ref=inputs.policy.ref, notify=inputs.notify, messages=(),
+                    unknown_authors=inputs.unknown_authors)
+            if out.get("state") == rd.DESIGNATED:
+                _sync_reviewers(tx, item, freeze,
+                                [r.get("name") for r in out.get("reviewers") or ()])
+            elif out.get("state") == rd.WAITING:
+                _reseat_alert(tx, item, freeze, inputs.notify, port.kept, dead, out,
+                              threads)
+        _drain(db, threads)
+        return out
+    except (_SeatsMoved, rd.StaleFreeze) as exc:
+        return unchanged("stale", str(exc))
+    except rd.DesignationError as exc:
+        return unchanged("unavailable", str(exc))
+
+
 def reassign_unreachable(cfg, db, *, limit: int = RETRY_LIMIT) -> dict:
     """Replays the designation of a lot whose reviewer became unreachable.
 
@@ -2844,12 +3031,17 @@ def reassign_unreachable(cfg, db, *, limit: int = RETRY_LIMIT) -> dict:
     written before the host was lost keeps a dead seat: the request sits in a
     mailbox nobody will read, and the freeze waits for a verdict that cannot
     come. On the next runner pass, an open lot whose **effective automatic**
-    mark of its latest freeze names an unreachable reviewer is re-designated on
-    the same freeze (`force=True`), with the usual selection (another agent of
-    the same family, else an explicit wait and the pilot's capacity alert). The
-    seat is journaled once per `(freeze, unreachable names)`: a replacement
-    that later dies is a new loss and is handled again; a pass that cannot
-    replace the same names does not loop.
+    mark of its latest freeze names an unreachable reviewer gets that seat
+    replaced on the same freeze (`reseat`), with the usual selection, else the
+    pilot's alert and the designation unchanged. The seat is journaled once per
+    `(freeze, unreachable names)`: a replacement that later dies is a new loss
+    and is handled again; a pass that cannot replace the same names does not
+    loop.
+
+    #3367 : only the dead seats move. A live seat is never replaced, and an
+    unreachable reviewer whose verdict is acquired on the exact frozen head
+    keeps its seat (`_head_voters`): the 15:54Z pass of 24/10 had re-designated
+    the whole set of 10 lots whose two families had already approved the head.
 
     The pass reads only machine evidence (registry, host lifecycle, journal)
     and never raises: the runner logs the summary. It does not touch a manual
@@ -2926,7 +3118,8 @@ def reassign_unreachable(cfg, db, *, limit: int = RETRY_LIMIT) -> dict:
                     or str((mark[2] or {}).get("state") or "") != rd.DESIGNATED:
                 out["skipped"] += 1
                 continue
-            dead = []
+            dead, kept = [], []
+            voters = None
             column = {str(name or "").strip()
                       for name in (row.get("reviewers") or ()) if str(name or "").strip()}
             for reviewer in (mark[2] or {}).get("reviewers") or ():
@@ -2937,34 +3130,57 @@ def reassign_unreachable(cfg, db, *, limit: int = RETRY_LIMIT) -> dict:
                     continue
                 why = _unreachable_reviewer(by_name.get(name), closed)
                 if why:
-                    dead.append((name, why))
+                    if voters is None:
+                        voters = _head_voters(db, lot, str(freeze.get("sha") or ""),
+                                              by_name)
+                    if not _acquired(name, voters, by_name):
+                        dead.append((name, why))
+                        continue
+                # #3367 : a live seat, or a verdict acquired on the frozen
+                # head, is kept as it is.
+                kept.append({"name": name,
+                             "family": str((reviewer or {}).get("family") or "").strip()})
             if not dead:
                 out["skipped"] += 1
                 continue
-            out["examined"] += 1
             names = ",".join(sorted(name for name, _why in dead))
             prefix = "%s%d:%d:%s:" % (REASSIGN_PREFIX, lot, freeze_id, names)
             since = float(freeze.get("at_ts") or 0.0)
             if storage.of(db).work.events_noted(prefix, since, ids=[lot]):
                 out["skipped"] += 1
                 continue
+            out["examined"] += 1
             attempted += 1
-            result = designate(cfg, db, lot, freeze=freeze, force=True)
+            result = reseat(cfg, db, lot, freeze=freeze, kept=kept, dead=dead,
+                            mark_id=int(mark[0]))
         except Exception as exc:  # noqa: BLE001 - one lot never stops the pass
             out["errors"].append("#%d: %s: %s"
                                  % (lot, type(exc).__name__, str(exc)[:160]))
             continue
-        replaced = [str((reviewer or {}).get("name") or "").strip()
-                    for reviewer in (result or {}).get("reviewers") or ()]
+        outcome = str((result or {}).get("state") or "")
+        if outcome == "stale":
+            # The freeze or its mark moved under the pass (another host's
+            # pass, a new freeze): nothing was written, the next pass reads
+            # the new designation.
+            out["skipped"] += 1
+            continue
+        kept_names = [seat["name"] for seat in kept]
+        added = [str((reviewer or {}).get("name") or "").strip()
+                 for reviewer in (result or {}).get("reviewers") or ()
+                 if str((reviewer or {}).get("name") or "").strip() not in kept_names]
         why_text = "; ".join("%s (%s)" % (name, why) for name, why in dead)
-        if str((result or {}).get("state") or "") == rd.DESIGNATED:
+        if outcome == rd.DESIGNATED:
             out["reassigned"] += 1
-            tail = "replaced by %s" % ", ".join(replaced)
-        elif str((result or {}).get("state") or "") == rd.WAITING:
+            tail = ("replaced by %s" % ", ".join(added) if added
+                    else str(result.get("why") or COVERED_WHY))
+        elif outcome == rd.WAITING:
             out["waiting"] += 1
-            tail = "no replacement: %s" % (result.get("why") or "waiting")
+            tail = ("no replacement: %s; designation unchanged"
+                    % (result.get("why") or "waiting"))
         else:
-            tail = "designation replayed: %s" % (result.get("why") or "unchanged")
+            tail = "designation unchanged: %s" % (result.get("why") or outcome)
+        if kept_names:
+            tail += "; kept: %s" % ", ".join(kept_names)
         try:
             storage.of(db).work.note(
                 lot, state,

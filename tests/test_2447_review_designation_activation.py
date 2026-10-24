@@ -1398,19 +1398,177 @@ class UnreachableDesignationTest(_ActivationFixture, PgTestCase):
 
     def test_a_reassignment_without_a_replacement_waits_once(self):
         # Seule la famille claude est disponible et son agent est mort : la
-        # reprise attend (alerte pilote), une seule fois, au lieu de réécrire
-        # le même siège mort à chaque passe.
+        # reprise alerte le pilote, une seule fois, au lieu de réécrire le
+        # même siège mort à chaque passe. #3367 : la désignation reste telle
+        # quelle — une marque d'attente retirait aussi r2, vivant, de la
+        # colonne ; r1 garde sa demande et relira au retour de son hôte.
         _, out = self.freeze()
         self._move_to_lost("r1")
         self._lose_host()
         report = act.reassign_unreachable(self.cfg, self.db)
         self.assertEqual(report["waiting"], 1, report)
-        self.assertEqual(self._designated()["state"], rd.WAITING)
+        noted = self._designated()
+        self.assertEqual(noted["state"], rd.DESIGNATED, noted)
+        self.assertEqual(sorted(r["name"] for r in noted["reviewers"]), ["r1", "r2"])
+        self.assertEqual(sorted(self._column()), ["r1", "r2"])
         self.assertIn("pilot", [m["recipient"] for m in self.mailbox()])
+        self.assertIn("designation unchanged", self.notes(act.REASSIGN_PREFIX)[-1])
         mails = len(self.mailbox())
         again = act.reassign_unreachable(self.cfg, self.db)
         self.assertEqual(again["examined"], 0, again)
         self.assertEqual(len(self.mailbox()), mails)
+
+    # -- #3367 : seuls les sièges morts bougent -----------------------------
+    def _column(self):
+        return list(self.db.query(
+            "SELECT reviewers FROM work_items WHERE id = %s",
+            (self.lot,))[0]["reviewers"] or [])
+
+    def _verdict(self, actor, sha=None, verdict="ok"):
+        work.milestone(self.db, self.lot, "verdict", sha=sha or self.frozen,
+                       actor=actor, verdict=verdict, repo=self.repo.root,
+                       after_commit=[])
+
+    def _requests(self, name):
+        return [m for m in self.mailbox()
+                if m["recipient"] == name and m["kind"] == rd.REQUEST_KIND]
+
+    def test_a_lost_seat_whose_verdict_is_acquired_on_the_head_is_kept(self):
+        # Témoin du lot : r1 a rendu son verdict sur la tête gelée exacte (même
+        # abrégé), puis son hôte se ferme. Le siège n'est pas perdu : aucune
+        # redésignation, aucun courrier, la marque et la colonne sont gardées.
+        self._agent("r3", "claude")
+        _, out = self.freeze()
+        self.assertEqual(sorted(r["name"] for r in out["reviewers"]), ["r1", "r2"])
+        self._verdict("r1", sha=self.frozen[:12])
+        self._verdict("r2")
+        self._move_to_lost("r1")
+        self._lose_host()
+        marks, mails = len(self.marks()), len(self.mailbox())
+        report = act.reassign_unreachable(self.cfg, self.db)
+        self.assertEqual(report["examined"], 0, report)
+        self.assertEqual(report["reassigned"], 0, report)
+        self.assertEqual(len(self.marks()), marks)
+        self.assertEqual(len(self.mailbox()), mails)
+        self.assertEqual(sorted(self._column()), ["r1", "r2"])
+        self.assertFalse(self.notes(act.REASSIGN_PREFIX))
+
+    def test_a_blocking_verdict_on_the_head_is_acquired_too(self):
+        # Un `blocked` sur la tête gelée est aussi un avis rendu : un
+        # remplaçant ne lèverait pas le blocage, il faut une nouvelle tête.
+        self._agent("r3", "claude")
+        self.freeze()
+        self._verdict("r1", verdict="blocked")
+        self._move_to_lost("r1")
+        self._lose_host()
+        report = act.reassign_unreachable(self.cfg, self.db)
+        self.assertEqual(report["examined"], 0, report)
+        self.assertEqual(sorted(self._column()), ["r1", "r2"])
+
+    def test_a_verdict_on_an_earlier_head_does_not_keep_the_seat(self):
+        # Le vrai trou (#3340) : r1 a relu une autre tête, pas celle du gel.
+        # Son siège est remplacé, r2 garde le sien.
+        self._agent("r3", "claude")
+        self.repo.write("docs/earlier.md", "earlier head\n")
+        earlier = self.repo.commit("earlier head")
+        self.freeze()
+        self._verdict("r1", sha=earlier)
+        self._move_to_lost("r1")
+        self._lose_host()
+        report = act.reassign_unreachable(self.cfg, self.db)
+        self.assertEqual(report["reassigned"], 1, report)
+        self.assertEqual(sorted(self._column()), ["r2", "r3"])
+
+    def test_a_live_seat_is_never_replaced(self):
+        # Le cas #3341 : r2 (codex) est vivant, r4 (codex) est moins chargé.
+        # L'ancien rejeu complet (force=True) reprenait r4 à la place de r2 ;
+        # seul le siège mort (r1) est remplacé, et seul r3 reçoit un courrier.
+        self._agent("r3", "claude")
+        self._agent("r4", "codex")
+        _, out = self.freeze()
+        self.assertEqual(sorted(r["name"] for r in out["reviewers"]), ["r1", "r2"])
+        self._move_to_lost("r1")
+        self._lose_host()
+        before = len(self._requests("r2"))
+        report = act.reassign_unreachable(self.cfg, self.db)
+        self.assertEqual(report["reassigned"], 1, report)
+        noted = self._designated()
+        self.assertEqual([r["name"] for r in noted["reviewers"]], ["r2", "r3"], noted)
+        self.assertEqual(sorted(self._column()), ["r2", "r3"])
+        self.assertEqual(len(self._requests("r2")), before)
+        self.assertEqual(len(self._requests("r3")), 1)
+        self.assertFalse(self._requests("r4"))
+        note = self.notes(act.REASSIGN_PREFIX)[-1]
+        self.assertIn("replaced by r3", note)
+        self.assertIn("kept: r2", note)
+
+    def test_kept_seats_that_cover_the_opinions_drop_the_dead_one(self):
+        # Trois sièges dont un mort : les deux vivants couvrent les deux
+        # familles requises. Le mort est retiré, personne n'est désigné ni
+        # prévenu.
+        self._agent("r5", "claude")
+        row, _out = self.freeze()
+        note = pg._mark_note(
+            self.lot, int(row["id"]), state=rd.DESIGNATED, required=2,
+            reviewers=[{"name": "r1", "family": "claude"},
+                       {"name": "r2", "family": "codex"},
+                       {"name": "r5", "family": "claude"}],
+            missing=0, why="test: three seats", authors=[], policy_ref="",
+            sha=self.frozen)
+        storage.of(self.db).work.note(self.lot, "build", note, "test")
+        self.db.execute(
+            "UPDATE work_items SET reviewers = ARRAY['r1', 'r2', 'r5'] WHERE id = %s",
+            (self.lot,))
+        self._move_to_lost("r1")
+        self._lose_host()
+        mails = len(self.mailbox())
+        report = act.reassign_unreachable(self.cfg, self.db)
+        self.assertEqual(report["reassigned"], 1, report)
+        noted = self._designated()
+        self.assertEqual([r["name"] for r in noted["reviewers"]], ["r2", "r5"], noted)
+        self.assertEqual(sorted(self._column()), ["r2", "r5"])
+        self.assertEqual(len(self.mailbox()), mails)
+        self.assertIn(act.COVERED_WHY, self.notes(act.REASSIGN_PREFIX)[-1])
+
+    def test_an_unreadable_head_never_clears_the_seats(self):
+        # #3341 à 15:56Z : le rejeu n'a trouvé aucun dépôt tenant la tête
+        # gelée, et le chemin « indisponible » a vidé la colonne (cx1, dev7).
+        # La reprise n'écrit plus rien quand elle ne peut pas conclure.
+        self._agent("r3", "claude")
+        self.freeze()
+        self._move_to_lost("r1")
+        self._lose_host()
+        marks, mails = len(self.marks()), len(self.mailbox())
+        unreadable = act.Unavailable(
+            "no repository holds the frozen head: cannot read the frozen diff")
+        with mock.patch.object(act, "prepare", return_value=unreadable):
+            report = act.reassign_unreachable(self.cfg, self.db)
+        self.assertEqual(report["reassigned"], 0, report)
+        self.assertEqual(sorted(self._column()), ["r1", "r2"])
+        self.assertEqual(len(self.marks()), marks)
+        self.assertEqual(len(self.mailbox()), mails)
+        self.assertFalse(self.notes(act.UNAVAILABLE_PREFIX))
+        self.assertIn("designation unchanged: no repository holds",
+                      self.notes(act.REASSIGN_PREFIX)[-1])
+
+    def test_a_mark_moved_by_another_pass_writes_nothing(self):
+        # Deux hôtes passent en même temps : celui qui arrive second lit une
+        # marque qui n'est plus la marque effective, et n'écrit rien.
+        self._agent("r3", "claude")
+        row, _out = self.freeze()
+        self._move_to_lost("r1")
+        self._lose_host()
+        freeze = act._latest_freeze(self.db, self.lot)
+        stale_mark = act._effective_mark(self.db, self.lot, int(freeze["id"]))
+        storage.of(self.db).work.note(self.lot, "build", self.marks()[-1], "test")
+        marks, mails = len(self.marks()), len(self.mailbox())
+        out = act.reseat(self.cfg, self.db, self.lot, freeze=freeze,
+                         kept=[{"name": "r2", "family": "codex"}],
+                         dead=[("r1", "host lost")], mark_id=int(stale_mark[0]))
+        self.assertEqual(out["state"], "stale", out)
+        self.assertEqual(len(self.marks()), marks)
+        self.assertEqual(len(self.mailbox()), mails)
+        self.assertEqual(sorted(self._column()), ["r1", "r2"])
 
     def test_two_hundred_older_healthy_lots_do_not_hide_the_lost_seat(self):
         # Relecture #132625 (1) : la fenêtre bornée lisait les 200 lots
