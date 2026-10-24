@@ -104,8 +104,12 @@ def _manual_refusal(cfg, db, name: str, source: str, target: str) -> str:
     if current and current != source:
         return ("%s left %s meanwhile (now on %s): nothing moved"
                 % (name, source, current))
-    if row.get("status") == "running" or registry.turn_in_progress(db, name):
+    if registry.turn_in_progress(db, name):
         return "%s has a turn in progress: never moved mid-turn" % name
+    if row.get("status") == "running":
+        return ("%s still has a stale 'running' status (no live lease): let the "
+                "runner's reap settle it or run \"ameesh resume %s\", then retry"
+                % (name, name))
     if target not in (row.get("admitted_hosts") or ()):
         return ("%s is no longer admitted on %s: its Placement changed meanwhile"
                 % (name, target))
@@ -162,8 +166,13 @@ def move_manual(cfg, db, name: str, target: str, *, keep_session: bool = False,
             % (name, target, ", ".join(admitted) or "nowhere"))
     if target in host_holds.live(db):
         raise MoveError("host %s is on hold: no agent is moved onto it" % target)
-    if row.get("status") == "running" or registry.turn_in_progress(db, name):
+    if registry.turn_in_progress(db, name):
         raise MoveError("%s has a turn in progress: never moved mid-turn" % name)
+    if row.get("status") == "running":
+        raise MoveError(
+            "%s still has a stale 'running' status (no live lease): let the "
+            "runner's reap settle it or run \"ameesh resume %s\", then retry"
+            % (name, name))
     if storage.of(db).handoffs.active(name):
         raise MoveError(
             "%s has an open host handoff: finish or cancel it before moving it"
@@ -184,9 +193,12 @@ def move_manual(cfg, db, name: str, target: str, *, keep_session: bool = False,
         # préalable (une réclamation concurrente a pu le changer)
         previous_owner = moved.get("previous_lease_owner") or ""
         previous_epoch = int(moved.get("previous_lease_epoch") or 0)
+        # preuve locale retenue par l'écriture (unité propre à l'agent), pas
+        # l'état brut du gabarit systemd qui répond inactive pour tout nom
+        proof = bool(moved.get("source_stopped"))
         data = {"agent": name, "from": source, "to": target,
                 "keep_session": bool(keep_session), "actor": actor or "",
-                "source_stopped": stopped is True,
+                "source_stopped": proof,
                 "lease_held": bool(previous_owner),
                 "revoked_lease_owner": previous_owner,
                 "revoked_lease_epoch": previous_epoch,
@@ -197,7 +209,7 @@ def move_manual(cfg, db, name: str, target: str, *, keep_session: bool = False,
             MANUAL_EVENT, "agent:%s" % name, None, data)
     return {"agent": name, "from": source, "to": target,
             "keep_session": bool(keep_session), "summary": summary,
-            "event": int(event), "source_stopped": stopped is True,
+            "event": int(event), "source_stopped": proof,
             "revoked_lease_owner": previous_owner,
             "revoked_lease_epoch": previous_epoch}
 

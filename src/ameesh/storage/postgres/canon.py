@@ -521,6 +521,13 @@ class Canon(interface.Canon):
         l'appelant). Un bail vivant et un exécuteur frais refusent : on ne
         dépossède pas un exécuteur qui sert encore l'agent.
 
+        `source_stopped` n'est retenu que si le dernier relevé vient de
+        l'unité DE CET agent (`runner_seen_owner` = `runner-<nom>@…`) : le
+        gabarit systemd `ameesh-runner-agent@<nom>.service` répond
+        `loaded`/`inactive` pour n'importe quel nom jamais instancié, et un
+        agent mené par une autre unité (coordinateur partagé) garderait sinon
+        un bail vivant (B de la relecture #3299).
+
         Le bail de la source est révoqué dans cette même écriture (owner et
         échéance vidés, époque +1), `keep_session` compris : `renew` et
         `begin_turn` ne contrôlent que owner/epoch, jamais l'hôte, donc un
@@ -533,7 +540,8 @@ class Canon(interface.Canon):
             """
             WITH verrou AS (
                 SELECT name, host, status, releve, admitted_hosts, lease_owner,
-                       lease_epoch, lease_expires_at, runner_seen_at, runner_seen_host
+                       lease_epoch, lease_expires_at, runner_seen_at, runner_seen_host,
+                       runner_seen_owner
                   FROM agent_registry WHERE name = %s FOR UPDATE
             )
             UPDATE agent_registry AS r
@@ -582,8 +590,15 @@ class Canon(interface.Canon):
                -- #254 : rien ne part vers un hôte en pause
                AND NOT EXISTS (SELECT 1 FROM host_holds hh
                                 WHERE hh.host = %s AND hh.until > clock_timestamp())
-               -- #3299 : bail vivant refusé, sauf exécuteur de départ arrêté
-               AND (%s::boolean
+               -- #3299 : bail vivant refusé, sauf exécuteur de départ arrêté.
+               -- La preuve locale (unité inactive) ne vaut que si le dernier
+               -- relevé vient de l'unité DE CET agent (`runner-<nom>@…`) : le
+               -- gabarit systemd répond loaded/inactive pour tout nom, même
+               -- jamais instancié, et un agent servi par une autre unité
+               -- (coordinateur partagé) garderait sinon un bail vivant.
+               AND ((%s::boolean
+                     AND starts_with(coalesce(verrou.runner_seen_owner, ''),
+                                     'runner-' || verrou.name || '@'))
                     OR verrou.lease_owner IS NULL
                     OR verrou.lease_expires_at IS NULL
                     OR verrou.lease_expires_at <= clock_timestamp()
@@ -593,12 +608,16 @@ class Canon(interface.Canon):
                                 clock_timestamp() - (%s::float8 * interval '1 second')))
               RETURNING r.name, r.host,
                         verrou.lease_owner AS previous_lease_owner,
-                        verrou.lease_epoch AS previous_lease_epoch
+                        verrou.lease_epoch AS previous_lease_epoch,
+                        (%s::boolean
+                         AND starts_with(coalesce(verrou.runner_seen_owner, ''),
+                                         'runner-' || verrou.name || '@'))
+                            AS source_stopped
             """,
             (name, target, canon_ref, diagnostic, ref, bool(keep_session),
              bool(keep_session), bool(keep_session), bool(keep_session), summary, summary,
              bool(keep_session), "moved to %s (manual)" % target,
-             host, target, target, bool(source_stopped), stale),
+             host, target, target, bool(source_stopped), stale, bool(source_stopped)),
         )
         return rows[0] if rows else None
 

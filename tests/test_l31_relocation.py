@@ -298,6 +298,17 @@ class OperatorMoveTest(_MoveCase):
             self._move()
         self.assertEqual(registry.get(self.db, "ouvrier")["host"], "atelier")
 
+    def test_refuse_un_running_perime_avec_reprise(self):
+        # N de la relecture #3299 : un statut `running` sans bail vivant n'est
+        # pas un tour ; le refus dit comment le solder (reap ou reprise).
+        _row, owner, epoch = self._pret()
+        self.db.execute("UPDATE agent_registry SET status = 'running', "
+                        "lease_expires_at = clock_timestamp() - interval '1 minute' "
+                        "WHERE name = 'ouvrier'")
+        with self.assertRaisesRegex(relocation.MoveError, "ameesh resume"):
+            self._move()
+        self.assertEqual(registry.get(self.db, "ouvrier")["host"], "atelier")
+
     def test_refuse_hote_non_admis(self):
         self._prepare()
         self.db.execute("UPDATE agent_registry SET admitted_hosts = ARRAY['atelier'] "
@@ -362,7 +373,8 @@ class OperatorMoveTest(_MoveCase):
 
     def test_unite_inactive_prouve_l_executeur_arrete(self):
         _row, owner, epoch = self._pret()
-        registry.runner_seen(self.db, "atelier", "runner-a", ["ouvrier"])
+        # l'unité DE cet agent a relevé le dernier passage (runner-<nom>@…)
+        registry.runner_seen(self.db, "atelier", "runner-ouvrier@atelier", ["ouvrier"])
         cfg = dataclasses.replace(self.cfg, host="atelier")
         with mock.patch.object(relocation, "unit_stopped", return_value=True):
             result = relocation.move_manual(cfg, self.db, "ouvrier", "banc",
@@ -372,6 +384,23 @@ class OperatorMoveTest(_MoveCase):
         self.assertEqual(row["host"], "banc")
         self.assertIsNone(row["lease_owner"])
         self.assertEqual(row["lease_epoch"], int(epoch) + 1)
+
+    def test_unite_inactive_d_un_autre_runner_ne_prouve_rien(self):
+        # le gabarit `ameesh-runner-agent@<nom>.service` répond loaded/inactive
+        # pour tout nom jamais instancié : si le dernier relevé vient d'une
+        # AUTRE unité (coordinateur partagé), la preuve locale ne vaut pas et
+        # le bail vivant doit refuser (B de la relecture #3299).
+        _row, owner, epoch = self._pret()
+        registry.runner_seen(self.db, "atelier", "runner-ima@atelier", ["ouvrier"])
+        cfg = dataclasses.replace(self.cfg, host="atelier")
+        with mock.patch.object(relocation, "unit_stopped", return_value=True):
+            with self.assertRaisesRegex(relocation.MoveError, "live lease"):
+                relocation.move_manual(cfg, self.db, "ouvrier", "banc",
+                                       actor="human:alice")
+        row = registry.get(self.db, "ouvrier")
+        self.assertEqual(row["host"], "atelier")
+        self.assertEqual(row["lease_owner"], owner)
+        self.assertEqual(row["lease_epoch"], int(epoch))
 
     def test_unite_inactive_lue_sur_systemd(self):
         # le repli systemd ne lit QUE sur l'hôte source, et une unité chargée

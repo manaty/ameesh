@@ -2782,9 +2782,12 @@ class Canon(Domain):
         départ est arrêté — `runner_seen_at` plus vieux que `runner_stale_s`
         (horloge de la base), `runner_seen_host` d'un autre hôte, ou
         `source_stopped` (preuve locale : l'unité de l'exécuteur est
-        inactive). Un bail VIVANT n'est accepté que dans ce cas : un exécuteur
-        qui sert encore l'agent n'est jamais dépossédé en silence. Un agent
-        `releve: election` est refusé (son élection déplace son bail).
+        inactive, et le dernier relevé vient bien de l'unité DE CET agent,
+        `runner_seen_owner` = `runner-<nom>@…` ; le gabarit systemd répond
+        `inactive` pour tout nom jamais instancié). Un bail VIVANT n'est
+        accepté que dans ce cas : un exécuteur qui sert encore l'agent n'est
+        jamais dépossédé en silence. Un agent `releve: election` est refusé
+        (son élection déplace son bail).
 
         `host` est l'hôte attendu (recontrôlé sous le verrou). `keep_session`
         garde la session native et la consigne ; sinon la session est oubliée,
