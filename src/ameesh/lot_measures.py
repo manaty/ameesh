@@ -93,10 +93,13 @@ CALL_TIMEOUT_S = 20
 #: runner's measure pass has a budget and a forge that does not answer must
 #: not eat it (#3038)
 LS_REMOTE_TIMEOUT_S = 8.0
+#: timeout of the exact-target fetch before a merge interval is read (#3275)
+FETCH_TIMEOUT_S = 120.0
 #: CI runs read at most for one branch
 CI_RUN_LIMIT = 100
 
 _SHA_RE = re.compile(r"^[0-9a-f]{7,64}$")
+_FULL_SHA_RE = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
 #: how long a published tip read by `ls-remote` is reused (s): a measure pass
 #: clears it anyway, but `review_lot.class_at_merge` reads it from a
 #: long-lived process and must not see a tip older than this (#3056)
@@ -427,6 +430,78 @@ def _target(repo: str, target: str | None, sha: str) -> str | None:
             return ref
     declared = plan_git.declared_target(repo)
     return _published_ref(repo, declared) if declared else None
+
+
+def _refresh_refs(repo: str, target: str | None) -> list[tuple[str, str]]:
+    """The (remote, branch) to refresh for `target` (#3275): the declared
+    target, then the repository's declared and default targets, which
+    `lot_diff_range` also reads; only branches of a declared remote."""
+    from . import plan_git
+
+    remotes = _remotes(repo)
+    out: list[tuple[str, str]] = []
+    for name in (target, plan_git.declared_target(repo), "HEAD"):
+        split = _remote_branch(repo, name) if name else None
+        if split and split[0] in remotes and split not in out:
+            out.append(split)
+    return out
+
+
+def refresh_target(repo: str, target: str | None, shas) -> str:
+    """Fetch the exact target before a merge interval is read in `repo` (#3275).
+
+    A shared clone is only as fresh as its last fetch: a merge pushed since
+    is absent, or not yet in the remote-tracking ref of its target, and the
+    interval reads « commit absent » although the merge is a fact (Nexlink
+    #3268). When a commit of `shas` is absent or carried by no target ref,
+    each target branch is fetched with an explicit refspec (a single-branch
+    clone is updated too), then every full commit still absent is fetched by
+    its SHA. A clone that already proves the interval is not fetched; a
+    repository without remotes is its own reference.
+
+    Best effort, never raises: returns "" when nothing was missing, else a
+    short note of what was fetched or failed, for the caller's doubt."""
+    wanted = [s for s in dict.fromkeys(str(s or "").strip() for s in shas or ())
+              if _SHA_RE.match(s)]
+    try:
+        remotes = _remotes(repo)
+        if not wanted or not remotes:
+            return ""
+        refs = _refresh_refs(repo, target)
+        tracked = ["refs/remotes/%s/%s" % split for split in refs]
+
+        def carried(sha: str) -> bool:
+            return has_commit(repo, sha) and (
+                not tracked or any(_is_ancestor(repo, sha, ref) for ref in tracked))
+
+        if all(carried(sha) for sha in wanted):
+            return ""
+        env = {"GIT_TERMINAL_PROMPT": "0"}
+        done, failed = [], []
+        for remote, branch in refs:
+            name = "%s/%s" % (remote, branch)
+            out = _git(repo, "fetch", "--quiet", "--no-tags", "--no-write-fetch-head",
+                       "--", remote,
+                       "+refs/heads/%s:refs/remotes/%s" % (branch, name),
+                       env_extra=env, timeout=FETCH_TIMEOUT_S)
+            (failed if out is None else done).append(name)
+        remote = refs[0][0] if refs else ("origin" if "origin" in remotes else remotes[0])
+        # every branch fetch failed: the remote does not answer, the SHA
+        # fetches would only wait for their own timeout
+        for sha in ([] if failed and not done else wanted):
+            if _FULL_SHA_RE.match(sha) and not has_commit(repo, sha):
+                out = _git(repo, "fetch", "--quiet", "--no-tags", "--no-write-fetch-head",
+                           "--", remote, sha, env_extra=env, timeout=FETCH_TIMEOUT_S)
+                (failed if out is None else done).append("%s %s" % (remote, sha[:12]))
+        parts = []
+        if done:
+            parts.append("fetch de %s" % ", ".join(done))
+        if failed:
+            parts.append("fetch impossible : %s" % ", ".join(failed))
+        return "; ".join(parts) or "aucune cible à rafraîchir"
+    except Exception as exc:  # noqa: BLE001 - best effort: the reading doubts
+        return "rafraîchissement impossible : %s: %s" % (type(exc).__name__,
+                                                        str(exc)[:120])
 
 
 def diff_range(repo: str, sha: str, target: str | None = None) -> tuple[str, str] | None:
