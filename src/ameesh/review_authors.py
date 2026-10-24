@@ -481,8 +481,11 @@ def target_commit(repo: str, target: str) -> str:
     (`origin/main`) en priorité — même règle que `_resolve_base` et
     `_delta_base`. Une branche locale peut porter un commit non fusionné (le
     correcteur) et masquer la cible réelle ; la lire écarterait ce correcteur
-    de la provenance. Une cible explicitement qualifiée est gardée telle
-    quelle."""
+    de la provenance.
+
+    #3318 (B3) : la ref distante se lit pleinement qualifiée
+    (`refs/remotes/origin/main`) : le nom court peut être masqué par une
+    branche ou un tag local homonyme. Une cible `refs/...` se lit exactement."""
     text = str(target or "").strip()
     if not repo or not text:
         return ""
@@ -492,7 +495,13 @@ def target_commit(repo: str, target: str) -> str:
         remote = canon_mod.remote_branch(repo, text)
     except Exception:  # noqa: BLE001 - résolution distante impossible : ref nue
         remote = None
-    for ref in ([remote] if remote else []) + [text]:
+    if text.startswith("refs/"):
+        refs = [text]
+    else:
+        if remote:
+            remote = "refs/remotes/" + remote
+        refs = ([remote] if remote else []) + [text]
+    for ref in refs:
         try:
             found = plan_git._commit(repo, ref) or ""
         except Exception:  # noqa: BLE001 - cible illisible : pas d'écart
