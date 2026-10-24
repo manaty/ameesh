@@ -896,7 +896,8 @@ def _latest_runs(runs) -> list:
     return latest
 
 
-def _required_gate(required, rollup, provenance=None, *, strict: bool = False) -> tuple:
+def _required_gate(required, rollup, provenance=None, *, strict: bool = False,
+                   unconcluded: list | None = None) -> tuple:
     """Les checks requis que `rollup` et `provenance` ne prouvent pas.
 
     `provenance` porte les check runs de la tête exacte avec leur application
@@ -917,16 +918,30 @@ def _required_gate(required, rollup, provenance=None, *, strict: bool = False) -
       démarrage raté, statut en erreur) d'un check requis. Ils ne bloquent
       pas et sont journalisés ; la correction s'ouvre à part.
 
+    #3186 (décision owner #128512 du 23/10) : un check requis qui n'a pas
+    conclu **lui-même** (`CANCELLED`, `TIMED_OUT`, `STARTUP_FAILURE`,
+    `STALE` : run annulé, runner perdu) n'est pas un test non concluant mais
+    une preuve absente — l'agrégat `tests` (#876) n'a rien vérifié. Il reste
+    dans `gaps` ; ses entrées sont ajoutées à `unconcluded`, si fourni, pour
+    que l'appelant relance le run une fois (`radar.rerun_unconcluded`) — sauf
+    si un autre check requis est un rouge prouvé : la relance ne lèverait pas
+    la porte. Les non concluants d'un agrégat qui a conclu restent consignés
+    (§3).
+
     `strict=True` garde l'ancienne preuve (tout ce qui n'est pas `SUCCESS`
     manque), pour les lecteurs qui n'ont pas reçu la règle du 23/10 (file de
     fusion, `merge-pr`)."""
     from . import radar
     rollup = radar.latest_rollup(rollup)
     gaps, consigned = [], []
+    mark = len(unconcluded) if unconcluded is not None else 0
+    proven_red = []
 
-    def classify(name: str, states: list) -> None:
-        """Trie les états d'un même nom : négatif, puis attente, puis non
-        concluant, puis vert ; `strict` remet tous les non-SUCCESS en gaps."""
+    def classify(name: str, entries: list) -> None:
+        """Trie les états d'un même nom : négatif, puis attente, puis jamais
+        conclu (#3186), puis non concluant, puis vert ; `strict` remet tous
+        les non-SUCCESS en gaps."""
+        states = [_rollup_state(entry) for entry in entries]
         results = {state: radar.rollup_state_result(state) for state in states}
         negative = sorted({state for state, result in results.items()
                            if result == radar.CI_NEGATIVE_RESULT})
@@ -934,6 +949,7 @@ def _required_gate(required, rollup, provenance=None, *, strict: bool = False) -
                           if result == radar.CI_WAITING_RESULT})
         inconclusive = sorted({state for state, result in results.items()
                                if result == radar.CI_INCONCLUSIVE_RESULT})
+        never = [state for state in inconclusive if radar.never_concluded(state)]
         if strict:
             bad = sorted({state or "?" for state in states if state != "SUCCESS"})
             if bad:
@@ -941,19 +957,24 @@ def _required_gate(required, rollup, provenance=None, *, strict: bool = False) -
             return
         if negative:
             gaps.append("%s (%s)" % (name, ", ".join(negative)))
+            proven_red.append(name)
         elif waiting:
             gaps.append("%s (%s)" % (name, ", ".join(waiting)))
+        elif never:
+            gaps.append("%s (%s: never concluded, no test proof)" % (name, ", ".join(never)))
+            if unconcluded is not None:
+                unconcluded.extend((name, entry) for entry in entries
+                                   if radar.never_concluded(_rollup_state(entry)))
         elif inconclusive:
             consigned.append("%s (%s)" % (name, ", ".join(inconclusive)))
 
     for name, app_id in _required_pairs(required):
         if app_id is None:
-            states = [_rollup_state(entry) for entry in rollup or ()
-                      if _rollup_name(entry) == name]
-            if not states:
+            entries = [entry for entry in rollup or () if _rollup_name(entry) == name]
+            if not entries:
                 gaps.append("%s (absent)" % name)
                 continue
-            classify(name, states)
+            classify(name, entries)
             continue
         runs = _latest_runs([entry for entry in provenance or ()
                              if _rollup_name(entry) == name
@@ -971,8 +992,42 @@ def _required_gate(required, rollup, provenance=None, *, strict: bool = False) -
             else:
                 gaps.append("%s (absent)" % name)
             continue
-        classify(name, [_rollup_state(entry) for entry in runs])
+        classify(name, runs)
+    if proven_red and unconcluded is not None:
+        del unconcluded[mark:]
     return gaps, consigned
+
+
+def relaunch_unconcluded(db, lot: int, slug: str, head: str, report: dict | None, *,
+                         gh, dry_run: bool = False, guard=None,
+                         actor: str = "ameesh") -> list:
+    """#3186 (décision owner #128512 du 23/10) : la porte a trouvé un check
+    requis jamais conclu (`report["unconcluded"]` de `ready_pr`) ; son run est
+    relancé **une fois** (`radar.rerun_unconcluded`), la porte reste fermée
+    jusqu'à une conclusion. `guard()` (bail du passage et garde du pilote
+    élu) est relu juste avant chaque relance : un détenteur périmé ne relance
+    rien. Chaque issue utile est notée au journal du lot, une seule fois.
+    Rend les issues."""
+    from . import radar
+    pairs = [(name, radar.actions_run_id(slug, entry))
+             for name, entry in (report or {}).get("unconcluded") or ()]
+    if not pairs:
+        return []
+    reruns = radar.rerun_unconcluded(slug, head, pairs, gh=gh, dry_run=dry_run,
+                                     guard=guard)
+    if not dry_run:
+        for row in reruns:
+            if row["result"] in ("running", "busy"):
+                continue
+            try:
+                work.note(db, int(lot),
+                          "required check %s never concluded on %s — no test proof, "
+                          "blocking (owner decision #128512): %s"
+                          % (row["check"], head[:12], row["detail"]),
+                          actor=actor, once=True)
+            except Exception:  # noqa: BLE001 - la trace au mieux, la porte reste fermée
+                pass
+    return reruns
 
 
 def _required_gap(required, rollup, provenance=None) -> list:
@@ -1185,12 +1240,16 @@ def _head_check_runs(slug: str | None, sha: str, *, gh) -> list:
             if isinstance(suite_id, bool) or not isinstance(suite_id, int):
                 suite_id = None
             started = run.get("started_at")
+            # #3186 : l'URL du job désigne le run à relancer d'un requis
+            # jamais conclu (`radar.actions_run_id`).
+            details = run.get("details_url")
             runs.append({"name": run["name"],
                          "status": str(run.get("status") or ""),
                          "conclusion": str(run.get("conclusion") or ""),
                          "app_id": app_id,
                          "started_at": started if isinstance(started, str) else None,
-                         "check_suite_id": suite_id})
+                         "check_suite_id": suite_id,
+                         "details_url": details if isinstance(details, str) else None})
     return runs
 
 
@@ -1496,7 +1555,12 @@ def ready_pr(status: dict, *, target: str, project, frozen: str, required=None,
     pour la trace.
     #3251 (décision owner #128512) : le check de détail de l'agrégat `tests`
     est lu en plus des checks requis — une part interne annulée laisse
-    `tests` vert et se consigne par ce canal."""
+    `tests` vert et se consigne par ce canal.
+
+    #3186 (décision owner #128512) : un check requis qui n'a pas conclu
+    lui-même (annulé, expiré, démarrage raté) bloque — preuve absente — et
+    `report["unconcluded"]` reçoit ses entrées `(nom, entrée)`, pour que
+    l'appelant relance le run une fois (`relaunch_unconcluded`)."""
     if status.get("draft"):
         return False, "PR #%s is a draft" % status.get("number")
     if target and status.get("base") and status["base"] != target:
@@ -1523,7 +1587,9 @@ def ready_pr(status: dict, *, target: str, project, frozen: str, required=None,
                 return False, ("the source of the required checks of %s on the freeze %s "
                                "cannot be proven: %s"
                                % (target or "the target", frozen[:12], exc))
-        gaps, consigned = _required_gate(pairs, rollup, provenance, strict=False)
+        unconcluded: list = []
+        gaps, consigned = _required_gate(pairs, rollup, provenance, strict=False,
+                                         unconcluded=unconcluded)
         # #2876/#3066 : la preuve du portier `paquet` n'est jamais un check
         # facultatif — un rouge ou une preuve indisponible bloque ; un non
         # concluant du portier se consigne.
@@ -1535,9 +1601,16 @@ def ready_pr(status: dict, *, target: str, project, frozen: str, required=None,
         detail_gaps, detail_consigned = _aggregate_detail_gate(rollup)
         gaps += detail_gaps
         consigned += detail_consigned
+        from . import radar
+        if any(radar.check_result(entry) == radar.CI_NEGATIVE_RESULT
+               for entry in radar.packet_proof_entries(rollup)):
+            # #3186 : un portier rouge retient la porte quoi qu'il arrive ;
+            # relancer l'agrégat jamais conclu ne coûterait qu'une suite.
+            unconcluded.clear()
         if report is not None:
             report.update({"consigned": consigned,
-                           "required": [name for name, _app in pairs]})
+                           "required": [name for name, _app in pairs],
+                           "unconcluded": unconcluded})
         if gaps:
             return False, ("PR #%s does not prove the required checks of %s on the freeze %s: %s"
                            % (status.get("number"), target or "the target", frozen[:12],
@@ -2129,6 +2202,26 @@ def _merge_direct(cfg, db, row: dict, marks: list, fire: dict, status: dict, *, 
     ok, why = ready_pr(status, target=target, project=project, frozen=frozen,
                        slug=slug, gh=gh, report=report)
     if not ok:
+        # #3186 : un requis jamais conclu bloque ; son run est relancé une fois,
+        # sous le bail du feu et la garde du pilote élu, comme la fusion.
+        def guard() -> bool:
+            if not _renew(handle):
+                return False
+            from . import pilot_gesture
+            try:
+                fence = pilot_gesture.gate(cfg, db, "merge", "fire rerun #%d" % lot,
+                                           project=(row.get("app") or None))
+                if fence is not None:
+                    fence.hold(db, margin_s=FIRE_CALL_MARGIN_S)
+            except pilot_gesture.GestureRefused:
+                return False
+            return True
+        reruns = relaunch_unconcluded(db, lot, slug, status.get("head") or frozen, report,
+                                      gh=gh, dry_run=dry_run, guard=guard)
+        if reruns:
+            from . import radar
+            out["reruns"] = reruns
+            why = "%s — %s" % (why, radar.describe_reruns(reruns))
         return _not_ready(db, row, status, out, why, gh=gh, slug=slug, dry_run=dry_run,
                           handle=handle)
     if status.get("armed"):
