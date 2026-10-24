@@ -28,14 +28,32 @@ dans le format de `scripts/paquet-inclusion.py --ready-file` :
         --head origin/integration/paquet-h-… --ready-file "$TMPDIR/prets-0800.txt" \\
         --expected-file "$TMPDIR/admissions-0800.txt"
 
+#3375 : un lot sous **hold de pilote** actif (`planned_waits`, la lecture de la
+stagnation) n'est pas prêt ; son motif est `pilot-hold` et son détail commence
+par « hold pilote », ce que le composeur écrit dans la table « Écartés » du
+manifeste. Le composeur peut passer outre, explicitement et pour une raison :
+
+    scripts/paquet-candidats.py --hold-override 3231 \\
+        --hold-reason "premier paquet post-T0 (décision mesh-design 16:5xZ)"
+
+La surcharge ne lève que le hold : un autre refus (gel, avis, conflit) garde
+le lot en attente, et le geste est alors refusé sans rien journaliser. Sinon
+la raison est écrite au journal du lot (`hold-override: …`), et le lot entre
+dans la liste prête pour ce calcul. Le hold du pilote, lui, reste en place :
+la liste suivante l'écarte de nouveau, et seule une note `unhold:` (ou un
+changement d'état) le lève.
+
 Codes de retour : 0 si la liste est complète (même sans lot prêt), 1 si une
 lecture a échoué (la liste est incomplète : ne pas composer dessus), 2 si
-l'entrée est invalide (dépôt, projet, base). En cas d'échec, `--ready-out` est
-retiré — y compris un export d'une exécution précédente — pour qu'aucune liste
-partielle ne serve de base au contrôle d'inclusion.
+l'entrée est invalide (dépôt, projet, base, surcharge de hold sans objet). En
+cas d'échec, `--ready-out` est retiré — y compris un export d'une exécution
+précédente — pour qu'aucune liste partielle ne serve de base au contrôle
+d'inclusion.
 
-Lecture seule : la base n'est pas modifiée ; les branches sont lues dans le
-clone privé du radar ou dans un clone jetable, jamais dans le dépôt des agents.
+Lecture seule, sauf le geste explicite `--hold-override` : la base n'est
+modifiée que pour y journaliser la raison de la surcharge sur le lot ; les
+branches sont lues dans le clone privé du radar ou dans un clone jetable,
+jamais dans le dépôt des agents.
 """
 from __future__ import annotations
 
@@ -48,7 +66,9 @@ from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
-from ameesh import config, db, merge_queue, packet_candidates  # noqa: E402
+from ameesh import config, db, identity, merge_queue, packet_candidates, work  # noqa: E402
+
+HoldOverrideError = packet_candidates.HoldOverrideError
 
 
 def resolve_project(cfg, repo: str, name: str | None):
@@ -74,6 +94,76 @@ def resolve_project(cfg, repo: str, name: str | None):
     return SimpleNamespace(name="", target="", repo=repo), False
 
 
+def parse_hold_overrides(lots, reason) -> dict[int, str]:
+    """#3375 : `--hold-override` répétable + une `--hold-reason` obligatoire.
+
+    La raison est le motif journalisé sur le lot : sans elle, la surcharge
+    n'est pas auditable et le geste est refusé. Une raison seule (sans
+    surcharge) est une erreur d'entrée, pas un commentaire.
+    """
+    ids = list(dict.fromkeys(int(lot) for lot in (lots or ())))
+    if any(lot <= 0 for lot in ids):
+        raise HoldOverrideError("--hold-override: positive lot ids are required")
+    text = " ".join(str(reason or "").split())
+    if ids and not text:
+        raise HoldOverrideError(
+            "--hold-override requires --hold-reason: the overtaking and its reason "
+            "are journaled on the lot")
+    if text and not ids:
+        raise HoldOverrideError("--hold-reason given without --hold-override")
+    return {lot: text for lot in ids}
+
+
+def hold_actor(cfg, conn) -> str:
+    """Le nom de la session qui surcharge, pour le journal du lot ; "" si
+    l'identité n'est pas lisible (la note reste écrite, l'auteur est vide)."""
+    try:
+        binding = identity.resolve_binding(cfg, conn)
+    except Exception:  # noqa: BLE001 - identité illisible : note sans auteur
+        return ""
+    return binding.name if getattr(binding, "ok", False) else ""
+
+
+def journal_hold_overrides(conn, payload: dict, overrides: dict[int, str], *,
+                           actor: str = "") -> list[dict]:
+    """#3375 : journalise chaque surcharge effective, et rien d'autre.
+
+    Toute la validation passe avant la première écriture : une surcharge qui
+    ne lève pas le hold (lot absent, sans hold actif, ou refusé par un autre
+    motif) n'écrit aucune note. Une surcharge effective écrit sur le lot la
+    ligne stable `hold-override: … raison …` (cible, base et source citées) :
+    le hold du pilote reste en place, la liste suivante écarte de nouveau le
+    lot.
+    """
+    entries = {int(entry["work_item"]): entry for entry in payload["candidates"]}
+    planned: list[tuple[int, str]] = []
+    for lot in sorted(overrides):
+        reason = overrides[lot]
+        entry = entries.get(lot)
+        if entry is None:
+            raise HoldOverrideError(
+                "hold override #%d: lot absent from the calculated list" % lot)
+        if not entry.get("hold_override"):
+            raise HoldOverrideError(
+                "hold override #%d: no active pilot hold to override" % lot)
+        if not entry.get("ready"):
+            causes = ", ".join(cause.get("code") or "?" for cause in entry["causes"])
+            raise HoldOverrideError(
+                "hold override #%d refused: the lot is not otherwise ready (%s); "
+                "the override lifts the pilot hold only" % (lot, causes or "unknown cause"))
+        hold = entry.get("pilot_hold") or {}
+        source = str(entry.get("source") or entry.get("published_head") or "")
+        planned.append((lot, (
+            "hold-override: composition malgré le hold pilote de %s — %s "
+            "(cible %s, base %s, source %s)"
+            % (hold.get("by") or "auteur inconnu", reason,
+               payload.get("target") or "?",
+               str(payload.get("base") or "")[:12], source[:12]))))
+    for lot, text in planned:
+        work.note(conn, lot, text, actor=actor or "", once=True)
+    return [{"lot": lot, "note": text} for lot, text in planned]
+
+
 def render(payload: dict) -> str:
     lines = [
         "paquet-candidats : projet %s, cible %s (%s), base %s (%s)"
@@ -92,11 +182,13 @@ def render(payload: dict) -> str:
             entry = by_id[lot]
             klass = (entry.get("review_class") or {}).get("class") or "?"
             remise = entry.get("remise") or {}
-            lines.append("  #%-5d %s  %-14s %-9s %s%s"
+            lines.append("  #%-5d %s  %-14s %-9s %s%s%s"
                          % (lot, (entry.get("source") or entry["published_head"])[:12],
                             entry.get("assignee") or "-", klass, entry["branch"],
                             "  (remise %s, %s)" % (remise["ref"], remise["cover"])
-                            if remise else ""))
+                            if remise else "",
+                            "  (hold pilote surchargé : %s)" % entry["hold_override"]
+                            if entry.get("hold_override") else ""))
     if payload["waiting"]:
         lines += ["", "EN ATTENTE (motif calculé)"]
         for lot in payload["waiting"]:
@@ -158,6 +250,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--json", action="store_true", help="sortie JSON")
     parser.add_argument("--ready-out", default=None, metavar="FILE",
                         help="écrit les ids prêts, un par ligne, pour --ready-file")
+    parser.add_argument("--hold-override", type=int, action="append", default=None,
+                        metavar="LOT",
+                        help="#3375 : passer outre le hold pilote actif de ce lot "
+                             "(répétable), la raison étant journalisée sur le lot")
+    parser.add_argument("--hold-reason", default=None,
+                        help="la raison de --hold-override, écrite au journal du lot")
     args = parser.parse_args(argv)
 
     ready_out = Path(args.ready_out) if args.ready_out else None
@@ -168,6 +266,12 @@ def main(argv: list[str] | None = None) -> int:
             print("paquet-candidats: cannot clear %s: %s" % (ready_out, exc),
                   file=sys.stderr)
             return 2
+
+    try:
+        hold_overrides = parse_hold_overrides(args.hold_override, args.hold_reason)
+    except HoldOverrideError as exc:
+        print("paquet-candidats: %s" % exc, file=sys.stderr)
+        return 2
 
     repo = os.path.realpath(args.repo)
     try:
@@ -188,16 +292,24 @@ def main(argv: list[str] | None = None) -> int:
         clone, scratch = merge_queue.working_clone(cfg, repo, project if declared else None)
         payload = packet_candidates.inventory(
             conn, project, repo=repo, clone=clone, target=args.target, app=app,
-            base=args.base, cfg=cfg)
+            base=args.base, cfg=cfg, hold_overrides=hold_overrides or None)
+        if hold_overrides and not payload["errors"]:
+            # #3375 : la raison est écrite avant l'export de la liste prête ;
+            # une surcharge sans effet réel (autre refus) est refusée ici.
+            journal_hold_overrides(conn, payload, hold_overrides,
+                                   actor=hold_actor(cfg, conn))
         if ready_out is not None:
             write_ready_out(ready_out, payload)
         print(json.dumps(payload, ensure_ascii=False, indent=2, default=str)
               if args.json else render(payload))
         return 1 if payload["errors"] else 0
+    except HoldOverrideError as exc:
+        print("paquet-candidats: %s" % exc, file=sys.stderr)
+        return 2
     except packet_candidates.CandidateError as exc:
         print("paquet-candidats: %s" % exc, file=sys.stderr)
         return 1
-    except (db.DbError, OSError, ValueError) as exc:
+    except (db.DbError, work.WorkError, OSError, ValueError) as exc:
         print("paquet-candidats: %s" % exc, file=sys.stderr)
         return 1
     finally:

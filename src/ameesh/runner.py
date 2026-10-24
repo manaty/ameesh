@@ -5310,24 +5310,28 @@ class AgentWorker(threading.Thread):
         l'orchestrateur pendant que son avis attendait (#3004, 1 j 14 h), et
         un auteur bloqué continuait sur d'autres lots (#3033 22 h, #3195 9 h).
         La correction due passe en premier : c'est elle qui débloque la revue.
+        #3307 : corrections et avis dus précèdent la consigne de reprise, qui
+        finit par « nothing to do … stop » : l'en-tête des avis les place
+        « before declaring yourself available ».
         Une file illisible ne change pas la relance : le brief de reprise la
         dit, et un tour au repos ne part pas sur une lecture ratée."""
         from . import reprise
-        parts = [adapters.idle_prompt(self._idle_pilot())]
+        parts: list[str] = []
         try:
             fixes = reprise.fixes_owed_lines(self.db, self.name)
         except Exception:  # noqa: BLE001 - la relance part quand même
             fixes = []
         if (fixes and fixes != [reprise.NO_FIX_OWED]
                 and not fixes[0].startswith("(fixes owed unreadable")):
-            parts += ["", adapters.IDLE_FIXES_HEADER] + fixes
+            parts += [adapters.IDLE_FIXES_HEADER] + fixes + [""]
         try:
             lines = reprise.pending_review_lines(self.db, self.name)
         except Exception:  # noqa: BLE001 - la relance part quand même
             lines = []
         if (lines and lines != [reprise.NO_PENDING_REVIEW]
                 and not lines[0].startswith("(pending reviews unreadable")):
-            parts += ["", adapters.IDLE_REVIEWS_HEADER] + lines
+            parts += [adapters.IDLE_REVIEWS_HEADER] + lines + [""]
+        parts.append(adapters.idle_prompt(self._idle_pilot()))
         return "\n".join(parts)
 
     #: #408 : intervalle minimal entre deux lectures des lots actionnables

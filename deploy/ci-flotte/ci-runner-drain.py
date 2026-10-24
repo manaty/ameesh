@@ -33,16 +33,21 @@ Which runners:
 passed. Exit status: 0 nothing left to do, 3 runners still busy (they keep
 their job; the timer, or the operator, comes back), 2 usage or system error.
 
-Residual race: the listener can accept a job between the idleness reading
-and the signal. The reading is repeated just before acting, so the window is
-the time of one `systemctl` call; a job lost there is a self-hosted job that
-lost its runner, which relance-hosted (#2954) reruns once.
+The final reading is made with the unit frozen (#3317). Busy units are
+immediately thawed. For an idle unit, cgroup.kill removes its processes
+before systemctl can thaw it (stop/restart automatically thaw a unit).
+This requires cgroup v2 and Restart=no, the upstream runner service default:
+no listener may respawn between the kill and the stop/restart. Unsupported
+configurations fail closed. Concurrent drain invocations share a host lock.
 """
 from __future__ import annotations
 
 import argparse
+import errno
+import fcntl
 import os
 import re
+import signal
 import subprocess
 import sys
 import time
@@ -51,18 +56,20 @@ UNIT_RE = re.compile(r"^actions\.runner\.[A-Za-z0-9_.@-]+\.service$")
 WORKER = "Runner.Worker"
 CGROUP_ROOT = "/sys/fs/cgroup"
 BUSY_EXIT = 3
+LOCK = "/run/lock/ameesh-ci-runner-drain.lock"
 
 
 class Host:
     """The real host: systemctl, needrestart, cgroup v2 and /proc."""
 
-    def __init__(self, cgroup_root=CGROUP_ROOT, proc="/proc"):
+    def __init__(self, cgroup_root=CGROUP_ROOT, proc="/proc", lock=LOCK):
         self.cgroup_root = cgroup_root
         self.proc = proc
+        self.lock = lock
 
     def _run(self, argv):
         return subprocess.run(argv, check=True, text=True,
-                              stdout=subprocess.PIPE).stdout
+                              stdout=subprocess.PIPE, timeout=60).stdout
 
     def outdated_units(self):
         out = self._run(["needrestart", "-b", "-r", "l"])
@@ -83,22 +90,89 @@ class Host:
                            "--value", unit]).strip()
         if not group:
             return []
-        try:
-            with open(self.cgroup_root + group + "/cgroup.procs") as f:
-                pids = f.read().split()
-        except FileNotFoundError:
-            return []
         names = []
-        for pid in pids:
-            try:
-                with open(os.path.join(self.proc, pid, "comm")) as f:
-                    names.append(f.read().strip())
-            except OSError:
-                continue  # the process ended meanwhile
+        def fail(exc):
+            raise exc
+        # A worker in a descendant cgroup also makes the runner busy.
+        for path, _, _ in os.walk(self.cgroup_root + group, onerror=fail):
+            with open(os.path.join(path, "cgroup.procs")) as f:
+                pids = f.read().split()
+            for pid in pids:
+                try:
+                    with open(os.path.join(self.proc, pid, "comm")) as f:
+                        names.append(f.read().strip())
+                except FileNotFoundError:
+                    continue  # the process ended meanwhile
         return names
 
     def act(self, verb, unit):
-        subprocess.run(["systemctl", verb, unit], check=True)
+        subprocess.run(["systemctl", verb, unit], check=True, timeout=60)
+
+    def _wait_event(self, group, key, value, removed_ok=False):
+        deadline = time.monotonic() + 5
+        while True:
+            try:
+                with open(group + "/cgroup.events") as f:
+                    events = dict(line.split() for line in f)
+            except FileNotFoundError:
+                if removed_ok:
+                    return
+                raise
+            if events.get(key) == value:
+                return
+            if time.monotonic() >= deadline:
+                raise OSError("runner cgroup timed out waiting for %s=%s" % (key, value))
+            time.sleep(0.01)
+
+    def _set_freezer(self, group, value):
+        # r+ refuses missing/unsupported interfaces instead of creating a file.
+        with open(group + "/cgroup.freeze", "r+") as f:
+            f.write(value)
+
+    def _kill_frozen(self, group):
+        with os.fdopen(os.open(group + "/cgroup.kill", os.O_WRONLY), "w") as f:
+            f.write("1")
+        # SIGKILL is asynchronous, even for frozen tasks. Do not let systemd
+        # thaw any survivor. A removed cgroup is also empty (Restart=no).
+        self._wait_event(group, "populated", "0", removed_ok=True)
+
+    def act_if_idle(self, verb, unit):
+        """Freeze, recheck, retire the idle listener, then stop/restart it."""
+        fd = os.open(self.lock, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+        with os.fdopen(fd, "w") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            restart = self._run(["systemctl", "show", "-p", "Restart",
+                                 "--value", unit]).strip()
+            if restart != "no":
+                raise OSError("safe drain requires Restart=no: " + unit)
+            forced = self._run(["systemctl", "show", "-p", "RestartForceExitStatus",
+                                "--value", unit]).strip()
+            if forced:
+                raise OSError("safe drain refuses RestartForceExitStatus: " + unit)
+            group = self._run(["systemctl", "show", "-p", "ControlGroup",
+                               "--value", unit]).strip()
+            if not group or group == "/" or not group.startswith("/"):
+                raise OSError("runner has no usable cgroup: " + unit)
+            group = self.cgroup_root + group
+            with open(group + "/cgroup.freeze") as f:
+                if f.read().strip() != "0":
+                    raise OSError("runner cgroup is already frozen: " + unit)
+            try:
+                # Use the kernel freezer: systemctl freeze retains a frozen
+                # unit state after SIGKILL and can then refuse its restart.
+                self._set_freezer(group, "1")
+                self._wait_event(group, "frozen", "1")
+                if busy(self, unit):
+                    return False
+                self._kill_frozen(group)
+            finally:
+                try:
+                    self._set_freezer(group, "0")
+                except OSError as exc:
+                    if exc.errno not in (errno.ENOENT, errno.ENODEV):
+                        raise
+            self.act(verb, unit)
+            return True
 
 
 def runner_units(units):
@@ -121,11 +195,9 @@ def one_pass(host, every, verb, dry_run, log):
         if dry_run:
             log("would %s %s (idle)" % (verb, unit))
             continue
-        # read again just before acting: the window left is one systemctl call
-        if busy(host, unit):
+        if not host.act_if_idle(verb, unit):
             left.append(unit)
             continue
-        host.act(verb, unit)
         log("%s %s (idle)" % (verb, unit))
     for unit in left:
         log("busy, kept until its job ends: %s" % unit)
@@ -163,11 +235,15 @@ def main(argv=None, host=None, sleep=time.sleep, clock=time.monotonic,
             if not left or args.dry_run or clock() >= deadline:
                 break
             sleep(min(args.interval, max(deadline - clock(), 0)))
-    except (OSError, subprocess.CalledProcessError) as exc:
+    except (OSError, subprocess.SubprocessError) as exc:
         print("ameesh-ci-runner-drain: %s" % exc, file=sys.stderr)
         return 2
     return BUSY_EXIT if left else 0
 
 
 if __name__ == "__main__":
+    # A service stop must unwind the frozen-unit cleanup, like Ctrl-C does.
+    def interrupted(signum, frame):
+        sys.exit(2)
+    signal.signal(signal.SIGTERM, interrupted)
     sys.exit(main())

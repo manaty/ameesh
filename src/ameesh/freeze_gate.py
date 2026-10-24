@@ -208,6 +208,12 @@ def _proposed_head(db: Db, item: dict, frozen: str, repo: str | None = None) -> 
     Un gel ancien peut porter moins de 12 caractères : on le complète dans un
     dépôt quand l'un le connaît, sinon la proposition est vide (le refus dit
     alors de geler de nouveau avec la tête complète)."""
+    return _complete_head(db, item, frozen, repo)[:12]
+
+
+def _complete_head(db: Db, item: dict, frozen: str, repo: str | None = None) -> str:
+    """La tête gelée telle quelle si elle a 12+ caractères, sinon le commit
+    complet d'un dépôt qui la connaît, sinon "" (aucun `--sha` acceptable)."""
     head = frozen
     if head and len(head) < REVIEWED_HEAD_MIN:
         from . import freeze_checks
@@ -215,7 +221,25 @@ def _proposed_head(db: Db, item: dict, frozen: str, repo: str | None = None) -> 
             head = freeze_checks.commit_in(where, head) or head
             if len(head) >= REVIEWED_HEAD_MIN:
                 break
-    return head[:12] if len(head) >= REVIEWED_HEAD_MIN else ""
+    return head if len(head) >= REVIEWED_HEAD_MIN else ""
+
+
+def verdict_sha(db: Db, lot, frozen: str) -> str:
+    """#3307 : le `--sha` d'une commande de verdict proposée (reprise, SLO).
+
+    Le SHA du gel est repris tel quel quand `reviewed_head` l'accepte (12+
+    caractères) ; un gel historique plus court est complété dans un dépôt qui
+    le connaît, sinon la commande proposée ne porterait qu'un `--sha` refusé
+    (head-missing) : "" laisse l'appelant écrire `<frozen head>`."""
+    head = str(frozen or "").strip().lower()
+    if not head or len(head) >= REVIEWED_HEAD_MIN:
+        return head
+    try:
+        from . import work
+        item = work.get(db, int(lot)) or {"id": int(lot)}
+        return _complete_head(db, item, head)
+    except Exception:  # noqa: BLE001 - lot ou dépôt illisible : pas de --sha
+        return ""
 
 
 def _head_refusal(db: Db, item: dict, why: str, *,

@@ -56,6 +56,12 @@ class FakeHost:
     def act(self, verb, unit):
         self.acts.append((verb, unit))
 
+    def act_if_idle(self, verb, unit):
+        if drain.busy(self, unit):
+            return False
+        self.act(verb, unit)
+        return True
+
 
 def run(argv, host, **kw):
     lines = []

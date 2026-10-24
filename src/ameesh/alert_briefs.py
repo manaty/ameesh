@@ -645,11 +645,12 @@ def _budget_pause_long(alert: dict) -> str:
 def _notify_undeliverable(alert: dict) -> str:
     """#3007 : aucun notificateur vivant ne couvre l'humain qui a des décisions
     en attente. Aux orchestrateurs et à l'auditeur : la poussée n'a pas eu
-    lieu, le geste de repli est un canal de secours ou le retour du
-    notificateur. Le brief est porté hors du poste (`notify_gap.brief_once`)."""
+    lieu ; #3383 : le geste est la route de l'humain sur chaque candidat du
+    rôle qui porte la minuterie `alerts`. Le brief est porté hors du poste (`notify_gap.brief_once`)."""
     return ("No living notifier covers the human with pending decisions: %s. Expected "
-            "action: restore ameesh-notify (and its routes) on the host that holds them, "
-            "or configure a fallback route on a healthy host and start it there; keep "
+            "action (#3383): the alerts pass is a role timer, run by the lease holder; "
+            "declare the human's notify route on every candidate of the role and run "
+            "`ameesh role timers --install` there (`--check` names the gap); keep "
             "the pending requests visible in the lot threads meanwhile — no agent can "
             "push them without a channel. This alert resolves by itself when a notifier "
             "beats again for that human, or when nothing is pending."

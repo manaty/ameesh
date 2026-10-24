@@ -54,7 +54,8 @@ class AssignmentError(RuntimeError):
     """Rattachement refusé : rien n'est déposé, le message dit quoi faire."""
 
 
-def is_orchestrator(cfg, db, name: str, *, roles=None, history: bool = True) -> bool:
+def is_orchestrator(cfg, db, name: str, *, roles=None, history: bool = True,
+                    strict: bool = False) -> bool:
     """`name` est-il un orchestrateur ? Déclaré (`AMEESH_ALERT_ORCHESTRATORS`),
     fiche Agent de son canon propriétaire dont `roles` nomme un orchestrateur
     (`sous_utilisation.orchestrators`), ou — tant que son organisation ne
@@ -62,13 +63,24 @@ def is_orchestrator(cfg, db, name: str, *, roles=None, history: bool = True) -> 
     derniers jours. `roles` : les rôles du canon qui comptent (défaut :
     orchestrateur ; `work.CORRECTOR_ROLES` ajoute les agents de conception).
     `history=False` (#740) : les lots confiés ne comptent pas, seule une
-    déclaration compte."""
+    déclaration compte.
+
+    #3375 : `strict=True` distingue « pas un orchestrateur » d'une **autorité
+    illisible**. Le défaut garde la tolérance des alertes (une panne du
+    registre ou du canon ne doit pas les faire taire) ; la porte du paquet lit
+    en strict, car y ignorer un rôle ferait composer un lot réservé. En strict,
+    une résolution d'alias, une lecture de registre ou de canon qui lève, un
+    canon configuré non chargé ou lu en partie (`fully_read`) lèvent au lieu de
+    conclure « non » : le doute refuse.
+    """
     from .agent_names import resolve as resolve_agent_name
     try:
         name = resolve_agent_name(name, db=db, operation="assignments.is_orchestrator")
     except Exception:
         # Registre indisponible (base hors service, doublure de test #424) :
         # on garde l'orthographe reçue, comme avant la résolution d'alias.
+        if strict:
+            raise
         pass
     from . import sous_utilisation as su
 
@@ -80,8 +92,23 @@ def is_orchestrator(cfg, db, name: str, *, roles=None, history: bool = True) -> 
     try:
         from . import canon, registry
         canons = canon.load_configured(cfg) if cfg is not None else []
+        if strict:
+            if cfg is None:
+                raise RuntimeError(
+                    "no configuration: the canon and its agent roles are unreadable")
+            entries = canon.configured(cfg)
+            if len(canons) < len(entries):
+                raise RuntimeError(
+                    "canon unreadable: %d of %d configured canon(s) loaded"
+                    % (len(canons), len(entries)))
+            partial = [str(getattr(c, "id", "?")) for c in canons
+                       if not su.fully_read(c)]
+            if partial:
+                raise RuntimeError("canon partially read: %s" % ", ".join(partial))
         row = registry.get(db, name) if db is not None else None
     except Exception:
+        if strict:
+            raise
         canons, row = [], None
     row = dict(row or {}, name=name)
     try:
@@ -89,6 +116,8 @@ def is_orchestrator(cfg, db, name: str, *, roles=None, history: bool = True) -> 
                                         roles=roles or su.ORCHESTRATOR_ROLES,
                                         history=history)
     except Exception:
+        if strict:
+            raise
         return False
 
 
