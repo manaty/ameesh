@@ -74,6 +74,116 @@ class OptionalJobReadingTest(unittest.TestCase):
         data = suite(mac="failure", run_id=601)
         data["runs"].extend(suite(mac="success")["runs"])
         self.assertFalse(self.read(data)["green"])
+        self.assertIsNone(release._full_suite_run(data))
+        self.assertIsNone(release._suite_proof(suite(mac="success"), data))
+
+    def test_manual_dispatch_aggregate_certifies_the_latest_suite(self):
+        data = suite(mac="success", run_id=601)
+        data["runs"][0]["event"] = "workflow_dispatch"
+        data["runs"][0]["jobs"][2]["name"] = "tests (dispatch)"
+        data["runs"].extend(suite(mac="success")["runs"])
+        self.assertTrue(self.read(data)["green"])
+        self.assertEqual(release._full_suite_run(data)["id"], 601)
+        self.assertIsNotNone(release._suite_proof(suite(mac="success"), data))
+        self.assertIsNotNone(release._suite_proof(data, suite(mac="success")))
+
+    def test_skipped_macos_label_run_does_not_replace_the_suite(self):
+        data = suite(mac="success")
+        data["runs"].append(fixture._run(601, [], event="pull_request",
+                                          conclusion="skipped"))
+        self.assertTrue(self.read(data)["green"])
+        self.assertEqual(release._full_suite_run(data)["id"], 600)
+        self.assertIsNotNone(release._suite_proof(suite(mac="success"), data))
+
+    def test_packet_porter_can_carry_the_only_full_suite(self):
+        data = suite(mac="success")
+        data["runs"][0]["workflow"] = "paquet"
+        for job in data["runs"][0]["jobs"]:
+            job["name"] = "suite complète du paquet / " + job["name"]
+        reading = self.read(data, {**rollup(), "negative": ["paquet"]})
+        self.assertTrue(reading["green"], reading)
+        self.assertIsNotNone(release._full_suite_run(data))
+        self.assertIsNotNone(release._suite_proof(suite(mac="success"), data))
+        self.assertIsNotNone(release._suite_proof(data, suite(mac="success")))
+
+    def test_coverage_only_porter_does_not_replace_the_tests_suite(self):
+        data = suite(mac="success")
+        data["runs"].append(fixture._run(601, [
+            fixture._job("couverture (PR ouverte sur cette tête)"),
+            fixture._job("suite complète du paquet", "skipped"),
+        ], workflow="paquet"))
+        self.assertTrue(self.read(data)["green"])
+        self.assertEqual(release._full_suite_run(data)["id"], 600)
+
+    def test_an_aborted_or_queued_suite_never_falls_back_to_old_green(self):
+        for conclusion in ("failure", "cancelled", "startup_failure", ""):
+            with self.subTest(conclusion=conclusion):
+                data = suite(mac="success")
+                data["runs"].append(fixture._run(601, [], conclusion=conclusion))
+                reading = self.read(data, {"green": True})
+                self.assertFalse(reading["green"], reading)
+                self.assertTrue(reading["pending"], reading)
+                self.assertIsNone(release._full_suite_run(data))
+                self.assertIsNone(release._suite_proof(suite(mac="success"), data))
+
+    def test_a_newer_failed_dispatch_supersedes_the_green_push(self):
+        data = suite(mac="success", tests="failure", run_id=601)
+        data["runs"][0]["event"] = "workflow_dispatch"
+        data["runs"][0]["jobs"][2]["name"] = "tests (dispatch)"
+        data["runs"][0]["conclusion"] = "failure"
+        data["runs"].extend(suite(mac="success")["runs"])
+        self.assertFalse(self.read(data)["green"])
+        self.assertIsNone(release._full_suite_run(data))
+
+    def test_aborted_packet_suite_without_aggregate_supersedes_old_green(self):
+        data = suite(mac="success")
+        data["runs"].append(fixture._run(601, [fixture._job(
+            "suite complète du paquet / plan", "failure")],
+            workflow="paquet", conclusion="failure"))
+        self.assertFalse(self.read(data)["green"])
+        self.assertIsNone(release._full_suite_run(data))
+        self.assertIsNone(release._suite_proof(suite(mac="success"), data))
+
+    def test_a_declared_tolerated_failure_neither_certifies_nor_blocks(self):
+        data = suite(mac="success")
+        bilan = {**fixture._job("bilan des impactés", "failure"), "tolerated": True}
+        data["runs"][0]["jobs"].append(bilan)
+        self.assertTrue(self.read(data)["green"])
+        self.assertIsNotNone(release._full_suite_run(data))
+        self.assertIsNotNone(release._suite_proof(suite(mac="success"), data))
+        self.assertEqual(release._run_evidence(data["runs"][0])["inconclusive"], [])
+        bilan["conclusion"] = "success"
+        self.assertIsNotNone(release._suite_proof(data, suite(mac="success")))
+        bilan["conclusion"] = "failure"
+        bilan["tolerated"] = False
+        self.assertFalse(self.read(data)["green"])
+        self.assertIsNone(release._full_suite_run(data))
+
+    def test_tolerances_are_read_from_the_existing_radar_configuration(self):
+        cfg = mock.Mock(humans="smichea", radar={"projects": {"ameesh": {
+            "repo": "/unused", "github": "acme/project", "full_suite": [{
+                "path": ".github/workflows/tests.yml", "jobs": ["tests"],
+                "tolerate": ["bilan des impactés"],
+            }],
+        }}})
+        project = release.ProjectRelease.from_config(cfg, "ameesh", {"repo": "/unused"})
+        self.assertEqual(project.suite_tolerated, ("bilan des impactés",))
+        data = suite(mac="success")
+        run = data["runs"][0]
+        run["workflow"] = "paquet"
+        run["jobs"].append(fixture._job(
+            "suite complète du paquet / bilan des impactés", "failure"))
+        with mock.patch.object(release.radar, "commit_suite", return_value=data):
+            reading = release.suite_reading(project, "a" * 40)
+        self.assertTrue(reading["runs"][0]["jobs"][-1]["tolerated"])
+        self.assertFalse(reading["runs"][0]["jobs"][2]["tolerated"])
+        self.assertIsNotNone(release._full_suite_run(reading))
+
+    def test_latest_attempt_cannot_borrow_jobs_from_a_superseded_suite(self):
+        data = suite(mac="success", run_id=601)
+        data["runs"][0]["jobs"] = [fixture._job("tests (dispatch)")]
+        data["runs"].extend(suite(mac="success")["runs"])
+        self.assertIsNone(release._suite_proof(suite(mac="success"), data))
 
     def test_other_negative_checks_still_block(self):
         reading = rollup()

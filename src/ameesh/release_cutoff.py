@@ -440,22 +440,27 @@ def ci_reading(project: "ProjectRelease", sha: str) -> dict:
         if project.name != "ameesh":
             return reading
         suite = suite_reading(project, sha)
-        runs = [run for run in suite.get("runs", ()) if run["workflow"] == "tests"]
-        # A newer run must never be redeemed by an older successful attempt.
-        run = max(runs, key=lambda row: int(row["id"]), default=None)
+        run = _suite_attempt(suite)
         aggregate_ok = run is not None and _aggregate_success(run)
-        negative = [name for name in reading.get("negative", ()) if name != "tests"]
-        pending = [name for name in reading.get("pending", ())
-                   if name != "tests" or not aggregate_ok]
-        inconclusive = [name for name in reading.get("inconclusive", ()) if name != "tests"]
-        if run:
-            for job in run["jobs"]:
+        # These workflows are reclassified job by job below. The newest
+        # workflow rollup may describe an auxiliary ci-macos label run.
+        managed = {"tests", "paquet"}
+        negative = [name for name in reading.get("negative", ()) if name not in managed]
+        pending = [name for name in reading.get("pending", ()) if name not in managed]
+        inconclusive = [name for name in reading.get("inconclusive", ()) if name not in managed]
+        for attempt in _suite_runs(suite, run):
+            for job in attempt["jobs"]:
                 label = "%s (%s; %s)" % (
-                    job["name"], job["conclusion"] or job["status"], run["url"])
-                if job["conclusion"] == "failure":
+                    job["name"], job["conclusion"] or job["status"], attempt["url"])
+                if _job_negative(job):
                     negative.append(label)
                 elif _job_inconclusive(job):
                     inconclusive.append(label)
+        if not aggregate_ok:
+            # Never silently reject an absent/cancelled aggregate with empty
+            # diagnostic lists, and never let an older green redeem it.
+            pending.append("suite complète : agrégat tests non validé%s" % (
+                " (%s)" % run["url"] if run else " (tentative absente)"))
         acceptable = bool(aggregate_ok and not negative and not pending
                           and not reading.get("missing"))
         return dict(reading, green=acceptable, acceptable=acceptable,
@@ -469,7 +474,17 @@ def suite_reading(project: "ProjectRelease", sha: str) -> dict:
     target = radar.Project(name=project.name, repo=project.repo, target=project.target,
                            github=project.github)
     try:
-        return radar.commit_suite(target, sha)
+        suite = radar.commit_suite(target, sha)
+        # Reuse the host's declared full-suite tolerances (#566), rather
+        # than inferring continue-on-error from a green workflow rollup.
+        for run in suite.get("runs", ()):
+            if run.get("workflow") not in ("tests", "paquet"):
+                continue
+            for job in run["jobs"]:
+                name = job["name"].removeprefix("suite complète du paquet / ")
+                job["tolerated"] = any(radar._job_matches(pattern, name)
+                                       for pattern in project.suite_tolerated)
+        return suite
     except plan_github.GithubError as exc:
         raise TransientReleaseError("CI jobs of %s unreadable: %s" % (sha[:12], exc)) from exc
 
@@ -874,6 +889,7 @@ class ProjectRelease:
     lock_ttl_s: float = LOCK_TTL_S
     lock_wait_s: float = LOCK_WAIT_S
     version_bump: str = "level"
+    suite_tolerated: tuple = ()
 
     @classmethod
     def from_config(cls, cfg, name: str, entry: dict) -> "ProjectRelease":
@@ -914,6 +930,9 @@ class ProjectRelease:
         staging = str(entry.get("staging", "deploy/mise-a-jour/staging.sh"))
         if os.path.isabs(staging):
             raise ReleaseError("release.projects.%s.staging must be relative to repo" % name)
+        suite_project = radar.settings_of(cfg).projects.get(name)
+        tolerated = radar._suite_jobs_of(
+            suite_project, ".github/workflows/tests.yml", "full_suite_tolerated") or ()
         return cls(
             name=name, repo=repo, target=target.strip(), remote=str(entry.get("remote", "origin")),
             staging=staging,
@@ -921,7 +940,8 @@ class ProjectRelease:
             window_s=number("window_s", WINDOW_S),
             staging_timeout_s=number("staging_timeout_s", STAGING_TIMEOUT_S),
             lock_ttl_s=number("lock_ttl_s", LOCK_TTL_S),
-            lock_wait_s=number("lock_wait_s", LOCK_WAIT_S), version_bump=bump)
+            lock_wait_s=number("lock_wait_s", LOCK_WAIT_S), version_bump=bump,
+            suite_tolerated=tolerated)
 
 
 def projects(cfg) -> dict[str, ProjectRelease]:
@@ -1042,36 +1062,75 @@ def _job_inconclusive(job: dict) -> bool:
     On every push to main, `version number`, `lecteurs de la doc` and
     `autre système de fichiers` are skipped by design: the aggregate decides
     whether they were due, so they are neither consigned nor reopened."""
-    return not _job_success(job) and job.get("conclusion") != "skipped"
+    tolerated = job.get("tolerated", False)
+    return not _job_success(job) and job.get("conclusion") != "skipped" and not tolerated
 
 
 def _aggregate_success(run: dict) -> bool:
     """The stable aggregate certifies its dependencies, regardless of macOS."""
-    aggregates = [job for job in run.get("jobs", ())
-                  if job["name"] in ("tests", "suite complète du paquet / tests")]
+    aggregates = _aggregates(run)
     return bool(aggregates) and all(_job_success(job) for job in aggregates)
+
+
+def _aggregates(run: dict) -> list[dict]:
+    # tests.yml deliberately publishes a distinct context on manual runs.
+    return [job for job in run.get("jobs", ())
+            if job["name"] in ("tests", "tests (dispatch)",
+                               "suite complète du paquet / tests")]
+
+
+def _suite_attempt(suite: dict) -> dict | None:
+    """Latest suite attempt, including failures, never an auxiliary run.
+
+    A skipped tests run on ci-macos has no jobs. A coverage-only packet
+    porter publishes no aggregate. Neither replaces the actual suite.
+    An unfinished/aborted tests attempt still supersedes an older green,
+    even if its aggregate has not been created yet.
+    """
+    runs = [run for run in suite.get("runs", ())
+            if run.get("workflow") in ("tests", "paquet")
+            and run.get("conclusion") != "skipped"
+            and (run.get("workflow") == "tests"
+                 or any(job["name"].startswith("suite complète du paquet / ")
+                        for job in run.get("jobs", ())))]
+    return max(runs, key=lambda row: int(row["id"]), default=None)
+
+
+def _suite_runs(suite: dict, attempt: dict | None) -> list[dict]:
+    """The suite and latest auxiliary jobs; no superseded suite jobs."""
+    latest = {}
+    for run in suite.get("runs", ()):
+        if run.get("conclusion") == "skipped":
+            continue
+        workflow = run.get("workflow")
+        if workflow not in latest or int(run["id"]) > int(latest[workflow]["id"]):
+            latest[workflow] = run
+    auxiliaries = [run for run in latest.values()
+                   if run is not attempt and not _aggregates(run)
+                   and (attempt is None or run.get("workflow") != attempt.get("workflow"))]
+    return ([attempt] if attempt is not None else []) + auxiliaries
+
+
+def _job_negative(job: dict) -> bool:
+    # A workflow's success never hides a failing required job. Only the
+    # configured tolerance attested by suite_reading exempts a job.
+    return job.get("conclusion") == "failure" and not job.get("tolerated", False)
 
 
 def _full_suite_run(suite: dict) -> dict | None:
     """The run of a commit that carries the target's full suite.
 
-    The target's suite is the run with the most jobs (the matrix run). Tied
-    runs with the same job set are re-runs of that suite (one is enough);
-    tied runs with a different job set are ambiguous and prove nothing. A run
-    without a successful `tests` aggregate certifies nothing. The workflow
+    Use the same latest attempt as ci_reading: an older successful matrix
+    cannot redeem a newer failed attempt. A run without a successful
+    `tests` aggregate certifies nothing. The workflow
     itself may be unfinished or cancelled because of an optional job.
     """
-    runs = [run for run in suite.get("runs") or ()
-            if run.get("jobs") and (run.get("conclusion") == "success" or _aggregate_success(run))
-            and not any(job.get("conclusion") == "failure" for job in run["jobs"])]
-    if not runs:
+    run = _suite_attempt(suite)
+    if run is None or not _aggregate_success(run):
         return None
-    best = max(runs, key=lambda run: (len(run["jobs"]), -int(run["id"])))
-    ties = [run for run in runs if len(run["jobs"]) == len(best["jobs"])]
-    names = {job["name"] for job in best["jobs"]}
-    if any({job["name"] for job in run["jobs"]} != names for run in ties):
+    if any(_job_negative(job) for job in run["jobs"]):
         return None
-    return best if _aggregate_success(best) else None
+    return run
 
 
 def _suite_proof(reference: dict, candidate: dict) -> dict | None:
@@ -1080,7 +1139,7 @@ def _suite_proof(reference: dict, candidate: dict) -> dict | None:
     Every job that ran green in the target's full-suite run must exist on the
     candidate under the same name (a caller/flow prefix is allowed). Its
     `tests` aggregate must complete successfully; other jobs may be non
-    conclusive, but a FAILURE always blocks (#3244). The suite is re-read on
+    conclusive, but a non-tolerated FAILURE always blocks (#3244). The suite is re-read on
     the last green commit, so a packet that changes the job set (a workflow
     edit, a reduced matrix) inherits nothing: it needs its own green target CI. Returns
     `{reference_run, runs}` when the proof holds, else None.
@@ -1094,17 +1153,24 @@ def _suite_proof(reference: dict, candidate: dict) -> dict | None:
     # nothing either.
     required = {}
     for job in reference_run["jobs"]:
-        if job["conclusion"] == "success":
-            required[job["name"]] = "success"
-    candidates = [(run, job) for run in candidate.get("runs") or ()
-                  for job in run.get("jobs") or ()]
-    if not any(_aggregate_success(run) for run in candidate.get("runs", ())):
+        if job["conclusion"] == "success" and not job.get("tolerated", False):
+            name = job["name"]
+            if name.startswith("suite complète du paquet / "):
+                name = name[len("suite complète du paquet / "):]
+            required["tests" if name == "tests (dispatch)" else name] = "success"
+    attempt = _full_suite_run(candidate)
+    if attempt is None:
         return None
-    if any(job.get("conclusion") == "failure" for _, job in candidates):
+    candidates = [(run, job) for run in _suite_runs(candidate, attempt)
+                  for job in run.get("jobs") or ()]
+    if any(_job_negative(job) for run, job in candidates):
         return None
     proof_runs: dict[int, dict] = {}
     for name, conclusion in required.items():
-        hits = [(run, job) for run, job in candidates if _same_job(name, job["name"])]
+        hits = [(run, job) for run, job in candidates
+                if not job.get("tolerated", False)
+                and (_same_job(name, job["name"])
+                     or (name == "tests" and job in _aggregates(run)))]
         if not hits:
             return None
         for run, job in hits:
