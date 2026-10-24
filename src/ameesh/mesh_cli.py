@@ -44,6 +44,8 @@
         [--full] [--sha S] [--force] [--dry-run]        on the frozen commit (#1343)
   agent-mesh ci cancel <item> [--all] [--dry-run]       cancel the stale runs of a lot
   agent-mesh agent spawn <name> --by <creator> --ttl 2h   ephemeral agent (R14)
+  agent-mesh agent move NOM --to HOST [--keep-session]   manual move of a `releve: hote`
+                                                          agent, fenced (#3299)
 
 The owner's authority is never inferred from text: it is proven by an Ed25519
 signature whose public key is in agent_registry, bound to the content and to

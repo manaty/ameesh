@@ -507,6 +507,120 @@ class Canon(interface.Canon):
         )
         return rows[0] if rows else None
 
+    def relocate_operator(self, name, host, *, target, canon_ref, diagnostic, ref,
+                          keep_session, runner_stale_s, summary="",
+                          source_stopped=False) -> dict | None:
+        """Déplacement manuel (#3299), sans bail vivant exigé.
+
+        Le verrou de ligne est pris d'abord, puis l'écriture recontrôle : hôte
+        de départ inchangé, agent `releve: hote` et hors tour, aucun handoff
+        ouvert, destination encore admise et sans `host_hold`. Le bail n'est
+        pas exigé quand l'exécuteur de départ est arrêté : `runner_seen_at`
+        périmé (horloge de la base), relevé sur un autre hôte, ou
+        `source_stopped` (unité de l'exécuteur inactive, prouvée par
+        l'appelant). Un bail vivant et un exécuteur frais refusent : on ne
+        dépossède pas un exécuteur qui sert encore l'agent.
+
+        `source_stopped` n'est retenu que si le dernier relevé vient de
+        l'unité DE CET agent (`runner_seen_owner` = `runner-<nom>@…`) : le
+        gabarit systemd `ameesh-runner-agent@<nom>.service` répond
+        `loaded`/`inactive` pour n'importe quel nom jamais instancié, et un
+        agent mené par une autre unité (coordinateur partagé) garderait sinon
+        un bail vivant (B de la relecture #3299).
+
+        Le bail de la source est révoqué dans cette même écriture (owner et
+        échéance vidés, époque +1), `keep_session` compris : `renew` et
+        `begin_turn` ne contrôlent que owner/epoch, jamais l'hôte, donc un
+        exécuteur de départ laissé vivant garderait l'agent (B1 #3299).
+        """
+        stale = float(runner_stale_s)
+        if not stale > 0:
+            raise ValueError("relocate_operator: runner_stale_s must be positive")
+        rows = self.db.query(
+            """
+            WITH verrou AS (
+                SELECT name, host, status, releve, admitted_hosts, lease_owner,
+                       lease_epoch, lease_expires_at, runner_seen_at, runner_seen_host,
+                       runner_seen_owner
+                  FROM agent_registry WHERE name = %s FOR UPDATE
+            )
+            UPDATE agent_registry AS r
+               SET host = %s,
+                   -- un agent du canon verra son responsable re-résolu par le
+                   -- sync d'arrivée ; un agent inscrit à la main le garde
+                   responsible = CASE WHEN coalesce(r.canon_ref, '') = ''
+                                      THEN r.responsible ELSE NULL END,
+                   canon_ref = %s,
+                   placement_ok = NULL, placement_diagnostic = %s::text,
+                   placement_ref = %s::text,
+                   placement_profile = NULL,
+                   session_id = CASE WHEN %s THEN r.session_id ELSE NULL END,
+                   session_work_item = CASE WHEN %s THEN r.session_work_item ELSE NULL END,
+                   session_reset_at = CASE WHEN %s THEN r.session_reset_at
+                                           ELSE clock_timestamp() END,
+                   pending_prompt = CASE
+                       WHEN %s OR coalesce(%s::text, '') = '' THEN r.pending_prompt
+                       ELSE concat_ws(E'\\n\\n', %s::text, r.pending_prompt) END,
+                   -- un arrêté reste arrêté (son motif d'arrêt est conservé) ;
+                   -- sinon l'agent repart réclamable sur l'hôte d'arrivée
+                   status = CASE WHEN %s THEN r.status
+                                 WHEN r.status = 'stopped' THEN r.status
+                                 ELSE 'queued' END,
+                   status_text = CASE WHEN r.status = 'stopped' THEN r.status_text
+                                      ELSE %s::text END,
+                   -- B1 des deux relectures (#3299) : l'ancien exécuteur ne
+                   -- doit plus pouvoir renouveler ni ouvrir un tour (renew et
+                   -- begin_turn ne contrôlent que owner/epoch, pas l'hôte).
+                   -- Même avec --keep-session, le bail de la source est révoqué
+                   -- dans CETTE écriture ; l'époque avance et l'arrivée peut
+                   -- réclamer après son sync.
+                   lease_owner = NULL,
+                   lease_expires_at = NULL,
+                   lease_epoch = r.lease_epoch + 1,
+                   updated_at = now()
+              FROM verrou
+             WHERE r.name = verrou.name
+               AND verrou.host = %s
+               AND coalesce(verrou.releve, 'hote') <> 'election'
+               AND verrou.status <> 'running'
+               AND NOT ameesh_handoff_fenced(r.name)
+               AND NOT EXISTS (SELECT 1 FROM host_handoffs h WHERE h.agent=r.name
+                               AND h.state NOT IN ('verified','cancelled'))
+               AND %s = ANY(verrou.admitted_hosts)
+               -- #254 : rien ne part vers un hôte en pause
+               AND NOT EXISTS (SELECT 1 FROM host_holds hh
+                                WHERE hh.host = %s AND hh.until > clock_timestamp())
+               -- #3299 : bail vivant refusé, sauf exécuteur de départ arrêté.
+               -- La preuve locale (unité inactive) ne vaut que si le dernier
+               -- relevé vient de l'unité DE CET agent (`runner-<nom>@…`) : le
+               -- gabarit systemd répond loaded/inactive pour tout nom, même
+               -- jamais instancié, et un agent servi par une autre unité
+               -- (coordinateur partagé) garderait sinon un bail vivant.
+               AND ((%s::boolean
+                     AND starts_with(coalesce(verrou.runner_seen_owner, ''),
+                                     'runner-' || verrou.name || '@'))
+                    OR verrou.lease_owner IS NULL
+                    OR verrou.lease_expires_at IS NULL
+                    OR verrou.lease_expires_at <= clock_timestamp()
+                    OR NOT (coalesce(verrou.runner_seen_host = verrou.host, false)
+                            AND verrou.runner_seen_at IS NOT NULL
+                            AND verrou.runner_seen_at >
+                                clock_timestamp() - (%s::float8 * interval '1 second')))
+              RETURNING r.name, r.host,
+                        verrou.lease_owner AS previous_lease_owner,
+                        verrou.lease_epoch AS previous_lease_epoch,
+                        (%s::boolean
+                         AND starts_with(coalesce(verrou.runner_seen_owner, ''),
+                                         'runner-' || verrou.name || '@'))
+                            AS source_stopped
+            """,
+            (name, target, canon_ref, diagnostic, ref, bool(keep_session),
+             bool(keep_session), bool(keep_session), bool(keep_session), summary, summary,
+             bool(keep_session), "moved to %s (manual)" % target,
+             host, target, target, bool(source_stopped), stale, bool(source_stopped)),
+        )
+        return rows[0] if rows else None
+
     def stop_removed(self, name, host, *, pending_text, stop_text,
                      owner=None, expected_lease_epoch=None) -> dict | None:
         guard, params = _owner(owner)

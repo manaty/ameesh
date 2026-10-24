@@ -2769,6 +2769,42 @@ class Canon(Domain):
         tour en cours, destination plus admise)."""
 
     @abc.abstractmethod
+    def relocate_operator(self, name: str, host: str, *, target: str, canon_ref: str,
+                          diagnostic: str, ref: str | None, keep_session: bool,
+                          runner_stale_s: float, summary: str = "",
+                          source_stopped: bool = False) -> dict | None:
+        """Déplacement MANUEL d'un agent `releve: hote` entre deux hôtes admis
+        (lot #3299), sans bail vivant de l'appelant.
+
+        Mêmes gardes que `relocate` (hôte d'arrivée dans `admitted_hosts`,
+        aucun tour en cours, aucun handoff ouvert, aucun `host_hold` sur
+        l'arrivée), sauf le bail : il n'est pas exigé quand l'exécuteur de
+        départ est arrêté — `runner_seen_at` plus vieux que `runner_stale_s`
+        (horloge de la base), `runner_seen_host` d'un autre hôte, ou
+        `source_stopped` (preuve locale : l'unité de l'exécuteur est
+        inactive, et le dernier relevé vient bien de l'unité DE CET agent,
+        `runner_seen_owner` = `runner-<nom>@…` ; le gabarit systemd répond
+        `inactive` pour tout nom jamais instancié). Un bail VIVANT n'est
+        accepté que dans ce cas : un exécuteur qui sert encore l'agent n'est
+        jamais dépossédé en silence. Un agent `releve: election` est refusé
+        (son élection déplace son bail).
+
+        `host` est l'hôte attendu (recontrôlé sous le verrou). `keep_session`
+        garde la session native et la consigne ; sinon la session est oubliée,
+        `session_reset_at` posé, le statut remis à `queued` (sauf `stopped`,
+        conservé) et `summary` ouvre la consigne en attente.
+
+        Le bail de la source est **révoqué dans la même écriture**, même avec
+        `keep_session` : `lease_owner` et `lease_expires_at` vidés,
+        `lease_epoch` incrémenté. `renew` et `begin_turn` ne contrôlent que
+        owner/epoch, pas l'hôte ; sans cette révocation, un exécuteur de départ
+        encore vivant garderait l'agent et l'arrivée ne pourrait pas le
+        réclamer (B1 des deux relectures, #3299). Rend la ligne (`name`,
+        `host`, et le bail révoqué `previous_lease_owner` /
+        `previous_lease_epoch`), ou None si une garde a changé depuis la
+        lecture."""
+
+    @abc.abstractmethod
     def stop_removed(self, name: str, host: str, *, pending_text: str,
                      stop_text: str, owner: tuple[str, bool] | None = None,
                      expected_lease_epoch: int | None = None) -> dict | None:
