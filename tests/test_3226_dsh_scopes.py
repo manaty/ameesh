@@ -32,7 +32,7 @@ def _dead_pid() -> int:
 
 
 def _scope(dsh_pid=None, *, owner_alive=False, turns=(TURN,), unread=False,
-           unreadable=False, start=None, unit=None):
+           unreadable=False, owner_unread=False, start=None, unit=None):
     start = time.time() - 7200 if start is None else start
     members = [{"pid": 4000 + i, "start": start, "turn": t, "unread": unread,
                 "tmpdir": "/home/a/.local/state/ameesh/.menage/tmp/mty-nxl-rel-01",
@@ -40,6 +40,7 @@ def _scope(dsh_pid=None, *, owner_alive=False, turns=(TURN,), unread=False,
     dsh_pid = 2846133 if dsh_pid is None else dsh_pid
     return {"unit": unit or "dsh-subprocess-%d-72deff11d18c.scope" % dsh_pid,
             "path": "/x", "dsh_pid": dsh_pid, "owner_alive": owner_alive,
+            "owner_unread": owner_unread,
             "members": members, "unreadable": unreadable}
 
 
@@ -60,10 +61,20 @@ class VerdictTest(unittest.TestCase):
         self.assertEqual((action, turn), ("kill", TURN))
         self.assertIn("dsh pid 2846133 gone", why)
 
-    def test_tour_orphelin_sans_fin_mesure_la_grace_depuis_le_processus(self):
-        self.assertEqual(self.verdict(_scope(), _row("orphan", ended="x"))[0], "kill")
-        jeune = _scope(start=time.time() - 60)
-        self.assertEqual(self.verdict(jeune, dict(_row("orphan"), ended_ts=None))[0], "wait")
+    def test_fin_de_tour_illisible_garde_et_signale(self):
+        """N2 : sans ended_ts lisible, la grâce ne part pas du démarrage du
+        membre (un tour clos depuis peu avec des processus anciens serait tué
+        sans la grâce complète) : le scope est gardé et signalé."""
+        for label, row in (
+                ("texte", _row("orphan", ended="x")),
+                ("absent", dict(_row("orphan"), ended_ts=None)),
+                ("nan", _row("orphan", ended=float("nan"))),
+                ("-inf", _row("orphan", ended=float("-inf")))):
+            with self.subTest(ended=label):
+                action, why, turn = self.verdict(_scope(), row)
+                self.assertEqual((action, turn), ("signal", TURN))
+                self.assertIn("end time unreadable", why)
+        self.assertEqual(self.verdict(_scope(), _row("done", ended="x"))[0], "signal")
 
     def test_tour_vivant_ou_dsh_vivant_garde(self):
         self.assertEqual(self.verdict(_scope(owner_alive=True), _row())[0], "wait")
@@ -74,8 +85,14 @@ class VerdictTest(unittest.TestCase):
     def test_non_attribuable_garde_et_signale(self):
         for scope, row in ((_scope(unread=True), _row()),
                            (_scope(unreadable=True), _row()),
+                           # N1 : illisible même quand le dsh est vivant ou que
+                           # son heure de démarrage est illisible
+                           (_scope(unreadable=True, owner_alive=True), _row()),
+                           (_scope(owner_alive=True, owner_unread=True), _row()),
+                           (_scope(owner_unread=True), _row()),
                            (_scope(turns=(None,)), _row()),
                            (_scope(turns=(TURN, "autre")), _row()),
+                           (_scope(), dict(_row(), status="perdu")),
                            (_scope(), None),
                            (_scope(), _row(host="autre-hote"))):
             with self.subTest(scope=scope, row=row):
@@ -138,6 +155,23 @@ class ReleveEtSignalTest(unittest.TestCase):
         self.assertTrue(scopes["dsh-subprocess-%d-1dfd2fb208eb.scope" % os.getpid()]
                         ["owner_alive"])
 
+    def test_releve_descend_les_slices_et_accepte_l_hex_majuscule(self):
+        """N3 : une hiérarchie imbriquée de `.slice` et un hex majuscule ne
+        cachent pas le scope."""
+        orphelin = self.spawn(["sleep", "60"])
+        unit = "dsh-subprocess-%d-ABCDEF0123.scope" % _dead_pid()
+        deep = self.app / "nested.slice" / "deeper.slice"
+        deep.mkdir(parents=True)
+        scope = deep / unit
+        scope.mkdir()
+        (scope / "cgroup.procs").write_text("%d\n" % orphelin.pid)
+        time.sleep(0.1)
+        scopes = self.scan()
+        self.assertEqual(list(scopes), [unit])
+        self.assertEqual([(m["pid"], m["turn"]) for m in scopes[unit]["members"]],
+                         [(orphelin.pid, TURN)])
+        self.assertFalse(scopes[unit]["owner_unread"])
+
     def test_pid_recycle_ne_tient_pas_lieu_de_dsh(self):
         outil = self.spawn(["sleep", "60"])
         time.sleep(1.2)
@@ -159,13 +193,38 @@ class ReleveEtSignalTest(unittest.TestCase):
 
     def test_pid_repris_n_est_jamais_signale(self):
         """cx1 B2 : un pid repris par un autre processus après le relevé ne
-        reçoit aucun signal (pidfd validé par l'heure de démarrage)."""
+        reçoit aucun signal (pidfd validé par l'heure de démarrage) et le
+        passage ne peut pas le journaliser comme tué (N5)."""
         repris = self.spawn(["sleep", "60"])
         time.sleep(0.1)
         membre = {"pid": repris.pid, "start": dsh_scopes.process.start_time(repris.pid) - 100,
                   "turn": TURN, "unread": False}
-        self.assertEqual(dsh_scopes.terminate([membre], term_wait=0.2, kill_wait=0.2), [])
+        left = dsh_scopes.terminate([membre], term_wait=0.2, kill_wait=0.2)
+        self.assertEqual([(m["pid"], m["why"]) for m in left],
+                         [(repris.pid, "pid reused before signal")])
         self.assertIsNone(repris.poll())
+
+    def test_membre_parti_avant_signal_n_est_pas_tue(self):
+        """N5 : un membre parti entre le relevé et le signal est rendu avec sa
+        raison, jamais compté comme tué."""
+        parti = _dead_pid()
+        membre = {"pid": parti, "start": time.time() - 60, "turn": TURN, "unread": False}
+        left = dsh_scopes.terminate([membre], term_wait=0.1, kill_wait=0.1)
+        self.assertEqual([(m["pid"], m["why"]) for m in left],
+                         [(parti, "gone before signal")])
+
+    def test_signal_refuse_n_est_pas_compte_tue(self):
+        """N5 : un signal refusé par le noyau n'est pas compté comme délivré."""
+        from ameesh.platform import signals
+        proc = self.spawn(["sleep", "60"])
+        time.sleep(0.1)
+        membre = {"pid": proc.pid, "start": dsh_scopes.process.start_time(proc.pid),
+                  "turn": TURN, "unread": False}
+        with mock.patch.object(signals.ProcessHandle, "send", return_value=False):
+            left = dsh_scopes.terminate([membre], term_wait=0.1, kill_wait=0.1)
+        self.assertEqual([(m["pid"], m["why"]) for m in left],
+                         [(proc.pid, "signal not delivered")])
+        self.assertIsNone(proc.poll())
 
     def test_identite_non_tenue_aucun_signal(self):
         """cx1 B1 : heure illisible ou pidfd indisponible pour UN membre :
@@ -259,6 +318,46 @@ class RecolteJournalAlerteTest(PgTestCase):
             scan=lambda: [_scope()], terminate=lambda members: members)
         self.assertEqual([e["action"] for e in out["entries"]], ["signaled"])
         self.assertIn("not killed", out["entries"][0]["detail"])
+
+    def test_parti_avant_signal_journalise_gone_pas_killed(self):
+        """N5 : tous les membres partis entre le relevé et le signal : `gone`,
+        jamais `killed` (aucun signal n'a été envoyé)."""
+        def termine(members):
+            return [dict(m, why="gone before signal") for m in members]
+        out = menage.reap_dsh_scopes(
+            self.db, HOST, now=time.time() + 2 * menage.DSH_SCOPE_GRACE_S,
+            scan=lambda: [_scope()], terminate=termine)
+        self.assertEqual([e["action"] for e in out["entries"]], ["gone"])
+        self.assertIn("gone before signal", out["entries"][0]["detail"])
+
+    def test_parti_et_retenu_signale_sans_conclure_gone(self):
+        """N5 : un membre parti ne conclut pas `gone` si un autre membre n'a
+        pas reçu de signal : le scope reste gardé et signalé."""
+        def termine(members):
+            return [dict(members[0], why="gone before signal")]
+        out = menage.reap_dsh_scopes(
+            self.db, HOST, now=time.time() + 2 * menage.DSH_SCOPE_GRACE_S,
+            scan=lambda: [_scope(turns=(TURN, TURN))], terminate=termine)
+        self.assertEqual([e["action"] for e in out["entries"]], ["signaled"])
+        self.assertIn("gone before signal", out["entries"][0]["detail"])
+
+    def test_exception_du_signal_ne_perd_pas_les_entrees(self):
+        """N4 : une exception de `terminate` sur un scope n'interrompt pas le
+        passage : elle est signalée et les scopes suivants sont traités."""
+        def termine(members):
+            if members[0]["pid"] == 4000:
+                raise RuntimeError("boom")
+            return []
+        premier = _scope(unit="dsh-subprocess-1-a.scope")
+        second = _scope(unit="dsh-subprocess-2-b.scope")
+        second["members"] = [dict(m, pid=5000) for m in second["members"]]
+        out = menage.reap_dsh_scopes(
+            self.db, HOST, now=time.time() + 2 * menage.DSH_SCOPE_GRACE_S,
+            scan=lambda: [premier, second], terminate=termine)
+        self.assertEqual([(e["path"], e["action"]) for e in out["entries"]],
+                         [("dsh-subprocess-1-a.scope", "signaled"),
+                          ("dsh-subprocess-2-b.scope", "killed")])
+        self.assertIn("pass failed (RuntimeError)", out["entries"][0]["detail"])
 
     def test_sans_releve_rien(self):
         self.assertEqual(menage.reap_dsh_scopes(self.db, HOST, scan=lambda: None),
