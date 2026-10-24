@@ -177,8 +177,29 @@ def resolve_actor(cfg, db, explicit: str | None = None) -> tuple[str, str | None
                            "\"%s\"; pass --actor <agent|human:id>" % UNKNOWN_ACTOR)
 
 
+def is_auditor(cfg, db, name: str) -> bool:
+    """#3324 : `name` est-il l'auditeur — la persona `auditeur`, ou un agent
+    dont la fiche Agent du canon porte `roles: [auditeur]` (ou `auditor`) ?
+
+    La fiche de l'auditeur (canon, 24/10/2026) range la redésignation d'un
+    relecteur au niveau 1 ; le plancher d'avis (`--floor`) reste un geste de
+    pilote. Un auditeur arrêté ou mort reste un acteur pour ce geste : c'est
+    son identité qui signe la désignation, pas un tour de travail."""
+    from . import alert_briefs, canon, registry
+
+    who = (name or "").strip()
+    if not who:
+        return False
+    try:
+        listing = registry.overview(db)
+        canons = canon.load_configured(cfg) if cfg is not None else []
+        return who in alert_briefs.auditors(listing, canons)
+    except Exception:  # noqa: BLE001 - autorité illisible : refus, comme avant
+        return False
+
+
 def corrector(cfg, db, explicit: str | None = None, *, what: str = "correction",
-              history: bool = True) -> str:
+              history: bool = True, auditor: bool = False) -> str:
     """Qui corrige un état posé par erreur (`work move … --correct`) ; WorkError
     si la correction lui est refusée. `what` (#705) nomme le geste dans les
     messages : la désignation du relecteur demande les mêmes autorités.
@@ -191,7 +212,11 @@ def corrector(cfg, db, explicit: str | None = None, *, what: str = "correction",
     récemment) ; elle ne peut pas corriger au nom d'un autre. Une session sans
     identité d'agent (un humain à son terminal) dit qui corrige : `--actor
     human:<id>`, un humain connu, ou un orchestrateur. `history=False` (#740) :
-    les lots confiés récemment ne comptent pas, seul un rôle déclaré compte."""
+    les lots confiés récemment ne comptent pas, seul un rôle déclaré compte.
+
+    `auditor=True` (#3324) ajoute l'auditeur aux autorités : la désignation et
+    le retrait d'un relecteur lui sont ouverts (fiche du 24/10, niveau 1), pas
+    le plancher d'avis (`review_floor.set_floor` garde le défaut)."""
     from . import assignments, identity, registry
 
     text = (explicit or "").strip()
@@ -207,12 +232,19 @@ def corrector(cfg, db, explicit: str | None = None, *, what: str = "correction",
     refus = ("%s refused: %%s is neither a human, an orchestrator nor a design agent "
              "(orchestrator or design role on its Agent card in the canon, "
              "AMEESH_ALERT_ORCHESTRATORS); ask the orchestrator or the owner" % what)
+    if auditor:
+        refus = ("%s refused: %%s is neither a human, an orchestrator, a design "
+                 "agent nor the auditor (orchestrator, design or auditor role on "
+                 "its Agent card in the canon, AMEESH_ALERT_ORCHESTRATORS); ask "
+                 "the orchestrator or the owner" % what)
     if binding.name:
         if text and text != binding.name:
             raise WorkError("%s refused: this session belongs to %s, it does not "
                             "act on behalf of %s" % (what, binding.name, text))
         if assignments.is_orchestrator(cfg, db, binding.name, roles=CORRECTOR_ROLES,
                                        history=history):
+            return binding.name
+        if auditor and is_auditor(cfg, db, binding.name):
             return binding.name
         raise WorkError(refus % binding.name)
     if not text:
@@ -230,6 +262,9 @@ def corrector(cfg, db, explicit: str | None = None, *, what: str = "correction",
     if registry.get(db, text) is not None \
             and assignments.is_orchestrator(cfg, db, text, roles=CORRECTOR_ROLES,
                                             history=history):
+        return text
+    if auditor and registry.get(db, text) is not None \
+            and is_auditor(cfg, db, text):
         return text
     raise WorkError(refus % text)
 
@@ -1452,10 +1487,13 @@ def reviewer_family_warning(db: Db, item: dict, reviewer: str) -> str:
             "designation is kept, #800)" % (name, author, author_harness))
 
 
-def _review_item(cfg, db: Db, item_id: int, actor: str | None):
+def _review_item(cfg, db: Db, item_id: int, actor: str | None, *,
+                 auditor: bool = False):
     """#705/#1979 : l'autorité du geste de relecture, et le lot, qui doit être
-    en `qa` (comme pour `designate_reviewer`)."""
-    who = corrector(cfg, db, actor, what="designation")
+    en `qa` (comme pour `designate_reviewer`). `auditor=True` (#3324) ouvre
+    la désignation et le retrait à l'auditeur ; `--no-verdict` garde le
+    défaut, comme `--floor`."""
+    who = corrector(cfg, db, actor, what="designation", auditor=auditor)
     item = get(db, item_id)
     if item is None:
         raise WorkError("lot %s not found" % item_id)
@@ -1546,7 +1584,8 @@ def designate_reviewer(cfg, db: Db, item_id: int, reviewer: str, *,
     """#2076 : ajoute ou retire un relecteur d'un lot **déjà en `qa`**.
 
     Geste de pilote : mêmes autorités que la correction (`corrector`) — un
-    humain, un orchestrateur ou un agent de conception. Le relecteur doit être
+    humain, un orchestrateur ou un agent de conception — plus l'auditeur
+    (#3324, fiche du 24/10, niveau 1). Le relecteur doit être
     joignable et différent de l'assigné (`check_reviewer_choice`). L'entrée en
     `qa` peut aussi le désigner d'un coup : `work move <id> qa --reviewer`.
     Même harnais déclaré que l'auteur : avertissement indicatif (#800), posé
@@ -1554,7 +1593,7 @@ def designate_reviewer(cfg, db: Db, item_id: int, reviewer: str, *,
     La désignation dépose aussi un `request` lié au lot (#2478) : le relecteur
     est réveillé, son runner ouvre un tour ; une remise en échec est un
     avertissement (`reviewer_request_warning`), la désignation reste écrite."""
-    who, item = _review_item(cfg, db, item_id, actor)
+    who, item = _review_item(cfg, db, item_id, actor, auditor=True)
     # A former reviewer can still be withdrawn after leaving the registry.
     name = (reviewer or "").strip() if remove else check_reviewer_choice(
         db, item, reviewer, cfg=cfg)
@@ -1573,11 +1612,12 @@ def designate_reviewer(cfg, db: Db, item_id: int, reviewer: str, *,
 def clear_reviewer(cfg, db: Db, item_id: int, *, actor: str | None = None) -> dict:
     """#1979 : retire la désignation du relecteur d'un lot en `qa`.
 
-    Geste de pilote (mêmes autorités que `designate_reviewer`). Le lot
+    Geste de pilote (mêmes autorités que `designate_reviewer`, auditeur
+    compris, #3324). Le lot
     retombe dans l'attente réelle d'un relecteur — « verdict d'un relecteur
     (non désigné) » — et l'alerte redemande d'en désigner un : c'est le geste
     inverse de `waive_review`, pour une désignation posée à tort."""
-    who, _item = _review_item(cfg, db, item_id, actor)
+    who, _item = _review_item(cfg, db, item_id, actor, auditor=True)
     return _write_reviewer(db, item_id, "", who, "reviewer designation removed")
 
 
@@ -3205,7 +3245,8 @@ def move(db: Db, item_id: int, state: str, *, note: str = "", actor: str = "",
 
     `reviewer` (#705) : le relecteur désigné, seulement en entrant en `qa` —
     il doit être joignable et différent de l'assigné (`check_reviewer_choice`),
-    et seul un humain ou un orchestrateur le désigne (`corrector`). La
+    et un humain, un orchestrateur, un agent de conception ou l'auditeur le
+    désigne (`corrector`). La
     désignation est journalisée ; `waiting()`, la vue de progrès et l'alerte
     `stale_lot` le nomment avant tout verdict. Un relecteur du **même harnais
     déclaré** que l'auteur rend un avertissement indicatif (#800), jamais un
@@ -3235,7 +3276,8 @@ def move(db: Db, item_id: int, state: str, *, note: str = "", actor: str = "",
         if not _pg.has_reviewers(db):
             raise WorkError("--reviewer: work_items.reviewers is missing (migration 0456): "
                             "run \"ameesh migrate\", then move the lot to qa with its reviewers")
-        actor = corrector(getattr(db, "cfg", None), db, actor, what="designation")
+        actor = corrector(getattr(db, "cfg", None), db, actor, what="designation",
+                          auditor=True)
     item = get(db, item_id)
     if item is None:
         raise WorkError("lot %s not found" % item_id)
