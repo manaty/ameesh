@@ -92,6 +92,9 @@ class TimerSpec:
     #: non-empty when this pass cannot run on this host (missing settings)
     blocked: str = ""
     detail: str = ""
+    #: #3402: blocked for a missing secret (the owner's notify route): reported,
+    #: never a failure of --check or --install (canon §3, absent credential)
+    advisory: bool = False
 
     @property
     def unit(self) -> str:
@@ -114,6 +117,7 @@ class TimerSpec:
             "description": self.description,
             "blocked": self.blocked,
             "detail": self.detail,
+            "advisory": self.advisory,
         }
 
 
@@ -421,7 +425,8 @@ def plan(*, host: str, role: str, row: dict, settings, watch_intervals,
             blocked=notify_error or "no human to reach on this host",
             detail=("the lease holder pushes on its own routes: declare the notify "
                     "key (the owner's ntfy route, secrets in notify.env) as on the "
-                    "other candidates (see EXPLOITATION, Alertes poussées)")))
+                    "other candidates (see EXPLOITATION, Alertes poussées)"),
+            advisory=True))
     else:
         reported.append(TimerSpec(
             "alerts", "alerts", ALERTS_INTERVAL_S, description,
@@ -643,7 +648,8 @@ def check(report: dict, *, directory: Path, apply: bool = True,
                          item["description"], item.get("blocked") or "",
                          item.get("detail") or "")
         if spec.blocked:
-            problems.append("%s: %s — %s" % (spec.name, item["blocked"], item["detail"]))
+            if not item.get("advisory"):
+                problems.append("%s: %s — %s" % (spec.name, item["blocked"], item["detail"]))
             continue
         expected = {spec.service: render_service(spec, role=report["role"],
                                                  bin_path=bin_path),
@@ -673,6 +679,22 @@ def check(report: dict, *, directory: Path, apply: bool = True,
             problems.append("ameesh-notify.service: the --skip drop-in is out of "
                             "date; rerun `ameesh role timers --install`")
     return problems
+
+
+def warnings(report: dict) -> list[str]:
+    """Passes blocked for a missing secret: reported, never a failure (#3402).
+
+    Without the owner's notify route, a candidate cannot push the alerts.
+    Under canon §3, that missing credential is not a negative result. It
+    must not fail ``--check``, nor therefore ``vm.sh agents controler``,
+    which would roll a staging deploy back. The gap stays visible here, and
+    through ``notify_undeliverable`` while a decision is pending.
+    """
+    if not report.get("candidate"):
+        return []
+    return ["%s: %s — %s" % (item["name"], item["blocked"], item["detail"])
+            for item in report.get("timers") or []
+            if item.get("blocked") and item.get("advisory")]
 
 
 def remove(report: dict, *, directory: Path, apply: bool = True) -> dict:
@@ -814,13 +836,16 @@ def main(argv: list[str] | None = None) -> int:
         if args.check:
             problems = check(report, directory=directory, apply=not args.no_apply,
                              bin_path=args.bin)
+            notes = warnings(report)
             if args.json:
-                print(json.dumps(dict(report, problems=problems), ensure_ascii=False,
-                                 sort_keys=True))
+                print(json.dumps(dict(report, problems=problems, warnings=notes),
+                                 ensure_ascii=False, sort_keys=True))
             elif problems:
-                for problem in problems:
+                for problem in problems + ["warning: %s" % note for note in notes]:
                     print("role timers: %s" % problem, file=sys.stderr)
             else:
+                for note in notes:
+                    print("role timers: warning: %s" % note, file=sys.stderr)
                 print("%s: role timers OK (%d pass(es))"
                       % (report["host"], len(report.get("timers") or ())))
             return 1 if problems else 0
@@ -840,10 +865,12 @@ def main(argv: list[str] | None = None) -> int:
             status = 0
             for item in result.get("timers") or []:
                 if item.get("blocked"):
-                    print("role timers: %s not installed: %s — %s"
-                          % (item["name"], item["blocked"], item["detail"]),
+                    print("role timers: %s%s not installed: %s — %s"
+                          % ("warning: " if item.get("advisory") else "",
+                             item["name"], item["blocked"], item["detail"]),
                           file=sys.stderr)
-                    status = 1
+                    if not item.get("advisory"):
+                        status = 1
             for item in result.get("missing_projects") or []:
                 print("role timers: github.projects lacks %s (%s); add it or rerun "
                       "without --no-sync" % (item["project"], item["repo"]),
