@@ -48,6 +48,23 @@ et sa tête, et il porte un trailer `ameesh-work:`. Aucun commit de `main` n'est
 venu pendant la composition. Aucune résolution manuelle : 7/7 unités
 fusionnées proprement.
 
+## Correction après CI rouge (tête `a4827fcce410`, run `40046106347`)
+
+La suite complète a rendu deux échecs, le même garde dans les parts
+`psycopg 3/8` et `psql 1/16` :
+`tests.test_cluster.SuperviseurRoleTest.test_chaque_colonne_est_accordee_ou_exclue`
+— `agent_registry.relit` (migration `0479`, #3185) n'était ni accordée ni
+exclue au contrat des rôles superviseur.
+
+Correctif `53c348f66` (`deploy/sql/role-superviseur.sql`) : `relit` rejoint
+les colonnes lisibles du rôle de base, comme `projects` (0388) et `roles`
+(0427) — des noms de projets déclarés, pas de contenu. Aucun GRANT retiré ;
+aucune autre colonne ne bouge. Avis delta SQL (deux familles) requis par le
+§12 avant fusion.
+
+Ciblés verts sur `53c348f66` : `tests.test_cluster.SuperviseurRoleTest`
+16/16, `tests.test_420_qa_role` 33/33.
+
 ## Écartés (ce véhicule)
 
 | lot | motif |
@@ -64,9 +81,10 @@ gelée ≠ tête publiée, conflit ou hold) : aucun n'était prêt à la coupure
 - **Liste calculée** : 7 prêts, **7/7 composés**. Une lecture impossible
   (#2914), non bloquante pour ce véhicule, avec son motif ci-dessus.
 - **Contrôles statiques** : `scripts/freeze-checks.py` **6/6** verts.
-- **Diff** : 39 fichiers, +1914/−263 ; `git diff --check` propre ; les sept
-  commits de composition portent leur trailer `ameesh-work:` ; aucun marqueur
-  de conflit ni de saut de CI.
+- **Diff** : 41 fichiers, +1994/−263 sur `53c348f66` (correctif de contrat
+  inclus) ; `git diff --check` propre ; les sept commits de composition
+  portent leur trailer `ameesh-work:` ; aucun marqueur de conflit ni de saut
+  de CI.
 - **Migrations** : la base 1.20.0 porte `0475`–`0476` ; `main` porte déjà
   `0477_election_brief` et `0478_role_handover`, et #3185 ajoute
   `0479_agent_relit` — toutes additives. La release 1.21.0 les applique avant
