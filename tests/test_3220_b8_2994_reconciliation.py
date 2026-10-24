@@ -243,10 +243,9 @@ class CommitSurvivesTest(TestCase):
         self.assertTrue(self.survives(head, fix, base))
 
     def test_a_duplicate_pre_image_is_not_an_annulment(self):
-        # B11 (revues cx2, cx3, auditeur) : la pré-image du retrait existe déjà
-        # intacte, dans la base, au fichier de reprise. Sa seule présence ne
-        # prouve pas que le retrait a été annulé ; seule une occurrence de plus
-        # que dans le même fichier au commit corrigé le prouve.
+        # B11 (arbitrage mesh-design) : la pré-image d'un retrait n'est plus
+        # examinée. Un retrait effectif par rapport à la base et pur garde son
+        # auteur, même si la tête a réintroduit les lignes.
         pre = ("    shared_before_1()\n"
                "    shared_before_2()\n"
                "    shared_before_3()\n"
@@ -282,10 +281,10 @@ class CommitSurvivesTest(TestCase):
         head = self.repo.commit("impl: contenu corrigé regroupé", agent="impl")
         self.assertTrue(self.survives(head, fix, base))
 
-    def test_a_reintroduced_pre_image_beside_a_duplicate_is_an_annulment(self):
-        # B11 : la pré-image existe déjà dans une fonction indépendante, mais
-        # la tête la réintroduit aussi au site corrigé (une occurrence de plus
-        # que dans le fichier corrigé) : le retrait est bien annulé.
+    def test_a_reintroduced_pre_image_beside_a_duplicate_keeps_the_corrector(self):
+        # B11 (arbitrage mesh-design) : la tête réintroduit la ligne au site
+        # corrigé, mais le retrait effectif et pur garde son auteur. C'est une
+        # sur-rétention acceptée, dans le sens sûr.
         pre = ("    shared_before_1()\n"
                "    shared_before_2()\n"
                "    shared_before_3()\n"
@@ -313,13 +312,12 @@ class CommitSurvivesTest(TestCase):
                         "def corrected():\n" + pre
                         + "def old_feature():\n" + pre + "    old_line()\n")
         head = self.repo.commit("impl: garde réintroduite", agent="impl")
-        self.assertFalse(self.survives(head, fix, base))
+        self.assertTrue(self.survives(head, fix, base))
 
-    def test_a_reintroduced_removal_pre_image_is_an_annulment(self):
-        # B9/B10 : l'annulation n'est prouvée que par la pré-image localisée
-        # du hunk (contexte + lignes retirées) retrouvée d'un seul tenant. Ici
-        # la tête réintroduit la garde exactement à sa place : le retrait est
-        # bien annulé, malgré le `return None` d'`old_feature`.
+    def test_a_reintroduced_removal_keeps_the_corrector(self):
+        # B9/B10/B11 (arbitrage mesh-design) : la tête réintroduit la garde
+        # exactement à sa place. Le retrait effectif et pur garde son auteur ;
+        # l'ancien chemin d'annulation est supprimé.
         self.repo.write("gate.py",
                         "def corrected():\n"
                         "    return None\n"
@@ -353,4 +351,4 @@ class CommitSurvivesTest(TestCase):
                         "    return None\n"
                         "    old_line()\n")
         head = self.repo.commit("impl: garde réintroduite", agent="impl")
-        self.assertFalse(self.survives(head, fix, base))
+        self.assertTrue(self.survives(head, fix, base))

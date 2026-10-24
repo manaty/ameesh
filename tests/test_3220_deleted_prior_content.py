@@ -813,10 +813,10 @@ class CommonLineControlTest(_UnrelatedCommonLineFixture):
 
 
 class DuplicatePreImageTest(UnrelatedCommonLineTest):
-    """B11 (revues cx2 + cx3, auditeur) : la pré-image du retrait existe déjà,
-    intacte, dans une fonction indépendante du fichier de reprise. Sa présence
-    ne prouve pas l'annulation : seule une occurrence de plus que dans le
-    fichier corrigé la prouve ; le compte garde cx3 et la porte refuse."""
+    """B11 (arbitrage mesh-design) : la pré-image du retrait existe déjà,
+    intacte, dans une fonction indépendante du fichier de reprise. Elle n'est
+    plus examinée : le retrait effectif et pur garde cx3 et la porte refuse
+    (sur-rétention acceptée)."""
 
     EXTRA = ""
     GATE_BASE = ("def gate(user):\n"

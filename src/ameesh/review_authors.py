@@ -786,12 +786,12 @@ def _removal_block_survives(repo: str, head: str, sha: str, paths,
     filtre les retraits qui peuvent encore prouver une survie (#2994/#2614) :
     un bloc dont un retrait ne passe pas est écarté en entier.
 
-    #3220 B10/B11 (cx2/cx3/auditeur) : le retrait n'est tenu pour annulé
-    dans un candidat que si la **pré-image** du hunk (contexte + lignes
-    retirées + contexte, depuis `sha^`) y réapparaît d'un seul tenant **plus
-    souvent que dans le fichier de référence à `sha`**. Une pré-image déjà
-    présente dans une fonction indépendante n'est pas une réintroduction ;
-    seule une occurrence de plus la prouve."""
+    #3220 B11 (arbitrage mesh-design, 24/10 00:15) : la détection
+    d'annulation d'un retrait est supprimée. Un retrait effectif par rapport à
+    la base de fusion et pur (`allow`) est tenu pour conservé, même si la tête
+    a réintroduit les lignes : un correctif annulé garde son auteur. C'est une
+    sur-rétention acceptée, dans le sens sûr ; B9, B10 et B11 venaient tous de
+    ce chemin."""
     changed = _changed_paths(repo, head, sha, cache)
     if changed is None:
         return True
@@ -799,7 +799,6 @@ def _removal_block_survives(repo: str, head: str, sha: str, paths,
         blocks = _removal_hunks(repo, sha, path, cache)
         if blocks is None:
             return True
-        current = _head_file_lines(repo, sha, path, cache)
         for block in blocks:
             post = block["post"]
             gone = [row for row in block["removed"] if _meaningful_line(row)]
@@ -820,10 +819,6 @@ def _removal_block_survives(repo: str, head: str, sha: str, paths,
                 if not any(now[at:at + size] == post
                            for at in range(len(now) - size + 1)):
                     continue
-                reference = _pre_image_reference(
-                    repo, sha, path, candidate, current, cache)
-                if _pre_image_reappears(block, now, reference):
-                    continue             # retrait annulé à cet endroit
                 return True
     return False
 
@@ -909,10 +904,10 @@ def _post_image_carried(repo: str, head: str, sha: str, path: str,
     Quand la post-image est petite, ce repli la traite comme un doute
     favorable à l'auteur plutôt que d'exiger trois lignes de contexte : c'est
     le contenu entier du fichier corrigé qui est comparé, pas un bloc isolé.
-    #3220 B10/B11 : un candidat n'est écarté que si la **pré-image** localisée
-    du retrait y réapparaît d'un seul tenant **plus souvent que dans le fichier
-    de référence à `sha`** (`_pre_image_reappears`) ; une pré-image déjà
-    présente dans une fonction indépendante ne l'annule pas.
+    #3220 B11 (mesh-design) : plus de détection d'annulation ; le contenu
+    corrigé retrouvé dans un candidat suffit, même si la tête a réintroduit
+    les lignes retirées. Un correctif annulé garde son auteur (sur-rétention
+    acceptée).
     None si une lecture échoue (le doute conserve l'auteur)."""
     excluded = tuple(sorted(str(value) for value in exclude or ()))
     key = ("post-image", sha, head, path, excluded, allow_removal is not None)
@@ -948,11 +943,6 @@ def _post_image_carried(repo: str, head: str, sha: str, path: str,
                             cache[key] = True   # lecture impossible : doute
                             break
                         continue
-                    reference = _pre_image_reference(
-                        repo, sha, path, candidate, current, cache)
-                    if any(_pre_image_reappears(block, now, reference)
-                           for block in blocks):
-                        continue             # le retrait a été annulé ici
                     if _ordered_contains(now, wanted):
                         cache[key] = True
                         break
@@ -972,67 +962,6 @@ def _path_line_counts(repo: str, rev: str, path: str, cache: dict):
                 counts[line.strip()] = counts.get(line.strip(), 0) + 1
         cache[key] = counts
     return cache[key]
-
-
-def _block_occurrences(lines, block) -> int:
-    """Le nombre d'occurrences du bloc `block` dans `lines` (#3220 B11)."""
-    size = len(block)
-    if not size:
-        return 0
-    return sum(1 for at in range(len(lines) - size + 1)
-               if lines[at:at + size] == block)
-
-
-def _pre_image_reference(repo: str, sha: str, path: str, candidate: str,
-                         current, cache: dict):
-    """Les fichiers de référence pour compter la pré-image dans `candidate`.
-
-    #3220 B11 : au même chemin, le fichier corrigé (`current`). À un chemin
-    déplacé, le candidat tel qu'il existait à `sha` s'il portait déjà du
-    contenu (sa pré-image est héritée, pas réintroduite) **et** le fichier
-    corrigé, dont le contenu a pu être repris : les occurrences héritées des
-    deux sources ne prouvent pas une réintroduction. None si une lecture est
-    impossible : le doute garde l'auteur."""
-    if candidate == path:
-        return None if current is None else (current,)
-    if current is None:
-        return None
-    references = [current]
-    inherited = _head_file_lines(repo, sha, candidate, cache)
-    if inherited is not None:
-        references.append(inherited)
-    else:
-        absent = _path_absent(repo, sha, candidate, cache)
-        if not absent:
-            return None
-    return tuple(references)
-
-
-def _pre_image_reappears(block, now, reference=None) -> bool:
-    """La pré-image d'un hunk de retrait a-t-elle été **réintroduite** dans `now` ?
-
-    #3220 B9/B10 (revues dev2, cx2, cx3 ; piste auditeur) : une ligne banale
-    (`return None`) peut déjà figurer dans le fichier de reprise, ou être
-    ajoutée dans une fonction indépendante. Ni sa présence ni un compte global
-    ne prouvent l'annulation du retrait. La preuve localisée est la pré-image
-    du hunk (contexte avant + lignes retirées + contexte après, lue depuis
-    `sha^`) retrouvée d'un seul tenant : c'est le symétrique de
-    `_hunks_survive`. Un bloc de moins de trois lignes significatives ne
-    prouve rien ; le doute conserve alors l'auteur.
-
-    #3220 B11 (revues cx2, cx3, auditeur) : la pré-image peut déjà exister
-    intacte dans une fonction indépendante — au fichier corrigé à `sha`, ou
-    dans le fichier candidat à `sha` quand la tête y a déplacé le contenu
-    corrigé. Une occurrence de plus dans la tête que dans ces références
-    prouve seule la réintroduction ; à égalité (ou référence illisible), le
-    doute conserve l'auteur."""
-    pre = block.get("pre") or []
-    if len([row for row in pre if _meaningful_line(row)]) < 3:
-        return False
-    if reference is None:
-        return False
-    return _block_occurrences(now, pre) > sum(
-        _block_occurrences(lines, pre) for lines in reference)
 
 
 def _raw_out(repo: str, *args: str) -> Optional[str]:
