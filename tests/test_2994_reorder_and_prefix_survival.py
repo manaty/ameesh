@@ -198,16 +198,70 @@ class CommitSurvivesTest(TestCase):
         head = self.squash(base, {"a.py": parent})
         self.assertFalse(self.survives(head, fix, base))
 
+    def repeated_reorder(self):
+        """Le parent et le réordre du témoin B1 (b) de #2994."""
+        names = {"A": "alpha_line()", "B": "beta_line()", "C": "gamma_line()"}
+        return ("".join(names[key] + "\n" for key in "ABACABACA"),
+                "".join(names[key] + "\n" for key in "ACABABACA"))
+
     def test_a_kept_reorder_of_repeated_lines_keeps_the_corrector(self):
         # B1 (b) : même comptes, mêmes paires de lignes voisines.
-        names = {"A": "alpha_line()", "B": "beta_line()", "C": "gamma_line()"}
-        parent = "".join(names[key] + "\n" for key in "ABACABACA")
-        fixed = "".join(names[key] + "\n" for key in "ACABABACA")
+        parent, fixed = self.repeated_reorder()
         self.repo.write("a.py", parent)
         base = self.repo.commit("base")
         self.repo.write("a.py", fixed)
         fix = self.repo.commit("fix", agent="cx3")
         head = self.squash(base, {"a.py": fixed})
+        self.assertTrue(self.survives(head, fix, base))
+
+    def test_a_reverted_reorder_of_repeated_lines_does_not_keep_the_corrector(self):
+        # #3005 (cx2 sur #2994) : la tête repart du parent, garde l'ordre
+        # d'origine dans a.py et ne modifie qu'un autre fichier. Les hunks du
+        # réordre s'y trouvent déjà, ailleurs dans le parent : ils ne prouvent
+        # pas que le réordre a survécu.
+        parent, fixed = self.repeated_reorder()
+        self.repo.write("a.py", parent)
+        base = self.repo.commit("base")
+        self.repo.write("a.py", fixed)
+        fix = self.repo.commit("fix", agent="cx3")
+        head = self.squash(base, {"a.py": parent})
+        self.assertFalse(self.survives(head, fix, base))
+
+    def test_a_reverted_reorder_of_repeated_lines_shifted_does_not_keep_the_corrector(self):
+        # #3005 : un ajout en tête décale le fichier ; les hunks préexistants
+        # restent présents à un autre rang et ne doivent pas faire survivre le
+        # réordre annulé.
+        parent, fixed = self.repeated_reorder()
+        self.repo.write("a.py", parent)
+        base = self.repo.commit("base")
+        self.repo.write("a.py", fixed)
+        fix = self.repo.commit("fix", agent="cx3")
+        head = self.squash(base, {"a.py": "header_line()\n" + parent})
+        self.assertFalse(self.survives(head, fix, base))
+
+    def test_a_kept_reorder_of_repeated_lines_shifted_keeps_the_corrector(self):
+        # #3005 : la preuve ne doit pas exiger que la tête soit exactement le
+        # contenu du commit ; un ajout en tête laisse le réordre survivant.
+        parent, fixed = self.repeated_reorder()
+        self.repo.write("a.py", parent)
+        base = self.repo.commit("base")
+        self.repo.write("a.py", fixed)
+        fix = self.repo.commit("fix", agent="cx3")
+        head = self.squash(base, {"a.py": "header_line()\n" + fixed})
+        self.assertTrue(self.survives(head, fix, base))
+
+    def test_a_shifted_block_absent_from_the_parent_keeps_the_corrector(self):
+        # #3005 : quand le bloc du commit n'existe nulle part dans le parent,
+        # sa présence dans la tête suffit, même décalée par un ajout en tête.
+        # Sa spécificité ne dépend pas de l'alignement du diff de la tête.
+        names = {"A": "alpha_line()", "B": "beta_line()", "C": "gamma_line()"}
+        parent = "".join(names[key] + "\n" for key in "BCABBBBAC")
+        fixed = "".join(names[key] + "\n" for key in "BBCABBBAC")
+        self.repo.write("a.py", parent)
+        base = self.repo.commit("base")
+        self.repo.write("a.py", fixed)
+        fix = self.repo.commit("fix", agent="cx3")
+        head = self.squash(base, {"a.py": "header_line()\n" + fixed})
         self.assertTrue(self.survives(head, fix, base))
 
     def test_a_binary_diff_keeps_the_corrector(self):

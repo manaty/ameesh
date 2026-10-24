@@ -566,6 +566,78 @@ def _raw_out(repo: str, *args: str) -> Optional[str]:
     return proc.stdout.decode("utf-8", "replace")
 
 
+def _parent_lines(repo: str, sha: str, path: str, cache: dict):
+    """Les lignes de `path` au parent du commit, [] s'il n'y existait pas,
+    None si la lecture est impossible (doute : l'auteur est conservé)."""
+    key = ("parent-lines", sha, path)
+    if key not in cache:
+        probe = plan_git._git(repo, "rev-parse", "--verify", "--quiet",
+                              "%s^:%s" % (sha, path))
+        if probe.returncode == 1:
+            cache[key] = []            # ajouté par le commit : rien avant lui
+        elif probe.returncode != 0:
+            cache[key] = None
+        else:
+            text = _raw_out(repo, "show", "%s^:%s" % (sha, path))
+            cache[key] = None if text is None else [
+                line.rstrip() for line in str(text).splitlines()]
+    return cache[key]
+
+
+def _lines_contain(lines: Sequence[str], block: Sequence[str]) -> bool:
+    """`block` apparaît-il d'un seul tenant dans `lines` ?"""
+    size = len(block)
+    return any(lines[at:at + size] == block
+               for at in range(len(lines) - size + 1))
+
+
+def _block_survives(now, parent, post, pos: int, block) -> Optional[bool]:
+    """Le bloc d'un hunk du commit (sa post-image) subsiste-t-il dans `now` ?
+
+    Le bloc est d'abord cherché tel quel. S'il existait déjà dans le parent
+    (lignes répétées), il est prolongé par ses voisins de post-image jusqu'à
+    une fenêtre qui n'existait **pas** avant le commit : seule cette fenêtre,
+    propre au commit, prouve que le réordre ou la réindentation a survécu. Une
+    tête revenue au parent ne peut contenir aucune de ces fenêtres.
+
+    Une fenêtre plus large contient la plus petite : pour chaque extension
+    gauche, le minimum d'extension droite qui casse toutes les occurrences du
+    parent est calculé, et l'extension gauche la plus courte suffit pour ce
+    minimum. True si une telle fenêtre subsiste, False sinon, None si le bloc
+    ne se localise pas dans la post-image (doute : l'auteur est conservé)."""
+    size = len(block)
+    if post[pos:pos + size] != block:
+        return None
+    left_max = pos
+    right_max = len(post) - pos - size
+    occurrences = [at for at in range(len(parent) - size + 1)
+                   if parent[at:at + size] == block]
+    if not occurrences:
+        return _lines_contain(now, block)
+    lefts, rights = [], []
+    for at in occurrences:
+        left = 0
+        while (left < min(left_max, at)
+               and parent[at - left - 1] == post[pos - left - 1]):
+            left += 1
+        right = 0
+        while (right < min(right_max, len(parent) - at - size)
+               and parent[at + size + right] == post[pos + size + right]):
+            right += 1
+        lefts.append(left)
+        rights.append(right)
+    candidates = {0, left_max}
+    candidates.update(left + 1 for left in lefts if left + 1 <= left_max)
+    for left in sorted(candidates):
+        needed = max([right + 1 for match, right in zip(lefts, rights)
+                      if match >= left] or [0])
+        if needed > right_max:
+            continue
+        if _lines_contain(now, post[pos - left:pos + size + needed]):
+            return True
+    return False
+
+
 def _hunks_survive(repo: str, head: str, sha: str, path: str,
                    cache: dict) -> bool:
     """Un hunk de `sha` dans `path` subsiste-t-il **tel quel** dans la tête ?
@@ -574,31 +646,53 @@ def _hunks_survive(repo: str, head: str, sha: str, path: str,
     leurs comptes : sa trace est la version du hunk après le commit (ses
     lignes ajoutées et une ligne de contexte de part et d'autre, indentation
     comprise). Le hunk subsiste si la tête la contient d'un seul tenant. Un
-    diff ou un chemin illisible est un doute : l'auteur est conservé (#2994)."""
+    diff ou un chemin illisible est un doute : l'auteur est conservé (#2994).
+
+    #3005 (cx2 sur #2994) : un bloc de lignes répétées se retrouve déjà
+    ailleurs dans le parent, même quand le réordre a été entièrement annulé.
+    Le bloc n'est donc une preuve que prolongé par ses voisins de post-image
+    jusqu'à une fenêtre absente du parent : cette fenêtre est propre au
+    commit, et non une copie de contenu antérieur."""
     key = ("hunks", sha, path)
     if key not in cache:
         text = _raw_out(repo, "diff", "--no-renames", "--no-color",
                         "--unified=1", str(sha) + "^", str(sha), "--", path)
         blocks = None
         if text is not None:
-            blocks, block, added = [], [], False
+            blocks, block, start, added = [], [], 0, False
             for line in str(text).splitlines() + ["@@"]:
                 if line.startswith("@@"):
                     if block and added:
-                        blocks.append(block)
-                    block, added = [], False
+                        blocks.append((block, start))
+                    block, start, added = [], 0, False
+                    if line == "@@":             # sentinelle de fin
+                        continue
+                    at = line.find(" +")
+                    try:
+                        start = int(line[at + 2:].split(" ", 1)[0]
+                                    .split(",", 1)[0]) - 1
+                    except (ValueError, IndexError):
+                        blocks = None
+                        break
                 elif line[:1] in (" ", "+") and not line.startswith("+++ "):
                     block.append(line[1:].rstrip())
                     added = added or line.startswith("+")
         cache[key] = blocks
     blocks = cache[key]
     text = _raw_out(repo, "show", "%s:%s" % (head, path))
-    if blocks is None or text is None:
+    post_text = _raw_out(repo, "show", "%s:%s" % (sha, path))
+    parent = _parent_lines(repo, sha, path, cache)
+    if (blocks is None or text is None or post_text is None
+            or parent is None):
         return True
     now = [line.rstrip() for line in str(text).splitlines()]
-    return any(now[at:at + len(block)] == block
-               for block in blocks
-               for at in range(len(now) - len(block) + 1))
+    post = [line.rstrip() for line in str(post_text).splitlines()]
+    for block, start in blocks:
+        survives = _block_survives(now, parent, post, start, block)
+        if survives is not False:
+            return True                # survie prouvée, ou doute
+    return False
+
 
 
 def _any_line_in_head(repo: str, head: str, lines: Sequence[str]) -> bool:
