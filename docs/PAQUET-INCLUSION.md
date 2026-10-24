@@ -81,16 +81,46 @@ laissé passer #2384, prêt depuis 14:29, absent du manifeste sans ligne
 « écarté ». Une recomposition recalcule la liste sur sa cible
 (`paquet-candidats.py --ready-out`) ; elle ne saute pas le contrôle.
 
+## Hold pilote (#3375)
+
+Un lot sous **hold de pilote actif** n'est pas candidat, même gelé, avisé et
+sans conflit : `packet_candidates.inventory` lit les retenues actives par
+`planned_waits` (la même lecture que la stagnation : `hold:` d'un humain ou
+d'un orchestrateur/conception, levé par `unhold:` ou un changement d'état) et
+ajoute le refus `pilot-hold`, dont le détail commence par « hold pilote ». Le
+composeur écrit ce motif dans la table « Écartés (ce véhicule) » : le lot
+n'entre pas dans `--ready-out`, et le calcul ne le propose plus comme unité.
+
+Le composeur peut passer outre, explicitement et pour une raison :
+
+```sh
+scripts/paquet-candidats.py --repo . \
+    --hold-override 3231 \
+    --hold-reason "premier paquet post-T0 (décision mesh-design 16:5xZ)" \
+    --ready-out "$TMPDIR/prets-0800.txt"
+```
+
+La surcharge ne lève **que** le hold : un autre refus (gel, avis, conflit)
+laisse le lot en attente, et le geste est alors refusé sans rien journaliser.
+Quand elle est effective, la raison est écrite au journal du lot
+(`hold-override: composition malgré le hold pilote de … — <raison>`, cible,
+base et source citées) avant l'export de la liste prête. Le hold du pilote
+reste en place : le calcul suivant écarte de nouveau le lot tant qu'un
+`unhold:` (ou un changement d'état) ne l'a pas levé.
+
 `paquet-candidats.py` ne compose rien et n'écrit dans aucun dépôt : il lit la
 base, les jalons et Git (clone privé du radar, ou clone jetable),
 et son code de retour est `1` si une lecture a échoué — une liste incomplète
-ne doit pas servir de base à un paquet. Dans ce cas `--ready-out` est retiré,
+ne doit pas servir de base à un paquet. Il reste en lecture seule, sauf le
+geste explicite `--hold-override`, qui écrit sur le lot la note de la
+surcharge. Dans ce cas `--ready-out` est retiré,
 y compris un export d'une exécution précédente : `paquet-inclusion.py`
 s'arrête alors sur un fichier absent (code `2`) au lieu de lire une liste
 partielle. `--json` rend le schéma
 `ameesh-packet-candidates/1` avec, par lot, la tête publiée, le gel effectif,
 la classe, la porte des avis, l'essai de fusion et les **codes** de refus
-(`freeze-not-head`, `verdicts-missing`, `conflict`, `already-in-target`, …).
+(`freeze-not-head`, `verdicts-missing`, `conflict`, `pilot-hold`,
+`already-in-target`, …).
 Un lot y est dit prêt quand **aucun** refus n'est calculé.
 
 ## Usage

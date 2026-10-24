@@ -539,9 +539,13 @@ La composition **part d'une liste calculée**, jamais des seuls courriers
 filtre d'assigné), leur gel effectif confronté à la tête **publiée**, les
 verdicts requis sur cette tête et un essai de fusion propre contre la cible. Un
 lot prêt absent du paquet doit figurer dans la table « Écartés (ce véhicule) »
-du manifeste avec un motif ; sinon il n'est ni composé ni visible. Si le calcul
-est incomplet (une lecture impossible), `--ready-out` est retiré, y compris un
-export précédent : le contrôle s'arrête plutôt que de lire une liste partielle.
+du manifeste avec un motif ; sinon il n'est ni composé ni visible. Un lot sous
+**hold de pilote actif** n'est pas prêt (`planned_waits`, #3375) : le calcul le
+rend `pilot-hold`, motif « hold pilote » au manifeste ; le composeur ne le
+passe qu'avec `--hold-override <lot> --hold-reason "…"`, la raison étant
+journalisée sur le lot. Si le calcul est incomplet (une lecture impossible),
+`--ready-out` est retiré, y compris un export précédent : le contrôle
+s'arrête plutôt que de lire une liste partielle.
 
 Avant la CI complète et le feu, le contrôle d'inclusion confronte cette liste
 calculée, les admissions ou routages du paquet, les lignes du manifeste **et**

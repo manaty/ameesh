@@ -121,6 +121,15 @@ transition. The storage pre-selects on the same motifs as this module
 so no ordinary note is fetched, and a transition note is stored stripped —
 what was authenticated is what is stored and read.
 
+The packet candidates (`packet_candidates.inventory`, `scripts/paquet-candidats.py`)
+read these active **pilot** holds with the same authority: a held lot is not
+ready for the hourly package, and the candidate list gives `pilot-hold` as its
+motif (canon §11 bis). The composer can overtake it only with an explicit
+`--hold-override <lot> --hold-reason "…"`, and that gesture is journaled on the
+lot (`hold-override: …`); the pilot's hold itself is unchanged, so the next
+calculation excludes the lot again until an `unhold:` or a state change lifts
+it (#3375).
+
 `merged`, `promoted` and `closed` blockers no longer defer the alert. Missing
 references, self references, proposed/done/cancelled commitments and free
 text such as “after #123 merges” do not suppress it. An unresolved package

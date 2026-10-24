@@ -38,6 +38,14 @@ Chaque refus porte un **code** stable (`freeze-not-head`, `verdicts-missing`,
 ligne « écarté » motivée, et un contrôle d'inclusion peut exiger que tout lot
 prêt y figure. Aucune écriture : ce module lit la base, les jalons et Git.
 
+#3375 : un lot dont un **hold de pilote** est actif (`planned_waits`, la même
+lecture que la stagnation) n'est pas candidat, même gelé, avisé et sans
+conflit : il porte le refus `pilot-hold`, dont le détail commence par « hold
+pilote » — le motif que le composeur écrit dans sa table « Écartés ». Le
+composeur peut passer outre explicitement (`hold_overrides`), jamais par
+défaut : la surcharge ne lève que le hold, pas les autres refus (gel, avis,
+conflit). Le journal de la surcharge est écrit par l'appelant, sur le lot.
+
 Un lot dont la préparation n'a pas pu être lue (branche, cible, classe, porte)
 n'est ni prêt ni écarté : il porte `error`, et l'appelant doit refuser de
 composer sur une liste incomplète plutôt que de l'omettre en silence.
@@ -47,6 +55,7 @@ from __future__ import annotations
 import os
 import re
 import subprocess
+import time
 
 from . import lot_class, merge_queue, packet_guard, plan_git, resolutions, storage, work
 from .canon import FETCH_TIMEOUT
@@ -63,6 +72,10 @@ _UNION_ATTRIBUTES = b"* merge=union\n"
 
 class CandidateError(RuntimeError):
     """La liste ne peut pas être calculée : cible, clone ou lecture Git."""
+
+
+class HoldOverrideError(CandidateError):
+    """#3375 : la surcharge explicite d'un hold de pilote est invalide ou sans objet."""
 
 
 def _cause(code: str, detail: str = "", **extra) -> dict:
@@ -464,9 +477,76 @@ def _marks(db, ids) -> dict:
     return out
 
 
+def _pilot_holds(db, ids, cfg=None) -> dict[int, dict]:
+    """#3375 : `{lot: hold}` des holds de **pilote** actifs, avec leur motif.
+
+    Même lecture que la stagnation : le flux ciblé du stockage
+    (`Progress.lot_hold_events`, transitions + notes hold/levée) et
+    `planned_waits.active_holds`, dont l'autorisation de pilote est relue à
+    l'instant (`human:*`, orchestrateur/conception). Un lot peut porter
+    plusieurs holds ; on retient le plus récent hold de pilote actif, celui
+    qui porte le motif à citer. Une lecture impossible est une erreur de
+    liste, jamais un lot réputé libre.
+    """
+    from . import planned_waits        # import tardif : évite le cycle work/plan
+
+    lot_ids = [int(lot) for lot in ids]
+    if not lot_ids:
+        return {}
+    try:
+        events = storage.of(db).progress.lot_hold_events(
+            lot_ids, planned_waits.HOLD_NOTE_PATTERNS)
+        active = planned_waits.active_holds(db, events, cfg=cfg)
+    except Exception as exc:  # noqa: BLE001 - lecture impossible : liste incomplète
+        raise CandidateError("cannot read the active pilot holds: %s" % exc) from exc
+    out: dict[int, dict] = {}
+    for lot, holds in active.items():
+        pilots = [hold for hold in holds.values() if hold.get("pilot")]
+        if not pilots:
+            continue
+        chosen = max(pilots, key=lambda hold: float(hold.get("since") or 0.0))
+        out[int(lot)] = {"by": chosen.get("by") or "",
+                         "since": chosen.get("since"),
+                         "note": chosen.get("note") or ""}
+    return out
+
+
+def _hold_moment(since) -> str:
+    """Le `since` d'un hold, lisible ; une date absente n'invente rien."""
+    try:
+        return time.strftime("%Y-%m-%d %H:%MZ", time.gmtime(float(since)))
+    except (TypeError, ValueError, OverflowError, OSError):
+        return "date inconnue"
+
+
+def _hold_overrides(raw) -> dict[int, str]:
+    """#3375 : valide `{lot: raison}` du geste explicite du composeur.
+
+    Une raison vide, un identifiant illisible ou un doublon contradictoire
+    sont des entrées invalides : une surcharge muette ne serait pas
+    auditable, et deux raisons pour un lot cacheraient laquelle a été
+    journalisée.
+    """
+    out: dict[int, str] = {}
+    for lot, reason in (raw or {}).items():
+        try:
+            ident = int(lot)
+        except (TypeError, ValueError) as exc:
+            raise HoldOverrideError("hold override: invalid lot %r" % (lot,)) from exc
+        if ident <= 0:
+            raise HoldOverrideError("hold override: invalid lot %r" % (lot,))
+        text = " ".join(str(reason or "").split())
+        if not text:
+            raise HoldOverrideError("hold override: lot #%d needs a reason" % ident)
+        if ident in out and out[ident] != text:
+            raise HoldOverrideError("hold override: lot #%d given two reasons" % ident)
+        out[ident] = text
+    return out
+
+
 def inventory(db, project, *, repo: str, clone, target: str | None = None,
               app: str | None = None, base: str | None = None,
-              cfg=None) -> dict:
+              cfg=None, hold_overrides: dict[int, str] | None = None) -> dict:
     """La liste calculée des candidats d'un paquet pour `project`.
 
     `project` porte le nom et la cible déclarée (`radar.Project`) ; `clone` est
@@ -476,6 +556,14 @@ def inventory(db, project, *, repo: str, clone, target: str | None = None,
     fusion (reproduction d'un manifeste) au lieu de la tête fraîche de la
     cible. La cible est résolue par `resolve_target` : un `origin/HEAD`
     `release/*` sans cible déclarée lève `CandidateError` (#2464).
+
+    #3375 : un hold de pilote actif ajoute le refus `pilot-hold` (détail
+    « hold pilote : … »). `hold_overrides` (`{lot: raison}`) est le geste
+    explicite du composeur : il ne lève que ce refus, et seulement sur un lot
+    qui porte effectivement un hold actif — une surcharge inutile, vide ou
+    visant un lot hors liste est une erreur d'entrée, jamais une omission
+    silencieuse. Le module reste en lecture seule : c'est l'appelant qui
+    journalise la raison sur le lot.
 
     Rend le schéma `ameesh-packet-candidates/1` : `candidates` (tous les lots
     `qa` du projet, prêts ou refusés avec leurs codes), `ready` (ids, ordre de
@@ -487,6 +575,18 @@ def inventory(db, project, *, repo: str, clone, target: str | None = None,
     rows = _items(db, app)
     ids = [int(row["id"]) for row in rows]
     marks = _marks(db, ids)
+    overrides = _hold_overrides(hold_overrides)
+    holds = _pilot_holds(db, ids, cfg=cfg)
+    unknown = sorted(set(overrides) - set(ids))
+    if unknown:
+        raise HoldOverrideError(
+            "hold override: lot(s) %s not among the %d qa lot(s) of project %s"
+            % (", ".join("#%d" % lot for lot in unknown), len(ids), app or "?"))
+    unheld = sorted(set(overrides) - set(holds))
+    if unheld:
+        raise HoldOverrideError(
+            "hold override: lot(s) %s carry no active pilot hold (the override "
+            "lifts a pilot hold, nothing else)" % ", ".join("#%d" % lot for lot in unheld))
     names = [target_branch]
     names += [str(row.get("branch") or "") for row in rows if row.get("branch")]
     try:
@@ -525,7 +625,8 @@ def inventory(db, project, *, repo: str, clone, target: str | None = None,
             db, row, target_branch=target_branch, tips=tips, where=where,
             package_base=package_base,
             marks=[m for m in marks.get(lot, []) if not _names_remise(m, shas)],
-            cfg=cfg, canons=canons))
+            cfg=cfg, canons=canons, pilot_hold=holds.get(lot),
+            hold_override=overrides.get(lot, "")))
     _apply_remises(db, candidates, {int(row["id"]): row for row in rows}, marks,
                    remises, remise_error, where=where, package_base=package_base,
                    cfg=cfg, canons=canons)
@@ -637,7 +738,8 @@ def _ready_order(entry: dict) -> tuple:
 
 def _candidate(db, row: dict, *, target_branch: str, tips: dict, where: str,
                package_base: str, marks: list[dict], cfg=None,
-               canons=None) -> dict:
+               canons=None, pilot_hold: dict | None = None,
+               hold_override: str = "") -> dict:
     """Un lot : tête publiée, gel, classe, porte des avis, essai de fusion."""
     lot = int(row["id"])
     branch = str(row.get("branch") or "").strip()
@@ -664,7 +766,21 @@ def _candidate(db, row: dict, *, target_branch: str, tips: dict, where: str,
         "source": "",
         "remise": None,
         "remises": [],
+        # #3375 : le hold de pilote actif, et la surcharge explicite éventuelle
+        "pilot_hold": None,
+        "hold_override": "",
     }
+    if pilot_hold:
+        entry["pilot_hold"] = dict(pilot_hold)
+        if hold_override:
+            entry["hold_override"] = hold_override
+        else:
+            entry["causes"].append(_cause(
+                "pilot-hold",
+                "hold pilote (par %s, depuis %s) : %s"
+                % (pilot_hold.get("by") or "auteur inconnu",
+                   _hold_moment(pilot_hold.get("since")),
+                   pilot_hold.get("note") or "motif non consigné")))
     if not branch:
         entry["causes"].append(_cause("missing-branch",
                                       "no branch: the lot has nothing to compose"))
