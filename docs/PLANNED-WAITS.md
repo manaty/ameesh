@@ -192,7 +192,11 @@ open packet has no escalation target of its own — the packet composer or the
 pilot carries the merge (canon §9, owner decision #103509 option a, home#147).
 A `packet-exception incident|unblock sha=… reason=…` declared for the current
 head takes the lot out of the packet: the table target (30 min; 15 min in P1)
-runs from the GO and the escalation applies.
+runs from `max(GO, CI green on that exact head)` (#3341) and the escalation
+applies. The green is read from the tracked run (`ci_runs`, the notifier's
+reading) on the frozen head — never assumed; a head with no green yet (absent,
+still running, cancelled) or with a red run starts no `verdict_merge` clock at
+all, so no alert asks for a merge the CI has not cleared.
 
 `planned_wait` is null when no explicit wait applies. While it applies,
 `stale` is null and no `stale_lot` is raised, so the notifier also stops its

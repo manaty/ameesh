@@ -367,6 +367,7 @@ def lot_steps(item: dict, jalons: dict, events: Iterable[dict], *,
               now: float | None = None, packet_slot: float | None = None,
               dependencies: Iterable[dict] = (), packet: bool = False,
               p80_s: float | None = None, outside_packet: bool = False,
+              ci_green_ts: float | None = None,
               hold_releases: Iterable[float] = (),
               reviews: Iterable[dict] = ()) -> list:
     """Les étapes mesurables d'un lot, une ligne par étape applicable.
@@ -382,6 +383,16 @@ def lot_steps(item: dict, jalons: dict, events: Iterable[dict], *,
     de fusionner un lot hors paquet : les 30 premières minutes après le GO ne
     sont pas un retard. La ligne porte `packet_slot` pour que l'alerte dise
     d'où part la mesure ; une fusion déjà faite garde sa durée réelle.
+
+    #3341 : hors paquet (exception `incident|unblock` déclarée), la fusion
+    attend aussi la CI verte sur la tête gelée exacte. `ci_green_ts` est
+    l'instant où cette CI est devenue verte (lu par l'appelant dans `ci_runs`,
+    jamais supposé ici) ; le départ est `max(GO, ci_green_ts)`. Une CI rouge,
+    encore en cours, annulée ou absente (pas de vert) ne fait pas partir
+    l'horloge : aucune ligne `verdict_merge`, donc aucune alerte — la mesure
+    ne pointe une attente que le porteur peut faire avancer. Une fusion déjà
+    faite garde sa durée réelle. Le chemin paquet garde son départ
+    (`packet_slot`/p80) : `ci_green_ts` ne le change pas.
 
     #2562 : le délai intake part au plus tôt du début planifié (minuit
     local). Avant cette date, aucune ligne intake en cours ne court.
@@ -539,13 +550,28 @@ def lot_steps(item: dict, jalons: dict, events: Iterable[dict], *,
                             target=target, escalate=not packet, **extra))
         elif state not in ("merged", "promoted", "closed"):
             start = float(verdict)
-            if packet_slot is not None and float(packet_slot) > start:
-                # #2335/A2 : la fusion ne peut entrer qu'au prochain paquet ;
-                # l'horloge GO → fusion part de ce créneau, pas du GO.
-                start = float(packet_slot)
-                extra["packet_slot"] = round(start, 3)
-            out.append(_row(step, start, now=now, critical=critical,
-                            target=target, escalate=not packet, **extra))
+            if outside_packet:
+                # #3341 : hors paquet, la CI de la tête gelée doit être verte
+                # avant que la fusion puisse avancer. Sans vert (absente,
+                # encore en cours, annulée ou rouge), l'horloge ne part pas et
+                # aucune ligne n'est produite : l'attente n'est pas imputable
+                # au porteur. Avec un vert, le départ est max(GO, vert).
+                if ci_green_ts is None:
+                    pass
+                else:
+                    green = float(ci_green_ts)
+                    start = max(start, green)
+                    extra["ci_green_ts"] = round(green, 3)
+                    out.append(_row(step, start, now=now, critical=critical,
+                                    target=target, escalate=not packet, **extra))
+            else:
+                if packet_slot is not None and float(packet_slot) > start:
+                    # #2335/A2 : la fusion ne peut entrer qu'au prochain paquet ;
+                    # l'horloge GO → fusion part de ce créneau, pas du GO.
+                    start = float(packet_slot)
+                    extra["packet_slot"] = round(start, 3)
+                out.append(_row(step, start, now=now, critical=critical,
+                                target=target, escalate=not packet, **extra))
 
     if state not in ("merged", "promoted", "closed"):
         step = step_of("green_verdict")
