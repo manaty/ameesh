@@ -11,7 +11,7 @@ Ce module est l'option courte du lot : il ne compose rien, il **réveille**. À
 chaque créneau compilé (`mechanics.last_packet`, bloc `packets.cutoffs` du
 canon), une fois le délai de grâce passé et jusqu'au créneau suivant :
 
-* la cible est-elle libre ? — aucun lot « Paquet horaire » (même sans branche)
+* la cible est-elle libre ? — aucun lot « Paquet horaire h-… » (même sans branche)
   ni porteur `integration/paquet*` ouvert pour
   le projet (un paquet en composition ou en CI occupe la cible, §12), et aucun
   porteur fusionné depuis moins que la grâce (le composeur enchaîne), ni
@@ -156,7 +156,7 @@ def _carrier(row, app: str, target: str = "", *, composing: bool = False) -> boo
         return False
     # Anchored title: a bug about packets is not a composition vehicle.
     return (str(row.get("branch") or "").startswith(CARRIER_PREFIX)
-            or (composing and re.match(r"^paquet\s+horaire\b",
+            or (composing and re.match(r"^paquet\s+horaire\s+h-",
                                        str(row.get("title") or "").strip(), re.I)
                 is not None))
 
@@ -268,7 +268,7 @@ def body(watch: ProjectWatch, at: dict, payload: dict, *, now: float | None = No
     by_id = {entry["work_item"]: entry for entry in payload.get("candidates") or ()}
     lines = [
         "Créneau de paquet %s manqué (%s) : cible %s @ %s libre, aucun porteur "
-        "integration/paquet* ni lot Paquet horaire ouvert, %d lot(s) prêt(s)."
+        "integration/paquet* ni lot Paquet horaire h-* ouvert, %d lot(s) prêt(s)."
         % (at["label"], watch.name, payload.get("target"),
            str(payload.get("base") or "")[:12], len(payload.get("ready") or ())),
         "",

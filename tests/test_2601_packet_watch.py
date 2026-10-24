@@ -203,6 +203,10 @@ class CompositionBeforePush(unittest.TestCase):
         self.assertFalse(packet_watch._carrier(row, "nexlink", "main", composing=True))
         self.assertFalse(packet_watch._carrier(dict(row, title="packet-watch : Paquet horaire"),
                                               "ameesh", "main", composing=True))
+        # #3406 N1: a bug title must not silence every subsequent slot.
+        self.assertFalse(packet_watch._carrier(
+            dict(row, title="Paquet horaire : corriger une alerte"),
+            "ameesh", "main", composing=True))
         for branch in (None, "integration/paquet-h-11"):
             other = dict(row, branch=branch, branch_target="origin/develop")
             self.assertFalse(packet_watch._carrier(other, "ameesh", "main", composing=True))

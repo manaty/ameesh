@@ -527,7 +527,7 @@ paquet.
 Un créneau manqué ne reste pas muet (#2601) : sur l'hôte opérateur, chaque
 `ameesh release tick` (minuteur de 5 min) relit la cadence compilée
 (`packets.cutoffs`) ; passé la grâce (15 min par défaut), si aucun porteur
-`integration/paquet*` ni lot au titre commençant par « Paquet horaire »
+`integration/paquet*` ni lot au titre commençant par « Paquet horaire h- »
 n’est ouvert (même sans branche) pour le projet et la cible, ni tout juste fusionné,
 qu'aucun paquet n'a déjà fusionné pendant le créneau et que la liste calculée
 rend au moins un lot prêt, une alerte urgente part, une fois
