@@ -392,23 +392,28 @@ _HUMAN_WAIT_PATTERNS = (
     r"double\s+authentification|mot\s+de\s+passe|identifiants?|credentials?)\b",
     # un go, un accord ou une signature encore requis
     r"\b(?:go|accord|feu\s+vert|validation|signature)\s+(?:de\s+l'|de\s+la\s+|"
-    r"du\s+|d')?(?:owner|propri[ée]taire)\b[^.;]{0,60}\b(?:requis|requise|"
+    r"du\s+|d')?(?:owner|propri[ée]taire)\b[^.;,]{0,25}\b(?:requis|requise|"
     r"à\s+demander|demand[ée]e?|attendu|en\s+attente|à\s+obtenir|à\s+donner|"
     r"à\s+signer|non\s+sign[ée]e?|pas\s+sign[ée]e?)\b",
     # une décision encore due ou non signée (une décision signée ne l'est plus)
     r"\bd[ée]cision\s+(?:de\s+l'|de\s+la\s+|du\s+|d')?(?:owner|propri[ée]taire)\b"
-    r"[^.;]{0,60}\b(?:due|attendue|à\s+prendre|à\s+demander|à\s+signer|"
+    r"[^.;,]{0,25}\b(?:due|attendue|à\s+prendre|à\s+demander|à\s+signer|"
     r"non\s+sign[ée]e?|pas\s+sign[ée]e?)\b",
     # la reprise dépend d'une décision de l'owner
     r"\b(?:reprise|reprendre|d[ée]pend)\b[^.;]{0,30}\b(?:de|sur|d')\s+"
     r"(?:la\s+)?d[ée]cision\s+(?:de\s+l'|de\s+la\s+|du\s+|d')?"
     r"(?:owner|propri[ée]taire)\b",
-    # retour, attente ou demande à l'owner
-    r"\b(?:retour|attente|attendre|attend|demand[ée]e?|demander)\b[^.;]{0,30}"
-    r"\b(?:de\s+l'|de\s+la\s+|du\s+|d')?(?:owner|propri[ée]taire)\b",
-    r"\b(?:owner|propri[ée]taire)\b[^.;]{0,30}\b(?:doit|devra|est\s+attendu|"
-    r"attend|reviendra|signera|donnera|validera|fournira|transmettra|"
-    r"r[ée]pondra)\b",
+    # retour, attente ou demande à l'owner : l'owner est l'objet direct (une
+    # attente d'autre chose près d'une « consigne owner » n'est pas humaine ;
+    # « demandée par l'owner » non plus, et « l'owner attend » encore moins)
+    r"\b(?:retour|r[ée]ponse|attente)\s+(?:de\s+l'|de\s+la\s+|du\s+|d')"
+    r"(?:owner|propri[ée]taire)\b",
+    r"\b(?:attendre|attend|attendons|demander|demand[ée]e?s?)\s+"
+    r"(?:à\s+l'|à\s+la\s+|au\s+|l'|le\s+|la\s+)(?:owner|propri[ée]taire)\b",
+    r"\b(?:owner|propri[ée]taire)\s+(?:(?:doit|devra)\s+(?:encore\s+)?"
+    r"(?:valider|signer|donner|d[ée]cider|trancher|r[ée]pondre|approuver|"
+    r"fournir|faire|se\s+connecter)|est\s+attendu|reviendra|signera|donnera|"
+    r"validera|fournira|transmettra|r[ée]pondra)\b",
     # gestes réservés au bureau ou au propriétaire, non réassignables à un agent
     r"\br[ée]serv[ée]s?\s+(?:au|à\s+la|à\s+l'|aux)\s+(?:bureau\s+ou\s+au\s+)?"
     r"(?:owner|propri[ée]taire)\b",

@@ -542,6 +542,23 @@ class VersionEtAttentesHumainesTest(unittest.TestCase):
                           "hold: décision owner due pour le go de production")])
         self.assertEqual([row["lot"] for row in report["human_waits"]], [9001])
 
+    def test_attente_d_agent_pres_d_une_mention_owner_n_est_pas_humaine(self):
+        # Relecture dev1 sur 80af09e5 : « attend … (consigne owner) » ou
+        # « demandée par l'owner » reste une attente d'agent ; seul l'owner
+        # objet direct de l'attente la rend humaine.
+        for text in ("hold: attend la fusion de #3100 (consigne owner)",
+                     "hold: attente de #3000 (règle owner 23/10)",
+                     "hold: évolution demandée par l'owner, attend le lot #3100",
+                     "hold: l'owner doit être notifié après fusion; attend #3100",
+                     "hold: validation owner reçue, en attente du paquet #3100"):
+            with self.subTest(text=text):
+                self.assertFalse(debit._human_wait(None, text))
+        for text in ("hold: retour de l'owner attendu",
+                     "hold: attend l'owner (séance de 16:15)",
+                     "hold: l'owner doit signer le go prod"):
+            with self.subTest(text=text):
+                self.assertTrue(debit._human_wait(None, text))
+
     def test_hold_undeployed_jamais_humain(self):
         # Canon §11 bis : même en waiting_human et avec un « owner » dans la
         # note, un correctif fusionné non déployé est une attente d'agent.
