@@ -985,6 +985,22 @@ def _notify(cfg, db, project: str, listing: Sequence[Mapping]) -> str:
     return ""
 
 
+def _candidates(listing: Sequence[Mapping], *, loads: Mapping, project: str, families,
+                pilot: str) -> list:
+    """The project's candidates, its pilot removed.
+
+    The project's agents plus the agents of another team that declare it under
+    `relit:` (#3185). The pilot receives the capacity alert; the review stays
+    with the others, so the two roles never collapse into one mail — even when
+    the pilot's card would make it a candidate.
+    """
+    candidates = rd.candidates_from_registry(listing, loads=loads, project=project,
+                                             families=families)
+    if pilot:
+        candidates = [candidate for candidate in candidates if candidate.name != pilot]
+    return candidates
+
+
 def _manual(db, item: Mapping) -> list:
     """The reviewer names that were designated by hand, not by a past freeze.
 
@@ -1191,16 +1207,10 @@ def prepare(cfg, db, lot: int, *, freeze: Optional[Mapping] = None,
     notify = _notify(cfg, db, project, listing)
     families = policy.families
     unreadable: list = []
-    candidates = rd.candidates_from_registry(
-        listing, loads=_loads(db, unreadable=unreadable), project=project,
-        families=families)
+    candidates = _candidates(listing, loads=_loads(db, unreadable=unreadable),
+                             project=project, families=families, pilot=notify)
     if unreadable:
         _note_unreadable(db, int(lot), str(item.get("state") or ""), unreadable)
-    if notify:
-        # the pilot receives the capacity alert; the review stays with the
-        # project's agents, so the two roles never collapse into one mail
-        candidates = [candidate for candidate in candidates
-                      if candidate.name != notify]
     authors, unknown, correctors = review_authors.reading(
         db, item, freeze, commits, repo, families=policy.families, trace=True,
         base=start, head=frozen_sha)

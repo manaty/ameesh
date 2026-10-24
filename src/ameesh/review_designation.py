@@ -244,6 +244,20 @@ def is_available(row: Mapping) -> bool:
     return not any(text.startswith(prefix) for prefix in PAUSE_PREFIXES)
 
 
+def reviewed_projects(row: Mapping) -> list[str]:
+    """#3185: the projects a registry row reviews beside its team (`relit`).
+
+    The column is a text array; a reader that returns it as `{a,b}` text is
+    read the same way as `projects.agent_projects` does. NULL or absent: none.
+    """
+    declared = (row or {}).get("relit")
+    if not declared:
+        return []
+    if isinstance(declared, str):
+        declared = declared.strip("{}").split(",")
+    return [p for p in (str(value or "").strip() for value in declared) if p]
+
+
 def candidates_from_registry(rows: Iterable[Mapping], *, loads: Optional[Mapping] = None,
                              project: str = "", families) -> list[Candidate]:
     """The candidates of a project: real family, availability, caller's charge.
@@ -254,13 +268,19 @@ def candidates_from_registry(rows: Iterable[Mapping], *, loads: Optional[Mapping
     restricts to agents of the same team: an ameesh lot is reviewed by an
     ameesh agent. An empty project does not filter — the caller knows what it
     is doing.
+
+    #3185: an agent whose card declares the project under `relit:` is a
+    candidate too, with its real family like any other: a project whose own
+    agents cover a single family (nexlink: codex, plus DeepSeek harnesses)
+    gets its second family from declared reviewers of another team. The
+    exclusions (authors, correctors, the project's pilot) stay the caller's.
     """
     loads = loads or {}
     wanted = (project or "").strip()
     out = []
     for row in rows or ():
         team = str((row or {}).get("team") or "").strip()
-        if wanted and team != wanted:
+        if wanted and team != wanted and wanted not in reviewed_projects(row):
             continue
         name = str((row or {}).get("name") or "").strip()
         if not name:
