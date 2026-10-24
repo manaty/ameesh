@@ -43,7 +43,8 @@
                                                  agent to its successor, expires the rest past
                                                  `mail_dead_letter_days` (7; 0 = never), with
                                                  a thread trace; run daily by the runner
-  agent-mail list                                agents, host, lease, unread
+  agent-mail list                                agents, host, lease, unread,
+                                                 last sign of life (seen/wrote)
   agent-mail inbox [NAME]                        unread messages of NAME (without marking them read)
   agent-mail whoami [--session ID --harness H]   bound identity and its source (runner, explicit,
                                                  session); --cwd DIR = diagnostic
@@ -696,8 +697,16 @@ def cmd_inbox(bk, cfg: Config, rest: list[str]) -> int:
 
 
 def cmd_list(bk) -> int:
-    for row in bk.agents():
-        age = int(time.time() - (row.get("last_seen") or 0))
+    # #3337 : l'ordre suit le même signe de vie que la ligne — une identité
+    # `externe` qui vient d'écrire ne reste pas enterrée en bas de la liste.
+    for row in sorted(bk.agents(), key=lambda item: -registry.presence(item)[0]):
+        # #3337 : une identité qui écrit hors exécuteur (mode `externe`) ne
+        # touche jamais `last_seen` ; son dernier message est un signe de vie
+        # plus récent. Le dire, et nommer la session hors exécuteur, pour ne
+        # plus afficher un faux « absent ».
+        seen_ts, source = registry.presence(row)
+        age = max(0, int(time.time() - seen_ts))
+        outside = " (outside runner)" if row.get("mode") == "externe" else ""
         extra = []
         if row.get("host"):
             extra.append("@" + row["host"])
@@ -709,8 +718,9 @@ def cmd_list(bk) -> int:
         # qu'un tour lira plus tard — un « unread:6 » de copies/radars ne doit
         # plus faire passer un agent au repos pour bloqué.
         passive = int(row.get("passive_unread") or 0)
-        print("%-20s %-9s seen %5ss ago  unread:%-3d%s %s%s" % (
-            row["name"], row.get("tool", "?"), age, row.get("unread", 0),
+        print("%-20s %-9s %s %5ss ago%s  unread:%-3d%s %s%s" % (
+            row["name"], row.get("tool", "?"), source, age, outside,
+            row.get("unread", 0),
             "  passive:%-3d" % passive if passive else "",
             row.get("cwd") or "", ("  " + " ".join(extra)) if extra else "",
         ))
