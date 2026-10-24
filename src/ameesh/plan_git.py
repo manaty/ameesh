@@ -937,6 +937,22 @@ def content_retention(st, row: dict) -> dict | None:
     return None
 
 
+def dry_run_retention(db, st, row: dict, *, sha: str, repo: str | None) -> dict | None:
+    """La retenue qu'un relevé à blanc annonce : #2744 (blocked, hold), puis
+    #3022 (porte de production hors de la branche de prod) — la même que
+    `work.close_merged` appliquerait, sans verrou ni écriture. Le hold de
+    l'assigné levé par le contenu (#3219, `lift: True`) n'exempte pas de la
+    porte : sa retenue prime, sinon la levée est rendue."""
+    retention = content_retention(st, row)
+    if retention is None or retention.get("lift"):
+        from . import prod_gate
+        gate = prod_gate.check(st, row, sha=sha, repo=repo,
+                               cfg=getattr(db, "cfg", None))["retention"]
+        if gate is not None:
+            retention = gate
+    return retention
+
+
 def _hold_reason(hold: dict) -> str:
     """Le motif d'une retenue (`hold: <raison>`), sur une ligne."""
     reason = " ".join(str((hold or {}).get("note") or "").split())
@@ -1027,12 +1043,17 @@ def _wake_retention(db, row: dict, retention: dict, *, entry: dict, target: str)
             or recipient == work_mod.SYSTEM_SENDER:
         return
     ref = str(entry.get("ref") or entry.get("sha") or "")
+    lift = ("lift the hold (a state change or an `unhold:` note) and the next "
+            "content sweep will close it")
+    if retention.get("what") == "production":
+        # #3022 : c'est la présence sur la branche de prod qui ferme
+        lift = ("it closes once the fix reaches the production branch (release or "
+                "incident fix); a wrong mark is lifted by a `prod-gate lifted:` note")
     body = ("Lot #%d \"%s\": its frozen content is merged into %s (%s, %s), but the "
-            "closure is withheld: %s. The lot stays %s; lift the hold (a state change "
-            "or an `unhold:` note) and the next content sweep will close it."
+            "closure is withheld: %s. The lot stays %s; %s."
             % (int(row["id"]), row.get("title") or "", target,
                entry.get("how") or "?", ref[:12] or "?", retention["motif"],
-               row.get("state") or "?"))
+               row.get("state") or "?", lift))
     try:
         mail.send(db, work_mod.SYSTEM_SENDER, recipient, body, kind="event",
                   work_item_id=str(int(row["id"])),
@@ -1171,7 +1192,8 @@ def sync_merges(db, repo_dir: str, *, target: str | None = None, dry_run: bool =
             if dry_run:
                 # #2744 : la même retenue que la fermeture par le gel ;
                 # #3219 : celle de l'assigné est levée par le contenu.
-                retention = content_retention(st, row)
+                retention = dry_run_retention(db, st, row, sha=entry["ref"] or "",
+                                              repo=repo_dir)
                 if retention is not None and not retention.get("lift"):
                     mark_retained(entry, retention, target=composition["target"],
                                   dry_run=True)
@@ -1270,7 +1292,8 @@ def sync_merges(db, repo_dir: str, *, target: str | None = None, dry_run: bool =
                      ref=found_proof["ref"], sha=sha, result="open",
                      detail=found_proof["detail"])
         if dry_run:
-            retention = content_retention(st, row)
+            retention = dry_run_retention(db, st, row, sha=entry["ref"] or "",
+                                          repo=repo_dir)
             if retention is not None and not retention.get("lift"):
                 mark_retained(entry, retention, target=found_target, dry_run=True)
                 results.append(entry)
@@ -3230,7 +3253,7 @@ def sync_branches(db, *, host: str | None = None, agents=None, dry_run: bool = F
             results.append(entry)
             continue
         if dry_run:
-            retention = content_retention(st, row)
+            retention = dry_run_retention(db, st, row, sha=found["ref"] or "", repo=repo)
             if retention is not None and not retention.get("lift"):
                 mark_retained(entry, retention, target=target, dry_run=True)
                 results.append(entry)

@@ -373,6 +373,11 @@ class PgBackend:
                 "cwd": row.get("cwd") or "",
                 "session_id": row.get("session_id"),
                 "last_seen": row.get("last_seen_ts") or 0.0,
+                # #3337 : le dernier message déposé par l'identité, distinct de
+                # `last_seen` (hook/exécuteur) ; une session `externe` n'écrit
+                # que par ce canal.
+                "last_mail": row.get("last_mail_ts") or 0.0,
+                "mode": row.get("mode") or "",
                 "host": row.get("host") or "",
                 "status": row.get("status") or "?",
                 "status_text": row.get("status_text") or "",

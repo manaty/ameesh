@@ -132,6 +132,25 @@ def live_harness(row: dict | None) -> str:
     return str(row.get("session_harness") or row.get("harness") or "")
 
 
+def presence(row: dict | None) -> tuple[float, str]:
+    """Dernier signe de vie d'un agent, et sa source (#3337).
+
+    `seen` : inscription au registre (hook, exécuteur, statut), lue dans
+    `last_seen`. `wrote` : un message déposé par l'identité, lu dans
+    `last_mail_ts` (le plus récent gagne). Une session `externe` écrit sans
+    exécuteur, donc sans que `last_seen` avance : sans cette seconde source,
+    `mail list` la présentait comme absente alors qu'elle venait d'écrire.
+
+    Un nom d'expéditeur est déclaré, pas prouvé (un message non signé ne
+    porte aucune autorité) : c'est un signe de vie, jamais une preuve."""
+    row = row or {}
+    seen = float(row.get("last_seen_ts") or row.get("last_seen") or 0.0)
+    wrote = float(row.get("last_mail_ts") or row.get("last_mail") or 0.0)
+    if wrote > seen:
+        return wrote, "wrote"
+    return seen, "seen"
+
+
 def overview(db: Db) -> list[dict]:
     """Vue d'observabilité (`mesh list --json`).
 

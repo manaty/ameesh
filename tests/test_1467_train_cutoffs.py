@@ -162,6 +162,11 @@ class CutoffTest(unittest.TestCase):
         self.ports.ci = original
         self.ports.ci_by_head[first["head"]] = "green"
         result = engine.step(stamp("2026-10-15T12:00:01"))
+        self.assertEqual(result["result"], "invalidated", result)
+        self.assertFalse(self.ports.held)
+        self.assertEqual(len(self.ports.probes), 1)
+        self.assertEqual([e[0] for e in self.ports.effects].count("ci"), 1)
+        result = engine.step(stamp("2026-10-15T12:00:02"))
         self.assertEqual(result["result"], "ci", result)
         self.assertEqual([r["work_item_id"] for r in result["plan"]["members"]], [2])
         self.assertNotEqual(result["plan"]["id"], first["id"])

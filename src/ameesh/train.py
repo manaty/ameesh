@@ -297,6 +297,9 @@ class Engine:
                 state["attempts"][-1]["ci"] = ci
                 state["phase"] = "invalidated"
                 state = self._save(state)
+                # End this passage before composing again: the caller must
+                # recheck its canon fence for the next packet (#2914).
+                return {"result": "invalidated", "plan": state["plan"]}
             if state is None or state["phase"] in TERMINAL:
                 enroll = getattr(self.ports, "enroll", None)
                 if callable(enroll):

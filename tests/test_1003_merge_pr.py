@@ -905,7 +905,12 @@ class RunTest(unittest.TestCase):
                 "title": "reviewed workflow", "issue_ref": None}
         done = dict(item, state="merged")
         store_close = mock.Mock(return_value=done)
-        store = SimpleNamespace(work=SimpleNamespace(close_merged=store_close))
+        # #3022 : la garde de porte de production lit la marque du lot sous
+        # son verrou de ligne ; un lot sans marque ne lit rien d'autre.
+        store = SimpleNamespace(
+            work=SimpleNamespace(close_merged=store_close,
+                                 lock=mock.Mock(return_value=item)),
+            progress=SimpleNamespace(lot_hold_events=mock.Mock(return_value=[])))
         # Current main closes the lot and wakes its dependents in one
         # transaction. Keep those unrelated DB ports explicit in this unit
         # witness; close_merged itself still runs, without any Git proof.

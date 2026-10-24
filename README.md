@@ -147,7 +147,9 @@ agent-mail send <dest> <texte…> [--from NOM] [--lot ID [--assign]] [--kind req
                                                # (90 s), --urgent without delay, --ack and --cc without waking
                                                # --lot: thread label; hands over a free lot (L94
                                                # history, or --assign #964), never one held by an agent (#1066)
-agent-mail list                                # nom, outil, âge, non lus, dossier, hôte, bail
+agent-mail list                                # nom, outil, dernier signe de vie
+                                               # (seen/wrote, hors exécuteur), non lus,
+                                               # dossier, hôte, bail
 agent-mail inbox [NOM]                         # non lus, sans les marquer lus
 agent-mail whoami                              # identité liée (nom + source : runner, explicit,
                                                # session), jamais le dossier

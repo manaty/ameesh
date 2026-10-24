@@ -287,7 +287,7 @@ def cmd_list(cfg: Config, args: argparse.Namespace) -> int:
         # à 9, la ligne entière se décalait d'un caractère.
         print("%-20s %-12s %-10s %-10s %-11s %-22s %-8s %-5s %-5s %-13s %-4s %s" % (
             "NAME", "PROJECT", "HARNESS", "HOST", "STATUS", "LEASE", "UNREAD", "ITEMS",
-            "BUILD", "BUDGET", "KEY", "SEEN"))
+            "BUILD", "BUDGET", "KEY", "ACTIVITY"))
         session_differs = False
         for row in rows:
             status = row.get("status") or "?"
@@ -312,6 +312,13 @@ def cmd_list(cfg: Config, args: argparse.Namespace) -> int:
             if starred:
                 session_differs = True
             wip = build_by_agent.get(row["name"], 0)
+            # #3337 : la colonne dit le dernier signe de vie, pas seulement
+            # l'inscription au registre — une session `externe` qui écrit ne
+            # touche jamais `last_seen` et paraissait absente.
+            presence_ts, presence_source = registry.presence(row)
+            last = _fmt_age(now - presence_ts)
+            if presence_source == "wrote":
+                last = "wrote " + last
             print("%-20s %-12s %-10s %-10s %-11s %-22s %-8d %-5d %-5s %-13s %-4s %s" % (
                 row["name"][:20], project_label(agent_project_label(row))[:12],
                 ((live or "?")[:9] + ("*" if starred else "")),
@@ -321,7 +328,7 @@ def cmd_list(cfg: Config, args: argparse.Namespace) -> int:
                 "%d!" % wip if cap is not None and wip > cap else str(wip), _budget(row),
                 ("owner" if row.get("has_owner_key")
                  else "agent" if row.get("key_ready") else "—"),
-                _fmt_age(now - float(row.get("last_seen_ts") or 0)),
+                last,
             ))
         if session_differs:
             print("* session harness: the live session runs under another "
@@ -2710,7 +2717,8 @@ def cmd_migrate(cfg: Config, args: argparse.Namespace) -> int:
 def cmd_doctor(cfg: Config, args: argparse.Namespace) -> int:
     from . import cli
     return cli.cmd_doctor(cfg, notify_test=args.notify_test, probe=args.probe,
-                          harness=getattr(args, "harness", False))
+                          harness=getattr(args, "harness", False),
+                          profiles=getattr(args, "profiles", False))
 
 
 # --------------------------------------------------------------------------
@@ -3923,6 +3931,10 @@ def build_parser() -> argparse.ArgumentParser:
     p_doc.add_argument("--harness", action="store_true",
                        help="harness binaries served by the host (path, provenance, "
                             "interpreter) and runner units (L106)")
+    p_doc.add_argument("--profiles", action="store_true",
+                       help="#3345: runner profiles against the host config.json; "
+                            "non-zero on a divergence of train, github or release "
+                            "(database-free, for deployment checks)")
     p_doc.set_defaults(func=cmd_doctor)
 
     from . import canon_cli
