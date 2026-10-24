@@ -1,6 +1,7 @@
 # Paquet integration/paquet-h-20261024-07 — composition (§12)
 
-Base : `main` **`bf1925787dd2`** (fusion du paquet h-06, PR #2493, 09:59Z).
+Base : `main` **`81be88044`** (fusion de l'incident #3336, PR #2516, 12:52Z ;
+le paquet h-06 était en `bf1925787dd2`).
 Branche `integration/paquet-h-20261024-07`, cible `main`. Porteur : **#3334**.
 Composeur : mty-amh-impl-05. Une seule suite complète est demandée sur la tête
 finale (CI de la PR).
@@ -30,6 +31,12 @@ finale (CI de la PR).
 - #3330 n'a pas conflicté avec #3326 : la règle du pilote (« garder #3326,
   écarter #3330 en cas de conflit ») n'a pas eu à s'appliquer ; les deux sont
   composés.
+- mesh-design, message du 24/10 12:52Z : #3336 fusionné par le pilote (fusion
+  admin, garde de tête `b4369387`) après annulation de sa CI par le plafond de
+  60 min (`psql 1/3` restant, aucun test négatif, §3) ; `main` = `81be88044`.
+  h-07 est recomposé sur ce main, puis une seule `ci-full` et avis delta.
+  Le même plafond de 60 min peut frapper une part `psql` de la `ci-full` :
+  non concluant, non bloquant (§3), consigné et corrigé à part.
 
 ## Admissions (11 lots, 11 unités)
 
@@ -64,8 +71,9 @@ finale (CI de la PR).
 | 11 | #3327 | `e4ad79ce25ab` | `c127b69eba52` | conflit `deploy/mise-a-jour/poste.sh`, `vm.sh` résolu en union |
 
 Chaque commit de composition a le lot en second parent, son sujet nomme le lot
-et sa tête, et il porte un trailer `ameesh-work:`. Aucun commit de `main` n'est
-venu pendant la composition (base `bf1925787dd2` figée).
+et sa tête, et il porte un trailer `ameesh-work:`. La composition a été faite
+sur `bf1925787dd2` figée ; la recomposition y ajoute le seul commit de `main`
+`81be88044` (#3336), fusionné sans conflit (`016b37af2`).
 
 ## Contrôles
 
@@ -86,12 +94,16 @@ venu pendant la composition (base `bf1925787dd2` figée).
   `test_1617_review_designation`, `test_2447_review_designation_activation`,
   `test_l118_assignments`, `test_l230_build_artifacts`,
   `test_l233b_budget_handoff` : 248).
+- **Tests ciblés de la tête recomposée** (`016b37af2`) : **235/235 verts** en
+  13 min 22 s, sans CI (`test_1252_vm_agents_install` 48,
+  `test_899_alerte_plafond`, `test_l161c_failures_realtime`,
+  `test_2446_train_contract`, `test_3098_train_contract_pins`,
+  `test_856_ci_flux_orphelins`).
 - **Compilation** : `compileall src tests` verte.
 - **Contrôles statiques** : 6/6 verts (`scripts/freeze-checks.py`).
-- **Diff** : 54 fichiers, +5216/−263 (manifeste et deux correctifs compris ;
-  composition seule : 53 fichiers, +5045/−263 ; correctifs : 3 fichiers
-  +18/−3 puis 1 fichier +7/−1) ; `git diff --check` vert ; les onze commits de
-  composition portent leur trailer `ameesh-work:`.
+- **Diff** : 54 fichiers, +5265/−264 (manifeste, recomposition sur `main`
+  `81be88044` et correctifs de banc compris) ; `git diff --check` vert ; les
+  onze commits de composition portent leur trailer `ameesh-work:`.
 - **Migrations** : aucune (aucun fichier SQL ni migration).
 - **Prévalidation** : demandée au gel ; carte périmée (`card-stale`) attendue,
   non bloquante (§3), motif consigné.
@@ -102,10 +114,10 @@ venu pendant la composition (base `bf1925787dd2` figée).
   (correctif mécanique §2/§11 bis, le manifeste est la revue du paquet), fusion
   automatique réarmée. Le deuxième tour ne change qu'un banc (#1252) : nouvelle
   tête, `ci-full` et avis sur le seul delta de test. Les onze unités gardent
-  leurs verdicts acquis sur leurs têtes gelées. La `ci-full` demandée sur
-  `b1ae015a71` a été annulée avant démarrage (run `40089199903`) : cette tête
-  allait changer (recomposition sur le `main` de #3336), une seule suite
-  complète est consommée sur la tête finale.
+  leurs verdicts acquis sur leurs têtes gelées. La `ci-full` du `b1ae015a71`
+  (run `40089294066`) est rouge sur le banc #1252 et remplacée par la
+  recomposition sur le `main` de #3336 : une seule suite complète est consommée
+  sur la tête finale.
 - **Fusion** : sous garde de tête (`--match-head-commit`), dès le vert, par le
   pilote ou le bureau ; tout rouge non infra isole le lot fautif sans relire
   le reste.
@@ -153,17 +165,23 @@ recomposer h-07. Ce run confirme le diagnostic (le python enfant meurt,
 `controler` ne prouve plus le MainPID vivant).
 
 Recomposition sur le `main` de #3336 (incident `ci-flow`, PR #2516) et
-correctif final `a018c5708` (test seul, 1 fichier +5/−8) : `f38773b2e`
-masquait la cause. Le `pyvenv.cfg` du faux venv était écrit avec
-`home = dirname(sys.executable)` (= `.venv-ci/bin` en CI, dossier sans
-stdlib) ; un vrai venv y nomme le préfixe de l'interpréteur de base. Le banc
-écrit `home = sys.base_prefix/bin` et respawne `sys.executable` comme avant
-(l'argv[0] reste dans `venv/bin`, la preuve est inchangée). `test_1252`
-**48/48** verts en local, y compris en lançant le banc sous un interpréteur de
-venv (`sys.executable` dans un venv, `base_prefix = /usr`), condition qui
-reproduisait le rouge CI ; la CI reste la preuve. La tête finale est demandée
-en `ci-full` ; les onze verdicts d'unité restent acquis, seuls les avis delta
-(auditeur + ameesh-cx1) portent sur la recomposition et ce correctif.
+correctif final `a018c5708` (test seul, 1 fichier +5/−8) : `main` a reçu #3336
+en `81be88044` (12:52Z, sa CI annulée par le plafond de 60 min, §3) ; le merge
+`origin/main` dans la branche est propre (`016b37af2`, 3 fichiers de #3336,
++63/−5, aucun conflit). `f38773b2e` masquait la cause du rouge #1252 : le
+`pyvenv.cfg` du faux venv était écrit avec `home = dirname(sys.executable)`
+(= `.venv-ci/bin` en CI, dossier sans stdlib) ; un vrai venv y nomme le
+préfixe de l'interpréteur de base. Le banc écrit `home = sys.base_prefix/bin`
+et respawne `sys.executable` comme avant (l'argv[0] reste dans `venv/bin`, la
+preuve est inchangée). `test_1252` **48/48** verts en local, y compris en
+lançant le banc sous un interpréteur de venv (`sys.executable` dans un venv,
+`base_prefix = /usr`), condition qui reproduisait le rouge CI ; la CI reste la
+preuve. Ciblés de la tête recomposée : `test_1252` (48), `test_899`,
+`test_l161c`, `test_2446`, `test_3098`, `test_856` — voir la section
+« Contrôles ». La tête finale est demandée en `ci-full` ; les onze verdicts
+d'unité restent acquis, seuls les avis delta (auditeur + ameesh-cx1) portent
+sur la recomposition et ce correctif. Le plafond de 60 min d'une part `psql`
+peut frapper cette `ci-full` : résultat non concluant, non bloquant (§3).
 
 ## Écartés (ce véhicule)
 
