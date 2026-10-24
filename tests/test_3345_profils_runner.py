@@ -10,9 +10,12 @@ resté en `train.mode: shadow` et sans clé `github`, alors que `config.json`
 pouvait pas voir la divergence des autres profils.
 
 Témoins :
-* un profil qui ne surcharge que `train.mode` hérite du `host`, des `projects`,
-  de `github` et de `release` de `config.json` (fusion récursive, pas une
-  recopie) ;
+* un profil qui ne surcharge que `train.mode` hérite du `host` et des
+  `projects` de `config.json` : la fusion récursive est réservée à `train` et
+  `release` (#133247) ;
+* tout autre objet déclaré (`github`, `radar`, `packet_watch`, `notify`,
+  `accounts`…) remplace celui de l'hôte en entier — un `notify: {}` vide bien
+  les routes héritées ;
 * `ameesh doctor` audite tous les profils de l'hôte et rend KO sur une
   divergence, en nommant le profil et la feuille ;
 * `ameesh doctor --profiles`, sans base, est le garde des contrôles de
@@ -121,16 +124,26 @@ class ProfilTest(Banc):
         cfg = self.load(self.critiques)
         self.assertEqual(cfg.github, BASE["github"])
 
-    def test_la_superposition_descend_dans_les_objets_imbriques(self):
-        """Un projet surchargé garde les autres, et ses champs non déclarés."""
+    def test_un_objet_hors_train_release_est_remplace_en_entier(self):
+        """Décision #133247 : la récursion est réservée à `train` et
+        `release`. Un `github` déclaré par le profil remplace celui de l'hôte,
+        il n'en hérite aucune sous-clé."""
         self._write(self.critiques, {
             "github": {"projects": {"ameesh": {"exclude_terms": ["wip"]}}},
         })
         cfg = self.load(self.critiques)
-        self.assertEqual(cfg.github["projects"]["ameesh"]["exclude_terms"], ["wip"])
-        self.assertEqual(cfg.github["projects"]["ameesh"]["repo"], "manaty/ameesh")
-        self.assertEqual(cfg.github["projects"]["nexlink"], {"repo": "manaty/nexlink"})
-        self.assertEqual(cfg.github["host"], "pc-smichea")
+        self.assertEqual(cfg.github,
+                         {"projects": {"ameesh": {"exclude_terms": ["wip"]}}})
+        self.assertNotIn("host", cfg.github)
+        self.assertNotIn("nexlink", cfg.github["projects"])
+
+    def test_release_se_superpose_feuille_a_feuille(self):
+        """Avec `train`, `release` reste le seul objet récursif : surcharger
+        son hôte garde ses `projects`."""
+        self._write(self.critiques, {"release": {"host": "autre-hote"}})
+        cfg = self.load(self.critiques)
+        self.assertEqual(cfg.release["host"], "autre-hote")
+        self.assertEqual(cfg.release["projects"], BASE["release"]["projects"])
 
     def test_une_liste_declaree_remplace_la_base_au_lieu_de_s_y_ajouter(self):
         self._write(self.critiques, {"notify": {"types": ["account_shared"]}})
@@ -138,6 +151,15 @@ class ProfilTest(Banc):
         self.assertEqual(cfg.notify, {"types": ["account_shared"]})
         # les autres réglages de l'hôte restent hérités
         self.assertEqual(cfg.harness_bins, {"claude": "/usr/bin/claude"})
+
+    def test_un_notify_vide_remplace_la_base_au_lieu_de_l_heriter(self):
+        """`notify: {}` doit vider les routes héritées, pas les conserver :
+        la récursion générale de la première version de #3345 avait introduit
+        cette régression (cx1)."""
+        self._write(self.critiques, {"notify": {}})
+        cfg = self.load(self.critiques)
+        self.assertEqual(cfg.notify, {})
+        self.assertEqual(cfg.config_shadowed, ("notify",))
 
     def test_les_comptes_restent_une_unite_d_isolation(self):
         """#1466 : un profil qui declare ses comptes les remplace, il n'herite
@@ -155,15 +177,16 @@ class ProfilTest(Banc):
         cfg = self.load(self.critiques)
         self.assertEqual(cfg.config_shadowed, ())
 
-    def test_le_radar_relu_suit_la_meme_superposition(self):
+    def test_un_radar_restreint_ne_relit_pas_les_entrees_de_l_hote(self):
+        """Un profil qui restreint `radar` à un sous-ensemble ne doit pas
+        hériter des entrées de l'hôte (régression relevée par l'auditeur)."""
         base = dict(BASE, radar={"projects": {"ameesh": {"migrations": "migrations"}}})
         self._write(self.host, base)
         self._write(self.critiques, {"radar": {"projects": {"nexlink": {"repo": "/n"}}}})
         cfg = self.load(self.critiques)
         with mock.patch.dict(os.environ, {"HOME": self.home}):
             relu = config.fresh_radar(cfg)
-        self.assertEqual(relu.radar["projects"]["ameesh"]["migrations"], "migrations")
-        self.assertEqual(relu.radar["projects"]["nexlink"]["repo"], "/n")
+        self.assertEqual(relu.radar, {"projects": {"nexlink": {"repo": "/n"}}})
 
     # -- (2) l'audit des clés partagées ----------------------------------
 

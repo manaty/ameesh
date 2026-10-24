@@ -619,29 +619,33 @@ SHARED_CONFIG_KEYS = ("train", "github", "release")
 #: sentinelle d'une clé absente d'un côté d'une comparaison de configuration
 _MISSING = object()
 
-#: clés qui restent des **unités d'isolation** : un profil qui en déclare une
-#: remplace celle de config.json, il n'hérite d'aucune sous-clé (#1466). Un
-#: groupe de runners qui déclare ses propres comptes ne doit pas hériter en
-#: silence des comptes des autres exécuteurs (quota et sessions partagés) :
-#: c'est le seul objet de configuration soustrait à la fusion récursive.
-ATOMIC_CONFIG_KEYS = ("accounts",)
+#: #3345 : les seuls objets dont un profil peut surcharger une feuille sans
+#: recopier le bloc. `train` et `release` portent des sous-réglages que les
+#: profils ajustent légitimement (mode du train, hôte de coupure) ; partout
+#: ailleurs la superposition reste de **premier niveau** (#1466) : une clé
+#: déclarée remplace la valeur de la base en entier, y compris `accounts`
+#: (isolation), `github`, `radar`, `packet_watch`, `notify`… (décision
+#: mesh-design #133247 du 24/10 13:53Z : liste d'autorisation, pas exclusion).
+RECURSIVE_CONFIG_KEYS = ("train", "release")
 
 
 def _merge_config(base: dict, overlay: dict) -> dict:
-    """Superpose `overlay` (un profil) sur `base` (config.json), objet par objet.
+    """Superpose `overlay` (un profil) sur `base` (config.json), clé par clé.
 
-    #3345 : un profil ne porte que ce qu'il surcharge. Les objets JSON se
-    fusionnent récursivement — `{"train": {"mode": "shadow"}}` garde le `host`
-    et les `projects` de `config.json` — tandis qu'une liste ou un scalaire
-    déclaré remplace la valeur de la base. `accounts` fait exception
-    (`ATOMIC_CONFIG_KEYS`) : une isolation voulue se déclare en entier. Avant,
-    la superposition était de premier niveau : un profil qui ne voulait changer
-    que `train.mode` devait recopier tout le bloc `train`, et cette copie
-    divergeait ensuite en silence."""
+    #3345 : un profil ne porte que ce qu'il surcharge. Une clé absente de
+    l'overlay est héritée de la base ; une clé déclarée la remplace en entier,
+    **sauf `train` et `release`** (`RECURSIVE_CONFIG_KEYS`) dont les objets se
+    fusionnent feuille à feuille : `{"train": {"mode": "shadow"}}` garde le
+    `host` et les `projects` de `config.json`, tandis qu'un `radar`,
+    `packet_watch`, `github`, `notify` ou `accounts` déclaré remplace la
+    valeur de la base (un `notify: {}` vide bien les routes héritées). La
+    récursion générale de la première version de #3345 faisait hériter en
+    silence les sous-clés d'objets que le profil voulait restreindre."""
     merged = dict(base)
     for key, value in overlay.items():
         old = merged.get(key, _MISSING)
-        if key not in ATOMIC_CONFIG_KEYS and isinstance(old, dict) and isinstance(value, dict):
+        if (key in RECURSIVE_CONFIG_KEYS
+                and isinstance(old, dict) and isinstance(value, dict)):
             merged[key] = _merge_config(old, value)
         else:
             merged[key] = value
@@ -813,10 +817,9 @@ def load(env: dict | None = None) -> Config:
         raw = _read_json_object(cfg_path)
         # #1466 : un profil (fichier rangé sous le dossier de la configuration
         # de l'hôte) hérite de `config.json` ; ses propres clés l'emportent.
-        # #3345 : la superposition est récursive pour les objets JSON — un
-        # profil ne porte que ce qu'il surcharge (`{"train": {"mode": …}}`
-        # garde le reste du bloc `train`) ; une liste ou un scalaire déclaré
-        # remplace la valeur de la base. Les clés de premier niveau dont la
+        # #3345 : la superposition ne descend que dans `train` et `release`
+        # (RECURSIVE_CONFIG_KEYS) ; toute autre clé déclarée remplace la
+        # valeur de la base en entier. Les clés de premier niveau dont la
         # valeur effective diffère de la base sont retenues : c'est l'écart
         # qu'un profil périmé creuse, et il doit rester lisible.
         base_path = _inherit_base(cfg_path, raw)
@@ -1111,8 +1114,9 @@ def fresh_radar(cfg: Config) -> Config:
     (`config_file` vide), `cfg` tel quel.
 
     Un profil (#1466) hérite de sa base comme dans `load` : un `radar` déclaré
-    seulement dans le `config.json` de l'hôte vaut pour le profil. La
-    superposition est récursive (#3345), comme celle de `load`."""
+    seulement dans le `config.json` de l'hôte vaut pour le profil, et un
+    `radar` déclaré dans le profil le remplace en entier (la récursion de
+    #3345 ne vaut que pour `train` et `release`)."""
     if not cfg.config_file:
         return cfg
     # `_read_json_object` et `_inherit_base` refusent par SystemExit, qui
