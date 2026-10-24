@@ -698,6 +698,17 @@ def _gate_locked(cfg, db, lot: int, mine: dict, *, gh, dry_run: bool, actor: str
                             target=base, project=project, frozen=sha,
                             required=required, slug=slug, gh=gh, report=report)
     if not ok:
+        # #3186 (décision owner #128512) : un check requis jamais conclu est
+        # une preuve absente ; la porte reste fermée et relance son run une
+        # fois, sous le bail du passage et la garde du pilote élu.
+        reruns = fire.relaunch_unconcluded(
+            db, lot, slug, sha, report, gh=gh, dry_run=dry_run, actor=actor,
+            guard=lambda: _renew(handle) and _fenced_hold(
+                db, fence, margin_s=AUTOMERGE_CALL_MARGIN_S))
+        if reruns:
+            from . import radar
+            return dict(out, result="pending", reruns=reruns,
+                        why="%s — %s" % (why, radar.describe_reruns(reruns)))
         return dict(out, result="pending", why=why)
     if dry_run:
         return dict(out, result="would-merge")

@@ -426,17 +426,60 @@ def github_slug(project: "ProjectRelease") -> str:
     return match.group(1)
 
 
+#: #3186 : durée de vie de la lecture des checks requis de la cible (une
+#: coupure lit plusieurs commits ; la protection ne change pas entre eux)
+REQUIRED_TTL_S = 300.0
+_REQUIRED: dict = {}
+
+
+def required_checks(project: "ProjectRelease") -> tuple | None:
+    """#3186 (décision owner #128512) : les checks requis de la cible, lus à
+    la forge (protection et rulesets, `fire.required_checks`) — les agrégats
+    dont la release exige une conclusion. Une cible sans protection n'en a
+    aucun. Relus au plus toutes les `REQUIRED_TTL_S`.
+
+    Une lecture impossible est passagère, comme celle de la CI ; un refus de
+    droits prouvé (403, #2344) rend None : un identifiant sans droits est un
+    non concluant (§3), il ne retient pas la release, qui lit alors la tête
+    sans requis connus et le dit dans son rapport."""
+    from . import fire, land, packet_automerge
+    slug = github_slug(project)
+    key = (slug, project.target)
+    now = time.monotonic()
+    cached = _REQUIRED.get(key)
+    if cached is not None and now - cached[0] < REQUIRED_TTL_S:
+        return cached[1]
+    try:
+        pairs = tuple(fire.required_checks(slug, project.target, None,
+                                           gh=packet_automerge.gh_of(plan_github.Gh())))
+    except land.ForbiddenLandError:
+        pairs = None
+    except (land.LandError, plan_github.GithubError) as exc:
+        raise TransientReleaseError("required checks of %s unreadable: %s"
+                                    % (project.target, exc)) from exc
+    _REQUIRED[key] = (now, pairs)
+    return pairs
+
+
 def ci_reading(project: "ProjectRelease", sha: str) -> dict:
     """Exact CI, with ameesh's required aggregate (#3244, decision #128512).
 
     A workflow's conclusion includes optional jobs. For ameesh, `tests`
     must itself complete successfully; other jobs block only on FAILURE.
     Other workflows and external checks retain their existing policy.
+
+    #3186 : les checks requis de la cible y sont lus par leur nom, pour tous
+    les projets : un agrégat requis jamais conclu est une preuve absente
+    (`unconcluded`, relancé une fois par `rerun_head`) et un workflow
+    facultatif annulé reste non concluant ; a failed read is transient.
     """
     target = radar.Project(name=project.name, repo=project.repo, target=project.target,
                            github=project.github)
+    required = required_checks(project)
     try:
-        reading = radar.commit_ci(target, sha)
+        reading = radar.commit_ci(target, sha, required=required or ())
+        if required is None:
+            reading["required_unread"] = True
         if project.name != "ameesh":
             return reading
         suite = suite_reading(project, sha)
@@ -449,6 +492,11 @@ def ci_reading(project: "ProjectRelease", sha: str) -> dict:
         negative = [name for name in reading.get("negative", ()) if name not in managed]
         pending = [name for name in reading.get("pending", ()) if name not in managed]
         inconclusive = [name for name in reading.get("inconclusive", ()) if name not in managed]
+        # B3 d'impl-04 (#3186) : le filtre vise les rollups reclassés job par
+        # job, pas un check requis rouge — celui d'une autre suite que la
+        # tentative lue ci-dessous resterait sinon masqué.
+        negative += [name for name in reading.get("required_negative", ())
+                     if name not in negative]
         for attempt in _suite_runs(suite, run):
             for job in attempt["jobs"]:
                 label = "%s (%s; %s)" % (
@@ -462,8 +510,10 @@ def ci_reading(project: "ProjectRelease", sha: str) -> dict:
             # diagnostic lists, and never let an older green redeem it.
             pending.append("suite complète : agrégat tests non validé%s" % (
                 " (%s)" % run["url"] if run else " (tentative absente)"))
+        # #3186 : un requis jamais conclu (`unconcluded`) reste une preuve
+        # absente, même hors des workflows reclassés ici.
         acceptable = bool(aggregate_ok and not negative and not pending
-                          and not reading.get("missing"))
+                          and not reading.get("missing") and not reading.get("unconcluded"))
         return dict(reading, green=acceptable, acceptable=acceptable,
                     negative=negative, pending=pending, inconclusive=inconclusive)
     except plan_github.GithubError as exc:
@@ -515,7 +565,12 @@ def reading_is_green(reading: dict) -> bool:
     s'ouvre) et ne retient pas la release. Un check encore en cours, un rouge
     prouvé, un préfixe requis absent ou une tête sans aucun check ne sont
     jamais verts (`acceptable` est alors faux). Une lecture sans clé
-    `acceptable` garde l'ancien sens strict."""
+    `acceptable` garde l'ancien sens strict.
+
+    #3186 (décision owner #128512) : un run terminé sans avoir conclu
+    lui-même (`unconcluded` : annulé, expiré, démarrage raté) est une preuve
+    absente, pas un non concluant — `acceptable` est faux et la tête ne
+    l'est pas ; `rerun_head` relance ce run une fois."""
     if reading.get("green"):
         return True
     if "acceptable" in reading:
@@ -1412,6 +1467,44 @@ def _open_correction(db, project: "ProjectRelease", plan: "Plan"):
     return out
 
 
+def _unconcluded_deviation(plan: "Plan", reruns) -> list:
+    """#3186 : les lignes d'écart d'une tête dont un agrégat requis n'a jamais
+    conclu, ou dont les checks requis n'ont pas pu être lus (403)."""
+    out = []
+    if plan.ci.get("required_unread"):
+        out.append("checks requis de %s illisibles (droits refusés) : agrégat requis "
+                   "jamais conclu non détecté sur la tête %s (décision owner #128512)"
+                   % (plan.project.target, plan.head[:12]))
+    rows = plan.ci.get("unconcluded") or ()
+    if rows:
+        out.append("tête %s: agrégat(s) requis jamais conclu(s) (%s) — preuve absente, "
+                   "tête non verte (décision owner #128512) ; %s"
+                   % (plan.head[:12], ", ".join(row.get("check") or "?" for row in rows),
+                      radar.describe_reruns(reruns) or "aucune relance"))
+    return out
+
+
+def rerun_head(project: "ProjectRelease", plan: "Plan") -> list:
+    """#3186 (décision owner #128512 du 23/10) : les runs de la tête terminés
+    sans avoir conclu (`plan.ci["unconcluded"]`) sont relancés une fois
+    (`radar.rerun_unconcluded`) ; la release de cette coupure prend le dernier
+    vert, la coupure suivante trouve la preuve. Une relance impossible est
+    rapportée, elle ne retient ni ne défait la release."""
+    rows = plan.ci.get("unconcluded") or ()
+    if not rows:
+        return []
+    try:
+        slug = github_slug(project)
+        return radar.rerun_unconcluded(
+            slug, plan.head, [(row.get("check") or "?", radar.actions_run_id(slug, row))
+                              for row in rows],
+            gh=plan_github.Gh())
+    except (ReleaseError, plan_github.GithubError, OSError) as exc:
+        return [{"check": row.get("check") or "?", "run": row.get("databaseId"),
+                 "result": "error", "detail": "rerun unavailable: %s" % exc}
+                for row in rows]
+
+
 def _worktree(repo: str, sha: str) -> tuple[str, str]:
     folder = tempfile.mkdtemp(prefix="ameesh-release-", dir=os.path.dirname(repo) or None)
     path = os.path.join(folder, "worktree")
@@ -2056,6 +2149,9 @@ def _execute_locked(cfg, db, project: ProjectRelease, *, now: float, force: bool
                       previous, None, staging, no_staging)
 
     plan = build_plan(cfg, project, now=now, version=version)
+    # #3186 : un run de la tête jamais conclu n'est pas une preuve ; il est
+    # relancé une fois, la release suit le dernier vert.
+    reruns = rerun_head(project, plan)
     if plan.kept_active:
         return _kept_active(cfg, db, project, state, state_slot, at, label,
                             plan.base, plan.kept_active, plan.canon_commit)
@@ -2068,8 +2164,11 @@ def _execute_locked(cfg, db, project: ProjectRelease, *, now: float, force: bool
                   "project": project.name, "version": plan.version,
                   "target_head": plan.head, "cutoff_at": at, "label": label,
                   "ci": plan.ci, "started_at": started,
-                  "deviations": ["no green first-parent commit: nothing to tag"],
+                  "deviations": ["no green first-parent commit: nothing to tag"]
+                  + _unconcluded_deviation(plan, reruns),
                   "canon_commit": plan.canon_commit}
+        if reruns:
+            report["reruns"] = reruns
         report["completed_at"] = time.time()
         report["duration_s"] = round(report["completed_at"] - started, 1)
         report["report_path"] = write_report(cfg, project, report)
@@ -2094,8 +2193,11 @@ def _execute_locked(cfg, db, project: ProjectRelease, *, now: float, force: bool
                   "base": plan.base, "cutoff_at": at, "label": label, "ci": plan.ci,
                   "started_at": started,
                   "deviations": ["nothing new since %s: no tag, no staging"
-                                 % plan.previous["tag"]],
+                                 % plan.previous["tag"]]
+                  + _unconcluded_deviation(plan, reruns),
                   "canon_commit": plan.canon_commit}
+        if reruns:
+            report["reruns"] = reruns
         report["completed_at"] = time.time()
         report["duration_s"] = round(report["completed_at"] - started, 1)
         report["report_path"] = write_report(cfg, project, report)
@@ -2109,7 +2211,7 @@ def _execute_locked(cfg, db, project: ProjectRelease, *, now: float, force: bool
                         report)
         return report
 
-    deviations = []
+    deviations = _unconcluded_deviation(plan, reruns)
     if plan.ci.get("inconclusive"):
         deviations.append(
             "tête %s: checks non concluants non bloquants (%s) — consignés, lot de "
@@ -2191,6 +2293,8 @@ def _execute_locked(cfg, db, project: ProjectRelease, *, now: float, force: bool
               "notes": plan.notes, "staging": staging, "started_at": started,
               "tree_green": plan.tree_green,
               "deviations": deviations}
+    if reruns:
+        report["reruns"] = reruns
     return finish(cfg, db, project, report, state, state_slot, at, label, rules,
                   plan.previous, plan, staging, no_staging)
 
