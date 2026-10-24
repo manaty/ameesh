@@ -72,7 +72,9 @@ ni ne lève rien et le dit, en nommant l’agent, le motif exact et la commande
 conditionnelle de levée manuelle. Une intention de pose incertaine garde son
 motif : une pose de rattrapage le réutilise et un `changed=false` est relu par
 l’état réel (motif identique = la nôtre) au lieu d’être classé étranger
-(#3120/B2). Pose et levée sont des gestes d’opérateur :
+(#3120/B2). Sa barrière reste tenue jusqu’à l’échéance même si une pose de
+rattrapage est confirmée, pour exclure tout écrivain tardif (#3120/B3). Pose
+et levée sont des gestes d’opérateur :
 le CLI local refuse une session liée à un agent (`bad_actor`), donc `vm.sh`
 doit être lancé hors session d’agent ; l’acteur d’audit consigné est
 l’opérateur du poste (`--human`), jamais le compte `ameesh` de la VM

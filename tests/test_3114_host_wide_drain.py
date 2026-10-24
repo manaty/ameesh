@@ -133,6 +133,28 @@ class HostWideDrainTest(unittest.TestCase):
         self.assertFalse((self.state / 'pause-dev2').exists())
         self.assert_no_pause()
 
+    def test_uncertain_prepose_barrier_survives_a_later_success(self):
+        # #3120/B3 : la seconde pose aboutit avant la première requête
+        # incertaine ; sa barrière doit rester tenue jusqu'à l'échéance, sinon
+        # la requête tardive repose le motif après la levée.
+        self.configure_turns()
+        self.agents[1]['status'] = 'idle'
+        (self.state / 'pose-incertaine-agent').write_text('dev2')
+        clock = self.state / 'horloge'
+        clock.write_text('100')
+        self.env.update(HORLOGE_FICHIER=str(clock), DRAIN_ECHEANCE='15',
+                        DRAIN_BORNE_INSTRUCTION='1', DRAIN_DERIVE='1')
+        p = self.run_vm(scenario='pose-incertaine-inverse')
+        self.assertEqual(p.returncode, 0, p.stdout + p.stderr)
+        poses = [l for l in self.operateur().splitlines() if l.startswith('pause dev2 ')]
+        reprises = [l for l in self.operateur().splitlines() if l.startswith('resume dev2 ')]
+        self.assertEqual(len(poses), 2, p.stdout + p.stderr)
+        self.assertEqual(len(reprises), 1, p.stdout + p.stderr)
+        self.assertFalse((self.state / 'pose-incertaine-late-fait').exists(),
+                         p.stdout + p.stderr)
+        self.assertFalse((self.state / 'pause-dev2').exists())
+        self.assert_no_pause()
+
     def test_second_stop_failure_cleans_every_pause(self):
         self.configure_turns(fail_second=True)
         p = self.run_vm()

@@ -135,7 +135,7 @@ elif sys.argv[1] == 'show':
     if scenario == 'always-busy': row['status'] = 'running'
     # #3120/B2 : une première pose incertaine (rc124) peut encore aboutir ;
     # l'agent est alors vu en tour et sans pause à la relecture.
-    if scenario == 'pose-incertaine':
+    if scenario in ('pose-incertaine', 'pose-incertaine-inverse'):
         agent_marque = state / 'pose-incertaine-agent'
         if agent_marque.exists() and name == agent_marque.read_text().strip() \
                 and (state / 'pose-incertaine-attente').exists() and not pause.exists():
@@ -162,6 +162,22 @@ elif sys.argv[1] == 'show':
     if scenario == 'busy-once' and name == 'dev9' and not (state / 'busy-seen').exists():
         (state / 'busy-seen').touch(); row['status'] = 'running'
     print(json.dumps(row))
+    # #3120/B3 : si la barrière d'une requête incertaine n'est pas tenue, elle
+    # aboutit après la lecture de reprise et repose le motif, sans reprise.
+    if scenario == 'pose-incertaine-inverse':
+        agent_marque = state / 'pose-incertaine-agent'
+        if agent_marque.exists() and name == agent_marque.read_text().strip() \
+                and (state / ('pose-incertaine-resume-fait-' + name)).exists() \
+                and not (state / 'pose-incertaine-late-fait').exists():
+            hf = os.environ.get('HORLOGE_FICHIER')
+            maintenant = float(Path(hf).read_text()) if hf and Path(hf).exists() else time.time()
+            premiere = float((state / 'echeance-incertaine').read_text())
+            if maintenant < premiere:
+                motif.write_text((state / 'motif-incertain').read_text())
+                pause.write_text('')
+                with (state / 'sequence.log').open('a') as f:
+                    f.write('pause %s\n' % name)
+                (state / 'pose-incertaine-late-fait').touch()
     # #2184/R3 : un créateur tardif indépendant (systemd-run retardé) rejoue
     # la pose APRÈS la relecture. La base doit la refuser au-delà de
     # --not-after ; sinon la pause resterait orpheline.
@@ -196,7 +212,7 @@ elif sys.argv[1] in ('pause', 'resume'):
         maintenant = float(Path(hf).read_text()) if hf and Path(hf).exists() else time.time()
         # #3120/B2 : la première pose a expiré (rc124) sans muter ; elle peut
         # encore aboutir. Le rattrapage doit retrouver ce motif et le lever.
-        if scenario == 'pose-incertaine':
+        if scenario in ('pose-incertaine', 'pose-incertaine-inverse'):
             agent_marque = state / 'pose-incertaine-agent'
             if agent_marque.exists() and name == agent_marque.read_text().strip():
                 attente = state / 'pose-incertaine-attente'
@@ -206,7 +222,7 @@ elif sys.argv[1] in ('pause', 'resume'):
                     (state / 'echeance-incertaine').write_text(str(echeance))
                     attente.touch()
                     sys.exit(124)
-                if not pause.exists():
+                if scenario == 'pose-incertaine' and not pause.exists():
                     premiere = float((state / 'echeance-incertaine').read_text())
                     if maintenant < premiere:
                         motif.write_text((state / 'motif-incertain').read_text())
@@ -280,6 +296,8 @@ elif sys.argv[1] in ('pause', 'resume'):
         raison = motif.read_text() if motif.exists() else ''
         if pause.exists() and (attendu is None or raison == attendu):
             pause.unlink(); motif.unlink(missing_ok=True)
+            if scenario == 'pose-incertaine-inverse':
+                (state / ('pose-incertaine-resume-fait-' + name)).touch()
             print(json.dumps({'agent': name, 'mode': 'execute', 'operator_paused': False,
                               'changed': True, 'event_id': 2}))
         else:

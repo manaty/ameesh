@@ -699,12 +699,25 @@ poser_drain() {  # $1 persona : pause immédiate (en tour ou au repos)
   if [ "$rc" = 0 ]; then
     if change=$(json_champ changed <<<"$sortie") && [ -n "$change" ]; then
       if [ "$change" = 1 ]; then
-        drain_marque_certaine "$1"
+        if [ "$reuse" = 1 ]; then
+          # #3120/B3 : une requête incertaine antérieure peut encore aboutir
+          # après cette pose ; sa barrière reste suivie jusqu'à son échéance,
+          # même si cette pose-ci est confirmée.
+          echo "$1 : nouvelle pose confirmée — barrière de l'ancienne intention conservée jusqu'à son échéance" >&2
+        else
+          drain_marque_certaine "$1"
+        fi
         echo "$1 : drain posé — le tour en cours se termine, aucun tour interrompu ; redémarrage dès qu'il est hors tour"
         return 0
       fi
       refusal=$(json_champ refusal <<<"$sortie")
       if [ "$refusal" = not_after ]; then
+        if [ "$reuse" = 1 ]; then
+          # #3120/B3 : ne pas retirer l'intention antérieure sur ce refus ;
+          # le trap attend son échéance et tranche par l'état réel.
+          echo "$1 : pose refusée par l'échéance — intention incertaine antérieure conservée" >&2
+          return 1
+        fi
         # #2184/R3 : la base a refusé la pose tardive ; aucune pause n'existe,
         # aucune attente n'est utile.
         drain_retire "$1"
@@ -749,9 +762,14 @@ poser_drain() {  # $1 persona : pause immédiate (en tour ou au repos)
   fi
   IFS='|' read -r pose raison <<<"$etat"
   if [ "$pose" = 1 ] && [ "$raison" = "$motif" ]; then
-    # La pause est là : la pose a commité, aucun écrivain tardif du même
-    # drain n'est possible (unité unique déjà exécutée) — pas d'attente.
-    drain_marque_certaine "$1"
+    # La pause est là. Si une intention antérieure est encore incertaine, sa
+    # barrière doit survivre à cette confirmation (#3120/B3) : un écrivain
+    # tardif pourrait reposer le motif après la levée.
+    if [ "$reuse" = 1 ]; then
+      echo "$1 : drain confirmé — barrière de l'ancienne intention conservée jusqu'à son échéance" >&2
+    else
+      drain_marque_certaine "$1"
+    fi
     echo "$1 : drain posé (confirmé par l'état réel) — le tour en cours se termine, aucun tour interrompu"
     return 0
   fi
@@ -760,7 +778,14 @@ poser_drain() {  # $1 persona : pause immédiate (en tour ou au repos)
   # tente la levée conditionnelle (motif identique) au lieu de l'orpheliner.
   case $rc in
     124|137|255) ;;
-    *) drain_retire "$1" ;;
+    *)
+      if [ "$reuse" = 1 ]; then
+        # #3120/B3 : un refus de cette pose ne prouve pas que la requête
+        # antérieure a échoué ; garder sa barrière suivie.
+        echo "$1 : pose refusée — intention incertaine antérieure conservée" >&2
+      else
+        drain_retire "$1"
+      fi ;;
   esac
   if [ "$pose" = 1 ]; then
     echo "$1 : la pause en place n'est pas celle de ce drain — aucun redémarrage, aucune levée" >&2
