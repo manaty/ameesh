@@ -2244,6 +2244,11 @@ def commit_ci(project: Project, sha: str, gh=None, *, branch: str | None = None,
         if any(conclusion_result(c.get("status"), c.get("conclusion")) == CI_NEGATIVE_RESULT
                for c in rows):
             negative = sorted(set(negative) | {name})
+            # B1 cx2 (#3186) : le requis rouge d'une suite homonyme est un
+            # échec, même quand chaque workflow se dit vert ; `failed` le
+            # nomme, et `green` tombe avec lui.
+            if name not in failed:
+                failed.append(name)
         elif any(c.get("status") == "completed" and never_concluded(c.get("conclusion"))
                  for c in rows):
             unconcluded.extend(

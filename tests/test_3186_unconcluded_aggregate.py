@@ -551,6 +551,21 @@ class CommitCiTest(unittest.TestCase):
         self.assertFalse(out["acceptable"])
         self.assertEqual(out["unconcluded"], [])
 
+    def test_a_required_check_red_in_one_suite_is_failed_even_if_every_run_is_green(self):
+        # B1 cx2 : les runs se disent verts, mais le requis `tests` est rouge
+        # dans l'une des deux suites ; l'ordre de lecture n'y change rien.
+        for checks in ([_actions_check("tests", "success", run=410, check_id=7),
+                        _actions_check("tests", "failure", run=411, check_id=8)],
+                       [_actions_check("tests", "failure", run=411, check_id=8),
+                        _actions_check("tests", "success", run=410, check_id=7)]):
+            with self.subTest(first=checks[0]["conclusion"]):
+                out = self.read([l160g._run("A"), l160g._run("B")], checks,
+                                required=(("tests", 15368),))
+                self.assertIn("tests", out["failed"])
+                self.assertEqual(out["negative"], ["tests"])
+                self.assertFalse(out["green"])
+                self.assertFalse(release_cutoff.reading_is_green(out))
+
     def test_a_green_workflow_does_not_hide_another_workflow_that_never_concluded(self):
         # R3 cx2 : deux workflows portent un check `tests` (suites distinctes) ;
         # le vert de l'un ne rachète pas l'agrégat annulé de l'autre, quel que
