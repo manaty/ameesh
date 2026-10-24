@@ -240,6 +240,7 @@ TYPE_LABELS = {
     "tmp_unremovable": "temporary directory over quota with files it cannot remove",
     "tmp_unscanned": "temporary directory too large to scan; nothing evicted",
     "dsh_scope": "dsh tool scope left by a closed turn",
+    "tmp_over_quota": "temporary directory over quota, not managed by this mesh",
     "plan_underused": "underused plan",
     "idle_capacity": "idle capacity",
     "orchestrator_held": "orchestrator held by a session",
