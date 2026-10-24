@@ -24,7 +24,7 @@ import pathlib
 import subprocess
 import unittest
 
-from tests.test_940_agregat_bash import run_script, scenario
+from tests.test_940_agregat_bash import agregat
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
 WORKFLOW = REPO / ".github" / "workflows" / "tests.yml"
@@ -52,13 +52,17 @@ def workflow() -> str:
     return WORKFLOW.read_text(encoding="utf-8")
 
 
-def aggregate_name(event: str) -> str:
+def aggregate_name(event: str, label: str = "") -> str:
     name = workflow().split("\n  tests:\n", 1)[1].split("    name: ", 1)[1].splitlines()[0]
     if not name.startswith("${{"):
         return name
     expression = name[3:-2].strip().replace("github.event_name", "event_name")
+    # #3198 : l'agrégat se renomme sur l'étiquette ci-macos ; ce témoin
+    # n'évaluait que l'évènement et ne connaissait pas encore ce contexte.
+    expression = expression.replace("github.event.label.name", "label_name")
     expression = expression.replace("&&", "and").replace("||", "or")
-    return eval(expression, {"__builtins__": {}}, {"event_name": event})
+    return eval(expression, {"__builtins__": {}},
+                {"event_name": event, "label_name": label})
 
 
 def step(name: str) -> str:
@@ -126,8 +130,11 @@ class WorkflowStepsTest(unittest.TestCase):
         self.assertFalse((REPO / "pwned").exists())
 
     def test_a_failed_plan_reddens_the_aggregate(self):
-        self.assertIn('test "${{ needs.plan.result }}" = success',
-                      workflow()[workflow().index("\n  tests:\n"):])
+        # #3251 : la garde vit dans scripts/ci-agregat.py, qui reçoit le
+        # résultat du plan ; un plan refusé reste un négatif de l'agrégat
+        # (tests/test_3251_agregat_annulation.py).
+        tests_job = workflow()[workflow().index("\n  tests:\n"):]
+        self.assertIn('--plan "${{ needs.plan.result }}"', tests_job)
 
 
 class GuardTest(unittest.TestCase):
@@ -195,9 +202,15 @@ class RequiredCheckTest(unittest.TestCase):
     même run (plan réussi, parts vertes) le rendait vert."""
 
     def aggregate(self, plan_result: str) -> int:
-        return run_script(scenario(**{"needs.plan.result": plan_result,
-                                      "github.event_name": "workflow_dispatch",
-                                      "needs.version.result": "skipped"})).returncode
+        # #3251 : la classification de l'agrégat vit dans scripts/ci-agregat.py
+        # (l'ancien script bash ne fait plus foi) ; même entrée qu'un
+        # workflow_dispatch, sans publication de check.
+        return agregat.main([
+            "--event", "workflow_dispatch", "--plan", plan_result,
+            "--version", "skipped", "--version-only", "false",
+            "--docs-only", "false", "--doc-readers", "skipped",
+            "--psycopg", "success", "--psycopg-parts", "[1]",
+            "--psql", "skipped", "--psql-parts", "[]"])
 
     def test_without_guard_the_dispatch_was_green(self):
         self.assertEqual(self.aggregate("success"), 0)
@@ -213,6 +226,14 @@ class RequiredCheckTest(unittest.TestCase):
         for event in ("pull_request", "push"):
             with self.subTest(event=event):
                 self.assertEqual(aggregate_name(event), "tests")
+
+    def test_the_ci_macos_label_does_not_publish_the_required_context(self):
+        # #3198 : l'étiquette ci-macos renomme l'agrégat ; toute autre
+        # étiquette de gel garde le contexte requis `tests`.
+        self.assertEqual(aggregate_name("pull_request", "ci-macos"),
+                         "tests (ci-macos, hors gel)")
+        self.assertEqual(aggregate_name("pull_request", "ci-lot-" + "a" * 40),
+                         "tests")
 
     def test_lot_branch_dispatch_is_red(self):
         ref_ok = run_ref_step("refs/heads/lot/1211-ci-impactes-contrat").returncode == 0

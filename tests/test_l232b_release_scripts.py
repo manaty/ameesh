@@ -16,6 +16,9 @@ import unittest
 
 from tests import support  # noqa: F401 — environnement isolé du poste
 
+# #3129 : le vrai cat, résolu avant les faux bancs (/usr/bin/cat sous Linux, /bin/cat sous macOS).
+REAL_CAT = shutil.which("cat") or "/bin/cat"
+
 
 ROOT = Path(__file__).resolve().parents[1]
 # poste.sh « sauvegarder » exécute sauvegarder-prive.py, qui parle psycopg : la
@@ -59,7 +62,7 @@ class MigrationPinningTest(unittest.TestCase):
         bin_dir.mkdir()
         (bin_dir / "python3").symlink_to(sys.executable)
         (bin_dir / "cat").write_text(
-            '#!/bin/sh\ncase "$1" in /proc/*/cgroup) printf "%s\\n" "${FAKE_CGROUP_TEXT:-0::/user.slice/session.scope}" ;; *) exec /usr/bin/cat "$@" ;; esac\n')
+            '#!/bin/sh\ncase "$1" in /proc/*/cgroup) printf "%s\\n" "${FAKE_CGROUP_TEXT:-0::/user.slice/session.scope}" ;; *) exec ' + REAL_CAT + ' "$@" ;; esac\n')
         (bin_dir / "cat").chmod(0o755)
         (bin_dir / "pg_dump").write_text(
             '#!/bin/sh\nprintf "%s\\n" "$*" >> "${PG_DUMP_CALLS:?}"\n'

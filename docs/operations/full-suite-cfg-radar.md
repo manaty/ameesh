@@ -82,6 +82,9 @@ Pourquoi ces jobs (relevé sur l'exécution `workflow_dispatch` 38355907994) :
   requis** et doivent être verts ou sautés : une part annulée au plafond les
   laisse non terminés, donc la porte refuse (c'est le refus du faux vert #940).
 * `plateforme macOS` requis : la couche plateforme (L63) ne tourne que là.
+  Depuis #3198 c'est le job **court** de `tests.yml` (20 min, sans base) ; la
+  suite complète macOS vit dans `macos.yml`, nocturne sur `main` et sur
+  `ci-macos`, hors de ce relevé.
 * `tests` requis : l'agrégat, vert seulement si les parts le sont.
 * `bilan des impactés` **toléré** : `continue-on-error: true`, jamais requis.
 * `version number` et `lecteurs de la doc` : sautés sur un dispatch (PR de

@@ -23,6 +23,7 @@
   agent-mesh work merged <id> --sha S | --pr owner/repo#N [--note …]   merge done outside a PR: any open state → merged
   agent-mesh work migration <id> [--number N] [--release [--number N]] [--skip-branch B]   reserve one of the work item's migration numbers (L122, #2481)
   agent-mesh work issue-ref <id> owner/repo#N | --none   correct the issue reference, journaled (#1603)
+  agent-mesh work set-type <id> bug|evolution   retype a lot, journaled (#2954)
   agent-mesh work resolve <id> --with <other> [--done | --abort]   prepared conflict resolution (L160d)
   agent-mesh work queue add|remove <id> | show [--target T]   merge queue per target (L160e)
   agent-mesh work land <id> [--project P]   land the queue head now (L160e2)
@@ -467,10 +468,8 @@ def _host_parts(cfg: Config, db, canons, only: str | None, history: int) -> list
         parts.append({
             "name": name, "fiches": fiches, "physical": physical, "latest": latest,
             "host": fiches[0][1] if fiches else None,
-            "admissions": {
-                canon.id: sum(1 for p in canon.placements if p.agent and name in
-                              placement_mod.admitted_hosts(canon, p))
-                for canon, _fiche in fiches},
+            "admissions": {canon.id: _host_admissions(canon, name)
+                           for canon, _fiche in fiches},
             "verdict": (res.pressure(latest, limits=physical["limits"])
                         if latest is not None else None),
             "history": res.history(db, name, history),
@@ -1022,6 +1021,14 @@ def cmd_menage(cfg: Config, args: argparse.Namespace) -> int:
     return cmd_housekeeping(cfg, args)
 
 
+def _host_admissions(canon, name: str) -> int:
+    """Admissions de `name` dans un canon : les épinglées, plus les rôles élus
+    qui y tiennent leur siège (#3101 : un rôle élu ne compte qu'une fois)."""
+    from . import placement as placement_mod
+    pinned, seats = placement_mod.host_load(canon)
+    return pinned.get(name, 0) + sum(1 for seat in seats.values() if seat == name)
+
+
 def _print_host_fiches(fiches: list, physical: dict, admissions: dict, *, many: bool) -> None:
     """`ameesh hosts` (L43, 0031) : les fiches Host de l'hôte par canon, et le
     `max_agents` physique (le plus strict) avec sa provenance."""
@@ -1488,7 +1495,7 @@ def _print_assignment(check: dict | None) -> None:
 
 #: sous-commandes `work` dont `--actor` a son propre sens (le délégant de
 #: `delegate`) ou son propre défaut non vide (relevés, échéances)
-_OWN_ACTOR = ("delegate", "expire-delegations", "sync-branches")
+_OWN_ACTOR = ("delegate", "expire-delegations", "sync-branches", "device-gates")
 
 
 def _work_actor(cfg: Config, db, args: argparse.Namespace) -> None:
@@ -1516,7 +1523,7 @@ def _work_actor(cfg: Config, db, args: argparse.Namespace) -> None:
                   "\"%s\"; pass --actor human:<id>" % work.UNKNOWN_ACTOR,
                   file=sys.stderr)
         return
-    if args.work_command in (*_OWN_ACTOR, "set-app", "issue-ref", "backfill-app") or getattr(args, "actor", None) is None:
+    if args.work_command in (*_OWN_ACTOR, "set-app", "set-type", "issue-ref", "backfill-app") or getattr(args, "actor", None) is None:
         return
     args.actor, warning = work.resolve_actor(cfg, db, args.actor)
     if warning:
@@ -1611,6 +1618,12 @@ def work_detail(cfg: Config, db, lot_id: int, repo: str | None = None,
             except Exception:  # noqa: BLE001 - l'affichage ne casse pas le lot
                 full = []
             item["reviewed"] = intake_neighbors.reviewed_head_of(full)
+        # #3183 : le plancher d'avis du pilote et sa source.
+        from . import review_floor
+        try:
+            item["reviews_floor"] = review_floor.of_lot(db, lot_id, cfg=cfg)
+        except Exception as exc:  # noqa: BLE001 - l'affichage ne casse pas le lot
+            item["reviews_floor"] = {"floor": None, "error": str(exc)[:200]}
         from . import plan_git
         item["freeze"] = plan_git.freeze_candidate(
             item["milestones"], repo=repo,
@@ -1668,6 +1681,11 @@ def work_detail(cfg: Config, db, lot_id: int, repo: str | None = None,
         # L317c: the auditor's automatic deep analysis and its measured delay
         from . import deep_analysis
         item["deep_analysis"] = deep_analysis.status(db, lot_id, cfg=cfg)
+        # #3070 (canon §12): a blocked lot waiting for a device session
+        from . import device_gates
+        item["device_gate"] = device_gates.of_item(
+            db, item, canons=work.configured_canons(cfg)) \
+            if item.get("state") == "blocked" else None
         return item
 
     # L61/L521: the detail's independent reads travel together (one query per
@@ -1903,6 +1921,29 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
             if out.get("warning"):
                 print("warning: %s" % out["warning"], file=sys.stderr)
             return 0
+        if args.work_command == "device-gates":
+            # #3070 (canon §12) : séances sur un appareil indisponible
+            from . import device_gates
+            canons = work.configured_canons(cfg)
+            if args.apply:
+                rows = device_gates.lift(db, canons=canons,
+                                         actor=args.actor or device_gates.ACTOR)
+            else:
+                rows = device_gates.candidates(db, canons=canons)
+            if args.json:
+                print(json.dumps(rows, ensure_ascii=False, indent=2, default=str))
+                return 0
+            if not rows:
+                print("no lot lifted" if args.apply
+                      else "no blocked lot declares a device session")
+                return 0
+            for row in rows:
+                if args.apply:
+                    print("lot #%d → %s (%s, verification lot #%d)" % (
+                        row["lot"], row["state"], device_gates.TRACE, row["verify"]))
+                else:
+                    print("lot #%d: %s" % (row["lot"], device_gates.label(row)))
+            return 0
         if args.work_command == "expire-delegations":
             rows = work.expire_delegations(db, actor=args.actor or work.SYSTEM_SENDER,
                                            dry_run=args.dry_run)
@@ -1985,6 +2026,14 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                 if designated(item):
                     print("reviewer : %s (designated for the review, #2076)" %
                           ", ".join(designated(item)))
+            floor = item.get("reviews_floor") or {}
+            if floor.get("floor"):
+                print("floor    : %d review(s) of distinct families (by %s, %s; #3183)" % (
+                    floor["floor"], floor.get("actor") or "?",
+                    _fmt_moment(floor.get("at_ts"))))
+            elif floor.get("error"):
+                print("floor    : unreadable (%s): the gate requires two reviews"
+                      % floor["error"])
             if item.get("priority"):
                 print("priority : %s (%s)" % (
                     item["priority"], work.PRIORITY_LABELS.get(item["priority"], "?")))
@@ -2071,6 +2120,9 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                     " (%s)" % q["reason"] if q.get("reason") else ""))
             if item.get("waiting_for"):
                 print("waiting  : %s" % item["waiting_for"]["label"])
+            if item.get("device_gate"):
+                from . import device_gates
+                print("device   : %s" % device_gates.label(item["device_gate"]))
             if item.get("delegation"):
                 delegation = item["delegation"]
                 print("delegated: %s (on %s%s)" % (
@@ -2143,7 +2195,17 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                         or "<migrations>/%s_<name>.sql" % row["label"]))
             return 0
         if args.work_command == "move":
-            item = work.move(db, args.id, args.state, note=args.note or "", actor=args.actor,
+            note = args.note or ""
+            if args.device:
+                # #3070 : la séance attendue sur un appareil, déclarée en note
+                from . import device_gates
+                if args.state != "blocked":
+                    print("ameesh work move: --device declares the device session a "
+                          "blocked lot waits for: ameesh work move %s blocked --device "
+                          "<device>" % args.id, file=sys.stderr)
+                    return 2
+                note = device_gates.session_note(args.device, note)
+            item = work.move(db, args.id, args.state, note=note, actor=args.actor,
                              correct=args.correct, reviewer=args.reviewer)
             print("lot #%d → %s (loops %s)%s%s" % (
                 item["id"], item["state"], item["loops"],
@@ -2169,8 +2231,26 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                 print("ameesh work reviewer: AGENT, --remove and --no-verdict are "
                       "mutually exclusive", file=sys.stderr)
                 return 2
+            if args.floor is not None and (args.remove or args.no_verdict):
+                print("ameesh work reviewer: --floor goes alone or with AGENT, not with "
+                      "--remove or --no-verdict", file=sys.stderr)
+                return 2
+            if args.floor is not None:
+                # #3183 : le plancher d'avis du pilote, posé avant la désignation
+                # (il vaut dans tout état ouvert, la désignation exige qa).
+                from . import review_floor
+                floor = review_floor.set_floor(cfg, db, args.id, args.floor,
+                                               reason=args.reason, actor=args.actor)
+                if floor["changed"]:
+                    print("lot #%d: review floor %d (was %d, by %s)" % (
+                        floor["lot"], floor["floor"], floor["previous"], floor["actor"]))
+                else:
+                    print("lot #%d: review floor already %d: nothing written" % (
+                        floor["lot"], floor["floor"]))
+                if not args.agent:
+                    return 0
             if not args.agent and not (args.remove or args.no_verdict):
-                print("ameesh work reviewer: give AGENT, --remove or --no-verdict",
+                print("ameesh work reviewer: give AGENT, --remove, --no-verdict or --floor",
                       file=sys.stderr)
                 return 2
             if args.remove and args.agent:
@@ -2269,6 +2349,13 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
             from . import work_projects
             item = work_projects.set_app(cfg, db, args.id, args.project, actor=args.actor)
             print("lot #%d: project %s" % (item["id"], item["app"]))
+            return 0
+        if args.work_command == "set-type":
+            item = work.set_type(db, args.id, args.lot_type, actor=args.actor, cfg=cfg)
+            if args.json:
+                print(json.dumps(item, ensure_ascii=False, indent=2))
+            else:
+                print("lot #%d: type %s" % (item["id"], item["type"]))
             return 0
         if args.work_command == "issue-ref":
             if bool(args.ref) == bool(args.none):
@@ -3360,6 +3447,11 @@ def build_parser() -> argparse.ArgumentParser:
                               "when moving to qa: waiting(), the progress view and the stale_lot "
                               "alert name them before any verdict; a reviewer of the author's "
                               "declared harness warns (indicative, #800)")
+    pw_move.add_argument("--device", action="append", default=None, metavar="DEVICE",
+                         help="#3070: with blocked, the device (canon Host fiche) whose "
+                              "session the lot waits for (repeatable); --note then names the "
+                              "cases not played. Declared unavailable (canon §12), the gate "
+                              "lifts by itself: see ameesh work device-gates")
     pw_move.set_defaults(func=cmd_work)
     pw_reviewer = work_sub.add_parser(
         "reviewer",
@@ -3378,6 +3470,14 @@ def build_parser() -> argparse.ArgumentParser:
     pw_reviewer.add_argument("--actor", default="",
                              help="who designates: the session's bound identity by default; "
                                   "a human or an orchestrator (same authority as --correct)")
+    pw_reviewer.add_argument("--floor", type=int, default=None, choices=(0, 1, 2),
+                             metavar="N",
+                             help="#3183: pilot's review floor: the gate, the freeze "
+                                  "designation and paquet-candidats require max(scale, N) "
+                                  "reviews of distinct families; journaled, kept across "
+                                  "refreezes; 0 withdraws it (a human's floor: by a human)")
+    pw_reviewer.add_argument("--reason", default="",
+                             help="#3183: why the floor (journaled with it)")
     pw_reviewer.set_defaults(func=cmd_work)
     pw_reviewers = work_sub.add_parser(
         "reviewers",
@@ -3476,6 +3576,16 @@ def build_parser() -> argparse.ArgumentParser:
     pw_expire.add_argument("--json", action="store_true")
     pw_expire.add_argument("--actor", default="")
     pw_expire.set_defaults(func=cmd_work)
+    pw_gates = work_sub.add_parser(
+        "device-gates",
+        help="#3070 (canon §12): blocked lots waiting for a session on a device; a device "
+             "declared unavailable lifts the gate (also done by the runner)")
+    pw_gates.add_argument("--apply", action="store_true",
+                          help="lift the gates: trace, verification lot, back to the state "
+                               "before blocked")
+    pw_gates.add_argument("--json", action="store_true")
+    pw_gates.add_argument("--actor", default="")
+    pw_gates.set_defaults(func=cmd_work)
 
     pw_note = work_sub.add_parser(
         "note", help="journal note; a `hold:`/lift note claiming a pilot is authenticated")
@@ -3513,6 +3623,15 @@ def build_parser() -> argparse.ArgumentParser:
     pw_app.add_argument("--actor", default="",
                         help="human, orchestrator or design agent; default: bound session")
     pw_app.set_defaults(func=cmd_work)
+    pw_type = work_sub.add_parser(
+        "set-type", help="retype a lot (bug/evolution), with a journal entry")
+    pw_type.add_argument("id", type=int)
+    pw_type.add_argument("lot_type", choices=work.RETYPE_TARGETS,
+                         help="the new lot type; a basket `improvement` can only be left")
+    pw_type.add_argument("--json", action="store_true")
+    pw_type.add_argument("--actor", default="",
+                         help="human, orchestrator or design agent; default: bound session")
+    pw_type.set_defaults(func=cmd_work)
     pw_iref = work_sub.add_parser(
         "issue-ref", help="correct a lot's issue reference (owner/repo#N), with a journal entry")
     pw_iref.add_argument("id", type=int)

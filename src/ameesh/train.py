@@ -302,6 +302,10 @@ class Engine:
                 if callable(enroll):
                     enroll(epoch)
                     self._held()
+                    # #3139: enrollment persists its per-lot refusals in the
+                    # same document. Reload its exact revision before this
+                    # pass writes anything (a stale revision would refuse).
+                    state = self.ports.load()
                 rows = self.ports.entries()
                 if self.policy.build_beta:
                     # A late admission belongs to the next packet, even if
@@ -323,7 +327,10 @@ class Engine:
                              revision=int((state or {}).get("revision", 0)), phase="composing",
                              base=self.ports.target(), members=rows, started_ts=now,
                              stamp=datetime.fromtimestamp(now, timezone.utc).strftime("%Y%m%d-%H%M"),
-                             attempts=[], failures=0, pending=[], excluded=[], good=[], deferred=[])
+                             attempts=[], failures=0, pending=[], excluded=[], good=[], deferred=[],
+                             enrollment_deferred=copy.deepcopy(
+                                 (state or {}).get("enrollment_deferred") or []),
+                             enrollment_checked_ts=(state or {}).get("enrollment_checked_ts"))
                 state = self._save(state)
             if self.policy.build_beta and (state.get("plan") or {}).get("diagnostic"):
                 raise TrainError("diagnostic CI is disabled during build/beta")

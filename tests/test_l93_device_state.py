@@ -190,11 +190,15 @@ class SocketTest(unittest.TestCase):
         self.assertEqual(stat.S_IMODE(os.stat(path).st_mode), 0o600)
         body = D.query(path)
         self.assertEqual(body["schema"], "ameesh-device/1")
-        # un ordre sur le canal d'état ne fait rien : il relit simplement l'état
+        # un ordre sur le canal d'état ne fait rien : il relit simplement l'état.
+        # Le serveur ne lit jamais l'ordre : selon l'ordonnancement, il a déjà
+        # répondu et fermé quand le client envoie (EPIPE). La réponse, écrite
+        # avant la fermeture, reste en file sur la socket AF_UNIX : on la lit.
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self.addCleanup(sock.close)
         sock.connect(path)
-        sock.sendall(b'{"op":"stop","agent":"agent-a"}\n')
+        with contextlib.suppress(BrokenPipeError, ConnectionResetError):
+            sock.sendall(b'{"op":"stop","agent":"agent-a"}\n')
         raw = sock.makefile("rb").readline()
         self.assertEqual(json.loads(raw)["schema"], D.SCHEMA)
 

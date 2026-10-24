@@ -433,13 +433,13 @@ def _close_lot_on_merge(db: Db, action_id: str, by: str) -> None:
     l'action est déjà enregistrée, la fermeture du lot est une conséquence."""
     try:
         action = get(db, action_id)
-        if action is None or action.get("connector") != "git-merge" \
+        if action is None or action.get("connector") != work.delivery_connector() \
                 or action.get("state") != "confirmed" or not action.get("work_item"):
             return
         from . import work as work_mod
         done = work_mod.close_merged(
             db, int(action["work_item"]), sha=action.get("external_ref") or "",
-            actor=action.get("auth_approver") or by or "git-merge",
+            actor=action.get("auth_approver") or by or work.delivery_connector(),
             source="the gate (action %s)" % action_id, pr_ref=action.get("target"))
         if done["result"] == "refused":
             fil.warn("work item #%s: %s" % (action["work_item"], done["detail"]))
