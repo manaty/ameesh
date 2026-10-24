@@ -10224,8 +10224,10 @@ class Runner:
         """#2561: retry the freezes whose automatic designation was journaled
         unavailable. A canon publication/sync (or a worktree that became
         readable) can lift the cause after the freeze; the freeze is kept, so
-        the same head is replayed, never a newer one. Bounded and never fatal:
-        the canon sync must not fail because a designation retry did."""
+        the same head is replayed, never a newer one. #3328: the same pass
+        reattributes a seat whose designated reviewer became unreachable (host
+        closed, stopped/dead). Bounded and never fatal: the canon sync must not
+        fail because a designation retry did."""
         if getattr(self, "mediated", False):
             return
         if not getattr(self, "_designation_retry_ready", False):
@@ -10238,6 +10240,9 @@ class Runner:
             db = ScopedDb(self.cfg)
             try:
                 report = activation.retry_pending(self.cfg, db)
+                # #3328 : a seat whose reviewer's host vanished is reattributed
+                # on the same pass, on the same freeze. Bounded and never fatal.
+                moved = activation.reassign_unreachable(self.cfg, db)
             finally:
                 db.close()
             if report.get("attempted") or report.get("errors"):
@@ -10245,6 +10250,11 @@ class Runner:
                     " (%d error(s): %s)" % (len(report["errors"]), report["errors"][0]))
                 log_async("review designation retry: %s%s"
                           % (report.get("summary") or "", detail))
+            if moved.get("examined") or moved.get("errors"):
+                detail = "" if not moved.get("errors") else (
+                    " (%d error(s): %s)" % (len(moved["errors"]), moved["errors"][0]))
+                log_async("review designation reassign: %s%s"
+                          % (moved.get("summary") or "", detail))
         except Exception as exc:  # noqa: BLE001 - never fatal for the canon sync
             log_async("review designation retry failed: %s"
                       % " ".join(str(exc).split())[:200])

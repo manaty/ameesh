@@ -225,13 +225,20 @@ def live_family(row: Mapping, *, families) -> str:
     return family if family in families else ""
 
 
-def is_available(row: Mapping) -> bool:
-    """Availability in the registry: neither stopped, nor paused, nor a human session.
+def is_available(row: Mapping, *, closed_hosts: Iterable[str] = ()) -> bool:
+    """Availability in the registry: neither stopped, nor paused, nor a human
+    session, nor on a host whose claims are closed (#3328).
 
     An agent in a turn remains available: the mail waits for it and opens its
     next turn. Unavailable are a `stopped`/`paused` agent, an `external` session
-    (never run by the executor, L46) and an operations or budget pause
-    (`status_text` "paused…" or "budget : …"). A row with no readable mode or
+    (never run by the executor, L46), an operations or budget pause
+    (`status_text` "paused…" or "budget : …"), and — #3328 — an agent whose
+    host is `draining`/`lost` (claims closed): the request deposited there is
+    not read until the host comes back, so the seat would stay blocked while
+    the freeze waits. The host evidence is the one agent-mail uses
+    (`alert_briefs.claims_closed_hosts`, #3036); an unreadable host state closes
+    nothing, and a missing lease is not read: an idle reviewer is woken by the
+    request mail, so it is still a candidate. A row with no readable mode or
     status is refused: doubt designates nobody.
     """
     row = dict(row or {})
@@ -241,7 +248,11 @@ def is_available(row: Mapping) -> bool:
     if not status or status in UNAVAILABLE_STATUS:
         return False
     text = str(row.get("status_text") or "").strip().lower()
-    return not any(text.startswith(prefix) for prefix in PAUSE_PREFIXES)
+    if any(text.startswith(prefix) for prefix in PAUSE_PREFIXES):
+        return False
+    host = str(row.get("host") or "").strip()
+    closed = {str(value).strip() for value in closed_hosts or () if str(value).strip()}
+    return not (host and host in closed)
 
 
 def reviewed_projects(row: Mapping) -> list[str]:
@@ -259,7 +270,8 @@ def reviewed_projects(row: Mapping) -> list[str]:
 
 
 def candidates_from_registry(rows: Iterable[Mapping], *, loads: Optional[Mapping] = None,
-                             project: str = "", families) -> list[Candidate]:
+                             project: str = "", families,
+                             closed_hosts: Iterable[str] = ()) -> list[Candidate]:
     """The candidates of a project: real family, availability, caller's charge.
 
     `loads` maps a name to the agent's charge (`review_designation_activation.
@@ -267,7 +279,9 @@ def candidates_from_registry(rows: Iterable[Mapping], *, loads: Optional[Mapping
     #3004); when absent, the load is zero. `project` (the lot's `app`)
     restricts to agents of the same team: an ameesh lot is reviewed by an
     ameesh agent. An empty project does not filter — the caller knows what it
-    is doing.
+    is doing. `closed_hosts` (#3328) is the host liveness evidence from
+    `alert_briefs.claims_closed_hosts`: a candidate whose host is closed is not
+    available, exactly as agent-mail does not deliver there.
 
     #3185: an agent whose card declares the project under `relit:` is a
     candidate too, with its real family like any other: a project whose own
@@ -277,6 +291,7 @@ def candidates_from_registry(rows: Iterable[Mapping], *, loads: Optional[Mapping
     """
     loads = loads or {}
     wanted = (project or "").strip()
+    closed = {str(value).strip() for value in closed_hosts or () if str(value).strip()}
     out = []
     for row in rows or ():
         team = str((row or {}).get("team") or "").strip()
@@ -292,7 +307,8 @@ def candidates_from_registry(rows: Iterable[Mapping], *, loads: Optional[Mapping
         row = dict(row or {})
         model = str(row.get("model") or row.get("session_model") or "").strip()
         out.append(Candidate(name=name, family=live_family(row, families=families),
-                             available=is_available(row), load=max(load, 0),
+                             available=is_available(row, closed_hosts=closed),
+                             load=max(load, 0),
                              model=model))
     return out
 

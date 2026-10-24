@@ -10,6 +10,7 @@ a guessed reviewer; the recovery path replays the same freeze.
 from __future__ import annotations
 
 import dataclasses
+import json
 import os
 import shutil
 import subprocess
@@ -1250,8 +1251,8 @@ class ActivationTest(_ActivationFixture, PgTestCase):
         self.assertEqual(report["attempted"], 1, report)
 
     def test_the_runner_retries_after_a_successful_canon_sync(self):
-        # The runner's periodic pass calls the bounded retry; a failure there
-        # never fails the canon sync.
+        # The runner's periodic pass calls the bounded retry and the #3328
+        # reassignment; a failure there never fails the canon sync.
         from ameesh import runner as runner_mod
 
         fake = types.SimpleNamespace(cfg=self.cfg, mediated=False,
@@ -1259,14 +1260,157 @@ class ActivationTest(_ActivationFixture, PgTestCase):
         fake_db = mock.MagicMock()
         report = {"attempted": 1, "designated": 1,
                   "summary": "1 attempted: 1 designated"}
+        moved = {"examined": 1, "reassigned": 1,
+                 "summary": "1 examined: 1 reassigned"}
         with mock.patch("ameesh.scoped_db.ScopedDb", return_value=fake_db), \
                 mock.patch.object(act, "retry_pending", return_value=report) as retry, \
+                mock.patch.object(act, "reassign_unreachable",
+                                  return_value=moved) as reassign, \
                 mock.patch.object(runner_mod, "log_async") as log:
             runner_mod.Runner.retry_review_designations(fake)
         retry.assert_called_once_with(self.cfg, fake_db)
+        reassign.assert_called_once_with(self.cfg, fake_db)
         fake_db.close.assert_called_once()
         self.assertTrue(any("review designation retry" in str(call)
                             for call in log.call_args_list))
+        self.assertTrue(any("review designation reassign" in str(call)
+                            for call in log.call_args_list))
+
+
+class UnreachableDesignationTest(_ActivationFixture, PgTestCase):
+    """#3328 : un hôte perdu n'est ni désigné, ni laissé en siège mort.
+
+    Le constat : pc-smichea `lost`, agent-mail dit « claims closed », mais
+    `is_available` ne lisait que le registre et désignait ses agents. Les
+    témoins couvrent la désignation neuve (exclusion, repli de la même famille,
+    attente si la famille n'a que cet agent), le retour de l'hôte, et la
+    reprise d'une désignation déjà écrite par le passage du runner.
+    """
+
+    LOST = "pc-smichea"
+
+    def _agent(self, name, harness):
+        registry.upsert(self.db, name, harness=harness, host=self.cfg.host,
+                        cwd=self.repo.root, status="idle")
+        self.db.execute("UPDATE agent_registry SET team = 'ameesh' WHERE name = %s",
+                        (name,))
+
+    def _lose_host(self, host=None):
+        host = host or self.LOST
+        self.db.execute(
+            "INSERT INTO host_lifecycle(host, mode, actor) VALUES (%s, 'lost', 'test')"
+            " ON CONFLICT (host) DO UPDATE SET mode = 'lost'", (host,))
+        self.addCleanup(self.db.execute,
+                        "DELETE FROM host_lifecycle WHERE host = %s", (host,))
+
+    def _move_to_lost(self, name, host=None):
+        self.db.execute("UPDATE agent_registry SET host = %s WHERE name = %s",
+                        (host or self.LOST, name))
+
+    def _designated(self, lot=None):
+        shown = act.reviewers(self.cfg, self.db, lot or self.lot)
+        return shown["designation"]
+
+    def test_a_lost_host_is_excluded_and_the_family_falls_back(self):
+        # r1 (claude) est sur l'hôte perdu ; r3, même famille, est sain :
+        # la désignation prend r3, jamais r1.
+        self._agent("r3", "claude")
+        self._move_to_lost("r1")
+        self._lose_host()
+        _, out = self.freeze()
+        self.assertEqual(out["state"], rd.DESIGNATED, out)
+        self.assertEqual(sorted(r["name"] for r in out["reviewers"]), ["r2", "r3"])
+        self.assertNotIn("r1", [r["name"] for r in out["reviewers"]])
+        self.assertEqual(sorted(m["recipient"] for m in self.mailbox()), ["r2", "r3"])
+
+    def test_a_lost_host_alone_in_its_family_waits_and_alerts(self):
+        # Aucun autre claude : la désignation attend le second avis au lieu de
+        # déposer la demande chez un mort (aucune marque portant r1).
+        self._move_to_lost("r1")
+        self._lose_host()
+        _, out = self.freeze()
+        self.assertEqual(out["state"], rd.WAITING, out)
+        self.assertEqual(out["reviewers"], [])
+        self.assertEqual(out["missing"], 1)
+        self.assertEqual([m["recipient"] for m in self.mailbox()], ["pilot"])
+        noted = pg.designation_of(self.marks()[0])
+        self.assertEqual(noted["state"], rd.WAITING)
+        self.assertEqual(noted["reviewers"], [])
+        self.assertNotIn("r1", json.dumps(noted))
+
+    def test_an_undrained_host_is_designated_on_the_next_pass(self):
+        # Témoin (3) : l'hôte rouvert rend r1 candidat ; la marque d'attente du
+        # même gel est rejouée et désigne r1 avec r2.
+        self._move_to_lost("r1")
+        self._lose_host()
+        _, out = self.freeze()
+        self.assertEqual(out["state"], rd.WAITING, out)
+        self.db.execute("UPDATE host_lifecycle SET mode = 'available' WHERE host = %s",
+                        (self.LOST,))
+        again = act.designate(self.cfg, self.db, self.lot)
+        self.assertEqual(again["state"], rd.DESIGNATED, again)
+        self.assertEqual(sorted(r["name"] for r in again["reviewers"]), ["r1", "r2"])
+
+    def test_an_existing_designation_is_reassigned_when_its_host_is_lost(self):
+        # Une désignation écrite avant la perte est reprise au passage du
+        # runner : r1 est remplacé par r3 (même famille), la colonne et le
+        # journal suivent, et une seconde passe ne redésigne rien.
+        self._agent("r3", "claude")
+        _, out = self.freeze()
+        self.assertEqual(sorted(r["name"] for r in out["reviewers"]), ["r1", "r2"])
+        self._move_to_lost("r1")
+        self._lose_host()
+        report = act.reassign_unreachable(self.cfg, self.db)
+        self.assertEqual(report["examined"], 1, report)
+        self.assertEqual(report["reassigned"], 1, report)
+        noted = self._designated()
+        self.assertEqual(noted["state"], rd.DESIGNATED, noted)
+        self.assertEqual(sorted(r["name"] for r in noted["reviewers"]), ["r2", "r3"])
+        column = self.db.query(
+            "SELECT reviewers FROM work_items WHERE id = %s", (self.lot,))[0]["reviewers"]
+        self.assertEqual(sorted(column), ["r2", "r3"])
+        self.assertTrue(self.notes(act.REASSIGN_PREFIX))
+        self.assertIn("r1 (host %s: claims closed)" % self.LOST,
+                      self.notes(act.REASSIGN_PREFIX)[-1])
+        mails = len(self.mailbox())
+        again = act.reassign_unreachable(self.cfg, self.db)
+        self.assertEqual(again["reassigned"], 0, again)
+        self.assertEqual(again["examined"], 0, again)
+        self.assertEqual(len(self.mailbox()), mails)
+
+    def test_a_seat_the_pilot_already_removed_is_not_moved_again(self):
+        # Le pilote a retiré le relecteur mort de la colonne avant la passe
+        # (#3311/#3312) : la marque reste son histoire, mais la reprise ne
+        # rouvre pas le siège et n'envoie rien.
+        self._agent("r3", "claude")
+        _, out = self.freeze()
+        self.assertEqual(sorted(r["name"] for r in out["reviewers"]), ["r1", "r2"])
+        self.db.execute(
+            "UPDATE work_items SET reviewers = ARRAY[%s] WHERE id = %s",
+            ("r2", self.lot))
+        self._move_to_lost("r1")
+        self._lose_host()
+        mails = len(self.mailbox())
+        report = act.reassign_unreachable(self.cfg, self.db)
+        self.assertEqual(report["examined"], 0, report)
+        self.assertEqual(len(self.mailbox()), mails)
+        self.assertFalse(self.notes(act.REASSIGN_PREFIX))
+
+    def test_a_reassignment_without_a_replacement_waits_once(self):
+        # Seule la famille claude est disponible et son agent est mort : la
+        # reprise attend (alerte pilote), une seule fois, au lieu de réécrire
+        # le même siège mort à chaque passe.
+        _, out = self.freeze()
+        self._move_to_lost("r1")
+        self._lose_host()
+        report = act.reassign_unreachable(self.cfg, self.db)
+        self.assertEqual(report["waiting"], 1, report)
+        self.assertEqual(self._designated()["state"], rd.WAITING)
+        self.assertIn("pilot", [m["recipient"] for m in self.mailbox()])
+        mails = len(self.mailbox())
+        again = act.reassign_unreachable(self.cfg, self.db)
+        self.assertEqual(again["examined"], 0, again)
+        self.assertEqual(len(self.mailbox()), mails)
 
 
 class PendingLoadTest(_ActivationFixture, PgTestCase):
