@@ -3360,14 +3360,17 @@ def _artifact_pass(db, host: str, policy: Policy, *, cwd_of: dict, dry_run: bool
     at the lowest priority, one worktree at a time.
 
     #3195: an idle worktree keeps them while the agent it is charged to is in
-    turn (`running`), or while a lot named by its branch or its directory is
-    open (an unknown id names no lot; an unreadable state keeps it). A
-    worktree of the clone an agent works in is that agent's."""
+    turn (`running`), or while a lot recorded for it (tracked worktree, R2
+    cx1) or named by its branch or its directory is open (an unknown id names
+    no lot; an unreadable state or record keeps it). A worktree of the clone
+    an agent works in is that agent's."""
     from . import housekeeping_clones
 
     rules = build_artifacts.rules_of(policy.artifacts)
     tracked = storage.of(db).housekeeping.worktrees(host, ("active", "kept"), limit=None)
     owner = {_real(row["path"]): row["agent"] for row in tracked}
+    recorded = {_real(row["path"]): row.get("lot") for row in tracked
+                if row.get("lot") not in (None, "")}
     agents = sorted(cwd_of.items(), key=lambda item: -len(item[1]))
     clone_of = {_real(cwd): name for name, cwd in cwd_of.items()}
     names = tuple(known_agents or ()) or tuple(cwd_of)
@@ -3386,7 +3389,15 @@ def _artifact_pass(db, host: str, policy: Policy, *, cwd_of: dict, dry_run: bool
         if agent and agent in running:
             return "turn in progress for %s" % agent
         branch = wt.get("branch") or ""
-        lots = cited_lots(branch, agent=branch_agent(branch, names)) \
+        lots = []
+        if _real(wt["path"]) in recorded:
+            # R2 cx1: the lot the tracked worktree was registered for counts
+            # first, whatever its branch or directory names
+            try:
+                lots.append(int(str(recorded[_real(wt["path"])]).lstrip("#")))
+            except ValueError:
+                return "recorded lot %r unreadable" % (recorded[_real(wt["path"])],)
+        lots += cited_lots(branch, agent=branch_agent(branch, names)) \
             + housekeeping_clones.named_lots(os.path.basename(os.path.normpath(wt["path"])),
                                              names)
         for ident in dict.fromkeys(lots):

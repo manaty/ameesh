@@ -689,8 +689,9 @@ def holders(path: str | None, needle: str | None = None, exclude=(), *,
     défaut ; le `comm` ET le nom de base d'`argv[0]` doivent s'y trouver
     (même règle que `user_paths`), sinon le refus reste un doute. #3195 : un
     agent de clés lancé par le gestionnaire de services comme son unité
-    (`key_agent_unit`, par cgroup et parent, jamais par nom) n'en est pas un
-    non plus. Un détenteur
+    (`key_agent_paths`, par cgroup et parent, jamais par nom, et par la
+    configuration que le gestionnaire en lit) n'en est pas un non plus tant
+    qu'aucun de ses chemins configurés n'est dans `path`. Un détenteur
     CONSTATÉ (fichier ouvert, dossier courant, `needle`) reste rapporté, même
     si son nom est dans `allow` : l'allow ne lève que le doute, jamais une
     observation."""
@@ -802,14 +803,15 @@ def _allowed_proc(pid, allow) -> bool:
     return bool(name) and name in allow and os.path.basename(argv0) in allow
 
 
-def _doubt_proc(pid, uid: int, managers, allow=()) -> str | None:
+def _doubt_proc(pid, uid: int, managers, allow=(), inside=None) -> str | None:
     """L63b: why a process whose open files were denied leaves the answer
     unknown, read on /proc; None when it cannot hold anything of the user's:
     gone, a zombie (no files left), running as another user (effective uid:
     a setuid helper such as sudo is root's), the user's service manager
     (`managers()`, by PID), a key agent run as its unit by that manager
-    (`key_agent_unit`, #3195), or a process named by `allow` (L230, `comm`
-    and `argv[0]`; an unreadable status is a doubt)."""
+    whose configured paths (`key_agent_paths`, #3195) are none `inside` the
+    path looked for, or a process named by `allow` (L230, `comm` and
+    `argv[0]`; an unreadable status is a doubt)."""
     try:
         status = _proc_status(pid)
     except OSError as exc:
@@ -821,7 +823,11 @@ def _doubt_proc(pid, uid: int, managers, allow=()) -> str | None:
         return "%s (uid unreadable)" % pid
     if int(uids[1]) != uid or int(pid) in managers():
         return None
-    if _allowed_proc(pid, allow) or key_agent_unit(pid, uid, managers, status):
+    if _allowed_proc(pid, allow):
+        return None
+    configured = key_agent_paths(pid, uid, managers, status)
+    if configured is not None and not any((inside or (lambda _p: False))(path)
+                                          for path in configured):
         return None
     return "%s %s" % (pid, " ".join(status.get("Name") or ["?"]))
 
@@ -1011,7 +1017,8 @@ def _holders_psutil(ps, real, is_dir, needle, exclude, mapped=False,
         uid, managers = os.getuid(), _once(service_managers)
 
         def doubt(pid):
-            return _doubt_proc(pid, uid, managers, allow)
+            return _doubt_proc(pid, uid, managers, allow,
+                               lambda path: _inside(os.path.realpath(path), real, is_dir))
     else:
         def doubt(pid):
             return _doubt_psutil(ps, pid, user, allow)
@@ -1114,6 +1121,9 @@ def _holders_proc(real, is_dir, needle, exclude, mapped=False, session=False,
                            "open files unreadable even for this process (%s)"
                            % exc) from None
     uid, managers = os.getuid(), _once(service_managers)
+
+    def inside(path: str) -> bool:
+        return _inside(os.path.realpath(path), real, is_dir)
     found = []
     doubts: dict = {}
     for pid in pids:
@@ -1156,13 +1166,13 @@ def _holders_proc(real, is_dir, needle, exclude, mapped=False, session=False,
         if row:
             found.append(row)
         elif refused:
-            who = _doubt_proc(pid, uid, managers, allow)
+            who = _doubt_proc(pid, uid, managers, allow, inside)
             if who:
                 doubts[pid] = who
     # L63b : même règle que la voie psutil — un détenteur vérifié ne se jette
     # pas parce qu'un tiers du même utilisateur refuse ses fichiers ouverts.
     if not found:
-        _settle(doubts, lambda pid: _doubt_proc(pid, uid, managers, allow))
+        _settle(doubts, lambda pid: _doubt_proc(pid, uid, managers, allow, inside))
     return found
 
 
@@ -1182,23 +1192,83 @@ SERVICE_MANAGER = frozenset({"systemd", "(sd-pam)"})
 #: `gpg-agent` a test starts inside a worktree keeps the cgroup of its
 #: launcher, even once the manager has reaped it as an orphan: a doubt.
 KEY_AGENT_UNITS = frozenset({"gpg-agent.service", "ssh-agent.service"})
+#: #3195 R2 (cx1, cx2): the unit's identity does not prove its paths — any
+#: unit can set `WorkingDirectory=` (systemd.exec). A key agent is let
+#: through only when the manager reads its unit from these root-owned vendor
+#: directories, without a drop-in nor `RootDirectory=`: the package's file,
+#: which the user cannot have pointed at a worktree.
+VENDOR_UNIT_DIRS = ("/usr/lib/systemd/user/", "/lib/systemd/user/",
+                    "/usr/share/systemd/user/")
+#: #3195 R2: the environment variables that place a key agent's files (its
+#: GnuPG home, its socket): what the manager passes is part of its paths
+KEY_AGENT_HOMES = ("GNUPGHOME", "SSH_AUTH_SOCK")
+UNIT_PROPERTIES = ("Id", "MainPID", "FragmentPath", "DropInPaths",
+                   "WorkingDirectory", "RootDirectory", "Environment")
 
 
-def key_agent_unit(pid, uid: int, managers, status: dict | None = None) -> bool:
-    """#3195: `pid` is a key agent run by the user's service manager as its
-    unit (`KEY_AGENT_UNITS`): its parent is the manager (`managers()`, PIDs
-    from `service_managers`) and its cgroup is that unit, under
-    `user@<uid>.service` through slices only (a sub-cgroup of a delegated
-    unit is not the unit). Both are readable on a process that is not
-    dumpable; anything unreadable: False, the doubt stays. `status`: its
+def _unit_show(unit: str) -> dict:
+    """#3195 R2: the user's service manager's reading of `unit`
+    (`systemctl --user show`), `{}` when it cannot be read."""
+    import subprocess
+    try:
+        done = subprocess.run(["systemctl", "--user", "show", unit,
+                               "--property=" + ",".join(UNIT_PROPERTIES)],
+                              capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    if done.returncode != 0:
+        return {}
+    return dict(line.split("=", 1) for line in done.stdout.splitlines() if "=" in line)
+
+
+def _manager_environment() -> dict:
+    """#3195 R2: the environment the user's service manager passes to its
+    units (`systemctl --user show-environment`), `{}` when unreadable."""
+    import subprocess
+    try:
+        done = subprocess.run(["systemctl", "--user", "show-environment"],
+                              capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    if done.returncode != 0:
+        return {}
+    return dict(line.split("=", 1) for line in done.stdout.splitlines() if "=" in line)
+
+
+def _home_of(uid: int) -> str:
+    try:
+        import pwd
+        return pwd.getpwuid(uid).pw_dir
+    except (ImportError, KeyError):
+        return ""
+
+
+def key_agent_paths(pid, uid: int, managers, status: dict | None = None, *,
+                    show=None, environment=None) -> list[str] | None:
+    """#3195: the paths a key agent run by the user's service manager as its
+    unit (`KEY_AGENT_UNITS`) may hold, by its configuration; None when that
+    is not proven (the doubt stays).
+
+    Its parent is the manager (`managers()`, PIDs from `service_managers`)
+    and its cgroup is that unit, under `user@<uid>.service` through slices
+    only (a sub-cgroup of a delegated unit is not the unit) — both readable
+    on a process that is not dumpable. R2 (cx1, cx2): and the manager's
+    reading of the unit (`show(unit)`, `_unit_show`) names this process as
+    its `MainPID`, from a vendor file (`VENDOR_UNIT_DIRS`), without a drop-in
+    nor a `RootDirectory=`. The paths are its `WorkingDirectory` as the
+    manager reports it (`~` or empty: the home) and the key homes
+    (`KEY_AGENT_HOMES`) of the unit's environment then of the manager's
+    (`environment()`, `_manager_environment`), the GnuPG home defaulting to
+    `~/.gnupg`: the caller records them as observed paths, so a worktree
+    that contains one stays held. Anything unreadable: None. `status`: its
     `_proc_status`, when already read."""
     try:
         status = _proc_status(pid) if status is None else status
         ppid = int(((status or {}).get("PPid") or ["0"])[0])
     except (OSError, ValueError):
-        return False
+        return None
     if ppid <= 1 or ppid not in managers():
-        return False
+        return None
     lines = _read_text(os.path.join(PROC, str(pid), "cgroup")).splitlines()
     # the hierarchy systemd tracks: `name=systemd` (cgroup v1, hybrid), else
     # the unified one (cgroup v2, `0::/…`)
@@ -1209,9 +1279,49 @@ def key_agent_unit(pid, uid: int, managers, status: dict | None = None) -> bool:
     parts = path.strip().strip("/").split("/")
     manager = "user@%d.service" % uid
     if manager not in parts[:-1]:
-        return False
+        return None
     between = parts[parts.index(manager) + 1:-1]
-    return parts[-1] in KEY_AGENT_UNITS and all(p.endswith(".slice") for p in between)
+    unit = parts[-1]
+    if unit not in KEY_AGENT_UNITS or not all(p.endswith(".slice") for p in between):
+        return None
+    try:
+        props = (show or _unit_show)(unit) or {}
+    except Exception:  # noqa: BLE001 - the manager's reading failed: a doubt
+        return None
+    fragment = os.path.normpath(props.get("FragmentPath") or "/")
+    if (props.get("Id") != unit or props.get("MainPID") != str(pid)
+            or not any(fragment.startswith(d) for d in VENDOR_UNIT_DIRS)
+            or (props.get("DropInPaths") or "").strip()
+            or (props.get("RootDirectory") or "").strip()):
+        return None
+    home = _home_of(uid)
+    # `!` (missing directory allowed) and `-` prefix the reported directory
+    workdir = (props.get("WorkingDirectory") or "").lstrip("!-") or "~"
+    workdir = home if workdir == "~" else workdir
+    if not workdir or not os.path.isabs(workdir):
+        return None
+    try:
+        passed = dict((environment or _manager_environment)() or {})
+    except Exception:  # noqa: BLE001 - its environment is unknown: a doubt
+        return None
+    try:
+        import shlex
+        items = shlex.split(props.get("Environment") or "")
+    except ValueError:  # an environment that cannot be read: a doubt
+        return None
+    passed.update(item.split("=", 1) for item in items if "=" in item)
+    paths = [workdir]
+    for name in KEY_AGENT_HOMES:
+        value = passed.get(name) or ""
+        if name == "SSH_AUTH_SOCK" and value:
+            value = os.path.dirname(value)
+        if name == "GNUPGHOME" and not value and home:
+            value = os.path.join(home, ".gnupg")
+        if value and not os.path.isabs(value):
+            return None
+        if value:
+            paths.append(value)
+    return paths
 
 
 class UserPaths:
@@ -1294,8 +1404,11 @@ def user_paths(uid: int | None = None, allow=()) -> UserPaths:
     of its `argv[0]` are both in `allow` (listed in `allowed`) or both name
     the service manager (not listed): its `exe` link is unreadable too, its
     command line is not. Nor is a key agent run as its unit by the service
-    manager (`key_agent_unit`, #3195, not listed). Without `/proc` (other
-    OS), `available` is false."""
+    manager (`key_agent_paths`, #3195, not listed): the paths its
+    configuration gives it are recorded as its own. What was read before a
+    refusal (a `cwd`, an `exe`) is recorded all the same (#3195 R2): an
+    observation is never dropped for what could not be read after it.
+    Without `/proc` (other OS), `available` is false."""
     if not _proc_ok():
         return UserPaths(available=False)
     uid = os.getuid() if uid is None else uid
@@ -1319,6 +1432,7 @@ def user_paths(uid: int | None = None, allow=()) -> UserPaths:
         name = _read_text(os.path.join(base, "comm")).strip() or "?"
         who = "%s %s" % (pid, name)
         found = []
+        refused = False
         try:
             found.append(_link(os.path.join(base, "cwd")))
             for link in ("exe", "root"):
@@ -1341,13 +1455,20 @@ def user_paths(uid: int | None = None, allow=()) -> UserPaths:
         except (FileNotFoundError, ProcessLookupError):
             continue   # gone meanwhile
         except OSError:
+            refused = True
+        if refused:
             argv0 = _read_text(os.path.join(base, "cmdline")).split("\0", 1)[0]
+            configured = None
             if name in allow and os.path.basename(argv0) in allow:
                 if name not in SERVICE_MANAGER:
                     out.allowed.append(who)
-            elif not key_agent_unit(pid, uid, managers):
-                out.unreadable.append(who)
-            continue
+            else:
+                configured = key_agent_paths(pid, uid, managers)
+                if configured is None:
+                    out.unreadable.append(who)
+            # #3195 R2: what was read before the refusal stays observed, and
+            # a key agent's configured paths are its own
+            found += configured or []
         for path in found:
             # `root` is `/` for every process: it only tells a chroot apart
             if path and path != "/":

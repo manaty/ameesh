@@ -5,6 +5,7 @@ and removes after 24 h a worktree kept although its lot is merged. Offline:
 temporary git trees, a fake /proc, a fake store."""
 from __future__ import annotations
 
+import contextlib
 import os
 import shutil
 import subprocess
@@ -90,6 +91,28 @@ class _Base(unittest.TestCase):
         if unreadable:
             os.chmod(os.path.join(d, "fd"), 0)
             self.addCleanup(os.chmod, os.path.join(d, "fd"), 0o700)
+
+    def units(self, pids, environment=None, **props):
+        """#3195 R2: the user's service manager's reading of the key agent
+        units — the package's file, `pids` (`{unit: MainPID}`), the home as
+        working directory — and its environment; `props` overrides a field."""
+        home = os.path.expanduser("~")
+
+        def show(unit):
+            if unit not in pids:
+                return {}
+            row = {"Id": unit, "MainPID": str(pids[unit]),
+                   "FragmentPath": "/usr/lib/systemd/user/" + unit, "DropInPaths": "",
+                   "WorkingDirectory": "!" + home, "RootDirectory": "", "Environment": ""}
+            row.update(props)
+            return row
+        stack = contextlib.ExitStack()
+        stack.enter_context(mock.patch.object(process, "_unit_show", side_effect=show))
+        stack.enter_context(mock.patch.object(process, "_manager_environment",
+                                              return_value=dict(environment or {})))
+        stack.enter_context(mock.patch.object(process, "service_managers",
+                                              return_value=frozenset({7})))
+        return stack
 
     def worktree(self, name: str = "wt") -> str:
         """A worktree: sources, node_modules (two levels), a Rust target
@@ -205,7 +228,7 @@ class UserPathsTest(_Base):
         self.fake_process(41, comm="ssh-agent", unreadable=True, ppid=7,
                           cgroup="1:name=systemd:%s/ssh-agent.service\n0::/\n" % user)
         managers = mock.patch.object(process, "service_managers", return_value=frozenset({7}))
-        with managers:
+        with self.units({"gpg-agent.service": 40, "ssh-agent.service": 41}):
             scan = platform.user_paths()
         self.assertEqual((scan.doubt(), scan.allowed), ("", []))
         with mock.patch.object(process, "service_managers", return_value=frozenset()):
@@ -224,8 +247,38 @@ class UserPathsTest(_Base):
             with self.subTest(name):
                 self.fake_process(pid, comm="gpg-agent", cwd=inside, unreadable=True,
                                   ppid=ppid, cgroup=cgroup)
-                with managers:
-                    self.assertIn("%d gpg-agent" % pid, platform.user_paths().doubt())
+                with managers, self.units({"gpg-agent.service": pid}):
+                    self.assertIn("%d gpg-agent" % pid, platform.user_paths().unreadable)
+
+    @unittest.skipIf(os.getuid() == 0, "root reads everything")
+    def test_3195_r2_only_the_package_unit_is_let_through(self):
+        """R2 (cx1, cx2): the unit's identity does not prove its paths — any
+        unit can set `WorkingDirectory=`. Only the manager's reading of the
+        package's file (vendor directory, no drop-in, no `RootDirectory=`,
+        this process as its `MainPID`) lets a key agent through."""
+        uid = os.getuid()
+        user = "/user.slice/user-%d.slice/user@%d.service" % (uid, uid)
+        cases = (("the user's own unit file", {"FragmentPath": os.path.expanduser(
+                    "~/.config/systemd/user/gpg-agent.service")}),
+                 ("a drop-in", {"DropInPaths": os.path.expanduser(
+                    "~/.config/systemd/user/gpg-agent.service.d/x.conf")}),
+                 ("a RootDirectory", {"RootDirectory": "/srv/jail"}),
+                 ("another MainPID", {"MainPID": "999"}),
+                 ("another unit answers", {"Id": "other.service"}),
+                 ("a relative working directory", {"WorkingDirectory": "node_modules"}),
+                 ("a relative GnuPG home", {"Environment": "GNUPGHOME=.gnupg"}))
+        for pid, (name, props) in enumerate(cases, start=60):
+            with self.subTest(name):
+                self.fake_process(pid, comm="gpg-agent", unreadable=True, ppid=7,
+                                  cgroup="0::%s/app.slice/gpg-agent.service\n" % user)
+                with self.units({"gpg-agent.service": pid}, **props):
+                    self.assertIn("%d gpg-agent" % pid, platform.user_paths().unreadable)
+        self.fake_process(70, comm="gpg-agent", unreadable=True, ppid=7,
+                          cgroup="0::%s/app.slice/gpg-agent.service\n" % user)
+        with self.units({"gpg-agent.service": 70}):
+            self.assertNotIn("70 gpg-agent", platform.user_paths().unreadable)
+        with self.units({}):  # the manager cannot be read
+            self.assertIn("70 gpg-agent", platform.user_paths().unreadable)
 
     @unittest.skipIf(os.getuid() == 0, "root reads everything")
     def test_a_zombie_is_not_a_doubt(self):
@@ -345,27 +398,55 @@ class RunTest(_Base):
     def test_3195_a_key_agent_inside_the_worktree_deletes_nothing(self):
         """B1 cx2: a real `gpg-agent` can work in the directory to clean (its
         cwd unreadable: `holders` would not see it). Out of its unit, it
-        holds back the deletion; the unit of the service manager does not."""
+        holds back the deletion."""
         uid = os.getuid()
         user = "/user.slice/user-%d.slice/user@%d.service" % (uid, uid)
         wt = self.worktree()
         self.fake_process(23, comm="gpg-agent", cwd=os.path.join(wt, "node_modules"),
                           unreadable=True, ppid=7,
                           cgroup="0::%s/ameesh.slice/ameesh-runner-agent@dev2.service\n" % user)
-        with mock.patch.object(process, "service_managers", return_value=frozenset({7})):
+        with self.units({"gpg-agent.service": 23}):
             out = self.go(wt)
         self.assertEqual((out["entries"], out["plan"]), ([], []))
         self.assertIn("artifacts: nothing deleted, process(es) of the user unreadable: "
                       "23 gpg-agent", out["skipped"])
         self.assertTrue(os.path.isdir(os.path.join(wt, "node_modules")))
-        _write(os.path.join(self.proc, "23", "cgroup"),
-               text="0::%s/app.slice/gpg-agent.service\n" % user)
-        _write(os.path.join(self.proc, "23", "status"),
-               text="Name:\tgpg-agent\nState:\tS (x)\nPPid:\t7\nUid:\t%d\t%d\t%d\t%d\n"
-                    % (uid, uid, uid, uid))
+
+    @unittest.skipIf(os.getuid() == 0, "root reads everything")
+    def test_3195_r2_the_unit_keeps_what_was_read_and_what_it_is_configured_for(self):
+        """R2 (cx1, cx2 witness): parent = manager, cgroup = gpg-agent.service,
+        cwd = <wt>/node_modules readable, fd unreadable: the cwd read is kept,
+        the worktree is held. With its cwd unreadable too, its paths are the
+        ones the manager's reading gives: the home by default (deleted), but a
+        `WorkingDirectory=` or a GnuPG home inside the worktree holds it."""
+        uid = os.getuid()
+        unit = "0::/user.slice/user-%d.slice/user@%d.service/app.slice/gpg-agent.service\n" \
+            % (uid, uid)
+        pids = {"gpg-agent.service": 23}
+        wt = self.worktree()
+        self.fake_process(23, comm="gpg-agent", cwd=os.path.join(wt, "node_modules"),
+                          unreadable=True, ppid=7, cgroup=unit)
+        with self.units(pids):
+            out = self.go(wt)
+        self.assertEqual(out["entries"], [])
+        self.assertIn("process inside (23 gpg-agent)", " ".join(out["skipped"]))
+        # its cwd unreadable as well (not dumpable): readlink refused
         os.remove(os.path.join(self.proc, "23", "cwd"))
-        os.symlink(os.path.expanduser("~"), os.path.join(self.proc, "23", "cwd"))
-        with mock.patch.object(process, "service_managers", return_value=frozenset({7})):
+        os.makedirs(os.path.join(self.proc, "23", "cwd"))
+        inside = os.path.join(wt, "node_modules")
+        held = (("a WorkingDirectory in the worktree", {"WorkingDirectory": inside}, {}),
+                ("a GnuPG home in the worktree, from the unit",
+                 {"Environment": "GNUPGHOME=%s/.gnupg" % inside}, {}),
+                ("a GnuPG home in the worktree, from the manager", {},
+                 {"GNUPGHOME": inside + "/.gnupg"}),
+                ("its socket in the worktree, from the manager", {},
+                 {"SSH_AUTH_SOCK": inside + "/S.agent"}))
+        for name, props, environment in held:
+            with self.subTest(name), self.units(pids, environment, **props):
+                out = self.go(wt)
+                self.assertEqual(out["entries"], [])
+                self.assertIn("process inside (23 gpg-agent)", " ".join(out["skipped"]))
+        with self.units(pids):
             self.assertEqual(len(self.go(wt)["entries"]), 3)
 
     def test_3195_keep_holds_an_idle_worktree(self):
@@ -1025,8 +1106,8 @@ class MergedKeptTest(_Repo):
 
 
 class ArtifactPassTest(_Repo):
-    def artifact_pass(self, lots, *, running=(), dry_run=False) -> dict:
-        with mock.patch.object(menage.storage, "of", return_value=_Store([], lots)):
+    def artifact_pass(self, lots, *, running=(), dry_run=False, rows=()) -> dict:
+        with mock.patch.object(menage.storage, "of", return_value=_Store(list(rows), lots)):
             return menage._artifact_pass(None, "pc", menage.Policy(),
                                          cwd_of={"dev2": self.main}, dry_run=dry_run,
                                          now=time.time() + LATER,
@@ -1071,6 +1152,29 @@ class ArtifactPassTest(_Repo):
         self.assertIn("lot #7 intake", skipped)
         for wt in (named, branch):
             self.assertTrue(os.path.exists(os.path.join(wt, "node_modules", "a.js")))
+
+    def test_3195_r2_the_recorded_lot_of_a_tracked_worktree_keeps_it(self):
+        """R2 B2 (cx1): a tracked worktree whose branch and directory name no
+        lot (`scratch`) keeps its build output while the lot it was
+        registered for is open; an unreadable record keeps it too; once the
+        lot is merged, the output goes."""
+        scratch = os.path.join(self.base, "scratch")
+        _git("worktree", "add", "-q", "-b", "scratch", scratch, cwd=self.main)
+        _write(os.path.join(scratch, "node_modules", "a.js"))
+
+        def row(lot):
+            return {"id": 9, "path": scratch, "agent": "dev2", "lot": lot,
+                    "repo": menage.common_dir(self.main), "status": "active",
+                    "branch": "scratch", "detail": ""}
+        out = self.artifact_pass({123: "qa"}, running={"dev1"}, rows=[row("123")])
+        self.assertEqual(out["entries"], [])
+        self.assertIn("lot #123 qa", " ".join(out["skipped"]))
+        out = self.artifact_pass({}, running={"dev1"}, rows=[row("#12x")])
+        self.assertEqual(out["entries"], [])
+        self.assertIn("recorded lot '#12x' unreadable", " ".join(out["skipped"]))
+        out = self.artifact_pass({123: "merged"}, running={"dev1"}, rows=[row("123")])
+        self.assertEqual([os.path.realpath(e["path"]) for e in out["entries"]],
+                         [os.path.realpath(os.path.join(scratch, "node_modules"))])
 
 
 if __name__ == "__main__":

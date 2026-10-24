@@ -21,7 +21,9 @@ housekeeping pass frees what a build regenerates:
   by default; logged) or it is the user's service manager (`systemd --user`:
   not dumpable, lives in `/`) or a key agent that manager runs as its unit
   (`gpg-agent.service`, `ssh-agent.service`: not dumpable, in the unit's
-  directory; told by cgroup and parent, never by name, #3195).
+  directory; told by cgroup and parent, never by name, #3195; and by the
+  manager's reading of the package's unit file, whose working directory and
+  key homes then count as its paths: `platform.key_agent_paths`).
 * **Never**: the main checkout of a repository, an agent's working directory
   or a directory that contains one, a worktree charged to an agent in turn or
   named (branch or directory) after a lot still open (#3195: `keep`), a
@@ -775,7 +777,8 @@ def run(candidates: list[dict], rules, *, idle_s: float, protected, skip_roots=(
     `skip_roots`: managed roots, never entered nor deleted; `owner_of(path)`:
     the agent a worktree is charged to; `keep(candidate)`: why an idle
     worktree keeps its artifacts all the same ('' if nothing: #3195, an open
-    lot, a turn in progress); `allow`: names of unreadable processes that do
+    lot — recorded, or named by its branch or directory —, a turn in
+    progress); `allow`: names of unreadable processes that do
     not block (policy `unreadable_ok`); `lock_path`: the host-wide lock of
     deleting passes; `journal_path`: the journal of the trash dirs
     (`Journal`), without which nothing is deleted. A doubt on the processes

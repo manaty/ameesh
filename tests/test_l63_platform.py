@@ -410,12 +410,75 @@ class PlatformTest(unittest.TestCase):
                         mock.patch.object(platform.process, "DOUBT_RETRY_S", 0), \
                         mock.patch.object(platform.process, "service_managers",
                                           return_value=frozenset(gestionnaires)), \
+                        self._unite(), \
                         mock.patch.object(platform, "SYSTEM", "linux"):
                     if doute:
                         with self.assertRaises(platform.NotAvailable):
                             platform.holders(__file__, "x")
                     else:
                         self.assertEqual(platform.holders(__file__, "x"), [])
+
+    def _unite(self, environnement=None, **champs):
+        """#3195 R2 : la lecture que le gestionnaire fait de l'unité du pid
+        4242 — le fichier du paquet, le home pour dossier — et son
+        environnement ; `champs` remplace un champ."""
+        import contextlib
+
+        def show(unite):
+            ligne = {"Id": unite, "MainPID": "4242",
+                     "FragmentPath": "/usr/lib/systemd/user/" + unite, "DropInPaths": "",
+                     "WorkingDirectory": "!" + os.path.expanduser("~"),
+                     "RootDirectory": "", "Environment": ""}
+            ligne.update(champs)
+            return ligne
+        pile = contextlib.ExitStack()
+        pile.enter_context(mock.patch.object(platform.process, "_unit_show", side_effect=show))
+        pile.enter_context(mock.patch.object(platform.process, "_manager_environment",
+                                             return_value=dict(environnement or {})))
+        return pile
+
+    def test_3195_r2_les_chemins_configures_de_l_unite_comptent(self):
+        """#3195 R2 (cx1, cx2) : l'identité de l'unité ne prouve pas ses
+        chemins. `holders(dossier)` garde le doute quand le dossier de travail
+        ou le home de clés que le gestionnaire lui donne est dans le dossier,
+        ou quand l'unité n'est pas le fichier du paquet ; il conclut sinon."""
+        if os.geteuid() == 0:
+            self.skipTest("root lit tout : pas de refus de lecture à simuler")
+        import tempfile
+        moi = os.getuid()
+        uid = "%d %d %d %d" % ((moi,) * 4)
+        unite = "0::/user.slice/user-%d.slice/user@%d.service/app.slice/gpg-agent.service\n" \
+            % (moi, moi)
+        dossier = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, dossier, True)
+        dedans = os.path.join(dossier, "node_modules")
+        cas = (("le fichier du paquet, le home", {}, {}, False),
+               ("WorkingDirectory dans le dossier", {"WorkingDirectory": dedans}, {}, True),
+               ("GNUPGHOME de l'unité dans le dossier",
+                {"Environment": "GNUPGHOME=%s/.gnupg" % dedans}, {}, True),
+               ("GNUPGHOME du gestionnaire dans le dossier", {},
+                {"GNUPGHOME": dedans + "/.gnupg"}, True),
+               ("un fichier d'unité de l'utilisateur",
+                {"FragmentPath": os.path.expanduser(
+                    "~/.config/systemd/user/gpg-agent.service")}, {}, True),
+               ("un drop-in", {"DropInPaths": "/etc/systemd/user/gpg-agent.service.d/x.conf"},
+                {}, True),
+               ("un autre MainPID", {"MainPID": "1234"}, {}, True))
+        for nom, champs, environnement, doute in cas:
+            with self.subTest(nom):
+                racine = self._faux_proc("gpg-agent", uid, ppid=7, cgroup=unite)
+                with mock.patch.object(platform, "psutil", None), \
+                        mock.patch.object(platform.process, "PROC", racine), \
+                        mock.patch.object(platform.process, "DOUBT_RETRY_S", 0), \
+                        mock.patch.object(platform.process, "service_managers",
+                                          return_value=frozenset({7})), \
+                        self._unite(environnement, **champs), \
+                        mock.patch.object(platform, "SYSTEM", "linux"):
+                    if doute:
+                        with self.assertRaises(platform.NotAvailable):
+                            platform.holders(dossier, "x")
+                    else:
+                        self.assertEqual(platform.holders(dossier, "x"), [])
 
     def test_allow_ne_cache_pas_un_detenteur_constate(self):
         """L230 : `allow` ne lève que le DOUTE ; un processus lisible qui tient
