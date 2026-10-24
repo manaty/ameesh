@@ -31,12 +31,13 @@ def _jalons(item, events):
 class TableTest(unittest.TestCase):
     """La table est celle du canon §9, avec ses deux colonnes de délai."""
 
-    def test_les_neuf_etapes_du_canon(self):
-        self.assertEqual(len(slo.STEPS), 9)
+    def test_les_dix_etapes_du_canon(self):
+        # #3288 : « avis bloquant → nouveau gel » s'ajoute au §9.
+        self.assertEqual(len(slo.STEPS), 10)
         self.assertEqual([s.key for s in slo.STEPS], [
             "signal_assigned", "intake_started", "build_quiet", "green_verdict",
-            "verdict_merge", "merge_prod", "prod_verified", "ci_queue",
-            "agent_paused"])
+            "blocked_freeze", "verdict_merge", "merge_prod", "prod_verified",
+            "ci_queue", "agent_paused"])
 
     def test_delais_du_canon(self):
         attendus = {
@@ -44,6 +45,7 @@ class TableTest(unittest.TestCase):
             "intake_started": (3600, 900),
             "build_quiet": (7200, 3600),
             "green_verdict": (7200, 1800),
+            "blocked_freeze": (7200, 3600),
             "verdict_merge": (1800, 900),
             "merge_prod": (86400, 14400),
             "prod_verified": (7200, 3600),
@@ -58,8 +60,10 @@ class TableTest(unittest.TestCase):
     def test_seules_les_etapes_des_evenements_sont_mesurees(self):
         mesurees = {s.key for s in slo.STEPS if s.measured}
         # #3033 : `green_verdict` est mesurée depuis la désignation au gel
+        # #3288 : `blocked_freeze` l'est depuis le premier avis bloquant
         self.assertEqual(mesurees, {"signal_assigned", "intake_started",
-                                    "build_quiet", "green_verdict", "verdict_merge"})
+                                    "build_quiet", "green_verdict",
+                                    "blocked_freeze", "verdict_merge"})
         for step in slo.STEPS:
             if not step.measured:
                 self.assertEqual(step.source, slo.EXTERNAL, step.key)

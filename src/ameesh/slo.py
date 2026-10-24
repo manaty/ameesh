@@ -84,6 +84,15 @@ STEPS: tuple = (
     Step("green_verdict",
          "frozen head designated → reviewer's verdict delivered",
          7200, 1800, LOT_EVENTS, True),
+    # #3288 : la correction d'un avis bloquant. Mesurée depuis le premier avis
+    # `blocked` encore en vigueur sur le dernier gel, jusqu'au nouveau gel
+    # (`review_designation_activation.due_fixes`, le même calcul que les avis
+    # dus de #3033) : un lot en qa avec un avis bloquant n'attend plus un
+    # relecteur, il attend la correction de son assigné. 2 h, 1 h en P1 ;
+    # escalade §9 : ×1 assigné, ×2 pilote qui réassigne, ×3 bureau/auditeur.
+    Step("blocked_freeze",
+         "blocking verdict → new freeze (fix)",
+         7200, 3600, LOT_EVENTS, True),
     Step("verdict_merge",
          "review GO → merge",
          1800, 900, LOT_EVENTS, True),
@@ -368,7 +377,8 @@ def lot_steps(item: dict, jalons: dict, events: Iterable[dict], *,
               dependencies: Iterable[dict] = (), packet: bool = False,
               p80_s: float | None = None, outside_packet: bool = False,
               hold_releases: Iterable[float] = (),
-              reviews: Iterable[dict] = ()) -> list:
+              reviews: Iterable[dict] = (),
+              fixes: Iterable[dict] = ()) -> list:
     """Les étapes mesurables d'un lot, une ligne par étape applicable.
 
     `jalons` vient de `progress._work_item_milestones` — le SEUL lecteur des
@@ -435,6 +445,17 @@ def lot_steps(item: dict, jalons: dict, events: Iterable[dict], *,
     ligne ; un nouveau gel le remet, depuis la nouvelle désignation. La grâce
     de prise en charge (#2217) ne s'y applique pas : elle protège le porteur
     du lot, pas un relecteur.
+
+    #3288 : `fixes` sont les corrections dues après un avis bloquant
+    (`review_designation_activation.due_fixes` : `name` (le débiteur,
+    l'assigné), `blocked_ts`, `blocked_by`, `sha`). Chacune donne une ligne
+    `blocked_freeze` en cours, depuis le **premier** avis bloquant encore en
+    vigueur sur le dernier gel : l'escalade §9 vise l'assigné, puis le pilote
+    qui réassigne, puis le bureau/l'auditeur. La grâce de prise en charge
+    s'applique ici en revanche : le débiteur est bien le porteur du lot, et
+    une réassignation ne doit pas déclencher une nouvelle demande de
+    réassignation dans la minute. Une correction livrée (nouveau gel) ou
+    annulée par un verdict inverse du même relecteur retire la ligne.
     """
     events = list(events)
     now = time.time() if now is None else float(now)
@@ -555,6 +576,18 @@ def lot_steps(item: dict, jalons: dict, events: Iterable[dict], *,
             if not name or since is None:
                 continue
             out.append(_row(step, since, now=now, critical=critical, reviewer=name))
+
+    if state not in ("merged", "promoted", "closed"):
+        step = step_of("blocked_freeze")
+        for fix in fixes or ():
+            since = fix.get("blocked_ts")
+            if since is None:
+                continue
+            # #3288 : le débiteur est l'assigné ; `blocked_by` et `sha` servent
+            # le texte de l'alerte, pas la cible de l'escalade.
+            out.append(_row(step, since, now=now, critical=critical,
+                            blocked_by=str(fix.get("blocked_by") or ""),
+                            sha=str(fix.get("sha") or "")))
 
     handover = handover_ts(item, events)
     if handover is not None and state not in ("merged", "promoted", "closed"):
