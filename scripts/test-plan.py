@@ -1853,7 +1853,11 @@ def make_plan(event: str, card: dict | None, now: datetime.datetime | None = Non
                                        always)
         if chosen_set is not None:
             selected = [m for m in selected if m in chosen_set]
-        n = n_pr if lot else n_other
+        # #3343 : une sélection impactée garde les parts d'un lot ; dès que le
+        # plan retombe sur la suite complète (carte périmée, doute), il prend
+        # les parts de main. Trois parts psql ne tiennent pas sous le plafond
+        # de 60 min (run 40089991398 : psql 1/3 encore en cours à 60m).
+        n = n_pr if lot and chosen_set is not None else n_other
         if chosen_set is not None:
             n = min(n, lot_part_count(driver, selected, card))
         plan["parts"][driver] = [] if skip else split(selected, driver, n, card, classes)
@@ -1884,8 +1888,9 @@ def fallback_plan(event: str, error: str, base_ref: str | None = None,
     """The plan when planning itself failed: full suite, alphabetical order.
 
     The lot shape of `mode` is kept: a lot CI that cannot plan still runs the
-    full suite on both drivers, with the lot part counts and the psql pilot
-    list — never fewer parts than the impacted selection would have had.
+    full suite on both drivers, with the full-suite part counts (#3343) and the
+    psql pilot list — never fewer parts than the impacted selection would have
+    had.
     """
     base_ref = _env_ref("GITHUB_BASE_REF", base_ref)
     head_ref = _env_ref("GITHUB_HEAD_REF", head_ref)
@@ -1910,7 +1915,10 @@ def fallback_plan(event: str, error: str, base_ref: str | None = None,
             "doc_readers": [],
             "contract": [], "classes": {m: ["P3", ""] for m in modules}, "parts": {}}
     for driver, (n_pr, n_other) in PARTS.items():
-        n = n_pr if lot else n_other
+        # #3343 : le repli est toujours la suite complète, y compris pour une
+        # branche de lot : il prend les parts de main, sinon les trois parts
+        # psql d'un lot dépassent le plafond de 60 min.
+        n = n_other
         # no module list: scripts/test-parts.py splits the suite itself (L116)
         plan["parts"][driver] = [
             {"part": i, "of": n, "label": f"{driver} {i}/{n}", "modules": None,
@@ -1935,10 +1943,22 @@ def outputs(plan: dict) -> dict[str, str]:
 
 
 def annotations(plan: dict) -> list[str]:
-    sha = ((plan.get("map") or {}).get("commit") or "")[:12]
-    return [f"::notice file={u['file']},line={u['lines'][0]},endLine={u['lines'][1]},"
-            f"title=Changed lines without a test::{u['block']} changed and no test "
-            f"executes it (map {sha})" for u in plan.get("untested", [])]
+    lines = []
+    m = plan.get("map") or {}
+    age = m.get("age_h")
+    # #3343 : une carte de plus de 48 h ne reste plus silencieuse — le plan
+    # retombe sur la suite complète et chaque CI de lot paie le prix fort.
+    if age is not None and age > MAX_AGE_H:
+        lines.append(
+            f"::warning title=Carte de mesure périmée::carte vieille de {age:.0f} h "
+            f"(> {MAX_AGE_H} h, générée le {str(m.get('generated') or '')[:10]}) : "
+            "les lots retombent sur la suite complète ; relancer carte.yml")
+    sha = (m.get("commit") or "")[:12]
+    lines.extend(
+        f"::notice file={u['file']},line={u['lines'][0]},endLine={u['lines'][1]},"
+        f"title=Changed lines without a test::{u['block']} changed and no test "
+        f"executes it (map {sha})" for u in plan.get("untested", []))
+    return lines
 
 
 def _listing(items: list[str]) -> str:
@@ -1955,6 +1975,10 @@ def summary(plan: dict) -> str:
     else:
         state = "used" if m["used"] else f"not used: {m['problem']}"
         lines.append(f"* map `{(m['commit'] or '')[:12]}`, {m['age_h']} h old: {state}")
+        age = m.get("age_h")
+        if age is not None and age > MAX_AGE_H:
+            lines.append(f"* **carte périmée** : {age:.0f} h (> {MAX_AGE_H} h) — "
+                         "relancer `carte.yml` (#3343)")
     if plan["version_only"] or plan["docs_only"]:
         lines.append(f"* {plan['why']}: parts skipped"
                      + (f"; doc readers: {', '.join(plan['doc_readers'])}"
