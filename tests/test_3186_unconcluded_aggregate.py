@@ -28,6 +28,7 @@ from ameesh import fire, packet_automerge, radar, release_cutoff
 from . import test_2271_fire_required_checks as f2271
 from . import test_2448_release_cutoff as r2448
 from . import test_2813_packet_auto_merge as banc
+from . import test_3244_release_optional_jobs as t3244
 from . import test_l160g_nexlink as l160g
 
 SLUG = "manaty/ameesh"
@@ -107,7 +108,17 @@ class RerunTest(unittest.TestCase):
         out = radar.rerun_unconcluded(SLUG, f2271.SHA, [("tests", 200), ("tests", 200)],
                                       gh=gh)
         self.assertEqual([row["result"] for row in out], ["rerun"])
-        self.assertEqual(gh.reruns(), [["run", "rerun", "200", "--failed", "--repo", SLUG]])
+        # B2 impl-04 : `--failed` ne rejoue pas un job annulé ; le run entier
+        self.assertEqual(gh.reruns(), [["run", "rerun", "200", "--repo", SLUG]])
+
+    def test_every_never_concluded_run_is_rerun_in_full(self):
+        for conclusion in ("cancelled", "timed_out", "startup_failure", "stale", "failure"):
+            with self.subTest(conclusion=conclusion):
+                gh = RunsGh({200: _run_row(conclusion=conclusion)})
+                out = radar.rerun_unconcluded(SLUG, f2271.SHA, [("tests", 200)], gh=gh)
+                self.assertEqual(out[0]["result"], "rerun")
+                [call] = gh.reruns()
+                self.assertNotIn("--failed", call)
 
     def test_a_run_already_rerun_is_not_rerun_again(self):
         gh = RunsGh({200: _run_row(attempt=2)})
@@ -439,8 +450,7 @@ class PacketTest(banc.Journal):
                 self.assertEqual(out["result"], "pending", out)
                 self.assertIn("never concluded", out["why"])
                 self.assertEqual([row["result"] for row in out["reruns"]], ["rerun"])
-                self.assertEqual(gh.reruns(), [["run", "rerun", "200", "--failed",
-                                                "--repo", banc.SLUG]])
+                self.assertEqual(gh.reruns(), [["run", "rerun", "200", "--repo", banc.SLUG]])
                 self.assertEqual(gh.merges(), [])
                 self.assertEqual(self.created, [])
                 self.assertTrue(any("#128512" in note for note in self.notes()))
@@ -563,6 +573,7 @@ class CommitCiTest(unittest.TestCase):
                                 required=(("tests", 15368),))
                 self.assertIn("tests", out["failed"])
                 self.assertEqual(out["negative"], ["tests"])
+                self.assertEqual(out["required_negative"], ["tests"])
                 self.assertFalse(out["green"])
                 self.assertFalse(release_cutoff.reading_is_green(out))
 
@@ -597,6 +608,43 @@ class CommitCiTest(unittest.TestCase):
         out = self.read([l160g._run("tests")], [_actions_check("tests", "success"), other],
                         required=(("tests", 99),))
         self.assertEqual(out["unconcluded"], [{"check": "tests", "databaseId": None}])
+
+
+class AmeeshReleaseReadingTest(unittest.TestCase):
+    """B3 d'impl-04 : à la release ameesh, le requis rouge d'une suite que la
+    lecture job par job ne choisit pas reste négatif — le filtre des
+    workflows reclassés (`tests`, `paquet`, `macos`) ne l'efface pas."""
+
+    project = release_cutoff.ProjectRelease("ameesh", "/unused", github="acme/project")
+
+    def read(self, checks):
+        real = radar.commit_ci
+        runs = [l160g._run("A"), l160g._run("B")]
+        green = t3244.suite(mac="success")
+        with mock.patch.object(release_cutoff, "required_checks",
+                               return_value=(("tests", 15368),)), \
+                mock.patch.object(release_cutoff.radar, "commit_ci",
+                                  side_effect=lambda target, sha, **kw: real(
+                                      target, sha, gh=l160g._Gh(runs, checks=checks), **kw)), \
+                mock.patch.object(release_cutoff, "suite_reading", return_value=green):
+            return release_cutoff.ci_reading(self.project, "a" * 40)
+
+    def test_a_red_required_check_of_another_suite_holds_the_release(self):
+        red = _actions_check("tests", "failure", run=430, check_id=5)
+        green = _actions_check("tests", "success", run=431, check_id=6)
+        for checks in ([red, green], [green, red]):
+            with self.subTest(first=checks[0]["conclusion"]):
+                reading = self.read(checks)
+                self.assertIn("tests", reading["negative"])
+                self.assertFalse(reading["acceptable"])
+                self.assertFalse(reading["green"])
+                self.assertFalse(release_cutoff.reading_is_green(reading))
+
+    def test_green_required_checks_still_release(self):
+        reading = self.read([_actions_check("tests", "success", run=430, check_id=5),
+                             _actions_check("tests", "success", run=431, check_id=6)])
+        self.assertEqual(reading["negative"], [])
+        self.assertTrue(release_cutoff.reading_is_green(reading), reading)
 
 
 class ReleaseTest(r2448.ReleaseFixtureMixin, unittest.TestCase):

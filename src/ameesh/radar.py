@@ -1893,9 +1893,10 @@ def rerun_unconcluded(slug: str, head: str, runs, *, gh, dry_run: bool = False,
     relance) ».
 
     `runs` : des paires `(libellé, run_id | None)`. Chaque run est relu
-    (`actions/runs/<id>`) puis relancé — `gh run rerun <id> --failed` : ses
-    jobs non conclus et leurs dépendants, l'agrégat compris — seulement s'il
-    porte la tête `head`, s'il est terminé et à son premier essai. Un run déjà
+    (`actions/runs/<id>`) puis relancé en entier — `gh run rerun <id>` :
+    `--failed` ne rejoue que les jobs FAILURE, pas un job annulé, expiré ou
+    jamais démarré (B2 d'impl-04) — seulement s'il porte la tête `head`, s'il
+    est terminé et à son premier essai. Un run déjà
     relancé (essai ≥ 2, par ameesh ou par `relance hosted`) ne l'est plus :
     la relance a coûté sa fois, la preuve manque toujours et le dire suffit.
     Aucune issue ne rouvre la porte : seule une conclusion la rouvre.
@@ -1949,7 +1950,7 @@ def rerun_unconcluded(slug: str, head: str, runs, *, gh, dry_run: bool = False,
                             % run_id))
         else:
             try:
-                code, _text, err = _gh_call(gh, ["run", "rerun", str(run_id), "--failed",
+                code, _text, err = _gh_call(gh, ["run", "rerun", str(run_id),
                                                  "--repo", slug])
             except (OSError, ValueError, TypeError) as exc:
                 code, err = 1, str(exc)
@@ -2051,7 +2052,8 @@ def commit_ci(project: Project, sha: str, gh=None, *, branch: str | None = None,
     un requis qui n'a pas conclu lui-même est dans `unconcluded`
     (`[{check, databaseId}]`, le run à relancer) — preuve absente, jamais
     `acceptable` (décision owner #128512). Un run ou un check hors des requis
-    qui n'a pas conclu reste non concluant (§3)."""
+    qui n'a pas conclu reste non concluant (§3). `required_negative` nomme les
+    requis rouges : la release ne les reclasse jamais (B3 d'impl-04)."""
     from datetime import datetime
     from . import plan_github
     slug = github_slug(project)
@@ -2236,7 +2238,7 @@ def commit_ci(project: Project, sha: str, gh=None, *, branch: str | None = None,
     # consigné. `green` garde son sens strict, `acceptable` porte la règle.
     negative = sorted({name for name, result in results
                        if result == CI_NEGATIVE_RESULT})
-    unconcluded = []
+    unconcluded, required_negative = [], []
     for name, app_id in wanted:
         rows = [check for (app, _suite, check_name), (_rank, check)
                 in sorted(required_latest.items())
@@ -2244,6 +2246,7 @@ def commit_ci(project: Project, sha: str, gh=None, *, branch: str | None = None,
         if any(conclusion_result(c.get("status"), c.get("conclusion")) == CI_NEGATIVE_RESULT
                for c in rows):
             negative = sorted(set(negative) | {name})
+            required_negative.append(name)
             # B1 cx2 (#3186) : le requis rouge d'une suite homonyme est un
             # échec, même quand chaque workflow se dit vert ; `failed` le
             # nomme, et `green` tombe avec lui.
@@ -2264,7 +2267,7 @@ def commit_ci(project: Project, sha: str, gh=None, *, branch: str | None = None,
     return {"runs": count, "green": bool(count) and not pending and not failed and not missing
             and not unconcluded,
             "acceptable": acceptable, "negative": negative, "inconclusive": inconclusive,
-            "unconcluded": unconcluded,
+            "unconcluded": unconcluded, "required_negative": sorted(set(required_negative)),
             "pending": sorted(pending), "failed": sorted(failed), "missing": missing,
             "contexts": contexts, "statuses": status_contexts}
 

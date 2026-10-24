@@ -492,6 +492,11 @@ def ci_reading(project: "ProjectRelease", sha: str) -> dict:
         negative = [name for name in reading.get("negative", ()) if name not in managed]
         pending = [name for name in reading.get("pending", ()) if name not in managed]
         inconclusive = [name for name in reading.get("inconclusive", ()) if name not in managed]
+        # B3 d'impl-04 (#3186) : le filtre vise les rollups reclassés job par
+        # job, pas un check requis rouge — celui d'une autre suite que la
+        # tentative lue ci-dessous resterait sinon masqué.
+        negative += [name for name in reading.get("required_negative", ())
+                     if name not in negative]
         for attempt in _suite_runs(suite, run):
             for job in attempt["jobs"]:
                 label = "%s (%s; %s)" % (
