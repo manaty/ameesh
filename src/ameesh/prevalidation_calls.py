@@ -66,6 +66,12 @@ JOURNAL_PREFIX = "prevalidation"
 #: artefact de la mesure carte (#161e) publié par `.github/workflows/carte.yml`
 CARTE_WORKFLOW = "carte.yml"
 CARTE_ARTIFACT = "carte"
+#: #3352 : la carte se lit sur la **cible** (`main`), jamais sur un run de PR.
+#: Depuis #3343, `carte.yml` tourne aussi sur `pull_request` ; sans ce filtre,
+#: un run vert de PR fournissait un artefact à la tête de PR, non ancêtre de
+#: la cible, que `scripts/test-plan.py` refusait ensuite (`card-stale`)
+#: jusqu'au prochain run carte de `main`.
+CARTE_BRANCH = "main"
 #: #2644/N dev1 : la prévalidation du train tourne avant `_held()`, mais le
 #: bail de la cible (land.LOCK_TTL_S, 1800 s par défaut) court déjà. Ces deux
 #: plafonds bornent le plan et le run ; ils ne composent pas une borne du
@@ -247,10 +253,11 @@ def map_for(repo_slug: str, repo: str = "", *, explicit: str = "",
     Rend ``(chemin, répertoire à nettoyer)`` ; ``("", "")`` quand aucune carte
     n'est disponible (le plan retombera sur la suite complète, et la
     prévalidation refusera). Un artefact de la dernière exécution carte verte
-    est téléchargé dans un répertoire temporaire : la fraîcheur et l'ascendance
-    de son commit restent vérifiées par ``scripts/test-plan.py``, jamais
-    supposées ici. Avec ``deadline``, les deux appels réseau ne prennent que le
-    temps qui reste au passage (#2665).
+    de ``CARTE_BRANCH`` est téléchargé dans un répertoire temporaire : la
+    fraîcheur et l'ascendance de son commit restent vérifiées par
+    ``scripts/test-plan.py``, jamais supposées ici. Le filtre ``--branch``
+    exclut les runs de PR (#3352). Avec ``deadline``, les deux appels réseau
+    ne prennent que le temps qui reste au passage (#2665).
     """
     text = (explicit or "").strip()
     if text:
@@ -266,7 +273,8 @@ def map_for(repo_slug: str, repo: str = "", *, explicit: str = "",
         return "", ""
     try:
         listed = runner(["gh", "run", "list", "--repo", slug, "--workflow",
-                         CARTE_WORKFLOW, "--status", "success", "--limit", "1",
+                         CARTE_WORKFLOW, "--branch", CARTE_BRANCH,
+                         "--status", "success", "--limit", "1",
                          "--json", "databaseId"], capture_output=True, text=True,
                         timeout=deadline.timeout(30) if deadline is not None else 30)
         if listed.returncode:
