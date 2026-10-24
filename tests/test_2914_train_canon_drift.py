@@ -229,9 +229,21 @@ class WatchTest(unittest.TestCase):
         recipient, body, state = self.sent[0]
         self.assertIn("train.projects.ameesh.canon_commit", body)
         self.assertIn("#1467", body)
+        self.assertIn("qualifier le commit de la porte", body)
         self.gate = ("c" * 40, "")
         self.watch.alert(None, self.watch.read(None), "shadow")
         self.assertEqual(len(self.sent), 2)
+
+    def test_rule_gap_mail_does_not_ask_to_requalify_the_commit(self):
+        self.gate = (PIN, "")
+        self.watch.rules = lambda db: "light_reviews porte 1 / train 0"
+        reading = self.watch.read(None)
+        self.assertEqual((reading.state, reading.gate), (train_canon.DRIFT, PIN))
+        self.assertEqual(self.watch.alert(None, reading, "shadow"), "mesh-design")
+        body = self.sent[0][1]
+        self.assertIn("rien à requalifier", body)
+        self.assertIn("light_reviews porte 1 / train 0", body)
+        self.assertNotIn("qualifier le commit de la porte", body)
 
     def test_aligned_sends_nothing_and_reader_failure_is_unknown(self):
         self.gate = (PIN, "")
@@ -315,6 +327,24 @@ class ShadowDriftTest(unittest.TestCase):
         self.assertEqual(result["plan"]["canon"]["state"], "aligned")
         self.assertEqual(self.sent, [])
         self.assertEqual(self.notices, [])
+
+    def test_a_gap_appearing_after_the_plan_rewrites_plan_canon(self):
+        self.gate = (PIN, "")
+        self.shadow.scheduled_step(None, 10_000.0)
+        plan = self.shadow.store.load()["plans"][-1]
+        self.assertEqual(plan["canon"]["state"], "aligned")
+        self.gate = (GATE, "")
+        result, _ = self.shadow.scheduled_step(None, 10_000.0)
+        self.assertEqual(result["result"], "shadow-idle")
+        plan = self.shadow.store.load()["plans"][-1]
+        self.assertEqual((plan["cutoff"], plan["canon"]["state"]), (9_940.0, "drift"))
+        self.assertEqual(plan["canon"]["gate"], GATE)
+        self.assertEqual(self.sent, ["pilot"])
+        self.gate = (PIN, "")
+        self.shadow.scheduled_step(None, 10_000.0)
+        plan = self.shadow.store.load()["plans"][-1]
+        self.assertEqual(plan["canon"]["state"], "aligned")
+        self.assertEqual(self.sent, ["pilot"])
 
 
 class ActiveDriftTest(unittest.TestCase):

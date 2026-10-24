@@ -234,6 +234,7 @@ class Passage:
                 state = self.store.record_plan(state, plan)
                 result = {"result": "shadow-plan", "plan": plan}
             else:
+                state = self.refresh_canon(state, reading)
                 result = {"result": "shadow-idle"}
         except Exception as exc:  # a transient Git/SQL failure never stalls the clock
             self.notify("shadow plan failed (%s: %s)" % (type(exc).__name__, exc))
@@ -259,6 +260,28 @@ class Passage:
             self.notify("shadow canon %s" % reading.describe())
             self.canon.alert(db, reading, "shadow")
         return reading
+
+    def refresh_canon(self, state, reading):
+        """#3349: keep the latest plan's canon reading current.
+
+        The plan is recorded once per slot; the gate's reading can start
+        differing (or converge) after that, when a canon is synced or another
+        configured canon moves. The alert already follows the reading at each
+        passage; the published plan must not keep the one read at the cutoff.
+        """
+        if reading is None or not state["plans"]:
+            return state
+        current = reading.to_json()
+        plans = list(state["plans"])
+        if plans[-1].get("canon") == current:
+            return state
+        plan = dict(plans[-1])
+        plan["canon"] = current
+        plans[-1] = plan
+        document = dict(state)
+        document["plans"] = plans
+        self.store.save(document)
+        return document
 
     def incident_facts(self, db, *, fallback=None):
         """#2682: « aucun fait de train » pour l'ombre, et jamais une levée.
