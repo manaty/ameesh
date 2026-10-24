@@ -10544,6 +10544,9 @@ class Runner:
                 actor="runner:%s" % self.runner_id, busy=busy, agents_in_turn=en_tour,
                 runtime=self.container_runtime(),
                 min_interval_s=min_interval_s,
+                # #3293 : au seuil de pause (disque presque plein), le ménage
+                # libère les caches au lieu d'attendre le quota.
+                free_target=int((self._host_limits or {}).get("min_disk_free") or 0),
                 # L230: the worktrees are walked at most every few hours
                 artifact_scan=build_artifacts.due(time.time()))
             self.expire_threads_once(db)

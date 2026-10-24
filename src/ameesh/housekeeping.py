@@ -27,9 +27,12 @@ l'humain. Chaque famille a sa règle :
   `<cache_root>/<nom>`. Partagés entre agents (un store pnpm par agent
   multiplierait le disque), bornés par un quota global, évincés du plus
   ancien au plus récent, et jamais pendant un tour de l'hôte (un store pnpm
-  modifié sous une installation casse l'installation). Une variable déjà
-  posée dans l'environnement de l'exécuteur est respectée : c'est un choix
-  de l'hôte.
+  modifié sous une installation casse l'installation) — sauf le cache npm,
+  fait de copies, qui peut partir pendant un tour quand aucun npm ne tourne
+  et que rien ne le tient (#3293). Sous pression disque (espace libre sous le
+  `min_disk_free` de l'hôte), l'éviction libère en plus le déficit, même
+  sous le quota. Une variable déjà posée dans l'environnement de l'exécuteur
+  est respectée : c'est un choix de l'hôte.
 * **Worktrees** : ceux qui APPARAISSENT pendant un tour (diff de `git
   worktree list` avant/après, sous-agents compris) sont enregistrés avec
   l'agent, le tour et le lot — s'ils sont sous le dossier de travail de
@@ -532,6 +535,28 @@ def agent_tmp(cfg, policy: Policy, agent: str) -> str:
 
 def cache_names(policy: Policy) -> list[tuple[str, tuple[str, ...]]]:
     return list(CACHES) + ([XDG_CACHE] if policy.xdg_cache else [])
+
+
+#: gestionnaires de paquets dont le cache est partagé (le titre de leur
+#: processus les nomme : « npm install … », « pnpm add … »)
+PACKAGE_MANAGERS = ("npm", "pnpm", "yarn")
+
+
+def package_managers_running() -> set[str]:
+    """#3293: les gestionnaires de paquets qui tournent sur l'hôte, d'après le
+    titre de leur processus (`process.title` : `npm install …`, tronqué à 15
+    caractères par le noyau). Un relevé illisible est un doute : tous sont
+    dits en cours, et rien n'est évincé sous un tour."""
+    try:
+        rows = platform.process_table()
+    except Exception:  # noqa: BLE001 - un passage de ménage ne lève jamais
+        return set(PACKAGE_MANAGERS)
+    found: set[str] = set()
+    for row in rows:
+        head = (row.get("name") or "").strip().split(" ", 1)[0].lower()
+        if head in PACKAGE_MANAGERS:
+            found.add(head)
+    return found
 
 
 def _conninfo_fields(dsn: str) -> dict[str, str]:
@@ -1337,12 +1362,20 @@ def _removable(path: str, uid: int | None, writable: dict) -> bool:
 
 
 def evict_lru(directories: list[str], root: str, quota: int, *, now: float | None = None,
-              min_age: float = EVICT_MIN_AGE_S, dry_run: bool = False) -> dict:
+              min_age: float = EVICT_MIN_AGE_S, dry_run: bool = False,
+              evict_at_least: int = 0) -> dict:
     """Éviction du plus ancien (mtime) au plus récent, jusqu'au quota.
 
     Un fichier modifié depuis moins de `min_age` n'est jamais évincé (il est
     peut-être en écriture) : le quota peut donc rester dépassé, et c'est dit
     (`over_quota`).
+
+    #3293 : `evict_at_least` évince aussi jusqu'à libérer au moins ces
+    octets, même quand le total tient déjà dans le quota — une pression
+    disque se traite en libérant ce qu'il faut, pas seulement au-delà d'un
+    plafond. L'éviction s'arrête quand les deux conditions tiennent (quota
+    respecté et octets libérés) ; un fichier trop récent ou irrécupérable
+    l'arrête comme avant, et `over_quota` ne dit que le quota.
 
     #500: only what this pass can remove counts toward the quota (owned by
     us, directory writable, outside a git work tree); the rest is reported
@@ -1431,16 +1464,18 @@ def evict_lru(directories: list[str], root: str, quota: int, *, now: float | Non
             else:
                 candidates.append(item)
         counted = before - unremovable
-    if not truncated and before > quota:
+    if not truncated and (before > quota or evict_at_least > 0):
         if not dry_run and not _managed(root):
             raise RefusedDeletion("%s is not a directory managed by ameesh" % root)
-        blocked = unremovable > quota
+        # #3293 : sous pression disque, des octets irrécupérables au-delà du
+        # quota n'interdisent pas de libérer ce qui peut l'être (le déficit).
+        blocked = unremovable > quota and evict_at_least <= 0
         protected: list[str] = []      # #500 r3: subtrees a stale candidate protects
         uncounted: set = set()         # #500 r5: candidates already out of `counted`
         handled: set = set()          # #1190: dry-run inodes already processed
         order = sorted(candidates, key=lambda item: item[2])
         for index, (path, size, mtime, st) in enumerate(order):
-            if blocked or counted <= quota:
+            if blocked or (counted <= quota and evicted >= evict_at_least):
                 break
             if any(_in_subtree(path, d) for d in protected):
                 # #500 r4 (codex P2 r3): the subtree became protected during
@@ -3985,13 +4020,19 @@ def tmp_problem(path: str, owner: str | None, key: str, *, registered: bool,
 def run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool = False,
              busy: bool = False, agents_in_turn: set | None = None,
              now: float | None = None,
-             runtime=None, artifact_scan: bool = True, min_interval_s: float = 0.0) -> dict:
+             runtime=None, artifact_scan: bool = True, min_interval_s: float = 0.0,
+             free_target: int = 0) -> dict:
     """One host pass across all runners and the CLI, without waiting.
 
     Periodic callers share the last completed pass's timestamp, under the
     same stable OS lock. An explicit or pressure-triggered pass bypasses the
     interval; dry runs never postpone real cleanup. Nothing is cached about
     whether a path may be deleted.
+
+    #3293: `free_target` is the free space (bytes) the cache's filesystem
+    should keep — the host's `min_disk_free`, the pause threshold. Under it,
+    the caches are evicted enough to free the deficit, the npm cache even
+    during a turn when no npm runs.
     """
     from .platform import session_lock
 
@@ -4026,7 +4067,8 @@ def run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool = 
                                % min_interval_s)
         report = _run_pass(cfg, db, policy, host=host, actor=actor, dry_run=dry_run,
                            busy=busy, agents_in_turn=agents_in_turn, now=now,
-                           runtime=runtime, artifact_scan=artifact_scan)
+                           runtime=runtime, artifact_scan=artifact_scan,
+                           free_target=free_target)
         if not dry_run and not report.get("disabled"):
             completed_passes[key] = time.time() if now is None else float(now)
             lock.seek(0)
@@ -4041,13 +4083,17 @@ def run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool = 
 def _run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool = False,
               busy: bool = False, agents_in_turn: set | None = None,
               now: float | None = None,
-              runtime=None, artifact_scan: bool = True) -> dict:
+              runtime=None, artifact_scan: bool = True,
+              free_target: int = 0) -> dict:
     """Un passage de ménage sur CET hôte ; rend le rapport.
 
     * dossiers temporaires : quota par agent (sauf agent en tour) ; dossier
       d'un agent absent du registre supprimé ;
     * caches partagés : éviction jusqu'au quota, seulement si aucun tour ne
-      tourne (`busy` faux) ;
+      tourne (`busy` faux) — sauf le cache npm pendant un tour, quand aucun
+      npm ne tourne et que rien ne le tient (#3293) ; sous pression disque
+      (`free_target`, espace libre à préserver), l'éviction libère en plus le
+      déficit ;
     * worktrees suivis dont le lot est fini : retirés s'ils sont propres et
       intégrés (garde-fous de `_worktree_pass`), sinon gardés et signalés ;
       #1665 : un worktree orphelin (aucun lot nommé, ou lot fini sans
@@ -4318,33 +4364,83 @@ def _run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool =
                 entries.append({"kind": "tmp", "action": "gone", "path": path,
                                 "detail": "unowned temporary directory gone"})
     # 2. caches partagés
-    directories = [os.path.join(croot, name) for name, _v in cache_names(policy)]
-    if busy:
-        skipped.append("caches: a turn is in progress on the host, eviction postponed")
-    elif os.path.isdir(croot) and _managed(croot):
-        result = evict_lru(directories, croot, policy.cache_quota, now=now, dry_run=dry_run)
-        if result["files"]:
-            plan.append({"kind": "cache", "path": croot, "action": "éviction",
-                         "bytes": result["evicted"],
-                         "detail": "%d file(s), quota %s" % (
-                             result["files"], resources_mod.fmt_value("q", policy.cache_quota))})
-            if not dry_run:
-                entries.append({"kind": "cache", "action": "evicted", "path": croot,
-                                "bytes": result["evicted"],
-                                "detail": "quota %s: %d oldest file(s) evicted"
-                                          % (resources_mod.fmt_value("q", policy.cache_quota),
-                                             result["files"])})
-        if result.get("mounts_unreadable"):
-            skipped.append("caches: mount table unreadable (platform layer), "
-                           "nothing evicted")
-        elif result["truncated"]:
-            skipped.append("caches: listing truncated (%s file limit), nothing evicted"
-                           % WALK_LIMIT)
-        elif result["blocked"]:
-            skipped.append("caches: quota held by %s this pass cannot remove, nothing evicted"
-                           % resources_mod.fmt_value("q", result["unremovable"]))
-        elif result["over_quota"]:
-            skipped.append("caches: quota still exceeded (files less than an hour old)")
+    # #3293 : sous pression disque (moins que `free_target` libre sur le
+    # système du cache), libérer au moins le déficit — et, pour le cache npm
+    # (copies, pas un store à liens durs), sans attendre qu'aucun tour ne
+    # tourne : il suffit qu'aucun npm ne tourne et que rien ne le tienne.
+    deficit = 0
+    free = None
+    if free_target > 0 and os.path.isdir(croot):
+        try:
+            free = shutil.disk_usage(croot).free
+        except OSError:
+            free = None
+        if free is not None and free < int(free_target):
+            deficit = int(free_target) - int(free)
+    directories: list[str] = []
+    if os.path.isdir(croot) and _managed(croot):
+        managers = None
+        busy_said = False
+        for name, _variables in cache_names(policy):
+            full = os.path.join(croot, name)
+            if not os.path.isdir(full) or os.path.islink(full):
+                continue
+            if name == "npm":
+                if managers is None:
+                    managers = package_managers_running()
+                if "npm" in managers:
+                    skipped.append("cache npm kept: npm is running on the host")
+                    continue
+                held = held_by_user(full)
+                if held:
+                    skipped.append("cache npm kept: %s (no eviction)" % held)
+                    continue
+                directories.append(full)
+            elif busy:
+                if not busy_said:
+                    skipped.append("caches: a turn is in progress on the host, "
+                                   "eviction postponed")
+                    busy_said = True
+            else:
+                directories.append(full)
+        if directories:
+            result = evict_lru(directories, croot, policy.cache_quota, now=now,
+                               dry_run=dry_run, evict_at_least=deficit)
+            detail = "%d file(s), quota %s" % (
+                result["files"], resources_mod.fmt_value("q", policy.cache_quota))
+            if deficit:
+                detail += ", %s freed under disk pressure (%s needed)" % (
+                    resources_mod.fmt_value("q", result["evicted"]),
+                    resources_mod.fmt_value("q", deficit))
+            if result["files"]:
+                plan.append({"kind": "cache", "path": croot, "action": "éviction",
+                             "bytes": result["evicted"], "detail": detail})
+                if not dry_run:
+                    entries.append({"kind": "cache", "action": "evicted", "path": croot,
+                                    "bytes": result["evicted"],
+                                    "detail": "quota %s: %d oldest file(s) evicted%s"
+                                              % (resources_mod.fmt_value("q", policy.cache_quota),
+                                                 result["files"],
+                                                 " (disk pressure)" if deficit else "")})
+            if result.get("mounts_unreadable"):
+                skipped.append("caches: mount table unreadable (platform layer), "
+                               "nothing evicted")
+            elif result["truncated"]:
+                skipped.append("caches: listing truncated (%s file limit), nothing evicted"
+                               % WALK_LIMIT)
+            elif result["blocked"]:
+                skipped.append("caches: quota held by %s this pass cannot remove, nothing evicted"
+                               % resources_mod.fmt_value("q", result["unremovable"]))
+            elif result["over_quota"]:
+                skipped.append("caches: quota still exceeded (files less than an hour old)")
+            if deficit and not (result.get("mounts_unreadable") or result["truncated"]
+                                or result["evicted"] >= deficit):
+                # ce qui reste libre après l'éviction, pour dire l'écart
+                left = (free + result["evicted"]) if free is not None else 0
+                skipped.append("caches: disk pressure persists (%s free under %s target), "
+                               "%s freed" % (resources_mod.fmt_value("q", left),
+                                             resources_mod.fmt_value("q", int(free_target)),
+                                             resources_mod.fmt_value("q", result["evicted"])))
     # 2b. #248: node_modules shared per lockfile, entries no worktree links to
     if policy.deps and registered is None:
         skipped.append("deps: registry unreadable, worktrees unknown, nothing deleted")
@@ -4675,6 +4771,10 @@ def cmd_housekeeping(cfg, args) -> int:
         except Exception:
             canons = []
         policy = effective(canons, host)
+        try:
+            limits = resources_mod.host_limits(canons, host)["limits"]
+        except Exception:  # un canon illisible ne bloque pas la commande
+            limits = {}
         busy = False
         if apply:
             try:
@@ -4685,6 +4785,9 @@ def cmd_housekeeping(cfg, args) -> int:
         from . import containers as containers_mod
         report = run_pass(cfg, db, policy, host=host, actor=actor, dry_run=not apply,
                           busy=busy,
+                          # #3293 : le seuil de pause disque de l'hôte
+                          # déclenche l'éviction des caches sous pression.
+                          free_target=int(limits.get("min_disk_free") or 0),
                           runtime=containers_mod.Runtime.from_config(cfg))
         if getattr(args, "json", False):
             print(json.dumps(dict(report, schema="ameesh-menage/1"), ensure_ascii=False,
