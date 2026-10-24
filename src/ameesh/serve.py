@@ -71,7 +71,7 @@ import time
 import urllib.parse
 from typing import Callable
 
-from . import __version__, events, httpkit, serve_actions, storage
+from . import events, httpkit, serve_actions, storage, version
 from . import db as db_mod
 
 BIND = "127.0.0.1"
@@ -447,7 +447,7 @@ def match_action(path: str) -> tuple[serve_actions.Action, dict] | None:
 def discovery(ctx: Context) -> dict:
     """`GET /.well-known/ameesh` (study §3)."""
     return {"schema": "ameesh-discovery/1", "organisation": ctx.organisation,
-            "api": API, "versions": ["v1"], "version": __version__, "mode": "local",
+            "api": API, "versions": ["v1"], "version": version(), "mode": "local",
             "oidc_issuer": None, "approve_url": getattr(ctx.cfg, "approve_url", None) or None,
             "languages": list(LANGUAGES), "openapi": OPENAPI_PATH}
 

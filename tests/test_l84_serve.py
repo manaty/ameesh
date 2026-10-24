@@ -23,6 +23,7 @@ from pathlib import Path
 from ameesh import db as db_mod
 from ameesh import fil, httpkit, mesh_cli, registry, serve, storage, work
 from ameesh import resources as res
+from ameesh import version as package_version
 
 from .support import PgTestCase
 from .test_l159a_capacity_guard import errors as schema_errors
@@ -138,6 +139,9 @@ class DefencesTest(ServerMixin, unittest.TestCase):
         self.assertEqual(schema_errors(serve.SCHEMAS["ameesh-discovery/1"], data), [])
         self.assertEqual((data["organisation"], data["api"], data["approve_url"]),
                          ("Example", "/api/v1", "https://approve.example"))
+        # #3394: the discovery version is the package version, not the frozen
+        # ACP protocol number of `ameesh.__version__`.
+        self.assertEqual(data["version"], package_version())
         status, data = self.get_json("/api/v1/openapi.json", auth=False)
         self.assertEqual((status, data), (200, serve.openapi()))
 
