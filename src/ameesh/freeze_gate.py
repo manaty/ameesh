@@ -616,16 +616,17 @@ def milestone(
 
     `supersedes` (#2989, #3399) nomme un ou des gels antérieurs du même lot que
     ce gel **remplace** ; la note reçoit alors la ligne machine
-    [`FREEZE_SUPERSEDES_MARK`]. La lecture des auteurs (`review_authors`) ignore
-    un gel remplacé quand son commit n'est plus contenu par une ref du dépôt de
-    lecture : c'est la réparation d'un gel fantôme (un SHA erroné écrit avant la
-    validation de la CLI) ou d'un gel devenu objet pendant après un force-push
-    (#3399). Le remplacement est refusé si le SHA nommé est encore **contenu par
-    une ref** d'un dépôt connu : la marque ne vaut que pour un fantôme prouvé,
-    et un gel encore accessible ne s'efface pas. Un objet seulement présent
-    dans l'ODB, hors de toute ref, n'est plus un refus (#3399). Une ligne de
-    note fournie par l'appelant est retirée : la marque ne se contourne pas.
-    Seul `frozen` accepte `supersedes`.
+    [`FREEZE_SUPERSEDES_MARK`]. La lecture des auteurs (`review_authors`) garde
+    les auteurs **connus** d'un gel remplacé dont le commit n'est plus contenu
+    par une ref, et ne laisse plus bloquer ses seuls inconnus : c'est la
+    réparation d'un gel fantôme (un SHA erroné écrit avant la validation de la
+    CLI) ou d'un gel devenu objet pendant après un force-push (#3399). Le
+    remplacement est refusé si le SHA nommé est encore **contenu par une ref
+    locale ou distante** d'un dépôt connu : la marque ne vaut que pour un
+    fantôme prouvé, et un gel encore accessible ne s'efface pas. Un objet
+    seulement présent dans l'ODB, hors de toute ref, n'est plus un refus
+    (#3399). Une ligne de note fournie par l'appelant est retirée : la marque
+    ne se contourne pas. Seul `frozen` accepte `supersedes`.
 
     `on_frozen` (facultatif, #1617) : le callback du gel, appelé dans la
     transaction du jalon `frozen` avec `(tx, milestone, after_commit)`. Il
@@ -719,7 +720,8 @@ def milestone(
         # filtre générique de #2971 qui a déjà retiré toute marque fournie par
         # `--note` (blanc de tête compris). `replaced` ne porte que des gels
         # fantômes (SHA absent) ou devenus objets pendants après un force-push
-        # (présents dans l'ODB mais hors de toute ref), vérifiés ci-dessous.
+        # (présents dans l'ODB mais hors de toute ref locale et distante),
+        # vérifiés ci-dessous.
         if replaced:
             # #2989 : la déclaration ne vaut que pour un gel antérieur du même
             # lot (la ligne machine est écrite ici, jamais recopiée).
@@ -737,30 +739,16 @@ def milestone(
                 # #2989 (N1 de la revue dev2) : la marque ne vaut que pour un
                 # fantôme **prouvé**. #3399 : la présence de l'objet dans l'ODB
                 # n'est pas une preuve d'accessibilité — un force-push laisse le
-                # commit hors de toute ref. On refuse tant qu'une ref d'un dépôt
-                # connu le contient encore (le refus fermé B5 garde sa force
-                # pour un gel accessible) ; sinon le remplacement est permis.
+                # commit hors de toute ref. On refuse tant qu'une ref locale ou
+                # **distante** d'un dépôt connu le contient encore (le refus
+                # fermé B5 garde sa force pour un gel accessible) ; sinon le
+                # remplacement est permis.
                 if not replaced_sha:
                     continue
                 for where in known:
                     if not where or not freeze_checks.commit_in(where, replaced_sha):
                         continue
                     reachable = plan_git.ref_reachable(where, replaced_sha)
-                    if reachable is False and plan_git._out(
-                            where, "remote", "get-url", "origin"):
-                        # Une ref distante non rapatriée ne prouve pas
-                        # l'absence : on rafraîchit une fois avant de conclure.
-                        errors = plan_git.refresh_clone(where, "", refreshed)
-                        if errors.get("origin"):
-                            raise WorkError(
-                                "--supersedes %s: freeze %s is present in %s but "
-                                "its remote refs cannot be refreshed (%s) — cannot "
-                                "prove it is out of every ref (#2989/#3399)"
-                                % (freeze_id, replaced_sha[:12], where,
-                                   errors.get("origin")))
-                        reachable = plan_git.ref_reachable(where, replaced_sha)
-                    if reachable is False:
-                        continue
                     if reachable is None:
                         raise WorkError(
                             "--supersedes %s: freeze %s is present in %s and its "
@@ -768,12 +756,38 @@ def milestone(
                             "ref; refusing to replace a freeze that may still be "
                             "accessible (#2989/#3399)"
                             % (freeze_id, replaced_sha[:12], where))
-                    raise WorkError(
-                        "--supersedes %s: freeze %s is still reachable from a ref "
-                        "of %s — only a freeze absent from every known repository "
-                        "or kept out of every ref after a force-push (a proven "
-                        "ghost) can be replaced (#2989/#3399)"
-                        % (freeze_id, replaced_sha[:12], where))
+                    if reachable:
+                        raise WorkError(
+                            "--supersedes %s: freeze %s is still reachable from a "
+                            "ref of %s — only a freeze absent from every known "
+                            "repository or kept out of every ref after a force-push "
+                            "(a proven ghost) can be replaced (#2989/#3399)"
+                            % (freeze_id, replaced_sha[:12], where))
+                    # #3399 B1 : une ref **distante** non rapatriée (tag, branche
+                    # hors du refspec de fetch) ne se voit pas localement. On lit
+                    # l'annonce de chaque remote ; preuve impossible = refus.
+                    remotes = [
+                        name for name in plan_git._git_remotes(where)
+                        if plan_git._out(where, "remote", "get-url", name)]
+                    for remote in remotes:
+                        distant = plan_git.remote_reachable(
+                            where, replaced_sha, remote)
+                        if distant is None:
+                            raise WorkError(
+                                "--supersedes %s: freeze %s is present in %s but "
+                                "the remote refs of %s cannot be verified — cannot "
+                                "prove it is out of every ref; refusing to replace "
+                                "a freeze that may still be accessible "
+                                "(#2989/#3399)"
+                                % (freeze_id, replaced_sha[:12], where, remote))
+                        if distant:
+                            raise WorkError(
+                                "--supersedes %s: freeze %s is still reachable "
+                                "from a remote ref of %s (%s) — only a freeze "
+                                "absent from every known repository or kept out of "
+                                "every ref after a force-push (a proven ghost) can "
+                                "be replaced (#2989/#3399)"
+                                % (freeze_id, replaced_sha[:12], where, remote))
             note = (note + "\n" if note else "") + "\n".join(
                 "%s %d" % (FREEZE_SUPERSEDES_MARK, freeze_id)
                 for freeze_id in replaced)

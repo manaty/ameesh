@@ -202,18 +202,21 @@ def local_commit(repo: str, rev: str, *,
 
 #: #3399 : borner le relevé d'accessibilité d'un gel (revwalk sur les refs).
 REACHABLE_TIMEOUT_S = 30.0
+#: #3399 B1 : nombre de pointes distantes non locales qu'on accepte de
+#: rapatrier pour prouver l'absence ; au-delà, la preuve est impossible.
+REMOTE_TIP_FETCH_BUDGET = 16
 
 
 def ref_reachable(repo: str, rev: str, *,
                   timeout: float | None = REACHABLE_TIMEOUT_S) -> bool | None:
     """`rev` est-il contenu par une **ref** de `repo` (#3399) ?
 
-    `True` : au moins une ref (`refs/heads`, `refs/remotes`, `refs/tags`...)
-    contient le commit. `False` : l'objet est présent mais aucune ref ne le
-    contient — un « pendant » laissé par un force-push, qui n'est plus
-    accessible par une ref. `None` : dépôt ou SHA illisible (objet absent au
-    sens de git, git en échec, délai dépassé) : l'appelant ne conclut pas (le
-    gate refuse, la lecture garde le doute).
+    `True` : au moins une ref locale (`refs/heads`, `refs/remotes`,
+    `refs/tags`...) contient le commit. `False` : l'objet est présent mais
+    aucune ref ne le contient — un « pendant » laissé par un force-push, qui
+    n'est plus accessible par une ref. `None` : dépôt ou SHA illisible (objet
+    absent au sens de git, git en échec, délai dépassé) : l'appelant ne conclut
+    pas (le gate refuse, la lecture garde le doute).
 
     #2989 N1 distinguait la présence de l'objet (`freeze_checks.commit_in`,
     un `rev-parse` qui lit un objet pendant) de son accessibilité. #3399 : un
@@ -221,7 +224,10 @@ def ref_reachable(repo: str, rev: str, *,
     doit donc plus être refusé par la seule présence dans l'ODB. La lecture
     est locale et sans fetch paresseux (`for-each-ref --contains`, un seul
     processus) ; un délai ou un dépôt illisible rend `None`, jamais `False`.
-    """
+
+    Ne voit que les refs **locales** : les refs distantes non rapatriées
+    (tags, refspec restreint) sont couvertes par [`remote_reachable`] (#3399
+    B1)."""
     rev = str(rev or "").strip()
     if not repo or not rev or rev.startswith("-") or not os.path.isdir(repo):
         return None
@@ -234,6 +240,162 @@ def ref_reachable(repo: str, rev: str, *,
     if proc.returncode != 0:
         return None
     return bool(proc.stdout.strip())
+
+
+def _history_complete(repo: str) -> bool:
+    """Le dépôt porte-t-il une histoire complète (ni shallow ni partielle) ?
+
+    Une ascendance ne se prouve que sur une histoire complète : dans un clone
+    superficiel ou partiel, l'absence d'un ancêtre ne prouve pas qu'il n'est
+    pas dans la ref. Un dépôt illisible rend False (le doute refuse)."""
+    try:
+        shallow = _out(repo, "rev-parse", "--is-shallow-repository")
+        if str(shallow or "").strip().lower() == "true":
+            return False
+        promisor = _out(repo, "config", "--get-regexp", r"^remote\..*\.promisor$")
+        return not str(promisor or "").strip()
+    except Exception:  # noqa: BLE001 - dépôt illisible : preuve impossible
+        return False
+
+
+def _remote_tips(repo: str, remote: str, *,
+                 timeout: float | None = FETCH_TIMEOUT) -> list[str] | None:
+    """Les pointes (commits, tags pelées) des refs distantes heads/tags.
+
+    `ls-remote` lit l'annonce de la forge, **indépendamment du refspec de
+    fetch local** : une ref non rapatriée (tag, branche hors refspec) reste
+    visible (#3399 B1). Les tags annotés sont remplacés par leur cible pelée
+    (`^{}`). Rend None si l'annonce est illisible : la preuve d'absence est
+    alors impossible."""
+    try:
+        proc = _git(repo, "ls-remote", "--heads", "--tags", "--", remote,
+                    timeout=timeout)
+    except (GitError, OSError):
+        return None
+    if proc.returncode != 0:
+        return None
+    peeled: dict[str, str] = {}
+    refs: list[tuple[str, str]] = []
+    for line in proc.stdout.decode("utf-8", "replace").splitlines():
+        fields = line.split("\t", 1)
+        if len(fields) != 2:
+            continue
+        sha, ref = fields[0].strip().lower(), fields[1].strip()
+        if not sha or not ref:
+            continue
+        if ref.endswith("^{}"):
+            peeled[ref[:-3]] = sha
+        else:
+            refs.append((sha, ref))
+    tips: list[str] = []
+    for sha, ref in refs:
+        tip = peeled.get(ref, sha)
+        if tip not in tips:
+            tips.append(tip)
+    return tips
+
+
+def remote_reachable(repo: str, rev: str, remote: str = "origin", *,
+                     timeout: float | None = FETCH_TIMEOUT,
+                     budget: int = REMOTE_TIP_FETCH_BUDGET) -> bool | None:
+    """`rev` est-il contenu par une **ref distante** heads/tags de `remote` ?
+
+    #3399 B1 : `refresh_clone` ne rapatrie que le refspec configuré et jamais
+    les tags (`fetch --no-tags`) ; il ne prouve donc pas l'absence de toute
+    ref distante. On lit l'annonce complète (`ls-remote --heads --tags`,
+    indépendante du refspec), puis :
+
+    - une pointe (ou un tag pelé) **égale** au commit prouve qu'il est
+      accessible, même sans l'objet local ;
+    - une pointe locale est jugée par `merge-base --is-ancestor` ;
+    - une pointe absente est rapatriée par SHA exact (`--no-tags`, sans écrire
+      de ref) dans la limite de `budget`, puis jugée ;
+    - un nombre de pointes à rapatrier au-delà du budget, un `ls-remote` ou un
+      fetch illisible, un dépôt shallow/partiel : `None` (preuve impossible,
+      l'appelant refuse).
+
+    Rend True (accessible), False (aucune ref distante ne le contient, prouvé)
+    ou None (vérification impossible)."""
+    full = local_commit(repo, rev) or full_commit_id(rev)
+    if not full:
+        return None
+    tips = _remote_tips(repo, remote, timeout=timeout)
+    if tips is None:
+        return None
+    if full in tips:
+        return True
+    if not _history_complete(repo):
+        return None                 # l'ascendance ne se prouve pas
+    # Une pointe déjà pointée par une ref locale est couverte par
+    # `ref_reachable` (False ici) : inutile de la rejouer, et une forge peut
+    # annoncer des milliers de branches. On ne juge ensuite que les pointes
+    # hors de ces refs (tags, refspec restreint).
+    try:
+        listing = _out(repo, "for-each-ref",
+                       "--format=%(objectname) %(*objectname)")
+    except Exception:  # noqa: BLE001 - refs illisibles : preuve impossible
+        return None
+    if listing is None:
+        return None
+    local: set[str] = set()
+    for line in str(listing).splitlines():
+        local.update(line.split())
+    candidates = [tip for tip in tips if tip not in local]
+    if not candidates:
+        return False
+    # Présence locale en un seul processus (`cat-file --batch-check`), puis
+    # ascendance. Un objet absent est rapatrié par SHA exact, dans la limite.
+    try:
+        proc = _git(repo, "cat-file", "--batch-check",
+                    stdin=("\n".join(candidates) + "\n").encode())
+    except (GitError, OSError):
+        return None
+    if proc.returncode != 0:
+        return None
+    kinds: dict[str, str] = {}
+    for line in proc.stdout.decode("utf-8", "replace").splitlines():
+        fields = line.split()
+        if len(fields) >= 2:
+            kinds[fields[0].strip().lower()] = fields[1].strip()
+    pending: list[str] = []
+    for tip in candidates:
+        kind = kinds.get(tip)
+        if kind is None:
+            return None             # réponse incohérente : preuve impossible
+        if kind == "missing":
+            pending.append(tip)
+            continue
+        if kind == "tag":
+            commit = local_commit(repo, tip)
+            if commit is None:
+                pending.append(tip)
+                continue
+        elif kind == "commit":
+            commit = tip
+        else:
+            continue                # arbre/blob : ne contient aucun commit
+        if commit == full or _is_ancestor(repo, full, commit):
+            return True
+    if not pending:
+        return False
+    if len(pending) > budget:
+        return None                 # trop de pointes inconnues : preuve impossible
+    for start in range(0, len(pending), 8):
+        chunk = pending[start:start + 8]
+        try:
+            proc = _git(repo, "fetch", "--quiet", "--no-tags",
+                        "--no-write-fetch-head", "--", remote, *chunk,
+                        timeout=timeout)
+        except (GitError, OSError):
+            return None
+        if proc.returncode != 0:
+            return None
+    for tip in pending:
+        commit = local_commit(repo, tip)
+        if commit is not None and (
+                commit == full or _is_ancestor(repo, full, commit)):
+            return True
+    return False
 
 
 def _patch_ids(repo: str, *log_args: str) -> dict[str, str]:

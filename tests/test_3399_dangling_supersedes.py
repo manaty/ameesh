@@ -6,15 +6,18 @@ reste lisible dans l'ODB. #2989 refusait `--supersedes` sur cette seule
 présence (`freeze_checks.commit_in`), et la lecture relisait ce gel : un commit
 sans provenance de son ancienne plage bloquait pour toujours la désignation
 des gels suivants. #3399 distingue la présence de l'objet de son accessibilité
-par une ref : un objet pendant est remplaçable, un gel encore accessible par
-une ref garde le refus fermé B5.
+par une ref **locale ou distante** : un objet pendant est remplaçable, un gel
+encore accessible par une ref garde le refus fermé B5.
 
-Témoin : gel A (avec un commit tiers non reçu), force-push qui laisse A
+Témoins : gel A (avec un commit tiers non reçu), force-push qui laisse A
 pendant, nouveau gel B sur l'histoire réécrite — la désignation de B bloquait
-sur l'inconnu de A ; le gel C = B + `--supersedes A` la débloque, sans perdre
-les auteurs encore accessibles.
+sur l'inconnu de A ; le gel C = B + `--supersedes A` la débloque en gardant les
+auteurs **connus** de B dont le contenu survit (correcteur #2924). Un tag
+distant ou une branche hors du refspec de fetch qui conserve A font refuser le
+remplacement ; l'ascendance se prouve par un fetch exact, sinon refus fermé.
 """
 import os
+import subprocess
 from unittest import mock
 
 from ameesh import plan_git, review_authors, storage, work
@@ -116,7 +119,7 @@ class DanglingSupersededFreezeTest(_DanglingSupersededFreezeFixture):
 
 
 class DanglingSupersedeWithRemoteTest(_DanglingSupersededFreezeFixture):
-    """Le refus ne conclut qu'après avoir rafraîchi les refs distantes."""
+    """#3399 B1 : les refs distantes non rapatriées sont couvertes."""
 
     def add_remote(self, *, reachable=True):
         bare = os.path.join(self.tmp, "origin.git")
@@ -128,7 +131,14 @@ class DanglingSupersedeWithRemoteTest(_DanglingSupersededFreezeFixture):
             self.repo.git("remote", "add", "origin", bare)
         return bare
 
-    def test_the_remote_is_refreshed_before_allowing_the_replacement(self):
+    def bare_git(self, bare, *args, env=None):
+        proc = subprocess.run(["git", "-C", bare, *args],
+                              capture_output=True, text=True, env=env)
+        if proc.returncode:
+            raise AssertionError("git %s: %s" % (" ".join(args), proc.stderr))
+        return proc.stdout.strip()
+
+    def test_a_remote_without_the_freeze_allows_the_replacement(self):
         self.add_remote()
         row = self.supersede()
         self.assertIn("ameesh-freeze-supersedes: %d" % int(self.op_freeze["id"]),
@@ -138,7 +148,98 @@ class DanglingSupersedeWithRemoteTest(_DanglingSupersededFreezeFixture):
         self.add_remote(reachable=False)
         with self.assertRaises(work.WorkError) as caught:
             self.supersede()
-        self.assertIn("cannot prove", str(caught.exception))
+        self.assertIn("cannot", str(caught.exception))
+
+    def test_a_remote_tag_keeping_the_freeze_refuses(self):
+        # Témoin cx1 : l'ancien gel reste accessible par un tag distant que
+        # `fetch --no-tags` ne rapatrie jamais ; `ref_reachable` seul est
+        # aveugle, `ls-remote` le voit et doit refuser le remplacement.
+        bare = self.add_remote()
+        self.repo.git("push", "-q", "origin",
+                      "%s:refs/tags/retained-freeze" % self.op)
+        self.assertFalse(plan_git.ref_reachable(self.repo.root, self.op))
+        self.assertIn("retained-freeze", self.repo.git("ls-remote", "--tags", bare))
+        with self.assertRaises(work.WorkError) as caught:
+            self.supersede()
+        self.assertIn("remote ref", str(caught.exception))
+        self.assertIn("origin", str(caught.exception))
+
+    def test_a_remote_branch_outside_the_fetch_refspec_refuses(self):
+        # Refspec restreint : seule `master` est rapatriée ; une branche
+        # distante porte un descendant de l'ancien gel. La preuve passe par
+        # `ls-remote` puis par le rapatriement exact de la pointe (ascendance).
+        bare = self.add_remote()
+        self.repo.git("config", "remote.origin.fetch",
+                      "+refs/heads/master:refs/remotes/origin/master")
+        self.repo.git("push", "-q", "origin",
+                      "%s:refs/heads/keep/old" % self.op)
+        tree = self.repo.git("rev-parse", self.op + "^{tree}")
+        child = self.bare_git(bare, "commit-tree", tree, "-p", self.op,
+                              "-m", "later", env=self.env("impl"))
+        self.bare_git(bare, "update-ref", "refs/heads/keep/later", child)
+        self.bare_git(bare, "update-ref", "-d", "refs/heads/keep/old")
+        self.repo.git("fetch", "-q", "origin")
+        self.assertFalse(plan_git.ref_reachable(self.repo.root, self.op))
+        self.assertIn("keep/later", self.repo.git("ls-remote", "--heads", bare))
+        with self.assertRaises(work.WorkError) as caught:
+            self.supersede()
+        self.assertIn("remote ref", str(caught.exception))
+
+
+class ForcePushSupersedesKeepsCorrectorTest(_RewriteFixture):
+    """#3399 (auditeur) : le correcteur connu du gel pendant reste auteur.
+
+    Témoin obligatoire de #2924 avec un force-push : le correctif codex de la
+    tête A survit dans la tête réécrite, mais il ne vit que dans le gel B
+    déclaré remplacé. Sans la lecture des auteurs connus du gel pendant, codex
+    sort des auteurs et sa famille peut relire son propre code.
+    """
+
+    def _build_head_a(self):
+        self.repo.write("src/ameesh/runner.py", "base\n")
+        self.base = self.repo.commit("base")
+        self.repo.write("src/ameesh/runner.py", "base\nlot\n")
+        self.author = self.repo.commit("impl: lot", agent="impl")
+        self.receipt("impl", "deepseek", [self.author])
+        self.db.execute("UPDATE work_items SET branch_target = %s WHERE id = %s",
+                        (self.base, self.lot))
+        self.head_a = self.author
+        self.freeze(self.author)                # gel A : impl seul
+
+    def setUp(self):
+        super().setUp()
+        # Le correcteur d'une autre famille et un inconnu n'existent que dans
+        # le gel B, laissé pendant par le force-push.
+        self.repo.write("src/ameesh/runner.py",
+                        "base\nlot\nif not admitted:\n"
+                        "    return deferred  # cx3 fix\n")
+        self.fix = self.repo.commit("cx3: correctif", agent="cx3")
+        self.receipt("cx3", "codex", [self.fix])
+        self.repo.write("tests/test_runner.py",
+                        "def test_admission():\n"
+                        "    assert admitted() is False  # cx3 witness\n")
+        self.op = self.repo.commit("operator: fix", agent="operator")
+        self.freeze_b = self.freeze(self.op)
+        self.tree = self.repo.git("rev-parse", self.op + "^{tree}")
+        self.repo.git("reset", "--hard", self.base)
+        self.head_c = self.squash(self.tree, self.base, "contenu réécrit")
+        self.repo.git("reset", "--hard", self.head_c)
+        self.freeze_c = self.freeze(self.head_c,
+                                    supersedes=[self.freeze_b["id"]])
+
+    def test_the_known_corrector_of_the_replaced_freeze_stays_author(self):
+        commits = review_authors._commits_between(
+            self.repo.root, self.base, self.head_c)
+        authors, unknown, correctors = review_authors.reading(
+            self.db, self.lot_item(),
+            {"id": int(self.freeze_c["id"]), "sha": self.head_c,
+             "actor": "impl", "at_ts": self.freeze_c.get("at_ts")},
+            commits, self.repo.root, FAMILIES, base=self.base,
+            head=self.head_c, strict=True)
+        self.assertEqual(unknown, [])
+        self.assertEqual({r["name"]: r["family"] for r in authors},
+                         {"impl": "deepseek", "cx3": "codex"})
+        self.assertIn("cx3", {r["name"] for r in correctors})
 
 
 class SupersededGhostStillIgnoredTest(_RewriteFixture):
