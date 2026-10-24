@@ -19,8 +19,9 @@ housekeeping pass frees what a build regenerates:
   doubt: no deletion at all for the pass (the dry run still lists its plan,
   #3195), unless its name is allowed by the policy (`unreadable_ok`, empty
   by default; logged) or it is the user's service manager (`systemd --user`:
-  not dumpable, lives in `/`) or a key agent (`gpg-agent`, `ssh-agent`: not
-  dumpable, serve from `/` or the home; #3195).
+  not dumpable, lives in `/`) or a key agent that manager runs as its unit
+  (`gpg-agent.service`, `ssh-agent.service`: not dumpable, in the unit's
+  directory; told by cgroup and parent, never by name, #3195).
 * **Never**: the main checkout of a repository, an agent's working directory
   or a directory that contains one, a worktree charged to an agent in turn or
   named (branch or directory) after a lot still open (#3195: `keep`), a

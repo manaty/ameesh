@@ -277,10 +277,12 @@ class PlatformTest(unittest.TestCase):
                 platform.holders(__file__, "x")
 
     def _faux_proc(self, comm: str, uids: str, *, state: str = "S",
-                   lien_refuse: bool = False, status_illisible: bool = False) -> str:
+                   lien_refuse: bool = False, status_illisible: bool = False,
+                   ppid: int = 1, cgroup: str = "") -> str:
         """Un /proc minimal : ce processus-ci (lisible) et le pid 4242
-        (`uids` : réel effectif …), dont `fd` refuse la lecture (non
-        dumpable) ou, avec `lien_refuse`, se liste mais pas ses liens."""
+        (`uids` : réel effectif …, `ppid` son parent, `cgroup` le contenu de
+        son /proc/<pid>/cgroup), dont `fd` refuse la lecture (non dumpable)
+        ou, avec `lien_refuse`, se liste mais pas ses liens."""
         import tempfile
         racine = tempfile.mkdtemp()
         autre = os.path.join(racine, "4242")
@@ -293,9 +295,12 @@ class PlatformTest(unittest.TestCase):
         with open(os.path.join(autre, "comm"), "w") as fh:
             fh.write(comm + "\n")
         with open(os.path.join(autre, "status"), "w") as fh:
-            fh.write("Name:\t%s\nState:\t%s (x)\nUid:\t%s\n" % (comm, state, uids))
+            fh.write("Name:\t%s\nState:\t%s (x)\nPPid:\t%d\nUid:\t%s\n"
+                     % (comm, state, ppid, uids))
         with open(os.path.join(autre, "cmdline"), "w") as fh:
             fh.write(comm + "\0")
+        with open(os.path.join(autre, "cgroup"), "w") as fh:
+            fh.write(cgroup)
         if status_illisible:
             os.chmod(os.path.join(autre, "status"), 0)
         if lien_refuse:   # readlink d'un fichier ordinaire : EINVAL, pas de cible
@@ -342,8 +347,8 @@ class PlatformTest(unittest.TestCase):
         """L230 : un processus illisible dont le `comm` ET l'`argv[0]` sont
         dans `allow` n'est plus un doute (le ménage de /tmp peut conclure que
         personne ne tient l'entrée) ; un nom emprunté d'un seul côté, ou
-        absent de la liste, reste un doute. #3195 : les agents de clés
-        (`gpg-agent`, `ssh-agent`) y sont toujours, sous la même règle."""
+        absent de la liste, reste un doute. #3195 (B1 cx2) : un agent de clés
+        n'est pas exempté par son seul nom (voir le test suivant)."""
         if os.geteuid() == 0:
             self.skipTest("root lit tout : pas de refus de lecture à simuler")
         uid = "%d %d %d %d" % ((os.getuid(),) * 4)
@@ -352,11 +357,7 @@ class PlatformTest(unittest.TestCase):
                ("argv emprunté", "btop", "/usr/bin/malveillant", ("btop",), True),
                ("comm emprunté", "node", "/usr/bin/btop", ("btop",), True),
                ("allow vide", "btop", None, (), True),
-               ("agent de clés, allow vide", "gpg-agent", None, (), False),
-               ("agent ssh, allow vide", "ssh-agent", None, (), False),
-               ("agent de clés, argv emprunté", "gpg-agent", "/usr/bin/malveillant", (),
-                True),
-               ("agent de clés, comm emprunté", "node", "/usr/bin/gpg-agent", (), True))
+               ("agent de clés par son seul nom, allow vide", "gpg-agent", None, (), True))
         for nom, comm, argv0, allow, doute in cas:
             with self.subTest(nom):
                 racine = self._faux_proc(comm, uid)
@@ -374,6 +375,47 @@ class PlatformTest(unittest.TestCase):
                             platform.holders(__file__, "x", allow=allow)
                     else:
                         self.assertEqual(platform.holders(__file__, "x", allow=allow), [])
+
+    def test_3195_agent_de_cles_seulement_comme_unite_du_gestionnaire(self):
+        """#3195 : un agent de clés que le gestionnaire de services lance comme
+        son unité (`gpg-agent.service`, `ssh-agent.service` sous
+        user@<uid>.service, le gestionnaire pour parent) n'est pas un doute :
+        son dossier courant est celui de l'unité. B1 cx2 : par cgroup et
+        parent, jamais par nom ; un `gpg-agent` lancé par un test dans un
+        worktree garde le cgroup de son lanceur, même recueilli par le
+        gestionnaire, et reste un doute."""
+        if os.geteuid() == 0:
+            self.skipTest("root lit tout : pas de refus de lecture à simuler")
+        moi = os.getuid()
+        uid = "%d %d %d %d" % ((moi,) * 4)
+        user = "/user.slice/user-%d.slice/user@%d.service" % (moi, moi)
+        unite = "0::%s/app.slice/gpg-agent.service\n" % user
+        cas = (("unité du gestionnaire", "gpg-agent", 7, unite, {7}, False),
+               ("unité ssh-agent, hiérarchie systemd v1", "ssh-agent", 7,
+                "1:name=systemd:%s/ssh-agent.service\n0::/\n" % user, {7}, False),
+               ("gestionnaire inconnu", "gpg-agent", 7, unite, set(), True),
+               ("parent autre que le gestionnaire", "gpg-agent", 99, unite, {7}, True),
+               ("lancé par un test, recueilli par le gestionnaire", "gpg-agent", 7,
+                "0::%s/ameesh.slice/ameesh-runner-agent@dev2.service\n" % user, {7}, True),
+               ("sous-cgroup d'une unité déléguée", "gpg-agent", 7,
+                "0::%s/app.slice/x.service/gpg-agent.service\n" % user, {7}, True),
+               ("unité d'un autre utilisateur", "gpg-agent", 7,
+                "0::/user.slice/user-1.slice/user@1.service/gpg-agent.service\n", {7}, True),
+               ("cgroup illisible", "gpg-agent", 7, "", {7}, True))
+        for nom, comm, ppid, cgroup, gestionnaires, doute in cas:
+            with self.subTest(nom):
+                racine = self._faux_proc(comm, uid, ppid=ppid, cgroup=cgroup)
+                with mock.patch.object(platform, "psutil", None), \
+                        mock.patch.object(platform.process, "PROC", racine), \
+                        mock.patch.object(platform.process, "DOUBT_RETRY_S", 0), \
+                        mock.patch.object(platform.process, "service_managers",
+                                          return_value=frozenset(gestionnaires)), \
+                        mock.patch.object(platform, "SYSTEM", "linux"):
+                    if doute:
+                        with self.assertRaises(platform.NotAvailable):
+                            platform.holders(__file__, "x")
+                    else:
+                        self.assertEqual(platform.holders(__file__, "x"), [])
 
     def test_allow_ne_cache_pas_un_detenteur_constate(self):
         """L230 : `allow` ne lève que le DOUTE ; un processus lisible qui tient
@@ -460,8 +502,7 @@ class PlatformTest(unittest.TestCase):
             # le détenteur n'est pas retrouvé et le doute l'emporte (CI macOS).
             cible = os.path.realpath(os.path.join(tmp, "tenu"))
             open(cible, "w").close()
-            # #3195 : gpg-agent n'est plus un doute ; un autre non dumpable l'est
-            racine = self._faux_proc("btop", moi)
+            racine = self._faux_proc("gpg-agent", moi)
             # ce processus-ci tient `cible` : le /proc simulé porte son lien
             os.symlink(cible, os.path.join(racine, str(os.getpid()), "fd", "3"))
             with mock.patch.object(platform, "psutil", None), \

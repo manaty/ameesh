@@ -687,15 +687,17 @@ def holders(path: str | None, needle: str | None = None, exclude=(), *,
     `allow` (L230) : noms des processus de l'utilisateur dont l'illisibilité
     n'est PAS un doute — le choix explicite de l'owner de l'hôte, vide par
     défaut ; le `comm` ET le nom de base d'`argv[0]` doivent s'y trouver
-    (même règle que `user_paths`), sinon le refus reste un doute. #3195 : les
-    agents de clés (`KEY_AGENTS`) y sont toujours. Un détenteur
+    (même règle que `user_paths`), sinon le refus reste un doute. #3195 : un
+    agent de clés lancé par le gestionnaire de services comme son unité
+    (`key_agent_unit`, par cgroup et parent, jamais par nom) n'en est pas un
+    non plus. Un détenteur
     CONSTATÉ (fichier ouvert, dossier courant, `needle`) reste rapporté, même
     si son nom est dans `allow` : l'allow ne lève que le doute, jamais une
     observation."""
     real = os.path.realpath(path) if path else None
     is_dir = bool(real) and os.path.isdir(real)
     exclude = set(int(p) for p in exclude)
-    allow = KEY_AGENTS | frozenset(allow or ())
+    allow = frozenset(allow or ())
     ps = _psutil()
     if ps is not None:
         return _holders_psutil(ps, real, is_dir, needle, exclude, mapped,
@@ -805,8 +807,9 @@ def _doubt_proc(pid, uid: int, managers, allow=()) -> str | None:
     unknown, read on /proc; None when it cannot hold anything of the user's:
     gone, a zombie (no files left), running as another user (effective uid:
     a setuid helper such as sudo is root's), the user's service manager
-    (`managers()`, by PID), or a process named by `allow` (L230, `comm` and
-    `argv[0]`; an unreadable status is a doubt)."""
+    (`managers()`, by PID), a key agent run as its unit by that manager
+    (`key_agent_unit`, #3195), or a process named by `allow` (L230, `comm`
+    and `argv[0]`; an unreadable status is a doubt)."""
     try:
         status = _proc_status(pid)
     except OSError as exc:
@@ -818,7 +821,7 @@ def _doubt_proc(pid, uid: int, managers, allow=()) -> str | None:
         return "%s (uid unreadable)" % pid
     if int(uids[1]) != uid or int(pid) in managers():
         return None
-    if _allowed_proc(pid, allow):
+    if _allowed_proc(pid, allow) or key_agent_unit(pid, uid, managers, status):
         return None
     return "%s %s" % (pid, " ".join(status.get("Name") or ["?"]))
 
@@ -1170,14 +1173,45 @@ def _holders_proc(real, is_dir, needle, exclude, mapped=False, session=False,
 #: never readable (not dumpable) and never inside a worktree: the user's
 #: service manager (`systemd --user`, cwd `/`)
 SERVICE_MANAGER = frozenset({"systemd", "(sd-pam)"})
-#: #3195: not dumpable on purpose (their memory holds keys) and never inside
-#: a worktree either: the key agents answer on a socket from `/` (started as
-#: a daemon) or from the user's home (`gpg-agent --supervised`, a service of
-#: `systemd --user`). On ameesh-agents-1 and -2, one `gpg-agent` alive since
-#: 13/10 held back every deletion of build output for ten days.
-KEY_AGENTS = frozenset({"gpg-agent", "ssh-agent"})
-#: let through without a word, whatever `allow` says
-BUILT_IN_UNREADABLE = SERVICE_MANAGER | KEY_AGENTS
+#: #3195: the key agents are not dumpable on purpose (their memory holds
+#: keys). Run as these units of the user's service manager (`gpg-agent
+#: --supervised`, socket-activated), their working directory is the unit's
+#: (the home by default), never a worktree. On ameesh-agents-1 and -2, one
+#: such `gpg-agent`, alive since 13/10, held back every deletion of build
+#: output for ten days. Told by cgroup and parent, never by name (B1 cx2): a
+#: `gpg-agent` a test starts inside a worktree keeps the cgroup of its
+#: launcher, even once the manager has reaped it as an orphan: a doubt.
+KEY_AGENT_UNITS = frozenset({"gpg-agent.service", "ssh-agent.service"})
+
+
+def key_agent_unit(pid, uid: int, managers, status: dict | None = None) -> bool:
+    """#3195: `pid` is a key agent run by the user's service manager as its
+    unit (`KEY_AGENT_UNITS`): its parent is the manager (`managers()`, PIDs
+    from `service_managers`) and its cgroup is that unit, under
+    `user@<uid>.service` through slices only (a sub-cgroup of a delegated
+    unit is not the unit). Both are readable on a process that is not
+    dumpable; anything unreadable: False, the doubt stays. `status`: its
+    `_proc_status`, when already read."""
+    try:
+        status = _proc_status(pid) if status is None else status
+        ppid = int(((status or {}).get("PPid") or ["0"])[0])
+    except (OSError, ValueError):
+        return False
+    if ppid <= 1 or ppid not in managers():
+        return False
+    lines = _read_text(os.path.join(PROC, str(pid), "cgroup")).splitlines()
+    # the hierarchy systemd tracks: `name=systemd` (cgroup v1, hybrid), else
+    # the unified one (cgroup v2, `0::/…`)
+    path = next((line.split(":", 2)[2] for line in lines
+                 if line.count(":") >= 2 and line.split(":", 2)[1] == "name=systemd"), None)
+    if path is None:
+        path = next((line[3:] for line in lines if line.startswith("0::")), "")
+    parts = path.strip().strip("/").split("/")
+    manager = "user@%d.service" % uid
+    if manager not in parts[:-1]:
+        return False
+    between = parts[parts.index(manager) + 1:-1]
+    return parts[-1] in KEY_AGENT_UNITS and all(p.endswith(".slice") for p in between)
 
 
 class UserPaths:
@@ -1257,14 +1291,16 @@ def user_paths(uid: int | None = None, allow=()) -> UserPaths:
     A process gone meanwhile is ignored, and so is a zombie (`_zombie`, #1678):
     it holds nothing anymore. One that cannot be read (not dumpable: setuid,
     file capabilities) is a doubt, unless its name (`comm`) AND the base name
-    of its `argv[0]` are both in `allow` (listed in `allowed`), or both name
-    the service manager or a key agent (`BUILT_IN_UNREADABLE`, not listed):
-    its `exe` link is unreadable too, its command line is not. Without `/proc`
-    (other OS), `available` is false."""
+    of its `argv[0]` are both in `allow` (listed in `allowed`) or both name
+    the service manager (not listed): its `exe` link is unreadable too, its
+    command line is not. Nor is a key agent run as its unit by the service
+    manager (`key_agent_unit`, #3195, not listed). Without `/proc` (other
+    OS), `available` is false."""
     if not _proc_ok():
         return UserPaths(available=False)
     uid = os.getuid() if uid is None else uid
-    allow = BUILT_IN_UNREADABLE | set(allow or ())
+    allow = SERVICE_MANAGER | set(allow or ())
+    managers = _once(lambda: service_managers(uid))
     out = UserPaths()
     try:
         pids = [p for p in os.listdir(PROC) if p.isdigit()]
@@ -1307,9 +1343,9 @@ def user_paths(uid: int | None = None, allow=()) -> UserPaths:
         except OSError:
             argv0 = _read_text(os.path.join(base, "cmdline")).split("\0", 1)[0]
             if name in allow and os.path.basename(argv0) in allow:
-                if name not in BUILT_IN_UNREADABLE:
+                if name not in SERVICE_MANAGER:
                     out.allowed.append(who)
-            else:
+            elif not key_agent_unit(pid, uid, managers):
                 out.unreadable.append(who)
             continue
         for path in found:

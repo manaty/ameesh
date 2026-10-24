@@ -59,10 +59,18 @@ class _Base(unittest.TestCase):
 
     def fake_process(self, pid: int, *, cwd: str = "/", fds=(), maps=(), comm: str = "bash",
                      argv0: str | None = None, state: str = "S",
-                     threads=(), unreadable: bool = False) -> None:
+                     threads=(), unreadable: bool = False, ppid: int = 1,
+                     cgroup: str | None = None) -> None:
         d = os.path.join(self.proc, str(pid))
         os.makedirs(os.path.join(d, "fd"))
         _write(os.path.join(d, "comm"), text=comm + "\n")
+        if cgroup is not None:
+            # #3195: what a process that is not dumpable still shows
+            uid = os.getuid()
+            _write(os.path.join(d, "status"),
+                   text="Name:\t%s\nState:\t%s (x)\nPPid:\t%d\nUid:\t%d\t%d\t%d\t%d\n"
+                        % (comm, state, ppid, uid, uid, uid, uid))
+            _write(os.path.join(d, "cgroup"), text=cgroup)
         _write(os.path.join(d, "cmdline"), text="%s\0--flag\0" % (argv0 or "/usr/bin/" + comm))
         # état du processus (`Z` = zombie, #1678) : /proc/<pid>/stat, champ 3
         _write(os.path.join(d, "stat"),
@@ -184,16 +192,40 @@ class UserPathsTest(_Base):
             self.assertIn("unreadable", platform.user_paths().doubt())
 
     @unittest.skipIf(os.getuid() == 0, "root reads everything")
-    def test_3195_key_agents_are_not_a_doubt(self):
+    def test_3195_key_agents_only_as_units_of_the_manager(self):
         """#3195: `gpg-agent --supervised` (not dumpable) held back every
-        deletion on ameesh-agents-1 and -2 for ten days."""
-        self.fake_process(40, comm="gpg-agent", argv0="/usr/bin/gpg-agent", unreadable=True)
-        self.fake_process(41, comm="ssh-agent", argv0="ssh-agent", unreadable=True)
-        scan = platform.user_paths()
+        deletion on ameesh-agents-1 and -2 for ten days. A key agent the
+        service manager runs as its unit is no doubt; told by cgroup and
+        parent, never by name (B1 cx2: a `gpg-agent` whose cwd is in a
+        `node_modules` stays one)."""
+        uid = os.getuid()
+        user = "/user.slice/user-%d.slice/user@%d.service" % (uid, uid)
+        self.fake_process(40, comm="gpg-agent", unreadable=True, ppid=7,
+                          cgroup="0::%s/app.slice/gpg-agent.service\n" % user)
+        self.fake_process(41, comm="ssh-agent", unreadable=True, ppid=7,
+                          cgroup="1:name=systemd:%s/ssh-agent.service\n0::/\n" % user)
+        managers = mock.patch.object(process, "service_managers", return_value=frozenset({7}))
+        with managers:
+            scan = platform.user_paths()
         self.assertEqual((scan.doubt(), scan.allowed), ("", []))
-        # the name AND the command line, as for `unreadable_ok`
-        self.fake_process(42, comm="gpg-agent", argv0="/tmp/evil", unreadable=True)
-        self.assertIn("42 gpg-agent", platform.user_paths().doubt())
+        with mock.patch.object(process, "service_managers", return_value=frozenset()):
+            self.assertIn("40 gpg-agent", platform.user_paths().doubt())
+        inside = os.path.join(self.base, "wt", "node_modules")
+        cases = (("started by a test, reaped by the manager", 7,
+                  "0::%s/ameesh.slice/ameesh-runner-agent@dev2.service\n" % user),
+                 ("in the unit, not run by the manager", 40,
+                  "0::%s/app.slice/gpg-agent.service\n" % user),
+                 ("a sub-cgroup of a delegated unit", 7,
+                  "0::%s/app.slice/runner.service/gpg-agent.service\n" % user),
+                 ("the unit of another user's manager", 7,
+                  "0::/user.slice/user-1.slice/user@1.service/gpg-agent.service\n"),
+                 ("its name alone", 7, ""))
+        for pid, (name, ppid, cgroup) in enumerate(cases, start=50):
+            with self.subTest(name):
+                self.fake_process(pid, comm="gpg-agent", cwd=inside, unreadable=True,
+                                  ppid=ppid, cgroup=cgroup)
+                with managers:
+                    self.assertIn("%d gpg-agent" % pid, platform.user_paths().doubt())
 
     @unittest.skipIf(os.getuid() == 0, "root reads everything")
     def test_a_zombie_is_not_a_doubt(self):
@@ -308,6 +340,33 @@ class RunTest(_Base):
         self.assertIn("artifacts: nothing deleted, process(es) of the user unreadable: 23 btop",
                       out["skipped"])
         self.assertTrue(os.path.isdir(os.path.join(wt, "node_modules")))
+
+    @unittest.skipIf(os.getuid() == 0, "root reads everything")
+    def test_3195_a_key_agent_inside_the_worktree_deletes_nothing(self):
+        """B1 cx2: a real `gpg-agent` can work in the directory to clean (its
+        cwd unreadable: `holders` would not see it). Out of its unit, it
+        holds back the deletion; the unit of the service manager does not."""
+        uid = os.getuid()
+        user = "/user.slice/user-%d.slice/user@%d.service" % (uid, uid)
+        wt = self.worktree()
+        self.fake_process(23, comm="gpg-agent", cwd=os.path.join(wt, "node_modules"),
+                          unreadable=True, ppid=7,
+                          cgroup="0::%s/ameesh.slice/ameesh-runner-agent@dev2.service\n" % user)
+        with mock.patch.object(process, "service_managers", return_value=frozenset({7})):
+            out = self.go(wt)
+        self.assertEqual((out["entries"], out["plan"]), ([], []))
+        self.assertIn("artifacts: nothing deleted, process(es) of the user unreadable: "
+                      "23 gpg-agent", out["skipped"])
+        self.assertTrue(os.path.isdir(os.path.join(wt, "node_modules")))
+        _write(os.path.join(self.proc, "23", "cgroup"),
+               text="0::%s/app.slice/gpg-agent.service\n" % user)
+        _write(os.path.join(self.proc, "23", "status"),
+               text="Name:\tgpg-agent\nState:\tS (x)\nPPid:\t7\nUid:\t%d\t%d\t%d\t%d\n"
+                    % (uid, uid, uid, uid))
+        os.remove(os.path.join(self.proc, "23", "cwd"))
+        os.symlink(os.path.expanduser("~"), os.path.join(self.proc, "23", "cwd"))
+        with mock.patch.object(process, "service_managers", return_value=frozenset({7})):
+            self.assertEqual(len(self.go(wt)["entries"]), 3)
 
     def test_3195_keep_holds_an_idle_worktree(self):
         wt = self.worktree()
