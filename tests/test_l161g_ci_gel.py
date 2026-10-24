@@ -376,6 +376,8 @@ class GelTestCase(unittest.TestCase):
         self.work.enter_context(mock.patch.object(work, "get", self._get))
         self.work.enter_context(mock.patch.object(work, "milestones", self._milestones))
         self.work.enter_context(mock.patch.object(work, "events", self._events))
+        self.work.enter_context(mock.patch.object(work, "events_noted",
+                                                  self._events_noted))
 
     def _get(self, db, item_id):
         return self.item if int(item_id) == self.item["id"] else None
@@ -387,6 +389,11 @@ class GelTestCase(unittest.TestCase):
 
     def _events(self, db, item_id, limit=100):
         return list(reversed(self.events))
+
+    def _events_noted(self, db, item_id, prefix, since_ts=0.0):
+        return [event for event in self.events
+                if (event.get("note") or "").startswith(prefix)
+                and float(event.get("created_ts") or 0) >= float(since_ts)]
 
     def gele(self, sha: str = GEL, acteur: str = "relecteur") -> None:
         """Le lot gelé sur `sha`, avec un verdict `ok` indépendant dessus."""

@@ -4712,6 +4712,7 @@
     "log",
     "recent",
     "register_worktree",
+    "set_worktree_attribution",
     "set_worktree_status",
     "summary",
     "worktrees"

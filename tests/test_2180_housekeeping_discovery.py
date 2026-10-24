@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """Discovery uses real Git and disposable SQL, never a host cleanup."""
 import os
+import subprocess
 import tempfile
 import time
 import unittest
@@ -219,3 +220,61 @@ class DiscoveryTest(PgTestCase):
             report = self.discover(dry_run=True)
         self.assertTrue(report["skipped"])
         self.assertTrue(os.path.isdir(linked))
+
+    def test_project_prefixed_copy_is_attributed_from_its_folder(self):
+        """#3266 : `nexlink-<agent>-<lot>` nomme l'agent et le lot même quand
+        la branche ne cite aucun numéro ; l'attribution est enregistrée et la
+        fin du lot s'applique (propre et intégré → retiré)."""
+        _sans_processus(self)
+        lot = work.add(self.db, title="prefixed", assignee="a1")["id"]
+        path = self.linked("nexlink-a1-%d" % lot, "topic")
+        work.close(self.db, lot, abandoned=True)
+        self.discover()
+        row = next(r for r in self.store.worktrees("pc") if r["path"] == path)
+        self.assertEqual((row["agent"], row["lot"]), ("a1", str(lot)))
+        self.assertFalse(row["detail"].startswith(hk.UNATTRIBUTED))
+        _entries, plan = hk._worktree_pass(
+            self.db, "pc", dry_run=True, protected={self.main},
+            now=row["created_ts"] + 2 * 3600)
+        self.assertEqual(next(p["action"] for p in plan if p["path"] == path), "retrait")
+
+    def test_a_folder_naming_another_agent_does_not_lend_its_lot(self):
+        """#3266 (relecture) : `nexlink-a2-431` avec #431 assigné à a1 garde
+        l'agent a2 et lot=None ; la passe vérifie le tour de a2 avant tout
+        retrait, jamais celui de l'assigné."""
+        _sans_processus(self)
+        lot = work.add(self.db, title="a1-lot", assignee="a1")["id"]
+        work.close(self.db, lot, abandoned=True)
+        self.agents["a2"] = os.path.join(self.tmp, "a2")
+        path = self.linked("nexlink-a2-%d" % lot, "topic")
+        self.discover()
+        row = next(r for r in self.store.worktrees("pc") if r["path"] == path)
+        self.assertEqual((row["agent"], row["lot"]), ("a2", None))
+        _entries, plan = hk._worktree_pass(
+            self.db, "pc", dry_run=True, protected={self.main},
+            running={"a2"}, now=row["created_ts"] + 25 * 3600)
+        tour = next(p for p in plan if p["path"] == path)
+        self.assertEqual(tour["action"], "attend")
+        self.assertIn("turn in progress for a2", tour["detail"])
+
+    def test_scratch_wt_under_the_agent_directory_is_attributed(self):
+        """#3266 : le nom de grattage `.wt<lot>` sous le dossier de travail de
+        l'agent nomme le lot ; `_attribution` le lit (le dossier est dans le
+        dossier de l'agent), puis la fin du lot s'applique."""
+        _sans_processus(self)
+        checkout = os.path.join(self.tmp, "a1checkout")
+        subprocess.run(["git", "clone", "-q", self.main, checkout], check=True,
+                       capture_output=True)
+        registry.upsert(self.db, "a1", harness="claude", host="pc", cwd=checkout)
+        self.agents["a1"] = checkout
+        lot = work.add(self.db, title="scratch", assignee="a1")["id"]
+        path = os.path.join(checkout, ".wt%d" % lot)
+        _git("worktree", "add", "-q", path, "-b", "scratch", cwd=checkout)
+        work.close(self.db, lot, abandoned=True)
+        self.discover()
+        row = next(r for r in self.store.worktrees("pc") if r["path"] == path)
+        self.assertEqual((row["agent"], row["lot"]), ("a1", str(lot)))
+        _entries, plan = hk._worktree_pass(
+            self.db, "pc", dry_run=True, protected={checkout},
+            now=row["created_ts"] + 2 * 3600)
+        self.assertEqual(next(p["action"] for p in plan if p["path"] == path), "retrait")

@@ -332,7 +332,8 @@ def tick(cfg, db, *, now: float, rules_of, dry_run: bool = False,
     #2813 : le même passage fusionne au vert un porteur publié, ou le désarme
     si sa tête ou sa cible a changé depuis la publication
     (`packet_automerge.watch`) ; seuls une fusion, un désarmement et une
-    erreur sont rendus, un porteur en attente ne dit rien."""
+    erreur sont rendus, un porteur en attente ne dit rien ici (son motif est
+    au journal du lot, `auto-merge held …`, #3175)."""
     declared = projects(cfg)
     if only:
         if only not in declared:
@@ -349,17 +350,20 @@ def tick(cfg, db, *, now: float, rules_of, dry_run: bool = False,
         except Exception as exc:  # noqa: BLE001 - un projet ne fait pas tomber l'autre
             results.append({"project": name, "result": "error",
                             "error": "%s: %s" % (type(exc).__name__, exc)})
-        results += _auto_merge(cfg, db, name, watch.app or name, gh=gh, dry_run=dry_run)
+        results += _auto_merge(cfg, db, name, watch.app or name, gh=gh, dry_run=dry_run,
+                               checkout=watch.repo)
     if not dry_run:
         save_state(cfg, state)
     return results
 
 
-def _auto_merge(cfg, db, name: str, app: str, *, gh, dry_run: bool) -> list[dict]:
+def _auto_merge(cfg, db, name: str, app: str, *, gh, dry_run: bool,
+                checkout: str = "") -> list[dict]:
     """#2813 : les fusions, désarmements et erreurs des porteurs publiés de `app`."""
     from . import packet_automerge
     try:
-        rows = packet_automerge.watch(cfg, db, app, gh=gh, dry_run=dry_run)
+        rows = packet_automerge.watch(cfg, db, app, gh=gh, dry_run=dry_run,
+                                      checkout=checkout)
     except Exception as exc:  # noqa: BLE001 - l'alerte de créneau reste rendue
         return [{"project": name, "result": "error",
                  "error": "auto-merge: %s: %s" % (type(exc).__name__, exc)}]

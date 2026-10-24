@@ -650,6 +650,8 @@ class OrphanGuardsTest(unittest.TestCase):
                     with mock.patch.object(menage.storage, "of", return_value=store), \
                             mock.patch.object(menage, "worktree_state", return_value=git), \
                             mock.patch.object(menage, "worktree_in_use", return_value=False), \
+                            mock.patch.object(menage, "current_branch",
+                                              return_value=(True, row["branch"])), \
                             mock.patch.object(menage, "ignored_leftovers", return_value=[]), \
                             mock.patch.object(hd, "_marker", return_value="linked"), \
                             mock.patch.object(menage, "same_repository", return_value=True), \
@@ -685,6 +687,11 @@ class _Store:
 
     def set_worktree_status(self, ident, status, detail):
         self.statuses.append((ident, status, detail))
+
+    def set_worktree_attribution(self, ident, agent, lot, detail):
+        # #3266 : la passe ne persiste une attribution que pour une ligne sans
+        # lot ; les scénarios de ce module partent tous d'un lot posé.
+        raise AssertionError("unexpected attribution of %s to lot %s" % (ident, lot))
 
 
 class MergedKeptTest(_Repo):

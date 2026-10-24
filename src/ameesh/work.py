@@ -3474,6 +3474,18 @@ def events(db: Db, item_id: int, limit: int | None = 100) -> list[dict]:
     return storage.of(db).work.events(item_id, limit)
 
 
+def events_noted(db: Db, item_id: int, prefix: str,
+                 since_ts: float = 0.0) -> list[dict]:
+    """Les notes du lot qui commencent par `prefix`, de la plus ancienne à la
+    plus récente.
+
+    Contrairement à `events`, la lecture n'est pas une fenêtre des N derniers
+    événements : une note ancienne reste lisible sous un flot de notes plus
+    récentes (#3279, marque d'armement évincée par les notes `held`)."""
+    return storage.of(db).work.events_noted(prefix, float(since_ts),
+                                            ids=[int(item_id)])
+
+
 #: les jalons et la porte du gel/verdict vivent dans `freeze_gate` (#2873),
 #: déclaré sensible à deux avis ; `work` les réexporte pour ses appelants.
 from .freeze_gate import (  # noqa: E402

@@ -160,6 +160,34 @@ class BriefsLivenessTest(unittest.TestCase):
         self.assertEqual(alert_briefs.briefs(alert, listing,
                                              auditor_names=["auditeur"]), {})
 
+    # #3274 : `plan_underused` se lit à la passe de l'auditeur, comme
+    # `stale_lot` ; il ne le réveille que si le pilotage n'a plus personne.
+    PLAN = {"type": "plan_underused", "harness": "claude", "account": "pro",
+            "detail": "account claude/pro, window 7d: 20 % used",
+            "idle_agents": ["dev1"], "orchestrators": ["orch"]}
+
+    def test_plan_underused_ne_reveille_pas_l_auditeur_avec_un_pilote_vivant(self):
+        listing = [_row("dev1"), _row("orch"), _row("auditeur")]
+        briefs = alert_briefs.briefs(self.PLAN, listing, auditor_names=["auditeur"])
+        self.assertEqual(list(briefs), ["orch"])
+        self.assertIn("Underused plan:", briefs["orch"])
+
+    def test_plan_underused_sans_pilote_vivant_replie_sur_l_auditeur(self):
+        listing = [_row("dev1"), _row("orch", lease=False), _row("auditeur")]
+        briefs = alert_briefs.briefs(self.PLAN, listing, auditor_names=["auditeur"])
+        self.assertEqual(list(briefs), ["auditeur"])
+        self.assertIn("Underused plan:", briefs["auditeur"])
+        self.assertIn("No live recipient: orch (no live lease)", briefs["auditeur"])
+
+    def test_plan_underused_sans_vivant_replie_sur_le_bureau(self):
+        listing = [_row("dev1"), _row("orch", lease=False),
+                   _row("auditeur", lease=False), _row("bureau")]
+        briefs = alert_briefs.briefs(self.PLAN, listing, auditor_names=["auditeur"])
+        self.assertEqual(list(briefs), ["bureau"])
+        self.assertIn("No live recipient:", briefs["bureau"])
+        self.assertIn("orch (no live lease)", briefs["bureau"])
+        self.assertIn("auditeur (no live lease)", briefs["bureau"])
+
 
 class LivenessFixture:
     """Registre, baux et notificateur des témoins de livraison (repris par
