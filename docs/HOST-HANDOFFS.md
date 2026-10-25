@@ -174,18 +174,26 @@ the placement/lease, both canon states, the destination gate and the existing
 private journal under the host execution enrollment: the step order, the
 source lease owner and its epoch, the last controller epoch, a durable intent
 before the effect and an exact allowlisted receipt. The lease is bound once
-per operation; a changed owner or lease epoch is refused, so a delayed stop
-cannot act for a later lease. A stale controller epoch, a changed intent or an
+per operation; a changed owner or lease epoch is refused. A separate durable
+fence, shared by every operation of one agent and unit on the host, records
+the highest lease epoch observed: a newer lease advances it, and any delayed
+operation from an older lease is refused before it can act — including a
+`stop_source` replayed from an old receipt, which must not stop the executor
+of a later lease. A stale controller epoch, a changed intent or an
 out-of-order step is refused; a repeated step returns its stored receipt
 without repeating the effect (a stored `stop_source` is re-observed, and
-re-stopped if the unit is active again); a receipt written before its state
-mark is repaired on replay without replaying the effect; an interrupted intent
-is resumed only with its exact original identity and payload, otherwise the
-call raises and the controller keeps its own durable intent for explicit
-reconciliation. Every SSH exchange is bounded by the enrolled endpoint; the
-host dispatcher's alarm covers the effect, not only the stdin read, and a
-timed-out child process group is killed before the uncertain intent is left
-for reconciliation.
+re-stopped only while its lease is still current); a receipt written before
+its state mark is repaired on replay without replaying the effect; an
+interrupted intent is resumed only with its exact original identity and
+payload, otherwise the call raises and the controller keeps its own durable
+intent for explicit reconciliation. Revalidation and effects share the agent
+lock and the fence, and the durable controller epoch is monotonic: a
+revalidation observed during an effect can only raise it. Every SSH exchange
+is bounded by the enrolled endpoint; the host dispatcher's alarm covers the
+effect, not only the stdin read, and a timed-out child process group is killed
+before the uncertain intent is left for reconciliation. Expiry during an
+effect is uncertain, never a definitive refusal: it keeps the durable intent,
+fails the transport, and leaves reconciliation to the controller.
 
 The host execution enrollment's `account` is the **Unix** account that owns
 the home and runner unit. The harness/provider account in a request is a

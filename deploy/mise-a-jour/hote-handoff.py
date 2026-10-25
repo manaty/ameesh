@@ -48,6 +48,7 @@ import signal
 import stat
 import subprocess
 import sys
+import threading
 import time
 from collections.abc import Mapping
 
@@ -94,6 +95,7 @@ _REASON = re.compile(r'^[a-z][a-z0-9_.:-]{0,63}$')
 EXECUTION_KEYS = ('host', 'state', 'config', 'release_store', 'accounts',
                   'roots', 'tools', 'secrets')
 ACCOUNT_KEYS = ('account', 'home', 'unit', 'scope')
+_FENCE_KEYS = ('agent', 'account', 'unit', 'owner', 'lease_epoch')
 CREDENTIAL_FILES = ('.credentials.yaml', 'auth.json', '.env', '.oauth',
                     'credentials.json')
 
@@ -537,7 +539,9 @@ class HostEffects:
     allowlisted receipt. Replaying the same step after a lost reply returns the
     stored receipt without repeating the effect; an interrupted intent is
     observed and completed when the host state proves it, otherwise the call
-    raises and the controller must reconcile.
+    raises and the controller must reconcile. A durable fence shared by every
+    operation of one agent/unit records the highest lease epoch observed and
+    refuses a delayed operation from an older lease before it can act.
     """
 
     def __init__(self, *, enrollment, system=None, git=None, work_dir=None,
@@ -551,6 +555,8 @@ class HostEffects:
         state = Path(root or self.enrollment['state'])
         self.state = _ensure_private(state)
         self.operations = _ensure_private(self.state / 'operations')
+        self.fences = _ensure_private(self.state / 'fences')
+        self._locks = {}
         self._release = None
         self._canons = None
 
@@ -579,13 +585,21 @@ class HostEffects:
         # ``request.account`` is the harness/provider account validated by the
         # controller's hosts document; ``entry.account`` is the Unix user that
         # owns the home and unit. They are deliberately independent.
-        if request['step'] == 'revalidate':
-            try:
-                self._revalidate(request, entry)
-            except Refused as exc:
-                return self._refusal(request, str(exc))
-            return self._receipt(request, {})
-        return self._journal(request, entry)
+        #
+        # Every operation of one agent shares one lock and one durable lease
+        # fence: a revalidation, an effect and a replayed stop cannot
+        # interleave, and a newer lease revokes every older operation on this
+        # host before it can act (including a stop replayed from an old
+        # receipt). The lock is reentrant for the same thread so an
+        # observation nested inside an effect still shares the same fence.
+        with self._agent_lock(request['agent']):
+            if request['step'] == 'revalidate':
+                try:
+                    self._revalidate(request, entry)
+                except Refused as exc:
+                    return self._refusal(request, str(exc))
+                return self._receipt(request, {})
+            return self._journal(request, entry)
 
     def _entry(self, agent):
         entry = self.enrollment['accounts'].get(agent)
@@ -612,7 +626,7 @@ class HostEffects:
         receipt_path = directory / (step + '.json')
         intent_path = directory / (step + '.intent.json')
         state_path = directory / 'state.json'
-        with self._locked(directory):
+        with self._agent_lock(request['agent']), self._locked(directory):
             state = self._state(state_path)
             state, refusal = self._bind_lease(state, state_path, request)
             if refusal is not None:
@@ -621,9 +635,16 @@ class HostEffects:
                 # The newer controller epoch is authoritative even for a
                 # replay: a delayed request from an older epoch is refused.
                 state = dict(state, epoch=request['controller_epoch'])
-                _atomic_json(state_path, state)
+                self._store_state(state_path, state)
             if request['controller_epoch'] < state['epoch']:
                 return self._refusal(request, 'revoked_epoch')
+            try:
+                # The shared fence is checked (and advanced by a newer lease)
+                # before any receipt replay: an old stop must not act on the
+                # executor of a lease that reached this host later.
+                self._bind_fence(request, entry)
+            except Refused as exc:
+                return self._refusal(request, str(exc))
             # A receipted effect is idempotent even after a later step: the
             # controller legitimately repeats ``stop_source`` before retrying a
             # held publication. Only a *new* earlier effect is out of order.
@@ -650,7 +671,7 @@ class HostEffects:
                     # Crash after the receipt write, before the state write:
                     # repair the order mark without replaying the effect.
                     state = dict(state, last_ok=True)
-                    _atomic_json(state_path, state)
+                    self._store_state(state_path, state)
                 try:
                     _unlink_private(intent_path)
                 except Uncertain:
@@ -678,7 +699,7 @@ class HostEffects:
                              {'request': request, 'at': float(self.clock())})
             state = dict(state, epoch=request['controller_epoch'], last_step=step,
                          last_seq=sequence, last_ok=False)
-            _atomic_json(state_path, state)
+            self._store_state(state_path, state)
             try:
                 fields = self._dispatch(request, entry)
             except Refused as exc:
@@ -691,7 +712,7 @@ class HostEffects:
             _atomic_json(receipt_path,
                          {'request': request, 'receipt': receipt,
                           'at': float(self.clock())})
-            _atomic_json(state_path, dict(state, last_ok=True))
+            self._store_state(state_path, dict(state, last_ok=True))
             try:
                 _unlink_private(intent_path)
             except Uncertain:
@@ -703,14 +724,85 @@ class HostEffects:
         lease = {'owner': request['owner'], 'lease_epoch': request['lease_epoch']}
         if state.get('lease') is None:
             state = dict(state, lease=lease)
-            _atomic_json(path, state)
+            self._store_state(path, state)
             return state, None
         if state['lease'] != lease:
             return state, self._refusal(request, 'lease_changed')
         return state, None
 
+    def _agent_lock(self, agent):
+        return self._locked(_ensure_private(self.fences / agent))
+
+    def _bind_fence(self, request, entry):
+        """Check and advance the durable lease fence shared by one agent.
+
+        The per-operation lease only protects its own directory; an agent can
+        have several operations (a handoff and its repeated revalidations, a
+        delayed replay, a later attempt). A replayed ``stop_source`` must not
+        stop the executor of a lease that reached this host after that
+        operation was written. The fence records the highest lease epoch seen
+        for the agent/unit identity on this host: a newer lease advances it,
+        and every older operation is refused before it can act. It is written
+        under the per-agent lock and survives a restart.
+        """
+        directory = _ensure_private(self.fences / request['agent'])
+        path = directory / 'lease.json'
+        fence = {'agent': request['agent'], 'account': entry['account'],
+                 'unit': entry['unit'], 'owner': request['owner'],
+                 'lease_epoch': request['lease_epoch']}
+        if not (path.exists() or path.is_symlink()):
+            _atomic_json(path, fence)
+            return
+        current = _read_private_json(path)
+        if (tuple(sorted(current)) != tuple(sorted(_FENCE_KEYS))
+                or current.get('agent') != request['agent']
+                or not isinstance(current.get('account'), str)
+                or _ACCOUNT.fullmatch(current['account']) is None
+                or not isinstance(current.get('unit'), str)
+                or _UNIT.fullmatch(current['unit']) is None
+                or not isinstance(current.get('owner'), str)
+                or not (current['owner'] == '' or _bounded(current['owner']))
+                or not isinstance(current.get('lease_epoch'), int)
+                or isinstance(current.get('lease_epoch'), bool)
+                or current['lease_epoch'] < 0):
+            raise Uncertain('journal:fence')
+        if request['lease_epoch'] < current['lease_epoch']:
+            raise Refused('lease_superseded')
+        if request['lease_epoch'] == current['lease_epoch']:
+            if (current['account'] != fence['account']
+                    or current['unit'] != fence['unit']
+                    or current['owner'] != fence['owner']):
+                raise Refused('lease_changed')
+            return
+        _atomic_json(path, fence)
+
+    def _store_state(self, path, state):
+        """Write an operation state without ever lowering its epoch.
+
+        A revalidation and an effect share the agent lock, but an observation
+        nested inside an effect runs after the effect already read its epoch;
+        the on-disk controller epoch is monotonic and must never go back to
+        the older local copy.
+        """
+        path = Path(path)
+        if path.exists() or path.is_symlink():
+            current = self._state(path)
+            if current['epoch'] > state['epoch']:
+                state = dict(state, epoch=current['epoch'])
+        _atomic_json(path, state)
+
     @contextlib.contextmanager
     def _locked(self, directory):
+        key = os.path.abspath(os.fspath(directory))
+        thread = threading.get_ident()
+        held = self._locks.get(key)
+        if held is not None and held[0] == thread:
+            held[1] += 1
+            try:
+                yield
+            finally:
+                held[1] -= 1
+            return
         descriptor = os.open(Path(directory) / '.lock',
                              os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
         try:
@@ -723,7 +815,11 @@ class HostEffects:
                     if time.monotonic() >= deadline:
                         raise Uncertain('journal:lock') from None
                     time.sleep(0.05)
-            yield
+            self._locks[key] = [thread, 1]
+            try:
+                yield
+            finally:
+                self._locks.pop(key, None)
         finally:
             try:
                 fcntl.flock(descriptor, fcntl.LOCK_UN)
@@ -772,6 +868,10 @@ class HostEffects:
     # -- revalidate: observe, never start ----------------------------------
 
     def _revalidate(self, request, entry):
+        with self._agent_lock(request['agent']):
+            self._revalidate_locked(request, entry)
+
+    def _revalidate_locked(self, request, entry):
         limit = MAX_SEQUENCE.get(request['state'])
         if limit is None:
             raise Refused('state')
@@ -783,9 +883,13 @@ class HostEffects:
             raise Refused('lease_changed')
         if request['controller_epoch'] > current['epoch']:
             current = dict(current, epoch=request['controller_epoch'])
-            _atomic_json(state_path, current)
+            self._store_state(state_path, current)
         elif request['controller_epoch'] < current['epoch']:
             raise Refused('revoked_epoch')
+        # A revalidation carries the same lease identity as the effects and
+        # participates in the shared fence: a newer lease observed here
+        # revokes every delayed operation of an older one.
+        self._bind_fence(request, entry)
         if current['last_seq'] > limit and not (
                 not current['last_ok']
                 and current['last_step'] == NEXT_STEP.get(request['state'])):
@@ -875,7 +979,7 @@ class HostEffects:
                     'executor_enabled': False}
         try:
             self.system.stop(entry['scope'], entry['account'], entry['unit'])
-        except Refused:
+        except (Refused, Uncertain):
             raise
         except Exception:
             raise Uncertain('stop:unavailable') from None
@@ -1311,11 +1415,12 @@ class HostAdapter:
             self._intent(operation, 'stop_source')
         except Refused:
             return False
-        try:
-            receipt = self._call(operation, 'stop_source', {},
-                                 target=_source(operation))
-        except (Refused, BridgeError, handoff_contract.ContractError):
-            return False
+        # A bridge or contract failure is ambiguous (the stop may have run and
+        # the reply been lost or the alarm expired): let it propagate so the
+        # controller keeps its durable intent for reconciliation. Only an
+        # explicit ``ok: false`` receipt is a definitive refusal.
+        receipt = self._call(operation, 'stop_source', {},
+                             target=_source(operation))
         if receipt.get('ok') is not True:
             return False
         return (receipt.get('stopped') is True and receipt.get('quiet') is True
@@ -1572,7 +1677,11 @@ def execute(request, *, root=ENROLLMENT_ROOT):
 
 def main(argv=None):
     def expired(signum, frame):
-        raise Refused('deadline')
+        # The alarm may fire inside an effect: the stop/Git/publish may have
+        # run and only its reply is missing. That is an uncertain outcome, not
+        # a definitive refusal: keep the durable intent and fail the transport
+        # so the controller reconciles instead of clearing ``pending_effect``.
+        raise Uncertain('deadline')
 
     argv = sys.argv[1:] if argv is None else list(argv)
     try:
