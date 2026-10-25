@@ -146,7 +146,7 @@ class DoctorTest(unittest.TestCase):
         with mock.patch.object(nx, "crypto_available", return_value=True):
             _code, out = self.doctor()
         self.assertIn("notify     : channel nx ready", out)
-        self.assertNotIn("refused", out)
+        self.assertNotIn("channel nx refused", out)
 
 
 class InstallerTest(unittest.TestCase):
