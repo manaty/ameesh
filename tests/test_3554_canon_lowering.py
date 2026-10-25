@@ -210,6 +210,29 @@ class DetectionTest(unittest.TestCase):
         self.assertEqual(found.hardened, 0)
         self.assertGreater(found.unchanged, 0)
 
+
+    def test_a_git_timeout_in_the_comparison_is_a_doubt_not_a_crash(self):
+        head = self._head(_federation(secret_rule=False))
+        with mock.patch.object(
+                canon_lowering.plan_git, "local_commit",
+                side_effect=canon_lowering.canon_mod.GitError("timeout sonde")):
+            found = canon_lowering.for_lot(
+                self.cfg, self.canon.root, self.base, head, ["federation.yaml"])
+        self.assertIsInstance(found, canon_lowering.Detection)
+        self.assertEqual(found.floor, 2)
+        self.assertIn("comparaison impossible", " ".join(found.errors))
+
+    def test_a_project_revision_timeout_fails_closed_without_raising(self):
+        head = self._head(_federation(secret_rule=False))
+        with mock.patch.object(
+                canon_lowering, "_revision",
+                side_effect=canon_lowering.canon_mod.GitError("timeout projet")):
+            found = self._detect(head)
+        self.assertEqual(found.floor, 2)
+        self.assertTrue(any("dépôt illisible" in error for error in found.errors),
+                        found.errors)
+
+
     def test_removing_a_project_from_the_policy_is_a_doubt(self):
         head = self._head(_federation(project=False))
         found = self._detect(head)

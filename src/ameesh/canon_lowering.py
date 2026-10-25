@@ -287,10 +287,10 @@ def _scan(cfg, canon_repo: str, base: str, head: str, project: str):
     if found is None:
         return (), 0, 0, None, (project, reason)
     repo, target = found
-    ref, commit = _revision(repo, target)
-    if not commit:
-        return (), 0, 0, None, (project, "no readable revision for %s" % (repo,))
     try:
+        ref, commit = _revision(repo, target)
+        if not commit:
+            return (), 0, 0, None, (project, "no readable revision for %s" % (repo,))
         items, plus, same, unreadable, total = _scan_project(
             canon_repo, base, head, project, repo, commit)
     except (canon_mod.GitError, mechanics.MechanicsError, OSError) as exc:
@@ -309,9 +309,24 @@ def for_lot(cfg, repo: str, base, head, paths: Iterable) -> Optional[Detection]:
     rien. Une comparaison impossible **après** ce constat rend une `Detection`
     en erreur (plancher 2) : la politique d'un canon qu'on ne sait plus lire ne
     se suppose pas inchangée.
+
+    Ne lève jamais : `lot_class._of_lot` est une lecture (porte, feu,
+    paquet-candidats, désignation) et une sonde git qui expire est un doute,
+    jamais une exception qui remonte.
     """
+    paths = list(paths or ())
     if not str(repo or "").strip() or not touches(paths):
         return None
+    try:
+        return _for_lot(cfg, repo, base, head, paths)
+    except (canon_mod.GitError, OSError) as exc:
+        return Detection(base=str(base or ""), head=str(head or ""),
+                         errors=("comparaison impossible: %s: %s"
+                                 % (type(exc).__name__, str(exc)[:200]),))
+
+
+def _for_lot(cfg, repo: str, base, head, paths) -> Optional[Detection]:
+    """Le corps de `for_lot`, sous la garde de ses erreurs git."""
     base_ref = str(base or "").strip()
     head_ref = str(head or "").strip()
     base_commit = _base_commit(repo, base_ref)
@@ -333,7 +348,7 @@ def for_lot(cfg, repo: str, base, head, paths: Iterable) -> Optional[Detection]:
     except (mechanics.MechanicsError, canon_mod.CanonError) as exc:
         return Detection(base=start, head=head_commit,
                          errors=("federation.yaml illisible à la base: %s"
-                                 % (str(exc)[:240],)))
+                                 % (str(exc)[:240],),))
     try:
         head_projects = mechanics.declared_projects(repo, head_commit)
     except mechanics.MechanicsAbsent:
@@ -342,7 +357,7 @@ def for_lot(cfg, repo: str, base, head, paths: Iterable) -> Optional[Detection]:
     except (mechanics.MechanicsError, canon_mod.CanonError) as exc:
         return Detection(base=start, head=head_commit,
                          errors=("federation.yaml illisible à la tête: %s"
-                                 % (str(exc)[:240],)))
+                                 % (str(exc)[:240],),))
     declared = sorted(set(base_projects) | set(head_projects))
     lowered: list = []
     hardened = unchanged = 0
