@@ -244,7 +244,7 @@ class FactoryCompositionTest(unittest.TestCase):
         factory = self.factory()
         names = ('secrets-handoff.py', 'coffre-release.py',
                  'transport-secrets.py', 'transport-release.py',
-                         'controleur-release.py')
+                 'controleur-release.py')
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             for name in names:
