@@ -1697,21 +1697,26 @@ def catch_up(db, *, repo: str = "", target: str = "",
     except Exception:  # noqa: BLE001 - pas de base : rien à rattraper
         return out
 
-    def mark(lot, state, detail):
-        """Marque la tentative sans création (best effort : le lot reste)."""
+    def mark(store, lot, state, detail):
+        """Marque la tentative sans création (best effort : le lot reste).
+
+        #3426 : `store` est le magasin de la transaction courante
+        (`storage.of(tx).work`), jamais celui de la connexion extérieure —
+        sur le pilote psql, les deux sessions sont distinctes et un
+        `FOR UPDATE` pris sur l'une ne protège pas l'autre."""
         try:
-            ops.log_review_attempt(lot, state, "%s%d %s"
-                                   % (ATTEMPT_PREFIX, int(lot), detail),
-                                   work.SYSTEM_SENDER)
+            store.log_review_attempt(lot, state, "%s%d %s"
+                                     % (ATTEMPT_PREFIX, int(lot), detail),
+                                     work.SYSTEM_SENDER)
         except Exception:  # noqa: BLE001 - marqueur best effort
             pass
 
-    def terminal(lot, state, detail):
+    def terminal(store, lot, state, detail):
         """Marque le candidat terminal (best effort : le journal le garde)."""
         try:
-            ops.log_review_attempt(lot, state, "%s%d %s"
-                                   % (TERMINAL_PREFIX, int(lot), detail),
-                                   work.SYSTEM_SENDER)
+            store.log_review_attempt(lot, state, "%s%d %s"
+                                     % (TERMINAL_PREFIX, int(lot), detail),
+                                     work.SYSTEM_SENDER)
         except Exception:  # noqa: BLE001 - marqueur best effort
             pass
 
@@ -1722,16 +1727,17 @@ def catch_up(db, *, repo: str = "", target: str = "",
             slug_cache[path] = plan_git._repo_slug(path)
         return slug_cache[path]
 
-    def attempt_marks(lot):
+    def attempt_marks(store, lot):
         """Le nombre de tentatives et l'instant de la dernière.
 
         #1448 N2 : compté sur les seules notes de tentative du lot (`_noted`),
         pas sur les 200 derniers événements — un lot bavard ne remet pas son
         compteur à zéro et ne retente pas sans fin. #3426 : l'instant sert au
         délai partagé entre les hôtes (une tentative récente écrite par un
-        autre hôte n'est pas doublée)."""
+        autre hôte n'est pas doublée), et `store` est celui de la transaction
+        qui tient le verrou du lot."""
         token = "%s%d" % (ATTEMPT_PREFIX, int(lot))
-        notes = [e for e in _noted(ops, lot, ATTEMPT_PREFIX)
+        notes = [e for e in _noted(store, lot, ATTEMPT_PREFIX)
                  if str(e.get("note") or "").split(" ")[0] == token]
         last = max((float(e.get("created_ts") or 0.0) for e in notes), default=0.0)
         return len(notes), last
@@ -1743,12 +1749,13 @@ def catch_up(db, *, repo: str = "", target: str = "",
         même avis déjà rendu ; un seul laisse la marque. Rend True si la
         marque est là (posée ici ou déjà par un autre), False sinon."""
         try:
-            with db.transaction():
-                if ops.lock(lot) is None:
+            with db.transaction() as tx:
+                store = storage.of(tx).work
+                if store.lock(lot) is None:
                     return False
-                if _noted(ops, lot, TERMINAL_PREFIX):
+                if _noted(store, lot, TERMINAL_PREFIX):
                     return True
-                terminal(lot, state, detail)
+                terminal(store, lot, state, detail)
                 return True
         except Exception:  # noqa: BLE001 - le journal reste best effort
             return False
@@ -1762,22 +1769,23 @@ def catch_up(db, *, repo: str = "", target: str = "",
         terminale), `busy` (un autre hôte a tenté dans le délai) ou `failed`
         (lecture/écriture impossible)."""
         try:
-            with db.transaction():
-                if ops.lock(lot) is None:
+            with db.transaction() as tx:
+                store = storage.of(tx).work
+                if store.lock(lot) is None:
                     return "failed", 0
-                if _open(ops, ref_of(lot)) is not None:
+                if _open(store, ref_of(lot)) is not None:
                     return "already", 0
-                if _noted(ops, lot, TERMINAL_PREFIX):
+                if _noted(store, lot, TERMINAL_PREFIX):
                     return "closed", 0
-                count, last_ts = attempt_marks(lot)
+                count, last_ts = attempt_marks(store, lot)
                 if count and float(retry_s) > 0 \
                         and (time.time() - last_ts) < float(retry_s):
                     return "busy", 0
                 seen = count + 1
                 if seen >= int(max_attempts):
-                    terminal(lot, state, "doute après %d tentatives" % seen)
+                    terminal(store, lot, state, "doute après %d tentatives" % seen)
                     return "terminal", seen
-                mark(lot, state, "sans ouverture: %s" % why)
+                mark(store, lot, state, "sans ouverture: %s" % why)
                 return "attempted", seen
         except Exception:  # noqa: BLE001 - un lot en panne n'arrête pas le rattrapage
             return "failed", 0
@@ -1859,7 +1867,7 @@ def catch_up(db, *, repo: str = "", target: str = "",
                     "title": row.get("title") or "", "sha": sha or ""})
         except Exception:  # noqa: BLE001 - un lot en panne n'arrête pas le rattrapage
             out["failed"] += 1
-            mark(lot, state, "erreur")
+            mark(ops, lot, state, "erreur")
     if out["unopened"]:
         out["warning"] = _warn_unopened(db, out["unopened"], host=out["host"])
     return out

@@ -13,9 +13,11 @@ constatée par git : la classe est calculée, pas doublée.
 """
 from __future__ import annotations
 
+import concurrent.futures
 import dataclasses
 import os
 import subprocess
+import threading
 import unittest
 import uuid
 from unittest import mock
@@ -788,10 +790,11 @@ class CatchUpWitnessTest(_Witness):
         lot = self.merged_lot("dépôt retrouvé")
         registry.upsert(self.db, "pilote", harness="claude", host=self.cfg.host,
                         cwd=self.repo)
+        # #3426 : un hôte sans dépôt s'abstient désormais ; le doute qui
+        # motive l'avertissement vient d'un dépôt candidat qui ne contient
+        # pas le commit (le dossier de l'assigné, ici le dépôt du témoin).
         with mock.patch.dict(os.environ,
-                             {"AMEESH_ALERT_ORCHESTRATORS": "pilote"}), \
-                mock.patch.object(review_lot, "_repo_of_agent", return_value=""), \
-                mock.patch.object(review_lot.lot_class, "repository", return_value=None):
+                             {"AMEESH_ALERT_ORCHESTRATORS": "pilote"}):
             first = review_lot.catch_up(self.db)
             second = review_lot.catch_up(self.db, retry_s=0)
         self.assertEqual((first["attempted"], second["attempted"]), (1, 1),
@@ -842,6 +845,42 @@ class CatchUpWitnessTest(_Witness):
             self.assertEqual(second["unopened"], [], second)
             warn.assert_not_called()
         self.assertEqual(self.review_lots(lot), [])
+
+    def test_deux_sessions_psql_ne_doublent_pas_l_avertissement(self):
+        """#3426 (B1 de la relecture cx1) : sur le pilote psql, deux sessions
+        distinctes sélectionnent le lot au même instant. Le verrou du lot doit
+        être pris sur la session de la transaction (`storage.of(tx)`), pas sur
+        la connexion extérieure : sinon les deux lisent le même compteur,
+        écrivent chacune la deuxième tentative et envoient deux courriers."""
+        lot = self.merged_lot("course psql")
+        storage.of(self.db).work.log_review_attempt(
+            lot, "merged",
+            "%s%d amorce" % (review_lot.ATTEMPT_PREFIX, lot), "témoin")
+        barrier = threading.Barrier(2, timeout=10)
+
+        def racy(_db, _lot, **_kw):
+            barrier.wait()
+            return {"class": "sensitive", "why": "clone sans le commit",
+                    "doubt": True}
+
+        warn = mock.Mock()
+        dbs = [self.connect(driver="psql") for _ in range(2)]
+        for db in dbs:
+            self.addCleanup(db.close)
+        with mock.patch.object(review_lot, "open_for_merge", side_effect=racy), \
+                mock.patch.object(review_lot, "_warn_unopened", warn):
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+                outs = list(pool.map(
+                    lambda db: review_lot.catch_up(
+                        db, retry_s=0, host="ameesh-agents-2"), dbs))
+        self.assertEqual(warn.call_count, 1, outs)
+        self.assertEqual(sum(len(out["unopened"]) for out in outs), 1, outs)
+        self.assertEqual(sum(out["attempted"] for out in outs), 1, outs)
+        notes = [e for e in storage.of(self.db).work.events(lot, 50)
+                 if str(e.get("note") or "").startswith(
+                     review_lot.ATTEMPT_PREFIX + str(lot))]
+        self.assertEqual(len(notes), 2,
+                         "une amorce + une seule deuxième tentative : %s" % notes)
 
     def test_deux_hotes_une_fusion_une_classification_zero_avertissement(self):
         """#3426, témoin du pilote : deux hôtes dont un sans dépôt, une fusion
