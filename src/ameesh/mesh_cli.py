@@ -3691,7 +3691,8 @@ def build_parser() -> argparse.ArgumentParser:
                              help="#3183: pilot's review floor: the gate, the freeze "
                                   "designation and paquet-candidats require max(scale, N) "
                                   "reviews of distinct families; raised after a freeze, it "
-                                  "completes that freeze's designation (#3557); journaled, "
+                                  "completes that freeze's designation (#3557; with an "
+                                  "AGENT, the floor alone — --apply completes); journaled, "
                                   "kept across refreezes; 0 withdraws it (a human's floor: "
                                   "by a human)")
     pw_reviewer.add_argument("--reason", default="",
