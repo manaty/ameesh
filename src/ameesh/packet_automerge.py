@@ -852,12 +852,12 @@ def _gate_locked(cfg, db, lot: int, mine: dict, *, gh, dry_run: bool, actor: str
     # R1 B1 (cx3) : la porte complète des verdicts, comme le feu (classe,
     # avis requis et indépendants sur la tête gelée, membres d'un porteur et
     # delta, #2766), avant toute lecture de CI et tout geste de fusion.
-    # #3091 : la cible résolue de la PR prouve la base de composition du
-    # paquet ; la ref locale du checkout de l'assigné peut être en retard.
-    # #3534 : la porte des avis lit la base de composition (le contenu testé),
-    # pas le SHA de la cible ; c'est aussi la borne du manifeste quand la
-    # cible a été fusionnée dans la tête (B2).
-    verdict_base = composition or base_oid
+    # #3091 : la cible résolue de la PR est la preuve transmise à
+    # `fire.ready_verdicts` ; `packet_reviews._packet_base` choisit ensuite la
+    # base du manifeste et la prouve sur cette cible. #3534 (B4) : ne jamais
+    # transmettre la base enregistrée à sa place — un `record --base X` où X
+    # est un commit sensible du paquet sortirait B..X du périmètre de revue.
+    verdict_base = base_oid
     extra = {"base_sha": verdict_base} if verdict_base else {}
     if checkout:
         extra.update(checkout=checkout, branch=view.get("branch") or "")

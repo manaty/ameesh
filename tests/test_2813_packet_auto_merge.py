@@ -940,7 +940,10 @@ class TargetMovedTest(Journal):
         self.assertEqual(out["result"], "disarmed", out)
         self.assertEqual(gh.merges(), [])
 
-    def test_the_review_gate_reads_the_composition_base(self):
+    def test_the_review_gate_keeps_the_true_target(self):
+        # #3534 (B4) : la base enregistrée ne remplace jamais le SHA de la
+        # cible dans la preuve transmise au feu ; `packet_reviews` y prouve
+        # ensuite la base du manifeste.
         path, git, base = self.repo()
         landing = self.cutoff(path, git)
         self.armed(composition=base)
@@ -953,7 +956,7 @@ class TargetMovedTest(Journal):
         with mock.patch.object(packet_automerge, "_verdicts", verdicts):
             out = self.check(FakeGh(tests="success", base_oid=landing), checkout=path)
         self.assertEqual(out["result"], "merged", out)
-        self.assertEqual(seen.get("base_sha"), base)
+        self.assertEqual(seen.get("base_sha"), landing)
 
     def test_b3_the_clone_is_resolved_before_the_cutoff_guard(self):
         path, git, base = self.repo()
