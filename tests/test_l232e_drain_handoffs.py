@@ -70,7 +70,7 @@ class DrainHandoffTest(PgTestCase):
     def test_missing_helper_and_secret_requirements_are_named_without_host_effects(self):
         self.api.host_lifecycle.drain("source", actor="orch")
         result = host_lifecycle.advance_host(self.db, "source", limits_for=lambda host: self.limits)
-        self.assertEqual(result[0]["missing"], ["helper:L232b"])
+        self.assertEqual(result[0]["missing"], ["helper:L232b", "requirements:L232c"])
         result = host_lifecycle.readiness(self.db, registry.get(self.db, "dev"), "target", adapter=self.adapter)
         self.assertIn("requirements:L232c", result["missing"])
         self.assertIsNone(self.api.handoffs.active("dev"))
