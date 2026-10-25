@@ -14,11 +14,14 @@ from ameesh.runner import AgentWorker, Runner
 from .support import PgTestCase
 
 
-def secondes(attentes):
-    """#1270 : l'attente est découpée au temps **restant**, mesuré à l'instant
-    de l'appel — la valeur porte donc les microsecondes écoulées. On compare à
-    la milliseconde : l'assertion ne dépend plus de l'ordonnanceur."""
-    return [round(t, 3) for t in attentes]
+#: #3597 : tolérance absolue de comparaison des attentes, en secondes.
+#: `_attendre_apres_echec` rend le temps **restant**, mesuré à l'instant de
+#: l'appel : la gigue d'ordonnanceur entre l'échéance calculée et `wake.wait`
+#: vaut quelques millisecondes en CI (run 40212064454 : 4,999 pour 5,0). 50 ms
+#: restent dix fois sous le pas court de 0,5 s : la discrimination 0,5 / 5,0
+#: est intacte, alors qu'un arrondi au centième casse encore au-delà de 5 ms
+#: de gigue (vu sous charge sur #3594).
+TOLERANCE_ATTENTE_S = 0.05
 
 
 class Horloge:
@@ -53,6 +56,20 @@ class EchecsRapidesTest(PgTestCase):
             worker.fast_failures = n
             attentes.append(worker.failure_wait())
         self.assertEqual(attentes, [5.0, 10.0, 20.0, 30.0, 30.0, 30.0])
+
+    def assertAttentes(self, attentes, attendus):
+        """#3597 : compare les attentes à `TOLERANCE_ATTENTE_S` près.
+
+        La valeur d'une attente d'échec est le temps restant mesuré à l'appel :
+        la gigue d'ordonnanceur en CI la raccourcit de quelques ms (run
+        40212064454 : 4,999 pour 5 s). Une égalité au millième dépendait donc
+        de l'ordonnanceur (le centième casserait encore au-delà de 5 ms)."""
+        self.assertEqual(len(attentes), len(attendus), attentes)
+        for i, (reel, attendu) in enumerate(zip(attentes, attendus)):
+            self.assertAlmostEqual(
+                reel, attendu, delta=TOLERANCE_ATTENTE_S,
+                msg="attente %d : %r, attendu %r ± %g s"
+                    % (i, reel, attendu, TOLERANCE_ATTENTE_S))
 
     def _boucle(self, worker, resultats, horloge=None):
         """Fait tourner `run()` sur une suite de tours simulés (True = réussi,
@@ -101,7 +118,7 @@ class EchecsRapidesTest(PgTestCase):
     def test_serie_d_echecs_rapides_arrete_l_agent(self):
         worker = self._worker(max_fast_failures=3)
         attentes = self._boucle(worker, [False, False, False, False])
-        self.assertEqual(secondes(attentes), [5.0, 10.0])  # pas d'attente après l'arrêt
+        self.assertAttentes(attentes, [5.0, 10.0])  # pas d'attente après l'arrêt
         row = registry.get(self.db, "rapide")
         self.assertEqual(row["status"], "stopped")
         self.assertEqual(row["stop_reason"], "erreur")
@@ -111,7 +128,7 @@ class EchecsRapidesTest(PgTestCase):
     def test_un_succes_remet_la_serie_a_zero(self):
         worker = self._worker(max_fast_failures=3)
         attentes = self._boucle(worker, [False, False, True, False, False, True])
-        self.assertEqual(secondes(attentes), [5.0, 10.0, 5.0, 10.0])
+        self.assertAttentes(attentes, [5.0, 10.0, 5.0, 10.0])
         self.assertNotEqual(registry.get(self.db, "rapide")["status"], "stopped")
 
     def test_echec_lent_ne_compte_pas(self):
@@ -126,7 +143,7 @@ class EchecsRapidesTest(PgTestCase):
         pas court de nouvelle tentative (0,5 s)."""
         worker = self._worker(max_fast_failures=2)
         attentes = self._boucle(worker, ["differe", "differe", "differe", False])
-        self.assertEqual(secondes(attentes), [0.5, 0.5, 0.5, 5.0])
+        self.assertAttentes(attentes, [0.5, 0.5, 0.5, 5.0])
         self.assertNotEqual(registry.get(self.db, "rapide")["status"], "stopped")
 
     def test_tour_differe_ne_remet_pas_la_serie_a_zero(self):
@@ -135,7 +152,7 @@ class EchecsRapidesTest(PgTestCase):
         l'arrêt."""
         worker = self._worker(max_fast_failures=2)
         attentes = self._boucle(worker, [False, "differe", False])
-        self.assertEqual(secondes(attentes), [5.0, 0.5])
+        self.assertAttentes(attentes, [5.0, 0.5])
         self.assertEqual(worker.fast_failures, 2)
         row = registry.get(self.db, "rapide")
         self.assertEqual(row["status"], "stopped")
@@ -168,8 +185,8 @@ class EchecsRapidesTest(PgTestCase):
         self.assertTrue(any(t.startswith("session lock held") for t in statuts), statuts)
         self.assertTrue(all(t.startswith("session lock held") for t in statuts[4:]), statuts)
         # le pas court tient pendant la grâce (2 s), puis s'allonge et se borne
-        self.assertEqual(secondes(attentes[:4]), [0.5, 0.5, 0.5, 0.5])
-        self.assertEqual(secondes(attentes[4:8]), [1.0, 2.0, 4.0, 8.0])
+        self.assertAttentes(attentes[:4], [0.5, 0.5, 0.5, 0.5])
+        self.assertAttentes(attentes[4:8], [1.0, 2.0, 4.0, 8.0])
         self.assertEqual(max(attentes), worker.DEFERRED_RETRY_MAX)
         # sur 10 min de verrou tenu, le nombre de prises reste borné (une boucle
         # à 0,5 s en ferait 1200) : la consigne n'est plus martelée
@@ -221,7 +238,7 @@ class EchecsRapidesTest(PgTestCase):
         self.assertFalse((row["status_text"] or "").startswith("session lock held"),
                          row["status_text"])
         self.assertFalse(worker.deferred_alerted)
-        self.assertEqual(secondes(attentes), [0.5] * 8)  # aucun espacement
+        self.assertAttentes(attentes, [0.5] * 8)  # aucun espacement
         lignes = [c.args[0] for c in journal.call_args_list
                   if c.args and "session lock held" in str(c.args[0])]
         self.assertEqual(lignes, [])
@@ -255,7 +272,7 @@ class EchecsRapidesTest(PgTestCase):
         self.assertTrue(statuts[12].startswith(worker.DEFERRED_STATUS), statuts)
         # la grâce repart du premier report de verrou : pas court pendant
         # 2 s, puis espacement — l'attach, lui, n'a jamais espacé.
-        self.assertEqual(secondes(attentes), [0.5] * 12 + [1.0])
+        self.assertAttentes(attentes, [0.5] * 12 + [1.0])
         lignes = [c.args[0] for c in journal.call_args_list
                   if c.args and "session lock held" in str(c.args[0])]
         self.assertEqual(len(lignes), 1, lignes)
@@ -301,5 +318,5 @@ class EchecsRapidesTest(PgTestCase):
                   if c.args and "session lock held" in str(c.args[0])]
         self.assertEqual(len(lignes), 1, lignes)
         # l'attente s'espace bien au-delà de la grâce, sans poser de marque
-        self.assertEqual(secondes(attentes[4:6]), [1.0, 2.0])
+        self.assertAttentes(attentes[4:6], [1.0, 2.0])
         self.assertFalse(worker.deferred_alerted)
