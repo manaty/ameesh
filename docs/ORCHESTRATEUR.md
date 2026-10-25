@@ -769,6 +769,11 @@ courrier les rappelle) :
 * **Diffusions** : `agent-mail send all "…"` dépose une annonce lue au
   prochain tour de chacun, sans réveiller personne ; `--urgent` réveille toute
   l'équipe, rarement.
+* **Un corps qui cite une commande** (backticks, `$(…)`) ne part jamais entre
+  guillemets doubles : le shell de l'expéditeur l'exécuterait avant l'envoi
+  (#3504, incident du 25/10). Envoyer le corps sur l'entrée standard avec un
+  délimiteur entre apostrophes, qui n'interprète rien :
+  `agent-mail send <agent> - --lot <id> <<'EOF'` … `EOF`.
 * Un message d'un humain réveille toujours tout de suite.
 
 | Je veux… | Commande |

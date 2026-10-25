@@ -905,6 +905,12 @@ le fil du projet que lit le propriétaire.
   attente de plus de 2 h, par le geste fait (niveau 1) ou le pilote nommé.
   « Rien à signaler » avec une attente de plus de 2 h est un défaut ; sans
   aucune attente, une ligne (« Audit 14:00 : rien à signaler »).
+* **Un corps qui cite une commande** (backticks, `$(…)`) ne part jamais entre
+  guillemets doubles : le shell de l'auditeur l'exécuterait avant l'envoi.
+  Envoyer le corps sur l'entrée standard, avec un délimiteur entre apostrophes
+  qui n'interprète rien : `agent-mail send mesh-design - --kind event <<'EOF'`
+  … `EOF` (#3504 ; le 25/10, une commande citée avait publié une table et
+  déclenché une rafale de courriers).
 * **Chaque analyse profonde** : dix lignes au plus,
   `agent-mail send mesh-design "Analyse profonde du 2026-10-11 (24 h) : …"
   --kind event`. Le temps perdu trouvé ; les causes racines, une ligne chacune

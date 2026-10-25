@@ -58,7 +58,10 @@ MAIL_REMAINING = ("(%d more recent message(s) waiting: not delivered yet, you wi
 #: pied commun : réponse et suite du travail ; L125 : la règle du courrier
 #: qui réveille (accusés, copies, urgence — docs/ORCHESTRATEUR.md)
 MAIL_FOOTER = ("These messages are delivered here: no need to look for them with "
-               "agent-mail inbox. To reply: agent-mail send <name> \"…\"; "
+               "agent-mail inbox. To reply: agent-mail send <name> \"…\"; when the body "
+               "cites a command (backticks, $(…)) send it on standard input: "
+               "agent-mail send <name> - <<'EOF' … EOF (a quoted delimiter expands "
+               "nothing, your shell runs nothing); "
                "no bare acknowledgement (if needed use --ack, which does not wake "
                "the recipient), a report that expects nothing (nothing to do, "
                "unchanged) with --info (read on the next turn, no wake-up), no "
