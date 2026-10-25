@@ -1016,6 +1016,15 @@ def briefs(alert: dict, listing: list, lot_titles: dict | None = None,
         elif kind == "estimate_bias":
             text = _estimate_bias(alert)
             teams = _projects(by_name, alert.get("agent"))
+            if not teams:
+                # #3502 : un estimateur sans équipe connue (hors registre, ou
+                # fiche sans projet) ne doit pas réveiller TOUS les
+                # orchestrateurs — l'orchestrateur Nexlink recevait ainsi les
+                # estimateurs ameesh `claude3`, `bureau`, `inconnu` et
+                # `human:smichea`. Le brief va à l'estimateur s'il est au
+                # registre, sinon à l'auditeur (repli bureau) : c'est lui qui
+                # publie la table et peut corriger le biais à la source.
+                orchestras = []
         elif kind == "waiting_without_question":
             text = _waiting_without_question(alert)
             teams = _projects(by_name, alert.get("agent"))

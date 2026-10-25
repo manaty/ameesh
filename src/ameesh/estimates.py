@@ -38,6 +38,7 @@ publiée, `ameesh-estimate-reference/1`.
 """
 from __future__ import annotations
 
+import copy
 import json
 import math
 import re
@@ -416,6 +417,12 @@ REFERENCE_SCHEMA = "ameesh-estimate-reference/1"
 MIN_LOTS = 3
 #: ratio réel/estimé médian d'un estimateur hors de cette plage : `estimate_bias`
 BIAS_LOW, BIAS_HIGH = 0.5, 2.0
+#: #3502 : un biais se range par sens (`under` : l'estimateur sous-estime,
+#: `over` : il surestime) et par palier (un doublement du seuil à chaque
+#: cran : ×2–×4, ×4–×8, … pour `under`, ×0,5–×0,25, … pour `over`). L'alerte
+#: ne repart que si ce couple change : republier la même table ne réveille
+#: personne. Le palier est une identité d'épisode, pas un seuil d'alerte.
+BIAS_MAX_LEVEL = 10
 #: clés des groupes, de la plus fine à la plus large ; la lecture prend le
 #: premier groupe d'au moins MIN_LOTS lots
 LEVELS = (("type", "size", "host", "harness"), ("type", "size"), ("type",), ())
@@ -425,6 +432,56 @@ SIZE_LABELS = {"s": "small", "m": "medium", "l": "large"}
 
 def _level_name(level) -> str:
     return ",".join(level) or "*"
+
+
+def bias_side(ratio, low: float = BIAS_LOW, high: float = BIAS_HIGH) -> str | None:
+    """Le sens d'un biais : `under` (réel > estimation), `over` (réel <
+    estimation), ou None dans la plage tolérée / sur une valeur illisible."""
+    try:
+        value = float(ratio)
+    except (TypeError, ValueError):
+        return None
+    if value > float(high):
+        return "under"
+    if value < float(low):
+        return "over"
+    return None
+
+
+def bias_level(ratio, low: float = BIAS_LOW, high: float = BIAS_HIGH) -> int | None:
+    """Le palier d'un biais : 1 au-delà du seuil, puis un cran par doublement
+    (×2–×4 = 1, ×4–×8 = 2, … pour `under` ; ×0,5–×0,25 = 1, … pour `over`).
+    None sans biais. Borné à `BIAS_MAX_LEVEL` : un ratio nul ou absurde ne
+    boucle pas."""
+    try:
+        value = float(ratio)
+    except (TypeError, ValueError):
+        return None
+    side = bias_side(value, low, high)
+    if side is None:
+        return None
+    level = 1
+    if side == "under":
+        bound = float(high) * 2.0
+        while level < BIAS_MAX_LEVEL and value >= bound:
+            level += 1
+            bound *= 2.0
+    else:
+        bound = float(low) / 2.0
+        while level < BIAS_MAX_LEVEL and value > 0.0 and value <= bound:
+            level += 1
+            bound /= 2.0
+        if value <= 0.0:
+            return BIAS_MAX_LEVEL
+    return level
+
+
+def bias_state(ratio, low: float = BIAS_LOW, high: float = BIAS_HIGH):
+    """`(sens, palier)` d'un biais, ou None."""
+    side = bias_side(ratio, low, high)
+    if side is None:
+        return None
+    return side, bias_level(ratio, low, high)
 
 
 def build_reference(rows: list[dict], agents: dict | None = None, *,
@@ -487,17 +544,89 @@ def build_reference(rows: list[dict], agents: dict | None = None, *,
             "bias": [e for e in estimators if e["biased"]]}
 
 
+#: #3502 : champs d'épisode ajoutés aux entrées `bias` par `publish` ; ils
+#: datent l'alerte, pas le contenu de la table — deux publications dont le
+#: contenu est identique (mêmes groupes, mêmes ratios, mêmes comptes) ne
+#: diffèrent que par `generated_ts` et ces champs, et n'écrivent pas de ligne.
+_BIAS_DATING = ("bias_side", "bias_level", "tier_since", "biased_since")
+
+
+def _content(body: dict) -> dict:
+    """Le contenu d'une table, sans l'horodatage de calcul ni les champs
+    d'épisode de ses entrées `bias` (copie profonde : on ne touche pas à
+    l'original)."""
+    out = copy.deepcopy(body)
+    out.pop("generated_ts", None)
+    for entry in out.get("bias") or ():
+        if isinstance(entry, dict):
+            for key in _BIAS_DATING:
+                entry.pop(key, None)
+    return out
+
+
+def _date_bias(body: dict, previous: dict | None) -> None:
+    """#3502 : date chaque biais d'un épisode plutôt que de la publication.
+
+    `biased_since` est l'entrée dans le biais (même sens, paliers confondus) :
+    c'est le `since` de l'alerte, stable d'une republication à l'autre.
+    `tier_since` date le couple (sens, palier) courant ; il est conservé dans
+    la table, et le palier entre dans l'identité de l'alerte (`reason`) pour
+    qu'un cran supérieur soit un nouvel épisode. Sans table précédente datée
+    (publication d'une version antérieure), le repli est `published_ts` de
+    cette table : la clé de niveau 1 déjà posée dans `notify` n'est pas
+    changée au déploiement (#3502)."""
+    low, high = body.get("bias_range") or (BIAS_LOW, BIAS_HIGH)
+    old_body = (previous or {}).get("body") or {}
+    old_low, old_high = old_body.get("bias_range") or (BIAS_LOW, BIAS_HIGH)
+    old = {e.get("estimator"): e for e in old_body.get("bias") or ()
+           if isinstance(e, dict)}
+    fallback = (previous or {}).get("published_ts")
+    stamp = body.get("generated_ts")
+    dated = []
+    for entry in body.get("bias") or ():
+        entry = dict(entry)
+        state = bias_state(entry.get("median_ratio"), low, high)
+        before = old.get(entry.get("estimator"))
+        before_state = (bias_state(before.get("median_ratio"), old_low, old_high)
+                        if before is not None else None)
+        side, level = state if state is not None else (None, None)
+        before_side = before_state[0] if before_state is not None else None
+        if before is not None and side is not None and side == before_side:
+            # même sens : l'entrée en biais survit à un changement de palier
+            biased_since = (before.get("biased_since") or before.get("tier_since")
+                            or fallback or stamp)
+            if state == before_state:
+                tier_since = (before.get("tier_since") or biased_since)
+            else:
+                tier_since = stamp
+        else:
+            tier_since = biased_since = stamp
+        entry.update(bias_side=side, bias_level=level,
+                     tier_since=tier_since, biased_since=biased_since)
+        dated.append(entry)
+    body["bias"] = dated
+
+
 def publish(db, *, actor: str = "", now: float | None = None) -> dict:
     """Le passage de l'auditeur : calcule la table sur les lots livrés et la
     publie (une ligne de `estimate_references`, la plus récente en vigueur).
-    Rend `{id, published_by, published_ts, body}`."""
+    Rend `{id, published_by, published_ts, body, unchanged}`.
+
+    #3502 : une publication dont le contenu est identique à la table en
+    vigueur n'écrit rien (`unchanged`) — republier la même table ne doit ni
+    créer une ligne ni relancer les alertes `estimate_bias` ; les biais
+    gardent leur date d'épisode."""
     from . import registry
 
     rows = storage.of(db).work.estimate_history(app=None, limit=HISTORY_LIMIT)
     agents = {a["name"]: a for a in registry.overview(db)}
     body = build_reference(rows, agents, now=now)
+    previous = current_reference(db)
+    if previous is not None and _content(previous["body"]) == _content(body):
+        return dict(previous, unchanged=True)
+    _date_bias(body, previous)
     row = storage.of(db).work.publish_reference(body, actor=actor)
-    return dict(row, body=body)
+    return dict(row, body=body, unchanged=False)
 
 
 def current_reference(db) -> dict | None:
@@ -578,8 +707,13 @@ def proposal_label(p: dict | None) -> str:
 def format_published(row: dict) -> str:
     """Le compte rendu de `work estimates --publish`."""
     body = row["body"]
-    out = ["reference table #%s published: %d lot(s) delivered, %d measured, %d group(s)"
-           % (row.get("id"), body["delivered"], body["measured"], len(body["groups"]))]
+    state = "unchanged" if row.get("unchanged") else "published"
+    out = ["reference table #%s %s: %d lot(s) delivered, %d measured, %d group(s)"
+           % (row.get("id"), state, body["delivered"], body["measured"],
+              len(body["groups"]))]
+    if row.get("unchanged"):
+        out.append("  identical to the table in force: no new row, no new "
+                   "estimate_bias alert")
     for e in body["estimators"]:
         out.append("  %-24s %4d lot(s)  median %s  p80 %s%s" % (
             str(e["estimator"])[:24], e["lots"], _ratio_cell(e["median_ratio"]),
