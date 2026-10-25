@@ -38,7 +38,7 @@ aux appels locaux et distants : une opération retardée ne contourne pas une
 époque plus récente. Un rejet de transport ne fabrique jamais un reçu négatif
 ou un succès : un effet peut avoir commencé et exige alors réconciliation.
 
-Délai global serveur 55 s, client 60 s ; durée systemd 65 s et arrêt 5 s,
+Délai global serveur 55 s, client 90 s ; vérification complète bornée à 8 s (attente du verrou : 8 s), durée systemd 85 s et arrêt 5 s,
 `KillMode=control-group`. Les enfants sont aussi bornés par H7. Au plus huit
 connexions actives par socket ; chaque requête d'un agent partage le verrou
 H7. Le journal systemd ne reçoit que la catégorie fixe d'indisponibilité,
@@ -53,14 +53,12 @@ intents privés restent dans le journal H7 enrôlé.
    compris ; rien ne provient du checkout modifiable du runner. Préparer les
    scripts compagnons dans `/opt/ameesh-release/lib` et les deux fichiers de
    `deploy/mise-a-jour/systemd/` dans `lib/systemd/`. Toute la chaîne et le
-   contenu sont root, sans écriture groupe/autres ; scripts 0644, dossiers
-   0755. Le runtime doit être au même SHA que les compagnons. Le paquet wheel
+   contenu sont root, sans écriture groupe/autres ; fichiers immuables 0444/0555, dossiers des arbres 0555 (racine 0755, store 0711). Le runtime doit être au même SHA que les compagnons. Le paquet wheel
    fournit les fichiers sous `share/ameesh/mise-a-jour`, pas leur installation
    privilégiée automatique. Pas de `.pth`, dépendance ou lien vers un arbre
-   d'agent. L'installateur refuse les liens de dossiers et vérifie les cibles
-   des liens de fichiers ; il refuse effectivement les `.pth`, FIFOs, sockets et
-   autres fichiers spéciaux. Le scellement cryptographique du contenu du runtime
-   est suivi par le lot #3526 (manaty/ameesh#2692), préalable distinct à l'enrôlement.
+   d'agent. L'installateur refuse tous les liens ; il refuse effectivement les `.pth`, FIFOs, sockets et
+   autres fichiers spéciaux. Le [scellement complet](ops/runtime-root-seal.md)
+   est un préalable à l'enrôlement, vérifié à chaque connexion.
 2. Installer les documents H7 et `local.json` validés par la décision, les
    comptes et groupes réels, journaux root privés. Établir notamment le bus
    user `/run/user/<uid>/bus` : le service root emploie `runuser` et les deux
@@ -68,7 +66,7 @@ intents privés restent dans le journal H7 enrôlé.
    les droits du runner ni ajouter sudo. Le service doit pouvoir joindre les
    bus, dépôts Git et bases enrôlés ; sa politique ne crée pas ces accès.
 3. Exécuter en root le script installé avec le runtime épinglé :
-   `/opt/ameesh-release/runtime/bin/python -I -B /opt/ameesh-release/lib/installer-local-handoff.py install`.
+   `/usr/bin/python3 -I -S -B /usr/local/libexec/ameesh-runtime-seal.py install`.
    Il impose 0755 au dossier du socket, vérifie le bundle root, l'UID, le document H7 et l'absence d'unités
    préexistantes, copie exclusivement les deux unités fixes en 0644, consigne
    leurs empreintes dans `local-install.json` root 0600, recharge systemd et
@@ -85,7 +83,7 @@ déjà admises, arrêter le socket puis toutes les instances
 `ameesh-handoff-local@*.service` ; une interruption peut laisser un intent,
 à réconcilier avant reprise, jamais à effacer pour forcer un succès.
 
-Exécuter le même installateur avec `rollback`. Il vérifie les empreintes des
+Exécuter la même entrée système avec `rollback` (vérification avant import comprise). Il vérifie les empreintes des
 unités contre le reçu, désactive et arrête le socket, arrête toutes les
 instances, puis retire uniquement les unités qu'il a installées et son reçu.
 Un fichier modifié exige examen opérateur, pas d'écrasement. Les documents,

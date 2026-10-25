@@ -49,15 +49,16 @@ class BootstrapFiles:
         runtime.trusted(path.parent)
         if not path.exists() and not path.is_symlink():
             return None
+        limit=8*1024*1024 if path==self.path(delegation.SEAL_DOCUMENT) else 65536
         fd=os.open(path,os.O_RDONLY|os.O_NOFOLLOW|os.O_NONBLOCK)
         with os.fdopen(fd,'rb') as stream:
             before=os.fstat(stream.fileno())
             if (not stat.S_ISREG(before.st_mode) or before.st_uid!=os.geteuid()
-                    or before.st_mode & 0o022 or before.st_nlink!=1 or before.st_size>65536
+                    or before.st_mode & 0o022 or before.st_nlink!=1 or before.st_size>limit
                     or before.st_mode & 0o7000):
                 raise FileError('untrusted bootstrap destination')
-            data=stream.read(65537)
-            if len(data)>65536 or runtime.stamp(before)!=runtime.stamp(os.fstat(stream.fileno())):
+            data=stream.read(limit+1)
+            if len(data)>limit or runtime.stamp(before)!=runtime.stamp(os.fstat(stream.fileno())):
                 raise FileError('bootstrap destination changed')
         return dict(content=base64.b64encode(data).decode(),mode=stat.S_IMODE(before.st_mode),
                     sha256=hashlib.sha256(data).hexdigest())

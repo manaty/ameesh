@@ -131,6 +131,29 @@ class SignedBootstrapTest(support.PgTestCase):
     def valid(self,step='account',digest=None):
         return self.adapter.validate(self.operation,digest or self.adapter.scopes[step],step)
 
+    def test_signed_seal_cannot_be_replaced_by_another_sha_or_unsigned_pin(self):
+        from tests.test_3526_runtime_seal import SealTest, seal, empty_tree
+        files=SealTest(); files.setUp(); self.addCleanup(files.doCleanups)
+        manifest=dict(files.document,machine_id=self.bundle['machine_id'])
+        plan=dict(self.bundle['plan'],
+                  runtime_tree_sha256=manifest['trees']['runtime']['digest'],
+                  source_tree_sha256=manifest['trees']['lib']['digest'])
+        def rendered(doc):
+            return bootstrap.delegation.render(plan,account_ids=dict(uid=987,gid=987),
+                enrollment={bootstrap.delegation.SEAL_DOCUMENT:seal.canonical(doc).decode()})
+        self.bundle=rendered(manifest)
+        self.view=decisions.ask(self.cfg,self.db,requester='fixture-controller',new_lot='Synthetic root seal',
+            question=bootstrap.question(self.operation,self.bundle,expires_at=int(self.now)+600),
+            options=['%s=%s'%(item['key'],item['label']) for item in bootstrap.OPTIONS],needs_signature=True)
+        self.adapter=bootstrap.SignedBootstrapAuthority(self.db,self.view['id'],self.operation,self.bundle,clock=lambda:self.now)
+        self.assertFalse(self.valid('configuration'))
+        self.sign(); self.assertTrue(self.valid('configuration'))
+        changed=rendered(dict(manifest,sha='c'*40))
+        replacement=bootstrap.SignedBootstrapAuthority(self.db,self.view['id'],self.operation,changed,clock=lambda:self.now)
+        self.assertFalse(replacement.validate(self.operation,replacement.scopes['configuration'],'configuration'))
+        authority.revoke_key(self.db,'fixture-owner')
+        self.assertFalse(self.valid('configuration'))
+
     def test_signature_requires_exact_scopes_and_cannot_authorize_arbitrary_steps(self):
         self.assertFalse(self.valid()); self.sign()
         for step in bootstrap.STEPS: self.assertTrue(self.valid(step),step)

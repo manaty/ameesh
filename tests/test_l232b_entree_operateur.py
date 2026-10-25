@@ -111,6 +111,49 @@ class OperatorEntryTest(unittest.TestCase):
         arguments.update(changes)
         return entry.probe(**arguments)
 
+    def test_prepare_seal_reuses_signed_bundle_and_exact_destination_inventory(self):
+        from tests.test_3526_runtime_seal import empty_tree
+        document=dict(version=1,sha='a'*40,machine_id=self.plan['machine_id'],trees={
+            'runtime':installer.runtime.inventory(self.trees['runtime']),
+            'lib':installer.runtime.inventory(self.trees['sources']), 'store':empty_tree()})
+        observed={path:None for path in entry.destinations(plan=self.plan,account_ids=self.accounts,
+                    probe_turn=self.turn,runtime_seal=document)}
+        prepared=self.prepare(runtime_seal=document,observed=observed)
+        self.assertEqual(prepared.bundle['files'][entry.delegation.SEAL_DOCUMENT]['content'],entry.canonical(document))
+        self.assertIn(entry.delegation.SEAL_ENTRY,prepared.bundle['files'])
+        with self.assertRaises(entry.OperatorError):
+            self.prepare(runtime_seal=document)  # prior inventory lacks the new protected files
+
+    def test_bootstrap_publishes_and_verifies_the_complete_sealed_runtime(self):
+        from types import SimpleNamespace
+        from unittest import mock
+        from tests.test_3526_runtime_seal import seal, empty_tree
+        config=self.trees['runtime']/'pyvenv.cfg'
+        config.write_text('home = /usr/bin\ninclude-system-site-packages = false\n'); config.chmod(0o600)
+        trees={name:installer.runtime.inventory(path) for name,path in self.trees.items()}
+        self.plan=dict(self.plan,runtime_tree_sha256=trees['runtime']['digest'],source_tree_sha256=trees['sources']['digest'])
+        document=dict(version=1,sha='a'*40,machine_id=self.plan['machine_id'],
+                      trees={'runtime':trees['runtime'],'lib':trees['sources'],'store':empty_tree()})
+        observed={path:None for path in entry.destinations(plan=self.plan,account_ids=self.accounts,
+                    probe_turn=self.turn,runtime_seal=document)}
+        prepared=self.prepare(runtime_seal=document,observed=observed)
+        host=Host(self.root)
+        adapter=installer.BootstrapHostAdapter(self.temp/'install-journal',authority=self.base.authority,system=host,root=self.root)
+        original=installer.module
+        calls=[]
+        def verify(doc,base):
+            calls.append(base)
+            return seal.verify(doc,base,uid=os.getuid())
+        with mock.patch.object(seal,'protected',side_effect=lambda path,**kw:Path(path)), \
+             mock.patch.object(installer,'module',side_effect=lambda name:SimpleNamespace(verify=verify) if name=='scellement-runtime' else original(name)):
+            # Lock serialization and real signature are tested independently;
+            # here every publication/snapshot/measurement is a real fixture file.
+            self.assertEqual(entry.bootstrap._run(self.temp/'order-journal',self.operation,prepared.bundle,
+                             authority=self.base.authority,adapter=adapter),'installed')
+        self.assertEqual(calls,[self.root/'opt/ameesh-release'])
+        installed=self.root/entry.delegation.SEAL_DOCUMENT.lstrip('/')
+        self.assertEqual(json.loads(installed.read_text()),document)
+
     def test_probe_is_bound_to_the_registry_row_and_the_enrolled_policy(self):
         self.assertEqual(self.turn,dict(agent='fixture',unit='ameesh-runner@fixture.service',
                                         account='ameesh',home='/home/ameesh',seconds=30))
@@ -278,7 +321,7 @@ class OperatorEntryTest(unittest.TestCase):
                          {'prepared','authority','adapter','journal'})
         self.assertEqual(set(inspect.signature(entry.prepare).parameters),
                          {'operation','plan','account_ids','trees','observed','probe_turn',
-                          'expires_at','db'})
+                          'expires_at','db','runtime_seal'})
         source=(ROOT/'deploy/mise-a-jour/entree-operateur.py').read_text()
         self.assertNotIn('__main__',source)
         self.assertNotIn('argparse',source)
