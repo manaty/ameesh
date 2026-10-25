@@ -940,6 +940,51 @@ class DispatcherTest(unittest.TestCase):
                 companion._atomic_json(link / 'x.json', {'x': 1})
             self.assertFalse((real / 'x.json').exists())
 
+    def test_owning_a_swapped_entry_never_follows_the_link(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            target = root / 'target'
+            target.write_text('secret')
+            target.chmod(0o600)
+            before = target.stat()
+            parent = root / 'parent'
+            parent.mkdir(mode=0o700)
+            link = parent / 'entry'
+            link.symlink_to(target)
+            with mock.patch.object(companion.os, 'fchown') as fchown:
+                with self.assertRaises(companion.Refused):
+                    companion._own_at(link, (65534, 65534))
+                fchown.assert_not_called()
+            after = target.stat()
+            self.assertEqual((after.st_uid, after.st_gid, after.st_mode),
+                             (before.st_uid, before.st_gid, before.st_mode))
+            self.assertTrue(link.is_symlink())
+            real = parent / 'real'
+            real.write_text('x')
+            with mock.patch.object(companion.os, 'fchown') as fchown:
+                companion._own_at(real, (0, 0))
+            self.assertEqual(fchown.call_args[0][1:], (0, 0))
+
+    def test_atomic_json_owns_the_temporary_before_the_rename(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / 'x.json'
+            calls = []
+            real_replace = companion.os.replace
+
+            def replace(*args, **kwargs):
+                calls.append('replace')
+                return real_replace(*args, **kwargs)
+
+            def chown(fd, uid, gid):
+                calls.append('chown')
+
+            with mock.patch.object(companion.os, 'geteuid', return_value=0), \
+                    mock.patch.object(companion.os, 'fchown', side_effect=chown), \
+                    mock.patch.object(companion.os, 'replace', side_effect=replace):
+                companion._atomic_json(path, {'x': 1}, owner=(0, 0))
+            self.assertEqual(calls, ['chown', 'replace'])
+            self.assertEqual(json.loads(path.read_text()), {'x': 1})
+
     def test_private_marker_read_allows_the_enrolled_account(self):
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / 'profile.json'

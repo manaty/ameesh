@@ -197,6 +197,12 @@ before the uncertain intent is left for reconciliation. Expiry during an
 effect is uncertain, never a definitive refusal: it keeps the durable intent,
 fails the transport, and leaves reconciliation to the controller.
 
+Root ownership changes never follow a path: each freshly created entry is
+opened with `O_NOFOLLOW` and chowned through its descriptor, and
+`_atomic_json` gives the temporary file to the account before its atomic
+rename. An account that swaps an entry for a link therefore cannot make root
+change the link target's owner.
+
 The host execution enrollment's `account` is the **Unix** account that owns
 the home and runner unit. The harness/provider account in a request is a
 different identity: the controller validates it against the enrolled

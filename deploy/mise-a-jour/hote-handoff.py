@@ -243,13 +243,15 @@ def load_execution(root=ENROLLMENT_ROOT):
         raise Refused('execution') from None
 
 
-def _atomic_json(path, value):
+def _atomic_json(path, value, *, owner=None):
     """Private durable JSON through a pinned directory descriptor.
 
     The parent is opened with ``O_DIRECTORY|O_NOFOLLOW`` and the temporary is
     created/replaced relative to that descriptor, so a directory swapped by
     the account between the private-chain check and this write cannot redirect
-    a privileged marker into another tree.
+    a privileged marker into another tree. When ``owner`` is given, the
+    temporary is handed to that account through its descriptor *before* the
+    rename: the account can never make the ownership change follow a link.
     """
     path = Path(path)
     candidate = '.' + path.name + '-' + os.urandom(6).hex()
@@ -263,6 +265,8 @@ def _atomic_json(path, value):
             json.dump(value, stream, sort_keys=True)
             stream.flush()
             os.fsync(stream.fileno())
+            if owner is not None and os.geteuid() == 0:
+                os.fchown(stream.fileno(), owner[0], owner[1])
         os.replace(candidate, path.name, src_dir_fd=directory,
                    dst_dir_fd=directory)
         os.fsync(directory)
@@ -276,6 +280,42 @@ def _atomic_json(path, value):
     finally:
         if directory is not None:
             os.close(directory)
+
+
+def _own_at(path, owner, *, directory=False):
+    """Hand a freshly created entry to the enrolled account, never a link.
+
+    The account owns the parent directory and can replace the entry between
+    its creation and the ownership change. Opening the entry itself with
+    ``O_NOFOLLOW`` and changing its descriptor's owner can never follow such a
+    link: a swapped entry is refused instead of chowning its target.
+    """
+    path = Path(path)
+    parent = descriptor = None
+    try:
+        parent = os.open(path.parent,
+                         os.O_RDONLY | _O_DIRECTORY | os.O_NOFOLLOW)
+        flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+        if directory:
+            flags |= _O_DIRECTORY
+        descriptor = os.open(path.name, flags, dir_fd=parent)
+        info = os.fstat(descriptor)
+        if directory:
+            if not stat.S_ISDIR(info.st_mode):
+                raise Refused('owner')
+        elif not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+            raise Refused('owner')
+        try:
+            os.fchown(descriptor, owner[0], owner[1])
+        except OSError:
+            raise Refused('owner') from None
+    except OSError:
+        raise Refused('owner') from None
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        if parent is not None:
+            os.close(parent)
 
 
 def _unlink_private(path):
@@ -309,8 +349,8 @@ def _ensure_private(path, *, owner=None):
         raise Refused('state')
     if owner is not None and os.geteuid() == 0 and info.st_uid == 0:
         try:
-            os.chown(path, owner[0], owner[1])
-        except OSError:
+            _own_at(path, owner, directory=True)
+        except Refused:
             raise Refused('state:owner') from None
     return path
 
@@ -353,8 +393,7 @@ def _private_chain(path, *, owner=None, root=None):
     for directory in reversed(missing):
         directory.mkdir(mode=0o700)
         if owner is not None and os.geteuid() == 0:
-            os.chown(directory, owner[0], owner[1])
-        os.chmod(directory, 0o700)
+            _own_at(directory, owner, directory=True)
     return _ensure_private(path, owner=owner)
 
 
@@ -966,8 +1005,7 @@ class HostEffects:
             if _read_private_json(marker, owner=self._owner(entry)) != expected:
                 raise Refused('dsh_profile')
         else:
-            _atomic_json(marker, expected)
-            _own(marker, self._owner(entry))
+            _atomic_json(marker, expected, owner=self._owner(entry))
         return True
 
     # -- source stop -------------------------------------------------------
@@ -1085,7 +1123,8 @@ class HostEffects:
         keep = False
         try:
             temporary.mkdir(mode=0o700)
-            _own(temporary, self._owner(entry))
+            if os.geteuid() == 0:
+                _own_at(temporary, self._owner(entry), directory=True)
             self._git(entry, temporary, ['init', '--quiet'])
             marker = temporary / '.git' / 'ameesh-handoff-intent'
             _atomic_json(marker, {'action_id': request['action_id']})
@@ -1156,8 +1195,7 @@ class HostEffects:
             if _read_private_json(marker, owner=self._owner(entry)) != expected:
                 raise Refused('session')
         else:
-            _atomic_json(marker, expected)
-            _own(marker, self._owner(entry))
+            _atomic_json(marker, expected, owner=self._owner(entry))
         return {'mode': mode, 'executor_enabled': False,
                 'oauth_cache_transferred': False}
 
@@ -1255,11 +1293,7 @@ class HostEffects:
         if not existed and os.geteuid() == 0:
             # Only a directory this executor just created is handed to the
             # account; an enrolled shared root keeps its own ownership.
-            try:
-                uid, gid = self._owner(entry)
-                os.chown(parent, uid, gid)
-            except OSError:
-                raise Refused('cwd') from None
+            _own_at(parent, self._owner(entry), directory=True)
 
     def _release_revision(self):
         """Read the pinned release receipt; never activate or switch it."""
@@ -1303,14 +1337,6 @@ def _caps_ready(fields):
     except (TypeError, ValueError):
         return False
     return maximum > 0 and high > 0
-
-
-def _own(path, owner):
-    if os.geteuid() == 0:
-        try:
-            os.chown(path, owner[0], owner[1])
-        except OSError:
-            raise Refused('owner') from None
 
 
 def _same_effect(stored, request):
