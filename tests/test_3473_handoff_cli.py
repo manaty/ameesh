@@ -5,6 +5,7 @@ import functools
 import io
 import json
 from pathlib import Path
+import shutil
 import tempfile
 from types import SimpleNamespace
 import unittest
@@ -29,6 +30,78 @@ class OperatorTest(unittest.TestCase):
         with contextlib.redirect_stdout(out):
             code = mesh_cli._handoff_operator(object(), self.db, args)
         return code, out.getvalue()
+
+    @contextlib.contextmanager
+    def controller(self):
+        """Run the real controller and contract with storage and host doubles."""
+        operation = {'id': 'op', 'agent': 'dev', 'source': 'source', 'target': 'target',
+                     'state': 'held', 'reserved_until_ts': 0,
+                     'plan': {'repository': 'git@forge:org/app.git',
+                              'owner': 'runner', 'epoch': 1},
+                     'evidence': {'held_at': 'prepared', 'controller_epoch': 1}}
+        self.api.handoffs.get.return_value = operation
+        self.api.handoffs.db = self.db
+        self.api.handoffs.controller.return_value = contextlib.nullcontext(self.db)
+        self.api.handoffs.cancellation_guard.return_value = contextlib.nullcontext(
+            self.api.handoffs)
+        self.api.handoffs.begin_effect.return_value = operation
+        self.api.handoffs.promote_loss.return_value = None
+        self.api.host_lifecycle.get.return_value = None
+        self.binding.adapter = mock.Mock()
+        self.binding.adapter.revalidate.return_value = True
+        with mock.patch.object(work, 'corrector'), \
+                mock.patch.object(storage, 'of', return_value=self.api), \
+                mock.patch.object(handoff_factory, 'load', return_value=self.binding):
+            yield operation
+
+    def test_expired_retry_names_explicit_renewal_without_resuming(self):
+        with self.controller():
+            with self.assertRaisesRegex(ValueError, 'renewal_required:.*--renew-ttl'):
+                self.invoke('retry')
+        self.binding.adapter.revalidate.assert_called_once()
+        self.api.handoffs.renew.assert_not_called()
+        self.api.handoffs.transition.assert_not_called()
+
+    def test_cancel_after_switch_or_source_loss_names_refusal_without_restoring(self):
+        for state, reason, control, category in (
+                ('switched', None, None, 'destination_switched'),
+                ('prepared', 'host_loss', None, 'source_lost'),
+                ('prepared', None, {'mode': 'lost'}, 'source_lost')):
+            with self.subTest(category=category, control=control), self.controller() as op:
+                op['evidence']['held_at'] = state
+                op['plan']['reason'] = reason
+                self.api.host_lifecycle.get.return_value = control
+                with self.assertRaisesRegex(ValueError, category + ':'):
+                    self.invoke('cancel')
+                self.binding.adapter.restore_source.assert_not_called()
+                self.api.handoffs.unfence.assert_not_called()
+
+    def test_helper_cannot_publish_a_controller_refusal(self):
+        with self.controller():
+            self.binding.adapter.revalidate.side_effect = handoffs.HandoffRefusal(
+                handoffs.Refusal.RENEWAL_REQUIRED)
+            with self.assertRaisesRegex(ValueError, '^handoff step refused; inspect') as caught:
+                self.invoke('retry')
+        self.binding.adapter.revalidate.assert_called_once()
+        self.assertNotIn('renewal_required', str(caught.exception))
+        self.api.handoffs.transition.assert_not_called()
+
+    def test_public_category_does_not_render_exception_text(self):
+        error = handoffs.HandoffRefusal(handoffs.Refusal.RENEWAL_REQUIRED)
+        error.args = ('SECRET',)
+        with self.controller(), mock.patch.object(handoffs, 'retry', side_effect=error):
+            with self.assertRaisesRegex(ValueError, 'renewal_required:.*--renew-ttl') as caught:
+                self.invoke('retry')
+        self.assertNotIn('SECRET', str(caught.exception))
+        self.assertTrue(caught.exception.__suppress_context__)
+
+    def test_unknown_category_is_filtered(self):
+        error = handoffs.HandoffRefusal(handoffs.Refusal.RENEWAL_REQUIRED)
+        error.reason = SimpleNamespace(name='SECRET', value='SECRET')
+        with self.controller(), mock.patch.object(handoffs, 'retry', side_effect=error):
+            with self.assertRaisesRegex(ValueError, '^handoff step refused; inspect') as caught:
+                self.invoke('retry')
+        self.assertNotIn('SECRET', str(caught.exception))
 
     def test_dispatch_one_step_with_shared_binding_and_filter_output(self):
         import ameesh
@@ -75,15 +148,21 @@ class OperatorTest(unittest.TestCase):
         self.loader.load.assert_not_called()
 
     def test_real_factory_without_enrollment_refuses_before_controller_step(self):
-        # Keep the actual pinned source and loader; only redirect its enrollment
-        # documents to an empty private directory, without touching this host.
-        module = handoff_factory._module(handoff_factory.source_path())
+        # Exercise enrollment even when the checkout is group-writable. The
+        # copy retains the actual source and passes the real loader trust check.
         with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / 'fabrique-handoff.py'
+            shutil.copyfile(handoff_factory.source_path(), source)
+            source.chmod(0o644)
+            enrollment = Path(directory) / 'enrollment'
+            enrollment.mkdir(mode=0o700)
+            module = handoff_factory._module(source)
             module.HandoffFactory = functools.partial(
-                module.HandoffFactory, root=Path(directory))
+                module.HandoffFactory, root=enrollment)
             with mock.patch.object(work, 'corrector'), \
                     mock.patch.object(storage, 'of', return_value=self.api), \
-                    mock.patch.object(handoff_factory, '_module', return_value=module), \
+                    mock.patch.object(handoff_factory, 'source_path', return_value=source), \
+                    mock.patch.object(handoff_factory, '_module', return_value=module) as load, \
                     mock.patch.object(handoffs, 'advance') as advance, \
                     mock.patch.object(handoffs, 'cancel') as cancel, \
                     mock.patch.object(handoffs, 'retry') as retry:
@@ -92,6 +171,10 @@ class OperatorTest(unittest.TestCase):
                         with self.assertRaisesRegex(ValueError, '^handoff step refused;') as caught:
                             self.invoke(command)
                         self.assertNotIn(directory, str(caught.exception))
+                        failure = caught.exception.__context__.__context__
+                        self.assertIsInstance(failure, module.FactoryError)
+                        self.assertEqual(str(failure), 'document:enrollment')
+                self.assertEqual(load.call_args_list, [mock.call(source)] * 3)
                 advance.assert_not_called()
                 cancel.assert_not_called()
                 retry.assert_not_called()
@@ -106,15 +189,20 @@ class OperatorTest(unittest.TestCase):
 
     def test_private_helper_exception_is_filtered(self):
         import ameesh
-        with mock.patch.object(work, 'corrector'), \
-                mock.patch.object(storage, 'of', return_value=self.api), \
-                mock.patch.object(ameesh, 'handoff_factory', self.loader, create=True), \
-                mock.patch.object(host_lifecycle, '_ReadyAdapter'), \
-                mock.patch.object(handoffs, 'retry', side_effect=ValueError('SECRET')):
-            with self.assertRaisesRegex(ValueError, '^handoff step refused;') as raised:
-                self.invoke('retry')
-        self.assertNotIn('SECRET', str(raised.exception))
-        self.assertTrue(raised.exception.__suppress_context__)
+        for command in ('advance', 'cancel', 'retry'):
+            for error in (ValueError('SECRET'), handoffs.HandoffError('SECRET'),
+                          handoffs.HandoffError(handoffs.Refusal.RENEWAL_REQUIRED.value)):
+                with self.subTest(command=command, error=type(error)), \
+                        mock.patch.object(work, 'corrector'), \
+                        mock.patch.object(storage, 'of', return_value=self.api), \
+                        mock.patch.object(ameesh, 'handoff_factory', self.loader, create=True), \
+                        mock.patch.object(host_lifecycle, '_ReadyAdapter'), \
+                        mock.patch.object(handoffs, command, side_effect=error):
+                    with self.assertRaisesRegex(ValueError, '^handoff step refused; inspect') as raised:
+                        self.invoke(command)
+                self.assertNotIn('SECRET', str(raised.exception))
+                self.assertNotIn('renewal_required', str(raised.exception))
+                self.assertTrue(raised.exception.__suppress_context__)
 
     def test_explicit_renewal_forwarded_without_advancing(self):
         import ameesh
