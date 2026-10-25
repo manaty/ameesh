@@ -191,9 +191,11 @@ to the account's X25519 key-wrap key (`GET /mesh/alerts/keys`, generation 1:
 AES-256-GCM under a random CEK, the CEK wrapped per active key with Nexlink's
 `wrapToX25519` format, subject `meshAlert = 5`), so the hub only stores
 `{v, alert_id, severity, occurred_at, ciphertext, nonce, wraps}`. `alert_id` is
-a deterministic UUIDv5 of the alert identity (Nexlink stores it as a `uuid`
-and refuses unknown envelope fields); `X-Mesh-Idempotency-Key` is that
-`alert_id`. A resolution is not pushed to the hub in v1 (its schema has no
+a deterministic UUIDv5 of the alert identity (the `since` of the episode, or
+the raised instant when it has none so two successive `account_overage` stay
+distinct; a rate summary carries the identity of its state bucket). Nexlink
+stores it as a `uuid` and refuses unknown envelope fields;
+`X-Mesh-Idempotency-Key` is that `alert_id`. A resolution is not pushed to the hub in v1 (its schema has no
 state; the app row stays raised), so `ameesh notify` skips it for this channel.
 With no active key the alert is sent **content-free** (`content_free: true`)
 and the app opens the console. Requests are signed with
@@ -202,9 +204,9 @@ and the app opens the console. Requests are signed with
 `key_id "\n" timestamp "\n" body`. 401/400/404/422 are
 permanent, 429/5xx are retried, 409 `key_unknown` refreshes the keys once.
 On the second consecutive failure (or at once on a permanent error) the text
-is sent once per alert to the `fallback` channel, prefixed
-`repli nexlink —`; the primary keeps being retried and a fallback success is
-not a Nexlink delivery. `ameesh notify --test` prints the read receipt
+— including a rate summary — is sent once per `alert_id` to the `fallback`
+channel, prefixed `repli nexlink —`; the primary keeps being retried and a
+fallback success is not a Nexlink delivery. `ameesh notify --test` prints the read receipt
 (`GET /mesh/alerts/{id}`). The `cryptography` extra is required
 (`pip install 'ameesh[crypto]'`). ntfy stays the transition channel and is
 removed only after 7 green days in production **and** a real urgent alert read

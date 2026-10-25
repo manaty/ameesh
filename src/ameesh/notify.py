@@ -107,6 +107,7 @@ import re
 import subprocess
 import sys
 import time
+import uuid
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -812,7 +813,8 @@ def _summary_resolved_count(resolved) -> int:
     return int(resolved or 0)
 
 
-def render_summary(bucket: dict, host: str) -> Message:
+def render_summary(bucket: dict, host: str, *, alert_id: str | None = None,
+                   occurred_at: str | None = None) -> Message:
     raised = _summary_raised_counts(bucket.get("raised"))
     resolved = _summary_resolved_count(bucket.get("resolved"))
     total = sum(raised.values()) + resolved
@@ -830,7 +832,8 @@ def render_summary(bucket: dict, host: str) -> Message:
             "%d %s" % (n, TYPE_LABELS.get(kind, kind)) for kind, n in sorted(raised.items())
             if kind in sous_utilisation.UNDERUSE_TYPES)))
     body = "%s\nsee `ameesh alerts` on host %s" % ("; ".join(parts) or "—", host)
-    return Message(title, body, urgent=any(k in URGENT_TYPES for k in raised))
+    return Message(title, body, urgent=any(k in URGENT_TYPES for k in raised),
+                   alert_id=alert_id, kind="summary", occurred_at=occurred_at)
 
 
 def test_alert_id(human: str, channel: Channel, host: str) -> str:
@@ -1566,9 +1569,10 @@ def _notification_id(key, severity, human, since=None) -> str:
 def message_alert_id(message: Message) -> str:
     """L'identité stable d'un message pour le canal `nexlink`.
 
-    Posée par `_attempt` (identité du registre `notified` en UUIDv5) ; un
-    message sans elle (résumé de débit) en reçoit une dérivée de son texte,
-    stable entre deux essais et valide comme UUID pour l'API #3537.
+    Posée par `_attempt` (identité du registre `notified` en UUIDv5) et par
+    `_summaries` (identité de l'épisode de bucket) ; un message construit
+    sans elle (test ad hoc) en reçoit une dérivée de son texte, stable entre
+    deux essais et valide comme UUID pour l'API #3537.
     """
     if message.alert_id:
         return message.alert_id
@@ -2742,8 +2746,15 @@ class Notifier:
         # #3536 : l'identité que porte le canal nexlink — le registre `notified`
         # (#2395) haché, donc stable d'un redémarrage à l'autre ; l'instant est
         # figé au premier essai pour que deux essais envoient les mêmes octets.
+        # Un épisode sans `since` (`account_overage`) n'a pas d'identité au
+        # registre : son `raised_ts`, figé dans l'entrée, distingue deux
+        # occurrences successives sans changer l'identité des retries
+        # (relecture cx3 B/P2).
+        since = _since_of(entry["alert"])
+        episode = since if since is not None else round(
+            float(entry.get("raised_ts") or now), 3)
         identity = _notification_id(key_of(entry["alert"]), _entry_severity(entry),
-                                    entry.get("human"), _since_of(entry["alert"]))
+                                    entry.get("human"), episode)
         occurred_at = entry.get("occurred_at") or iso_utc(now)
         entry["occurred_at"] = occurred_at
         message = replace(message,
@@ -3046,6 +3057,8 @@ class Notifier:
         bucket["raised"] = self._normalize_summary_raised(human, bucket.get("raised"))
         bucket["resolved"] = self._normalize_summary_resolved(human, bucket.get("resolved"))
         bucket["attempts"] = int(bucket.get("attempts") or 0)
+        if not isinstance(bucket.get("channels"), dict):
+            bucket["channels"] = {}
         return bucket
 
     def _bucket(self, human: str) -> dict:
@@ -3111,6 +3124,23 @@ class Notifier:
             if identity in active:
                 del resolved[identity]
 
+    def _summary_alert_id(self, human: str, bucket: dict) -> str:
+        """L'identité d'un résumé est celle de son épisode de bucket, pas celle
+        de son texte (#3536, relecture cx3 B/P2) : deux résumés successifs
+        « 1 dead_runner » restent deux lignes dans l'app. L'épisode et
+        l'`alert_id` sont figés dans l'état, donc les retries envoient le même
+        UUID et l'API #3537 les déduplique."""
+        alert_id = bucket.get("alert_id")
+        if isinstance(alert_id, str) and alert_id:
+            return alert_id
+        episode = bucket.get("episode")
+        if not isinstance(episode, str) or not episode:
+            episode = uuid.uuid4().hex
+            bucket["episode"] = episode
+        alert_id = nexlink_alerts.alert_id_for("summary|%s|%s" % (human, episode))
+        bucket["alert_id"] = alert_id
+        return alert_id
+
     def _summaries(self, now: float) -> None:
         for human in list(self.state["summary"]):
             bucket = self._bucket(human)
@@ -3127,33 +3157,81 @@ class Notifier:
                 self.log("rate summary for %s lost: no channel left" % human)
                 del self.state["summary"][human]
                 continue
-            message = render_summary(bucket, self.cfg.host)
-            results, ok = {}, False
+            alert_id = self._summary_alert_id(human, bucket)
+            occurred_at = bucket.get("occurred_at") or iso_utc(now)
+            bucket["occurred_at"] = occurred_at
+            message = render_summary(bucket, self.cfg.host, alert_id=alert_id,
+                                     occurred_at=occurred_at)
+            states = bucket["channels"]
             for channel in channels:
+                states.setdefault(channel.name, {"ok": False, "attempts": 0,
+                                                 "error": None})
+            entry = {"alert": {"type": "summary"}, "human": human,
+                     "source": "debit", "channels": states}
+            results, fallbacks = {}, {}
+            primary_ok = False
+            for channel in channels:
+                state = states[channel.name]
+                if (state.get("fallback_of") or state.get("ok")
+                        or int(state.get("attempts") or 0) >= self.ncfg.max_attempts):
+                    continue
                 sent, error = self._send(channel, message)
-                ok = ok or sent
-                results[channel.name] = ("a_blanc" if self.dry_run else "ok") if sent \
-                    else "failed: %s" % error
-                if not sent:
-                    self.log("rate summary → %s, channel %s: %s" % (human, channel.name,
-                                                                    error))
+                state["attempts"] = int(state.get("attempts") or 0) + 1
+                if sent:
+                    state.update(ok=True, error=None, ts=round(now, 3))
+                    results[channel.name] = "a_blanc" if self.dry_run else "ok"
+                    primary_ok = True
+                    continue
+                if error.permanent:
+                    state["attempts"] = self.ncfg.max_attempts
+                state["error"] = str(error)
+                results[channel.name] = "failed: %s" % error
+                self.log("rate summary → %s, channel %s: %s" % (human, channel.name,
+                                                                error))
+                if channel.kind == "nexlink":
+                    # #3536 (relecture cx3 B/P1) : un résumé de débit passe par
+                    # le même repli qu'une alerte directe. Sans cela, une API
+                    # nexlink en panne perdait le résumé malgré un repli sain.
+                    self._nexlink_fallback(entry, channel, message, state, error,
+                                           fallbacks)
+            for name in [name for name, state in states.items()
+                         if state.get("fallback_of")]:
+                state = states[name]
+                if (state.get("ok")
+                        or int(state.get("attempts") or 0) >= self.ncfg.max_attempts):
+                    continue
+                result = self._attempt_fallback(entry, name, message, now)
+                if result is not None:
+                    results[name] = result
+                    fallbacks[state.get("target") or name] = result
+            # Un primaire épuisé ne bloque plus le repli ; un repli en échec
+            # temporaire est retenté même quand tous les primaires ont donné.
+            primary_pending = any(
+                not states[channel.name].get("ok")
+                and int(states[channel.name].get("attempts") or 0)
+                < self.ncfg.max_attempts
+                for channel in channels)
+            fallback_pending = any(
+                state.get("fallback_of") and not state.get("ok")
+                and int(state.get("attempts") or 0) < self.ncfg.max_attempts
+                for state in states.values())
             self.state["rate"].setdefault(human, []).append(now)
-            entry = {"alert": {"type": "summary"}, "human": human, "source": "debit"}
             bucket["attempts"] = int(bucket.get("attempts") or 0) + 1
-            if ok and not self.dry_run:
+            if primary_ok and not self.dry_run:
                 # #2395 B2 : les membres livrés par le résumé entrent au
                 # registre, sinon la même alerte repart en envoi direct après
                 # la fenêtre. Après succès seulement ; un échec reste retenté.
+                # Un repli réussi ne vaut pas livraison du primaire.
                 self._mark_summary_notified(bucket, now)
-            if ok or bucket["attempts"] >= self.ncfg.max_attempts:
-                if not ok:
+            if primary_ok or (not primary_pending and not fallback_pending):
+                if not primary_ok:
                     self.log("rate summary → %s: GIVING UP after %d attempt(s)"
                              % (human, bucket["attempts"]))
                 del self.state["summary"][human]
                 self.state["last_summary"][human] = now
             self._record("summary", entry,
-                         "a_blanc" if self.dry_run else ("envoyee" if ok else "echec"),
-                         results, message)
+                         "a_blanc" if self.dry_run else ("envoyee" if primary_ok else "echec"),
+                         results, message, fallback=fallbacks or None)
 
     # -- journal ----------------------------------------------------------------
     def _record(self, event: str, entry: dict, delivery: str, channels: dict,

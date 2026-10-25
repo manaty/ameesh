@@ -730,6 +730,80 @@ class NotifierTest(unittest.TestCase):
             notifier._attempt(entry, "raised", 1000.0 + 30 * pass_no)
         self.assertEqual([name for name, _ in sender.sent], ["nx", "nx", "nx"])
 
+    def test_episode_sans_since_a_une_identite_distincte(self):
+        """B/P2 cx3 : deux occurrences d'un type sans `since` (account_overage)
+        doivent avoir deux `alert_id`, et les retries le même."""
+        ncfg = notify.parse_config({
+            "routes": {"human:owner": ["nx"]},
+            "channels": {"nx": {"type": "nexlink", "url": MESH_URL,
+                                "token_env": "MESH_SECRET"}}})
+        sender = FakeSender({"nx": [notify.ChannelError("boom"),
+                                    notify.ChannelError("boom"), None]})
+        notifier = notify.Notifier(self.cfg, ncfg, notify.empty_state(),
+                                   sender=sender, log=self.logs.append,
+                                   clock=lambda: 1000.0)
+        alert = {"type": "account_overage", "harness": "claude", "account": "x"}
+        first = self.entry(alert=alert, raised_ts=1000.0)
+        notifier._attempt(first, "raised", 1000.0)
+        notifier._attempt(first, "raised", 1030.0)
+        second = self.entry(alert=alert, raised_ts=2000.0)
+        notifier._attempt(second, "raised", 2000.0)
+        ids = [message.alert_id for _, message in sender.sent]
+        self.assertEqual(ids[0], ids[1])
+        self.assertNotEqual(ids[0], ids[2])
+        self.assertEqual(str(uuid.UUID(ids[0])), ids[0])
+
+    def test_resume_identite_propre_a_l_episode(self):
+        """B/P2 cx3 : deux résumés successifs au texte identique sont deux
+        épisodes distincts ; un retry garde l'identité de son épisode."""
+        notifier = self.notifier(FakeSender())
+        first, second = {}, {}
+        one = notifier._summary_alert_id("human:owner", first)
+        self.assertEqual(one, notifier._summary_alert_id("human:owner", first))
+        # l'identité survit à un rechargement de l'état (retry après restart)
+        self.assertEqual(one, notifier._summary_alert_id(
+            "human:owner", json.loads(json.dumps(first))))
+        other = notifier._summary_alert_id("human:owner", second)
+        self.assertNotEqual(one, other)
+        self.assertEqual(str(uuid.UUID(one)), one)
+        self.assertEqual(str(uuid.UUID(other)), other)
+
+    def test_resume_passe_par_le_repli_nexlink(self):
+        """B/P1 cx3 : un résumé de débit atteint le repli quand le primaire
+        est en panne, et le repli est retenté indépendamment du primaire."""
+        sender = FakeSender({
+            "nx": [notify.ChannelError("boom") for _ in range(5)],
+            "ntfy": [notify.ChannelError("timeout"), None]})
+        notifier = self.notifier(sender)
+        notifier._summary_add(notifier._bucket("human:owner"), "raised",
+                              self.entry())
+        for pass_no in range(5):
+            notifier._summaries(1000.0 + 60 * pass_no)
+        self.assertEqual([name for name, _ in sender.sent],
+                         ["nx", "nx", "ntfy", "nx", "ntfy", "nx", "nx"])
+        sent = [message for _, message in sender.sent]
+        self.assertTrue(sent[4].title.startswith("[repli] "))
+        self.assertTrue(sent[4].body.startswith("repli nexlink — "))
+        self.assertEqual({message.alert_id for message in sent}, {sent[0].alert_id})
+        self.assertEqual(len(notifier.state["fallback"]), 1)
+        self.assertNotIn("human:owner", notifier.state["summary"])
+        # un repli réussi ne marque pas les membres livrés côté primaire
+        self.assertEqual(notifier.state["notified"], {})
+
+    def test_resume_erreur_permanente_repli_immediat(self):
+        """Le cas de la relecture cx3 B/P1 : erreur permanente du primaire,
+        le résumé part sur ntfy dans le même passage, pas cinq fois sur nx."""
+        sender = FakeSender({"nx": [notify.ChannelError("401", permanent=True)]})
+        notifier = self.notifier(sender)
+        notifier._summary_add(notifier._bucket("human:owner"), "raised",
+                              self.entry())
+        notifier._summaries(1000.0)
+        self.assertEqual([name for name, _ in sender.sent], ["nx", "ntfy"])
+        self.assertTrue(sender.sent[-1][1].body.startswith("repli nexlink — "))
+        self.assertEqual(len(notifier.state["fallback"]), 1)
+        self.assertNotIn("human:owner", notifier.state["summary"])
+        self.assertEqual(notifier.state["notified"], {})
+
     def test_message_sans_identite(self):
         message = notify.render_summary({"raised": {"dead_runner": 2}}, "hote")
         first = notify.message_alert_id(message)
