@@ -131,6 +131,17 @@ class InheritedRedTest(Journal):
         entries += list(extra)
         return entries
 
+    def armed_for(self, *names):
+        """Arme la même tête avec une liste de checks requis (le journal est
+        la seule source de l'armement, #2813)."""
+        self._note(None, LOT, "auto-merge armed repo=%s pr=%d sha=%s base=main "
+                              "method=merge required=%s — test"
+                  % (SLUG, NUM, HEAD, ",".join(names)))
+
+    def lint_protection(self):
+        return {"required_status_checks": {"strict": False,
+                                           "contexts": ["tests", "lint"]}}
+
     def check(self, gh, **kwargs):
         return packet_automerge.check(None, None, LOT, gh=gh, **kwargs)
 
@@ -214,6 +225,51 @@ class InheritedRedTest(Journal):
         gh = InheritedGh(entries)
         self.assertEqual(self.check(gh)["result"], "pending")
         self.assertEqual(gh.landed, [])
+
+    def test_a_cancelled_flux_part_blocks(self):
+        # #3558 (ameesh-dev4 B/P1) : le runner meurt après un échec hérité,
+        # sans ligne `fin` ; le flux de la part conclut CANCELLED. Ce non
+        # concluant ne prouve pas la fin du flux, et le job rouge serait masqué
+        # par la part lue. Le flux doit être présent et FAILURE.
+        entries = [entry for entry in self.rollup()
+                   if entry["name"] != "tests (flux) psql 1/16"]
+        entries.append(flux("tests (flux) psql 1/16", "CANCELLED"))
+        gh = InheritedGh(entries)
+        out = self.check(gh)
+        self.assertEqual(out["result"], "pending", out)
+        self.assertEqual(gh.landed, [])
+        self.assertEqual(self.created, [])
+
+    def test_a_red_required_check_without_its_own_test_blocks(self):
+        # #3558 (ameesh-cx1 B/P1) : `tests` et `lint` sont requis, tous deux
+        # rouges ; seul `psql 1/16` a un test lu et hérité. L'agrégat `tests`
+        # s'exempte, pas `lint` : un check requis rouge sans sa propre preuve
+        # ne se masque jamais en vert.
+        self.armed_for("tests", "lint")
+        gh = InheritedGh(self.rollup(extra=[check("lint", "FAILURE", job=125)]),
+                         protection=self.lint_protection())
+        out = self.check(gh)
+        self.assertEqual(out["result"], "pending", out)
+        self.assertEqual(gh.landed, [])
+        self.assertEqual(self.created, [])
+
+    def test_a_red_required_check_with_its_own_test_merges(self):
+        # La contrepartie du témoin ci-dessus : un check requis non agrégat
+        # rouge et prouvé par sa part (test lu, hérité, flux FAILURE) passe.
+        # L'exemption est réservée à l'agrégat, pas un refus de tout autre.
+        self.armed_for("tests", "lint")
+        self.ci.rows[RUN].append({"part": "lint", "test": "tests.test_lint",
+                                  "inherited": True})
+        self.ci.reference["tests"].append("tests.test_lint")
+        entries = self.rollup(extra=[check("lint", "FAILURE", job=125),
+                                     flux("tests (flux) lint", "FAILURE")])
+        gh = InheritedGh(entries, protection=self.lint_protection())
+        out = self.check(gh)
+        self.assertEqual(out["result"], "merged", out)
+        self.assertEqual(gh.landed, [("main", HEAD)])
+        self.assertIn("lint", out["inherited"]["parts"])
+        self.assertIn("merged over inherited red: lint, psql 1/16",
+                      self.merged_notes()[0])
 
     def test_a_base_without_a_finished_run_blocks(self):
         self.ci.reference = {}

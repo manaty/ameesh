@@ -97,6 +97,13 @@ _SHA = re.compile(r"[0-9a-f]{40}")
 #: ligne de version et les notes de version.
 NOTES_DIR = "docs/versions"
 _VERSION_LINE = re.compile(r'^version\s*=\s*"[^"\s]+"\s*$')
+#: #3558 : les agrégats requis dont le rouge se prouve par les parts lues —
+#: les mêmes noms que `release_cutoff._aggregates` (#3244). Un agrégat n'a
+#: pas de test à son nom : il est le seul check requis exempté de la preuve
+#: par part. Tout autre check requis rouge (`lint`, une part, un portier)
+#: exige sa propre part lue et son flux `FAILURE` (relectures B/P1 du 25/10).
+INHERITED_RED_AGGREGATES = frozenset((
+    "tests", "tests (dispatch)", "suite complète du paquet / tests"))
 
 
 def carrier(head_ref) -> bool:
@@ -817,7 +824,12 @@ def _inherited_red(db, *, slug: str, base: str, sha: str, view: dict, required,
     * au moins un échec de **test** est identifié avec sa part (une ligne
       `job` ne suffit pas) ;
     * chaque check rouge de la même exécution que le check requis a un test lu
-      — une part rouge sans test identifié reste bloquante ;
+      — une part rouge sans test identifié reste bloquante ; l'exemption par
+      part ne vaut que pour un agrégat requis reconnu (`tests`), tout autre
+      check requis rouge (`lint`) a sa propre part et son test ;
+    * chaque part lue exige son flux `tests (flux) <part>` présent et
+      `FAILURE` : un flux CANCELLED (runner mort avant sa ligne `fin`) ne
+      prouve pas la fin de la part et bloque, comme un flux absent ou en cours ;
     * tout check de cette exécution qui n'est ni vert, ni sauté/neutre, ni
       rouge identifié (en attente, annulé, expiré, jamais conclu) bloque ;
     * les écarts hors CI de `fire.ready_pr` (brouillon, cible, gel, statuts
@@ -846,6 +858,11 @@ def _inherited_red(db, *, slug: str, base: str, sha: str, view: dict, required,
         # La fusion auto n'est armée que sur une protection prouvée (#2813) ;
         # sans check requis, il n'y a pas de rouge de CI à rouvrir ici.
         return None
+    # #3558 (ameesh-cx1, B/P1) : seul un agrégat reconnu est exempté de la
+    # preuve par part ; `lint` ou tout autre check requis rouge doit avoir sa
+    # part et son test lus, sinon il ne se masque pas en vert.
+    aggregates = required_names & INHERITED_RED_AGGREGATES
+    prefix = ci_mod.CHECK_PREFIX
     provenance = None
     if any(app is not None for _, app in pairs):
         try:
@@ -903,12 +920,18 @@ def _inherited_red(db, *, slug: str, base: str, sha: str, view: dict, required,
                 return None
             # Chaque check de l'exécution est relu : une part rouge sans test
             # identifié, une part encore en cours ou annulée/expirée bloque.
+            # #3558 (ameesh-cx1, B/P1) : l'exemption ne vaut que pour un
+            # agrégat requis reconnu (`tests`) ; tout autre check requis rouge
+            # — `lint`, par exemple — exige sa part et son test propres. Le
+            # saut de tous les `required_names` le masquait en vert sans preuve.
             red_parts = set()
             for other in view.get("rollup") or ():
                 if radar.actions_run_id(slug, other) != rid:
                     continue
                 name = str(other.get("name") or other.get("context") or "")
-                if name in required_names:
+                if name in aggregates:
+                    # L'agrégat se prouve par les parts, pas par un test à son
+                    # nom : il n'a pas de part propre.
                     continue
                 result = radar.check_result(other)
                 if result == radar.CI_NEGATIVE_RESULT:
@@ -921,6 +944,24 @@ def _inherited_red(db, *, slug: str, base: str, sha: str, view: dict, required,
                     state = str(other.get("conclusion") or other.get("state") or "").upper()
                     if state not in ("SKIPPED", "NEUTRAL"):
                         return None
+            # #3558 (ameesh-dev4, B/P1) : un runner mort après un échec hérité
+            # publie ses événements mais pas sa ligne `fin` ; le flux de la
+            # part conclut alors CANCELLED — un non concluant que le portier
+            # se contente de consigner, et la part lue masquerait le job rouge.
+            # Chaque part de `run_parts` exige donc son flux présent et
+            # FAILURE ; absent, annulé, expiré ou en cours bloque.
+            flux_results: dict[str, list[str]] = {}
+            for other in radar.latest_rollup(rollup):
+                part = _flux_part(str(other.get("name")
+                                      or other.get("context") or ""), prefix)
+                if part is not None:
+                    flux_results.setdefault(part, []).append(
+                        radar.check_result(other))
+            for part in run_parts:
+                results = flux_results.get(part)
+                if not results or any(result != radar.CI_NEGATIVE_RESULT
+                                      for result in results):
+                    return None
             if not red_parts and not (run_parts & required_names):
                 # Un agrégat rouge sans aucune part rouge lue n'est pas un
                 # échec de test identifié : le cas de #3558 ne s'applique pas.
@@ -942,7 +983,6 @@ def _inherited_red(db, *, slug: str, base: str, sha: str, view: dict, required,
         return None
     # Les rouges sans exécution Actions (le détail de l'agrégat et les flux)
     # ne se prouvent que par la part qu'ils nomment, ou par l'agrégat prouvé.
-    prefix = ci_mod.CHECK_PREFIX
     for entry in reds:
         name = str(entry.get("name") or entry.get("context") or "")
         if radar.actions_run_id(slug, entry) is not None:
