@@ -236,7 +236,8 @@ def workflow_step(project, pending, workflow, *, staging, save, now):
         raise rc.ReleaseError("workflow is outside the closed staging/CI list")
     if staging:
         validate_staging(project, pending["sha"], workflow)
-    ref = pending["tag"] if staging else pending["integration"]
+    # GitHub staging admits release/*; this branch pins the tagged SHA.
+    ref = ("release/" + pending["version"]) if staging else pending["integration"]
     ledger = pending.setdefault("dispatches", {})
     key = ("staging/" if staging else "ci/") + workflow
     attempt = ledger.get(key)
@@ -282,7 +283,7 @@ def migration_requirements(project, sha, base):
     Nexlink migrate.sh: hub skips content-only files; content applies every
     migration except its explicit skips (147, 178, 333). Source: #3528 releaser.
     """
-    names = rc._out(project.repo, "diff", "--name-only", "--diff-filter=AM", base, sha,
+    names = rc._out(project.repo, "diff", "--no-renames", "--name-only", "--diff-filter=AM", base, sha,
                     "--", "supabase/migrations").splitlines()
     required = {"hub": [], "content": []}
     for name in names:
@@ -292,7 +293,7 @@ def migration_requirements(project, sha, base):
         version = int(match[1])
         data = subprocess.run(["git", "-C", project.repo, "show", sha + ":" + name],
                               capture_output=True, check=True, timeout=30).stdout
-        content_only = re.search(rb"(?m)^-- migrate-target: content\s*$", data) is not None
+        content_only = re.search(rb"(?im)^--[ \t]*migrate-target:[ \t]*content[ \t]*$", data) is not None
         row = dict(version=version, name=os.path.basename(name).removesuffix(".sql"),
                    checksum=hashlib.sha256(data).hexdigest())
         if not content_only:

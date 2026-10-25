@@ -92,6 +92,16 @@ class GitTests(unittest.TestCase):
                 with self.assertRaisesRegex(rc.ReleaseError, "attestation"):
                     nx.migration_gate(None, self.project, pending)
 
+    def test_content_marker_read_like_migrate_sh_and_renames_seen(self):
+        old = self.commit("supabase/migrations/541_x.sql", "select 0;\n")
+        sha = self.commit("supabase/migrations/541_x.sql", "--Migrate-Target:  content\nselect 1;\n")
+        self.assertEqual(set(nx.migration_requirements(self.project, sha, old)), {"content"})
+        self.git("mv", "supabase/migrations/541_x.sql", "supabase/migrations/542_x.sql")
+        self.git("commit", "-qm", "rename")
+        moved = self.git("rev-parse", "HEAD").strip()
+        rows = nx.migration_requirements(self.project, moved, sha)["content"]
+        self.assertEqual([row["version"] for row in rows], [542])
+
     def test_gate_checks_both_staging_targets_and_ignores_old_holes(self):
         old = self.commit("supabase/migrations/001_old.sql", "select 0;\n")
         sha = self.commit("supabase/migrations/540_new.sql", "select 1;\n")
@@ -146,7 +156,7 @@ class DispatchTests(unittest.TestCase):
     def setUp(self):
         self.project = rc.ProjectRelease("nexlink", "/unused", target="develop",
                                          github="acme/nexlink", model="nexlink")
-        self.pending = dict(sha="a" * 40, main="b" * 40, tag="nexlink-11w",
+        self.pending = dict(sha="a" * 40, main="b" * 40, tag="nexlink-11w", version="11w",
                             integration="integration/release-11w",
                             ci_parts=[{"workflow": "sql-invariant.yml", "anchor_input": "landing_target"}])
         self.saved = []
@@ -181,6 +191,24 @@ class DispatchTests(unittest.TestCase):
                                               staging=False, save=self.save, now=200))
             gh.assert_not_called()
             self.assertIn("run not visible", self.pending["waiting"])
+
+    def test_staging_dispatch_runs_on_release_branch_not_tag(self):
+        # The staging environment's branch policy admits release/*, no nexlink-* tag.
+        with mock.patch.object(nx, "validate_staging"), \
+                mock.patch.object(nx, "gh", return_value="") as gh:
+            self.assertFalse(nx.workflow_step(self.project, self.pending, "deploy-api.yml",
+                                              staging=True, save=self.save, now=100))
+        args = gh.call_args.args[1]
+        self.assertEqual(args[args.index("--ref") + 1], "release/11w")
+        self.assertNotIn("-f", args)
+        row = dict(databaseId=2, headSha="a" * 40, headBranch="release/11w",
+                   event="workflow_dispatch", createdAt="1970-01-01T00:01:40Z",
+                   status="completed", conclusion="success", url="https://example/run/2")
+        with mock.patch.object(nx, "validate_staging"), \
+                mock.patch.object(nx, "runs", return_value=[row]) as runs:
+            self.assertTrue(nx.workflow_step(self.project, self.pending, "deploy-api.yml",
+                                             staging=True, save=self.save, now=200))
+        self.assertEqual(runs.call_args.args[2], "release/11w")
 
     def test_production_dispatch_rejected_before_external_operation(self):
         with mock.patch.object(nx, "gh") as gh:
