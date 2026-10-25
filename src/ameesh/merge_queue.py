@@ -449,7 +449,7 @@ def _waiver(db, item) -> tuple:
 
 def _attribution_on_freeze(db, marks, frozen, *, repo, klass, item, families=None,
                            commits=None, strict=False, families_out=None,
-                           target=""):
+                           target="", admitted_heads=()):
     """Les auteurs et correcteurs de la tête gelée (#2681/#2739/#2888).
 
     Lecture des commits exacts de la plage gelée et de leur provenance, la même
@@ -484,7 +484,7 @@ def _attribution_on_freeze(db, marks, frozen, *, repo, klass, item, families=Non
     authors, unknown, correctors = act.attribution_of_head(
         db, item, milestone, repo, base, frozen, families=families or (),
         commits=commits, strict=strict, families_out=families_out,
-        target=target or base)
+        target=target or base, admitted_heads=admitted_heads)
     if unknown:
         raise ValueError("author provenance unknown for frozen commit(s): %s"
                          % ", ".join(unknown))
@@ -526,8 +526,13 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
                 item=None, families=None, required=None, family_of=None,
                 authors=None, authors_complete=False, cfg=None, project=None,
                 target=None, vehicle=None, exclude_author_family=None,
-                distinct_families=None) -> dict:
+                distinct_families=None, admitted_heads=()) -> dict:
     """Les avis requis sur la tête gelée `frozen`, et eux seuls (#1374).
+
+    `admitted_heads` ne vient que de la porte du véhicule : les gels de ses
+    membres déjà acceptés couvrent leurs commits hérités, dans la lecture
+    courante et le report des anciens gels (#3513). La classe reste prudente
+    sur le diff complet ; les verdicts restent dus sur la tête exacte.
 
     Un verdict ne compte que s'il a été rendu **sur cette tête** (le `sha` du
     jalon est résolu, jamais une ref). Parmi ces verdicts, seul le **dernier de
@@ -647,7 +652,9 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
 
     Rend `{ok, why, class, required, accepted, accepted_unfiltered, blocked,
     waived, author, author_family, authors, corrections, on_freeze, unproven,
-    completed_ts, vehicle}` ; ne lève jamais.
+    completed_ts, vehicle, attribution_read}` ; ne lève jamais.
+    `attribution_read` prouve une lecture effective de la provenance ; une
+    dispense ou une porte sans avis requis ne fournit pas cette preuve.
     """
     from . import lot_class
     klass = klass or {}
@@ -675,6 +682,7 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
            "waived": waived, "waived_by": waived_by,
            "author": author, "author_family": "", "authors": [],
            "corrections": [], "on_freeze": 0, "unproven": [], "vehicle": None,
+           "attribution_read": False,
            "exclude_author_family": exclude_author_family,
            "distinct_families": distinct_families}
     if not frozen:
@@ -874,7 +882,8 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
                                              commits=own_commits if vehicle_delta else None,
                                              strict=True,
                                              families_out=proven_families,
-                                             target=target or "")
+                                             target=target or "",
+                                             admitted_heads=admitted_heads)
     except Exception as exc:  # noqa: BLE001 - une plage illisible ne conclut pas
         out["error"] = str(exc)
         out["why"] = ("no review verdict ok on the freeze %s (class: %s): the frozen "
@@ -884,6 +893,7 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
         return out
     # #2803 : la lecture a établi les auteurs du seul delta relu. Sans elle
     # (pas de dépôt ou de ligne), la porte garde la référence historique.
+    out["attribution_read"] = attribution is not None
     exact = vehicle_delta and attribution is not None
     range_authors: list = []
     if attribution is not None:

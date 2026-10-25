@@ -280,6 +280,30 @@ the exchange and must cover the enable budget (H7 enrollment); a transport
 timeout is an uncertain hold, never a success. H3 ships source only;
 installation, real SSH and the operator enrollment remain H7.
 
+## Runner wiring (H5)
+
+The runner binds `deploy/mise-a-jour/fabrique-handoff.py` once, before its
+first `readiness` or `advance_host` call, on a dedicated controller
+connection (`ScopedDb`): the companion's durable reads never run on an agent's
+connection. The fixed path is derived from the installed source tree; no
+message, job, environment variable or enrollment document chooses the module.
+The binding exposes `_lifecycle_adapter` and `_lifecycle_requirements`, so
+both paths consume the same enrolled adapter and `requirements_for`. An absent
+or unsafe source, or a refused enrollment, leaves them unbound and records the
+same named prerequisites — `helper:L232b` and `requirements:L232c` — in both
+paths; no adapter is fabricated and no host effect is attempted. The runner
+does not move an elected role: `releve: election` stays with the election.
+For every post-switch step, `readiness` receives the account frozen in the
+plan (`plan.account`, H4): the switch clears the registry's
+`session_account`, so re-reading the registry would refuse the exact account
+the operation was admitted with.
+
+The binding is source only; H7 installs the tree, the enrollment documents and
+the host execution enrollment. `src/ameesh/handoff_factory.py` is the shared
+loader (`load(db)` returns the factory with `.adapter` and
+`.requirements_for`); a refusing loader raises `FactoryUnavailable` carrying
+only the stable gap category, never a document body, path or credential.
+
 ## Host drain, return and loss recovery (L232e)
 
 `ameesh host drain HOST [--for 8h] [--actor human:<id>]` closes new claims,
