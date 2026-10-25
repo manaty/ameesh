@@ -29,7 +29,8 @@ exactement ces clés (valeurs à établir par l'opérateur) :
 L'exemple n'est pas une admission. `uid` doit être celui du compte `ameesh`
 réel, `host` celui de `execution.json`, `agents` la liste approuvée. Le fichier
 est root:root 0600 et tous ses parents root sans écriture groupe/autres.
-Chaque connexion recharge cette politique ; agent et hôte sont vérifiés avant
+Chaque connexion recharge cette politique et la recoupe avec `execution.json` :
+hôte identique et agents inclus dans les comptes enrôlés ; agent et hôte sont vérifiés avant
 l'effet. L'inventaire exige l'UID/hôte mais ne modifie rien. H7 relit ensuite
 `execution.json` root pour les comptes Unix, unités, racines et outils admis.
 Ses verrous, clôtures d'époques, journal d'intent et reçus demeurent communs
@@ -57,7 +58,9 @@ intents privés restent dans le journal H7 enrôlé.
    fournit les fichiers sous `share/ameesh/mise-a-jour`, pas leur installation
    privilégiée automatique. Pas de `.pth`, dépendance ou lien vers un arbre
    d'agent. L'installateur refuse les liens de dossiers et vérifie les cibles
-   des liens de fichiers.
+   des liens de fichiers ; il refuse effectivement les `.pth`, FIFOs, sockets et
+   autres fichiers spéciaux. Le scellement cryptographique du contenu du runtime
+   est suivi par le lot #3526 (manaty/ameesh#2692), préalable distinct à l'enrôlement.
 2. Installer les documents H7 et `local.json` validés par la décision, les
    comptes et groupes réels, journaux root privés. Établir notamment le bus
    user `/run/user/<uid>/bus` : le service root emploie `runuser` et les deux
@@ -66,7 +69,7 @@ intents privés restent dans le journal H7 enrôlé.
    bus, dépôts Git et bases enrôlés ; sa politique ne crée pas ces accès.
 3. Exécuter en root le script installé avec le runtime épinglé :
    `/opt/ameesh-release/runtime/bin/python -I -B /opt/ameesh-release/lib/installer-local-handoff.py install`.
-   Il vérifie le bundle root, l'UID, le document H7 et l'absence d'unités
+   Il impose 0755 au dossier du socket, vérifie le bundle root, l'UID, le document H7 et l'absence d'unités
    préexistantes, copie exclusivement les deux unités fixes en 0644, consigne
    leurs empreintes dans `local-install.json` root 0600, recharge systemd et
    active le socket. Aucun agent, login ou handoff n'est lancé par ce geste.
@@ -87,8 +90,8 @@ unités contre le reçu, désactive et arrête le socket, arrête toutes les
 instances, puis retire uniquement les unités qu'il a installées et son reçu.
 Un fichier modifié exige examen opérateur, pas d'écrasement. Les documents,
 journaux, code et runtime sont conservés. En cas d'installation partielle,
-le reçu conserve les unités écrites ; si le socket n'a pas été posé, arrêter
-les unités présentes et retirer ces seuls fichiers après vérification du
-reçu. Aucun retour au chemin local en processus n'existe : sans socket le
+le reçu conserve les unités écrites ; le rollback accepte les unités absentes,
+arrête toutes les instances même sans fichier socket et retire les fichiers
+restants après vérification du reçu. Aucun retour au chemin local en processus n'existe : sans socket le
 runner retient l'opération. La version précédente et les journaux H7 restent
 le point de reprise selon le plan d'enrôlement signé.

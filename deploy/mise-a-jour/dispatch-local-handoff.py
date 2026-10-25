@@ -69,6 +69,12 @@ def policy(path=POLICY):
     return value
 
 
+def consistent_policy(rules, enrollment):
+    if (rules['host'] != enrollment['host']
+            or not set(rules['agents']).issubset(enrollment['accounts'])):
+        raise Refused('execution_policy')
+
+
 def admitted(request, rules, uid):
     if uid != rules['uid']:
         raise Refused('caller')
@@ -134,6 +140,7 @@ def main(argv=None):
         signal.signal(signal.SIGALRM, expired)
         signal.alarm(SECONDS)
         rules = policy()
+        consistent_policy(rules, module.load_execution())
         channel = socket.socket(fileno=os.dup(0))
         if channel.family != socket.AF_UNIX or channel.type != socket.SOCK_STREAM:
             raise Refused('channel')
@@ -145,7 +152,7 @@ def main(argv=None):
         # May follow an effect. No forged negative receipt: client reconciles.
         category = ('uncertain' if module is not None
                     and isinstance(exc, module.Uncertain) else
-                    'refused' if isinstance(exc, Refused) else 'unavailable')
+                    'refused' if isinstance(exc, (Refused, handoff_contract.ContractError)) else 'unavailable')
         print(f'local_handoff_{category} pid={pid} uid={uid}', file=sys.stderr)
         return 1
     finally:
