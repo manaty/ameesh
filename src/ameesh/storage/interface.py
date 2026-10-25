@@ -1573,8 +1573,12 @@ class WorkItems(Domain):
         lock on the reference and refuse the creation (`DbError`) when any lot,
         whatever its state, already carries it. Two hosts creating the incident
         of the same run serialize: the second sees the first and the caller
-        re-reads the winner. Off by default: several lots may legitimately
-        share a reference except where the identity is one per execution.
+        re-reads the winner. #3607 : the re-read covers the exact `source` too,
+        not only `issue_ref` — the identity of an execution is also carried
+        there (`ci-incident:<repo>:<run>`), and the ticket sync may have moved
+        the winner's `issue_ref` to its mirror ticket between the lock wait and
+        the re-read. Off by default: several lots may legitimately share a
+        reference except where the identity is one per execution.
 
         `external_executor` (#3447) : le lot est créé réservé à un exécutant
         externe déclaré (agent `externe` avec responsable humain, ou humain),
@@ -1934,6 +1938,19 @@ class WorkItems(Domain):
         """L539 : les lots portant exactement cette `issue_ref`, **quel que
         soit leur état** — l'identité d'un lot de relecture après fusion
         survit à sa fermeture, sinon un second lot serait ouvert."""
+
+    @abc.abstractmethod
+    def by_source(self, source: str) -> list[dict]:
+        """#3607 : les lots dont la `source` vaut exactement cette référence,
+        **quel que soit leur état**, la comparaison étant à la casse près
+        (comme `by_issue_ref` : la casse d'un dépôt GitHub ne fait pas une
+        autre exécution). L'identité d'un incident de CI vit aussi dans
+        `source` (`ci-incident:<repo>:<run>`) : un lot ouvert à la main la
+        porte quand la synchro des tickets a remplacé son `issue_ref` par le
+        ticket miroir. Sans cette lecture, l'ouverture automatique doublerait
+        l'incident. Aucun motif : préfixe et suffixe ne matchent pas, et une
+        `source` vide ne désigne rien (sans la garde, elle rendrait tous les
+        lots sans source)."""
 
     @abc.abstractmethod
     def lock(self, item_id: int) -> dict | None:
