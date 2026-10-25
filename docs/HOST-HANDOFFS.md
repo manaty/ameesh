@@ -237,6 +237,37 @@ execution enrollment (`execution.json`: host, state root, configuration path,
 release store, per-agent account/home/unit and allowed work roots) and the
 private transport endpoints; H2 ships source only and performs no installation.
 
+## Activation, health and reconciliation (H3)
+
+H3 implements `admit`, `enable`, `verify`, `restore_source` and
+`reconcile_effect`; `recover_source` remains the L232e loss recovery and stays
+an explicit refusal here. `admit` rechecks the prepared destination without
+starting anything. `enable` starts only the enrolled unit and proves it active
+with its finite caps inside the controller's 60-second gate boundary; a replay
+re-observes the unit and never double-starts. `verify` observes the exact clean
+checkout, live unit and caps; the controller-side companion then reads the
+durable turn ledger (`turn_resources` plus its `turn_costs` line) for a
+completed turn on the target host after the `switched` event and returns
+`{"ok": true, "pending": true}` until it exists. A completed turn with no token
+usage is not authenticated and holds the operation.
+
+`restore_source` returns the source unit to service before a cancellation; the
+controller keeps the source gate lock through restoration and fence release.
+`reconcile_effect` advances the operation to the new controller epoch, checks
+the exact pending intent (operation, agent, lease and epoch), stops and proves
+quiescent the enrolled unit for a pending `enable`, `restore_source` or
+`stop_source`, then returns `{"ok": true, "quiesced": true, "epoch": PREVIOUS}`.
+The journal order mark is preserved so the retry resumes the same step under
+the new epoch; a delayed call from the revoked epoch is refused before it can
+act, and read-only effects leave no host job. The destination account is
+frozen in the plan (`plan.account`, equal to `plan.session_account` when both
+are present); no effect re-reads the registry after the switch, which clears
+the source session account. The host helper keeps no credential value and
+`verify` never starts a turn itself. The enrolled transport's `seconds` bounds
+the exchange and must cover the enable budget (H7 enrollment); a transport
+timeout is an uncertain hold, never a success. H3 ships source only;
+installation, real SSH and the operator enrollment remain H7.
+
 ## Host drain, return and loss recovery (L232e)
 
 `ameesh host drain HOST [--for 8h] [--actor human:<id>]` closes new claims,

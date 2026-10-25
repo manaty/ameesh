@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: AGPL-3.0-only
-"""H2: preparation and Git effects of the enrolled host handoff.
+"""H2/H3: preparation, Git, activation and health effects of a host handoff.
 
 Two authorities share this pinned source and never merge:
 
@@ -8,20 +8,24 @@ Two authorities share this pinned source and never merge:
   checks the durable operation and the destination preflight, then asks one
   host's executor for a typed effect through ``pont-handoff.py``. It never
   runs a host primitive itself and never fabricates a completion.
-- ``HostEffects`` is the host-side executor. It performs one narrow
-  preparation/Git effect for an exact enrolled agent, keeps a private durable
-  intent/receipt journal, refuses a stale controller epoch or an out-of-order
-  step, and observes an interrupted effect before returning a receipt. It
-  starts no executor: ``prepare``, ``transfer`` and ``session`` only read
-  systemd/Git/file state, ``stop_source`` stops and proves quiescence.
+- ``HostEffects`` is the host-side executor. It performs one narrow effect for
+  an exact enrolled agent, keeps a private durable intent/receipt journal,
+  refuses a stale controller epoch or an out-of-order step, and observes an
+  interrupted effect before returning a receipt. H2 prepares and transfers
+  without starting an executor; H3 ``enable`` starts the destination unit,
+  ``admit``/``verify`` observe it, ``verify`` proves an authenticated first
+  turn (the controller-side companion reads the durable turn ledger) and
+  ``restore_source`` restarts a source unit before cancellation.
+  ``reconcile_effect`` quiesces the exact interrupted epoch so a delayed host
+  call cannot act after revocation.
 
 The effects implemented here are ``inventory``, ``revalidate``, ``prepare``,
-``stop_source``, ``publish``, ``transfer`` and ``session``. Activation and
-health (``admit``, ``enable``, ``verify``, ``restore_source``,
-``recover_source``, ``reconcile_effect``) stay explicit refusals until H3; a
-definitive refusal is an ``ok: false`` receipt (or ``False`` for the two
-boolean checks), never a simulated success. An uncertain call raises so the
-controller keeps its durable intent and requires reconciliation.
+``stop_source``, ``publish``, ``transfer``, ``session``, ``admit``,
+``enable``, ``verify``, ``restore_source`` and ``reconcile_effect``.
+``recover_source`` is the L232e lost-source recovery and stays an explicit
+refusal here; a definitive refusal is an ``ok: false`` receipt (or ``False``
+for the two boolean checks), never a simulated success. An uncertain call
+raises so the controller keeps its durable intent and requires reconciliation.
 
 No source home, harness cache, OAuth token or credential value is copied:
 ``publish`` reads Git, ``transfer`` fetches the enrolled repository with the
@@ -65,6 +69,15 @@ SAFE_PATH = '/usr/local/bin:/usr/bin:/bin'
 GIT_PROTOCOLS = ('ssh', 'https', 'http', 'git')
 GIT_SECONDS = 20
 STOP_SECONDS = 15.0
+#: H3: ``enable`` must conclude inside the controller's 60 s deadline; the
+#: systemctl start call itself is short, the unit may take longer to become
+#: active, so the host observes it for the remaining budget.
+START_SECONDS = 8
+ENABLE_SECONDS = 40.0
+RESTORE_SECONDS = 30.0
+#: The outer dispatcher alarm covers the effect, not only the stdin read. H3
+#: enable is the longest effect and must stay below the controller deadline.
+SECONDS = 52
 LOCK_SECONDS = 10.0
 MAX_RECEIPT_BYTES = 65536
 #: ``O_DIRECTORY`` is absent on some platforms; a pinned directory fd still
@@ -76,17 +89,23 @@ SESSION_MODES = {'deepseek': 'fresh', 'dsh': 'fresh'}
 #: Effects are ordered inside one operation. A later step may not run after an
 #: earlier one, and a stale controller epoch is refused even when it is the
 #: same step. ``revalidate`` is a read-only check and is not journaled.
+#: ``restore_source`` is the cancellation path: it is journalled after any
+#: pre-switch effect, and no later effect follows a cancelled operation.
 STEP_SEQUENCE = {'prepare': 10, 'stop_source': 20, 'publish': 30,
-                 'transfer': 40, 'session': 50}
+                 'transfer': 40, 'session': 50, 'admit': 60,
+                 'enable': 70, 'verify': 80, 'restore_source': 90}
 #: The furthest journaled effect a controller state may already have reached.
 MAX_SEQUENCE = {'planned': 0, 'prepared': 10, 'drained': 20, 'published': 30,
-                'transferred': 40, 'session_ready': 50, 'switched': 50,
-                'activated': 50, 'held': 50}
+                'transferred': 40, 'session_ready': 50, 'switched': 60,
+                'activated': 80, 'held': 90}
 #: The effect a state attempts next. A refused attempt advances the journal's
 #: order mark but leaves the controller at the same state, so its retry must
 #: still revalidate (the step itself is accepted as a same-step retry).
 NEXT_STEP = {'planned': 'prepare', 'drained': 'publish',
              'published': 'transfer', 'transferred': 'session'}
+#: H3 effects whose stored receipt must be re-observed on replay: a unit can
+#: die, or a source can be stopped, between the first reply and the replay.
+REOBSERVE = ('stop_source', 'restore_source', 'enable', 'verify')
 
 _ACCOUNT = re.compile(r'^[A-Za-z0-9][A-Za-z0-9_.:/-]{0,127}$')
 _ALIAS = re.compile(r'^[A-Za-z0-9][A-Za-z0-9_.:/-]{0,127}$')
@@ -679,7 +698,9 @@ class HostSystem:
     """The one systemd scope an enrolled unit may use, with fixed executables.
 
     No request supplies a unit, a property, a program or an environment. The
-    executor only observes a unit and stops it; it never starts or enables one.
+    executor observes a unit, stops it, and starts only that exact enrolled
+    unit for H3 activation/restoration; it never enables, edits or disables
+    one.
     """
 
     def __init__(self, *, systemctl='/usr/bin/systemctl',
@@ -727,6 +748,23 @@ class HostSystem:
         if _UNIT.fullmatch(unit) is None:
             raise Refused('unit')
         self._run(scope, account, ['stop', unit], timeout=STOP_SECONDS)
+
+    def start(self, scope, account, unit):
+        """Start the exact enrolled unit; a timeout is an uncertain effect.
+
+        ``systemctl start`` returns once the job is queued, not when the unit
+        is active: the caller observes ``ActiveState`` for the remaining
+        enable budget. A non-zero exit is a definitive start refusal.
+        """
+        if _UNIT.fullmatch(unit) is None or scope not in ('system', 'user'):
+            raise Refused('unit')
+        result = _bounded_run(
+            self._argv(scope, account, ['start', unit]),
+            timeout=START_SECONDS,
+            env={'PATH': '/usr/bin:/bin', 'LANG': 'C', 'LC_ALL': 'C'},
+            check=False)
+        if result.returncode != 0:
+            raise Refused('start')
 
     def active(self, scope, account, unit):
         return self.show(scope, account, unit,
@@ -819,13 +857,17 @@ class HostEffects:
     """
 
     def __init__(self, *, enrollment, system=None, git=None, work_dir=None,
-                 clock=time.time, root=None, runuser='/usr/sbin/runuser'):
+                 clock=time.time, root=None, runuser='/usr/sbin/runuser',
+                 enable_seconds=ENABLE_SECONDS,
+                 restore_seconds=RESTORE_SECONDS):
         self.enrollment = validate_execution(enrollment)
         self.host = self.enrollment['host']
         self.system = system if system is not None else HostSystem(runuser=runuser)
         self.git = git if git is not None else HostGit(runuser=runuser)
         self.work_dir = work_dir
         self.clock = clock
+        self.enable_seconds = float(enable_seconds)
+        self.restore_seconds = float(restore_seconds)
         state = Path(root or self.enrollment['state'])
         self.state = _ensure_state(state)
         self.operations = _ensure_private(self.state / 'operations',
@@ -874,6 +916,11 @@ class HostEffects:
                 except Refused as exc:
                     return self._refusal(request, str(exc))
                 return self._receipt(request, {})
+            if request['step'] == 'reconcile_effect':
+                try:
+                    return self._reconcile(request, entry)
+                except Refused as exc:
+                    return self._refusal(request, str(exc))
             return self._journal(request, entry)
 
     def _entry(self, agent):
@@ -933,11 +980,13 @@ class HostEffects:
                 if not _same_effect(record['request'], request):
                     return self._refusal(request, 'request_changed')
                 stored = record['receipt']
-                if step == 'stop_source':
-                    # A stored stop receipt is not proof that the unit is
-                    # still quiet: re-observe and re-stop when it is not.
+                if step in REOBSERVE:
+                    # A stored receipt is not proof that the host state is
+                    # still the same: a unit can die or a source can be
+                    # stopped between the first reply and the replay. H3
+                    # re-observes and repairs the stored receipt.
                     try:
-                        fields = self._stop_source(request, entry)
+                        fields = self._observe(request, entry)
                     except Refused as exc:
                         return self._refusal(request, str(exc))
                     stored = self._receipt(request, fields)
@@ -955,7 +1004,18 @@ class HostEffects:
                 except Uncertain:
                     pass
                 return dict(stored, controller_epoch=request['controller_epoch'])
+            # Cancellation is pre-switch only: once the destination was
+            # admitted, the controller reconciles forward and never restores
+            # the source over possible destination work.
+            if (step == 'restore_source'
+                    and state['last_seq'] >= STEP_SEQUENCE['admit']):
+                return self._refusal(request, 'order')
             if step == state['last_step']:
+                allowed = True
+            elif (step == 'restore_source'
+                  and state['last_seq'] < STEP_SEQUENCE['admit']):
+                # Cancellation restores the source after any pre-switch
+                # attempt, including a refused prepare/publish.
                 allowed = True
             elif sequence > state['last_seq'] and (state['last_ok'] or not state['last_step']):
                 allowed = True
@@ -998,6 +1058,95 @@ class HostEffects:
             except Uncertain:
                 pass
             return receipt
+
+    def _check_pending(self, directory, state, step, epoch, request):
+        """The durable host intent must be exactly the controller's pending one.
+
+        A missing intent means the request never reached the host (no effect
+        ran). A different step, lease or controller epoch is a mismatch: an
+        uncertain effect is never quiesced on another operation's behalf.
+        """
+        for name in (step + '.intent.json', step + '.json'):
+            path = Path(directory) / name
+            if not (path.exists() or path.is_symlink()):
+                continue
+            record = _read_private_json(path, root=self.state)
+            stored = record.get('request')
+            if not isinstance(stored, dict):
+                raise Uncertain('journal:' + name)
+            if (stored.get('operation') != request['operation']
+                    or stored.get('agent') != request['agent']
+                    or stored.get('owner') != request['owner']
+                    or stored.get('lease_epoch') != request['lease_epoch']
+                    or stored.get('controller_epoch') != epoch):
+                raise Refused('intent_changed')
+            return
+        if state.get('last_step') == step and state.get('last_ok') is True:
+            raise Uncertain('journal:' + step)
+        if state.get('last_step') not in ('', step):
+            raise Refused('intent_changed')
+
+    def _quiesce(self, step, entry):
+        """Quiesce the host jobs of the interrupted effect.
+
+        ``enable`` and ``restore_source`` start the enrolled unit: an
+        interrupted call may have started it, so reconciliation stops it and
+        proves the cgroup quiet. A pending ``stop_source`` is made quiet too.
+        Read-only effects leave no host job; the shared epoch fence refuses
+        any delayed call from the revoked epoch before it can act.
+        """
+        if step in ('enable', 'restore_source', 'stop_source'):
+            self._stop_unit(entry)
+
+    def _reconcile(self, request, entry):
+        """Fence the old controller epoch and quiesce its host jobs.
+
+        The controller calls this before any retry of an uncertain effect. The
+        operation state advances to the new controller epoch (a delayed call
+        from the old one is then refused), the exact pending intent is checked
+        against the request, the host job is quiesced, and a durable proof is
+        returned: ``{ok, quiesced, epoch: PENDING_EPOCH}``. The journal's
+        order mark is left untouched so the controller's retry can resume the
+        same step, idempotently, under the new epoch.
+        """
+        operation = request['operation']
+        step, pending_epoch = request['pending_step'], request['pending_epoch']
+        directory = _ensure_private(self.operations / operation,
+                                    root=self.state)
+        state_path = directory / 'state.json'
+        with self._locked(directory, root=self.state):
+            state = self._state(state_path)
+            state, refusal = self._bind_lease(state, state_path, request)
+            if refusal is not None:
+                return refusal
+            if request['controller_epoch'] > state['epoch']:
+                state = dict(state, epoch=request['controller_epoch'])
+                self._store_state(state_path, state)
+            elif request['controller_epoch'] < state['epoch']:
+                return self._refusal(request, 'revoked_epoch')
+            try:
+                self._bind_fence(request, entry)
+            except Refused as exc:
+                return self._refusal(request, str(exc))
+            record_path = directory / 'reconcile.json'
+            if record_path.exists() or record_path.is_symlink():
+                record = _read_private_json(record_path, root=self.state)
+                if (record.get('pending_step') != step
+                        or record.get('pending_epoch') != pending_epoch):
+                    return self._refusal(request, 'intent_changed')
+                if record.get('quiesced') is not True:
+                    raise Uncertain('journal:reconcile')
+                return self._receipt(request, {'quiesced': True,
+                                               'epoch': pending_epoch})
+            self._check_pending(directory, state, step, pending_epoch, request)
+            self._quiesce(step, entry)
+            _atomic_json(record_path,
+                         {'version': 1, 'pending_step': step,
+                          'pending_epoch': pending_epoch, 'quiesced': True,
+                          'at': float(self.clock())},
+                         root=self.state)
+            return self._receipt(request, {'quiesced': True,
+                                           'epoch': pending_epoch})
 
     def _bind_lease(self, state, path, request):
         """Bind the operation's source lease once, then refuse any change."""
@@ -1157,6 +1306,27 @@ class HostEffects:
             return self._transfer(request, entry)
         if step == 'session':
             return self._session(request, entry)
+        if step == 'admit':
+            return self._admit(request, entry)
+        if step == 'enable':
+            return self._enable(request, entry)
+        if step == 'verify':
+            return self._verify(request, entry)
+        if step == 'restore_source':
+            return self._restore_source(request, entry)
+        raise Refused('method')
+
+    def _observe(self, request, entry):
+        """Re-observe a stored H3 receipt without replaying its first effect."""
+        step = request['step']
+        if step == 'stop_source':
+            return self._stop_source(request, entry)
+        if step == 'restore_source':
+            return self._restore_source(request, entry)
+        if step == 'enable':
+            return self._enable(request, entry)
+        if step == 'verify':
+            return self._verify(request, entry)
         raise Refused('method')
 
     # -- revalidate: observe, never start ----------------------------------
@@ -1197,14 +1367,26 @@ class HostEffects:
             cwd = transfer['cwd']
             try:
                 head = self._git(entry, cwd, ['rev-parse', 'HEAD'])
-                clean = not self._git(entry, cwd,
-                                      ['status', '--porcelain', '--untracked-files=all'])
+                if current['last_seq'] < STEP_SEQUENCE['admit']:
+                    clean = not self._git(entry, cwd,
+                                          ['status', '--porcelain',
+                                           '--untracked-files=all'])
+                    if head != transfer['commit'] or not clean:
+                        raise Refused('checkout')
+                elif head != transfer['commit']:
+                    # After the switch, the destination's own turn may have
+                    # committed on top of the exact checkout. The transfer
+                    # commit must remain an ancestor; a reset or another
+                    # branch is a checkout mismatch, not new work.
+                    self._git(entry, cwd, ['merge-base', '--is-ancestor',
+                                           transfer['commit'], head])
             except Uncertain:
                 raise Refused('checkout') from None
-            if head != transfer['commit'] or not clean:
-                raise Refused('checkout')
         session = self._step_receipt(directory, 'session')
-        if session is not None and self._active(entry):
+        # H3: after the switch, the destination unit is expected to become
+        # active; only a pre-switch state refuses an active target.
+        if (session is not None and self._active(entry)
+                and current['last_seq'] < STEP_SEQUENCE['admit']):
             raise Refused('target_active')
 
     def _step_receipt(self, directory, step):
@@ -1270,11 +1452,11 @@ class HostEffects:
 
     # -- source stop -------------------------------------------------------
 
-    def _stop_source(self, request, entry):
+    def _stop_unit(self, entry):
+        """Stop the exact enrolled unit and prove its cgroup is quiescent."""
         if not self._active(entry) and self.system.quiet(
                 entry['scope'], entry['account'], entry['unit']):
-            return {'unit': entry['unit'], 'stopped': True, 'quiet': True,
-                    'executor_enabled': False}
+            return
         try:
             self.system.stop(entry['scope'], entry['account'], entry['unit'])
         except (Refused, Uncertain):
@@ -1285,10 +1467,37 @@ class HostEffects:
         while time.monotonic() < deadline:
             if (not self._active(entry) and self.system.quiet(
                     entry['scope'], entry['account'], entry['unit'])):
-                return {'unit': entry['unit'], 'stopped': True, 'quiet': True,
-                        'executor_enabled': False}
+                return
             time.sleep(0.2)
         raise Uncertain('stop:deadline')
+
+    def _stop_source(self, request, entry):
+        self._stop_unit(entry)
+        return {'unit': entry['unit'], 'stopped': True, 'quiet': True,
+                'executor_enabled': False}
+
+    def _restore_source(self, request, entry):
+        """Restart the source unit before cancellation, then prove it active.
+
+        The source worktree and session were never touched by the pre-switch
+        effects; restoration only returns the enrolled unit to service. A
+        start refusal is definitive (the controller holds), a timeout is
+        uncertain (the unit may be starting) and requires reconciliation.
+        """
+        if not self._active(entry):
+            self.system.start(entry['scope'], entry['account'], entry['unit'])
+        deadline = time.monotonic() + self.restore_seconds
+        while time.monotonic() < deadline:
+            caps = self.system.show(
+                entry['scope'], entry['account'], entry['unit'],
+                ('LoadState', 'ActiveState', 'MemoryMax', 'MemoryHigh', 'Slice'))
+            if caps.get('ActiveState') == 'failed':
+                raise Refused('restore')
+            if caps.get('ActiveState') == 'active' and _caps_ready(caps):
+                return {'unit': entry['unit'], 'active': True,
+                        'executor_enabled': True}
+            time.sleep(0.2)
+        raise Uncertain('restore:deadline')
 
     # -- publication and transfer -----------------------------------------
 
@@ -1505,6 +1714,154 @@ class HostEffects:
             _atomic_json(marker, expected, owner=owner, root=home)
         return {'mode': mode, 'executor_enabled': False,
                 'oauth_cache_transferred': False}
+
+    # -- activation and health (H3) ---------------------------------------
+
+    def _dsh_profile_check(self, harness, agent, entry, home):
+        """Observe the private dsh profile prepared by H2; never create it."""
+        if harness not in ('deepseek', 'dsh'):
+            return True
+        owner = self._owner(entry)
+        base = _private_chain(Path(home) / '.ameesh-handoff',
+                              owner=owner, root=home)
+        directory = _private_chain(base / 'dsh', owner=owner, root=home)
+        marker = directory / 'profile.json'
+        expected = {'version': 1, 'agent': agent, 'harness': harness,
+                    'credentials': False}
+        if marker.is_symlink() or not marker.exists():
+            raise Refused('dsh_profile')
+        if _read_private_json(marker, owner=owner, root=home) != expected:
+            raise Refused('dsh_profile')
+        descriptor = _open_dir(home, directory, owner=owner)
+        try:
+            for name in os.listdir(descriptor):
+                if name in CREDENTIAL_FILES:
+                    raise Refused('dsh_credentials')
+        finally:
+            os.close(descriptor)
+        return True
+
+    def _session_credentials_ok(self, entry, operation):
+        """Refuse a prepared session directory that carries a credential."""
+        home = self._home(entry)
+        owner = self._owner(entry)
+        base = _private_chain(Path(home) / '.ameesh-handoff',
+                              owner=owner, root=home)
+        sessions = _private_chain(base / 'sessions', owner=owner, root=home)
+        directory = _private_chain(sessions / operation, owner=owner, root=home)
+        descriptor = _open_dir(home, directory, owner=owner)
+        try:
+            for name in os.listdir(descriptor):
+                if name in CREDENTIAL_FILES:
+                    raise Refused('oauth_cache')
+        finally:
+            os.close(descriptor)
+
+    def _admit(self, request, entry):
+        """Recheck the prepared destination without changing or starting it."""
+        prepare = self._step_receipt(self.operations / request['operation'],
+                                     'prepare')
+        if prepare is None:
+            raise Refused('order')
+        if not self._tooling(request['tools']):
+            raise Refused('tooling')
+        if not all(alias in self.enrollment['secrets']
+                   for alias in request['secrets']):
+            raise Refused('credentials')
+        caps = self.system.show(entry['scope'], entry['account'], entry['unit'],
+                                ('LoadState', 'ActiveState', 'MemoryMax',
+                                 'MemoryHigh', 'Slice'))
+        if not _caps_ready(caps):
+            raise Refused('caps')
+        if caps.get('ActiveState') in ('active', 'activating', 'reloading'):
+            raise Refused('target_active')
+        release = self._release_revision()
+        if release != prepare.get('release_revision'):
+            raise Refused('release')
+        dsh = self._dsh_profile_check(request['harness'], request['agent'],
+                                      entry, self._home(entry))
+        return {'release_revision': release, 'credentials_ready': True,
+                'caps_ready': True, 'tooling_ready': True,
+                'dsh_profile_ready': dsh, 'executor_enabled': False}
+
+    def _enable(self, request, entry):
+        """Start the exact destination unit and prove it active with its caps.
+
+        The controller holds the destination gate publication lock around this
+        call; a queued/late start from a revoked epoch is fenced by the
+        journal state before it can act. A unit already active (a replayed
+        receipt or a completed first start) is accepted only after the exact
+        checkout and caps are re-observed. A timeout is uncertain: the start
+        may still complete and reconciliation must quiesce it.
+        """
+        transfer = self._step_receipt(self.operations / request['operation'],
+                                      'transfer')
+        session = self._step_receipt(self.operations / request['operation'],
+                                     'session')
+        if transfer is None or session is None:
+            raise Refused('order')
+        cwd, commit = transfer.get('cwd'), transfer.get('commit')
+        if not isinstance(cwd, str) or not isinstance(commit, str) \
+                or not _SHA.fullmatch(commit):
+            raise Refused('order')
+        try:
+            head = self._git(entry, cwd, ['rev-parse', 'HEAD'])
+            dirty = self._git(entry, cwd,
+                              ['status', '--porcelain', '--untracked-files=all'])
+        except Uncertain:
+            raise Refused('checkout') from None
+        if head != commit or dirty:
+            raise Refused('checkout')
+        self._session_credentials_ok(entry, request['operation'])
+        if not self._active(entry):
+            self.system.start(entry['scope'], entry['account'], entry['unit'])
+        deadline = time.monotonic() + self.enable_seconds
+        while time.monotonic() < deadline:
+            caps = self.system.show(
+                entry['scope'], entry['account'], entry['unit'],
+                ('LoadState', 'ActiveState', 'MemoryMax', 'MemoryHigh', 'Slice'))
+            if caps.get('ActiveState') == 'failed':
+                raise Refused('enable')
+            if caps.get('ActiveState') == 'active' and _caps_ready(caps):
+                return {'unit': entry['unit'], 'active': True,
+                        'executor_enabled': True}
+            time.sleep(0.2)
+        raise Uncertain('enable:deadline')
+
+    def _verify(self, request, entry):
+        """Observe the exact checkout, live unit and caps after the first turn.
+
+        The authenticated turn itself is proven by the controller's durable
+        turn ledger, not by this host observation.
+        """
+        transfer = self._step_receipt(self.operations / request['operation'],
+                                      'transfer')
+        session = self._step_receipt(self.operations / request['operation'],
+                                     'session')
+        if transfer is None or session is None:
+            raise Refused('order')
+        commit = request['commit']
+        cwd = transfer.get('cwd')
+        if transfer.get('commit') != commit or not isinstance(cwd, str):
+            raise Refused('commit')
+        try:
+            head = self._git(entry, cwd, ['rev-parse', 'HEAD'])
+            if head != commit:
+                # The destination's own first turn may have committed new
+                # work; the exact transfer commit must remain an ancestor,
+                # never a reset or another branch.
+                self._git(entry, cwd, ['merge-base', '--is-ancestor',
+                                       commit, head])
+        except Uncertain:
+            raise Refused('checkout') from None
+        caps = self.system.show(entry['scope'], entry['account'], entry['unit'],
+                                ('LoadState', 'ActiveState', 'MemoryMax',
+                                 'MemoryHigh', 'Slice'))
+        if caps.get('ActiveState') != 'active' or not _caps_ready(caps):
+            raise Refused('target_inactive')
+        self._session_credentials_ok(entry, request['operation'])
+        return {'unit': entry['unit'], 'commit': commit,
+                'executor_enabled': True, 'caps_ready': True}
 
     # -- host facts --------------------------------------------------------
 
@@ -1747,7 +2104,7 @@ class HostAdapter:
         entry = self._entry(operation['target'])
         request = self._wire(operation, 'prepare', target=_target(operation), extra={
             'harness': operation['plan']['harness'],
-            'account': operation['plan'].get('session_account') or '',
+            'account': _account(operation['plan']),
             'tools': sorted(entry['tools']), 'secrets': sorted(entry['secrets'])})
         receipt = self._call(operation, 'prepare', request, target=_target(operation),
                              validated=True)
@@ -1830,7 +2187,7 @@ class HostAdapter:
                 return {'ok': False, 'reason': 'transfer'}
         receipt = self._call(operation, 'session', {
             'harness': plan['harness'],
-            'account': plan.get('session_account') or '',
+            'account': _account(plan),
             'cwd': evidence['cwd'], 'commit': evidence['commit']},
             target=_target(operation))
         if receipt.get('ok') is not True:
@@ -1842,28 +2199,164 @@ class HostAdapter:
             return {'ok': False, 'reason': 'oauth_cache'}
         return {'ok': True, 'mode': expected, 'executor_enabled': False}
 
-    # -- H3 capabilities stay explicit refusals ----------------------------
-
-    def _unbound(self, capability):
-        raise Refused('capability:' + capability)
+    # -- H3: activation, health and reconciliation ------------------------
 
     def admit(self, operation):
-        self._unbound('admit')
+        """Recheck the prepared destination without starting it."""
+        try:
+            self._identity(operation, _target(operation))
+            self._intent(operation, 'admit')
+            missing = self._prerequisites(operation, step='admit')
+        except (Refused, handoff_contract.ContractError):
+            return {'ok': False, 'reason': 'prerequisites'}
+        if missing:
+            return {'ok': False, 'reason': 'prerequisites'}
+        plan = operation['plan']
+        entry = self._entry(_target(operation))
+        request = self._wire(operation, 'admit', target=_target(operation), extra={
+            'harness': plan['harness'], 'account': _account(plan),
+            'tools': sorted(entry['tools']), 'secrets': sorted(entry['secrets'])})
+        receipt = self._call(operation, 'admit', request,
+                             target=_target(operation), validated=True)
+        if receipt.get('ok') is not True:
+            return receipt
+        if (receipt.get('credentials_ready') is not True
+                or receipt.get('caps_ready') is not True
+                or receipt.get('tooling_ready') is not True):
+            return {'ok': False, 'reason': 'admit'}
+        if (plan['harness'] in SESSION_MODES
+                and receipt.get('dsh_profile_ready') is not True):
+            return {'ok': False, 'reason': 'dsh_profile'}
+        if receipt.get('release_revision') != operation['evidence'].get('release_revision'):
+            return {'ok': False, 'reason': 'release'}
+        return {'ok': True, 'canon_revision': plan['canon_revision'],
+                'release_revision': receipt['release_revision'],
+                'credentials_ready': True, 'caps_ready': True,
+                'tooling_ready': True,
+                'dsh_profile_ready': receipt.get('dsh_profile_ready') is True}
 
     def enable(self, operation):
-        self._unbound('enable')
+        """Start the exact destination unit through the enrolled helper."""
+        try:
+            self._identity(operation, _target(operation))
+            self._intent(operation, 'enable')
+            missing = self._prerequisites(operation, step='enable')
+        except (Refused, handoff_contract.ContractError):
+            return {'ok': False, 'reason': 'prerequisites'}
+        if missing:
+            return {'ok': False, 'reason': 'prerequisites'}
+        receipt = self._call(operation, 'enable', {}, target=_target(operation))
+        if receipt.get('ok') is not True:
+            return receipt
+        if (receipt.get('active') is not True
+                or receipt.get('executor_enabled') is not True):
+            return {'ok': False, 'reason': 'enable'}
+        return True
 
     def verify(self, operation):
-        self._unbound('verify')
+        """Prove the first authenticated destination turn and its host state.
+
+        The host receipt proves the live unit, exact checkout and caps; the
+        durable turn ledger proves an authenticated turn on the target after
+        the switch. While that turn is still running the receipt is
+        ``pending`` and the controller keeps the operation active.
+        """
+        try:
+            self._identity(operation, _target(operation))
+            self._intent(operation, 'verify')
+            missing = self._prerequisites(operation, step='verify')
+        except (Refused, handoff_contract.ContractError):
+            return {'ok': False, 'reason': 'prerequisites'}
+        if missing:
+            return {'ok': False, 'reason': 'prerequisites'}
+        commit = operation['evidence'].get('commit')
+        if not isinstance(commit, str) or not _SHA.fullmatch(commit):
+            return {'ok': False, 'reason': 'verify'}
+        receipt = self._call(operation, 'verify', {'commit': commit},
+                             target=_target(operation))
+        if receipt.get('ok') is not True:
+            return receipt
+        if (receipt.get('commit') != commit
+                or receipt.get('executor_enabled') is not True
+                or receipt.get('caps_ready') is not True):
+            return {'ok': False, 'reason': 'verify'}
+        turn = self._turn_proof(operation)
+        if turn is None:
+            return {'ok': True, 'pending': True}
+        return {'ok': True, 'commit': commit, 'turn_completed': True,
+                'authenticated': turn.get('authenticated') is True,
+                'caps_ready': True}
 
     def restore_source(self, operation):
-        self._unbound('restore_source')
+        """Return the source unit to service before a cancellation."""
+        try:
+            self._identity(operation, _source(operation))
+            self._intent(operation, 'restore_source')
+        except Refused:
+            return False
+        receipt = self._call(operation, 'restore_source', {},
+                             target=_source(operation))
+        if receipt.get('ok') is not True:
+            return False
+        return (receipt.get('active') is True
+                and receipt.get('executor_enabled') is True)
 
     def recover_source(self, operation):
-        self._unbound('recover_source')
+        raise Refused('capability:recover_source')
 
     def reconcile_effect(self, operation):
-        self._unbound('reconcile_effect')
+        """Quiesce the exact epoch of an interrupted host effect."""
+        try:
+            self._identity(operation, _target(operation))
+        except Refused:
+            return {'ok': False, 'reason': 'identity'}
+        pending = (operation.get('evidence') or {}).get('pending_effect')
+        if (not isinstance(pending, dict)
+                or not isinstance(pending.get('name'), str)
+                or not isinstance(pending.get('epoch'), int)
+                or isinstance(pending.get('epoch'), bool)
+                or pending['epoch'] < 1):
+            return {'ok': False, 'reason': 'intent'}
+        return self._call(operation, 'reconcile_effect', {
+            'pending_step': pending['name'], 'pending_epoch': pending['epoch']},
+            target=_target(operation))
+
+    def _turn_proof(self, operation):
+        """The destination's first authenticated turn, from the turn ledger.
+
+        The switch event is the durable boundary: a completed turn recorded on
+        the target host after it, with its cost line, proves the harness ran
+        there. Token usage above zero is the authenticated response; a
+        completed turn with no usage is returned as ``authenticated: false``
+        and holds the operation. The source is fenced and cannot produce a
+        target turn.
+        """
+        if self.db is None:
+            return None
+        rows = self.db.query(
+            "SELECT created_at FROM host_handoff_events"
+            " WHERE operation=%s AND state='switched'"
+            " ORDER BY id DESC LIMIT 1", (operation['id'],))
+        if not rows:
+            return None
+        switched = rows[0]['created_at']
+        rows = self.db.query(
+            "SELECT tr.turn_id, tr.status, tr.ended_at, tc.id AS cost_id,"
+            " tc.input_tokens, tc.cached_input_tokens, tc.output_tokens"
+            " FROM turn_resources tr"
+            " LEFT JOIN turn_costs tc ON tc.turn_id = tr.turn_id"
+            " WHERE tr.agent=%s AND tr.host=%s AND tr.started_at >= %s"
+            " ORDER BY tr.started_at DESC, tr.id DESC LIMIT 20",
+            (operation['agent'], operation['target'], switched))
+        for row in rows:
+            if (row.get('status') != 'done' or row.get('ended_at') is None
+                    or row.get('cost_id') is None):
+                continue
+            tokens = sum(int(row.get(key) or 0) for key in
+                         ('input_tokens', 'cached_input_tokens',
+                          'output_tokens'))
+            return {'authenticated': tokens > 0}
+        return None
 
     # -- internals ---------------------------------------------------------
 
@@ -1900,7 +2393,7 @@ class HostAdapter:
         plan = operation['plan']
         host = _target(operation)
         entry = self._entry(host)
-        account = plan.get('session_account') or ''
+        account = _account(plan)
         if account not in entry['accounts']:
             raise Refused('identity:account')
         return host_preflight.Requirements(
@@ -2033,6 +2526,28 @@ def _source(operation):
     return operation['source']
 
 
+def _account(plan):
+    """H4 raccord: the destination account is frozen in the plan.
+
+    The switch clears the registry's source `session_account`; a destination
+    effect must never re-read it. H4 lands `plan.account` from the same agent
+    snapshot as `plan.session_account`; both are equal when present, and any
+    divergence refuses rather than picking one.
+    """
+    if not isinstance(plan, Mapping):
+        raise Refused('identity:account')
+    account = plan.get('account')
+    session = plan.get('session_account')
+    if account is None:
+        account = session if session is not None else ''
+    if session is None:
+        session = account
+    if (not isinstance(account, str) or not isinstance(session, str)
+            or (account and session and account != session)):
+        raise Refused('identity:account')
+    return account or session or ''
+
+
 def _fresh(reading, now, max_age=60.0):
     stamp = reading.get('sampled_ts') if reading else None
     return (isinstance(stamp, (int, float)) and not isinstance(stamp, bool)
@@ -2042,8 +2557,6 @@ def _fresh(reading, now, max_age=60.0):
 # ---------------------------------------------------------------------------
 # The root stdin dispatcher installed by H7
 # ---------------------------------------------------------------------------
-
-SECONDS = 30
 
 
 def execute(request, *, root=ENROLLMENT_ROOT):
