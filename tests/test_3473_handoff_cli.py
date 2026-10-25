@@ -14,7 +14,7 @@ class OperatorTest(unittest.TestCase):
     def setUp(self):
         self.db = mock.Mock()
         self.api = mock.Mock()
-        self.api.handoffs.get.return_value = {'id': 'op'}
+        self.api.handoffs.get.return_value = {'id': 'op', 'plan': {'lifecycle_host': 'source'}}
         self.binding = SimpleNamespace(adapter=object(), requirements_for=object())
         self.loader = SimpleNamespace(load=mock.Mock(return_value=self.binding))
         self.result = {'id': 'op', 'state': 'held', 'evidence': {'token': 'SECRET'},
@@ -50,6 +50,26 @@ class OperatorTest(unittest.TestCase):
                 self.assertEqual(sum(calls), 1)
                 if command == 'retry':
                     self.assertIsNone(retry.call_args.kwargs['renew_ttl'])
+
+    def test_manual_plan_uses_enrolled_adapter_without_lifecycle_requirement(self):
+        import ameesh
+        self.api.handoffs.get.return_value = {'id': 'op', 'plan': {}}
+        with mock.patch.object(work, 'corrector'), \
+                mock.patch.object(storage, 'of', return_value=self.api), \
+                mock.patch.object(ameesh, 'handoff_factory', self.loader, create=True), \
+                mock.patch.object(host_lifecycle, '_ReadyAdapter') as wrapper, \
+                mock.patch.object(handoffs, 'advance', return_value=self.result) as advance:
+            self.invoke('advance')
+        wrapper.assert_not_called()
+        advance.assert_called_once_with(self.db, 'op', self.binding.adapter)
+
+    def test_unknown_operation_never_loads_factory(self):
+        self.api.handoffs.get.return_value = None
+        with mock.patch.object(work, 'corrector'), \
+                mock.patch.object(storage, 'of', return_value=self.api):
+            with self.assertRaisesRegex(ValueError, 'unknown handoff'):
+                self.invoke('advance')
+        self.loader.load.assert_not_called()
 
     def test_unauthorized_never_loads_factory_or_reads_operation(self):
         with mock.patch.object(work, 'corrector', side_effect=work.WorkError('refused')), \
