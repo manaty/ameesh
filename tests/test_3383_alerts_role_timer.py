@@ -147,7 +147,7 @@ class AlertsTimerTest(unittest.TestCase):
         self.assertIn("human:owner", alerts["detail"])
         role_timers.install(report, directory=self.dir, apply=False)
         service = (self.dir / "ameesh-role-alerts.service").read_text(encoding="utf-8")
-        self.assertIn("role run mesh-design -- %s notify --once --only alerts"
+        self.assertIn("role run mesh-design --pass alerts -- %s notify --once --only alerts"
                       % role_timers.DEFAULT_BIN, service)
         self.assertIn("EnvironmentFile=-%h/.config/ameesh/notify.env", service)
         timer = (self.dir / "ameesh-role-alerts.timer").read_text(encoding="utf-8")

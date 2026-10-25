@@ -278,7 +278,7 @@ class ReferencePgTest(PgTestCase):
 
     def setUp(self) -> None:
         super().setUp()
-        for name in ("orch", "dev1"):
+        for name in ("orch", "dev1", "auditeur"):
             registry.upsert(self.db, name, harness="claude", host=self.cfg.host)
 
     def _deliver(self, lot_id, *, started_min_ago):
@@ -314,11 +314,12 @@ class ReferencePgTest(PgTestCase):
         # la création seule ne calcule rien : toujours pas de référence
         self.assertIsNone(estimates.proposal(self.db, type="evolution", size="m"))
 
-        proc = self.mesh("work", "estimates", "--publish", "--actor", "auditeur")
+        proc = self.mesh("work", "estimates", "--publish", "--actor", "human:smichea")
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("BIAS (estimate_bias)", proc.stdout)
         ref = estimates.current_reference(self.db)
-        self.assertEqual((ref["published_by"], ref["body"]["measured"]), ("auditeur", 3))
+        self.assertEqual((ref["published_by"], ref["body"]["measured"]),
+                         ("human:smichea", 3))
         self.assertEqual([e["estimator"] for e in ref["body"]["bias"]], ["orch"])
 
         proc = self.mesh("work", "add", "--title", "après", "--actor", "orch",
@@ -341,7 +342,8 @@ class ReferencePgTest(PgTestCase):
         self.assertEqual([(a["agent"], a["value"], a["lot_count"]) for a in bias],
                          [("orch", 0.1, 3)])
         # --publish couvre tous les projets
-        proc = self.mesh("work", "estimates", "--publish", "--app", "p")
+        proc = self.mesh("work", "estimates", "--publish", "--app", "p",
+                         "--actor", "human:smichea")
         self.assertEqual(proc.returncode, 2)
         # une taille inconnue est refusée
         with self.assertRaises(work.WorkError):
@@ -366,7 +368,7 @@ class ReferencePgTest(PgTestCase):
         self.assertEqual(
             self.db.query("SELECT count(*) AS n FROM estimate_references")[0]["n"], 1)
         self.assertEqual(storage.of(self.db).work.reference()["id"], first["id"])
-        proc = self.mesh("work", "estimates", "--publish", "--actor", "auditeur")
+        proc = self.mesh("work", "estimates", "--publish", "--actor", "human:smichea")
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertIn("reference table #%s unchanged" % first["id"], proc.stdout)
 
@@ -383,6 +385,70 @@ class ReferencePgTest(PgTestCase):
         self.assertFalse(second["unchanged"])
         self.assertNotEqual(second["id"], first["id"])
         self.assertEqual(second["body"]["bias"][0]["biased_since"], since)
+
+    def test_publication_reservee_a_l_auditeur(self):
+        # #3501 : un agent qui n'est pas l'auditeur reçoit un refus explicite
+        proc = self.mesh("work", "estimates", "--publish", "--actor", "dev1")
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("dev1 is not a human", proc.stderr)
+        proc = self.mesh("work", "estimates", "--publish")
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("say who publishes", proc.stderr)
+        # revue de mty-amh-impl-05 : sans liaison, nommer l'auditeur ne suffit
+        # pas, ni un AGENT_MAIL_NAME seulement auto-déclaré
+        proc = self.mesh("work", "estimates", "--publish", "--actor", "auditeur")
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("auditeur is not a human", proc.stderr)
+        proc = self.mesh("work", "estimates", "--publish",
+                         env=self.env(AGENT_MAIL_NAME="auditeur"))
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("identity auditeur is explicit, not bound", proc.stderr)
+        self.assertIsNone(estimates.current_reference(self.db))
+
+        proc = self.mesh("work", "estimates", "--publish", "--actor", "human:owner")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        first = estimates.current_reference(self.db)
+        self.assertEqual(first["published_by"], "human:owner")
+        # le contenu identique n'écrit rien (#3502)
+        proc = self.mesh("work", "estimates", "--publish", "--actor", "human:owner")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("reference table #%s unchanged" % first["id"], proc.stdout)
+        self.assertEqual(estimates.current_reference(self.db)["id"], first["id"])
+
+class PublisherTest(unittest.TestCase):
+    """#3501 : une session liée publie en son nom, et seulement l'auditeur."""
+
+    def _binding(self, name):
+        source = "runner"
+        if isinstance(name, tuple):
+            name, source = name
+        return types.SimpleNamespace(name=name, ok=True, source=source, reason=None)
+
+    def _publisher(self, bound, explicit="", auditors=("auditeur",)):
+        with mock.patch("ameesh.identity.resolve_binding",
+                        return_value=self._binding(bound)), \
+                mock.patch("ameesh.agent_names.resolve", side_effect=lambda t, **_: t), \
+                mock.patch.object(work, "is_auditor",
+                                  side_effect=lambda cfg, db, n: n in auditors):
+            return work.publisher(None, None, explicit)
+
+    def test_session_liee(self):
+        self.assertEqual(self._publisher("auditeur"), "auditeur")
+        with self.assertRaisesRegex(work.WorkError, "mty-amh-docs-01 is not the auditor"):
+            self._publisher("mty-amh-docs-01")
+        with self.assertRaisesRegex(work.WorkError, "does not publish on behalf of auditeur"):
+            self._publisher("mty-amh-docs-01", "auditeur")
+        # un nom seulement auto-déclaré (AGENT_MAIL_NAME sans bail) ne suffit pas
+        with self.assertRaisesRegex(work.WorkError, "auditeur is explicit, not bound"):
+            self._publisher(("auditeur", "explicit"))
+        self.assertEqual(self._publisher(("auditeur", "session")), "auditeur")
+
+    def test_session_sans_identite(self):
+        self.assertEqual(self._publisher("", "human:owner"), "human:owner")
+        with self.assertRaisesRegex(work.WorkError, "auditeur is not a human"):
+            self._publisher("", "auditeur")
+        with self.assertRaisesRegex(work.WorkError, "say who publishes"):
+            self._publisher("")
 
 
 if __name__ == "__main__":

@@ -40,6 +40,7 @@ class FakeQueue(FakeWork):
         #: #2371 N2 : l'instant de chaque note, en parallèle de `notes` ; le
         #: faux `events_noted` honore ainsi `since_ts` comme le vrai journal.
         self.note_ts: list = []
+        self.withdrawals: dict = {}
 
     def _append_note(self, item_id, note, actor):
         """Ajoute une note datée du faux horloge (#2371 N2).
@@ -61,8 +62,12 @@ class FakeQueue(FakeWork):
                     item_state=item.get("state"), branch=item.get("branch"),
                     assignee=item.get("assignee"))
 
-    def queue_add(self, item_id, *, target, frozen_sha, note, actor, source="", frozen_id=None):
+    def queue_add(self, item_id, *, target, frozen_sha, note, actor, source="", frozen_id=None,
+                  withdrawn_after=None):
         if self.lots[item_id]["state"] in ("merged", "promoted", "closed"):
+            return None
+        if withdrawn_after is not None and \
+                self.queue_withdrawn_since(item_id, withdrawn_after) is not None:
             return None
         self.clock += 1
         self.queue_rows[item_id] = {"work_item_id": item_id, "target": target,
@@ -115,7 +120,15 @@ class FakeQueue(FakeWork):
 
     def queue_remove(self, item_id, *, note, actor):
         self._append_note(item_id, note, actor)
-        return self.queue_rows.pop(item_id, None) is not None
+        removed = self.queue_rows.pop(item_id, None) is not None
+        if removed:
+            #: #3532 : l'instant du reçu typé `removed`
+            self.withdrawals.setdefault(item_id, []).append(self.clock)
+        return removed
+
+    def queue_withdrawn_since(self, item_id, since_ts):
+        at = [t for t in self.withdrawals.get(item_id, ()) if t >= since_ts]
+        return max(at) if at else None
 
     def queue(self, target=None):
         rows = [self._row(n) for n in self.queue_rows]

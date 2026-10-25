@@ -89,6 +89,21 @@ harness: claude
 """
 
 
+def _federation(*, risk_paths=("src/ameesh/**",), rule_paths=("src/ameesh/**",),
+                reviews=2):
+    """FEDERATION avec d'autres portées de classe et de `train_reviews`."""
+    text = FEDERATION.replace(
+        '          - paths:\n              - "src/ameesh/**"\n            class: sensitive',
+        "          - paths:\n"
+        + "".join('              - "%s"\n' % path for path in risk_paths)
+        + "            class: sensitive")
+    return text.replace(
+        '          - paths:\n              - "src/ameesh/**"\n            reviews: 2',
+        "          - paths:\n"
+        + "".join('              - "%s"\n' % path for path in rule_paths)
+        + "            reviews: " + str(reviews))
+
+
 class _Repo:
     """A minimal git repository for the frozen lot or the canon."""
 
@@ -1069,20 +1084,42 @@ class ActivationTest(_ActivationFixture, PgTestCase):
         self.assertEqual(list(raw), ["-none"])
 
     def test_the_critical_floor_of_the_merge_gate_is_the_requirement(self):
-        # #2627 : le canon peut ne declarer qu'un avis sur exploitation.py ;
-        # la porte de fusion en exige deux (chemin critique). La designation
-        # doit lire le meme besoin que le feu, sinon le lot reste court.
-        self.repo.write("src/ameesh/exploitation.py", "lot\n")
+        # #2627 / #3542 : le canon couvre scripts/** d'une règle `**` à un
+        # avis, mais ne le nomme pas ; le plancher critique de la porte reste
+        # deux avis, et `**` ne l'abaisse pas.
+        self.repo.write("scripts/deploy-cutoff.sh", "lot\n")
         self.frozen = self.repo.commit("critical path")
         self.receipts()
         canon = _Canon(os.path.join(self.tmp, "canon-un-avis"),
-                       federation=FEDERATION.replace("            reviews: 2",
-                                                     "            reviews: 1"))
+                       federation=_federation(risk_paths=("src/ameesh/**",
+                                                          "scripts/**"),
+                                              rule_paths=("**",), reviews=1))
         cfg = dataclasses.replace(self.cfg, canon=canon.root, canon_ref="HEAD")
         _, out = self.freeze(cfg=cfg)
         self.assertEqual(out["state"], rd.DESIGNATED, out)
         self.assertEqual(out["required"], 2)
         self.assertEqual(len(out["reviewers"]), 2)
+
+    def test_a_canon_rule_that_names_the_path_is_authoritative(self):
+        # #3542 : deploy/** est nommé à un avis par le canon. La désignation
+        # lit le même besoin que la porte : un avis, même si CRITICAL_SCOPE
+        # reconnaît deploy/.
+        self.repo.write("deploy/bascule.py", "lot\n")
+        self.frozen = self.repo.commit("named deploy path")
+        self.receipts()
+        canon = _Canon(os.path.join(self.tmp, "canon-deploy-un-avis"),
+                       federation=_federation(risk_paths=("src/ameesh/**",
+                                                          "deploy/**"),
+                                              rule_paths=("deploy/**",
+                                                          "src/ameesh/mail.py"),
+                                              reviews=1))
+        cfg = dataclasses.replace(self.cfg, canon=canon.root, canon_ref="HEAD")
+        _, out = self.freeze(cfg=cfg)
+        self.assertEqual(out["state"], rd.DESIGNATED, out)
+        self.assertEqual(out["required"], 1)
+        self.assertEqual(len(out["reviewers"]), 1)
+        self.assertEqual([m["recipient"] for m in self.mailbox()],
+                         [out["reviewers"][0]["name"]])
 
     def test_no_canon_is_silent_and_keeps_the_freeze(self):
         cfg = dataclasses.replace(self.cfg, canon="")

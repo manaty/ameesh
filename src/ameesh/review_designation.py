@@ -393,10 +393,10 @@ def families_of(authors: Iterable) -> tuple[set, set]:
     co-author and each reviewer who pushed a correction onto the head (exact
     evidence #1465, canon §2 and #2888). `families` carries every proven
     family when the actor wrote under several (#2924 B6): each one is
-    forbidden (#3584). A `test_only` corrector (#3518) forbids only their
-    name: their non-sensitive tests do not author the product delta.
-    An author with no proof is not guessed: `select` then waits instead of
-    designating (see `unknown_families`).
+    forbidden (#3584). A `test_only` corrector (#3518/#3577) forbids only
+    their name: their tests do not author the product delta, even on a
+    sensitive path. An author with no proof is not guessed: `select` then
+    waits instead of designating (see `unknown_families`).
     """
     names, families = set(), set()
     for author in authors or ():

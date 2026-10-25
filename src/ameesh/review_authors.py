@@ -20,9 +20,10 @@ auteurs, avec les mêmes exceptions du canon §2 :
   auteur de la tête (#2888) : sa famille n'est plus éligible. Le seuil ne
   décide que de la recevabilité process (une correction trop grosse revient à
   l'auteur), jamais de l'indépendance. Le correcteur reste tenu hors des
-  relecteurs par son nom (#2739). Exception #3518 : une correction dont tous
-  les chemins sont des tests reconnus (§11 bis), hors plan CI et hors classe
-  sensible du projet, garde seulement cette exclusion personnelle ;
+  relecteurs par son nom (#2739). Exception #3518/#3577 : une correction dont
+  tous les chemins sont des tests reconnus (§11 bis), hors plan CI, garde
+  seulement cette exclusion personnelle, même sous un chemin sensible ; la
+  classe du lot ne change pas ;
 * une réécriture d'historique **à contenu identique** n'efface pas la
   provenance (#2924) : les auteurs des gels antérieurs du même lot dont le
   contenu subsiste restent auteurs de la tête. Une consolidation sur une cible
@@ -334,12 +335,14 @@ def change(repo: str, sha: str) -> Optional[tuple[int, bool]]:
 
 
 def _test_only_correction(repo: str, entries, project: str) -> bool:
-    """All changed paths must be test adaptations (§2/§11 bis, #3518).
+    """All changed paths must be test adaptations (§2/§11 bis, #3518/#3577).
 
-    Reuse the vehicle's test recognition and the project risk class. CI plans,
-    sensitive paths and unreadable or
-    empty diffs never buy an exception to the author-family exclusion.
-    --no-renames includes both sides of a move out of product code.
+    Reuse the vehicle's test recognition. CI plans, unreadable or empty diffs
+    and an unreadable project policy never buy an exception to the author-family
+    exclusion. A sensitive path does not prevent it (#3577): the correction
+    keeps its author family eligible for the product delta while the lot's
+    class is unchanged. --no-renames includes both sides of a move out of
+    product code.
     """
     from . import config, lot_class, packet_reviews, work
 
@@ -362,8 +365,10 @@ def _test_only_correction(repo: str, entries, project: str) -> bool:
             work.configured_canons(config.load()), project, sorted(changed))
     except Exception:  # noqa: BLE001 - unknown policy never grants an exception
         return False
-    return (not klass.get("doubt")
-            and klass.get("class") in (lot_class.LIGHT, lot_class.NORMAL))
+    # #3577: the risk class no longer forbids the exception — a test-only
+    # correction stays test-only under a sensitive path. The policy must still
+    # be readable (no doubt): an unknown policy never grants an exception.
+    return not klass.get("doubt")
 
 
 def _registered(db, name: str) -> bool:
@@ -2440,12 +2445,13 @@ def reading(db, item: Mapping, milestone: Optional[Mapping],
     (#2888) : leur famille est exclue comme celle de tout auteur, et l'agent
     lui-même ne relit pas son propre correctif. `correctors` garde leur trace
     (provenance réelle) pour l'exclusion personnelle ; ce n'est plus une
-    éligibilité de famille. Exception #3518 : un correctif de tests seuls,
-    non sensible selon le projet, reste dans `correctors` avec `test_only`,
-    quelle que soit sa taille, mais n'ajoute pas un auteur produit. La
-    désignation ignore sa famille et exclut toujours son nom. Le report des
-    gels antérieurs garde cette distinction. Un correctif au-delà du seuil ou de conception est
-    aussi un auteur, mais n'est pas un « correcteur » de premier tour.
+    éligibilité de famille. Exception #3518/#3577 : un correctif de tests
+    seuls, même sous un chemin sensible, reste dans `correctors` avec
+    `test_only`, quelle que soit sa taille, mais n'ajoute pas un auteur
+    produit. La désignation ignore sa famille et exclut toujours son nom. Le
+    report des gels antérieurs garde cette distinction. Un correctif au-delà
+    du seuil ou de conception est aussi un auteur, mais n'est pas un
+    « correcteur » de premier tour.
     #3335 : cette promotion et la trace « correcteur » suivent la survie du
     contenu (#3220). Un correctif de relecteur dont aucune ligne significative
     ne subsiste plus dans la tête n'exclut plus sa famille ; une ligne qui
@@ -2611,8 +2617,8 @@ def reading(db, item: Mapping, milestone: Optional[Mapping],
     # #2888 : toute correction d'un relecteur désigné fait de lui un auteur de
     # la tête, quelle que soit sa taille. Le seuil du §2 ne décide que de la
     # recevabilité process (une correction trop grosse revient à l'auteur),
-    # jamais de l'indépendance. #3518 : seuls les tests non sensibles font
-    # exception à l'exclusion de famille ; le nom reste exclu.
+    # jamais de l'indépendance. #3518/#3577 : les tests seuls font exception à
+    # l'exclusion de famille, même sous un chemin sensible ; le nom reste exclu.
     small_correctors: set[str] = set()
     test_correctors: set[str] = set()
     for actor, entries in sorted(review_commits.items()):

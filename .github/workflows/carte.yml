@@ -266,10 +266,6 @@ jobs:
     # #876 : la mesure n'est jamais bloquante, mais une exécution annulée ne
     # doit pas laisser cet agrégat en file des heures (always() seul le recrée).
     if: always() && !cancelled()
-    # supprimer les mesures du run (étape finale) ; le reste du workflow reste en lecture
-    permissions:
-      contents: read
-      actions: write
     runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted", "linux", "ameesh-ci"]') || 'ubuntu-latest' }}
     # #2175 : l'assemblage d'une carte complète (10 parts) coûte ~11 min à 100 % CPU
     # localement ; à 15 min il a été annulé à 15m20 au run 38985327391 alors que les
@@ -329,17 +325,49 @@ jobs:
         with:
           path: carte/carte.json.gz
           key: carte-${{ github.sha }}
-      # Quota d'artefacts de l'organisation, plein le 15/10 (2,4 Go de mesures
-      # gardées un jour) : les mesures ne servent qu'à ce job, on les supprime
-      # dès la carte faite. Seule la carte (3 jours, #2520) reste. Jamais bloquant ;
-      # pas de condition « toujours » (#1341 : rien ne tourne sur échec de la fusion,
-      # les mesures d'un échec expirent seules en un jour).
+
+  # Quota d'artefacts de l'organisation, plein le 15/10 (2,4 Go de mesures
+  # gardées un jour) : les mesures ne servent qu'au job `carte` de leur run.
+  # #3546 : le ménage était la dernière étape de `carte`, après une fusion
+  # réussie ; or les quinze runs des 24 h précédant le 25/10 11:20Z ont tous
+  # fini `cancelled` (plafond de 60 min, concurrence des PR), et leurs
+  # 1,4 Gio de mesures restaient leur journée entière (mesure #2376). Le
+  # ménage est donc un job à part, qui tourne quelle que soit l'issue, même
+  # annulée (`always()`), sur un runner hébergé : quelques secondes sans
+  # checkout, jamais en file derrière la mesure sur le pool (#876). Seule
+  # exception : matrice verte et fusion en échec ou annulée hors PR — les
+  # mesures restent leur jour pour rejouer le seul job `carte` sans
+  # remesurer. #3564 : le plafond de 60 min de `carte` conclut `cancelled`,
+  # pas `failure` (runs 39223265159, 38985327391 : parts toutes vertes,
+  # fusion coupée) ; c'est le cas même du rejeu.
+  # Une PR d'un fork a un jeton en lecture : elle n'y entre pas.
+  # Jamais bloquant ; la carte (3 jours, #2520) n'est pas touchée.
+  # #3564 : GitHub ne crée pas toujours ce job après une annulation. Il l'a
+  # fait pour l'agrégat `always()` de tests.yml au run 40180614008 (parts
+  # annulées à 09:32:21, agrégat démarré à 09:33:04), pas au run 38917093257
+  # (agrégat jamais créé). menage-mesures.yml applique donc la même règle
+  # après la conclusion du run (`workflow_run`), PR de fork comprises ; la
+  # rétention d'un jour des envois reste la dernière borne.
+  menage-mesures:
+    name: ménage des mesures
+    needs: [mesure, carte]
+    if: always() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+    permissions:
+      actions: write
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
       - name: supprimer les mesures intermédiaires
         continue-on-error: true
         env:
           GH_TOKEN: ${{ github.token }}
           API: ${{ github.api_url }}/repos/${{ github.repository }}/actions
+          GARDER: ${{ github.event_name != 'pull_request' && needs.mesure.result == 'success' && (needs.carte.result == 'failure' || needs.carte.result == 'cancelled') }}
         run: |
+          if [ "$GARDER" = true ]; then
+            echo "mesures gardées un jour : matrice verte, fusion en échec ou annulée (rejouer le job carte)"
+            exit 0
+          fi
           curl -sS -H "Authorization: Bearer $GH_TOKEN" "$API/runs/${{ github.run_id }}/artifacts?per_page=100" |
             python3 -c 'import json,sys; [print(a["id"]) for a in json.load(sys.stdin).get("artifacts", []) if a["name"].startswith("mesure-")]' |
             while read -r id; do

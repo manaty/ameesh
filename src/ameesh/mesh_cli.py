@@ -1559,6 +1559,10 @@ def _work_actor(cfg: Config, db, args: argparse.Namespace) -> None:
         # #540 : l'auteur d'un forçage est l'identité de la session
         args.actor = work.forcer(cfg, db, args.actor)
         return
+    if args.work_command == "estimates" and getattr(args, "publish", False):
+        # #3501 : la table de référence (L157b) est le passage de l'auditeur
+        args.actor = work.publisher(cfg, db, args.actor)
+        return
     if args.work_command == "milestone" and getattr(args, "kind", "") in ("frozen", "verdict"):
         # #2928 : une session liée ne pose un gel ou un verdict qu'en son nom.
         # Sans cette garde, `--actor <autre agent>` signait un avis au nom d'un
@@ -2320,14 +2324,34 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                 # #3183 : le plancher d'avis du pilote, posé avant la désignation
                 # (il vaut dans tout état ouvert, la désignation exige qa).
                 from . import review_floor
-                floor = review_floor.set_floor(cfg, db, args.id, args.floor,
-                                               reason=args.reason, actor=args.actor)
+                # #3557 : avec un AGENT, la désignation manuelle est le geste
+                # du pilote ; sans lui, le plancher complète la désignation du
+                # dernier gel par la sélection déterministe.
+                floor = review_floor.set_floor(
+                    cfg, db, args.id, args.floor, reason=args.reason,
+                    actor=args.actor, complete=not bool(args.agent))
                 if floor["changed"]:
                     print("lot #%d: review floor %d (was %d, by %s)" % (
                         floor["lot"], floor["floor"], floor["previous"], floor["actor"]))
                 else:
                     print("lot #%d: review floor already %d: nothing written" % (
                         floor["lot"], floor["floor"]))
+                completion = floor.get("designation")
+                if completion:
+                    state = completion.get("state")
+                    if state == "designated":
+                        names = ", ".join(
+                            "%s (%s)" % (r.get("name"), r.get("family"))
+                            for r in completion.get("reviewers") or ())
+                        print("designation: %s%s" % (
+                            "completed — " if completion.get("completed") else "",
+                            names))
+                    elif state in ("unavailable", "waiting", "stale", "unfrozen",
+                                   "none", "manual"):
+                        print("designation: %s — %s" % (
+                            state, completion.get("why") or ""))
+                    else:
+                        print("designation: %s" % state)
                 if not args.agent:
                     return 0
             if not args.agent and not (args.remove or args.no_verdict):
@@ -3666,8 +3690,10 @@ def build_parser() -> argparse.ArgumentParser:
                              metavar="N",
                              help="#3183: pilot's review floor: the gate, the freeze "
                                   "designation and paquet-candidats require max(scale, N) "
-                                  "reviews of distinct families; journaled, kept across "
-                                  "refreezes; 0 withdraws it (a human's floor: by a human)")
+                                  "reviews of distinct families; raised after a freeze, it "
+                                  "completes that freeze's designation (#3557); journaled, "
+                                  "kept across refreezes; 0 withdraws it (a human's floor: "
+                                  "by a human)")
     pw_reviewer.add_argument("--reason", default="",
                              help="#3183: why the floor (journaled with it)")
     pw_reviewer.set_defaults(func=cmd_work)
