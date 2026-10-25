@@ -2458,6 +2458,23 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
             return 0
         if args.work_command == "reviewers":
             from . import review_designation_activation as activation
+            if getattr(args, "if_corrector", ""):
+                # #3416 : aperçu en lecture seule avant de pousser un correctif.
+                if args.apply:
+                    raise work.WorkError(
+                        "--if-corrector is an aperçu: --apply is refused")
+                from . import review_correction
+
+                room = review_correction.check(cfg, db, args.id,
+                                               args.if_corrector, fetch=True)
+                if args.json:
+                    print(json.dumps(room, ensure_ascii=False, indent=2))
+                else:
+                    print("correction: %s — %s"
+                          % (room.get("state"), room.get("why") or ""))
+                if room.get("state") == review_correction.STATE_TOO_TIGHT:
+                    return 1
+                return 0
             out = activation.reviewers(cfg, db, args.id, apply=args.apply)
             if args.json:
                 print(json.dumps(out, ensure_ascii=False, indent=2, default=str))
@@ -2539,6 +2556,16 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
             print("milestone %s added to lot #%d%s" % (
                 row["kind"], args.id,
                 " (%s)" % row["verdict"] if row.get("verdict") else ""))
+            if row.get("verdict") == "blocked":
+                # #3416 : le relecteur désigné qui bloque corrige souvent
+                # lui-même ; prévenu ici, il sait que sa famille deviendrait
+                # auteur et que le canon §2 renvoie le correctif à l'auteur.
+                from . import review_correction
+
+                advice = review_correction.warning(
+                    cfg, db, args.id, row.get("actor") or args.actor or "")
+                if advice:
+                    print("warning: %s" % advice, file=sys.stderr)
             if args.kind == "frozen":
                 # #2962 : l'avertissement de publication (ou de gel distant non
                 # vérifié) est dans la note du jalon ; la sortie le dit aussi,
@@ -3591,6 +3618,11 @@ def build_parser() -> argparse.ArgumentParser:
                               help="retry the designation of the latest freeze (same head); "
                                    "a waiting state yields to the designation when capacity "
                                    "or the canon policy comes back")
+    pw_reviewers.add_argument(
+        "--if-corrector", default="", metavar="AGENT",
+        help="#3416: read-only preview — would a first-round correction by AGENT "
+             "keep enough independent families for the required opinions? "
+             "exit 1 when canon §2 sends it back to the author")
     pw_reviewers.add_argument("--json", action="store_true")
     pw_reviewers.set_defaults(func=cmd_work)
     pw_merged = work_sub.add_parser(
