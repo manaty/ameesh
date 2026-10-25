@@ -69,7 +69,8 @@ class MenageMesuresTest(unittest.TestCase):
         job = _job(CARTE, "menage-mesures")
         self.assertIn("GARDER: ${{ github.event_name != 'pull_request' && "
                       "needs.mesure.result == 'success' && "
-                      "needs.carte.result == 'failure' }}", job)
+                      "(needs.carte.result == 'failure' || "
+                      "needs.carte.result == 'cancelled') }}", job)
         self.assertIn('a["name"].startswith("mesure-")', job)
 
     def test_une_pr_de_fork_n_y_entre_pas(self):

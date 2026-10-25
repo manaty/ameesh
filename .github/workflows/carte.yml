@@ -335,10 +335,19 @@ jobs:
   # ménage est donc un job à part, qui tourne quelle que soit l'issue, même
   # annulée (`always()`), sur un runner hébergé : quelques secondes sans
   # checkout, jamais en file derrière la mesure sur le pool (#876). Seule
-  # exception : matrice verte et fusion en échec hors PR — les mesures
-  # restent leur jour pour rejouer le seul job `carte` sans remesurer.
+  # exception : matrice verte et fusion en échec ou annulée hors PR — les
+  # mesures restent leur jour pour rejouer le seul job `carte` sans
+  # remesurer. #3564 : le plafond de 60 min de `carte` conclut `cancelled`,
+  # pas `failure` (runs 39223265159, 38985327391 : parts toutes vertes,
+  # fusion coupée) ; c'est le cas même du rejeu.
   # Une PR d'un fork a un jeton en lecture : elle n'y entre pas.
   # Jamais bloquant ; la carte (3 jours, #2520) n'est pas touchée.
+  # #3564 : GitHub ne crée pas toujours ce job après une annulation. Il l'a
+  # fait pour l'agrégat `always()` de tests.yml au run 40180614008 (parts
+  # annulées à 09:32:21, agrégat démarré à 09:33:04), pas au run 38917093257
+  # (agrégat jamais créé). menage-mesures.yml applique donc la même règle
+  # après la conclusion du run (`workflow_run`), PR de fork comprises ; la
+  # rétention d'un jour des envois reste la dernière borne.
   menage-mesures:
     name: ménage des mesures
     needs: [mesure, carte]
@@ -353,10 +362,10 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           API: ${{ github.api_url }}/repos/${{ github.repository }}/actions
-          GARDER: ${{ github.event_name != 'pull_request' && needs.mesure.result == 'success' && needs.carte.result == 'failure' }}
+          GARDER: ${{ github.event_name != 'pull_request' && needs.mesure.result == 'success' && (needs.carte.result == 'failure' || needs.carte.result == 'cancelled') }}
         run: |
           if [ "$GARDER" = true ]; then
-            echo "mesures gardées un jour : matrice verte, fusion en échec (rejouer le job carte)"
+            echo "mesures gardées un jour : matrice verte, fusion en échec ou annulée (rejouer le job carte)"
             exit 0
           fi
           curl -sS -H "Authorization: Bearer $GH_TOKEN" "$API/runs/${{ github.run_id }}/artifacts?per_page=100" |

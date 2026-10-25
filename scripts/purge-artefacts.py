@@ -11,7 +11,8 @@ règle d'aujourd'hui n'aurait pas gardé :
 
 * `mesure-*` : ne sert qu'au job `carte` de son run ; supprimé dès le run
   terminé, sauf dans le cas où le workflow les garde lui-même (hors PR,
-  matrice verte, fusion en échec : le job `carte` peut être rejoué seul) ;
+  matrice verte, fusion en échec ou annulée — un plafond atteint conclut
+  `cancelled` : le job `carte` peut être rejoué seul) ;
 * les autres familles : supprimées au-delà de la rétention que déclare
   aujourd'hui leur envoi (`RETENTION_H`, miroir des `retention-days` de
   `.github/workflows/`, tenu par tests/test_3546_purge_artefacts.py).
@@ -28,8 +29,14 @@ Par défaut le script ne fait que compter (avant, après, par famille) ;
 `--appliquer` supprime. Il lit et supprime par `gh api` (jeton de `gh`,
 droit `actions: write` sur le dépôt).
 
+`--run ID` (#3564) ne lit que les artefacts d'un run, sans relevé des runs
+en cours : la relecture du statut avant suppression suffit. C'est la voie de
+`.github/workflows/menage-mesures.yml`, lancé après la conclusion de chaque
+run `carte`, pour le cas où le job `menage-mesures` du run n'a pas démarré.
+
 Usage :
-  python3 scripts/purge-artefacts.py [--repo manaty/ameesh] [--epargne-heures 24] [--appliquer]
+  python3 scripts/purge-artefacts.py [--repo manaty/ameesh] [--epargne-heures 24]
+                                     [--run ID] [--appliquer]
 """
 from __future__ import annotations
 
@@ -45,7 +52,7 @@ import time
 #: rétention déclarée aujourd'hui par famille (heures), miroir des
 #: `retention-days` des envois de `.github/workflows/` ; None : la famille ne
 #: vit que le temps de son run (le job `menage-mesures` de carte.yml la
-#: supprime à la fin du run).
+#: supprime à la fin du run, menage-mesures.yml après sa conclusion).
 RETENTION_H: dict[str, int | None] = {
     "mesure": None,          # carte.yml, mesure-<pilote>-<part>
     "plan-mesure": 3 * 24,   # carte.yml
@@ -59,6 +66,11 @@ RETENTION_H: dict[str, int | None] = {
 }
 
 ETATS_EN_COURS = ("queued", "in_progress", "waiting", "requested", "pending")
+
+#: conclusions du job `carte` qui gardent les mesures (`mesures_gardees`) :
+#: le plafond de 60 min conclut `cancelled` (runs 39223265159, 38985327391 :
+#: parts toutes vertes, fusion coupée), `timed_out` par prudence (#3564).
+CARTE_A_REJOUER = ("failure", "cancelled", "timed_out")
 
 def famille(nom: str) -> str | None:
     """Famille d'un nom d'artefact : `mesure-psycopg-3` → `mesure`,
@@ -91,7 +103,8 @@ def jobs_effectifs(jobs: list[dict]) -> list[dict]:
 
 def mesures_gardees(run: dict, jobs: list[dict]) -> bool:
     """Le cas où carte.yml garde les mesures de son run : hors PR, toutes les
-    parts de mesure vertes, fusion (job `carte`) en échec — sur le dernier
+    parts de mesure vertes, fusion (job `carte`) en échec ou annulée
+    (`CARTE_A_REJOUER`) — sur le dernier
     résultat de chaque job (`jobs_effectifs`). Une preuve incomplète (aucun
     job de mesure, ou pas de `carte` après des mesures vertes) garde aussi :
     la rétention d'un jour fera le reste."""
@@ -104,7 +117,7 @@ def mesures_gardees(run: dict, jobs: list[dict]) -> bool:
         return True
     if not all(j.get("conclusion") == "success" for j in mesures):
         return False
-    return not carte or carte[0].get("conclusion") == "failure"
+    return not carte or carte[0].get("conclusion") in CARTE_A_REJOUER
 
 
 def decision(artefact: dict, maintenant: dt.datetime, *, en_cours: set[int],
@@ -167,6 +180,12 @@ def _lignes_json(texte: str) -> list:
 
 def lire_artefacts(repo: str) -> list[dict]:
     return _lignes_json(_gh("--paginate", f"repos/{repo}/actions/artifacts?per_page=100",
+                            "--jq", ".artifacts[]"))
+
+
+def lire_artefacts_run(repo: str, run_id: int) -> list[dict]:
+    return _lignes_json(_gh("--paginate",
+                            f"repos/{repo}/actions/runs/{run_id}/artifacts?per_page=100",
                             "--jq", ".artifacts[]"))
 
 
@@ -245,12 +264,16 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--repo", default="manaty/ameesh")
     p.add_argument("--epargne-heures", type=float, default=24.0,
                    help="épargner tout artefact plus jeune, hors mesure-* (défaut 24)")
+    p.add_argument("--run", type=int,
+                   help="les seuls artefacts de ce run (menage-mesures.yml)")
     p.add_argument("--appliquer", action="store_true",
                    help="supprimer (sans lui : compte seulement)")
     a = p.parse_args(argv)
     maintenant = dt.datetime.now(dt.timezone.utc)
-    artefacts = lire_artefacts(a.repo)
-    en_cours = runs_en_cours(a.repo)
+    if a.run:
+        artefacts, en_cours = lire_artefacts_run(a.repo, a.run), set()
+    else:
+        artefacts, en_cours = lire_artefacts(a.repo), runs_en_cours(a.repo)
     runs = LecteurRuns(a.repo)
     supprimes, raisons, echecs = [], collections.Counter(), 0
     for art in artefacts:
