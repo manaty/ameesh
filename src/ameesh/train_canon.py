@@ -21,8 +21,8 @@ over every configured canon, and the compiled model families.
 * **active**: the train refuses, by name, to compose a new packet; a packet
   already in flight runs to its terminal outcome.
 
-The pin never follows the gate by itself: a new commit must be qualified and
-configured by the pilot (#1467). The service re-reads the configured pin at
+The host service follows the audited gate when the versioned train-rule
+guard is unchanged (#3483); other changes require reviewed qualification. The service re-reads the configured pin at
 each passage (#3366), so a requalified pin needs no runner restart. The
 gate's commit is read, never written.
 """
@@ -261,8 +261,9 @@ class Watch:
                       "ces sources sur le canon épinglé, ou, si l'épingle doit "
                       "changer, qualifier un nouveau canon (#1467).")
         else:
-            follow = ("- Aucun suivi automatique (#1467) : qualifier le commit de "
-                      "la porte, puis l'épingler dans la configuration de l'hôte.\n"
+            follow = ("- Le suivi automatique (#3483) exige une avance descendante "
+                      "sans changement des fichiers de règles versionnés ; sinon "
+                      "requalification relue requise.\n"
                       "- Requalification mécanique si le diff pin..porte ne touche ni "
                       "`processus/mecanique.yaml` ni `federation.yaml` : "
                       "python -m ameesh.train_cli --project %s requalify --lot <lot>."

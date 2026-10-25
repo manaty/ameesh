@@ -198,6 +198,11 @@ ASSIGN_NOTE_PREFIXES = ("assigned to ", "assigné à ", "created and assigned to
 #: #2584 : début de la note de journal d'une ligne de panier (`backlog_basket_add`)
 #: — le compte des lignes d'un panier se lit sur ce préfixe
 BASKET_LINE_NOTE = "basket line"
+#: #3447 : début de la note qui déclare (ou efface) l'exécutant externe d'un
+#: lot. `debit` lit la date de la déclaration sur ce préfixe ; le texte est
+#: défini ici, seul.
+EXTERNAL_EXECUTOR_NOTE = "external executor:"
+EXTERNAL_EXECUTOR_CLEARED_NOTE = "external executor cleared"
 
 
 class Domain(abc.ABC):
@@ -1493,7 +1498,8 @@ class WorkItems(Domain):
             estimate_source: str | None = None, change_size: str | None = None,
             queued_note: str | None = None, forced_note: str | None = None,
             mark_item_id: int | None = None, mark_note: str = "",
-            parent_lot: int | None = None, unique_ref: bool = False) -> dict:
+            parent_lot: int | None = None, unique_ref: bool = False,
+            external_executor: str | None = None) -> dict:
         """Crée le lot en `intake` (rattaché à une fiche WorkPackage si
         `package_id`, L29 ; avec sa branche si `branch`, L118 ; sa priorité
         si `priority`, L130 ; avec sa durée estimée et sa ligne d'historique
@@ -1527,6 +1533,12 @@ class WorkItems(Domain):
         of the same run serialize: the second sees the first and the caller
         re-reads the winner. Off by default: several lots may legitimately
         share a reference except where the identity is one per execution.
+
+        `external_executor` (#3447) : le lot est créé réservé à un exécutant
+        externe déclaré (agent `externe` avec responsable humain, ou humain),
+        **sans** `assignee` ; la prise automatique L165 ne le prend pas. Le
+        champ ne se propage pas au sous-lot (`parent_lot`) : la part d'un
+        agent reste assignable.
 
         L'ordre des verrous est commun avec `assign` (#540, revue R1 delta) :
         les lignes de lots d'abord (`mark_item_id` et `parent_lot`, par
@@ -2032,7 +2044,17 @@ class WorkItems(Domain):
         silencieux (#1696). La réservation manuelle garde son comportement par
         défaut. #705 : si le nouvel assigné est le relecteur désigné, la
         désignation tombe dans la même écriture (le journal la nomme) — un
-        relecteur ne relit pas son propre travail."""
+        relecteur ne relit pas son propre travail. #3447 : un lot réservé à un
+        exécutant externe (`external_executor`) n'est pas assignable : refusé
+        sous le même verrou, tant que la réservation n'est pas levée."""
+
+    @abc.abstractmethod
+    def set_external_executor(self, item_id: int, executor: str | None, *,
+                              note: str, actor: str) -> dict | None:
+        """#3447 : pose (ou efface, `executor=None`) l'exécutant externe d'un
+        lot ouvert, avec sa ligne de journal, en UNE transaction ; None si le
+        lot est fermé, ou si la pose perd la course contre une attribution.
+        Un lot assigné ne reçoit pas d'exécutant externe (deux porteurs)."""
 
     @abc.abstractmethod
     def count_builds(self, assignee: str) -> int:
@@ -2194,6 +2216,10 @@ class WorkItems(Domain):
                       after_commit: list | None = None,
                       proof: dict | None = None) -> dict:
         """Écrit un jalon déclaré (`frozen`, `verdict`) et le rend.
+
+        Un gel depuis `intake` ou `build` entre en `qa` avant son callback
+        (#3467), par les transitions ordinaires, dans la même transaction.
+        Un état bloqué ou terminal n'est pas levé par ce geste.
 
         `on_frozen` (facultatif, #1617) : callback du gel, appelé dans la
         transaction du jalon `frozen` avec `(tx, milestone, after_commit)` ;
@@ -2364,7 +2390,9 @@ class WorkItems(Domain):
         `pending_decision` (une demande de décision attend sur le lot),
         `decision_milestone` (un jalon de décision ouvert y est rattaché) et
         `returned_to_queue` (§4, le lot `build` a été rendu ; `false` pour un
-        `intake`).
+        `intake`). #3447 : un lot réservé à un exécutant externe
+        (`external_executor`) n'est pas offert — le filtre précède le LIMIT,
+        comme les dépendances.
         #1193: a lot whose explicit prerequisite is not finished is excluded —
         the ready intake never offers a lot that cannot be started.
         #2252 : « finished » veut dire fusionné (`merged`/`promoted`/`closed`) :

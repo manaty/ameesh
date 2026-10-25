@@ -20,6 +20,7 @@
   agent-mesh work list [--state S] | work show <id> | work move <id> <state> | work note <id> "…"
   agent-mesh work wake <id> --at ISO | --in DURATION | --cancel   scheduled wake, even under hold (#2466)
   agent-mesh work assign <id> <agent> [--externe] [--actor A]   reassign (guarded assignment)
+  agent-mesh work external-executor <id> <agent> | --clear   reserve a lot to an external executor (#3447)
   agent-mesh work merged <id> --sha S | --pr owner/repo#N [--note …]   merge done outside a PR: any open state → merged
   agent-mesh work migration <id> [--number N] [--release [--number N]] [--skip-branch B]   reserve one of the work item's migration numbers (L122, #2481)
   agent-mesh work issue-ref <id> owner/repo#N | --none   correct the issue reference, journaled (#1603)
@@ -1838,6 +1839,7 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                 body=args.body or "", issue_ref=args.issue_ref, workstream=args.workstream,
                 assignee=args.assignee, budget_usd=args.budget, actor=args.actor,
                 package=args.package, externe=args.externe, cfg=cfg,
+                external_executor=args.external_executor,
                 branch=args.branch, branch_target=args.target, priority=args.priority,
                 estimate=minutes, estimate_source=args.estimate_source, size=args.size,
                 note=note,
@@ -1849,6 +1851,9 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                 " (priority %s)" % work.PRIORITY_LABELS.get(item.get("priority"))
                 if item.get("priority") else "",
                 " — estimated %s" % estimates.label(minutes) if minutes else ""))
+            if item.get("external_executor"):
+                print("executor : %s (external, reserved; not assigned — L165 does not "
+                      "take it)" % item["external_executor"])
             # L157b : l'estimation de référence, LUE dans la table de l'auditeur
             ref = estimates.proposal(db, type=item.get("type"), size=item.get("change_size"),
                                      assignee=item.get("assignee"))
@@ -1918,6 +1923,27 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                     "; branch %s" % out["item"]["branch"] if args.branch else "",
                     "; WIP exception (§4)" if args.wip_exception else ""))
             _print_assignment(out["check"])
+            return 0
+        if args.work_command == "external-executor":
+            # #3447 : réservation déclarative à un exécutant externe (bureau,
+            # owner), jamais une attribution.
+            if args.clear and args.agent:
+                raise work.WorkError("--clear goes without an executor name")
+            if not args.clear and not args.agent:
+                raise work.WorkError("name the external executor, or pass --clear")
+            out = work.set_external_executor(db, args.id, args.agent,
+                                             actor=args.actor, cfg=cfg,
+                                             clear=args.clear)
+            if args.json:
+                print(json.dumps(out, ensure_ascii=False, indent=2, default=str))
+                return 0
+            if args.clear:
+                print("lot #%d: external executor cleared (was %s); the lot is back in "
+                      "the ordinary queue" % (out["item"]["id"],
+                                              out["previous"] or "nobody"))
+            else:
+                print("lot #%d: reserved to %s (external executor; not assigned — L165 "
+                      "does not take it)" % (out["item"]["id"], out["executor"]))
             return 0
         if args.work_command == "branch":
             # #2102 : détachement explicite, ou (ré)association explicite
@@ -2035,6 +2061,9 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                     notes.append("waiting: %s" % row["waiting_for"]["label"])
                 if row.get("delegation"):
                     notes.append(row["delegation"]["label"])
+                if row.get("external_executor"):
+                    notes.append("reserved to %s (external executor)"
+                                 % row["external_executor"])
                 if notes:
                     print("      %s" % " · ".join(notes))
             return 0
@@ -2052,6 +2081,9 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
             print("lot      : #%d %s" % (item["id"], item["title"]))
             print("type     : %-10s state: %-14s assignee: %s" % (
                 item["type"], item["state"], item.get("assignee") or "—"))
+            if item.get("external_executor"):
+                print("executor : %s (external, reserved; not assignable)" % (
+                    item["external_executor"]))
             print("app      : %-10s source: %-12s workstream: %s" % (
                 item.get("app") or "—", item.get("source") or "—", item.get("workstream") or "—"))
             print("issue    : %-12s loops: %-3s budget: %s" % (
@@ -3497,6 +3529,10 @@ def build_parser() -> argparse.ArgumentParser:
     pw_add.add_argument("--externe", action="store_true",
                         help="force assignment to an external agent that has a human "
                              "responsible (L37, 0030)")
+    pw_add.add_argument("--external-executor", default=None, metavar="AGENT",
+                        help="#3447: declare the lot reserved to an external executor "
+                             "(an `externe` agent with a human owner, or human:<id>) "
+                             "without assigning it; L165 does not take it")
     pw_add.add_argument("--branch", default=None,
                         help="work item branch: its merge into the target closes the work item (L118)")
     pw_add.add_argument("--target", default=None,
@@ -3712,6 +3748,19 @@ def build_parser() -> argparse.ArgumentParser:
                                 "agents")
     pw_assign.add_argument("--actor", default="")
     pw_assign.set_defaults(func=cmd_work)
+    pw_executor = work_sub.add_parser(
+        "external-executor",
+        help="#3447: declare the external executor a lot is reserved to (an `externe` "
+             "agent with a human owner, or a human), or clear the reservation")
+    pw_executor.add_argument("id", type=int)
+    pw_executor.add_argument("agent", nargs="?", default=None,
+                             help="the external executor (registered `externe` agent, or "
+                                  "human:<id>); omitted with --clear")
+    pw_executor.add_argument("--clear", action="store_true",
+                             help="clear the reservation (the lot returns to the ordinary queue)")
+    pw_executor.add_argument("--json", action="store_true")
+    pw_executor.add_argument("--actor", default="")
+    pw_executor.set_defaults(func=cmd_work)
     pw_branch = work_sub.add_parser(
         "branch", help="set a work item's branch explicitly (L118), or detach an obsolete one "
                        "(#2102: closed or superseded PR); journaled, state and assignee kept")
@@ -4327,11 +4376,14 @@ def _cost_l26(cfg: Config, db, what: str, args) -> int:
     if what == "turns":
         limit = int(args.limit)
         rows = ops.turns(agent=args.agent, since_s=_since_seconds(args.since),
-                         limit=limit, message=getattr(args, "message", None))
+                         limit=limit + 1 if limit > 0 else limit,
+                         message=getattr(args, "message", None))
         # #3452 : le plafond s'appliquait sans le dire — 500 tours sur ~4 h 30
         # d'une nuit se lisaient comme la fenêtre entière. La troncature est
         # désormais dite, en JSON comme en texte.
-        truncated = bool(limit and len(rows) >= limit)
+        truncated = limit > 0 and len(rows) > limit
+        if truncated:
+            rows = rows[:limit]
         if args.json:
             payload = {"schema": "ameesh-turns/1", "turns": rows,
                        "truncated": truncated, "limit": limit}

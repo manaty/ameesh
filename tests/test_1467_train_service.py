@@ -64,6 +64,22 @@ class TrainServiceTest(unittest.TestCase):
                 passage.scheduled_step(db, 100)
         self.assertEqual(passage._step.call_count, 1)
 
+    def test_standby_host_refreshes_pin_without_executing_a_passage(self):
+        for role_held in (False, True):
+            with self.subTest(role_held=role_held):
+                passage = mock.Mock()
+                service = self.service(passage)
+                def refresh():
+                    service.stop.set()
+                    return []
+                service.refresh = refresh
+                with mock.patch.object(service, "_role_ready", return_value=role_held), \
+                     mock.patch.object(service, "_lease_ready", return_value=False), \
+                     mock.patch.object(service, "_release_lease"):
+                    service.run()
+                self.assertTrue(service.stop.is_set())
+                passage.scheduled_step.assert_not_called()
+
     def test_stop_prevents_new_connection_and_passage(self):
         passage = mock.Mock()
         service = self.service(passage)

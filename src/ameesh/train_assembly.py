@@ -273,13 +273,16 @@ def assemble(cfg, *, notify=None) -> Assembly:
     lease = train_runner.HostLease(cfg)
     gate = ("role %s" % settings.role) if settings.role else "host pin"
 
+    refusals = {}  # last automatic refusal per project, cleared on recovery
+
     def refresh():
         # #3366: read the same configuration file the service was assembled
         # from, not whatever the ambient environment names later. The assembled
         # settings stay the reference: anything but the pin changing is a
         # restart, never a silent half-reload of a running service.
         return reload(passages, expected=settings, host=cfg.host,
-                      config_path=getattr(cfg, "config_path", "") or "")
+                      config_path=getattr(cfg, "config_path", "") or "",
+                      automatic=True, report=report, refusals=refusals)
     return Assembly(settings, passages, lease, "%s mode, %d passage(s), %s"
                     % (settings.mode, len(passages), gate), role=settings.role,
                     refresh=refresh)
@@ -355,7 +358,8 @@ def _same_assembly(expected, fresh):
                 _restart("train.projects.%s" % name, field, old, new)
 
 
-def reload(passages, *, expected=None, load=None, host=None, config_path=None):
+def reload(passages, *, expected=None, load=None, host=None, config_path=None,
+           automatic=False, report=None, refusals=None):
     """#3366: re-read the effective ``train.projects.<p>.canon_commit``.
 
     The service used to keep the pin assembled at startup, so a requalified pin
@@ -389,6 +393,32 @@ def reload(passages, *, expected=None, load=None, host=None, config_path=None):
                                  % (settings.host, this_host or "?"))
     if expected is not None:
         _same_assembly(expected, settings)
+    if automatic:
+        from . import train_requalify
+        from .scoped_db import ScopedDb
+        report = report or (lambda message: print("train: " + message, file=sys.stderr))
+        refusals = {} if refusals is None else refusals
+        for spec in settings.projects:
+            db = None
+            try:
+                db = ScopedDb(fresh)
+                train_requalify.automatic(fresh, db, spec.name)
+            except Exception as exc:  # optional follow-up must not stop the train
+                reason = "%s: %s" % (type(exc).__name__, exc)
+                if refusals.get(spec.name) != reason:
+                    report("automatic canon requalification refused for %s: %s; "
+                           "configured pin will still be reloaded" % (spec.name, reason))
+                refusals[spec.name] = reason
+            else:
+                refusals.pop(spec.name, None)
+            finally:
+                if db is not None:
+                    db.close()
+        # A refused automatic move does not disable the independent #3366
+        # reload: a pilot may already have qualified an intermediate commit.
+        # canon_refusal still guards new composition against the gate.
+        return reload(passages, expected=expected, load=load, host=host,
+                      config_path=config_path)
     by_name = {spec.name: spec for spec in settings.projects}
     pending = []
     for passage in passages or ():
@@ -428,13 +458,13 @@ def canon_diff(canon, pin, gate):
         raise ConfigurationError("canon requalification needs two full commit ids")
     if not os.path.isdir(canon):
         raise ConfigurationError("canon directory not found: %s" % canon)
-    proc = resolutions._run(canon, "diff", "--name-only", pin, gate)
+    proc = resolutions._run(canon, "diff", "--no-renames", "--name-only", "-z", pin, gate, "--")
     if proc.returncode:
         raise ConfigurationError(
             "cannot read the canon diff %s..%s in %s: %s"
             % (pin[:12], gate[:12], canon,
-               " ".join((proc.stderr or proc.stdout or "").split())[:240]))
-    return [line.strip() for line in resolutions._text(proc).splitlines() if line.strip()]
+               resolutions._err(proc)[:240]))
+    return [name for name in proc.stdout.decode("utf-8", "strict").split("\0") if name]
 
 
 def _passage(cfg, spec: ProjectConfig, mode, report):

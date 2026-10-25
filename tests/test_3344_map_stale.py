@@ -174,8 +174,8 @@ class MapStaleTest(PgTestCase):
         self.assertEqual(alert["repo"], REPO)
         self.assertEqual(alert["threshold"], round(exploitation.MAP_STALE_S))
         self.assertAlmostEqual(alert["since"], round(published), delta=1)
-        for text in (REPO, "40000001", "163 h ago", "over 48 h", "full suite",
-                     "dispatch carte.yml on main"):
+        for text in (REPO, "40000001", "163 h ago", "over 48 h", "no longer fresh",
+                     "own-diff", "full suite", "dispatch carte.yml on main"):
             self.assertIn(text, alert["detail"])
 
     def test_map_under_48_h_is_healthy(self):

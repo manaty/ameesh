@@ -732,7 +732,7 @@ class MergeSweepTest(_Base):
         work.milestone(self.db, n, "frozen", sha=gel, actor="ouvrier")
         self.merge("feature/paquet-54", "paquet 54 : #%d" % n)
         report = {r["work_item"]: r for r in self.sync()["results"]}
-        self.assertEqual(work.get(self.db, n)["state"], "intake")
+        self.assertEqual(work.get(self.db, n)["state"], "qa")
         self.assertEqual(report[n]["how"], "unproven")
         self.assertIn("the last freeze %s is not in develop" % gel[:12], report[n]["detail"])
 
@@ -765,7 +765,7 @@ class MergeSweepTest(_Base):
         self.merge("feature/citation", "paquet : #%d" % n)
         entry = self.sync()["results"][0]
         self.assertEqual((entry["result"], entry["how"]), ("open", "unproven"))
-        self.assertEqual(work.get(self.db, n)["state"], "intake")
+        self.assertEqual(work.get(self.db, n)["state"], "qa")
 
     def test_diese_regel_concurrent_ne_ferme_pas(self):
         _git(self.repo, "config", plan_git.LOT_REF_GIT_KEY, "hash")
@@ -792,7 +792,7 @@ class MergeSweepTest(_Base):
         with mock.patch.object(work, "close_merged", side_effect=regeler):
             entry = self.sync()["results"][0]
         self.assertEqual(entry["result"], "refrozen")
-        self.assertEqual(work.get(self.db, n)["state"], "intake")
+        self.assertEqual(work.get(self.db, n)["state"], "qa")
 
     def test_branche_implicite_en_avance_rapide(self):
         lot = self.lot()

@@ -490,7 +490,7 @@ class LifecycleGateTest(PgTestCase):
         with self.assertRaises(db_mod.DbError):
             work.milestone(self.db, self.lot, "verdict", verdict="ok",
                            sha="a" * 40)
-        self.assertEqual(work.get(self.db, self.lot)["state"], "intake")
+        self.assertEqual(work.get(self.db, self.lot)["state"], "qa")
         self.assertFalse(any(m["kind"] == "merged" for m in work.milestones(self.db, self.lot)))
         work.milestone(self.db, self.lot, "verdict", verdict="blocked",
                        sha="a" * 40)
@@ -546,7 +546,7 @@ class LifecycleGateTest(PgTestCase):
         thread.join(timeout=15)
         self.assertFalse(thread.is_alive())
         self.assertEqual(result, ["refused"])
-        self.assertEqual(work.get(self.db, self.lot)["state"], "intake")
+        self.assertEqual(work.get(self.db, self.lot)["state"], "qa")
 
     def test_independent_lots_do_not_block_each_other_with_or_without_module(self):
         for project, kind in (("acme", "release"), ("plain", "evolution")):
