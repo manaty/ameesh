@@ -621,6 +621,29 @@ class PacketAllocationTest(PgTestCase):
                                                                row["frozen_id"], HEAD)))
         self.assertEqual(self.ops.queue(None), [again])
 
+    def test_3560_a_concurrent_ejection_for_another_cause_wins_over_the_requeue(self):
+        row = self.allocate()
+        self.eject_for_want_of_ci()
+        other = self.connect()
+        self.addCleanup(other.close)
+        read, raced_once = self.ops._queue_row, []
+        def raced(db, item_id):
+            current = read(db, item_id)
+            if not raced_once:
+                # an ejection only writes merge_queue: it commits between the
+                # read and the requeue, same generation, for a cause that refuses
+                raced_once.append(storage.of(other).work.queue_update(
+                    item_id, state="ejected", note="radar landing", actor="radar",
+                    reason="stacked trial: conflict"))
+            return current
+        with mock.patch.object(self.ops, "_queue_row", side_effect=raced):
+            self.assertIsNone(self.allocate(actor="next-cutoff"))
+        self.assertEqual(raced_once[0]["reason"], "stacked trial: conflict")
+        (current,) = self.ops.queue(None)
+        self.assertEqual((current["state"], current["reason"], current["generation"]),
+                         ("ejected", "stacked trial: conflict", row["generation"]))
+        self.assertEqual([r["kind"] for r in self.receipts()], ["packet"])
+
     def test_3560_only_a_ci_required_ejection_of_the_same_allocation_is_requeued(self):
         self.allocate()
         self.eject_for_want_of_ci(reason="stacked trial: conflict not covered on a.py")

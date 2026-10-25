@@ -2455,13 +2455,20 @@ class WorkItems(interface.WorkItems):
                     # lieu). Même gel, même SHA, aucun retrait : l'allocation est
                     # remise en file sous une nouvelle génération et son reçu ;
                     # un écrivain resté sur l'ancienne génération est refusé.
+                    # La ligne lue n'est pas verrouillée (une éjection n'écrit
+                    # que merge_queue) : l'UPDATE compare la ligne entière lue,
+                    # cause comprise, et une éjection concurrente pour une autre
+                    # cause le fait échouer (revue cx3, B/P2).
                     requeued = tx.query(
                         "UPDATE merge_queue SET state = 'queued', rank = NULL, landing_sha = NULL,"
                         "   reason = '', generation = nextval('merge_queue_generation_seq'),"
                         "   queued_by = %s, queued_at = clock_timestamp(), updated_at = now()"
                         " WHERE work_item_id = %s AND state = 'ejected' AND generation = %s"
+                        "   AND reason = %s AND target = %s AND frozen_id IS NOT DISTINCT FROM %s"
+                        "   AND frozen_sha = %s AND source = %s"
                         " RETURNING work_item_id",
-                        (actor or "", int(item_id), allocated))
+                        (actor or "", int(item_id), allocated, current["reason"], target,
+                         frozen_id, frozen_sha, source))
                     if not requeued:
                         return None
                     WorkItems(tx)._event(int(item_id), lot[0]["state"],
