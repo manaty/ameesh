@@ -742,6 +742,9 @@ courrier les rappelle) :
   S'il faut accuser réception : `--ack`, déposé sans réveil. Un message très
   court qui n'est qu'un accusé est reconnu et traité de même ; « ok », « oui »,
   « go », « d'accord » restent des réponses, qui réveillent.
+* **Un compte rendu qui n'attend rien** (« rien à faire », « inchangé ») :
+  `--info`, déposé sans réveil, lu au tour suivant (#3451). Les avis de prise
+  automatique (L165) arrivent ainsi aux pilotes.
 * **`--urgent` seulement quand l'attente bloque** : le destinataire doit agir
   avant de continuer (build cassé sur la branche commune, fusion à arrêter,
   question sans laquelle il tourne à vide). De l'owner (`human:*`) ou d'un
@@ -760,6 +763,7 @@ courrier les rappelle) :
 | confier, demander, répondre | `ameesh mail send <agent> "…" [--lot …]` — regroupé, au plus 90 s |
 | que le destinataire agisse sans attendre | `… --urgent` |
 | accuser réception | rien ; au besoin `… --ack` |
+| rendre compte sans rien demander | `… --info` |
 | tenir quelqu'un au courant | `… --cc <nom>[,<nom>]` |
 | annoncer à toute l'équipe | `ameesh mail send all "…"` |
 

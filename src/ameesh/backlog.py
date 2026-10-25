@@ -1491,9 +1491,14 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
                                        lot_take_message(done, notified), kind="event",
                                        work_item_id=str(done["id"]), payload=payload)
                 idle_for = now - sous_utilisation.idle_since(row)
+                # #3451 : l'avis aux pilotes n'attend aucun geste (une
+                # réattribution reste possible) : il est lu à leur prochain
+                # tour sans en ouvrir un — 32 avis pour 14 lots en 24 h
+                # ouvraient autant de tours de pilote.
+                avis = dict(payload, info=True)
                 for name in notified:
                     mail.send(db, SENDER, name, lot_notice(done, check["assignee"], idle_for),
-                              kind="event", work_item_id=str(done["id"]), payload=payload)
+                              kind="event", work_item_id=str(done["id"]), payload=avis)
                 taken.append({"item": done, "agent": check["assignee"],
                               "message_id": message_id, "kind": "lot",
                               "notified": notified, "fallback": fallback})

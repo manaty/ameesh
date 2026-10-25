@@ -68,7 +68,7 @@ _RESERVED_SQL = """
 
 #: L125 : un message PASSIF — accusé, copie, diffusion à tous, conflit signalé
 #: par le radar (L160c), échec de CI sans référence de la base (L161c),
-#: jamais urgent —
+#: information sans geste attendu (#3451), jamais urgent —
 #: n'ouvre pas de tour à lui seul (même règle que `mail.passive_reason`).
 #: `{t}` : l'alias de la table `agent_mailbox` (`PASSIVE_SQL.format(t="mb")`).
 PASSIVE_SQL = (
@@ -76,6 +76,7 @@ PASSIVE_SQL = (
     " AND ({t}.payload @> '{{\"ack\": true}}'::jsonb"
     " OR {t}.payload @> '{{\"broadcast\": true}}'::jsonb"
     " OR {t}.payload @> '{{\"ci_passif\": true}}'::jsonb"
+    " OR {t}.payload @> '{{\"info\": true}}'::jsonb"
     " OR coalesce({t}.payload->>'cc', '') <> ''"
     " OR coalesce(jsonb_typeof({t}.payload->'radar'), '') = 'object'))")
 

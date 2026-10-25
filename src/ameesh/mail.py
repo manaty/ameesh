@@ -588,8 +588,10 @@ def drop_expired(db: Db, rows: Sequence[dict]) -> int:
 #: lu au tour suivant de son destinataire (dans la consigne du tour, ou par le
 #: hook pendant un tour) — accusé de réception, copie, diffusion à tous,
 #: conflit signalé par le radar (L160c), échec de CI peut-être hérité faute
-#: d'exécution relevée de la base (L161c). Un message `urgent` n'est jamais passif.
-PASSIVE_KEYS = ("ack", "cc", "broadcast", "radar", "ci_passif")
+#: d'exécution relevée de la base (L161c), information sans geste attendu
+#: (#3451 : avis de prise automatique aux pilotes, compte rendu sans demande,
+#: `agent-mail send --info`). Un message `urgent` n'est jamais passif.
+PASSIVE_KEYS = ("ack", "cc", "broadcast", "radar", "ci_passif", "info")
 
 #: un accusé de réception reconnu à l'envoi tient en au plus ce nombre de
 #: caractères…
@@ -616,7 +618,7 @@ def _payload(row: Any) -> dict:
 
 
 def passive_reason(row: Any) -> str:
-    """L125 : `ack`, `cc`, `broadcast`, `radar` ou `ci_passif` si ce message
+    """L125 : `ack`, `cc`, `broadcast`, `radar`, `ci_passif` ou `info` si ce message
     n'ouvre pas de tour à lui seul ; '' s'il réveille son destinataire."""
     payload = _payload(row)
     if payload.get("urgent"):
@@ -667,7 +669,8 @@ def passive_label(row: Any) -> str:
         cible = str(_payload(row).get("cc") or "")
         return "copy of a message to %s" % (cible if NAME_RE.match(cible) else "?")
     return {"ack": "acknowledgement", "broadcast": "broadcast to all",
-            "radar": "conflict radar", "ci_passif": "CI without base reference"}.get(reason, "")
+            "radar": "conflict radar", "ci_passif": "CI without base reference",
+            "info": "information, no action expected"}.get(reason, "")
 
 
 def _nature(row: Any) -> str:
