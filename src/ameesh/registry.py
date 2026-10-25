@@ -619,12 +619,19 @@ def wake_status(db: Db, cfg, name: str) -> tuple[bool, str, str]:
 
     #2200 : une pause opérateur n'est PAS réveillable — le geste humain dit
     « aucun nouveau tour » et `claim` la respecte déjà ; la disponibilité
-    partagée (attribution, courrier, adoption, alertes) la nomme donc."""
+    partagée (attribution, courrier, adoption, alertes) la nomme donc.
+
+    #3460 : un agent retiré n'est pas réveillable non plus. Sans ce refus
+    explicite, `canon_claim_ok` (qui inclut `retired_at IS NULL`) se lisait
+    comme une attente temporaire de canon sync et `wakeable` répondait vrai."""
     from .agent_names import resolve as resolve_agent_name
     name = resolve_agent_name(name, db=db, operation="registry.wake_status")
     row = storage.of(db).agents.wake_check(name)
     if row is None:
         return False, "%s is not in the registry (unknown agent)" % name, ""
+    if row.get("retired_ts"):
+        return False, ("%s is retired: restore it first (ameesh agent restore %s); "
+                       "a retirement is not a temporary canon wait" % (name, name)), ""
     if (row.get("mode") or "execute") == "externe":
         return False, ("%s is an external agent (human session, cannot be woken)%s"
                        % (name, "" if row.get("responsible")
@@ -679,7 +686,8 @@ def wakeable(db: Db, cfg, name: str) -> tuple[bool, str]:
     est requis (`cfg.responsible_required`, vrai dès qu'un canon est
     configuré), il faut aussi un humain responsable. Un agent arrêté
     (`stopped`) reste réveillable au sens de cette règle : l'arrêt est un
-    geste humain réversible, que l'appelant peut signaler.
+    geste humain réversible, que l'appelant peut signaler. Un agent retiré
+    (#3460) ne l'est pas : `restore` le rend au registre actif.
 
     L46 : l'ÉTAT du canon de l'hôte n'en fait plus partie — un canon
     momentanément invalide ne doit pas bloquer une attribution ; la
