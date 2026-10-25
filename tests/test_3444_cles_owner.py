@@ -11,8 +11,11 @@ lot séparé sur décision owner.
 * le drop-in OPT-IN `deploy/poste/cles-owner.conf` cache `~/.ssh`
   (`InaccessiblePaths=%h/.ssh`) et refuse le démarrage si le mount namespace
   n'a pas été posé (témoin) ;
-* le témoin exige un MONTAGE sur le chemin (`/proc/self/mountinfo`), pas un
-  simple répertoire vide (relecture cx1 B1) ;
+* le témoin exige un montage sur le chemin (`/proc/self/mountinfo`) **et**
+  une inaccessibilité effective (mode 000 de l'inode de systemd, listage ou
+  lecture refusés), pas un simple répertoire vide, ni un montage lisible,
+  ni un montage seulement traversable où un canari reste lisible (relecture
+  cx1 B1) ;
 * le profil AppArmor rend à `systemd-executor` le droit de créer un espace de
   noms utilisateur, sans quoi systemd ignore SILENCIEUSEMENT
   `InaccessiblePaths=` sur Ubuntu 24.04 (constat sur agents-2, 25/10/2026).
@@ -110,13 +113,22 @@ class TemoinTest(unittest.TestCase):
     def _run(self, *chemins: str) -> subprocess.CompletedProcess:
         return subprocess.run([TEMOIN, *chemins], capture_output=True, text=True)
 
+    def _dans_bwrap(self, source: str, cible: str, script: str) -> subprocess.CompletedProcess:
+        bwrap = shutil.which("bwrap")
+        if not bwrap:
+            self.skipTest("bwrap absent")
+        return subprocess.run(
+            [bwrap, "--dev-bind", "/", "/", "--bind", source, cible,
+             "/bin/sh", "-c", script, "sh", cible, TEMOIN],
+            capture_output=True, text=True)
+
     def test_repertoire_vide_sans_montage_refuse(self):
         # Relecture cx1 B1 : un répertoire vide accessible n'est PAS une
         # preuve d'isolation — une clé déposée plus tard serait lisible.
         with tempfile.TemporaryDirectory() as tmp:
             sortie = self._run(tmp)
             self.assertEqual(sortie.returncode, 1)
-            self.assertIn("aucun montage", sortie.stderr)
+            self.assertIn("montage inaccessible", sortie.stderr)
 
     def test_repertoire_non_vide_sans_montage_refuse(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -135,26 +147,75 @@ class TemoinTest(unittest.TestCase):
                 fh.write("canari\n")
             self.assertEqual(self._run(chemin).returncode, 1)
 
-    def test_montage_reel_conforme(self):
-        # Le positif : un vrai mount namespace (bwrap a le profil userns du
-        # train) pose un tmpfs sur le chemin ; le témoin doit alors passer.
-        bwrap = shutil.which("bwrap")
-        if not bwrap:
-            self.skipTest("bwrap absent")
+    def test_un_montage_lisible_refuse(self):
+        # Démonstration de la relecture cx1 : /proc est un point de montage
+        # lisible ; il ne prouve aucune isolation.
+        self.assertEqual(self._run("/proc").returncode, 1)
+
+    def test_montage_inaccessible_avec_canari_conforme(self):
+        # Le positif : bwrap (profil userns du train) binde un annuaire 000
+        # sur le chemin, comme systemd avec /run/systemd/inaccessible/dir.
+        # Le canari déposé avant le masque doit être illisible, et le témoin
+        # doit accepter.
         with tempfile.TemporaryDirectory() as tmp:
             cible = os.path.join(tmp, "ssh")
+            source = os.path.join(tmp, "inaccessible")
             os.makedirs(cible)
-            with open(os.path.join(cible, "id_test"), "w", encoding="utf-8") as fh:
+            os.makedirs(source)
+            with open(os.path.join(source, "canari"), "w", encoding="utf-8") as fh:
                 fh.write("canari\n")
-            proc = subprocess.run(
-                [bwrap, "--dev-bind", "/", "/", "--tmpfs", cible, TEMOIN, cible],
-                capture_output=True, text=True)
+            try:
+                os.chmod(source, 0)
+                proc = self._dans_bwrap(
+                    source, cible,
+                    'if cat "$1/canari" >/dev/null 2>&1; then '
+                    'echo "canari encore lisible" >&2; exit 9; fi; '
+                    'exec "$2" "$1"')
+            finally:
+                os.chmod(source, 0o700)
             self.assertEqual(proc.returncode, 0, proc.stderr)
+
+    def test_montage_lisible_avec_canari_refuse(self):
+        # Négatif : un bind 0755 des clés (canari) est un montage, mais pas
+        # un masque ; le canari est lisible, le témoin doit refuser.
+        with tempfile.TemporaryDirectory() as tmp:
+            cible = os.path.join(tmp, "ssh")
+            source = os.path.join(tmp, "lisible")
+            os.makedirs(cible)
+            os.makedirs(source)
+            with open(os.path.join(source, "canari"), "w", encoding="utf-8") as fh:
+                fh.write("canari\n")
+            proc = self._dans_bwrap(
+                source, cible,
+                'cat "$1/canari" >/dev/null || exit 9; exec "$2" "$1"')
+            self.assertEqual(proc.returncode, 1, proc.stderr)
+
+    def test_montage_traversable_avec_canari_refuse(self):
+        # Négatif du cas que « ls refusé » seul laisserait filer : un bind
+        # 0111 n'est pas listable mais reste traversable ; le canari au nom
+        # connu est lisible. Le témoin doit refuser (mode != 000).
+        with tempfile.TemporaryDirectory() as tmp:
+            cible = os.path.join(tmp, "ssh")
+            source = os.path.join(tmp, "traversable")
+            os.makedirs(cible)
+            os.makedirs(source)
+            with open(os.path.join(source, "canari"), "w", encoding="utf-8") as fh:
+                fh.write("canari\n")
+            try:
+                os.chmod(source, 0o111)
+                proc = self._dans_bwrap(
+                    source, cible,
+                    'cat "$1/canari" >/dev/null || exit 9; exec "$2" "$1"')
+            finally:
+                os.chmod(source, 0o700)
+            self.assertEqual(proc.returncode, 1, proc.stderr)
 
     def test_le_temoin_regarde_les_montages(self):
         with open(TEMOIN, encoding="utf-8") as fh:
             texte = fh.read()
         self.assertIn("/proc/self/mountinfo", texte)
+        self.assertIn("stat -c %a", texte)
+        self.assertIn("ls -A", texte)
 
 
 class ProfilAppArmorTest(unittest.TestCase):

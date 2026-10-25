@@ -9,11 +9,14 @@
 # CONTENU du chemin : un `~/.ssh` vide sans isolation passerait, et une clé
 # déposée après le démarrage redeviendrait lisible (relecture cx1 #3444 B1).
 # Il exige qu'un MONTAGE soit posé SUR le chemin dans le namespace de
-# l'unité (`/proc/self/mountinfo`, champ 5) : c'est la preuve directe que
-# systemd a appliqué `InaccessiblePaths=` (bind mount d'un inode
-# inaccessible `mode=000`, `/run/systemd/inaccessible/dir`), et le contenu
-# réel est alors hors d'atteinte pour la vie de l'unité. Aucun montage =
-# isolation absente = sortie 1, l'unité refuse de démarrer.
+# l'unité (`/proc/self/mountinfo`, champ 5) ET que ce montage soit
+# effectivement inaccessible : c'est la preuve directe que systemd a
+# appliqué `InaccessiblePaths=` (bind mount de l'inode inaccessible
+# `mode=000`, `/run/systemd/inaccessible/dir`). Un montage lisible, même
+# vide, ne prouve rien ; un montage seulement traversable (`0111`) laisse
+# lire un fichier dont le nom est connu (canari) et ne prouve rien non plus.
+# Pas de montage ou montage accessible = isolation absente = sortie 1,
+# l'unité refuse de démarrer.
 #
 # Posé en root, non modifiable par l'agent qu'il contrôle :
 #   install -D -m 0755 deploy/poste/verifie-cles-owner \
@@ -22,13 +25,38 @@
 # Usage : verifie-cles-owner CHEMIN...
 set -u
 
-# Un montage sur le chemin ? Chemins résolus (systemd résout aussi les
-# liens) ; les échappements octaux de mountinfo ne concernent pas les
-# chemins du poste.
+# Le chemin est-il masqué par un montage ET effectivement inaccessible ?
+# Un simple montage ne prouve rien : /proc est un montage lisible, et un
+# bind 0755 (ou 0111) laisse lire un canari. systemd pose l'inode
+# inaccessible `/run/systemd/inaccessible/dir` (mode 000) : on vérifie le
+# mode du point de montage, puis le refus effectif du listage (ou de la
+# lecture pour un fichier).
 est_masque() {
   resolue=$(readlink -f -- "$1" 2>/dev/null) || return 1
   [ -n "$resolue" ] || return 1
-  awk -v p="$resolue" '$5 == p { trouve = 1 } END { exit !trouve }' /proc/self/mountinfo
+  # 1. Un montage sur le chemin ? (/proc/self/mountinfo, champ 5 ; chemins
+  #    résolus, systemd résout aussi les liens.)
+  if ! awk -v p="$resolue" '$5 == p { trouve = 1 } END { exit !trouve }' /proc/self/mountinfo; then
+    return 1
+  fi
+  # 2. Le point de montage est l'inode inaccessible de systemd : mode 000.
+  #    C'est ce qui distingue le masque d'un bind 0755 (listable) ou 0111
+  #    (traversable : un canari au nom connu reste lisible). Le seul
+  #    « ls refusé » laisserait passer le 0111.
+  mode=$(stat -c %a -- "$resolue" 2>/dev/null) || return 1
+  [ "$mode" = 0 ] || return 1
+  # 3. Refus effectif : listage d'annuaire (ou lecture de fichier) impossible.
+  #    Redondant avec le mode 000, sauf ACL ou root : on refuse alors aussi.
+  if [ -d "$resolue" ]; then
+    if ls -A -- "$resolue" >/dev/null 2>&1; then
+      return 1
+    fi
+  else
+    if [ -r "$resolue" ]; then
+      return 1
+    fi
+  fi
+  return 0
 }
 
 statut=0
@@ -36,7 +64,7 @@ for chemin in "$@"; do
   if est_masque "$chemin"; then
     continue
   fi
-  echo "isolation absente : aucun montage sur $chemin dans l'unité" >&2
+  echo "isolation absente : $chemin n'est pas masqué par un montage inaccessible dans l'unité" >&2
   statut=1
 done
 exit "$statut"
