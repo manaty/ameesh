@@ -449,8 +449,6 @@ class PgPort:
         reviewers = [dict(r) for r in reviewers or ()]
         if state == DESIGNATED and not reviewers:
             raise DesignationError("a designated review names its reviewers")
-        if state == WAITING and reviewers:
-            raise DesignationError("a waiting designation designates no reviewer")
         names: dict = {}
         messages = _canonical_messages(
             db, [dict(message or {}) for message in messages or ()], names)
@@ -496,17 +494,46 @@ class PgPort:
                 (why + "; ") if why else "", what)
             if state == DESIGNATED:
                 state, reviewers, missing = WAITING, [], int(required)
-            messages = []
+                messages = []
+            else:
+                # #3596: a partial waiting designation records only the seats
+                # whose request actually leaves. The undeliverable capacity
+                # notice must not drop a reviewer whose request is valid, and
+                # a prior seat (no new request) is never removed.
+                bad = {str(entry.get("to") or "") for entry in undelivered}
+                requested = {str((message or {}).get("to") or "").strip()
+                             for message in messages
+                             if str((message or {}).get("kind") or "") == REQUEST_KIND}
+                before = len(reviewers)
+                reviewers = [
+                    row for row in reviewers
+                    if not (str((row or {}).get("name") or "").strip() in bad
+                            and str((row or {}).get("name") or "").strip()
+                            in requested)]
+                messages = [message for message in messages
+                            if str((message or {}).get("to") or "").strip() not in bad]
+                missing = int(missing) + (before - len(reviewers))
         existing = None if force else self._recorded_in(
             db, lot, freeze_id, since_ts=float(last.get("at_ts") or 0.0))
-        # A designation is final; a waiting state is not rewritten (a single
-        # notification per freeze) but **yields** to the designation when
-        # capacity comes back: it is the same freeze, the following mark
-        # prevails. A forced replay writes a newer mark even over a final one:
-        # the caller is an explicit recovery after a refused carry (#2487).
-        if existing is not None and (existing.get("state") == DESIGNATED
-                                     or state == WAITING):
-            return existing
+        # A designation is final. A waiting state is retryable: it yields to
+        # the designation when capacity comes back, and a partial waiting
+        # designation (#3596) is rewritten when it gains a seat — but a replay
+        # that brings no new seat, or would remove one, returns the recorded
+        # state untouched. A forced replay writes a newer mark even over a
+        # final one: the caller is an explicit recovery after a refused carry
+        # (#2487).
+        if existing is not None:
+            if existing.get("state") == DESIGNATED:
+                return existing
+            old_names = {str((row or {}).get("name") or "").strip()
+                         for row in existing.get("reviewers") or ()}
+            old_names.discard("")
+            if state == WAITING:
+                new_names = {str((row or {}).get("name") or "").strip()
+                             for row in reviewers or ()}
+                new_names.discard("")
+                if new_names <= old_names:
+                    return existing
         if undelivered:
             ops.note(lot, str(rows[0].get("state") or ""),
                      "désignation au gel #%d : notification non remise — %s. Gel conservé, "

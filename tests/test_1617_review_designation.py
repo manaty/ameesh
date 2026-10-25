@@ -215,11 +215,12 @@ class SelectionTest(unittest.TestCase):
         self.assertEqual(one["state"], rd.DESIGNATED)
         self.assertEqual([r["name"] for r in one["reviewers"]], ["codex-one"])
         self.assertEqual(one["families"], ["codex"])
-        # Deux avis hors claude et hors deepseek : la seule famille restante ne suffit pas.
+        # Deux avis hors claude et hors deepseek : la seule famille restante ne
+        # suffit pas, mais elle est pourvue tout de suite (#3596).
         two = rd.select(families=FAMILIES, required=2, authors=authors, candidates=pool)
         self.assertEqual(two["state"], rd.WAITING)
         self.assertEqual(two["missing"], 1)
-        self.assertEqual(two["reviewers"], [])
+        self.assertEqual([r["name"] for r in two["reviewers"]], ["codex-one"])
         self.assertEqual(two["families"], ["codex"])
 
     def test_author_with_unknown_family_waits_instead_of_guessing(self):
@@ -282,7 +283,7 @@ class SelectionTest(unittest.TestCase):
                            authors=[{"name": "impl-02", "family": "deepseek"}],
                            candidates=pool)
         self.assertEqual(picked["state"], rd.WAITING)
-        self.assertEqual(picked["reviewers"], [])
+        self.assertEqual([r["name"] for r in picked["reviewers"]], ["codex-ok"])
         self.assertEqual(picked["missing"], 1)
         self.assertEqual(picked["families"], ["codex"])
 
@@ -366,6 +367,7 @@ class SelectionTest(unittest.TestCase):
             candidates=candidates(row("claude-one", harness="claude", session="claude"),
                                   row("claude-two", harness="claude", session="claude")))
         self.assertEqual(picked["state"], rd.WAITING)
+        self.assertEqual([r["name"] for r in picked["reviewers"]], ["claude-one"])
         self.assertEqual(picked["missing"], 1)
         self.assertEqual(picked["families"], ["claude"])
         self.assertIn("claude", picked["why"])
@@ -688,13 +690,18 @@ class ApplyTest(unittest.TestCase):
         out = self.apply(candidates=pool)
         self.assertEqual(out["state"], rd.WAITING)
         self.assertEqual(out["missing"], 1)
+        # #3596 : la famille disponible est pourvue tout de suite ; le manque
+        # est notifié au pilote, et le relecteur reçoit sa demande.
+        self.assertEqual([r["name"] for r in out["reviewers"]], ["claude-one"])
         self.assertEqual(len(self.port.commits), 1)
         self.assertEqual(self.port.messages[0][0], "mesh-design")
         self.assertIn("No implicit admission", self.port.messages[0][1])
+        self.assertIn("Designation at freeze incomplete", self.port.messages[0][1])
+        self.assertEqual(self.port.messages[1][0], "claude-one")
         again = self.apply(candidates=pool)
         self.assertTrue(again.get("replayed"))
         self.assertEqual(len(self.port.commits), 1)
-        self.assertEqual(len(self.port.messages), 1)
+        self.assertEqual(len(self.port.messages), 2)
 
     def test_light_lot_designates_nobody(self):
         out = self.apply(paths=["docs/guide.md"], risk="light")
@@ -749,11 +756,18 @@ class ApplyTest(unittest.TestCase):
                           row("claude-two", harness="claude", session="claude"))
         first = self.apply(candidates=pool)
         self.assertEqual(first["state"], rd.WAITING)
-        self.assertEqual(len(self.port.messages), 1)
+        self.assertEqual([r["name"] for r in first["reviewers"]], ["claude-one"])
+        self.assertEqual(len(self.port.messages), 2)  # avis de manque + demande claude
         second = self.apply(candidates=self.pool)  # claude + codex disponibles
         self.assertEqual(second["state"], rd.DESIGNATED)
         self.assertFalse(second.get("replayed"))
+        # #3596 : claude garde son siège et ne reçoit pas de seconde demande ;
+        # codex est ajouté seul.
+        self.assertEqual([r["name"] for r in second["reviewers"]],
+                         ["claude-one", "codex-one"])
         self.assertEqual(len(self.port.messages), 3)
+        self.assertEqual(self.port.messages[2][0], "codex-one")
+        self.assertEqual([to for to, _body in self.port.messages].count("claude-one"), 1)
         third = self.apply(candidates=self.pool)
         self.assertTrue(third.get("replayed"))
         self.assertEqual(len(self.port.messages), 3)

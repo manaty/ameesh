@@ -94,6 +94,9 @@ SENDER = pg.SENDER
 UNAVAILABLE_PREFIX = "review-designation-unavailable:"
 #: journal prefix of a light/no-review outcome: one note per freeze (#2561)
 NONE_PREFIX = "review-designation-none:"
+#: journal prefix of a manual designation that covers the required reviews
+#: (#3596): the retry queue treats it as final without re-reading the policy
+MANUAL_PREFIX = "review-designation-manual:"
 #: journal prefix of an unreadable mark ignored by the reviewer load (#3047):
 #: the line names the offending lot and the id of the note it ignored
 UNREADABLE_PREFIX = "review-designation-unreadable:"
@@ -1693,17 +1696,18 @@ def _previous_reviewers(db, lot: int, freeze_id: int) -> list:
 
     Only the journal marks are read: a name that never appeared in a mark is a
     manual designation and must survive a new freeze. A `waiting` designation
-    names no reviewer. A carried mark (#2487) is an automatic designation too.
+    may name the seats already provided (#3596): they are automatic too, so
+    they are read here — that keeps `_manual` from counting them as manual and
+    lets a new freeze retire them like any automatic name. A carried mark
+    (#2487) is an automatic designation too.
     """
     names: list[str] = []
-    for _row_id, kind, noted, _ts in _marks(db, lot) or ():
+    for _row_id, _kind, noted, _ts in _marks(db, lot) or ():
         try:
             noted_freeze = int((noted.get("freeze") or {}).get("id") or 0)
         except (TypeError, ValueError):
             continue
         if noted_freeze == int(freeze_id):
-            continue
-        if kind == "designation" and noted.get("state") != rd.DESIGNATED:
             continue
         for reviewer in noted.get("reviewers") or ():
             name = str((reviewer or {}).get("name") or "").strip()
@@ -1868,7 +1872,10 @@ def _sync_reviewers(db, item: Mapping, freeze: Mapping, names, *, text: str = ""
     marks = _marks(db, lot)
     if marks is None:
         return                    # journal illisible : aucun nom retiré
-    effective = _effective_mark(db, lot, freeze_id) if names else None
+    # The effective mark of this freeze is authoritative even when the caller
+    # names no new reviewer: a partial waiting designation (#3596) keeps the
+    # seats it already provided, exactly like a carried mark (#2487).
+    effective = _effective_mark(db, lot, freeze_id)
     keep_marks = {effective[0]} if effective else set()
     retired = set()
     for row_id, _kind, noted, _ts in marks:
@@ -2110,6 +2117,10 @@ def _manual_outcome(db, item: Mapping, freeze: Mapping, manual: Sequence[str], *
                 " reviewer(s) already cover the required review(s) (%s); the"
                 " manual designation remains the journaled exception"
                 % (_freeze_label(freeze), ", ".join(manual)))
+        # #3596: the retry queue reads this marker instead of re-reading the
+        # policy for every manual seat; the freeze id keeps it bounded.
+        text = "%s%d:%d: %s" % (MANUAL_PREFIX, lot,
+                                int((freeze or {}).get("id") or 0), text)
         why = "manual reviewer designation"
     if note:
         storage.of(db).work.note(lot, str((item or {}).get("state") or ""), text, SENDER)
@@ -2221,7 +2232,9 @@ def _designate_in_transaction(cfg, tx, lot: int, *, milestone: Optional[Mapping]
             _sync_reviewers(tx, item, freeze, [])
         else:
             out = _selection(inputs, pg.PgPort(tx, after_commit=threads))
-            if out.get("state") == rd.DESIGNATED:
+            if out.get("state") in (rd.DESIGNATED, rd.WAITING):
+                # #3596 : une désignation partielle reste `waiting` et nomme
+                # les sièges déjà pourvus ; la colonne les garde.
                 _sync_reviewers(tx, item, freeze,
                                 [r.get("name") for r in out.get("reviewers") or ()])
             else:
@@ -2524,9 +2537,10 @@ def designate(cfg, db, lot: int, *, freeze: Optional[Mapping] = None,
         # #3554 : même journal hors du hook (reprise), une fois par tête.
         _note_canon_lowering(db, item, freeze, inputs)
         if _manual_covers(inputs):
-            return {"state": "manual", "reviewers": [], "freeze": freeze,
-                    "why": "manual reviewer(s) already cover the required review(s): %s"
-                           % ", ".join(inputs.manual)}
+            # #3596 : la couverture manuelle finale est marquée au journal
+            # (`MANUAL_PREFIX`) pour que la boucle de reprise ne relise pas la
+            # politique à chaque passe.
+            return _manual_outcome(db, item, freeze, inputs.manual)
         if not inputs.paths or inputs.policy.required == 0:
             why = LIGHT_WHY if inputs.paths else NO_PATH_WHY
             with db.transaction() as tx:
@@ -2540,7 +2554,7 @@ def designate(cfg, db, lot: int, *, freeze: Optional[Mapping] = None,
             out = _selection(inputs, pg.PgPort(tx, after_commit=threads,
                                                 at_freeze=False), force=force)
             names = ([r.get("name") for r in out.get("reviewers") or ()]
-                     if out.get("state") == rd.DESIGNATED else [])
+                     if out.get("state") in (rd.DESIGNATED, rd.WAITING) else [])
             _sync_reviewers(tx, item, freeze, names)
             try:
                 _notify_superseded_blocks(tx, item, freeze, out, threads)
@@ -2608,24 +2622,24 @@ def reviewers(cfg, db, lot: int, *, apply: bool = False) -> dict:
 def _retry_resolved(db, lot: int, freeze: Mapping) -> bool:
     """True when this freeze already has a final outcome.
 
-    A manual designation, a `none` note or a designated/light mark is final. A
-    `waiting` mark is not: capacity or evidence may have returned, which is
+    A `none` note, a manual designation whose coverage is journaled
+    (`MANUAL_PREFIX`, #3596), a carried/designated mark or a light outcome is
+    final. A **manual seat alone** is not trusted as final: the retry reads
+    the coverage once, and `designate` either writes the manual marker (it
+    covers) or provides the missing automatic seat beside it. A `waiting`
+    mark is not final: capacity or evidence may have returned, which is
     exactly what a retry is for (#1617).
     """
-    try:
-        item = work.get(db, int(lot))
-        if item is not None and _manual(db, item):
-            return True
-    except Exception:  # noqa: BLE001 - unreadable manual list: retry the freeze
-        pass
     freeze_id = int((freeze or {}).get("id") or 0)
     since = float((freeze or {}).get("at_ts") or 0.0)
-    try:
-        if storage.of(db).work.events_noted(
-                "%s%d:%d:" % (NONE_PREFIX, int(lot), freeze_id), since, ids=[int(lot)]):
-            return True
-    except Exception:  # noqa: BLE001 - unreadable journal: let `designate` decide
-        pass
+    for prefix in (NONE_PREFIX, MANUAL_PREFIX):
+        try:
+            if storage.of(db).work.events_noted(
+                    "%s%d:%d:" % (prefix, int(lot), freeze_id), since,
+                    ids=[int(lot)]):
+                return True
+        except Exception:  # noqa: BLE001 - unreadable journal: retry the freeze
+            pass
     # #2487: the effective mark of the freeze can be a carried one (verdicts
     # reported from an earlier head); it is final too, exactly like a
     # designation. A waiting selection is retried.
@@ -2635,7 +2649,8 @@ def _retry_resolved(db, lot: int, freeze: Mapping) -> bool:
     effective = marks[-1]
     if effective[1] == "carried":
         return True
-    return str((effective[2] or {}).get("state") or "") in (rd.DESIGNATED, rd.NONE)
+    state = str((effective[2] or {}).get("state") or "")
+    return state in (rd.DESIGNATED, rd.NONE)
 
 
 def _cursor_path(cfg, name: str) -> str:
@@ -2705,10 +2720,11 @@ def retry_pending(cfg, db, *, limit: int = RETRY_LIMIT) -> dict:
 
     The pass is a **fair slice** of the queue, not the newest 20 notes again:
     `RETRY_CURSOR` keeps the last note examined, the pass resumes after it and
-    wraps at the end. A resolved lot (manual, `none`, carried or designated) is
-    skipped without consuming an attempt, and a note that no longer matches the
-    lot's latest freeze is skipped too; neither can hold a slot forever. A
-    blocked or unavailable lot itself does not vanish: it is seen again on the
+    wraps at the end. A resolved lot (manual coverage journaled, `none`,
+    carried or designated) is skipped without consuming an attempt, and a note
+    that no longer matches the lot's latest freeze is skipped too; neither can
+    hold a slot forever. A blocked or unavailable lot itself does not vanish:
+    it is seen again on the
     next turn of the cursor. A new freeze's note is a new id, so the cursor
     reaches it on its next turn; the link to the freeze is re-read on every
     pass, never stored in the cursor.

@@ -653,23 +653,52 @@ class ActivationTest(_ActivationFixture, PgTestCase):
         self.assertIn("Designation at freeze impossible", self.mailbox()[0]["body"])
         self.assertEqual(pg.designation_of(self.marks()[0])["state"], rd.WAITING)
 
+    def test_a_partial_designation_keeps_its_seat_on_retry_and_is_not_manual(self):
+        # #3596 : deux avis requis, codex absent au gel. Claude (r1) est nommé
+        # tout de suite, le manque est notifié, et le siège automatique ne
+        # devient pas une désignation manuelle (il compterait deux fois).
+        self.db.execute(
+            "UPDATE agent_registry SET status = 'stopped' WHERE name = 'r2'")
+        _mark, out = self.freeze()
+        self.assertEqual(out["state"], rd.WAITING, out)
+        self.assertEqual([r["name"] for r in out["reviewers"]], ["r1"])
+        self.assertEqual(out["missing"], 1)
+        self.assertEqual([m["recipient"] for m in self.mailbox()], ["pilot", "r1"])
+        self.assertIn("Designation at freeze incomplete", self.mailbox()[0]["body"])
+        self.assertEqual(designated(work.get(self.db, self.lot)), ["r1"])
+        self.assertEqual(act._manual(self.db, work.get(self.db, self.lot)), [])
+        # codex revient : la reprise du même gel ajoute codex seul, claude reste.
+        self.db.execute(
+            "UPDATE agent_registry SET status = 'idle' WHERE name = 'r2'")
+        again = act.designate(self.cfg, self.db, self.lot)
+        self.assertEqual(again["state"], rd.DESIGNATED, again)
+        self.assertEqual([r["name"] for r in again["reviewers"]], ["r1", "r2"])
+        self.assertEqual([m["recipient"] for m in self.mailbox()],
+                         ["pilot", "r1", "r2"])
+        self.assertEqual(designated(work.get(self.db, self.lot)), ["r1", "r2"])
+        self.assertEqual(act._manual(self.db, work.get(self.db, self.lot)), [])
+        self.assertEqual(len(self.marks()), 2)
+
     def test_the_real_session_family_decides_not_the_declared_harness(self):
         # r1 declares claude but runs deepseek: it is the author's family and
-        # must not be designated. r2 (codex) is the only independent reviewer.
+        # must not be designated. r2 (codex) is the only independent reviewer,
+        # and #3596 provides its seat at once while the second one waits.
         self.db.execute(
             "UPDATE agent_registry SET session_id='s-r1', session_origin='s-r1',"
             " session_harness='deepseek' WHERE name='r1'")
         _, out = self.freeze()
         self.assertEqual(out["state"], rd.WAITING, out)
+        self.assertEqual([r["name"] for r in out["reviewers"]], ["r2"])
         self.assertEqual(out["missing"], 1)
-        self.assertEqual([m["recipient"] for m in self.mailbox()], ["pilot"])
+        self.assertEqual([m["recipient"] for m in self.mailbox()], ["pilot", "r2"])
         # capacity comes back: the same freeze is designated by the recovery
         self.db.execute(
             "UPDATE agent_registry SET session_harness='claude' WHERE name='r1'")
         again = act.designate(self.cfg, self.db, self.lot)
         self.assertEqual(again["state"], rd.DESIGNATED, again)
-        self.assertEqual([r["name"] for r in again["reviewers"]], ["r1", "r2"])
-        self.assertEqual([m["recipient"] for m in self.mailbox()], ["pilot", "r1", "r2"])
+        self.assertEqual([r["name"] for r in again["reviewers"]], ["r2", "r1"])
+        self.assertEqual([m["recipient"] for m in self.mailbox()],
+                         ["pilot", "r2", "r1"])
 
     def test_an_unknown_commit_provenance_waits_instead_of_guessing(self):
         self.db.execute("DELETE FROM provenance_receipts")
@@ -834,7 +863,10 @@ class ActivationTest(_ActivationFixture, PgTestCase):
         authors = {row["name"]: row for row in out["authors"]}
         self.assertEqual(authors["r2"]["family"], "codex")
         self.assertEqual(out["state"], rd.WAITING, out)
-        self.assertEqual(out["reviewers"], [], out)
+        # #3596 : la seule famille indépendante (claude, r1) est pourvue tout
+        # de suite ; le second siège attend.
+        self.assertEqual([r["name"] for r in out["reviewers"]], ["r1"])
+        self.assertEqual(out["missing"], 1)
         # le correcteur est un auteur de la tête : son nom et sa famille
         # (codex) sont interdits, comme pour tout auteur (#2888).
         self.assertIn("r2", out["why"])
@@ -845,8 +877,8 @@ class ActivationTest(_ActivationFixture, PgTestCase):
 
         L'agent `author` est déclaré deepseek au registre, mais son tour au
         commit est codex : c'est la famille du tour qui compte, donc codex, et
-        l'unique famille indépendante restante (claude) ne suffit pas pour
-        deux avis."""
+        l'unique famille indépendante restante (claude) est pourvue tout de
+        suite ; le second avis attend (#3596)."""
         self.repo.git("checkout", "-q", "-B", "borrowed", self.base)
         self.repo.write("src/ameesh/work.py", "codex\n")
         head = self.repo.commit("codex", agent="author")
@@ -861,7 +893,8 @@ class ActivationTest(_ActivationFixture, PgTestCase):
         self.assertEqual(author["family"], "codex")
         self.assertEqual(out["state"], rd.WAITING, out)
         self.assertNotIn("provenance unknown", out["why"])
-        self.assertEqual(out["reviewers"], [])
+        self.assertEqual([r["name"] for r in out["reviewers"]], ["r1"])
+        self.assertEqual(out["missing"], 1)
 
     def test_a_freeze_family_different_from_the_commit_turn_waits(self):
         """#2755 / #2721 N : deux familles prouvées restent ambiguës."""
@@ -1250,6 +1283,64 @@ class ActivationTest(_ActivationFixture, PgTestCase):
         self.assertEqual(again["attempted"], 0, again)
         self.assertEqual(len(self.mailbox()), before)
 
+    def test_the_retry_adds_the_missing_seat_beside_a_manual_one(self):
+        # #3596 / #140401 : une note `unavailable` et un siège manuel claude ne
+        # doivent pas faire sauter le lot. Quand le canon arrive, la reprise
+        # ajoute codex seul, sans redemander claude.
+        bad = _Canon(os.path.join(self.tmp, "canon-manuel"), mechanics=None)
+        cfg = dataclasses.replace(self.cfg, canon=bad.root, canon_ref="HEAD")
+        self.freeze(cfg=cfg)
+        self.assertEqual(self.marks(), [])
+        self.assertEqual(len(self.notes(act.UNAVAILABLE_PREFIX)), 1)
+        # the freeze already moved the lot to qa: add the manual claude seat
+        work.designate_reviewer(self.cfg, self.db, self.lot, "r1",
+                                actor="human:smichea")
+        before = len(self.mailbox())
+        bad.repo.write("processus/mecanique.yaml", MECHANICS)
+        bad.commit = bad.repo.commit("mechanics published")
+        storage.of(self.db).canon.record_state(
+            self.cfg.host, "ok", root=bad.root,
+            source="home @ %s" % bad.commit[:12], commit=bad.commit, good=True,
+            diagnostic="", canon="")
+        report = act.retry_pending(cfg, self.db)
+        self.assertEqual(report["attempted"], 1, report)
+        self.assertEqual(report["designated"], 1, report)
+        self.assertEqual([m["recipient"] for m in self.mailbox()[before:]], ["r2"])
+        self.assertEqual(designated(work.get(self.db, self.lot)), ["r1", "r2"])
+        mark = pg.designation_of(self.marks()[-1])
+        self.assertEqual(mark["state"], rd.DESIGNATED)
+        self.assertEqual(mark["reviewers"], [{"name": "r2", "family": "codex"}])
+        # désignation finale : la passe suivante saute le lot, sans courrier
+        before = len(self.mailbox())
+        again = act.retry_pending(cfg, self.db)
+        self.assertEqual(again["attempted"], 0, again)
+        self.assertEqual(len(self.mailbox()), before)
+
+    def test_a_covered_manual_designation_is_journaled_and_not_retried(self):
+        # #3596 : deux manuels couvrent les deux avis ; la reprise le constate
+        # une fois, écrit le marqueur de couverture, puis saute le lot.
+        bad = _Canon(os.path.join(self.tmp, "canon-couvert"), mechanics=None)
+        cfg = dataclasses.replace(self.cfg, canon=bad.root, canon_ref="HEAD")
+        self.freeze(cfg=cfg)
+        self.assertEqual(len(self.notes(act.UNAVAILABLE_PREFIX)), 1)
+        for name in ("r1", "r2"):
+            work.designate_reviewer(self.cfg, self.db, self.lot, name,
+                                    actor="human:smichea")
+        bad.repo.write("processus/mecanique.yaml", MECHANICS)
+        bad.commit = bad.repo.commit("mechanics published")
+        storage.of(self.db).canon.record_state(
+            self.cfg.host, "ok", root=bad.root,
+            source="home @ %s" % bad.commit[:12], commit=bad.commit, good=True,
+            diagnostic="", canon="")
+        before = len(self.mailbox())
+        report = act.retry_pending(cfg, self.db)
+        self.assertEqual(report["attempted"], 1, report)
+        self.assertEqual(report["manual"], 1, report)
+        self.assertEqual(len(self.mailbox()), before)
+        self.assertTrue(self.notes(act.MANUAL_PREFIX))
+        again = act.retry_pending(cfg, self.db)
+        self.assertEqual(again["attempted"], 0, again)
+
     # -- retry queue fairness (cx1 B1/P2 of #2561) -------------------------
 
     def _retry_candidate(self, index: int, *, reviewer: str = "") -> int:
@@ -1258,15 +1349,21 @@ class ActivationTest(_ActivationFixture, PgTestCase):
                         assignee="author")
         lot = int(item["id"])
         self.db.execute("UPDATE work_items SET state = 'qa' WHERE id = %s", (lot,))
-        if reviewer:
-            # a manual reviewer is a final outcome: _retry_resolved skips it
-            self.db.execute(
-                "UPDATE work_items SET reviewers = ARRAY[%s] WHERE id = %s",
-                (reviewer, lot))
         row = self.db.query(
             "INSERT INTO work_item_milestones (work_item_id, kind, sha, actor)"
             " VALUES (%s, 'frozen', %s, 'author') RETURNING id",
             (lot, ("%040x" % lot)))[0]
+        if reviewer:
+            # #3596: a manual seat is final only when its coverage is journaled
+            # (MANUAL_PREFIX); without that marker the retry must attempt it.
+            self.db.execute(
+                "UPDATE work_items SET reviewers = ARRAY[%s] WHERE id = %s",
+                (reviewer, lot))
+            marker = "%s%d:%d: manual coverage witness" % (
+                act.MANUAL_PREFIX, lot, int(row["id"]))
+            self.db.execute(
+                "INSERT INTO work_item_events (work_item_id, state, note, actor)"
+                " VALUES (%s, 'qa', %s, 'ameesh')", (lot, marker))
         note = "%s%d:%d: retry witness" % (act.UNAVAILABLE_PREFIX, lot,
                                            int(row["id"]))
         self.db.execute(
@@ -1400,18 +1497,19 @@ class UnreachableDesignationTest(_ActivationFixture, PgTestCase):
         self.assertEqual(sorted(m["recipient"] for m in self.mailbox()), ["r2", "r3"])
 
     def test_a_lost_host_alone_in_its_family_waits_and_alerts(self):
-        # Aucun autre claude : la désignation attend le second avis au lieu de
-        # déposer la demande chez un mort (aucune marque portant r1).
+        # Aucun autre claude : la demande n'est pas déposée chez un mort ; la
+        # famille codex disponible est pourvue et le second avis attend
+        # (#3596, aucune marque ne porte r1).
         self._move_to_lost("r1")
         self._lose_host()
         _, out = self.freeze()
         self.assertEqual(out["state"], rd.WAITING, out)
-        self.assertEqual(out["reviewers"], [])
+        self.assertEqual([r["name"] for r in out["reviewers"]], ["r2"])
         self.assertEqual(out["missing"], 1)
-        self.assertEqual([m["recipient"] for m in self.mailbox()], ["pilot"])
+        self.assertEqual([m["recipient"] for m in self.mailbox()], ["pilot", "r2"])
         noted = pg.designation_of(self.marks()[0])
         self.assertEqual(noted["state"], rd.WAITING)
-        self.assertEqual(noted["reviewers"], [])
+        self.assertEqual(noted["reviewers"], [{"name": "r2", "family": "codex"}])
         self.assertNotIn("r1", json.dumps(noted))
 
     def test_an_undrained_host_is_designated_on_the_next_pass(self):
