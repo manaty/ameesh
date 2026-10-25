@@ -3810,7 +3810,11 @@ def build_parser() -> argparse.ArgumentParser:
     pw_gates.set_defaults(func=cmd_work)
 
     pw_note = work_sub.add_parser(
-        "note", help="journal note; a `hold:`/lift note claiming a pilot is authenticated")
+        "note", help="journal note; a `hold:`/lift note claiming a pilot is authenticated",
+        epilog="#3498: a pilot hold may declare an external wait — "
+               "\"hold: attente bureau : <geste>\" (or owner), with an optional "
+               "\"(due 2026-10-25 12:00 UTC)\"; ameesh debit lists it as an "
+               "external wait, not an agent wait.")
     pw_note.add_argument("id", type=int)
     pw_note.add_argument("text")
     pw_note.add_argument("--wake-at", default=None, metavar="TIME",
