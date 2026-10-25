@@ -21,9 +21,8 @@ cours de CI compris), un artefact de moins de `--epargne-heures` (24 par
 défaut) hors `mesure-*`, une famille inconnue, un artefact déjà expiré.
 Le cliché des runs en cours, pris au départ, ne suffit pas : un run terminé
 peut être relancé pendant la purge. Le statut du run est donc relu juste
-avant chaque suppression, toutes familles (lecture de moins de `FRAIS_S`
-secondes) ; un run qui n'est plus `completed`, ou illisible, garde ses
-artefacts.
+avant chaque suppression, toutes familles, sans cache ; un run qui n'est
+plus `completed`, ou illisible, garde ses artefacts.
 
 Par défaut le script ne fait que compter (avant, après, par famille) ;
 `--appliquer` supprime. Il lit et supprime par `gh api` (jeton de `gh`,
@@ -60,11 +59,6 @@ RETENTION_H: dict[str, int | None] = {
 }
 
 ETATS_EN_COURS = ("queued", "in_progress", "waiting", "requested", "pending")
-
-#: âge maximal (secondes) d'une lecture de run sur laquelle une suppression
-#: s'appuie : le statut se relit au lieu de vivre toute la purge en cache.
-FRAIS_S = 30.0
-
 
 def famille(nom: str) -> str | None:
     """Famille d'un nom d'artefact : `mesure-psycopg-3` → `mesure`,
@@ -186,28 +180,21 @@ def runs_en_cours(repo: str) -> set[int]:
 
 
 class LecteurRuns:
-    """Lectures d'un run par l'API, chacune réutilisée au plus `frais_s`
-    secondes : assez pour les parts d'un même run, jamais pour la purge
-    entière (un run relancé entre-temps se voit à la lecture suivante)."""
+    """Lectures d'un run par l'API, sans cache : chaque suppression s'appuie
+    sur un statut lu juste avant elle (relecture cx3 de fb1f3860 : un
+    `completed` réutilisé laissait supprimer pendant une relance)."""
 
-    def __init__(self, repo: str, frais_s: float = FRAIS_S, gh=None, horloge=time.monotonic):
-        self.repo, self.frais_s = repo, frais_s
-        self._gh, self._horloge = gh or _gh, horloge
-        self._runs: dict[int, tuple[float, dict | None]] = {}
+    def __init__(self, repo: str, gh=None):
+        self.repo, self._gh = repo, gh or _gh
 
     def run(self, run_id: int) -> dict | None:
-        """Le run, ou None s'il est illisible."""
-        lu = self._runs.get(run_id)
-        if lu is None or self._horloge() - lu[0] > self.frais_s:
-            try:
-                run = json.loads(self._gh(f"repos/{self.repo}/actions/runs/{run_id}"))
-            except (subprocess.CalledProcessError, ValueError) as e:
-                print(f"run {run_id} illisible, artefacts gardés : "
-                      f"{getattr(e, 'stderr', '') or e}".strip(), file=sys.stderr)
-                run = None
-            lu = (self._horloge(), run)
-            self._runs[run_id] = lu
-        return lu[1]
+        """Le run, relu à chaque appel, ou None s'il est illisible."""
+        try:
+            return json.loads(self._gh(f"repos/{self.repo}/actions/runs/{run_id}"))
+        except (subprocess.CalledProcessError, ValueError) as e:
+            print(f"run {run_id} illisible, artefacts gardés : "
+                  f"{getattr(e, 'stderr', '') or e}".strip(), file=sys.stderr)
+            return None
 
     def termine(self, run_id: int) -> bool:
         run = self.run(run_id)
@@ -227,6 +214,12 @@ class LecteurRuns:
         except (subprocess.CalledProcessError, ValueError) as e:
             print(f"jobs du run {run_id} illisibles, mesures gardées : "
                   f"{getattr(e, 'stderr', '') or e}".strip(), file=sys.stderr)
+            return True
+        # un job sans conclusion, ou d'une tentative plus récente que le run
+        # lu : relancé entre les deux lectures
+        if any(j.get("conclusion") is None
+               or (j.get("run_attempt") or 0) > (run.get("run_attempt") or 0)
+               for j in jobs):
             return True
         return mesures_gardees(run, jobs)
 

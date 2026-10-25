@@ -189,8 +189,8 @@ def _jobs_relance():
             {"id": 4, "name": "carte", "conclusion": "failure", "run_attempt": 2}]
 
 
-def decide_api(a, gh, en_cours=(), horloge=lambda: 0.0):
-    runs = purge.LecteurRuns("o/r", gh=gh, horloge=horloge)
+def decide_api(a, gh, en_cours=(), runs=None):
+    runs = runs or purge.LecteurRuns("o/r", gh=gh)
     return purge.decision(a, MAINTENANT, en_cours=set(en_cours), epargne_h=24,
                           garde_mesures=runs.garde_mesures, run_termine=runs.termine)
 
@@ -213,16 +213,48 @@ class RelanceTest(unittest.TestCase):
         gh = FauxGh({1: {"event": "push", "status": "completed", "run_attempt": 1}})
         self.assertEqual(decide_api(art("flux-psql-1", 30), gh)[0], True)
 
-    def test_b1_la_lecture_du_run_ne_vit_pas_toute_la_purge(self):
-        temps = [0.0]
-        gh = FauxGh({1: {"event": "push", "status": "completed", "run_attempt": 1}})
-        runs = purge.LecteurRuns("o/r", gh=gh, horloge=lambda: temps[0])
-        self.assertTrue(runs.termine(1))
+    def test_b1_un_completed_lu_n_est_jamais_reutilise(self):
+        # relecture cx3 de fb1f3860 : un même lecteur, deux mesures du run ;
+        # la relance arrive entre les deux décisions
+        gh = FauxGh({1: {"event": "push", "status": "completed", "run_attempt": 1}},
+                    _jobs_relance()[:3])
+        runs = purge.LecteurRuns("o/r", gh=gh)
+        self.assertEqual(decide_api(art("mesure-psql-1", 1), gh, runs=runs),
+                         (False, "gardée pour rejouer la fusion"))
         gh.runs[1] = {"event": "push", "status": "in_progress", "run_attempt": 2}
-        temps[0] = purge.FRAIS_S / 2
-        self.assertTrue(runs.termine(1))
-        temps[0] = purge.FRAIS_S + 1
-        self.assertFalse(runs.termine(1))
+        gh.jobs.append({"id": 4, "name": "carte", "conclusion": None, "run_attempt": 2})
+        self.assertEqual(decide_api(art("mesure-psql-2", 1), gh, runs=runs)[0], False)
+        self.assertEqual(decide_api(art("flux-psql-1", 30), gh, runs=runs)[0], False)
+        # une lecture du run par décision, aucune reprise du cache
+        self.assertEqual(sum("/jobs" not in u for u in gh.appels), 3)
+
+    def test_b1_relance_entre_la_lecture_du_run_et_celle_des_jobs(self):
+        # run lu completed (tentative 1), jobs lus après la relance
+        gh = FauxGh({1: {"event": "push", "status": "completed", "run_attempt": 1}},
+                    _jobs_relance()[:3] + [{"id": 4, "name": "carte", "conclusion": None,
+                                            "run_attempt": 2}])
+        self.assertEqual(decide_api(art("mesure-psql-2", 1), gh),
+                         (False, "gardée pour rejouer la fusion"))
+        # une tentative plus récente déjà conclue, mais le run lu est l'ancien
+        gh.jobs[-1]["conclusion"] = "success"
+        self.assertEqual(decide_api(art("mesure-psql-2", 1), gh)[0], False)
+
+    def test_b1_le_statut_se_relit_apres_les_jobs(self):
+        # le run passe in_progress juste après la lecture des jobs : la
+        # relecture d'avant suppression le voit
+        class RelanceApresJobs(FauxGh):
+            def __call__(self, *args):
+                sortie = super().__call__(*args)
+                if any("/jobs" in a for a in args):
+                    self.runs[1] = {"event": "push", "status": "in_progress",
+                                    "run_attempt": 2}
+                return sortie
+        jobs = _jobs_relance() + [{"id": 5, "name": "carte", "conclusion": "success",
+                                   "run_attempt": 3}]
+        gh = RelanceApresJobs({1: {"event": "push", "status": "completed",
+                                   "run_attempt": 3}}, jobs)
+        self.assertEqual(decide_api(art("mesure-psql-2", 1), gh),
+                         (False, "run relancé ou illisible à la relecture"))
 
     def test_b2_relance_de_la_seule_carte_garde_les_mesures(self):
         # run_attempt=2 terminé : les mesures vertes sont de la tentative 1
