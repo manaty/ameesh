@@ -1551,6 +1551,10 @@ def _work_actor(cfg: Config, db, args: argparse.Namespace) -> None:
         # #540 : l'auteur d'un forçage est l'identité de la session
         args.actor = work.forcer(cfg, db, args.actor)
         return
+    if args.work_command == "estimates" and getattr(args, "publish", False):
+        # #3501 : la table de référence (L157b) est le passage de l'auditeur
+        args.actor = work.publisher(cfg, db, args.actor)
+        return
     if args.work_command == "milestone" and getattr(args, "kind", "") in ("frozen", "verdict"):
         # #2928 : une session liée ne pose un gel ou un verdict qu'en son nom.
         # Sans cette garde, `--actor <autre agent>` signait un avis au nom d'un

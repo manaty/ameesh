@@ -487,17 +487,29 @@ def build_reference(rows: list[dict], agents: dict | None = None, *,
             "bias": [e for e in estimators if e["biased"]]}
 
 
+def _content(body: dict) -> dict:
+    """Le contenu d'une table, sans sa date de calcul (`generated_ts`)."""
+    return {k: v for k, v in body.items() if k != "generated_ts"}
+
+
 def publish(db, *, actor: str = "", now: float | None = None) -> dict:
     """Le passage de l'auditeur : calcule la table sur les lots livrés et la
     publie (une ligne de `estimate_references`, la plus récente en vigueur).
-    Rend `{id, published_by, published_ts, body}`."""
+    Rend `{id, published_by, published_ts, body, unchanged}`.
+
+    #3501 : une table au contenu identique à celle en vigueur (hors
+    `generated_ts`) n'est pas republiée : la table en vigueur est rendue avec
+    `unchanged` vrai, et aucun nouvel épisode `estimate_bias` ne s'ouvre."""
     from . import registry
 
     rows = storage.of(db).work.estimate_history(app=None, limit=HISTORY_LIMIT)
     agents = {a["name"]: a for a in registry.overview(db)}
     body = build_reference(rows, agents, now=now)
+    current = current_reference(db)
+    if current is not None and _content(current["body"]) == _content(body):
+        return dict(current, unchanged=True)
     row = storage.of(db).work.publish_reference(body, actor=actor)
-    return dict(row, body=body)
+    return dict(row, body=body, unchanged=False)
 
 
 def current_reference(db) -> dict | None:
@@ -578,6 +590,9 @@ def proposal_label(p: dict | None) -> str:
 def format_published(row: dict) -> str:
     """Le compte rendu de `work estimates --publish`."""
     body = row["body"]
+    if row.get("unchanged"):
+        return ("reference table unchanged: #%s (published by %s) stays in force, "
+                "nothing republished" % (row.get("id"), row.get("published_by") or "?"))
     out = ["reference table #%s published: %d lot(s) delivered, %d measured, %d group(s)"
            % (row.get("id"), body["delivered"], body["measured"], len(body["groups"]))]
     for e in body["estimators"]:

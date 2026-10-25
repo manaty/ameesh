@@ -136,8 +136,10 @@ class ReferencePgTest(PgTestCase):
 
     def setUp(self) -> None:
         super().setUp()
-        for name in ("orch", "dev1"):
+        for name in ("orch", "dev1", "auditeur"):
             registry.upsert(self.db, name, harness="claude", host=self.cfg.host)
+        # hors du TRUNCATE commun : chaque test part sans table publiée
+        self.db.execute("DELETE FROM estimate_references")
 
     def _deliver(self, lot_id, *, started_min_ago):
         work.move(self.db, lot_id, "build")
@@ -199,12 +201,62 @@ class ReferencePgTest(PgTestCase):
         self.assertEqual([(a["agent"], a["value"], a["lot_count"]) for a in bias],
                          [("orch", 0.1, 3)])
         # --publish couvre tous les projets
-        proc = self.mesh("work", "estimates", "--publish", "--app", "p")
+        proc = self.mesh("work", "estimates", "--publish", "--app", "p",
+                         "--actor", "auditeur")
         self.assertEqual(proc.returncode, 2)
         # une taille inconnue est refusée
         with self.assertRaises(work.WorkError):
             work.add(self.db, title="x", size="xl")
         self.assertEqual(storage.of(self.db).work.reference()["id"], ref["id"])
+
+    def test_publication_reservee_a_l_auditeur_et_sans_doublon(self):
+        # #3501 : un agent qui n'est pas l'auditeur reçoit un refus explicite
+        proc = self.mesh("work", "estimates", "--publish", "--actor", "dev1")
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("dev1 is not the auditor", proc.stderr)
+        proc = self.mesh("work", "estimates", "--publish")
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("say who publishes", proc.stderr)
+        self.assertIsNone(estimates.current_reference(self.db))
+
+        proc = self.mesh("work", "estimates", "--publish", "--actor", "auditeur")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        first = estimates.current_reference(self.db)
+        # deux publications identiques successives n'en créent qu'une
+        proc = self.mesh("work", "estimates", "--publish", "--actor", "human:owner")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("reference table unchanged: #%s" % first["id"], proc.stdout)
+        self.assertEqual(estimates.current_reference(self.db)["id"], first["id"])
+        self.assertEqual(self.db.query(
+            "SELECT count(*) AS n FROM estimate_references")[0]["n"], 1)
+        # un contenu nouveau (un lot livré de plus) se publie
+        lot = work.add(self.db, title="livré", actor="orch", estimate=30, size="m")
+        self._deliver(lot["id"], started_min_ago=20)
+        row = estimates.publish(self.db, actor="auditeur")
+        self.assertFalse(row["unchanged"])
+        self.assertGreater(row["id"], first["id"])
+
+
+class PublisherTest(unittest.TestCase):
+    """#3501 : une session liée publie en son nom, et seulement l'auditeur."""
+
+    def _binding(self, name):
+        return types.SimpleNamespace(name=name, ok=True, source="env", reason=None)
+
+    def _publisher(self, bound, explicit="", auditors=("auditeur",)):
+        with mock.patch("ameesh.identity.resolve_binding",
+                        return_value=self._binding(bound)), \
+                mock.patch("ameesh.agent_names.resolve", side_effect=lambda t, **_: t), \
+                mock.patch.object(work, "is_auditor",
+                                  side_effect=lambda cfg, db, n: n in auditors):
+            return work.publisher(None, None, explicit)
+
+    def test_session_liee(self):
+        self.assertEqual(self._publisher("auditeur"), "auditeur")
+        with self.assertRaisesRegex(work.WorkError, "mty-amh-docs-01 is not the auditor"):
+            self._publisher("mty-amh-docs-01")
+        with self.assertRaisesRegex(work.WorkError, "does not publish on behalf of auditeur"):
+            self._publisher("mty-amh-docs-01", "auditeur")
 
 
 if __name__ == "__main__":

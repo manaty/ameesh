@@ -187,7 +187,9 @@ def add_parsers(work_sub, func) -> None:
     p_est.add_argument("--publish", action="store_true",
                        help="auditor pass (L157b): computes and publishes the duration "
                             "reference table (schema ameesh-estimate-reference/1), which "
-                            "work add and work show read; clears estimate_bias")
+                            "work add and work show read; clears estimate_bias; the "
+                            "auditor (or a human) only, and a table identical to the one "
+                            "in force is not republished (#3501)")
     p_est.add_argument("--actor", default="", help="who publishes (--publish)")
     p_est.set_defaults(func=func)
 
