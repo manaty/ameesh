@@ -253,7 +253,19 @@ EFFECT_FIELDS = {
     "publish": ("repository", "cwd"),
     "transfer": ("repository", "branch", "commit", "project"),
     "session": ("harness", "account", "cwd", "commit"),
+    # H3: activation, health and reconciliation. `enable` and
+    # `restore_source` name no unit or command: the enrolled account is
+    # resolved from the operation/agent, never from the request.
+    "admit": ("harness", "account", "tools", "secrets"),
+    "enable": (),
+    "verify": ("commit",),
+    "restore_source": (),
+    "reconcile_effect": ("pending_step", "pending_epoch"),
 }
+#: Effects whose interrupted intent can be reconciled. `recover_source` is
+#: the L232e loss recovery and stays outside this H3 path.
+RECONCILABLE_STEPS = ("prepare", "stop_source", "publish", "transfer", "session",
+                      "admit", "enable", "verify", "restore_source")
 #: States a read-only revalidation may observe.
 HANDOFF_STATES = ("planned", "prepared", "drained", "published", "transferred",
                   "session_ready", "switched", "activated", "held")
@@ -269,7 +281,20 @@ EFFECT_RECEIPT_FIELDS = {
     "publish": ("repository", "branch", "commit", "remote_commit", "clean"),
     "transfer": ("repository", "branch", "commit", "clean", "cwd"),
     "session": ("mode", "executor_enabled", "oauth_cache_transferred"),
+    "admit": ("release_revision", "credentials_ready", "caps_ready",
+              "tooling_ready", "dsh_profile_ready", "executor_enabled"),
+    "enable": ("unit", "active", "executor_enabled"),
+    "verify": ("unit", "commit", "executor_enabled", "caps_ready"),
+    "restore_source": ("unit", "active", "executor_enabled"),
+    "reconcile_effect": ("quiesced", "epoch"),
 }
+
+#: The enrolled runner unit: a fixed pattern, never a request-chosen unit.
+_UNIT = re.compile(r"^ameesh-runner(?:-agent)?@[A-Za-z0-9][A-Za-z0-9_.-]{0,100}[.]service$")
+
+
+def _unit(value):
+    return isinstance(value, str) and _UNIT.fullmatch(value) is not None
 
 
 def _aliases(value, label, pattern=_ALIAS):
@@ -330,16 +355,26 @@ def validate_effect_request(request):
         if request.get("state") not in HANDOFF_STATES:
             raise ContractError("effect state")
         value["state"] = request["state"]
-    if step in ("prepare", "session"):
+    if step in ("prepare", "admit", "session"):
         if (not _name(request.get("harness"))
                 or not isinstance(request.get("account"), str)
                 or (request["account"] and _ACCOUNT.fullmatch(request["account"]) is None)):
             raise ContractError("effect identity")
         value["harness"] = request["harness"]
         value["account"] = request["account"]
-    if step == "prepare":
+    if step in ("prepare", "admit"):
         value["tools"] = _tools(request.get("tools"), "effect tools")
         value["secrets"] = _aliases(request.get("secrets"), "effect secrets")
+    if step == "verify":
+        if not _sha(request.get("commit")):
+            raise ContractError("effect commit")
+        value["commit"] = request["commit"]
+    if step == "reconcile_effect":
+        if (request.get("pending_step") not in RECONCILABLE_STEPS
+                or not _epoch(request.get("pending_epoch"), 1)):
+            raise ContractError("effect pending")
+        value["pending_step"] = request["pending_step"]
+        value["pending_epoch"] = request["pending_epoch"]
     if step in ("publish", "transfer"):
         if not repository_identity(request.get("repository")):
             raise ContractError("effect repository")
@@ -415,9 +450,7 @@ def validate_effect_receipt(receipt, request):
                 or receipt.get("executor_enabled") is not False):
             raise ContractError("prepare receipt")
     elif step == "stop_source":
-        if (not isinstance(receipt.get("unit"), str)
-                or not re.fullmatch(r"ameesh-runner(?:-agent)?@[A-Za-z0-9][A-Za-z0-9_.-]{0,100}\.service",
-                                    receipt["unit"])
+        if (not _unit(receipt.get("unit"))
                 or any(receipt.get(key) is not True for key in ("stopped", "quiet"))
                 or receipt.get("executor_enabled") is not False):
             raise ContractError("stop receipt")
@@ -440,4 +473,29 @@ def validate_effect_receipt(receipt, request):
                 or receipt.get("executor_enabled") is not False
                 or receipt.get("oauth_cache_transferred") is not False):
             raise ContractError("session receipt")
+    elif step == "admit":
+        if (not _sha(receipt.get("release_revision"))
+                or any(type(receipt.get(key)) is not bool for key in
+                       ("credentials_ready", "caps_ready", "tooling_ready",
+                        "dsh_profile_ready"))
+                or receipt.get("executor_enabled") is not False):
+            raise ContractError("admit receipt")
+    elif step == "enable":
+        if (not _unit(receipt.get("unit")) or receipt.get("active") is not True
+                or receipt.get("executor_enabled") is not True):
+            raise ContractError("enable receipt")
+    elif step == "verify":
+        if (not _unit(receipt.get("unit")) or not _sha(receipt.get("commit"))
+                or receipt.get("commit") != request["commit"]
+                or receipt.get("executor_enabled") is not True
+                or receipt.get("caps_ready") is not True):
+            raise ContractError("verify receipt")
+    elif step == "restore_source":
+        if (not _unit(receipt.get("unit")) or receipt.get("active") is not True
+                or receipt.get("executor_enabled") is not True):
+            raise ContractError("restore receipt")
+    elif step == "reconcile_effect":
+        if (receipt.get("quiesced") is not True
+                or not _epoch(receipt.get("epoch"), 1)):
+            raise ContractError("reconcile receipt")
     return value

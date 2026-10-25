@@ -161,7 +161,10 @@ def _plan(cfg, db, project, *, gate_reader=None):
     canon = canons.pop()
     from . import resolutions
     ancestor = resolutions._run(canon, "merge-base", "--is-ancestor", pin, gate)
-    if ancestor.returncode:
+    if ancestor.returncode not in (0, 1):
+        raise RequalifyError("refused: cannot check gate ancestry (git exit %s): %s"
+                             % (ancestor.returncode, ancestor.stderr.strip()))
+    if ancestor.returncode == 1:
         raise RequalifyError("refused: gate is not a descendant of the pin; "
                              "reviewed requalification required")
     changed = train_assembly.canon_diff(canon, pin, gate)
@@ -297,6 +300,13 @@ def automatic(cfg, db, project, *, gate_reader=None):
                 journal.write(json.dumps(row, ensure_ascii=False) + "\n")
                 journal.flush()
                 os.fsync(journal.fileno())
+                # Persist the journal's directory entry, including its first
+                # creation, before accepting the pin move as recorded.
+                directory_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY)
+                try:
+                    os.fsync(directory_fd)
+                finally:
+                    os.close(directory_fd)
             except BaseException:
                 journal.seek(before)
                 journal.truncate()

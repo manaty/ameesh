@@ -27,6 +27,7 @@ test_1425_stop_sweep_suites  # stockage : suites N de #753 — CLI stop, gardes 
 test_1677_prise_empilee  # stockage : blocage par dépendances lu sous verrou (verdict favorable en qa), lots actionnables du listing (#1677)
 test_2076_multiple_reviewers  # stockage : désignations concurrentes, retrait et compatibilité des anciens runners (#2076)
 test_3250_freeze_target_refresh  # stockage : cible rafraîchie hors transaction et gel conservé sur échec du fetch (#3250)
+test_3503_jit  # driver : jit=off dans le paquet de démarrage et le chemin DSN `options=`, session persistante, doctor (#3503)
 test_420_qa_role  # SQL: QA role, runner binding and TEMP registry spoofing (#420, #919)
 test_1132_jauges_perimees  # stockage : provenance des relevés (production, source), dédup par fraîcheur, gauge_latest (#1132)
 test_2179_roadmap_cli  # stockage : import transactionnel, clés stables, CAS et filtre projet avant LIMIT (#2179)

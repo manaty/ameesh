@@ -253,6 +253,25 @@ class FreezeIntakeTest(_ActivationFixture, PgTestCase):
         self.assertEqual([(r["state"], r["actor"]) for r in moves],
                          [("build", "author"), ("qa", "author")])
 
+    def test_pinned_freeze_keeps_process_state_and_designates_reviewers(self):
+        for state in ("intake", "build"):
+            with self.subTest(state=state):
+                self.db.execute(
+                    "UPDATE work_items SET state = %s, workflow_ref = %s WHERE id = %s",
+                    (state, "process:delivery@revision", self.lot))
+                mark, out = self.freeze()
+                item = work.get(self.db, self.lot)
+                self.assertEqual(item["state"], state)
+                self.assertEqual(item["workflow_ref"], "process:delivery@revision")
+                self.assertEqual(set(designated(item)), {"r1", "r2"})
+                self.assertEqual(out["state"], rd.DESIGNATED)
+                self.assertIn(mark["id"], [m["id"] for m in
+                                         work.milestones(self.db, self.lot)])
+        self.assertEqual({m["recipient"] for m in self.mailbox()}, {"r1", "r2"})
+        self.assertEqual(self.db.query(
+            "SELECT id FROM work_item_events WHERE work_item_id = %s"
+            " AND note LIKE %s", (self.lot, "%frozen (#3467)")), [])
+
     def test_hook_failure_rolls_back_state_and_freeze(self):
         before = len(work.milestones(self.db, self.lot))
 

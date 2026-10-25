@@ -143,11 +143,14 @@ Repo-local wrappers: `bin/ameesh`, `bin/agent-mail`, `bin/agent-runner`, `bin/am
 `agent-mail` keeps the v0 interface — and the v0 hook JSON, byte for byte:
 
 ```
-agent-mail send <dest> <texte…> [--from NOM] [--lot ID [--assign]] [--kind request|reply|notify|event] [--urgent]
+agent-mail send <dest> <texte…|-> [--from NOM] [--lot ID [--assign]] [--kind request|reply|notify|event] [--urgent]
                [--ack] [--cc NOM[,NOM…]]       # dest = name or "all"; L125: batched mail
                                                # (90 s), --urgent without delay, --ack and --cc without waking
                                                # --lot: thread label; hands over a free lot (L94
                                                # history, or --assign #964), never one held by an agent (#1066)
+                                               # corps `-`: lu sur l'entrée standard, avec un heredoc
+                                               # `<<'EOF'` (délimiteur entre apostrophes : rien n'est
+                                               # interprété, une commande citée ne s'exécute pas, #3504)
 agent-mail list                                # nom, outil, dernier signe de vie
                                                # (seen/wrote, hors exécuteur), non lus,
                                                # dossier, hôte, bail

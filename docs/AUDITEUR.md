@@ -91,7 +91,13 @@ demande pas à l'auditeur de traiter un goulot d'agent à leur place. #3447 : le
 lots réservés à un exécutant externe déclaré (`external_executor` : bureau,
 owner) sont eux aussi listés à part (« attentes externes »), avec leur
 exécutant ; ce ne sont pas des lots sans assigné et ils ne font pas sortir 2.
-Une simple
+#3498 : un **hold de pilote** peut nommer le même exécutant et le geste
+attendu (`ameesh work note <lot> "hold: attente bureau : <geste>"`, ou
+`attente owner`) ; le débit le range dans les mêmes attentes externes, avec
+une relance à cet exécutant — à l'échéance déclarée, sinon après le seuil du
+débit (`(due 2026-10-25 12:00 UTC)`). La relance est réaffichée à chaque
+passage et se porte au bureau (§10) ; `--check` ne sort pas 2 sur une attente
+externe. Une simple
 mention d'une règle ou d'une consigne de l'owner, ou d'une décision déjà
 signée, ne classe pas l'attente humaine ; un `hold_undeployed` ne l'est jamais
 (canon §11 bis).
@@ -103,7 +109,7 @@ le JSON plutôt que le texte.
 
 | # | Point | Commandes | Signe d'un problème |
 |---|---|---|---|
-| 0 | **Débit (en premier)** | `ameesh debit --json` (`--check` pour le code de sortie) | `slow_waits` non vide (attente de plus de 2 h sans geste) ; `device_holds` ou `undeployed_holds` non vides ; `reviews_by_reviewer` (avis dus) ; `idle_agents_with_work` ; `ci.slow_runs` et `ci.slow_jobs` (le job macOS de 3 à 4 h avant #3198) |
+| 0 | **Débit (en premier)** | `ameesh debit --json` (`--check` pour le code de sortie) | `slow_waits` non vide (attente de plus de 2 h sans geste) ; `device_holds` ou `undeployed_holds` non vides ; `external_reminders` (relances bureau/owner dues, #3498) ; `reviews_by_reviewer` (avis dus) ; `idle_agents_with_work` ; `ci.slow_runs` et `ci.slow_jobs` (le job macOS de 3 à 4 h avant #3198) |
 | 1 | Agents bloqués, arrêtés ou à vide | `ameesh list`, `ameesh show <agent>`, `ameesh alerts --json` | `stopped_with_mail`, `idle_with_mail`, `dead_runner`, `host_not_ready` ; agent au repos avec un lot actionnable (`idle_actionable_lot`, niveau 1 : il relance) ; `critical_budget_pause` (urgent, L242b) : un orchestrateur, l'agent de conception ou un auditeur en pause budget |
 | 2 | Tours longs, sessions qui grossissent | `ameesh alerts --json`, `ameesh cost turns` | `long_turn`, `session_too_big`, `stale_lot` |
 | 3 | Forfaits | `ameesh accounts list` | capacité perdue à la prochaine remise à zéro (`plan_underused`), compte au seuil de rythme, compte forcé depuis longtemps |
@@ -460,7 +466,10 @@ par lui-même (une lecture, pas un sous-agent) :
    2026-10-11). Un estimateur hors de ×0,5–×2 sur au moins trois lots est
    rangé dans `bias` : l'alerte `estimate_bias` en découle, adressée à
    l'estimateur et aux orchestrateurs de son équipe, jusqu'à la publication
-   suivante qui ne le relève plus. Then (L157c) `ameesh work schedule
+   suivante qui ne le relève plus. Republier une table identique n'écrit
+   rien (`unchanged`) et ne relance aucune alerte ; l'alerte est un épisode
+   daté à l'entrée en biais, pas à la publication (#3502). Then (L157c)
+   `ameesh work schedule
    --apply --actor auditeur`: the planned dates of the open lots, at the p80
    of the new table, queues chained at the median (dates set by a person
    are kept).
@@ -905,6 +914,12 @@ le fil du projet que lit le propriétaire.
   attente de plus de 2 h, par le geste fait (niveau 1) ou le pilote nommé.
   « Rien à signaler » avec une attente de plus de 2 h est un défaut ; sans
   aucune attente, une ligne (« Audit 14:00 : rien à signaler »).
+* **Un corps qui cite une commande** (backticks, `$(…)`) ne part jamais entre
+  guillemets doubles : le shell de l'auditeur l'exécuterait avant l'envoi.
+  Envoyer le corps sur l'entrée standard, avec un délimiteur entre apostrophes
+  qui n'interprète rien : `agent-mail send mesh-design - --kind event <<'EOF'`
+  … `EOF` (#3504 ; le 25/10, une commande citée avait publié une table et
+  déclenché une rafale de courriers).
 * **Chaque analyse profonde** : dix lignes au plus,
   `agent-mail send mesh-design "Analyse profonde du 2026-10-11 (24 h) : …"
   --kind event`. Le temps perdu trouvé ; les causes racines, une ligne chacune

@@ -1273,7 +1273,10 @@ _KEPT = ("module", "rule", "project", "declaration_id", "subject", "action",
          "critical", "targets",
          # #1901 : l'hôte qui a observé l'alerte (porte d'hôte) reste dans
          # l'état — une famille non relue ne résout pas ses alertes
-         "observation_host")
+         "observation_host",
+         # #3502 : l'épisode de biais (sens, palier, entrée) est lisible dans
+         # l'état ; la clé garde `since` et `reason`, pas la publication.
+         "bias_side", "bias_level", "tier_since", "biased_since")
 
 
 # --------------------------------------------------------------------------

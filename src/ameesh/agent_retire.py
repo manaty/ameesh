@@ -12,8 +12,9 @@ restauration rend exactement l'état d'avant. Retrait et restauration sont
 journalisés (`agent.retired`, `agent.restored`) dans la transaction du geste.
 
 Le retrait est refusé, avec chaque cause nommée, tant que l'agent tient un
-bail vivant, un lot non clos ou une veille `ameesh watch` qui lui écrit :
-l'agent les rend d'abord. `watch.SENDER` (« veille ») reste une identité
+bail vivant, un lot ouvert assigné ou réservé comme exécutant externe, ou une
+veille `ameesh watch` qui lui écrit : l'agent les rend d'abord.
+`watch.SENDER` (« veille ») reste une identité
 d'émission système, comme « ameesh » : les veilles et les réveils émettent
 toujours sous ce nom, retiré ou non (#3342). Les unités héritées
 `ameesh-veille-<agent>` (L121) de l'hôte émettent elles aussi sous ce nom ;
@@ -50,6 +51,13 @@ def _blocker_text(name: str, blocker: dict) -> str:
     if kind == "watch":
         return ("receives an ameesh watch on %s: ameesh watch disable --agent %s"
                 % (blocker.get("host") or "?", name))
+    if kind == "external_executor":
+        return ("is external executor of lot #%s (%s), not closed: clear the "
+                "reservation (ameesh work external-executor %s --clear) or "
+                "reserve it to another executor "
+                "(ameesh work external-executor %s <executor>)"
+                % (blocker.get("id"), blocker.get("state"), blocker.get("id"),
+                   blocker.get("id")))
     return str(blocker)
 
 
