@@ -8553,6 +8553,11 @@ RELOADABLE_FIELDS = frozenset({
     "accounts_shared", "account_sharing", "account_registry",
     # binaires de harnais de l'hôte (L106), lus au lancement de chaque tour
     "harness_bins",
+    # #3568 : la route de poussée (clé `notify`) décide le délégué de la passe
+    # alerts que cet hôte publie avec son relevé de candidature ; l'ajouter
+    # sans redémarrer évite de laisser un hôte fraîchement routé en `notify_ok`
+    # faux jusqu'au prochain redémarrage de l'exécuteur.
+    "notify",
 })
 
 
@@ -8845,6 +8850,38 @@ class Runner:
             self._gate_settled.set()
         else:
             self._sync_host_gate(False, None)
+        #: H5 : la fabrique de handoff épinglée est liée AVANT tout appel à
+        #: `readiness`/`advance_host` ; son absence reste un préalable nommé.
+        self._lifecycle_factory = None
+        self._lifecycle_adapter = None
+        self._lifecycle_requirements = None
+        self._lifecycle_gap = None
+        self._lifecycle_db = None
+        if not self.mediated:
+            self._bind_lifecycle()
+
+    def _bind_lifecycle(self) -> None:
+        """H5: bind the pinned handoff factory on a dedicated connection.
+
+        The runner, not an agent worker, owns this binding: the factory's
+        companion reads durable state on the controller's own scoped
+        connection, never on an agent's. Both ``readiness`` and
+        ``advance_host`` therefore consume the same adapter and
+        ``requirements_for``. A refused source or enrollment keeps the binding
+        empty; it is recorded by the named prerequisites, never simulated.
+        """
+        from . import handoff_factory
+        from .scoped_db import ScopedDb
+        self._lifecycle_db = ScopedDb(self.cfg)
+        try:
+            factory = handoff_factory.load(self._lifecycle_db)
+        except handoff_factory.FactoryUnavailable as exc:
+            self._lifecycle_gap = exc.gap
+            self._lifecycle_db = None
+            return
+        self._lifecycle_factory = factory
+        self._lifecycle_adapter = factory.adapter
+        self._lifecycle_requirements = factory.requirements_for
 
     # -- exécuteur médié (L109) ---------------------------------------------
     def _mediated_gate(self) -> None:

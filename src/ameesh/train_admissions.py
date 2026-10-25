@@ -6,13 +6,14 @@ alone does not encode the review count for SQL/security/production. Neither
 a journal note nor a caller-supplied receipt is used as a policy decision.
 The provider also supplies its classified reading of the exact frozen diff;
 admission rechecks the declared class and count against that same reading, so
-a critical SQL/security/production lot cannot enter with one family and be
-withdrawn after the freeze. No provider, runner hook or configuration is
-enabled by importing this module.
+a critical SQL/security/production path that no `train_reviews` rule names
+cannot enter with one family and be withdrawn after the freeze (#3542 : a
+rule that names the path is authoritative, `**` never lowers the floor). No
+provider, runner hook or configuration is enabled by importing this module.
 """
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 
 from . import land, lot_class, merge_queue, packet_guard, review, storage, work
 from .train import MemberDeferred, TrainError, identity
@@ -60,16 +61,34 @@ class Requirement:
     #: Admission recomputes the class minimum (critical SQL/security/prod
     #: paths need two distinct families) instead of trusting the count alone.
     files: tuple = ()
+    #: #3542 : la lecture par chemin du canon, portée avec le besoin pour que
+    #: l'admission relise exactement la porte de fusion (règle qui nomme le
+    #: chemin, et attrape-tout `**` qui ne baisse jamais le plancher).
+    project: str = ""
+    train_reviews_paths: dict = field(default_factory=dict)
+    train_reviews_wide: int = 0
 
     def klass(self) -> dict:
-        """La classe et les chemins classés, lus par la porte des avis (#2681)."""
-        return {"class": self.risk, "files": list(self.files)}
+        """La classe et les chemins classés, lus par la porte des avis (#2681),
+        avec la lecture par chemin du canon (#3542)."""
+        return {"class": self.risk, "files": list(self.files),
+                "project": self.project,
+                "train_reviews_paths": dict(self.train_reviews_paths),
+                "train_reviews_wide": self.train_reviews_wide}
 
     def check(self, row, base):
         if (self.lot, self.base, self.head) != (row["work_item_id"], base, row["frozen_sha"]):
             raise TrainError("review policy covers another lot, base or frozen head")
         if not isinstance(self.policy_commit, str) or not SHA.fullmatch(self.policy_commit):
             raise TrainError("versioned review policy required")
+        if not isinstance(self.project, str) \
+                or not isinstance(self.train_reviews_paths, dict) \
+                or any(not isinstance(path, str) or not path
+                       or type(count) is not int or count not in (1, 2)
+                       for path, count in self.train_reviews_paths.items()) \
+                or type(self.train_reviews_wide) is not int \
+                or self.train_reviews_wide not in (0, 1, 2):
+            raise TrainError("malformed review path reading")
         if type(self.reviews) is not int or self.risk not in _RISKS \
                 or self.reviews not in ({0, 1, 2} if self.risk == "light" else {1, 2}):
             raise TrainError("explicit known non-release review requirement expected")
@@ -77,7 +96,7 @@ class Requirement:
         worst = max((entry["class"] for entry in files), key=review.RANK.__getitem__)
         if review.RANK[worst] > review.RANK[self.risk]:
             raise TrainError("review policy understates the class of the frozen content")
-        minimum = merge_queue.required_verdicts({"class": self.risk, "files": files})
+        minimum = merge_queue.required_verdicts(self.klass())
         if self.reviews < minimum:
             raise TrainError("review policy requires %d independent review(s) for the frozen "
                              "class, not %d" % (minimum, self.reviews))

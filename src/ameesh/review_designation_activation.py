@@ -81,6 +81,7 @@ from typing import Mapping, Optional, Sequence
 
 from . import alert_briefs
 from . import canon as canon_mod
+from . import canon_lowering
 from . import db as db_mod
 from . import lot_class, mechanics, plan_git, projects, registry, review
 from . import review_designation as rd
@@ -157,6 +158,9 @@ class Policy:
     ref: str
     commit: str
     source: str
+    #: #3554 : la comparaison base/tête d'un lot du canon, quand elle conclut
+    #: à une baisse d'exigence (`required` vaut alors au moins 2)
+    canon_lowering: Optional[dict] = None
 
 
 @dataclass
@@ -256,6 +260,18 @@ def policy_sources(cfg, db, project: str, errors: list):
             yield source, commit, loaded
 
 
+def _declared_reviews(rules, paths) -> tuple[dict, int]:
+    """La lecture `train_reviews` du canon compilé, par chemin (#3542).
+
+    `mechanics.ReviewRule` porte les motifs (`.paths`) et leur nombre
+    (`.reviews`). Rend `(nommés, attrape-tout)` comme
+    `review.declared_reviews` : une règle qui nomme le chemin fixe son nombre ;
+    une règle `**` couvre tout sans nommer et ne peut que relever le compte.
+    """
+    return review.declared_reviews(
+        [(rule.paths, rule.reviews) for rule in rules or ()], paths)
+
+
 def _policy(cfg, db, project: str, paths: Sequence[str]) -> Policy | Unavailable:
     """The first configured canon that declares a usable policy for `project`."""
     if cfg is None or not str(getattr(cfg, "canon", "") or "").strip():
@@ -265,12 +281,16 @@ def _policy(cfg, db, project: str, paths: Sequence[str]) -> Policy | Unavailable
         for source, commit, loaded in policy_sources(cfg, db, project, errors):
             try:
                 need = loaded.reviews_for(paths)
-                # #2627 : le plancher critique de la porte de fusion
-                # (`merge_queue.required_verdicts`) fait partie du besoin. Un
-                # canon qui déclare un avis sur `exploitation.py` ou `db.py`
-                # n'abaisse pas les deux avis que la porte exigera au feu.
+                # #2627 / #3542 : le besoin que la porte de fusion calculera
+                # au feu. Le nombre d'une règle `train_reviews` qui nomme le
+                # chemin fait foi ; `CRITICAL_SCOPE` ne relève que les chemins
+                # qu'aucune règle ne nomme, et `**` ne l'abaisse jamais.
                 from . import merge_queue
                 classified = review.classify(loaded.review_policy, list(paths))
+                named, wide = _declared_reviews(loaded.rules, paths)
+                classified["train_reviews_paths"] = named
+                classified["train_reviews_wide"] = wide
+                classified["project"] = project
                 required = max(need.reviews, merge_queue.required_verdicts(classified))
                 # même classe que le lecteur compilé : le max des deux lectures
                 risk = max((need.risk, str(classified.get("class") or "light")),
@@ -741,7 +761,7 @@ def attribution_of_head(db, item: Mapping, milestone: Optional[Mapping],
                         repo: str, base: str, head: str, *, families=(),
                         commits=None, strict: bool = False,
                         families_out: Optional[dict] = None,
-                        target: str = "") -> tuple[list, list, list]:
+                        target: str = "", admitted_heads=()) -> tuple[list, list, list]:
     """`(auteurs, inconnus, correcteurs)` de la plage gelée `base..head` (#2681/#2739).
 
     La même lecture partagée que la désignation (`review_authors.reading`),
@@ -769,7 +789,8 @@ def attribution_of_head(db, item: Mapping, milestone: Optional[Mapping],
     return review_authors.reading(db, item, milestone, commits, repo,
                                   families=families, strict=strict,
                                   families_out=families_out,
-                                  base=base, head=head, target=target)
+                                  base=base, head=head, target=target,
+                                  admitted_heads=admitted_heads)
 
 
 def corrections_of_head(db, item: Mapping, milestone: Optional[Mapping],
@@ -1474,6 +1495,14 @@ def prepare(cfg, db, lot: int, *, freeze: Optional[Mapping] = None,
     policy = _policy(cfg, db, project, paths)
     if isinstance(policy, Unavailable):
         return policy
+    # #3554 : un lot du canon qui touche sa politique est comparé à la base ;
+    # une baisse d'exigence (avis ou classe) exige deux avis. Le résultat est
+    # porté par `Policy` pour que la désignation et son journal le lisent.
+    lowering = canon_lowering.for_lot(cfg, repo, start, frozen_sha, paths)
+    if lowering is not None and lowering.floor:
+        policy = dataclasses.replace(
+            policy, required=max(int(policy.required), lowering.floor),
+            canon_lowering=lowering.to_dict())
     # #3183 : le plancher posé par un pilote (`review_floor`) relève le compte
     # de la désignation comme celui de la porte ; un journal illisible attend.
     floor = review_floor.apply({}, db, int(lot), cfg=cfg)
@@ -1505,6 +1534,25 @@ def prepare(cfg, db, lot: int, *, freeze: Optional[Mapping] = None,
                   manual_seats=_manual_seats(manual, listing, authors, families,
                                              correctors=correctors),
                   advances=_advances(db))
+
+
+def _note_canon_lowering(db, item: Mapping, freeze: Mapping, inputs: Inputs) -> None:
+    """#3554 : la liste des fichiers abaissés au journal, une fois par tête.
+
+    Best-effort : un journal qui refuse ne perd ni le gel ni sa désignation.
+    La ligne porte le préfixe `canon-review-lowering:` et les commits exacts ;
+    `once=True` déduit un rejeu de la même tête.
+    """
+    lowering = getattr(inputs.policy, "canon_lowering", None)
+    if not lowering or not int(lowering.get("floor") or 0):
+        return
+    text = canon_lowering.journal_text(lowering)
+    if not text:
+        return
+    try:
+        work.note(db, int(item["id"]), text, actor=SENDER, once=True)
+    except Exception:  # noqa: BLE001 - la trace au mieux, le gel reste
+        pass
 
 
 # --------------------------------------------------------------------------
@@ -2166,6 +2214,9 @@ def _designate_in_transaction(cfg, tx, lot: int, *, milestone: Optional[Mapping]
             _sync_reviewers(tx, item, freeze, [])
         return {"state": "unavailable", "reviewers": [], "freeze": freeze,
                 "why": inputs.why}
+    # #3554 : la baisse du canon est un fait du gel, journalisée même quand la
+    # couverture manuelle dispense de désigner.
+    _note_canon_lowering(tx, item, freeze, inputs)
     if reading is not None:
         # #2812 : la même lecture que la désignation, réutilisée par la
         # notification des blocages levés (aucune lecture git redoublée).
@@ -2486,6 +2537,8 @@ def designate(cfg, db, lot: int, *, freeze: Optional[Mapping] = None,
                 _drain(db, threads)
             return {"state": "unavailable", "reviewers": [], "freeze": freeze,
                     "why": inputs.why}
+        # #3554 : même journal hors du hook (reprise), une fois par tête.
+        _note_canon_lowering(db, item, freeze, inputs)
         if _manual_covers(inputs):
             return {"state": "manual", "reviewers": [], "freeze": freeze,
                     "why": "manual reviewer(s) already cover the required review(s): %s"

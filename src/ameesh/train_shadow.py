@@ -344,8 +344,9 @@ class Passage:
                     continue
                 # The shadow plan must not show a member that the active
                 # enrollment would refuse: a withdrawal receipt or an
-                # unqualified initial absence is the same refusal here.
-                if decision["initial"] is not True:
+                # unqualified initial absence is the same refusal here. An
+                # allocation ejected for want of a lot CI is requeued (#3560).
+                if decision["initial"] is not True and not decision.get("recover"):
                     deferred.append(_deferred(
                         lot, "candidate",
                         "no qualified initial queue history or a withdrawal: "

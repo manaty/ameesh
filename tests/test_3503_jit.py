@@ -20,6 +20,7 @@ Témoins :
 from __future__ import annotations
 
 import dataclasses
+import importlib.util
 import os
 import unittest
 from unittest import mock
@@ -29,6 +30,10 @@ from ameesh import config as config_mod
 from ameesh import db as db_mod
 from ameesh import hostcheck
 from tests.support import REPO, TEST_DSN, PgTestCase
+
+#: #3503 : la part psql de la CI n'installe pas psycopg (tests.yml) ; les
+#: témoins qui forcent ce pilote y sont sautés, couverts par la part psycopg.
+HAVE_PSYCOPG = importlib.util.find_spec("psycopg") is not None
 
 
 class StartupOptionsTest(unittest.TestCase):
@@ -127,6 +132,7 @@ class SessionTest(PgTestCase):
         self.assertEqual(len(rows), 1)
         return rows[0]["setting"]
 
+    @unittest.skipUnless(HAVE_PSYCOPG, "psycopg absent (part psql)")
     def test_psycopg(self):
         conn = self.connect(driver="psycopg")
         try:
@@ -158,6 +164,7 @@ class SessionTest(PgTestCase):
         finally:
             conn.close()
 
+    @unittest.skipUnless(HAVE_PSYCOPG, "psycopg absent (part psql)")
     def test_un_dsn_qui_fixe_options_est_couvert_psycopg(self):
         dsn = TEST_DSN + ("&" if "?" in TEST_DSN else "?") + "options=" + quote(
             "-c statement_timeout=21000")
@@ -185,6 +192,7 @@ class SessionTest(PgTestCase):
         finally:
             conn.close()
 
+    @unittest.skipUnless(HAVE_PSYCOPG, "psycopg absent (part psql)")
     def test_un_pgoptions_jit_on_ne_rallume_pas_psycopg(self):
         cfg = dataclasses.replace(self.cfg, driver="psycopg")
         with mock.patch.dict(os.environ, {"PGOPTIONS": "-c jit=on"}):

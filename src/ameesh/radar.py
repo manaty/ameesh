@@ -78,7 +78,7 @@ SCHEMA = "ameesh-radar/1"
 SETTINGS_KEYS = ("projects",)
 PROJECT_KEYS = ("repo", "migrations", "target", "github", "land", "gates", "merge_method",
                 "lease_ref", "generated", "ci_required", "protected", "full_suite", "ci_parts",
-                "required_statuses", "required_checks")
+                "required_statuses", "required_checks", "production_branch")
 #: L1651 : clés de la déclaration `ci_parts` (les espaces réservés d'`argv`
 #: sont ceux du contrat, `ci_parts.PLACEHOLDERS`)
 CI_PARTS_KEYS = ("selector", "rev", "argv", "schema", "due")
@@ -213,6 +213,8 @@ class Project:
     #: de plan prouvé (`Upgrade to GitHub Pro…`) ; l'absence de clé garde le
     #: refus fail-closed. Ce drapeau distingue `[]` de l'absence.
     required_checks_declared: bool = False
+    #: #3533: published ancestry excluded from packet author attribution.
+    production_branch: str = ""
 
 
 @dataclass
@@ -340,13 +342,15 @@ def parse_settings(raw) -> Settings:
         if not isinstance(repo, str) or not repo.strip():
             raise SettingsError("%s.repo: repository path expected" % where)
         texts = {}
-        for key in ("migrations", "target", "github"):
+        for key in ("migrations", "target", "github", "production_branch"):
             text = value.get(key) or ""
             if not isinstance(text, str):
                 raise SettingsError("%s.%s: text expected" % (where, key))
             texts[key] = text.strip().strip("/")
         if texts["target"]:
             plan_git.check_ref(texts["target"], "cible")
+        if texts["production_branch"]:
+            plan_git.check_ref(texts["production_branch"], "production_branch")
         if texts["github"] and not _GITHUB_RE.match(texts["github"]):
             raise SettingsError("%s.github: \"owner/repo\" repository expected" % where)
         land = value.get("land") or "off"
@@ -503,6 +507,7 @@ def parse_settings(raw) -> Settings:
         projects[name] = Project(name=name, repo=os.path.expanduser(repo.strip()),
                                  migrations=texts["migrations"], target=texts["target"],
                                  github=texts["github"], land=land,
+                                 production_branch=texts["production_branch"],
                                  gates=tuple(gates), merge_method=method,
                                  lease_ref=lease_ref,
                                  generated=tuple(generated), path_gates=tuple(by_path),
@@ -1677,8 +1682,15 @@ def never_concluded(state) -> bool:
 
 
 #: #3221 : les états qu'une porte écrit entre parenthèses après le nom consigné
+#: #3530 : `ci_reading` écrit aussi `(état; URL)` et l'état d'un job encore en
+#: cours (`in_progress`, `queued`) — la casse reste libre.
 CI_CONSIGNED_STATES = (CI_INCONCLUSIVE | CI_INCONCLUSIVE_STATES | CI_NEGATIVE
-                       | frozenset(("SUCCESS", "PENDING", "EXPECTED", "?")))
+                       | frozenset(("SUCCESS", "PENDING", "EXPECTED", "?",
+                                    "IN_PROGRESS", "QUEUED")))
+
+#: #3530 : l'URL du run que `release_cutoff.ci_reading` met après l'état dans
+#: le suffixe consigné. Absente ou vide (`(cancelled; )`) : rien à garder.
+_CONSIGNED_URL = re.compile(r"^https?://\S*$", re.IGNORECASE)
 
 #: #3251 : check de détail publié par l'étape « bilan des parts » de
 #: `.github/workflows/tests.yml` (scripts/ci-agregat.py), à chaque exécution.
@@ -1713,18 +1725,31 @@ def aggregate_detail_entries(rollup) -> list:
     return latest_rollup(rows)
 
 
+def _consigned_suffix(group: str) -> bool:
+    """#3530 : le suffixe d'occurrence écrit par `release_cutoff.ci_reading` —
+    `ÉTAT[, ÉTAT]` puis, éventuellement, `; URL` — ne contient que des états
+    connus. Une parenthèse du nom (`linux`, `linux; arm64`) ne l'est pas."""
+    chunks = [chunk.strip() for chunk in str(group or "").split(";")]
+    states = [state.strip().upper() for state in chunks[0].split(",")]
+    if not states or not all(states) \
+            or any(state not in CI_CONSIGNED_STATES for state in states):
+        return False
+    return all(not chunk or _CONSIGNED_URL.match(chunk) for chunk in chunks[1:])
+
+
 def nonconclusive_source(app: str, entry: str) -> str:
     """#3209 : la clé du lot de correction d'un check non concluant — l'app
     et le **nom du check**, sans l'état consigné (`tests (CANCELLED)` →
     `tests`) ni la tête : le même check au paquet suivant ou à la release
     retrouve le lot encore ouvert (`work.add_or_note`).
     #3221 : seul un suffixe fait d'états connus est retiré ; une parenthèse du
-    nom (`tests (linux)`, nom brut de la release) reste dans la clé."""
+    nom (`tests (linux)`, nom brut de la release) reste dans la clé.
+    #3530 : `ci_reading` écrit `(état; URL)` (et l'état d'un job encore en
+    cours, `in_progress` / `queued`) ; l'URL et l'état ne font pas partie de
+    la clé, sinon chaque occurrence rouvre un lot."""
     text = str(entry or "").strip()
     match = re.match(r"^(.*?)\s*\(([^()]*)\)$", text)
-    if match and match.group(1) and all(
-            state.strip().upper() in CI_CONSIGNED_STATES
-            for state in match.group(2).split(",")):
+    if match and match.group(1) and _consigned_suffix(match.group(2)):
         text = match.group(1)
     return "nonconclusive:%s:%s" % (app, text)
 

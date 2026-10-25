@@ -73,21 +73,41 @@ def reconcile(cfg, db, host, *, actor=None):
         host, actor=actor, fresh_within=fresh_within)
 
 
-def readiness(db, agent, target, *, adapter=None, requirements_for=None):
-    """Evaluate helper inventory and host-scoped logins, exposing only named gaps."""
-    required = host_preflight.Requirements(target, agent["harness"], agent.get("session_account") or "")
+def _prerequisite_gaps(adapter, requirements_for):
+    """The same named prerequisites for ``readiness`` and ``advance_host``."""
     missing = []
+    if adapter is None:
+        missing.append("helper:L232b")
     if requirements_for is None:
         missing.append("requirements:L232c")
-    else:
-        required = requirements_for(agent, target)
+    return missing
+
+
+def readiness(db, agent, target, *, adapter=None, requirements_for=None, account=None):
+    """Evaluate helper inventory and host-scoped logins, exposing only named gaps.
+
+    ``account`` is the frozen plan account for a post-switch step: the switch
+    clears the registry's ``session_account``, so re-reading it would refuse
+    the exact account the operation was admitted with (H4 freezes it in the
+    plan). Without an override the registry value is used, as for a new plan.
+    """
+    if account is None:
+        account = agent.get("session_account") or ""
+    required = host_preflight.Requirements(target, agent["harness"], account)
+    missing = _prerequisite_gaps(adapter, requirements_for)
+    if requirements_for is not None:
+        try:
+            required = requirements_for(dict(agent, session_account=account), target)
+        except Exception:
+            # A refused agent/host identity is the same prerequisite as an
+            # absent factory: named, never a raw factory diagnostic.
+            return {"host": target, "ready": False,
+                    "missing": sorted(set(missing + ["requirements:L232c"]))}
         if (not isinstance(required, host_preflight.Requirements) or required.host != target
                 or required.harness != agent["harness"]):
             raise ValueError("requirements must name the agent's harness and receiving host")
     inventory = None
-    if adapter is None:
-        missing.append("helper:L232b")
-    else:
+    if adapter is not None:
         try:
             inventory = adapter.inventory(target)
         except Exception:
@@ -107,8 +127,13 @@ class _ReadyAdapter:
 
     def revalidate(self, op):
         agent = registry.get(self.db, op["agent"])
-        if agent is None or not readiness(self.db, agent, op["target"], adapter=self.adapter,
-                                         requirements_for=self.requirements_for)["ready"]:
+        # H4 freezes the exact account in the plan; after the switch the
+        # registry's session_account is cleared, so readiness must use the
+        # frozen value for every post-switch step.
+        if agent is None or not readiness(
+                self.db, agent, op["target"], adapter=self.adapter,
+                requirements_for=self.requirements_for,
+                account=op["plan"].get("account"))["ready"]:
             return False
         # A return request supersedes a move still on the source. Once the
         # target may have work, complete reconciliation there before return.
@@ -142,10 +167,8 @@ def advance_host(db, host, *, limits_for, adapter=None, requirements_for=None):
             continue
         demand = api.host_lifecycle.demand(agent["name"], agent["host"])
         op = api.handoffs.active(agent["name"])
-        missing = []
-        if adapter is None:
-            missing = ["helper:L232b"]
-        elif op:
+        missing = _prerequisite_gaps(adapter, requirements_for)
+        if adapter is not None and op:
             if (control["mode"] == "lost" and op["source"] == host
                     and op["plan"].get("reason") != "host_loss"):
                 try:
@@ -165,7 +188,7 @@ def advance_host(db, host, *, limits_for, adapter=None, requirements_for=None):
                     op = handoffs.advance(db, op["id"], wrapped)
             else:
                 op = handoffs.advance(db, op["id"], wrapped)
-        elif demand:
+        elif adapter is not None and demand:
             def ready(row, target):
                 result = readiness(db, row, target, adapter=adapter, requirements_for=requirements_for)
                 missing.extend(result["missing"])

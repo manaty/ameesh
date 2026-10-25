@@ -16,6 +16,10 @@
 #   # AppArmor, sinon plus aucun runner ne démarre (témoin fail-closed).
 #   install -D -m 0644 deploy/poste/cles-owner.conf \
 #     ~/.config/systemd/user/ameesh-runner-agent@.service.d/cles-owner.conf   # #3444
+#   # Ce drop-in porte aussi le transport git des unités (HTTPS+gh, #3540) :
+#   # poser avec lui le fichier de configuration git.
+#   install -D -m 0644 deploy/poste/git-agents.conf \
+#     ~/.config/ameesh/git-agents.conf   # #3540
 #   systemctl --user daemon-reload
 #   systemctl --user enable --now ameesh-runner-agent@<agent>
 #   journalctl --user -u ameesh-runner-agent@<agent> -f
@@ -50,6 +54,12 @@ EnvironmentFile=-%h/.config/ameesh/env
 # retire en plus ~/.ssh du système de fichiers de l'exécuteur ; ce n'est pas
 # la frontière de la décision (même uid = contournable), voir
 # docs/EXPLOITATION.md.
+# #3540 : sur un poste où ~/.ssh est masqué, ce même drop-in pose aussi
+# GIT_CONFIG_SYSTEM (git en HTTPS+gh, `deploy/poste/git-agents.conf`) et
+# GIT_SSH_COMMAND. Le gabarit reste universel : ailleurs ~/.ssh est lisible
+# et `ameesh work merge-pr` pousse en SSH (le jeton d'un rôle peut manquer
+# `workflow`) ; une réinstallation du gabarit ne défait pas le drop-in, qui
+# porte ces deux réglages.
 UnsetEnvironment=SSH_AUTH_SOCK SSH_AGENT_PID
 ExecStart=%h/.local/share/ameesh/venv/bin/ameesh run --agents %i --runner-id runner-%i@%H
 # Une base pas encore là au démarrage n'est plus une sortie en échec (L106,

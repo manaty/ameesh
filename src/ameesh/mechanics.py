@@ -962,6 +962,38 @@ def _declared(mapping, key: str, where: str) -> dict:
     return mapping[key]
 
 
+def declared_projects(repo: str, commit: str, *,
+                      deadline: Deadline | None = None) -> tuple[str, ...]:
+    """Les projets que `review_policies.risk_classes.projects` déclare.
+
+    Lu au commit exact, sans compiler les barèmes de chaque projet : un canon
+    peut déclarer une classe sans bloc `train_reviews` complet (`omarchy`), et
+    cette lecture ne le refuse pas ; c'est `load` qui dit si le projet se
+    compile. Un canon **sans** `review_policies` ou sans `risk_classes` rend
+    `()` (aucune politique) ; un bloc présent mais mal formé refuse, pour que
+    l'appelant distingue « rien à mesurer » d'une politique cassée.
+    """
+    commit = _exact_commit(repo, commit, deadline=deadline)
+    federation = _federation(repo, commit, deadline=deadline)
+    policies = federation.get("review_policies")
+    if policies is None:
+        return ()
+    if not isinstance(policies, dict):
+        raise MechanicsError("review_policies must be a mapping")
+    classes = policies.get("risk_classes")
+    if classes is None:
+        return ()
+    if not isinstance(classes, dict):
+        raise MechanicsError("review_policies.risk_classes must be a mapping")
+    projects = classes.get("projects")
+    if projects is None:
+        return ()
+    if not isinstance(projects, dict):
+        raise MechanicsError("review_policies.risk_classes.projects must be a mapping")
+    return tuple(sorted(name for name in projects
+                        if isinstance(name, str) and name.strip()))
+
+
 def _review_policy(federation: dict, project: str, commit: str
                    ) -> tuple[review.ReviewPolicy, tuple[ReviewRule, ...]]:
     """`risk_classes` et `train_reviews` du projet, au même commit exact."""

@@ -4,10 +4,11 @@
 The caller explicitly selects an audited canon commit. The checkout, registry
 and lot notes supply no policy. A separate per-project declaration of review
 counts is mandatory; the existing risk classification alone is insufficient.
-The classified exact diff then floors that count under the same critical-scope
-reading as the merge gate: SQL, security and production paths need two distinct
-model families even when their per-path rule says one. Importing this module
-installs no policy or runner.
+The classified exact diff then floors that count with the same reading as the
+merge gate (#3542): a rule that names the path is authoritative, SQL, security
+and production paths keep two reviews when no rule names them, and an
+attrape-tout `**` never lowers that floor. Importing this module installs no
+policy or runner.
 """
 from __future__ import annotations
 
@@ -32,8 +33,10 @@ class Versioned:
     Each rule has nonempty ``paths`` and ``reviews`` (1 or 2). Every changed
     non-light path needs coverage. Overlapping rules use the largest count;
     positive counts also raise an otherwise light path to sensitive. The
-    frozen diff's class floors the count: a critical SQL/security/production
-    path takes two reviews (the merge gate's own requirement), never one.
+    frozen diff's class floors the count with the merge gate's reading
+    (#3542): a rule that names the path makes its count authoritative, while
+    a critical SQL/security/production path that no rule names keeps two
+    reviews, and `**` never lowers that floor.
     Rules must be qualified by the pilot before selecting their canon commit.
     Unknown projects never borrow another project's policy or a fallback.
     """
@@ -66,6 +69,7 @@ class Versioned:
                 or not isinstance(declaration["rules"], list):
             raise TrainError("explicit train review rules required; no implicit default")
         rules = []
+        patterns = []
         for rule in declaration["rules"]:
             if not isinstance(rule, dict) or set(rule) != {"paths", "reviews"} \
                     or type(rule["reviews"]) is not int or rule["reviews"] not in (1, 2) \
@@ -76,8 +80,15 @@ class Versioned:
                 rules.append((tuple(review.compile_glob(p) for p in rule["paths"]), rule["reviews"]))
             except re.error as exc:
                 raise TrainError("invalid train review path pattern") from exc
+            patterns.append((tuple(rule["paths"]), rule["reviews"]))
         self.rules = tuple(rules)
+        self.patterns = tuple(patterns)
         self.commit, self.project = commit, project
+
+    def _named(self, paths):
+        """La lecture par chemin du canon (#3542) : les règles qui nomment le
+        chemin et le compte d'un attrape-tout `**`."""
+        return review.declared_reviews(self.patterns, paths)
 
     def __call__(self, item, row, base, path):
         head = row["frozen_sha"]
@@ -100,14 +111,20 @@ class Versioned:
         except (canon.GitError, review.ReviewError) as exc:
             raise TrainError("cannot classify exact lot content: %s" % exc) from exc
         risk, reviews = self._need(paths)
-        # The merge gate reads the frozen diff again and requires two distinct
-        # model families for SQL/security/prod paths, whatever a per-path rule
-        # says. Admission uses the same reading so a lot is never withdrawn
-        # after its freeze for a family/class check the gate already knew.
+        named, wide = self._named(paths)
+        # The merge gate reads the frozen diff again with the same per-path
+        # reading (#3542): a rule that names the path is authoritative,
+        # `CRITICAL_SCOPE` only floors unnamed paths, and `**` never lowers
+        # that floor. Admission uses the same reading so a lot is never
+        # withdrawn after its freeze for a count the gate already knew.
+        classified["train_reviews_paths"] = named
+        classified["train_reviews_wide"] = wide
+        classified["project"] = self.project
         risk = max((risk, classified["class"]), key=review.RANK.__getitem__)
         reviews = max(reviews, merge_queue.required_verdicts(classified))
         requirement = Requirement(row["work_item_id"], base, head, risk, reviews, self.commit,
-                                  files=tuple(classified["files"]))
+                                  files=tuple(classified["files"]), project=self.project,
+                                  train_reviews_paths=named, train_reviews_wide=wide)
         requirement.check(row, base)
         return requirement
 
@@ -151,3 +168,12 @@ class Compiled(Versioned):
         except (canon.CanonError, review.ReviewError) as exc:
             raise TrainError("cannot classify compiled canon policy: %s" % exc) from exc
         return need.risk, need.reviews
+
+    def _named(self, paths):
+        """La lecture par chemin du canon compilé, sans reparser (#3542)."""
+        provider = getattr(self.mechanics, "_named", None)
+        if callable(provider):
+            return provider(paths)
+        return review.declared_reviews(
+            [(getattr(rule, "paths", ()), getattr(rule, "reviews", 0))
+             for rule in getattr(self.mechanics, "rules", ()) or ()], paths)
