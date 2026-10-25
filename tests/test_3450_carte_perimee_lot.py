@@ -52,7 +52,9 @@ class StaleMapLotTest(unittest.TestCase):
         GitHub teste, donc le range propre de la branche (`--base`).
         """
         repo = self.repo.path
-        _git(repo, "checkout", "-q", "-b", "main", self.repo.base)
+        # -B : sous init.defaultBranch=main, le premier commit du dépôt
+        # jetable crée déjà `main` (CI GitHub) ; -b échouait alors en 128.
+        _git(repo, "checkout", "-q", "-B", "main", self.repo.base)
         if target is not None:
             target()
         self.repo.commit()
