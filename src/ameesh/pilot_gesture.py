@@ -46,6 +46,12 @@ host (90 s), the 300 s default would keep a disappeared host's pilot alive
 for 300 s and delay the election by as much; `ttl_s` only covers a host with
 no known rule, and an external call's margin still wins (#3123).
 
+The drill's `canary` (EP7 P3, `ameesh role canary`) goes through the same
+gate and `hold` but has no effect at all: the lease renewal and its event are
+its only writes. A real gesture used as a canary (`work assign` of a lot to
+its current assignee) is refused by its business rule before the fence and
+proves neither the refusal of a stale epoch nor the acceptance of a live one.
+
 The event is the durable trace of the authorization; the effect follows it.
 A human or the bureau has no agent lease to fence and passes through, as does
 a host-pinned agent (`releve: hote`): its placement already prevents another
@@ -65,9 +71,10 @@ from dataclasses import dataclass, field
 
 from . import agent_names, identity, registry, storage
 
-#: the five gestures of the study; kept explicit so a typo can never create a
+#: the five gestures of the study, and the drill's no-op `canary` (EP7 P3,
+#: `ameesh role canary`, #3433); kept explicit so a typo can never create a
 #: new event namespace by accident
-GESTURES = ("merge", "queue", "assign", "packet", "decision")
+GESTURES = ("merge", "queue", "assign", "packet", "decision", "canary")
 #: event type written in `ameesh_events` (append-only, one year by default)
 EVENT = "pilot.gesture"
 #: minimum lease duration used to hold the role while the gesture runs (the

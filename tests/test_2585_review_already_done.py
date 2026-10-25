@@ -495,7 +495,11 @@ class CatchUpAlreadyDoneDbTest(PgTestCase):
 
     def setUp(self):
         super().setUp()
-        registry.upsert(self.db, "a1", harness="deepseek", host=self.cfg.host)
+        # #3426 : le rattrapage ne tente un lot que sur un hôte qui peut
+        # nommer un dépôt (ici le dossier de l'assigné) ; la classe est
+        # doublée par le témoin, le contenu du dossier importe peu.
+        registry.upsert(self.db, "a1", harness="deepseek", host=self.cfg.host,
+                        cwd=self.tmp)
         registry.upsert(self.db, "codex1", harness="codex", host=self.cfg.host)
         self.lot = work.add(self.db, title="un chemin léger déjà relu", app="ameesh",
                             assignee="a1")["id"]

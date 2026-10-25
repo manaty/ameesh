@@ -170,6 +170,33 @@ class ResidentInputsBoundaryTest(unittest.TestCase):
                 self._rp(), fin, [7]), (True, None))
 
 
+class InputsAttributionTest(unittest.TestCase):
+    def test_un_tour_non_resident_attribue_aussi_ses_messages(self):
+        """#3452 : le même événement d'attribution sert un tour non résident
+        (harnais CLI) — `cost turns --message` ne rendait rien pour eux."""
+        event = resident_runner.inputs_attribution(
+            "deepseek", session="s1", turn="t1", inputs=("12", "human:7"),
+            status="completed")
+        self.assertEqual(event["type"], resident.INPUTS_EVENT)
+        self.assertEqual(event["protocol"], "deepseek")
+        self.assertEqual(event["inputs"], ["12", "human:7"])
+        self.assertEqual(event["session"], "s1")
+        self.assertIsNone(resident_runner.inputs_attribution(
+            "deepseek", session="s1", inputs=()))
+
+
+class TurnAttributionLotTest(unittest.TestCase):
+    def test_le_courrier_sans_lot_n_herite_pas_du_lot_de_session(self):
+        """#3452 : un tour de courrier sans lot (pilotage, courrier ambigu) ne
+        s'impute pas au lot de session dans le grand livre."""
+        self.assertEqual(cost_mod.turn_attribution_lot(
+            {"lot": "3426", "ids": [1]}, "1606"), "3426")
+        self.assertIsNone(cost_mod.turn_attribution_lot({"ids": [1]}, "1606"))
+        self.assertEqual(cost_mod.turn_attribution_lot({"ids": []}, "1606"), "1606")
+        self.assertEqual(cost_mod.turn_attribution_lot({}, "1606"), "1606")
+        self.assertIsNone(cost_mod.turn_attribution_lot({}, None))
+
+
 class TurnCostsInputsTest(Sandbox, PgTestCase):
     """L'écriture (record → turn_costs), la lecture par message et la CLI."""
 
@@ -226,6 +253,23 @@ class TurnCostsInputsTest(Sandbox, PgTestCase):
             agent="a1", since_s=3600, limit=50, message="12")
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["inputs"], ["12", "13"])
+
+    def test_un_evenement_non_resident_est_lu_par_le_grand_livre(self):
+        """#3452 : la ligne du grand livre relit l'attribution d'un tour non
+        résident (même événement, autre protocole), sans mesure résidente."""
+        self.agent("a1", "deepseek")
+        book = self.book()
+        self.events(
+            "a1",
+            {"type": "status", "phase": "step_end",
+             "usage": {"inputTokens": 1000, "cacheReadTokens": 0, "outputTokens": 10}},
+            {"type": resident.INPUTS_EVENT, "protocol": "deepseek",
+             "session": "s1", "turn": "t1", "status": "completed",
+             "inputs": ["12"]})
+        book.record("a1")
+        row = self.db.query(
+            "select inputs from turn_costs where agent = 'a1'")[0]
+        self.assertEqual(row["inputs"], ["12"])
 
     def test_turns_by_message_returns_the_turn_cost_once(self):
         self._record(["12", "13"])

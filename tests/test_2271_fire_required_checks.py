@@ -197,6 +197,30 @@ class ProtectionTest(unittest.TestCase):
         project = _project(required_checks=("coverage",))
         self.assertEqual(self._required(gh, project=project), (("coverage", None),))
 
+    def test_an_empty_declaration_covers_only_the_proven_plan_refusal(self):
+        """#3428 : Nexlink est privé hors GitHub Pro ; la forge répond qu'elle
+        ne peut pas porter de protection. Une déclaration vide dit alors
+        « aucune protection forge » et le feu continue ; un 403 de droits
+        reste un refus que la déclaration vide ne couvre pas."""
+        plan = ("gh: Upgrade to GitHub Pro or make this repository public to enable "
+                "this feature. (HTTP 403)")
+        project = _project(required_checks=(), required_checks_declared=True)
+        self.assertEqual(self._required(FakeGh(error=plan), project=project), ())
+        rights = "gh: Resource not accessible by integration (HTTP 403)"
+        with self.assertRaises(land.LandError):
+            self._required(FakeGh(error=rights), project=project)
+
+    def test_an_empty_declaration_never_weakens_a_readable_protection(self):
+        project = _project(required_checks=(), required_checks_declared=True)
+        self.assertEqual(self._required(FakeGh(), project=project),
+                         (("tests", 15368),))
+
+    def test_an_absent_declaration_does_not_cover_the_plan_refusal(self):
+        plan = ("gh: Upgrade to GitHub Pro or make this repository public to enable "
+                "this feature. (HTTP 403)")
+        with self.assertRaises(land.LandError):
+            self._required(FakeGh(error=plan))
+
     def test_only_a_proven_403_lets_the_declaration_cover_the_protection(self):
         # #2344 N1 : un 404, un GOAWAY, un DNS ou une sortie vide ne prouvent
         # pas un refus de droits ; la déclaration ne remplace pas la source.
@@ -670,6 +694,20 @@ class SettingsTest(unittest.TestCase):
             with self.subTest(bad=bad), self.assertRaises(radar.SettingsError):
                 radar.parse_settings({"projects": {"ameesh": {
                     "repo": "/r", "required_checks": bad}}})
+
+    def test_an_empty_declaration_is_recorded_as_declared(self):
+        # #3428 : `[]` n'est pas l'absence de la clé ; le feu doit pouvoir
+        # distinguer « aucune protection forge » de « rien de déclaré ».
+        settings = radar.parse_settings({"projects": {"ameesh": {
+            "repo": "/r", "required_checks": []}}})
+        project = settings.projects["ameesh"]
+        self.assertEqual(project.required_checks, ())
+        self.assertTrue(project.required_checks_declared)
+        settings = radar.parse_settings({"projects": {"ameesh": {"repo": "/r"}}})
+        self.assertFalse(settings.projects["ameesh"].required_checks_declared)
+        settings = radar.parse_settings({"projects": {"ameesh": {
+            "repo": "/r", "required_checks": None}}})
+        self.assertFalse(settings.projects["ameesh"].required_checks_declared)
 
 
 class WiringTest(unittest.TestCase):

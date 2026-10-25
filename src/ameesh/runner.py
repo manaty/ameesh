@@ -6725,6 +6725,24 @@ class AgentWorker(threading.Thread):
             self._resident_failures = 0
         return True, None
 
+    def _write_served_inputs(self, harness: str, ids, session, status: str) -> None:
+        """#3452 : l'attribution des messages servis, pour un tour non résident.
+
+        Les tours de harnais CLI n'écrivent ni `resident.turn` ni
+        `resident.inputs` : la colonne `turn_costs.inputs` restait vide pour
+        eux, et `cost turns --message` ne reliait aucun tour à son courrier.
+        L'événement est le même que pour Claude natif (même type, même lecture
+        par `cost.record`) ; une écriture ratée ne fait jamais échouer le tour,
+        seule l'attribution est perdue."""
+        from . import resident_runner
+        event = resident_runner.inputs_attribution(
+            harness, session=session or "", turn=self._turn_id or "",
+            inputs=ids, status=status)
+        if event is not None and not resident_runner.write_usage_event(
+                self._path("events.jsonl"), event):
+            log_async("[%s] turn inputs event not written: message attribution "
+                      "lost for this turn" % self.name)
+
     def _resident_turn_end(self, rp) -> None:
         """Fin d'un tour résident : dépublié ; le processus reste pour le tour
         suivant, sauf s'il est mort, si son tour n'a pas fini, ou si le tour
@@ -7122,6 +7140,12 @@ class AgentWorker(threading.Thread):
         turn_id = uuid.uuid4().hex
         self._turn_id = turn_id
         lot_du_tour = lot or self.agent.get("session_work_item") or None
+        # #3452 : le lot imputé au grand livre ne se replie pas sur le lot de
+        # session pour un tour de courrier sans lot (pilotage, courrier
+        # ambigu) — il n'y a pas travaillé. Les étiquettes de conteneurs
+        # gardent le lot de session (hygiène du dossier), pas la comptabilité.
+        lot_comptable = cost_mod.turn_attribution_lot(
+            spec, self.agent.get("session_work_item"))
         turn_label = containers_mod.turn_labels(
             turn_id, self.name, str(lot_du_tour) if lot_du_tour else None)
         identite = {
@@ -7282,7 +7306,8 @@ class AgentWorker(threading.Thread):
             self.fail_turn("accounting unavailable", "turn harness not written")
             return False
         if not self._compta_marque(events_start, label, model,
-                                   work_item_id=str(lot_du_tour) if lot_du_tour else None,
+                                   work_item_id=(str(lot_comptable)
+                                                 if lot_comptable else None),
                                    turn_id=turn_id):
             self.fail_turn("accounting unavailable",
                            "accounting marker not written")
@@ -7673,6 +7698,13 @@ class AgentWorker(threading.Thread):
                     if not ecrit:
                         error = error or erreur_flux
                         result_code = result_code or 1
+            else:
+                # #3452 : un tour non résident n'écrit aucune mesure résidente ;
+                # ses messages servis vont quand même au grand livre, sinon
+                # `cost turns --message` ne rend rien pour la majorité des tours.
+                self._write_served_inputs(
+                    harness, spec.get("ids") or (), session_new or session,
+                    "completed" if result_code == 0 and not error else "failed")
             # L498 : les descripteurs du READY ne survivent pas au tour (le
             # descripteur d'écriture est déjà fermé après le Popen).
             if ready_r is not None:
