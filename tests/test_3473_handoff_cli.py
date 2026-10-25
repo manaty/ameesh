@@ -103,6 +103,16 @@ class OperatorTest(unittest.TestCase):
         self.assertEqual(retry.call_args.kwargs['renew_ttl'], 300)
         advance.assert_not_called()
 
+    def test_command_closes_its_connection_after_refusal(self):
+        args = mesh_cli.build_parser().parse_args(['handoff', 'advance', 'op'])
+        with mock.patch.object(mesh_cli, '_open', return_value=self.db) as opened, \
+                mock.patch.object(mesh_cli, '_handoff_operator',
+                                  side_effect=ValueError('refused')):
+            with self.assertRaisesRegex(ValueError, 'refused'):
+                mesh_cli.cmd_handoff(object(), args)
+        opened.assert_called_once()
+        self.db.close.assert_called_once()
+
     def test_ttl_bounds_rejected_before_database(self):
         for ttl in ('29', '7201', 'true', '1.5'):
             with self.subTest(ttl=ttl), contextlib.redirect_stderr(io.StringIO()):
