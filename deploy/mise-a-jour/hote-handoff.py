@@ -62,6 +62,9 @@ GIT_SECONDS = 20
 STOP_SECONDS = 15.0
 LOCK_SECONDS = 10.0
 MAX_RECEIPT_BYTES = 65536
+#: ``O_DIRECTORY`` is absent on some platforms; a pinned directory fd still
+#: works without it (the path is checked by the caller's private chain).
+_O_DIRECTORY = getattr(os, 'O_DIRECTORY', 0)
 #: The destination's first session is fresh for a harness without portable
 #: native session storage; the others resume from the controller's brief.
 SESSION_MODES = {'deepseek': 'fresh', 'dsh': 'fresh'}
@@ -111,27 +114,33 @@ class BridgeError(ValueError):
 # Private files and the host execution enrollment
 # ---------------------------------------------------------------------------
 
+def _bounded(value, limit=128):
+    return (isinstance(value, str) and 0 < len(value) <= limit
+            and all(32 <= ord(char) != 127 for char in value))
+
+
 def _owned(info, owner=None):
     return info.st_uid in (os.geteuid(), 0) or (
         owner is not None and info.st_uid == owner[0])
 
 
-def _trusted_file(path, *, private=False):
-    """A fixed private regular file: no link, owned by root or the caller."""
+def _trusted_file(path, *, private=False, owner=None):
+    """A fixed private regular file: no link, owned by root, the caller or
+    the enrolled account whose home holds it."""
     path = Path(path)
     try:
         info = path.lstat()
     except OSError:
         raise Refused('file') from None
     if (stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode)
-            or not _owned(info) or info.st_mode & 0o022
+            or not _owned(info, owner) or info.st_mode & 0o022
             or (private and info.st_mode & 0o027) or info.st_nlink != 1):
         raise Refused('file')
     return path
 
 
-def _read_private_json(path, *, limit=65536):
-    path = _trusted_file(path, private=True)
+def _read_private_json(path, *, limit=65536, owner=None):
+    path = _trusted_file(path, private=True, owner=owner)
     try:
         descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
         with os.fdopen(descriptor, 'rb') as stream:
@@ -233,28 +242,53 @@ def load_execution(root=ENROLLMENT_ROOT):
 
 
 def _atomic_json(path, value):
-    """Private durable JSON: write, fsync, rename, fsync the directory."""
+    """Private durable JSON through a pinned directory descriptor.
+
+    The parent is opened with ``O_DIRECTORY|O_NOFOLLOW`` and the temporary is
+    created/replaced relative to that descriptor, so a directory swapped by
+    the account between the private-chain check and this write cannot redirect
+    a privileged marker into another tree.
+    """
     path = Path(path)
-    candidate = path.with_name('.' + path.name + '-' + os.urandom(6).hex())
+    candidate = '.' + path.name + '-' + os.urandom(6).hex()
+    directory = None
     try:
+        directory = os.open(path.parent,
+                            os.O_RDONLY | _O_DIRECTORY | os.O_NOFOLLOW)
         descriptor = os.open(candidate, os.O_CREAT | os.O_EXCL | os.O_WRONLY,
-                            0o600)
+                             0o600, dir_fd=directory)
         with os.fdopen(descriptor, 'w', encoding='utf-8') as stream:
             json.dump(value, stream, sort_keys=True)
             stream.flush()
             os.fsync(stream.fileno())
-        os.replace(candidate, path)
-        directory = os.open(path.parent, os.O_RDONLY)
-        try:
-            os.fsync(directory)
-        finally:
-            os.close(directory)
+        os.replace(candidate, path.name, src_dir_fd=directory,
+                   dst_dir_fd=directory)
+        os.fsync(directory)
     except OSError:
-        try:
-            candidate.unlink()
-        except OSError:
-            pass
+        if directory is not None:
+            try:
+                os.unlink(candidate, dir_fd=directory)
+            except OSError:
+                pass
         raise Uncertain('journal:write') from None
+    finally:
+        if directory is not None:
+            os.close(directory)
+
+
+def _unlink_private(path):
+    """Remove one entry through its pinned parent, never a swapped path."""
+    path = Path(path)
+    directory = None
+    try:
+        directory = os.open(path.parent,
+                            os.O_RDONLY | _O_DIRECTORY | os.O_NOFOLLOW)
+        os.unlink(path.name, dir_fd=directory)
+    except OSError:
+        raise Uncertain('journal:write') from None
+    finally:
+        if directory is not None:
+            os.close(directory)
 
 
 def _ensure_private(path, *, owner=None):
@@ -332,17 +366,51 @@ def _env(home):
             'SSH_ASKPASS': '/bin/false'}
 
 
-def _bounded_run(argv, *, timeout, env, cwd=None, check=True):
+def _kill_group(process):
+    """Kill the whole child session, including git/ssh descendants."""
     try:
-        result = subprocess.run(argv, cwd=cwd, env=env, capture_output=True,
-                                text=True, timeout=timeout, check=False)
+        os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+    except OSError:
+        try:
+            process.kill()
+        except OSError:
+            pass
+
+
+def _bounded_run(argv, *, timeout, env, cwd=None, check=True):
+    process = None
+    try:
+        process = subprocess.Popen(argv, cwd=cwd, env=env,
+                                   stdout=subprocess.PIPE,
+                                   stderr=subprocess.PIPE, text=True,
+                                   start_new_session=True)
+        try:
+            stdout, stderr = process.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            _kill_group(process)
+            try:
+                process.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+            raise Uncertain('command:unavailable') from None
+        except BaseException:
+            # The dispatcher's alarm or a cancellation must not leave a child
+            # or its git/ssh descendants running after an uncertain effect.
+            _kill_group(process)
+            try:
+                process.communicate(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+            raise
+    except Uncertain:
+        raise
     except (OSError, subprocess.SubprocessError):
         raise Uncertain('command:unavailable') from None
-    if len(result.stdout) > MAX_RECEIPT_BYTES or len(result.stderr) > MAX_RECEIPT_BYTES:
+    if len(stdout) > MAX_RECEIPT_BYTES or len(stderr) > MAX_RECEIPT_BYTES:
         raise Uncertain('command:output')
-    if check and result.returncode != 0:
+    if check and process.returncode != 0:
         raise Uncertain('command:failed')
-    return result
+    return subprocess.CompletedProcess(argv, process.returncode, stdout, stderr)
 
 
 class HostSystem:
@@ -508,8 +576,9 @@ class HostEffects:
             entry = self._entry(request['agent'])
         except Refused as exc:
             return self._refusal(request, str(exc))
-        if request['step'] in ('prepare', 'session') and request['account'] != entry['account']:
-            return self._refusal(request, 'account')
+        # ``request.account`` is the harness/provider account validated by the
+        # controller's hosts document; ``entry.account`` is the Unix user that
+        # owns the home and unit. They are deliberately independent.
         if request['step'] == 'revalidate':
             try:
                 self._revalidate(request, entry)
@@ -545,6 +614,9 @@ class HostEffects:
         state_path = directory / 'state.json'
         with self._locked(directory):
             state = self._state(state_path)
+            state, refusal = self._bind_lease(state, state_path, request)
+            if refusal is not None:
+                return refusal
             if request['controller_epoch'] > state['epoch']:
                 # The newer controller epoch is authoritative even for a
                 # replay: a delayed request from an older epoch is refused.
@@ -563,6 +635,26 @@ class HostEffects:
                 if not _same_effect(record['request'], request):
                     return self._refusal(request, 'request_changed')
                 stored = record['receipt']
+                if step == 'stop_source':
+                    # A stored stop receipt is not proof that the unit is
+                    # still quiet: re-observe and re-stop when it is not.
+                    try:
+                        fields = self._stop_source(request, entry)
+                    except Refused as exc:
+                        return self._refusal(request, str(exc))
+                    stored = self._receipt(request, fields)
+                    _atomic_json(receipt_path,
+                                 {'request': request, 'receipt': stored,
+                                  'at': float(self.clock())})
+                if state['last_step'] == step and state['last_ok'] is not True:
+                    # Crash after the receipt write, before the state write:
+                    # repair the order mark without replaying the effect.
+                    state = dict(state, last_ok=True)
+                    _atomic_json(state_path, state)
+                try:
+                    _unlink_private(intent_path)
+                except Uncertain:
+                    pass
                 return dict(stored, controller_epoch=request['controller_epoch'])
             if step == state['last_step']:
                 allowed = True
@@ -572,7 +664,18 @@ class HostEffects:
                 allowed = False
             if not allowed:
                 return self._refusal(request, 'order')
-            _atomic_json(intent_path, {'request': request, 'at': float(self.clock())})
+            if intent_path.exists() or intent_path.is_symlink():
+                intent = _read_private_json(intent_path)
+                stored_request = intent.get('request')
+                if not isinstance(stored_request, dict):
+                    raise Uncertain('journal:intent')
+                if not _same_effect(stored_request, request):
+                    # An uncertain effect may only be resumed with its exact
+                    # original identity and payload, never re-dispatched.
+                    return self._refusal(request, 'intent_changed')
+            else:
+                _atomic_json(intent_path,
+                             {'request': request, 'at': float(self.clock())})
             state = dict(state, epoch=request['controller_epoch'], last_step=step,
                          last_seq=sequence, last_ok=False)
             _atomic_json(state_path, state)
@@ -580,8 +683,8 @@ class HostEffects:
                 fields = self._dispatch(request, entry)
             except Refused as exc:
                 try:
-                    intent_path.unlink()
-                except OSError:
+                    _unlink_private(intent_path)
+                except Uncertain:
                     pass
                 return self._refusal(request, str(exc))
             receipt = self._receipt(request, fields)
@@ -590,10 +693,21 @@ class HostEffects:
                           'at': float(self.clock())})
             _atomic_json(state_path, dict(state, last_ok=True))
             try:
-                intent_path.unlink()
-            except OSError:
+                _unlink_private(intent_path)
+            except Uncertain:
                 pass
             return receipt
+
+    def _bind_lease(self, state, path, request):
+        """Bind the operation's source lease once, then refuse any change."""
+        lease = {'owner': request['owner'], 'lease_epoch': request['lease_epoch']}
+        if state.get('lease') is None:
+            state = dict(state, lease=lease)
+            _atomic_json(path, state)
+            return state, None
+        if state['lease'] != lease:
+            return state, self._refusal(request, 'lease_changed')
+        return state, None
 
     @contextlib.contextmanager
     def _locked(self, directory):
@@ -618,7 +732,8 @@ class HostEffects:
 
     def _state(self, path):
         if not path.exists():
-            return {'epoch': 0, 'last_step': '', 'last_seq': 0, 'last_ok': False}
+            return {'epoch': 0, 'last_step': '', 'last_seq': 0, 'last_ok': False,
+                    'lease': None}
         value = _read_private_json(path)
         if (not isinstance(value.get('epoch'), int) or isinstance(value.get('epoch'), bool)
                 or value.get('epoch') < 0
@@ -628,6 +743,16 @@ class HostEffects:
                 or value.get('last_seq') < 0
                 or not isinstance(value.get('last_ok'), bool)):
             raise Uncertain('journal:state')
+        lease = value.get('lease')
+        if lease is not None:
+            if (not isinstance(lease, dict)
+                    or set(lease) != {'owner', 'lease_epoch'}
+                    or not isinstance(lease.get('owner'), str)
+                    or not (lease['owner'] == '' or _bounded(lease['owner']))
+                    or not isinstance(lease.get('lease_epoch'), int)
+                    or isinstance(lease.get('lease_epoch'), bool)
+                    or lease['lease_epoch'] < 0):
+                raise Uncertain('journal:state')
         return value
 
     def _dispatch(self, request, entry):
@@ -650,8 +775,17 @@ class HostEffects:
         limit = MAX_SEQUENCE.get(request['state'])
         if limit is None:
             raise Refused('state')
-        directory = self.operations / request['operation']
-        current = self._state(directory / 'state.json')
+        directory = _ensure_private(self.operations / request['operation'])
+        state_path = directory / 'state.json'
+        current = self._state(state_path)
+        current, refusal = self._bind_lease(current, state_path, request)
+        if refusal is not None:
+            raise Refused('lease_changed')
+        if request['controller_epoch'] > current['epoch']:
+            current = dict(current, epoch=request['controller_epoch'])
+            _atomic_json(state_path, current)
+        elif request['controller_epoch'] < current['epoch']:
+            raise Refused('revoked_epoch')
         if current['last_seq'] > limit and not (
                 not current['last_ok']
                 and current['last_step'] == NEXT_STEP.get(request['state'])):
@@ -725,7 +859,7 @@ class HostEffects:
         expected = {'version': 1, 'agent': agent, 'harness': harness,
                     'credentials': False}
         if marker.exists():
-            if _read_private_json(marker) != expected:
+            if _read_private_json(marker, owner=self._owner(entry)) != expected:
                 raise Refused('dsh_profile')
         else:
             _atomic_json(marker, expected)
@@ -810,6 +944,15 @@ class HostEffects:
                 raise Refused('cwd') from None
             if remote_url != request['repository']:
                 raise Refused('cwd')
+            try:
+                branch = self._git(entry, cwd,
+                                   ['symbolic-ref', '--quiet', '--short', 'HEAD'])
+            except Uncertain:
+                raise Refused('branch') from None
+            if branch != request['branch']:
+                # The same commit on another branch (or a detached HEAD) is
+                # never adopted silently: the worktree must be this branch.
+                raise Refused('branch')
             if head == request['commit'] and not dirty:
                 return {'repository': request['repository'], 'branch': request['branch'],
                         'commit': request['commit'], 'clean': True, 'cwd': str(cwd)}
@@ -821,8 +964,13 @@ class HostEffects:
         if temporary.exists() or temporary.is_symlink():
             marker = temporary / '.git' / 'ameesh-handoff-intent'
             if (temporary.is_symlink() or not temporary.is_dir()
-                    or not marker.is_file() or marker.is_symlink()
-                    or marker.read_text().strip() != request['action_id']):
+                    or not marker.is_file() or marker.is_symlink()):
+                raise Refused('cwd')
+            try:
+                record = _read_private_json(marker)
+            except Refused:
+                raise Refused('cwd') from None
+            if record.get('action_id') != request['action_id']:
                 raise Refused('cwd')
             shutil.rmtree(temporary)
         keep = False
@@ -831,7 +979,7 @@ class HostEffects:
             _own(temporary, self._owner(entry))
             self._git(entry, temporary, ['init', '--quiet'])
             marker = temporary / '.git' / 'ameesh-handoff-intent'
-            marker.write_text(request['action_id'])
+            _atomic_json(marker, {'action_id': request['action_id']})
             self._git(entry, temporary,
                       ['remote', 'add', 'origin', request['repository']])
             self._git(entry, temporary,
@@ -843,7 +991,7 @@ class HostEffects:
             if self._git(entry, temporary,
                          ['status', '--porcelain', '--untracked-files=all']):
                 raise Refused('dirty')
-            marker.unlink()
+            _unlink_private(marker)
             if cwd.exists() or cwd.is_symlink():
                 raise Refused('cwd')
             os.replace(temporary, cwd)
@@ -896,7 +1044,7 @@ class HostEffects:
                     'account': request['account'], 'mode': mode,
                     'source_session': None, 'oauth_cache': False}
         if marker.exists():
-            if _read_private_json(marker) != expected:
+            if _read_private_json(marker, owner=self._owner(entry)) != expected:
                 raise Refused('session')
         else:
             _atomic_json(marker, expected)
@@ -1185,8 +1333,8 @@ class HostAdapter:
             target=_source(operation))
         if receipt.get('ok') is not True:
             return receipt
-        return {key: receipt[key] for key in
-                ('repository', 'branch', 'commit', 'remote_commit', 'clean')}
+        return dict({'ok': True}, **{key: receipt[key] for key in
+                    ('repository', 'branch', 'commit', 'remote_commit', 'clean')})
 
     def transfer(self, operation):
         try:
@@ -1204,8 +1352,8 @@ class HostAdapter:
             target=_target(operation))
         if receipt.get('ok') is not True:
             return receipt
-        return {key: receipt[key] for key in
-                ('repository', 'branch', 'commit', 'clean', 'cwd')}
+        return dict({'ok': True}, **{key: receipt[key] for key in
+                    ('repository', 'branch', 'commit', 'clean', 'cwd')})
 
     def session(self, operation):
         try:
@@ -1380,7 +1528,9 @@ class HostAdapter:
         fields = {'step': step, 'host': target, 'operation': operation['id'],
                   'action_id': operation['id'] + ':' + step,
                   'controller_epoch': operation['controller_epoch'],
-                  'agent': operation['agent']}
+                  'agent': operation['agent'],
+                  'owner': operation['plan'].get('owner') or '',
+                  'lease_epoch': operation['plan'].get('epoch')}
         fields.update(extra or {})
         return handoff_contract.validate_effect_request(fields)
 
@@ -1429,15 +1579,19 @@ def main(argv=None):
         if argv:
             raise Refused('arguments')
         signal.signal(signal.SIGALRM, expired)
+        # The alarm covers the effect, not only the stdin read: a stalled
+        # git/systemd child is killed by _bounded_run and the durable intent
+        # stays for explicit reconciliation.
         signal.alarm(SECONDS)
         data = sys.stdin.buffer.read(MAX_RECEIPT_BYTES + 1)
-        signal.alarm(0)
         if len(data) > MAX_RECEIPT_BYTES:
             raise Refused('request')
         request = json.loads(data)
         if not isinstance(request, dict):
             raise Refused('request')
-        print(json.dumps(execute(request), sort_keys=True))
+        receipt = execute(request)
+        signal.alarm(0)
+        print(json.dumps(receipt, sort_keys=True))
         return 0
     except Exception:
         signal.alarm(0)

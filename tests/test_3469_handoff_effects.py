@@ -15,6 +15,7 @@ from pathlib import Path
 import pwd
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -154,7 +155,7 @@ class RequestMixin:
     def request(self, fx, step, **changes):
         value = {'step': step, 'host': 'target', 'operation': 'a' * 32,
                  'action_id': 'a' * 32 + ':' + step, 'controller_epoch': 3,
-                 'agent': 'dev'}
+                 'agent': 'dev', 'owner': 'runner', 'lease_epoch': 7}
         if step in ('prepare', 'session'):
             value.update(harness='codex', account=fx.user)
         if step == 'prepare':
@@ -204,7 +205,8 @@ class WireContractTest(unittest.TestCase):
     def test_effect_request_is_narrow_and_normalised(self):
         value = {'step': 'prepare', 'host': 'target', 'operation': 'a' * 32,
                  'action_id': 'a' * 32 + ':prepare', 'controller_epoch': 3,
-                 'agent': 'dev', 'harness': 'deepseek', 'account': 'main',
+                 'agent': 'dev', 'owner': 'runner', 'lease_epoch': 7,
+                 'harness': 'deepseek', 'account': 'main',
                  'tools': ['gh', 'git'], 'secrets': ['z/api', 'a/api']}
         checked = handoff_contract.validate_effect_request(value)
         self.assertEqual(checked['tools'], ('gh', 'git'))
@@ -221,14 +223,16 @@ class WireContractTest(unittest.TestCase):
                         {'tools': ['/bin/sh']},
                         {'account': 'bad account'},
                         {'account': 'a@b'},
-                        {'controller_epoch': 0}):
+                        {'controller_epoch': 0},
+                        {'owner': 'bad\nowner'},
+                        {'lease_epoch': -1}):
             with self.subTest(changes=changes):
                 with self.assertRaises(handoff_contract.ContractError):
                     handoff_contract.validate_effect_request(dict(value, **changes))
 
     def test_each_effect_has_its_own_fields_and_receipt(self):
         base = {'host': 'target', 'operation': 'a' * 32, 'controller_epoch': 3,
-                'agent': 'dev'}
+                'agent': 'dev', 'owner': 'runner', 'lease_epoch': 7}
         requests = {
             'revalidate': {'state': 'planned'},
             'stop_source': {},
@@ -269,7 +273,8 @@ class WireContractTest(unittest.TestCase):
         request = handoff_contract.validate_effect_request({
             'step': 'prepare', 'host': 'target', 'operation': 'a' * 32,
             'action_id': 'a' * 32 + ':prepare', 'controller_epoch': 3,
-            'agent': 'dev', 'harness': 'deepseek', 'account': 'main',
+            'agent': 'dev', 'owner': 'runner', 'lease_epoch': 7,
+            'harness': 'deepseek', 'account': 'main',
             'tools': ['git'], 'secrets': []})
         receipt = {'host': 'target', 'action_id': 'a' * 32 + ':prepare',
                    'controller_epoch': 3, 'ok': True, 'release_revision': COMMIT,
@@ -288,7 +293,7 @@ class WireContractTest(unittest.TestCase):
         request = handoff_contract.validate_effect_request({
             'step': 'stop_source', 'host': 'target', 'operation': 'a' * 32,
             'action_id': 'a' * 32 + ':stop_source', 'controller_epoch': 3,
-            'agent': 'dev'})
+            'agent': 'dev', 'owner': 'runner', 'lease_epoch': 7})
         receipt = {'host': 'target', 'action_id': 'a' * 32 + ':stop_source',
                    'controller_epoch': 3, 'ok': True,
                    'unit': 'ameesh-runner@dev.service', 'stopped': True,
@@ -368,6 +373,36 @@ class EffectsTest(RequestMixin, unittest.TestCase):
         self.assertIs(refused['ok'], False)
         self.assertEqual(refused['reason'], 'dsh_credentials')
 
+    def test_provider_account_is_not_the_unix_user(self):
+        default = self.fx.effects.perform(self.request(self.fx, 'prepare',
+                                                       account=''))
+        self.assertIs(default['ok'], True)
+        other = self.fx.effects.perform(self.request(
+            self.fx, 'prepare', operation='b' * 32, account='provider-1'))
+        self.assertIs(other['ok'], True)
+        self.fx.effects.perform(self.request(
+            self.fx, 'transfer', operation='b' * 32))
+        session = self.fx.effects.perform(self.request(
+            self.fx, 'session', operation='b' * 32, harness='deepseek',
+            account='provider-1'))
+        self.assertIs(session['ok'], True)
+        self.assertEqual(session['mode'], 'fresh')
+        marker = (self.fx.home / '.ameesh-handoff' / 'sessions' / ('b' * 32)
+                  / 'session.json')
+        self.assertEqual(json.loads(marker.read_text())['account'], 'provider-1')
+
+    def test_local_bridge_carries_default_and_distinct_provider_accounts(self):
+        bridge = bridge_module.Bridge(local_host='target', transports={},
+                                      local=self.fx.effects)
+        for index, account in enumerate(('', 'provider-1')):
+            with self.subTest(account=account):
+                operation = ('b' if index == 0 else 'c') * 32
+                request = self.request(self.fx, 'prepare', operation=operation,
+                                       account=account)
+                receipt = bridge.perform('target', request)
+                self.assertIs(receipt['ok'], True)
+                self.assertEqual(receipt['executor_enabled'], False)
+
     def test_private_chains_refuse_a_pre_created_link(self):
         outside = self.fx.root / 'outside'
         outside.mkdir()
@@ -409,6 +444,18 @@ class EffectsTest(RequestMixin, unittest.TestCase):
         self.fx.system.fields['MemoryMax'] = str(4 * GIB)
         accepted = self.fx.effects.perform(self.request(self.fx, 'prepare'))
         self.assertIs(accepted['ok'], True)
+
+    def test_stop_source_reobserves_the_unit_on_replay(self):
+        self.fx.system.fields['ActiveState'] = 'active'
+        self.fx.system.after_stop = {'ActiveState': 'inactive'}
+        first = self.fx.effects.perform(self.request(self.fx, 'stop_source'))
+        self.assertIs(first['ok'], True)
+        self.assertEqual(self.fx.system.stops, 1)
+        self.fx.system.fields['ActiveState'] = 'active'
+        replay = self.fx.effects.perform(
+            self.request(self.fx, 'stop_source', controller_epoch=8))
+        self.assertIs(replay['ok'], True)
+        self.assertEqual(self.fx.system.stops, 2)
 
     def test_stop_source_timeout_is_uncertain(self):
         self.fx.system.fields['ActiveState'] = 'active'
@@ -494,9 +541,48 @@ class EffectsTest(RequestMixin, unittest.TestCase):
                 self.fx.effects.perform(self.request(self.fx, 'transfer'))
         temporary = list((self.fx.work).glob('.dev.handoff-*'))
         self.assertEqual(len(temporary), 1)
+        changed = self.fx.effects.perform(self.request(
+            self.fx, 'transfer', branch='other', commit='b' * 40))
+        self.assertIs(changed['ok'], False)
+        self.assertEqual(changed['reason'], 'intent_changed')
         receipt = self.fx.effects.perform(self.request(self.fx, 'transfer'))
         self.assertIs(receipt['ok'], True)
         self.assertEqual(list(self.fx.work.glob('.dev.handoff-*')), [])
+
+    def test_receipt_written_before_state_is_repaired_on_replay(self):
+        real = companion._atomic_json
+
+        def fail_state(path, value):
+            if Path(path).name == 'state.json' and value.get('last_ok') is True:
+                raise companion.Uncertain('test crash after receipt')
+            return real(path, value)
+
+        with mock.patch.object(companion, '_atomic_json',
+                               side_effect=fail_state):
+            with self.assertRaises(companion.Uncertain):
+                self.fx.effects.perform(self.request(self.fx, 'prepare'))
+        replay = self.fx.effects.perform(self.request(self.fx, 'prepare'))
+        self.assertIs(replay['ok'], True)
+        state = json.loads((self.fx.effects.operations / ('a' * 32)
+                            / 'state.json').read_text())
+        self.assertIs(state['last_ok'], True)
+        stop = self.fx.effects.perform(self.request(self.fx, 'stop_source'))
+        self.assertIs(stop['ok'], True)
+
+    def test_transfer_refuses_the_same_commit_on_another_branch_or_detached(self):
+        self.assertIs(self.fx.effects.perform(
+            self.request(self.fx, 'transfer'))['ok'], True)
+        target = self.fx.work / 'dev'
+        git('checkout', '-q', '-B', 'other', 'HEAD', cwd=target, home=self.fx.root)
+        wrong = self.fx.effects.perform(self.request(
+            self.fx, 'transfer', operation='b' * 32))
+        self.assertIs(wrong['ok'], False)
+        self.assertEqual(wrong['reason'], 'branch')
+        git('checkout', '-q', '--detach', 'HEAD', cwd=target, home=self.fx.root)
+        detached = self.fx.effects.perform(self.request(
+            self.fx, 'transfer', operation='c' * 32))
+        self.assertIs(detached['ok'], False)
+        self.assertEqual(detached['reason'], 'branch')
 
     def test_session_brief_and_fresh_have_no_oauth_cache(self):
         for harness, mode in (('codex', 'brief'), ('deepseek', 'fresh')):
@@ -554,6 +640,20 @@ class EffectsTest(RequestMixin, unittest.TestCase):
             self.request(self.fx, 'stop_source', controller_epoch=8))
         self.assertIs(replay['ok'], True)
         self.assertEqual(self.fx.system.stops, 1)
+
+    def test_a_changed_source_lease_is_refused_everywhere(self):
+        self.assertIs(self.fx.effects.perform(
+            self.request(self.fx, 'prepare'))['ok'], True)
+        for step, changes in (
+                ('revalidate', {'state': 'prepared', 'lease_epoch': 8}),
+                ('revalidate', {'state': 'prepared', 'owner': 'other'}),
+                ('stop_source', {'lease_epoch': 8}),
+                ('publish', {'owner': 'other'})):
+            with self.subTest(step=step, changes=changes):
+                receipt = self.fx.effects.perform(
+                    self.request(self.fx, step, **changes))
+                self.assertIs(receipt['ok'], False)
+                self.assertEqual(receipt['reason'], 'lease_changed')
 
     def test_a_new_earlier_effect_is_out_of_order(self):
         publish = self.fx.effects.perform(self.request(self.fx, 'publish'))
@@ -618,6 +718,62 @@ class DispatcherTest(unittest.TestCase):
         self.assertEqual(json.loads(output.getvalue()),
                          {'error': 'host_action_unavailable'})
 
+    def test_alarm_covers_the_effect_and_is_disarmed_after(self):
+        calls = []
+
+        def alarm(seconds):
+            calls.append(seconds)
+            return 0
+
+        def execute(request):
+            calls.append('execute')
+            return {'host': 'target', 'checked_ts': 0.0, 'connected': True,
+                    'tools': {}, 'secrets': {}}
+
+        stdin = __import__('io').TextIOWrapper(__import__('io').BytesIO(
+            b'{"step":"inventory","host":"target","tools":[],"secrets":[]}'))
+        output = __import__('io').StringIO()
+        with mock.patch.object(companion.signal, 'alarm', side_effect=alarm), \
+                mock.patch.object(companion, 'execute', side_effect=execute), \
+                mock.patch('sys.stdin', stdin), mock.patch('sys.stdout', output):
+            self.assertEqual(companion.main([]), 0)
+        self.assertEqual(calls, [companion.SECONDS, 'execute', 0])
+
+    def test_bounded_run_kills_the_child_group_on_timeout(self):
+        with tempfile.TemporaryDirectory() as temp:
+            pidfile = Path(temp) / 'pid'
+            script = ("import os,time; open(%r,'w').write(str(os.getpid()));"
+                      " time.sleep(5)" % str(pidfile))
+            with self.assertRaises(companion.Uncertain):
+                companion._bounded_run([sys.executable, '-c', script],
+                                       timeout=0.5,
+                                       env={'PATH': '/usr/bin:/bin'})
+            pid = int(pidfile.read_text())
+            with self.assertRaises(ProcessLookupError):
+                os.kill(pid, 0)
+
+    def test_atomic_json_refuses_a_linked_parent(self):
+        with tempfile.TemporaryDirectory() as temp:
+            real = Path(temp) / 'real'
+            real.mkdir()
+            link = Path(temp) / 'link'
+            link.symlink_to(real)
+            with self.assertRaises(companion.Uncertain):
+                companion._atomic_json(link / 'x.json', {'x': 1})
+            self.assertFalse((real / 'x.json').exists())
+
+    def test_private_marker_read_allows_the_enrolled_account(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / 'profile.json'
+            path.write_text('{}')
+            path.chmod(0o600)
+            uid, gid = os.geteuid(), os.getegid()
+            with mock.patch.object(companion.os, 'geteuid', return_value=0):
+                with self.assertRaises(companion.Refused):
+                    companion._read_private_json(path)
+                self.assertEqual(
+                    companion._read_private_json(path, owner=(uid, gid)), {})
+
 
 class BridgeTest(unittest.TestCase):
     class Transport:
@@ -671,7 +827,8 @@ class BridgeTest(unittest.TestCase):
                 'step': 'stop_source', 'host': 'target',
                 'operation': 'a' * 32,
                 'action_id': 'a' * 32 + ':stop_source',
-                'controller_epoch': 3, 'agent': 'dev'})
+                'controller_epoch': 3, 'agent': 'dev',
+                'owner': 'runner', 'lease_epoch': 7})
             transport.reply = {'host': 'target',
                                'action_id': 'a' * 32 + ':stop_source',
                                'controller_epoch': 3, 'ok': True,
@@ -706,7 +863,8 @@ class BridgeTest(unittest.TestCase):
         request = handoff_contract.validate_effect_request({
             'step': 'revalidate', 'host': 'target', 'operation': 'a' * 32,
             'action_id': 'a' * 32 + ':revalidate', 'controller_epoch': 3,
-            'agent': 'dev', 'state': 'planned'})
+            'agent': 'dev', 'owner': 'runner', 'lease_epoch': 7,
+            'state': 'planned'})
         self.assertIs(bridge.perform('target', request)['ok'], True)
         self.assertEqual(local.calls[0]['state'], 'planned')
         self.assertEqual(transport.payloads, [])
@@ -958,7 +1116,7 @@ class AdapterTest(PgTestCase):
     def test_stop_publish_transfer_and_session_return_only_proof_fields(self):
         self.assertIs(self.adapter.stop_source(self.plain('stop_source')), True)
         publish = self.adapter.publish(self.plain('publish'))
-        self.assertEqual(set(publish), {'repository', 'branch', 'commit',
+        self.assertEqual(set(publish), {'ok', 'repository', 'branch', 'commit',
                                         'remote_commit', 'clean'})
         transfer = self.adapter.transfer(self.plain(
             'transfer', evidence={'branch': 'main', 'commit': COMMIT}))
@@ -970,6 +1128,28 @@ class AdapterTest(PgTestCase):
                                    'executor_enabled': False})
         steps = [request['step'] for request in self.fake.requests]
         self.assertEqual(steps, ['stop_source', 'publish', 'transfer', 'session'])
+
+    def test_positive_adapter_receipts_pass_the_controller_proof(self):
+        operation = self.intent('prepare')
+        try:
+            prepare = self.adapter.prepare(operation)
+        finally:
+            self.finish(operation)
+        self.assertEqual(handoffs._proof('prepare', prepare, operation),
+                         {'prepared': True,
+                          'release_revision': prepare['release_revision']})
+        publish = self.adapter.publish(self.plain('publish'))
+        handoffs._proof('publish', publish, self.plain('publish'))
+        transfer = self.adapter.transfer(self.plain(
+            'transfer', evidence={'branch': 'main', 'commit': COMMIT}))
+        handoffs._proof('transfer', transfer, self.plain(
+            'transfer', evidence={'branch': 'main', 'commit': COMMIT}))
+        session = self.adapter.session(self.plain(
+            'session', evidence={'branch': 'main', 'commit': COMMIT,
+                                 'cwd': '/w/dev'}))
+        handoffs._proof('session', session, self.plain(
+            'session', evidence={'branch': 'main', 'commit': COMMIT,
+                                 'cwd': '/w/dev'}))
 
     def test_the_controller_proof_rejects_a_mismatched_receipt(self):
         operation = self.plain('publish')
@@ -1034,6 +1214,12 @@ class AdapterTest(PgTestCase):
                 self.assertEqual(row['plan']['repository'], repository)
                 self.db.execute("UPDATE host_handoffs SET state='cancelled'"
                                 " WHERE id=%s", (row['id'],))
+
+    def test_the_wire_carries_the_plan_lease_identity(self):
+        self.adapter.publish(self.plain('publish'))
+        request = self.fake.requests[-1]
+        self.assertEqual(request['owner'], self.row['plan']['owner'] or '')
+        self.assertEqual(request['lease_epoch'], self.row['plan']['epoch'])
 
     def test_plan_carries_the_exact_session_account(self):
         self.db.execute("UPDATE host_handoffs SET state='cancelled' WHERE id=%s",

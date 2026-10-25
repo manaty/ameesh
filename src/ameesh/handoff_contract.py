@@ -204,8 +204,11 @@ def validate_transport(value, host, *, root):
     return dict(value)
 
 
-#: Common fields of every host effect request.
-_COMMON_REQUEST = ("step", "host", "operation", "action_id", "controller_epoch", "agent")
+#: Common fields of every host effect request. The source lease owner and its
+#: epoch travel with the controller epoch so a host can refuse a delayed or
+#: revoked request even when the operation id and step are unchanged.
+_COMMON_REQUEST = ("step", "host", "operation", "action_id", "controller_epoch",
+                   "agent", "owner", "lease_epoch")
 #: Step-specific request fields; no request carries a command, unit or choice.
 EFFECT_FIELDS = {
     "revalidate": ("state",),
@@ -282,7 +285,9 @@ def validate_effect_request(request):
             or not isinstance(request.get("operation"), str)
             or _OPERATION_ID.fullmatch(request["operation"]) is None
             or request.get("action_id") != request["operation"] + ":" + step
-            or not _epoch(request.get("controller_epoch"), 1)):
+            or not _epoch(request.get("controller_epoch"), 1)
+            or not (request.get("owner") == "" or _bounded(request.get("owner")))
+            or not _epoch(request.get("lease_epoch"), 0)):
         raise ContractError("effect identity")
     value = {key: request[key] for key in _COMMON_REQUEST}
     if step == "revalidate":
