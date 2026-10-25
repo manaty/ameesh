@@ -377,7 +377,10 @@ identique d’un candidat à l’autre : le responsable du rôle et
 `notify.default_human` doivent y avoir un canal `ntfy` ou `slack` utilisable
 (`desktop` et `app` ne comptent pas) ; sinon `timers` et `controler`
 nomment l’humain et la raison en avertissement, sans échouer (#3402, canon
-§3 : un secret absent ne fait pas retomber le staging en arrière).
+§3 : un secret absent ne fait pas retomber le staging en arrière). Un
+candidat sans route ne porte pas la passe `alerts` : si le bail lui échoit,
+l’un des candidats routés l’exécute (#3568, `role run --pass alerts`), et
+`ameesh role status` le nomme.
 
 `controler` (`vm.sh agents controler`, `poste.sh controler`) exécute
 `ameesh role timers --check` et échoue sur une minuterie absente, désactivée,
