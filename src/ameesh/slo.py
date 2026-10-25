@@ -344,6 +344,24 @@ def hold_release_ts(events: Iterable[dict], *,
     return released
 
 
+def last_hold_release(events: Iterable[dict],
+                      hold_releases: Iterable[float] = ()) -> float | None:
+    """La dernière levée d'une retenue, d'état ou de pilote (#3555).
+
+    Une retenue d'état (`blocked`, `waiting_human`) est datée par
+    `hold_release_ts` (#2916) ; un hold explicite de pilote (#1664) par les
+    levées autorisées que l'appelant passe (`planned_waits.pilot_hold_releases`).
+    Les deux suspendent les étapes d'après le gel : le temps parqué n'est pas
+    un retard du porteur, l'horloge repart de la dernière levée. `None` sans
+    retenue levée."""
+    lifted = hold_release_ts(events)
+    for stamp in hold_releases or ():
+        value = float(stamp)
+        if lifted is None or value > lifted:
+            lifted = value
+    return lifted
+
+
 def intake_ready_ts(assigned: float | None, requested: float | None,
                     dependencies: Iterable[dict] = (), *,
                     started: float | None = None) -> float | None:
@@ -532,6 +550,15 @@ def lot_steps(item: dict, jalons: dict, events: Iterable[dict], *,
     en `build` ; `build_quiet` ne double plus cette mesure. L'alerte dit que
     le porteur porte le correctif : au niveau 3, elle ne prescrit jamais de le
     réassigner (la réassignation perd son contexte).
+
+    #3555 : une retenue (`blocked`, `waiting_human`) ou un hold explicite de
+    pilote levé (#1664) suspend aussi les étapes d'après le gel
+    (`green_verdict`, `verdict_merge` ; `blocked_freeze` l'était déjà par
+    #3333). Sous retenue, aucune ligne ne court ; hors retenue, le départ de
+    l'étape est repoussé à la dernière levée qui suit son début. Le temps
+    parqué volontairement n'est donc pas un retard imputable au porteur, et
+    un lot sans retenue garde son alerte. Une étape déjà terminée garde sa
+    durée réelle, moins la retenue qui a suivi son départ.
     """
     events = list(events)
     fixes = list(fixes or ())
@@ -623,6 +650,10 @@ def lot_steps(item: dict, jalons: dict, events: Iterable[dict], *,
         if last is not None:
             out.append(_row(step, last, now=now, critical=critical))
 
+    # #3555 : une retenue (état ou hold de pilote) suspend les étapes d'après
+    # le gel ; la dernière levée, lue une fois, repousse leur départ.
+    lifted = last_hold_release(events, hold_releases)
+
     if kind == "ok" and verdict is not None and jalons.get("verdict_current", True):
         step = step_of("verdict_merge")
         # #2919 : le p80 mesuré remplace la cible de la table sur le chemin
@@ -651,12 +682,22 @@ def lot_steps(item: dict, jalons: dict, events: Iterable[dict], *,
         if packet:
             extra["packet"] = True
         if merged is not None:
-            out.append(_row(step, verdict, now=now, critical=critical,
+            # #3555 : le temps parqué avant la fusion ne compte pas ; une
+            # fusion déjà faite garde sa durée réelle, moins la retenue.
+            start = float(verdict)
+            parked = {}
+            if lifted is not None and start < lifted <= float(merged):
+                start = lifted
+                parked["hold_released_ts"] = round(lifted, 3)
+            out.append(_row(step, start, now=now, critical=critical,
                             done_ts=round(float(merged), 3),
-                            elapsed_s=int(max(0.0, float(merged) - float(verdict))),
-                            target=target, escalate=not packet, **extra))
-        elif state not in ("merged", "promoted", "closed", "build"):
+                            elapsed_s=int(max(0.0, float(merged) - start)),
+                            target=target, escalate=not packet, **extra,
+                            **parked))
+        elif (state not in ("merged", "promoted", "closed", "build")
+              and state not in HOLDS):
             # #3487 : revenu en build, le GO ne court plus (cf. plus haut).
+            # #3555 : sous retenue, aucune ligne ne court.
             start = float(verdict)
             if outside_packet:
                 # #3341 : hors paquet, la CI de la tête gelée doit être verte
@@ -670,6 +711,9 @@ def lot_steps(item: dict, jalons: dict, events: Iterable[dict], *,
                     green = float(ci_green_ts)
                     start = max(start, green)
                     extra["ci_green_ts"] = round(green, 3)
+                    if lifted is not None and lifted > start:
+                        start = lifted
+                        extra["hold_released_ts"] = round(lifted, 3)
                     out.append(_row(step, start, now=now, critical=critical,
                                     target=target, escalate=not packet, **extra))
             else:
@@ -678,25 +722,33 @@ def lot_steps(item: dict, jalons: dict, events: Iterable[dict], *,
                     # l'horloge GO → fusion part de ce créneau, pas du GO.
                     start = float(packet_slot)
                     extra["packet_slot"] = round(start, 3)
+                if lifted is not None and lifted > start:
+                    # #3555 : la levée de retenue suit le créneau ; l'horloge
+                    # repart d'elle, le parcage n'est pas un retard.
+                    start = lifted
+                    extra["hold_released_ts"] = round(lifted, 3)
                 out.append(_row(step, start, now=now, critical=critical,
                                 target=target, escalate=not packet, **extra))
 
-    if state not in ("merged", "promoted", "closed"):
+    if state not in ("merged", "promoted", "closed") and state not in HOLDS:
         step = step_of("green_verdict")
         for review in reviews or ():
             name = str(review.get("name") or "").strip()
             since = review.get("designated_ts")
             if not name or since is None:
                 continue
-            out.append(_row(step, since, now=now, critical=critical, reviewer=name))
+            extra = {}
+            if lifted is not None and lifted > float(since):
+                # #3555 : le relecteur n'est pas relancé pour du temps parqué.
+                extra["hold_released_ts"] = round(lifted, 3)
+                since = lifted
+            out.append(_row(step, since, now=now, critical=critical,
+                            reviewer=name, **extra))
 
     if state not in ("merged", "promoted", "closed") and state not in HOLDS:
         step = step_of("blocked_freeze")
-        # #3333 : la dernière levée de retenue (état ou hold de pilote).
-        lifted = hold_release_ts(events)
-        for stamp in hold_releases or ():
-            if lifted is None or float(stamp) > lifted:
-                lifted = float(stamp)
+        # #3333 : la dernière levée de retenue (état ou hold de pilote), lue
+        # une fois pour les trois étapes d'après le gel (#3555).
         for fix in fixes or ():
             since = fix.get("blocked_ts")
             if since is None:
