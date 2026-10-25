@@ -172,7 +172,7 @@ file, never the canon:
 | `default_human` | recipient of an alert when no responsible human is found |
 | `routes` | `{"human:<id>": [channels]}` |
 | `default` | channels of a human without a route |
-| `channels` | channel settings; a channel can have any name if it carries its `type` (`"ntfy-bruno": {"type": "ntfy", …}`); `desktop` and `slack` need no declaration |
+| `channels` | channel settings; a channel can have any name if it carries its `type` (`"ntfy-bruno": {"type": "ntfy", …}`); `desktop` and `slack` need no declaration; `nexlink` always does |
 | `types` | alert types pushed (default: the five above) |
 | `interval` | seconds between two passes (else `AMEESH_NOTIFY_INTERVAL`, else 30) |
 | `rate_per_minute` | messages per human over 60 s (0 = no limit); beyond, a summary |
@@ -184,6 +184,28 @@ file, never the canon:
 | `desktop` | `notify-send` (`AMEESH_NOTIFY_SEND_BIN`, else `AMEESH_BIN_DIR/notify-send`, else the `PATH`) | `timeout` |
 | `ntfy` | `POST <url>/<topic>` | `url` (HTTPS, or HTTP on loopback), `topic`, `token_env` or `token_file` (optional) |
 | `slack` | incoming webhook | `webhook_env` (default `AMEESH_SLACK_WEBHOOK`) or `webhook_file` |
+| `nexlink` | signed `POST <url>/mesh/alerts`, end-to-end encrypted for the owner's Nexlink app (#3536) | `url` (HTTPS, or HTTP on loopback), `token_env` or `token_file` (**required**: named HMAC secret), `fallback` (declared `ntfy`/`slack` channel) |
+
+**`nexlink` channel (#3536, owner decision #138440).** The alert is encrypted
+to the account's X25519 key-wrap key (`GET /mesh/alerts/keys`, generation 1:
+AES-256-GCM under a random CEK, the CEK wrapped per active key with Nexlink's
+`wrapToX25519` format, subject `meshAlert = 5`), so the hub only stores
+`{v, alert_id, event, severity, occurred_at, ciphertext, nonce, wraps}`. With
+no active key the alert is sent **content-free** (`content_free: true`) and the
+app opens the console. Requests are signed with
+`X-Mesh-Key-Id` (`AMEESH_NEXLINK_KEY_ID`, default `ameesh-v1`),
+`X-Mesh-Timestamp` and `X-Mesh-Signature: v1=HMAC-SHA-256(...)` over
+`key_id "\n" timestamp "\n" body`; `X-Mesh-Idempotency-Key` is `alert_id` for a
+raised alert and `alert_id:resolved` for a resolution. 401/400/404/422 are
+permanent, 429/5xx are retried, 409 `key_unknown` refreshes the keys once.
+On the second consecutive failure (or at once on a permanent error) the text
+is sent once per alert to the `fallback` channel, prefixed
+`repli nexlink —`; the primary keeps being retried and a fallback success is
+not a Nexlink delivery. `ameesh notify --test` prints the read receipt
+(`GET /mesh/alerts/{id}`). The `cryptography` extra is required
+(`pip install 'ameesh[crypto]'`). ntfy stays the transition channel and is
+removed only after 7 green days in production **and** a real urgent alert read
+with the app closed.
 
 **Secrets are never in the configuration.** A `token`, `webhook`, `password`,
 `secret` key, or the `url` of a Slack channel, is refused (exit 2). The
