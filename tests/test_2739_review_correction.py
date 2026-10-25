@@ -63,9 +63,12 @@ class SelectFixerTest(TestCase):
                         families=FAMILIES,
                         fixers=[{"name": "cx2", "family": "codex"}])
         # #2888: codex is the corrector's family, an author's family; only
-        # claude remains and cannot cover two distinct-family opinions.
+        # claude remains and cannot cover two distinct-family opinions. #3596
+        # provides the available seat at once and waits for the missing one.
         self.assertEqual(out["state"], rd.WAITING, out)
-        self.assertEqual(out["reviewers"], [])
+        self.assertEqual([row["name"] for row in out["reviewers"]], ["dev1"])
+        self.assertEqual(out["missing"], 1)
+        self.assertIn("1 independent review missing", out["why"])
         self.assertIn("forbidden codex, deepseek", out["why"])
 
 
