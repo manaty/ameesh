@@ -9,7 +9,7 @@ import time
 import unittest
 from unittest.mock import patch
 
-from ameesh import backlog, db as db_mod, notify, storage, work
+from ameesh import backlog, db as db_mod, mail, notify, storage, work
 from ameesh.storage.postgres.work import WorkItems
 
 from .support import hold_for_owner
@@ -286,6 +286,10 @@ class PriseDeLotTest(_Lots):
         payload = mails[1]["payload"]
         payload = json.loads(payload) if isinstance(payload, str) else payload
         self.assertEqual(payload["lot_take"]["team"], "nexlink")
+        # #3451 : l'avis au pilote n'attend aucun geste, il ne réveille pas ;
+        # le message au preneur, lui, réveille
+        self.assertEqual(mail.passive_reason(mails[1]), "info")
+        self.assertEqual(mail.passive_reason(mails[0]), "")
         notes = [e["note"] for e in work.events(self.db, lot["id"])]
         self.assertTrue(any(n.startswith(backlog.LOT_TAKE_NOTE) for n in notes))
         # la prise d'un lot ne mange pas le débit de la file d'amélioration

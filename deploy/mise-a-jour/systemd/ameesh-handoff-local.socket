@@ -1,0 +1,15 @@
+[Unit]
+Description=Typed local handoff endpoint (H8)
+
+[Socket]
+ListenStream=/run/ameesh-handoff/local.sock
+Accept=yes
+SocketUser=root
+SocketGroup=ameesh
+SocketMode=0660
+DirectoryMode=0755
+MaxConnections=8
+RemoveOnStop=yes
+
+[Install]
+WantedBy=sockets.target

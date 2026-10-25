@@ -109,6 +109,18 @@ A lot is stale when it is open and inactive beyond the configured threshold
   [the work plan](PLAN-DE-TRAVAIL.md)): the proven content lifts them and the
   merge note records the lift.
 
+  #3498 : a hold written by a pilot may name its **external executor** and
+  the gesture expected — `hold: attente bureau : <geste>` or `hold: attente
+  owner : <geste>` (`attente externe (bureau)`, `attente du bureau` are read
+  too). An optional deadline `(due 2026-10-25 12:00 UTC)` or `(échéance …)`,
+  before or after the gesture, bounds the reminder; without one, `ameesh
+  debit` reminds after its threshold. The debit puts such a hold in
+  `external_waits` with its executor (bureau or owner), not in `slow_waits`,
+  and `--check` does not fire on it, even when the reminder is due: the
+  report repeats the reminder to the bureau/owner (§10). A non-pilot hold
+  that carries the declaration is not external — it stays a plain agent wait
+  and the debit says so in `unreadable`.
+
 Grouped views (`work list`, `progress --json`, the stale alert, the dependency
 labels) read the hold from a targeted storage stream
 (`Progress.lot_hold_events`: state transitions plus the `hold:`/lift notes,
@@ -208,12 +220,19 @@ min, not 15 —; the ×2/×3 thresholds apply to it. A unit declared by an
 open packet has no escalation target of its own — the packet composer or the
 pilot carries the merge (canon §9, owner decision #103509 option a, home#147).
 A `packet-exception incident|unblock sha=… reason=…` declared for the current
-head takes the lot out of the packet: the table target (30 min; 15 min in P1)
-runs from `max(GO, CI green on that exact head)` (#3341) and the escalation
-applies. The green is read from the tracked run (`ci_runs`, the notifier's
-reading) on the frozen head — never assumed; a head with no green yet (absent,
-still running, cancelled) or with a red run starts no `verdict_merge` clock at
-all, so no alert asks for a merge the CI has not cleared.
+head normally takes the lot out of the packet: the table target (30 min; 15 min
+in P1) runs from `max(GO, CI green on that exact head)` (#3341) and the
+escalation applies. The green is read from the tracked run (`ci_runs`, the
+notifier's reading) on the frozen head — never assumed; a head with no green yet
+(absent, still running, cancelled) or with a red run starts no `verdict_merge`
+clock at all, so no alert asks for a merge the CI has not cleared.
+
+When the lot is nevertheless carried by an open packet — its manifest or its
+composition trailers name it with its head — the packet wins (#3487): the
+`verdict_merge` clock starts at the packet slot (#2335) and uses the packet CI's
+p80 (30-minute fallback), and an escalation names the packet and the state of
+its full CI instead of prescribing a reassignment of the holder. The lot merges
+with the packet; reassigning it cannot advance that merge.
 
 `planned_wait` is null when no explicit wait applies. While it applies,
 `stale` is null and no `stale_lot` is raised, so the notifier also stops its

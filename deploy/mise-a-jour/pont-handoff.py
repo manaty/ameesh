@@ -10,8 +10,8 @@ and sends one typed handoff request to that host's pinned
 ``hote-handoff.py`` executor. The release controller, its operations, its
 database and its restart authority are never loaded.
 
-A local effect is dispatched to the same pinned ``HostEffects`` object without
-SSH, so the host journal and the receipt shape are identical. A transport
+A local effect crosses the fixed H8 Unix socket to the root-pinned
+``HostEffects`` executor; the runner never acquires its privileges. A transport
 failure is ambiguous and raises: the controller keeps its durable intent and
 the next pass reconciles the same effect instead of repeating it blind.
 """
@@ -23,12 +23,16 @@ import json
 import os
 from pathlib import Path
 import stat
+import socket
+import struct
 
 from ameesh import handoff_contract
 
 ENROLLMENT_ROOT = Path('/etc/ameesh-handoff')
 TRANSPORT_NAME = 'transport-release.py'
 MAX_REQUEST_BYTES = 65536
+LOCAL_SOCKET = "/run/ameesh-handoff/local.sock"
+LOCAL_SECONDS = 90  # includes seal lock + full measurement + request + systemd stop
 
 
 class BridgeError(ValueError):
@@ -46,6 +50,64 @@ def _trusted_file(path):
             or info.st_uid not in (0, os.geteuid()) or info.st_mode & 0o022):
         raise BridgeError('source')
     return path
+
+
+class LocalDispatcher:
+    """Kernel-authenticated fixed Unix endpoint; no local in-process effects."""
+
+    def inventory(self, request):
+        return self._exchange(request)
+
+    def perform(self, request):
+        return self._exchange(request)
+
+    def _exchange(self, request):
+        payload = json.dumps(request, sort_keys=True, separators=(',', ':')).encode()
+        if len(payload) > MAX_REQUEST_BYTES:
+            raise BridgeError('request')
+        try:
+            # The path and its parent must belong to root, never the runner.
+            for path in (Path('/run'), Path(LOCAL_SOCKET).parent):
+                info = path.lstat()
+                if (not stat.S_ISDIR(info.st_mode) or info.st_uid != 0
+                        or info.st_mode & 0o022):
+                    raise BridgeError('local')
+            info = Path(LOCAL_SOCKET).lstat()
+            if not stat.S_ISSOCK(info.st_mode) or info.st_uid != 0:
+                raise BridgeError('local')
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as channel:
+                channel.settimeout(LOCAL_SECONDS)
+                channel.connect(LOCAL_SOCKET)
+                _, uid, _ = struct.unpack('3i', channel.getsockopt(
+                    socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize('3i')))
+                if uid != 0:
+                    raise BridgeError('local_peer')
+                channel.sendall(payload)
+                channel.shutdown(socket.SHUT_WR)
+                data = bytearray()
+                while True:
+                    chunk = channel.recv(min(8192, MAX_REQUEST_BYTES + 1 - len(data)))
+                    if not chunk:
+                        break
+                    data.extend(chunk)
+                    if len(data) > MAX_REQUEST_BYTES:
+                        raise BridgeError('receipt')
+                def unique(pairs):
+                    result = {}
+                    for key, value in pairs:
+                        if key in result:
+                            raise BridgeError('receipt')
+                        result[key] = value
+                    return result
+                receipt = json.loads(data, object_pairs_hook=unique)
+                if not isinstance(receipt, dict):
+                    raise BridgeError('receipt')
+                return receipt
+        except BridgeError:
+            raise
+        except Exception:
+            # A broken channel can follow a completed effect: never retry here.
+            raise BridgeError('local') from None
 
 
 class Bridge:

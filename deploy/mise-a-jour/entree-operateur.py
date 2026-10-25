@@ -129,7 +129,7 @@ def enrolled_probe(turn, *, db, plan):
     return attested
 
 
-def destinations(*, plan, account_ids, probe_turn=None):
+def destinations(*, plan, account_ids, probe_turn=None, runtime_seal=None):
     """Exact reviewed destinations the host inventory must cover, sorted.
 
     Rendering is pure: this is the same canonical inventory `prepare()` signs,
@@ -138,6 +138,9 @@ def destinations(*, plan, account_ids, probe_turn=None):
     enrollment=None
     if probe_turn is not None:
         enrollment={TURN:canonical(probe_document(probe_turn))}
+    if runtime_seal is not None:
+        enrollment=dict(enrollment or {})
+        enrollment[delegation.SEAL_DOCUMENT]=canonical(runtime_seal)
     try:
         review=delegation.render(plan,account_ids=account_ids,enrollment=enrollment)
     except delegation.DelegationError:
@@ -145,7 +148,7 @@ def destinations(*, plan, account_ids, probe_turn=None):
     return sorted(review['files'])
 
 
-def previous_files(observed, *, plan, account_ids, probe_turn=None):
+def previous_files(observed, *, plan, account_ids, probe_turn=None, runtime_seal=None):
     """Exact reviewed prior state of every destination (None: absent).
 
     `observed` is the host inventory produced by the enrolled administrator
@@ -153,7 +156,7 @@ def previous_files(observed, *, plan, account_ids, probe_turn=None):
     these values against the live files before its first replacement, so a
     stale or partial report cannot authorize a write.
     """
-    expected=destinations(plan=plan,account_ids=account_ids,probe_turn=probe_turn)
+    expected=destinations(plan=plan,account_ids=account_ids,probe_turn=probe_turn,runtime_seal=runtime_seal)
     if not isinstance(observed,dict) or set(observed)!=set(expected):
         raise OperatorError('exact host file inventory required')
     prior={}
@@ -173,7 +176,7 @@ def previous_files(observed, *, plan, account_ids, probe_turn=None):
 
 
 def prepare(*, operation, plan, account_ids, trees, observed, probe_turn=None, expires_at,
-            db=None):
+            db=None, runtime_seal=None):
     """Assemble the exact signed bundle; no host effect and no chosen path.
 
     `trees` names the staged `runtime` and `sources` trees: both are measured
@@ -195,6 +198,9 @@ def prepare(*, operation, plan, account_ids, trees, observed, probe_turn=None, e
     if probe_turn is not None:
         turn=probe_document(probe_turn)
         enrollment={TURN:canonical(turn)}
+    if runtime_seal is not None:
+        enrollment=dict(enrollment or {})
+        enrollment[delegation.SEAL_DOCUMENT]=canonical(runtime_seal)
     try:
         template=delegation.render(plan,account_ids=account_ids,enrollment=enrollment)
     except delegation.DelegationError:
@@ -212,7 +218,7 @@ def prepare(*, operation, plan, account_ids, trees, observed, probe_turn=None, e
             raise OperatorError('staged '+name+' tree unavailable') from None
         if digest!=pinned[field]:
             raise OperatorError('staged '+name+' tree does not match the pinned digest')
-    prior=previous_files(observed,plan=pinned,account_ids=account_ids,probe_turn=turn)
+    prior=previous_files(observed,plan=pinned,account_ids=account_ids,probe_turn=turn,runtime_seal=runtime_seal)
     try:
         bundle=delegation.render(pinned,account_ids=account_ids,previous_files=prior,
                                  enrollment=enrollment)

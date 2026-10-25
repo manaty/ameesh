@@ -497,7 +497,7 @@ class PgTestCase(unittest.TestCase):
         self.db.execute(
             "TRUNCATE agent_registry, key_holders, key_events, agent_mailbox, mesh_approvals, "
             "work_items, work_item_events, work_item_milestones, work_packages, "
-            "thread_index, notify_liveness, notify_briefs "
+            "thread_index, notify_liveness, notify_briefs, estimate_references "
             "RESTART IDENTITY CASCADE")
         shutil.rmtree(self.tmp, ignore_errors=True)
         os.makedirs(self.tmp, exist_ok=True)

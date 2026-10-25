@@ -1,33 +1,48 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: AGPL-3.0-only
-"""#3251 — l'agrégat requis `tests` distingue une annulation interne d'un échec.
+"""#3449 — l'agrégat requis `tests` n'accorde pas un vert sans les parts Linux.
 
 Décision owner #128512 (signée le 23/10/2026, option a) : « Agrégat requis
 jamais conclu = preuve absente, donc bloquant […]. Les non-concluants à
 l'intérieur d'un agrégat qui a conclu restent non bloquants (§3). »
 
-Avant ce lot, l'étape « bilan des parts » exigeait `success` de chaque job
-interne : une annulation de capacité (job hébergé jamais pris, runner perdu)
-rougissait le check requis `tests`, donc le paquet et la release, alors que
-le canon §3 range une panne d'infra dans les non-concluants. #940 interdit
-la correction inverse — un `tests` SUCCESS muet avec une part annulée : le
-check requis ne doit jamais verdir sans le dire.
+#3251 avait lu cette décision comme « au moins une part réussie suffit » : un
+run annulé où seuls la part macOS (2 min) et l'agrégat concluaient a publié
+`tests` SUCCESS alors que les 8 psycopg et les 16 psql étaient annulés (run
+40144843565, paquet h-13, fusionné sans suite Linux). #3449 revient au texte
+de #128512 : « les parts annulées ou expirées restent bloquantes ». Une
+part **Linux planifiée** annulée, expirée, absente ou en échec rougit donc
+l'agrégat, même si les 15 autres ont réussi ; seuls les non-concluants
+**à l'intérieur d'un test individuel** sont neutres. Le commentaire de
+#3251 qui élargissait #128512 est justement le maillon qui a laissé passer
+h-13.
 
-Ce script sépare donc les deux :
+Ce script sépare donc trois cas :
 
 * un **échec** (`failure`, ou une part sautée qui devait tourner) est un
   négatif : l'agrégat conclut rouge (code retour 1) ;
-* une **annulation interne** (`cancelled`, `timed_out`, `startup_failure`,
-  `stale`, `action_required`) est un non concluant : l'agrégat conclut vert
-  s'il garde **au moins une part réussie** — il a conclu — et publie le
-  check de détail `tests (bilan des parts)` en `neutral`, avec la part et son
-  état. `fire` et `radar` le consignent (lot de correction #3209) sans
-  retenir le paquet ni la release. Le détail est aussi écrit en annotation
-  `::warning::`, jamais muet. Si **aucune** part due n'a réussi (toutes
-  annulées ou sautées), c'est l'absence de toute preuve : l'agrégat rougit
-  (décision #128512, #940).
+* une **famille Linux planifiée** (`psycopg`, `psql` avec au moins une part)
+  qui a une part annulée, expirée, absente ou en échec est un manque :
+  l'agrégat conclut rouge (code retour 1) et le détail la nomme. Si toutes
+  ses parts sont non concluantes et qu'aucune n'a réussi, c'est une preuve
+  absente (même rouge) : c'est le cas du run annulé de h-13, macOS vert,
+  0/8 psycopg et 0/16 psql réussies. Les jobs du run sont lus par l'API
+  (`actions: read`) parce que `needs.psycopg.result` vaut `cancelled` dès
+  qu'une part l'est, sans dire combien ont réussi ;
+* une **annulation d'une part non requise** (macOS, autre système de
+  fichiers) reste un non concluant : l'agrégat conclut vert s'il garde la
+  preuve Linux, et publie le check de détail en `neutral`, avec la part et
+  son état. `fire` et `radar` le consignent (lot de correction #3209) sans
+  retenir le paquet ni la release — canon §3. Le détail est aussi écrit en
+  annotation `::warning::`, jamais muet. Si **aucune** part due n'a réussi
+  (toutes annulées ou sautées), c'est l'absence de toute preuve : l'agrégat
+  rougit (décision #128512, #940).
 * un **run annulé** ne conclut pas : l'étape `if: cancelled()` du workflow
-  échoue explicitement avant le bilan, et le check requis reste rouge.
+  échoue explicitement avant le bilan, et une famille Linux sans part
+  réussie est vue par la classification (`needs.*.result` et jobs du run),
+  pas seulement par cette garde — un job `always()` démarré après
+  l'annulation du run ne voit pas toujours `cancelled()` (#3449, run
+  40144843565).
 
 Le check de détail est publié à **chaque** exécution (vert quand toutes les
 parts ont conclu) : une tentative ultérieure sur la même tête remplace ainsi
@@ -42,12 +57,12 @@ jamais un vert silencieux.
 
 Usage (étape « bilan des parts » de .github/workflows/tests.yml) :
 
-    scripts/ci-agregat.py --event pull_request --plan success \
+    scripts/ci-agregat.py --event pull_request --run-id 123 --plan success \
         --version success --version-only false --docs-only false \
         --doc-readers skipped \
         --psycopg success --psycopg-parts '[1, 2]' \
-        --psql cancelled --psql-parts '[1]' \
-        --plateforme-macos success --autre-fs skipped --publish
+        --psql success --psql-parts '[1]' \
+        --plateforme-macos cancelled --autre-fs skipped --publish
 
 Sans `--publish` (tests locaux), la classification seule est rendue.
 """
@@ -71,6 +86,7 @@ NON_CONCLUSIVE = ("cancelled", "timed_out", "startup_failure", "stale",
 #: état d'une part
 GREEN = "green"
 RED = "red"
+MISSING = "missing"
 INCONCLUSIVE = "inconclusive"
 
 
@@ -101,28 +117,119 @@ def _json_list(text) -> list | None:
     return value if isinstance(value, list) else None
 
 
+def _family_jobs(jobs, family: str) -> list:
+    """Les jobs d'une famille (`psycopg 1/8`, `psql 1/16`) parmi les jobs lus.
+
+    Appelée par `paquet.yml`, `tests.yml` est un workflow réutilisable : l'API
+    préfixe le nom de chaque job appelé par celui du job appelant
+    (`suite complète du paquet / psycopg 1/8`). On lit donc la feuille après
+    le dernier ` / `, sans dépendre du préfixe."""
+    prefix = family + " "
+    return [job for job in (jobs or []) if isinstance(job, dict)
+            and str(job.get("name", "")).rsplit(" / ", 1)[-1].startswith(prefix)]
+
+
+def _job_stats(jobs, expected):
+    """Les comptes d'une famille, ou None si ses jobs sont illisibles.
+
+    `jobs` est la liste des jobs du run (`name`, `status`, `conclusion`),
+    `expected` le nombre de parts du plan (les jobs jamais démarrés ne sont
+    pas toujours listés). Une liste vide est une lecture valide : zéro part
+    réussie, toutes les parts planifiées absentes. Tout job dont la
+    conclusion n'est ni `success` ni non concluante (`cancelled`,
+    `timed_out`…) est un échec individuel : une famille `cancelled` qui cache
+    un `failure` ne doit jamais verdir (B2 de cx3/dev1). Une part planifiée
+    absente de la lecture n'est pas une preuve non plus (B3 de cx2), et une
+    part annulée ou expirée reste bloquante (prémisse de #128512, pilote
+    25/10 01:55)."""
+    if jobs is None:
+        return None
+    rows = [job for job in jobs if isinstance(job, dict)]
+    conclusions = [_state(job.get("conclusion")) for job in rows]
+    successes = sum(1 for value in conclusions if value == "success")
+    failures = sum(1 for value in conclusions
+                   if value != "success" and value not in NON_CONCLUSIVE)
+    nonconclusive = sum(1 for value in conclusions if value in NON_CONCLUSIVE)
+    planned = int(expected or 0)
+    total = max(planned, len(rows))
+    absent = max(0, planned - len(rows))
+    return {"success": successes, "total": total, "failure": failures,
+            "absent": absent, "nonconclusive": nonconclusive}
+
+
 def classify(*, event, plan, version, version_only, docs_only, doc_readers,
              psycopg, psycopg_parts, psql, psql_parts,
-             platform_macos=None, fs_class=None) -> dict:
-    """Classe l'agrégat sans réseau : `{state, red, consigned, parts}`.
+             platform_macos=None, fs_class=None,
+             psycopg_jobs=None, psql_jobs=None) -> dict:
+    """Classe l'agrégat sans réseau : `{state, red, missing, consigned, parts}`.
 
-    `state` vaut `green` quand l'agrégat a conclu avec au moins une part
-    réussie (même avec des annulations internes), `red` sur un négatif ou
-    quand aucune part due n'a réussi. `red` liste les manques prouvés,
-    `consigned` les parts non concluantes (dans l'ordre du workflow), `parts`
-    le détail de chaque part exigée (pour le check publié)."""
+    `state` vaut `green` quand la preuve Linux est acquise (chaque famille
+    planifiée garde au moins une part réussie), `red` sur un négatif ou une
+    preuve absente. `red` liste les négatifs prouvés, `missing` les familles
+    Linux planifiées sans aucune part réussie (et l'absence de toute part
+    réussie), `consigned` les annulations des parts **non requises** (macOS,
+    autre système de fichiers, dans l'ordre du workflow), `parts` le détail
+    de chaque part exigée (pour le check publié).
+
+    `psycopg_jobs` / `psql_jobs` sont les jobs du run lus par l'API : une
+    part Linux planifiée annulée, expirée, absente ou en échec rougit la
+    famille, même si les 15 autres ont réussi (15/16 = rouge, #128512).
+    Sans jobs lisibles, une famille non concluante est une preuve absente
+    (jamais un vert sur une lecture manquante)."""
     red: list[str] = []
+    missing: list[str] = []
     consigned: list[dict] = []
     parts: list[dict] = []
 
-    def add(name: str, result, parts_text: str, *, skipped_ok: bool) -> None:
+    def add(name: str, result, parts_text: str, *, skipped_ok: bool,
+            required: bool, jobs=None, expected=None) -> None:
         value = _state(result)
         row = {"part": name, "result": value or "absent", "parts": parts_text}
         if value == "success":
             row["status"] = GREEN
         elif value in NON_CONCLUSIVE:
-            row["status"] = INCONCLUSIVE
-            consigned.append(row)
+            stats = _job_stats(jobs, expected) if required else None
+            if stats is not None:
+                row["success"] = stats["success"]
+            if not required:
+                row["status"] = INCONCLUSIVE
+                consigned.append(row)
+            elif stats is None:
+                # Jobs illisibles : jamais un vert sur une lecture manquante.
+                row["status"] = MISSING
+                missing.append("%s (%s, preuve absente : jobs du run "
+                               "illisibles)" % (name, value))
+            elif stats["failure"] or stats["absent"] or stats["nonconclusive"]:
+                # B2/B3 et #128512 : un échec individuel, une part planifiée
+                # absente, ou une part planifiée annulée/expirée restent
+                # bloquants. Toutes les parts non concluantes et aucune
+                # réussie = preuve absente (cas h-13).
+                gaps = []
+                if stats["failure"]:
+                    gaps.append("%d/%d part(s) en échec"
+                                % (stats["failure"], stats["total"]))
+                if stats["absent"]:
+                    gaps.append("%d/%d part(s) planifiée(s) absente(s)"
+                                % (stats["absent"], stats["total"]))
+                if stats["nonconclusive"]:
+                    gaps.append("%d/%d part(s) annulée(s) ou non concluante(s)"
+                                % (stats["nonconclusive"], stats["total"]))
+                if (stats["success"] == 0 and not stats["failure"]
+                        and not stats["absent"]):
+                    row["status"] = MISSING
+                    missing.append("%s (%s, 0/%d part(s) réussie(s), preuve "
+                                   "absente)" % (name, value, stats["total"]))
+                else:
+                    row["status"] = RED
+                    red.append("%s (%s, famille %s)"
+                               % (name, ", ".join(gaps), value))
+            else:
+                # Toutes les parts lues sont vertes, mais la famille ne
+                # conclut pas (run annulé après les parts) : pas un vert.
+                row["status"] = RED
+                red.append("%s (%s, famille non concluante malgré %d/%d "
+                           "part(s) verte(s))"
+                           % (name, value, stats["success"], stats["total"]))
         elif value == "skipped" and skipped_ok:
             # un saut prévu par le plan n'a rien à consigner
             row["status"] = GREEN
@@ -155,40 +262,54 @@ def classify(*, event, plan, version, version_only, docs_only, doc_readers,
     # L157 : une PR qui ne change que le numéro de version a déjà été validée
     # sur main ; aucune part ne tourne. L161a : ses lecteurs déclarés seulement.
     if _flag(version_only) and not red:
-        return {"state": GREEN, "red": [], "consigned": [], "parts": []}
+        return {"state": GREEN, "red": [], "missing": [], "consigned": [],
+                "parts": []}
     if _flag(docs_only):
         readers = _state(doc_readers)
         if readers != "success":
             red.append("doc-readers (%s)" % (readers or "absent"))
         if not red:
-            return {"state": GREEN, "red": [], "consigned": [], "parts": []}
+            return {"state": GREEN, "red": [], "missing": [], "consigned": [],
+                    "parts": []}
 
-    add("psycopg", psycopg, str(psycopg_parts or "").strip(), skipped_ok=False)
-    # psql n'a pas de part quand le plan n'en a sélectionné aucune : c'est le
-    # seul saut légitime. Une liste absente ou illisible ne l'est jamais.
+    # #3449 : psycopg est toujours planifiée (les voies version/doc sont
+    # sorties plus haut) ; un job sauté, absent ou sans part réussie y est un
+    # manque. psql n'est requise que si le plan sélectionne des parts : une
+    # liste explicitement vide (`[]`) est son seul saut légitime.
+    psycopg_expected = len(_json_list(psycopg_parts) or [])
+    psql_expected = len(_json_list(psql_parts) or [])
+    add("psycopg", psycopg, str(psycopg_parts or "").strip(),
+        skipped_ok=False, required=True,
+        jobs=psycopg_jobs, expected=psycopg_expected)
     add("psql", psql, str(psql_parts or "").strip(),
-        skipped_ok=(_json_list(psql_parts) == []))
+        skipped_ok=(_json_list(psql_parts) == []),
+        required=(_json_list(psql_parts) != []),
+        jobs=psql_jobs, expected=psql_expected)
     if platform_macos is not None:
         # L68b (#3026) : le job court macOS entre dans les needs de `tests` ;
-        # son annulation est une annulation interne comme les autres.
-        add("plateforme macOS", platform_macos, "", skipped_ok=False)
+        # son annulation reste une annulation interne : la preuve Linux suffit
+        # (#3449).
+        add("plateforme macOS", platform_macos, "", skipped_ok=False,
+            required=False)
     if fs_class is not None:
         # #748 : la part « autre système de fichiers » ne tourne qu'à la
         # release (ou à la main) ; sautée ailleurs, elle n'a rien à prouver.
-        add("autre système de fichiers", fs_class, "", skipped_ok=True)
+        add("autre système de fichiers", fs_class, "", skipped_ok=True,
+            required=False)
 
     # Décision #128512 : « agrégat requis jamais conclu = preuve absente, donc
-    # bloquant ». L'agrégat peut tolérer un non-concluant **à l'intérieur**
-    # d'un agrégat qui a conclu, mais il lui faut au moins une part qui a
-    # prouvé quelque chose : toutes les parts annulées (ou sautées) sont
-    # l'absence de toute preuve, et #940 reste fermé (jamais de tests SUCCESS
-    # sans test). Le saut légitime de psql (aucune part) ne compte pas comme
-    # preuve : un autre job doit avoir conclu.
-    if parts and not any(row["result"] == "success" for row in parts):
-        red.append("aucune part n'a conclu (preuve absente)")
+    # bloquant ». #3449 : une famille Linux sans part réussie est déjà une
+    # preuve absente ci-dessus ; ici on ferme le cas où **aucune** part due
+    # n'a réussi (toutes annulées ou sautées), y compris si seules des parts
+    # non requises ont conclu — #940 reste fermé (jamais de tests SUCCESS
+    # sans test).
+    if parts and not any(
+            (row["status"] == GREEN and row["result"] == "success")
+            or row.get("success", 0) > 0 for row in parts):
+        missing.append("aucune part n'a conclu (preuve absente)")
 
-    return {"state": RED if red else GREEN, "red": red,
-            "consigned": consigned, "parts": parts}
+    return {"state": RED if red or missing else GREEN, "red": red,
+            "missing": missing, "consigned": consigned, "parts": parts}
 
 
 def _summary(event: str, parts: list[dict], result: dict) -> str:
@@ -204,6 +325,10 @@ def _summary(event: str, parts: list[dict], result: dict) -> str:
         lines.append("Non concluant (non bloquant, canon §3 ; lot de correction "
                      "ouvert par fire/radar) : %s."
                      % ", ".join(row["part"] for row in result["consigned"]))
+    if result["missing"]:
+        lines.append("")
+        lines.append("Preuve absente (bloquant, décision #128512, #3449) : %s."
+                     % ", ".join(result["missing"]))
     if result["red"]:
         lines.append("")
         lines.append("Négatif prouvé (bloquant) : %s." % ", ".join(result["red"]))
@@ -225,6 +350,47 @@ class GitHub:
 
     def ready(self) -> bool:
         return bool(self.jeton and self.depot and self.tete)
+
+    def jobs(self, run_id) -> list[dict]:
+        """Les jobs du run (parts comprises), lus par l'API Actions.
+
+        `actions: read` est accordé au job `tests` ; une lecture impossible ou
+        tronquée lève `AgregatError` — le classifieur retombe alors sur une
+        preuve absente pour une famille annulée, jamais un vert muet."""
+        if not self.ready():
+            raise AgregatError("no token, repository or head: the run jobs "
+                              "cannot be read")
+        if not str(run_id).isdigit() or int(run_id) <= 0:
+            raise AgregatError("run jobs: invalid run id %r" % (run_id,))
+        request = urllib.request.Request(
+            "%s/repos/%s/actions/runs/%s/jobs?per_page=100&filter=latest"
+            % (self.api, self.depot, int(run_id)),
+            headers={"Authorization": "Bearer %s" % self.jeton,
+                     "Accept": "application/vnd.github+json",
+                     "X-GitHub-Api-Version": "2022-11-28"})
+        try:
+            with urllib.request.urlopen(request, timeout=20) as response:
+                body = json.loads(response.read().decode("utf-8") or "{}")
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", "replace")[:300]
+            raise AgregatError("run jobs: HTTP %d %s" % (exc.code, detail)) from exc
+        except (urllib.error.URLError, OSError, ValueError) as exc:
+            raise AgregatError("run jobs: %s" % exc) from exc
+        if (not isinstance(body, dict)
+                or type(body.get("total_count")) is not int
+                or not isinstance(body.get("jobs"), list)
+                or body["total_count"] != len(body["jobs"])
+                or body["total_count"] >= 100):
+            raise AgregatError("run jobs: malformed, truncated or wrong response")
+        rows = []
+        for job in body["jobs"]:
+            if (not isinstance(job, dict) or not isinstance(job.get("name"), str)
+                    or not job["name"]):
+                raise AgregatError("run jobs: invalid job")
+            rows.append({"name": job["name"],
+                         "status": job.get("status") or "",
+                         "conclusion": job.get("conclusion") or ""})
+        return rows
 
     def create(self, name: str, conclusion: str, title: str, summary: str) -> int:
         """Publie le check de détail sur la tête poussée ; l'identifiant rendu."""
@@ -261,7 +427,8 @@ class GitHub:
 
 def _parse(argv=None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="bilan des parts de l'agrégat requis « tests » (#3251)")
+        description="bilan des parts de l'agrégat requis « tests » "
+                    "(#3251, #3449)")
     parser.add_argument("--event", default="")
     parser.add_argument("--plan", default="")
     parser.add_argument("--version", default="")
@@ -274,13 +441,22 @@ def _parse(argv=None) -> argparse.Namespace:
     parser.add_argument("--psql-parts", default="")
     parser.add_argument("--plateforme-macos", dest="platform_macos", default=None)
     parser.add_argument("--autre-fs", dest="fs_class", default=None)
+    parser.add_argument("--run-id", default=os.environ.get("GITHUB_RUN_ID", ""),
+                        help="run dont lire les jobs (défaut : GITHUB_RUN_ID)")
     parser.add_argument("--publish", action="store_true",
                         help="publier le check de détail sur la tête poussée")
     return parser.parse_args(argv)
 
 
-def main(argv=None, gh=None) -> int:
+def main(argv=None, gh=None, jobs=None) -> int:
     args = _parse(argv)
+    if jobs is None and args.run_id:
+        try:
+            jobs = (gh or GitHub()).jobs(args.run_id)
+        except AgregatError as exc:
+            print("ci-agregat : jobs du run illisibles : %s" % exc, file=sys.stderr)
+    psycopg_jobs = _family_jobs(jobs, "psycopg") if jobs is not None else None
+    psql_jobs = _family_jobs(jobs, "psql") if jobs is not None else None
     try:
         result = classify(
             event=args.event, plan=args.plan, version=args.version,
@@ -288,7 +464,8 @@ def main(argv=None, gh=None) -> int:
             doc_readers=args.doc_readers,
             psycopg=args.psycopg, psycopg_parts=args.psycopg_parts,
             psql=args.psql, psql_parts=args.psql_parts,
-            platform_macos=args.platform_macos, fs_class=args.fs_class)
+            platform_macos=args.platform_macos, fs_class=args.fs_class,
+            psycopg_jobs=psycopg_jobs, psql_jobs=psql_jobs)
     except (TypeError, ValueError) as exc:  # pragma: no cover - garde-fou
         print("ci-agregat : %s" % exc, file=sys.stderr)
         return 2
@@ -296,6 +473,8 @@ def main(argv=None, gh=None) -> int:
     for row in result["parts"]:
         suffix = " (parts %s)" % row["parts"] if row.get("parts") else ""
         print("%-24s: %s%s" % (row["part"], row["result"], suffix))
+    for gap in result["missing"]:
+        print("::error title=tests : preuve absente::%s" % gap)
     for gap in result["red"]:
         print("::error title=tests : négatif prouvé::%s" % gap)
     for row in result["consigned"]:
@@ -307,7 +486,8 @@ def main(argv=None, gh=None) -> int:
     conclusion = ("failure" if result["state"] == RED
                   else "neutral" if result["consigned"] else "success")
     if result["state"] == RED:
-        title = "tests : négatif prouvé"
+        title = ("tests : preuve absente" if result["missing"]
+                 else "tests : négatif prouvé")
     elif result["consigned"]:
         title = "tests : %d part(s) non concluante(s)" % len(result["consigned"])
     else:

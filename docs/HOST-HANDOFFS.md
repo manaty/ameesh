@@ -845,3 +845,6 @@ the witness lot, docs-only, through the normal packet path by the elected
 pilot; no other lot is merged. The Nexlink pilot runs the same procedure
 under lot `#3024` and `docs/ops/election-pilote-nexlink.md`; the two drills
 may share one window but never one holder.
+
+For wheel installation, the secret-free canary, protected enrollment manifest
+and rollback procedure, see [HANDOFF-STAGING](HANDOFF-STAGING.md).

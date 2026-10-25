@@ -157,6 +157,8 @@ class Operations(interface.Operations):
                    r.operator_pause_for,
                    extract(epoch from r.operator_pause_at)::float8 AS operator_pause_ts,
                    r.canon,  -- L242c : le canon propriétaire (rôles de sa fiche)
+                   -- #3460 : un agent retiré ne prend rien et n'alerte plus
+                   extract(epoch from r.retired_at)::float8 AS retired_ts,
                    extract(epoch from r.lease_wait_since)::float8 AS lease_wait_since_ts,
                    r.admitted_hosts,  -- #254 : hôtes en pause
                    r.last_error,  -- L106 : le détail de « hôte non prêt »
@@ -439,6 +441,7 @@ class Operations(interface.Operations):
     _LOTS_ACTIVITY = """
             SELECT w.id, w.title, w.state, w.assignee, w.package_id, w.type,
                    w.priority, w.app, w.workstream, w.branch_target, __REVIEWER__,
+                   to_jsonb(w)->>'external_executor' AS external_executor,
                    -- #2335 : l'appartenance à un paquet se lit sur le porteur
                    -- (`integration/**`), son manifeste (corps) et la tête gelée
                    -- du lot, sans requête par lot. Le corps n'est transféré que

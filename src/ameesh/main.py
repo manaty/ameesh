@@ -14,6 +14,8 @@
         to another admitted host, without a live lease when the source executor
         is stopped (#3299);
   ameesh agent peek <name> [--limit N] [--json]   responsible human's work summary;
+  ameesh agent retire <name> --reason R | restore <name>   take an agent out of the
+        active registry (never designated, claimed nor mailed), or back (#3460);
   ameesh agent spawn <name> --by <creator> --ttl <duration>   ephemeral agent;
   ameesh alerts [--follow] [--json]     operational alerts (one object per line);
   ameesh approvals            list signed approvals;

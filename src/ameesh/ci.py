@@ -1164,9 +1164,11 @@ class Watcher:
     def _map(self, db, repo: str, bases=BASE_BRANCHES) -> None:
         """#3344 : la dernière carte de mesure publiée sur la base du dépôt.
 
-        Le plan de tests (`scripts/test-plan.py`) n'utilise plus une carte de
-        plus de 48 h et le dit en annotation CI ; seule cette lecture permet à
-        `ameesh alerts` de le voir (`map_stale`). Un dépôt sans `carte.yml`
+        Le plan de tests (`scripts/test-plan.py`) la juge périmée au-delà de
+        48 h (#3450 : un lot garde les impactés de son propre diff, la voie
+        documentation et la prévalidation retombent sur la suite complète) et
+        le dit en annotation CI ; seule cette lecture permet à `ameesh alerts`
+        de le voir (`map_stale`). Un dépôt sans `carte.yml`
         n'est pas lu ; la dernière exécution réussie de la base est relue au
         plus toutes les `MAP_READ_S` (date du relevé précédent, dans la base :
         plusieurs processus de relevé ne la repaient pas). Une erreur GitHub
