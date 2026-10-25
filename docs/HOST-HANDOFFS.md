@@ -321,6 +321,32 @@ prepares outside the database check the epoch first:
 | assignment | `ameesh work assign` / an assigned `work add` (and mail assignment through it) |
 | packet | `ameesh work packet record` / the packet train fire |
 | decision routing | `ameesh decide ask` |
+| drill canary (no effect) | `ameesh role canary [--json]` (EP7 P3, #3433) |
+
+The canary is the drill's fenced gesture. A real gesture played "same-value"
+(`work assign` of a lot to its current assignee) is refused by its business
+rule *before* the fence, for a stale epoch as for a live one, and so proves
+nothing. `ameesh role canary` acts under the environment's identity like any
+gesture — `AMEESH_ROLE` + `AMEESH_LEASE_EPOCH`, or a session bound by its
+runner — and its only writes are the lease renewal and one `pilot.gesture`
+event (`gesture` and `ref` both `canary`). Exit `0`: accepted, the event id
+is printed (`--json`: `{ok, role, epoch, host, runner, event}`). Exit `1`:
+refused, nothing journaled; for a stale or expired epoch (or a stopped role)
+the message names the holder, its host and its epoch, while an earlier
+refusal (no or invalid epoch, unknown role, unreadable registry) states its
+own reason — the proof of a refusal is the exit code, the message and the
+absence of the event. Exit `2`: no lease to fence (a human, the bureau, a host-pinned
+agent). For the drill, clear the session identity so only the epoch speaks,
+negative first:
+
+```sh
+env -u AGENT_MAIL_NAME -u AMEESH_RUNNER_ID -u AGENT_MESH_RUNNER_ID \
+    -u AMEESH_LEASE_OWNER AMEESH_ROLE=<ROLE> AMEESH_LEASE_EPOCH=<OLD-EPOCH> \
+  ameesh role canary          # exit 1, names the holder at <NEW-EPOCH>
+env -u AGENT_MAIL_NAME -u AMEESH_RUNNER_ID -u AGENT_MESH_RUNNER_ID \
+    -u AMEESH_LEASE_OWNER AMEESH_ROLE=<ROLE> AMEESH_LEASE_EPOCH=<NEW-EPOCH> \
+  ameesh role canary --json   # exit 0, one canary event at <NEW-EPOCH>
+```
 
 For an agent whose card says `releve: election`, `pilot_gesture.gate` reads
 the session's bound identity. A session that is not the live lease-holder at
