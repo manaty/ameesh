@@ -2397,12 +2397,18 @@ class WorkItems(interface.WorkItems):
         return rows[0] if rows else None
 
     def queue_add(self, item_id, *, target, frozen_sha, note, actor,
-                  source="", frozen_id=None, packet=None, packet_initial=False, lease=None) -> dict | None:
+                  source="", frozen_id=None, packet=None, packet_initial=False, lease=None,
+                  withdrawn_after=None) -> dict | None:
         with self.db.transaction() as tx:
             lot = tx.query("SELECT state, app, branch, branch_target, type FROM work_items WHERE id = %s"
                            " AND state NOT IN ('merged', 'promoted', 'closed')"
                            " FOR NO KEY UPDATE", (int(item_id),))
             if not lot:
+                return None
+            # #3532: read under the lot row lock that `queue_remove` takes
+            # first, so a take-out cannot slip between this check and insertion.
+            if withdrawn_after is not None and WorkItems(tx).queue_withdrawn_since(
+                    item_id, withdrawn_after) is not None:
                 return None
             if lease is not None:
                 key, owner, epoch = lease
@@ -2530,6 +2536,14 @@ class WorkItems(interface.WorkItems):
                        " (work_item_id, generation, frozen_id, kind) VALUES (%s, %s, %s, 'removed')",
                        (rows[0]["work_item_id"], rows[0]["generation"], rows[0]["frozen_id"]))
             return True
+
+    def queue_withdrawn_since(self, item_id, since_ts) -> float | None:
+        rows = self.db.query(
+            "SELECT extract(epoch FROM max(created_at))::float8 AS at"
+            " FROM integration_train_queue_receipts WHERE work_item_id = %s"
+            " AND kind = 'removed' AND created_at >= to_timestamp(%s)",
+            (int(item_id), float(since_ts)))
+        return rows[0]["at"] if rows and rows[0]["at"] is not None else None
 
     def land_lock(self, key, owner, ttl_s, *, epoch=None) -> int | None:
         if epoch is not None:  # renewal: only the holder, at its epoch
