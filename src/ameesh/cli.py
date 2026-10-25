@@ -2132,6 +2132,20 @@ def cmd_doctor(cfg: Config, notify_test: bool, probe: bool = False,
     print("agents     : %d" % agents)
     print("unread     : %d" % unread)
     print(host_measures_line(cfg))
+    # #3503 : le JIT de Postgres. db.connect le coupe dans chaque session
+    # (`-c jit=off`) ; ici, on signale en plus si le rôle ou la base ne le
+    # couperaient pas pour une session qui ne passe pas par ameesh (psql,
+    # script de déploiement, nouveau rôle). Le défaut ON est signalé sans
+    # changer le verdict ; une SESSION on (le réglage du client n'est pas
+    # passé) est un échec du doctor.
+    from . import hostcheck
+    jit_ko = False
+    try:
+        for line in hostcheck.jit_lines(db):
+            print(line)
+            jit_ko = jit_ko or line.startswith(hostcheck.JIT_SESSION_ON_PREFIX)
+    except db_mod.DbError as exc:
+        print("jit        : not checked (%s)" % exc)
     # #2580 : un compte déclaré aussi par un autre mesh de l'hôte — signalé,
     # sans changer le verdict par défaut (refuser arrêterait les deux meshes).
     try:
@@ -2142,7 +2156,6 @@ def cmd_doctor(cfg: Config, notify_test: bool, probe: bool = False,
         print("accounts   : unreadable (%s)" % exc)
     # L106 : un agent mené sans unité d'exécuteur ne repart pas après une
     # coupure de l'hôte (signalé, sans changer le verdict)
-    from . import hostcheck
     try:
         for line in hostcheck.missing_runner_lines(cfg, db):
             print(line)
@@ -2164,6 +2177,10 @@ def cmd_doctor(cfg: Config, notify_test: bool, probe: bool = False,
     except db_mod.DbError:
         pass
     verdict = 0
+    # #3503 : la session d'ameesh doit avoir reçu `-c jit=off` ; sinon le
+    # correctif ne s'applique pas à ce processus (ligne déjà imprimée).
+    if jit_ko:
+        verdict = 1
     # #3345 : un profil de l'hôte qui diverge sur train, github ou release
     # n'est pas un état vert — le runner d'à côté ne fait pas la même chose.
     if profile_ko:
