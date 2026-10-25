@@ -174,18 +174,21 @@ def compile_glob(pattern: str) -> re.Pattern:
 
 
 def is_catch_all(pattern: str) -> bool:
-    """Le motif couvre-t-il **tout** chemin (`**`) ?
+    """Le motif est-il une portée générique de tout chemin, sans littéral ?
 
-    Un attrape-tout ne nomme aucun chemin : il peut relever un compte d'avis,
-    jamais abaisser le plancher critique (#3542). La lecture est celle de
-    [`compile_glob`] : un `/` de tête est ancré à la racine, les composants
-    vides sont retirés.
+    Un motif qui contient `**` mais aucun caractère littéral (`**`, `**/*`,
+    `***`, `**/**`, `*/**`…) ne nomme aucun chemin : il couvre une portée
+    générique, peut relever un compte d'avis, jamais abaisser le plancher
+    critique (#3542). [`compile_glob`] fait de `**` et de `**/*` des motifs qui
+    traversent les séparateurs et couvrent tout chemin ; un littéral
+    (`deploy/**`, `**/*.sql`, `src/ameesh/**`) nomme, lui, la portée qu'il
+    couvre. Un `/` de tête est ancré à la racine, les composants vides sont
+    retirés.
     """
     text = normalize_path(str(pattern or ""))
     if text.startswith("/"):
         text = text[1:]
-    parts = text.split("/")
-    return bool(parts) and all(part == "**" for part in parts)
+    return "**" in text and all(char in "*/?" for char in text)
 
 
 def declared_reviews(rules, paths) -> tuple[dict, int]:

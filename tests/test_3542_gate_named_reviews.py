@@ -94,10 +94,11 @@ class NamedReviewGateTest(unittest.TestCase):
         self.assertEqual(merge_queue.required_verdicts(klass), 2)
 
     def test_a_catch_all_does_not_lower_a_critical_path(self):
-        # `**` couvre tout sans nommer : il relève le compte, jamais il
-        # n'abaisse le plancher critique d'un chemin qu'aucune règle ne nomme.
+        # `**` et ses équivalents sans littéral couvrent tout sans nommer :
+        # ils relèvent le compte, jamais n'abaissent le plancher critique
+        # d'un chemin qu'aucune règle ne nomme (#3542, avis cx3).
         path = "scripts/deploy-cutoff.sh"
-        for pattern in ("**", "**/**", "/**"):
+        for pattern in ("**", "**/**", "/**", "**/*", "***", "*/**", "**?"):
             with self.subTest(pattern=pattern):
                 source = canon(default="normal",
                                rules=[{"paths": [pattern], "reviews": 1}])
@@ -106,6 +107,20 @@ class NamedReviewGateTest(unittest.TestCase):
                 self.assertEqual(klass["train_reviews_paths"], {})
                 self.assertEqual(klass["train_reviews_wide"], 1)
                 self.assertEqual(merge_queue.required_verdicts(klass), 2)
+
+    def test_a_literal_pattern_still_names_the_path(self):
+        # La reconnaissance des attrape-tout ne doit pas avaler un motif qui
+        # porte un littéral : `deploy/**` et `**/*.sql` nomment le chemin et
+        # font foi, même si CRITICAL_SCOPE le reconnaît (#3542).
+        for pattern, path in (("deploy/**", "deploy/bascule.py"),
+                              ("**/*.sql", "deploy/mise-a-jour/secret.sql")):
+            with self.subTest(pattern=pattern):
+                source = canon(rules=[{"paths": [pattern], "reviews": 1}])
+                klass = lot_class.class_of_paths([source], "ameesh", [path])
+                self.assertTrue(merge_queue.critical_scope(klass))
+                self.assertEqual(klass["train_reviews_paths"], {path: 1})
+                self.assertEqual(klass["train_reviews_wide"], 0)
+                self.assertEqual(merge_queue.required_verdicts(klass), 1)
 
     def test_a_catch_all_still_raises_a_named_path(self):
         # Le maximum des règles applicables reste le nombre d'avis ; seule
