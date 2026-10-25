@@ -256,6 +256,9 @@ class ServiceBesideTimerTest(unittest.TestCase):
         fake.run_pass = mock.Mock(return_value=[])
         fake.state = notify.empty_state()
         with mock.patch.object(notify, "Notifier", return_value=fake), \
+                mock.patch.object(notify, "enter_shared_state",
+                                  return_value=(("agents-a:1", 1), True)), \
+                mock.patch.object(notify, "leave_shared_state", return_value=True), \
                 mock.patch.object(notify.db_mod, "connect", return_value=fake), \
                 mock.patch.object(notify.db_mod, "require_schema"):
             self.assertEqual(notify.cmd_notify(cfg, notify.NotifyConfig(), args), 0)

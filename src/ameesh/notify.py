@@ -60,17 +60,23 @@ secrets (ntfy token, Slack webhook) come from an environment variable or a
 0600 file that the config NAMES — a secret value written in the config is
 refused. See docs/EXPLOITATION.md, "Alertes poussées — ameesh notify".
 
-Reliability: the delivery state is kept in `<state>/notify/state.json` (a
-lasting alert is not resent after a restart; an alert resolved while
-stopped is sent on restart); rate limited per human (beyond that, a
-summary, whose members enter the `notified` ledger once the summary is
-delivered); a failing channel does not block the others and is retried on
-later passes, a bounded number of times. #2395: the state also keeps a
-persistent `notified` ledger — one notification per alert identity (same
-`since`, same severity) and per human, even if the alert resolves and comes
-back, and even after `ameesh notify` restarts; `slo_breach` is never pushed
-to the owner (canon §9, owner decision 18/10), including from an old
-persisted summary bucket.
+Reliability: #3576 — the delivery state lives in the shared database
+(`notify_state`, a `ameesh-notify-state/1` document) under its own execution
+lease: the `alerts` pass may change host (#3383) without re-pushing a lasting
+alert or losing a resolution, and a holder whose lease expired cannot
+overwrite the new holder's state. `<state>/notify/state.json` remains the
+local document (read before the database for the #532 local console, and the
+fallback when the database is unreachable); the shared state supersedes it
+at the first pass that takes the lease. A lasting alert is not resent after
+a restart; an alert resolved while stopped is sent on restart; rate limited
+per human (beyond that, a summary, whose members enter the `notified` ledger
+once the summary is delivered); a failing channel does not block the others
+and is retried on later passes, a bounded number of times. #2395: the state
+also keeps a persistent `notified` ledger — one notification per alert
+identity (same `since`, same severity) and per human, even if the alert
+resolves and comes back, and even after `ameesh notify` restarts;
+`slo_breach` is never pushed to the owner (canon §9, owner decision 18/10),
+including from an old persisted summary bucket.
 
 Channels: `desktop`, `ntfy`, `slack`, `app`. L66 — the `desktop` channel
 follows the OS through `ameesh.platform.notify`: `notify-send` on Linux,
@@ -1108,6 +1114,24 @@ def empty_state() -> dict:
             "summary": {}, "last_summary": {}, "briefs": {}, "notified": {}}
 
 
+#: #3576 : le document d'envoi et son bail d'exécution sont partagés en base
+#: (`notify_state`), pour que la passe `alerts` change d'hôte sans re-pousser.
+#: La durée du bail couvre le `TimeoutStartSec=10min` de l'unité de rôle
+#: (`role_timers.render_service`) : un passage anormalement long ne livre
+#: jamais au-delà de l'expiration de son unité.
+STATE_SCOPE = "alerts"
+STATE_LEASE_S = 600.0
+
+
+def _state_from_document(data) -> dict | None:
+    """Valide un document `ameesh-notify-state/1` ; None s'il n'en est pas un."""
+    if not isinstance(data, dict) or data.get("schema") != STATE_SCHEMA:
+        return None
+    state = empty_state()
+    state.update({k: v for k, v in data.items() if k in state and isinstance(v, dict)})
+    return state
+
+
 def load_state(path: str, log=None, *, move_aside: bool = True) -> dict:
     """L'état d'envoi ; absent = vide. Illisible : mis de côté (journalisé),
     on repart vide — au pire une alerte en cours est renvoyée une fois.
@@ -1115,7 +1139,8 @@ def load_state(path: str, log=None, *, move_aside: bool = True) -> dict:
     try:
         with open(path, encoding="utf-8") as fh:
             data = json.load(fh)
-        if not isinstance(data, dict) or data.get("schema") != STATE_SCHEMA:
+        state = _state_from_document(data)
+        if state is None:
             raise ValueError("unexpected schema")
     except FileNotFoundError:
         return empty_state()
@@ -1131,8 +1156,6 @@ def load_state(path: str, log=None, *, move_aside: bool = True) -> dict:
             log("unreadable delivery state (%s): set aside as %s, starting from an empty "
                 "state" % (exc, aside))
         return empty_state()
-    state = empty_state()
-    state.update({k: v for k, v in data.items() if k in state and isinstance(v, dict)})
     return state
 
 
@@ -1146,6 +1169,143 @@ def save_state(path: str, state: dict) -> None:
         fh.flush()
         os.fsync(fh.fileno())
     os.replace(tmp, path)
+
+
+#: Un jeton par processus : un PID recyclé après un redémarrage ne reprend
+#: jamais le bail de son incarnation précédente (l'epoch, lui, ne recule pas).
+_STATE_RUN = os.urandom(4).hex()
+
+
+def state_owner(cfg: Config) -> str:
+    """Identité du processus sur le bail d'état : hôte, PID et jeton de run.
+
+    Une relève change d'hôte, donc d'owner ; le jeton empêche un PID recyclé
+    de se faire passer pour l'ancien détenteur.
+    """
+    host = str(getattr(cfg, "host", None) or "?").strip() or "?"
+    return "%s:%d:%s" % (host, os.getpid(), _STATE_RUN)
+
+
+def load_shared_state(db) -> dict | None:
+    """#3576 : le document partagé de la passe alerts, None tant qu'il n'est
+    pas amorcé (premier détenteur depuis la migration)."""
+    return _state_from_document(storage.of(db).notify_liveness.read_state(STATE_SCOPE))
+
+
+def save_shared_state(db, state: dict, *, owner: str, epoch: int) -> bool:
+    """Écrit le document sous le bail vivant `(owner, epoch)` ; False s'il a
+    été perdu ou a expiré (le détenteur ne doit alors plus livrer)."""
+    return storage.of(db).notify_liveness.save_state(
+        STATE_SCOPE, state, owner=owner, epoch=epoch)
+
+
+def _merge_local_state(local: dict, shared: dict) -> None:
+    """Reporte dans l'état partagé ce que seul le passage local a produit.
+
+    `run_local_pass` tourne avant la base (#532) : ses alertes de console
+    (`LOCAL_TYPES`) et son registre ne peuvent pas venir du document partagé.
+    Tout le reste est remplacé par celui-ci — c'est la règle du dédoublonnage
+    entre hôtes.
+    """
+    for section in ("active", "resolved"):
+        for key, entry in (local.get(section) or {}).items():
+            if ((entry or {}).get("alert") or {}).get("type") in LOCAL_TYPES:
+                shared[section].setdefault(key, entry)
+    for identity, sent_ts in (local.get("notified") or {}).items():
+        shared["notified"][identity] = max(
+            float(sent_ts), float(shared["notified"].get(identity, 0.0)))
+    for human, stamps in (local.get("rate") or {}).items():
+        known = {float(stamp) for stamp in shared["rate"].get(human) or ()}
+        shared["rate"][human] = list(shared["rate"].get(human) or ()) + [
+            stamp for stamp in stamps if float(stamp) not in known]
+    for human, bucket in (local.get("summary") or {}).items():
+        if not isinstance(bucket, dict):
+            continue
+        for event in ("raised", "resolved"):
+            members = bucket.get(event)
+            if not isinstance(members, dict):
+                continue
+            for identity, member in members.items():
+                if isinstance(member, dict) and member.get("type") in LOCAL_TYPES:
+                    target = shared["summary"].get(human)
+                    if not isinstance(target, dict):
+                        target = shared["summary"][human] = {}
+                    target.setdefault(event, {})[identity] = member
+
+
+def enter_shared_state(db, notifier, cfg: Config, *, dry_run: bool = False,
+                       log=None) -> tuple[tuple[str, int] | None, bool]:
+    """Prend le bail d'état partagé et lit le document (rendu ``(bail,
+    livre)``).
+
+    ``livre`` est faux quand un autre hôte détient le bail : ce passage se
+    met en veille, sans livrer ni écrire (l'autre hôte le fait). En
+    ``--dry-run``, le document est lu sans bail et rien n'est écrit.
+    """
+    log = log or notifier.log
+    if dry_run:
+        shared = load_shared_state(db)
+        if shared is not None:
+            _merge_local_state(notifier.state, shared)
+            notifier.state = shared
+        return None, True
+    owner = state_owner(cfg)
+    try:
+        epoch = storage.of(db).notify_liveness.acquire_state(
+            STATE_SCOPE, owner, STATE_LEASE_S)
+    except db_mod.DbError as exc:
+        if getattr(exc, "sqlstate", None) != "42P01":
+            raise
+        # The migration is applied before the runners (§14), but the owner
+        # channel must not fall silent on a host updated ahead of the base:
+        # deliver from the local document, loudly, until `ameesh migrate`.
+        log("shared delivery state table missing (migration 0487 not applied): "
+            "delivering from the local state, duplicates possible until it is")
+        return None, True
+    if epoch is None:
+        log("another host holds the alerts delivery state (shared lease): "
+            "standing by, nothing is delivered")
+        return None, False
+    try:
+        shared = load_shared_state(db)
+        if shared is None:
+            # Premier détenteur depuis la migration : son état local amorce le
+            # document partagé (les autres hôtes liront celui-ci).
+            save_shared_state(db, notifier.state, owner=owner, epoch=epoch)
+        else:
+            _merge_local_state(notifier.state, shared)
+            notifier.state = shared
+    except Exception:
+        # Ne pas garder un bail qu'aucune passe n'utilisera (base tombée
+        # entre la prise et la lecture) : le prochain essai doit pouvoir le
+        # prendre sans attendre son expiration.
+        try:
+            storage.of(db).notify_liveness.release_state(STATE_SCOPE, owner, epoch)
+        except Exception:
+            pass
+        raise
+    return (owner, epoch), True
+
+
+def leave_shared_state(db, notifier, lease, *, log=None) -> bool:
+    """Écrit le document partagé sous le bail, puis le rend.
+
+    False si l'écriture a été refusée (bail perdu ou expiré) : la livraison a
+    eu lieu, l'état n'est plus celui du détenteur courant.
+    """
+    if lease is None:
+        return True
+    owner, epoch = lease
+    log = log or notifier.log
+    saved = False
+    try:
+        saved = save_shared_state(db, notifier.state, owner=owner, epoch=epoch)
+        if not saved:
+            log("alerts delivery state NOT saved: the shared lease was lost or "
+                "expired; the next holder may re-push")
+        return saved
+    finally:
+        storage.of(db).notify_liveness.release_state(STATE_SCOPE, owner, epoch)
 
 
 def key_of(alert: dict) -> str:
@@ -3017,6 +3177,7 @@ def cmd_notify(cfg: Config, ncfg: NotifyConfig, args) -> int:
     seuils = exploitation.thresholds(args)
     interval = _interval(args, ncfg)
     db = None
+    lease = None
     try:
         while True:
             # #532 : la console du pool local se lit depuis `cfg` seule, avant
@@ -3030,12 +3191,36 @@ def cmd_notify(cfg: Config, ncfg: NotifyConfig, args) -> int:
                 if db is None:
                     db = db_mod.connect(cfg)
                     db_mod.require_schema(db)
+                if alerts_pass:
+                    # #3576 : l'état de livraison est partagé et un seul hôte
+                    # livre. Sans le bail, ce passage se met en veille sans
+                    # rien pousser ni écrire (l'autre hôte le fait).
+                    lease, deliver = enter_shared_state(
+                        db, notifier, cfg, dry_run=args.dry_run)
+                    if not deliver:
+                        if args.once:
+                            return 0
+                        time.sleep(interval)
+                        continue
                 notifier.run_pass(db, thresholds=seuils)
                 if alerts_pass and not args.dry_run:
-                    save_state(path, notifier.state)
+                    # #3576 : le document partagé d'abord (le bail peut
+                    # expirer), le miroir local ensuite quoi qu'il arrive.
+                    try:
+                        leave_shared_state(db, notifier, lease)
+                    finally:
+                        lease = None
+                        save_state(path, notifier.state)
             except db_mod.SchemaMissing:
                 raise
             except db_mod.DbError as exc:
+                if lease is not None and db is not None:
+                    try:
+                        storage.of(db).notify_liveness.release_state(
+                            STATE_SCOPE, lease[0], lease[1])
+                    except Exception:
+                        pass  # le bail expirera ; la base est déjà en défaut
+                    lease = None
                 if args.once:
                     raise
                 _stderr_log("database unavailable (%s): retrying in %ds" % (exc, interval))
@@ -3051,6 +3236,12 @@ def cmd_notify(cfg: Config, ncfg: NotifyConfig, args) -> int:
     except KeyboardInterrupt:
         return 0
     finally:
+        if lease is not None and db is not None:
+            try:
+                storage.of(db).notify_liveness.release_state(
+                    STATE_SCOPE, lease[0], lease[1])
+            except Exception:
+                pass
         if db is not None:
             db.close()
         if lock is not None:

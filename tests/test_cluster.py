@@ -186,6 +186,10 @@ FERMEES = {
     # aux deux rôles, aucun GRANT modifié.
     "notify_liveness": {"host", "human", "seen_at"},
     "notify_briefs": {"recipient", "human", "sent_at"},
+    # #3576 (0487) : document de livraison de la passe alerts et son bail
+    # d'exécution, écrits et lus par le notificateur seul ; état interne fermé
+    # aux deux rôles superviseur, aucun GRANT modifié.
+    "notify_state": {"scope", "body", "owner", "epoch", "expires_at", "updated_at"},
 }
 #: L232b (0417) : l'état interne du contrôleur de release reste hors contrat,
 #: sauf `host_release_fences.host`, lu par `ameesh_host_gate_state` (l.314).

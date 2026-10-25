@@ -4663,6 +4663,36 @@ class NotifyLiveness(Domain):
     def release_brief(self, recipient: str, human: str) -> None:
         """Rend une réclamation dont le courrier n'a pas pu être déposé."""
 
+    # -- #3576 : état de livraison partagé de la passe alerts ----------------
+    @abc.abstractmethod
+    def acquire_state(self, scope: str, owner: str, ttl_seconds: float) -> int | None:
+        """Prend le bail d'exécution de l'état `scope` ; rend son epoch.
+
+        La ligne d'état est créée au premier appel (`body` vide, à amorcer).
+        Un bail non expiré d'un AUTRE owner refuse la prise (`None`) ; le même
+        owner le reprend à une epoch neuve. `expires_at` est lu avec l'heure
+        réelle de la base, jamais avec l'horloge de l'hôte.
+        """
+
+    @abc.abstractmethod
+    def read_state(self, scope: str) -> dict | None:
+        """Le document de livraison partagé, ou None tant qu'il n'est pas
+        amorcé (ligne absente, `body` vide ou schéma inconnu).
+
+        Lecture sans verrou : un écrivain doit avoir pris le bail, l'appelant
+        ne livre que sous ce bail.
+        """
+
+    @abc.abstractmethod
+    def save_state(self, scope: str, body: dict, *, owner: str, epoch: int) -> bool:
+        """Écrit le document sous le bail `(owner, epoch)`, s'il est encore
+        vivant ; False si le bail a été perdu ou a expiré (rien n'est écrit :
+        un détenteur périmé ne remplace jamais l'état du nouveau)."""
+
+    @abc.abstractmethod
+    def release_state(self, scope: str, owner: str, epoch: int) -> bool:
+        """Rend le bail d'exécution de l'état, à son epoch."""
+
 
 class Storage(abc.ABC):
     """Les domaines du stockage, liés à une connexion ou une transaction."""
