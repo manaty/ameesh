@@ -364,9 +364,9 @@ def families_of(authors: Iterable) -> tuple[set, set]:
 
     An author is `{"name", "family"}`: the lot's assignee, each co-author and
     each reviewer who pushed a correction onto the head (exact evidence #1465,
-    canon §2 and #2888). A `test_only` corrector (#3518) forbids only their
-    name: their non-sensitive tests do not author the product delta.
-    An unknown family is not guessed: `select` then waits
+    canon §2 and #2888). A `test_only` corrector (#3518/#3577) forbids only
+    their name: their tests do not author the product delta, even on a
+    sensitive path. An unknown family is not guessed: `select` then waits
     instead of designating (see `unknown_families`).
     """
     names, families = set(), set()

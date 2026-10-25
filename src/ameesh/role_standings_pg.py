@@ -135,16 +135,26 @@ def sample_interval_s(db, host: str, *, now: float | None = None,
 
 
 def record(db, name: str, host: str, *, availability: float, capacity: float,
-           score: float, ready: bool, diagnostic: str) -> None:
-    """Append one standing; the database stamps it with its own clock."""
+           score: float, ready: bool, diagnostic: str,
+           notify_ok: bool = False, notify_diagnostic: str = "") -> None:
+    """Append one standing; the database stamps it with its own clock.
+
+    #3568: `notify_ok` is the candidate's LOCAL ability to push an alert
+    (route and secret resolved by ``role_timers.notify_reach``). It is
+    published with the standing so that the readers can delegate the alert
+    delivery to a candidate that can actually push; it never changes the
+    role's eligibility (`ready`).
+    """
     db.execute(
         """
         INSERT INTO role_standings
-            (name, host, availability, capacity, score, ready, diagnostic)
-        VALUES (%s, %s, %s, %s, %s, %s, %s)
+            (name, host, availability, capacity, score, ready, diagnostic,
+             notify_ok, notify_diagnostic)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
         """,
         (name, host, float(availability), float(capacity), float(score),
-         bool(ready), diagnostic or ""))
+         bool(ready), diagnostic or "", bool(notify_ok),
+         notify_diagnostic or ""))
 
 
 def latest(db, name: str) -> dict[str, dict]:
@@ -155,7 +165,8 @@ def latest(db, name: str) -> dict[str, dict]:
                host, id,
                extract(epoch FROM evaluated_at)::float8 AS evaluated_ts,
                extract(epoch FROM now())::float8 AS now_ts,
-               availability, capacity, score, ready, diagnostic
+               availability, capacity, score, ready, diagnostic,
+               notify_ok, notify_diagnostic
           FROM role_standings
          WHERE name = %s
          ORDER BY host, evaluated_at DESC, id DESC
