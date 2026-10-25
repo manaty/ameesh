@@ -348,8 +348,11 @@ class BlockedFreezeSLOTest(_Base):
         self.assertIn("ameesh work assign %d" % lot, text)
         text = alert_briefs._slo_breach(dict(alert, level=3))
         self.assertIn("bureau or auditor:", text)
-        self.assertIn("author's family", text)
-        self.assertIn("do not wait for the pilot", text)
+        # #3487 : le porteur porte le correctif ; le niveau 3 ne le réassigne pas.
+        self.assertIn("do not reassign the holder", text)
+        self.assertIn("carries the fix", text)
+        self.assertNotIn("ameesh work assign", text)
+        self.assertNotIn("reassign it now", text)
 
     def test_the_witness_ages_breach_at_the_expected_levels(self):
         # #3033 (22 h) et #3195 (9 h) auraient dû escalader au niveau 3.
