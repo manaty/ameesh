@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+from unittest import mock
 
 from ameesh import (agent_retire, registry, review_designation as rd,
                     review_designation_activation as rda, storage, undeliverable,
@@ -133,6 +134,59 @@ class RetireTest(PgTestCase):
         self.assertIn("third", recipients)
         self.assertNotIn("worker", recipients)
 
+    def test_copy_to_a_retired_agent_is_refused_nothing_deposited(self):
+        registry.upsert(self.db, "other", harness="deepseek", host=self.cfg.host,
+                        cwd=self.tmp)
+        registry.upsert(self.db, "third", harness="deepseek", host=self.cfg.host,
+                        cwd=self.tmp)
+        self.retire()
+        out = self.cli("send", "third", "bonjour", "--from", "other", "--cc", "worker")
+        self.assertEqual(out.returncode, 2, out.stdout)
+        self.assertIn("copy refused — worker is retired", out.stderr)
+        self.assertEqual(self.db.query(
+            "SELECT count(*) AS n FROM agent_mailbox WHERE sender = 'other'")[0]["n"], 0)
+
+    def test_forward_to_a_retired_agent_is_refused_even_under_the_lock(self):
+        registry.upsert(self.db, "dead", harness="deepseek", host=self.cfg.host,
+                        cwd=self.tmp)
+        self.db.execute("UPDATE agent_registry SET status = 'stopped' WHERE name = 'dead'")
+        storage.of(self.db).mailbox.send(
+            "ameesh", "dead", "en attente", host=None, kind="notify", payload=None,
+            work_item_id=None, signature=None, signature_key=None, signed_payload=None,
+            nonce=None, created_us=None, expires_us=None)
+        self.retire()
+        with self.assertRaises(undeliverable.Refused) as ctx:
+            undeliverable.forward(self.cfg, self.db, "dead", "worker", actor=ALICE)
+        self.assertIn("worker is retired", str(ctx.exception))
+        # le stockage relit le retrait sous le verrou de la ligne : un retrait
+        # committé après la lecture d'`undeliverable` gagne encore
+        with self.assertRaises(storage.MailboxRefused) as ctx:
+            storage.of(self.db).mailbox.forward("dead", "worker", ALICE)
+        self.assertIn("worker is retired", str(ctx.exception))
+        self.assertEqual(storage.of(self.db).mailbox.unread("worker", 10), [])
+
+    def test_no_watch_nor_wake_for_a_retired_agent(self):
+        units = os.path.join(self.tmp, "units")
+        os.makedirs(units)
+        env = {watch.UNIT_DIR_ENV: units, watch.IDENTITY_ENV: "worker"}
+        # un réveil armé avant le retrait
+        with open(os.path.join(units, watch.wake_name("worker", "deadline", "wake.json")),
+                  "w", encoding="utf-8") as fh:
+            json.dump({"agent": "worker", "slug": "deadline", "message": "réveil"}, fh)
+        self.retire()
+        run = mock.Mock(side_effect=AssertionError("systemd must not be called"))
+        with mock.patch.object(watch.platform, "is_linux", return_value=True):
+            with self.assertRaisesRegex(watch.WatchError, "worker is retired"):
+                watch.enable(self.cfg, self.db, "worker", 1800, run=run, env=env,
+                             actor=ALICE)
+            with self.assertRaisesRegex(watch.WatchError, "worker is retired"):
+                watch.arm(self.cfg, self.db, "worker", "later", 1800, "réveil",
+                          run=run, env=env, actor=ALICE)
+        with self.assertRaisesRegex(watch.WatchError, "worker is retired"):
+            watch.fire(self.cfg, self.db, "worker", "deadline", run=run, env=env)
+        self.assertEqual(storage.of(self.db).mailbox.unread("worker", 10), [])
+        self.assertEqual(storage.of(self.db).watches.list("worker"), [])
+
     def test_veille_retired_still_sends_watches_and_names_legacy_units(self):
         registry.upsert(self.db, watch.SENDER, harness="other", host="pc", cwd=None,
                         mode="externe")
@@ -165,6 +219,17 @@ class RetireTest(PgTestCase):
         self.assertIn("reviewer is retired", str(ctx.exception))
         self.restore("reviewer")
         self.assertEqual(work.check_reviewer(self.db, "reviewer"), "reviewer")
+
+    def test_a_retired_agent_is_never_assigned(self):
+        self.retire()
+        lot = work.add(self.db, title="lot", app="ameesh")
+        for externe in (False, True):
+            with self.assertRaises(work.WorkError) as ctx:
+                work.check_assignee(self.db, "worker", externe=externe, cfg=self.cfg)
+            self.assertIn("worker is retired", str(ctx.exception))
+        with self.assertRaises(work.WorkError):
+            work.assign(self.db, lot["id"], "worker")
+        self.assertIsNone(work.get(self.db, lot["id"])["assignee"])
 
     def test_cli_retire_and_restore(self):
         out = self.mesh("agent", "retire", "worker", "--reason", "décision #135690 a",

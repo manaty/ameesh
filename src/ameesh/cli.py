@@ -467,8 +467,14 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
                 print("copy refused — %s" % undeliverable.watch_sender_text(name),
                       file=sys.stderr)
                 return 2
-            if undeliverable.registry_rows(bk.db, [name])[name] is None:
+            row = undeliverable.registry_rows(bk.db, [name])[name]
+            if row is None:
                 print("copy refused: unknown agent: %s (nothing delivered)" % name,
+                      file=sys.stderr)
+                return 2
+            if row.get("retired_ts"):
+                # #3460 : un retiré n'est jamais destinataire, pas même en copie
+                print("copy refused — %s" % undeliverable.retired_text(row, sender=False),
                       file=sys.stderr)
                 return 2
     # L77/B1 : l'identité humaine est normalisée à la frontière (`human:<id>`,

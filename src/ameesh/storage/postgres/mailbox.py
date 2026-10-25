@@ -551,9 +551,12 @@ class Mailbox(interface.Mailbox):
             # entre la lecture et la copie bloquait jusqu'ici sans être revu :
             # il bloque désormais sur ce verrou jusqu'à notre commit, donc
             # jamais entre la décision et la copie.
-            locked = {row["name"]: row["status"] for row in tx.query(
-                "SELECT name, status FROM agent_registry"
-                " WHERE name IN (%s, %s) ORDER BY name FOR UPDATE", (old, new))}
+            rows = tx.query(
+                "SELECT name, status, retired_at IS NOT NULL AS retired"
+                " FROM agent_registry"
+                " WHERE name IN (%s, %s) ORDER BY name FOR UPDATE", (old, new))
+            locked = {row["name"]: row["status"] for row in rows}
+            retired = {row["name"] for row in rows if row["retired"]}
             if old == new:
                 raise interface.MailboxRefused(
                     "old and new recipient are the same (%s)" % old)
@@ -567,6 +570,10 @@ class Mailbox(interface.Mailbox):
             if locked[new] == "stopped":
                 raise interface.MailboxRefused(
                     "%s is stopped: forward to a live agent" % new)
+            if new in retired:
+                # #3460 : un retrait committé pendant l'attente du verrou gagne
+                raise interface.MailboxRefused(
+                    "%s is retired: forward to a live agent" % new)
             ids = sorted(int(row["id"]) for row in tx.query(
                 "SELECT m.id FROM agent_mailbox m"
                 " WHERE m.recipient = %%s AND m.delivered_at IS NULL"

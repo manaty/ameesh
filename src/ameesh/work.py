@@ -1726,7 +1726,8 @@ def check_assignee(db: Db, assignee: str, *, externe: bool = False, cfg=None) ->
     s'il est requis). `externe=True` (option `--externe`) force l'attribution
     à un agent EXTERNE, seulement s'il a un humain responsable : c'est lui qui
     portera l'attente et les alertes du lot. Un nom inconnu est toujours
-    refusé. Un agent arrêté reste accepté, avec un avertissement (`warning`).
+    refusé, un agent retiré aussi (#3460). Un agent arrêté reste accepté, avec
+    un avertissement (`warning`).
 
     L46 : un nom NU inconnu du registre mais qui désigne un humain connu
     (`known_human` : Member d'un canon, humain déclaré) est normalisé en
@@ -1761,6 +1762,11 @@ def check_assignee(db: Db, assignee: str, *, externe: bool = False, cfg=None) ->
         raise WorkError("assignment refused: %s is not in the registry (unknown "
                         "agent): nobody would work on this lot; %s"
                         % (name, _ASSIGNEE_HINT))
+    if row.get("retired_ts"):
+        # #3460 : un retiré n'est jamais réclamé, le lot dormirait
+        raise WorkError("assignment refused: %s is retired (ameesh agent retire, "
+                        "#3460): nobody would work on this lot; %s"
+                        % (row.get("name") or name, _ASSIGNEE_HINT))
     mode = row.get("mode") or "execute"
     responsible = (row.get("responsible") or "").strip() or None
     if externe:

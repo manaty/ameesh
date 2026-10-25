@@ -654,7 +654,8 @@ def forward(cfg, db, old: str, new: str, *, actor: str, dry_run: bool = False,
     """Re-livre à `new` le courrier en attente de `old`, une boîte morte.
 
     `old` doit être arrêté (`stopped`) ou absent du registre : on ne vide pas
-    la boîte d'un agent qui la lit. `new` doit être inscrit et non arrêté.
+    la boîte d'un agent qui la lit. `new` doit être inscrit, ni arrêté ni
+    retiré (#3460).
     Chaque message garde son expéditeur, sa date, sa nature et son lot ; la
     copie porte `meta.forwarded_from` (montré au destinataire), l'original
     passe remis avec `meta.forwarded` ; le renvoi est écrit dans le fil.
@@ -680,6 +681,8 @@ def forward(cfg, db, old: str, new: str, *, actor: str, dry_run: bool = False,
     if new_row.get("status") == "stopped":
         raise Refused("%s is stopped (%s): forward to a live agent"
                       % (new, stop_facts(new_row, now)))
+    if new_row.get("retired_ts"):
+        raise Refused(retired_text(new_row, sender=False))
     state = "arrêté" if old_row is not None else "absent du registre"
     if dry_run:
         rows = storage.of(db).mailbox.unread(old, 10000)
