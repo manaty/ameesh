@@ -2421,17 +2421,19 @@ def _required_ci(project, sha: str, commit_ci=None, *, parts=None,
     commit — the reader is pinned to `sha` — can stand for a part of this
     one."""
     from . import plan_github, radar
-    requirement = "ci_required" if getattr(project, "ci_required", False) else "no PR"
+    # #3560 : le texte `ci_required` est celui que `queue_add` reconnaît
+    # (`storage.interface.CI_REQUIRED_EJECTION`) ; « no PR » ne l'est pas.
+    required = (storage.interface.CI_REQUIRED_EJECTION
+                if getattr(project, "ci_required", False)
+                else "requires CI on the frozen commit (no PR)")
     try:
         runs = (commit_ci or (lambda s: radar.commit_ci(project, s, branch=branch)))(sha)
     except plan_github.GithubError as exc:
-        raise QueueError("project %s requires CI on the frozen commit (%s), "
-                         "unreadable (%s): try again once gh works"
-                         % (project.name, requirement, exc)) from exc
+        raise QueueError("project %s %s, unreadable (%s): try again once gh works"
+                         % (project.name, required, exc)) from exc
     if not runs["runs"]:
-        raise QueueError("project %s requires CI on the frozen commit (%s): no run "
-                         "on %s yet (push it, let the workflows run)"
-                         % (project.name, requirement, sha[:12]))
+        raise QueueError("project %s %s: no run on %s yet (push it, let the workflows run)"
+                         % (project.name, required, sha[:12]))
     if allow_inconclusive and parts is None and runs.get("acceptable"):
         # #3085 : tous les checks ont conclu, aucun n'est négatif ; les non
         # concluants se consignent, la porte du feu/paquet ne les attend pas.

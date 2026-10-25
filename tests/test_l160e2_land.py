@@ -173,6 +173,26 @@ class LocalLandTest(_Land):
         off = dataclasses.replace(self.project, land="off")
         self.assertEqual(land.run_pass(self.cfg, None, off, report, owner="r"), [])
 
+    def test_run_pass_never_lands_a_row_the_train_enrolled(self):
+        """#3560 : la ligne d'un lot inscrit par le train (reçu `packet` sur sa
+        génération) est portée par le train ; la file ne l'atterrit pas seule,
+        ne l'éjecte pas, et atterrit la tête suivante."""
+        self.queued(4)
+        self.queued(3)
+        self.fake.queue_rows[3]["rank"] = 2
+        self.fake.queue_rows[4]["packet_allocated"] = True
+        report = {"queue": {"targets": {"main": [{"lot": 4, "rank": 1, "state": "queued"},
+                                                 {"lot": 3, "rank": 2, "state": "queued"}]}}}
+        out = land.run_pass(self.cfg, None, self.project, report, owner="runner-1")
+        self.assertEqual([(o["lot"], o["result"]) for o in out], [(3, "landed")])
+        self.assertEqual(self.fake.queue_rows[4]["state"], "queued")
+        self.assertEqual(self.fake.queue_rows[4].get("reason") or "", "")
+        # en « landing » non plus : seul le train la fait avancer
+        self.fake.queue_rows[4]["state"] = "landing"
+        only = {"queue": {"targets": {"main": [{"lot": 4, "rank": 1, "state": "landing"}]}}}
+        self.assertEqual(land.run_pass(self.cfg, None, self.project, only, owner="runner-1"), [])
+        self.assertEqual(self.fake.queue_rows[4]["state"], "landing")
+
 
 class ReviewAfterMergeTest(LocalLandTest):
     """L539 : la fusion confirmée d'un lot léger ouvre le lot de relecture §2."""
@@ -1098,6 +1118,21 @@ class SettingsAndAlertTest(unittest.TestCase):
         self.assertEqual([(a["type"], a["lot"], a["agent"]) for a in alerts],
                          [("merge_blocked", 1, "a1")])
         self.assertIn("bloquée derrière le lot #1", alerts[0]["detail"])
+
+    def test_merge_blocked_ignores_a_row_the_train_enrolled(self):
+        """#3569 : la file saute la ligne d'un lot inscrit par le train (#3560) ;
+        une longue CI de paquet ne la rend pas « bloquante »."""
+        now = time.time()
+        rows = [{"work_item_id": 1, "target": "main", "state": "queued", "rank": 1,
+                 "updated_ts": now - 3600, "packet_allocated": True},
+                {"work_item_id": 3, "target": "dev", "state": "landing", "rank": 1,
+                 "updated_ts": now - 3600, "packet_allocated": True},
+                {"work_item_id": 4, "target": "ops", "state": "queued", "rank": 1,
+                 "updated_ts": now - 3600, "packet_allocated": False}]
+        store = mock.Mock()
+        store.work.queue.return_value = rows
+        with mock.patch.object(storage, "of", return_value=store):
+            self.assertEqual([r["work_item_id"] for r in land.blocked(None, now)], [4])
 
 
 class LeaseDbTest(PgTestCase):
