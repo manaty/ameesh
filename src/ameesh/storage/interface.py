@@ -280,8 +280,9 @@ class Agents(Domain):
         """#3460 : retire l'agent sous le verrou de sa ligne ; None s'il est inconnu.
 
         Rend `{name, changed, blockers}`. Un bail vivant, un lot assigné non
-        clos ou une veille `ameesh watch` vers l'agent sont des `blockers`
-        (`{kind: lease|lot|watch, …}`) : rien n'est écrit tant qu'il en reste.
+        clos, une veille `ameesh watch` vers l'agent ou un lot ouvert dont il
+        est l'exécutant externe déclaré sont des `blockers`
+        (`{kind: lease|lot|external_executor|watch, …}`) : rien n'est écrit tant qu'il en reste.
         Seules `retired_at`, `retired_by` et `retired_reason` changent ; ni
         statut, ni mode, ni bail. Déjà retiré : `changed` faux. Not exposed to
         executors."""
