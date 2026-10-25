@@ -484,7 +484,8 @@ def _attribution_on_freeze(db, marks, frozen, *, repo, klass, item, families=Non
     authors, unknown, correctors = act.attribution_of_head(
         db, item, milestone, repo, base, frozen, families=families or (),
         commits=commits, strict=strict, families_out=families_out,
-        target=target or base, admitted_heads=admitted_heads)
+        target=target or base, admitted_heads=tuple(
+            value["head"] if isinstance(value, dict) else value for value in admitted_heads))
     if unknown:
         raise ValueError("author provenance unknown for frozen commit(s): %s"
                          % ", ".join(unknown))
@@ -526,7 +527,7 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
                 item=None, families=None, required=None, family_of=None,
                 authors=None, authors_complete=False, cfg=None, project=None,
                 target=None, vehicle=None, exclude_author_family=None,
-                distinct_families=None, admitted_heads=()) -> dict:
+                distinct_families=None, admitted_heads=(), production_cache=None) -> dict:
     """Les avis requis sur la tête gelée `frozen`, et eux seuls (#1374).
 
     `admitted_heads` ne vient que de la porte du véhicule : les gels de ses
@@ -682,7 +683,8 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
            "waived": waived, "waived_by": waived_by,
            "author": author, "author_family": "", "authors": [],
            "corrections": [], "on_freeze": 0, "unproven": [], "vehicle": None,
-           "attribution_read": False,
+           "attribution_read": False, "provenance_exclusions": [],
+           "provenance_manifest": "",
            "exclude_author_family": exclude_author_family,
            "distinct_families": distinct_families}
     if not frozen:
@@ -873,6 +875,36 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
     # La même lecture rend les correcteurs (#2739) et échoue fermé quand la
     # provenance manque : une porte qui ne peut pas prouver qui a écrit la tête
     # ne compte pas un avis non prouvé (l'indépendance ne se suppose pas).
+    try:
+        from . import provenance_scope
+        if production_cache is None:
+            production_cache = (vehicle or {}).pop("production_cache", {})
+        cache_key = str(repo) + "\n" + str((item or {}).get("app") or "")
+        if cache_key not in production_cache:
+            try:
+                production_cache[cache_key] = (provenance_scope.production(cfg, item, repo), "")
+            except Exception as exc:  # noqa: BLE001 - failure grants no exclusion
+                production_cache[cache_key] = (None, str(exc))
+        production, publication_error = production_cache[cache_key]
+        if publication_error:
+            out["production_scope_error"] = publication_error
+        inherited = tuple((vehicle or {}).get("admitted_heads") or ())
+        scopes = tuple(admitted_heads) + inherited + ((production,) if production else ())
+        if scopes and repo:
+            from . import review_authors
+            boundary = (review_authors.target_commit(repo, target or (klass or {}).get("target") or "")
+                        or (klass or {}).get("base_sha"))
+            if boundary:
+                listing = plan_git._out(repo, "rev-list", "%s..%s" % (boundary, frozen))
+                if listing is None:
+                    raise ValueError("provenance exclusion range unreadable")
+                provenance_scope.exclude(repo, listing.split(), scopes,
+                                         out["provenance_exclusions"])
+        out["provenance_manifest"] = provenance_scope.manifest(out["provenance_exclusions"])
+    except Exception as exc:  # unreadable publication never authorizes exclusions
+        out["error"] = str(exc)
+        out["why"] = "provenance scope unreadable: %s" % exc
+        return out
     corrections: set = set()
     proven_families: dict = {}
     try:
@@ -883,7 +915,7 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
                                              strict=True,
                                              families_out=proven_families,
                                              target=target or "",
-                                             admitted_heads=admitted_heads)
+                                             admitted_heads=scopes)
     except Exception as exc:  # noqa: BLE001 - une plage illisible ne conclut pas
         out["error"] = str(exc)
         out["why"] = ("no review verdict ok on the freeze %s (class: %s): the frozen "
