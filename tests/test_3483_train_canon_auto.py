@@ -2,6 +2,7 @@
 """Real Git/config witnesses for automatic, host-local canon qualification."""
 import json
 import os
+import stat
 import tempfile
 import threading
 import types
@@ -108,6 +109,42 @@ class AutomaticCanonTest(unittest.TestCase):
         with mock.patch.object(train_requalify.os, 'fsync', side_effect=OSError('disk')):
             with self.assertRaisesRegex(OSError, 'disk'):
                 self.automatic(cfg, root)
+        for path in (base, profile):
+            self.assertEqual(self.read(path)['train']['projects']['ameesh']['canon_commit'],
+                             self.pin)
+        with open(os.path.join(root, 'train-canon.jsonl')) as journal:
+            self.assertEqual(journal.read(), '')
+
+    def test_git_ancestry_error_is_not_reported_as_divergence(self):
+        from ameesh import resolutions
+        cfg, root, base, profile = self.host('git-error')
+        run = resolutions._run
+        def fail_ancestry(repo, *args, **kwargs):
+            if args[0] == 'merge-base':
+                return types.SimpleNamespace(returncode=128, stderr='object unreadable')
+            return run(repo, *args, **kwargs)
+        with mock.patch.object(resolutions, '_run', side_effect=fail_ancestry):
+            with self.assertRaisesRegex(train_requalify.RequalifyError,
+                                        'cannot check gate ancestry.*object unreadable'):
+                self.automatic(cfg, root)
+        for path in (base, profile):
+            self.assertEqual(self.read(path)['train']['projects']['ameesh']['canon_commit'],
+                             self.pin)
+
+    def test_journal_directory_sync_failure_restores_pins(self):
+        cfg, root, base, profile = self.host('directory-sync')
+        fsync = os.fsync
+        synced = []
+        def sync(fd):
+            if stat.S_ISDIR(os.fstat(fd).st_mode):
+                synced.append('directory')
+                raise OSError('directory sync failed')
+            synced.append('file')
+            return fsync(fd)
+        with mock.patch.object(train_requalify.os, 'fsync', side_effect=sync):
+            with self.assertRaisesRegex(OSError, 'directory sync failed'):
+                self.automatic(cfg, root)
+        self.assertEqual(synced, ['file', 'directory'])
         for path in (base, profile):
             self.assertEqual(self.read(path)['train']['projects']['ameesh']['canon_commit'],
                              self.pin)
@@ -229,6 +266,10 @@ class AutomaticCanonTest(unittest.TestCase):
                 self.assertEqual(passage.canon.pin, reviewed)
                 passage.scheduled_step.assert_called_once()
                 report.assert_called_once()
+                expected = ('rules change' if index == 0 else
+                            'no gate canon commit' if index == 1 else
+                            'database unavailable')
+                self.assertIn(expected, report.call_args.args[0])
                 for path in (base, profile):
                     self.assertEqual(self.read(path)['train']['projects']['ameesh']['canon_commit'],
                                      reviewed)
