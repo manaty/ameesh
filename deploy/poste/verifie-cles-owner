@@ -10,10 +10,10 @@
 # déposée après le démarrage redeviendrait lisible (relecture cx1 #3444 B1).
 # Il exige qu'un MONTAGE soit posé SUR le chemin dans le namespace de
 # l'unité (`/proc/self/mountinfo`, champ 5) : c'est la preuve directe que
-# systemd a appliqué `InaccessiblePaths=` (tmpfs `mode=000` sur le
-# répertoire), et le contenu réel est alors hors d'atteinte pour la vie de
-# l'unité. Aucun montage = isolation absente = sortie 1, l'unité refuse de
-# démarrer.
+# systemd a appliqué `InaccessiblePaths=` (bind mount d'un inode
+# inaccessible `mode=000`, `/run/systemd/inaccessible/dir`), et le contenu
+# réel est alors hors d'atteinte pour la vie de l'unité. Aucun montage =
+# isolation absente = sortie 1, l'unité refuse de démarrer.
 #
 # Posé en root, non modifiable par l'agent qu'il contrôle :
 #   install -D -m 0755 deploy/poste/verifie-cles-owner \
