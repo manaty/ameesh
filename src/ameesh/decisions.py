@@ -719,6 +719,12 @@ BUREAU_MENTIONS = (
     "— réponse de l'owner relayée par le bureau, source ",
 )
 
+#: Le contrat de `--source` de `signer-owner.sh` : la session relayée est un mot
+#: de [A-Za-z0-9._:@-], sans tiret initial, 200 caractères au plus. Une mention
+#: qui ne le respecte pas n'est pas une signature du bureau (#3454, B1 de
+#: ameesh-cx3) : `--text` peut y mettre du texte libre, qui reste libre.
+RELAY_SOURCE_RE = re.compile(r"[A-Za-z0-9._:@][A-Za-z0-9._:@-]{0,199}")
+
 
 def match_option(view: dict, text: str) -> str | None:
     """La clé de l'option que `text` désigne (casse de la clé ignorée), sinon None.
@@ -726,9 +732,11 @@ def match_option(view: dict, text: str) -> str | None:
     Reconnaît « <clé> » et les deux textes que `signer-owner.sh` signe au nom
     de l'owner : « <clé> — saisi par le bureau, délégation §10 » et
     « <clé> — réponse de l'owner relayée par le bureau, source <session> »
-    (#3443, décision #135142 b). Le texte signé reste entier : l'empreinte
-    `answer_digest` couvre le texte et l'option, et une preuve déjà enregistrée
-    garde l'option qu'elle a signée (#3454)."""
+    (#3443, décision #135142 b), <session> devant suivre le contrat de
+    `--source` du script ([A-Za-z0-9._:@-], sans tiret initial, 200 au plus).
+    Le texte signé reste entier : l'empreinte `answer_digest` couvre le texte
+    et l'option, et une preuve déjà enregistrée garde l'option qu'elle a
+    signée (#3454)."""
     wanted = str(text or "").strip()
     for option in view.get("options") or ():
         key = str(option.get("key") or "")
@@ -741,7 +749,7 @@ def match_option(view: dict, text: str) -> str | None:
         if mention == BUREAU_MENTIONS[0]:
             return option["key"]
         relay = BUREAU_MENTIONS[1]
-        if mention.startswith(relay) and mention[len(relay):].strip():
+        if mention.startswith(relay) and RELAY_SOURCE_RE.fullmatch(mention[len(relay):]):
             return option["key"]
     return None
 

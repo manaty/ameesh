@@ -308,12 +308,28 @@ class ReponseTest(_Base):
         # la clé reste insensible à la casse, la mention est exacte
         self.assertEqual(decisions.match_option(first, "A — saisi par le bureau, "
                                                        "délégation §10"), "a")
+        relais_a = "a — réponse de l'owner relayée par le bureau, source "
+        # B1 de ameesh-cx3 : la session suit le contrat de --source
+        # ([A-Za-z0-9._:@-], sans tiret initial, 200 au plus)
+        for session in ("x", "a.b_c:d@e-f", "x" * 200):
+            self.assertEqual(decisions.match_option(first, relais_a + session), "a",
+                             session)
         for texte in ("a et autre chose",
                       "a — saisi par le bureau",
                       "a — saisi par le bureau, délégation §10 et autre chose",
-                      "a — réponse de l'owner relayée par le bureau, source ",
+                      relais_a,
+                      relais_a + "x" * 201,
+                      relais_a + "-session",
+                      relais_a + "session 1",
+                      relais_a + "session1, mais attendre lundi",
+                      relais_a + "session1\nmais attendre lundi",
                       "a — Réponse de l'owner relayée par le bureau, source x"):
             self.assertIsNone(decisions.match_option(first, texte), texte)
+        # le texte hors contrat reste libre, et entier
+        conditionnel = relais_a + "session1, mais attendre lundi"
+        third = self.ask()
+        answer = self.answer(third["id"], conditionnel)["decision"]["answer"]
+        self.assertEqual((answer["option"], answer["text"]), (None, conditionnel))
 
     def test_seul_l_humain_vise(self):
         view = self.ask()
