@@ -658,6 +658,10 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         -- #705 (0421) : le relecteur désigné d'un lot en qa — l'alerte
         -- stale_lot le nomme, le superviseur doit donc le lire
         'reviewer', 'reviewers',
+        -- #3447 (0482) : exécutant externe déclaré d'un lot (un nom d'agent
+        -- ou d'humain, de l'ÉTAT comme `assignee` ; NULL = lot ordinaire) —
+        -- le superviseur lit à qui le lot est réservé
+        'external_executor',
         -- #2466 (0466) : échéance du réveil programmé d'un lot et bail de
         -- livraison (des instants, de l'ÉTAT) — sans eux, la lecture de la
         -- ligne par `to_jsonb` échouerait pour le rôle à droits de colonne

@@ -145,9 +145,25 @@ conception nouvelle : conflit mécanique, aucun avis supplémentaire (§2, §11 
 Aucun lot prêt n'est écarté : les 11 lots prêts du recalcul de 05:12Z sont
 composés. #3430 (app nexlink, cible `develop`) est hors du `main` d'ameesh.
 
+## Reprise CI du 25/10 05:55Z
+
+La suite complète du run `40166201082` (tête `b24b8cd1`) a rendu rouge
+`tests.test_cluster.SuperviseurRoleTest.test_chaque_colonne_est_accordee_ou_exclue`
+(psycopg 4/8) : `work_items.external_executor` (migration 0482, #3447) n'était
+ni accordée ni exclue au contrat des rôles superviseur. Correctif sur le
+véhicule, `deploy/sql/role-superviseur.sql` : la colonne est un nom d'agent ou
+d'humain, de l'ÉTAT comme `assignee` et `reviewer`, et entre au contrat (aucun
+droit retiré, aucune autre colonne). Témoin local :
+`test_chaque_colonne_est_accordee_ou_exclue` vert (45 s, banc 55432). Classe du
+delta propre : sensible (SQL) → deux avis de familles différentes sur la
+nouvelle tête, puis suite complète.
+
 ## Têtes précédentes
 
-Aucune : première tête de composition, base `cc93c5927` inchangée depuis h-15.
+`b24b8cd1` : première tête de composition (11 unités), CI rouge sur le seul
+classement `work_items.external_executor` (run `40166201082`) ; deux verdicts
+rendus sur son delta propre (auditeur et mesh-design, 05:41Z — même famille).
+Base `cc93c5927` inchangée depuis h-15.
 
 ## CI
 
