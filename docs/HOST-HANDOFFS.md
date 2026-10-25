@@ -242,14 +242,21 @@ private transport endpoints; H2 ships source only and performs no installation.
 H3 implements `admit`, `enable`, `verify`, `restore_source` and
 `reconcile_effect`; `recover_source` remains the L232e loss recovery and stays
 an explicit refusal here. `admit` rechecks the prepared destination without
-starting anything. `enable` starts only the enrolled unit and proves it active
-with its finite caps inside the controller's 60-second gate boundary; a replay
+starting anything; its `credentials_ready` flag is the enrolled alias/release
+readiness from preparation, not a live credential probe — the authenticated
+first turn below is the credential proof. `enable` starts only the enrolled
+unit and proves it active with its finite caps inside the controller's
+60-second gate boundary; a replay
 re-observes the unit and never double-starts. `verify` observes the exact clean
 checkout, live unit and caps; the controller-side companion then reads the
 durable turn ledger (`turn_resources` plus its `turn_costs` line) for a
-completed turn on the target host after the `switched` event and returns
-`{"ok": true, "pending": true}` until it exists. A completed turn with no token
-usage is not authenticated and holds the operation.
+terminal (`done` or `orphan`) turn on the target host after the `switched`
+event. A running turn returns `{"ok": true, "pending": true}`. A terminal turn
+with no token usage is not authenticated and holds the operation; a terminal
+turn whose cost line is not yet committed is given a short bounded settlement
+window (the runner closes the resource before writing the ledger), then is
+also unauthenticated, so a missing login or a runner that died before any usage
+holds instead of leaving `verify` pending forever.
 
 `restore_source` returns the source unit to service before a cancellation; the
 controller keeps the source gate lock through restoration and fence release.
@@ -257,7 +264,11 @@ controller keeps the source gate lock through restoration and fence release.
 the exact pending intent (operation, agent, lease and epoch), stops and proves
 quiescent the enrolled unit for a pending `enable`, `restore_source` or
 `stop_source`, then returns `{"ok": true, "quiesced": true, "epoch": PREVIOUS}`.
-The journal order mark is preserved so the retry resumes the same step under
+It writes one durable proof per interrupted `(pending_step, pending_epoch)`
+pair (`reconcile-<step>-<epoch>.json`), so an operation interrupted a second
+time after its retry (an `enable` that expires again, a later `verify`) gets
+its own reconciliation instead of being refused as `intent_changed`. The
+journal order mark is preserved so the retry resumes the same step under
 the new epoch; a delayed call from the revoked epoch is refused before it can
 act, and read-only effects leave no host job. The destination account is
 frozen in the plan (`plan.account`, equal to `plan.session_account` when both

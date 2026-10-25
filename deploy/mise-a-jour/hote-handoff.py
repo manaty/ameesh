@@ -80,6 +80,12 @@ RESTORE_SECONDS = 30.0
 SECONDS = 52
 LOCK_SECONDS = 10.0
 MAX_RECEIPT_BYTES = 65536
+#: A terminal turn whose ``turn_costs`` line has not committed yet is still in
+#: flight: the runner closes ``turn_resources`` before writing the ledger. Past
+#: this bounded window the missing line means the turn never authenticated
+#: (missing login, failed before any usage, orphaned runner) and ``verify``
+#: must return ``authenticated: false`` instead of staying pending forever.
+TURN_SETTLE_SECONDS = 30.0
 #: ``O_DIRECTORY`` is absent on some platforms; a pinned directory fd still
 #: works without it (the path is checked by the caller's private chain).
 _O_DIRECTORY = getattr(os, 'O_DIRECTORY', 0)
@@ -1063,8 +1069,17 @@ class HostEffects:
         """The durable host intent must be exactly the controller's pending one.
 
         A missing intent means the request never reached the host (no effect
-        ran). A different step, lease or controller epoch is a mismatch: an
-        uncertain effect is never quiesced on another operation's behalf.
+        ran); that is accepted only when the pending step is still ahead of
+        the journal, never for an earlier step. A different operation, agent,
+        owner or lease is a mismatch: an uncertain effect is never quiesced on
+        another operation's behalf.
+
+        The stored controller epoch may be older than the pending one. A retry
+        resumes the same intent under a newer controller epoch without
+        rewriting it, and the controller can even record its pending intent
+        and crash before the retry reaches this host: the effect identity is
+        what binds, the epoch only fences delayed calls, so the stored epoch
+        must not be newer than the pending one.
         """
         for name in (step + '.intent.json', step + '.json'):
             path = Path(directory) / name
@@ -1074,16 +1089,20 @@ class HostEffects:
             stored = record.get('request')
             if not isinstance(stored, dict):
                 raise Uncertain('journal:' + name)
+            stored_epoch = stored.get('controller_epoch')
             if (stored.get('operation') != request['operation']
                     or stored.get('agent') != request['agent']
                     or stored.get('owner') != request['owner']
                     or stored.get('lease_epoch') != request['lease_epoch']
-                    or stored.get('controller_epoch') != epoch):
+                    or not isinstance(stored_epoch, int)
+                    or isinstance(stored_epoch, bool)
+                    or not 1 <= stored_epoch <= epoch):
                 raise Refused('intent_changed')
             return
         if state.get('last_step') == step and state.get('last_ok') is True:
             raise Uncertain('journal:' + step)
-        if state.get('last_step') not in ('', step):
+        if (state.get('last_step') not in ('', step)
+                and STEP_SEQUENCE[step] <= state.get('last_seq', 0)):
             raise Refused('intent_changed')
 
     def _quiesce(self, step, entry):
@@ -1108,13 +1127,29 @@ class HostEffects:
         returned: ``{ok, quiesced, epoch: PENDING_EPOCH}``. The journal's
         order mark is left untouched so the controller's retry can resume the
         same step, idempotently, under the new epoch.
+
+        One operation can be interrupted more than once (an ``enable`` that
+        expires again after its retry, a later ``verify``): each uncertainty
+        has its own ``(pending_step, pending_epoch)`` and therefore its own
+        durable proof, named after both. A single per-operation file would
+        refuse the second, legitimate reconciliation as ``intent_changed`` and
+        leave the operation held with no way forward.
         """
         operation = request['operation']
         step, pending_epoch = request['pending_step'], request['pending_epoch']
+        if (step not in handoff_contract.RECONCILABLE_STEPS
+                or not isinstance(pending_epoch, int)
+                or isinstance(pending_epoch, bool) or pending_epoch < 1):
+            raise Refused('intent')
         directory = _ensure_private(self.operations / operation,
                                     root=self.state)
         state_path = directory / 'state.json'
-        with self._locked(directory, root=self.state):
+        # Quiescence stops the agent's unit: it must hold the same agent lock
+        # as every effect and fence write. The lock is reentrant, and
+        # ``perform`` already holds it around this call; taking it here keeps
+        # the invariant local to the function that acts on the host.
+        with self._agent_lock(request['agent']), self._locked(
+                directory, root=self.state):
             state = self._state(state_path)
             state, refusal = self._bind_lease(state, state_path, request)
             if refusal is not None:
@@ -1128,13 +1163,13 @@ class HostEffects:
                 self._bind_fence(request, entry)
             except Refused as exc:
                 return self._refusal(request, str(exc))
-            record_path = directory / 'reconcile.json'
+            record_path = directory / ('reconcile-%s-%d.json'
+                                       % (step, pending_epoch))
             if record_path.exists() or record_path.is_symlink():
                 record = _read_private_json(record_path, root=self.state)
                 if (record.get('pending_step') != step
-                        or record.get('pending_epoch') != pending_epoch):
-                    return self._refusal(request, 'intent_changed')
-                if record.get('quiesced') is not True:
+                        or record.get('pending_epoch') != pending_epoch
+                        or record.get('quiesced') is not True):
                     raise Uncertain('journal:reconcile')
                 return self._receipt(request, {'quiesced': True,
                                                'epoch': pending_epoch})
@@ -2326,10 +2361,17 @@ class HostAdapter:
 
         The switch event is the durable boundary: a completed turn recorded on
         the target host after it, with its cost line, proves the harness ran
-        there. Token usage above zero is the authenticated response; a
-        completed turn with no usage is returned as ``authenticated: false``
-        and holds the operation. The source is fenced and cannot produce a
-        target turn.
+        there. A running turn keeps the receipt pending.
+
+        A terminal turn (``done`` or ``orphan``) without a cost line is not
+        skipped: that is the missing-login/crashed-before-usage case the proof
+        must catch, and skipping it left ``verify`` pending forever. The runner
+        closes the resource before committing the ledger line, so a just-ended
+        turn is still given the short ``TURN_SETTLE_SECONDS`` window; after it
+        the turn is returned as ``authenticated: false`` and holds the
+        operation. A later authenticated turn supersedes an earlier failed one
+        once the operator repaired the login and the destination ran again.
+        The source is fenced and cannot produce a target turn.
         """
         if self.db is None:
             return None
@@ -2341,7 +2383,9 @@ class HostAdapter:
             return None
         switched = rows[0]['created_at']
         rows = self.db.query(
-            "SELECT tr.turn_id, tr.status, tr.ended_at, tc.id AS cost_id,"
+            "SELECT tr.turn_id, tr.status, tr.ended_at,"
+            " extract(epoch from now() - tr.ended_at)::float8 AS ended_ago,"
+            " tc.id AS cost_id,"
             " tc.input_tokens, tc.cached_input_tokens, tc.output_tokens"
             " FROM turn_resources tr"
             " LEFT JOIN turn_costs tc ON tc.turn_id = tr.turn_id"
@@ -2349,9 +2393,15 @@ class HostAdapter:
             " ORDER BY tr.started_at DESC, tr.id DESC LIMIT 20",
             (operation['agent'], operation['target'], switched))
         for row in rows:
-            if (row.get('status') != 'done' or row.get('ended_at') is None
-                    or row.get('cost_id') is None):
+            if (row.get('status') not in ('done', 'orphan')
+                    or row.get('ended_at') is None):
                 continue
+            if row.get('cost_id') is None:
+                ago = row.get('ended_ago')
+                if (isinstance(ago, (int, float)) and not isinstance(ago, bool)
+                        and ago < TURN_SETTLE_SECONDS):
+                    return None
+                return {'authenticated': False}
             tokens = sum(int(row.get(key) or 0) for key in
                          ('input_tokens', 'cached_input_tokens',
                           'output_tokens'))

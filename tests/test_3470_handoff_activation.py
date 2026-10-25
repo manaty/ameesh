@@ -255,6 +255,54 @@ class EffectTest(unittest.TestCase):
         held = self.call('revalidate', state='held', controller_epoch=5)
         self.assertIs(held['ok'], True)
 
+    def test_reconcile_accepts_a_pending_step_that_never_reached_the_host(self):
+        # The controller recorded its pending intent, then crashed before the
+        # host saw the call. The pending step is ahead of this host's journal:
+        # reconciliation quiesces nothing and must not dead-end the retry.
+        for step in ('prepare', 'transfer', 'session', 'admit'):
+            self.assertIs(self.call(step)['ok'], True)
+        proof = self.call('reconcile_effect', pending_step='verify',
+                          pending_epoch=3, controller_epoch=4)
+        self.assertIs(proof['ok'], True, proof)
+        self.assertIs(proof['quiesced'], True)
+        self.assertEqual(proof['epoch'], 3)
+
+    def test_two_successive_uncertainties_each_get_their_own_reconciliation(self):
+        # B1: one operation can be interrupted again *after* a reconciliation.
+        # The second (step, epoch) pair is a new uncertainty, not a replay of
+        # the first: refusing it as ``intent_changed`` would leave the
+        # operation held with no way forward.
+        self.prepared()
+        self.assertIs(self.call('admit')['ok'], True)
+        self.system.start_state = None
+        with self.assertRaises(companion.Uncertain):
+            self.call('enable')                      # pending (enable, 3)
+        self.system.fields['ActiveState'] = 'active'
+        first = self.call('reconcile_effect', pending_step='enable',
+                          pending_epoch=3, controller_epoch=4)
+        self.assertIs(first['ok'], True, first)
+        self.assertEqual(first['epoch'], 3)
+        # The retry expires again under a new controller epoch.
+        with self.assertRaises(companion.Uncertain):
+            self.call('enable', controller_epoch=5)  # pending (enable, 5)
+        self.system.fields['ActiveState'] = 'active'
+        second = self.call('reconcile_effect', pending_step='enable',
+                           pending_epoch=5, controller_epoch=6)
+        self.assertIs(second['ok'], True, second)
+        self.assertIs(second['quiesced'], True)
+        self.assertEqual(second['epoch'], 5)
+        self.assertGreaterEqual(self.system.stops, 2)
+        directory = self.fx.effects.operations / ('a' * 32)
+        self.assertEqual(
+            sorted(path.name for path in directory.glob('reconcile-*.json')),
+            ['reconcile-enable-3.json', 'reconcile-enable-5.json'])
+        self.assertFalse((directory / 'reconcile.json').exists())
+        # Each proof is still replayable and bound to its own epoch.
+        replay = self.call('reconcile_effect', pending_step='enable',
+                           pending_epoch=3, controller_epoch=7)
+        self.assertIs(replay['ok'], True, replay)
+        self.assertEqual(replay['epoch'], 3)
+
 
 class WireContractTest(unittest.TestCase):
     """The H3 wire shape: bounded fields, exact receipts, no command/path."""
@@ -584,6 +632,100 @@ class AdapterTest(PgTestCase):
             self.finish(operation)
         self.assertIs(proof['ok'], True)
         self.assertIs(proof['authenticated'], False)
+
+    def switch(self, *, seconds=0):
+        # PgTestCase truncates turn_costs (through its work_items FK) but not
+        # turn_resources: drop the earlier tests' rows on this agent/host so
+        # the proof really starts at this operation's switch event.
+        self.db.execute("DELETE FROM turn_resources WHERE agent='dev'"
+                        " AND host='target'")
+        self.db.execute(
+            "INSERT INTO host_handoff_events (operation, state, detail, created_at)"
+            " VALUES (%s, 'switched', 'test', now() - make_interval(secs=>%s))",
+            (self.row['id'], seconds))
+
+    def terminal_turn(self, *, tokens=None, orphan=False, settled_seconds=None):
+        """A terminal target turn; its ledger line only when ``tokens`` is set."""
+        turn = 'turn-%d-%d' % (int(time.time() * 1000), len(self.fake.requests))
+        self.api.turn_resources.open_turn(turn, 'dev', 'target', pgid=None,
+                                          label='first')
+        self.api.turn_resources.close_turn(turn, orphan=orphan)
+        if tokens is not None:
+            self.api.turn_costs.insert(
+                agent='dev', harness='deepseek', turn=None, model=None,
+                session=None, usd=0, input_tokens=tokens,
+                cached_input_tokens=0, output_tokens=0, cum_usd=0,
+                cum_input_tokens=tokens, cum_cached_input_tokens=0,
+                cum_output_tokens=0, turn_id=turn)
+        if settled_seconds is not None:
+            self.db.execute(
+                "UPDATE turn_resources SET"
+                " started_at=now()-make_interval(secs=>%s),"
+                " ended_at=now()-make_interval(secs=>%s) WHERE turn_id=%s",
+                (settled_seconds + 10, settled_seconds, turn))
+        return turn
+
+    def test_verify_holds_a_settled_turn_without_a_cost_line(self):
+        # B2: a terminal turn with no ledger line is the missing-login or
+        # died-before-usage case. It must hold (authenticated false), never
+        # leave verify pending forever.
+        self.set_state('activated', release_revision=COMMIT, branch='main',
+                       commit=COMMIT, cwd='/w/dev')
+        self.switch(seconds=300)
+        self.terminal_turn(tokens=None, settled_seconds=60)
+        operation = self.intent('verify')
+        try:
+            proof = self.adapter.verify(operation)
+        finally:
+            self.finish(operation)
+        self.assertIs(proof['ok'], True, proof)
+        self.assertIs(proof.get('turn_completed'), True, proof)
+        self.assertIs(proof.get('authenticated'), False, proof)
+
+    def test_verify_waits_for_a_just_closed_turn_ledger_line(self):
+        # The runner closes the resource before writing its ledger line: a
+        # just-ended terminal turn stays pending, never a spurious hold.
+        self.set_state('activated', release_revision=COMMIT, branch='main',
+                       commit=COMMIT, cwd='/w/dev')
+        self.switch()
+        self.terminal_turn(tokens=None)
+        operation = self.intent('verify')
+        try:
+            proof = self.adapter.verify(operation)
+        finally:
+            self.finish(operation)
+        self.assertEqual(proof, {'ok': True, 'pending': True})
+
+    def test_verify_holds_a_settled_orphan_turn_without_a_cost_line(self):
+        self.set_state('activated', release_revision=COMMIT, branch='main',
+                       commit=COMMIT, cwd='/w/dev')
+        self.switch(seconds=300)
+        self.terminal_turn(tokens=None, orphan=True, settled_seconds=60)
+        operation = self.intent('verify')
+        try:
+            proof = self.adapter.verify(operation)
+        finally:
+            self.finish(operation)
+        self.assertIs(proof['ok'], True, proof)
+        self.assertIs(proof.get('authenticated'), False, proof)
+
+    def test_verify_accepts_a_later_authenticated_turn_after_a_failure(self):
+        # Once the login is repaired and the destination runs again, the new
+        # authenticated turn is the proof; an older failed one does not pin
+        # the operation to a hold.
+        self.set_state('activated', release_revision=COMMIT, branch='main',
+                       commit=COMMIT, cwd='/w/dev')
+        self.switch(seconds=300)
+        self.terminal_turn(tokens=None, settled_seconds=120)
+        self.terminal_turn(tokens=10)
+        operation = self.intent('verify')
+        try:
+            proof = self.adapter.verify(operation)
+        finally:
+            self.finish(operation)
+        self.assertIs(proof['ok'], True, proof)
+        self.assertIs(proof['turn_completed'], True)
+        self.assertIs(proof['authenticated'], True)
 
     # -- restore / reconcile ----------------------------------------------
 
