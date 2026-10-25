@@ -144,7 +144,10 @@ class Recorded:
                 base=base, head=head, target=base)
             if unknown:
                 raise TrainError("unknown historical author for commit %s" % unknown[0])
-            missing_family = [entry for entry in authors if not entry["family"]]
+            # #3584 : un auteur prouvé sous plusieurs familles n'est pas sans
+            # famille — l'ensemble est exclu à la porte, comme à la désignation.
+            missing_family = [entry for entry in authors
+                              if not entry.get("family") and not entry.get("families")]
             if missing_family:
                 raise TrainError("unknown model family for author %s"
                                  % missing_family[0]["name"])
