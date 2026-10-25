@@ -214,6 +214,35 @@ class CmdNotifySharedTest(PgTestCase):
         super().setUp()
         self.db.execute("TRUNCATE notify_state")
 
+    def test_a_standby_service_keeps_its_other_passes(self):
+        # Le bail d'état ne ferme que la livraison d'alertes : le service
+        # complet d'un hôte en veille garde take/issues/github-watch/ci.
+        holder_cfg = dataclasses.replace(
+            self.cfg, host="agents-a",
+            state_dir=tempfile.mkdtemp(prefix="3576-holder-", dir=self.tmp))
+        holder = notify.Notifier(holder_cfg, ncfg(), notify.empty_state(),
+                                 sender=FakeSender(), log=lambda text: None)
+        lease, deliver = notify.enter_shared_state(self.db, holder, holder_cfg)
+        self.assertTrue(deliver)
+        try:
+            cfg = dataclasses.replace(
+                self.cfg, host="agents-b",
+                state_dir=tempfile.mkdtemp(prefix="3576-standby-", dir=self.tmp))
+            args = notify.build_parser().parse_args(["--once"])
+            fake = mock.Mock()
+            fake.state = notify.empty_state()
+            fake.log = lambda text: None
+            with mock.patch.object(notify, "Notifier", return_value=fake), \
+                    mock.patch.object(notify.db_mod, "connect", return_value=self.db), \
+                    mock.patch.object(notify.db_mod, "require_schema"):
+                self.assertEqual(notify.cmd_notify(cfg, ncfg(), args), 0)
+            fake.run_local_pass.assert_called_once()
+            fake.run_pass.assert_called_once()
+            self.assertEqual(fake.run_pass.call_args.kwargs["only"],
+                             frozenset({"take", "issues", "github-watch", "ci"}))
+        finally:
+            notify.leave_shared_state(self.db, holder, lease)
+
     def test_once_seeds_the_shared_state_and_releases_the_lease(self):
         cfg = dataclasses.replace(
             self.cfg, host="agents-a",

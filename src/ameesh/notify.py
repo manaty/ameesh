@@ -3198,6 +3198,15 @@ def cmd_notify(cfg: Config, ncfg: NotifyConfig, args) -> int:
                     lease, deliver = enter_shared_state(
                         db, notifier, cfg, dry_run=args.dry_run)
                     if not deliver:
+                        # Le bail ne ferme QUE la livraison d'alertes : les
+                        # autres passes (take, issues, github-watch, ci) de ce
+                        # service gardent leur tour, selon sa sélection.
+                        if only is not None:
+                            rest = frozenset(only) - {"alerts"}
+                        else:
+                            rest = frozenset(ONLY_PASSES) - {"alerts"} - set(skip or ())
+                        if rest:
+                            notifier.run_pass(db, thresholds=seuils, only=rest)
                         if args.once:
                             return 0
                         time.sleep(interval)
