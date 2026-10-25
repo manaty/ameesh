@@ -4293,12 +4293,24 @@ def _cost_l26(cfg: Config, db, what: str, args) -> int:
     touché. Schémas : docs/EXPLOITATION.md."""
     ops = storage.of(db).operations
     if what == "turns":
+        limit = int(args.limit)
         rows = ops.turns(agent=args.agent, since_s=_since_seconds(args.since),
-                         limit=args.limit, message=getattr(args, "message", None))
+                         limit=limit, message=getattr(args, "message", None))
+        # #3452 : le plafond s'appliquait sans le dire — 500 tours sur ~4 h 30
+        # d'une nuit se lisaient comme la fenêtre entière. La troncature est
+        # désormais dite, en JSON comme en texte.
+        truncated = bool(limit and len(rows) >= limit)
         if args.json:
-            print(json.dumps({"schema": "ameesh-turns/1", "turns": rows},
-                             ensure_ascii=False, indent=2))
+            payload = {"schema": "ameesh-turns/1", "turns": rows,
+                       "truncated": truncated, "limit": limit}
+            print(json.dumps(payload, ensure_ascii=False, indent=2))
+            if truncated:
+                print("note: window truncated at %d turn(s); raise --limit to see "
+                      "the rest" % limit, file=sys.stderr)
             return 0
+        if truncated:
+            print("note: window truncated at %d turn(s); raise --limit to see the rest"
+                  % limit, file=sys.stderr)
         if getattr(args, "message", None) is not None:
             # L80b : le coût est celui du TOUR qui a servi le message, partagé
             # avec les autres messages du même tour — jamais divisé.
