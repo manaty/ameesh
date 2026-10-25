@@ -25,7 +25,8 @@
 #                venv versionné préparé à l'écart (dépendance psycopg comprise)
 #                puis bascule atomique du venv (#1969) ; refusé tant qu'une
 #                base n'a pas les migrations de REF
-#   role         rôle superviseur réappliqué, sur chaque base où il existe
+#   role         rôle superviseur réappliqué, sur chaque base où il existe ;
+#                JIT de Postgres coupé par défaut sur la base du mesh (#3503)
 #   redemarrer   exécuteurs du poste un par un (arrêt prouvé avant chaque
 #                démarrage), puis notify, puis les exécuteurs de l'ancienne base
 #                refusé depuis une unité ameesh-* (risque de tuer le script)
@@ -467,9 +468,27 @@ SQL
   fi
 }
 
+reapply_jit_off() {
+  # #3503 : le JIT de Postgres compilait des plans à coût estimé élevé sur de
+  # très petites tables (_unreachable_lots : 42 s contre 0,2 s, et toutes les
+  # passes de réassignation des relecteurs expiraient). ameesh coupe le JIT
+  # dans chaque session ; ce réglage de la base et du rôle de connexion couvre
+  # les sessions qui ne passent pas par ameesh (psql, script de déploiement,
+  # nouveau rôle).
+  local existe
+  existe=$(ssh_vm "runuser -u postgres -- psql -X -At -d ameesh -c \"SELECT 1 FROM pg_roles WHERE rolname = 'ameesh'\"")
+  if [ "$existe" = 1 ]; then
+    ssh_vm "runuser -u postgres -- psql -X -q -d ameesh -v ON_ERROR_STOP=1 -c 'ALTER ROLE ameesh SET jit = off'"
+  fi
+  ssh_vm "runuser -u postgres -- psql -X -q -d ameesh -v ON_ERROR_STOP=1 -c 'ALTER DATABASE ameesh SET jit = off'"
+  echo "JIT de Postgres coupé par défaut (rôle ameesh, base du mesh)"
+}
+
 role() {
   local existe dsn
   reapply_executor_role
+  etape "réglage JIT de la base du mesh (#3503)"
+  reapply_jit_off
   etape "rôle $ROLE, base du mesh (sur le serveur, en superutilisateur)"
   existe=$(ssh_vm "runuser -u postgres -- psql -X -At -d ameesh -c \"SELECT 1 FROM pg_roles WHERE rolname = '$ROLE'\"")
   if [ "$existe" = 1 ]; then

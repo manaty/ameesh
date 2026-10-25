@@ -26,6 +26,7 @@
 --
 --   CREATE ROLE supervision_outil LOGIN IN ROLE ameesh_superviseur;
 --   ALTER ROLE supervision_outil SET default_transaction_read_only = on;
+--   ALTER ROLE supervision_outil SET jit = off;  -- #3503 : pas de compilation JIT
 --   -- mot de passe : \password supervision_outil (jamais dans un fichier versionné)
 --
 -- Ce qui est EXCLU, et pourquoi (le test tests/test_cluster.py vérifie que
