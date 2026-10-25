@@ -710,11 +710,38 @@ def format_prose(row: dict, now: float | None = None) -> list[str]:
 # réponse
 # --------------------------------------------------------------------------
 
+#: Les deux mentions que `signer-owner.sh` (manaty/home, #3443) ajoute à
+#: l'option d'une signature au nom de l'owner, décision #135142 b : la première
+#: sans source, la seconde avec la session d'origine. Elles sont figées dans le
+#: script : `match_option` ne reconnaît qu'elles, jamais un autre texte (#3454).
+BUREAU_MENTIONS = (
+    "— saisi par le bureau, délégation §10",
+    "— réponse de l'owner relayée par le bureau, source ",
+)
+
+
 def match_option(view: dict, text: str) -> str | None:
-    """La clé de l'option que `text` désigne exactement (casse ignorée), sinon None."""
-    wanted = str(text or "").strip().lower()
+    """La clé de l'option que `text` désigne (casse de la clé ignorée), sinon None.
+
+    Reconnaît « <clé> » et les deux textes que `signer-owner.sh` signe au nom
+    de l'owner : « <clé> — saisi par le bureau, délégation §10 » et
+    « <clé> — réponse de l'owner relayée par le bureau, source <session> »
+    (#3443, décision #135142 b). Le texte signé reste entier : l'empreinte
+    `answer_digest` couvre le texte et l'option, et une preuve déjà enregistrée
+    garde l'option qu'elle a signée (#3454)."""
+    wanted = str(text or "").strip()
     for option in view.get("options") or ():
-        if wanted == str(option.get("key") or "").lower():
+        key = str(option.get("key") or "")
+        if wanted.lower() == key.lower():
+            return option["key"]
+        head = key + " "
+        if wanted[:len(head)].lower() != head.lower():
+            continue
+        mention = wanted[len(head):]
+        if mention == BUREAU_MENTIONS[0]:
+            return option["key"]
+        relay = BUREAU_MENTIONS[1]
+        if mention.startswith(relay) and mention[len(relay):].strip():
             return option["key"]
     return None
 
