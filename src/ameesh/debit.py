@@ -27,7 +27,15 @@ humaines explicites (geste owner, go encore requis, décision owner due ou non
 signée, retour de l'owner, login/2FA, lot `waiting_human`) sont listées à part
 et ne font pas sortir 2 : le canon ne vise que les attentes d'agent. Une
 simple mention d'une règle ou d'une consigne de l'owner ne suffit pas, et un
-`hold_undeployed` n'est jamais humain.
+`hold_undeployed` n'est jamais humain. #3447 : les lots réservés à un exécutant
+externe déclaré (`external_executor`) sont, de même, listés à part (« attentes
+externes ») : ce n'est ni un lot sans assigné ni une attente d'agent, et ce
+n'est pas `--check` qui la pousse.
+
+Un lot relu (tous ses avis rendus) dont `branch_target` est la branche d'un
+autre lot **ouvert** n'est pas une attente de paquet : il ne peut entrer
+qu'avec ce lot, dont le hold couvre déjà l'attente. Le rapport le marque
+`depends_on` et ne produit ni `qa_merge` ni sortie 2 pour lui (#3437).
 """
 from __future__ import annotations
 
@@ -146,6 +154,33 @@ def installed_version() -> str:
 
 def _version_gt(left: tuple[int, int, int], right: tuple[int, int, int] | None) -> bool:
     return right is not None and left > right
+
+
+def _branch_name(value: Any) -> str:
+    """La branche courte d'une ref (`origin/lot/x`, `refs/heads/lot/x`)."""
+    name = str(value or "").strip()
+    for prefix in ("refs/heads/", "refs/remotes/origin/", "origin/"):
+        if name.startswith(prefix):
+            return name[len(prefix):]
+    return name
+
+
+def _target_lot(ident: int, item: Mapping[str, Any],
+                open_branches: Mapping[tuple[str, str], Iterable[int]]) -> int | None:
+    """Le lot ouvert dont `branch_target` est la branche, s'il existe (#3437).
+
+    La comparaison est faite par projet quand il est connu : deux projets
+    peuvent nommer la même branche. Un lot ne dépend jamais de lui-même."""
+    target = _branch_name(item.get("branch_target"))
+    if not target:
+        return None
+    app = str(item.get("app") or "")
+    found: set[int] = set()
+    for (branch_app, branch), lots in open_branches.items():
+        if branch != target or (app and branch_app and branch_app != app):
+            continue
+        found.update(int(lot) for lot in lots if int(lot) != int(ident))
+    return min(found) if found else None
 
 
 def _same_sha(left: Any, right: Any) -> bool:
@@ -676,6 +711,9 @@ def build(*, items: Iterable[Mapping[str, Any]],
           holds: Mapping[int, Mapping[str, Mapping[str, Any]]] | None = None,
           ci_unreadable: Iterable[str] = ()) -> dict:
     """Le rapport de débit, calculé sans I/O (témoins et tests)."""
+    # #3447 : le préfixe de journal est défini une fois, pour l'écrivain
+    # (`work.set_external_executor`) et ce lecteur.
+    from .storage.interface import EXTERNAL_EXECUTOR_NOTE
     now = time.time() if now is None else float(now)
     installed = installed_version() if installed is None else str(installed)
     installed_triple = _version(installed)
@@ -699,6 +737,9 @@ def build(*, items: Iterable[Mapping[str, Any]],
                  for ident, values in events_by_lot.items()}
     hold_by_lot = {int(ident): dict(value) for ident, value in (holds or {}).items()}
     held_lots = {ident for ident, entries in hold_by_lot.items() if entries}
+    #: branches des lots encore ouverts : une cible de lot qui en nomme une
+    #: est une dépendance (le lot entre avec son parent), pas un paquet dû.
+    open_branches: dict[tuple[str, str], list[int]] = {}
 
     qa: list[dict] = []
     blocked_reviews: list[dict] = []
@@ -707,6 +748,7 @@ def build(*, items: Iterable[Mapping[str, Any]],
     wakes_out: list[dict] = []
     device_holds: list[dict] = []
     undeployed_holds: list[dict] = []
+    external_waits: list[dict] = []
     unreadable: list[str] = list(devices.get("unreadable") or ())
 
     for ident, item in by_id.items():
@@ -716,6 +758,38 @@ def build(*, items: Iterable[Mapping[str, Any]],
         terminal_ts = _terminal_at(lot_milestones)
         if terminal_ts is not None and _reopened(lot_events, terminal_ts):
             terminal_ts = None
+        # #3447 : un lot réservé à un exécutant externe n'est pas « sans
+        # assigné » ; il attend cet exécutant (bureau, owner), pas un agent.
+        # La mesure reste lue sur le journal : la déclaration nommée par
+        # `work.EXTERNAL_EXECUTOR_NOTE`, sinon la création du lot.
+        external = str(item.get("external_executor") or "").strip()
+        state = state_by_lot.get(ident)
+        if external and not (item.get("assignee") or "").strip() \
+                and terminal_ts is None and state in ("intake", "build"):
+            since = item.get("created_ts")
+            for event in lot_events:
+                text = str(event.get("note") or "")
+                if not text.startswith(EXTERNAL_EXECUTOR_NOTE):
+                    continue
+                at = event.get("at_ts")
+                if at is not None and (since is None or float(at) > float(since)):
+                    since = float(at)
+            age = _age(now, since)
+            external_waits.append({
+                "lot": ident, "title": item.get("title") or "",
+                "app": item.get("app") or None, "who": external,
+                "kind": "external", "state": state,
+                "since_ts": since, "since": _iso(since), "age_s": age,
+                "gesture": "the external executor %s acts (bureau/owner, not an "
+                           "agent); the pilot clears the reservation if it is no "
+                           "longer wanted (`ameesh work external-executor %d "
+                           "--clear`)" % (external, ident),
+            })
+        if terminal_ts is None:
+            branch = _branch_name(item.get("branch"))
+            if branch:
+                open_branches.setdefault(
+                    (str(item.get("app") or ""), branch), []).append(ident)
         if freeze is not None and terminal_ts is None:
             designation = designations(lot_milestones, lot_events)
             unreadable.extend("%s: %s" % (ident, text)
@@ -808,8 +882,23 @@ def build(*, items: Iterable[Mapping[str, Any]],
             }
             wakes_out.append(entry)
 
+    # Une cible qui est la branche d'un lot encore ouvert est une dépendance :
+    # le lot ne peut pas entrer seul dans un paquet, il suit le lot parent
+    # (dont le hold, s'il y en a un, porte déjà l'attente) (#3437).
+    dependents_by_lot: dict[int, list[int]] = {}
+    for row in qa:
+        parent = _target_lot(int(row["lot"]), by_id[int(row["lot"])], open_branches)
+        if parent is not None:
+            row["depends_on"] = parent
+            dependents_by_lot.setdefault(parent, []).append(int(row["lot"]))
+
     # -- tableau des attentes de plus de 2 h --------------------------------
     waits: list[dict] = []
+
+    def dependents_of(lot) -> dict:
+        """Les lots relus que ce lot transporte : leur attente est la sienne."""
+        children = dependents_by_lot.get(int(lot))
+        return {"dependents": sorted(children)} if children else {}
 
     def add_wait(kind, entry, since, who, gesture, level=1, human=False, **extra):
         age = _age(now, since)
@@ -839,8 +928,11 @@ def build(*, items: Iterable[Mapping[str, Any]],
                      GESTURES["no_reviewer"].format(lot=row["lot"]),
                      human=_human_wait(state))
         else:
+            if row.get("depends_on"):
+                continue                # l'attente est celle du lot parent
             add_wait("qa_merge", row, row["frozen_ts"], "paquet",
-                     GESTURES["qa_merge"], level=2, human=_human_wait(state))
+                     GESTURES["qa_merge"], level=2, human=_human_wait(state),
+                     **dependents_of(row["lot"]))
     for row in blocked_reviews:
         add_wait("blocking_review", row, row["blocked_ts"],
                  row.get("assignee") or row.get("reviewer") or "auteur",
@@ -857,15 +949,16 @@ def build(*, items: Iterable[Mapping[str, Any]],
         if row.get("device"):
             add_wait("hold_device", row, row["since_ts"], row.get("by") or "?",
                      GESTURES["hold_device"], level=2, device=row["device"],
-                     human=human)
+                     human=human, **dependents_of(row["lot"]))
         elif row.get("undeployed"):
             add_wait("hold_undeployed", row, row["since_ts"], row.get("by") or "?",
                      GESTURES["hold_undeployed"], level=2,
-                     version=row.get("version"), human=human)
+                     version=row.get("version"), human=human,
+                     **dependents_of(row["lot"]))
         else:
             add_wait("hold", row, row["since_ts"], row.get("by") or "?",
                      GESTURES["hold"].format(who=row.get("by") or "?"), level=2,
-                     human=human)
+                     human=human, **dependents_of(row["lot"]))
     for row in wakes_out:
         if row.get("overdue"):
             add_wait("wake_overdue", row, row["due_ts"],
@@ -1020,6 +1113,7 @@ def build(*, items: Iterable[Mapping[str, Any]],
         "idle_with_work": len(idle_with_work),
         "slow_waits": len(slow_waits),
         "human_waits": len(human_waits),
+        "external_waits": len(external_waits),
         "slow_ci_runs": len([run for run in runs
                              if float(run["duration_s"]) > ci_slow_s]),
     }
@@ -1036,6 +1130,9 @@ def build(*, items: Iterable[Mapping[str, Any]],
         "totals": totals,
         "slow_waits": slow_waits,
         "human_waits": human_waits,
+        "external_waits": sorted(
+            external_waits,
+            key=lambda row: (-float(row.get("age_s") or 0.0), row["lot"])),
         "qa": sorted(qa, key=lambda row: (-float(row["age_s"] or 0.0), row["lot"])),
         "blocked_reviews": sorted(blocked_reviews,
                                   key=lambda row: (-float(row["age_s"] or 0.0),
@@ -1092,9 +1189,14 @@ def _rows(db, sql: str, params=()) -> list[dict]:
 
 
 #: les colonnes d'un lot lues sont des **étiquettes** (id, titre, projet,
-#: assigné) ; jamais state, reviewer(s), wake_at ni updated_at (canon 24/10).
+#: assigné, exécutant externe déclaré, instant de création, branche et cible) ;
+#: jamais state, reviewer(s), wake_at ni updated_at (canon 24/10). L'état
+#: courant d'un lot se lit au journal (`state_by_lot`), pas dans sa colonne.
 _ITEMS_SQL = """
-    SELECT w.id, w.title, w.app, w.assignee, w.priority
+    SELECT w.id, w.title, w.app, w.assignee, w.priority,
+           to_jsonb(w)->>'external_executor' AS external_executor,
+           extract(epoch FROM w.created_at)::float8 AS created_ts,
+           w.branch, w.branch_target
       FROM work_items w
      WHERE (EXISTS (SELECT 1 FROM work_item_milestones m
                      WHERE m.work_item_id = w.id AND m.at > to_timestamp(%s))
@@ -1345,6 +1447,20 @@ def format_text(report: Mapping[str, Any]) -> str:
                             str(row.get("title") or "")[:48]))
     else:
         lines.append("Attentes humaines, hors --check : aucune.")
+    external = report.get("external_waits") or []
+    if external:
+        lines.append("")
+        lines.append("Attentes externes, hors --check (%d) — exécutant déclaré, "
+                     "pas un agent à assigner :" % len(external))
+        for row in external[:20]:
+            lines.append("  #%-6d %-16s %8s  %-22s %s"
+                         % (int(row.get("lot") or 0), str(row.get("kind")),
+                            _duration(row.get("age_s")),
+                            str(row.get("who") or "?")[:22],
+                            str(row.get("title") or "")[:48]))
+            lines.append("         → %s" % row.get("gesture"))
+    else:
+        lines.append("Attentes externes, hors --check : aucune.")
     reviews = report.get("reviews_by_reviewer") or []
     lines.append("")
     lines.append("Avis dus par relecteur : %s" % (
@@ -1408,8 +1524,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-jobs", action="store_true",
                         help="ne pas lire les jobs GitHub (durée par workflow seulement)")
     parser.add_argument("--check", action="store_true",
-                        help="sortir 2 si une attente non humaine dépasse le seuil "
-                             "(aucun « rien à signaler »)")
+                        help="sortir 2 si une attente d'agent dépasse le seuil "
+                             "(hors attentes humaines et externes ; aucun « rien à "
+                             "signaler »)")
     parser.add_argument("--canon", action="append", default=None,
                         help="racine d'un canon à lire pour les appareils (répétable)")
     parser.add_argument("--installed", default=None,

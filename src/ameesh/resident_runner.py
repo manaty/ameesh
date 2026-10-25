@@ -276,6 +276,26 @@ def usage_event(protocol: str, result: "resident.TurnResult", *,
     return event
 
 
+def inputs_attribution(protocol: str, *, session: str = "", turn: str = "",
+                       inputs=(), status: str = "") -> dict | None:
+    """L'attribution des messages servis (L80b), sans mesure d'usage.
+
+    Claude natif l'écrit dans `resident.inputs` parce que son flux porte déjà
+    l'usage ; depuis #3452, un tour **non résident** (harnais CLI) écrit le
+    même événement, sinon `cost turns --message` ne rend rien pour la majorité
+    des tours. None quand il n'y a rien à attribuer (aucun message servi)."""
+    if not inputs:
+        return None
+    return {
+        "type": resident.INPUTS_EVENT,
+        "protocol": protocol,
+        "session": session or "",
+        "turn": turn or "",
+        "status": status,
+        "inputs": [str(i) for i in inputs if i is not None],
+    }
+
+
 def inputs_event(protocol: str, result: "resident.TurnResult", *,
                  turn: str = "", inputs=()) -> dict | None:
     """The served-message attribution of a native-usage resident turn (L80b).
@@ -286,16 +306,10 @@ def inputs_event(protocol: str, result: "resident.TurnResult", *,
     the steer barrier, so an ACK accepted while the turn closes is included;
     a failed write never fails the turn (the cost is already counted by the
     stream, only the attribution is lost). None when there is nothing to say."""
-    if protocol not in NATIVE_USAGE or not inputs:
+    if protocol not in NATIVE_USAGE:
         return None
-    return {
-        "type": resident.INPUTS_EVENT,
-        "protocol": protocol,
-        "session": result.session or "",
-        "turn": turn or "",
-        "status": result.status,
-        "inputs": [str(i) for i in inputs if i is not None],
-    }
+    return inputs_attribution(protocol, session=result.session or "",
+                              turn=turn, inputs=inputs, status=result.status)
 
 
 def write_usage_event(path: str, event: dict | None) -> bool:

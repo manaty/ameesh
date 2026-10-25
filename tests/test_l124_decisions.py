@@ -286,6 +286,51 @@ class ReponseTest(_Base):
                          (None, texte))
         self.assertEqual(decisions.match_option(view, " A "), "a")
 
+    def test_mentions_du_bureau_gardent_l_option(self):
+        """#3454 : les deux mentions exactes de signer-owner.sh (#3443) laissent
+        l'option reconnue ; le texte signé reste entier, rien d'autre ne
+        devient une option."""
+        saisine = "a — saisi par le bureau, délégation §10"
+        relais = ("b — réponse de l'owner relayée par le bureau, source "
+                  "526a0a74-f00e-4639-b4d1-d11066d51f99")
+        first = self.ask()
+        answer = self.answer(first["id"], saisine)["decision"]["answer"]
+        self.assertEqual((answer["option"], answer["option_label"], answer["text"]),
+                         ("a", "oui, fusionner maintenant", saisine))
+        second = self.ask()
+        answer = self.answer(second["id"], relais)["decision"]["answer"]
+        self.assertEqual((answer["option"], answer["option_label"], answer["text"]),
+                         ("b", "non, attendre la revue", relais))
+        # la note du lot nomme l'option, comme pour une réponse simple
+        notes = [e["note"] for e in work.events(self.db, self.lot["id"])]
+        self.assertTrue(any("decision #%d answered by %s (cli): option a"
+                            % (first["id"], ALICE) in note for note in notes), notes)
+        # la clé reste insensible à la casse, la mention est exacte
+        self.assertEqual(decisions.match_option(first, "A — saisi par le bureau, "
+                                                       "délégation §10"), "a")
+        relais_a = "a — réponse de l'owner relayée par le bureau, source "
+        # B1 de ameesh-cx3 : la session suit le contrat de --source
+        # ([A-Za-z0-9._:@-], sans tiret initial, 200 au plus)
+        for session in ("x", "a.b_c:d@e-f", "x" * 200):
+            self.assertEqual(decisions.match_option(first, relais_a + session), "a",
+                             session)
+        for texte in ("a et autre chose",
+                      "a — saisi par le bureau",
+                      "a — saisi par le bureau, délégation §10 et autre chose",
+                      relais_a,
+                      relais_a + "x" * 201,
+                      relais_a + "-session",
+                      relais_a + "session 1",
+                      relais_a + "session1, mais attendre lundi",
+                      relais_a + "session1\nmais attendre lundi",
+                      "a — Réponse de l'owner relayée par le bureau, source x"):
+            self.assertIsNone(decisions.match_option(first, texte), texte)
+        # le texte hors contrat reste libre, et entier
+        conditionnel = relais_a + "session1, mais attendre lundi"
+        third = self.ask()
+        answer = self.answer(third["id"], conditionnel)["decision"]["answer"]
+        self.assertEqual((answer["option"], answer["text"]), (None, conditionnel))
+
     def test_seul_l_humain_vise(self):
         view = self.ask()
         with self.assertRaises(decisions.DecisionError) as ctx:
@@ -384,6 +429,20 @@ class SignatureTest(_Base):
         autre = self.ask(needs_signature=True, question="Autre ?")
         with self.assertRaises(decisions.DecisionError):
             self.answer(autre["id"], texte, signed=True)
+
+    def test_signature_d_une_reponse_du_bureau(self):
+        """#3454 : la mention du bureau reste dans le texte signé, l'option
+        reconnue entre dans l'empreinte et la preuve se vérifie."""
+        key = self.owner_key()
+        view = self.ask(needs_signature=True)
+        texte = "a — saisi par le bureau, délégation §10"
+        digest = decisions.answer_digest(view, texte, "a", ALICE)
+        out = self.answer(view["id"], texte, key_path=key)
+        answer = out["decision"]["answer"]
+        self.assertEqual((answer["option"], answer["text"], answer["proof"]["digest"]),
+                         ("a", texte, digest))
+        ok, detail = decisions.verify_proof(self.db, out["decision"])
+        self.assertTrue(ok, detail)
 
 
 # ==========================================================================

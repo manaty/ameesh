@@ -519,6 +519,7 @@ def add(
     mark_item_id: int | None = None,
     mark_note: str = "",
     unique_ref: bool = False,
+    external_executor: str | None = None,
 ) -> dict:
     """Crée un lot en `intake`. Un assigné passe par l'attribution gardée
     (`check_assignee`, L37) : un agent non réveillable est refusé (WorkError).
@@ -556,6 +557,12 @@ def add(
     parent is refused before any creation. No number is ever guessed from the
     title or the body.
 
+    #3447 : `external_executor` déclare l'agent externe (ou l'humain) à qui le
+    lot est réservé, sans l'assigner : L165 ne le prend pas, l'alerte et le
+    débit le nomment. Le geste est celui d'un pilote (`corrector`,
+    `history=False`) ; un lot ne porte pas deux exécutants (`assignee` et
+    `external_executor` s'excluent).
+
     Canon §2 (15/10/2026): the returned item carries `route_hint` when the
     title or the source looks like a non-blocking follow-up (N, P2, P3) — the
     route to the backlog, to be shown by the caller. Nothing is ever refused:
@@ -570,7 +577,8 @@ def add(
                    estimate=estimate, estimate_source=estimate_source, size=size,
                    note=note, force=force, parent_lot=parent_lot,
                    mark_item_id=mark_item_id, mark_note=mark_note,
-                   unique_ref=unique_ref, team_queue=True)
+                   unique_ref=unique_ref, team_queue=True,
+                   external_executor=external_executor)
 
 
 #: #3209 : les états d'un lot encore ouvert, lus par `open_with_source`
@@ -620,7 +628,8 @@ def _create(db: Db, *, title, type="evolution", source="", app="",  # noqa: A002
             actor="", package=None, externe=False, cfg=None, branch=None,
             branch_target=None, priority=None, estimate=None, estimate_source=None,
             size=None, note="", force=None, parent_lot=None, mark_item_id=None,
-            mark_note="", unique_ref: bool = False, team_queue: bool) -> dict:
+            mark_note="", unique_ref: bool = False, team_queue: bool,
+            external_executor=None) -> dict:
     """`add`, et `_decision_lot` (`team_queue=False`)."""
     minutes = None
     if estimate not in (None, ""):
@@ -665,10 +674,21 @@ def _create(db: Db, *, title, type="evolution", source="", app="",  # noqa: A002
         queued = check if team_queue else None
     elif externe:
         raise WorkError("--externe without assignee: nothing to force")
+    external_executor = (external_executor or "").strip() or None
+    if external_executor:
+        if assignee:
+            raise WorkError("a lot carries one executor: %s is assigned, drop the "
+                            "external executor (or assign it instead)" % assignee)
+        # #3447 : déclarer l'exécutant externe est un geste de pilote. Le lot
+        # reste sans assigné (l'agent externe ne se réveille pas, 0030).
+        actor = corrector(cfg, db, actor, what="external executor", history=False)
+        external_executor = check_external_executor(db, external_executor, cfg=cfg)
     fiche = _package(db, package) if package else None
     branch, branch_target = _branch_args(branch, branch_target)
     created = ("created" + (" (plan: %s)" % package if package else "")
                + ("; estimate: %s" % span(minutes * 60) if minutes else "")
+               + ("; reserved to external executor %s" % external_executor
+                  if external_executor else "")
                + ("; %s" % note if note else ""))
 
 
@@ -686,7 +706,7 @@ def _create(db: Db, *, title, type="evolution", source="", app="",  # noqa: A002
             queued_note=queued and _queued_note(queued, created),
             forced_note=queued and _forced_note(queued, created, force, actor),
             mark_item_id=mark_item_id, mark_note=mark_note, parent_lot=parent_lot,
-            unique_ref=unique_ref)
+            unique_ref=unique_ref, external_executor=external_executor)
 
     if fence is None:
         item = create(db)
@@ -1717,6 +1737,46 @@ def waive_review(cfg, db: Db, item_id: int, *, actor: str | None = None) -> dict
                            "verdict not required: no re-verdict due (#1979)")
 
 
+def check_external_executor(db: Db, executor: str, *, cfg=None) -> str:
+    """#3447 : l'exécutant externe déclaré d'un lot est-il joignable ?
+
+    C'est un *déclaratif*, pas une attribution : le lot reste sans `assignee`
+    (l'agent externe ne se réveille pas, 0030), mais il porte le nom de celui
+    qui doit le faire — le bureau (`mode=externe` avec un responsable humain),
+    ou un humain (`human:…`, nom nu connu normalisé comme pour l'assignation).
+
+    Un agent `execute` est refusé : il s'attribue (`work assign`), il ne se
+    réserve pas. Un agent externe sans responsable humain est refusé (0030,
+    il ne porterait ni l'attente ni les alertes). Rend le nom normalisé.
+    """
+    from . import registry
+
+    from .agent_names import resolve
+    name = resolve((executor or "").strip(), db=db, operation="work.external-executor")
+    if not name:
+        raise WorkError("empty external executor")
+    if name.startswith(HUMAN_PREFIX):
+        return name
+    cfg = cfg if cfg is not None else getattr(db, "cfg", None)
+    row = registry.get(db, name)
+    if row is None:
+        human = known_human(db, name, cfg)
+        if human:
+            return human
+        raise WorkError("external executor refused: %s is not in the registry; "
+                        "an external executor is a registered `externe` agent with a "
+                        "human owner, or a human (human:<id>)" % name)
+    if (row.get("mode") or "execute") != "externe":
+        raise WorkError("external executor refused: %s is a %s agent, not an external "
+                        "one — assign it instead (`ameesh work assign <lot> %s`)"
+                        % (name, row.get("mode") or "execute", name))
+    if not (row.get("responsible") or "").strip():
+        raise WorkError("external executor refused: external agent %s has no human "
+                        "owner (0030); set one first (canon, or `ameesh set %s "
+                        "responsible=human:<id>`)" % (name, name))
+    return name
+
+
 def check_assignee(db: Db, assignee: str, *, externe: bool = False, cfg=None) -> dict:
     """L37 (0030, règle 2) : un lot ne va qu'à un agent qu'ameesh sait réveiller.
 
@@ -1876,7 +1936,12 @@ def assign(db: Db, item_id: int, assignee: str, *, externe: bool = False, actor:
     (`is_pilot`), elle est écrite dans la note de la dernière attribution (même
     assigné : c'est le geste qui la réécrit), et le balayage (`ameesh work
     wip`) laisse alors le lot au-delà du plafond. Elle s'efface à l'attribution
-    suivante sans marqueur."""
+    suivante sans marqueur.
+
+    #3447 : un lot réservé à un exécutant externe (`external_executor`) ne
+    s'assigne pas à un agent — deux exécutants, et L165 ne le prend déjà pas.
+    Le pilote lève la réservation (`ameesh work external-executor <lot>
+    --clear`) ou y fait travailler l'agent sur un sous-lot de préparation."""
     from .agent_names import resolve as resolve_agent_name
     assignee = resolve_agent_name(assignee, db=db, operation="work.assign")
     item = get(db, item_id)
@@ -1885,6 +1950,12 @@ def assign(db: Db, item_id: int, assignee: str, *, externe: bool = False, actor:
     if item["state"] in MERGED_STATES or item["state"] == "closed":
         raise WorkError("lot %s already %s: nothing to reassign" % (item_id, item["state"]))
     previous = item.get("assignee")
+    reserved = (item.get("external_executor") or "").strip()
+    if reserved:
+        raise WorkError(
+            "lot %s is reserved to %s (external executor, #3447): it is not assignable — "
+            "clear the reservation first (`ameesh work external-executor %s --clear`) or "
+            "give the agent a preparation sub-lot" % (item_id, reserved, item_id))
     if if_holder is not None:
         expected = str(if_holder).strip() or None
         if (previous or None) != expected:
@@ -1978,6 +2049,46 @@ def assign(db: Db, item_id: int, assignee: str, *, externe: bool = False, actor:
         row["queued_behind"] = behind
         out["queue_warning"] = queue_warning(db, row, check["assignee"])
     return out
+
+
+def set_external_executor(db: Db, item_id: int, executor: str | None, *,
+                          actor: str = "", cfg=None, clear: bool = False) -> dict:
+    """#3447 : déclare (ou efface, `clear=True`) l'exécutant externe d'un lot.
+
+    Geste de pilote (`corrector`, `history=False`), comme la déclaration à la
+    création. Le lot reste sans assigné : l'exécutant externe ne se réveille
+    pas (0030), il porte l'attente nommée par les alertes et le débit. Un lot
+    déjà assigné est refusé (deux exécutants) ; le lot doit être ouvert. Rend
+    `{item, previous, executor}`."""
+    who = corrector(cfg, db, actor, what="external executor", history=False)
+    item = get(db, item_id)
+    if item is None:
+        raise WorkError("lot %s not found" % item_id)
+    if item["state"] in MERGED_STATES or item["state"] == "closed":
+        raise WorkError("lot %s is %s: no external executor to declare"
+                        % (item_id, item["state"]))
+    previous = (item.get("external_executor") or "").strip() or None
+    if clear:
+        name = None
+        note = ("%s (was %s)" % (interface.EXTERNAL_EXECUTOR_CLEARED_NOTE, previous)
+                if previous else interface.EXTERNAL_EXECUTOR_CLEARED_NOTE)
+    else:
+        name = check_external_executor(db, executor or "", cfg=cfg)
+        if item.get("assignee"):
+            raise WorkError("lot %s is assigned to %s: clear the assignment first "
+                            "(one executor per lot)" % (item_id, item["assignee"]))
+        if name == previous:
+            raise WorkError("lot %s is already reserved to %s" % (item_id, name))
+        note = "%s %s" % (interface.EXTERNAL_EXECUTOR_NOTE, name)
+    row = storage.of(db).work.set_external_executor(item_id, name, note=note, actor=who)
+    if row is None:
+        current = get(db, item_id)
+        holder = (current or {}).get("assignee")
+        if holder:
+            raise WorkError("lot %s was assigned to %s in the meantime: one executor "
+                            "per lot, nothing changed" % (item_id, holder))
+        raise WorkError("lot %s changed or closed in the meantime: retry" % item_id)
+    return {"item": row, "previous": previous, "executor": name}
 
 
 def takes_rule(check: dict) -> bool:
@@ -2136,6 +2247,10 @@ def delegate(db: Db, item_id: int, agent: str, *, within, actor: str = "",
              cfg=None) -> dict:
     """L40 (0030, point 5) : `ameesh work delegate <id> <agent> --within 30m`.
 
+    #3447 : un lot réservé à un exécutant externe (`external_executor`) ne se
+    délègue pas : la délégation écrit un `assignee` (deux exécutants) et
+    réveillerait un agent. Le pilote lève la réservation d'abord.
+
     Le délégant est `actor`, à défaut l'assigné actuel (un `human:…` est
     admis) ; c'est à lui que le lot reviendra. Le délégué passe par
     l'attribution gardée (`check_assignee`, mêmes refus que `work assign`) et
@@ -2154,6 +2269,15 @@ def delegate(db: Db, item_id: int, agent: str, *, within, actor: str = "",
         raise WorkError("lot %s not found" % item_id)
     if item["state"] in MERGED_STATES or item["state"] == "closed":
         raise WorkError("lot %s already %s: nothing to delegate" % (item_id, item["state"]))
+    # #3447 : un lot réservé à un exécutant externe n'est pas délégable —
+    # déléguer écrit un `assignee`, donc deux exécutants, et réveillerait un
+    # agent que le pilote n'a pas désigné.
+    reserved = (item.get("external_executor") or "").strip()
+    if reserved:
+        raise WorkError(
+            "delegation refused: lot %s is reserved to %s (external executor, #3447): "
+            "it is not assignable — clear the reservation first "
+            "(`ameesh work external-executor %s --clear`)" % (item_id, reserved, item_id))
     name = (agent or "").strip()
     if name.startswith(HUMAN_PREFIX):
         raise WorkError("delegation refused: %s is a human; a delegation with a "
@@ -2184,6 +2308,15 @@ def delegate(db: Db, item_id: int, agent: str, *, within, actor: str = "",
         item_id, name, current=previous, delegated_by=delegator, within_s=within_s,
         note=note, actor=delegator)
     if out is None:
+        # #3447 : la course réservation/délégation est tranchée sous le verrou
+        # du storage ; la perdante dit ce qui a changé, pas « retry ».
+        latest = get(db, item_id)
+        reserved_now = ((latest or {}).get("external_executor") or "").strip()
+        if reserved_now:
+            raise WorkError(
+                "delegation refused: lot %s was reserved to %s in the meantime "
+                "(external executor, #3447): one executor per lot — the reservation "
+                "wins, nothing was delegated" % (item_id, reserved_now))
         raise WorkError("lot %s changed in the meantime: retry" % item_id)
     out.update(check=check, previous=previous, message_id=None, warning=check.get("warning"))
     lot = out["item"]

@@ -32,6 +32,7 @@ from .work_dependencies import not_blocking as _not_blocking
 _COLUMNS_TEMPLATE = """
     id, type, source, app, title, body, issue_ref, workstream, state, assignee,
     __REVIEWER__,
+    __EXTERNAL__,
     loops, budget_usd, spent_usd, package_id, package_parent, pr_ref, close_reason,
     superseded_by, delegated_by,
     expected_value, value_score, priority, team, required_capabilities,
@@ -150,6 +151,9 @@ def item_columns(db, ref: str | None = None) -> str:
     # to_jsonb keeps reads compatible with schemas predating 0456, without
     # another catalogue round trip (including bounded progress/list reads).
     reviewers = "to_jsonb(%s)->'reviewers' AS reviewers" % (ref or "work_items")
+    # #3447 : même compatibilité — la colonne n'existe qu'après 0482.
+    external = ("to_jsonb(%s)->>'external_executor' AS external_executor"
+                % (ref or "work_items"))
     wake = ("extract(epoch from (to_jsonb(%s)->>'wake_at')::timestamptz)::float8"
             " as wake_ts" % (ref or "work_items"))
     if ref:
@@ -168,6 +172,7 @@ def item_columns(db, ref: str | None = None) -> str:
             " as wake_ts" % (ref or "work_items"))
     return (_COLUMNS_TEMPLATE
             .replace("__REVIEWER__", reviewer + ", " + reviewers)
+            .replace("__EXTERNAL__", external)
             .replace("__WAKE__", wake)
             .replace("__MIGRATIONS__", migrations))
 
@@ -558,7 +563,7 @@ class WorkItems(interface.WorkItems):
             branch=None, branch_target=None, priority=None, estimate_minutes=None,
             estimate_source=None, change_size=None, queued_note=None,
             forced_note=None, mark_item_id=None, mark_note="",
-            parent_lot=None, unique_ref=False) -> dict:
+            parent_lot=None, unique_ref=False, external_executor=None) -> dict:
         """Crée le lot en `intake`, puis sa première ligne de journal ; L157 :
         avec sa durée estimée (et sa ligne d'historique), en UNE transaction.
         #540 : `queued_note` (voir l'interface).
@@ -646,9 +651,9 @@ class WorkItems(interface.WorkItems):
                     (type, source, app, title, body, issue_ref, workstream, assignee,
                      budget_usd, state, package_id, package_parent, branch, branch_target,
                      priority, estimate_minutes, estimate_source, estimate_by, estimate_at,
-                     change_size)
+                     change_size, external_executor)
                 VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, 'intake', %s, %s, %s, %s, %s,
-                        %s, %s, %s, CASE WHEN %s THEN now() END, %s)
+                        %s, %s, %s, CASE WHEN %s THEN now() END, %s, %s)
                 RETURNING __COLUMNS__
                 """.replace("__COLUMNS__", item_columns(self.db)),
                 (type, source, app, title, body, issue_ref, workstream, assignee,
@@ -656,7 +661,7 @@ class WorkItems(interface.WorkItems):
                  None if priority is None else int(priority),
                  estimate_minutes, estimate_source if estimate_minutes else None,
                  (actor or "") if estimate_minutes else None, bool(estimate_minutes),
-                 change_size or None),
+                 change_size or None, external_executor or None),
             )
             item = rows[0]
             if estimate_minutes:
@@ -1038,6 +1043,7 @@ class WorkItems(interface.WorkItems):
             self.db.execute(_DEPENDENCIES_LOCK)
             rows = self.db.query(
                 "SELECT id, state, assignee,"
+                "       to_jsonb(work_items)->>'external_executor' AS external_executor,"
                 "       (state = 'build' AND " + requeued_sql("work_items")
                 + ") AS returned_to_queue"
                 "  FROM work_items"
@@ -1046,7 +1052,10 @@ class WorkItems(interface.WorkItems):
                 " ORDER BY id FOR UPDATE",
                 REQUEUED_PARAMS + (int(item_id), int(item_id)))
             item = next((r for r in rows if int(r["id"]) == int(item_id)), None)
+            # #3447 : un lot réservé à un exécutant externe n'est pas prenable
+            # — le filtre de `unassigned_lots` est revérifié sous le verrou.
             if current is not None or item is None or item["assignee"] is not None \
+                    or (item.get("external_executor") or "").strip() \
                     or (item["state"] != "intake" and not item["returned_to_queue"]):
                 return None
             # #2252 : toutes les dépendances doivent être FUSIONNÉES
@@ -1139,6 +1148,7 @@ class WorkItems(interface.WorkItems):
                  " WHERE id = %s AND assignee IS NOT DISTINCT FROM %s"
                  "   AND state NOT IN ('merged', 'promoted', 'closed')"
                  "   AND (%s::text IS NULL OR state = %s)"
+                 "   AND to_jsonb(work_items)->>'external_executor' IS NULL"
                  " RETURNING __COLUMNS__").replace("__COLUMNS__", item_columns(self.db)),
                 tuple(params))
         if not rows:
@@ -1257,6 +1267,26 @@ class WorkItems(interface.WorkItems):
                 return None
             return work._unassign_locked(item_id, agent, note, actor)
 
+    def set_external_executor(self, item_id, executor, *, note, actor) -> dict | None:
+        """#3447 : pose (ou efface, `executor=None`) l'exécutant externe d'un lot
+        ouvert, avec sa ligne de journal, en une transaction.
+
+        Un lot assigné ne reçoit pas d'exécutant externe (deux porteurs) ; une
+        levée reste possible pour nettoyer un lot déjà assigné. None si le lot
+        est fermé ou si la pose perd la course contre une attribution : sous le
+        verrou de la ligne, la condition est relue, pas devinée."""
+        with self.db.transaction() as tx:
+            rows = tx.query(
+                ("UPDATE work_items SET external_executor = %s, updated_at = now()"
+                 " WHERE id = %s AND state NOT IN ('merged', 'promoted', 'closed')"
+                 "   AND (%s::text IS NULL OR assignee IS NULL)"
+                 " RETURNING __COLUMNS__").replace("__COLUMNS__", item_columns(self.db)),
+                (executor or None, int(item_id), executor or None))
+            if not rows:
+                return None
+            WorkItems(tx)._event(int(item_id), rows[0]["state"], note, actor)
+            return rows[0]
+
     def _wip_exception_locked(self, item_id, marker, prefixes) -> bool:
         """§4 : la dernière note d'attribution du lot porte-t-elle `marker` ?
         À lire sous le verrou de la ligne du lot : toute attribution met cette
@@ -1338,6 +1368,10 @@ class WorkItems(interface.WorkItems):
             seen = tx.query(
                 "SELECT id%s FROM work_items WHERE id = %%s"
                 "   AND assignee IS NOT DISTINCT FROM %%s AND state NOT IN %s"
+                # #3447 : un lot réservé à un exécutant externe n'est pas
+                # délégable — la course réservation/délégation se tranche ici,
+                # sous le verrou de la ligne.
+                "   AND to_jsonb(work_items)->>'external_executor' IS NULL"
                 " FOR NO KEY UPDATE"
                 % (", reviewer, reviewers" if with_reviewers
                    else (", reviewer" if with_reviewer else ""), _CLOSED),
@@ -1762,7 +1796,14 @@ class WorkItems(interface.WorkItems):
             raise ValueError("on_frozen only makes sense for the `frozen` milestone")
         threads = [] if after_commit is None else after_commit
         with self.db.transaction() as tx:
-            items = tx.query("SELECT id, app, branch_target FROM work_items"
+            # #3490: a freeze can call work.move below. Acquire its repository
+            # advisory lock before any lot row lock, as all migration writers
+            # do; reversing that order deadlocks with a concurrent move.
+            # Other milestones never move the lot and may follow a note that
+            # already holds its row (e.g. a fenced fire exception).
+            if kind == "frozen":
+                _lock_migration_writer(tx, item_id)
+            items = tx.query("SELECT id, app, branch_target, state FROM work_items"
                              " WHERE id = %s FOR NO KEY UPDATE", (int(item_id),))
             rows = tx.query(
                 """
@@ -1774,6 +1815,17 @@ class WorkItems(interface.WorkItems):
                 (int(item_id), kind, sha or "", actor or "", verdict, note or ""),
             )
             milestone = rows[0]
+            if kind == "frozen" and items and items[0]["state"] in ("intake", "build"):
+                # #3467: freezing enters review before the designation hook.
+                # Use the ordinary transitions (including Process guards),
+                # under this lot's lock and transaction: a failing hook must
+                # roll back the state, journal and milestone together.
+                from ... import work
+                if items[0]["state"] == "intake":
+                    work.move(tx, item_id, "build", actor=actor,
+                              note="intake → build — frozen (#3467)")
+                work.move(tx, item_id, "qa", actor=actor,
+                          note="build → qa — frozen (#3467)")
             if kind == "verdict" and items:
                 from ... import merge_queue, train_events
                 item = items[0]
@@ -3256,6 +3308,9 @@ class WorkItems(interface.WorkItems):
                "         WHERE (state = 'intake' OR (state = 'build' AND "
                + requeued_sql("work_items") + "))"
                "           AND assignee IS NULL"
+               # #3447 : un lot réservé à un exécutant externe n'est pas
+               # prenable (le filtre précède le LIMIT, comme les dépendances).
+               "           AND to_jsonb(work_items)->>'external_executor' IS NULL"
                "           AND type <> 'improvement'"
                "           AND NOT EXISTS (SELECT 1 FROM work_item_dependencies d"
                "                             JOIN work_items b ON b.id = d.blocker_id"

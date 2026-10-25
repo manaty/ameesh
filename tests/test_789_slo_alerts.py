@@ -626,6 +626,38 @@ class PaquetTest(_Base):
         packet_guard.declare(self.db, self.lot["id"], "incident",
                              "cible rouge", head, actor="dev1")
 
+    def _packet_ci_on_head(self, carrier, head, *, status="running", run_id=None,
+                           workflow="tests.yml"):
+        """#3487 : une exécution de la CI du paquet, sur sa tête."""
+        if not hasattr(self, "_packet_ci_seq"):
+            self._packet_ci_seq = 900000
+        self._packet_ci_seq += 1
+        self.db.execute(
+            "INSERT INTO ci_runs (repo, run_id, head_sha, branch, event, base,"
+            " work_item_id, status, url, workflow, first_seen_at, concluded_at)"
+            " VALUES ('manaty/ameesh', %s, %s, %s, 'push', 'main', %s, %s, 'u',"
+            " %s, to_timestamp(%s), to_timestamp(%s))",
+            (int(run_id or self._packet_ci_seq), head,
+             str(carrier.get("branch") or "integration/paquet-test"),
+             carrier["id"], status, workflow, self.now - 60.0,
+             None if status == "running" else self.now))
+
+    def _return_to_build(self, at, *, qa_at=None):
+        """#3487 : le lot quitte qa pour build à `at` (transition datée)."""
+        if qa_at is not None:
+            self.db.execute(
+                "UPDATE work_item_events SET created_at = to_timestamp(%s)"
+                " WHERE id = (SELECT max(id) FROM work_item_events"
+                "             WHERE work_item_id = %s AND state = 'qa')",
+                (float(qa_at), self.lot["id"]))
+        work.move(self.db, self.lot["id"], "build")
+        self.db.execute(
+            "UPDATE work_item_events SET created_at = to_timestamp(%s)"
+            " WHERE id = (SELECT max(id) FROM work_item_events"
+            "             WHERE work_item_id = %s AND state = 'build')",
+            (float(at), self.lot["id"]))
+        self.now = float(at)
+
     def test_hors_paquet_le_vert_de_la_ci_fixe_le_depart(self):
         # #3341 : GO à 23:05, CI verte à 23:45 (40 min). L'horloge P1 (15 min)
         # part du vert : silence à 23:59, niveau 1 à 00:01 — pas à 23:20
@@ -770,21 +802,110 @@ class PaquetTest(_Base):
         self.assertEqual(alerts[0]["since"], self.GO)
         self.assertEqual(alerts[0]["value"], 60)
 
-    def test_exception_declaree_sort_du_paquet_et_alerte(self):
-        # #2919 : une exception `packet-exception incident` pour la tête
-        # courante ramène la cible de la table (30 min) et l'escalade ; la CI
-        # verte sur cette tête date le départ (#3341).
+    def test_exception_dans_un_paquet_suit_la_cadence_du_paquet(self):
+        # #3487, cas réel #3449 dans h-15 (#3461) : une exception déclarée
+        # pour la tête ne sort plus du paquet qui porte réellement le lot. Le
+        # lot n'attend que la CI du paquet : l'horloge part du créneau (#2335)
+        # et suit le repli 30 min ; aucune alerte ne prescrit une
+        # réassignation. La CI propre du lot était verte avant le GO, elle ne
+        # date plus rien (#3341 ne s'applique qu'hors paquet).
         self.qa_at(self.GO)
         head = "a" * 40
-        self._outside_packet(head, priority=None)
+        self._outside_packet(head)                  # P1, comme #3449
         self._ci_on_head(head, self.GO - 10 * 60)
-        self.packet(body="unités : #%d @ %s" % (self.lot["id"], head))
-        self.now = self.GO + 50 * 60
+        carrier = self.packet(body="unités : #%d @ %s" % (self.lot["id"], head),
+                              head=head)
+        self._packet_ci_on_head(carrier, head, status="running", run_id=700001)
+        # 00:26, 26 min après le créneau de 00:00 : dans le repli de 30 min,
+        # comme l'alerte de 03:22Z (21 min après le créneau de 03:00). La ligne
+        # P1 du paquet n'a pas de colonne critique : 30 min, pas 15.
+        self.now = self.GO + 81 * 60
+        self.assertEqual(self.slo(), [])
+        # 3× le repli après le créneau : le niveau 3 est dû, et il nomme le
+        # paquet et sa CI au lieu de réassigner le porteur.
+        self.now = self.GO + 3 * HEURE
+        alerts = self.slo()
+        self.assertEqual([(a["step"], a["level"], a["threshold"], a["targets"])
+                          for a in alerts],
+                         [("verdict_merge", 3, 1800,
+                           ["pilot", "bureau", "auditeur"])])
+        alert = alerts[0]
+        self.assertEqual((alert["waiting"] or {}).get("what"), "packet")
+        self.assertEqual((alert["waiting"] or {}).get("vehicle"), carrier["id"])
+        self.assertEqual((alert["waiting"] or {}).get("ci", {}).get("state"),
+                         "running")
+        out = self.briefs(alert)
+        self.assertEqual(sorted(out), ["auditeur", "bureau", "orch"])
+        for text in out.values():
+            self.assertIn("#%d" % carrier["id"], text)
+            self.assertIn("run 700001", text)
+            self.assertIn("do not reassign or nudge its holder", text)
+            self.assertNotIn("reassign it now", text)
+
+    def test_hors_paquet_le_niveau_3_garde_la_reassignation(self):
+        # #3487, contrôle positif : un lot relu hors paquet (exception
+        # déclarée, aucun porteur) garde le geste de réassignation du niveau 3.
+        self.qa_at(self.GO)
+        head = "b" * 40
+        self._outside_packet(head)                  # P1 : cible 15 min
+        self._ci_on_head(head, self.GO - 10 * 60)   # vert avant le GO
+        self.now = self.GO + 46 * 60
         alerts = self.slo()
         self.assertEqual([(a["step"], a["level"], a["targets"]) for a in alerts],
-                         [("verdict_merge", 1, ["assignee"])])
+                         [("verdict_merge", 3, ["bureau", "auditeur"])])
         self.assertIsNone(alerts[0]["waiting"])
-        self.assertEqual(alerts[0]["threshold"], 1800)
+        out = self.briefs(alerts[0])
+        self.assertEqual(sorted(out), ["auditeur", "bureau"])
+        for text in out.values():
+            self.assertIn("reassign it now", text)
+
+    def test_retour_en_build_quitte_le_go_et_repart_sur_le_correctif(self):
+        # #3487, cas auditeur #3450 : un lot relu, revenu en build avec un
+        # correctif dû, sort de « review GO → merge ». L'étape du correctif
+        # repart du retour en build ; son niveau 3 ne réassigne pas le porteur.
+        self.qa_at(self.GO)
+        self._return_to_build(self.GO + 30 * 60, qa_at=self.GO)
+        # 46 min après le GO : l'ancienne horloge GO → merge aurait déjà
+        # dépassé sa cible (30 min) ; il n'en reste aucune ligne.
+        self.now = self.GO + 46 * 60
+        self.assertEqual([a for a in self.slo() if a["step"] == "verdict_merge"], [])
+        # 3× la cible du correctif (2 h) après le retour : niveau 3, geste sur
+        # le correctif, jamais une réassignation du porteur.
+        self.now = self.GO + 30 * 60 + 6 * HEURE
+        all_alerts = self.slo()
+        alerts = [a for a in all_alerts if a["step"] == "blocked_freeze"]
+        self.assertEqual([(a["level"], a["targets"], a["returned"]) for a in alerts],
+                         [(3, ["bureau", "auditeur"], True)])
+        self.assertEqual([a for a in all_alerts if a["step"] == "build_quiet"], [])
+        out = self.briefs(alerts[0])
+        self.assertEqual(sorted(out), ["auditeur", "bureau"])
+        for text in out.values():
+            self.assertIn("returning to build", text)
+            self.assertIn("do not reassign the holder", text)
+            self.assertNotIn("reassign it now", text)
+            self.assertNotIn("ameesh work assign", text)
+
+    def test_ci_du_paquet_verte_seulement_si_tous_les_workflows_le_sont(self):
+        # #3487 (avis cx3) : un workflow vert n'efface pas un autre en cours ou
+        # rouge sur la même tête ; l'état nommé est le plus actionnable.
+        head = "a" * 40
+        carrier = self.packet(body="unités : #999999 @ cafebabe", head=head)
+        wait = {"vehicle": carrier["id"], "head": head}
+        st = storage.of(self.db)
+        self._packet_ci_on_head(carrier, head, status="running", run_id=710001,
+                                workflow="tests.yml")
+        self._packet_ci_on_head(carrier, head, status="success", run_id=710002,
+                                workflow="ui.yml")
+        ci = exploitation._packet_ci(st, wait)
+        self.assertEqual((ci["state"], ci["run_id"]), ("running", 710001))
+        self._packet_ci_on_head(carrier, head, status="failure", run_id=710003,
+                                workflow="tests.yml")
+        ci = exploitation._packet_ci(st, wait)
+        self.assertEqual((ci["state"], ci["run_id"]), ("red", 710003))
+        self._packet_ci_on_head(carrier, head, status="success", run_id=710004,
+                                workflow="tests.yml")
+        ci = exploitation._packet_ci(st, wait)
+        self.assertEqual((ci["state"], ci["workflows"]), ("green", 2))
 
     def test_exception_d_une_autre_tete_ne_sort_pas_du_paquet(self):
         # Une exception ne couvre que sa tête : le nouveau gel reste dans le

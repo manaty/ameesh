@@ -87,7 +87,11 @@ de 2 h est un défaut de son travail. Les attentes humaines **explicites**
 (geste owner, go encore requis, décision owner due ou non signée, retour de
 l'owner, login/2FA, lot `waiting_human`) sont listées à part et ne font pas
 sortir 2 : elles ont leur propre relance (décision due), et le canon ne
-demande pas à l'auditeur de traiter un goulot d'agent à leur place. Une simple
+demande pas à l'auditeur de traiter un goulot d'agent à leur place. #3447 : les
+lots réservés à un exécutant externe déclaré (`external_executor` : bureau,
+owner) sont eux aussi listés à part (« attentes externes »), avec leur
+exécutant ; ce ne sont pas des lots sans assigné et ils ne font pas sortir 2.
+Une simple
 mention d'une règle ou d'une consigne de l'owner, ou d'une décision déjà
 signée, ne classe pas l'attente humaine ; un `hold_undeployed` ne l'est jamais
 (canon §11 bis).

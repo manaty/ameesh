@@ -91,7 +91,7 @@ import time
 from datetime import datetime
 from typing import Optional
 
-from . import lot_class, plan_git, storage, work
+from . import lot_class, plan_git, projects, storage, work
 
 #: la référence qui identifie le lot de relecture d'un lot fusionné
 PREFIX = "review-after-merge:"
@@ -1565,19 +1565,46 @@ def _warn_unopened(db, entries: list[dict], host: str = "") -> str:
     tentative partagée (verrou de la ligne du lot) fait qu'une deuxième
     tentative n'est écrite que par un seul hôte. Best effort : sans pilote
     déclaré ou sans dépôt de courrier, le journal reste et le compte rendu le
-    dit — un avertissement ne casse jamais le relevé. Rend une ligne lisible."""
+    dit — un avertissement ne casse jamais le relevé. Rend une ligne lisible.
+
+    #3453 : chaque pilote ne reçoit que les lots de ses projets
+    (`alert_briefs._of_project` : projet du lot, repli sur tous les pilotes
+    quand aucun ne le déclare) — un lot ameesh ne part plus à l'orchestrateur
+    nexlink, ni l'inverse."""
     try:
-        from . import mail, registry, sous_utilisation
+        from . import alert_briefs, mail, registry, sous_utilisation
         cfg = getattr(db, "cfg", None)
         listing = registry.overview(db)
         names = sous_utilisation.alert_orchestrators(
             cfg, db, listing,
             declared=sous_utilisation.declared_orchestrators())
+        by_name = {row["name"]: row for row in listing}
+        per_pilot: dict[str, list[dict]] = {}
+        for entry in entries:
+            for name in alert_briefs._of_project(
+                    names, by_name, entry.get("project"), set()):
+                per_pilot.setdefault(name, []).append(entry)
     except Exception as exc:  # noqa: BLE001 - un avertissement n'arrête rien
         return "aucun pilote joignable : %s: %s" % (
             type(exc).__name__, str(exc)[:120])
     if not names:
         return "aucun pilote déclaré : avertissement laissé au journal"
+    sent, failed = [], []
+    for name in sorted(per_pilot):
+        mine = per_pilot[name]
+        try:
+            mail.send(db, work.SYSTEM_SENDER, name, _unopened_body(mine, host),
+                      work_item_id=(str(mine[0]["lot"]) if len(mine) == 1 else None))
+            sent.append(name)
+        except Exception as exc:  # noqa: BLE001 - le journal reste, rien d'autre
+            failed.append("%s: %s" % (name, str(exc)[:80]))
+    if sent:
+        return "avertissement envoyé à %s" % ", ".join(sent)
+    return "avertissement non remis (%s)" % "; ".join(failed)
+
+
+def _unopened_body(entries: list[dict], host: str = "") -> str:
+    """Le courrier de `_warn_unopened` pour les lots d'un pilote."""
     shown = entries[:WARN_LIMIT]
     lines = [
         "Relecture après fusion (canon §2) non ouverte : le clone du",
@@ -1607,18 +1634,7 @@ def _warn_unopened(db, entries: list[dict], host: str = "") -> str:
         "sur l'hôte du rattrapage — un hôte sans clone s'abstient désormais,",
         "sans avertir (#3426).",
     ]
-    body = "\n".join(lines)
-    sent, failed = [], []
-    for name in names:
-        try:
-            mail.send(db, work.SYSTEM_SENDER, name, body,
-                      work_item_id=(str(entries[0]["lot"]) if len(entries) == 1 else None))
-            sent.append(name)
-        except Exception as exc:  # noqa: BLE001 - le journal reste, rien d'autre
-            failed.append("%s: %s" % (name, str(exc)[:80]))
-    if sent:
-        return "avertissement envoyé à %s" % ", ".join(sent)
-    return "avertissement non remis (%s)" % "; ".join(failed)
+    return "\n".join(lines)
 
 
 def catch_up(db, *, repo: str = "", target: str = "",
@@ -1864,7 +1880,8 @@ def catch_up(db, *, repo: str = "", target: str = "",
             if seen == 2 and result in ("attempted", "terminal"):
                 out["unopened"].append({
                     "lot": lot, "why": why, "state": state,
-                    "title": row.get("title") or "", "sha": sha or ""})
+                    "title": row.get("title") or "", "sha": sha or "",
+                    "project": projects.lot_project(row) or ""})
         except Exception:  # noqa: BLE001 - un lot en panne n'arrête pas le rattrapage
             out["failed"] += 1
             mark(ops, lot, state, "erreur")
