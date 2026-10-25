@@ -717,6 +717,87 @@ def turn_cgroup_lines(cfg, db, run=_systemctl) -> list[str]:
     return lines
 
 
+def _jit_default(rows: list) -> tuple[str | None, str]:
+    """Réglage `jit` par défaut du couple (rôle, base) d'après
+    `pg_db_role_setting` : la portée la plus précise l'emporte (rôle dans la
+    base, puis rôle, puis base). Rend `(valeur ou None, portée lue)`."""
+    best_rank, best_value, best_scope = (-1, None, "PostgreSQL default")
+    for row in rows:
+        database = row.get("database")
+        role = row.get("role")
+        if database and role:
+            rank, scope = 3, "role in this database"
+        elif role:
+            rank, scope = 2, "role"
+        elif database:
+            rank, scope = 1, "database"
+        else:
+            continue
+        for setting in row.get("setconfig") or ():
+            key, _, value = str(setting).partition("=")
+            if key.strip() != "jit":
+                continue
+            if rank > best_rank:
+                best_rank, best_value, best_scope = rank, value.strip(), scope
+    return best_value, best_scope
+
+
+#: #3503 : marque de la ligne qui met le doctor en échec (la session d'ameesh
+#: n'a pas reçu `-c jit=off` : le correctif ne s'applique pas).
+JIT_SESSION_ON_PREFIX = "jit        : ON in this session"
+JIT_SESSION_ON = (JIT_SESSION_ON_PREFIX + " (source %s) — db.connect "
+                  "must pass -c jit=off: every expensive plan pays the JIT "
+                  "compile (#3503)")
+
+
+def jit_lines(db) -> list[str]:
+    """#3503 : lignes de `ameesh doctor` sur le JIT de Postgres.
+
+    `_unreachable_lots` (coût estimé 1,26 M, au-dessus de `jit_above_cost`)
+    passait de 0,2 s sans JIT à 42 s avec, sur 22 lots et 51 agents : toutes
+    les passes de réassignation des relecteurs expiraient. `db.connect` force
+    donc `jit=off` dans chaque session d'ameesh (`-c jit=off`, sans
+    aller-retour). Ce contrôle lit la session et le réglage PAR DÉFAUT du
+    rôle et de la base : une session qui ne passe pas par ameesh (psql, un
+    script de déploiement, un nouveau rôle) ne paierait pas la compilation du
+    JIT si le rôle ou la base le coupe aussi. Le défaut ON est signalé sans
+    changer le verdict (la session d'ameesh est déjà protégée) ; la session
+    ON, elle, est un échec du doctor (le réglage du client n'est pas passé)."""
+    rows = db.query(
+        "SELECT current_user AS role, current_database() AS database,"
+        "       setting, source FROM pg_settings WHERE name = 'jit'")
+    if not rows:
+        return ["jit        : not checked (pg_settings has no jit on this server)"]
+    session = str(rows[0].get("setting") or "").strip().lower()
+    source = str(rows[0].get("source") or "?").strip()
+    if session != "off":
+        return [JIT_SESSION_ON % source]
+    settings = db.query(
+        "SELECT d.datname AS database, r.rolname AS role, s.setconfig"
+        "  FROM pg_db_role_setting s"
+        "  LEFT JOIN pg_database d ON d.oid = s.setdatabase"
+        "  LEFT JOIN pg_roles r ON r.oid = s.setrole"
+        " WHERE (s.setdatabase = 0 OR d.datname = current_database())"
+        "   AND (s.setrole = 0 OR r.rolname = current_user)")
+    value, scope = _jit_default(settings)
+    role = str(rows[0].get("role") or "")
+    database = str(rows[0].get("database") or "")
+    if value == "off":
+        return ["jit        : off (session, forced by ameesh; default off for "
+                "this %s)" % scope]
+    found = "(%s is jit=%s)" % (scope, value) if value else "(PostgreSQL default)"
+    return ["warning    : jit is off in this session (forced by ameesh) but "
+            "not by default for role %s on database %s %s: a session outside "
+            "ameesh (psql, a deploy script, a new role) pays the JIT — "
+            "ALTER ROLE %s SET jit = off; ALTER DATABASE %s SET jit = off (#3503)"
+            % (role, database, found, _sql_name(role), _sql_name(database))]
+
+
+def _sql_name(name: str) -> str:
+    """Identifiant SQL entre guillemets (conseil de commande, jamais exécuté)."""
+    return '"%s"' % str(name).replace('"', '""')
+
+
 def cmd_harness(cfg, db=None) -> int:
     """`ameesh doctor --harness` : 0 si chaque harnais servi est trouvé."""
     adapters.configure(cfg)

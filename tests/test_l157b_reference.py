@@ -14,7 +14,8 @@ import types
 import unittest
 from unittest import mock
 
-from ameesh import alert_briefs, estimates, exploitation, registry, storage, work
+from ameesh import (alert_briefs, estimates, exploitation, notify, registry,
+                    storage, work)
 
 from .support import PgTestCase
 
@@ -124,12 +125,153 @@ class BriefTest(unittest.TestCase):
         alert = {"type": "estimate_bias", "agent": "dev1", "value": 0.1,
                  "detail": "estimations de dev1 : réel/estimé médian ×0,1",
                  "orchestrators": ["orch"]}
-        listing = [{"name": "dev1"}, {"name": "orch"}, {"name": "auditeur"}]
+        listing = [{"name": "dev1", "team": "app"}, {"name": "orch", "team": "app"},
+                   {"name": "auditeur", "team": "app"}]
         out = alert_briefs.briefs(alert, listing, {}, ["auditeur"])
         self.assertEqual(set(out), {"dev1", "orch", "auditeur"})
         self.assertIn("overestimates", out["dev1"])
         self.assertIn("phases", out["orch"])
         self.assertIn("estimate_bias", exploitation.ALERT_TYPES)
+
+    def test_estimateur_sans_equipe_ne_reveille_pas_tous_les_orchestrateurs(self):
+        # #3502 : un estimateur hors registre (`claude3`, `bureau`, `inconnu`,
+        # `human:smichea` dans la table du 25/10) n'a pas d'équipe ; le repli
+        # « sans équipe, tous les orchestrateurs » réveillait les pilotes des
+        # autres projets (l'orchestrateur Nexlink recevait les estimateurs
+        # ameesh). L'auditeur reste destinataire — c'est son geste.
+        listing = [{"name": "mesh-design", "team": "ameesh"},
+                   {"name": "orchestrateur", "team": "nexlink"},
+                   {"name": "auditeur", "team": "ameesh"}]
+        alert = {"type": "estimate_bias", "agent": "claude3", "value": 2.9,
+                 "detail": "estimates of claude3: median ×2.9",
+                 "orchestrators": ["mesh-design", "orchestrateur"]}
+        out = alert_briefs.briefs(alert, listing, {}, ["auditeur"])
+        self.assertEqual(set(out), {"auditeur"})
+        # un estimateur au registre mais sans projet reçoit SON brief, pas
+        # celui de tous les orchestrateurs.
+        alert["agent"] = "bureau"
+        listing.append({"name": "bureau"})
+        out = alert_briefs.briefs(alert, listing, {}, ["auditeur"])
+        self.assertEqual(set(out), {"bureau", "auditeur"})
+
+
+class BiasEpisodeTest(unittest.TestCase):
+    """#3502 : l'alerte est un épisode (sens, palier) daté à l'entrée en
+    biais, pas une publication ; republier ne la relance pas."""
+
+    def _body(self, generated, ratio):
+        return {"schema": estimates.REFERENCE_SCHEMA, "generated_ts": generated,
+                "bias_range": [0.5, 2.0],
+                "bias": [{"estimator": "dev1", "median_ratio": ratio,
+                          "p80_ratio": ratio * 1.5, "lots": 4, "biased": True}]}
+
+    def _alert(self, ref):
+        with mock.patch.object(estimates, "current_reference", return_value=ref):
+            return exploitation._estimate_bias(
+                types.SimpleNamespace(), object(), [], [])[0]
+
+    def test_sens_et_paliers(self):
+        self.assertEqual(estimates.bias_side(3), "under")
+        self.assertEqual(estimates.bias_side(0.3), "over")
+        self.assertIsNone(estimates.bias_side(1))
+        self.assertEqual([estimates.bias_level(r) for r in (3, 4, 8, 0.3, 0.25, 0.1)],
+                         [1, 2, 3, 1, 2, 3])
+        self.assertIsNone(estimates.bias_level(1))
+        # un ratio nul ne boucle pas
+        self.assertEqual(estimates.bias_level(0.0), estimates.BIAS_MAX_LEVEL)
+
+    def test_date_d_episode_survit_a_une_publication(self):
+        first = self._body(1000.0, 3.0)
+        estimates._date_bias(first, None)
+        entry = first["bias"][0]
+        self.assertEqual((entry["biased_since"], entry["tier_since"]), (1000.0, 1000.0))
+        # même sens, même palier : l'épisode est conservé
+        second = self._body(2000.0, 3.2)
+        estimates._date_bias(second, {"published_ts": 1500.0, "body": first})
+        entry = second["bias"][0]
+        self.assertEqual((entry["biased_since"], entry["tier_since"]), (1000.0, 1000.0))
+        # même sens, palier supérieur : le début du palier change, pas le biais
+        third = self._body(3000.0, 4.2)
+        estimates._date_bias(third, {"published_ts": 2500.0, "body": second})
+        entry = third["bias"][0]
+        self.assertEqual((entry["biased_since"], entry["tier_since"]), (1000.0, 3000.0))
+        # sens inverse : nouvel épisode
+        fourth = self._body(4000.0, 0.3)
+        estimates._date_bias(fourth, {"published_ts": 3500.0, "body": third})
+        entry = fourth["bias"][0]
+        self.assertEqual((entry["biased_since"], entry["tier_since"]), (4000.0, 4000.0))
+
+    def test_republication_ne_change_pas_la_cle(self):
+        body = self._body(1000.0, 3.0)
+        estimates._date_bias(body, None)
+        first = self._alert({"id": 12, "published_ts": 1100.0, "body": body})
+        same = self._alert({"id": 13, "published_ts": 1200.0,
+                            "body": dict(body, generated_ts=2000.0)})
+        self.assertEqual(notify.key_of(first), notify.key_of(same))
+        self.assertEqual(first["since"], same["since"])
+        self.assertEqual(first["bias_level"], 1)
+        # un palier supérieur est un nouvel épisode
+        higher = self._body(3000.0, 4.2)
+        estimates._date_bias(higher, {"published_ts": 2500.0, "body": body})
+        tier = self._alert({"id": 14, "published_ts": 3100.0, "body": higher})
+        self.assertNotEqual(notify.key_of(first), notify.key_of(tier))
+        self.assertTrue(tier["reason"].startswith("bias-level-2"))
+        # le sens inverse aussi
+        over = self._body(4000.0, 0.3)
+        estimates._date_bias(over, None)
+        inverted = self._alert({"id": 15, "published_ts": 4100.0, "body": over})
+        self.assertNotEqual(notify.key_of(first), notify.key_of(inverted))
+
+    def test_retour_a_un_palier_deja_vu_est_un_nouvel_episode(self):
+        # #3502 : le registre `notified` retient 30 jours ; un retour au
+        # palier 2 après un passage au palier 1 doit donc produire une clé
+        # neuve, sinon la seconde montée ne serait jamais renvoyée.
+        first = self._body(1000.0, 3.0)
+        estimates._date_bias(first, None)
+        up = self._body(2000.0, 4.2)
+        estimates._date_bias(up, {"published_ts": 1500.0, "body": first})
+        down = self._body(3000.0, 3.2)
+        estimates._date_bias(down, {"published_ts": 2500.0, "body": up})
+        up2 = self._body(4000.0, 4.2)
+        estimates._date_bias(up2, {"published_ts": 3500.0, "body": down})
+        keys = [notify.key_of(self._alert({"id": i, "published_ts": ts, "body": body}))
+                for i, (body, ts) in enumerate(
+                    ((first, 1100.0), (up, 2100.0), (down, 3100.0), (up2, 4100.0)),
+                    start=12)]
+        self.assertEqual(len(set(keys)), 4)
+        # republier le dernier état ne change pas la clé du dernier épisode
+        again = self._body(5000.0, 4.2)
+        estimates._date_bias(again, {"published_ts": 4500.0, "body": up2})
+        self.assertEqual(notify.key_of(self._alert(
+            {"id": 16, "published_ts": 5100.0, "body": again})), keys[-1])
+
+    def test_table_ancienne_garde_la_cle_du_niveau_1(self):
+        # une table publiée avant le correctif n'a pas de dates d'épisode : le
+        # repli `published_ts` et l'absence de `reason` gardent la clé déjà
+        # posée dans `notify` (pas de rafale au déploiement).
+        alert = self._alert({"id": 13, "published_ts": NOW,
+                             "body": self._body(NOW, 3.0)})
+        self.assertEqual(alert["since"], NOW)
+        self.assertIsNone(alert["reason"])
+        tier = self._alert({"id": 13, "published_ts": NOW,
+                            "body": self._body(NOW, 4.2)})
+        self.assertEqual(tier["reason"], "bias-level-2")
+
+    def test_contenu_identique_ignore_horodatage_et_dates(self):
+        first = self._body(1000.0, 3.0)
+        estimates._date_bias(first, None)
+        second = self._body(2000.0, 3.0)
+        self.assertEqual(estimates._content(first), estimates._content(second))
+        second["bias"][0]["median_ratio"] = 4.0
+        self.assertNotEqual(estimates._content(first), estimates._content(second))
+
+    def test_compte_rendu_publication_inchangee(self):
+        row = {"id": 13, "unchanged": True,
+               "body": {"delivered": 1, "measured": 1, "groups": [],
+                        "estimators": []}}
+        text = estimates.format_published(row)
+        self.assertIn("reference table #13 unchanged", text)
+        self.assertIn("no new row, no new estimate_bias alert", text)
 
 
 class ReferencePgTest(PgTestCase):
@@ -205,6 +347,42 @@ class ReferencePgTest(PgTestCase):
         with self.assertRaises(work.WorkError):
             work.add(self.db, title="x", size="xl")
         self.assertEqual(storage.of(self.db).work.reference()["id"], ref["id"])
+
+    def _three_biased_lots(self):
+        for minutes in (20, 30, 40):
+            lot = work.add(self.db, title="lot %d" % minutes, actor="orch",
+                           estimate=minutes * 10, size="m")
+            self._deliver(lot["id"], started_min_ago=minutes)
+
+    def test_deux_publications_identiques_une_seule_ligne(self):
+        # #3502 : republier la même table n'écrit rien et ne relance aucune
+        # alerte (le contenu est identique hors horodatage de calcul).
+        self._three_biased_lots()
+        first = estimates.publish(self.db, actor="auditeur")
+        second = estimates.publish(self.db, actor="auditeur")
+        self.assertFalse(first["unchanged"])
+        self.assertTrue(second["unchanged"])
+        self.assertEqual(second["id"], first["id"])
+        self.assertEqual(
+            self.db.query("SELECT count(*) AS n FROM estimate_references")[0]["n"], 1)
+        self.assertEqual(storage.of(self.db).work.reference()["id"], first["id"])
+        proc = self.mesh("work", "estimates", "--publish", "--actor", "auditeur")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("reference table #%s unchanged" % first["id"], proc.stdout)
+
+    def test_publication_modifiee_garde_l_episode(self):
+        # une table au contenu différent crée une ligne, mais un biais qui
+        # reste dans le même sens garde sa date d'entrée (pas de nouvel
+        # épisode, donc pas de nouvel envoi).
+        self._three_biased_lots()
+        first = estimates.publish(self.db, actor="auditeur")
+        since = first["body"]["bias"][0]["biased_since"]
+        lot = work.add(self.db, title="lot 50", actor="orch", estimate=500, size="m")
+        self._deliver(lot["id"], started_min_ago=50)
+        second = estimates.publish(self.db, actor="auditeur")
+        self.assertFalse(second["unchanged"])
+        self.assertNotEqual(second["id"], first["id"])
+        self.assertEqual(second["body"]["bias"][0]["biased_since"], since)
 
 
 if __name__ == "__main__":

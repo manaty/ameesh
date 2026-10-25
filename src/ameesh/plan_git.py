@@ -1147,15 +1147,19 @@ def content_retention(st, row: dict) -> dict | None:
                 "motif": "journal des retenues illisible (%s: %s)"
                          % (type(exc).__name__, " ".join(str(exc).split())[:120]),
                 "by": str(row.get("assignee") or ""), "since": None}
-    if state in CONTENT_HELD_STATES:
-        transitions = [e for e in events if e.get("state") in CONTENT_HELD_STATES]
-        last = transitions[-1] if transitions else {}
-        by = str(last.get("actor") or row.get("assignee") or "")
-        return {"what": "blocked", "motif": "état %s" % state, "by": by,
-                "since": last.get("created_ts")}
     db = getattr(st, "db", None)
     holds = planned_waits.active_holds(db, events,
                                        cfg=getattr(db, "cfg", None)).get(lot) or {}
+    if state in CONTENT_HELD_STATES:
+        transitions = [e for e in events if e.get("state") in CONTENT_HELD_STATES]
+        last = transitions[-1] if transitions else {}
+        # Une observation de fusion peut être la dernière transition, avec
+        # un acteur « runner …@hôte » : elle n'est pas l'auteur du hold.
+        hold = max(holds.values(), key=lambda h: float(h.get("since") or 0.0),
+                   default={})
+        by = str(hold.get("by") or row.get("assignee") or "")
+        return {"what": "blocked", "motif": "état %s" % state, "by": by,
+                "since": hold.get("since") if hold else last.get("created_ts")}
     if holds:
         assignee = str(row.get("assignee") or "")
         own, retained = [], []
@@ -1284,10 +1288,23 @@ def _wake_retention(db, row: dict, retention: dict, *, entry: dict, target: str)
 
     Best-effort : la note est déjà écrite ; un courrier non délivré ne doit pas
     casser le relevé. Un humain n'est pas réveillé par la boîte aux lettres."""
-    from . import mail
-    recipient = str(retention.get("by") or row.get("assignee") or "").strip()
-    if not recipient or recipient.startswith(work_mod.HUMAN_PREFIX) \
-            or recipient == work_mod.SYSTEM_SENDER:
+    from . import mail, registry
+    from .config import NAME_RE
+    recipient = ""
+    try:
+        for candidate in (retention.get("by"), row.get("assignee")):
+            candidate = str(candidate or "").strip()
+            if candidate.startswith(work_mod.HUMAN_PREFIX):
+                return  # un hold humain n'est pas délégué par courrier
+            if candidate == work_mod.SYSTEM_SENDER or not NAME_RE.fullmatch(candidate):
+                continue
+            agent = registry.get(db, candidate)
+            if agent and agent.get("status") != "stopped":
+                recipient = candidate
+                break
+    except Exception:  # noqa: BLE001 — la note reste la preuve de la retenue
+        return
+    if not recipient:
         return
     ref = str(entry.get("ref") or entry.get("sha") or "")
     lift = ("lift the hold (a state change or an `unhold:` note) and the next "

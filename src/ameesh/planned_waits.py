@@ -12,7 +12,14 @@ keeps its own, older convention (`LotSessions.HOLD_PREFIX`).
 
 #2378: a lot in `waiting_human` with an open decision request (`ameesh decide
 ask`) waits for its decider until the request's deadline; past the deadline,
-the ordinary alerts come back."""
+the ordinary alerts come back.
+
+#3498: a pilot's hold may declare its external executor and the gesture
+expected (`hold: attente bureau : <geste>`, `hold: attente owner : <geste>`,
+optionally dated `(due 2026-10-25 12:00 UTC)` or `[réveil programmé: …]`).
+`external_hold` reads that declaration; the debit keeps the lot out of the
+agent waits and reports the reminder to the bureau or owner.
+"""
 from __future__ import annotations
 
 import datetime
@@ -100,6 +107,63 @@ def is_hold_lookalike(text) -> bool:
         and not is_lift_note(value)
 
 
+#: #3498 : un hold peut nommer son exécutant externe (bureau ou owner) et le
+#: geste attendu — `hold: attente bureau : <geste>`, `hold: attente owner :
+#: <geste>`, `hold: attente externe (bureau) : <geste>`. Une échéance
+#: facultative `(due 2026-10-25 12:00 UTC)` ou `(échéance …)`, avant ou après
+#: le geste, borne la relance ; sans elle, le débit relance après son seuil.
+_EXTERNAL_HEAD = re.compile(
+    r"(?<![\w])attente\s+"
+    r"(?:externe\s*[\(\[]?\s*)?"
+    r"(?:de\s+la\s+|du\s+|de\s+l'|de\s+)?"
+    r"(?P<who>bureau|owner|propri[eé]taire)"
+    r"\s*(?:[\)\]]\s*)?"
+    r"(?P<tail>.*)", re.I | re.S)
+_EXTERNAL_DUE = re.compile(
+    r"\s*[\(\[]\s*(?:échéance|echeance|due|au\s+plus\s+tard|jusqu'au|avant\s+le)"
+    r"\s*:?\s*(?P<date>[^\)\]]+?)\s*[\)\]]", re.I)
+_EXTERNAL_SEP = re.compile(r"^\s*:\s*(?P<gesture>.+)$", re.S)
+_EXTERNAL_DASH = re.compile(r"^\s*[—–-]\s*(?P<gesture>.+)$", re.S)
+_EXTERNAL_WAKE = re.compile(r"\[\s*réveil programmé\s*:\s*(?P<date>[^\]]+)\]",
+                            re.I)
+_EXTERNAL_TOKEN = re.compile(r"(?:^|\s)wake_at=\S+", re.I)
+_EXTERNAL_EXECUTORS = {"bureau": "bureau", "owner": "owner",
+                       "propriétaire": "owner", "proprietaire": "owner"}
+
+
+def external_hold(text) -> dict | None:
+    """#3498 : la déclaration d'attente externe portée par un hold, ou None.
+
+    Rend `{executor, gesture, due}` : `executor` est `bureau` ou `owner`
+    (`propriétaire` est normalisé), `gesture` le texte attendu après le
+    séparateur, `due` la date déclarée (texte brut, pour
+    `debit.parse_wake_due`) ou None. Une déclaration sans geste n'est pas une
+    déclaration : le hold reste une attente ordinaire, et rien n'est deviné
+    depuis la prose (« attente du bureau depuis 3 h » ne déclare pas)."""
+    note = str(text or "").strip()
+    match = _EXTERNAL_HEAD.search(note)
+    if not match:
+        return None
+    who = _EXTERNAL_EXECUTORS.get(match.group("who").strip().casefold())
+    if not who:
+        return None
+    tail = match.group("tail")
+    head_due = _EXTERNAL_DUE.match(tail)
+    if head_due:
+        tail = tail[head_due.end():]
+    separator = _EXTERNAL_SEP.match(tail) or _EXTERNAL_DASH.match(tail)
+    if not separator:
+        return None
+    gesture = _EXTERNAL_DUE.sub("", separator.group("gesture"))
+    gesture = _EXTERNAL_WAKE.sub("", gesture)
+    gesture = _EXTERNAL_TOKEN.sub("", gesture).strip(" ;,.")
+    if not gesture:
+        return None
+    due = _EXTERNAL_DUE.search(note) or _EXTERNAL_WAKE.search(note)
+    return {"executor": who, "gesture": gesture,
+            "due": due.group("date").strip() if due else None}
+
+
 def explicit_holds(events, *, allowed=None) -> dict[int, dict]:
     """Les holds lus dans le journal d'un lot (#1664) — la **dernière** retenue.
 
@@ -180,6 +244,17 @@ def _pilot_allowed(db, cfg, *, strict: bool = False):
     return allowed
 
 
+def lift_authority(db, cfg=None, *, strict: bool = False):
+    """Le prédicat d'autorisation d'une levée de hold (#3219), partagé.
+
+    `active_holds` et la reconstruction des retenues de fermeture du débit
+    (#3497) doivent lire la **même** autorité : un auteur ne lève que sa
+    retenue, un pilote (humain, orchestrateur ou conception) lève celle du lot.
+    `cfg` par défaut : celui de `db`."""
+    cfg = getattr(db, "cfg", None) if cfg is None else cfg
+    return _pilot_allowed(db, cfg, strict=strict)
+
+
 def active_holds(db, events, *, cfg=None,
                  strict: bool = False) -> dict[int, dict[str, dict]]:
     """#3219 : les retenues actives de chaque lot, par auteur.
@@ -203,8 +278,7 @@ def active_holds(db, events, *, cfg=None,
     if not ordered or not any(is_hold_note(event.get("note"))
                               for event in events or ()):
         return {}
-    cfg = getattr(db, "cfg", None) if cfg is None else cfg
-    allowed = _pilot_allowed(db, cfg, strict=strict)
+    allowed = lift_authority(db, cfg, strict=strict)
     out: dict[int, dict[str, dict]] = {}
     for ident, lot_events in ordered.items():
         held: dict[str, dict] = {}

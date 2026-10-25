@@ -4546,7 +4546,9 @@
     "upsert_unleased",
     "wake_check",
     "note_unleased",
-    "operator_pause"
+    "operator_pause",
+    "retire",
+    "restore"
    ],
    "alert_acknowledgements": [
     "acknowledge",
@@ -4950,6 +4952,7 @@
     "set_branch",
     "set_branch_head",
     "set_estimate",
+    "set_external_executor",
     "set_issue_ref",
     "set_partial_seen",
     "set_priority",

@@ -1539,6 +1539,7 @@ class RegistryTest(PgTestCase):
         the registry — the read depends on no column probe."""
         moved = self.lot(state="build")
         to_close = self.lot(state="build")
+        to_freeze = self.lot(state="intake")
         self.db.execute("ALTER TABLE work_items DROP COLUMN workflow_ref CASCADE")
         self.db.execute("ALTER TABLE work_items DROP COLUMN workflow_stage")
         self.db.execute("ALTER TABLE work_items DROP COLUMN workflow_version")
@@ -1552,6 +1553,13 @@ class RegistryTest(PgTestCase):
         self.assertEqual(closed["state"], "closed")
         self.assertEqual(self.row(moved)["state"], "qa")
         self.assertEqual(self.row(to_close)["state"], "closed")
+        frozen = storage.of(self.db).work.add_milestone(
+            to_freeze, "frozen", sha="a" * 40, actor=ACME_ACTOR,
+            verdict=None, note="pre-0452 freeze (#3489)")
+        self.assertEqual(frozen["kind"], "frozen")
+        self.assertEqual(self.row(to_freeze)["state"], "qa")
+        self.assertIn(frozen["id"], [m["id"] for m in
+                                   work.milestones(self.db, to_freeze)])
 
     def test_read_sources_declares_only_the_real(self):
         lot = self.pinned(stage="implementation", state="build")

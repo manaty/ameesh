@@ -215,9 +215,12 @@ def waiting(item: dict, jalons: dict, actions: Iterable[dict] = (), *,
     if state == lifecycle.BLOCKED:
         return _waiting("unblock", responsible or assignee)
     if state == lifecycle.REQUESTED:
-        return _waiting("start", assignee)
+        # #3447 : un lot réservé à un exécutant externe n'est pas « sans
+        # assigné » ; l'attente le nomme (et `with_availability` dit « session
+        # externe, <responsable> »).
+        return _waiting("start", assignee or (item.get("external_executor") or None))
     if state == lifecycle.IN_PROGRESS:
-        return _waiting("build", assignee)
+        return _waiting("build", assignee or (item.get("external_executor") or None))
     # qa : en revue — approuvé par un verdict `ok` courant, ou dispensé de
     # re-verdict par le pilote (#1979 : résolution de composition mécanique,
     # canon §11 bis/#87), ou lot léger dont la relecture suit la fusion
@@ -552,6 +555,9 @@ def stagnant_lots(db, *, threshold_s: float = DEFAULT_THRESHOLD_S,
             "title": row.get("title"),
             "state": row.get("state"),
             "assignee": row.get("assignee") or None,
+            # #3447 : la réservation se lit sur le lot, pour que l'alerte
+            # `stale_lot` nomme l'exécutant externe au lieu de « unassigned ».
+            "external_executor": row.get("external_executor") or None,
             "lot_team": row.get("lot_team") or None,
             "last_activity_ts": float(row["last_activity_ts"]),
             "idle_s": int(now - float(row["last_activity_ts"])),

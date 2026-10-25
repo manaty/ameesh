@@ -68,7 +68,7 @@ _RESERVED_SQL = """
 
 #: L125 : un message PASSIF — accusé, copie, diffusion à tous, conflit signalé
 #: par le radar (L160c), échec de CI sans référence de la base (L161c),
-#: jamais urgent —
+#: information sans geste attendu (#3451), jamais urgent —
 #: n'ouvre pas de tour à lui seul (même règle que `mail.passive_reason`).
 #: `{t}` : l'alias de la table `agent_mailbox` (`PASSIVE_SQL.format(t="mb")`).
 PASSIVE_SQL = (
@@ -76,6 +76,7 @@ PASSIVE_SQL = (
     " AND ({t}.payload @> '{{\"ack\": true}}'::jsonb"
     " OR {t}.payload @> '{{\"broadcast\": true}}'::jsonb"
     " OR {t}.payload @> '{{\"ci_passif\": true}}'::jsonb"
+    " OR {t}.payload @> '{{\"info\": true}}'::jsonb"
     " OR coalesce({t}.payload->>'cc', '') <> ''"
     " OR coalesce(jsonb_typeof({t}.payload->'radar'), '') = 'object'))")
 
@@ -94,24 +95,36 @@ class Mailbox(interface.Mailbox):
     def send(self, sender, recipient, body, *, host, kind, payload, work_item_id,
              signature, signature_key, signed_payload, nonce, created_us,
              expires_us) -> dict:
+        # #3460 : un retiré n'est jamais destinataire. Le retrait est relu
+        # dans l'instruction qui dépose, sous un verrou partagé de sa ligne
+        # (`retire` la prend en exclusif) : un retrait committé après un
+        # précontrôle gagne, un retrait en cours attend ce dépôt. Un nom hors
+        # du registre (humain, service) n'a pas de ligne et reste déposé.
         rows = self.db.query(
             """
+            WITH registered AS (
+                SELECT retired_at FROM agent_registry WHERE name = %s FOR SHARE)
             INSERT INTO agent_mailbox
                 (sender, recipient, body, host, kind, payload, work_item_id,
                  signature, signature_key, signed_payload, nonce,
                  created_at, signature_expires_at)
-            VALUES (%s, %s, %s, %s, %s, %s::jsonb, %s, %s, %s, %s, %s,
-                    coalesce(to_timestamp(%s::bigint / 1000000.0), now()),
-                    to_timestamp(%s::bigint / 1000000.0))
+            SELECT %s, %s, %s, %s, %s, %s::jsonb, %s, %s, %s, %s, %s,
+                   coalesce(to_timestamp(%s::bigint / 1000000.0), now()),
+                   to_timestamp(%s::bigint / 1000000.0)
+             WHERE NOT EXISTS (SELECT 1 FROM registered WHERE retired_at IS NOT NULL)
             RETURNING id, extract(epoch from created_at)::float8 AS created_ts,
                       (__PROJECT__) AS sender_project,
                       (__PROJECT__) AS recipient_project
             """.replace("__PROJECT__", PROJECT_SQL),
-            (sender, recipient, body, host, kind,
+            (recipient, sender, recipient, body, host, kind,
              json.dumps(payload or {}, ensure_ascii=False), work_item_id,
              signature, signature_key, signed_payload, nonce,
              created_us, expires_us, sender, recipient),
         )
+        if not rows:
+            raise interface.RecipientRetired(
+                "%s is retired: nothing deposited (ameesh agent restore %s)"
+                % (recipient, recipient))
         return rows[0]
 
     def unread(self, recipient, limit) -> list[dict]:
@@ -551,9 +564,12 @@ class Mailbox(interface.Mailbox):
             # entre la lecture et la copie bloquait jusqu'ici sans être revu :
             # il bloque désormais sur ce verrou jusqu'à notre commit, donc
             # jamais entre la décision et la copie.
-            locked = {row["name"]: row["status"] for row in tx.query(
-                "SELECT name, status FROM agent_registry"
-                " WHERE name IN (%s, %s) ORDER BY name FOR UPDATE", (old, new))}
+            rows = tx.query(
+                "SELECT name, status, retired_at IS NOT NULL AS retired"
+                " FROM agent_registry"
+                " WHERE name IN (%s, %s) ORDER BY name FOR UPDATE", (old, new))
+            locked = {row["name"]: row["status"] for row in rows}
+            retired = {row["name"] for row in rows if row["retired"]}
             if old == new:
                 raise interface.MailboxRefused(
                     "old and new recipient are the same (%s)" % old)
@@ -567,6 +583,10 @@ class Mailbox(interface.Mailbox):
             if locked[new] == "stopped":
                 raise interface.MailboxRefused(
                     "%s is stopped: forward to a live agent" % new)
+            if new in retired:
+                # #3460 : un retrait committé pendant l'attente du verrou gagne
+                raise interface.MailboxRefused(
+                    "%s is retired: forward to a live agent" % new)
             ids = sorted(int(row["id"]) for row in tx.query(
                 "SELECT m.id FROM agent_mailbox m"
                 " WHERE m.recipient = %%s AND m.delivered_at IS NULL"

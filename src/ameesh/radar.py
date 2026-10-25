@@ -1503,6 +1503,25 @@ def merge_rollup(rollup, *, slug: str, head: str, branch: str, gh) -> list:
     if len(aggregate) != 1 or aggregate[0].get("conclusion") != "SUCCESS":
         return rows
 
+    #: #3494 : les checks publiés par les étapes du workflow appelé (flux des
+    #: parts `tests (flux) …`, détail de l'agrégat `tests (bilan des parts)`)
+    #: sont rattachés par la forge à la suite `paquet` de la tête ; leur
+    #: `detailsUrl` (`/runs/<check-id>`) ne désigne aucun run Actions. Ils ne
+    #: prouvent pas le portier : les compter comme tels rendait sa preuve
+    #: illisible et la sentinelle `paquet (run proof unavailable)` bloquait la
+    #: fusion du paquet (h-15, run 40158149836). Ils restent dans le rollup,
+    #: avec leurs portes propres (agrégat, flux).
+    def custom(check):
+        name = str(check.get("name") or check.get("context") or "")
+        return name == AGGREGATE_DETAIL_CHECK or name.startswith("tests (flux)")
+
+    all_packet = [c for c in original if c.get("__typename") == "CheckRun"
+                  and c.get("workflowName") == "paquet" and not custom(c)]
+    packet = [c for c in all_packet
+              if (c.get("name") in ("couverture (PR ouverte sur cette tête)",
+                                    "suite complète du paquet")
+                  or (c.get("name") or "").startswith("suite complète du paquet / "))]
+
     def blocked():
         return rows + [{"__typename": "CheckRun", "name": "paquet (run proof unavailable)",
                         "status": "COMPLETED", "conclusion": "FAILURE"}]
@@ -1564,7 +1583,7 @@ def merge_rollup(rollup, *, slug: str, head: str, branch: str, gh) -> list:
         runs = [r for r in runs if r.get("path") == ".github/workflows/paquet.yml"]
         if not runs:
             # Aucun portier créé : la PR porte toute la validation.
-            return rows if not any(c.get("workflowName") == "paquet" for c in rows) else blocked()
+            return rows if not all_packet else blocked()
         if any(r.get("status") != "completed" for r in runs):
             return blocked()  # y compris une nouvelle tentative d'un ancien run
         latest = max(runs, key=lambda r: r["id"])
@@ -1585,11 +1604,6 @@ def merge_rollup(rollup, *, slug: str, head: str, branch: str, gh) -> list:
     except (ValueError, KeyError, TypeError, AttributeError, OSError, RuntimeError):
         return blocked()
 
-    all_packet = [c for c in original if c.get("__typename") == "CheckRun"
-                  and c.get("workflowName") == "paquet"]
-    packet = [c for c in all_packet
-              if (c.get("name") == "couverture (PR ouverte sur cette tête)"
-                   or (c.get("name") or "").startswith("suite complète du paquet / "))]
     # Le run annulé le plus récent doit être visible : un CANCELLED d'un
     # ancien run ne permet jamais de retirer les FAILURE d'un nouveau run.
     ids = [run_id(c) for c in all_packet]

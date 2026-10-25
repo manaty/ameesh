@@ -36,6 +36,13 @@
                                          est arrêté ; journal `agent.moved` sur l'agent,
                                          puis canon sync de l'hôte d'arrivée déclenché
                                          (si la commande y tourne) ou rappelé
+  ameesh agent retire NOM --reason R [--actor A] [--json]
+                                         retrait du registre actif (#3460) : jamais
+                                         plus désigné, réclamé ni destinataire ;
+                                         historique gardé ; refusé tant que l'agent
+                                         tient un bail, un lot non clos ou une veille
+  ameesh agent restore NOM [--actor A] [--json]
+                                         l'inverse : l'agent redevient actif (#3460)
   ameesh canon agent spawn|name …        mêmes commandes sous `canon` (L243, #468) ;
                                          la place canonique du nommage
 
@@ -908,6 +915,41 @@ def _sync_arrival_json(cfg: Config, host: str) -> dict:
     return result
 
 
+def _retire_gesture(cfg: Config, args: argparse.Namespace, gesture) -> int:
+    """#3460 : `agent retire` et `agent restore`, même sortie."""
+    from . import agent_retire
+
+    db = db_mod.connect(cfg)
+    try:
+        db_mod.require_schema(db)
+        result = gesture(agent_retire, db)
+    except agent_retire.RetireError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+    finally:
+        db.close()
+    if args.json:
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return 0
+    for warning in result["warnings"]:
+        print("warning: %s" % warning, file=sys.stderr)
+    if result["changed"]:
+        print("%s %s by %s (journal #%d)" % (
+            result["agent"], "retired" if args.agent_command == "retire" else "restored",
+            result["actor"], result["event"]))
+    return 0
+
+
+def cmd_retire(cfg: Config, args: argparse.Namespace) -> int:
+    return _retire_gesture(cfg, args, lambda mod, db: mod.retire(
+        cfg, db, args.name, reason=args.reason, actor=args.actor))
+
+
+def cmd_restore(cfg: Config, args: argparse.Namespace) -> int:
+    return _retire_gesture(cfg, args, lambda mod, db: mod.restore(
+        cfg, db, args.name, actor=args.actor))
+
+
 def cmd_move(cfg: Config, args: argparse.Namespace) -> int:
     """#3299 : `ameesh agent move NOM --to HÔTE`, déplacement manuel fencé."""
     from . import relocation
@@ -1028,6 +1070,26 @@ def _add_agent_parsers(parent, *, move: bool = False) -> None:
                                  "otherwise this session's identity")
         p_move.add_argument("--json", action="store_true")
         p_move.set_defaults(func=cmd_move)
+
+        p_retire = agent_sub.add_parser(
+            "retire", help="take an agent out of the active registry: never designated, "
+                           "claimed nor mailed again; history kept (#3460)")
+        p_retire.add_argument("name", help="agent to retire")
+        p_retire.add_argument("--reason", required=True,
+                              help="why (the decision or the lot)")
+        p_retire.add_argument("--actor", default=None,
+                              help="who retires it (human:<id>, orchestrator, design agent "
+                                   "or auditor); otherwise this session's identity")
+        p_retire.add_argument("--json", action="store_true")
+        p_retire.set_defaults(func=cmd_retire)
+
+        p_restore = agent_sub.add_parser(
+            "restore", help="the inverse of agent retire: the agent is active again (#3460)")
+        p_restore.add_argument("name", help="agent to restore")
+        p_restore.add_argument("--actor", default=None,
+                               help="who restores it; otherwise this session's identity")
+        p_restore.add_argument("--json", action="store_true")
+        p_restore.set_defaults(func=cmd_restore)
 
 
 def add_parsers(sub) -> None:

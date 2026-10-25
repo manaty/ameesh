@@ -200,19 +200,34 @@ Dans tous ces cas :
   courrier ; un paquet déjà en vol va au bout (CI, promotion ou vidange), un
   train en pause reste en pause.
 
-L'épingle ne suit jamais la porte d'elle-même (#1467) : qualifier le commit de
-la porte. Le service relit `train.projects.<p>.canon_commit` à **chaque
-passage** (#3366) : une fois le commit qualifié, la commande
-`python -m ameesh.train_cli --project <p> requalify --lot <lot>` (avec le même
-`AMEESH_CONFIG` que l'exécuteur, pour lire le profil qu'il exécute) l'écrit
-dans `config.json` et dans les profils qui déclarent l'épingle (l'héritage
-récursif de #3345 fait suivre les autres), avec une note sur le lot ;
-`--dry-run` montre le diff et les fichiers sans rien écrire. Elle
-refuse si le diff `pin..porte` touche `processus/mecanique.yaml` ou
-`federation.yaml` : ce changement de règles se relit, il ne se requalifie
-pas. Un changement de `mode`, de `canon`, de dépôt ou de cible n'est pas
-appliqué à chaud : le service refuse par son nom et attend le redémarrage ;
-seul l'épinglage est relu.
+Le service fait suivre automatiquement l'épingle à la porte auditée (#3483),
+avant chaque passage et sur les hôtes en attente du rôle ou du bail. Chaque
+hôte vérifie localement l'avance : la porte doit descendre de l'épingle et le
+diff ne doit toucher aucun fichier de la liste fermée, versionnée dans
+`train_assembly.REQUALIFY_GUARD` : `processus/mecanique.yaml`, `federation.yaml`.
+Les renommages et suppressions sont vérifiés également. Sinon, refus explicite
+et requalification relue requise ; une porte illisible ne fournit aucun repli.
+
+L'écriture couvre `config.json` et tous les profils hérités qui déclarent une
+épingle ; les autres héritent. Le verrou `.train-canon.lock` dans le dossier
+de la configuration hôte sérialise les exécuteurs et la commande manuelle. Le journal durable
+`train-canon.jsonl` au même endroit conserve hôte, ancien et nouveau SHA,
+chemins du diff vérifié et liste de garde. Une erreur de journalisation
+restaure les fichiers. Le service recharge ensuite l'épingle effective (#3366).
+Le suivi ne modifie ni les références ni les règles de la porte. Un refus du suivi
+est signalé par projet, une fois par motif jusqu'au rétablissement. Le passage
+recharge toujours son épingle configurée (#3366), même si le suivi automatique
+échoue : une épingle intermédiaire qualifiée par le pilote reste applicable.
+Les autres projets poursuivent leur suivi.
+La garde de dérive refuse toute nouvelle composition non qualifiée ; les
+paquets déjà en vol peuvent atteindre leur état terminal.
+
+La commande pilote `python -m ameesh.train_cli --project <p> requalify --lot
+<lot>` reste disponible avec sa trace sur le lot ; `--dry-run` montre le diff.
+Elle exige aussi que la porte descende de l’épingle et que le diff laisse les
+fichiers de garde intacts ; un retour arrière exige une requalification relue.
+Un changement de `mode`, de `canon`, de dépôt ou de cible exige toujours un
+redémarrage ; seul l'épinglage est relu.
 
 Quand le commit est le même et que seules les autres lectures des règles
 diffèrent (`gate_rules_gap`), il n'y a aucun commit à requalifier : aligner les

@@ -18,8 +18,10 @@ import os
 import tempfile
 import threading
 import unittest
+from unittest import mock
 
-from ameesh import alert_ack, fil, mail, notify, registry, storage, work
+from ameesh import (alert_ack, estimates, exploitation, fil, mail, notify,
+                    registry, storage, work)
 
 from .support import (DESKTOP_MISSING, DESKTOP_VAR, FAKEBIN, PgTestCase,
                       desktop_backend_env, desktop_received)
@@ -846,6 +848,36 @@ class FiabiliteTest(_Base):
         self.assertEqual(records[0]["delivery"], "a_blanc")
         self.assertIn("agent stopped with mail", records[0]["title"])
         self.assertEqual(_desktop_log(self.desk), [])
+
+
+class EstimateBiasEpisodeTest(_Base):
+    """#3502 : deux publications identiques ne produisent aucun second envoi."""
+
+    BODY = {"bias_range": [0.5, 2.0],
+            "bias": [{"estimator": "dev1", "median_ratio": 2.9, "p80_ratio": 4.0,
+                      "lots": 4, "biased": True, "bias_side": "under",
+                      "bias_level": 1, "biased_since": 500.0, "tier_since": 500.0}]}
+
+    def _alerts(self, ref_id, published_ts):
+        ref = {"id": ref_id, "published_ts": published_ts, "body": self.BODY}
+        with mock.patch.object(estimates, "current_reference", return_value=ref):
+            return exploitation._estimate_bias(self.cfg, self.db, [], [])
+
+    def test_deux_publications_identiques_un_seul_envoi(self):
+        self.register("dev1", "claude", cwd=self.tmp)
+        storage.of(self.db).leases.claim("dev1", "runner-test", 3600,
+                                         require_responsible=False,
+                                         host=self.cfg.host)
+        notifier = self.notifier(self.ncfg(default_human="human:proprio"))
+        first, second = self._alerts(12, 1000.0), self._alerts(13, 1060.0)
+        self.assertEqual(notify.key_of(first[0]), notify.key_of(second[0]))
+        self.passe(notifier, first)
+        sent = self.db.query("SELECT count(*) AS n FROM agent_mailbox")[0]["n"]
+        self.assertEqual(sent, 1)
+        self.passe(notifier, second)
+        self.assertEqual(
+            self.db.query("SELECT count(*) AS n FROM agent_mailbox")[0]["n"], sent)
+        self.assertEqual(self.passe(notifier, second), [])
 
 
 class CliTest(_Base):

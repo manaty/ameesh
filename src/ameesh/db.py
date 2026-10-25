@@ -262,6 +262,14 @@ def startup_options(cfg: Config, existing: str = "") -> str:
     if getattr(cfg, "read_only", False):
         # L304 : toute écriture est refusée par le serveur lui-même
         parts.append("-c default_transaction_read_only=on")
+    # #3503 : le JIT de Postgres. Sur de très petites tables, un plan dont le
+    # coût estimé dépasse `jit_above_cost` (100 000) est compilé au lieu d'être
+    # exécuté : `_unreachable_lots` (coût estimé 1,26 M, 22 lots et 51 agents)
+    # passait de 0,2 s à 42 s, et toutes les passes de réassignation des
+    # relecteurs expiraient. Le JIT ne rapporte rien à ces volumes : il est
+    # coupé dans CHAQUE session d'ameesh, après les réglages de l'utilisateur
+    # (un `-c jit=on` du DSN ou de PGOPTIONS ne peut pas le rallumer).
+    parts.append("-c jit=off")
     return " ".join(parts)
 
 
@@ -480,6 +488,13 @@ class PsqlDriver:
                 ro = "SET default_transaction_read_only = on;"
                 self._args += ["-c", ro[:-1]]
                 self._bootstrap = ro + "\n" + self._bootstrap
+            # #3503 : le DSN fixe `options`, donc PGOPTIONS est ignoré : le
+            # `-c jit=off` de `startup_options` ne partirait pas. Même réglage
+            # en SET (et dans l'amorce de la session persistante : transaction
+            # et LISTEN/NOTIFY).
+            jit = "SET jit = off;"
+            self._args += ["-c", jit[:-1]]
+            self._bootstrap = jit + "\n" + self._bootstrap
         #: résultat de la vérification de schéma, faite avec la sonde de
         #: connexion (L61 : un seul sous-processus pour les deux)
         self._schema_ok: bool | None = None

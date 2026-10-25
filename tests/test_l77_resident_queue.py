@@ -1001,6 +1001,9 @@ def tearDownModule():
     # avant la finalisation évite l'abort CPython sur le verrou stdout.
     from ameesh import runner
     runner._journal.close(2.0)
+    # Le processus de tests continue : les modules suivants doivent retrouver
+    # un journal ouvert, sinon log_async abandonne silencieusement leurs logs.
+    runner._journal = runner._AsyncLog()
 
 
 if __name__ == "__main__":
