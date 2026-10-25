@@ -1,8 +1,10 @@
 #!/bin/sh
 # SPDX-License-Identifier: AGPL-3.0-only
 #
-# #3444 — preuve, sur l'hôte, que le garde-fou du drop-in `cles-owner.conf`
-# est effectif : un processus d'unité utilisateur ne peut plus lire ~/.ssh.
+# #3444 — preuve, sur l'hôte, que le garde-fou du drop-in OPT-IN
+# `deploy/poste/cles-owner.conf` est effectif : un processus d'unité
+# utilisateur ne peut plus lire ~/.ssh. Ce n'est pas la frontière de la
+# décision #133454 a (même uid = contournable) ; voir docs/EXPLOITATION.md.
 #
 # À lancer par le propriétaire du compte des exécuteurs (smichea sur le
 # poste), depuis un checkout du dépôt :
@@ -11,13 +13,13 @@
 #   deploy/poste/preuve-isolation-cles-owner.sh --cible ~/.ssh --helper CHEMIN
 #
 # Elle démarre une unité UTILISATEUR transitoire avec les mêmes propriétés que
-# le drop-in (InaccessiblePaths=, SSH_AUTH_SOCK retiré), y exécute le témoin
-# root `/usr/local/libexec/ameesh/verifie-cles-owner`, et sort en 0 seulement
-# si le mount namespace a réellement été posé. C'est le critère de recette du
-# lot : avant le prérequis AppArmor (deploy/poste/ameesh-systemd-executor),
-# la preuve ÉCHOUE (InaccessiblePaths= silencieusement ignoré) ; après, elle
-# passe. Aucun secret n'est lu ni affiché : le témoin dit seulement si le
-# chemin est encore listable.
+# le drop-in (InaccessiblePaths= sur ~/.ssh, SSH_AUTH_SOCK retiré), y exécute
+# le témoin root `/usr/local/libexec/ameesh/verifie-cles-owner` et sort en 0
+# seulement si un montage a réellement été posé sur la cible. C'est le
+# critère de recette du garde-fou : avant le prérequis AppArmor
+# (deploy/poste/ameesh-systemd-executor), la preuve ÉCHOUE (InaccessiblePaths=
+# silencieusement ignoré) ; après, elle passe. Aucun secret n'est lu ni
+# affiché : le témoin ne regarde que les points de montage de l'unité.
 set -u
 
 HELPER=/usr/local/libexec/ameesh/verifie-cles-owner
@@ -44,6 +46,9 @@ done
   echo "le poser en root : install -D -m 0755 deploy/poste/verifie-cles-owner $HELPER" >&2
   exit 2
 }
+# Cible absente : InaccessiblePaths= ne monterait rien ; le témoin doit
+# refuser, et la preuve n'aurait aucun sens.
+[ -e "$CIBLE" ] || { echo "cible absente : $CIBLE" >&2; exit 2; }
 
 echo "cible            : $CIBLE"
 echo "témoin           : $HELPER"
@@ -57,7 +62,7 @@ fi
 
 unite="test-3444-cles-$$"
 systemd-run --user --unit="$unite" --wait --pipe --collect \
-  --property="InaccessiblePaths=-$CIBLE" \
+  --property="InaccessiblePaths=$CIBLE" \
   --property=UnsetEnvironment=SSH_AUTH_SOCK \
   --property=UnsetEnvironment=SSH_AGENT_PID \
   /bin/sh -c '
