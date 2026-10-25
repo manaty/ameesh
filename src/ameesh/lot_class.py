@@ -602,8 +602,9 @@ def of_lot(db, lot: int, *, cfg=None, item: Optional[dict] = None,
            repo: Optional[str] = None, base: Optional[str] = None,
            head: Optional[str] = None, milestones: Optional[list] = None,
            canons=None, base_sha: Optional[str] = None) -> dict:
-    """La classe du lot `lot` (`_of_lot`) et le plancher d'avis posé par un
-    pilote (#3183, `review_floor`) : `reviews_floor` ne reclasse jamais, il
+    """La classe du lot `lot` (`_of_lot`) et le plancher d'avis : celui posé
+    par un pilote (#3183, `review_floor`) et celui d'une baisse d'exigence du
+    canon (#3554, `canon_lowering`). `reviews_floor` ne reclasse jamais, il
     relève le compte de `merge_queue.required_verdicts` pour tous ses
     lecteurs (porte, désignation au gel, `paquet-candidats`)."""
     from . import review_floor
@@ -630,7 +631,9 @@ def _of_lot(db, lot: int, *, cfg=None, item: Optional[dict] = None,
     d'une politique), `light_reviews` (le plancher d'avis d'un lot léger,
     #2642), `train_reviews` avec `project` (le barème par chemin et le
     projet qui décide du repli de la porte, #2696) et les drapeaux compilés
-    `exclude_author_family` / `distinct_families` (#2726) pour la trace.
+    `exclude_author_family` / `distinct_families` (#2726) pour la trace, et,
+    sur un lot du canon qui touche sa politique, `canon_lowering` (#3554) avec
+    `reviews_floor=2` sur une baisse d'exigence.
     """
     out: dict = {"lot": int(lot), "class": SENSITIVE, "why": "", "files": [],
                  "policy_ref": "", "repo": repo or "", "target": base or "",
@@ -709,6 +712,17 @@ def _of_lot(db, lot: int, *, cfg=None, item: Optional[dict] = None,
         out.update({"class": LIGHT, "why": "no file changed since %s" % revision,
                     "doubt": False})
         return out
+    # #3554 : un diff du canon qui touche la politique (federation.yaml,
+    # processus/mecanique.yaml, agents/**) est comparé aux politiques compilées
+    # base/tête ; une baisse d'exigence relève le compte requis à deux avis.
+    # Le lecteur est paresseux : hors de ces chemins, il ne lit rien.
+    from . import canon_lowering
+    lowering = canon_lowering.for_lot(cfg, repo, revision, head, paths)
+    if lowering is not None and lowering.floor:
+        out["reviews_floor"] = max(int(out.get("reviews_floor") or 0),
+                                   lowering.floor)
+        out["reviews_floor_by"] = "canon-policy-lowering"
+        out["canon_lowering"] = lowering.to_dict()
     if canons is None:
         canons = work.configured_canons(cfg)
     elif callable(canons):
