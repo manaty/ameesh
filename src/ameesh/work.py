@@ -433,6 +433,43 @@ def forcer(cfg, db, explicit: str | None = None) -> str:
         "own bound session, a human terminal says --actor human:<id>" % text)
 
 
+def publisher(cfg, db, explicit: str | None = None) -> str:
+    """#3501 : l'auteur de `work estimates --publish` (L157b), le passage de
+    l'auditeur ; WorkError pour tout autre. Chaque publication renvoyait les
+    briefs `estimate_bias` à tous les estimateurs biaisés : le 25/10, un agent
+    a republié la table une minute après l'auditeur pour clore sa propre
+    alerte. Une session qui porte une identité d'agent publie en son nom, et
+    seulement si cet agent est l'auditeur (`is_auditor`) ; une identité
+    refusée ne retombe pas sur le terminal humain. Une session sans identité
+    dit qui publie : un humain (`--actor human:<id>`) ou l'auditeur."""
+    from . import identity
+    from .agent_names import resolve
+
+    text = resolve((explicit or "").strip(), db=db, operation="work.publisher")
+    binding = identity.resolve_binding(cfg, db)
+    if not binding.ok and (binding.name or binding.source != "none"
+                           or os.environ.get("AGENT_MAIL_NAME")):
+        raise WorkError("--publish refused: invalid session identity (%s)"
+                        % (binding.reason or "unbound identity"))
+    refus = ("--publish refused: %s is not the auditor; the reference table (L157b) "
+             "is the auditor's pass (persona auditeur, or auditeur role on its Agent "
+             "card in the canon); work estimates without --publish reads it")
+    if binding.name:
+        if text and text != binding.name:
+            raise WorkError("--publish refused: this session belongs to %s, it does "
+                            "not publish on behalf of %s" % (binding.name, text))
+        if is_auditor(cfg, db, binding.name):
+            return binding.name
+        raise WorkError(refus % binding.name)
+    if not text:
+        raise WorkError("--publish: say who publishes (--actor human:<id>)")
+    if text.startswith(HUMAN_PREFIX) and len(text) > len(HUMAN_PREFIX):
+        return text
+    if is_auditor(cfg, db, text):
+        return text
+    raise WorkError(refus % text)
+
+
 def milestone_actor(cfg, db, explicit: str | None = None, *, kind: str = "") -> str:
     """#2928 : l'auteur d'un jalon `frozen`/`verdict`, vérifié au chemin d'écriture.
 
