@@ -362,6 +362,32 @@ def last_hold_release(events: Iterable[dict],
     return lifted
 
 
+def current_hold_start(events: Iterable[dict], state: str | None) -> float | None:
+    """L'instant où la retenue courante a commencé (`None` hors retenue).
+
+    Un lot `blocked` ou `waiting_human` est retenu depuis la dernière
+    transition d'un état hors retenue vers un état de retenue ; une transition
+    entre deux états de retenue (`blocked` → `waiting_human`) ne rouvre pas
+    l'horloge, comme `hold_release_ts` lit la même continuité. Le temps couru
+    avant cette entrée reste acquis : les étapes d'après le gel s'arrêtent à
+    cet instant, elles ne s'effacent pas (#3555). `None` sans retenue
+    courante."""
+    if state not in HOLDS:
+        return None
+    ordered = sorted(events or (),
+                     key=lambda ev: (float(ev.get("created_ts") or 0.0),
+                                     int(ev.get("id") or 0)))
+    started = None
+    previous = None
+    for event in ordered:
+        seen = event.get("state")
+        at = event.get("created_ts")
+        if seen in HOLDS and previous not in HOLDS and at is not None:
+            started = float(at)
+        previous = seen
+    return started
+
+
 def intake_ready_ts(assigned: float | None, requested: float | None,
                     dependencies: Iterable[dict] = (), *,
                     started: float | None = None) -> float | None:
@@ -554,11 +580,12 @@ def lot_steps(item: dict, jalons: dict, events: Iterable[dict], *,
     #3555 : une retenue (`blocked`, `waiting_human`) ou un hold explicite de
     pilote levé (#1664) suspend aussi les étapes d'après le gel
     (`green_verdict`, `verdict_merge` ; `blocked_freeze` l'était déjà par
-    #3333). Sous retenue, aucune ligne ne court ; hors retenue, le départ de
-    l'étape est repoussé à la dernière levée qui suit son début. Le temps
-    parqué volontairement n'est donc pas un retard imputable au porteur, et
-    un lot sans retenue garde son alerte. Une étape déjà terminée garde sa
-    durée réelle, moins la retenue qui a suivi son départ.
+    #3333). Sous retenue d'état, l'horloge s'arrête à l'entrée en retenue :
+    le temps déjà couru reste acquis, ce qui laisse au pilote l'alerte d'un
+    lot déjà en retard qu'il doit débloquer, mais le temps du parcage ne
+    compte pas. À la levée, l'horloge repart de la levée ; un lot sans
+    retenue garde son alerte. Une étape déjà terminée garde sa durée réelle,
+    moins la retenue qui a suivi son départ.
     """
     events = list(events)
     fixes = list(fixes or ())
@@ -651,8 +678,13 @@ def lot_steps(item: dict, jalons: dict, events: Iterable[dict], *,
             out.append(_row(step, last, now=now, critical=critical))
 
     # #3555 : une retenue (état ou hold de pilote) suspend les étapes d'après
-    # le gel ; la dernière levée, lue une fois, repousse leur départ.
+    # le gel ; la dernière levée, lue une fois, repousse leur départ. Sous
+    # retenue d'état, l'horloge s'arrête à l'entrée en retenue : le temps déjà
+    # couru reste acquis (un lot déjà en retard alerte le pilote pour qu'il le
+    # débloque), le temps du parcage ne compte pas.
     lifted = last_hold_release(events, hold_releases)
+    stopped = current_hold_start(events, state)
+    running_now = now if stopped is None else min(now, stopped)
 
     if kind == "ok" and verdict is not None and jalons.get("verdict_current", True):
         step = step_of("verdict_merge")
@@ -694,10 +726,9 @@ def lot_steps(item: dict, jalons: dict, events: Iterable[dict], *,
                             elapsed_s=int(max(0.0, float(merged) - start)),
                             target=target, escalate=not packet, **extra,
                             **parked))
-        elif (state not in ("merged", "promoted", "closed", "build")
-              and state not in HOLDS):
+        elif state not in ("merged", "promoted", "closed", "build"):
             # #3487 : revenu en build, le GO ne court plus (cf. plus haut).
-            # #3555 : sous retenue, aucune ligne ne court.
+            # #3555 : sous retenue, `running_now` arrête l'horloge à l'entrée.
             start = float(verdict)
             if outside_packet:
                 # #3341 : hors paquet, la CI de la tête gelée doit être verte
@@ -714,8 +745,9 @@ def lot_steps(item: dict, jalons: dict, events: Iterable[dict], *,
                     if lifted is not None and lifted > start:
                         start = lifted
                         extra["hold_released_ts"] = round(lifted, 3)
-                    out.append(_row(step, start, now=now, critical=critical,
-                                    target=target, escalate=not packet, **extra))
+                    out.append(_row(step, start, now=running_now,
+                                    critical=critical, target=target,
+                                    escalate=not packet, **extra))
             else:
                 if packet_slot is not None and float(packet_slot) > start:
                     # #2335/A2 : la fusion ne peut entrer qu'au prochain paquet ;
@@ -727,10 +759,10 @@ def lot_steps(item: dict, jalons: dict, events: Iterable[dict], *,
                     # repart d'elle, le parcage n'est pas un retard.
                     start = lifted
                     extra["hold_released_ts"] = round(lifted, 3)
-                out.append(_row(step, start, now=now, critical=critical,
+                out.append(_row(step, start, now=running_now, critical=critical,
                                 target=target, escalate=not packet, **extra))
 
-    if state not in ("merged", "promoted", "closed") and state not in HOLDS:
+    if state not in ("merged", "promoted", "closed"):
         step = step_of("green_verdict")
         for review in reviews or ():
             name = str(review.get("name") or "").strip()
@@ -742,7 +774,7 @@ def lot_steps(item: dict, jalons: dict, events: Iterable[dict], *,
                 # #3555 : le relecteur n'est pas relancé pour du temps parqué.
                 extra["hold_released_ts"] = round(lifted, 3)
                 since = lifted
-            out.append(_row(step, since, now=now, critical=critical,
+            out.append(_row(step, since, now=running_now, critical=critical,
                             reviewer=name, **extra))
 
     if state not in ("merged", "promoted", "closed") and state not in HOLDS:

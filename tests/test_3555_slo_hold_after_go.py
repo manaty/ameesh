@@ -127,13 +127,29 @@ class HoldApresLeGoTest(unittest.TestCase):
         self.assertEqual(row["started_ts"], T0 + GO)
         self.assertNotIn("hold_released_ts", row)
 
-    def test_aucune_ligne_pendant_la_retenue(self):
+    def test_l_horloge_s_arrete_a_l_entree_en_retenue(self):
+        # #2231 : un lot déjà en retard au moment où il est parqué garde son
+        # alerte (le pilote doit le débloquer) ; le temps du parcage, lui, ne
+        # compte pas — l'horloge s'arrête à l'entrée en retenue.
+        for state in slo.HOLDS:
+            with self.subTest(state=state):
+                events = [_ev(1, "qa", T0), _ev(2, state, T0 + 3600)]
+                rows = _rows(events, state=state, jalons=_jalons(verdict=T0),
+                             now=T0 + 10 * 3600)
+                row = _row(rows, "verdict_merge")
+                self.assertEqual(row["elapsed_s"], 3600)
+                self.assertEqual(row["level"], 2)
+                self.assertEqual(row["targets"], ("pilot",))
+
+    def test_le_parcage_ne_compte_pas_dans_la_mesure(self):
         for state in slo.HOLDS:
             with self.subTest(state=state):
                 events = [_ev(1, "qa", T0), _ev(2, state, T0 + 60)]
-                rows = _rows(events, state=state, now=T0 + 10 * 3600)
-                self.assertEqual(
-                    [r for r in rows if r["step"] == "verdict_merge"], [])
+                rows = _rows(events, state=state, jalons=_jalons(verdict=T0),
+                             now=T0 + 10 * 3600)
+                row = _row(rows, "verdict_merge")
+                self.assertEqual(row["elapsed_s"], 60)
+                self.assertEqual(row["level"], 0)
                 self.assertEqual(slo.breaches(rows), [])
 
     def test_la_levee_apres_le_creneau_de_paquet_gouverne(self):
@@ -180,15 +196,24 @@ class AvisEnCoursTest(unittest.TestCase):
         self.assertEqual(row["level"], 0)
         self.assertEqual(row["hold_released_ts"], T0 + 3600)
 
-    def test_aucune_relance_du_relecteur_sous_retenue(self):
+    def test_le_temps_du_relecteur_s_arrete_a_l_entree_en_retenue(self):
         for state in slo.HOLDS:
             with self.subTest(state=state):
-                rows = _rows([_ev(1, "qa", T0), _ev(2, state, T0 + 60)],
-                             state=state, reviews=[dict(self.REVIEW)],
-                             now=T0 + 10 * 3600)
-                self.assertEqual(
-                    [r for r in rows if r["step"] == "green_verdict"], [])
-                self.assertEqual(slo.breaches(rows), [])
+                events = [_ev(1, "qa", T0), _ev(2, state, T0 + 7300)]
+                rows = _rows(events, state=state, reviews=[dict(self.REVIEW)],
+                             now=T0 + 20 * 3600)
+                row = _row(rows, "green_verdict")
+                # 7300 s de retard acquis avant l'entrée, pas 20 h de parcage.
+                self.assertEqual(row["elapsed_s"], 7300 - 60)
+                self.assertEqual(row["level"], 1)
+
+    def test_une_retenue_avant_la_designation_ne_fait_pas_courir(self):
+        rows = _rows([_ev(1, "qa", T0), _ev(2, "blocked", T0 + 10)],
+                     state="blocked", reviews=[dict(self.REVIEW)],
+                     now=T0 + 20 * 3600)
+        row = _row(rows, "green_verdict")
+        self.assertEqual(row["elapsed_s"], 0)
+        self.assertEqual(slo.breaches(rows), [])
 
 
 if __name__ == "__main__":
