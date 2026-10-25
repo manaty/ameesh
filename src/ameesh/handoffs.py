@@ -17,7 +17,6 @@ import subprocess
 import threading
 import time
 import uuid
-from urllib.parse import urlsplit
 
 from . import handoff_contract, projects, relocation, resources, storage
 from .db import DbError
@@ -169,10 +168,7 @@ def request(db, candidate, *, repository, ttl=900, now=None):
         raise HandoffError("fresh plan, source lease and enrolled repository required")
     if not 30 <= ttl <= 7200:
         raise HandoffError("reservation TTL outside 30..7200 seconds")
-    parsed = urlsplit(repository)
-    if (parsed.password is not None or parsed.query or parsed.fragment
-            or (parsed.scheme == "https" and parsed.username is not None)
-            or any(ord(c) < 32 for c in repository)):
+    if not handoff_contract.repository_identity(repository):
         raise HandoffError("repository reference contains credentials or control characters")
     for key in ("memory_bytes", "disk_bytes", "max_agents"):
         if isinstance(candidate.get(key), bool) or not isinstance(candidate.get(key), int) or candidate[key] <= 0:

@@ -15,6 +15,7 @@ composed without widening what a caller may choose.
 """
 from collections.abc import Mapping
 import re
+from urllib.parse import urlsplit
 
 from .config import NAME_RE
 
@@ -56,10 +57,37 @@ def _epoch(value, minimum):
     return isinstance(value, int) and not isinstance(value, bool) and value >= minimum
 
 
+def repository_identity(value):
+    """A bounded repository reference without credential userinfo.
+
+    HTTP(S)/``git+https`` userinfo may carry a token
+    (``http://TOKEN@forge/r.git``), so only the SSH user ``git`` is admitted,
+    in its URL and scp-like forms. Query strings, fragments, passwords and
+    control bytes are always refused.
+    """
+    if (not isinstance(value, str) or not value or len(value) > 1024
+            or any(ord(char) < 32 or ord(char) == 127 for char in value)):
+        return False
+    try:
+        parsed = urlsplit(value)
+    except ValueError:
+        return False
+    if parsed.password is not None or parsed.query or parsed.fragment:
+        return False
+    if parsed.username is not None:
+        return (parsed.scheme in ("ssh", "git+ssh")
+                and parsed.username == "git")
+    if "://" not in value:
+        head, separator, _ = value.partition(":")
+        if separator and "@" in head:
+            user, _, host = head.rpartition("@")
+            return user == "git" and bool(host)
+    return True
+
+
 def _repository(value):
     """The enrollment's repository identity: a bounded reference, not a path."""
-    return (isinstance(value, str) and 0 < len(value) <= 1024
-            and all(ord(char) >= 32 and ord(char) != 127 for char in value))
+    return repository_identity(value)
 
 
 def validate_request(operation, method):

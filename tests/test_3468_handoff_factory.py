@@ -9,6 +9,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import signal
 from types import SimpleNamespace
 import tempfile
 import unittest
@@ -70,10 +71,14 @@ class ContractTest(unittest.TestCase):
                     handoff_contract.validate_request(operation(**changes), 'prepare')
 
     def test_lease_and_repository_are_required(self):
-        self.assertTrue(handoff_contract.validate_request(
-            operation(plan={'repository': 'git@forge:manaty/ameesh.git',
-                            'owner': 'host:1234', 'epoch': 1, 'reason': 'host_drain'}),
-            'prepare'))
+        for repository in ('git@forge:manaty/ameesh.git',
+                           'ssh://git@forge.example/manaty/ameesh.git'):
+            with self.subTest(repository=repository):
+                self.assertTrue(handoff_contract.validate_request(
+                    operation(plan={'repository': repository,
+                                    'owner': 'host:1234', 'epoch': 1,
+                                    'reason': 'host_drain'}),
+                    'prepare'))
         for plan in ({'repository': '', 'owner': 'runner', 'epoch': 1},
                      {'repository': 'r', 'owner': '', 'epoch': 1},
                      {'repository': 'r', 'owner': 'bad\nowner', 'epoch': 1},
@@ -82,6 +87,17 @@ class ContractTest(unittest.TestCase):
                      {'repository': 'r', 'owner': 'runner', 'epoch': -1}):
             with self.subTest(plan=plan):
                 value = operation(plan=plan)
+                with self.assertRaises(handoff_contract.ContractError):
+                    handoff_contract.validate_request(value, 'prepare')
+        for repository in ('http://JETON@forge.example/r.git',
+                           'https://JETON@forge.example/r.git',
+                           'git+https://JETON@forge.example/r.git',
+                           'ssh://JETON@forge.example/r.git',
+                           'JETON@forge.example:manaty/r.git'):
+            with self.subTest(repository=repository):
+                value = operation(plan={'repository': repository,
+                                        'owner': 'runner', 'epoch': 1,
+                                        'reason': 'host_drain'})
                 with self.assertRaises(handoff_contract.ContractError):
                     handoff_contract.validate_request(value, 'prepare')
 
@@ -241,6 +257,20 @@ class FactoryTest(unittest.TestCase):
         self.assertEqual(value.references_for(agent, 'target'),
                          ('harnais.env#DEEPSEEK_API_KEY',))
 
+    def test_account_grammar_is_the_preflight_grammar(self):
+        account = 'a' * 126 + ':x'
+        self.documents['hosts']['hosts'][self.host]['codex']['accounts'] = ['', account]
+        self.write('hosts', self.documents['hosts'])
+        value = self.factory()
+        required = value.requirements_for(self.agent(session_account=account),
+                                          self.host)
+        self.assertEqual(required.account, account)
+        # Preflight accepts exactly this reference; requirements_for must not
+        # admit an account it would then refuse.
+        host_preflight.Requirements(
+            host=self.host, harness='codex', account=required.account,
+            tools=('gh',), secret_refs=())
+
     def test_missing_identity_is_refused(self):
         value = self.factory()
         cases = [
@@ -275,6 +305,11 @@ class FactoryTest(unittest.TestCase):
 
     def test_repository_credentials_query_fragment_or_control_are_refused(self):
         for repository in ('https://user:secret@forge.example/r.git',
+                           'https://JETON@forge.example/r.git',
+                           'http://JETON@forge.example/r.git',
+                           'git+https://JETON@forge.example/r.git',
+                           'ssh://JETON@forge.example/r.git',
+                           'JETON@forge.example:manaty/r.git',
                            'git@forge:manaty/r.git?ref=main',
                            'git@forge:manaty/r.git#fragment',
                            'git@forge:manaty/r\n.git'):
@@ -282,8 +317,18 @@ class FactoryTest(unittest.TestCase):
                 self.documents['repositories'] = {'repositories': {'ameesh': repository}}
                 self.write('repositories', self.documents['repositories'])
                 with self.assertRaisesRegex(factory_module.FactoryError,
-                                            'document:repositories'):
+                                            'document:repositories') as caught:
                     self.factory()
+                self.assertNotIn('JETON', str(caught.exception))
+
+    def test_ssh_git_userinfo_is_admitted(self):
+        for repository in ('ssh://git@forge.example/manaty/r.git',
+                           'git@forge.example:manaty/r.git'):
+            with self.subTest(repository=repository):
+                self.documents['repositories'] = {'repositories': {'ameesh': repository}}
+                self.write('repositories', self.documents['repositories'])
+                self.assertEqual(self.factory().adapter.repository(self.agent()),
+                                 repository)
 
     def test_missing_document_is_refused_by_name(self):
         for name in factory_module.DOCUMENTS:
@@ -309,6 +354,8 @@ class FactoryTest(unittest.TestCase):
             ('secrets', {'references': {'codex/api': 'harnais.env#BAD-KEY'}}),
             ('hosts', {'hosts': {self.host: {'codex': {
                 'accounts': [''], 'tools': ['gh'], 'secrets': ['unknown/api']}}}}),
+            ('hosts', {'hosts': {self.host: {'codex': {
+                'accounts': ['a@b'], 'tools': ['gh'], 'secrets': []}}}}),
         ]
         for name, value in cases:
             with self.subTest(name=name, value=value):
@@ -361,6 +408,23 @@ class FactoryTest(unittest.TestCase):
                 self.factory()
         finally:
             alias.unlink()
+
+    def test_fifo_document_is_refused_without_blocking(self):
+        path = self.root / 'hosts.json'
+        path.unlink()
+        os.mkfifo(path, 0o600)
+        previous = signal.getsignal(signal.SIGALRM)
+        self.addCleanup(signal.signal, signal.SIGALRM, previous)
+        self.addCleanup(signal.alarm, 0)
+
+        def expired(signum, frame):
+            raise TimeoutError('FIFO document open blocked')
+
+        signal.signal(signal.SIGALRM, expired)
+        signal.alarm(2)
+        with self.assertRaisesRegex(factory_module.FactoryError, 'document:hosts'):
+            self.factory()
+        signal.alarm(0)
 
     def test_untrusted_enrollment_root_is_refused(self):
         self.root.chmod(0o777)

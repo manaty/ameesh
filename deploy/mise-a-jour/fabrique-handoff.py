@@ -31,7 +31,6 @@ from pathlib import Path
 import re
 import stat
 from collections.abc import Mapping
-from urllib.parse import urlsplit
 
 from ameesh import handoff_contract, host_preflight, projects
 from ameesh.config import NAME_RE
@@ -50,7 +49,9 @@ DOCUMENTS = {
 COMPANION_METHODS = tuple(name for name in handoff_contract.METHODS
                           if name != handoff_contract.REPOSITORY)
 
-_ACCOUNT = re.compile(r'^[A-Za-z0-9][A-Za-z0-9_.@-]{0,63}$')
+#: Same grammar as ``host_preflight.Requirements`` (the consumer), so an
+#: account admitted by a document cannot fail later in requirements_for.
+_ACCOUNT = re.compile(r'^[A-Za-z0-9][A-Za-z0-9_.:/-]{0,127}$')
 _ALIAS = re.compile(r'^[A-Za-z0-9][A-Za-z0-9_.:/-]{0,127}$')
 _STORE_FILE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$')
 _STORE_KEY = re.compile(r'^[A-Za-z_][A-Za-z0-9_]{0,127}$')
@@ -70,11 +71,13 @@ class Documents:
 
     The enrollment root is the trust anchor (owned by the controller or root,
     never group/world writable, no symlink). Every component below it is
-    checked before the document is opened; ancestors above the fixed
-    production root are outside the enrollment's own boundary. A document is
-    owned by the controller or root and is neither group-writable nor
-    world-accessible, so the L232c system mode (0640 root:group) is admitted
-    without widening anything.
+    checked before the document is opened and the final document must be a
+    regular file; ancestors above the fixed production root are outside the
+    enrollment's own boundary. The open is non-blocking, so a FIFO/device
+    swapped in after the lstat cannot hang admission, and the descriptor's
+    fstat decides. A document is owned by the controller or root and is
+    neither group-writable nor world-accessible, so the L232c system mode
+    (0640 root:group) is admitted without widening anything.
     """
 
     def __init__(self, root=ENROLLMENT_ROOT):
@@ -98,14 +101,21 @@ class Documents:
             relative = path.relative_to(self.root)
         except ValueError:
             raise FactoryError('document:path') from None
+        parts = relative.parts
+        if not parts:
+            raise FactoryError('document:path')
         current = self.root
-        for part in relative.parts:
+        for index, part in enumerate(parts):
             current = current / part
             try:
                 info = current.lstat()
             except OSError:
                 raise FactoryError('document:missing') from None
-            if stat.S_ISLNK(info.st_mode) or not _owned(info) or info.st_mode & 0o022:
+            last = index == len(parts) - 1
+            expected = stat.S_ISREG if last else stat.S_ISDIR
+            if (stat.S_ISLNK(info.st_mode) or not _owned(info)
+                    or info.st_mode & 0o022
+                    or not expected(info.st_mode)):
                 raise FactoryError('document:untrusted')
 
     def json(self, name, *, exact):
@@ -114,7 +124,11 @@ class Documents:
         path = self.root / (name + '.json')
         try:
             self._trusted(path)
-            descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+            # O_NONBLOCK bounds a FIFO/device swapped in after the lstat; the
+            # fstat below then refuses anything that is not the expected
+            # regular file before any byte is read.
+            descriptor = os.open(path,
+                                 os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
         except (OSError, FactoryError):
             raise FactoryError('document:' + name) from None
         try:
@@ -178,13 +192,7 @@ def _hosts(value):
 
 def _repository(value):
     """An enrolled repository identity: no credentials, query or control byte."""
-    if not isinstance(value, str) or not value or len(value) > 1024:
-        return False
-    if any(ord(char) < 32 or ord(char) == 127 for char in value):
-        return False
-    parsed = urlsplit(value)
-    return (parsed.password is None and not parsed.query and not parsed.fragment
-            and not (parsed.scheme == 'https' and parsed.username is not None))
+    return handoff_contract.repository_identity(value)
 
 
 def _repositories(value):

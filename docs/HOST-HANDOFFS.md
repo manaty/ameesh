@@ -141,7 +141,11 @@ tools and alias names; the private reference mapping is available separately
 for the L232c bridge and never enters `Requirements` or an error. A missing or
 unsafe document, an unenrolled host, harness or account, an unknown project
 repository, a credential-bearing repository URL or a missing adapter method
-refuses admission.
+refuses admission. Only the SSH userinfo `git@` is admitted, in URL or
+scp-like form; HTTP(S)/`git+https` userinfo is refused as a credential.
+Documents must be regular files: the final type is checked before opening,
+the open is non-blocking and the descriptor is checked again, so a FIFO or a
+device cannot hang admission.
 
 H1 binds no host effect. The companion's capabilities refuse by name until H2
 (preparation and Git) and H3 (activation, health and recovery) replace them;
