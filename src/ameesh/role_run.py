@@ -25,12 +25,23 @@ them. This module is that gate, and nothing more:
   can never pass as a process without identity. ``AMEESH_TURN_ID`` is removed:
   a timer is not an agent turn.
 
+#3568: ``--pass alerts`` delegates ONE pass independently of the lease. The
+alert delivery must not go silent because the elected lease fell to a host
+without a push route (#3383). The wrapper reads the published candidate
+standings and asks :func:`election.alerts_delegate` who runs the pass: the
+holder when it can push, otherwise the first candidate that proves a remote
+route. A non-delegate stands by (exit 0); the delegate runs the pass **without
+the holder's epoch**, since it is not the lease holder and the alerts pass
+writes no fenced pilot gesture (local notify state and the shared liveness
+beat only). The other passes keep the lease-only gate.
+
 The command is an argument vector, never a shell string. Its exit code is
 returned unchanged. The wrapper's own refusals are:
 
 * ``0`` — standby (another host holds the lease, the lease is expired, the
-  role is stopped, or the remaining lease is below ``--min-left``): the timer
-  did nothing, as expected on a standby host;
+  role is stopped, the remaining lease is below ``--min-left``, or the alerts
+  pass is delegated to another candidate): the timer did nothing, as expected
+  on a standby host;
 * ``1`` — the lease could not be read (database unavailable): the timer must
   be noticed, never silently considered standby;
 * ``2`` — the invocation is invalid (unknown role, no host, no command).
@@ -49,6 +60,7 @@ from . import db as db_mod
 #: environment given to the command. The epoch is the fencing token of EP4.
 ENV_ROLE = "AMEESH_ROLE"
 ENV_HOST = "AMEESH_ROLE_HOST"
+ENV_PASS = "AMEESH_ROLE_PASS"
 ENV_EPOCH = "AMEESH_LEASE_EPOCH"
 ENV_LEFT = "AMEESH_LEASE_LEFT"
 ENV_OWNER = "AMEESH_LEASE_OWNER"
@@ -165,6 +177,12 @@ def role_host_authorized(cfg) -> bool:
     role = (os.environ.get(ENV_ROLE) or "").strip()
     host = (os.environ.get(ENV_HOST) or "").strip()
     here = (getattr(cfg, "host", None) or "").strip()
+    # #3568: a delegated pass carries the role without the lease epoch. It
+    # must not open the host-designated GitHub/CI passes that the lease gate
+    # authorizes: only the lease holder's timer does (`AMEESH_ROLE_PASS` is
+    # set for the delegated `alerts` pass and for a holder's `--pass alerts`).
+    if (os.environ.get(ENV_PASS) or "").strip():
+        return False
     return bool(role) and bool(host) and bool(here) and host == here
 
 
@@ -192,7 +210,28 @@ def _detail(code: str, report: dict) -> str:
         return "role is stopped"
     if code == "lease-too-short":
         return "%s left" % report.get("left_s")
+    if code == "alerts-delegated":
+        return "alerts pass delegated to %s (%s)" % (
+            report.get("delegate"), report.get("delegation") or "another candidate")
+    if code == "no-alerts-delegate":
+        return "no candidate proves a remote push route (%s)" % (
+            report.get("delegation") or "no route")
     return code
+
+
+def _alerts_delegation(db, report: dict, *, host: str) -> dict:
+    """#3568: the alerts-pass delegate read from the live role row.
+
+    The wrapper stays the entry gate only: this read chooses *which host* runs
+    the `alerts` pass, it writes nothing. `report` is the fresh `live()` row
+    of the role.
+    """
+    from . import election
+    role = {"name": report.get("role"), "releve": report.get("releve"),
+            "candidats": list(report.get("candidates") or ())}
+    decision = election.alerts_delegate(db, role, holder=report.get("holder"))
+    decision["this_host"] = host
+    return decision
 
 
 def _record(report: dict, *, host: str, argv: list[str] | None = None,
@@ -208,6 +247,7 @@ def run(cfg, args) -> int:
     """The `ameesh role run ROLE -- command` entry point."""
     name = args.role
     host = (getattr(cfg, "host", None) or "").strip()
+    pass_name = str(getattr(args, "pass_name", "") or "").strip()
     argv = list(args.command)
     if argv[:1] == ["--"]:
         argv = argv[1:]
@@ -218,6 +258,10 @@ def run(cfg, args) -> int:
         print("ameesh role run: this host has no name (AMEESH_HOST or config host)",
               file=sys.stderr)
         return 2
+    if pass_name and pass_name != "alerts":
+        print("ameesh role run: unknown delegated pass %r (only: alerts)" % pass_name,
+              file=sys.stderr)
+        return 2
 
     def emit(report, *, result, stream=sys.stdout):
         if args.json:
@@ -226,8 +270,9 @@ def run(cfg, args) -> int:
                                      detail=report.get("detail") or ""),
                              ensure_ascii=False, sort_keys=True), file=stream)
         else:
-            print("role %s on %s: %s%s" % (
+            print("role %s on %s: %s%s%s" % (
                 report.get("role") or name, host, result,
+                " (alerts delegated)" if report.get("delegated") else "",
                 " (%s)" % (report.get("detail") or report.get("code"))
                 if (report.get("detail") or report.get("code")) else ""), file=stream)
 
@@ -242,10 +287,30 @@ def run(cfg, args) -> int:
         except RoleError as exc:
             print("ameesh role run: %s" % exc, file=sys.stderr)
             return 2
+        delegated = False
         if report["stopped"]:
             report["code"] = "role-stopped"
         elif not report["held"]:
             report["code"] = "no-live-lease"
+        elif pass_name == "alerts" and report.get("releve") == "election":
+            # #3568: the alerts pass follows a route, not only the lease. The
+            # holder keeps it when its standing says it can push; a holder
+            # without a route leaves it to the first candidate that can.
+            delegation = _alerts_delegation(db, report, host=host)
+            report["pass"] = pass_name
+            report["delegate"] = delegation.get("delegate")
+            report["delegation"] = delegation.get("reason") or ""
+            report["holder_notify_ok"] = bool(delegation.get("holder_notify_ok"))
+            if delegation.get("delegate") is None:
+                report["code"] = "no-alerts-delegate"
+            elif delegation["delegate"] != host:
+                report["code"] = "alerts-delegated"
+            else:
+                delegated = delegation["delegate"] != report["host"]
+                if not delegated and args.min_left and (
+                        report.get("left_s") is None
+                        or float(report["left_s"]) < float(args.min_left)):
+                    report["code"] = "lease-too-short"
         elif report["host"] != host:
             report["code"] = "other-host"
         elif args.min_left and (report.get("left_s") is None
@@ -255,6 +320,7 @@ def run(cfg, args) -> int:
             report["detail"] = _detail(report["code"], report)
             emit(report, result="standby")
             return 0
+        report["delegated"] = delegated
         if args.dry_run:
             emit(report, result="would-run")
             return 0
@@ -267,7 +333,7 @@ def run(cfg, args) -> int:
         for key in ("AGENT_MAIL_NAME", "AMEESH_RUNNER_ID", "AGENT_MESH_RUNNER_ID",
                     "AMEESH_TURN_ID", "AMEESH_LEASE_EPOCH", "AGENT_MESH_LEASE_EPOCH",
                     "AMEESH_LEASE_OWNER", "AMEESH_LEASE_LEFT", "AMEESH_ROLE",
-                    "AMEESH_ROLE_HOST"):
+                    "AMEESH_ROLE_HOST", ENV_PASS):
             env.pop(key, None)
         env.update({
             # a child loads the same host, even when its AMEESH_HOST was unset
@@ -275,12 +341,21 @@ def run(cfg, args) -> int:
             # explicit actor = the role, bound to the live lease (EP4 gate).
             ENV_ROLE: report["role"],
             ENV_HOST: host,
-            ENV_EPOCH: ("" if report.get("epoch") is None
-                        else str(report["epoch"])),
-            ENV_LEFT: ("" if report.get("left_s") is None
-                       else str(int(report["left_s"]))),
-            ENV_OWNER: str(report.get("owner") or ""),
         })
+        if pass_name:
+            env[ENV_PASS] = pass_name
+        # #3568: the delegated pass runs on a candidate that does NOT hold the
+        # lease. It must not carry the holder's epoch: EP4 would read it as a
+        # fenced gesture of the holder. The alerts pass writes no pilot
+        # gesture (local notify state and the shared liveness beat).
+        if not delegated:
+            env.update({
+                ENV_EPOCH: ("" if report.get("epoch") is None
+                            else str(report["epoch"])),
+                ENV_LEFT: ("" if report.get("left_s") is None
+                           else str(int(report["left_s"]))),
+                ENV_OWNER: str(report.get("owner") or ""),
+            })
         try:
             proc = subprocess.run(argv, env=env, check=False)
         except FileNotFoundError as exc:
@@ -316,9 +391,15 @@ def build_parser() -> argparse.ArgumentParser:
                     "role's live lease (L165/EP5)",
     )
     parser.add_argument("role", help="agent name of the role (aliases accepted)")
+    parser.add_argument("--pass", dest="pass_name", default="", metavar="PASS",
+                        choices=("alerts",),
+                        help="run this pass under its own delegation instead of "
+                             "the lease alone (#3568: only `alerts`; the pass "
+                             "runs on the holder when it can push, else on the "
+                             "first candidate that can)")
     parser.add_argument("--min-left", type=float, default=0.0,
                         help="refuse to start below S seconds of lease left "
-                             "(default 0)")
+                             "(default 0; ignored by a delegated pass)")
     parser.add_argument("--dry-run", action="store_true",
                         help="print the decision; run nothing")
     parser.add_argument("--json", action="store_true",
