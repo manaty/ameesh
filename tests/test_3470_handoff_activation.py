@@ -470,7 +470,11 @@ class AdapterTest(PgTestCase):
                                            'tools': ('gh',), 'secrets': ()}},
                    'target': {'deepseek': {'accounts': ('main',),
                                            'tools': ('gh',), 'secrets': ()}}},
-            references={}, transports={}, bridge=self.fake)
+            references={}, transports={},
+            # H2 final freeze: the plan's repository is bound to the enrolled
+            # project before any effect, never widened by the caller.
+            repositories={'ameesh': 'git@forge:manaty/app.git'},
+            bridge=self.fake)
         registry.upsert(self.db, 'dev', chantier='ameesh', harness='deepseek',
                         host='source', cwd='/work/source')
         self.db.execute("UPDATE agent_registry SET session_account='main',"
