@@ -1,0 +1,45 @@
+#!/bin/sh
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# #3444 — témoin d'isolation d'un exécuteur d'agent.
+#
+# Appelé par le drop-in `ameesh-runner-agent@.service.d/cles-owner.conf` en
+# ExecStartPre, donc DANS le mount namespace de l'unité : si
+# InaccessiblePaths= a été appliqué, chaque chemin protégé est soit absent,
+# soit un répertoire vide (le tmpfs posé par systemd), soit illisible. S'il
+# est encore listable et non vide, l'isolation n'a pas été posée (AppArmor
+# d'Ubuntu 24.04, cf. docs/EXPLOITATION.md, « Clés SSH de l'owner et
+# exécuteurs du poste ») : on sort en 1 et l'unité refuse de démarrer.
+#
+# Posé en root, non modifiable par l'agent qu'il contrôle :
+#   install -D -m 0755 deploy/poste/verifie-cles-owner \
+#     /usr/local/libexec/ameesh/verifie-cles-owner
+#
+# Usage : verifie-cles-owner CHEMIN...
+set -u
+
+statut=0
+for chemin in "$@"; do
+  # `InaccessiblePaths=-` : un chemin absent n'est pas protégé, rien à cacher.
+  if [ ! -e "$chemin" ] && [ ! -L "$chemin" ]; then
+    continue
+  fi
+  # Un fichier protégé ne doit plus être lisible.
+  if [ ! -d "$chemin" ]; then
+    if [ -r "$chemin" ]; then
+      echo "isolation absente : $chemin est un fichier encore lisible" >&2
+      statut=1
+    fi
+    continue
+  fi
+  # Répertoire : listable et non vide = isolation absente. `ls` refusé ou
+  # liste vide = chemin rendu inaccessible (le but), donc conforme.
+  if liste=$(ls -A -- "$chemin" 2>/dev/null); then
+    if [ -n "$liste" ]; then
+      premier=$(printf '%s\n' "$liste" | sed -n '1p')
+      echo "isolation absente : $chemin est encore lisible et non vide (ex. $premier)" >&2
+      statut=1
+    fi
+  fi
+done
+exit "$statut"

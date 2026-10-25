@@ -10,6 +10,10 @@
 #     deploy/systemd/ameesh-agents.slice ~/.config/systemd/user/
 #   install -D -m 0644 'deploy/systemd/ameesh-runner-agent@.service.d/cargo-target.conf' \
 #     ~/.config/systemd/user/ameesh-runner-agent@.service.d/cargo-target.conf   # #248
+#   # poste où l'exécuteur partage le compte de l'humain : clés de l'owner
+#   # hors de l'unité (#3444, prérequis root dans docs/EXPLOITATION.md)
+#   install -D -m 0644 'deploy/systemd/ameesh-runner-agent@.service.d/cles-owner.conf' \
+#     ~/.config/systemd/user/ameesh-runner-agent@.service.d/cles-owner.conf   # #3444
 #   systemctl --user daemon-reload
 #   systemctl --user enable --now ameesh-runner-agent@<agent>
 #   journalctl --user -u ameesh-runner-agent@<agent> -f
@@ -35,6 +39,14 @@ Wants=network-online.target
 Environment=PATH=%h/.local/share/mise/shims:%h/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/bin:/bin
 # AMEESH_DSN, AMEESH_HOST, AMEESH_CANON… ; peut redéfinir PATH (facultatif)
 EnvironmentFile=-%h/.config/ameesh/env
+# #3444 (décision owner #133454 a) : l'agent SSH de l'humain n'entre jamais
+# dans un exécuteur. UnsetEnvironment s'applique APRÈS EnvironmentFile= et
+# après l'environnement hérité du gestionnaire : ni ~/.config/ameesh/env ni la
+# session de l'owner ne peuvent réintroduire le socket (mesuré : le
+# gestionnaire portait SSH_AUTH_SOCK, l'unité ne le voit plus). Le drop-in
+# ...service.d/cles-owner.conf du poste retire en plus ~/.ssh du système de
+# fichiers de l'exécuteur.
+UnsetEnvironment=SSH_AUTH_SOCK SSH_AGENT_PID
 ExecStart=%h/.local/share/ameesh/venv/bin/ameesh run --agents %i --runner-id runner-%i@%H
 # Une base pas encore là au démarrage n'est plus une sortie en échec (L106,
 # attente croissante) ; une sortie anormale relance l'exécuteur.
