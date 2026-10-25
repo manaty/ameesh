@@ -362,6 +362,13 @@ class Agents(interface.Agents):
                              "   AND state NOT IN ('merged', 'promoted', 'closed')"
                              " ORDER BY id",
                              (agent,))]
+            blockers += [{"kind": "external_executor", "id": int(lot["id"]),
+                          "state": lot["state"]}
+                         for lot in tx.query(
+                             "SELECT id, state FROM work_items"
+                             " WHERE external_executor = %s"
+                             "   AND state NOT IN ('merged', 'promoted', 'closed')"
+                             " ORDER BY id", (agent,))]
             blockers += [{"kind": "watch", "host": watch["host"]}
                          for watch in tx.query(
                              "SELECT host FROM agent_watches WHERE agent = %s", (agent,))]
