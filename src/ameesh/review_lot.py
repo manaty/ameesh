@@ -87,6 +87,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import time
 from datetime import datetime
 from typing import Optional
 
@@ -342,6 +343,71 @@ def _repo_of_agent(db, name: str) -> str:
         return ""
     path = os.path.expanduser(str(row.get("cwd") or ""))
     return path if path and os.path.isdir(path) else ""
+
+
+#: #3426 : la déduplication du rattrapage entre les hôtes. Un hôte sans
+#: dépôt ne tente rien pour un lot ; l'hôte qui en a un le classe, et le
+#: verrou de la ligne du lot sérialise la marque de tentative (donc
+#: l'avertissement, qui n'est envoyé qu'une fois, par le porteur de la
+#: deuxième tentative).
+
+
+def _candidate_repos(db, item: dict, repo: str = "") -> list[str]:
+    """Les dépôts candidats pour lire le diff d'un lot (#3426).
+
+    `repo` explicite est autoritaire, sans repli (#2968) ; sinon le dossier de
+    travail de l'assigné au registre, puis le dépôt du projet
+    (`lot_class.repository`). C'est exactement l'ordre de `class_at_merge` :
+    la couverture d'un hôte et la lecture effective ne peuvent pas diverger.
+    """
+    if repo:
+        return [repo]
+    candidates: list[str] = []
+    for path in (_repo_of_agent(db, str(item.get("assignee") or "")),
+                 lot_class.repository(getattr(db, "cfg", None), item) or ""):
+        path = str(path or "").strip()
+        if path and path not in candidates:
+            candidates.append(path)
+    return candidates
+
+
+def _host_holds_lot_repo(db, item: dict, repo: str = "", *,
+                         slug_of=None) -> bool:
+    """#3426 : cet hôte a-t-il un dépôt candidat pour ce lot ?
+
+    Un hôte **sans dépôt** ne peut rien classer : le rattrapage s'abstient
+    pour ce lot (aucune tentative, aucun avertissement) et laisse l'hôte qui
+    porte le clone le classer. C'est le correctif des avertissements « aucun
+    dépôt lisible » partis d'ameesh-agents-1 à chaque fusion légère, alors
+    qu'ameesh-agents-2 classait ensuite (#134889, #135218, #135227, #135228).
+
+    Un `repo` explicite et le dépôt du projet (`radar.projects`, ou le clone
+    du canon) comptent sans autre preuve : c'est là qu'un avertissement est
+    actionnable si le clone ne contient pas la fusion. Le dossier de
+    l'assigné ne compte pas s'il est reconnu comme un AUTRE dépôt (un agent
+    d'un autre projet sur le même hôte) ; un dossier dont le `origin` n'est
+    pas lisible reste un candidat — on ne prouve pas qu'il est le mauvais.
+    """
+    if repo:
+        return True
+    project = str(lot_class.repository(getattr(db, "cfg", None), item) or "").strip()
+    if project and os.path.isdir(os.path.expanduser(project)):
+        return True
+    cwd = _repo_of_agent(db, str(item.get("assignee") or ""))
+    if not cwd:
+        return False
+    expected_slug, expected_name = plan_git._expected_repo(item)
+    if not expected_slug and not expected_name:
+        return True
+    # #3426 : le slug est relu une fois par dossier dans un passage — le
+    # même dossier d'agent revient pour chaque lot, et `git remote` n'est pas
+    # gratuit quand une vingtaine de lots sont candidats.
+    slug = (slug_of or plan_git._repo_slug)(cwd)
+    if not slug:
+        return True          # dépôt non reconnu : on ne peut pas prouver le contraire
+    if expected_slug:
+        return slug == expected_slug
+    return slug.rsplit("/", 1)[-1] == expected_name
 
 
 def _open(ops, ref: str) -> Optional[dict]:
@@ -1277,16 +1343,9 @@ def class_at_merge(db, lot: int, *, item: Optional[dict] = None,
     # dépôt git) ou un clone partiel sans le commit : on essaie les candidats
     # dans l'ordre (--repo explicite, dépôt de l'assigné, dépôt du projet) et
     # on retient le premier qui prouve l'intervalle. --repo explicite reste
-    # autoritaire, sans repli (#2968).
-    candidates: list[str] = []
-    if repo:
-        candidates = [repo]
-    else:
-        for path in (_repo_of_agent(db, str(item.get("assignee") or "")),
-                     lot_class.repository(getattr(db, "cfg", None), item) or ""):
-            path = str(path or "").strip()
-            if path and path not in candidates:
-                candidates.append(path)
+    # autoritaire, sans repli (#2968). #3426 : la même liste sert au rattrapage
+    # pour savoir si CET hôte peut classer le lot.
+    candidates = _candidate_repos(db, item, repo or "")
     where = candidates[0] if candidates else ""
     base = head = ""
     proven = False
@@ -1492,18 +1551,21 @@ def merged_sha(db, lot: int) -> str:
     return str(last.get("sha") or "").strip()
 
 
-def _warn_unopened(db, entries: list[dict]) -> str:
-    """#3201 : les relectures manquantes faute de dépôt, dites aux pilotes.
+def _warn_unopened(db, entries: list[dict], host: str = "") -> str:
+    """#3201/#3426 : les relectures qu'un hôte muni d'un clone n'a pas pu classer.
 
-    Un simple journal ne se lit pas. La **deuxième** tentative d'un lot sans
-    dépôt connu envoie un courrier durable aux pilotes déclarés, qui nomme les
-    lots et le geste de reprise (`ameesh work merged <id> --sha <merge>
-    --repo <clone>`, idempotent). #3413 : ce geste relance réellement la
-    classification (le clone fourni n'attend ni le délai ni le plafond de
-    tentatives du balayage) — il répondait « already merged: nothing to do ».
-    Best effort : sans pilote déclaré ou sans
-    dépôt de courrier, le journal reste et le compte rendu le dit — un
-    avertissement ne casse jamais le relevé. Rend une ligne lisible."""
+    Un simple journal ne se lit pas. La **deuxième** tentative d'un lot sur un
+    hôte qui porte un dépôt candidat envoie un courrier durable aux pilotes
+    déclarés, qui nomme les lots et le geste de reprise (`ameesh work merged
+    <id> --sha <merge> --repo <clone>`, idempotent). #3413 : ce geste relance
+    réellement la classification (le clone fourni n'attend ni le délai ni le
+    plafond de tentatives du balayage) — il répondait « already merged:
+    nothing to do ». #3426 : seuls les hôtes munis d'un dépôt tentent et
+    avertissent — un hôte sans clone s'abstient sans courrier, et la marque de
+    tentative partagée (verrou de la ligne du lot) fait qu'une deuxième
+    tentative n'est écrite que par un seul hôte. Best effort : sans pilote
+    déclaré ou sans dépôt de courrier, le journal reste et le compte rendu le
+    dit — un avertissement ne casse jamais le relevé. Rend une ligne lisible."""
     try:
         from . import mail, registry, sous_utilisation
         cfg = getattr(db, "cfg", None)
@@ -1518,9 +1580,11 @@ def _warn_unopened(db, entries: list[dict]) -> str:
         return "aucun pilote déclaré : avertissement laissé au journal"
     shown = entries[:WARN_LIMIT]
     lines = [
-        "Relecture après fusion (canon §2) impossible : aucun dépôt lisible.",
+        "Relecture après fusion (canon §2) non ouverte : le clone du",
+        "rattrapage ne prouve pas la fusion.",
         "",
-        "Ces lots fusionnés n'ont pas pu être classés, faute de dépôt connu :",
+        "Ces lots fusionnés n'ont pas pu être classés sur un hôte muni d'un",
+        "dépôt candidat :",
     ]
     for entry in shown:
         lines.append("- #%s « %s » (fusion %s)" % (
@@ -1530,15 +1594,18 @@ def _warn_unopened(db, entries: list[dict]) -> str:
     if len(entries) > len(shown):
         lines.append("… et %d autre(s), au journal des lots."
                      % (len(entries) - len(shown)))
+    if host:
+        lines += ["", "Constat fait sur l'hôte %s." % host]
     lines += [
         "",
-        "Un lot léger doit être relu après fusion ; sans dépôt, la relecture",
-        "n'est jamais ouverte. Reprendre chaque lot avec le clone qui porte la",
-        "fusion : le clone fourni relance la classification, la fusion déjà",
-        "écrite n'est pas rouverte (la déclaration est idempotente) :",
+        "Un lot léger doit être relu après fusion ; sans classement, la",
+        "relecture n'est jamais ouverte. Reprendre chaque lot avec le clone qui",
+        "porte la fusion : le clone fourni relance la classification, la fusion",
+        "déjà écrite n'est pas rouverte (la déclaration est idempotente) :",
         "  ameesh work merged <id> --sha <commit de fusion> --repo <clone>",
         "Ou corriger `radar.projects.<projet>.repo` (ou le dossier de l'assigné)",
-        "sur l'hôte du rattrapage.",
+        "sur l'hôte du rattrapage — un hôte sans clone s'abstient désormais,",
+        "sans avertir (#3426).",
     ]
     body = "\n".join(lines)
     sent, failed = [], []
@@ -1557,7 +1624,8 @@ def _warn_unopened(db, entries: list[dict]) -> str:
 def catch_up(db, *, repo: str = "", target: str = "",
              limit: int = CATCH_UP_LIMIT,
              retry_s: float = ATTEMPT_RETRY_S,
-             max_attempts: int = CATCH_UP_MAX_ATTEMPTS) -> dict:
+             max_attempts: int = CATCH_UP_MAX_ATTEMPTS,
+             host: str = "") -> dict:
     """L539 (#1104) : rattrapage des relectures manquantes après une panne.
 
     Les relevés ne sélectionnent que des lots **ouverts** : un lot déjà `merged`
@@ -1588,15 +1656,30 @@ def catch_up(db, *, repo: str = "", target: str = "",
     n'ouvre rien ; il reçoit la marque terminale (`reviewed`) au lieu d'être
     retenté à chaque balayage — la relecture est rendue, pas manquante.
 
-    Ne lève jamais ; rend `{examined, missing, opened, already, reviewed,
-    attempted, terminal, failed, bound, unopened, warning}` (`attempted` :
+    #3426 (pilote, 24/10/2026) : le rattrapage tourne sur **chaque hôte**, mais
+    seul un hôte qui peut nommer un dépôt pour le lot le tente
+    (`_host_holds_lot_repo`). Un hôte sans clone s'abstient — aucune tentative,
+    aucun avertissement — et laisse l'hôte muni du clone classer. Les hôtes
+    munis d'un clone se dédupliquent **par lot** : le verrou de la ligne du lot
+    sérialise la marque de tentative, qui n'est écrite qu'une fois par délai
+    même si deux hôtes ont sélectionné le lot ; la deuxième tentative, et donc
+    le courrier de `_warn_unopened`, n'a qu'un seul auteur. C'est le correctif
+    des avertissements « aucun dépôt lisible » partis d'ameesh-agents-1 à
+    chaque fusion légère alors qu'ameesh-agents-2 classait ensuite.
+
+    Ne lève jamais ; rend `{host, examined, missing, opened, already, reviewed,
+    attempted, terminal, deferred, busy, failed, bound, unopened, warning}`
+    (`deferred` : lots sans dépôt candidat sur cet hôte, laissés à un autre ;
+    `busy` : lots qu'une autre passe a déjà tentés dans le délai, `attempted` :
     tentatives sans création marquées, `already` : relecture ouverte entre la
     sélection et le geste, `reviewed` : avis déjà rendu sur la tête fusionnée,
     `terminal` : candidats clos par la marque terminale, `unopened` : lots de
-    la deuxième tentative restés sans dépôt — #3384, `warning` : ce qui a été
-    fait de l'avertissement aux pilotes)."""
-    out = {"examined": 0, "missing": 0, "opened": 0, "already": 0,
-           "reviewed": 0, "attempted": 0, "terminal": 0, "failed": 0, "bound": "",
+    la deuxième tentative restés sans classement — #3384, `warning` : ce qui a
+    été fait de l'avertissement aux pilotes)."""
+    out = {"host": str(host or getattr(getattr(db, "cfg", None), "host", "") or ""),
+           "examined": 0, "missing": 0, "opened": 0,
+           "already": 0, "reviewed": 0, "attempted": 0, "terminal": 0,
+           "deferred": 0, "busy": 0, "failed": 0, "bound": "",
            "unopened": [], "warning": ""}
     try:
         ops = storage.of(db).work
@@ -1632,15 +1715,72 @@ def catch_up(db, *, repo: str = "", target: str = "",
         except Exception:  # noqa: BLE001 - marqueur best effort
             pass
 
-    def attempts(lot):
-        """Le nombre de tentatives déjà marquées au journal du lot.
+    slug_cache: dict[str, str | None] = {}
 
-        #1448 N2 : compté sur les seules notes de tentative du lot
-        (`_noted`), pas sur les 200 derniers événements — un lot bavard ne
-        remet pas son compteur à zéro et ne retente pas sans fin."""
+    def slug_of(path: str) -> str | None:
+        if path not in slug_cache:
+            slug_cache[path] = plan_git._repo_slug(path)
+        return slug_cache[path]
+
+    def attempt_marks(lot):
+        """Le nombre de tentatives et l'instant de la dernière.
+
+        #1448 N2 : compté sur les seules notes de tentative du lot (`_noted`),
+        pas sur les 200 derniers événements — un lot bavard ne remet pas son
+        compteur à zéro et ne retente pas sans fin. #3426 : l'instant sert au
+        délai partagé entre les hôtes (une tentative récente écrite par un
+        autre hôte n'est pas doublée)."""
         token = "%s%d" % (ATTEMPT_PREFIX, int(lot))
-        return sum(1 for e in _noted(ops, lot, ATTEMPT_PREFIX)
-                   if str(e.get("note") or "").split(" ")[0] == token)
+        notes = [e for e in _noted(ops, lot, ATTEMPT_PREFIX)
+                 if str(e.get("note") or "").split(" ")[0] == token]
+        last = max((float(e.get("created_ts") or 0.0) for e in notes), default=0.0)
+        return len(notes), last
+
+    def close_terminal(lot, state, detail):
+        """Pose la marque terminale une seule fois, sous le verrou du lot.
+
+        #3426 : deux hôtes peuvent constater la même classe non-light ou le
+        même avis déjà rendu ; un seul laisse la marque. Rend True si la
+        marque est là (posée ici ou déjà par un autre), False sinon."""
+        try:
+            with db.transaction():
+                if ops.lock(lot) is None:
+                    return False
+                if _noted(ops, lot, TERMINAL_PREFIX):
+                    return True
+                terminal(lot, state, detail)
+                return True
+        except Exception:  # noqa: BLE001 - le journal reste best effort
+            return False
+
+    def record_attempt(lot, state, why):
+        """Marque la tentative sous le verrou du lot (#3426).
+
+        Rend `(résultat, vu)` : `terminal` (la borne de tentatives est
+        atteinte), `attempted` (la tentative est écrite), `already` (un autre
+        hôte a ouvert la relecture), `closed` (un autre hôte a posé la marque
+        terminale), `busy` (un autre hôte a tenté dans le délai) ou `failed`
+        (lecture/écriture impossible)."""
+        try:
+            with db.transaction():
+                if ops.lock(lot) is None:
+                    return "failed", 0
+                if _open(ops, ref_of(lot)) is not None:
+                    return "already", 0
+                if _noted(ops, lot, TERMINAL_PREFIX):
+                    return "closed", 0
+                count, last_ts = attempt_marks(lot)
+                if count and float(retry_s) > 0 \
+                        and (time.time() - last_ts) < float(retry_s):
+                    return "busy", 0
+                seen = count + 1
+                if seen >= int(max_attempts):
+                    terminal(lot, state, "doute après %d tentatives" % seen)
+                    return "terminal", seen
+                mark(lot, state, "sans ouverture: %s" % why)
+                return "attempted", seen
+        except Exception:  # noqa: BLE001 - un lot en panne n'arrête pas le rattrapage
+            return "failed", 0
 
     for row in rows:
         lot = int(row["id"])
@@ -1652,6 +1792,11 @@ def catch_up(db, *, repo: str = "", target: str = "",
             if _open(ops, ref_of(lot)) is not None:
                 continue
             out["missing"] += 1
+            # #3426 : sans dépôt candidat sur cet hôte, rien n'est tenté ni
+            # dit — l'hôte qui porte le clone classera le lot.
+            if not _host_holds_lot_repo(db, row, repo, slug_of=slug_of):
+                out["deferred"] += 1
+                continue
             sha = merged_sha(db, lot)
             done = open_for_merge(db, lot, merged_sha=sha, repo=repo,
                                   target=target or str(row.get("branch_target") or ""))
@@ -1670,9 +1815,8 @@ def catch_up(db, *, repo: str = "", target: str = "",
                 # `open_after_merge` a déjà posé la marque terminale avec la
                 # même raison ; ne pas la doubler (elle est best effort, le
                 # repli la pose si elle a manqué).
-                if not _noted(ops, lot, TERMINAL_PREFIX):
-                    terminal(lot, state, "avis déjà rendu sur la tête fusionnée : %s"
-                             % reviewed_by)
+                close_terminal(lot, state, "avis déjà rendu sur la tête fusionnée : %s"
+                               % reviewed_by)
                 continue
             if done.get("id") or "déjà" in str(done.get("why") or ""):
                 # un autre exécuteur a ouvert la relecture entre la sélection
@@ -1687,22 +1831,29 @@ def catch_up(db, *, repo: str = "", target: str = "",
                 # relecture : un light critique a bien une relecture due (deux
                 # avis) et doit rester réessayable (#2374).
                 out["terminal"] += 1
-                terminal(lot, state, "classe %s confirmée non-light" % merged_class)
+                close_terminal(lot, state, "classe %s confirmée non-light"
+                               % merged_class)
                 continue
-            seen = attempts(lot) + 1
-            if seen >= int(max_attempts):
-                out["terminal"] += 1
-                terminal(lot, state, "doute après %d tentatives" % seen)
-            else:
+            why = str(done.get("why") or "?")
+            result, seen = record_attempt(lot, state, why)
+            if result == "attempted":
                 out["attempted"] += 1
-                why = str(done.get("why") or "?")
-                mark(lot, state, "sans ouverture: %s" % why)
+            elif result == "terminal":
+                out["terminal"] += 1
+            elif result == "already":
+                out["already"] += 1
+            elif result == "closed":
+                out["terminal"] += 1
+            elif result == "busy":
+                out["busy"] += 1
+            else:
+                out["failed"] += 1
             # #3384 : laisser une passe au clone pour devenir lisible.
             # Une classe confirmée au passage suivant sort plus haut, sans
             # courrier. La deuxième tentative avertit une seule fois, même
-            # si elle épuise la borne configurée.
-            why = str(done.get("why") or "?")
-            if seen == 2 and why.startswith("dépôt inconnu"):
+            # si elle épuise la borne configurée ; #3426 : seule la passe qui
+            # a écrit cette deuxième tentative (sous le verrou du lot) avertit.
+            if seen == 2 and result in ("attempted", "terminal"):
                 out["unopened"].append({
                     "lot": lot, "why": why, "state": state,
                     "title": row.get("title") or "", "sha": sha or ""})
@@ -1710,7 +1861,7 @@ def catch_up(db, *, repo: str = "", target: str = "",
             out["failed"] += 1
             mark(lot, state, "erreur")
     if out["unopened"]:
-        out["warning"] = _warn_unopened(db, out["unopened"])
+        out["warning"] = _warn_unopened(db, out["unopened"], host=out["host"])
     return out
 
 
