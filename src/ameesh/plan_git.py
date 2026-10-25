@@ -85,8 +85,9 @@ import tempfile
 from . import planned_waits
 from . import storage
 from . import work as work_mod
-from .canon import (FETCH_TIMEOUT, GIT_TIMEOUT, GitError, NO_LAZY_FETCH, _git,
-                    _norm_url, git_fetch)
+from .canon import (FETCH_TIMEOUT, GIT_TIMEOUT, GitDeadline, GitError,
+                    NO_LAZY_FETCH, _git, _norm_url, git_fetch)
+from .deadline import Deadline
 
 #: cible historique du relevé de contenu (`--target` explicite) ; sans lui,
 #: c'est la cible déclarée du lot ou du dépôt qui fait foi (#1005)
@@ -126,21 +127,28 @@ def _patch_id_run(repo: str, data: bytes):
     return proc
 
 
-def _out(repo: str, *args: str) -> str | None:
-    proc = _git(repo, *args)
+def _bounded(deadline: Deadline | None) -> dict:
+    """#3572 : l'argument `deadline` des aides, seulement quand il est donné
+    (les appelants et doublures d'avant gardent leur signature)."""
+    return {} if deadline is None else {"deadline": deadline}
+
+
+def _out(repo: str, *args: str, deadline: Deadline | None = None) -> str | None:
+    proc = _git(repo, *args, **_bounded(deadline))
     if proc.returncode != 0:
         return None
     return proc.stdout.decode("utf-8", "replace").strip()
 
 
-def _commit(repo: str, rev: str, *, timeout: float | None = None) -> str | None:
+def _commit(repo: str, rev: str, *, timeout: float | None = None,
+            deadline: Deadline | None = None) -> str | None:
     # #1749 : sonde de présence — pas de fetch paresseux (l'échec laisse un
     # transport orphelin derrière lui dans un clone partiel).
     # #2665 : `timeout` laisse l'appelant ramener la sonde au temps qui reste ;
     # le défaut de `canon._git` (GIT_TIMEOUT) vaut quand il est absent.
     bound = {} if timeout is None else {"timeout": timeout}
     proc = _git(repo, "rev-parse", "--verify", "--quiet", rev + "^{commit}",
-                env_extra=NO_LAZY_FETCH, **bound)
+                env_extra=NO_LAZY_FETCH, **_bounded(deadline), **bound)
     if proc.returncode != 0:
         return None
     return proc.stdout.decode("utf-8", "replace").strip()
@@ -154,7 +162,8 @@ PROBE_TIMEOUT_S = 2.0
 
 
 def local_commit(repo: str, rev: str, *,
-                 timeout: float | None = PROBE_TIMEOUT_S) -> str | None:
+                 timeout: float | None = PROBE_TIMEOUT_S,
+                 deadline: Deadline | None = None) -> str | None:
     """`rev` résolu en commit complet **depuis les objets locaux** de `repo`.
 
     Sert aux sondes de présence qui balaient des clones d'autres projets
@@ -167,24 +176,32 @@ def local_commit(repo: str, rev: str, *,
     compris à travers `objects/info/alternates`.
 
     Une ref non-SHA (`HEAD`, une branche) n'a pas de sens dans un magasin sans
-    refs : on retombe sur `_commit`, borné. Lecture seule, jamais de fetch."""
+    refs : on retombe sur `_commit`, borné. Lecture seule, jamais de fetch.
+
+    #3572 : avec ``deadline``, chacune des commandes git de la sonde ne prend
+    que le temps qui reste (pas le plafond de 60 s) ; épuisée, elle rend None.
+    Sans elle, rien ne change pour les autres appelants."""
     rev = str(rev or "").strip()
     if not rev or rev.startswith("-"):
         return None
     if not commit_id(rev):
-        return _commit(repo, rev, timeout=timeout)
+        try:
+            return _commit(repo, rev, timeout=timeout, **_bounded(deadline))
+        except GitDeadline:
+            return None
+    bound = {} if timeout is None else {"timeout": timeout}
     try:
-        objects = _out(repo, "rev-parse", "--git-path", "objects")
+        objects = _out(repo, "rev-parse", "--git-path", "objects",
+                       **_bounded(deadline))
     except Exception:  # noqa: BLE001 - dépôt illisible : la piste est écartée
         return None
     if not objects:
         return None
     objects = os.path.realpath(os.path.join(repo, objects))
-    bound = {} if timeout is None else {"timeout": timeout}
     try:
         with tempfile.TemporaryDirectory(prefix="ameesh-objets-") as gitdir:
             # sans GIT_DIR, `git init --bare` prend le dossier courant
-            init = _git(gitdir, "init", "--quiet", "--bare")
+            init = _git(gitdir, "init", "--quiet", "--bare", **_bounded(deadline))
             if init.returncode != 0:
                 return None
             proc = _git(gitdir, "rev-parse", "--verify", "--quiet",
@@ -192,8 +209,8 @@ def local_commit(repo: str, rev: str, *,
                             "GIT_DIR": gitdir,
                             "GIT_OBJECT_DIRECTORY": objects,
                             "GIT_ALTERNATE_OBJECT_DIRECTORIES": objects,
-                            **NO_LAZY_FETCH}, **bound)
-    except (GitError, OSError):
+                            **NO_LAZY_FETCH}, **_bounded(deadline), **bound)
+    except (GitError, GitDeadline, OSError):
         return None
     if proc.returncode != 0:
         return None
@@ -1757,31 +1774,35 @@ def cited_branch(text: str) -> str | None:
     return next(iter(found)) if len(found) == 1 else None
 
 
-def declared_target(repo: str) -> str | None:
+def declared_target(repo: str, *, deadline: Deadline | None = None) -> str | None:
     """La cible déclarée du dépôt (`git config ameesh.target`), ou None :
     une cible déclarée fait foi, le relevé ne cherche pas ailleurs."""
-    return _out(repo, "config", "--get", TARGET_GIT_KEY) or None
+    return _out(repo, "config", "--get", TARGET_GIT_KEY, **_bounded(deadline)) or None
 
 
-def default_target(repo: str) -> str | None:
+def default_target(repo: str, *, deadline: Deadline | None = None) -> str | None:
     """La cible par défaut du dépôt : `git config ameesh.target`, sinon la
     branche par défaut du dépôt distant (`origin/HEAD`), sinon main/master.
 
     Une cible configurée mais introuvable (faute de frappe, `origin/develop`
     jamais récupérée) lève MergeProbeError : se rabattre sur main ferait
-    chercher les fusions au mauvais endroit, sans le dire."""
-    configured = declared_target(repo)
+    chercher les fusions au mauvais endroit, sans le dire. Avec ``deadline``
+    (#3572), chaque lecture ne prend que le temps qui reste ; épuisée, elle
+    lève `GitDeadline`."""
+    bound = _bounded(deadline)
+    configured = declared_target(repo, **bound)
     if configured:
-        if _commit(repo, configured):
+        if _commit(repo, configured, **bound):
             return configured
         raise MergeProbeError("%s = %s not found in %s (no fetch is done: "
                               "fix the value or fetch the branch)"
                               % (TARGET_GIT_KEY, configured, repo))
-    head = _out(repo, "symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD")
-    if head and _commit(repo, head):
+    head = _out(repo, "symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD",
+                **bound)
+    if head and _commit(repo, head, **bound):
         return head
     for candidate in DEFAULT_TARGETS:
-        if _commit(repo, candidate):
+        if _commit(repo, candidate, **bound):
             return candidate
     return None
 

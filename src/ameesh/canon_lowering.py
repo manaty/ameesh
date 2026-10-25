@@ -27,9 +27,9 @@ avis, avec la raison au journal.
 `processus/mecanique.yaml` sont comparés eux aussi (un passage true→false abaisse
 l'exigence de tous les fichiers sans changer un seul compte) ; et la sonde
 tient dans une échéance globale (`BUDGET_S`) : une politique ou un dépôt de
-projet lent fait conclure au doute (deux avis), jamais attendre le gel. Les
-sondes locales de présence (`rev-parse`, `remote`) gardent leur plafond propre ;
-l'échéance est relue avant chacune.
+projet lent fait conclure au doute (deux avis), jamais attendre le gel.
+Chaque commande git, jusque dans les aides (`local_commit`, `default_target`,
+`remote_branch`), ne prend que le temps qui reste.
 """
 from __future__ import annotations
 
@@ -166,7 +166,8 @@ def _base_commit(repo: str, ref, deadline: Optional[Deadline] = None
     if not text:
         return None
     return plan_git.local_commit(
-        repo, text, timeout=_probe_timeout(deadline, "the lot commits"))
+        repo, text, timeout=_probe_timeout(deadline, "the lot commits"),
+        deadline=deadline)
 
 
 def _merge_base(repo: str, base: str, head: str,
@@ -294,7 +295,7 @@ def _project_repository(cfg, project: str, deadline: Optional[Deadline] = None):
     target = str(getattr(entry, "target", "") or "").strip()
     if not target:
         try:
-            target = plan_git.default_target(root) or ""
+            target = plan_git.default_target(root, deadline=deadline) or ""
         except Exception:  # noqa: BLE001 - pas de cible par défaut : HEAD
             target = ""
         _check(deadline, "the target of %s" % (project,))
@@ -305,7 +306,7 @@ def _revision(repo: str, target: str, deadline: Optional[Deadline] = None):
     """`(ref, commit)` de la cible du projet, sinon `HEAD`, sinon rien."""
     candidates = []
     if target:
-        remote = canon_mod.remote_branch(repo, target)
+        remote = canon_mod.remote_branch(repo, target, deadline=deadline)
         if remote:
             candidates.append("refs/remotes/" + remote)
         candidates.append(target)
@@ -314,7 +315,8 @@ def _revision(repo: str, target: str, deadline: Optional[Deadline] = None):
         # `local_commit` : jamais de fetch paresseux pour une sonde de présence
         # (#2851), et une tête absente localement est un « non mesuré » explicite.
         commit = plan_git.local_commit(
-            repo, ref, timeout=_probe_timeout(deadline, "the project revision"))
+            repo, ref, timeout=_probe_timeout(deadline, "the project revision"),
+            deadline=deadline)
         if commit:
             return ref, commit
     return "", ""

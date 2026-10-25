@@ -129,6 +129,40 @@ class FlagsAndDeadlineTest(unittest.TestCase):
         self.assertEqual(found.unmeasured, ())
         self.assertIn("échéance", " ".join(found.errors))
 
+    def test_every_git_command_fits_in_the_remaining_budget(self):
+        # Relecture cx3 : l'échéance descend dans les aides (`local_commit`,
+        # `default_target`, `remote_branch`), pas seulement dans `ls-tree`.
+        # Horloge figée à 5 s restantes : aucune commande git ne reçoit le
+        # plafond de 60 s, quelle que soit la cible déclarée du projet.
+        head = self._mechanics(MECHANICS + "# neutre\n")
+        self.project.git("remote", "add", "origin", self.project.root)
+        self.project.git("fetch", "-q", "origin")
+        real = canon_lowering.canon_mod.subprocess.run
+        for target in ("main", "", "origin/main"):
+            with self.subTest(target=target):
+                for memo in (canon_lowering._LOADED, canon_lowering._GLOBAL,
+                             canon_lowering._TRACKED, canon_lowering._SCANNED):
+                    memo.clear()
+                for entry in self.cfg.radar["projects"].values():
+                    entry["target"] = target
+                timeouts = []
+
+                def run(cmd, *args, **kwargs):
+                    if cmd and cmd[0] == "git":
+                        timeouts.append((kwargs.get("timeout"), cmd[1:]))
+                    return real(cmd, *args, **kwargs)
+
+                deadline = Deadline(5.0, clock=lambda: 0.0)
+                with mock.patch.object(canon_lowering.canon_mod.subprocess,
+                                       "run", side_effect=run):
+                    found = self._detect(head, deadline=deadline)
+                self.assertEqual(found.floor, 0, found.errors)
+                self.assertTrue(found.scans)
+                self.assertTrue(timeouts)
+                late = [(value, cmd) for value, cmd in timeouts
+                        if value is None or value > 5.0]
+                self.assertEqual(late, [])
+
     def test_a_git_deadline_exception_never_escapes(self):
         head = self._mechanics(MECHANICS + "# neutre\n")
         with mock.patch.object(
