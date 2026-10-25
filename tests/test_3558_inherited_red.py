@@ -222,6 +222,14 @@ class InheritedRedTest(Journal):
         self.assertEqual(gh.landed, [])
         self.assertEqual(self.created, [])
 
+    def test_an_unreadable_base_blocks(self):
+        def boom(*args, **kwargs):
+            raise RuntimeError("base unreadable")
+        self.ci.base_failures = boom
+        gh = InheritedGh(self.rollup())
+        self.assertEqual(self.check(gh)["result"], "pending")
+        self.assertEqual(gh.landed, [])
+
     def test_a_stale_inherited_marker_blocks(self):
         # La base a depuis un relevé conclu qui ne porte plus un des tests :
         # le marqueur `inherited` enregistré plus tôt ne suffit plus.
