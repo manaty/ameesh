@@ -109,7 +109,9 @@ class AuditorTest(unittest.TestCase):
                                      backlog=lambda **kw: [item] if queue else [])
         st = types.SimpleNamespace(work=work, operations=types.SimpleNamespace(
             open_lots_activity=lambda *a: []),
-            hosts=types.SimpleNamespace(holds=lambda: []))   # #254: no host on hold
+            hosts=types.SimpleNamespace(holds=lambda: []),   # #254: no host on hold
+            progress=types.SimpleNamespace(                 # #3556 : aucun hold
+                lot_hold_events=lambda *a, **kw: []))
         real_cfg = cfg is not None
         cfg = cfg or types.SimpleNamespace(host=None)
         loaded = canon([agent("controle", roles=["auditor"])])
