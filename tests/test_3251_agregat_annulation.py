@@ -65,8 +65,9 @@ class ClassifierTest(unittest.TestCase):
             with self.subTest(part=part):
                 result = classify(**over)
                 self.assertEqual(result["state"], agregat.RED)
-                self.assertTrue(any(gap.startswith(part + " (cancelled, 0/")
-                                    for gap in result["missing"]), result["missing"])
+                self.assertTrue(any(gap.startswith(part + " (")
+                                    and "planifiée(s) absente(s)" in gap
+                                    for gap in result["red"]), result["red"])
                 self.assertEqual(result["consigned"], [])
 
     def test_les_conclusions_non_concluantes_sont_toutes_acceptees(self):
@@ -93,8 +94,9 @@ class ClassifierTest(unittest.TestCase):
                           psql="failure")
         self.assertEqual(result["state"], agregat.RED)
         self.assertEqual(result["consigned"], [])
-        self.assertTrue(any(gap.startswith("psycopg (cancelled, 0/")
-                            for gap in result["missing"]), result["missing"])
+        self.assertTrue(any(gap.startswith("psycopg (")
+                            and "planifiée(s) absente(s)" in gap
+                            for gap in result["red"]), result["red"])
 
     def test_toutes_les_parts_annulees_sont_une_preuve_absente(self):
         # Décision #128512 : un agrégat qui n'a aucune part réussie n'a rien
@@ -104,13 +106,14 @@ class ClassifierTest(unittest.TestCase):
                           platform_macos="cancelled", fs_class="cancelled")
         self.assertEqual(result["state"], agregat.RED)
         self.assertIn("aucune part n'a conclu (preuve absente)", result["missing"])
-        self.assertTrue(any(gap.startswith("psycopg (cancelled, 0/2")
-                            for gap in result["missing"]), result["missing"])
+        self.assertTrue(any(gap.startswith("psycopg (")
+                            and "planifiée(s) absente(s)" in gap
+                            for gap in result["red"]), result["red"])
         self.assertEqual([row["part"] for row in result["consigned"]],
                          ["plateforme macOS", "autre système de fichiers"])
         statuses = {row["part"]: row["status"] for row in result["parts"]}
         self.assertEqual((statuses["psycopg"], statuses["psql"]),
-                         (agregat.MISSING, agregat.MISSING))
+                         (agregat.RED, agregat.RED))
 
     def test_un_saut_legitime_ne_remplace_pas_une_preuve(self):
         # psql saute sans part ([]), ce n'est pas un test ; si tout le reste

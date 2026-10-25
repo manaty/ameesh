@@ -29,7 +29,9 @@ Ce script sépare donc trois cas :
   `15/16`. `needs.psycopg.result` seul ne suffit pas — une matrice vaut
   `cancelled` dès qu'une part l'est —, les jobs du run sont donc lus par
   l'API (`actions: read`) ; ce cas ne durcit pas #128512 pour une part
-  perdue (B1 de la relecture claude sur #3449) ;
+  perdue (B1 de la relecture claude sur #3449). Une part **planifiée mais
+  absente** de la lecture (job jamais listé) ou un job en `failure` rougit
+  en revanche la famille (B2/B3 de cx3, dev1 et cx2) ;
 * une **annulation d'une part non requise** (macOS, autre système de
   fichiers) reste un non concluant : l'agrégat conclut vert s'il garde la
   preuve Linux, et publie le check de détail en `neutral`, avec la part et
@@ -131,18 +133,28 @@ def _family_jobs(jobs, family: str) -> list:
 
 
 def _job_stats(jobs, expected):
-    """`(réussies, total)` d'une famille, ou None si ses jobs sont illisibles.
+    """Les comptes d'une famille, ou None si ses jobs sont illisibles.
 
     `jobs` est la liste des jobs du run (`name`, `status`, `conclusion`),
     `expected` le nombre de parts du plan (les jobs jamais démarrés ne sont
     pas toujours listés). Une liste vide est une lecture valide : zéro part
-    réussie."""
+    réussie, toutes les parts planifiées absentes. Tout job dont la
+    conclusion n'est ni `success` ni non concluante (`cancelled`,
+    `timed_out`…) est un échec individuel : une famille `cancelled` qui cache
+    un `failure` ne doit jamais verdir (B2 de cx3/dev1). Une part planifiée
+    absente de la lecture n'est pas une preuve non plus (B3 de cx2)."""
     if jobs is None:
         return None
     rows = [job for job in jobs if isinstance(job, dict)]
-    successes = sum(1 for job in rows if _state(job.get("conclusion")) == "success")
-    total = max(int(expected or 0), len(rows))
-    return successes, total
+    conclusions = [_state(job.get("conclusion")) for job in rows]
+    successes = sum(1 for value in conclusions if value == "success")
+    failures = sum(1 for value in conclusions
+                   if value != "success" and value not in NON_CONCLUSIVE)
+    planned = int(expected or 0)
+    total = max(planned, len(rows))
+    absent = max(0, planned - len(rows))
+    return {"success": successes, "total": total,
+            "failure": failures, "absent": absent}
 
 
 def classify(*, event, plan, version, version_only, docs_only, doc_readers,
@@ -160,9 +172,10 @@ def classify(*, event, plan, version, version_only, docs_only, doc_readers,
     de chaque part exigée (pour le check publié).
 
     `psycopg_jobs` / `psql_jobs` sont les jobs du run lus par l'API : une
-    matrice `cancelled` avec 15 parts réussies sur 16 est consignée, pas
-    bloquante ; sans jobs lisibles, une famille annulée reste une preuve
-    absente (jamais un vert sur une lecture manquante)."""
+    matrice `cancelled` avec 15 parts réussies sur 16 et la 16e annulée est
+    consignée, pas bloquante ; une part planifiée absente ou un échec
+    individuel rougit la famille. Sans jobs lisibles, une famille annulée
+    reste une preuve absente (jamais un vert sur une lecture manquante)."""
     red: list[str] = []
     missing: list[str] = []
     consigned: list[dict] = []
@@ -179,18 +192,32 @@ def classify(*, event, plan, version, version_only, docs_only, doc_readers,
             if not required:
                 row["status"] = INCONCLUSIVE
                 consigned.append(row)
-            elif stats is not None and stats[0] > 0:
+            elif stats is not None and (stats["failure"] or stats["absent"]):
+                # B2/B3 : un échec individuel ou une part planifiée absente
+                # reste un négatif, même si la matrice est `cancelled`.
+                gaps = []
+                if stats["failure"]:
+                    gaps.append("%d/%d part(s) en échec"
+                                % (stats["failure"], stats["total"]))
+                if stats["absent"]:
+                    gaps.append("%d/%d part(s) planifiée(s) absente(s)"
+                                % (stats["absent"], stats["total"]))
+                row["status"] = RED
+                red.append("%s (%s, famille %s)"
+                           % (name, ", ".join(gaps), value))
+            elif stats is not None and stats["success"] > 0:
                 # #3449/B1 : une part perdue dans une famille qui en garde
                 # 15/16 reste une annulation partielle non bloquante.
                 row["status"] = INCONCLUSIVE
-                row["parts_ok"] = "%d/%d" % stats
+                row["parts_ok"] = "%d/%d" % (stats["success"], stats["total"])
                 consigned.append(row)
             else:
                 # Aucune part réussie (ou jobs illisibles) : preuve absente.
                 row["status"] = MISSING
                 if stats is not None:
                     missing.append("%s (%s, %d/%d part(s) réussie(s), preuve "
-                                   "absente)" % (name, value, stats[0], stats[1]))
+                                   "absente)" % (name, value, stats["success"],
+                                                 stats["total"]))
                 else:
                     missing.append("%s (%s, preuve absente)" % (name, value))
         elif value == "skipped" and skipped_ok:
@@ -266,7 +293,9 @@ def classify(*, event, plan, version, version_only, docs_only, doc_readers,
     # n'a réussi (toutes annulées ou sautées), y compris si seules des parts
     # non requises ont conclu — #940 reste fermé (jamais de tests SUCCESS
     # sans test).
-    if parts and not any(row["result"] == "success" for row in parts):
+    if parts and not any(
+            (row["status"] == GREEN and row["result"] == "success")
+            or row.get("parts_ok") for row in parts):
         missing.append("aucune part n'a conclu (preuve absente)")
 
     return {"state": RED if red or missing else GREEN, "red": red,

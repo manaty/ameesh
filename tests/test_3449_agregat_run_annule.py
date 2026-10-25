@@ -111,6 +111,77 @@ class RunAnnuleTest(unittest.TestCase):
         self.assertEqual([row["part"] for row in result["consigned"]], ["psql"])
         self.assertEqual(result["consigned"][0]["parts_ok"], "15/16")
 
+    def test_deux_familles_partielles_et_macos_annule_restent_vertes(self):
+        # B1 de cx3/dev1 : le bilan final doit compter les parts_ok, pas
+        # seulement une ligne row.result == success.
+        result = classify(psycopg_jobs=part_jobs("psycopg", 8, 7),
+                          psql_jobs=part_jobs("psql", 16, 15),
+                          platform_macos="cancelled")
+        self.assertEqual(result["state"], agregat.GREEN)
+        self.assertEqual(result["missing"], [])
+        self.assertEqual([row["part"] for row in result["consigned"]],
+                         ["psycopg", "psql", "plateforme macOS"])
+        counts = {row["part"]: row["parts_ok"] for row in result["consigned"]
+                  if row.get("parts_ok")}
+        self.assertEqual(counts, {"psycopg": "7/8", "psql": "15/16"})
+
+    def test_psycopg_partiel_avec_psql_non_planifie_reste_vert(self):
+        # Variante B1 : psql n'est pas planifiée ([]), macOS est annulé ;
+        # la preuve partielle de psycopg suffit, le reste est consigné.
+        result = classify(psycopg_jobs=part_jobs("psycopg", 8, 7),
+                          psql="skipped", psql_parts="[]",
+                          platform_macos="cancelled")
+        self.assertEqual(result["state"], agregat.GREEN)
+        self.assertEqual(result["missing"], [])
+        self.assertEqual([row["part"] for row in result["consigned"]],
+                         ["psycopg", "plateforme macOS"])
+
+    def test_un_echec_individuel_dans_une_famille_annulee_rougit(self):
+        # B2 : une famille `cancelled` avec 6 succès, 1 failure et 1 annulée
+        # ne doit pas passer neutre ; macOS vert ne rachète pas l'échec.
+        jobs = ([{"name": "psycopg %d/8" % index, "conclusion": "success"}
+                 for index in range(1, 7)]
+                + [{"name": "psycopg 7/8", "conclusion": "failure"},
+                   {"name": "psycopg 8/8", "conclusion": "cancelled"}])
+        result = classify(psycopg_jobs=jobs, psql="success",
+                          psql_jobs=part_jobs("psql", 16, 16),
+                          platform_macos="success")
+        self.assertEqual(result["state"], agregat.RED)
+        self.assertIn("psycopg (1/8 part(s) en échec, famille cancelled)",
+                      result["red"])
+        self.assertEqual(result["consigned"], [])
+        self.assertEqual(result["missing"], [])
+
+    def test_une_part_planifiee_absente_rougit(self):
+        # B3 de cx2 : le plan sélectionne 3 parts psql, un seul job est lu ;
+        # les deux autres ne sont pas une preuve, même si le seul job est vert.
+        result = classify(psycopg="success",
+                          psycopg_jobs=part_jobs("psycopg", 8, 8),
+                          psql="cancelled", psql_parts="[1, 2, 3]",
+                          psql_jobs=[{"name": "psql 1/3",
+                                      "conclusion": "success"}])
+        self.assertEqual(result["state"], agregat.RED)
+        self.assertIn("psql (2/3 part(s) planifiée(s) absente(s), famille "
+                      "cancelled)", result["red"])
+        self.assertEqual(result["consigned"], [])
+
+    def test_un_echec_individuel_avec_plan_trois_rougit(self):
+        # Reproduction cx2 : success, failure et cancelled dans la même
+        # famille ; le failure explicite ne doit pas être noyé.
+        result = classify(psycopg="success",
+                          psycopg_jobs=part_jobs("psycopg", 8, 8),
+                          psql="cancelled", psql_parts="[1, 2, 3]",
+                          psql_jobs=[{"name": "psql 1/3",
+                                      "conclusion": "success"},
+                                     {"name": "psql 2/3",
+                                      "conclusion": "failure"},
+                                     {"name": "psql 3/3",
+                                      "conclusion": "cancelled"}])
+        self.assertEqual(result["state"], agregat.RED)
+        self.assertIn("psql (1/3 part(s) en échec, famille cancelled)",
+                      result["red"])
+        self.assertEqual(result["consigned"], [])
+
     def test_le_script_publie_neutral_pour_une_annulation_partielle(self):
         created = []
 
@@ -223,6 +294,8 @@ class RunAnnuleTest(unittest.TestCase):
         self.assertEqual(result["state"], agregat.RED)
         self.assertIn("aucune part n'a conclu (preuve absente)",
                       result["missing"])
+        self.assertTrue(any("planifiée(s) absente(s)" in gap
+                            for gap in result["red"]), result["red"])
         self.assertEqual([row["part"] for row in result["consigned"]],
                          ["plateforme macOS", "autre système de fichiers"])
 

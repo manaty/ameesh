@@ -172,7 +172,10 @@ class SilentSuccessTest(unittest.TestCase):
                 "--psycopg", "success", "--psycopg-parts", "[1]",
                 "--publish"]
         args += rules
-        return agregat.main(args, gh=gh, jobs=jobs)
+        # Les tests qui n'exercent pas le comptage des jobs n'appellent pas
+        # l'API : une lecture vide est un repli valide (`jobs=[]`), et évite
+        # de dépendre de `GITHUB_RUN_ID` quand la suite tourne dans Actions.
+        return agregat.main(args, gh=gh, jobs=[] if jobs is None else jobs)
 
     def test_annulation_non_requise_consignee_publie_neutral_et_ne_rougit_pas(self):
         gh = self.FakeGh()
