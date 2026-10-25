@@ -329,7 +329,7 @@ def _same_sha(a, b, repo: str | None = None) -> bool:
     return False
 
 
-def actor_family(db, name, *, families=None) -> str:
+def actor_family(db, name, *, families=None, declared=False) -> str:
     """La famille de modèle d'un agent, "" si elle n'est pas connue.
 
     `claude`, `codex`, `deepseek` sont les familles du canon compilé
@@ -344,6 +344,10 @@ def actor_family(db, name, *, families=None) -> str:
     qui ne peuvent rien en faire d'autre l'attrapent explicitement. Un canon
     illisible, lui, rend "" : les appelants qui doivent nommer le canon
     (`review_gate`) le lisent avant et échouent fermé avec son diagnostic.
+
+    `declared` (#3578) lit le harnais **déclaré** de l'agent, jamais celui de
+    sa session courante : la famille d'un verdict sans reçu ne doit pas suivre
+    un repli ultérieur (codex en repli deepseek).
     """
     from . import registry, review_lot
     name = str(name or "").strip()
@@ -359,15 +363,42 @@ def actor_family(db, name, *, families=None) -> str:
             families = review_lot.compiled_families(db)
         except review_lot.FamiliesError:
             return ""
-    return review_lot.family_of(registry.live_harness(row), families)
+    harness = (str(row.get("harness") or "") if declared
+               else registry.live_harness(row))
+    return review_lot.family_of(harness, families)
 
 
-
-def _actor_family(db, name, families) -> str:
+def _actor_family(db, name, families, *, declared=False) -> str:
     """`actor_family` avec les familles déjà lues (ou None : il les lit)."""
     if families is None:
-        return actor_family(db, name)
-    return actor_family(db, name, families=families)
+        return actor_family(db, name, declared=declared)
+    return actor_family(db, name, families=families, declared=declared)
+
+
+def verdict_family(db, mark, *, families=None, receipt=None) -> str:
+    """La famille de modèle d'un verdict (#3578), "" si elle n'est pas connue.
+
+    C'est le harnais de son **reçu exact** (#1465/#2928) : la famille sous
+    laquelle l'avis a été rendu. Sans reçu (classe légère, verdict antérieur),
+    la famille **déclarée** de l'acteur ; jamais le harnais de sa session
+    courante — un `ok` rendu sous codex par un agent aujourd'hui en repli
+    deepseek reste codex. `receipt` évite de relire un reçu déjà lu.
+    Lève `RegistryReadError` comme `actor_family` quand le repli lit le
+    registre."""
+    from . import review_lot
+    actor = str((mark or {}).get("actor") or "").strip()
+    if not actor or actor.startswith(work.HUMAN_PREFIX):
+        return ""
+    if receipt is None:
+        receipt = _exact_verdict_receipt(db, mark)
+    if receipt is not None:
+        if families is None:
+            try:
+                families = review_lot.compiled_families(db)
+            except review_lot.FamiliesError:
+                return ""
+        return review_lot.family_of(receipt.get("harness"), families)
+    return _actor_family(db, actor, families, declared=True)
 
 
 def blocked_verdicts(marks, frozen, *, repo: str | None = None) -> list[dict]:
@@ -754,6 +785,7 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
     # relecteur » : un faux ok ne masque plus un vrai block, et un faux block
     # ne bloque plus une tête.
     unproven: list[dict] = []
+    receipts: dict = {}
     if cls == lot_class.SENSITIVE and db is not None:
         proven: list = []
         for mark in on_freeze:
@@ -763,12 +795,15 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
                 # n'a pas de tour managé (sa signature est un autre contrôle).
                 proven.append(mark)
                 continue
-            if _exact_verdict_receipt(db, mark) is None:
+            receipt = _exact_verdict_receipt(db, mark)
+            if receipt is None:
                 unproven.append({"id": mark.get("id"),
                                  "actor": mark.get("actor") or "",
                                  "verdict": mark.get("verdict") or "",
                                  "at_ts": mark.get("at_ts")})
             else:
+                # #3578 : le reçu lu ici donne aussi la famille du verdict.
+                receipts[id(mark)] = receipt
                 proven.append(mark)
         on_freeze = proven
     out["unproven"] = unproven
@@ -816,6 +851,16 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
             return "" if value is None else str(value)
         return _actor_family(db, name, families)
 
+    def _verdict_family(mark):
+        # #3578 : la famille d'un verdict est celle de son reçu (harnais au
+        # moment de l'avis), à défaut la famille déclarée de l'acteur — jamais
+        # le harnais de sa session courante. Le train (`family_of`) porte déjà
+        # sa lecture historique des verdicts (`verdict_families`).
+        if family_of is not None:
+            return _family_of(mark.get("actor"))
+        return verdict_family(db, mark, families=families,
+                              receipt=receipts.get(id(mark)))
+
     provided: dict[str, str] = {}
     for entry in authors or ():
         if isinstance(entry, Mapping):
@@ -845,7 +890,7 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
         # avis indépendants ; aucune décision ne lit `accepted` sur une porte
         # fermée (`packet_candidates` exige `ok`).
         unfiltered = [{"actor": str(mark.get("actor") or ""),
-                       "family": _family_of(mark.get("actor")),
+                       "family": _verdict_family(mark),
                        "id": mark.get("id"), "at_ts": mark.get("at_ts")}
                       for mark in sorted(latest_ok, key=_mark_order)]
         out["accepted_unfiltered"] = unfiltered
@@ -1086,7 +1131,7 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
         if actor and actor.lower() in corrections:
             continue                      # l'auteur d'un correctif ne le relit pas (#2739)
         try:
-            family = _family_of(actor)
+            family = _verdict_family(mark)
         except RegistryReadError as exc:
             out["error"] = str(exc)
             out["why"] = ("no review verdict ok on the freeze %s (class: %s): the agent "

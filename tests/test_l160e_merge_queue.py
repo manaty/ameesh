@@ -164,7 +164,10 @@ class _Base(unittest.TestCase):
                            [{"name": str(item.get("assignee") or "").strip(),
                              "family": self.FAMILIES.get(
                                  str(item.get("assignee") or "").strip(), "")}]
-                           if str(item.get("assignee") or "").strip() else [], ()))]
+                           if str(item.get("assignee") or "").strip() else [],
+                           # #3578 : les familles compilées, comme la lecture
+                           # réelle (jamais vides)
+                           ("claude", "codex", "deepseek")))]
         if getattr(self, "PACKET_GUARD", True):
             # #2333 : ces bancs sans base simulent la mécanique de file ; la
             # garde du paquet y est simulée (les témoins de la garde elle-même
@@ -1489,7 +1492,7 @@ class QueueWithoutRadarTest(PgTestCase):
                                return_value=None), \
                 mock.patch.object(merge_queue, "_complete_authors",
                                   return_value=([{"name": "a1", "family": "deepseek"}],
-                                                ())), \
+                                                ("claude", "codex", "deepseek"))), \
                 mock.patch.object(merge_queue, "radar_project", return_value=None), \
                 mock.patch.object(radar, "github_ci",
                                   return_value=lambda branch: dict(status)), \
