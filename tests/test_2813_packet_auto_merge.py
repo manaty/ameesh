@@ -238,9 +238,13 @@ class Journal(unittest.TestCase):
     def notes(self, lot: int = LOT) -> list[str]:
         return [e["note"] for e in self.events.get(lot, [])]
 
-    def armed(self, sha: str = HEAD, lot: int = LOT, pr: int = NUM, base: str = "main"):
-        self._note(None, lot, "auto-merge armed repo=%s pr=%d sha=%s base=%s method=merge "
-                              "required=tests — test" % (SLUG, pr, sha, base))
+    def armed(self, sha: str = HEAD, lot: int = LOT, pr: int = NUM, base: str = "main",
+              composition: str = ""):
+        pinned = "base=%s method=merge required=tests" % base
+        if composition:
+            pinned += " composition=%s" % composition
+        self._note(None, lot, "auto-merge armed repo=%s pr=%d sha=%s %s — test"
+                   % (SLUG, pr, sha, pinned))
 
     def active(self, lot: int = LOT):
         return packet_automerge.active(packet_automerge.marks(None, lot))
@@ -749,6 +753,115 @@ class PassTest(Journal):
                 mock.patch.object(packet_automerge, "marks", marks):
             out = packet_automerge.watch(None, None, "ameesh", gh=FakeGh(head=NEW, auto=True))
         self.assertEqual({r["lot"]: r["result"] for r in out}, {LOT: "error", 9: "disarmed"})
+
+
+class TargetMovedTest(Journal):
+    """#3534 : la cible a avancé depuis la base de composition du paquet.
+
+    Seul un atterrissage de coupure (ligne de version de `pyproject.toml` et
+    notes `docs/versions/*.md`, manaty/home#173) laisse fusionner la tête
+    publiée ; un commit de code retient le paquet (mise à jour + CI à
+    relancer)."""
+
+    def check(self, gh, **kw):
+        return packet_automerge.check(None, None, LOT, gh=gh, **kw)
+
+    def repo(self):
+        """Un dépôt jetable : base, puis commits de coupure ou de code."""
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        path = directory.name
+
+        def git(*args):
+            proc = subprocess.run(["git", "-C", path, *args], capture_output=True,
+                                  text=True)
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            return (proc.stdout or "").strip()
+
+        git("init", "-q")
+        git("config", "user.email", "test@ameesh.invalid")
+        git("config", "user.name", "test")
+        (Path(path) / "pyproject.toml").write_text('[project]\nversion = "1.0.0"\n')
+        git("add", "-A")
+        git("commit", "-qm", "base")
+        return path, git, git("rev-parse", "HEAD")
+
+    def cutoff(self, path, git):
+        (Path(path) / "pyproject.toml").write_text('[project]\nversion = "1.0.1"\n')
+        notes = Path(path) / "docs" / "versions"
+        notes.mkdir(parents=True)
+        (notes / "1.0.1.md").write_text("# 1.0.1\n")
+        git("add", "-A")
+        git("commit", "-qm", "release: 1.0.1 [skip ci]\n\nameesh-release: 1.0.1")
+        return git("rev-parse", "HEAD")
+
+    def code(self, path, git):
+        (Path(path) / "src").mkdir(exist_ok=True)
+        (Path(path) / "src" / "x.py").write_text("x = 1\n")
+        git("add", "-A")
+        git("commit", "-qm", "fix: code")
+        return git("rev-parse", "HEAD")
+
+    def test_a_target_that_advanced_by_code_is_held(self):
+        path, git, base = self.repo()
+        moved = self.code(path, git)
+        self.armed(composition=base)
+        gh = FakeGh(tests="success", base_oid=moved)
+        out = self.check(gh, checkout=path)
+        self.assertEqual(out["result"], "disarmed", out)
+        self.assertEqual(gh.merges(), [])
+        self.assertIn("target advanced since composition", self.notes()[-1])
+        self.assertIn("ci run %d --full" % LOT, self.notes()[-1])
+
+    def test_a_target_that_advanced_by_a_cutoff_landing_merges(self):
+        path, git, base = self.repo()
+        landing = self.cutoff(path, git)
+        self.armed(composition=base)
+        gh = FakeGh(tests="success", base_oid=landing)
+        out = self.check(gh, checkout=path)
+        self.assertEqual(out["result"], "merged", out)
+        self.assertEqual(gh.landed, [("main", HEAD)])
+
+    def test_a_cutoff_landing_followed_by_code_is_held(self):
+        path, git, base = self.repo()
+        self.cutoff(path, git)
+        moved = self.code(path, git)
+        self.armed(composition=base)
+        gh = FakeGh(tests="success", base_oid=moved)
+        out = self.check(gh, checkout=path)
+        self.assertEqual(out["result"], "disarmed", out)
+        self.assertEqual(gh.merges(), [])
+
+    def test_a_release_landing_merge_is_a_cutoff_landing(self):
+        path, git, base = self.repo()
+        current = git("rev-parse", "--abbrev-ref", "HEAD")
+        git("checkout", "-q", "-b", "release")
+        self.cutoff(path, git)
+        git("checkout", "-q", current)
+        git("merge", "-q", "--no-ff", "release", "-m",
+            "release: 1.0.1 landing [skip ci]\n\nameesh-release: 1.0.1")
+        landing = git("rev-parse", "HEAD")
+        self.armed(composition=base)
+        gh = FakeGh(tests="success", base_oid=landing)
+        out = self.check(gh, checkout=path)
+        self.assertEqual(out["result"], "merged", out)
+        self.assertEqual(gh.landed, [("main", HEAD)])
+
+    def test_the_package_record_supplies_the_composition_base(self):
+        fake = types.SimpleNamespace(work=types.SimpleNamespace(
+            packet_members=lambda **kw: [
+                {"base_sha": "a" * 40, "head_sha": HEAD, "package_target": "main"}]))
+        with mock.patch.object(packet_automerge.storage, "of", lambda db: fake):
+            self.assertEqual(
+                packet_automerge._composition_base(object(), LOT, HEAD, "main"), "a" * 40)
+            self.assertEqual(
+                packet_automerge._composition_base(object(), LOT, NEW, "main"), "")
+
+    def test_the_armed_mark_carries_its_composition_base(self):
+        m = packet_automerge.MARK_RE.match(
+            "auto-merge armed repo=%s pr=%d sha=%s base=main method=merge "
+            "required=tests composition=%s — x" % (SLUG, NUM, HEAD, NEW))
+        self.assertEqual(m.group("composition"), NEW)
 
 
 class VerdictsTest(unittest.TestCase):
