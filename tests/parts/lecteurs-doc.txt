@@ -7,6 +7,7 @@
 #
 # Un module par ligne, dans l'ordre alphabétique, sa raison en commentaire.
 
+test_3444_cles_owner  # docs/EXPLOITATION.md (clés SSH de l'owner hors des exécuteurs, #3444)
 test_doc_links  # docs/ (liens internes et ancres, vérificateur scripts/doc-links.py, #775)
 test_l107_executor_contract  # docs/EXECUTEUR-MEDIEE.md (compteurs du contrat de l'exécuteur, L107)
 test_l1124_explorations  # docs/design/explorations and plan/roadmap/lot cards (exploration inbox off the roadmap, #1124)
