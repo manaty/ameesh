@@ -149,7 +149,8 @@
   ameesh role canary [--json]   L165 (EP7 P3) : geste sans effet gardé par
         l'époque du bail de l'environnement (AMEESH_ROLE + AMEESH_LEASE_EPOCH,
         ou session liée) ; 0 accepté (un `pilot.gesture` canary), 1 refusé
-        (détenteur nommé, rien journalisé), 2 aucun bail à garder ;
+        (rien journalisé ; détenteur nommé pour une époque périmée ou
+        expirée), 2 aucun bail à garder ;
   ameesh role status [ROLE] [--json]   elected roles: holder, epoch, ranked
                                         candidates (L165); the runners publish;
   ameesh role timers [--role R] [--install|--check|--remove] [--no-apply] [--no-sync] [--json]

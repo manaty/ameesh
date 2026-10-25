@@ -20,9 +20,10 @@ then `Gate.hold`: the lease renewal and ONE `pilot.gesture` event
 (`gesture = ref = canary`) are its only writes, in one transaction. No lot,
 mail, merge, queue, decision, packet or wake.
 
-Exit codes: `0` accepted (the event id is printed); `1` refused — stale or
-expired epoch, role without epoch, stopped role, unreadable registry: the
-message names the holder, its host and its epoch, and nothing is journaled;
+Exit codes: `0` accepted (the event id is printed); `1` refused, nothing
+journaled — for a stale or expired epoch (or a stopped role) the message
+names the holder, its host and its epoch; an earlier refusal (no or invalid
+epoch, unknown role, unreadable registry) states its own reason;
 `2` no lease to fence (a human, the bureau, a host-pinned agent): nothing is
 journaled either.
 """

@@ -331,10 +331,11 @@ gesture — `AMEESH_ROLE` + `AMEESH_LEASE_EPOCH`, or a session bound by its
 runner — and its only writes are the lease renewal and one `pilot.gesture`
 event (`gesture` and `ref` both `canary`). Exit `0`: accepted, the event id
 is printed (`--json`: `{ok, role, epoch, host, runner, event}`). Exit `1`:
-refused (stale or expired epoch, role without epoch, stopped role); the
-message names the holder, its host and its epoch, and nothing is journaled —
-the proof of a refusal is the exit code, the message and the absence of the
-event. Exit `2`: no lease to fence (a human, the bureau, a host-pinned
+refused, nothing journaled; for a stale or expired epoch (or a stopped role)
+the message names the holder, its host and its epoch, while an earlier
+refusal (no or invalid epoch, unknown role, unreadable registry) states its
+own reason — the proof of a refusal is the exit code, the message and the
+absence of the event. Exit `2`: no lease to fence (a human, the bureau, a host-pinned
 agent). For the drill, clear the session identity so only the epoch speaks,
 negative first:
 
