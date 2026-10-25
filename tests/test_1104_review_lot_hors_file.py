@@ -781,6 +781,30 @@ class CatchUpWitnessTest(_Witness):
             self.assertEqual(len(mail.unread_active(self.db, "pilote")), 1,
                              "l'avertissement est renvoyé à chaque tentative")
 
+    def test_l_avertissement_ne_part_qu_aux_pilotes_du_projet(self):
+        """#3453 : chaque pilote ne reçoit que les lots de son projet — un lot
+        ameesh ne part plus à l'orchestrateur nexlink, ni l'inverse."""
+        ours = self.merged_lot("lot ameesh")
+        theirs = work.add(self.db, title="lot nexlink", app="nexlink",
+                          assignee="claude1", actor="orch")["id"]
+        self.assertEqual(work.merged(self.db, theirs, sha="abcdef1234",
+                                     actor="claude1")["result"], "merged")
+        for name, project in (("pilote-a", "ameesh"), ("pilote-n", "nexlink")):
+            registry.upsert(self.db, name, harness="claude", host=self.cfg.host,
+                            cwd=self.repo, chantier=project)
+        with mock.patch.dict(os.environ,
+                             {"AMEESH_ALERT_ORCHESTRATORS": "pilote-a,pilote-n"}):
+            review_lot.catch_up(self.db, host="ameesh-agents-2")
+            out = review_lot.catch_up(self.db, retry_s=0, host="ameesh-agents-2")
+        self.assertEqual(sorted(e["lot"] for e in out["unopened"]),
+                         sorted([ours, theirs]), out)
+        for name, mine, other in (("pilote-a", ours, theirs),
+                                  ("pilote-n", theirs, ours)):
+            messages = mail.unread_active(self.db, name)
+            self.assertEqual(len(messages), 1, (name, messages))
+            self.assertIn("#%d " % mine, messages[0]["body"])
+            self.assertNotIn("#%d " % other, messages[0]["body"])
+
     def test_le_geste_conseille_relance_la_classification(self):
         """#3413 : l'avertissement conseille `work merged --repo` ; lancé juste
         après la tentative qui l'a motivé, ce geste relance la classification
