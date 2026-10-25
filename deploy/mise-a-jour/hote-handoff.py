@@ -2434,17 +2434,10 @@ class HostAdapter:
             spec.loader.exec_module(module)
         except Exception:
             raise Refused('source:' + BRIDGE_NAME) from None
-        local = self._local()
+        local = module.LocalDispatcher()
         return module.Bridge(local_host=self.host, transports=self.transports,
                              local=local,
                              enrollment_root=self.enrollment_root)
-
-    def _local(self):
-        try:
-            execution = load_execution(self.enrollment_root)
-        except Refused:
-            return None
-        return HostEffects(enrollment=execution)
 
     def _entry(self, host):
         admitted = self.hosts.get(host)
