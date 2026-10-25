@@ -92,7 +92,29 @@ _TRAILER = re.compile(r"(?im)^[ \t>*-]*ameesh-work[ \t]*:[ \t]*#?(\d+)[ \t]*$")
 #: #2692: prefixes GitHub adds to a full-suite job on a packet head — the
 #: packet gate's caller job and the flow check runs of tests.yml. A required
 #: job is matched exactly or under one of these, never by a loose suffix.
-_JOB_PREFIXES = ("suite complète du paquet / ", "tests (flux) ")
+#: #3530 : le check du flux L161c (`tests (flux) <part>`) figure aussi dans la
+#: liste des jobs de l'API ; il double le job de la part, il n'est pas un job.
+_PACKET_CALLER_PREFIX = "suite complète du paquet / "
+_FLUX_CHECK_PREFIX = "tests (flux) "
+_JOB_PREFIXES = (_PACKET_CALLER_PREFIX, _FLUX_CHECK_PREFIX)
+
+
+def _is_flow_check(name) -> bool:
+    """#3530 : un check du flux L161c (`tests (flux) <part>`), pas un job.
+
+    Le préfixe d'appel du portier (`suite complète du paquet / …`) peut le
+    précéder quand la suite tourne en workflow réutilisable."""
+    text = str(name or "")
+    if text.startswith(_PACKET_CALLER_PREFIX):
+        text = text[len(_PACKET_CALLER_PREFIX):]
+    return text.startswith(_FLUX_CHECK_PREFIX)
+
+
+def _bare_job_name(name: str) -> str:
+    """The job name without GitHub's packet-caller and flow prefixes (#2692)."""
+    for prefix in _JOB_PREFIXES:
+        name = name.removeprefix(prefix)
+    return name
 
 
 class ReleaseError(RuntimeError):
@@ -313,11 +335,12 @@ def _locked(path: str):
 # --------------------------------------------------------------------------
 
 def _git(repo: str, *args: str, check: bool = False, timeout: float = 120.0,
-         input_text: str | None = None) -> subprocess.CompletedProcess:
+         input_text: str | None = None, env: dict | None = None) -> subprocess.CompletedProcess:
     try:
         proc = subprocess.run(
             ["git", "-C", repo, *args], input=input_text, capture_output=True,
-            text=True, timeout=timeout, env=dict(os.environ, GIT_TERMINAL_PROMPT="0"))
+            text=True, timeout=timeout,
+            env=dict(os.environ if env is None else env, GIT_TERMINAL_PROMPT="0"))
     except subprocess.TimeoutExpired as exc:
         raise TransientReleaseError("git %s timed out" % " ".join(args[:2])) from exc
     except OSError as exc:
@@ -489,9 +512,16 @@ def ci_reading(project: "ProjectRelease", sha: str) -> dict:
         # separate macOS suite (#3198). Its unfinished rollup must not block
         # a successful tests aggregate; a job FAILURE still blocks below.
         managed = {"tests", "paquet", "macos"}
-        negative = [name for name in reading.get("negative", ()) if name not in managed]
-        pending = [name for name in reading.get("pending", ()) if name not in managed]
-        inconclusive = [name for name in reading.get("inconclusive", ()) if name not in managed]
+        # #3530 : un check « tests (flux) » double le job de la part ; ses
+        # non concluants ne se consignent pas deux fois. Un flux **négatif**
+        # reste une preuve (le publisher peut avoir écrit `fin=echec` avant
+        # que le job ne soit annulé) : il n'est jamais filtré.
+        negative = [name for name in reading.get("negative", ())
+                    if name not in managed]
+        pending = [name for name in reading.get("pending", ())
+                   if name not in managed and not _is_flow_check(name)]
+        inconclusive = [name for name in reading.get("inconclusive", ())
+                        if name not in managed and not _is_flow_check(name)]
         # B3 d'impl-04 (#3186) : le filtre vise les rollups reclassés job par
         # job, pas un check requis rouge — celui d'une autre suite que la
         # tentative lue ci-dessous resterait sinon masqué.
@@ -503,6 +533,10 @@ def ci_reading(project: "ProjectRelease", sha: str) -> dict:
                     job["name"], job["conclusion"] or job["status"], attempt["url"])
                 if _job_negative(job):
                     negative.append(label)
+                elif _is_flow_check(job.get("name")):
+                    # #3530 : doublon non concluant/en attente du job de la
+                    # part, déjà lu ; jamais un second lot de correction.
+                    continue
                 elif _job_inconclusive(job):
                     inconclusive.append(label)
         if not aggregate_ok:
@@ -528,11 +562,15 @@ def suite_reading(project: "ProjectRelease", sha: str) -> dict:
         suite = radar.commit_suite(target, sha)
         # Reuse the host's declared full-suite tolerances (#566), rather
         # than inferring continue-on-error from a green workflow rollup.
+        # #3535 : le check du flux L161c double le job de sa part ; son nom
+        # porte `tests (flux) ` — retiré avant le match, comme le préfixe
+        # d'appel du portier, pour qu'une part tolérée ne rougisse pas la
+        # tête par son flux.
         for run in suite.get("runs", ()):
             if run.get("workflow") not in ("tests", "paquet"):
                 continue
             for job in run["jobs"]:
-                name = job["name"].removeprefix("suite complète du paquet / ")
+                name = _bare_job_name(job["name"])
                 job["tolerated"] = any(radar._job_matches(pattern, name)
                                        for pattern in project.suite_tolerated)
         return suite
@@ -1114,12 +1152,22 @@ def _job_success(job: dict) -> bool:
     return job.get("status") == "completed" and job.get("conclusion") == "success"
 
 
+def _job_waiting(job: dict) -> bool:
+    """#3530 : un job encore en cours (`in_progress`, `queued`, …) attend ;
+    ce n'est pas un résultat non concluant et il n'ouvre aucun lot avant la
+    fin du run ou le délai du job."""
+    return str(job.get("status") or "").strip().lower() != "completed"
+
+
 def _job_inconclusive(job: dict) -> bool:
     """A job that neither succeeded nor was skipped by its `if:` (#3244).
 
     On every push to main, `version number`, `lecteurs de la doc` and
     `autre système de fichiers` are skipped by design: the aggregate decides
-    whether they were due, so they are neither consigned nor reopened."""
+    whether they were due, so they are neither consigned nor reopened.
+    #3530 : un job encore en cours attend ; il n'est pas consigné."""
+    if _job_waiting(job):
+        return False
     tolerated = job.get("tolerated", False)
     return not _job_success(job) and job.get("conclusion") != "skipped" and not tolerated
 
@@ -1177,8 +1225,7 @@ def _suite_runs(suite: dict, attempt: dict | None) -> list[dict]:
         workflow, name = run.get("workflow"), job["name"]
         if workflow in ("tests", "paquet"):
             workflow = "tests"
-            for prefix in _JOB_PREFIXES:
-                name = name.removeprefix(prefix)
+            name = _bare_job_name(name)
             if name == "tests (dispatch)":
                 name = "tests"
         return workflow, name
@@ -1540,12 +1587,16 @@ def _write_notes(path: str, version: str, notes: str) -> None:
         stream.write(notes)
 
 
+def _release_env(author: str = "ameesh release") -> dict:
+    """One command-local identity for version commits, landing merges and tags."""
+    return dict(os.environ,
+                GIT_AUTHOR_NAME=author, GIT_AUTHOR_EMAIL="release@ameesh.invalid",
+                GIT_COMMITTER_NAME=author, GIT_COMMITTER_EMAIL="release@ameesh.invalid")
+
+
 def _commit(path: str, message: str, *, author: str = "ameesh release") -> str:
-    env = dict(os.environ,
-               GIT_AUTHOR_NAME=author, GIT_AUTHOR_EMAIL="release@ameesh.invalid",
-               GIT_COMMITTER_NAME=author, GIT_COMMITTER_EMAIL="release@ameesh.invalid")
     proc = subprocess.run(["git", "-C", path, "commit", "--no-verify", "-q", "-m", message],
-                          capture_output=True, text=True, env=env, timeout=120.0)
+                          capture_output=True, text=True, env=_release_env(author), timeout=120.0)
     if proc.returncode:
         detail = " ".join((proc.stderr or proc.stdout or "").split())[-300:]
         raise ReleaseError("git commit: %s" % (detail or "failed"))
@@ -1628,11 +1679,9 @@ def _ensure_local_tag(project: ProjectRelease, release_sha: str, version: str) -
             raise ReleaseError("tag %s fetched on another commit than %s"
                                % (tag, release_sha[:12]))
         return tag
-    env = dict(os.environ, GIT_COMMITTER_NAME="ameesh release",
-               GIT_COMMITTER_EMAIL="release@ameesh.invalid")
     proc = subprocess.run(
         ["git", "-C", project.repo, "tag", "-a", tag, "-m", "ameesh %s" % version,
-         release_sha], capture_output=True, text=True, env=env, timeout=120.0)
+         release_sha], capture_output=True, text=True, env=_release_env(), timeout=120.0)
     if proc.returncode:
         detail = " ".join((proc.stderr or proc.stdout or "").split())[-300:]
         raise ReleaseError("git tag: %s" % (detail or "failed"))
@@ -1644,7 +1693,9 @@ def _landing_merge(project: ProjectRelease, plan: Plan, release_sha: str,
     """M = merge(main, V), with `[skip ci]`, or a named refusal."""
     folder, worktree = _worktree(project.repo, main)
     try:
-        merged = _git(worktree, "merge", "--no-ff", "--no-commit", release_sha)
+        # Git requires an identity even with --no-commit (#3527).
+        merged = _git(worktree, "merge", "--no-ff", "--no-commit", release_sha,
+                      env=_release_env())
         if merged.returncode:
             _git(worktree, "merge", "--abort")
             detail = " ".join((merged.stderr or merged.stdout or "").split())[-300:]
