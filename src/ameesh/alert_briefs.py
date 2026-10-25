@@ -448,6 +448,30 @@ def _idle_actionable_lot(alert: dict) -> str:
                 int(alert.get("wakes") or 0), nudge, lot))
 
 
+def _packet_ci_text(ci: dict) -> str:
+    """#3487 : l'état de la CI du paquet, dans le geste SLO.
+
+    Le lot porté n'attend plus sa propre CI ; le brief dit où en est celle du
+    paquet (en cours, en file, pas encore démarrée, verte, rouge, annulée) pour
+    que le palier visé sache s'il doit pousser le composeur ou traiter un
+    rouge. Un état illisible ne fait pas taire le geste : il nomme le paquet.
+    """
+    state = str((ci or {}).get("state") or "unknown")
+    run = "run %s" % ci["run_id"] if (ci or {}).get("run_id") else "its CI"
+    if state == "running":
+        return " (%s is still running)" % run
+    if state == "pending":
+        return " (its full CI has not started yet)"
+    if state == "green":
+        return " (%s is green; the packet merge is pending)" % run
+    if state == "red":
+        return (" (%s is red: a unit must be fixed or removed before the packet "
+                "merges)" % run)
+    if state in ("cancelled", "superseded"):
+        return " (%s was %s; a new run is expected)" % (run, state)
+    return " (its CI is not readable here)"
+
+
 def _slo_breach(alert: dict, *, level: int | None = None) -> str:
     """#789 tranche 2 (canon §9) : une étape interne du lot a dépassé son
     délai ; le texte dit l'étape, le retard, et le geste du niveau atteint
@@ -463,6 +487,11 @@ def _slo_breach(alert: dict, *, level: int | None = None) -> str:
     #2231 : quand l'attente est une fusion (`merge*`) ou un déblocage
     (`unblock`), le porteur n'est pas le blocage — le brief vise le pilote/le
     composeur et ne prescrit ni relance ni réassignation du porteur.
+
+    #3487 : quand l'attente est un paquet ouvert (`packet`), le lot est porté
+    par un paquet composé ; le geste nomme le paquet, sa branche et l'état de
+    sa CI complète, et ne prescrit jamais de réassigner le porteur — il pousse
+    le pilote/le composeur à voir le paquet jusqu'à sa fusion.
 
     #2378 : de même pour une demande de décision ouverte et échue
     (`waiting.decision`) : le geste est de vérifier l'échéance avec le
@@ -556,6 +585,25 @@ def _slo_breach(alert: dict, *, level: int | None = None) -> str:
             move = ("pilot: the lot is `blocked` and waits for its unblock/decision — "
                     "do not reassign its holder; unblock it or record the decision "
                     "(ameesh work note %d \"hold: <reason>\")" % lot)
+    elif what == "packet":
+        # #3487 : le lot est porté par un paquet composé ; son attente est la CI
+        # complète du paquet et sa fusion. Le geste nomme le paquet et sa CI,
+        # jamais une réassignation du porteur (qui n'avancerait rien).
+        vehicle = waiting.get("vehicle")
+        packet = ("#%s" % vehicle if vehicle is not None
+                  else (waiting.get("who") or "its packet"))
+        branch = str(waiting.get("branch") or "")
+        where = " (%s)" % branch if branch else ""
+        ci = _packet_ci_text(waiting.get("ci") or {})
+        if level >= 3:
+            move = ("bureau or auditor: the lot is carried by packet %s%s and waits for "
+                    "the packet's full CI%s — do not reassign or nudge its holder; push "
+                    "the pilot/composer to see the packet through (the lot merges with "
+                    "it)" % (packet, where, ci))
+        else:
+            move = ("pilot: the lot is carried by packet %s%s and waits for the packet's "
+                    "full CI%s — do not reassign or nudge its holder; the composer/pilot "
+                    "carries the packet merge" % (packet, where, ci))
     elif alert.get("step") == "green_verdict":
         # #3033 : l'avis est dû par le relecteur désigné, pas par le porteur ;
         # le geste est de rendre le verdict, puis de remplacer le relecteur.

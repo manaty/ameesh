@@ -626,6 +626,21 @@ class PaquetTest(_Base):
         packet_guard.declare(self.db, self.lot["id"], "incident",
                              "cible rouge", head, actor="dev1")
 
+    def _packet_ci_on_head(self, carrier, head, *, status="running", run_id=None):
+        """#3487 : une exécution de la CI complète du paquet, sur sa tête."""
+        if not hasattr(self, "_packet_ci_seq"):
+            self._packet_ci_seq = 900000
+        self._packet_ci_seq += 1
+        self.db.execute(
+            "INSERT INTO ci_runs (repo, run_id, head_sha, branch, event, base,"
+            " work_item_id, status, url, workflow, first_seen_at, concluded_at)"
+            " VALUES ('manaty/ameesh', %s, %s, %s, 'push', 'main', %s, %s, 'u',"
+            " 'tests.yml', to_timestamp(%s), to_timestamp(%s))",
+            (int(run_id or self._packet_ci_seq), head,
+             str(carrier.get("branch") or "integration/paquet-test"),
+             carrier["id"], status, self.now - 60.0,
+             None if status == "running" else self.now))
+
     def test_hors_paquet_le_vert_de_la_ci_fixe_le_depart(self):
         # #3341 : GO à 23:05, CI verte à 23:45 (40 min). L'horloge P1 (15 min)
         # part du vert : silence à 23:59, niveau 1 à 00:01 — pas à 23:20
@@ -770,21 +785,62 @@ class PaquetTest(_Base):
         self.assertEqual(alerts[0]["since"], self.GO)
         self.assertEqual(alerts[0]["value"], 60)
 
-    def test_exception_declaree_sort_du_paquet_et_alerte(self):
-        # #2919 : une exception `packet-exception incident` pour la tête
-        # courante ramène la cible de la table (30 min) et l'escalade ; la CI
-        # verte sur cette tête date le départ (#3341).
+    def test_exception_dans_un_paquet_suit_la_cadence_du_paquet(self):
+        # #3487, cas réel #3449 dans h-15 (#3461) : une exception déclarée
+        # pour la tête ne sort plus du paquet qui porte réellement le lot. Le
+        # lot n'attend que la CI du paquet : l'horloge part du créneau (#2335)
+        # et suit le repli 30 min ; aucune alerte ne prescrit une
+        # réassignation. La CI propre du lot était verte avant le GO, elle ne
+        # date plus rien (#3341 ne s'applique qu'hors paquet).
         self.qa_at(self.GO)
         head = "a" * 40
-        self._outside_packet(head, priority=None)
+        self._outside_packet(head)                  # P1, comme #3449
         self._ci_on_head(head, self.GO - 10 * 60)
-        self.packet(body="unités : #%d @ %s" % (self.lot["id"], head))
-        self.now = self.GO + 50 * 60
+        carrier = self.packet(body="unités : #%d @ %s" % (self.lot["id"], head),
+                              head=head)
+        self._packet_ci_on_head(carrier, head, status="running", run_id=700001)
+        # 00:26, 26 min après le créneau de 00:00 : dans le repli de 30 min,
+        # comme l'alerte de 03:22Z (21 min après le créneau de 03:00). La ligne
+        # P1 du paquet n'a pas de colonne critique : 30 min, pas 15.
+        self.now = self.GO + 81 * 60
+        self.assertEqual(self.slo(), [])
+        # 3× le repli après le créneau : le niveau 3 est dû, et il nomme le
+        # paquet et sa CI au lieu de réassigner le porteur.
+        self.now = self.GO + 3 * HEURE
+        alerts = self.slo()
+        self.assertEqual([(a["step"], a["level"], a["threshold"], a["targets"])
+                          for a in alerts],
+                         [("verdict_merge", 3, 1800,
+                           ["pilot", "bureau", "auditeur"])])
+        alert = alerts[0]
+        self.assertEqual((alert["waiting"] or {}).get("what"), "packet")
+        self.assertEqual((alert["waiting"] or {}).get("vehicle"), carrier["id"])
+        self.assertEqual((alert["waiting"] or {}).get("ci", {}).get("state"),
+                         "running")
+        out = self.briefs(alert)
+        self.assertEqual(sorted(out), ["auditeur", "bureau", "orch"])
+        for text in out.values():
+            self.assertIn("#%d" % carrier["id"], text)
+            self.assertIn("run 700001", text)
+            self.assertIn("do not reassign or nudge its holder", text)
+            self.assertNotIn("reassign it now", text)
+
+    def test_hors_paquet_le_niveau_3_garde_la_reassignation(self):
+        # #3487, contrôle positif : un lot relu hors paquet (exception
+        # déclarée, aucun porteur) garde le geste de réassignation du niveau 3.
+        self.qa_at(self.GO)
+        head = "b" * 40
+        self._outside_packet(head)                  # P1 : cible 15 min
+        self._ci_on_head(head, self.GO - 10 * 60)   # vert avant le GO
+        self.now = self.GO + 46 * 60
         alerts = self.slo()
         self.assertEqual([(a["step"], a["level"], a["targets"]) for a in alerts],
-                         [("verdict_merge", 1, ["assignee"])])
+                         [("verdict_merge", 3, ["bureau", "auditeur"])])
         self.assertIsNone(alerts[0]["waiting"])
-        self.assertEqual(alerts[0]["threshold"], 1800)
+        out = self.briefs(alerts[0])
+        self.assertEqual(sorted(out), ["auditeur", "bureau"])
+        for text in out.values():
+            self.assertIn("reassign it now", text)
 
     def test_exception_d_une_autre_tete_ne_sort_pas_du_paquet(self):
         # Une exception ne couvre que sa tête : le nouveau gel reste dans le

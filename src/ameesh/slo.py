@@ -67,6 +67,9 @@ class Step(NamedTuple):
 #: cible dynamique, le p80 réel de la CI du paquet (`lot_steps(..., p80_s=...)`,
 #: canon §9, décision owner #103509 option a, home#147) ; une unité d'un paquet
 #: ouvert n'a en plus aucune cible d'escalade propre (`packet=True`).
+#: #3487 : une exception déclarée pour un lot réellement porté par un paquet
+#: suit la cadence de ce paquet (créneau #2335 + p80), pas sa CI propre : le
+#: lot se fusionne avec le paquet, et le geste nomme le paquet et sa CI.
 STEPS: tuple = (
     Step("signal_assigned",
          "request or incident reported → lot assigned to an executor",
@@ -466,6 +469,13 @@ def lot_steps(item: dict, jalons: dict, events: Iterable[dict], *,
     porte la fusion (canon §9, décision owner #103509 option a, home#147). La
     mesure reste lisible (`elapsed_s`, `target_s`, `packet`, `target_source`)
     pour le taux de respect.
+
+    #3487 : un lot qui a déclaré une exception (`outside_packet=True`) mais
+    que le paquet porte réellement suit la cadence du paquet, pas sa CI
+    propre : l'appelant lui passe `packet_slot` (#2335) et `p80_s`, et garde
+    `outside_packet=False` ; seule son escalade reste due (l'exception est le
+    signal d'un lot à suivre). Le geste qui en sort nomme le paquet et sa CI
+    (`alert_briefs`), jamais une réassignation du porteur.
 
     #2551 : `dependencies` sont les arêtes de prérequis du lot
     (`work_dependencies.grouped`, enrichies de `satisfied_ts` — fusion ou
