@@ -42,7 +42,11 @@ holds a **shared execution lease** in `merge_locks` (key
 ``alerts-pass:<role>``, as the train service borrows that table) for the whole
 life of its child, re-reads the selection under it, and renews it every third
 of its TTL; a lost lease stops the child instead of letting a second delivery
-overlap. The other passes never take it.
+overlap. The renewal is a network call that can block past the database
+expiry, so the lease also carries a **local monotonic deadline**, fixed before
+acquisition and extended only by a successful renewal; a watchdog that never
+touches the database TERMs then KILLs the child on that deadline, before
+another host can take the execution lease. The other passes never take it.
 
 The command is an argument vector, never a shell string. Its exit code is
 returned unchanged. The wrapper's own refusals are:
@@ -61,9 +65,11 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import signal
 import subprocess
 import sys
 import threading
+import time
 import uuid
 
 from . import config as config_mod
@@ -88,6 +94,19 @@ ALERTS_LEASE_KEY = "alerts-pass:%s"
 #: long enough for a renewal to survive one slow database round-trip, short
 #: enough that a killed wrapper frees the pass within a minute
 ALERTS_LEASE_TTL_S = 60.0
+#: #3568 (review cx3): the database lease is renewed over the network, and a
+#: suspended network can make that call block past the server expiry. The
+#: child is therefore stopped on a LOCAL monotonic deadline, fixed at
+#: acquisition and extended only by a successful renewal. The guard is the
+#: margin kept before the database expiry: it must cover the TERM/KILL
+#: sequence plus scheduling, even when the renewal never returns. With the
+#: defaults (TTL 60 s, renewal every 20 s, client timeout 35 s), the first
+#: renewal starts at 20 s and may answer at 55 s; the local deadline is 45 s,
+#: so the child is dead before 47 s and the server lease cannot be taken
+#: before 60 s.
+ALERTS_LEASE_GUARD_S = 15.0
+#: delay between SIGTERM and SIGKILL when the local deadline is reached
+ALERTS_LEASE_KILL_GRACE_S = 2.0
 
 #: a role the wrapper may run; its name is an agent name (aliases resolved).
 _SCHEMA = "ameesh-role-run/1"
@@ -118,6 +137,12 @@ class _AlertsLease:
     is fenced by the owner token and that epoch, so a lease taken over after
     an expiry cannot be renewed by the old process. A killed wrapper frees the
     pass when the TTL ends; a live one renews it while its child runs.
+
+    The database expiry is not enough on its own: the renewal is a network
+    call and can block past that expiry. The lease therefore also keeps a
+    **local monotonic deadline**, fixed *before* the acquisition call and
+    extended only by a renewal that succeeded. A watchdog stops the child on
+    that deadline without issuing any database call (review cx3).
     """
 
     def __init__(self, db, role: str, host: str, *, ttl: float | None = None):
@@ -125,7 +150,16 @@ class _AlertsLease:
         self.key = ALERTS_LEASE_KEY % (role or "")
         self.owner = "alerts-pass:%s:%s" % (host, uuid.uuid4().hex)
         self.ttl = float(ALERTS_LEASE_TTL_S if ttl is None else ttl)
+        #: margin kept between the local stop and the database expiry; it
+        #: must cover TERM + KILL and scheduling, not just one round-trip
+        self.guard = max(0.05, min(ALERTS_LEASE_GUARD_S,
+                                  self.ttl / 3.0, self.ttl * 0.9))
+        self.kill_grace = max(0.02, min(ALERTS_LEASE_KILL_GRACE_S,
+                                        self.guard / 2.0))
         self.epoch = None
+        #: monotonic time at which the child must already be stopped; None
+        #: when this process holds no lease
+        self.deadline = None
         self.lock = threading.Lock()
 
     def _work(self):
@@ -134,9 +168,15 @@ class _AlertsLease:
 
     def acquire(self) -> int | None:
         """Take the lease, or return None when another child holds it."""
+        # The server sets its expiry during the call, before the response can
+        # be delayed by the network: starting from the local time *before* the
+        # call keeps the local deadline conservative in every case.
+        started = time.monotonic()
         epoch = self._work().land_lock(self.key, self.owner, self.ttl)
         with self.lock:
             self.epoch = None if epoch is None else int(epoch)
+            self.deadline = (started + self.ttl - self.guard
+                             if self.epoch is not None else None)
         return self.epoch
 
     def renew(self) -> bool:
@@ -145,17 +185,41 @@ class _AlertsLease:
             epoch = self.epoch
         if epoch is None:
             return False
+        # A slow renewal extends the server expiry from when its statement
+        # ran; measuring from before the call only makes the local deadline
+        # earlier, never later.
+        started = time.monotonic()
         try:
             got = self._work().land_lock(self.key, self.owner, self.ttl,
                                          epoch=epoch)
         except Exception:  # noqa: BLE001 - a broken renewal is a lost lease
             got = None
-        return got == epoch
+        if got != epoch:
+            return False
+        with self.lock:
+            if self.epoch != epoch:
+                return False
+            proposed = started + self.ttl - self.guard
+            if self.deadline is None or proposed > self.deadline:
+                self.deadline = proposed
+            # The call may itself have outlived the local deadline: in that
+            # case the watchdog is already stopping the child, and reporting
+            # a lost lease lets the caller fail closed without waiting.
+            return self.deadline > time.monotonic()
+
+    def remaining(self) -> float:
+        """Seconds left on the local deadline; negative when it has passed."""
+        with self.lock:
+            deadline = self.deadline
+        if deadline is None:
+            return -1.0
+        return deadline - time.monotonic()
 
     def release(self) -> bool:
         """Release this process's lease; never another holder's."""
         with self.lock:
             epoch, self.epoch = self.epoch, None
+            self.deadline = None
         if epoch is None:
             return False
         try:
@@ -164,40 +228,128 @@ class _AlertsLease:
             return False
 
 
-def _watch_alerts_lease(lease: _AlertsLease, proc, stop: threading.Event,
-                        lost: threading.Event) -> None:
-    """Renew the shared lease for the child's whole life; stop it if lost.
+def _signal_child_group(proc, sig: int) -> None:
+    """Signal the child's whole session, not only its own process."""
+    try:
+        os.killpg(os.getpgid(proc.pid), sig)
+    except ProcessLookupError:
+        pass
+    except OSError:
+        try:
+            proc.send_signal(sig)
+        except OSError:
+            pass
 
-    Renewal is deliberately not fatal to the pass (it is fatal to the child):
-    another host must never start a second alerts pass while this one still
-    writes. A lost lease therefore terminates the child and returns the
-    wrapper as an error, rather than letting two deliveries overlap.
+
+def _stop_child(proc, grace: float) -> None:
+    """TERM the child, then KILL it if it is still alive after ``grace``.
+
+    The deadline watchdog owns the process reaping (the main thread is in
+    ``proc.wait()``); this only signals and escalates, so a child that ignores
+    SIGTERM cannot outlive the local deadline that precedes the lease expiry.
+    """
+    if proc.poll() is not None:
+        return
+    _signal_child_group(proc, signal.SIGTERM)
+    deadline = time.monotonic() + max(0.0, grace)
+    while proc.poll() is None and time.monotonic() < deadline:
+        time.sleep(0.01)
+    if proc.poll() is None:
+        _signal_child_group(proc, signal.SIGKILL)
+
+
+class _AlertsExecution:
+    """The local, database-free stop of one alerts child.
+
+    The shared lease is renewed over the network, and that call can block past
+    the server expiry. This guard watches the lease's monotonic deadline in a
+    thread that never touches the database, so it stops the child *before*
+    another host can take the execution lease, even if no renewal ever
+    returns. It is armed just after acquisition (before the selection
+    re-reads) and its lock closes the race between the last deadline check
+    and the child registration.
+    """
+
+    def __init__(self, lease: _AlertsLease):
+        self.lease = lease
+        self.lock = threading.Lock()
+        self.proc = None
+        self.lost = threading.Event()
+        self.stopped = threading.Event()
+        self.stop = threading.Event()
+        self.thread = threading.Thread(target=self._watch,
+                                       name="alerts-deadline", daemon=True)
+
+    def start(self) -> None:
+        self.thread.start()
+
+    def close(self) -> None:
+        self.stop.set()
+        self.thread.join(timeout=max(1.0, self.lease.kill_grace + 1.0))
+
+    def _watch(self) -> None:
+        # No database call here: a pending renewal must not delay the stop.
+        while not self.stop.is_set():
+            left = self.lease.remaining()
+            if left <= 0:
+                self.kill()
+                return
+            self.stop.wait(min(0.2, max(0.01, left)))
+
+    def start_child(self, argv: list[str], env: dict):
+        """Register and start the child, or None if the deadline has passed."""
+        with self.lock:
+            if self.lost.is_set() or self.lease.remaining() <= 0:
+                self.lost.set()
+                return None
+            # Its own session lets the watchdog stop the command's children
+            # too: a wrapper that leaves a helper behind is still one pass.
+            self.proc = subprocess.Popen(argv, env=env, start_new_session=True)
+            return self.proc
+
+    def kill(self) -> None:
+        """Stop the child once; any caller may signal a lost lease."""
+        with self.lock:
+            self.lost.set()
+            if self.stopped.is_set():
+                return
+            self.stopped.set()
+            proc = self.proc
+        if proc is not None:
+            _stop_child(proc, self.lease.kill_grace)
+
+
+def _watch_alerts_lease(lease: _AlertsLease, execution: _AlertsExecution,
+                        stop: threading.Event) -> None:
+    """Renew the shared lease for the child's whole life.
+
+    A failed renewal stops the child at once; the deadline watchdog is the
+    second, local line of defence when the renewal call itself is blocked.
     """
     while not stop.wait(max(0.1, lease.ttl / 3.0)):
         if stop.is_set():
             return
         if lease.renew():
             continue
-        if not stop.is_set():
-            lost.set()
-            try:
-                proc.terminate()
-            except OSError:
-                pass
+        execution.kill()
         return
 
 
-def _run_under_lease(argv: list[str], env: dict, lease: _AlertsLease) -> tuple[int, bool]:
+def _run_under_lease(argv: list[str], env: dict, lease: _AlertsLease,
+                     execution: _AlertsExecution) -> tuple[int, bool]:
     """Run the child while the shared lease is held and renewed.
 
-    Returns ``(exit code, lost)``. The lease is released before returning,
-    including when the child cannot be started (the caller's `finally` covers
-    the start failure itself).
+    Returns ``(exit code, lost)``. The caller releases the lease after closing
+    the execution guard, so no stop thread can use the connection while it is
+    released. The local deadline is already armed by the caller: it covers the
+    selection re-reads that happen before this function starts the child.
     """
-    stop, lost = threading.Event(), threading.Event()
-    proc = subprocess.Popen(argv, env=env)
+    proc = execution.start_child(argv, env)
+    if proc is None:
+        return 1, True
+    stop = threading.Event()
     watcher = threading.Thread(target=_watch_alerts_lease,
-                               args=(lease, proc, stop, lost),
+                               args=(lease, execution, stop),
                                name="alerts-lease", daemon=True)
     watcher.start()
     try:
@@ -205,11 +357,11 @@ def _run_under_lease(argv: list[str], env: dict, lease: _AlertsLease) -> tuple[i
     finally:
         stop.set()
         # No timeout: releasing while the watcher still uses the connection
-        # would race the driver. A genuinely hung renewal is bounded by the
-        # unit's TimeoutStartSec, and the TTL frees the pass for the others.
+        # would race the driver. The child is already stopped by the local
+        # deadline even if this renewal never returns; the TTL then frees the
+        # pass for the other hosts.
         watcher.join()
-        lease.release()
-    return code, lost.is_set()
+    return code, execution.lost.is_set()
 
 
 def _read(db, name: str) -> dict | None:
@@ -456,6 +608,7 @@ def run(cfg, args) -> int:
             emit(report, result="would-run")
             return 0
         lease = None
+        execution = None
         try:
             if pass_name == "alerts":
                 lease = _AlertsLease(db, report["role"], host)
@@ -464,6 +617,11 @@ def run(cfg, args) -> int:
                     report["detail"] = _detail(report["code"], report)
                     emit(report, result="standby")
                     return 0
+                # The local deadline is armed BEFORE the re-reads below: a
+                # selection read that blocks past it must not let a child
+                # start under an execution lease another host can take.
+                execution = _AlertsExecution(lease)
+                execution.start()
                 # The selection read is not a reservation: the holder's route
                 # can return between that read and the acquisition above.
                 # Re-read the role AND the selection under the lease; if this
@@ -471,7 +629,6 @@ def run(cfg, args) -> int:
                 try:
                     fresh = live(db, name)
                 except RoleError as exc:
-                    lease.release()
                     print("ameesh role run: %s" % exc, file=sys.stderr)
                     return 2
                 report.update(fresh)
@@ -496,10 +653,13 @@ def run(cfg, args) -> int:
                             or float(report["left_s"]) < float(args.min_left)):
                         report["code"] = "lease-too-short"
                 if report.get("code"):
-                    lease.release()
                     report["detail"] = _detail(report["code"], report)
                     emit(report, result="standby")
                     return 0
+                if execution.lost.is_set() or lease.remaining() <= 0:
+                    print("ameesh role run: alerts execution lease deadline "
+                          "passed before the child started", file=sys.stderr)
+                    return 1
                 report["delegated"] = delegated
             env = os.environ.copy()
             # The command is not an agent turn: never inherit the shell's turn,
@@ -534,7 +694,7 @@ def run(cfg, args) -> int:
                     ENV_OWNER: str(report.get("owner") or ""),
                 })
             if lease is not None:
-                code, lost = _run_under_lease(argv, env, lease)
+                code, lost = _run_under_lease(argv, env, lease, execution)
                 if lost:
                     print("ameesh role run: alerts execution lease lost; the "
                           "child was stopped", file=sys.stderr)
@@ -558,6 +718,11 @@ def run(cfg, args) -> int:
                   file=sys.stderr)
             return 126
         finally:
+            # Stop the local deadline thread before releasing the connection
+            # it watches: a release clears the deadline, and a late stop must
+            # not race the database driver.
+            if execution is not None:
+                execution.close()
             if lease is not None:
                 lease.release()
     except db_mod.DbError as exc:

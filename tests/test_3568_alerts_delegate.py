@@ -16,13 +16,18 @@ holder's fenced gesture, and the alerts pass writes no pilot gesture.
 The selection alone does not reserve execution (review cx3): when the holder's
 route returns while a delegate's child runs, both would select the holder. The
 alerts pass therefore takes a shared execution lease in `merge_locks` for the
-whole child, renews it, and stops the child if it is lost. The witnesses below
-cover the overlap at route return, the renewal, and the fail-closed loss.
+whole child, renews it, and stops the child if it is lost. The renewal is a
+network call that can hang: a local monotonic deadline, fixed at acquisition
+and extended only by a successful renewal, stops the child before the server
+lease can be taken (review cx3, second round). The witnesses below cover the
+overlap at route return, the renewal, the fail-closed loss, and a renewal
+blocked past the local deadline.
 """
 from __future__ import annotations
 
 import contextlib
 import dataclasses
+import fcntl
 import io
 import json
 import os
@@ -408,8 +413,10 @@ class AlertsGateTest(_AlertsCase):
         first = {}
 
         def run_first():
-            # short TTL: the watcher's next renewal is ~0.3 s away
-            with mock.patch.object(role_run, "ALERTS_LEASE_TTL_S", 0.9):
+            # A short TTL relative to the bench, but long enough for the
+            # selection re-reads and the child start to fit before the local
+            # deadline. The watcher's next renewal is TTL/3 away.
+            with mock.patch.object(role_run, "ALERTS_LEASE_TTL_S", 8.0):
                 first["result"] = self.run_cli_isolated(
                     dataclasses.replace(self.cfg, host="atelier"), self.args(command))
 
@@ -430,6 +437,202 @@ class AlertsGateTest(_AlertsCase):
         self.assertFalse(thread.is_alive())
         self.assertEqual(first["result"][0], 1)
         self.assertFalse(os.path.exists(done))
+
+    def test_a_blocked_renewal_cannot_overlap_the_next_host(self):
+        """cx3 round 2: a suspended renewal must not leave a live child."""
+        self.role()
+        self.hold("banc")
+        self.standing("banc", notify_ok=False)
+        self.standing("atelier", notify_ok=True)
+        folder = tempfile.mkdtemp(prefix="3568-suspended-")
+        self.addCleanup(shutil.rmtree, folder, ignore_errors=True)
+        lock = os.path.join(folder, "lock")
+        first_started = os.path.join(folder, "first")
+        second_started = os.path.join(folder, "second")
+        overlap = os.path.join(folder, "overlap")
+        first_command = ["python3", "-c", LOCK_CHILD, lock, first_started,
+                         overlap, "20"]
+        second_command = ["python3", "-c", LOCK_CHILD, lock, second_started,
+                          overlap, "0.2"]
+        original_renew = role_run._AlertsLease.renew
+
+        def suspended_renew(lease):
+            # The delegate's renewal is suspended before the server: it never
+            # returns before the lease expires (the other host renews normally).
+            if "atelier" in lease.owner:
+                time.sleep(4.0)
+                return False
+            return original_renew(lease)
+
+        first = {}
+
+        def run_first():
+            with mock.patch.object(role_run, "ALERTS_LEASE_TTL_S", 8.0), \
+                    mock.patch.object(role_run._AlertsLease, "renew",
+                                      suspended_renew):
+                first["result"] = self.run_cli_isolated(
+                    dataclasses.replace(self.cfg, host="atelier"),
+                    self.args(first_command))
+
+        thread = threading.Thread(target=run_first, name="alerts-suspended")
+        thread.start()
+        try:
+            deadline = time.time() + 10.0
+            while time.time() < deadline and not os.path.exists(first_started):
+                time.sleep(0.02)
+            self.assertTrue(os.path.exists(first_started),
+                            "the delegate child did not start")
+            # The holder's route returns: it now selects itself, as soon as
+            # the shared execution lease is free.
+            self.standing("banc", notify_ok=True)
+            # Wait for the database lease to expire. The first child must
+            # already be dead by then, on its local deadline.
+            deadline = time.time() + 15.0
+            while time.time() < deadline:
+                rows = self.db.query(
+                    "SELECT (owner IS NULL OR expires_at < clock_timestamp())"
+                    " AS free FROM merge_locks WHERE target = %s", (ALERTS_KEY,))
+                if rows and rows[0]["free"]:
+                    break
+                time.sleep(0.05)
+            else:
+                self.fail("the shared execution lease never expired")
+            code, _ = self.run_cli_isolated(self.cfg, self.args(second_command))
+            self.assertEqual(code, 0)
+            self.assertTrue(os.path.exists(second_started),
+                            "the next host could not run the pass")
+            self.assertFalse(os.path.exists(overlap),
+                             "two alerts children ran at the same time")
+        finally:
+            thread.join(timeout=15.0)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(first["result"][0], 1)
+
+    def test_a_re_read_past_the_deadline_does_not_start_a_child(self):
+        """cx3 round 2: the local deadline also covers the pre-Popen reads."""
+        self.role()
+        self.hold("banc")
+        self.standing("banc", notify_ok=False)
+        self.standing("atelier", notify_ok=True)
+        folder = tempfile.mkdtemp(prefix="3568-reread-")
+        self.addCleanup(shutil.rmtree, folder, ignore_errors=True)
+        ran = os.path.join(folder, "ran")
+        original = role_run._alerts_delegation
+        calls = {"n": 0}
+
+        def slow_reread(db, report, *, host):
+            calls["n"] += 1
+            # The first read chooses the delegate; the second is the re-read
+            # under the execution lease and blocks past the local deadline.
+            if calls["n"] >= 2:
+                time.sleep(1.2)
+            return original(db, report, host=host)
+
+        with mock.patch.object(role_run, "ALERTS_LEASE_TTL_S", 1.0), \
+                mock.patch.object(role_run, "_alerts_delegation", slow_reread):
+            code, _ = self.run_cli_isolated(
+                dataclasses.replace(self.cfg, host="atelier"),
+                self.args(self.marker_command(ran)))
+        self.assertEqual(code, 1)
+        self.assertGreaterEqual(calls["n"], 2)
+        self.assertFalse(os.path.exists(ran),
+                         "a child started after the local deadline")
+
+#: A child that holds an exclusive `flock` until it dies. A second child that
+#: can take the lock proves the first one is really gone; one that cannot
+#: writes the overlap witness. Used to make "no simultaneous children" a
+#: kernel fact rather than a timing guess.
+LOCK_CHILD = (
+    "import fcntl, os, pathlib, sys, time\n"
+    "lock, started, overlap, seconds = sys.argv[1:5]\n"
+    "handle = open(lock, 'w')\n"
+    "try:\n"
+    "    fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)\n"
+    "except BlockingIOError:\n"
+    "    pathlib.Path(overlap).write_text(str(os.getpid()))\n"
+    "    raise SystemExit(9)\n"
+    "pathlib.Path(started).write_text(str(os.getpid()))\n"
+    "time.sleep(float(seconds))\n"
+)
+
+
+class AlertsDeadlineTest(unittest.TestCase):
+    """A suspended renewal cannot keep the child alive past the lease."""
+
+    def test_a_blocked_renewal_stops_the_child_without_it(self):
+        folder = tempfile.mkdtemp(prefix="3568-deadline-")
+        self.addCleanup(shutil.rmtree, folder, ignore_errors=True)
+        lock = os.path.join(folder, "lock")
+        started = os.path.join(folder, "started")
+        overlap = os.path.join(folder, "overlap")
+
+        class BlockedLease:
+            """No database: the renewal is suspended and never answers."""
+
+            ttl = 1.2
+            kill_grace = 0.2
+
+            def __init__(self):
+                self.acquired = time.monotonic()
+                # conservative local deadline: two thirds of the TTL, so the
+                # child is dead before the lease could be taken at 1.2 s
+                self.deadline = self.acquired + 0.8
+                self.renewing = threading.Event()
+                self.renew_blocked = threading.Event()
+
+            def remaining(self):
+                return self.deadline - time.monotonic()
+
+            def renew(self):
+                self.renewing.set()
+                self.renew_blocked.wait(5.0)
+                return False
+
+        lease = BlockedLease()
+        execution = role_run._AlertsExecution(lease)
+        execution.start()
+        result = {}
+
+        def run_child():
+            result["value"] = role_run._run_under_lease(
+                ["python3", "-c", LOCK_CHILD, lock, started, overlap, "5"],
+                os.environ.copy(), lease, execution)
+
+        thread = threading.Thread(target=run_child, name="blocked-renewal")
+        thread.start()
+        try:
+            deadline = time.time() + 5.0
+            while time.time() < deadline and not os.path.exists(started):
+                time.sleep(0.01)
+            self.assertTrue(os.path.exists(started), "the child did not start")
+            proc = execution.proc
+            deadline = time.time() + 3.0
+            while time.time() < deadline and proc.poll() is None:
+                time.sleep(0.01)
+            self.assertIsNotNone(proc.poll(),
+                                 "the child outlived the local deadline")
+            self.assertLess(time.monotonic(), lease.acquired + 1.2,
+                            "the child was still alive at the database expiry")
+            # The stop did not wait for the renewal: it is still blocked.
+            self.assertTrue(lease.renewing.is_set())
+            self.assertFalse(lease.renew_blocked.is_set())
+            self.assertTrue(thread.is_alive())
+            # The kernel lock is free: a second child would start now.
+            handle = open(lock, "w")
+            try:
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            finally:
+                handle.close()
+        finally:
+            lease.renew_blocked.set()
+            thread.join(timeout=5.0)
+            execution.close()
+        self.assertFalse(thread.is_alive())
+        # The child was stopped by the watchdog (a signal), and the caller
+        # sees the failed execution lease; the wrapper maps it to exit 1.
+        self.assertTrue(result["value"][1])
+        self.assertLess(result["value"][0], 0)
+        self.assertFalse(os.path.exists(overlap))
 
 
 class AlertsUnitTest(unittest.TestCase):
