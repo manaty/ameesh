@@ -270,6 +270,29 @@ class WireContractTest(unittest.TestCase):
                     handoff_contract.validate_effect_receipt(receipt, checked)['ok'],
                     True)
 
+    def test_wire_repository_userinfo_is_refused(self):
+        base = {'host': 'target', 'operation': 'a' * 32,
+                'controller_epoch': 3, 'agent': 'dev', 'owner': 'runner',
+                'lease_epoch': 7, 'step': 'publish',
+                'action_id': 'a' * 32 + ':publish', 'cwd': '/w/source'}
+        for repository in ('https://TOKEN@forge.example/r.git',
+                           'http://TOKEN@forge.example/r.git',
+                           'git+https://TOKEN@forge.example/r.git',
+                           'ssh://TOKEN@forge.example/r.git',
+                           'TOKEN@forge.example:manaty/r.git'):
+            with self.subTest(repository=repository), self.assertRaises(
+                    handoff_contract.ContractError):
+                handoff_contract.validate_effect_request(
+                    dict(base, repository=repository))
+        for repository in ('git@forge.example:manaty/r.git',
+                           'ssh://git@forge.example/manaty/r.git',
+                           'https://forge.example/manaty/r.git'):
+            with self.subTest(repository=repository):
+                self.assertEqual(
+                    handoff_contract.validate_effect_request(
+                        dict(base, repository=repository))['repository'],
+                    repository)
+
     def test_prepare_receipt_refuses_a_target_executor_or_missing_caps(self):
         request = handoff_contract.validate_effect_request({
             'step': 'prepare', 'host': 'target', 'operation': 'a' * 32,
@@ -1538,7 +1561,8 @@ class AdapterTest(PgTestCase):
                            'git+https://TOKEN@forge.example/r.git',
                            'ssh://TOKEN@forge.example/r.git',
                            'ssh://git:secret@forge.example/r.git',
-                           'https://git@forge.example/r.git'):
+                           'https://git@forge.example/r.git',
+                           'TOKEN@forge.example:manaty/r.git'):
             with self.subTest(repository=repository), self.assertRaises(
                     handoffs.HandoffError):
                 handoffs.request(self.db, candidate, repository=repository)
