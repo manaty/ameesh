@@ -2200,10 +2200,17 @@ def render_status(report: dict) -> list[str]:
                          "armed (see the lot's `auto-merge not-armed` note): rerun `ameesh ci "
                          "run %d --full --reason …`" % (sha, lot))
         else:
-            lines.append("  packet carrier: no ci-full request on the frozen head %s — a push "
-                         "run of the packet workflow does not produce the target's required "
-                         "check(s), and nothing merges it: open its PR, then `ameesh ci run %d "
-                         "--full --reason …` (#2813)" % (sha, lot))
+            # #3614 : le journal ne dit pas si la forge impose des checks à la
+            # cible ; sans check imposé (Nexlink), le feu atterrit le porteur
+            # (`fire._carrier_gap`) — la ligne reste conditionnelle.
+            lines.append("  packet carrier: no ci-full request on the frozen head %s — if the "
+                         "target's forge requires checks (ameesh: `tests` on main), a push run "
+                         "of the packet workflow does not produce them and nothing merges it: "
+                         "open its PR if none, then `ameesh ci run %d --full --reason …` "
+                         "(#2813); without required checks (Nexlink), the fire lands it. The "
+                         "journal alone does not tell which: the fire reads the protection and "
+                         "answers `not-ready` with this cause when it applies (#3611)"
+                         % (sha, lot))
     for run in report["runs"]:
         state = _STATUS_FR.get(run["status"], run["status"])
         attempt = int(run.get("run_attempt") or 1)
