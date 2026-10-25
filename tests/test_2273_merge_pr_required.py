@@ -202,6 +202,31 @@ class RequiredChecksRefusalTest(unittest.TestCase):
         self.assertEqual(self.refusal(gh, [_check("tests")],
                                       project=_project(required_checks=("tests",))), "")
 
+    def test_an_empty_declaration_covers_the_nexlink_plan_refusal(self):
+        # #3428 : privé hors GitHub Pro, la forge ne peut pas porter de
+        # protection ; une déclaration vide le dit et merge-pr continue. La
+        # porte reste tenue par le vert de la PR et `ci_required`.
+        gh = FakeGh(error="gh: Upgrade to GitHub Pro or make this repository public to "
+                          "enable this feature. (HTTP 403)")
+        project = _project(required_checks=(), required_checks_declared=True)
+        self.assertEqual(self.refusal(gh, [_check("couverture")], project=project), "")
+
+    def test_an_empty_declaration_does_not_cover_a_rights_refusal(self):
+        gh = FakeGh(error="gh: Resource not accessible by integration (HTTP 403)")
+        project = _project(required_checks=(), required_checks_declared=True)
+        reason = self.refusal(gh, [_check("tests")], project=project)
+        self.assertIn("cannot be proven", reason)
+        self.assertIn("403", reason)
+
+    def test_an_empty_declaration_does_not_dispense_with_a_green_head(self):
+        """#3428 : la déclaration vide ne saute que la lecture de la forge ;
+        la PR doit toujours porter au moins un check conclu et vert. Sans
+        aucun check, `merge-pr` refuse (le cas du paquet 169 à 23:4xZ)."""
+        project = _project(required_checks=(), required_checks_declared=True)
+        with self.assertRaises(merge_pr.MergePrError) as raised:
+            merge_pr._pr_guards(_view([]), 1638, HEAD, "main", project)
+        self.assertIn("not all concluded and green", str(raised.exception))
+
     def test_the_declaration_completes_the_forge_without_weakening_it(self):
         gh = FakeGh(error="gh: Branch not protected (HTTP 404)")
         # la protection ne demande rien : la déclaration seule s'applique

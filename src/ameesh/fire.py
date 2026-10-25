@@ -1149,6 +1149,25 @@ def _read_error(detail: str):
     return land.LandError
 
 
+#: #3428 : refus de **plan** GitHub — la protection de branche et les rulesets
+#: n'existent pas sur un dépôt privé hors GitHub Pro. C'est la preuve d'une
+#: fonctionnalité indisponible, pas d'un jeton sans droits.
+_PLAN_PROTECTION = re.compile(
+    r"(?i)upgrade to github pro|make this repository public to enable this feature")
+
+
+def _plan_unprotected(detail: str) -> bool:
+    """#3428 : le 403 prouve-t-il que la protection est **indisponible** au
+    plan du dépôt, et non que le jeton n'a pas les droits ?
+
+    GitHub répond « Upgrade to GitHub Pro or make this repository public to
+    enable this feature » quand un dépôt privé n'a pas accès à la protection
+    de branche ni aux rulesets : il n'y a alors aucune protection à lire. Un
+    « Resource not accessible by integration » reste un refus de droits, que
+    la déclaration vide d'un projet ne couvre jamais."""
+    return bool(_PLAN_PROTECTION.search(str(detail or "")))
+
+
 def _json_pages(stdout: str, what: str) -> list:
     """Les pages d'une sortie `gh api --paginate` concaténée (`[…][…]`).
 
@@ -1387,10 +1406,20 @@ def required_checks(slug: str | None, target: str, project, *, gh) -> tuple:
     déclaration ne tient pas lieu de preuve (#2344). La déclaration ne peut
     jamais retirer un check que la forge exige : elle s'ajoute. Les noms sont
     exacts de bout en bout : la déclaration `tests ` ne vaut pas le contexte
-    `tests`."""
+    `tests`.
+
+    #3428 : une déclaration **vide** (`"required_checks": []`) ne couvre que
+    le 403 de **plan** GitHub, qui prouve que la protection est indisponible
+    sur ce dépôt (privé hors Pro) — il n'y a alors aucune protection à lire.
+    Un 403 de droits, une protection lisible ou tout autre échec gardent le
+    refus : une déclaration vide n'affaiblit jamais une source qui existe."""
     declared = tuple((str(name), None) for name in
                      (getattr(project, "required_checks", ()) or ())
                      if str(name).strip())
+    # #3428 : `[]` déclaré est une déclaration, pas une absence ; elle ne vaut
+    # que pour le 403 de plan, prouvé source par source ci-dessous.
+    empty_declared = (not declared
+                      and bool(getattr(project, "required_checks_declared", False)))
     if not target:
         if declared:
             return declared
@@ -1400,10 +1429,12 @@ def required_checks(slug: str | None, target: str, project, *, gh) -> tuple:
                  lambda: _ruleset_required(slug, target, gh=gh)):
         try:
             forged.extend(read())
-        except land.ForbiddenLandError:
+        except land.ForbiddenLandError as exc:
             # #2344 : seul un 403 prouvé autorise la déclaration à tenir lieu
             # de cette source ; sans déclaration, la lecture refuse.
-            if not declared:
+            # #3428 : une déclaration vide couvre le seul 403 de plan, qui
+            # prouve l'absence de protection ; un 403 de droits refuse.
+            if not declared and not (empty_declared and _plan_unprotected(str(exc))):
                 raise
         except land.TransientLandError:
             # #2306 : un échec passager n'est pas une source absente ; la
