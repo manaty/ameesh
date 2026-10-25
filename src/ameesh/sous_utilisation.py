@@ -1009,9 +1009,20 @@ def idle_agents(listing: list, now: float, idle_s: float, *,
     serait donc jamais « au repos » (N9). La **prise** de lots et les alertes
     de sous-utilisation s'en servent ; la remise (`handoff.hand`, L233b) garde
     son contrat d'origine, « au repos depuis au moins `idle_s` », qu'un relevé
-    sans `actionable_lots` (bancs, appels anciens) impose de toute façon."""
+    sans `actionable_lots` (bancs, appels anciens) impose de toute façon.
+
+    #3480 : un agent éphémère (`ameesh agent spawn --ttl`) n'est jamais au
+    repos. C'est un instrument de mesure, pas une capacité : il ne prend rien
+    (L119, L165, propositions #1677, remise L233b) et ne fait pas lever une
+    alerte de repos (`idle_capacity`, `backlog_empty`). La garde est ici, dans
+    le seul calcul du repos, pour que ces appelants l'héritent au lieu de la
+    répéter chacun ; la réassignation manuelle reste possible, comme pour la
+    désignation (#3411)."""
     idle = []
     for row in listing:
+        # #3480 : vivant ou expiré, un éphémère n'est pas une capacité.
+        if row.get("ephemeral"):
+            continue
         # un agent `externe` n'est jamais compté — dont le chat du
         # propriétaire (L123), qui n'a ni exécuteur ni lot
         if (row.get("mode") or "execute") != "execute" or _state(row) != "idle":
