@@ -279,7 +279,8 @@ def assemble(cfg, *, notify=None) -> Assembly:
         # settings stay the reference: anything but the pin changing is a
         # restart, never a silent half-reload of a running service.
         return reload(passages, expected=settings, host=cfg.host,
-                      config_path=getattr(cfg, "config_path", "") or "")
+                      config_path=getattr(cfg, "config_path", "") or "",
+                      automatic=True)
     return Assembly(settings, passages, lease, "%s mode, %d passage(s), %s"
                     % (settings.mode, len(passages), gate), role=settings.role,
                     refresh=refresh)
@@ -355,7 +356,8 @@ def _same_assembly(expected, fresh):
                 _restart("train.projects.%s" % name, field, old, new)
 
 
-def reload(passages, *, expected=None, load=None, host=None, config_path=None):
+def reload(passages, *, expected=None, load=None, host=None, config_path=None,
+           automatic=False):
     """#3366: re-read the effective ``train.projects.<p>.canon_commit``.
 
     The service used to keep the pin assembled at startup, so a requalified pin
@@ -389,6 +391,17 @@ def reload(passages, *, expected=None, load=None, host=None, config_path=None):
                                  % (settings.host, this_host or "?"))
     if expected is not None:
         _same_assembly(expected, settings)
+    if automatic:
+        from . import train_requalify
+        from .scoped_db import ScopedDb
+        db = ScopedDb(fresh)
+        try:
+            for spec in settings.projects:
+                train_requalify.automatic(fresh, db, spec.name)
+        finally:
+            db.close()
+        return reload(passages, expected=expected, load=load, host=host,
+                      config_path=config_path)
     by_name = {spec.name: spec for spec in settings.projects}
     pending = []
     for passage in passages or ():
@@ -428,13 +441,13 @@ def canon_diff(canon, pin, gate):
         raise ConfigurationError("canon requalification needs two full commit ids")
     if not os.path.isdir(canon):
         raise ConfigurationError("canon directory not found: %s" % canon)
-    proc = resolutions._run(canon, "diff", "--name-only", pin, gate)
+    proc = resolutions._run(canon, "diff", "--no-renames", "--name-only", "-z", pin, gate, "--")
     if proc.returncode:
         raise ConfigurationError(
             "cannot read the canon diff %s..%s in %s: %s"
             % (pin[:12], gate[:12], canon,
-               " ".join((proc.stderr or proc.stdout or "").split())[:240]))
-    return [line.strip() for line in resolutions._text(proc).splitlines() if line.strip()]
+               resolutions._err(proc)[:240]))
+    return [name for name in proc.stdout.decode("utf-8", "strict").split("\0") if name]
 
 
 def _passage(cfg, spec: ProjectConfig, mode, report):

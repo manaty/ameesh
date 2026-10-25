@@ -2,8 +2,8 @@
 """#3366 — the pilot's mechanical requalification of the train's canon pin.
 
 The train reads its rules at the commit pinned in the host configuration
-(``train.projects.<p>.canon_commit``). The pin never follows the merge gate by
-itself (#1467). When the canon has moved and its diff does not touch the two
+(``train.projects.<p>.canon_commit``). The automatic host service follows the
+audited gate only through this guard (#3483). When the canon has moved and its diff does not touch the two
 files that carry the train's rules — ``processus/mecanique.yaml`` and
 ``federation.yaml`` — the move is mechanical: the command below writes the
 gate's audited commit where the pin is declared, and traces the gesture on the
@@ -18,6 +18,8 @@ in a file that inherits it. Each write is atomic.
 from __future__ import annotations
 
 import dataclasses
+import fcntl
+from datetime import datetime, timezone
 import json
 import os
 import tempfile
@@ -156,12 +158,18 @@ def _plan(cfg, db, project, *, gate_reader=None):
                 "changed": [], "files": [path for path, _raw in files]}, []
     for path, raw in files:
         _validate(spec, path, raw, project, gate)
-    changed = train_assembly.canon_diff(canons.pop(), pin, gate)
+    canon = canons.pop()
+    from . import resolutions
+    ancestor = resolutions._run(canon, "merge-base", "--is-ancestor", pin, gate)
+    if ancestor.returncode:
+        raise RequalifyError("refused: gate is not a descendant of the pin; "
+                             "reviewed requalification required")
+    changed = train_assembly.canon_diff(canon, pin, gate)
     guard = [name for name in changed if name in train_assembly.REQUALIFY_GUARD]
     if guard:
         raise RequalifyError(
             "refused: the canon diff %s..%s touches %s — a rules change is not "
-            "a mechanical requalification"
+            "a mechanical requalification; reviewed requalification required"
             % (pin[:12], gate[:12], ", ".join(guard)))
     return {"state": "requalified", "project": project, "pin": pin, "gate": gate,
             "changed": changed, "files": [path for path, _raw in files]}, files
@@ -202,12 +210,12 @@ def _write(path, raw):
     _replace(path, (json.dumps(raw, ensure_ascii=False, indent=2) + "\n").encode("utf-8"))
 
 
-def apply(cfg, db, project, *, lot, actor, gate_reader=None):
+def apply(cfg, db, project, *, lot, actor, gate_reader=None, record=None):
     """Requalify the pin, write every declaring file, trace on the lot."""
     result, files = _plan(cfg, db, project, gate_reader=gate_reader)
     if result["state"] == "aligned":
         return result
-    if work.get(db, int(lot)) is None:
+    if record is None and work.get(db, int(lot)) is None:
         raise RequalifyError("lot #%s not found: no trace target" % lot)
     originals = [(path, _bytes(path)) for path, _raw in files]
     written = []
@@ -233,7 +241,10 @@ def apply(cfg, db, project, *, lot, actor, gate_reader=None):
             % (project, result["pin"][:12], result["gate"][:12],
                ", ".join(result["changed"]) or "none", ", ".join(written)))
     try:
-        work.note(db, int(lot), text, actor=actor)
+        if record is None:
+            work.note(db, int(lot), text, actor=actor)
+        else:
+            record(result)
     except BaseException:
         # The trace is part of the gesture: without it, put every file back so
         # a retry performs the move and the note together, never a silent pin.
@@ -244,7 +255,7 @@ def apply(cfg, db, project, *, lot, actor, gate_reader=None):
                 pass
         raise
     result["files"] = written
-    result["lot"] = int(lot)
+    result["lot"] = int(lot) if lot is not None else None
     result["actor"] = actor
     return result
 
@@ -256,3 +267,32 @@ def execute(cfg, db, project, *, lot, actor, dry_run=False, gate_reader=None):
         result["dry_run"] = True
         return result
     return apply(cfg, db, project, lot=lot, actor=actor, gate_reader=gate_reader)
+
+
+def automatic(cfg, db, project, *, gate_reader=None):
+    """#3483: follow the audited gate independently on every train host.
+
+    All local profiles follow. The durable host journal is required: a write
+    failure rolls the pin writes back. A host lock serializes executor profiles.
+    """
+    directory = os.path.dirname(os.path.abspath(cfg.config_base or cfg.config_path))
+    with open(os.path.join(directory, ".train-canon.lock"), "a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        def record(result):
+            row = dict(result, host=cfg.host, actor="train", event="canon-requalified",
+                       at=datetime.now(timezone.utc).isoformat(),
+                       guard=list(train_assembly.REQUALIFY_GUARD))
+            with open(os.path.join(directory, "train-canon.jsonl"), "a+",
+                      encoding="utf-8") as journal:
+                journal.seek(0, os.SEEK_END)
+                before = journal.tell()
+                try:
+                    journal.write(json.dumps(row, ensure_ascii=False) + "\n")
+                    journal.flush()
+                    os.fsync(journal.fileno())
+                except BaseException:
+                    journal.seek(before)
+                    journal.truncate()
+                    raise
+        return apply(cfg, db, project, lot=None, actor="train",
+                     gate_reader=gate_reader, record=record)
