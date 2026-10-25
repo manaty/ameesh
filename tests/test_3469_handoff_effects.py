@@ -550,6 +550,32 @@ class EffectsTest(RequestMixin, unittest.TestCase):
             action_id='b' * 32 + ':publish'))
         self.assertIn(detached['reason'], ('branch', 'unpublished'))
 
+    def test_publish_refuses_an_absent_remote_branch_without_an_intent(self):
+        # A branch that exists locally but not on the remote used to make
+        # ``ls-remote --exit-code`` exit 2: an Uncertain that stranded the
+        # intent for H3 reconciliation. It must be a definitive refusal.
+        git('checkout', '-q', '-b', 'topic', cwd=self.fx.source,
+            home=self.fx.root)
+        receipt = self.fx.effects.perform(self.request(self.fx, 'publish'))
+        self.assertIs(receipt['ok'], False)
+        self.assertEqual(receipt['reason'], 'unpublished')
+        directory = self.fx.root / 'state' / 'operations' / ('a' * 32)
+        self.assertFalse((directory / 'publish.intent.json').exists())
+        # publish is read-only: a failed remote read is also a retryable
+        # refusal, never an ambiguous intent.
+        real = self.fx.effects.git.run
+
+        def run(account, home, cwd, args, *, timeout=20, check=True):
+            if args and args[0] == 'ls-remote':
+                raise companion.Uncertain('command:unavailable')
+            return real(account, home, cwd, args, timeout=timeout, check=check)
+
+        with mock.patch.object(self.fx.effects.git, 'run', side_effect=run):
+            failed = self.fx.effects.perform(self.request(self.fx, 'publish'))
+        self.assertIs(failed['ok'], False)
+        self.assertEqual(failed['reason'], 'unpublished')
+        self.assertFalse((directory / 'publish.intent.json').exists())
+
     def test_transfer_checks_out_the_exact_commit_and_never_copies_a_cache(self):
         (self.fx.home / '.credentials.yaml').write_text('source token')
         receipt = self.fx.effects.perform(self.request(self.fx, 'transfer'))

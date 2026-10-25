@@ -1023,11 +1023,16 @@ class HostEffects:
         if not _SHA.fullmatch(commit):
             raise Refused('commit')
         try:
+            # Without ``--exit-code`` a branch absent from the remote is an
+            # empty, successful read: ``unpublished`` is a definitive,
+            # retryable refusal. A failed remote read is read-only too, so it
+            # is also a refusal: this step never leaves an ambiguous intent
+            # that only H3 reconciliation could settle.
             remote = self._git(entry, cwd,
-                               ['ls-remote', '--exit-code', 'origin',
+                               ['ls-remote', 'origin',
                                 'refs/heads/' + branch])
         except Uncertain:
-            raise Uncertain('publish:remote') from None
+            raise Refused('unpublished') from None
         first = remote.split()[0] if remote.split() else ''
         if first != commit:
             raise Refused('unpublished')
