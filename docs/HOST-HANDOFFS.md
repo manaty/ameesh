@@ -166,6 +166,8 @@ home, harness cache or OAuth token. `prepare` reads the destination's pinned
 release receipt, the enrolled tools and secret aliases, and the unit's finite
 memory caps; `stop_source` stops only the enrolled unit and proves its cgroup
 is quiescent. None of these steps starts or enables the destination executor.
+`publish` is read-only: a branch absent from the remote or a failed remote
+read is a definitive, retryable refusal, never an ambiguous intent.
 
 The controller-side companion checks the durable operation `pending_effect`,
 the placement/lease, both canon states, the destination gate and the existing
