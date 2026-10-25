@@ -171,9 +171,12 @@ def warning(cfg, db, lot: int, actor: str) -> str:
 
     Vide pour l'auteur du lot (il corrige librement), pour un acteur qui n'est
     pas relecteur désigné de ce gel, et pour tout état qui n'est pas `short`.
-    La lecture est locale (`fetch=False`) : elle ne retarde ni ne refuse le
-    verdict, et une erreur inattendue rend le silence — le contrôle reste une
-    aide, jamais une porte.
+    La lecture rafraîchit la cible hors transaction (`fetch=True`) : `prepare`
+    en a besoin pour lire le diff gelé quand la cible est une branche distante
+    (`review_target.resolve` refuse une cible non rafraîchie avec
+    `fetch=False`), et un aperçu qui ne lit jamais la cible restait muet. Un
+    échec de lecture rend le silence : le contrôle reste une aide, jamais une
+    porte, et il ne refuse ni ne retarde le verdict au-delà du fetch borné.
     """
     name = (actor or "").strip()
     if not name:
@@ -191,7 +194,7 @@ def warning(cfg, db, lot: int, actor: str) -> str:
             db, item, freeze, str(item.get("assignee") or ""))
         if name not in designated:
             return ""
-        room = check(cfg, db, int(lot), name, fetch=False)
+        room = check(cfg, db, int(lot), name, fetch=True)
     except Exception:  # noqa: BLE001 - un aperçu ne bloque jamais le verdict
         return ""
     if room.get("state") != STATE_TOO_TIGHT:

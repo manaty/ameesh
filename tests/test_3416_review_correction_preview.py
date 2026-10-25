@@ -11,6 +11,8 @@ from __future__ import annotations
 import argparse
 import contextlib
 import io
+import os
+import subprocess
 import types
 import unittest
 from unittest import mock
@@ -19,6 +21,10 @@ from ameesh import mesh_cli
 from ameesh import review_correction as rc
 from ameesh import review_designation
 from ameesh import review_designation_activation
+from ameesh import work
+
+from .support import PgTestCase
+from .test_2447_review_designation_activation import _ActivationFixture
 
 FAMILIES = ["codex", "deepseek", "claude"]
 WRITER = [{"name": "redacteur", "family": "claude"}]
@@ -192,11 +198,11 @@ class DesignatedReviewerWarningTest(unittest.TestCase):
                 mock.patch.object(rc, "check", return_value=result) as checked:
             return rc.warning(None, None, 3186, actor), checked
 
-    def test_a_designated_reviewer_is_warned_without_a_network_read(self):
+    def test_a_designated_reviewer_is_warned_with_the_target_refreshed(self):
         advice, checked = self.warn("lecteur-codex")
         self.assertIn(rc.BACK_TO_AUTHOR, advice)
         self.assertIn("--if-corrector lecteur-codex", advice)
-        self.assertEqual(checked.call_args.kwargs.get("fetch"), False)
+        self.assertEqual(checked.call_args.kwargs.get("fetch"), True)
 
     def test_the_author_is_never_warned(self):
         advice, checked = self.warn("redacteur", holders=("lecteur-codex",))
@@ -214,6 +220,40 @@ class DesignatedReviewerWarningTest(unittest.TestCase):
     def test_an_unreadable_journal_never_raises(self):
         with mock.patch.object(rc.work, "get", side_effect=RuntimeError("db")):
             self.assertEqual(rc.warning(None, None, 3186, "lecteur-codex"), "")
+
+
+class RemoteTargetWarningTest(_ActivationFixture, PgTestCase):
+    """B1 cx2 : le témoin intégré avec une cible `main` réellement distante.
+
+    `warning` appelait `check(fetch=False)` ; `prepare` sans cible préparée
+    passait alors par `review_target.resolve(main, fetch=False)`, qui refuse
+    une branche distante non rafraîchie : l'avertissement restait muet sur un
+    verdict bloquant. Ici le dépôt a un vrai `origin`, la cible est `main`, et
+    `prepare` / `prepare_target` ne sont pas mockés.
+    """
+
+    def setUp(self):
+        super().setUp()
+        origin = os.path.join(self.tmp, "origin-cible.git")
+        subprocess.run(["git", "init", "--bare", "-q", origin], check=True)
+        self.repo.git("branch", "-f", "main", self.base)
+        self.repo.git("remote", "add", "origin", origin)
+        self.repo.git("push", "-q", "origin", "main")
+        self.db.execute("UPDATE work_items SET branch_target = 'main' WHERE id = %s",
+                        (self.lot,))
+        self.item = work.get(self.db, self.lot)
+
+    def test_the_blocked_verdict_warning_reads_a_remote_target(self):
+        outcome: dict = {}
+        target = review_designation_activation.prepare_target(
+            self.cfg, self.db, self.item, self.frozen, fetch=True)
+        self.assertNotIsInstance(target, review_designation_activation.Unavailable,
+                                 target)
+        hook = review_designation_activation.hook(self.cfg, outcome, target=target)
+        self.freeze(hook=hook)
+        self.assertEqual(outcome.get("state"), review_designation.DESIGNATED, outcome)
+        advice = rc.warning(self.cfg, self.db, self.lot, "r2")
+        self.assertIn(rc.BACK_TO_AUTHOR, advice)
 
 
 class CliWiringTest(unittest.TestCase):
