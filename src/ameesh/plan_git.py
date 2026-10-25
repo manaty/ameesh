@@ -85,8 +85,8 @@ import tempfile
 from . import planned_waits
 from . import storage
 from . import work as work_mod
-from .canon import (FETCH_TIMEOUT, GitError, NO_LAZY_FETCH, _git, _norm_url,
-                    git_fetch)
+from .canon import (FETCH_TIMEOUT, GIT_TIMEOUT, GitError, NO_LAZY_FETCH, _git,
+                    _norm_url, git_fetch)
 
 #: cible historique du relevé de contenu (`--target` explicite) ; sans lui,
 #: c'est la cible déclarée du lot ou du dépôt qui fait foi (#1005)
@@ -198,6 +198,253 @@ def local_commit(repo: str, rev: str, *,
     if proc.returncode != 0:
         return None
     return proc.stdout.decode("utf-8", "replace").strip()
+
+
+#: #3399 : borner le relevé d'accessibilité d'un gel (revwalk sur les refs).
+REACHABLE_TIMEOUT_S = 30.0
+#: #3399 B1 : nombre de pointes heads/tags non locales qu'on accepte de
+#: rapatrier pour prouver l'absence ; au-delà, la preuve est impossible.
+REMOTE_TIP_FETCH_BUDGET = 16
+#: #3399 B1 (cx1) : les autres refs annoncées (`refs/archive/…`,
+#: `refs/pull/N/head`, résolutions) gardent aussi des descendants d'un gel
+#: après un force-push. Leur ascendance se prouve donc aussi, avec un budget
+#: séparé : une forge en annonce des milliers, et au-delà de ce nombre la
+#: preuve d'absence reste impossible (`None`, jamais un `False` déduit des
+#: refs ignorées).
+REMOTE_EXTRA_TIP_FETCH_BUDGET = 512
+
+
+def ref_reachable(repo: str, rev: str, *,
+                  timeout: float | None = REACHABLE_TIMEOUT_S) -> bool | None:
+    """`rev` est-il contenu par une **ref** de `repo` (#3399) ?
+
+    `True` : au moins une ref locale (`refs/heads`, `refs/remotes`,
+    `refs/tags`...) contient le commit. `False` : l'objet est présent mais
+    aucune ref ne le contient — un « pendant » laissé par un force-push, qui
+    n'est plus accessible par une ref. `None` : dépôt ou SHA illisible (objet
+    absent au sens de git, git en échec, délai dépassé) : l'appelant ne conclut
+    pas (le gate refuse, la lecture garde le doute).
+
+    #2989 N1 distinguait la présence de l'objet (`freeze_checks.commit_in`,
+    un `rev-parse` qui lit un objet pendant) de son accessibilité. #3399 : un
+    force-push retire le commit de toute ref sans l'élaguer ; le remplacer ne
+    doit donc plus être refusé par la seule présence dans l'ODB. La lecture
+    est locale et sans fetch paresseux (`for-each-ref --contains`, un seul
+    processus) ; un délai ou un dépôt illisible rend `None`, jamais `False`.
+
+    Ne voit que les refs **locales** : les refs distantes non rapatriées
+    (toute l'annonce : tags, branches hors refspec, `refs/archive/…`,
+    `refs/pull/N/head`) sont couvertes par [`remote_reachable`] (#3399 B1)."""
+    rev = str(rev or "").strip()
+    if not repo or not rev or rev.startswith("-") or not os.path.isdir(repo):
+        return None
+    bound = {} if timeout is None else {"timeout": timeout}
+    try:
+        proc = _git(repo, "for-each-ref", "--contains=" + rev,
+                    "--format=%(refname)", env_extra=NO_LAZY_FETCH, **bound)
+    except (GitError, OSError):
+        return None
+    if proc.returncode != 0:
+        return None
+    return bool(proc.stdout.strip())
+
+
+def _history_complete(repo: str) -> bool:
+    """Le dépôt porte-t-il une histoire complète (ni shallow ni partielle) ?
+
+    Une ascendance ne se prouve que sur une histoire complète : dans un clone
+    superficiel ou partiel, l'absence d'un ancêtre ne prouve pas qu'il n'est
+    pas dans la ref. Un dépôt illisible rend False (le doute refuse)."""
+    try:
+        shallow = _out(repo, "rev-parse", "--is-shallow-repository")
+        if str(shallow or "").strip().lower() == "true":
+            return False
+        promisor = _out(repo, "config", "--get-regexp", r"^remote\..*\.promisor$")
+        return not str(promisor or "").strip()
+    except Exception:  # noqa: BLE001 - dépôt illisible : preuve impossible
+        return False
+
+
+def _remote_tips(repo: str, remote: str, *,
+                 timeout: float | None = FETCH_TIMEOUT
+                 ) -> tuple[list[str], list[str]] | None:
+    """Les pointes (commits, tags pelées) de **toutes** les refs annoncées.
+
+    `ls-remote` lit l'annonce de la forge, **indépendamment du refspec de
+    fetch local** : une ref non rapatriée (tag, branche hors refspec, mais
+    aussi `refs/pull/N/head`, `refs/archive/…`) reste visible (#3399).
+    Les tags annotés sont remplacés par leur cible pelée (`^{}`).
+
+    Rend `(toutes, heads_tags)` : `toutes` sert à l'égalité exacte de pointe
+    et à l'**ascendance** sur l'annonce entière (sans fetch pour l'égalité) ;
+    `heads_tags` distingue les refs à l'ancien budget d'ascendance (16) des
+    autres (`refs/pull`, `refs/archive`, résolutions), qui ont le leur (#3399
+    B1 cx1) : une forge en annonce des milliers, et une preuve d'absence ne se
+    déduit jamais d'une ref ignorée. `None` si l'annonce est illisible : la
+    preuve d'absence est alors impossible."""
+    try:
+        proc = _git(repo, "ls-remote", "--", remote, timeout=timeout)
+    except (GitError, OSError):
+        return None
+    if proc.returncode != 0:
+        return None
+    peeled: dict[str, str] = {}
+    refs: list[tuple[str, str]] = []
+    for line in proc.stdout.decode("utf-8", "replace").splitlines():
+        fields = line.split("\t", 1)
+        if len(fields) != 2:
+            continue
+        sha, ref = fields[0].strip().lower(), fields[1].strip()
+        if not sha or not ref:
+            continue
+        if ref.endswith("^{}"):
+            peeled[ref[:-3]] = sha
+        else:
+            refs.append((sha, ref))
+    all_tips: list[str] = []
+    all_seen: set[str] = set()
+    heads_tags: list[str] = []
+    heads_seen: set[str] = set()
+    for sha, ref in refs:
+        tip = peeled.get(ref, sha)
+        if tip not in all_seen:
+            all_seen.add(tip)
+            all_tips.append(tip)
+        if ref.startswith(("refs/heads/", "refs/tags/")) \
+                and tip not in heads_seen:
+            heads_seen.add(tip)
+            heads_tags.append(tip)
+    return all_tips, heads_tags
+
+
+def remote_reachable(repo: str, rev: str, remote: str = "origin", *,
+                     timeout: float | None = FETCH_TIMEOUT,
+                     budget: int = REMOTE_TIP_FETCH_BUDGET,
+                     extra_budget: int = REMOTE_EXTRA_TIP_FETCH_BUDGET
+                     ) -> bool | None:
+    """`rev` est-il contenu par une **ref distante** de `remote` ?
+
+    #3399 : `refresh_clone` ne rapatrie que le refspec configuré et jamais
+    les tags (`fetch --no-tags`) ; il ne prouve donc pas l'absence de toute
+    ref distante. On lit l'annonce **entière** (`ls-remote`, indépendante du
+    refspec), puis :
+
+    - une pointe (ou un tag pelé) **égale** au commit prouve qu'il est
+      accessible, même sans l'objet local — sur **toutes** les refs annoncées,
+      `refs/pull/N/head` et `refs/archive/…` comprises ;
+    - l'**ascendance** se prouve sur **toutes** les pointes annoncées : une
+      pointe locale est jugée par `merge-base --is-ancestor` ; une pointe
+      absente est rapatriée par SHA exact (`--no-tags`, sans écrire de ref),
+      dans la limite de `budget` pour heads/tags et de `extra_budget` pour les
+      autres refs (`refs/pull`, `refs/archive`, résolutions). Une ref hors
+      heads/tags qui pointe un **descendant** du gel le rend donc accessible
+      (#3399 B1 cx1) ;
+    - un nombre de pointes à rapatrier au-delà de son budget, un `ls-remote`
+      ou un fetch illisible, un dépôt shallow/partiel : `None` (preuve
+      impossible, l'appelant refuse). Aucune ref annoncée n'est ignorée sans
+      que le doute soit rendu : l'absence n'est jamais déduite d'une ref non
+      lue.
+
+    Rend True (accessible), False (aucune ref distante ne le contient, prouvé)
+    ou None (vérification impossible)."""
+    full = local_commit(repo, rev) or full_commit_id(rev)
+    if not full:
+        return None
+    found = _remote_tips(repo, remote, timeout=timeout)
+    if found is None:
+        return None
+    all_tips, heads_tags = found
+    if full in all_tips:
+        return True
+    if not _history_complete(repo):
+        return None                 # l'ascendance ne se prouve pas
+    # Une pointe déjà pointée par une ref locale est couverte par
+    # `ref_reachable` (False ici) : inutile de la rejouer, et une forge peut
+    # annoncer des milliers de branches. Les autres pointes, **toutes refs
+    # confondues**, sont jugées par leur ascendance.
+    try:
+        listing = _out(repo, "for-each-ref",
+                       "--format=%(objectname) %(*objectname)")
+    except Exception:  # noqa: BLE001 - refs illisibles : preuve impossible
+        return None
+    if listing is None:
+        return None
+    local: set[str] = set()
+    for line in str(listing).splitlines():
+        local.update(line.split())
+    candidates = [tip for tip in all_tips if tip not in local]
+    if not candidates:
+        return False
+    # Présence locale en un seul processus (`cat-file --batch-check`), puis
+    # ascendance. Un objet absent est rapatrié par SHA exact, dans la limite
+    # de son budget (heads/tags ou autres refs).
+    try:
+        proc = _git(repo, "cat-file", "--batch-check",
+                    stdin=("\n".join(candidates) + "\n").encode())
+    except (GitError, OSError):
+        return None
+    if proc.returncode != 0:
+        return None
+    kinds: dict[str, str] = {}
+    for line in proc.stdout.decode("utf-8", "replace").splitlines():
+        fields = line.split()
+        if len(fields) >= 2:
+            kinds[fields[0].strip().lower()] = fields[1].strip()
+    heads_set = set(heads_tags)
+    pending_heads: list[str] = []
+    pending_extra: list[str] = []
+    for tip in candidates:
+        kind = kinds.get(tip)
+        if kind is None:
+            return None             # réponse incohérente : preuve impossible
+        if kind == "missing":
+            (pending_heads if tip in heads_set else pending_extra).append(tip)
+            continue
+        if kind == "tag":
+            commit = local_commit(repo, tip)
+            if commit is None:
+                (pending_heads if tip in heads_set else pending_extra).append(tip)
+                continue
+        elif kind == "commit":
+            commit = tip
+        else:
+            continue                # arbre/blob : ne contient aucun commit
+        if commit == full:
+            return True
+        ancestor = _is_ancestor_checked(repo, full, commit)
+        if ancestor is None:
+            return None             # histoire illisible : doute, jamais absence
+        if ancestor:
+            return True
+    if not pending_heads and not pending_extra:
+        return False
+    if len(pending_heads) > budget:
+        return None                 # trop de pointes heads/tags inconnues
+    if len(pending_extra) > extra_budget:
+        return None                 # trop d'autres refs inconnues : doute
+    pending = pending_heads + pending_extra
+    for start in range(0, len(pending), 64):
+        chunk = pending[start:start + 64]
+        try:
+            proc = _git(repo, "fetch", "--quiet", "--no-tags",
+                        "--no-write-fetch-head", "--", remote, *chunk,
+                        timeout=timeout)
+        except (GitError, OSError):
+            return None
+        if proc.returncode != 0:
+            return None
+    for tip in pending:
+        commit = local_commit(repo, tip)
+        if commit is None:
+            return None             # pointe rapatriée illisible : doute
+        if commit == full:
+            return True
+        ancestor = _is_ancestor_checked(repo, full, commit)
+        if ancestor is None:
+            return None             # histoire illisible après fetch : doute
+        if ancestor:
+            return True
+    return False
 
 
 def _patch_ids(repo: str, *log_args: str) -> dict[str, str]:
@@ -2208,6 +2455,20 @@ def _off_target_citations(repo: str, lot: int, row: dict, all_merges: list,
 def _is_ancestor(repo: str, sha: str, ref: str) -> bool:
     """`git merge-base --is-ancestor` : une commande, sans lecture d'objet."""
     return _git(repo, "merge-base", "--is-ancestor", sha, ref).returncode == 0
+
+
+def _is_ancestor_checked(repo: str, sha: str, ref: str) -> bool | None:
+    """`merge-base --is-ancestor` en trois états : True, False, None.
+
+    Git sort **1** aussi bien pour « pas ancêtre » que pour une histoire
+    illisible (objet manquant) ; dans le second cas il écrit sur stderr
+    (`error: Could not read <objet>`). Le code seul confondrait donc absence
+    et panne de lecture (#3399 B2 cx1). Toute sortie d'erreur, tout code hors
+    0/1, est un doute : l'appelant refuse au lieu de conclure à l'absence."""
+    proc = _git(repo, "merge-base", "--is-ancestor", sha, ref)
+    if proc.stderr.strip() or proc.returncode not in (0, 1):
+        return None
+    return proc.returncode == 0
 
 
 def _target_tip_at(repo: str, target: str, when) -> str | None:

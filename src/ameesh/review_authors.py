@@ -34,7 +34,10 @@ auteurs, avec les mêmes exceptions du canon §2 :
   même chemin (#2994/#2614) ; une lecture impossible, elle, conserve toujours
   l'auteur. Un gel antérieur absent du clone de lecture est demandé à la forge
   (`origin`) par SHA exact, quel que soit l'appelant (#3147) : le résultat de
-  la porte ne dépend pas du clone ;
+  la porte ne dépend pas du clone. Un gel **déclaré remplacé** dont l'objet
+  n'est plus contenu par une ref (objet pendant d'un force-push, #3399) garde
+  ses auteurs connus dont le contenu survit ; seuls ses inconnus cessent de
+  bloquer. Le refus fermé B5 ne vaut que pour un gel encore accessible ;
 * un commit **déjà dans la cible** au moment de la lecture ne compte ni comme
   auteur ni comme tiers du lot (#3116) : la plage reportée d'un ancien gel,
   calculée avant un rebase, peut contenir du develop déjà relu sous son propre
@@ -1734,7 +1737,8 @@ def _freeze_reference(db, item: Mapping, freeze: Mapping, families) -> dict:
 def _prior_reading(db, item: Mapping, freeze: Mapping, commits: Sequence[str],
                    repo: str, families, *, provider=None,
                    strict: bool = False, ignore_missing=None, target: str = "",
-                   head: str = "", base: str = "", cache: Optional[dict] = None
+                   head: str = "", base: str = "", cache: Optional[dict] = None,
+                   ignore_unknown: bool = False
                    ) -> tuple[dict, dict, dict, list]:
     """`(auteurs, commits_écrits, corrections, inconnus)` d'un gel antérieur.
 
@@ -1750,7 +1754,13 @@ def _prior_reading(db, item: Mapping, freeze: Mapping, commits: Sequence[str],
     #3116 : `target` est la cible au moment de la lecture. Ses commits ne
     comptent ni comme auteurs ni comme tiers. Hors cible, un inconnu qui n'est
     plus ancêtre de `head` et dont le contenu ne survit pas ne bloque plus
-    (`_survives_rewrite`) ; `cache` partage la preuve de contenu."""
+    (`_survives_rewrite`) ; `cache` partage la preuve de contenu.
+
+    `ignore_unknown` (#3399, avis auditeur) : un gel **déclaré remplacé** et
+    hors de toute ref garde ses auteurs **connus** dont le contenu survit ; seuls
+    ses inconnus (commit sans reçu ni attribution) cessent de bloquer. Un reçu
+    contradictoire (`record_unreadable`) reste bloquant : ce n'est pas une
+    famille inconnue mais une provenance invalide."""
     reference = _freeze_reference(db, item, freeze, families)
     author_name = str(reference.get("name") or "").strip()
     author_family = str(reference.get("family") or "")
@@ -1764,7 +1774,11 @@ def _prior_reading(db, item: Mapping, freeze: Mapping, commits: Sequence[str],
 
     def record_unknown(value: str) -> None:
         """Un inconnu ne bloque que s'il compte encore pour la tête (#3116),
-        et qu'il n'est pas dispensé comme obsolete (#3301)."""
+        et qu'il n'est pas dispensé comme obsolete (#3301). #3399 : un inconnu
+        d'un gel remplacé et pendant ne bloque plus (ses auteurs connus sont
+        lus par la même passe)."""
+        if ignore_unknown:
+            return
         if not _survives_rewrite(repo, head, value, cache, base, target):
             return
         if ignore_missing is not None and ignore_missing(value):
@@ -1907,9 +1921,14 @@ def _superseded_freeze_ids(freezes: Sequence[Mapping]) -> set[int]:
 
     La marque est écrite par `ameesh work milestone frozen --supersedes <id>`
     (jamais recopiée d'une note d'appelant) : elle vaut pour un gel dont le SHA
-    n'existe nulle part, le cas d'un gel fantôme écrit avant la validation de
-    la CLI. Elle ne dispense jamais de lire un gel encore présent dans le
-    dépôt : le refus fermé de #2924 B5 reste la règle quand le contenu existe."""
+    n'existe nulle part (le cas d'un gel fantôme écrit avant la validation de
+    la CLI) ou dont l'objet, laissé pendant par un force-push, n'est plus
+    contenu par une ref (#3399). Elle ne dispense jamais de lire un gel encore
+    **accessible par une ref** : le refus fermé de #2924 B5 reste la règle
+    quand le contenu est encore atteignable par l'histoire. Pour un gel
+    remplacé hors de toute ref, la lecture garde ses auteurs connus dont le
+    contenu survit et ne laisse plus bloquer ses seuls inconnus (#3399, avis
+    auditeur)."""
     from .freeze_gate import FREEZE_SUPERSEDES_RE
     out: set[int] = set()
     for row in freezes or ():
@@ -1982,6 +2001,13 @@ def _carried_from_previous(db, item: Mapping, milestone: Optional[Mapping],
     contenu n'a jamais existé, et le blocage de la provenance serait définitif.
     La note du gel remplaçant porte la trace de la déclaration. Un gel remplacé
     mais encore lisible est lu comme avant (B5).
+
+    #3399 : un force-push laisse l'ancien gel présent dans l'ODB mais hors de
+    toute ref. Un gel déclaré remplacé est alors lu **pour ses auteurs connus**
+    (le contenu qui survit les porte, #2924), mais ses inconnus ne bloquent plus
+    la désignation (avis auditeur) ; un gel resté accessible par une ref garde
+    la lecture normale et ses inconnus (B5). Le marqueur n'est écrit qu'après
+    la preuve d'inaccessibilité locale **et distante** (#2989/#3399).
 
     #3301 : un commit antérieur sans reçu et sans attribution ne reste inconnu
     que si son contenu subsiste sans équivalent reçu. Une réémission par le
@@ -2125,6 +2151,22 @@ def _carried_from_previous(db, item: Mapping, milestone: Optional[Mapping],
         except Exception:  # noqa: BLE001 - dépôt illisible : absence
             return False
 
+    def at_ref(commit: str) -> bool | None:
+        """Le commit est-il contenu par une **ref** du dépôt de lecture (#3399) ?
+
+        `False` : objet pendant (force-push) ou absent — la présence dans l'ODB
+        n'est pas consultée, c'est justement ce que #3399 distingue. `None` :
+        accessibilité illisible (doute) ; l'appelant relit alors le gel, le
+        refus fermé B5 garde sa force pour un contenu peut-être accessible.
+        """
+        try:
+            full = plan_git.local_commit(repo, str(commit or "").strip())
+            if not full:
+                return False
+            return plan_git.ref_reachable(repo, full)
+        except Exception:  # noqa: BLE001 - lecture impossible : doute
+            return None
+
     def recover_one(commit: str) -> bool:
         """Tente de rapatrier un gel absent ; True seulement s'il est lisible.
 
@@ -2154,16 +2196,27 @@ def _carried_from_previous(db, item: Mapping, milestone: Optional[Mapping],
                                                 int(value.get("id") or 0)),
                       reverse=True):
         row_id = int(row.get("id") or 0)
+        ignore_unknown = False
         if row_id in superseded:
-            # #2989 : un gel déclaré remplacé dont le SHA n'existe nulle part
-            # (même après récupération) est un gel fantôme : son contenu n'a
-            # jamais existé, et le refus fermé bloquerait la provenance pour
-            # toujours. La note du gel remplaçant porte la trace (marque
-            # machine + événement de gel). Un gel encore lisible est lu.
+            # #2989 : un gel déclaré remplacé dont le SHA n'existe nulle part est
+            # un gel fantôme : son contenu n'a jamais existé, et le refus fermé
+            # bloquerait la provenance pour toujours. #3399 : un force-push
+            # laisse l'ancien gel présent dans l'ODB mais hors de toute ref.
+            # La note du gel remplaçant porte la trace (marque machine +
+            # événement de gel).
             prior_sha = str(row.get("sha") or "").strip()
-            if not prior_sha or (not present(prior_sha)
-                                 and not recover_one(prior_sha)):
+            if not prior_sha:
                 continue
+            access = at_ref(prior_sha)
+            if access is False:
+                # #3399 (avis auditeur) : un gel remplacé hors de toute ref
+                # garde ses auteurs **connus** dont le contenu survit ; seuls
+                # ses inconnus cessent de bloquer. Un fantôme absent et
+                # irrécupérable n'a aucun contenu à porter : ignoré (#2989).
+                if not present(prior_sha) and not recover_one(prior_sha):
+                    continue
+                ignore_unknown = True
+            # accessible (ou accessibilité illisible) : lecture normale, B5.
         sha = str(row.get("sha") or "").strip()
         if not sha:
             if strict:
@@ -2228,6 +2281,7 @@ def _carried_from_previous(db, item: Mapping, milestone: Optional[Mapping],
                 db, item, row, earlier, repo, families,
                 provider=provider, strict=strict, target=target_sha,
                 head=head_sha, base=base, cache=file_cache,
+                ignore_unknown=ignore_unknown,
                 ignore_missing=lambda commit: obsolete_missing(commit, stored=stored))
         except Exception as exc:  # noqa: BLE001 - un gel antérieur illisible
             if strict:
