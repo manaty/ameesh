@@ -13,13 +13,16 @@ Témoins ici : rouge hérité seul → fusion + note au lot + incident de la cib
 un échec propre en plus → `pending` ; une part rouge sans test lu → `pending` ;
 une base sans relevé conclu → `pending`. Les relectures B/P1 du 25/10 ajoutent
 les fermetures du relevé : ligne encore `running`, attempt différent du flux,
-dernier échec publié après la passe du veilleur, et provenance homonyme d'un
-autre run (jamais masquée par le seul nom).
+dernier échec publié après la passe du veilleur, sortie de flux tronquée par
+`MAX_TEXT` (marqueur d'omission), et provenance homonyme d'un autre run
+(jamais masquée par le seul nom).
 """
 from __future__ import annotations
 
 import contextlib
+import importlib.util
 import json
+import pathlib
 import types
 import unittest
 from unittest import mock
@@ -33,13 +36,25 @@ BASE_RUN = 300
 BASE_SHA = "9" * 40
 RUN = 200
 FAIL_TESTS = ("tests.test_a", "tests.test_b", "tests.test_c")
+REPO = pathlib.Path(__file__).resolve().parent.parent
 
 
-def event(test, *, part="psql 1/16", attempt=1, run=RUN, statut="echec"):
+def _ci_flow():
+    spec = importlib.util.spec_from_file_location("ci_flow_3558",
+                                                  REPO / "scripts" / "ci-flow.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+CI_FLOW = _ci_flow()
+
+
+def event(test, *, part="psql 1/16", attempt=1, run=RUN, statut="echec", rejouer=""):
     """Une ligne `test` publiée dans la sortie d'un flux (`ci-flow.py`)."""
     return {"v": 1, "type": "test", "execution": run, "attempt": attempt,
             "part": part, "test": test, "statut": statut, "module": "",
-            "extrait": "", "rejouer": "", "duree_s": 1.0,
+            "extrait": "", "rejouer": rejouer, "duree_s": 1.0,
             "ts": "2026-10-25T12:00:00Z"}
 
 
@@ -58,10 +73,10 @@ def pending(name, *, run=RUN, workflow="tests", job=123):
                           % (SLUG, run, job)}
 
 
-def flux(name, conclusion):
+def flux(name, conclusion, *, workflow="paquet"):
     """Le check d'une part publié par le portier (`/runs/<check-id>`, aucun
     run Actions : #3494)."""
-    return {"__typename": "CheckRun", "name": name, "workflowName": "paquet",
+    return {"__typename": "CheckRun", "name": name, "workflowName": workflow,
             "status": "COMPLETED", "conclusion": conclusion,
             "detailsUrl": "https://github.com/%s/runs/121135624438" % SLUG}
 
@@ -112,6 +127,8 @@ class InheritedGh(FakeGh):
         self.events = None
         #: `total_count` de la page REST (un au-delà = lecture tronquée)
         self.check_runs_total = None
+        #: nombre d'échecs omis par `ci-flow.py` dans la sortie des flux
+        self.omitted = 0
         #: des checks REST supplémentaires (provenance d'une autre suite/run)
         self.check_runs_extra = []
 
@@ -128,7 +145,12 @@ class InheritedGh(FakeGh):
                 "tests (flux) %s" % part, "failure",
                 details_url="https://github.com/%s/runs/%d" % (SLUG, 121135624400 + index),
                 suite=200 + index, started="2026-10-25T12:01:00Z")
-            run["output"] = {"text": "\n".join(json.dumps(ev) for ev in events)}
+            text = "\n".join(json.dumps(ev) for ev in events)
+            if self.omitted:
+                # Ce que `ci-flow.py` écrit quand `MAX_TEXT` coupe des échecs.
+                text += ("\n%d échec(s) de plus, hors de la limite de taille de "
+                         "GitHub." % self.omitted)
+            run["output"] = {"text": text}
             runs.append(run)
         runs += [dict(run) for run in self.check_runs_extra]
         return runs
@@ -310,6 +332,40 @@ class InheritedRedTest(Journal):
         out = self.check(gh)
         self.assertEqual(out["result"], "pending", out)
         self.assertEqual(gh.landed, [])
+
+    def test_a_truncated_flux_output_blocks(self):
+        # #3558 (ameesh-dev4 + ameesh-cx3 B/P1) : `ci-flow.py` a omis des
+        # échecs (`MAX_TEXT`) et l'écrit dans la sortie du flux. `events_of`
+        # ignore cette ligne, donc le relevé semblerait complet alors qu'un
+        # échec propre n'a jamais été publié. Une sortie qui porte le marqueur
+        # d'omission ne prouve rien.
+        gh = InheritedGh(self.rollup())
+        gh.omitted = 7
+        out = self.check(gh)
+        self.assertEqual(out["result"], "pending", out)
+        self.assertEqual(gh.landed, [])
+        self.assertEqual(self.created, [])
+
+    def test_the_refused_marker_is_the_one_ci_flow_writes(self):
+        # Contrat avec `scripts/ci-flow.py` : le marqueur refusé par
+        # `_fresh_events` est exactement la ligne d'omission que
+        # `check_output` écrit quand `MAX_TEXT` coupe des échecs.
+        events = [event("tests.test_%d" % index, rejouer="x" * 30000)
+                  for index in range(6)]
+        text = CI_FLOW.check_output(events, attempt=1)["text"]
+        self.assertIn("hors de la limite de taille de GitHub", text)
+        self.assertTrue(packet_automerge.OMITTED_EVENTS_RE.search(text), text[-200:])
+
+    def test_a_flux_outside_the_required_filter_still_proves_its_part(self):
+        # #3558 (ameesh-dev4 N) : le flux d'une part se lit dans le rollup
+        # complet de la tête, pas dans le rollup filtré par les exigences.
+        entries = [entry for entry in self.rollup()
+                   if entry["name"] != "tests (flux) psql 1/16"]
+        entries.append(flux("tests (flux) psql 1/16", "FAILURE", workflow="tests"))
+        gh = InheritedGh(entries)
+        out = self.check(gh)
+        self.assertEqual(out["result"], "merged", out)
+        self.assertEqual(gh.landed, [("main", HEAD)])
 
     def test_a_same_app_failure_of_another_run_is_not_masked_by_name(self):
         # #3558 (ameesh-cx3 B/P1) : la provenance REST porte un second `tests`

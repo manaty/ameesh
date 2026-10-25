@@ -104,6 +104,12 @@ _VERSION_LINE = re.compile(r'^version\s*=\s*"[^"\s]+"\s*$')
 #: exige sa propre part lue et son flux `FAILURE` (relectures B/P1 du 25/10).
 INHERITED_RED_AGGREGATES = frozenset((
     "tests", "tests (dispatch)", "suite complète du paquet / tests"))
+#: #3558 (ameesh-dev4 + ameesh-cx3 B/P1) : ligne que `ci-flow.py` ajoute à la
+#: sortie d'un flux quand `MAX_TEXT` l'a obligé à omettre des échecs. Ces
+#: événements ne sont pas publiés : `ci.events_of` l'ignore, donc une telle
+#: sortie ne prouve jamais la liste complète des échecs.
+OMITTED_EVENTS_RE = re.compile(
+    r"(?m)^\d+ échec\(s\) de plus, hors de la limite de taille de GitHub\.\s*$")
 
 
 def carrier(head_ref) -> bool:
@@ -833,8 +839,10 @@ def _fresh_events(slug: str, head: str, rid: int, attempt: int, *, gh) -> list[d
 
     La lecture est celle du veilleur (`commits/<sha>/check-runs`, une page de
     100) ; une page tronquée (`total_count` au-delà) ne prouve pas la
-    complétude et rend None. None aussi si la lecture est absente ou
-    malformée."""
+    complétude et rend None. None aussi si une sortie de flux porte le
+    marqueur d'omission de `ci-flow.py` (relectures B/P1 du 25/10) : les
+    échecs coupés par `MAX_TEXT` ne sont ni publiés ni lus, donc `events_of`
+    les ignore et le relevé semblerait complet à tort."""
     from . import ci as ci_mod
     path = "repos/%s/commits/%s/check-runs?per_page=100" % (slug, quote(head, safe=""))
     try:
@@ -853,6 +861,13 @@ def _fresh_events(slug: str, head: str, rid: int, attempt: int, *, gh) -> list[d
     total = data.get("total_count")
     if type(total) is not int or total > len(data["check_runs"]):
         return None
+    for run in runs:
+        if not str(run.get("name") or "").startswith(ci_mod.CHECK_PREFIX):
+            continue
+        output = run.get("output")
+        text = output.get("text") if isinstance(output, dict) else ""
+        if isinstance(text, str) and OMITTED_EVENTS_RE.search(text):
+            return None
     return ci_mod.events_of(runs, int(rid), int(attempt))
 
 
@@ -878,6 +893,9 @@ def _inherited_red(db, *, slug: str, base: str, sha: str, view: dict, required,
     * les événements terminaux relus sur la tête pour cet attempt sont
       exactement ceux enregistrés (part, test) : un dernier échec publié après
       la passe du veilleur bloque tant qu'il n'est pas lu ;
+    * aucune sortie de flux ne porte le marqueur d'omission de `ci-flow.py`
+      (`MAX_TEXT`) : des échecs coupés ne sont jamais publiés, donc le relevé
+      semblerait complet à tort (relectures B/P1 du 25/10) ;
     * chaque échec lu sur la tête porte `inherited`, et son test figure encore
       dans le dernier relevé conclu de la cible (un marqueur périmé, une base
       devenue verte ou sans relevé conclu ne rouvrent rien) ;
@@ -1049,8 +1067,11 @@ def _inherited_red(db, *, slug: str, base: str, sha: str, view: dict, required,
             # se contente de consigner, et la part lue masquerait le job rouge.
             # Chaque part de `run_parts` exige donc son flux présent et
             # FAILURE ; absent, annulé, expiré ou en cours bloque.
+            # #3558 (ameesh-dev4, N) : lire le rollup complet de la tête, pas
+            # le rollup filtré : un flux de part reste une preuve même quand
+            # `_required_ci` ne l'a pas retenu (nom hors exigences).
             flux_results: dict[str, list[str]] = {}
-            for other in radar.latest_rollup(rollup):
+            for other in radar.latest_rollup(view.get("rollup") or ()):
                 part = _flux_part(str(other.get("name")
                                       or other.get("context") or ""), prefix)
                 if part is not None:
