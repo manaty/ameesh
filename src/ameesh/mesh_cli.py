@@ -216,8 +216,8 @@ def _handoff_operator(cfg, db, args):
     if storage.of(db).handoffs.get(args.operation) is None:
         raise ValueError("unknown handoff")
     try:
-        from . import handoff_binding
-        binding = handoff_binding.load(db)
+        from . import handoff_factory
+        binding = handoff_factory.load(db)
         adapter = host_lifecycle._ReadyAdapter(db, binding.adapter,
                                               binding.requirements_for)
         if args.handoff_command == "retry":
