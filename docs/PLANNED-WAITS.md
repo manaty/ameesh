@@ -109,6 +109,18 @@ A lot is stale when it is open and inactive beyond the configured threshold
   [the work plan](PLAN-DE-TRAVAIL.md)): the proven content lifts them and the
   merge note records the lift.
 
+  #3498 : a hold written by a pilot may name its **external executor** and
+  the gesture expected — `hold: attente bureau : <geste>` or `hold: attente
+  owner : <geste>` (`attente externe (bureau)`, `attente du bureau` are read
+  too). An optional deadline `(due 2026-10-25 12:00 UTC)` or `(échéance …)`,
+  before or after the gesture, bounds the reminder; without one, `ameesh
+  debit` reminds after its threshold. The debit puts such a hold in
+  `external_waits` with its executor (bureau or owner), not in `slow_waits`,
+  and `--check` does not fire on it, even when the reminder is due: the
+  report repeats the reminder to the bureau/owner (§10). A non-pilot hold
+  that carries the declaration is not external — it stays a plain agent wait
+  and the debit says so in `unreadable`.
+
 Grouped views (`work list`, `progress --json`, the stale alert, the dependency
 labels) read the hold from a targeted storage stream
 (`Progress.lot_hold_events`: state transitions plus the `hold:`/lift notes,
