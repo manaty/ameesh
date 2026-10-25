@@ -504,8 +504,12 @@ def ci_reading(project: "ProjectRelease", sha: str) -> dict:
         # separate macOS suite (#3198). Its unfinished rollup must not block
         # a successful tests aggregate; a job FAILURE still blocks below.
         managed = {"tests", "paquet", "macos"}
+        # #3530 : un check « tests (flux) » double le job de la part ; ses
+        # non concluants ne se consignent pas deux fois. Un flux **négatif**
+        # reste une preuve (le publisher peut avoir écrit `fin=echec` avant
+        # que le job ne soit annulé) : il n'est jamais filtré.
         negative = [name for name in reading.get("negative", ())
-                    if name not in managed and not _is_flow_check(name)]
+                    if name not in managed]
         pending = [name for name in reading.get("pending", ())
                    if name not in managed and not _is_flow_check(name)]
         inconclusive = [name for name in reading.get("inconclusive", ())
@@ -517,13 +521,14 @@ def ci_reading(project: "ProjectRelease", sha: str) -> dict:
                      if name not in negative]
         for attempt in _suite_runs(suite, run):
             for job in attempt["jobs"]:
-                if _is_flow_check(job.get("name")):
-                    # #3530 : le check du flux double le job de la part.
-                    continue
                 label = "%s (%s; %s)" % (
                     job["name"], job["conclusion"] or job["status"], attempt["url"])
                 if _job_negative(job):
                     negative.append(label)
+                elif _is_flow_check(job.get("name")):
+                    # #3530 : doublon non concluant/en attente du job de la
+                    # part, déjà lu ; jamais un second lot de correction.
+                    continue
                 elif _job_inconclusive(job):
                     inconclusive.append(label)
         if not aggregate_ok:

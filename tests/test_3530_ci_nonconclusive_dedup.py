@@ -98,17 +98,21 @@ class ReadingTest(unittest.TestCase):
     def test_a_flow_check_is_not_counted_as_a_second_job(self):
         # Le run réel : la part est annulée, son check « tests (flux) » est
         # vert (les tests de la part avaient fini), et le rollup porte les
-        # flux dans ses trois listes. Sans filtre : deux consignations.
+        # flux dans ses listes non concluantes/en attente. Sans filtre :
+        # deux consignations.
         data = suite(
             fixture._job("plan"),
             fixture._job("psql 13/16", "cancelled"),
             fixture._job("tests"),
             fixture._job("tests (flux) psql 13/16"),
+            # Flux resté en cours ou annulé alors que sa part a fini : sa
+            # conclusion ne prouve rien, elle n'est pas un second job.
+            fixture._job("psql 5/16"),
+            fixture._job("tests (flux) psql 5/16", "cancelled"),
             # Forme préfixée de l'appel du portier : elle double aussi son job.
             fixture._job("suite complète du paquet / tests (flux) psql 4/16"),
         )
         reading = self.read(data, rollup(
-            negative=["tests (flux) psql 1/16 (FAILURE)"],
             pending=["tests", "tests (flux) psql 13/16"],
             inconclusive=["tests (flux) psql 2/16 (CANCELLED)"]))
         self.assertTrue(reading["green"], reading)
@@ -117,6 +121,48 @@ class ReadingTest(unittest.TestCase):
         self.assertEqual(reading["inconclusive"], [
             "psql 13/16 (cancelled; "
             "https://github.com/manaty/ameesh/actions/runs/600)"])
+
+    def test_a_flow_failure_remains_a_negative(self):
+        # Le publisher écrit `fin=echec` puis le job facultatif est annulé
+        # pendant la clôture : le flux est le seul porteur du négatif
+        # (relecture bloquante de #3530, ameesh-cx3). Il ne doit jamais
+        # disparaître du verdict.
+        data = suite(
+            fixture._job("plan"),
+            fixture._job("tests"),
+            fixture._job("autre système de fichiers 1/16", "cancelled"),
+            fixture._job("tests (flux) autre système de fichiers 1/16", "failure"),
+        )
+        reading = self.read(data, rollup(
+            negative=["tests (flux) autre système de fichiers 1/16 (FAILURE)"]))
+        self.assertFalse(reading["green"], reading)
+        self.assertFalse(reading["acceptable"], reading)
+        self.assertTrue(any("tests (flux) autre système de fichiers 1/16"
+                            in text for text in reading["negative"]), reading)
+        self.assertEqual(reading["inconclusive"], [
+            "autre système de fichiers 1/16 (cancelled; "
+            "https://github.com/manaty/ameesh/actions/runs/600)"])
+
+    def test_a_historical_flow_failure_is_not_repaired_by_a_rerun(self):
+        # Un flux négatif d'un essai antérieur que le nouvel essai n'a pas
+        # réparé (sa part est encore annulée) reste un négatif.
+        old = fixture._run(700, [
+            fixture._job("plan"), fixture._job("tests"),
+            fixture._job("autre système de fichiers 1/16", "cancelled"),
+            fixture._job("tests (flux) autre système de fichiers 1/16", "failure"),
+        ])
+        new = fixture._run(800, [
+            fixture._job("plan"), fixture._job("tests"),
+            fixture._job("autre système de fichiers 1/16", "cancelled"),
+            fixture._job("tests (flux) autre système de fichiers 1/16", "success"),
+        ])
+        reading = self.read({"runs": [old, new]})
+        self.assertFalse(reading["green"], reading)
+        self.assertTrue(any("(failure;" in text
+                            and "tests (flux) autre système de fichiers 1/16" in text
+                            for text in reading["negative"]), reading)
+        self.assertEqual([text for text in reading["inconclusive"]
+                          if "tests (flux)" in text], [])
 
     def test_an_in_progress_or_queued_part_waits_and_is_not_consigned(self):
         data = suite(
