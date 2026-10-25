@@ -1,8 +1,8 @@
 ---
 type: Study
 title: "3309 — tours d'exécution externe natifs : contrat public, exactly-once, usage, heartbeat et révocation"
-description: "Étude de la demande IMA #2480 (suite de #2202) : un exécuteur hors de l'arbre de processus du runner ouvre un tour ameesh, avec bail, réservation de courrier, session, corrélation exactly-once, reporting d'usage par modèle, heartbeat et révocation ; réutilise l'exécuteur médié et son contrat stable plutôt qu'une seconde API. Options et décision owner."
-status: proposed
+description: "Étude de la demande IMA #2480 (suite de #2202) : un exécuteur hors de l'arbre de processus du runner ouvre un tour ameesh, avec bail, réservation de courrier, session, corrélation exactly-once, reporting d'usage par modèle, heartbeat et révocation ; réutilise l'exécuteur médié et son contrat stable plutôt qu'une seconde API. Décision owner #132239 (25/10/2026) : option c — attendre le supervisor natif #2202 (S1–S6), IMA reste sur son intérim v1.16, aucun turn.open public pour l'instant ; étude conservée et rattachée à #2202."
+status: decided
 tags: [api, tour, bail, exactly-once, usage, heartbeat, revocation, executeur-medié, ima, contrat, spending]
 generated: { by: "mty-amh-impl-02/deepseek", at: "2026-10-24T07:10:00+00:00" }
 sources:
@@ -19,7 +19,14 @@ sources:
   - { resource: "../../../src/ameesh/migrations/0443_account_daily_budget.sql", title: "enveloppe journalière, `turn_costs.billing_account`" }
   - { resource: "../../../docs/EXECUTEUR-MEDIEE.md", title: "identité d'exécuteur, jetons, fence, révocation, contrat 1.x" }
   - { resource: "../../../docs/versions/1.17.0.md", title: "migration 0471 : la clé de dépense devient exacte ; c'est la rupture que le pont IMA ne sait pas absorber" }
+  - { resource: "ameesh decide show 132239", title: "Décision owner #132239 (25/10/2026, signée) : option c — attendre le supervisor natif #2202 (S1–S6), IMA reste sur son intérim v1.16, aucun turn.open public" }
 ---
+
+> **Décision owner #132239 (25/10/2026, signée) : option c.** Attendre le
+> supervisor natif #2202 (S1–S6) ; IMA reste sur son intérim v1.16 ; **aucun
+> `turn.open` public dans `/api/exec/v1` pour l'instant**. Cette étude est
+> conservée sur la branche `lot/3309-external-execution-turns` et rattachée à
+> #2202 ; le lot #3309 est clos livré hors cible (note), sans code.
 
 # Besoin
 
@@ -637,10 +644,31 @@ dépense déclarée, l'ouverture du bail par un consommateur et le contrat
 public sont trois décisions sensibles que #120571 n'a pas couvertes pour ce
 cas.
 
+# Décision prise
+
+**Décision owner #132239** (human:smichea, signée avec la clé de l'owner,
+approbation #104, `ameesh decide show 132239`) : **option c** — attendre le
+supervisor natif **#2202 (S1–S6)** ; IMA reste sur son intérim v1.16.
+
+Conséquences :
+
+- **aucun `turn.open` public** dans `/api/exec/v1` pour l'instant : ni la v2
+  de l'exécuteur médié (option a) ni le harnais externe piloté par le runner
+  (option b) ne sont implémentés ;
+- cette étude est **conservée** sur la branche
+  `lot/3309-external-execution-turns` et **rattachée à #2202** : les lots
+  S1–S6 du supervisor natif sont la voie retenue pour les tours d'exécution
+  externe ;
+- IMA garde son intérim v1.16 (mail + pont privé) ; le suivi externe reste
+  manaty/ameesh#2480 ;
+- le lot #3309 est **clos livré hors cible** (note), sans fusion de code — il
+  n'y a pas de code.
+
 # Sources
 
 - manaty/ameesh#2480, #2202, #2167 ; notes `2202-external-sandbox-turns.md`,
-  `l2894-turn-context-api.md` ; décisions owner #120571, #120568.
+  `l2894-turn-context-api.md` ; décisions owner #120571, #120568, **#132239
+  (option c)**.
 - `src/ameesh/mediated_executor/contract.json` (1.9.0), `dispatcher.py`,
   `server.py`, `identity.py`, `scope.py`.
 - `src/ameesh/runner.py` (ouverture du tour), `src/ameesh/storage/interface.py`
