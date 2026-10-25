@@ -306,9 +306,9 @@ class PacketMemberBaseTest(PgTestCase):
         units = self.stacked_vehicle()
         self.db.execute("DELETE FROM provenance_receipts WHERE subject = %s",
                         ("commit:" + units[0][1],))
-        self.db.execute("UPDATE work_items SET reviewer = %s, reviewers = %s"
+        self.db.execute("UPDATE work_items SET reviewer = %s, reviewers = ARRAY[%s]"
                         " WHERE id = %s", (work.REVIEWER_NONE,
-                                            [work.REVIEWER_NONE], units[0][0]))
+                                            work.REVIEWER_NONE, units[0][0]))
         out = self.need(self.base)
         self.assertFalse(out["ok"], out)
         self.assertIn("provenance unknown", out["why"])
