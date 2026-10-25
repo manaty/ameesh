@@ -1536,7 +1536,7 @@ class HostEffects:
         current = root
         for part in relative.parts:
             current = current / part
-            if current.exists() and current.is_symlink():
+            if current.is_symlink():
                 raise Refused('cwd')
         if must_exist:
             info = _stat_at(root, path, owner=owner)
