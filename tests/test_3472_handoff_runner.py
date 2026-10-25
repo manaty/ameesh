@@ -13,7 +13,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 from ameesh import handoff_factory, host_lifecycle, host_preflight, registry, resources, storage
-from ameesh.runner import Runner
+from ameesh.runner import Runner, AgentWorker
 
 from . import test_l232e_drain_handoffs as drain_fixtures
 from .test_l232e_loss_recovery import RecoveryAdapter
@@ -28,6 +28,13 @@ class FactorySourceTest(unittest.TestCase):
     def test_source_is_derived_from_this_tree(self):
         self.assertEqual(handoff_factory.source_path(),
                          REPO / "deploy/mise-a-jour/fabrique-handoff.py")
+
+    def test_wheel_source_uses_its_interpreter_prefix(self):
+        with mock.patch.object(handoff_factory, "__file__",
+                               "/opt/venv/lib/python3.12/site-packages/ameesh/handoff_factory.py"), \
+                mock.patch.object(handoff_factory.sys, "prefix", "/opt/venv"):
+            self.assertEqual(handoff_factory.source_path(),
+                             Path("/opt/venv/share/ameesh/mise-a-jour/fabrique-handoff.py"))
 
     def test_missing_source_is_a_named_prerequisite(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -238,3 +245,49 @@ class RunnerLifecycleTest(PgTestCase):
         for _ in range(9):
             Runner.host_lifecycle_once(self.runner(), self.db)
         self.assertEqual(registry.get(self.db, "gov")["host"], "source")
+
+
+class BindingRecoveryTest(unittest.TestCase):
+    def test_gap_is_logged_once_and_cleared_when_enrollment_arrives(self):
+        runner = object.__new__(Runner)
+        runner.cfg = object()
+        runner._lifecycle_gap = None
+        factory = SimpleNamespace(adapter=object(), requirements_for=lambda a, h: None)
+        with mock.patch("ameesh.scoped_db.ScopedDb"), \
+                mock.patch.object(handoff_factory, "load", side_effect=[
+                    handoff_factory.FactoryUnavailable(),
+                    handoff_factory.FactoryUnavailable(), factory]), \
+                mock.patch("ameesh.runner.log_async") as log:
+            runner._bind_lifecycle()
+            runner._bind_lifecycle()
+            self.assertEqual(log.call_count, 1)
+            runner._bind_lifecycle()
+        self.assertIsNone(runner._lifecycle_gap)
+        self.assertIs(runner._lifecycle_adapter, factory.adapter)
+
+    def test_lifecycle_pass_retries_an_empty_binding(self):
+        runner = object.__new__(Runner)
+        runner._lifecycle_factory = None
+        with mock.patch.object(runner, "_bind_lifecycle") as bind, \
+                mock.patch("ameesh.runner.storage.of", side_effect=ValueError), \
+                mock.patch("ameesh.runner.log_async"):
+            runner.host_lifecycle_once(object())
+        bind.assert_called_once_with()
+
+    def test_lifecycle_pass_keeps_an_active_binding(self):
+        runner = object.__new__(Runner)
+        runner._lifecycle_factory = object()
+        with mock.patch.object(runner, "_bind_lifecycle") as bind, \
+                mock.patch("ameesh.runner.storage.of", side_effect=ValueError), \
+                mock.patch("ameesh.runner.log_async"):
+            runner.host_lifecycle_once(object())
+        bind.assert_not_called()
+
+    def test_relocation_readiness_value_error_keeps_source(self):
+        worker = SimpleNamespace(
+            runner=SimpleNamespace(mediated=False), db=object(), name="canary",
+            agent={"host": "source"})
+        with mock.patch("ameesh.runner.storage.of", side_effect=ValueError("private detail")), \
+                mock.patch("ameesh.runner.log") as log:
+            self.assertFalse(AgentWorker.maybe_relocate(worker, {}))
+        self.assertNotIn("private detail", str(log.call_args))
