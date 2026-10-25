@@ -247,3 +247,47 @@ the helper entry point, the unprivileged child for an `account_file` (install,
 replay, rotation, revocation, a refusal carried back as a category, the
 account's own health read, a child that dies, a `root` account refused), a
 hard-linked destination, and a health check that raises after the write.
+
+## Handoff bridge (H4)
+
+The pinned handoff factory exposes `credential_bridge()`. Its read-only
+`check(agent, host)` rereads the authenticated helper inventory and the
+receiving host's `credential_health` rows through `host_preflight.check`.
+Missing, expired, stale, revoked or wrong-account reports refuse readiness;
+`gh` and `gcloud` still need their own healthy default login. Delivery never
+creates a health report, logs in or changes account/provider.
+
+`deliver(operation, agent, host, operation_kind='install')` resolves H1's
+secret aliases into policy references, checks the operation identity and the
+frozen plan's `harness` and `account`, and resolves every policy destination
+before sending. `account` is captured from `session_account` when planning;
+an older plan without this field must be replanned before delivery.
+The output contains readiness and named missing prerequisites, never a frame,
+value, destination path or upstream diagnostic.
+
+The default pinned `secrets-handoff.py` builder composes `Livraison` with
+root-owned protected `/etc/ameesh-secrets/policy.json` and `transport.json`
+(`0600` or `0640`, protected parents). The latter has exactly
+`{"hosts": {"<host>": <L232c SSH enrollment>}}`; each entry must name that
+same host and the dedicated `ameesh-secrets` user. Existing transport checks
+validate pinned keys, paths and timeouts. Durable delivery intents and the
+journal remain under `/var/lib/ameesh-secrets`. Constructing the bridge
+reads no policy or value and contacts no host.
+
+H2/H3 must supply `guard(operation, requirements, rotation=bool)`, a context
+manager yielding `True` only while durable operation/bail/controller epoch
+exclusion and the exact destination account's turn boundary are held. The
+guard must reject revoked epochs and delayed effects, and remain held through
+all reference deliveries and the fresh health read. Missing/failed guard
+refuses before delivery. Its scoped boundary is passed to L232c on every
+rotation and becomes false on exit. An injected `delivery_for` is a trusted
+backend binding, never chosen by an operation or enrollment document.
+
+Once any delivery is attempted, an exception is conservatively
+`CredentialUncertain`: a preceding reference may already be installed.
+Keep the handoff held and reconcile; L232c retains an ambiguous delivery's
+version for replay. A failed post-delivery preflight returns
+`credentials_ready: false`, even when the file was installed successfully.
+H3 must require readiness before enabling; no implicit rollback of credentials
+or paid fallback occurs. H7 installs the enrollment separately; this source
+change authorizes no host or secret access.
