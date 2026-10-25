@@ -142,15 +142,15 @@
         turn's account can resume it, otherwise a deterministic resume brief;
   ameesh review-class [--project P] [--diff REF | FILE ...]
         review class of the changed files from the project's policy;
-  ameesh role run <agent> [--min-left S] [--dry-run] [--json] -- <commande…>
-        L165 (EP5) : une minuterie mécanique ne tourne que sur l'hôte qui
-        détient le bail vivant de ce rôle (composeur, veille GitHub, guet CI) ;
-        l'époque du bail est passée à la commande pour la garde EP4 ;
   ameesh role canary [--json]   L165 (EP7 P3) : geste sans effet gardé par
         l'époque du bail de l'environnement (AMEESH_ROLE + AMEESH_LEASE_EPOCH,
         ou session liée) ; 0 accepté (un `pilot.gesture` canary), 1 refusé
         (rien journalisé ; détenteur nommé pour une époque périmée ou
         expirée), 2 aucun bail à garder ;
+  ameesh role run <agent> [--min-left S] [--dry-run] [--json] -- <commande…>
+        L165 (EP5) : une minuterie mécanique ne tourne que sur l'hôte qui
+        détient le bail vivant de ce rôle (composeur, veille GitHub, guet CI) ;
+        l'époque du bail est passée à la commande pour la garde EP4 ;
   ameesh role status [ROLE] [--json]   elected roles: holder, epoch, ranked
                                         candidates (L165); the runners publish;
   ameesh role timers [--role R] [--install|--check|--remove] [--no-apply] [--no-sync] [--json]

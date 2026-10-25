@@ -117,12 +117,17 @@ et sa tête (`vehicule 1400 : #<lot> <tête>`), et il porte un trailer
   (déplace la ref sans toucher l'arbre de travail) ; témoin rejoué sous
   `init.defaultBranch=main`, module `test_3416_review_correction_preview`
   25/25 vert. Aucun changement de code produit.
+- **Adaptation d'aide (aucun avis, §11 bis)** : #3433 — le bloc `role canary`
+  de l'aide racine (`src/ameesh/main.py`) passait après `role run`, ce que
+  `test_2179_roadmap_cli` refuse (ordre alphabétique attendu) ; déplacé avant
+  `role run`. Aide seule, aucun comportement changé ; `test_2179_roadmap_cli`
+  et `test_l165_ep4_pilot_gesture` 63/63 verts.
 - **Compilation / contrôles statiques** : 6/6 verts (`scripts/freeze-checks.py` :
   garde mécanique #2449, compilation, attribution #1632, lint L63, alert types
   #1060, doc readers L161a).
 - **Prévalidation** : indisponible (card-stale, carte de plus de 48 h) —
   non bloquante, motif journalisé au lot et dans la demande de CI.
-- **Diff** : 33 fichiers, +2389/−169 (manifeste compris). Aucune migration.
+- **Diff** : 33 fichiers, +2402/−168 (manifeste compris). Aucune migration.
 - **Inclusion** : `scripts/paquet-inclusion.py` rc 0 sur la tête (attendus =
   les 10 admis ; prêts = les 10 du calcul ; 0 écarté).
 - **Suite complète** : une seule `ci-full` demandée sur la tête finale, en
