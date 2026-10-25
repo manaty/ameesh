@@ -269,7 +269,8 @@ class Banc(unittest.TestCase):
         (sauvegarde / "git-agents.conf").write_text("[credential]\n")
         # la cible est active ; la source est arrêtée. L'état change après
         # stop/start, comme un vrai gestionnaire.
-        etat = {"cible": "active", "source": "inactive"}
+        etat = {"cible": "active", "source": "inactive",
+                "unite_cible": "enabled", "unite_source": "enabled"}
 
         delegue = self.faux.executer
 
@@ -281,12 +282,19 @@ class Banc(unittest.TestCase):
                     else "source"
                 actif, pid = etat[cote], "123" if etat[cote] == "active" else "0"
                 return M.Resultat(0, "LoadState=loaded\nActiveState=%s\nMainPID=%s\n"
-                                  "UnitFileState=enabled\n" % (actif, pid))
+                                  "UnitFileState=%s\n"
+                                  % (actif, pid, etat["unite_" + cote]))
             if "systemctl --user stop" in commande:
                 etat["cible"] = "inactive"
                 return M.Resultat(0, "")
             if "systemctl --user start" in commande:
                 etat["source"] = "active"
+                return M.Resultat(0, "")
+            if "systemctl --user disable" in commande:
+                etat["unite_cible"] = "disabled"
+                return M.Resultat(0, "")
+            if "systemctl --user enable" in commande:
+                etat["unite_source"] = "enabled"
                 return M.Resultat(0, "")
             if "daemon-reload" in commande or "list-units" in commande:
                 return M.Resultat(0, "")
@@ -467,7 +475,8 @@ class Banc(unittest.TestCase):
 
     def test_basculer_interrompu_remet_la_source(self):
         """B4 : un Ctrl-C pendant l'arrêt restaure la source et lève les pauses."""
-        etat_unites = {"source": "active", "cible": "inactive"}
+        etat_unites = {"source": "active", "cible": "inactive",
+                       "unite_cible": "enabled", "unite_source": "enabled"}
         delegue = self.faux.executer
 
         def systemctl(argv, env, delai):
@@ -478,12 +487,19 @@ class Banc(unittest.TestCase):
                     else "source"
                 actif = etat_unites[cote]
                 return M.Resultat(0, "LoadState=loaded\nActiveState=%s\nMainPID=%s\n"
-                                  "UnitFileState=enabled\n"
-                                  % (actif, "123" if actif == "active" else "0"))
+                                  "UnitFileState=%s\n"
+                                  % (actif, "123" if actif == "active" else "0",
+                                     etat_unites["unite_" + cote]))
             if "systemctl --user stop" in commande:
                 raise KeyboardInterrupt
             if "systemctl --user start" in commande:
                 etat_unites["source"] = "active"
+                return M.Resultat(0, "")
+            if "systemctl --user disable" in commande:
+                etat_unites["unite_cible"] = "disabled"
+                return M.Resultat(0, "")
+            if "systemctl --user enable" in commande:
+                etat_unites["unite_source"] = "enabled"
                 return M.Resultat(0, "")
             if "daemon-reload" in commande or "list-units" in commande:
                 return M.Resultat(0, "")
@@ -493,7 +509,8 @@ class Banc(unittest.TestCase):
         for motif in ("ameesh pause", "ameesh resume"):
             self.faux.repondre(motif, 0, '{"changed": true, "reason": "x"}\n')
         self.faux.repondre("ameesh show", 0, json.dumps(
-            {"last_turn_ts": 0, "lease_owner": None}))
+            {"last_turn_ts": 0, "lease_owner": None,
+             "cwd": str(self.source_home / "development/manaty/ameesh-dev1")}))
         self.faux.remplacer("systemctl --user show", 0, "")
         self.ctx.etat_dir.mkdir(parents=True, exist_ok=True)
         etat = M.etat_vide()
@@ -566,6 +583,134 @@ class Banc(unittest.TestCase):
         self.assertTrue(any("ameesh-dev1" in " ".join(a) for a in demarrages))
         self.assertTrue(any("codex2" in " ".join(a) for a in demarrages))
         self.assertTrue(self.faux.a_appele("ameesh resume"))
+
+    # ------------------------------------------------------------------
+    # régressions de la relecture cx3 (7 constats ; B2, B3, B6 ici)
+    # ------------------------------------------------------------------
+
+    def test_dossiers_identites_chownes_avant_appel_cible(self):
+        """B2 cx3 : les dossiers neufs (gh, Codex, Claude, config_dir
+        secondaire) appartiennent au compte cible avant tout appel sous cible."""
+        config = M.lire_json(self.source_home / ".config/ameesh/config.json")
+        with mock.patch.object(M, "chown_cible") as chown:
+            M.preparer_gh(self.ctx, config)
+            M.preparer_codex(self.ctx, config)
+            M.commandes_claude(self.ctx, config)
+        chemins = [str(appel.args[1]) for appel in chown.call_args_list]
+        for attendu in (".config/gh", ".codex", ".claude", ".claude-secondary"):
+            self.assertTrue(any(p.endswith(attendu) for p in chemins),
+                            "%s absent de %s" % (attendu, chemins))
+
+    def test_annulation_retablit_les_cwd_source(self):
+        """B3 cx3 : après canon_sync cible, un échec avant tout démarrage
+        cible rétablit les cwd sous la source avant de la redémarrer."""
+        etat_unites = {"source": "active", "cible": "inactive",
+                       "unite_cible": "enabled", "unite_source": "enabled"}
+        delegue = self.faux.executer
+
+        def systemctl(argv, env, delai):
+            commande = " ".join(argv)
+            self.faux.appels.append(tuple(argv))
+            if "show" in commande and "ameesh-runner-agent@" in commande:
+                cote = "cible" if env and env.get("HOME") == "/home/ameesh" \
+                    else "source"
+                actif = etat_unites[cote]
+                return M.Resultat(0, "LoadState=loaded\nActiveState=%s\nMainPID=%s\n"
+                                  "UnitFileState=%s\n"
+                                  % (actif, "123" if actif == "active" else "0",
+                                     etat_unites["unite_" + cote]))
+            if "systemctl --user stop" in commande:
+                etat_unites["source"] = "inactive"
+                return M.Resultat(0, "")
+            if "systemctl --user start" in commande:
+                etat_unites["source"] = "active"
+                return M.Resultat(0, "")
+            if "systemctl --user disable" in commande:
+                if env and env.get("HOME") == "/home/ameesh":
+                    etat_unites["unite_cible"] = "disabled"
+                else:
+                    etat_unites["unite_source"] = "disabled"
+                return M.Resultat(0, "")
+            if "systemctl --user enable" in commande:
+                if env and env.get("HOME") == "/home/ameesh":
+                    etat_unites["unite_cible"] = "enabled"
+                else:
+                    etat_unites["unite_source"] = "enabled"
+                return M.Resultat(0, "")
+            if "daemon-reload" in commande or "list-units" in commande:
+                return M.Resultat(0, "")
+            return delegue(argv, env, delai)
+        self.faux.executer = systemctl
+        self.hote.executeur = systemctl
+        for motif in ("ameesh pause", "ameesh resume"):
+            self.faux.repondre(motif, 0, '{"changed": true, "reason": "x"}\n')
+        self.faux.repondre("ameesh show", 0, json.dumps(
+            {"last_turn_ts": 0, "lease_owner": None,
+             "cwd": str(self.source_home / "development/manaty/ameesh-dev1")}))
+        self.faux.remplacer("systemctl --user show", 0, "")
+        self.ctx.etat_dir.mkdir(parents=True, exist_ok=True)
+        etat = M.etat_vide()
+        etat["stage"] = "prepare"
+        M.ecrit_etat(self.ctx, etat)
+        syncs = []
+
+        def canon_sync(ctx_, *, cible):
+            syncs.append(cible)
+            return True, "ok"
+
+        def verifier_cwd(ctx_, agents, *, cible):
+            return ["codex2 : cwd cible absent"] if cible else []
+
+        args = mock.Mock(canari="codex2", attente_arret=5)
+        agents = [{"name": "ameesh-dev1", "harness": "claude", "status": "idle"},
+                  {"name": "codex2", "harness": "codex", "status": "idle"}]
+        with mock.patch.object(M, "agents_du_poste", return_value=agents), \
+                mock.patch.object(M, "verifier_avant_bascule", return_value=[]), \
+                mock.patch.object(M, "canon_sync", side_effect=canon_sync), \
+                mock.patch.object(M, "verifier_cwd", side_effect=verifier_cwd):
+            with self.assertRaises(M.Refus):
+                M.basculer(self.ctx, args)
+        self.assertIn(True, syncs)
+        self.assertIn(False, syncs)
+        self.assertTrue(self.faux.a_appele("systemctl --user start"))
+        self.assertEqual(M.lit_etat(self.ctx)["stage"], "prepare")
+
+    def test_retour_disable_cible_echoue_sans_demarrer_source(self):
+        """B6 cx3 : un disable cible refusé n'est pas masqué ; la source n'est
+        ni réactivée ni redémarrée."""
+        etat = M.etat_vide()
+        etat.update({"stage": "bascule", "actifs": ["ameesh-dev1"],
+                     "enabled_source": ["ameesh-dev1"],
+                     "enabled_cible": ["ameesh-dev1"],
+                     "migre_le": "2026-10-25T10:00:00Z", "canari": "codex2",
+                     "pauses": {}})
+        M.ecrit_etat(self.ctx, etat)
+        delegation = self.faux.executer
+
+        def systemctl(argv, env, delai):
+            commande = " ".join(argv)
+            self.faux.appels.append(tuple(argv))
+            if "show" in commande and "ameesh-runner-agent@" in commande:
+                return M.Resultat(0, "LoadState=loaded\nActiveState=inactive\n"
+                                  "MainPID=0\nUnitFileState=enabled\n")
+            if "systemctl --user stop" in commande:
+                return M.Resultat(0, "")
+            if "systemctl --user disable" in commande:
+                return M.Resultat(1, "", "disable refusé (test)")
+            if "daemon-reload" in commande or "list-units" in commande:
+                return M.Resultat(0, "")
+            return delegation(argv, env, delai)
+        self.faux.executer = systemctl
+        self.hote.executeur = systemctl
+        for motif in ("ameesh pause", "ameesh resume"):
+            self.faux.repondre(motif, 0, '{"changed": true, "reason": "x"}\n')
+        args = mock.Mock(force=True, attente_arret=5)
+        agents = [{"name": "ameesh-dev1", "harness": "claude", "status": "idle"}]
+        with mock.patch.object(M, "agents_du_poste", return_value=agents):
+            with self.assertRaises(M.Refus):
+                M.retour(self.ctx, args)
+        self.assertFalse(self.faux.a_appele("systemctl --user start"))
+        self.assertFalse(self.faux.a_appele("systemctl --user enable"))
 
 
 if __name__ == "__main__":

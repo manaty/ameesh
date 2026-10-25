@@ -639,6 +639,25 @@ def chown_cible(ctx: Contexte, chemin: Path, *, recursif: bool = False) -> None:
         os.chown(chemin, compte.uid, compte.gid)
 
 
+def creer_dossier_cible(ctx: Contexte, dossier: Path, *,
+                        mode: int = 0o700) -> None:
+    """Crée un dossier du home cible et le donne au compte cible.
+
+    Un dossier neuf créé par root en 0700 barre le compte cible, même si les
+    fichiers copiés dessous lui appartiennent : c'est le cas des dossiers
+    d'identités (gh, Codex, Claude, config_dir secondaires). Les parents
+    créés sous le home cible reçoivent le même propriétaire (revue cx3, B2).
+    """
+    dossier.mkdir(parents=True, exist_ok=True)
+    os.chmod(dossier, mode)
+    chown_cible(ctx, dossier)
+    parent = dossier.parent
+    while parent != ctx.cible_home and ctx.cible_home in parent.parents:
+        if parent.exists():
+            chown_cible(ctx, parent)
+        parent = parent.parent
+
+
 def copier_fichier(ctx: Contexte, source: Path, cible: Path, *,
                    mode: int | None = None, owner: str = CIBLE,
                    reecrire: bool = True) -> None:
@@ -1479,8 +1498,7 @@ def preparer_gh(ctx: Contexte, config: dict, *, creer: bool = True) -> list[str]
     manques = []
     dossier = ctx.cible_home / ".config/gh"
     if creer:
-        dossier.mkdir(parents=True, exist_ok=True)
-        os.chmod(dossier, 0o700)
+        creer_dossier_cible(ctx, dossier)
     source = ctx.source_home / ".config/gh/hosts.yml"
     cible = dossier / "hosts.yml"
     if creer and not cible.exists() and source.is_file():
@@ -1509,8 +1527,7 @@ def preparer_codex(ctx: Contexte, config: dict, *, creer: bool = True) -> list[s
         nom = compte.get("name") or "?"
         dossier = dossier_config_dir(ctx, compte, "codex")
         if creer:
-            dossier.mkdir(parents=True, exist_ok=True)
-            os.chmod(dossier, 0o700)
+            creer_dossier_cible(ctx, dossier)
         source_dossier = chemin_cible(ctx, compte.get("path"), ".codex")
         source_dossier = Path(str(source_dossier).replace(str(ctx.cible_home),
                                                           str(ctx.source_home)))
@@ -1564,8 +1581,7 @@ def commandes_claude(ctx: Contexte, config: dict, *,
         nom = compte.get("name") or "?"
         dossier = dossier_config_dir(ctx, compte, "claude")
         if creer:
-            dossier.mkdir(parents=True, exist_ok=True)
-            os.chmod(dossier, 0o700)
+            creer_dossier_cible(ctx, dossier)
         # `claude auth status` lit CLAUDE_CONFIG_DIR : le passer explicitement
         fait = executer_sous_cible(ctx, [
             "env", "CLAUDE_CONFIG_DIR=%s" % dossier, "claude", "auth", "status"],
@@ -1847,16 +1863,30 @@ def annuler_avant_canari(ctx: Contexte, actifs: Sequence[str],
     # avant la fin de `poser_pauses` (B4) ; les fusionner évite de laisser
     # une admission fermée après la remise en service.
     pauses = {**(etat.get("pauses") or {}), **dict(pauses)}
-    # remettre l'ensemble enabled d'avant : la source doit redémarrer au
-    # boot, la cible non.
+    # remettre l'ensemble enabled d'avant : la cible doit d'abord être
+    # désactivée et vérifiée, sinon un redémarrage lancerait les deux jeux ;
+    # la source ensuite seulement (revue cx3, B6).
     enabled_source = etat.get("enabled_source") or actifs
+    if actifs:
+        desactiver_unites(ctx, actifs, cible=True)
+        restants = etat_enabled(ctx, actifs, cible=True)
+        if restants:
+            refuser("unités cible encore activées au boot (%s) : source non "
+                    "réactivée ni redémarrée" % ", ".join(restants))
     if enabled_source:
-        with contextlib.suppress(Refus):
-            activer_unites(ctx, enabled_source)
+        activer_unites(ctx, enabled_source)
     if actifs:
-        with contextlib.suppress(Refus):
-            desactiver_unites(ctx, actifs, cible=True)
-    if actifs:
+        # canon_sync(cible=True) a pu réécrire les cwd sous /home/ameesh :
+        # les rétablir sous la source AVANT son redémarrage (revue cx3, B3).
+        ok, detail = canon_sync(ctx, cible=False)
+        if not ok:
+            refuser("canon sync de retour (cwd source) a échoué : %s ; source "
+                    "non redémarrée" % detail)
+        agents = [a for a in agents_du_poste(ctx) if a["name"] in actifs]
+        manques = verifier_cwd(ctx, agents, cible=False)
+        if manques:
+            refuser("cwd source non rétablis (%s) ; source non redémarrée"
+                    % "; ".join(manques))
         systemctl_source(ctx, "start", *["%s%s.service" % (PREFIXE_UNITE, n)
                                         for n in actifs], delai=300)
         attendre_unites(ctx, actifs, cible=False, delai=120)
@@ -2394,8 +2424,13 @@ def retour(ctx: Contexte, args) -> int:
     systemctl_source(ctx, "daemon-reload", delai=60)
     enabled_cible = etat.get("enabled_cible") or actifs
     if enabled_cible:
-        with contextlib.suppress(Refus):
-            desactiver_unites(ctx, enabled_cible, cible=True)
+        # ne pas masquer un `disable` en échec : réactiver la source avant
+        # laisserait les deux jeux activés au redémarrage (revue cx3, B6).
+        desactiver_unites(ctx, enabled_cible, cible=True)
+        restants = etat_enabled(ctx, enabled_cible, cible=True)
+        if restants:
+            refuser("unités cible encore activées au boot (%s) : source non "
+                    "réactivée" % ", ".join(restants))
     enabled_source = (etat.get("enabled_source") or etat.get("actifs")
                       or list(actifs))
     if enabled_source:

@@ -148,7 +148,11 @@ est vérifié.
     * **recréer** les clones sous `/home/ameesh/development/manaty` depuis
       l'origine (mêmes branches/commits) et n'y copier que les worktrees
       actifs et les modifications non poussées — la voie du lot, « migrés ou
-      recréés » ; exige un inventaire cwd/branche des agents actifs ;
+      recréés » ; exige un inventaire cwd/branche des agents actifs. **Voie
+      manuelle** : `preparer_repos` (pré-copie puis copie finale) fait un
+      `rsync --delete` de la source et écraserait ces clones ; ce mode n'est
+      pas automatisé par ce script (limite P2 connue, lot séparé). Pour un
+      premier passage, préférer le volume dédié ci-dessous ;
     * **placer** `/home/ameesh/development` sur le volume de développement
       (bind mount persistant, par exemple
       `/home/smichea/development/.ameesh` → `/home/ameesh/development`, monté
@@ -227,7 +231,10 @@ sudo deploy/poste/migration-runners-ameesh.py identites
 
 Le premier passage **échoue volontairement** et affiche ce qui manque : il
 prépare la clé SSH et les dossiers, copie Codex/DeepSeek/`gh`, puis liste les
-connexions Claude à faire. C'est la séance owner :
+connexions Claude à faire. Les dossiers d'identités (`~/.config/gh`,
+`~/.codex`, `.claude*`, config_dir secondaires) sont créés en 0700 **et
+donnés au compte ameesh** avant tout appel sous son compte : un dossier
+root 0700 barriérerait le harnais. C'est la séance owner :
 
 ### 7.1 Clé SSH dédiée
 
@@ -323,9 +330,11 @@ sudo deploy/poste/migration-runners-ameesh.py basculer
    pour que `retour` puisse les restaurer.
 
 Si la bascule échoue **avant** tout démarrage cible, le script remet la
-source en service et lève ses pauses. Si elle échoue **après**, les unités
-cible restent en place et les pauses non levées gardent l'admission fermée ;
-le message dit de lancer `retour`.
+source en service et lève ses pauses ; avant de la redémarrer, il rétablit
+les `cwd` sous `/home/smichea` (`canon sync`) et le vérifie. Si ce
+rétablissement échoue, il s'arrête **sans** redémarrer la source et le dit.
+Si elle échoue **après**, les unités cible restent en place et les pauses
+non levées gardent l'admission fermée ; le message dit de lancer `retour`.
 
 **Interruption** (Ctrl-C, `OSError`, coupure) dans la fenêtre critique —
 source arrêtée, aucune unité cible encore démarrée : le script remet la
@@ -382,9 +391,12 @@ Le script :
 3. restaure `cles-owner.conf` et `git-agents.conf` depuis la sauvegarde,
    `daemon-reload` sous smichea ;
 4. `canon sync` sous smichea pour ramener les `cwd` sous `/home/smichea`,
-   **désactive au boot** les unités ameesh, **réactive** celles de smichea,
-   puis redémarre **le même ensemble** d'unités actives qu'avant (les arrêtées
-   restent arrêtées) ; cet ensemble est celui écrit dans `etat.json` avant le
+   **désactive au boot** les unités ameesh et **vérifie** que la
+   désactivation a pris (`UnitFileState`) avant de **réactiver** celles de
+   smichea — un `disable` refusé arrête le retour sans redémarrer la source,
+   pour ne pas laisser les deux jeux activés au redémarrage ; puis redémarre
+   **le même ensemble** d'unités actives qu'avant (les arrêtées restent
+   arrêtées) ; cet ensemble est celui écrit dans `etat.json` avant le
    premier arrêt, donc `retour --force` répare aussi une bascule interrompue
    avant `stage=bascule` ;
 5. lève ses pauses — y compris celles restées posées par une bascule
