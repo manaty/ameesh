@@ -400,6 +400,13 @@ class VmAgentsHarness(unittest.TestCase):
         # vient de l'EnvironmentFile simulé ou du fichier de configuration.
         for nom in ('AMEESH_HOST', 'AGENT_MESH_HOST', 'AMEESH_CONFIG', 'AGENT_MESH_CONFIG'):
             self.env.pop(nom, None)
+        # #3604 : sous mesure, chaque faux exécutable de la VM (ssh, pip,
+        # ameesh, systemctl…) démarrait sa propre couverture ; le module pesait
+        # 2 413 s sur la part psycopg 1/8 (67 %), coupée au plafond de 60 min.
+        # Seul le processus de test est mesuré : ses lectures et son code
+        # restent dans la carte, les enfants ne sont plus instrumentés.
+        for variable in ('CARTE_MESURE', 'COVERAGE_PROCESS_START'):
+            self.env.pop(variable, None)
         # Le dépôt d'origine est bâti par le test : la CI clone la tête en
         # profondeur 1, l'historique du checkout n'est donc pas une dépendance
         # admissible (défaut de test, canon §3). Trois commits réels :
