@@ -28,6 +28,11 @@ signée, retour de l'owner, login/2FA, lot `waiting_human`) sont listées à par
 et ne font pas sortir 2 : le canon ne vise que les attentes d'agent. Une
 simple mention d'une règle ou d'une consigne de l'owner ne suffit pas, et un
 `hold_undeployed` n'est jamais humain.
+
+Un lot relu (tous ses avis rendus) dont `branch_target` est la branche d'un
+autre lot **ouvert** n'est pas une attente de paquet : il ne peut entrer
+qu'avec ce lot, dont le hold couvre déjà l'attente. Le rapport le marque
+`depends_on` et ne produit ni `qa_merge` ni sortie 2 pour lui (#3437).
 """
 from __future__ import annotations
 
@@ -146,6 +151,33 @@ def installed_version() -> str:
 
 def _version_gt(left: tuple[int, int, int], right: tuple[int, int, int] | None) -> bool:
     return right is not None and left > right
+
+
+def _branch_name(value: Any) -> str:
+    """La branche courte d'une ref (`origin/lot/x`, `refs/heads/lot/x`)."""
+    name = str(value or "").strip()
+    for prefix in ("refs/heads/", "refs/remotes/origin/", "origin/"):
+        if name.startswith(prefix):
+            return name[len(prefix):]
+    return name
+
+
+def _target_lot(ident: int, item: Mapping[str, Any],
+                open_branches: Mapping[tuple[str, str], Iterable[int]]) -> int | None:
+    """Le lot ouvert dont `branch_target` est la branche, s'il existe (#3437).
+
+    La comparaison est faite par projet quand il est connu : deux projets
+    peuvent nommer la même branche. Un lot ne dépend jamais de lui-même."""
+    target = _branch_name(item.get("branch_target"))
+    if not target:
+        return None
+    app = str(item.get("app") or "")
+    found: set[int] = set()
+    for (branch_app, branch), lots in open_branches.items():
+        if branch != target or (app and branch_app and branch_app != app):
+            continue
+        found.update(int(lot) for lot in lots if int(lot) != int(ident))
+    return min(found) if found else None
 
 
 def _same_sha(left: Any, right: Any) -> bool:
@@ -699,6 +731,9 @@ def build(*, items: Iterable[Mapping[str, Any]],
                  for ident, values in events_by_lot.items()}
     hold_by_lot = {int(ident): dict(value) for ident, value in (holds or {}).items()}
     held_lots = {ident for ident, entries in hold_by_lot.items() if entries}
+    #: branches des lots encore ouverts : une cible de lot qui en nomme une
+    #: est une dépendance (le lot entre avec son parent), pas un paquet dû.
+    open_branches: dict[tuple[str, str], list[int]] = {}
 
     qa: list[dict] = []
     blocked_reviews: list[dict] = []
@@ -716,6 +751,11 @@ def build(*, items: Iterable[Mapping[str, Any]],
         terminal_ts = _terminal_at(lot_milestones)
         if terminal_ts is not None and _reopened(lot_events, terminal_ts):
             terminal_ts = None
+        if terminal_ts is None:
+            branch = _branch_name(item.get("branch"))
+            if branch:
+                open_branches.setdefault(
+                    (str(item.get("app") or ""), branch), []).append(ident)
         if freeze is not None and terminal_ts is None:
             designation = designations(lot_milestones, lot_events)
             unreadable.extend("%s: %s" % (ident, text)
@@ -808,6 +848,14 @@ def build(*, items: Iterable[Mapping[str, Any]],
             }
             wakes_out.append(entry)
 
+    # Une cible qui est la branche d'un lot encore ouvert est une dépendance :
+    # le lot ne peut pas entrer seul dans un paquet, il suit le lot parent
+    # (dont le hold, s'il y en a un, porte déjà l'attente) (#3437).
+    for row in qa:
+        parent = _target_lot(int(row["lot"]), by_id[int(row["lot"])], open_branches)
+        if parent is not None:
+            row["depends_on"] = parent
+
     # -- tableau des attentes de plus de 2 h --------------------------------
     waits: list[dict] = []
 
@@ -839,6 +887,8 @@ def build(*, items: Iterable[Mapping[str, Any]],
                      GESTURES["no_reviewer"].format(lot=row["lot"]),
                      human=_human_wait(state))
         else:
+            if row.get("depends_on"):
+                continue                # l'attente est celle du lot parent
             add_wait("qa_merge", row, row["frozen_ts"], "paquet",
                      GESTURES["qa_merge"], level=2, human=_human_wait(state))
     for row in blocked_reviews:
@@ -1092,9 +1142,11 @@ def _rows(db, sql: str, params=()) -> list[dict]:
 
 
 #: les colonnes d'un lot lues sont des **étiquettes** (id, titre, projet,
-#: assigné) ; jamais state, reviewer(s), wake_at ni updated_at (canon 24/10).
+#: assigné, branche et cible) ; jamais state, reviewer(s), wake_at ni updated_at
+#: (canon 24/10).
 _ITEMS_SQL = """
-    SELECT w.id, w.title, w.app, w.assignee, w.priority
+    SELECT w.id, w.title, w.app, w.assignee, w.priority,
+           w.branch, w.branch_target
       FROM work_items w
      WHERE (EXISTS (SELECT 1 FROM work_item_milestones m
                      WHERE m.work_item_id = w.id AND m.at > to_timestamp(%s))
