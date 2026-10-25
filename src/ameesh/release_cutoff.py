@@ -110,6 +110,13 @@ def _is_flow_check(name) -> bool:
     return text.startswith(_FLUX_CHECK_PREFIX)
 
 
+def _bare_job_name(name: str) -> str:
+    """The job name without GitHub's packet-caller and flow prefixes (#2692)."""
+    for prefix in _JOB_PREFIXES:
+        name = name.removeprefix(prefix)
+    return name
+
+
 class ReleaseError(RuntimeError):
     """A release cannot proceed; the message says what is missing."""
 
@@ -555,11 +562,15 @@ def suite_reading(project: "ProjectRelease", sha: str) -> dict:
         suite = radar.commit_suite(target, sha)
         # Reuse the host's declared full-suite tolerances (#566), rather
         # than inferring continue-on-error from a green workflow rollup.
+        # #3535 : le check du flux L161c double le job de sa part ; son nom
+        # porte `tests (flux) ` — retiré avant le match, comme le préfixe
+        # d'appel du portier, pour qu'une part tolérée ne rougisse pas la
+        # tête par son flux.
         for run in suite.get("runs", ()):
             if run.get("workflow") not in ("tests", "paquet"):
                 continue
             for job in run["jobs"]:
-                name = job["name"].removeprefix("suite complète du paquet / ")
+                name = _bare_job_name(job["name"])
                 job["tolerated"] = any(radar._job_matches(pattern, name)
                                        for pattern in project.suite_tolerated)
         return suite
@@ -1214,8 +1225,7 @@ def _suite_runs(suite: dict, attempt: dict | None) -> list[dict]:
         workflow, name = run.get("workflow"), job["name"]
         if workflow in ("tests", "paquet"):
             workflow = "tests"
-            for prefix in _JOB_PREFIXES:
-                name = name.removeprefix(prefix)
+            name = _bare_job_name(name)
             if name == "tests (dispatch)":
                 name = "tests"
         return workflow, name
