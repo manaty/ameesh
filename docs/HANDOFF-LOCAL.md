@@ -41,6 +41,7 @@ Délai global serveur 55 s, client 60 s ; durée systemd 65 s et arrêt 5 s,
 `KillMode=control-group`. Les enfants sont aussi bornés par H7. Au plus huit
 connexions actives par socket ; chaque requête d'un agent partage le verrou
 H7. Le journal systemd ne reçoit que la catégorie fixe d'indisponibilité,
+avec le PID et l’UID du pair obtenus du noyau (−1 avant identification),
 jamais le corps reçu, les chemins d'un refus ou les secrets. Les reçus et
 intents privés restent dans le journal H7 enrôlé.
 
