@@ -246,17 +246,18 @@ starting anything; its `credentials_ready` flag is the enrolled alias/release
 readiness from preparation, not a live credential probe — the authenticated
 first turn below is the credential proof. `enable` starts only the enrolled
 unit and proves it active with its finite caps inside the controller's
-60-second gate boundary; a replay
-re-observes the unit and never double-starts. `verify` observes the exact clean
-checkout, live unit and caps; the controller-side companion then reads the
-durable turn ledger (`turn_resources` plus its `turn_costs` line) for a
-terminal (`done` or `orphan`) turn on the target host after the `switched`
-event. A running turn returns `{"ok": true, "pending": true}`. A terminal turn
-with no token usage is not authenticated and holds the operation; a terminal
-turn whose cost line is not yet committed is given a short bounded settlement
-window (the runner closes the resource before writing the ledger), then is
-also unauthenticated, so a missing login or a runner that died before any usage
-holds instead of leaving `verify` pending forever.
+60-second gate boundary; a replay re-observes the unit and never
+double-starts. `verify` observes the exact clean checkout, live unit and caps;
+the controller-side companion then reads the durable turn ledger
+(`turn_resources` plus its `turn_costs` line) for the latest turn on the
+target host after the `switched` event. While that turn is still running,
+`verify` returns `{"ok": true, "pending": true}` and never falls through to an
+older failed one. A terminal turn with no token usage is not authenticated and
+holds the operation; a terminal turn whose cost line is not yet committed is
+given a short bounded settlement window (the runner closes the resource before
+writing the ledger), then is also unauthenticated, so a missing login or a
+runner that died before any usage holds instead of leaving `verify` pending
+forever.
 
 `restore_source` returns the source unit to service before a cancellation; the
 controller keeps the source gate lock through restoration and fence release.

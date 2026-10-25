@@ -696,6 +696,30 @@ class AdapterTest(PgTestCase):
             self.finish(operation)
         self.assertEqual(proof, {'ok': True, 'pending': True})
 
+    def running_turn(self):
+        turn = 'turn-%d-%d' % (int(time.time() * 1000), len(self.fake.requests))
+        self.api.turn_resources.open_turn(turn, 'dev', 'target', pgid=None,
+                                          label='first')
+        self.addCleanup(self.db.execute,
+                        "DELETE FROM turn_resources WHERE turn_id=%s", (turn,))
+        return turn
+
+    def test_verify_waits_while_the_latest_turn_still_runs(self):
+        # A repaired login starts a new turn after an earlier failed one: the
+        # in-flight attempt is the evidence, so verify stays pending instead
+        # of holding on the older terminal turn.
+        self.set_state('activated', release_revision=COMMIT, branch='main',
+                       commit=COMMIT, cwd='/w/dev')
+        self.switch(seconds=300)
+        self.terminal_turn(tokens=None, settled_seconds=120)
+        self.running_turn()
+        operation = self.intent('verify')
+        try:
+            proof = self.adapter.verify(operation)
+        finally:
+            self.finish(operation)
+        self.assertEqual(proof, {'ok': True, 'pending': True})
+
     def test_verify_holds_a_settled_orphan_turn_without_a_cost_line(self):
         self.set_state('activated', release_revision=COMMIT, branch='main',
                        commit=COMMIT, cwd='/w/dev')

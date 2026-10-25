@@ -2359,19 +2359,19 @@ class HostAdapter:
     def _turn_proof(self, operation):
         """The destination's first authenticated turn, from the turn ledger.
 
-        The switch event is the durable boundary: a completed turn recorded on
-        the target host after it, with its cost line, proves the harness ran
-        there. A running turn keeps the receipt pending.
+        The switch event is the durable boundary. The latest turn recorded on
+        the target host after it is the evidence: while it runs, the receipt
+        stays pending; once terminal, its cost line decides. A running turn
+        never falls through to an older failed one — after a login repair a
+        new attempt is in flight, not a proof of failure.
 
         A terminal turn (``done`` or ``orphan``) without a cost line is not
-        skipped: that is the missing-login/crashed-before-usage case the proof
-        must catch, and skipping it left ``verify`` pending forever. The runner
-        closes the resource before committing the ledger line, so a just-ended
-        turn is still given the short ``TURN_SETTLE_SECONDS`` window; after it
-        the turn is returned as ``authenticated: false`` and holds the
-        operation. A later authenticated turn supersedes an earlier failed one
-        once the operator repaired the login and the destination ran again.
-        The source is fenced and cannot produce a target turn.
+        skipped either: that is the missing-login/crashed-before-usage case the
+        proof must catch, and skipping it left ``verify`` pending forever. The
+        runner closes the resource before committing the ledger line, so a
+        just-ended turn is still given the short ``TURN_SETTLE_SECONDS`` window;
+        after it the turn is returned as ``authenticated: false`` and holds the
+        operation. The source is fenced and cannot produce a target turn.
         """
         if self.db is None:
             return None
@@ -2395,7 +2395,8 @@ class HostAdapter:
         for row in rows:
             if (row.get('status') not in ('done', 'orphan')
                     or row.get('ended_at') is None):
-                continue
+                # The latest turn is still running: its outcome is the proof.
+                return None
             if row.get('cost_id') is None:
                 ago = row.get('ended_ago')
                 if (isinstance(ago, (int, float)) and not isinstance(ago, bool)
