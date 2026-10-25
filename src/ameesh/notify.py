@@ -998,6 +998,30 @@ def remote_push_problem(channel: Channel, env: dict | None = None,
     return ""
 
 
+def fallback_readiness(ncfg: NotifyConfig, channel: Channel,
+                       env: dict | None = None) -> dict | None:
+    """#3536 : l'état du repli d'un canal `nexlink`, affiché par `--test`.
+
+    ``None`` sans repli ; sinon ``{channel, ready[, problem]}``. La question
+    posée est celle de `role timers --check` : le repli est-il un remote push
+    utilisable depuis cet environnement ?
+    """
+    if channel.kind != "nexlink":
+        return None
+    name = channel.options.get("fallback")
+    if not name:
+        return None
+    target = ncfg.channels.get(str(name))
+    if target is None:
+        return {"channel": str(name), "ready": False,
+                "problem": "channel not declared"}
+    problem = remote_push_problem(target, env)
+    out = {"channel": target.name, "ready": not problem}
+    if problem:
+        out["problem"] = problem
+    return out
+
+
 def _request(url: str, data: bytes | None, headers: dict, timeout: float, *,
              method: str = "POST", show_url: bool = True,
              secrets: tuple = ()) -> tuple[int, bytes]:
@@ -3384,11 +3408,15 @@ def cmd_test(cfg: Config, ncfg: NotifyConfig, args) -> int:
                 receipt = sender.receipt(channel, last["alert_id"])
             except ChannelError as exc:
                 receipt = {"error": str(exc)}
+        fallback = (fallback_readiness(ncfg, channel, sender.env)
+                    if channel is not None else None)
         if args.json:
             record = {"schema": NOTIFY_SCHEMA, "event": "test", "human": human,
                       "channel": name, "ok": error is None, "error": error}
             if receipt is not None:
                 record["receipt"] = receipt
+            if fallback is not None:
+                record["fallback"] = fallback
             print(json.dumps(record, ensure_ascii=False, sort_keys=True))
         else:
             print("%s → %s: %s" % (name, human, "sent" if error is None
@@ -3400,6 +3428,11 @@ def cmd_test(cfg: Config, ncfg: NotifyConfig, args) -> int:
                     print("  receipt: accepted_at=%s pushed=%s read_at=%s"
                           % (receipt.get("accepted_at"), receipt.get("pushed"),
                              receipt.get("read_at")))
+            if fallback is not None:
+                print("  fallback %s: %s" % (
+                    fallback["channel"],
+                    "ready" if fallback["ready"] else
+                    "MISSING: %s" % _clean(fallback.get("problem"), 120)))
     return 0 if all(error is None for _, error in results) else 1
 
 

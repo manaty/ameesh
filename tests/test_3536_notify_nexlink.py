@@ -215,6 +215,22 @@ class ConfigTest(unittest.TestCase):
         self.assertIn("MESH_SECRET", problem)
         self.assertNotIn(SECRET, problem)
 
+    def test_fallback_readiness_pour_le_test(self):
+        ncfg = _nx_config()
+        self.assertEqual(notify.fallback_readiness(
+            ncfg, ncfg.channels["nx"], {"MESH_SECRET": SECRET}),
+            {"channel": "ntfy", "ready": True})
+        raw = {"routes": {"human:owner": ["nx"]},
+               "channels": {"nx": {"type": "nexlink", "url": MESH_URL,
+                                   "token_env": "S", "fallback": "s"},
+                            "s": {"type": "slack"}}}
+        ncfg = notify.parse_config(raw)
+        out = notify.fallback_readiness(ncfg, ncfg.channels["nx"], {})
+        self.assertFalse(out["ready"])
+        self.assertIn("AMEESH_SLACK_WEBHOOK", out["problem"])
+        self.assertIsNone(notify.fallback_readiness(
+            ncfg, ncfg.channels["s"], {}))
+
     def test_role_timers_accepte_le_repli(self):
         cfg = types.SimpleNamespace(notify={
             "routes": {"human:owner": ["nx"]},
