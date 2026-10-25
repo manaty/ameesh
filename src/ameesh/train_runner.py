@@ -663,12 +663,15 @@ class Service:
                     if self.lease is not None and self.lease.epoch is not None:
                         self._release_tenure()
                         self.report("train role lost: service lease released")
+                    # #3483: standby hosts also maintain their local canon pin.
+                    self._reload_pin()
                     with self.condition:
                         if self.stop.is_set():
                             return
                         self.condition.wait(timeout=ROLE_RETRY_S)
                     continue
                 if not self._lease_ready():
+                    self._reload_pin()
                     with self.condition:
                         if self.stop.is_set():
                             return
