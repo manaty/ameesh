@@ -1,0 +1,902 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+"""#3549 — runbook et script réversibles : exécuteurs de pc-smichea sous ameesh.
+
+Aucun test ne touche l'hôte : le script est chargé comme module, un `Hote`
+factice enraciné dans un répertoire temporaire enregistre chaque commande, et
+les commandes système sont simulées. On vérifie les gardes qui comptent pour
+la décision owner #135872 a :
+
+* la cible ne reçoit jamais les clés de l'owner (`~/.ssh`, `.credentials.json`
+  de Claude) : seulement une clé dédiée et les auth Codex/DeepSeek copiées ;
+* un compte dans `docker`, `sudo` ou `wheel` est refusé (la clé resterait
+  lisible par un conteneur) ;
+* les pièces #3444 (`cles-owner.conf`) et #3540 (`git-agents.conf`) ne sont
+  pas recopiées dans le home cible ; elles sont sauvegardées puis retirées à
+  la bascule, restaurées au retour ;
+* le retour est une seule commande, qui restaure l'ensemble actif de la
+  source, ses drop-ins et ses cwd ;
+* le créneau et la file des paquets sont des gardes, pas des politesses :
+  une bascule à moins de 60 min d'une coupure ou pendant un paquet est
+  refusée avant tout arrêt.
+"""
+from __future__ import annotations
+
+import importlib.util
+import json
+import os
+from pathlib import Path
+import sys
+import tempfile
+import unittest
+from unittest import mock
+
+ROOT = Path(__file__).resolve().parents[1]
+SCRIPT = ROOT / "deploy/poste/migration-runners-ameesh.py"
+
+
+def charger():
+    spec = importlib.util.spec_from_file_location("migration3549", SCRIPT)
+    module = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    sys.modules["migration3549"] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+M = charger()
+
+
+class FauxHote:
+    """Un exécuteur qui répond par motif et enregistre les commandes."""
+
+    def __init__(self, racine: Path, utilisateurs: dict[str, "M.Compte"]):
+        self.racine = racine
+        self.utilisateurs = utilisateurs
+        self.reponses: list[tuple[str, int, str, str]] = []
+        self.appels: list[tuple[str, ...]] = []
+        self.executeur = self.executer
+
+    def repondre(self, motif: str, code: int = 0, sortie: str = "", erreur: str = ""):
+        self.reponses.append((motif, code, sortie, erreur))
+
+    def remplacer(self, motif: str, code: int = 0, sortie: str = "", erreur: str = ""):
+        self.reponses.insert(0, (motif, code, sortie, erreur))
+
+    def executer(self, argv, env, delai):
+        commande = " ".join(argv)
+        self.appels.append(tuple(argv))
+        for motif, code, sortie, erreur in self.reponses:
+            if motif in commande:
+                return M.Resultat(code, sortie, erreur)
+        return M.Resultat(0, "", "")
+
+    def a_appele(self, motif: str) -> list[tuple[str, ...]]:
+        return [appel for appel in self.appels if motif in " ".join(appel)]
+
+
+class Banc(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(prefix="migration3549-")
+        self.addCleanup(self.tmp.cleanup)
+        self.racine = Path(self.tmp.name)
+        self.source_home = self.racine / "home" / "smichea"
+        self.cible_home = self.racine / "home" / "ameesh"
+        self.source_home.mkdir(parents=True)
+        self.cible_home.mkdir(parents=True)
+        # les homes des comptes sont les chemins logiques ; `Hote.chemin`
+        # les enracine dans le temporaire du banc.
+        self.comptes = {
+            "smichea": M.Compte("smichea", 1000, 1000, "/home/smichea",
+                                "/bin/bash", ("smichea", "docker")),
+            "ameesh": M.Compte("ameesh", 1001, 1001, "/home/ameesh",
+                               "/bin/bash", ("ameesh",)),
+        }
+        self.faux = FauxHote(self.racine, self.comptes)
+        self.hote = M.Hote(racine=self.racine, comptes=self.comptes,
+                           executeur=self.faux.executer)
+        self.ctx = M.Contexte(
+            hote=self.hote, depot=ROOT,
+            etat_dir=self.hote.chemin("/var/lib/ameesh/migration-runners"),
+            source=self.comptes["smichea"], cible=self.comptes["ameesh"],
+            racine_surcharge=True)
+        self.ctx.etat_dir.mkdir(parents=True)
+        self.ecrire_config()
+        self.ecrire_unites()
+        self.ecrire_share()
+        self.faux.repondre("systemctl --user show",
+                           0, "LoadState=loaded\nActiveState=inactive\nMainPID=0\n"
+                              "UnitFileState=enabled\n")
+        self.faux.repondre("systemctl --user list-units", 0, "")
+        self.faux.repondre("loginctl show-user", 0, "Linger=yes\n")
+        self.faux.repondre("ameesh list --json", 0, json.dumps([
+            {"name": "ameesh-dev1", "host": "pc-smichea", "mode": "execute",
+             "harness": "claude", "status": "idle", "operator_paused": False},
+            {"name": "codex2", "host": "pc-smichea", "mode": "execute",
+             "harness": "codex", "status": "idle", "operator_paused": False},
+            {"name": "bureau", "host": "pc-smichea", "mode": "externe",
+             "harness": "codex", "status": "idle", "operator_paused": False},
+        ]))
+        self.faux.repondre("release calendar", 0,
+                           "ameesh: canon 0b97d2303ab2, coupures 11:00, 23:00, "
+                           "dernière 11:00, prochaine 25/10 23:00, cible main\n")
+        self.faux.repondre("work queue show --target main --json", 0, "[]")
+        self.faux.repondre("mechanics.configured", 0, "Europe/Paris\n")
+
+    def ecrire_config(self):
+        dossier = self.source_home / ".config/ameesh"
+        dossier.mkdir(parents=True)
+        (dossier / "config.json").write_text(json.dumps({
+            "dsn": "postgresql://ameesh@example/ameesh",
+            "host": "pc-smichea",
+            "accounts": {
+                "claude": [{"name": "primaire"},
+                           {"name": "secondaire", "type": "config_dir",
+                            "path": str(self.source_home / ".claude-secondary")}],
+                "codex": [{"name": "primaire"}],
+            },
+            "canons": [{"path": str(self.source_home / "canon"), "ref": "origin/main"}],
+        }, indent=2), encoding="utf-8")
+        os.chmod(dossier / "config.json", 0o600)
+        (dossier / "env").write_text("DEEPSEEK_API_KEY=secret-de-test\n",
+                                     encoding="utf-8")
+        os.chmod(dossier / "env", 0o600)
+        (self.source_home / ".ssh").mkdir(mode=0o700)
+        (self.source_home / ".ssh/id_ed25519").write_text("cle-owner\n")
+        (self.source_home / ".ssh/id_ed25519.pub").write_text("ssh-ed25519 OWNER\n")
+        (self.source_home / ".ssh/known_hosts").write_text(
+            "github.com ssh-ed25519 AAAA\n", encoding="utf-8")
+        (self.source_home / ".claude").mkdir()
+        (self.source_home / ".claude/.credentials.json").write_text(
+            '{"claudeAiOauth": {"accessToken": "secret"}}\n', encoding="utf-8")
+
+    def ecrire_unites(self):
+        dossier = self.source_home / ".config/systemd/user"
+        dossier.mkdir(parents=True)
+        (dossier / "ameesh-runner-agent@.service").write_text(
+            "[Service]\n"
+            "UnsetEnvironment=SSH_AUTH_SOCK SSH_AGENT_PID\n"
+            "ExecStart=%h/.local/share/ameesh/venv/bin/ameesh run "
+            "--agents %i --runner-id runner-%i@%H\n")
+        (dossier / "ameesh-agents.slice").write_text("[Slice]\nMemoryMax=85%\n")
+        dropins = dossier / "ameesh-runner-agent@.service.d"
+        dropins.mkdir()
+        (dropins / "cles-owner.conf").write_text(
+            "[Service]\nInaccessiblePaths=%h/.ssh\n")
+        (self.source_home / ".config/ameesh/git-agents.conf").write_text(
+            "[credential]\nhelper = !gh\n")
+
+    def ecrire_share(self):
+        share = self.source_home / ".local/share/ameesh"
+        share.mkdir(parents=True)
+        (share / "src-abcdef0/deploy/mise-a-jour").mkdir(parents=True)
+        (share / "src-abcdef0/deploy/mise-a-jour/bascule.py").write_text(
+            "# faux bascule\n")
+        (share / "src-current").symlink_to("src-abcdef0")
+        (share / "venv/bin").mkdir(parents=True)
+        (share / "venv/bin/ameesh").write_text("#!/bin/sh\necho ameesh 1.22.0\n")
+        os.chmod(share / "venv/bin/ameesh", 0o755)
+        self.ctx.cible_home.joinpath(
+            ".local/share/ameesh/venv/bin").mkdir(parents=True)
+        (self.ctx.cible_home / ".local/share/ameesh/venv/bin/ameesh").write_text(
+            "#!/bin/sh\necho ameesh 1.22.0\n")
+        os.chmod(self.ctx.cible_home / ".local/share/ameesh/venv/bin/ameesh", 0o755)
+        canon = self.source_home / "canon"
+        canon.mkdir()
+        (canon / "index.md").write_text("# canon\n")
+        dev = self.source_home / "development/manaty/ameesh-dev1"
+        (dev / ".git").mkdir(parents=True)
+        (dev / "README.md").write_text("clone\n")
+        dev_cible = self.cible_home / "development/manaty/ameesh-dev1"
+        (dev_cible / ".git").mkdir(parents=True)
+        (dev_cible / "README.md").write_text("clone\n")
+
+    def test_definition_de_la_cible_absente_de_la_source(self):
+        """La cible ne reçoit ni ~/.ssh ni les identifiants Claude."""
+        M.preparer_config(self.ctx)
+        self.assertFalse((self.cible_home / ".ssh").exists())
+        self.assertFalse((self.cible_home / ".claude").exists())
+        self.assertTrue((self.cible_home / ".config/ameesh/config.json").is_file())
+        self.assertFalse((self.cible_home / ".config/ameesh/bascule.env").exists())
+        self.assertFalse((self.cible_home / ".config/ameesh/git-agents.conf").exists())
+        config = json.loads((self.cible_home / ".config/ameesh/config.json").read_text())
+        self.assertNotIn(str(self.source_home), json.dumps(config))
+
+    def test_compte_dans_docker_refuse(self):
+        self.comptes["ameesh"] = M.Compte("ameesh", 1001, 1001,
+                                          str(self.cible_home), "/bin/bash",
+                                          ("ameesh", "docker"))
+        with self.assertRaises(M.Refus):
+            M.verifier_compte_cible(self.ctx)
+        self.assertFalse(self.faux.a_appele("useradd"))
+
+    def test_unites_obsoletes_jamais_copiees(self):
+        M.preparer_unites(self.ctx)
+        cible = self.cible_home / ".config/systemd/user"
+        self.assertTrue((cible / "ameesh-runner-agent@.service").is_file())
+        self.assertTrue((cible / "ameesh-agents.slice").is_file())
+        self.assertFalse((cible / "ameesh-runner-agent@.service.d/"
+                          "cles-owner.conf").exists())
+        self.assertFalse((self.cible_home / ".config/ameesh/"
+                          "git-agents.conf").exists())
+        self.assertTrue(self.faux.a_appele("daemon-reload"))
+        self.assertFalse(self.faux.a_appele("systemctl --user enable"))
+
+    def test_creneau_refuse_une_coupure_proche(self):
+        from datetime import datetime, timedelta
+        try:
+            from zoneinfo import ZoneInfo
+        except Exception:  # pragma: no cover
+            self.skipTest("tzdata absent")
+        fuseau = ZoneInfo("Europe/Paris")
+        prochain = datetime.now(fuseau) + timedelta(minutes=10)
+        self.faux.remplacer("release calendar", 0,
+                            "prochaine %s, cible main"
+                            % prochain.strftime("%d/%m %H:%M"))
+        ok, detail = M.creneau(self.ctx)
+        self.assertFalse(ok)
+        self.assertIn("coupure dans", detail)
+
+    def test_file_de_paquets_active_refusee(self):
+        self.faux.remplacer("work queue show --target main --json", 0,
+                            json.dumps([{"work_item_id": 42, "state": "queued"}]))
+        ok, detail = M.paquets_inactifs(self.ctx)
+        self.assertFalse(ok)
+        self.assertIn("#42", detail)
+
+    def test_commandes_claude_une_par_compte_sans_secret(self):
+        config = M.lire_json(self.source_home / ".config/ameesh/config.json")
+        self.faux.repondre("claude auth status", 0, '{"loggedIn": false}\n')
+        commandes, manques = M.commandes_claude(self.ctx, config, creer=False)
+        self.assertEqual(len(commandes), 2)
+        self.assertTrue(all("CLAUDE_CONFIG_DIR=" in c for c in commandes))
+        self.assertTrue(all("auth login" in c for c in commandes))
+        self.assertTrue(manques)
+        self.assertFalse(any("secret" in c for c in commandes))
+
+    def test_retour_restaure_unites_dropins_et_pauses(self):
+        # état d'une bascule réussie
+        self.ctx.etat_dir.mkdir(parents=True, exist_ok=True)
+        etat = M.etat_vide()
+        etat.update({"stage": "bascule", "actifs": ["ameesh-dev1", "codex2"],
+                     "enabled_source": ["ameesh-dev1", "codex2"],
+                     "enabled_cible": ["ameesh-dev1", "codex2"],
+                     "migre_le": "2026-10-25T10:00:00Z", "canari": "codex2",
+                     "pauses": {}, "pieces_retirees": [
+                         "config/ameesh/git-agents.conf"]})
+        M.ecrit_etat(self.ctx, etat)
+        sauvegarde = self.ctx.etat_dir / "sauvegarde/config/ameesh"
+        sauvegarde.mkdir(parents=True)
+        (sauvegarde / "git-agents.conf").write_text("[credential]\n")
+        # la cible est active ; la source est arrêtée. L'état change après
+        # stop/start, comme un vrai gestionnaire.
+        etat = {"cible": "active", "source": "inactive",
+                "unite_cible": "enabled", "unite_source": "enabled"}
+
+        delegue = self.faux.executer
+
+        def systemctl(argv, env, delai):
+            commande = " ".join(argv)
+            self.faux.appels.append(tuple(argv))
+            if "show" in commande and "ameesh-runner-agent@" in commande:
+                cote = "cible" if env and env.get("HOME") == "/home/ameesh" \
+                    else "source"
+                actif, pid = etat[cote], "123" if etat[cote] == "active" else "0"
+                return M.Resultat(0, "LoadState=loaded\nActiveState=%s\nMainPID=%s\n"
+                                  "UnitFileState=%s\n"
+                                  % (actif, pid, etat["unite_" + cote]))
+            if "systemctl --user stop" in commande:
+                etat["cible"] = "inactive"
+                return M.Resultat(0, "")
+            if "systemctl --user start" in commande:
+                etat["source"] = "active"
+                return M.Resultat(0, "")
+            if "systemctl --user disable" in commande:
+                etat["unite_cible"] = "disabled"
+                return M.Resultat(0, "")
+            if "systemctl --user enable" in commande:
+                etat["unite_source"] = "enabled"
+                return M.Resultat(0, "")
+            if "daemon-reload" in commande or "list-units" in commande:
+                return M.Resultat(0, "")
+            return delegue(argv, env, delai)
+        self.faux.executer = systemctl
+        self.hote.executeur = systemctl
+        # pauses : pose et levée OK
+        for motif in ("ameesh pause", "ameesh resume"):
+            self.faux.repondre(motif, 0, '{"changed": true, "reason": "x"}\n')
+        self.faux.repondre("ameesh show", 0, json.dumps(
+            {"last_turn_ts": 0, "lease_owner": None}))
+        args = mock.Mock(force=False, attente_arret=5)
+        with mock.patch.object(M, "agents_du_poste", return_value=[
+                {"name": "ameesh-dev1", "harness": "claude", "status": "idle"},
+                {"name": "codex2", "harness": "codex", "status": "idle"}]):
+            with mock.patch.object(M, "canon_sync", return_value=(True, "ok")):
+                rc = M.retour(self.ctx, args)
+        self.assertEqual(rc, 0)
+        self.assertTrue((self.source_home / ".config/ameesh/git-agents.conf").is_file())
+        self.assertTrue(self.faux.a_appele("systemctl --user start"))
+        arrets = self.faux.a_appele("systemctl --user stop")
+        self.assertTrue(arrets)
+        self.assertTrue(all("--no-block" in " ".join(a) for a in arrets))
+        self.assertTrue(self.faux.a_appele("systemctl --user disable"))
+        self.assertTrue(self.faux.a_appele("systemctl --user enable"))
+        self.assertEqual(M.lit_etat(self.ctx)["stage"], "retour")
+
+
+    def test_bascule_canari_puis_reste_et_etat_final(self):
+        # source active, cible inactive ; stop/start changent l'état
+        etat_unites = {"source": "active", "cible": "inactive"}
+        delegue = self.faux.executer
+        appels = self.faux.appels
+
+        def systemctl(argv, env, delai):
+            commande = " ".join(argv)
+            appels.append(tuple(argv))
+            if "show" in commande and "ameesh-runner-agent@" in commande:
+                cote = "cible" if env and env.get("HOME") == "/home/ameesh" \
+                    else "source"
+                actif = etat_unites[cote]
+                return M.Resultat(0, "LoadState=loaded\nActiveState=%s\nMainPID=%s\n"
+                                  "UnitFileState=enabled\n"
+                                  % (actif, "123" if actif == "active" else "0"))
+            if "systemctl --user stop" in commande:
+                etat_unites["source"] = "inactive"
+                return M.Resultat(0, "")
+            if "systemctl --user start" in commande:
+                etat_unites["cible"] = "active"
+                return M.Resultat(0, "")
+            if "daemon-reload" in commande or "list-units" in commande:
+                return M.Resultat(0, "")
+            return delegue(argv, env, delai)
+        self.faux.executer = systemctl
+        self.hote.executeur = systemctl
+        for motif, sortie in (
+                ("ameesh pause", '{"changed": true, "reason": "x"}\n'),
+                ("ameesh resume", ""),
+                ("ameesh show", json.dumps(
+                    {"last_turn_ts": 0, "lease_owner": "runner-codex2@laptop",
+                     "lease_expires_ts": 9999999999, "status": "idle"})),
+                ("ameesh mail send", ""),
+        ):
+            self.faux.remplacer(motif, 0, sortie)
+        self.faux.remplacer("systemctl --user show", 0, "")
+        self.ctx.etat_dir.mkdir(parents=True, exist_ok=True)
+        etat = M.etat_vide()
+        etat["stage"] = "prepare"
+        M.ecrit_etat(self.ctx, etat)
+        args = mock.Mock(canari="codex2", attente_arret=5)
+        agents = [{"name": "ameesh-dev1", "harness": "claude", "status": "idle"},
+                  {"name": "codex2", "harness": "codex", "status": "idle"}]
+        with mock.patch.object(M, "agents_du_poste", return_value=agents), \
+                mock.patch.object(M, "verifier_avant_bascule", return_value=[]), \
+                mock.patch.object(M, "canon_sync", return_value=(True, "ok")), \
+                mock.patch.object(M, "verifier_cwd", return_value=[]), \
+                mock.patch.object(M, "test_courrier",
+                                  return_value=(True, "courrier test livré")), \
+                mock.patch.object(M, "attendre_bail",
+                                  return_value=(True, {"lease_owner":
+                                                       "runner-codex2@laptop"})):
+            rc = M.basculer(self.ctx, args)
+        self.assertEqual(rc, 0)
+        final = M.lit_etat(self.ctx)
+        self.assertEqual(final["stage"], "bascule")
+        self.assertIn("courrier test livré", final["preuve_courrier"])
+        self.assertEqual(set(final["actifs"]), {"ameesh-dev1", "codex2"})
+        arrets = self.faux.a_appele("systemctl --user stop")
+        self.assertTrue(arrets)
+        self.assertTrue(all("--no-block" in " ".join(a) for a in arrets))
+        self.assertTrue(self.faux.a_appele("systemctl --user start"))
+        self.assertTrue(self.faux.a_appele("systemctl --user disable"))
+        self.assertTrue(self.faux.a_appele("systemctl --user enable"))
+        # les deux pièces retirées de la source, sauvegardées
+        self.assertFalse((self.source_home / ".config/systemd/user/"
+                          "ameesh-runner-agent@.service.d/cles-owner.conf").exists())
+        self.assertTrue((self.ctx.etat_dir / "sauvegarde/.config/systemd/user/"
+                         "ameesh-runner-agent@.service.d/cles-owner.conf").is_file())
+
+    def test_ssh_owner_eacces_sous_ameesh(self):
+        self.faux.repondre("python3 -c", 0, "EACCES\n")
+        ok, detail = M.verifier_ssh_isole(self.ctx)
+        self.assertTrue(ok, detail)
+        self.assertIn("EACCES", detail)
+
+    def test_docker_rend_la_preuve_rouge(self):
+        self.comptes["ameesh"] = M.Compte("ameesh", 1001, 1001,
+                                          str(self.cible_home), "/bin/bash",
+                                          ("ameesh", "docker"))
+        ok, detail = M.verifier_docker(self.ctx)
+        self.assertFalse(ok)
+        self.assertIn("docker", detail)
+
+    def test_git_fetch_ssh_utilise_la_cle_du_home(self):
+        self.faux.repondre("git fetch", 0, "")
+        ok, detail = M.git_ssh_fetch(self.ctx)
+        self.assertTrue(ok, detail)
+        appels = [appel for appel in self.faux.appels if "fetch" in " ".join(appel)]
+        self.assertTrue(appels)
+        self.assertIn("git@github.com", " ".join(appels[0]))
+
+    def test_obsolete_retiree_et_sauvegardee(self):
+        etat = M.etat_vide()
+        M.retirer_pieces_obsoletes(self.ctx, etat)
+        self.assertFalse((self.source_home / ".config/systemd/user/"
+                          "ameesh-runner-agent@.service.d/cles-owner.conf").exists())
+        self.assertFalse((self.source_home / ".config/ameesh/git-agents.conf").exists())
+        self.assertTrue((self.ctx.etat_dir / "sauvegarde/.config/systemd/user/"
+                         "ameesh-runner-agent@.service.d/cles-owner.conf").is_file())
+        self.assertIn("pieces_retirees", etat)
+
+    # ------------------------------------------------------------------
+    # régressions de la relecture dev1 (4 bloquants)
+    # ------------------------------------------------------------------
+
+    def test_preparer_venv_activer_sans_src(self):
+        """B1 : `bascule.py activer` refuse `--src` ; seule `preparer` le prend."""
+        destination = self.cible_home / ".local/share/ameesh/src-abcdef0"
+        (destination / "deploy/mise-a-jour").mkdir(parents=True)
+        (destination / "deploy/mise-a-jour/bascule.py").write_text("# faux\n")
+        M.preparer_venv(self.ctx)
+        commandes = [" ".join(appel) for appel in self.faux.appels
+                     if "deploy/mise-a-jour/bascule.py" in " ".join(appel)]
+        preparer = [c for c in commandes if " preparer " in c]
+        activer = [c for c in commandes if " activer " in c]
+        self.assertEqual(len(preparer), 1, commandes)
+        self.assertEqual(len(activer), 1, commandes)
+        self.assertIn("--src", preparer[0])
+        self.assertNotIn("--src", activer[0])
+        self.assertIn("--version", activer[0])
+
+    def test_preparer_refuse_espace_insuffisant_avant_copie(self):
+        """B3 : l'espace est vérifié avant la première copie, pas pendant."""
+        besoin = M.besoin_espace(self.ctx)
+        self.assertGreater(besoin["home"], 0)
+        with mock.patch.object(M.shutil, "disk_usage",
+                               return_value=mock.Mock(free=1024)):
+            with self.assertRaises(M.Refus) as refus:
+                M.verifier_espace(self.ctx, {"home": 10**12, "development": 0})
+        self.assertIn("espace insuffisant", str(refus.exception))
+        # la garde est bien branchée avant toute copie
+        with mock.patch.object(M, "creer_compte"), \
+                mock.patch.object(M, "preparer_dossiers"), \
+                mock.patch.object(M, "verifier_espace",
+                                  side_effect=M.Refus("plein")) as garde, \
+                mock.patch.object(M, "preparer_config") as copie:
+            with self.assertRaises(M.Refus):
+                M.preparer(self.ctx, M.etat_vide())
+        garde.assert_called_once()
+        copie.assert_not_called()
+
+    def test_espace_supplement_tient_compte_de_la_cible(self):
+        """Une reprise ne redemande pas l'espace déjà occupé par la pré-copie."""
+        besoin = M.besoin_espace(self.ctx)
+        with mock.patch.object(M, "_mesure_arbres", return_value=besoin):
+            supplement = M.espace_supplement(self.ctx, besoin)
+        self.assertEqual(supplement, {"development": 0, "home": 0})
+
+    def test_basculer_interrompu_remet_la_source(self):
+        """B4 : un Ctrl-C pendant l'arrêt restaure la source et lève les pauses."""
+        etat_unites = {"source": "active", "cible": "inactive",
+                       "unite_cible": "enabled", "unite_source": "enabled"}
+        delegue = self.faux.executer
+
+        def systemctl(argv, env, delai):
+            commande = " ".join(argv)
+            self.faux.appels.append(tuple(argv))
+            if "show" in commande and "ameesh-runner-agent@" in commande:
+                cote = "cible" if env and env.get("HOME") == "/home/ameesh" \
+                    else "source"
+                actif = etat_unites[cote]
+                return M.Resultat(0, "LoadState=loaded\nActiveState=%s\nMainPID=%s\n"
+                                  "UnitFileState=%s\n"
+                                  % (actif, "123" if actif == "active" else "0",
+                                     etat_unites["unite_" + cote]))
+            if "systemctl --user stop" in commande:
+                raise KeyboardInterrupt
+            if "systemctl --user start" in commande:
+                etat_unites["source"] = "active"
+                return M.Resultat(0, "")
+            if "systemctl --user disable" in commande:
+                etat_unites["unite_cible"] = "disabled"
+                return M.Resultat(0, "")
+            if "systemctl --user enable" in commande:
+                etat_unites["unite_source"] = "enabled"
+                return M.Resultat(0, "")
+            if "daemon-reload" in commande or "list-units" in commande:
+                return M.Resultat(0, "")
+            return delegue(argv, env, delai)
+        self.faux.executer = systemctl
+        self.hote.executeur = systemctl
+        for motif in ("ameesh pause", "ameesh resume"):
+            self.faux.repondre(motif, 0, '{"changed": true, "reason": "x"}\n')
+        self.faux.repondre("ameesh show", 0, json.dumps(
+            {"last_turn_ts": 0, "lease_owner": None,
+             "cwd": str(self.source_home / "development/manaty/ameesh-dev1")}))
+        self.faux.remplacer("systemctl --user show", 0, "")
+        self.ctx.etat_dir.mkdir(parents=True, exist_ok=True)
+        etat = M.etat_vide()
+        etat["stage"] = "prepare"
+        M.ecrit_etat(self.ctx, etat)
+        args = mock.Mock(canari="codex2", attente_arret=5)
+        agents = [{"name": "ameesh-dev1", "harness": "claude", "status": "idle"},
+                  {"name": "codex2", "harness": "codex", "status": "idle"}]
+        with mock.patch.object(M, "agents_du_poste", return_value=agents), \
+                mock.patch.object(M, "verifier_avant_bascule", return_value=[]):
+            with self.assertRaises(KeyboardInterrupt):
+                M.basculer(self.ctx, args)
+        final = M.lit_etat(self.ctx)
+        self.assertEqual(final["stage"], "prepare")
+        self.assertEqual(final["pauses"], {})
+        self.assertEqual(set(final["actifs"]), {"ameesh-dev1", "codex2"})
+        self.assertTrue(self.faux.a_appele("systemctl --user start"))
+        self.assertTrue(self.faux.a_appele("ameesh resume"))
+
+    def test_basculer_canari_echoue_ne_rend_pas_prepare(self):
+        """B cx1/dev2 : canari démarré puis sorti/failed avant l'échec du
+        courrier — l'annulation ne doit pas rendre `prepare` (home utilisé)."""
+        etat_unites = {"source": "active", "cible": "inactive",
+                       "unite_cible": "enabled", "unite_source": "enabled"}
+        delegue = self.faux.executer
+        demarrages_source = []
+
+        def systemctl(argv, env, delai):
+            commande = " ".join(argv)
+            self.faux.appels.append(tuple(argv))
+            if "show" in commande and "ameesh-runner-agent@" in commande:
+                cote = "cible" if env and env.get("HOME") == "/home/ameesh" \
+                    else "source"
+                actif = etat_unites[cote]
+                return M.Resultat(0, "LoadState=loaded\nActiveState=%s\nMainPID=%s\n"
+                                  "UnitFileState=%s\n"
+                                  % (actif, "123" if actif == "active" else "0",
+                                     etat_unites["unite_" + cote]))
+            if "systemctl --user stop" in commande:
+                etat_unites["source"] = "inactive"
+                return M.Resultat(0, "")
+            if "systemctl --user start" in commande:
+                if env and env.get("HOME") == "/home/ameesh":
+                    etat_unites["cible"] = "active"
+                else:
+                    demarrages_source.append(commande)
+                    etat_unites["source"] = "active"
+                return M.Resultat(0, "")
+            if "systemctl --user disable" in commande:
+                if env and env.get("HOME") == "/home/ameesh":
+                    etat_unites["unite_cible"] = "disabled"
+                else:
+                    etat_unites["unite_source"] = "disabled"
+                return M.Resultat(0, "")
+            if "systemctl --user enable" in commande:
+                if env and env.get("HOME") == "/home/ameesh":
+                    etat_unites["unite_cible"] = "enabled"
+                else:
+                    etat_unites["unite_source"] = "enabled"
+                return M.Resultat(0, "")
+            if "daemon-reload" in commande or "list-units" in commande:
+                return M.Resultat(0, "")
+            return delegue(argv, env, delai)
+        self.faux.executer = systemctl
+        self.hote.executeur = systemctl
+        for motif in ("ameesh pause", "ameesh resume"):
+            self.faux.repondre(motif, 0, '{"changed": true, "reason": "x"}\n')
+        self.faux.repondre("ameesh show", 0, json.dumps(
+            {"last_turn_ts": 0, "lease_owner": None,
+             "cwd": str(self.source_home / "development/manaty/ameesh-dev1")}))
+        self.faux.remplacer("systemctl --user show", 0, "")
+        self.ctx.etat_dir.mkdir(parents=True, exist_ok=True)
+        etat = M.etat_vide()
+        etat["stage"] = "prepare"
+        M.ecrit_etat(self.ctx, etat)
+
+        def courrier(*_args, **_kwargs):
+            # le canari a tourné, puis son unité est sortie/failed
+            etat_unites["cible"] = "inactive"
+            return False, "courrier non consommé (canari sorti)"
+
+        args = mock.Mock(canari="codex2", attente_arret=5)
+        agents = [{"name": "ameesh-dev1", "harness": "claude", "status": "idle"},
+                  {"name": "codex2", "harness": "codex", "status": "idle"}]
+        with mock.patch.object(M, "agents_du_poste", return_value=agents), \
+                mock.patch.object(M, "verifier_avant_bascule", return_value=[]), \
+                mock.patch.object(M, "canon_sync", return_value=(True, "ok")), \
+                mock.patch.object(M, "verifier_cwd", return_value=[]), \
+                mock.patch.object(M, "test_courrier", side_effect=courrier), \
+                mock.patch.object(M, "attendre_bail",
+                                  return_value=(True, {"lease_owner":
+                                                       "runner-codex2@laptop"})):
+            with self.assertRaises(M.Refus):
+                M.basculer(self.ctx, args)
+        final = M.lit_etat(self.ctx)
+        self.assertEqual(final["stage"], "bascule")
+        self.assertTrue(final.get("cible_demarree"))
+        self.assertEqual(demarrages_source, [],
+                         "l'annulation ne doit pas redémarrer la source")
+        with self.assertRaises(M.Refus):
+            M.commande_preparer(self.ctx, mock.Mock())
+        with self.assertRaises(M.Refus):
+            M.commande_identites(self.ctx, mock.Mock())
+
+    def test_retour_force_reprend_les_actifs_persistes(self):
+        """B4 : après une coupure avant `stage=bascule`, `retour --force`
+        redémarre l'ensemble actif écrit avant l'arrêt et lève ses pauses."""
+        etat = M.etat_vide()
+        etat.update({"stage": "prepare",
+                     "actifs": ["ameesh-dev1", "codex2"],
+                     "enabled_source": ["ameesh-dev1", "codex2"],
+                     "enabled_cible": [],
+                     "pauses": {"ameesh-dev1": "migration #3549 (interrompue)",
+                                "codex2": "migration #3549 (interrompue)"}})
+        M.ecrit_etat(self.ctx, etat)
+        etat_unites = {"source": "inactive", "cible": "inactive"}
+        delegue = self.faux.executer
+
+        def systemctl(argv, env, delai):
+            commande = " ".join(argv)
+            self.faux.appels.append(tuple(argv))
+            if "show" in commande and "ameesh-runner-agent@" in commande:
+                cote = "cible" if env and env.get("HOME") == "/home/ameesh" \
+                    else "source"
+                actif = etat_unites[cote]
+                return M.Resultat(0, "LoadState=loaded\nActiveState=%s\nMainPID=%s\n"
+                                  "UnitFileState=enabled\n"
+                                  % (actif, "123" if actif == "active" else "0"))
+            if "systemctl --user start" in commande:
+                etat_unites["source"] = "active"
+                return M.Resultat(0, "")
+            if "systemctl --user stop" in commande:
+                etat_unites["cible"] = "inactive"
+                return M.Resultat(0, "")
+            if "daemon-reload" in commande or "list-units" in commande:
+                return M.Resultat(0, "")
+            return delegue(argv, env, delai)
+        self.faux.executer = systemctl
+        self.hote.executeur = systemctl
+        for motif in ("ameesh pause", "ameesh resume"):
+            self.faux.repondre(motif, 0, '{"changed": true, "reason": "x"}\n')
+        self.faux.repondre("ameesh show", 0,
+                           json.dumps({"last_turn_ts": 0, "lease_owner": None}))
+        args = mock.Mock(force=True, attente_arret=5)
+        agents = [{"name": "ameesh-dev1", "harness": "claude", "status": "idle"},
+                  {"name": "codex2", "harness": "codex", "status": "idle"}]
+        with mock.patch.object(M, "agents_du_poste", return_value=agents), \
+                mock.patch.object(M, "canon_sync", return_value=(True, "ok")):
+            rc = M.retour(self.ctx, args)
+        self.assertEqual(rc, 0)
+        final = M.lit_etat(self.ctx)
+        self.assertEqual(final["stage"], "retour")
+        self.assertEqual(final["pauses"], {})
+        demarrages = self.faux.a_appele("systemctl --user start")
+        self.assertTrue(any("ameesh-dev1" in " ".join(a) for a in demarrages))
+        self.assertTrue(any("codex2" in " ".join(a) for a in demarrages))
+        self.assertTrue(self.faux.a_appele("ameesh resume"))
+
+    # ------------------------------------------------------------------
+    # régressions de la relecture cx3 (7 constats ; B2, B3, B6 ici)
+    # ------------------------------------------------------------------
+
+    def test_dossiers_identites_chownes_avant_appel_cible(self):
+        """B2 cx3 : les dossiers neufs (gh, Codex, Claude, config_dir
+        secondaire) appartiennent au compte cible avant tout appel sous cible."""
+        config = M.lire_json(self.source_home / ".config/ameesh/config.json")
+        with mock.patch.object(M, "chown_cible") as chown:
+            M.preparer_gh(self.ctx, config)
+            M.preparer_codex(self.ctx, config)
+            M.commandes_claude(self.ctx, config)
+        chemins = [str(appel.args[1]) for appel in chown.call_args_list]
+        for attendu in (".config/gh", ".codex", ".claude", ".claude-secondary"):
+            self.assertTrue(any(p.endswith(attendu) for p in chemins),
+                            "%s absent de %s" % (attendu, chemins))
+
+    def test_annulation_retablit_les_cwd_source(self):
+        """B3 cx3 : après canon_sync cible, un échec avant tout démarrage
+        cible rétablit les cwd sous la source avant de la redémarrer."""
+        etat_unites = {"source": "active", "cible": "inactive",
+                       "unite_cible": "enabled", "unite_source": "enabled"}
+        delegue = self.faux.executer
+
+        def systemctl(argv, env, delai):
+            commande = " ".join(argv)
+            self.faux.appels.append(tuple(argv))
+            if "show" in commande and "ameesh-runner-agent@" in commande:
+                cote = "cible" if env and env.get("HOME") == "/home/ameesh" \
+                    else "source"
+                actif = etat_unites[cote]
+                return M.Resultat(0, "LoadState=loaded\nActiveState=%s\nMainPID=%s\n"
+                                  "UnitFileState=%s\n"
+                                  % (actif, "123" if actif == "active" else "0",
+                                     etat_unites["unite_" + cote]))
+            if "systemctl --user stop" in commande:
+                etat_unites["source"] = "inactive"
+                return M.Resultat(0, "")
+            if "systemctl --user start" in commande:
+                etat_unites["source"] = "active"
+                return M.Resultat(0, "")
+            if "systemctl --user disable" in commande:
+                if env and env.get("HOME") == "/home/ameesh":
+                    etat_unites["unite_cible"] = "disabled"
+                else:
+                    etat_unites["unite_source"] = "disabled"
+                return M.Resultat(0, "")
+            if "systemctl --user enable" in commande:
+                if env and env.get("HOME") == "/home/ameesh":
+                    etat_unites["unite_cible"] = "enabled"
+                else:
+                    etat_unites["unite_source"] = "enabled"
+                return M.Resultat(0, "")
+            if "daemon-reload" in commande or "list-units" in commande:
+                return M.Resultat(0, "")
+            return delegue(argv, env, delai)
+        self.faux.executer = systemctl
+        self.hote.executeur = systemctl
+        for motif in ("ameesh pause", "ameesh resume"):
+            self.faux.repondre(motif, 0, '{"changed": true, "reason": "x"}\n')
+        self.faux.repondre("ameesh show", 0, json.dumps(
+            {"last_turn_ts": 0, "lease_owner": None,
+             "cwd": str(self.source_home / "development/manaty/ameesh-dev1")}))
+        self.faux.remplacer("systemctl --user show", 0, "")
+        self.ctx.etat_dir.mkdir(parents=True, exist_ok=True)
+        etat = M.etat_vide()
+        etat["stage"] = "prepare"
+        M.ecrit_etat(self.ctx, etat)
+        syncs = []
+
+        def canon_sync(ctx_, *, cible):
+            syncs.append(cible)
+            return True, "ok"
+
+        def verifier_cwd(ctx_, agents, *, cible):
+            return ["codex2 : cwd cible absent"] if cible else []
+
+        args = mock.Mock(canari="codex2", attente_arret=5)
+        agents = [{"name": "ameesh-dev1", "harness": "claude", "status": "idle"},
+                  {"name": "codex2", "harness": "codex", "status": "idle"}]
+        with mock.patch.object(M, "agents_du_poste", return_value=agents), \
+                mock.patch.object(M, "verifier_avant_bascule", return_value=[]), \
+                mock.patch.object(M, "canon_sync", side_effect=canon_sync), \
+                mock.patch.object(M, "verifier_cwd", side_effect=verifier_cwd):
+            with self.assertRaises(M.Refus):
+                M.basculer(self.ctx, args)
+        self.assertIn(True, syncs)
+        self.assertIn(False, syncs)
+        self.assertTrue(self.faux.a_appele("systemctl --user start"))
+        self.assertEqual(M.lit_etat(self.ctx)["stage"], "prepare")
+
+    def test_retour_disable_cible_echoue_sans_demarrer_source(self):
+        """B6 cx3 : un disable cible refusé n'est pas masqué ; la source n'est
+        ni réactivée ni redémarrée."""
+        etat = M.etat_vide()
+        etat.update({"stage": "bascule", "actifs": ["ameesh-dev1"],
+                     "enabled_source": ["ameesh-dev1"],
+                     "enabled_cible": ["ameesh-dev1"],
+                     "migre_le": "2026-10-25T10:00:00Z", "canari": "codex2",
+                     "pauses": {}})
+        M.ecrit_etat(self.ctx, etat)
+        delegation = self.faux.executer
+
+        def systemctl(argv, env, delai):
+            commande = " ".join(argv)
+            self.faux.appels.append(tuple(argv))
+            if "show" in commande and "ameesh-runner-agent@" in commande:
+                return M.Resultat(0, "LoadState=loaded\nActiveState=inactive\n"
+                                  "MainPID=0\nUnitFileState=enabled\n")
+            if "systemctl --user stop" in commande:
+                return M.Resultat(0, "")
+            if "systemctl --user disable" in commande:
+                return M.Resultat(1, "", "disable refusé (test)")
+            if "daemon-reload" in commande or "list-units" in commande:
+                return M.Resultat(0, "")
+            return delegation(argv, env, delai)
+        self.faux.executer = systemctl
+        self.hote.executeur = systemctl
+        for motif in ("ameesh pause", "ameesh resume"):
+            self.faux.repondre(motif, 0, '{"changed": true, "reason": "x"}\n')
+        args = mock.Mock(force=True, attente_arret=5)
+        agents = [{"name": "ameesh-dev1", "harness": "claude", "status": "idle"}]
+        with mock.patch.object(M, "agents_du_poste", return_value=agents):
+            with self.assertRaises(M.Refus):
+                M.retour(self.ctx, args)
+        self.assertFalse(self.faux.a_appele("systemctl --user start"))
+        self.assertFalse(self.faux.a_appele("systemctl --user enable"))
+
+    # ------------------------------------------------------------------
+    # régressions des seconds verdicts dev2 (#19076) et cx3 (#19075)
+    # ------------------------------------------------------------------
+
+    def test_espace_agrege_par_systeme_de_fichiers(self):
+        """B7 cx3 / B3 dev2 : 60 Gio + 60 Gio sur le même FS, 100 Gio libres."""
+        besoin = {"home": 60 * 2**30, "development": 60 * 2**30}
+        with mock.patch.object(M.shutil, "disk_usage",
+                               return_value=mock.Mock(free=100 * 2**30)):
+            manques = M.manques_espace(self.ctx, besoin)
+        self.assertTrue(manques, "le total sur le même FS doit être comparé")
+        self.assertIn("development + home", manques[0])
+
+    def test_espace_marge_rsync_meme_si_supplement_nul(self):
+        """B7 cx3 : la soustraction source−cible ne supprime pas la marge rsync."""
+        with mock.patch.object(M.shutil, "disk_usage",
+                               return_value=mock.Mock(free=1 * 2**30)):
+            manques = M.manques_espace(self.ctx, {"home": 0, "development": 0})
+        self.assertTrue(manques)
+        with mock.patch.object(M.shutil, "disk_usage",
+                               return_value=mock.Mock(free=6 * 2**30)):
+            manques = M.manques_espace(self.ctx, {"home": 0, "development": 0})
+        self.assertFalse(manques)
+
+    def test_etat_enabled_show_rc1_nest_pas_une_preuve(self):
+        """N cx3 : un show rc1 (sortie vide) ne conclut pas à la désactivation."""
+        self.faux.remplacer("systemctl --user show", 1, "", "bus absent")
+        actifs = M.etat_enabled(self.ctx, ["ameesh-dev1"], cible=True)
+        self.assertEqual(actifs, ["ameesh-dev1"])
+
+    def test_preparer_et_identites_refuses_apres_bascule(self):
+        """B2 dev2 / B cx1 : preparer/identites ne réécrivent pas un home
+        utilisé, même si l'état a été ramené à `prepare` (témoin monotone)."""
+        args = mock.Mock()
+        for etat in ({"stage": "retour"},
+                     {"stage": "prepare",
+                      "cible_demarree": "2026-10-25T10:00:00Z"}):
+            M.ecrit_etat(self.ctx, M.etat_vide() | etat)
+            with self.assertRaises(M.Refus):
+                M.commande_preparer(self.ctx, args)
+            with self.assertRaises(M.Refus):
+                M.commande_identites(self.ctx, args)
+
+    def test_annuler_refuse_apres_un_demarrage_cible(self):
+        """B cx1/dev2 : une annulation ne remet jamais stage=prepare après
+        une tentative de démarrage cible."""
+        etat = M.etat_vide()
+        etat["stage"] = "bascule"
+        etat["cible_demarree"] = "2026-10-25T10:00:00Z"
+        with self.assertRaises(M.Refus):
+            M.annuler_avant_canari(self.ctx, ["ameesh-dev1"], {}, etat)
+        self.assertFalse(self.faux.a_appele("systemctl --user start"))
+
+    def test_preparer_autorise_a_l_etape_prepare(self):
+        """La garde de stage laisse la reprise idempotente à `prepare`."""
+        etat = M.etat_vide()
+        etat["stage"] = "prepare"
+        M.ecrit_etat(self.ctx, etat)
+        with mock.patch.object(M, "preparer") as preparation, \
+                mock.patch.object(M, "agents_du_poste", return_value=[]):
+            self.assertEqual(M.commande_preparer(self.ctx, mock.Mock()), 0)
+        preparation.assert_called_once()
+
+    def test_session_liee_refusee_avec_unite_transitoire(self):
+        """B1 dev2 : une session liée est refusée avant tout arrêt, y compris
+        une liaison trouvée mais non valide (whoami rc1 + description)."""
+        self.faux.repondre("ameesh mail whoami", 0,
+                           "codex [session] claude pid 532757\n")
+        with self.assertRaises(M.Refus) as refus:
+            M.verifier_hors_session_liee(self.ctx)
+        self.assertIn("systemd-run", str(refus.exception))
+        self.faux.remplacer("ameesh mail whoami", 1, "",
+                            "unbound identity: binding pid 1 not in the hook "
+                            "ancestry\n(binding claude 01abc on pc-smichea, "
+                            "pid 532757, by smichea)\n")
+        with self.assertRaises(M.Refus):
+            M.verifier_hors_session_liee(self.ctx)
+        self.faux.remplacer("ameesh mail whoami", 1, "",
+                            "unbound identity: AGENT_MAIL_NAME not set\n")
+        M.verifier_hors_session_liee(self.ctx)  # sans session liée : passe
+
+    def test_ecriture_refuse_un_lien_symbolique(self):
+        """B2 dev2 : root ne suit pas un lien planté dans le home cible."""
+        cible = self.cible_home / ".config/ameesh/env"
+        cible.parent.mkdir(parents=True, exist_ok=True)
+        victime = self.racine / "victime-root"
+        victime.write_text("intact\n")
+        cible.symlink_to(victime)
+        with self.assertRaises(M.Refus):
+            M.ecrire_fichier(self.ctx, cible, "remplacé\n")
+        self.assertEqual(victime.read_text(), "intact\n")
+
+    def test_chemin_cible_ne_reecrit_qu_un_prefixe_de_home(self):
+        """N dev2 : un chemin qui contient le home sans en être un n'est pas réécrit."""
+        piege = "/prefix" + str(self.source_home) + "/x"
+        self.assertEqual(str(M.chemin_cible(self.ctx, piege, "d")), piege)
+        chemin = str(self.source_home) + "/.codex"
+        self.assertEqual(str(M.chemin_cible(self.ctx, chemin, "d")),
+                         str(self.cible_home) + "/.codex")
+
+
+if __name__ == "__main__":
+    unittest.main()

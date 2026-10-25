@@ -174,8 +174,11 @@ FERMEES = {
     # L165 (EP2, 0476) : scores de candidats d'un rôle élu, lus par les
     # exécuteurs candidats et `ameesh role status`, pas par le rôle
     # superviseur ; table interne fermée aux deux rôles, aucun GRANT ajouté.
+    # #3568 (0485) : la route de poussée publiée avec le relevé (notify_ok,
+    # notify_diagnostic) reste interne à l'élection, fermée de même.
     "role_standings": {"id", "name", "host", "evaluated_at", "availability",
-                       "capacity", "score", "ready", "diagnostic"},
+                       "capacity", "score", "ready", "diagnostic",
+                       "notify_ok", "notify_diagnostic"},
     # #3099 (0478) : marque de libération d'une bascule de rôle élu, côté hôte
     # détenteur, relue par l'exécuteur au redémarrage ; état interne fermé aux
     # deux rôles superviseur, aucun GRANT modifié.
