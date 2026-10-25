@@ -85,9 +85,26 @@ class DebitDependanceTest(unittest.TestCase):
         self.assertNotIn((3260, "qa_merge"),
                          [(row["lot"], row["kind"]) for row in report["slow_waits"]])
         self.assertNotIn(3260, [row["lot"] for row in report["slow_waits"]])
-        # L'attente reste celle du parent, dont le hold porte la cause.
-        self.assertIn((693, "hold"),
-                      [(row["lot"], row["kind"]) for row in report["slow_waits"]])
+        # L'attente reste celle du parent, dont le hold porte la cause et
+        # nomme le lot qu'il transporte.
+        hold = [row for row in report["slow_waits"] if row["lot"] == 693][0]
+        self.assertEqual(hold["kind"], "hold")
+        self.assertEqual(hold["dependents"], [3260])
+
+    def test_le_paquet_du_parent_porte_le_lot_dependant(self):
+        parent_milestones, parent_events = reviewed(693, 100, T - 10 * H)
+        child_milestones, child_events = reviewed(3260, 200, T - 5 * H)
+        report = run(
+            items=[item(693, branch="agent/deepseek6-693-eco-exp-1"),
+                   item(3260, branch="review/codex2-3260-expiry",
+                        branch_target="agent/deepseek6-693-eco-exp-1",
+                        assignee="codex2")],
+            milestones=parent_milestones + child_milestones,
+            events=parent_events + child_events)
+        parent = [row for row in report["slow_waits"]
+                  if (row["lot"], row["kind"]) == (693, "qa_merge")][0]
+        self.assertEqual(parent["dependents"], [3260])
+        self.assertNotIn(3260, [row["lot"] for row in report["slow_waits"]])
 
     def test_cible_develop_reste_une_attente_de_paquet(self):
         child_milestones, child_events = reviewed(3260, 200, T - 25 * H)
@@ -218,8 +235,9 @@ class ReadDependanceTest(PgTestCase):
         child = [row for row in report["qa"] if row["lot"] == 7001][0]
         self.assertEqual(child["depends_on"], 7000)
         self.assertNotIn(7001, [row["lot"] for row in report["slow_waits"]])
-        self.assertIn((7000, "hold"),
-                      [(row["lot"], row["kind"]) for row in report["slow_waits"]])
+        hold = [row for row in report["slow_waits"] if row["lot"] == 7000][0]
+        self.assertEqual(hold["kind"], "hold")
+        self.assertEqual(hold["dependents"], [7001])
 
 
 if __name__ == "__main__":

@@ -851,13 +851,20 @@ def build(*, items: Iterable[Mapping[str, Any]],
     # Une cible qui est la branche d'un lot encore ouvert est une dépendance :
     # le lot ne peut pas entrer seul dans un paquet, il suit le lot parent
     # (dont le hold, s'il y en a un, porte déjà l'attente) (#3437).
+    dependents_by_lot: dict[int, list[int]] = {}
     for row in qa:
         parent = _target_lot(int(row["lot"]), by_id[int(row["lot"])], open_branches)
         if parent is not None:
             row["depends_on"] = parent
+            dependents_by_lot.setdefault(parent, []).append(int(row["lot"]))
 
     # -- tableau des attentes de plus de 2 h --------------------------------
     waits: list[dict] = []
+
+    def dependents_of(lot) -> dict:
+        """Les lots relus que ce lot transporte : leur attente est la sienne."""
+        children = dependents_by_lot.get(int(lot))
+        return {"dependents": sorted(children)} if children else {}
 
     def add_wait(kind, entry, since, who, gesture, level=1, human=False, **extra):
         age = _age(now, since)
@@ -890,7 +897,8 @@ def build(*, items: Iterable[Mapping[str, Any]],
             if row.get("depends_on"):
                 continue                # l'attente est celle du lot parent
             add_wait("qa_merge", row, row["frozen_ts"], "paquet",
-                     GESTURES["qa_merge"], level=2, human=_human_wait(state))
+                     GESTURES["qa_merge"], level=2, human=_human_wait(state),
+                     **dependents_of(row["lot"]))
     for row in blocked_reviews:
         add_wait("blocking_review", row, row["blocked_ts"],
                  row.get("assignee") or row.get("reviewer") or "auteur",
@@ -907,15 +915,16 @@ def build(*, items: Iterable[Mapping[str, Any]],
         if row.get("device"):
             add_wait("hold_device", row, row["since_ts"], row.get("by") or "?",
                      GESTURES["hold_device"], level=2, device=row["device"],
-                     human=human)
+                     human=human, **dependents_of(row["lot"]))
         elif row.get("undeployed"):
             add_wait("hold_undeployed", row, row["since_ts"], row.get("by") or "?",
                      GESTURES["hold_undeployed"], level=2,
-                     version=row.get("version"), human=human)
+                     version=row.get("version"), human=human,
+                     **dependents_of(row["lot"]))
         else:
             add_wait("hold", row, row["since_ts"], row.get("by") or "?",
                      GESTURES["hold"].format(who=row.get("by") or "?"), level=2,
-                     human=human)
+                     human=human, **dependents_of(row["lot"]))
     for row in wakes_out:
         if row.get("overdue"):
             add_wait("wake_overdue", row, row["due_ts"],
