@@ -638,9 +638,16 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
     # blocage ni avis requis, il vaut None (la porte est ouverte au gel). C'est
     # l'instant d'admissibilité du train, pas une nouvelle règle pour la file.
 
-    Rend `{ok, why, class, required, accepted, blocked, waived, author,
-    author_family, authors, corrections, on_freeze, unproven, completed_ts,
-    vehicle}` ; ne lève jamais.
+    #3400 : sur le chemin anticipé (#3397), les `ok` comptés ne sont pas des
+    # avis **acceptés** — le filtre d'indépendance (auteurs, correcteurs,
+    # familles) n'a pas été appliqué, et la lecture qui le prouverait est
+    # précisément celle qu'on évite. Ils sont donc rendus dans
+    # `accepted_unfiltered` ; `accepted` reste la liste des seuls avis dont
+    # l'indépendance est prouvée, vide quand la porte se ferme sans la lire.
+
+    Rend `{ok, why, class, required, accepted, accepted_unfiltered, blocked,
+    waived, author, author_family, authors, corrections, on_freeze, unproven,
+    completed_ts, vehicle}` ; ne lève jamais.
     """
     from . import lot_class
     klass = klass or {}
@@ -664,7 +671,8 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
     waived, waived_by, row = _waiver(db, item)
     author = str(row.get("assignee") or "").strip()
     out = {"ok": False, "why": "", "error": "", "class": cls, "required": 0,
-           "accepted": [], "blocked": [], "waived": waived, "waived_by": waived_by,
+           "accepted": [], "accepted_unfiltered": [], "blocked": [],
+           "waived": waived, "waived_by": waived_by,
            "author": author, "author_family": "", "authors": [],
            "corrections": [], "on_freeze": 0, "unproven": [], "vehicle": None,
            "exclude_author_family": exclude_author_family,
@@ -821,16 +829,23 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
     latest_ok = [mark for mark in latest.values()
                  if (mark.get("verdict") or "") == "ok"]
     if len(latest_ok) < required and callable(getattr(db, "query", None)):
-        accepted = [{"actor": str(mark.get("actor") or ""),
-                     "family": _family_of(mark.get("actor")),
-                     "id": mark.get("id"), "at_ts": mark.get("at_ts")}
-                    for mark in sorted(latest_ok, key=_mark_order)]
-        out["accepted"] = accepted
+        # #3400 (auditeur sur #3397) : ces `ok` ne sont pas des avis
+        # **acceptés**. Le filtre d'indépendance (auteurs, correcteurs,
+        # familles) n'a pas été appliqué — c'est la lecture Git qu'on évite —
+        # donc `accepted` les compterait à tort. Ils restent lisibles sous
+        # `accepted_unfiltered`, un nom qui ne les fait pas passer pour des
+        # avis indépendants ; aucune décision ne lit `accepted` sur une porte
+        # fermée (`packet_candidates` exige `ok`).
+        unfiltered = [{"actor": str(mark.get("actor") or ""),
+                       "family": _family_of(mark.get("actor")),
+                       "id": mark.get("id"), "at_ts": mark.get("at_ts")}
+                      for mark in sorted(latest_ok, key=_mark_order)]
+        out["accepted_unfiltered"] = unfiltered
         need = ("two independent verdicts from different model families, neither from "
                 "an author's" if required >= 2 else "one verdict from another agent")
         got = ", ".join("%s (%s)" % (entry["actor"] or "?",
                                      entry["family"] or "famille inconnue")
-                        for entry in accepted) or "aucun"
+                        for entry in unfiltered) or "aucun"
         out["why"] = ("no review verdict ok on the freeze %s (class: %s): %d independent "
                       "review verdict(s) required, %s; got %s"
                       % (frozen[:12], cls, required, need, got))
@@ -841,6 +856,9 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
         if unproven:
             out["why"] += ("; %d verdict(s) without an exact provenance receipt were "
                            "not counted (sensitive class, #2928)" % len(unproven))
+        if unfiltered:
+            out["why"] += ("; these %d ok verdict(s) are not proven independent "
+                           "(no author reading)" % len(unfiltered))
         return out
     # #2726 : la porte lit elle-même la plage gelée quand l'appelant ne passe
     # pas les auteurs — le feu, la file et le paquet, qui ne les lisaient pas.
