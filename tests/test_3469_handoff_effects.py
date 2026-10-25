@@ -596,6 +596,17 @@ class EffectsTest(RequestMixin, unittest.TestCase):
         self.assertEqual(replay, receipt)
         self.assertEqual(calls, [])
 
+    def test_transfer_creates_a_deep_work_parent_through_descriptors(self):
+        target = self.fx.work / 'a' / 'systemd' / 'system' / 'checkout'
+        effects = companion.HostEffects(
+            enrollment=self.fx.execution, system=self.fx.system,
+            work_dir=lambda agent, project: str(target))
+        receipt = effects.perform(self.request(self.fx, 'transfer'))
+        self.assertIs(receipt['ok'], True)
+        self.assertEqual(receipt['cwd'], str(target))
+        self.assertEqual(git('rev-parse', 'HEAD', cwd=target,
+                             home=self.fx.root).stdout.strip(), self.fx.commit)
+
     def test_transfer_refuses_a_linked_work_root(self):
         outside = self.fx.root / 'outside'
         outside.mkdir()
@@ -642,10 +653,10 @@ class EffectsTest(RequestMixin, unittest.TestCase):
     def test_receipt_written_before_state_is_repaired_on_replay(self):
         real = companion._atomic_json
 
-        def fail_state(path, value):
+        def fail_state(path, value, **kwargs):
             if Path(path).name == 'state.json' and value.get('last_ok') is True:
                 raise companion.Uncertain('test crash after receipt')
-            return real(path, value)
+            return real(path, value, **kwargs)
 
         with mock.patch.object(companion, '_atomic_json',
                                side_effect=fail_state):
@@ -932,13 +943,27 @@ class DispatcherTest(unittest.TestCase):
 
     def test_atomic_json_refuses_a_linked_parent(self):
         with tempfile.TemporaryDirectory() as temp:
-            real = Path(temp) / 'real'
+            root = Path(temp)
+            real = root / 'real'
             real.mkdir()
-            link = Path(temp) / 'link'
+            link = root / 'link'
             link.symlink_to(real)
             with self.assertRaises(companion.Uncertain):
-                companion._atomic_json(link / 'x.json', {'x': 1})
+                companion._atomic_json(link / 'x.json', {'x': 1}, root=root)
             self.assertFalse((real / 'x.json').exists())
+
+    def test_atomic_json_refuses_a_linked_ancestor(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / 'a' / 'b').mkdir(parents=True)
+            protected = root / 'protected'
+            (protected / 'b').mkdir(parents=True)
+            os.rename(root / 'a', root / 'a-old')
+            (root / 'a').symlink_to(protected)
+            with self.assertRaises(companion.Uncertain):
+                companion._atomic_json(root / 'a' / 'b' / 'x.json',
+                                       {'x': 1}, root=root)
+            self.assertFalse((protected / 'b' / 'x.json').exists())
 
     def test_owning_a_swapped_entry_never_follows_the_link(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -953,7 +978,7 @@ class DispatcherTest(unittest.TestCase):
             link.symlink_to(target)
             with mock.patch.object(companion.os, 'fchown') as fchown:
                 with self.assertRaises(companion.Refused):
-                    companion._own_at(link, (65534, 65534))
+                    companion._own_at(link, (65534, 65534), root=root)
                 fchown.assert_not_called()
             after = target.stat()
             self.assertEqual((after.st_uid, after.st_gid, after.st_mode),
@@ -962,40 +987,112 @@ class DispatcherTest(unittest.TestCase):
             real = parent / 'real'
             real.write_text('x')
             with mock.patch.object(companion.os, 'fchown') as fchown:
-                companion._own_at(real, (0, 0))
+                companion._own_at(real, (0, 0), root=root)
             self.assertEqual(fchown.call_args[0][1:], (0, 0))
+
+    def test_owning_an_entry_through_a_swapped_ancestor_is_refused(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            protected = root / 'protected'
+            victim = protected / 'systemd' / 'system'
+            victim.mkdir(parents=True)
+            victim.chmod(0o755)
+            before = victim.stat()
+            (root / 'a' / 'systemd' / 'system').mkdir(parents=True)
+            os.rename(root / 'a', root / 'a-old')
+            (root / 'a').symlink_to(protected)
+            with mock.patch.object(companion.os, 'fchown') as fchown:
+                with self.assertRaises(companion.Refused):
+                    companion._own_at(root / 'a' / 'systemd' / 'system',
+                                      (65534, 65534), directory=True,
+                                      root=root)
+                fchown.assert_not_called()
+            after = victim.stat()
+            self.assertEqual(
+                (after.st_dev, after.st_ino, after.st_uid, after.st_gid,
+                 after.st_mode),
+                (before.st_dev, before.st_ino, before.st_uid, before.st_gid,
+                 before.st_mode))
+
+    def test_work_parent_ownership_refuses_an_ancestor_swap(self):
+        fx = Fixture()
+        self.addCleanup(fx.close)
+        protected = fx.root / 'protected'
+        victim = protected / 'systemd' / 'system'
+        victim.mkdir(parents=True)
+        victim.chmod(0o755)
+        before = victim.stat()
+        effects = companion.HostEffects(
+            enrollment=fx.execution, system=fx.system,
+            work_dir=lambda agent, project: str(
+                fx.work / 'a' / 'systemd' / 'system' / 'checkout'))
+        calls = []
+        swapped = []
+        real_own = companion._own_at
+
+        def chown(fd, uid, gid):
+            info = os.fstat(fd)
+            calls.append((info.st_dev, info.st_ino, uid, gid))
+
+        def swapping(path, owner, **kwargs):
+            if not swapped:
+                swapped.append(True)
+                os.rename(fx.work / 'a', fx.work / 'a-old')
+                (fx.work / 'a').symlink_to(protected)
+            return real_own(path, owner, **kwargs)
+
+        with mock.patch.object(companion, '_own_at', side_effect=swapping), \
+                mock.patch.object(companion.os, 'geteuid', return_value=0), \
+                mock.patch.object(companion.os, 'fchown', side_effect=chown):
+            with self.assertRaises(companion.Refused):
+                effects._ensure_work_parent(
+                    fx.work / 'a' / 'systemd' / 'system',
+                    fx.execution['accounts']['dev'], root=Path(fx.work))
+        self.assertFalse(any(dev == before.st_dev and ino == before.st_ino
+                             for dev, ino, _uid, _gid in calls))
+        after = victim.stat()
+        self.assertEqual(
+            (after.st_dev, after.st_ino, after.st_uid, after.st_gid,
+             after.st_mode),
+            (before.st_dev, before.st_ino, before.st_uid, before.st_gid,
+             before.st_mode))
 
     def test_atomic_json_owns_the_temporary_before_the_rename(self):
         with tempfile.TemporaryDirectory() as temp:
-            path = Path(temp) / 'x.json'
+            root = Path(temp)
+            path = root / 'x.json'
             calls = []
             real_replace = companion.os.replace
+            uid, gid = os.geteuid(), os.getegid()
 
             def replace(*args, **kwargs):
                 calls.append('replace')
                 return real_replace(*args, **kwargs)
 
-            def chown(fd, uid, gid):
+            def chown(fd, owner_uid, owner_gid):
                 calls.append('chown')
 
             with mock.patch.object(companion.os, 'geteuid', return_value=0), \
                     mock.patch.object(companion.os, 'fchown', side_effect=chown), \
                     mock.patch.object(companion.os, 'replace', side_effect=replace):
-                companion._atomic_json(path, {'x': 1}, owner=(0, 0))
+                companion._atomic_json(path, {'x': 1}, owner=(uid, gid),
+                                       root=root)
             self.assertEqual(calls, ['chown', 'replace'])
             self.assertEqual(json.loads(path.read_text()), {'x': 1})
 
     def test_private_marker_read_allows_the_enrolled_account(self):
         with tempfile.TemporaryDirectory() as temp:
-            path = Path(temp) / 'profile.json'
+            root = Path(temp)
+            path = root / 'profile.json'
             path.write_text('{}')
             path.chmod(0o600)
             uid, gid = os.geteuid(), os.getegid()
             with mock.patch.object(companion.os, 'geteuid', return_value=0):
                 with self.assertRaises(companion.Refused):
-                    companion._read_private_json(path)
+                    companion._read_private_json(path, root=root)
                 self.assertEqual(
-                    companion._read_private_json(path, owner=(uid, gid)), {})
+                    companion._read_private_json(path, owner=(uid, gid),
+                                                root=root), {})
 
 
 class BridgeTest(unittest.TestCase):

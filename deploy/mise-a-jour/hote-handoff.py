@@ -141,18 +141,42 @@ def _trusted_file(path, *, private=False, owner=None):
     return path
 
 
-def _read_private_json(path, *, limit=65536, owner=None):
-    path = _trusted_file(path, private=True, owner=owner)
+def _read_private_json(path, *, limit=65536, owner=None, root=None):
+    """Read one private regular file through its pinned parent descriptor.
+
+    ``root`` is the trusted anchor (enrollment root, state root, account home
+    or enrolled work root): every component below it is opened relative to
+    its parent with ``O_NOFOLLOW``. The file itself is checked on the
+    descriptor that is actually read, never on a path re-resolved afterwards.
+    """
+    path = Path(path)
+    if root is None or path.name in ('', '.', '..') or '/' in path.name:
+        raise Refused('file')
+    directory = descriptor = None
     try:
-        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+        directory = _open_dir(root, path.parent, owner=owner)
+        descriptor = os.open(path.name,
+                             os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                             dir_fd=directory)
+        info = os.fstat(descriptor)
+        if (stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode)
+                or not _owned(info, owner) or info.st_mode & 0o022
+                or info.st_mode & 0o027 or info.st_nlink != 1
+                or info.st_size > limit):
+            raise Refused('file')
+        os.set_blocking(descriptor, True)
         with os.fdopen(descriptor, 'rb') as stream:
-            info = os.fstat(stream.fileno())
-            if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
-                    or info.st_size > limit):
-                raise Refused('file')
+            descriptor = None
             data = stream.read(limit + 1)
+    except Refused:
+        raise
     except OSError:
         raise Refused('file') from None
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+        if directory is not None:
+            os.close(directory)
     if len(data) > limit:
         raise Refused('file')
     try:
@@ -238,28 +262,132 @@ def load_execution(root=ENROLLMENT_ROOT):
             or not _owned(info) or info.st_mode & 0o022):
         raise Refused('execution:root')
     try:
-        return validate_execution(_read_private_json(root / EXECUTION_NAME))
+        return validate_execution(
+            _read_private_json(root / EXECUTION_NAME, root=root))
     except Refused:
         raise Refused('execution') from None
 
 
-def _atomic_json(path, value, *, owner=None):
-    """Private durable JSON through a pinned directory descriptor.
+def _relative_parts(root, path):
+    """The single components of ``path`` below ``root`` (no ``..`` escape)."""
+    try:
+        relative = Path(path).relative_to(Path(root))
+    except ValueError:
+        raise Refused('state') from None
+    if any(part in ('', '.', '..') for part in relative.parts):
+        raise Refused('state')
+    return relative.parts
 
-    The parent is opened with ``O_DIRECTORY|O_NOFOLLOW`` and the temporary is
-    created/replaced relative to that descriptor, so a directory swapped by
-    the account between the private-chain check and this write cannot redirect
-    a privileged marker into another tree. When ``owner`` is given, the
-    temporary is handed to that account through its descriptor *before* the
-    rename: the account can never make the ownership change follow a link.
+
+def _open_root(root, *, owner=None, private=False):
+    """Open a trusted root once, refusing a link in its final component.
+
+    ``root`` itself is the trust anchor (the account home or an enrolled work
+    root); everything below it is opened component by component in
+    ``_open_dir``. The descriptor is checked after opening, never a path just
+    before it, so the caller keeps the exact object it validated.
+    """
+    root = Path(root)
+    try:
+        descriptor = os.open(root,
+                             os.O_RDONLY | _O_DIRECTORY | os.O_NOFOLLOW)
+    except OSError:
+        raise Refused('state') from None
+    try:
+        info = os.fstat(descriptor)
+        mask = 0o077 if private else 0o022
+        if (not stat.S_ISDIR(info.st_mode) or not _owned(info, owner)
+                or info.st_mode & mask):
+            raise Refused('state')
+    except Refused:
+        os.close(descriptor)
+        raise
+    except OSError:
+        os.close(descriptor)
+        raise Refused('state') from None
+    return descriptor
+
+
+def _open_dir(root, path, *, create=False, owner=None, final_private=False):
+    """Open ``path`` below a trusted root through nested directory descriptors.
+
+    No component is ever reopened by its absolute path: each one is opened
+    relative to the descriptor of its parent with ``O_DIRECTORY|O_NOFOLLOW``,
+    and its type, owner and mode are checked on that descriptor. A missing
+    component is created relative to its pinned parent and handed to ``owner``
+    through its descriptor. Replacing any ancestor by a symlink therefore
+    makes the walk fail instead of redirecting the next mkdir/open/fchown.
     """
     path = Path(path)
+    descriptor = _open_root(root, owner=owner)
+    try:
+        parts = _relative_parts(root, path)
+        for index, part in enumerate(parts):
+            last = index == len(parts) - 1
+            mask = 0o077 if last and final_private else 0o022
+            created = False
+            try:
+                child = os.open(part,
+                                os.O_RDONLY | _O_DIRECTORY | os.O_NOFOLLOW,
+                                dir_fd=descriptor)
+            except FileNotFoundError:
+                if not create:
+                    raise Refused('state') from None
+                try:
+                    os.mkdir(part, 0o700, dir_fd=descriptor)
+                    created = True
+                except FileExistsError:
+                    pass
+                except OSError:
+                    raise Refused('state:create') from None
+                try:
+                    child = os.open(part,
+                                    os.O_RDONLY | _O_DIRECTORY | os.O_NOFOLLOW,
+                                    dir_fd=descriptor)
+                except OSError:
+                    raise Refused('state') from None
+            except OSError:
+                raise Refused('state') from None
+            info = os.fstat(child)
+            if (not stat.S_ISDIR(info.st_mode) or not _owned(info, owner)
+                    or info.st_mode & mask):
+                os.close(child)
+                raise Refused('state')
+            if created and owner is not None and os.geteuid() == 0:
+                try:
+                    os.fchown(child, owner[0], owner[1])
+                except OSError:
+                    os.close(child)
+                    raise Refused('state:owner') from None
+            os.close(descriptor)
+            descriptor = child
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def _atomic_json(path, value, *, owner=None, root=None):
+    """Private durable JSON through the pinned parent descriptor.
+
+    The parent chain is reopened from the trusted root for every write and the
+    temporary is created/replaced relative to the resulting descriptor, so a
+    directory swapped by the account between the private-chain check and this
+    write cannot redirect a privileged marker into another tree. When
+    ``owner`` is given, the temporary is handed to that account through its
+    descriptor *before* the rename: the account can never make the ownership
+    change follow a link.
+    """
+    path = Path(path)
+    if root is None or path.name in ('', '.', '..') or '/' in path.name:
+        raise Uncertain('journal:write')
     candidate = '.' + path.name + '-' + os.urandom(6).hex()
     directory = None
     try:
-        directory = os.open(path.parent,
-                            os.O_RDONLY | _O_DIRECTORY | os.O_NOFOLLOW)
-        descriptor = os.open(candidate, os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+        directory = _open_dir(root, path.parent, owner=owner)
+        descriptor = os.open(candidate,
+                             os.O_CREAT | os.O_EXCL | os.O_WRONLY
+                             | os.O_NOFOLLOW,
                              0o600, dir_fd=directory)
         with os.fdopen(descriptor, 'w', encoding='utf-8') as stream:
             json.dump(value, stream, sort_keys=True)
@@ -270,7 +398,7 @@ def _atomic_json(path, value, *, owner=None):
         os.replace(candidate, path.name, src_dir_fd=directory,
                    dst_dir_fd=directory)
         os.fsync(directory)
-    except OSError:
+    except (OSError, Refused):
         if directory is not None:
             try:
                 os.unlink(candidate, dir_fd=directory)
@@ -282,19 +410,21 @@ def _atomic_json(path, value, *, owner=None):
             os.close(directory)
 
 
-def _own_at(path, owner, *, directory=False):
+def _own_at(path, owner, *, directory=False, root=None):
     """Hand a freshly created entry to the enrolled account, never a link.
 
-    The account owns the parent directory and can replace the entry between
-    its creation and the ownership change. Opening the entry itself with
-    ``O_NOFOLLOW`` and changing its descriptor's owner can never follow such a
-    link: a swapped entry is refused instead of chowning its target.
+    The parent chain is reopened from the trusted root through descriptors;
+    the entry is then opened relative to the pinned parent with
+    ``O_NOFOLLOW`` and changed through its own descriptor. Replacing any
+    ancestor or the entry itself by a link is refused instead of chowning the
+    target.
     """
     path = Path(path)
+    if root is None or path.name in ('', '.', '..') or '/' in path.name:
+        raise Refused('owner')
     parent = descriptor = None
     try:
-        parent = os.open(path.parent,
-                         os.O_RDONLY | _O_DIRECTORY | os.O_NOFOLLOW)
+        parent = _open_dir(root, path.parent, owner=owner)
         flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
         if directory:
             flags |= _O_DIRECTORY
@@ -309,6 +439,10 @@ def _own_at(path, owner, *, directory=False):
             os.fchown(descriptor, owner[0], owner[1])
         except OSError:
             raise Refused('owner') from None
+    except Refused:
+        # A replaced ancestor is not a target to chown either: it is a
+        # definitive refusal of this effect.
+        raise Refused('owner') from None
     except OSError:
         raise Refused('owner') from None
     finally:
@@ -318,83 +452,163 @@ def _own_at(path, owner, *, directory=False):
             os.close(parent)
 
 
-def _unlink_private(path):
+def _unlink_private(path, *, owner=None, root=None):
     """Remove one entry through its pinned parent, never a swapped path."""
     path = Path(path)
+    if root is None or path.name in ('', '.', '..') or '/' in path.name:
+        raise Uncertain('journal:write')
     directory = None
     try:
-        directory = os.open(path.parent,
-                            os.O_RDONLY | _O_DIRECTORY | os.O_NOFOLLOW)
+        directory = _open_dir(root, path.parent, owner=owner)
         os.unlink(path.name, dir_fd=directory)
-    except OSError:
+    except (OSError, Refused):
         raise Uncertain('journal:write') from None
     finally:
         if directory is not None:
             os.close(directory)
 
 
-def _ensure_private(path, *, owner=None):
-    """Create or verify a private directory owned by root or the executor."""
+def _ensure_private(path, *, owner=None, root=None):
+    """Create or verify a private directory through pinned descriptors."""
     path = Path(path)
-    try:
-        path.mkdir(mode=0o700, parents=True, exist_ok=True)
-    except OSError:
-        raise Refused('state:create') from None
-    try:
-        info = path.lstat()
-    except OSError:
-        raise Refused('state') from None
-    if (stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode)
-            or not _owned(info, owner) or info.st_mode & 0o077):
+    if root is None:
         raise Refused('state')
-    if owner is not None and os.geteuid() == 0 and info.st_uid == 0:
+    if path == Path(root):
+        descriptor = None
         try:
-            _own_at(path, owner, directory=True)
+            descriptor = _open_root(path, owner=owner, private=True)
+            info = os.fstat(descriptor)
+            if owner is not None and os.geteuid() == 0 and info.st_uid == 0:
+                os.fchown(descriptor, owner[0], owner[1])
         except Refused:
             raise Refused('state:owner') from None
+        except OSError:
+            raise Refused('state:owner') from None
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
+        return path
+    descriptor = None
+    try:
+        descriptor = _open_dir(root, path, create=True, owner=owner,
+                               final_private=True)
+        info = os.fstat(descriptor)
+        if owner is not None and os.geteuid() == 0 and info.st_uid == 0:
+            os.fchown(descriptor, owner[0], owner[1])
+    except Refused:
+        raise
+    except OSError:
+        raise Refused('state:create') from None
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
     return path
+
+
+def _existing_ancestor(path):
+    """The nearest existing lexical ancestor of ``path`` (``/`` at worst)."""
+    path = Path(path)
+    while True:
+        try:
+            os.lstat(path)
+            return path
+        except FileNotFoundError:
+            if path == path.parent:
+                return path
+            path = path.parent
+        except OSError:
+            raise Refused('state') from None
+
+
+def _ensure_state(path):
+    """Create or verify the enrollment state root without a path race.
+
+    An existing root is opened once and checked through its descriptor. A
+    missing root is created below the nearest existing ancestor after that
+    ancestor has been opened and validated; every component is then created
+    relative to the descriptor of its parent.
+    """
+    path = Path(path)
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
+        anchor = _existing_ancestor(path.parent)
+        probe = _open_root(anchor, owner=None)
+        os.close(probe)
+        return _ensure_private(path, root=anchor)
+    except OSError:
+        raise Refused('state') from None
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+        raise Refused('state')
+    return _ensure_private(path, root=path)
 
 
 def _private_chain(path, *, owner=None, root=None):
     """Create each missing component with 0700, never through a symlink.
 
-    ``root`` is the account home the chain must stay inside. Every existing
-    component below it must be a real directory owned by the account or root
-    and not group/world writable, so a pre-created link cannot make a
-    privileged executor write outside the account's home.
+    ``root`` is the account home (or enrolled root) the chain must stay
+    inside. Every component is opened relative to its parent's descriptor
+    with ``O_DIRECTORY|O_NOFOLLOW``; a pre-created link cannot make a
+    privileged executor write outside that root, and a directory swapped
+    during the walk is refused rather than followed.
     """
     path = Path(path)
-    if root is not None:
-        root = Path(root)
-        info = root.lstat()
-        if (stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode)
-                or not _owned(info, owner) or info.st_mode & 0o022):
-            raise Refused('state')
+    if root is None:
+        raise Refused('state')
+    descriptor = None
+    try:
+        descriptor = _open_dir(root, path, create=True, owner=owner,
+                               final_private=True)
+        info = os.fstat(descriptor)
+        if owner is not None and os.geteuid() == 0 and info.st_uid == 0:
+            os.fchown(descriptor, owner[0], owner[1])
+    except Refused:
+        raise
+    except OSError:
+        raise Refused('state:create') from None
+    finally:
+        if descriptor is not None:
+            os.close(descriptor)
+    return path
+
+
+def _stat_at(root, path, *, owner=None):
+    """``lstat`` one entry relative to a parent reopened from a trusted root."""
+    path = Path(path)
+    if path.name in ('', '.', '..') or '/' in path.name:
+        raise Refused('state')
+    directory = _open_dir(root, path.parent, owner=owner)
+    try:
         try:
-            relative = path.relative_to(root)
-        except ValueError:
+            return os.stat(path.name, dir_fd=directory,
+                           follow_symlinks=False)
+        except FileNotFoundError:
+            return None
+        except OSError:
             raise Refused('state') from None
-        current = root
-        for part in relative.parts:
-            current = current / part
-            if not current.exists():
-                break
-            info = current.lstat()
-            if (stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode)
-                    or not _owned(info, owner) or info.st_mode & 0o022):
-                raise Refused('state')
-    missing = []
-    current = path
-    while not current.exists():
-        missing.append(current)
-        current = current.parent
-        if current == current.parent:
-            break
-    for directory in reversed(missing):
-        directory.mkdir(mode=0o700)
-        if owner is not None and os.geteuid() == 0:
-            _own_at(directory, owner, directory=True)
-    return _ensure_private(path, owner=owner)
+    finally:
+        os.close(directory)
+
+
+def _remove_tree_at(parent_fd, name):
+    """Remove one tree below an already pinned parent, never following links.
+
+    The recursive walk opens every child relative to its parent descriptor
+    with ``O_DIRECTORY|O_NOFOLLOW``; a directory swapped for a link is
+    unlinked as a link, never descended into.
+    """
+    info = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+    if not stat.S_ISDIR(info.st_mode):
+        os.unlink(name, dir_fd=parent_fd)
+        return
+    child = os.open(name, os.O_RDONLY | _O_DIRECTORY | os.O_NOFOLLOW,
+                    dir_fd=parent_fd)
+    try:
+        for entry in os.listdir(child):
+            _remove_tree_at(child, entry)
+    finally:
+        os.close(child)
+    os.rmdir(name, dir_fd=parent_fd)
 
 
 # ---------------------------------------------------------------------------
@@ -592,9 +806,10 @@ class HostEffects:
         self.work_dir = work_dir
         self.clock = clock
         state = Path(root or self.enrollment['state'])
-        self.state = _ensure_private(state)
-        self.operations = _ensure_private(self.state / 'operations')
-        self.fences = _ensure_private(self.state / 'fences')
+        self.state = _ensure_state(state)
+        self.operations = _ensure_private(self.state / 'operations',
+                                          root=self.state)
+        self.fences = _ensure_private(self.state / 'fences', root=self.state)
         self._locks = {}
         self._release = None
         self._canons = None
@@ -661,11 +876,13 @@ class HostEffects:
     def _journal(self, request, entry):
         operation, step = request['operation'], request['step']
         sequence = STEP_SEQUENCE[step]
-        directory = _ensure_private(self.operations / operation)
+        directory = _ensure_private(self.operations / operation,
+                                    root=self.state)
         receipt_path = directory / (step + '.json')
         intent_path = directory / (step + '.intent.json')
         state_path = directory / 'state.json'
-        with self._agent_lock(request['agent']), self._locked(directory):
+        with self._agent_lock(request['agent']), self._locked(
+                directory, root=self.state):
             state = self._state(state_path)
             state, refusal = self._bind_lease(state, state_path, request)
             if refusal is not None:
@@ -688,7 +905,7 @@ class HostEffects:
             # controller legitimately repeats ``stop_source`` before retrying a
             # held publication. Only a *new* earlier effect is out of order.
             if receipt_path.exists() or receipt_path.is_symlink():
-                record = _read_private_json(receipt_path)
+                record = _read_private_json(receipt_path, root=self.state)
                 if (not isinstance(record.get('request'), dict)
                         or not isinstance(record.get('receipt'), dict)):
                     raise Uncertain('journal:receipt')
@@ -705,14 +922,15 @@ class HostEffects:
                     stored = self._receipt(request, fields)
                     _atomic_json(receipt_path,
                                  {'request': request, 'receipt': stored,
-                                  'at': float(self.clock())})
+                                  'at': float(self.clock())},
+                                 root=self.state)
                 if state['last_step'] == step and state['last_ok'] is not True:
                     # Crash after the receipt write, before the state write:
                     # repair the order mark without replaying the effect.
                     state = dict(state, last_ok=True)
                     self._store_state(state_path, state)
                 try:
-                    _unlink_private(intent_path)
+                    _unlink_private(intent_path, root=self.state)
                 except Uncertain:
                     pass
                 return dict(stored, controller_epoch=request['controller_epoch'])
@@ -725,7 +943,7 @@ class HostEffects:
             if not allowed:
                 return self._refusal(request, 'order')
             if intent_path.exists() or intent_path.is_symlink():
-                intent = _read_private_json(intent_path)
+                intent = _read_private_json(intent_path, root=self.state)
                 stored_request = intent.get('request')
                 if not isinstance(stored_request, dict):
                     raise Uncertain('journal:intent')
@@ -735,7 +953,8 @@ class HostEffects:
                     return self._refusal(request, 'intent_changed')
             else:
                 _atomic_json(intent_path,
-                             {'request': request, 'at': float(self.clock())})
+                             {'request': request, 'at': float(self.clock())},
+                             root=self.state)
             state = dict(state, epoch=request['controller_epoch'], last_step=step,
                          last_seq=sequence, last_ok=False)
             self._store_state(state_path, state)
@@ -743,17 +962,18 @@ class HostEffects:
                 fields = self._dispatch(request, entry)
             except Refused as exc:
                 try:
-                    _unlink_private(intent_path)
+                    _unlink_private(intent_path, root=self.state)
                 except Uncertain:
                     pass
                 return self._refusal(request, str(exc))
             receipt = self._receipt(request, fields)
             _atomic_json(receipt_path,
                          {'request': request, 'receipt': receipt,
-                          'at': float(self.clock())})
+                          'at': float(self.clock())},
+                         root=self.state)
             self._store_state(state_path, dict(state, last_ok=True))
             try:
-                _unlink_private(intent_path)
+                _unlink_private(intent_path, root=self.state)
             except Uncertain:
                 pass
             return receipt
@@ -770,7 +990,9 @@ class HostEffects:
         return state, None
 
     def _agent_lock(self, agent):
-        return self._locked(_ensure_private(self.fences / agent))
+        return self._locked(_ensure_private(self.fences / agent,
+                                            root=self.state),
+                            root=self.state)
 
     def _bind_fence(self, request, entry):
         """Check and advance the durable lease fence shared by one agent.
@@ -784,15 +1006,16 @@ class HostEffects:
         and every older operation is refused before it can act. It is written
         under the per-agent lock and survives a restart.
         """
-        directory = _ensure_private(self.fences / request['agent'])
+        directory = _ensure_private(self.fences / request['agent'],
+                                    root=self.state)
         path = directory / 'lease.json'
         fence = {'agent': request['agent'], 'account': entry['account'],
                  'unit': entry['unit'], 'owner': request['owner'],
                  'lease_epoch': request['lease_epoch']}
         if not (path.exists() or path.is_symlink()):
-            _atomic_json(path, fence)
+            _atomic_json(path, fence, root=self.state)
             return
-        current = _read_private_json(path)
+        current = _read_private_json(path, root=self.state)
         if (tuple(sorted(current)) != tuple(sorted(_FENCE_KEYS))
                 or current.get('agent') != request['agent']
                 or not isinstance(current.get('account'), str)
@@ -813,7 +1036,7 @@ class HostEffects:
                     or current['owner'] != fence['owner']):
                 raise Refused('lease_changed')
             return
-        _atomic_json(path, fence)
+        _atomic_json(path, fence, root=self.state)
 
     def _store_state(self, path, state):
         """Write an operation state without ever lowering its epoch.
@@ -828,10 +1051,10 @@ class HostEffects:
             current = self._state(path)
             if current['epoch'] > state['epoch']:
                 state = dict(state, epoch=current['epoch'])
-        _atomic_json(path, state)
+        _atomic_json(path, state, root=self.state)
 
     @contextlib.contextmanager
-    def _locked(self, directory):
+    def _locked(self, directory, *, root=None):
         key = os.path.abspath(os.fspath(directory))
         thread = threading.get_ident()
         held = self._locks.get(key)
@@ -842,8 +1065,18 @@ class HostEffects:
             finally:
                 held[1] -= 1
             return
-        descriptor = os.open(Path(directory) / '.lock',
-                             os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+        directory_fd = descriptor = None
+        try:
+            directory_fd = _open_dir(root, directory)
+            descriptor = os.open('.lock',
+                                 os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW,
+                                 0o600, dir_fd=directory_fd)
+        except (OSError, Refused):
+            if descriptor is not None:
+                os.close(descriptor)
+            if directory_fd is not None:
+                os.close(directory_fd)
+            raise Uncertain('journal:lock') from None
         try:
             deadline = time.monotonic() + LOCK_SECONDS
             while True:
@@ -864,12 +1097,13 @@ class HostEffects:
                 fcntl.flock(descriptor, fcntl.LOCK_UN)
             finally:
                 os.close(descriptor)
+                os.close(directory_fd)
 
     def _state(self, path):
         if not path.exists():
             return {'epoch': 0, 'last_step': '', 'last_seq': 0, 'last_ok': False,
                     'lease': None}
-        value = _read_private_json(path)
+        value = _read_private_json(path, root=self.state)
         if (not isinstance(value.get('epoch'), int) or isinstance(value.get('epoch'), bool)
                 or value.get('epoch') < 0
                 or not isinstance(value.get('last_step'), str)
@@ -914,7 +1148,8 @@ class HostEffects:
         limit = MAX_SEQUENCE.get(request['state'])
         if limit is None:
             raise Refused('state')
-        directory = _ensure_private(self.operations / request['operation'])
+        directory = _ensure_private(self.operations / request['operation'],
+                                    root=self.state)
         state_path = directory / 'state.json'
         current = self._state(state_path)
         current, refusal = self._bind_lease(current, state_path, request)
@@ -955,7 +1190,7 @@ class HostEffects:
         path = Path(directory) / (step + '.json')
         if not path.exists():
             return None
-        record = _read_private_json(path)
+        record = _read_private_json(path, root=self.state)
         receipt = record.get('receipt')
         if not isinstance(receipt, dict) or receipt.get('ok') is not True:
             raise Uncertain('journal:receipt')
@@ -991,21 +1226,25 @@ class HostEffects:
         """
         if harness not in ('deepseek', 'dsh'):
             return True
+        owner = self._owner(entry)
         base = _private_chain(Path(home) / '.ameesh-handoff',
-                              owner=self._owner(entry), root=home)
-        directory = _private_chain(base / 'dsh', owner=self._owner(entry),
-                                   root=home)
-        for name in os.listdir(directory):
-            if name in CREDENTIAL_FILES:
-                raise Refused('dsh_credentials')
+                              owner=owner, root=home)
+        directory = _private_chain(base / 'dsh', owner=owner, root=home)
+        descriptor = _open_dir(home, directory, owner=owner)
+        try:
+            for name in os.listdir(descriptor):
+                if name in CREDENTIAL_FILES:
+                    raise Refused('dsh_credentials')
+        finally:
+            os.close(descriptor)
         marker = directory / 'profile.json'
         expected = {'version': 1, 'agent': agent, 'harness': harness,
                     'credentials': False}
         if marker.exists():
-            if _read_private_json(marker, owner=self._owner(entry)) != expected:
+            if _read_private_json(marker, owner=owner, root=home) != expected:
                 raise Refused('dsh_profile')
         else:
-            _atomic_json(marker, expected, owner=self._owner(entry))
+            _atomic_json(marker, expected, owner=owner, root=home)
         return True
 
     # -- source stop -------------------------------------------------------
@@ -1078,9 +1317,15 @@ class HostEffects:
                 'commit': commit, 'remote_commit': commit, 'clean': True}
 
     def _transfer(self, request, entry):
-        cwd = self._target_cwd(request['agent'], request['project'], entry)
+        cwd, root = self._target_cwd(request['agent'], request['project'],
+                                     entry)
+        owner = self._owner(entry)
+        current = None
         if cwd.exists() or cwd.is_symlink():
-            if cwd.is_symlink() or not cwd.is_dir():
+            current = _stat_at(root, cwd, owner=owner)
+        if current is not None:
+            if (stat.S_ISLNK(current.st_mode)
+                    or not stat.S_ISDIR(current.st_mode)):
                 raise Refused('cwd')
             try:
                 remote_url = self._git(entry, cwd, ['remote', 'get-url', 'origin'])
@@ -1105,53 +1350,84 @@ class HostEffects:
                         'commit': request['commit'], 'clean': True, 'cwd': str(cwd)}
             raise Refused('cwd_occupied')
         parent = cwd.parent
-        self._ensure_work_parent(parent, entry)
+        self._ensure_work_parent(parent, entry, root=root)
+        parent_fd = _open_dir(root, parent, owner=owner)
         temporary = parent / ('.' + cwd.name + '.handoff-' + hashlib.sha256(
             request['action_id'].encode()).hexdigest()[:12])
-        if temporary.exists() or temporary.is_symlink():
-            marker = temporary / '.git' / 'ameesh-handoff-intent'
-            if (temporary.is_symlink() or not temporary.is_dir()
-                    or not marker.is_file() or marker.is_symlink()):
-                raise Refused('cwd')
-            try:
-                record = _read_private_json(marker)
-            except Refused:
-                raise Refused('cwd') from None
-            if record.get('action_id') != request['action_id']:
-                raise Refused('cwd')
-            shutil.rmtree(temporary)
-        keep = False
         try:
-            temporary.mkdir(mode=0o700)
-            if os.geteuid() == 0:
-                _own_at(temporary, self._owner(entry), directory=True)
-            self._git(entry, temporary, ['init', '--quiet'])
-            marker = temporary / '.git' / 'ameesh-handoff-intent'
-            _atomic_json(marker, {'action_id': request['action_id']})
-            self._git(entry, temporary,
-                      ['remote', 'add', 'origin', request['repository']])
-            self._git(entry, temporary,
-                      ['fetch', '--no-tags', '--quiet', 'origin', request['branch']])
-            self._git(entry, temporary,
-                      ['checkout', '--quiet', '-B', request['branch'], 'FETCH_HEAD'])
-            if self._git(entry, temporary, ['rev-parse', 'HEAD']) != request['commit']:
-                raise Refused('commit')
-            if self._git(entry, temporary,
-                         ['status', '--porcelain', '--untracked-files=all']):
-                raise Refused('dirty')
-            _unlink_private(marker)
-            if cwd.exists() or cwd.is_symlink():
-                raise Refused('cwd')
-            os.replace(temporary, cwd)
-        except Uncertain:
-            # The temporary tree carries its exact action marker and the
-            # durable intent is on disk: the next pass removes only its own
-            # tree and resumes instead of cloning a second one.
-            keep = True
-            raise
+            try:
+                info = os.stat(temporary.name, dir_fd=parent_fd,
+                               follow_symlinks=False)
+            except FileNotFoundError:
+                info = None
+            if info is not None:
+                marker = temporary / '.git' / 'ameesh-handoff-intent'
+                try:
+                    marker_info = _stat_at(root, marker, owner=owner)
+                except Refused:
+                    raise Refused('cwd') from None
+                if (stat.S_ISLNK(info.st_mode)
+                        or not stat.S_ISDIR(info.st_mode)
+                        or marker_info is None
+                        or not stat.S_ISREG(marker_info.st_mode)):
+                    raise Refused('cwd')
+                try:
+                    record = _read_private_json(marker, root=root, owner=owner)
+                except Refused:
+                    raise Refused('cwd') from None
+                if record.get('action_id') != request['action_id']:
+                    raise Refused('cwd')
+                _remove_tree_at(parent_fd, temporary.name)
+            keep = False
+            try:
+                os.mkdir(temporary.name, 0o700, dir_fd=parent_fd)
+                if os.geteuid() == 0:
+                    _own_at(temporary, owner, directory=True, root=root)
+                self._git(entry, temporary, ['init', '--quiet'])
+                marker = temporary / '.git' / 'ameesh-handoff-intent'
+                _atomic_json(marker, {'action_id': request['action_id']},
+                             root=root, owner=owner)
+                self._git(entry, temporary,
+                          ['remote', 'add', 'origin', request['repository']])
+                self._git(entry, temporary,
+                          ['fetch', '--no-tags', '--quiet', 'origin',
+                           request['branch']])
+                self._git(entry, temporary,
+                          ['checkout', '--quiet', '-B', request['branch'],
+                           'FETCH_HEAD'])
+                if self._git(entry, temporary,
+                             ['rev-parse', 'HEAD']) != request['commit']:
+                    raise Refused('commit')
+                if self._git(entry, temporary,
+                             ['status', '--porcelain', '--untracked-files=all']):
+                    raise Refused('dirty')
+                _unlink_private(marker, root=root, owner=owner)
+                if _stat_at(root, cwd, owner=owner) is not None:
+                    raise Refused('cwd')
+                os.replace(temporary.name, cwd.name,
+                           src_dir_fd=parent_fd, dst_dir_fd=parent_fd)
+            except Uncertain:
+                # The temporary tree carries its exact action marker and the
+                # durable intent is on disk: the next pass removes only its
+                # own tree and resumes instead of cloning a second one.
+                keep = True
+                raise
+            finally:
+                if not keep:
+                    try:
+                        os.stat(temporary.name, dir_fd=parent_fd,
+                                follow_symlinks=False)
+                    except FileNotFoundError:
+                        pass
+                    except OSError:
+                        pass
+                    else:
+                        try:
+                            _remove_tree_at(parent_fd, temporary.name)
+                        except OSError:
+                            pass
         finally:
-            if not keep and temporary.exists():
-                shutil.rmtree(temporary, ignore_errors=True)
+            os.close(parent_fd)
         return {'repository': request['repository'], 'branch': request['branch'],
                 'commit': request['commit'], 'clean': True, 'cwd': str(cwd)}
 
@@ -1177,25 +1453,29 @@ class HostEffects:
             raise Refused('dirty')
         mode = SESSION_MODES.get(request['harness'], 'brief')
         home = self._home(entry)
+        owner = self._owner(entry)
         base = _private_chain(Path(home) / '.ameesh-handoff',
-                              owner=self._owner(entry), root=home)
-        sessions = _private_chain(base / 'sessions', owner=self._owner(entry),
-                                  root=home)
+                              owner=owner, root=home)
+        sessions = _private_chain(base / 'sessions', owner=owner, root=home)
         directory = _private_chain(sessions / request['operation'],
-                                   owner=self._owner(entry), root=home)
-        for name in os.listdir(directory):
-            if name in CREDENTIAL_FILES:
-                raise Refused('oauth_cache')
+                                   owner=owner, root=home)
+        descriptor = _open_dir(home, directory, owner=owner)
+        try:
+            for name in os.listdir(descriptor):
+                if name in CREDENTIAL_FILES:
+                    raise Refused('oauth_cache')
+        finally:
+            os.close(descriptor)
         marker = directory / 'session.json'
         expected = {'version': 1, 'operation': request['operation'],
                     'agent': request['agent'], 'harness': request['harness'],
                     'account': request['account'], 'mode': mode,
                     'source_session': None, 'oauth_cache': False}
         if marker.exists():
-            if _read_private_json(marker, owner=self._owner(entry)) != expected:
+            if _read_private_json(marker, owner=owner, root=home) != expected:
                 raise Refused('session')
         else:
-            _atomic_json(marker, expected, owner=self._owner(entry))
+            _atomic_json(marker, expected, owner=owner, root=home)
         return {'mode': mode, 'executor_enabled': False,
                 'oauth_cache_transferred': False}
 
@@ -1234,14 +1514,21 @@ class HostEffects:
     def _git(self, entry, cwd, args, *, check=True):
         return self.git.run(entry['account'], entry['home'], cwd, args, check=check)
 
-    def _worktree(self, value, entry, *, must_exist):
+    def _worktree(self, value, entry, *, must_exist, with_root=False):
         path = Path(value)
-        if not path.is_absolute() or '..' in path.parts or path.is_symlink():
+        owner = self._owner(entry)
+        if not path.is_absolute() or '..' in path.parts:
             raise Refused('cwd')
         root = next((Path(root) for root in self.enrollment['roots']
                      if str(path).startswith(root.rstrip('/') + '/')), None)
-        if root is None or root.is_symlink() or not root.is_dir():
+        if root is None:
             raise Refused('cwd')
+        try:
+            probe = _open_root(root, owner=owner)
+        except Refused:
+            raise Refused('cwd') from None
+        else:
+            os.close(probe)
         try:
             relative = path.relative_to(root)
         except ValueError:
@@ -1251,8 +1538,12 @@ class HostEffects:
             current = current / part
             if current.exists() and current.is_symlink():
                 raise Refused('cwd')
-        if must_exist and not path.is_dir():
-            raise Refused('cwd')
+        if must_exist:
+            info = _stat_at(root, path, owner=owner)
+            if info is None or not stat.S_ISDIR(info.st_mode):
+                raise Refused('cwd')
+        if with_root:
+            return path, root
         return path
 
     def _target_cwd(self, agent, project, entry):
@@ -1264,7 +1555,7 @@ class HostEffects:
             raise Refused('cwd')
         if value.startswith('~/'):
             value = entry['home'].rstrip('/') + value[1:]
-        return self._worktree(value, entry, must_exist=False)
+        return self._worktree(value, entry, must_exist=False, with_root=True)
 
     def _canon_work_dir(self, agent, project):
         """The receiving host's own canonical Work directory (L31/L35)."""
@@ -1284,16 +1575,23 @@ class HostEffects:
         value, _ = canon_mod.work_dir_for(host, card, None)
         return value
 
-    def _ensure_work_parent(self, parent, entry):
+    def _ensure_work_parent(self, parent, entry, *, root):
+        owner = self._owner(entry)
         existed = parent.exists()
+        descriptor = None
         try:
-            parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        except OSError:
+            descriptor = _open_dir(root, parent, create=True, owner=owner)
+        except Refused:
             raise Refused('cwd') from None
+        finally:
+            if descriptor is not None:
+                os.close(descriptor)
         if not existed and os.geteuid() == 0:
             # Only a directory this executor just created is handed to the
-            # account; an enrolled shared root keeps its own ownership.
-            _own_at(parent, self._owner(entry), directory=True)
+            # account; an enrolled shared root keeps its own ownership. The
+            # walk reopens every component from the trusted root, so an
+            # ancestor swapped before this call is refused, not followed.
+            _own_at(parent, owner, directory=True, root=root)
 
     def _release_revision(self):
         """Read the pinned release receipt; never activate or switch it."""

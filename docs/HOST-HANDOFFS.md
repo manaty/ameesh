@@ -197,11 +197,14 @@ before the uncertain intent is left for reconciliation. Expiry during an
 effect is uncertain, never a definitive refusal: it keeps the durable intent,
 fails the transport, and leaves reconciliation to the controller.
 
-Root ownership changes never follow a path: each freshly created entry is
-opened with `O_NOFOLLOW` and chowned through its descriptor, and
-`_atomic_json` gives the temporary file to the account before its atomic
-rename. An account that swaps an entry for a link therefore cannot make root
-change the link target's owner.
+Root ownership changes never follow a path: every component below the trusted
+root (the account home, the state root or an enrolled work root) is opened from
+its parent's descriptor with `O_DIRECTORY|O_NOFOLLOW`; mkdir, open, fchown,
+atomic writes, renames and unlinks all use those descriptors. A freshly created
+entry is chowned through its own descriptor, and `_atomic_json` gives the
+temporary file to the account before its atomic rename. An account that swaps an
+ancestor or an entry for a link therefore makes the effect fail instead of
+making root change a target's owner or write outside the trusted root.
 
 The host execution enrollment's `account` is the **Unix** account that owns
 the home and runner unit. The harness/provider account in a request is a
