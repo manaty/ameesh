@@ -1469,14 +1469,15 @@ def commande_preparer(ctx: Contexte, args) -> int:
         exiger_source(ctx)
         exiger_hote(ctx)
         etat = lit_etat(ctx)
-        if etat.get("stage") not in ("neuf", "prepare"):
+        if etat.get("cible_demarree") or etat.get("stage") not in ("neuf", "prepare"):
             # une fois basculé (ou revenu en arrière), le home cible a pu être
             # utilisé par les agents : root ne doit plus y écrire à l'aveugle
-            # (symlinks plantés, rsync --delete du travail ameesh) — revue
-            # dev2, B2.
-            refuser("état %r : le home cible a pu être utilisé par les agents ; "
-                    "écriture root refusée après bascule ou retour (recréer le "
-                    "home cible, ou geste dédié)" % etat.get("stage"))
+            # (symlinks plantés, rsync --delete du travail ameesh) — revues
+            # dev2 B2 et cx1 B/P1. Le témoin `cible_demarree` est monotone :
+            # il suffit même si l'état a été ramené à `prepare`.
+            refuser("home cible déjà utilisé (témoin cible_demarree=%r, état %r) : "
+                    "écriture root refusée ; recréer le home cible, ou geste "
+                    "dédié" % (etat.get("cible_demarree"), etat.get("stage")))
         etat["stage"] = "prepare"
         etat["agents"] = agents_du_poste(ctx)
         journal(ctx, "preparer", "préparation du compte %s et de son home" % CIBLE)
@@ -1711,12 +1712,14 @@ def commande_identites(ctx: Contexte, args) -> int:
         exiger_hote(ctx)
         exiger_cible(ctx)
         etat = lit_etat(ctx)
-        if etat.get("stage") != "prepare":
+        if etat.get("cible_demarree") or etat.get("stage") != "prepare":
             # même garde que `preparer` : les identités s'écrivent dans le
-            # home cible avant que les agents ne l'utilisent (revue dev2, B2).
-            refuser("état %r : « preparer » d'abord ; refus d'écrire des "
-                    "identités dans un home utilisé par les agents"
-                    % etat.get("stage"))
+            # home cible avant que les agents ne l'utilisent (revues dev2 B2,
+            # cx1 B/P1) ; le témoin monotone prime sur l'état.
+            refuser("home cible déjà utilisé (témoin cible_demarree=%r, état "
+                    "%r) : « preparer » d'abord, et aucune écriture d'identités "
+                    "après un démarrage cible"
+                    % (etat.get("cible_demarree"), etat.get("stage")))
         config = lire_json(ctx.cible_home / ".config/ameesh/config.json")
         journal(ctx, "identites", "clé SSH dédiée et vérification des harnais")
         ok, detail = cle_ssh_source(ctx)
@@ -1950,6 +1953,13 @@ def retirer_pieces_obsoletes(ctx: Contexte, etat: dict) -> None:
 def annuler_avant_canari(ctx: Contexte, actifs: Sequence[str],
                          pauses: Mapping[str, str], etat: dict) -> None:
     """Restaure la source si l'échec précède tout démarrage cible."""
+    if etat.get("cible_demarree"):
+        # Un démarrage cible a été TENTÉ : le home a pu être utilisé par les
+        # agents. Ne jamais revenir à `prepare` (cx1/dev2, B/P1) ; le retour
+        # est le seul geste sûr.
+        refuser("un démarrage cible a été tenté (témoin cible_demarree=%r) : "
+                "annulation refusée ; utiliser « retour »"
+                % etat.get("cible_demarree"))
     dire("")
     dire("échec avant tout démarrage sous %s : remise en service de la source" % CIBLE)
     actifs = list(actifs or etat.get("actifs") or [])
@@ -1999,20 +2009,34 @@ def verifier_hors_session_liee(ctx: Contexte) -> None:
     lancé depuis la session liée du bureau, même via sudo/runuser, le CLI
     répond « an agent session cannot act as the local human » et la bascule
     ou le retour échoue aux pauses. L'unité transitoire casse l'ascendance
-    (revue dev2, B1)."""
+    (revue dev2, B1).
+
+    `agent_pause` refuse dès que `binding.name or binding.ok` : une liaison
+    trouvée mais non valide (pid hors ascendance, processus recyclé) fait
+    aussi échouer les pauses, avec `whoami` rc1 et la description de session
+    sur stderr. On refuse donc ce cas comme l'autre (N dev2)."""
     binaire = ctx.source_home / ".local/share/ameesh/venv/bin/ameesh"
     fait = ctx.hote.lancer([str(binaire), "mail", "whoami"],
                            utilisateur=SOURCE, delai=60)
-    if fait.ok and "[session]" in fait.sortie:
+    sortie = fait.sortie or ""
+    erreur = fait.erreur or ""
+    liee = (fait.ok and "[session]" in sortie) or (
+        not fait.ok and "binding " in erreur and ", pid " in erreur)
+    if liee:
         commande = (
             "sudo systemd-run --collect --wait --pipe --unit migration-3549 "
             "--working-directory %s python3 %s %s"
             % (shlex.quote(str(ctx.depot)),
                shlex.quote(str(Path(__file__).resolve())),
                " ".join(shlex.quote(arg) for arg in sys.argv[1:])))
+        detail = ""
+        for ligne in (sortie + "\n" + erreur).splitlines():
+            if "[session]" in ligne or "binding " in ligne:
+                detail = ligne.strip().strip("()").strip()
+                break
         refuser("session liée détectée (%s) : les pauses opérateur seraient "
                 "refusées ; relancer sous une unité transitoire : %s"
-                % (fait.sortie.strip().splitlines()[0], commande))
+                % (detail or "liaison de session", commande))
 
 
 def basculer(ctx: Contexte, args) -> int:
@@ -2091,12 +2115,17 @@ def basculer(ctx: Contexte, args) -> int:
                                  else actifs[0])
         if canari not in actifs:
             refuser("canari %s absent des exécuteurs actifs" % canari)
-        # à partir d'ici un démarrage cible peut exister : l'état autorise
+        # à partir d'ici un démarrage cible est possible : l'état autorise
         # « retour » même si la suite échoue.
         etat["stage"] = "bascule"
         etat["migre_le"] = horodatage()
         etat["actifs"] = actifs
         etat["canari"] = canari
+        # Témoin MONOTONE, écrit avant le premier `systemctl start` cible :
+        # il n'est jamais effacé. Même si le canari tourne puis sort/failed
+        # (toutes les unités inactives), `preparer`/`identites` restent
+        # refusés et l'annulation ne rend pas `prepare` (cx1/dev2, B/P1).
+        etat["cible_demarree"] = horodatage()
         ecrit_etat(ctx, etat)
         ok, detail = demarrer_canari(ctx, canari)
         if not ok:
@@ -2136,19 +2165,28 @@ def basculer(ctx: Contexte, args) -> int:
         etat["preuve_courrier"] = detail_courrier
         ecrit_etat(ctx, etat)
     except (Refus, KeyboardInterrupt, OSError):
-        # Une interruption pendant la fenêtre critique (source arrêtée, aucune
-        # unité cible encore démarrée) doit remettre la source en service :
-        # sinon le poste reste sans exécuteurs et `retour --force` n'aurait
-        # aucun ensemble actif à redémarrer (revue dev1, B4).
-        etats_cible = {n: statut_unite(ctx, n, cible=True)["actif"] for n in actifs}
-        if not any(e in ("active", "activating", "reloading")
-                   for e in etats_cible.values()):
-            annuler_avant_canari(ctx, actifs, pauses, etat)
-        else:
-            dire("échec après démarrage sous %s : les unités cible restent "
-                 "en place et les pauses non levées gardent l'admission fermée ; "
-                 "« retour » pour revenir aux unités de %s"
+        # Un démarrage cible a-t-il été TENTÉ ? Le témoin monotone
+        # `cible_demarree` est écrit avant le premier start : même si le
+        # canari a tourné puis est sorti/failed (toutes les unités cible
+        # inactives), on ne revient jamais à `prepare` — le home a pu être
+        # utilisé par les agents, et `preparer`/`identites` y écriraient en
+        # root (revues cx1 et dev2, B/P1). Seul `retour` est sûr.
+        demarrage_tente = bool(etat.get("cible_demarree"))
+        cible_active = False
+        if not demarrage_tente:
+            # le témoin suffit dans le cas courant : on n'interroge systemd
+            # que si aucun démarrage n'a été tenté (état d'avant le start).
+            cible_active = any(
+                statut_unite(ctx, n, cible=True)["actif"]
+                in ("active", "activating", "reloading") for n in actifs)
+        if demarrage_tente or cible_active:
+            dire("échec après une tentative de démarrage sous %s : les unités "
+                 "cible restent en place et les pauses non levées gardent "
+                 "l'admission fermée ; « retour » pour revenir aux unités de %s "
+                 "(jamais « preparer » après un démarrage cible)"
                  % (CIBLE, SOURCE))
+        else:
+            annuler_avant_canari(ctx, actifs, pauses, etat)
         raise
     dire("")
     dire("bascule faite : %d exécuteurs actifs sous %s ; lancer « preuve »."

@@ -530,6 +530,91 @@ class Banc(unittest.TestCase):
         self.assertTrue(self.faux.a_appele("systemctl --user start"))
         self.assertTrue(self.faux.a_appele("ameesh resume"))
 
+    def test_basculer_canari_echoue_ne_rend_pas_prepare(self):
+        """B cx1/dev2 : canari démarré puis sorti/failed avant l'échec du
+        courrier — l'annulation ne doit pas rendre `prepare` (home utilisé)."""
+        etat_unites = {"source": "active", "cible": "inactive",
+                       "unite_cible": "enabled", "unite_source": "enabled"}
+        delegue = self.faux.executer
+        demarrages_source = []
+
+        def systemctl(argv, env, delai):
+            commande = " ".join(argv)
+            self.faux.appels.append(tuple(argv))
+            if "show" in commande and "ameesh-runner-agent@" in commande:
+                cote = "cible" if env and env.get("HOME") == "/home/ameesh" \
+                    else "source"
+                actif = etat_unites[cote]
+                return M.Resultat(0, "LoadState=loaded\nActiveState=%s\nMainPID=%s\n"
+                                  "UnitFileState=%s\n"
+                                  % (actif, "123" if actif == "active" else "0",
+                                     etat_unites["unite_" + cote]))
+            if "systemctl --user stop" in commande:
+                etat_unites["source"] = "inactive"
+                return M.Resultat(0, "")
+            if "systemctl --user start" in commande:
+                if env and env.get("HOME") == "/home/ameesh":
+                    etat_unites["cible"] = "active"
+                else:
+                    demarrages_source.append(commande)
+                    etat_unites["source"] = "active"
+                return M.Resultat(0, "")
+            if "systemctl --user disable" in commande:
+                if env and env.get("HOME") == "/home/ameesh":
+                    etat_unites["unite_cible"] = "disabled"
+                else:
+                    etat_unites["unite_source"] = "disabled"
+                return M.Resultat(0, "")
+            if "systemctl --user enable" in commande:
+                if env and env.get("HOME") == "/home/ameesh":
+                    etat_unites["unite_cible"] = "enabled"
+                else:
+                    etat_unites["unite_source"] = "enabled"
+                return M.Resultat(0, "")
+            if "daemon-reload" in commande or "list-units" in commande:
+                return M.Resultat(0, "")
+            return delegue(argv, env, delai)
+        self.faux.executer = systemctl
+        self.hote.executeur = systemctl
+        for motif in ("ameesh pause", "ameesh resume"):
+            self.faux.repondre(motif, 0, '{"changed": true, "reason": "x"}\n')
+        self.faux.repondre("ameesh show", 0, json.dumps(
+            {"last_turn_ts": 0, "lease_owner": None,
+             "cwd": str(self.source_home / "development/manaty/ameesh-dev1")}))
+        self.faux.remplacer("systemctl --user show", 0, "")
+        self.ctx.etat_dir.mkdir(parents=True, exist_ok=True)
+        etat = M.etat_vide()
+        etat["stage"] = "prepare"
+        M.ecrit_etat(self.ctx, etat)
+
+        def courrier(*_args, **_kwargs):
+            # le canari a tourné, puis son unité est sortie/failed
+            etat_unites["cible"] = "inactive"
+            return False, "courrier non consommé (canari sorti)"
+
+        args = mock.Mock(canari="codex2", attente_arret=5)
+        agents = [{"name": "ameesh-dev1", "harness": "claude", "status": "idle"},
+                  {"name": "codex2", "harness": "codex", "status": "idle"}]
+        with mock.patch.object(M, "agents_du_poste", return_value=agents), \
+                mock.patch.object(M, "verifier_avant_bascule", return_value=[]), \
+                mock.patch.object(M, "canon_sync", return_value=(True, "ok")), \
+                mock.patch.object(M, "verifier_cwd", return_value=[]), \
+                mock.patch.object(M, "test_courrier", side_effect=courrier), \
+                mock.patch.object(M, "attendre_bail",
+                                  return_value=(True, {"lease_owner":
+                                                       "runner-codex2@laptop"})):
+            with self.assertRaises(M.Refus):
+                M.basculer(self.ctx, args)
+        final = M.lit_etat(self.ctx)
+        self.assertEqual(final["stage"], "bascule")
+        self.assertTrue(final.get("cible_demarree"))
+        self.assertEqual(demarrages_source, [],
+                         "l'annulation ne doit pas redémarrer la source")
+        with self.assertRaises(M.Refus):
+            M.commande_preparer(self.ctx, mock.Mock())
+        with self.assertRaises(M.Refus):
+            M.commande_identites(self.ctx, mock.Mock())
+
     def test_retour_force_reprend_les_actifs_persistes(self):
         """B4 : après une coupure avant `stage=bascule`, `retour --force`
         redémarre l'ensemble actif écrit avant l'arrêt et lève ses pauses."""
@@ -743,15 +828,27 @@ class Banc(unittest.TestCase):
         self.assertEqual(actifs, ["ameesh-dev1"])
 
     def test_preparer_et_identites_refuses_apres_bascule(self):
-        """B2 dev2 : preparer/identites ne réécrivent pas un home utilisé."""
-        etat = M.etat_vide()
-        etat["stage"] = "retour"
-        M.ecrit_etat(self.ctx, etat)
+        """B2 dev2 / B cx1 : preparer/identites ne réécrivent pas un home
+        utilisé, même si l'état a été ramené à `prepare` (témoin monotone)."""
         args = mock.Mock()
+        for etat in ({"stage": "retour"},
+                     {"stage": "prepare",
+                      "cible_demarree": "2026-10-25T10:00:00Z"}):
+            M.ecrit_etat(self.ctx, M.etat_vide() | etat)
+            with self.assertRaises(M.Refus):
+                M.commande_preparer(self.ctx, args)
+            with self.assertRaises(M.Refus):
+                M.commande_identites(self.ctx, args)
+
+    def test_annuler_refuse_apres_un_demarrage_cible(self):
+        """B cx1/dev2 : une annulation ne remet jamais stage=prepare après
+        une tentative de démarrage cible."""
+        etat = M.etat_vide()
+        etat["stage"] = "bascule"
+        etat["cible_demarree"] = "2026-10-25T10:00:00Z"
         with self.assertRaises(M.Refus):
-            M.commande_preparer(self.ctx, args)
-        with self.assertRaises(M.Refus):
-            M.commande_identites(self.ctx, args)
+            M.annuler_avant_canari(self.ctx, ["ameesh-dev1"], {}, etat)
+        self.assertFalse(self.faux.a_appele("systemctl --user start"))
 
     def test_preparer_autorise_a_l_etape_prepare(self):
         """La garde de stage laisse la reprise idempotente à `prepare`."""
@@ -764,12 +861,19 @@ class Banc(unittest.TestCase):
         preparation.assert_called_once()
 
     def test_session_liee_refusee_avec_unite_transitoire(self):
-        """B1 dev2 : une session liée est refusée avant tout arrêt."""
+        """B1 dev2 : une session liée est refusée avant tout arrêt, y compris
+        une liaison trouvée mais non valide (whoami rc1 + description)."""
         self.faux.repondre("ameesh mail whoami", 0,
                            "codex [session] claude pid 532757\n")
         with self.assertRaises(M.Refus) as refus:
             M.verifier_hors_session_liee(self.ctx)
         self.assertIn("systemd-run", str(refus.exception))
+        self.faux.remplacer("ameesh mail whoami", 1, "",
+                            "unbound identity: binding pid 1 not in the hook "
+                            "ancestry\n(binding claude 01abc on pc-smichea, "
+                            "pid 532757, by smichea)\n")
+        with self.assertRaises(M.Refus):
+            M.verifier_hors_session_liee(self.ctx)
         self.faux.remplacer("ameesh mail whoami", 1, "",
                             "unbound identity: AGENT_MAIL_NAME not set\n")
         M.verifier_hors_session_liee(self.ctx)  # sans session liée : passe

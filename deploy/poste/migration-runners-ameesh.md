@@ -97,8 +97,9 @@ le même uid. Ce que la migration établit :
 * root n'écrit jamais à travers un lien dans `~ameesh` : `lchown`, fichiers
   temporaires `mkstemp` et `fchmod`/`fchown` par descripteur, liens refusés ;
   `preparer`/`identites` ne s'exécutent plus une fois les agents passés sous
-  ameesh (sinon un lien planté serait ameesh→root, et `rsync --delete`
-  emporterait leur travail).
+  ameesh (témoin monotone `cible_demarree`, écrit avant le premier start
+  cible et jamais effacé ; sinon un lien planté serait ameesh→root, et
+  `rsync --delete` emporterait leur travail).
 
 Ce que la migration **ne protège pas** : root (le bureau et l'owner), un
 groupe privilégié ajouté plus tard, l'accès physique, et les secrets que les
@@ -249,8 +250,13 @@ relancer `preparer` (idempotent). `preparer` et `identites` n'acceptent que
 les états `neuf`/`prepare` : après une bascule ou un `retour`, le home cible
 a pu être utilisé par les agents (liens plantés, travail non poussé) et le
 script **refuse** d'y écrire en root ; `rsync --delete` ne doit pas non plus
-emporter le travail créé sous ameesh. Une nouvelle tentative exige de
-recréer le home cible (geste dédié), pas un simple `preparer`.
+emporter le travail créé sous ameesh. Le refus est porté par un **témoin
+monotone** `cible_demarree`, écrit dans `etat.json` juste avant la première
+tentative de démarrage cible et jamais effacé : même si le canari a tourné
+puis est sorti ou failed (donc plus aucune unité active), l'état ne revient
+pas à `prepare` et `preparer`/`identites` restent refusés. Une nouvelle
+tentative exige de recréer le home cible (geste dédié), pas un simple
+`preparer`.
 
 ## 7. Étape 3 — identités (une seule séance owner)
 
@@ -367,20 +373,28 @@ sudo systemd-run --collect --wait --pipe --unit migration-3549-basculer \
    et `daemon-reload`. Le témoin root et le profil AppArmor restent en place
    pour que `retour` puisse les restaurer.
 
-Si la bascule échoue **avant** tout démarrage cible, le script remet la
-source en service et lève ses pauses ; avant de la redémarrer, il rétablit
-les `cwd` sous `/home/smichea` (`canon sync`) et le vérifie. Si ce
-rétablissement échoue, il s'arrête **sans** redémarrer la source et le dit.
-Si elle échoue **après**, les unités cible restent en place et les pauses
-non levées gardent l'admission fermée ; le message dit de lancer `retour`.
+Si la bascule échoue **avant toute tentative de démarrage cible** (témoin
+`cible_demarree` absent), le script remet la source en service et lève ses
+pauses ; avant de la redémarrer, il rétablit les `cwd` sous `/home/smichea`
+(`canon sync`) et le vérifie. Si ce rétablissement échoue, il s'arrête
+**sans** redémarrer la source et le dit. Si elle échoue **après une
+tentative de démarrage cible** — même si le canari a tourné puis est sorti ou
+failed et que toutes les unités cible sont désormais inactives — le témoin
+interdit l'annulation : les unités cible restent en place, les pauses non
+levées gardent l'admission fermée, **aucun retour à `prepare`**, et le
+message dit de lancer `retour`.
 
-**Interruption** (Ctrl-C, `OSError`, coupure) dans la fenêtre critique —
-source arrêtée, aucune unité cible encore démarrée : le script remet la
-source en service et lève les pauses de lui-même. L'ensemble actif est écrit
-dans `etat.json` **avant le premier arrêt** ; après une coupure brutale
-(SIGKILL, redémarrage), `retour --force` le relit et redémarre exactement
-ces unités (§ 10). Ne pas relancer `preparer` dans cet état : il copierait
-sans redémarrer la source.
+**Interruption** (Ctrl-C, `OSError`, coupure) dans la fenêtre critique :
+- **avant** le premier `systemctl start` cible (témoin absent) : le script
+  remet la source en service et lève les pauses de lui-même ; l'ensemble
+  actif est écrit dans `etat.json` **avant le premier arrêt**, donc après une
+  coupure brutale (SIGKILL, redémarrage) `retour --force` le relit et
+  redémarre exactement ces unités (§ 10) ;
+- **après** (témoin présent, même si aucune unité cible n'est active) : pas
+  d'annulation, `retour` comme ci-dessus.
+
+Ne pas relancer `preparer` dans ces états : le témoin le refuse, précisément
+pour ne pas réécrire en root dans un home que les agents ont utilisé.
 
 ## 9. Étape 5 — preuve
 
@@ -511,7 +525,8 @@ La migration est un **geste de préparation** ; elle ne rend pas le poste
 | `retour` : pause non levée | deux CLI en échec | la commande exacte est imprimée : `ameesh resume <agent> --operator --reason … --expect-reason …` |
 | `basculer`/`retour` : `session liée détectée` | le bureau est lié (pause/resume refuse un descendant) | relancer la commande sous `systemd-run` comme l'imprime le script (§ 4.11) |
 | redémarrage pendant la bascule | source déjà désactivée, cible pas encore activée | `retour` (état `bascule`) : il réactive la source et redémarre son ensemble actif |
-| `basculer` interrompu (Ctrl-C, coupure) avec source arrêtée | état resté `prepare`, actifs écrits avant l'arrêt | `retour --force` : il redémarre l'ensemble actif de `etat.json` et lève les pauses ; ne pas relancer `preparer` |
+| `basculer` interrompu (Ctrl-C, coupure) **avant** le premier start cible | témoin `cible_demarree` absent, actifs écrits avant l'arrêt | `retour --force` : il redémarre l'ensemble actif de `etat.json` et lève les pauses ; ne pas relancer `preparer` |
+| canari démarré puis sorti/failed avant la fin de `basculer` | témoin `cible_demarree` présent, aucune unité cible active | ne pas annuler ni relancer `preparer` (refusé) : `retour` pour remettre la source en service |
 
 Toujours : lire le journal, ne pas éditer `etat.json` à la main, ne pas lancer
 deux gestes en parallèle (le verrou le refuse).
@@ -520,7 +535,8 @@ deux gestes en parallèle (le verrou le refuse).
 
 * journal JSONL : `/var/lib/ameesh/migration-runners/journal.jsonl` (racine
   0700) — étapes, horodatages, codes, jamais un secret ;
-* état : `etat.json` (stage, agents, actifs, pauses, pièces retirées) ;
+* état : `etat.json` (stage, agents, actifs, pauses, pièces retirées, témoin
+  monotone `cible_demarree`) ;
 * preuves : `preuve.json` (matrice) ;
 * sauvegarde : `sauvegarde/` (drop-ins #3444/#3540, 0600) ; à conserver
   jusqu'à la fin de la fenêtre de retour ;
