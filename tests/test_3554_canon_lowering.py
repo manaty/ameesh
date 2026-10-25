@@ -54,7 +54,7 @@ projects: {}
 
 
 def _federation(*, secret_rule=True, batch_reviews=1, tools_class=True,
-                project=True):
+                tools_count=True, project=True):
     """La politique de base ; les témoins retirent une règle ou en ajoutent."""
     ameesh_rules = ["          - paths:\n              - \"deploy/**\"\n"
                     "            class: sensitive"]
@@ -70,6 +70,7 @@ def _federation(*, secret_rule=True, batch_reviews=1, tools_class=True,
     if tools_class:
         ameesh_rules.append("          - paths:\n              - \"tools/**\"\n"
                             "            class: sensitive")
+    if tools_count:
         ameesh_counts.append("          - paths:\n              - \"tools/**\"\n"
                              "            reviews: 1")
     if batch_reviews:
@@ -194,13 +195,17 @@ class DetectionTest(unittest.TestCase):
         self.assertIn("sensitive/2→sensitive/1", text)
 
     def test_losing_a_class_alone_is_a_lowering(self):
-        # tools/run.py passe de sensible à léger sans perdre de compte.
-        head = self._head(_federation(tools_class=False))
+        # B1 cx3 : tools/run.py passe de sensible à léger, le compte
+        # train_reviews reste 1. `reviews_for` force des deux côtés
+        # risk=sensitive : seule la classe compilée révèle la baisse.
+        head = self._head(_federation(tools_class=False, tools_count=True))
         found = self._detect(head)
         self.assertEqual(found.floor, 2)
         self.assertEqual([item.path for item in found.lowered], ["tools/run.py"])
-        self.assertEqual(found.lowered[0].before_class, "sensitive")
-        self.assertEqual(found.lowered[0].after_class, "light")
+        item = found.lowered[0]
+        self.assertEqual((item.before_class, item.after_class),
+                         ("sensitive", "light"))
+        self.assertEqual((item.before_reviews, item.after_reviews), (1, 1))
 
     def test_a_neutral_change_keeps_one_review(self):
         head = self._head(_federation() + "# commentaire\n")

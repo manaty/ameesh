@@ -256,18 +256,24 @@ def _scan_cached(canon_repo: str, base: str, head: str, project: str,
             # baisse imputable à ce diff : elle est comptée, pas inventée.
             base_unreadable += 1
             continue
+        # B1 cx3 : `reviews_for` force `risk=sensitive` dès qu'un compte
+        # `train_reviews` existe ; comparer ce risque masquerait une baisse de
+        # la classe déclarée (`tools/**` sensible→léger, compte inchangé). La
+        # classe se lit donc dans la politique compilée, le compte à part.
+        before_class, _before_rule = base_loaded.review_policy.class_of(path)
+        after_class, _after_rule = head_loaded.review_policy.class_of(path)
         try:
             after = head_loaded.reviews_for([path])
         except (mechanics.MechanicsError, review.ReviewError):
             # La tête ne sait plus exiger : c'est une baisse (le doute aussi).
-            lowered.append(Lowered(project, path, before.risk, "indécise",
+            lowered.append(Lowered(project, path, before_class, after_class,
                                    before.reviews, 0))
             continue
-        if (review.RANK[after.risk] < review.RANK[before.risk]
+        if (review.RANK[after_class] < review.RANK[before_class]
                 or after.reviews < before.reviews):
-            lowered.append(Lowered(project, path, before.risk, after.risk,
+            lowered.append(Lowered(project, path, before_class, after_class,
                                    before.reviews, after.reviews))
-        elif (review.RANK[after.risk] > review.RANK[before.risk]
+        elif (review.RANK[after_class] > review.RANK[before_class]
               or after.reviews > before.reviews):
             hardened += 1
         else:
