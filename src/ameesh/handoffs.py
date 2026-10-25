@@ -17,9 +17,8 @@ import subprocess
 import threading
 import time
 import uuid
-from urllib.parse import urlsplit
 
-from . import projects, relocation, resources, storage
+from . import handoff_contract, projects, relocation, resources, storage
 from .db import DbError
 
 GIB = 1024 ** 3
@@ -169,10 +168,7 @@ def request(db, candidate, *, repository, ttl=900, now=None):
         raise HandoffError("fresh plan, source lease and enrolled repository required")
     if not 30 <= ttl <= 7200:
         raise HandoffError("reservation TTL outside 30..7200 seconds")
-    parsed = urlsplit(repository)
-    if (parsed.password is not None or parsed.query or parsed.fragment
-            or (parsed.scheme == "https" and parsed.username is not None)
-            or any(ord(c) < 32 for c in repository)):
+    if not handoff_contract.repository_identity(repository):
         raise HandoffError("repository reference contains credentials or control characters")
     for key in ("memory_bytes", "disk_bytes", "max_agents"):
         if isinstance(candidate.get(key), bool) or not isinstance(candidate.get(key), int) or candidate[key] <= 0:
@@ -275,9 +271,21 @@ def brief(op):
 
 
 def _adapter_call(adapter, step, op):
-    """Contain host failures without persisting potentially private diagnostics."""
+    """Contain host failures without persisting potentially private diagnostics.
+
+    The H1 contract is checked before the adapter is entered: a method that is
+    absent, an operation without its lease/epoch identity or a missing
+    controller epoch is refused, never replayed against a host.
+    """
+    method = getattr(adapter, step, None)
+    if not callable(method):
+        raise HandoffError("host adapter method missing: " + step)
     try:
-        return getattr(adapter, step)(op)
+        handoff_contract.validate_request(op, step)
+    except handoff_contract.ContractError:
+        raise HandoffError("handoff operation contract refused: " + step) from None
+    try:
+        return method(op)
     except Exception:
         raise HandoffError("host adapter failed: " + step) from None
 

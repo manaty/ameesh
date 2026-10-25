@@ -117,6 +117,42 @@ not install a real host adapter, enable production agents, copy secrets,
 perform root operations or authorise spending. L232b/c and provider login
 readiness supply those separate integrations.
 
+## Enrolled handoff factory (H1)
+
+`ameesh.handoff_contract` binds what a controller may call on an adapter:
+`inventory`, `repository`, `revalidate`, then the effects `prepare`,
+`stop_source`, `publish`, `transfer`, `session`, `admit`, `enable`, `verify`,
+`restore_source`, `recover_source` and `reconcile_effect`. Every effect
+request carries the operation id, the source lease owner and its epoch, its
+repository identity, the durable evidence and the controller epoch. The
+controller refuses an absent method or a request outside that identity before
+the adapter is entered; proofs stay checked by the controller.
+
+`deploy/mise-a-jour/fabrique-handoff.py` is the single pinned factory. A
+controller loads that exact file, never a module named by a job, a message or
+a document. It reads four exact private documents under
+`/etc/ameesh-handoff` — `enrollment.json` (version and controller host),
+`hosts.json` (admitted host/harness/account/tool/secret-alias identities),
+`repositories.json` (project to enrolled repository identity) and
+`secrets.json` (preflight alias to private `fichier#CLE` reference) — and the
+fixed `hote-handoff.py` companion next to it. `requirements_for(agent, host)`
+returns the exact `host_preflight.Requirements`: host, harness, exact account,
+tools and alias names; the private reference mapping is available separately
+for the L232c bridge and never enters `Requirements` or an error. A missing or
+unsafe document, an unenrolled host, harness or account, an unknown project
+repository, a credential-bearing repository URL or a missing adapter method
+refuses admission. Only the SSH userinfo `git@` is admitted, in URL or
+scp-like form; HTTP(S)/`git+https` userinfo is refused as a credential.
+Documents must be regular files: the final type is checked before opening,
+the open is non-blocking and the descriptor is checked again, so a FIFO or a
+device cannot hang admission.
+
+H1 binds no host effect. The companion's capabilities refuse by name until H2
+(preparation and Git) and H3 (activation, health and recovery) replace them;
+a present-but-unimplemented method refuses at call time and never returns a
+simulated success. This factory is source only: it installs no service,
+performs no SSH, root, credential or production operation.
+
 ## Host drain, return and loss recovery (L232e)
 
 `ameesh host drain HOST [--for 8h] [--actor human:<id>]` closes new claims,
