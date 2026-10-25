@@ -185,6 +185,18 @@ class InputsAttributionTest(unittest.TestCase):
             "deepseek", session="s1", inputs=()))
 
 
+class TurnAttributionLotTest(unittest.TestCase):
+    def test_le_courrier_sans_lot_n_herite_pas_du_lot_de_session(self):
+        """#3452 : un tour de courrier sans lot (pilotage, courrier ambigu) ne
+        s'impute pas au lot de session dans le grand livre."""
+        self.assertEqual(cost_mod.turn_attribution_lot(
+            {"lot": "3426", "ids": [1]}, "1606"), "3426")
+        self.assertIsNone(cost_mod.turn_attribution_lot({"ids": [1]}, "1606"))
+        self.assertEqual(cost_mod.turn_attribution_lot({"ids": []}, "1606"), "1606")
+        self.assertEqual(cost_mod.turn_attribution_lot({}, "1606"), "1606")
+        self.assertIsNone(cost_mod.turn_attribution_lot({}, None))
+
+
 class TurnCostsInputsTest(Sandbox, PgTestCase):
     """L'écriture (record → turn_costs), la lecture par message et la CLI."""
 

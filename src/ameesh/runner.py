@@ -7140,6 +7140,12 @@ class AgentWorker(threading.Thread):
         turn_id = uuid.uuid4().hex
         self._turn_id = turn_id
         lot_du_tour = lot or self.agent.get("session_work_item") or None
+        # #3452 : le lot imputé au grand livre ne se replie pas sur le lot de
+        # session pour un tour de courrier sans lot (pilotage, courrier
+        # ambigu) — il n'y a pas travaillé. Les étiquettes de conteneurs
+        # gardent le lot de session (hygiène du dossier), pas la comptabilité.
+        lot_comptable = cost_mod.turn_attribution_lot(
+            spec, self.agent.get("session_work_item"))
         turn_label = containers_mod.turn_labels(
             turn_id, self.name, str(lot_du_tour) if lot_du_tour else None)
         identite = {
@@ -7300,7 +7306,8 @@ class AgentWorker(threading.Thread):
             self.fail_turn("accounting unavailable", "turn harness not written")
             return False
         if not self._compta_marque(events_start, label, model,
-                                   work_item_id=str(lot_du_tour) if lot_du_tour else None,
+                                   work_item_id=(str(lot_comptable)
+                                                 if lot_comptable else None),
                                    turn_id=turn_id):
             self.fail_turn("accounting unavailable",
                            "accounting marker not written")

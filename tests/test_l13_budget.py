@@ -182,6 +182,33 @@ class BudgetGateTest(PgTestCase):
             "order by id desc limit 1")[0]
         self.assertEqual(ligne["inputs"], ["12"])
 
+    def test_un_tour_de_courrier_sans_lot_ne_s_impute_pas_au_lot_de_session(self):
+        """#3452 : le grand livre d'un tour de courrier sans lot ne prend pas
+        le lot de session (206 tours de pilotage imputés à #1606, 117 USD)."""
+        runner, worker = self._worker(plafond=10.0, harness="deepseek")
+        lot = work.add(self.db, title="lot de session", assignee="budget")
+        self.db.execute("UPDATE agent_registry SET session_work_item = %s"
+                        " WHERE name = 'budget'", (str(lot["id"]),))
+        worker.agent = registry.get(self.db, "budget")
+        env = {"AMEESH_BIN_DIR": FAKEBIN, "AMEESH_TEST_LOG": self.turns_log}
+        try:
+            with mock.patch.dict(os.environ, env, clear=False):
+                self.assertTrue(worker.run_turn(
+                    {"kind": "prompt", "prompt": "tour", "ids": ["12"]}))
+                ligne = self.db.query(
+                    "select work_item_id from turn_costs where agent = 'budget' "
+                    "order by id desc limit 1")[0]
+                self.assertIsNone(ligne["work_item_id"])
+                # un tour sans courrier (réveil, suite) garde, lui, le lot de session
+                self.assertTrue(worker.run_turn(
+                    {"kind": "prompt", "prompt": "suite", "ids": []}))
+        finally:
+            worker.watchdog_stop.set()
+        ligne = self.db.query(
+            "select work_item_id from turn_costs where agent = 'budget' "
+            "order by id desc limit 1")[0]
+        self.assertEqual(ligne["work_item_id"], lot["id"])
+
     def test_echec_de_comptabilite_suspend_les_tours(self):
         """Verdict L13 B1 : sans grand livre, plus de tour (fail-closed)."""
         runner, worker = self._worker(plafond=10.0, harness="claude")

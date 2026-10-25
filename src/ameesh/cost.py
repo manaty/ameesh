@@ -2539,6 +2539,23 @@ def _resident_event(events: Iterable[dict]) -> dict | None:
     return found
 
 
+def turn_attribution_lot(spec: dict, session_lot: str | None) -> str | None:
+    """#3452 : le lot imputé au grand livre pour un tour.
+
+    Le lot explicite du tour (courrier lié, réveil de lot, consigne) fait foi.
+    Un tour de **courrier** sans lot déductible (pilotage, courrier ambigu,
+    avis) n'hérite pas du lot de session : il n'y a pas travaillé, et le grand
+    livre l'imputait au lot de session (206 tours de mesh-design sur #1606,
+    117 USD, constat de l'analyse du 25/10). Les tours sans courrier (suite,
+    réveil, résumé de session) gardent le lot de session."""
+    lot = str((spec or {}).get("lot") or "").strip()
+    if lot:
+        return lot
+    if (spec or {}).get("ids"):
+        return None
+    return str(session_lot or "").strip() or None
+
+
 def _resident_inputs_event(events: Iterable[dict]) -> dict | None:
     """L'événement `resident.inputs` de la tranche, s'il y en a un (L80b).
 
