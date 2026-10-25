@@ -101,10 +101,11 @@ class PacketMemberBaseTest(PgTestCase):
             ("milestone:%d" % int(mark["id"]), sha, actor,
              "s-" + harness, "t", harness))
 
-    def member_row(self, head, actor="author"):
-        row = work.add(self.db, title="membre", app="ameesh", branch="lot/member",
-                       branch_target="main")
-        lot = int(row["id"])
+    def member_row(self, head, actor="author", lot=None):
+        if lot is None:
+            row = work.add(self.db, title="membre", app="ameesh",
+                           branch="lot/member", branch_target="main")
+            lot = int(row["id"])
         self.db.execute("UPDATE work_items SET assignee = %s WHERE id = %s",
                         (actor, lot))
         storage.of(self.db).work.add_milestone(
@@ -224,10 +225,19 @@ class PacketMemberBaseTest(PgTestCase):
         self.assertTrue(self.need(self.base)["ok"])
 
     # #3513: inherited co-members have already passed their own review gate.
-    def stacked_vehicle(self, *, outsider=False, prior_freeze=False):
+    def stacked_vehicle(self, *, outsider=False, prior_freeze=False,
+                        inverted=False):
         actors = ("r_codex", "r_claude", "author")
         families = dict(zip(actors, ("codex", "claude", "deepseek")))
         units = []
+        # #3516 : numéros réservés d'avance, le bas de la pile prend le plus
+        # grand ; la composition garde l'ordre de l'empilement.
+        numbers = [None] * len(actors)
+        if inverted:
+            numbers = [int(work.add(self.db, title="membre", app="ameesh",
+                                    branch="lot/member",
+                                    branch_target="main")["id"])
+                       for _ in actors][::-1]
         start = self.base
         for index, actor in enumerate(actors):
             self.repo.git("checkout", "-q", "-b", "stack-%d" % index, start)
@@ -238,7 +248,7 @@ class PacketMemberBaseTest(PgTestCase):
                             "name: member-%d\n" % index)
             head = self.repo.commit("stack member", agent=actor)
             self.receipt(head, actor, families[actor])
-            lot = self.member_row(head, actor=actor)
+            lot = self.member_row(head, actor=actor, lot=numbers[index])
             if prior_freeze and index == 2:
                 self.repo.write(".github/workflows/member-2.yml", "name: revised\n")
                 head = self.repo.commit("revision", agent=actor)
@@ -269,6 +279,27 @@ class PacketMemberBaseTest(PgTestCase):
         self.assertEqual([call.kwargs["admitted_heads"]
                           for call in gate.call_args_list],
                          [(), (units[0][1],), (units[0][1], units[1][1])])
+
+    def test_3516_a_predecessor_with_a_higher_number_is_read_first(self):
+        # Témoin de numérotation inversée : la porte lisait les membres par
+        # numéro et le bas de la pile, lu en dernier, ne couvrait rien.
+        units = self.stacked_vehicle(inverted=True)
+        self.assertGreater(units[0][0], units[1][0])
+        self.assertGreater(units[1][0], units[2][0])
+        with mock.patch.object(merge_queue, "review_gate",
+                               wraps=merge_queue.review_gate) as gate:
+            out = self.need(self.base)
+        self.assertTrue(out["ok"], out)
+        self.assertEqual(out["required"], 0)
+        self.assertEqual([call.kwargs["admitted_heads"]
+                          for call in gate.call_args_list],
+                         [(), (units[0][1],), (units[0][1], units[1][1])])
+
+    def test_3516_inverted_numbering_keeps_an_outside_unknown_blocking(self):
+        self.stacked_vehicle(outsider=True, inverted=True)
+        out = self.need(self.base)
+        self.assertFalse(out["ok"], out)
+        self.assertIn("provenance unknown", out["why"])
 
     def test_3513_unknown_commit_outside_admitted_members_still_refuses(self):
         self.stacked_vehicle(outsider=True)
