@@ -19,6 +19,11 @@ règle d'aujourd'hui n'aurait pas gardé :
 Toujours épargnés : un artefact d'un run qui n'est pas terminé (paquet en
 cours de CI compris), un artefact de moins de `--epargne-heures` (24 par
 défaut) hors `mesure-*`, une famille inconnue, un artefact déjà expiré.
+Le cliché des runs en cours, pris au départ, ne suffit pas : un run terminé
+peut être relancé pendant la purge. Le statut du run est donc relu juste
+avant chaque suppression, toutes familles (lecture de moins de `FRAIS_S`
+secondes) ; un run qui n'est plus `completed`, ou illisible, garde ses
+artefacts.
 
 Par défaut le script ne fait que compter (avant, après, par famille) ;
 `--appliquer` supprime. Il lit et supprime par `gh api` (jeton de `gh`,
@@ -56,6 +61,10 @@ RETENTION_H: dict[str, int | None] = {
 
 ETATS_EN_COURS = ("queued", "in_progress", "waiting", "requested", "pending")
 
+#: âge maximal (secondes) d'une lecture de run sur laquelle une suppression
+#: s'appuie : le statut se relit au lieu de vivre toute la purge en cache.
+FRAIS_S = 30.0
+
 
 def famille(nom: str) -> str | None:
     """Famille d'un nom d'artefact : `mesure-psycopg-3` → `mesure`,
@@ -70,24 +79,59 @@ def _date(texte: str) -> dt.datetime:
     return dt.datetime.fromisoformat(texte.replace("Z", "+00:00"))
 
 
+def jobs_effectifs(jobs: list[dict]) -> list[dict]:
+    """Le dernier résultat de chaque job, toutes tentatives confondues.
+
+    `jobs` est la liste de `/jobs?filter=all` : une relance du seul job
+    `carte` ne rejoue pas les mesures, dont le résultat reste celui de la
+    tentative précédente. `filter=latest` (le défaut de l'API) les omet."""
+    dernier: dict[str, dict] = {}
+    for j in jobs:
+        cle = (j.get("run_attempt") or 1, j.get("id") or 0)
+        nom = j.get("name") or ""
+        if nom not in dernier or cle > (dernier[nom].get("run_attempt") or 1,
+                                        dernier[nom].get("id") or 0):
+            dernier[nom] = j
+    return list(dernier.values())
+
+
 def mesures_gardees(run: dict, jobs: list[dict]) -> bool:
     """Le cas où carte.yml garde les mesures de son run : hors PR, toutes les
-    parts de mesure vertes, fusion (job `carte`) en échec."""
+    parts de mesure vertes, fusion (job `carte`) en échec — sur le dernier
+    résultat de chaque job (`jobs_effectifs`). Une preuve incomplète (aucun
+    job de mesure, ou pas de `carte` après des mesures vertes) garde aussi :
+    la rétention d'un jour fera le reste."""
     if run.get("event") == "pull_request":
         return False
+    jobs = jobs_effectifs(jobs)
     mesures = [j for j in jobs if (j.get("name") or "").startswith("mesure ")]
     carte = [j for j in jobs if j.get("name") == "carte"]
-    return (bool(mesures) and all(j.get("conclusion") == "success" for j in mesures)
-            and bool(carte) and carte[0].get("conclusion") == "failure")
+    if not mesures:
+        return True
+    if not all(j.get("conclusion") == "success" for j in mesures):
+        return False
+    return not carte or carte[0].get("conclusion") == "failure"
 
 
 def decision(artefact: dict, maintenant: dt.datetime, *, en_cours: set[int],
-             epargne_h: float, garde_mesures=lambda run_id: False) -> tuple[bool, str]:
+             epargne_h: float, garde_mesures=lambda run_id: False,
+             run_termine=lambda run_id: True) -> tuple[bool, str]:
     """(supprimer, raison) pour un artefact au format de l'API GitHub.
 
-    `en_cours` : identifiants des runs non terminés ; `garde_mesures(run_id)` :
-    vrai si le workflow garde les mesures de ce run (`mesures_gardees`), appelé
-    seulement pour une mesure d'un run terminé."""
+    `en_cours` : identifiants des runs non terminés au départ ;
+    `garde_mesures(run_id)` : vrai si le workflow garde les mesures de ce run
+    (`mesures_gardees`), appelé seulement pour une mesure d'un run terminé ;
+    `run_termine(run_id)` : relecture du statut, vrai seulement si le run est
+    encore `completed`, appelée avant toute suppression."""
+    supprimer, raison = _decision(artefact, maintenant, en_cours=en_cours,
+                                  epargne_h=epargne_h, garde_mesures=garde_mesures)
+    if supprimer and not run_termine(artefact["workflow_run"]["id"]):
+        return False, "run relancé ou illisible à la relecture"
+    return supprimer, raison
+
+
+def _decision(artefact: dict, maintenant: dt.datetime, *, en_cours: set[int],
+              epargne_h: float, garde_mesures) -> tuple[bool, str]:
     if artefact.get("expired"):
         return False, "déjà expiré"
     fam = famille(artefact.get("name") or "")
@@ -141,24 +185,50 @@ def runs_en_cours(repo: str) -> set[int]:
     return ids
 
 
-def garde_par_api(repo: str):
-    cache: dict[int, bool] = {}
+class LecteurRuns:
+    """Lectures d'un run par l'API, chacune réutilisée au plus `frais_s`
+    secondes : assez pour les parts d'un même run, jamais pour la purge
+    entière (un run relancé entre-temps se voit à la lecture suivante)."""
 
-    def garde(run_id: int) -> bool:
-        if run_id not in cache:
+    def __init__(self, repo: str, frais_s: float = FRAIS_S, gh=None, horloge=time.monotonic):
+        self.repo, self.frais_s = repo, frais_s
+        self._gh, self._horloge = gh or _gh, horloge
+        self._runs: dict[int, tuple[float, dict | None]] = {}
+
+    def run(self, run_id: int) -> dict | None:
+        """Le run, ou None s'il est illisible."""
+        lu = self._runs.get(run_id)
+        if lu is None or self._horloge() - lu[0] > self.frais_s:
             try:
-                run = json.loads(_gh(f"repos/{repo}/actions/runs/{run_id}"))
-                jobs = _lignes_json(_gh("--paginate",
-                                        f"repos/{repo}/actions/runs/{run_id}/jobs?per_page=100",
-                                        "--jq", ".jobs[]"))
-                cache[run_id] = mesures_gardees(run, jobs)
-            except subprocess.CalledProcessError as e:
-                # run illisible : on garde, la rétention d'un jour fera le reste
-                print(f"run {run_id} illisible, mesures gardées : {e.stderr.strip()}",
-                      file=sys.stderr)
-                cache[run_id] = True
-        return cache[run_id]
-    return garde
+                run = json.loads(self._gh(f"repos/{self.repo}/actions/runs/{run_id}"))
+            except (subprocess.CalledProcessError, ValueError) as e:
+                print(f"run {run_id} illisible, artefacts gardés : "
+                      f"{getattr(e, 'stderr', '') or e}".strip(), file=sys.stderr)
+                run = None
+            lu = (self._horloge(), run)
+            self._runs[run_id] = lu
+        return lu[1]
+
+    def termine(self, run_id: int) -> bool:
+        run = self.run(run_id)
+        return run is not None and run.get("status") == "completed"
+
+    def garde_mesures(self, run_id: int) -> bool:
+        """Vrai (garder) si le run n'est pas terminé, est illisible, ou
+        répond au cas de garde du workflow sur toutes ses tentatives."""
+        run = self.run(run_id)
+        if run is None or run.get("status") != "completed":
+            return True
+        try:
+            jobs = _lignes_json(self._gh(
+                "--paginate",
+                f"repos/{self.repo}/actions/runs/{run_id}/jobs?filter=all&per_page=100",
+                "--jq", ".jobs[]"))
+        except (subprocess.CalledProcessError, ValueError) as e:
+            print(f"jobs du run {run_id} illisibles, mesures gardées : "
+                  f"{getattr(e, 'stderr', '') or e}".strip(), file=sys.stderr)
+            return True
+        return mesures_gardees(run, jobs)
 
 
 def bilan(artefacts: list[dict]) -> dict[str, tuple[int, int]]:
@@ -188,11 +258,13 @@ def main(argv: list[str] | None = None) -> int:
     maintenant = dt.datetime.now(dt.timezone.utc)
     artefacts = lire_artefacts(a.repo)
     en_cours = runs_en_cours(a.repo)
-    garde = garde_par_api(a.repo)
+    runs = LecteurRuns(a.repo)
     supprimes, raisons, echecs = [], collections.Counter(), 0
     for art in artefacts:
         suppr, raison = decision(art, maintenant, en_cours=en_cours,
-                                 epargne_h=a.epargne_heures, garde_mesures=garde)
+                                 epargne_h=a.epargne_heures,
+                                 garde_mesures=runs.garde_mesures,
+                                 run_termine=runs.termine)
         raisons[raison] += 1
         if not suppr:
             continue

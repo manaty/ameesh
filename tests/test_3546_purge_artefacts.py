@@ -158,5 +158,97 @@ class DecisionTest(unittest.TestCase):
         self.assertEqual(b, {"mesure": (2, 20)})
 
 
+class FauxGh:
+    """`gh api` simulé : un run par identifiant, ses jobs de toutes les
+    tentatives ; `filter=latest` (défaut de l'API) ne rend que la dernière."""
+
+    def __init__(self, runs, jobs=()):
+        self.runs, self.jobs, self.appels = runs, list(jobs), []
+
+    def __call__(self, *args):
+        url = next(a for a in args if a.startswith("repos/"))
+        self.appels.append(url)
+        run_id = int(url.split("/runs/")[1].split("/")[0].split("?")[0])
+        if run_id not in self.runs:
+            raise purge.subprocess.CalledProcessError(1, "gh", stderr="HTTP 404")
+        run = self.runs[run_id]
+        if "/jobs" not in url:
+            return purge.json.dumps(run)
+        jobs = self.jobs
+        if "filter=all" not in url:
+            jobs = [j for j in jobs if j["run_attempt"] == run["run_attempt"]]
+        return "\n".join(purge.json.dumps(j) for j in jobs)
+
+
+def _jobs_relance():
+    """Tentative 1 : mesures vertes, carte en échec ; tentative 2 : la seule
+    carte rejouée, encore en échec."""
+    return [{"id": 1, "name": "mesure psycopg 1/8", "conclusion": "success", "run_attempt": 1},
+            {"id": 2, "name": "mesure psql 1/6", "conclusion": "success", "run_attempt": 1},
+            {"id": 3, "name": "carte", "conclusion": "failure", "run_attempt": 1},
+            {"id": 4, "name": "carte", "conclusion": "failure", "run_attempt": 2}]
+
+
+def decide_api(a, gh, en_cours=(), horloge=lambda: 0.0):
+    runs = purge.LecteurRuns("o/r", gh=gh, horloge=horloge)
+    return purge.decision(a, MAINTENANT, en_cours=set(en_cours), epargne_h=24,
+                          garde_mesures=runs.garde_mesures, run_termine=runs.termine)
+
+
+class RelanceTest(unittest.TestCase):
+    """Relecture cx3 et dev3 de e2b4b0a2 : un run relancé pendant la purge."""
+
+    def test_b1_mesure_d_un_run_relance_apres_le_cliche_est_gardee(self):
+        # cliché en_cours vide, mesure d'une heure, le run relu est in_progress
+        gh = FauxGh({1: {"event": "push", "status": "in_progress", "run_attempt": 2}},
+                    [{"id": 3, "name": "carte", "conclusion": None, "run_attempt": 2}])
+        self.assertEqual(decide_api(art("mesure-psql-2", 1), gh)[0], False)
+
+    def test_b1_toute_famille_relit_le_statut_avant_de_supprimer(self):
+        gh = FauxGh({1: {"event": "push", "status": "queued", "run_attempt": 2}})
+        self.assertEqual(decide_api(art("flux-psql-1", 30), gh),
+                         (False, "run relancé ou illisible à la relecture"))
+        gh = FauxGh({})
+        self.assertEqual(decide_api(art("flux-psql-1", 30), gh)[0], False)
+        gh = FauxGh({1: {"event": "push", "status": "completed", "run_attempt": 1}})
+        self.assertEqual(decide_api(art("flux-psql-1", 30), gh)[0], True)
+
+    def test_b1_la_lecture_du_run_ne_vit_pas_toute_la_purge(self):
+        temps = [0.0]
+        gh = FauxGh({1: {"event": "push", "status": "completed", "run_attempt": 1}})
+        runs = purge.LecteurRuns("o/r", gh=gh, horloge=lambda: temps[0])
+        self.assertTrue(runs.termine(1))
+        gh.runs[1] = {"event": "push", "status": "in_progress", "run_attempt": 2}
+        temps[0] = purge.FRAIS_S / 2
+        self.assertTrue(runs.termine(1))
+        temps[0] = purge.FRAIS_S + 1
+        self.assertFalse(runs.termine(1))
+
+    def test_b2_relance_de_la_seule_carte_garde_les_mesures(self):
+        # run_attempt=2 terminé : les mesures vertes sont de la tentative 1
+        gh = FauxGh({1: {"event": "push", "status": "completed", "run_attempt": 2}},
+                    _jobs_relance())
+        self.assertEqual(decide_api(art("mesure-psql-2", 1), gh),
+                         (False, "gardée pour rejouer la fusion"))
+        self.assertTrue(any("/jobs?filter=all" in u for u in gh.appels))
+
+    def test_b2_preuve_incomplete_garde(self):
+        # l'API ne rend que la dernière tentative : aucun job de mesure
+        self.assertTrue(purge.mesures_gardees(
+            {"event": "push"}, [{"id": 4, "name": "carte", "conclusion": "failure",
+                                 "run_attempt": 2}]))
+        # mesures vertes sans carte : rien ne dit que la fusion a réussi
+        self.assertTrue(purge.mesures_gardees(
+            {"event": "push"}, [{"id": 1, "name": "mesure psql 1/6",
+                                 "conclusion": "success", "run_attempt": 1}]))
+
+    def test_b2_le_dernier_resultat_de_chaque_job_fait_foi(self):
+        jobs = _jobs_relance() + [{"id": 5, "name": "carte", "conclusion": "success",
+                                   "run_attempt": 3}]
+        self.assertFalse(purge.mesures_gardees({"event": "push"}, jobs))
+        gh = FauxGh({1: {"event": "push", "status": "completed", "run_attempt": 3}}, jobs)
+        self.assertEqual(decide_api(art("mesure-psql-2", 1), gh)[0], True)
+
+
 if __name__ == "__main__":
     unittest.main()
