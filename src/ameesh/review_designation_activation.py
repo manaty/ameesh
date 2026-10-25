@@ -94,6 +94,10 @@ SENDER = pg.SENDER
 UNAVAILABLE_PREFIX = "review-designation-unavailable:"
 #: journal prefix of a light/no-review outcome: one note per freeze (#2561)
 NONE_PREFIX = "review-designation-none:"
+#: journal prefix of a floor completion (#3557): `<lot>:<freeze>:<floor>:`. One
+#: note per (freeze, floor): a replay that finds the seats already kept writes
+#: nothing, and a waiting outcome cannot be re-noted by a concurrent pass.
+FLOOR_PREFIX = "review-designation-floor:"
 #: journal prefix of an unreadable mark ignored by the reviewer load (#3047):
 #: the line names the offending lot and the id of the note it ignored
 UNREADABLE_PREFIX = "review-designation-unreadable:"
@@ -1563,6 +1567,77 @@ def _freeze_label(freeze: Mapping) -> str:
     return "#%s (%s)" % (freeze.get("id"), str(freeze.get("sha") or "")[:12])
 
 
+def _floor_prefix(lot: int, freeze_id: int, floor: int) -> str:
+    """The idempotent journal prefix of one floor completion (#3557)."""
+    return "%s%d:%d:%d:" % (FLOOR_PREFIX, int(lot), int(freeze_id), int(floor))
+
+
+def _floor_of(db, lot: int, cfg) -> int:
+    """The lot's current review floor, 0 when the journal cannot be read.
+
+    A read failure is not guessed here: `prepare` reads the same floor and
+    fails closed (`Unavailable`), which is the path that matters for a
+    designation. This cheap read only decides whether a recorded designation
+    should be completed."""
+    try:
+        return int(review_floor.of_lot(db, int(lot), cfg=cfg).get("floor") or 0)
+    except Exception:  # noqa: BLE001 - prepare will report it, fail closed
+        return 0
+
+
+def _mark_covers(mark: Mapping, floor: int, *, column=None) -> bool:
+    """True when a recorded designation already covers `floor` opinions.
+
+    Both the recorded required count and the **distinct families** of its
+    reviewers must reach the floor: a mark that declares two opinions but
+    names two agents of the same family still owes an independent one.
+    `column` (the live reviewer names) excludes a seat the pilot removed: the
+    mark alone would otherwise pretend the seat is still designated."""
+    if floor <= 0:
+        return True
+    mark = dict(mark or {})
+    try:
+        required = int(mark.get("required") or 0)
+    except (TypeError, ValueError):
+        required = 0
+    rows = [row for row in mark.get("reviewers") or ()]
+    if column is not None:
+        rows = [row for row in rows
+                if str((row or {}).get("name") or "").strip() in column]
+    families = {str((row or {}).get("family") or "").strip().lower()
+                for row in rows}
+    families.discard("")
+    return required >= floor and len(families) >= floor and len(rows) >= floor
+
+
+def _kept_seats(shape: Mapping, item: Mapping) -> list:
+    """The designated seats of a mark still present in the reviewer column.
+
+    A name the pilot removed from the column is **not** written back: the
+    floor completion completes the live designation, it does not undo a manual
+    removal. The families come from the mark, the same reading the freeze
+    used."""
+    from .work_reviewers import designated
+
+    rows = (shape or {}).get("reviewers") or ()
+    if item is None or (item.get("reviewers") is None
+                        and item.get("reviewer") is None):
+        # no readable column (old schema): the mark is the only evidence
+        column = {str((row or {}).get("name") or "").strip() for row in rows}
+    else:
+        try:
+            column = {str(name or "").strip() for name in designated(dict(item))}
+        except Exception:  # noqa: BLE001 - unreadable column: keep nobody
+            column = set()
+    seats = []
+    for row in rows:
+        name = str((row or {}).get("name") or "").strip()
+        if name and name in column:
+            seats.append({"name": name,
+                          "family": str((row or {}).get("family") or "").strip()})
+    return seats
+
+
 def _note_unavailable(db, item: Mapping, freeze: Mapping, why: str,
                       threads: list, notify: str = "") -> None:
     """One journal note per freeze, plus a mail to the pilot when one is known.
@@ -1977,6 +2052,100 @@ class _ForcedPort:
 
     def commit(self, lot: int, **kwargs) -> dict:
         return self.port.commit(lot, force=True, **kwargs)
+
+
+class _FloorPort(_ForcedPort):
+    """#3557 : le port d'une désignation complétée par un plancher d'avis.
+
+    Les sièges déjà désignés pour ce gel sont **gardés** et ne reçoivent aucun
+    second courrier ; seuls les sièges manquants sont sélectionnés et notifiés.
+    La marque écrite les nomme tous, avec le compte requis `max(barème,
+    plancher)`.
+
+    Une attente (pas assez de familles indépendantes) n'écrit **aucune** marque :
+    une marque `waiting` retirerait de la colonne du lot les sièges déjà
+    désignés (`_sync_reviewers`), alors que le plancher ne les invalide pas.
+    L'attente est journalisée sous le verrou, une fois par `(gel, plancher)`,
+    et la désignation reste inchangée.
+    """
+
+    def __init__(self, port, *, kept, examined=(), mark_id: int, floor: int) -> None:
+        super().__init__(port)
+        self.kept = [{"name": str((seat or {}).get("name") or "").strip(),
+                      "family": str((seat or {}).get("family") or "").strip()}
+                     for seat in kept or ()
+                     if str((seat or {}).get("name") or "").strip()]
+        #: les sièges du gel **vivants au début de la passe** (la marque
+        #: filtrée par la colonne) : si la colonne ne les porte plus, un retrait
+        #: du pilote s'est produit pendant la passe et rien ne doit le
+        #: réécrire (#3367). Un siège retiré avant la passe n'en fait pas
+        #: partie : c'est un retrait acquis, pas un déplacement concurrent
+        #: (B/P2 cx1).
+        self.examined = {str(name or "").strip() for name in examined or ()
+                         if str(name or "").strip()}
+        self.mark_id = int(mark_id)
+        self.floor = int(floor)
+        #: les sièges ajoutés par cette complétion (trace rendue à l'appelant)
+        self.added: list = []
+
+    def commit(self, lot: int, **kwargs) -> dict:
+        db = self.port.db
+        freeze = dict(kwargs.get("freeze") or {})
+        freeze_id = int(freeze.get("id") or 0)
+        since = float(freeze.get("at_ts") or 0.0)
+        rows = db.query("SELECT state, reviewers FROM work_items WHERE id = %s"
+                        " FOR NO KEY UPDATE", (int(lot),))
+        effective = _effective_mark(db, int(lot), freeze_id, since_ts=since)
+        if effective is None or int(effective[0]) != self.mark_id:
+            raise _SeatsMoved(
+                "the designation of freeze #%s moved during the floor completion:"
+                " nothing written" % (freeze.get("id"),))
+        column = {str(name or "").strip()
+                  for name in ((rows[0].get("reviewers") if rows else None) or ())}
+        examined = self.examined or {seat["name"] for seat in self.kept}
+        gone = sorted(examined - column)
+        if gone:
+            raise _SeatsMoved(
+                "reviewer column changed during the floor completion (%s no longer"
+                " designated): nothing written" % ", ".join(gone))
+        state = str(rows[0].get("state") or "") if rows else ""
+        prefix = _floor_prefix(int(lot), freeze_id, self.floor)
+        if kwargs.get("state") == rd.WAITING:
+            if not storage.of(db).work.events_noted(prefix, since, ids=[int(lot)]):
+                storage.of(db).work.note(
+                    int(lot), state,
+                    "%s review floor %d not covered at freeze #%s: %s; kept: %s"
+                    % (prefix, self.floor, freeze_id,
+                       str(kwargs.get("why") or "waiting"),
+                       ", ".join(seat["name"] for seat in self.kept) or "none"),
+                    SENDER)
+            return {"state": rd.WAITING,
+                    "required": int(kwargs.get("required") or 0),
+                    "reviewers": [], "missing": int(kwargs.get("missing") or 0),
+                    "why": str(kwargs.get("why") or ""), "freeze": freeze}
+        names = {seat["name"] for seat in self.kept}
+        new = [dict(row) for row in kwargs.get("reviewers") or ()
+               if str((row or {}).get("name") or "").strip() not in names]
+        kwargs["reviewers"] = self.kept + new
+        why = str(kwargs.get("why") or "")
+        kwargs["why"] = ("%s; review floor %d completed at freeze #%s"
+                         % (why, self.floor, freeze_id) if why
+                         else "review floor %d completed at freeze #%s"
+                              % (self.floor, freeze_id))
+        out = super().commit(lot, **kwargs)
+        self.added = [str((row or {}).get("name") or "").strip() for row in new]
+        out["completed"] = True
+        out["added"] = list(self.added)
+        if not storage.of(db).work.events_noted(prefix, since, ids=[int(lot)]):
+            storage.of(db).work.note(
+                int(lot), state,
+                "%s review floor %d completed the freeze #%s designation:"
+                " added %s; kept %s"
+                % (prefix, self.floor, freeze_id,
+                   ", ".join(self.added) or "none",
+                   ", ".join(seat["name"] for seat in self.kept) or "none"),
+                SENDER)
+        return out
 
 
 def _selection(inputs: Inputs, port, *, force: bool = False,
@@ -2470,6 +2639,14 @@ def designate(cfg, db, lot: int, *, freeze: Optional[Mapping] = None,
     doivent être désignés). Sans lui, une désignation reportée déjà écrite est
     rendue telle quelle, et un plan de report encore valable garde les
     relecteurs reportés sans courrier.
+
+    #3557 : quand le plancher d'avis du lot dépasse le compte enregistré pour
+    le dernier gel, la désignation de ce gel est **complétée** — les sièges
+    déjà désignés sont gardés, les manquants sont choisis par la même sélection
+    déterministe et notifiés, et une marque plus récente porte le nouveau
+    compte. `work reviewers --apply` et `work reviewer --floor` passent ici.
+    Une attente (pas assez de familles) ne retire aucun siège : la marque et la
+    colonne restent la désignation valide, l'attente est journalisée.
     """
     item = work.get(db, int(lot)) or {"id": int(lot), "state": "", "title": "",
                                       "app": ""}
@@ -2495,6 +2672,21 @@ def designate(cfg, db, lot: int, *, freeze: Optional[Mapping] = None,
     if _waiver(item):
         return {"state": "manual", "reviewers": [], "freeze": freeze,
                 "why": "manual waiver (-none)"}
+    # #3557 : un plancher posé après le gel relève le besoin ; la désignation
+    # enregistrée doit être **complétée** pour ce même gel, pas rejouée telle
+    # quelle. `floor` vaut 0 quand le journal est illisible : `prepare` le
+    # relit et échoue fermé, la complétion ne devine rien.
+    floor = _floor_of(db, int(lot), cfg)
+    # the live reviewer column, the same reading `_kept_seats` and the port
+    # use: a seat the pilot removed is not part of the designation any more
+    live = None
+    if item.get("reviewers") is not None or item.get("reviewer") is not None:
+        try:
+            from .work_reviewers import designated
+            live = {str(name or "").strip() for name in designated(dict(item))}
+        except Exception:  # noqa: BLE001 - unreadable column: the mark alone
+            live = None
+    completion = None
     if not force:
         effective = _effective_mark(db, int(lot), int(freeze.get("id") or 0),
                                     since_ts=float(freeze.get("at_ts") or 0.0))
@@ -2503,20 +2695,39 @@ def designate(cfg, db, lot: int, *, freeze: Optional[Mapping] = None,
             # Une sélection `waiting` est retentée : la capacité peut être
             # revenue, et la même marque devient `designated`.
             if effective[1] == "carried":
-                return _carried_shape(effective[2])
-            if effective[2].get("state") == rd.DESIGNATED:
-                return dict(effective[2])
-        plan = carried_plan(cfg, db, int(lot), str(freeze.get("sha") or ""))
-        if plan:
-            with db.transaction() as tx:
-                if not _lock_current_freeze(tx, int(lot), freeze):
-                    return _stale(freeze)
-                return _carried_in_transaction(tx, item, freeze, plan)
+                carried = _carried_shape(effective[2])
+                if _mark_covers(carried, floor, column=live):
+                    return carried
+                completion = {"mark_id": int(effective[0]), "shape": carried}
+            elif effective[2].get("state") == rd.DESIGNATED:
+                existing = dict(effective[2])
+                if _mark_covers(existing, floor, column=live):
+                    return existing
+                # #3557 : le plancher dépasse le compte enregistré. Les sièges
+                # de la marque sont gardés ; seuls les manquants seront choisis
+                # par la même sélection déterministe (famille opposée, charge,
+                # disponibilité) et notifiés.
+                completion = {"mark_id": int(effective[0]), "shape": existing}
+        if completion is None:
+            plan = carried_plan(cfg, db, int(lot), str(freeze.get("sha") or ""))
+            if plan:
+                with db.transaction() as tx:
+                    if not _lock_current_freeze(tx, int(lot), freeze):
+                        return _stale(freeze)
+                    return _carried_in_transaction(tx, item, freeze, plan)
     threads = _threads()
     checkpoint = len(threads)
     try:
         inputs = prepare(cfg, db, int(lot), freeze=freeze)
         if isinstance(inputs, Unavailable):
+            if completion is not None:
+                # #3557 : une complétion qui ne peut pas lire ses entrées ne
+                # touche à rien. La marque et la colonne restent la
+                # désignation valide du gel ; le plancher reste posé et un
+                # `--apply` ultérieur réessaiera.
+                return {"state": "unavailable", "reviewers": [],
+                        "freeze": freeze,
+                        "why": "review floor completion: %s" % inputs.why}
             if manual:
                 with db.transaction() as tx:
                     if not _lock_current_freeze(tx, int(lot), freeze):
@@ -2543,6 +2754,49 @@ def designate(cfg, db, lot: int, *, freeze: Optional[Mapping] = None,
             return {"state": "manual", "reviewers": [], "freeze": freeze,
                     "why": "manual reviewer(s) already cover the required review(s): %s"
                            % ", ".join(inputs.manual)}
+        if completion is not None:
+            # #3557 : la désignation du gel est complétée, jamais remplacée.
+            if not inputs.paths or inputs.policy.required == 0:
+                return dict(completion["shape"])
+            # Le snapshot **vivant** du début de passe : seuls les sièges du
+            # gel encore présents dans la colonne sont examinés et gardés. Un
+            # siège retiré à la main **avant** la passe n'est ni réexaminé
+            # (sinon chaque essai refuse en `stale`, B/P2 cx1) ni choisi de
+            # nouveau comme candidat (sinon la complétion réinscrit le retrait
+            # sans courrier, B/P1 dev4) : il est exclu, et l'attente est
+            # journalisée si la couverture manque.
+            live_seats = _kept_seats(completion["shape"], item)
+            live_names = {seat["name"] for seat in live_seats}
+            mark_names = {str((row or {}).get("name") or "").strip()
+                          for row in (completion["shape"] or {}).get("reviewers") or ()}
+            mark_names.discard("")
+            removed = mark_names - live_names
+            seats = rd.manual_seats(
+                list(inputs.manual_seats) + live_seats,
+                authors=inputs.authors, fixers=inputs.correctors,
+                families=inputs.policy.families)
+            kept = [seat for seat in seats if seat["name"] in live_names]
+            if len(seats) >= int(inputs.policy.required):
+                # the live seats already cover the raised floor: nothing to
+                # designate, no mail, no new mark
+                return dict(completion["shape"])
+            if removed:
+                inputs = dataclasses.replace(
+                    inputs,
+                    candidates=[candidate for candidate in inputs.candidates
+                                if str(getattr(candidate, "name", "") or "").strip()
+                                not in removed])
+            with db.transaction() as tx:
+                port = _FloorPort(
+                    pg.PgPort(tx, after_commit=threads, at_freeze=False),
+                    kept=kept, examined=live_names,
+                    mark_id=int(completion["mark_id"]), floor=floor)
+                out = _selection(inputs, port, kept=port.kept)
+                if out.get("state") == rd.DESIGNATED:
+                    _sync_reviewers(tx, item, freeze,
+                                    [r.get("name") for r in out.get("reviewers") or ()])
+            _drain(db, threads)
+            return out
         if not inputs.paths or inputs.policy.required == 0:
             why = LIGHT_WHY if inputs.paths else NO_PATH_WHY
             with db.transaction() as tx:
@@ -2564,13 +2818,18 @@ def designate(cfg, db, lot: int, *, freeze: Optional[Mapping] = None,
                 pass
         _drain(db, threads)
         return out
-    except rd.StaleFreeze as exc:
+    except (rd.StaleFreeze, _SeatsMoved) as exc:
         # The port or the column guard refused an old freeze before any
         # write: never clear or re-register the newer head's reviewers.
         del threads[checkpoint:]
         return _stale(freeze, str(exc))
     except rd.DesignationError as exc:
         del threads[checkpoint:]
+        if completion is not None:
+            # #3557 : a failed completion never clears the valid designation
+            # of the freeze (unlike a first designation, which admits nothing).
+            return {"state": "unavailable", "reviewers": [], "freeze": freeze,
+                    "why": "review floor completion: %s" % exc}
         with db.transaction() as tx:
             if not _lock_current_freeze(tx, int(lot), freeze):
                 return _stale(freeze)
