@@ -837,29 +837,37 @@ def _fresh_events(slug: str, head: str, rid: int, attempt: int, *, gh) -> list[d
     sortie des flux terminaux et la comparer aux lignes en base prouve que le
     relevé est complet, au lieu de supposer que la dernière passe a tout vu.
 
-    La lecture est celle du veilleur (`commits/<sha>/check-runs`, une page de
-    100) ; une page tronquée (`total_count` au-delà) ne prouve pas la
-    complétude et rend None. None aussi si une sortie de flux porte le
-    marqueur d'omission de `ci-flow.py` (relectures B/P1 du 25/10) : les
-    échecs coupés par `MAX_TEXT` ne sont ni publiés ni lus, donc `events_of`
-    les ignore et le relevé semblerait complet à tort."""
+    La lecture est celle du veilleur (`commits/<sha>/check-runs`, 100 par
+    page) ; #3593 : toutes les pages sont lues (`--paginate`), pas seulement
+    la première — au-delà de 100 check-runs, la preuve restait sinon inerte.
+    Une lecture partielle (pages absentes, `total_count` non couvert, compte
+    qui change d'une page à l'autre) ne prouve pas la complétude et rend
+    None. None aussi si une sortie de flux porte le marqueur d'omission de
+    `ci-flow.py` (relectures B/P1 du 25/10) : les échecs coupés par `MAX_TEXT`
+    ne sont ni publiés ni lus, donc `events_of` les ignore et le relevé
+    semblerait complet à tort."""
     from . import ci as ci_mod
     path = "repos/%s/commits/%s/check-runs?per_page=100" % (slug, quote(head, safe=""))
     try:
-        proc = gh(["api", path])
+        pages = fire._api_pages(gh, path, "gh api %s" % path)
     except Exception:  # noqa: BLE001 - une lecture illisible ne prouve rien
         return None
-    if proc.returncode != 0:
-        return None
-    try:
-        data = json.loads(proc.stdout or "{}")
-    except ValueError:
-        return None
-    if not isinstance(data, dict) or not isinstance(data.get("check_runs"), list):
-        return None
-    runs = [run for run in data["check_runs"] if isinstance(run, dict)]
-    total = data.get("total_count")
-    if type(total) is not int or total > len(data["check_runs"]):
+    runs = []
+    total = None
+    for data in pages:
+        if not isinstance(data, dict) or not isinstance(data.get("check_runs"), list):
+            return None
+        count = data.get("total_count")
+        if type(count) is not int or count < 0:
+            return None
+        if total is None:
+            total = count
+        elif count != total:
+            # Un check est né entre deux pages : l'ensemble lu n'est pas
+            # celui que `total_count` décrit, la preuve est incomplète.
+            return None
+        runs.extend(run for run in data["check_runs"] if isinstance(run, dict))
+    if total is None or len(runs) != total:
         return None
     for run in runs:
         if not str(run.get("name") or "").startswith(ci_mod.CHECK_PREFIX):
@@ -911,13 +919,16 @@ def _inherited_red(db, *, slug: str, base: str, sha: str, view: dict, required,
     * tout check de cette exécution qui n'est ni vert, ni sauté/neutre, ni
       rouge identifié (en attente, annulé, expiré, jamais conclu) bloque ;
     * les écarts hors CI de `fire.ready_pr` (brouillon, cible, gel, statuts
-      exigés) sont relus : seul un rouge de CI peut être rouvert.
+      exigés) sont relus : seul un rouge de CI peut être rouvert. Un statut
+      exigé non concluant (`ERROR`) ne rouvre rien mais se consigne (#3593 N1),
+      comme sur le chemin vert (`#3085`, règle owner 23/10).
 
     Le masquage est lié aux identités exactes `(nom, exécution)` : une entrée
     de provenance homonyme d'une autre exécution (même application requise)
     reste un rouge non prouvé (relecture ameesh-cx3 B/P1).
 
-    Rend `{parts, tests, base_shas, runs}` (matière de la note), ou None."""
+    Rend `{parts, tests, base_shas, runs}` (matière de la note) et, s'il y en
+    a, `consigned` (statuts exigés non concluants à consigner), ou None."""
     from . import ci as ci_mod, radar
     try:
         st = storage.of(db).ci
@@ -951,6 +962,7 @@ def _inherited_red(db, *, slug: str, base: str, sha: str, view: dict, required,
             provenance = fire._head_check_runs(slug, head, gh=gh)
         except land.LandError:
             return None
+    status_consigned: list[str] = []
     try:
         statuses = radar.required_statuses(project, view.get("branch"))
         status_gaps = []
@@ -959,7 +971,7 @@ def _inherited_red(db, *, slug: str, base: str, sha: str, view: dict, required,
                        if isinstance(entry, dict)
                        and (entry.get("__typename") == "StatusContext"
                             or "state" in entry and "conclusion" not in entry)]
-            status_gaps, _status_consigned = fire._required_status_gate(entries, statuses)
+            status_gaps, status_consigned = fire._required_status_gate(entries, statuses)
     except Exception:  # noqa: BLE001 - une porte illisible ne fusionne pas
         return None
     if status_gaps:
@@ -1154,10 +1166,17 @@ def _inherited_red(db, *, slug: str, base: str, sha: str, view: dict, required,
         return None
     if gaps or proof_gaps or detail_gaps:
         return None
-    return {"parts": sorted(parts), "tests": sorted(tests),
-            "base_shas": sorted({row["head_sha"] for row in bases.values()
-                                 if row.get("head_sha")}),
-            "runs": bases}
+    proof = {"parts": sorted(parts), "tests": sorted(tests),
+             "base_shas": sorted({row["head_sha"] for row in bases.values()
+                                  if row.get("head_sha")}),
+             "runs": bases}
+    # #3593 (N1) : `ready_pr` s'arrête sur les checks rouges avant de relire
+    # les statuts exigés ; le statut non concluant (ERROR) consigné ici ne
+    # doit pas être jeté — il se consigne et ouvre son lot de correction comme
+    # sur le chemin vert (`#3085`, règle owner 23/10).
+    if status_consigned:
+        proof["consigned"] = sorted(set(status_consigned))
+    return proof
 
 
 def _inherited_text(proof: dict) -> str:
@@ -1392,6 +1411,13 @@ def _gate_locked(cfg, db, lot: int, mine: dict, *, gh, dry_run: bool, actor: str
     if error is not None:
         return dict(out, result="error", error="merge: %s" % error)
     consigned = list(report.get("consigned") or ())
+    # #3593 (N1) : les statuts exigés non concluants relus par la preuve du
+    # rouge hérité (ERROR) n'ont pas été consignés par `ready_pr`, qui s'arrête
+    # sur les checks rouges avant cette lecture. Ils se joignent à la liste,
+    # sans doublon quand `ready_pr` les a déjà portés.
+    for text in (inherited or {}).get("consigned") or ():
+        if text not in consigned:
+            consigned.append(text)
     verdict = "gates green" if not inherited else "gates green apart from inherited red"
     note = ("base=%s commit=%s — merged by ameesh into %s at its published head, %s"
             % (base, commit or "already-contained", base, verdict))
