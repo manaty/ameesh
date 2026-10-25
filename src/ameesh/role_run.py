@@ -151,11 +151,13 @@ class _AlertsLease:
         self.owner = "alerts-pass:%s:%s" % (host, uuid.uuid4().hex)
         self.ttl = float(ALERTS_LEASE_TTL_S if ttl is None else ttl)
         #: margin kept between the local stop and the database expiry; it
-        #: must cover TERM + KILL and scheduling, not just one round-trip
-        self.guard = max(0.05, min(ALERTS_LEASE_GUARD_S,
-                                  self.ttl / 3.0, self.ttl * 0.9))
+        #: must cover TERM + KILL and scheduling, not just one round-trip.
+        #: The 0.15 s floor keeps a deliberately tiny TTL (the review probe
+        #: uses 0.3 s) from leaving less time than a scheduler jitter.
+        self.guard = min(self.ttl * 0.9,
+                         max(0.15, min(ALERTS_LEASE_GUARD_S, self.ttl / 3.0)))
         self.kill_grace = max(0.02, min(ALERTS_LEASE_KILL_GRACE_S,
-                                        self.guard / 2.0))
+                                        self.guard / 3.0))
         self.epoch = None
         #: monotonic time at which the child must already be stopped; None
         #: when this process holds no lease

@@ -337,12 +337,9 @@ class AlertsGateTest(_AlertsCase):
         self.addCleanup(shutil.rmtree, folder, ignore_errors=True)
         started = os.path.join(folder, "started")
         done = os.path.join(folder, "done")
+        release = os.path.join(folder, "release")
         second = os.path.join(folder, "second")
-        command = ["python3", "-c",
-                   "import pathlib, time;"
-                   " pathlib.Path(%r).write_text('x');"
-                   " time.sleep(2.0);"
-                   " pathlib.Path(%r).write_text('x')" % (started, done)]
+        command = ["python3", "-c", WAIT_CHILD, started, release, done]
         first = {}
 
         def run_first():
@@ -367,6 +364,9 @@ class AlertsGateTest(_AlertsCase):
             self.assertIn("shared execution lease", out)
             self.assertFalse(os.path.exists(second))
         finally:
+            # Let the first child finish only after the second attempt: a slow
+            # query must not turn "the lease is held" into "the child is gone".
+            open(release, "w").close()
             thread.join(timeout=20.0)
         self.assertFalse(thread.is_alive())
         self.assertEqual(first["result"][0], 0)
@@ -405,11 +405,8 @@ class AlertsGateTest(_AlertsCase):
         self.addCleanup(shutil.rmtree, folder, ignore_errors=True)
         started = os.path.join(folder, "started")
         done = os.path.join(folder, "done")
-        command = ["python3", "-c",
-                   "import pathlib, time;"
-                   " pathlib.Path(%r).write_text('x');"
-                   " time.sleep(8.0);"
-                   " pathlib.Path(%r).write_text('x')" % (started, done)]
+        release = os.path.join(folder, "release")
+        command = ["python3", "-c", WAIT_CHILD, started, release, done]
         first = {}
 
         def run_first():
@@ -434,7 +431,11 @@ class AlertsGateTest(_AlertsCase):
                 " WHERE target = %s", (ALERTS_KEY,))
         finally:
             thread.join(timeout=15.0)
-        self.assertFalse(thread.is_alive())
+            alive = thread.is_alive()
+            if alive:  # let the child finish so the failure can be reported
+                open(release, "w").close()
+                thread.join(timeout=5.0)
+        self.assertFalse(alive, "a stolen lease left the child running")
         self.assertEqual(first["result"][0], 1)
         self.assertFalse(os.path.exists(done))
 
@@ -537,6 +538,18 @@ class AlertsGateTest(_AlertsCase):
         self.assertGreaterEqual(calls["n"], 2)
         self.assertFalse(os.path.exists(ran),
                          "a child started after the local deadline")
+
+#: A child that stays alive until the test writes a release file: the overlap
+#: witnesses must not depend on a fixed sleep finishing after a slow query.
+WAIT_CHILD = (
+    "import pathlib, sys, time\n"
+    "started, release, done = sys.argv[1:4]\n"
+    "pathlib.Path(started).write_text('x')\n"
+    "while not pathlib.Path(release).exists():\n"
+    "    time.sleep(0.02)\n"
+    "pathlib.Path(done).write_text('x')\n"
+)
+
 
 #: A child that holds an exclusive `flock` until it dies. A second child that
 #: can take the lock proves the first one is really gone; one that cannot
