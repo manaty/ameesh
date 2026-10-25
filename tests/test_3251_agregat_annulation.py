@@ -1,19 +1,21 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""#3251 — une annulation interne de l'agrégat `tests` ne retient plus rien.
+"""#3251/#3449 — l'annulation interne de l'agrégat `tests` : ce qui reste tolérable.
 
 Décision owner #128512 (23/10/2026, option a) : « Agrégat requis jamais
 conclu = preuve absente, donc bloquant […]. Les non-concluants à l'intérieur
 d'un agrégat qui a conclu restent non bloquants (§3). »
 
-L'agrégat `tests` conclut donc vert quand une part interne a été **annulée**
-(capacité hébergée, runner perdu), et publie son détail `tests (bilan des
-parts)` en `neutral`. `fire.ready_pr` le consigne sans retenir le paquet,
-`radar.commit_ci` le consigne sans retenir la release ; un `FAILURE` de part
-reste un négatif qui rougit l'agrégat et bloque.
+#3449 borne cette tolérance : les familles **Linux planifiées** (`psycopg`,
+`psql`) sont la preuve de la suite. Leur annulation ou leur absence est une
+preuve absente : l'agrégat rougit. Seules les parts non requises (macOS,
+autre système de fichiers) restent des non-concluants consignés en
+`neutral`, que `fire.ready_pr` et `radar.commit_ci` consignent sans retenir
+le paquet ni la release ; un `FAILURE` de part reste un négatif qui bloque.
 
 Ce fichier couvre le classifieur pur (`scripts/ci-agregat.py`) et les deux
 portes ; `tests/test_940_agregat_bash.py` garde le contrat du workflow et
-l'invariant « jamais de SUCCESS muet ».
+l'invariant « jamais de SUCCESS muet », `tests/test_3449_agregat_run_annule.py`
+le cas exact du run annulé de h-13.
 """
 from __future__ import annotations
 
@@ -43,22 +45,33 @@ class ClassifierTest(unittest.TestCase):
     def test_le_detail_est_le_meme_nom_dans_le_script_et_radar(self):
         self.assertEqual(agregat.DETAIL_CHECK, radar.AGGREGATE_DETAIL_CHECK)
 
-    def test_annulation_interne_conclut_vert_et_se_consigne(self):
-        for part, over in (("psycopg", {"psycopg": "cancelled"}),
-                           ("psql", {"psql": "cancelled"}),
-                           ("plateforme macOS", {"platform_macos": "cancelled"}),
+    def test_annulation_d_une_part_non_requise_conclut_vert_et_se_consigne(self):
+        for part, over in (("plateforme macOS", {"platform_macos": "cancelled"}),
                            ("autre système de fichiers", {"fs_class": "cancelled"})):
             with self.subTest(part=part):
                 result = classify(**over)
                 self.assertEqual(result["state"], agregat.GREEN)
                 self.assertEqual([row["part"] for row in result["consigned"]], [part])
-                self.assertEqual(result["red"], [])
+                self.assertEqual((result["red"], result["missing"]), ([], []))
+
+    def test_les_familles_linux_annulees_sont_une_preuve_absente(self):
+        # #3449 : macOS vert ne prouve pas la suite Linux. Chaque famille
+        # planifiée qui n'a pas conclu rougit l'agrégat, sans consignation
+        # non bloquante.
+        for part, over in (("psycopg", {"psycopg": "cancelled"}),
+                           ("psql", {"psql": "cancelled"})):
+            with self.subTest(part=part):
+                result = classify(**over)
+                self.assertEqual(result["state"], agregat.RED)
+                self.assertTrue(any(gap.startswith(part + " (cancelled")
+                                    for gap in result["missing"]), result["missing"])
+                self.assertEqual(result["consigned"], [])
 
     def test_les_conclusions_non_concluantes_sont_toutes_acceptees(self):
         for conclusion in ("cancelled", "timed_out", "startup_failure",
                            "stale", "action_required"):
             with self.subTest(conclusion=conclusion):
-                result = classify(psql=conclusion)
+                result = classify(platform_macos=conclusion)
                 self.assertEqual(result["state"], agregat.GREEN)
                 self.assertEqual(result["consigned"][0]["result"], conclusion)
 
@@ -76,7 +89,9 @@ class ClassifierTest(unittest.TestCase):
     def test_echec_et_annulation_ensemble_le_negatif_gagne(self):
         result = classify(psycopg="cancelled", psql="failure")
         self.assertEqual(result["state"], agregat.RED)
-        self.assertEqual([row["part"] for row in result["consigned"]], ["psycopg"])
+        self.assertEqual(result["consigned"], [])
+        self.assertTrue(any(gap.startswith("psycopg (cancelled")
+                            for gap in result["missing"]), result["missing"])
 
     def test_toutes_les_parts_annulees_sont_une_preuve_absente(self):
         # Décision #128512 : un agrégat qui n'a aucune part réussie n'a rien
@@ -84,24 +99,27 @@ class ClassifierTest(unittest.TestCase):
         result = classify(psycopg="cancelled", psql="cancelled",
                           platform_macos="cancelled", fs_class="cancelled")
         self.assertEqual(result["state"], agregat.RED)
-        self.assertIn("aucune part n'a conclu (preuve absente)", result["red"])
+        self.assertIn("aucune part n'a conclu (preuve absente)", result["missing"])
         self.assertEqual([row["part"] for row in result["consigned"]],
-                         ["psycopg", "psql", "plateforme macOS",
-                          "autre système de fichiers"])
+                         ["plateforme macOS", "autre système de fichiers"])
+        statuses = {row["part"]: row["status"] for row in result["parts"]}
+        self.assertEqual((statuses["psycopg"], statuses["psql"]),
+                         (agregat.MISSING, agregat.MISSING))
 
     def test_un_saut_legitime_ne_remplace_pas_une_preuve(self):
         # psql saute sans part ([]), ce n'est pas un test ; si tout le reste
         # est annulé, l'agrégat reste sans preuve et rougit.
         result = classify(psycopg="cancelled", psql="skipped", psql_parts="[]")
         self.assertEqual(result["state"], agregat.RED)
-        self.assertIn("aucune part n'a conclu (preuve absente)", result["red"])
+        self.assertIn("aucune part n'a conclu (preuve absente)", result["missing"])
 
-    def test_une_part_reussie_suffit_pour_conclure(self):
-        result = classify(psycopg="success", psql="cancelled",
+    def test_une_annulation_non_requise_suffit_avec_la_preuve_linux(self):
+        result = classify(psycopg="success", psql="success",
                           platform_macos="cancelled")
         self.assertEqual(result["state"], agregat.GREEN)
         self.assertEqual([row["part"] for row in result["consigned"]],
-                         ["psql", "plateforme macOS"])
+                         ["plateforme macOS"])
+        self.assertEqual(result["missing"], [])
 
     def test_psql_saute_sans_part_reste_legitime(self):
         result = classify(psql="skipped", psql_parts="[]")

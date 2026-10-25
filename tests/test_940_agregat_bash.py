@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""L940/#3251 : le check requis `tests` ne verdit jamais muet.
+"""L940/#3251/#3449 : le check requis `tests` ne verdit jamais muet.
 
 #940 (13/10/2026) : une part psql annulée concluait `tests` SUCCESS sans
 qu'aucun test n'ait tourné — un vert muet, fusionné. La garde bash d'alors
@@ -8,20 +8,23 @@ interne.
 
 #3251 (décision owner #128512, 23/10, option a) déplace la frontière : un
 non-concluant **à l'intérieur** d'un agrégat qui a conclu n'est pas bloquant
-(canon §3), mais l'agrégat doit le dire. L'étape « bilan des parts » appelle
+(canon §3), mais l'agrégat doit le dire. #3449 la borne : les familles Linux
+planifiées (`psycopg`, `psql`) sont la preuve ; leur annulation est une
+preuve absente, jamais un vert. L'étape « bilan des parts » appelle
 `scripts/ci-agregat.py`, qui :
 
-* rougit `tests` sur un **échec** prouvé, une part sautée qui devait tourner
-  ou un plan refusé (inchangé, #940) ;
-* laisse `tests` vert sur une **annulation interne** (capacité hébergée,
-  runner perdu) et publie le check de détail `tests (bilan des parts)` en
-  `neutral`, que fire/radar consignent ;
-* échoue si l'annulation ne peut pas être consignée (jeton en lecture seule,
-  API en panne) : jamais de SUCCESS muet.
+* rougit `tests` sur un **échec** prouvé, une part sautée qui devait tourner,
+  un plan refusé ou une **famille Linux planifiée annulée/absente**
+  (inchangé pour l'échec, #940 ; #3449 pour la preuve absente) ;
+* laisse `tests` vert sur l'**annulation d'une part non requise** (macOS,
+  autre système de fichiers) et publie le check de détail
+  `tests (bilan des parts)` en `neutral`, que fire/radar consignent ;
+* échoue si une annulation non requise ne peut pas être consignée (jeton en
+  lecture seule, API en panne) : jamais de SUCCESS muet.
 
 Ce contrat vérifie l'étape du workflow (chaque résultat passé au classifieur,
-plus aucune garde bash) et rejoue les deux issues qui font #940 : l'échec
-réel rougit, l'annulation ne verdit pas sans consignation.
+plus aucune garde bash) et rejoue les issues qui font #940 : l'échec réel
+rougit, l'annulation non requise ne verdit pas sans consignation.
 """
 from __future__ import annotations
 
@@ -170,9 +173,10 @@ class SilentSuccessTest(unittest.TestCase):
         args += rules
         return agregat.main(args, gh=gh)
 
-    def test_annulation_consignee_publie_neutral_et_ne_rougit_pas(self):
+    def test_annulation_non_requise_consignee_publie_neutral_et_ne_rougit_pas(self):
         gh = self.FakeGh()
-        self.assertEqual(self.run_main(["--psql", "cancelled", "--psql-parts", "[1]"],
+        self.assertEqual(self.run_main(["--psql", "success", "--psql-parts", "[1]",
+                                        "--plateforme-macos", "cancelled"],
                                        gh=gh), 0)
         self.assertEqual(gh.created, [(agregat.DETAIL_CHECK, "neutral")])
 
@@ -185,11 +189,19 @@ class SilentSuccessTest(unittest.TestCase):
                                         "--psql-parts", "[1]"], gh=gh), 1)
         self.assertEqual(gh.created, [(agregat.DETAIL_CHECK, "failure")])
 
-    def test_annulation_non_consignable_rougit(self):
+    def test_annulation_non_requise_non_consignable_rougit(self):
         # #940 : on ne peut pas verdir quand l'annulation ne peut pas être
         # consignée. Une PR de fourche sans `checks: write` reste rouge.
-        self.assertEqual(self.run_main(["--psql", "cancelled", "--psql-parts", "[1]"],
+        self.assertEqual(self.run_main(["--psql", "success", "--psql-parts", "[1]",
+                                        "--plateforme-macos", "cancelled"],
                                        gh=self.FakeGh(fail=True)), 2)
+
+    def test_annulation_d_une_famille_linux_rougit_et_publie_failure(self):
+        # #3449 : macOS vert ne rachète pas psql annulé.
+        gh = self.FakeGh()
+        self.assertEqual(self.run_main(["--psql", "cancelled", "--psql-parts", "[1]",
+                                        "--plateforme-macos", "success"], gh=gh), 1)
+        self.assertEqual(gh.created, [(agregat.DETAIL_CHECK, "failure")])
 
     def test_echec_reel_rougit_et_publie_failure(self):
         gh = self.FakeGh()
