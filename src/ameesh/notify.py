@@ -1199,18 +1199,50 @@ def save_shared_state(db, state: dict, *, owner: str, epoch: int) -> bool:
         STATE_SCOPE, state, owner=owner, epoch=epoch)
 
 
-def _merge_local_state(local: dict, shared: dict) -> None:
+def _local_entry_owned(entry, host) -> bool:
+    """Une entrée de console appartient-elle à cet hôte ?
+
+    Les `LOCAL_TYPES` naissent de la console d'UN hôte (`pgbouncer_local`
+    pose `alert.host`) : le document partagé en porte plusieurs, et un hôte
+    ne doit ni résoudre ni fusionner celle d'un autre (#3576, relecture cx1).
+    """
+    alert = (entry or {}).get("alert") or {}
+    return (alert.get("type") in LOCAL_TYPES
+            and str(alert.get("host") or "") == str(host or ""))
+
+
+def _summary_key_host(key) -> str | None:
+    """L'hôte d'une clé d'alerte (`key_of` est une liste JSON), ou None."""
+    try:
+        parsed = json.loads(key)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(parsed, list) or len(parsed) < 3:
+        return None
+    return str(parsed[2] or "")
+
+
+def _merge_local_state(local: dict, shared: dict, host) -> None:
     """Reporte dans l'état partagé ce que seul le passage local a produit.
 
     `run_local_pass` tourne avant la base (#532) : ses alertes de console
     (`LOCAL_TYPES`) et son registre ne peuvent pas venir du document partagé.
-    Tout le reste est remplacé par celui-ci — c'est la règle du dédoublonnage
-    entre hôtes.
+    Seules les entrées de CET hôte traversent : une entrée de console d'un
+    autre hôte reste à lui. Une résolution locale retire la clé de `active` du
+    document partagé, sinon elle y reste et le passage suivant la re-résout à
+    chaque tick (relecture cx1). Tout le reste est remplacé par l'état
+    partagé — c'est la règle du dédoublonnage entre hôtes.
     """
-    for section in ("active", "resolved"):
-        for key, entry in (local.get(section) or {}).items():
-            if ((entry or {}).get("alert") or {}).get("type") in LOCAL_TYPES:
-                shared[section].setdefault(key, entry)
+    owned_keys = set()
+    for key, entry in (local.get("active") or {}).items():
+        if _local_entry_owned(entry, host):
+            shared["active"][key] = entry
+            owned_keys.add(key)
+    for key, entry in (local.get("resolved") or {}).items():
+        if _local_entry_owned(entry, host):
+            shared["active"].pop(key, None)
+            shared["resolved"][key] = entry
+            owned_keys.add(key)
     for identity, sent_ts in (local.get("notified") or {}).items():
         shared["notified"][identity] = max(
             float(sent_ts), float(shared["notified"].get(identity, 0.0)))
@@ -1226,11 +1258,15 @@ def _merge_local_state(local: dict, shared: dict) -> None:
             if not isinstance(members, dict):
                 continue
             for identity, member in members.items():
-                if isinstance(member, dict) and member.get("type") in LOCAL_TYPES:
-                    target = shared["summary"].get(human)
-                    if not isinstance(target, dict):
-                        target = shared["summary"][human] = {}
-                    target.setdefault(event, {})[identity] = member
+                if not isinstance(member, dict) or member.get("type") not in LOCAL_TYPES:
+                    continue
+                if member.get("key") not in owned_keys \
+                        and _summary_key_host(member.get("key")) != str(host or ""):
+                    continue
+                target = shared["summary"].get(human)
+                if not isinstance(target, dict):
+                    target = shared["summary"][human] = {}
+                target.setdefault(event, {})[identity] = member
 
 
 def enter_shared_state(db, notifier, cfg: Config, *, dry_run: bool = False,
@@ -1246,7 +1282,7 @@ def enter_shared_state(db, notifier, cfg: Config, *, dry_run: bool = False,
     if dry_run:
         shared = load_shared_state(db)
         if shared is not None:
-            _merge_local_state(notifier.state, shared)
+            _merge_local_state(notifier.state, shared, getattr(cfg, "host", None))
             notifier.state = shared
         return None, True
     owner = state_owner(cfg)
@@ -1273,7 +1309,7 @@ def enter_shared_state(db, notifier, cfg: Config, *, dry_run: bool = False,
             # document partagé (les autres hôtes liront celui-ci).
             save_shared_state(db, notifier.state, owner=owner, epoch=epoch)
         else:
-            _merge_local_state(notifier.state, shared)
+            _merge_local_state(notifier.state, shared, getattr(cfg, "host", None))
             notifier.state = shared
     except Exception:
         # Ne pas garder un bail qu'aucune passe n'utilisera (base tombée
@@ -1785,12 +1821,21 @@ class Notifier:
     def _local_resolutions(self, wanted: dict, now: float) -> None:
         """Résout les alertes locales que la console ne montre plus, et retente
         les résolutions en vol. Les autres types ne sont jamais touchés : la
-        base peut simplement être non observée."""
+        base peut simplement être non observée.
+
+        #3576 : l'état partagé porte les alertes de console de tous les hôtes ;
+        un hôte ne résout que les siennes (`alert.host`), jamais celle d'un
+        autre dont la console ne dit rien ici (relecture cx1)."""
+        host = getattr(self.cfg, "host", None)
+        # Résolutions déjà en vol AVANT ce tour : seules celles-là se soldent
+        # ici ; celle que `_resolved` vient d'ajouter doit atteindre la fusion
+        # de l'état partagé (#3576, relecture cx1).
+        before = set(self.state["resolved"])
         for key in list(self.state["active"]):
             if key in wanted:
                 continue
             entry = self.state["active"][key]
-            if entry["alert"].get("type") not in LOCAL_TYPES:
+            if not _local_entry_owned(entry, host):
                 continue
             del self.state["active"][key]
             if entry["alert"].get("type") not in self.ncfg.types:
@@ -1799,8 +1844,10 @@ class Notifier:
                 continue
             self._resolved(key, entry, now)
         for key in list(self.state["resolved"]):
+            if key not in before:
+                continue
             entry = self.state["resolved"][key]
-            if entry["alert"].get("type") not in LOCAL_TYPES:
+            if not _local_entry_owned(entry, host):
                 continue
             self._retry(entry, "resolved", now)
             if not self._pending(entry):
@@ -2502,8 +2549,13 @@ class Notifier:
             self._record("resolved", resolved, "resumee", {})
             return
         self._attempt(resolved, "resolved", now)
-        if self._pending(resolved):
-            self.state["resolved"][key] = resolved
+        # #3576 : garder l'entrée même quand l'envoi a réussi. Le passage
+        # local tourne AVANT la lecture de l'état partagé ; c'est cette entrée
+        # qui dit à `_merge_local_state` de retirer la clé de `active` du
+        # document partagé (sinon la console calme la re-résout à chaque
+        # tick). Le passage complet supprime une entrée soldée dans le même
+        # tour (boucle `resolved` de `run_pass`), donc rien ne s'accumule.
+        self.state["resolved"][key] = resolved
 
     # -- envoi ----------------------------------------------------------------
     def _pending(self, entry: dict) -> list:

@@ -5025,10 +5025,14 @@
     "scan"
    ],
    "notify_liveness": [
+    "acquire_state",
     "beat",
     "claim_brief",
     "latest",
-    "release_brief"
+    "read_state",
+    "release_brief",
+    "release_state",
+    "save_state"
    ]
   }
  },

@@ -19,7 +19,7 @@ import tempfile
 import unittest
 from unittest import mock
 
-from ameesh import notify, storage
+from ameesh import notify, pgbouncer_local, storage
 
 from .support import PgTestCase
 
@@ -194,7 +194,7 @@ class SharedDeliveryTest(PgTestCase):
         self.pass_on(self.cfg_a, self.notifier(self.cfg_a, seeded), [])
         local = self.notifier(self.cfg_b, FakeSender())
         local_entry = {"alert": {"type": "pgbouncer_pool_waiting",
-                                 "since": 900.0},
+                                 "host": "agents-b", "since": 900.0},
                        "key": "pool", "status": "envoi", "human": "human:owner",
                        "channels": {"ntfy": {"ok": True, "attempts": 1}}}
         local.state["active"]["pool"] = local_entry
@@ -205,6 +205,59 @@ class SharedDeliveryTest(PgTestCase):
         self.assertEqual(local.state["active"]["pool"], local_entry)
         self.assertIn("pool-identity", local.state["notified"])
         notify.leave_shared_state(self.db, local, lease)
+
+    def _console_entry(self, host="agents-a"):
+        return {"alert": {"type": "pgbouncer_pool_waiting", "host": host,
+                          "since": 900.0},
+                "key": "pool", "status": "envoi", "human": "human:owner",
+                "channels": {"ntfy": {"ok": True, "attempts": 1}}}
+
+    def test_a_local_resolution_pops_the_shared_active_key(self):
+        # Relecture cx1 : la résolution locale (console calmée) doit retirer
+        # la clé du document partagé. Sinon, le passage suivant la relit
+        # active et renvoie la résolution à chaque tick.
+        entry = self._console_entry("agents-a")
+        seeded = self.notifier(self.cfg_a, FakeSender())
+        seeded.state["active"]["pool"] = entry
+        lease, deliver = notify.enter_shared_state(self.db, seeded, self.cfg_a)
+        self.assertTrue(deliver)
+        notify.leave_shared_state(self.db, seeded, lease)
+
+        local = self.notifier(self.cfg_a, FakeSender())
+        local.state["active"]["pool"] = entry
+        with mock.patch.object(pgbouncer_local, "probe", return_value=[]):
+            local.run_local_pass()
+        self.assertNotIn("pool", local.state["active"])
+        self.assertIn("pool", local.state["resolved"])
+
+        lease, deliver = notify.enter_shared_state(self.db, local, self.cfg_a)
+        self.assertTrue(deliver)
+        self.assertNotIn("pool", local.state["active"])
+        self.assertIn("pool", local.state["resolved"])
+        # Le passage ordinaire solde l'entrée résolue dans le même tour.
+        local.run_pass(self.db, current=[])
+        self.assertNotIn("pool", local.state["resolved"])
+        notify.leave_shared_state(self.db, local, lease)
+        shared = storage.of(self.db).notify_liveness.read_state("alerts")
+        self.assertNotIn("pool", shared["active"])
+        self.assertNotIn("pool", shared["resolved"])
+
+    def test_another_hosts_console_alert_is_never_resolved(self):
+        # Le document partagé porte les alertes de console de A ; la console
+        # de B est calme — B ne doit ni la résoudre ni la retirer du partagé.
+        entry = self._console_entry("agents-a")
+        other = self.notifier(self.cfg_b, FakeSender())
+        other.state["active"]["pool"] = entry
+        with mock.patch.object(pgbouncer_local, "probe", return_value=[]):
+            records = other.run_local_pass()
+        self.assertEqual(records, [])
+        self.assertIn("pool", other.state["active"])
+        self.assertNotIn("pool", other.state["resolved"])
+        shared = notify.empty_state()
+        shared["active"]["pool"] = entry
+        notify._merge_local_state(other.state, shared, "agents-b")
+        self.assertIn("pool", shared["active"])
+        self.assertNotIn("pool", shared["resolved"])
 
 
 class CmdNotifySharedTest(PgTestCase):
