@@ -39,6 +39,10 @@ COMMIT = "a" * 40
 POLICY = receipts.Policy(rp_id=RP_ID, origins=(ORIGIN,))
 FAKE_GH = os.path.join(FAKEBIN, "gh")
 PR = "o/r#12"
+#: Marge (s) avant l'échéance d'un reçu « presque échu » : la préparation
+#: (connexions psql, approbation, lancement) doit rester sous l'échéance sur
+#: un runner CI chargé, sans retirer le contrôle avant échéance (#3594).
+MARGE_RECU = 10
 
 
 def member(title: str, *entries: dict) -> dict:
@@ -151,6 +155,15 @@ class ActionsBase(PgTestCase):
 
     def receipt(self, action: dict, soft=None, approver: str = ALICE, **kwargs) -> dict:
         return (soft or self.alice).receipt(actions.approval_request(action, approver, **kwargs))
+
+    def receipt_presque_echu(self, action: dict, **kwargs) -> dict:
+        """Un reçu encore valide ~MARGE_RECU secondes (#3594).
+
+        Le témoin vérifie le passage Python → SQL à l'heure réelle : la
+        préparation doit tenir sous l'échéance sur un runner CI chargé, sans
+        retirer le contrôle avant échéance."""
+        return self.receipt(action, now=int(time.time()) - (600 - MARGE_RECU),
+                            ttl=600, **kwargs)
 
     def approve(self, action: dict, receipt=None, **kwargs) -> dict:
         return actions.approve(self.db, action["action_id"],
@@ -398,10 +411,10 @@ class ActionsCycleTest(ActionsBase):
 
     def test_recu_expire_avant_execution(self):
         action = self.propose("send")
-        receipt = self.receipt(action, now=int(time.time()) - 598, ttl=600)
+        receipt = self.receipt_presque_echu(action)
         self.approve(action, receipt)
         deadline = receipt["request"]["exp"]
-        self.wait_for(lambda: time.time() > deadline + 0.2, timeout=10)
+        self.wait_for(lambda: time.time() > deadline + 0.2, timeout=MARGE_RECU + 10)
         self.refused(receipts.EXPIRED, self.execute, action)
         self.assertFalse(self.nonce_consumed(receipt))
         self.assertEqual((self.get(action)["state"], self.noop.calls), ("approved", []))
@@ -411,9 +424,12 @@ class ActionsCycleTest(ActionsBase):
 
     def test_lancement_echeance_controlee_a_l_heure_reelle(self):
         """L'échéance du reçu est revérifiée DANS la transaction de lancement, à
-        l'heure réelle (clock_timestamp, pas now()), après les verrous."""
+        l'heure réelle (clock_timestamp, pas now()), après les verrous.
+
+        La marge nommée MARGE_RECU laisse la préparation (psql, approbation)
+        tenir sous l'échéance sur un runner CI chargé (#3594)."""
         action = self.propose("send")
-        receipt = self.receipt(action, now=int(time.time()) - 598, ttl=600)
+        receipt = self.receipt_presque_echu(action)
         row = self.approve(action, receipt)
         # transaction ouverte AVANT l'échéance, lancement APRÈS : now() est périmé
         self.db.execute(
@@ -433,7 +449,7 @@ class ActionsCycleTest(ActionsBase):
         self.assertFalse(self.nonce_consumed(receipt))
         self.assertEqual(actions.attempts(self.db, action["action_id"]), [])
         # par la porte : reçu valide à la vérification Python, échu à l'appel SQL
-        receipt = self.receipt(action, now=int(time.time()) - 598, ttl=600)
+        receipt = self.receipt_presque_echu(action)
         self.approve(action, receipt)
         paused = Paused(self.db, "ameesh_action_launch(", until=receipt["request"]["exp"] + 0.3)
         self.refused(receipts.EXPIRED, self.execute, action, db=paused)
@@ -1112,8 +1128,7 @@ class ActionsUnknownTest(ActionsBase):
         action = self.propose("merge", connector=lossy, target=PR)
         self.approve(action)
         self.assertEqual(self.execute(action, lossy)["state"], "unknown")
-        decision = self.receipt(action, assume_duplicate=True, now=int(time.time()) - 598,
-                                ttl=600)
+        decision = self.receipt_presque_echu(action, assume_duplicate=True)
         paused = Paused(self.db, "ameesh_action_replace(", until=decision["request"]["exp"] + 0.3)
         self.refused(receipts.EXPIRED, actions.replace, paused, action["action_id"], decision,
                      policy=POLICY, by=ALICE)
