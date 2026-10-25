@@ -46,6 +46,11 @@ import sys
 import time
 
 MARKER = ".pret"                 # venv-<version> complet et contrôlé
+#: #3619 : les extras que porte tout venv versionné d'hôte — psycopg (pilote
+#: normal) et crypto (canal nexlink, `cryptography>=41`). La préparation les
+#: installe et les contrôle AVANT la bascule : un hôte sans crypto ne sert
+#: jamais le code qui activerait le canal.
+HOST_EXTRAS = "psycopg,crypto"
 CURRENT = "venv-courant"         # lien : version vivante
 REPORT = "venv.precedent"        # fichier : version précédente enregistrée
 LAUNCHERS = ".bascule-lanceurs"  # marqueur : <venv> porte les lanceurs
@@ -188,7 +193,7 @@ def _creer_venv(directory, python):
 def _pip_install(directory, src):
     pip = os.path.join(directory, "bin", "pip")
     _run([pip, "install", "-q", "--force-reinstall", "--no-deps", src])
-    _run([pip, "install", "-q", src])
+    _run([pip, "install", "-q", "%s[%s]" % (src, HOST_EXTRAS)])
 
 
 def _sceller(directory):
@@ -276,7 +281,9 @@ def _controles(directory):
     python = os.path.join(directory, "bin", "python")
     ameesh = os.path.join(directory, "bin", "ameesh")
     _verifier_shebang(ameesh, python)
-    _run([python, "-c", "import psycopg, ameesh; print('imports ok')"],
+    # #3619 : `cryptography` fait partie du contrat du venv (canal nexlink) ;
+    # son absence fait échouer la préparation, pas le premier envoi.
+    _run([python, "-c", "import psycopg, cryptography, ameesh; print('imports ok')"],
          stdout=subprocess.DEVNULL)
     _run([ameesh, "--version"], stdout=subprocess.DEVNULL)
 
