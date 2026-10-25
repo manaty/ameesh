@@ -313,11 +313,12 @@ def _locked(path: str):
 # --------------------------------------------------------------------------
 
 def _git(repo: str, *args: str, check: bool = False, timeout: float = 120.0,
-         input_text: str | None = None) -> subprocess.CompletedProcess:
+         input_text: str | None = None, env: dict | None = None) -> subprocess.CompletedProcess:
     try:
         proc = subprocess.run(
             ["git", "-C", repo, *args], input=input_text, capture_output=True,
-            text=True, timeout=timeout, env=dict(os.environ, GIT_TERMINAL_PROMPT="0"))
+            text=True, timeout=timeout,
+            env=dict(os.environ if env is None else env, GIT_TERMINAL_PROMPT="0"))
     except subprocess.TimeoutExpired as exc:
         raise TransientReleaseError("git %s timed out" % " ".join(args[:2])) from exc
     except OSError as exc:
@@ -1540,12 +1541,16 @@ def _write_notes(path: str, version: str, notes: str) -> None:
         stream.write(notes)
 
 
+def _release_env(author: str = "ameesh release") -> dict:
+    """One command-local identity for version commits, landing merges and tags."""
+    return dict(os.environ,
+                GIT_AUTHOR_NAME=author, GIT_AUTHOR_EMAIL="release@ameesh.invalid",
+                GIT_COMMITTER_NAME=author, GIT_COMMITTER_EMAIL="release@ameesh.invalid")
+
+
 def _commit(path: str, message: str, *, author: str = "ameesh release") -> str:
-    env = dict(os.environ,
-               GIT_AUTHOR_NAME=author, GIT_AUTHOR_EMAIL="release@ameesh.invalid",
-               GIT_COMMITTER_NAME=author, GIT_COMMITTER_EMAIL="release@ameesh.invalid")
     proc = subprocess.run(["git", "-C", path, "commit", "--no-verify", "-q", "-m", message],
-                          capture_output=True, text=True, env=env, timeout=120.0)
+                          capture_output=True, text=True, env=_release_env(author), timeout=120.0)
     if proc.returncode:
         detail = " ".join((proc.stderr or proc.stdout or "").split())[-300:]
         raise ReleaseError("git commit: %s" % (detail or "failed"))
@@ -1628,11 +1633,9 @@ def _ensure_local_tag(project: ProjectRelease, release_sha: str, version: str) -
             raise ReleaseError("tag %s fetched on another commit than %s"
                                % (tag, release_sha[:12]))
         return tag
-    env = dict(os.environ, GIT_COMMITTER_NAME="ameesh release",
-               GIT_COMMITTER_EMAIL="release@ameesh.invalid")
     proc = subprocess.run(
         ["git", "-C", project.repo, "tag", "-a", tag, "-m", "ameesh %s" % version,
-         release_sha], capture_output=True, text=True, env=env, timeout=120.0)
+         release_sha], capture_output=True, text=True, env=_release_env(), timeout=120.0)
     if proc.returncode:
         detail = " ".join((proc.stderr or proc.stdout or "").split())[-300:]
         raise ReleaseError("git tag: %s" % (detail or "failed"))
@@ -1644,7 +1647,9 @@ def _landing_merge(project: ProjectRelease, plan: Plan, release_sha: str,
     """M = merge(main, V), with `[skip ci]`, or a named refusal."""
     folder, worktree = _worktree(project.repo, main)
     try:
-        merged = _git(worktree, "merge", "--no-ff", "--no-commit", release_sha)
+        # Git requires an identity even with --no-commit (#3527).
+        merged = _git(worktree, "merge", "--no-ff", "--no-commit", release_sha,
+                      env=_release_env())
         if merged.returncode:
             _git(worktree, "merge", "--abort")
             detail = " ".join((merged.stderr or merged.stdout or "").split())[-300:]
