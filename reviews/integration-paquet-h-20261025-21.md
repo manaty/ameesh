@@ -88,3 +88,17 @@ conflit. Le run `40204065236` n'a rien exécuté (merge-ref encore sur
   paquet) corrige les 3 témoins psycopg hérités de `test_3503_jit`.
 - Après fusion : staging hors créneau (§11 bis) pour #3560 (Nexlink #3537,
   #3561), #3540 (git HTTPS de pc-smichea) et les portes #3534/#3554/#3556.
+
+## Correction après CI rouge (25/10 15:0xZ)
+
+Le run `40204539739` (tête `4173808ac`) a rougi 6 fois, toutes dans
+`tests.test_l234a_auditor_canon_guard.CanonGuardTest` : chaque prise passe
+désormais par `backlog._take_holds` (#3556), qui lit
+`storage.of(db).progress.lot_hold_events`, alors que la fixture
+`tests.test_l234_auditor.AuditorTest.take` ne fournissait que `work`,
+`operations` et `hosts`. Correctif `4f47c9d9f8b5` : la fixture fournit un
+`progress` sans hold. Aucune unité modifiée ; témoin seul (adaptation de
+test, §2 — aucun avis dû). Ciblés locaux verts :
+`test_l234a_auditor_canon_guard` + `test_l234_auditor` (20 OK),
+`test_3556_auto_take_holds` (7 OK). Nouvelle tête gelée et suite `ci-full`
+relancée ; le feu est à redonner par le pilote.
