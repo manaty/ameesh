@@ -17,10 +17,15 @@
 # `flags=(unconfined)` + `userns,`, pour que la restriction d'Ubuntu ne
 # s'applique pas au binaire de confiance qui pose les bacs à sable.
 #
-# Portée : tout service utilisateur de CET hôte pourra de nouveau utiliser les
-# options de sandboxing de systemd. Sur un poste mono-utilisateur dont les
-# agents ont déjà le groupe docker (donc root), la restriction d'Ubuntu ne
-# protège plus rien ; le profil ne fait que rendre le garde-fou #3444 effectif.
+# Portée : le profil est attaché au BINAIRE systemd-executor, que le
+# gestionnaire système comme le gestionnaire utilisateur exécutent pour chaque
+# service. Tout service sans profil propre hérite donc de ce label
+# `flags=(unconfined)` + `allow all,` : il est behaviorally unconfined et le
+# profil ne lui ajoute que le droit `userns`. Les services qui ont leur propre
+# profil AppArmor (attachement par chemin) y passent comme avant. Sur un poste
+# mono-utilisateur dont les agents ont déjà le groupe docker (donc root), la
+# restriction d'Ubuntu ne protège plus rien ; le profil ne fait que rendre le
+# garde-fou #3444 effectif.
 #
 # Installation (root, propriétaire de l'hôte) :
 #   install -m 0644 deploy/poste/ameesh-systemd-executor.apparmor \
