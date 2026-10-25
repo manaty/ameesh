@@ -1612,6 +1612,10 @@ def explain(result: Evaluation, now: float) -> str:
     gauges = result.gauges
     if not gauges:
         return "no reading: unverified"
+    if _empty_after_reset(gauges, now):
+        # #3586 : la fenêtre remise à zéro est vide ; ce n'est pas une mesure
+        # courante (le relevé est ancien), mais c'est un 0 % sûr à essayer.
+        return "stale reading (window reset since the reading): 0% used, tried first"
     if stale_reading(gauges, now):
         last = lag(gauges, now, result.limits)[1]
         suffix = (", last %s %.0f%%" % (last.key, last.used * 100)
@@ -1701,15 +1705,37 @@ def _informative_partial(gauges, result: Evaluation, now: float) -> bool:
     return True
 
 
+def _empty_after_reset(gauges, now: float) -> bool:
+    """#3586 : un relevé antérieur au reset ne pèse plus quand tout vaut 0 %.
+
+    Une fenêtre remise à zéro depuis la lecture est vide (`used_at` rend 0,
+    L71) ; si **toutes** les fenêtres valent 0 % à `now`, le relevé ancien ne
+    prouve aucun budget entamé. Il n'est plus classé « périmé derrière tout
+    état vérifié » (#1561) : il s'essaie en premier, comme un relevé absent
+    (L117), et le premier tour relit la jauge (`evaluate`/`record_gauges`) —
+    c'est la sonde qui confirme le 0 %. Un compte réellement au seuil reste
+    écarté par `Evaluation.ok`/`placeable` ; `auth_blocked` et les plafonds
+    durs restent intacts, jamais d'overage.
+
+    Sans gauge (relevé absent), la règle L117 existante s'applique : ce helper
+    ne la double pas.
+    """
+    gauges = list(gauges)
+    return bool(gauges) and stale_reading(gauges, now) \
+        and all(g.used_at(now) <= 0.0 for g in gauges)
+
+
 def _rank_key(profile: Profile, evaluations: dict, now: float) -> tuple:
     """La clé de classement d'un compte (0034 amendée, #1561, #1580, #1566).
 
     * la fraîcheur du relevé (#1561, #1566 N1) : sans relevé d'abord (L117,
       amendement 0034 du 2026-10-10 — un compte jamais utilisé compte pour
       0 % et passe en premier, pour ne pas laisser un forfait inutilisé), puis
-      un relevé courant — ou un relevé partiel encore informatif
-      (`_informative_partial`, GO pilote du 15/10) —, puis un relevé périmé,
-      qui ne passe jamais avant un état vérifié ;
+      un relevé dont la fenêtre remise à zéro est vide (0 % partout, #3586 —
+      essayé comme L117, la sonde du premier tour confirme), puis un relevé
+      courant — ou un relevé partiel encore informatif (`_informative_partial`,
+      GO pilote du 15/10) —, puis un relevé périmé, qui ne passe jamais avant
+      un état vérifié ;
     * la perte par seconde d'ici la remise à zéro (`lost_rate`, la plus
       rapide d'abord, #1789/N1) ;
     * le retard sur le rythme (`lag`, le plus petit rapport d'abord) ;
@@ -1725,11 +1751,17 @@ def _rank_key(profile: Profile, evaluations: dict, now: float) -> tuple:
     équilibre les comptes et porte les plafonds fixes (L226b)."""
     result = evaluations[profile.name]
     gauges = result.gauges
+    if _empty_after_reset(gauges, now):
+        # #3586 : 0 % partout, aucun budget entamé à départager — l'ordre
+        # déclaré décide, comme entre deux relevés absents (L117) ; la sonde
+        # du premier tour relit la jauge et confirme le 0 %.
+        return (0, 0.0, 0.0, float("inf"), 0.0, priority(profile))
     found = expiry(gauges, now)
     # #1561 : absent (0, L117), courant (1), périmé (2) — le périmé après tout
     # état vérifié ; #1580/#1789 : le budget perdu avant le retard, lui-même
     # avant l'ordre déclaré ; #1566 N1 : un partiel encore informatif garde le
-    # rang d'un courant.
+    # rang d'un courant ; #3586 : un relevé dont la fenêtre remise à zéro est
+    # vide (0 % partout) s'essaie en premier, comme L117.
     if not gauges:
         freshness = 0
     elif not stale_reading(gauges, now) or _informative_partial(gauges, result, now):
@@ -1779,6 +1811,13 @@ def rank(items: list[Profile], evaluations: dict, now: float, *,
     Sans preuve, il reste périmé (fraîcheur 2) ; un relevé écarté par
     `placeable` ne revient pas par cette règle.
 
+    #3586 : un relevé périmé dont la fenêtre remise à zéro est **vide** (0 %
+    partout à `now`, `_empty_after_reset`) ne porte aucun budget entamé à
+    départager : il s'essaie en premier, comme un relevé absent (L117), et
+    l'ordre déclaré décide ; la sonde du premier tour relit la jauge et
+    confirme le 0 %. La borne #1672 (`placeable`) reste : un relevé plus vieux
+    que la fenêtre ouverte n'entre pas.
+
     Un relevé **absent** garde la règle L117 (amendement 0034 du 2026-10-10) :
     un compte jamais utilisé compte pour 0 % et passe en premier, pour ne pas
     laisser un forfait inutilisé. Un relevé dont **toutes** les fenêtres
@@ -1812,6 +1851,12 @@ def reason_of(ranked: list[Profile], evaluations: dict, now: float) -> str:
         # compte pour 0 % et passe en premier — la raison le dit, sans
         # prétendre à un 0 % mesuré (#1561).
         why = "no reading: unverified, tried first (L117)"
+    elif _empty_after_reset(gauges, now):
+        # #3586 : la fenêtre remise à zéro est vide ; le relevé s'essaie en
+        # premier comme L117, la sonde du premier tour confirme le 0 %.
+        why = explain(evaluations[first.name], now)
+        if len(ranked) > 1 and priority(first) != priority(ranked[1]):
+            why += ", first in the failover order (priority %d)" % priority(first)
     elif stale_reading(gauges, now):
         # #1561 : un relevé périmé est essayé faute de mieux (L71), pas choisi
         # sur un rythme qui n'est plus mesuré. #1672 ne l'écarte que lorsqu'il
