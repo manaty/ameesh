@@ -18,6 +18,7 @@ from ameesh import review_designation as rd
 #: #2451 : familles explicites ; l'activation passe celles du canon compilé
 FAMILIES = ("claude", "codex", "deepseek")
 from ameesh import review_designation_pg as pg
+from ameesh import review_designation_activation as activation
 from ameesh import registry, storage, work
 
 from .support import PgTestCase
@@ -57,6 +58,23 @@ class Test1617ReviewDesignationPgMark(unittest.TestCase):
         self.assertEqual(found["state"], rd.DESIGNATED)
         self.assertEqual(found["freeze"], {"id": 12, "sha": SHA_A})
         self.assertEqual(found["reviewers"], [{"name": "r1", "family": "claude"}])
+
+    def test_a_multi_family_author_keeps_its_proven_set(self):
+        # #3584 : la marque garde tout l'ensemble, pas la seule réduction
+        # ambiguë à "".
+        note = pg._mark_note(
+            3, 12, state=rd.WAITING, required=1, reviewers=[], missing=1,
+            why="one eligible family", policy_ref="canon@deadbeef", sha=SHA_A,
+            authors=[{"name": "cx1", "family": "",
+                      "families": ["codex", "deepseek"],
+                      "proof": "turn-journal",
+                      "fallback_commits": [SHA_A[:12]]}])
+        found = pg.designation_of(note)
+        self.assertEqual(found["authors"], [{
+            "name": "cx1", "family": "",
+            "families": ["codex", "deepseek"],
+            "proof": "turn-journal",
+            "fallback_commits": [SHA_A[:12]]}])
 
 
 class Test1617ReviewDesignationPg(PgTestCase):
@@ -689,3 +707,23 @@ class Test1617FrozenHook(PgTestCase):
                 self.lot, "verdict", sha=SHA_A, actor="me", verdict="ok", note="",
                 on_frozen=lambda *args: None)
         self.assertEqual(self.milestones(), [])
+
+
+class FrozenAuthorsFamiliesTest(PgTestCase):
+    """#3584 : la lecture durable garde l'ensemble des familles prouvées."""
+
+    def test_a_freeze_mark_keeps_the_proven_family_set(self):
+        item = work.add(self.db, title="auteurs multi-familles", app="ameesh")
+        lot = int(item["id"])
+        freeze = storage.of(self.db).work.add_milestone(
+            lot, "frozen", sha=SHA_A, actor="cx1", verdict=None, note="")
+        note = pg._mark_note(
+            lot, int(freeze["id"]), state=rd.WAITING, required=1,
+            reviewers=[], missing=1, why="one eligible family",
+            authors=[{"name": "cx1", "family": "",
+                      "families": ["codex", "deepseek"]}],
+            policy_ref="canon@deadbeef", sha=SHA_A, unknown=())
+        storage.of(self.db).work.note(lot, "build", note, "ameesh")
+        self.assertEqual(activation.frozen_authors(self.db, work.get(self.db, lot)),
+                         [{"name": "cx1", "family": "",
+                           "families": ["codex", "deepseek"]}])
