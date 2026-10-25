@@ -2580,6 +2580,13 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                         print("designation: kept from carried verdicts (%s)"
                               % ", ".join(str(r.get("name"))
                                           for r in designation.get("reviewers") or ()))
+                    elif designation.get("state") == "waiting":
+                        # #3596 : l'attente peut déjà porter des sièges.
+                        names = ", ".join("%s (%s)" % (r.get("name"), r.get("family"))
+                                          for r in designation.get("reviewers") or ())
+                        print("designation: waiting%s — %s" % (
+                            (" (already designated: %s)" % names) if names else "",
+                            designation.get("why") or ""))
                     else:
                         print("designation: %s — %s" % (
                             designation.get("state"), designation.get("why") or ""))
@@ -2595,6 +2602,12 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                                       for r in applied.get("reviewers") or ())
                     print("designated: %s" % names)
                 elif state == "waiting":
+                    # #3596 : une désignation partielle reste `waiting` mais a
+                    # déjà pourvu des sièges ; les montrer avant l'attente.
+                    names = ", ".join("%s (%s)" % (r.get("name"), r.get("family"))
+                                      for r in applied.get("reviewers") or ())
+                    if names:
+                        print("designated: %s (partial; review pending)" % names)
                     print("waiting    : %s" % (applied.get("why") or ""))
                 elif state == "manual":
                     print("manual     : %s" % (applied.get("why") or ""))
@@ -2682,6 +2695,11 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                 print("reviewers: kept from carried verdicts (%s)" % ", ".join(
                     str(r.get("name")) for r in outcome.get("reviewers") or ()))
             elif state == "waiting":
+                # #3596 : une attente peut déjà avoir pourvu des sièges.
+                names = ", ".join("%s (%s)" % (r.get("name"), r.get("family"))
+                                  for r in outcome.get("reviewers") or ())
+                if names:
+                    print("reviewers: %s (partial)" % names)
                 print("review pending: %s" % (outcome.get("why") or ""))
             elif state == "manual":
                 print("reviewers: manual designation kept (%s)"
