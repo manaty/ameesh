@@ -69,7 +69,6 @@ OBSOLETES = ("cles-owner.conf", "git-agents.conf")
 ETATS_QUEUE_INACTIFS = {"landed", "ejected", "skipped", "cancelled"}
 MARGE_AVANT_MIN = 60
 MARGE_APRES_MIN = 30
-FUSEAU = "Europe/Paris"
 #: empreinte GitHub publiée (docs.github.com, clés SSH de github.com).
 EMPREINTE_GITHUB = "SHA256:+DiY3wvvV6TuJJhbpZisF/zLDA0zPMSvHdkr4UvCOqU"
 CLE_GITHUB = ("github.com ssh-ed25519 "
@@ -480,8 +479,21 @@ def unites_installees(ctx: Contexte, *, cible: bool = False) -> list[str]:
     return sorted(set(agents) | trouves)
 
 
+def fuseau_canon(ctx: Contexte) -> str:
+    """Le fuseau des coupures vient du canon compilé, jamais d'un littéral."""
+    python = ctx.source_home / ".local/share/ameesh/venv/bin/python"
+    code = ("from ameesh import config, mechanics;"
+            "print(mechanics.configured(config.load()).timezone)")
+    fait = ctx.hote.lancer([str(python), "-c", code], utilisateur=SOURCE, delai=60)
+    fuseau = (fait.sortie or "").strip()
+    if not fait.ok or not fuseau:
+        refuser("fuseau des coupures illisible dans le canon compilé : %s"
+                % (fait.erreur or fait.sortie).strip()[-300:])
+    return fuseau
+
+
 def creneau(ctx: Contexte) -> tuple[bool, str]:
-    """Le geste doit rester hors des coupures (11:00 et 23:00 Europe/Paris)."""
+    """Le geste doit rester hors des coupures du canon (11:00 et 23:00)."""
     fait = ameesh_source(ctx, "release", "calendar", delai=60)
     if not fait.ok:
         return False, "calendrier de coupure illisible : %s" % fait.erreur.strip()
@@ -492,9 +504,9 @@ def creneau(ctx: Contexte) -> tuple[bool, str]:
     jour, mois, heure, minute = (int(x) for x in correspondance.groups())
     try:
         from zoneinfo import ZoneInfo
-        fuseau = ZoneInfo(FUSEAU)
-    except Exception:  # tzdata absente : refus, jamais une heure locale devinée
-        return False, "fuseau %s indisponible (tzdata)" % FUSEAU
+        fuseau = ZoneInfo(fuseau_canon(ctx))
+    except Exception as exc:  # tzdata absente : refus, jamais une heure locale devinée
+        return False, "fuseau des coupures indisponible : %s" % exc
     maintenant = dt.datetime.now(fuseau)
     prochaine = dt.datetime(maintenant.year, mois, jour, heure, minute, tzinfo=fuseau)
     while prochaine <= maintenant:

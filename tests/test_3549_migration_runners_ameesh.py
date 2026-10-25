@@ -120,6 +120,7 @@ class Banc(unittest.TestCase):
                            "ameesh: canon 0b97d2303ab2, coupures 11:00, 23:00, "
                            "dernière 11:00, prochaine 25/10 23:00, cible main\n")
         self.faux.repondre("work queue show --target main --json", 0, "[]")
+        self.faux.repondre("mechanics.configured", 0, "Europe/Paris\n")
 
     def ecrire_config(self):
         dossier = self.source_home / ".config/ameesh"
