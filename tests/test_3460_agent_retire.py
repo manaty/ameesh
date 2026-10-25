@@ -311,6 +311,22 @@ class RetireTest(PgTestCase):
             work.assign(self.db, lot["id"], "worker")
         self.assertIsNone(work.get(self.db, lot["id"])["assignee"])
 
+    def test_a_retired_agent_is_not_wakeable(self):
+        self.assertTrue(registry.wakeable(self.db, self.cfg, "worker")[0])
+        self.retire()
+        # le marqueur arrive par wake_check : le refus ne dépend pas de
+        # canon_claim_ok (qui, lui, ressemble à une attente de canon sync)
+        self.assertIsNotNone(
+            storage.of(self.db).agents.wake_check("worker")["retired_ts"])
+        ok, why, note = registry.wake_status(self.db, self.cfg, "worker")
+        self.assertFalse(ok)
+        self.assertIn("worker is retired", why)
+        self.assertIn("ameesh agent restore worker", why)
+        self.assertEqual(note, "")
+        self.assertFalse(registry.wakeable(self.db, self.cfg, "worker")[0])
+        self.restore()
+        self.assertTrue(registry.wakeable(self.db, self.cfg, "worker")[0])
+
     def test_cli_retire_and_restore(self):
         out = self.mesh("agent", "retire", "worker", "--reason", "décision #135690 a",
                         "--actor", ALICE, "--json")
