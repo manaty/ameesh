@@ -374,6 +374,52 @@ class ScopedReservationsTest(PgTestCase):
         self.assertEqual(errors, [])
         self.assertIsNotNone(results[0])
 
+    def test_freeze_and_move_lock_repository_before_lot(self):
+        # #3490: move owns the repo lock; freeze must wait before locking
+        # the lot. The old order produces a real PostgreSQL deadlock here.
+        work.reserve_migration(self.db, self.a['id'], 400, repo=self.repo)
+        errors, pid = [], []
+        ready = threading.Event()
+
+        def freeze():
+            conn = self.connect()
+            try:
+                with conn.transaction() as tx:
+                    tx.execute("SET LOCAL lock_timeout = '10s'")
+                    pid.append(tx.query('SELECT pg_backend_pid() AS pid')[0]['pid'])
+                    ready.set()
+                    storage.of(tx).work.add_milestone(
+                        self.a['id'], 'frozen', sha='a' * 40, actor='dev',
+                        verdict=None, note='concurrent freeze')
+            except Exception as exc:
+                errors.append(exc)
+            finally:
+                conn.close()
+
+        thread = threading.Thread(target=freeze, daemon=True)
+        try:
+            with self.db.transaction() as tx:
+                tx.execute("SET LOCAL lock_timeout = '10s'")
+                tx.execute("SELECT pg_advisory_xact_lock(hashtextextended("
+                           "current_schema() || ':migration-repo:' || %s, 0))",
+                           ('github.com/manaty/nexlink',))
+                thread.start()
+                self.assertTrue(ready.wait(timeout=5))
+                deadline = time.monotonic() + 5
+                while not tx.query("SELECT 1 FROM pg_locks WHERE pid = %s"
+                                   " AND locktype = 'advisory' AND NOT granted", (pid[0],)):
+                    self.assertFalse(errors, errors)
+                    self.assertLess(time.monotonic(), deadline, 'freeze never waited')
+                    time.sleep(0.01)
+                storage.of(tx).work.move(
+                    self.a['id'], 'build', current='intake', loops=0,
+                    note='concurrent move', actor='dev')
+        finally:
+            thread.join(timeout=15)
+        self.assertFalse(thread.is_alive(), 'freeze did not finish')
+        self.assertEqual(errors, [])
+        self.assertEqual(work.get(self.db, self.a['id'])['state'], 'qa')
+
     def test_set_app_and_named_allocation_lock_repository_before_lot(self):
         self._legacy_writer_concurrent_with_named(
             lambda api: api.set_app(self.a['id'], 'other', actor='dev'))
