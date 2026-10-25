@@ -157,6 +157,8 @@ class Operations(interface.Operations):
                    r.operator_pause_for,
                    extract(epoch from r.operator_pause_at)::float8 AS operator_pause_ts,
                    r.canon,  -- L242c : le canon propriétaire (rôles de sa fiche)
+                   -- #3460 : un agent retiré ne prend rien et n'alerte plus
+                   extract(epoch from r.retired_at)::float8 AS retired_ts,
                    extract(epoch from r.lease_wait_since)::float8 AS lease_wait_since_ts,
                    r.admitted_hosts,  -- #254 : hôtes en pause
                    r.last_error,  -- L106 : le détail de « hôte non prêt »

@@ -1377,7 +1377,8 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
             # automatiquement — ni un lot d'équipe (L165), ni un élément de la
             # file (L119, la prise de #3403), ni une relecture proposée
             # (#1677). Vivant ou expiré : l'échéance ne le rend pas preneur.
-            if row.get("ephemeral"):
+            # #3460 : un agent retiré non plus.
+            if row.get("ephemeral") or row.get("retired_ts"):
                 continue
             if row["name"] in skip or row["name"] in held \
                     or _awaited(row, waiting_free=waiting_free) or row.get("host") in blocked:

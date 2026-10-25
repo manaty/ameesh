@@ -1472,7 +1472,8 @@ def check_reviewer(db: Db, reviewer: str, *, cfg=None) -> str:
     un, normalisé comme pour l'assignation). Un nom inconnu est refusé : la
     revue attendrait quelqu'un que ni le courrier ni l'alerte ne peuvent
     joindre — le défaut que ce lot corrige. Un agent arrêté reste accepté : il
-    porte l'attente et sera relancé à sa reprise.
+    porte l'attente et sera relancé à sa reprise. Un agent retiré (#3460) est
+    refusé : il ne reviendra pas lire la demande.
     """
     from . import registry
 
@@ -1486,6 +1487,10 @@ def check_reviewer(db: Db, reviewer: str, *, cfg=None) -> str:
     row = registry.get(db, name)
     if row is not None:
         if isinstance(row, dict):
+            if row.get("retired_ts"):
+                raise WorkError("reviewer refused: %s is retired (ameesh agent retire, "
+                                "#3460): name an active reviewer"
+                                % (row.get("name") or name))
             return row.get("name") or name
         # Doublure de registre (tests #705 r2 N2) : pas un mapping, on garde
         # l'orthographe demandée, comme avant #423.
