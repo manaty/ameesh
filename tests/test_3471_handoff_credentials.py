@@ -4,6 +4,8 @@ from contextlib import contextmanager, redirect_stdout, redirect_stderr
 from copy import deepcopy
 import io
 import json
+from pathlib import Path
+import tempfile
 from types import SimpleNamespace
 import time
 import unittest
@@ -238,6 +240,37 @@ class FactoryCompositionTest(unittest.TestCase):
     setUp = h1.FactoryTest.setUp
     write = h1.FactoryTest.write
     factory = h1.FactoryTest.factory
+    def test_credential_bridge_refuses_untrusted_chain_before_execution(self):
+        factory = self.factory()
+        names = ('secrets-handoff.py', 'coffre-release.py',
+                 'transport-secrets.py', 'transport-release.py')
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for name in names:
+                (root / name).write_text('raise AssertionError("executed")\n')
+                (root / name).chmod(0o644)
+            with patch.object(h1.factory_module, '__file__',
+                              str(root / 'fabrique-handoff.py')):
+                for name in names:
+                    for kind in ('writable', 'symlink'):
+                        with self.subTest(name=name, kind=kind):
+                            source = root / name
+                            if kind == 'writable':
+                                source.chmod(0o664)
+                            else:
+                                source.unlink()
+                                source.symlink_to(root / 'target.py')
+                            with patch.object(h1.factory_module.importlib.util,
+                                              'spec_from_file_location') as load:
+                                with self.assertRaisesRegex(
+                                        h1.factory_module.FactoryError,
+                                        'source:' + name):
+                                    factory.credential_bridge()
+                                load.assert_not_called()
+                            source.unlink()
+                            source.write_text('raise AssertionError("executed")\n')
+                            source.chmod(0o644)
+
     def test_credential_bridge_is_lazy_and_missing_guard_refuses(self):
         factory = self.factory()
         service = factory.credential_bridge()

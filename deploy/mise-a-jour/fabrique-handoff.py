@@ -429,7 +429,10 @@ class HandoffFactory:
         """
         if delivery_for is None:
             source = Path(__file__).absolute().with_name('secrets-handoff.py')
-            _trusted_source(source, 'secrets-handoff.py')
+            # Check the transitive import chain before executing any companion.
+            for name in ('secrets-handoff.py', 'coffre-release.py',
+                         'transport-secrets.py', 'transport-release.py'):
+                _trusted_source(source.with_name(name), name)
             try:
                 spec = importlib.util.spec_from_file_location('handoff_secrets', source)
                 module = importlib.util.module_from_spec(spec)
