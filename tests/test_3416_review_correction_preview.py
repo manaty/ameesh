@@ -236,7 +236,10 @@ class RemoteTargetWarningTest(_ActivationFixture, PgTestCase):
         super().setUp()
         origin = os.path.join(self.tmp, "origin-cible.git")
         subprocess.run(["git", "init", "--bare", "-q", origin], check=True)
-        self.repo.git("branch", "-f", "main", self.base)
+        # `main` peut être la branche extraite du dépôt (init.defaultBranch=main
+        # en CI) : `branch -f` est alors refusé ; `update-ref` déplace la ref sans
+        # toucher l'arbre de travail, ce dont ce témoin a besoin.
+        self.repo.git("update-ref", "refs/heads/main", self.base)
         self.repo.git("remote", "add", "origin", origin)
         self.repo.git("push", "-q", "origin", "main")
         self.db.execute("UPDATE work_items SET branch_target = 'main' WHERE id = %s",

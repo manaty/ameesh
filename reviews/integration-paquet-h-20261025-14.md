@@ -110,11 +110,19 @@ et sa tête (`vehicule 1400 : #<lot> <tête>`), et il porte un trailer
   non concluante (§3), l'auteur rapporte sur la même tête `CatchUpWitnessTest`
   22/22, 2585, 3275, `l539` 21/21 et contrat 23/23 verts. La suite complète du
   paquet couvre ces modules.
+- **Adaptation de test (aucun avis, §11 bis)** : le premier échec de la run
+  40148520341 vient de #3416, `RemoteTargetWarningTest.setUp` : `git branch -f
+  main` est refusé quand `init.defaultBranch=main` (la branche est extraite dans
+  le dépôt du test). Remplacé par `git update-ref refs/heads/main <base>`
+  (déplace la ref sans toucher l'arbre de travail) ; témoin rejoué sous
+  `init.defaultBranch=main`, module `test_3416_review_correction_preview`
+  25/25 vert. Aucun changement de code produit.
 - **Compilation / contrôles statiques** : 6/6 verts (`scripts/freeze-checks.py` :
   garde mécanique #2449, compilation, attribution #1632, lint L63, alert types
   #1060, doc readers L161a).
-- **Prévalidation** : à constater au gel.
-- **Diff** : 32 fichiers, +2244/−168 (manifeste non compris). Aucune migration.
+- **Prévalidation** : indisponible (card-stale, carte de plus de 48 h) —
+  non bloquante, motif journalisé au lot et dans la demande de CI.
+- **Diff** : 33 fichiers, +2389/−169 (manifeste compris). Aucune migration.
 - **Inclusion** : `scripts/paquet-inclusion.py` rc 0 sur la tête (attendus =
   les 10 admis ; prêts = les 10 du calcul ; 0 écarté).
 - **Suite complète** : une seule `ci-full` demandée sur la tête finale, en
