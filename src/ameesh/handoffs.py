@@ -150,6 +150,10 @@ def plan(db, agent, *, limits_for, queued=True, now=None, memory_bytes=4*GIB, di
                       "max_agents": target_limits["max_agents"],
                       "requires_gate": target_limits.get("lend") is not None,
                       "sampled_ts": rows[-1]["sampled_ts"], "harness": agent["harness"],
+                      # H2: the exact account the destination must authenticate.
+                      # It is enrolled per host/harness; the adapter refuses a
+                      # plan whose account is not the factory's admitted one.
+                      "session_account": agent.get("session_account") or "",
                       "reason": demand["reason"] if forced else ("source_pressure" if current_pressure else "spare_capacity"),
                       **({"lifecycle_host": demand["host"], "lifecycle_generation": demand["generation"]}
                          if forced else {}),
@@ -161,7 +165,7 @@ def plan(db, agent, *, limits_for, queued=True, now=None, memory_bytes=4*GIB, di
 
 
 def request(db, candidate, *, repository, ttl=900, now=None):
-    """Reserve an admitted target; repository is an enrolled identity, never a directory label."""
+    """Reserve an admitted target; repository is an enrolled network transport, never a directory label."""
     now = time.time() if now is None else now
     if (not candidate or not _fresh(candidate, now) or not repository
             or (not candidate.get("owner") and candidate.get("reason") != "host_loss")):
@@ -169,7 +173,7 @@ def request(db, candidate, *, repository, ttl=900, now=None):
     if not 30 <= ttl <= 7200:
         raise HandoffError("reservation TTL outside 30..7200 seconds")
     if not handoff_contract.repository_identity(repository):
-        raise HandoffError("repository reference contains credentials or control characters")
+        raise HandoffError("repository reference is not an admitted network transport")
     for key in ("memory_bytes", "disk_bytes", "max_agents"):
         if isinstance(candidate.get(key), bool) or not isinstance(candidate.get(key), int) or candidate[key] <= 0:
             raise HandoffError("invalid reservation capacity")

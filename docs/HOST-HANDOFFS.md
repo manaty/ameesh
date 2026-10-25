@@ -130,28 +130,112 @@ the adapter is entered; proofs stay checked by the controller.
 
 `deploy/mise-a-jour/fabrique-handoff.py` is the single pinned factory. A
 controller loads that exact file, never a module named by a job, a message or
-a document. It reads four exact private documents under
+a document. It reads five exact private documents under
 `/etc/ameesh-handoff` — `enrollment.json` (version and controller host),
 `hosts.json` (admitted host/harness/account/tool/secret-alias identities),
-`repositories.json` (project to enrolled repository identity) and
-`secrets.json` (preflight alias to private `fichier#CLE` reference) — and the
-fixed `hote-handoff.py` companion next to it. `requirements_for(agent, host)`
-returns the exact `host_preflight.Requirements`: host, harness, exact account,
-tools and alias names; the private reference mapping is available separately
-for the L232c bridge and never enters `Requirements` or an error. A missing or
-unsafe document, an unenrolled host, harness or account, an unknown project
-repository, a credential-bearing repository URL or a missing adapter method
-refuses admission. Only the SSH userinfo `git@` is admitted, in URL or
-scp-like form; HTTP(S)/`git+https` userinfo is refused as a credential.
-Documents must be regular files: the final type is checked before opening,
-the open is non-blocking and the descriptor is checked again, so a FIFO or a
-device cannot hang admission.
+`repositories.json` (project to enrolled repository identity),
+`secrets.json` (preflight alias to private `fichier#CLE` reference) and
+`transports.json` (one private SSH endpoint per other admitted host) — the
+fixed `hote-handoff.py` companion and the fixed `pont-handoff.py` bridge next
+to it. `requirements_for(agent, host)` returns the exact
+`host_preflight.Requirements`: host, harness, exact account, tools and alias
+names; the private reference mapping is available separately for the L232c
+bridge and never enters `Requirements` or an error. A missing or unsafe
+document, an unenrolled host, harness or account, an unknown project
+repository, a credential-bearing repository URL, an endpoint outside the
+private enrollment or a missing adapter method refuses admission. Repository
+identities are a closed set of network transports: scp-like `git@host:path`
+(SSH) and `ssh://`, `https://`, `http://` or `git://` URLs. A local path,
+`file://`, `ext::`, an unknown scheme or an initial `-` is refused before any
+Git command; userinfo is refused except the SSH user `git` (HTTP(S) userinfo
+may carry a token). The adapter binds every request to the source and target
+hosts admitted by `hosts.json` and to the project repository of the current
+agent in `repositories.json`; the controller-side companion repeats that check
+before an effect, so a caller-chosen `--repository` cannot widen the
+enrollment. Documents must be regular files: the final type is checked before
+opening, the open is non-blocking and the descriptor is checked again, so a
+FIFO or a device cannot hang admission.
 
 H1 binds no host effect. The companion's capabilities refuse by name until H2
 (preparation and Git) and H3 (activation, health and recovery) replace them;
 a present-but-unimplemented method refuses at call time and never returns a
 simulated success. This factory is source only: it installs no service,
 performs no SSH, root, credential or production operation.
+
+## Preparation and Git effects (H2)
+
+H2 implements `inventory`, `revalidate`, `prepare`, `stop_source`, `publish`,
+`transfer` and `session`. `publish` proves the source branch is clean, on its
+enrolled remote, at the exact commit; `transfer` checks out that exact commit
+on the destination with the account's own Git credentials and refuses a dirty
+or occupied worktree; `session` prepares a new private marker with no copied
+home, harness cache or OAuth token. `prepare` reads the destination's pinned
+release receipt, the enrolled tools and secret aliases, and the unit's finite
+memory caps; `stop_source` stops only the enrolled unit and proves its cgroup
+is quiescent. None of these steps starts or enables the destination executor.
+`publish` is read-only: a branch absent from the remote or a failed remote
+read is a definitive, retryable refusal, never an ambiguous intent.
+
+The host Git runner admits only the closed network transports above through
+`GIT_ALLOW_PROTOCOL`, so Git itself refuses a local path, `file://` or
+`ext::` even if a config tries to rewrite the URL. It re-checks the repository
+identity before `remote add`, `fetch` or `ls-remote`, and compares the stored
+`remote.origin.url` rather than a `url.*.insteadOf` rewrite. An option-like
+value (`-...`) or an unknown scheme is refused before any Git process starts.
+
+The controller-side companion checks the durable operation `pending_effect`,
+the placement/lease, both canon states, the destination gate and the existing
+`host_preflight` readiness before an effect. The host executor is the pinned
+`hote-handoff.py` (its `HostEffects` class and stdin dispatcher). It keeps a
+private journal under the host execution enrollment: the step order, the
+source lease owner and its epoch, the last controller epoch, a durable intent
+before the effect and an exact allowlisted receipt. The lease is bound once
+per operation; a changed owner or lease epoch is refused. A separate durable
+fence, shared by every operation of one agent and unit on the host, records
+the highest lease epoch observed: a newer lease advances it, and any delayed
+operation from an older lease is refused before it can act — including a
+`stop_source` replayed from an old receipt, which must not stop the executor
+of a later lease. A stale controller epoch, a changed intent or an
+out-of-order step is refused; a repeated step returns its stored receipt
+without repeating the effect (a stored `stop_source` is re-observed, and
+re-stopped only while its lease is still current); a receipt written before
+its state mark is repaired on replay without replaying the effect; an
+interrupted intent is resumed only with its exact original identity and
+payload, otherwise the call raises and the controller keeps its own durable
+intent for explicit reconciliation. Revalidation and effects share the agent
+lock and the fence, and the durable controller epoch is monotonic: a
+revalidation observed during an effect can only raise it. Every SSH exchange
+is bounded by the enrolled endpoint; the host dispatcher's alarm covers the
+effect, not only the stdin read, and a timed-out child process group is killed
+before the uncertain intent is left for reconciliation. Expiry during an
+effect is uncertain, never a definitive refusal: it keeps the durable intent,
+fails the transport, and leaves reconciliation to the controller.
+
+Root ownership changes never follow a path: every component below the trusted
+root (the account home, the state root or an enrolled work root) is opened from
+its parent's descriptor with `O_DIRECTORY|O_NOFOLLOW`; mkdir, open, fchown,
+atomic writes, renames and unlinks all use those descriptors. A freshly created
+entry is chowned through its own descriptor, and `_atomic_json` gives the
+temporary file to the account before its atomic rename. An account that swaps an
+ancestor or an entry for a link therefore makes the effect fail instead of
+making root change a target's owner or write outside the trusted root.
+
+The host execution enrollment's `account` is the **Unix** account that owns
+the home and runner unit. The harness/provider account in a request is a
+different identity: the controller validates it against the enrolled
+`hosts.json` accounts, and the host executor keeps it only as session metadata.
+The two are never compared as if they were the same login.
+
+`pont-handoff.py` is the explicit bridge to admitted helpers. It reuses only
+the hardened SSH substrate of `transport-release.py` — fixed client options,
+the private key and known-hosts files with their pinned digest, the bounded
+pipe exchange and duplicate-key refusal — and never loads the release
+controller, its operations, its database or its restart authority. The
+destination release receipt is read through `environnement-versionne.py`;
+neither module gains a new authority from the bridge. H7 installs the host
+execution enrollment (`execution.json`: host, state root, configuration path,
+release store, per-agent account/home/unit and allowed work roots) and the
+private transport endpoints; H2 ships source only and performs no installation.
 
 ## Host drain, return and loss recovery (L232e)
 
