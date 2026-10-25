@@ -48,6 +48,8 @@
   agent-mesh agent spawn <name> --by <creator> --ttl 2h   ephemeral agent (R14)
   agent-mesh agent move NOM --to HOST [--keep-session]   manual move of a `releve: hote`
                                                           agent, fenced (#3299)
+  agent-mesh agent retire NOM --reason R | restore NOM   retired: never designated,
+                                                          claimed nor mailed (#3460)
 
 The owner's authority is never inferred from text: it is proven by an Ed25519
 signature whose public key is in agent_registry, bound to the content and to
@@ -1136,10 +1138,16 @@ def cmd_show(cfg: Config, args: argparse.Namespace) -> int:
             else:
                 print("           no new turn starts until it is lifted "
                       "(ameesh resume %s --operator --reason <reason>)" % row["name"])
+        # #3460 : un agent retiré n'est plus ni désigné, ni réclamé, ni joint
+        if row.get("retired_ts"):
+            print("retired  : since %s by %s — %s (ameesh agent restore %s)" % (
+                _fmt_moment(row["retired_ts"]), row.get("retired_by") or "?",
+                row.get("retired_reason") or "(no reason given)", row["name"]))
         # L37 (0030) : mode explicite ; un agent externe exige un responsable
+        # (sauf retiré : il ne travaille plus)
         if row.get("mode") == "externe":
             print("mode     : externe (human session, cannot be woken)%s" % (
-                "" if row.get("responsible")
+                "" if row.get("responsible") or row.get("retired_ts")
                 else " — NO human responsible: mandatory for an external agent"))
         else:
             print("mode     : execute (driven by a runner, under lease)")
