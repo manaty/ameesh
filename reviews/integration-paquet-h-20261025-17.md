@@ -167,6 +167,23 @@ complète. Témoin local : la classe `SuperviseurRoleTest` verte sur le banc
 (`dea94f3b7`) sont ajoutés ensuite pour la tête finale. Base `7d3e776e`
 inchangée.
 
+`ed729a4d0` : tête gelée et revue (deux familles), run `40175115734`. Le
+delta banc test-only ci-dessous est ajouté après elle, sans changer les lots
+ni la preuve produit.
+
+## Delta banc (hors lots)
+
+`tests/test_l77_resident_queue.py` fermait le journal asynchrone global
+(`runner._journal.close`) dans `tearDownModule` sans le rouvrir. Dans le plan
+psycopg 7/8, `tests.test_events_attach` tourne après ce module et perd
+`log_async` : `test_attach_coupe_sans_journal_sur_le_chemin_d_arret` échoue
+(« le journal n'a pas atteint le puits »), reproduit par l'ordre local et vert
+en isolation. Correctif **test-only** : drainer puis recréer un fil neuf
+(`runner._journal = runner._AsyncLog()`) ; séquence l77 + events_attach 83/83
+verte, pilotes psql et psycopg. Aucun avis (§11 bis : adaptation de test) ;
+aucun fichier produit touché, la preuve CI de `ed729a4d0` reste valable pour
+le produit identique.
+
 ## CI
 
 Suite complète unique portée par le run `pull_request` de la PR sur la tête

@@ -999,8 +999,13 @@ class StopAtPublicationTest(unittest.TestCase):
 def tearDownModule():
     # L77 : les préemptions journalisent (`log_async`) ; fermer le fil borné
     # avant la finalisation évite l'abort CPython sur le verrou stdout.
+    # #3499 : le journal est global au processus, pas au module. Le fermer
+    # sans le rouvrir tue `log_async` pour les modules suivants du même
+    # processus (tests.test_events_attach) : on draine, puis on repart d'un
+    # fil neuf, laissé vivant comme à l'import.
     from ameesh import runner
     runner._journal.close(2.0)
+    runner._journal = runner._AsyncLog()
 
 
 if __name__ == "__main__":
