@@ -1762,7 +1762,7 @@ class WorkItems(interface.WorkItems):
             raise ValueError("on_frozen only makes sense for the `frozen` milestone")
         threads = [] if after_commit is None else after_commit
         with self.db.transaction() as tx:
-            items = tx.query("SELECT id, app, branch_target FROM work_items"
+            items = tx.query("SELECT id, app, branch_target, state FROM work_items"
                              " WHERE id = %s FOR NO KEY UPDATE", (int(item_id),))
             rows = tx.query(
                 """
@@ -1774,6 +1774,17 @@ class WorkItems(interface.WorkItems):
                 (int(item_id), kind, sha or "", actor or "", verdict, note or ""),
             )
             milestone = rows[0]
+            if kind == "frozen" and items and items[0]["state"] in ("intake", "build"):
+                # #3467: freezing enters review before the designation hook.
+                # Use the ordinary transitions (including Process guards),
+                # under this lot's lock and transaction: a failing hook must
+                # roll back the state, journal and milestone together.
+                from ... import work
+                if items[0]["state"] == "intake":
+                    work.move(tx, item_id, "build", actor=actor,
+                              note="intake → build — frozen (#3467)")
+                work.move(tx, item_id, "qa", actor=actor,
+                          note="build → qa — frozen (#3467)")
             if kind == "verdict" and items:
                 from ... import merge_queue, train_events
                 item = items[0]

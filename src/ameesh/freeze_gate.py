@@ -614,6 +614,11 @@ def milestone(
     `origin/<branche>` après rafraîchissement est accepté avec la note
     [`FREEZE_UNPUBLISHED_MARK`] (geler puis pousser dans le même tour).
 
+    Le gel entre en `qa` depuis `intake` (par `build`) ou `build` avant la
+    désignation (#3467). Les transitions, leur journal et le jalon sont
+    atomiques ; les gardes Process restent celles des transitions ordinaires.
+    Un gel ne lève pas un état bloqué ou terminal.
+
     `supersedes` (#2989, #3399) nomme un ou des gels antérieurs du même lot que
     ce gel **remplace** ; la note reçoit alors la ligne machine
     [`FREEZE_SUPERSEDES_MARK`]. La lecture des auteurs (`review_authors`) garde
