@@ -63,6 +63,7 @@ class ProdGateCloseTest(_PlanDb):
 
     def setUp(self) -> None:
         super().setUp()
+        self.register("orchestrateur", "claude")
         self.repo = os.path.join(self.make_tmp(), "nexlink")
         os.makedirs(self.repo)
         git(self.repo, "init", "-q", "-b", "main")

@@ -26,7 +26,7 @@ en silence.
 
 | Fichier | Rôle |
 |---|---|
-| `src/ameesh/mediated_executor/contract.json` | la table fermée des 72 opérations et la liste des 433 refusées |
+| `src/ameesh/mediated_executor/contract.json` | la table fermée des 72 opérations et la liste des 435 refusées |
 | `src/ameesh/mediated_executor/contract.py` | chargeur (`load()`), enveloppes, idempotence, erreurs, vérificateur de schémas |
 | `src/ameesh/mediated_executor/events.py` | flux SSE, attente longue, curseurs |
 | `src/ameesh/mediated_executor/gate.py` | `HostGate`, `ameesh-host-state/1`, `ameesh-host-ack/1` |
@@ -74,7 +74,7 @@ Comptes : 72 opérations, dont 29 lectures et 43 écritures. 62 passent par
 lignes de `op` sont marquées `session: true` (contrats 1.1, 1.2, 1.3, 1.5 et
 1.6) : elles sont servies aussi par `session/op`. Le test
 vérifie que chaque ligne existe dans `storage.interface` avec la même
-signature et les mêmes types. Il vérifie aussi que l'interface entière (505
+signature et les mêmes types. Il vérifie aussi que l'interface entière (507
 opérations) est classée, admise ou refusée. Toute opération ajoutée à
 l'interface fait donc échouer le test tant qu'elle n'est pas classée.
 
@@ -258,7 +258,9 @@ table : aucun écart n'est toléré d'un côté seulement.
   hors de ±(2^53 − 1) donnent 400 `bad_args`.
 - **`agents.overview`** (annuaire réduit de la session) : `name`, `role`,
   `team`, `chantier`, `canon_governed`, `status`. `role` vaut `team` : le
-  registre n'a pas de colonne « rôle ».
+  registre n'a pas de colonne « rôle ». Un agent retiré (`ameesh agent
+  retire`, #3460) n'y figure pas, et `mailbox.send` refuse de lui écrire
+  (400 `bad_args`).
 - **Lignes ouvertes au jeton de session** (`session: true`) :
   `mailbox.reserve`, `mailbox.deliver`, `mailbox.release` (le hook
   `agent-mail` dans la VM), `mailbox.unread` (`mail inbox`) et

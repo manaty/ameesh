@@ -301,6 +301,11 @@ def is_ephemeral(row: Mapping) -> bool:
     return bool((row or {}).get("ephemeral"))
 
 
+def is_retired(row: Optional[Mapping]) -> bool:
+    """#3460: the agent was retired (`ameesh agent retire`): never designated."""
+    return bool((row or {}).get("retired_ts"))
+
+
 def candidates_from_registry(rows: Iterable[Mapping], *, loads: Optional[Mapping] = None,
                              project: str = "", families,
                              closed_hosts: Iterable[str] = ()) -> list[Candidate]:
@@ -321,13 +326,14 @@ def candidates_from_registry(rows: Iterable[Mapping], *, loads: Optional[Mapping
     gets its second family from declared reviewers of another team. The
     exclusions (authors, correctors, the project's pilot) stay the caller's.
     #3411: an ephemeral agent is never a candidate (`is_ephemeral`).
+    #3460: nor is a retired agent (`is_retired`).
     """
     loads = loads or {}
     wanted = (project or "").strip()
     closed = {str(value).strip() for value in closed_hosts or () if str(value).strip()}
     out = []
     for row in rows or ():
-        if is_ephemeral(row):
+        if is_ephemeral(row) or is_retired(row):
             continue
         team = str((row or {}).get("team") or "").strip()
         if wanted and team != wanted and wanted not in reviewed_projects(row):

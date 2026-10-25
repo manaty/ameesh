@@ -63,7 +63,10 @@ AGENT_COLUMNS = """
     -- déclaré (`harness`) ne dit pas sous lequel la session tourne (L242b).
     session_harness, session_cwd, session_origin,
     operator_paused, operator_pause_reason, operator_pause_by, operator_pause_for,
-    extract(epoch from operator_pause_at)::float8 as operator_pause_ts
+    extract(epoch from operator_pause_at)::float8 as operator_pause_ts,
+    -- #3460 (0484) : retrait d'un agent (`ameesh agent retire`)
+    retired_by, retired_reason,
+    extract(epoch from retired_at)::float8 as retired_ts
 """
 
 
@@ -164,8 +167,8 @@ def canon_claim_predicate_sql(alias: str = "agent_registry", *, probe: bool = Fa
                               host: str | None = None) -> str:
     """Condition SQL de réclamation liée au canon (§4.1), pour un `WHERE`.
 
-    Vraie si l'agent de la ligne `alias` (une ligne de `agent_registry`, ou de
-    la vue `agent_mesh_overview`) n'est pas gouverné par le canon
+    Vraie si l'agent de la ligne `alias` (une ligne de `agent_registry`)
+    n'est pas retiré (#3460), et s'il n'est pas gouverné par le canon
     (`canon_governed_sql`), ou si le dernier état de **son canon** sur l'hôte
     qui le réclame (`canon_state`, clé (host, canon) depuis L42/0031 ; colonne
     `canon` de la ligne, NULL = canon par défaut ; écrit par
@@ -181,6 +184,10 @@ def canon_claim_predicate_sql(alias: str = "agent_registry", *, probe: bool = Fa
     refusent donc toute NOUVELLE réclamation d'un agent du canon (et de ses
     éphémères) jusqu'au prochain `canon sync`, sans rien toucher aux baux,
     sessions ni tours en cours : fail closed.
+
+    #3460 : un agent retiré (`retired_at`, `ameesh agent retire`) n'est
+    jamais réclamable. La colonne n'est que sur `agent_registry`, pas sur la
+    vue `agent_mesh_overview` : `alias` nomme une ligne du registre.
 
     `host` (L165, EP1) : l'hôte qui réclame, pour un agent `releve: election`.
     La condition porte alors sur le verdict de placement de CET hôte candidat
@@ -212,6 +219,7 @@ def canon_claim_predicate_sql(alias: str = "agent_registry", *, probe: bool = Fa
     open_sql = ("ameesh_agent_claims_open(%s, %s.name)" % (h, a) if probe
                 else "ameesh_host_claims_open(%s)" % h)
     sql = """(%(open)s
+       AND %(a)s.retired_at IS NULL
        AND (%(a)s.releve = 'election' OR NOT ameesh_handoff_fenced(%(a)s.name))
        AND (NOT %(governed)s
             OR (EXISTS (SELECT 1 FROM canon_state s
@@ -327,6 +335,60 @@ class Agents(interface.Agents):
             (name, paused, reason, actor, principal))
         return rows[0] if rows else None
 
+    def retire(self, name, *, actor, reason) -> dict | None:
+        with self.db.transaction() as tx:
+            rows = tx.query(
+                "SELECT name, retired_at IS NOT NULL AS retired, lease_owner,"
+                "       (lease_owner IS NOT NULL"
+                "        AND lease_expires_at > clock_timestamp()) AS lease_live"
+                "  FROM agent_registry"
+                " WHERE name = (SELECT ameesh_resolve_agent_name(%s, %s)) FOR UPDATE",
+                (name, "agents.retire"))
+            if not rows:
+                return None
+            row = rows[0]
+            agent = row["name"]
+            if row["retired"]:
+                return {"name": agent, "changed": False, "blockers": []}
+            blockers = []
+            if row["lease_live"]:
+                blockers.append({"kind": "lease", "owner": row["lease_owner"]})
+            blockers += [{"kind": "lot", "id": int(lot["id"]), "state": lot["state"]}
+                         for lot in tx.query(
+                             # #3460 (B de dev3) : un lot livré (`merged`,
+                             # `promoted`) garde son assigné mais ne retient pas
+                             "SELECT id, state FROM work_items"
+                             " WHERE assignee = %s"
+                             "   AND state NOT IN ('merged', 'promoted', 'closed')"
+                             " ORDER BY id",
+                             (agent,))]
+            blockers += [{"kind": "watch", "host": watch["host"]}
+                         for watch in tx.query(
+                             "SELECT host FROM agent_watches WHERE agent = %s", (agent,))]
+            if blockers:
+                return {"name": agent, "changed": False, "blockers": blockers}
+            tx.execute(
+                "UPDATE agent_registry SET retired_at = clock_timestamp(),"
+                "       retired_by = %s, retired_reason = %s, updated_at = now()"
+                " WHERE name = %s",
+                (actor, reason, agent))
+            return {"name": agent, "changed": True, "blockers": []}
+
+    def restore(self, name, *, actor) -> dict | None:
+        rows = self.db.query(
+            "SELECT name, retired_at IS NOT NULL AS retired FROM agent_registry"
+            " WHERE name = (SELECT ameesh_resolve_agent_name(%s, %s))",
+            (name, "agents.restore"))
+        if not rows:
+            return None
+        agent = rows[0]["name"]
+        changed = self.db.query(
+            "UPDATE agent_registry SET retired_at = NULL, retired_by = NULL,"
+            "       retired_reason = NULL, updated_at = now()"
+            " WHERE name = %s AND retired_at IS NOT NULL RETURNING name",
+            (agent,))
+        return {"name": agent, "changed": bool(changed)}
+
     def upsert(self, name, *, chantier, harness, host, cwd, session_id, status,
                status_text, model, budget_usd, mode=None) -> dict:
         # L37 (0030) : `mode` ne vaut qu'à l'INSERT — un agent existant
@@ -439,6 +501,9 @@ class Agents(interface.Agents):
             SELECT name, (SELECT r.aliases FROM agent_registry r WHERE r.name=o.name) AS aliases,
                    -- #3185 : projets relus hors équipe (la vue ne porte pas la colonne)
                    (SELECT r.relit FROM agent_registry r WHERE r.name=o.name) AS relit,
+                   -- #3460 : retrait (la vue ne porte pas la colonne)
+                   (SELECT extract(epoch from r.retired_at)::float8 FROM agent_registry r
+                     WHERE r.name=o.name) AS retired_ts,
                    chantier, harness, host, cwd, session_id, status, status_text,
                    model, budget_usd, spent_usd, turns, pending_prompt, last_error,
                    -- #3337 : un message déposé est un signe de vie distinct de
