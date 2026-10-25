@@ -4950,6 +4950,7 @@
     "set_branch",
     "set_branch_head",
     "set_estimate",
+    "set_external_executor",
     "set_issue_ref",
     "set_partial_seen",
     "set_priority",
