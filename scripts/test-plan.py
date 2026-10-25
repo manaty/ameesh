@@ -31,13 +31,17 @@ so the split never differs between parts.
 **Lot branches: impacted + contract (L1211, canon §3).** On a pull request
 whose source and target are lot branches, only the impacted modules (P0, P1)
 and the contract list (`tests/parts/toujours.txt`: droits, rôles, migrations,
-objets globaux du cluster) run; any doubt — no map, a stale or unsure
-selection, a changed block without a test, test infrastructure, a removed
-file outside documentation, an empty contract list — gives the full suite
-(`lot_selection`). On `main` every module runs, P0 and
-P1 first, then P2, then P3: the phase 1 order. A lot branch runs one part per
-driver, and one more per `PR_TARGET_PART_S` of estimate, instead of the full
-matrix.
+objets globaux du cluster) run; any doubt — no map, an unusable or unsure
+selection, a changed block without a test, test infrastructure, a removed file
+outside documentation, an empty contract list — gives the full suite
+(`lot_selection`). A **stale** map (older than 48 h) is no longer such a
+doubt (#3450): it still judges the branch's own diff (base → head), so the
+lot keeps impacted + contract instead of paying the full suite that starves
+the measurement and keeps the map stale. The full suite stays on `main`,
+`release/**`, the package integration branch and the full CI request. On
+`main` every module runs, P0 and P1 first, then P2, then P3: the phase 1
+order. A lot branch runs one part per driver, and one more per
+`PR_TARGET_PART_S` of estimate, instead of the full matrix.
 
 **Lot CI requested at freeze (#1343).** `--mode lot` is the `ci-lot-<sha>`
 request of a frozen lot (canon §3: review first, one CI on the frozen head,
@@ -69,17 +73,20 @@ version number never takes the lane: L157 is a pull-request rule.
 
 **The full suite is the fallback.** The changed files are taken from the
 map commit to HEAD, not from the merge base: whatever changed on main since
-the map counts as changed, so the selection widens, never narrows. Map
-missing, unreadable, older than 48 h, not an ancestor of HEAD, or built on
-unreadable measure artefacts (`measure.artefacts_incomplets`, #1690/#1716):
-the order falls back to the textual heuristic of L161b (`--base`, `HEAD^1` by
-default) and the plan is marked unsure. A file the map cannot judge (Python
-outside `src/ameesh`, a non-documentation file no test reads, a syntax
-error) uses the textual heuristic for that file and marks the plan unsure;
-test infrastructure (`tests/support.py`, `tests/fakebin/`, the CI scripts,
-`.github/`, `pyproject.toml` beyond its version line) marks it unsure too,
-unless the target already changed it since the map and the branch does not
-change it itself (the merge base with the target to the head): the target's
+the map counts as changed, so the selection widens, never narrows. On a
+**stale** map (older than 48 h) a lot judges its own range instead (merge base
+to head): changes already merged on main passed their full suite, and judging
+them again through an old map would make every lot unsure and run the full
+suite — the loop #3450 breaks. Map missing, unreadable, not an ancestor of
+HEAD, or built on unreadable measure artefacts (`measure.artefacts_incomplets`,
+#1690/#1716): the order falls back to the textual heuristic of L161b (`--base`,
+`HEAD^1` by default) and the plan is marked unsure. A file the map cannot
+judge (Python outside `src/ameesh`, a non-documentation file no test reads, a
+syntax error) uses the textual heuristic for that file and marks the plan
+unsure; test infrastructure (`tests/support.py`, `tests/fakebin/`, the CI
+scripts, `.github/`, `pyproject.toml` beyond its version line) marks it unsure
+too, unless the target already changed it since the map and the branch does
+not change it itself (the merge base with the target to the head): the target's
 own full suite validated that change, and a late map must never send every
 lot branch back to the full suite (#1314). The branch's own change to the
 foundation still marks the plan unsure, and the version-only exemption of
@@ -173,9 +180,11 @@ LEAKS_SCHEMA = "ameesh-test-leaks/1"
 ALWAYS_FILE = REPO / "tests" / "parts" / "toujours.txt"
 PILOT_FILE = REPO / "tests" / "parts" / "pilote-psql.txt"
 
-#: map older than this: fallback order, plan unsure
+#: une carte plus vieille est « périmée » (#3343/#3344) : un lot la garde pour
+#: juger son propre diff (#3450), la voie documentation et la prévalidation
+#: exigent mieux ; l'alerte `map_stale` se lève à ce seuil.
 MAX_AGE_H = 48
-#: phase 2 also requires a map younger than this
+#: phase 2 (sélection réduite hors lot périmé) exige une carte plus fraîche
 PHASE2_MAX_AGE_H = 24
 #: failures under measure younger than this make a module P2
 RECENT_FAILURE_DAYS = 7
@@ -813,7 +822,12 @@ def ignored_coverages(card: dict) -> list:
 
 def map_problem(card: dict | None, now: datetime.datetime, head: str = "HEAD",
                 repo: pathlib.Path = REPO) -> tuple[str, float | None]:
-    """Why the map cannot be used ("" if it can), and its age in hours."""
+    """Why the map cannot be used at all ("" if it can), and its age in hours.
+
+    Age is not a problem by itself (#3450): a stale map still judges the
+    branch's own diff for a lot, and the caller decides the freshness it
+    needs — the documentation lane and prevalidation still require a fresh
+    map (`stale` in the plan's `map` block)."""
     if card is None:
         return "no map", None
     ignorees = ignored_coverages(card)
@@ -830,8 +844,9 @@ def map_problem(card: dict | None, now: datetime.datetime, head: str = "HEAD",
     except (KeyError, TypeError, ValueError):
         return "map without a generation date", None
     age = (now - generated).total_seconds() / 3600
-    if age > MAX_AGE_H:
-        return f"map older than {MAX_AGE_H} h ({age:.0f} h)", age
+    #: #3450 : l'âge n'est plus un motif d'inutilisation. Une carte périmée
+    #: garde le jugement du diff propre d'un lot (voir `classify`) ; la voie
+    #: documentation et la prévalidation, elles, exigent `stale` faux.
     if not card.get("commit") or not is_ancestor(card["commit"], head, repo):
         return f"map commit {str(card.get('commit'))[:12]} is not an ancestor of {head}", age
     # #1716 : #1690 écarte un artefact de mesure illisible et le nomme dans
@@ -1329,33 +1344,50 @@ def classify(modules: list[str], card: dict | None, now: datetime.datetime,
     """Classes of every module, and what the plan knows about its own safety."""
     always = read_list(ALWAYS_FILE, modules)
     problem, age = map_problem(card, now, head, repo)
+    stale = age is not None and age > MAX_AGE_H
     out = {"map": None, "sure": False, "phase2_safe": False, "phase2_why": "",
+           "lot_safe": False, "diff_since": "map",
            "unsure": [], "contract": list(always),
            "untested": [], "unknown_blocks": [], "foundation": [], "removed": [],
            "importers": {}, "certified": {}, "uncovered": [], "changed": 0}
     if card is not None:
         out["map"] = {"commit": card.get("commit"), "generated": card.get("genere"),
                       "age_h": None if age is None else round(age, 1),
-                      "used": not problem, "problem": problem}
+                      "used": not problem, "problem": problem, "stale": stale}
     impact = None
     if not problem:
         # A documentation-only range has already been checked by nature().
         # CI changes on its base do not belong to that range; use the map to
         # find readers of its documents, not to rejudge the base's code.
-        diff_base = base_fallback if docs_only else card["commit"]
+        #
+        # #1314 : le range propre de la branche (base de fusion → tête)
+        # distingue ses changements de ceux déjà portés par la cible. Pour la
+        # voie documentation, `changes` est déjà ce range ; s'il est illisible
+        # ou non fiable (HEAD^1 hors commit de fusion), le doute du socle est
+        # conservé (repli sûr).
+        own_paths = (None if docs_only
+                     else own_changes(base_fallback, head, repo))
+        # #3450 : une carte périmée (> MAX_AGE_H) juge le diff **propre** de la
+        # branche. Juger depuis le commit de la carte couvrirait des jours de
+        # main : ses fichiers non mesurables (scripts hors socle, blocs neufs
+        # sans test) rendraient la sélection « non sûre » à chaque lot, donc la
+        # suite complète — la boucle que ce lot casse. Les changements de main
+        # ont passé sa suite complète ; la suite complète du paquet reste la
+        # preuve d'intégration (canon §12). Si ce range propre n'est pas
+        # lisible (HEAD^1 hors commit de fusion, poussée simple), on garde le
+        # diff depuis la carte : élargir, jamais rétrécir en silence.
+        stale_own = stale and own_paths is not None and not docs_only
+        diff_base = base_fallback if (docs_only or stale_own) else card["commit"]
+        out["diff_since"] = "base" if (docs_only or stale_own) else "map"
         changes = changed_files(diff_base, head, repo)
         if changes is None:
-            kind = "documentation base" if docs_only else "map commit"
+            kind = ("documentation base" if docs_only
+                    else "branch base" if stale_own else "map commit")
             problem = f"diff from {kind} {diff_base[:12]} unreadable"
             out["map"]["used"], out["map"]["problem"] = False, problem
         else:
-            # #1314 : le range propre de la branche (base de fusion → tête)
-            # distingue ses changements de ceux déjà portés par la cible. Pour
-            # la voie documentation, `changes` est déjà ce range ; s'il est
-            # illisible ou non fiable (HEAD^1 hors commit de fusion), le doute
-            # du socle est conservé (repli sûr).
-            own_paths = ({path for _, path in changes} if docs_only
-                         else own_changes(base_fallback, head, repo))
+            if docs_only:
+                own_paths = {path for _, path in changes}
             try:
                 impact = judge(card, changes, modules, head, repo, own=own_paths,
                                own_base=base_fallback)
@@ -1399,9 +1431,18 @@ def classify(modules: list[str], card: dict | None, now: datetime.datetime,
                    removed=impact.removed, importers=impact.importers,
                    certified=impact.certified, uncovered=impact.uncovered,
                    sure=not impact.unsure)
-        out["phase2_safe"] = (out["sure"] and age is not None and age <= PHASE2_MAX_AGE_H
-                              and not impact.uncovered and not impact.foundation
-                              and not impact.removed)
+        admissible = (out["sure"] and not impact.uncovered and not impact.foundation
+                      and not impact.removed)
+        out["phase2_safe"] = bool(
+            admissible and age is not None and age <= PHASE2_MAX_AGE_H)
+        #: #3450 : un lot garde la sélection impactés + contrat sur une carte
+        #: périmée (> MAX_AGE_H) : elle juge le diff propre de la branche
+        #: ci-dessus. Entre PHASE2_MAX_AGE_H et MAX_AGE_H, le comportement
+        #: d'avant reste : la carte est trop vieille pour la sélection réduite
+        #: mais pas encore « périmée » au sens de l'alerte.
+        out["lot_safe"] = bool(
+            admissible and age is not None
+            and (age <= PHASE2_MAX_AGE_H or stale))
     changes = changes or []
     out["changed"] = len(changes)
     out["phase2_why"] = "" if out["phase2_safe"] else phase2_why(out, impact, age)
@@ -1528,10 +1569,11 @@ def lot_selection(lot: bool, state: dict, modules: list[str],
 
     `None` means the full suite: a branch that is not a lot (`main`,
     `release/**`, the package integration branch), a release pull request
-    (`release`, `release_pr`), or any doubt the plan cannot decide through —
-    no usable map, a selection that is not safe (stale map, unmeasured blocks
-    no test is guaranteed to load, test infrastructure, a removed file), an
-    empty contract list. The reason goes to the summary.
+    (`release`, `release_pr`), or a doubt the plan cannot decide through —
+    no usable map, a selection that is not safe (unmeasured blocks no test is
+    guaranteed to load, test infrastructure, a removed file), an empty
+    contract list. A stale map is not a doubt any more (#3450): it keeps its
+    own-diff judgement and the contract. The reason goes to the summary.
     """
     if not lot:
         return None, "main, release/** and the integration branch run the full suite"
@@ -1543,7 +1585,10 @@ def lot_selection(lot: bool, state: dict, modules: list[str],
     if not (state.get("map") and state["map"].get("used")):
         unsure = state.get("unsure") or ["no map"]
         return None, f"map not usable ({unsure[0]})"
-    if not state.get("phase2_safe"):
+    #: #3450 : `lot_safe` est la sûreté d'une sélection réduite pour un lot
+    #: (âge périmé admis) ; les états antérieurs au champ retombent sur
+    #: `phase2_safe`, qui en est la version stricte.
+    if not state.get("lot_safe", state.get("phase2_safe")):
         return None, f"selection unsure ({state.get('phase2_why') or 'no reason'})"
     return sorted({m for m in modules if classes[m][0] in ("P0", "P1")}
                   | set(contract)), ""
@@ -1786,6 +1831,7 @@ def make_plan(event: str, card: dict | None, now: datetime.datetime | None = Non
     plan = {"schema": PLAN_SCHEMA, "event": event, "generated": now.isoformat(timespec="seconds"),
             "head": os.environ.get("AMEESH_CI_TETE") or _rev(head, repo),
             "tested": _rev(head, repo), "release": release, "mode": mode,
+            "docs_fallback": False,
             "refs": {"base": base_ref, "head": head_ref},
             **nature(event, base=base, head=head, repo=repo, ref=ref)}
     if mode in ("lot", "full"):
@@ -1809,12 +1855,18 @@ def make_plan(event: str, card: dict | None, now: datetime.datetime | None = Non
     always = [m for m in plan.get("always", []) if m in modules]
     plan["doc_readers"] = []
     if plan["docs_only"] and not release:
-        # The fast lane needs a usable map and a sure judgement of the actual
-        # documentation range. Missing readers or a bad map keep the full suite.
+        # The fast lane needs a usable and **fresh** map and a sure judgement
+        # of the actual documentation range: a stale map may not record the
+        # readers added since (#3450 — a lot keeps the impacted selection on a
+        # stale map, the documentation lane skips tests and does not).
         full = None
         if not (plan["map"] and plan["map"]["used"]):
             reason = next(iter(plan["unsure"]), "map unusable")
             full = f"documentation, map not usable ({reason}): full suite"
+        elif plan["map"].get("stale"):
+            age = plan["map"].get("age_h")
+            full = (f"documentation, map not usable (stale: {age} h > "
+                    f"{MAX_AGE_H} h): full suite")
         elif not plan["sure"]:
             reason = next(iter(plan["unsure"]), "selection unsure")
             full = f"documentation, selection unsure ({reason}): full suite"
@@ -1825,6 +1877,10 @@ def make_plan(event: str, card: dict | None, now: datetime.datetime | None = Non
                         f"({', '.join(db_readers)}): full suite")
         if full:
             plan["docs_only"], plan["why"], plan["doc_readers"] = False, full, []
+            #: la voie documentation saute les parts : quand elle retombe, le
+            #: repli est la suite complète, jamais la sélection d'un lot
+            #: (même sur une carte périmée, #3450).
+            plan["docs_fallback"] = True
     if release:
         #: canon §3 : une PR de release passe la suite complète, les deux
         #: pilotes, sans voie version seule ni documentation seule.
@@ -1836,8 +1892,11 @@ def make_plan(event: str, card: dict | None, now: datetime.datetime | None = Non
     #: L1211/canon §3 : la sélection impactés+contrat est celle d'un lot — une
     #: PR de lot (mode `auto`) ou la CI dispatchée au gel (mode `lot`, #1343) ;
     #: une PR de release et une CI `full` gardent la suite complète, y compris
-    #: dans le repli.
-    lot = (mode == "lot" or (mode == "auto" and pr)) and not release
+    #: dans le repli. Une voie documentation retombée garde la suite complète
+    #: (`docs_fallback`) : elle sautait les parts, elle ne peut pas finir en
+    #: sélection réduite.
+    lot = ((mode == "lot" or (mode == "auto" and pr)) and not release
+           and not plan["docs_fallback"])
     #: L1211 : une branche de lot ne lance que les impactés et le contrat ;
     #: tout doute rend la suite complète (lot_selection). La sélection se
     #: contente d'une part par pilote tant que l'estimation le permet.
@@ -1946,13 +2005,16 @@ def annotations(plan: dict) -> list[str]:
     lines = []
     m = plan.get("map") or {}
     age = m.get("age_h")
-    # #3343 : une carte de plus de 48 h ne reste plus silencieuse — le plan
-    # retombe sur la suite complète et chaque CI de lot paie le prix fort.
+    # #3343 : une carte de plus de 48 h ne reste plus silencieuse.
+    # #3450 : elle ne renvoie plus les lots à la suite complète — le lot juge
+    # le diff propre de sa branche avec elle (impactés + contrat) ; l'alerte
+    # et la prévalidation gardent la carte pour périmée.
     if age is not None and age > MAX_AGE_H:
         lines.append(
             f"::warning title=Carte de mesure périmée::carte vieille de {age:.0f} h "
             f"(> {MAX_AGE_H} h, générée le {str(m.get('generated') or '')[:10]}) : "
-            "les lots retombent sur la suite complète ; relancer carte.yml")
+            "les lots gardent les impactés de cette carte sur leur propre diff ; "
+            "relancer carte.yml")
     sha = (m.get("commit") or "")[:12]
     lines.extend(
         f"::notice file={u['file']},line={u['lines'][0]},endLine={u['lines'][1]},"
@@ -1978,14 +2040,17 @@ def summary(plan: dict) -> str:
         age = m.get("age_h")
         if age is not None and age > MAX_AGE_H:
             lines.append(f"* **carte périmée** : {age:.0f} h (> {MAX_AGE_H} h) — "
-                         "relancer `carte.yml` (#3343)")
+                         "les lots gardent les impactés de cette carte sur leur "
+                         "propre diff ; relancer `carte.yml` (#3343, #3450)")
     if plan["version_only"] or plan["docs_only"]:
         lines.append(f"* {plan['why']}: parts skipped"
                      + (f"; doc readers: {', '.join(plan['doc_readers'])}"
                         if plan["docs_only"] else ""))
     sel = plan["selection"]
-    lines.append(f"* {plan['changed']} file(s) changed since the "
-                 f"{'map commit' if m and m['used'] else 'parent commit'}; impacted (P0, P1): "
+    since = ("base commit" if plan.get("diff_since") == "base"
+             else "map commit" if m and m["used"] else "parent commit")
+    lines.append(f"* {plan['changed']} file(s) changed since the {since}; "
+                 f"impacted (P0, P1): "
                  f"{sel['impacted']} of {sel['modules']} modules, ~{sel['impacted_estimate_s']:.0f}"
                  f" s of ~{sel['total_estimate_s']:.0f} s (psycopg)")
     if sel.get("mode") == "impacted":
@@ -2002,6 +2067,9 @@ def summary(plan: dict) -> str:
     lines.append(f"* selection sure: {'yes' if plan['sure'] else 'no'}; impacted-only safe: "
                  f"{'yes' if plan['phase2_safe'] else 'no'}"
                  + (f" ({plan['phase2_why']})" if plan.get("phase2_why") else ""))
+    if plan.get("lot_safe") and not plan.get("phase2_safe"):
+        lines.append("* carte périmée : le lot garde les impactés de son propre diff "
+                     "+ le contrat (#3450)")
     for reason in plan["unsure"][:SUMMARY_LIMIT]:
         lines.append(f"  * {reason}")
     by_class = collections.defaultdict(list)

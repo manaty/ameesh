@@ -339,6 +339,13 @@ def selection(plan: dict, *, head: str, base: str = "", plan_path: str = "") -> 
         problem = str((card or {}).get("problem") or "carte absente")
         causes.append("card-missing" if _missing(problem) else "card-stale")
         why.append(problem)
+    elif card.get("stale"):
+        #: #3450 : une carte périmée juge encore le diff propre d'un lot en CI,
+        #: mais la prévalidation au gel exige une carte fraîche (elle prouve la
+        #: tête avant le gel) ; le refus reste nommé, pas une indisponibilité
+        #: silencieuse.
+        causes.append("card-stale")
+        why.append("carte de mesure périmée (%s h)" % card.get("age_h", "?"))
     sel = plan.get("selection") if isinstance(plan.get("selection"), dict) else {}
     modules = planned_modules(plan)
     mode = str(sel.get("mode") or "")
