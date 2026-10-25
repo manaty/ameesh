@@ -836,6 +836,36 @@ def _take_holds(db, rows, *, cfg=None):
     return planned_waits.pilot_holds(db, events, cfg=cfg, strict=True)
 
 
+def _hold_blocks(item: dict, hold, now: float | None = None) -> bool:
+    """#3556/#3565 : ce hold retient-il encore ce lot ?
+
+    Un hold vivant retient jusqu'à sa levée ou son réveil échu ; seul un
+    réveil échu POSTÉRIEUR à la pose libère. Un réveil plus ancien, jamais
+    consommé sur un lot sans assigné, ne lève pas un hold posé ensuite."""
+    if not hold:
+        return False
+    stamp = time.time() if now is None else float(now)
+    wake = item.get("wake_ts")
+    return (wake is None or float(wake) > stamp
+            or float(wake) < float(hold.get("since") or 0.0))
+
+
+def _held_now(db, item: dict, *, cfg=None, now: float | None = None) -> bool:
+    """#3565 : les holds de pilote du lot, relus dans la transaction ouverte
+    (donc sous son verrou de ligne), avec la même règle que la sélection.
+
+    Une note `hold:`/`unhold:` de pilote prend le verrou de ligne du lot avant
+    d'écrire (`work.note`), et les transitions de lot passent par leur UPDATE :
+    une pose concurrente est donc soit déjà visible à cette relecture, soit
+    ordonnée après l'écriture de la prise — jamais perdue entre les deux."""
+    from . import planned_waits
+    ident = int(item["id"])
+    events = storage.of(db).progress.lot_hold_events(
+        [ident], planned_waits.HOLD_NOTE_PATTERNS)
+    holds = planned_waits.pilot_holds(db, events, cfg=cfg, strict=True)
+    return _hold_blocks(item, holds.get(ident), now)
+
+
 def lot_takeable(item: dict, today: str | None = None, *, holds=None,
                  now: float | None = None) -> bool:
     """Un lot du projet peut-il être pris sans qu'on le confie ? Jamais un lot
@@ -862,15 +892,8 @@ def lot_takeable(item: dict, today: str | None = None, *, holds=None,
         return False
     if item.get("state") == "build" and not item.get("returned_to_queue"):
         return False
-    hold = (holds or {}).get(int(item.get("id") or 0))
-    if hold:
-        wake = item.get("wake_ts")
-        stamp = time.time() if now is None else float(now)
-        # Seul un réveil échu postérieur à la pose libère : un réveil plus
-        # ancien, jamais consommé sur un lot sans assigné, ne lève pas le hold.
-        if (wake is None or float(wake) > stamp
-                or float(wake) < float(hold.get("since") or 0.0)):
-            return False
+    if _hold_blocks(item, (holds or {}).get(int(item.get("id") or 0)), now):
+        return False
     start = str(item.get("planned_start") or "")[:10]
     if today and start and start > today:
         return False
@@ -901,11 +924,13 @@ def roadmap_waiting(db: Db, project: str, *, now: float | None = None) -> list:
         return []
     stamp = time.time() if now is None else float(now)
     today = time.strftime("%Y-%m-%d", time.localtime(stamp))
-    candidates = storage.of(db).work.unassigned_lots(200)
+    # #3565 : le projet filtre AVANT la lecture des holds — seuls les candidats
+    # du projet sont lus, au lieu des 200 lots de tous les projets.
+    candidates = [item for item in storage.of(db).work.unassigned_lots(200)
+                  if _lot_project(item) == project]
     holds = _take_holds(db, candidates)
     out = [item for item in candidates
-           if _lot_project(item) == project
-           and lot_takeable(item, today, holds=holds, now=stamp)
+           if lot_takeable(item, today, holds=holds, now=stamp)
            and not review_lot.review_ref(item) and not is_review_followup(item)]
     if not out:
         return []
@@ -1066,8 +1091,14 @@ def _team_orchestrators(cfg, db, listing: list, team: str, orchestras=None) -> l
     return sorted([name for name in known if team in teams[name]] or known)
 
 
-def _assign_ready(st, item: dict, assignee: str, note: str, take,
-                  cap: int) -> dict | None:
+class _HoldPlaced(Exception):
+    """#3565 : un hold de pilote est apparu pendant la transaction de prise —
+    l'assignation déjà écrite est annulée avec la transaction."""
+
+
+def _assign_ready(db, item: dict, assignee: str, note: str, take,
+                  cap: int, *, cfg=None, hold_guard: bool = False,
+                  now: float | None = None) -> dict | None:
     """La prise conditionnelle d'un élément prêt (`assign_capped`,
     `ready_only`), ou None s'il a été pris, bloqué, ou si l'agent a atteint
     le plafond §4 entre-temps.
@@ -1077,11 +1108,29 @@ def _assign_ready(st, item: dict, assignee: str, note: str, take,
     Le serveur annule alors la prise entière (rien d'écrit) : c'est une prise
     perdue entre-temps, comme une course perdue, et non une panne du passage.
     L'élément reste libre et le prochain passage le revérifie en entier ;
-    toute autre erreur remonte. `cap` : le plafond du canon (`work.build_limit`)."""
+    toute autre erreur remonte. `cap` : le plafond du canon (`work.build_limit`).
+
+    #3565 (`hold_guard`) : les holds de pilote sont relus DANS la transaction
+    de la prise, après le verrou de ligne du lot (celui d'`assign_capped`,
+    le même que les notes hold/levée). Un hold posé entre la sélection et
+    l'écriture est donc vu : l'assignation est annulée avec la transaction,
+    sans courrier. Celle-ci est un point de sauvegarde sous psycopg et se
+    joint à la session sous psql. Une connexion d'exécuteur médiée n'a pas
+    de transaction : elle garde la lecture de la sélection (garde non
+    applicable)."""
+    st = storage.of(db)
+    args = dict(current=None, note=note, actor=SENDER, max_build=cap,
+                take=take, ready_only=True)
     try:
-        return st.work.assign_capped(int(item["id"]), assignee, current=None, note=note,
-                                     actor=SENDER, max_build=cap,
-                                     take=take, ready_only=True)
+        if not hold_guard or storage.is_remote(db):
+            return st.work.assign_capped(int(item["id"]), assignee, **args)
+        with db.transaction() as tx:
+            done = storage.of(tx).work.assign_capped(int(item["id"]), assignee, **args)
+            if done is not None and _held_now(tx, done, cfg=cfg, now=now):
+                raise _HoldPlaced
+            return done
+    except _HoldPlaced:
+        return None
     except DbError as exc:
         if not is_deadlock(exc):
             raise
@@ -1089,7 +1138,8 @@ def _assign_ready(st, item: dict, assignee: str, note: str, take,
 
 
 def _propose_reviews(db, st, listing, *, pool, room, dry_run=False, canons=(),
-                     skip=(), within_budget=None, wakeable=None) -> list:
+                     skip=(), within_budget=None, wakeable=None, cfg=None,
+                     now: float | None = None) -> list:
     """#1677 (c) : apparie les lots en attente de relecture — ou de correction —
     aux agents au repos. Une relecture va à l'autre famille de modèles que
     l'auteur (canon §2) ; une correction peut aller à n'importe quel agent au
@@ -1114,7 +1164,11 @@ def _propose_reviews(db, st, listing, *, pool, room, dry_run=False, canons=(),
     passages suivants le temps de `REVIEW_PROPOSAL_WINDOW_S` ; le contrôle de
     la fenêtre et la note sont pris sous un verrou consultatif par lot
     (#1738 N5), et une relecture désigne son relecteur (#705, #1738 N7) — la
-    double relecture est écartée et `stale_lot` sait à qui s'adresser."""
+    double relecture est écartée et `stale_lot` sait à qui s'adresser.
+
+    #3565 : un lot sous hold pilote vivant n'est ni relu ni corrigé par
+    proposition — la même lecture que la prise (#3556), réveil échu
+    postérieur à la pose compris."""
     from . import mail, registry, review_designation as rd, review_lot
     from . import review_designation_activation as activation
     if room <= 0 or not pool:
@@ -1127,6 +1181,24 @@ def _propose_reviews(db, st, listing, *, pool, room, dry_run=False, canons=(),
                                     window_s=REVIEW_PROPOSAL_WINDOW_S)
     if not rows:
         return []
+    # #3565 : le hold de pilote suspend aussi cette voie. `review_proposals`
+    # lit `w.*`, sans l'alias `wake_ts` : un lot effectivement tenu est relu
+    # une fois par son `get` pour connaître son réveil (aucune lecture pour
+    # les autres).
+    holds = _take_holds(db, rows, cfg=cfg)
+    if holds:
+        stamp = time.time() if now is None else float(now)
+        kept = []
+        for row in rows:
+            hold = holds.get(int(row["id"]))
+            if hold and "wake_ts" not in row:
+                wake = (st.work.get(int(row["id"])) or {}).get("wake_ts")
+                row = dict(row, wake_ts=wake)
+            if not _hold_blocks(row, hold, stamp):
+                kept.append(row)
+        rows = kept
+        if not rows:
+            return []
     # relectures d'abord, corrections ensuite (l'ordre du SQL est conservé)
     rows = sorted(rows, key=lambda r: 1 if (r.get("last_verdict") or "") == "blocked" else 0)
     by_name = {row.get("name"): row for row in listing}
@@ -1504,8 +1576,9 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
                     # non démarré (il en a reçu un depuis sa sélection).
                     # #1242 (L165) : la prise ne vise qu'un lot intake dont
                     # toutes les dépendances sont satisfaites.
-                    done = _assign_ready(st, item, check["assignee"], note,
-                                         work.takes_rule(check), cap())
+                    done = _assign_ready(db, item, check["assignee"], note,
+                                         work.takes_rule(check), cap(),
+                                         cfg=cfg, hold_guard=True, now=now)
                 except storage.PendingLot:
                     break                   # le lot reste à l'agent suivant
                 if done is None:
@@ -1558,7 +1631,8 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
             db, st, listing,
             pool=candidates(idle_s, skip=set(orchestras), waiting_free=True),
             room=proposal_room, dry_run=dry_run, canons=canons,
-            skip=set(orchestras), within_budget=within_budget, wakeable=wakeable))
+            skip=set(orchestras), within_budget=within_budget, wakeable=wakeable,
+            cfg=cfg, now=now))
     if not queue:
         return taken
     # un lot du projet attend un preneur (ou vient d'être pris) : il passe
@@ -1608,7 +1682,7 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
                 AUTO_TAKE_NOTE, check["assignee"], item.get("value_score"),
                 item.get("expected_value") or "")
             try:
-                done = _assign_ready(st, item, check["assignee"], note,
+                done = _assign_ready(db, item, check["assignee"], note,
                                      work.takes_rule(check), cap())
             except storage.PendingLot:
                 break                       # #540 : l'élément reste au suivant
