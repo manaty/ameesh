@@ -197,10 +197,13 @@ def declared_reviews(rules, paths) -> tuple[dict, int]:
     `rules` est une suite de `(motifs, avis)` : les motifs sont les chaînes du
     canon, lues au même commit. Rend `(nommés, attrape-tout)` :
     `nommés[chemin]` est le plus grand nombre d'avis d'une règle qui **nomme**
-    ce chemin (au moins un de ses motifs, autre que `**`, le couvre) ;
-    `attrape-tout` est le plus grand nombre porté par une règle `**`. Un `**`
-    couvre tous les chemins sans en nommer aucun : il peut relever un compte,
-    jamais abaisser le plancher critique (#3542). Un motif invalide lève
+    ce chemin (au moins un de ses motifs, autre qu'un attrape-tout, le couvre) ;
+    `attrape-tout` est le plus grand nombre porté par une règle sans littéral
+    (`**`, `*/**`…) qui **couvre effectivement** au moins un chemin changé. Un
+    `**` couvre tous les chemins sans en nommer aucun : il peut relever un
+    compte, jamais abaisser le plancher critique (#3542). Un attrape-tout plus
+    étroit (`*/**`, `*/*/**`) ne relève de même que s'il matche un chemin du
+    diff : sa portée se lit, elle ne se suppose pas. Un motif invalide lève
     `re.error`, comme [`compile_glob`] : l'appelant en fait un doute, jamais un
     repli rassurant.
     """
@@ -210,13 +213,15 @@ def declared_reviews(rules, paths) -> tuple[dict, int]:
     for patterns, reviews in rules or ():
         count = int(reviews)
         compiled = []
-        catch = False
+        catch = []
         for pattern in patterns or ():
+            regex = compile_glob(pattern)
             if is_catch_all(pattern):
-                catch = True
+                catch.append(regex)
             else:
-                compiled.append(compile_glob(pattern))
-        if catch and wanted:
+                compiled.append(regex)
+        if wanted and any(regex.fullmatch(path)
+                          for regex in catch for path in wanted):
             wide = max(wide, count)
         for path in wanted:
             if any(regex.fullmatch(path) for regex in compiled):

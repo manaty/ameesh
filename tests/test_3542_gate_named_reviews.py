@@ -9,7 +9,9 @@ attrape-tout (`**`) ne l'abaisse jamais.
 Témoins : les 9 chemins de #3529 (4 `deploy/**` que le canon met à 1, les 5
 autres hors périmètre critique) demandent un avis ; un chemin hors canon qui
 correspond à `CRITICAL_SCOPE` en demande deux ; une règle à 2 en demande deux ;
-`**` ne baisse pas un chemin critique non nommé.
+`**` ne baisse pas un chemin critique non nommé ; un attrape-tout étroit
+(`*/**`, `*/*/**`) ne relève le compte que s'il couvre un chemin du diff
+(#3542, avis cx3 #138707).
 """
 from __future__ import annotations
 
@@ -121,6 +123,40 @@ class NamedReviewGateTest(unittest.TestCase):
                 self.assertEqual(klass["train_reviews_paths"], {path: 1})
                 self.assertEqual(klass["train_reviews_wide"], 0)
                 self.assertEqual(merge_queue.required_verdicts(klass), 1)
+
+    def test_a_narrow_catch_all_counts_only_when_it_covers_the_diff(self):
+        # cx3 (#138707) : `*/**` et `*/*/**` ne couvrent pas un fichier à la
+        # racine. Seul `pyproject.toml` change : le motif générique ne matche
+        # aucun chemin du diff, donc il ne relève pas `wide` ; la règle
+        # nommante à 1 fait foi au lieu de retomber sur un 2 supposé.
+        path = "pyproject.toml"
+        for pattern in ("*/**", "*/*/**"):
+            with self.subTest(pattern=pattern, matched=False):
+                source = canon(default="normal", rules=[
+                    {"paths": [path], "reviews": 1},
+                    {"paths": [pattern], "reviews": 2}])
+                klass = lot_class.class_of_paths([source], "ameesh", [path])
+                self.assertTrue(merge_queue.critical_scope(klass))
+                self.assertEqual(klass["train_reviews_paths"], {path: 1})
+                self.assertEqual(klass["train_reviews"], 1)
+                self.assertEqual(klass["train_reviews_wide"], 0)
+                self.assertEqual(merge_queue.required_verdicts(klass), 1)
+
+    def test_a_narrow_catch_all_counts_when_it_covers_the_diff(self):
+        # Témoin correspondant : `src/foo/bar.py` porte un séparateur (deux
+        # pour `*/*/**`), les deux motifs le couvrent et relèvent le compte
+        # nommé à 1 jusqu'à 2.
+        path = "src/foo/bar.py"
+        for pattern in ("*/**", "*/*/**"):
+            with self.subTest(pattern=pattern, matched=True):
+                source = canon(default="normal", rules=[
+                    {"paths": [path], "reviews": 1},
+                    {"paths": [pattern], "reviews": 2}])
+                klass = lot_class.class_of_paths([source], "ameesh", [path])
+                self.assertEqual(klass["train_reviews_paths"], {path: 1})
+                self.assertEqual(klass["train_reviews"], 2)
+                self.assertEqual(klass["train_reviews_wide"], 2)
+                self.assertEqual(merge_queue.required_verdicts(klass), 2)
 
     def test_a_catch_all_still_raises_a_named_path(self):
         # Le maximum des règles applicables reste le nombre d'avis ; seule
