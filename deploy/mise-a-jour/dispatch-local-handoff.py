@@ -128,12 +128,12 @@ def serve(channel, rules, execute):
 
 
 def outcome(exc, module, executed):
-    """Fixed journal category: a contract error after execute may follow an effect."""
+    """Fixed journal category: a refusal after execute may follow an effect."""
     if module is not None and isinstance(exc, module.Uncertain):
         return 'uncertain'
-    if isinstance(exc, handoff_contract.ContractError):
+    if isinstance(exc, (handoff_contract.ContractError, Refused)):
         return 'uncertain' if executed else 'refused'
-    return 'refused' if isinstance(exc, Refused) else 'unavailable'
+    return 'unavailable'
 
 
 def main(argv=None):
