@@ -1368,6 +1368,10 @@ class WorkItems(interface.WorkItems):
             seen = tx.query(
                 "SELECT id%s FROM work_items WHERE id = %%s"
                 "   AND assignee IS NOT DISTINCT FROM %%s AND state NOT IN %s"
+                # #3447 : un lot réservé à un exécutant externe n'est pas
+                # délégable — la course réservation/délégation se tranche ici,
+                # sous le verrou de la ligne.
+                "   AND to_jsonb(work_items)->>'external_executor' IS NULL"
                 " FOR NO KEY UPDATE"
                 % (", reviewer, reviewers" if with_reviewers
                    else (", reviewer" if with_reviewer else ""), _CLOSED),

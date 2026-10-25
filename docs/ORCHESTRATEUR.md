@@ -66,9 +66,11 @@ l'orchestrateur de l'équipe en reçoit un courrier (`event`, lié au lot).
   il porte son exécutant : L165 ne le prend pas, l'alerte et `ameesh debit` le
   nomment (« attente externe ») au lieu de « sans assigné ». Le geste est
   celui d'un pilote (`corrector`, rôle déclaré) ; `--clear` lève la
-  réservation. Un **sous-lot de préparation** ne l'hérite pas : la part d'un
-  agent reste assignable (aucun héritage du champ par `parent_lot` ni par la
-  fiche).
+  réservation. `work assign` et `work delegate` le refusent tant que la
+  réservation tient (un seul exécutant ; la course réservation/délégation se
+  tranche sous le verrou de la ligne). Un **sous-lot de préparation** ne
+  l'hérite pas : la part d'un agent reste assignable (aucun héritage du champ
+  par `parent_lot` ni par la fiche).
 * Un lot de relecture après fusion (`review-after-merge:#<lot>`, sur son
   `issue_ref` ou sa `source`, #2377/#2552) n'est pris que par un agent de la
   **famille opposée** à celle de l'auteur au gel ; famille de l'auteur

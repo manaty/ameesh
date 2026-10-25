@@ -2236,6 +2236,10 @@ def delegate(db: Db, item_id: int, agent: str, *, within, actor: str = "",
              cfg=None) -> dict:
     """L40 (0030, point 5) : `ameesh work delegate <id> <agent> --within 30m`.
 
+    #3447 : un lot réservé à un exécutant externe (`external_executor`) ne se
+    délègue pas : la délégation écrit un `assignee` (deux exécutants) et
+    réveillerait un agent. Le pilote lève la réservation d'abord.
+
     Le délégant est `actor`, à défaut l'assigné actuel (un `human:…` est
     admis) ; c'est à lui que le lot reviendra. Le délégué passe par
     l'attribution gardée (`check_assignee`, mêmes refus que `work assign`) et
@@ -2254,6 +2258,15 @@ def delegate(db: Db, item_id: int, agent: str, *, within, actor: str = "",
         raise WorkError("lot %s not found" % item_id)
     if item["state"] in MERGED_STATES or item["state"] == "closed":
         raise WorkError("lot %s already %s: nothing to delegate" % (item_id, item["state"]))
+    # #3447 : un lot réservé à un exécutant externe n'est pas délégable —
+    # déléguer écrit un `assignee`, donc deux exécutants, et réveillerait un
+    # agent que le pilote n'a pas désigné.
+    reserved = (item.get("external_executor") or "").strip()
+    if reserved:
+        raise WorkError(
+            "delegation refused: lot %s is reserved to %s (external executor, #3447): "
+            "it is not assignable — clear the reservation first "
+            "(`ameesh work external-executor %s --clear`)" % (item_id, reserved, item_id))
     name = (agent or "").strip()
     if name.startswith(HUMAN_PREFIX):
         raise WorkError("delegation refused: %s is a human; a delegation with a "
@@ -2284,6 +2297,15 @@ def delegate(db: Db, item_id: int, agent: str, *, within, actor: str = "",
         item_id, name, current=previous, delegated_by=delegator, within_s=within_s,
         note=note, actor=delegator)
     if out is None:
+        # #3447 : la course réservation/délégation est tranchée sous le verrou
+        # du storage ; la perdante dit ce qui a changé, pas « retry ».
+        latest = get(db, item_id)
+        reserved_now = ((latest or {}).get("external_executor") or "").strip()
+        if reserved_now:
+            raise WorkError(
+                "delegation refused: lot %s was reserved to %s in the meantime "
+                "(external executor, #3447): one executor per lot — the reservation "
+                "wins, nothing was delegated" % (item_id, reserved_now))
         raise WorkError("lot %s changed in the meantime: retry" % item_id)
     out.update(check=check, previous=previous, message_id=None, warning=check.get("warning"))
     lot = out["item"]

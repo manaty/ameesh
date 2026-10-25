@@ -5,8 +5,10 @@ assigné » ; sa part agent (sous-lot de préparation) reste assignable."""
 from __future__ import annotations
 
 import re
+import threading
 import time
 import unittest
+from unittest import mock
 
 from ameesh import (alert_briefs, debit, exploitation, stagnation,
                     sous_utilisation, storage, work)
@@ -184,6 +186,88 @@ class PriseExterneTest(_Base):
             {"id": lot["id"], "external_executor": "bureau"})
         self.assertIn("external executor bureau acts", action)
         self.assertNotIn("assign it", action)
+
+    def test_delegation_refusee_sur_lot_reserve(self):
+        self.external_agent()
+        self.agent("claude1", team="nexlink")
+        lot = self.reserve()
+        with self.assertRaises(work.WorkError) as raised:
+            work.delegate(self.db, lot["id"], "claude1", within="30m",
+                          actor="human:proprio", cfg=self.cfg)
+        self.assertIn("reserved to bureau", str(raised.exception))
+        after = work.get(self.db, lot["id"])
+        self.assertIsNone(after["assignee"])
+        self.assertEqual(after["external_executor"], "bureau")
+        self.assertIsNone(storage.of(self.db).work.current_delegation(lot["id"]))
+        # La levée rend la délégation possible : le refus tient à la
+        # réservation, pas à la délégation elle-même.
+        work.set_external_executor(self.db, lot["id"], None, actor="human:proprio",
+                                   cfg=self.cfg, clear=True)
+        out = work.delegate(self.db, lot["id"], "claude1", within="30m",
+                            actor="human:proprio", cfg=self.cfg)
+        self.assertEqual(out["item"]["assignee"], "claude1")
+        self.assertIsNone(out["item"]["external_executor"])
+
+    def test_course_reservation_delegation_un_seul_gagnant(self):
+        """La course ``external_executor`` / ``assignee`` se tranche sous le
+        verrou : les deux gestes lisent le lot libre, un seul écrit."""
+        self.external_agent()
+        self.agent("claude1", team="nexlink")
+        lot = work.add(self.db, title="course réservation", app="nexlink")
+        db1, db2 = self.connect(), self.connect()
+        lus = threading.Barrier(2, timeout=10)
+        vrai_get = work.get
+        lectures: list = []
+        results: list = [None, None]
+
+        def get_puis_attendre(db, item_id):
+            row = vrai_get(db, item_id)
+            lectures.append(item_id)
+            if len(lectures) <= 2:
+                lus.wait(timeout=10)   # les deux lectures voient le lot libre
+            return row
+
+        def reserver():
+            try:
+                results[0] = ("reserve", work.set_external_executor(
+                    db1, lot["id"], "bureau", actor="human:proprio", cfg=self.cfg))
+            except work.WorkError as exc:
+                results[0] = ("reserve-refusee", exc)
+
+        def deleguer():
+            try:
+                results[1] = ("delegue", work.delegate(
+                    db2, lot["id"], "claude1", within="30m",
+                    actor="human:proprio", cfg=self.cfg))
+            except work.WorkError as exc:
+                results[1] = ("delegation-refusee", exc)
+
+        try:
+            with mock.patch.object(work, "get", side_effect=get_puis_attendre):
+                threads = [threading.Thread(target=reserver),
+                           threading.Thread(target=deleguer)]
+                for thread in threads:
+                    thread.start()
+                for thread in threads:
+                    thread.join(timeout=30)
+                self.assertFalse(any(thread.is_alive() for thread in threads))
+        finally:
+            db1.close()
+            db2.close()
+        self.assertGreaterEqual(len(lectures), 2)
+        gagnants = [r for r in results if r and r[0] in ("reserve", "delegue")]
+        perdants = [r for r in results if r and r[0] not in ("reserve", "delegue")]
+        self.assertEqual(len(gagnants), 1, results)
+        self.assertEqual(len(perdants), 1, results)
+        item = work.get(self.db, lot["id"])
+        if gagnants[0][0] == "reserve":
+            self.assertEqual(item["external_executor"], "bureau")
+            self.assertIsNone(item["assignee"])
+            self.assertIn("reserved", str(perdants[0][1]))
+        else:
+            self.assertIsNone(item["external_executor"])
+            self.assertEqual(item["assignee"], "claude1")
+            self.assertIn("assigned", str(perdants[0][1]))
 
     def test_idle_capacity_nomme_le_lot_reserve(self):
         self.external_agent()
