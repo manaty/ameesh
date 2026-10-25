@@ -2183,10 +2183,11 @@ class Notifier:
                         # #3512: the alert snapshot can predate a merge. Check
                         # again before each delivery, including the desk thread.
                         item = storage.of(db).work.get(int(alert["lot"]))
-                        if item is None or item.get("state") in (
+                        # A missing row is no evidence that delivery happened.
+                        if item is not None and item.get("state") in (
                                 "merged", "promoted", "closed"):
                             break
-                        if alert.get("step") == "verdict_merge":
+                        if item is not None and alert.get("step") == "verdict_merge":
                             from . import slo_delivery
                             if slo_delivery.merge_observed(
                                     self.cfg, db, item, overview=listing):

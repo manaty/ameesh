@@ -70,8 +70,21 @@ class MergedSloTest(_Base):
         send, _ = self.deliver()
         self.assertTrue(send.called)
 
+    def test_missing_lot_is_not_completion_evidence(self):
+        missing_id = self.lot["id"] + 1000
+        self.assertIsNone(work.get(self.db, missing_id))
+        registry.set_mode(self.db, "bureau", "externe")
+        for step in ("verdict_merge", "build_quiet"):
+            with self.subTest(step=step):
+                self.notifier.state["briefs"].clear()
+                alerts = [dict(alert, lot=missing_id, step=step, level=3,
+                               targets=["bureau", "auditeur"]) for alert in self.snapshot]
+                send, thread = self.deliver(alerts)
+                self.assertTrue(send.called)
+                self.assertTrue(thread.called)
+
     def test_terminal_state_after_snapshot_sends_neither_mail_nor_thread(self):
-        registry.upsert(self.db, "bureau", harness="claude", mode="externe")
+        registry.set_mode(self.db, "bureau", "externe")
         for state in ("merged", "promoted", "closed"):
             with self.subTest(state=state):
                 self.db.execute("UPDATE work_items SET state = %s, close_reason = %s"
