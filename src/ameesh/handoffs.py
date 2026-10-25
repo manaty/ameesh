@@ -19,7 +19,7 @@ import time
 import uuid
 from urllib.parse import urlsplit
 
-from . import projects, relocation, resources, storage
+from . import handoff_contract, projects, relocation, resources, storage
 from .db import DbError
 
 GIB = 1024 ** 3
@@ -275,9 +275,21 @@ def brief(op):
 
 
 def _adapter_call(adapter, step, op):
-    """Contain host failures without persisting potentially private diagnostics."""
+    """Contain host failures without persisting potentially private diagnostics.
+
+    The H1 contract is checked before the adapter is entered: a method that is
+    absent, an operation without its lease/epoch identity or a missing
+    controller epoch is refused, never replayed against a host.
+    """
+    method = getattr(adapter, step, None)
+    if not callable(method):
+        raise HandoffError("host adapter method missing: " + step)
     try:
-        return getattr(adapter, step)(op)
+        handoff_contract.validate_request(op, step)
+    except handoff_contract.ContractError:
+        raise HandoffError("handoff operation contract refused: " + step) from None
+    try:
+        return method(op)
     except Exception:
         raise HandoffError("host adapter failed: " + step) from None
 
