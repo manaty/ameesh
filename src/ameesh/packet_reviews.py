@@ -471,6 +471,7 @@ def need(db, vehicle: int, row, marks, repo: str, base: str, head: str,
         return None
     total = len(found)
     frozen_sources = []
+    admitted_sources = []
     constituents = []
     for entry in found:
         lot = int(entry["lot"])
@@ -517,8 +518,6 @@ def need(db, vehicle: int, row, marks, repo: str, base: str, head: str,
                     "why": "constituent #%d: composed source %s does not carry its "
                            "frozen head %s" % (lot, resolved[:12], frozen[:12]),
                     "members": found, "own_paths": []}
-        frozen_sources.append(frozen)
-        constituents.append(entry)
         # L'avis du membre se lit sur SA tête gelée et SA classe, pas sur le
         # diff du paquet (#2766).
         try:
@@ -549,7 +548,8 @@ def need(db, vehicle: int, row, marks, repo: str, base: str, head: str,
                                      base=packet_target or base,
                                      base_sha=member_base)
             gate = merge_queue.review_gate(db, member_marks, frozen, repo=repo,
-                                           klass=klass, item=member_row)
+                                           klass=klass, item=member_row,
+                                           admitted_heads=tuple(admitted_sources))
         except Exception as exc:  # noqa: BLE001 - lecture impossible : refus
             return {"ok": False, "required": None, "klass": None,
                     "why": "constituent #%d: cannot read its review gate: %s"
@@ -558,6 +558,12 @@ def need(db, vehicle: int, row, marks, repo: str, base: str, head: str,
             return {"ok": False, "required": None, "klass": None,
                     "why": "constituent #%d: %s" % (lot, gate.get("why") or "no review"),
                     "members": found, "own_paths": []}
+        # A waived/no-review gate can open without reading provenance. It
+        # covers its vehicle delta, but cannot attest inherited authors.
+        if gate.get("attribution_read"):
+            admitted_sources.append(frozen)
+        frozen_sources.append(frozen)
+        constituents.append(entry)
     total = len(constituents)
     if not total:
         return None
