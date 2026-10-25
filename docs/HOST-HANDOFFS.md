@@ -8,6 +8,24 @@ Planning requires the agent's bound identity or a correction role.
 `ameesh handoff show OPERATION` reads the durable plan, allowlisted evidence
 and event journal. These commands perform no SSH or provisioning.
 
+The operator commands `ameesh handoff advance OPERATION`,
+`ameesh handoff cancel OPERATION` and `ameesh handoff retry OPERATION`
+require an authenticated human, orchestrator or design role. An unbound human
+terminal names its identity with `--actor human:ID`; an agent session cannot
+impersonate that identity. Each invocation opens its own controller connection,
+loads the same pinned enrolled factory as the runner and performs one controller
+step. It prints only the operation identity, hosts, state and reservation expiry;
+private helper errors are replaced by a generic refusal. A held state requires
+explicit recovery; commands never loop until completion.
+
+`retry` reconciles unfinished effects before resuming the saved checkpoint.
+An expired reservation requires `--renew-ttl SECONDS` (30–7200); renewal is
+explicit and does not itself advance the handoff. `cancel` restores the source
+only when the existing controller proves that cancellation is safe; after the
+switch, recover forward with reconciliation. Missing enrollment refuses all
+three commands. Manual plans use the enrolled adapter's prerequisite checks;
+lifecycle plans additionally retain the runner's lifecycle generation checks.
+
 The runner's relocation option reserves a handoff instead of changing the
 host or discarding a native session. The current lot continues until its
 boundary. An atomic database fence then blocks source claims and new turns.
