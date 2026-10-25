@@ -2219,6 +2219,7 @@ class WorkItems(Domain):
 
         Un gel depuis `intake` ou `build` entre en `qa` avant son callback
         (#3467), par les transitions ordinaires, dans la même transaction.
+        Un lot épinglé à un Process conserve son état (#3489).
         Un état bloqué ou terminal n'est pas levé par ce geste.
 
         `on_frozen` (facultatif, #1617) : callback du gel, appelé dans la

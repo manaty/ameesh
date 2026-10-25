@@ -616,7 +616,8 @@ def milestone(
 
     Le gel entre en `qa` depuis `intake` (par `build`) ou `build` avant la
     désignation (#3467). Les transitions, leur journal et le jalon sont
-    atomiques ; les gardes Process restent celles des transitions ordinaires.
+    atomiques. Un lot épinglé à un Process conserve son état (#3489) ;
+    le jalon et la désignation sont enregistrés sans transition implicite.
     Un gel ne lève pas un état bloqué ou terminal.
 
     `supersedes` (#2989, #3399) nomme un ou des gels antérieurs du même lot que
