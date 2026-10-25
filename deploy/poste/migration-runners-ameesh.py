@@ -44,10 +44,12 @@ import json
 import os
 import pwd
 import re
+import shlex
 import shutil
 import stat
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import Callable, Iterable, Mapping, Sequence
@@ -390,10 +392,15 @@ def unites_de(agents: Sequence[str]) -> list[str]:
 
 def etat_enabled(ctx: Contexte, agents: Sequence[str], *,
                  cible: bool = False) -> list[str]:
-    """Les agents dont l'unité est activée au démarrage."""
+    """Les agents dont l'unité est activée au démarrage.
+
+    Un `show` en échec (rc1, sortie vide) n'est PAS une preuve de
+    désactivation : l'agent est compté comme activé, pour que la vérification
+    refuse au lieu de conclure sur une lecture impossible (N cx3)."""
     actifs = []
     for nom in agents:
-        if statut_unite(ctx, nom, cible=cible)["active_file"] == "enabled":
+        statut = statut_unite(ctx, nom, cible=cible)
+        if not statut["ok"] or statut["active_file"] == "enabled":
             actifs.append(nom)
     return actifs
 
@@ -586,11 +593,17 @@ def comptes_declares(config: dict) -> dict[str, list[dict]]:
 
 
 def chemin_cible(ctx: Contexte, chemin: str | None, defaut: str) -> Path:
-    """Traduit un chemin du home smichea vers le home ameesh."""
+    """Traduit un chemin du home smichea vers le home ameesh.
+
+    Le remplacement est ancré : un `str.replace` nu réécrirait aussi un
+    TMPDIR qui contient `/home/smichea` (test dépendant de l'environnement,
+    N dev2 sans effet en prod avec `racine=/`)."""
     if not chemin:
         return ctx.cible_home / defaut
-    chemin = chemin.replace(str(ctx.source_home), str(ctx.cible_home))
-    chemin = chemin.replace("/home/%s" % SOURCE, "/home/%s" % CIBLE)
+    if chemin == str(ctx.source_home) or chemin.startswith(str(ctx.source_home) + "/"):
+        chemin = str(ctx.cible_home) + chemin[len(str(ctx.source_home)):]
+    elif chemin == "/home/%s" % SOURCE or chemin.startswith("/home/%s/" % SOURCE):
+        chemin = "/home/%s" % CIBLE + chemin[len("/home/%s" % SOURCE):]
     return Path(chemin)
 
 
@@ -606,37 +619,71 @@ def reecrire_home(texte: str, source: Path, cible: Path) -> str:
     return texte.replace(str(source), str(cible))
 
 
+def exiger_reel(chemin: Path) -> None:
+    """Un chemin que root va écrire ne doit pas être un lien symbolique.
+
+    Un agent sous ameesh peut planter un lien vers un fichier root ; le
+    suivre donnerait ameesh→root (revue dev2, B2). Les liens sont refusés,
+    jamais suivis.
+    """
+    if chemin.is_symlink():
+        refuser("%s est un lien symbolique : écriture root refusée" % chemin)
+
+
+def exiger_reels(ctx: Contexte, chemin: Path) -> None:
+    """Contrôle le chemin et ses parents sous le home cible."""
+    courant = chemin
+    while True:
+        exiger_reel(courant)
+        if courant == ctx.cible_home or ctx.cible_home not in courant.parents:
+            break
+        courant = courant.parent
+
+
 def ecrire_fichier(ctx: Contexte, chemin: Path, donnees: str | bytes,
                    mode: int = 0o600, owner: str = CIBLE) -> None:
     chemin.parent.mkdir(parents=True, exist_ok=True)
+    exiger_reel(chemin)
     if isinstance(donnees, str):
         donnees = donnees.encode("utf-8")
-    tmp = chemin.with_name(chemin.name + ".tmp.%d" % os.getpid())
-    with open(tmp, "wb") as flux:
-        flux.write(donnees)
-    os.chmod(tmp, mode)
-    os.replace(tmp, chemin)
-    if ctx.hote.comptes is None:
-        compte = ctx.hote.compte(owner)
-        os.chown(chemin, compte.uid, compte.gid)
+    # mkstemp : nom imprévisible, ouvert O_EXCL ; fchmod/fchown par
+    # descripteur, donc jamais à travers un lien (revue dev2, B2).
+    descripteur, nom = tempfile.mkstemp(prefix=chemin.name + ".tmp.",
+                                       dir=str(chemin.parent))
+    tmp = Path(nom)
+    try:
+        with os.fdopen(descripteur, "wb") as flux:
+            flux.write(donnees)
+            flux.flush()
+            os.fchmod(flux.fileno(), mode)
+            if ctx.hote.comptes is None:
+                compte = ctx.hote.compte(owner)
+                os.fchown(flux.fileno(), compte.uid, compte.gid)
+        os.replace(tmp, chemin)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            tmp.unlink()
+        raise
     dire("  écrit %s (%04o, %s)" % (chemin, mode, owner))
 
 
 def chown_cible(ctx: Contexte, chemin: Path, *, recursif: bool = False) -> None:
     """Le compte cible doit pouvoir écrire son home : les répertoires créés
-    par root (état, unités, config) lui appartiennent."""
+    par root (état, unités, config) lui appartiennent.
+
+    `lchown` : un lien planté dans le home change de propriétaire lui-même,
+    jamais sa cible root (revue dev2, B2)."""
     if ctx.hote.comptes is not None:
         return
     compte = ctx.changer_cible()
     if recursif:
         for dossier, sous, fichiers in os.walk(chemin):
-            os.chown(dossier, compte.uid, compte.gid)
+            os.lchown(dossier, compte.uid, compte.gid)
             for nom in fichiers:
                 with contextlib.suppress(OSError):
-                    os.chown(os.path.join(dossier, nom), compte.uid, compte.gid,
-                             follow_symlinks=False)
+                    os.lchown(os.path.join(dossier, nom), compte.uid, compte.gid)
     else:
-        os.chown(chemin, compte.uid, compte.gid)
+        os.lchown(chemin, compte.uid, compte.gid)
 
 
 def creer_dossier_cible(ctx: Contexte, dossier: Path, *,
@@ -646,8 +693,10 @@ def creer_dossier_cible(ctx: Contexte, dossier: Path, *,
     Un dossier neuf créé par root en 0700 barre le compte cible, même si les
     fichiers copiés dessous lui appartiennent : c'est le cas des dossiers
     d'identités (gh, Codex, Claude, config_dir secondaires). Les parents
-    créés sous le home cible reçoivent le même propriétaire (revue cx3, B2).
+    créés sous le home cible reçoivent le même propriétaire, et aucun
+    composant n'est suivi s'il est un lien (revues cx3 B2, dev2 B2).
     """
+    exiger_reels(ctx, dossier)
     dossier.mkdir(parents=True, exist_ok=True)
     os.chmod(dossier, mode)
     chown_cible(ctx, dossier)
@@ -664,6 +713,7 @@ def copier_fichier(ctx: Contexte, source: Path, cible: Path, *,
     if not source.exists():
         return
     cible.parent.mkdir(parents=True, exist_ok=True)
+    exiger_reel(cible)
     texte = None
     if reecrire:
         with contextlib.suppress(UnicodeDecodeError, OSError):
@@ -851,10 +901,11 @@ def preparer_dossiers(ctx: Contexte) -> None:
             (ctx.cible_home / "development/manaty", 0o755),
             (ctx.cible_home / "canon", 0o755),
     ):
+        exiger_reels(ctx, chemin)
         chemin.mkdir(parents=True, exist_ok=True)
         os.chmod(chemin, mode)
         if ctx.hote.comptes is None:
-            os.chown(chemin, compte.uid, compte.gid)
+            os.lchown(chemin, compte.uid, compte.gid)
 
 
 def preparer_linger(ctx: Contexte) -> None:
@@ -881,6 +932,7 @@ def preparer_config(ctx: Contexte) -> None:
     secrets root de `bascule.env` et `notify.env` restent hors du compte."""
     source = ctx.source_home / ".config/ameesh"
     cible = ctx.cible_home / ".config/ameesh"
+    exiger_reels(ctx, cible)
     cible.mkdir(parents=True, exist_ok=True)
     os.chmod(cible, 0o700)
     chown_cible(ctx, cible)
@@ -899,6 +951,7 @@ def preparer_config(ctx: Contexte) -> None:
         if not arbre.is_dir():
             continue
         destination = cible / dossier
+        exiger_reels(ctx, destination)
         destination.mkdir(parents=True, exist_ok=True)
         os.chmod(destination, 0o700)
         chown_cible(ctx, destination)
@@ -919,6 +972,7 @@ def preparer_etat(ctx: Contexte) -> None:
     traversent pas : ils ne servent pas à reprendre un tour."""
     source = ctx.source_home / ".local/state/ameesh"
     cible = ctx.cible_home / ".local/state/ameesh"
+    exiger_reels(ctx, cible)
     cible.mkdir(parents=True, exist_ok=True)
     chown_cible(ctx, cible)
     rsync(ctx, source, cible, supprimer=True, chown=CIBLE, exclusions=[
@@ -930,6 +984,7 @@ def preparer_etat(ctx: Contexte) -> None:
     autre = ctx.source_home / ".local/state/ameesh-host"
     if autre.is_dir():
         destination = ctx.cible_home / ".local/state/ameesh-host"
+        exiger_reels(ctx, destination)
         destination.mkdir(parents=True, exist_ok=True)
         chown_cible(ctx, destination)
         rsync(ctx, autre, destination, supprimer=True, chown=CIBLE)
@@ -937,6 +992,7 @@ def preparer_etat(ctx: Contexte) -> None:
         chemin = ctx.source_home / ".local/state" / petit
         if chemin.is_dir():
             destination = ctx.cible_home / ".local/state" / petit
+            exiger_reels(ctx, destination)
             destination.mkdir(parents=True, exist_ok=True)
             chown_cible(ctx, destination)
             rsync(ctx, chemin, destination, supprimer=True, chown=CIBLE)
@@ -1104,19 +1160,42 @@ def espace_supplement(ctx: Contexte,
             for cle, octets in besoin.items()}
 
 
+def _volume_existant(chemin: Path) -> tuple[int | None, Path]:
+    """Le périphérique réel d'une destination, et un chemin qui existe."""
+    while not chemin.exists() and chemin != chemin.parent:
+        chemin = chemin.parent
+    try:
+        return chemin.stat().st_dev, chemin
+    except OSError:
+        return None, chemin
+
+
 def manques_espace(ctx: Contexte,
                    besoin: dict[str, int] | None = None) -> list[str]:
-    """Les refus d'espace, pour `preparer` (bloquant) et la bascule (manque)."""
-    manques = []
+    """Les refus d'espace, pour `preparer` (bloquant) et la bascule (manque).
+
+    Les besoins sont agrégés par système de fichiers **réel** (`st_dev`) :
+    `development` et `home` peuvent partager le même volume, et deux besoins
+    qui passent chacun sous le libre peuvent le dépasser ensemble (B7 cx3 /
+    B3 dev2). La marge de copie est exigée même quand le supplément est nul :
+    `rsync` crée des temporaires, et la soustraction source−cible ne prouve
+    pas l'identité des contenus.
+    """
+    groupes: dict[int | None, dict] = {}
     for cle, octets in espace_supplement(ctx, besoin).items():
-        if not octets:
-            continue
         racine = ctx.cible_home / "development" if cle == "development" \
             else ctx.cible_home
-        while not racine.exists() and racine != racine.parent:
-            racine = racine.parent
+        dev, racine = _volume_existant(racine)
+        groupe = groupes.setdefault(dev, {"racine": racine, "cles": [],
+                                          "octets": 0})
+        groupe["cles"].append(cle)
+        groupe["octets"] += octets
+    manques = []
+    for groupe in groupes.values():
+        cles = groupe["cles"]
+        octets = groupe["octets"]
         try:
-            libre = shutil.disk_usage(racine).free
+            libre = shutil.disk_usage(groupe["racine"]).free
         except OSError:
             libre = 0
         marge = max(MARGE_ESPACE, octets // 5)
@@ -1125,7 +1204,8 @@ def manques_espace(ctx: Contexte,
                 "espace insuffisant pour %s : %.1f Gio libres, ~%.1f Gio à "
                 "copier + %.1f Gio de marge ; libérer de l'espace ou monter un "
                 "volume dédié (runbook § 4.10)"
-                % (cle, libre / 2**30, octets / 2**30, marge / 2**30))
+                % (" + ".join(sorted(cles)), libre / 2**30, octets / 2**30,
+                   marge / 2**30))
     return manques
 
 
@@ -1320,6 +1400,7 @@ def preparer_venv(ctx: Contexte) -> None:
 def preparer_unites(ctx: Contexte) -> None:
     source = ctx.source_home / ".config/systemd/user"
     cible = ctx.cible_home / ".config/systemd/user"
+    exiger_reels(ctx, cible)
     cible.mkdir(parents=True, exist_ok=True)
     os.chmod(cible, 0o755)
     chown_cible(ctx, cible)
@@ -1388,9 +1469,14 @@ def commande_preparer(ctx: Contexte, args) -> int:
         exiger_source(ctx)
         exiger_hote(ctx)
         etat = lit_etat(ctx)
-        if etat.get("stage") in ("bascule", "preuve"):
-            refuser("migration déjà basculée : « retour » d'abord, ou --reprendre "
-                    "explicitement")
+        if etat.get("stage") not in ("neuf", "prepare"):
+            # une fois basculé (ou revenu en arrière), le home cible a pu être
+            # utilisé par les agents : root ne doit plus y écrire à l'aveugle
+            # (symlinks plantés, rsync --delete du travail ameesh) — revue
+            # dev2, B2.
+            refuser("état %r : le home cible a pu être utilisé par les agents ; "
+                    "écriture root refusée après bascule ou retour (recréer le "
+                    "home cible, ou geste dédié)" % etat.get("stage"))
         etat["stage"] = "prepare"
         etat["agents"] = agents_du_poste(ctx)
         journal(ctx, "preparer", "préparation du compte %s et de son home" % CIBLE)
@@ -1624,6 +1710,13 @@ def commande_identites(ctx: Contexte, args) -> int:
         exiger_source(ctx)
         exiger_hote(ctx)
         exiger_cible(ctx)
+        etat = lit_etat(ctx)
+        if etat.get("stage") != "prepare":
+            # même garde que `preparer` : les identités s'écrivent dans le
+            # home cible avant que les agents ne l'utilisent (revue dev2, B2).
+            refuser("état %r : « preparer » d'abord ; refus d'écrire des "
+                    "identités dans un home utilisé par les agents"
+                    % etat.get("stage"))
         config = lire_json(ctx.cible_home / ".config/ameesh/config.json")
         journal(ctx, "identites", "clé SSH dédiée et vérification des harnais")
         ok, detail = cle_ssh_source(ctx)
@@ -1713,8 +1806,9 @@ def poser_pauses(ctx: Contexte, agents: Sequence[dict], motif: str, *,
                 dire("  %s : pause étrangère conservée (%s)" % (nom, raison or "?"))
         if etat is not None and nom in posees:
             # journal de reprise : une pause posée est durable même si la
-            # suite du geste est interrompue (B4).
-            etat["pauses"] = dict(posees)
+            # suite du geste est interrompue (B4) ; fusionner garde les
+            # pauses d'une tentative précédente (leur motif exact).
+            etat["pauses"] = {**(etat.get("pauses") or {}), **posees}
             ecrit_etat(ctx, etat)
     return posees
 
@@ -1898,6 +1992,29 @@ def annuler_avant_canari(ctx: Contexte, actifs: Sequence[str],
     ecrit_etat(ctx, etat)
 
 
+def verifier_hors_session_liee(ctx: Contexte) -> None:
+    """Refuse AVANT tout arrêt si le script descend d'une session liée.
+
+    `ameesh pause/resume` résout la liaison par ascendance, sans filtre uid :
+    lancé depuis la session liée du bureau, même via sudo/runuser, le CLI
+    répond « an agent session cannot act as the local human » et la bascule
+    ou le retour échoue aux pauses. L'unité transitoire casse l'ascendance
+    (revue dev2, B1)."""
+    binaire = ctx.source_home / ".local/share/ameesh/venv/bin/ameesh"
+    fait = ctx.hote.lancer([str(binaire), "mail", "whoami"],
+                           utilisateur=SOURCE, delai=60)
+    if fait.ok and "[session]" in fait.sortie:
+        commande = (
+            "sudo systemd-run --collect --wait --pipe --unit migration-3549 "
+            "--working-directory %s python3 %s %s"
+            % (shlex.quote(str(ctx.depot)),
+               shlex.quote(str(Path(__file__).resolve())),
+               " ".join(shlex.quote(arg) for arg in sys.argv[1:])))
+        refuser("session liée détectée (%s) : les pauses opérateur seraient "
+                "refusées ; relancer sous une unité transitoire : %s"
+                % (fait.sortie.strip().splitlines()[0], commande))
+
+
 def basculer(ctx: Contexte, args) -> int:
     etat = lit_etat(ctx)
     if etat.get("stage") not in ("prepare", "identites"):
@@ -1928,11 +2045,16 @@ def basculer(ctx: Contexte, args) -> int:
     journal(ctx, "basculer", "drain de %d exécuteurs, motif %r" % (len(actifs), motif),
             agents=actifs)
     ecrit_etat(ctx, etat)
-    pauses = poser_pauses(ctx, [a for a in agents if a["name"] in actifs], motif,
-                          etat=etat)
-    etat["pauses"] = pauses
-    ecrit_etat(ctx, etat)
+    pauses = {}
     try:
+        # la pose des pauses est dans la fenêtre de reprise : une erreur ou
+        # une interruption partielle doit les lever (N dev2). Les pauses déjà
+        # persistées d'une tentative précédente gardent leur motif exact.
+        pauses = {**(etat.get("pauses") or {})}
+        pauses.update(poser_pauses(ctx, [a for a in agents if a["name"] in actifs],
+                                   motif, etat=etat))
+        etat["pauses"] = pauses
+        ecrit_etat(ctx, etat)
         # `stop` est une mise en file, pas une attente : le drainage d'un
         # tour peut dépasser 5 min. L'arrêt est prouvé ensuite, séparément,
         # dans la borne `--attente-arret` (revue dev1, B2).
@@ -2134,6 +2256,7 @@ def commande_basculer(ctx: Contexte, args) -> int:
     with verrou(ctx, "basculer"):
         exiger_source(ctx)
         exiger_hote(ctx)
+        verifier_hors_session_liee(ctx)
         return basculer(ctx, args)
 
 
@@ -2401,7 +2524,7 @@ def retour(ctx: Contexte, args) -> int:
     pauses = dict(etat.get("pauses") or {})
     if actifs:
         pauses.update(poser_pauses(ctx, [a for a in agents if a["name"] in actifs],
-                                   motif))
+                                   motif, etat=etat))
     if actifs:
         # mise en file, pas une attente : le drainage peut dépasser 5 min ;
         # l'arrêt est prouvé ensuite dans la borne `--attente-arret` (B2).
@@ -2467,6 +2590,7 @@ def commande_retour(ctx: Contexte, args) -> int:
     with verrou(ctx, "retour"):
         exiger_source(ctx)
         exiger_hote(ctx)
+        verifier_hors_session_liee(ctx)
         return retour(ctx, args)
 
 
@@ -2527,7 +2651,6 @@ def analyse_arguments(argv: Sequence[str] | None = None) -> argparse.Namespace:
     p.set_defaults(fonction=commande_verifier)
 
     p = sous.add_parser("preparer", help="compte, home, état, venv, unités (sans démarrer)")
-    p.add_argument("--reprendre", action="store_true")
     p.set_defaults(fonction=commande_preparer)
 
     p = sous.add_parser("identites", help="clé SSH, gh, auth Codex/DeepSeek, logins Claude")

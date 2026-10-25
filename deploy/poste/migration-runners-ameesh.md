@@ -93,7 +93,12 @@ le même uid. Ce que la migration établit :
   (`git-agents.conf`, HTTPS + `GIT_SSH_COMMAND`) ne sont **pas** recopiées :
   le nouveau compte rend le masque inutile, et le montage qui cassait
   `/etc/ssh/ssh_config.d/20-omarchy-keepalive.conf` disparaît avec lui. Elles
-  sont sauvegardées puis retirées à la bascule, restaurées au retour.
+  sont sauvegardées puis retirées à la bascule, restaurées au retour ;
+* root n'écrit jamais à travers un lien dans `~ameesh` : `lchown`, fichiers
+  temporaires `mkstemp` et `fchmod`/`fchown` par descripteur, liens refusés ;
+  `preparer`/`identites` ne s'exécutent plus une fois les agents passés sous
+  ameesh (sinon un lien planté serait ameesh→root, et `rsync --delete`
+  emporterait leur travail).
 
 Ce que la migration **ne protège pas** : root (le bureau et l'owner), un
 groupe privilégié ajouté plus tard, l'accès physique, et les secrets que les
@@ -142,9 +147,12 @@ est vérifié.
    développement), mais `/home/ameesh` est sur le volume d'état (~146 Gio
    libres). Une copie intégrale de `development/manaty` peut donc ne pas
    tenir. `preparer` et `verifier --avant-bascule` mesurent la source et ce
-   que la cible porte déjà (`du -sb`, caches et `events.jsonl` exclus) et
-   refusent sous 20 % de marge, au moins 5 Gio ; `preparer` refuse **avant
-   la première copie**. Deux voies, à choisir avant le geste :
+   que la cible porte déjà (`du -sb`, caches et `events.jsonl` exclus),
+   **agrègent par système de fichiers réel** (`st_dev` : `development` et
+   `home` peuvent partager le même volume) et refusent sous 20 % de marge,
+   au moins 5 Gio — même quand le supplément calculé est nul, `rsync` a
+   besoin de temporaires. `preparer` refuse **avant la première copie**.
+   Deux voies, à choisir avant le geste :
     * **recréer** les clones sous `/home/ameesh/development/manaty` depuis
       l'origine (mêmes branches/commits) et n'y copier que les worktrees
       actifs et les modifications non poussées — la voie du lot, « migrés ou
@@ -159,6 +167,22 @@ est vérifié.
       par une unité `.mount` ou `/etc/fstab`), puis copier normalement ; geste
       root du bureau, à tracer.
    Sans l'une de ces voies, le script s'arrête avant tout arrêt de service.
+11. **Lancer hors session liée** : le bureau est une session **liée** sur
+   pc-smichea (`ameesh mail bind --pid`). `ameesh pause`/`resume` refuse tout
+   descendant d'une session liée (`by_ancestry`, sans filtre uid), même via
+   `sudo`/`runuser` : `basculer` et `retour` échoueraient aux pauses. Lancer
+   ces deux étapes dans une **unité transitoire**, qui casse l'ascendance :
+
+   ```sh
+   sudo systemd-run --collect --wait --pipe --unit migration-3549-basculer \
+     --working-directory "$PWD" \
+     python3 deploy/poste/migration-runners-ameesh.py basculer
+   ```
+
+   `preparer`, `identites`, `verifier` et `preuve` peuvent rester en direct.
+   Le script détecte la session liée et refuse **avant tout arrêt** avec la
+   commande exacte ; un `retour --force` se lance de la même façon. Suivre
+   `journalctl -u migration-3549-basculer` si besoin.
 
 ## 5. Étape 1 — vérifier (lecture seule)
 
@@ -196,8 +220,9 @@ Le script, dans cet ordre :
    `.local/share/ameesh`, `development/manaty`, `canon`) et pose
    `loginctl enable-linger ameesh` (gestionnaire utilisateur au boot) ;
    **avant la première copie**, vérifie l'espace libre (source moins ce que
-   la cible porte déjà, `du -sb`, marge de 20 % ou 5 Gio) et refuse si
-   `/home` ou le volume de développement est trop plein (§ 4.10) ;
+   la cible porte déjà, `du -sb`, **agrégé par système de fichiers réel**,
+   marge de 20 % ou 5 Gio) et refuse si `/home` ou le volume de
+   développement est trop plein (§ 4.10) ;
 3. copie `config.json` (0600, chemins réécrits), `env` (0600), `.pgpass`,
    `runner-profiles/`, `keys/`, `cles-ci/` ; **pas** `bascule.env`, **pas**
    `notify.env`, **pas** `git-agents.conf` ;
@@ -220,8 +245,12 @@ Le script, dans cet ordre :
    arrêtée.
 
 Aucun exécuteur n'est arrêté. En cas d'échec, la source continue ; corriger et
-relancer `preparer` (idempotent). `preparer` refuse si l'état est déjà
-`bascule`/`preuve` : faire `retour` d'abord.
+relancer `preparer` (idempotent). `preparer` et `identites` n'acceptent que
+les états `neuf`/`prepare` : après une bascule ou un `retour`, le home cible
+a pu être utilisé par les agents (liens plantés, travail non poussé) et le
+script **refuse** d'y écrire en root ; `rsync --delete` ne doit pas non plus
+emporter le travail créé sous ameesh. Une nouvelle tentative exige de
+recréer le home cible (geste dédié), pas un simple `preparer`.
 
 ## 7. Étape 3 — identités (une seule séance owner)
 
@@ -284,17 +313,26 @@ vérifie `claude auth status` par dossier (`loggedIn: true`), `ssh -T`,
 
 ## 8. Étape 4 — basculer (drain par vagues, hors créneau)
 
+Le bureau est une session liée : lancer **sous unité transitoire** (§ 4.11),
+sinon le script refuse avant tout arrêt.
+
 ```sh
-sudo deploy/poste/migration-runners-ameesh.py basculer
+sudo systemd-run --collect --wait --pipe --unit migration-3549-basculer \
+  --working-directory "$PWD" \
+  python3 deploy/poste/migration-runners-ameesh.py basculer
 # options : --canari <agent> (défaut codex2), --attente-arret <secondes> (2200)
 ```
 
 1. **Gardes** : `verifier_avant_bascule` (créneau, paquet, drill, comptes,
-   auth, versions, espace) ; refus avant tout arrêt.
+   auth, versions, espace agrégé par système de fichiers) ; refus avant tout
+   arrêt.
 2. **Pauses opérateur** : `ameesh pause <agent> --reason "migration #3549 …
-   <horodatage>" --not-after <+2 h>` pour les six actifs. L'admission est
-   fermée ; un tour en cours n'est pas interrompu. Une pause étrangère est
-   conservée et ne sera pas levée.
+   <horodatage>" --not-after <+2 h>` pour les six actifs. `--not-after` borne
+   la **pose** à deux heures (échéance comparée à l'horloge de la base), pas
+   la durée de la pause : c'est `resume` qui la lève. L'admission est fermée ;
+   un tour en cours n'est pas interrompu. Une pause étrangère est conservée et
+   ne sera pas levée. Une pose partielle est journalisée dans `etat.json` et
+   levée par l'annulation ou le retour.
 3. **Vague 1 — arrêt** : `systemctl --user stop --no-block` sur les six
    unités de smichea, en parallèle : la commande met les arrêts en file et
    rend la main, elle n'attend pas un tour. Chaque SIGTERM draine son tour,
@@ -375,8 +413,13 @@ et ses worktrees sont ceux d'ameesh, la source n'est plus alimentée.
 
 ## 10. Retour arrière — une commande
 
+Comme la bascule, le retour pose des pauses : il se lance **sous unité
+transitoire** (§ 4.11).
+
 ```sh
-sudo deploy/poste/migration-runners-ameesh.py retour
+sudo systemd-run --collect --wait --pipe --unit migration-3549-retour \
+  --working-directory "$PWD" \
+  python3 deploy/poste/migration-runners-ameesh.py retour
 # --force : même si des tours ont eu lieu sous ameesh depuis la bascule,
 #           ou après une bascule interrompue (état resté `prepare`)
 ```
@@ -406,8 +449,10 @@ Limites : le retour ne recopie pas les données créées sous ameesh (worktrees,
 commits non poussés) ; il remet les **services** et les cwd. Après un tour de
 canari, `--force` suffit car le canari est exclu du contrôle ; après du vrai
 travail, pousser ou copier d'abord, puis `retour`, ou corriger en avant. Le
-compte ameesh, son home et ses données restent en place : une nouvelle
-tentative n'a pas à tout recopier.
+compte ameesh, son home et ses données restent en place, mais une **nouvelle
+tentative** ne repasse pas `preparer` par-dessus : le script refuse d'écrire
+en root dans un home que les agents ont utilisé (§ 6). Recréer le home cible
+est un geste dédié, tracé ; sinon, le retour est définitif.
 
 ## 11. Après la migration — ce qui reste à faire
 
@@ -454,7 +499,8 @@ La migration est un **geste de préparation** ; elle ne rend pas le poste
 | `preparer` : `useradd` refuse | compte existant, home inattendu, groupe privilégié | `id ameesh`, `gpasswd -d ameesh docker`, corriger le home à la main puis relancer |
 | `preparer` : `linger non posé` | `systemd-logind` ou `/run/user/<uid>` absent | `loginctl enable-linger ameesh`, `loginctl show-user ameesh -p Linger`, relancer |
 | `preparer` : `bascule.py … a échoué` | pip/réseau, dépendance, disque | lire la sortie ; la source n'a pas bougé ; corriger et relancer |
-| `preparer` : `espace insuffisant` | `/home` ou le volume de développement trop plein | libérer de l'espace ou monter le volume dédié (§ 4.10) ; la source n'a pas bougé |
+| `preparer` : `espace insuffisant` | le total sur un même système de fichiers dépasse le libre (marge rsync 5 Gio incluse) | libérer de l'espace ou monter le volume dédié (§ 4.10) ; la source n'a pas bougé |
+| `preparer`/`identites` : `état 'retour' …` | le home cible a été utilisé par les agents (liens, travail ameesh) | ne pas forcer : recréer le home cible (geste dédié) ; `rsync --delete` emporterait le travail ameesh |
 | `preparer` : gabarit sans `SSH_AUTH_SOCK` | unité source antérieure à #3444 | réinstaller `deploy/systemd/ameesh-runner-agent@.service` sous smichea, `daemon-reload` (le gabarit seul ne redémarre pas les runners), relancer |
 | `identites` : `claude … loggedIn false` | login web non fait, mauvais dossier | refaire la commande du § 7.3 pour **ce** dossier |
 | `identites` : `ssh GitHub` échoue | clé publique non ajoutée, `known_hosts` | `gh ssh-key add`, vérifier l'empreinte, relancer |
@@ -463,6 +509,7 @@ La migration est un **geste de préparation** ; elle ne rend pas le poste
 | `preuve` : `doctor` rouge | config, DB, unité | ne pas retirer les sauvegardes ; `retour` ou correctif |
 | `retour` : unité source inactive | drop-in/witness retiré, `daemon-reload` | le script s'arrête ; restaurer le témoin, relancer `retour` |
 | `retour` : pause non levée | deux CLI en échec | la commande exacte est imprimée : `ameesh resume <agent> --operator --reason … --expect-reason …` |
+| `basculer`/`retour` : `session liée détectée` | le bureau est lié (pause/resume refuse un descendant) | relancer la commande sous `systemd-run` comme l'imprime le script (§ 4.11) |
 | redémarrage pendant la bascule | source déjà désactivée, cible pas encore activée | `retour` (état `bascule`) : il réactive la source et redémarre son ensemble actif |
 | `basculer` interrompu (Ctrl-C, coupure) avec source arrêtée | état resté `prepare`, actifs écrits avant l'arrêt | `retour --force` : il redémarre l'ensemble actif de `etat.json` et lève les pauses ; ne pas relancer `preparer` |
 

@@ -712,6 +712,87 @@ class Banc(unittest.TestCase):
         self.assertFalse(self.faux.a_appele("systemctl --user start"))
         self.assertFalse(self.faux.a_appele("systemctl --user enable"))
 
+    # ------------------------------------------------------------------
+    # régressions des seconds verdicts dev2 (#19076) et cx3 (#19075)
+    # ------------------------------------------------------------------
+
+    def test_espace_agrege_par_systeme_de_fichiers(self):
+        """B7 cx3 / B3 dev2 : 60 Gio + 60 Gio sur le même FS, 100 Gio libres."""
+        besoin = {"home": 60 * 2**30, "development": 60 * 2**30}
+        with mock.patch.object(M.shutil, "disk_usage",
+                               return_value=mock.Mock(free=100 * 2**30)):
+            manques = M.manques_espace(self.ctx, besoin)
+        self.assertTrue(manques, "le total sur le même FS doit être comparé")
+        self.assertIn("development + home", manques[0])
+
+    def test_espace_marge_rsync_meme_si_supplement_nul(self):
+        """B7 cx3 : la soustraction source−cible ne supprime pas la marge rsync."""
+        with mock.patch.object(M.shutil, "disk_usage",
+                               return_value=mock.Mock(free=1 * 2**30)):
+            manques = M.manques_espace(self.ctx, {"home": 0, "development": 0})
+        self.assertTrue(manques)
+        with mock.patch.object(M.shutil, "disk_usage",
+                               return_value=mock.Mock(free=6 * 2**30)):
+            manques = M.manques_espace(self.ctx, {"home": 0, "development": 0})
+        self.assertFalse(manques)
+
+    def test_etat_enabled_show_rc1_nest_pas_une_preuve(self):
+        """N cx3 : un show rc1 (sortie vide) ne conclut pas à la désactivation."""
+        self.faux.remplacer("systemctl --user show", 1, "", "bus absent")
+        actifs = M.etat_enabled(self.ctx, ["ameesh-dev1"], cible=True)
+        self.assertEqual(actifs, ["ameesh-dev1"])
+
+    def test_preparer_et_identites_refuses_apres_bascule(self):
+        """B2 dev2 : preparer/identites ne réécrivent pas un home utilisé."""
+        etat = M.etat_vide()
+        etat["stage"] = "retour"
+        M.ecrit_etat(self.ctx, etat)
+        args = mock.Mock()
+        with self.assertRaises(M.Refus):
+            M.commande_preparer(self.ctx, args)
+        with self.assertRaises(M.Refus):
+            M.commande_identites(self.ctx, args)
+
+    def test_preparer_autorise_a_l_etape_prepare(self):
+        """La garde de stage laisse la reprise idempotente à `prepare`."""
+        etat = M.etat_vide()
+        etat["stage"] = "prepare"
+        M.ecrit_etat(self.ctx, etat)
+        with mock.patch.object(M, "preparer") as preparation, \
+                mock.patch.object(M, "agents_du_poste", return_value=[]):
+            self.assertEqual(M.commande_preparer(self.ctx, mock.Mock()), 0)
+        preparation.assert_called_once()
+
+    def test_session_liee_refusee_avec_unite_transitoire(self):
+        """B1 dev2 : une session liée est refusée avant tout arrêt."""
+        self.faux.repondre("ameesh mail whoami", 0,
+                           "codex [session] claude pid 532757\n")
+        with self.assertRaises(M.Refus) as refus:
+            M.verifier_hors_session_liee(self.ctx)
+        self.assertIn("systemd-run", str(refus.exception))
+        self.faux.remplacer("ameesh mail whoami", 1, "",
+                            "unbound identity: AGENT_MAIL_NAME not set\n")
+        M.verifier_hors_session_liee(self.ctx)  # sans session liée : passe
+
+    def test_ecriture_refuse_un_lien_symbolique(self):
+        """B2 dev2 : root ne suit pas un lien planté dans le home cible."""
+        cible = self.cible_home / ".config/ameesh/env"
+        cible.parent.mkdir(parents=True, exist_ok=True)
+        victime = self.racine / "victime-root"
+        victime.write_text("intact\n")
+        cible.symlink_to(victime)
+        with self.assertRaises(M.Refus):
+            M.ecrire_fichier(self.ctx, cible, "remplacé\n")
+        self.assertEqual(victime.read_text(), "intact\n")
+
+    def test_chemin_cible_ne_reecrit_qu_un_prefixe_de_home(self):
+        """N dev2 : un chemin qui contient le home sans en être un n'est pas réécrit."""
+        piege = "/prefix" + str(self.source_home) + "/x"
+        self.assertEqual(str(M.chemin_cible(self.ctx, piege, "d")), piege)
+        chemin = str(self.source_home) + "/.codex"
+        self.assertEqual(str(M.chemin_cible(self.ctx, chemin, "d")),
+                         str(self.cible_home) + "/.codex")
+
 
 if __name__ == "__main__":
     unittest.main()
