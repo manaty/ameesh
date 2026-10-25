@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: AGPL-3.0-only
-"""H1: the pinned enrolled factory for host handoffs.
+"""H1/H2: the pinned enrolled factory for host handoffs.
 
 This file is the sole handoff factory source. A controller loads this exact
 file, never a module named by a job, a transport message or an enrollment
@@ -9,11 +9,13 @@ document. It composes:
 - exact private enrollment documents under ``/etc/ameesh-handoff``:
   ``enrollment.json`` (version and controller host), ``hosts.json`` (admitted
   host/harness/account/tool/secret-alias identities), ``repositories.json``
-  (project to enrolled repository identity) and ``secrets.json`` (adapter
-  alias to private ``fichier#CLE`` reference);
+  (project to enrolled repository identity), ``secrets.json`` (adapter alias
+  to private ``fichier#CLE`` reference) and ``transports.json`` (one private
+  SSH endpoint per other admitted host);
 - the fixed companion ``hote-handoff.py`` next to this file, whose methods are
-  the enrolled adapter. H2/H3 fill its preparation/Git and activation/health
-  capabilities; H1 ships explicit refusals, never a simulated success.
+  the enrolled adapter, and the fixed ``pont-handoff.py`` bridge it uses. H2
+  fills the preparation/Git effects; H3 fills activation/health. An absent
+  effect is an explicit refusal, never a simulated success.
 
 Admission is all-or-nothing: a missing or unsafe document, an unenrolled host,
 harness or account, an unknown repository, a privacy-unsafe repository URL or
@@ -31,7 +33,6 @@ from pathlib import Path
 import re
 import stat
 from collections.abc import Mapping
-from urllib.parse import urlsplit
 
 from ameesh import handoff_contract, host_preflight, projects
 from ameesh.config import NAME_RE
@@ -39,19 +40,25 @@ from ameesh.config import NAME_RE
 
 ENROLLMENT_ROOT = Path('/etc/ameesh-handoff')
 COMPANION_NAME = 'hote-handoff.py'
+#: H2 bridge to the admitted SSH transport and to each host's pinned executor.
+BRIDGE_NAME = 'pont-handoff.py'
 #: Closed document set: an extra key is refused, never ignored.
 DOCUMENTS = {
     'enrollment': ('version', 'host'),
     'hosts': ('hosts',),
     'repositories': ('repositories',),
     'secrets': ('references',),
+    'transports': ('transports',),
 }
 #: The factory owns repository enrollment; the companion supplies the rest.
 COMPANION_METHODS = tuple(name for name in handoff_contract.METHODS
                           if name != handoff_contract.REPOSITORY)
 
-_ACCOUNT = re.compile(r'^[A-Za-z0-9][A-Za-z0-9_.@-]{0,63}$')
+#: The preflight's reference grammar: no implicit widening of an account.
+_ACCOUNT = re.compile(r'^[A-Za-z0-9][A-Za-z0-9_.:/-]{0,127}$')
 _ALIAS = re.compile(r'^[A-Za-z0-9][A-Za-z0-9_.:/-]{0,127}$')
+#: A tool is a program name; a path is never admitted as a preflight tool.
+_TOOL = re.compile(r'^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$')
 _STORE_FILE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$')
 _STORE_KEY = re.compile(r'^[A-Za-z_][A-Za-z0-9_]{0,127}$')
 
@@ -105,7 +112,11 @@ class Documents:
                 info = current.lstat()
             except OSError:
                 raise FactoryError('document:missing') from None
-            if stat.S_ISLNK(info.st_mode) or not _owned(info) or info.st_mode & 0o022:
+            final = current == path
+            if (stat.S_ISLNK(info.st_mode) or not _owned(info)
+                    or info.st_mode & 0o022
+                    or (final and not stat.S_ISREG(info.st_mode))
+                    or (not final and not stat.S_ISDIR(info.st_mode))):
                 raise FactoryError('document:untrusted')
 
     def json(self, name, *, exact):
@@ -114,7 +125,8 @@ class Documents:
         path = self.root / (name + '.json')
         try:
             self._trusted(path)
-            descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+            # A swapped-in FIFO must never block the factory before fstat.
+            descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
         except (OSError, FactoryError):
             raise FactoryError('document:' + name) from None
         try:
@@ -165,7 +177,7 @@ def _hosts(value):
                     or len(set(accounts)) != len(accounts)):
                 raise FactoryError('document:hosts')
             if (not _sequence(tools) or len(set(tools)) != len(tools)
-                    or any(not _ALIAS.fullmatch(name) for name in tools)):
+                    or any(not _TOOL.fullmatch(name) for name in tools)):
                 raise FactoryError('document:hosts')
             if (not _sequence(secrets) or len(set(secrets)) != len(secrets)
                     or any(not _ALIAS.fullmatch(name) for name in secrets)):
@@ -178,13 +190,7 @@ def _hosts(value):
 
 def _repository(value):
     """An enrolled repository identity: no credentials, query or control byte."""
-    if not isinstance(value, str) or not value or len(value) > 1024:
-        return False
-    if any(ord(char) < 32 or ord(char) == 127 for char in value):
-        return False
-    parsed = urlsplit(value)
-    return (parsed.password is None and not parsed.query and not parsed.fragment
-            and not (parsed.scheme == 'https' and parsed.username is not None))
+    return handoff_contract.repository_allowed(value)
 
 
 def _repositories(value):
@@ -215,23 +221,47 @@ def _references(value):
     return result
 
 
-def _trusted_source(path):
-    """The companion is a fixed file next to this factory, not group-writable.
+def _transports(value, hosts, local_host, root):
+    """One private SSH endpoint per other admitted host, exact keys only.
+
+    The controller host itself runs the pinned executor locally; every other
+    admitted host needs its own endpoint. An endpoint names no command, unit
+    or path outside this enrollment: the wire carries only typed effects.
+    """
+    if not isinstance(value, Mapping):
+        raise FactoryError('document:transports')
+    result = {}
+    for host, endpoint in value.items():
+        if not _name(host) or host not in hosts:
+            raise FactoryError('document:transports')
+        try:
+            result[host] = handoff_contract.validate_transport(endpoint, host, root=root)
+        except handoff_contract.ContractError:
+            raise FactoryError('document:transports') from None
+    missing = sorted(set(hosts) - {local_host} - set(result))
+    if missing:
+        raise FactoryError('document:transports:' + ','.join(missing))
+    return result
+
+
+def _trusted_source(path, name):
+    """A companion is a fixed file next to this factory, not group-writable.
 
     The installed tree is pinned by the H7 enrollment; this check refuses a
     replaced or writable companion without constraining a development
     checkout (whose shared directory mode is not the installation mode).
     """
     path = Path(path)
-    if path.is_symlink() or path.name != COMPANION_NAME:
-        raise FactoryError('source:' + COMPANION_NAME)
+    if path.is_symlink() or path.name != name:
+        raise FactoryError('source:' + name)
     try:
         info = path.lstat()
     except OSError:
-        raise FactoryError('source:' + COMPANION_NAME) from None
+        raise FactoryError('source:' + name) from None
     if (not stat.S_ISREG(info.st_mode) or not _owned(info)
             or info.st_mode & 0o022):
-        raise FactoryError('source:' + COMPANION_NAME)
+        raise FactoryError('source:' + name)
+    return path
 
 
 class EnrolledAdapter:
@@ -305,8 +335,10 @@ class HandoffFactory:
     factory never selects a source from a document, a message or an operation.
     """
 
-    def __init__(self, db=None, *, root=ENROLLMENT_ROOT, implementation=None):
+    def __init__(self, db=None, *, root=ENROLLMENT_ROOT, implementation=None,
+                 bridge=None):
         self.db = db
+        self.bridge = bridge
         self.documents = Documents(root)
         enrollment = self.documents.json('enrollment', exact=DOCUMENTS['enrollment'])
         if (not isinstance(enrollment.get('version'), int)
@@ -327,6 +359,11 @@ class HandoffFactory:
                 for alias in entry['secrets']:
                     if alias not in self.references:
                         raise FactoryError('document:secrets:' + alias)
+        self.transports = _transports(
+            self.documents.json('transports', exact=DOCUMENTS['transports'])['transports'],
+            self.hosts, self.host, self.documents.root)
+        self.bridge_path = _trusted_source(Path(__file__).absolute().parent / BRIDGE_NAME,
+                                           BRIDGE_NAME)
         self.source_path, self.provider = self._load(implementation)
         missing = [name for name in COMPANION_METHODS
                    if not callable(getattr(self.provider, name, None))]
@@ -339,7 +376,7 @@ class HandoffFactory:
         if implementation is not None:
             return None, implementation
         source = Path(__file__).absolute().parent / COMPANION_NAME
-        _trusted_source(source)
+        _trusted_source(source, COMPANION_NAME)
         spec = importlib.util.spec_from_file_location('ameesh_handoff_host', source)
         if spec is None or spec.loader is None:
             raise FactoryError('source:' + COMPANION_NAME)
@@ -353,7 +390,9 @@ class HandoffFactory:
             raise FactoryError('source:HostAdapter')
         try:
             provider = enrolled(db=self.db, enrollment=dict(self.enrollment),
-                                hosts=self.hosts, references=self.references)
+                                hosts=self.hosts, references=self.references,
+                                transports=self.transports, bridge=self.bridge,
+                                enrollment_root=self.documents.root)
         except Exception:
             raise FactoryError('source:HostAdapter') from None
         return source, provider

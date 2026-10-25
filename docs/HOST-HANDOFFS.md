@@ -130,24 +130,63 @@ the adapter is entered; proofs stay checked by the controller.
 
 `deploy/mise-a-jour/fabrique-handoff.py` is the single pinned factory. A
 controller loads that exact file, never a module named by a job, a message or
-a document. It reads four exact private documents under
+a document. It reads five exact private documents under
 `/etc/ameesh-handoff` — `enrollment.json` (version and controller host),
 `hosts.json` (admitted host/harness/account/tool/secret-alias identities),
-`repositories.json` (project to enrolled repository identity) and
-`secrets.json` (preflight alias to private `fichier#CLE` reference) — and the
-fixed `hote-handoff.py` companion next to it. `requirements_for(agent, host)`
-returns the exact `host_preflight.Requirements`: host, harness, exact account,
-tools and alias names; the private reference mapping is available separately
-for the L232c bridge and never enters `Requirements` or an error. A missing or
-unsafe document, an unenrolled host, harness or account, an unknown project
-repository, a credential-bearing repository URL or a missing adapter method
-refuses admission.
+`repositories.json` (project to enrolled repository identity),
+`secrets.json` (preflight alias to private `fichier#CLE` reference) and
+`transports.json` (one private SSH endpoint per other admitted host) — the
+fixed `hote-handoff.py` companion and the fixed `pont-handoff.py` bridge next
+to it. `requirements_for(agent, host)` returns the exact
+`host_preflight.Requirements`: host, harness, exact account, tools and alias
+names; the private reference mapping is available separately for the L232c
+bridge and never enters `Requirements` or an error. A missing or unsafe
+document, an unenrolled host, harness or account, an unknown project
+repository, a credential-bearing repository URL, an endpoint outside the
+private enrollment or a missing adapter method refuses admission.
 
 H1 binds no host effect. The companion's capabilities refuse by name until H2
 (preparation and Git) and H3 (activation, health and recovery) replace them;
 a present-but-unimplemented method refuses at call time and never returns a
 simulated success. This factory is source only: it installs no service,
 performs no SSH, root, credential or production operation.
+
+## Preparation and Git effects (H2)
+
+H2 implements `inventory`, `revalidate`, `prepare`, `stop_source`, `publish`,
+`transfer` and `session`. `publish` proves the source branch is clean, on its
+enrolled remote, at the exact commit; `transfer` checks out that exact commit
+on the destination with the account's own Git credentials and refuses a dirty
+or occupied worktree; `session` prepares a new private marker with no copied
+home, harness cache or OAuth token. `prepare` reads the destination's pinned
+release receipt, the enrolled tools and secret aliases, and the unit's finite
+memory caps; `stop_source` stops only the enrolled unit and proves its cgroup
+is quiescent. None of these steps starts or enables the destination executor.
+
+The controller-side companion checks the durable operation `pending_effect`,
+the placement/lease, both canon states, the destination gate and the existing
+`host_preflight` readiness before an effect. The host executor is the pinned
+`hote-handoff.py` (its `HostEffects` class and stdin dispatcher). It keeps a
+private journal under the host execution enrollment: the step order, the last
+controller epoch, a durable intent before the effect and an exact allowlisted
+receipt. A stale epoch or an out-of-order step is refused; a repeated step
+returns its stored receipt without repeating the effect; an interrupted
+intent is observed and completed only when the host state proves it, otherwise
+the call raises and the controller keeps its own durable intent for explicit
+reconciliation. Every SSH exchange is bounded by the enrolled endpoint and the
+host dispatcher's 30-second alarm; every Git and systemd call has its own
+bounded subprocess deadline.
+
+`pont-handoff.py` is the explicit bridge to admitted helpers. It reuses only
+the hardened SSH substrate of `transport-release.py` — fixed client options,
+the private key and known-hosts files with their pinned digest, the bounded
+pipe exchange and duplicate-key refusal — and never loads the release
+controller, its operations, its database or its restart authority. The
+destination release receipt is read through `environnement-versionne.py`;
+neither module gains a new authority from the bridge. H7 installs the host
+execution enrollment (`execution.json`: host, state root, configuration path,
+release store, per-agent account/home/unit and allowed work roots) and the
+private transport endpoints; H2 ships source only and performs no installation.
 
 ## Host drain, return and loss recovery (L232e)
 
