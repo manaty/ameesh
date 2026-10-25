@@ -330,11 +330,30 @@ def _cutoff_landing_only(repo: str, base: str, head: str) -> bool:
     return bool(shas) and all(_cutoff_commit(repo, sha) for sha in shas)
 
 
-def _in_head(repo: str, tip: str, head: str) -> bool:
-    """`tip` est-il déjà contenu dans la tête testée `head` ?"""
-    if not repo or not tip or not head:
+def _merge_base(repo: str, a: str, b: str) -> str:
+    """Le dernier commit commun de `a` et `b`, ou ""."""
+    if not repo or not a or not b:
+        return ""
+    return (_git(repo, "merge-base", a, b) or "").strip().lower()
+
+
+def _target_tested(repo: str, target: str, head: str, composition: str = "") -> bool:
+    """La cible est-elle couverte par la tête testée `head` ?
+
+    #3534 (B2) : la borne n'est pas la base du manifeste mais le dernier
+    commit de la cible **contenu dans la tête** (`merge-base`) ; c'est lui qui
+    a été testé avec le paquet. Si la cible a ensuite avancé, seul le delta
+    depuis ce commit doit être un atterrissage de coupure. Sans tête lisible
+    (clone en retard, tête absente), le repli est la base du manifeste : une
+    cible qui n'a pas bougé depuis la composition reste couverte."""
+    if not repo or not target or not head:
         return False
-    return _git(repo, "merge-base", "--is-ancestor", tip, head) is not None
+    included = _merge_base(repo, target, head)
+    if not included:
+        return bool(composition) and _cutoff_landing_only(repo, composition, target)
+    if included == target:
+        return True
+    return _cutoff_landing_only(repo, included, target)
 
 
 def _gate_repo(cfg, db, row, slug: str, checkout: str = "") -> str:
@@ -775,19 +794,16 @@ def _gate_locked(cfg, db, lot: int, mine: dict, *, gh, dry_run: bool, actor: str
     # #3534 (B3) : le clone se résout comme pour la porte des avis, avant la
     # garde du delta ; `checkout` est vide dans `ci run`/`arm`.
     repo = _gate_repo(cfg, db, row, slug, checkout)
-    # #3534 (B2) : si la cible est déjà dans la tête testée (H2 = merge(H, C)),
-    # ses commits sont couverts par la CI du paquet ; la borne du manifeste
-    # n'est plus le SHA de la cible.
-    target_in_head = _in_head(repo, base_oid, sha)
     moved = []
-    # #3534 : la cible courante doit être la base de composition, ou n'avoir
-    # avancé que par des atterrissages de coupure (version + notes, #173).
-    # Sinon la CI du paquet n'a pas testé cet arbre : on désarme.
+    # #3534 : la cible doit être couverte par la tête testée, soit directement
+    # (H2 = merge(H, C)), soit par une avance limitée aux atterrissages de
+    # coupure depuis le dernier commit de la cible déjà dans la tête (B2,
+    # #173). Sinon la CI du paquet n'a pas testé cet arbre : on désarme.
     target_moved = ""
-    if base_oid and composition and base_oid != composition and not target_in_head:
+    if base_oid and composition and base_oid != composition:
         if repo:
             _fetch_into(repo, (view.get("branch") or "", base))
-        if not _cutoff_landing_only(repo, composition, base_oid):
+        if not _target_tested(repo, base_oid, sha, composition):
             target_moved = ("target advanced since composition %s → %s"
                             % (composition[:12], base_oid[:12]))
             moved.append(target_moved)

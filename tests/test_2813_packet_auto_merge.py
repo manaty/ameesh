@@ -795,9 +795,9 @@ class TargetMovedTest(Journal):
         git("commit", "-qm", "release: 1.0.1 [skip ci]\n\nameesh-release: 1.0.1")
         return git("rev-parse", "HEAD")
 
-    def code(self, path, git):
+    def code(self, path, git, name: str = "x.py"):
         (Path(path) / "src").mkdir(exist_ok=True)
-        (Path(path) / "src" / "x.py").write_text("x = 1\n")
+        (Path(path) / "src" / name).write_text("x = 1\n")
         git("add", "-A")
         git("commit", "-qm", "fix: code")
         return git("rev-parse", "HEAD")
@@ -864,9 +864,8 @@ class TargetMovedTest(Journal):
         self.assertIn("expected target", out["why"])
         self.assertEqual(gh.merges(), [])
 
-    def test_b2_a_target_merged_into_the_tested_head_is_not_held(self):
-        path, git, base = self.repo()
-        moved = self.code(path, git)
+    def packet_with_target(self, path, git, base):
+        """Une tête de paquet H2 = merge(H, cible courante) ; rend (main, H2)."""
         current = git("rev-parse", "--abbrev-ref", "HEAD")
         git("checkout", "-q", "-b", "packet", base)
         (Path(path) / "packet.txt").write_text("packet\n")
@@ -874,12 +873,44 @@ class TargetMovedTest(Journal):
         git("commit", "-qm", "packet commit")
         git("merge", "-q", "--no-ff", current, "-m", "packet: merge target")
         head = git("rev-parse", "HEAD")
+        return current, head
+
+    def test_b2_a_target_merged_into_the_tested_head_is_not_held(self):
+        path, git, base = self.repo()
+        moved = self.code(path, git)
+        _, head = self.packet_with_target(path, git, base)
         self.frozen = head
         self.armed(sha=head, composition=base)
         gh = FakeGh(head=head, base_oid=moved, tests="success")
         out = self.check(gh, checkout=path)
         self.assertEqual(out["result"], "merged", out)
         self.assertEqual(gh.landed, [("main", head)])
+
+    def test_b2_a_cutoff_after_the_included_target_still_merges(self):
+        path, git, base = self.repo()
+        self.code(path, git)                    # C, inclus dans H2
+        current, head = self.packet_with_target(path, git, base)
+        git("checkout", "-q", current)          # main revient sur C
+        landing = self.cutoff(path, git)        # D = coupure après C
+        self.frozen = head
+        self.armed(sha=head, composition=base)
+        gh = FakeGh(head=head, base_oid=landing, tests="success")
+        out = self.check(gh, checkout=path)
+        self.assertEqual(out["result"], "merged", out)
+        self.assertEqual(gh.landed, [("main", head)])
+
+    def test_b2_a_code_after_the_included_target_is_held(self):
+        path, git, base = self.repo()
+        self.code(path, git)                    # C, inclus dans H2
+        current, head = self.packet_with_target(path, git, base)
+        git("checkout", "-q", current)
+        moved = self.code(path, git, name="y.py")   # code après C
+        self.frozen = head
+        self.armed(sha=head, composition=base)
+        gh = FakeGh(head=head, base_oid=moved, tests="success")
+        out = self.check(gh, checkout=path)
+        self.assertEqual(out["result"], "disarmed", out)
+        self.assertEqual(gh.merges(), [])
 
     def test_the_review_gate_reads_the_composition_base(self):
         path, git, base = self.repo()
