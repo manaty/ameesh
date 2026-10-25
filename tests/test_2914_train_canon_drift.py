@@ -228,8 +228,8 @@ class WatchTest(unittest.TestCase):
         self.assertEqual(len(self.sent), 1)
         recipient, body, state = self.sent[0]
         self.assertIn("train.projects.ameesh.canon_commit", body)
-        self.assertIn("#1467", body)
-        self.assertIn("qualifier le commit de la porte", body)
+        self.assertIn("#3483", body)
+        self.assertIn("requalification relue requise", body)
         self.gate = ("c" * 40, "")
         self.watch.alert(None, self.watch.read(None), "shadow")
         self.assertEqual(len(self.sent), 2)

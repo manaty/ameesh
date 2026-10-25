@@ -2776,6 +2776,9 @@ def _unreachable_reviewer(row: Optional[Mapping], closed_hosts: set) -> str:
     """
     if row is None:
         return "absent from the registry"
+    # #3460 : un agent retiré ne reçoit plus de courrier, son siège est mort
+    if rd.is_retired(row):
+        return "retired"
     if (row.get("mode") or "execute") != "execute":
         return "mode %s" % (row.get("mode"),)
     status = str(row.get("status") or "").strip().lower()

@@ -4631,7 +4631,7 @@ class AgentWorker(threading.Thread):
             operation = handoffs.request(self.db, candidate, repository=remote)
             log("[%s] host handoff %s reserved to %s; waits for host preparation and lot boundary"
                 % (self.name, operation["id"], operation["target"]))
-        except (db_mod.DbError, handoffs.HandoffError, OSError, subprocess.SubprocessError):
+        except (db_mod.DbError, handoffs.HandoffError, ValueError, OSError, subprocess.SubprocessError):
             log("[%s] host handoff unavailable; source and worktree retained" % self.name)
         return False
 
@@ -5043,6 +5043,7 @@ class AgentWorker(threading.Thread):
             error="%s relay server credential failing" % auth_failure.STATUS_PREFIX,
             cost_usd=cost)
         self.last_activity = time.monotonic()
+        self._turn_end_mono = self.last_activity  # #3451
         return True
 
     def _pick_for_turn(self) -> dict | None:
@@ -5616,6 +5617,12 @@ class AgentWorker(threading.Thread):
         l'horloge de la base (`created_ts`) et depuis que cet exécuteur a vu
         le message (horloge monotone) : un décalage d'horloge entre l'hôte et
         la base ne retarde jamais un message de plus d'une fenêtre.
+
+        #3451 : la fenêtre court aussi depuis la fin du dernier tour de cet
+        exécuteur — un message arrivé pendant un long tour n'en rouvre pas un
+        2 à 6 s après le précédent, il attend que la fenêtre ait regroupé ce
+        qui suit. Le retard ajouté est au plus d'une fenêtre ; l'urgent et
+        l'humain n'attendent jamais.
         """
         window = self.mail_batch()
         if window <= 0 or any(mail.is_urgent(m) or self._from_human(m) for m in rows):
@@ -5629,6 +5636,9 @@ class AgentWorker(threading.Thread):
             kept[int(row["id"])] = first
             waited = max(waited, now - float(row.get("created_ts") or now), mono - first)
         self._batch_seen = kept  # les messages remis entre-temps sont oubliés
+        fin_tour = getattr(self, "_turn_end_mono", None)
+        if fin_tour is not None:
+            waited = min(waited, mono - fin_tour)
         if waited >= window:
             return True
         oldest = min(kept)
@@ -6725,6 +6735,24 @@ class AgentWorker(threading.Thread):
             self._resident_failures = 0
         return True, None
 
+    def _write_served_inputs(self, harness: str, ids, session, status: str) -> None:
+        """#3452 : l'attribution des messages servis, pour un tour non résident.
+
+        Les tours de harnais CLI n'écrivent ni `resident.turn` ni
+        `resident.inputs` : la colonne `turn_costs.inputs` restait vide pour
+        eux, et `cost turns --message` ne reliait aucun tour à son courrier.
+        L'événement est le même que pour Claude natif (même type, même lecture
+        par `cost.record`) ; une écriture ratée ne fait jamais échouer le tour,
+        seule l'attribution est perdue."""
+        from . import resident_runner
+        event = resident_runner.inputs_attribution(
+            harness, session=session or "", turn=self._turn_id or "",
+            inputs=ids, status=status)
+        if event is not None and not resident_runner.write_usage_event(
+                self._path("events.jsonl"), event):
+            log_async("[%s] turn inputs event not written: message attribution "
+                      "lost for this turn" % self.name)
+
     def _resident_turn_end(self, rp) -> None:
         """Fin d'un tour résident : dépublié ; le processus reste pour le tour
         suivant, sauf s'il est mort, si son tour n'a pas fini, ou si le tour
@@ -7122,6 +7150,12 @@ class AgentWorker(threading.Thread):
         turn_id = uuid.uuid4().hex
         self._turn_id = turn_id
         lot_du_tour = lot or self.agent.get("session_work_item") or None
+        # #3452 : le lot imputé au grand livre ne se replie pas sur le lot de
+        # session pour un tour de courrier sans lot (pilotage, courrier
+        # ambigu) — il n'y a pas travaillé. Les étiquettes de conteneurs
+        # gardent le lot de session (hygiène du dossier), pas la comptabilité.
+        lot_comptable = cost_mod.turn_attribution_lot(
+            spec, self.agent.get("session_work_item"))
         turn_label = containers_mod.turn_labels(
             turn_id, self.name, str(lot_du_tour) if lot_du_tour else None)
         identite = {
@@ -7282,7 +7316,8 @@ class AgentWorker(threading.Thread):
             self.fail_turn("accounting unavailable", "turn harness not written")
             return False
         if not self._compta_marque(events_start, label, model,
-                                   work_item_id=str(lot_du_tour) if lot_du_tour else None,
+                                   work_item_id=(str(lot_comptable)
+                                                 if lot_comptable else None),
                                    turn_id=turn_id):
             self.fail_turn("accounting unavailable",
                            "accounting marker not written")
@@ -7673,6 +7708,13 @@ class AgentWorker(threading.Thread):
                     if not ecrit:
                         error = error or erreur_flux
                         result_code = result_code or 1
+            else:
+                # #3452 : un tour non résident n'écrit aucune mesure résidente ;
+                # ses messages servis vont quand même au grand livre, sinon
+                # `cost turns --message` ne rend rien pour la majorité des tours.
+                self._write_served_inputs(
+                    harness, spec.get("ids") or (), session_new or session,
+                    "completed" if result_code == 0 and not error else "failed")
             # L498 : les descripteurs du READY ne survivent pas au tour (le
             # descripteur d'écriture est déjà fermé après le Popen).
             if ready_r is not None:
@@ -7899,6 +7941,7 @@ class AgentWorker(threading.Thread):
                     status="blocked", status_text=self.HOST_STATUS,
                     error="%s : %s" % (self.HOST_ERROR, hote), cost_usd=cost)
                 self.last_activity = time.monotonic()
+                self._turn_end_mono = self.last_activity  # #3451
                 if not self._power_texte:
                     self._host_not_ready(hote)
                 return False
@@ -7929,6 +7972,7 @@ class AgentWorker(threading.Thread):
                     status="blocked", status_text=texte,
                     error="%s %s" % (auth_failure.STATUS_PREFIX, raison_auth), cost_usd=cost)
                 self.last_activity = time.monotonic()
+                self._turn_end_mono = self.last_activity  # #3451
                 self._auth_note(nom_harnais, account, raison_auth, texte, turn=True)
                 return False
             session_fille_ecartee = bool(session and adapters.child_session_refused(error))
@@ -8014,6 +8058,7 @@ class AgentWorker(threading.Thread):
             error=error, cost_usd=cost,
         )
         self.last_activity = time.monotonic()
+        self._turn_end_mono = self.last_activity  # #3451
         self._backup_session(adapter, compte, session_new or session)
         if ok:
             self.session_turns += 1
@@ -8826,9 +8871,12 @@ class Runner:
         try:
             factory = handoff_factory.load(self._lifecycle_db)
         except handoff_factory.FactoryUnavailable as exc:
+            if getattr(self, "_lifecycle_gap", None) != exc.gap:
+                log_async("host lifecycle: " + exc.gap)
             self._lifecycle_gap = exc.gap
             self._lifecycle_db = None
             return
+        self._lifecycle_gap = None
         self._lifecycle_factory = factory
         self._lifecycle_adapter = factory.adapter
         self._lifecycle_requirements = factory.requirements_for
@@ -10613,6 +10661,11 @@ class Runner:
         """Drive durable requests with the enrolled helper, or record its named gap."""
         from . import handoffs, host_lifecycle
         try:
+            # An operator may finish enrollment after startup. Retry only an
+            # empty binding; a live operation keeps its factory until restart.
+            if (hasattr(self, "_lifecycle_factory")
+                    and self._lifecycle_factory is None):
+                self._bind_lifecycle()
             api = storage.of(db).host_lifecycle
             api.detect_losses(actor=self.runner_id,
                               older_than=int(host_lifecycle.staleness_s(

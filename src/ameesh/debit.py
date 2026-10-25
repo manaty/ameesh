@@ -27,7 +27,21 @@ humaines explicites (geste owner, go encore requis, décision owner due ou non
 signée, retour de l'owner, login/2FA, lot `waiting_human`) sont listées à part
 et ne font pas sortir 2 : le canon ne vise que les attentes d'agent. Une
 simple mention d'une règle ou d'une consigne de l'owner ne suffit pas, et un
-`hold_undeployed` n'est jamais humain.
+`hold_undeployed` n'est jamais humain. #3447 : les lots réservés à un exécutant
+externe déclaré (`external_executor`) sont, de même, listés à part (« attentes
+externes ») : ce n'est ni un lot sans assigné ni une attente d'agent, et ce
+n'est pas `--check` qui la pousse. #3498 : un hold peut nommer son exécutant
+externe et le geste attendu (`hold: attente bureau : …`,
+`hold: attente owner : …`) ; le débit le range dans les mêmes « attentes
+externes », avec une relance à cet exécutant — à l'échéance déclarée
+(`(due 2026-10-25 12:00 UTC)`), sinon après le seuil du débit — et non à
+l'agent. Une attente externe, même échue, ne fait pas sortir `--check` 2 : le
+rapport la relance à chaque passage.
+
+Un lot relu (tous ses avis rendus) dont `branch_target` est la branche d'un
+autre lot **ouvert** n'est pas une attente de paquet : il ne peut entrer
+qu'avec ce lot, dont le hold couvre déjà l'attente. Le rapport le marque
+`depends_on` et ne produit ni `qa_merge` ni sortie 2 pour lui (#3437).
 """
 from __future__ import annotations
 
@@ -67,6 +81,18 @@ _DUE = re.compile(r"\(due\s+([0-9]{4}-[0-9]{2}-[0-9]{2}[ T][0-9]{2}:[0-9]{2}"
                   r"(?::[0-9]{2})?(?:\s+[A-Za-z][A-Za-z0-9_/+-]*)?)\)")
 _PROGRAMMED = re.compile(r"\[réveil programmé\s*:\s*([^\]]+)\]", re.I)
 _VERSION = re.compile(r"\b(\d+)\.(\d+)\.(\d+)\b")
+#: une retenue qui attend un déploiement (#3497) : « pas/non/jamais déployé »,
+#: le verbe (« reste à déployer main »), et le nom dans une formule d'attente
+#: (« attente du déploiement », « inerte jusqu'au déploiement ») ou de
+#: constat. « déploiement » seul ne suffit pas : un compte rendu de bureau
+#: (« vidage de déploiement 06:02Z ») n'est pas une retenue.
+_UNDEPLOYED = re.compile(
+    r"(?:pas|non|jamais)(?:\s+encore)?\s+d[ée]ploy[ée]e?s?"
+    r"|\bd[ée]ployer\b"
+    r"|\b(?:à|reste[nt]?|attend(?:s|re|ons|ent)?|attente|en\s+attente|"
+    r"jusqu'au|avant|après|dès)\b[^.;]{0,60}\bd[ée]ploiement\b"
+    r"|\bd[ée]ploiement\s+(?:constat[ée]e?|non\s+constat[ée]e?|à\s+faire|"
+    r"attendu|requis|dû|pas\s+fait)\b", re.I)
 _DEVICE_TOKEN = re.compile(r"`([^`]+)`")
 _DEVICE_PHRASE = re.compile(r"\b((?:Mac|PC|portable|ordinateur)\s+de\s+[A-ZÉÈÀÂÎÔÛ][\w-]+)",
                             re.I)
@@ -95,6 +121,9 @@ GESTURES = {
                        "hors créneau (canon §11 bis) ou la levée du hold",
     "hold": "relancer le détenteur du hold ({who}) ; s'il est sans objet, "
             "demander sa levée au pilote",
+    "hold_external": "relancer {actor} sur le geste attendu : {gesture} "
+                     "(attente externe déclarée, pas un agent à assigner ; "
+                     "canon §10)",
     "wake_overdue": "réveiller l'assigné : le réveil programmé est échu",
 }
 
@@ -146,6 +175,33 @@ def installed_version() -> str:
 
 def _version_gt(left: tuple[int, int, int], right: tuple[int, int, int] | None) -> bool:
     return right is not None and left > right
+
+
+def _branch_name(value: Any) -> str:
+    """La branche courte d'une ref (`origin/lot/x`, `refs/heads/lot/x`)."""
+    name = str(value or "").strip()
+    for prefix in ("refs/heads/", "refs/remotes/origin/", "origin/"):
+        if name.startswith(prefix):
+            return name[len(prefix):]
+    return name
+
+
+def _target_lot(ident: int, item: Mapping[str, Any],
+                open_branches: Mapping[tuple[str, str], Iterable[int]]) -> int | None:
+    """Le lot ouvert dont `branch_target` est la branche, s'il existe (#3437).
+
+    La comparaison est faite par projet quand il est connu : deux projets
+    peuvent nommer la même branche. Un lot ne dépend jamais de lui-même."""
+    target = _branch_name(item.get("branch_target"))
+    if not target:
+        return None
+    app = str(item.get("app") or "")
+    found: set[int] = set()
+    for (branch_app, branch), lots in open_branches.items():
+        if branch != target or (app and branch_app and branch_app != app):
+            continue
+        found.update(int(lot) for lot in lots if int(lot) != int(ident))
+    return min(found) if found else None
 
 
 def _same_sha(left: Any, right: Any) -> bool:
@@ -357,8 +413,12 @@ def _terminal_at(milestones: list[dict]) -> float | None:
     return max(moments) if moments else None
 
 
-#: états d'un lot ouvert : une réouverture qui finit sur l'un d'eux tient
-_OPEN_STATES = ("intake", "build", "qa", "blocked", "waiting_human")
+#: états d'une vraie reprise de revue : le lot retravaille sa tête
+_OPEN_STATES = ("intake", "build", "qa")
+#: états d'une retenue de fermeture : le contenu est déjà dans la cible
+_CLOSURE_STATES = ("blocked", "waiting_human")
+#: états terminaux (le jalon, pas seulement la colonne)
+_TERMINAL_STATES = ("merged", "closed", "delivered")
 
 
 def _reopened(events: list[dict], terminal_ts: float | None) -> bool:
@@ -366,17 +426,77 @@ def _reopened(events: list[dict], terminal_ts: float | None) -> bool:
 
     Une note concurrente peut porter qa après la fusion (#1982), puis les
     notes suivantes merged. Un retour à merged annule une réouverture ; un lot
-    rouvert puis retenu (blocked, waiting_human) reste ouvert.
-    """
+    rouvert puis retenu (blocked, waiting_human) reste ouvert — mais seulement
+    s'il a vraiment repris (intake/build/qa) depuis le jalon : une écriture
+    `blocked` de fermeture après la fusion ne rouvre pas une revue (#3497,
+    #3444 classé `qa_merge` alors que son contenu était dans main)."""
     if terminal_ts is None:
         return False
     later = [e for e in events or ()
              if float(e.get("at_ts") or 0.0) > terminal_ts and e.get("state")]
     if not later:
         return False
-    latest = max(later, key=lambda e: (float(e.get("at_ts") or 0.0),
-                                       int(e.get("id") or 0)))
-    return str(latest["state"]) in _OPEN_STATES
+    resumed = False
+    latest_state = None
+    for event in sorted(later, key=lambda e: (float(e.get("at_ts") or 0.0),
+                                              int(e.get("id") or 0))):
+        state = str(event["state"])
+        if state in _OPEN_STATES:
+            resumed = True
+        elif state in _TERMINAL_STATES:
+            resumed = False
+        latest_state = state
+    if latest_state in _CLOSURE_STATES:
+        return resumed
+    return latest_state in _OPEN_STATES
+
+
+def _closure_holds(events: list[dict], terminal_ts: float | None,
+                   allowed=None) -> dict[str, dict]:
+    """Les retenues posées après le jalon terminal d'un lot fusionné (#3497).
+
+    Après une fusion, les écritures d'état du harnais (`merged` d'un
+    review-after-merge, `blocked` de la fermeture retenue) ne sont pas des
+    reprises : `active_holds` remet la retenue à zéro à chaque changement
+    d'état, ce qui perdait la retenue de fermeture de #3444 (`hold:` de
+    04:44:17, `merged` concurrent de 04:44:23). Une retenue posée dans cet
+    intervalle tient donc jusqu'à une levée ou une vraie reprise (`intake`,
+    `build`, `qa`) ; une retenue antérieure à la fusion est du ressort
+    d'`active_holds` et n'est jamais ressuscitée ici.
+
+    Les levées suivent #3219, sur l'autorité partagée `lift_authority` : un
+    auteur ne lève que sa retenue, un pilote lève toute celle du lot. Sans
+    prédicat (lecture brute), seul l'auteur est levé — jamais celle d'un
+    autre (relecture cx1 du 25/10 : un `unhold` ordinaire ne doit pas
+    effacer la retenue d'un pilote)."""
+    from . import planned_waits
+
+    if terminal_ts is None:
+        return {}
+    held: dict[str, dict] = {}
+    for event in sorted(events or (),
+                        key=lambda e: (float(e.get("at_ts") or 0.0),
+                                       int(e.get("id") or 0))):
+        if float(event.get("at_ts") or 0.0) <= terminal_ts:
+            continue
+        state = str(event.get("state") or "")
+        if state in _OPEN_STATES:
+            held = {}                   # vraie reprise : la retenue est finie
+        text = str(event.get("note") or "").strip()
+        if not text:
+            continue
+        who = event.get("actor") or ""
+        if planned_waits.is_hold_note(text):
+            held[who] = {"by": who or None,
+                         "since": float(event.get("at_ts") or 0.0),
+                         "note": text,
+                         "pilot": bool(allowed(who)) if allowed is not None else False}
+        elif planned_waits.is_lift_note(text):
+            if allowed is not None and allowed(who):
+                held = {}               # un pilote lève toute la retenue
+            else:
+                held.pop(who, None)     # l'auteur ne lève que la sienne
+    return held
 
 
 def _current_state(events: list[dict]) -> str | None:
@@ -611,8 +731,11 @@ def blocking_review(milestones: list[dict], freeze: dict | None) -> dict | None:
 
 # -- holds -------------------------------------------------------------------
 
-def _holds_from_events(events: list[dict]) -> dict[str, dict]:
-    """Repli sans base : la dernière retenue, levée par toute note de levée."""
+def _holds_from_events(events: list[dict], allowed=None) -> dict[str, dict]:
+    """Repli sans base : la dernière retenue, levée par toute note de levée.
+
+    `allowed` est l'autorité de levée (#3219) ; sans elle, seul l'auteur lève
+    sa retenue."""
     from . import planned_waits
 
     held: dict[str, dict] = {}
@@ -630,9 +753,14 @@ def _holds_from_events(events: list[dict]) -> dict[str, dict]:
         if planned_waits.is_hold_note(text):
             who = event.get("actor") or ""
             held[who] = {"by": who or None, "since": float(event.get("at_ts") or 0.0),
-                         "note": text, "pilot": False}
+                         "note": text,
+                         "pilot": bool(allowed(who)) if allowed is not None else False}
         elif planned_waits.is_lift_note(text):
-            held.pop(event.get("actor") or "", None)
+            who = event.get("actor") or ""
+            if allowed is not None and allowed(who):
+                held = {}               # un pilote lève toute la retenue
+            else:
+                held.pop(who, None)     # l'auteur ne lève que la sienne
     return held
 
 
@@ -674,8 +802,19 @@ def build(*, items: Iterable[Mapping[str, Any]],
           devices: Mapping[str, Any] | None = None,
           installed: str | None = None,
           holds: Mapping[int, Mapping[str, Mapping[str, Any]]] | None = None,
+          closure_allowed=None,
           ci_unreadable: Iterable[str] = ()) -> dict:
-    """Le rapport de débit, calculé sans I/O (témoins et tests)."""
+    """Le rapport de débit, calculé sans I/O (témoins et tests).
+
+    `closure_allowed` est l'autorité de levée (#3219) partagée par `read`
+    (`planned_waits.lift_authority`) : un pilote lève toute la retenue de
+    fermeture, un auteur ordinaire seulement la sienne. Sans elle (appel sans
+    base), une levée ne retire que la retenue de son propre auteur."""
+    # #3447 : le préfixe de journal est défini une fois, pour l'écrivain
+    # (`work.set_external_executor`) et ce lecteur. #3498 : même lecture pour
+    # la déclaration d'attente externe d'un hold.
+    from .storage.interface import EXTERNAL_EXECUTOR_NOTE
+    from . import planned_waits
     now = time.time() if now is None else float(now)
     installed = installed_version() if installed is None else str(installed)
     installed_triple = _version(installed)
@@ -694,19 +833,45 @@ def build(*, items: Iterable[Mapping[str, Any]],
         values.sort(key=lambda r: (float(r.get("at_ts") or 0.0), int(r.get("id") or 0)))
     state_by_lot = {ident: _current_state(values)
                     for ident, values in events_by_lot.items()}
+    #: le repli sans base ne connaît pas les rôles : il ne peut pas refuser
+    #: une déclaration faute de pilote (#3498).
+    holds_authoritative = holds is not None
     if holds is None:
-        holds = {ident: _holds_from_events(values)
+        holds = {ident: _holds_from_events(values, allowed=closure_allowed)
                  for ident, values in events_by_lot.items()}
     hold_by_lot = {int(ident): dict(value) for ident, value in (holds or {}).items()}
+    # #3497 : après un jalon terminal, une retenue de fermeture survit aux
+    # écritures d'état `merged`/`blocked` du harnais (voir `_closure_holds`).
+    # Un lot vraiment rouvert (build/qa après la fusion) relève d'`active_holds` :
+    # ses changements d'état sont réels et lèvent la retenue.
+    for ident, lot_milestones in milestones_by_lot.items():
+        terminal_ts = _terminal_at(lot_milestones)
+        if terminal_ts is None or _reopened(events_by_lot.get(ident, []), terminal_ts):
+            continue
+        closure = _closure_holds(events_by_lot.get(ident, []), terminal_ts,
+                                 allowed=closure_allowed)
+        entries = hold_by_lot.setdefault(ident, {})
+        for who, entry in closure.items():
+            current = entries.get(who)
+            if current is None or float(entry["since"]) > float(
+                    current.get("since") or 0.0):
+                entries[who] = entry
     held_lots = {ident for ident, entries in hold_by_lot.items() if entries}
+    #: branches des lots encore ouverts : une cible de lot qui en nomme une
+    #: est une dépendance (le lot entre avec son parent), pas un paquet dû.
+    open_branches: dict[tuple[str, str], list[int]] = {}
 
     qa: list[dict] = []
     blocked_reviews: list[dict] = []
     reviews_due: list[dict] = []
     holds_out: list[dict] = []
+    #: #3498 : une déclaration externe vaut pour le lot, pas seulement pour le
+    #: hold qui la porte ; les autres retenues du même lot sont couvertes.
+    external_by_lot: dict[int, dict] = {}
     wakes_out: list[dict] = []
     device_holds: list[dict] = []
     undeployed_holds: list[dict] = []
+    external_waits: list[dict] = []
     unreadable: list[str] = list(devices.get("unreadable") or ())
 
     for ident, item in by_id.items():
@@ -716,6 +881,38 @@ def build(*, items: Iterable[Mapping[str, Any]],
         terminal_ts = _terminal_at(lot_milestones)
         if terminal_ts is not None and _reopened(lot_events, terminal_ts):
             terminal_ts = None
+        # #3447 : un lot réservé à un exécutant externe n'est pas « sans
+        # assigné » ; il attend cet exécutant (bureau, owner), pas un agent.
+        # La mesure reste lue sur le journal : la déclaration nommée par
+        # `work.EXTERNAL_EXECUTOR_NOTE`, sinon la création du lot.
+        external = str(item.get("external_executor") or "").strip()
+        state = state_by_lot.get(ident)
+        if external and not (item.get("assignee") or "").strip() \
+                and terminal_ts is None and state in ("intake", "build"):
+            since = item.get("created_ts")
+            for event in lot_events:
+                text = str(event.get("note") or "")
+                if not text.startswith(EXTERNAL_EXECUTOR_NOTE):
+                    continue
+                at = event.get("at_ts")
+                if at is not None and (since is None or float(at) > float(since)):
+                    since = float(at)
+            age = _age(now, since)
+            external_waits.append({
+                "lot": ident, "title": item.get("title") or "",
+                "app": item.get("app") or None, "who": external,
+                "kind": "external", "state": state,
+                "since_ts": since, "since": _iso(since), "age_s": age,
+                "gesture": "the external executor %s acts (bureau/owner, not an "
+                           "agent); the pilot clears the reservation if it is no "
+                           "longer wanted (`ameesh work external-executor %d "
+                           "--clear`)" % (external, ident),
+            })
+        if terminal_ts is None:
+            branch = _branch_name(item.get("branch"))
+            if branch:
+                open_branches.setdefault(
+                    (str(item.get("app") or ""), branch), []).append(ident)
         if freeze is not None and terminal_ts is None:
             designation = designations(lot_milestones, lot_events)
             unreadable.extend("%s: %s" % (ident, text)
@@ -763,16 +960,26 @@ def build(*, items: Iterable[Mapping[str, Any]],
                     "gesture": GESTURES["review"].format(
                         who=review["name"], lot=ident)})
         # holds (les lots mergés peuvent encore attendre un déploiement)
+        lot_holds: list[dict] = []
         for hold in hold_by_lot.get(ident, {}).values():
             if terminal_ts is not None and float(hold.get("since") or 0.0) <= terminal_ts:
                 continue
             note = str(hold.get("note") or "")
             age = _age(now, hold.get("since"))
+            # #3498 : la déclaration externe est un geste de pilote ; un hold
+            # ordinaire qui la porte ne soustrait pas son lot à `--check`.
+            declared = planned_waits.external_hold(note)
+            if declared is not None and holds_authoritative \
+                    and hold.get("pilot") is False:
+                unreadable.append(
+                    "lot %d: external wait declared by %s, not a pilot hold: "
+                    "it stays an agent wait (#3498)"
+                    % (ident, hold.get("by") or "?"))
+                declared = None
             device = match_device(note, devices)
             versions = _versions(note)
             version = max(versions) if versions else None
-            undeployed = bool(re.search(r"pas\s+d[ée]ploy[ée]|non\s+d[ée]ploy[ée]",
-                                        note, re.I)) \
+            undeployed = bool(_UNDEPLOYED.search(note)) \
                 or any(_version_gt(item, installed_triple) for item in versions)
             entry = {
                 "lot": ident, "title": item.get("title") or "",
@@ -784,13 +991,23 @@ def build(*, items: Iterable[Mapping[str, Any]],
                 "device": device, "undeployed": undeployed,
                 "version": ".".join(str(p) for p in version) if version else None,
             }
+            if declared is not None:
+                entry["external"] = declared
             holds_out.append(entry)
+            lot_holds.append(entry)
             if device:
                 entry["device_unavailable"] = True
                 device_holds.append(entry)
             if undeployed:
                 entry["held_by_undeployed"] = True
                 undeployed_holds.append(entry)
+        declared_here = [entry for entry in lot_holds if entry.get("external")]
+        if declared_here:
+            chosen = max(declared_here,
+                         key=lambda entry: float(entry.get("since_ts") or 0.0))
+            external_by_lot[ident] = chosen
+            for entry in lot_holds:
+                entry["external_lot"] = True
         # réveils
         wake = wake_state(lot_events)
         if (wake is not None and wake.get("due_ts") is not None
@@ -808,8 +1025,23 @@ def build(*, items: Iterable[Mapping[str, Any]],
             }
             wakes_out.append(entry)
 
+    # Une cible qui est la branche d'un lot encore ouvert est une dépendance :
+    # le lot ne peut pas entrer seul dans un paquet, il suit le lot parent
+    # (dont le hold, s'il y en a un, porte déjà l'attente) (#3437).
+    dependents_by_lot: dict[int, list[int]] = {}
+    for row in qa:
+        parent = _target_lot(int(row["lot"]), by_id[int(row["lot"])], open_branches)
+        if parent is not None:
+            row["depends_on"] = parent
+            dependents_by_lot.setdefault(parent, []).append(int(row["lot"]))
+
     # -- tableau des attentes de plus de 2 h --------------------------------
     waits: list[dict] = []
+
+    def dependents_of(lot) -> dict:
+        """Les lots relus que ce lot transporte : leur attente est la sienne."""
+        children = dependents_by_lot.get(int(lot))
+        return {"dependents": sorted(children)} if children else {}
 
     def add_wait(kind, entry, since, who, gesture, level=1, human=False, **extra):
         age = _age(now, since)
@@ -839,8 +1071,11 @@ def build(*, items: Iterable[Mapping[str, Any]],
                      GESTURES["no_reviewer"].format(lot=row["lot"]),
                      human=_human_wait(state))
         else:
+            if row.get("depends_on"):
+                continue                # l'attente est celle du lot parent
             add_wait("qa_merge", row, row["frozen_ts"], "paquet",
-                     GESTURES["qa_merge"], level=2, human=_human_wait(state))
+                     GESTURES["qa_merge"], level=2, human=_human_wait(state),
+                     **dependents_of(row["lot"]))
     for row in blocked_reviews:
         add_wait("blocking_review", row, row["blocked_ts"],
                  row.get("assignee") or row.get("reviewer") or "auteur",
@@ -848,6 +1083,8 @@ def build(*, items: Iterable[Mapping[str, Any]],
                      who=row.get("assignee") or "l'auteur"), level=1,
                  human=_human_wait(state_by_lot.get(int(row["lot"]))))
     for row in holds_out:
+        if int(row["lot"]) in external_by_lot:
+            continue                    # #3498 : attente externe, pas d'agent
         state = state_by_lot.get(int(row["lot"]))
         # canon §11 bis : un correctif fusionné non déployé se traite sans
         # l'owner ; même une note qui cite une règle ou un go de l'owner ne
@@ -857,17 +1094,53 @@ def build(*, items: Iterable[Mapping[str, Any]],
         if row.get("device"):
             add_wait("hold_device", row, row["since_ts"], row.get("by") or "?",
                      GESTURES["hold_device"], level=2, device=row["device"],
-                     human=human)
+                     human=human, **dependents_of(row["lot"]))
         elif row.get("undeployed"):
             add_wait("hold_undeployed", row, row["since_ts"], row.get("by") or "?",
                      GESTURES["hold_undeployed"], level=2,
-                     version=row.get("version"), human=human)
+                     version=row.get("version"), human=human,
+                     **dependents_of(row["lot"]))
         else:
             add_wait("hold", row, row["since_ts"], row.get("by") or "?",
                      GESTURES["hold"].format(who=row.get("by") or "?"), level=2,
-                     human=human)
+                     human=human, **dependents_of(row["lot"]))
+    # #3498 : une attente externe déclarée par un hold ne relève pas de
+    # `--check` ; elle porte sa relance (échéance déclarée, sinon le seuil du
+    # débit), que le rapport répète à chaque passage.
+    for lot, row in external_by_lot.items():
+        declared = row["external"]
+        since = row.get("since_ts")
+        due_ts = (parse_wake_due("(due %s)" % declared["due"])
+                  if declared.get("due") else None)
+        if declared.get("due") and due_ts is None:
+            unreadable.append("lot %d: external hold due date unreadable: %s"
+                              % (lot, declared["due"]))
+        reminder_ts = due_ts
+        if reminder_ts is None and since is not None:
+            reminder_ts = float(since) + max(float(wait_s), 60.0)
+        external_waits.append({
+            "lot": lot, "title": row["title"], "app": row["app"],
+            "assignee": row.get("assignee"),
+            "who": declared["executor"], "kind": "hold_external",
+            "state": state_by_lot.get(lot),
+            "since_ts": since, "since": row.get("since"),
+            "age_s": row.get("age_s"),
+            "gesture": GESTURES["hold_external"].format(
+                actor=("le bureau" if declared["executor"] == "bureau"
+                       else "l'owner"),
+                gesture=declared["gesture"]),
+            "declared": declared["gesture"], "hold_by": row.get("by"),
+            "cause": row.get("cause"),
+            "due_ts": due_ts, "due": _iso(due_ts),
+            "reminder_ts": reminder_ts, "reminder": _iso(reminder_ts),
+            "reminder_due": bool(reminder_ts is not None and now >= reminder_ts),
+            **dependents_of(lot),
+        })
+    #: un réveil sur une attente externe relance l'assigné qui doit porter le
+    #: geste au bureau ; ce n'est pas une attente d'agent (#3498).
+    external_lots = set(external_by_lot)
     for row in wakes_out:
-        if row.get("overdue"):
+        if row.get("overdue") and int(row["lot"]) not in external_lots:
             add_wait("wake_overdue", row, row["due_ts"],
                      row.get("assignee") or "?",
                      GESTURES["wake_overdue"], level=1,
@@ -1020,6 +1293,9 @@ def build(*, items: Iterable[Mapping[str, Any]],
         "idle_with_work": len(idle_with_work),
         "slow_waits": len(slow_waits),
         "human_waits": len(human_waits),
+        "external_waits": len(external_waits),
+        "external_reminders": len([row for row in external_waits
+                                   if row.get("reminder_due")]),
         "slow_ci_runs": len([run for run in runs
                              if float(run["duration_s"]) > ci_slow_s]),
     }
@@ -1036,6 +1312,9 @@ def build(*, items: Iterable[Mapping[str, Any]],
         "totals": totals,
         "slow_waits": slow_waits,
         "human_waits": human_waits,
+        "external_waits": sorted(
+            external_waits,
+            key=lambda row: (-float(row.get("age_s") or 0.0), row["lot"])),
         "qa": sorted(qa, key=lambda row: (-float(row["age_s"] or 0.0), row["lot"])),
         "blocked_reviews": sorted(blocked_reviews,
                                   key=lambda row: (-float(row["age_s"] or 0.0),
@@ -1092,9 +1371,14 @@ def _rows(db, sql: str, params=()) -> list[dict]:
 
 
 #: les colonnes d'un lot lues sont des **étiquettes** (id, titre, projet,
-#: assigné) ; jamais state, reviewer(s), wake_at ni updated_at (canon 24/10).
+#: assigné, exécutant externe déclaré, instant de création, branche et cible) ;
+#: jamais state, reviewer(s), wake_at ni updated_at (canon 24/10). L'état
+#: courant d'un lot se lit au journal (`state_by_lot`), pas dans sa colonne.
 _ITEMS_SQL = """
-    SELECT w.id, w.title, w.app, w.assignee, w.priority
+    SELECT w.id, w.title, w.app, w.assignee, w.priority,
+           to_jsonb(w)->>'external_executor' AS external_executor,
+           extract(epoch FROM w.created_at)::float8 AS created_ts,
+           w.branch, w.branch_target
       FROM work_items w
      WHERE (EXISTS (SELECT 1 FROM work_item_milestones m
                      WHERE m.work_item_id = w.id AND m.at > to_timestamp(%s))
@@ -1230,12 +1514,16 @@ def read(db, *, cfg=None, now: float | None = None, hours: int = DEFAULT_HOURS,
     # Les retenues actives : la lecture d'autorité de #3219 (un hold de pilote
     # lève toute la retenue, celui d'un auteur ne lève que la sienne).
     holds: dict[int, dict] = {}
+    closure_allowed = None
     try:
         from . import planned_waits
         # `active_holds` lit `created_ts` (le nom du journal) ; la lecture SQL
         # porte `at_ts` comme le reste du module : on expose les deux.
         for event in events:
             event.setdefault("created_ts", event.get("at_ts"))
+        # La reconstruction des retenues de fermeture (#3497) partage la même
+        # autorité de levée que `active_holds` (#3219).
+        closure_allowed = planned_waits.lift_authority(db, cfg)
         holds = planned_waits.active_holds(db, events, cfg=cfg)
     except Exception as exc:  # noqa: BLE001 - repli nommé, jamais un hold inventé
         unreadable.append("holds unreadable: %s" % " ".join(str(exc).split())[:200])
@@ -1291,7 +1579,8 @@ def read(db, *, cfg=None, now: float | None = None, hours: int = DEFAULT_HOURS,
                    jobs=jobs_rows,
                    now=now, hours=hours, wait_s=wait_s, ci_hours=ci_hours,
                    ci_slow_s=ci_slow_s, devices=devices, installed=installed,
-                   holds=holds, ci_unreadable=ci_unreadable)
+                   holds=holds, closure_allowed=closure_allowed,
+                   ci_unreadable=ci_unreadable)
     report["unreadable"] = list(dict.fromkeys(list(report["unreadable"]) + unreadable))
     return report
 
@@ -1345,6 +1634,29 @@ def format_text(report: Mapping[str, Any]) -> str:
                             str(row.get("title") or "")[:48]))
     else:
         lines.append("Attentes humaines, hors --check : aucune.")
+    external = report.get("external_waits") or []
+    if external:
+        reminders = [row for row in external if row.get("reminder_due")]
+        lines.append("")
+        lines.append("Attentes externes, hors --check (%d) — exécutant déclaré, "
+                     "pas un agent à assigner%s :"
+                     % (len(external),
+                        " ; %d relance(s) due(s)" % len(reminders)
+                        if reminders else ""))
+        for row in external[:20]:
+            lines.append("  #%-6d %-16s %8s  %-22s %s"
+                         % (int(row.get("lot") or 0), str(row.get("kind")),
+                            _duration(row.get("age_s")),
+                            str(row.get("who") or "?")[:22],
+                            str(row.get("title") or "")[:48]))
+            lines.append("         → %s" % row.get("gesture"))
+            if row.get("reminder_due"):
+                lines.append("         ! relance due le %s — porter au %s (canon §10)"
+                             % (row.get("reminder") or "?",
+                                "bureau" if row.get("who") == "bureau"
+                                else "owner"))
+    else:
+        lines.append("Attentes externes, hors --check : aucune.")
     reviews = report.get("reviews_by_reviewer") or []
     lines.append("")
     lines.append("Avis dus par relecteur : %s" % (
@@ -1352,9 +1664,10 @@ def format_text(report: Mapping[str, Any]) -> str:
                                        _duration(row.get("oldest_age_s")))
                    for row in reviews[:12]) or "aucun"))
     lines.append("Holds : %d · réveils : %d · sur appareil indisponible : %d · "
-                 "sur correctif non déployé : %d"
+                 "sur correctif non déployé : %d · relances externes : %d"
                  % (totals.get("holds", 0), totals.get("wakes", 0),
-                    totals.get("device_holds", 0), totals.get("undeployed_holds", 0)))
+                    totals.get("device_holds", 0), totals.get("undeployed_holds", 0),
+                    totals.get("external_reminders", 0)))
     idle = report.get("idle_agents_with_work") or []
     if idle:
         lines.append("Agents au repos avec du travail dû : %s"
@@ -1408,8 +1721,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-jobs", action="store_true",
                         help="ne pas lire les jobs GitHub (durée par workflow seulement)")
     parser.add_argument("--check", action="store_true",
-                        help="sortir 2 si une attente non humaine dépasse le seuil "
-                             "(aucun « rien à signaler »)")
+                        help="sortir 2 si une attente d'agent dépasse le seuil "
+                             "(hors attentes humaines et externes, même avec une "
+                             "relance due ; aucun « rien à signaler »)")
     parser.add_argument("--canon", action="append", default=None,
                         help="racine d'un canon à lire pour les appareils (répétable)")
     parser.add_argument("--installed", default=None,

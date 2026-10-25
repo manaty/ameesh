@@ -228,6 +228,80 @@ class _ActivationFixture:
             (self.lot,)) if str(row["note"]).startswith(prefix)]
 
 
+class FreezeIntakeTest(_ActivationFixture, PgTestCase):
+    """#3467: an author freezes an intake lot without a pilot's state moves."""
+
+    def setUp(self):
+        super().setUp()
+        self.db.execute("UPDATE work_items SET state = 'intake' WHERE id = %s",
+                        (self.lot,))
+
+    def test_intake_freeze_enters_qa_and_designates_live_reviewers(self):
+        registry.upsert(self.db, "dead-reviewer", harness="codex", host=self.cfg.host,
+                        cwd=self.repo.root, status="dead")
+        self.db.execute("UPDATE agent_registry SET team = 'ameesh' WHERE name = %s",
+                        ("dead-reviewer",))
+        _mark, out = self.freeze()
+        item = work.get(self.db, self.lot)
+        self.assertEqual(item["state"], "qa")
+        self.assertEqual(set(designated(item)), {"r1", "r2"})
+        self.assertEqual(out["state"], rd.DESIGNATED)
+        self.assertEqual([m["recipient"] for m in self.mailbox()], ["r1", "r2"])
+        moves = self.db.query(
+            "SELECT state, actor FROM work_item_events WHERE work_item_id = %s"
+            " AND note LIKE %s ORDER BY id", (self.lot, "%frozen (#3467)"))
+        self.assertEqual([(r["state"], r["actor"]) for r in moves],
+                         [("build", "author"), ("qa", "author")])
+
+    def test_pinned_freeze_keeps_process_state_and_designates_reviewers(self):
+        for state in ("intake", "build"):
+            with self.subTest(state=state):
+                self.db.execute(
+                    "UPDATE work_items SET state = %s, workflow_ref = %s WHERE id = %s",
+                    (state, "process:delivery@revision", self.lot))
+                mark, out = self.freeze()
+                item = work.get(self.db, self.lot)
+                self.assertEqual(item["state"], state)
+                self.assertEqual(item["workflow_ref"], "process:delivery@revision")
+                self.assertEqual(set(designated(item)), {"r1", "r2"})
+                self.assertEqual(out["state"], rd.DESIGNATED)
+                self.assertIn(mark["id"], [m["id"] for m in
+                                         work.milestones(self.db, self.lot)])
+        self.assertEqual({m["recipient"] for m in self.mailbox()}, {"r1", "r2"})
+        self.assertEqual(self.db.query(
+            "SELECT id FROM work_item_events WHERE work_item_id = %s"
+            " AND note LIKE %s", (self.lot, "%frozen (#3467)")), [])
+
+    def test_hook_failure_rolls_back_state_and_freeze(self):
+        before = len(work.milestones(self.db, self.lot))
+
+        def fail(tx, mark, threads):
+            self.assertEqual(work.get(tx, self.lot)["state"], "qa")
+            raise RuntimeError("designation failed")
+
+        with self.assertRaisesRegex(RuntimeError, "designation failed"):
+            self.freeze(hook=fail)
+        self.assertEqual(work.get(self.db, self.lot)["state"], "intake")
+        self.assertEqual(len(work.milestones(self.db, self.lot)), before)
+        self.assertEqual(self.db.query(
+            "SELECT id FROM work_item_events WHERE work_item_id = %s"
+            " AND note LIKE %s", (self.lot, "%frozen (#3467)")), [])
+
+    def test_refreeze_in_qa_does_not_repeat_the_transition(self):
+        self.freeze()
+        self.freeze()
+        self.assertEqual(work.get(self.db, self.lot)["state"], "qa")
+        rows = self.db.query(
+            "SELECT id FROM work_item_events WHERE work_item_id = %s"
+            " AND note LIKE %s", (self.lot, "%frozen (#3467)"))
+        self.assertEqual(len(rows), 2)
+
+    def test_freeze_does_not_lift_a_blocked_state(self):
+        work.move(self.db, self.lot, "blocked", actor="author")
+        self.freeze()
+        self.assertEqual(work.get(self.db, self.lot)["state"], "blocked")
+
+
 class ActivationTest(_ActivationFixture, PgTestCase):
     """The freeze hook against a real database and a real frozen repository."""
 

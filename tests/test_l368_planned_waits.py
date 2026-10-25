@@ -733,10 +733,10 @@ class PgTest(PgTestCase):
                                actor="mesh-design")
         self.assertEqual(stagnation.stagnant_lots(self.db, now=self.now), [])
         row = plan.annotate(self.db, [work.get(self.db, waiting["id"])], now=self.now)[0]
-        label = "landing on vehicle #%d (intake, head %s) until %s" % (
+        label = "landing on vehicle #%d (qa, head %s) until %s" % (
             vehicle["id"], vehicle_head[:12], until)
         self.assertEqual(row["planned_wait"],
-                         {"what": "landing", "vehicle": vehicle["id"], "step": "intake",
+                         {"what": "landing", "vehicle": vehicle["id"], "step": "qa",
                           "head": vehicle_head, "until": until})
         self.assertIsNone(row["stale"])
         self.assertEqual(row["waiting_for"]["label"], label)

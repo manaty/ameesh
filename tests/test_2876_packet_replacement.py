@@ -13,9 +13,11 @@ OLD = "2026-10-20T11:37:57Z"
 NEW = "2026-10-20T12:20:00Z"
 
 
-def check(name, conclusion="SUCCESS", *, workflow="tests", end=NEW, run=None):
+def check(name, conclusion="SUCCESS", *, workflow="tests", end=NEW, run=None,
+          url=None):
     run = run or (100 if workflow == "paquet" else 200)
-    return {"detailsUrl": f"https://github.com/manaty/ameesh/actions/runs/{run}/job/123",
+    url = url or f"https://github.com/manaty/ameesh/actions/runs/{run}/job/123"
+    return {"detailsUrl": url,
             "__typename": "CheckRun", "name": name, "workflowName": workflow,
             "status": "COMPLETED", "conclusion": conclusion,
             "startedAt": "2026-10-20T11:17:30Z", "completedAt": end}
@@ -111,6 +113,27 @@ class PacketReplacementTest(unittest.TestCase):
         rows = witness()
         for ordered in (rows, rows[::-1]):
             self.assert_gate(ordered, True)
+
+    def test_aggregate_detail_check_on_packet_suite_does_not_hide_proof(self):
+        # #3494 (h-15) : la forge rattache les checks publiés par les étapes
+        # du workflow appelé (détail de l'agrégat, flux des parts) à la suite
+        # `paquet` de la tête, et leurs detailsUrl (`/runs/<check-id>`) ne
+        # désignent aucun run Actions. Ils ne prouvent pas le portier : ils ne
+        # doivent pas rendre la preuve illisible (sentinelle `paquet (run
+        # proof unavailable)`), mais garder leurs propres portes.
+        detail = check(radar.AGGREGATE_DETAIL_CHECK, workflow="paquet",
+                       url="https://github.com/manaty/ameesh/runs/121076492312")
+        flux = check("tests (flux) psql 1/16", workflow="paquet",
+                     url="https://github.com/manaty/ameesh/runs/121076818019")
+        self.assert_gate(witness() + [detail, flux], True)
+        # Un détail ou un flux rouge reste un négatif prouvé : il bloque.
+        self.assert_gate(witness() + [dict(detail, conclusion="FAILURE"), flux], False)
+        self.assert_gate(witness() + [detail, dict(flux, conclusion="FAILURE")], False)
+        # Un check du portier inconnu (hors flux et agrégat) garde la preuve
+        # stricte : une URL illisible ne permet aucun remplacement.
+        unknown = check("security", workflow="paquet",
+                        url="https://github.com/manaty/ameesh/runs/121076818019")
+        self.assert_gate(witness() + [unknown], False)
 
     def test_missing_skipped_failed_or_pending_pr_never_replaces_packet(self):
         rows = witness()
