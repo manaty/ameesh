@@ -1721,7 +1721,8 @@ class WorkItems(Domain):
     def queue_add(self, item_id: int, *, target: str, frozen_sha: str, note: str,
                   actor: str, source: str = "", frozen_id: int | None = None,
                   packet: dict | None = None, packet_initial: bool = False,
-                  lease: tuple | None = None) -> dict | None:
+                  lease: tuple | None = None,
+                  withdrawn_after: float | None = None) -> dict | None:
         """L160e (0058): puts (or puts back) the lot in the merge queue of
         `target`, state `queued`, with a journal line; `source`: the
         repository it was queued from (`merge_queue.source_of`). None if the
@@ -1737,7 +1738,10 @@ class WorkItems(Domain):
         provider: absence of a queue row cannot prove never-withdrawn for
         historical lots. It cannot override a recorded withdrawal.
         `lease` (#1467): optional `(target key, owner, epoch)`, locked after
-        the lot and checked live before allocation/replay, in this transaction."""
+        the lot and checked live before allocation/replay, in this transaction.
+        `withdrawn_after` (#3532): an epoch instant; refuses (None) when a
+        typed `removed` receipt of the lot was written at or after it, read
+        under the lot row lock that `queue_remove` takes first."""
 
     @abc.abstractmethod
     def queue_update(self, item_id: int, *, state: str | None = None,
@@ -1765,6 +1769,11 @@ class WorkItems(Domain):
         Locks the lot before its queue row and records a typed `removed`
         receipt for the deleted row's freeze in the same transaction.
         A free-text journal note cannot write this receipt."""
+
+    @abc.abstractmethod
+    def queue_withdrawn_since(self, item_id: int, since_ts: float) -> float | None:
+        """#3532: the epoch instant of the lot's latest typed `removed`
+        receipt written at or after `since_ts`, None without one."""
 
     @abc.abstractmethod
     def land_lock(self, key: str, owner: str, ttl_s: float, *,

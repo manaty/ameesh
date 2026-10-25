@@ -42,6 +42,7 @@ import os
 import re
 import shutil
 import tempfile
+import time
 from collections.abc import Mapping
 from types import SimpleNamespace
 
@@ -62,6 +63,11 @@ class QueueError(RuntimeError):
     """A lot that cannot enter the queue: actionable message."""
 
 
+class QueueWithdrawn(QueueError):
+    """#3532: the lot was taken out of the queue after the gesture that
+    wanted to put it back (`enter(withdrawn_after=…)`)."""
+
+
 class RegistryReadError(QueueError):
     """#2521 : le registre des agents n'a pas pu être lu.
 
@@ -73,6 +79,10 @@ class RegistryReadError(QueueError):
 # --------------------------------------------------------------------------
 # entering and leaving
 # --------------------------------------------------------------------------
+
+def _utc(ts: float) -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(ts))
+
 
 def _same(a: str | None, b: str | None) -> bool:
     """Two full commit ids, equal (never a prefix: `readiness` resolves them)."""
@@ -2466,11 +2476,17 @@ def required_full_ci(project, sha: str, full_ci=None, *, lot=None) -> None:
 
 
 def enter(db, lot: int, *, repo: str, actor: str = "", ci="github", project=None,
-          clone=None, commit_ci=None, full_ci=None, cfg=None, parts=None) -> dict:
+          clone=None, commit_ci=None, full_ci=None, cfg=None, parts=None,
+          withdrawn_after: float | None = None) -> dict:
     """Puts `lot` into the queue of its target, once `readiness` passes.
     `parts` is `readiness`'s (L1651): the caller that requalifies a lot (§12
     package manifest) passes the due contexts it vouches for, `()` to disable
-    the per-lot proof for that gesture."""
+    the per-lot proof for that gesture.
+
+    #3532: `withdrawn_after` (epoch instant) is the gesture's own date — the
+    fire's grant for its fallback. A take-out written since then is final
+    for that gesture: `QueueWithdrawn`, checked again in the insertion's
+    transaction."""
     # L165 (EP4) : l'entrée en file est un geste du pilote hors base (la file
     # poussera). Le bail élu est vérifié avant les lectures de préparation et
     # journalisé dans la transaction de l'écriture ; le radar et un humain ne
@@ -2499,6 +2515,8 @@ def enter(db, lot: int, *, repo: str, actor: str = "", ci="github", project=None
         waived_note = ", verdict waived by %s (#1979)" % (
             ready.get("waived_by") or "pilot")
 
+    guard = {} if withdrawn_after is None else {"withdrawn_after": withdrawn_after}
+
     def add(tx):
         return storage.of(tx).work.queue_add(
             lot, target=ready["target"], frozen_sha=ready["frozen_sha"],
@@ -2508,7 +2526,7 @@ def enter(db, lot: int, *, repo: str, actor: str = "", ci="github", project=None
                 ", PR #%s green" % ready["pr"] if ready["pr"] else "",
                 ready.get("class") or "?", " (%s)" % ready["class_why"]
                 if ready.get("class_why") else "", parts_note, waived_note),
-            actor=actor)
+            actor=actor, **guard)
 
     if fence is None:
         row = add(db)
@@ -2517,6 +2535,11 @@ def enter(db, lot: int, *, repo: str, actor: str = "", ci="github", project=None
             fence.hold(tx)
             row = add(tx)
     if row is None:
+        if withdrawn_after is not None:
+            at = storage.of(db).work.queue_withdrawn_since(lot, withdrawn_after)
+            if at is not None:
+                raise QueueWithdrawn("lot #%d was taken out of the queue at %s"
+                                     % (lot, _utc(at)))
         raise QueueError("lot #%d is no longer open" % lot)
     # L539 : la classe lue à l'entrée, rendue avec la ligne de file (lecture)
     row["class"] = ready.get("class")
@@ -2537,6 +2560,28 @@ def leave(db, lot: int, *, actor: str = "", reason: str = "") -> bool:
         return storage.of(tx).work.queue_remove(
             lot, note="merge queue: taken out%s" % (" (%s)" % reason if reason else ""),
             actor=actor)
+
+
+def live_train(cfg, db, lot: int) -> dict | None:
+    """#3532: the live train whose plan carries `lot` (`{key, stamp, phase}`),
+    None otherwise. Its withdrawal condemns that train: `queue remove` says so
+    without refusing. Best effort: an unreadable train is no warning."""
+    from .train import TERMINAL
+    try:
+        ops = storage.of(db).work
+        row = next((r for r in ops.queue() if int(r["work_item_id"]) == lot), None)
+        if row is None:
+            return None
+        for name in sorted(declared_projects(cfg)):
+            key = "%s:%s" % (name, _remote_branch(row["target"]))
+            state = ops.train_read(key) or {}
+            members = (state.get("plan") or {}).get("members") or ()
+            if state.get("phase") not in TERMINAL and \
+                    any(int(m.get("work_item_id") or 0) == lot for m in members):
+                return {"key": key, "stamp": state.get("stamp"), "phase": state.get("phase")}
+    except Exception:  # noqa: BLE001 - an advisory read never blocks the gesture
+        return None
+    return None
 
 
 # --------------------------------------------------------------------------
@@ -3134,8 +3179,16 @@ def run(cfg, db, args) -> int:
                                  row.get("class") or "?"))
             return 0
         if args.queue_command == "remove":
+            train = live_train(cfg, db, args.id)
             done = leave(db, args.id, actor=args.actor, reason=args.message)
-            print(json.dumps({"lot": args.id, "removed": done}) if args.json else
+            if done and train:
+                print("warning: lot #%d is a member of the live train %s (%s, phase %s): "
+                      "this take-out invalidates it; it lands nothing and frees the target "
+                      "once its CI ends" % (args.id, train["stamp"] or "?", train["key"],
+                                            train["phase"]), file=sys.stderr)
+            print(json.dumps(dict({"lot": args.id, "removed": done},
+                                  **({"train": train} if done and train else {})))
+                  if args.json else
                   "lot #%d %s" % (args.id, "taken out of the queue" if done
                                   else "was not queued"))
             return 0
