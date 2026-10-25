@@ -174,6 +174,44 @@ class AlarmOutcomeTest(unittest.TestCase):
                          'revoked_epoch')
 
 
+class ContractOutcomeTest(unittest.TestCase):
+    def main(self, error, *, executed):
+        import io
+        import struct
+        module = mock.Mock()
+        module.Uncertain = type('Uncertain', (Exception,), {})
+        channel = mock.Mock(family=socket.AF_UNIX, type=socket.SOCK_STREAM)
+        channel.getsockopt.return_value = struct.pack('3i', 42, 1001, 1001)
+
+        def serve(channel, rules, effect):
+            if executed:
+                effect(request())
+            raise error
+
+        with mock.patch.object(dispatch.os, 'geteuid', return_value=0), \
+                mock.patch.object(dispatch.os, 'dup', return_value=123), \
+                mock.patch.object(dispatch, 'executor', return_value=module), \
+                mock.patch.object(dispatch, 'policy', return_value={}), \
+                mock.patch.object(dispatch, 'consistent_policy'), \
+                mock.patch.object(dispatch.signal, 'signal'), \
+                mock.patch.object(dispatch.signal, 'alarm'), \
+                mock.patch.object(dispatch.socket, 'socket', return_value=channel), \
+                mock.patch.object(dispatch, 'serve', side_effect=serve), \
+                mock.patch.object(dispatch.sys, 'stderr', new_callable=io.StringIO) as log:
+            self.assertEqual(dispatch.main([]), 1)
+        return log.getvalue()
+
+    def test_contract_error_after_execute_is_uncertain(self):
+        error = dispatch.handoff_contract.ContractError('receipt')
+        self.assertEqual(self.main(error, executed=True),
+                         'local_handoff_uncertain pid=42 uid=1001\n')
+
+    def test_contract_error_before_execute_is_refused(self):
+        error = dispatch.handoff_contract.ContractError('secret')
+        self.assertEqual(self.main(error, executed=False),
+                         'local_handoff_refused pid=42 uid=1001\n')
+
+
 class ClientBoundaryTest(unittest.TestCase):
     def channel(self, uid=0, output=b'{}'):
         import struct
