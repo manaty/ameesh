@@ -87,3 +87,6 @@ nommé. Si un effet est incertain, réconcilier et quiescer l'époque avant
 rejeu ; après switch, reprendre en avant sur la cible. Ne jamais redémarrer
 aveuglément la source lors d'un retour au code précédent. La procédure et les
 preuves de quiescence sont celles de [HOST-HANDOFFS](HOST-HANDOFFS.md).
+
+Le [manifeste par hôte](ops/handoff-staging-enrollment.md) distingue les
+observations, les propositions soumises à décision et les manques refusants.
