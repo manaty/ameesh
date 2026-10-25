@@ -370,6 +370,32 @@ def _ancestor(repo: str, tip: str, base: str) -> bool:
     return proc.returncode == 0
 
 
+def _stack_order(repo: str, prepared: list) -> list:
+    """Les membres préparés, chaque prédécesseur empilé avant ses successeurs.
+
+    `prepared` est rangé par numéro de lot. Un membre dont la tête gelée est
+    ancêtre de celle d'un autre est lu avant lui, quels que soient leurs
+    numéros (#3516) : sa tête admise doit déjà couvrir la provenance héritée
+    quand la porte du successeur la lit. Entre membres sans lien d'ascendance,
+    l'ordre des numéros reste celui de la lecture. Deux têtes identiques ne se
+    précèdent pas.
+    """
+    heads = [item["frozen"] for item in prepared]
+    before = {index: set() for index in range(len(prepared))}
+    for later, head in enumerate(heads):
+        for earlier, other in enumerate(heads):
+            if other != head and _ancestor(repo, other, head):
+                before[later].add(earlier)
+    ordered: list = []
+    done: set = set()
+    while len(ordered) < len(prepared):
+        # Une ascendance stricte n'a pas de cycle : un membre prêt existe.
+        index = min(i for i in before if i not in done and before[i] <= done)
+        done.add(index)
+        ordered.append(prepared[index])
+    return ordered
+
+
 def _packet_base(db, vehicle: int, repo: str, head: str, target: str) -> tuple[str, str]:
     """La base enregistrée de la composition du véhicule, prouvée sur la cible.
 
@@ -474,6 +500,7 @@ def need(db, vehicle: int, row, marks, repo: str, base: str, head: str,
     production_cache = {}
     admitted_sources = []
     constituents = []
+    prepared = []
     for entry in found:
         lot = int(entry["lot"])
         try:
@@ -519,6 +546,19 @@ def need(db, vehicle: int, row, marks, repo: str, base: str, head: str,
                     "why": "constituent #%d: composed source %s does not carry its "
                            "frozen head %s" % (lot, resolved[:12], frozen[:12]),
                     "members": found, "own_paths": []}
+        prepared.append({"entry": entry, "lot": lot, "row": member_row,
+                         "marks": member_marks, "frozen": frozen})
+    # #3516 : les portes se lisent dans l'ordre de l'empilement, pas des
+    # numéros. Un prédécesseur de numéro supérieur, lu trop tard, ne couvrait
+    # pas encore les commits que son successeur hérite de lui.
+    try:
+        prepared = _stack_order(repo, prepared)
+    except VehicleError as exc:
+        return {"ok": False, "required": None, "klass": None,
+                "why": str(exc), "members": found, "own_paths": []}
+    for item in prepared:
+        entry, lot, frozen = item["entry"], item["lot"], item["frozen"]
+        member_row, member_marks = item["row"], item["marks"]
         # L'avis du membre se lit sur SA tête gelée et SA classe, pas sur le
         # diff du paquet (#2766).
         try:
