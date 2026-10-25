@@ -215,12 +215,35 @@ class BiasEpisodeTest(unittest.TestCase):
         estimates._date_bias(higher, {"published_ts": 2500.0, "body": body})
         tier = self._alert({"id": 14, "published_ts": 3100.0, "body": higher})
         self.assertNotEqual(notify.key_of(first), notify.key_of(tier))
-        self.assertEqual(tier["reason"], "bias-level-2")
+        self.assertTrue(tier["reason"].startswith("bias-level-2"))
         # le sens inverse aussi
         over = self._body(4000.0, 0.3)
         estimates._date_bias(over, None)
         inverted = self._alert({"id": 15, "published_ts": 4100.0, "body": over})
         self.assertNotEqual(notify.key_of(first), notify.key_of(inverted))
+
+    def test_retour_a_un_palier_deja_vu_est_un_nouvel_episode(self):
+        # #3502 : le registre `notified` retient 30 jours ; un retour au
+        # palier 2 après un passage au palier 1 doit donc produire une clé
+        # neuve, sinon la seconde montée ne serait jamais renvoyée.
+        first = self._body(1000.0, 3.0)
+        estimates._date_bias(first, None)
+        up = self._body(2000.0, 4.2)
+        estimates._date_bias(up, {"published_ts": 1500.0, "body": first})
+        down = self._body(3000.0, 3.2)
+        estimates._date_bias(down, {"published_ts": 2500.0, "body": up})
+        up2 = self._body(4000.0, 4.2)
+        estimates._date_bias(up2, {"published_ts": 3500.0, "body": down})
+        keys = [notify.key_of(self._alert({"id": i, "published_ts": ts, "body": body}))
+                for i, (body, ts) in enumerate(
+                    ((first, 1100.0), (up, 2100.0), (down, 3100.0), (up2, 4100.0)),
+                    start=12)]
+        self.assertEqual(len(set(keys)), 4)
+        # republier le dernier état ne change pas la clé du dernier épisode
+        again = self._body(5000.0, 4.2)
+        estimates._date_bias(again, {"published_ts": 4500.0, "body": up2})
+        self.assertEqual(notify.key_of(self._alert(
+            {"id": 16, "published_ts": 5100.0, "body": again})), keys[-1])
 
     def test_table_ancienne_garde_la_cle_du_niveau_1(self):
         # une table publiée avant le correctif n'a pas de dates d'épisode : le

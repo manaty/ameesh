@@ -484,6 +484,29 @@ def bias_state(ratio, low: float = BIAS_LOW, high: float = BIAS_HIGH):
     return side, bias_level(ratio, low, high)
 
 
+def bias_reason(level, tier_since, biased_since) -> str | None:
+    """#3502 : la partie de la clé qui nomme l'épisode de palier.
+
+    `bias-level-N` pour un palier supérieur, None pour le palier 1 du premier
+    épisode (la clé de niveau 1 d'une table antérieure est ainsi conservée).
+    Quand le palier a changé depuis l'entrée en biais, son début (`tier_since`)
+    suffixe la raison (`…@<epoch>`) : un retour à un palier déjà vu est un
+    nouvel épisode, et ne se confond pas avec la notification du précédent
+    (le registre `notified` de `notify` retient 30 jours)."""
+    if level is None:
+        return None
+    token = ""
+    try:
+        if tier_since is not None and biased_since is not None \
+                and float(tier_since) != float(biased_since):
+            token = "@%.3f" % float(tier_since)
+    except (TypeError, ValueError):
+        token = ""
+    if level > 1:
+        return "bias-level-%d%s" % (level, token)
+    return "bias-tier%s" % token if token else None
+
+
 def build_reference(rows: list[dict], agents: dict | None = None, *,
                     now: float | None = None) -> dict:
     """La table `ameesh-estimate-reference/1` depuis les lots livrés
@@ -569,12 +592,13 @@ def _date_bias(body: dict, previous: dict | None) -> None:
 
     `biased_since` est l'entrée dans le biais (même sens, paliers confondus) :
     c'est le `since` de l'alerte, stable d'une republication à l'autre.
-    `tier_since` date le couple (sens, palier) courant ; il est conservé dans
-    la table, et le palier entre dans l'identité de l'alerte (`reason`) pour
-    qu'un cran supérieur soit un nouvel épisode. Sans table précédente datée
-    (publication d'une version antérieure), le repli est `published_ts` de
-    cette table : la clé de niveau 1 déjà posée dans `notify` n'est pas
-    changée au déploiement (#3502)."""
+    `tier_since` date le couple (sens, palier) courant ; quand il diffère de
+    l'entrée en biais, il entre dans la raison de l'alerte (`bias_reason`) :
+    un changement de palier, et même un retour à un palier déjà vu, est un
+    nouvel épisode. Sans table précédente datée (publication d'une version
+    antérieure), le repli est `published_ts` de cette table : la clé de
+    niveau 1 déjà posée dans `notify` n'est pas changée au déploiement
+    (#3502)."""
     low, high = body.get("bias_range") or (BIAS_LOW, BIAS_HIGH)
     old_body = (previous or {}).get("body") or {}
     old_low, old_high = old_body.get("bias_range") or (BIAS_LOW, BIAS_HIGH)
