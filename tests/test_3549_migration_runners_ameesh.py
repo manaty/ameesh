@@ -307,6 +307,9 @@ class Banc(unittest.TestCase):
         self.assertEqual(rc, 0)
         self.assertTrue((self.source_home / ".config/ameesh/git-agents.conf").is_file())
         self.assertTrue(self.faux.a_appele("systemctl --user start"))
+        arrets = self.faux.a_appele("systemctl --user stop")
+        self.assertTrue(arrets)
+        self.assertTrue(all("--no-block" in " ".join(a) for a in arrets))
         self.assertTrue(self.faux.a_appele("systemctl --user disable"))
         self.assertTrue(self.faux.a_appele("systemctl --user enable"))
         self.assertEqual(M.lit_etat(self.ctx)["stage"], "retour")
@@ -371,7 +374,9 @@ class Banc(unittest.TestCase):
         self.assertEqual(final["stage"], "bascule")
         self.assertIn("courrier test livré", final["preuve_courrier"])
         self.assertEqual(set(final["actifs"]), {"ameesh-dev1", "codex2"})
-        self.assertTrue(self.faux.a_appele("systemctl --user stop"))
+        arrets = self.faux.a_appele("systemctl --user stop")
+        self.assertTrue(arrets)
+        self.assertTrue(all("--no-block" in " ".join(a) for a in arrets))
         self.assertTrue(self.faux.a_appele("systemctl --user start"))
         self.assertTrue(self.faux.a_appele("systemctl --user disable"))
         self.assertTrue(self.faux.a_appele("systemctl --user enable"))
@@ -412,6 +417,155 @@ class Banc(unittest.TestCase):
         self.assertTrue((self.ctx.etat_dir / "sauvegarde/.config/systemd/user/"
                          "ameesh-runner-agent@.service.d/cles-owner.conf").is_file())
         self.assertIn("pieces_retirees", etat)
+
+    # ------------------------------------------------------------------
+    # régressions de la relecture dev1 (4 bloquants)
+    # ------------------------------------------------------------------
+
+    def test_preparer_venv_activer_sans_src(self):
+        """B1 : `bascule.py activer` refuse `--src` ; seule `preparer` le prend."""
+        destination = self.cible_home / ".local/share/ameesh/src-abcdef0"
+        (destination / "deploy/mise-a-jour").mkdir(parents=True)
+        (destination / "deploy/mise-a-jour/bascule.py").write_text("# faux\n")
+        M.preparer_venv(self.ctx)
+        commandes = [" ".join(appel) for appel in self.faux.appels
+                     if "deploy/mise-a-jour/bascule.py" in " ".join(appel)]
+        preparer = [c for c in commandes if " preparer " in c]
+        activer = [c for c in commandes if " activer " in c]
+        self.assertEqual(len(preparer), 1, commandes)
+        self.assertEqual(len(activer), 1, commandes)
+        self.assertIn("--src", preparer[0])
+        self.assertNotIn("--src", activer[0])
+        self.assertIn("--version", activer[0])
+
+    def test_preparer_refuse_espace_insuffisant_avant_copie(self):
+        """B3 : l'espace est vérifié avant la première copie, pas pendant."""
+        besoin = M.besoin_espace(self.ctx)
+        self.assertGreater(besoin["home"], 0)
+        with mock.patch.object(M.shutil, "disk_usage",
+                               return_value=mock.Mock(free=1024)):
+            with self.assertRaises(M.Refus) as refus:
+                M.verifier_espace(self.ctx, {"home": 10**12, "development": 0})
+        self.assertIn("espace insuffisant", str(refus.exception))
+        # la garde est bien branchée avant toute copie
+        with mock.patch.object(M, "creer_compte"), \
+                mock.patch.object(M, "preparer_dossiers"), \
+                mock.patch.object(M, "verifier_espace",
+                                  side_effect=M.Refus("plein")) as garde, \
+                mock.patch.object(M, "preparer_config") as copie:
+            with self.assertRaises(M.Refus):
+                M.preparer(self.ctx, M.etat_vide())
+        garde.assert_called_once()
+        copie.assert_not_called()
+
+    def test_espace_supplement_tient_compte_de_la_cible(self):
+        """Une reprise ne redemande pas l'espace déjà occupé par la pré-copie."""
+        besoin = M.besoin_espace(self.ctx)
+        with mock.patch.object(M, "_mesure_arbres", return_value=besoin):
+            supplement = M.espace_supplement(self.ctx, besoin)
+        self.assertEqual(supplement, {"development": 0, "home": 0})
+
+    def test_basculer_interrompu_remet_la_source(self):
+        """B4 : un Ctrl-C pendant l'arrêt restaure la source et lève les pauses."""
+        etat_unites = {"source": "active", "cible": "inactive"}
+        delegue = self.faux.executer
+
+        def systemctl(argv, env, delai):
+            commande = " ".join(argv)
+            self.faux.appels.append(tuple(argv))
+            if "show" in commande and "ameesh-runner-agent@" in commande:
+                cote = "cible" if env and env.get("HOME") == "/home/ameesh" \
+                    else "source"
+                actif = etat_unites[cote]
+                return M.Resultat(0, "LoadState=loaded\nActiveState=%s\nMainPID=%s\n"
+                                  "UnitFileState=enabled\n"
+                                  % (actif, "123" if actif == "active" else "0"))
+            if "systemctl --user stop" in commande:
+                raise KeyboardInterrupt
+            if "systemctl --user start" in commande:
+                etat_unites["source"] = "active"
+                return M.Resultat(0, "")
+            if "daemon-reload" in commande or "list-units" in commande:
+                return M.Resultat(0, "")
+            return delegue(argv, env, delai)
+        self.faux.executer = systemctl
+        self.hote.executeur = systemctl
+        for motif in ("ameesh pause", "ameesh resume"):
+            self.faux.repondre(motif, 0, '{"changed": true, "reason": "x"}\n')
+        self.faux.repondre("ameesh show", 0, json.dumps(
+            {"last_turn_ts": 0, "lease_owner": None}))
+        self.faux.remplacer("systemctl --user show", 0, "")
+        self.ctx.etat_dir.mkdir(parents=True, exist_ok=True)
+        etat = M.etat_vide()
+        etat["stage"] = "prepare"
+        M.ecrit_etat(self.ctx, etat)
+        args = mock.Mock(canari="codex2", attente_arret=5)
+        agents = [{"name": "ameesh-dev1", "harness": "claude", "status": "idle"},
+                  {"name": "codex2", "harness": "codex", "status": "idle"}]
+        with mock.patch.object(M, "agents_du_poste", return_value=agents), \
+                mock.patch.object(M, "verifier_avant_bascule", return_value=[]):
+            with self.assertRaises(KeyboardInterrupt):
+                M.basculer(self.ctx, args)
+        final = M.lit_etat(self.ctx)
+        self.assertEqual(final["stage"], "prepare")
+        self.assertEqual(final["pauses"], {})
+        self.assertEqual(set(final["actifs"]), {"ameesh-dev1", "codex2"})
+        self.assertTrue(self.faux.a_appele("systemctl --user start"))
+        self.assertTrue(self.faux.a_appele("ameesh resume"))
+
+    def test_retour_force_reprend_les_actifs_persistes(self):
+        """B4 : après une coupure avant `stage=bascule`, `retour --force`
+        redémarre l'ensemble actif écrit avant l'arrêt et lève ses pauses."""
+        etat = M.etat_vide()
+        etat.update({"stage": "prepare",
+                     "actifs": ["ameesh-dev1", "codex2"],
+                     "enabled_source": ["ameesh-dev1", "codex2"],
+                     "enabled_cible": [],
+                     "pauses": {"ameesh-dev1": "migration #3549 (interrompue)",
+                                "codex2": "migration #3549 (interrompue)"}})
+        M.ecrit_etat(self.ctx, etat)
+        etat_unites = {"source": "inactive", "cible": "inactive"}
+        delegue = self.faux.executer
+
+        def systemctl(argv, env, delai):
+            commande = " ".join(argv)
+            self.faux.appels.append(tuple(argv))
+            if "show" in commande and "ameesh-runner-agent@" in commande:
+                cote = "cible" if env and env.get("HOME") == "/home/ameesh" \
+                    else "source"
+                actif = etat_unites[cote]
+                return M.Resultat(0, "LoadState=loaded\nActiveState=%s\nMainPID=%s\n"
+                                  "UnitFileState=enabled\n"
+                                  % (actif, "123" if actif == "active" else "0"))
+            if "systemctl --user start" in commande:
+                etat_unites["source"] = "active"
+                return M.Resultat(0, "")
+            if "systemctl --user stop" in commande:
+                etat_unites["cible"] = "inactive"
+                return M.Resultat(0, "")
+            if "daemon-reload" in commande or "list-units" in commande:
+                return M.Resultat(0, "")
+            return delegue(argv, env, delai)
+        self.faux.executer = systemctl
+        self.hote.executeur = systemctl
+        for motif in ("ameesh pause", "ameesh resume"):
+            self.faux.repondre(motif, 0, '{"changed": true, "reason": "x"}\n')
+        self.faux.repondre("ameesh show", 0,
+                           json.dumps({"last_turn_ts": 0, "lease_owner": None}))
+        args = mock.Mock(force=True, attente_arret=5)
+        agents = [{"name": "ameesh-dev1", "harness": "claude", "status": "idle"},
+                  {"name": "codex2", "harness": "codex", "status": "idle"}]
+        with mock.patch.object(M, "agents_du_poste", return_value=agents), \
+                mock.patch.object(M, "canon_sync", return_value=(True, "ok")):
+            rc = M.retour(self.ctx, args)
+        self.assertEqual(rc, 0)
+        final = M.lit_etat(self.ctx)
+        self.assertEqual(final["stage"], "retour")
+        self.assertEqual(final["pauses"], {})
+        demarrages = self.faux.a_appele("systemctl --user start")
+        self.assertTrue(any("ameesh-dev1" in " ".join(a) for a in demarrages))
+        self.assertTrue(any("codex2" in " ".join(a) for a in demarrages))
+        self.assertTrue(self.faux.a_appele("ameesh resume"))
 
 
 if __name__ == "__main__":

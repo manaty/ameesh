@@ -69,6 +69,16 @@ OBSOLETES = ("cles-owner.conf", "git-agents.conf")
 ETATS_QUEUE_INACTIFS = {"landed", "ejected", "skipped", "cancelled"}
 MARGE_AVANT_MIN = 60
 MARGE_APRES_MIN = 30
+#: sorties régénérables que `preparer_repos` ne copie pas.
+EXCLUSIONS_REPOS = (
+    "node_modules/", "*/node_modules/", "**/node_modules/",
+    "target/", "dist/", ".venv/", "venv/",
+    ".pytest_cache/", ".mypy_cache/", ".git/index.lock",
+)
+#: marge d'espace libre exigée en plus de la copie : 5 Gio, ou 20 % de la
+#: taille estimée si c'est plus grand. La copie duplique l'état vivant ; la
+#: garde refuse avant la première écriture (revue dev1, B3).
+MARGE_ESPACE = 5 * 1024 ** 3
 #: empreinte GitHub publiée (docs.github.com, clés SSH de github.com).
 EMPREINTE_GITHUB = "SHA256:+DiY3wvvV6TuJJhbpZisF/zLDA0zPMSvHdkr4UvCOqU"
 CLE_GITHUB = ("github.com ssh-ed25519 "
@@ -990,6 +1000,128 @@ def rsync(ctx: Contexte, source: Path, cible: Path, *, supprimer: bool = False,
                 % (source, cible, fait.code, fait.erreur.strip()))
 
 
+def taille_arbre(ctx: Contexte, chemin: Path, *,
+                 exclusions: Sequence[str] = (),
+                 prefixes: Sequence[str] = ()) -> int:
+    """Taille d'un arbre à copier, sans les caches exclus de la copie.
+
+    `du -sb` lit les métadonnées sans ouvrir les fichiers ; si sa sortie est
+    illisible (banc de test, `du` absent), on parcourt l'arbre en Python pour
+    que la garde d'espace reste vérifiable dans les deux cas.
+    """
+    if not chemin.exists():
+        return 0
+    fait = ctx.hote.lancer(
+        ["du", "-sb", *["--exclude=%s" % motif.rstrip("/") for motif in exclusions],
+         str(chemin)], delai=600)
+    if fait.ok:
+        with contextlib.suppress(ValueError, IndexError):
+            return int(fait.sortie.split()[0])
+    exclus = {motif.rstrip("/") for motif in exclusions}
+    total = 0
+    for dossier, sous, noms in os.walk(chemin):
+        sous[:] = [d for d in sous if d not in exclus]
+        for nom in noms:
+            if any(nom == prefixe or nom.startswith(prefixe)
+                   for prefixe in prefixes):
+                continue
+            try:
+                total += os.path.getsize(os.path.join(dossier, nom))
+            except OSError:
+                continue
+    return total
+
+
+#: arbres que `preparer` copie, par système de fichiers cible, avec les
+#: exclusions de la copie (caches régénérables, événements, venvs).
+ARBRES_ESPACE = (
+    ("development", "development/manaty",
+     ("node_modules", "target", "dist", ".venv", "venv",
+      ".pytest_cache", ".mypy_cache"), ()),
+    ("home", "canon", ("__pycache__",), ()),
+    ("home", ".local/state/ameesh", (".menage", "__pycache__"),
+     ("events.jsonl",)),
+    ("home", ".local/state/ameesh-host", (".menage", "__pycache__"),
+     ("events.jsonl",)),
+    ("home", ".local/state/agent-mail", ("__pycache__",), ()),
+    ("home", ".local/state/claude", ("__pycache__",), ()),
+    ("home", ".local/state/gh", ("__pycache__",), ()),
+    ("home", ".config/ameesh", ("__pycache__",), ()),
+    ("home", ".local/share/ameesh", ("__pycache__", "venv", "venv-*"),
+     ("venv", "events.jsonl")),
+)
+
+
+def _mesure_arbres(ctx: Contexte, racine: Path) -> dict[str, int]:
+    mesure = {"development": 0, "home": 0}
+    for cle, relatif, exclusions, prefixes in ARBRES_ESPACE:
+        mesure[cle] += taille_arbre(ctx, racine / relatif,
+                                    exclusions=exclusions, prefixes=prefixes)
+    return mesure
+
+
+def besoin_espace(ctx: Contexte) -> dict[str, int]:
+    """Octets que `preparer` va copier, par système de fichiers.
+
+    Les caches régénérables (`.menage`, `events.jsonl`, `node_modules`,
+    `target`, venvs) ne traversent pas : les compter ferait refuser un poste
+    sain sur une estimation fausse. `development` peut être un volume dédié
+    (runbook § 4.10), d'où deux mesures distinctes.
+    """
+    return _mesure_arbres(ctx, ctx.source_home)
+
+
+def espace_supplement(ctx: Contexte,
+                      besoin: dict[str, int] | None = None) -> dict[str, int]:
+    """Ce qu'il reste à écrire : la source moins ce que la cible porte déjà.
+
+    `preparer` est idempotent et se relance après un échec ; comparer au
+    volume entier de la source ferait refuser à tort une reprise alors que la
+    première copie occupe déjà la place.
+    """
+    besoin = besoin_espace(ctx) if besoin is None else besoin
+    deja = _mesure_arbres(ctx, ctx.cible_home)
+    return {cle: max(0, octets - deja.get(cle, 0))
+            for cle, octets in besoin.items()}
+
+
+def manques_espace(ctx: Contexte,
+                   besoin: dict[str, int] | None = None) -> list[str]:
+    """Les refus d'espace, pour `preparer` (bloquant) et la bascule (manque)."""
+    manques = []
+    for cle, octets in espace_supplement(ctx, besoin).items():
+        if not octets:
+            continue
+        racine = ctx.cible_home / "development" if cle == "development" \
+            else ctx.cible_home
+        while not racine.exists() and racine != racine.parent:
+            racine = racine.parent
+        try:
+            libre = shutil.disk_usage(racine).free
+        except OSError:
+            libre = 0
+        marge = max(MARGE_ESPACE, octets // 5)
+        if libre < octets + marge:
+            manques.append(
+                "espace insuffisant pour %s : %.1f Gio libres, ~%.1f Gio à "
+                "copier + %.1f Gio de marge ; libérer de l'espace ou monter un "
+                "volume dédié (runbook § 4.10)"
+                % (cle, libre / 2**30, octets / 2**30, marge / 2**30))
+    return manques
+
+
+def verifier_espace(ctx: Contexte, besoin: dict[str, int] | None = None) -> None:
+    """Refuse `preparer` avant la première copie si le disque est trop plein.
+
+    La copie duplique l'état vivant : c'est un refus, pas un avertissement
+    (revue dev1, B3). La marge couvre les fichiers qui changent pendant la
+    copie et les sorties de build recréées ensuite.
+    """
+    manques = manques_espace(ctx, besoin)
+    if manques:
+        refuser(manques[0])
+
+
 def preparer_canon(ctx: Contexte) -> None:
     source = ctx.source_home / "canon"
     if not source.is_dir():
@@ -1019,11 +1151,7 @@ def preparer_repos(ctx: Contexte, *, final: bool = False) -> None:
     # garde `verifier_exclusions_trackees` refuse si un fichier suivi tombe
     # sous une exclusion. On ne retire donc que des sorties franchement
     # régénérables.
-    exclusions = [
-        "node_modules/", "*/node_modules/", "**/node_modules/",
-        "target/", "dist/", ".venv/", "venv/",
-        ".pytest_cache/", ".mypy_cache/", ".git/index.lock",
-    ]
+    exclusions = list(EXCLUSIONS_REPOS)
     rsync(ctx, source, cible, supprimer=True, chown=CIBLE, exclusions=exclusions)
     chown_cible(ctx, cible)
     verifier_exclusions_trackees(ctx, cible)
@@ -1129,9 +1257,16 @@ def preparer_venv(ctx: Contexte) -> None:
     if not bascule.is_file():
         refuser("bascule.py absent de l'instantané : %s" % bascule)
     version = nom[len("src-"):]
-    for action in ("preparer", "activer"):
-        commande = ["python3", str(bascule), action, "--venv", str(venv),
-                    "--src", str(destination), "--version", version]
+    # `activer` ne prend pas `--src` (il bascule le lien `venv-courant` vers
+    # le venv préparé) : passer l'option à l'aveugle le faisait refuser par
+    # argparse, donc `preparer` échouait toujours (revue dev1, B1).
+    commandes = (
+        ("preparer", ["python3", str(bascule), "preparer", "--venv", str(venv),
+                      "--src", str(destination), "--version", version]),
+        ("activer", ["python3", str(bascule), "activer", "--venv", str(venv),
+                     "--version", version]),
+    )
+    for action, commande in commandes:
         journal(ctx, "preparer", "bascule.py %s du venv %s" % (action, version))
         fait = ctx.hote.lancer(commande, utilisateur=CIBLE, delai=1800)
         if not fait.ok:
@@ -1216,6 +1351,9 @@ def preparer_unites(ctx: Contexte) -> None:
 def preparer(ctx: Contexte, etat: dict) -> None:
     creer_compte(ctx)
     preparer_dossiers(ctx)
+    # avant la première copie : la duplication de l'état vivant peut remplir
+    # /home ou le volume de développement (B3).
+    verifier_espace(ctx)
     preparer_linger(ctx)
     preparer_config(ctx)
     preparer_etat(ctx)
@@ -1534,7 +1672,8 @@ def attendre_unites(ctx: Contexte, noms: Sequence[str], *, cible: bool,
     return etats
 
 
-def poser_pauses(ctx: Contexte, agents: Sequence[dict], motif: str) -> dict[str, str]:
+def poser_pauses(ctx: Contexte, agents: Sequence[dict], motif: str, *,
+                 etat: dict | None = None) -> dict[str, str]:
     posees = {}
     for agent in agents:
         nom = agent["name"]
@@ -1556,6 +1695,11 @@ def poser_pauses(ctx: Contexte, agents: Sequence[dict], motif: str) -> dict[str,
                 posees[nom] = motif
             else:
                 dire("  %s : pause étrangère conservée (%s)" % (nom, raison or "?"))
+        if etat is not None and nom in posees:
+            # journal de reprise : une pause posée est durable même si la
+            # suite du geste est interrompue (B4).
+            etat["pauses"] = dict(posees)
+            ecrit_etat(ctx, etat)
     return posees
 
 
@@ -1698,9 +1842,14 @@ def annuler_avant_canari(ctx: Contexte, actifs: Sequence[str],
     """Restaure la source si l'échec précède tout démarrage cible."""
     dire("")
     dire("échec avant tout démarrage sous %s : remise en service de la source" % CIBLE)
+    actifs = list(actifs or etat.get("actifs") or [])
+    # les pauses déjà posées sont dans l'état si le geste a été interrompu
+    # avant la fin de `poser_pauses` (B4) ; les fusionner évite de laisser
+    # une admission fermée après la remise en service.
+    pauses = {**(etat.get("pauses") or {}), **dict(pauses)}
     # remettre l'ensemble enabled d'avant : la source doit redémarrer au
     # boot, la cible non.
-    enabled_source = etat.get("enabled_source") or list(actifs)
+    enabled_source = etat.get("enabled_source") or actifs
     if enabled_source:
         with contextlib.suppress(Refus):
             activer_unites(ctx, enabled_source)
@@ -1710,7 +1859,7 @@ def annuler_avant_canari(ctx: Contexte, actifs: Sequence[str],
     if actifs:
         systemctl_source(ctx, "start", *["%s%s.service" % (PREFIXE_UNITE, n)
                                         for n in actifs], delai=300)
-        attendre_unites(ctx, list(actifs), cible=False, delai=120)
+        attendre_unites(ctx, actifs, cible=False, delai=120)
     non_levees = lever_pauses(ctx, pauses)
     if non_levees:
         dire("  pauses NON levées : %s" % ", ".join(non_levees))
@@ -1741,16 +1890,25 @@ def basculer(ctx: Contexte, args) -> int:
     enabled_source = etat_enabled(ctx, [a["name"] for a in agents])
     etat["enabled_source"] = enabled_source
     etat["enabled_cible"] = []
+    # L'ensemble actif est écrit AVANT le premier arrêt : si le geste est
+    # interrompu (Ctrl-C, OSError, coupure), `retour --force` sait quelles
+    # unités source redémarrer, même si aucune unité cible n'a démarré.
+    etat["actifs"] = list(actifs)
     motif = "migration #3549 pc-smichea vers %s (%s)" % (CIBLE, horodatage())
     journal(ctx, "basculer", "drain de %d exécuteurs, motif %r" % (len(actifs), motif),
             agents=actifs)
-    pauses = poser_pauses(ctx, [a for a in agents if a["name"] in actifs], motif)
+    ecrit_etat(ctx, etat)
+    pauses = poser_pauses(ctx, [a for a in agents if a["name"] in actifs], motif,
+                          etat=etat)
     etat["pauses"] = pauses
     ecrit_etat(ctx, etat)
     try:
-        fait = systemctl_source(ctx, "stop",
+        # `stop` est une mise en file, pas une attente : le drainage d'un
+        # tour peut dépasser 5 min. L'arrêt est prouvé ensuite, séparément,
+        # dans la borne `--attente-arret` (revue dev1, B2).
+        fait = systemctl_source(ctx, "stop", "--no-block",
                                 *["%s%s.service" % (PREFIXE_UNITE, n) for n in actifs],
-                                delai=300)
+                                delai=60)
         if not fait.ok:
             refuser("arrêt refusé : %s" % fait.erreur.strip())
         etats = attendre_unites(ctx, actifs, cible=False, delai=args.attente_arret,
@@ -1812,7 +1970,12 @@ def basculer(ctx: Contexte, args) -> int:
             journal(ctx, "basculer", detail)
         non_levees = lever_pauses(ctx, pauses)
         if non_levees:
+            # ne garder que ce qui reste fermé : un retour ne doit pas
+            # rejouer la levée des pauses déjà levées (B4).
+            etat["pauses"] = {n: pauses[n] for n in non_levees}
+            ecrit_etat(ctx, etat)
             refuser("pauses non levées : %s" % ", ".join(non_levees))
+        etat["pauses"] = {}
         activer_unites(ctx, actifs, cible=True)
         etat["enabled_cible"] = list(actifs)
         journal(ctx, "basculer", "unités cible activées au boot", agents=actifs)
@@ -1820,7 +1983,11 @@ def basculer(ctx: Contexte, args) -> int:
         etat["stage"] = "bascule"
         etat["preuve_courrier"] = detail_courrier
         ecrit_etat(ctx, etat)
-    except Refus:
+    except (Refus, KeyboardInterrupt, OSError):
+        # Une interruption pendant la fenêtre critique (source arrêtée, aucune
+        # unité cible encore démarrée) doit remettre la source en service :
+        # sinon le poste reste sans exécuteurs et `retour --force` n'aurait
+        # aucun ensemble actif à redémarrer (revue dev1, B4).
         etats_cible = {n: statut_unite(ctx, n, cible=True)["actif"] for n in actifs}
         if not any(e in ("active", "activating", "reloading")
                    for e in etats_cible.values()):
@@ -1924,30 +2091,11 @@ def verifier_avant_bascule(ctx: Contexte, inv: dict) -> list[str]:
         if avant and apres and avant != apres:
             manques.append("%s : version cible %r != source %r"
                            % (outil, apres, avant))
-    # capacité : `development` peut être un montage dédié (bind mount du
-    # runbook § 4.10), le reste vit sous le home. Deux mesures distinctes.
-    besoin = {"development": 0, "home": 0}
-    for chemin, cle in ((ctx.source_home / "development/manaty", "development"),
-                        (ctx.source_home / ".local/state/ameesh", "home"),
-                        (ctx.source_home / ".local/share/ameesh", "home")):
-        if chemin.exists():
-            taille = ctx.hote.lancer(["du", "-sb", str(chemin)], delai=600)
-            with contextlib.suppress(ValueError, IndexError):
-                besoin[cle] += int(taille.sortie.split()[0])
-    for cle in ("development", "home"):
-        if not besoin[cle]:
-            continue
-        racine = ctx.cible_home / cle if cle == "development" else ctx.cible_home
-        try:
-            libre = shutil.disk_usage(racine).free
-        except OSError:
-            libre = 0
-        if libre < besoin[cle] * 1.2:
-            manques.append(
-                "espace libre insuffisant pour %s : %.1f Gio libres pour ~%.1f "
-                "Gio à copier — voir le runbook § 4.10 (recréer les clones ou "
-                "monter le volume de développement sur /home/ameesh/development)"
-                % (cle, libre / 2**30, besoin[cle] / 2**30))
+    # capacité : la même mesure que `preparer` (B3), pour que la garde
+    # d'avant-copie et celle d'avant-bascule ne divergent pas. Seul le
+    # supplément (source moins ce que la cible porte déjà) compte : la
+    # pré-copie de `preparer` occupe déjà la place.
+    manques += manques_espace(ctx)
     return manques
 
 
@@ -2218,12 +2366,18 @@ def retour(ctx: Contexte, args) -> int:
               in ("active", "activating", "reloading")]
     journal(ctx, "retour", "arrêt des %d exécuteurs cible, retour à %s"
             % (len(actifs), SOURCE))
-    pauses = poser_pauses(ctx, [a for a in agents if a["name"] in actifs], motif) \
-        if actifs else {}
+    # les pauses de la bascule interrompue sont dans l'état (B4) : les lever
+    # aussi, sinon l'admission reste fermée après le retour.
+    pauses = dict(etat.get("pauses") or {})
     if actifs:
-        fait = systemctl_cible(ctx, "stop",
+        pauses.update(poser_pauses(ctx, [a for a in agents if a["name"] in actifs],
+                                   motif))
+    if actifs:
+        # mise en file, pas une attente : le drainage peut dépasser 5 min ;
+        # l'arrêt est prouvé ensuite dans la borne `--attente-arret` (B2).
+        fait = systemctl_cible(ctx, "stop", "--no-block",
                                *["%s%s.service" % (PREFIXE_UNITE, n) for n in actifs],
-                               delai=300)
+                               delai=60)
         if not fait.ok:
             refuser("arrêt de la cible refusé : %s" % fait.erreur.strip())
         etats = attendre_unites(ctx, actifs, cible=True, delai=args.attente_arret,
@@ -2246,7 +2400,7 @@ def retour(ctx: Contexte, args) -> int:
                       or list(actifs))
     if enabled_source:
         activer_unites(ctx, enabled_source)
-    a_demarrer = list(etat.get("actifs") or actifs)
+    a_demarrer = list(etat.get("actifs") or etat.get("enabled_source") or actifs)
     if a_demarrer:
         ok, detail = canon_sync(ctx, cible=False)
         if not ok:
@@ -2265,6 +2419,7 @@ def retour(ctx: Contexte, args) -> int:
         refuser("pauses de retour non levées : %s" % ", ".join(non_levees))
     etat["stage"] = "retour"
     etat["retour_le"] = horodatage()
+    etat["pauses"] = {}
     ecrit_etat(ctx, etat)
     dire("")
     dire("retour fait : les unités actives de %s servent de nouveau ; "
@@ -2374,7 +2529,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 2
     except KeyboardInterrupt:
         print("migration-runners-ameesh: interrompu ; état conservé sous "
-              "/var/lib/ameesh/migration-runners", file=sys.stderr)
+              "/var/lib/ameesh/migration-runners. Si la source a été arrêtée "
+              "(stage prepare, actifs listés), « retour --force » la remet en "
+              "service.", file=sys.stderr)
         return 130
 
 
