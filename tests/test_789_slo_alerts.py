@@ -1434,5 +1434,21 @@ class LotIllisibleTest(_Base):
         self._verifie(alerts, malsain, "jamais", [self.lot["id"], malsain["id"]])
 
 
+class AttributionRendueTest(_Base):
+    """#3424 : un lot créé déjà assigné puis rendu à la file ne redevient pas
+    « jamais assigné » — `signal_assigned` reste conclu à la création et
+    l'alerte de niveau 3 « reassign it now » ne part pas (#3223)."""
+
+    def test_lot_rendu_ne_leve_pas_signal_assigned(self):
+        work.move(self.db, self.lot["id"], "build")
+        work.return_to_queue(self.db, self.lot["id"], actor="dev1")
+        work.move(self.db, self.lot["id"], "qa")
+        self.assertIsNone(work.get(self.db, self.lot["id"])["assignee"])
+        self.age(4 * HEURE)
+        self.now = time.time()
+        alerts = self.slo()
+        self.assertEqual([a for a in alerts if a["step"] == "signal_assigned"], [])
+
+
 if __name__ == "__main__":
     unittest.main()
