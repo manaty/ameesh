@@ -92,7 +92,22 @@ _TRAILER = re.compile(r"(?im)^[ \t>*-]*ameesh-work[ \t]*:[ \t]*#?(\d+)[ \t]*$")
 #: #2692: prefixes GitHub adds to a full-suite job on a packet head — the
 #: packet gate's caller job and the flow check runs of tests.yml. A required
 #: job is matched exactly or under one of these, never by a loose suffix.
-_JOB_PREFIXES = ("suite complète du paquet / ", "tests (flux) ")
+#: #3530 : le check du flux L161c (`tests (flux) <part>`) figure aussi dans la
+#: liste des jobs de l'API ; il double le job de la part, il n'est pas un job.
+_PACKET_CALLER_PREFIX = "suite complète du paquet / "
+_FLUX_CHECK_PREFIX = "tests (flux) "
+_JOB_PREFIXES = (_PACKET_CALLER_PREFIX, _FLUX_CHECK_PREFIX)
+
+
+def _is_flow_check(name) -> bool:
+    """#3530 : un check du flux L161c (`tests (flux) <part>`), pas un job.
+
+    Le préfixe d'appel du portier (`suite complète du paquet / …`) peut le
+    précéder quand la suite tourne en workflow réutilisable."""
+    text = str(name or "")
+    if text.startswith(_PACKET_CALLER_PREFIX):
+        text = text[len(_PACKET_CALLER_PREFIX):]
+    return text.startswith(_FLUX_CHECK_PREFIX)
 
 
 class ReleaseError(RuntimeError):
@@ -489,9 +504,12 @@ def ci_reading(project: "ProjectRelease", sha: str) -> dict:
         # separate macOS suite (#3198). Its unfinished rollup must not block
         # a successful tests aggregate; a job FAILURE still blocks below.
         managed = {"tests", "paquet", "macos"}
-        negative = [name for name in reading.get("negative", ()) if name not in managed]
-        pending = [name for name in reading.get("pending", ()) if name not in managed]
-        inconclusive = [name for name in reading.get("inconclusive", ()) if name not in managed]
+        negative = [name for name in reading.get("negative", ())
+                    if name not in managed and not _is_flow_check(name)]
+        pending = [name for name in reading.get("pending", ())
+                   if name not in managed and not _is_flow_check(name)]
+        inconclusive = [name for name in reading.get("inconclusive", ())
+                        if name not in managed and not _is_flow_check(name)]
         # B3 d'impl-04 (#3186) : le filtre vise les rollups reclassés job par
         # job, pas un check requis rouge — celui d'une autre suite que la
         # tentative lue ci-dessous resterait sinon masqué.
@@ -499,6 +517,9 @@ def ci_reading(project: "ProjectRelease", sha: str) -> dict:
                      if name not in negative]
         for attempt in _suite_runs(suite, run):
             for job in attempt["jobs"]:
+                if _is_flow_check(job.get("name")):
+                    # #3530 : le check du flux double le job de la part.
+                    continue
                 label = "%s (%s; %s)" % (
                     job["name"], job["conclusion"] or job["status"], attempt["url"])
                 if _job_negative(job):
@@ -1114,12 +1135,22 @@ def _job_success(job: dict) -> bool:
     return job.get("status") == "completed" and job.get("conclusion") == "success"
 
 
+def _job_waiting(job: dict) -> bool:
+    """#3530 : un job encore en cours (`in_progress`, `queued`, …) attend ;
+    ce n'est pas un résultat non concluant et il n'ouvre aucun lot avant la
+    fin du run ou le délai du job."""
+    return str(job.get("status") or "").strip().lower() != "completed"
+
+
 def _job_inconclusive(job: dict) -> bool:
     """A job that neither succeeded nor was skipped by its `if:` (#3244).
 
     On every push to main, `version number`, `lecteurs de la doc` and
     `autre système de fichiers` are skipped by design: the aggregate decides
-    whether they were due, so they are neither consigned nor reopened."""
+    whether they were due, so they are neither consigned nor reopened.
+    #3530 : un job encore en cours attend ; il n'est pas consigné."""
+    if _job_waiting(job):
+        return False
     tolerated = job.get("tolerated", False)
     return not _job_success(job) and job.get("conclusion") != "skipped" and not tolerated
 
