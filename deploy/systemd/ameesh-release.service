@@ -23,7 +23,7 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
-Environment=PATH=%h/.local/bin:/opt/node/bin:/usr/local/bin:/usr/bin:/bin
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
 # AMEESH_DSN, AMEESH_HOST, AMEESH_CANON… (the same file as the runner).
 EnvironmentFile=%h/.config/ameesh/env
 # Optional: GH_TOKEN if `gh` has no session for this service.
