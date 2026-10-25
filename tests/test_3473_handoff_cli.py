@@ -1,13 +1,16 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """H6: operator authorization, single-step dispatch and private output."""
 import contextlib
+import functools
 import io
 import json
+from pathlib import Path
+import tempfile
 from types import SimpleNamespace
 import unittest
 from unittest import mock
 
-from ameesh import handoffs, host_lifecycle, mesh_cli, storage, work
+from ameesh import handoff_factory, handoffs, host_lifecycle, mesh_cli, storage, work
 
 
 class OperatorTest(unittest.TestCase):
@@ -70,6 +73,28 @@ class OperatorTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'unknown handoff'):
                 self.invoke('advance')
         self.loader.load.assert_not_called()
+
+    def test_real_factory_without_enrollment_refuses_before_controller_step(self):
+        # Keep the actual pinned source and loader; only redirect its enrollment
+        # documents to an empty private directory, without touching this host.
+        module = handoff_factory._module(handoff_factory.source_path())
+        with tempfile.TemporaryDirectory() as directory:
+            module.HandoffFactory = functools.partial(
+                module.HandoffFactory, root=Path(directory))
+            with mock.patch.object(work, 'corrector'), \
+                    mock.patch.object(storage, 'of', return_value=self.api), \
+                    mock.patch.object(handoff_factory, '_module', return_value=module), \
+                    mock.patch.object(handoffs, 'advance') as advance, \
+                    mock.patch.object(handoffs, 'cancel') as cancel, \
+                    mock.patch.object(handoffs, 'retry') as retry:
+                for command in ('advance', 'cancel', 'retry'):
+                    with self.subTest(command=command):
+                        with self.assertRaisesRegex(ValueError, '^handoff step refused;') as caught:
+                            self.invoke(command)
+                        self.assertNotIn(directory, str(caught.exception))
+                advance.assert_not_called()
+                cancel.assert_not_called()
+                retry.assert_not_called()
 
     def test_unauthorized_never_loads_factory_or_reads_operation(self):
         with mock.patch.object(work, 'corrector', side_effect=work.WorkError('refused')), \
