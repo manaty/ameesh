@@ -150,6 +150,7 @@ def plan(db, agent, *, limits_for, queued=True, now=None, memory_bytes=4*GIB, di
                       "max_agents": target_limits["max_agents"],
                       "requires_gate": target_limits.get("lend") is not None,
                       "sampled_ts": rows[-1]["sampled_ts"], "harness": agent["harness"],
+                      "account": agent.get("session_account") or "",
                       "reason": demand["reason"] if forced else ("source_pressure" if current_pressure else "spare_capacity"),
                       **({"lifecycle_host": demand["host"], "lifecycle_generation": demand["generation"]}
                          if forced else {}),
