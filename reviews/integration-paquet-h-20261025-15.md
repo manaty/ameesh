@@ -87,17 +87,26 @@ et sa tête (`vehicule 1500 : #<lot> <tête>`), et il porte un trailer
 - **Compilation / contrôles statiques** : 6/6 verts (`scripts/freeze-checks.py` :
   garde mécanique #2449, compilation, attribution #1632, lint L63, alert types
   #1060, doc readers L161a).
-- **Prévalidation** : indisponible (card-stale, carte de plus de 48 h) —
-  non bloquante, motif journalisé au lot et dans la demande de CI.
-- **Diff** : 34 fichiers, +2475/−278 (manifeste compris). Classe sensible :
+- **Adaptation de test (aucun avis, §11 bis)** : #3450 — sur la CI GitHub
+  (`init.defaultBranch=main`), le premier commit du dépôt jetable crée déjà
+  `main` ; `git checkout -b main <base>` échouait en 128 (5 tests
+  `StaleMapLotTest`). Remplacé par `checkout -B main <base>` (force la branche
+  sur la base) ; module `test_3450_carte_perimee_lot` 5/5 vert avec et sans
+  `init.defaultBranch=main`. Test seul, aucun changement produit.
+- **Prévalidation** : indisponible (`selection-full` : sélection non sûre car
+  `.github/workflows/carte.yml` est modifié par #3450 ; la carte de plus de
+  48 h n'est pas utilisable) — non bloquante, motif journalisé au lot et dans
+  la demande de CI.
+- **Diff** : 35 fichiers, +2609/−278 (manifeste compris). Classe sensible :
   `.github/workflows/tests.yml` et `carte.yml`, `deploy/poste/` et
   `deploy/systemd/`, `scripts/test-plan.py`, `src/ameesh/prevalidation.py`.
   Aucune migration SQL.
 - **Inclusion** : `scripts/paquet-inclusion.py` rc 0 sur la tête (attendus =
   les 6 admis ; prêts = les 6 du calcul ; 0 écarté).
-- **Suite complète** : une seule `ci-full` demandée sur la tête finale, en
-  mode paquet ; les verdicts unitaires couvrent les contenus, le paquet est
-  relu sur sa tête par les familles du porteur (§12).
+- **Suite complète** : demandée sur la tête finale, en mode paquet ; l'unique
+  échec de la première demande était l'adaptation de test ci-dessus (même
+  tête, correction poussée) ; les verdicts unitaires couvrent les contenus, le
+  paquet est relu sur sa tête par les familles du porteur (§12).
 - **Fusion** : sous garde de tête, dès le vert et les avis du porteur ;
   landings `ameesh work landing <unité> --vehicle 3461` déclarés au gel
   (#3444 excepté : garde-fou, lot à laisser ouvert).
