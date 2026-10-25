@@ -2922,17 +2922,35 @@ class Notifier:
     @staticmethod
     def _summary_member(entry: dict, human: str) -> dict:
         alert = entry.get("alert") or {}
+        since = _since_of(alert)
+        # #3536 (B/P2 cx3) : un épisode sans `since` (`account_overage`) n'a
+        # pas d'identité au registre. Son `raised_ts`, figé dans l'entrée, doit
+        # entrer dans l'identité du membre de résumé : sinon deux occurrences
+        # successives partagent le même membre et la seconde est perdue quand
+        # le premier épisode se clôt.
+        episode = since
+        if episode is None:
+            raised = entry.get("raised_ts")
+            try:
+                episode = round(float(raised), 3) if raised is not None else None
+            except (TypeError, ValueError):
+                episode = None
         return {"key": entry.get("key") or key_of(alert),
                 "severity": _entry_severity(entry),
                 "type": alert.get("type"),
-                "since": _since_of(alert),
+                "since": since,
+                "episode": episode,
                 "human": human}
 
     @staticmethod
     def _summary_member_id(member: dict) -> str:
-        """Même identité que le registre `notified` : clé, sévérité, humain."""
+        """L'identité d'un membre : clé, sévérité, humain et épisode — `since`
+        quand il existe, sinon le `raised_ts` de secours (#3536 B/P2 cx3)."""
+        episode = member.get("episode")
+        if episode is None:
+            episode = member.get("since")
         return _notification_id(member.get("key"), member.get("severity"),
-                                member.get("human"), member.get("since"))
+                                member.get("human"), episode)
 
     def _owner_human(self, human) -> bool:
         owner = normalize_human(self.ncfg.default_human)
@@ -3003,6 +3021,7 @@ class Notifier:
                               "severity": member.get("severity"),
                               "type": member.get("type"),
                               "since": member.get("since"),
+                              "episode": member.get("episode"),
                               "human": human}
                 if self._summary_forbidden(human, normalized["type"]):
                     self.log("owner rate summary: slo_breach member filtered (#2395)")
@@ -3036,6 +3055,7 @@ class Notifier:
                               "severity": member.get("severity"),
                               "type": member.get("type"),
                               "since": member.get("since"),
+                              "episode": member.get("episode"),
                               "human": human}
                 if self._summary_forbidden(human, normalized["type"]):
                     continue
@@ -3114,11 +3134,7 @@ class Notifier:
         for entry in (self.state.get("active") or {}).values():
             if not isinstance(entry, dict) or entry.get("human") != human:
                 continue
-            alert = entry.get("alert") or {}
-            member = {"key": entry.get("key") or key_of(alert),
-                      "severity": entry.get("severity"),
-                      "type": alert.get("type"), "since": _since_of(alert),
-                      "human": human}
+            member = self._summary_member(entry, human)
             ids.add(self._summary_member_id(member))
         return ids
 

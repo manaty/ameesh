@@ -753,6 +753,55 @@ class NotifierTest(unittest.TestCase):
         self.assertNotEqual(ids[0], ids[2])
         self.assertEqual(str(uuid.UUID(ids[0])), ids[0])
 
+    def test_membre_resume_sans_since_par_episode(self):
+        """B/P2 cx3 : le `raised_ts` de secours distingue les membres de
+        résumé d'account_overage, et il survit à la normalisation/reprise."""
+        notifier = self.notifier(FakeSender())
+        alert = {"type": "account_overage", "harness": "claude", "account": "x"}
+        first = self.entry(alert=alert, raised_ts=900.0)
+        second = self.entry(alert=alert, raised_ts=1001.0)
+        one = notifier._summary_member(first, "human:owner")
+        other = notifier._summary_member(second, "human:owner")
+        self.assertNotEqual(notifier._summary_member_id(one),
+                            notifier._summary_member_id(other))
+        raised = {notifier._summary_member_id(one): one,
+                  notifier._summary_member_id(other): other}
+        restored = notifier._normalize_summary_raised(
+            "human:owner", json.loads(json.dumps(raised)))
+        self.assertEqual(set(restored), set(raised))
+
+    def test_resume_sans_since_ne_perd_pas_le_second_episode(self):
+        """B/P2 cx3 : le second account_overage arrive pendant le gel du
+        premier ; il survit à la clôture et part avec un nouvel `alert_id`."""
+        sender = FakeSender({"nx": [notify.ChannelError("boom"),
+                                    notify.ChannelError("boom"), None]})
+        notifier = self.notifier(sender)
+        alert = {"type": "account_overage", "harness": "claude", "account": "x"}
+        bucket = notifier._bucket("human:owner")
+        notifier._summary_add(bucket, "raised",
+                              self.entry(alert=alert, raised_ts=900.0,
+                                         status="resumee"))
+        notifier._summaries(1000.0)              # premier envoi, réponse perdue
+        notifier._summary_add(
+            bucket, "resolved",
+            {"alert": alert, "raised_ts": 900.0, "human": "human:owner",
+             "status": "envoi"})
+        notifier._summary_add(bucket, "raised",
+                              self.entry(alert=alert, raised_ts=1001.0,
+                                         status="resumee"))
+        self.assertEqual(len(bucket["raised"]), 2)
+        self.assertEqual(len(bucket["resolved"]), 1)
+        notifier._summaries(1060.0)              # retry du premier épisode
+        notifier._summaries(1120.0)              # succès du premier épisode
+        self.assertEqual(len(bucket["raised"]), 1)
+        notifier._summaries(1180.0)              # second épisode
+        summaries = [message for _, message in sender.sent
+                     if message.kind == "summary"]
+        self.assertGreaterEqual(len(summaries), 4)
+        self.assertNotEqual(summaries[0].alert_id, summaries[-1].alert_id)
+        self.assertEqual(str(uuid.UUID(summaries[-1].alert_id)),
+                         summaries[-1].alert_id)
+
     def test_resume_identite_propre_a_l_episode(self):
         """B/P2 cx3 : deux résumés successifs au texte identique sont deux
         épisodes distincts ; un retry garde l'identité de son épisode."""
