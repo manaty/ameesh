@@ -29,11 +29,12 @@ def operation(**changes):
     value = {
         'id': 'a' * 32,
         'agent': 'dev',
-        'source': 'source',
+        'source': 'ameesh-agents-2',
         'target': 'target',
         'controller_epoch': 3,
         'evidence': {},
         'plan': {'repository': 'git@forge:manaty/ameesh.git',
+                 'project': 'ameesh',
                  'owner': 'runner', 'epoch': 7, 'reason': 'host_drain'},
     }
     value.update(changes)

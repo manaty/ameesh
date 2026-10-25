@@ -292,11 +292,45 @@ class EnrolledAdapter:
     def repository(self, agent):
         return self.factory.repository_for(agent)
 
+    def _enrolled(self, operation):
+        """Bind the request to the enrolled hosts and the agent's repository.
+
+        The controller may name the repository on its command line; this
+        boundary is where that choice must equal the project repository
+        enrolled in ``repositories.json`` for the current agent. Both the
+        source and the target host must be admitted, so a request cannot reach
+        an effect through a host the documents never enrolled.
+        """
+        for field in ('source', 'target'):
+            if operation.get(field) not in self.factory.hosts:
+                raise FactoryError('identity:' + field)
+        plan = operation.get('plan') or {}
+        project = plan.get('project')
+        if not _name(project) or project not in self.factory.repositories:
+            raise FactoryError('repository:project')
+        if self.factory.db is not None:
+            from ameesh import registry
+            agent = registry.get(self.factory.db, operation['agent'])
+            if agent is None:
+                raise FactoryError('repository:agent')
+            current = projects.agent_project(agent) or agent.get('project')
+            if current != project:
+                raise FactoryError('repository:project')
+            expected = self.factory.repository_for(agent)
+        else:
+            # A factory without a DB (H1 source tests) still binds the plan to
+            # the enrolled project repository; production always has a DB.
+            expected = self.factory.repositories[project]
+        if plan.get('repository') != expected:
+            raise FactoryError('repository:enrolled')
+        return expected
+
     def _request(self, method, operation):
         try:
             handoff_contract.validate_request(operation, method)
         except handoff_contract.ContractError:
             raise FactoryError('contract:' + method) from None
+        self._enrolled(operation)
         return getattr(self.factory.provider, method)(operation)
 
     def revalidate(self, operation):
@@ -400,6 +434,7 @@ class HandoffFactory:
         try:
             provider = enrolled(db=self.db, enrollment=dict(self.enrollment),
                                 hosts=self.hosts, references=self.references,
+                                repositories=self.repositories,
                                 transports=self.transports, bridge=self.bridge,
                                 enrollment_root=self.documents.root)
         except Exception:

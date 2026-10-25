@@ -52,13 +52,17 @@ import threading
 import time
 from collections.abc import Mapping
 
-from ameesh import handoff_contract, host_preflight, relocation, storage
+from ameesh import handoff_contract, host_preflight, projects, relocation, storage
 from ameesh.config import NAME_RE
 
 ENROLLMENT_ROOT = Path('/etc/ameesh-handoff')
 EXECUTION_NAME = 'execution.json'
 BRIDGE_NAME = 'pont-handoff.py'
 SAFE_PATH = '/usr/local/bin:/usr/bin:/bin'
+#: Git may only reach the network transports of an enrolled repository. A
+#: local path, ``file://``, ``ext::`` or any other protocol is refused by Git
+#: itself even if a caller or an account config tries to rewrite the URL.
+GIT_PROTOCOLS = ('ssh', 'https', 'http', 'git')
 GIT_SECONDS = 20
 STOP_SECONDS = 15.0
 LOCK_SECONDS = 10.0
@@ -615,10 +619,13 @@ def _remove_tree_at(parent_fd, name):
 # Host primitives (systemd, Git) - injectable, never shell text
 # ---------------------------------------------------------------------------
 
-def _env(home):
-    return {'PATH': SAFE_PATH, 'LANG': 'C', 'LC_ALL': 'C', 'HOME': str(home),
-            'GIT_TERMINAL_PROMPT': '0', 'GIT_ASKPASS': '/bin/false',
-            'SSH_ASKPASS': '/bin/false'}
+def _env(home, protocols=GIT_PROTOCOLS):
+    env = {'PATH': SAFE_PATH, 'LANG': 'C', 'LC_ALL': 'C', 'HOME': str(home),
+           'GIT_TERMINAL_PROMPT': '0', 'GIT_ASKPASS': '/bin/false',
+           'SSH_ASKPASS': '/bin/false'}
+    if protocols is not None:
+        env['GIT_ALLOW_PROTOCOL'] = ':'.join(protocols)
+    return env
 
 
 def _kill_group(process):
@@ -761,12 +768,19 @@ class HostSystem:
 
 
 class HostGit:
-    """Bounded Git reads and one exact checkout, run as the enrolled account."""
+    """Bounded Git reads and one exact checkout, run as the enrolled account.
 
-    def __init__(self, *, runuser='/usr/sbin/runuser', euid=None, runner=_bounded_run):
+    ``protocols`` is the closed network transport list handed to Git through
+    ``GIT_ALLOW_PROTOCOL``. Tests may pass ``None`` to exercise local fixtures;
+    the executor never does.
+    """
+
+    def __init__(self, *, runuser='/usr/sbin/runuser', euid=None, runner=_bounded_run,
+                 protocols=GIT_PROTOCOLS):
         self.runuser = str(runuser)
         self.euid = os.geteuid() if euid is None else euid
         self.runner = runner
+        self.protocols = protocols
 
     def _argv(self, account, cwd, args):
         argv = ['git', '-C', str(cwd), *args]
@@ -776,8 +790,15 @@ class HostGit:
 
     def run(self, account, home, cwd, args, *, timeout=GIT_SECONDS, check=True):
         result = self.runner(self._argv(account, cwd, args), timeout=timeout,
-                             env=_env(home), cwd=None, check=check)
+                             env=_env(home, self.protocols), cwd=None, check=check)
         return result.stdout.strip()
+
+    @staticmethod
+    def repository(value):
+        """Refuse a repository outside the admitted transports before Git sees it."""
+        if not handoff_contract.repository_identity(value):
+            raise Refused('repository')
+        return value
 
 
 # ---------------------------------------------------------------------------
@@ -1272,12 +1293,16 @@ class HostEffects:
     # -- publication and transfer -----------------------------------------
 
     def _publish(self, request, entry):
+        repository = self.git.repository(request['repository'])
         cwd = self._worktree(request['cwd'], entry, must_exist=True)
         try:
-            remote_url = self._git(entry, cwd, ['remote', 'get-url', 'origin'])
+            # The stored enrolled URL, not ``remote get-url``: the latter
+            # applies ``url.*.insteadOf`` from the account's own config.
+            remote_url = self._git(entry, cwd, ['config', '--get',
+                                                'remote.origin.url'])
         except Uncertain:
             raise Refused('repository') from None
-        if remote_url != request['repository']:
+        if remote_url != repository:
             raise Refused('repository')
         try:
             dirty = self._git(entry, cwd, ['status', '--porcelain',
@@ -1313,10 +1338,11 @@ class HostEffects:
         first = remote.split()[0] if remote.split() else ''
         if first != commit:
             raise Refused('unpublished')
-        return {'repository': request['repository'], 'branch': branch,
+        return {'repository': repository, 'branch': branch,
                 'commit': commit, 'remote_commit': commit, 'clean': True}
 
     def _transfer(self, request, entry):
+        repository = self.git.repository(request['repository'])
         cwd, root = self._target_cwd(request['agent'], request['project'],
                                      entry)
         owner = self._owner(entry)
@@ -1328,13 +1354,14 @@ class HostEffects:
                     or not stat.S_ISDIR(current.st_mode)):
                 raise Refused('cwd')
             try:
-                remote_url = self._git(entry, cwd, ['remote', 'get-url', 'origin'])
+                remote_url = self._git(entry, cwd, ['config', '--get',
+                                                    'remote.origin.url'])
                 head = self._git(entry, cwd, ['rev-parse', 'HEAD'])
                 dirty = self._git(entry, cwd, ['status', '--porcelain',
                                                '--untracked-files=all'])
             except Uncertain:
                 raise Refused('cwd') from None
-            if remote_url != request['repository']:
+            if remote_url != repository:
                 raise Refused('cwd')
             try:
                 branch = self._git(entry, cwd,
@@ -1346,7 +1373,7 @@ class HostEffects:
                 # never adopted silently: the worktree must be this branch.
                 raise Refused('branch')
             if head == request['commit'] and not dirty:
-                return {'repository': request['repository'], 'branch': request['branch'],
+                return {'repository': repository, 'branch': request['branch'],
                         'commit': request['commit'], 'clean': True, 'cwd': str(cwd)}
             raise Refused('cwd_occupied')
         parent = cwd.parent
@@ -1388,7 +1415,7 @@ class HostEffects:
                 _atomic_json(marker, {'action_id': request['action_id']},
                              root=root, owner=owner)
                 self._git(entry, temporary,
-                          ['remote', 'add', 'origin', request['repository']])
+                          ['remote', 'add', 'origin', repository])
                 self._git(entry, temporary,
                           ['fetch', '--no-tags', '--quiet', 'origin',
                            request['branch']])
@@ -1428,7 +1455,7 @@ class HostEffects:
                             pass
         finally:
             os.close(parent_fd)
-        return {'repository': request['repository'], 'branch': request['branch'],
+        return {'repository': repository, 'branch': request['branch'],
                 'commit': request['commit'], 'clean': True, 'cwd': str(cwd)}
 
     # -- session -----------------------------------------------------------
@@ -1663,13 +1690,15 @@ class HostAdapter:
     """The enrolled adapter; host effects go through the pinned bridge."""
 
     def __init__(self, *, db=None, enrollment=None, hosts=None, references=None,
-                 transports=None, bridge=None, enrollment_root=None):
+                 repositories=None, transports=None, bridge=None,
+                 enrollment_root=None):
         self.db = db
         self.enrollment = dict(enrollment or {})
         self.enrollment_root = Path(enrollment_root or ENROLLMENT_ROOT)
         self.host = self.enrollment.get('host')
         self.hosts = dict(hosts or {})
         self.references = dict(references or {})
+        self.repositories = dict(repositories or {})
         self.transports = dict(transports or {})
         self._plan = {}
         self.bridge = bridge if bridge is not None else self._bridge()
@@ -1895,10 +1924,11 @@ class HostAdapter:
         if (not isinstance(pending, dict) or pending.get('name') != step
                 or pending.get('epoch') != operation.get('controller_epoch')):
             raise Refused('intent')
-        for key in ('repository', 'canon', 'canon_revision', 'harness', 'source',
-                    'target', 'owner', 'epoch', 'reason'):
+        for key in ('repository', 'project', 'canon', 'canon_revision',
+                    'harness', 'source', 'target', 'owner', 'epoch', 'reason'):
             if row['plan'].get(key) != self._plan.get(key):
                 raise Refused('plan')
+        self._enrolled_repository(operation)
         if (row['memory_bytes'] != self._plan.get('memory_bytes')
                 or row['disk_bytes'] != self._plan.get('disk_bytes')):
             raise Refused('reservation')
@@ -1911,6 +1941,9 @@ class HostAdapter:
                     or target not in (agent.get('admitted_hosts') or ())
                     or agent.get('mode') != 'execute'
                     or agent.get('status') in ('stopped', 'paused')):
+                raise Refused('placement')
+            if (projects.agent_project(agent) or agent.get('project')
+                    ) != self._plan.get('project'):
                 raise Refused('placement')
             if self._plan.get('reason') != 'host_loss' and (
                     agent.get('host') != source
@@ -1948,11 +1981,28 @@ class HostAdapter:
                 or pending.get('epoch') != operation.get('controller_epoch')):
             raise Refused('intent')
 
+    def _enrolled_repository(self, operation):
+        """The plan's repository is this project's exact enrolled identity.
+
+        ``--repository`` is a caller choice; it never widens the enrollment.
+        The durable row is checked too, so a mismatch between the operation and
+        ``repositories.json`` cannot be hidden by writing the same wrong value
+        in both places.
+        """
+        plan = operation.get('plan') or {}
+        project = plan.get('project')
+        if not _name(project) or project not in self.repositories:
+            raise Refused('repository')
+        if plan.get('repository') != self.repositories[project]:
+            raise Refused('repository')
+        return self.repositories[project]
+
     def _identity(self, operation, host):
         plan = operation.get('plan') or {}
         self._plan = plan
         if plan.get('target') != _target(operation) or plan.get('source') != _source(operation):
             raise Refused('plan')
+        self._enrolled_repository(operation)
         if not _name(operation.get('agent')) or host not in self.hosts:
             raise Refused('identity')
         if plan.get('harness') not in self.hosts[host]:

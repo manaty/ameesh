@@ -28,6 +28,10 @@ from .support import PgTestCase
 REPO = Path(__file__).resolve().parents[1]
 COMMIT = 'a' * 40
 GIB = 1024 ** 3
+#: The enrolled repository identity used by the fixtures. The test Git runner
+#: rewrites it to a disposable local bare repository, never to a path admitted
+#: by the contract.
+REPOSITORY = 'https://forge.example/manaty/app.git'
 
 
 def _module(name, filename):
@@ -54,6 +58,25 @@ def git_env(home):
 def git(*args, cwd=None, home=None, check=True):
     return subprocess.run(['git', *args], cwd=cwd, env=git_env(home or cwd),
                           capture_output=True, text=True, check=check)
+
+
+class RewritingGit(companion.HostGit):
+    """Test-only runner: the enrolled URL resolves to the local fixture.
+
+    Production ``HostGit`` only admits the enrolled network transports; the
+    fixtures need a real local fetch, so this runner adds the ``insteadOf``
+    rewrite while the request still carries the enrolled identity.
+    """
+
+    def __init__(self, origin):
+        super().__init__(protocols=None)
+        self.origin = str(origin)
+
+    def run(self, account, home, cwd, args, *, timeout=companion.GIT_SECONDS,
+            check=True):
+        prefix = ['-c', 'url.%s.insteadOf=%s' % (self.origin, REPOSITORY)]
+        return super().run(account, home, cwd, prefix + list(args),
+                           timeout=timeout, check=check)
 
 
 class FakeSystem:
@@ -129,7 +152,6 @@ class Fixture:
             'secrets': ['codex/api'],
         }
         self.system = FakeSystem()
-        self.effects = self._effects()
         self.origin = self.root / 'origin.git'
         self.source = self.work / 'source'
         git('init', '-q', '--bare', '-b', 'main', str(self.origin), home=self.root)
@@ -139,8 +161,13 @@ class Fixture:
         git('commit', '-q', '-m', 'one', cwd=self.source, home=self.root)
         git('remote', 'add', 'origin', str(self.origin), cwd=self.source, home=self.root)
         git('push', '-q', '-u', 'origin', 'main', cwd=self.source, home=self.root)
+        git('remote', 'set-url', 'origin', REPOSITORY, cwd=self.source,
+            home=self.root)
         self.commit = git('rev-parse', 'HEAD', cwd=self.source,
                           home=self.root).stdout.strip()
+        self.repository = REPOSITORY
+        self.git = RewritingGit(self.origin)
+        self.effects = self._effects()
 
     def close(self):
         self.temp.cleanup()
@@ -149,6 +176,7 @@ class Fixture:
         value = dict(self.execution)
         value.update(changes)
         return companion.HostEffects(enrollment=value, system=self.system,
+                                     git=self.git,
                                      work_dir=lambda agent, project: str(self.work / agent))
 
 
@@ -162,9 +190,9 @@ class RequestMixin:
         if step == 'prepare':
             value.update(tools=['git'], secrets=['codex/api'])
         if step == 'publish':
-            value.update(repository=str(fx.origin), cwd=str(fx.source))
+            value.update(repository=fx.repository, cwd=str(fx.source))
         if step == 'transfer':
-            value.update(repository=str(fx.origin), branch='main',
+            value.update(repository=fx.repository, branch='main',
                          commit=fx.commit, project='ameesh')
         if step == 'session':
             value.update(cwd=str(fx.work / 'dev'), commit=fx.commit)
@@ -292,6 +320,61 @@ class WireContractTest(unittest.TestCase):
                     handoff_contract.validate_effect_request(
                         dict(base, repository=repository))['repository'],
                     repository)
+
+    def test_wire_repository_is_a_closed_network_transport(self):
+        base = {'host': 'target', 'operation': 'a' * 32,
+                'controller_epoch': 3, 'agent': 'dev', 'owner': 'runner',
+                'lease_epoch': 7, 'step': 'publish',
+                'action_id': 'a' * 32 + ':publish', 'cwd': '/w/source'}
+        transfer = {'host': 'target', 'operation': 'a' * 32,
+                    'controller_epoch': 3, 'agent': 'dev', 'owner': 'runner',
+                    'lease_epoch': 7, 'step': 'transfer',
+                    'action_id': 'a' * 32 + ':transfer', 'branch': 'main',
+                    'commit': COMMIT, 'project': 'ameesh'}
+        for step, fields in (('publish', base), ('transfer', transfer)):
+            for repository in ('/home/other/private.git', './private.git',
+                               'private.git', 'file:///home/other/private.git',
+                               'ext::sh -c id', '-option',
+                               'C:/private.git', 'git+https://forge.example/r.git'):
+                with self.subTest(step=step, repository=repository), \
+                        self.assertRaises(handoff_contract.ContractError):
+                    handoff_contract.validate_effect_request(
+                        dict(fields, repository=repository))
+            for repository in ('git@forge.example:manaty/r.git',
+                               'ssh://git@forge.example/manaty/r.git',
+                               'ssh://git@[::1]/r.git',
+                               'https://forge.example/manaty/r.git',
+                               'http://forge.example/manaty/r.git'):
+                with self.subTest(step=step, repository=repository):
+                    self.assertEqual(
+                        handoff_contract.validate_effect_request(
+                            dict(fields, repository=repository))['repository'],
+                        repository)
+        self.assertEqual(handoff_contract.repository_transport(
+            'git@forge.example:manaty/r.git'), 'scp')
+        self.assertIsNone(handoff_contract.repository_transport(
+            'file:///home/other/private.git'))
+
+    def test_host_git_refuses_a_repository_outside_the_network_transports(self):
+        for repository in ('/home/other/private.git', 'file:///home/other/private.git',
+                           'ext::sh -c id', '-option', 'private.git'):
+            with self.subTest(repository=repository), self.assertRaises(
+                    companion.Refused):
+                companion.HostGit.repository(repository)
+        self.assertEqual(companion.HostGit.repository('git@forge:r.git'),
+                         'git@forge:r.git')
+
+    def test_host_git_environment_allows_only_the_admitted_protocols(self):
+        seen = {}
+
+        def runner(argv, *, timeout, env, cwd, check):
+            seen.update(env)
+            return subprocess.CompletedProcess(argv, 0, '', '')
+
+        companion.HostGit(runner=runner).run('dev', '/home/dev', '/w', ['status'])
+        self.assertEqual(seen['GIT_ALLOW_PROTOCOL'],
+                         ':'.join(companion.GIT_PROTOCOLS))
+        self.assertNotIn('file', seen['GIT_ALLOW_PROTOCOL'].split(':'))
 
     def test_prepare_receipt_refuses_a_target_executor_or_missing_caps(self):
         request = handoff_contract.validate_effect_request({
@@ -623,6 +706,7 @@ class EffectsTest(RequestMixin, unittest.TestCase):
         target = self.fx.work / 'a' / 'systemd' / 'system' / 'checkout'
         effects = companion.HostEffects(
             enrollment=self.fx.execution, system=self.fx.system,
+            git=self.fx.git,
             work_dir=lambda agent, project: str(target))
         receipt = effects.perform(self.request(self.fx, 'transfer'))
         self.assertIs(receipt['ok'], True)
@@ -636,6 +720,7 @@ class EffectsTest(RequestMixin, unittest.TestCase):
         (self.fx.work / 'linked').symlink_to(outside)
         effects = companion.HostEffects(
             enrollment=self.fx.execution, system=self.fx.system,
+            git=self.fx.git,
             work_dir=lambda agent, project: str(self.fx.work / 'linked' / agent))
         receipt = effects.perform(self.request(self.fx, 'transfer'))
         self.assertIs(receipt['ok'], False)
@@ -1552,7 +1637,33 @@ class AdapterTest(PgTestCase):
         wrong_epoch['evidence']['pending_effect']['epoch'] = 9
         self.assertIs(self.adapter.publish(wrong_epoch)['ok'], False)
 
-    def test_repository_userinfo_is_refused_before_reservation(self):
+    def test_adapter_binds_each_request_to_the_enrolled_hosts_and_repository(self):
+        operation = self.plain('publish')
+        outside = dict(operation['plan'],
+                       repository='git@forge:manaty/other.git')
+        with self.assertRaisesRegex(factory_module.FactoryError,
+                                    'repository:enrolled'):
+            self.adapter.publish(dict(operation, plan=outside))
+        for field in ('source', 'target'):
+            with self.subTest(field=field), self.assertRaisesRegex(
+                    factory_module.FactoryError, 'identity:' + field):
+                self.adapter.publish(dict(operation, **{field: 'unknown'}))
+
+    def test_prerequisites_refuse_a_repository_outside_repositories_json(self):
+        self.db.execute(
+            "UPDATE host_handoffs SET plan = jsonb_set(plan, '{repository}',"
+            " to_jsonb(%s::text)) WHERE id=%s",
+            ('git@forge:manaty/other.git', self.row['id']))
+        self.assertIs(self.factory.provider.revalidate(self.plain('revalidate')),
+                      False)
+
+    def test_prerequisites_refuse_a_changed_agent_project(self):
+        self.db.execute("UPDATE agent_registry SET chantier='nexlink'"
+                        " WHERE name='dev'")
+        self.assertIs(self.factory.provider.revalidate(self.plain('revalidate')),
+                      False)
+
+    def test_repository_outside_an_enrolled_transport_is_refused_before_reservation(self):
         self.db.execute("UPDATE host_handoffs SET state='cancelled' WHERE id=%s",
                         (self.row['id'],))
         candidate = self.candidate()
@@ -1562,7 +1673,10 @@ class AdapterTest(PgTestCase):
                            'ssh://TOKEN@forge.example/r.git',
                            'ssh://git:secret@forge.example/r.git',
                            'https://git@forge.example/r.git',
-                           'TOKEN@forge.example:manaty/r.git'):
+                           'TOKEN@forge.example:manaty/r.git',
+                           '/home/other/private.git',
+                           'file:///home/other/private.git',
+                           'ext::sh -c id', '-option'):
             with self.subTest(repository=repository), self.assertRaises(
                     handoffs.HandoffError):
                 handoffs.request(self.db, candidate, repository=repository)

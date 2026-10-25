@@ -143,11 +143,18 @@ names; the private reference mapping is available separately for the L232c
 bridge and never enters `Requirements` or an error. A missing or unsafe
 document, an unenrolled host, harness or account, an unknown project
 repository, a credential-bearing repository URL, an endpoint outside the
-private enrollment or a missing adapter method refuses admission. Only the SSH
-userinfo `git@` is admitted, in URL or scp-like form; HTTP(S)/`git+https`
-userinfo is refused as a credential. Documents must be regular files: the
-final type is checked before opening, the open is non-blocking and the
-descriptor is checked again, so a FIFO or a device cannot hang admission.
+private enrollment or a missing adapter method refuses admission. Repository
+identities are a closed set of network transports: scp-like `git@host:path`
+(SSH) and `ssh://`, `https://`, `http://` or `git://` URLs. A local path,
+`file://`, `ext::`, an unknown scheme or an initial `-` is refused before any
+Git command; userinfo is refused except the SSH user `git` (HTTP(S) userinfo
+may carry a token). The adapter binds every request to the source and target
+hosts admitted by `hosts.json` and to the project repository of the current
+agent in `repositories.json`; the controller-side companion repeats that check
+before an effect, so a caller-chosen `--repository` cannot widen the
+enrollment. Documents must be regular files: the final type is checked before
+opening, the open is non-blocking and the descriptor is checked again, so a
+FIFO or a device cannot hang admission.
 
 H1 binds no host effect. The companion's capabilities refuse by name until H2
 (preparation and Git) and H3 (activation, health and recovery) replace them;
@@ -168,6 +175,13 @@ memory caps; `stop_source` stops only the enrolled unit and proves its cgroup
 is quiescent. None of these steps starts or enables the destination executor.
 `publish` is read-only: a branch absent from the remote or a failed remote
 read is a definitive, retryable refusal, never an ambiguous intent.
+
+The host Git runner admits only the closed network transports above through
+`GIT_ALLOW_PROTOCOL`, so Git itself refuses a local path, `file://` or
+`ext::` even if a config tries to rewrite the URL. It re-checks the repository
+identity before `remote add`, `fetch` or `ls-remote`, and compares the stored
+`remote.origin.url` rather than a `url.*.insteadOf` rewrite. An option-like
+value (`-...`) or an unknown scheme is refused before any Git process starts.
 
 The controller-side companion checks the durable operation `pending_effect`,
 the placement/lease, both canon states, the destination gate and the existing

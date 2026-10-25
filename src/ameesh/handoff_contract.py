@@ -63,34 +63,62 @@ def _epoch(value, minimum):
     return isinstance(value, int) and not isinstance(value, bool) and value >= minimum
 
 
-def repository_identity(value):
-    """A bounded repository reference without credential userinfo.
+#: The closed set of Git transports an enrolled repository may name. A local
+#: path, ``file://``, ``ext::``, an unknown scheme and an option-like value
+#: (leading ``-``) are never admitted: the host passes this identity to Git.
+REPOSITORY_SCHEMES = ("ssh", "https", "http", "git")
+_REPOSITORY_HOST = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+_REPOSITORY_IPV6 = re.compile(r"^[0-9A-Fa-f:]*:[0-9A-Fa-f:]*$")
 
-    HTTP(S)/``git+https`` userinfo may carry a token
-    (``http://TOKEN@forge/r.git``), so only the SSH user ``git`` is admitted,
-    in its URL and scp-like forms. Query strings, fragments, passwords and
-    control bytes are always refused.
+
+def _repository_host(value):
+    """A DNS name or a bracketed IPv6 literal (``urlsplit`` drops brackets)."""
+    return (_REPOSITORY_HOST.fullmatch(value) is not None
+            or _REPOSITORY_IPV6.fullmatch(value) is not None)
+
+
+def repository_transport(value):
+    """Name the admitted Git transport of a repository identity, or ``None``.
+
+    Only a network transport is admitted: scp-like ``git@host:path`` (SSH) and
+    ``ssh://``, ``https://``, ``http://`` or ``git://`` URLs. Userinfo is
+    refused except the SSH user ``git`` (HTTP(S) userinfo may carry a token).
+    Query strings, fragments, passwords, control bytes, local paths and an
+    initial ``-`` (which Git could read as an option) are always refused.
     """
     if (not isinstance(value, str) or not value or len(value) > 1024
-            or any(ord(char) < 32 or ord(char) == 127 for char in value)):
-        return False
+            or value.startswith("-")):
+        return None
+    if any(ord(char) <= 32 or ord(char) == 127 for char in value):
+        return None
     try:
         parsed = urlsplit(value)
     except ValueError:
-        return False
+        return None
     if parsed.password is not None or parsed.query or parsed.fragment:
-        return False
-    if parsed.username is not None:
-        return (parsed.scheme in ("ssh", "git+ssh")
-                and parsed.username == "git" and bool(parsed.hostname))
-    if parsed.scheme in ("http", "https", "ssh", "git", "git+ssh", "git+https"):
-        return bool(parsed.hostname)
-    if "://" not in value:
-        head, separator, _ = value.partition(":")
-        if separator and "@" in head:
-            user, _, host = head.rpartition("@")
-            return user == "git" and bool(host)
-    return True
+        return None
+    scheme = parsed.scheme.lower()
+    if scheme:
+        if scheme not in REPOSITORY_SCHEMES:
+            return None
+        if parsed.username is not None and not (
+                scheme == "ssh" and parsed.username == "git"):
+            return None
+        host = parsed.hostname or ""
+        return scheme if _repository_host(host) else None
+    # No scheme: only the scp-like SSH form ``git@host:path`` is a transport.
+    head, separator, path = value.partition(":")
+    if not separator or not path:
+        return None
+    user, at, host = head.rpartition("@")
+    if not at or user != "git" or not _repository_host(host):
+        return None
+    return "scp"
+
+
+def repository_identity(value):
+    """A bounded enrolled repository identity on one admitted transport."""
+    return repository_transport(value) is not None
 
 
 def _repository(value):
