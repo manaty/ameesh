@@ -10,8 +10,9 @@ l'intérieur d'un agrégat qui a conclu restent non bloquants (§3). »
 run annulé où seuls la part macOS (2 min) et l'agrégat concluaient a publié
 `tests` SUCCESS alors que les 8 psycopg et les 16 psql étaient annulés (run
 40144843565, paquet h-13, fusionné sans suite Linux). #3449 borne la
-tolérance : les familles **Linux planifiées** sont la preuve de la suite, et
-une d'elles absente ou non concluante est une preuve absente.
+tolérance : les familles **Linux planifiées** sont la preuve de la suite ;
+une famille sans **aucune part réussie** est une preuve absente, tandis
+qu'une part perdue parmi d'autres réussies reste consignée (15/16).
 
 Ce script sépare donc trois cas :
 
@@ -38,10 +39,11 @@ Ce script sépare donc trois cas :
   (toutes annulées ou sautées), c'est l'absence de toute preuve : l'agrégat
   rougit (décision #128512, #940).
 * un **run annulé** ne conclut pas : l'étape `if: cancelled()` du workflow
-  échoue explicitement avant le bilan, et les familles Linux annulées sont
-  vues par la classification (`needs.*.result`), pas seulement par cette
-  garde — un job `always()` démarré après l'annulation du run ne voit pas
-  toujours `cancelled()` (#3449, run 40144843565).
+  échoue explicitement avant le bilan, et une famille Linux sans part
+  réussie est vue par la classification (`needs.*.result` et jobs du run),
+  pas seulement par cette garde — un job `always()` démarré après
+  l'annulation du run ne voit pas toujours `cancelled()` (#3449, run
+  40144843565).
 
 Le check de détail est publié à **chaque** exécution (vert quand toutes les
 parts ont conclu) : une tentative ultérieure sur la même tête remplace ainsi
@@ -117,10 +119,15 @@ def _json_list(text) -> list | None:
 
 
 def _family_jobs(jobs, family: str) -> list:
-    """Les jobs d'une famille (`psycopg 1/8`, `psql 1/16`) parmi les jobs lus."""
+    """Les jobs d'une famille (`psycopg 1/8`, `psql 1/16`) parmi les jobs lus.
+
+    Appelée par `paquet.yml`, `tests.yml` est un workflow réutilisable : l'API
+    préfixe le nom de chaque job appelé par celui du job appelant
+    (`suite complète du paquet / psycopg 1/8`). On lit donc la feuille après
+    le dernier ` / `, sans dépendre du préfixe."""
     prefix = family + " "
     return [job for job in (jobs or []) if isinstance(job, dict)
-            and str(job.get("name", "")).startswith(prefix)]
+            and str(job.get("name", "")).rsplit(" / ", 1)[-1].startswith(prefix)]
 
 
 def _job_stats(jobs, expected):
@@ -254,10 +261,11 @@ def classify(*, event, plan, version, version_only, docs_only, doc_readers,
             required=False)
 
     # Décision #128512 : « agrégat requis jamais conclu = preuve absente, donc
-    # bloquant ». #3449 : une annulation de famille Linux est déjà une preuve
-    # absente ci-dessus ; ici on ferme le cas où **aucune** part due n'a réussi
-    # (toutes annulées ou sautées), y compris si seules des parts non requises
-    # ont conclu — #940 reste fermé (jamais de tests SUCCESS sans test).
+    # bloquant ». #3449 : une famille Linux sans part réussie est déjà une
+    # preuve absente ci-dessus ; ici on ferme le cas où **aucune** part due
+    # n'a réussi (toutes annulées ou sautées), y compris si seules des parts
+    # non requises ont conclu — #940 reste fermé (jamais de tests SUCCESS
+    # sans test).
     if parts and not any(row["result"] == "success" for row in parts):
         missing.append("aucune part n'a conclu (preuve absente)")
 

@@ -134,6 +134,20 @@ class RunAnnuleTest(unittest.TestCase):
         self.assertIn("psql", detail[3])
         self.assertIn("15/16 part(s) réussie(s)", detail[3])
 
+    def test_les_jobs_prefixes_par_le_portier_sont_reconnus(self):
+        # Appelée par paquet.yml, tests.yml est un workflow réutilisable :
+        # l'API préfixe les jobs appelés par « suite complète du paquet / ».
+        jobs = [{"name": "suite complète du paquet / psql 1/16",
+                 "conclusion": "success"},
+                {"name": "suite complète du paquet / psycopg 1/8",
+                 "conclusion": "cancelled"},
+                {"name": "suite complète du paquet / tests",
+                 "conclusion": "success"}]
+        self.assertEqual([job["name"] for job in agregat._family_jobs(jobs, "psql")],
+                         ["suite complète du paquet / psql 1/16"])
+        self.assertEqual([job["name"] for job in agregat._family_jobs(jobs, "psycopg")],
+                         ["suite complète du paquet / psycopg 1/8"])
+
     def test_le_script_lit_les_jobs_du_run_par_l_api(self):
         seen = []
         created = []
