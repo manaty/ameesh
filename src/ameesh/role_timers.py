@@ -12,9 +12,9 @@ left in the full ``ameesh-notify`` service, whose routes lived on one host
 only (``pc-smichea``): when it was off, nothing was pushed (three times on
 2026-10-24). The ``alerts`` pass is now a role timer too; a candidate that
 cannot push to the role's responsible (and ``notify.default_human``) through
-a remote channel (ntfy, slack) does not install the timer and reports the gap
-as an advisory warning (#3402: the missing secret is not a failure, still
-less a deploy failure).
+a remote channel (ntfy, slack, or nexlink with a usable fallback, #3536)
+does not install the timer and reports the gap as an advisory warning
+(#3402: the missing secret is not a failure, still less a deploy failure).
 
 #3568: that warning was not enough when the *lease holder* was a host without
 a route: the `alerts` timer exists only on route-capable candidates, so none
@@ -329,10 +329,12 @@ def notify_reach(cfg, *, responsible=None, env: dict | None = None) -> tuple[lis
     The holder pushes on its own routes, whichever candidate it is. The
     humans required are the role's responsible and ``notify.default_human``;
     each needs, through ``channels_for`` (an empty route excludes, #3007), a
-    remote push channel (``ntfy``, ``slack``) whose secret resolves in the
-    unit's environment. ``desktop`` (the holder's graphical session) and
-    ``app`` (nothing pushed) do not count. Any gap is named; a candidate that
-    would hold the lease and push nothing is the silence #3383 reports.
+    remote push channel (``ntfy``, ``slack``, ``nexlink``) whose secret
+    resolves in the unit's environment; a ``nexlink`` channel whose crypto or
+    secret is missing is covered by its configured fallback (#3536).
+    ``desktop`` (the holder's graphical session) and ``app`` (nothing pushed)
+    do not count. Any gap is named; a candidate that would hold the lease and
+    push nothing is the silence #3383 reports.
     """
     from . import notify as notify_mod
     try:
@@ -353,9 +355,10 @@ def notify_reach(cfg, *, responsible=None, env: dict | None = None) -> tuple[lis
         if not channels:
             gaps.append("%s has no route on this host" % human)
             continue
-        problems = [notify_mod.remote_push_problem(channel, env) for channel in channels]
+        problems = [notify_mod.remote_push_problem(channel, env, ncfg=ncfg)
+                    for channel in channels]
         if all(problems):
-            gaps.append("%s has no usable remote push (ntfy, slack): %s"
+            gaps.append("%s has no usable remote push (ntfy, slack, nexlink): %s"
                         % (human, "; ".join(problems)))
     if gaps:
         return [], " ".join("; ".join(gaps).split())[:400]

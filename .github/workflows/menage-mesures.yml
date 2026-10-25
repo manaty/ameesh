@@ -1,0 +1,57 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# #3564 — ménage des mesures d'un run `carte` après sa conclusion.
+#
+# Le job `menage-mesures` de carte.yml supprime les `mesure-*` de son run à
+# toute issue (`always()`, #3546). Mais GitHub ne crée pas toujours un job
+# encore en file quand le run est annulé : l'agrégat `always()` de tests.yml
+# a démarré après l'annulation au run 40180614008, jamais au run 38917093257.
+# Un ménage manqué rendait au quota de l'organisation (500 Mo) jusqu'à
+# ~100 Mio par run pendant le jour de rétention (mesure #2376).
+#
+# Ce workflow se déclenche APRÈS la conclusion du run (`workflow_run`), quand
+# plus rien ne peut être annulé, et applique la règle de carte.yml par
+# `scripts/purge-artefacts.py --run` : les mesures d'un run terminé sont
+# supprimées, sauf hors PR quand la matrice est verte et la fusion en échec
+# ou annulée (rejeu du seul job `carte`) ; le statut du run est relu avant
+# chaque suppression, un run relancé garde ses mesures. Sur un run déjà
+# nettoyé, il ne trouve rien : quelques secondes.
+#
+# Le fichier doit vivre sur la branche par défaut pour que `workflow_run` se
+# déclenche ; `actions/checkout` y prend donc le code de la branche par défaut,
+# jamais celui de la PR : le jeton `actions: write` n'exécute que du code de
+# confiance (même règle que flux-orphelins, #2097). C'est aussi ce qui lui
+# permet de nettoyer les runs des PR de fork, dont le jeton est en lecture.
+# `ubuntu-latest` : jamais en file derrière la mesure sur le pool (#876) ; le
+# dépôt est public, ce runner standard n'est pas facturé (canon §3).
+name: menage mesures
+
+on:
+  workflow_run:
+    workflows: ["carte"]
+    types: [completed]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: menage-mesures-${{ github.event.workflow_run.id }}
+  cancel-in-progress: false
+
+jobs:
+  menage:
+    name: ménage des mesures du run carte
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read   # actions/checkout, branche par défaut
+      actions: write   # lire le run, supprimer ses mesures
+    steps:
+      - uses: actions/checkout@v4
+      - name: supprimer les mesures du run terminé
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          timeout 240 python3 scripts/purge-artefacts.py
+          --repo "${{ github.repository }}"
+          --run "${{ github.event.workflow_run.id }}"
+          --appliquer
