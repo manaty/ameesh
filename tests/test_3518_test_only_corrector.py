@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""#3518: test-only corrections exclude the person, not their family."""
+"""#3518/#3577: test-only corrections exclude the person, not their family."""
 from __future__ import annotations
 
 import types
@@ -15,10 +15,19 @@ from .test_2447_review_designation_activation import _Repo
 
 def canon():
     return types.SimpleNamespace(root="fixture", sources=[], federation={
-        "review_policies": {"risk_classes": {"projects": {"ameesh": {
-            "default": "light", "rules": [
-                {"paths": ["**/*.sql", "tests/parts/**", "src/**"],
-                 "class": "sensitive"}]}}}}})
+        "review_policies": {"risk_classes": {"projects": {
+            "ameesh": {
+                "default": "light", "rules": [
+                    {"paths": ["**/*.sql", "tests/parts/**", "src/**"],
+                     "class": "sensitive"}]},
+            # #3577 / Nexlink #3062 : les specs licoin sont classées sensibles
+            # (argent) par la politique du projet, mais restent des tests.
+            "nexlink": {
+                "default": "light", "rules": [
+                    {"paths": ["backend/src/modules/licoin/**",
+                               "backend/test/licoin*"],
+                     "class": "sensitive"}]},
+        }}}})
 
 
 class TestOnlyCorrectorTest(PgTestCase):
@@ -70,6 +79,10 @@ class TestOnlyCorrectorTest(PgTestCase):
                                   actor=name, verdict="ok")
             self.verdict_receipt(mark, family)
 
+    def set_app(self, app: str) -> None:
+        self.db.execute("UPDATE work_items SET app = %s WHERE id = %s",
+                        (app, self.lot))
+
     def test_test_only_fix_keeps_family_but_never_its_own_verdict(self):
         self.freeze(["tests/test_product.py"])
         out = self.gate()
@@ -88,17 +101,46 @@ class TestOnlyCorrectorTest(PgTestCase):
         self.freeze(["tests/parts/always.txt"])
         self.assertFalse(self.gate()["ok"])
 
-    def test_sensitive_test_sql_excludes_family(self):
+    def test_sensitive_test_sql_keeps_family_eligible(self):
+        # #3577 : un test SQL reste un test, même classé sensible par *.sql.
         self.freeze(["tests/test_access.sql"])
-        self.assertFalse(self.gate()["ok"])
+        out = self.gate()
+        self.assertTrue(out["ok"], out)
+        self.assertEqual(out["corrections"], ["cx2"])
+        self.assertEqual({row["actor"] for row in out["accepted"]}, {"cx3", "dev1"})
 
-    def test_sensitive_non_sql_test_keeps_family_excluded(self):
+    def test_sensitive_test_path_keeps_family_eligible(self):
         policy = canon()
         policy.federation["review_policies"]["risk_classes"]["projects"]["ameesh"][
             "rules"].append({"paths": ["tests/test_product.py"], "class": "sensitive"})
         self.freeze(["tests/test_product.py"])
         with mock.patch.object(work, "configured_canons", return_value=[policy]):
-            self.assertFalse(self.gate()["ok"])
+            out = self.gate()
+        self.assertTrue(out["ok"], out)
+        self.assertEqual(out["corrections"], ["cx2"])
+        self.assertEqual({row["actor"] for row in out["accepted"]}, {"cx3", "dev1"})
+
+    def test_nexlink_sensitive_specs_keep_family_eligible(self):
+        # Témoin #3062 : les deux specs licoin sont SENSITIVE par la politique
+        # du projet (argent) et restent pourtant une correction de tests seuls.
+        self.set_app("nexlink")
+        self.freeze(["backend/src/modules/licoin/licoin.service.spec.ts",
+                     "backend/test/licoin.e2e-spec.ts"])
+        out = self.gate()
+        self.assertTrue(out["ok"], out)
+        self.assertEqual(out["corrections"], ["cx2"])
+        self.assertEqual({row["actor"] for row in out["accepted"]}, {"cx3", "dev1"})
+
+    def test_nexlink_sensitive_specs_with_product_file_exclude_family(self):
+        # Témoin #3577 : un seul fichier produit sous le même chemin sensible
+        # suffit à exclure la famille du correcteur.
+        self.set_app("nexlink")
+        self.freeze(["backend/src/modules/licoin/licoin.service.spec.ts",
+                     "backend/test/licoin.e2e-spec.ts",
+                     "backend/src/modules/licoin/licoin.service.ts"])
+        out = self.gate()
+        self.assertFalse(out["ok"], out)
+        self.assertEqual([row["actor"] for row in out["accepted"]], ["dev1"])
 
     def test_unknown_policy_does_not_grant_an_exception(self):
         self.freeze(["tests/test_product.py"])
