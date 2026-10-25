@@ -146,6 +146,10 @@
         L165 (EP5) : une minuterie mécanique ne tourne que sur l'hôte qui
         détient le bail vivant de ce rôle (composeur, veille GitHub, guet CI) ;
         l'époque du bail est passée à la commande pour la garde EP4 ;
+  ameesh role canary [--json]   L165 (EP7 P3) : geste sans effet gardé par
+        l'époque du bail de l'environnement (AMEESH_ROLE + AMEESH_LEASE_EPOCH,
+        ou session liée) ; 0 accepté (un `pilot.gesture` canary), 1 refusé
+        (détenteur nommé, rien journalisé), 2 aucun bail à garder ;
   ameesh role status [ROLE] [--json]   elected roles: holder, epoch, ranked
                                         candidates (L165); the runners publish;
   ameesh role timers [--role R] [--install|--check|--remove] [--no-apply] [--no-sync] [--json]
@@ -358,7 +362,8 @@ def _dispatch(argv: list[str] | None) -> int:
         from . import host_lifecycle
         return host_lifecycle.main(rest)
     if command == "role":
-        # L165 (EP2) : détenteur, époque et candidats classés d'un rôle élu
+        # L165 (EP2) : détenteur, époque et candidats classés d'un rôle élu ;
+        # EP7 P3 (#3433) : `role canary`, le geste sans effet de l'exercice
         from . import role
         return role.main(rest)
     if command == "plan":
