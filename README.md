@@ -33,6 +33,7 @@ What v1 does (design: [`docs/design/specification.md`](docs/design/specification
 ameesh canon check | show | sync                  # canon → registry of this host
 agent-runner [--once]  |  ameesh attach <agent>   # the host's runner; interactive takeover
 ameesh role status [ROLE] [--json]                # elected roles: holder, epoch, ranked candidates (L165)
+ameesh role canary [--json]                       # no-op gesture fenced by the lease epoch (L165/EP7)
 ameesh mail send <agent> "<text>"                 # agent-mail, unchanged for the hooks
 ameesh fil list | show <project> [<lot>]          # readable threads
 ameesh action propose | execute | reconcile …     # the gate
