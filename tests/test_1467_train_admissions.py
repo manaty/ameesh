@@ -7,10 +7,11 @@ import shutil
 import subprocess
 import threading
 import types
+import unittest
 from unittest import mock
 
-from ameesh import (registry, resolutions, storage, train, train_admissions,
-                    train_candidates, train_git, train_history, train_policy, work)
+from ameesh import (merge_queue, plan_github, radar, registry, resolutions, storage, train,
+                    train_admissions, train_candidates, train_git, train_history, train_policy, work)
 from ameesh.db import DbError
 from .support import PgTestCase
 from .test_1467_train_review import author, verdict
@@ -337,18 +338,52 @@ class TrainAdmissionsTest(PgTestCase):
         (row,) = self.ops.queue(None)
         self.assertIs(row["packet_allocated"], False)
 
-    def test_3560_enrolled_row_is_marked_and_an_ejected_row_names_the_blocking_cause(self):
+    def test_3560_enrolled_row_is_marked_and_an_other_ejection_names_the_blocking_cause(self):
         base, _, _, item, candidate, preparation, _ = self.enrollment_fixture()
         admitted = self.enrollment(preparation).enroll(candidate, base, actor="fixture")
         self.assertIs(admitted["entry"]["packet_allocated"], True)
         (row,) = self.ops.queue(None)
         self.assertIs(row["packet_allocated"], True)
-        # what the radar queue did to #2376 and #3537 before #3560
-        self.ops.queue_update(item, state="ejected", reason="ci_required: no CI on the frozen head",
+        self.ops.queue_update(item, state="ejected", reason="stacked trial: conflict not covered on a.py",
                               note="ejected", actor="radar")
+        self.assertFalse(self.enrollment(preparation).decide(candidate, base)["recover"])
         with self.assertRaisesRegex(train.TrainError,
-                                    r"existing queue row blocks it \(state ejected.*ci_required"):
+                                    r"existing queue row blocks it \(state ejected.*stacked trial"):
             self.enrollment(preparation).enroll(candidate, base, actor="next-cutoff")
+
+    def test_3560_enrolled_then_ejected_ci_required_is_enrolled_again_at_the_next_composition(self):
+        base, _, head, item, candidate, preparation, _ = self.enrollment_fixture()
+        admitted = self.enrollment(preparation).enroll(candidate, base, actor="fixture")
+        first = admitted["entry"]
+        # what the radar queue did to #2376 and #3537 before #3560
+        self.ops.queue_update(item, state="ejected", note="ejected", actor="radar",
+                              reason="project fixture %s: no run on %s yet"
+                                     % (storage.interface.CI_REQUIRED_EJECTION, head[:12]))
+        decision = self.enrollment(preparation).decide(candidate, base)
+        self.assertIs(decision["initial"], False)
+        self.assertIs(decision["recover"], True)
+        again = self.enrollment(preparation).enroll(candidate, base, actor="next-cutoff")
+        entry = again["entry"]
+        self.assertEqual((entry["state"], entry["reason"], entry["packet_allocated"]), ("queued", "", True))
+        self.assertGreater(entry["generation"], first["generation"])
+        self.assertEqual((entry["frozen_id"], entry["frozen_sha"]), (first["frozen_id"], first["frozen_sha"]))
+        # a replay at the following cutoff keeps the requeued generation
+        self.assertEqual(self.enrollment(preparation).enroll(candidate, base, actor="replay")["entry"], entry)
+
+    def test_3560_ci_required_ejection_of_a_refrozen_allocation_still_refuses(self):
+        base, _, head, item, candidate, preparation, _ = self.enrollment_fixture()
+        self.enrollment(preparation).enroll(candidate, base, actor="fixture")
+        reason = "project fixture %s: no run" % storage.interface.CI_REQUIRED_EJECTION
+        self.ops.queue_update(item, state="ejected", reason=reason, note="ejected", actor="radar")
+        self.ops.add_milestone(item, "frozen", sha=head, actor="author", verdict=None, note="regel")
+        refrozen = next(mark for mark in self.ops.milestones(item, None)
+                        if mark["kind"] == "frozen" and mark["note"] == "regel")
+        with self.assertRaisesRegex(train.TrainError, "latest exact freeze"):
+            self.enrollment(preparation).enroll(candidate, base, actor="next-cutoff")
+        candidate = dict(candidate, candidate=dict(candidate["candidate"], declared=refrozen))
+        with self.assertRaisesRegex(train.TrainError, "existing queue row blocks it"):
+            self.enrollment(preparation).enroll(candidate, base, actor="next-cutoff")
+        self.assertEqual(self.ops.queue(None)[0]["state"], "ejected")
 
     def test_recorded_enrollment_survives_clone_loss_and_fresh_connection_then_reports_withdrawal(self):
         base, _, _, item, candidate, preparation, _ = self.enrollment_fixture()
@@ -557,6 +592,68 @@ class PacketAllocationTest(PgTestCase):
                 self.assertEqual(self.ops.queue(None)[0]["generation"], existing["generation"])
                 self.assertEqual(self.ops.queue(None)[0]["state"], state)
 
+    def eject_for_want_of_ci(self, reason=None):
+        self.ops.queue_update(self.item, state="ejected", note="radar landing", actor="radar",
+                              reason=reason or "project fixture %s: no run on %s yet"
+                              % (storage.interface.CI_REQUIRED_EJECTION, HEAD[:12]))
+
+    def receipts(self):
+        return self.db.query("SELECT generation, kind FROM integration_train_queue_receipts"
+                             " WHERE work_item_id = %s ORDER BY id", (self.item,))
+
+    def test_3560_ci_required_ejection_of_the_allocation_is_requeued_under_a_new_generation(self):
+        row = self.allocate()
+        self.eject_for_want_of_ci()
+        again = self.allocate(actor="next-cutoff")
+        self.assertEqual((again["state"], again["reason"], again["rank"], again["landing_sha"]),
+                         ("queued", "", None, None))
+        self.assertGreater(again["generation"], row["generation"])
+        self.assertIs(again["packet_allocated"], True)
+        self.assertEqual(self.ops.queue(None), [again])
+        self.assertEqual(self.receipts(), [{"generation": row["generation"], "kind": "packet"},
+                                           {"generation": again["generation"], "kind": "packet"}])
+        self.assertTrue(any("#3560" in (event.get("note") or "")
+                            for event in work.events(self.db, self.item)))
+        self.assertEqual(self.allocate(actor="replay"), again)
+        # a writer still on the ejected generation is fenced out
+        self.assertIsNone(self.ops.queue_update(
+            self.item, state="ejected", reason="stale", entry=(row["generation"], "main",
+                                                               row["frozen_id"], HEAD)))
+        self.assertEqual(self.ops.queue(None), [again])
+
+    def test_3560_only_a_ci_required_ejection_of_the_same_allocation_is_requeued(self):
+        self.allocate()
+        self.eject_for_want_of_ci(reason="stacked trial: conflict not covered on a.py")
+        self.assertIsNone(self.allocate())
+        self.eject_for_want_of_ci()
+        for change in (dict(source="another-origin"), dict(target="develop"), dict(frozen_sha=BASE)):
+            with self.subTest(change=change):
+                self.assertIsNone(self.allocate(**change))
+        self.assertEqual(self.ops.queue(None)[0]["state"], "ejected")
+
+    def test_3560_ci_required_ejection_of_an_individual_row_is_not_adopted(self):
+        existing = self.allocate(packet=None)
+        self.eject_for_want_of_ci()
+        self.assertIsNone(self.allocate())
+        self.assertEqual(self.ops.queue(None)[0]["generation"], existing["generation"])
+        self.assertEqual(self.receipts(), [])
+
+    def test_3560_ci_required_ejection_after_refreeze_is_not_requeued(self):
+        self.allocate()
+        self.eject_for_want_of_ci()
+        mark = self.ops.add_milestone(self.item, "frozen", sha=HEAD, actor="fixture",
+                                      verdict=None, note="regel")
+        self.assertIsNone(self.allocate())
+        self.assertIsNone(self.allocate(frozen_id=mark["id"]))
+        self.assertEqual(self.ops.queue(None)[0]["state"], "ejected")
+
+    def test_3560_withdrawn_allocation_is_not_requeued(self):
+        self.allocate()
+        self.eject_for_want_of_ci()
+        self.assertTrue(self.ops.queue_remove(self.item, note="withdrawn", actor="assignee"))
+        self.assertIsNone(self.allocate())
+        self.assertEqual(self.ops.queue(None), [])
+
     def test_free_text_packet_receipt_cannot_adopt_an_individual_generation(self):
         existing = self.allocate(packet=None)
         forged = "ameesh-queue-receipt/1 " + json.dumps(dict(
@@ -733,3 +830,26 @@ class PacketAllocationTest(PgTestCase):
             self.assertTrue(ops.queue_remove(self.item, note="retry removal", actor="fixture"))
         self.assertEqual(other.query("SELECT kind FROM integration_train_queue_receipts WHERE kind = %s",
                                      (kind,)), [dict(kind=kind)])
+
+
+class CiRequiredEjectionTextTest(unittest.TestCase):
+    """#3560: the queue writes the text `queue_add` recognizes, and only for
+    a project that requires CI on the frozen commit."""
+
+    def eject(self, ci_required, reader):
+        project = radar.Project("nexlink", "/r", github="o/nexlink", ci_required=ci_required)
+        with self.assertRaises(merge_queue.QueueError) as raised:
+            merge_queue._required_ci(project, HEAD, reader)
+        return dict(state="ejected", reason=str(raised.exception))
+
+    def test_no_run_or_unreadable_ci_is_recognized_only_under_ci_required(self):
+        def unreadable(sha):
+            raise plan_github.GithubError("gh down")
+        for reader in (lambda sha: {"runs": []}, unreadable):
+            with self.subTest(reader=reader):
+                self.assertTrue(storage.interface.ci_required_ejection(self.eject(True, reader)))
+                self.assertFalse(storage.interface.ci_required_ejection(self.eject(False, reader)))
+        red = self.eject(True, lambda sha: {"runs": ["x"], "pending": [], "failed": ["x"]})
+        self.assertFalse(storage.interface.ci_required_ejection(red))
+        self.assertFalse(storage.interface.ci_required_ejection(dict(red, state="queued",
+            reason=storage.interface.CI_REQUIRED_EJECTION)))

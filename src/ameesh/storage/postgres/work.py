@@ -2443,8 +2443,35 @@ class WorkItems(interface.WorkItems):
                         allocated = receipt.get("generation")
                 if current is not None:
                     same = (current["generation"], current["target"], current["frozen_id"],
-                            current["frozen_sha"], current["source"], current["state"])
-                    return current if same == (allocated, target, frozen_id, frozen_sha, source, "queued") else None
+                            current["frozen_sha"], current["source"])
+                    if same != (allocated, target, frozen_id, frozen_sha, source):
+                        return None
+                    if current["state"] == "queued":
+                        return current
+                    if not interface.ci_required_ejection(current):
+                        return None
+                    # #3560 : la file radar a éjecté cette allocation faute de CI
+                    # de lot (§11 bis : il n'y en a pas, la CI du paquet en tient
+                    # lieu). Même gel, même SHA, aucun retrait : l'allocation est
+                    # remise en file sous une nouvelle génération et son reçu ;
+                    # un écrivain resté sur l'ancienne génération est refusé.
+                    requeued = tx.query(
+                        "UPDATE merge_queue SET state = 'queued', rank = NULL, landing_sha = NULL,"
+                        "   reason = '', generation = nextval('merge_queue_generation_seq'),"
+                        "   queued_by = %s, queued_at = clock_timestamp(), updated_at = now()"
+                        " WHERE work_item_id = %s AND state = 'ejected' AND generation = %s"
+                        " RETURNING work_item_id",
+                        (actor or "", int(item_id), allocated))
+                    if not requeued:
+                        return None
+                    WorkItems(tx)._event(int(item_id), lot[0]["state"],
+                                         "%s (#3560: allocation ejected for want of a lot CI, "
+                                         "requeued: generation %s)" % (note, allocated), actor)
+                    row = self._queue_row(tx, item_id)
+                    tx.execute("INSERT INTO integration_train_queue_receipts"
+                               " (work_item_id, generation, frozen_id, kind) VALUES (%s, %s, %s, 'packet')",
+                               (row["work_item_id"], row["generation"], row["frozen_id"]))
+                    return dict(row, packet_allocated=True)
                 if allocated is not None:
                     return None  # the allocated entry was withdrawn; do not resurrect it
                 if packet_initial is not True:

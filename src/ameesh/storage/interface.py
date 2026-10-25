@@ -203,6 +203,18 @@ BASKET_LINE_NOTE = "basket line"
 #: défini ici, seul.
 EXTERNAL_EXECUTOR_NOTE = "external executor:"
 EXTERNAL_EXECUTOR_CLEARED_NOTE = "external executor cleared"
+#: #3560 : la cause d'éjection de la file quand le projet exige une CI sur le
+#: commit gelé (`ci_required`) et qu'aucun run ne s'y lit (`merge_queue._required_ci`).
+#: Sur une ligne d'inscription au paquet, ce n'est pas un échec du lot : le §11 bis
+#: ne lance aucune CI de lot, la CI complète du paquet en tient lieu. Le texte est
+#: défini ici, seul : la file l'écrit, `queue_add` et le train le relisent.
+CI_REQUIRED_EJECTION = "requires CI on the frozen commit (ci_required)"
+
+
+def ci_required_ejection(row) -> bool:
+    """#3560 : une ligne de file `ejected` pour la seule absence de CI de lot."""
+    return bool(row) and row.get("state") == "ejected" \
+        and CI_REQUIRED_EJECTION in str(row.get("reason") or "")
 
 
 class Domain(abc.ABC):
