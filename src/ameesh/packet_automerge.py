@@ -330,6 +330,37 @@ def _cutoff_landing_only(repo: str, base: str, head: str) -> bool:
     return bool(shas) and all(_cutoff_commit(repo, sha) for sha in shas)
 
 
+def _in_head(repo: str, tip: str, head: str) -> bool:
+    """`tip` est-il déjà contenu dans la tête testée `head` ?"""
+    if not repo or not tip or not head:
+        return False
+    return _git(repo, "merge-base", "--is-ancestor", tip, head) is not None
+
+
+def _gate_repo(cfg, db, row, slug: str, checkout: str = "") -> str:
+    """Le clone où lire le delta de la cible, résolu comme la porte des avis.
+
+    #3534 (relecture cx3 B3) : `ci run`/`arm` laissent `checkout` vide ; le
+    registre de l'assigné et le clone du projet (`radar.projects`) sont les
+    mêmes sources que `_verdicts`, et doivent être lues **avant** la garde du
+    delta, pas seulement plus tard par la porte des avis."""
+    repo = None
+    try:
+        repo = fire._repo_of(db, row)
+        if repo is not None and not fire._same_repository(repo, slug):
+            repo = None
+        project = fire._project(cfg, repo, slug)
+        if repo is None:
+            repo = fire._project_checkout(project)
+    except Exception:  # noqa: BLE001 - registre/radar illisibles : repli
+        repo = None
+    if repo is None and checkout:
+        repo = fire._checkout(checkout)
+        if repo is not None and not fire._same_repository(repo, slug):
+            repo = None
+    return repo or ""
+
+
 # --------------------------------------------------------------------------
 # GitHub
 # --------------------------------------------------------------------------
@@ -741,15 +772,22 @@ def _gate_locked(cfg, db, lot: int, mine: dict, *, gh, dry_run: bool, actor: str
     base_oid = str(view.get("base_oid") or "").strip().lower()
     composition = (_composition_base(db, lot, sha, base)
                    or str(mine.get("composition") or "").strip().lower())
+    # #3534 (B3) : le clone se résout comme pour la porte des avis, avant la
+    # garde du delta ; `checkout` est vide dans `ci run`/`arm`.
+    repo = _gate_repo(cfg, db, row, slug, checkout)
+    # #3534 (B2) : si la cible est déjà dans la tête testée (H2 = merge(H, C)),
+    # ses commits sont couverts par la CI du paquet ; la borne du manifeste
+    # n'est plus le SHA de la cible.
+    target_in_head = _in_head(repo, base_oid, sha)
     moved = []
     # #3534 : la cible courante doit être la base de composition, ou n'avoir
     # avancé que par des atterrissages de coupure (version + notes, #173).
     # Sinon la CI du paquet n'a pas testé cet arbre : on désarme.
     target_moved = ""
-    if base_oid and composition and base_oid != composition:
-        if checkout:
-            _fetch_into(checkout, (view.get("branch") or "", base))
-        if not _cutoff_landing_only(checkout, composition, base_oid):
+    if base_oid and composition and base_oid != composition and not target_in_head:
+        if repo:
+            _fetch_into(repo, (view.get("branch") or "", base))
+        if not _cutoff_landing_only(repo, composition, base_oid):
             target_moved = ("target advanced since composition %s → %s"
                             % (composition[:12], base_oid[:12]))
             moved.append(target_moved)
@@ -800,11 +838,10 @@ def _gate_locked(cfg, db, lot: int, mine: dict, *, gh, dry_run: bool, actor: str
     # delta, #2766), avant toute lecture de CI et tout geste de fusion.
     # #3091 : la cible résolue de la PR prouve la base de composition du
     # paquet ; la ref locale du checkout de l'assigné peut être en retard.
-    # #3534 : quand la cible n'a avancé que par une coupure, la porte des avis
-    # lit la base de composition (le contenu testé), pas le SHA de la cible.
-    verdict_base = (composition if (composition and base_oid
-                                    and base_oid != composition and not target_moved)
-                    else base_oid)
+    # #3534 : la porte des avis lit la base de composition (le contenu testé),
+    # pas le SHA de la cible ; c'est aussi la borne du manifeste quand la
+    # cible a été fusionnée dans la tête (B2).
+    verdict_base = composition or base_oid
     extra = {"base_sha": verdict_base} if verdict_base else {}
     if checkout:
         extra.update(checkout=checkout, branch=view.get("branch") or "")
@@ -856,11 +893,17 @@ def _gate_locked(cfg, db, lot: int, mine: dict, *, gh, dry_run: bool, actor: str
         fresh = pr_status(slug, number, gh=gh)
     except land.LandError as exc:
         return dict(out, result="error", error="fresh read: %s" % exc)
-    if (fresh["state"], fresh["head"], fresh["base"]) != ("OPEN", sha, base):
+    # #3534 (B1) : la cible est relue **et comparée à son SHA de la porte**,
+    # pas seulement à son nom ; une avance de code pendant les lectures ne
+    # fusionne pas un arbre non testé (le passage suivant désarmera).
+    if (fresh["state"], fresh["head"], fresh["base"], fresh["base_oid"]) != \
+            ("OPEN", sha, base, base_oid):
         return dict(out, result="pending", why=(
-            "PR #%d changed just before the merge (%s, head %s, base %s): nothing merged"
+            "PR #%d changed just before the merge (%s, head %s, base %s, target %s — "
+            "expected target %s): nothing merged"
             % (number, fresh["state"] or "?", fresh["head"][:12] or "?",
-               fresh["base"] or "?")))
+               fresh["base"] or "?", fresh["base_oid"][:12] or "?",
+               base_oid[:12] or "?")))
     if not _renew(handle):
         return dict(out, result="busy")
     # L165 (EP4) : renouvellement du bail élu juste avant `POST /merges`, avec

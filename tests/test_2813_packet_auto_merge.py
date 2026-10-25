@@ -847,6 +847,70 @@ class TargetMovedTest(Journal):
         self.assertEqual(out["result"], "merged", out)
         self.assertEqual(gh.landed, [("main", HEAD)])
 
+    def test_b1_a_target_advanced_during_the_gate_never_merges(self):
+        self.armed(composition=HEAD)
+        gh = FakeGh(tests="success")
+        real = gh.answer
+
+        def answer(args):
+            out = real(args)
+            if args[:1] == ["api"] and "/check-runs" in args[-1]:
+                gh.base_oid = NEW       # la cible avance pendant les portes
+            return out
+        gh.answer = answer
+        out = self.check(gh)
+        self.assertEqual(out["result"], "pending", out)
+        self.assertIn("changed just before the merge", out["why"])
+        self.assertIn("expected target", out["why"])
+        self.assertEqual(gh.merges(), [])
+
+    def test_b2_a_target_merged_into_the_tested_head_is_not_held(self):
+        path, git, base = self.repo()
+        moved = self.code(path, git)
+        current = git("rev-parse", "--abbrev-ref", "HEAD")
+        git("checkout", "-q", "-b", "packet", base)
+        (Path(path) / "packet.txt").write_text("packet\n")
+        git("add", "-A")
+        git("commit", "-qm", "packet commit")
+        git("merge", "-q", "--no-ff", current, "-m", "packet: merge target")
+        head = git("rev-parse", "HEAD")
+        self.frozen = head
+        self.armed(sha=head, composition=base)
+        gh = FakeGh(head=head, base_oid=moved, tests="success")
+        out = self.check(gh, checkout=path)
+        self.assertEqual(out["result"], "merged", out)
+        self.assertEqual(gh.landed, [("main", head)])
+
+    def test_the_review_gate_reads_the_composition_base(self):
+        path, git, base = self.repo()
+        landing = self.cutoff(path, git)
+        self.armed(composition=base)
+        seen = {}
+
+        def verdicts(cfg, db, row, ms, **kw):
+            seen.update(kw)
+            return True, "", None
+
+        with mock.patch.object(packet_automerge, "_verdicts", verdicts):
+            out = self.check(FakeGh(tests="success", base_oid=landing), checkout=path)
+        self.assertEqual(out["result"], "merged", out)
+        self.assertEqual(seen.get("base_sha"), base)
+
+    def test_b3_the_clone_is_resolved_before_the_cutoff_guard(self):
+        path, git, base = self.repo()
+        landing = self.cutoff(path, git)
+        self.armed(composition=base)
+        gh = FakeGh(tests="success", base_oid=landing)
+        project = types.SimpleNamespace(repo=path)
+        with mock.patch.object(packet_automerge.fire, "_repo_of", return_value=None), \
+                mock.patch.object(packet_automerge.fire, "_project",
+                                  return_value=project), \
+                mock.patch.object(packet_automerge.fire, "_project_checkout",
+                                  return_value=path):
+            out = self.check(gh)        # checkout vide, clone résolu par le radar
+        self.assertEqual(out["result"], "merged", out)
+        self.assertEqual(gh.landed, [("main", HEAD)])
+
     def test_the_package_record_supplies_the_composition_base(self):
         fake = types.SimpleNamespace(work=types.SimpleNamespace(
             packet_members=lambda **kw: [
