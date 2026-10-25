@@ -445,6 +445,26 @@ def _host_hold(cfg: Config, args: argparse.Namespace) -> int:
         db.close()
 
 
+def _host_reading_staleness(cfg: Config, latest: dict | None) -> tuple[bool, float | None]:
+    """#3452 : l'âge du dernier relevé et sa péremption.
+
+    Le seuil est celui de l'alerte `host_unsampled` (`exploitation`), pour que
+    `ameesh hosts` ne calcule pas de pression sur un relevé que l'alerte
+    déclare muet. Un relevé sans `sampled_ts` n'est pas datable : ni âge ni
+    péremption déduits (fail-open sur la seule datation, jamais sur la mesure).
+    """
+    if latest is None:
+        return False, None
+    from . import exploitation
+    from . import resources as res
+
+    sampled = res.finite_float(latest.get("sampled_ts"))
+    if sampled is None:
+        return False, None
+    age = max(0.0, time.time() - sampled)
+    return age > exploitation.host_unsampled_after_s(cfg), age
+
+
 def _host_parts(cfg: Config, db, canons, only: str | None, history: int) -> list[dict]:
     """What `ameesh hosts` shows of each host (all, or `only`), by name."""
     from . import canon as canon_mod
@@ -475,13 +495,17 @@ def _host_parts(cfg: Config, db, canons, only: str | None, history: int) -> list
         default_scope = res.pressure_scope(None) if name == cfg.host else None
         physical = res.host_limits(canons, name, reading=latest,
                                    default_scope=default_scope)
+        # #3452 : un relevé périmé n'est pas une mesure du présent — la vue
+        # publie son âge et ne calcule pas de pression dessus.
+        stale, age = _host_reading_staleness(cfg, latest)
         parts.append({
             "name": name, "fiches": fiches, "physical": physical, "latest": latest,
             "host": fiches[0][1] if fiches else None,
             "admissions": {canon.id: _host_admissions(canon, name)
                            for canon, _fiche in fiches},
-            "verdict": (res.pressure(latest, limits=physical["limits"])
-                        if latest is not None else None),
+            "stale": stale, "sampled_age_s": age,
+            "verdict": (None if stale else res.pressure(latest, limits=physical["limits"]))
+                       if latest is not None else None,
             "history": res.history(db, name, history),
             "menage": _host_menage(hk, name, menage_mod.effective(canons, name),
                                    measure_by_host.get(name), latest),
@@ -512,6 +536,10 @@ def _host_json(part: dict) -> dict:
                     "admissions": part["admissions"].get(canon.id, 0)}
                    for canon, fiche in part["fiches"]],
         "latest": latest,
+        # #3452 : l'âge du relevé et sa péremption, à côté de la mesure
+        # qu'ils qualifient (un relevé périmé ne porte pas de pression)
+        "sampled_age_s": part.get("sampled_age_s"),
+        "stale": bool(part.get("stale")),
         # #253: every filesystem the host writes to, its own reading
         "volumes": (latest or {}).get("volumes") or [],
         # L159d: the offer, and the common measure (study §1.4)
@@ -737,7 +765,9 @@ def cmd_hosts(cfg: Config, args: argparse.Namespace) -> int:
                     if latest.get("gate_state") is not None
                     else "none recorded: closed to relocation (lending host)"))
 
-            if verdict and verdict["breaches"]:
+            if part.get("stale"):
+                print("  pressure   unknown (reading stale, no verdict)")
+            elif verdict and verdict["breaches"]:
                 tag = "CRITICAL" if verdict["critical"] else "PRESSURE"
                 detail = "; ".join(
                     "%s %s (threshold %s)" % (b["label"], res.fmt_value(b["key"], b["value"]),
@@ -4295,12 +4325,24 @@ def _cost_l26(cfg: Config, db, what: str, args) -> int:
     touché. Schémas : docs/EXPLOITATION.md."""
     ops = storage.of(db).operations
     if what == "turns":
+        limit = int(args.limit)
         rows = ops.turns(agent=args.agent, since_s=_since_seconds(args.since),
-                         limit=args.limit, message=getattr(args, "message", None))
+                         limit=limit, message=getattr(args, "message", None))
+        # #3452 : le plafond s'appliquait sans le dire — 500 tours sur ~4 h 30
+        # d'une nuit se lisaient comme la fenêtre entière. La troncature est
+        # désormais dite, en JSON comme en texte.
+        truncated = bool(limit and len(rows) >= limit)
         if args.json:
-            print(json.dumps({"schema": "ameesh-turns/1", "turns": rows},
-                             ensure_ascii=False, indent=2))
+            payload = {"schema": "ameesh-turns/1", "turns": rows,
+                       "truncated": truncated, "limit": limit}
+            print(json.dumps(payload, ensure_ascii=False, indent=2))
+            if truncated:
+                print("note: window truncated at %d turn(s); raise --limit to see "
+                      "the rest" % limit, file=sys.stderr)
             return 0
+        if truncated:
+            print("note: window truncated at %d turn(s); raise --limit to see the rest"
+                  % limit, file=sys.stderr)
         if getattr(args, "message", None) is not None:
             # L80b : le coût est celui du TOUR qui a servi le message, partagé
             # avec les autres messages du même tour — jamais divisé.
