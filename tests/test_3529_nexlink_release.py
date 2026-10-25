@@ -284,3 +284,20 @@ class PipelineTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TickStatusTests(unittest.TestCase):
+    def test_pending_and_empty_are_success_but_failure_is_not(self):
+        from ameesh import release
+        args = types.SimpleNamespace(project="nexlink", now=100, release_command="tick",
+                                     json=True)
+        project = rc.ProjectRelease("nexlink", "/unused", model="nexlink")
+        for result in ("waiting-ci", "waiting-staging", "empty", "failed"):
+            with self.subTest(result=result), \
+                    mock.patch.object(release, "_project_names", return_value=["nexlink"]), \
+                    mock.patch("ameesh.db.open_db"), \
+                    mock.patch.object(rc, "execute", return_value={"result": result}), \
+                    mock.patch("ameesh.staging_pending.tick", return_value={}), \
+                    mock.patch("builtins.print"):
+                self.assertEqual(release._release_tick(None, args, {"nexlink": project}),
+                                 int(result == "failed"))

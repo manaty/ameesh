@@ -372,7 +372,7 @@ def _release_tick(cfg, args, declared) -> int:
                                     if report.get("version") else ""))
             if report.get("result") not in ("released", "reconciled", "nothing-new",
                                             "already-recorded", "not-due", "missed",
-                                            "kept-active"):
+                                            "kept-active", "waiting-ci", "waiting-staging", "empty"):
                 status = 1
         return status
     finally:
