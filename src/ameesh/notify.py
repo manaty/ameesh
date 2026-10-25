@@ -2054,6 +2054,12 @@ class Notifier:
         bucket = self._normalize_summary_bucket(human, bucket)
         member = self._summary_member(entry, human)
         identity = self._summary_member_id(member)
+        frozen = bucket.get("frozen") or {}
+        if identity in (frozen.get("raised") or {}):
+            # L'alerte est dans l'épisode déjà figé : annuler l'épisode et
+            # remettre ses autres membres dans le stock vivant, avec une
+            # nouvelle identité (le contenu du résumé change).
+            self._summary_cancel_frozen(bucket)
         members = bucket["raised"]
         if identity in members:
             del members[identity]
@@ -2066,7 +2072,7 @@ class Notifier:
                         and str(old.get("key") or "").startswith("legacy:")):
                     del members[old_id]
                     break
-        if not members and not bucket["resolved"]:
+        if not self._summary_has_members(bucket):
             self.state["summary"].pop(human, None)
 
     def _mute(self, entry: dict) -> None:
@@ -3059,6 +3065,13 @@ class Notifier:
         bucket["attempts"] = int(bucket.get("attempts") or 0)
         if not isinstance(bucket.get("channels"), dict):
             bucket["channels"] = {}
+        frozen = bucket.get("frozen")
+        if isinstance(frozen, dict):
+            for event in ("raised", "resolved"):
+                if not isinstance(frozen.get(event), dict):
+                    frozen[event] = {}
+        elif "frozen" in bucket:
+            bucket.pop("frozen", None)
         return bucket
 
     def _bucket(self, human: str) -> dict:
@@ -3115,6 +3128,18 @@ class Notifier:
         un résumé précédent — ne repart pas ; une résolution dont l'alerte est
         revenue (active) est dépassée et ne part pas non plus."""
         active = self._active_member_ids(human)
+        frozen = bucket.get("frozen") or {}
+        # Un membre de l'épisode figé peut avoir été livré en direct (ou son
+        # alerte revenue) depuis le gel : l'épisode est annulé et ses autres
+        # membres repartent sous une nouvelle identité, plutôt que de garder
+        # un contenu périmé sous le même `alert_id`.
+        stale = any(
+            isinstance(member, dict) and self._member_already_notified(member)
+            for member in (frozen.get("raised") or {}).values())
+        stale = stale or any(identity in active
+                             for identity in (frozen.get("resolved") or {}))
+        if stale:
+            self._summary_cancel_frozen(bucket)
         raised = bucket.get("raised") or {}
         for identity, member in list(raised.items()):
             if isinstance(member, dict) and self._member_already_notified(member):
@@ -3141,11 +3166,63 @@ class Notifier:
         bucket["alert_id"] = alert_id
         return alert_id
 
+    @staticmethod
+    def _summary_has_members(bucket: dict) -> bool:
+        frozen = bucket.get("frozen") or {}
+        return bool(bucket.get("raised") or bucket.get("resolved")
+                    or frozen.get("raised") or frozen.get("resolved"))
+
+    @staticmethod
+    def _summary_clear_episode(bucket: dict) -> None:
+        for key in ("frozen", "alert_id", "episode", "occurred_at", "channels"):
+            bucket.pop(key, None)
+        bucket["attempts"] = 0
+
+    def _summary_freeze(self, bucket: dict) -> dict:
+        """Fige les membres du résumé avant son premier envoi (#3536, relecture
+        cx1) : un membre arrivé ensuite ne peut pas changer le contenu sous le
+        même `alert_id`, sinon l'API #3537 déduplique le retry et le membre
+        ajouté est perdu. Les nouveaux membres forment l'épisode suivant."""
+        frozen = bucket.get("frozen")
+        if isinstance(frozen, dict) and (frozen.get("raised") or frozen.get("resolved")):
+            return frozen
+        frozen = {"raised": dict(bucket.get("raised") or {}),
+                  "resolved": dict(bucket.get("resolved") or {})}
+        if not frozen["raised"] and not frozen["resolved"]:
+            return frozen
+        bucket["frozen"] = frozen
+        for key in ("alert_id", "episode", "occurred_at", "channels"):
+            bucket.pop(key, None)
+        return frozen
+
+    def _summary_finish_episode(self, bucket: dict, now: float, *,
+                                notified: bool) -> None:
+        """Clôt l'épisode figé : ses membres quittent le stock vivant ; ceux
+        qui sont arrivés entre-temps restent pour l'épisode suivant."""
+        frozen = bucket.get("frozen") or {}
+        for event in ("raised", "resolved"):
+            live = bucket.get(event) or {}
+            for identity in (frozen.get(event) or {}):
+                live.pop(identity, None)
+        if notified:
+            self._mark_summary_notified(frozen, now)
+        self._summary_clear_episode(bucket)
+
+    def _summary_cancel_frozen(self, bucket: dict) -> None:
+        """Annule un épisode figé (membre acquitté) : ses autres membres
+        repartent dans le stock vivant sous une nouvelle identité."""
+        frozen = bucket.get("frozen") or {}
+        for event in ("raised", "resolved"):
+            live = bucket.setdefault(event, {})
+            for identity, member in (frozen.get(event) or {}).items():
+                live.setdefault(identity, member)
+        self._summary_clear_episode(bucket)
+
     def _summaries(self, now: float) -> None:
         for human in list(self.state["summary"]):
             bucket = self._bucket(human)
             self._drop_notified_members(bucket, human)
-            if not bucket["raised"] and not bucket["resolved"]:
+            if not self._summary_has_members(bucket):
                 # Stock entièrement filtré (ancien résumé SLO owner, #2395 B1).
                 del self.state["summary"][human]
                 continue
@@ -3157,12 +3234,13 @@ class Notifier:
                 self.log("rate summary for %s lost: no channel left" % human)
                 del self.state["summary"][human]
                 continue
+            frozen = self._summary_freeze(bucket)
             alert_id = self._summary_alert_id(human, bucket)
             occurred_at = bucket.get("occurred_at") or iso_utc(now)
             bucket["occurred_at"] = occurred_at
-            message = render_summary(bucket, self.cfg.host, alert_id=alert_id,
+            message = render_summary(frozen, self.cfg.host, alert_id=alert_id,
                                      occurred_at=occurred_at)
-            states = bucket["channels"]
+            states = bucket.setdefault("channels", {})
             for channel in channels:
                 states.setdefault(channel.name, {"ok": False, "attempts": 0,
                                                  "error": None})
@@ -3217,17 +3295,20 @@ class Notifier:
                 for state in states.values())
             self.state["rate"].setdefault(human, []).append(now)
             bucket["attempts"] = int(bucket.get("attempts") or 0) + 1
-            if primary_ok and not self.dry_run:
-                # #2395 B2 : les membres livrés par le résumé entrent au
-                # registre, sinon la même alerte repart en envoi direct après
-                # la fenêtre. Après succès seulement ; un échec reste retenté.
-                # Un repli réussi ne vaut pas livraison du primaire.
-                self._mark_summary_notified(bucket, now)
             if primary_ok or (not primary_pending and not fallback_pending):
                 if not primary_ok:
                     self.log("rate summary → %s: GIVING UP after %d attempt(s)"
                              % (human, bucket["attempts"]))
-                del self.state["summary"][human]
+                # #2395 B2 : les membres livrés par le résumé entrent au
+                # registre, sinon la même alerte repart en envoi direct après
+                # la fenêtre. Après succès du primaire seulement ; un repli
+                # réussi ne vaut pas livraison du primaire.
+                self._summary_finish_episode(bucket, now,
+                                             notified=primary_ok and not self.dry_run)
+                if not self._summary_has_members(bucket):
+                    del self.state["summary"][human]
+                # Les membres arrivés après le gel forment l'épisode suivant,
+                # à la fenêtre de débit suivante.
                 self.state["last_summary"][human] = now
             self._record("summary", entry,
                          "a_blanc" if self.dry_run else ("envoyee" if primary_ok else "echec"),

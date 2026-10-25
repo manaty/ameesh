@@ -804,6 +804,36 @@ class NotifierTest(unittest.TestCase):
         self.assertNotIn("human:owner", notifier.state["summary"])
         self.assertEqual(notifier.state["notified"], {})
 
+    def test_resume_fige_ses_membres_avant_l_envoi(self):
+        """B/P2 cx1 : un membre arrivé après le premier envoi ne doit pas
+        changer le contenu sous le même `alert_id` — le hub dédupliquerait le
+        retry et le membre ajouté serait perdu."""
+        sender = FakeSender({"nx": [notify.ChannelError("response lost"),
+                                    None, None]})
+        notifier = self.notifier(sender)
+        one = self.entry(alert={"type": "dead_runner", "agent": "one",
+                                "since": 900.0, "detail": "x"})
+        notifier._summary_add(notifier._bucket("human:owner"), "raised", one)
+        notifier._summaries(1000.0)
+        # le second membre arrive alors que le premier envoi n'a pas été
+        # acquitté (réponse perdue) : il doit attendre l'épisode suivant.
+        two = self.entry(alert={"type": "dead_runner", "agent": "two",
+                                "since": 1001.0, "detail": "y"})
+        notifier._summary_add(notifier._bucket("human:owner"), "raised", two)
+        notifier._summaries(2000.0)
+        self.assertEqual(len(sender.sent), 2)
+        first, retry = sender.sent[0][1], sender.sent[1][1]
+        self.assertEqual(first.alert_id, retry.alert_id)
+        self.assertEqual((retry.title, retry.body), (first.title, first.body))
+        # seul le membre figé est marqué ; l'autre reste pour son épisode
+        self.assertEqual(len(notifier.state["notified"]), 1)
+        self.assertIn("human:owner", notifier.state["summary"])
+        notifier._summaries(2100.0)
+        third = sender.sent[-1][1]
+        self.assertNotEqual(third.alert_id, first.alert_id)
+        self.assertNotIn("human:owner", notifier.state["summary"])
+        self.assertEqual(len(notifier.state["notified"]), 2)
+
     def test_message_sans_identite(self):
         message = notify.render_summary({"raised": {"dead_runner": 2}}, "hote")
         first = notify.message_alert_id(message)

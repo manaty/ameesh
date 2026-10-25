@@ -193,8 +193,9 @@ AES-256-GCM under a random CEK, the CEK wrapped per active key with Nexlink's
 `{v, alert_id, severity, occurred_at, ciphertext, nonce, wraps}`. `alert_id` is
 a deterministic UUIDv5 of the alert identity (the `since` of the episode, or
 the raised instant when it has none so two successive `account_overage` stay
-distinct; a rate summary carries the identity of its state bucket). Nexlink
-stores it as a `uuid` and refuses unknown envelope fields;
+distinct; a rate summary carries the identity of its state bucket and its
+members are frozen at the first send, later ones forming the next episode).
+Nexlink stores it as a `uuid` and refuses unknown envelope fields;
 `X-Mesh-Idempotency-Key` is that `alert_id`. A resolution is not pushed to the hub in v1 (its schema has no
 state; the app row stays raised), so `ameesh notify` skips it for this channel.
 With no active key the alert is sent **content-free** (`content_free: true`)
