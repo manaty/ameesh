@@ -142,6 +142,11 @@
         turn's account can resume it, otherwise a deterministic resume brief;
   ameesh review-class [--project P] [--diff REF | FILE ...]
         review class of the changed files from the project's policy;
+  ameesh role canary [--json]   L165 (EP7 P3) : geste sans effet gardé par
+        l'époque du bail de l'environnement (AMEESH_ROLE + AMEESH_LEASE_EPOCH,
+        ou session liée) ; 0 accepté (un `pilot.gesture` canary), 1 refusé
+        (rien journalisé ; détenteur nommé pour une époque périmée ou
+        expirée), 2 aucun bail à garder ;
   ameesh role run <agent> [--min-left S] [--dry-run] [--json] -- <commande…>
         L165 (EP5) : une minuterie mécanique ne tourne que sur l'hôte qui
         détient le bail vivant de ce rôle (composeur, veille GitHub, guet CI) ;
@@ -358,7 +363,8 @@ def _dispatch(argv: list[str] | None) -> int:
         from . import host_lifecycle
         return host_lifecycle.main(rest)
     if command == "role":
-        # L165 (EP2) : détenteur, époque et candidats classés d'un rôle élu
+        # L165 (EP2) : détenteur, époque et candidats classés d'un rôle élu ;
+        # EP7 P3 (#3433) : `role canary`, le geste sans effet de l'exercice
         from . import role
         return role.main(rest)
     if command == "plan":

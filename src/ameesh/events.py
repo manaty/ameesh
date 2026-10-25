@@ -25,7 +25,8 @@ alike); the insertion emits `pg_notify('ameesh_events', id)`. Types:
   alert.raised         an alert raised, seen by `ameesh notify` (no table: written
   alert.resolved       by the notifier, outside any transaction of the change)
   pilot.gesture        an elected pilot's gesture (merge, queue, assign,
-                       packet, decision), in the transaction of its lease check
+                       packet, decision, or the drill's no-op canary), in the
+                       transaction of its lease check
 
 `data` holds identifiers and states, never free text: the client rereads the
 object through the API.
