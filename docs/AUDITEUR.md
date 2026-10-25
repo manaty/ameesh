@@ -460,7 +460,10 @@ par lui-même (une lecture, pas un sous-agent) :
    2026-10-11). Un estimateur hors de ×0,5–×2 sur au moins trois lots est
    rangé dans `bias` : l'alerte `estimate_bias` en découle, adressée à
    l'estimateur et aux orchestrateurs de son équipe, jusqu'à la publication
-   suivante qui ne le relève plus. Then (L157c) `ameesh work schedule
+   suivante qui ne le relève plus. Republier une table identique n'écrit
+   rien (`unchanged`) et ne relance aucune alerte ; l'alerte est un épisode
+   daté à l'entrée en biais, pas à la publication (#3502). Then (L157c)
+   `ameesh work schedule
    --apply --actor auditeur`: the planned dates of the open lots, at the p80
    of the new table, queues chained at the median (dates set by a person
    are kept).
