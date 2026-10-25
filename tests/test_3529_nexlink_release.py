@@ -2,6 +2,7 @@
 """Nexlink cutoffs: real Git candidates, fake GitHub and database reads."""
 import json
 import os
+import shutil
 import subprocess
 import tempfile
 import types
@@ -114,6 +115,7 @@ class GitTests(unittest.TestCase):
             with self.assertRaisesRegex(rc.ReleaseError, "540_new on content"):
                 nx.migration_gate(None, self.project, {"sha": sha, "main": old})
 
+    @unittest.skipUnless(shutil.which("node"), "node absent : planificateur JS indisponible")
     def test_ci_planner_bridge_uses_frozen_script_without_dispatch(self):
         program = """export async function main(args, deps) {
           if (!args.includes('--dry-run') || !args.includes('--sql-anchor')) throw Error('args');
