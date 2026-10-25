@@ -189,3 +189,46 @@ class AutomaticCanonTest(unittest.TestCase):
             self.automatic(cfg, root)
         self.assertEqual(lock.call_count, 2)
         self.assertEqual(apply.call_count, 2)
+
+    def test_manual_intermediate_pin_reloads_despite_automatic_refusal(self):
+        self.repo.write('processus/mecanique.yaml', 'schema: reviewed-g1\n')
+        reviewed = self.repo.commit('reviewed rules G1')
+        self.repo.write('processus/mecanique.yaml', 'schema: unreviewed-g2\n')
+        latest = self.repo.commit('new rules G2')
+        for index, outcome in enumerate(((latest, ''), ('', 'unreadable gate'),
+                                         RuntimeError('database unavailable'))):
+            with self.subTest(outcome=outcome):
+                cfg, root, base, profile = self.host('manual-%s' % index)
+                # The live passage still uses P0. The pilot has qualified and
+                # persisted G1, while the gate is already G2 or unreadable.
+                passage = types.SimpleNamespace(
+                    project=types.SimpleNamespace(name='ameesh'),
+                    policy_path=self.repo.root, policy_commit=self.pin,
+                    canon=types.SimpleNamespace(pin=self.pin),
+                    scheduled_step=mock.Mock(return_value=({'result': 'ci'}, 200)))
+                for path in (base, profile):
+                    raw = self.read(path)
+                    raw['train']['projects']['ameesh']['canon_commit'] = reviewed
+                    with open(path, 'w') as out:
+                        json.dump(raw, out)
+                report = mock.Mock()
+                def refresh():
+                    return train_assembly.reload((passage,),
+                        expected=train_assembly.Settings.parse(cfg.train),
+                        config_path=cfg.config_path, automatic=True, report=report)
+                service = train_runner.Service(cfg, (passage,),
+                    stop=threading.Event(), report=mock.Mock(), refresh=refresh)
+                reader = (dict(side_effect=outcome) if isinstance(outcome, Exception)
+                          else dict(return_value=outcome))
+                with mock.patch.object(config, '_config_dir_default',
+                        return_value=os.path.join(root, 'runner-profiles')), \
+                     mock.patch('ameesh.scoped_db.ScopedDb'), \
+                     mock.patch.object(train_requalify.train_canon, 'gate_commit', **reader):
+                    self.assertEqual(service.pass_once(0, 100), 200)
+                self.assertEqual(passage.policy_commit, reviewed)
+                self.assertEqual(passage.canon.pin, reviewed)
+                passage.scheduled_step.assert_called_once()
+                report.assert_called_once()
+                for path in (base, profile):
+                    self.assertEqual(self.read(path)['train']['projects']['ameesh']['canon_commit'],
+                                     reviewed)

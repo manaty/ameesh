@@ -398,30 +398,26 @@ def reload(passages, *, expected=None, load=None, host=None, config_path=None,
         from .scoped_db import ScopedDb
         report = report or (lambda message: print("train: " + message, file=sys.stderr))
         refusals = {} if refusals is None else refusals
-        failed = set()
         for spec in settings.projects:
             db = None
             try:
                 db = ScopedDb(fresh)
                 train_requalify.automatic(fresh, db, spec.name)
             except Exception as exc:  # optional follow-up must not stop the train
-                failed.add(spec.name)
                 reason = "%s: %s" % (type(exc).__name__, exc)
                 if refusals.get(spec.name) != reason:
                     report("automatic canon requalification refused for %s: %s; "
-                           "passages keep the current pin" % (spec.name, reason))
+                           "configured pin will still be reloaded" % (spec.name, reason))
                 refusals[spec.name] = reason
             else:
                 refusals.pop(spec.name, None)
             finally:
                 if db is not None:
                     db.close()
-        # Failed projects keep their live pin. Other projects independently
-        # reload their persisted pins; canon_refusal still guards composition.
-        kept = tuple(p for p in passages or () if p.project.name not in failed)
-        if not kept:
-            return []
-        return reload(kept, expected=expected, load=load, host=host,
+        # A refused automatic move does not disable the independent #3366
+        # reload: a pilot may already have qualified an intermediate commit.
+        # canon_refusal still guards new composition against the gate.
+        return reload(passages, expected=expected, load=load, host=host,
                       config_path=config_path)
     by_name = {spec.name: spec for spec in settings.projects}
     pending = []

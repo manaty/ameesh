@@ -216,12 +216,16 @@ chemins du diff vérifié et liste de garde. Une erreur de journalisation
 restaure les fichiers. Le service recharge ensuite l'épingle effective (#3366).
 Le suivi ne modifie ni les références ni les règles de la porte. Un refus du suivi
 est signalé par projet, une fois par motif jusqu'au rétablissement. Le passage
-continue sur son épingle active et les autres projets poursuivent leur suivi.
+recharge toujours son épingle configurée (#3366), même si le suivi automatique
+échoue : une épingle intermédiaire qualifiée par le pilote reste applicable.
+Les autres projets poursuivent leur suivi.
 La garde de dérive refuse toute nouvelle composition non qualifiée ; les
 paquets déjà en vol peuvent atteindre leur état terminal.
 
 La commande pilote `python -m ameesh.train_cli --project <p> requalify --lot
 <lot>` reste disponible avec sa trace sur le lot ; `--dry-run` montre le diff.
+Elle exige aussi que la porte descende de l’épingle et que le diff laisse les
+fichiers de garde intacts ; un retour arrière exige une requalification relue.
 Un changement de `mode`, de `canon`, de dépôt ou de cible exige toujours un
 redémarrage ; seul l'épinglage est relu.
 
