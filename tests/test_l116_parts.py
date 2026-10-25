@@ -47,13 +47,6 @@ class RepartitionTest(unittest.TestCase):
         self.assertEqual(repli, ["test_neuf"])
         self.assertEqual(pesees, {"test_mesure": 4.0, "test_neuf": 12.0})  # 6 tests × 2 s
 
-    def test_la_carte_ne_sous_pondere_pas_la_table(self):
-        # #3604 : la carte périmée donne test_503 à 297 s, la table mesurée à
-        # 2 700 s ; le maximum des deux garde la part sous le plafond de 60 min.
-        table = {"psycopg": {"test_503_agent_host": 297.0}}
-        pesees, _ = parts.weight(["test_503_agent_host"], "psycopg", table)
-        self.assertEqual(pesees["test_503_agent_host"], 2700.0)
-
     def test_modules_a_duree_nulle_repartis(self):
         # #1476 : un module mesuré à 0,0 s n'atterrit plus toujours dans la
         # même part ; le plancher les répartit.

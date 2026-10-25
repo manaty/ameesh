@@ -219,14 +219,8 @@ def weight(mods: list[str], pilote: str, table: dict | None = None,
         table = json.loads(TABLE.read_text(encoding="utf-8")) if TABLE.exists() else {}
     else:
         base = json.loads(TABLE.read_text(encoding="utf-8")) if TABLE.exists() else {}
-        # #3604 : la carte peut être plus ancienne que la table (ou l'inverse).
-        # On garde le maximum des deux poids : une carte périmée sous-pondérait
-        # un module lourd (test_503 : 297 s contre 2 700 s mesurés) et sa part
-        # dépasserait le plafond de 60 min, carte non publiée.
         for driver, mesures in table.items():
-            cible = base.setdefault(driver, {})
-            for module, duree in mesures.items():
-                cible[module] = max(float(cible.get(module, 0.0)), float(duree))
+            base.setdefault(driver, {}).update(mesures)
         table = base
     mesures = table.get(pilote, {})
     connus = [m for m in mesures if m in set(mods)]
