@@ -55,15 +55,17 @@ class ClassifierTest(unittest.TestCase):
                 self.assertEqual((result["red"], result["missing"]), ([], []))
 
     def test_les_familles_linux_annulees_sont_une_preuve_absente(self):
-        # #3449 : macOS vert ne prouve pas la suite Linux. Chaque famille
-        # planifiée qui n'a pas conclu rougit l'agrégat, sans consignation
-        # non bloquante.
-        for part, over in (("psycopg", {"psycopg": "cancelled"}),
-                           ("psql", {"psql": "cancelled"})):
+        # #3449 : macOS vert ne prouve pas la suite Linux. Une famille
+        # planifiée qui n'a aucune part réussie rougit l'agrégat, sans
+        # consignation non bloquante.
+        for part, over in (("psycopg", {"psycopg": "cancelled",
+                                       "psycopg_jobs": []}),
+                           ("psql", {"psql": "cancelled",
+                                     "psql_jobs": []})):
             with self.subTest(part=part):
                 result = classify(**over)
                 self.assertEqual(result["state"], agregat.RED)
-                self.assertTrue(any(gap.startswith(part + " (cancelled")
+                self.assertTrue(any(gap.startswith(part + " (cancelled, 0/")
                                     for gap in result["missing"]), result["missing"])
                 self.assertEqual(result["consigned"], [])
 
@@ -87,19 +89,23 @@ class ClassifierTest(unittest.TestCase):
                                 result["red"])
 
     def test_echec_et_annulation_ensemble_le_negatif_gagne(self):
-        result = classify(psycopg="cancelled", psql="failure")
+        result = classify(psycopg="cancelled", psycopg_jobs=[],
+                          psql="failure")
         self.assertEqual(result["state"], agregat.RED)
         self.assertEqual(result["consigned"], [])
-        self.assertTrue(any(gap.startswith("psycopg (cancelled")
+        self.assertTrue(any(gap.startswith("psycopg (cancelled, 0/")
                             for gap in result["missing"]), result["missing"])
 
     def test_toutes_les_parts_annulees_sont_une_preuve_absente(self):
         # Décision #128512 : un agrégat qui n'a aucune part réussie n'a rien
         # prouvé. Toutes les parts annulées ne doivent pas verdir `tests`.
-        result = classify(psycopg="cancelled", psql="cancelled",
+        result = classify(psycopg="cancelled", psycopg_jobs=[],
+                          psql="cancelled", psql_jobs=[],
                           platform_macos="cancelled", fs_class="cancelled")
         self.assertEqual(result["state"], agregat.RED)
         self.assertIn("aucune part n'a conclu (preuve absente)", result["missing"])
+        self.assertTrue(any(gap.startswith("psycopg (cancelled, 0/2")
+                            for gap in result["missing"]), result["missing"])
         self.assertEqual([row["part"] for row in result["consigned"]],
                          ["plateforme macOS", "autre système de fichiers"])
         statuses = {row["part"]: row["status"] for row in result["parts"]}
@@ -109,7 +115,8 @@ class ClassifierTest(unittest.TestCase):
     def test_un_saut_legitime_ne_remplace_pas_une_preuve(self):
         # psql saute sans part ([]), ce n'est pas un test ; si tout le reste
         # est annulé, l'agrégat reste sans preuve et rougit.
-        result = classify(psycopg="cancelled", psql="skipped", psql_parts="[]")
+        result = classify(psycopg="cancelled", psycopg_jobs=[],
+                          psql="skipped", psql_parts="[]")
         self.assertEqual(result["state"], agregat.RED)
         self.assertIn("aucune part n'a conclu (preuve absente)", result["missing"])
 

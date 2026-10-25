@@ -85,6 +85,7 @@ class WorkflowContractTest(unittest.TestCase):
     #: chaque résultat lu par le classifieur, et l'argument qui le porte
     ARGS = {
         "github.event_name": "--event",
+        "github.run_id": "--run-id",
         "needs.plan.result": "--plan",
         "needs.version.result": "--version",
         "needs.plan.outputs.version_only": "--version-only",
@@ -164,14 +165,14 @@ class SilentSuccessTest(unittest.TestCase):
             self.created.append((name, conclusion))
             return 1
 
-    def run_main(self, rules, gh=None) -> int:
+    def run_main(self, rules, gh=None, jobs=None) -> int:
         args = ["--event", "pull_request", "--plan", "success",
                 "--version", "success", "--version-only", "false",
                 "--docs-only", "false", "--doc-readers", "skipped",
                 "--psycopg", "success", "--psycopg-parts", "[1]",
                 "--publish"]
         args += rules
-        return agregat.main(args, gh=gh)
+        return agregat.main(args, gh=gh, jobs=jobs)
 
     def test_annulation_non_requise_consignee_publie_neutral_et_ne_rougit_pas(self):
         gh = self.FakeGh()
@@ -184,9 +185,11 @@ class SilentSuccessTest(unittest.TestCase):
         # #128512 : aucune part réussie = preuve absente. Le check requis
         # rougit, même si la consignation est possible ; le détail le dit.
         gh = self.FakeGh()
-        self.assertEqual(self.run_main(["--psycopg", "cancelled",
-                                        "--psql", "cancelled",
-                                        "--psql-parts", "[1]"], gh=gh), 1)
+        self.assertEqual(self.run_main(
+            ["--psycopg", "cancelled", "--psql", "cancelled",
+             "--psql-parts", "[1]"], gh=gh,
+            jobs=[{"name": "psycopg 1/1", "conclusion": "cancelled"},
+                  {"name": "psql 1/1", "conclusion": "cancelled"}]), 1)
         self.assertEqual(gh.created, [(agregat.DETAIL_CHECK, "failure")])
 
     def test_annulation_non_requise_non_consignable_rougit(self):
@@ -197,10 +200,12 @@ class SilentSuccessTest(unittest.TestCase):
                                        gh=self.FakeGh(fail=True)), 2)
 
     def test_annulation_d_une_famille_linux_rougit_et_publie_failure(self):
-        # #3449 : macOS vert ne rachète pas psql annulé.
+        # #3449 : macOS vert ne rachète pas 0/1 psql réussie.
         gh = self.FakeGh()
-        self.assertEqual(self.run_main(["--psql", "cancelled", "--psql-parts", "[1]",
-                                        "--plateforme-macos", "success"], gh=gh), 1)
+        self.assertEqual(self.run_main(
+            ["--psql", "cancelled", "--psql-parts", "[1]",
+             "--plateforme-macos", "success"], gh=gh,
+            jobs=[{"name": "psql 1/1", "conclusion": "cancelled"}]), 1)
         self.assertEqual(gh.created, [(agregat.DETAIL_CHECK, "failure")])
 
     def test_echec_reel_rougit_et_publie_failure(self):
