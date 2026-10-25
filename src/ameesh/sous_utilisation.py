@@ -1056,10 +1056,15 @@ def waiting_project_lots(lots: list, *, db=None, now: float | None = None) -> li
     engagement `depends_on` d'un lot ou d'un paquet ouvert, début prévu à
     venir) attend son prérequis, pas un agent (#1625).
 
+    #3447 : un lot réservé à un exécutant externe (`external_executor`) ne
+    compte pas — il n'attend pas un agent de l'équipe (L165 ne le prend pas) ;
+    `external_project_lots` le nomme à part pour l'alerte et le débit.
+
     Une lecture des attentes en échec est conservatrice : le lot reste compté,
     la porte reste fermée — jamais une amélioration prise sur un doute."""
     waiting = [lot for lot in lots
                if not (lot.get("assignee") or "").strip()
+               and not (lot.get("external_executor") or "").strip()
                and lot.get("state") in WAITING_LOT_STATES and not is_backlog_item(lot)]
     if not waiting or db is None:
         return waiting
@@ -1072,6 +1077,19 @@ def waiting_project_lots(lots: list, *, db=None, now: float | None = None) -> li
     except Exception:  # noqa: BLE001 - attentes illisibles : on ne devine pas
         return waiting
     return [lot for lot in waiting if int(lot["id"]) not in waits]
+
+
+def external_project_lots(lots: list) -> list:
+    """#3447 : les lots ouverts réservés à un exécutant externe déclaré.
+
+    Ni « sans assigné » (l'alerte les nommait ainsi), ni prenables : ils
+    attendent le geste de leur exécutant (bureau, owner), pas un agent. Rendus
+    à part pour que l'alerte et le débit nomment cet exécutant."""
+    return [lot for lot in lots
+            if not (lot.get("assignee") or "").strip()
+            and (lot.get("external_executor") or "").strip()
+            and lot.get("state") in WAITING_LOT_STATES
+            and not is_backlog_item(lot)]
 
 
 def _budget_held(cfg, db, rows: list) -> dict:
@@ -1179,10 +1197,14 @@ def idle_capacity(db, listing: list, now: float, orchestras: list, *,
     # (démarrables / en attente d'un prérequis) ; le filtrage `db=db` de
     # #1021 reste dans `waiting_project_lots` pour la prise automatique (0037).
     waiting_lots = waiting_project_lots(lots)
+    # #3447 : les lots réservés à un exécutant externe ne sont pas « sans
+    # assigné » ; ils sont nommés à part, avec leur exécutant.
+    reserved_lots = external_project_lots(lots)
     # #2337 B4 : un lot démarrable d'un autre projet n'est pas une capacité
     # pour ces agents (cinq agents Nexlink au repos + un lot ameesh levait
     # encore l'alerte) ; on croise avec les projets des agents au repos.
     waiting_lots = lots_for_idle(waiting_lots, idle)
+    reserved_lots = lots_for_idle(reserved_lots, idle)
     waits = planned_waits.read(db, waiting_lots, now=now) if waiting_lots else {}
     startable_lots, blocked_lots = split_startable(waiting_lots, waits)
     backlog = [row for row in listing
@@ -1199,7 +1221,7 @@ def idle_capacity(db, listing: list, now: float, orchestras: list, *,
     # `waiting_lots` en compte 24 sans qu'un agent puisse rien prendre. Les
     # bloqués restent dans le détail d'une alerte levée par autre chose (un
     # courrier en souffrance, le forfait au repos).
-    if not (startable_lots or backlog or aggravating):
+    if not (startable_lots or backlog or aggravating or reserved_lots):
         return []
     names = sorted(row["name"] for row in idle)
     # #1677 (b) : le repos se lit sur les lots actionnables, plus sur le temps
@@ -1218,6 +1240,12 @@ def idle_capacity(db, listing: list, now: float, orchestras: list, *,
         if blocked_lots:
             parts.append("%d waiting for a prerequisite: %s" % (
                 len(blocked_lots), waiting_text(blocked_lots)))
+    if reserved_lots:
+        parts.append("%d lot(s) reserved to an external executor, not assignable: %s"
+                     % (len(reserved_lots), ", ".join(
+                         "#%d (%s)" % (int(l["id"]), l.get("external_executor"))
+                         for l in reserved_lots[:8])
+                        + (", …" if len(reserved_lots) > 8 else "")))
     if backlog:
         parts.append("mail waiting at %s" % ", ".join(
             sorted(row["name"] for row in backlog)))
@@ -1253,6 +1281,14 @@ def idle_capacity(db, listing: list, now: float, orchestras: list, *,
         action = "dispatch: ameesh work assign <lot> <agent>, or write to the orchestrator"
     if waiting_lots and not startable_lots:
         action = "no startable lot: clear the named prerequisite before assigning work"
+    if reserved_lots and not startable_lots:
+        action = ("no assignable lot: %s is reserved to %s (external executor, not "
+                  "wakeable) — the pilot declared it and that executor acts; the "
+                  "reservation is not an assignment (clear it with ameesh work "
+                  "external-executor <lot> --clear)" % (
+                      ", ".join("#%d" % int(l["id"]) for l in reserved_lots[:5]),
+                      ", ".join(sorted({str(l.get("external_executor"))
+                                        for l in reserved_lots[:5]}))))
     detail = "; ".join(parts) + ". Action: " + action
     responsible = None
     for name in attached + asleep + list(orchestras):
@@ -1266,6 +1302,9 @@ def idle_capacity(db, listing: list, now: float, orchestras: list, *,
         agents=names, lots=[int(l["id"]) for l in waiting_lots[:50]],
         startable_lots=[int(l["id"]) for l in startable_lots[:50]],
         blocked_lots={str(i): w for i, w in sorted(blocked_lots.items())[:50]},
+        external_lots=[{"lot": int(l["id"]),
+                        "executor": str(l.get("external_executor"))}
+                       for l in reserved_lots[:50]],
         paid_working=paid_working, orchestrators=list(orchestras),
         designers=[n for n in designers if n not in orchestras],
         responsible=responsible)]
@@ -1294,6 +1333,9 @@ def orchestrator_briefs(alert: dict, listing: list, lot_titles: dict | None = No
     startable = alert.get("startable_lots")
     startable = lots if startable is None else [int(i) for i in startable]
     blocked = {int(k): v for k, v in (alert.get("blocked_lots") or {}).items()}
+    external = [(int(row.get("lot")), str(row.get("executor") or "?"))
+                for row in alert.get("external_lots") or ()
+                if row.get("lot") is not None]
     out = {}
     for orch in list(alert.get("orchestrators") or ()) + list(alert.get("designers") or ()):
         mine = set(projects_mod.agent_projects(by_name.get(orch) or {}))
@@ -1313,7 +1355,19 @@ def orchestrator_briefs(alert: dict, listing: list, lot_titles: dict | None = No
             parts.append("No open lot without an agent.")
         if startable and blocked:
             parts.append("Waiting for a prerequisite: %s." % waiting_text(blocked))
-        if startable or not lots:
+        if external:
+            parts.append("Reserved to an external executor, not assignable: %s."
+                         % ", ".join("#%d (%s)" % pair for pair in external[:12])
+                         + (" …" if len(external) > 12 else ""))
+        if startable:
+            parts.append("Give them work tied to a lot: ameesh mail send <agent> "
+                         "\"…\" --lot <id> (or --new-lot \"title\"), or ameesh work assign <lot> "
+                         "<agent> --claim.")
+        elif external:
+            parts.append("Do not assign the reserved lots: their external executor acts "
+                         "(the pilot can clear a reservation with ameesh work "
+                         "external-executor <lot> --clear).")
+        elif not lots:
             parts.append("Give them work tied to a lot: ameesh mail send <agent> "
                          "\"…\" --lot <id> (or --new-lot \"title\"), or ameesh work assign <lot> "
                          "<agent> --claim.")

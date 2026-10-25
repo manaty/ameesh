@@ -58,6 +58,17 @@ l'orchestrateur de l'équipe en reçoit un courrier (`event`, lié au lot).
   aujourd'hui attend sa date (exemple : un bilan à deux semaines).
 * Réserver un lot à une attribution explicite : capacité exigée `decision` ou
   `production`. Exiger un harnais : capacité `harness:<nom>`.
+* Réserver un lot à un **exécutant externe déclaré** (#3447, constat du 25/10 :
+  le bureau n'était pas assignable et L165 prenait ses lots) :
+  `ameesh work add … --external-executor bureau`, ou
+  `ameesh work external-executor <lot> bureau` sur un lot existant. Le lot
+  reste **sans assigné** — l'agent `externe` ne se réveille pas (0030) — mais
+  il porte son exécutant : L165 ne le prend pas, l'alerte et `ameesh debit` le
+  nomment (« attente externe ») au lieu de « sans assigné ». Le geste est
+  celui d'un pilote (`corrector`, rôle déclaré) ; `--clear` lève la
+  réservation. Un **sous-lot de préparation** ne l'hérite pas : la part d'un
+  agent reste assignable (aucun héritage du champ par `parent_lot` ni par la
+  fiche).
 * Un lot de relecture après fusion (`review-after-merge:#<lot>`, sur son
   `issue_ref` ou sa `source`, #2377/#2552) n'est pris que par un agent de la
   **famille opposée** à celle de l'auteur au gel ; famille de l'auteur

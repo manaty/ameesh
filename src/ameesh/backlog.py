@@ -831,7 +831,9 @@ def lot_takeable(item: dict, today: str | None = None) -> bool:
     arrivent ici), de décision (demande de décision en attente, jalon de
     décision ouvert, capacité `decision` exigée) ni de production (capacité
     `production` exigée) ; jamais un lot sans équipe connue, ni un lot dont le
-    début prévu est après `today` (« AAAA-MM-JJ »).
+    début prévu est après `today` (« AAAA-MM-JJ »). #3447 : jamais un lot
+    réservé à un exécutant externe déclaré (`external_executor`) — cette part
+    attend son exécutant, elle n'est pas à la file.
 
     §4 : un lot `build` sans assigné n'est prenable que s'il a été RENDU à la
     file par la limite d'en-cours (`returned_to_queue` : la note de retour est
@@ -839,6 +841,8 @@ def lot_takeable(item: dict, today: str | None = None) -> bool:
     (prérequis, travail confié par courrier) n'est pas à la file."""
     if item.get("state") not in ("intake", "build") \
             or (item.get("assignee") or "").strip():
+        return False
+    if (item.get("external_executor") or "").strip():
         return False
     if item.get("state") == "build" and not item.get("returned_to_queue"):
         return False
@@ -1228,6 +1232,7 @@ def _still_free(st, item_id) -> bool:
     if item is None:
         return False
     return (not (item.get("assignee") or "").strip()
+            and not (item.get("external_executor") or "").strip()
             and item.get("state") in ("intake", "build"))
 
 

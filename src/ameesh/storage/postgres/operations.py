@@ -439,6 +439,7 @@ class Operations(interface.Operations):
     _LOTS_ACTIVITY = """
             SELECT w.id, w.title, w.state, w.assignee, w.package_id, w.type,
                    w.priority, w.app, w.workstream, w.branch_target, __REVIEWER__,
+                   to_jsonb(w)->>'external_executor' AS external_executor,
                    -- #2335 : l'appartenance à un paquet se lit sur le porteur
                    -- (`integration/**`), son manifeste (corps) et la tête gelée
                    -- du lot, sans requête par lot. Le corps n'est transféré que

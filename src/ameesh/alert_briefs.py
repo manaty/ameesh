@@ -333,6 +333,13 @@ def _stale_move(alert: dict, lot: int, who: str | None) -> str:
         # main entre-temps, au lieu de voler le lot au premier.
         return ("nudge %s: ameesh mail send %s \"…\" --lot %d, or reassign it: "
                 "ameesh work assign %d <agent> --if-holder %s" % (who, who, lot, lot, who))
+    external = (alert.get("external_executor") or "").strip() or None
+    if external:
+        # #3447 : réservé, pas sans assigné — le geste est celui de
+        # l'exécutant, ou la levée préalable par le pilote.
+        return ("this lot is reserved to %s (external executor, not an assignee): the "
+                "executor acts; if the reservation is without object, the pilot clears "
+                "it first: ameesh work external-executor %d --clear" % (external, lot))
     # #1026 : un lot sans assigné se prend (`--claim`) : deux orchestrateurs
     # qui l'assignent en même temps ne peuvent plus se voler le lot.
     return "assign it: ameesh work assign %d <agent> --claim" % lot
@@ -358,11 +365,14 @@ def _one_orchestrator(orchestras, by_name: dict, lot) -> list:
 def _stale_lot(alert: dict) -> str:
     lot = int(alert["lot"])
     who = alert.get("agent")
+    external = (alert.get("external_executor") or "").strip() or None
     title = alert.get("title")
     head = "Stale lot: #%d%s (%s) no activity for %s, %s%s." % (
         lot, " \"%s\"" % title if title else "", alert.get("lot_state") or "?",
         sous_utilisation._duration(alert.get("value") or 0),
-        "assigned to %s" % who if who else "unassigned",
+        "assigned to %s" % who if who
+        else "reserved to %s (external executor)" % external if external
+        else "unassigned",
         ", waiting for: %s" % alert["waiting_for"] if alert.get("waiting_for") else "")
     move = _stale_move(alert, lot, who)
     # L368: a dependency declared towards an open parent lot is a planned wait,
@@ -472,12 +482,17 @@ def _slo_breach(alert: dict, *, level: int | None = None) -> str:
     #3288 : `blocked_freeze` est due par l'assigné (le débiteur de la
     correction), pas par le relecteur : ×1 l'assigné corrige et regel, ×2 le
     pilote réassigne, ×3 le bureau/l'auditeur réassigne à un agent libre de la
-    famille de l'auteur."""
+    famille de l'auteur.
+
+    #3447 : un lot réservé à un exécutant externe n'est pas « unassigned » —
+    le texte nomme l'exécutant (bureau, owner) et le fait que ce n'est pas une
+    attribution."""
     lot = int(alert["lot"])
     title = alert.get("title")
     level = int(alert.get("level") or 1) if level is None else int(level)
     step = alert.get("step_label") or alert.get("step") or "?"
     who = alert.get("agent")
+    external = alert.get("external_executor")
     head = ("SLO breach, level %d: lot #%d%s (%s), step `%s` late by %s (target %s)%s."
             % (level, lot, " \"%s\"" % title if title else "",
                alert.get("lot_state") or "?", step,
@@ -485,7 +500,9 @@ def _slo_breach(alert: dict, *, level: int | None = None) -> str:
                sous_utilisation._duration(alert.get("threshold") or 0),
                (", owed by reviewer %s" % who if alert.get("step") == "green_verdict"
                 else ", fix owed by %s" % who if alert.get("step") == "blocked_freeze"
-                else ", assigned to %s" % who if who else ", unassigned")))
+                else ", assigned to %s" % who if who
+                else ", reserved to %s (external executor)" % external if external
+                else ", unassigned")))
     # #2016 : quand la commande est proposée, elle porte le titulaire lu
     # (`--if-holder`) : le pilote ou le bureau parti de ce brief est refusé si
     # le lot a changé de main entre-temps, au lieu d'écraser le premier geste.
@@ -600,6 +617,24 @@ def _slo_breach(alert: dict, *, level: int | None = None) -> str:
                     "the lot to build, re-enter qa (`ameesh work move %d qa`); if you "
                     "cannot, say so (`ameesh work note %d \"hold: <reason>\"`) so the "
                     "pilot hands the fix over" % (blocker, lot, lot, lot))
+    elif external:
+        # #3447 : le lot est réservé, pas assigné — le geste n'est ni une
+        # relance d'assigné ni une réassignation directe (refusée par
+        # `work assign`) mais l'action de l'exécutant ou la levée préalable.
+        if level >= 3:
+            move = ("bureau or auditor: lot #%d is reserved to %s (external executor, not "
+                    "an assignee) — this is not an assignment; the executor acts, or the "
+                    "pilot clears the reservation before any reassignment (ameesh work "
+                    "external-executor %d --clear)" % (lot, external, lot))
+        elif level >= 2:
+            move = ("pilot: lot #%d is reserved to %s (external executor) — do not assign "
+                    "it as is; the executor acts, or clear the reservation before "
+                    "reassigning (ameesh work external-executor %d --clear)"
+                    % (lot, external, lot))
+        else:
+            move = ("%s (external executor): lot #%d is reserved to you; act on it, or tell "
+                    "the pilot it is not for you (the pilot clears the reservation with "
+                    "ameesh work external-executor %d --clear)" % (external, lot, lot))
     elif level >= 3:
         move = ("bureau or auditor: reassign it now to a free agent (ameesh work assign "
                 "%d <agent>%s, then agent-mail send <agent> \"…\" --lot %d); do not wait "
@@ -663,7 +698,23 @@ def _for_auditor(alert: dict) -> str:
     niveau 1). #1608 : un lot qu'une attente planifiée retient n'est pas
     démarrable, on ne lui demande pas de l'assigner."""
     text = "Idle capacity: %s." % (alert.get("detail") or "?")
-    if alert.get("startable_lots", alert.get("lots")):
+    if alert.get("startable_lots"):
+        text += (" Lots are waiting with idle agents: if this still holds at your next "
+                 "pass, 30 min or more after this mail, fix it yourself (level 1, reversible): ameesh "
+                 "work assign <lot> <agent> (an idle agent of the lot's team, highest "
+                 "priority first), then agent-mail send <agent> \"…\" --lot <lot> to "
+                 "wake it; name it in your report.")
+    elif alert.get("external_lots"):
+        # #3447 : ces lots ne s'assignent pas — l'alerte nomme l'exécutant
+        # externe (bureau, owner) ; le pilote lève la réservation s'il la
+        # juge sans objet.
+        text += (" No startable lot: %s — the pilot declared them; their external executor "
+                 "acts, do not assign an agent. If the reservation is without object, ask "
+                 "the pilot to clear it (ameesh work external-executor <lot> --clear)."
+                 % ", ".join("#%s (%s)" % (row.get("lot"), row.get("executor"))
+                             for row in alert.get("external_lots") or ()))
+    elif alert.get("lots") and "startable_lots" not in alert:
+        # Producteur d'avant #1608 : la liste `lots` n'était pas classée.
         text += (" Lots are waiting with idle agents: if this still holds at your next "
                  "pass, 30 min or more after this mail, fix it yourself (level 1, reversible): ameesh "
                  "work assign <lot> <agent> (an idle agent of the lot's team, highest "

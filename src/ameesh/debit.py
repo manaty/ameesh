@@ -27,7 +27,10 @@ humaines explicites (geste owner, go encore requis, décision owner due ou non
 signée, retour de l'owner, login/2FA, lot `waiting_human`) sont listées à part
 et ne font pas sortir 2 : le canon ne vise que les attentes d'agent. Une
 simple mention d'une règle ou d'une consigne de l'owner ne suffit pas, et un
-`hold_undeployed` n'est jamais humain.
+`hold_undeployed` n'est jamais humain. #3447 : les lots réservés à un exécutant
+externe déclaré (`external_executor`) sont, de même, listés à part (« attentes
+externes ») : ce n'est ni un lot sans assigné ni une attente d'agent, et ce
+n'est pas `--check` qui la pousse.
 """
 from __future__ import annotations
 
@@ -676,6 +679,9 @@ def build(*, items: Iterable[Mapping[str, Any]],
           holds: Mapping[int, Mapping[str, Mapping[str, Any]]] | None = None,
           ci_unreadable: Iterable[str] = ()) -> dict:
     """Le rapport de débit, calculé sans I/O (témoins et tests)."""
+    # #3447 : le préfixe de journal est défini une fois, pour l'écrivain
+    # (`work.set_external_executor`) et ce lecteur.
+    from .storage.interface import EXTERNAL_EXECUTOR_NOTE
     now = time.time() if now is None else float(now)
     installed = installed_version() if installed is None else str(installed)
     installed_triple = _version(installed)
@@ -707,6 +713,7 @@ def build(*, items: Iterable[Mapping[str, Any]],
     wakes_out: list[dict] = []
     device_holds: list[dict] = []
     undeployed_holds: list[dict] = []
+    external_waits: list[dict] = []
     unreadable: list[str] = list(devices.get("unreadable") or ())
 
     for ident, item in by_id.items():
@@ -716,6 +723,33 @@ def build(*, items: Iterable[Mapping[str, Any]],
         terminal_ts = _terminal_at(lot_milestones)
         if terminal_ts is not None and _reopened(lot_events, terminal_ts):
             terminal_ts = None
+        # #3447 : un lot réservé à un exécutant externe n'est pas « sans
+        # assigné » ; il attend cet exécutant (bureau, owner), pas un agent.
+        # La mesure reste lue sur le journal : la déclaration nommée par
+        # `work.EXTERNAL_EXECUTOR_NOTE`, sinon la création du lot.
+        external = str(item.get("external_executor") or "").strip()
+        state = state_by_lot.get(ident)
+        if external and not (item.get("assignee") or "").strip() \
+                and terminal_ts is None and state in ("intake", "build"):
+            since = item.get("created_ts")
+            for event in lot_events:
+                text = str(event.get("note") or "")
+                if not text.startswith(EXTERNAL_EXECUTOR_NOTE):
+                    continue
+                at = event.get("at_ts")
+                if at is not None and (since is None or float(at) > float(since)):
+                    since = float(at)
+            age = _age(now, since)
+            external_waits.append({
+                "lot": ident, "title": item.get("title") or "",
+                "app": item.get("app") or None, "who": external,
+                "kind": "external", "state": state,
+                "since_ts": since, "since": _iso(since), "age_s": age,
+                "gesture": "the external executor %s acts (bureau/owner, not an "
+                           "agent); the pilot clears the reservation if it is no "
+                           "longer wanted (`ameesh work external-executor %d "
+                           "--clear`)" % (external, ident),
+            })
         if freeze is not None and terminal_ts is None:
             designation = designations(lot_milestones, lot_events)
             unreadable.extend("%s: %s" % (ident, text)
@@ -1020,6 +1054,7 @@ def build(*, items: Iterable[Mapping[str, Any]],
         "idle_with_work": len(idle_with_work),
         "slow_waits": len(slow_waits),
         "human_waits": len(human_waits),
+        "external_waits": len(external_waits),
         "slow_ci_runs": len([run for run in runs
                              if float(run["duration_s"]) > ci_slow_s]),
     }
@@ -1036,6 +1071,9 @@ def build(*, items: Iterable[Mapping[str, Any]],
         "totals": totals,
         "slow_waits": slow_waits,
         "human_waits": human_waits,
+        "external_waits": sorted(
+            external_waits,
+            key=lambda row: (-float(row.get("age_s") or 0.0), row["lot"])),
         "qa": sorted(qa, key=lambda row: (-float(row["age_s"] or 0.0), row["lot"])),
         "blocked_reviews": sorted(blocked_reviews,
                                   key=lambda row: (-float(row["age_s"] or 0.0),
@@ -1092,9 +1130,13 @@ def _rows(db, sql: str, params=()) -> list[dict]:
 
 
 #: les colonnes d'un lot lues sont des **étiquettes** (id, titre, projet,
-#: assigné) ; jamais state, reviewer(s), wake_at ni updated_at (canon 24/10).
+#: assigné, exécutant externe déclaré, instant de création) ; jamais state,
+#: reviewer(s), wake_at ni updated_at (canon 24/10). L'état courant d'un lot
+#: se lit au journal (`state_by_lot`), pas dans sa colonne.
 _ITEMS_SQL = """
-    SELECT w.id, w.title, w.app, w.assignee, w.priority
+    SELECT w.id, w.title, w.app, w.assignee, w.priority,
+           to_jsonb(w)->>'external_executor' AS external_executor,
+           extract(epoch FROM w.created_at)::float8 AS created_ts
       FROM work_items w
      WHERE (EXISTS (SELECT 1 FROM work_item_milestones m
                      WHERE m.work_item_id = w.id AND m.at > to_timestamp(%s))
@@ -1345,6 +1387,20 @@ def format_text(report: Mapping[str, Any]) -> str:
                             str(row.get("title") or "")[:48]))
     else:
         lines.append("Attentes humaines, hors --check : aucune.")
+    external = report.get("external_waits") or []
+    if external:
+        lines.append("")
+        lines.append("Attentes externes, hors --check (%d) — exécutant déclaré, "
+                     "pas un agent à assigner :" % len(external))
+        for row in external[:20]:
+            lines.append("  #%-6d %-16s %8s  %-22s %s"
+                         % (int(row.get("lot") or 0), str(row.get("kind")),
+                            _duration(row.get("age_s")),
+                            str(row.get("who") or "?")[:22],
+                            str(row.get("title") or "")[:48]))
+            lines.append("         → %s" % row.get("gesture"))
+    else:
+        lines.append("Attentes externes, hors --check : aucune.")
     reviews = report.get("reviews_by_reviewer") or []
     lines.append("")
     lines.append("Avis dus par relecteur : %s" % (
@@ -1408,8 +1464,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-jobs", action="store_true",
                         help="ne pas lire les jobs GitHub (durée par workflow seulement)")
     parser.add_argument("--check", action="store_true",
-                        help="sortir 2 si une attente non humaine dépasse le seuil "
-                             "(aucun « rien à signaler »)")
+                        help="sortir 2 si une attente d'agent dépasse le seuil "
+                             "(hors attentes humaines et externes ; aucun « rien à "
+                             "signaler »)")
     parser.add_argument("--canon", action="append", default=None,
                         help="racine d'un canon à lire pour les appareils (répétable)")
     parser.add_argument("--installed", default=None,
