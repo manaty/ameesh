@@ -26,6 +26,19 @@ def rollup():
             "inconclusive": [], "missing": []}
 
 
+#: #3186 : `ci_reading` lit aussi les checks requis de la cible à la forge ;
+#: ici, aucun (les agrégats jamais conclus ont leurs témoins dans test_3186).
+_REQUIRED = mock.patch.object(release, "required_checks", return_value=())
+
+
+def setUpModule():
+    _REQUIRED.start()
+
+
+def tearDownModule():
+    _REQUIRED.stop()
+
+
 class OptionalJobReadingTest(unittest.TestCase):
     project = release.ProjectRelease("ameesh", "/unused", github="acme/project")
 
@@ -295,6 +308,16 @@ class OptionalJobReadingTest(unittest.TestCase):
         reading = rollup()
         reading["negative"].append("security")
         self.assertFalse(self.read(suite(), reading)["green"])
+
+    def test_an_unconcluded_required_check_is_never_acceptable(self):
+        # #3186 × #3244 : un requis jamais conclu, rendu par la lecture des
+        # checks requis, reste une preuve absente même si `tests` a conclu.
+        reading = rollup()
+        reading["unconcluded"] = [{"check": "security", "databaseId": 700}]
+        result = self.read(suite(mac="success"), reading)
+        self.assertFalse(result["acceptable"])
+        self.assertFalse(release.reading_is_green(result))
+        self.assertEqual(result["unconcluded"], reading["unconcluded"])
 
     def test_unreadable_jobs_are_transient(self):
         with mock.patch.object(release.radar, "commit_ci", return_value=rollup()), \

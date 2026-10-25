@@ -153,9 +153,10 @@ class PacketReplacementTest(unittest.TestCase):
                 # workflow) ne gate pas, même rouge ; un `FAILURE` du nom
                 # requis ou du portier bloque encore, et un CANCELLED du
                 # portier aussi (preuve stricte). `ci_green`, `status.ci` et
-                # merge-pr gardent leur preuve stricte.
-                blocking = (workflow == "paquet"
-                            or (name == "tests" and conclusion == "FAILURE"))
+                # merge-pr gardent leur preuve stricte. #3186 (décision owner
+                # #128512) : un `tests` requis jamais conclu (CANCELLED) est
+                # une preuve absente — il bloque, quelle que soit sa source.
+                blocking = workflow == "paquet" or name == "tests"
                 with self.subTest(workflow=workflow, name=name, conclusion=conclusion):
                     self.assert_gate(rows, False, gate=not blocking)
 

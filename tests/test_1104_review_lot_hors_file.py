@@ -755,6 +755,55 @@ class CatchUpWitnessTest(_Witness):
         self.assertEqual(len(mail.unread_active(self.db, "pilote")), 1,
                          "l'avertissement est renvoyé à chaque tentative")
 
+    def test_le_geste_conseille_relance_la_classification(self):
+        """#3413 : l'avertissement conseille `work merged --repo` ; lancé juste
+        après la tentative qui l'a motivé, ce geste relance la classification
+        avec le clone retrouvé au lieu de répondre « nothing to do » (le délai
+        de reprise d'une heure et le plafond du balayage ne valent pas pour un
+        geste explicite)."""
+        lot = self.merged_lot("dépôt retrouvé")
+        registry.upsert(self.db, "pilote", harness="claude", host=self.cfg.host,
+                        cwd=self.repo)
+        with mock.patch.dict(os.environ,
+                             {"AMEESH_ALERT_ORCHESTRATORS": "pilote"}), \
+                mock.patch.object(review_lot, "_repo_of_agent", return_value=""), \
+                mock.patch.object(review_lot.lot_class, "repository", return_value=None):
+            first = review_lot.catch_up(self.db)
+            second = review_lot.catch_up(self.db, retry_s=0)
+        self.assertEqual((first["attempted"], second["attempted"]), (1, 1),
+                         (first, second))
+        self.assertEqual(len(mail.unread_active(self.db, "pilote")), 1)
+        with mock.patch.object(review_lot, "class_at_merge",
+                               return_value={"class": "light", "why": "témoin"}):
+            done = work.merged(self.db, lot, sha="abcdef1234", repo=self.repo,
+                               actor="claude1")
+        self.assertEqual(done["result"], "already", done)
+        self.assertIn("relecture", done["detail"], done)
+        self.assertEqual(len(self.review_lots(lot)), 1, done)
+        # le lot de relecture est désormais ouvert : un second geste le rend
+        # tel quel, sans relire la classe (idempotence d'`open_for_merge`).
+        with mock.patch.object(review_lot, "class_at_merge") as klass:
+            again = work.merged(self.db, lot, sha="abcdef1234", repo=self.repo,
+                                actor="claude1")
+        klass.assert_not_called()
+        self.assertIn("déjà ouverte", again["detail"], again)
+
+    def test_le_geste_explicite_ne_relit_pas_l_historique(self):
+        """#3413 : la reprise explicite reste tenue par la borne d'activation
+        (B1 #1104) — un lot fusionné avant l'activation n'est pas relu
+        rétroactivement, même avec un clone."""
+        lot = self.merged_lot("fusion ancienne")
+        self.db.execute(
+            "UPDATE work_item_milestones SET at = now() - interval '1 day'"
+            " WHERE work_item_id = %s AND kind = 'merged'", (lot,))
+        with mock.patch.object(review_lot, "class_at_merge") as klass:
+            done = work.merged(self.db, lot, sha="abcdef1234", repo=self.repo,
+                               actor="claude1")
+        self.assertEqual(done["result"], "already", done)
+        klass.assert_not_called()
+        self.assertEqual(self.review_lots(lot), [])
+        self.assertIn("hors bornes", done["detail"], done)
+
     def test_depot_lisible_a_la_deuxieme_passe_sans_courrier(self):
         """#3384 : absence transitoire puis classe sensible confirmée."""
         lot = self.merged_lot("clone pas encore lisible")
@@ -852,6 +901,21 @@ class DeclaredMergeWitnessTest(_Witness):
         rows = self.review_lots(lot)
         self.assertEqual(len(rows), 1, rows)
         self.assertIn("Classe : light", work.get(self.db, rows[0]["id"])["body"])
+
+    def test_le_cli_dit_pourquoi_la_relecture_n_est_pas_ouverte(self):
+        """#3413 : « already merged: nothing to do » cachait la relecture
+        manquante et son motif ; le geste explicite doit dire ce qu'il a fait
+        ou pourquoi il n'a rien pu faire."""
+        lot = self.merged_lot("hors bornes")
+        self.db.execute(
+            "UPDATE work_item_milestones SET at = now() - interval '1 day'"
+            " WHERE work_item_id = %s AND kind = 'merged'", (lot,))
+        proc = self.mesh("work", "merged", str(lot), "--sha", "abcdef1234",
+                         "--repo", self.repo)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("lot #%d already merged:" % lot, proc.stdout)
+        self.assertIn("relecture non ouverte", proc.stdout)
+        self.assertNotIn("nothing to do", proc.stdout)
 
 
 class CloseGuardWitnessTest(_Witness):
