@@ -152,6 +152,8 @@ class TemoinTest(unittest.TestCase):
         # lisible ; il ne prouve aucune isolation.
         self.assertEqual(self._run("/proc").returncode, 1)
 
+    @unittest.skipIf(os.geteuid() == 0,
+                     "root peut lire un masque 000 : positif réservé à un uid non root")
     def test_montage_inaccessible_avec_canari_conforme(self):
         # Le positif : bwrap (profil userns du train) binde un annuaire 000
         # sur le chemin, comme systemd avec /run/systemd/inaccessible/dir.
