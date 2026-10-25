@@ -1762,6 +1762,13 @@ class WorkItems(interface.WorkItems):
             raise ValueError("on_frozen only makes sense for the `frozen` milestone")
         threads = [] if after_commit is None else after_commit
         with self.db.transaction() as tx:
+            # #3490: a freeze can call work.move below. Acquire its repository
+            # advisory lock before any lot row lock, as all migration writers
+            # do; reversing that order deadlocks with a concurrent move.
+            # Other milestones never move the lot and may follow a note that
+            # already holds its row (e.g. a fenced fire exception).
+            if kind == "frozen":
+                _lock_migration_writer(tx, item_id)
             items = tx.query("SELECT id, app, branch_target, state FROM work_items"
                              " WHERE id = %s FOR NO KEY UPDATE", (int(item_id),))
             rows = tx.query(
