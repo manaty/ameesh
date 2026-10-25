@@ -66,11 +66,9 @@ class VersionedPolicyTest(unittest.TestCase):
         return (provider or self.provider())(self.item, self.row, self.base, self.repo)
 
     def test_light_and_one_or_two_reviews_are_bound_to_exact_subject_and_policy(self):
-        # deploy/** is critical (production): the merge gate demands two
-        # families on the changed path, so a one-review rule is floored to
-        # two. queue/** is sensitive (concurrency) but not one of the critical
-        # domains (SQL, security, prod): its one-review rule stays one. ui/**
-        # stays a non-critical one-review case.
+        # #3542 : chaque chemin suit la règle du canon qui le nomme ; le
+        # plancher de classe demeure pour les chemins qu'aucune règle ne nomme.
+        # queue/** et ui/** restent à un avis, private/keys.py à deux.
         for path, risk, count in (("docs/readme.md", "light", 0), ("ui/page.py", "sensitive", 1),
                                   ("queue/lock.py", "sensitive", 1), ("private/keys.py", "sensitive", 2)):
             # Each subsequent diff contains the preceding changes as well.
@@ -79,14 +77,36 @@ class VersionedPolicyTest(unittest.TestCase):
             self.assertEqual((result.lot, result.base, result.head, result.policy_commit),
                              (7, self.base, self.row["frozen_sha"], self.version))
 
-    def test_critical_domain_floor_raises_the_per_path_count_to_two_families(self):
-        # The merge gate requires two distinct families for deploy/**: the
-        # per-path rule says one, admission must not read it as one.
+    def test_a_canon_rule_that_names_deploy_is_authoritative(self):
+        # #3542 : le canon nomme deploy/** à un avis. La porte de fusion ne le
+        # relève plus par CRITICAL_SCOPE ; l'admission du train doit lire le
+        # même besoin, sinon la désignation dirait 1 et le train exigerait 2.
         result = self.qualify("deploy/bascule.py")
-        self.assertEqual((result.risk, result.reviews), ("sensitive", 2))
+        self.assertEqual((result.risk, result.reviews), ("sensitive", 1))
+        self.assertEqual(result.train_reviews_paths, {"deploy/bascule.py": 1})
+        self.assertEqual(result.train_reviews_wide, 0)
         self.assertEqual([(entry["path"], entry["class"]) for entry in result.files],
                          [("deploy/bascule.py", "sensitive")])
         self.assertIn("deploy/**", result.files[0]["rule"])
+
+    def test_a_catch_all_does_not_lower_an_unnamed_critical_path_in_the_train(self):
+        # #3542 : une règle `**` à un avis couvre scripts/deploy* sans le
+        # nommer ; pour ameesh, le plancher critique du train reste deux avis,
+        # comme celui de la porte.
+        self.document["review_policies"]["risk_classes"]["projects"]["ameesh"] = \
+            copy.deepcopy(self.document["review_policies"]["risk_classes"]["projects"]["example"])
+        self.document["review_policies"]["train_reviews"]["projects"]["ameesh"] = dict(rules=[
+            dict(paths=["db/**", "private/**", "**/*.sql"], reviews=2),
+            dict(paths=["deploy/**"], reviews=1),
+            dict(paths=["**"], reviews=1)])
+        version = self.save_policy()
+        item = dict(self.item, app="ameesh")
+        self.row["frozen_sha"] = self.change("scripts/deploy-cutoff.sh")
+        result = self.provider(version, project="ameesh")(
+            item, self.row, self.base, self.repo)
+        self.assertEqual(result.train_reviews_paths, {})
+        self.assertEqual(result.train_reviews_wide, 1)
+        self.assertEqual((result.risk, result.reviews), ("sensitive", 2))
 
     def test_sensitive_path_without_a_count_is_refused_even_beside_covered_path(self):
         self.change("private/key.py")
