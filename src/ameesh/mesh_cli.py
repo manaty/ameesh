@@ -4327,11 +4327,14 @@ def _cost_l26(cfg: Config, db, what: str, args) -> int:
     if what == "turns":
         limit = int(args.limit)
         rows = ops.turns(agent=args.agent, since_s=_since_seconds(args.since),
-                         limit=limit, message=getattr(args, "message", None))
+                         limit=limit + 1 if limit > 0 else limit,
+                         message=getattr(args, "message", None))
         # #3452 : le plafond s'appliquait sans le dire — 500 tours sur ~4 h 30
         # d'une nuit se lisaient comme la fenêtre entière. La troncature est
         # désormais dite, en JSON comme en texte.
-        truncated = bool(limit and len(rows) >= limit)
+        truncated = limit > 0 and len(rows) > limit
+        if truncated:
+            rows = rows[:limit]
         if args.json:
             payload = {"schema": "ameesh-turns/1", "turns": rows,
                        "truncated": truncated, "limit": limit}
