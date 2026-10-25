@@ -47,7 +47,9 @@ The gesture, and its guards (all checked BEFORE any write):
    imposes an application, the check runs of the exact head are read for
    their source, so a same-named check from another application or a commit
    status does not satisfy it; an unreadable protection without a
-   declaration refuses. This path writes outside the API, so it never
+   declaration refuses, and a declared empty list covers only the proven
+   GitHub-plan 403 (no protection can exist on that repository), never a
+   rights refusal. This path writes outside the API, so it never
    bypasses the protection it cannot see; when the base is not the
    repository's default target, it must not already be merged into that
    default (#2603: a stacked PR would land on a dead branch) — the guard
@@ -315,7 +317,10 @@ def _required_refusal(slug: str, target: str, project, rollup, *, head: str = ""
     de `gh pr view` ne porte ni application ni source, donc un statut de commit
     ou un homonyme d'une autre application ne satisfait pas l'exigence. Une
     protection ou une source illisible sans déclaration refuse : le geste hors
-    API n'est jamais plus faible que la file. Un transport local (chemin réel
+    API n'est jamais plus faible que la file. Une déclaration **vide** ne
+    couvre que le 403 de plan GitHub prouvé, qui dit qu'aucune protection ne
+    peut exister sur ce dépôt (#3428) ; un 403 de droits reste refusé. Un
+    transport local (chemin réel
     existant, celui que lie `_bind_repo_identity`) n'a pas de protection de
     branche, il n'y a donc rien à exiger ; un slug vide ou malformé n'est ni
     l'un ni l'autre et refuse, sans s'en remettre à l'appelant (#2289)."""
