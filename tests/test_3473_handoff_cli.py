@@ -33,7 +33,7 @@ class OperatorTest(unittest.TestCase):
             with self.subTest(command=command), \
                     mock.patch.object(work, 'corrector') as authorize, \
                     mock.patch.object(storage, 'of', return_value=self.api), \
-                    mock.patch.object(ameesh, 'handoff_binding', self.loader, create=True), \
+                    mock.patch.object(ameesh, 'handoff_factory', self.loader, create=True), \
                     mock.patch.object(host_lifecycle, '_ReadyAdapter') as wrapper, \
                     mock.patch.object(handoffs, 'advance', return_value=self.result) as advance, \
                     mock.patch.object(handoffs, 'cancel', return_value=self.result) as cancel, \
@@ -63,7 +63,7 @@ class OperatorTest(unittest.TestCase):
         import ameesh
         with mock.patch.object(work, 'corrector'), \
                 mock.patch.object(storage, 'of', return_value=self.api), \
-                mock.patch.object(ameesh, 'handoff_binding', self.loader, create=True), \
+                mock.patch.object(ameesh, 'handoff_factory', self.loader, create=True), \
                 mock.patch.object(host_lifecycle, '_ReadyAdapter'), \
                 mock.patch.object(handoffs, 'retry', side_effect=ValueError('SECRET')):
             with self.assertRaisesRegex(ValueError, '^handoff step refused;') as raised:
@@ -75,7 +75,7 @@ class OperatorTest(unittest.TestCase):
         import ameesh
         with mock.patch.object(work, 'corrector'), \
                 mock.patch.object(storage, 'of', return_value=self.api), \
-                mock.patch.object(ameesh, 'handoff_binding', self.loader, create=True), \
+                mock.patch.object(ameesh, 'handoff_factory', self.loader, create=True), \
                 mock.patch.object(host_lifecycle, '_ReadyAdapter'), \
                 mock.patch.object(handoffs, 'retry', return_value=self.result) as retry, \
                 mock.patch.object(handoffs, 'advance') as advance:
