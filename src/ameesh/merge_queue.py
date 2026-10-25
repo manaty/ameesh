@@ -211,7 +211,10 @@ def required_verdicts(klass) -> int:
     chemin correspond à `CRITICAL_SCOPE` ; celui-ci ne relève plus que les
     chemins qu'aucune règle ne nomme, et une règle attrape-tout (`**`) ne
     l'abaisse jamais. `critical: true` du canon reste un plancher explicite,
-    pour tous les projets.
+    pour tous les projets. Sous doute (#2394, dev2 #138909), cette lecture par
+    chemin est ignorée — le doute dit que le besoin n'est pas lisible — et
+    `CRITICAL_SCOPE` relève le chemin critique non nommé ; le compte global
+    déclaré reste un plancher.
     Les motifs de secours `CRITICAL_SCOPE` ne s'appliquent qu'au projet ameesh
     (ou à un appel sans projet connu) : pour les autres projets, la politique
     compilée fait foi (#2696, cas pilote Nexlink `desktop/host/**`) ; une
@@ -292,8 +295,12 @@ def _scale_verdicts(klass) -> int:
         cls = lot_class.SENSITIVE
     # #3542 : un classement qui porte la lecture par chemin fait foi chemin
     # par chemin ; les classements antérieurs (et les appelants qui n'ont que
-    # la classe) gardent la lecture globale ci-dessous.
-    if "train_reviews_paths" in klass and files:
+    # la classe) gardent la lecture globale ci-dessous. Un doute (#2394,
+    # dev2 #138909) ne lit jamais ces comptes : ils viennent d'un canon
+    # lisible alors que le doute dit que le besoin ne l'est pas ; une règle
+    # nommante à 1 y ferait tomber le plancher critique d'un chemin non nommé.
+    # Le compte global déclaré reste un plancher dans la lecture de doute.
+    if not klass.get("doubt") and "train_reviews_paths" in klass and files:
         return _named_verdicts(klass, cls, project)
     # #2696 : le canon compilé fait foi hors ameesh. Les motifs de secours
     # décrivent les chemins d'ameesh ; sur un lot Nexlink, `host-linux` (un

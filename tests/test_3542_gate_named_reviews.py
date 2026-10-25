@@ -158,6 +158,21 @@ class NamedReviewGateTest(unittest.TestCase):
                 self.assertEqual(klass["train_reviews_wide"], 2)
                 self.assertEqual(merge_queue.required_verdicts(klass), 2)
 
+    def test_a_doubt_never_applies_a_named_count(self):
+        # dev2 #138909 (B/P2) : un canon lisible nomme `deploy/**` à 1, un
+        # second canon a un `train_reviews` illisible. Le doute est sensible,
+        # mais il ne peut pas lire le compte par chemin : le plancher critique
+        # du chemin non nommé reste 2 (#2394), au lieu de tomber à 1.
+        readable = canon(rules=[{"paths": ["deploy/**"], "reviews": 1}])
+        unreadable = canon(rules=[{"paths": ["deploy/**"], "reviews": 3}])
+        klass = lot_class.class_of_paths(
+            [readable, unreadable], "ameesh", ["deploy/x.sh"])
+        self.assertTrue(klass["doubt"])
+        self.assertEqual(klass["class"], "sensitive")
+        self.assertIn("review train counts unreadable", klass["why"])
+        self.assertTrue(merge_queue.critical_scope(klass))
+        self.assertEqual(merge_queue.required_verdicts(klass), 2)
+
     def test_a_catch_all_still_raises_a_named_path(self):
         # Le maximum des règles applicables reste le nombre d'avis ; seule
         # l'abaissement du plancher critique par `**` est interdit.
