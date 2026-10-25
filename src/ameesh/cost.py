@@ -1789,11 +1789,10 @@ class CostBook:
         row = usage.row()
         row["turn"] = turn or usage.turn
         row["session"] = session_id
-        # L80b : les messages servis par ce tour, quand le flux résident les
-        # porte. Codex/ACP les mettent dans `resident.turn.inputs` ; Claude,
-        # dont le flux porte déjà l'usage, dans l'événement séparé
-        # `resident.inputs`. Aucun autre chemin n'en produit : les tours non
-        # résidents gardent la colonne non écrite.
+        # L80b : les messages servis par ce tour. Codex/ACP les mettent dans
+        # `resident.turn.inputs` ; Claude, dont le flux porte déjà l'usage, et
+        # depuis #3452 tout tour non résident, dans l'événement séparé
+        # `resident.inputs` (écrit par l'exécuteur avant la ligne).
         attribution = resident if resident is not None \
             else _resident_inputs_event(events)
         inputs = None
@@ -2540,13 +2539,31 @@ def _resident_event(events: Iterable[dict]) -> dict | None:
     return found
 
 
+def turn_attribution_lot(spec: dict, session_lot: str | None) -> str | None:
+    """#3452 : le lot imputé au grand livre pour un tour.
+
+    Le lot explicite du tour (courrier lié, réveil de lot, consigne) fait foi.
+    Un tour de **courrier** sans lot déductible (pilotage, courrier ambigu,
+    avis) n'hérite pas du lot de session : il n'y a pas travaillé, et le grand
+    livre l'imputait au lot de session (206 tours de mesh-design sur #1606,
+    117 USD, constat de l'analyse du 25/10). Les tours sans courrier (suite,
+    réveil, résumé de session) gardent le lot de session."""
+    lot = str((spec or {}).get("lot") or "").strip()
+    if lot:
+        return lot
+    if (spec or {}).get("ids"):
+        return None
+    return str(session_lot or "").strip() or None
+
+
 def _resident_inputs_event(events: Iterable[dict]) -> dict | None:
     """L'événement `resident.inputs` de la tranche, s'il y en a un (L80b).
 
     Le flux de Claude porte lui-même l'usage du tour, donc il n'écrit pas de
     `resident.turn` ; les messages servis voyagent dans cet événement, écrit
-    après la barrière steer. C'est une attribution seule — l'usage reste celui
-    du flux."""
+    après la barrière steer. Depuis #3452, un tour non résident écrit le même
+    événement (même type, même lecture) : c'est une attribution seule —
+    l'usage reste celui du flux ou de `turn.completed`."""
     found = None
     for event in events:
         if event.get("type") == RESIDENT_INPUTS_EVENT:

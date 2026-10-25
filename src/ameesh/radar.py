@@ -208,6 +208,11 @@ class Project:
     #: la branche cible est lue à la forge ; cette déclaration la complète et
     #: la remplace quand elle ne peut pas être lue (jamais pour l'affaiblir).
     required_checks: tuple = ()
+    #: #3428 : la clé `required_checks` était **déclarée**, même vide. Une
+    #: déclaration vide dit « aucune protection forge » et ne couvre qu'un 403
+    #: de plan prouvé (`Upgrade to GitHub Pro…`) ; l'absence de clé garde le
+    #: refus fail-closed. Ce drapeau distingue `[]` de l'absence.
+    required_checks_declared: bool = False
 
 
 @dataclass
@@ -409,6 +414,8 @@ def parse_settings(raw) -> Settings:
         required_checks = tuple(required_checks)
         if len(set(required_checks)) != len(required_checks):
             raise SettingsError("%s.required_checks: duplicate check name" % where)
+        required_checks_declared = ("required_checks" in value
+                                    and value["required_checks"] is not None)
         ci_parts = None
         if value.get("ci_parts") is not None:
             ci_parts = parse_ci_parts(value["ci_parts"], where)
@@ -507,7 +514,8 @@ def parse_settings(raw) -> Settings:
                                  ci_parts=ci_parts,
                                  required_statuses=tuple((g.strip(), p.strip())
                                                          for g, p in required.items()),
-                                 required_checks=required_checks)
+                                 required_checks=required_checks,
+                                 required_checks_declared=required_checks_declared)
 
     # Lease namespaces are reserved across the whole configuration. Checkout
     # paths and remote aliases must not let one project's lease overwrite

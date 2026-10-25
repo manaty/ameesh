@@ -206,23 +206,59 @@ def assigned_ts(item: dict, events: Iterable[dict]) -> float | None:
     (`backlog.LOT_TAKE_NOTE`) est aussi une première attribution — elle ne
     s'applique qu'à un lot sans preneur. Sans elle, un lot pris par la file
     restait « jamais assigné » : `signal_assigned` courait depuis sa création
-    et l'alerte demandait de le réassigner juste après sa prise (#660)."""
-    from . import backlog
+    et l'alerte demandait de le réassigner juste après sa prise (#660).
 
+    #3424 : la première attribution reste acquise quand le lot est rendu à la
+    file. Le retour (`work.RETURN_NOTE`, `handoff.RETURN_NOTE`) et le début
+    mesuré (`estimates.START_NOTE`) ne sont écrits que pour un lot qui a eu un
+    porteur ; une réassignation qui nomme le porteur remplacé (`before: Y`
+    avec Y non vide) le prouve aussi. Une attribution datée qui suit une de
+    ces preuves est une reprise, pas la première : la création reste la date
+    de l'étape. Le journal garde donc le fait que le lot a été attribué, même
+    si `assignee` est vide aujourd'hui : un lot créé déjà assigné puis rendu
+    ne redevient plus « jamais assigné » et `signal_assigned`, déjà conclu,
+    ne rouvre pas l'alerte de niveau 3 « reassign it now » (#3223)."""
+    from . import backlog, estimates, handoff, work
+
+    #: notes qu'un lot sans porteur ne peut pas avoir au journal : elles
+    #: prouvent qu'un exécutant a tenu le lot, sans dater sa première
+    #: attribution.
+    held_notes = (work.RETURN_NOTE, handoff.RETURN_NOTE, estimates.START_NOTE)
     first = None
+    held = False
+    held_at = None
     for ev in events:
         note = ev.get("note") or ""
-        if note.startswith("assigned to "):
-            if "(before: nobody)" not in note:
+        at = ev.get("created_ts")
+        stamp = None if at is None else float(at)
+        if note.startswith(held_notes):
+            held = True
+            if stamp is not None and (held_at is None or stamp < held_at):
+                held_at = stamp
+            continue
+        if note.startswith(("assigned to ", "assigné à ")):
+            previous = ""
+            if "(before: " in note:
+                previous = note.split("(before: ", 1)[1].split(")", 1)[0].strip()
+            if previous and previous != "nobody":
+                # #3424 : la réassignation nomme le porteur qu'elle remplace.
+                held = True
+                if stamp is not None and (held_at is None or stamp < held_at):
+                    held_at = stamp
+            if previous != "nobody":
+                # un marqueur absent ou une réassignation ne datent pas le
+                # début de l'étape : seule `(before: nobody)` est une première
+                # attribution
                 continue
         elif not note.startswith((backlog.LOT_TAKE_NOTE, backlog.AUTO_TAKE_NOTE)):
             continue
-        at = ev.get("created_ts")
-        if at is not None and (first is None or float(at) < first):
-            first = float(at)
-    if first is not None:
+        if stamp is not None and (first is None or stamp < first):
+            first = stamp
+    # #3424 : une reprise datée APRÈS un rendu (ou un début mesuré) n'est pas
+    # la première attribution — le lot avait déjà un porteur à sa création.
+    if first is not None and not (held_at is not None and held_at < first):
         return first
-    if item.get("assignee"):
+    if item.get("assignee") or held:
         return float(item["created_ts"]) if item.get("created_ts") is not None else None
     return None
 

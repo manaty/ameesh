@@ -321,6 +321,32 @@ prepares outside the database check the epoch first:
 | assignment | `ameesh work assign` / an assigned `work add` (and mail assignment through it) |
 | packet | `ameesh work packet record` / the packet train fire |
 | decision routing | `ameesh decide ask` |
+| drill canary (no effect) | `ameesh role canary [--json]` (EP7 P3, #3433) |
+
+The canary is the drill's fenced gesture. A real gesture played "same-value"
+(`work assign` of a lot to its current assignee) is refused by its business
+rule *before* the fence, for a stale epoch as for a live one, and so proves
+nothing. `ameesh role canary` acts under the environment's identity like any
+gesture — `AMEESH_ROLE` + `AMEESH_LEASE_EPOCH`, or a session bound by its
+runner — and its only writes are the lease renewal and one `pilot.gesture`
+event (`gesture` and `ref` both `canary`). Exit `0`: accepted, the event id
+is printed (`--json`: `{ok, role, epoch, host, runner, event}`). Exit `1`:
+refused, nothing journaled; for a stale or expired epoch (or a stopped role)
+the message names the holder, its host and its epoch, while an earlier
+refusal (no or invalid epoch, unknown role, unreadable registry) states its
+own reason — the proof of a refusal is the exit code, the message and the
+absence of the event. Exit `2`: no lease to fence (a human, the bureau, a host-pinned
+agent). For the drill, clear the session identity so only the epoch speaks,
+negative first:
+
+```sh
+env -u AGENT_MAIL_NAME -u AMEESH_RUNNER_ID -u AGENT_MESH_RUNNER_ID \
+    -u AMEESH_LEASE_OWNER AMEESH_ROLE=<ROLE> AMEESH_LEASE_EPOCH=<OLD-EPOCH> \
+  ameesh role canary          # exit 1, names the holder at <NEW-EPOCH>
+env -u AGENT_MAIL_NAME -u AMEESH_RUNNER_ID -u AGENT_MESH_RUNNER_ID \
+    -u AMEESH_LEASE_OWNER AMEESH_ROLE=<ROLE> AMEESH_LEASE_EPOCH=<NEW-EPOCH> \
+  ameesh role canary --json   # exit 0, one canary event at <NEW-EPOCH>
+```
 
 For an agent whose card says `releve: election`, `pilot_gesture.gate` reads
 the session's bound identity. A session that is not the live lease-holder at
@@ -373,3 +399,244 @@ lease (`merge_locks`) or GitHub's compare-and-swap: it stops a pilot that
 lost the election from starting the gesture at all. The packet composition
 itself is local git work; what is fenced is the composition record the pilot
 writes and the train fire that follows it.
+
+## Drill: planned stop, network cut and standby on return (L165/EP7)
+
+The election is proven by a real exercise on staging (canon §14: the mesh's
+hosts, never a production), not by a green unit test. EP7 is that proof for
+the governance roles — the ameesh pilot (`mesh-design`), the Nexlink pilot
+(`orchestrateur`), the auditor — and, through them, for any elected role. It
+runs against a *deployed* version: a merge, or a suite that passes on `main`,
+does not replace it.
+
+### Criteria
+
+`T0` is the gesture time written down by the operator (the stop, or the
+network cut), not the observer's first sample. Durations are measured in
+database time; the observer's wall clock is only used to order samples.
+
+| # | Criterion | Measurement | Target |
+|---|---|---|---|
+| P1 | New holder | `T_expiry` = last `lease_expires_ts` read before `T0`; `T_claim` = first sample with another `lease_owner` and a higher `lease_epoch`; `T_turn` = first `turn.started` of the new holder | `T_turn - T0 < 5 min`; `T_claim` follows `T_expiry` by at most one 60 s election pass plus the rank delay (100 s with three candidates) |
+| P2 | Never two holders | every observer sample carries at most one `lease_owner`; `lease_epoch` only grows; the old holder's renew is refused; no turn of the old holder survives the claim | exactly 1 holder in every sample that has one; 0 during the expiry window is expected |
+| P3 | Epoch fence | one no-op fenced gesture from the old holder (`ameesh role canary` at the old epoch, §Fencing) must exit 1, naming the current holder, host and epoch, with no `pilot.gesture` event; the same at the new epoch exits 0 with exactly one canary event | old epoch refused, new epoch accepted |
+| P4 | Return to standby | after the host (or its executors) comes back while another holder is live: no claim, no turn, same holder and epoch for 5 min; the returning runner logs standby | yes |
+| P5 | Continuity | the new holder starts a turn and consumes a mail addressed to the role; the first hourly packet after the switch, containing the witness lot, is composed and merged by the elected pilot with no gesture from the stopped host; when EP5 timers are installed, the next `ameesh role run` tick runs under its epoch | `T_turn - T0 < 5 min`; the witness packet merges at the first hourly cutoff after the switch |
+| P6 | No double effect | one `turn.started` per transition; exactly one merge in the window (the witness lot); no duplicated mail, wake, `pilot.gesture`, packet or landing; no other lot merged | 0 duplicate; 1 witness merge |
+
+"Never two holders" is not "never zero": during the lease TTL after `T0`
+there is no holder, and that is the designed window.
+
+### Scenarios
+
+- **A — planned stop of the workstation.** The owner or the bureau stops the
+  host that holds the role (or, when the host cannot be powered off, all of
+  the role's executors on it; the report names which). The lease expires after
+  its effective TTL (180 s in the study; verify `lease_ttl`, the code default
+  is 300 s and can miss the 5-minute target) and a candidate claims. Restart
+  the workstation only after the new holder is live.
+- **B — network cut.** The holder stays alive but loses the database; it
+  stops renewing and, after the lease TTL, another candidate claims. When the
+  database path returns, the former holder is refused by epoch and goes back
+  to standby. This is the scenario that tests P2 and P3 for real, because two
+  processes are alive at once.
+- **C — return of the workstation.** After A or B the workstation comes
+  back: it takes no lease and produces no effect from its old epoch. Only a
+  planned handover (its availability at least 5 points above the holder for
+  a full hour, at the end of a turn) can give it the role back.
+
+To run both A and B from the same starting holder, after A restart the
+workstation, then hand the role back by stopping the VM that just won (a
+planned stop, same procedure); the workstation claiming a free lease is the
+normal rank-delay path, not a violation. Then run B with the workstation
+holding again. Do not transfer the lease by hand at any point.
+
+### Staging variants accepted for the first run
+
+The workstation's owner uses `pc-smichea` during the day, and the bureau has
+no root network filter. The first exercise therefore uses two named variants,
+recorded as such in the report; they exercise the election and the fence, not
+a hardware loss or a network partition:
+
+- **A′ — executors only.** On the holder, at `T0`, stop the role's executor
+  with an immediate kill — never a plain `systemctl stop`, which drains the
+  running turn for up to 30 min and keeps renewing the lease:
+
+  ```sh
+  systemctl --user stop --no-block 'ameesh-runner-agent@<ROLE>'
+  systemctl --user kill --signal=KILL 'ameesh-runner-agent@<ROLE>'
+  systemctl --user stop 'ameesh-runner-agent@<ROLE>'
+  systemctl --user is-active 'ameesh-runner-agent@<ROLE>'   # must be inactive
+  ```
+
+  The scope is the role's executor(s) on the holder. All executors of the
+  host may be stopped instead only when every governance role they serve has
+  a live standby on another host; otherwise the others would lose their
+  holder for nothing. The report names the scope. The host stays up; the
+  lease follows its TTL, exactly as in A. Never the `ameesh-runner-ima`/TPK
+  units.
+- **B′ — process freeze.** `SIGSTOP` the role's runners and hold them
+  frozen until a **new holder with a higher epoch is observed**, not for a
+  fixed sleep: `SIGCONT` must never precede the expiry, or no takeover
+  happens and the exercise proves nothing. The wait is bounded by the
+  effective TTL plus 180 s (one election pass, the rank delay and a margin);
+  if the bound expires without a takeover, `SIGCONT` and stop the exercise
+  (restore on a surviving host) — that is a failed run, not a drill. On
+  resume the old process must be refused by epoch and go back to standby.
+  This is not a network cut; it proves the same no-renewal and stale-epoch
+  paths (P2, P3, P4).
+
+  ```sh
+  systemctl --user kill --kill-whom=all --signal=STOP 'ameesh-runner-agent@<ROLE>'
+  # poll `ameesh role status <ROLE> --json` every 5 s; stop at the first
+  # sample with another holder and a higher epoch, or at
+  # effective_ttl + 180 s (the bound), whichever comes first
+  systemctl --user kill --kill-whom=all --signal=CONT 'ameesh-runner-agent@<ROLE>'
+  ```
+
+The nominal A (whole host off) and B (root network cut) stay on the list for
+a later window with the owner's agreement. The report says which variant ran
+and does not present A′/B′ as a hardware-loss or network-partition proof.
+
+### Preconditions
+
+- EP1–EP6 are **deployed by a release**, not merely merged:
+  `ameesh role status` names the role, its holder, its epoch and the ranked
+  candidates on the deployed hosts.
+- At least two candidates of the role are ready: placement admitted, host
+  gate open, canon `ok`, fresh standing, and the role's **standby runner**
+  installed and running on each (`systemctl --user enable --now
+  ameesh-runner-agent@<ROLE>` on the candidate; never `agent-runner
+  register` there, which would move the registry row to that host instead of
+  standing by). A standby takes no turn and costs no token.
+- The effective lease TTL is the 180 s of the study. `lease_ttl` is a
+  parameter and the code default is **300 s**: a 300 s lease plus one 60 s
+  election pass and the rank delay can exceed 5 minutes after `T0`, so the
+  target may be missed. Verify the effective value before `T0`. If it exceeds
+  180 s, either set it to 180 s first (decision A) or run at 300 s and record
+  the drift and the missed target as a result (decision B); the criterion is
+  never re-based on the expiry — the delay from expiry stays diagnostic.
+- The drill starts from the holder named by `ameesh role status`, never from
+  an assumption; if the target host is not the holder, either run the drill
+  on the actual holder or wait for a planned handover.
+- A quiet window: no real packet in CI, no release in progress. A witness
+  lot (docs-only, light, no production effect) is created at drill start and
+  assigned to an agent that runs on a candidate VM; it is frozen and reviewed
+  **before the switch**, so the post-switch packet depends only on the elected
+  pilot/composer, not on the stopped host. Its packet is the first hourly
+  packet after the switch, composed by the elected pilot. It must merge with
+  no gesture from the stopped host, and no other lot is merged in the
+  window.
+- Owner go for the stop or the network cut (bureau delegation, canon §10);
+  the bureau executes the host gesture and writes `T0` on the host.
+
+Baseline at 2026-10-23T15:40Z, kept here as the starting point of EP7 (it is
+not a verdict): the deployed version is 1.19.0, which has no `ameesh role`
+command, so EP1–EP4 are not in staging; `agent_registry` still carries
+`releve='hote'` for `mesh-design`, `auditeur` and `orchestrateur`;
+`agent_candidates` is empty; `ameesh role status` answers "no elected role
+declared". The holders are all on `pc-smichea` (epochs 198, 143 and 174 at
+the reading). Seven-day availability is 100 % on `ameesh-agents-1` and
+`ameesh-agents-2`, 79.8 % on `pc-smichea` (8042 minutes of 10080). The
+declared target is three candidates for the two pilots and the auditor,
+`[ameesh-agents-1, ameesh-agents-2, pc-smichea]`, effective only after
+`#3101` and `manaty/home#156` (the admission counted once) are merged and
+deployed, and after the standby runners are started on the VMs. Until then
+the exercise is blocked, not failed.
+
+### Procedure
+
+0. **Prepare.** Create the witness lot now (docs-only, light, estimate a
+   few minutes), assign it to an agent that runs on a candidate VM, freeze
+   it and get its review **before the switch**; pin the two candidate hosts;
+   check no packet is in CI. Keep a shell on a **surviving** host (a VM that
+   is not the holder) for the observer.
+1. **Baseline.** On the surviving host, record `date -u`, `ameesh role
+   status <ROLE> --json`, the role's row (`host`, `lease_owner`,
+   `lease_epoch`, `lease_expires_ts`) and `ameesh list`. Note the witness
+   lot id. Send a mail to the role so P5 has a witness, and note its id.
+2. **Observer.** On the surviving host, in `$TMPDIR` or under
+   `~/.local/state/ameesh/drills/`, sample the role every 5 s and prefix
+   each line with the time:
+
+   ```sh
+   while :; do
+     printf '%s ' "$(date -u +%FT%T.%3NZ)"
+     ameesh role status <ROLE> --json
+     sleep 5
+   done | tee "$HOME/.local/state/ameesh/drills/ep7-<ROLE>-$(date -u +%Y%m%dT%H%M%SZ).jsonl"
+   ```
+
+   Record the observer start and stop times. Also read the last
+   `lease_expires_ts` before `T0`: it is `T_expiry` for P1.
+3. **Gesture A or A′.** The bureau runs the A′ stop command above on the
+   holder (or stops the whole host when that is the agreed variant) at `T0`,
+   written down on the host and repeated on the lot thread. A plain
+   `systemctl stop` is not a host loss: it drains the turn and keeps the lease
+   alive for up to 30 min. Do not touch the database. Watch the observer: the
+   lease must expire, then one candidate must claim with a new epoch.
+4. **First turn (P1, P5).** As soon as the new holder is visible, send it a
+   short mail (or check the one sent at step 1). `T_turn` is the first
+   `turn.started` for the role after the claim, read from `ameesh events
+   --json`. The new holder must process the mail within 5 min. Once it is
+   live, the elected pilot (or the packet composer it delegates to) composes
+   the first hourly packet with the witness lot; it must merge with no
+   gesture from the stopped host. Record the merge time and the actor.
+5. **Fence (P3).** From any surviving shell, present the old epoch the way
+   an EP5 timer would and run the dedicated no-op canary (`ameesh role
+   canary`, added to the gesture table of §Fencing by #3433):
+
+   ```sh
+   env -u AGENT_MAIL_NAME -u AMEESH_RUNNER_ID -u AGENT_MESH_RUNNER_ID \
+       -u AMEESH_LEASE_OWNER \
+       AMEESH_ROLE=<ROLE> AMEESH_LEASE_EPOCH=<OLD-EPOCH> \
+       ameesh role canary
+   ```
+
+   It must exit 1, name the current holder, host and epoch, and write no
+   `pilot.gesture` event. Then the positive control, same command with
+   `<NEW-EPOCH>` and `--json`, must exit 0 and journal exactly one `canary`
+   gesture at the new epoch — this proves the refusal was not vacuous. Exit 2
+   means no live lease: that is not a fence result. The old `work assign
+   <witness> <current-assignee>` canary is **invalid**: the business check
+   ("already assigned") refuses it before the epoch gate, for both epochs.
+   The real pass requires #3433 deployed on the candidate hosts. Never
+   attempt `fire`, `land`, `merge`, `queue remove` or a decision creation as
+   a drill gesture: an accepted one would be a real effect.
+6. **Scenario B or B′.** Hand the role back (stop the VM holder, let the
+   workstation claim on the free lease). Then either cut the workstation's
+   database path — the tunnel or the DB endpoint only, never the LAN, with an
+   automatic rollback timer — or, when root is unavailable, run the B′
+   `SIGSTOP`/`SIGCONT` above. Record `T0`; check expiry, claim, the new epoch
+   and, when the path or the process returns, that the old holder is refused
+   and stays standby.
+7. **Return (P4, P6).** Restart the stopped executors
+   (`systemctl --user start 'ameesh-runner-agent@<ROLE>'`) or the host while
+   the new holder is live. For 5 min the observer must show the same holder
+   and epoch; the returning runner logs standby and opens no turn. Then compare the events
+   of the window: one transition, exactly one merge (the witness lot), no
+   duplicated mail, wake, `pilot.gesture`, packet or landing, and no other
+   lot merged.
+8. **Report.** Save the observer JSONL, the `ameesh events --json` slice,
+   the two `journalctl --user -u ameesh-runner-agent@<role>` excerpts (old
+   and new holder) and the operator timeline. The lot carries a three-line
+   note: verdict per criterion, the measured `T_claim` / `T_turn`, and a
+   `sha256` of each evidence file kept on the observer host. No process
+   journal goes into the repository.
+
+### Stop conditions
+
+Stop the exercise, restore the host or the network and do not retry
+blindly: two holders observed; an old-epoch gesture accepted; a duplicated
+mail, wake, landing, fire or packet; any production effect; no new holder
+5 min after `T0` on two consecutive attempts; go withdrawn. A failure is a
+result: record it, leave the current holder in place (the lease decides) and
+do not force the witness merge to "unblock" anything.
+
+### Scope
+
+This drill does not deploy, migrate, publish or spend. The only merge is
+the witness lot, docs-only, through the normal packet path by the elected
+pilot; no other lot is merged. The Nexlink pilot runs the same procedure
+under lot `#3024` and `docs/ops/election-pilote-nexlink.md`; the two drills
+may share one window but never one holder.

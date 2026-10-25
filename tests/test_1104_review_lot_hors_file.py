@@ -13,9 +13,11 @@ constatée par git : la classe est calculée, pas doublée.
 """
 from __future__ import annotations
 
+import concurrent.futures
 import dataclasses
 import os
 import subprocess
+import threading
 import unittest
 import uuid
 from unittest import mock
@@ -720,40 +722,64 @@ class CatchUpWitnessTest(_Witness):
                         review_lot.ATTEMPT_PREFIX + str(lot))]
         self.assertEqual(attempts, [], attempts)
 
-    def test_un_depot_inconnu_avertit_le_pilote(self):
-        """#3201 : une relecture qui ne peut pas s'ouvrir faute de dépôt n'est
-        plus seulement journalisée. La deuxième tentative envoie un courrier
-        aux pilotes déclarés, qui nomme le lot et le geste de reprise ; les
-        tentatives suivantes ne le renvoient pas."""
-        lot = self.merged_lot("dépôt inconnu")
+    def test_un_hote_sans_depot_ne_tente_ni_n_avertit_pas(self):
+        """#3426 : l'hôte sans clone ne journalise aucune tentative et
+        n'envoie aucun courrier — la relecture reste à l'hôte qui porte le
+        dépôt (le faux « aucun dépôt lisible » d'ameesh-agents-1)."""
+        lot = self.merged_lot("hôte sans dépôt")
         registry.upsert(self.db, "pilote", harness="claude", host=self.cfg.host,
                         cwd=self.repo)
-        patches = (
-            mock.patch.dict(os.environ,
-                            {"AMEESH_ALERT_ORCHESTRATORS": "pilote"}),
-            mock.patch.object(review_lot, "_repo_of_agent", return_value=""),
-            mock.patch.object(review_lot.lot_class, "repository", return_value=None),
-        )
-        with patches[0], patches[1], patches[2]:
-            out = review_lot.catch_up(self.db)
-        self.assertEqual(out["attempted"], 1, out)
-        self.assertEqual(out["unopened"], [], out)
+        warn = mock.Mock()
+        with mock.patch.dict(os.environ,
+                             {"AMEESH_ALERT_ORCHESTRATORS": "pilote"}), \
+                mock.patch.object(review_lot, "_repo_of_agent", return_value=""), \
+                mock.patch.object(review_lot.lot_class, "repository", return_value=None), \
+                mock.patch.object(review_lot, "_warn_unopened", warn):
+            first = review_lot.catch_up(self.db, host="ameesh-agents-1")
+        self.assertEqual((first["examined"], first["missing"], first["deferred"],
+                          first["attempted"], first["unopened"]),
+                         (1, 1, 1, 0, []), first)
+        with mock.patch.dict(os.environ,
+                             {"AMEESH_ALERT_ORCHESTRATORS": "pilote"}), \
+                mock.patch.object(review_lot, "_repo_of_agent", return_value=""), \
+                mock.patch.object(review_lot.lot_class, "repository", return_value=None), \
+                mock.patch.object(review_lot, "_warn_unopened", warn):
+            second = review_lot.catch_up(self.db, retry_s=0, host="ameesh-agents-1")
+        self.assertEqual((second["deferred"], second["attempted"]), (1, 0), second)
+        warn.assert_not_called()
         self.assertEqual(mail.unread_active(self.db, "pilote"), [])
-        with patches[0], patches[1], patches[2]:
-            out = review_lot.catch_up(self.db, retry_s=0)
-        self.assertEqual([entry["lot"] for entry in out["unopened"]], [lot], out)
-        self.assertIn("avertissement envoyé", out["warning"], out)
-        messages = mail.unread_active(self.db, "pilote")
-        self.assertEqual(len(messages), 1, messages)
-        body = messages[0]["body"]
-        self.assertIn("#%d" % lot, body)
-        self.assertIn("ameesh work merged", body)
-        with mock.patch.object(review_lot, "_repo_of_agent", return_value=""), \
-                mock.patch.object(review_lot.lot_class, "repository", return_value=None):
-            again = review_lot.catch_up(self.db, retry_s=0)
-        self.assertEqual(again["unopened"], [], again)
-        self.assertEqual(len(mail.unread_active(self.db, "pilote")), 1,
-                         "l'avertissement est renvoyé à chaque tentative")
+        events = storage.of(self.db).work.events(lot, 50)
+        attempts = [e for e in events
+                    if str(e.get("note") or "").startswith(
+                        review_lot.ATTEMPT_PREFIX + str(lot))]
+        self.assertEqual(attempts, [], "un hôte sans dépôt ne marque rien")
+
+    def test_un_depot_sans_le_commit_avertit_le_pilote(self):
+        """#3201/#3384/#3426 : sur un hôte muni d'un dépôt, une relecture qui
+        reste sans classement n'est pas seulement journalisée. La deuxième
+        tentative envoie un courrier aux pilotes déclarés, qui nomme le lot et
+        le geste de reprise ; les tentatives suivantes ne le renvoient pas."""
+        lot = self.merged_lot("dépôt sans le commit")
+        registry.upsert(self.db, "pilote", harness="claude", host=self.cfg.host,
+                        cwd=self.repo)
+        with mock.patch.dict(os.environ,
+                             {"AMEESH_ALERT_ORCHESTRATORS": "pilote"}):
+            out = review_lot.catch_up(self.db, host="ameesh-agents-2")
+            self.assertEqual(out["attempted"], 1, out)
+            self.assertEqual(out["unopened"], [], out)
+            self.assertEqual(mail.unread_active(self.db, "pilote"), [])
+            out = review_lot.catch_up(self.db, retry_s=0, host="ameesh-agents-2")
+            self.assertEqual([entry["lot"] for entry in out["unopened"]], [lot], out)
+            self.assertIn("avertissement envoyé", out["warning"], out)
+            messages = mail.unread_active(self.db, "pilote")
+            self.assertEqual(len(messages), 1, messages)
+            body = messages[0]["body"]
+            self.assertIn("#%d" % lot, body)
+            self.assertIn("ameesh work merged", body)
+            again = review_lot.catch_up(self.db, retry_s=0, host="ameesh-agents-2")
+            self.assertEqual(again["unopened"], [], again)
+            self.assertEqual(len(mail.unread_active(self.db, "pilote")), 1,
+                             "l'avertissement est renvoyé à chaque tentative")
 
     def test_le_geste_conseille_relance_la_classification(self):
         """#3413 : l'avertissement conseille `work merged --repo` ; lancé juste
@@ -764,10 +790,11 @@ class CatchUpWitnessTest(_Witness):
         lot = self.merged_lot("dépôt retrouvé")
         registry.upsert(self.db, "pilote", harness="claude", host=self.cfg.host,
                         cwd=self.repo)
+        # #3426 : un hôte sans dépôt s'abstient désormais ; le doute qui
+        # motive l'avertissement vient d'un dépôt candidat qui ne contient
+        # pas le commit (le dossier de l'assigné, ici le dépôt du témoin).
         with mock.patch.dict(os.environ,
-                             {"AMEESH_ALERT_ORCHESTRATORS": "pilote"}), \
-                mock.patch.object(review_lot, "_repo_of_agent", return_value=""), \
-                mock.patch.object(review_lot.lot_class, "repository", return_value=None):
+                             {"AMEESH_ALERT_ORCHESTRATORS": "pilote"}):
             first = review_lot.catch_up(self.db)
             second = review_lot.catch_up(self.db, retry_s=0)
         self.assertEqual((first["attempted"], second["attempted"]), (1, 1),
@@ -805,12 +832,11 @@ class CatchUpWitnessTest(_Witness):
         self.assertIn("hors bornes", done["detail"], done)
 
     def test_depot_lisible_a_la_deuxieme_passe_sans_courrier(self):
-        """#3384 : absence transitoire puis classe sensible confirmée."""
+        """#3384 : doute transitoire puis classe sensible confirmée — la
+        deuxième passe classe sans courrier."""
         lot = self.merged_lot("clone pas encore lisible")
         with mock.patch.object(review_lot, "_warn_unopened") as warn:
-            with mock.patch.object(review_lot, "_repo_of_agent", return_value=""), \
-                    mock.patch.object(review_lot.lot_class, "repository", return_value=None):
-                first = review_lot.catch_up(self.db)
+            first = review_lot.catch_up(self.db)
             self.assertEqual(first["attempted"], 1, first)
             with mock.patch.object(review_lot, "class_at_merge",
                                    return_value={"class": "sensitive", "doubt": False}):
@@ -819,6 +845,71 @@ class CatchUpWitnessTest(_Witness):
             self.assertEqual(second["unopened"], [], second)
             warn.assert_not_called()
         self.assertEqual(self.review_lots(lot), [])
+
+    def test_deux_sessions_psql_ne_doublent_pas_l_avertissement(self):
+        """#3426 (B1 de la relecture cx1) : sur le pilote psql, deux sessions
+        distinctes sélectionnent le lot au même instant. Le verrou du lot doit
+        être pris sur la session de la transaction (`storage.of(tx)`), pas sur
+        la connexion extérieure : sinon les deux lisent le même compteur,
+        écrivent chacune la deuxième tentative et envoient deux courriers."""
+        lot = self.merged_lot("course psql")
+        storage.of(self.db).work.log_review_attempt(
+            lot, "merged",
+            "%s%d amorce" % (review_lot.ATTEMPT_PREFIX, lot), "témoin")
+        barrier = threading.Barrier(2, timeout=10)
+
+        def racy(_db, _lot, **_kw):
+            barrier.wait()
+            return {"class": "sensitive", "why": "clone sans le commit",
+                    "doubt": True}
+
+        warn = mock.Mock()
+        dbs = [self.connect(driver="psql") for _ in range(2)]
+        for db in dbs:
+            self.addCleanup(db.close)
+        with mock.patch.object(review_lot, "open_for_merge", side_effect=racy), \
+                mock.patch.object(review_lot, "_warn_unopened", warn):
+            with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+                outs = list(pool.map(
+                    lambda db: review_lot.catch_up(
+                        db, retry_s=0, host="ameesh-agents-2"), dbs))
+        self.assertEqual(warn.call_count, 1, outs)
+        self.assertEqual(sum(len(out["unopened"]) for out in outs), 1, outs)
+        self.assertEqual(sum(out["attempted"] for out in outs), 1, outs)
+        notes = [e for e in storage.of(self.db).work.events(lot, 50)
+                 if str(e.get("note") or "").startswith(
+                     review_lot.ATTEMPT_PREFIX + str(lot))]
+        self.assertEqual(len(notes), 2,
+                         "une amorce + une seule deuxième tentative : %s" % notes)
+
+    def test_deux_hotes_une_fusion_une_classification_zero_avertissement(self):
+        """#3426, témoin du pilote : deux hôtes dont un sans dépôt, une fusion
+        — l'hôte sans dépôt s'abstient (zéro courrier), l'autre classe une
+        seule fois."""
+        lot = self.lot()
+        sha = self.merge_lot(lot, "lot/3426-deux-hotes")
+        with mock.patch.object(review_lot, "open_for_merge",
+                               side_effect=RuntimeError("ouverture perdue")):
+            done = work.close_merged(self.db, lot, sha=sha, actor="claude1",
+                                     source="témoin #3426")
+        self.assertEqual(done["result"], "merged", done)
+        self.assertEqual(self.review_lots(lot), [])
+        with mock.patch.object(review_lot, "_repo_of_agent", return_value=""), \
+                mock.patch.object(review_lot.lot_class, "repository", return_value=None), \
+                mock.patch.object(review_lot, "_warn_unopened") as warn:
+            without = review_lot.catch_up(self.db, host="ameesh-agents-1")
+        self.assertEqual((without["deferred"], without["attempted"],
+                          without["opened"]), (1, 0, 0), without)
+        self.assertEqual(self.review_lots(lot), [])
+        warn.assert_not_called()
+        with mock.patch.object(review_lot, "_warn_unopened") as warn:
+            with_repo = review_lot.catch_up(self.db, host="ameesh-agents-2")
+        self.assertEqual((with_repo["opened"], with_repo["deferred"],
+                          with_repo["attempted"]), (1, 0, 0), with_repo)
+        rows = self.review_lots(lot)
+        self.assertEqual(len(rows), 1, rows)
+        self.assertIn("Classe : light", work.get(self.db, rows[0]["id"])["body"])
+        warn.assert_not_called()
 
 
 class DeclaredMergeWitnessTest(_Witness):

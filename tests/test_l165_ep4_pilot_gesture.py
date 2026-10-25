@@ -17,6 +17,7 @@ car `ameesh_events` est append-only.
 from __future__ import annotations
 
 import contextlib
+import json
 import os
 import re
 import time
@@ -35,6 +36,7 @@ from ameesh import (
     registry,
     work,
 )
+from ameesh import role as role_cli
 
 from .support import PgTestCase
 
@@ -252,6 +254,122 @@ class GestureFenceTest(PgTestCase):
                     gate.hold(self.db, margin_s=60.0)
         self.assertIn("external call", str(caught.exception))
         self.assertEqual(self.events(ref="marge #1"), [])
+
+    # -- the drill's canary (EP7 P3, #3433) -----------------------------
+    def last_event_id(self) -> int:
+        return int(self.db.query(
+            "SELECT coalesce(max(id), 0) AS id FROM ameesh_events")[0]["id"])
+
+    def events_since(self, since: int) -> list[dict]:
+        return self.db.query(
+            "SELECT id, type, object, data FROM ameesh_events WHERE id > %s "
+            "ORDER BY id", (since,))
+
+    def business_rows(self) -> tuple:
+        return tuple(int(self.db.query("SELECT count(*) AS n FROM %s" % table)[0]["n"])
+                     for table in ("work_items", "work_item_events",
+                                   "work_item_milestones", "work_packages",
+                                   "agent_mailbox", "merge_locks"))
+
+    def test_canary_role_vivant_un_seul_evenement_sans_effet(self):
+        before, since = self.business_rows(), self.last_event_id()
+        with self.role_env(role=self.name, epoch=self.epoch):
+            code, report = role_cli.canary(self.cfg, self.db)
+        self.assertEqual(code, 0, report)
+        self.assertEqual((report["ok"], report["role"], report["epoch"], report["host"],
+                          report["runner"]),
+                         (True, self.name, self.epoch, "h1", "runner-h1"))
+        rows = self.events_since(since)
+        self.assertEqual([row["id"] for row in rows], [report["event"]])
+        data = rows[0]["data"]
+        self.assertEqual((rows[0]["type"], data["gesture"], data["ref"], data["epoch"],
+                          data["role"]),
+                         ("pilot.gesture", "canary", "canary", self.epoch, self.name))
+        self.assertEqual(self.business_rows(), before)
+        row = registry.get(self.db, self.name)
+        self.assertEqual((row["lease_owner"], int(row["lease_epoch"])),
+                         ("runner-h1", self.epoch))
+
+    def test_canary_session_liee_vivante(self):
+        with self.live():
+            code, report = role_cli.canary(self.cfg, self.db)
+        self.assertEqual(code, 0, report)
+        self.assertEqual((report["role"], report["epoch"]), (self.name, self.epoch))
+        self.assertEqual(len(self.events(ref="canary")), 1)
+
+    def test_canary_ancienne_epoque_refusee_nomme_le_detenteur(self):
+        old = self.epoch
+        self.assertTrue(registry.release(self.db, self.name, "runner-h1", old))
+        lease = registry.claim(self.db, self.name, "runner-h2", 600, host="h2",
+                               election_brief="brief-h2")
+        self.assertIsNotNone(lease)
+        new = int(lease["lease_epoch"])
+        since = self.last_event_id()
+        with self.role_env(role=self.name, epoch=old):
+            code, report = role_cli.canary(self.cfg, self.db)
+        self.assertEqual(code, 1, report)
+        self.assertFalse(report["ok"])
+        for part in ("runner-h2", " h2 ", "epoch %d" % new):
+            self.assertIn(part, report["error"])
+        self.assertEqual(self.events_since(since), [])
+        # the positive control, at the new epoch, is accepted
+        with self.role_env(role=self.name, epoch=new):
+            code, report = role_cli.canary(self.cfg, self.db)
+        self.assertEqual(code, 0, report)
+        self.assertEqual([row["data"]["epoch"] for row in self.events(ref="canary")],
+                         [new])
+
+    def test_canary_bail_expire_refuse(self):
+        self.db.execute(
+            "UPDATE agent_registry SET lease_expires_at = clock_timestamp() "
+            "- interval '5 seconds' WHERE name = %s", (self.name,))
+        with self.role_env(role=self.name, epoch=self.epoch):
+            code, report = role_cli.canary(self.cfg, self.db)
+        self.assertEqual(code, 1, report)
+        self.assertIn("expired", report["error"])
+        self.assertEqual(self.events(ref="canary"), [])
+
+    def test_canary_role_sans_epoque_refuse(self):
+        since = self.last_event_id()
+        with self.role_env(role=self.name):
+            code, report = role_cli.canary(self.cfg, self.db)
+        self.assertEqual(code, 1, report)
+        self.assertIn("without AMEESH_LEASE_EPOCH", report["error"])
+        self.assertEqual(self.events_since(since), [])
+
+    def test_canary_humain_aucun_bail(self):
+        since = self.last_event_id()
+        with self.identity_env():
+            code, report = role_cli.canary(self.cfg, self.db)
+        self.assertEqual(code, 2, report)
+        self.assertEqual(report, {"ok": False, "error": role_cli.NO_LEASE})
+        self.assertEqual(self.events_since(since), [])
+
+    def test_canary_cli_json_negatif_puis_positif(self):
+        old = self.epoch
+        registry.release(self.db, self.name, "runner-h1", old)
+        new = int(registry.claim(self.db, self.name, "runner-h2", 600, host="h2",
+                                 election_brief="brief-h2")["lease_epoch"])
+
+        def run(epoch: int):
+            env = self.env(AMEESH_ROLE=self.name, AMEESH_LEASE_EPOCH=str(epoch))
+            env.pop("AMEESH_LEASE_OWNER", None)
+            proc = self.mesh("role", "canary", "--json", env=env)
+            return proc.returncode, json.loads(proc.stdout), proc
+
+        code, report, proc = run(old)
+        self.assertEqual(code, 1, proc.stderr)
+        self.assertFalse(report["ok"])
+        self.assertIn("runner-h2", report["error"])
+        self.assertEqual(self.events(ref="canary"), [])
+        code, report, proc = run(new)
+        self.assertEqual(code, 0, proc.stderr)
+        self.assertEqual(sorted(report), ["epoch", "event", "host", "ok", "role", "runner"])
+        self.assertEqual((report["ok"], report["role"], report["epoch"], report["host"],
+                          report["runner"]),
+                         (True, self.name, new, "h2", "runner-h2"))
+        self.assertEqual([row["id"] for row in self.events(ref="canary")],
+                         [report["event"]])
 
     # -- the five call sites --------------------------------------------
     def test_work_assign_live_ecrit_le_geste(self):

@@ -3599,7 +3599,7 @@ def sync_branches(db, *, host: str | None = None, agents=None, dry_run: bool = F
         try:
             from . import review_lot
             review_catch_up = review_lot.catch_up(
-                db, limit=review_lot.CATCH_UP_LIMIT)
+                db, limit=review_lot.CATCH_UP_LIMIT, host=host or "")
         except Exception:  # noqa: BLE001 - un rattrapage ne casse pas le relevé
             review_catch_up = {}
     return {"host": host, "dry_run": bool(dry_run), "results": results,

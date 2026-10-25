@@ -94,6 +94,42 @@ def _landing_members(db, vehicle: int) -> list[dict]:
     return found
 
 
+def _fetch_head(repo: str, sha: str) -> bool:
+    """Rapatrie la tête exacte du véhicule depuis la forge du clone (#3416).
+
+    Le clone du radar n'est frais que de son dernier fetch : une branche
+    d'intégration poussée depuis n'y est pas, et `git log base..head` rendait
+    « cannot read the composition history » alors que la composition existait
+    (h-12, #3414). Le geste est celui de #3147, déjà employé pour les gels
+    antérieurs : demander le seul SHA à `origin`, sans déplacer de ref et sans
+    écrire `FETCH_HEAD`, borné par `FETCH_TIMEOUT`. Un SHA abrégé ne se demande
+    pas, un dépôt sans forge n'en a pas, et une forge qui ne sert pas l'objet
+    laisse l'absence — que l'appelant refuse.
+    """
+    text = plan_git.full_commit_id(sha)
+    try:
+        if plan_git.local_commit(repo, sha):
+            return True
+    except Exception:  # noqa: BLE001 - dépôt illisible : aucune récupération
+        return False
+    if not text:
+        return False
+    try:
+        if plan_git._out(repo, "remote", "get-url", "origin") is None:
+            return False
+        proc = plan_git._git(
+            repo, "fetch", "--quiet", "--no-tags", "--no-write-fetch-head",
+            "--", "origin", text, timeout=plan_git.FETCH_TIMEOUT)
+    except Exception:  # noqa: BLE001 - forge injoignable : absence
+        return False
+    if proc.returncode != 0:
+        return False
+    try:
+        return bool(plan_git.local_commit(repo, text))
+    except Exception:  # noqa: BLE001 - lecture impossible : absence
+        return False
+
+
 def _trailer_members(repo: str, base: str, head: str, vehicle: int) -> list[dict]:
     """Les lots nommés par les commits de composition (`ameesh-work: <lot>`).
 
@@ -103,7 +139,14 @@ def _trailer_members(repo: str, base: str, head: str, vehicle: int) -> list[dict
     source est le commit lui-même, et `own_changes` compare ses chemins à tous
     ses parents — le contenu d'un membre y est donc reconnu, seule une
     résolution qui diffère de tous les parents reste propre.
+
+    #3416 : la tête gelée est rapatriée avant la lecture. Un clone en retard ne
+    doit pas retenir un paquet vert tant que personne ne l'a fetché.
     """
+    if not _fetch_head(repo, head):
+        raise VehicleError("cannot read the composition history %s..%s: the frozen "
+                           "head is not in the repository after an exact fetch"
+                           % (base[:12], head[:12]))
     log = plan_git._out(repo, "log", "--first-parent", "--format=%H",
                         "%s..%s" % (base, head))
     if log is None:

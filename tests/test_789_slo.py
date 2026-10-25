@@ -777,5 +777,87 @@ class GracePriseTest(unittest.TestCase):
         self.assertIsNone(slo.handover_ts(_item(), []))
 
 
+class AttributionAcquiseTest(unittest.TestCase):
+    """#3424 : un lot créé déjà assigné puis rendu à la file garde sa première
+    attribution. Le journal le prouve (rendu, début mesuré, réassignation) ;
+    `signal_assigned`, déjà conclu, ne rouvre pas l'alerte de niveau 3
+    « reassign it now » (#3223)."""
+
+    def test_lot_cree_assigne_puis_rendu_garde_sa_premiere_attribution(self):
+        events = [_ev("intake", T0, "created; estimate: 20 min"),
+                  _ev("intake", T0 + 600,
+                      "returned to the queue by executant (§4: lots in build per "
+                      "agent, capped by the canon)"),
+                  _ev("qa", T0 + 601, "passage en qa sans assigné")]
+        item = _item(state="qa", assignee="")
+        self.assertEqual(slo.assigned_ts(item, events), T0)
+        rows = slo.lot_steps(item, _jalons(item, events), events, now=T0 + 4 * 3600)
+        signal = [r for r in rows if r["step"] == "signal_assigned"][0]
+        self.assertEqual(signal["level"], 0)
+        self.assertEqual(signal["done_ts"], T0)
+        self.assertEqual(slo.breaches(rows), [])
+
+    def test_le_rendu_et_le_debut_mesure_prouvent_le_porteur(self):
+        from ameesh import estimates, handoff
+
+        cases = {
+            "rendu à la file": "%s par executant" % handoff.RETURN_NOTE,
+            "début mesuré": "%sfirst turn of executant on the lot"
+                            % estimates.START_NOTE,
+        }
+        for label, note in cases.items():
+            with self.subTest(label):
+                events = [_ev("intake", T0, "created"),
+                          _ev("build", T0 + 10, note)]
+                self.assertEqual(slo.assigned_ts(_item(assignee=""), events), T0)
+
+    def test_reassignation_nommant_le_porteur_precedent(self):
+        # « before: a » prouve que a a tenu le lot, même sans retour au journal.
+        events = [_ev("intake", T0, "created"),
+                  _ev("build", T0 + 10, "assigned to b (before: a)")]
+        self.assertEqual(slo.assigned_ts(_item(assignee=""), events), T0)
+
+    def test_une_reprise_apres_le_rendu_ne_remplace_pas_la_creation(self):
+        # créé assigné, rendu, repris par un autre agent (before: nobody),
+        # puis rendu de nouveau : la première attribution reste la création.
+        events = [_ev("intake", T0, "created"),
+                  _ev("intake", T0 + 600, "returned to the queue by a"),
+                  _ev("intake", T0 + 1200, "assigned to b (before: nobody)"),
+                  _ev("intake", T0 + 1800, "returned to the queue by b")]
+        self.assertEqual(slo.assigned_ts(_item(assignee=""), events), T0)
+
+    def test_lot_cree_sans_porteur_date_sa_premiere_prise(self):
+        # créé sans porteur puis attribué (before: nobody), rendu, repris :
+        # la première attribution datée reste celle de la prise, pas la
+        # création.
+        events = [_ev("intake", T0, "created"),
+                  _ev("intake", T0 + 600, "assigned to a (before: nobody)"),
+                  _ev("intake", T0 + 1200, "returned to the queue by a"),
+                  _ev("intake", T0 + 1800, "assigned to b (before: nobody)")]
+        self.assertEqual(slo.assigned_ts(_item(assignee=""), events), T0 + 600)
+
+    def test_une_premiere_attribution_datee_prime_sur_la_creation(self):
+        from ameesh import backlog
+
+        events = [_ev("intake", T0, "created"),
+                  _ev("intake", T0 + 7200,
+                      "%s par executant, au repos" % backlog.LOT_TAKE_NOTE),
+                  _ev("intake", T0 + 7300, "returned to the queue by executant")]
+        self.assertEqual(slo.assigned_ts(_item(assignee=""), events), T0 + 7200)
+
+    def test_lot_jamais_assigne_reste_sans_attribution(self):
+        # une note de création seule, ou une mise en file refusée, ne prouve
+        # aucun porteur : l'étape reste ouverte et l'alerte part.
+        for note in ("created; estimate: 20 min",
+                     "not assigned to a (before: nobody, now: nobody)"):
+            with self.subTest(note=note):
+                events = [_ev("intake", T0, note)]
+                self.assertIsNone(slo.assigned_ts(_item(assignee=""), events))
+                rows = slo.lot_steps(_item(assignee=""), _jalons(_item(), events),
+                                     events, now=T0 + 3 * 3600)
+                signal = [r for r in rows if r["step"] == "signal_assigned"][0]
+                self.assertEqual(signal["level"], 3)
+
+
 if __name__ == "__main__":
     unittest.main()
