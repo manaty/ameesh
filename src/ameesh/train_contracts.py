@@ -95,8 +95,9 @@ def stale_pins(root: str, workflows=None) -> list[tuple[str, str | None, str, st
     pin. A source missing from the tree has no blob and is stale too.
 
     Only static contracts (``Workflow`` tuples) can be checked this way. The
-    Nexlink contract pins sources of the Nexlink repository, which an ameesh
-    tree does not carry; its own tree runs the same check.
+    Nexlink contract is dynamic and pins sources of the Nexlink repository,
+    which an ameesh tree does not carry; this check applies to the project
+    tree that declares them.
     """
     from . import plan_git
     if workflows is None:
