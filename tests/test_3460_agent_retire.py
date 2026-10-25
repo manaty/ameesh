@@ -118,6 +118,55 @@ class RetireTest(PgTestCase):
                         " WHERE assignee = 'worker' AND state = 'build'")
         self.assertTrue(self.retire()["changed"])
 
+    def external_reservation(self, state="intake"):
+        self.db.execute("UPDATE agent_registry SET mode = 'externe', responsible = %s"
+                        " WHERE name = 'worker'", (ALICE,))
+        return self.db.query(
+            "INSERT INTO work_items (title, external_executor, state, close_reason)"
+            " VALUES ('external gesture', 'worker', %s, %s) RETURNING id",
+            (state, "done" if state == "closed" else None))[0]["id"]
+
+    def test_external_executor_blocks_retirement_until_reservation_cleared(self):
+        lot = self.external_reservation()
+        with self.assertRaises(agent_retire.RetireError) as ctx:
+            self.retire()
+        text = str(ctx.exception)
+        self.assertIn("external executor of lot #%d (intake)" % lot, text)
+        self.assertIn("ameesh work external-executor %d --clear" % lot, text)
+        self.assertIn("ameesh work external-executor %d <executor>" % lot, text)
+        self.assertIsNone(registry.get(self.db, "worker")["retired_ts"])
+        self.assertEqual(self.events(agent_retire.RETIRED_EVENT), [])
+        self.assertIsNone(work.get(self.db, lot)["assignee"])
+        work.set_external_executor(self.db, lot, None, clear=True, actor=ALICE,
+                                   cfg=self.cfg)
+        self.assertTrue(self.retire()["changed"])
+
+    def test_external_executor_blocks_all_open_states_but_not_delivered_lots(self):
+        for state in ("intake", "build", "qa", "blocked", "waiting_human"):
+            with self.subTest(state=state):
+                lot = self.external_reservation(state)
+                with self.assertRaises(agent_retire.RetireError) as ctx:
+                    self.retire()
+                self.assertIn("external executor of lot #%d (%s)" % (lot, state),
+                              str(ctx.exception))
+                self.db.execute("UPDATE work_items SET state = 'closed',"
+                                " close_reason = 'done' WHERE id = %s", (lot,))
+        for state in ("merged", "promoted", "closed"):
+            self.external_reservation(state)
+        self.assertTrue(self.retire()["changed"])
+
+    def test_handing_external_reservation_over_unblocks_only_previous_executor(self):
+        lot = self.external_reservation()
+        registry.upsert(self.db, "other", harness="codex", host=self.cfg.host,
+                        cwd=self.tmp)
+        self.db.execute("UPDATE agent_registry SET mode = 'externe', responsible = %s"
+                        " WHERE name = 'other'", (ALICE,))
+        work.set_external_executor(self.db, lot, "other", actor=ALICE, cfg=self.cfg)
+        self.assertTrue(self.retire()["changed"])
+        with self.assertRaisesRegex(agent_retire.RetireError,
+                                    "external executor of lot #%d" % lot):
+            self.retire("other")
+
     def test_mail_to_and_from_a_retired_agent_is_refused(self):
         registry.upsert(self.db, "other", harness="deepseek", host=self.cfg.host,
                         cwd=self.tmp)
