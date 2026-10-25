@@ -14,6 +14,7 @@ import os
 from pathlib import Path
 import pwd
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -463,6 +464,69 @@ class EffectsTest(RequestMixin, unittest.TestCase):
                 self.assertRaises(companion.Uncertain):
             self.fx.effects.perform(self.request(self.fx, 'stop_source'))
 
+    def test_a_later_lease_fences_an_older_operation_before_a_stop(self):
+        self.fx.system.fields['ActiveState'] = 'active'
+        self.fx.system.after_stop = {'ActiveState': 'inactive'}
+        first = self.fx.effects.perform(self.request(self.fx, 'stop_source'))
+        self.assertIs(first['ok'], True)
+        self.assertEqual(self.fx.system.stops, 1)
+        # The next lease for this agent reaches the host through another
+        # operation (a revalidation): its higher epoch must revoke the old one
+        # everywhere, not only in its own operation directory.
+        later = self.fx.effects.perform(self.request(
+            self.fx, 'revalidate', operation='b' * 32, state='planned',
+            owner='new-runner', lease_epoch=8, controller_epoch=1))
+        self.assertIs(later['ok'], True)
+        older = self.fx.effects.perform(self.request(
+            self.fx, 'revalidate', operation='c' * 32, state='planned',
+            owner='old-runner', lease_epoch=6, controller_epoch=1))
+        self.assertIs(older['ok'], False)
+        self.assertEqual(older['reason'], 'lease_superseded')
+        self.fx.system.fields['ActiveState'] = 'active'
+        # A restart must not forget the fence: replaying the old operation
+        # would otherwise stop the executor of the later lease.
+        restarted = companion.HostEffects(
+            enrollment=self.fx.execution, system=self.fx.system,
+            work_dir=lambda agent, project: str(self.fx.work / agent))
+        replay = restarted.perform(self.request(self.fx, 'stop_source'))
+        self.assertIs(replay['ok'], False)
+        self.assertEqual(replay['reason'], 'lease_superseded')
+        self.assertEqual(self.fx.system.stops, 1)
+        # The current lease still owns the unit and may stop its executor.
+        theirs = self.fx.effects.perform(self.request(
+            self.fx, 'stop_source', operation='b' * 32, owner='new-runner',
+            lease_epoch=8, controller_epoch=2))
+        self.assertIs(theirs['ok'], True)
+        self.assertEqual(self.fx.system.stops, 2)
+
+    def test_a_revalidation_cannot_lower_the_controller_epoch(self):
+        prepare = self.fx.effects._prepare
+        nested = []
+
+        def observe(request, entry):
+            # Deterministic interleaving while the journal holds its effect:
+            # a newer revalidation writes epoch 5, then the effect would like
+            # to write back its older epoch 3.
+            nested.append(self.fx.effects.perform(self.request(
+                self.fx, 'revalidate', state='planned', controller_epoch=5)))
+            return prepare(request, entry)
+
+        with mock.patch.object(self.fx.effects, '_prepare', side_effect=observe):
+            receipt = self.fx.effects.perform(
+                self.request(self.fx, 'prepare', controller_epoch=3))
+        self.assertIs(receipt['ok'], True)
+        self.assertIs(nested[0]['ok'], True)
+        state_path = (self.fx.root / 'state' / 'operations' / ('a' * 32)
+                      / 'state.json')
+        self.assertEqual(json.loads(state_path.read_text())['epoch'], 5)
+        stale = self.fx.effects.perform(
+            self.request(self.fx, 'prepare', controller_epoch=3))
+        self.assertEqual(stale['reason'], 'revoked_epoch')
+        replay = self.fx.effects.perform(
+            self.request(self.fx, 'prepare', controller_epoch=5))
+        self.assertIs(replay['ok'], True)
+        self.assertEqual(replay['release_revision'], COMMIT)
+
     def test_publish_is_the_exact_clean_pushed_commit(self):
         receipt = self.fx.effects.perform(self.request(self.fx, 'publish'))
         self.assertIs(receipt['ok'], True)
@@ -739,6 +803,72 @@ class DispatcherTest(unittest.TestCase):
             self.assertEqual(companion.main([]), 0)
         self.assertEqual(calls, [companion.SECONDS, 'execute', 0])
 
+    def test_an_expired_effect_keeps_its_intent_and_fails_the_transport(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            root.chmod(0o700)
+            home = root / 'home'
+            home.mkdir(mode=0o700)
+            work = root / 'work'
+            work.mkdir(mode=0o700)
+            config = root / 'config.json'
+            config.write_text('{}')
+            config.chmod(0o600)
+            store = release_store(root, COMMIT)
+            execution = {
+                'host': 'target', 'state': str(root / 'state'),
+                'config': str(config), 'release_store': str(store),
+                'accounts': {'dev': {'account': pwd.getpwuid(os.geteuid()).pw_name,
+                                     'home': str(home),
+                                     'unit': 'ameesh-runner@dev.service',
+                                     'scope': 'system'}},
+                'roots': [str(work)], 'tools': ['git'], 'secrets': [],
+            }
+            document = root / 'execution.json'
+            document.write_text(json.dumps(execution))
+            document.chmod(0o600)
+            system = FakeSystem()
+            system.fields['ActiveState'] = 'active'
+            system.after_stop = {'ActiveState': 'inactive'}
+            effects = companion.HostEffects(enrollment=execution, system=system)
+
+            def stop(scope, account, unit):
+                # The stop is applied, then the dispatcher's alarm expires
+                # before the effect can return its receipt.
+                system.stops += 1
+                system.fields.update(system.after_stop)
+                signal.raise_signal(signal.SIGALRM)
+
+            system.stop = stop
+            request = {'step': 'stop_source', 'host': 'target',
+                       'operation': 'a' * 32,
+                       'action_id': 'a' * 32 + ':stop_source',
+                       'controller_epoch': 3, 'agent': 'dev',
+                       'owner': 'runner', 'lease_epoch': 7}
+            stdin = __import__('io').TextIOWrapper(__import__('io').BytesIO(
+                json.dumps(request).encode()))
+            output = __import__('io').StringIO()
+            previous = signal.getsignal(signal.SIGALRM)
+            self.addCleanup(signal.signal, signal.SIGALRM, previous)
+            self.addCleanup(signal.alarm, 0)
+            with mock.patch.object(companion, 'execute',
+                                   side_effect=lambda value: effects.perform(value)), \
+                    mock.patch.object(companion.signal, 'alarm', return_value=0), \
+                    mock.patch('sys.stdin', stdin), mock.patch('sys.stdout', output):
+                self.assertEqual(companion.main([]), 1)
+            self.assertEqual(json.loads(output.getvalue()),
+                             {'error': 'host_action_unavailable'})
+            directory = root / 'state' / 'operations' / ('a' * 32)
+            self.assertTrue((directory / 'stop_source.intent.json').exists())
+            self.assertFalse((directory / 'stop_source.json').exists())
+            self.assertEqual(system.stops, 1)
+            # The retained intent is resumable; the observed stop is not
+            # repeated and the receipt can now be recorded.
+            resumed = effects.perform(request)
+            self.assertIs(resumed['ok'], True)
+            self.assertFalse((directory / 'stop_source.intent.json').exists())
+            self.assertEqual(system.stops, 1)
+
     def test_bounded_run_kills_the_child_group_on_timeout(self):
         with tempfile.TemporaryDirectory() as temp:
             pidfile = Path(temp) / 'pid'
@@ -747,6 +877,28 @@ class DispatcherTest(unittest.TestCase):
             with self.assertRaises(companion.Uncertain):
                 companion._bounded_run([sys.executable, '-c', script],
                                        timeout=0.5,
+                                       env={'PATH': '/usr/bin:/bin'})
+            pid = int(pidfile.read_text())
+            with self.assertRaises(ProcessLookupError):
+                os.kill(pid, 0)
+
+    def test_an_alarm_kills_the_child_group_before_the_uncertain_intent(self):
+        with tempfile.TemporaryDirectory() as temp:
+            pidfile = Path(temp) / 'pid'
+            script = ("import os,time; open(%r,'w').write(str(os.getpid()));"
+                      " time.sleep(10)" % str(pidfile))
+            previous = signal.getsignal(signal.SIGALRM)
+            self.addCleanup(signal.signal, signal.SIGALRM, previous)
+            self.addCleanup(signal.alarm, 0)
+
+            def expired(signum, frame):
+                raise companion.Uncertain('deadline')
+
+            signal.signal(signal.SIGALRM, expired)
+            signal.alarm(1)
+            with self.assertRaises(companion.Uncertain):
+                companion._bounded_run([sys.executable, '-c', script],
+                                       timeout=30,
                                        env={'PATH': '/usr/bin:/bin'})
             pid = int(pidfile.read_text())
             with self.assertRaises(ProcessLookupError):
@@ -1183,6 +1335,22 @@ class AdapterTest(PgTestCase):
             result = getattr(self.adapter, method)(
                 self.plain(method, evidence=evidence))
             self.assertIs(result['ok'], False)
+
+    def test_a_lost_stop_reply_keeps_the_durable_intent(self):
+        # A transport failure after the host may have stopped the unit is
+        # ambiguous: the adapter raises instead of returning False, so the
+        # controller's pending_effect is not cleared by _effect.
+        with self.api.handoffs.controller(self.row['id']) as tx:
+            self.assertIsNotNone(tx)
+            api = storage.of(tx).handoffs
+            operation = api.get(self.row['id'])
+            with mock.patch.object(
+                    self.fake, 'perform',
+                    side_effect=bridge_module.BridgeError('transport')):
+                with self.assertRaises(handoffs.HandoffError):
+                    handoffs._effect(api, self.adapter, 'stop_source', operation)
+        row = self.api.handoffs.get(self.row['id'])
+        self.assertEqual(row['evidence']['pending_effect']['name'], 'stop_source')
 
     def test_each_effect_requires_its_durable_pending_intent(self):
         self.assertIs(self.adapter.stop_source(self.plain()), False)
