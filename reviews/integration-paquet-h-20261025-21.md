@@ -91,14 +91,26 @@ conflit. Le run `40204065236` n'a rien exécuté (merge-ref encore sur
 
 ## Correction après CI rouge (25/10 15:0xZ)
 
-Le run `40204539739` (tête `4173808ac`) a rougi 6 fois, toutes dans
-`tests.test_l234a_auditor_canon_guard.CanonGuardTest` : chaque prise passe
-désormais par `backlog._take_holds` (#3556), qui lit
-`storage.of(db).progress.lot_hold_events`, alors que la fixture
-`tests.test_l234_auditor.AuditorTest.take` ne fournissait que `work`,
-`operations` et `hosts`. Correctif `4f47c9d9f8b5` : la fixture fournit un
-`progress` sans hold. Aucune unité modifiée ; témoin seul (adaptation de
-test, §2 — aucun avis dû). Ciblés locaux verts :
-`test_l234a_auditor_canon_guard` + `test_l234_auditor` (20 OK),
-`test_3556_auto_take_holds` (7 OK). Nouvelle tête gelée et suite `ci-full`
-relancée ; le feu est à redonner par le pilote.
+Le run `40204539739` (tête `4173808ac`) a rougi 13 fois, deux causes :
+
+- 12 fois (psycopg 6/8 et psql 5/16) dans
+  `tests.test_l234a_auditor_canon_guard.CanonGuardTest` : chaque prise passe
+  désormais par `backlog._take_holds` (#3556), qui lit
+  `storage.of(db).progress.lot_hold_events`, alors que la fixture
+  `tests.test_l234_auditor.AuditorTest.take` ne fournissait que `work`,
+  `operations` et `hosts`. Correctif `4f47c9d9f8b5` : la fixture fournit un
+  `progress` sans hold.
+- 1 fois (psql 7/16) dans
+  `tests.test_3529_nexlink_release.GitTests.test_ci_planner_bridge_uses_frozen_script_without_dispatch`
+  : `FileNotFoundError: node` sur le runner `ameesh-ci-1-8`, qui n'a pas le
+  binaire dans son PATH. Correctif `6fdfefdde1c7` : le témoin saute quand
+  `node` est absent (même forme que `bwrap` ou `systemd-analyze`), et reste
+  exécuté quand il est là — dépendance d'environnement consignée, non
+  bloquante (§3), à corriger à la source côté runners.
+
+Aucune unité modifiée ; témoins seuls (adaptation de test, §2 — aucun avis
+dû). Ciblés locaux verts : `test_l234a_auditor_canon_guard` +
+`test_l234_auditor` (20 OK), `test_3556_auto_take_holds` (7 OK),
+`test_3529_nexlink_release` (18 OK, dont le saut contrôlé sans `node`).
+Nouvelle tête gelée et suite `ci-full` relancée ; le feu est à redonner par
+le pilote.
