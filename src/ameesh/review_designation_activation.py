@@ -2027,9 +2027,12 @@ class _FloorPort(_ForcedPort):
                       "family": str((seat or {}).get("family") or "").strip()}
                      for seat in kept or ()
                      if str((seat or {}).get("name") or "").strip()]
-        #: tous les sièges que la passe a examinés (gardés ou retirés à la
-        #: main) : si la colonne ne les porte plus, un retrait du pilote s'est
-        #: produit pendant la passe et rien ne doit le réécrire (#3367).
+        #: les sièges du gel **vivants au début de la passe** (la marque
+        #: filtrée par la colonne) : si la colonne ne les porte plus, un retrait
+        #: du pilote s'est produit pendant la passe et rien ne doit le
+        #: réécrire (#3367). Un siège retiré avant la passe n'en fait pas
+        #: partie : c'est un retrait acquis, pas un déplacement concurrent
+        #: (B/P2 cx1).
         self.examined = {str(name or "").strip() for name in examined or ()
                          if str(name or "").strip()}
         self.mark_id = int(mark_id)
@@ -2702,25 +2705,38 @@ def designate(cfg, db, lot: int, *, freeze: Optional[Mapping] = None,
             # #3557 : la désignation du gel est complétée, jamais remplacée.
             if not inputs.paths or inputs.policy.required == 0:
                 return dict(completion["shape"])
+            # Le snapshot **vivant** du début de passe : seuls les sièges du
+            # gel encore présents dans la colonne sont examinés et gardés. Un
+            # siège retiré à la main **avant** la passe n'est ni réexaminé
+            # (sinon chaque essai refuse en `stale`, B/P2 cx1) ni choisi de
+            # nouveau comme candidat (sinon la complétion réinscrit le retrait
+            # sans courrier, B/P1 dev4) : il est exclu, et l'attente est
+            # journalisée si la couverture manque.
+            live_seats = _kept_seats(completion["shape"], item)
+            live_names = {seat["name"] for seat in live_seats}
             mark_names = {str((row or {}).get("name") or "").strip()
                           for row in (completion["shape"] or {}).get("reviewers") or ()}
             mark_names.discard("")
-            names = {str((row or {}).get("name") or "").strip()
-                     for row in _kept_seats(completion["shape"], item)}
+            removed = mark_names - live_names
             seats = rd.manual_seats(
-                list(inputs.manual_seats)
-                + _kept_seats(completion["shape"], item),
+                list(inputs.manual_seats) + live_seats,
                 authors=inputs.authors, fixers=inputs.correctors,
                 families=inputs.policy.families)
-            kept = [seat for seat in seats if seat["name"] in names]
+            kept = [seat for seat in seats if seat["name"] in live_names]
             if len(seats) >= int(inputs.policy.required):
                 # the live seats already cover the raised floor: nothing to
                 # designate, no mail, no new mark
                 return dict(completion["shape"])
+            if removed:
+                inputs = dataclasses.replace(
+                    inputs,
+                    candidates=[candidate for candidate in inputs.candidates
+                                if str(getattr(candidate, "name", "") or "").strip()
+                                not in removed])
             with db.transaction() as tx:
                 port = _FloorPort(
                     pg.PgPort(tx, after_commit=threads, at_freeze=False),
-                    kept=kept, examined=mark_names,
+                    kept=kept, examined=live_names,
                     mark_id=int(completion["mark_id"]), floor=floor)
                 out = _selection(inputs, port, kept=port.kept)
                 if out.get("state") == rd.DESIGNATED:

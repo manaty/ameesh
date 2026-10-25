@@ -11,14 +11,18 @@ Témoins : plancher 2 après un gel à 1 → une seconde famille est désignée 
 notifiée, la marque porte required=2 ; plancher sans gel → rien ; plancher
 déjà couvert → rien ; `reviewers --apply` complète un plancher écrit sans
 complétion (version antérieure) ; un plancher non couvert ne retire pas les
-sièges déjà désignés.
+sièges déjà désignés ; un siège retiré à la main **avant** la hausse n'est ni
+réexaminé (stale) ni réinscrit par la complétion (B/P1 dev4, B/P2 cx1) ; un
+retrait **pendant** la passe refuse toujours, sans écrire.
 """
 from __future__ import annotations
 
 import dataclasses
 import os
 import unittest
+from unittest import mock
 
+from ameesh import registry
 from ameesh import review_designation as rd
 from ameesh import review_designation_activation as act
 from ameesh import review_designation_pg as pg
@@ -172,6 +176,92 @@ class FloorCompletionTest(base._ActivationFixture, PgTestCase):
         self.assertEqual(len(self.mailbox()), before + 1)
         self.assertEqual(len(designated(work.get(self.db, self.lot))), 2)
         self.assertIn(first[0], designated(work.get(self.db, self.lot)))
+
+    # -- sièges retirés à la main (B/P1 dev4, B/P2 cx1) --------------------
+
+    def remove(self, name):
+        work.designate_reviewer(self.cfg, self.db, self.lot, name,
+                                actor="human:smichea", remove=True)
+        self.assertEqual(designated(work.get(self.db, self.lot)), [])
+
+    def _third_family(self):
+        """Un second agent claude disponible : après le retrait de r1, deux
+        familles distinctes restent couvrables (r2 codex, r3 claude)."""
+        registry.upsert(self.db, "r3", harness="claude", host=self.cfg.host,
+                        cwd=self.repo.root, status="idle")
+        self.db.execute("UPDATE agent_registry SET team = 'ameesh' WHERE name = %s",
+                        ("r3",))
+
+    def test_a_seat_removed_before_the_floor_is_not_rewritten(self):
+        self._third_family()
+        _, out = self.freeze()
+        self.assertEqual([r["name"] for r in out["reviewers"]], ["r1"], out)
+        self.remove("r1")
+        before_mail, before_marks = len(self.mailbox()), len(self.marks())
+
+        result = self.floor(2)
+
+        completion = result["designation"]
+        self.assertEqual(completion["state"], rd.DESIGNATED, completion)
+        self.assertTrue(completion.get("completed"), completion)
+        names = [r["name"] for r in completion["reviewers"]]
+        self.assertEqual(names, ["r2", "r3"], completion)
+        self.assertEqual(designated(work.get(self.db, self.lot)), names)
+        self.assertEqual([m["recipient"] for m in self.mailbox()[before_mail:]],
+                         ["r2", "r3"])
+        self.assertGreater(len(self.marks()), before_marks)
+
+        # rejeu `--apply` : même désignation, aucun courrier ni marque
+        before_mail, before_marks = len(self.mailbox()), len(self.marks())
+        again = act.reviewers(self.cfg, self.db, self.lot, apply=True)["applied"]
+        self.assertEqual(again["state"], rd.DESIGNATED, again)
+        self.assertEqual(len(self.mailbox()), before_mail)
+        self.assertEqual(len(self.marks()), before_marks)
+
+    def test_a_seat_removed_before_the_floor_leaves_a_journaled_wait(self):
+        _, out = self.freeze()
+        self.assertEqual([r["name"] for r in out["reviewers"]], ["r1"], out)
+        self.remove("r1")
+        before_mail, before_marks = len(self.mailbox()), len(self.marks())
+
+        result = self.floor(2)
+
+        completion = result["designation"]
+        self.assertEqual(completion["state"], rd.WAITING, completion)
+        self.assertEqual(designated(work.get(self.db, self.lot)), [])
+        self.assertEqual(len(self.mailbox()), before_mail)
+        self.assertEqual(len(self.marks()), before_marks)
+        self.assertTrue(self.notes(act.FLOOR_PREFIX))
+        before_notes = len(self.notes(act.FLOOR_PREFIX))
+
+        # le rejeu ne renote pas la même attente (une par gel et par plancher)
+        again = act.reviewers(self.cfg, self.db, self.lot, apply=True)["applied"]
+        self.assertEqual(again["state"], rd.WAITING, again)
+        self.assertEqual(len(self.mailbox()), before_mail)
+        self.assertEqual(len(self.marks()), before_marks)
+        self.assertEqual(len(self.notes(act.FLOOR_PREFIX)), before_notes)
+
+    def test_a_seat_removed_during_the_pass_still_refuses_stale(self):
+        _, out = self.freeze()
+        self.assertEqual([r["name"] for r in out["reviewers"]], ["r1"], out)
+        before_marks = len(self.marks())
+        real = act._selection
+
+        def remove_then_select(inputs, port, **kwargs):
+            # retrait concurrent, sous la passe : la colonne vivante perd le
+            # siège examiné ; la complétion doit refuser, jamais le réécrire.
+            self.db.execute("UPDATE work_items SET reviewers = '{}' WHERE id = %s",
+                            (self.lot,))
+            return real(inputs, port, **kwargs)
+
+        with mock.patch.object(act, "_selection", remove_then_select):
+            result = self.floor(2)
+
+        completion = result["designation"]
+        self.assertEqual(completion["state"], "stale", completion)
+        self.assertIn("column changed", completion["why"])
+        self.assertEqual(len(self.marks()), before_marks)
+        self.assertEqual(self.notes(act.FLOOR_PREFIX), [])
 
 
 if __name__ == "__main__":
