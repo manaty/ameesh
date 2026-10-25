@@ -1,0 +1,52 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# #3444 — prérequis hôte pour que le drop-in `cles-owner.conf` soit EFFECTIF
+# sur Ubuntu 24.04.
+#
+# Constat (mesuré sur agents-2, 24.04.5, systemd 255, noyau 6.8) : une unité
+# UTILISATEUR qui demande InaccessiblePaths= crée bien un espace de noms
+# utilisateur, mais AppArmor fait passer l'executor de systemd dans le profil
+# `unprivileged_userns` (`audit deny capability`). Le mount namespace ne peut
+# donc pas être posé, et systemd l'ignore SILENCIEUSEMENT : le fichier reste
+# lisible, PrivateTmp=yes n'est pas appliqué non plus. InaccessiblePaths= seul
+# donnerait une fausse sécurité.
+#
+# Ce profil rend à systemd-executor — et à lui seul — le droit de créer un
+# espace de noms utilisateur, exactement comme le profil `bwrap` déjà posé sur
+# les hôtes du train ameesh (accord owner du 19/10, #2381) : profil
+# `flags=(unconfined)` + `userns,`, pour que la restriction d'Ubuntu ne
+# s'applique pas au binaire de confiance qui pose les bacs à sable.
+#
+# Portée : le profil est attaché au BINAIRE systemd-executor, que le
+# gestionnaire système comme le gestionnaire utilisateur exécutent pour chaque
+# service. Tout service sans profil propre hérite donc de ce label
+# `flags=(unconfined)` + `allow all,` : il est behaviorally unconfined et le
+# profil ne lui ajoute que le droit `userns`. Les services qui ont leur propre
+# profil AppArmor (attachement par chemin) y passent comme avant. Sur un poste
+# mono-utilisateur dont les agents ont déjà le groupe docker (donc root), la
+# restriction d'Ubuntu ne protège plus rien ; le profil ne fait que rendre le
+# garde-fou #3444 effectif.
+#
+# Installation (root, propriétaire de l'hôte) :
+#   install -m 0644 deploy/poste/ameesh-systemd-executor.apparmor \
+#     /etc/apparmor.d/ameesh-systemd-executor
+#   apparmor_parser -r /etc/apparmor.d/ameesh-systemd-executor
+#   # preuve : deploy/poste/preuve-isolation-cles-owner.sh, en smichea
+# Retrait :
+#   apparmor_parser -R /etc/apparmor.d/ameesh-systemd-executor
+#   rm /etc/apparmor.d/ameesh-systemd-executor
+
+abi <abi/4.0>,
+include <tunables/global>
+
+profile ameesh-systemd-executor /usr/lib/systemd/systemd-executor flags=(unconfined) {
+  userns,
+  # Un profil `flags=(unconfined)` empilé avec `unprivileged_userns` devient
+  # `(mixed)` : le « allow everything » du drapeau s'évapore et, sans règle
+  # réseau, TOUT le réseau est refusé (Ubuntu #2168612). `allow all,` rend le
+  # profil équivalent à l'unconfined qu'il remplace, même empilé — mesuré sur
+  # le profil bwrap du même hôte : label `bwrap (unconfined)` après création
+  # du user ns, mount et réseau intacts.
+  allow all,
+  include if exists <local/ameesh-systemd-executor>
+}

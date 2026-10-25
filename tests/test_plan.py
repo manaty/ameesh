@@ -1372,7 +1372,9 @@ class ContentMergeTest(_PlanDb):
 
     def test_2744_un_lot_blocked_n_est_pas_ferme_par_le_contenu(self):
         from ameesh import mail
+        self.register("dev-a", "claude")
         item = self._delivered("bloque")
+        work.assign(self.db, item["id"], "dev-a")
         work.move(self.db, item["id"], "blocked", note="passe réelle due",
                   actor="dev-a")
         dry = self.run_sync(dry_run=True)[item["id"]]

@@ -1,0 +1,22 @@
+[Unit]
+Description=One privileged typed handoff request (H8)
+
+[Service]
+Type=exec
+User=root
+Group=root
+ExecStart=/usr/bin/python3 -I -S -B /usr/local/libexec/ameesh-runtime-seal.py
+StandardInput=socket
+StandardOutput=null
+StandardError=journal
+Environment=PATH=/usr/bin:/bin LANG=C LC_ALL=C
+WorkingDirectory=/
+UMask=0077
+RuntimeMaxSec=85
+TimeoutStopSec=5
+KillMode=control-group
+NoNewPrivileges=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK

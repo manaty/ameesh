@@ -15,6 +15,8 @@ alike); the insertion emits `pg_notify('ameesh_events', id)`. Types:
   agent.updated        another change of status, lease, mode or stop reason
   agent.moved          a manual move of a `releve: hote` agent to another
                        admitted host (#3299, written with the move)
+  agent.retired        an agent taken out of the active registry, and
+  agent.restored       brought back (#3460, written with the gesture)
   cost.recorded        a priced turn (turn_costs)
   thread.entry         an entry in a thread (thread_index)
   decision.created     an action proposed (actions)

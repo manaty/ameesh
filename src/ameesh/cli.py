@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """agent-mail (mesh v1) — the agents' mailbox, on Postgres.
 
-  agent-mail send <dest> <text…> [--from NAME] [--lot ID|REF [--assign]] [--new-lot "title"
+  agent-mail send <dest> <text…|-> [--from NAME] [--lot ID|REF [--assign]] [--new-lot "title"
                  [--estimate 2h] [--app PROJECT]] [--force REASON] [--queue]
                                                  drops a message (dest = name, or "all")
                                                  and writes it to the readable thread of the
@@ -22,7 +22,7 @@
                                                  refused to a name not in the registry (close
                                                  names suggested), to a stopped agent
                                                  (unless --queue) and from a stopped identity
-                       [--urgent] [--ack] [--cc NAME[,NAME…]] [--request-expires 2h]
+                       [--urgent] [--ack] [--info] [--cc NAME[,NAME…]] [--request-expires 2h]
                                                  a request deadline (`request_expires_ts`,
                                                  distinct from the signature TTL): after it,
                                                  no turn starts, the sender is notified and
@@ -30,10 +30,16 @@
                                                  L125: an idle agent is woken only
                                                  after a batching window
                                                  (AMEESH_MAIL_BATCH, 90 s); --urgent wakes
-                                                 it at once; --ack (acknowledgement)
+                                                 it at once; --ack (acknowledgement),
+                                                 --info (report, no action expected)
                                                  and --cc (copy, as an event)
                                                  do not wake: read on the next turn;
                                                  nor does "all" without --urgent
+                                                 a body of `-` is read on standard input
+                                                 (`send <dest> - <<'EOF' … EOF`): with a quoted
+                                                 delimiter nothing is expanded, so a command
+                                                 cited in the body is not run by your shell
+                                                 (#3504)
   agent-mail forward <old> <new> [--dry-run] [--json]
                                                  re-delivers the pending mail of a stopped
                                                  agent (or one missing from the registry) to a
@@ -89,6 +95,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import time
 
@@ -264,6 +271,51 @@ def set_title(cfg: Config, bk, name: str) -> None:
 # commandes
 # --------------------------------------------------------------------------
 
+#: #3504 : confirmations typiques d'une commande ameesh qui écrit (envoi de
+#: courrier, gel, clôture, fusion, décision). Un corps reçu en arguments qui
+#: en contient une a probablement subi une substitution de commande entre
+#: guillemets doubles ; on le dit, sans rien refuser. Lignes entières
+#: seulement : une citation en prose ne les aligne pas ainsi.
+_COMMAND_OUTPUT_RE = re.compile(
+    r"(?m)^(?:"
+    r"delivered to \S"
+    r"|milestone \w+ added to lot #\d+"
+    r"|decision #\d+(?::| withdrawn)"
+    r"|work item #\d+ closed:"
+    r"|lot #\d+ → merged \(commit"
+    r")")
+
+
+def _stdin_body() -> tuple[str | None, str | None]:
+    """#3504 : corps de `send <dest> -`, lu sur l'entrée standard.
+
+    Rend `(texte, None)` ou `(None, erreur)`. Le texte est nettoyé des blancs
+    de bord comme un corps passé en arguments ; une entrée illisible (UTF-8
+    invalide) ou vide est refusée avant tout dépôt.
+    """
+    try:
+        data = sys.stdin.buffer.read()
+    except AttributeError:  # flux déjà textuel (tests, appel en processus)
+        data = sys.stdin.read()
+    if isinstance(data, bytes):
+        try:
+            data = data.decode("utf-8")
+        except UnicodeDecodeError:
+            return None, ("the body on standard input is not valid UTF-8; "
+                          "write plain text")
+    text = data.strip()
+    if not text:
+        return None, ("empty body on standard input: write the message before "
+                      "closing standard input")
+    return text, None
+
+
+def _command_output_in(text: str) -> str:
+    """#3504 : la confirmation ameesh reconnue dans un corps, ou ''."""
+    match = _COMMAND_OUTPUT_RE.search(text)
+    return match.group(0) if match else ""
+
+
 def cmd_send(bk, cfg: Config, args: list[str]) -> int:
     sender = None
     key_path = None
@@ -289,6 +341,10 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
         cc += [name.strip() for name in value.split(",") if name.strip()]
     ack = "--ack" in args
     args = [arg for arg in args if arg != "--ack"]
+    # #3451 : information sans geste attendu (compte rendu « rien à faire »,
+    # état inchangé) — lue au prochain tour du destinataire, sans réveil
+    passif_info = "--info" in args
+    args = [arg for arg in args if arg != "--info"]
     # #964: `--assign` is the explicit gesture that lets a `--lot` assign a
     # FREE lot (or one held by a human) to the recipient, even outside the
     # orchestrator detection (L94 history included); never a lot held by an
@@ -362,6 +418,12 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
         print("--ack and --assign contradict each other: an acknowledgement does not hand over work",
               file=sys.stderr)
         return 2
+    if passif_info and (urgent or marks or new_lot is not None or assign):
+        print("--info and --%s contradict each other: an information does not wake, "
+              "interrupt a turn nor hand over work"
+              % ("urgent" if urgent else marks[0] if marks
+                 else "new-lot" if new_lot is not None else "assign"), file=sys.stderr)
+        return 2
     sign = key_path is not None or "--sign" in args
     allow_structured = "--allow-structured" in args
     args = [arg for arg in args if arg not in ("--sign", "--allow-structured")]
@@ -369,13 +431,15 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
         print("--expires only makes sense with --sign/--key", file=sys.stderr)
         return 2
     if len(args) < 2:
-        print("usage: agent-mail send <dest|all> <text…> [--from NAME] [--lot ID|REF [--assign]] "
+        print("usage: agent-mail send <dest|all> <text…|-> [--from NAME] [--lot ID|REF [--assign]] "
               "[--new-lot \"title\" [--estimate 2h] [--app PROJECT [--new-project]] "
               "[--parent-lot ID]] "
               "[--kind request|reply|notify|event] "
               "[--urgent] [--verdict|--arbitration] "
-              "[--ack] [--cc NAME[,NAME…]] [--sign --key FILE] [--expires 24h] "
-              "[--request-expires 2h] [--queue]",
+              "[--ack] [--info] [--cc NAME[,NAME…]] [--sign --key FILE] [--expires 24h] "
+              "[--request-expires 2h] [--queue]\n"
+              "       a body of `-` is read on standard input "
+              "(send <dest> - <<'EOF' … EOF: a quoted delimiter expands nothing)",
               file=sys.stderr)
         return 2
     if lot is not None and not NAME_RE.match(lot):
@@ -419,7 +483,30 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
             print("--parent-lot: a lot number (e.g. 1070 or #1070)", file=sys.stderr)
             return 2
         parent_lot = int(number)
-    dest, text = args[0], " ".join(args[1:]).strip()
+    dest = args[0]
+    body = args[1:]
+    if body == ["-"]:
+        # #3504 : le corps vient de l'entrée standard, pour citer une commande
+        # sans que le shell de l'expéditeur ne la lance (heredoc `<<'EOF'`).
+        text, error = _stdin_body()
+        if error:
+            print(error, file=sys.stderr)
+            return 2
+    elif "-" in body:
+        print("`-` reads the whole body on standard input: give it alone after "
+              "the recipient (or pass the text as arguments)", file=sys.stderr)
+        return 2
+    else:
+        text = " ".join(body).strip()
+        output = _command_output_in(text)
+        if output:
+            # #3504 (optionnel) : la sortie d'une commande ameesh dans un corps
+            # passé en arguments trahit une substitution de commande.
+            print("warning: the body contains \"%s\", the confirmation of an ameesh "
+                  "command: a command between double quotes is run by your shell. "
+                  "Send the body on standard input: agent-mail send <dest> - "
+                  "<<'EOF' … EOF (quoted delimiter: nothing is expanded)" % output,
+                  file=sys.stderr)
     # L77 : la liaison est lue même avec --from — un processus lié à un agent
     # ne produit JAMAIS de preuve humaine, quel que soit l'expéditeur nommé.
     entry_binding = identity.resolve_binding(cfg, bk.db if bk.kind == "pg" else None)
@@ -467,8 +554,14 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
                 print("copy refused — %s" % undeliverable.watch_sender_text(name),
                       file=sys.stderr)
                 return 2
-            if undeliverable.registry_rows(bk.db, [name])[name] is None:
+            row = undeliverable.registry_rows(bk.db, [name])[name]
+            if row is None:
                 print("copy refused: unknown agent: %s (nothing delivered)" % name,
+                      file=sys.stderr)
+                return 2
+            if row.get("retired_ts"):
+                # #3460 : un retiré n'est jamais destinataire, pas même en copie
+                print("copy refused — %s" % undeliverable.retired_text(row, sender=False),
                       file=sys.stderr)
                 return 2
     # L77/B1 : l'identité humaine est normalisée à la frontière (`human:<id>`,
@@ -548,6 +641,8 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
                and lot is None and new_lot is None and kind in ("notify", "reply")
                and mail.looks_like_ack(text)):
         payload["ack"] = True
+    if passif_info:
+        payload["info"] = True
     if request_expires is not None:
         # #2814 : échéance de REQUÊTE explicite, distincte de la TTL de
         # signature (`--expires`). Absolue en base, pour ne pas dépendre de
@@ -611,18 +706,28 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
                 int(item["id"]), quoi,
                 ": %s" % item.get("title") if linked["created"] else "",
                 " (branch %s)" % linked["branch"] if linked["branch"] else ""))
-        if payload.get("ack") and (linked["created"] or linked["assigned"]):
-            # L125 : un message qui confie un lot n'est jamais un accusé
-            del payload["ack"]
+        passif = [key for key in ("ack", "info") if payload.get(key)]
+        if passif and (linked["created"] or linked["assigned"]):
+            # L125 : un message qui confie un lot n'est jamais un accusé ;
+            # #3451 : ni une simple information
+            for key in passif:
+                del payload[key]
             print("warning: this message hands a work item to %s: it wakes it "
-                  "(not an acknowledgement)" % dest, file=sys.stderr)
+                  "(not %s)" % (dest, "an acknowledgement" if "ack" in passif
+                                else "an information"), file=sys.stderr)
 
     skipped: list[str] = []
-    targets = bk.send(sender, dest, text, host=cfg.host, signed=signed,
-                      work_item_id=lot, allow_structured=allow_structured,
-                      kind=kind, urgent=urgent, thread_meta=thread_meta,
-                      payload=payload or None, cc=cc,
-                      include_stopped=queue, skipped=skipped)
+    from . import storage
+    try:
+        targets = bk.send(sender, dest, text, host=cfg.host, signed=signed,
+                          work_item_id=lot, allow_structured=allow_structured,
+                          kind=kind, urgent=urgent, thread_meta=thread_meta,
+                          payload=payload or None, cc=cc,
+                          include_stopped=queue, skipped=skipped)
+    except storage.RecipientRetired as exc:
+        # #3460 : retiré après le précontrôle — le refus du stockage, lisible
+        print("refused: %s" % exc, file=sys.stderr)
+        return 2
     # #1689 (N1) : le marqueur local des destinataires est posé par le dépôt
     # lui-même (`mail.send`, `FileBackend.send`), pour tout émetteur local et
     # pas seulement cette commande.
@@ -662,6 +767,8 @@ def _send_note(dest: str, urgent: bool, payload: dict, cc: list[str]) -> str:
     note = ""
     if payload.get("ack"):
         note = " (acknowledgement: read on its next turn, without waking it)"
+    elif payload.get("info"):
+        note = " (information: read on its next turn, without waking it)"
     elif dest == "all" and not urgent and not payload.get("human"):
         note = (" (announcement: read on everyone's next turn, no wake-up; "
                 "--urgent to wake)")
@@ -1652,7 +1759,10 @@ def cmd_forward(bk, cfg: Config, rest: list[str]) -> int:
     except ValueError as exc:
         print("%s\n%s" % (exc, _FORWARD_USAGE), file=sys.stderr)
         return 2
-    if len(positional) != 2 or not all(NAME_RE.match(name) for name in positional):
+    # L'ancien destinataire est une clé exacte de boîte morte, y compris
+    # un ancien libellé d'acteur hors registre. Le nouveau reste un nom agent.
+    if (len(positional) != 2 or not positional[0].strip()
+            or not NAME_RE.fullmatch(positional[1])):
         print(_FORWARD_USAGE, file=sys.stderr)
         return 2
     old, new = positional
@@ -2113,6 +2223,20 @@ def cmd_doctor(cfg: Config, notify_test: bool, probe: bool = False,
     print("agents     : %d" % agents)
     print("unread     : %d" % unread)
     print(host_measures_line(cfg))
+    # #3503 : le JIT de Postgres. db.connect le coupe dans chaque session
+    # (`-c jit=off`) ; ici, on signale en plus si le rôle ou la base ne le
+    # couperaient pas pour une session qui ne passe pas par ameesh (psql,
+    # script de déploiement, nouveau rôle). Le défaut ON est signalé sans
+    # changer le verdict ; une SESSION on (le réglage du client n'est pas
+    # passé) est un échec du doctor.
+    from . import hostcheck
+    jit_ko = False
+    try:
+        for line in hostcheck.jit_lines(db):
+            print(line)
+            jit_ko = jit_ko or line.startswith(hostcheck.JIT_SESSION_ON_PREFIX)
+    except db_mod.DbError as exc:
+        print("jit        : not checked (%s)" % exc)
     # #2580 : un compte déclaré aussi par un autre mesh de l'hôte — signalé,
     # sans changer le verdict par défaut (refuser arrêterait les deux meshes).
     try:
@@ -2123,7 +2247,6 @@ def cmd_doctor(cfg: Config, notify_test: bool, probe: bool = False,
         print("accounts   : unreadable (%s)" % exc)
     # L106 : un agent mené sans unité d'exécuteur ne repart pas après une
     # coupure de l'hôte (signalé, sans changer le verdict)
-    from . import hostcheck
     try:
         for line in hostcheck.missing_runner_lines(cfg, db):
             print(line)
@@ -2145,6 +2268,10 @@ def cmd_doctor(cfg: Config, notify_test: bool, probe: bool = False,
     except db_mod.DbError:
         pass
     verdict = 0
+    # #3503 : la session d'ameesh doit avoir reçu `-c jit=off` ; sinon le
+    # correctif ne s'applique pas à ce processus (ligne déjà imprimée).
+    if jit_ko:
+        verdict = 1
     # #3345 : un profil de l'hôte qui diverge sur train, github ou release
     # n'est pas un état vert — le runner d'à côté ne fait pas la même chose.
     if profile_ko:

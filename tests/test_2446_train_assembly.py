@@ -287,7 +287,9 @@ class AssemblyTest(unittest.TestCase):
         with self.assertRaisesRegex(train.TrainError, "missing key"):
             self.assemble(train=dict(self.config, projects={"ameesh": project}))
 
-    def test_live_reload_follows_the_effective_pin_and_refuses_a_bad_one(self):
+    @mock.patch("ameesh.scoped_db.ScopedDb")
+    @mock.patch("ameesh.train_requalify.automatic")
+    def test_live_reload_follows_the_effective_pin_and_refuses_a_bad_one(self, automatic, scoped_db):
         """#3366: the service re-reads the pin without a runner restart."""
         self.canon.write("docs/guide.md", "guide\n")
         new = self.canon.commit("docs only")
@@ -336,7 +338,9 @@ class AssemblyTest(unittest.TestCase):
             train_assembly.reload(result.passages, load=lambda: fresh,
                                   host="host-b")
 
-    def test_refresh_reads_the_profile_on_disk_without_a_restart(self):
+    @mock.patch("ameesh.scoped_db.ScopedDb")
+    @mock.patch("ameesh.train_requalify.automatic")
+    def test_refresh_reads_the_profile_on_disk_without_a_restart(self, automatic, scoped_db):
         """#3366: the effective file (host + profile) is what the service rereads."""
         self.canon.write("docs/guide.md", "guide\n")
         new = self.canon.commit("docs only")

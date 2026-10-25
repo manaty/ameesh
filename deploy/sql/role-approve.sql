@@ -30,6 +30,7 @@
 --
 --   CREATE ROLE approve_service LOGIN IN ROLE ameesh_approve;
 --   ALTER ROLE approve_service SET default_transaction_read_only = on;
+--   ALTER ROLE approve_service SET jit = off;  -- #3503 : pas de compilation JIT
 --   ALTER ROLE approve_service SET search_path = <schéma de l équipe>;
 --   -- mot de passe : \password approve_service (jamais dans un fichier versionné)
 --

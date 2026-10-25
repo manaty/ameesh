@@ -1046,7 +1046,10 @@ The `installer` step follows the same practice.
 5. `poste.sh role`: `deploy/sql/role-superviseur.sql` (0041 columns and
    0042 tables in the contract) reapplied on each database **where the role already
    exists**. On the server, as local superuser, over SSH. A missing
-   role is not created: that is a separate decision.
+   role is not created: that is a separate decision. The same step sets
+   `jit = off` on the mesh role `ameesh` and on the mesh database (#3503): the
+   client already forces it per session, this covers psql, deploy scripts and
+   any new role.
 6. `poste.sh redemarrer`: each active `ameesh-runner-agent@<p>` is
    restarted **one by one**: the unit is stopped first (SIGTERM closes
    admission; the turn in progress drains, bounded by `TimeoutStopSec`), the

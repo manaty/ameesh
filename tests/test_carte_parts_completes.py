@@ -71,7 +71,7 @@ class MiroirDesPartsTest(unittest.TestCase):
 
     def test_le_miroir_couvre_la_matrice_de_mesure(self):
         matrice = sorted(f"mesure-{p}-{n}" for p, n, _ in INCLUDE.findall(WORKFLOW))
-        self.assertEqual(len(matrice), 10, "matrice de mesure inattendue")
+        self.assertEqual(len(matrice), 14, "matrice de mesure inattendue")
         m = MIROIR.search(WORKFLOW)
         self.assertIsNotNone(m, "PARTS_MESURE introuvable dans carte.yml")
         miroir = sorted(m.group(2).split())
@@ -81,13 +81,14 @@ class MiroirDesPartsTest(unittest.TestCase):
     def test_la_mesure_psql_est_decoupee(self):
         # B : une seule part de 45 modules pesait 38 min de mur pour 40 de
         # plafond, annulée deux fois ; le run 38845518821 (16/10) a annulé
-        # psql 1/2 et 2/2, psycopg 2/4 et 3/4 à 40m30 : 4 parts psql et 6
-        # parts psycopg (arbitrage pilote ; plafond porté à 60 min par #2224).
+        # psql 1/2 et 2/2, psycopg 2/4 et 3/4 à 40m30 : 6 parts psql et 8
+        # parts psycopg (#3450 : 4/6 ne tenaient pas sous le plafond de 60 min
+        # sur un pool saturé, run du 24/10).
         psql = [(p, n, of) for p, n, of in INCLUDE.findall(WORKFLOW) if p == "psql"]
-        self.assertEqual(psql, [("psql", str(n), "4") for n in range(1, 5)])
+        self.assertEqual(psql, [("psql", str(n), "6") for n in range(1, 7)])
         psycopg = [(p, n, of) for p, n, of in INCLUDE.findall(WORKFLOW)
                    if p == "psycopg"]
-        self.assertEqual(psycopg, [("psycopg", str(n), "6") for n in range(1, 7)])
+        self.assertEqual(psycopg, [("psycopg", str(n), "8") for n in range(1, 9)])
 
     def test_le_plafond_des_mesures_est_celui_que_le_plan_verifie(self):
         # #2224 : psycopg 3/6 annulée à 40m46 (run 39015105210), aucune carte.

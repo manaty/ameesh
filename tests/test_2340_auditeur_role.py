@@ -135,6 +135,8 @@ class AuditeurLoginRoleTest(PgTestCase):
                           "rolreplication", "rolbypassrls"):
             self.assertFalse(row[attribute], attribute)
         self.assertIn("default_transaction_read_only=on", row["rolconfig"] or [])
+        # #3503 : un NOUVEAU rôle de connexion coupe aussi le JIT de Postgres
+        self.assertIn("jit=off", row["rolconfig"] or [])
         self.assertEqual(self.memberships(), {self.etat: False, self.contenus: False})
 
     def test_idempotent(self):

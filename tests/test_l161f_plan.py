@@ -861,8 +861,10 @@ class MapTest(unittest.TestCase):
         card = self.repo.card()
         self.assertEqual(plan.map_problem(card, NOW, "HEAD", self.repo.path), ("", 0.0))
         self.assertEqual(plan.map_problem(None, NOW)[0], "no map")
+        # #3450 : l'âge n'est plus un motif d'inutilisation — la carte rend son
+        # âge et l'appelant décide de la fraîcheur exigée.
         old = NOW + datetime.timedelta(hours=49)
-        self.assertIn("older than 48 h", plan.map_problem(card, old, "HEAD", self.repo.path)[0])
+        self.assertEqual(plan.map_problem(card, old, "HEAD", self.repo.path), ("", 49.0))
         stranger = dict(card, commit="0" * 40)
         self.assertIn("not an ancestor", plan.map_problem(stranger, NOW, "HEAD",
                                                           self.repo.path)[0])
@@ -1468,13 +1470,22 @@ class DocsLaneTest(unittest.TestCase):
         self.card["modules"] = {m: {"durees": {"psycopg": 1.0}, "echecs": []}
                                 for m in self.MODULES}
 
+    def _read_list(self, path, known, required=False):
+        # un contrat non vide : sans lui, un repli de la voie documentation
+        # rendrait la suite complète par « contrat vide » et masquerait une
+        # sélection réduite (#3450).
+        if path == plan.ALWAYS_FILE:
+            return [self.MODULES[0]]
+        if path == plan.PILOT_FILE:
+            return list(self.MODULES)
+        return []
+
     def _plan(self, files: list[str], event: str = "pull_request") -> dict:
         docs = {"version_only": False, "docs_only": event == "pull_request",
                 "why": "docs", "files": files}
         with mock.patch.object(plan, "nature", lambda *a, **k: dict(docs)), \
                 mock.patch.object(plan.parts, "modules", lambda *a: list(self.MODULES)), \
-                mock.patch.object(plan, "read_list", lambda *a, **k: list(self.MODULES)
-                                  if a and a[0] == plan.PILOT_FILE else []):
+                mock.patch.object(plan, "read_list", self._read_list):
             return plan.make_plan(event, self.card, NOW, head="HEAD", repo=self.repo.path,
                                   base_ref="main", head_ref="lot/x")
 
@@ -1486,8 +1497,7 @@ class DocsLaneTest(unittest.TestCase):
 
     def _real_plan(self, base):
         with mock.patch.object(plan.parts, "modules", lambda *a: list(self.MODULES)), \
-                mock.patch.object(plan, "read_list", lambda *a, **k: list(self.MODULES)
-                                  if a and a[0] == plan.PILOT_FILE else []):
+                mock.patch.object(plan, "read_list", self._read_list):
             return plan.make_plan("pull_request", self.card, NOW, base=base, head="HEAD",
                                   repo=self.repo.path, base_ref="main", head_ref="lot/x")
 
@@ -1549,8 +1559,12 @@ class DocsLaneTest(unittest.TestCase):
         self.assertEqual(sorted(p["files"]), ["docs/guide.md", "src/ameesh/code.py"])
         self.assertFalse(p["docs_only"], p["why"])
         self.assertEqual(plan.outputs(p)["code"], "true")
+        # #3450 : le contrat du banc n'est plus vide (il masquait la sélection
+        # d'un lot derrière « contrat vide ») ; la PR mixte suit bien le lot —
+        # les impactés (`used` → test_a) et le contrat —, pas la suite complète.
+        self.assertEqual(p["selection"]["mode"], "impacted")
         self.assertEqual(sorted(m for part in p["parts"]["psycopg"]
-                                for m in part["modules"]), self.MODULES)
+                                for m in part["modules"]), [self.name["test_a"]])
 
     def test_missing_uncertainty_diagnostic_keeps_the_full_suite(self):
         with mock.patch.object(plan, "read_list", return_value=[]):
@@ -1600,8 +1614,10 @@ class DocsLaneTest(unittest.TestCase):
         self.assertFullSuite(p, self.name["test_db"])
         self.assertEqual(p["classes"][self.name["test_db"]][0], "P1")
 
-    def test_stale_map_always_runs_the_full_suite(self):
-        # codex (1): a 49 h map left only the declared readers
+    def test_stale_map_keeps_the_documentation_lane_on_the_full_suite(self):
+        # #3450 : une carte périmée juge encore le diff d'un lot, mais la voie
+        # documentation saute les parts : elle exige une carte fraîche, sinon
+        # les lecteurs ajoutés depuis la carte manqueraient.
         self.card["donnees"]["docs/guide.md"] = [self.name["test_db"]]
         self.card["genere"] = (NOW - datetime.timedelta(hours=49)).isoformat()
         self.repo.write("docs/guide.md", "# Guide, again\n")
@@ -2202,8 +2218,9 @@ class LotBranchTest(unittest.TestCase):
     def _state(self, classes, **kw):
         state = {
             "map": {"commit": "c" * 40, "generated": NOW.isoformat(), "age_h": 0.0,
-                    "used": True, "problem": ""},
-            "sure": True, "phase2_safe": True, "phase2_why": "", "unsure": [],
+                    "used": True, "problem": "", "stale": False},
+            "sure": True, "phase2_safe": True, "lot_safe": True,
+            "phase2_why": "", "unsure": [],
             "untested": [], "unknown_blocks": [], "foundation": [], "changed": 2,
             "always": [], "contract": list(self.contract),
             "classes": {m: list(c) for m, c in classes.items()},
@@ -2268,7 +2285,7 @@ class LotBranchTest(unittest.TestCase):
             "no map": {"map": None},
             "map unusable": {"map": {"commit": "c" * 40, "generated": NOW.isoformat(),
                                      "age_h": 0.0, "used": False, "problem": "map unreadable"}},
-            "unsafe selection": {"phase2_safe": False,
+            "unsafe selection": {"phase2_safe": False, "lot_safe": False,
                                  "phase2_why": "3 changed block(s) without a test"},
             "empty contract": {"contract": []},
         }
@@ -2375,7 +2392,8 @@ class LotBranchTest(unittest.TestCase):
         text = plan.summary(p)
         self.assertIn("lot branch (L1211)", text)
         self.assertIn(f"{len(self.contract)} contract module(s)", text)
-        full = self._plan(phase2_safe=False, phase2_why="changed block(s) without a test")
+        full = self._plan(phase2_safe=False, lot_safe=False,
+                          phase2_why="changed block(s) without a test")
         text = plan.summary(full)
         self.assertIn("full suite", text)
         self.assertIn("changed block(s) without a test", text)
@@ -2388,7 +2406,8 @@ class LotBranchTest(unittest.TestCase):
                        certified={"src/ameesh/x.py": [self.mods[0]]})
         text = plan.summary(p)
         self.assertIn("unmeasured blocks covered by their importers", text)
-        unknown = self._plan(phase2_safe=False, phase2_why="selection unsafe",
+        unknown = self._plan(phase2_safe=False, lot_safe=False,
+                             phase2_why="selection unsafe",
                              importers={"src/ameesh/y.py": [self.mods[0]]},
                              uncovered=["src/ameesh/y.py"])
         text = plan.summary(unknown)

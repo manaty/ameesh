@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ameesh"
-version = "1.21.0"
+version = "1.22.0"
 description = "Coordination d'équipes mixtes humains et agents IA : exécuteur multi-harnais, canon OKF, fil lisible, actions sous porte et approbations signées."
 readme = "README.md"
 requires-python = ">=3.9"
@@ -64,6 +64,10 @@ ameesh = ["migrations/*.sql", "progress_page.html", "harness_descriptors/*.json"
 [tool.setuptools.data-files]
 "share/ameesh/mise-a-jour" = [
     "deploy/mise-a-jour/canari-handoff.py",
+    "deploy/mise-a-jour/dispatch-local-handoff.py",
+    "deploy/mise-a-jour/installer-local-handoff.py",
+    "deploy/mise-a-jour/scellement-runtime.py",
+    "deploy/mise-a-jour/*.py",
     "deploy/mise-a-jour/fabrique-handoff.py",
     "deploy/mise-a-jour/hote-handoff.py",
     "deploy/mise-a-jour/pont-handoff.py",
@@ -73,4 +77,9 @@ ameesh = ["migrations/*.sql", "progress_page.html", "harness_descriptors/*.json"
     "deploy/mise-a-jour/transport-release.py",
     "deploy/mise-a-jour/controleur-release.py",
     "deploy/mise-a-jour/environnement-versionne.py",
+]
+
+"share/ameesh/mise-a-jour/systemd" = [
+    "deploy/mise-a-jour/systemd/ameesh-handoff-local.socket",
+    "deploy/mise-a-jour/systemd/ameesh-handoff-local@.service",
 ]

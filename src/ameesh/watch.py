@@ -435,14 +435,23 @@ def _note(cfg: Config, db, agent: str, actor: str, text: str, **meta) -> None:
                meta=dict({"action": "watch", "audit": "watch"}, **meta))
 
 
+def _refuse_retired(row: dict | None, agent: str) -> None:
+    """#3460 : un agent inconnu ou retiré n'a ni veille ni réveil — jamais
+    destinataire."""
+    if row is None:
+        raise WatchError("unknown agent: %s" % agent)
+    if row.get("retired_ts"):
+        from . import undeliverable
+        raise WatchError(undeliverable.retired_text(row, sender=False))
+
+
 def enable(cfg: Config, db, agent: str, every_s: int, *, run: Callable = subprocess.run,
            env: dict | None = None, actor: str | None = None) -> list[str]:
     """Installs (or updates) the timer on this host, records the watch, notes
     it in the thread. The warnings to print."""
     if not platform.is_linux():
         raise WatchError("a watch needs systemd (Linux)")
-    if registry.get(db, agent) is None:
-        raise WatchError("unknown agent: %s" % agent)
+    _refuse_retired(registry.get(db, agent), agent)
     host = cfg.host or ""
     if not host:
         raise WatchError("this host has no name (host of the configuration)")
@@ -645,8 +654,7 @@ def arm(cfg: Config, db, agent: str, slug: str, delay_s: int, message: str, *,
     watches)."""
     if not platform.is_linux():
         raise WatchError("a wake needs systemd (Linux)")
-    if registry.get(db, agent) is None:
-        raise WatchError("unknown agent: %s" % agent)
+    _refuse_retired(registry.get(db, agent), agent)
     if not WAKE_RE.match(slug or ""):
         raise WatchError("--wake: %r (lowercase letters, digits and dashes)" % slug)
     message = (message or "").strip()
@@ -778,6 +786,9 @@ def fire(cfg: Config, db, agent: str, slug: str, *,
     # read before the delivery: once the message is committed, nothing may
     # fail the firing (the unit would retry and send it twice)
     row = registry.get(db, agent)
+    # #3460 : un réveil armé avant le retrait ne dépose rien chez un retiré ;
+    # l'unité échoue et garde son état lisible.
+    _refuse_retired(row, agent)
     from . import mail
     host = cfg.host or ""
     with db.transaction() as tx:
