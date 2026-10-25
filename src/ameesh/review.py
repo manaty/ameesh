@@ -173,6 +173,54 @@ def compile_glob(pattern: str) -> re.Pattern:
     return re.compile("".join(out), re.DOTALL)
 
 
+def is_catch_all(pattern: str) -> bool:
+    """Le motif couvre-t-il **tout** chemin (`**`) ?
+
+    Un attrape-tout ne nomme aucun chemin : il peut relever un compte d'avis,
+    jamais abaisser le plancher critique (#3542). La lecture est celle de
+    [`compile_glob`] : un `/` de tête est ancré à la racine, les composants
+    vides sont retirés.
+    """
+    text = normalize_path(str(pattern or ""))
+    if text.startswith("/"):
+        text = text[1:]
+    parts = text.split("/")
+    return bool(parts) and all(part == "**" for part in parts)
+
+
+def declared_reviews(rules, paths) -> tuple[dict, int]:
+    """Les avis déclarés par chemin (`train_reviews`), nommés vs attrape-tout.
+
+    `rules` est une suite de `(motifs, avis)` : les motifs sont les chaînes du
+    canon, lues au même commit. Rend `(nommés, attrape-tout)` :
+    `nommés[chemin]` est le plus grand nombre d'avis d'une règle qui **nomme**
+    ce chemin (au moins un de ses motifs, autre que `**`, le couvre) ;
+    `attrape-tout` est le plus grand nombre porté par une règle `**`. Un `**`
+    couvre tous les chemins sans en nommer aucun : il peut relever un compte,
+    jamais abaisser le plancher critique (#3542). Un motif invalide lève
+    `re.error`, comme [`compile_glob`] : l'appelant en fait un doute, jamais un
+    repli rassurant.
+    """
+    wanted = [str(path) for path in paths or () if str(path or "")]
+    named: dict[str, int] = {}
+    wide = 0
+    for patterns, reviews in rules or ():
+        count = int(reviews)
+        compiled = []
+        catch = False
+        for pattern in patterns or ():
+            if is_catch_all(pattern):
+                catch = True
+            else:
+                compiled.append(compile_glob(pattern))
+        if catch and wanted:
+            wide = max(wide, count)
+        for path in wanted:
+            if any(regex.fullmatch(path) for regex in compiled):
+                named[path] = max(named.get(path, 0), count)
+    return named, wide
+
+
 def parse(policies) -> tuple[ReviewPolicy, list[tuple[str, str, str]]]:
     """`(politique, constats)` — ne lève jamais, pour que `canon check` rapporte.
 

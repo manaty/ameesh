@@ -157,6 +157,25 @@ SENSITIVE_REVIEWS = 1
 CRITICAL_REVIEWS = 2
 
 
+def _entry_critical(entry) -> bool:
+    """Ce chemin classé prouve-t-il SQL, la sécurité ou la prod ?
+
+    `critical: true` du canon fait foi, même porté par une entrée sans chemin.
+    Sinon les motifs de secours de `CRITICAL_SCOPE` lisent le chemin des seuls
+    **chemins changés**, sauf la documentation Markdown classée légère ou
+    normale (le canon peut la classer ainsi).
+    """
+    if entry.get("critical") is True:
+        return True
+    path = str(entry.get("path") or "")
+    if not path:
+        return False
+    if (str(entry.get("class") or "") in ("light", "normal")
+            and _PROSE.search(path)):
+        return False
+    return any(rx.search(path) for rx in CRITICAL_SCOPE)
+
+
 def critical_scope(klass) -> bool:
     """Le diff gelé touche-t-il SQL, la sécurité ou la prod (deux avis) ?
 
@@ -170,20 +189,13 @@ def critical_scope(klass) -> bool:
     classe n'est pas critique pour autant : `required_verdicts` le garde
     sensible, à un avis (canon §2, owner 15/10 ; #2394). Une déclaration
     `critical: true` du canon reste lue même portée par une entrée sans
-    chemin."""
+    chemin.
+
+    Depuis #3542, `required_verdicts` n'oppose ce plancher qu'aux chemins
+    qu'aucune règle `train_reviews` ne nomme ; cette fonction reste la lecture
+    globale du diff, pour les autres lecteurs."""
     files = (klass or {}).get("files") or ()
-    for entry in files:
-        if entry.get("critical") is True:
-            return True
-        path = str(entry.get("path") or "")
-        if not path:
-            continue
-        if (str(entry.get("class") or "") in ("light", "normal")
-                and _PROSE.search(path)):
-            continue
-        if any(rx.search(path) for rx in CRITICAL_SCOPE):
-            return True
-    return False
+    return any(_entry_critical(entry) for entry in files)
 
 
 def required_verdicts(klass) -> int:
@@ -195,6 +207,11 @@ def required_verdicts(klass) -> int:
     #2696) : le classement le lit et le porte (`train_reviews`), la porte
     l'applique comme la désignation au gel ; un chemin léger déclaré à deux
     avis les exige sans être reclassé, et le doute ne l'efface pas.
+    #3542 : le nombre d'une règle qui **nomme** le chemin fait foi, même si le
+    chemin correspond à `CRITICAL_SCOPE` ; celui-ci ne relève plus que les
+    chemins qu'aucune règle ne nomme, et une règle attrape-tout (`**`) ne
+    l'abaisse jamais. `critical: true` du canon reste un plancher explicite,
+    pour tous les projets.
     Les motifs de secours `CRITICAL_SCOPE` ne s'appliquent qu'au projet ameesh
     (ou à un appel sans projet connu) : pour les autres projets, la politique
     compilée fait foi (#2696, cas pilote Nexlink `desktop/host/**`) ; une
@@ -224,6 +241,43 @@ def required_verdicts(klass) -> int:
     return max(base, int(klass.get("reviews_floor") or 0))
 
 
+def _named_verdicts(klass, cls: str, project: str) -> int:
+    """Le compte par chemin, quand le classement porte la lecture du canon.
+
+    Une règle `train_reviews` qui **nomme** un chemin fixe son nombre : elle
+    fait foi contre `CRITICAL_SCOPE` (#3542). Un `critical: true` du canon
+    reste un plancher explicite pour tous les projets ; le plancher de classe
+    (`light_reviews` compris) s'applique toujours. Une règle `**` couvre tous
+    les chemins sans en nommer aucun : elle peut relever le compte (maximum),
+    jamais abaisser le plancher critique.
+    """
+    from . import lot_class
+    named = klass.get("train_reviews_paths") or {}
+    wide = int(klass.get("train_reviews_wide") or 0)
+    floor = (int(klass.get("light_reviews") or 0)
+             if cls == lot_class.LIGHT else SENSITIVE_REVIEWS)
+    highest = floor
+    for entry in klass.get("files") or ():
+        path = str(entry.get("path") or "")
+        explicit = entry.get("critical") is True
+        if not path:
+            if explicit:
+                highest = max(highest, CRITICAL_REVIEWS)
+            continue
+        count = named.get(path)
+        if count is None:
+            value = max(floor, wide)
+            if explicit or (project in ("", "ameesh")
+                            and _entry_critical(entry)):
+                value = max(value, CRITICAL_REVIEWS)
+        else:
+            value = max(floor, int(count), wide)
+            if explicit:
+                value = max(value, CRITICAL_REVIEWS)
+        highest = max(highest, value)
+    return highest
+
+
 def _scale_verdicts(klass) -> int:
     """Le compte du barème seul (classe et chemins), sans plancher de pilote."""
     from . import lot_class
@@ -236,6 +290,11 @@ def _scale_verdicts(klass) -> int:
         # canon §8 : « en cas de doute, le lot est sensible » — jamais léger,
         # jamais critique par le seul doute (#2394).
         cls = lot_class.SENSITIVE
+    # #3542 : un classement qui porte la lecture par chemin fait foi chemin
+    # par chemin ; les classements antérieurs (et les appelants qui n'ont que
+    # la classe) gardent la lecture globale ci-dessous.
+    if "train_reviews_paths" in klass and files:
+        return _named_verdicts(klass, cls, project)
     # #2696 : le canon compilé fait foi hors ameesh. Les motifs de secours
     # décrivent les chemins d'ameesh ; sur un lot Nexlink, `host-linux` (un
     # crate sous `desktop/`) ne devient pas un chemin de prod par `host[-_]`.

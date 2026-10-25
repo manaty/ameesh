@@ -21,7 +21,7 @@ BASE, HEAD = "a" * 40, "b" * 40
 class TrainAdmissionsTest(PgTestCase):
     def setUp(self):
         super().setUp()
-        self.project = types.SimpleNamespace(name="admission-test", repo=self.tmp, target="main")
+        self.project = types.SimpleNamespace(name="ameesh", repo=self.tmp, target="main")
         self.ops = storage.of(self.db).work
         self.history = mock.Mock(db=self.db, path=self.tmp)
         self.history.qualify.side_effect = lambda row, base, **kw: dict(
@@ -66,7 +66,9 @@ class TrainAdmissionsTest(PgTestCase):
             self.entry, BASE, required=2,
             klass={"class": "sensitive",
                    "files": [{"path": "content", "class": "sensitive",
-                              "rule": ["content"]}]})
+                              "rule": ["content"]}],
+                   "project": "", "train_reviews_paths": {},
+                   "train_reviews_wide": 0})
 
     def test_other_source_and_inactive_queue_rows_do_not_enter(self):
         foreign = self.enqueue(source="github.com/foreign/repository")
@@ -130,7 +132,9 @@ class TrainAdmissionsTest(PgTestCase):
     def test_policy_must_name_exact_subject_and_version_with_valid_review_count(self):
         valid = self.requirement(None, self.entry, BASE, self.tmp)
         for fields in (dict(lot=999999), dict(base=HEAD), dict(head=BASE), dict(policy_commit=""),
-                       dict(risk="release"), dict(risk="sensitive", reviews=0), dict(reviews=True)):
+                       dict(risk="release"), dict(risk="sensitive", reviews=0), dict(reviews=True),
+                       dict(train_reviews_paths={"content": 3}),
+                       dict(train_reviews_paths=[]), dict(train_reviews_wide=3)):
             self.requirement.side_effect = None
             self.requirement.return_value = dataclasses.replace(valid, **fields)
             with self.subTest(fields=fields), self.assertRaises(train.TrainError):
@@ -143,7 +147,8 @@ class TrainAdmissionsTest(PgTestCase):
             self.qualify()
 
     def recorded_admission(self, *, light=False, reviewed=True, path="content",
-                           reviews=2, reviewers=(("r1", "claude"), ("r2", "codex"))):
+                           reviews=2, reviewers=(("r1", "claude"), ("r2", "codex")),
+                           rule_paths=None):
         env = dict(os.environ, GIT_AUTHOR_NAME="fixture", GIT_AUTHOR_EMAIL="fixture@example.invalid",
                    GIT_COMMITTER_NAME="fixture", GIT_COMMITTER_EMAIL="fixture@example.invalid")
         def git(*args):
@@ -167,7 +172,7 @@ class TrainAdmissionsTest(PgTestCase):
                     default="light" if light else "sensitive", rules=[])}),
                 train_reviews=dict(schema="ameesh-train-reviews-policy/1", projects={
                     self.project.name: dict(rules=[] if light else [
-                        dict(paths=[path], reviews=reviews)])}))), fh)
+                        dict(paths=list(rule_paths or [path]), reviews=reviews)])}))), fh)
         git("add", "federation.yaml")
         base, first, head = commit("base"), commit("author"), commit("correction")
         self.admissions.policy = train_policy.Versioned(self.tmp, base, self.project.name)
@@ -378,20 +383,19 @@ class TrainAdmissionsTest(PgTestCase):
             self.admissions.qualify([entry], base, "packet")
 
     def test_critical_sensitive_lot_with_two_same_family_reviews_is_refused_at_admission(self):
-        # deploy/** is a critical (production) path: the merge gate requires two
-        # distinct model families even when the per-path count rule says one.
-        # Admission must apply that same reading before the freeze, not let the
-        # lot enter a packet and withdraw it after the freeze.
+        # #3542 : deploy/** est un chemin critique, mais aucune règle ne le
+        # nomme ici : une règle `**` à un avis ne baisse pas le plancher de
+        # deux familles. L'admission doit lire le même besoin que la porte.
         base, _, _, entry = self.recorded_admission(
             path="deploy/mise-a-jour/bascule.py", reviews=1,
-            reviewers=(("r1", "claude"), ("r2", "claude")))
+            reviewers=(("r1", "claude"), ("r2", "claude")), rule_paths=["**"])
         with self.assertRaisesRegex(train.TrainError, "no review verdict ok"):
             self.admissions.qualify([entry], base, "packet")
 
     def test_critical_sensitive_lot_with_two_families_is_admitted(self):
         base, first, head, entry = self.recorded_admission(
             path="deploy/mise-a-jour/bascule.py", reviews=1,
-            reviewers=(("r1", "claude"), ("r2", "codex")))
+            reviewers=(("r1", "claude"), ("r2", "codex")), rule_paths=["**"])
         proof = self.admissions.qualify([entry], base, "packet")["members"][0]
         self.assertEqual((proof["policy"]["risk"], proof["policy"]["reviews"]),
                          ("sensitive", 2))
