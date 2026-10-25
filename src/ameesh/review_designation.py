@@ -359,37 +359,71 @@ def candidates_from_registry(rows: Iterable[Mapping], *, loads: Optional[Mapping
 # included)
 # --------------------------------------------------------------------------
 
+def proven_families(author) -> set:
+    """Every model family **proven** for one author row (#3584).
+
+    A row carries its unique family in `family`; when an actor wrote under
+    several families (a codex agent that froze in a deepseek fallback session,
+    #2924 B6), `family` is empty by ambiguity and `families` keeps the whole
+    proven set. That set is a proof, not an unknown: the caller excludes each
+    of its families instead of waiting. Placeholders are not proofs, and a
+    `test_only` corrector (#3518) forbids only their name.
+    """
+    row = dict(author or {}) if isinstance(author, Mapping) \
+        else {"name": str(author or "").strip()}
+    if row.get("test_only"):
+        return set()
+    proven = set()
+    family = str(row.get("family") or "").strip().lower()
+    if family and family not in PLACEHOLDER_FAMILIES:
+        proven.add(family)
+    values = row.get("families")
+    if isinstance(values, (list, tuple, set, frozenset)):
+        for value in values:
+            value = str(value or "").strip().lower()
+            if value and value not in PLACEHOLDER_FAMILIES:
+                proven.add(value)
+    return proven
+
+
 def families_of(authors: Iterable) -> tuple[set, set]:
     """`(names, families)` forbidden, drawn from the authors of the frozen content.
 
-    An author is `{"name", "family"}`: the lot's assignee, each co-author and
-    each reviewer who pushed a correction onto the head (exact evidence #1465,
-    canon §2 and #2888). A `test_only` corrector (#3518) forbids only their
+    An author is `{"name", "family", "families"}`: the lot's assignee, each
+    co-author and each reviewer who pushed a correction onto the head (exact
+    evidence #1465, canon §2 and #2888). `families` carries every proven
+    family when the actor wrote under several (#2924 B6): each one is
+    forbidden (#3584). A `test_only` corrector (#3518) forbids only their
     name: their non-sensitive tests do not author the product delta.
-    An unknown family is not guessed: `select` then waits
-    instead of designating (see `unknown_families`).
+    An author with no proof is not guessed: `select` then waits instead of
+    designating (see `unknown_families`).
     """
     names, families = set(), set()
     for author in authors or ():
         row = dict(author or {}) if isinstance(author, Mapping) \
             else {"name": str(author or "").strip()}
         name = str(row.get("name") or "").strip()
-        family = str(row.get("family") or "").strip().lower()
         if name:
             names.add(name)
-        if family and family not in PLACEHOLDER_FAMILIES and not row.get("test_only"):
-            families.add(family)
+        families.update(proven_families(row))
     return names, families
 
 
 def unknown_families(authors: Iterable) -> list[str]:
-    """The authors whose real family is unknown (empty or a label).
+    """The authors without any proven real family (empty or a label).
 
-    Without their family, a reviewer's independence cannot be proven: a reviewer
-    of the same real family would be designated without anyone knowing."""
-    return sorted({str((a or {}).get("name") or "").strip() for a in authors or ()
-                   if str((a or {}).get("family") or "").strip().lower()
-                   in PLACEHOLDER_FAMILIES})
+    Without a proof, a reviewer's independence cannot be proven: a reviewer
+    of the same real family would be designated without anyone knowing. A
+    row whose `families` set is non-empty is **not** unknown (#3584): the
+    caller excludes each of those families."""
+    out = set()
+    for author in authors or ():
+        row = dict(author or {}) if isinstance(author, Mapping) \
+            else {"name": str(author or "").strip()}
+        name = str(row.get("name") or "").strip()
+        if name and not proven_families(row):
+            out.add(name)
+    return sorted(out)
 
 
 def names_of(rows: Iterable) -> set:

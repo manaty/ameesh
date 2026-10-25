@@ -92,6 +92,13 @@ def _mark_author(author) -> dict:
     auditable without pretending they carry an exact receipt."""
     row = {"name": str((author or {}).get("name") or ""),
            "family": str((author or {}).get("family") or "")}
+    families = (author or {}).get("families")
+    if isinstance(families, (list, tuple, set, frozenset)):
+        values = [str(value).strip() for value in families if str(value or "").strip()]
+        if values:
+            # #3584 : la marque garde tout l'ensemble prouvé, pas la seule
+            # réduction ambiguë à "".
+            row["families"] = values
     proof = str((author or {}).get("proof") or "").strip()
     if proof:
         row["proof"] = proof

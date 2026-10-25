@@ -435,6 +435,66 @@ class SelectionTest(unittest.TestCase):
         self.assertEqual(len(candidates(*rows, project="")), 3)
 
 
+class MultiFamilyAuthorTest(unittest.TestCase):
+    """#3584 — un auteur prouvé sous plusieurs familles exclut chacune d'elles.
+
+    Un agent codex gelé pendant la pause Codex tourne en repli deepseek : ses
+    gels antérieurs prouvent codex, sa session de repli deepseek. La lecture
+    rend `{family: "", families: ["codex", "deepseek"]}` : ce n'est ni une
+    famille inconnue, ni une ambiguïté à refuser.
+    """
+
+    MULTI = {"name": "cx1", "family": "",
+             "families": ["codex", "deepseek"]}
+
+    def test_the_proven_set_is_not_an_unknown_family(self):
+        self.assertEqual(rd.families_of([self.MULTI]),
+                         ({"cx1"}, {"codex", "deepseek"}))
+        self.assertEqual(rd.unknown_families([self.MULTI]), [])
+        self.assertEqual(rd.unknown_families([{"name": "cx1", "family": ""}]),
+                         ["cx1"])
+
+    def test_one_opinion_from_an_outside_family_is_designated(self):
+        picked = rd.select(
+            families=FAMILIES, required=1, authors=[self.MULTI],
+            candidates=candidates(
+                row("claude-one", harness="claude", session="claude"),
+                row("codex-one", harness="codex", session="codex"),
+                row("deepseek-one", harness="deepseek", session="deepseek")))
+        self.assertEqual(picked["state"], rd.DESIGNATED)
+        self.assertEqual([r["name"] for r in picked["reviewers"]], ["claude-one"])
+
+    def test_two_opinions_name_both_excluded_families_not_unknown(self):
+        picked = rd.select(
+            families=FAMILIES, required=2, authors=[self.MULTI],
+            candidates=candidates(
+                row("claude-one", harness="claude", session="claude"),
+                row("codex-one", harness="codex", session="codex"),
+                row("deepseek-one", harness="deepseek", session="deepseek")))
+        self.assertEqual(picked["state"], rd.WAITING)
+        self.assertEqual(picked["reviewers"], [])
+        self.assertEqual(picked["missing"], 1)
+        self.assertIn("codex", picked["why"])
+        self.assertIn("deepseek", picked["why"])
+        self.assertNotIn("unknown", picked["why"])
+
+    def test_a_manual_reviewer_of_an_excluded_family_does_not_cover_a_seat(self):
+        seats = rd.manual_seats(
+            [{"name": "manual-codex", "family": "codex"},
+             {"name": "manual-claude", "family": "claude"}],
+            authors=[self.MULTI], families=FAMILIES)
+        self.assertEqual(seats, [{"name": "manual-claude", "family": "claude"}])
+
+    def test_an_author_without_any_proof_still_waits(self):
+        picked = rd.select(
+            families=FAMILIES, required=1,
+            authors=[{"name": "cx1", "family": ""}],
+            candidates=candidates(
+                row("claude-one", harness="claude", session="claude")))
+        self.assertEqual(picked["state"], rd.WAITING)
+        self.assertIn("author family unknown", picked["why"])
+
+
 class NexlinkPolicyTest(unittest.TestCase):
     """La politique est par projet : Nexlink a ses propres règles (PR85)."""
 
@@ -547,6 +607,22 @@ class ApplyTest(unittest.TestCase):
             latest = self.port.latest_freeze(LOT["id"]) or {}
             args["freeze_sha"] = latest.get("sha") or SHA_A
         return rd.apply(LOT, **dict({"families": FAMILIES}, **args))
+
+    def test_a_multi_family_author_designates_outside_both_families(self):
+        # #3584 : l'auteur a gelé sous codex puis tourné en repli deepseek ;
+        # la désignation exclut les deux familles et prend claude.
+        self.authors = [{"name": "cx1", "family": "",
+                         "families": ["codex", "deepseek"]}]
+        self.pool = candidates(
+            row("claude-one", harness="claude", session="claude"),
+            row("codex-one", harness="codex", session="codex"),
+            row("deepseek-one", harness="deepseek", session="deepseek"))
+        out = self.apply(
+            policy={"rules": [{"paths": ["src/ameesh/**"], "reviews": 1}]},
+            required=1)
+        self.assertEqual(out["state"], rd.DESIGNATED)
+        self.assertEqual([r["name"] for r in out["reviewers"]], ["claude-one"])
+        self.assertEqual(out["authors"][0]["families"], ["codex", "deepseek"])
 
     def test_an_abbreviated_freeze_is_the_same_head(self):
         # #1775 N1 : un jalon frozen peut porter un SHA abrégé alors que le
