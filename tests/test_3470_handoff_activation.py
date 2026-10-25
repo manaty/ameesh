@@ -452,6 +452,20 @@ class H3FakeBridge(FakeBridge):
         return super().perform(host, request)
 
 
+class RoutedBridge(H3FakeBridge):
+    """H3 bridge double whose reconciliation reaches a real host journal."""
+
+    def __init__(self, effects):
+        super().__init__()
+        self.effects = effects
+
+    def perform(self, host, request):
+        if request['step'] == 'reconcile_effect':
+            self.requests.append(request)
+            return self.effects[host].perform(request)
+        return super().perform(host, request)
+
+
 class AdapterTest(PgTestCase):
     """The companion against a durable operation and the turn ledger."""
 
@@ -782,6 +796,56 @@ class AdapterTest(PgTestCase):
         self.assertIs(proof['quiesced'], True)
         self.assertEqual(proof['epoch'], pending)
         self.assertEqual(self.fake.requests[-1]['pending_step'], 'enable')
+
+    def test_reconcile_source_effects_fence_the_source_and_never_the_target(self):
+        # B1: stop_source, publish and restore_source run on the source, so
+        # their reconciliation must reach the source's journal. Reconciling
+        # the destination would return a simulated quiescence: nothing there
+        # carries the intent, and a delayed source start would stay possible.
+        fx = Fixture()
+        self.addCleanup(fx.close)
+        source = fx._effects(host='source',
+                             state=str(fx.root / 'state-source'))
+        target = fx._effects(host='target',
+                             state=str(fx.root / 'state-target'))
+        bridge = RoutedBridge({'source': source, 'target': target})
+        self.adapter.bridge = bridge
+        self.set_state('drained', release_revision=COMMIT, branch='main',
+                       commit=COMMIT, cwd='/w/dev')
+        for step in ('stop_source', 'publish', 'restore_source'):
+            with self.subTest(step=step):
+                operation = self.intent(step)
+                pending = operation['evidence']['pending_effect']['epoch']
+                # The controller reconciles under a newer epoch; that is the
+                # epoch the source journal advances to.
+                reconcile = dict(operation, controller_epoch=pending + 1)
+                seen = len(bridge.requests)
+                try:
+                    proof = self.adapter.reconcile_effect(reconcile)
+                finally:
+                    self.finish(operation)
+                self.assertIs(proof['ok'], True, proof)
+                self.assertIs(proof['quiesced'], True)
+                self.assertEqual(proof['epoch'], pending)
+                sent = bridge.requests[seen:]
+                self.assertEqual(len(sent), 1, sent)
+                self.assertEqual(sent[0]['host'], 'source')
+                self.assertEqual(sent[0]['step'], 'reconcile_effect')
+                # A delayed call from the interrupted epoch is refused by the
+                # source journal. It never reaches the destination.
+                stale = dict(sent[0], step=step,
+                             action_id=sent[0]['operation'] + ':' + step,
+                             controller_epoch=pending)
+                stale.pop('pending_step')
+                stale.pop('pending_epoch')
+                if step == 'publish':
+                    stale.update(repository=operation['plan']['repository'],
+                                 cwd='/work/source')
+                refusal = source.perform(stale)
+                self.assertIs(refusal['ok'], False, refusal)
+                self.assertEqual(refusal['reason'], 'revoked_epoch')
+        self.assertEqual({request['host'] for request in bridge.requests},
+                         {'source'})
 
     def test_account_divergence_refuses(self):
         operation = {'plan': {'account': 'main', 'session_account': 'other'}}

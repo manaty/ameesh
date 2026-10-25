@@ -112,6 +112,10 @@ NEXT_STEP = {'planned': 'prepare', 'drained': 'publish',
 #: H3 effects whose stored receipt must be re-observed on replay: a unit can
 #: die, or a source can be stopped, between the first reply and the replay.
 REOBSERVE = ('stop_source', 'restore_source', 'enable', 'verify')
+#: Effects that run on the source executor before the switch. Reconciling one
+#: of them must fence and quiesce that same host: the destination's journal
+#: never received the intent, so quiescing it would be a simulated proof.
+SOURCE_EFFECTS = frozenset(('stop_source', 'publish', 'restore_source'))
 
 _ACCOUNT = re.compile(r'^[A-Za-z0-9][A-Za-z0-9_.:/-]{0,127}$')
 _ALIAS = re.compile(r'^[A-Za-z0-9][A-Za-z0-9_.:/-]{0,127}$')
@@ -2340,11 +2344,14 @@ class HostAdapter:
         raise Refused('capability:recover_source')
 
     def reconcile_effect(self, operation):
-        """Quiesce the exact epoch of an interrupted host effect."""
-        try:
-            self._identity(operation, _target(operation))
-        except Refused:
-            return {'ok': False, 'reason': 'identity'}
+        """Quiesce the exact epoch of an interrupted host effect.
+
+        The effect ran on the host that would have executed it: the source for
+        the pre-switch ``stop_source``, ``publish`` and ``restore_source``,
+        the destination for the others. Reconciling the destination for a
+        source effect would fence nothing there and return a simulated
+        ``quiesced`` proof while a delayed source start stayed possible.
+        """
         pending = (operation.get('evidence') or {}).get('pending_effect')
         if (not isinstance(pending, dict)
                 or not isinstance(pending.get('name'), str)
@@ -2352,9 +2359,15 @@ class HostAdapter:
                 or isinstance(pending.get('epoch'), bool)
                 or pending['epoch'] < 1):
             return {'ok': False, 'reason': 'intent'}
+        host = (_source(operation) if pending['name'] in SOURCE_EFFECTS
+                else _target(operation))
+        try:
+            self._identity(operation, host)
+        except Refused:
+            return {'ok': False, 'reason': 'identity'}
         return self._call(operation, 'reconcile_effect', {
             'pending_step': pending['name'], 'pending_epoch': pending['epoch']},
-            target=_target(operation))
+            target=host)
 
     def _turn_proof(self, operation):
         """The destination's first authenticated turn, from the turn ledger.
