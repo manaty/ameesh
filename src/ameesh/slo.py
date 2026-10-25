@@ -92,9 +92,12 @@ STEPS: tuple = (
     # (`review_designation_activation.due_fixes`, le même calcul que les avis
     # dus de #3033) : un lot en qa avec un avis bloquant n'attend plus un
     # relecteur, il attend la correction de son assigné. 2 h, 1 h en P1 ;
-    # escalade §9 : ×1 assigné, ×2 pilote qui réassigne, ×3 bureau/auditeur.
+    # escalade §9 : ×1 assigné, ×2 pilote, ×3 bureau/auditeur. #3487 : la même
+    # étape mesure le correctif d'un lot revenu en build après son GO ; le
+    # porteur porte le correctif, et le niveau 3 ne prescrit pas de le
+    # réassigner (la réassignation perdrait son contexte).
     Step("blocked_freeze",
-         "blocking verdict → new freeze (fix)",
+         "fix owed after a review → new freeze",
          7200, 3600, LOT_EVENTS, True),
     Step("verdict_merge",
          "review GO → merge",
@@ -522,8 +525,16 @@ def lot_steps(item: dict, jalons: dict, events: Iterable[dict], *,
     suit le blocage. Le temps passé sous retenue n'est donc pas un retard du
     porteur, et un lot parqué volontairement ne fait plus crier « réassigner
     maintenant » vers le bureau à la levée.
+
+    #3487 : un lot revenu en `build` après un GO courant porte un correctif
+    dû. Le GO → fusion ne court plus — la tête relue n'est plus le travail
+    courant — et l'étape du correctif (`blocked_freeze`) repart de ce retour
+    en `build` ; `build_quiet` ne double plus cette mesure. L'alerte dit que
+    le porteur porte le correctif : au niveau 3, elle ne prescrit jamais de le
+    réassigner (la réassignation perd son contexte).
     """
     events = list(events)
+    fixes = list(fixes or ())
     now = time.time() if now is None else float(now)
     critical = int(item.get("priority") or 0) == 1
     state = item.get("state")
@@ -584,14 +595,34 @@ def lot_steps(item: dict, jalons: dict, events: Iterable[dict], *,
             # inventé — seules l'origine réelle et les durées mesurées restent.
             out.append(_row(step, ready, now=now, critical=critical))
 
-    if state == "build":
+    verdict, kind = jalons.get("verdict"), jalons.get("verdict_kind")
+    merged = jalons.get("merged")
+    # #3487 : un lot revenu en build après son GO courant porte un correctif
+    # dû. Le retour en build (transition, pas une note) date l'épisode ;
+    # l'étape du correctif le mesure et le GO → fusion ne court plus.
+    returned = None
+    if (state == "build" and kind == "ok" and verdict is not None
+            and jalons.get("verdict_current", True)):
+        latest_build = None
+        previous = None
+        for ev in sorted(events, key=lambda e: (float(e.get("created_ts") or 0.0),
+                                                int(e.get("id") or 0))):
+            seen = ev.get("state")
+            if (seen == "build" and previous != "build"
+                    and ev.get("created_ts") is not None):
+                latest_build = float(ev["created_ts"])
+            previous = seen
+        if latest_build is not None and latest_build >= float(verdict):
+            returned = latest_build
+
+    if state == "build" and returned is None and not fixes:
+        # #3487 : le correctif dû (avis bloquant ou retour en build) a sa
+        # propre horloge ; `build_quiet` ne la double pas.
         step = step_of("build_quiet")
         last = last_event_ts(item, events) or item.get("created_ts")
         if last is not None:
             out.append(_row(step, last, now=now, critical=critical))
 
-    verdict, kind = jalons.get("verdict"), jalons.get("verdict_kind")
-    merged = jalons.get("merged")
     if kind == "ok" and verdict is not None and jalons.get("verdict_current", True):
         step = step_of("verdict_merge")
         # #2919 : le p80 mesuré remplace la cible de la table sur le chemin
@@ -624,7 +655,8 @@ def lot_steps(item: dict, jalons: dict, events: Iterable[dict], *,
                             done_ts=round(float(merged), 3),
                             elapsed_s=int(max(0.0, float(merged) - float(verdict))),
                             target=target, escalate=not packet, **extra))
-        elif state not in ("merged", "promoted", "closed"):
+        elif state not in ("merged", "promoted", "closed", "build"):
+            # #3487 : revenu en build, le GO ne court plus (cf. plus haut).
             start = float(verdict)
             if outside_packet:
                 # #3341 : hors paquet, la CI de la tête gelée doit être verte
@@ -679,6 +711,17 @@ def lot_steps(item: dict, jalons: dict, events: Iterable[dict], *,
             out.append(_row(step, since, now=now, critical=critical,
                             blocked_by=str(fix.get("blocked_by") or ""),
                             sha=str(fix.get("sha") or ""), **extra))
+        if returned is not None and not fixes:
+            # #3487 : le correctif est dû depuis le retour en build (ou depuis
+            # la levée d'une retenue qui l'a suivi). La ligne dit que c'est le
+            # porteur qui porte le correctif, pas un avis bloquant.
+            since = returned
+            extra = {}
+            if lifted is not None and lifted > float(since):
+                extra["hold_released_ts"] = round(lifted, 3)
+                since = lifted
+            out.append(_row(step, since, now=now, critical=critical,
+                            returned=True, **extra))
 
     handover = handover_ts(item, events)
     if handover is not None and state not in ("merged", "promoted", "closed"):

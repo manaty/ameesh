@@ -626,28 +626,30 @@ def _slo_breach(alert: dict, *, level: int | None = None) -> str:
                     % (who or "?", verdict))
     elif alert.get("step") == "blocked_freeze":
         # #3288 : un avis bloquant n'attend pas un relecteur mais la correction
-        # de l'assigné ; le canon §9 escalade de l'assigné au pilote (qui
-        # réassigne), puis au bureau/à l'auditeur.
-        blocker = str(alert.get("blocked_by") or "a reviewer")
-        sha = str(alert.get("sha") or "")
+        # de l'assigné ; le canon §9 escalade de l'assigné au pilote, puis au
+        # bureau/à l'auditeur. #3487 : même horloge pour un lot revenu en build
+        # après son GO, et le niveau 3 ne prescrit jamais de réassigner le
+        # porteur qui porte le correctif (la réassignation perd son contexte).
+        blocker = str(alert.get("blocked_by") or "")
+        reason = ("the fix owed after returning to build" if alert.get("returned")
+                  else "the blocking verdict of %s" % (blocker or "a reviewer"))
         if level >= 3:
-            move = ("bureau or auditor: the pilot has not reassigned the fix — reassign the "
-                    "lot now to a free agent of the author's family (the fix needs it): "
-                    "ameesh work assign %d <agent>%s, then agent-mail send <agent> \"…\" "
-                    "--lot %d; do not wait for the pilot if it is itself late"
-                    % (lot, holder, lot))
+            move = ("bureau or auditor: %s is still owed by %s, who carries the fix — do "
+                    "not reassign the holder (a reassignment loses the context of the "
+                    "fix); push the holder and the pilot to deliver the new freeze, and "
+                    "ask the pilot to record a hold if it cannot advance (a pilot hold is "
+                    "what suspends this clock)" % (reason, who or "the assignee"))
         elif level >= 2:
-            move = ("pilot: the assignee has not corrected the blocking verdict of %s — "
-                    "reassign the lot to a free agent of the same family, or take the fix "
-                    "yourself (ameesh work assign %d <agent>%s, then agent-mail send "
-                    "<agent> \"…\" --lot %d)"
-                    % (blocker, lot, holder, lot))
+            move = ("pilot: %s — push %s; if the holder cannot deliver it, take the fix "
+                    "yourself or hand it over to a free agent of the same family (ameesh "
+                    "work assign %d <agent>%s, then agent-mail send <agent> \"…\" --lot "
+                    "%d)" % (reason, who or "the assignee", lot, holder, lot))
         else:
-            move = ("assignee: correct the blocking verdict of %s and freeze the new head "
-                    "(`ameesh work milestone %d frozen --sha <new head>`); if you moved "
-                    "the lot to build, re-enter qa (`ameesh work move %d qa`); if you "
-                    "cannot, say so (`ameesh work note %d \"hold: <reason>\"`) so the "
-                    "pilot hands the fix over" % (blocker, lot, lot, lot))
+            move = ("assignee: deliver %s and freeze the new head (`ameesh work "
+                    "milestone %d frozen --sha <new head>`); if you moved the lot to "
+                    "build, re-enter qa (`ameesh work move %d qa`); if you cannot, say "
+                    "so (`ameesh work note %d \"hold: <reason>\"`) so the pilot hands "
+                    "the fix over" % (reason, lot, lot, lot))
     elif level >= 3:
         move = ("bureau or auditor: reassign it now to a free agent (ameesh work assign "
                 "%d <agent>%s, then agent-mail send <agent> \"…\" --lot %d); do not wait "
