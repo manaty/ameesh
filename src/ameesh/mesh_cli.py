@@ -210,13 +210,16 @@ def _handoff_operator(cfg, db, args):
     """H6: one authorized controller step and a closed public response."""
     from . import handoffs, host_lifecycle
     work.corrector(cfg, db, args.actor, what="handoff operator", history=False)
-    if storage.of(db).handoffs.get(args.operation) is None:
+    operation = storage.of(db).handoffs.get(args.operation)
+    if operation is None:
         raise ValueError("unknown handoff")
     try:
         from . import handoff_factory
         binding = handoff_factory.load(db)
-        adapter = host_lifecycle._ReadyAdapter(db, binding.adapter,
-                                              binding.requirements_for)
+        adapter = binding.adapter
+        if "lifecycle_host" in operation.get("plan", {}):
+            adapter = host_lifecycle._ReadyAdapter(db, adapter,
+                                                  binding.requirements_for)
         if args.handoff_command == "retry":
             result = handoffs.retry(db, args.operation, adapter,
                                     renew_ttl=args.renew_ttl)
