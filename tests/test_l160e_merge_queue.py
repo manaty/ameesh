@@ -66,8 +66,9 @@ class FakeQueue(FakeWork):
                   withdrawn_after=None):
         if self.lots[item_id]["state"] in ("merged", "promoted", "closed"):
             return None
-        if withdrawn_after is not None and \
-                self.queue_withdrawn_since(item_id, withdrawn_after) is not None:
+        if withdrawn_after is not None and self.queue_withdrawn_since(
+                item_id, withdrawn_after, target=target,
+                frozen_id=frozen_id) is not None:
             return None
         self.clock += 1
         self.queue_rows[item_id] = {"work_item_id": item_id, "target": target,
@@ -120,14 +121,21 @@ class FakeQueue(FakeWork):
 
     def queue_remove(self, item_id, *, note, actor):
         self._append_note(item_id, note, actor)
-        removed = self.queue_rows.pop(item_id, None) is not None
-        if removed:
-            #: #3532 : l'instant du reçu typé `removed`
-            self.withdrawals.setdefault(item_id, []).append(self.clock)
-        return removed
+        row = self.queue_rows.pop(item_id, None)
+        if row is not None:
+            #: #3532 : l'instant du reçu typé `removed` ; #3550 : la cible et
+            #: le gel de l'entrée retirée, que le lecteur doit filtrer.
+            self.withdrawals.setdefault(item_id, []).append(
+                {"at": self.clock, "target": row.get("target"),
+                 "frozen_id": row.get("frozen_id")})
+        return row is not None
 
-    def queue_withdrawn_since(self, item_id, since_ts):
-        at = [t for t in self.withdrawals.get(item_id, ()) if t >= since_ts]
+    def queue_withdrawn_since(self, item_id, since_ts, *, target=None, frozen_id=None):
+        at = [w["at"] for w in self.withdrawals.get(item_id, ())
+              if w["at"] >= since_ts
+              and (target is None or w.get("target") is None
+                   or w.get("target") == target)
+              and (frozen_id is None or w.get("frozen_id") == frozen_id)]
         return max(at) if at else None
 
     def queue(self, target=None):

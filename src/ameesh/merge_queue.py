@@ -2530,7 +2530,8 @@ def enter(db, lot: int, *, repo: str, actor: str = "", ci="github", project=None
     #3532: `withdrawn_after` (epoch instant) is the gesture's own date — the
     fire's grant for its fallback. A take-out written since then is final
     for that gesture: `QueueWithdrawn`, checked again in the insertion's
-    transaction."""
+    transaction. #3550: only a take-out of the same target and freeze binds
+    the gesture; an old entry of another target or freeze does not."""
     # L165 (EP4) : l'entrée en file est un geste du pilote hors base (la file
     # poussera). Le bail élu est vérifié avant les lectures de préparation et
     # journalisé dans la transaction de l'écriture ; le radar et un humain ne
@@ -2580,10 +2581,12 @@ def enter(db, lot: int, *, repo: str, actor: str = "", ci="github", project=None
             row = add(tx)
     if row is None:
         if withdrawn_after is not None:
-            at = storage.of(db).work.queue_withdrawn_since(lot, withdrawn_after)
+            at = storage.of(db).work.queue_withdrawn_since(
+                lot, withdrawn_after, target=ready["target"],
+                frozen_id=ready.get("frozen_id"))
             if at is not None:
-                raise QueueWithdrawn("lot #%d was taken out of the queue at %s"
-                                     % (lot, _utc(at)))
+                raise QueueWithdrawn("lot #%d was taken out of the queue of %s at %s"
+                                     % (lot, ready["target"], _utc(at)))
         raise QueueError("lot #%d is no longer open" % lot)
     # L539 : la classe lue à l'entrée, rendue avec la ligne de file (lecture)
     row["class"] = ready.get("class")
