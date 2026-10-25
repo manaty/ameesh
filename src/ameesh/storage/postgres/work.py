@@ -1803,7 +1803,9 @@ class WorkItems(interface.WorkItems):
             # already holds its row (e.g. a fenced fire exception).
             if kind == "frozen":
                 _lock_migration_writer(tx, item_id)
-            items = tx.query("SELECT id, app, branch_target, state, workflow_ref FROM work_items"
+            items = tx.query("SELECT id, app, branch_target, state,"
+                             " coalesce(to_jsonb(work_items)->>'workflow_ref', '') AS workflow_ref"
+                             " FROM work_items"
                              " WHERE id = %s FOR NO KEY UPDATE", (int(item_id),))
             rows = tx.query(
                 """
