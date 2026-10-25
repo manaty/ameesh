@@ -383,7 +383,7 @@ database time; the observer's wall clock is only used to order samples.
 |---|---|---|---|
 | P1 | New holder | `T_expiry` = last `lease_expires_ts` read before `T0`; `T_claim` = first sample with another `lease_owner` and a higher `lease_epoch`; `T_turn` = first `turn.started` of the new holder | `T_turn - T0 < 5 min`; `T_claim` follows `T_expiry` by at most one 60 s election pass plus the rank delay (100 s with three candidates) |
 | P2 | Never two holders | every observer sample carries at most one `lease_owner`; `lease_epoch` only grows; the old holder's renew is refused; no turn of the old holder survives the claim | exactly 1 holder in every sample that has one; 0 during the expiry window is expected |
-| P3 | Epoch fence | one same-value fenced gesture from the old holder (`work assign` on the witness lot to its current assignee) must be refused, naming the current holder and epoch; no row changes and no `pilot.gesture` event for it | 100 % refused |
+| P3 | Epoch fence | one no-op fenced gesture from the old holder (`ameesh role canary` at the old epoch, §Fencing) must exit 1, naming the current holder, host and epoch, with no `pilot.gesture` event; the same at the new epoch exits 0 with exactly one canary event | old epoch refused, new epoch accepted |
 | P4 | Return to standby | after the host (or its executors) comes back while another holder is live: no claim, no turn, same holder and epoch for 5 min; the returning runner logs standby | yes |
 | P5 | Continuity | the new holder starts a turn and consumes a mail addressed to the role; the first hourly packet after the switch, containing the witness lot, is composed and merged by the elected pilot with no gesture from the stopped host; when EP5 timers are installed, the next `ameesh role run` tick runs under its epoch | `T_turn - T0 < 5 min`; the witness packet merges at the first hourly cutoff after the switch |
 | P6 | No double effect | one `turn.started` per transition; exactly one merge in the window (the witness lot); no duplicated mail, wake, `pilot.gesture`, packet or landing; no other lot merged | 0 duplicate; 1 witness merge |
@@ -547,19 +547,26 @@ the exercise is blocked, not failed.
    the first hourly packet with the witness lot; it must merge with no
    gesture from the stopped host. Record the merge time and the actor.
 5. **Fence (P3).** From any surviving shell, present the old epoch the way
-   an EP5 timer would and run the same-value canary:
+   an EP5 timer would and run the dedicated no-op canary (`ameesh role
+   canary`, added to the gesture table of §Fencing by #3433):
 
    ```sh
-   AMEESH_ROLE=<ROLE> AMEESH_LEASE_EPOCH=<OLD-EPOCH> \
-     ameesh work assign <WITNESS> <CURRENT-ASSIGNEE>
+   env -u AGENT_MAIL_NAME -u AMEESH_RUNNER_ID -u AGENT_MESH_RUNNER_ID \
+       -u AMEESH_LEASE_OWNER \
+       AMEESH_ROLE=<ROLE> AMEESH_LEASE_EPOCH=<OLD-EPOCH> \
+       ameesh role canary
    ```
 
-   It must be refused, name the current holder, host and epoch, and write
-   no `pilot.gesture` event. Then the positive control: the same command
-   with `<NEW-EPOCH>` must be accepted and journal one `pilot.gesture` at
-   the new epoch — this proves the refusal was not vacuous. Never attempt
-   `fire`, `land`, `merge`, `queue remove` or a decision creation as a drill
-   gesture: an accepted one would be a real effect.
+   It must exit 1, name the current holder, host and epoch, and write no
+   `pilot.gesture` event. Then the positive control, same command with
+   `<NEW-EPOCH>` and `--json`, must exit 0 and journal exactly one `canary`
+   gesture at the new epoch — this proves the refusal was not vacuous. Exit 2
+   means no live lease: that is not a fence result. The old `work assign
+   <witness> <current-assignee>` canary is **invalid**: the business check
+   ("already assigned") refuses it before the epoch gate, for both epochs.
+   The real pass requires #3433 deployed on the candidate hosts. Never
+   attempt `fire`, `land`, `merge`, `queue remove` or a decision creation as
+   a drill gesture: an accepted one would be a real effect.
 6. **Scenario B or B′.** Hand the role back (stop the VM holder, let the
    workstation claim on the free lease). Then either cut the workstation's
    database path — the tunnel or the DB endpoint only, never the LAN, with an
