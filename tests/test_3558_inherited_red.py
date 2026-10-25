@@ -11,8 +11,10 @@ qu'un rouge que le paquet n'introduit pas ne le retient pas.
 
 Témoins ici : rouge hérité seul → fusion + note au lot + incident de la cible ;
 un échec propre en plus → `pending` ; une part rouge sans test lu → `pending` ;
-une base sans relevé conclu → `pending`. Les autres cas (marqueur périmé, part
-annulée, check en attente, flux sans part) sont les verrous de la même porte.
+une base sans relevé conclu → `pending`. Les relectures B/P1 du 25/10 ajoutent
+les fermetures du relevé : ligne encore `running`, attempt différent du flux,
+dernier échec publié après la passe du veilleur, et provenance homonyme d'un
+autre run (jamais masquée par le seul nom).
 """
 from __future__ import annotations
 
@@ -24,13 +26,21 @@ from unittest import mock
 
 from ameesh import packet_automerge, storage, work
 
-from .test_2813_packet_auto_merge import (HEAD, LOT, NUM, SLUG, FakeGh,  # noqa: E402
-                                         Journal)
+from .test_2813_packet_auto_merge import (APP, HEAD, LOT, NUM, SLUG,  # noqa: E402
+                                         FakeGh, Journal)
 
 BASE_RUN = 300
 BASE_SHA = "9" * 40
 RUN = 200
 FAIL_TESTS = ("tests.test_a", "tests.test_b", "tests.test_c")
+
+
+def event(test, *, part="psql 1/16", attempt=1, run=RUN, statut="echec"):
+    """Une ligne `test` publiée dans la sortie d'un flux (`ci-flow.py`)."""
+    return {"v": 1, "type": "test", "execution": run, "attempt": attempt,
+            "part": part, "test": test, "statut": statut, "module": "",
+            "extrait": "", "rejouer": "", "duree_s": 1.0,
+            "ts": "2026-10-25T12:00:00Z"}
 
 
 def check(name, conclusion, *, run=RUN, workflow="tests", job=123):
@@ -61,6 +71,7 @@ class Ci:
 
     def __init__(self, *, inherited=True, tests=FAIL_TESTS, base=None):
         self.runs = {RUN: {"run_id": RUN, "head_sha": HEAD, "workflow": "tests.yml",
+                           "status": "failure", "run_attempt": 1,
                            "url": "https://github.com/%s/actions/runs/%d" % (SLUG, RUN)}}
         self.rows = {RUN: [{"part": "psql 1/16", "test": test, "inherited": inherited}
                            for test in tests]}
@@ -78,14 +89,52 @@ class Ci:
         return self.reference
 
 
+def _check_run(name, conclusion, *, details_url, suite, started):
+    """Un check run REST de la tête, tel que `commits/<sha>/check-runs`."""
+    return {"name": name, "status": "completed", "conclusion": conclusion,
+            "head_sha": HEAD, "app": {"id": APP},
+            "check_suite": {"id": suite}, "started_at": started,
+            "details_url": details_url,
+            "output": {"text": ""}}
+
+
 class InheritedGh(FakeGh):
-    """Le faux `gh` avec le rollup exact de la tête (tous workflows)."""
+    """Le faux `gh` avec le rollup exact de la tête (tous workflows), l'état
+    frais de l'exécution et les événements terminaux de ses flux."""
 
     def __init__(self, entries, **kwargs):
         super().__init__(tests="failure", **kwargs)
         self.entries = list(entries)
+        #: l'état frais de `actions/runs/<RUN>` : conclu en échec, attempt 1
+        self.run_state = {"id": RUN, "head_sha": HEAD, "status": "completed",
+                          "conclusion": "failure", "run_attempt": 1}
+        #: les événements terminaux relus ; None : ceux des lignes du faux CI
+        self.events = None
+        #: `total_count` de la page REST (un au-delà = lecture tronquée)
+        self.check_runs_total = None
+        #: des checks REST supplémentaires (provenance d'une autre suite/run)
+        self.check_runs_extra = []
+
+    def check_runs(self):
+        runs = [_check_run(
+            "tests", "failure",
+            details_url="https://github.com/%s/actions/runs/%d/job/123" % (SLUG, RUN),
+            suite=200, started="2026-10-25T12:00:00Z")]
+        by_part = {}
+        for ev in self.events or ():
+            by_part.setdefault(str(ev.get("part") or ""), []).append(ev)
+        for index, (part, events) in enumerate(sorted(by_part.items()), start=1):
+            run = _check_run(
+                "tests (flux) %s" % part, "failure",
+                details_url="https://github.com/%s/runs/%d" % (SLUG, 121135624400 + index),
+                suite=200 + index, started="2026-10-25T12:01:00Z")
+            run["output"] = {"text": "\n".join(json.dumps(ev) for ev in events)}
+            runs.append(run)
+        runs += [dict(run) for run in self.check_runs_extra]
+        return runs
 
     def answer(self, args):
+        path = args[-1] if args else ""
         if list(args[:2]) == ["pr", "view"]:
             self.calls.append(list(args))
             return 0, json.dumps({
@@ -93,6 +142,17 @@ class InheritedGh(FakeGh):
                 "headRefName": self.branch, "baseRefName": self.base,
                 "isDraft": False, "autoMergeRequest": None,
                 "statusCheckRollup": self.entries, "title": "packet"}), ""
+        if args[:1] == ["api"] and path.endswith("/actions/runs/%d" % RUN):
+            self.calls.append(list(args))
+            return 0, json.dumps(self.run_state), ""
+        if args[:1] == ["api"] and "/commits/" in path and "/check-runs" in path:
+            self.calls.append(list(args))
+            runs = self.check_runs()
+            total = len(runs) if self.check_runs_total is None else self.check_runs_total
+            page = {"total_count": total, "check_runs": runs}
+            # `_head_check_runs` lit `--paginate --slurp` : une liste de pages ;
+            # la relecture des événements lit la page du veilleur, seule.
+            return 0, json.dumps([page] if "--paginate" in args else page), ""
         return super().answer(args)
 
 
@@ -143,6 +203,11 @@ class InheritedRedTest(Journal):
                                            "contexts": ["tests", "lint"]}}
 
     def check(self, gh, **kwargs):
+        if getattr(gh, "events", 0) is None:
+            attempt = int(gh.run_state.get("run_attempt") or 1)
+            gh.events = [event(str(row.get("test")),
+                               part=str(row.get("part") or ""), attempt=attempt)
+                         for row in self.ci.rows.get(RUN, ()) if row.get("test")]
         return packet_automerge.check(None, None, LOT, gh=gh, **kwargs)
 
     def merged_notes(self):
@@ -200,6 +265,75 @@ class InheritedRedTest(Journal):
         self.assertEqual(gh.landed, [])
         self.assertEqual(self.created, [])
         self.assertEqual(self.merged_notes(), [])
+
+    def test_a_line_still_running_is_not_a_complete_reading(self):
+        # #3558 (ameesh-dev2 B/P1) : le veilleur CI et ce passage tournent
+        # séparément. La ligne n'a pas encore conclu : un échec propre publié
+        # après sa dernière passe n'est pas en base, et la part rouge du flux
+        # le masquerait. La ligne doit être conclue `failure`.
+        self.ci.runs[RUN]["status"] = "running"
+        gh = InheritedGh(self.rollup())
+        out = self.check(gh)
+        self.assertEqual(out["result"], "pending", out)
+        self.assertEqual(gh.landed, [])
+        self.assertEqual(self.created, [])
+
+    def test_a_flux_run_concluded_on_another_attempt_blocks(self):
+        # #3558 (ameesh-cx3 B/P1) : la ligne est restée sur l'attempt 1 tandis
+        # que la forge a conclu un attempt 2. Le flux lu est celui de l'attempt
+        # 2 : son rouge ne se prouve pas avec les échecs de l'attempt 1.
+        gh = InheritedGh(self.rollup())
+        gh.run_state["run_attempt"] = 2
+        gh.events = [event(test, attempt=1) for test in FAIL_TESTS]
+        out = self.check(gh)
+        self.assertEqual(out["result"], "pending", out)
+        self.assertEqual(gh.landed, [])
+        self.assertEqual(self.created, [])
+
+    def test_a_last_failure_published_after_the_watcher_pass_blocks(self):
+        # #3558 (ameesh-cx3 B/P1) : la ligne est conclue `failure` mais sa
+        # dernière passe n'a lu que les échecs hérités ; le flux terminal porte
+        # en plus un échec propre. Fusionner masquerait ce dernier échec.
+        gh = InheritedGh(self.rollup())
+        gh.events = [event(test) for test in FAIL_TESTS] + [event("tests.test_new")]
+        out = self.check(gh)
+        self.assertEqual(out["result"], "pending", out)
+        self.assertEqual(gh.landed, [])
+        self.assertEqual(self.created, [])
+
+    def test_a_truncated_terminal_read_blocks(self):
+        # La page de check runs du veilleur est tronquée (`total_count` plus
+        # grand) : elle ne prouve pas que tous les flux ont été lus. La porte
+        # ne suppose pas la complétude d'une lecture partielle.
+        gh = InheritedGh(self.rollup())
+        gh.check_runs_total = 999
+        out = self.check(gh)
+        self.assertEqual(out["result"], "pending", out)
+        self.assertEqual(gh.landed, [])
+
+    def test_a_same_app_failure_of_another_run_is_not_masked_by_name(self):
+        # #3558 (ameesh-cx3 B/P1) : la provenance REST porte un second `tests`
+        # FAILURE de la même application requise, mais d'une autre suite/run
+        # (999) absente du rollup prouvé. L'exemption ne vaut que pour
+        # l'identité exacte (nom, exécution) : ce rouge reste non prouvé.
+        gh = InheritedGh(self.rollup())
+        gh.check_runs_extra = [_check_run(
+            "tests", "failure",
+            details_url="https://github.com/%s/actions/runs/999/job/999" % SLUG,
+            suite=999, started="2026-10-25T12:30:00Z")]
+        out = self.check(gh)
+        self.assertEqual(out["result"], "pending", out)
+        self.assertEqual(gh.landed, [])
+        self.assertEqual(self.created, [])
+
+    def test_a_required_red_of_the_proven_run_is_masked_by_its_exact_identity(self):
+        # La contrepartie : la provenance du run prouvé (200) est bien
+        # masquée, y compris avec son application requise. Le second run plus
+        # récent (999) de l'autre témoin n'est pas là.
+        gh = InheritedGh(self.rollup())
+        out = self.check(gh)
+        self.assertEqual(out["result"], "merged", out)
+        self.assertEqual(gh.landed, [("main", HEAD)])
 
     def test_a_red_part_without_a_read_test_blocks(self):
         # `psycopg 1/8` rougit mais aucun événement de test n'a été lu : une

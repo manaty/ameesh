@@ -802,6 +802,60 @@ def _flux_part(name: str, prefix: str) -> str | None:
     return name[len(head):] if name.startswith(head) and len(name) > len(head) else None
 
 
+def _fresh_run(slug: str, rid: int, *, gh) -> dict | None:
+    """L'état frais d'une exécution GitHub (`status`, `conclusion`,
+    `run_attempt`, `head_sha`), ou None.
+
+    #3558 (ameesh-cx3 B/P1) : la base peut être en retard sur la forge — une
+    ligne encore `running`, ou un flux d'un autre attempt. Une lecture
+    impossible ne prouve rien : la porte reste fermée."""
+    try:
+        proc = gh(["api", "repos/%s/actions/runs/%d" % (slug, int(rid))])
+    except Exception:  # noqa: BLE001 - une lecture illisible ne prouve rien
+        return None
+    if proc.returncode != 0:
+        return None
+    try:
+        data = json.loads(proc.stdout or "{}")
+    except ValueError:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _fresh_events(slug: str, head: str, rid: int, attempt: int, *, gh) -> list[dict] | None:
+    """Les événements d'échec **terminaux** de l'attempt `attempt` de
+    l'exécution `rid`, relus sur la tête exacte.
+
+    #3558 (ameesh-cx3 B/P1) : `st.ci.failures` peut ne pas encore porter le
+    dernier échec publié, même quand le veilleur a conclu la ligne. Relire la
+    sortie des flux terminaux et la comparer aux lignes en base prouve que le
+    relevé est complet, au lieu de supposer que la dernière passe a tout vu.
+
+    La lecture est celle du veilleur (`commits/<sha>/check-runs`, une page de
+    100) ; une page tronquée (`total_count` au-delà) ne prouve pas la
+    complétude et rend None. None aussi si la lecture est absente ou
+    malformée."""
+    from . import ci as ci_mod
+    path = "repos/%s/commits/%s/check-runs?per_page=100" % (slug, quote(head, safe=""))
+    try:
+        proc = gh(["api", path])
+    except Exception:  # noqa: BLE001 - une lecture illisible ne prouve rien
+        return None
+    if proc.returncode != 0:
+        return None
+    try:
+        data = json.loads(proc.stdout or "{}")
+    except ValueError:
+        return None
+    if not isinstance(data, dict) or not isinstance(data.get("check_runs"), list):
+        return None
+    runs = [run for run in data["check_runs"] if isinstance(run, dict)]
+    total = data.get("total_count")
+    if type(total) is not int or total > len(data["check_runs"]):
+        return None
+    return ci_mod.events_of(runs, int(rid), int(attempt))
+
+
 def _inherited_red(db, *, slug: str, base: str, sha: str, view: dict, required,
                    project, gh) -> dict | None:
     """#3558 : la preuve qu'une tête n'est rouge que d'échecs **hérités** de
@@ -818,6 +872,12 @@ def _inherited_red(db, *, slug: str, base: str, sha: str, view: dict, required,
 
     La preuve est fermée par défaut :
 
+    * la ligne du veilleur est conclue `failure`, et la forge dit le même
+      run `completed` en échec, sur **le même attempt** et la même tête : un
+      flux d'un autre attempt, ou une ligne encore `running`, ne prouve rien ;
+    * les événements terminaux relus sur la tête pour cet attempt sont
+      exactement ceux enregistrés (part, test) : un dernier échec publié après
+      la passe du veilleur bloque tant qu'il n'est pas lu ;
     * chaque échec lu sur la tête porte `inherited`, et son test figure encore
       dans le dernier relevé conclu de la cible (un marqueur périmé, une base
       devenue verte ou sans relevé conclu ne rouvrent rien) ;
@@ -834,6 +894,10 @@ def _inherited_red(db, *, slug: str, base: str, sha: str, view: dict, required,
       rouge identifié (en attente, annulé, expiré, jamais conclu) bloque ;
     * les écarts hors CI de `fire.ready_pr` (brouillon, cible, gel, statuts
       exigés) sont relus : seul un rouge de CI peut être rouvert.
+
+    Le masquage est lié aux identités exactes `(nom, exécution)` : une entrée
+    de provenance homonyme d'une autre exécution (même application requise)
+    reste un rouge non prouvé (relecture ameesh-cx3 B/P1).
 
     Rend `{parts, tests, base_shas, runs}` (matière de la note), ou None."""
     from . import ci as ci_mod, radar
@@ -884,7 +948,9 @@ def _inherited_red(db, *, slug: str, base: str, sha: str, view: dict, required,
         # `ready_pr` refuse aussi sur un statut exigé : hors CI, rien n'est
         # rouvert (le brouillon, la cible et le gel sont relus plus haut).
         return None
-    explained: set[str] = set()
+    explained_names: set[str] = set()
+    explained_runs: set[tuple[str, int]] = set()
+    explained_rest: set[str] = set()
     seen: set[int] = set()
     bases: dict[int, dict] = {}
     parts: set[str] = set()
@@ -899,8 +965,41 @@ def _inherited_red(db, *, slug: str, base: str, sha: str, view: dict, required,
             if not isinstance(run, dict) \
                     or str(run.get("head_sha") or "").strip().lower() != head:
                 return None
+            # #3558 (ameesh-dev2, B/P1) : le veilleur CI et ce passage
+            # tournent séparément. Tant que `_conclude` n'a pas figé la ligne
+            # en `failure`, `st.ci.failures` peut n'avoir lu qu'un échec hérité
+            # et manquer le dernier échec propre. Une ligne conclue prouve
+            # qu'une dernière passe `_failures` a eu lieu (relecture cx3).
+            if str(run.get("status") or "") != "failure":
+                return None
+            attempt = int(run.get("run_attempt") or 1)
+            # #3558 (ameesh-cx3, B/P1) : la ligne peut être restée sur un
+            # attempt précédent pendant qu'un flux plus récent a déjà conclu.
+            # Seul un relevé de la forge terminé en échec, sur le **même
+            # attempt** et la même tête, prouve le rouge lu.
+            remote = _fresh_run(slug, rid, gh=gh)
+            if not isinstance(remote, dict) \
+                    or str(remote.get("status") or "") != "completed" \
+                    or str(remote.get("conclusion") or "").lower() \
+                    not in ("failure", "timed_out") \
+                    or int(remote.get("run_attempt") or 1) != attempt \
+                    or str(remote.get("head_sha") or "").strip().lower() != head:
+                return None
+            # #3558 (ameesh-cx3, B/P1) : relire les événements terminaux de cet
+            # attempt et les comparer au relevé en base. Un échec publié après
+            # la dernière passe du veilleur — même sur une ligne déjà conclue —
+            # n'est pas encore enregistré : le masquer fusionnerait par-dessus.
+            events = _fresh_events(slug, head, rid, attempt, gh=gh)
+            if not events:
+                return None
             failures = st.failures(slug, rid)
             if not failures or any(not f.get("inherited") for f in failures):
+                return None
+            recorded = {(str(f.get("part") or ""), str(f.get("test") or ""))
+                        for f in failures}
+            terminal = {(str(ev.get("part") or ""), str(ev["test"]))
+                        for ev in events}
+            if recorded != terminal:
                 return None
             workflow = str(run.get("workflow") or "")
             reference = st.base_failures(slug, base, workflow=workflow)
@@ -973,10 +1072,12 @@ def _inherited_red(db, *, slug: str, base: str, sha: str, view: dict, required,
                 "workflow": workflow, "url": ""}
             parts |= run_parts
             tests |= {str(f.get("test")) for f in failures if f.get("test")}
-        explained.add(str(entry.get("name") or entry.get("context") or ""))
+        name = str(entry.get("name") or entry.get("context") or "")
+        explained_names.add(name)
+        explained_runs.add((name, int(rid)))
     if not seen or not bases or not parts:
         return None
-    if not any(name in explained for name in required_names):
+    if not any(name in explained_names for name in required_names):
         # Sans un check **requis** rouge et prouvé, il n'y a pas de porte de
         # paquet à rouvrir : un flux ou un détail rouge seul n'est pas le cas
         # de #3558.
@@ -988,26 +1089,35 @@ def _inherited_red(db, *, slug: str, base: str, sha: str, view: dict, required,
         if radar.actions_run_id(slug, entry) is not None:
             continue
         if name == radar.AGGREGATE_DETAIL_CHECK:
-            explained.add(name)
+            explained_rest.add(name)
+            explained_names.add(name)
             continue
         part = _flux_part(name, prefix)
         if part is None or part not in parts:
             return None
-        explained.add(name)
+        explained_rest.add(name)
+        explained_names.add(name)
     # La relecture qui décide : les seules entrées masquées sont les rouges
     # prouvés ci-dessus. Tout autre écart de `ready_pr` — check absent, en
     # attente, jamais conclu, portier rouge non expliqué — reste dans les
     # portes relues et garde la fusion fermée, même à côté d'un héritage réel.
-    def masked(entry):
+    # #3558 (ameesh-cx3, B/P1) : l'identité est exacte — `(nom, exécution)` —
+    # jamais le seul nom. Une entrée de provenance homonyme d'une autre suite
+    # ou d'un autre run (même application requise) reste un rouge non prouvé.
+    def proven(entry) -> bool:
         name = str(entry.get("name") or entry.get("context") or "")
-        if name in explained \
-                and radar.check_result(entry) == radar.CI_NEGATIVE_RESULT:
+        rid = radar.actions_run_id(slug, entry)
+        if rid is None:
+            return name in explained_rest
+        return (name, int(rid)) in explained_runs
+
+    def masked(entry):
+        if proven(entry) and radar.check_result(entry) == radar.CI_NEGATIVE_RESULT:
             return _masked_green(entry)
         return entry
 
     def masked_run(run):
-        if str(run.get("name") or "") in explained \
-                and str(run.get("conclusion") or "").upper() == "FAILURE":
+        if str(run.get("conclusion") or "").upper() == "FAILURE" and proven(run):
             return _masked_green(run)
         return run
 
