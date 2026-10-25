@@ -1856,7 +1856,11 @@ class WorkItems(Domain):
     @abc.abstractmethod
     def queue(self, target: str | None = None) -> list[dict]:
         """L160e (0058): the queue rows (of `target`, else every target),
-        ranked first, then by arrival."""
+        ranked first, then by arrival.
+
+        #3560: `packet_allocated` is true when the row's current generation
+        carries the train's `packet` receipt: the train enrolled it and lands
+        it itself; the radar queue never lands it."""
 
     @abc.abstractmethod
     def set_branch_head(self, item_id: int, branch: str, head: str | None) -> bool:

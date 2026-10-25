@@ -1357,7 +1357,14 @@ def uncertain(db, now: float | None = None) -> list[dict]:
 
 def run_pass(cfg, db, project, report: dict, *, owner: str, locks=None, gh=_gh) -> list[dict]:
     """After the queue pass (`report["queue"]`): lands the head of each
-    queue of `project`, when it declares `land`. Never raises."""
+    queue of `project`, when it declares `land`. Never raises.
+
+    #3560: a row the train enrolled (`packet_allocated`, its `packet` receipt
+    on the current generation) is the train's: the train lands it with its
+    packet (`train_git.promote`). The queue pass never lands it, whatever its
+    state: landing it alone ejected it for want of a lot CI (`ci_required`,
+    impossible on `agent/**` under §11 bis), and the ejected row then refused
+    every later enrollment of the lot (#2376, #3537)."""
     if project.land == "off":
         return []
     out = []
@@ -1367,7 +1374,8 @@ def run_pass(cfg, db, project, report: dict, *, owner: str, locks=None, gh=_gh) 
         return [{"result": "error", "error": "%s: %s" % (type(exc).__name__, exc)}]
     for target, listed in sorted(((report.get("queue") or {}).get("targets") or {}).items()):
         head = next((rows[o["lot"]] for o in listed if o["lot"] in rows
-                     and rows[o["lot"]]["state"] in ("queued", "landing")), None)
+                     and rows[o["lot"]]["state"] in ("queued", "landing")
+                     and not rows[o["lot"]].get("packet_allocated")), None)
         if head is None:
             continue
         try:
@@ -1434,6 +1442,11 @@ def run(cfg, db, args) -> int:
         if not rows:
             raise LandError("lot #%d is not in a queue" % args.id)
         row = rows[0]
+        if row.get("packet_allocated"):
+            # #3560 : la ligne d'un lot inscrit par le train est portée par le
+            # train, jamais atterrie seule (même règle que `run_pass`).
+            raise LandError("lot #%d was enrolled by the train: its packet lands it, not the "
+                            "queue" % args.id)
         if row["state"] == "queued" and row.get("rank") != 1:
             raise LandError("lot #%d is ranked %s in the queue of %s, not 1"
                             % (args.id, row.get("rank") or "—", row["target"]))

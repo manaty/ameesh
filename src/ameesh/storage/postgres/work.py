@@ -226,6 +226,9 @@ def python_reviewer_audit(db):
 QUEUE_COLUMNS = """
     q.work_item_id, q.target, q.frozen_sha, q.state, q.rank, q.landing_sha, q.reason,
     q.queued_by, q.source, q.generation, q.frozen_id,
+    EXISTS (SELECT 1 FROM integration_train_queue_receipts tr
+            WHERE tr.work_item_id = q.work_item_id AND tr.generation = q.generation
+              AND tr.kind = 'packet') AS packet_allocated,
     extract(epoch from q.queued_at)::float8 as queued_ts,
     extract(epoch from q.updated_at)::float8 as updated_ts,
     w.title, w.priority, w.state as item_state, w.branch, w.assignee
@@ -2469,6 +2472,9 @@ class WorkItems(interface.WorkItems):
                 tx.execute("INSERT INTO integration_train_queue_receipts"
                            " (work_item_id, generation, frozen_id, kind) VALUES (%s, %s, %s, 'packet')",
                            (row["work_item_id"], row["generation"], row["frozen_id"]))
+                # #3560 : la ligne rendue est lue avant son reçu ; elle le porte
+                # déjà, comme toute relecture (`packet_allocated`).
+                row = dict(row, packet_allocated=True)
             return row
 
     def queue_update(self, item_id, *, state=None, rank=None, reason=None, landing_sha=None,

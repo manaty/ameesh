@@ -193,6 +193,38 @@ class Enrollment:
                 initial = False
         return dict(prepared=prepared, initial=initial)
 
+    def _refusal(self, subject, initial):
+        """#3560 (b): the exact cause of a refused enrollment, read after the
+        refusal (`queue_add` only returns None). An existing row comes first:
+        it forces `initial=False`, and an ejected one blocks every later
+        enrollment until it is removed and the lot is frozen again."""
+        lot = subject["work_item_id"]
+        try:
+            current = next((row for row in self.preparation.ops.queue(None)
+                            if row["work_item_id"] == lot), None)
+        except Exception:  # noqa: BLE001 - the cause stays generic, the refusal holds
+            current = None
+        if current is not None:
+            reason = str(current.get("reason") or "").strip()
+            return ("an existing queue row blocks it (state %s, generation %s, freeze %s%s): "
+                    "`ameesh work queue remove %s`, then freeze again on the same head"
+                    % (current.get("state") or "?", current.get("generation"),
+                       str(current.get("frozen_sha") or "")[:12],
+                       ", reason: " + reason[:160] if reason else "", lot))
+        try:
+            kinds = {receipt["kind"] for receipt in self.preparation.history.db.query(
+                "SELECT kind FROM integration_train_queue_receipts WHERE work_item_id = %s"
+                " AND frozen_id IS NOT DISTINCT FROM %s", (int(lot), subject.get("frozen_id")))}
+        except Exception:  # noqa: BLE001 - unreadable receipts: the generic cause
+            kinds = None
+        if kinds:
+            return ("the train's allocation of this freeze was withdrawn (%s receipt): freeze "
+                    "again to enroll it" % "/".join(sorted(kinds)))
+        if kinds is not None and initial is not True:
+            return ("queue-history-unknown (no receipt for this freeze and no qualified "
+                    "initial absence)")
+        return ("reservation lost, or the subject or freeze changed, or queue-history-unknown")
+
     def enroll(self, candidate, base, *, actor, lease=None):
         decision = self.decide(candidate, base)
         prepared, initial = decision["prepared"], decision["initial"]
@@ -202,9 +234,8 @@ class Enrollment:
             packet=prepared["item"], packet_initial=initial is True,
             actor=actor, note="packet enrollment; complete packet CI remains due", lease=lease)
         if row is None:
-            raise TrainError("packet enrollment #%s refused: reservation lost, subject, freeze or queue changed/withdrawn, "
-                             "or queue-history-unknown" %
-                             subject["work_item_id"])
+            raise TrainError("packet enrollment #%s refused: %s"
+                             % (subject["work_item_id"], self._refusal(subject, initial)))
         self.preparation.repository.check_members(subject["target"], [row])
         # This rereads the real generation and complete evidence after the
         # allocation transaction. The runtime repeats it before any effect.

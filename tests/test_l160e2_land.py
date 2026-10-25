@@ -173,6 +173,26 @@ class LocalLandTest(_Land):
         off = dataclasses.replace(self.project, land="off")
         self.assertEqual(land.run_pass(self.cfg, None, off, report, owner="r"), [])
 
+    def test_run_pass_never_lands_a_row_the_train_enrolled(self):
+        """#3560 : la ligne d'un lot inscrit par le train (reçu `packet` sur sa
+        génération) est portée par le train ; la file ne l'atterrit pas seule,
+        ne l'éjecte pas, et atterrit la tête suivante."""
+        self.queued(4)
+        self.queued(3)
+        self.fake.queue_rows[3]["rank"] = 2
+        self.fake.queue_rows[4]["packet_allocated"] = True
+        report = {"queue": {"targets": {"main": [{"lot": 4, "rank": 1, "state": "queued"},
+                                                 {"lot": 3, "rank": 2, "state": "queued"}]}}}
+        out = land.run_pass(self.cfg, None, self.project, report, owner="runner-1")
+        self.assertEqual([(o["lot"], o["result"]) for o in out], [(3, "landed")])
+        self.assertEqual(self.fake.queue_rows[4]["state"], "queued")
+        self.assertEqual(self.fake.queue_rows[4].get("reason") or "", "")
+        # en « landing » non plus : seul le train la fait avancer
+        self.fake.queue_rows[4]["state"] = "landing"
+        only = {"queue": {"targets": {"main": [{"lot": 4, "rank": 1, "state": "landing"}]}}}
+        self.assertEqual(land.run_pass(self.cfg, None, self.project, only, owner="runner-1"), [])
+        self.assertEqual(self.fake.queue_rows[4]["state"], "landing")
+
 
 class ReviewAfterMergeTest(LocalLandTest):
     """L539 : la fusion confirmée d'un lot léger ouvre le lot de relecture §2."""

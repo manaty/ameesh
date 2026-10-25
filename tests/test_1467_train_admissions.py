@@ -272,7 +272,7 @@ class TrainAdmissionsTest(PgTestCase):
             with self.assertRaisesRegex(train.TrainError, "admission withdrawn"):
                 enrollment.enroll(candidate, base, actor="fixture")
         self.assertEqual(self.ops.queue(None), [])
-        with self.assertRaisesRegex(train.TrainError, "changed/withdrawn"):
+        with self.assertRaisesRegex(train.TrainError, "allocation of this freeze was withdrawn"):
             enrollment.enroll(candidate, base, actor="fixture")
 
     def test_enrollment_rechecks_a_blocking_vote_committed_after_allocation(self):
@@ -310,7 +310,7 @@ class TrainAdmissionsTest(PgTestCase):
                                                  verdict=None, note="new freeze before write")
             return actual(*args, **kwargs)
         with mock.patch.object(preparation.ops, "queue_add", side_effect=refrozen):
-            with self.assertRaisesRegex(train.TrainError, "subject, freeze or queue changed/withdrawn"):
+            with self.assertRaisesRegex(train.TrainError, "reservation lost, or the subject or freeze changed"):
                 self.enrollment(preparation).enroll(
                     candidate, base, actor="fixture")
         self.assertEqual(self.ops.queue(None), [])
@@ -331,6 +331,24 @@ class TrainAdmissionsTest(PgTestCase):
         self.assertEqual(self.ops.queue(None), [])
         admitted = self.enrollment(preparation).enroll(candidate, base, actor="fixture")
         self.assertEqual(unknown.enroll(candidate, base, actor="restart"), admitted)
+
+    def test_3560_legacy_queue_row_is_not_marked_as_a_train_enrollment(self):
+        self.recorded_admission()
+        (row,) = self.ops.queue(None)
+        self.assertIs(row["packet_allocated"], False)
+
+    def test_3560_enrolled_row_is_marked_and_an_ejected_row_names_the_blocking_cause(self):
+        base, _, _, item, candidate, preparation, _ = self.enrollment_fixture()
+        admitted = self.enrollment(preparation).enroll(candidate, base, actor="fixture")
+        self.assertIs(admitted["entry"]["packet_allocated"], True)
+        (row,) = self.ops.queue(None)
+        self.assertIs(row["packet_allocated"], True)
+        # what the radar queue did to #2376 and #3537 before #3560
+        self.ops.queue_update(item, state="ejected", reason="ci_required: no CI on the frozen head",
+                              note="ejected", actor="radar")
+        with self.assertRaisesRegex(train.TrainError,
+                                    r"existing queue row blocks it \(state ejected.*ci_required"):
+            self.enrollment(preparation).enroll(candidate, base, actor="next-cutoff")
 
     def test_recorded_enrollment_survives_clone_loss_and_fresh_connection_then_reports_withdrawal(self):
         base, _, _, item, candidate, preparation, _ = self.enrollment_fixture()
@@ -359,7 +377,7 @@ class TrainAdmissionsTest(PgTestCase):
         refused = restarted.enroll_many([candidate], base, actor="restarted-fixture")
         self.assertEqual(refused["admitted"], [])
         self.assertEqual([r["work_item_id"] for r in refused["deferred"]], [item])
-        self.assertIn("changed/withdrawn", refused["deferred"][0]["reason"])
+        self.assertIn("allocation of this freeze was withdrawn", refused["deferred"][0]["reason"])
         self.assertEqual(self.ops.queue(None), [])
 
     def test_light_admission_with_no_verdict_uses_versioned_zero_review_policy(self):
