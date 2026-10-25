@@ -166,6 +166,22 @@ class BudgetGateTest(PgTestCase):
                              tools={"budget": "claude"})
         self.assertGreater(book.spent("budget", 3600), 0.0)
 
+    def test_un_tour_non_resident_attribue_les_messages_servis(self):
+        """#3452 : un harnais CLI n'écrit pas de mesure résidente ; ses messages
+        servis vont quand même au grand livre (`turn_costs.inputs`)."""
+        runner, worker = self._worker(plafond=10.0, harness="deepseek")
+        env = {"AMEESH_BIN_DIR": FAKEBIN, "AMEESH_TEST_LOG": self.turns_log}
+        try:
+            with mock.patch.dict(os.environ, env, clear=False):
+                self.assertTrue(worker.run_turn(
+                    {"kind": "prompt", "prompt": "tour", "ids": ["12"]}))
+        finally:
+            worker.watchdog_stop.set()
+        ligne = self.db.query(
+            "select inputs from turn_costs where agent = 'budget' "
+            "order by id desc limit 1")[0]
+        self.assertEqual(ligne["inputs"], ["12"])
+
     def test_echec_de_comptabilite_suspend_les_tours(self):
         """Verdict L13 B1 : sans grand livre, plus de tour (fail-closed)."""
         runner, worker = self._worker(plafond=10.0, harness="claude")

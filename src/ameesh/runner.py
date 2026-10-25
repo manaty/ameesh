@@ -6725,6 +6725,24 @@ class AgentWorker(threading.Thread):
             self._resident_failures = 0
         return True, None
 
+    def _write_served_inputs(self, harness: str, ids, session, status: str) -> None:
+        """#3452 : l'attribution des messages servis, pour un tour non résident.
+
+        Les tours de harnais CLI n'écrivent ni `resident.turn` ni
+        `resident.inputs` : la colonne `turn_costs.inputs` restait vide pour
+        eux, et `cost turns --message` ne reliait aucun tour à son courrier.
+        L'événement est le même que pour Claude natif (même type, même lecture
+        par `cost.record`) ; une écriture ratée ne fait jamais échouer le tour,
+        seule l'attribution est perdue."""
+        from . import resident_runner
+        event = resident_runner.inputs_attribution(
+            harness, session=session or "", turn=self._turn_id or "",
+            inputs=ids, status=status)
+        if event is not None and not resident_runner.write_usage_event(
+                self._path("events.jsonl"), event):
+            log_async("[%s] turn inputs event not written: message attribution "
+                      "lost for this turn" % self.name)
+
     def _resident_turn_end(self, rp) -> None:
         """Fin d'un tour résident : dépublié ; le processus reste pour le tour
         suivant, sauf s'il est mort, si son tour n'a pas fini, ou si le tour
@@ -7673,6 +7691,13 @@ class AgentWorker(threading.Thread):
                     if not ecrit:
                         error = error or erreur_flux
                         result_code = result_code or 1
+            else:
+                # #3452 : un tour non résident n'écrit aucune mesure résidente ;
+                # ses messages servis vont quand même au grand livre, sinon
+                # `cost turns --message` ne rend rien pour la majorité des tours.
+                self._write_served_inputs(
+                    harness, spec.get("ids") or (), session_new or session,
+                    "completed" if result_code == 0 and not error else "failed")
             # L498 : les descripteurs du READY ne survivent pas au tour (le
             # descripteur d'écriture est déjà fermé après le Popen).
             if ready_r is not None:
