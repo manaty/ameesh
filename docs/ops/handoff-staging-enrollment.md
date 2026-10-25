@@ -74,10 +74,11 @@ bureau dans le plan exact ; absence = refus. Pas d'appartenance `sudo`,
 
 Les permissions du contrôleur doivent être cohérentes avec le lecteur réel :
 un runner `ameesh` ne peut pas lire une clé root `0600`. Ne pas élargir la clé
-ni ajouter silencieusement le runner à un groupe. En outre, H2 exécute l'hôte
-local par son objet local : ce manifeste ne lui attribue pas automatiquement
-les privilèges root du dispatcher distant. Un besoin de privilège local non
-satisfait reste un refus, à résoudre explicitement avant qualification.
+ni ajouter silencieusement le runner à un groupe. H8 remplace l'appel local en processus par le socket Unix privilégié fixe
+([contrat et installation](../HANDOFF-LOCAL.md)). La décision #137536 b
+autorise son développement ; son enrôlement reste à nommer ici : UID du
+client, hôte, agents admis, SHA du runtime root, politique 0600 et unités
+systemd. Un socket absent ou refusé reste un préalable manquant.
 
 ## Clés et restrictions du canal
 
