@@ -276,6 +276,25 @@ class Agents(Domain):
         """
 
     @abc.abstractmethod
+    def retire(self, name: str, *, actor: str, reason: str) -> dict | None:
+        """#3460 : retire l'agent sous le verrou de sa ligne ; None s'il est inconnu.
+
+        Rend `{name, changed, blockers}`. Un bail vivant, un lot assigné non
+        clos ou une veille `ameesh watch` vers l'agent sont des `blockers`
+        (`{kind: lease|lot|watch, …}`) : rien n'est écrit tant qu'il en reste.
+        Seules `retired_at`, `retired_by` et `retired_reason` changent ; ni
+        statut, ni mode, ni bail. Déjà retiré : `changed` faux. Not exposed to
+        executors."""
+
+    @abc.abstractmethod
+    def restore(self, name: str, *, actor: str) -> dict | None:
+        """#3460 : l'inverse de `retire` ; None si l'agent est inconnu.
+
+        Efface les trois colonnes du retrait et rend `{name, changed}` ; un
+        agent qui n'était pas retiré rend `changed` faux. Not exposed to
+        executors."""
+
+    @abc.abstractmethod
     def harnesses(self) -> dict[str, str]:
         """L71 : `{agent: harnais}` pour tout le registre (comptabilité, jauges)."""
 
