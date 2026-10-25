@@ -5043,6 +5043,7 @@ class AgentWorker(threading.Thread):
             error="%s relay server credential failing" % auth_failure.STATUS_PREFIX,
             cost_usd=cost)
         self.last_activity = time.monotonic()
+        self._turn_end_mono = self.last_activity  # #3451
         return True
 
     def _pick_for_turn(self) -> dict | None:
@@ -5616,6 +5617,12 @@ class AgentWorker(threading.Thread):
         l'horloge de la base (`created_ts`) et depuis que cet exécuteur a vu
         le message (horloge monotone) : un décalage d'horloge entre l'hôte et
         la base ne retarde jamais un message de plus d'une fenêtre.
+
+        #3451 : la fenêtre court aussi depuis la fin du dernier tour de cet
+        exécuteur — un message arrivé pendant un long tour n'en rouvre pas un
+        2 à 6 s après le précédent, il attend que la fenêtre ait regroupé ce
+        qui suit. Le retard ajouté est au plus d'une fenêtre ; l'urgent et
+        l'humain n'attendent jamais.
         """
         window = self.mail_batch()
         if window <= 0 or any(mail.is_urgent(m) or self._from_human(m) for m in rows):
@@ -5629,6 +5636,9 @@ class AgentWorker(threading.Thread):
             kept[int(row["id"])] = first
             waited = max(waited, now - float(row.get("created_ts") or now), mono - first)
         self._batch_seen = kept  # les messages remis entre-temps sont oubliés
+        fin_tour = getattr(self, "_turn_end_mono", None)
+        if fin_tour is not None:
+            waited = min(waited, mono - fin_tour)
         if waited >= window:
             return True
         oldest = min(kept)
@@ -7899,6 +7909,7 @@ class AgentWorker(threading.Thread):
                     status="blocked", status_text=self.HOST_STATUS,
                     error="%s : %s" % (self.HOST_ERROR, hote), cost_usd=cost)
                 self.last_activity = time.monotonic()
+                self._turn_end_mono = self.last_activity  # #3451
                 if not self._power_texte:
                     self._host_not_ready(hote)
                 return False
@@ -7929,6 +7940,7 @@ class AgentWorker(threading.Thread):
                     status="blocked", status_text=texte,
                     error="%s %s" % (auth_failure.STATUS_PREFIX, raison_auth), cost_usd=cost)
                 self.last_activity = time.monotonic()
+                self._turn_end_mono = self.last_activity  # #3451
                 self._auth_note(nom_harnais, account, raison_auth, texte, turn=True)
                 return False
             session_fille_ecartee = bool(session and adapters.child_session_refused(error))
@@ -8014,6 +8026,7 @@ class AgentWorker(threading.Thread):
             error=error, cost_usd=cost,
         )
         self.last_activity = time.monotonic()
+        self._turn_end_mono = self.last_activity  # #3451
         self._backup_session(adapter, compte, session_new or session)
         if ok:
             self.session_turns += 1

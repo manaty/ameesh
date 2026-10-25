@@ -60,7 +60,9 @@ MAIL_REMAINING = ("(%d more recent message(s) waiting: not delivered yet, you wi
 MAIL_FOOTER = ("These messages are delivered here: no need to look for them with "
                "agent-mail inbox. To reply: agent-mail send <name> \"…\"; "
                "no bare acknowledgement (if needed use --ack, which does not wake "
-               "the recipient), no copy to the orchestrator for it to relay (--cc "
+               "the recipient), a report that expects nothing (nothing to do, "
+               "unchanged) with --info (read on the next turn, no wake-up), no "
+               "copy to the orchestrator for it to relay (--cc "
                "<name>: copy without waking), --urgent only if the recipient "
                "must act right away. "
                "Then continue your work without waiting for confirmation.")

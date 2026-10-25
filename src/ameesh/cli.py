@@ -22,7 +22,7 @@
                                                  refused to a name not in the registry (close
                                                  names suggested), to a stopped agent
                                                  (unless --queue) and from a stopped identity
-                       [--urgent] [--ack] [--cc NAME[,NAME…]] [--request-expires 2h]
+                       [--urgent] [--ack] [--info] [--cc NAME[,NAME…]] [--request-expires 2h]
                                                  a request deadline (`request_expires_ts`,
                                                  distinct from the signature TTL): after it,
                                                  no turn starts, the sender is notified and
@@ -30,7 +30,8 @@
                                                  L125: an idle agent is woken only
                                                  after a batching window
                                                  (AMEESH_MAIL_BATCH, 90 s); --urgent wakes
-                                                 it at once; --ack (acknowledgement)
+                                                 it at once; --ack (acknowledgement),
+                                                 --info (report, no action expected)
                                                  and --cc (copy, as an event)
                                                  do not wake: read on the next turn;
                                                  nor does "all" without --urgent
@@ -289,6 +290,10 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
         cc += [name.strip() for name in value.split(",") if name.strip()]
     ack = "--ack" in args
     args = [arg for arg in args if arg != "--ack"]
+    # #3451 : information sans geste attendu (compte rendu « rien à faire »,
+    # état inchangé) — lue au prochain tour du destinataire, sans réveil
+    info = "--info" in args
+    args = [arg for arg in args if arg != "--info"]
     # #964: `--assign` is the explicit gesture that lets a `--lot` assign a
     # FREE lot (or one held by a human) to the recipient, even outside the
     # orchestrator detection (L94 history included); never a lot held by an
@@ -362,6 +367,12 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
         print("--ack and --assign contradict each other: an acknowledgement does not hand over work",
               file=sys.stderr)
         return 2
+    if info and (urgent or marks or new_lot is not None or assign):
+        print("--info and --%s contradict each other: an information does not wake, "
+              "interrupt a turn nor hand over work"
+              % ("urgent" if urgent else marks[0] if marks
+                 else "new-lot" if new_lot is not None else "assign"), file=sys.stderr)
+        return 2
     sign = key_path is not None or "--sign" in args
     allow_structured = "--allow-structured" in args
     args = [arg for arg in args if arg not in ("--sign", "--allow-structured")]
@@ -374,7 +385,7 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
               "[--parent-lot ID]] "
               "[--kind request|reply|notify|event] "
               "[--urgent] [--verdict|--arbitration] "
-              "[--ack] [--cc NAME[,NAME…]] [--sign --key FILE] [--expires 24h] "
+              "[--ack] [--info] [--cc NAME[,NAME…]] [--sign --key FILE] [--expires 24h] "
               "[--request-expires 2h] [--queue]",
               file=sys.stderr)
         return 2
@@ -548,6 +559,8 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
                and lot is None and new_lot is None and kind in ("notify", "reply")
                and mail.looks_like_ack(text)):
         payload["ack"] = True
+    if info:
+        payload["info"] = True
     if request_expires is not None:
         # #2814 : échéance de REQUÊTE explicite, distincte de la TTL de
         # signature (`--expires`). Absolue en base, pour ne pas dépendre de
@@ -611,11 +624,15 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
                 int(item["id"]), quoi,
                 ": %s" % item.get("title") if linked["created"] else "",
                 " (branch %s)" % linked["branch"] if linked["branch"] else ""))
-        if payload.get("ack") and (linked["created"] or linked["assigned"]):
-            # L125 : un message qui confie un lot n'est jamais un accusé
-            del payload["ack"]
+        passif = [key for key in ("ack", "info") if payload.get(key)]
+        if passif and (linked["created"] or linked["assigned"]):
+            # L125 : un message qui confie un lot n'est jamais un accusé ;
+            # #3451 : ni une simple information
+            for key in passif:
+                del payload[key]
             print("warning: this message hands a work item to %s: it wakes it "
-                  "(not an acknowledgement)" % dest, file=sys.stderr)
+                  "(not %s)" % (dest, "an acknowledgement" if "ack" in passif
+                                else "an information"), file=sys.stderr)
 
     skipped: list[str] = []
     targets = bk.send(sender, dest, text, host=cfg.host, signed=signed,
@@ -662,6 +679,8 @@ def _send_note(dest: str, urgent: bool, payload: dict, cc: list[str]) -> str:
     note = ""
     if payload.get("ack"):
         note = " (acknowledgement: read on its next turn, without waking it)"
+    elif payload.get("info"):
+        note = " (information: read on its next turn, without waking it)"
     elif dest == "all" and not urgent and not payload.get("human"):
         note = (" (announcement: read on everyone's next turn, no wake-up; "
                 "--urgent to wake)")
