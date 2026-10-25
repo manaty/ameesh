@@ -367,6 +367,12 @@ class HandoffTest(PgTestCase):
         self.assertIsNone(handoffs.plan(self.db, registry.get(self.db, "dev"),
                                        limits_for=lambda host:self.limits, queued=False))
 
+    def test_plan_freezes_exact_session_account_for_credential_delivery(self):
+        registry.set_session(self.db, "dev", "synthetic-session", account="mesh")
+        self.assertEqual(self.candidate()['account'], 'mesh')
+        self.db.execute("UPDATE agent_registry SET session_account=NULL WHERE name='dev'")
+        self.assertEqual(self.candidate()['account'], '')
+
     def test_full_or_stale_target_and_unsynchronised_canon_refused(self):
         self.db.execute("UPDATE canon_state SET last_good_commit='different' WHERE host='target'")
         self.assertIsNone(self.candidate())
@@ -707,10 +713,20 @@ class HandoffTest(PgTestCase):
         self.assertNotEqual(missing.returncode, 0)
 
     def test_repository_credentials_cannot_enter_reservation(self):
-        for repository in ("https://user:secret@forge/app.git", "https://forge/app.git?token=secret"):
-            with self.assertRaises(handoffs.HandoffError):
+        for repository in ("https://user:secret@forge/app.git",
+                           "https://forge/app.git?token=secret",
+                           "https://JETON@forge/app.git",
+                           "http://JETON@forge/app.git",
+                           "git+https://JETON@forge/app.git",
+                           "ssh://JETON@forge/app.git",
+                           "JETON@forge:app.git"):
+            with self.subTest(repository=repository), \
+                    self.assertRaises(handoffs.HandoffError):
                 handoffs.request(self.db, self.candidate(), repository=repository)
         self.assertIsNone(self.api.handoffs.active("dev"))
+        op = handoffs.request(self.db, self.candidate(),
+                              repository="ssh://git@forge/app.git")
+        self.assertEqual(op["plan"]["repository"], "ssh://git@forge/app.git")
 
     def test_legacy_canon_move_cannot_bypass_active_handoff(self):
         op = self.request()

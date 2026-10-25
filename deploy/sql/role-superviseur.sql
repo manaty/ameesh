@@ -26,6 +26,7 @@
 --
 --   CREATE ROLE supervision_outil LOGIN IN ROLE ameesh_superviseur;
 --   ALTER ROLE supervision_outil SET default_transaction_read_only = on;
+--   ALTER ROLE supervision_outil SET jit = off;  -- #3503 : pas de compilation JIT
 --   -- mot de passe : \password supervision_outil (jamais dans un fichier versionné)
 --
 -- Ce qui est EXCLU, et pourquoi (le test tests/test_cluster.py vérifie que
@@ -250,7 +251,11 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         'workstream',
         -- L244 (0427) : rôles déclarés d'une fiche Agent/Persona (des noms,
         -- pas de contenu) — comme `projects`, le garde QA les lit
-        'roles'
+        'roles',
+        -- 0484 (#3460, décision #135690 a) : retrait d'un agent — un instant,
+        -- le nom de qui l'a retiré et la raison de cet état (même nature que
+        -- `stop_reason` et `status_text`, pas de contenu)
+        'retired_at', 'retired_by', 'retired_reason'
     ]),
     ('authenticator_syncs', ARRAY[
         'id', 'root_member', 'root_commit', 'commits', 'branch', 'trust',

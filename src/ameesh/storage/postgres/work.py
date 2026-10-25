@@ -1803,7 +1803,9 @@ class WorkItems(interface.WorkItems):
             # already holds its row (e.g. a fenced fire exception).
             if kind == "frozen":
                 _lock_migration_writer(tx, item_id)
-            items = tx.query("SELECT id, app, branch_target, state FROM work_items"
+            items = tx.query("SELECT id, app, branch_target, state,"
+                             " coalesce(to_jsonb(work_items)->>'workflow_ref', '') AS workflow_ref"
+                             " FROM work_items"
                              " WHERE id = %s FOR NO KEY UPDATE", (int(item_id),))
             rows = tx.query(
                 """
@@ -1815,9 +1817,13 @@ class WorkItems(interface.WorkItems):
                 (int(item_id), kind, sha or "", actor or "", verdict, note or ""),
             )
             milestone = rows[0]
-            if kind == "frozen" and items and items[0]["state"] in ("intake", "build"):
+            if (kind == "frozen" and items
+                    and not items[0].get("workflow_ref")
+                    and items[0]["state"] in ("intake", "build")):
                 # #3467: freezing enters review before the designation hook.
-                # Use the ordinary transitions (including Process guards),
+                # #3489: pinned lots keep their Process state; work.move
+                # rejects them. The milestone and designation still apply.
+                # Use the ordinary transitions for unpinned lots,
                 # under this lot's lock and transaction: a failing hook must
                 # roll back the state, journal and milestone together.
                 from ... import work

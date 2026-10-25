@@ -395,7 +395,9 @@ class Passage:
         read) would count reviews differently from the merge gate. No new
         packet is composed; a packet already in flight keeps its terminal
         path (CI, promotion or drain), and a paused train stays paused. The
-        pin never follows the gate by itself (#1467).
+        host refresh may first qualify the pin automatically when the audited
+        diff leaves the train rules unchanged (#3483); this guard refuses any
+        mismatch that remains after refresh.
         """
         if self.canon is None:
             return None

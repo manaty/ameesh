@@ -112,9 +112,17 @@ DO \$\$ BEGIN
   END IF;
 END \$\$;
 ALTER ROLE ameesh PASSWORD '$PW';
+-- #3503 : le JIT de Postgres compilait des plans à coût estimé élevé sur de
+-- très petites tables (_unreachable_lots : 42 s contre 0,2 s). Le client le
+-- coupe déjà dans chaque session ; ce réglage couvre les sessions qui ne
+-- passent pas par ameesh (psql, script de déploiement, nouveau rôle).
+ALTER ROLE ameesh SET jit = off;
 SQL
 runuser -u postgres -- psql -tAc "SELECT 1 FROM pg_database WHERE datname = 'ameesh'" | grep -q 1 \
   || runuser -u postgres -- createdb -O ameesh ameesh
+# même réglage pour la base : un NOUVEAU rôle qui s'y connecte en hérite.
+runuser -u postgres -- psql -v ON_ERROR_STOP=1 -q -d ameesh \
+  -c "ALTER DATABASE ameesh SET jit = off"
 unset PW
 
 # --- ameesh --------------------------------------------------------------------

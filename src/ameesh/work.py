@@ -1529,7 +1529,8 @@ def check_reviewer(db: Db, reviewer: str, *, cfg=None) -> str:
     un, normalisé comme pour l'assignation). Un nom inconnu est refusé : la
     revue attendrait quelqu'un que ni le courrier ni l'alerte ne peuvent
     joindre — le défaut que ce lot corrige. Un agent arrêté reste accepté : il
-    porte l'attente et sera relancé à sa reprise.
+    porte l'attente et sera relancé à sa reprise. Un agent retiré (#3460) est
+    refusé : il ne reviendra pas lire la demande.
     """
     from . import registry
 
@@ -1543,6 +1544,10 @@ def check_reviewer(db: Db, reviewer: str, *, cfg=None) -> str:
     row = registry.get(db, name)
     if row is not None:
         if isinstance(row, dict):
+            if row.get("retired_ts"):
+                raise WorkError("reviewer refused: %s is retired (ameesh agent retire, "
+                                "#3460): name an active reviewer"
+                                % (row.get("name") or name))
             return row.get("name") or name
         # Doublure de registre (tests #705 r2 N2) : pas un mapping, on garde
         # l'orthographe demandée, comme avant #423.
@@ -1818,7 +1823,8 @@ def check_assignee(db: Db, assignee: str, *, externe: bool = False, cfg=None) ->
     s'il est requis). `externe=True` (option `--externe`) force l'attribution
     à un agent EXTERNE, seulement s'il a un humain responsable : c'est lui qui
     portera l'attente et les alertes du lot. Un nom inconnu est toujours
-    refusé. Un agent arrêté reste accepté, avec un avertissement (`warning`).
+    refusé, un agent retiré aussi (#3460). Un agent arrêté reste accepté, avec
+    un avertissement (`warning`).
 
     L46 : un nom NU inconnu du registre mais qui désigne un humain connu
     (`known_human` : Member d'un canon, humain déclaré) est normalisé en
@@ -1853,6 +1859,11 @@ def check_assignee(db: Db, assignee: str, *, externe: bool = False, cfg=None) ->
         raise WorkError("assignment refused: %s is not in the registry (unknown "
                         "agent): nobody would work on this lot; %s"
                         % (name, _ASSIGNEE_HINT))
+    if row.get("retired_ts"):
+        # #3460 : un retiré n'est jamais réclamé, le lot dormirait
+        raise WorkError("assignment refused: %s is retired (ameesh agent retire, "
+                        "#3460): nobody would work on this lot; %s"
+                        % (row.get("name") or name, _ASSIGNEE_HINT))
     mode = row.get("mode") or "execute"
     responsible = (row.get("responsible") or "").strip() or None
     if externe:

@@ -225,6 +225,8 @@ copier() {
   ssh_vm "set -e
     runuser -u postgres -- psql -q -c 'DROP DATABASE IF EXISTS ameesh_essai'
     runuser -u postgres -- psql -q -c 'DROP DATABASE ameesh' -c 'CREATE DATABASE ameesh OWNER ameesh'
+    # #3503 : la nouvelle base coupe le JIT pour tout rôle qui s'y connecte
+    runuser -u postgres -- psql -q -d ameesh -c 'ALTER DATABASE ameesh SET jit = off'
     runuser -u postgres -- psql -q -d ameesh -v ON_ERROR_STOP=1 -c 'set role ameesh' -f /tmp/mesh.sql > /tmp/mesh-restauration.log
     rm -f /tmp/mesh.sql
     runuser -l ameesh -c 'ameesh migrate && ameesh doctor' | tail -5

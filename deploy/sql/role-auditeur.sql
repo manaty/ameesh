@@ -15,7 +15,8 @@
 -- Le rôle de connexion est membre des deux contrats et n'a aucun droit
 -- direct : ses droits propres sur le schéma sont retirés, seuls les contrats
 -- hérités comptent. `default_transaction_read_only=on` borne la session, mais
--- la garantie reste les GRANT de colonne des contrats. Le mot de passe n'est
+-- la garantie reste les GRANT de colonne des contrats. `jit=off` (#3503) évite
+-- de compiler les plans coûteux sur de petites tables. Le mot de passe n'est
 -- JAMAIS dans ce fichier : le propriétaire pose `\password <role>`, puis une
 -- ligne dans le `~/.pgpass` (0600) de l'hôte de l'auditeur.
 --
@@ -152,6 +153,11 @@ BEGIN
         EXECUTE format('GRANT %I TO %I', c, r);
     END IF;
     EXECUTE format('ALTER ROLE %I SET default_transaction_read_only = on', r);
+    -- #3503 : le JIT de Postgres compilait des plans à coût estimé élevé sur
+    -- de très petites tables (_unreachable_lots : 42 s contre 0,2 s). Un
+    -- NOUVEAU rôle de connexion le coupe aussi, pour ses sessions hors du
+    -- client ameesh (psql de l'auditeur).
+    EXECUTE format('ALTER ROLE %I SET jit = off', r);
 
     -- Read-back : l'appartenance, les attributs et la lecture seule sont
     -- relus dans les catalogues, pas supposés par les ordres ci-dessus.
@@ -212,8 +218,9 @@ BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_roles
                     WHERE rolname = r AND rolcanlogin AND rolinherit
                       AND coalesce(rolconfig, '{}')
-                          @> ARRAY['default_transaction_read_only=on']) THEN
-        RAISE EXCEPTION 'rôle % non LOGIN, non INHERIT ou lecture seule non posée ; transaction annulée', r;
+                          @> ARRAY['default_transaction_read_only=on',
+                                   'jit=off']) THEN
+        RAISE EXCEPTION 'rôle % non LOGIN, non INHERIT, lecture seule ou jit=off non posé ; transaction annulée', r;
     END IF;
 END
 $auditeur$;
