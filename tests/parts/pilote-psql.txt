@@ -50,6 +50,7 @@ test_2905_stale_spend_key  # stockage : un spend_key périmé après retour arri
 test_2951_github_observation  # stockage : fraîcheur ci_queue_state, silence GitHub et résolution par tout notificateur (#2951)
 test_3344_map_stale  # stockage : relevé ci_map_state (0480), alerte map_stale d'une carte de plus de 48 h (#3344)
 test_3397_alerts_lenteur  # stockage : index turn_costs du dernier tour (0481), porte fermée sans Git, alerte partagée (#3397)
+test_3512_slo_merged  # stockage : fusion observée avant état/composition et relecture avant courrier SLO (#3512)
 test_423_agent_aliases  # storage: alias namespace guards, audit, same fenced lease/session and canon sync (#423)
 test_1022_creneau_landed  # storage: une fusion lande le creneau de migration, une liberation sans atterrissage le libere (#1022)
 test_472_zombie_turn_close  # storage: worker close and live-review settlement of real zombie-only groups (#472)
