@@ -211,6 +211,15 @@ def _write(path, raw):
 
 
 def apply(cfg, db, project, *, lot, actor, gate_reader=None, record=None):
+    """Serialize manual and automatic writers of this host's train pins."""
+    directory = os.path.dirname(os.path.abspath(cfg.config_base or cfg.config_path))
+    with open(os.path.join(directory, ".train-canon.lock"), "a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        return _apply(cfg, db, project, lot=lot, actor=actor,
+                      gate_reader=gate_reader, record=record)
+
+
+def _apply(cfg, db, project, *, lot, actor, gate_reader=None, record=None):
     """Requalify the pin, write every declaring file, trace on the lot."""
     result, files = _plan(cfg, db, project, gate_reader=gate_reader)
     if result["state"] == "aligned":
@@ -276,23 +285,21 @@ def automatic(cfg, db, project, *, gate_reader=None):
     failure rolls the pin writes back. A host lock serializes executor profiles.
     """
     directory = os.path.dirname(os.path.abspath(cfg.config_base or cfg.config_path))
-    with open(os.path.join(directory, ".train-canon.lock"), "a") as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX)
-        def record(result):
-            row = dict(result, host=cfg.host, actor="train", event="canon-requalified",
-                       at=datetime.now(timezone.utc).isoformat(),
-                       guard=list(train_assembly.REQUALIFY_GUARD))
-            with open(os.path.join(directory, "train-canon.jsonl"), "a+",
-                      encoding="utf-8") as journal:
-                journal.seek(0, os.SEEK_END)
-                before = journal.tell()
-                try:
-                    journal.write(json.dumps(row, ensure_ascii=False) + "\n")
-                    journal.flush()
-                    os.fsync(journal.fileno())
-                except BaseException:
-                    journal.seek(before)
-                    journal.truncate()
-                    raise
-        return apply(cfg, db, project, lot=None, actor="train",
-                     gate_reader=gate_reader, record=record)
+    def record(result):
+        row = dict(result, host=cfg.host, actor="train", event="canon-requalified",
+                   at=datetime.now(timezone.utc).isoformat(),
+                   guard=list(train_assembly.REQUALIFY_GUARD))
+        with open(os.path.join(directory, "train-canon.jsonl"), "a+",
+                  encoding="utf-8") as journal:
+            journal.seek(0, os.SEEK_END)
+            before = journal.tell()
+            try:
+                journal.write(json.dumps(row, ensure_ascii=False) + "\n")
+                journal.flush()
+                os.fsync(journal.fileno())
+            except BaseException:
+                journal.seek(before)
+                journal.truncate()
+                raise
+    return apply(cfg, db, project, lot=None, actor="train",
+                 gate_reader=gate_reader, record=record)

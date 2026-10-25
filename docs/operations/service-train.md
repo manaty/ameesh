@@ -210,11 +210,15 @@ et requalification relue requise ; une porte illisible ne fournit aucun repli.
 
 L'écriture couvre `config.json` et tous les profils hérités qui déclarent une
 épingle ; les autres héritent. Le verrou `.train-canon.lock` dans le dossier
-de la configuration hôte sérialise les exécuteurs. Le journal durable
+de la configuration hôte sérialise les exécuteurs et la commande manuelle. Le journal durable
 `train-canon.jsonl` au même endroit conserve hôte, ancien et nouveau SHA,
 chemins du diff vérifié et liste de garde. Une erreur de journalisation
 restaure les fichiers. Le service recharge ensuite l'épingle effective (#3366).
-Le suivi ne modifie ni les références ni les règles de la porte.
+Le suivi ne modifie ni les références ni les règles de la porte. Un refus du suivi
+est signalé par projet, une fois par motif jusqu'au rétablissement. Le passage
+continue sur son épingle active et les autres projets poursuivent leur suivi.
+La garde de dérive refuse toute nouvelle composition non qualifiée ; les
+paquets déjà en vol peuvent atteindre leur état terminal.
 
 La commande pilote `python -m ameesh.train_cli --project <p> requalify --lot
 <lot>` reste disponible avec sa trace sur le lot ; `--dry-run` montre le diff.

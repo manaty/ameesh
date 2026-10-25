@@ -3,11 +3,12 @@
 import json
 import os
 import tempfile
+import threading
 import types
 import unittest
 from unittest import mock
 
-from ameesh import config, train_assembly, train_requalify
+from ameesh import config, train_assembly, train_requalify, train_runner
 from .test_3366_train_canon_requalify import _Repo
 
 
@@ -130,3 +131,61 @@ class AutomaticCanonTest(unittest.TestCase):
         self.assertEqual(passage.policy_commit, self.gate)
         self.assertEqual(passage.canon.pin, self.gate)
         self.assertEqual(changes[0]['previous'], self.pin)
+
+    def test_refusals_keep_passages_running_and_do_not_block_other_projects(self):
+        for index, failure in enumerate((
+                train_requalify.RequalifyError('rules change'),
+                train_requalify.RequalifyError('no gate canon commit'),
+                train_requalify.RequalifyError('not a descendant'),
+                OSError('journal failed'), RuntimeError('database unavailable'))):
+            with self.subTest(failure=str(failure)):
+                cfg, root, base, profile = self.host('refusal-%s' % index)
+                raw = self.read(base)
+                raw['train']['projects']['nexlink'] = dict(
+                    raw['train']['projects']['ameesh'], ci_contract='nexlink')
+                with open(base, 'w') as out:
+                    json.dump(raw, out)
+                cfg = config.load({'AMEESH_CONFIG': profile})
+                passages = [types.SimpleNamespace(
+                    project=types.SimpleNamespace(name=name),
+                    policy_path=self.repo.root, policy_commit=self.pin,
+                    canon=types.SimpleNamespace(pin=self.pin),
+                    scheduled_step=mock.Mock(return_value=({'result': 'ci'}, 200)))
+                    for name in ('ameesh', 'nexlink')]
+                report, refusals = mock.Mock(), {}
+                original = train_requalify.automatic
+                def qualify(fresh, db, project):
+                    if project == 'ameesh':
+                        raise failure
+                    return original(fresh, db, project,
+                                    gate_reader=lambda *args: (self.gate, ''))
+                def refresh():
+                    return train_assembly.reload(passages,
+                        expected=train_assembly.Settings.parse(cfg.train),
+                        config_path=cfg.config_path, automatic=True,
+                        refusals=refusals, report=report)
+                service = train_runner.Service(cfg, passages, stop=threading.Event(),
+                                               report=mock.Mock(), refresh=refresh)
+                with mock.patch.object(config, '_config_dir_default',
+                        return_value=os.path.join(root, 'runner-profiles')), \
+                     mock.patch('ameesh.scoped_db.ScopedDb'), \
+                     mock.patch.object(train_requalify, 'automatic', side_effect=qualify):
+                    for _ in range(2):
+                        self.assertEqual(service.pass_once(0, 100), 200)
+                        self.assertEqual(service.pass_once(1, 100), 200)
+                self.assertEqual(passages[0].policy_commit, self.pin)
+                self.assertEqual(passages[1].policy_commit, self.gate)
+                self.assertEqual(passages[0].scheduled_step.call_count, 2)
+                self.assertEqual(passages[1].scheduled_step.call_count, 2)
+                report.assert_called_once()
+                self.assertIn('ameesh', report.call_args.args[0])
+                self.assertIn(str(failure), report.call_args.args[0])
+
+    def test_manual_and_automatic_writers_take_the_same_lock(self):
+        cfg, root, *_ = self.host('locking')
+        with mock.patch.object(train_requalify.fcntl, 'flock') as lock, \
+             mock.patch.object(train_requalify, '_apply', return_value={}) as apply:
+            train_requalify.apply(cfg, object(), 'ameesh', lot=3483, actor='pilot')
+            self.automatic(cfg, root)
+        self.assertEqual(lock.call_count, 2)
+        self.assertEqual(apply.call_count, 2)
