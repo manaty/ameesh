@@ -1110,6 +1110,16 @@ class MailboxRefused(RuntimeError):
     L'appelant (`ameesh.undeliverable`) la rend en `Refused` lisible."""
 
 
+class RecipientRetired(MailboxRefused):
+    """#3460 : dépôt refusé, le destinataire est retiré (`ameesh agent retire`).
+
+    Le retrait est relu dans l'instruction même qui dépose, sous un verrou
+    partagé de la ligne du registre que `retire` prend en exclusif : un
+    retrait committé entre un précontrôle et le dépôt gagne, aucun message
+    n'est écrit. Une diffusion (« all », copies) saute le retiré ; un envoi à
+    un seul destinataire remonte le refus."""
+
+
 class Mailbox(Domain):
     """Messages durables ; le dépôt réveille le destinataire (NOTIFY en Postgres)."""
 

@@ -361,8 +361,11 @@ class HostScopeRules(ScopeRules):
             raise ScopeError("forbidden_scope", "seul l'agent du jeton de session")
 
     def _apply_mailbox_send(self, principal, kw, fence):
+        # #3460 : FOR SHARE, dans la transaction du dépôt — un retrait
+        # concurrent attend ce dépôt, ou l'a précédé et il est lu ici
         rows = self.db.query(
-            "SELECT retired_at IS NOT NULL AS retired FROM agent_registry WHERE name = %s",
+            "SELECT retired_at IS NOT NULL AS retired FROM agent_registry"
+            " WHERE name = %s FOR SHARE",
             (kw.get("recipient"),))
         if not rows:
             raise ScopeError("bad_args", "destinataire inconnu (pas de création implicite)")

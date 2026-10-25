@@ -11,9 +11,9 @@ import json
 import os
 from unittest import mock
 
-from ameesh import (agent_retire, registry, review_designation as rd,
-                    review_designation_activation as rda, storage, undeliverable,
-                    watch, work)
+from ameesh import (agent_retire, backend, db as db_mod, mail, registry,
+                    review_designation as rd, review_designation_activation as rda,
+                    storage, undeliverable, watch, work)
 
 from .support import PgTestCase
 
@@ -133,6 +133,58 @@ class RetireTest(PgTestCase):
             "SELECT recipient FROM agent_mailbox WHERE sender = 'other'")}
         self.assertIn("third", recipients)
         self.assertNotIn("worker", recipients)
+
+    def unread(self, name="worker"):
+        return storage.of(self.db).mailbox.unread(name, 10)
+
+    def test_a_direct_deposit_to_a_retired_agent_is_refused_by_the_storage(self):
+        # les notifications système passent par mail.send, sans check_send
+        self.retire()
+        with self.assertRaises(storage.RecipientRetired) as ctx:
+            mail.send(self.db, "ameesh", "worker", "notification système", kind="event")
+        self.assertIn("worker is retired", str(ctx.exception))
+        self.assertEqual(self.unread(), [])
+        # un nom hors du registre (humain, service) reste déposé
+        mail.send(self.db, "ameesh", "human:alice", "décision", kind="event")
+        self.restore()
+        mail.send(self.db, "ameesh", "worker", "de retour", kind="event")
+        self.assertEqual([m["body"] for m in self.unread()], ["de retour"])
+
+    def test_a_retirement_between_the_precheck_and_the_deposit_wins(self):
+        registry.upsert(self.db, "other", harness="deepseek", host=self.cfg.host,
+                        cwd=self.tmp)
+        undeliverable.check_send(self.cfg, self.db, sender="other", dest="worker")
+        self.retire()   # committé après le précontrôle
+        bk = backend.PgBackend(self.cfg, self.db)
+        with self.assertRaises(storage.RecipientRetired):
+            bk.send("other", "worker", "bonjour")
+        self.assertEqual(self.unread(), [])
+        # « all » lu avant le retrait : la diffusion saute le retiré, livre les autres
+        stale = [dict(row, retired_ts=None) for row in registry.overview(self.db)]
+        with mock.patch.object(backend.registry, "overview", return_value=stale):
+            delivered = bk.send("other", "all", "à tous")
+        self.assertNotIn("worker", delivered)
+        self.assertEqual(self.unread(), [])
+        # une copie à un retiré n'est pas déposée ; le message principal l'est
+        registry.upsert(self.db, "third", harness="deepseek", host=self.cfg.host,
+                        cwd=self.tmp)
+        self.assertEqual(bk.send("other", "third", "avec copie", cc=["worker"]), ["third"])
+        self.assertEqual(self.unread(), [])
+        self.assertEqual([m["body"] for m in self.unread("third")], ["avec copie"])
+
+    def test_a_deposit_in_progress_holds_the_retirement(self):
+        """Le dépôt prend la ligne du registre en partagé ; `retire` la prend
+        en exclusif : il attend le commit du dépôt, jamais l'inverse."""
+        # délai par connexion (paquet de démarrage) : vaut pour les deux pilotes
+        other = self.connect(statement_timeout_ms=500)
+        self.addCleanup(other.close)
+        with self.db.transaction() as tx:
+            mail.send(tx, "ameesh", "worker", "en cours", kind="event")
+            with self.assertRaises(db_mod.DbError) as ctx:
+                storage.of(other).agents.retire("worker", actor=ALICE, reason="course")
+            self.assertIn("statement timeout", str(ctx.exception))
+        self.assertIsNone(registry.get(self.db, "worker")["retired_ts"])
+        self.assertEqual([m["body"] for m in self.unread()], ["en cours"])
 
     def test_copy_to_a_retired_agent_is_refused_nothing_deposited(self):
         registry.upsert(self.db, "other", harness="deepseek", host=self.cfg.host,
