@@ -2195,6 +2195,10 @@ class WorkItems(Domain):
                       proof: dict | None = None) -> dict:
         """Écrit un jalon déclaré (`frozen`, `verdict`) et le rend.
 
+        Un gel depuis `intake` ou `build` entre en `qa` avant son callback
+        (#3467), par les transitions ordinaires, dans la même transaction.
+        Un état bloqué ou terminal n'est pas levé par ce geste.
+
         `on_frozen` (facultatif, #1617) : callback du gel, appelé dans la
         transaction du jalon `frozen` avec `(tx, milestone, after_commit)` ;
         `after_commit` reçoit les écritures de fil différées, que **l'appelant**
