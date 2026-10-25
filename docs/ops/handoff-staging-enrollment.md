@@ -80,6 +80,34 @@ autorise son développement ; son enrôlement reste à nommer ici : UID du
 client, hôte, agents admis, SHA du runtime root, politique 0600 et unités
 systemd. Un socket absent ou refusé reste un préalable manquant.
 
+### Frontière d'identité de `SO_PEERCRED`
+
+`SO_PEERCRED` rend le triplet `pid, uid, gid` du pair **au moment de la
+connexion**, fourni par le noyau. Le dispatcher H8 compare seulement l'`uid`
+au champ `uid` de `local.json` ; il ne peut donc pas distinguer deux sessions,
+deux processus ou deux agents qui partagent ce compte Unix. L'`uid` admis est
+celui du compte qui exécute les runners — aujourd'hui `ameesh`, partagé par
+toutes les sessions — et non une identité de session. Le champ `agent` de la
+requête est contrôlé contre la liste `agents` de la politique, mais il est
+**déclaré par l'appelant** : `SO_PEERCRED` ne l'authentifie pas. Un processus
+du même compte peut présenter n'importe quel agent admis ; les fences, époques,
+verrous et journaux H7 restent la barrière de session et d'effet. Le `pid` et
+le `gid` ne servent qu'au diagnostic et à l'autorisation de connexion par le
+groupe du socket ; ils ne sont jamais une identité d'agent.
+
+La décision d'enrôlement doit trancher explicitement :
+
+- soit un **UID dédié** au runner, distinct du compte des sessions, rend
+  `SO_PEERCRED` discriminant entre runners et sessions, au prix d'un compte
+  et d'un bus user supplémentaires ;
+- soit l'**UID partagé** est accepté, et le plan écrit que `SO_PEERCRED`
+  n'authentifie que ce compte, pas une session ni un agent : toute session
+  du compte peut soumettre une requête admise, dans les limites de la
+  politique, des fences et du journal H7.
+
+Aucun des deux choix n'est implicite ; le champ `uid` du manifeste signé porte
+la valeur retenue.
+
 ## Clés et restrictions du canal
 
 Le client H2 ne fournit **aucune commande distante** : le canal doit imposer
