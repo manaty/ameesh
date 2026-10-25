@@ -825,7 +825,19 @@ def lot_notice(item: dict, agent: str, idle_for_s: float) -> str:
                 item["title"], int(item["id"])))
 
 
-def lot_takeable(item: dict, today: str | None = None) -> bool:
+def _take_holds(db, rows, *, cfg=None):
+    """#3556 : une lecture ciblée des holds de pilote pour les candidats."""
+    from . import planned_waits
+    ids = [int(row["id"]) for row in rows]
+    if not ids:
+        return {}
+    events = storage.of(db).progress.lot_hold_events(
+        ids, planned_waits.HOLD_NOTE_PATTERNS)
+    return planned_waits.pilot_holds(db, events, cfg=cfg, strict=True)
+
+
+def lot_takeable(item: dict, today: str | None = None, *, holds=None,
+                 now: float | None = None) -> bool:
     """Un lot du projet peut-il être pris sans qu'on le confie ? Jamais un lot
     qui attend un humain (seuls les lots `intake` ou `build` sans assigné
     arrivent ici), de décision (demande de décision en attente, jalon de
@@ -834,6 +846,9 @@ def lot_takeable(item: dict, today: str | None = None) -> bool:
     début prévu est après `today` (« AAAA-MM-JJ »). #3447 : jamais un lot
     réservé à un exécutant externe déclaré (`external_executor`) — cette part
     attend son exécutant, elle n'est pas à la file.
+
+    #3556 : `holds` est la lecture groupée stricte des holds de pilote.
+    Un hold actif retient le lot jusqu'à sa levée ou son réveil échu.
 
     §4 : un lot `build` sans assigné n'est prenable que s'il a été RENDU à la
     file par la limite d'en-cours (`returned_to_queue` : la note de retour est
@@ -846,6 +861,11 @@ def lot_takeable(item: dict, today: str | None = None) -> bool:
         return False
     if item.get("state") == "build" and not item.get("returned_to_queue"):
         return False
+    if int(item.get("id") or 0) in (holds or {}):
+        wake = item.get("wake_ts")
+        stamp = time.time() if now is None else float(now)
+        if wake is None or float(wake) > stamp:
+            return False
     start = str(item.get("planned_start") or "")[:10]
     if today and start and start > today:
         return False
@@ -876,8 +896,11 @@ def roadmap_waiting(db: Db, project: str, *, now: float | None = None) -> list:
         return []
     stamp = time.time() if now is None else float(now)
     today = time.strftime("%Y-%m-%d", time.localtime(stamp))
-    out = [item for item in storage.of(db).work.unassigned_lots(200)
-           if _lot_project(item) == project and lot_takeable(item, today)
+    candidates = storage.of(db).work.unassigned_lots(200)
+    holds = _take_holds(db, candidates)
+    out = [item for item in candidates
+           if _lot_project(item) == project
+           and lot_takeable(item, today, holds=holds, now=stamp)
            and not review_lot.review_ref(item) and not is_review_followup(item)]
     if not out:
         return []
@@ -1315,7 +1338,9 @@ def auto_take(cfg, db, *, now: float | None = None, idle_s: float = DEFAULT_TAKE
     lots = st.work.unassigned_lots(200) if lot_room > 0 else []
     # un lot tout juste créé va sans doute être confié : on lui laisse le temps
     today = time.strftime("%Y-%m-%d", time.localtime(now))
-    lots = [item for item in lots if lot_takeable(item, today)
+    holds = _take_holds(db, lots, cfg=cfg)
+    lots = [item for item in lots
+            if lot_takeable(item, today, holds=holds, now=now)
             and now - float(item.get("created_ts") or now) >= LOT_MIN_AGE_S]
     room = 0
     if idle_s > 0 and max_per_hour > 0:
