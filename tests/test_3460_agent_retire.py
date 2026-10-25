@@ -120,6 +120,19 @@ class RetireTest(PgTestCase):
         self.restore()
         undeliverable.check_send(self.cfg, self.db, sender="other", dest="worker")
 
+    def test_broadcast_skips_a_retired_agent_even_with_queue(self):
+        for name in ("other", "third"):
+            registry.upsert(self.db, name, harness="deepseek", host=self.cfg.host,
+                            cwd=self.tmp)
+        self.retire()
+        for extra in ((), ("--queue",)):
+            out = self.cli("send", "all", "bonjour", "--from", "other", *extra)
+            self.assertEqual(out.returncode, 0, out.stderr)
+        recipients = {r["recipient"] for r in self.db.query(
+            "SELECT recipient FROM agent_mailbox WHERE sender = 'other'")}
+        self.assertIn("third", recipients)
+        self.assertNotIn("worker", recipients)
+
     def test_veille_retired_still_sends_watches_and_names_legacy_units(self):
         registry.upsert(self.db, watch.SENDER, harness="other", host="pc", cwd=None,
                         mode="externe")

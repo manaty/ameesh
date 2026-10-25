@@ -361,9 +361,14 @@ class HostScopeRules(ScopeRules):
             raise ScopeError("forbidden_scope", "seul l'agent du jeton de session")
 
     def _apply_mailbox_send(self, principal, kw, fence):
-        if not self.db.query("SELECT 1 AS ok FROM agent_registry WHERE name = %s",
-                             (kw.get("recipient"),)):
+        rows = self.db.query(
+            "SELECT retired_at IS NOT NULL AS retired FROM agent_registry WHERE name = %s",
+            (kw.get("recipient"),))
+        if not rows:
             raise ScopeError("bad_args", "destinataire inconnu (pas de création implicite)")
+        # #3460 : un agent retiré n'est destinataire de rien, même en file
+        if rows[0]["retired"]:
+            raise ScopeError("bad_args", "destinataire retiré (ameesh agent retire, #3460)")
 
     def _apply_mailbox_mark_delivered(self, principal, kw, fence):
         ids = self._int_ids(kw.get("ids"))
@@ -420,9 +425,12 @@ class HostScopeRules(ScopeRules):
     def _filter_agents_overview(self, principal, value):
         # annuaire réduit : ni consigne, ni dossier, ni bail, ni hôte.
         # `role` (contrat 1.0, gardé en 1.1) : le registre n'a pas de colonne
-        # « rôle » ; c'est l'équipe de la fiche (`team`), chaîne vide sinon
+        # « rôle » ; c'est l'équipe de la fiche (`team`), chaîne vide sinon.
+        # #3460 : un agent retiré n'y figure pas (ni destinataire, ni diffusé)
         rows = []
         for r in value or ():
+            if r.get("retired_ts"):
+                continue
             row = {k: r.get(k) for k in self.OVERVIEW_KEYS}
             row["role"] = r.get("team") or ""
             rows.append(row)

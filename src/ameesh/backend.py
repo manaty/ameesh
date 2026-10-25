@@ -289,7 +289,9 @@ class PgBackend:
             # L36 (0030) : « all » = l'équipe (ou le chantier) de l'expéditeur ;
             # un expéditeur sans équipe ni chantier garde la diffusion globale.
             own = projects.get(sender)
+            # #3460 : un agent retiré n'est jamais diffusé, même avec --queue
             team = [row for row in rows if row["name"] != sender
+                    and not row.get("retired_ts")
                     and (not own or projects.get(row["name"]) == own)]
             # un agent arrêté ne lit pas sa boîte : la diffusion ne la remplit pas
             stopped = [row["name"] for row in team
@@ -456,7 +458,9 @@ class MediatedBackend(PgBackend):
             rows = registry.overview(self.db)
             projects = {row["name"]: fil.agent_project(row) for row in rows}
             own = projects.get(sender)
+            # #3460 : l'annuaire réduit de la session omet déjà les retirés
             team = [row for row in rows if row["name"] != sender
+                    and not row.get("retired_ts")
                     and (not own or projects.get(row["name"]) == own)]
             stopped = [row["name"] for row in team
                        if row.get("status") == "stopped" and not include_stopped]

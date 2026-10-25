@@ -258,7 +258,9 @@ table : aucun écart n'est toléré d'un côté seulement.
   hors de ±(2^53 − 1) donnent 400 `bad_args`.
 - **`agents.overview`** (annuaire réduit de la session) : `name`, `role`,
   `team`, `chantier`, `canon_governed`, `status`. `role` vaut `team` : le
-  registre n'a pas de colonne « rôle ».
+  registre n'a pas de colonne « rôle ». Un agent retiré (`ameesh agent
+  retire`, #3460) n'y figure pas, et `mailbox.send` refuse de lui écrire
+  (400 `bad_args`).
 - **Lignes ouvertes au jeton de session** (`session: true`) :
   `mailbox.reserve`, `mailbox.deliver`, `mailbox.release` (le hook
   `agent-mail` dans la VM), `mailbox.unread` (`mail inbox`) et
