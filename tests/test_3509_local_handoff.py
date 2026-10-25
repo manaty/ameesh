@@ -207,6 +207,16 @@ class ContractOutcomeTest(unittest.TestCase):
         self.assertEqual(self.main(error, executed=True),
                          'local_handoff_uncertain pid=42 uid=1001\n')
 
+    def test_oversized_receipt_after_execute_is_uncertain(self):
+        error = dispatch.Refused('receipt')
+        self.assertEqual(self.main(error, executed=True),
+                         'local_handoff_uncertain pid=42 uid=1001\n')
+
+    def test_refusal_before_execute_is_refused(self):
+        error = dispatch.Refused('caller')
+        self.assertEqual(self.main(error, executed=False),
+                         'local_handoff_refused pid=42 uid=1001\n')
+
     def test_contract_error_before_execute_is_refused(self):
         error = dispatch.handoff_contract.ContractError('secret')
         self.assertEqual(self.main(error, executed=False),

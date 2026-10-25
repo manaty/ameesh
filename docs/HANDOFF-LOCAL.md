@@ -46,9 +46,10 @@ connexions actives par socket ; chaque requête d'un agent partage le verrou
 H7. Le journal systemd ne reçoit qu'une catégorie fixe (`refused`, `uncertain`
 ou `unavailable`) avec le PID et l’UID du pair obtenus du noyau (−1 avant
 identification), jamais le corps reçu, les chemins d'un refus ou les secrets.
-Une erreur de contrat survenue après l'appel de l'effet est classée `uncertain`,
-jamais `refused` : le reçu manquant peut suivre un effet, et le client
-réconcilie ; un refus sans effet reste `refused`. Les reçus et intents privés
+Une erreur de contrat ou un refus survenu après l'appel de l'effet (reçu
+invalide ou trop long) est classé `uncertain`, jamais `refused` : le reçu
+manquant peut suivre un effet, et le client réconcilie ; un refus sans effet
+reste `refused`. Les reçus et intents privés
 restent dans le journal H7 enrôlé.
 
 ## Installation par l'opérateur après relecture et enrôlement signé
