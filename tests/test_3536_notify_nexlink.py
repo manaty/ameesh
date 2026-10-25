@@ -643,6 +643,27 @@ class NotifierTest(unittest.TestCase):
         self.assertEqual(entry["channels"]["nx"]["attempts"], notifier.ncfg.max_attempts)
         self.assertEqual(len(notifier.state["fallback"]), 1)
 
+    def test_repli_avec_un_seul_essai_primaire(self):
+        """Cas 3 de dev4 : avec `max_attempts=1`, un échec transitoire du
+        primaire doit ouvrir le repli dans le même passage."""
+        ncfg = notify.parse_config({
+            "routes": {"human:owner": ["nx"]},
+            "max_attempts": 1,
+            "channels": {"nx": {"type": "nexlink", "url": MESH_URL,
+                                "token_env": "MESH_SECRET", "fallback": "ntfy"},
+                         "ntfy": {"type": "ntfy", "url": "https://ntfy.example",
+                                  "topic": "t"}}})
+        sender = FakeSender({"nx": [notify.ChannelError("timeout")]})
+        notifier = notify.Notifier(self.cfg, ncfg, notify.empty_state(),
+                                   sender=sender, log=self.logs.append,
+                                   clock=lambda: 1000.0)
+        entry = self.entry()
+        notifier._attempt(entry, "raised", 1000.0)
+        self.assertEqual([name for name, _ in sender.sent], ["nx", "ntfy"])
+        self.assertTrue(entry["channels"]["nx→ntfy"]["ok"])
+        self.assertEqual(len(notifier.state["fallback"]), 1)
+        self.assertEqual(entry["channels"]["nx"]["attempts"], 1)
+
     def test_repli_retente_meme_si_le_primaire_est_epuise(self):
         """B/P1 de la relecture cx1 : un repli temporairement en échec doit
         être retenté alors que le primaire est déjà à `max_attempts`."""

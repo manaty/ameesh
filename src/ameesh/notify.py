@@ -2820,7 +2820,11 @@ class Notifier:
         target = self.ncfg.channels.get(str(name))
         if target is None or target.name == channel.name:
             return
-        if not (error.permanent or int(st.get("attempts") or 0) >= 2):
+        # #3536 (relecture dev4/cx1, cas max_attempts=1) : le seuil de
+        # déclenchement ne doit pas dépasser le nombre d'essais configuré,
+        # sinon un échec transitoire du dernier essai n'ouvre jamais le repli.
+        threshold = min(2, self.ncfg.max_attempts)
+        if not (error.permanent or int(st.get("attempts") or 0) >= threshold):
             return
         key = "%s→%s" % (channel.name, target.name)
         if key in entry.setdefault("channels", {}):
