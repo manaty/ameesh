@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """H5: bind the single pinned handoff factory to the runner.
 
-The factory path is derived from this source tree, never from a message, a
-job, a document or an environment variable: an agent may not choose the code
-a controller runs. The runner binds the factory once, before ``readiness`` or
+The factory path comes from this source tree or installed prefix, never from
+a message, job, document or environment variable: an agent may not choose the code
+a controller runs. The runner binds the factory before ``readiness`` or
 ``advance_host`` use it, on its own controller connection; the companion's
 durable reads then share the controller's committed view. An absent source, an
 unsafe file or a refused enrollment leaves the binding empty and names the
@@ -16,6 +16,7 @@ import importlib.util
 import os
 from pathlib import Path
 import stat
+import sys
 
 #: fixed relative source of the factory, from the repository root
 FACTORY_RELATIVE = Path("deploy") / "mise-a-jour" / "fabrique-handoff.py"
@@ -35,8 +36,13 @@ class FactoryUnavailable(ValueError):
 
 
 def source_path() -> Path:
-    """The one factory source, relative to this installed tree."""
-    return Path(__file__).resolve().parents[2] / FACTORY_RELATIVE
+    """The one factory source in a checkout or versioned wheel environment."""
+    module = Path(__file__).resolve()
+    if module.parent.parent.name == "src":
+        return module.parents[2] / FACTORY_RELATIVE
+    # Wheel data is installed under the interpreter prefix, alongside the
+    # versioned environment. No cwd, document or environment selects code.
+    return Path(sys.prefix) / "share/ameesh/mise-a-jour/fabrique-handoff.py"
 
 
 def _trusted(path: Path) -> None:
