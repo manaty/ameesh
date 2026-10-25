@@ -121,6 +121,8 @@ class MiroirDesPartsTest(unittest.TestCase):
         # échec. Un ménage tolérant (`continue-on-error`) peut, lui, tourner
         # sur échec : il ne publie rien (quota d'artefacts).
         section = WORKFLOW.split("\n  carte:\n", 1)[1]
+        # #3546 : le ménage des mesures est un job à part, après `carte`
+        section = re.split(r"\n  [\w-]+:\n", section, maxsplit=1)[0]
         etapes = section.split("    steps:\n", 1)[1]
         # la première étape suit `steps:` sans saut de ligne : on le remet
         blocs = ("\n" + etapes).split("\n      - ")[1:]

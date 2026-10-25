@@ -260,6 +260,18 @@ def policy_sources(cfg, db, project: str, errors: list):
             yield source, commit, loaded
 
 
+def _declared_reviews(rules, paths) -> tuple[dict, int]:
+    """La lecture `train_reviews` du canon compilé, par chemin (#3542).
+
+    `mechanics.ReviewRule` porte les motifs (`.paths`) et leur nombre
+    (`.reviews`). Rend `(nommés, attrape-tout)` comme
+    `review.declared_reviews` : une règle qui nomme le chemin fixe son nombre ;
+    une règle `**` couvre tout sans nommer et ne peut que relever le compte.
+    """
+    return review.declared_reviews(
+        [(rule.paths, rule.reviews) for rule in rules or ()], paths)
+
+
 def _policy(cfg, db, project: str, paths: Sequence[str]) -> Policy | Unavailable:
     """The first configured canon that declares a usable policy for `project`."""
     if cfg is None or not str(getattr(cfg, "canon", "") or "").strip():
@@ -269,12 +281,16 @@ def _policy(cfg, db, project: str, paths: Sequence[str]) -> Policy | Unavailable
         for source, commit, loaded in policy_sources(cfg, db, project, errors):
             try:
                 need = loaded.reviews_for(paths)
-                # #2627 : le plancher critique de la porte de fusion
-                # (`merge_queue.required_verdicts`) fait partie du besoin. Un
-                # canon qui déclare un avis sur `exploitation.py` ou `db.py`
-                # n'abaisse pas les deux avis que la porte exigera au feu.
+                # #2627 / #3542 : le besoin que la porte de fusion calculera
+                # au feu. Le nombre d'une règle `train_reviews` qui nomme le
+                # chemin fait foi ; `CRITICAL_SCOPE` ne relève que les chemins
+                # qu'aucune règle ne nomme, et `**` ne l'abaisse jamais.
                 from . import merge_queue
                 classified = review.classify(loaded.review_policy, list(paths))
+                named, wide = _declared_reviews(loaded.rules, paths)
+                classified["train_reviews_paths"] = named
+                classified["train_reviews_wide"] = wide
+                classified["project"] = project
                 required = max(need.reviews, merge_queue.required_verdicts(classified))
                 # même classe que le lecteur compilé : le max des deux lectures
                 risk = max((need.risk, str(classified.get("class") or "light")),
