@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 from types import SimpleNamespace
 import tempfile
+import threading
 import unittest
 
 from ameesh import handoff_contract, handoffs, host_preflight
@@ -177,6 +178,14 @@ class FactoryTest(unittest.TestCase):
                 'codex/api': 'harnais.env#OPENAI_API_KEY',
                 'deepseek/api': 'harnais.env#DEEPSEEK_API_KEY',
             }},
+            'transports': {'transports': {
+                'target': {'host': 'target', 'address': '10.0.0.3', 'port': 22,
+                           'user': 'ameesh-handoff', 'host_key_alias': 'target',
+                           'known_hosts': str(self.root / 'known_hosts-target'),
+                           'known_hosts_sha256': 'a' * 64,
+                           'identity_file': str(self.root / 'id-target'),
+                           'seconds': 30},
+            }},
         }
         for name, value in self.documents.items():
             self.write(name, value)
@@ -252,6 +261,8 @@ class FactoryTest(unittest.TestCase):
             (self.agent(session_account='other'), self.host, 'identity:account'),
             (self.agent(harness='deepseek', session_account=None), 'target',
              'identity:account'),
+            (self.agent(harness='deepseek', session_account='a@b'), 'target',
+             'identity:account'),
         ]
         for agent, host, message in cases:
             with self.subTest(agent=agent, host=host):
@@ -275,6 +286,11 @@ class FactoryTest(unittest.TestCase):
 
     def test_repository_credentials_query_fragment_or_control_are_refused(self):
         for repository in ('https://user:secret@forge.example/r.git',
+                           'http://TOKEN@forge.example/r.git',
+                           'git+https://TOKEN@forge.example/r.git',
+                           'ssh://TOKEN@forge.example/r.git',
+                           'ssh://git:secret@forge.example/r.git',
+                           'https://git@forge.example/r.git',
                            'git@forge:manaty/r.git?ref=main',
                            'git@forge:manaty/r.git#fragment',
                            'git@forge:manaty/r\n.git'):
@@ -284,6 +300,38 @@ class FactoryTest(unittest.TestCase):
                 with self.assertRaisesRegex(factory_module.FactoryError,
                                             'document:repositories'):
                     self.factory()
+
+    def test_ssh_git_and_plain_urls_are_admitted_repository_identities(self):
+        for repository in ('git@forge:manaty/ameesh.git',
+                           'ssh://git@forge.example/manaty/ameesh.git',
+                           'https://forge.example/manaty/ameesh.git'):
+            with self.subTest(repository=repository):
+                self.write('repositories',
+                           {'repositories': {'ameesh': repository}})
+                try:
+                    self.factory()
+                finally:
+                    self.write('repositories', self.documents['repositories'])
+
+    def test_fifo_document_is_refused_without_blocking(self):
+        path = self.root / 'hosts.json'
+        path.unlink()
+        os.mkfifo(path, 0o600)
+        path.chmod(0o600)
+        outcome = []
+
+        def attempt():
+            try:
+                self.factory()
+            except factory_module.FactoryError as exc:
+                outcome.append(str(exc))
+
+        worker = threading.Thread(target=attempt, daemon=True)
+        worker.start()
+        worker.join(5)
+        self.assertFalse(worker.is_alive(),
+                         'the factory blocked on a FIFO document')
+        self.assertEqual(outcome, ['document:hosts'])
 
     def test_missing_document_is_refused_by_name(self):
         for name in factory_module.DOCUMENTS:
@@ -410,7 +458,8 @@ class FactoryTest(unittest.TestCase):
 
     def test_adapter_refuses_every_effect_it_has_not_implemented(self):
         value = self.factory()
-        for method in handoff_contract.EFFECTS:
+        for method in ('admit', 'enable', 'verify', 'restore_source',
+                       'recover_source', 'reconcile_effect'):
             with self.subTest(method=method):
                 request = operation()
                 if method == 'reconcile_effect':
@@ -418,12 +467,41 @@ class FactoryTest(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, 'capability:' + method):
                     getattr(value.adapter, method)(request)
 
+    def test_h2_effects_are_callable_not_simulated(self):
+        value = self.factory()
+        for method in ('inventory', 'revalidate', 'prepare', 'stop_source',
+                       'publish', 'transfer', 'session'):
+            with self.subTest(method=method):
+                self.assertTrue(callable(getattr(value.adapter, method, None)))
+
     def test_adapter_rejects_an_operation_outside_the_contract(self):
         value = self.factory()
         with self.assertRaisesRegex(factory_module.FactoryError, 'contract:prepare'):
             value.adapter.prepare(operation(controller_epoch=0))
         with self.assertRaisesRegex(factory_module.FactoryError, 'identity:host'):
             value.adapter.inventory('unknown')
+
+    def test_transport_document_is_exact_and_binds_every_other_host(self):
+        value = self.factory()
+        self.assertEqual(set(value.transports), {'target'})
+        broken = dict(self.documents['transports'])
+        broken['transports'] = {'target': dict(
+            self.documents['transports']['transports']['target'],
+            user='ameesh-release')}
+        self.write('transports', broken)
+        try:
+            with self.assertRaisesRegex(factory_module.FactoryError,
+                                        'document:transports'):
+                self.factory()
+        finally:
+            self.write('transports', self.documents['transports'])
+        self.write('transports', {'transports': {}})
+        try:
+            with self.assertRaisesRegex(factory_module.FactoryError,
+                                        'document:transports:target'):
+                self.factory()
+        finally:
+            self.write('transports', self.documents['transports'])
 
 
 if __name__ == '__main__':

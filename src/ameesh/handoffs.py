@@ -17,7 +17,6 @@ import subprocess
 import threading
 import time
 import uuid
-from urllib.parse import urlsplit
 
 from . import handoff_contract, projects, relocation, resources, storage
 from .db import DbError
@@ -152,6 +151,10 @@ def plan(db, agent, *, limits_for, queued=True, now=None, memory_bytes=4*GIB, di
                       "requires_gate": target_limits.get("lend") is not None,
                       "sampled_ts": rows[-1]["sampled_ts"], "harness": agent["harness"],
                       "account": agent.get("session_account") or "",
+                      # H2: the exact account the destination must authenticate.
+                      # It is enrolled per host/harness; the adapter refuses a
+                      # plan whose account is not the factory's admitted one.
+                      "session_account": agent.get("session_account") or "",
                       "reason": demand["reason"] if forced else ("source_pressure" if current_pressure else "spare_capacity"),
                       **({"lifecycle_host": demand["host"], "lifecycle_generation": demand["generation"]}
                          if forced else {}),
@@ -170,10 +173,7 @@ def request(db, candidate, *, repository, ttl=900, now=None):
         raise HandoffError("fresh plan, source lease and enrolled repository required")
     if not 30 <= ttl <= 7200:
         raise HandoffError("reservation TTL outside 30..7200 seconds")
-    parsed = urlsplit(repository)
-    if (parsed.password is not None or parsed.query or parsed.fragment
-            or (parsed.scheme == "https" and parsed.username is not None)
-            or any(ord(c) < 32 for c in repository)):
+    if not handoff_contract.repository_allowed(repository):
         raise HandoffError("repository reference contains credentials or control characters")
     for key in ("memory_bytes", "disk_bytes", "max_agents"):
         if isinstance(candidate.get(key), bool) or not isinstance(candidate.get(key), int) or candidate[key] <= 0:
