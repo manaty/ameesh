@@ -147,6 +147,8 @@ class AlarmOutcomeTest(unittest.TestCase):
 
         with mock.patch.object(dispatch, 'executor', return_value=companion), \
                 mock.patch.object(dispatch, 'policy', return_value={}), \
+                mock.patch.object(dispatch, 'consistent_policy'), \
+                mock.patch.object(companion, 'load_execution', return_value={}), \
                 mock.patch.object(dispatch, 'os',
                     mock.Mock(geteuid=mock.Mock(return_value=0),
                               dup=mock.Mock(return_value=123))), \
@@ -249,3 +251,172 @@ class EnrollmentPolicyTest(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     installer.main([action])
             run.assert_not_called()
+
+
+class InstallerTest(unittest.TestCase):
+    def setUp(self):
+        import tempfile
+        from contextlib import ExitStack
+        self.stack = ExitStack()
+        self.addCleanup(self.stack.close)
+        self.root = Path(self.stack.enter_context(tempfile.TemporaryDirectory()))
+        self.installer = load('installer-local-handoff')
+        self.module = mock.Mock()
+        self.module.protected.side_effect = lambda path, **kw: path
+        self.module.policy.return_value = {'uid': 1001, 'host': 'source', 'agents': ['dev']}
+        self.module.consistent_policy.side_effect = dispatch.consistent_policy
+        self.module.executor.return_value.load_execution.return_value = {
+            'host': 'source', 'accounts': {'dev': {}}}
+        for name, value in {'BASE': self.root / 'bundle', 'UNITS': self.root / 'units',
+                            'RECEIPT': self.root / 'policy/receipt.json',
+                            'ENDPOINT': self.root / 'endpoint'}.items():
+            self.stack.enter_context(mock.patch.object(self.installer, name, value))
+        for path in (self.installer.BASE / 'lib/systemd',
+                     self.installer.BASE / 'runtime/bin', self.installer.UNITS,
+                     self.installer.RECEIPT.parent, self.installer.ENDPOINT):
+            path.mkdir(parents=True, exist_ok=True)
+        self.installer.ENDPOINT.chmod(0o700)
+        for name in self.installer.NAMES:
+            (self.installer.BASE / 'lib/systemd' / name).write_text('unit ' + name)
+        (self.installer.BASE / 'runtime/bin/python').write_text('interpreter')
+        self.stack.enter_context(mock.patch.object(self.installer, 'bootstrap', return_value=self.module))
+        self.stack.enter_context(mock.patch.object(self.installer.os, 'geteuid', return_value=0))
+        # Model root metadata without requiring root; preserve actual types/modes.
+        original = Path.lstat
+        def root_info(path, *args, **kwargs):
+            from types import SimpleNamespace
+            info = original(path, *args, **kwargs)
+            return SimpleNamespace(st_uid=0, st_mode=info.st_mode)
+        self.stack.enter_context(mock.patch.object(Path, 'lstat', root_info))
+        import pwd
+        self.stack.enter_context(mock.patch.object(pwd, 'getpwnam',
+            return_value=mock.Mock(pw_uid=1001)))
+        self.run = self.stack.enter_context(mock.patch.object(self.installer, 'run'))
+
+    def install(self):
+        self.installer.main(['install'])
+
+    def test_install_modes_receipt_and_full_rollback(self):
+        import stat
+        self.install()
+        self.assertEqual(stat.S_IMODE(self.installer.ENDPOINT.stat().st_mode), 0o755)
+        self.assertEqual(stat.S_IMODE(self.installer.RECEIPT.stat().st_mode), 0o600)
+        for name in self.installer.NAMES:
+            self.assertEqual(stat.S_IMODE((self.installer.UNITS / name).stat().st_mode), 0o644)
+        self.run.assert_has_calls([mock.call('daemon-reload'),
+                                  mock.call('enable', '--now', self.installer.NAMES[0])])
+        self.installer.main(['rollback'])
+        self.assertFalse(self.installer.RECEIPT.exists())
+        self.assertEqual(list(self.installer.UNITS.iterdir()), [])
+        self.run.assert_any_call('stop', 'ameesh-handoff-local@*.service')
+        self.assertTrue(self.installer.BASE.exists())
+
+    def test_bundle_rejects_pth_fifo_socket_and_symlink_directory(self):
+        for kind in ('pth', 'fifo', 'socket', 'directory_link'):
+            path = self.installer.BASE / 'runtime' / ('bad.pth' if kind == 'pth' else 'bad')
+            channel = None
+            try:
+                if kind == 'pth':
+                    path.write_text('import evil')
+                elif kind == 'fifo':
+                    os.mkfifo(path)
+                elif kind == 'socket':
+                    channel = socket.socket(socket.AF_UNIX)
+                    channel.bind(str(path))
+                else:
+                    path.symlink_to(self.installer.BASE / 'lib', target_is_directory=True)
+                with self.subTest(kind=kind), self.assertRaises(ValueError):
+                    self.install()
+                self.run.assert_not_called()
+            finally:
+                if channel:
+                    channel.close()
+                path.unlink()
+
+    def test_missing_socket_still_stops_instances_and_removes_service(self):
+        self.install()
+        (self.installer.UNITS / self.installer.NAMES[0]).unlink()
+        self.run.reset_mock()
+        self.installer.main(['rollback'])
+        self.run.assert_has_calls([mock.call('stop', self.installer.NAMES[0], absent_ok=True),
+                                   mock.call('stop', 'ameesh-handoff-local@*.service'),
+                                   mock.call('daemon-reload')])
+        self.assertEqual(list(self.installer.UNITS.iterdir()), [])
+        self.assertFalse(self.installer.RECEIPT.exists())
+
+    def test_partial_install_receipt_rolls_back_without_socket(self):
+        service = self.installer.NAMES[1]
+        path = self.installer.UNITS / service
+        path.write_text('partial')
+        self.installer.RECEIPT.write_text(json.dumps({'units': {
+            service: self.installer.digest(path)}}))
+        self.installer.main(['rollback'])
+        self.run.assert_any_call('stop', 'ameesh-handoff-local@*.service')
+        self.assertFalse(path.exists())
+
+    def test_activation_failure_leaves_receipt_for_rollback(self):
+        self.run.side_effect = [None, OSError('systemctl failed')]
+        with self.assertRaises(OSError):
+            self.install()
+        self.assertTrue(self.installer.RECEIPT.exists())
+        self.run.side_effect = None
+        self.installer.main(['rollback'])
+        self.assertEqual(list(self.installer.UNITS.iterdir()), [])
+
+    def test_changed_unit_prevents_removal(self):
+        self.install()
+        path = self.installer.UNITS / self.installer.NAMES[1]
+        path.write_text('operator modified')
+        self.run.reset_mock()
+        with self.assertRaisesRegex(ValueError, 'unit changed'):
+            self.installer.main(['rollback'])
+        self.run.assert_not_called()
+        self.assertTrue(self.installer.RECEIPT.exists())
+
+    def test_install_refuses_existing_units_and_inconsistent_policy(self):
+        path = self.installer.UNITS / self.installer.NAMES[1]
+        path.write_text('existing')
+        with self.assertRaisesRegex(ValueError, 'existing unit'):
+            self.install()
+        path.unlink()
+        self.module.executor.return_value.load_execution.return_value['host'] = 'other'
+        with self.assertRaises(dispatch.Refused):
+            self.install()
+        self.run.assert_not_called()
+
+
+class PolicyConsistencyTest(unittest.TestCase):
+    def test_host_and_agent_subset(self):
+        rules = {'host': 'source', 'agents': ['dev']}
+        dispatch.consistent_policy(rules, {'host': 'source', 'accounts': {'dev': {}, 'other': {}}})
+        for enrollment in ({'host': 'other', 'accounts': {'dev': {}}},
+                           {'host': 'source', 'accounts': {'other': {}}}):
+            with self.assertRaises(dispatch.Refused):
+                dispatch.consistent_policy(rules, enrollment)
+
+    def test_contract_error_logs_fixed_refused_category(self):
+        import io
+        module = mock.Mock()
+        with mock.patch.object(dispatch.os, 'geteuid', return_value=0), \
+                mock.patch.object(dispatch, 'executor', return_value=module), \
+                mock.patch.object(dispatch, 'policy', side_effect=dispatch.handoff_contract.ContractError('secret')), \
+                mock.patch.object(dispatch.signal, 'signal'), \
+                mock.patch.object(dispatch.signal, 'alarm'), \
+                mock.patch.object(dispatch.sys, 'stderr', new_callable=io.StringIO) as log:
+            module.Uncertain = type('Uncertain', (Exception,), {})
+            self.assertEqual(dispatch.main([]), 1)
+        self.assertEqual(log.getvalue(), 'local_handoff_refused pid=-1 uid=-1\n')
+
+
+class SystemctlFailureTest(unittest.TestCase):
+    def test_only_missing_unit_exit_is_accepted(self):
+        import subprocess
+        installer = load('installer-local-handoff')
+        for code in (0, 1, 5):
+            result = subprocess.CompletedProcess(['systemctl'], code)
+            with mock.patch.object(installer.subprocess, 'run', return_value=result):
+                if code in (0, 5):
+                    installer.run('stop', installer.NAMES[0], absent_ok=True)
+                else:
+                    with self.assertRaises(subprocess.CalledProcessError):
+                        installer.run('stop', installer.NAMES[0], absent_ok=True)
