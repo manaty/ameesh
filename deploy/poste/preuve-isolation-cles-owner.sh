@@ -16,9 +16,10 @@
 # le drop-in (InaccessiblePaths= sur ~/.ssh, SSH_AUTH_SOCK retiré), y exécute
 # le témoin root `/usr/local/libexec/ameesh/verifie-cles-owner` et sort en 0
 # seulement si un montage inaccessible (inode mode 000) a réellement été posé
-# sur la cible. C'est le critère de recette du garde-fou : avant le prérequis
-# AppArmor (deploy/poste/ameesh-systemd-executor), la preuve ÉCHOUE
-# (InaccessiblePaths= silencieusement ignoré) ; après, elle passe. Aucun
+# sur la cible. C'est le critère de recette du garde-fou. Si
+# kernel.apparmor_restrict_unprivileged_userns=1, le profil AppArmor
+# deploy/poste/ameesh-systemd-executor.apparmor est un prérequis ; sinon il
+# est inutile. La preuve reste obligatoire dans les deux cas. Aucun
 # secret n'est lu ni affiché : le témoin ne regarde que le point de montage
 # et son mode dans l'unité.
 set -u
@@ -76,7 +77,10 @@ rc=$?
 if [ "$rc" -eq 0 ]; then
   echo "PASS : $CIBLE est hors de l'exécuteur (masque mode 000, agent SSH absent)"
 else
-  echo "FAIL : isolation absente — prérequis AppArmor non posé ?" >&2
-  echo "       voir deploy/poste/ameesh-systemd-executor.apparmor, docs/EXPLOITATION.md" >&2
+  echo "FAIL : isolation non prouvée — vérifier les diagnostics de l'unité et du témoin" >&2
+  if [ "$userns" = 1 ]; then
+    echo "       restriction userns active : vérifier le profil deploy/poste/ameesh-systemd-executor.apparmor" >&2
+  fi
+  echo "       voir docs/EXPLOITATION.md" >&2
 fi
 exit "$rc"
