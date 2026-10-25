@@ -1652,7 +1652,10 @@ def cmd_forward(bk, cfg: Config, rest: list[str]) -> int:
     except ValueError as exc:
         print("%s\n%s" % (exc, _FORWARD_USAGE), file=sys.stderr)
         return 2
-    if len(positional) != 2 or not all(NAME_RE.match(name) for name in positional):
+    # L'ancien destinataire est une clé exacte de boîte morte, y compris
+    # un ancien libellé d'acteur hors registre. Le nouveau reste un nom agent.
+    if (len(positional) != 2 or not positional[0].strip()
+            or not NAME_RE.fullmatch(positional[1])):
         print(_FORWARD_USAGE, file=sys.stderr)
         return 2
     old, new = positional
