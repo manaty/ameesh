@@ -43,6 +43,12 @@ relus sous le bail, renouvelé et vérifié juste avant chaque geste externe, et
 feu, gel et verdicts sont revalidés juste avant la PR, la file ou la fusion.
 Un détenteur périmé s'arrête (`busy`) au lieu d'agir sur un instantané
 (P1-3, P2-6).
+
+#3598 : un passage tient ce bail 15 à 20 s et le rend entre deux passages ;
+`give` et `withdraw` l'attendent donc par tentatives courtes et espacées
+jusqu'à `LOCK_WAIT_S` avant de refuser, en nommant le détenteur et son
+échéance. Le feu ne se pose ni ne se retire sur un instantané : il attend la
+fenêtre libre, sans jamais écrire hors bail.
 """
 from __future__ import annotations
 
@@ -50,6 +56,7 @@ import json
 import os
 import re
 import socket
+import time
 from urllib.parse import quote
 
 from . import land, lot_class, merge_queue, packet_guard, plan_git, storage, work
@@ -61,6 +68,14 @@ FIRE_KINDS = (FIRE, UNFIRE)
 MAX_LOTS = 1000
 #: durée du bail d'une opération de feu
 LOCK_TTL_S = 120.0
+#: #3598 : budget d'attente du bail par `give`/`withdraw` avant le refus. Un
+#: passage d'auto-fusion tient le bail 15 à 20 s et le rend entre deux
+#: passages : le retrait trouve une fenêtre libre bien avant la borne. À la
+#: borne, le refus nomme le détenteur et son échéance.
+LOCK_WAIT_S = LOCK_TTL_S
+#: première attente entre deux tentatives, doublée jusqu'à LOCK_WAIT_MAX_S
+LOCK_WAIT_FIRST_S = 0.25
+LOCK_WAIT_MAX_S = 2.0
 #: L165 (EP4) : marge du bail élu renouvelée juste avant `gh pr merge`
 #: (timeout de 120 s + relecture de la PR). La course résiduelle est
 #: documentée dans `docs/HOST-HANDOFFS.md`.
@@ -168,7 +183,7 @@ def state(db, lot: int) -> dict:
 
 
 def give(db, lot: int, *, sha: str, actor: str, note: str = "", repo: str | None = None,
-         exception: str = "", reason: str = "") -> dict:
+         exception: str = "", reason: str = "", wait: float | None = None) -> dict:
     """Donne le feu du pilote sur la tête gelée `sha` du lot (jalon `fire`).
 
     Refuse un lot terminé, un lot non gelé, un `sha` qui n'est pas un commit,
@@ -184,10 +199,9 @@ def give(db, lot: int, *, sha: str, actor: str, note: str = "", repo: str | None
     Le geste prend le bail du feu (`fire:<lot>`), celui du passage : un
     passage en cours d'armement ou de fusion ne peut pas ignorer un feu qui
     arrive, et le feu ne peut pas se poser pendant qu'un autre hôte agit
-    (#1374, P1-3)."""
-    handle = _lock(db, lot)
-    if handle is None:
-        raise FireError("another fire operation holds lot #%d: retry once it is done" % lot)
+    (#1374, P1-3). Il l'attend jusqu'à `wait` (LOCK_WAIT_S par défaut) avant
+    de refuser, en nommant alors le détenteur et son échéance (#3598)."""
+    handle = _wait_lock(db, lot, wait=wait)
     try:
         # L165 (EP4) : le feu du pilote est un geste hors base (il arme la
         # fusion) ; l'époque du bail élu est vérifiée et journalisée avant.
@@ -269,13 +283,15 @@ def _give_locked(db, lot: int, *, sha: str, actor: str, note: str = "",
                               note=(note or "").strip())
 
 
-def withdraw(db, lot: int, *, actor: str, note: str = "", repo: str | None = None) -> dict:
+def withdraw(db, lot: int, *, actor: str, note: str = "", repo: str | None = None,
+             wait: float | None = None) -> dict:
     """Retire le feu actif d'un lot (jalon `unfire`) : l'auto-fusion est
     désarmée et la ligne de file retirée au passage suivant, rien d'autre n'est
-    annulé. Même bail que le passage (#1374, P1-3)."""
-    handle = _lock(db, lot)
-    if handle is None:
-        raise FireError("another fire operation holds lot #%d: retry once it is done" % lot)
+    annulé. Même bail que le passage (#1374, P1-3), attendu jusqu'à `wait`
+    (LOCK_WAIT_S par défaut) : un passage le tient 15 à 20 s, le retrait doit
+    trouver sa fenêtre ; à la borne, le refus nomme le détenteur et son
+    échéance (#3598)."""
+    handle = _wait_lock(db, lot, wait=wait)
     try:
         from . import pilot_gesture
         try:
@@ -1745,6 +1761,59 @@ def _renew(handle, ttl: float = LOCK_TTL_S) -> bool:
         return False
 
 
+def _land_holder(db, lot: int) -> dict | None:
+    """Le détenteur du bail `fire:<lot>`, pour le refus (#3598).
+
+    Lecture de diagnostic, jamais une garde : un backend qui ne l'expose pas,
+    ou une lecture en échec, laisse le message générique."""
+    try:
+        reader = getattr(storage.of(db).work, "land_holder", None)
+        return reader("fire:%d" % lot) if reader is not None else None
+    except Exception:  # noqa: BLE001 - un message ne casse pas le refus
+        return None
+
+
+def _held_error(lot: int, holder: dict | None, waited: float) -> FireError:
+    """Le refus du bail, avec son détenteur et son échéance (#3598)."""
+    prefix = "another fire operation holds lot #%d" % lot
+    if not holder:
+        return FireError("%s: retry once it is done (waited %ds)" % (prefix, int(waited)))
+    owner = str(holder.get("owner") or "?")
+    until = str(holder.get("expires_at") or "?")
+    left = holder.get("left_s")
+    left_s = ""
+    if left is not None:
+        try:
+            left_s = " (%.0fs left)" % float(left)
+        except (TypeError, ValueError):
+            left_s = ""
+    return FireError("%s: held by %s until %s%s; retry once it is done (waited %ds)"
+                     % (prefix, owner, until, left_s, int(waited)))
+
+
+def _wait_lock(db, lot: int, *, wait: float | None = None,
+               sleep=time.sleep, clock=time.monotonic):
+    """Le bail `fire:<lot>`, en attendant qu'un passage le rende (#3598).
+
+    `give`/`withdraw` ne doivent plus échouer au premier refus : les passages
+    d'auto-fusion tiennent le bail 15 à 20 s, et le retrait doit passer dans
+    une fenêtre libre. Tentatives courtes et espacées jusqu'à `wait`
+    (`LOCK_WAIT_S` par défaut), puis refus nommant le détenteur et son
+    échéance. `sleep`/`clock` sont injectables pour les témoins."""
+    budget = LOCK_WAIT_S if wait is None else max(0.0, float(wait))
+    deadline = clock() + budget
+    interval = LOCK_WAIT_FIRST_S
+    while True:
+        handle = _lock(db, lot)
+        if handle is not None:
+            return handle
+        remaining = deadline - clock()
+        if remaining <= 0:
+            raise _held_error(lot, _land_holder(db, lot), budget)
+        sleep(min(interval, remaining))
+        interval = min(interval * 2.0, LOCK_WAIT_MAX_S)
+
+
 def _reconcile(db, row: dict, marks: list, status: dict, *, slug: str, repo: str | None,
                target: str, dry_run: bool) -> dict:
     """La PR est fusionnée : le lot passe `merged` tout de suite."""
@@ -2533,9 +2602,11 @@ def add_parser(work_sub, func) -> None:
                      "which departs at green CI")
     parser.add_argument("id", type=int)
     parser.add_argument("--sha", default="",
-                        help="the frozen head the fire covers (to give the fire)")
+                        help="the frozen head the fire covers (to give the fire); waits for an "
+                             "in-flight pass's lease (up to ~2 min) before refusing")
     parser.add_argument("--withdraw", action="store_true",
-                        help="withdraw the fire: the automatic merge is disarmed")
+                        help="withdraw the fire: the automatic merge is disarmed; waits for an "
+                             "in-flight pass's lease (up to ~2 min) before refusing (#3598)")
     parser.add_argument("--repo", default=None,
                         help="the lot's repository: a checkout path, or the current "
                              "checkout's owner/name (default: the current git repository)")

@@ -2611,6 +2611,20 @@ class WorkItems(interface.WorkItems):
             (key, owner, int(epoch)))
         return bool(rows)
 
+    def land_holder(self, key) -> dict | None:
+        """#3598 : qui tient le bail, et jusqu'à quand, pour le refus de
+        `give`/`withdraw`. Horloge de la base, lecture seule, jamais une garde.
+        L'échéance est rendue en UTC ISO (`…Z`), identique sous les deux
+        pilotes plutôt que datetime (psycopg) ou texte (psql)."""
+        rows = self.db.query(
+            "SELECT owner,"
+            " to_char(expires_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"')"
+            "   AS expires_at,"
+            " extract(epoch FROM (expires_at - clock_timestamp()))::float8 AS left_s"
+            " FROM merge_locks WHERE target = %s AND owner IS NOT NULL"
+            "   AND expires_at > clock_timestamp()", (key,))
+        return dict(rows[0]) if rows else None
+
     def train_read(self, key) -> dict | None:
         rows = self.db.query(
             "SELECT revision, document FROM integration_trains WHERE target_key = %s", (key,))

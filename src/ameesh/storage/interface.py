@@ -1802,6 +1802,12 @@ class WorkItems(Domain):
         """L160e2 (0058): frees the lease, if still held at that epoch."""
 
     @abc.abstractmethod
+    def land_holder(self, key: str) -> dict | None:
+        """#3598: the live holder of the merge lease of `key`, for a refusal
+        message: `{owner, expires_at, left_s}`, or None. A diagnostic read,
+        never a guard; server-only, like `land_lock`/`land_unlock`."""
+
+    @abc.abstractmethod
     def train_read(self, key: str) -> dict | None:
         """#1467: durable train document and its revision, or None."""
 
