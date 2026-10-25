@@ -33,10 +33,12 @@ on its first line.
 ## Mailbox: `ameesh mail` / `agent-mail`
 
 ```
-agent-mail send <dest|all> <text…> [--from NAME] [--lot ID|REF]
+agent-mail send <dest|all> <text…|-> [--from NAME] [--lot ID|REF]
                 [--new-lot "title" [--estimate 2h] [--app PROJECT]]
                 [--kind request|reply|notify|event] [--urgent] [--ack] [--cc NAME[,NAME…]]
                 [--sign --key FILE] [--expires 24h] [--queue]
+                # a body of `-` is read on standard input: send <dest> - <<'EOF' … EOF
+                # (quoted delimiter: nothing is expanded, no shell command runs)
 agent-mail forward <OLD> <NEW> [--dry-run] [--json]   # redeliver a dead mailbox
 agent-mail list                       # agents, host, lease, unread
 agent-mail inbox [NAME]               # unread messages of NAME, without marking them read
@@ -53,6 +55,24 @@ agent-mail statusline                 # Claude Code status line
 agent-mail migrate                    # versioned migrations
 agent-mail doctor [--notify-test | --probe]
 ```
+
+**Body from standard input (#3504).** `send <dest> -` reads the message body
+on standard input; use it with a quoted here-document whenever the body cites
+a command, so the sender's shell runs nothing:
+
+```sh
+agent-mail send <dest> - --lot <id> <<'EOF'
+The command `ameesh work close 12 --abandoned` stays text here.
+EOF
+```
+
+The body arrives verbatim (surrounding whitespace trimmed, like an argument
+body); an empty or non-UTF-8 input is refused before any delivery. The `-`
+alone after the recipient means stdin; a `-` mixed with argument text is
+refused. An argument body containing the confirmation of an ameesh command
+(`delivered to …`, `milestone … added to lot #…`, `decision #…`,
+`work item #… closed:`, `lot #… → merged (commit …)`) gets a warning on
+standard error: it probably came from command substitution.
 
 The session identity is `$AGENT_MAIL_NAME` (set by the runner). If
 `$AMEESH_RUNNER_ID` and `$AMEESH_LEASE_EPOCH` are also set, the lease must be

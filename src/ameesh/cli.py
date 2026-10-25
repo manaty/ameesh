@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """agent-mail (mesh v1) — the agents' mailbox, on Postgres.
 
-  agent-mail send <dest> <text…> [--from NAME] [--lot ID|REF [--assign]] [--new-lot "title"
+  agent-mail send <dest> <text…|-> [--from NAME] [--lot ID|REF [--assign]] [--new-lot "title"
                  [--estimate 2h] [--app PROJECT]] [--force REASON] [--queue]
                                                  drops a message (dest = name, or "all")
                                                  and writes it to the readable thread of the
@@ -35,6 +35,11 @@
                                                  and --cc (copy, as an event)
                                                  do not wake: read on the next turn;
                                                  nor does "all" without --urgent
+                                                 a body of `-` is read on standard input
+                                                 (`send <dest> - <<'EOF' … EOF`): with a quoted
+                                                 delimiter nothing is expanded, so a command
+                                                 cited in the body is not run by your shell
+                                                 (#3504)
   agent-mail forward <old> <new> [--dry-run] [--json]
                                                  re-delivers the pending mail of a stopped
                                                  agent (or one missing from the registry) to a
@@ -90,6 +95,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import time
 
@@ -265,6 +271,51 @@ def set_title(cfg: Config, bk, name: str) -> None:
 # commandes
 # --------------------------------------------------------------------------
 
+#: #3504 : confirmations typiques d'une commande ameesh qui écrit (envoi de
+#: courrier, gel, clôture, fusion, décision). Un corps reçu en arguments qui
+#: en contient une a probablement subi une substitution de commande entre
+#: guillemets doubles ; on le dit, sans rien refuser. Lignes entières
+#: seulement : une citation en prose ne les aligne pas ainsi.
+_COMMAND_OUTPUT_RE = re.compile(
+    r"(?m)^(?:"
+    r"delivered to \S"
+    r"|milestone \w+ added to lot #\d+"
+    r"|decision #\d+(?::| withdrawn)"
+    r"|work item #\d+ closed:"
+    r"|lot #\d+ → merged \(commit"
+    r")")
+
+
+def _stdin_body() -> tuple[str | None, str | None]:
+    """#3504 : corps de `send <dest> -`, lu sur l'entrée standard.
+
+    Rend `(texte, None)` ou `(None, erreur)`. Le texte est nettoyé des blancs
+    de bord comme un corps passé en arguments ; une entrée illisible (UTF-8
+    invalide) ou vide est refusée avant tout dépôt.
+    """
+    try:
+        data = sys.stdin.buffer.read()
+    except AttributeError:  # flux déjà textuel (tests, appel en processus)
+        data = sys.stdin.read()
+    if isinstance(data, bytes):
+        try:
+            data = data.decode("utf-8")
+        except UnicodeDecodeError:
+            return None, ("the body on standard input is not valid UTF-8; "
+                          "write plain text")
+    text = data.strip()
+    if not text:
+        return None, ("empty body on standard input: write the message before "
+                      "closing standard input")
+    return text, None
+
+
+def _command_output_in(text: str) -> str:
+    """#3504 : la confirmation ameesh reconnue dans un corps, ou ''."""
+    match = _COMMAND_OUTPUT_RE.search(text)
+    return match.group(0) if match else ""
+
+
 def cmd_send(bk, cfg: Config, args: list[str]) -> int:
     sender = None
     key_path = None
@@ -380,13 +431,15 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
         print("--expires only makes sense with --sign/--key", file=sys.stderr)
         return 2
     if len(args) < 2:
-        print("usage: agent-mail send <dest|all> <text…> [--from NAME] [--lot ID|REF [--assign]] "
+        print("usage: agent-mail send <dest|all> <text…|-> [--from NAME] [--lot ID|REF [--assign]] "
               "[--new-lot \"title\" [--estimate 2h] [--app PROJECT [--new-project]] "
               "[--parent-lot ID]] "
               "[--kind request|reply|notify|event] "
               "[--urgent] [--verdict|--arbitration] "
               "[--ack] [--info] [--cc NAME[,NAME…]] [--sign --key FILE] [--expires 24h] "
-              "[--request-expires 2h] [--queue]",
+              "[--request-expires 2h] [--queue]\n"
+              "       a body of `-` is read on standard input "
+              "(send <dest> - <<'EOF' … EOF: a quoted delimiter expands nothing)",
               file=sys.stderr)
         return 2
     if lot is not None and not NAME_RE.match(lot):
@@ -430,7 +483,30 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
             print("--parent-lot: a lot number (e.g. 1070 or #1070)", file=sys.stderr)
             return 2
         parent_lot = int(number)
-    dest, text = args[0], " ".join(args[1:]).strip()
+    dest = args[0]
+    body = args[1:]
+    if body == ["-"]:
+        # #3504 : le corps vient de l'entrée standard, pour citer une commande
+        # sans que le shell de l'expéditeur ne la lance (heredoc `<<'EOF'`).
+        text, error = _stdin_body()
+        if error:
+            print(error, file=sys.stderr)
+            return 2
+    elif "-" in body:
+        print("`-` reads the whole body on standard input: give it alone after "
+              "the recipient (or pass the text as arguments)", file=sys.stderr)
+        return 2
+    else:
+        text = " ".join(body).strip()
+        output = _command_output_in(text)
+        if output:
+            # #3504 (optionnel) : la sortie d'une commande ameesh dans un corps
+            # passé en arguments trahit une substitution de commande.
+            print("warning: the body contains \"%s\", the confirmation of an ameesh "
+                  "command: a command between double quotes is run by your shell. "
+                  "Send the body on standard input: agent-mail send <dest> - "
+                  "<<'EOF' … EOF (quoted delimiter: nothing is expanded)" % output,
+                  file=sys.stderr)
     # L77 : la liaison est lue même avec --from — un processus lié à un agent
     # ne produit JAMAIS de preuve humaine, quel que soit l'expéditeur nommé.
     entry_binding = identity.resolve_binding(cfg, bk.db if bk.kind == "pg" else None)
