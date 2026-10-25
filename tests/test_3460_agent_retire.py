@@ -7,6 +7,8 @@ identité d'émission système : retirée, elle émet toujours les veilles.
 """
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import os
 from unittest import mock
@@ -98,11 +100,22 @@ class RetireTest(PgTestCase):
         self.assertIn("ameesh watch disable --agent worker", text)
         self.assertIsNone(registry.get(self.db, "worker")["retired_ts"])
         self.assertEqual(self.events(agent_retire.RETIRED_EVENT), [])
-        # un lot clos ne retient plus
+        # un lot livré (merged, promoted) ou clos ne retient plus ; un lot en
+        # build retient toujours
         self.db.execute("UPDATE work_items SET state = 'closed', close_reason = 'done'"
                         " WHERE id = %s", (lot,))
+        for state in ("merged", "promoted", "build"):
+            self.db.execute("INSERT INTO work_items (title, assignee, state)"
+                            " VALUES (%s, 'worker', %s)", ("lot " + state, state))
         storage.of(self.db).watches.delete("worker")
         registry.release(self.db, "worker", "runner-test", lease["lease_epoch"])
+        with self.assertRaises(agent_retire.RetireError) as ctx:
+            self.retire()
+        self.assertIn("(build)", str(ctx.exception))
+        self.assertNotIn("(merged)", str(ctx.exception))
+        self.assertNotIn("(promoted)", str(ctx.exception))
+        self.db.execute("UPDATE work_items SET state = 'closed', close_reason = 'done'"
+                        " WHERE assignee = 'worker' AND state = 'build'")
         self.assertTrue(self.retire()["changed"])
 
     def test_mail_to_and_from_a_retired_agent_is_refused(self):
@@ -171,6 +184,21 @@ class RetireTest(PgTestCase):
         self.assertEqual(bk.send("other", "third", "avec copie", cc=["worker"]), ["third"])
         self.assertEqual(self.unread(), [])
         self.assertEqual([m["body"] for m in self.unread("third")], ["avec copie"])
+
+    def test_a_stale_precheck_gives_a_readable_refusal_not_a_trace(self):
+        from ameesh import cli
+        registry.upsert(self.db, "other", harness="deepseek", host=self.cfg.host,
+                        cwd=self.tmp)
+        self.retire()
+        out, err = io.StringIO(), io.StringIO()
+        # le précontrôle a lu l'agent avant son retrait
+        with mock.patch.dict(os.environ, self.env(), clear=True), \
+                mock.patch.object(undeliverable, "check_send", return_value=[]), \
+                contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = cli.main(["send", "worker", "bonjour", "--from", "other"])
+        self.assertEqual(code, 2, out.getvalue())
+        self.assertIn("refused: worker is retired", err.getvalue())
+        self.assertEqual(self.unread(), [])
 
     def test_a_deposit_in_progress_holds_the_retirement(self):
         """Le dépôt prend la ligne du registre en partagé ; `retire` la prend

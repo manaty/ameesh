@@ -355,8 +355,12 @@ class Agents(interface.Agents):
                 blockers.append({"kind": "lease", "owner": row["lease_owner"]})
             blockers += [{"kind": "lot", "id": int(lot["id"]), "state": lot["state"]}
                          for lot in tx.query(
+                             # #3460 (B de dev3) : un lot livré (`merged`,
+                             # `promoted`) garde son assigné mais ne retient pas
                              "SELECT id, state FROM work_items"
-                             " WHERE assignee = %s AND state <> 'closed' ORDER BY id",
+                             " WHERE assignee = %s"
+                             "   AND state NOT IN ('merged', 'promoted', 'closed')"
+                             " ORDER BY id",
                              (agent,))]
             blockers += [{"kind": "watch", "host": watch["host"]}
                          for watch in tx.query(
