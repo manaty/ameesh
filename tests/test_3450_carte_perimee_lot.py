@@ -52,12 +52,15 @@ class StaleMapLotTest(unittest.TestCase):
         GitHub teste, donc le range propre de la branche (`--base`).
         """
         repo = self.repo.path
-        _git(repo, "checkout", "-q", "-b", "main", self.repo.base)
+        # `-B` : selon `init.defaultBranch` (main en CI, master sur un poste),
+        # la branche `main` peut déjà exister au commit de base — `-b` y
+        # échouait en 128 (rouge CI du paquet h-15).
+        _git(repo, "checkout", "-q", "-B", "main", self.repo.base)
         if target is not None:
             target()
         self.repo.commit()
         base_b = _git(repo, "rev-parse", "HEAD")
-        _git(repo, "checkout", "-q", "-b", "lot/3450-carte-boucle")
+        _git(repo, "checkout", "-q", "-B", "lot/3450-carte-boucle")
         (own or self._own_change)()
         self.repo.commit()
         _git(repo, "checkout", "-q", "main")
