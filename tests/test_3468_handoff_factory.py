@@ -520,21 +520,17 @@ class FactoryTest(unittest.TestCase):
         self.assertEqual(value.adapter.repository(self.agent()),
                          'git@forge:manaty/ameesh.git')
 
-    def test_adapter_refuses_every_effect_it_has_not_implemented(self):
+    def test_adapter_refuses_the_loss_recovery_it_has_not_implemented(self):
         value = self.factory()
-        for method in ('admit', 'enable', 'verify', 'restore_source',
-                       'recover_source', 'reconcile_effect'):
-            with self.subTest(method=method):
-                request = operation()
-                if method == 'reconcile_effect':
-                    request['evidence'] = {'pending_effect': {'epoch': 6}}
-                with self.assertRaisesRegex(ValueError, 'capability:' + method):
-                    getattr(value.adapter, method)(request)
+        request = operation()
+        with self.assertRaisesRegex(ValueError, 'capability:recover_source'):
+            value.adapter.recover_source(request)
 
-    def test_h2_effects_are_callable_not_simulated(self):
+    def test_h2_and_h3_effects_are_callable_not_simulated(self):
         value = self.factory()
         for method in ('inventory', 'revalidate', 'prepare', 'stop_source',
-                       'publish', 'transfer', 'session'):
+                       'publish', 'transfer', 'session', 'admit', 'enable',
+                       'verify', 'restore_source', 'reconcile_effect'):
             with self.subTest(method=method):
                 self.assertTrue(callable(getattr(value.adapter, method, None)))
 

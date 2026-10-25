@@ -247,7 +247,7 @@ class WireContractTest(unittest.TestCase):
                 with self.assertRaises(handoff_contract.ContractError):
                     handoff_contract.validate_effect_request(broken)
         for changes in ({'action_id': 'a' * 32 + ':publish'},
-                        {'step': 'admit'},
+                        {'step': 'unknown'},
                         {'tools': ['gh', 'gh']},
                         {'tools': ['/bin/sh']},
                         {'account': 'bad account'},
