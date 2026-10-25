@@ -301,3 +301,35 @@ class PacketMemberBaseTest(PgTestCase):
         out = self.need(self.base)
         self.assertFalse(out["ok"], out)
         self.assertIn("provenance unknown", out["why"])
+
+    def test_3513_waived_predecessor_cannot_hide_unknown_provenance(self):
+        units = self.stacked_vehicle()
+        self.db.execute("DELETE FROM provenance_receipts WHERE subject = %s",
+                        ("commit:" + units[0][1],))
+        self.db.execute("UPDATE work_items SET reviewer = %s, reviewers = %s"
+                        " WHERE id = %s", (work.REVIEWER_NONE,
+                                            [work.REVIEWER_NONE], units[0][0]))
+        out = self.need(self.base)
+        self.assertFalse(out["ok"], out)
+        self.assertIn("provenance unknown", out["why"])
+
+    def test_3513_zero_required_predecessor_does_not_attest_provenance(self):
+        self.stacked_vehicle()
+        real_gate = merge_queue.review_gate
+        calls = []
+
+        def gate(*args, **kwargs):
+            calls.append(kwargs["admitted_heads"])
+            if len(calls) == 1:
+                kwargs["klass"] = {"class": "light", "files": []}
+                result = real_gate(*args, **kwargs)
+                self.assertTrue(result["ok"], result)
+                self.assertEqual(result["required"], 0)
+                self.assertFalse(result["attribution_read"])
+                return result
+            return real_gate(*args, **kwargs)
+
+        with mock.patch.object(merge_queue, "review_gate", side_effect=gate):
+            out = self.need(self.base)
+        self.assertEqual(calls[:2], [(), ()])
+        self.assertFalse(out["ok"], out)

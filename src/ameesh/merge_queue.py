@@ -652,7 +652,9 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
 
     Rend `{ok, why, class, required, accepted, accepted_unfiltered, blocked,
     waived, author, author_family, authors, corrections, on_freeze, unproven,
-    completed_ts, vehicle}` ; ne lève jamais.
+    completed_ts, vehicle, attribution_read}` ; ne lève jamais.
+    `attribution_read` prouve une lecture effective de la provenance ; une
+    dispense ou une porte sans avis requis ne fournit pas cette preuve.
     """
     from . import lot_class
     klass = klass or {}
@@ -680,6 +682,7 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
            "waived": waived, "waived_by": waived_by,
            "author": author, "author_family": "", "authors": [],
            "corrections": [], "on_freeze": 0, "unproven": [], "vehicle": None,
+           "attribution_read": False,
            "exclude_author_family": exclude_author_family,
            "distinct_families": distinct_families}
     if not frozen:
@@ -890,6 +893,7 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
         return out
     # #2803 : la lecture a établi les auteurs du seul delta relu. Sans elle
     # (pas de dépôt ou de ligne), la porte garde la référence historique.
+    out["attribution_read"] = attribution is not None
     exact = vehicle_delta and attribution is not None
     range_authors: list = []
     if attribution is not None:

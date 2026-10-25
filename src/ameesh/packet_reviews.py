@@ -471,6 +471,7 @@ def need(db, vehicle: int, row, marks, repo: str, base: str, head: str,
         return None
     total = len(found)
     frozen_sources = []
+    admitted_sources = []
     constituents = []
     for entry in found:
         lot = int(entry["lot"])
@@ -548,7 +549,7 @@ def need(db, vehicle: int, row, marks, repo: str, base: str, head: str,
                                      base_sha=member_base)
             gate = merge_queue.review_gate(db, member_marks, frozen, repo=repo,
                                            klass=klass, item=member_row,
-                                           admitted_heads=tuple(frozen_sources))
+                                           admitted_heads=tuple(admitted_sources))
         except Exception as exc:  # noqa: BLE001 - lecture impossible : refus
             return {"ok": False, "required": None, "klass": None,
                     "why": "constituent #%d: cannot read its review gate: %s"
@@ -557,7 +558,10 @@ def need(db, vehicle: int, row, marks, repo: str, base: str, head: str,
             return {"ok": False, "required": None, "klass": None,
                     "why": "constituent #%d: %s" % (lot, gate.get("why") or "no review"),
                     "members": found, "own_paths": []}
-        # Only a member that passed its own gate may cover inherited commits.
+        # A waived/no-review gate can open without reading provenance. It
+        # covers its vehicle delta, but cannot attest inherited authors.
+        if gate.get("attribution_read"):
+            admitted_sources.append(frozen)
         frozen_sources.append(frozen)
         constituents.append(entry)
     total = len(constituents)
