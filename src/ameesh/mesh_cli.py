@@ -227,8 +227,14 @@ def _handoff_operator(cfg, db, args):
             result = handoffs.cancel(db, args.operation, adapter)
         else:
             result = handoffs.advance(db, args.operation, adapter)
-    except Exception:
-        raise ValueError("handoff step refused; inspect the protected controller journal") from None
+    except Exception as exc:
+        if isinstance(exc, handoffs.HandoffRefusal) and isinstance(exc.reason, handoffs.Refusal):
+            reason = exc.reason
+            # Read only the closed category, never str(exc) or helper diagnostics.
+            raise ValueError("handoff step refused; %s: %s" %
+                             (reason.name.lower(), reason.value)) from None
+        raise ValueError("handoff step refused; inspect state and evidence with "
+                         "ameesh handoff show OPERATION") from None
     public = {key: result[key] for key in
               ("id", "agent", "source", "target", "state", "reserved_until_ts")
               if key in result}

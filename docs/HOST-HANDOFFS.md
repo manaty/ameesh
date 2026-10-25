@@ -15,8 +15,13 @@ terminal names its identity with `--actor human:ID`; an agent session cannot
 impersonate that identity. Each invocation opens its own controller connection,
 loads the same pinned enrolled factory as the runner and performs one controller
 step. It prints only the operation identity, hosts, state and reservation expiry;
-private helper errors are replaced by a generic refusal. A held state requires
-explicit recovery; commands never loop until completion.
+private helper errors are replaced by a generic refusal. Controller guards
+report fixed public categories, such as `renewal_required` (retry with
+`--renew-ttl SECONDS`), `source_lost` (ordinary cancellation is unavailable)
+and `destination_switched` (recovery requires reconciliation). These diagnostics
+contain no helper exception text. `ameesh handoff show OPERATION` gives the
+recorded state and evidence; a refused command need not have a journal entry.
+A held state requires explicit recovery; commands never loop until completion.
 
 `retry` reconciles unfinished effects before resuming the saved checkpoint.
 An expired reservation requires `--renew-ttl SECONDS` (30–7200); renewal is
