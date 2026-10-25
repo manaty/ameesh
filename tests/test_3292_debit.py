@@ -192,6 +192,19 @@ class ReviewDueTest(unittest.TestCase):
         self.assertFalse(debit._reopened(events, None))
         self.assertFalse(debit._reopened([event(1, 1, T, "note")], T))
 
+    def test_une_fermeture_retenue_ne_rouvre_pas_la_revue(self):
+        # #3497 : après la fusion, les écritures merged/blocked du harnais ne
+        # sont pas une reprise ; sans intake/build/qa, le lot n'est pas en
+        # revue (le jalon merge tient).
+        self.assertFalse(debit._reopened(
+            [event(1, 1, T, "fusion", state="merged"),
+             event(1, 2, T + 1, "fermeture retenue", state="blocked"),
+             event(1, 3, T + 2, "review-after-merge", state="merged"),
+             event(1, 4, T + 3, "encore retenu", state="blocked")], T))
+        self.assertFalse(debit._reopened(
+            [event(1, 1, T, "fusion", state="merged"),
+             event(1, 2, T + 1, "attente externe", state="waiting_human")], T))
+
 
 class HoldsAndWakesTest(unittest.TestCase):
     def test_hold_et_releve(self):
@@ -241,6 +254,100 @@ class HoldsAndWakesTest(unittest.TestCase):
             events=[event(1, 1, T - 3 * H, "hold: attend la 1.20.0")])
         self.assertEqual(report["undeployed_holds"], [])
         self.assertEqual(report["totals"]["holds"], 1)
+
+    def test_lot_fusionne_puis_blocke_en_attente_de_deploiement(self):
+        # Témoin #3497 (#3444) : fusion par un paquet, tête de branche absente
+        # de main (le débit lit le jalon merge, pas la branche), fermeture
+        # retenue jusqu'au déploiement sur pc-smichea. Les états merged/blocked
+        # de la fermeture ne rouvrent pas la revue et ne perdent pas la
+        # retenue : le lot va en undeployed_holds, pas en qa_merge.
+        merged_at = T - 5 * H
+        note = ("hold: le code est dans main. Reste le geste hôte : déployer "
+                "main sur pc-smichea. Levée : déploiement constaté.")
+        report = run(
+            items=[dict(item(3444, assignee="mty-amh-impl-08"),
+                        branch="lot/3444-executeurs-sans-cles-owner",
+                        branch_target="main")],
+            milestones=[frozen(3444, 10, merged_at - 3 * H, sha="e" * 40),
+                        {"work_item_id": 3444, "id": 11, "kind": "merged",
+                         "at_ts": merged_at, "sha": "e" * 40}],
+            events=[event(3444, 1, merged_at - 3 * H,
+                          mark(3444, 10, ["ameesh-cx3", "ameesh-dev2"])),
+                    event(3444, 2, merged_at + 1, "merge vu", state="merged"),
+                    event(3444, 3, merged_at + 2, "contenu fusionné",
+                          state="blocked"),
+                    event(3444, 4, merged_at + 3, note, actor="mesh-design",
+                          state="blocked"),
+                    event(3444, 5, merged_at + 4, "review-after-merge",
+                          state="merged"),
+                    event(3444, 6, merged_at + 5, "fermeture retenue",
+                          state="blocked")])
+        self.assertEqual(report["qa"], [])
+        self.assertEqual([row["lot"] for row in report["undeployed_holds"]],
+                         [3444])
+        self.assertEqual([row["kind"] for row in report["slow_waits"]],
+                         ["hold_undeployed"])
+        self.assertEqual(report["reviews_due"], [])
+
+    def test_un_lot_rouvert_puis_retenu_reste_en_revue(self):
+        # #3409 conservé : un lot vraiment rouvert (build après la fusion)
+        # puis retenu reste ouvert, et non en retenue de fermeture.
+        merged_at = T - 6 * H
+        report = run(
+            items=[item(8)],
+            milestones=[frozen(8, 10, merged_at - H),
+                        {"work_item_id": 8, "id": 11, "kind": "merged",
+                         "at_ts": merged_at}],
+            events=[event(8, 1, merged_at + 1, "correction: merged → build",
+                          state="build"),
+                    event(8, 2, merged_at + 2, "retenu", state="blocked")])
+        self.assertEqual([row["lot"] for row in report["qa"]], [8])
+        self.assertEqual(report["undeployed_holds"], [])
+
+    def test_une_levee_explicite_leve_la_retenue_de_fermeture(self):
+        merged_at = T - 5 * H
+        report = run(
+            items=[item(7)],
+            milestones=[frozen(7, 10, merged_at - H),
+                        {"work_item_id": 7, "id": 11, "kind": "merged",
+                         "at_ts": merged_at}],
+            events=[event(7, 1, merged_at + 1,
+                          "hold: correctif fusionné pas déployé",
+                          state="blocked"),
+                    event(7, 2, merged_at + 2, "unhold: déployé",
+                          actor="orchestrateur", state="merged"),
+                    event(7, 3, merged_at + 3, "fermeture retenue",
+                          state="blocked")])
+        self.assertEqual(report["undeployed_holds"], [])
+        self.assertEqual(report["holds"], [])
+
+    def test_un_compte_rendu_de_deploiement_n_est_pas_une_retenue(self):
+        # « vidage de déploiement 06:02Z » raconte un geste déjà fait : ce n'est
+        # pas une retenue de déploiement (#3458 au passage du 25/10).
+        report = run(
+            items=[item(3458)],
+            events=[event(3458, 1, T - 3 * H,
+                          "hold: geste du bureau ; le bureau est actif "
+                          "(vidage de déploiement 06:02Z), sans réponse",
+                          actor="auditeur", state="blocked")])
+        self.assertEqual(report["undeployed_holds"], [])
+        self.assertEqual(report["totals"]["holds"], 1)
+
+    def test_formules_de_deploiement_reconnues(self):
+        for text, expected in (
+                ("correctif fusionné pas déployé", True),
+                ("correctif fusionné pas déployée", True),
+                ("correctif non déployés", True),
+                ("reste à déployer main sur pc-smichea", True),
+                ("attendre le déploiement staging", True),
+                ("attente du déploiement de #3435", True),
+                ("inerte jusqu'au déploiement staging", True),
+                ("levée : déploiement constaté sur le poste", True),
+                ("le bureau est actif (vidage de déploiement 06:02Z)", False),
+                ("correctif déployé hier, reste la vérification", False),
+                ("aucun déploiement prévu cette semaine", False)):
+            with self.subTest(text=text):
+                self.assertEqual(bool(debit._UNDEPLOYED.search(text)), expected)
 
     def test_reveil_arme_et_echu(self):
         report = run(

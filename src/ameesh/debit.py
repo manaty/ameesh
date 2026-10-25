@@ -75,6 +75,18 @@ _DUE = re.compile(r"\(due\s+([0-9]{4}-[0-9]{2}-[0-9]{2}[ T][0-9]{2}:[0-9]{2}"
                   r"(?::[0-9]{2})?(?:\s+[A-Za-z][A-Za-z0-9_/+-]*)?)\)")
 _PROGRAMMED = re.compile(r"\[réveil programmé\s*:\s*([^\]]+)\]", re.I)
 _VERSION = re.compile(r"\b(\d+)\.(\d+)\.(\d+)\b")
+#: une retenue qui attend un déploiement (#3497) : « pas/non/jamais déployé »,
+#: le verbe (« reste à déployer main »), et le nom dans une formule d'attente
+#: (« attente du déploiement », « inerte jusqu'au déploiement ») ou de
+#: constat. « déploiement » seul ne suffit pas : un compte rendu de bureau
+#: (« vidage de déploiement 06:02Z ») n'est pas une retenue.
+_UNDEPLOYED = re.compile(
+    r"(?:pas|non|jamais)(?:\s+encore)?\s+d[ée]ploy[ée]e?s?"
+    r"|\bd[ée]ployer\b"
+    r"|\b(?:à|reste[nt]?|attend(?:s|re|ons|ent)?|attente|en\s+attente|"
+    r"jusqu'au|avant|après|dès)\b[^.;]{0,60}\bd[ée]ploiement\b"
+    r"|\bd[ée]ploiement\s+(?:constat[ée]e?|non\s+constat[ée]e?|à\s+faire|"
+    r"attendu|requis|dû|pas\s+fait)\b", re.I)
 _DEVICE_TOKEN = re.compile(r"`([^`]+)`")
 _DEVICE_PHRASE = re.compile(r"\b((?:Mac|PC|portable|ordinateur)\s+de\s+[A-ZÉÈÀÂÎÔÛ][\w-]+)",
                             re.I)
@@ -392,8 +404,12 @@ def _terminal_at(milestones: list[dict]) -> float | None:
     return max(moments) if moments else None
 
 
-#: états d'un lot ouvert : une réouverture qui finit sur l'un d'eux tient
-_OPEN_STATES = ("intake", "build", "qa", "blocked", "waiting_human")
+#: états d'une vraie reprise de revue : le lot retravaille sa tête
+_OPEN_STATES = ("intake", "build", "qa")
+#: états d'une retenue de fermeture : le contenu est déjà dans la cible
+_CLOSURE_STATES = ("blocked", "waiting_human")
+#: états terminaux (le jalon, pas seulement la colonne)
+_TERMINAL_STATES = ("merged", "closed", "delivered")
 
 
 def _reopened(events: list[dict], terminal_ts: float | None) -> bool:
@@ -401,17 +417,70 @@ def _reopened(events: list[dict], terminal_ts: float | None) -> bool:
 
     Une note concurrente peut porter qa après la fusion (#1982), puis les
     notes suivantes merged. Un retour à merged annule une réouverture ; un lot
-    rouvert puis retenu (blocked, waiting_human) reste ouvert.
-    """
+    rouvert puis retenu (blocked, waiting_human) reste ouvert — mais seulement
+    s'il a vraiment repris (intake/build/qa) depuis le jalon : une écriture
+    `blocked` de fermeture après la fusion ne rouvre pas une revue (#3497,
+    #3444 classé `qa_merge` alors que son contenu était dans main)."""
     if terminal_ts is None:
         return False
     later = [e for e in events or ()
              if float(e.get("at_ts") or 0.0) > terminal_ts and e.get("state")]
     if not later:
         return False
-    latest = max(later, key=lambda e: (float(e.get("at_ts") or 0.0),
-                                       int(e.get("id") or 0)))
-    return str(latest["state"]) in _OPEN_STATES
+    resumed = False
+    latest_state = None
+    for event in sorted(later, key=lambda e: (float(e.get("at_ts") or 0.0),
+                                              int(e.get("id") or 0))):
+        state = str(event["state"])
+        if state in _OPEN_STATES:
+            resumed = True
+        elif state in _TERMINAL_STATES:
+            resumed = False
+        latest_state = state
+    if latest_state in _CLOSURE_STATES:
+        return resumed
+    return latest_state in _OPEN_STATES
+
+
+def _closure_holds(events: list[dict], terminal_ts: float | None) -> dict[str, dict]:
+    """Les retenues posées après le jalon terminal d'un lot fusionné (#3497).
+
+    Après une fusion, les écritures d'état du harnais (`merged` d'un
+    review-after-merge, `blocked` de la fermeture retenue) ne sont pas des
+    reprises : `active_holds` remet la retenue à zéro à chaque changement
+    d'état, ce qui perdait la retenue de fermeture de #3444 (`hold:` de
+    04:44:17, `merged` concurrent de 04:44:23). Une retenue posée dans cet
+    intervalle tient donc jusqu'à une levée explicite ou une vraie reprise
+    (`intake`, `build`, `qa`) ; une retenue antérieure à la fusion est du
+    ressort d'`active_holds` et n'est jamais ressuscitée ici."""
+    from . import planned_waits
+
+    if terminal_ts is None:
+        return {}
+    held: dict[str, dict] = {}
+    for event in sorted(events or (),
+                        key=lambda e: (float(e.get("at_ts") or 0.0),
+                                       int(e.get("id") or 0))):
+        if float(event.get("at_ts") or 0.0) <= terminal_ts:
+            continue
+        state = str(event.get("state") or "")
+        if state in _OPEN_STATES:
+            held = {}                   # vraie reprise : la retenue est finie
+        text = str(event.get("note") or "").strip()
+        if not text:
+            continue
+        who = event.get("actor") or ""
+        if planned_waits.is_hold_note(text):
+            held[who] = {"by": who or None,
+                         "since": float(event.get("at_ts") or 0.0),
+                         "note": text, "pilot": False}
+        elif planned_waits.is_lift_note(text):
+            # Une levée explicite lève la retenue de fermeture : le débit ne
+            # ressuscite pas une retenue que le journal dit levée. L'autorité
+            # de la levée n'est pas rejugée ici (la lecture d'autorité reste
+            # `active_holds`, #3219).
+            held = {}
+    return held
 
 
 def _current_state(events: list[dict]) -> str | None:
@@ -736,6 +805,21 @@ def build(*, items: Iterable[Mapping[str, Any]],
         holds = {ident: _holds_from_events(values)
                  for ident, values in events_by_lot.items()}
     hold_by_lot = {int(ident): dict(value) for ident, value in (holds or {}).items()}
+    # #3497 : après un jalon terminal, une retenue de fermeture survit aux
+    # écritures d'état `merged`/`blocked` du harnais (voir `_closure_holds`).
+    # Un lot vraiment rouvert (build/qa après la fusion) relève d'`active_holds` :
+    # ses changements d'état sont réels et lèvent la retenue.
+    for ident, lot_milestones in milestones_by_lot.items():
+        terminal_ts = _terminal_at(lot_milestones)
+        if terminal_ts is None or _reopened(events_by_lot.get(ident, []), terminal_ts):
+            continue
+        closure = _closure_holds(events_by_lot.get(ident, []), terminal_ts)
+        entries = hold_by_lot.setdefault(ident, {})
+        for who, entry in closure.items():
+            current = entries.get(who)
+            if current is None or float(entry["since"]) > float(
+                    current.get("since") or 0.0):
+                entries[who] = entry
     held_lots = {ident for ident, entries in hold_by_lot.items() if entries}
     #: branches des lots encore ouverts : une cible de lot qui en nomme une
     #: est une dépendance (le lot entre avec son parent), pas un paquet dû.
@@ -845,8 +929,7 @@ def build(*, items: Iterable[Mapping[str, Any]],
             device = match_device(note, devices)
             versions = _versions(note)
             version = max(versions) if versions else None
-            undeployed = bool(re.search(r"pas\s+d[ée]ploy[ée]|non\s+d[ée]ploy[ée]",
-                                        note, re.I)) \
+            undeployed = bool(_UNDEPLOYED.search(note)) \
                 or any(_version_gt(item, installed_triple) for item in versions)
             entry = {
                 "lot": ident, "title": item.get("title") or "",
