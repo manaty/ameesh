@@ -135,6 +135,52 @@ class PacketReplacementTest(unittest.TestCase):
                         url="https://github.com/manaty/ameesh/runs/121076818019")
         self.assert_gate(witness() + [unknown], False)
 
+    def test_packet_cancelled_before_the_pr_opened_is_replaced_once_tests_is_green(self):
+        # #3621 (h-24, PR #2802, run paquet 40239302259) : le portier part
+        # sans PR (covered=false), puis il est annulé quand le run
+        # `pull_request` prend la suite ; plan et parts CANCELLED, l'agrégat
+        # démarré après l'annulation conclut FAILURE, son détail aussi. Tant
+        # que `tests` de la PR n'a pas conclu, la porte reste retenue sur
+        # `tests` ; dès qu'il est vert, le portier annulé est remplacé.
+        def at(entry, started):
+            return dict(entry, startedAt=started)
+        parts = [check("suite complète du paquet / " + name, "CANCELLED",
+                       workflow="paquet", end=OLD)
+                 for name in ("plan", "psql ${{ matrix.part }}/${{ needs.plan.outputs.psql_parts }}",
+                              "plateforme macOS", "bilan des impactés")]
+        packet = [check("couverture (PR ouverte sur cette tête)", workflow="paquet", end=OLD),
+                  check("suite complète du paquet / version number", "SKIPPED",
+                        workflow="paquet", end=OLD),
+                  *parts,
+                  check("suite complète du paquet / tests", "FAILURE",
+                        workflow="paquet", end="2026-10-20T11:54:26Z"),
+                  at(check(radar.AGGREGATE_DETAIL_CHECK, "FAILURE", workflow="paquet",
+                           url="https://github.com/manaty/ameesh/runs/121309581653"),
+                     "2026-10-20T11:54:20Z")]
+        flux = check("tests (flux) psql 9/16", workflow="paquet",
+                     url="https://github.com/manaty/ameesh/runs/121308158787")
+        running = packet + [check("psql 9/16", "", end=None) | {"status": "IN_PROGRESS"},
+                            flux | {"status": "IN_PROGRESS", "conclusion": "",
+                                    "completedAt": None}]
+        status = fire._pr_status("manaty/ameesh", "integration/paquet-h-2876",
+                                 gh=gh_for(running))
+        ready, why = fire.ready_pr(status, target="main", project=None,
+                                   frozen=SHA, required=("tests",))
+        self.assertFalse(ready)
+        self.assertIn("tests (absent)", why)
+        self.assert_gate(running, False)
+        for workflow in ("paquet", "tests"):
+            # le détail de la PR peut être rattaché à la suite `paquet` (#3494)
+            # ou à la sienne : dans les deux cas le plus récent décide.
+            detail = at(check(radar.AGGREGATE_DETAIL_CHECK, workflow=workflow,
+                              url="https://github.com/manaty/ameesh/runs/121330000000"),
+                        "2026-10-20T12:19:50Z")
+            green = packet + [check("psql 9/16"), flux, check("tests"), detail]
+            with self.subTest(detail=workflow):
+                # `ci_green` (preuve stricte) ne normalise pas le détail entre
+                # workflows ; la porte du feu/paquet le fait (#3251).
+                self.assert_gate(green, workflow == "paquet", gate=True)
+
     def test_missing_skipped_failed_or_pending_pr_never_replaces_packet(self):
         rows = witness()
         self.assert_gate([c for c in rows if c["name"] != "tests"], False)
