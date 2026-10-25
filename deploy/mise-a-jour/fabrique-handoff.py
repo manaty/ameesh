@@ -34,7 +34,7 @@ import re
 import stat
 from collections.abc import Mapping
 
-from ameesh import handoff_contract, host_preflight, projects
+from ameesh import handoff_contract, handoff_credentials, host_preflight, projects
 from ameesh.config import NAME_RE
 
 
@@ -253,7 +253,7 @@ def _transports(value, hosts, local_host, root):
     return result
 
 
-def _trusted_source(path, name):
+def _trusted_source(path, name=COMPANION_NAME):
     """A companion is a fixed file next to this factory, not group-writable.
 
     The installed tree is pinned by the H7 enrollment; this check refuses a
@@ -494,3 +494,27 @@ class HandoffFactory:
         if repository is None:
             raise FactoryError('repository:' + project)
         return repository
+
+    def credential_bridge(self, *, delivery_for=None, guard=None):
+        """H4: compose reference delivery with the controller's held guard.
+
+        No host effect at construction. H2/H3 provide the durable effect guard;
+        H7 enrolls the L232c policy/transport builder. Missing bindings refuse
+        delivery explicitly. Read-only check uses fresh credential_health.
+        """
+        if delivery_for is None:
+            source = Path(__file__).absolute().with_name('secrets-handoff.py')
+            # Check the transitive import chain before executing any companion.
+            for name in ('secrets-handoff.py', 'coffre-release.py',
+                         'transport-secrets.py', 'transport-release.py',
+                         'controleur-release.py'):
+                _trusted_source(source.with_name(name), name)
+            try:
+                spec = importlib.util.spec_from_file_location('handoff_secrets', source)
+                module = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(module)
+                delivery_for = module.DeliveryBuilder(controller_host=self.host)
+            except Exception:
+                raise FactoryError('source:secrets-handoff.py') from None
+        return handoff_credentials.CredentialBridge(
+            self, delivery_for=delivery_for, guard=guard)
