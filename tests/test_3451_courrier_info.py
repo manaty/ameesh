@@ -15,10 +15,11 @@ Postgres réel.
 """
 from __future__ import annotations
 
+import os
 import time
 import unittest
 
-from ameesh import adapters, mail, registry
+from ameesh import adapters, authority, mail, registry, signing
 from ameesh.storage.postgres.mailbox import PASSIVE_SQL
 
 from .test_l125_courrier_regroupe import _Base, _ligne
@@ -98,6 +99,28 @@ class EnvoiInfoTest(_Base):
             proc = self._envoi("orch", "x", "--info", contraire)
             self.assertEqual(proc.returncode, 2, contraire)
             self.assertIn("--info and", proc.stderr)
+
+
+    def test_envoi_signe_sans_info_reste_actif(self):
+        # relecture cx3 : les renseignements de clé (cmd_send) écrasaient le
+        # drapeau --info ; tout envoi signé avec clé enregistrée devenait passif
+        for name in ("orch", "dev1"):
+            registry.upsert(self.db, name, harness="claude")
+        seed = signing.backend("pure").generate_seed()
+        authority.register_key(self.db, "dev1",
+                               signing.backend("pure").public_from_seed(seed))
+        key = os.path.join(self.tmp, "dev1.key")
+        with open(key, "w", encoding="utf-8") as fh:
+            fh.write(signing.encode_private(seed))
+        os.chmod(key, 0o600)
+        proc = self._envoi("orch", "Décision signée : à appliquer", "--sign", "--key", key)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertNotIn("info", self._payload("orch"))
+        self.assertEqual(mail.passive_reason(mail.unread(self.db, "orch")[-1]), "")
+        proc = self._envoi("orch", "Lot 12 : rien à faire", "--sign", "--key", key, "--info")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertTrue(self._payload("orch").get("info"))
+        self.assertEqual(mail.passive_reason(mail.unread(self.db, "orch")[-1]), "info")
 
 
 if __name__ == "__main__":  # pragma: no cover

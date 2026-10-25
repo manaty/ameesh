@@ -292,7 +292,7 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
     args = [arg for arg in args if arg != "--ack"]
     # #3451 : information sans geste attendu (compte rendu « rien à faire »,
     # état inchangé) — lue au prochain tour du destinataire, sans réveil
-    info = "--info" in args
+    passif_info = "--info" in args
     args = [arg for arg in args if arg != "--info"]
     # #964: `--assign` is the explicit gesture that lets a `--lot` assign a
     # FREE lot (or one held by a human) to the recipient, even outside the
@@ -367,7 +367,7 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
         print("--ack and --assign contradict each other: an acknowledgement does not hand over work",
               file=sys.stderr)
         return 2
-    if info and (urgent or marks or new_lot is not None or assign):
+    if passif_info and (urgent or marks or new_lot is not None or assign):
         print("--info and --%s contradict each other: an information does not wake, "
               "interrupt a turn nor hand over work"
               % ("urgent" if urgent else marks[0] if marks
@@ -559,7 +559,7 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
                and lot is None and new_lot is None and kind in ("notify", "reply")
                and mail.looks_like_ack(text)):
         payload["ack"] = True
-    if info:
+    if passif_info:
         payload["info"] = True
     if request_expires is not None:
         # #2814 : échéance de REQUÊTE explicite, distincte de la TTL de
