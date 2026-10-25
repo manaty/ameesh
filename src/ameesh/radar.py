@@ -1503,6 +1503,25 @@ def merge_rollup(rollup, *, slug: str, head: str, branch: str, gh) -> list:
     if len(aggregate) != 1 or aggregate[0].get("conclusion") != "SUCCESS":
         return rows
 
+    #: #3494 : les checks publiés par les étapes du workflow appelé (flux des
+    #: parts `tests (flux) …`, détail de l'agrégat `tests (bilan des parts)`)
+    #: sont rattachés par la forge à la suite `paquet` de la tête ; leur
+    #: `detailsUrl` (`/runs/<check-id>`) ne désigne aucun run Actions. Ils ne
+    #: prouvent pas le portier : les compter comme tels rendait sa preuve
+    #: illisible et la sentinelle `paquet (run proof unavailable)` bloquait la
+    #: fusion du paquet (h-15, run 40158149836). Ils restent dans le rollup,
+    #: avec leurs portes propres (agrégat, flux).
+    def custom(check):
+        name = str(check.get("name") or check.get("context") or "")
+        return name == AGGREGATE_DETAIL_CHECK or name.startswith("tests (flux)")
+
+    all_packet = [c for c in original if c.get("__typename") == "CheckRun"
+                  and c.get("workflowName") == "paquet" and not custom(c)]
+    packet = [c for c in all_packet
+              if (c.get("name") in ("couverture (PR ouverte sur cette tête)",
+                                    "suite complète du paquet")
+                  or (c.get("name") or "").startswith("suite complète du paquet / "))]
+
     def blocked():
         return rows + [{"__typename": "CheckRun", "name": "paquet (run proof unavailable)",
                         "status": "COMPLETED", "conclusion": "FAILURE"}]
@@ -1564,7 +1583,7 @@ def merge_rollup(rollup, *, slug: str, head: str, branch: str, gh) -> list:
         runs = [r for r in runs if r.get("path") == ".github/workflows/paquet.yml"]
         if not runs:
             # Aucun portier créé : la PR porte toute la validation.
-            return rows if not any(c.get("workflowName") == "paquet" for c in rows) else blocked()
+            return rows if not all_packet else blocked()
         if any(r.get("status") != "completed" for r in runs):
             return blocked()  # y compris une nouvelle tentative d'un ancien run
         latest = max(runs, key=lambda r: r["id"])
@@ -1585,11 +1604,6 @@ def merge_rollup(rollup, *, slug: str, head: str, branch: str, gh) -> list:
     except (ValueError, KeyError, TypeError, AttributeError, OSError, RuntimeError):
         return blocked()
 
-    all_packet = [c for c in original if c.get("__typename") == "CheckRun"
-                  and c.get("workflowName") == "paquet"]
-    packet = [c for c in all_packet
-              if (c.get("name") == "couverture (PR ouverte sur cette tête)"
-                   or (c.get("name") or "").startswith("suite complète du paquet / "))]
     # Le run annulé le plus récent doit être visible : un CANCELLED d'un
     # ancien run ne permet jamais de retirer les FAILURE d'un nouveau run.
     ids = [run_id(c) for c in all_packet]
@@ -1663,8 +1677,15 @@ def never_concluded(state) -> bool:
 
 
 #: #3221 : les états qu'une porte écrit entre parenthèses après le nom consigné
+#: #3530 : `ci_reading` écrit aussi `(état; URL)` et l'état d'un job encore en
+#: cours (`in_progress`, `queued`) — la casse reste libre.
 CI_CONSIGNED_STATES = (CI_INCONCLUSIVE | CI_INCONCLUSIVE_STATES | CI_NEGATIVE
-                       | frozenset(("SUCCESS", "PENDING", "EXPECTED", "?")))
+                       | frozenset(("SUCCESS", "PENDING", "EXPECTED", "?",
+                                    "IN_PROGRESS", "QUEUED")))
+
+#: #3530 : l'URL du run que `release_cutoff.ci_reading` met après l'état dans
+#: le suffixe consigné. Absente ou vide (`(cancelled; )`) : rien à garder.
+_CONSIGNED_URL = re.compile(r"^https?://\S*$", re.IGNORECASE)
 
 #: #3251 : check de détail publié par l'étape « bilan des parts » de
 #: `.github/workflows/tests.yml` (scripts/ci-agregat.py), à chaque exécution.
@@ -1699,18 +1720,31 @@ def aggregate_detail_entries(rollup) -> list:
     return latest_rollup(rows)
 
 
+def _consigned_suffix(group: str) -> bool:
+    """#3530 : le suffixe d'occurrence écrit par `release_cutoff.ci_reading` —
+    `ÉTAT[, ÉTAT]` puis, éventuellement, `; URL` — ne contient que des états
+    connus. Une parenthèse du nom (`linux`, `linux; arm64`) ne l'est pas."""
+    chunks = [chunk.strip() for chunk in str(group or "").split(";")]
+    states = [state.strip().upper() for state in chunks[0].split(",")]
+    if not states or not all(states) \
+            or any(state not in CI_CONSIGNED_STATES for state in states):
+        return False
+    return all(not chunk or _CONSIGNED_URL.match(chunk) for chunk in chunks[1:])
+
+
 def nonconclusive_source(app: str, entry: str) -> str:
     """#3209 : la clé du lot de correction d'un check non concluant — l'app
     et le **nom du check**, sans l'état consigné (`tests (CANCELLED)` →
     `tests`) ni la tête : le même check au paquet suivant ou à la release
     retrouve le lot encore ouvert (`work.add_or_note`).
     #3221 : seul un suffixe fait d'états connus est retiré ; une parenthèse du
-    nom (`tests (linux)`, nom brut de la release) reste dans la clé."""
+    nom (`tests (linux)`, nom brut de la release) reste dans la clé.
+    #3530 : `ci_reading` écrit `(état; URL)` (et l'état d'un job encore en
+    cours, `in_progress` / `queued`) ; l'URL et l'état ne font pas partie de
+    la clé, sinon chaque occurrence rouvre un lot."""
     text = str(entry or "").strip()
     match = re.match(r"^(.*?)\s*\(([^()]*)\)$", text)
-    if match and match.group(1) and all(
-            state.strip().upper() in CI_CONSIGNED_STATES
-            for state in match.group(2).split(",")):
+    if match and match.group(1) and _consigned_suffix(match.group(2)):
         text = match.group(1)
     return "nonconclusive:%s:%s" % (app, text)
 

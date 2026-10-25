@@ -699,6 +699,27 @@ class PorteeTest(ServeurExecTest):
                                        " WHERE name = 'nouveau'")[0]["n"], 0)
 
 
+class RetraitTest(ServeurExecTest):
+    """#3460 : un agent retiré n'est ni dans l'annuaire réduit de la session,
+    ni destinataire d'un `mailbox.send` (refus serveur, pas seulement client)."""
+
+    def test_retired_agent_is_out_of_the_directory_and_never_a_recipient(self):
+        self.db.execute("UPDATE agent_registry SET retired_at = now(),"
+                        " retired_by = 'human:x', retired_reason = 'test'"
+                        " WHERE name = 'coord'")
+        overview = self.op("agents.overview", token=SESSION).body["value"]
+        self.assertNotIn("coord", [r["name"] for r in overview])
+        self.assertIn("inge-front", [r["name"] for r in overview])
+        refused = self.op("mailbox.send", ["inge-front", "coord", "x"],
+                          {"host": None, "kind": "request", "payload": None,
+                           "work_item_id": None, "signature": None, "signature_key": None,
+                           "signed_payload": None, "nonce": None, "created_us": None,
+                           "expires_us": None}, token=SESSION)
+        self.assertEqual(refused.body["error"], "bad_args")
+        self.assertEqual(self.db.query("SELECT count(*) AS n FROM agent_mailbox"
+                                       " WHERE recipient = 'coord'")[0]["n"], 0)
+
+
 class FencingTest(ServeurExecTest):
 
     FENCE = ("inge-front", OWNER, 42)

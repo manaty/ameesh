@@ -26,6 +26,7 @@
 --
 --   CREATE ROLE supervision_outil LOGIN IN ROLE ameesh_superviseur;
 --   ALTER ROLE supervision_outil SET default_transaction_read_only = on;
+--   ALTER ROLE supervision_outil SET jit = off;  -- #3503 : pas de compilation JIT
 --   -- mot de passe : \password supervision_outil (jamais dans un fichier versionné)
 --
 -- Ce qui est EXCLU, et pourquoi (le test tests/test_cluster.py vérifie que
@@ -250,7 +251,11 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         'workstream',
         -- L244 (0427) : rôles déclarés d'une fiche Agent/Persona (des noms,
         -- pas de contenu) — comme `projects`, le garde QA les lit
-        'roles'
+        'roles',
+        -- 0484 (#3460, décision #135690 a) : retrait d'un agent — un instant,
+        -- le nom de qui l'a retiré et la raison de cet état (même nature que
+        -- `stop_reason` et `status_text`, pas de contenu)
+        'retired_at', 'retired_by', 'retired_reason'
     ]),
     ('authenticator_syncs', ARRAY[
         'id', 'root_member', 'root_commit', 'commits', 'branch', 'trust',
@@ -658,6 +663,10 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         -- #705 (0421) : le relecteur désigné d'un lot en qa — l'alerte
         -- stale_lot le nomme, le superviseur doit donc le lire
         'reviewer', 'reviewers',
+        -- #3447 (0482) : exécutant externe déclaré d'un lot (un nom d'agent
+        -- ou d'humain, de l'ÉTAT comme `assignee` ; NULL = lot ordinaire) —
+        -- le superviseur lit à qui le lot est réservé
+        'external_executor',
         -- #2466 (0466) : échéance du réveil programmé d'un lot et bail de
         -- livraison (des instants, de l'ÉTAT) — sans eux, la lecture de la
         -- ligne par `to_jsonb` échouerait pour le rôle à droits de colonne

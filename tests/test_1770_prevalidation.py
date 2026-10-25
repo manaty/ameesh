@@ -113,6 +113,19 @@ class SelectionTest(unittest.TestCase):
         sel = pv.selection(plan, head=A)
         self.assertIn("selection-unsafe", sel.causes)
 
+    def test_carte_perimee_marquee_refusee(self):
+        # #3450 : une carte périmée juge encore le diff propre d'un lot en CI,
+        # mais la prévalidation au gel exige une carte fraîche ; le refus
+        # garde sa cause nommée.
+        plan = plan_sain()
+        plan["map"] = {"commit": B, "used": True, "problem": None,
+                       "age_h": 176.0, "stale": True}
+        plan["phase2_safe"] = False
+        plan["phase2_why"] = "map older than 24 h (176 h)"
+        sel = pv.selection(plan, head=A)
+        self.assertIn("card-stale", sel.causes)
+        self.assertIn("périmée", sel.why)
+
     def test_tete_changee_refusee(self):
         plan = plan_sain()
         plan["head"] = B

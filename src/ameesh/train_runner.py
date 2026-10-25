@@ -395,7 +395,9 @@ class Passage:
         read) would count reviews differently from the merge gate. No new
         packet is composed; a packet already in flight keeps its terminal
         path (CI, promotion or drain), and a paused train stays paused. The
-        pin never follows the gate by itself (#1467).
+        host refresh may first qualify the pin automatically when the audited
+        diff leaves the train rules unchanged (#3483); this guard refuses any
+        mismatch that remains after refresh.
         """
         if self.canon is None:
             return None
@@ -663,12 +665,15 @@ class Service:
                     if self.lease is not None and self.lease.epoch is not None:
                         self._release_tenure()
                         self.report("train role lost: service lease released")
+                    # #3483: standby hosts also maintain their local canon pin.
+                    self._reload_pin()
                     with self.condition:
                         if self.stop.is_set():
                             return
                         self.condition.wait(timeout=ROLE_RETRY_S)
                     continue
                 if not self._lease_ready():
+                    self._reload_pin()
                     with self.condition:
                         if self.stop.is_set():
                             return

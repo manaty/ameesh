@@ -544,7 +544,9 @@ class ConfigTest(unittest.TestCase):
         cfg = config_mod.Config(statement_timeout_ms=0)
         self.assertNotIn("read_only", db_mod.startup_options(cfg))
         ro = __import__("dataclasses").replace(cfg, read_only=True)
-        self.assertEqual(db_mod.startup_options(ro), "-c default_transaction_read_only=on")
+        # #3503 : jit=off est toujours le dernier réglage du paquet de démarrage
+        self.assertEqual(db_mod.startup_options(ro),
+                         "-c default_transaction_read_only=on -c jit=off")
 
 
 if __name__ == "__main__":

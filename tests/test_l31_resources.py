@@ -217,6 +217,28 @@ class ResourcesDbTest(PgTestCase):
         self.assertIn("pc-test", texte.stdout)
         self.assertIn("thresholds", texte.stdout)
         self.assertIn("pressure", texte.stdout)
+        # #3452 : le relevé frais porte son âge et n'est pas périmé
+        self.assertFalse(objet["stale"])
+        self.assertIsNotNone(objet["sampled_age_s"])
+        self.assertLess(objet["sampled_age_s"], 600)
+
+    def test_cli_hosts_releve_perime_sans_pression(self):
+        """#3452 : un relevé plus vieux que le seuil `host_unsampled` n'est pas
+        courant : `hosts` publie son âge et ne calcule pas de pression dessus,
+        au lieu d'afficher un verdict sur une mesure d'hier."""
+        self.record(host="pc-vieux", mem_available_bytes=1024 ** 3, load1=0.2)
+        self.db.execute("UPDATE host_resources SET sampled_at = now() - interval '2 hours'"
+                        " WHERE host = 'pc-vieux'")
+        proc = self.mesh("hosts", "pc-vieux", "--json")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        [objet] = [json.loads(line) for line in proc.stdout.splitlines() if line.strip()]
+        self.assertTrue(objet["stale"])
+        self.assertGreaterEqual(objet["sampled_age_s"], 7000)
+        self.assertIsNone(objet["pressure"])
+        texte = self.mesh("hosts", "pc-vieux")
+        self.assertEqual(texte.returncode, 0, texte.stderr)
+        self.assertIn("reading stale, no verdict", texte.stdout)
+        self.assertNotIn("pressure   none", texte.stdout)
 
     def test_executeur_publie_un_releve(self):
         proc = self.runner("--once", "--wait", "0",

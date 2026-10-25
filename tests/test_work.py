@@ -299,8 +299,8 @@ class DelaysTest(PgTestCase):
         work.move(self.db, item["id"], "build")
         work.milestone(self.db, item["id"], "frozen", sha="c" * 40)
         work.milestone(self.db, item["id"], "verdict", verdict="ok", sha="c" * 40)
-        for state in ("qa", "merged"):
-            work.move(self.db, item["id"], state)
+        self.assertEqual(work.get(self.db, item["id"])["state"], "qa")
+        work.move(self.db, item["id"], "merged")
         kinds = [row["kind"] for row in work.milestones(self.db, item["id"])]
         self.assertEqual(kinds.count("frozen"), 2)
         self.assertEqual(kinds.count("verdict"), 2)

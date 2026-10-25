@@ -741,7 +741,7 @@ def attribution_of_head(db, item: Mapping, milestone: Optional[Mapping],
                         repo: str, base: str, head: str, *, families=(),
                         commits=None, strict: bool = False,
                         families_out: Optional[dict] = None,
-                        target: str = "") -> tuple[list, list, list]:
+                        target: str = "", admitted_heads=()) -> tuple[list, list, list]:
     """`(auteurs, inconnus, correcteurs)` de la plage gelée `base..head` (#2681/#2739).
 
     La même lecture partagée que la désignation (`review_authors.reading`),
@@ -769,7 +769,8 @@ def attribution_of_head(db, item: Mapping, milestone: Optional[Mapping],
     return review_authors.reading(db, item, milestone, commits, repo,
                                   families=families, strict=strict,
                                   families_out=families_out,
-                                  base=base, head=head, target=target)
+                                  base=base, head=head, target=target,
+                                  admitted_heads=admitted_heads)
 
 
 def corrections_of_head(db, item: Mapping, milestone: Optional[Mapping],
@@ -2776,6 +2777,9 @@ def _unreachable_reviewer(row: Optional[Mapping], closed_hosts: set) -> str:
     """
     if row is None:
         return "absent from the registry"
+    # #3460 : un agent retiré ne reçoit plus de courrier, son siège est mort
+    if rd.is_retired(row):
+        return "retired"
     if (row.get("mode") or "execute") != "execute":
         return "mode %s" % (row.get("mode"),)
     status = str(row.get("status") or "").strip().lower()

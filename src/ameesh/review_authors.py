@@ -20,7 +20,9 @@ auteurs, avec les mêmes exceptions du canon §2 :
   auteur de la tête (#2888) : sa famille n'est plus éligible. Le seuil ne
   décide que de la recevabilité process (une correction trop grosse revient à
   l'auteur), jamais de l'indépendance. Le correcteur reste tenu hors des
-  relecteurs par son nom (#2739) ;
+  relecteurs par son nom (#2739). Exception #3518 : une correction dont tous
+  les chemins sont des tests reconnus (§11 bis), hors plan CI et hors classe
+  sensible du projet, garde seulement cette exclusion personnelle ;
 * une réécriture d'historique **à contenu identique** n'efface pas la
   provenance (#2924) : les auteurs des gels antérieurs du même lot dont le
   contenu subsiste restent auteurs de la tête. Une consolidation sur une cible
@@ -324,6 +326,39 @@ def change(repo: str, sha: str) -> Optional[tuple[int, bool]]:
         if path.startswith(DESIGN_PREFIXES):
             design = True
     return lines, design
+
+
+def _test_only_correction(repo: str, entries, project: str) -> bool:
+    """All changed paths must be test adaptations (§2/§11 bis, #3518).
+
+    Reuse the vehicle's test recognition and the project risk class. CI plans,
+    sensitive paths and unreadable or
+    empty diffs never buy an exception to the author-family exclusion.
+    --no-renames includes both sides of a move out of product code.
+    """
+    from . import config, lot_class, packet_reviews, work
+
+    if not repo or not entries:
+        return False
+    changed = set()
+    for sha, _family in entries:
+        text = plan_git._out(repo, "show", "--format=", "--name-only", "-z",
+                             "--no-renames", sha)
+        if text is None:
+            return False
+        paths = [path for path in text.split("\0") if path]
+        if not paths or any(packet_reviews._CI_PLAN.search(path)
+                            or not packet_reviews._TEST.search(path)
+                            for path in paths):
+            return False
+        changed.update(paths)
+    try:
+        klass = lot_class.class_of_paths(
+            work.configured_canons(config.load()), project, sorted(changed))
+    except Exception:  # noqa: BLE001 - unknown policy never grants an exception
+        return False
+    return (not klass.get("doubt")
+            and klass.get("class") in (lot_class.LIGHT, lot_class.NORMAL))
 
 
 def _registered(db, name: str) -> bool:
@@ -1832,15 +1867,18 @@ def _prior_reading(db, item: Mapping, freeze: Mapping, commits: Sequence[str],
             record_unreadable(sha)
             continue
         proven = _family(receipt.get("harness"), families)
-        by_name.setdefault(actor, set()).add(proven)
         written.setdefault(actor, []).append(sha)
         if actor != author_name and actor in reviewers:
             review_commits.setdefault(actor, []).append((sha, proven))
+        else:
+            by_name.setdefault(actor, set()).add(proven)
     # #2924 B4 : la lecture courante promeut tout commit de relecteur en auteur
     # (#2888). La lecture d'un gel antérieur doit faire de même, même quand le
     # commit n'a pas de reçu exact et que la famille vient du journal des tours
     # (#2721) : sinon un squash à contenu identique perdrait cette famille.
     for actor, entries in review_commits.items():
+        if _test_only_correction(repo, entries, str(item.get("app") or "")):
+            continue
         by_name.setdefault(actor, set())
         for _sha, proven in entries:
             if proven:
@@ -1890,7 +1928,7 @@ def _received_patch_authors(db, repo: str, commits: Sequence[str], families,
     return out
 
 
-def _prior_correctors(repo: str, review_commits: Mapping) -> dict:
+def _prior_correctors(repo: str, review_commits: Mapping, project: str = "") -> dict:
     """Les correctifs de premier tour d'un gel antérieur, par acteur.
 
     Même seuil que `reading` (#2888) : le seuil ne décide que de la trace
@@ -1905,7 +1943,8 @@ def _prior_correctors(repo: str, review_commits: Mapping) -> dict:
                 design = True
                 break
             total += measured[0]
-        if design or total > REVIEWER_FIX_LINES:
+        test_only = _test_only_correction(repo, entries, project)
+        if not test_only and (design or total > REVIEWER_FIX_LINES):
             continue
         proven = {value for _sha, value in entries if value}
         family = next(iter(proven)) if len(proven) == 1 else ""
@@ -1913,6 +1952,8 @@ def _prior_correctors(repo: str, review_commits: Mapping) -> dict:
         # seulement sa réduction à une famille unique (vide si ambiguë).
         out[actor] = {"name": actor, "family": family,
                       "families": sorted(proven)}
+        if test_only:
+            out[actor]["test_only"] = True
     return out
 
 
@@ -1980,7 +2021,7 @@ def _carried_from_previous(db, item: Mapping, milestone: Optional[Mapping],
                            commits: Sequence[str], repo: str, families, *,
                            base: str = "", head: str = "", provider=None,
                            strict: bool = False, target: str = "",
-                           recover=None) -> tuple[list, list, list]:
+                           recover=None, admitted_heads=()) -> tuple[list, list, list]:
     """Auteurs/correcteurs des gels antérieurs dont le contenu subsiste (#2924).
 
     Rend `(auteurs, inconnus, correcteurs)` à fusionner dans la lecture de la
@@ -2262,6 +2303,8 @@ def _carried_from_previous(db, item: Mapping, milestone: Optional[Mapping],
         earlier = _commits_between(repo, start, sha)
         if earlier is not None:
             earlier = _not_in_target(repo, earlier, target_sha)
+            for admitted in admitted_heads:
+                earlier = _not_in_target(repo, earlier, admitted)
         if earlier is None:
             if strict:
                 raise review_provenance.ProvenanceError(
@@ -2329,8 +2372,6 @@ def _carried_from_previous(db, item: Mapping, milestone: Optional[Mapping],
             # correction survit.
             if not survives(written, stored, actor, content=True):
                 continue
-            if actor in correctors:
-                continue
             # Mesure le seuil sur les correctifs que la plage courante ne
             # couvre pas : ceux qu'elle couvre ont déjà été jugés par
             # `_surviving_review_commits` (#3335).
@@ -2339,7 +2380,12 @@ def _carried_from_previous(db, item: Mapping, milestone: Optional[Mapping],
                 if plan_git.full_commit_id(str(
                     entry[0] if isinstance(entry, (tuple, list)) else entry))
                 not in current_set]
-            correctors.update(_prior_correctors(repo, {actor: prior_entries}))
+            rows = _prior_correctors(
+                repo, {actor: prior_entries}, str(item.get("app") or ""))
+            for name, row in rows.items():
+                if name in correctors and not correctors[name].get("test_only"):
+                    row.pop("test_only", None)
+                correctors[name] = row
     authors = []
     for actor in sorted(carried):
         proven = {value for value in carried[actor] if value}
@@ -2360,7 +2406,7 @@ def reading(db, item: Mapping, milestone: Optional[Mapping],
             strict: bool = False, trace: bool = False,
             families_out: Optional[dict] = None,
             base: str = "", head: str = "", target: str = "",
-            recover=None) -> tuple[list, list, list]:
+            recover=None, admitted_heads=()) -> tuple[list, list, list]:
     """`(auteurs, inconnus, correcteurs)` de la plage gelée, même lecture pour tous.
 
     `reference` est l'auteur de référence déjà lu (`reference_author`) : la
@@ -2388,7 +2434,11 @@ def reading(db, item: Mapping, milestone: Optional[Mapping],
     (#2888) : leur famille est exclue comme celle de tout auteur, et l'agent
     lui-même ne relit pas son propre correctif. `correctors` garde leur trace
     (provenance réelle) pour l'exclusion personnelle ; ce n'est plus une
-    éligibilité de famille. Un correctif au-delà du seuil ou de conception est
+    éligibilité de famille. Exception #3518 : un correctif de tests seuls,
+    non sensible selon le projet, reste dans `correctors` avec `test_only`,
+    quelle que soit sa taille, mais n'ajoute pas un auteur produit. La
+    désignation ignore sa famille et exclut toujours son nom. Le report des
+    gels antérieurs garde cette distinction. Un correctif au-delà du seuil ou de conception est
     aussi un auteur, mais n'est pas un « correcteur » de premier tour.
     #3335 : cette promotion et la trace « correcteur » suivent la survie du
     contenu (#3220). Un correctif de relecteur dont aucune ligne significative
@@ -2433,6 +2483,11 @@ def reading(db, item: Mapping, milestone: Optional[Mapping],
     antérieur garde tout l'ensemble (`families_out`), jamais la seule famille
     du reçu courant.
 
+    #3513 : `admitted_heads` sont les gels des membres déjà admis par la
+    porte du même véhicule. Leurs commits sont écartés de la plage courante
+    et des gels antérieurs, comme ceux de la cible ; aucun autre tiers
+    ne bénéficie de cette exclusion. Une lecture Git impossible ne retire rien.
+
     #3116 : `target` est la cible au moment de la lecture (commit ou ref). Un
     commit qui y est déjà entré ne compte ni comme auteur ni comme tiers du
     lot, qu'il vienne de la plage courante ou du report d'un gel antérieur :
@@ -2444,6 +2499,8 @@ def reading(db, item: Mapping, milestone: Optional[Mapping],
     packet = bool(packet_composer(item))
     target_sha = target_commit(repo, target) or target_commit(repo, base)
     commits = _not_in_target(repo, commits, target_sha)
+    for admitted in admitted_heads:
+        commits = _not_in_target(repo, commits, admitted)
     proven_reference: dict = dict(reference_families or {})
     if reference is None:
         reference = reference_author(db, item, milestone, families,
@@ -2548,8 +2605,10 @@ def reading(db, item: Mapping, milestone: Optional[Mapping],
     # #2888 : toute correction d'un relecteur désigné fait de lui un auteur de
     # la tête, quelle que soit sa taille. Le seuil du §2 ne décide que de la
     # recevabilité process (une correction trop grosse revient à l'auteur),
-    # jamais de l'indépendance : sa famille n'est plus éligible.
+    # jamais de l'indépendance. #3518 : seuls les tests non sensibles font
+    # exception à l'exclusion de famille ; le nom reste exclu.
     small_correctors: set[str] = set()
+    test_correctors: set[str] = set()
     for actor, entries in sorted(review_commits.items()):
         total, design = 0, False
         for sha, _proven in entries:
@@ -2558,18 +2617,22 @@ def reading(db, item: Mapping, milestone: Optional[Mapping],
                 design = True
                 break
             total += measured[0]
-        by_name.setdefault(actor, set())
-        for _sha, proven in entries:
-            if proven:
-                by_name[actor].add(proven)
-        if not design and total <= REVIEWER_FIX_LINES:
+        if _test_only_correction(repo, entries, str(item.get("app") or "")):
+            test_correctors.add(actor)
+        else:
+            by_name.setdefault(actor, set())
+            for _sha, proven in entries:
+                if proven:
+                    by_name[actor].add(proven)
+        if actor in test_correctors or (not design and total <= REVIEWER_FIX_LINES):
             small_correctors.add(actor)
     # #2924 : les auteurs des gels antérieurs dont le contenu subsiste restent
     # auteurs de cette tête. Une réécriture à contenu identique ne les efface
     # pas ; un contenu réellement réécrit n'est pas repris (le doute conserve).
     carried, carried_unknown, carried_correctors = _carried_from_previous(
         db, item, milestone, commits, repo, families, base=base, head=head,
-        provider=provider, strict=strict, target=target_sha, recover=recover)
+        provider=provider, strict=strict, target=target_sha, recover=recover,
+        admitted_heads=admitted_heads)
     unknown.extend(carried_unknown)
     for row in carried:
         values = row.get("families")
@@ -2596,7 +2659,8 @@ def reading(db, item: Mapping, milestone: Optional[Mapping],
         out.append(row)
     corrector_rows: dict[str, dict] = {}
 
-    def record_corrector(name: str, family: str, families_values=()) -> None:
+    def record_corrector(name: str, family: str, families_values=(),
+                         *, test_only=False) -> None:
         """Trace un correcteur en gardant **toutes** ses familles prouvées."""
         name = str(name or "").strip()
         if not name:
@@ -2607,8 +2671,10 @@ def reading(db, item: Mapping, milestone: Optional[Mapping],
             proven.add(str(family))
         row = corrector_rows.get(key)
         if row is None:
-            row = {"name": name, "family": "", "proven": set()}
+            row = {"name": name, "family": "", "proven": set(),
+                   "test_only": True}
             corrector_rows[key] = row
+        row["test_only"] = row["test_only"] and test_only
         row["proven"].update(proven)
         # une ambiguïté de familles ne change rien à l'exclusion par le nom,
         # mais elle ne doit pas être présentée comme une famille unique.
@@ -2619,15 +2685,17 @@ def reading(db, item: Mapping, milestone: Optional[Mapping],
 
     for actor in sorted(small_correctors):
         proven = {value for _sha, value in review_commits[actor] if value}
-        record_corrector(actor, "", proven)
+        record_corrector(actor, "", proven, test_only=actor in test_correctors)
     # #2924 : un correcteur d'un gel antérieur dont le correctif subsiste garde
-    # sa trace ; il est déjà auteur de la tête ci-dessus (l'exclusion de famille
-    # ne dépend pas de cette liste).
+    # sa trace. Hors tests seuls (#3518), il est aussi auteur de la tête ;
+    # une correction produit ancienne ne devient jamais une dispense de famille.
     for row in carried_correctors:
         record_corrector(str(row.get("name") or ""),
                          str(row.get("family") or ""),
-                         row.get("families") or ())
-    correctors = [{"name": row["name"], "family": row["family"]}
+                         row.get("families") or (),
+                         test_only=bool(row.get("test_only")))
+    correctors = [dict({"name": row["name"], "family": row["family"]},
+                       **({"test_only": True} if row["test_only"] else {}))
                   for row in corrector_rows.values()]
     return out, unknown, correctors
 

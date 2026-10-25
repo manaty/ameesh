@@ -8,7 +8,7 @@ import threading
 import time
 from unittest import mock
 
-from ameesh import migration_reservations as reservations, migrations, storage, work
+from ameesh import fire, packet_guard, migration_reservations as reservations, migrations, storage, work
 from ameesh.db import DbError
 from ameesh.storage.postgres import work as pg_work
 
@@ -373,6 +373,112 @@ class ScopedReservationsTest(PgTestCase):
         self.assertFalse(thread.is_alive())
         self.assertEqual(errors, [])
         self.assertIsNotNone(results[0])
+
+    def test_freeze_and_move_lock_repository_before_lot(self):
+        # #3490: move owns the repo lock; freeze must wait before locking
+        # the lot. The old order produces a real PostgreSQL deadlock here.
+        work.reserve_migration(self.db, self.a['id'], 400, repo=self.repo)
+        errors, pid = [], []
+        ready = threading.Event()
+
+        def freeze():
+            conn = self.connect()
+            try:
+                with conn.transaction() as tx:
+                    tx.execute("SET LOCAL lock_timeout = '10s'")
+                    pid.append(tx.query('SELECT pg_backend_pid() AS pid')[0]['pid'])
+                    ready.set()
+                    storage.of(tx).work.add_milestone(
+                        self.a['id'], 'frozen', sha='a' * 40, actor='dev',
+                        verdict=None, note='concurrent freeze')
+            except Exception as exc:
+                errors.append(exc)
+            finally:
+                conn.close()
+
+        thread = threading.Thread(target=freeze, daemon=True)
+        try:
+            with self.db.transaction() as tx:
+                tx.execute("SET LOCAL lock_timeout = '10s'")
+                tx.execute("SELECT pg_advisory_xact_lock(hashtextextended("
+                           "current_schema() || ':migration-repo:' || %s, 0))",
+                           ('github.com/manaty/nexlink',))
+                thread.start()
+                self.assertTrue(ready.wait(timeout=5))
+                deadline = time.monotonic() + 5
+                while not tx.query("SELECT 1 FROM pg_locks WHERE pid = %s"
+                                   " AND locktype = 'advisory' AND NOT granted", (pid[0],)):
+                    self.assertFalse(errors, errors)
+                    self.assertLess(time.monotonic(), deadline, 'freeze never waited')
+                    time.sleep(0.01)
+                storage.of(tx).work.move(
+                    self.a['id'], 'build', current='intake', loops=0,
+                    note='concurrent move', actor='dev')
+        finally:
+            thread.join(timeout=15)
+        self.assertFalse(thread.is_alive(), 'freeze did not finish')
+        self.assertEqual(errors, [])
+        self.assertEqual(work.get(self.db, self.a['id'])['state'], 'qa')
+
+    def test_fire_exception_does_not_lock_repository_after_lot(self):
+        # #3490: the fenced exception journals a note (lot row lock) before
+        # writing its fire milestone. A move already owns the repo lock.
+        lot = self.a['id']
+        work.set_branch(self.db, lot, 'lot/fire-witness', target='develop', actor='dev')
+        work.reserve_migration(self.db, lot, 400, repo=self.repo)
+        storage.of(self.db).work.add_milestone(
+            lot, 'frozen', sha=self.sha, actor='dev', verdict=None, note='freeze')
+        errors, results = [], []
+        declared, proceed = threading.Event(), threading.Event()
+        original = packet_guard.declare
+
+        def declare(*args, **kwargs):
+            result = original(*args, **kwargs)
+            declared.set()
+            if not proceed.wait(timeout=5):
+                raise AssertionError('move never started')
+            return result
+
+        def give():
+            conn = self.connect()
+            try:
+                conn.execute("SET lock_timeout = '10s'")
+                results.append(fire.give(
+                    conn, lot, sha=self.sha, actor='dev', repo=self.repo,
+                    exception='unblock', reason='concurrent fire witness'))
+            except Exception as exc:
+                errors.append(exc)
+            finally:
+                conn.close()
+
+        thread = threading.Thread(target=give, daemon=True)
+        # Only the external lease/election is stubbed; the fenced transaction,
+        # exception declaration, note, milestone and concurrent move are real.
+        with mock.patch.object(fire, '_lock', return_value=object()), \
+                mock.patch.object(fire, '_unlock'), \
+                mock.patch('ameesh.pilot_gesture.gate', return_value=mock.Mock()), \
+                mock.patch.object(packet_guard, 'declare', side_effect=declare):
+            try:
+                with self.db.transaction() as tx:
+                    tx.execute("SET LOCAL lock_timeout = '10s'")
+                    tx.execute("SELECT pg_advisory_xact_lock(hashtextextended("
+                               "current_schema() || ':migration-repo:' || %s, 0))",
+                               ('github.com/manaty/nexlink',))
+                    thread.start()
+                    self.assertTrue(declared.wait(timeout=5), errors)
+                    proceed.set()
+                    storage.of(tx).work.move(
+                        lot, 'build', current='qa', loops=0,
+                        note='concurrent move', actor='dev')
+            except Exception as exc:
+                errors.append(exc)
+            finally:
+                proceed.set()
+                thread.join(timeout=15)
+        self.assertFalse(thread.is_alive(), 'fire did not finish')
+        self.assertEqual(errors, [])
+        self.assertEqual([result['kind'] for result in results], ['fire'])
+        self.assertEqual(work.get(self.db, lot)['state'], 'build')
 
     def test_set_app_and_named_allocation_lock_repository_before_lot(self):
         self._legacy_writer_concurrent_with_named(
