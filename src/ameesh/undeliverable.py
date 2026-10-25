@@ -44,6 +44,7 @@ Le SQL est dans le stockage (`storage.of(db).mailbox` : `dead_letters`,
 from __future__ import annotations
 
 import os
+import shlex
 import time
 
 from . import db as db_mod
@@ -546,7 +547,7 @@ def alerts(cfg, db, listing: list, now: float, *, threshold_s: float = DEFAULT_T
                       "and tell the senders the right name"
                       % (group["count"], age, name, _senders(group),
                          "Close names: %s. " % ", ".join(n for n, _why in near) if near else "",
-                         name))
+                         shlex.quote(name)))
             detail += _retention_note(cfg)
             extra.update(suggestions=[n for n, _why in near])
         orchestras = team_orchestrators(listing, known, {t for t in teams if t},
@@ -579,7 +580,7 @@ def brief_text(alert: dict) -> str:
                 "read them. %sRe-deliver them: ameesh mail forward %s <agent> (to yourself if they "
                 "were meant for you), then tell the senders the right name."
                 % (count, name, _span(alert.get("threshold") or 0), senders,
-                   "Close names: %s. " % ", ".join(near) if near else "", name))
+                   "Close names: %s. " % ", ".join(near) if near else "", shlex.quote(name)))
     else:
         heir = alert.get("successor")
         text = ("Undeliverable mail: %d message(s) addressed to %s, stopped, waiting "

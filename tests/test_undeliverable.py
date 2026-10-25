@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import threading
 import time
 import unittest
@@ -467,6 +468,31 @@ class RenvoiTest(_Base):
         for name in ("claude1", "mesh-design", "orchestrateur"):
             self.agent(name)
         self.agent("claude3")
+
+    def test_legacy_runner_label_forwarded_by_agent_and_alert_cleared(self):
+        old = "runner runner-mty-amh-impl-08@ameesh-agents-2"
+        mail.send(self.db, "claude1", old, "Closure withheld.")
+        self.db.execute("UPDATE agent_mailbox SET created_at = now() - interval '20 minutes'")
+        [alert] = undeliverable.alerts(
+            self.cfg, self.db, registry.overview(self.db), time.time(),
+            orchestrators_declared=("orchestrateur",))
+        command = "ameesh mail forward %s <agent>" % shlex.quote(old)
+        self.assertIn(command, alert["detail"])
+        self.assertIn(command, undeliverable.brief_text(alert))
+        for flags in (("--dry-run",), ()):
+            proc = self.mesh("mail", "forward", old, "mesh-design", *flags,
+                             env=self.env(AGENT_MAIL_NAME="orchestrateur"))
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            if flags:
+                self.assertEqual(len(mail.unread(self.db, old)), 1)
+                self.assertEqual(mail.unread(self.db, "mesh-design"), [])
+        self.assertEqual(mail.unread(self.db, old), [])
+        [copy] = mail.unread(self.db, "mesh-design")
+        self.assertEqual(copy["forwarded_from"], old)
+        self.assertEqual(copy["sender"], "claude1")
+        self.assertEqual(undeliverable.alerts(
+            self.cfg, self.db, registry.overview(self.db), time.time(),
+            orchestrators_declared=("orchestrateur",)), [])
 
     def test_renvoi_garde_expediteur_et_date(self):
         self.stop("claude3")
