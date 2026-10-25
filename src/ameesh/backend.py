@@ -18,7 +18,7 @@ import time
 
 from . import config as config_mod
 from . import db as db_mod
-from . import fastmail, fil, identity, mail, registry
+from . import fastmail, fil, identity, mail, registry, storage
 from .config import Config
 
 
@@ -289,7 +289,9 @@ class PgBackend:
             # L36 (0030) : « all » = l'équipe (ou le chantier) de l'expéditeur ;
             # un expéditeur sans équipe ni chantier garde la diffusion globale.
             own = projects.get(sender)
+            # #3460 : un agent retiré n'est jamais diffusé, même avec --queue
             team = [row for row in rows if row["name"] != sender
+                    and not row.get("retired_ts")
                     and (not own or projects.get(row["name"]) == own)]
             # un agent arrêté ne lit pas sa boîte : la diffusion ne la remplit pas
             stopped = [row["name"] for row in team
@@ -303,15 +305,25 @@ class PgBackend:
         # #515 : un message lié à un lot se range dans le fil du projet du lot,
         # quel que soit le projet de l'expéditeur ou des destinataires.
         lot_project = fil.lot_project(self.db, work_item_id)
+        delivered = []
         for target in targets:
             # `signed` vient de authority.sign_message : signature, payload,
             # nonce, horodatage et échéance signés. Un envoi simple écrit son
             # fil dans mail.send ; un envoi à « all » est regroupé ci-dessous.
-            message_id = mail.send(
-                self.db, sender, target, text, host=host, work_item_id=work_item_id,
-                allow_structured=allow_structured, thread=(dest != "all"),
-                kind=kind, payload=payload or None,
-                thread_meta=thread_meta, **dict(signed or {}))
+            try:
+                message_id = mail.send(
+                    self.db, sender, target, text, host=host, work_item_id=work_item_id,
+                    allow_structured=allow_structured, thread=(dest != "all"),
+                    kind=kind, payload=payload or None,
+                    thread_meta=thread_meta, **dict(signed or {}))
+            except storage.RecipientRetired:
+                # #3460 : retiré entre la liste et le dépôt — la diffusion le
+                # saute ; un envoi à un seul destinataire remonte le refus.
+                # (`skipped` ne nomme que les arrêtés, comme le dit la CLI)
+                if dest != "all":
+                    raise
+                continue
+            delivered.append(target)
             if dest == "all":
                 project = fil.project_for(self.cfg, lot_project, projects.get(sender),
                                           projects.get(target))
@@ -325,10 +337,15 @@ class PgBackend:
             # L125 : la copie part en événement passif — lue au prochain tour
             # de son destinataire, sans le réveiller. Sans lot (elle ne change
             # pas le lot de sa session) ; le fil la cite sur l'entrée du message.
-            mail.send(self.db, sender, name, text, host=host, kind="event",
-                      payload={"cc": dest}, allow_structured=allow_structured,
-                      thread=False)
-        return targets
+            # #3460 : une copie à un retiré (retrait après le précontrôle de
+            # `agent-mail send`) n'est pas déposée ; le message principal l'est.
+            try:
+                mail.send(self.db, sender, name, text, host=host, kind="event",
+                          payload={"cc": dest}, allow_structured=allow_structured,
+                          thread=False)
+            except storage.RecipientRetired:
+                pass
+        return delivered
 
     def unread(self, name: str) -> list[dict]:
         return [mail.normalize(row) for row in mail.unread(self.db, name)]
@@ -456,7 +473,9 @@ class MediatedBackend(PgBackend):
             rows = registry.overview(self.db)
             projects = {row["name"]: fil.agent_project(row) for row in rows}
             own = projects.get(sender)
+            # #3460 : l'annuaire réduit de la session omet déjà les retirés
             team = [row for row in rows if row["name"] != sender
+                    and not row.get("retired_ts")
                     and (not own or projects.get(row["name"]) == own)]
             stopped = [row["name"] for row in team
                        if row.get("status") == "stopped" and not include_stopped]

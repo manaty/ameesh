@@ -478,8 +478,14 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
                 print("copy refused — %s" % undeliverable.watch_sender_text(name),
                       file=sys.stderr)
                 return 2
-            if undeliverable.registry_rows(bk.db, [name])[name] is None:
+            row = undeliverable.registry_rows(bk.db, [name])[name]
+            if row is None:
                 print("copy refused: unknown agent: %s (nothing delivered)" % name,
+                      file=sys.stderr)
+                return 2
+            if row.get("retired_ts"):
+                # #3460 : un retiré n'est jamais destinataire, pas même en copie
+                print("copy refused — %s" % undeliverable.retired_text(row, sender=False),
                       file=sys.stderr)
                 return 2
     # L77/B1 : l'identité humaine est normalisée à la frontière (`human:<id>`,
@@ -635,11 +641,17 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
                                 else "an information"), file=sys.stderr)
 
     skipped: list[str] = []
-    targets = bk.send(sender, dest, text, host=cfg.host, signed=signed,
-                      work_item_id=lot, allow_structured=allow_structured,
-                      kind=kind, urgent=urgent, thread_meta=thread_meta,
-                      payload=payload or None, cc=cc,
-                      include_stopped=queue, skipped=skipped)
+    from . import storage
+    try:
+        targets = bk.send(sender, dest, text, host=cfg.host, signed=signed,
+                          work_item_id=lot, allow_structured=allow_structured,
+                          kind=kind, urgent=urgent, thread_meta=thread_meta,
+                          payload=payload or None, cc=cc,
+                          include_stopped=queue, skipped=skipped)
+    except storage.RecipientRetired as exc:
+        # #3460 : retiré après le précontrôle — le refus du stockage, lisible
+        print("refused: %s" % exc, file=sys.stderr)
+        return 2
     # #1689 (N1) : le marqueur local des destinataires est posé par le dépôt
     # lui-même (`mail.send`, `FileBackend.send`), pour tout émetteur local et
     # pas seulement cette commande.

@@ -316,6 +316,19 @@ def unknown_text(cfg, db, dest: str, rows: list | None = None, *, sender: str | 
     return "\n  ".join(lines)
 
 
+def retired_text(row: dict, *, sender: bool) -> str:
+    """#3460 : le refus d'un agent retiré (`ameesh agent retire`), destinataire
+    ou expéditeur : depuis quand, par qui, pourquoi, et le geste inverse."""
+    name = row["name"]
+    facts = "since %s, by %s: %s" % (
+        _moment(row["retired_ts"]) if row.get("retired_ts") else "?",
+        row.get("retired_by") or "?", row.get("retired_reason") or "no reason given")
+    what = ("this identity no longer sends mail" if sender
+            else "nobody reads its mailbox, and nothing is queued for it")
+    return "%s is retired (%s): %s.\n  to bring it back: ameesh agent restore %s" % (
+        name, facts, what, name)
+
+
 def stopped_recipient_text(db, row: dict, now: float | None = None) -> str:
     """Le refus d'un destinataire arrêté : depuis quand, pourquoi, qui, qui a
     repris, et les deux gestes possibles."""
@@ -422,9 +435,12 @@ def check_send(cfg, db, *, sender: str, dest: str, queue: bool = False,
     """Contrôle d'un envoi `agent-mail send`, AVANT tout dépôt (base seulement).
 
     Lève `Refused` (rien n'est déposé, aucun agent créé) : identité
-    d'expéditeur arrêtée ; destinataire absent du registre ; destinataire
-    arrêté sans `queue` ; courrier adressé à l'identité d'émission de la
-    veille (`veille`, qui ne lit aucune boîte — #3342). Rend les
+    d'expéditeur arrêtée ou retirée ; destinataire absent du registre ;
+    destinataire retiré, même avec `queue` (#3460) ; destinataire arrêté sans
+    `queue` ; courrier adressé à l'identité d'émission de la veille
+    (`veille`, qui ne lit aucune boîte — #3342). `veille` reste une identité
+    d'émission système, comme « ameesh » : retirée, elle émet encore les
+    veilles et les réveils (#3460). Rend les
     avertissements à dire (destinataire arrêté avec `queue` ; #858 :
     destinataire inscrit mais non réveillable à l'instant — le message part
     quand même, le réveil attend). `explicit` : l'expéditeur vient de
@@ -437,6 +453,8 @@ def check_send(cfg, db, *, sender: str, dest: str, queue: bool = False,
     if row is not None and row.get("status") == "stopped":
         raise Refused(stopped_sender_text(cfg, db, row, explicit=explicit, binding=binding,
                                           now=now))
+    if row is not None and row.get("retired_ts") and not watch_sender(sender):
+        raise Refused(retired_text(row, sender=True))
     if dest == "all":
         return []
     if watch_sender(dest):
@@ -444,6 +462,8 @@ def check_send(cfg, db, *, sender: str, dest: str, queue: bool = False,
     row = rows.get(dest)
     if row is None:
         raise Refused(unknown_text(cfg, db, dest, sender=sender))
+    if row.get("retired_ts"):
+        raise Refused(retired_text(row, sender=False))
     if row.get("status") != "stopped":
         return wake_note(cfg, db, dest, row)
     if not queue:
@@ -635,7 +655,8 @@ def forward(cfg, db, old: str, new: str, *, actor: str, dry_run: bool = False,
     """Re-livre à `new` le courrier en attente de `old`, une boîte morte.
 
     `old` doit être arrêté (`stopped`) ou absent du registre : on ne vide pas
-    la boîte d'un agent qui la lit. `new` doit être inscrit et non arrêté.
+    la boîte d'un agent qui la lit. `new` doit être inscrit, ni arrêté ni
+    retiré (#3460).
     Chaque message garde son expéditeur, sa date, sa nature et son lot ; la
     copie porte `meta.forwarded_from` (montré au destinataire), l'original
     passe remis avec `meta.forwarded` ; le renvoi est écrit dans le fil.
@@ -661,6 +682,8 @@ def forward(cfg, db, old: str, new: str, *, actor: str, dry_run: bool = False,
     if new_row.get("status") == "stopped":
         raise Refused("%s is stopped (%s): forward to a live agent"
                       % (new, stop_facts(new_row, now)))
+    if new_row.get("retired_ts"):
+        raise Refused(retired_text(new_row, sender=False))
     state = "arrêté" if old_row is not None else "absent du registre"
     if dry_run:
         rows = storage.of(db).mailbox.unread(old, 10000)

@@ -276,6 +276,25 @@ class Agents(Domain):
         """
 
     @abc.abstractmethod
+    def retire(self, name: str, *, actor: str, reason: str) -> dict | None:
+        """#3460 : retire l'agent sous le verrou de sa ligne ; None s'il est inconnu.
+
+        Rend `{name, changed, blockers}`. Un bail vivant, un lot assigné non
+        clos ou une veille `ameesh watch` vers l'agent sont des `blockers`
+        (`{kind: lease|lot|watch, …}`) : rien n'est écrit tant qu'il en reste.
+        Seules `retired_at`, `retired_by` et `retired_reason` changent ; ni
+        statut, ni mode, ni bail. Déjà retiré : `changed` faux. Not exposed to
+        executors."""
+
+    @abc.abstractmethod
+    def restore(self, name: str, *, actor: str) -> dict | None:
+        """#3460 : l'inverse de `retire` ; None si l'agent est inconnu.
+
+        Efface les trois colonnes du retrait et rend `{name, changed}` ; un
+        agent qui n'était pas retiré rend `changed` faux. Not exposed to
+        executors."""
+
+    @abc.abstractmethod
     def harnesses(self) -> dict[str, str]:
         """L71 : `{agent: harnais}` pour tout le registre (comptabilité, jauges)."""
 
@@ -1094,6 +1113,16 @@ class MailboxRefused(RuntimeError):
     relu SOUS VERROU dans la transaction qui copie — un destinataire relancé
     entre la lecture et l'écriture, un successeur arrêté ou un nom absent.
     L'appelant (`ameesh.undeliverable`) la rend en `Refused` lisible."""
+
+
+class RecipientRetired(MailboxRefused):
+    """#3460 : dépôt refusé, le destinataire est retiré (`ameesh agent retire`).
+
+    Le retrait est relu dans l'instruction même qui dépose, sous un verrou
+    partagé de la ligne du registre que `retire` prend en exclusif : un
+    retrait committé entre un précontrôle et le dépôt gagne, aucun message
+    n'est écrit. Une diffusion (« all », copies) saute le retiré ; un envoi à
+    un seul destinataire remonte le refus."""
 
 
 class Mailbox(Domain):
