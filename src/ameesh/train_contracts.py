@@ -74,11 +74,11 @@ def ameesh() -> tuple[Workflow, ...]:
         event="push",
         called=".github/workflows/tests.yml",
         sources=((".github/workflows/paquet.yml", "0d4e4c9cae703575b33aa393d6a1c95a81e5c896"),
-                 (".github/workflows/tests.yml", "7498c03480c4c618a4ba1cd0108f37e9d662b3a2"),
+                 (".github/workflows/tests.yml", "2fc4381f3ea37a6ae832b19d0ca3332137bd2118"),
                  ("scripts/test-plan.py", "d279301f0c81664944cab2adf42afb947cabaf84"),
                  ("scripts/test-parts.py", "2265308c9fed248852bfd9ec41ba8f79266f0647"),
                  ("scripts/ci-flow.py", "b633b95258f03db4d0760d3f47855a0e832ac8a4"),
-                 ("scripts/ci-agregat.py", "6a1194ce64d3747a60ccd3b1066ae1692a2fd9e3"),
+                 ("scripts/ci-agregat.py", "7de7ca4b3463f27f1fa90d32e0020fbbce25b17b"),
                  ("scripts/map.py", "7a7516683643ff7cd66abf3d50147b25446a03bb")),
         pins_at="src/ameesh/train_contracts.py",
     ),)

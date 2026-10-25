@@ -9,29 +9,26 @@ l'intérieur d'un agrégat qui a conclu restent non bloquants (§3). »
 #3251 avait lu cette décision comme « au moins une part réussie suffit » : un
 run annulé où seuls la part macOS (2 min) et l'agrégat concluaient a publié
 `tests` SUCCESS alors que les 8 psycopg et les 16 psql étaient annulés (run
-40144843565, paquet h-13, fusionné sans suite Linux). #3449 borne la
-tolérance : les familles **Linux planifiées** sont la preuve de la suite ;
-une famille sans **aucune part réussie** est une preuve absente, tandis
-qu'une part perdue parmi d'autres réussies reste consignée (15/16).
+40144843565, paquet h-13, fusionné sans suite Linux). #3449 revient au texte
+de #128512 : « les parts annulées ou expirées restent bloquantes ». Une
+part **Linux planifiée** annulée, expirée, absente ou en échec rougit donc
+l'agrégat, même si les 15 autres ont réussi ; seuls les non-concluants
+**à l'intérieur d'un test individuel** sont neutres. Le commentaire de
+#3251 qui élargissait #128512 est justement le maillon qui a laissé passer
+h-13.
 
 Ce script sépare donc trois cas :
 
 * un **échec** (`failure`, ou une part sautée qui devait tourner) est un
   négatif : l'agrégat conclut rouge (code retour 1) ;
 * une **famille Linux planifiée** (`psycopg`, `psql` avec au moins une part)
-  qui n'a **aucune part réussie** (toutes annulées, absentes ou le job
-  sauté) est une **preuve absente** : l'agrégat conclut rouge (code retour 1)
-  et le détail la nomme. C'est le cas du run annulé de h-13 : macOS vert,
-  0/8 psycopg et 0/16 psql réussies ;
-* une **annulation partielle** d'une famille Linux (15 parts sur 16
-  réussies, une annulée) reste un non concluant : l'agrégat conclut vert, le
-  détail `tests (bilan des parts)` passe en `neutral` et nomme le compte
-  `15/16`. `needs.psycopg.result` seul ne suffit pas — une matrice vaut
-  `cancelled` dès qu'une part l'est —, les jobs du run sont donc lus par
-  l'API (`actions: read`) ; ce cas ne durcit pas #128512 pour une part
-  perdue (B1 de la relecture claude sur #3449). Une part **planifiée mais
-  absente** de la lecture (job jamais listé) ou un job en `failure` rougit
-  en revanche la famille (B2/B3 de cx3, dev1 et cx2) ;
+  qui a une part annulée, expirée, absente ou en échec est un manque :
+  l'agrégat conclut rouge (code retour 1) et le détail la nomme. Si toutes
+  ses parts sont non concluantes et qu'aucune n'a réussi, c'est une preuve
+  absente (même rouge) : c'est le cas du run annulé de h-13, macOS vert,
+  0/8 psycopg et 0/16 psql réussies. Les jobs du run sont lus par l'API
+  (`actions: read`) parce que `needs.psycopg.result` vaut `cancelled` dès
+  qu'une part l'est, sans dire combien ont réussi ;
 * une **annulation d'une part non requise** (macOS, autre système de
   fichiers) reste un non concluant : l'agrégat conclut vert s'il garde la
   preuve Linux, et publie le check de détail en `neutral`, avec la part et
@@ -142,7 +139,9 @@ def _job_stats(jobs, expected):
     conclusion n'est ni `success` ni non concluante (`cancelled`,
     `timed_out`…) est un échec individuel : une famille `cancelled` qui cache
     un `failure` ne doit jamais verdir (B2 de cx3/dev1). Une part planifiée
-    absente de la lecture n'est pas une preuve non plus (B3 de cx2)."""
+    absente de la lecture n'est pas une preuve non plus (B3 de cx2), et une
+    part annulée ou expirée reste bloquante (prémisse de #128512, pilote
+    25/10 01:55)."""
     if jobs is None:
         return None
     rows = [job for job in jobs if isinstance(job, dict)]
@@ -150,11 +149,12 @@ def _job_stats(jobs, expected):
     successes = sum(1 for value in conclusions if value == "success")
     failures = sum(1 for value in conclusions
                    if value != "success" and value not in NON_CONCLUSIVE)
+    nonconclusive = sum(1 for value in conclusions if value in NON_CONCLUSIVE)
     planned = int(expected or 0)
     total = max(planned, len(rows))
     absent = max(0, planned - len(rows))
-    return {"success": successes, "total": total,
-            "failure": failures, "absent": absent}
+    return {"success": successes, "total": total, "failure": failures,
+            "absent": absent, "nonconclusive": nonconclusive}
 
 
 def classify(*, event, plan, version, version_only, docs_only, doc_readers,
@@ -167,15 +167,15 @@ def classify(*, event, plan, version, version_only, docs_only, doc_readers,
     planifiée garde au moins une part réussie), `red` sur un négatif ou une
     preuve absente. `red` liste les négatifs prouvés, `missing` les familles
     Linux planifiées sans aucune part réussie (et l'absence de toute part
-    réussie), `consigned` les annulations partielles et les parts non
-    requises non concluantes (dans l'ordre du workflow), `parts` le détail
+    réussie), `consigned` les annulations des parts **non requises** (macOS,
+    autre système de fichiers, dans l'ordre du workflow), `parts` le détail
     de chaque part exigée (pour le check publié).
 
     `psycopg_jobs` / `psql_jobs` sont les jobs du run lus par l'API : une
-    matrice `cancelled` avec 15 parts réussies sur 16 et la 16e annulée est
-    consignée, pas bloquante ; une part planifiée absente ou un échec
-    individuel rougit la famille. Sans jobs lisibles, une famille annulée
-    reste une preuve absente (jamais un vert sur une lecture manquante)."""
+    part Linux planifiée annulée, expirée, absente ou en échec rougit la
+    famille, même si les 15 autres ont réussi (15/16 = rouge, #128512).
+    Sans jobs lisibles, une famille non concluante est une preuve absente
+    (jamais un vert sur une lecture manquante)."""
     red: list[str] = []
     missing: list[str] = []
     consigned: list[dict] = []
@@ -189,12 +189,21 @@ def classify(*, event, plan, version, version_only, docs_only, doc_readers,
             row["status"] = GREEN
         elif value in NON_CONCLUSIVE:
             stats = _job_stats(jobs, expected) if required else None
+            if stats is not None:
+                row["success"] = stats["success"]
             if not required:
                 row["status"] = INCONCLUSIVE
                 consigned.append(row)
-            elif stats is not None and (stats["failure"] or stats["absent"]):
-                # B2/B3 : un échec individuel ou une part planifiée absente
-                # reste un négatif, même si la matrice est `cancelled`.
+            elif stats is None:
+                # Jobs illisibles : jamais un vert sur une lecture manquante.
+                row["status"] = MISSING
+                missing.append("%s (%s, preuve absente : jobs du run "
+                               "illisibles)" % (name, value))
+            elif stats["failure"] or stats["absent"] or stats["nonconclusive"]:
+                # B2/B3 et #128512 : un échec individuel, une part planifiée
+                # absente, ou une part planifiée annulée/expirée restent
+                # bloquants. Toutes les parts non concluantes et aucune
+                # réussie = preuve absente (cas h-13).
                 gaps = []
                 if stats["failure"]:
                     gaps.append("%d/%d part(s) en échec"
@@ -202,24 +211,25 @@ def classify(*, event, plan, version, version_only, docs_only, doc_readers,
                 if stats["absent"]:
                     gaps.append("%d/%d part(s) planifiée(s) absente(s)"
                                 % (stats["absent"], stats["total"]))
-                row["status"] = RED
-                red.append("%s (%s, famille %s)"
-                           % (name, ", ".join(gaps), value))
-            elif stats is not None and stats["success"] > 0:
-                # #3449/B1 : une part perdue dans une famille qui en garde
-                # 15/16 reste une annulation partielle non bloquante.
-                row["status"] = INCONCLUSIVE
-                row["parts_ok"] = "%d/%d" % (stats["success"], stats["total"])
-                consigned.append(row)
-            else:
-                # Aucune part réussie (ou jobs illisibles) : preuve absente.
-                row["status"] = MISSING
-                if stats is not None:
-                    missing.append("%s (%s, %d/%d part(s) réussie(s), preuve "
-                                   "absente)" % (name, value, stats["success"],
-                                                 stats["total"]))
+                if stats["nonconclusive"]:
+                    gaps.append("%d/%d part(s) annulée(s) ou non concluante(s)"
+                                % (stats["nonconclusive"], stats["total"]))
+                if (stats["success"] == 0 and not stats["failure"]
+                        and not stats["absent"]):
+                    row["status"] = MISSING
+                    missing.append("%s (%s, 0/%d part(s) réussie(s), preuve "
+                                   "absente)" % (name, value, stats["total"]))
                 else:
-                    missing.append("%s (%s, preuve absente)" % (name, value))
+                    row["status"] = RED
+                    red.append("%s (%s, famille %s)"
+                               % (name, ", ".join(gaps), value))
+            else:
+                # Toutes les parts lues sont vertes, mais la famille ne
+                # conclut pas (run annulé après les parts) : pas un vert.
+                row["status"] = RED
+                red.append("%s (%s, famille non concluante malgré %d/%d "
+                           "part(s) verte(s))"
+                           % (name, value, stats["success"], stats["total"]))
         elif value == "skipped" and skipped_ok:
             # un saut prévu par le plan n'a rien à consigner
             row["status"] = GREEN
@@ -295,7 +305,7 @@ def classify(*, event, plan, version, version_only, docs_only, doc_readers,
     # sans test).
     if parts and not any(
             (row["status"] == GREEN and row["result"] == "success")
-            or row.get("parts_ok") for row in parts):
+            or row.get("success", 0) > 0 for row in parts):
         missing.append("aucune part n'a conclu (preuve absente)")
 
     return {"state": RED if red or missing else GREEN, "red": red,
@@ -307,8 +317,6 @@ def _summary(event: str, parts: list[dict], result: dict) -> str:
 
     def display(row: dict) -> str:
         suffix = " (parts %s)" % row["parts"] if row.get("parts") else ""
-        if row.get("parts_ok"):
-            suffix += " — %s part(s) réussie(s)" % row["parts_ok"]
         return "- %s : %s%s" % (row["part"], row["result"], suffix)
 
     lines += [display(row) for row in parts]

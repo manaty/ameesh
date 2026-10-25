@@ -152,10 +152,11 @@
 # annulation d'une part **non requise** (macOS, autre système de fichiers) ne
 # le rougit pas et publie le check de détail `tests (bilan des parts)` en
 # `neutral`, que fire et radar consignent (#3209) sans retenir paquet ni
-# release. #3449 : une famille **Linux planifiée** (psycopg, psql) sans
-# aucune part réussie est une preuve absente, donc `tests` rougit — macOS vert
-# ne prouve pas la suite Linux (run 40144843565, h-13). Une annulation
-# partielle (15/16) reste consignée, non bloquante. #940 reste fermé : si
+# release. #3449 : une part **Linux planifiée** (psycopg, psql) annulée,
+# expirée, absente ou en échec rougit `tests`, même si les 15 autres ont
+# réussi (15/16) — macOS vert ne prouve pas la suite Linux (run
+# 40144843565, h-13). Seuls macOS et « autre système de fichiers » restent
+# des non-concluants consignés. #940 reste fermé : si
 # l'annulation ne peut pas être consignée, l'étape échoue et `tests` reste
 # rouge — jamais de SUCCESS muet.
 name: tests
@@ -1011,9 +1012,8 @@ jobs:
   # #3251/#3449 (décision owner #128512) : une annulation d'une part non
   # requise n'est pas un négatif — l'agrégat conclut vert et publie son détail
   # `tests (bilan des parts)` (neutral), consigné par fire/radar ; un échec
-  # prouvé reste rouge, et une famille Linux planifiée sans aucune part
-  # réussie est une preuve absente, donc rouge (une part perdue sur 16 est
-  # consignée, non bloquante).
+  # prouvé reste rouge, et une part Linux planifiée annulée, expirée,
+  # absente ou en échec rougit, même si 15/16 ont réussi (#128512).
   tests:
     # Une PR peut être ouverte sur ce SHA après la garde ou la fin du run :
     # un dispatch ne doit jamais publier le contexte requis de cette PR.
@@ -1044,8 +1044,8 @@ jobs:
       # ne suffit pas — un job `tests` démarré après l'annulation des familles
       # Linux mais avant que le run ne soit marqué `cancelled` la voit fausse
       # (run 40144843565). Le classifieur lit donc aussi les jobs du run
-      # (`needs.*.result` ne distingue pas 0/16 de 15/16) : une famille Linux
-      # planifiée sans aucune part réussie est une preuve absente.
+      # (`needs.*.result` ne distingue pas 0/16 de 15/16) : une part Linux
+      # planifiée annulée, expirée, absente ou en échec est bloquante.
       - name: run annulé
         if: cancelled()
         run: |
@@ -1073,11 +1073,12 @@ jobs:
           # de détail `tests (bilan des parts)` en `neutral`, que fire et
           # radar consignent (#3209) sans retenir paquet ni release (canon
           # §3). #3449 : les familles **Linux planifiées** (psycopg, psql)
-          # sont la preuve de la suite — une famille sans **aucune part
-          # réussie** est une **preuve absente** : `tests` rougit, même si
-          # macOS est vert (run 40144843565) ; une annulation partielle
-          # (15/16) reste consignée en `neutral` (B1 de la relecture claude).
-          # Un **échec** (`FAILURE`), une part sautée qui devait tourner, un
+          # sont la preuve de la suite — une part planifiée annulée, expirée,
+          # absente ou en échec est **bloquante** : `tests` rougit, même si
+          # macOS est vert (run 40144843565) et même si 15 parts sur 16 ont
+          # réussi (#128512) ; seuls macOS et « autre système de fichiers »
+          # restent des non-concluants consignés. Un **échec** (`FAILURE`),
+          # une part sautée qui devait tourner, un
           # plan refusé **ou aucune part réussie** (toutes annulées : preuve
           # absente, #128512) restent un négatif. #940 n'est pas rouvert : si
           # une annulation ne peut pas être consignée (jeton en lecture
@@ -1088,8 +1089,8 @@ jobs:
           # CI) ; l'étape ne fait que lui passer les résultats des `needs`.
           # #3449 : les parts réussies par famille se lisent sur les jobs du
           # run (`actions: read`) — une matrice `cancelled` peut garder 15/16
-          # parts vertes, et seule une famille sans aucune part réussie est
-          # une preuve absente.
+          # parts vertes, mais une part planifiée annulée, expirée, absente
+          # ou en échec rougit quand même (#128512).
           python3 scripts/ci-agregat.py \
             --event "${{ github.event_name }}" \
             --run-id "${{ github.run_id }}" \

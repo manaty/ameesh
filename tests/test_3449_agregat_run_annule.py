@@ -9,13 +9,13 @@ familles Linux eurent été annulées mais avant que le run ne soit marqué
 `cancelled` — et #3251 lisait « au moins une part réussie » comme une preuve
 suffisante.
 
-#3449 exige la preuve de chaque famille Linux planifiée : une famille sans
-**aucune** part réussie est une preuve absente, donc un agrégat rouge. Une
-annulation partielle (15 parts sur 16 réussies) reste un non-concluant
-consigné, vert neutre : `needs.psql.result` d'une matrice vaut `cancelled`
-dès qu'une part l'est, il faut donc lire les jobs du run (B1 de la relecture
-claude). Une annulation macOS ou « autre système de fichiers » reste, elle,
-un non-concluant consigné (décision #128512, canon §3).
+#3449 revient au texte de #128512 : « les parts annulées ou expirées restent
+bloquantes ». Une part Linux planifiée annulée, expirée, absente ou en échec
+rougit l'agrégat, même si les 15 autres ont réussi (15/16 = rouge) ; une
+famille sans aucune part réussie est une preuve absente (rouge, cas h-13).
+`needs.psql.result` d'une matrice vaut `cancelled` dès qu'une part l'est, il
+faut donc lire les jobs du run. Seuls macOS et « autre système de fichiers »
+restent des non-concluants consignés (canon §3).
 """
 from __future__ import annotations
 
@@ -100,41 +100,45 @@ class RunAnnuleTest(unittest.TestCase):
         self.assertIn("psql (cancelled, 0/16 part(s) réussie(s), preuve absente)",
                       detail[3])
 
-    def test_une_part_annulee_sur_seize_reste_non_bloquante(self):
-        # B1 de la relecture claude : une matrice `cancelled` avec 15/16
-        # parts vertes n'est pas une preuve absente (décision #128512).
+    def test_une_part_annulee_sur_seize_rougit(self):
+        # #128512 (prémisse : les parts annulées ou expirées restent
+        # bloquantes) : 15 succès + 1 annulée sur 16 = rouge, pas neutre.
         result = classify(psycopg="success",
                           psycopg_jobs=part_jobs("psycopg", 8, 8),
                           psql_jobs=part_jobs("psql", 16, 15))
-        self.assertEqual(result["state"], agregat.GREEN)
+        self.assertEqual(result["state"], agregat.RED)
         self.assertEqual(result["missing"], [])
-        self.assertEqual([row["part"] for row in result["consigned"]], ["psql"])
-        self.assertEqual(result["consigned"][0]["parts_ok"], "15/16")
+        self.assertEqual(result["consigned"], [])
+        self.assertIn("psql (1/16 part(s) annulée(s) ou non concluante(s), "
+                      "famille cancelled)", result["red"])
 
-    def test_deux_familles_partielles_et_macos_annule_restent_vertes(self):
-        # B1 de cx3/dev1 : le bilan final doit compter les parts_ok, pas
-        # seulement une ligne row.result == success.
+    def test_deux_familles_partielles_et_macos_annule_rougissent(self):
+        # Chaque famille planifiée qui a une part annulée rougit ; macOS
+        # (non requis) reste le seul non-concluant consigné.
         result = classify(psycopg_jobs=part_jobs("psycopg", 8, 7),
                           psql_jobs=part_jobs("psql", 16, 15),
                           platform_macos="cancelled")
-        self.assertEqual(result["state"], agregat.GREEN)
+        self.assertEqual(result["state"], agregat.RED)
         self.assertEqual(result["missing"], [])
         self.assertEqual([row["part"] for row in result["consigned"]],
-                         ["psycopg", "psql", "plateforme macOS"])
-        counts = {row["part"]: row["parts_ok"] for row in result["consigned"]
-                  if row.get("parts_ok")}
-        self.assertEqual(counts, {"psycopg": "7/8", "psql": "15/16"})
+                         ["plateforme macOS"])
+        self.assertTrue(any(gap.startswith("psycopg (1/8 part(s) annulée(s)")
+                            for gap in result["red"]), result["red"])
+        self.assertTrue(any(gap.startswith("psql (1/16 part(s) annulée(s)")
+                            for gap in result["red"]), result["red"])
 
-    def test_psycopg_partiel_avec_psql_non_planifie_reste_vert(self):
-        # Variante B1 : psql n'est pas planifiée ([]), macOS est annulé ;
-        # la preuve partielle de psycopg suffit, le reste est consigné.
+    def test_psycopg_partiel_avec_psql_non_planifie_rougit(self):
+        # psql n'est pas planifiée (neutre), mais la part psycopg annulée
+        # rougit quand même ; macOS annulé reste consigné.
         result = classify(psycopg_jobs=part_jobs("psycopg", 8, 7),
                           psql="skipped", psql_parts="[]",
                           platform_macos="cancelled")
-        self.assertEqual(result["state"], agregat.GREEN)
+        self.assertEqual(result["state"], agregat.RED)
         self.assertEqual(result["missing"], [])
         self.assertEqual([row["part"] for row in result["consigned"]],
-                         ["psycopg", "plateforme macOS"])
+                         ["plateforme macOS"])
+        self.assertTrue(any(gap.startswith("psycopg (1/8 part(s) annulée(s)")
+                            for gap in result["red"]), result["red"])
 
     def test_un_echec_individuel_dans_une_famille_annulee_rougit(self):
         # B2 : une famille `cancelled` avec 6 succès, 1 failure et 1 annulée
@@ -147,8 +151,8 @@ class RunAnnuleTest(unittest.TestCase):
                           psql_jobs=part_jobs("psql", 16, 16),
                           platform_macos="success")
         self.assertEqual(result["state"], agregat.RED)
-        self.assertIn("psycopg (1/8 part(s) en échec, famille cancelled)",
-                      result["red"])
+        self.assertTrue(any(gap.startswith("psycopg (1/8 part(s) en échec")
+                            for gap in result["red"]), result["red"])
         self.assertEqual(result["consigned"], [])
         self.assertEqual(result["missing"], [])
 
@@ -178,11 +182,11 @@ class RunAnnuleTest(unittest.TestCase):
                                      {"name": "psql 3/3",
                                       "conclusion": "cancelled"}])
         self.assertEqual(result["state"], agregat.RED)
-        self.assertIn("psql (1/3 part(s) en échec, famille cancelled)",
-                      result["red"])
+        self.assertTrue(any(gap.startswith("psql (1/3 part(s) en échec")
+                            for gap in result["red"]), result["red"])
         self.assertEqual(result["consigned"], [])
 
-    def test_le_script_publie_neutral_pour_une_annulation_partielle(self):
+    def test_le_script_publie_failure_pour_une_part_annulee(self):
         created = []
 
         class Gh:
@@ -199,11 +203,10 @@ class RunAnnuleTest(unittest.TestCase):
             "--plateforme-macos", "success", "--autre-fs", "skipped",
             "--publish"], gh=Gh(), jobs=run_jobs(psycopg_successes=8,
                                                   psql_successes=15))
-        self.assertEqual(code, 0)
+        self.assertEqual(code, 1)
         [detail] = created
-        self.assertEqual(detail[:2], (agregat.DETAIL_CHECK, "neutral"))
-        self.assertIn("psql", detail[3])
-        self.assertIn("15/16 part(s) réussie(s)", detail[3])
+        self.assertEqual(detail[:2], (agregat.DETAIL_CHECK, "failure"))
+        self.assertIn("1/16 part(s) annulée(s)", detail[3])
 
     def test_les_jobs_prefixes_par_le_portier_sont_reconnus(self):
         # Appelée par paquet.yml, tests.yml est un workflow réutilisable :
@@ -242,15 +245,15 @@ class RunAnnuleTest(unittest.TestCase):
             "--plateforme-macos", "success", "--autre-fs", "skipped",
             "--publish"], gh=Gh())
         self.assertEqual(seen, ["40144843565"])
-        self.assertEqual(code, 0)
-        self.assertEqual(created, [(agregat.DETAIL_CHECK, "neutral")])
+        self.assertEqual(code, 1)
+        self.assertEqual(created, [(agregat.DETAIL_CHECK, "failure")])
 
     def test_sans_jobs_lisibles_une_famille_annulee_reste_rouge(self):
         # Une lecture impossible ne verdit jamais : repli sur preuve absente.
         result = classify(psycopg_jobs=None, psql_jobs=None)
         self.assertEqual(result["state"], agregat.RED)
         self.assertEqual(result["consigned"], [])
-        self.assertTrue(any(gap.startswith("psycopg (cancelled, preuve absente)")
+        self.assertTrue(any(gap.startswith("psycopg (cancelled, preuve absente")
                             for gap in result["missing"]), result["missing"])
 
     def test_une_famille_linux_absente_est_une_preuve_absente(self):
