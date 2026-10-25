@@ -527,7 +527,7 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
                 item=None, families=None, required=None, family_of=None,
                 authors=None, authors_complete=False, cfg=None, project=None,
                 target=None, vehicle=None, exclude_author_family=None,
-                distinct_families=None, admitted_heads=()) -> dict:
+                distinct_families=None, admitted_heads=(), production_cache=None) -> dict:
     """Les avis requis sur la tête gelée `frozen`, et eux seuls (#1374).
 
     `admitted_heads` ne vient que de la porte du véhicule : les gels de ses
@@ -789,24 +789,6 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
                       % (frozen[:12], cls, ", ".join(sorted(
                           str(m.get("actor") or "relecteur sans nom") for m in blocked))))
         return out
-    try:
-        from . import provenance_scope
-        production = provenance_scope.production(cfg, item, repo)
-        inherited = tuple((vehicle or {}).get("admitted_heads") or ())
-        scopes = tuple(admitted_heads) + inherited + ((production,) if production else ())
-        if scopes and repo:
-            boundary = target or (klass or {}).get("base_sha") or (klass or {}).get("target")
-            if boundary:
-                listing = plan_git._out(repo, "rev-list", "%s..%s" % (boundary, frozen))
-                if listing is None:
-                    raise ValueError("provenance exclusion range unreadable")
-                provenance_scope.exclude(repo, listing.split(), scopes,
-                                         out["provenance_exclusions"])
-        out["provenance_manifest"] = provenance_scope.manifest(out["provenance_exclusions"])
-    except Exception as exc:  # unreadable publication never authorizes exclusions
-        out["error"] = str(exc)
-        out["why"] = "provenance scope unreadable: %s" % exc
-        return out
     if waived or required == 0:
         # #2965 : sans avis requis, la porte est ouverte dès le gel ; un
         # blocage courant la referme jusqu'à sa levée, et c'est alors le `ok`
@@ -893,6 +875,36 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
     # La même lecture rend les correcteurs (#2739) et échoue fermé quand la
     # provenance manque : une porte qui ne peut pas prouver qui a écrit la tête
     # ne compte pas un avis non prouvé (l'indépendance ne se suppose pas).
+    try:
+        from . import provenance_scope
+        if production_cache is None:
+            production_cache = (vehicle or {}).pop("production_cache", {})
+        cache_key = str(repo) + "\n" + str((item or {}).get("app") or "")
+        if cache_key not in production_cache:
+            try:
+                production_cache[cache_key] = (provenance_scope.production(cfg, item, repo), "")
+            except Exception as exc:  # noqa: BLE001 - failure grants no exclusion
+                production_cache[cache_key] = (None, str(exc))
+        production, publication_error = production_cache[cache_key]
+        if publication_error:
+            out["production_scope_error"] = publication_error
+        inherited = tuple((vehicle or {}).get("admitted_heads") or ())
+        scopes = tuple(admitted_heads) + inherited + ((production,) if production else ())
+        if scopes and repo:
+            from . import review_authors
+            boundary = (review_authors.target_commit(repo, target or (klass or {}).get("target") or "")
+                        or (klass or {}).get("base_sha"))
+            if boundary:
+                listing = plan_git._out(repo, "rev-list", "%s..%s" % (boundary, frozen))
+                if listing is None:
+                    raise ValueError("provenance exclusion range unreadable")
+                provenance_scope.exclude(repo, listing.split(), scopes,
+                                         out["provenance_exclusions"])
+        out["provenance_manifest"] = provenance_scope.manifest(out["provenance_exclusions"])
+    except Exception as exc:  # unreadable publication never authorizes exclusions
+        out["error"] = str(exc)
+        out["why"] = "provenance scope unreadable: %s" % exc
+        return out
     corrections: set = set()
     proven_families: dict = {}
     try:

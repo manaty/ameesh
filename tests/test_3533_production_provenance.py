@@ -3,7 +3,7 @@
 import os
 import subprocess
 import types
-from unittest import TestCase
+from unittest import TestCase, mock
 
 from ameesh import merge_queue, provenance_scope, radar, registry, storage, work
 from . import test_3091_packet_member_base as fixture
@@ -81,7 +81,7 @@ class ProductionGateTest(PgTestCase):
             "repo": self.repo.root, "target": "develop", "production_branch": "live"}}})
         return units
 
-    def gate(self, cfg=True):
+    def gate(self, cfg=True, target=None):
         row = work.get(self.db, self.vehicle)
         marks = work.milestones(self.db, self.vehicle)
         # Require two independent opinions on the vehicle resolution.
@@ -95,7 +95,7 @@ class ProductionGateTest(PgTestCase):
         return merge_queue.review_gate(
             self.db, marks, self.packet, repo=self.repo.root,
             klass={"class": "normal", "base_sha": self.base, "files": [{"path": "src/shared.py"}]},
-            item=row, cfg=self.gate_cfg if cfg else None, target=self.base, vehicle=vehicle)
+            item=row, cfg=self.gate_cfg if cfg else None, target=target or self.base, vehicle=vehicle)
 
     def test_packet_174_production_and_admitted_member_are_traced(self):
         units = self.prepare()
@@ -111,6 +111,15 @@ class ProductionGateTest(PgTestCase):
         for sha in self.published:
             self.assertIn(sha, out["provenance_manifest"])
         self.assertIn("refs/heads/live", out["provenance_manifest"])
+
+    def test_remote_only_target_and_single_production_read(self):
+        self.prepare()
+        self.repo.git("update-ref", "refs/remotes/origin/develop", self.base)
+        with mock.patch.object(provenance_scope, "production", wraps=provenance_scope.production) as read:
+            out = self.gate(target="develop")
+        self.assertTrue(out["ok"], out)
+        self.assertEqual(read.call_count, 1)
+        self.assertTrue(out["provenance_exclusions"])
 
     def test_unpublished_unknown_still_refuses(self):
         self.prepare(outsider=True)
@@ -153,7 +162,8 @@ class ProductionGateTest(PgTestCase):
         self.repo.git("remote", "set-url", "origin", os.path.join(self.tmp, "absent.git"))
         out = self.gate()
         self.assertFalse(out["ok"], out)
-        self.assertIn("remote branch unreadable", out["why"])
+        self.assertIn("remote branch unreadable", out["production_scope_error"])
+        self.assertIn(self.published[0][:12], out["why"])
 
 
 class ConfigurationTest(TestCase):
@@ -162,3 +172,12 @@ class ConfigurationTest(TestCase):
                          .projects["p"].production_branch, "")
         with self.assertRaises(ValueError):
             radar.parse_settings({"projects": {"p": {"repo": "/fixture", "production_branch": "--bad"}}})
+
+
+class LazyProductionTest(TestCase):
+    def test_zero_reviews_does_not_read_remote(self):
+        with mock.patch.object(provenance_scope, "production", side_effect=AssertionError("network")):
+            out = merge_queue.review_gate(None, [], "a" * 40,
+                klass={"class": "light", "files": []}, required=0,
+                item={"id": 1, "app": "nexlink"})
+        self.assertTrue(out["ok"], out)

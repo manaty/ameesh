@@ -471,6 +471,7 @@ def need(db, vehicle: int, row, marks, repo: str, base: str, head: str,
         return None
     total = len(found)
     frozen_sources = []
+    production_cache = {}
     admitted_sources = []
     constituents = []
     for entry in found:
@@ -549,7 +550,8 @@ def need(db, vehicle: int, row, marks, repo: str, base: str, head: str,
                                      base_sha=member_base)
             gate = merge_queue.review_gate(db, member_marks, frozen, repo=repo,
                                            klass=klass, item=member_row, cfg=cfg,
-                                           admitted_heads=tuple(admitted_sources))
+                                           admitted_heads=tuple(admitted_sources),
+                                           production_cache=production_cache)
         except Exception as exc:  # noqa: BLE001 - lecture impossible : refus
             return {"ok": False, "required": None, "klass": None,
                     "why": "constituent #%d: cannot read its review gate: %s"
@@ -581,7 +583,7 @@ def need(db, vehicle: int, row, marks, repo: str, base: str, head: str,
                 "members": found, "own_paths": []}
     if not own["paths"]:
         return {"ok": True, "required": 0, "klass": None, "members": found,
-                "own_paths": [], "admitted_heads": admitted_sources,
+                "own_paths": [], "admitted_heads": admitted_sources, "production_cache": production_cache,
                 "why": ("%d constituent(s) reviewed on their frozen "
                                          "head(s); no proper vehicle delta" % total)}
     try:
@@ -603,5 +605,5 @@ def need(db, vehicle: int, row, marks, repo: str, base: str, head: str,
                 "own_paths": own["paths"]}
     return {"ok": None, "required": required, "klass": klass, "members": found,
             "own_paths": own["paths"], "commits": own["commits"],
-            "admitted_heads": admitted_sources,
+            "admitted_heads": admitted_sources, "production_cache": production_cache,
             "why": "proper delta: %d path(s)" % len(own["paths"])}

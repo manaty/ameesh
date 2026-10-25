@@ -13,8 +13,9 @@ from . import plan_git, radar, review_authors
 def production(cfg, item, repo):
     """Return an exact published scope, or None when none is configured.
 
-    A configured but unreadable branch refuses the gate; stale local evidence
-    never substitutes for a failed remote read.
+    A configured but unreadable branch raises; callers retain ordinary
+    attribution without production exclusions. Stale local evidence never
+    substitutes for a failed remote read.
     """
     if cfg is None or not item or not repo:
         return None
