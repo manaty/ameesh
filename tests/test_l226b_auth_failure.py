@@ -114,7 +114,7 @@ class _CapsBase(unittest.TestCase):
         self.addCleanup(lambda: __import__("shutil").rmtree(self.tmp, ignore_errors=True))
 
     def _items(self, **settings):
-        raw = [{"name": "primaire"}]
+        raw = [{"name": "primaire", "check_credentials": False}]
         for name in ("secondaire", "tertiaire"):
             path = os.path.join(self.tmp, name)
             os.makedirs(path, mode=0o700, exist_ok=True)
@@ -963,7 +963,8 @@ class UnpacedChoiceTest(_AuthBase):
         self.assertFalse(storage.of(self.db).accounts.active(self.cfg.host, "claude")["forced"])
 
     def test_fixed_cap_is_hard_even_below_a_lower_pace_cap(self):
-        items = accounts.parse({"claude": [{"name": "primaire"}]})["claude"]
+        items = accounts.parse({"claude": [{"name": "primaire",
+                                            "check_credentials": False}]})["claude"]
         # 60 % at a tenth of the window: the pace cap is lower than 50 %, but
         # the primary cap is what holds it
         reading = cost.Gauges([cost.Gauge(

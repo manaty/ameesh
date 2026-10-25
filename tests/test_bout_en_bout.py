@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import json
 import os
+from pathlib import Path
 import re
 import shutil
 import subprocess
@@ -186,7 +187,8 @@ class BoutEnBoutTest(PgTestCase):
             if proc.poll() is not None:
                 self.fail("ameesh-approve s'est arrêté (code %s) :\n%s" % (proc.returncode, text))
             return None
-        found = self.wait_for(port, timeout=30)
+        found = self.wait_for(port, timeout=30,
+                              msg=lambda: Path(log_path).read_text(encoding="utf-8"))
         self.approve_url = "http://127.0.0.1:%d" % found
         return found
 

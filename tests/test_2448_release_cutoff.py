@@ -18,6 +18,8 @@ import tempfile
 import time
 import types
 import unittest
+
+from ameesh import platform
 from datetime import datetime
 from pathlib import Path
 from unittest import mock
@@ -916,6 +918,7 @@ sleep 30
 """
 
 
+@unittest.skipUnless(platform.is_linux(), "unités systemd et état /proc : Linux")
 class StagingTimeoutUnitsTest(unittest.TestCase):
     """#3049: a timed-out staging never drops the worktree under a live unit."""
 

@@ -168,7 +168,7 @@ class ProfilsTest(unittest.TestCase):
         ambiant ; le profil synthétique, lui, garde le dossier hérité."""
         herite = {"CLAUDE_CONFIG_DIR": "/herite", "CODEX_HOME": "/autre",
                   "HOME": self.tmp}
-        declare = accounts.parse({"claude": [{"name": "primaire"}],
+        declare = accounts.parse({"claude": [{"name": "primaire", "check_credentials": False}],
                                   "codex": [{"name": "primaire"}]})
         claude, codex = declare["claude"][0], declare["codex"][0]
         self.assertEqual(claude.home(herite), os.path.join(self.tmp, ".claude"))
