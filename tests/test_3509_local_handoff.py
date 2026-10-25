@@ -117,6 +117,61 @@ class LocalAuthorityTest(unittest.TestCase):
             server.close()
 
 
+class AlarmOutcomeTest(unittest.TestCase):
+    def test_dispatcher_alarm_preserves_intent_then_reconciliation_quiesces(self):
+        import io
+        import signal
+        from .test_3470_handoff_activation import EffectTest, companion
+        fixture = EffectTest()
+        fixture.setUp()
+        self.addCleanup(fixture.doCleanups)
+        fixture.prepared()
+        self.assertIs(fixture.call('admit')['ok'], True)
+        handlers = {}
+        channel = mock.Mock(family=socket.AF_UNIX, type=socket.SOCK_STREAM)
+        import struct
+        channel.getsockopt.return_value = struct.pack('3i', 42, 1001, 1001)
+        observed = []
+
+        def start(*args):
+            # The unit started, but the alarm interrupts its response.
+            fixture.system.fields['ActiveState'] = 'active'
+            handlers[signal.SIGALRM](signal.SIGALRM, None)
+
+        def serve(*args):
+            try:
+                fixture.call('enable')
+            except companion.Uncertain as exc:
+                observed.append(exc)
+                raise
+
+        with mock.patch.object(dispatch, 'executor', return_value=companion), \
+                mock.patch.object(dispatch, 'policy', return_value={}), \
+                mock.patch.object(dispatch, 'os',
+                    mock.Mock(geteuid=mock.Mock(return_value=0),
+                              dup=mock.Mock(return_value=123))), \
+                mock.patch.object(dispatch.socket, 'socket', return_value=channel), \
+                mock.patch.object(dispatch.signal, 'signal',
+                    side_effect=lambda sig, handler: handlers.update({sig: handler})), \
+                mock.patch.object(dispatch.signal, 'alarm'), \
+                mock.patch.object(dispatch, 'serve', side_effect=serve), \
+                mock.patch.object(fixture.system, 'start', side_effect=start), \
+                mock.patch.object(dispatch.sys, 'stderr', new_callable=io.StringIO) as log:
+            self.assertEqual(dispatch.main([]), 1)
+        self.assertEqual(len(observed), 1, log.getvalue())
+        self.assertEqual(str(observed[0]), 'deadline')
+        self.assertEqual(log.getvalue(), 'local_handoff_uncertain pid=42 uid=1001\n')
+        directory = fixture.fx.effects.operations / ('a' * 32)
+        self.assertTrue((directory / 'enable.intent.json').exists())
+        proof = fixture.call('reconcile_effect', controller_epoch=4)
+        self.assertIs(proof['ok'], True)
+        self.assertIs(proof['quiesced'], True)
+        self.assertEqual(proof['epoch'], 3)
+        self.assertGreaterEqual(fixture.system.stops, 1)
+        self.assertEqual(fixture.call('enable', controller_epoch=3)['reason'],
+                         'revoked_epoch')
+
+
 class ClientBoundaryTest(unittest.TestCase):
     def channel(self, uid=0, output=b'{}'):
         import struct

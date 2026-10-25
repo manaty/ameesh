@@ -123,22 +123,30 @@ def serve(channel, rules, execute):
 
 def main(argv=None):
     def expired(signum, frame):
-        raise Refused('deadline')
+        raise module.Uncertain('deadline')
     channel = None
+    module = None
+    pid = uid = -1
     try:
         if (sys.argv[1:] if argv is None else argv) or os.geteuid() != 0:
             raise Refused('authority')
+        module = executor()
         signal.signal(signal.SIGALRM, expired)
         signal.alarm(SECONDS)
         rules = policy()
         channel = socket.socket(fileno=os.dup(0))
         if channel.family != socket.AF_UNIX or channel.type != socket.SOCK_STREAM:
             raise Refused('channel')
-        serve(channel, rules, executor().execute)
+        pid, uid, _ = struct.unpack('3i', channel.getsockopt(
+            socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize('3i')))
+        serve(channel, rules, module.execute)
         return 0
-    except Exception:
+    except Exception as exc:
         # May follow an effect. No forged negative receipt: client reconciles.
-        print('local_handoff_unavailable', file=sys.stderr)
+        category = ('uncertain' if module is not None
+                    and isinstance(exc, module.Uncertain) else
+                    'refused' if isinstance(exc, Refused) else 'unavailable')
+        print(f'local_handoff_{category} pid={pid} uid={uid}', file=sys.stderr)
         return 1
     finally:
         signal.alarm(0)
