@@ -317,8 +317,39 @@ class HoldsAndWakesTest(unittest.TestCase):
                     event(7, 2, merged_at + 2, "unhold: déployé",
                           actor="orchestrateur", state="merged"),
                     event(7, 3, merged_at + 3, "fermeture retenue",
-                          state="blocked")])
+                          state="blocked")],
+            closure_allowed=lambda who: who == "orchestrateur")
         self.assertEqual(report["undeployed_holds"], [])
+        self.assertEqual(report["holds"], [])
+
+    def test_unhold_ordinaire_ne_leve_pas_la_retenue_d_un_pilote(self):
+        # B de cx1 (25/10) : la reconstruction de fermeture garde les règles
+        # #3219. Un auteur ordinaire ne lève que sa retenue ; un pilote lève
+        # toute celle du lot. Sans prédicat (lecture sans base), une levée ne
+        # retire que celle de son auteur — jamais celle d'un autre.
+        merged_at = T - 5 * H
+        milestones = [frozen(1, 10, merged_at - H, sha="a" * 40),
+                      {"work_item_id": 1, "id": 11, "kind": "merged",
+                       "at_ts": merged_at}]
+        base = [event(1, 1, merged_at, "fusion", state="merged"),
+                event(1, 2, merged_at + 1,
+                      "hold: déployer main sur pc-smichea",
+                      actor="mesh-design", state="merged"),
+                event(1, 3, merged_at + 2, "review-after-merge",
+                      actor="ameesh", state="merged")]
+        ordinary = base + [event(1, 4, merged_at + 3,
+                                 "unhold: je lève la mienne",
+                                 actor="mty-amh-impl-08", state="merged")]
+        report = run(items=[item(1)], milestones=milestones, events=ordinary,
+                     holds={})
+        self.assertEqual([row["by"] for row in report["holds"]],
+                         ["mesh-design"])
+        self.assertIn(1, [row["lot"] for row in report["undeployed_holds"]])
+        pilot = base + [event(1, 4, merged_at + 3, "unhold: staging déployé",
+                              actor="orchestrateur", state="merged")]
+        report = run(items=[item(1)], milestones=milestones, events=pilot,
+                     holds={},
+                     closure_allowed=lambda who: who == "orchestrateur")
         self.assertEqual(report["holds"], [])
 
     def test_un_compte_rendu_de_deploiement_n_est_pas_une_retenue(self):

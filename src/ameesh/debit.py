@@ -442,7 +442,8 @@ def _reopened(events: list[dict], terminal_ts: float | None) -> bool:
     return latest_state in _OPEN_STATES
 
 
-def _closure_holds(events: list[dict], terminal_ts: float | None) -> dict[str, dict]:
+def _closure_holds(events: list[dict], terminal_ts: float | None,
+                   allowed=None) -> dict[str, dict]:
     """Les retenues posées après le jalon terminal d'un lot fusionné (#3497).
 
     Après une fusion, les écritures d'état du harnais (`merged` d'un
@@ -450,9 +451,15 @@ def _closure_holds(events: list[dict], terminal_ts: float | None) -> dict[str, d
     reprises : `active_holds` remet la retenue à zéro à chaque changement
     d'état, ce qui perdait la retenue de fermeture de #3444 (`hold:` de
     04:44:17, `merged` concurrent de 04:44:23). Une retenue posée dans cet
-    intervalle tient donc jusqu'à une levée explicite ou une vraie reprise
-    (`intake`, `build`, `qa`) ; une retenue antérieure à la fusion est du
-    ressort d'`active_holds` et n'est jamais ressuscitée ici."""
+    intervalle tient donc jusqu'à une levée ou une vraie reprise (`intake`,
+    `build`, `qa`) ; une retenue antérieure à la fusion est du ressort
+    d'`active_holds` et n'est jamais ressuscitée ici.
+
+    Les levées suivent #3219, sur l'autorité partagée `lift_authority` : un
+    auteur ne lève que sa retenue, un pilote lève toute celle du lot. Sans
+    prédicat (lecture brute), seul l'auteur est levé — jamais celle d'un
+    autre (relecture cx1 du 25/10 : un `unhold` ordinaire ne doit pas
+    effacer la retenue d'un pilote)."""
     from . import planned_waits
 
     if terminal_ts is None:
@@ -473,13 +480,13 @@ def _closure_holds(events: list[dict], terminal_ts: float | None) -> dict[str, d
         if planned_waits.is_hold_note(text):
             held[who] = {"by": who or None,
                          "since": float(event.get("at_ts") or 0.0),
-                         "note": text, "pilot": False}
+                         "note": text,
+                         "pilot": bool(allowed(who)) if allowed is not None else False}
         elif planned_waits.is_lift_note(text):
-            # Une levée explicite lève la retenue de fermeture : le débit ne
-            # ressuscite pas une retenue que le journal dit levée. L'autorité
-            # de la levée n'est pas rejugée ici (la lecture d'autorité reste
-            # `active_holds`, #3219).
-            held = {}
+            if allowed is not None and allowed(who):
+                held = {}               # un pilote lève toute la retenue
+            else:
+                held.pop(who, None)     # l'auteur ne lève que la sienne
     return held
 
 
@@ -715,8 +722,11 @@ def blocking_review(milestones: list[dict], freeze: dict | None) -> dict | None:
 
 # -- holds -------------------------------------------------------------------
 
-def _holds_from_events(events: list[dict]) -> dict[str, dict]:
-    """Repli sans base : la dernière retenue, levée par toute note de levée."""
+def _holds_from_events(events: list[dict], allowed=None) -> dict[str, dict]:
+    """Repli sans base : la dernière retenue, levée par toute note de levée.
+
+    `allowed` est l'autorité de levée (#3219) ; sans elle, seul l'auteur lève
+    sa retenue."""
     from . import planned_waits
 
     held: dict[str, dict] = {}
@@ -734,9 +744,14 @@ def _holds_from_events(events: list[dict]) -> dict[str, dict]:
         if planned_waits.is_hold_note(text):
             who = event.get("actor") or ""
             held[who] = {"by": who or None, "since": float(event.get("at_ts") or 0.0),
-                         "note": text, "pilot": False}
+                         "note": text,
+                         "pilot": bool(allowed(who)) if allowed is not None else False}
         elif planned_waits.is_lift_note(text):
-            held.pop(event.get("actor") or "", None)
+            who = event.get("actor") or ""
+            if allowed is not None and allowed(who):
+                held = {}               # un pilote lève toute la retenue
+            else:
+                held.pop(who, None)     # l'auteur ne lève que la sienne
     return held
 
 
@@ -778,8 +793,14 @@ def build(*, items: Iterable[Mapping[str, Any]],
           devices: Mapping[str, Any] | None = None,
           installed: str | None = None,
           holds: Mapping[int, Mapping[str, Mapping[str, Any]]] | None = None,
+          closure_allowed=None,
           ci_unreadable: Iterable[str] = ()) -> dict:
-    """Le rapport de débit, calculé sans I/O (témoins et tests)."""
+    """Le rapport de débit, calculé sans I/O (témoins et tests).
+
+    `closure_allowed` est l'autorité de levée (#3219) partagée par `read`
+    (`planned_waits.lift_authority`) : un pilote lève toute la retenue de
+    fermeture, un auteur ordinaire seulement la sienne. Sans elle (appel sans
+    base), une levée ne retire que la retenue de son propre auteur."""
     # #3447 : le préfixe de journal est défini une fois, pour l'écrivain
     # (`work.set_external_executor`) et ce lecteur.
     from .storage.interface import EXTERNAL_EXECUTOR_NOTE
@@ -802,7 +823,7 @@ def build(*, items: Iterable[Mapping[str, Any]],
     state_by_lot = {ident: _current_state(values)
                     for ident, values in events_by_lot.items()}
     if holds is None:
-        holds = {ident: _holds_from_events(values)
+        holds = {ident: _holds_from_events(values, allowed=closure_allowed)
                  for ident, values in events_by_lot.items()}
     hold_by_lot = {int(ident): dict(value) for ident, value in (holds or {}).items()}
     # #3497 : après un jalon terminal, une retenue de fermeture survit aux
@@ -813,7 +834,8 @@ def build(*, items: Iterable[Mapping[str, Any]],
         terminal_ts = _terminal_at(lot_milestones)
         if terminal_ts is None or _reopened(events_by_lot.get(ident, []), terminal_ts):
             continue
-        closure = _closure_holds(events_by_lot.get(ident, []), terminal_ts)
+        closure = _closure_holds(events_by_lot.get(ident, []), terminal_ts,
+                                 allowed=closure_allowed)
         entries = hold_by_lot.setdefault(ident, {})
         for who, entry in closure.items():
             current = entries.get(who)
@@ -1415,12 +1437,16 @@ def read(db, *, cfg=None, now: float | None = None, hours: int = DEFAULT_HOURS,
     # Les retenues actives : la lecture d'autorité de #3219 (un hold de pilote
     # lève toute la retenue, celui d'un auteur ne lève que la sienne).
     holds: dict[int, dict] = {}
+    closure_allowed = None
     try:
         from . import planned_waits
         # `active_holds` lit `created_ts` (le nom du journal) ; la lecture SQL
         # porte `at_ts` comme le reste du module : on expose les deux.
         for event in events:
             event.setdefault("created_ts", event.get("at_ts"))
+        # La reconstruction des retenues de fermeture (#3497) partage la même
+        # autorité de levée que `active_holds` (#3219).
+        closure_allowed = planned_waits.lift_authority(db, cfg)
         holds = planned_waits.active_holds(db, events, cfg=cfg)
     except Exception as exc:  # noqa: BLE001 - repli nommé, jamais un hold inventé
         unreadable.append("holds unreadable: %s" % " ".join(str(exc).split())[:200])
@@ -1476,7 +1502,8 @@ def read(db, *, cfg=None, now: float | None = None, hours: int = DEFAULT_HOURS,
                    jobs=jobs_rows,
                    now=now, hours=hours, wait_s=wait_s, ci_hours=ci_hours,
                    ci_slow_s=ci_slow_s, devices=devices, installed=installed,
-                   holds=holds, ci_unreadable=ci_unreadable)
+                   holds=holds, closure_allowed=closure_allowed,
+                   ci_unreadable=ci_unreadable)
     report["unreadable"] = list(dict.fromkeys(list(report["unreadable"]) + unreadable))
     return report
 
