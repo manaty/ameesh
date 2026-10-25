@@ -180,6 +180,17 @@ def _pilot_allowed(db, cfg, *, strict: bool = False):
     return allowed
 
 
+def lift_authority(db, cfg=None, *, strict: bool = False):
+    """Le prédicat d'autorisation d'une levée de hold (#3219), partagé.
+
+    `active_holds` et la reconstruction des retenues de fermeture du débit
+    (#3497) doivent lire la **même** autorité : un auteur ne lève que sa
+    retenue, un pilote (humain, orchestrateur ou conception) lève celle du lot.
+    `cfg` par défaut : celui de `db`."""
+    cfg = getattr(db, "cfg", None) if cfg is None else cfg
+    return _pilot_allowed(db, cfg, strict=strict)
+
+
 def active_holds(db, events, *, cfg=None,
                  strict: bool = False) -> dict[int, dict[str, dict]]:
     """#3219 : les retenues actives de chaque lot, par auteur.
@@ -203,8 +214,7 @@ def active_holds(db, events, *, cfg=None,
     if not ordered or not any(is_hold_note(event.get("note"))
                               for event in events or ()):
         return {}
-    cfg = getattr(db, "cfg", None) if cfg is None else cfg
-    allowed = _pilot_allowed(db, cfg, strict=strict)
+    allowed = lift_authority(db, cfg, strict=strict)
     out: dict[int, dict[str, dict]] = {}
     for ident, lot_events in ordered.items():
         held: dict[str, dict] = {}
