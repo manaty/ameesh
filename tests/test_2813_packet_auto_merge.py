@@ -784,6 +784,7 @@ class TargetMovedTest(Journal):
         (Path(path) / "pyproject.toml").write_text('[project]\nversion = "1.0.0"\n')
         git("add", "-A")
         git("commit", "-qm", "base")
+        git("branch", "-M", "main")
         return path, git, git("rev-parse", "HEAD")
 
     def cutoff(self, path, git):
@@ -883,6 +884,33 @@ class TargetMovedTest(Journal):
         self.armed(sha=head, composition=base)
         gh = FakeGh(head=head, base_oid=moved, tests="success")
         out = self.check(gh, checkout=path)
+        self.assertEqual(out["result"], "merged", out)
+        self.assertEqual(gh.landed, [("main", head)])
+
+    def test_b2a_the_fetch_precedes_the_target_head_check(self):
+        # Le clone de passage ne connaît d'abord que la cible C (main) ; H2
+        # arrive par le fetch de la branche du porteur, jamais avant la garde.
+        path, git, base = self.repo()
+        moved = self.code(path, git)
+        _, head = self.packet_with_target(path, git, base)
+        pass_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(pass_dir.cleanup)
+        clone = pass_dir.name
+        subprocess.run(["git", "-C", clone, "init", "-q"], check=True)
+        subprocess.run(["git", "-C", clone, "remote", "add", "origin", path],
+                       check=True)
+        subprocess.run(["git", "-C", clone, "fetch", "-q", "origin",
+                        "refs/heads/main:refs/remotes/origin/main"], check=True)
+        self.frozen = head
+        self.armed(sha=head, composition=base)
+        gh = FakeGh(head=head, base_oid=moved, tests="success", branch="packet")
+        with mock.patch.object(packet_automerge.fire, "_repo_of", return_value=None), \
+                mock.patch.object(packet_automerge.fire, "_project", return_value=None), \
+                mock.patch.object(packet_automerge.fire, "_project_checkout",
+                                  return_value=None), \
+                mock.patch.object(packet_automerge.fire, "_same_repository",
+                                  return_value=True):
+            out = self.check(gh, checkout=clone)
         self.assertEqual(out["result"], "merged", out)
         self.assertEqual(gh.landed, [("main", head)])
 
