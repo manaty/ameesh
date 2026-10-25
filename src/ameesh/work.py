@@ -438,10 +438,13 @@ def publisher(cfg, db, explicit: str | None = None) -> str:
     l'auditeur ; WorkError pour tout autre. Chaque publication renvoyait les
     briefs `estimate_bias` à tous les estimateurs biaisés : le 25/10, un agent
     a republié la table une minute après l'auditeur pour clore sa propre
-    alerte. Une session qui porte une identité d'agent publie en son nom, et
-    seulement si cet agent est l'auditeur (`is_auditor`) ; une identité
-    refusée ne retombe pas sur le terminal humain. Une session sans identité
-    dit qui publie : un humain (`--actor human:<id>`) ou l'auditeur."""
+    alerte. Une session liée (bail du runner ou liaison de session,
+    `identity.BOUND_SOURCES`, L244) publie en son nom, et seulement si cet
+    agent est l'auditeur (`is_auditor`) ; un `AGENT_MAIL_NAME` seulement
+    auto-déclaré ne suffit pas, et une identité refusée ne retombe pas sur le
+    terminal humain. Une session sans identité ne nomme qu'un humain
+    (`--actor human:<id>`) : sans liaison, un nom d'agent est refusé (revue
+    de mty-amh-impl-05, comme #540 r2 pour `forcer`)."""
     from . import identity
     from .agent_names import resolve
 
@@ -458,6 +461,9 @@ def publisher(cfg, db, explicit: str | None = None) -> str:
         if text and text != binding.name:
             raise WorkError("--publish refused: this session belongs to %s, it does "
                             "not publish on behalf of %s" % (binding.name, text))
+        if binding.source not in identity.BOUND_SOURCES:
+            raise WorkError("--publish refused: identity %s is %s, not bound (runner "
+                            "lease or `ameesh mail bind`)" % (binding.name, binding.source))
         if is_auditor(cfg, db, binding.name):
             return binding.name
         raise WorkError(refus % binding.name)
@@ -465,9 +471,10 @@ def publisher(cfg, db, explicit: str | None = None) -> str:
         raise WorkError("--publish: say who publishes (--actor human:<id>)")
     if text.startswith(HUMAN_PREFIX) and len(text) > len(HUMAN_PREFIX):
         return text
-    if is_auditor(cfg, db, text):
-        return text
-    raise WorkError(refus % text)
+    raise WorkError(
+        "--publish refused: %s is not a human and this session has no bound agent "
+        "identity (runner lease or `ameesh mail bind`); the auditor publishes from "
+        "its own bound session, a human terminal says --actor human:<id>" % text)
 
 
 def milestone_actor(cfg, db, explicit: str | None = None, *, kind: str = "") -> str:
