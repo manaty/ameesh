@@ -1395,13 +1395,18 @@ BLOCKED_AFTER_S = float(os.environ.get("AMEESH_MERGE_BLOCKED_MIN", "30")) * 60
 
 def blocked(db, now: float | None = None) -> list[dict]:
     """Heads of queue (rank 1, or landing) that have not moved for
-    `BLOCKED_AFTER_S`: the queue is stuck behind them."""
+    `BLOCKED_AFTER_S`: the queue is stuck behind them.
+
+    #3569: a row the train enrolled (`packet_allocated`) is not one: the
+    queue pass skips it (`run_pass`, #3560) and the train moves it with its
+    packet, whose CI may run longer than this delay."""
     now = time.time() if now is None else now
     try:
         rows = storage.of(db).work.queue()
     except Exception:  # noqa: BLE001 - database without 0058
         return []
     return [r for r in rows if r["state"] in ("queued", "landing")
+            and not r.get("packet_allocated")
             and (r["state"] == "landing" or r.get("rank") == 1)
             and now - float(r.get("updated_ts") or now) >= BLOCKED_AFTER_S]
 

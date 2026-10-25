@@ -1119,6 +1119,21 @@ class SettingsAndAlertTest(unittest.TestCase):
                          [("merge_blocked", 1, "a1")])
         self.assertIn("bloquée derrière le lot #1", alerts[0]["detail"])
 
+    def test_merge_blocked_ignores_a_row_the_train_enrolled(self):
+        """#3569 : la file saute la ligne d'un lot inscrit par le train (#3560) ;
+        une longue CI de paquet ne la rend pas « bloquante »."""
+        now = time.time()
+        rows = [{"work_item_id": 1, "target": "main", "state": "queued", "rank": 1,
+                 "updated_ts": now - 3600, "packet_allocated": True},
+                {"work_item_id": 3, "target": "dev", "state": "landing", "rank": 1,
+                 "updated_ts": now - 3600, "packet_allocated": True},
+                {"work_item_id": 4, "target": "ops", "state": "queued", "rank": 1,
+                 "updated_ts": now - 3600, "packet_allocated": False}]
+        store = mock.Mock()
+        store.work.queue.return_value = rows
+        with mock.patch.object(storage, "of", return_value=store):
+            self.assertEqual([r["work_item_id"] for r in land.blocked(None, now)], [4])
+
 
 class LeaseDbTest(PgTestCase):
     def test_lease(self):
