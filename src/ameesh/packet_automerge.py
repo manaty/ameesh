@@ -37,7 +37,10 @@ repos/<slug>/merges`, `base=<cible épinglée>`, `head=<tête publiée>`)
 * **Le passage** (`watch`, `ameesh release tick` des projets de
   `packet_watch`, toutes les cinq minutes) relit chaque porteur ouvert armé :
   tête, cible ou gel changé depuis la publication → désarmé (journal, et
-  auto-fusion GitHub éventuelle retirée). Sinon la fusion passe les mêmes
+  auto-fusion GitHub éventuelle retirée). Une cible qui n'a avancé que par
+  des atterrissages de coupure (ligne de version seule et notes
+  `docs/versions/*.md`, manaty/home#173) ne désarme pas : le contenu testé
+  n'a pas changé. Sinon la fusion passe les mêmes
   portes que le feu (R1, ameesh-cx3) : `fire.ready_verdicts` (classe, avis
   requis et indépendants sur la tête gelée, membres d'un porteur et delta,
   #2766), puis au moins un check imposé par la forge — et tous ceux épinglés
@@ -85,10 +88,15 @@ MARK_RE = re.compile(
     r"^auto-merge (?P<state>armed|disarmed|merged|not-armed|held) "
     r"repo=(?P<repo>[\w.-]+/[\w.-]+) pr=(?P<pr>\d+) sha=(?P<sha>[0-9a-f]{40})"
     r"(?: base=(?P<base>[\w./-]+))?(?: method=[a-z]+)?(?: required=(?P<required>\S+))?"
+    r"(?: composition=(?P<composition>[0-9a-f]{40}))?"
     r"(?:\s|$)(?: *— *(?P<why>.*))?", re.S)
 #: marques qui referment un armement de la même PR
 CLOSING = ("disarmed", "merged")
 _SHA = re.compile(r"[0-9a-f]{40}")
+#: #3534 / manaty/home#173 : un atterrissage de coupure ne change que la
+#: ligne de version et les notes de version.
+NOTES_DIR = "docs/versions"
+_VERSION_LINE = re.compile(r'^version\s*=\s*"[^"\s]+"\s*$')
 
 
 def carrier(head_ref) -> bool:
@@ -125,6 +133,7 @@ def marks(db, lot: int) -> list[dict]:
             out.append({"id": int(ev.get("id") or 0), "state": m.group("state"),
                         "repo": m.group("repo"), "pr": int(m.group("pr")),
                         "sha": m.group("sha"), "base": m.group("base") or "",
+                        "composition": (m.group("composition") or "").strip().lower(),
                         "required": tuple(unquote(name) for name in
                                           (m.group("required") or "").split(",") if name),
                         "why": (m.group("why") or "").strip()})
@@ -222,6 +231,156 @@ def _unlock(handle) -> None:
 
 
 # --------------------------------------------------------------------------
+# cible et base de composition (#3534, manaty/home#173)
+# --------------------------------------------------------------------------
+
+def _git(repo: str, *args: str, timeout: float = 60.0) -> str | None:
+    """La sortie d'un git local, ou None (dépôt absent, commande en échec)."""
+    try:
+        proc = subprocess.run(["git", "-C", repo, *args], capture_output=True,
+                              text=True, timeout=timeout)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return proc.stdout if proc.returncode == 0 else None
+
+
+def _composition_base(db, lot: int, sha: str, target: str = "") -> str:
+    """La base de composition enregistrée du paquet (`work_packet_members`),
+    pour la tête `sha` ; "" si absente ou illisible.
+
+    #3534 : c'est la seule borne qui ne dépende pas du SHA courant de la
+    cible ; elle est écrite par `work packet record` au moment de la
+    composition."""
+    if db is None:
+        return ""
+    try:
+        rows = storage.of(db).work.packet_members(package_ids=[int(lot)])
+    except Exception:  # noqa: BLE001 - base ou schéma illisible : repli
+        return ""
+    head = str(sha or "").strip().lower()
+    for row in rows or ():
+        row = row or {}
+        if str(row.get("head_sha") or "").strip().lower() != head:
+            continue
+        base = str(row.get("base_sha") or "").strip().lower()
+        if not base:
+            continue
+        recorded_target = str(row.get("package_target") or "").strip()
+        if target and recorded_target and recorded_target != target:
+            continue
+        return base
+    return ""
+
+
+def _cutoff_commit(repo: str, sha: str) -> bool:
+    """Un commit d'atterrissage de coupure (manaty/home#173) : message de
+    release, et diff contre sa première parente limité à la ligne de version
+    de `pyproject.toml` et aux notes `docs/versions/*.md`."""
+    message = _git(repo, "log", "-1", "--format=%B", sha) or ""
+    if "ameesh-release:" not in message:
+        return False
+    parents = (_git(repo, "rev-list", "--parents", "-n", "1", sha) or "").split()
+    if len(parents) < 2:
+        return False
+    parent = parents[1]
+    names = (_git(repo, "diff", "--name-only", "--no-renames", parent, sha)
+             or "").splitlines()
+    if not names:
+        return False
+    for name in names:
+        if name == "pyproject.toml":
+            patch = _git(repo, "diff", "-U0", parent, sha, "--", "pyproject.toml")
+            if patch is None:
+                return False
+            removed, added = [], []
+            for line in patch.splitlines():
+                if line.startswith(("+++", "---")):
+                    continue
+                if line.startswith("+"):
+                    added.append(line[1:])
+                elif line.startswith("-"):
+                    removed.append(line[1:])
+            if len(removed) != 1 or len(added) != 1:
+                return False
+            if not (_VERSION_LINE.match(removed[0].strip())
+                    and _VERSION_LINE.match(added[0].strip())):
+                return False
+        elif name.startswith(NOTES_DIR + "/") and name.endswith(".md"):
+            continue
+        else:
+            return False
+    return True
+
+
+def _cutoff_landing_only(repo: str, base: str, head: str) -> bool:
+    """La cible n'a avancé que par des atterrissages de coupure (#173).
+
+    `base` doit être un ancêtre de `head` ; chaque commit de l'intervalle doit
+    être un atterrissage (version + notes). Un dépôt illisible, une cible
+    absente ou un commit de code rendent False : on ne fusionne pas un arbre
+    que la CI n'a pas testé."""
+    if not repo or not base or not head or base == head:
+        return False
+    if _git(repo, "merge-base", "--is-ancestor", base, head) is None:
+        return False
+    commits = _git(repo, "rev-list", "--reverse", "%s..%s" % (base, head))
+    if commits is None:
+        return False
+    shas = commits.split()
+    return bool(shas) and all(_cutoff_commit(repo, sha) for sha in shas)
+
+
+def _merge_base(repo: str, a: str, b: str) -> str:
+    """Le dernier commit commun de `a` et `b`, ou ""."""
+    if not repo or not a or not b:
+        return ""
+    return (_git(repo, "merge-base", a, b) or "").strip().lower()
+
+
+def _target_tested(repo: str, target: str, head: str, composition: str = "") -> bool:
+    """La cible est-elle couverte par la tête testée `head` ?
+
+    #3534 (B2) : la borne n'est pas la base du manifeste mais le dernier
+    commit de la cible **contenu dans la tête** (`merge-base`) ; c'est lui qui
+    a été testé avec le paquet. Si la cible a ensuite avancé, seul le delta
+    depuis ce commit doit être un atterrissage de coupure. Sans tête lisible
+    (clone en retard, tête absente), le repli est la base du manifeste : une
+    cible qui n'a pas bougé depuis la composition reste couverte."""
+    if not repo or not target or not head:
+        return False
+    included = _merge_base(repo, target, head)
+    if not included:
+        return bool(composition) and _cutoff_landing_only(repo, composition, target)
+    if included == target:
+        return True
+    return _cutoff_landing_only(repo, included, target)
+
+
+def _gate_repo(cfg, db, row, slug: str, checkout: str = "") -> str:
+    """Le clone où lire le delta de la cible, résolu comme la porte des avis.
+
+    #3534 (relecture cx3 B3) : `ci run`/`arm` laissent `checkout` vide ; le
+    registre de l'assigné et le clone du projet (`radar.projects`) sont les
+    mêmes sources que `_verdicts`, et doivent être lues **avant** la garde du
+    delta, pas seulement plus tard par la porte des avis."""
+    repo = None
+    try:
+        repo = fire._repo_of(db, row)
+        if repo is not None and not fire._same_repository(repo, slug):
+            repo = None
+        project = fire._project(cfg, repo, slug)
+        if repo is None:
+            repo = fire._project_checkout(project)
+    except Exception:  # noqa: BLE001 - registre/radar illisibles : repli
+        repo = None
+    if repo is None and checkout:
+        repo = fire._checkout(checkout)
+        if repo is not None and not fire._same_repository(repo, slug):
+            repo = None
+    return repo or ""
+
+
+# --------------------------------------------------------------------------
 # GitHub
 # --------------------------------------------------------------------------
 
@@ -282,7 +441,7 @@ def pr_status(slug: str, number: int, *, gh) -> dict:
 # --------------------------------------------------------------------------
 
 def arm(cfg, db, lot: int, *, slug: str, number: int, sha: str, target: str, gh,
-        actor: str = work.SYSTEM_SENDER) -> dict:
+        actor: str = work.SYSTEM_SENDER, checkout: str = "") -> dict:
     """Arme la fusion du porteur `lot` (PR `number` de `slug`) sur `sha`,
     vers `target`.
 
@@ -315,7 +474,7 @@ def arm(cfg, db, lot: int, *, slug: str, number: int, sha: str, target: str, gh,
         if out["state"] in ("armed", "already-armed"):
             # une composition déjà verte fusionne tout de suite, sous le même bail
             out["merge"] = _check_locked(cfg, db, lot, gh=gh, dry_run=False, actor=actor,
-                                         handle=handle, fence=fence)
+                                         handle=handle, fence=fence, checkout=checkout)
         return out
     finally:
         _unlock(handle)
@@ -377,12 +536,19 @@ def _arm_locked(db, lot: int, *, slug: str, number: int, sha: str, target: str, 
                 "why": "already armed on %s → %s" % (sha[:12], target)}
     names = ",".join(dict.fromkeys(quote(context, safe="")
                                    for context, _app in required))
+    # #3534 : la base de composition est épinglée avec la tête et la cible ;
+    # le passage compare la cible courante à cette borne, pas à elle-même.
+    composition = (_composition_base(db, lot, sha, target)
+                   or str(view.get("base_oid") or "").strip().lower())
+    pinned = "base=%s method=%s required=%s" % (target, METHOD, names)
+    if composition:
+        pinned += " composition=%s" % composition
     if not _renew(handle):
         return lost
     if not _note_fenced(db, fence, lot, "armed", slug, number, sha,
-                        "base=%s method=%s required=%s — ameesh merges this head into %s "
-                        "once its required checks are green; a new push or a retarget "
-                        "disarms it" % (target, METHOD, names, target), actor,
+                        "%s — ameesh merges this head into %s once its required checks "
+                        "are green; a new push, a retarget or a target that advanced "
+                        "since composition disarms it" % (pinned, target), actor,
                         margin_s=AUTOMERGE_CALL_MARGIN_S):
         return {"state": "error", "why": "the elected pilot lease was lost before "
                                          "arming: nothing armed"}
@@ -622,7 +788,25 @@ def _gate_locked(cfg, db, lot: int, mine: dict, *, gh, dry_run: bool, actor: str
     if row is None:
         return dict(out, result="error", error="lot #%d not found" % lot)
     frozen = fire._norm((fire.freeze_of(milestones) or {}).get("sha"))
+    base_oid = str(view.get("base_oid") or "").strip().lower()
+    composition = (_composition_base(db, lot, sha, base)
+                   or str(mine.get("composition") or "").strip().lower())
+    # #3534 (B3) : le clone se résout comme pour la porte des avis, avant la
+    # garde du delta ; `checkout` est vide dans `ci run`/`arm`.
+    repo = _gate_repo(cfg, db, row, slug, checkout)
     moved = []
+    # #3534 : la cible doit être couverte par la tête testée, soit directement
+    # (H2 = merge(H, C)), soit par une avance limitée aux atterrissages de
+    # coupure depuis le dernier commit de la cible déjà dans la tête (B2,
+    # #173). Sinon la CI du paquet n'a pas testé cet arbre : on désarme.
+    target_moved = ""
+    if base_oid and composition and base_oid != composition:
+        if repo:
+            _fetch_into(repo, (view.get("branch") or "", base))
+        if not _target_tested(repo, base_oid, sha, composition):
+            target_moved = ("target advanced since composition %s → %s"
+                            % (composition[:12], base_oid[:12]))
+            moved.append(target_moved)
     if view["head"] != sha:
         moved.append("head=%s" % (view["head"] or "?"))
     if view["base"] != base:
@@ -643,10 +827,13 @@ def _gate_locked(cfg, db, lot: int, mine: dict, *, gh, dry_run: bool, actor: str
             error = land.pr_disable_auto(slug, number, gh=gh)
             if error is not None:
                 return dict(out, result="error", error="disarm: %s" % error)
+        why = ("the target advanced since composition; the packet must be updated "
+               "and its CI relaunched: `ameesh ci run %d --full` re-arms on the new head"
+               % int(lot)) if target_moved else (
+               "the PR changed since its publication; `ameesh ci run %d --full` "
+               "re-arms on the new head" % int(lot))
         if not _note_fenced(db, fence, lot, "disarmed", slug, number, sha,
-                            "base=%s %s — the PR changed since its publication; `ameesh "
-                            "ci run %d --full` re-arms on the new head"
-                            % (base, " ".join(moved), int(lot)), actor):
+                            "base=%s %s — %s" % (base, " ".join(moved), why), actor):
             return dict(out, result="error",
                         error="the elected pilot lease was lost before journaling "
                               "the disarm")
@@ -665,10 +852,13 @@ def _gate_locked(cfg, db, lot: int, mine: dict, *, gh, dry_run: bool, actor: str
     # R1 B1 (cx3) : la porte complète des verdicts, comme le feu (classe,
     # avis requis et indépendants sur la tête gelée, membres d'un porteur et
     # delta, #2766), avant toute lecture de CI et tout geste de fusion.
-    # #3091 : la cible résolue de la PR prouve la base de composition du
-    # paquet ; la ref locale du checkout de l'assigné peut être en retard.
-    base_oid = str(view.get("base_oid") or "").strip().lower()
-    extra = {"base_sha": base_oid} if base_oid else {}
+    # #3091 : la cible résolue de la PR est la preuve transmise à
+    # `fire.ready_verdicts` ; `packet_reviews._packet_base` choisit ensuite la
+    # base du manifeste et la prouve sur cette cible. #3534 (B4) : ne jamais
+    # transmettre la base enregistrée à sa place — un `record --base X` où X
+    # est un commit sensible du paquet sortirait B..X du périmètre de revue.
+    verdict_base = base_oid
+    extra = {"base_sha": verdict_base} if verdict_base else {}
     if checkout:
         extra.update(checkout=checkout, branch=view.get("branch") or "")
     ok, why, project = _verdicts(cfg, db, row, milestones, slug=slug, base=base,
@@ -719,11 +909,17 @@ def _gate_locked(cfg, db, lot: int, mine: dict, *, gh, dry_run: bool, actor: str
         fresh = pr_status(slug, number, gh=gh)
     except land.LandError as exc:
         return dict(out, result="error", error="fresh read: %s" % exc)
-    if (fresh["state"], fresh["head"], fresh["base"]) != ("OPEN", sha, base):
+    # #3534 (B1) : la cible est relue **et comparée à son SHA de la porte**,
+    # pas seulement à son nom ; une avance de code pendant les lectures ne
+    # fusionne pas un arbre non testé (le passage suivant désarmera).
+    if (fresh["state"], fresh["head"], fresh["base"], fresh["base_oid"]) != \
+            ("OPEN", sha, base, base_oid):
         return dict(out, result="pending", why=(
-            "PR #%d changed just before the merge (%s, head %s, base %s): nothing merged"
+            "PR #%d changed just before the merge (%s, head %s, base %s, target %s — "
+            "expected target %s): nothing merged"
             % (number, fresh["state"] or "?", fresh["head"][:12] or "?",
-               fresh["base"] or "?")))
+               fresh["base"] or "?", fresh["base_oid"][:12] or "?",
+               base_oid[:12] or "?")))
     if not _renew(handle):
         return dict(out, result="busy")
     # L165 (EP4) : renouvellement du bail élu juste avant `POST /merges`, avec

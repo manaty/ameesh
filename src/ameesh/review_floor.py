@@ -112,8 +112,13 @@ def apply(klass: dict, db, lot: int, *, cfg=None) -> dict:
                                                        str(exc)[:200])
         return klass
     if found["floor"]:
-        klass["reviews_floor"] = found["floor"]
-        klass["reviews_floor_by"] = found["actor"]
+        # #3554 : le plancher automatique d'une baisse du canon (posé par la
+        # classe, `reviews_floor`) ne se perd pas sous un plancher de pilote
+        # plus bas que lui.
+        floor = int(found["floor"])
+        if floor >= int(klass.get("reviews_floor") or 0):
+            klass["reviews_floor"] = floor
+            klass["reviews_floor_by"] = found["actor"]
     return klass
 
 

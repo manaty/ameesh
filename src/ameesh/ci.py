@@ -3492,7 +3492,8 @@ def _arm_packet(cfg, db, decision: dict, gh, args) -> dict | None:
         out = packet_automerge.arm(
             cfg, db, args.id, slug=decision["repo"], number=decision["pr"], sha=decision["sha"],
             target=decision.get("base_ref") or "", gh=packet_automerge.gh_of(gh),
-            actor=getattr(args, "actor", "") or work.SYSTEM_SENDER)
+            actor=getattr(args, "actor", "") or work.SYSTEM_SENDER,
+            checkout=getattr(args, "prevalidation_repo", "") or "")
     except Exception as exc:  # noqa: BLE001 - l'étiquette est posée : jamais fatal
         out = {"state": "error", "why": "%s: %s" % (type(exc).__name__, exc)}
     decision["auto_merge"] = out

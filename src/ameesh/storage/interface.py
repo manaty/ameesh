@@ -203,6 +203,18 @@ BASKET_LINE_NOTE = "basket line"
 #: défini ici, seul.
 EXTERNAL_EXECUTOR_NOTE = "external executor:"
 EXTERNAL_EXECUTOR_CLEARED_NOTE = "external executor cleared"
+#: #3560 : la cause d'éjection de la file quand le projet exige une CI sur le
+#: commit gelé (`ci_required`) et qu'aucun run ne s'y lit (`merge_queue._required_ci`).
+#: Sur une ligne d'inscription au paquet, ce n'est pas un échec du lot : le §11 bis
+#: ne lance aucune CI de lot, la CI complète du paquet en tient lieu. Le texte est
+#: défini ici, seul : la file l'écrit, `queue_add` et le train le relisent.
+CI_REQUIRED_EJECTION = "requires CI on the frozen commit (ci_required)"
+
+
+def ci_required_ejection(row) -> bool:
+    """#3560 : une ligne de file `ejected` pour la seule absence de CI de lot."""
+    return bool(row) and row.get("state") == "ejected" \
+        and CI_REQUIRED_EJECTION in str(row.get("reason") or "")
 
 
 class Domain(abc.ABC):
@@ -1722,7 +1734,8 @@ class WorkItems(Domain):
     def queue_add(self, item_id: int, *, target: str, frozen_sha: str, note: str,
                   actor: str, source: str = "", frozen_id: int | None = None,
                   packet: dict | None = None, packet_initial: bool = False,
-                  lease: tuple | None = None) -> dict | None:
+                  lease: tuple | None = None,
+                  withdrawn_after: float | None = None) -> dict | None:
         """L160e (0058): puts (or puts back) the lot in the merge queue of
         `target`, state `queued`, with a journal line; `source`: the
         repository it was queued from (`merge_queue.source_of`). None if the
@@ -1738,7 +1751,10 @@ class WorkItems(Domain):
         provider: absence of a queue row cannot prove never-withdrawn for
         historical lots. It cannot override a recorded withdrawal.
         `lease` (#1467): optional `(target key, owner, epoch)`, locked after
-        the lot and checked live before allocation/replay, in this transaction."""
+        the lot and checked live before allocation/replay, in this transaction.
+        `withdrawn_after` (#3532): an epoch instant; refuses (None) when a
+        typed `removed` receipt of the lot was written at or after it, read
+        under the lot row lock that `queue_remove` takes first."""
 
     @abc.abstractmethod
     def queue_update(self, item_id: int, *, state: str | None = None,
@@ -1766,6 +1782,11 @@ class WorkItems(Domain):
         Locks the lot before its queue row and records a typed `removed`
         receipt for the deleted row's freeze in the same transaction.
         A free-text journal note cannot write this receipt."""
+
+    @abc.abstractmethod
+    def queue_withdrawn_since(self, item_id: int, since_ts: float) -> float | None:
+        """#3532: the epoch instant of the lot's latest typed `removed`
+        receipt written at or after `since_ts`, None without one."""
 
     @abc.abstractmethod
     def land_lock(self, key: str, owner: str, ttl_s: float, *,
@@ -1856,7 +1877,11 @@ class WorkItems(Domain):
     @abc.abstractmethod
     def queue(self, target: str | None = None) -> list[dict]:
         """L160e (0058): the queue rows (of `target`, else every target),
-        ranked first, then by arrival."""
+        ranked first, then by arrival.
+
+        #3560: `packet_allocated` is true when the row's current generation
+        carries the train's `packet` receipt: the train enrolled it and lands
+        it itself; the radar queue never lands it."""
 
     @abc.abstractmethod
     def set_branch_head(self, item_id: int, branch: str, head: str | None) -> bool:

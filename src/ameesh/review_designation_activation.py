@@ -81,6 +81,7 @@ from typing import Mapping, Optional, Sequence
 
 from . import alert_briefs
 from . import canon as canon_mod
+from . import canon_lowering
 from . import db as db_mod
 from . import lot_class, mechanics, plan_git, projects, registry, review
 from . import review_designation as rd
@@ -157,6 +158,9 @@ class Policy:
     ref: str
     commit: str
     source: str
+    #: #3554 : la comparaison base/tête d'un lot du canon, quand elle conclut
+    #: à une baisse d'exigence (`required` vaut alors au moins 2)
+    canon_lowering: Optional[dict] = None
 
 
 @dataclass
@@ -1475,6 +1479,14 @@ def prepare(cfg, db, lot: int, *, freeze: Optional[Mapping] = None,
     policy = _policy(cfg, db, project, paths)
     if isinstance(policy, Unavailable):
         return policy
+    # #3554 : un lot du canon qui touche sa politique est comparé à la base ;
+    # une baisse d'exigence (avis ou classe) exige deux avis. Le résultat est
+    # porté par `Policy` pour que la désignation et son journal le lisent.
+    lowering = canon_lowering.for_lot(cfg, repo, start, frozen_sha, paths)
+    if lowering is not None and lowering.floor:
+        policy = dataclasses.replace(
+            policy, required=max(int(policy.required), lowering.floor),
+            canon_lowering=lowering.to_dict())
     # #3183 : le plancher posé par un pilote (`review_floor`) relève le compte
     # de la désignation comme celui de la porte ; un journal illisible attend.
     floor = review_floor.apply({}, db, int(lot), cfg=cfg)
@@ -1506,6 +1518,25 @@ def prepare(cfg, db, lot: int, *, freeze: Optional[Mapping] = None,
                   manual_seats=_manual_seats(manual, listing, authors, families,
                                              correctors=correctors),
                   advances=_advances(db))
+
+
+def _note_canon_lowering(db, item: Mapping, freeze: Mapping, inputs: Inputs) -> None:
+    """#3554 : la liste des fichiers abaissés au journal, une fois par tête.
+
+    Best-effort : un journal qui refuse ne perd ni le gel ni sa désignation.
+    La ligne porte le préfixe `canon-review-lowering:` et les commits exacts ;
+    `once=True` déduit un rejeu de la même tête.
+    """
+    lowering = getattr(inputs.policy, "canon_lowering", None)
+    if not lowering or not int(lowering.get("floor") or 0):
+        return
+    text = canon_lowering.journal_text(lowering)
+    if not text:
+        return
+    try:
+        work.note(db, int(item["id"]), text, actor=SENDER, once=True)
+    except Exception:  # noqa: BLE001 - la trace au mieux, le gel reste
+        pass
 
 
 # --------------------------------------------------------------------------
@@ -2167,6 +2198,9 @@ def _designate_in_transaction(cfg, tx, lot: int, *, milestone: Optional[Mapping]
             _sync_reviewers(tx, item, freeze, [])
         return {"state": "unavailable", "reviewers": [], "freeze": freeze,
                 "why": inputs.why}
+    # #3554 : la baisse du canon est un fait du gel, journalisée même quand la
+    # couverture manuelle dispense de désigner.
+    _note_canon_lowering(tx, item, freeze, inputs)
     if reading is not None:
         # #2812 : la même lecture que la désignation, réutilisée par la
         # notification des blocages levés (aucune lecture git redoublée).
@@ -2487,6 +2521,8 @@ def designate(cfg, db, lot: int, *, freeze: Optional[Mapping] = None,
                 _drain(db, threads)
             return {"state": "unavailable", "reviewers": [], "freeze": freeze,
                     "why": inputs.why}
+        # #3554 : même journal hors du hook (reprise), une fois par tête.
+        _note_canon_lowering(db, item, freeze, inputs)
         if _manual_covers(inputs):
             return {"state": "manual", "reviewers": [], "freeze": freeze,
                     "why": "manual reviewer(s) already cover the required review(s): %s"

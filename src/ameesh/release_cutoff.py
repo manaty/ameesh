@@ -984,6 +984,7 @@ class ProjectRelease:
     lock_wait_s: float = LOCK_WAIT_S
     version_bump: str = "level"
     suite_tolerated: tuple = ()
+    model: str = "semver"
 
     @classmethod
     def from_config(cls, cfg, name: str, entry: dict) -> "ProjectRelease":
@@ -991,7 +992,7 @@ class ProjectRelease:
             raise ReleaseError("release.projects.%s: an object is required" % name)
         unknown = set(entry) - {"repo", "target", "remote", "staging", "report",
                                 "github", "window_s", "staging_timeout_s",
-                                "lock_ttl_s", "lock_wait_s", "version_bump"}
+                                "lock_ttl_s", "lock_wait_s", "version_bump", "model"}
         if unknown:
             raise ReleaseError("release.projects.%s: unknown key(s) %s"
                                % (name, ", ".join(sorted(unknown))))
@@ -1007,6 +1008,13 @@ class ProjectRelease:
             humans = [h.strip() for h in str(getattr(cfg, "humans", "") or "").split(",")
                       if h.strip()]
             report = humans[0] if humans else "smichea"
+        model = entry.get("model", "semver")
+        if model not in ("semver", "nexlink"):
+            raise ReleaseError("release model: semver | nexlink expected")
+        if model == "nexlink" and (name != "nexlink" or target != "develop"
+                                    or "staging" in entry):
+            raise ReleaseError("nexlink model requires project nexlink, target develop, "
+                               "and its closed staging workflow list (no staging script)")
         bump = entry.get("version_bump", "level")
         if bump not in ("level", "patch"):
             raise ReleaseError("release.projects.%s.version_bump: level | patch" % name)
@@ -1035,7 +1043,7 @@ class ProjectRelease:
             staging_timeout_s=number("staging_timeout_s", STAGING_TIMEOUT_S),
             lock_ttl_s=number("lock_ttl_s", LOCK_TTL_S),
             lock_wait_s=number("lock_wait_s", LOCK_WAIT_S), version_bump=bump,
-            suite_tolerated=tolerated)
+            suite_tolerated=tolerated, model=model)
 
 
 def projects(cfg) -> dict[str, ProjectRelease]:
@@ -1383,6 +1391,9 @@ def tree_proof_text(head: str, proof: dict) -> str:
 
 def build_plan(cfg, project: ProjectRelease, *, now: float,
                version: str | None = None) -> Plan:
+    if project.model == "nexlink":
+        from . import nexlink_release
+        return nexlink_release.plan(cfg, project, now=now, version=version)
     rules, source = compiled_rules(cfg, project.name)
     cutoff_at, cutoff_label = cutoff_slot(rules, now)
     fetch(project.repo, project.remote, project.target)
@@ -2109,6 +2120,10 @@ def execute(cfg, db, project: ProjectRelease, *, now: float | None = None,
             version: str | None = None) -> dict:
     """One release attempt; the report is the durable answer."""
     now = time.time() if now is None else float(now)
+    if project.model == "nexlink":
+        from . import nexlink_release
+        return nexlink_release.execute(cfg, db, project, now=now, force=force,
+                                       no_staging=no_staging, version=version)
     state = load_state(cfg)
     state_slot = project_state(state, project.name)
     rules, source = compiled_rules(cfg, project.name)

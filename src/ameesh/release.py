@@ -255,6 +255,10 @@ def _dry_run(cfg, project, *, now, version, as_json: bool) -> int:
     }
     if as_json:
         print(json.dumps(report, ensure_ascii=False, indent=2, default=str))
+    elif project.model == "nexlink":
+        print("Nexlink %s — develop %s + main %s ; CI arbre final à produire%s"
+              % (plan.version, plan.base[:12], plan.previous["commit"][:12],
+                 " ; delta vide : branche créée sans staging" if plan.empty else ""))
     elif plan.kept_active:
         print("actif conservé — candidate %s plus ancienne ou divergente : aucun tag, "
               "aucun déploiement" % plan.base[:12])
@@ -300,10 +304,13 @@ def _report_error(cfg, db, project, exc, now: float) -> None:
         slot["last_error_at"] = now
         release_cutoff.save_state(cfg, state)
         if db is not None:
-            mail.send(db, work.SYSTEM_SENDER, project.report,
-                      "Release %s NON faite : %s\n\nAucun tag, aucun déploiement. "
-                      "Corrige la cause ; le prochain tick réessaiera tant que la "
-                      "coupure est dans sa fenêtre." % (project.name, text),
+            body = ("Coupe Nexlink en attente : %s. État de reprise conservé ; "
+                    "consulter pending_nexlink pour les branches, tags et runs déjà créés."
+                    % text) if project.model == "nexlink" else (
+                    "Release %s NON faite : %s\n\nAucun tag, aucun déploiement. "
+                    "Corrige la cause ; le prochain tick réessaiera tant que la "
+                    "coupure est dans sa fenêtre." % (project.name, text))
+            mail.send(db, work.SYSTEM_SENDER, project.report, body,
                       kind="event", payload={"release_error": text, "urgent": True})
     except Exception:  # a report never masks the original error
         pass
@@ -365,7 +372,7 @@ def _release_tick(cfg, args, declared) -> int:
                                     if report.get("version") else ""))
             if report.get("result") not in ("released", "reconciled", "nothing-new",
                                             "already-recorded", "not-due", "missed",
-                                            "kept-active"):
+                                            "kept-active", "waiting-ci", "waiting-staging", "empty"):
                 status = 1
         return status
     finally:

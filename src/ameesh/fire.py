@@ -2375,7 +2375,13 @@ def _queue(db, row: dict, marks: list, fire: dict, *, project, repo: str | None,
     dont la protection de branche GitHub n'est pas exploitable (Nexlink, plan
     gratuit : la lecture répond 403). Le contrôle de la cible y est celui de
     `merge_queue.enter` — la CI du commit gelé quand le projet déclare
-    `ci_required` (#2285 N3, hors périmètre de ce lot)."""
+    `ci_required` (#2285 N3, hors périmètre de ce lot).
+
+    #3532 : une sortie de file (`queue remove`, reçu typé `removed`) écrite
+    après ce feu est définitive pour lui : le repli ne ré-entre pas le lot
+    (`taken-out`). Sans cela, chaque passage défaisait la sortie, et le lot
+    atterrissait dès que la cible se libérait. Un nouveau feu ou un
+    `ameesh work queue add` explicite le remet en file."""
     lot = int(row["id"])
     if not repo:
         out.update(result="no-repository", detail=(
@@ -2394,6 +2400,16 @@ def _queue(db, row: dict, marks: list, fire: dict, *, project, repo: str | None,
         out.update(result="ejected", detail="merge queue of %s: ejected (%s)"
                    % (entry.get("target"), entry.get("reason") or "?"))
         return out
+    granted = float(fire.get("at_ts") or 0.0)
+    try:
+        removed = storage.of(db).work.queue_withdrawn_since(lot, granted)
+    except Exception as exc:  # noqa: BLE001 - reçus illisibles : on n'entre pas
+        out.update(result="not-ready", detail=(
+            "cannot read the queue take-outs of lot #%d (%s: %s): not queued"
+            % (lot, type(exc).__name__, str(exc)[:120])))
+        return out
+    if removed is not None:
+        return _taken_out(out, lot, removed, granted)
     if dry_run:
         out.update(result="would-queue", detail="enter the merge queue of %s" % (target or "?"))
         return out
@@ -2404,7 +2420,11 @@ def _queue(db, row: dict, marks: list, fire: dict, *, project, repo: str | None,
         target=getattr(project, "target", "") or "") if repo else None
     try:
         entered = merge_queue.enter(db, lot, repo=repo, actor=work.SYSTEM_SENDER,
-                                    project=project, clone=clone, cfg=cfg)
+                                    project=project, clone=clone, cfg=cfg,
+                                    withdrawn_after=granted)
+    except merge_queue.QueueWithdrawn:
+        removed = storage.of(db).work.queue_withdrawn_since(lot, granted)
+        return _taken_out(out, lot, removed or granted, granted)
     except merge_queue.QueueError as exc:
         out.update(result="not-ready", detail=str(exc))
         return out
@@ -2417,6 +2437,14 @@ def _queue(db, row: dict, marks: list, fire: dict, *, project, repo: str | None,
            ", PR #%s" % entered.get("pr") if entered.get("pr") else "")),
         {"project": row.get("app") or "", "target": entered.get("target"),
          "sha": fire.get("sha")})
+    return out
+
+
+def _taken_out(out: dict, lot: int, removed: float, granted: float) -> dict:
+    out.update(result="taken-out", detail=(
+        "lot #%d was taken out of the merge queue at %s, after its fire (%s): the fire's "
+        "fallback does not queue it again; fire again or `ameesh work queue add %d`"
+        % (lot, merge_queue._utc(removed), merge_queue._utc(granted), lot)))
     return out
 
 

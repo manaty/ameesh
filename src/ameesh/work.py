@@ -433,6 +433,50 @@ def forcer(cfg, db, explicit: str | None = None) -> str:
         "own bound session, a human terminal says --actor human:<id>" % text)
 
 
+def publisher(cfg, db, explicit: str | None = None) -> str:
+    """#3501 : l'auteur de `work estimates --publish` (L157b), le passage de
+    l'auditeur ; WorkError pour tout autre. Chaque publication renvoyait les
+    briefs `estimate_bias` à tous les estimateurs biaisés : le 25/10, un agent
+    a republié la table une minute après l'auditeur pour clore sa propre
+    alerte. Une session liée (bail du runner ou liaison de session,
+    `identity.BOUND_SOURCES`, L244) publie en son nom, et seulement si cet
+    agent est l'auditeur (`is_auditor`) ; un `AGENT_MAIL_NAME` seulement
+    auto-déclaré ne suffit pas, et une identité refusée ne retombe pas sur le
+    terminal humain. Une session sans identité ne nomme qu'un humain
+    (`--actor human:<id>`) : sans liaison, un nom d'agent est refusé (revue
+    de mty-amh-impl-05, comme #540 r2 pour `forcer`)."""
+    from . import identity
+    from .agent_names import resolve
+
+    text = resolve((explicit or "").strip(), db=db, operation="work.publisher")
+    binding = identity.resolve_binding(cfg, db)
+    if not binding.ok and (binding.name or binding.source != "none"
+                           or os.environ.get("AGENT_MAIL_NAME")):
+        raise WorkError("--publish refused: invalid session identity (%s)"
+                        % (binding.reason or "unbound identity"))
+    refus = ("--publish refused: %s is not the auditor; the reference table (L157b) "
+             "is the auditor's pass (persona auditeur, or auditeur role on its Agent "
+             "card in the canon); work estimates without --publish reads it")
+    if binding.name:
+        if text and text != binding.name:
+            raise WorkError("--publish refused: this session belongs to %s, it does "
+                            "not publish on behalf of %s" % (binding.name, text))
+        if binding.source not in identity.BOUND_SOURCES:
+            raise WorkError("--publish refused: identity %s is %s, not bound (runner "
+                            "lease or `ameesh mail bind`)" % (binding.name, binding.source))
+        if is_auditor(cfg, db, binding.name):
+            return binding.name
+        raise WorkError(refus % binding.name)
+    if not text:
+        raise WorkError("--publish: say who publishes (--actor human:<id>)")
+    if text.startswith(HUMAN_PREFIX) and len(text) > len(HUMAN_PREFIX):
+        return text
+    raise WorkError(
+        "--publish refused: %s is not a human and this session has no bound agent "
+        "identity (runner lease or `ameesh mail bind`); the auditor publishes from "
+        "its own bound session, a human terminal says --actor human:<id>" % text)
+
+
 def milestone_actor(cfg, db, explicit: str | None = None, *, kind: str = "") -> str:
     """#2928 : l'auteur d'un jalon `frozen`/`verdict`, vérifié au chemin d'écriture.
 
