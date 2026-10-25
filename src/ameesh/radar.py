@@ -78,7 +78,7 @@ SCHEMA = "ameesh-radar/1"
 SETTINGS_KEYS = ("projects",)
 PROJECT_KEYS = ("repo", "migrations", "target", "github", "land", "gates", "merge_method",
                 "lease_ref", "generated", "ci_required", "protected", "full_suite", "ci_parts",
-                "required_statuses", "required_checks")
+                "required_statuses", "required_checks", "production_branch")
 #: L1651 : clés de la déclaration `ci_parts` (les espaces réservés d'`argv`
 #: sont ceux du contrat, `ci_parts.PLACEHOLDERS`)
 CI_PARTS_KEYS = ("selector", "rev", "argv", "schema", "due")
@@ -213,6 +213,8 @@ class Project:
     #: de plan prouvé (`Upgrade to GitHub Pro…`) ; l'absence de clé garde le
     #: refus fail-closed. Ce drapeau distingue `[]` de l'absence.
     required_checks_declared: bool = False
+    #: #3533: published ancestry excluded from packet author attribution.
+    production_branch: str = ""
 
 
 @dataclass
@@ -340,13 +342,15 @@ def parse_settings(raw) -> Settings:
         if not isinstance(repo, str) or not repo.strip():
             raise SettingsError("%s.repo: repository path expected" % where)
         texts = {}
-        for key in ("migrations", "target", "github"):
+        for key in ("migrations", "target", "github", "production_branch"):
             text = value.get(key) or ""
             if not isinstance(text, str):
                 raise SettingsError("%s.%s: text expected" % (where, key))
             texts[key] = text.strip().strip("/")
         if texts["target"]:
             plan_git.check_ref(texts["target"], "cible")
+        if texts["production_branch"]:
+            plan_git.check_ref(texts["production_branch"], "production_branch")
         if texts["github"] and not _GITHUB_RE.match(texts["github"]):
             raise SettingsError("%s.github: \"owner/repo\" repository expected" % where)
         land = value.get("land") or "off"
@@ -503,6 +507,7 @@ def parse_settings(raw) -> Settings:
         projects[name] = Project(name=name, repo=os.path.expanduser(repo.strip()),
                                  migrations=texts["migrations"], target=texts["target"],
                                  github=texts["github"], land=land,
+                                 production_branch=texts["production_branch"],
                                  gates=tuple(gates), merge_method=method,
                                  lease_ref=lease_ref,
                                  generated=tuple(generated), path_gates=tuple(by_path),

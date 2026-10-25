@@ -1,0 +1,67 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+"""#3533: published production ancestry is outside a packet's authorship.
+
+The remote branch is resolved afresh, then its exact object is fetched. No
+local branch or tracking ref can attest publication. Merge commits bringing
+production back are not reachable from that branch and remain attributable.
+"""
+from __future__ import annotations
+
+from . import plan_git, radar, review_authors
+
+
+def production(cfg, item, repo):
+    """Return an exact published scope, or None when none is configured.
+
+    A configured but unreadable branch refuses the gate; stale local evidence
+    never substitutes for a failed remote read.
+    """
+    if cfg is None or not item or not repo:
+        return None
+    project = radar.settings_of(cfg).projects.get(str(item.get("app") or ""))
+    branch = getattr(project, "production_branch", "")
+    if not branch:
+        return None
+    ref = "refs/heads/" + branch
+    listing = plan_git._git(repo, "ls-remote", "--exit-code", "--refs",
+                            "origin", ref, timeout=plan_git.FETCH_TIMEOUT)
+    advertised = (listing.stdout.decode("utf-8", "replace")
+                  if listing.returncode == 0 else "")
+    rows = [line.split() for line in (advertised or "").splitlines()]
+    if len(rows) != 1 or len(rows[0]) != 2 or rows[0][1] != ref:
+        raise ValueError("production provenance: remote branch unreadable: " + ref)
+    sha = plan_git.full_commit_id(rows[0][0])
+    if not sha:
+        raise ValueError("production provenance: invalid remote commit")
+    proc = plan_git._git(repo, "fetch", "--quiet", "--no-tags",
+                         "--no-write-fetch-head", "--", "origin", sha,
+                         timeout=plan_git.FETCH_TIMEOUT)
+    if proc.returncode or not plan_git.local_commit(repo, sha):
+        raise ValueError("production provenance: exact remote commit unavailable: " + sha)
+    return {"head": sha, "ref": ref, "reason": "published-production"}
+
+
+def exclude(repo, commits, scopes, trace=None):
+    """Exclude only proven ancestry; record each removed input commit."""
+    remaining = list(commits or ())
+    for scope in scopes:
+        scope = scope if isinstance(scope, dict) else {
+            "head": scope, "reason": "admitted-member"}
+        after = review_authors._not_in_target(repo, remaining, scope["head"])
+        kept = set(after)
+        if trace is not None:
+            trace.extend(dict(scope, commit=sha) for sha in remaining if sha not in kept)
+        remaining = after
+    return remaining
+
+
+def manifest(exclusions):
+    """Fragment for the composer's immutable packet manifest, from gate facts."""
+    if not exclusions:
+        return ""
+    lines = ["## Provenance exclusions", "", "| Commit | Reason | Published ref / admitted head |",
+             "| --- | --- | --- |"]
+    for row in exclusions:
+        lines.append("| %s | %s | %s @ %s |" % (
+            row["commit"], row["reason"], row.get("ref", "member"), row["head"]))
+    return "\n".join(lines) + "\n"

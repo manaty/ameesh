@@ -484,7 +484,8 @@ def _attribution_on_freeze(db, marks, frozen, *, repo, klass, item, families=Non
     authors, unknown, correctors = act.attribution_of_head(
         db, item, milestone, repo, base, frozen, families=families or (),
         commits=commits, strict=strict, families_out=families_out,
-        target=target or base, admitted_heads=admitted_heads)
+        target=target or base, admitted_heads=tuple(
+            value["head"] if isinstance(value, dict) else value for value in admitted_heads))
     if unknown:
         raise ValueError("author provenance unknown for frozen commit(s): %s"
                          % ", ".join(unknown))
@@ -682,7 +683,8 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
            "waived": waived, "waived_by": waived_by,
            "author": author, "author_family": "", "authors": [],
            "corrections": [], "on_freeze": 0, "unproven": [], "vehicle": None,
-           "attribution_read": False,
+           "attribution_read": False, "provenance_exclusions": [],
+           "provenance_manifest": "",
            "exclude_author_family": exclude_author_family,
            "distinct_families": distinct_families}
     if not frozen:
@@ -787,6 +789,24 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
                       % (frozen[:12], cls, ", ".join(sorted(
                           str(m.get("actor") or "relecteur sans nom") for m in blocked))))
         return out
+    try:
+        from . import provenance_scope
+        production = provenance_scope.production(cfg, item, repo)
+        inherited = tuple((vehicle or {}).get("admitted_heads") or ())
+        scopes = tuple(admitted_heads) + inherited + ((production,) if production else ())
+        if scopes and repo:
+            boundary = target or (klass or {}).get("base_sha") or (klass or {}).get("target")
+            if boundary:
+                listing = plan_git._out(repo, "rev-list", "%s..%s" % (boundary, frozen))
+                if listing is None:
+                    raise ValueError("provenance exclusion range unreadable")
+                provenance_scope.exclude(repo, listing.split(), scopes,
+                                         out["provenance_exclusions"])
+        out["provenance_manifest"] = provenance_scope.manifest(out["provenance_exclusions"])
+    except Exception as exc:  # unreadable publication never authorizes exclusions
+        out["error"] = str(exc)
+        out["why"] = "provenance scope unreadable: %s" % exc
+        return out
     if waived or required == 0:
         # #2965 : sans avis requis, la porte est ouverte dès le gel ; un
         # blocage courant la referme jusqu'à sa levée, et c'est alors le `ok`
@@ -883,7 +903,7 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
                                              strict=True,
                                              families_out=proven_families,
                                              target=target or "",
-                                             admitted_heads=admitted_heads)
+                                             admitted_heads=scopes)
     except Exception as exc:  # noqa: BLE001 - une plage illisible ne conclut pas
         out["error"] = str(exc)
         out["why"] = ("no review verdict ok on the freeze %s (class: %s): the frozen "

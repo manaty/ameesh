@@ -548,7 +548,7 @@ def need(db, vehicle: int, row, marks, repo: str, base: str, head: str,
                                      base=packet_target or base,
                                      base_sha=member_base)
             gate = merge_queue.review_gate(db, member_marks, frozen, repo=repo,
-                                           klass=klass, item=member_row,
+                                           klass=klass, item=member_row, cfg=cfg,
                                            admitted_heads=tuple(admitted_sources))
         except Exception as exc:  # noqa: BLE001 - lecture impossible : refus
             return {"ok": False, "required": None, "klass": None,
@@ -581,7 +581,8 @@ def need(db, vehicle: int, row, marks, repo: str, base: str, head: str,
                 "members": found, "own_paths": []}
     if not own["paths"]:
         return {"ok": True, "required": 0, "klass": None, "members": found,
-                "own_paths": [], "why": ("%d constituent(s) reviewed on their frozen "
+                "own_paths": [], "admitted_heads": admitted_sources,
+                "why": ("%d constituent(s) reviewed on their frozen "
                                          "head(s); no proper vehicle delta" % total)}
     try:
         from . import lot_class
@@ -602,4 +603,5 @@ def need(db, vehicle: int, row, marks, repo: str, base: str, head: str,
                 "own_paths": own["paths"]}
     return {"ok": None, "required": required, "klass": klass, "members": found,
             "own_paths": own["paths"], "commits": own["commits"],
+            "admitted_heads": admitted_sources,
             "why": "proper delta: %d path(s)" % len(own["paths"])}
