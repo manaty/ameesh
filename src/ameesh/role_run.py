@@ -35,13 +35,23 @@ the holder's epoch**, since it is not the lease holder and the alerts pass
 writes no fenced pilot gesture (local notify state and the shared liveness
 beat only). The other passes keep the lease-only gate.
 
+#3568 (review cx3): the delegation read does not reserve execution. A holder
+whose route returns selects itself while a delegate's child is still running,
+and the notify state lock is local to one host. The alerts pass therefore
+holds a **shared execution lease** in `merge_locks` (key
+``alerts-pass:<role>``, as the train service borrows that table) for the whole
+life of its child, re-reads the selection under it, and renews it every third
+of its TTL; a lost lease stops the child instead of letting a second delivery
+overlap. The other passes never take it.
+
 The command is an argument vector, never a shell string. Its exit code is
 returned unchanged. The wrapper's own refusals are:
 
 * ``0`` — standby (another host holds the lease, the lease is expired, the
-  role is stopped, the remaining lease is below ``--min-left``, or the alerts
-  pass is delegated to another candidate): the timer did nothing, as expected
-  on a standby host;
+  role is stopped, the remaining lease is below ``--min-left``, the alerts
+  pass is delegated to another candidate, or another alerts child holds the
+  shared execution lease): the timer did nothing, as expected on a standby
+  host;
 * ``1`` — the lease could not be read (database unavailable): the timer must
   be noticed, never silently considered standby;
 * ``2`` — the invocation is invalid (unknown role, no host, no command).
@@ -53,6 +63,8 @@ import json
 import os
 import subprocess
 import sys
+import threading
+import uuid
 
 from . import config as config_mod
 from . import db as db_mod
@@ -64,6 +76,18 @@ ENV_PASS = "AMEESH_ROLE_PASS"
 ENV_EPOCH = "AMEESH_LEASE_EPOCH"
 ENV_LEFT = "AMEESH_LEASE_LEFT"
 ENV_OWNER = "AMEESH_LEASE_OWNER"
+
+#: #3568: the SHARED execution lease of the alerts pass, one key per role in
+#: `merge_locks` (the train service already borrows that table). Selecting the
+#: delegate does not reserve execution: a holder whose route returns chooses
+#: itself while a delegate's child is still running, and the notify state lock
+#: is local to one host. The lease makes at most one alerts child run at a
+#: time; its owner carries a per-process token (two processes on one host also
+#: contend) and its TTL is renewed while the child runs.
+ALERTS_LEASE_KEY = "alerts-pass:%s"
+#: long enough for a renewal to survive one slow database round-trip, short
+#: enough that a killed wrapper frees the pass within a minute
+ALERTS_LEASE_TTL_S = 60.0
 
 #: a role the wrapper may run; its name is an agent name (aliases resolved).
 _SCHEMA = "ameesh-role-run/1"
@@ -82,6 +106,110 @@ _READ_SQL = """
 
 class RoleError(ValueError):
     """The role cannot be read, or the invocation is invalid."""
+
+
+class _AlertsLease:
+    """#3568: the shared execution lease of one role's alerts pass.
+
+    The delegation read chooses *who should* run; this lease decides *who is
+    running*. It lives in `merge_locks` under a key of its own, as the train
+    service does, because that table already offers the cross-host CAS and
+    the TTL the earlier host leases use. Acquisition bumps the epoch; renewal
+    is fenced by the owner token and that epoch, so a lease taken over after
+    an expiry cannot be renewed by the old process. A killed wrapper frees the
+    pass when the TTL ends; a live one renews it while its child runs.
+    """
+
+    def __init__(self, db, role: str, host: str, *, ttl: float | None = None):
+        self.db = db
+        self.key = ALERTS_LEASE_KEY % (role or "")
+        self.owner = "alerts-pass:%s:%s" % (host, uuid.uuid4().hex)
+        self.ttl = float(ALERTS_LEASE_TTL_S if ttl is None else ttl)
+        self.epoch = None
+        self.lock = threading.Lock()
+
+    def _work(self):
+        from . import storage
+        return storage.of(self.db).work
+
+    def acquire(self) -> int | None:
+        """Take the lease, or return None when another child holds it."""
+        epoch = self._work().land_lock(self.key, self.owner, self.ttl)
+        with self.lock:
+            self.epoch = None if epoch is None else int(epoch)
+        return self.epoch
+
+    def renew(self) -> bool:
+        """Extend the lease we hold; False when it expired or was taken."""
+        with self.lock:
+            epoch = self.epoch
+        if epoch is None:
+            return False
+        try:
+            got = self._work().land_lock(self.key, self.owner, self.ttl,
+                                         epoch=epoch)
+        except Exception:  # noqa: BLE001 - a broken renewal is a lost lease
+            got = None
+        return got == epoch
+
+    def release(self) -> bool:
+        """Release this process's lease; never another holder's."""
+        with self.lock:
+            epoch, self.epoch = self.epoch, None
+        if epoch is None:
+            return False
+        try:
+            return bool(self._work().land_unlock(self.key, self.owner, epoch))
+        except Exception:  # noqa: BLE001 - the TTL still frees the pass
+            return False
+
+
+def _watch_alerts_lease(lease: _AlertsLease, proc, stop: threading.Event,
+                        lost: threading.Event) -> None:
+    """Renew the shared lease for the child's whole life; stop it if lost.
+
+    Renewal is deliberately not fatal to the pass (it is fatal to the child):
+    another host must never start a second alerts pass while this one still
+    writes. A lost lease therefore terminates the child and returns the
+    wrapper as an error, rather than letting two deliveries overlap.
+    """
+    while not stop.wait(max(0.1, lease.ttl / 3.0)):
+        if stop.is_set():
+            return
+        if lease.renew():
+            continue
+        if not stop.is_set():
+            lost.set()
+            try:
+                proc.terminate()
+            except OSError:
+                pass
+        return
+
+
+def _run_under_lease(argv: list[str], env: dict, lease: _AlertsLease) -> tuple[int, bool]:
+    """Run the child while the shared lease is held and renewed.
+
+    Returns ``(exit code, lost)``. The lease is released before returning,
+    including when the child cannot be started (the caller's `finally` covers
+    the start failure itself).
+    """
+    stop, lost = threading.Event(), threading.Event()
+    proc = subprocess.Popen(argv, env=env)
+    watcher = threading.Thread(target=_watch_alerts_lease,
+                               args=(lease, proc, stop, lost),
+                               name="alerts-lease", daemon=True)
+    watcher.start()
+    try:
+        code = int(proc.wait())
+    finally:
+        stop.set()
+        # No timeout: releasing while the watcher still uses the connection
+        # would race the driver. A genuinely hung renewal is bounded by the
+        # unit's TimeoutStartSec, and the TTL frees the pass for the others.
+        watcher.join()
+        lease.release()
+    return code, lost.is_set()
 
 
 def _read(db, name: str) -> dict | None:
@@ -216,6 +344,9 @@ def _detail(code: str, report: dict) -> str:
     if code == "no-alerts-delegate":
         return "no candidate proves a remote push route (%s)" % (
             report.get("delegation") or "no route")
+    if code == "alerts-busy":
+        return ("another alerts pass holds the shared execution lease (%s)"
+                % (ALERTS_LEASE_KEY % (report.get("role") or "")))
     return code
 
 
@@ -324,40 +455,100 @@ def run(cfg, args) -> int:
         if args.dry_run:
             emit(report, result="would-run")
             return 0
-        env = os.environ.copy()
-        # The command is not an agent turn: never inherit the shell's turn,
-        # identity or a foreign tenure. Its explicit actor is the ROLE, under
-        # the very lease read above; EP4's guard reads AMEESH_ROLE and the
-        # epoch, and refuses a role without an epoch instead of treating the
-        # timer as an anonymous process that may pass.
-        for key in ("AGENT_MAIL_NAME", "AMEESH_RUNNER_ID", "AGENT_MESH_RUNNER_ID",
-                    "AMEESH_TURN_ID", "AMEESH_LEASE_EPOCH", "AGENT_MESH_LEASE_EPOCH",
-                    "AMEESH_LEASE_OWNER", "AMEESH_LEASE_LEFT", "AMEESH_ROLE",
-                    "AMEESH_ROLE_HOST", ENV_PASS):
-            env.pop(key, None)
-        env.update({
-            # a child loads the same host, even when its AMEESH_HOST was unset
-            "AMEESH_HOST": host,
-            # explicit actor = the role, bound to the live lease (EP4 gate).
-            ENV_ROLE: report["role"],
-            ENV_HOST: host,
-        })
-        if pass_name:
-            env[ENV_PASS] = pass_name
-        # #3568: the delegated pass runs on a candidate that does NOT hold the
-        # lease. It must not carry the holder's epoch: EP4 would read it as a
-        # fenced gesture of the holder. The alerts pass writes no pilot
-        # gesture (local notify state and the shared liveness beat).
-        if not delegated:
-            env.update({
-                ENV_EPOCH: ("" if report.get("epoch") is None
-                            else str(report["epoch"])),
-                ENV_LEFT: ("" if report.get("left_s") is None
-                           else str(int(report["left_s"]))),
-                ENV_OWNER: str(report.get("owner") or ""),
-            })
+        lease = None
         try:
-            proc = subprocess.run(argv, env=env, check=False)
+            if pass_name == "alerts":
+                lease = _AlertsLease(db, report["role"], host)
+                if not lease.acquire():
+                    report["code"] = "alerts-busy"
+                    report["detail"] = _detail(report["code"], report)
+                    emit(report, result="standby")
+                    return 0
+                # The selection read is not a reservation: the holder's route
+                # can return between that read and the acquisition above.
+                # Re-read the role AND the selection under the lease; if this
+                # host is no longer the delegate, release and let it run.
+                try:
+                    fresh = live(db, name)
+                except RoleError as exc:
+                    lease.release()
+                    print("ameesh role run: %s" % exc, file=sys.stderr)
+                    return 2
+                report.update(fresh)
+                report["pass"] = pass_name
+                if report["stopped"]:
+                    report["code"] = "role-stopped"
+                elif not report["held"]:
+                    report["code"] = "no-live-lease"
+                else:
+                    again = _alerts_delegation(db, report, host=host)
+                    report["delegate"] = again.get("delegate")
+                    report["delegation"] = again.get("reason") or ""
+                    report["holder_notify_ok"] = bool(
+                        again.get("holder_notify_ok"))
+                    delegated = again.get("delegate") != report["host"]
+                    if again.get("delegate") is None:
+                        report["code"] = "no-alerts-delegate"
+                    elif again.get("delegate") != host:
+                        report["code"] = "alerts-delegated"
+                    elif delegated is False and args.min_left and (
+                            report.get("left_s") is None
+                            or float(report["left_s"]) < float(args.min_left)):
+                        report["code"] = "lease-too-short"
+                if report.get("code"):
+                    lease.release()
+                    report["detail"] = _detail(report["code"], report)
+                    emit(report, result="standby")
+                    return 0
+                report["delegated"] = delegated
+            env = os.environ.copy()
+            # The command is not an agent turn: never inherit the shell's turn,
+            # identity or a foreign tenure. Its explicit actor is the ROLE, under
+            # the very lease read above; EP4's guard reads AMEESH_ROLE and the
+            # epoch, and refuses a role without an epoch instead of treating the
+            # timer as an anonymous process that may pass.
+            for key in ("AGENT_MAIL_NAME", "AMEESH_RUNNER_ID", "AGENT_MESH_RUNNER_ID",
+                        "AMEESH_TURN_ID", "AMEESH_LEASE_EPOCH", "AGENT_MESH_LEASE_EPOCH",
+                        "AMEESH_LEASE_OWNER", "AMEESH_LEASE_LEFT", "AMEESH_ROLE",
+                        "AMEESH_ROLE_HOST", ENV_PASS):
+                env.pop(key, None)
+            env.update({
+                # a child loads the same host, even when its AMEESH_HOST was unset
+                "AMEESH_HOST": host,
+                # explicit actor = the role, bound to the live lease (EP4 gate).
+                ENV_ROLE: report["role"],
+                ENV_HOST: host,
+            })
+            if pass_name:
+                env[ENV_PASS] = pass_name
+            # #3568: the delegated pass runs on a candidate that does NOT hold
+            # the lease. It must not carry the holder's epoch: EP4 would read
+            # it as a fenced gesture of the holder. The alerts pass writes no
+            # pilot gesture (local notify state and the shared liveness beat).
+            if not delegated:
+                env.update({
+                    ENV_EPOCH: ("" if report.get("epoch") is None
+                                else str(report["epoch"])),
+                    ENV_LEFT: ("" if report.get("left_s") is None
+                               else str(int(report["left_s"]))),
+                    ENV_OWNER: str(report.get("owner") or ""),
+                })
+            if lease is not None:
+                code, lost = _run_under_lease(argv, env, lease)
+                if lost:
+                    print("ameesh role run: alerts execution lease lost; the "
+                          "child was stopped", file=sys.stderr)
+                    return 1
+            else:
+                code = int(subprocess.run(argv, env=env, check=False).returncode)
+            # The exit code of the command is the wrapper's. A report is printed
+            # only on stderr in JSON mode, so a command that speaks JSON keeps
+            # its stdout intact.
+            if args.json:
+                print(json.dumps(_record(report, host=host, argv=argv, result="ran",
+                                         code="", detail=""),
+                                 ensure_ascii=False, sort_keys=True), file=sys.stderr)
+            return code
         except FileNotFoundError as exc:
             print("ameesh role run: command not found: %s" % exc.filename,
                   file=sys.stderr)
@@ -366,14 +557,9 @@ def run(cfg, args) -> int:
             print("ameesh role run: cannot start the command: %s" % exc,
                   file=sys.stderr)
             return 126
-        # The exit code of the command is the wrapper's. A report is printed
-        # only on stderr in JSON mode, so a command that speaks JSON keeps its
-        # stdout intact.
-        if args.json:
-            print(json.dumps(_record(report, host=host, argv=argv, result="ran",
-                                     code="", detail=""),
-                             ensure_ascii=False, sort_keys=True), file=sys.stderr)
-        return int(proc.returncode)
+        finally:
+            if lease is not None:
+                lease.release()
     except db_mod.DbError as exc:
         print("ameesh role run: %s" % exc, file=sys.stderr)
         return 1

@@ -12,6 +12,12 @@ The missing route stays a *warning*, never a refusal (that is #3402): the host
 can still hold the lease and run the other role timers, it simply does not keep
 the alert delivery. The delegated run carries no lease epoch: it is not the
 holder's fenced gesture, and the alerts pass writes no pilot gesture.
+
+The selection alone does not reserve execution (review cx3): when the holder's
+route returns while a delegate's child runs, both would select the holder. The
+alerts pass therefore takes a shared execution lease in `merge_locks` for the
+whole child, renews it, and stops the child if it is lost. The witnesses below
+cover the overlap at route return, the renewal, and the fail-closed loss.
 """
 from __future__ import annotations
 
@@ -20,7 +26,9 @@ import dataclasses
 import io
 import json
 import os
+import shutil
 import tempfile
+import threading
 import time
 import unittest
 from argparse import Namespace
@@ -37,13 +45,15 @@ NTFY = {"routes": {"human:owner": ["ntfy"]},
         "channels": {"ntfy": {"url": "https://ntfy.example", "topic": "t"}}}
 #: the secrets file is host state: these witnesses never read the real one
 NO_ENV = {}
+ALERTS_KEY = role_run.ALERTS_LEASE_KEY % NAME
 
 
 class _Conn:
-    """Test connection: the bench database, without closing it."""
+    """Test connection: the bench database, closed only when it owns it."""
 
-    def __init__(self, db):
+    def __init__(self, db, *, own: bool = False):
         self.db = db
+        self.own = own
 
     def query(self, sql, params=None):
         if params is None:
@@ -51,7 +61,8 @@ class _Conn:
         return self.db.query(sql, params)
 
     def close(self):
-        pass
+        if self.own:
+            self.db.close()
 
 
 class _AlertsCase(PgTestCase):
@@ -64,7 +75,7 @@ class _AlertsCase(PgTestCase):
         self.cfg = dataclasses.replace(self.cfg, host=self.HOST)
         for table in ("role_standings", "role_handover", "agent_candidates",
                       "canon_state", "host_lifecycle", "host_holds",
-                      "credential_health", "host_resources"):
+                      "credential_health", "host_resources", "merge_locks"):
             self.db.execute("DELETE FROM " + table)
         # the role's harness need not exist on the bench (same fixture as the
         # election tests: the witness is about the route, not the harness)
@@ -195,6 +206,20 @@ class AlertsGateTest(_AlertsCase):
                 code = role_run.run(cfg, args)
         return code, out.getvalue()
 
+    def run_cli_isolated(self, cfg, args):
+        """One real connection per call, as two timer processes would have."""
+        original = role_run.db_mod.connect
+
+        def connect(cfg_):
+            return _Conn(original(cfg_), own=True)
+
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), \
+                contextlib.redirect_stderr(io.StringIO()), \
+                mock.patch.object(role_run.db_mod, "connect", side_effect=connect):
+            code = role_run.run(cfg, args)
+        return code, out.getvalue()
+
     def marker_command(self, marker: str) -> list[str]:
         return ["python3", "-c", "open(%r, 'w').write('x')" % marker]
 
@@ -296,6 +321,115 @@ class AlertsGateTest(_AlertsCase):
     def test_an_unknown_pass_is_an_invocation_error(self):
         code, _ = self.run_cli(self.cfg, self.args(["true"], pass_name="bogus"))
         self.assertEqual(code, 2)
+
+    def test_a_route_return_cannot_start_a_second_alerts_child(self):
+        """#3568 cx3: selection is not a reservation; the child holds the lease."""
+        self.role()
+        self.hold("banc")
+        self.standing("banc", notify_ok=False)
+        self.standing("atelier", notify_ok=True)
+        folder = tempfile.mkdtemp(prefix="3568-overlap-")
+        self.addCleanup(shutil.rmtree, folder, ignore_errors=True)
+        started = os.path.join(folder, "started")
+        done = os.path.join(folder, "done")
+        second = os.path.join(folder, "second")
+        command = ["python3", "-c",
+                   "import pathlib, time;"
+                   " pathlib.Path(%r).write_text('x');"
+                   " time.sleep(2.0);"
+                   " pathlib.Path(%r).write_text('x')" % (started, done)]
+        first = {}
+
+        def run_first():
+            first["result"] = self.run_cli_isolated(
+                dataclasses.replace(self.cfg, host="atelier"), self.args(command))
+
+        thread = threading.Thread(target=run_first, name="alerts-first")
+        thread.start()
+        try:
+            deadline = time.time() + 10.0
+            while time.time() < deadline and not os.path.exists(started):
+                time.sleep(0.02)
+            self.assertTrue(os.path.exists(started),
+                            "the delegate child did not start")
+            # The holder's route returns while the delegate child is running:
+            # both hosts now select the holder, but only the child holds the
+            # shared execution lease.
+            self.standing("banc", notify_ok=True)
+            code, out = self.run_cli_isolated(
+                self.cfg, self.args(self.marker_command(second)))
+            self.assertEqual(code, 0)
+            self.assertIn("shared execution lease", out)
+            self.assertFalse(os.path.exists(second))
+        finally:
+            thread.join(timeout=20.0)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(first["result"][0], 0)
+        self.assertTrue(os.path.exists(done))
+        # The lease is released with the child: the new delegate runs next.
+        code, _ = self.run_cli_isolated(
+            self.cfg, self.args(self.marker_command(second)))
+        self.assertEqual(code, 0)
+        self.assertTrue(os.path.exists(second))
+
+    def test_the_shared_lease_is_exclusive_and_renewable(self):
+        lease = role_run._AlertsLease(self.db, NAME, "atelier", ttl=2.0)
+        other_db = role_run.db_mod.connect(self.__class__.cfg)
+        other = role_run._AlertsLease(other_db, NAME, "banc", ttl=2.0)
+        try:
+            self.assertIsNotNone(lease.acquire())
+            self.assertIsNone(other.acquire())
+            # A renewal extends the expiry: an expired-at-first lease would
+            # already be takeable here if the heartbeat did not run.
+            self.assertTrue(lease.renew())
+            self.assertIsNone(other.acquire())
+            self.assertTrue(lease.release())
+            self.assertIsNotNone(other.acquire())
+        finally:
+            lease.release()
+            other.release()
+            other_db.close()
+
+    def test_a_stolen_lease_stops_the_alerts_child(self):
+        """A lost lease kills the child: no second delivery can overlap."""
+        self.role()
+        self.hold("banc")
+        self.standing("banc", notify_ok=False)
+        self.standing("atelier", notify_ok=True)
+        folder = tempfile.mkdtemp(prefix="3568-lost-")
+        self.addCleanup(shutil.rmtree, folder, ignore_errors=True)
+        started = os.path.join(folder, "started")
+        done = os.path.join(folder, "done")
+        command = ["python3", "-c",
+                   "import pathlib, time;"
+                   " pathlib.Path(%r).write_text('x');"
+                   " time.sleep(8.0);"
+                   " pathlib.Path(%r).write_text('x')" % (started, done)]
+        first = {}
+
+        def run_first():
+            # short TTL: the watcher's next renewal is ~0.3 s away
+            with mock.patch.object(role_run, "ALERTS_LEASE_TTL_S", 0.9):
+                first["result"] = self.run_cli_isolated(
+                    dataclasses.replace(self.cfg, host="atelier"), self.args(command))
+
+        thread = threading.Thread(target=run_first, name="alerts-lost")
+        thread.start()
+        try:
+            deadline = time.time() + 10.0
+            while time.time() < deadline and not os.path.exists(started):
+                time.sleep(0.02)
+            self.assertTrue(os.path.exists(started))
+            # Steal the lease as an expiry + takeover would. The watcher must
+            # notice at its next renewal, stop the child, and report an error.
+            self.db.execute(
+                "UPDATE merge_locks SET owner = 'other', epoch = epoch + 1"
+                " WHERE target = %s", (ALERTS_KEY,))
+        finally:
+            thread.join(timeout=15.0)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(first["result"][0], 1)
+        self.assertFalse(os.path.exists(done))
 
 
 class AlertsUnitTest(unittest.TestCase):
