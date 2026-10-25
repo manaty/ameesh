@@ -625,6 +625,48 @@ class NotifierTest(unittest.TestCase):
         self.assertEqual(entry["channels"]["nx"]["attempts"], notifier.ncfg.max_attempts)
         self.assertEqual(len(notifier.state["fallback"]), 1)
 
+    def test_repli_retente_meme_si_le_primaire_est_epuise(self):
+        """B/P1 de la relecture cx1 : un repli temporairement en échec doit
+        être retenté alors que le primaire est déjà à `max_attempts`."""
+        sender = FakeSender({
+            "nx": [notify.ChannelError("secret absent", permanent=True)],
+            "ntfy": [notify.ChannelError("timeout"), None]})
+        notifier = self.notifier(sender)
+        entry = self.entry()
+        notifier._attempt(entry, "raised", 1000.0)
+        self.assertEqual([name for name, _ in sender.sent], ["nx", "ntfy"])
+        self.assertEqual(entry["channels"]["nx"]["attempts"],
+                         notifier.ncfg.max_attempts)
+        self.assertEqual(notifier._pending(entry), ["nx→ntfy"])
+        # le chemin réel du passage suivant : `_retry` ne voit plus que le repli
+        notifier._retry(entry, "raised", 1030.0)
+        self.assertEqual([name for name, _ in sender.sent],
+                         ["nx", "ntfy", "ntfy"])
+        self.assertTrue(entry["channels"]["nx→ntfy"]["ok"])
+        self.assertFalse(entry["channels"]["nx"]["ok"])
+        self.assertEqual(len(notifier.state["fallback"]), 1)
+        self.assertEqual(notifier.state["notified"], {})
+
+    def test_succes_primaire_annule_le_repli_en_attente(self):
+        sender = FakeSender({
+            "nx": [notify.ChannelError("boom"), notify.ChannelError("boom"), None],
+            "ntfy": [notify.ChannelError("timeout")]})
+        notifier = self.notifier(sender)
+        entry = self.entry()
+        notifier._attempt(entry, "raised", 1000.0)
+        notifier._attempt(entry, "raised", 1030.0)
+        self.assertEqual([name for name, _ in sender.sent], ["nx", "nx", "ntfy"])
+        self.assertFalse(entry["channels"]["nx→ntfy"]["ok"])
+        self.assertEqual(entry["channels"]["nx→ntfy"]["attempts"], 1)
+        notifier._attempt(entry, "raised", 1060.0)
+        self.assertEqual([name for name, _ in sender.sent],
+                         ["nx", "nx", "ntfy", "nx"])
+        self.assertTrue(entry["channels"]["nx"]["ok"])
+        self.assertTrue(entry["channels"]["nx→ntfy"]["ok"])
+        self.assertTrue(entry["channels"]["nx→ntfy"].get("cancelled"))
+        self.assertEqual(notifier.state["fallback"], {})
+        self.assertEqual(len(notifier.state["notified"]), 1)
+
     def test_succes_primaire_pas_de_repli_et_registre(self):
         sender = FakeSender()
         notifier = self.notifier(sender)

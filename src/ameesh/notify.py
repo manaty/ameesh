@@ -2700,10 +2700,13 @@ class Notifier:
             self._adopt_summary_entry(entry, bucket)
             self._summary_add(bucket, "resolved", entry)
             return
-        delivered = [name for name, st in entry["channels"].items() if st.get("ok")]
+        # #3536 : un repli livré n'est pas une livraison du primaire ; la
+        # résolution ne repart pas sur le pseudo-canal `nexlink→ntfy`.
+        delivered = [name for name, st in entry["channels"].items()
+                     if st.get("ok") and not st.get("fallback_of")]
         if not delivered:
-            self.log("alert [%s] %s resolved before any successful send: nothing is sent"
-                     % (alert.get("type"), _subject(alert)))
+            self.log("alert [%s] %s resolved before any successful primary send: "
+                     "nothing is sent" % (alert.get("type"), _subject(alert)))
             self._record("resolved", entry, "abandonnee", {})
             return
         resolved = {"alert": alert, "raised_ts": entry.get("raised_ts"), "resolved_ts": now,
@@ -2744,6 +2747,8 @@ class Notifier:
         fallbacks = {}
         for name in self._pending(entry):
             st = entry["channels"][name]
+            if st.get("fallback_of"):
+                continue                # un repli : traité après les primaires
             channel = self.ncfg.channels.get(name)
             if channel is None:          # canal retiré de la configuration
                 st.update(attempts=self.ncfg.max_attempts, error="channel removed")
@@ -2766,11 +2771,24 @@ class Notifier:
                 else " — retried on next pass (%d/%d)"
                 % (st["attempts"], self.ncfg.max_attempts)))
             if channel.kind == "nexlink":
-                self._nexlink_fallback(channel, message, st, error, now, fallbacks)
+                self._nexlink_fallback(entry, channel, message, st, error, fallbacks)
+        # #3536 (relecture cx1 B/P1) : le repli garde son propre compteur et
+        # son propre état `pending`. Il part dans le même passage (immédiat sur
+        # erreur permanente) et il est retenté même quand le primaire est
+        # épuisé — sinon un premier échec temporaire du repli perdait l'alerte.
+        for name in [name for name in self._pending(entry)
+                     if (entry["channels"].get(name) or {}).get("fallback_of")]:
+            result = self._attempt_fallback(entry, name, message, now)
+            if result is not None:
+                results[name] = result
+                fallbacks[entry["channels"][name].get("target") or name] = result
         if results:
+            primary_ok = any(
+                value == "ok" and not (entry["channels"].get(name) or {}).get("fallback_of")
+                for name, value in results.items())
             delivery = ("a_blanc" if self.dry_run else
                         "envoyee" if any(v == "ok" for v in results.values()) else "echec")
-            if event == "raised" and any(v == "ok" for v in results.values()):
+            if event == "raised" and primary_ok:
                 # #2395 : au moins un canal a livré — l'alerte est marquée au
                 # registre AVANT le journal, pour qu'un arrêt juste après ne la
                 # fasse pas repartir à la reprise. Un échec total n'est pas
@@ -2781,14 +2799,14 @@ class Notifier:
             self._record(event, entry, delivery, results, message,
                          fallback=fallbacks or None)
 
-    def _nexlink_fallback(self, channel: Channel, message: Message, st: dict,
-                          error: ChannelError, now: float, out: dict) -> None:
-        """#3536 : le repli `ntfy`/`slack` du canal `nexlink`, une fois par alerte.
+    def _nexlink_fallback(self, entry: dict, channel: Channel, message: Message,
+                          st: dict, error: ChannelError, out: dict) -> None:
+        """#3536 : met le repli `ntfy`/`slack` du canal `nexlink` en attente.
 
         Déclenché au 2e échec consécutif ou tout de suite sur une erreur
-        permanente ; le texte est préfixé « repli nexlink — ». Le primaire
-        continue d'être retenté : un repli réussi ne marque pas l'alerte
-        livrée côté Nexlink.
+        permanente ; une seule fois par alerte (registre `fallback`). Le texte
+        enverra « repli nexlink — » ; le primaire reste retenté, et un repli
+        réussi ne vaut pas livraison côté Nexlink.
         """
         name = channel.options.get("fallback")
         if not name:
@@ -2798,25 +2816,57 @@ class Notifier:
             return
         if not (error.permanent or int(st.get("attempts") or 0) >= 2):
             return
+        key = "%s→%s" % (channel.name, target.name)
+        if key in entry.setdefault("channels", {}):
+            return
         alert_id = message_alert_id(message)
-        ledger = self.state.setdefault("fallback", {})
-        if alert_id in ledger:
+        if alert_id in (self.state.get("fallback") or {}):
             out[target.name] = "déjà envoyé"
             return
+        entry["channels"][key] = {"ok": False, "attempts": 0, "error": None,
+                                  "fallback_of": channel.name,
+                                  "target": target.name}
+        out[target.name] = "en attente"
+
+    def _attempt_fallback(self, entry: dict, name: str, message: Message,
+                          now: float) -> str | None:
+        """Envoie (ou annule) un repli en attente ; rend le résultat du journal."""
+        st = entry["channels"][name]
+        if st.get("ok"):
+            return None
+        primary = entry["channels"].get(str(st.get("fallback_of") or ""))
+        if primary is not None and primary.get("ok"):
+            # le primaire a fini par livrer : le repli n'a plus d'objet
+            st.update(ok=True, error=None, cancelled=True)
+            return "annulé"
+        target = self.ncfg.channels.get(str(st.get("target") or ""))
+        if target is None:
+            st.update(attempts=self.ncfg.max_attempts,
+                      error="fallback channel removed")
+            return "failed: fallback channel removed"
         fallback = replace(message, title="[repli] " + message.title,
                            body="repli nexlink — " + message.body)
         ok, failure = self._send(target, fallback)
+        st["attempts"] = st.get("attempts", 0) + 1
         if ok:
-            ledger[alert_id] = round(now, 3)
-            out[target.name] = "a_blanc" if self.dry_run else "ok"
-            self.log("[%s] %s: nexlink failed (%s), fallback %s sent"
+            st.update(ok=True, error=None, ts=round(now, 3))
+            self.state.setdefault("fallback", {})[message_alert_id(message)] = \
+                round(now, 3)
+            self.log("[%s] %s: fallback %s sent (primary: %s)"
                      % (message.kind or "alert", _clean(message.title, 80),
-                        _clean(error, 120), target.name))
-        else:
-            out[target.name] = "failed: %s" % failure
-            self.log("[%s] %s: nexlink failed (%s), fallback %s also failed: %s"
-                     % (message.kind or "alert", _clean(message.title, 80),
-                        _clean(error, 120), target.name, failure))
+                        target.name, _clean(primary.get("error") if primary else "", 120)))
+            return "a_blanc" if self.dry_run else "ok"
+        st["error"] = str(failure)
+        if failure.permanent:
+            st["attempts"] = self.ncfg.max_attempts
+        last = st["attempts"] >= self.ncfg.max_attempts
+        self.log("[%s] %s: fallback %s failed: %s%s"
+                 % (message.kind or "alert", _clean(message.title, 80),
+                    target.name, failure,
+                    " — GIVING UP (%d attempt(s))" % st["attempts"] if last
+                    else " — retried on next pass (%d/%d)"
+                    % (st["attempts"], self.ncfg.max_attempts)))
+        return "failed: %s" % failure
 
     def _send(self, channel: Channel, message: Message) -> tuple:
         try:
