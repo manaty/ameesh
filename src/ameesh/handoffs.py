@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import logging
 import math
+from enum import Enum
 from functools import wraps
 import os
 import queue
@@ -49,6 +50,35 @@ STEPS = {"planned": ("prepare", "prepared"), "drained": ("publish", "published")
 
 class HandoffError(ValueError):
     pass
+
+
+class Refusal(Enum):
+    """Fixed public diagnostics for controller guards, never helper text."""
+
+    CONTROLLER_BUSY = "another controller or unfinished host effect is processing this handoff"
+    CONTROLLER_LOST = "handoff controller ownership lost; explicit reconciliation required"
+    RESERVATION_CHANGED = "host effect refused: reservation or controller intent changed"
+    SOURCE_LOST = "lost source cannot be restored by ordinary cancellation"
+    DESTINATION_SWITCHED = "destination may have new work; recovery requires reconciliation"
+    SOURCE_RECOVERY_UNVERIFIED = "source recovery not verified"
+    RETRY_UNAVAILABLE = "only a held or unfinished operation can be retried"
+    EFFECT_NOT_QUIESCED = "unfinished host effect not quiesced"
+    PREREQUISITES_CHANGED = "host reconciliation or prerequisites changed"
+    INVALID_TTL = "reservation TTL outside 30..7200 seconds"
+    RENEWAL_REFUSED = "host identity, admission or fresh readings changed"
+    RENEWAL_REQUIRED = ("reservation expired; explicit host reconciliation and renewal required; "
+                        "retry with --renew-ttl SECONDS (30..7200)")
+    CHECKPOINT_MISSING = "missing recovery checkpoint"
+
+
+class HandoffRefusal(HandoffError):
+    """An explicitly public guard failure; ordinary HandoffError stays private."""
+
+    def __init__(self, reason: Refusal):
+        if not isinstance(reason, Refusal):
+            raise TypeError("handoff refusal requires a fixed category")
+        self.reason = reason
+        super().__init__(reason.value)
 
 
 def _sha(value):
@@ -360,10 +390,10 @@ def _serialized(function):
         try:
             with storage.of(db).handoffs.controller(operation, reconcile=function.__name__ == "retry") as tx:
                 if tx is None:
-                    raise HandoffError("another controller or unfinished host effect is processing this handoff")
+                    raise HandoffRefusal(Refusal.CONTROLLER_BUSY)
                 return function(tx, operation, adapter, **kwargs)
         except DbError:
-            raise HandoffError("handoff controller ownership lost; explicit reconciliation required") from None
+            raise HandoffRefusal(Refusal.CONTROLLER_LOST) from None
     return step
 
 
@@ -377,7 +407,7 @@ def _effect(api, adapter, step, op, *, enable_slot=None, completion_api=None):
             raise HandoffError("destination host gate closed or stale")
     intent = api.begin_effect(op["id"], op["state"], step)
     if intent is None:
-        raise HandoffError("host effect refused: reservation or controller intent changed")
+        raise HandoffRefusal(Refusal.RESERVATION_CHANGED)
     intent["controller_epoch"] = intent["evidence"]["controller_epoch"]
     if step == "enable":
         with storage.of(api.db).hosts.gate_guard(op["target"]) as hosts:
@@ -483,17 +513,17 @@ def cancel(db, operation, adapter):
     if op["state"] == "cancelled":
         return op
     if op["plan"].get("reason") == "host_loss":
-        raise HandoffError("lost source cannot be restored by ordinary cancellation")
+        raise HandoffRefusal(Refusal.SOURCE_LOST)
     if state in ("switched", "activated", "verified"):
-        raise HandoffError("destination may have new work; recovery requires reconciliation")
+        raise HandoffRefusal(Refusal.DESTINATION_SWITCHED)
     # Loss publication uses this same gate lock. Keep the current lifecycle
     # check, restoration and fence release within one boundary.
     with api.cancellation_guard(operation) as guarded:
         control = storage.of(guarded.db).host_lifecycle.get(op["source"])
         if control and control["mode"] == "lost":
-            raise HandoffError("lost source cannot be restored by ordinary cancellation")
+            raise HandoffRefusal(Refusal.SOURCE_LOST)
         if _effect(api, adapter, "restore_source", op, completion_api=guarded) is not True:
-            raise HandoffError("source recovery not verified")
+            raise HandoffRefusal(Refusal.SOURCE_RECOVERY_UNVERIFIED)
         return guarded.unfence(operation, op["state"], "cancelled") or guarded.get(operation)
 
 
@@ -510,7 +540,7 @@ def retry(db, operation, adapter, *, renew_ttl=None):
     if not op or op["state"] != "held":
         # Lock loss can leave an intent before a checkpoint was held.
         if not op or not op["evidence"].get("pending_effect"):
-            raise HandoffError("only a held or unfinished operation can be retried")
+            raise HandoffRefusal(Refusal.RETRY_UNAVAILABLE)
     pending = op["evidence"].get("pending_effect")
     if pending:
         # This adapter operation MUST fence and quiesce the exact former
@@ -522,7 +552,7 @@ def retry(db, operation, adapter, *, renew_ttl=None):
         if (not isinstance(proof, dict) or proof.get("ok") is not True
                 or proof.get("quiesced") is not True or isinstance(proof.get("epoch"), bool)
                 or proof.get("epoch") != pending["epoch"]):
-            raise HandoffError("unfinished host effect not quiesced")
+            raise HandoffRefusal(Refusal.EFFECT_NOT_QUIESCED)
         op = api.finish_effect(operation, pending["epoch"])
         if op["state"] != "held":
             op = api.hold(operation, op["state"])
@@ -531,16 +561,16 @@ def retry(db, operation, adapter, *, renew_ttl=None):
             return op  # explicit cancellation may now restore the source
     op = api.promote_loss(operation) or op
     if _effect(api, adapter, "revalidate", op) is not True:
-        raise HandoffError("host reconciliation or prerequisites changed")
+        raise HandoffRefusal(Refusal.PREREQUISITES_CHANGED)
     if renew_ttl is not None:
         if isinstance(renew_ttl, bool) or not isinstance(renew_ttl, int) or not 30 <= renew_ttl <= 7200:
-            raise HandoffError("reservation TTL outside 30..7200 seconds")
+            raise HandoffRefusal(Refusal.INVALID_TTL)
         op = api.renew(operation, ttl=renew_ttl)
         if op is None:
-            raise HandoffError("host identity, admission or fresh readings changed")
+            raise HandoffRefusal(Refusal.RENEWAL_REFUSED)
     if op["reserved_until_ts"] <= time.time():
-        raise HandoffError("reservation expired; explicit host reconciliation and renewal required")
+        raise HandoffRefusal(Refusal.RENEWAL_REQUIRED)
     previous = op["evidence"].get("held_at")
     if previous not in (*STEPS, "prepared", "session_ready"):
-        raise HandoffError("missing recovery checkpoint")
+        raise HandoffRefusal(Refusal.CHECKPOINT_MISSING)
     return api.transition(operation, "held", previous, detail="explicit idempotent retry")

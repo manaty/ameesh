@@ -730,6 +730,8 @@ class Agents(interface.Agents):
             """
             SELECT r.name, r.mode, r.status, r.stop_reason, r.responsible, r.host,
                    r.canon_ref, r.placement_ok, r.placement_diagnostic,
+                   -- #3460 : le retrait est un état, pas une attente de canon
+                   extract(epoch from r.retired_at)::float8 AS retired_ts,
                    -- #2200 : la pause opérateur fait partie de la disponibilité
                    r.operator_paused, r.operator_pause_reason, r.operator_pause_by,
                    (NOT r.ephemeral OR r.ephemeral_expires_at > now()) AS alive,
