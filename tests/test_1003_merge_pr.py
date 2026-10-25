@@ -144,7 +144,9 @@ class _Base(unittest.TestCase):
                                       [{"name": item.get("assignee"),
                                         "family": self.FAMILIES.get(
                                             str(item.get("assignee") or ""), "")}],
-                                      ())),
+                                      # #3578 : les familles compilées, comme
+                                      # la lecture réelle (jamais vides)
+                                      ("claude", "codex", "deepseek"))),
                 mock.patch.object(merge_queue, "_attribution_on_freeze",
                                   return_value=None),
                 # #2928 : en classe sensible, un verdict ne compte que sur son
