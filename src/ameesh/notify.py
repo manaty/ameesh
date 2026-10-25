@@ -100,7 +100,6 @@ from __future__ import annotations
 import argparse
 import base64
 import errno
-import hashlib
 import http.client
 import json
 import os
@@ -836,8 +835,8 @@ def render_summary(bucket: dict, host: str) -> Message:
 
 def test_alert_id(human: str, channel: Channel, host: str) -> str:
     """Identité stable d'un message de test (le statut/accusé la réutilise)."""
-    return hashlib.sha256(("test|%s|%s|%s" % (human, channel.name, host))
-                          .encode("utf-8")).hexdigest()
+    return nexlink_alerts.alert_id_for(
+        "test|%s|%s|%s" % (human, channel.name, host))
 
 
 def render_test(human: str, channel: Channel, host: str) -> Message:
@@ -1238,8 +1237,9 @@ class Sender:
         """L'enveloppe claire : identité + chiffré + un wrap par clé active."""
         alert_id = message_alert_id(message)
         occurred_at = message.occurred_at or iso_utc(time.time())
+        # #3537 refuse tout champ inconnu (`forbidNonWhitelisted`) : le clair
+        # ne porte que les champs du DTO ; l'événement reste dans le chiffré.
         envelope = {"v": nexlink_alerts.ENVELOPE_V, "alert_id": alert_id,
-                    "event": message.event or "raised",
                     "severity": "urgent" if message.urgent else "normal",
                     "occurred_at": occurred_at}
         active = keys.get("keys") or []
@@ -1291,6 +1291,12 @@ class Sender:
     def _nexlink(self, channel: Channel, message: Message, timeout: float) -> None:
         """Pousse une alerte dans l'app Nexlink (POST signé, contenu chiffré)."""
         alert_id = message_alert_id(message)
+        if (message.event or "raised") != "raised":
+            # #3537 v1 ne stocke que l'alerte levée (pas d'état de résolution
+            # dans son schéma) ; la ligne de l'app reste levée, sans 400.
+            self.last[channel.name] = {"alert_id": alert_id,
+                                       "skipped": message.event or "raised"}
+            return
         delivery = nexlink_alerts.delivery_key(message.event or "raised", alert_id)
         keys = self._nexlink_keys_for(channel, timeout)
         envelope = self._nexlink_envelope(message, keys)
@@ -1560,14 +1566,14 @@ def _notification_id(key, severity, human, since=None) -> str:
 def message_alert_id(message: Message) -> str:
     """L'identité stable d'un message pour le canal `nexlink`.
 
-    Posée par `_attempt` (l'identité du registre `notified` hachée) ; un
-    message sans elle (résumé de débit, test) en reçoit une dérivée de son
-    texte, stable entre deux essais.
+    Posée par `_attempt` (identité du registre `notified` en UUIDv5) ; un
+    message sans elle (résumé de débit) en reçoit une dérivée de son texte,
+    stable entre deux essais et valide comme UUID pour l'API #3537.
     """
     if message.alert_id:
         return message.alert_id
-    return hashlib.sha256(("%s\n%s" % (message.title, message.body))
-                          .encode("utf-8")).hexdigest()
+    return nexlink_alerts.alert_id_for(
+        "%s\n%s" % (message.title, message.body))
 
 
 def _since_of(alert: dict):
@@ -2741,7 +2747,7 @@ class Notifier:
         occurred_at = entry.get("occurred_at") or iso_utc(now)
         entry["occurred_at"] = occurred_at
         message = replace(message,
-                          alert_id=nexlink_alerts.alert_identity_hash(identity),
+                          alert_id=nexlink_alerts.alert_id_for(identity),
                           occurred_at=occurred_at)
         results = {}
         fallbacks = {}

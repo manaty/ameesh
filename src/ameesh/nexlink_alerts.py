@@ -9,10 +9,15 @@ format et la cryptographie, testables seuls.
 
 **Enveloppe** (claire, c'est tout ce que le hub stocke) ::
 
-    {"v": 1, "alert_id": <sha256 hex>, "event": "raised"|"resolved",
-     "severity": "urgent"|"normal", "occurred_at": "…Z",
-     "ciphertext": <base64 ct||tag>, "nonce": <base64 12 o>,
-     "wraps": [{"key_id": …, "gen": 1, "wrap": <base64>}]}
+    {"v": 1, "alert_id": <uuid v5>, "severity": "urgent"|"normal",
+     "occurred_at": "…Z", "ciphertext": <base64 ct||tag>,
+     "nonce": <base64 12 o>, "wraps": [{"key_id": …, "gen": 1, "wrap": …}]}
+
+L'API #3537 valide `alert_id` comme un UUID (colonne `uuid` du hub) et
+n'accepte que ces champs : l'identité de registre est donc projetée en
+UUIDv5, déterministe, et la clé d'idempotence est cet `alert_id`. Une
+résolution n'est **pas** poussée au hub en v1 (son schéma ne porte pas
+d'état ; la ligne de l'app reste levée) — `ameesh notify` la saute.
 
 Sans clé active : ``{"content_free": true}`` et ni chiffré ni enveloppe.
 
@@ -320,17 +325,24 @@ def mesh_headers(secret, body: bytes, *, key_id: str = MESH_ALERT_KEY_ID,
             "X-Mesh-Signature": mesh_signature(secret, key_id, timestamp, body)}
 
 
-def alert_identity_hash(identity: str) -> str:
-    """`alert_id` : SHA-256 de l'identité de registre `notified` (#2395)."""
-    return hashlib.sha256(str(identity).encode("utf-8")).hexdigest()
+#: espace de noms fixe des `alert_id` du canal (UUIDv5, jamais un UUIDv4 :
+#: la même alerte garde la même ligne après un redémarrage).
+ALERT_NAMESPACE = uuid.uuid5(uuid.NAMESPACE_URL, "ameesh:mesh-alert:v1")
+
+
+def alert_id_for(identity: str) -> str:
+    """`alert_id` : UUIDv5 déterministe de l'identité de registre (#2395).
+
+    L'API #3537 stocke `alert_id` en colonne `uuid` ; une même identité
+    (clé, sévérité, humain, `since`) donne donc toujours le même UUID.
+    """
+    return str(uuid.uuid5(ALERT_NAMESPACE, str(identity)))
 
 
 def delivery_key(event: str, alert_id: str) -> str:
-    """Clé d'idempotence d'un envoi : l'alerte, et l'événement s'il en faut.
+    """Clé d'idempotence d'un envoi : l'`alert_id`, comme l'exige #3537.
 
-    `raised` garde l'`alert_id` du contrat (#3537) ; un `resolved` reçoit
-    ``<alert_id>:resolved`` — la ligne durable de l'app a la même identité,
-    mais l'envoi n'est pas un doublon du `raised`.
+    Une résolution n'est pas poussée au hub en v1 (`_nexlink` la saute) : il
+    n'y a donc qu'un envoi par alerte, et le serveur déduplique par cette clé.
     """
-    event = str(event or "raised")
-    return str(alert_id) if event == "raised" else "%s:%s" % (alert_id, event)
+    return str(alert_id)

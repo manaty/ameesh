@@ -190,13 +190,16 @@ file, never the canon:
 to the account's X25519 key-wrap key (`GET /mesh/alerts/keys`, generation 1:
 AES-256-GCM under a random CEK, the CEK wrapped per active key with Nexlink's
 `wrapToX25519` format, subject `meshAlert = 5`), so the hub only stores
-`{v, alert_id, event, severity, occurred_at, ciphertext, nonce, wraps}`. With
-no active key the alert is sent **content-free** (`content_free: true`) and the
-app opens the console. Requests are signed with
+`{v, alert_id, severity, occurred_at, ciphertext, nonce, wraps}`. `alert_id` is
+a deterministic UUIDv5 of the alert identity (Nexlink stores it as a `uuid`
+and refuses unknown envelope fields); `X-Mesh-Idempotency-Key` is that
+`alert_id`. A resolution is not pushed to the hub in v1 (its schema has no
+state; the app row stays raised), so `ameesh notify` skips it for this channel.
+With no active key the alert is sent **content-free** (`content_free: true`)
+and the app opens the console. Requests are signed with
 `X-Mesh-Key-Id` (`AMEESH_NEXLINK_KEY_ID`, default `ameesh-v1`),
 `X-Mesh-Timestamp` and `X-Mesh-Signature: v1=HMAC-SHA-256(...)` over
-`key_id "\n" timestamp "\n" body`; `X-Mesh-Idempotency-Key` is `alert_id` for a
-raised alert and `alert_id:resolved` for a resolution. 401/400/404/422 are
+`key_id "\n" timestamp "\n" body`. 401/400/404/422 are
 permanent, 429/5xx are retried, 409 `key_unknown` refreshes the keys once.
 On the second consecutive failure (or at once on a permanent error) the text
 is sent once per alert to the `fallback` channel, prefixed

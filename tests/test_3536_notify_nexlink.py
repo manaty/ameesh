@@ -12,7 +12,6 @@ le lot jumeau #3537.
 from __future__ import annotations
 
 import base64
-import hashlib
 import hmac
 import http.server
 import json
@@ -21,6 +20,7 @@ import tempfile
 import threading
 import types
 import unittest
+import uuid
 from unittest import mock
 
 from ameesh import nexlink_alerts as nx
@@ -28,6 +28,9 @@ from ameesh import notify, role_timers
 
 ACCOUNT = "b1e3c612-4825-4716-abe9-194ab3acde43"
 SECRET = "s3cr3t-mesh"
+#: l'API #3537 valide `alert_id` comme un UUID (colonne `uuid`)
+ALERT_ID = "6f1c2a3b-4c5d-4e6f-8a9b-0c1d2e3f4a5b"
+ALERT_ID_2 = "9a8b7c6d-5e4f-4a3b-9c8d-7e6f5a4b3c2d"
 RECIPIENT_PRIVATE = bytes(range(1, 33))
 RECIPIENT_PUBLIC = bytes.fromhex(
     "07a37cbc142093c8b755dc1b10e86cb426374ad16aa853ed0bdfc0b2b86d1c7c")
@@ -116,10 +119,13 @@ class CryptoTest(unittest.TestCase):
                                         "X-Mesh-Signature"})
 
     def test_identites(self):
-        self.assertEqual(nx.alert_identity_hash("x"),
-                         hashlib.sha256(b"x").hexdigest())
-        self.assertEqual(nx.delivery_key("raised", "a"), "a")
-        self.assertEqual(nx.delivery_key("resolved", "a"), "a:resolved")
+        # l'API #3537 valide l'alert_id comme un UUID (colonne `uuid`)
+        first = nx.alert_id_for("x")
+        self.assertEqual(first, nx.alert_id_for("x"))
+        self.assertEqual(str(uuid.UUID(first)), first)
+        self.assertNotEqual(first, nx.alert_id_for("y"))
+        self.assertEqual(nx.delivery_key("raised", first), first)
+        self.assertEqual(nx.delivery_key("resolved", first), first)
         with self.assertRaises(ValueError):
             nx.uuid_bytes("00000000-0000-0000-0000-000000000000")
 
@@ -348,7 +354,7 @@ class _MeshCase(unittest.TestCase):
     def message(**over):
         base = {"title": "ameesh: agent stopped with mail",
                 "body": "[stopped_with_mail] agent ouvrier\narrêté avec 2 messages",
-                "urgent": True, "alert_id": "a" * 64, "event": "raised",
+                "urgent": True, "alert_id": ALERT_ID, "event": "raised",
                 "occurred_at": "2026-10-25T11:41:27Z", "kind": "stopped_with_mail",
                 "context": {"agent": "ouvrier"}}
         base.update(over)
@@ -370,10 +376,13 @@ class SenderTest(_MeshCase):
         self.assertEqual(request["headers"]["X-Mesh-Key-Id"], "ameesh-v1")
         self.assertNotIn("ouvrier", request["body"].decode("utf-8"))
         body = json.loads(request["body"])
-        self.assertEqual((body["v"], body["alert_id"], body["event"], body["severity"],
+        self.assertEqual(set(body), {"v", "alert_id", "severity", "occurred_at",
+                                     "ciphertext", "nonce", "wraps"})
+        self.assertEqual((body["v"], body["alert_id"], body["severity"],
                           body["occurred_at"]),
-                         (1, "a" * 64, "raised", "urgent", "2026-10-25T11:41:27Z"))
-        self.assertEqual(request["headers"]["X-Mesh-Idempotency-Key"], "a" * 64)
+                         (1, ALERT_ID, "urgent", "2026-10-25T11:41:27Z"))
+        self.assertEqual(str(uuid.UUID(body["alert_id"])), ALERT_ID)
+        self.assertEqual(request["headers"]["X-Mesh-Idempotency-Key"], ALERT_ID)
         # l'enveloppe se déchiffre avec la clé privée du compte (celle de l'app)
         (wrap,) = body["wraps"]
         self.assertEqual((wrap["key_id"], wrap["gen"]), ("wrap-1", 1))
@@ -388,22 +397,30 @@ class SenderTest(_MeshCase):
         self.assertEqual(content["kind"], "stopped_with_mail")
         self.assertEqual(content["agent"], "ouvrier")
         # le dernier envoi retenu pour l'accusé de `--test`
-        self.assertEqual(sender.last[channel.name]["alert_id"], "a" * 64)
+        self.assertEqual(sender.last[channel.name]["alert_id"], ALERT_ID)
         self.assertTrue(sender.last[channel.name]["accepted"])
 
-    def test_key_id_surchargeable_et_resolution(self):
+    def test_key_id_surchargeable(self):
         server = self.mesh()
         _, channel = self.config(server)
         sender = self.sender({"MESH_SECRET": SECRET,
                               "AMEESH_NEXLINK_KEY_ID": "ameesh-test"})
-        sender.send(channel, self.message(event="resolved"))
+        sender.send(channel, self.message())
         (request,) = server.by_path("/mesh/alerts", "POST")
         self.assertTrue(request["signature_ok"])
         self.assertEqual(request["headers"]["X-Mesh-Key-Id"], "ameesh-test")
         body = json.loads(request["body"])
-        self.assertEqual(body["event"], "resolved")
-        self.assertEqual(request["headers"]["X-Mesh-Idempotency-Key"],
-                         "a" * 64 + ":resolved")
+        self.assertNotIn("event", body)
+        self.assertEqual(request["headers"]["X-Mesh-Idempotency-Key"], ALERT_ID)
+
+    def test_resolution_non_poussee(self):
+        """#3537 v1 ne stocke que l'alerte levée : une résolution ne part pas."""
+        server = self.mesh()
+        _, channel = self.config(server)
+        sender = self.sender()
+        sender.send(channel, self.message(event="resolved"))
+        self.assertEqual(server.requests, [])
+        self.assertEqual(sender.last[channel.name]["skipped"], "resolved")
 
     def test_test_avec_accuse(self):
         server = self.mesh()
@@ -489,16 +506,16 @@ class SenderTest(_MeshCase):
         _, channel = self.config(server)
         sender = self.sender()
         sender.send(channel, self.message())
-        sender.send(channel, self.message(alert_id="b" * 64))
+        sender.send(channel, self.message(alert_id=ALERT_ID_2))
         self.assertEqual(len(server.by_path("/mesh/alerts/keys", "GET")), 1)
         self.assertEqual(len(server.by_path("/mesh/alerts", "POST")), 2)
 
     def test_accuse_de_lecture_signe(self):
         server = self.mesh()
         ncfg, channel = self.config(server)
-        receipt = self.sender().receipt(channel, "a" * 64)
+        receipt = self.sender().receipt(channel, ALERT_ID)
         self.assertEqual(receipt["read_at"], "2026-10-25T11:42:00Z")
-        (request,) = server.by_path("/mesh/alerts/" + "a" * 64, "GET")
+        (request,) = server.by_path("/mesh/alerts/" + ALERT_ID, "GET")
         self.assertTrue(request["signature_ok"])
 
     def test_secret_fichier_0600(self):
@@ -584,10 +601,11 @@ class NotifierTest(unittest.TestCase):
         self.assertEqual((first.occurred_at, second.occurred_at),
                          ("1970-01-01T00:16:40Z", "1970-01-01T00:16:40Z"))
         self.assertEqual(first.alert_id,
-                         nx.alert_identity_hash(notify._notification_id(
+                         nx.alert_id_for(notify._notification_id(
                              notify.key_of(entry["alert"]),
                              notify._entry_severity(entry), "human:owner",
                              notify._since_of(entry["alert"]))))
+        self.assertEqual(str(uuid.UUID(first.alert_id)), first.alert_id)
         # une autre alerte (autre `since`) n'a pas la même identité
         other = self.entry(alert={"type": "dead_runner", "agent": "ouvrier",
                                   "since": 950.0, "detail": "x"})
