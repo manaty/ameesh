@@ -2323,7 +2323,15 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                                migration_landed=args.migration_landed,
                                cfg=cfg, announce=_declare_constat, pr=args.pr)
             if done["result"] == "already":
-                print("lot #%d already %s: nothing to do" % (args.id, done["item"]["state"]))
+                # #3413 : dire ce qui a été fait (ou pourquoi rien ne l'a été) ;
+                # « nothing to do » cachait la relecture non ouverte et son motif.
+                detail = str(done.get("detail") or "").strip()
+                prefix = "already %s" % done["item"]["state"]
+                if detail.startswith(prefix):
+                    detail = detail[len(prefix):].lstrip(" —-")
+                print("lot #%d already %s%s" % (
+                    args.id, done["item"]["state"],
+                    ": %s" % detail if detail else ""))
             elif done["result"] == "landed":
                 print("lot #%d already %s: %s" % (
                     args.id, done["item"]["state"], done["detail"]))

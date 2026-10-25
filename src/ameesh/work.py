@@ -2379,7 +2379,7 @@ def _review_after_merge(db, item_id, *, sha: str = "", pr_ref=None, repo=None) -
 
 
 def _resume_review_after_merge(db, item_id, *, sha: str = "", pr_ref=None,
-                               repo=None) -> dict:
+                               repo=None, explicit: bool = False) -> dict:
     """L539 (#1104) : reprendre la relecture manquante d'un lot **déjà** fusionné.
 
     B1 de la R1 : ce chemin est rappelé par `sync-github` pour des lots
@@ -2388,13 +2388,25 @@ def _resume_review_after_merge(db, item_id, *, sha: str = "", pr_ref=None,
     rattrapage historique que l'arbitrage pilote du 15/10 exclut. Le prédicat
     partagé (`review_lot.catch_up_eligible`) dit la même vérité que `catch_up`
     (borne, relecture manquante, marque terminale, tentatives) ; hors bornes,
-    rien n'est tenté et le lot reste au seul rattrapage borné."""
+    rien n'est tenté et le lot reste au seul rattrapage borné.
+
+    `explicit` (#3413) : le geste humain `ameesh work merged <id> --repo …`
+    fournit le clone qui manquait au balayage ; il relance la classification
+    sans attendre le délai de reprise, mais reste tenu par la borne
+    d'activation (aucun historique relu)."""
     try:
         from . import review_lot
-        if not review_lot.catch_up_eligible(db, int(item_id)):
-            return {"id": None, "created": False,
-                    "why": "hors bornes du rattrapage (fusion antérieure à l'activation"
-                           " ou marque terminale) : laissé à review_lot.catch_up"}
+        existing = review_lot.opened_for(db, int(item_id))
+        if existing is not None:
+            return {"id": int(existing["id"]), "created": False,
+                    "why": "lot de relecture #%d déjà ouvert (état %s)"
+                           % (int(existing["id"]), existing.get("state") or "?")}
+        if not review_lot.catch_up_eligible(db, int(item_id), explicit=explicit):
+            why = ("hors bornes du rattrapage (fusion antérieure à l'activation"
+                   " ou borne illisible) : aucune relecture due" if explicit else
+                   "hors bornes du rattrapage (fusion antérieure à l'activation"
+                   " ou marque terminale) : laissé à review_lot.catch_up")
+            return {"id": None, "created": False, "why": why}
         return _review_after_merge(db, item_id, sha=sha, pr_ref=pr_ref, repo=repo)
     except Exception as exc:  # noqa: BLE001 - la fusion reste un fait
         return {"id": None, "created": False,
@@ -2406,7 +2418,7 @@ def close_merged(db: Db, item_id: int, *, sha: str = "", actor: str = "", source
                  pr_ref: str | None = None, frozen_id: int | None = None,
                  declared: bool = False, extra: str = "", repo: str | None = None,
                  landed: tuple[int, str] | None = None, unfrozen: bool = False,
-                 content_guard=None) -> dict:
+                 content_guard=None, retry_review: bool = False) -> dict:
     """Fusion constatée : le lot passe `merged` et son jalon `merged` est posé.
 
     Idempotent : un lot déjà fusionné reste tel quel (`already`). Jamais de
@@ -2458,6 +2470,13 @@ def close_merged(db: Db, item_id: int, *, sha: str = "", actor: str = "", source
     rattrapage (`review_lot.catch_up_eligible`, B1 de la R1 #1104) ;
     `review_lot.catch_up` reprend les lots fusionnés que les relevés ne
     sélectionnent plus.
+
+    `retry_review` (#3413) : le chemin `already` est un geste **explicite**
+    qui fournit le clone (`ameesh work merged <id> --repo …`) ; il relance la
+    classification sans subir le délai ni le plafond de tentatives du
+    balayage (la borne d'activation reste). Sans lui, l'avertissement
+    « aucun dépôt lisible » conseillait un geste qui répondait « nothing to
+    do ».
     """
     for _attempt in range(3):
         item = get(db, item_id)
@@ -2477,10 +2496,20 @@ def close_merged(db: Db, item_id: int, *, sha: str = "", actor: str = "", source
             # manquer (l'ouverture avait échoué). Ce chemin idempotent la
             # reprend sans jamais rouvrir ni défaire la fusion (R1 #1104 P2-2),
             # et seulement dans les bornes du rattrapage (B1 de la R1) : un lot
-            # fusionné avant l'activation n'est pas relu rétroactivement.
-            review = _resume_review_after_merge(db, item_id, sha=sha, pr_ref=pr_ref, repo=repo)
+            # fusionné avant l'activation n'est pas relu rétroactivement. Un
+            # geste explicite avec le clone (#3413) relance la classification
+            # sans attendre le délai de reprise : c'est le geste conseillé par
+            # l'avertissement « aucun dépôt lisible ».
+            review = _resume_review_after_merge(db, item_id, sha=sha, pr_ref=pr_ref,
+                                                repo=repo, explicit=retry_review)
             detail = "already %s" % state
-            if not review.get("id") and not review.get("already_reviewed"):
+            if review.get("created") and review.get("id"):
+                detail += " — relecture #%d ouverte" % int(review["id"])
+            elif review.get("id"):
+                detail += " — relecture #%d déjà ouverte" % int(review["id"])
+            elif review.get("already_reviewed"):
+                detail += " — avis déjà rendu sur la tête fusionnée"
+            else:
                 detail += " — relecture non ouverte : %s" % (review.get("why") or "?")
             return {"id": int(item_id), "result": "already", "item": item,
                     "detail": detail, "review_lot": review}
@@ -2835,8 +2864,15 @@ def merged(db: Db, item_id: int, *, sha: str = "", note: str = "", actor: str = 
     relecture §2 ; sans lui, un hôte qui ne connaît ni le dossier de
     l'assigné ni le projet radar rendait « dépôt inconnu » et la relecture
     d'un lot léger ne s'ouvrait jamais. Le même dépôt rejoue une relecture
-    manquante sur un lot déjà fusionné (dans les bornes du rattrapage)."""
+    manquante sur un lot déjà fusionné (dans les bornes du rattrapage).
+
+    #3413 : ce rejeu est **explicite** — le clone fourni relance la
+    classification sans attendre le délai ni le plafond de tentatives du
+    balayage, sinon l'avertissement « aucun dépôt lisible » conseillerait un
+    geste qui répond « already merged: nothing to do ». La borne d'activation
+    du rattrapage (fusion antérieure non relue) reste appliquée."""
     pr_text = (pr or "").strip()
+    retry_review = bool((repo or "").strip() or pr_text)
     text = (sha or "").strip().lower()
     if not text and not pr_text:
         raise WorkError("--sha: the merge commit (7 to 64 hex characters); for a PR of "
@@ -2894,14 +2930,15 @@ def merged(db: Db, item_id: int, *, sha: str = "", note: str = "", actor: str = 
             done = close_merged(db, item_id, sha=text, actor=actor,
                                 source=actor or UNKNOWN_ACTOR, declared=True, extra=extra,
                                 landed=landed, pr_ref=pr_ref, repo=proof_repo,
-                                **proof_guard)
+                                retry_review=retry_review, **proof_guard)
         else:
             with db.transaction() as tx:
                 fence.hold(tx)
                 done = close_merged(tx, item_id, sha=text, actor=actor,
                                     source=actor or UNKNOWN_ACTOR, declared=True,
                                     extra=extra, landed=landed, pr_ref=pr_ref,
-                                    repo=proof_repo, **proof_guard)
+                                    repo=proof_repo, retry_review=retry_review,
+                                    **proof_guard)
     except DbError as exc:
         # #1567 : course perdue sur l'index unique (dépôt, numéro atterri) —
         # message lisible plutôt que la DbError brute ; la pré-vérification a
