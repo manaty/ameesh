@@ -33,7 +33,7 @@ import os
 import types
 from unittest import mock
 
-from ameesh import merge_queue, packet_reviews, registry, storage, work
+from ameesh import lot_class, merge_queue, packet_reviews, registry, storage, work
 
 from .support import PgTestCase
 from .test_2447_review_designation_activation import _Repo
@@ -155,6 +155,23 @@ class PacketMemberBaseTest(PgTestCase):
             out = self.need(base)
         return out, gate.call_args_list[0].kwargs["klass"]
 
+    def own_commit_then_member(self):
+        """X sensible propre au véhicule, puis un membre léger ; record --base X."""
+        self.repo.git("checkout", "-q", "-b", "lot/member", self.base)
+        self.repo.write("src/ameesh/member.py", "member\n")
+        head = self.repo.commit("member", agent="author")
+        self.receipt(head, "author", "deepseek")
+        lot = self.member_row(head)
+        self.repo.git("checkout", "-q", "-b", "integration/paquet", self.base)
+        self.repo.write(".github/workflows/deploy.yml", "name: deploy\n")
+        own = self.repo.commit("vehicule: workflow", agent="author")
+        self.repo.git("merge", "-q", "--no-ff", "-m",
+                      "Merge #%d — membre\n\nameesh-work: %d" % (lot, lot),
+                      "lot/member")
+        self.packet = self.repo.git("rev-parse", "HEAD")
+        self.record(own, self.packet, lot, head)
+        return own
+
     # -- témoins ----------------------------------------------------------
     def test_a_member_of_the_composition_base_stays_light(self):
         # La cible réelle porte un workflow sensible ; le membre, lui, n'ajoute
@@ -192,25 +209,32 @@ class PacketMemberBaseTest(PgTestCase):
         # Témoin cx1 : la branche du véhicule porte un commit propre sensible
         # X, puis fusionne un membre léger ; `record --base X` accepte X car
         # il est ancêtre de la tête. X ne doit pas sortir de la relecture.
-        self.repo.git("checkout", "-q", "-b", "lot/member", self.base)
-        self.repo.write("src/ameesh/member.py", "member\n")
-        head = self.repo.commit("member", agent="author")
-        self.receipt(head, "author", "deepseek")
-        lot = self.member_row(head)
-        self.repo.git("checkout", "-q", "-b", "integration/paquet", self.base)
-        self.repo.write(".github/workflows/deploy.yml", "name: deploy\n")
-        own = self.repo.commit("vehicule: workflow", agent="author")
-        self.repo.git("merge", "-q", "--no-ff", "-m",
-                      "Merge #%d — membre\n\nameesh-work: %d" % (lot, lot),
-                      "lot/member")
-        self.packet = self.repo.git("rev-parse", "HEAD")
-        # Le record menteur (ou hérité d'une composition fautive) : X en base.
-        self.record(own, self.packet, lot, head)
+        self.own_commit_then_member()
         out, klass = self.classify(self.base)
         self.assertEqual(klass["class"], "light", klass)
         self.assertIsNone(out["ok"], out)
         self.assertEqual(out["required"], 2)
         self.assertIn(".github/workflows/deploy.yml", out["own_paths"])
+
+    def test_the_gate_must_pass_the_true_target_not_the_recorded_base(self):
+        # #3534 (B4) : la classe du porteur est lue depuis le SHA de la cible
+        # résolue, jamais depuis la base enregistrée X. Avec X, le commit
+        # sensible propre au véhicule B..X sortirait de la relecture.
+        own = self.own_commit_then_member()
+        row = work.get(self.db, self.vehicle)
+
+        def klass(base_sha):
+            return lot_class.of_lot(
+                self.db, self.vehicle, item=row, repo=self.repo.root,
+                base="main", head=self.packet, milestones=[], canons=[_canon()],
+                base_sha=base_sha)
+
+        bypass = klass(own)
+        self.assertEqual(bypass["class"], "light", bypass)
+        real = klass(self.base)
+        self.assertEqual(real["class"], "sensitive", real)
+        self.assertIn(".github/workflows/deploy.yml",
+                      [f["path"] for f in real["files"]])
 
     def test_a_sensitive_member_still_needs_two_independent_reviews(self):
         self.member(path=".github/workflows/deploy.yml", text="name: deploy\n")
