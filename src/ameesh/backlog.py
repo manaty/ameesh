@@ -848,7 +848,8 @@ def lot_takeable(item: dict, today: str | None = None, *, holds=None,
     attend son exécutant, elle n'est pas à la file.
 
     #3556 : `holds` est la lecture groupée stricte des holds de pilote.
-    Un hold actif retient le lot jusqu'à sa levée ou son réveil échu.
+    Un hold actif retient le lot jusqu'à sa levée ou son réveil échu, si ce
+    réveil tombe après la pose du hold.
 
     §4 : un lot `build` sans assigné n'est prenable que s'il a été RENDU à la
     file par la limite d'en-cours (`returned_to_queue` : la note de retour est
@@ -861,10 +862,14 @@ def lot_takeable(item: dict, today: str | None = None, *, holds=None,
         return False
     if item.get("state") == "build" and not item.get("returned_to_queue"):
         return False
-    if int(item.get("id") or 0) in (holds or {}):
+    hold = (holds or {}).get(int(item.get("id") or 0))
+    if hold:
         wake = item.get("wake_ts")
         stamp = time.time() if now is None else float(now)
-        if wake is None or float(wake) > stamp:
+        # Seul un réveil échu postérieur à la pose libère : un réveil plus
+        # ancien, jamais consommé sur un lot sans assigné, ne lève pas le hold.
+        if (wake is None or float(wake) > stamp
+                or float(wake) < float(hold.get("since") or 0.0)):
             return False
     start = str(item.get("planned_start") or "")[:10]
     if today and start and start > today:

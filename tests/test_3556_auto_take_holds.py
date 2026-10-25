@@ -36,8 +36,20 @@ class PilotHoldTest(_Lots):
         st = storage.of(self.db)
         st.work.schedule_wake(lot["id"], self.now + 60, text="rendez-vous", actor="test")
         self.assertEqual(self.take(dry_run=True), [])
-        st.work.schedule_wake(lot["id"], self.now - 1, text="rendez-vous", actor="test")
-        self.assertEqual([t["item"]["id"] for t in self.take()], [lot["id"]])
+        self.assertEqual([t["item"]["id"] for t in self.take(now=self.now + 120)],
+                         [lot["id"]])
+
+    def test_stale_wake_before_hold_does_not_release(self):
+        """Un réveil échu AVANT la pose du hold (lot rendu à la file, réveil
+        jamais consommé faute d'assigné) ne lève pas le hold posé ensuite."""
+        self.agent("claude1", team="nexlink")
+        lot = self.lot("spec attendue", priority=1)
+        storage.of(self.db).work.schedule_wake(
+            lot["id"], self.now - 3600, text="ancien rendez-vous", actor="test")
+        storage.of(self.db).work.note(
+            lot["id"], "intake", "hold: spec attendue", "human:proprio")
+        self.assertEqual(self.take(dry_run=True), [])
+        self.assertEqual(self.take(), [])
 
     def test_roadmap_uses_same_hold_filter(self):
         lot = self.held()
