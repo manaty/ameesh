@@ -8,6 +8,7 @@ réseau.
 """
 from __future__ import annotations
 
+import argparse
 import importlib.util
 import json
 import pathlib
@@ -129,6 +130,8 @@ class PaquetAutoBanc(unittest.TestCase):
         self.assertEqual([run.label for run in runs], ["unité #1", "contrats"])
         self.assertTrue(runs[0].inconclusive)
         self.assertTrue(runs[1].inconclusive)
+        self.assertFalse(runs[0].real_failure)
+        self.assertFalse(runs[1].real_failure)
         manifest = paquet_auto.build_manifest(
             name="banc", target="main", base_sha=self.base, carrier=99,
             composition=composition,
@@ -155,6 +158,140 @@ class PaquetAutoBanc(unittest.TestCase):
                 log=lambda _line: None)
         self.assertEqual(faulty, [1])
         self.assertFalse(runs[0].inconclusive)
+
+    def test_run_mixte_fail_et_operationalerror_est_rouge(self) -> None:
+        mixed = paquet_auto.TestRun(
+            "unité #1", ["tests.test_unit"], 1,
+            "======================================================================\n"
+            "FAIL: test_regression (tests.test_unit.TestX)\n"
+            "----------------------------------------------------------------------\n"
+            "Traceback (most recent call last):\n"
+            "  ...\n"
+            "AssertionError: wrong result\n"
+            "\n"
+            "======================================================================\n"
+            "ERROR: test_db (tests.test_unit.TestX)\n"
+            "----------------------------------------------------------------------\n"
+            "Traceback (most recent call last):\n"
+            "  ...\n"
+            "psycopg.OperationalError: connection refused\n"
+            "\n"
+            "----------------------------------------------------------------------\n"
+            "Ran 2 tests in 0.1s\n"
+            "\n"
+            "FAILED (failures=1, errors=1)\n",
+            0.1)
+        self.assertTrue(mixed.real_failure)
+        self.assertFalse(mixed.inconclusive)
+        summary = paquet_auto._tests_summary([mixed])
+        self.assertIn("1 échec(s)", summary)
+        self.assertIn("0 non concluant(s)", summary)
+        composition = paquet_auto.Composition(
+            units=[paquet_auto.Unit(1, "0" * 40, "1" * 40)],
+            discarded=[], head="2" * 40)
+        with mock.patch.object(paquet_auto, "unit_test_modules",
+                               return_value=["tests.test_unit"]), \
+                mock.patch.object(paquet_auto, "run_tests",
+                                  side_effect=[mixed]):
+            runs, faulty = paquet_auto.check_local_tests(
+                pathlib.Path(self.tmp.name), composition, timeout=1,
+                log=lambda _line: None)
+        self.assertEqual(faulty, [1])
+        self.assertFalse(runs[0].inconclusive)
+
+    def test_contrat_mixte_est_rouge(self) -> None:
+        composition = paquet_auto.Composition(
+            units=[paquet_auto.Unit(1, "0" * 40, "1" * 40)],
+            discarded=[], head="2" * 40)
+        green = paquet_auto.TestRun(
+            "unité #1", ["tests.test_unit"], 0,
+            "Ran 1 test in 0.1s\n\nOK", 0.1)
+        mixed = paquet_auto.TestRun(
+            "contrats", ["tests.test_contract"], 1,
+            "======================================================================\n"
+            "FAIL: test_regression (tests.test_contract.TestX)\n"
+            "----------------------------------------------------------------------\n"
+            "Traceback (most recent call last):\n"
+            "  ...\n"
+            "AssertionError: wrong result\n"
+            "\n"
+            "======================================================================\n"
+            "ERROR: test_db (tests.test_contract.TestX)\n"
+            "----------------------------------------------------------------------\n"
+            "Traceback (most recent call last):\n"
+            "  ...\n"
+            "psycopg.OperationalError: connection refused\n"
+            "\n"
+            "FAILED (failures=1, errors=1)\n",
+            0.1)
+        with mock.patch.object(paquet_auto, "unit_test_modules",
+                               return_value=["tests.test_unit"]), \
+                mock.patch.object(paquet_auto, "contract_modules",
+                                  return_value=["tests.test_contract"]), \
+                mock.patch.object(paquet_auto, "run_tests",
+                                  side_effect=[green, mixed]):
+            with self.assertRaises(paquet_auto.PaquetAutoError) as caught:
+                paquet_auto.check_local_tests(
+                    pathlib.Path(self.tmp.name), composition, timeout=1,
+                    log=lambda _line: None)
+        self.assertIn("contrat rouges", str(caught.exception))
+
+    def test_non_concluant_poursuit_jusqu_au_gel(self) -> None:
+        composition = paquet_auto.Composition(
+            units=[paquet_auto.Unit(1, "a" * 40, "b" * 40)],
+            discarded=[], head="c" * 40)
+        inconclusive = paquet_auto.TestRun(
+            "unité #1", ["tests.test_x"], 1,
+            "OperationalError: could not connect", 0.1)
+        worktree = pathlib.Path(self.tmp.name) / "wt"
+        (worktree / "scripts").mkdir(parents=True)
+        (worktree / "scripts" / "paquet-compose.py").write_text(
+            "", encoding="utf-8")
+        args = argparse.Namespace(
+            repo=str(self.repo), name="banc", target="main", carrier=99,
+            base=None, local=False, no_packet_record=True, keep_worktree=False,
+            keep_failed_hours=24.0, force=False, tests_timeout=10,
+            pilot="pilote")
+        calls: dict[str, object] = {}
+
+        def record(name, result):
+            def side_effect(*_args, **_kwargs):
+                calls[name] = True
+                return result
+            return side_effect
+
+        with mock.patch.object(paquet_auto, "fresh_base",
+                               return_value="a" * 40), \
+                mock.patch.object(paquet_auto, "prune_stale_worktrees",
+                                  return_value=[]), \
+                mock.patch.object(paquet_auto, "make_worktree",
+                                  return_value=worktree), \
+                mock.patch.object(paquet_auto, "compute_candidates",
+                                  return_value=([paquet_auto.Candidate(1, "a" * 40)],
+                                                {"ready": [1], "waiting": []})), \
+                mock.patch.object(paquet_auto, "compose_candidates",
+                                  return_value=composition), \
+                mock.patch.object(paquet_auto, "run_freeze_checks",
+                                  return_value=(0, "ok", 0.1)), \
+                mock.patch.object(paquet_auto, "check_local_tests",
+                                  return_value=([inconclusive], [])), \
+                mock.patch.object(paquet_auto, "composition_table",
+                                  return_value="## Composition (1 unité, 1 lot)\n"), \
+                mock.patch.object(paquet_auto, "write_manifest",
+                                  return_value="d" * 40), \
+                mock.patch.object(paquet_auto, "run_inclusion",
+                                  return_value=(0, "inclusion ok")), \
+                mock.patch.object(paquet_auto, "push_branch",
+                                  side_effect=record("push", "pushed")), \
+                mock.patch.object(paquet_auto, "ensure_pull_request",
+                                  side_effect=record("pr", (1, "http://pr"))), \
+                mock.patch.object(paquet_auto, "freeze_carrier",
+                                  side_effect=record("freeze", "gel")), \
+                mock.patch.object(paquet_auto, "send_mail",
+                                  side_effect=record("mail", "sent")), \
+                mock.patch.object(paquet_auto, "remove_worktree"):
+            self.assertEqual(paquet_auto.compose_packet(args), 0)
+        self.assertEqual(set(calls), {"push", "pr", "freeze", "mail"})
 
     def test_worktree_d_echec_ancien_est_purge(self) -> None:
         path = pathlib.Path(self.tmp.name) / "paquet-auto-vieux"

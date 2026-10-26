@@ -101,6 +101,11 @@ INCONCLUSIVE_RE = re.compile(
 #: une ligne de résumé unittest
 RAN_RE = re.compile(r"^Ran (\d+) tests? in ", re.MULTILINE)
 OK_RE = re.compile(r"^OK(?: \(skipped=(\d+)\))?", re.MULTILINE)
+FAILED_SUMMARY_RE = re.compile(r"^FAILED \((.*?)\)", re.MULTILINE)
+FAIL_HEADER_RE = re.compile(r"^FAIL: ", re.MULTILINE)
+ERROR_HEADER_RE = re.compile(r"^ERROR: .*$", re.MULTILINE)
+EXCEPTION_LINE_RE = re.compile(r"^[\w.]+(?:Error|Exception):.*$", re.MULTILINE)
+BLOCK_END_RE = re.compile(r"^=+$", re.MULTILINE)
 
 
 class PaquetAutoError(RuntimeError):
@@ -165,12 +170,65 @@ class TestRun:
     def green(self) -> bool:
         return self.returncode == 0
 
+    def _summary(self) -> dict[str, int]:
+        found = FAILED_SUMMARY_RE.search(self.output)
+        if not found:
+            return {}
+        return {name: int(value) for name, value in
+                re.findall(r"(\w+)=(\d+)", found.group(1))}
+
+    @staticmethod
+    def _error_is_environment(block: str) -> bool:
+        """La dernière exception du bloc est-elle une panne d'environnement ?"""
+        lines = EXCEPTION_LINE_RE.findall(block)
+        if lines:
+            return bool(INCONCLUSIVE_RE.search(lines[-1]))
+        return bool(INCONCLUSIVE_RE.search(block))
+
+    @property
+    def real_failure(self) -> bool:
+        """Un test négatif réel, même mêlé à une erreur d'environnement.
+
+        Un `FAIL:` (assertion) est toujours réel. Un `ERROR:` n'est une panne
+        d'environnement que si **sa** dernière exception matche les motifs
+        d'infrastructure ; sinon il est réel. Un run mixte
+        `FAIL + OperationalError` est donc rouge, jamais « non concluant ».
+        """
+        if self.returncode == 0:
+            return False
+        if self.timed_out or self.returncode != 1:
+            return False
+        if FAIL_HEADER_RE.search(self.output):
+            return True
+        headers = list(ERROR_HEADER_RE.finditer(self.output))
+        env_error = False
+        for header in headers:
+            rest = self.output[header.end():]
+            end = BLOCK_END_RE.search(rest)
+            block = rest[:end.start()] if end else rest
+            if self._error_is_environment(block):
+                env_error = True
+            else:
+                return True
+        summary = self._summary()
+        failures = int(summary.get("failures", 0))
+        errors = int(summary.get("errors", 0))
+        if failures:
+            return True
+        if errors and not env_error:
+            return True
+        if not headers and not summary and not INCONCLUSIVE_RE.search(self.output):
+            # rc 1 sans en-tête ni résumé ni motif connu : un rouge, jamais
+            # un non-concluant présumé.
+            return True
+        return False
+
     @property
     def inconclusive(self) -> bool:
         if self.timed_out or self.returncode not in (0, 1):
             return True
-        if self.returncode == 1 and INCONCLUSIVE_RE.search(self.output):
-            return True
+        if self.returncode == 1:
+            return not self.real_failure
         return False
 
     @property
