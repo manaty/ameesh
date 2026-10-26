@@ -249,6 +249,31 @@ class CompositionTest(unittest.TestCase):
         self.assertEqual(comp["source"], "none")
         self.assertEqual(comp["members"], [])
 
+    def test_ancien_manifeste_ne_prime_pas_sur_le_record(self):
+        """Le work packet à la tête exacte fait foi, pas un ancien manifeste."""
+        self.repo.write("reviews/integration-paquet-old.md",
+                        "# Paquet old\n\n## Composition (1 unité, 1 lot)\n\n"
+                        "| unité | lot | source | commit |\n|---|---|---|---|\n"
+                        "| 1 | #900 | `aaaaaaa` | `bbbbbbb` |\n")
+        self.repo.commit("ancien manifeste")
+        self.repo.git("checkout", "-q", "-b", "integration/paquet-h-new")
+        self.repo.write("src/ameesh/new.py", "x = 1\n")
+        head = self.repo.commit("paquet sans manifeste")
+        rows = [{"work_item_id": 101, "unit_sha": "c" * 40,
+                 "source_sha": "d" * 40, "frozen_sha": "", "head_sha": head,
+                 "recorded_ts": 1.0}]
+
+        class Ops:
+            def packet_members(self, **kwargs):
+                return rows
+
+        item = {"id": 1, "branch": "integration/paquet-h-new"}
+        with mock.patch.object(packet_red.storage, "of",
+                               return_value=types.SimpleNamespace(work=Ops())):
+            comp = packet_red.composition(None, item, head, checkout=self.repo.path)
+        self.assertEqual(comp["source"], "record")
+        self.assertEqual([row["lot"] for row in comp["members"]], [101])
+
     def test_enregistrement_seulement_si_la_tete_est_la_meme(self):
         head = "c" * 40
         rows = [{"work_item_id": 101, "unit_sha": "a" * 40,
