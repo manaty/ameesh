@@ -227,14 +227,22 @@ class Hosts(interface.HostResources):
         sampled_ts = float(sample.get("sampled_ts") or 0.0)
         slot_start = math.floor(sampled_ts / SLOT_S) * SLOT_S
         free_mem = _free_mem(reading)
+        # #3631 (relecture) : les relevés d'un exécuteur peuvent omettre
+        # `app_cpu` (premier relevé, part invitée inconnue). psycopg envoie
+        # alors NULL sans type et `CASE WHEN %s IS NULL` / `to_timestamp(%s)`
+        # n'ont pas de contexte pour le déduire (IndeterminateDatatype, $4) :
+        # le relevé — donc la tranche — était perdu. Les mêmes flottants sont
+        # donc typés explicitement, comme `free_mem_min` en bigint.
         self.db.execute(
             """
             INSERT INTO host_resource_slots
                 (host, slot_start, readings, cpu_sum, cpu_n, free_mem_min,
                  first_cpu_at, last_cpu_at)
-            VALUES (%s, to_timestamp(%s), 1,
-                    coalesce(%s, 0), CASE WHEN %s IS NULL THEN 0 ELSE 1 END,
-                    %s, to_timestamp(%s), to_timestamp(%s))
+            VALUES (%s, to_timestamp(%s::float8), 1,
+                    coalesce(%s::float8, 0),
+                    CASE WHEN %s::float8 IS NULL THEN 0 ELSE 1 END,
+                    %s::bigint, to_timestamp(%s::float8),
+                    to_timestamp(%s::float8))
             ON CONFLICT (host, slot_start) DO UPDATE
                SET readings = host_resource_slots.readings + 1,
                    cpu_sum = host_resource_slots.cpu_sum + excluded.cpu_sum,
@@ -276,10 +284,10 @@ class Hosts(interface.HostResources):
     def current(self, host) -> list[dict]:
         # #2851 : les colonnes coûteuses (`ameesh_host_gate_state`) ne sont
         # calculées que pour le dernier relevé de chaque hôte.
-        # #3631 : la liste des hôtes vient d'un parcours d'index (une entrée
-        # par hôte, sans le tas), et le dernier relevé se lit par l'index
-        # (hôte, instant) — plus de DISTINCT ON sur les 335 000 lignes de
-        # l'historique à chaque passe d'alertes.
+        # #3631 : la liste des hôtes est un parcours de l'index (`host`, …)
+        # — les entrées seulement, pas le tas ; le dernier relevé se lit
+        # ensuite par l'index (hôte, instant) — plus de DISTINCT ON sur les
+        # 335 000 lignes de l'historique à chaque passe d'alertes.
         params: list[Any] = []
         where = ""
         if host:
@@ -390,12 +398,13 @@ class Hosts(interface.HostResources):
         #3631 : les tranches de 10 min sont tenues à jour par `record` ; la
         lecture porte sur ~1 000 lignes par hôte (7 jours) au lieu de
         ~135 000 lignes larges de `host_resources`. La sémantique est celle de
-        L159d : `samples` compte les relevés avec `app_cpu`, `span_s` couvre
-        du premier au dernier de ces relevés, `min_free_mem_bytes` est le
-        minimum de `mem_available + guest_mem`, et `app_cpu_p95` est le
-        centile des moyennes par tranche. Une autre largeur de tranche que
-        celle que la table résume retombe sur l'historique (contrat inchangé,
-        appelant hors du pas de mesure).
+        L159d : `samples` compte tous les relevés (comme l'historique),
+        `span_s` couvre du premier au dernier relevé dont `app_cpu` est
+        connu, `min_free_mem_bytes` est le minimum de
+        `mem_available + guest_mem`, et `app_cpu_p95` est le centile des
+        moyennes par tranche. Une autre largeur de tranche que celle que la
+        table résume retombe sur l'historique (contrat inchangé, appelant
+        hors du pas de mesure).
         """
         if abs(float(slot_s) - SLOT_S) > 1e-9:
             return self._lend_basis_history(host, since_s, slot_s, percentile)

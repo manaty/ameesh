@@ -4548,7 +4548,8 @@
     "note_unleased",
     "operator_pause",
     "retire",
-    "restore"
+    "restore",
+    "reachability"
    ],
    "alert_acknowledgements": [
     "acknowledge",
