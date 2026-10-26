@@ -595,7 +595,63 @@ def _applied_in(repo: str, target: str, sha: str) -> bool:
         return False
 
 
-def _not_in_target(repo: str, commits, target: str) -> list:
+def _text_delta(repo: str, before: str, after: str):
+    """Exact added/removed lines, or None for unreadable/non-text changes.
+
+    Compare globally, including trivial lines and whitespace: a rename or a
+    repeated line can only retain an author. Modes, submodules and binaries
+    have no line proof and never grant the exception (#3781).
+    """
+    proc = plan_git._git(repo, "diff", "--no-color", "--no-ext-diff", "--no-textconv",
+                         "--ignore-submodules=none",
+                         "--no-renames", "--unified=0", before, after, "--")
+    if proc.returncode:
+        return None
+    text = proc.stdout.decode("utf-8", "strict")
+    adds, removes = set(), set()
+    hunk = False
+    for line in text.split("\n"):
+        if line.startswith("diff --git "):
+            hunk = False
+        elif line.startswith(("Binary files ", "GIT binary patch", "old mode ",
+                              "new mode ")):
+            return None
+        elif line.startswith(("new file mode ", "deleted file mode ")):
+            if line.rsplit(" ", 1)[-1] not in ("100644", "100755"):
+                return None
+        elif line.startswith("index ") and line.endswith(" 160000"):
+            return None
+        elif line.startswith("@@"):
+            hunk = True
+        elif hunk and line.startswith("+"):
+            adds.add(line[1:])
+        elif hunk and line.startswith("-"):
+            removes.add(line[1:])
+    return adds, removes
+
+
+def _no_reintroduced_patch(repo: str, sha: str, landing) -> bool:
+    """Historical integration + no contribution in the actual landing.
+
+    Historical patch-id alone is never current-content proof. A clean merge
+    of the WHOLE head must add none of the candidate's added lines and remove
+    none of its removed lines. This also covers prior freezes no longer
+    ancestral to head. A revert/rewrite reintroduced by head intersects the
+    landing and keeps its author. No head, clean merge or readable text
+    deltas: keep the author. No inference from `_effective_revert(None)`.
+    """
+    if landing is None:
+        return False
+    try:
+        patch = _text_delta(repo, sha + "^", sha)
+    except Exception:  # noqa: BLE001 - unreadable candidate retains author
+        return False
+    if patch is None or not any(patch):
+        return False
+    return not (patch[0] & landing[0] or patch[1] & landing[1])
+
+
+def _not_in_target(repo: str, commits, target: str, *, head: str = "") -> list:
     """Les commits qui ne sont dans `target` ni par ascendance ni par patch.
 
     #3116 : un commit déjà dans la cible a été relu sous son propre lot ; il
@@ -619,7 +675,9 @@ def _not_in_target(repo: str, commits, target: str) -> list:
     restent dans la liste. La recherche cible est bornée ; dépasser la borne
     ne peut que conserver des auteurs, jamais en retirer sans preuve. Un
     patch historique n'est écarté que si son rejeu laisse la cible inchangée,
-    pour conserver l'auteur après un revert ou une réécriture de la cible."""
+    ou si la fusion propre de `head` prouve qu'aucune de ses lignes ajoutées
+    ou retirées n'est réintroduite (#3781). Sans tête, seule la première
+    preuve s'applique. Le doute conserve l'auteur après revert/réécriture."""
     wanted = [str(commit).strip() for commit in commits or ()
               if str(commit).strip()]
     if not wanted or not target:
@@ -658,6 +716,7 @@ def _not_in_target(repo: str, commits, target: str) -> list:
             return kept
     except Exception:  # noqa: BLE001 - pas de preuve : garder les auteurs
         return kept
+    landing, landing_read = None, False
     equivalent = set()
     for sha in set(kept):
         try:
@@ -666,8 +725,22 @@ def _not_in_target(repo: str, commits, target: str) -> list:
             patches = plan_git._patch_ids(repo, "--no-walk", sha)
         except Exception:  # noqa: BLE001 - ce candidat reste dans le doute
             continue
-        if (patches and patches.keys() <= on_target.keys()
-                and _applied_in(repo, str(target), sha)):
+        if not patches or not patches.keys() <= on_target.keys():
+            continue
+        if _applied_in(repo, str(target), sha):
+            equivalent.add(sha)
+            continue
+        # #3781: compute the actual landing once, only for historical
+        # equivalents whose isolated replay failed. A failed read is not empty.
+        if head and not landing_read:
+            landing_read = True
+            try:
+                tree = _merged_tree(repo, str(target), head)
+                if tree:
+                    landing = _text_delta(repo, str(target), tree)
+            except Exception:  # noqa: BLE001 - uncertainty retains authors
+                pass
+        if _no_reintroduced_patch(repo, sha, landing):
             equivalent.add(sha)
     return [sha for sha in kept if sha not in equivalent]
 
@@ -1887,7 +1960,7 @@ def _prior_reading(db, item: Mapping, freeze: Mapping, commits: Sequence[str],
     review_commits: dict[str, list] = {}
     unknown: list[str] = []
     cache = {} if cache is None else cache
-    commits = _not_in_target(repo, commits, target)
+    commits = _not_in_target(repo, commits, target, head=head)
 
     def record_unknown(value: str) -> None:
         """Un inconnu ne bloque que s'il compte encore pour la tête (#3116),
@@ -2395,7 +2468,7 @@ def _carried_from_previous(db, item: Mapping, milestone: Optional[Mapping],
             continue
         earlier = _commits_between(repo, start, sha)
         if earlier is not None:
-            earlier = _not_in_target(repo, earlier, target_sha)
+            earlier = _not_in_target(repo, earlier, target_sha, head=head_sha)
             # #3544 : l'exclusion du report se trace comme celle de la plage
             # courante, avec le gel antérieur d'où vient la plage.
             from . import provenance_scope
@@ -2616,7 +2689,8 @@ def reading(db, item: Mapping, milestone: Optional[Mapping],
     item = dict(item or {})
     packet = bool(packet_composer(item))
     target_sha = target_commit(repo, target) or target_commit(repo, base)
-    commits = _not_in_target(repo, commits, target_sha)
+    commits = _not_in_target(repo, commits, target_sha,
+                             head=str(head or (milestone or {}).get("sha") or ""))
     for admitted in admitted_heads:
         commits = _not_in_target(repo, commits, admitted["head"]
                                  if isinstance(admitted, dict) else admitted)
