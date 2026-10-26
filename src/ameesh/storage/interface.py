@@ -1754,7 +1754,9 @@ class WorkItems(Domain):
         the lot and checked live before allocation/replay, in this transaction.
         `withdrawn_after` (#3532): an epoch instant; refuses (None) when a
         typed `removed` receipt of the lot was written at or after it, read
-        under the lot row lock that `queue_remove` takes first."""
+        under the lot row lock that `queue_remove` takes first. #3550: the
+        receipt only binds the entry it removed — `target` and `frozen_id`
+        (the expected freeze) scope it."""
 
     @abc.abstractmethod
     def queue_update(self, item_id: int, *, state: str | None = None,
@@ -1780,13 +1782,20 @@ class WorkItems(Domain):
     def queue_remove(self, item_id: int, *, note: str, actor: str) -> bool:
         """L160e (0058): takes the lot out of the queue, with a journal line.
         Locks the lot before its queue row and records a typed `removed`
-        receipt for the deleted row's freeze in the same transaction.
-        A free-text journal note cannot write this receipt."""
+        receipt for the deleted row's freeze and target in the same
+        transaction. A free-text journal note cannot write this receipt."""
 
     @abc.abstractmethod
-    def queue_withdrawn_since(self, item_id: int, since_ts: float) -> float | None:
+    def queue_withdrawn_since(self, item_id: int, since_ts: float, *,
+                              target: str | None = None,
+                              frozen_id: int | None = None) -> float | None:
         """#3532: the epoch instant of the lot's latest typed `removed`
-        receipt written at or after `since_ts`, None without one."""
+        receipt written at or after `since_ts`, None without one. #3550:
+        `target` and `frozen_id` restrict the read to the queue entry the
+        caller is about to replace; a removal of another target or of an
+        older freeze is not a take-out of that entry. Legacy receipts without
+        a target still match (they cannot be told apart); a receipt without a
+        freeze never matches a named freeze."""
 
     @abc.abstractmethod
     def land_lock(self, key: str, owner: str, ttl_s: float, *,

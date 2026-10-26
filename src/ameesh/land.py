@@ -161,9 +161,19 @@ def _fire_guard(landing, *, gh=None) -> dict | None:
 
     #2306 : une lecture passagère des checks (5xx, délai) ne prouve pas un
     manque ; la ligne reste en file et repart au passage suivant, au lieu
-    d'éjecter le lot."""
+    d'éjecter le lot.
+
+    #3550 : la ligne de file lue par le passage est un instantané ; une
+    sortie de file survenue depuis retire l'autorisation de fusionner. Le
+    dernier geste relit l'identité de l'entrée (génération, cible, gel) et
+    s'arrête si elle a disparu ou changé."""
     from . import fire, packet_guard
     row = landing.row or {}
+    if getattr(landing, "entry", None) is not None and landing.queue_gone():
+        landing.release = True
+        return {"lot": landing.lot, "result": "taken-out", "detail": (
+            "the queue entry of lot #%d was removed or replaced before the merge: "
+            "nothing merged" % landing.lot)}
     try:
         packet_guard.check_merge(landing.db, landing.lot, row.get("branch") or "",
                                  row.get("target") or "", row.get("frozen_sha") or "")
@@ -635,6 +645,15 @@ class _Landing:
         self.locks.pop(self.key, None)
         return False
 
+    def queue_gone(self) -> bool:
+        """#3550: the queue entry this landing follows is no longer there, or
+        has been replaced (another generation, target or freeze). The stale
+        snapshot from the pass never authorizes a merge."""
+        entry = next((r for r in self.ops.queue()
+                      if int(r["work_item_id"]) == self.lot), None)
+        return entry is None or tuple(entry.get(k) for k in (
+            "generation", "target", "frozen_id", "frozen_sha")) != self.entry
+
     def fence_hold(self) -> None:
         """L165 (EP4) : renouvelle le bail élu juste avant l'effet externe.
 
@@ -778,7 +797,9 @@ class _Landing:
 def land_head(cfg, db, project, row: dict, *, owner: str, replayer=None, locks=None,
               gh=_gh, parts=None) -> dict:
     """Lands (or follows the landing of) `row`, the head of its queue.
-    Returns `{lot, result: landed|landing|retry|ejected|busy|error, …}`.
+    Returns `{lot, result: landed|landing|retry|ejected|taken-out|busy|error, …}`.
+    `taken-out` (#3550): the queue entry was removed or replaced since the
+    pass read it; nothing is merged.
 
     L1651 (#1650) : `parts` porte la requalification d'un lot dont la CI
     individuelle est remplacée par celle d'un paquet (§12, #1467) — les
@@ -806,6 +827,16 @@ def land_head(cfg, db, project, row: dict, *, owner: str, replayer=None, locks=N
     projects = tuple(radar.settings_of(cfg).projects.values())
     key = lock_key(project, row["target"])
     ops = storage.of(db).work
+    # #3550: `row` is the pass's snapshot, not the queue's current state. A
+    # take-out (or a replacement entry) before this landing means there is no
+    # work left to land: stop before taking the lease or reading the forge.
+    identity = ("generation", "target", "frozen_id", "frozen_sha")
+    current = next((r for r in ops.queue() if int(r["work_item_id"]) == lot), None)
+    if current is None or tuple(current.get(k) for k in identity) != \
+            tuple(row.get(k) for k in identity):
+        return {"lot": lot, "result": "taken-out", "detail": (
+            "the queue entry of lot #%d was removed or replaced before its landing: "
+            "nothing merged" % lot)}
     epoch = ops.land_lock(key, owner, LOCK_TTL_S, epoch=locks.get(key)) \
         if key in locks else None
     if epoch is None:

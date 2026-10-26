@@ -2381,7 +2381,12 @@ def _queue(db, row: dict, marks: list, fire: dict, *, project, repo: str | None,
     après ce feu est définitive pour lui : le repli ne ré-entre pas le lot
     (`taken-out`). Sans cela, chaque passage défaisait la sortie, et le lot
     atterrissait dès que la cible se libérait. Un nouveau feu ou un
-    `ameesh work queue add` explicite le remet en file."""
+    `ameesh work queue add` explicite le remet en file.
+
+    #3550 : cette sortie ne vaut que pour l'entrée qu'elle a retirée — sa
+    cible et son gel. Une sortie d'une autre cible, ou d'un gel plus ancien,
+    ne retient pas le repli du feu courant (lecture `queue_withdrawn_since`
+    portée par `target` et `frozen_id`)."""
     lot = int(row["id"])
     if not repo:
         out.update(result="no-repository", detail=(
@@ -2401,8 +2406,11 @@ def _queue(db, row: dict, marks: list, fire: dict, *, project, repo: str | None,
                    % (entry.get("target"), entry.get("reason") or "?"))
         return out
     granted = float(fire.get("at_ts") or 0.0)
+    freeze = freeze_of(marks)
+    frozen_id = freeze.get("id") if freeze else None
     try:
-        removed = storage.of(db).work.queue_withdrawn_since(lot, granted)
+        removed = storage.of(db).work.queue_withdrawn_since(
+            lot, granted, target=target or None, frozen_id=frozen_id)
     except Exception as exc:  # noqa: BLE001 - reçus illisibles : on n'entre pas
         out.update(result="not-ready", detail=(
             "cannot read the queue take-outs of lot #%d (%s: %s): not queued"
@@ -2423,7 +2431,17 @@ def _queue(db, row: dict, marks: list, fire: dict, *, project, repo: str | None,
                                     project=project, clone=clone, cfg=cfg,
                                     withdrawn_after=granted)
     except merge_queue.QueueWithdrawn:
-        removed = storage.of(db).work.queue_withdrawn_since(lot, granted)
+        # #3550: a failed re-read here is a transient refusal (not-ready), not
+        # an error that escapes the fire pass. The read is scoped like the
+        # first one: the take-out must name this target and this freeze.
+        try:
+            removed = storage.of(db).work.queue_withdrawn_since(
+                lot, granted, target=target or None, frozen_id=frozen_id)
+        except Exception as exc:  # noqa: BLE001 - reçus illisibles : on n'entre pas
+            out.update(result="not-ready", detail=(
+                "cannot read the queue take-outs of lot #%d (%s: %s): not queued"
+                % (lot, type(exc).__name__, str(exc)[:120])))
+            return out
         return _taken_out(out, lot, removed or granted, granted)
     except merge_queue.QueueError as exc:
         out.update(result="not-ready", detail=str(exc))
