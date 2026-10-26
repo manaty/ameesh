@@ -2001,7 +2001,11 @@ def cmd_probe(cfg: Config) -> int:
     try:
         db = db_mod.connect(cfg)
     except db_mod.Unavailable as exc:
-        print("probe: KO — database unreachable (%s)" % exc)
+        # #3745 : le refus d'un pgbouncer n'est pas une migration manquante
+        hint = ("; a pgbouncer refuses an ameesh session setting: add it to its "
+                "track_extra_parameters and restart it (deploy/pgbouncer-host.md)"
+                if "unsupported startup parameter" in str(exc) else "")
+        print("probe: KO — database unreachable (%s)%s" % (exc, hint))
         return 1
     try:
         db_mod.require_schema(db)
@@ -2194,6 +2198,17 @@ def cmd_doctor(cfg: Config, notify_test: bool, probe: bool = False,
             print(line)
     except Exception as exc:  # a reading never breaks the doctor
         print("network    : not checked (%s)" % (" ".join(str(exc).split())[:120],))
+    # #3745 : le pgbouncer local accepte-t-il les réglages `-c` qu'ameesh
+    # envoie au démarrage de session ? Lu sur sa console avant la connexion
+    # ordinaire, que son refus ferait échouer (`jit` de #3503 sur pc-smichea).
+    from . import pgbouncer_local
+    pool_ok = True
+    try:
+        pool_ok, pool_lines = pgbouncer_local.startup_lines(cfg)
+    except Exception as exc:  # a reading never breaks the doctor
+        pool_lines = ["startup options not checked (%s)" % (" ".join(str(exc).split())[:120],)]
+    for line in pool_lines:
+        print("pgbouncer  : %s" % line)
     started = time.monotonic()
     try:
         db = db_mod.connect(cfg)
@@ -2287,6 +2302,10 @@ def cmd_doctor(cfg: Config, notify_test: bool, probe: bool = False,
     except db_mod.DbError:
         pass
     verdict = 1 if nexlink_ko else 0
+    # #3745 : un réglage de session que le pool local refuserait (ligne
+    # déjà imprimée) casse chaque nouvelle session d'ameesh de l'hôte.
+    if not pool_ok:
+        verdict = 1
     # #3503 : la session d'ameesh doit avoir reçu `-c jit=off` ; sinon le
     # correctif ne s'applique pas à ce processus (ligne déjà imprimée).
     if jit_ko:

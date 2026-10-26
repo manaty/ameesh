@@ -26,9 +26,19 @@ warning is routed and pushed even then.
 accepts the socket and stops answering used to hang `ameesh alerts` (and
 `SIGINT` with it) after every other alert family had been read; it now raises
 `Unavailable` and becomes a `pgbouncer_console_unreadable` line.
+
+#3745: PgBouncer refuses a session whose startup `options` carry a `-c`
+setting it does not track ("unsupported startup parameter in options"). The
+`-c jit=off` of #3503 was refused that way on pc-smichea, whose pool predates
+it. `startup_lines` compares the settings an ameesh session really sends with
+the *running* pool's tracked set (`SHOW CONFIG`, not the file:
+`track_extra_parameters` is not reloaded by a HUP), so the next setting added
+to `db.startup_options` is named by `doctor` instead of failing every runner.
 """
 from __future__ import annotations
 
+import os
+import re
 import threading
 
 from pathlib import Path
@@ -50,6 +60,14 @@ PROBE_TIMEOUT_S = 5.0
 FAMILY = "pgbouncer_console"
 #: the raised message keeps one bounded line: a console error may be long
 _ERROR_MAX = 200
+#: #3745: the parameters PgBouncer 1.26 always tracks (`init_var_lookup`,
+#: src/varcache.c), lower-cased: its lookup ignores case.
+TRACKED_BY_DEFAULT = frozenset((
+    'datestyle', 'client_encoding', 'timezone', 'standard_conforming_strings',
+    'application_name', 'default_transaction_read_only', 'intervalstyle',
+    'search_path', 'scram_iterations', 'session_authorization'))
+#: a `-c name=value` or `--name=value` setting of a startup `options` string
+_OPTION = re.compile(r'(?:^|\s)(?:-c\s*|--)([^\s=]+)=')
 
 
 def _one_line(value) -> str:
@@ -132,6 +150,9 @@ def _reading(pools, lists, config) -> dict:
         # (`SHOW CONFIG`), the only honest denominator here.
         'clients_used': _number(lists.get('used_clients')),
         'clients_max': _number(config.get('max_client_conn')),
+        # #3745: the running values, which a HUP does not change
+        'track_extra_parameters': config.get('track_extra_parameters'),
+        'ignore_startup_parameters': config.get('ignore_startup_parameters'),
     }
 
 
@@ -253,6 +274,71 @@ def probe(cfg) -> list[dict]:
                  servers_idle=reading['servers_idle'],
                  clients_used=reading['clients_used'], clients_max=reading['clients_max'],
                  detail=line(reading))]
+
+
+def option_names(options: str) -> list[str]:
+    """The setting names of a startup `options` string, in order."""
+    return _OPTION.findall(options or '')
+
+
+def _words(value) -> set[str]:
+    return {word.strip().lower() for word in str(value or '').split(',') if word.strip()}
+
+
+def session_options(cfg) -> str:
+    """The startup `options` an ameesh session sends, as `db` builds them: the
+    DSN's own `options` (else PGOPTIONS), then `db.startup_options`."""
+    import psycopg
+    from .db import startup_options
+    try:
+        existing = psycopg.conninfo.conninfo_to_dict(getattr(cfg, 'dsn', '') or '').get('options')
+    except Exception:
+        existing = None
+    if existing is None:
+        existing = os.environ.get('PGOPTIONS', '')
+    return startup_options(cfg, str(existing or ''))
+
+
+def startup_problems(options: str, reading: dict) -> list[str]:
+    """The settings of `options` this pool would refuse, or accept without
+    applying them (`ignore_startup_parameters`): both break an ameesh session."""
+    tracked = TRACKED_BY_DEFAULT | _words(reading.get('track_extra_parameters'))
+    ignored = _words(reading.get('ignore_startup_parameters'))
+    problems = []
+    for name in option_names(options):
+        key = name.lower()
+        if key in tracked:
+            continue
+        if key in ignored or 'options' in ignored:
+            problems.append('%s ignored (never applied to the session)' % name)
+        else:
+            problems.append('%s refused (unsupported startup parameter)' % name)
+    return problems
+
+
+def startup_lines(cfg) -> tuple[bool, list[str]]:
+    """`doctor` (#3745): does the local pool accept the startup settings of an
+    ameesh session? `(False, lines)` names what it would refuse.
+
+    Read from `cfg` alone, before any ordinary connection: when the pool
+    refuses ameesh, that connection fails and this line is the diagnosis. No
+    local pool, or a DSN that does not use it: nothing to check. An unreadable
+    console is reported without a verdict (the pool alerts cover it)."""
+    dsn = admin_dsn(cfg)
+    if dsn is None:
+        return True, []
+    from .db import Unavailable
+    options = session_options(cfg)
+    try:
+        reading = _read_bounded(dsn)
+    except Unavailable as exc:
+        return True, ['startup options not checked (%s)' % _one_line(exc)]
+    problems = startup_problems(options, reading)
+    if not problems:
+        return True, ['startup options accepted (%s)' % (', '.join(option_names(options)) or 'none')]
+    return False, ['KO — %s: add to track_extra_parameters in ~/%s, then RESTART the pool '
+                   '(a HUP does not apply it; deploy/pgbouncer-host.md)'
+                   % ('; '.join(problems), CONFIG_PATH)]
 
 
 def alerts(db) -> list[dict]:
