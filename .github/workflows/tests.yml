@@ -681,8 +681,11 @@ jobs:
           python-version: "3.12"
       # ManifestesTest (test_cluster, liste « toujours ») lit deploy/k8s avec
       # PyYAML : sans lui il est sauté, donc jamais vérifié en CI (#1511).
-      - name: pyyaml (manifestes k8s)
-        run: python -m pip install -q 'pyyaml>=6'
+      # #3616 : test_3536_notify_nexlink exige l'extra `crypto` ; le job psql
+      # n'a pas de .venv-ci, et sans cryptography la part 2/16 rougit (run
+      # 40235900946). Les parts psycopg l'installent déjà dans leur venv.
+      - name: dépendances des parts psql (pyyaml, crypto)
+        run: python -m pip install -q 'pyyaml>=6' 'cryptography>=41'
       - *base
       - *git
       - *plan
