@@ -101,14 +101,16 @@ class FreezeDeadPauseTest(_ActivationFixture, PgTestCase):
                          ["r2", "r3"])
 
     def test_un_agent_dead_seul_dans_sa_famille_fait_attendre(self):
-        # Aucun autre claude : le siège n'est pas déposé chez un mort, l'attente
-        # est explicite et le pilote reçoit la notification de capacité.
+        # Aucun autre claude : le siège n'est pas déposé chez un mort ; la
+        # famille codex disponible est pourvue et l'attente du second avis est
+        # explicite, avec la notification de capacité (#3596).
         self._dead("r1")
         _, out = self.freeze()
         self.assertEqual(out["state"], rd.WAITING, out)
-        self.assertEqual(out["reviewers"], [])
+        self.assertEqual([r["name"] for r in out["reviewers"]], ["r2"])
         self.assertEqual(out["missing"], 1)
-        self.assertEqual([mail["recipient"] for mail in self.mailbox()], ["pilot"])
+        self.assertEqual([mail["recipient"] for mail in self.mailbox()],
+                         ["pilot", "r2"])
 
     def test_un_agent_ordinaire_en_pause_operateur_n_est_pas_designe(self):
         # pilot-resident-3389 (gel #18160) : ordinaire, drainé, statut resté
