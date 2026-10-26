@@ -3726,6 +3726,10 @@ def note(db: Db, item_id: int, text: str, *, actor: str = "", once: bool = False
     if not (text or "").strip():
         raise WorkError("empty note")
     text = text.strip()
+    if text == "-":
+        # #3683 : « - » est le marqueur de l'entrée standard, jamais une note.
+        raise WorkError("note refused: `-` alone is not a note; write the text, "
+                        "or pass `-` to ameesh work note to read it on standard input")
     from . import review_floor
     if review_floor.is_floor_note(text):
         # #3183 : la ligne du plancher d'avis est lue par la porte ; seule la

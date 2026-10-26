@@ -59,6 +59,24 @@ class WorkDependencies(abc.ABC):
         """
 
     @abc.abstractmethod
+    def landings_on_vehicle(self, vehicle_id: int) -> list[dict]:
+        """#3641: declarations pinned to this vehicle, one row per unit.
+
+        Read by the freeze path to warn the declarants when a re-freeze makes
+        their declaration stale: `work_item_id`, `vehicle_id`, `pinned_sha`,
+        `until_on`, `created_by`.
+        """
+
+    @abc.abstractmethod
+    def landing_matches(self, item_id: int, vehicle_id: int, pinned_sha: str, *,
+                        frozen_sha: str) -> bool:
+        """#3641: is the declaration still the one pinned at `frozen_sha`?
+
+        Read under the same lock, before warning the declarant: a declaration
+        renewed since, or a newer freeze, gets no warning for a delayed one.
+        """
+
+    @abc.abstractmethod
     def release_unassigned(self, item_ids: Sequence[int], *, actor: str) -> list[int]:
         """Return still-unassigned blocked candidates to intake and journal them.
 

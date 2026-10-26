@@ -14,6 +14,15 @@ complétion (version antérieure) ; un plancher non couvert ne retire pas les
 sièges déjà désignés ; un siège retiré à la main **avant** la hausse n'est ni
 réexaminé (stale) ni réinscrit par la complétion (B/P1 dev4, B/P2 cx1) ; un
 retrait **pendant** la passe refuse toujours, sans écrire.
+
+#3617 : une attente partielle pourvoit les familles disponibles (marque
+`waiting`, demande aux seuls nouveaux sièges, sans avis de capacité) ; la
+reprise complète le siège manquant sans réinscrire un siège retiré.
+
+#3661 : un siège retiré d'une attente partielle n'est plus lu dans la marque
+`waiting` effective : ni compté, ni réécrit dans la colonne, ni épargné de
+courrier au profit d'un nouveau siège, sur aucun chemin (y compris une
+reprise sans entrées lisibles).
 """
 from __future__ import annotations
 
@@ -218,7 +227,10 @@ class FloorCompletionTest(base._ActivationFixture, PgTestCase):
         self.assertEqual(len(self.mailbox()), before_mail)
         self.assertEqual(len(self.marks()), before_marks)
 
-    def test_a_seat_removed_before_the_floor_leaves_a_journaled_wait(self):
+    def test_a_seat_removed_before_the_floor_provides_the_available_family(self):
+        # #3617 : r1 retiré, une seule famille disponible (r2 codex) pour un
+        # plancher à deux avis. L'attente est partielle : r2 est pourvu tout
+        # de suite (demande, marque `waiting`, colonne), sans avis de capacité.
         _, out = self.freeze()
         self.assertEqual([r["name"] for r in out["reviewers"]], ["r1"], out)
         self.remove("r1")
@@ -228,13 +240,123 @@ class FloorCompletionTest(base._ActivationFixture, PgTestCase):
 
         completion = result["designation"]
         self.assertEqual(completion["state"], rd.WAITING, completion)
+        self.assertTrue(completion.get("completed"), completion)
+        self.assertEqual(completion.get("added"), ["r2"], completion)
+        self.assertEqual([r["name"] for r in completion["reviewers"]], ["r2"])
+        self.assertEqual(completion["missing"], 1, completion)
+        self.assertEqual(designated(work.get(self.db, self.lot)), ["r2"])
+        sent = self.mailbox()[before_mail:]
+        self.assertEqual([(m["recipient"], m["kind"]) for m in sent],
+                         [("r2", "request")])
+        self.assertEqual(len(self.marks()), before_marks + 1)
+        mark = pg.designation_of(self.marks()[-1])
+        self.assertEqual(mark["state"], rd.WAITING)
+        self.assertEqual(mark["required"], 2)
+        self.assertEqual([r["name"] for r in mark["reviewers"]], ["r2"])
+        floor_notes = self.notes(act.FLOOR_PREFIX)
+        self.assertEqual(len(floor_notes), 1, floor_notes)
+        self.assertIn("partially completed", floor_notes[0])
+        self.assertIn("r2", floor_notes[0])
+
+        # le rejeu ne renvoie rien et ne réinscrit pas r1 (claude, disponible)
+        before_mail, before_marks = len(self.mailbox()), len(self.marks())
+        again = act.reviewers(self.cfg, self.db, self.lot, apply=True)["applied"]
+        self.assertEqual(again["state"], rd.WAITING, again)
+        self.assertEqual(len(self.mailbox()), before_mail)
+        self.assertEqual(len(self.marks()), before_marks)
+        self.assertEqual(designated(work.get(self.db, self.lot)), ["r2"])
+        self.assertEqual(len(self.notes(act.FLOOR_PREFIX)), 1)
+
+        # la capacité revient (r3 claude) : la reprise pourvoit le siège
+        # manquant, garde r2 sans second courrier et ne reprend jamais r1
+        self._third_family()
+        before_mail = len(self.mailbox())
+        done = act.reviewers(self.cfg, self.db, self.lot, apply=True)["applied"]
+        self.assertEqual(done["state"], rd.DESIGNATED, done)
+        self.assertEqual([r["name"] for r in done["reviewers"]], ["r2", "r3"])
+        self.assertEqual([m["recipient"] for m in self.mailbox()[before_mail:]],
+                         ["r3"])
+        self.assertEqual(designated(work.get(self.db, self.lot)), ["r2", "r3"])
+
+    def _partial_wait_then_remove_r2(self):
+        """r1 retiré, plancher 2 : attente partielle [r2], puis r2 retiré."""
+        _, out = self.freeze()
+        self.assertEqual([r["name"] for r in out["reviewers"]], ["r1"], out)
+        self.remove("r1")
+        completion = self.floor(2)["designation"]
+        self.assertEqual(completion["state"], rd.WAITING, completion)
+        self.assertEqual([r["name"] for r in completion["reviewers"]], ["r2"])
+        self.remove("r2")
+
+    def test_a_seat_removed_from_a_partial_wait_is_not_replayed(self):
+        # #3661 (B dev3) : la marque `waiting` effective nomme encore r2 ;
+        # la reprise ne le compte plus comme siège ni ne le réécrit.
+        self._partial_wait_then_remove_r2()
+        before_mail, before_marks = len(self.mailbox()), len(self.marks())
+
+        again = act.reviewers(self.cfg, self.db, self.lot, apply=True)["applied"]
+
+        self.assertEqual(again["state"], rd.WAITING, again)
+        self.assertEqual(again["reviewers"], [], again)
+        self.assertEqual(again["missing"], 2, again)
+        self.assertEqual(designated(work.get(self.db, self.lot)), [])
+        self.assertEqual(len(self.mailbox()), before_mail)
+        self.assertEqual(len(self.marks()), before_marks)
+
+    def test_a_new_family_after_a_removed_partial_seat_is_asked_alone(self):
+        # #3661 (B dev3) : r3 (claude) arrive après le retrait de r2 ; r3 est
+        # demandé, r2 n'est ni compté ni réinscrit, la marque ne le nomme plus.
+        self._partial_wait_then_remove_r2()
+        self._third_family()
+        before_mail, before_marks = len(self.mailbox()), len(self.marks())
+
+        again = act.reviewers(self.cfg, self.db, self.lot, apply=True)["applied"]
+
+        self.assertEqual(again["state"], rd.WAITING, again)
+        self.assertEqual([r["name"] for r in again["reviewers"]], ["r3"], again)
+        self.assertEqual(again["missing"], 1, again)
+        self.assertEqual(designated(work.get(self.db, self.lot)), ["r3"])
+        self.assertEqual([(m["recipient"], m["kind"])
+                          for m in self.mailbox()[before_mail:]],
+                         [("r3", "request")])
+        self.assertEqual(len(self.marks()), before_marks + 1)
+        mark = pg.designation_of(self.marks()[-1])
+        self.assertEqual([r["name"] for r in mark["reviewers"]], ["r3"])
+
+    def test_a_removed_partial_seat_stays_out_on_an_unavailable_retry(self):
+        # #3661 (B dev3, 2e tour) : un --apply qui ne peut pas lire ses
+        # entrées (cible non rafraîchie) ne réécrit pas r2 depuis la marque
+        # `waiting` effective.
+        self._partial_wait_then_remove_r2()
+
+        with mock.patch.object(act, "prepare", return_value=act.Unavailable(
+                "simulated target refresh failure")):
+            again = act.reviewers(self.cfg, self.db, self.lot, apply=True)["applied"]
+
+        self.assertEqual(again["state"], "unavailable", again)
+        self.assertEqual(designated(work.get(self.db, self.lot)), [])
+
+    def test_a_floor_with_no_available_family_leaves_a_journaled_wait(self):
+        # r1 retiré et r2 mort : aucune famille ne peut être pourvue, rien
+        # n'est écrit ni envoyé (attente journalisée, une par gel et plancher)
+        _, out = self.freeze()
+        self.assertEqual([r["name"] for r in out["reviewers"]], ["r1"], out)
+        self.remove("r1")
+        self.db.execute("UPDATE agent_registry SET status = 'dead'"
+                        " WHERE name = 'r2'")
+        before_mail, before_marks = len(self.mailbox()), len(self.marks())
+
+        result = self.floor(2)
+
+        completion = result["designation"]
+        self.assertEqual(completion["state"], rd.WAITING, completion)
+        self.assertFalse(completion.get("completed"), completion)
         self.assertEqual(designated(work.get(self.db, self.lot)), [])
         self.assertEqual(len(self.mailbox()), before_mail)
         self.assertEqual(len(self.marks()), before_marks)
         self.assertTrue(self.notes(act.FLOOR_PREFIX))
         before_notes = len(self.notes(act.FLOOR_PREFIX))
 
-        # le rejeu ne renote pas la même attente (une par gel et par plancher)
         again = act.reviewers(self.cfg, self.db, self.lot, apply=True)["applied"]
         self.assertEqual(again["state"], rd.WAITING, again)
         self.assertEqual(len(self.mailbox()), before_mail)

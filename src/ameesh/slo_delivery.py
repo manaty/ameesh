@@ -17,6 +17,14 @@ def _packet_delivery(db, row: dict, marks) -> bool:
     this proof needs neither a readable clone, a declared target, nor a fresh
     `origin/<target>` (#2309 has no `branch_target`).
 
+    #3634: the composition row also names the carrier head it was recorded at
+    (`head_sha`). `record_packet` replaces the whole membership on every
+    record, so a recomposition that was never recorded leaves rows of units the
+    merged packet no longer carries. Such a row only proves delivery when its
+    head is the carrier's frozen head — the head the merge covered — or the
+    `merged` milestone itself. A head that moved since the record is a stale
+    composition: not delivery evidence, the alert stays active.
+
     The proof is stale if the unit's effective freeze moved after the
     composition, or if an observed branch head carries work absent from it.
     A carrier closed for another reason is not delivery evidence. Only the
@@ -39,6 +47,19 @@ def _packet_delivery(db, row: dict, marks) -> bool:
         return False
     for member in members:
         if str(member.get("package_state") or "") not in _DELIVERED_CARRIERS:
+            continue
+        # #3634: only the composition of the merged head is delivery evidence.
+        # The carrier's last freeze is authoritative (a re-freeze after the
+        # composition moves it); a `merged` milestone that names the exact head
+        # also carries it (fast-forward/ancestor closure). Without either, a
+        # stale membership row must not silence the alert.
+        recorded = plan_git.commit_id(member.get("head_sha"))
+        if not recorded:
+            continue
+        frozen_head = plan_git.commit_id(member.get("package_frozen_sha"))
+        merged_head = plan_git.commit_id(member.get("package_merged_sha"))
+        if not ((frozen_head and plan_git.same_commit(recorded, frozen_head))
+                or (merged_head and plan_git.same_commit(recorded, merged_head))):
             continue
         # The composed head is the exact content the vehicle merged. The
         # recorded freeze can move after the composition (`record` re-reads

@@ -34,6 +34,12 @@ mécanique, ce que l'outillage exécute sans agent :
   #122895) : la branche de prod d'un projet, où un lot de porte de production
   (`prod_gate`) doit être présent pour se fermer. Absente : un tel lot n'est
   jamais fermé par une fusion constatée, aucune branche n'est supposée.
+- `accounts.pace_multipliers` et `accounts.underused_loss` (#3647, canon §11,
+  décision owner #141793 a) : le multiplicateur de rythme de chaque compte de
+  forfait, par harnais et nom de compte (absent : ×1), et la perte prévue au
+  reset au-delà de laquelle `ameesh accounts` relève lui-même le rythme d'une
+  fenêtre (bloc optionnel ; absent : `None`, le réglage local de l'hôte reste
+  appliqué et signalé).
 
 Les classes sensibles et le nombre d'avis par chemin ne sont pas répétés : ils
 viennent de `federation.yaml` (`review_policies.risk_classes` et
@@ -49,6 +55,7 @@ immuable qui porte le commit audité.
 from __future__ import annotations
 
 import functools
+import math
 import re
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
@@ -81,7 +88,7 @@ _LABEL = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 _SHA = re.compile(r"^([0-9a-f]{40}|[0-9a-f]{64})$")
 
 _DOCUMENT_KEYS = ("schema", "timezone", "cutoffs", "packets", "build", "ci", "reviews",
-                  "merge", "prevalidation", "backlog", "staging", "projects")
+                  "merge", "prevalidation", "backlog", "staging", "accounts", "projects")
 _OVERRIDE_KEYS = ("timezone", "cutoffs", "packets", "build", "ci", "production")
 _PRODUCTION_KEYS = ("branch",)
 #: un nom de branche Git simple (`main`, `release/prod`) : ni `..`, ni `@{`,
@@ -101,6 +108,8 @@ _BACKLOG_KEYS = ("lot_min_value",)
 #: #3291 : clés du bloc optionnel `staging` (déploiement hors créneau)
 _STAGING_KEYS = ("waiting_lots_min", "before_cutoff_seconds",
                  "before_packet_seconds")
+#: #3647 : clés du bloc optionnel `accounts` (rythme des comptes de forfait)
+_ACCOUNTS_KEYS = ("pace_multipliers", "underused_loss")
 #: bornes du score de valeur d'un élément de backlog (`backlog.add`)
 _VALUE_SCORE = (1, 100)
 
@@ -175,6 +184,33 @@ class Staging:
 
 
 @dataclass(frozen=True)
+class AccountsPace:
+    """#3647 : le rythme des comptes de forfait, compilé du canon (§11).
+
+    `multipliers` : `((harnais, compte, multiplicateur), …)`, un compte absent
+    vaut ×1 ; `underused_loss` : la perte prévue au reset (part du quota de la
+    fenêtre) au-delà de laquelle le rythme de la fenêtre est relevé, `None` =
+    aucun relèvement déclaré."""
+
+    multipliers: tuple[tuple[str, str, float], ...] = ()
+    underused_loss: float | None = None
+
+    def multiplier(self, harness: str, account: str) -> float:
+        for item_harness, item_account, value in self.multipliers:
+            if (item_harness, item_account) == (harness, account):
+                return value
+        return 1.0
+
+    def to_dict(self) -> dict:
+        out: dict = {"pace_multipliers": {}}
+        for harness, account, value in self.multipliers:
+            out["pace_multipliers"].setdefault(harness, {})[account] = value
+        if self.underused_loss is not None:
+            out["underused_loss"] = self.underused_loss
+        return out
+
+
+@dataclass(frozen=True)
 class Document:
     """Le document global compilé et validé, sans politique de revue."""
 
@@ -203,6 +239,8 @@ class Document:
     #: #2584 : seuil de lot d'un défaut non bloquant ; None = bloc absent
     backlog_lot_min_value: int | None = None
     staging: Staging | None = None
+    #: #3647 : rythme des comptes de forfait ; None = bloc absent
+    accounts: AccountsPace | None = None
 
     def override(self, project: str) -> ProjectOverride | None:
         for item in self.overrides:
@@ -249,6 +287,8 @@ class Document:
             payload["backlog"] = {"lot_min_value": self.backlog_lot_min_value}
         if self.staging is not None:
             payload["staging"] = self.staging.to_dict()
+        if self.accounts is not None:
+            payload["accounts"] = self.accounts.to_dict()
         return payload
 
 
@@ -743,6 +783,48 @@ def _staging(value, where: str) -> Staging:
                      for key in _STAGING_KEYS))
 
 
+def _name(value, where: str) -> str:
+    if not isinstance(value, str) or not value.strip() or value != value.strip():
+        raise MechanicsError("%s: a non-empty name is required" % where)
+    return value
+
+
+def _number(value, where: str) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise MechanicsError("%s: a number is required" % where)
+    number = float(value)
+    if not math.isfinite(number):
+        raise MechanicsError("%s: a finite number is required" % where)
+    return number
+
+
+def _accounts(value, where: str) -> AccountsPace:
+    """Le bloc `accounts` (#3647, canon §11) : `pace_multipliers` par harnais
+    puis compte (nombre fini > 0), `underused_loss` dans ]0, 1[ (optionnel)."""
+    data = _mapping(value, where, _ACCOUNTS_KEYS)
+    multipliers = []
+    table = data.get("pace_multipliers", {})
+    if not isinstance(table, dict):
+        raise MechanicsError("%s.pace_multipliers: a mapping is required" % where)
+    for harness, accounts in table.items():
+        scope = "%s.pace_multipliers.%s" % (where, _name(harness, where + ".pace_multipliers"))
+        if not isinstance(accounts, dict) or not accounts:
+            raise MechanicsError("%s: a non-empty mapping {account: multiplier} is required"
+                                 % scope)
+        for account, multiplier in accounts.items():
+            item = "%s.%s" % (scope, _name(account, scope))
+            multiplier = _number(multiplier, item)
+            if multiplier <= 0:
+                raise MechanicsError("%s: a multiplier > 0 is required" % item)
+            multipliers.append((harness, account, multiplier))
+    loss = None
+    if "underused_loss" in data:
+        loss = _number(data["underused_loss"], where + ".underused_loss")
+        if not 0 < loss < 1:
+            raise MechanicsError("%s.underused_loss: a share in ]0, 1[ is required" % where)
+    return AccountsPace(multipliers=tuple(multipliers), underused_loss=loss)
+
+
 def compile_document(text: str, *, source: str = PATH) -> Document:
     """Compile le document global. Strict : toute règle manquante ou inconnue refuse."""
     try:
@@ -810,6 +892,8 @@ def compile_document(text: str, *, source: str = PATH) -> Document:
         backlog_lot_min_value=lot_min_value,
         staging=(_staging(parsed["staging"], source + ".staging")
                  if "staging" in parsed else None),
+        accounts=(_accounts(parsed["accounts"], source + ".accounts")
+                  if "accounts" in parsed else None),
     )
 
 

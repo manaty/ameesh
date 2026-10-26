@@ -60,17 +60,23 @@ secrets (ntfy token, Slack webhook) come from an environment variable or a
 0600 file that the config NAMES — a secret value written in the config is
 refused. See docs/EXPLOITATION.md, "Alertes poussées — ameesh notify".
 
-Reliability: the delivery state is kept in `<state>/notify/state.json` (a
-lasting alert is not resent after a restart; an alert resolved while
-stopped is sent on restart); rate limited per human (beyond that, a
-summary, whose members enter the `notified` ledger once the summary is
-delivered); a failing channel does not block the others and is retried on
-later passes, a bounded number of times. #2395: the state also keeps a
-persistent `notified` ledger — one notification per alert identity (same
-`since`, same severity) and per human, even if the alert resolves and comes
-back, and even after `ameesh notify` restarts; `slo_breach` is never pushed
-to the owner (canon §9, owner decision 18/10), including from an old
-persisted summary bucket.
+Reliability: #3576 — the delivery state lives in the shared database
+(`notify_state`, a `ameesh-notify-state/1` document) under its own execution
+lease: the `alerts` pass may change host (#3383) without re-pushing a lasting
+alert or losing a resolution, and a holder whose lease expired cannot
+overwrite the new holder's state. `<state>/notify/state.json` remains the
+local document (read before the database for the #532 local console, and the
+fallback when the database is unreachable); the shared state supersedes it
+at the first pass that takes the lease. A lasting alert is not resent after
+a restart; an alert resolved while stopped is sent on restart; rate limited
+per human (beyond that, a summary, whose members enter the `notified` ledger
+once the summary is delivered); a failing channel does not block the others
+and is retried on later passes, a bounded number of times. #2395: the state
+also keeps a persistent `notified` ledger — one notification per alert
+identity (same `since`, same severity) and per human, even if the alert
+resolves and comes back, and even after `ameesh notify` restarts;
+`slo_breach` is never pushed to the owner (canon §9, owner decision 18/10),
+including from an old persisted summary bucket.
 
 Channels: `desktop`, `ntfy`, `slack`, `app`, `nexlink`. L66 — the `desktop` channel
 follows the OS through `ameesh.platform.notify`: `notify-send` on Linux,
@@ -149,6 +155,8 @@ DEFAULT_TYPES = ("stopped_with_mail", "orphan_lot", "dead_runner", "idle_with_ma
                  # #1883 : deux configurations de l'hôte déclarent le même nom de
                  # compte vers deux dossiers — lecture ambiguë, compte refusé
                  "account_identity",
+                 # #3647 : un rythme de compte local, hors du canon (§11)
+                 "account_pace_local",
                  # #313 : un autre mesh de l'hôte déclare le même identifiant de
                  # compte — quota et sessions partagés, contraire à 0033
                  "account_shared",
@@ -1545,6 +1553,24 @@ def empty_state() -> dict:
             "fallback": {}}
 
 
+#: #3576 : le document d'envoi et son bail d'exécution sont partagés en base
+#: (`notify_state`), pour que la passe `alerts` change d'hôte sans re-pousser.
+#: La durée du bail couvre le `TimeoutStartSec=10min` de l'unité de rôle
+#: (`role_timers.render_service`) : un passage anormalement long ne livre
+#: jamais au-delà de l'expiration de son unité.
+STATE_SCOPE = "alerts"
+STATE_LEASE_S = 600.0
+
+
+def _state_from_document(data) -> dict | None:
+    """Valide un document `ameesh-notify-state/1` ; None s'il n'en est pas un."""
+    if not isinstance(data, dict) or data.get("schema") != STATE_SCHEMA:
+        return None
+    state = empty_state()
+    state.update({k: v for k, v in data.items() if k in state and isinstance(v, dict)})
+    return state
+
+
 def load_state(path: str, log=None, *, move_aside: bool = True) -> dict:
     """L'état d'envoi ; absent = vide. Illisible : mis de côté (journalisé),
     on repart vide — au pire une alerte en cours est renvoyée une fois.
@@ -1552,7 +1578,8 @@ def load_state(path: str, log=None, *, move_aside: bool = True) -> dict:
     try:
         with open(path, encoding="utf-8") as fh:
             data = json.load(fh)
-        if not isinstance(data, dict) or data.get("schema") != STATE_SCHEMA:
+        state = _state_from_document(data)
+        if state is None:
             raise ValueError("unexpected schema")
     except FileNotFoundError:
         return empty_state()
@@ -1568,8 +1595,6 @@ def load_state(path: str, log=None, *, move_aside: bool = True) -> dict:
             log("unreadable delivery state (%s): set aside as %s, starting from an empty "
                 "state" % (exc, aside))
         return empty_state()
-    state = empty_state()
-    state.update({k: v for k, v in data.items() if k in state and isinstance(v, dict)})
     return state
 
 
@@ -1583,6 +1608,193 @@ def save_state(path: str, state: dict) -> None:
         fh.flush()
         os.fsync(fh.fileno())
     os.replace(tmp, path)
+
+
+#: Un jeton par processus : un PID recyclé après un redémarrage ne reprend
+#: jamais le bail de son incarnation précédente (l'epoch, lui, ne recule pas).
+_STATE_RUN = os.urandom(4).hex()
+
+
+def state_owner(cfg: Config) -> str:
+    """Identité du processus sur le bail d'état : hôte, PID et jeton de run.
+
+    Une relève change d'hôte, donc d'owner ; le jeton empêche un PID recyclé
+    de se faire passer pour l'ancien détenteur.
+    """
+    host = str(getattr(cfg, "host", None) or "?").strip() or "?"
+    return "%s:%d:%s" % (host, os.getpid(), _STATE_RUN)
+
+
+def load_shared_state(db) -> dict | None:
+    """#3576 : le document partagé de la passe alerts, None tant qu'il n'est
+    pas amorcé (premier détenteur depuis la migration)."""
+    return _state_from_document(storage.of(db).notify_liveness.read_state(STATE_SCOPE))
+
+
+def save_shared_state(db, state: dict, *, owner: str, epoch: int) -> bool:
+    """Écrit le document sous le bail vivant `(owner, epoch)` ; False s'il a
+    été perdu ou a expiré (le détenteur ne doit alors plus livrer)."""
+    return storage.of(db).notify_liveness.save_state(
+        STATE_SCOPE, state, owner=owner, epoch=epoch)
+
+
+def _local_entry_owned(entry, host) -> bool:
+    """Une entrée de console appartient-elle à cet hôte ?
+
+    Les `LOCAL_TYPES` naissent de la console d'UN hôte (`pgbouncer_local`
+    pose `alert.host`) : le document partagé en porte plusieurs, et un hôte
+    ne doit ni résoudre ni fusionner celle d'un autre (#3576, relecture cx1).
+    """
+    alert = (entry or {}).get("alert") or {}
+    return (alert.get("type") in LOCAL_TYPES
+            and str(alert.get("host") or "") == str(host or ""))
+
+
+def _summary_key_host(key) -> str | None:
+    """L'hôte d'une clé d'alerte (`key_of` est une liste JSON), ou None."""
+    try:
+        parsed = json.loads(key)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(parsed, list) or len(parsed) < 3:
+        return None
+    return str(parsed[2] or "")
+
+
+def _merge_local_state(local: dict, shared: dict, host, *,
+                       removed=()) -> None:
+    """Reporte dans l'état partagé ce que seul le passage local a produit.
+
+    `run_local_pass` tourne avant la base (#532) : ses alertes de console
+    (`LOCAL_TYPES`) et son registre ne peuvent pas venir du document partagé.
+    Seules les entrées de CET hôte traversent : une entrée de console d'un
+    autre hôte reste à lui. Une résolution locale retire la clé de `active` du
+    document partagé, sinon elle y reste et le passage suivant la re-résout à
+    chaque tick (relecture cx1). `removed` porte les clés que le passage local
+    a retirées même quand `_resolved` n'écrit rien (acknowledged, notifiee,
+    sans_canal, type retiré) : sans elles, la clé resterait active dans le
+    partagé et une ligne resolved repartirait à chaque tick (relecture dev4).
+    Tout le reste est remplacé par l'état partagé — c'est la règle du
+    dédoublonnage entre hôtes.
+    """
+    owned_keys = set()
+    for key, entry in (local.get("active") or {}).items():
+        if _local_entry_owned(entry, host):
+            shared["active"][key] = entry
+            owned_keys.add(key)
+    for key, entry in (local.get("resolved") or {}).items():
+        if _local_entry_owned(entry, host):
+            shared["active"].pop(key, None)
+            shared["resolved"][key] = entry
+            owned_keys.add(key)
+    for identity, sent_ts in (local.get("notified") or {}).items():
+        shared["notified"][identity] = max(
+            float(sent_ts), float(shared["notified"].get(identity, 0.0)))
+    for human, stamps in (local.get("rate") or {}).items():
+        known = {float(stamp) for stamp in shared["rate"].get(human) or ()}
+        shared["rate"][human] = list(shared["rate"].get(human) or ()) + [
+            stamp for stamp in stamps if float(stamp) not in known]
+    for human, bucket in (local.get("summary") or {}).items():
+        if not isinstance(bucket, dict):
+            continue
+        for event in ("raised", "resolved"):
+            members = bucket.get(event)
+            if not isinstance(members, dict):
+                continue
+            for identity, member in members.items():
+                if not isinstance(member, dict) or member.get("type") not in LOCAL_TYPES:
+                    continue
+                if member.get("key") not in owned_keys \
+                        and _summary_key_host(member.get("key")) != str(host or ""):
+                    continue
+                target = shared["summary"].get(human)
+                if not isinstance(target, dict):
+                    target = shared["summary"][human] = {}
+                target.setdefault(event, {})[identity] = member
+    for key in removed or ():
+        shared["active"].pop(key, None)
+
+
+def enter_shared_state(db, notifier, cfg: Config, *, dry_run: bool = False,
+                       log=None) -> tuple[tuple[str, int] | None, bool]:
+    """Prend le bail d'état partagé et lit le document (rendu ``(bail,
+    livre)``).
+
+    ``livre`` est faux quand un autre hôte détient le bail : ce passage se
+    met en veille, sans livrer ni écrire (l'autre hôte le fait). En
+    ``--dry-run``, le document est lu sans bail et rien n'est écrit.
+    """
+    log = log or notifier.log
+    if dry_run:
+        shared = load_shared_state(db)
+        if shared is not None:
+            _merge_local_state(notifier.state, shared, getattr(cfg, "host", None),
+                               removed=notifier.local_resolved_keys)
+            notifier.state = shared
+            notifier.local_resolved_keys.clear()
+        return None, True
+    owner = state_owner(cfg)
+    try:
+        epoch = storage.of(db).notify_liveness.acquire_state(
+            STATE_SCOPE, owner, STATE_LEASE_S)
+    except db_mod.DbError as exc:
+        if getattr(exc, "sqlstate", None) != "42P01":
+            raise
+        # The migration is applied before the runners (§14), but the owner
+        # channel must not fall silent on a host updated ahead of the base:
+        # deliver from the local document, loudly, until `ameesh migrate`.
+        log("shared delivery state table missing (migration 0487 not applied): "
+            "delivering from the local state, duplicates possible until it is")
+        return None, True
+    if epoch is None:
+        log("another host holds the alerts delivery state (shared lease): "
+            "standing by, nothing is delivered")
+        return None, False
+    try:
+        shared = load_shared_state(db)
+        if shared is None:
+            # Premier détenteur depuis la migration : son état local amorce le
+            # document partagé (les autres hôtes liront celui-ci). Le passage
+            # local a déjà retiré ses clés résolues de `active` ; aucun
+            # tombstone n'est donc nécessaire dans le document amorcé.
+            save_shared_state(db, notifier.state, owner=owner, epoch=epoch)
+            notifier.local_resolved_keys.clear()
+        else:
+            _merge_local_state(notifier.state, shared, getattr(cfg, "host", None),
+                               removed=notifier.local_resolved_keys)
+            notifier.state = shared
+            notifier.local_resolved_keys.clear()
+    except Exception:
+        # Ne pas garder un bail qu'aucune passe n'utilisera (base tombée
+        # entre la prise et la lecture) : le prochain essai doit pouvoir le
+        # prendre sans attendre son expiration.
+        try:
+            storage.of(db).notify_liveness.release_state(STATE_SCOPE, owner, epoch)
+        except Exception:
+            pass
+        raise
+    return (owner, epoch), True
+
+
+def leave_shared_state(db, notifier, lease, *, log=None) -> bool:
+    """Écrit le document partagé sous le bail, puis le rend.
+
+    False si l'écriture a été refusée (bail perdu ou expiré) : la livraison a
+    eu lieu, l'état n'est plus celui du détenteur courant.
+    """
+    if lease is None:
+        return True
+    owner, epoch = lease
+    log = log or notifier.log
+    saved = False
+    try:
+        saved = save_shared_state(db, notifier.state, owner=owner, epoch=epoch)
+        if not saved:
+            log("alerts delivery state NOT saved: the shared lease was lost or "
+                "expired; the next holder may re-push")
+        return saved
+    finally:
+        storage.of(db).notify_liveness.release_state(STATE_SCOPE, owner, epoch)
 
 
 def key_of(alert: dict) -> str:
@@ -1781,6 +1993,11 @@ class Notifier:
         #: None le coupe (défaut : aucun balayage du mesh actif à ce stade)
         self.wip = wip
         self.state = state if state is not None else empty_state()
+        #: #3576 (relecture dev4) : clés de console retirées de `active` par le
+        #: passage local, à retirer du document partagé à la fusion suivante.
+        #: En mémoire seulement : une console calmée sans envoi ne laisse
+        #: aucune entrée `resolved`, et la clé resterait active dans le partagé.
+        self.local_resolved_keys: set = set()
         self.dry_run = dry_run
         self.sender = sender or (DrySender() if dry_run else Sender(timeout=ncfg.timeout))
         #: les enregistrements du dernier passage (remplacé par `run_pass`)
@@ -2083,6 +2300,9 @@ class Notifier:
         wanted = {key_of(a): a for a in current if a.get("type") in self.ncfg.types}
         active = self.state["active"]
         for key, alert in wanted.items():
+            # Une console qui represse la même clé annule le tombstone de
+            # résolution en attente de fusion (#3576, relecture dev4).
+            self.local_resolved_keys.discard(key)
             entry = active.get(key)
             if entry is None:
                 entry = active[key] = {
@@ -2102,22 +2322,38 @@ class Notifier:
     def _local_resolutions(self, wanted: dict, now: float) -> None:
         """Résout les alertes locales que la console ne montre plus, et retente
         les résolutions en vol. Les autres types ne sont jamais touchés : la
-        base peut simplement être non observée."""
+        base peut simplement être non observée.
+
+        #3576 : l'état partagé porte les alertes de console de tous les hôtes ;
+        un hôte ne résout que les siennes (`alert.host`), jamais celle d'un
+        autre dont la console ne dit rien ici (relecture cx1)."""
+        host = getattr(self.cfg, "host", None)
+        # Résolutions déjà en vol AVANT ce tour : seules celles-là se soldent
+        # ici ; celle que `_resolved` vient d'ajouter doit atteindre la fusion
+        # de l'état partagé (#3576, relecture cx1).
+        before = set(self.state["resolved"])
         for key in list(self.state["active"]):
             if key in wanted:
                 continue
             entry = self.state["active"][key]
-            if entry["alert"].get("type") not in LOCAL_TYPES:
+            if not _local_entry_owned(entry, host):
                 continue
             del self.state["active"][key]
+            # #3576 (relecture dev4) : la fusion doit retirer la clé du partagé
+            # même quand `_resolved` ne garde rien (acknowledged, notifiee,
+            # sans_canal, type retiré) — sinon l'entrée y reste active et une
+            # résolution repart à chaque tick.
+            self.local_resolved_keys.add(key)
             if entry["alert"].get("type") not in self.ncfg.types:
                 self.log("[%s] removed from notify.types: forgotten without resolution"
                          % entry["alert"].get("type"))
                 continue
             self._resolved(key, entry, now)
         for key in list(self.state["resolved"]):
+            if key not in before:
+                continue
             entry = self.state["resolved"][key]
-            if entry["alert"].get("type") not in LOCAL_TYPES:
+            if not _local_entry_owned(entry, host):
                 continue
             self._retry(entry, "resolved", now)
             if not self._pending(entry):
@@ -2836,8 +3072,13 @@ class Notifier:
             self._record("resolved", resolved, "resumee", {})
             return
         self._attempt(resolved, "resolved", now)
-        if self._pending(resolved):
-            self.state["resolved"][key] = resolved
+        # #3576 : garder l'entrée même quand l'envoi a réussi. Le passage
+        # local tourne AVANT la lecture de l'état partagé ; c'est cette entrée
+        # qui dit à `_merge_local_state` de retirer la clé de `active` du
+        # document partagé (sinon la console calme la re-résout à chaque
+        # tick). Le passage complet supprime une entrée soldée dans le même
+        # tour (boucle `resolved` de `run_pass`), donc rien ne s'accumule.
+        self.state["resolved"][key] = resolved
 
     # -- envoi ----------------------------------------------------------------
     def _pending(self, entry: dict) -> list:
@@ -3818,6 +4059,7 @@ def cmd_notify(cfg: Config, ncfg: NotifyConfig, args) -> int:
     seuils = exploitation.thresholds(args)
     interval = _interval(args, ncfg)
     db = None
+    lease = None
     try:
         while True:
             # #532 : la console du pool local se lit depuis `cfg` seule, avant
@@ -3831,12 +4073,45 @@ def cmd_notify(cfg: Config, ncfg: NotifyConfig, args) -> int:
                 if db is None:
                     db = db_mod.connect(cfg)
                     db_mod.require_schema(db)
+                if alerts_pass:
+                    # #3576 : l'état de livraison est partagé et un seul hôte
+                    # livre. Sans le bail, ce passage se met en veille sans
+                    # rien pousser ni écrire (l'autre hôte le fait).
+                    lease, deliver = enter_shared_state(
+                        db, notifier, cfg, dry_run=args.dry_run)
+                    if not deliver:
+                        # Le bail ne ferme QUE la livraison d'alertes : les
+                        # autres passes (take, issues, github-watch, ci) de ce
+                        # service gardent leur tour, selon sa sélection.
+                        if only is not None:
+                            rest = frozenset(only) - {"alerts"}
+                        else:
+                            rest = frozenset(ONLY_PASSES) - {"alerts"} - set(skip or ())
+                        if rest:
+                            notifier.run_pass(db, thresholds=seuils, only=rest)
+                        if args.once:
+                            return 0
+                        time.sleep(interval)
+                        continue
                 notifier.run_pass(db, thresholds=seuils)
                 if alerts_pass and not args.dry_run:
-                    save_state(path, notifier.state)
+                    # #3576 : le document partagé d'abord (le bail peut
+                    # expirer), le miroir local ensuite quoi qu'il arrive.
+                    try:
+                        leave_shared_state(db, notifier, lease)
+                    finally:
+                        lease = None
+                        save_state(path, notifier.state)
             except db_mod.SchemaMissing:
                 raise
             except db_mod.DbError as exc:
+                if lease is not None and db is not None:
+                    try:
+                        storage.of(db).notify_liveness.release_state(
+                            STATE_SCOPE, lease[0], lease[1])
+                    except Exception:
+                        pass  # le bail expirera ; la base est déjà en défaut
+                    lease = None
                 if args.once:
                     raise
                 _stderr_log("database unavailable (%s): retrying in %ds" % (exc, interval))
@@ -3852,6 +4127,12 @@ def cmd_notify(cfg: Config, ncfg: NotifyConfig, args) -> int:
     except KeyboardInterrupt:
         return 0
     finally:
+        if lease is not None and db is not None:
+            try:
+                storage.of(db).notify_liveness.release_state(
+                    STATE_SCOPE, lease[0], lease[1])
+            except Exception:
+                pass
         if db is not None:
             db.close()
         if lock is not None:

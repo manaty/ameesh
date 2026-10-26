@@ -270,10 +270,11 @@ def _dry_run(cfg, project, *, now, version, as_json: bool) -> int:
         print("release %s — coupure %s — cible %s @ %s"
               % (plan.version, plan.cutoff_label, project.target, plan.head[:12]))
         if plan.tree_green:
-            print("CI tête en cours ; arbre = tête de paquet %s, suite complète verte "
-                  "(%s)" % (plan.tree_green["head"][:12], ", ".join(
-                      run["url"] or "run %s" % run["id"]
-                      for run in plan.tree_green["runs"])))
+            print("CI tête: %s ; arbre = tête de paquet %s, suite complète verte "
+                  "(%s)" % (release_cutoff.ci_state_text(plan.ci),
+                            plan.tree_green["head"][:12], ", ".join(
+                                run["url"] or "run %s" % run["id"]
+                                for run in plan.tree_green["runs"])))
         else:
             print("CI verte: %s%s" % ("oui" if plan.green else "non",
                                       "" if plan.green else

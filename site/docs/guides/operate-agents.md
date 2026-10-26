@@ -197,12 +197,16 @@ ameesh notify --test human:<id> [--json]
   responsible of the host's `Host` card; `notify.default_human`. An alert
   without a recipient or channel is logged once and kept: if a route appears
   while it lasts, it is sent.
-- **Reliability**: the delivery state is kept in `<state>/notify/state.json`
-  (`0600`), so a lasting alert is not sent again after a restart and an alert
-  resolved meanwhile gets its resolution. One `notify` per state directory (a
-  second one exits with code 1). Beyond `rate_per_minute` per human, alerts are
-  folded into a summary. A failed channel does not stop the others and is
-  retried up to `max_attempts` times.
+- **Reliability**: the delivery document and its execution lease are shared in
+  the database (`notify_state`), so a lasting alert is not sent again after a
+  restart **or when the elected `alerts` pass changes host**, and an alert
+  resolved meanwhile gets its resolution once. One host delivers at a time;
+  another stands by. `<state>/notify/state.json` (`0600`) remains the local
+  mirror read before the database (local pool console, #532) and the fallback
+  when it is unreachable. One `notify` per state directory (a second one exits
+  with code 1). Beyond `rate_per_minute` per human, alerts are folded into a
+  summary. A failed channel does not stop the others and is retried up to
+  `max_attempts` times.
 - `--json`: one object per delivery, schema `ameesh-notify/1` (`event`,
   `type`, `agent`, `lot`, `host`, `human`, `source`, `delivery`, `channels`,
   `title`, `text`, `ts`).

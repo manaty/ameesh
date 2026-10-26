@@ -170,12 +170,13 @@ class TurnJournalFallbackTest(_Fixture):
 
 
 class AmbiguousReferenceFamilyTest(_Fixture):
-    """B1 (#2961) : deux familles prouvées ne retombent pas au registre.
+    """B1 (#2961) / #3584 : deux familles prouvées excluent chacune d'elles.
 
     Le journal du gel dit codex, le reçu du commit dit claude : la lecture rend
-    une famille vide pour la référence. Ce n'est pas une absence de preuve —
-    les deux familles ont écrit — et la porte doit refuser au lieu de prendre
-    le registre (codex ici), qui laisserait passer un avis claude.
+    une famille vide pour la référence, avec l'ensemble prouvé. Ce n'est pas
+    une absence de preuve — les deux familles ont écrit — et la porte n'a ni à
+    refuser l'ensemble ni à prendre le registre : elle exclut codex **et**
+    claude. Un avis deepseek reste donc recevable.
     """
 
     def setUp(self):
@@ -190,20 +191,21 @@ class AmbiguousReferenceFamilyTest(_Fixture):
         self.verdict("qa")            # deepseek
         self.verdict("dev1")          # claude
 
-    def test_an_ambiguous_reference_refuses_instead_of_using_the_registry(self):
-        out = self.gate()
-        self.assertFalse(out["ok"], out)
-        self.assertIn("ambiguous", (out.get("error") or "")
-                      + (out.get("why") or ""))
-        self.assertEqual(out["accepted"], [])
+    def test_an_ambiguous_reference_excludes_each_proven_family(self):
+        out = self.gate(self.klass(path="src/ameesh/mail.py"))
+        self.assertTrue(out["ok"], out)
+        self.assertEqual(out["author_family"], "")
+        self.assertEqual(out["author_families"], ["claude", "codex"])
+        self.assertEqual([row["actor"] for row in out["accepted"]], ["qa"])
 
 
 class AmbiguousCoauthorFamilyTest(_Fixture):
-    """Le même refus pour un coauteur lu sans famille unique (#2961, auditeur).
+    """Le même ensemble prouvé pour un coauteur lu sans famille unique.
 
     Deux commits du même coauteur, l'un reçu codex, l'autre reçu claude : sa
     famille est vide par ambiguïté, jamais par absence. La porte du composeur
-    doit refuser comme `_complete_authors` (R9 B cx2).
+    exclut codex et claude (comme `_complete_authors`), elle ne refuse pas
+    l'ensemble (#3584).
     """
 
     def setUp(self):
@@ -219,12 +221,11 @@ class AmbiguousCoauthorFamilyTest(_Fixture):
         self.verdict("qa")
         self.verdict("dev1")
 
-    def test_an_ambiguous_coauthor_refuses(self):
-        out = self.gate()
-        self.assertFalse(out["ok"], out)
-        self.assertIn("ambiguous", (out.get("error") or "")
-                      + (out.get("why") or ""))
-        self.assertIn("other", (out.get("error") or "") + (out.get("why") or ""))
+    def test_an_ambiguous_coauthor_excludes_each_proven_family(self):
+        out = self.gate(self.klass(path="src/ameesh/mail.py"))
+        self.assertTrue(out["ok"], out)
+        self.assertEqual(out["author_families"], ["claude", "codex"])
+        self.assertEqual([row["actor"] for row in out["accepted"]], ["qa"])
 
 
 class FreezeReceiptFallbackTest(_Fixture):

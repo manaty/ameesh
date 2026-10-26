@@ -1706,6 +1706,24 @@ def _mark_covers(mark: Mapping, floor: int, *, column=None) -> bool:
     return required >= floor and len(families) >= floor and len(rows) >= floor
 
 
+def _removed_seats(db, lot: int, freeze: Mapping, live) -> set:
+    """The automatic seats of THIS freeze absent from the live column (#3617).
+
+    Every mark of the freeze is read, not only the effective one: a floor
+    completion that could only wait partially writes a `waiting` mark naming
+    the live seats, so a seat the pilot removed before it appears only in an
+    older mark of the same freeze. An unreadable journal removes nobody."""
+    names = set()
+    for _row_id, _kind, noted, _ts in _marks(
+            db, int(lot), freeze_id=int((freeze or {}).get("id") or 0),
+            since_ts=float((freeze or {}).get("at_ts") or 0.0)) or ():
+        for row in (noted or {}).get("reviewers") or ():
+            name = str((row or {}).get("name") or "").strip()
+            if name:
+                names.add(name)
+    return names - {str(name or "").strip() for name in live or ()}
+
+
 def _kept_seats(shape: Mapping, item: Mapping) -> list:
     """The designated seats of a mark still present in the reviewer column.
 
@@ -1956,7 +1974,8 @@ def frozen_authors(db, item: Mapping) -> Optional[list]:
     prouvent pas qu'aucun autre commit ne l'est pas. Une marque sans cette
     liste (antérieure au champ), ou qui la porte non vide, ne prouve donc rien.
 
-    Rend la liste `{name, family}`, ou None quand aucune lecture **complète**
+    Rend la liste `{name, family}`, plus `families` pour un acteur prouvé sous
+    plusieurs familles (#3584), ou None quand aucune lecture **complète**
     n'est disponible : pas de gel, pas de marque pour ce gel, journal
     illisible, marque antérieure à #2721 (sans `authors`), liste
     `unknown_authors` absente ou non vide, ou liste d'auteurs vide. L'appelant
@@ -1989,9 +2008,19 @@ def frozen_authors(db, item: Mapping) -> Optional[list]:
             if not isinstance(row, Mapping):
                 continue
             name = str(row.get("name") or "").strip()
-            if name:
-                authors.append({"name": name,
-                                "family": str(row.get("family") or "").strip().lower()})
+            if not name:
+                continue
+            author = {"name": name,
+                      "family": str(row.get("family") or "").strip().lower()}
+            families = row.get("families")
+            if isinstance(families, (list, tuple, set, frozenset)):
+                values = sorted({str(value).strip().lower() for value in families
+                                 if str(value or "").strip()})
+                if values:
+                    # #3584 : une marque écrite après ce lot garde l'ensemble
+                    # prouvé ; la proposition de relecture en exclut chacune.
+                    author["families"] = values
+            authors.append(author)
         return authors or None
     return None
 
@@ -2038,7 +2067,11 @@ def _sync_reviewers(db, item: Mapping, freeze: Mapping, names, *, text: str = ""
     gesture is never dropped on a read we cannot prove.
 
     `text`, when given, is the journal line of this sync (a verdict carry keeps
-    the reported reviewers instead of designating, #2487)."""
+    the reported reviewers instead of designating, #2487).
+
+    #3661: a `waiting` effective mark keeps only its seats still in the column
+    (or named by the caller). A seat the pilot removed is never written back,
+    whatever the path: a selection, a replay, an unavailable or light outcome."""
     from .storage.postgres.work import has_reviewers
 
     if not has_reviewers(db):
@@ -2087,6 +2120,11 @@ def _sync_reviewers(db, item: Mapping, freeze: Mapping, names, *, text: str = ""
     keep = [name for name in current if name not in retired]
     wanted = [str((reviewer or {}).get("name") or "").strip()
               for reviewer in (effective[2].get("reviewers") or () if effective else ())]
+    if (effective is not None and effective[1] != "carried"
+            and effective[2].get("state") == rd.WAITING):
+        # #3661 : les sièges d'une attente sont écrits avec leur marque ; un
+        # siège absent de la colonne a été retiré par le pilote.
+        wanted = [name for name in wanted if name in current]
     wanted.extend(names)
     for name in wanted:
         if name and name not in keep:
@@ -2177,11 +2215,15 @@ class _FloorPort(_ForcedPort):
     La marque écrite les nomme tous, avec le compte requis `max(barème,
     plancher)`.
 
-    Une attente (pas assez de familles indépendantes) n'écrit **aucune** marque :
-    une marque `waiting` retirerait de la colonne du lot les sièges déjà
-    désignés (`_sync_reviewers`), alors que le plancher ne les invalide pas.
-    L'attente est journalisée sous le verrou, une fois par `(gel, plancher)`,
-    et la désignation reste inchangée.
+    Une attente (pas assez de familles indépendantes) qui ne pourvoit aucun
+    siège n'écrit **aucune** marque : la désignation reste inchangée et
+    l'attente est journalisée sous le verrou, une fois par `(gel, plancher)`.
+    Une attente **partielle** (#3617) pourvoit les familles disponibles comme
+    au gel (#3596) : la marque `waiting` nomme les sièges gardés et les
+    nouveaux, seuls les nouveaux reçoivent leur demande, et la colonne garde
+    tous les sièges (`_sync_reviewers` suit la marque effective). L'avis de
+    capacité n'est pas envoyé : le plancher vient du pilote, l'attente est
+    journalisée, et la reprise du même gel complète les sièges manquants.
     """
 
     def __init__(self, port, *, kept, examined=(), mark_id: int, floor: int) -> None:
@@ -2225,6 +2267,30 @@ class _FloorPort(_ForcedPort):
                 " designated): nothing written" % ", ".join(gone))
         state = str(rows[0].get("state") or "") if rows else ""
         prefix = _floor_prefix(int(lot), freeze_id, self.floor)
+        names = {seat["name"] for seat in self.kept}
+        new = [dict(row) for row in kwargs.get("reviewers") or ()
+               if str((row or {}).get("name") or "").strip() not in names]
+        if kwargs.get("state") == rd.WAITING and new:
+            # #3617 : attente partielle, les familles disponibles sont pourvues
+            # sans attendre le retour de la capacité manquante.
+            kwargs["reviewers"] = self.kept + new
+            kwargs["messages"] = [message for message in kwargs.get("messages") or ()
+                                  if not (message or {}).get("capacity")]
+            out = super().commit(lot, **kwargs)
+            self.added = [str((row or {}).get("name") or "").strip() for row in new]
+            out["completed"] = True
+            out["added"] = list(self.added)
+            if not storage.of(db).work.events_noted(prefix, since, ids=[int(lot)]):
+                storage.of(db).work.note(
+                    int(lot), state,
+                    "%s review floor %d partially completed the freeze #%s"
+                    " designation: added %s; kept %s; %d missing: %s"
+                    % (prefix, self.floor, freeze_id, ", ".join(self.added),
+                       ", ".join(seat["name"] for seat in self.kept) or "none",
+                       int(kwargs.get("missing") or 0),
+                       str(kwargs.get("why") or "waiting")),
+                    SENDER)
+            return out
         if kwargs.get("state") == rd.WAITING:
             if not storage.of(db).work.events_noted(prefix, since, ids=[int(lot)]):
                 storage.of(db).work.note(
@@ -2238,9 +2304,6 @@ class _FloorPort(_ForcedPort):
                     "required": int(kwargs.get("required") or 0),
                     "reviewers": [], "missing": int(kwargs.get("missing") or 0),
                     "why": str(kwargs.get("why") or ""), "freeze": freeze}
-        names = {seat["name"] for seat in self.kept}
-        new = [dict(row) for row in kwargs.get("reviewers") or ()
-               if str((row or {}).get("name") or "").strip() not in names]
         kwargs["reviewers"] = self.kept + new
         why = str(kwargs.get("why") or "")
         kwargs["why"] = ("%s; review floor %d completed at freeze #%s"
@@ -2768,7 +2831,9 @@ def designate(cfg, db, lot: int, *, freeze: Optional[Mapping] = None,
     déterministe et notifiés, et une marque plus récente porte le nouveau
     compte. `work reviewers --apply` et `work reviewer --floor` passent ici.
     Une attente (pas assez de familles) ne retire aucun siège : la marque et la
-    colonne restent la désignation valide, l'attente est journalisée.
+    colonne restent la désignation valide, l'attente est journalisée. Une
+    attente partielle (#3617) pourvoit déjà les familles disponibles : une
+    marque `waiting` nomme les sièges gardés et les nouveaux.
     """
     item = work.get(db, int(lot)) or {"id": int(lot), "state": "", "title": "",
                                       "app": ""}
@@ -2821,9 +2886,12 @@ def designate(cfg, db, lot: int, *, freeze: Optional[Mapping] = None,
         except Exception:  # noqa: BLE001 - unreadable column: the mark alone
             live = None
     completion = None
+    waiting = False
     if not force:
         effective = _effective_mark(db, int(lot), int(freeze.get("id") or 0),
                                     since_ts=float(freeze.get("at_ts") or 0.0))
+        waiting = (effective is not None and effective[1] != "carried"
+                   and effective[2].get("state") == rd.WAITING)
         if effective is not None:
             # #2487 : la dernière marque du gel fait foi, sélection ou report.
             # Une sélection `waiting` est retentée : la capacité peut être
@@ -2934,11 +3002,27 @@ def designate(cfg, db, lot: int, *, freeze: Optional[Mapping] = None,
                     kept=kept, examined=live_names,
                     mark_id=int(completion["mark_id"]), floor=floor)
                 out = _selection(inputs, port, kept=port.kept)
-                if out.get("state") == rd.DESIGNATED:
+                if out.get("state") == rd.DESIGNATED or out.get("completed"):
                     _sync_reviewers(tx, item, freeze,
                                     [r.get("name") for r in out.get("reviewers") or ()])
             _drain(db, threads)
             return out
+        removed = set()
+        if waiting and live is not None:
+            # #3617 : la reprise d'une attente (partielle ou non) ne réinscrit
+            # pas un siège de CE gel que le pilote a retiré de la colonne,
+            # comme la complétion du plancher (B/P1 dev4) : après une attente
+            # partielle écrite par le plancher, la reprise passe ici. #3661 :
+            # ni comme candidat, ni comme siège acquis de la marque `waiting`
+            # (le port la lit sans eux, `retired`) ; `_sync_reviewers` ne le
+            # réécrit sur aucun chemin.
+            removed = _removed_seats(db, int(lot), freeze, live)
+            if removed:
+                inputs = dataclasses.replace(
+                    inputs,
+                    candidates=[candidate for candidate in inputs.candidates
+                                if str(getattr(candidate, "name", "") or "").strip()
+                                not in removed])
         if not inputs.paths or inputs.policy.required == 0:
             why = LIGHT_WHY if inputs.paths else NO_PATH_WHY
             with db.transaction() as tx:
@@ -2950,7 +3034,8 @@ def designate(cfg, db, lot: int, *, freeze: Optional[Mapping] = None,
                     "freeze": freeze, "why": why}
         with db.transaction() as tx:
             out = _selection(inputs, pg.PgPort(tx, after_commit=threads,
-                                                at_freeze=False), force=force)
+                                                at_freeze=False, retired=removed),
+                             force=force)
             names = ([r.get("name") for r in out.get("reviewers") or ()]
                      if out.get("state") in (rd.DESIGNATED, rd.WAITING) else [])
             _sync_reviewers(tx, item, freeze, names)

@@ -54,6 +54,8 @@ import sys
 import time
 from typing import Any, Iterable, Mapping
 
+from . import work_lifecycle
+
 SCHEMA = "ameesh-debit/1"
 
 #: fenêtre par défaut du débit (tours et fusions par heure)
@@ -419,6 +421,8 @@ _OPEN_STATES = ("intake", "build", "qa")
 _CLOSURE_STATES = ("blocked", "waiting_human")
 #: états terminaux (le jalon, pas seulement la colonne)
 _TERMINAL_STATES = ("merged", "closed", "delivered")
+#: états finis au journal (promu, fermé) : plus aucune attente (#3672)
+_CLOSED_STATES = work_lifecycle.TERMINAL
 
 
 def _reopened(events: list[dict], terminal_ts: float | None) -> bool:
@@ -875,6 +879,12 @@ def build(*, items: Iterable[Mapping[str, Any]],
     unreadable: list[str] = list(devices.get("unreadable") or ())
 
     for ident, item in by_id.items():
+        # #3672 : un lot fermé (ou promu) au journal n'attend plus rien, même
+        # sans jalon terminal (#3585, fermé « superseded » puis retenu par
+        # une note `hold:`) ; ses holds et réveils ne sont pas des attentes.
+        # Un lot `merged` reste lu : il peut attendre son déploiement.
+        if state_by_lot.get(ident) in _CLOSED_STATES:
+            continue
         lot_milestones = milestones_by_lot.get(ident, [])
         lot_events = events_by_lot.get(ident, [])
         freeze = _latest_freeze(lot_milestones)

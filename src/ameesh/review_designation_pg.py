@@ -92,6 +92,13 @@ def _mark_author(author) -> dict:
     auditable without pretending they carry an exact receipt."""
     row = {"name": str((author or {}).get("name") or ""),
            "family": str((author or {}).get("family") or "")}
+    families = (author or {}).get("families")
+    if isinstance(families, (list, tuple, set, frozenset)):
+        values = [str(value).strip() for value in families if str(value or "").strip()]
+        if values:
+            # #3584 : la marque garde tout l'ensemble prouvé, pas la seule
+            # réduction ambiguë à "".
+            row["families"] = values
     proof = str((author or {}).get("proof") or "").strip()
     if proof:
         row["proof"] = proof
@@ -314,12 +321,17 @@ class PgPort:
     """
 
     def __init__(self, db, *, sender: str = SENDER, after_commit: Optional[list] = None,
-                 at_freeze: Optional[bool] = None):
+                 at_freeze: Optional[bool] = None, retired: Sequence[str] = ()):
         self.db = db
         self.sender = sender or SENDER
         self.after_commit = after_commit
         self.at_freeze = ((after_commit is not None) if at_freeze is None
                           else bool(at_freeze))
+        # #3661 : les sièges de ce gel que le pilote a retirés de la colonne.
+        # Une marque `waiting` qui les nomme encore est lue sans eux : ils ne
+        # comptent plus comme sièges acquis et ne sont jamais réécrits.
+        self.retired = frozenset(str(name or "").strip()
+                                 for name in retired or ()) - {""}
 
     # -- reads ------------------------------------------------------------
     def latest_freeze(self, lot: int) -> Optional[dict]:
@@ -336,8 +348,25 @@ class PgPort:
 
         Reads the journal mark (the last one of this freeze if several, the
         journal order decides); this is what makes the freeze replayable without
-        a second mail."""
-        return self._recorded_in(self.db, int(lot), int(freeze_id))
+        a second mail. A waiting mark is read without the `retired` seats."""
+        return self._unretired(self._recorded_in(self.db, int(lot), int(freeze_id)))
+
+    def _unretired(self, shape: Optional[dict]) -> Optional[dict]:
+        """A waiting designation without the seats the pilot removed (#3661).
+
+        A final designation is returned as is: only a waiting state is
+        retried, and only its seats are counted again as acquired."""
+        if not shape or not self.retired or shape.get("state") != WAITING:
+            return shape
+        rows = shape.get("reviewers") or ()
+        kept = [dict(row) for row in rows
+                if str((row or {}).get("name") or "").strip() not in self.retired]
+        if len(kept) == len(rows):
+            return shape
+        out = dict(shape)
+        out["reviewers"] = kept
+        out["missing"] = int(shape.get("missing") or 0) + len(rows) - len(kept)
+        return out
 
     def _freeze_since(self, db, lot: int, freeze_id: int) -> Optional[float]:
         """The `at_ts` of the `frozen` milestone, if it is within the read window.
@@ -400,7 +429,8 @@ class PgPort:
                                unknown_authors=unknown_authors,
                                hook=self.at_freeze, force=force)
         threads: list = []
-        inner = PgPort(self.db, sender=self.sender, after_commit=threads)
+        inner = PgPort(self.db, sender=self.sender, after_commit=threads,
+                       retired=self.retired)
         with self.db.transaction() as tx:
             if _nested_transaction(tx):
                 # The transaction belongs to the caller: it will not commit
@@ -513,8 +543,8 @@ class PgPort:
                 messages = [message for message in messages
                             if str((message or {}).get("to") or "").strip() not in bad]
                 missing = int(missing) + (before - len(reviewers))
-        existing = None if force else self._recorded_in(
-            db, lot, freeze_id, since_ts=float(last.get("at_ts") or 0.0))
+        existing = None if force else self._unretired(self._recorded_in(
+            db, lot, freeze_id, since_ts=float(last.get("at_ts") or 0.0)))
         # A designation is final. A waiting state is retryable: it yields to
         # the designation when capacity comes back, and a partial waiting
         # designation (#3596) is rewritten when it gains a seat — but a replay

@@ -616,6 +616,35 @@ def reading_is_green(reading: dict) -> bool:
     return False
 
 
+def ci_state_text(reading: dict | None) -> str:
+    """#3641 : l'état réel de la CI de la tête, pour les rapports de coupe.
+
+    #2692 ne laissait hériter qu'une tête **en cours** ; #3633 étend
+    l'héritage d'arbre à une tête rouge, annulée ou absente. Le rapport ne
+    peut donc plus écrire « en cours » par défaut : il nomme ce qui a été lu,
+    et la preuve d'arbre reste citée à part.
+    """
+    if not reading:
+        return "absente"
+    if reading_is_green(reading):
+        return "verte"
+    if reading.get("negative") or reading.get("required_negative"):
+        return "rouge"
+    if reading.get("pending"):
+        return "en cours"
+    if reading.get("unconcluded"):
+        return "non conclue"
+    if reading.get("missing"):
+        return "absente"
+    if reading.get("inconclusive"):
+        return "non concluante"
+    if reading.get("failed"):
+        return "rouge"
+    if not reading.get("runs", 1):
+        return "absente"
+    return "non verte"
+
+
 def commit_is_green(repo: str, project: "ProjectRelease", sha: str,
                     reading: dict | None = None) -> bool:
     """The exact commit is green; a non-green release commit inherits its chain.
@@ -668,6 +697,25 @@ def _latest_green_tag(repo: str, head: str, project: "ProjectRelease") -> str | 
     return None
 
 
+def _release_on_green_tree(repo: str, project: "ProjectRelease", candidates, reference):
+    """#3641 : la plus récente release dont le parent porte une preuve d'arbre.
+
+    Une coupe sur une tête rouge à arbre vert crée V sur M (`[skip ci]`) ; la
+    coupe suivante doit repartir de V, déjà taguée, et non du vert antérieur
+    B (sinon `staging_pending.regressions(B)` retient le paquet suivant et le
+    tag existe déjà). On rejoue la preuve d'arbre sur le parent M de V contre
+    la référence verte B : mêmes gardes de contenu que #2692/#3633. Rend le
+    candidat `(release, parent, lecture du parent, lecture de la release)`, ou
+    None."""
+    if not reference:
+        return None
+    for candidate in candidates:
+        release, merge, reading, _own = candidate
+        if tree_green(repo, project, merge, reference, reading=reading) is not None:
+            return candidate
+    return None
+
+
 def last_green(repo: str, head: str, project: "ProjectRelease", limit: int = 100,
                *, evidence: dict | None = None) -> str | None:
     """The green content of the history, without a release-chain cap.
@@ -678,18 +726,50 @@ def last_green(repo: str, head: str, project: "ProjectRelease", limit: int = 100
     a red child of it. A landing merge is recognised directly, so any number of
     successive red cutoffs works. Without a landing merge, only a truly green
     first-parent commit is accepted; if none is found the caller refuses (N5).
+
+    #3641 : un commit de release `V` posé sur une tête rouge dont l'arbre est
+    celui d'une tête de paquet verte (#3633) est le vert le plus récent. Son
+    propre CI est absente (`[skip ci]`) et son parent M est rouge ; sans cette
+    reconnaissance, la coupe suivante sautait V et repartait de B.
+
+    `evidence` reçoit la lecture du vert retenu et, quand c'est une release sur
+    arbre vert, `tree_reference` : le vert B dont la suite a prouvé l'arbre de
+    M. La coupe part de V, mais la preuve de suite se rejoue contre B.
     """
     cursor = head
+    candidates: list[tuple[str, str, dict, dict]] = []
     for _ in range(limit):
         reading = ci_reading(project, cursor)
         if commit_is_green(repo, project, cursor, reading=reading):
+            chosen = _release_on_green_tree(repo, project, candidates, cursor)
+            if chosen is not None:
+                if evidence is not None:
+                    evidence.update(chosen[3])
+                    # #3641 : la référence de suite de `tree_green` est le
+                    # vert qui a prouvé l'arbre de M, jamais la release V
+                    # elle-même (sans suite) ; la coupe, elle, part de V.
+                    evidence["tree_reference"] = cursor
+                return chosen[0]
             if evidence is not None:
                 evidence.update(reading)
             return cursor
         if _landing_release(repo, cursor):
             # Exact CI first: a re-validated landing is green content, never
             # an inheritance from its red first parent.
-            return _latest_green_tag(repo, head, project)
+            reference = _latest_green_tag(repo, head, project)
+            chosen = _release_on_green_tree(repo, project, candidates, reference)
+            if chosen is not None:
+                if evidence is not None:
+                    evidence["tree_reference"] = reference
+                return chosen[0]
+            return reference
+        if _release_commit(repo, cursor):
+            parent = _git(repo, "rev-parse", "--verify", "%s^1" % cursor)
+            if not parent.returncode:
+                merge = (parent.stdout or "").strip()
+                if merge and packet_head(repo, merge) is not None:
+                    candidates.append(
+                        (cursor, merge, ci_reading(project, merge), reading))
         parent = _git(repo, "rev-parse", "--verify", "%s^1" % cursor)
         if parent.returncode:
             break
@@ -1413,7 +1493,11 @@ def build_plan(cfg, project: ProjectRelease, *, now: float,
         # #2692: a packet merge whose tree is the green packet head's content
         # is green — #3633 : whatever the target's own CI says (décision
         # owner #141353 a).
-        tree_proof = tree_green(project.repo, project, head, green_commit,
+        # #3641 : V (release sur tête rouge à arbre vert) est la base de
+        # coupe, mais la suite se prouve contre le vert B qui a validé l'arbre
+        # de sa tête M — V n'a pas de suite propre.
+        tree_reference = base_reading.get("tree_reference") or green_commit
+        tree_proof = tree_green(project.repo, project, head, tree_reference,
                                 reading=reading)
         if tree_proof is not None:
             green, green_commit = True, head
@@ -2050,9 +2134,9 @@ def _report_body(project: ProjectRelease, plan: Plan | None, *, result: str,
     lines.append("Après: %s (commit %s)." % (version, release_sha[:12]))
     if plan and plan.tree_green:
         proof = plan.tree_green
-        lines.append("CI tête: en cours ; arbre identique à la tête de paquet %s, "
+        lines.append("CI tête: %s ; arbre identique à la tête de paquet %s, "
                      "suite complète verte (preuve %s)."
-                     % (proof["head"][:12], ", ".join(
+                     % (ci_state_text(plan.ci), proof["head"][:12], ", ".join(
                          run["url"] or "run %s" % run["id"] for run in proof["runs"])))
     elif plan and plan.ci:
         state = "verte" if reading_is_green(plan.ci) else "non verte"
@@ -2290,9 +2374,9 @@ def _execute_locked(cfg, db, project: ProjectRelease, *, now: float, force: bool
             "correction ouvert" % (plan.head[:12], ", ".join(plan.ci["inconclusive"])))
     if plan.tree_green:
         deviations.append(
-            "tête %s: CI en cours, arbre identique à la tête de paquet %s "
+            "tête %s: CI %s, arbre identique à la tête de paquet %s "
             "(suite complète verte, %s)"
-            % (plan.head[:12], plan.tree_green["head"][:12],
+            % (plan.head[:12], ci_state_text(plan.ci), plan.tree_green["head"][:12],
                ", ".join(run["url"] or "run %s" % run["id"]
                          for run in plan.tree_green["runs"])))
     elif not plan.green:

@@ -311,6 +311,7 @@ class DropinCommandTest(unittest.TestCase):
                 mock.patch.object(notify.db_mod, "connect", return_value=fake_db), \
                 mock.patch.object(notify.db_mod, "require_schema"), \
                 mock.patch.object(notify, "load_state", return_value=notify.empty_state()), \
+                mock.patch.object(notify, "load_shared_state", return_value=None), \
                 mock.patch.object(notify.time, "sleep", side_effect=KeyboardInterrupt):
             rc = notify.cmd_notify(cfg, SimpleNamespace(configured=True), args)
         self.assertEqual(rc, 0, "the drop-in command must not be refused")
