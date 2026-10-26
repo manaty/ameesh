@@ -55,6 +55,7 @@ from . import account_budget, account_turn, adapters, auth_failure, canon as can
 from . import cost as cost_mod
 from . import budget as budget_mod, db as db_mod, device_state, fil, harnesses, identity, mail, registry, sentinel, storage
 from . import rate_limit as rate_limit_mod
+from . import account_window
 from . import persona_memory as memory_mod
 from . import train_events
 from . import venv_guard
@@ -7126,6 +7127,19 @@ class AgentWorker(threading.Thread):
             log("[%s] %s turn (dry-run, session %s): %s"
                 % (self.name, shown, session or "new", " ".join(argv)))
             return True
+        # #3779 : seconde lecture de la fenêtre courte juste avant d'ouvrir le
+        # tour. La première (dans `account_turn.choose`) a pu laisser passer
+        # deux agents dans la même fenêtre ; ici l'écart avec `begin_turn` est
+        # minimal. Un tour refusé ici n'est pas un échec : consigne remise.
+        raison_courte = account_window.reason(
+            self.db, harness, getattr(compte, "name", ""),
+            exclude_agent=self.name, profile=compte)
+        if raison_courte:
+            log("[%s] turn postponed: %s" % (self.name, raison_courte))
+            registry.restore_prompt(self.db, self.name, self.runner.runner_id, self.epoch)
+            registry.set_status(self.db, self.name, "blocked",
+                                status_text=raison_courte)
+            return False
         if not registry.begin_turn(self.db, self.name, self.runner.runner_id, self.epoch,
                                    self._marqueurs_durables(
                                        "%s turn (%s)" % (shown, harness))):
@@ -7134,6 +7148,11 @@ class AgentWorker(threading.Thread):
             registry.restore_prompt(self.db, self.name, self.runner.runner_id, self.epoch)
             log("[%s] lease lost, agent stopped or operator paused before the turn" % self.name)
             return False
+        # #3779 : début effectif du tour, journalisé pour l'écart minimal entre
+        # deux débuts du compte (le `status_since` seul ne le donne pas après
+        # la fin du tour). Best-effort : le tour part même si le journal échoue.
+        account_window.record_start(
+            self.db, harness, getattr(compte, "name", None), self.cfg.host, self.name)
         lot = spec.get("lot")
         if lot and not spec.get("lot_finished") \
                 and str(lot) != str(self.agent.get("session_work_item") or ""):
@@ -8024,9 +8043,9 @@ class AgentWorker(threading.Thread):
             # reste seule juge du budget. Un échec d'une autre cause
             # efface l'épisode (hors refus de session fille, qui n'est pas une
             # panne fournisseur et n'efface ni n'étend l'épisode).
+            stderr_debit = auth_failure.stderr_tail(stderr_path, start=stderr_debut)
             genre = rate_limit_mod.classify(
-                error, self.last_final,
-                auth_failure.stderr_tail(stderr_path, start=stderr_debut))
+                error, self.last_final, stderr_debit)
             if genre:
                 if genre == rate_limit_mod.RATE_LIMITED:
                     self.fast_failure = False
@@ -8041,6 +8060,22 @@ class AgentWorker(threading.Thread):
                 # redémarrage et ne se recalcule pas à chaque réveil (#1270 B1)
                 self.rate_limit_retry_at = (time.time() + rate_limit_mod.delay(
                     self.rate_limit_streak))
+                # #3779 : un 429 du fournisseur est aussi un refus du BUCKET
+                # COURT du compte, partagé par toutes ses sessions. On le
+                # journalise en base pour que les autres agents du compte
+                # s'arrêtent avec le fautif, au lieu de relancer chacun leur
+                # tour et d'entretenir la rafale.
+                detail_429 = "\n".join(
+                    texte for texte in (str(error or ""), stderr_debit or "") if texte)
+                if (genre == rate_limit_mod.RATE_LIMITED
+                        and account_window.enabled(harness)
+                        and ("429" in detail_429
+                             or "Too Many Requests" in detail_429)):
+                    nom_compte = getattr(compte, "name", None)
+                    if nom_compte:
+                        account_window.record_rate_limit(
+                            self.db, harness, nom_compte, self.cfg.host,
+                            self.name, detail_429)
             elif not session_fille_ecartee:
                 self._clos_episode_debit(started)
                 self.rate_limit = None

@@ -1053,3 +1053,34 @@ are not seen, because ameesh never reads a credential. A `key_env` variable
 that is absent from the executor's environment has no value to fingerprint
 (the launch would fail for the same reason). The separation itself stays the
 owner's: lot #65 (accounts per organisation).
+
+## Fenêtre courte du fournisseur (#3779)
+
+Le forfait Codex n'expose qu'un bucket hebdomadaire (`codex`, 10080 min). Le
+fournisseur applique en plus un **bucket de rafale/concurrence non documenté,
+au niveau du compte** : plusieurs sessions reçoivent 429 sur la première
+requête d'un tour alors que la jauge hebdomadaire est loin de son plafond
+(openai/codex#41702, holon-run/holon#3369). Les runners le suivent maintenant
+ensemble :
+
+* `account_rate_events` journalise chaque 429 par `(harnais, compte)` ; le
+  cooldown partagé vaut 4 min après le premier refus, doublé à chaque refus
+  supplémentaire dans les 15 min, plafonné à 15 min. Il retarde le **début**
+  des tours, jamais un tour en cours ;
+* `account_turn_starts` porte les débuts de tour du compte ; l'écart minimal
+  par défaut est de **30 s**, le plafond de tours actifs de **2** (Codex) ;
+* `ameesh accounts list` affiche la jauge `codex-short-window` (texte et
+  `--json`) : tours actifs, écart de début, 429 récents et cooldown.
+
+Les deux seuils se règlent par profil de compte, comme les autres seuils de
+compte, sans redémarrage :
+
+```json
+{"accounts": {"codex": [
+  {"name": "primaire", "max_concurrent": 2, "min_start_gap_s": 30}
+]}}
+```
+
+`max_concurrent: 0` ou `min_start_gap_s: 0` désactivent la garde
+correspondante ; l'absence des clés prend les défauts du harnais. Un exécuteur
+médié sans le domaine `account_windows` ignore la garde (contrat fermé).

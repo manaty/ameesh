@@ -315,6 +315,14 @@ class Profile:
     #: #1469: dollars reserved before each turn on that billing account (the
     #: bound of one turn), settled at the real cost when the turn ends
     reserve_usd: float = 2.0
+    #: #3779: provider short-window admission of this account. `None` = the
+    #: harness default (`account_window`); an explicit integer caps the
+    #: account's concurrent turns (0 disables the cap), an explicit number of
+    #: seconds spaces two turn starts (0 disables the gap). The start gap is
+    #: what the observed bursts needed: five turn starts in 90 s produced 429s
+    #: even with one active turn.
+    max_concurrent: int | None = None
+    min_start_gap_s: float | None = None
     #: #1176: the account's own pace ceiling (default `cost.PACE_CEILING`),
     #: and its end-of-window raise. Within `pace_ceiling_end_hours` of a
     #: window's `resets_at`, the ceiling rises to `pace_ceiling_end` when the
@@ -533,6 +541,27 @@ def parse(raw) -> dict[str, list[Profile]]:
             if not reserve > 0 or reserve == float("inf"):
                 raise AccountError("account %s/%s: reserve_usd must be positive"
                                    % (harness, name))
+            # #3779 : admission de la fenêtre courte du fournisseur. Absent =
+            # défaut du harnais (`account_window`) ; 0 explicite désactive.
+            max_concurrent = item.get("max_concurrent")
+            if max_concurrent is not None and (
+                    isinstance(max_concurrent, bool)
+                    or not isinstance(max_concurrent, int) or max_concurrent < 0):
+                raise AccountError("account %s/%s: max_concurrent must be an "
+                                   "integer >= 0" % (harness, name))
+            min_start_gap_s = item.get("min_start_gap_s")
+            if min_start_gap_s is not None:
+                if isinstance(min_start_gap_s, bool):
+                    raise AccountError("account %s/%s: min_start_gap_s must be a "
+                                       "finite number >= 0" % (harness, name))
+                try:
+                    min_start_gap_s = float(min_start_gap_s)
+                except (TypeError, ValueError):
+                    raise AccountError("account %s/%s: unreadable min_start_gap_s"
+                                       % (harness, name))
+                if not math.isfinite(min_start_gap_s) or min_start_gap_s < 0:
+                    raise AccountError("account %s/%s: min_start_gap_s must be a "
+                                       "finite number >= 0" % (harness, name))
             pace_ceiling, pace_ceiling_end, pace_ceiling_end_hours = _pace_ceiling(
                 harness, name, item)
             overage = str(item.get("overage") or "auto")
@@ -570,6 +599,7 @@ def parse(raw) -> dict[str, list[Profile]]:
                 priority=priority, overage=overage, **caps,
                 pace_multiplier=pace_multiplier, pace_local=pace_local, declared=True,
                 billing_account=billing, reserve_usd=reserve,
+                max_concurrent=max_concurrent, min_start_gap_s=min_start_gap_s,
                 pace_ceiling=pace_ceiling,
                 pace_ceiling_end=pace_ceiling_end,
                 pace_ceiling_end_hours=pace_ceiling_end_hours,

@@ -67,6 +67,7 @@ import sys
 import time
 
 from . import accounts as accounts_mod
+from . import account_window
 from . import balance as balance_mod
 from . import authority, catalog, mail, config as config_mod, cost as cost_mod, db as db_mod, identity
 from . import migrations, placement, progress, registry
@@ -4501,6 +4502,10 @@ def cmd_accounts(cfg: Config, args) -> int:
         # #1580 point 2 : la marge des forfaits et les agents déplaçables
         # (lecture seule : aucune bascule n'est faite ici)
         prop = rebalance_mod.proposal(cfg, db, book)
+        # #3779 : la fenêtre courte du fournisseur (bucket de rafale partagé
+        # par les sessions du compte), lue dans le journal central — la
+        # « jauge » demandée par le témoin du lot.
+        courte = account_window.rows(db, rows, profiles=declares)
         bascules = storage.of(db).accounts.switches(cfg.host, None, max(0, getattr(args, "last", 5))) \
             if declares else []
         if getattr(args, "json", False):
@@ -4511,7 +4516,8 @@ def cmd_accounts(cfg: Config, args) -> int:
             print(json.dumps({"schema": "ameesh-accounts/1", "host": cfg.host,
                               "config": _config_origin(cfg),
                               "accounts": rows, "switches": bascules,
-                              "credentials": sante, "proposal": prop.as_dict()},
+                              "credentials": sante, "proposal": prop.as_dict(),
+                              "short_window": courte},
                              ensure_ascii=False, indent=2, default=str))
             return 0
         if cfg.config_base:
@@ -4526,6 +4532,11 @@ def cmd_accounts(cfg: Config, args) -> int:
                          "host's; a stale profile diverges silently from other runners")
             print(note)
         print(accounts_mod.format_rows(rows))
+        if courte:
+            print()
+            print("short window (provider burst bucket shared by sessions, #3779):")
+            for ligne in account_window.format_rows(courte):
+                print(ligne)
         print(prop.text())
         if bascules:
             print()

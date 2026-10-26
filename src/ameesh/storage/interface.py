@@ -1091,6 +1091,50 @@ class Accounts(Domain):
 
 
 # --------------------------------------------------------------------------
+# fenêtre courte du fournisseur, par compte logique (#3779)
+# --------------------------------------------------------------------------
+
+class AccountWindows(Domain):
+    """Refus 429 du fournisseur, partagés par les exécuteurs d'un même compte.
+
+    Les lignes de `account_rate_events` ne portent que des noms de comptes,
+    des noms d'agents, l'hôte et le texte d'erreur du fournisseur (borné) :
+    jamais de secret, d'invite ni de jeton. La clé est le compte **logique**
+    (`harness`, `account`), le même nom sur tous les hôtes du réservoir (Codex :
+    `primaire`) — le bucket de rafale est celui du fournisseur, pas celui d'un
+    hôte.
+    """
+
+    @abc.abstractmethod
+    def record(self, harness: str, account: str, host: str, agent: str,
+               kind: str, detail: str | None) -> None:
+        """Ajoute un refus fournisseur (`kind` = `rate_limited`)."""
+
+    @abc.abstractmethod
+    def recent(self, harness: str, account: str, since_s: float) -> dict:
+        """Les refus des `since_s` dernières secondes : `count`, `last_at_ts`
+        (epoch), `last_agent`, `last_host`, `last_detail`. Zéros et None sans
+        refus ; l'instant est celui de la base (`now()`), commun aux hôtes."""
+
+    @abc.abstractmethod
+    def active(self, harness: str, account: str) -> list[dict]:
+        """Les tours `running` du compte : `name`, `host`, `status_since_ts`
+        (epoch). Un agent sans `session_account` est compté (session d'avant
+        L30, ou premier tour d'une session neuve) : conservateur, jamais un
+        dépassement silencieux."""
+
+    @abc.abstractmethod
+    def start(self, harness: str, account: str, host: str, agent: str) -> None:
+        """Journalise le début d'un tour du compte (écart entre deux débuts)."""
+
+    @abc.abstractmethod
+    def last_start(self, harness: str, account: str) -> dict:
+        """Le dernier début de tour du compte : `last_at_ts` (epoch, None sans
+        début) et `last_agent`, `last_host`. Instant de la base, commun aux
+        hôtes."""
+
+
+# --------------------------------------------------------------------------
 # credential health (L226a/L226b, migrations 0060 and 0068)
 # --------------------------------------------------------------------------
 
@@ -4762,6 +4806,7 @@ class Storage(abc.ABC):
     pending_spend: PendingSpend
     turn_costs: TurnCosts
     accounts: Accounts
+    account_windows: AccountWindows
     credentials: Credentials
     budgets: Budgets
     api_requests: ApiRequests
