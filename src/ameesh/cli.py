@@ -2194,6 +2194,13 @@ def cmd_doctor(cfg: Config, notify_test: bool, probe: bool = False,
             print(line)
     except Exception as exc:  # a reading never breaks the doctor
         print("network    : not checked (%s)" % (" ".join(str(exc).split())[:120],))
+    # #3735 : le banc Postgres local (schémas t_* orphelins, catalogues
+    # gonflés, autovacuum muet) — un signal, jamais un verdict KO : la base
+    # du mesh peut être saine alors que le banc de l'hôte ne l'est pas. Lu
+    # avant la connexion au mesh pour rester visible si celle-ci échoue.
+    from . import bench as bench_mod
+    for line in bench_mod.doctor_lines(cfg):
+        print(line)
     started = time.monotonic()
     try:
         db = db_mod.connect(cfg)

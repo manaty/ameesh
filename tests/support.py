@@ -22,6 +22,7 @@ from unittest import mock
 import uuid
 from unittest import mock
 
+from ameesh import bench as bench_mod
 from ameesh import config as config_mod
 from ameesh import db as db_mod
 from ameesh import migrations
@@ -91,6 +92,10 @@ TEST_DSN = os.environ.get(
 )
 REQUIRE_DB = os.environ.get(
     "AMEESH_REQUIRE_DB", os.environ.get("AGENT_MESH_REQUIRE_DB", "1")) != "0"
+#: lot #3735 : une seule passe de ménage du banc par processus de suite (un
+#: schéma t_* laissé par une exécution tuée). Un échec de lecture ne fait
+#: jamais échouer un test ; `AMEESH_BENCH_UPKEEP=0` la désactive.
+BENCH_UPKEEP_DONE = False
 #: L142 : le banc ne dépend pas non plus de l'umask de la session appelante
 #: (0002 sur certains hôtes, 0022 en CI). Les fixtures d'arbres de confiance
 #: créent répertoires 0700 et fichiers 0644 et les vérifient ; un umask
@@ -574,6 +579,28 @@ class SensitiveGlobalsMixin:
             verify_sensitive_globals(cls)
 
 
+def _bench_upkeep(db) -> None:
+    """Purge les schémas t_* orphelins, une fois par processus de suite.
+
+    Le banc est partagé par tous les agents de l'hôte (`scripts/pg-up.sh`) :
+    une exécution tuée laisse son schéma. La passe est bornée (âge, sessions,
+    verrou court) et ne fait jamais échouer un test.
+    """
+    global BENCH_UPKEEP_DONE
+    if BENCH_UPKEEP_DONE:
+        return
+    BENCH_UPKEEP_DONE = True
+    if os.environ.get("AMEESH_BENCH_UPKEEP", "1").lower() in ("0", "false", "no", "off"):
+        return
+    try:
+        result = bench_mod.purge_orphans(db)
+    except Exception:  # noqa: BLE001 — un ménage de banc ne juge jamais un test
+        return
+    if result.dropped:
+        print("banc : %d schéma(s) t_* orphelin(s) purgé(s)" % len(result.dropped),
+              file=sys.stderr)
+
+
 class PgTestCase(SensitiveGlobalsMixin, unittest.TestCase):
     """Base : un schéma migré, un bac à sable disque, des utilitaires CLI."""
 
@@ -585,6 +612,11 @@ class PgTestCase(SensitiveGlobalsMixin, unittest.TestCase):
             uuid.uuid4().hex[:8],
         )
         cls.tmp = tempfile.mkdtemp(prefix="agent-mesh-test-")
+        # #3735 : `tearDownClass` n'est pas appelé quand `setUpClass` échoue
+        # (migration en erreur, kill) — le schéma resterait à jamais. Le
+        # cleanup de classe est enregistré AVANT la migration ; le drop de
+        # `tearDownClass` reste le chemin normal.
+        cls.addClassCleanup(cls._drop_schema)
         cls.state = os.path.join(cls.tmp, "state")
         cls.v0state = os.path.join(cls.tmp, "v0state")
         cls.conf = os.path.join(cls.tmp, "conf")
@@ -609,6 +641,7 @@ class PgTestCase(SensitiveGlobalsMixin, unittest.TestCase):
             if REQUIRE_DB:
                 raise AssertionError(message) from exc
             raise unittest.SkipTest(message) from exc
+        _bench_upkeep(cls.db)
         migrations.migrate(cls.db, log=None)
         if CARTE:
             try:
@@ -617,11 +650,22 @@ class PgTestCase(SensitiveGlobalsMixin, unittest.TestCase):
                 cls._carte_tables = None
 
     @classmethod
+    def _drop_schema(cls) -> None:
+        """Supprime le schéma de la classe ; tolère une base déjà fermée."""
+        db = getattr(cls, "db", None)
+        if db is None:
+            return
+        try:
+            db.execute('DROP SCHEMA IF EXISTS "%s" CASCADE' % cls.schema)
+        except Exception:  # noqa: BLE001 — cleanup : ne masque pas l'erreur d'origine
+            pass
+
+    @classmethod
     def tearDownClass(cls) -> None:
         try:
             noter_tables(cls)
             try:
-                cls.db.execute('DROP SCHEMA IF EXISTS "%s" CASCADE' % cls.schema)
+                cls._drop_schema()
                 cls.db.close()
             finally:
                 shutil.rmtree(cls.tmp, ignore_errors=True)

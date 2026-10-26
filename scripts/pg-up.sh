@@ -104,6 +104,21 @@ garde_sources() {
   done <<<"$conteneurs"
 }
 
+# #3735 : un banc démarré (ou créé) purge les schémas t_* qu'une suite tuée a
+# laissés ; un banc déjà en marche n'est jamais touché (les suites le font
+# elles-mêmes, une fois par processus). `AMEESH_PG_UPKEEP=0` désactive.
+STARTED=0
+menage_banc() {
+  [ "${AMEESH_PG_UPKEEP:-1}" != 0 ] || return 0
+  (
+    cd "$(dirname "$0")/.." || exit 0
+    if [ -n "$PASSWORD" ]; then export PGPASSWORD="$PASSWORD"; fi
+    export AMEESH_DRIVER=psql PYTHONPATH="src${PYTHONPATH:+:$PYTHONPATH}"
+    python3 -m ameesh.bench purge \
+      --dsn "postgresql://$USER@127.0.0.1:$PORT/$DB" 2>&1
+  ) | sed 's/^/banc : /' || true
+}
+
 if docker inspect "$NAME" >/dev/null 2>&1; then
   if [ "$(docker inspect -f '{{.State.Running}}' "$NAME")" != "true" ]; then
     # un conteneur créé avant ce garde peut partager ses données avec un
@@ -114,6 +129,7 @@ if docker inspect "$NAME" >/dev/null 2>&1; then
     garde_sources "" "$miennes"
     echo "démarrage du conteneur $NAME"
     docker start "$NAME" >/dev/null
+    STARTED=1
   fi
 else
   if [ -z "$PASSWORD" ]; then
@@ -181,6 +197,15 @@ else
     fi
   fi
   echo "création du conteneur $NAME ($IMAGE, 127.0.0.1:$PORT, volume $VOLUME)"
+  # #3735 : les catalogues d'un banc partagé encaissent des dizaines de
+  # milliers de CREATE/DROP par jour ; le réglage par défaut (seuil 20 %,
+  # réveil 60 s) laisse filer les tuples morts. Valeurs surchargeables ;
+  # un conteneur existant les garde jusqu'à sa recréation (volume intact).
+  AUTOVACUUM_OPTS=(
+    -c "autovacuum_naptime=${AMEESH_PG_AUTOVACUUM_NAPTIME:-15s}"
+    -c "autovacuum_vacuum_scale_factor=${AMEESH_PG_AUTOVACUUM_SCALE:-0.05}"
+    -c "autovacuum_analyze_scale_factor=${AMEESH_PG_AUTOVACUUM_ANALYZE_SCALE:-0.05}"
+  )
   # #1411 : le banc est partagé par tous les agents de l'hôte ; l'étiquette
   # d'un tour (posée par le shim docker depuis AMEESH_CONTAINER_LABELS) en
   # ferait la ressource d'un tour et d'un lot, gardée jusqu'à la fin du lot
@@ -191,12 +216,17 @@ else
     -v "$VOLUME":/var/lib/postgresql/data \
     --health-cmd "pg_isready -U $USER -d $DB" \
     --health-interval 2s --health-timeout 3s --health-retries 30 \
-    "$IMAGE" >/dev/null
+    "$IMAGE" "${AUTOVACUUM_OPTS[@]}" >/dev/null
+  STARTED=1
 fi
 
 for _ in $(seq 1 60); do
   status=$(docker inspect -f '{{.State.Health.Status}}' "$NAME" 2>/dev/null || echo unknown)
-  [ "$status" = healthy ] && { echo "$NAME prêt sur 127.0.0.1:$PORT"; exit 0; }
+  [ "$status" = healthy ] && {
+    [ "$STARTED" = 1 ] && menage_banc
+    echo "$NAME prêt sur 127.0.0.1:$PORT"
+    exit 0
+  }
   sleep 1
 done
 echo "le conteneur $NAME n'est pas devenu sain" >&2
