@@ -97,7 +97,11 @@ attendu (`ameesh work note <lot> "hold: attente bureau : <geste>"`, ou
 une relance à cet exécutant — à l'échéance déclarée, sinon après le seuil du
 débit (`(due 2026-10-25 12:00 UTC)`). La relance est réaffichée à chaque
 passage et se porte au bureau (§10) ; `--check` ne sort pas 2 sur une attente
-externe. Une simple
+externe. #3773 : le hold peut aussi déclarer un **tiers extérieur** sans
+nommer le bureau ni l'owner (`"hold: attente externe : revue Apple"`,
+`"hold: attente externe : examen du store"`) ; le débit le range dans les
+mêmes attentes externes, avec `externe` comme exécutant et la relance portée
+au bureau. Une simple
 mention d'une règle ou d'une consigne de l'owner, ou d'une décision déjà
 signée, ne classe pas l'attente humaine ; un `hold_undeployed` ne l'est jamais
 (canon §11 bis).
@@ -109,7 +113,7 @@ le JSON plutôt que le texte.
 
 | # | Point | Commandes | Signe d'un problème |
 |---|---|---|---|
-| 0 | **Débit (en premier)** | `ameesh debit --json` (`--check` pour le code de sortie) | `slow_waits` non vide (attente de plus de 2 h sans geste) ; `device_holds` ou `undeployed_holds` non vides ; `external_reminders` (relances bureau/owner dues, #3498) ; `reviews_by_reviewer` (avis dus) ; `idle_agents_with_work` ; `ci.slow_runs` et `ci.slow_jobs` (le job macOS de 3 à 4 h avant #3198) |
+| 0 | **Débit (en premier)** | `ameesh debit --json` (`--check` pour le code de sortie) | `slow_waits` non vide (attente de plus de 2 h sans geste) ; `device_holds` ou `undeployed_holds` non vides ; `external_reminders` (relances bureau/owner/tiers dues, #3498, #3773) ; `reviews_by_reviewer` (avis dus) ; `idle_agents_with_work` ; `ci.slow_runs` et `ci.slow_jobs` (le job macOS de 3 à 4 h avant #3198) |
 | 1 | Agents bloqués, arrêtés ou à vide | `ameesh list`, `ameesh show <agent>`, `ameesh alerts --json` | `stopped_with_mail`, `idle_with_mail`, `dead_runner`, `host_not_ready` ; agent au repos avec un lot actionnable (`idle_actionable_lot`, niveau 1 : il relance) ; `critical_budget_pause` (urgent, L242b) : un orchestrateur, l'agent de conception ou un auditeur en pause budget |
 | 2 | Tours longs, sessions qui grossissent | `ameesh alerts --json`, `ameesh cost turns` | `long_turn`, `session_too_big`, `stale_lot` |
 | 3 | Forfaits | `ameesh accounts list` | capacité perdue à la prochaine remise à zéro (`plan_underused`), compte au seuil de rythme, compte forcé depuis longtemps |
