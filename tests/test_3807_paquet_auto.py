@@ -278,6 +278,24 @@ class PaquetAutoBanc(unittest.TestCase):
             self.repo, ref, "fixture", self.base, compose_script=COMPOSE,
             candidates_json=good, log=lambda _line: None), 0)
 
+    @unittest.skipUnless(_has_ref("b57c0380") and _has_ref("f444955b"),
+                         "témoin h-31 v3 : références absentes de ce clone")
+    def test_rejeu_h31_v3_refuse_le_lot_en_erreur(self) -> None:
+        # Le snapshot minimal des entrées h-31 : #3506 est en erreur de porte,
+        # les six autres unités de la v4 sont prêtes.
+        snapshot = pathlib.Path(self.tmp.name) / "h31-candidats.json"
+        snapshot.write_text(json.dumps({
+            "base": "f444955b2eebcde5b096175e2c52e7a32bceda06",
+            "ready": [3779, 3782, 3755, 3792, 3788, 3735],
+            "errors": ["#3506 : provenance de gel illisible (cas #3781)"],
+        }), encoding="utf-8")
+        with self.assertRaises(paquet_auto.PaquetAutoError) as caught:
+            paquet_auto.replay(
+                REPO, "b57c0380", "h-20261026-31", "f444955b",
+                candidates_json=snapshot, log=lambda _line: None)
+        self.assertIn("#3506", str(caught.exception))
+        self.assertIn("erreur", str(caught.exception))
+
     @unittest.skipUnless(_has_ref("fc59a14e") and _has_ref("f444955b"),
                          "témoin h-31 v4 : références absentes de ce clone")
     def test_rejeu_h31_v4_arbre_identique(self) -> None:
