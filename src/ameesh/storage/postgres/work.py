@@ -583,6 +583,12 @@ class WorkItems(interface.WorkItems):
         gagnant). Le verrou est pris avant les lignes de lots : aucun chemin
         ne prend l'ordre inverse.
 
+        #3607 : la relecture couvre aussi la `source` exacte, pas seulement
+        `issue_ref` — l'identité d'une exécution y vit aussi
+        (`ci-incident:<repo>:<run>`) et la synchro des tickets peut avoir
+        déplacé l'`issue_ref` du gagnant vers son ticket miroir pendant
+        l'attente du verrou.
+
         `parent_lot` (#1193): the explicit parent of a suite lot. The parent is
         read back **under lock in the same transaction**: still open, the
         blocking dependency edge is written with the creation (a failure of the
@@ -637,11 +643,15 @@ class WorkItems(interface.WorkItems):
                 # #2954 : sous le verrou consultatif, la relecture voit le
                 # premier créateur (son commit précède l'acquisition) ; un lot
                 # fermé garde l'identité de l'exécution, comme `_open`.
+                # #3607 : l'identité vit aussi dans `source`, exactement — la
+                # synchro des tickets peut avoir déplacé l'`issue_ref` du
+                # gagnant vers son ticket miroir pendant l'attente du verrou.
                 duplicate = tx.query(
-                    "SELECT id FROM work_items WHERE lower(issue_ref) = lower(%s)"
-                    " ORDER BY id LIMIT 1", (issue_ref,))
+                    "SELECT id FROM work_items"
+                    " WHERE lower(issue_ref) = lower(%s) OR lower(source) = lower(%s)"
+                    " ORDER BY id LIMIT 1", (issue_ref, issue_ref))
                 if duplicate:
-                    raise DbError("issue_ref %s is already carried by lot #%d"
+                    raise DbError("reference %s is already carried by lot #%d"
                                   % (issue_ref, int(duplicate[0]["id"])))
             behind = (WorkItems(tx)._pending(assignee, None)
                       if queued_note is not None and assignee else None)
@@ -3033,6 +3043,19 @@ class WorkItems(interface.WorkItems):
         return self.db.query(
             "SELECT %s FROM work_items WHERE lower(issue_ref) = lower(%%s)"
             " ORDER BY id" % item_columns(self.db), (str(ref or ""),))
+
+    def by_source(self, source) -> list[dict]:
+        """#3607 : les lots dont la `source` vaut exactement cette référence,
+        quel que soit leur état. La comparaison est à la casse près, comme
+        `by_issue_ref` (la casse d'un dépôt GitHub ne fait pas une autre
+        exécution). Une source vide ne désigne rien : sans la garde, elle
+        rendrait tous les lots sans source."""
+        text = str(source or "").strip()
+        if not text:
+            return []
+        return self.db.query(
+            "SELECT %s FROM work_items WHERE lower(source) = lower(%%s)"
+            " ORDER BY id" % item_columns(self.db), (text,))
 
     def by_package(self, package_id) -> list[dict]:
         return self.db.query(
