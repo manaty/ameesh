@@ -10,6 +10,9 @@ voisines.
 """
 from __future__ import annotations
 
+import os
+import subprocess
+import sys
 import time
 import unittest
 import uuid
@@ -86,6 +89,48 @@ class BenchCataloguesTest(PgTestCase):
         self.assertIn(mine, result.dropped)
         self.assertNotIn(neighbour, result.dropped)
         self.assertTrue(self._exists(neighbour))
+
+    def test_owner_marker_protects_idle_old_schema(self) -> None:
+        """Le cas du verdict codex : propriétaire vivant, aucune session active.
+
+        Une suite au repos entre deux transactions n'a ni verrou ni requête
+        qui nomme son schéma ; seule la preuve de propriété (PID/start du
+        processus) le garde. Un propriétaire mort ne protège plus.
+        """
+        owned = _name("owned")
+        gone = _name("gone")
+        self._create(owned)
+        self._create(gone)
+        bench_mod.claim_owner(self.db, owned)  # le processus de la suite vit
+        child = subprocess.Popen([sys.executable, "-c", "pass"])
+        child.wait()
+        bench_mod.claim_owner(self.db, gone, pid=child.pid, start=0)
+        # la dernière requête de la connexion ne doit nommer aucun des deux
+        # schémas (sinon la garde _in_use suffirait au lieu de la preuve).
+        self.db.query("SELECT 1")
+        time.sleep(1.1)
+        result = bench_mod.purge_orphans(self.db, min_age_s=0.5, only={owned, gone})
+        self.assertNotIn(owned, result.dropped)
+        self.assertTrue(self._exists(owned))
+        self.assertIn(gone, result.dropped)
+        self.assertFalse(self._exists(gone))
+
+    def test_owner_marker_round_trip(self) -> None:
+        marker = bench_mod.owner_marker()
+        self.assertEqual(bench_mod.parse_owner(marker)[0], os.getpid())
+        self.assertTrue(bench_mod.owner_alive(marker))
+        self.assertFalse(bench_mod.owner_alive("un commentaire étranger"))
+        child = subprocess.Popen([sys.executable, "-c", "pass"])
+        child.wait()
+        dead = "ameesh-bench-owner pid=%d start=0" % child.pid
+        self.assertFalse(bench_mod.owner_alive(dead))
+
+    def test_pgtestcase_schema_has_live_owner(self) -> None:
+        """Le socle pose bien la preuve de propriété de son propre schéma."""
+        row = self.db.query(
+            "SELECT obj_description(n.oid, 'pg_namespace') AS comment "
+            "FROM pg_namespace n WHERE n.nspname = %s", (self.schema,))[0]
+        self.assertTrue(bench_mod.owner_alive(row["comment"]), row["comment"])
 
     def test_read_counts_orphans_and_catalogs(self) -> None:
         reading = bench_mod.read(self.db)

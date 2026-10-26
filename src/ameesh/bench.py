@@ -13,9 +13,13 @@ depuis le 17/10). Cette maintenance :
 
 * purge les schémas `t_*` **prouvés** orphelins — créés depuis plus de
   ``ORPHAN_MIN_AGE_HOURS`` (âge de leur première relation, une borne basse :
-  un schéma récent n'est jamais purgé) et sans session qui les nomme, les
-  verrouille ou les porte dans un `search_path` déclaré (jamais un schéma en
-  cours d'usage) ;
+  un schéma récent n'est jamais purgé), sans propriétaire vivant et sans
+  session qui les nomme, les verrouille ou les porte dans un `search_path`
+  déclaré. La preuve de propriété est un commentaire de schéma
+  (``ameesh-bench-owner pid=… start=…``, PID et starttime de l'hôte) posé par
+  la suite : une suite au repos entre deux transactions n'a ni verrou ni
+  requête nommante, et reste pourtant propriétaire ; sa mort (le processus
+  disparaît) libère la purge ;
 * signale le gonflement et un dernier autovacuum trop ancien (`doctor`) ;
 * refuse de conclure quand l'activité n'est pas lisible (pas superutilisateur,
   `pg_stat_file` refusé) : le doute ne supprime rien.
@@ -37,9 +41,11 @@ from __future__ import annotations
 import dataclasses
 import os
 import re
+import socket
 import sys
 import time
 from dataclasses import dataclass
+from urllib.parse import urlsplit
 
 from . import db as db_mod
 
@@ -241,6 +247,9 @@ def read(db, *, now: float | None = None) -> Reading:
         "FROM pg_stat_sys_tables WHERE schemaname = 'pg_catalog' "
         "AND relname IN (%s)" % names
     )
+    # le plus récent des catalogues suivis : l'autovacuum est muet seulement
+    # si aucun n'a été touché depuis le seuil ; un catalogue calme (pg_proc)
+    # ne doit pas déclencher un faux signal.
     last_values = [float(row["last_autovacuum"]) for row in vac_rows
                    if row["last_autovacuum"] is not None]
     orphan_row = db.query(
@@ -252,7 +261,7 @@ def read(db, *, now: float | None = None) -> Reading:
         size_bytes=int(row["size_bytes"] or 0),
         catalogs=catalogs,
         orphan_schemas=int(orphan_row["n"] or 0),
-        last_autovacuum=(min(last_values) if last_values else None),
+        last_autovacuum=(max(last_values) if last_values else None),
         server_start=(float(row["server_start"]) if row["server_start"] is not None else None),
         now=now,
     )
@@ -265,6 +274,120 @@ class Orphan:
     schema: str
     created: float
     age_s: float
+
+
+#: préfixe du commentaire de schéma qui prouve son propriétaire (suite de test)
+OWNER_TAG = "ameesh-bench-owner"
+_OWNER_RE = re.compile(r"^ameesh-bench-owner pid=(\d+)(?: start=(\d*))?$")
+
+
+def process_start(pid: int) -> int | None:
+    """Champ 22 (starttime) de /proc/<pid>/stat ; None si absent/illisible.
+
+    Sert à distinguer un propriétaire d'un processus qui a réutilisé son PID.
+    Sur un système sans /proc (macOS), None : la vivacité se juge alors au
+    seul ``os.kill``.
+    """
+    try:
+        with open("/proc/%d/stat" % int(pid), "r", encoding="ascii",
+                  errors="replace") as fh:
+            text = fh.read()
+    except (OSError, ValueError, TypeError):
+        return None
+    try:
+        fields = text.rsplit(")", 1)[1].split()
+        return int(fields[19])
+    except (IndexError, ValueError):
+        return None
+
+
+def owner_marker(pid: int | None = None, start: int | None = None) -> str:
+    """Commentaire de propriété d'un schéma (PID et starttime de l'hôte)."""
+    pid = os.getpid() if pid is None else int(pid)
+    start = process_start(pid) if start is None else int(start)
+    return "%s pid=%d start=%s" % (OWNER_TAG, pid, "" if start is None else start)
+
+
+def parse_owner(comment: str | None) -> tuple[int, int | None] | None:
+    """(pid, start) d'un commentaire de propriété, ou None si étranger."""
+    if not comment:
+        return None
+    match = _OWNER_RE.match(comment.strip())
+    if match is None:
+        return None
+    start = match.group(2)
+    return int(match.group(1)), (int(start) if start else None)
+
+
+def owner_alive(comment: str | None) -> bool:
+    """Le propriétaire du schéma (processus de la suite) vit-il encore ?"""
+    parsed = parse_owner(comment)
+    if parsed is None:
+        return False
+    pid, start = parsed
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        pass  # le processus existe, il n'est pas à nous
+    except OSError:
+        return False
+    if start is None:
+        return True
+    actual = process_start(pid)
+    # /proc illisible (macOS) : le kill suffit ; un start connu et différent =
+    # PID réutilisé, donc l'ancien propriétaire est bien parti.
+    return actual is None or actual == start
+
+
+def claim_owner(db, schema: str, *, pid: int | None = None,
+                start: int | None = None) -> None:
+    """Pose la preuve de propriété du schéma, tenue par toute la classe.
+
+    ``pid``/``start`` sont ceux du processus de la suite par défaut ; les
+    témoins peuvent désigner un processus mort. Le commentaire disparaît avec
+    le schéma (``DROP SCHEMA``).
+    """
+    if not SCHEMA_RE.match(schema):
+        raise ValueError("invalid bench schema name")
+    # COMMENT ... IS n'accepte pas un paramètre lié (psycopg enverrait $1) :
+    # le marqueur est construit ici (PID/start entiers), jamais une entrée
+    # libre ; on l'inline comme littéral SQL.
+    marker = owner_marker(pid=pid, start=start)
+    literal = "'" + marker.replace("'", "''") + "'"
+    db.execute('COMMENT ON SCHEMA "%s" IS %s' % (schema, literal))
+
+
+def _owners(db) -> dict[str, str]:
+    """Commentaire de chaque schéma t_* (vide si aucun)."""
+    try:
+        rows = db.query(
+            "SELECT n.nspname AS schema, "
+            "obj_description(n.oid, 'pg_namespace') AS comment "
+            "FROM pg_namespace n WHERE left(n.nspname, 2) = %s",
+            (SCHEMA_PREFIX,),
+        )
+    except db_mod.DbError as exc:
+        raise BenchError("bench owners unreadable: %s" % exc) from exc
+    return {str(row["schema"]): str(row["comment"])
+            for row in rows if row["comment"]}
+
+
+def _local_dsn(dsn: str) -> bool:
+    """La preuve de propriété est un PID de l'hôte : le banc doit être local."""
+    if not dsn:
+        return True
+    if not dsn.startswith(("postgresql://", "postgres://")):
+        return False  # forme mot-clé/hôte inconnu : refus conservateur
+    try:
+        host = urlsplit(dsn).hostname
+    except ValueError:
+        return False
+    if not host:
+        return True  # socket local
+    return host in ("127.0.0.1", "localhost", "::1",
+                    socket.gethostname(), socket.getfqdn())
 
 
 def _creation_rows(db) -> list[dict]:
@@ -305,7 +428,15 @@ def _own_schema(db) -> str:
 
 
 def _in_use(db) -> set[str]:
-    """Schémas qu'une session nomme, verrouille ou porte dans un search_path."""
+    """Garde bon marché : schéma nommé, verrouillé ou dans un search_path.
+
+    Ce n'est pas une preuve de propriété : entre deux transactions, une
+    connexion au repos n'a ni verrou ni requête qui nomme son schéma, et un
+    ``search_path`` posé par les options de connexion n'apparaît pas dans
+    ``pg_db_role_setting``. La preuve durable est le commentaire de schéma
+    (``claim_owner``) ; cette garde couvre les schémas antérieurs, sans
+    commentaire.
+    """
     used: set[str] = set()
     queries = (
         "SELECT DISTINCT n.nspname AS schema FROM pg_namespace n "
@@ -339,15 +470,19 @@ def orphan_schemas(db, *, min_age_s: float | None = None,
     """Schémas ``t_*`` orphelins prouvés : assez vieux, aucune session.
 
     Un schéma sans relation n'a pas d'âge prouvable : il est gardé (le doute
-    ne supprime rien). ``only`` borne la passe à ces noms (témoins : le banc
-    est partagé, un âge minimal abaissé n'y vise jamais les schémas des autres
-    suites).
+    ne supprime rien). Un schéma dont le commentaire de propriété désigne un
+    processus encore vivant est gardé, même sans session ni verrou (suite au
+    repos entre deux transactions) ; un commentaire dont le processus est
+    mort ne protège plus. ``only`` borne la passe à ces noms (témoins : le
+    banc est partagé, un âge minimal abaissé n'y vise jamais les schémas des
+    autres suites).
     """
     minimum = orphan_min_age_s() if min_age_s is None else float(min_age_s)
     if minimum < 0:
         raise ValueError("min_age_s must be >= 0")
     moment = time.time() if now is None else float(now)
     rows = _creation_rows(db)
+    owners = _owners(db)
     used = _in_use(db)
     own = _own_schema(db)
     if own:
@@ -358,6 +493,9 @@ def orphan_schemas(db, *, min_age_s: float | None = None,
         if not SCHEMA_RE.match(name):
             continue
         if only is not None and name not in only:
+            continue
+        comment = owners.get(name)
+        if comment is not None and owner_alive(comment):
             continue
         if name in used:
             continue
@@ -410,6 +548,9 @@ def purge_orphans(db, *, min_age_s: float | None = None,
     revérifiés juste avant la passe ; une course reste couverte par le
     ``lock_timeout``.
     """
+    if not _local_dsn(getattr(getattr(db, "cfg", None), "dsn", "") or ""):
+        return Purge(scanned=0, dropped=(), kept=(),
+                     unreadable="bench is not local: owner proof is host-local")
     try:
         orphans = orphan_schemas(db, min_age_s=min_age_s, now=now, only=only)
     except BenchError as exc:

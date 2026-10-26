@@ -643,6 +643,14 @@ class PgTestCase(SensitiveGlobalsMixin, unittest.TestCase):
             raise unittest.SkipTest(message) from exc
         _bench_upkeep(cls.db)
         migrations.migrate(cls.db, log=None)
+        # #3735 : preuve de propriété durable du schéma — le processus de la
+        # suite vit, même au repos entre deux transactions sans verrou ni
+        # requête nommante ; sa mort libère la purge. Best-effort : sans
+        # commentaire, l'âge de 6 h protège encore le schéma.
+        try:
+            bench_mod.claim_owner(cls.db, cls.schema)
+        except Exception:  # noqa: BLE001 — jamais un échec de test pour la preuve
+            pass
         if CARTE:
             try:
                 cls._carte_tables = table_stats(cls.db, cls.schema)
