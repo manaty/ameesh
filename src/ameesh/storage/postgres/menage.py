@@ -127,23 +127,26 @@ class Housekeeping(interface.Housekeeping):
     def summary(self, host, since_s) -> list[dict]:
         # #2617: an unattributed /tmp entry is signaled again every 12 h; in
         # the 24 h window each path counts once, with its latest size, or the
-        # report shows its volume twice.
+        # report shows its volume twice. #3728: so does an `unremovable`
+        # reading, written at every pass while the episode lasts (84 lines of
+        # one 1.3 GiB directory read as 106.6 GiB on agents-2).
         where, params = "", [float(since_s)]
         if host:
             where = " AND host = %s"
             params.append(host)
+        once = "((kind = 'orphan' AND action = 'signaled') OR action = 'unremovable')"
         return self.db.query(
             "WITH recent AS ("
             " SELECT host, kind, action, path, bytes, at, id FROM housekeeping_log"
             " WHERE at >= now() - make_interval(secs => %s) AND kind <> 'mesure'" + where +
             "), signaled_once AS ("
-            " SELECT DISTINCT ON (host, path) host, kind, action, bytes FROM recent"
-            " WHERE kind = 'orphan' AND action = 'signaled'"
-            " ORDER BY host, path, at DESC, id DESC)"
+            " SELECT DISTINCT ON (host, kind, action, path) host, kind, action, bytes"
+            " FROM recent WHERE " + once +
+            " ORDER BY host, kind, action, path, at DESC, id DESC)"
             " SELECT host, kind, action, count(*)::int AS n,"
             " coalesce(sum(bytes), 0)::bigint AS bytes FROM ("
             " SELECT host, kind, action, bytes FROM recent"
-            " WHERE NOT (kind = 'orphan' AND action = 'signaled')"
+            " WHERE NOT " + once +
             " UNION ALL SELECT host, kind, action, bytes FROM signaled_once"
             ") AS lignes GROUP BY host, kind, action ORDER BY host, kind, action",
             tuple(params))

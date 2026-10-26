@@ -1002,12 +1002,19 @@ def _print_host_menage(menage: dict) -> None:
         from .menage import describe_top
         print("  /tmp large %s" % describe_top(m["system_tmp_top"]))
     if m:
+        # #3728 : les archives des worktrees gardés pour fichiers modifiés
+        # (ce que leur retrait a libéré est dans la ligne 24 h : `worktree
+        # archived`)
+        arch = m.get("worktree_archives") or {}
         print("  cleanup    temporary directories %s (quota %s per agent); caches %s / %s"
-              "%s" % (_fmt_bytes(m.get("tmp_bytes")), _fmt_bytes(m.get("tmp_quota")),
-                      _fmt_bytes(m.get("cache_bytes")), _fmt_bytes(m.get("cache_quota")),
-                      "; %d /tmp entries reported (%s)" % (
-                          m["orphans"], _fmt_bytes(m.get("orphan_bytes")))
-                      if m.get("orphans") else ""))
+              "%s%s" % (_fmt_bytes(m.get("tmp_bytes")), _fmt_bytes(m.get("tmp_quota")),
+                        _fmt_bytes(m.get("cache_bytes")), _fmt_bytes(m.get("cache_quota")),
+                        "; %d /tmp entries reported (%s)" % (
+                            m["orphans"], _fmt_bytes(m.get("orphan_bytes")))
+                        if m.get("orphans") else "",
+                        "; %d worktree archive(s) (%s)" % (
+                            arch["count"], _fmt_bytes(arch.get("bytes")))
+                        if arch.get("count") else ""))
     conteneurs = (m or {}).get("containers") or {}
     if conteneurs.get("ameesh") is not None or conteneurs.get("others") is not None:
         ours = conteneurs.get("ameesh") or []
