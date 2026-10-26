@@ -185,6 +185,14 @@ class CiStatusCarrierTest(unittest.TestCase):
         self.assertIn("packet carrier: no ci-full request on the frozen head %s" % A[:12], text)
         self.assertIn("ameesh ci run 3599 --full", text)
 
+    def test_unrequested_carrier_stays_conditional_on_the_protection(self):
+        # #3614 : le journal ne lit pas la protection ; sans check imposé
+        # (Nexlink), le feu atterrit le porteur — pas d'affirmation nue.
+        text = "\n".join(ci.render_status(self._report()))
+        self.assertIn("if the target's forge requires checks", text)
+        self.assertIn("without required checks (Nexlink), the fire lands it", text)
+        self.assertIn("journal alone does not tell which", text)
+
     def test_requested_but_not_armed(self):
         text = "\n".join(ci.render_status(self._report(requested=True)))
         self.assertIn("auto-merge is not armed", text)
