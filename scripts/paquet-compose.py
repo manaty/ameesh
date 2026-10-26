@@ -29,10 +29,13 @@ fusion de la première parente depuis `--base` qui portent `ameesh-work:`) et
 imprime une ligne `N unités de fusion, M lots portés : #<lot> <tête>, …`
 (tête = second parent, 12 caractères) à reprendre telle quelle dans le corps du
 lot porteur et dans le manifeste (#2360) : le porteur déclare ainsi ses unités
-sans rien recopier à la main. Une unité peut porter plusieurs lots, tous listés
-avec leur tête. Une fusion sans trailer (mise à jour depuis la cible) n'est pas
-une unité ; un lot recomposé garde sa place, prend la tête la plus récente et
-son unité est le commit de composition le plus récent. Le compteur distingue
+sans rien recopier à la main. Suit le gabarit de la table `## Composition`
+du manifeste (`| unité | lot(s) | source | commit | note |`), la seule forme
+que lisent `sync-packets` et la coupe de release (#3629). Une unité peut
+porter plusieurs lots, tous listés avec leur tête. Une fusion sans trailer
+(mise à jour depuis la cible) n'est pas une unité ; un lot recomposé garde sa
+place, prend la tête la plus récente et son unité est le commit de
+composition le plus récent. Le compteur distingue
 donc les unités de fusion encore rattachées à un lot des lots portés (#2387).
 
 Ne réécrit aucun commit existant : la convention vaut pour les unités
@@ -185,6 +188,39 @@ def packet_units(repo: Path, base: str, head: str = "HEAD"
     return units, len(set(unit_of.values()))
 
 
+def manifest_template(repo: Path, base: str, head: str = "HEAD") -> str:
+    """#3629 : la table de composition du manifeste, prête à coller.
+
+    Une ligne par unité de fusion encore rattachée à un lot, dans l'ordre de
+    composition : ses lots, la source composée (second parent) et le commit
+    de composition. C'est la forme que lisent `packet_close.parse_manifest`
+    (colonnes « lot » et « commit ») et `release_cutoff` (section
+    `## Composition` seulement) : une table sans colonne « commit » ne livre
+    aucune unité à la fusion du paquet (#3514).
+    """
+    units, _merges = packet_units(repo, base, head)
+    log = out(repo, "log", "--first-parent", "--merges", "--reverse",
+              "--format=%H%x1f%P%x1f%B%x1e", "%s..%s" % (base, head))
+    unit_of: dict[int, str] = {}
+    for record in log.split("\x1e"):
+        commit, _, rest = record.strip().partition("\x1f")
+        parents, _, body = rest.partition("\x1f")
+        if len(parents.split()) < 2:
+            continue
+        for match in TRAILER_RE.finditer(body):
+            unit_of[int(match.group(1))] = commit
+    rows: dict[str, list[int]] = {}
+    for lot in units:
+        rows.setdefault(unit_of[lot], []).append(lot)
+    lines = ["## Composition (%d unités, %d lots)" % (len(rows), len(units)), "",
+             "| unité | lot(s) | source | commit | note |", "|---|---|---|---|---|"]
+    for index, (commit, lots) in enumerate(rows.items(), start=1):
+        lines.append("| %d | %s | `%s` | `%s` | composition |" % (
+            index, ", ".join("#%d" % lot for lot in lots), units[lots[0]],
+            out(repo, "rev-parse", "--short=12", commit)))
+    return "\n".join(lines)
+
+
 def list_units(args: argparse.Namespace) -> int:
     repo = check_repo(Path(args.repo).resolve())
     units, merges = packet_units(repo, args.base, args.head)
@@ -192,6 +228,9 @@ def list_units(args: argparse.Namespace) -> int:
         raise InputError("aucune unité `ameesh-work:` depuis %s" % args.base)
     print("%d unités de fusion, %d lots portés : %s" % (merges, len(units), ", ".join(
         "#%d %s" % (lot, head) for lot, head in units.items())))
+    # #3629 : le gabarit exact de la table du manifeste, à côté de la ligne.
+    print()
+    print(manifest_template(repo, args.base, args.head))
     return 0
 
 
