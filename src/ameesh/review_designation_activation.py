@@ -329,9 +329,13 @@ def _policy(cfg, db, project: str, paths: Sequence[str]) -> Policy | Unavailable
                           ref=str(getattr(loaded, "source", "") or
                                   "%s@%s" % (source.repo, commit)),
                           commit=commit, source=source.repo,
+                          # Un objet de lecture minimal (témoins, ancien
+                          # appelant) peut ne pas porter les drapeaux : le
+                          # repli garde la politique stricte du canon plutôt
+                          # que de supposer l'inverse (#3742).
                           review_independence=(
-                              bool(loaded.exclude_author_family),
-                              bool(loaded.distinct_families)))
+                              bool(getattr(loaded, "exclude_author_family", True)),
+                              bool(getattr(loaded, "distinct_families", True))))
     except NoCanon as exc:
         return Unavailable(str(exc))
     why = "; ".join(errors[:4]) or "no canon declares a review policy for %r" % (project,)
