@@ -1866,6 +1866,14 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
             creator = binding.name if binding.ok else args.actor
             if args.new_project and args.app is None:
                 raise work.WorkError("--new-project goes with --app <project>")
+            if args.body == "-":
+                # #3744 : comme `work note <lot> -` (#3683), le corps vient de
+                # l'entrée standard (heredoc `<<'EOF'`), jamais « - » tel quel ;
+                # une entrée vide ou réduite à « - » est refusée avant création.
+                from . import cli
+                args.body, error = cli._stdin_body("body")
+                if error:
+                    raise work.WorkError(error)
             args.app = work_projects.creation_project(cfg, db, creator, args.app,
                                                       new_project=args.new_project)
             # #506: read before the lot exists (it makes its project known)
@@ -3625,7 +3633,9 @@ def build_parser() -> argparse.ArgumentParser:
     pw_add.add_argument("--new-project", action="store_true",
                         help="#506: accept an --app project nobody declares yet "
                              "(journaled on the lot); refused otherwise")
-    pw_add.add_argument("--body", default=None)
+    pw_add.add_argument("--body", default=None,
+                        help="the lot's statement; `-` reads it on standard input "
+                             "(heredoc <<'EOF', #3744)")
     pw_add.add_argument("--issue-ref", default=None)
     pw_add.add_argument("--workstream", default=None)
     pw_add.add_argument("--assignee", default=None)
