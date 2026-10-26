@@ -634,6 +634,11 @@ jobs:
         # gabarit se replie sur migrate() à chaque classe. Le paquet PGDG est
         # installé une fois par runner (les jobs suivants sautent l'étape) ;
         # les huit jobs d'un hôte se sérialisent sur les verrous apt.
+        # #3754 (avis auditeur) : installation de confort, pas un verdict.
+        # Sans client 17, tests/gabarit.py se replie sur migrate() ; un sudo à
+        # mot de passe, une panne PGDG ou un verrou apt au-delà de 180 s ne
+        # doit pas faire tomber la ci-full du paquet.
+        continue-on-error: true
         run: |
           set -euo pipefail
           if [ -x /usr/lib/postgresql/17/bin/pg_dump ] \

@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import os
 import pathlib
+import re
 import subprocess
 import sys
 import tempfile
@@ -134,6 +135,12 @@ class WorkflowTest(unittest.TestCase):
         self.assertGreaterEqual(texte.count("--parallel 2"), 2)
         self.assertIn("postgresql-client-17", texte)
         self.assertIn("*pgdump17", texte)
+        # Avis auditeur : l'installation du client 17 est un confort, le
+        # gabarit se replie sur migrate() ; elle ne doit jamais faire tomber
+        # le job (sudo, PGDG, verrou apt).
+        bloc = re.search(r"- &pgdump17\n(.*?)(?=\n      - )", texte, re.S)
+        self.assertIsNotNone(bloc)
+        self.assertIn("continue-on-error: true", bloc.group(1))
 
 
 class ProcessusTest(unittest.TestCase):
