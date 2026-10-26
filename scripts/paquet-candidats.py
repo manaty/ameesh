@@ -43,12 +43,23 @@ dans la liste prête pour ce calcul. Le hold du pilote, lui, reste en place :
 la liste suivante l'écarte de nouveau, et seule une note `unhold:` (ou un
 changement d'état) le lève.
 
+#3782 : le calcul n'est valide que si le code exécuté est la référence
+attendue. Le script rend `code_sha` (le commit du dépôt qui fournit `src`),
+`code_ref` et `code_ref_source` à côté de `target_head`, et refuse quand ce
+code n'est pas la référence, ne la contient pas, ou quand son arbre porte des
+modifications suivies ou des fichiers non suivis sous `src` (un paquet non
+suivi masque un module). Pour le projet ameesh, la référence est la tête de la
+cible ; pour un autre projet, c'est `origin/main` du dépôt du code (la cible du
+projet n'est pas comparable). Un calcul lancé depuis un vieux checkout ne peut
+donc plus passer pour un calcul sur la cible. `--allow-code-mismatch` assume
+explicitement le décalage : il est alors dit dans la sortie lisible et le JSON.
+
 Codes de retour : 0 si la liste est complète (même sans lot prêt), 1 si une
 lecture a échoué (la liste est incomplète : ne pas composer dessus), 2 si
-l'entrée est invalide (dépôt, projet, base, surcharge de hold sans objet). En
-cas d'échec, `--ready-out` est retiré — y compris un export d'une exécution
-précédente — pour qu'aucune liste partielle ne serve de base au contrôle
-d'inclusion.
+l'entrée est invalide (dépôt, projet, base, surcharge de hold sans objet,
+code exécuté qui n'est pas la tête de la cible). En cas d'échec, `--ready-out`
+est retiré — y compris un export d'une exécution précédente — pour qu'aucune
+liste partielle ne serve de base au contrôle d'inclusion.
 
 Lecture seule, sauf le geste explicite `--hold-override` : la base n'est
 modifiée que pour y journaliser la raison de la surcharge sur le lot ; les
@@ -64,9 +75,11 @@ import sys
 from pathlib import Path
 from types import SimpleNamespace
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+CODE_REPO = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(CODE_REPO / "src"))
 
-from ameesh import config, db, identity, merge_queue, packet_candidates, work  # noqa: E402
+from ameesh import (config, db, identity, merge_queue, packet_candidates,  # noqa: E402
+                    plan_git, work)
 
 HoldOverrideError = packet_candidates.HoldOverrideError
 
@@ -124,6 +137,123 @@ def hold_actor(cfg, conn) -> str:
     return binding.name if getattr(binding, "ok", False) else ""
 
 
+RELATION_TEXT = {
+    "same": "la référence exacte",
+    "ahead": "en avance sur la référence",
+    "behind": "antérieur à la référence",
+    "diverged": "histoire sans rapport avec la référence",
+    "absent": "référence absente du dépôt",
+    "dirty": "modifié non commité",
+    "unknown": "inconnu",
+}
+
+
+def _origin_url(repo) -> str:
+    """L'URL d'origine d'un dépôt, normalisée pour comparer deux clones."""
+    url = plan_git._out(str(repo), "remote", "get-url", "origin")
+    if not url:
+        return ""
+    value = url.strip().rstrip("/")
+    if value.endswith(".git"):
+        value = value[:-4]
+    return value
+
+
+def code_reference(code_repo, project_repo, target_head: str) -> tuple[str, str]:
+    """#3782 : la référence que le code exécuté doit être.
+
+    Le dépôt du code (`src` importé) peut être celui du projet composé
+    (`--repo ameesh`) : la référence est alors la tête de la cible. Pour un
+    autre projet (Nexlink), la cible est un commit du projet, jamais comparable
+    au SHA du dépôt ameesh : la référence de l'outillage est `origin/main` du
+    dépôt du code. Rend `(ref, source)` avec source `project-target`,
+    `tooling-origin-main` ou `unknown`.
+    """
+    target = str(target_head or "").strip()
+    code_url = _origin_url(code_repo)
+    project_url = _origin_url(project_repo)
+    if target and code_url and project_url and code_url == project_url:
+        return target, "project-target"
+    main = plan_git._out(str(code_repo), "rev-parse", "--verify", "origin/main")
+    if main:
+        return main, "tooling-origin-main"
+    return "", "unknown"
+
+
+def code_provenance(code_repo, code_ref: str) -> dict:
+    """#3782 : le commit du code qui tourne (le `src` importé), face à la référence.
+
+    Le code exécuté est le `src` du dépôt qui porte ce script, jamais le dépôt
+    `--repo` (qui peut être un clone jetable). `code_relation` vaut `same` (le
+    code est la référence), `ahead` (il la contient mais n'est pas cette
+    référence), `behind` (il lui est antérieur), `diverged` (ni l'un ni
+    l'autre), `absent` (la référence n'est pas dans ce dépôt), `dirty` (l'arbre
+    a des modifications suivies ou des fichiers non suivis sous `src`) ou
+    `unknown` (HEAD illisible). Les **non suivis** comptent : un paquet ou
+    module non suivi sous `src` peut masquer un module suivi et changer
+    l'import (relecture cx2 B/P2, #3782). Lecture stricte : une preuve
+    illisible n'est pas une preuve d'à-propos.
+    """
+    out = {"code_sha": "", "code_repo": str(code_repo),
+           "code_relation": "unknown", "code_contains_ref": False,
+           "code_dirty": False}
+    try:
+        head = plan_git._out(str(code_repo), "rev-parse", "HEAD")
+        if not head:
+            return out
+        out["code_sha"] = head
+        status = plan_git._out(str(code_repo), "status", "--porcelain",
+                               "--untracked-files=all", "--", "src",
+                               "scripts/paquet-candidats.py")
+        # #3782 : un statut illisible est un doute, pas une preuve de propreté ;
+        # les non suivis de `src` peuvent masquer un module à l'import.
+        out["code_dirty"] = status is None or bool(status)
+        ref = str(code_ref or "").strip()
+        if not ref:
+            return out
+        pinned = plan_git._commit(str(code_repo), ref.lower())
+        if not pinned:
+            out["code_relation"] = "absent"
+            return out
+        out["code_relation"] = "same" if pinned.lower() == head.lower() else ""
+        if plan_git._out(str(code_repo), "merge-base", "--is-ancestor",
+                         pinned, head) is not None:
+            out["code_contains_ref"] = True
+            if out["code_relation"] != "same":
+                out["code_relation"] = "ahead"
+        elif plan_git._out(str(code_repo), "merge-base", "--is-ancestor",
+                           head, pinned) is not None:
+            out["code_relation"] = "behind"
+        else:
+            out["code_relation"] = "diverged"
+        if out["code_relation"] == "same" and out["code_dirty"]:
+            out["code_relation"] = "dirty"
+    except Exception:  # noqa: BLE001 - lecture git impossible : un doute, pas un accord
+        out["code_relation"] = "unknown"
+        out["code_contains_ref"] = False
+    return out
+
+
+def code_refusal(provenance: dict, code_ref: str,
+                 ref_source: str = "project-target") -> str:
+    """#3782 : le message de refus, ou "" si le code est la référence.
+
+    `--allow-code-mismatch` ne passe pas par ici : l'appelant assume alors le
+    décalage, et le dit dans la sortie (`code_override`).
+    """
+    relation = str(provenance.get("code_relation") or "unknown")
+    if relation == "same":
+        return ""
+    label = ("la tête de la cible" if ref_source == "project-target"
+             else "la référence de l'outillage (origin/main du code)")
+    return ("le code exécuté n'est pas %s : %s (code %s, référence %s) ; "
+            "relancer depuis un worktree à cette référence exacte, ou "
+            "--allow-code-mismatch pour assumer le décalage"
+            % (label, RELATION_TEXT.get(relation, relation),
+               (provenance.get("code_sha") or "?")[:12],
+               str(code_ref or "?")[:12]))
+
+
 def journal_hold_overrides(conn, payload: dict, overrides: dict[int, str], *,
                            actor: str = "") -> list[dict]:
     """#3375 : journalise chaque surcharge effective, et rien d'autre.
@@ -175,6 +305,15 @@ def render(payload: dict) -> str:
         "%d lot(s) prêt(s), %d en attente, %d erreur(s)"
         % (len(payload["ready"]), len(payload["waiting"]), len(payload["errors"])),
     ]
+    if payload.get("code_sha"):
+        relation = str(payload.get("code_relation") or "unknown")
+        ref = ("réf %s : %s" % (payload["code_ref"][:12],
+                                payload.get("code_ref_source") or "?")
+               if payload.get("code_ref") else "réf inconnue")
+        lines.insert(1, "code %s (%s ; %s)%s" % (
+            payload["code_sha"][:12], ref, RELATION_TEXT.get(relation, relation),
+            " — DÉCALAGE ASSUMÉ (--allow-code-mismatch)"
+            if payload.get("code_override") and relation != "same" else ""))
     by_id = {entry["work_item"]: entry for entry in payload["candidates"]}
     if payload["ready"]:
         lines += ["", "PRÊTS (à composer, ou à écarter avec un motif au manifeste)"]
@@ -223,9 +362,12 @@ def write_ready_out(path: Path, payload: dict) -> None:
     if payload.get("errors"):
         clear_ready_out(path)
         return
-    content = "# paquet-candidats %s %s\n%s\n" % (
+    code = (("code %s" % payload["code_sha"][:12])
+            if payload.get("code_sha") else "code ?")
+    content = "# paquet-candidats %s %s %s\n%s\n" % (
         payload["target"],
         payload["base"][:12],
+        code,
         "\n".join("#%d" % lot for lot in payload["ready"]),
     )
     temporary = path.with_name("%s.%d.tmp" % (path.name, os.getpid()))
@@ -250,6 +392,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--json", action="store_true", help="sortie JSON")
     parser.add_argument("--ready-out", default=None, metavar="FILE",
                         help="écrit les ids prêts, un par ligne, pour --ready-file")
+    parser.add_argument("--allow-code-mismatch", action="store_true",
+                        help="#3782 : calculer même si le code exécuté n'est pas la "
+                             "tête de la cible ; le décalage est dit dans la sortie")
     parser.add_argument("--hold-override", type=int, action="append", default=None,
                         metavar="LOT",
                         help="#3375 : passer outre le hold pilote actif de ce lot "
@@ -293,6 +438,29 @@ def main(argv: list[str] | None = None) -> int:
         payload = packet_candidates.inventory(
             conn, project, repo=repo, clone=clone, target=args.target, app=app,
             base=args.base, cfg=cfg, hold_overrides=hold_overrides or None)
+        # #3782 : avant toute écriture (journal d'une surcharge) et tout export,
+        # le code exécuté doit être la référence attendue (tête de la cible
+        # pour ce projet, origin/main de l'outillage pour un autre projet). Le
+        # calcul est refusé sinon, même si la liste est par ailleurs complète.
+        ref, ref_source = code_reference(CODE_REPO, repo,
+                                         payload.get("target_head") or "")
+        code = code_provenance(CODE_REPO, ref)
+        payload.update(code)
+        payload["code_ref"] = ref
+        payload["code_ref_source"] = ref_source
+        payload["code_override"] = bool(args.allow_code_mismatch)
+        refusal = code_refusal(code, ref, ref_source)
+        if refusal:
+            if not args.allow_code_mismatch:
+                print("paquet-candidats: %s" % refusal, file=sys.stderr)
+                return 2
+            print("paquet-candidats: AVERTISSEMENT: code %s décalé de la référence %s "
+                  "(%s ; %s), assumé par --allow-code-mismatch"
+                  % ((code.get("code_sha") or "?")[:12], (ref or "?")[:12],
+                     RELATION_TEXT.get(code.get("code_relation"),
+                                       code.get("code_relation")),
+                     ref_source),
+                  file=sys.stderr)
         if hold_overrides and not payload["errors"]:
             # #3375 : la raison est écrite avant l'export de la liste prête ;
             # une surcharge sans effet réel (autre refus) est refusée ici.
