@@ -1111,8 +1111,9 @@ class Plan:
     notes: str
     # N4: the base carries the previous tag's exact tree, nothing to release.
     empty: bool = False
-    #: #2692: the target head's CI is still in progress, but its tree is the
-    #: packet head's green content; the evidence (head, runs) or None.
+    #: #2692: the target head's CI is not green (#3633: red, cancelled, absent
+    #: or in progress), but its tree is the packet head's green content; the
+    #: evidence (head, runs) or None.
     tree_green: dict | None = None
     #: #3291: this green candidate would discard content already active.
     kept_active: dict[str, str] = dataclasses.field(default_factory=dict)
@@ -1335,16 +1336,20 @@ def tree_green(repo: str, project: "ProjectRelease", sha: str, reference: str | 
                reading: dict | None = None) -> dict | None:
     """#2692: the head's tree is content a green packet head validated.
 
-    Only a head whose own CI is still in progress may inherit (a concluded red
-    stays red, even with an equal tree). The packet merge must carry the
-    packet head's exact tree (no conflict resolution), that head must be green,
-    and its jobs must prove the same full suite as the target's last green
-    commit. Returns the evidence or None; a read failure stays transient.
+    The packet merge must carry the packet head's exact tree (no conflict
+    resolution), that head must be green, and its jobs must prove the same
+    full suite as the target's last green commit. Returns the evidence or
+    None; a read failure stays transient.
+
+    #3633 (décision owner #141353 a, 26/10/2026) : la CI propre de la tête
+    n'entre plus en compte. Rouge, annulée, absente ou en cours, une tête dont
+    l'arbre est celui d'une tête de paquet entièrement verte vaut verte pour
+    la coupe — le contenu a déjà passé la suite complète, et le critère se
+    calcule sans jugement (canon §7, §11 bis). Avant, seule une tête encore en
+    cours héritait.
     """
     own = ci_reading(project, sha) if reading is None else reading
-    if own.get("green") or own.get("failed") or own.get("missing"):
-        return None
-    if not own.get("pending"):
+    if own.get("green"):
         return None
     if not reference or reference == sha:
         return None
@@ -1406,7 +1411,8 @@ def build_plan(cfg, project: ProjectRelease, *, now: float,
         base_reading = {}
         green_commit = last_green(project.repo, head, project, evidence=base_reading)
         # #2692: a packet merge whose tree is the green packet head's content
-        # is green while the target's own CI is still in progress.
+        # is green — #3633 : whatever the target's own CI says (décision
+        # owner #141353 a).
         tree_proof = tree_green(project.repo, project, head, green_commit,
                                 reading=reading)
         if tree_proof is not None:

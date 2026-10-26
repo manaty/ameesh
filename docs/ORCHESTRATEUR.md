@@ -535,7 +535,10 @@ conflit et aux verdicts complets, sur la tête de la cible (canon
 `processus/lots.md` §§11 bis et 12) ; un nouveau paquet attend le précédent.
 Aux coupures de 11:00 et 23:00, la release prend la tête de la cible (ou le
 dernier commit vert), taguée et déployée en staging : elle ne compose plus de
-paquet.
+paquet. Une tête de la cible dont l'arbre est identique à la tête d'une PR de
+paquet entièrement verte (même suite complète que le dernier vert de la cible)
+compte comme verte, quelle que soit sa propre CI : rouge, annulée, absente ou
+en cours (#3633, décision owner #141353 a du 26/10/2026).
 
 Un créneau manqué ne reste pas muet (#2601) : sur l'hôte opérateur, chaque
 `ameesh release tick` (minuteur de 5 min) relit la cadence compilée
