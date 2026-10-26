@@ -27,14 +27,20 @@ class VehicleMergedTest(_Base):
         self.freeze = "d" * 40
         work.move(self.db, self.lot["id"], "build")
         work.move(self.db, self.lot["id"], "qa")
+        # Véhicule h-26 : le départ de `verdict_merge` est le créneau de paquet
+        # strictement après le GO (#2335), pas le GO. Avec un GO à 2 h,
+        # l'ancienneté mesurée varie de 1 h à 2 h selon la minute de la passe
+        # et le niveau 3 (3 × 30 min) manque la moitié du temps. Un GO à 6 h
+        # laisse plus de 5 h, au-delà du p80 de CI le plus lent observé
+        # (1 h 05), donc le témoin ne dépend plus de l'heure de la passe.
         self.db.execute(
             "INSERT INTO work_item_milestones (work_item_id, kind, at, sha, actor)"
-            " VALUES (%s, 'frozen', now() - interval '3 hours', %s, 'dev1')",
+            " VALUES (%s, 'frozen', now() - interval '7 hours', %s, 'dev1')",
             (self.lot["id"], self.freeze))
         self.db.execute(
             "INSERT INTO work_item_milestones"
             " (work_item_id, kind, at, sha, actor, verdict)"
-            " VALUES (%s, 'verdict', now() - interval '2 hours', %s, 'rel', 'ok')",
+            " VALUES (%s, 'verdict', now() - interval '6 hours', %s, 'rel', 'ok')",
             (self.lot["id"], self.freeze))
         # The member is composed in an `integration/**` vehicle. No repository,
         # no declared target: the Git probe cannot run (the #2309 shape).

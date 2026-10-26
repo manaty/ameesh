@@ -96,6 +96,16 @@ ajouté à 05:1xZ) est composé après lui avec cette nouvelle version.
    psycopg 6/8, run 40275356197). Le test du détenteur utilise une cible
    distincte (`h:main`) ; `LeaseDbTest` 8/8 vert. Aucun avis (§2, adaptation
    de test).
+3. **#3632 × horloge du banc, niveau SLO** (`tests/test_3632_merge_observed_vehicle.py`,
+   test seul) : le départ de `verdict_merge` est le créneau de paquet
+   strictement après le GO (#2335), pas le GO. Avec un verdict à 2 h,
+   l'ancienneté mesurée va de 1 h à 2 h selon la minute de la passe : le
+   niveau 3 (3 × 30 min) manque la moitié du temps. La ci-full 40276625764
+   sur `fb965c9e` l'a montré (`[2] != [3]`, psql 5/16). Le verdict passe à
+   6 h (gel à 7 h) : plus de 5 h mesurées, au-delà du p80 de CI le plus lent
+   observé (1 h 05), donc les deux témoins de niveau ne dépendent plus de
+   l'heure de la passe. Aucun avis (§2, adaptation de test) ; #3644 (prêt,
+   revu) porte l'isolation du p80 pour le paquet suivant.
 
 ## Écartés de h-26
 
@@ -123,8 +133,8 @@ attendent leur clôture par `sync-merges` ; ce ne sont pas des unités.
 ## Contrôles
 
 - Composition : 12 unités sur `5d21c7534711` ; aucune fusion en conflit,
-  aucune résolution d'union ; deux adaptations (compteurs du contrat médié,
-  isolation de `test_lease` — ci-dessus).
+  aucune résolution d'union ; trois adaptations (compteurs du contrat médié,
+  isolation de `test_lease`, horloge du banc #3632 — ci-dessus).
 - Liste calculée `paquet-candidats` sur `5d21c753` : 12 lots prêts au total
   (11 au calcul de 05:0xZ, #3389 ajouté après son avis de 05:08Z) ; 12
   composés ; #3634 non prêt au calcul (avis manquants) et écarté au
@@ -138,8 +148,11 @@ attendent leur clôture par `sync-merges` ; ce ne sont pas des unités.
   `LeaseDbTest` 8/8 après l'adaptation 2. La première ci-full (run
   40275356197, tête `97fe4ce8b`) a révélé le rouge `test_lease` ci-dessus ;
   la tête est refaite avec l'adaptation 2 et une nouvelle ci-full unique est
-  demandée. Les modules de feu, désignation, notify et SLO restent couverts
-  par cette ci-full.
+  demandée. La deuxième ci-full (run 40276625764, tête `fb965c9e`) a révélé
+  les deux témoins de niveau de `test_3632` (2 au lieu de 3, psql 5/16),
+  dépendants de l'heure de la passe ; la tête est refaite avec l'adaptation 3
+  et une nouvelle ci-full unique est demandée. Les modules de feu,
+  désignation, notify et SLO restent couverts par cette ci-full.
 - Contrôle d'inclusion `scripts/paquet-inclusion.py` sur la tête du
   manifeste : aucun défaut ; 12 compositions, 12 contenus présents ;
   #3634 seul écarté au manifeste avec motif.
