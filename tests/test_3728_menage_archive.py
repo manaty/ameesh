@@ -41,7 +41,7 @@ def _touch(top: str, moment: float) -> None:
     os.utime(top, (moment, moment))
 
 
-class ArchiveThenRemoveTest(_Repo):
+class _ArchiveRepo(_Repo):
     def setUp(self) -> None:
         super().setUp()
         self.archives = os.path.join(self.base, "state", ".menage", ha.ARCHIVE_DIR)
@@ -67,6 +67,8 @@ class ArchiveThenRemoveTest(_Repo):
                 if archive else None)
         return store, entries, plan
 
+
+class ArchiveThenRemoveTest(_ArchiveRepo):
     def dirty(self, branch):
         wt = self.add_worktree(branch)
         # cx2 (B/P1): staged content distinct from the working copy (`MM`)
@@ -231,6 +233,85 @@ class ArchiveThenRemoveTest(_Repo):
         with self.assertRaisesRegex(ha.ArchiveRefused, "unmerged"):
             ha.archive(wt, self.archives, retention_s=RETENTION)
         self.assertFalse(os.path.exists(self.archives) and os.listdir(self.archives))
+
+
+class PanierTest(_ArchiveRepo):
+    """#3734 (panier de la relecture #3728) : un témoin par ligne."""
+
+    def restore(self, folder: str, target: str) -> None:
+        with open(os.path.join(folder, "manifest.json")) as fh:
+            command = json.load(fh)["restore"]
+        proc = subprocess.run(["bash", "-c", command.replace("<path>", target)],
+                              cwd=self.main, capture_output=True, text=True)
+        self.assertEqual(proc.returncode, 0, (command, proc.stderr))
+
+    def test_line1_restore_skips_both_empty_layers(self):
+        # ligne 1 : ni couche indexée ni couche de travail, rien que des
+        # fichiers ignorés : la commande n'a ni `git apply` ni `&&` qui coupe
+        wt = self.add_worktree("lot-31")
+        _write(os.path.join(wt, ".env"), text="SECRET=31\n")
+        made = ha.archive(wt, self.archives, retention_s=RETENTION,
+                          head=_git("rev-parse", "HEAD", cwd=wt).strip())
+        with open(os.path.join(made["archive"], "manifest.json")) as fh:
+            self.assertNotIn("git -C <path> apply", json.load(fh)["restore"])
+        target = os.path.join(self.base, "restored-31")
+        self.restore(made["archive"], target)
+        with open(os.path.join(target, ".env")) as fh:
+            self.assertEqual(fh.read(), "SECRET=31\n")
+
+    def test_line2_ignored_only_worktree_archived_then_removed(self):
+        # ligne 2 (dev3 N2) : propre et poussé, gardé pour un `.env` ignoré
+        # seulement : archivé puis retrait, comme un worktree modifié
+        wt = self.add_worktree("lot-32")
+        _write(os.path.join(wt, ".env"), text="SECRET=32\n")
+        _store, _e, plan = self.run_pass(wt, {32: "merged"}, dry_run=True)
+        self.assertEqual(plan[0]["action"], "archivage", plan)
+        self.assertIn("kept for ignored files only", plan[0]["detail"])
+        store, entries, plan = self.run_pass(wt, {32: "merged"})
+        self.assertEqual(plan[0]["action"], "retrait", plan)
+        self.assertFalse(os.path.exists(wt))
+        self.assertEqual(store.statuses[-1][1], "removed")
+        archived, = [e for e in entries if e["action"] == "archived"]
+        folder = archived["data"]["archive"]
+        with tarfile.open(os.path.join(folder, "untracked.tar.gz")) as tar:
+            self.assertEqual(tar.getnames(), [".env"])
+        target = os.path.join(self.base, "restored-32")
+        self.restore(folder, target)
+        with open(os.path.join(target, ".env")) as fh:
+            self.assertEqual(fh.read(), "SECRET=32\n")
+
+    def test_line2_same_guards_keep_it(self):
+        wt = self.add_worktree("lot-33")
+        _write(os.path.join(wt, ".env"), text="SECRET=33\n")
+        for label, lots, kw in (
+                ("lot ended recently", {33: "merged"}, dict(ended_ago=AFTER - 600)),
+                ("worktree touched recently", {33: "merged"}, dict(idle=AFTER - 600)),
+                ("policy not declared", {33: "merged"}, dict(archive=False)),
+                ("lot open", {33: "build"}, {})):
+            with self.subTest(label):
+                _store, entries, plan = self.run_pass(wt, lots, **kw)
+                self.assertIn(plan[0]["action"], ("garde", "attend"), plan)
+                self.assertEqual([e for e in entries if e["action"] == "archived"], [])
+                self.assertTrue(os.path.isfile(os.path.join(wt, ".env")))
+        self.assertFalse(os.path.exists(self.archives) and os.listdir(self.archives))
+        with mock.patch.object(ha, "MAX_BYTES", 4):
+            _store, _e, plan = self.run_pass(wt, {33: "merged"})
+        self.assertEqual(plan[0]["action"], "garde", plan)
+        self.assertIn("not archived", plan[0]["detail"])
+        self.assertTrue(os.path.isfile(os.path.join(wt, ".env")))
+        self.assertFalse(os.path.exists(self.archives) and os.listdir(self.archives))
+
+    def test_line3_cache_name_excludes_a_directory_only(self):
+        # ligne 3 : un fichier ou un lien nommé comme un cache est archivé ;
+        # seul un dossier de ce nom est exclu
+        wt = self.add_worktree("lot-34")
+        _write(os.path.join(wt, ".cache"), text="a note, not a cache\n")
+        _write(os.path.join(wt, "sub", "__pycache__"), text="a file\n")
+        _write(os.path.join(wt, "pkg", "__pycache__", "m.pyc"))
+        _write(os.path.join(wt, "data", "real", "x"))
+        os.symlink("real", os.path.join(wt, "data", ".venv"))
+        self.assertEqual(ha.untracked_files(wt, ()),
+                         [".cache", "data/.venv", "data/real/x", "sub/__pycache__"])
 
 
 class PolicyTest(unittest.TestCase):
