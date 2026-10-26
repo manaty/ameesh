@@ -84,7 +84,7 @@ from . import alert_briefs
 from . import canon as canon_mod
 from . import canon_lowering
 from . import db as db_mod
-from . import lot_class, mechanics, plan_git, projects, registry, review
+from . import lot_class, mechanics, plan_git, registry, review
 from . import review_designation as rd
 from . import review_designation_pg as pg
 from . import review_authors, review_floor, review_target, storage, work
@@ -1305,22 +1305,20 @@ def _advances(db) -> dict:
 
 
 def _notify(cfg, db, project: str, listing: Sequence[Mapping]) -> str:
-    """The project's orchestrator in the registry, when one is declared."""
-    from . import sous_utilisation
+    """The project's orchestrator, by the shared pilot rule (#2935).
 
+    `alert_briefs.project_pilots` restricts the declared orchestrators to the
+    project and, when none declares it, keeps the declared ones rather than
+    naming nobody. The stable order names the first, exactly like a base
+    failure. A project is never matched to a hard-coded pilot: the role comes
+    from the canon and the project from the registry.
+    """
     try:
-        names = sous_utilisation.alert_orchestrators(cfg, db, list(listing))
+        pilots = alert_briefs.project_pilots(
+            str(project or "").strip(), list(listing), cfg=cfg, db=db)
     except Exception:  # noqa: BLE001 - no readable role: no recipient
         return ""
-    by_name = {str(row.get("name") or ""): row for row in listing or ()}
-    wanted = str(project or "").strip()
-    for name in names:
-        row = by_name.get(name)
-        if row is None:
-            continue
-        if not wanted or wanted in projects.agent_projects(dict(row)):
-            return name
-    return ""
+    return pilots[0] if pilots else ""
 
 
 def _candidates(listing: Sequence[Mapping], *, loads: Mapping, project: str, families,
