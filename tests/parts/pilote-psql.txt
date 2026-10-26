@@ -118,3 +118,4 @@ test_migrations  # couche base : migrations sur un schéma neuf
 test_process_registry  # stockage/driver : reçus transactionnels, verrous FOR UPDATE/FOR SHARE, concurrence et annulation (#1922)
 test_registry_lease  # verrous et baux : comportement différent entre psql et psycopg
 test_undeliverable  # courrier en souffrance : renvoi en une transaction (psql persistant), lecture jointe à la vue par projet (une requête)
+test_3752_gabarit  # #3752 : le schéma cloné du gabarit vaut migrate(), rejoué par le pilote psql comme psycopg
