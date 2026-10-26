@@ -3,17 +3,23 @@
 
 Témoins du lot : un schéma `t_*` assez vieux et **prouvé** orphelin (marqueur
 d'un propriétaire mort) est purgé ; un schéma tenu par une session active, un
-schéma récent, un schéma sans marqueur avec un client au repos et un schéma
-dont la preuve est illisible sont gardés ; un dernier autovacuum ancien est
-signalé. La base de la suite (`AMEESH_TEST_DSN`) est le banc partagé de
-l'hôte : avec un âge minimal abaissé, les purges des témoins sont bornées à
-leurs propres schémas (`only`), jamais ceux des suites voisines.
+schéma récent, un schéma sans marqueur (client au repos, ou suite psql vivante
+entre deux échanges) et un schéma dont la preuve est illisible sont gardés ;
+les schémas sans marqueur ne sont purgés que par une maintenance qui tient le
+verrou **exclusif** du banc, jamais par un démarrage de suite. Un dernier
+autovacuum ancien est signalé. La base de la suite (`AMEESH_TEST_DSN`) est le
+banc partagé de l'hôte : avec un âge minimal abaissé, les purges des témoins
+sont bornées à leurs propres schémas (`only`), jamais ceux des suites
+voisines.
 """
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
 import sys
+import tempfile
+import textwrap
 import time
 import unittest
 import uuid
@@ -130,13 +136,14 @@ class BenchCataloguesTest(PgTestCase):
         self.assertIn(gone, result.dropped)
         self.assertFalse(self._exists(gone))
 
-    def test_unmarked_old_schema_with_idle_client_is_kept(self) -> None:
-        """#3735 B/P1 : propriété inconnue = garder, même avec un client idle.
+    def test_unmarked_old_schema_kept_by_second_suite_start(self) -> None:
+        """#3735 B/P1 : un non marqué survit au démarrage d'une seconde suite.
 
-        Une suite lancée avant le marqueur (ou dont `claim_owner` a échoué)
-        laisse un schéma sans commentaire ; une connexion au repos ne nomme
-        pas son schéma et ne le verrouille pas. Le doute ne supprime rien :
-        aucun DROP.
+        Une suite ancienne (lancée avant ce patch, ou dont `claim_owner` a
+        échoué) laisse un schéma sans commentaire ; elle peut n'avoir aucun
+        client backend entre deux échanges psql, ou une session au repos qui
+        ne nomme pas son schéma. Le démarrage d'une seconde suite fait une
+        passe ordinaire : le doute ne supprime rien, aucun DROP.
         """
         unmarked = _name("unmarked")
         self._create(unmarked)
@@ -195,19 +202,25 @@ class BenchCataloguesTest(PgTestCase):
         self.assertNotIn(legacy, result.dropped)
         self.assertTrue(self._exists(legacy))
 
-    def test_bootstrap_admits_unmarked_only_without_other_client(self) -> None:
-        """#3735 B/P1 : le bootstrap ne lève le doute que sans autre client."""
-        old = _name("bootstrap")
-        self._create(old)
-        time.sleep(1.1)
-        with mock.patch.object(bench_mod, "_other_clients", return_value=1):
-            found = {orphan.schema for orphan in bench_mod.orphan_schemas(
-                self.db, min_age_s=0.5, only={old}, bootstrap=True)}
-        self.assertNotIn(old, found)
-        with mock.patch.object(bench_mod, "_other_clients", return_value=0):
-            found = {orphan.schema for orphan in bench_mod.orphan_schemas(
-                self.db, min_age_s=0.5, only={old}, bootstrap=True)}
-        self.assertIn(old, found)
+    def test_suite_upkeep_never_bootstraps(self) -> None:
+        """#3735 B/P1 : le démarrage d'une suite ne lève jamais le doute.
+
+        `_bench_upkeep` est une passe ordinaire : elle purge les propriétaires
+        prouvés morts et garde les schémas sans marqueur. Leur purge est
+        réservée à la maintenance qui tient le verrou exclusif.
+        """
+        from . import support
+        support.BENCH_UPKEEP_DONE = False
+        try:
+            with mock.patch.object(
+                    support.bench_mod, "purge_orphans",
+                    return_value=bench_mod.Purge(0, (), ())) as purge:
+                support._bench_upkeep(self.db)
+        finally:
+            support.BENCH_UPKEEP_DONE = True
+        purge.assert_called_once()
+        self.assertIs(purge.call_args.args[0], self.db)
+        self.assertNotIn("bootstrap", purge.call_args.kwargs)
 
     def test_owner_marker_round_trip(self) -> None:
         marker = bench_mod.owner_marker()
@@ -265,6 +278,89 @@ class BenchCataloguesTest(PgTestCase):
         self.assertTrue(bench_mod.SCHEMA_RE.match("t_bench_0123abcd"))
         self.assertFalse(bench_mod.SCHEMA_RE.match('t_x"; DROP TABLE x; --'))
         self.assertFalse(bench_mod.SCHEMA_RE.match("public"))
+
+
+#: #3735 B/P1 : scénario hors processus — une suite vivante **sans client
+#: backend** (comme `PsqlDriver` entre deux échanges) tient le verrou partagé ;
+#: la maintenance ne peut alors pas admettre un schéma sans marqueur. Une fois
+#: la suite morte, la même maintenance, sous verrou exclusif, le purge. Le
+#: schéma est propre au témoin (`only`) et supprimé dans tous les cas.
+_LOCK_SCENARIO = r'''
+import dataclasses
+import os
+import subprocess
+import sys
+import time
+
+from ameesh import bench
+from ameesh import config as config_mod
+from ameesh import db as db_mod
+
+dsn, name = sys.argv[1], sys.argv[2]
+holder = subprocess.Popen(
+    [sys.executable, "-c",
+     "import time\n"
+     "from ameesh import bench\n"
+     "fh = bench.suite_lock()\n"
+     "print('ok' if fh else 'none', flush=True)\n"
+     "time.sleep(60)\n"],
+    stdout=subprocess.PIPE, text=True)
+try:
+    print("holder=%s" % holder.stdout.readline().strip(), flush=True)
+    cfg = dataclasses.replace(config_mod.Config(), dsn=dsn, schema="public",
+                              backend="pg", statement_timeout_ms=120000.0)
+    database = db_mod.connect(cfg)
+    try:
+        database.execute('CREATE SCHEMA "%s"' % name)
+        database.execute('CREATE TABLE "%s".x (id integer)' % name)
+        time.sleep(1.1)
+        first = bench.purge_orphans(database, min_age_s=0.5, only={name},
+                                    bootstrap=True)
+        print("first=%s" % ",".join(first.dropped), flush=True)
+        holder.kill()
+        holder.wait()
+        second = bench.purge_orphans(database, min_age_s=0.5, only={name},
+                                     bootstrap=True)
+        print("second=%s" % ",".join(second.dropped), flush=True)
+        present = database.query(
+            "SELECT to_regnamespace(%s) IS NOT NULL AS present", (name,))[0]
+        print("exists=%s" % bool(present["present"]), flush=True)
+    finally:
+        database.execute('DROP SCHEMA IF EXISTS "%s" CASCADE' % name)
+        database.close()
+finally:
+    holder.kill()
+'''
+
+
+class BenchMaintenanceLockTest(unittest.TestCase):
+    """#3735 B/P1 : la purge des non marqués exige le verrou exclusif.
+
+    Classe sans `PgTestCase` : le scénario tourne dans un processus séparé,
+    qui ne tient pas le verrou partagé de la suite de tests.
+    """
+
+    def test_live_suite_without_client_blocks_the_unmarked_purge(self) -> None:
+        name = _name("locked")
+        tmp = tempfile.mkdtemp(prefix="ameesh-bench-lock-")
+        self.addCleanup(shutil.rmtree, tmp, True)
+        env = dict(os.environ)
+        env["AMEESH_BENCH_LOCK"] = os.path.join(tmp, "bench.lock")
+        here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        env["PYTHONPATH"] = os.pathsep.join(
+            [os.path.join(here, "src"), env.get("PYTHONPATH", "")])
+        proc = subprocess.run(
+            [sys.executable, "-c", textwrap.dedent(_LOCK_SCENARIO),
+             bench_mod.bench_dsn(), name],
+            capture_output=True, text=True, env=env, timeout=240)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        lines = dict(line.split("=", 1) for line in proc.stdout.splitlines()
+                     if "=" in line)
+        output = proc.stdout + proc.stderr
+        self.assertEqual(lines.get("holder"), "ok", output)
+        self.assertEqual(lines.get("first"), "", output)
+        self.assertEqual(lines.get("second"), name, output)
+        self.assertEqual(lines.get("exists"), "False", output)
 
 
 if __name__ == "__main__":

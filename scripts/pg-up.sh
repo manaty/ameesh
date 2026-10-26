@@ -107,8 +107,9 @@ garde_sources() {
 # #3735 : un banc démarré (ou créé) purge les schémas t_* qu'une suite tuée a
 # laissés ; un banc déjà en marche n'est jamais touché (les suites le font
 # elles-mêmes, une fois par processus). `AMEESH_PG_UPKEEP=0` désactive.
-# `--bootstrap` : les schémas sans marqueur de propriété ne sont admis que si
-# aucun autre client n'est connecté (au démarrage, il n'y en a aucun).
+# `--bootstrap` : maintenance sous verrou exclusif du banc — les schémas sans
+# marqueur ne sont admis que si aucune suite ne vit sur l'hôte (le verrou
+# partagé qu'elles tiennent couvre les échanges psql, sans client backend).
 STARTED=0
 menage_banc() {
   [ "${AMEESH_PG_UPKEEP:-1}" != 0 ] || return 0

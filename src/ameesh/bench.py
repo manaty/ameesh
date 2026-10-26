@@ -20,9 +20,11 @@ depuis le 17/10). Cette maintenance :
   par la suite : une suite au repos entre deux transactions n'a ni verrou ni
   requête nommante, et reste pourtant propriétaire ; sa mort (le processus
   disparaît) libère la purge. Une preuve **absente ou illisible garde le
-  schéma** (#3735 B/P1) : seule la mort prouvée autorise le DROP ; la passe
-  de démarrage (``--bootstrap``, `pg-up.sh`) n'admet les schémas sans
-  marqueur que s'il n'y a **aucun autre client** sur la base ;
+  schéma** (#3735 B/P1) : seule la mort prouvée autorise le DROP. Les schémas
+  **sans marqueur** ne sont admis que par une maintenance qui tient le verrou
+  **exclusif** du banc (``--bootstrap``, `pg-up.sh`) ; les suites tiennent ce
+  verrou en partagé pendant toute la vie de leur processus, donc une suite
+  vivante — même sans client backend entre deux échanges psql — les garde ;
 * signale le gonflement et un dernier autovacuum trop ancien (`doctor`) ;
 * refuse de conclure quand l'activité n'est pas lisible (pas superutilisateur,
   `pg_stat_file` refusé) : le doute ne supprime rien.
@@ -34,7 +36,9 @@ d'ameesh) :
 * ``AMEESH_BENCH_ORPHAN_HOURS`` (défaut 6) : âge minimal d'un orphelin ;
 * ``AMEESH_BENCH_AUTOVACUUM_HOURS`` (défaut 24) : seuil du signal autovacuum ;
 * ``AMEESH_BENCH_CATALOG_BYTES`` / ``AMEESH_BENCH_DATABASE_BYTES`` : seuils
-  du signal de gonflement (4 Gio / 8 Gio par défaut).
+  du signal de gonflement (4 Gio / 8 Gio par défaut) ;
+* ``AMEESH_BENCH_LOCK`` (défaut ``~/.local/state/ameesh/bench-maintenance.lock``) :
+  verrou hôte partagé par les suites et la maintenance.
 
 Le volume du banc n'est jamais touché ; aucune opération ici n'est un
 `VACUUM FULL` (geste d'exploitation, hors de cette maintenance).
@@ -52,6 +56,7 @@ from urllib.parse import urlsplit
 
 from . import db as db_mod
 from . import platform as platform_mod
+from .platform import bench_lock as bench_lock_mod
 
 #: préfixe des schémas de test (`tests/support.py: PgTestCase`)
 SCHEMA_PREFIX = "t_"
@@ -481,41 +486,76 @@ def _in_use(db) -> set[str]:
     return used
 
 
-def _other_clients(db) -> int:
-    """Connexions autres que la nôtre sur la base du banc (#3735 B/P1).
+#: fichier de verrou hôte partagé par les suites et la maintenance (#3735)
+BENCH_LOCK_ENV = "AMEESH_BENCH_LOCK"
+BENCH_LOCK_NAME = "bench-maintenance.lock"
 
-    Au démarrage (banc ou suite), un schéma sans preuve de propriétaire n'est
-    admis à la purge que si aucun autre client n'est connecté : une session
-    au repos, dont le search_path ne dit rien, ne peut alors pas l'utiliser.
-    Seuls les ``client backend`` comptent (un autovacuum ne possède pas de
-    schéma `t_*`) ; le doute (lecture impossible) refuse la qualification.
+
+def bench_lock_path() -> str:
+    """Le verrou hôte des suites et de la maintenance du banc (#3735 B/P1).
+
+    Un chemin stable entre processus de l'hôte (jamais le dossier d'état
+    temporaire d'une suite) ; ``AMEESH_BENCH_LOCK`` le déplace pour un témoin.
     """
-    try:
-        row = db.query(
-            "SELECT count(*)::bigint AS n FROM pg_stat_activity "
-            "WHERE datname = current_database() AND pid <> pg_backend_pid() "
-            "AND backend_type = 'client backend'")[0]
-    except db_mod.DbError as exc:
-        raise BenchError("bench clients unreadable: %s" % exc) from exc
-    return int(row["n"] or 0)
+    env = (os.environ.get(BENCH_LOCK_ENV) or "").strip()
+    if env:
+        return env
+    base = (os.environ.get("XDG_STATE_HOME") or "").strip()
+    if not base:
+        home = os.path.expanduser("~")
+        base = (os.path.join(home, ".local", "state")
+                if home and home != "~"
+                else os.path.join(os.environ.get("TMPDIR") or "/tmp",
+                                  "ameesh-state"))
+    return os.path.join(base, "ameesh", BENCH_LOCK_NAME)
+
+
+def suite_lock(*, wait_s: float = 120.0):
+    """Verrou **partagé** d'une suite, tenu toute la vie du processus.
+
+    Il couvre les échanges psql (une connexion par requête) : même sans client
+    backend entre deux échanges, la suite empêche la maintenance d'admettre un
+    schéma sans marqueur. Rend le handle ouvert, ou None si la plateforme ne
+    sait pas faire de verrou partagé (la maintenance reste alors
+    conservatrice) ; attend au plus ``wait_s`` la fin d'une maintenance.
+    """
+    path = bench_lock_path()
+    deadline = time.monotonic() + max(0.0, float(wait_s))
+    while True:
+        handle = bench_lock_mod.try_shared(path)
+        if handle is not None:
+            return handle
+        if time.monotonic() >= deadline:
+            return None
+        time.sleep(0.2)
+
+
+def maintenance_lock():
+    """Verrou **exclusif** de la maintenance, non bloquant (#3735 B/P1).
+
+    None signifie qu'une suite vit sur l'hôte (même sans client backend) :
+    aucun schéma sans marqueur ne doit être admis à la purge.
+    """
+    return bench_lock_mod.try_exclusive(bench_lock_path())
 
 
 def orphan_schemas(db, *, min_age_s: float | None = None,
                    now: float | None = None,
                    only: frozenset[str] | set[str] | None = None,
-                   bootstrap: bool = False) -> list[Orphan]:
+                   admit_unmarked: bool = False) -> list[Orphan]:
     """Schémas ``t_*`` orphelins prouvés : assez vieux, aucune session.
 
     Un schéma sans relation n'a pas d'âge prouvable : il est gardé (le doute
     ne supprime rien). Une preuve de propriété (``claim_owner``) qui désigne
     un processus **mort** ne protège plus ; une preuve vivante, absente ou
     illisible garde le schéma (#3735 B/P1 : seule la mort prouvée autorise
-    un DROP). Un schéma sans marqueur n'est admis que par une passe
-    ``bootstrap`` qui prouve qu'aucun autre client n'est connecté à la base
-    (démarrage du banc ou d'une suite) : une session au repos ne peut alors
-    pas l'utiliser. ``only`` borne la passe à ces noms (témoins : le banc est
-    partagé, un âge minimal abaissé n'y vise jamais les schémas des autres
-    suites).
+    un DROP). Un schéma sans marqueur n'est admis que si ``admit_unmarked``
+    est posé : le contrat est que l'appelant tient alors le verrou
+    **exclusif** de [`maintenance_lock`], donc qu'aucune suite ne vit sur
+    l'hôte (une suite psql peut n'avoir aucun client backend entre deux
+    échanges).
+    ``only`` borne la passe à ces noms (témoins : le banc est partagé, un âge
+    minimal abaissé n'y vise jamais les schémas des autres suites).
     """
     minimum = orphan_min_age_s() if min_age_s is None else float(min_age_s)
     if minimum < 0:
@@ -527,7 +567,7 @@ def orphan_schemas(db, *, min_age_s: float | None = None,
     own = _own_schema(db)
     if own:
         used.add(own)
-    admit_unmarked = bool(bootstrap) and _other_clients(db) == 0
+    unmarked_admitted = bool(admit_unmarked)
     out: list[Orphan] = []
     for row in rows:
         name = str(row["schema"])
@@ -539,7 +579,7 @@ def orphan_schemas(db, *, min_age_s: float | None = None,
         if comment is not None:
             if owner_state(comment) != OWNER_DEAD:
                 continue
-        elif not admit_unmarked:
+        elif not unmarked_admitted:
             continue
         if name in used:
             continue
@@ -591,65 +631,72 @@ def purge_orphans(db, *, min_age_s: float | None = None,
     Un `DROP SCHEMA ... CASCADE` qui n'obtient pas son verrou échoue et le
     schéma est gardé (aucune purge forcée). L'âge et l'absence de session sont
     revérifiés juste avant la passe ; une course reste couverte par le
-    ``lock_timeout``. ``bootstrap`` (démarrage du banc ou d'une suite) admet
-    les schémas sans marqueur seulement si aucun autre client n'est connecté
-    (#3735 B/P1) ; une preuve de propriété vivante ou illisible les garde.
+    ``lock_timeout``. ``bootstrap`` réserve les schémas **sans marqueur** à
+    une maintenance qui tient le verrou exclusif du banc (#3735 B/P1) : sans
+    ce verrou (une suite vit, même sans client backend), ils sont gardés ;
+    une preuve de propriété vivante ou illisible les garde aussi.
     """
     if not _local_dsn(getattr(getattr(db, "cfg", None), "dsn", "") or ""):
         return Purge(scanned=0, dropped=(), kept=(),
                      unreadable="bench is not local: owner proof is host-local")
+    lock = maintenance_lock() if bootstrap else None
     try:
-        orphans = orphan_schemas(db, min_age_s=min_age_s, now=now, only=only,
-                                 bootstrap=bootstrap)
-    except BenchError as exc:
-        count = 0
         try:
-            count = int(db.query(
-                "SELECT count(*)::bigint AS n FROM pg_namespace "
-                "WHERE left(nspname, 2) = %s", (SCHEMA_PREFIX,))[0]["n"] or 0)
-        except db_mod.DbError:
-            pass
-        return Purge(scanned=count, dropped=(), kept=(), unreadable=str(exc))
-    if dry_run:
-        return Purge(scanned=len(orphans), dropped=(),
-                     kept=tuple((orphan.schema, "dry-run") for orphan in orphans),
-                     dry_run=True)
-    # un schéma a pu être pris entre la lecture et la passe : on relit les
-    # sessions juste avant de supprimer, et un doute laisse tout en place.
-    try:
-        used = _in_use(db)
-        own = _own_schema(db)
-        if own:
-            used.add(own)
-    except BenchError as exc:
-        return Purge(scanned=len(orphans), dropped=(), kept=(),
-                     unreadable=str(exc))
-    orphans = [orphan for orphan in orphans if orphan.schema not in used]
-    before = _database_size(db)
-    started = time.monotonic()
-    dropped: list[str] = []
-    kept: list[tuple[str, str]] = []
-    for orphan in orphans:
-        name = orphan.schema
-        if not SCHEMA_RE.match(name):  # defense in depth; never interpolate blindly
-            kept.append((name, "name refused"))
-            continue
-        if time.monotonic() - started > budget_s:
-            kept.append((name, "purge budget exceeded"))
-            continue
+            orphans = orphan_schemas(db, min_age_s=min_age_s, now=now, only=only,
+                                     admit_unmarked=lock is not None)
+        except BenchError as exc:
+            count = 0
+            try:
+                count = int(db.query(
+                    "SELECT count(*)::bigint AS n FROM pg_namespace "
+                    "WHERE left(nspname, 2) = %s", (SCHEMA_PREFIX,))[0]["n"] or 0)
+            except db_mod.DbError:
+                pass
+            return Purge(scanned=count, dropped=(), kept=(), unreadable=str(exc))
+        if dry_run:
+            return Purge(scanned=len(orphans), dropped=(),
+                         kept=tuple((orphan.schema, "dry-run") for orphan in orphans),
+                         dry_run=True)
+        # un schéma a pu être pris entre la lecture et la passe : on relit les
+        # sessions juste avant de supprimer, et un doute laisse tout en place.
         try:
-            with db.transaction() as tx:
-                tx.execute("SET LOCAL lock_timeout = '%dms'"
-                           % int(LOCK_TIMEOUT_S * 1000))
-                tx.execute('DROP SCHEMA IF EXISTS "%s" CASCADE' % name)
-        except db_mod.DbError as exc:
-            kept.append((name, _short_reason(exc)))
-            continue
-        dropped.append(name)
-    after = _database_size(db)
-    freed = max(0, before - after) if before is not None and after is not None else 0
-    return Purge(scanned=len(orphans), dropped=tuple(dropped), kept=tuple(kept),
-                 freed_bytes=freed)
+            used = _in_use(db)
+            own = _own_schema(db)
+            if own:
+                used.add(own)
+        except BenchError as exc:
+            return Purge(scanned=len(orphans), dropped=(), kept=(),
+                         unreadable=str(exc))
+        orphans = [orphan for orphan in orphans if orphan.schema not in used]
+        before = _database_size(db)
+        started = time.monotonic()
+        dropped: list[str] = []
+        kept: list[tuple[str, str]] = []
+        for orphan in orphans:
+            name = orphan.schema
+            if not SCHEMA_RE.match(name):  # defense in depth; never interpolate blindly
+                kept.append((name, "name refused"))
+                continue
+            if time.monotonic() - started > budget_s:
+                kept.append((name, "purge budget exceeded"))
+                continue
+            try:
+                with db.transaction() as tx:
+                    tx.execute("SET LOCAL lock_timeout = '%dms'"
+                               % int(LOCK_TIMEOUT_S * 1000))
+                    tx.execute('DROP SCHEMA IF EXISTS "%s" CASCADE' % name)
+            except db_mod.DbError as exc:
+                kept.append((name, _short_reason(exc)))
+                continue
+            dropped.append(name)
+        after = _database_size(db)
+        freed = (max(0, before - after)
+                 if before is not None and after is not None else 0)
+        return Purge(scanned=len(orphans), dropped=tuple(dropped), kept=tuple(kept),
+                     freed_bytes=freed)
+    finally:
+        if lock is not None:
+            lock.close()
 
 
 def _database_size(db) -> int | None:
@@ -701,8 +748,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument(
         "--bootstrap", action="store_true",
-        help="admettre les schémas sans marqueur seulement si aucun autre "
-             "client n'est connecté (démarrage du banc ou d'une suite)")
+        help="maintenance avec verrou exclusif du banc : admettre les schémas "
+             "sans marqueur seulement si aucune suite ne vit sur l'hôte")
     parser.add_argument("--min-age-hours", type=float, default=None)
     args = parser.parse_args(argv)
     dsn = _with_connect_timeout(args.dsn or bench_dsn())

@@ -96,6 +96,14 @@ REQUIRE_DB = os.environ.get(
 #: schéma t_* laissé par une exécution tuée). Un échec de lecture ne fait
 #: jamais échouer un test ; `AMEESH_BENCH_UPKEEP=0` la désactive.
 BENCH_UPKEEP_DONE = False
+#: #3735 B/P1 : verrou partagé tenu toute la vie du processus ; il couvre les
+#: échanges psql (une connexion par requête), donc la maintenance du banc ne
+#: peut pas admettre un schéma sans marqueur pendant qu'une suite vit, même
+#: sans client backend entre deux échanges.
+BENCH_SUITE_LOCK = None
+#: #3735 B/P1 : une seule tentative de verrou par processus (un timeout de
+#: maintenance ne se paie pas à chaque classe).
+BENCH_LOCK_TRIED = False
 #: L142 : le banc ne dépend pas non plus de l'umask de la session appelante
 #: (0002 sur certains hôtes, 0022 en CI). Les fixtures d'arbres de confiance
 #: créent répertoires 0700 et fichiers 0644 et les vérifient ; un umask
@@ -584,19 +592,26 @@ def _bench_upkeep(db) -> None:
 
     Le banc est partagé par tous les agents de l'hôte (`scripts/pg-up.sh`) :
     une exécution tuée laisse son schéma. La passe est bornée (âge, sessions,
-    verrou court) et ne fait jamais échouer un test. ``bootstrap`` : les
-    schémas sans marqueur ne sont admis que si aucun autre client n'est
-    connecté (démarrage d'une suite) ; les schémas dont le marqueur prouve un
-    propriétaire mort restent purgés (#3735 B/P1).
+    verrou court) et ne fait jamais échouer un test. #3735 B/P1 : la suite
+    tient un verrou **partagé** toute la vie du processus, et sa passe est
+    **ordinaire** — les schémas sans marqueur sont gardés ; seuls ceux dont le
+    marqueur prouve un propriétaire mort sont purgés. Leur purge est réservée
+    à une maintenance qui tient le verrou exclusif (aucune suite vivante).
     """
-    global BENCH_UPKEEP_DONE
+    global BENCH_UPKEEP_DONE, BENCH_SUITE_LOCK, BENCH_LOCK_TRIED
+    if not BENCH_LOCK_TRIED:
+        BENCH_LOCK_TRIED = True
+        try:
+            BENCH_SUITE_LOCK = bench_mod.suite_lock()
+        except Exception:  # noqa: BLE001 — jamais un échec de test pour le verrou
+            BENCH_SUITE_LOCK = None
     if BENCH_UPKEEP_DONE:
         return
     BENCH_UPKEEP_DONE = True
     if os.environ.get("AMEESH_BENCH_UPKEEP", "1").lower() in ("0", "false", "no", "off"):
         return
     try:
-        result = bench_mod.purge_orphans(db, bootstrap=True)
+        result = bench_mod.purge_orphans(db)
     except Exception:  # noqa: BLE001 — un ménage de banc ne juge jamais un test
         return
     if result.dropped:
