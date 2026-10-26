@@ -23,8 +23,26 @@ import unittest
 import uuid
 from unittest import mock
 
-from ameesh import nexlink_alerts as nx
-from ameesh import notify, role_timers
+#: Témoin d'import (#3609) : les parts psql de la CI n'installent pas l'extra
+#: `ameesh[crypto]` (tests.yml n'est pas modifié ici, #3581 porte la parité).
+#: Les cas qui exigent `cryptography` sont sautés avec un motif explicite au
+#: lieu d'échouer ; ceux de configuration forcent le cas qu'ils vérifient.
+try:
+    from cryptography.hazmat.primitives.asymmetric.x25519 import (  # noqa: F401
+        X25519PrivateKey)
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM  # noqa: F401
+except ImportError:  # pragma: no cover - dépend de l'environnement
+    CRYPTOGRAPHY_AVAILABLE = False
+else:
+    CRYPTOGRAPHY_AVAILABLE = True
+
+requires_cryptography = unittest.skipUnless(
+    CRYPTOGRAPHY_AVAILABLE,
+    "cryptography absente de cet environnement (parts psql sans "
+    "ameesh[crypto], #3609) : cas de crypto sauté")
+
+from ameesh import nexlink_alerts as nx  # noqa: E402
+from ameesh import notify, role_timers  # noqa: E402
 
 ACCOUNT = "b1e3c612-4825-4716-abe9-194ab3acde43"
 SECRET = "s3cr3t-mesh"
@@ -53,6 +71,7 @@ def _public_key(private: bytes) -> bytes:
 # ==========================================================================
 
 class CryptoTest(unittest.TestCase):
+    @requires_cryptography
     def test_vecteur_wrap_nexlink(self):
         """Le vecteur du wrap est identique à celui produit par node:crypto.
 
@@ -78,6 +97,7 @@ class CryptoTest(unittest.TestCase):
                                   wrapped),
             bytes(range(65, 97)))
 
+    @requires_cryptography
     def test_wrap_contexte_lie_au_destinataire(self):
         wrapped = nx.wrap_to_x25519(
             _public_key(RECIPIENT_PRIVATE), nx.WrapContext(ACCOUNT, 1),
@@ -87,6 +107,7 @@ class CryptoTest(unittest.TestCase):
             with self.subTest(context=context), self.assertRaises(Exception):
                 nx.unwrap_from_x25519(RECIPIENT_PRIVATE, context, wrapped)
 
+    @requires_cryptography
     def test_contenu_aes_gcm_et_aad(self):
         cek = bytes(range(32))
         aad = nx.content_aad("a" * 64, "2026-10-25T11:41:27Z")
@@ -200,9 +221,12 @@ class ConfigTest(unittest.TestCase):
         self.assertTrue(message.urgent)
 
     def test_remote_push_problem_et_repli(self):
+        # #3609 : les cas qui attendent un message précis forcent le cas de
+        # l'environnement (crypto présente) au lieu de dépendre de l'installation.
         channel = _nx_config().channels["nx"]
-        self.assertEqual(notify.remote_push_problem(
-            channel, {"MESH_SECRET": SECRET}, ncfg=_nx_config()), "")
+        with mock.patch.object(nx, "crypto_available", return_value=True):
+            self.assertEqual(notify.remote_push_problem(
+                channel, {"MESH_SECRET": SECRET}, ncfg=_nx_config()), "")
         # sans le module de crypto, le repli déclaré couvre le canal
         with mock.patch.object(nx, "crypto_available", return_value=False):
             ncfg = _nx_config()
@@ -214,12 +238,15 @@ class ConfigTest(unittest.TestCase):
                                                  {"MESH_SECRET": SECRET}, ncfg=ncfg2)
             self.assertIn("cryptography", problem)
         # secret absent : le repli couvre ; sans repli, la variable est nommée
+        # (crypto présente, sinon c'est elle que le message nommerait)
         ncfg = _nx_config()
-        self.assertEqual(notify.remote_push_problem(ncfg.channels["nx"], {}, ncfg=ncfg), "")
         ncfg2 = _nx_config(channel={"fallback": None})
-        problem = notify.remote_push_problem(ncfg2.channels["nx"], {}, ncfg=ncfg2)
-        self.assertIn("MESH_SECRET", problem)
-        self.assertNotIn(SECRET, problem)
+        with mock.patch.object(nx, "crypto_available", return_value=True):
+            self.assertEqual(notify.remote_push_problem(ncfg.channels["nx"], {},
+                                                        ncfg=ncfg), "")
+            problem = notify.remote_push_problem(ncfg2.channels["nx"], {}, ncfg=ncfg2)
+            self.assertIn("MESH_SECRET", problem)
+            self.assertNotIn(SECRET, problem)
 
     def test_fallback_readiness_pour_le_test(self):
         ncfg = _nx_config()
@@ -366,6 +393,7 @@ class _MeshCase(unittest.TestCase):
 
 
 class SenderTest(_MeshCase):
+    @requires_cryptography
     def test_envoi_signe_chiffre_et_wrap(self):
         server = self.mesh()
         _, channel = self.config(server)
@@ -400,6 +428,7 @@ class SenderTest(_MeshCase):
         self.assertEqual(sender.last[channel.name]["alert_id"], ALERT_ID)
         self.assertTrue(sender.last[channel.name]["accepted"])
 
+    @requires_cryptography
     def test_key_id_surchargeable(self):
         server = self.mesh()
         _, channel = self.config(server)
@@ -422,6 +451,7 @@ class SenderTest(_MeshCase):
         self.assertEqual(server.requests, [])
         self.assertEqual(sender.last[channel.name]["skipped"], "resolved")
 
+    @requires_cryptography
     def test_test_avec_accuse(self):
         server = self.mesh()
         ncfg, channel = self.config(server)
@@ -456,6 +486,7 @@ class SenderTest(_MeshCase):
         raw = server.by_path("/mesh/alerts", "POST")[0]["body"].decode("utf-8")
         self.assertNotIn("ouvrier", raw)
 
+    @requires_cryptography
     def test_plusieurs_cles_actives(self):
         second = _public_key(bytes(range(9, 41)))
         server = self.mesh(keys=[
@@ -471,6 +502,7 @@ class SenderTest(_MeshCase):
         self.assertEqual([(w["key_id"], w["gen"]) for w in wraps],
                          [("wrap-1", 1), ("device-2", 2)])
 
+    @requires_cryptography
     def test_cle_inconnue_409_relit_et_reessaie(self):
         server = self.mesh(responses=[(409, {"error": "key_unknown"}),
                                       (202, {"accepted": True, "duplicate": False})])
@@ -480,6 +512,7 @@ class SenderTest(_MeshCase):
         self.assertEqual(len(server.by_path("/mesh/alerts", "POST")), 2)
         self.assertTrue(all(r["signature_ok"] for r in server.requests))
 
+    @requires_cryptography
     def test_409_apres_relecture_est_permanent(self):
         server = self.mesh(responses=[(409, {"error": "key_unknown"}),
                                       (409, {"error": "key_unknown"})])
@@ -489,6 +522,7 @@ class SenderTest(_MeshCase):
         self.assertTrue(ctx.exception.permanent)
         self.assertEqual(ctx.exception.status, 409)
 
+    @requires_cryptography
     def test_401_permanent_429_non(self):
         server = self.mesh(responses=[(401, {"error": "unauthorized"})])
         _, channel = self.config(server)
@@ -501,6 +535,7 @@ class SenderTest(_MeshCase):
             self.sender().send(channel2, self.message())
         self.assertFalse(ctx.exception.permanent)
 
+    @requires_cryptography
     def test_cache_des_cles(self):
         server = self.mesh()
         _, channel = self.config(server)
@@ -518,6 +553,7 @@ class SenderTest(_MeshCase):
         (request,) = server.by_path("/mesh/alerts/" + ALERT_ID, "GET")
         self.assertTrue(request["signature_ok"])
 
+    @requires_cryptography
     def test_secret_fichier_0600(self):
         server = self.mesh()
         with tempfile.TemporaryDirectory() as tmp:
