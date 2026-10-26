@@ -498,6 +498,36 @@ jobs:
         name: début du job (mesure du plafond, #899)
         run: echo "AMEESH_JOB_DEBUT=$(date -u +%s)" >> "$GITHUB_ENV"
       - uses: actions/checkout@v4
+      # #3581 : le témoin du pont JS (#3529) appelle `node`, absent du PATH de
+      # certains runners du pool (FileNotFoundError node, psql 7/16 et psycopg
+      # 3/8). Le correctif de paquet 6fdfefdde faisait sauter le témoin quand
+      # node manque : le pont n'était alors plus vérifié, un non-concluant
+      # silencieux (§3). Node 22 — la majeure des workflows Nexlink qui portent
+      # ce pont, et de ui.yml — est provisionné par job sur le runner (cache
+      # d'outils d'actions/setup-node, aucun geste root sur la VM), puis la
+      # vérification de démarrage refuse la part si ce node n'est pas dans le
+      # PATH ou n'est pas en 22. Les ancres `&node_bridge`/`&node_witness` sont
+      # reprises telles quelles par psql et fs-class : une seule déclaration,
+      # aucun job de la suite ne peut oublier le pont.
+      - &node_bridge
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4
+        with:
+          node-version: "22"
+      - &node_witness
+        name: node 22 du pont JS (lot 3581)
+        run: |
+          set -euo pipefail
+          if ! node_path="$(command -v node)"; then
+            echo "::error::node 22 requis par le pont JS (lot 3581) : aucun node dans le PATH de ce runner ; la suite ne tourne pas sans lui"
+            exit 1
+          fi
+          version="$("$node_path" --version)"
+          case "$version" in
+            v22.*) echo "node $version ($node_path) : pont JS disponible" ;;
+            *)
+              echo "::error::node 22 requis par le pont JS (lot 3581) : ce runner porte '$version' ; la suite ne tourne pas sans lui"
+              exit 1 ;;
+          esac
       - &dsn
         name: port de la base jetable
         run: echo "AMEESH_TEST_DSN=postgresql://ameesh@127.0.0.1:${{ job.services.postgres.ports['5432'] }}/ameesh" >> "$GITHUB_ENV"
@@ -675,6 +705,8 @@ jobs:
     steps:
       - *debut
       - uses: actions/checkout@v4
+      - *node_bridge
+      - *node_witness
       - *dsn
       - uses: actions/setup-python@v5
         with:
@@ -684,6 +716,7 @@ jobs:
       # #3616 : test_3536_notify_nexlink exige l'extra `crypto` ; le job psql
       # n'a pas de .venv-ci, et sans cryptography la part 2/16 rougit (run
       # 40235900946). Les parts psycopg l'installent déjà dans leur venv.
+      # #3581 : le pont JS de ce job utilise node 22, provisionné ci-dessus.
       - name: dépendances des parts psql (pyyaml, crypto)
         run: python -m pip install -q 'pyyaml>=6' 'cryptography>=41'
       - *base
@@ -752,6 +785,8 @@ jobs:
     steps:
       - *debut
       - uses: actions/checkout@v4
+      - *node_bridge
+      - *node_witness
       - *dsn
       - id: py
         uses: actions/setup-python@v5
