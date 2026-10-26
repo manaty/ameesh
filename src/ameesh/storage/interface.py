@@ -2388,7 +2388,8 @@ class WorkItems(Domain):
         d'abord. Chaque ligne porte `package_id`, `work_item_id`,
         `package_branch`, `base_sha`, `head_sha`, `unit_sha`, `source_sha`,
         `frozen_sha`, `recorded_by`, `recorded_ts`, l'état du porteur
-        (`package_state`) et son jalon de fusion (`package_merged_sha`)."""
+        (`package_state`), son jalon de fusion (`package_merged_sha`) et sa
+        tête gelée (`package_frozen_sha`, #3634)."""
 
     @abc.abstractmethod
     def close_merged(self, item_id: int, *, current: str, sha: str, actor: str, note: str,

@@ -8,6 +8,11 @@ At 00:34Z on 2026-10-26, three level-3 `review GO → merge` alerts fired on
 clone, a declared target (#2309 has no `branch_target`) and a fresh
 `origin/<target>`. The packet composition table already records the member's
 effective freeze and its carrier's merge; reading it is enough.
+
+#3634 (basket of #3632, N1): `record_packet` replaces the whole membership on
+every record. A vehicle recomposed without a new record keeps rows of units it
+no longer carries (#3584 left h-25); the database proof must only accept the
+composition of the head the carrier actually froze and merged.
 """
 from __future__ import annotations
 
@@ -21,6 +26,9 @@ from .test_789_slo_alerts import _Base
 
 class VehicleMergedTest(_Base):
     """A member of a merged vehicle is delivered even while it is still `qa`."""
+
+    #: the head recorded by `record_packet` (and frozen by the carrier).
+    HEAD = "b" * 40
 
     def setUp(self):
         super().setUp()
@@ -47,7 +55,7 @@ class VehicleMergedTest(_Base):
         self.vehicle = self.packet()
         storage.of(self.db).work.record_packet(
             int(self.vehicle["id"]), branch="integration/paquet-test",
-            base_sha="a" * 40, head_sha="b" * 40,
+            base_sha="a" * 40, head_sha=self.HEAD,
             units=[{"work_item_id": int(self.lot["id"]), "unit_sha": "c" * 40,
                     "source_sha": self.freeze, "frozen_sha": self.freeze}],
             note="packet composition recorded", actor="orch")
@@ -57,7 +65,17 @@ class VehicleMergedTest(_Base):
         self.now = time.time()
 
     # -- fixtures ---------------------------------------------------------
-    def merge_vehicle(self):
+    def freeze_vehicle(self, head=None):
+        """The carrier freezes the head it will merge (the recorded one by
+        default)."""
+        self.db.execute(
+            "INSERT INTO work_item_milestones (work_item_id, kind, at, sha, actor)"
+            " VALUES (%s, 'frozen', now() - interval '1 hour', %s, 'orch')",
+            (int(self.vehicle["id"]), self.HEAD if head is None else head))
+
+    def merge_vehicle(self, *, frozen_head=None, freeze=True):
+        if freeze:
+            self.freeze_vehicle(frozen_head)
         for state in ("build", "qa", "merged"):
             work.move(self.db, int(self.vehicle["id"]), state)
 
@@ -125,6 +143,39 @@ class VehicleMergedTest(_Base):
         self.db.execute("UPDATE work_items SET branch_head = %s WHERE id = %s",
                         ("e" * 40, self.lot["id"]))
         self.assertFalse(slo_delivery.merge_observed(self.cfg, self.db, self.member()))
+
+    # -- #3634: a composition must be the one the carrier merged ------------
+    def test_a_recomposition_not_recorded_keeps_the_removed_members_alert(self):
+        # #3584 left h-25 after the last record: the carrier was recomposed,
+        # re-frozen and merged at another head, while the row still names the
+        # old one. The removed unit is not delivered and its alert stays.
+        self.merge_vehicle(frozen_head="e" * 40)
+        self.assertEqual(self.member()["state"], "qa")
+        self.assertFalse(slo_delivery.merge_observed(self.cfg, self.db, self.member()))
+        self.assertEqual([alert["level"] for alert in self.verdict_merge()], [3])
+
+    def test_a_newer_freeze_without_commit_is_not_the_recorded_head(self):
+        # The latest freeze is authoritative even when it names no commit: an
+        # older matching head must not stand in for it.
+        self.freeze_vehicle()
+        self.freeze_vehicle("")
+        for state in ("build", "qa", "merged"):
+            work.move(self.db, int(self.vehicle["id"]), state)
+        self.assertFalse(slo_delivery.merge_observed(self.cfg, self.db, self.member()))
+
+    def test_a_vehicle_merged_without_a_frozen_head_is_not_database_evidence(self):
+        self.merge_vehicle(freeze=False)
+        self.assertFalse(slo_delivery.merge_observed(self.cfg, self.db, self.member()))
+
+    def test_a_merged_milestone_naming_the_composed_head_delivers(self):
+        # An ancestor/fast-forward closure records the exact branch head as the
+        # `merged` milestone: that milestone carries the composition.
+        self.merge_vehicle(freeze=False)
+        self.db.execute(
+            "UPDATE work_item_milestones SET sha = %s"
+            " WHERE work_item_id = %s AND kind = 'merged'",
+            (self.HEAD, int(self.vehicle["id"])))
+        self.assertTrue(slo_delivery.merge_observed(self.cfg, self.db, self.member()))
 
     def test_a_closed_vehicle_is_not_delivery_evidence(self):
         self.merge_vehicle()
