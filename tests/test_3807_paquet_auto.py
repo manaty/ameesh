@@ -257,12 +257,32 @@ class PaquetAutoBanc(unittest.TestCase):
                             cwd=self.repo).stdout
         self.assertEqual(branches.strip(), "")
         self.assertEqual(self.rev(ref + "^{tree}"), expected_tree)
+        # Admission (#3813) : #12 en erreur dans la liste calculée est refusé ;
+        # une liste sans erreur laisse passer le même manifeste.
+        bad = pathlib.Path(self.tmp.name) / "candidats-legacy.json"
+        bad.write_text(json.dumps({
+            "base": self.base, "ready": [11],
+            "errors": ["#12 : porte illisible"],
+        }), encoding="utf-8")
+        with self.assertRaises(paquet_auto.PaquetAutoError) as caught:
+            paquet_auto.replay(
+                self.repo, ref, "fixture", self.base, compose_script=COMPOSE,
+                candidates_json=bad, log=lambda _line: None)
+        self.assertIn("#12", str(caught.exception))
+        self.assertIn("erreur", str(caught.exception))
+        good = pathlib.Path(self.tmp.name) / "candidats-prets.json"
+        good.write_text(json.dumps({
+            "base": self.base, "ready": [11, 12], "errors": [],
+        }), encoding="utf-8")
+        self.assertEqual(paquet_auto.replay(
+            self.repo, ref, "fixture", self.base, compose_script=COMPOSE,
+            candidates_json=good, log=lambda _line: None), 0)
 
-    @unittest.skipUnless(_has_ref("b57c0380") and _has_ref("f444955b"),
-                         "témoin h-31 : références absentes de ce clone")
-    def test_rejeu_h31_arbre_identique(self) -> None:
+    @unittest.skipUnless(_has_ref("fc59a14e") and _has_ref("f444955b"),
+                         "témoin h-31 v4 : références absentes de ce clone")
+    def test_rejeu_h31_v4_arbre_identique(self) -> None:
         self.assertEqual(
-            paquet_auto.main(["--repo", str(REPO), "--replay", "b57c0380",
+            paquet_auto.main(["--repo", str(REPO), "--replay", "fc59a14e",
                               "--name", "h-20261026-31", "--base", "f444955b"]),
             0)
 

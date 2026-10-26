@@ -41,12 +41,15 @@ Modes :
 * normal : composition réelle, poussée, PR, gel et courrier ;
 * `--local` : s'arrête après le manifeste et `packet record`, sans poussée,
   PR, gel ni courrier (composition de contrôle) ;
-* `--replay <réf>` : rejoue la table `## Composition` d'un manifeste déjà
-  gelé depuis `--base`, reprend le manifeste de `--réf` tel quel (métadonnée,
-  aucun effet sur le contenu composé) et compare l'arbre obtenu à
-  `git rev-parse <réf>^{tree}`. C'est le témoin de fidélité du script : le
-  rejeu de h-31 (`--base f444955b`, `--name h-20261026-31`) doit rendre
-  l'arbre de `b57c0380`. Aucune poussée, aucune écriture en base.
+* `--replay <réf> [--candidates-json <sortie paquet-candidats --json>]` :
+  rejoue la table `## Composition` d'un manifeste déjà gelé depuis `--base`,
+  reprend le manifeste de `--réf` tel quel (métadonnée, aucun effet sur le
+  contenu composé) et compare l'arbre obtenu à `git rev-parse <réf>^{tree}`.
+  Avec `--candidates-json`, chaque unité doit être prête et aucune en erreur
+  (#3813) : h-31 v3 (`b57c0380`, #3506 en erreur) est refusé, h-31 v4
+  (`fc59a14e`, 6 unités) passe et rend l'arbre `2d15e224…` de `fc59a14e`.
+  Sans le JSON, c'est le témoin de fidélité d'arbre seul. Aucune poussée,
+  aucune écriture en base.
 
 Codes de retour : 0 composition réussie (ou aucun lot prêt), 1 échec
 opérationnel (git, test, contrôle, poussée, PR, gel, courrier), 2 entrée
@@ -1180,9 +1183,57 @@ def parse_composition_table(text: str) -> list[tuple[list[int], str]]:
     return rows
 
 
+def _legacy_error_discards(payload: dict) -> list[Discarded]:
+    """Les `errors` du format antérieur à #3813, quand ils nomment un lot."""
+    out: list[Discarded] = []
+    for text in payload.get("errors") or []:
+        match = re.match(r"^\s*[#!](\d+)\s*:?\s*(.*)$", str(text))
+        if not match:
+            raise PaquetAutoError(
+                "--candidates-json : erreur globale, la liste n'est pas "
+                "utilisable : %s" % text)
+        out.append(Discarded(
+            int(match.group(1)), "erreur paquet-candidats, jamais composé",
+            " ".join(match.group(2).split()) or str(text)))
+    return out
+
+
+def check_replay_admission(specs: list[tuple[list[int], str]], payload: dict,
+                           base_sha: str, repo: Path) -> None:
+    """#3813 : aucune unité du manifeste n'est en erreur ou hors des prêts."""
+    stated = str(payload.get("base") or "").strip()
+    if stated:
+        resolved = rev(repo, stated)
+        if resolved and resolved != base_sha:
+            raise InputError(
+                "--candidates-json : base %s, rejeu sur %s"
+                % (resolved[:12], base_sha[:12]))
+        if not resolved and not (stated.startswith(base_sha)
+                                 or base_sha.startswith(stated)):
+            raise InputError(
+                "--candidates-json : base %r, rejeu sur %s"
+                % (stated, base_sha[:12]))
+    errors = _errors_by_lot(payload)
+    if not errors:
+        errors = _legacy_error_discards(payload)
+    by_lot = {item.lot: item for item in errors}
+    ready = {int(lot) for lot in payload.get("ready") or []}
+    for lots, _source in specs:
+        for lot in lots:
+            if lot in by_lot:
+                raise PaquetAutoError(
+                    "rejeu refusé : #%d est en erreur dans paquet-candidats "
+                    "(jamais composé) : %s"
+                    % (lot, by_lot[lot].detail or by_lot[lot].reason))
+            if lot not in ready:
+                raise PaquetAutoError(
+                    "rejeu refusé : #%d n'est pas dans la liste des lots prêts "
+                    "de --candidates-json" % lot)
+
+
 def replay(repo: Path, reference: str, name: str, base: str, *,
            compose_script: Path | None = None, keep: bool = False,
-           log=print) -> int:
+           candidates_json: Path | None = None, log=print) -> int:
     """Rejoue un manifeste gelé et compare l'arbre obtenu à celui de `reference`."""
     ref = rev(repo, reference)
     if ref is None:
@@ -1198,6 +1249,15 @@ def replay(repo: Path, reference: str, name: str, base: str, *,
     base_sha = rev(repo, base)
     if base_sha is None:
         raise InputError("base %r introuvable" % base)
+    if candidates_json is not None:
+        try:
+            payload = json.loads(Path(candidates_json).read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise InputError(
+                "--candidates-json %s illisible : %s" % (candidates_json, exc)) from exc
+        if not isinstance(payload, dict):
+            raise InputError("--candidates-json : un objet JSON attendu")
+        check_replay_admission(specs, payload, base_sha, repo)
     branch = "tmp/paquet-auto-rejeu-%d" % os.getpid()
     worktree = make_worktree(repo, base_sha, branch)
     try:
@@ -1461,11 +1521,17 @@ def main(argv: list[str] | None = None) -> int:
                              "branche distante sous --force-with-lease (retirer "
                              "la CI et le feu avant)")
     parser.add_argument("--replay", default=None, metavar="REF",
-                        help="rejouer le manifeste d'une référence et comparer les arbres")
+                        help="rejouer le manifeste d'une référence et comparer "
+                             "les arbres (avec --candidates-json : refuser une "
+                             "unité en erreur ou non prête, #3813)")
     parser.add_argument("--base", default=None,
                         help="avec --replay : la base du rejeu (seul usage ; "
                              "la composition part toujours de la tête fraîche "
                              "d'origin/<cible>)")
+    parser.add_argument("--candidates-json", default=None,
+                        help="avec --replay : la sortie `paquet-candidats "
+                             "--json` pour refuser une unité en erreur ou "
+                             "non prête (#3813)")
     parser.add_argument("--python", default=None,
                         help="interpréteur des outils enfants (défaut : un "
                              "Python du projet qui porte psycopg)")
@@ -1491,11 +1557,18 @@ def main(argv: list[str] | None = None) -> int:
                 raise InputError("--replay : ni --carrier ni --local")
             if not args.base:
                 raise InputError("--replay exige --base")
+            if args.candidates_json:
+                candidates_json = Path(args.candidates_json)
+            else:
+                candidates_json = None
             return replay(Path(args.repo).resolve(), args.replay, args.name,
-                          args.base, keep=args.keep_worktree)
+                          args.base, keep=args.keep_worktree,
+                          candidates_json=candidates_json)
         if args.base:
             raise InputError("--base ne s'applique qu'à --replay : la "
                              "composition part de la tête fraîche de la cible")
+        if args.candidates_json:
+            raise InputError("--candidates-json ne s'applique qu'à --replay")
         if not args.carrier:
             raise InputError("--carrier : le lot porteur est requis")
         if args.no_packet_record and not args.local:

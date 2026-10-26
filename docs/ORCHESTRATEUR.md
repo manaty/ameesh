@@ -564,7 +564,9 @@ jetable à la tête exacte d'`origin/<cible>`, y exécute `paquet-candidats.py`
 conflit sans le résoudre, passe les contrôles locaux, écrit le manifeste,
 `packet record` et le contrôle d'inclusion, puis pousse la branche, ouvre la
 PR, gèle la tête et couronne le pilote. « Verdict non requis », la CI complète
-et le feu restent au pilote.
+et le feu restent au pilote. Un lot rendu en **erreur** par `paquet-candidats`
+n'est jamais composé : il est écarté au manifeste avec son motif (rc 3 et
+`errors_by_lot`, #3813).
 
 ```sh
 scripts/paquet-auto.py --target main --name h-20261027-01 --carrier 3808
@@ -573,7 +575,10 @@ scripts/paquet-auto.py --target main --name h-20261027-01 --carrier 3808
 `--local` s'arrête après le manifeste et `packet record` (contrôle sans
 poussée ni gel) ; `--replay <réf>` rejoue la table `## Composition` d'un
 manifeste gelé et compare l'arbre produit à celui de `<réf>` (témoin de
-fidélité, sans poussée ni écriture en base).
+fidélité, sans poussée ni écriture en base). Avec
+`--candidates-json <sortie paquet-candidats --json>`, le rejeu refuse une
+unité en erreur ou non prête : h-31 v3 (`b57c0380`, #3506 en erreur) est
+refusé, h-31 v4 (`fc59a14e`, 6 unités) passe (arbre `2d15e224…`).
 
 La composition **part d'une liste calculée**, jamais des seuls courriers
 (#2404) : `scripts/paquet-candidats.py` lit tous les lots `qa` du projet (sans
