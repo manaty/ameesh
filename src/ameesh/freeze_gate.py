@@ -861,4 +861,16 @@ def milestone(
         # the internal `with` has committed: the readable thread can leave now
         for record in drain:
             record(db.cfg, db)
+    if kind == "frozen":
+        # #3641 : un regel de véhicule ne reporte pas silencieusement les
+        # déclarations d'atterrissage de ses unités (SLO `verdict_merge`
+        # fantôme). On prévient le déclarant, sous verrou, et la déclaration
+        # reste : le signal stale revient et le pilote renouvelle. Jamais
+        # d'échec du gel pour ce courrier.
+        try:
+            from . import work_dependencies
+            work_dependencies.warn_landings_after_freeze(
+                db, item_id, sha.strip(), actor=actor or "")
+        except Exception:  # noqa: BLE001 - le gel est écrit ; l'avis se répare
+            pass
     return row

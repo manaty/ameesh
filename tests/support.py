@@ -451,10 +451,12 @@ SENSITIVE_GLOBALS = (
     ("sys.stderr", sys, "stderr", sys.stderr),
 )
 
-#: #3625 : sous `python -m unittest -b`, unittest remplace `sys.stdout` et
-#: `sys.stderr` par ses tampons avant `setUpClass` et `tearDownClass`. Leur
-#: référence est donc prise par classe ; `ameesh.db.connect` garde celle du
-#: chargement, pour qu'une fuite d'une classe précédente reste visible.
+#: #3625/#3641 : sous `python -m unittest -b`, unittest remplace `sys.stdout`
+#: et `sys.stderr` par ses tampons avant `setUpClass` et `tearDownClass`. Leur
+#: référence n'est prise par classe que si c'est le tampon du résultat actif ;
+#: sinon la référence du chargement reste la vérité, pour qu'une fuite d'une
+#: classe précédente (hors du mixin) reste visible. `ameesh.db.connect` garde
+#: toujours celle du chargement.
 SENSITIVE_GLOBALS_PER_CLASS = frozenset(("sys.stdout", "sys.stderr"))
 
 
@@ -465,19 +467,48 @@ def _describe_global(value) -> str:
     return type(value).__name__
 
 
-def capture_sensitive_globals(cls) -> None:
-    """#3625 : fige la référence des globaux sensibles pour cette classe.
+def _active_result_streams() -> dict:
+    """#3641 : les flux du résultat tamponné de la classe en cours, s'il les
+    possède réellement.
 
-    Appelé en tête de `setUpClass`. Sous `-b`, les flux valent déjà le tampon
-    du lanceur, le même au début et à la fin de la classe : cette référence
-    distingue une fuite d'un tampon du lanceur, et la restauration remet le
-    tampon, pas le flux réel que `TestResult._restoreStdout` utiliserait
-    ensuite (`AttributeError: getvalue`).
+    Sous `-b`, `unittest` appelle `setUpClass` entre `TestResult._setupStdout`
+    et `_restoreStdout` ; la trame de `TestSuite._handleClassSetUp` tient
+    encore le `result`, et ses deux tampons sont exactement les flux courants.
+    Seuls ceux-là sont pris par classe : un autre `StringIO` est une fuite
+    d'une classe hors du mixin, que la garde #3601 doit continuer de voir
+    (#3625 la masquait en le prenant pour la référence de la classe).
     """
+    frame = sys._getframe(1)
+    try:
+        while frame is not None:
+            result = frame.f_locals.get("result")
+            if (getattr(result, "buffer", False)
+                    and sys.stdout is getattr(result, "_stdout_buffer", None)
+                    and sys.stderr is getattr(result, "_stderr_buffer", None)):
+                return {"sys.stdout": sys.stdout, "sys.stderr": sys.stderr}
+            frame = frame.f_back
+    finally:
+        del frame
+    return {}
+
+
+def capture_sensitive_globals(cls) -> None:
+    """#3625/#3641 : fige la référence des globaux sensibles pour cette classe.
+
+    Appelé en tête de `setUpClass`. Les flux ne sont pris par classe que
+    lorsqu'ils sont le tampon du résultat tamponné actif (`-b`) : leur
+    référence de classe distingue alors une fuite du tampon du lanceur, et la
+    restauration remet ce tampon, pas le flux réel que
+    `TestResult._restoreStdout` utiliserait ensuite (`AttributeError:
+    getvalue`). Hors `-b`, ou quand la référence courante n'est pas ce
+    tampon, la référence du chargement reste la vérité : une fuite d'une
+    classe simple, hors du mixin, n'est plus masquée (#3641).
+    """
+    streams = _active_result_streams()
     cls._sensitive_globals_baseline = {
-        nom: getattr(module, attribut)
-        for nom, module, attribut, _ in SENSITIVE_GLOBALS
-        if nom in SENSITIVE_GLOBALS_PER_CLASS
+        nom: streams[nom]
+        for nom, _module, _attribut, _expected in SENSITIVE_GLOBALS
+        if nom in SENSITIVE_GLOBALS_PER_CLASS and nom in streams
     }
 
 
