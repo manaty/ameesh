@@ -76,6 +76,47 @@ class ReviewDueTest(unittest.TestCase):
         self.assertGreaterEqual(due[0]["age_s"], 21 * H)
         self.assertEqual([row["lot"] for row in report["blocked_reviews"]], [3033])
 
+    def test_dispense_du_gel_retire_les_avis_et_le_faux_repos_3818(self):
+        report = run(
+            items=[item(7)], milestones=[frozen(7, 10, T - 5 * H)],
+            agents=[{"name": "ameesh-cx2", "status": "idle"}],
+            events=[event(7, 1, T - 5 * H, mark(7, 10, ["ameesh-cx2"])),
+                    event(7, 2, T - 4 * H,
+                          "verdict not required: no re-verdict due (#1979)")])
+        self.assertEqual(report["reviews_due"], [])
+        self.assertEqual(report["qa"][0]["pending_reviewers"], [])
+        self.assertTrue(report["qa"][0]["ready"])
+        self.assertEqual(report["idle_agents_with_work"], [])
+
+    def test_nouveau_gel_apres_dispense_redesigne_3818(self):
+        report = run(
+            items=[item(7)],
+            milestones=[frozen(7, 10, T - 5 * H),
+                        frozen(7, 11, T - 2 * H, sha="b" * 40)],
+            events=[event(7, 1, T - 5 * H, mark(7, 10, ["ameesh-cx2"])),
+                    event(7, 2, T - 4 * H,
+                          "verdict not required: no re-verdict due (#1979)"),
+                    event(7, 3, T - 2 * H, mark(7, 11, ["ameesh-dev3"]))])
+        self.assertEqual([r["reviewer"] for r in report["reviews_due"]],
+                         ["ameesh-dev3"])
+
+    def test_ancienne_dispense_sans_effet_sur_gel_courant_3818(self):
+        report = run(
+            items=[item(7)], milestones=[frozen(7, 10, T - 3 * H)],
+            events=[event(7, 1, T - 4 * H,
+                          "verdict not required: no re-verdict due (#1979)"),
+                    event(7, 2, T - 3 * H, mark(7, 10, ["ameesh-cx2"]))])
+        self.assertEqual(report["qa"][0]["pending_reviewers"], ["ameesh-cx2"])
+        self.assertFalse(report["qa"][0]["ready"])
+
+    def test_designation_explicite_apres_dispense_3818(self):
+        report = run(
+            items=[item(7)], milestones=[frozen(7, 10, T - 5 * H)],
+            events=[event(7, 1, T - 4 * H,
+                          "verdict not required: no re-verdict due (#1979)"),
+                    event(7, 2, T - 3 * H, "reviewer ameesh-dev3 designated")])
+        self.assertEqual(report["qa"][0]["pending_reviewers"], ["ameesh-dev3"])
+
     def test_verdict_sur_une_autre_tete_ne_compte_pas(self):
         report = run(
             items=[item(7)],

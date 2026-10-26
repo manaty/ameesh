@@ -638,6 +638,8 @@ def designations(milestones: list[dict], events: list[dict]) -> dict:
       sur la nouvelle tête que s'il a été redésigné depuis le gel (#3033) ;
       un auteur ou correcteur de la tête, nommé par la marque du dernier gel,
       ne compte jamais (#2888/#2739) ;
+    * la dispense `verdict not required:` depuis le gel, levée par une
+      désignation explicite ou son retrait (#1979) ;
     * les verdicts qui nomment la tête gelée : un `blocked` rendu compte
       l'avis (le relecteur a rendu), un verdict d'une autre tête ne compte pas.
     """
@@ -650,12 +652,18 @@ def designations(milestones: list[dict], events: list[dict]) -> dict:
     unreadable: list[str] = []
     latest_mark = None
     none_mark = False
+    waived = False
     ever: set[str] = set()
     manual: dict[str, dict] = {}
     for event in sorted(events or (),
                         key=lambda e: (float(e.get("at_ts") or 0.0),
                                        int(e.get("id") or 0))):
         text = str(event.get("note") or "").strip()
+        if float(event.get("at_ts") or 0.0) >= freeze_at:
+            if text.startswith("verdict not required:"):
+                waived = True
+            elif text == "reviewer designation removed" or _MANUAL.match(text):
+                waived = False
         parsed = _mark(event)
         if parsed is not None:
             for name in parsed["names"]:
@@ -676,6 +684,11 @@ def designations(milestones: list[dict], events: list[dict]) -> dict:
             manual[_norm(name)] = {"name": name,
                                    "kind": manual_match.group(2),
                                    "at": float(event.get("at_ts") or 0.0)}
+    # #3818/#1979 : la dispense vaut pour ce gel seulement. Un nouveau
+    # gel ou une désignation explicite rend la revue à nouveau due.
+    if waived:
+        return {"freeze": freeze, "designees": [], "pending": [],
+                "missing": False, "none": True, "unreadable": []}
     auto = list(latest_mark["names"]) if latest_mark else []
     # Un auteur de la tête — dont le relecteur qui y a poussé un correctif
     # (#2888/#2739) — ne peut pas la relire. La marque du gel courant le dit ;
