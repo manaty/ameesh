@@ -3260,6 +3260,24 @@ class _AlreadyNoted(Exception):
     """#3369 : a concurrent pass already journaled this reassignment."""
 
 
+class _UnreadableInputs(Exception):
+    """#3631 : a read the reassignment pass needs could not be made.
+
+    The message names the read (`agents.reachability`, `work_items.unreachable`
+    …, so the runner log says WHICH query lost the pass) and carries the
+    driver's statement detail when the failure is a statement timeout.
+    """
+
+
+def _named_read(name: str, call):
+    """Run `call`, naming the read on failure (`_UnreadableInputs`)."""
+    try:
+        return call()
+    except Exception as exc:  # noqa: BLE001 - the caller reports and skips
+        raise _UnreadableInputs(
+            "%s: %s" % (name, db_mod.timeout_detail(exc))) from exc
+
+
 def _reassign_prefix(lot: int, freeze_id: int, dead: Sequence[tuple]) -> str:
     """The journal prefix that makes one reassignment pass idempotent (#3328).
 
@@ -3491,24 +3509,33 @@ def reassign_unreachable(cfg, db, *, limit: int = RETRY_LIMIT) -> dict:
     cursor = _read_cursor(cfg, REASSIGN_CURSOR)
     try:
         from .storage.postgres.work import has_reviewers
-        if not has_reviewers(db):
+        if not _named_read("work_items.reviewers", lambda: has_reviewers(db)):
             out["summary"] = "no reviewer column: nothing to reassign"
             return out
-        listing = registry.overview(db)
+        # #3631 : six colonnes suffisent (joignabilité), au lieu de la vue
+        # d'observabilité complète que la base commune faisait expirer.
+        listing = _named_read(
+            "agents.reachability", lambda: storage.of(db).agents.reachability())
         if not listing:
             out["summary"] = "registry unreadable or empty: no reassignment"
             return out
         by_name = _reviewer_rows(listing)
-        closed = alert_briefs.claims_closed_hosts(db)
+        closed = _named_read(
+            "alert_briefs.claims_closed_hosts",
+            lambda: alert_briefs.claims_closed_hosts(db))
         hosts = [str(host).strip() for host in closed if str(host).strip()]
         # #3328 (relecture) : le filtre est dans la requête, AVANT la fenêtre
         # bornée. Les 200 lots anciens sains ne peuvent plus masquer le 201e
         # dont le siège est perdu ; le curseur fait avancer une passe dont les
         # lignes examinées ne demandent rien, puis se replie une fois au bout.
-        rows = _unreachable_lots(db, after=cursor, hosts=hosts)
+        rows = _named_read(
+            "work_items.unreachable",
+            lambda: _unreachable_lots(db, after=cursor, hosts=hosts))
         if not rows and cursor:
             cursor = 0
-            rows = _unreachable_lots(db, after=0, hosts=hosts)
+            rows = _named_read(
+                "work_items.unreachable",
+                lambda: _unreachable_lots(db, after=0, hosts=hosts))
         if not rows:
             if cursor:
                 # The queue is empty: the next pass starts at the oldest lot
@@ -3516,6 +3543,12 @@ def reassign_unreachable(cfg, db, *, limit: int = RETRY_LIMIT) -> dict:
                 _write_cursor(cfg, REASSIGN_CURSOR, 0)
             out["summary"] = "no unreachable evidence"
             return out
+    except _UnreadableInputs as exc:
+        # #3631 : la passe nomme la lecture qui a expiré (et la requête, quand
+        # le pilote l'a portée) au lieu de perdre 639 passes en silence.
+        out["errors"].append(str(exc))
+        out["summary"] = "no reassignment: inputs unreadable"
+        return out
     except Exception as exc:  # noqa: BLE001 - the pass never breaks the caller
         out["errors"].append("%s: %s" % (type(exc).__name__, str(exc)[:200]))
         out["summary"] = "no reassignment: inputs unreadable"

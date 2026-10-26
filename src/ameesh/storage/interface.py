@@ -316,6 +316,18 @@ class Agents(Domain):
         """Vue d'observabilité (`mesh list --json`), colonnes du canon comprises."""
 
     @abc.abstractmethod
+    def reachability(self) -> list[dict]:
+        """#3631 : les seules colonnes qui disent si un relecteur désigné lira
+        son courrier — `name`, `aliases`, `retired_ts`, `mode`, `status`,
+        `host`.
+
+        La passe de redésignation lit ce fait à chaque synchronisation de
+        canon sur chaque exécuteur : `overview()` y joignait le canon, les
+        baux et des colonnes larges, et expirait sous la pression de la base
+        commune (639 passes perdues en 24 h). Aucune décision de sélection
+        n'est prise ici, seulement la preuve de joignabilité."""
+
+    @abc.abstractmethod
     def claimable(self, host: str, names: Sequence[str] | None, *,
                   require_responsible: bool) -> list[dict]:
         """Agents de l'hôte sans bail vivant, réclamables (mêmes règles que `claim`).

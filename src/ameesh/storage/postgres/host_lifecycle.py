@@ -38,10 +38,17 @@ class HostLifecycle(interface.HostLifecycle):
             raise ValueError("loss threshold must be at least 60 seconds")
         # Only hosts with an observed heartbeat qualify. Missing inventory
         # and a fresh runner lease are not evidence of a lost machine.
+        # #3631 : the candidate hosts are the registry's (the pass skips a
+        # host without an executor agent anyway) and the last reading is one
+        # index lookup per host — the old GROUP BY over host_resources read
+        # the whole history on every pass of every executor.
         candidates = self.db.query(
-            "SELECT host FROM host_resources GROUP BY host "
-            "HAVING max(sampled_at)<clock_timestamp()-make_interval(secs=>%s) "
-            "ORDER BY host", (older_than,))
+            "SELECT h.host FROM (SELECT DISTINCT host FROM agent_registry"
+            "                    WHERE mode = 'execute' AND host IS NOT NULL) h"
+            " WHERE (SELECT max(sampled_at) FROM host_resources r"
+            "         WHERE r.host = h.host)"
+            "       < clock_timestamp()-make_interval(secs=>%s)"
+            " ORDER BY h.host", (older_than,))
         changed = []
         for candidate in candidates:
             host = candidate["host"]
@@ -59,10 +66,12 @@ class HostLifecycle(interface.HostLifecycle):
                 # Re-read after the gate/agent locks: a heartbeat or renewal
                 # may have committed while this detector was waiting.
                 stale = tx.query(
-                    "SELECT host FROM host_resources WHERE host=%s GROUP BY host "
-                    "HAVING max(sampled_at)<clock_timestamp()-make_interval(secs=>%s) "
-                    "AND NOT EXISTS (SELECT 1 FROM agent_registry r WHERE r.host=%s "
-                    "AND r.mode='execute' AND r.lease_expires_at>clock_timestamp())",
+                    "SELECT host FROM (VALUES (%s::text)) v(host)"
+                    " WHERE (SELECT max(sampled_at) FROM host_resources r"
+                    "         WHERE r.host = v.host)"
+                    "       < clock_timestamp()-make_interval(secs=>%s)"
+                    "   AND NOT EXISTS (SELECT 1 FROM agent_registry r WHERE r.host=%s "
+                    "   AND r.mode='execute' AND r.lease_expires_at>clock_timestamp())",
                     (host, older_than, host))
                 if not stale:
                     continue
