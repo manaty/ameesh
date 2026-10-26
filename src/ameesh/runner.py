@@ -621,7 +621,7 @@ class AgentWorker(threading.Thread):
         #: #3733 : épisodes de débit passager clos de l'heure glissante, et
         #: début de leur série ; le cumul est écrit dans `status_text` (un
         #: succès ne l'efface pas) et lu par `rate_limited_chronic`. Relus de
-        #: la ligne : le cumul mesuré revient comme un épisode clos.
+        #: la ligne avec les bornes réelles des épisodes (#3743).
         self.rate_limit_window, self.rate_limit_window_since = rate_limit_mod.window_restore(
             rate_limit_mod.window_state(agent.get("status_text")), etat_debit)
         self.last_activity = time.monotonic()
@@ -1943,7 +1943,7 @@ class AgentWorker(threading.Thread):
             if row.get("status") in ("running", "idle", "queued"):
                 registry.set_status(self.db, self.name,
                                     "queued" if row.get("pending_prompt") else "idle",
-                                    status_text=texte)
+                                    status_text=self._fenetre_debit(texte, paused=True))
         except db_mod.DbError as exc:
             log_async("[%s] withdrawal state not written (%s)" % (self.name, db_mod.explain(exc)))
 
@@ -6955,7 +6955,7 @@ class AgentWorker(threading.Thread):
         if self.preemption_streak:
             texte = exploitation_mod.preemption_status_text(
                 texte, self.preemption_streak, since=self.preemption_since)
-        return self._fenetre_debit(texte)
+        return self._fenetre_debit(texte, paused=True)
 
     def _clos_episode_debit(self, fin: float) -> None:
         """#3733 : l'épisode de débit passager en cours, fini à `fin` (début
@@ -6965,7 +6965,7 @@ class AgentWorker(threading.Thread):
             self.rate_limit_window.append(
                 (self.rate_limit_since, max(self.rate_limit_since, float(fin))))
 
-    def _fenetre_debit(self, texte: str) -> str:
+    def _fenetre_debit(self, texte: str, *, paused: bool = False) -> str:
         """#3733 : `texte` suffixé du cumul de débit passager de l'heure
         glissante (épisode en cours compris) ; tel quel sans cumul, et la
         série se referme quand la fenêtre est vide."""
@@ -6981,7 +6981,8 @@ class AgentWorker(threading.Thread):
             self.rate_limit_window_since = min(debuts)
         return rate_limit_mod.window_text(
             texte, rate_limit_mod.window_total(self.rate_limit_window, now, en_cours),
-            len(debuts), self.rate_limit_window_since, now)
+            len(debuts), self.rate_limit_window_since, now,
+            closed=self.rate_limit_window, ongoing=en_cours, paused=paused)
 
     def _run_turn(self, spec: dict) -> bool:
         """Un tour, sous battement de bail **dès la préparation** (#2544).
@@ -7889,7 +7890,8 @@ class AgentWorker(threading.Thread):
                                self.db, self.name, self.runner.runner_id, self.epoch)
             self._avec_reprise("statut de fin de tour", registry.set_status,
                                self.db, self.name, "queued",
-                               status_text="tour interrompu : l'hôte se retire (%s)" % raison)
+                               status_text=self._fenetre_debit(
+                                   "tour interrompu : l'hôte se retire (%s)" % raison, paused=True))
             self._fil_note(
                 "Tour interrompu après %ds : l'hôte se retire (%s). La consigne repart "
                 "en attente ; le travail reprendra dans la même session au retour de "
@@ -7904,7 +7906,8 @@ class AgentWorker(threading.Thread):
                                self.db, self.name, self.runner.runner_id, self.epoch)
             self._avec_reprise("end-of-turn status", registry.set_status,
                                self.db, self.name, "queued",
-                               status_text="turn stopped: restart requested")
+                               status_text=self._fenetre_debit(
+                                   "turn stopped: restart requested", paused=True))
             return False
         if self.host_yield is not None and not preempte:
             # L159f : l'hôte se retire — comme une préemption : la consigne
@@ -7917,7 +7920,8 @@ class AgentWorker(threading.Thread):
                                self.db, self.name, self.runner.runner_id, self.epoch)
             self._avec_reprise("end-of-turn status", registry.set_status,
                                self.db, self.name, "queued",
-                               status_text="turn interrupted: the host is withdrawing (%s)" % raison)
+                               status_text=self._fenetre_debit(
+                                   "turn interrupted: the host is withdrawing (%s)" % raison, paused=True))
             self._fil_note(
                 "Turn interrupted after %ds: the host is withdrawing (%s). The turn's "
                 "instruction goes back in the queue; the work resumes in the same "
