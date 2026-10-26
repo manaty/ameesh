@@ -22,16 +22,26 @@ l'hôte) ; un projet sans dépôt lisible est **non mesuré** et nommé au journ
 jamais supposé sain. Un projet dont la politique était lisible et ne l'est plus
 à la tête (bloc retiré, document absent, YAML invalide) est une baisse : deux
 avis, avec la raison au journal.
+
+#3572 : les drapeaux `reviews.exclude_author_family` / `distinct_families` de
+`processus/mecanique.yaml` sont comparés eux aussi (un passage true→false abaisse
+l'exigence de tous les fichiers sans changer un seul compte) ; et la sonde
+tient dans une échéance globale (`BUDGET_S`) : une politique ou un dépôt de
+projet lent fait conclure au doute (deux avis), jamais attendre le gel.
+Chaque commande git, jusque dans les aides (`local_commit`, `default_target`,
+`remote_branch`), ne prend que le temps qui reste.
 """
 from __future__ import annotations
 
-import functools
+import dataclasses
 import os
+import threading
 from dataclasses import dataclass
 from typing import Iterable, Optional
 
 from . import canon as canon_mod
 from . import mechanics, plan_git, radar, review
+from .deadline import Deadline
 
 #: les fichiers du canon dont un diff peut changer la politique de revue
 POLICY_FILES = ("federation.yaml", "processus/mecanique.yaml")
@@ -41,6 +51,22 @@ AGENTS_PREFIX = "agents/"
 PREFIX = "canon-review-lowering:"
 #: nombre de fichiers nommés au journal (le reste est compté)
 MAX_LISTED = 20
+#: #3572 : échéance globale d'une comparaison (secondes), lectures du canon et
+#: `ls-tree` des dépôts de projets comprises ; épuisée, elle rend un doute
+BUDGET_S = 20.0
+#: #3572 : drapeaux `reviews` dont un passage true→false abaisse l'exigence
+FLAGS = ("exclude_author_family", "distinct_families")
+#: l'échéance est relue tous les N fichiers d'un dépôt (boucle sans git)
+CHECK_EVERY = 512
+
+
+class _Expired(Exception):
+    """L'échéance globale de la sonde est épuisée (#3572) : un doute."""
+
+
+def _check(deadline: Optional[Deadline], what: str) -> None:
+    if deadline is not None and deadline.expired():
+        raise _Expired(what)
 
 
 def touches(paths: Iterable) -> bool:
@@ -105,14 +131,17 @@ class Detection:
     #: une comparaison impossible est un doute, pas un « rien n'a baissé »
     errors: tuple = ()
     note: str = ""
+    #: #3572 : drapeaux `reviews` passés de true à false (nom du drapeau)
+    lowered_flags: tuple = ()
 
     @property
     def floor(self) -> int:
-        return 2 if (self.lowered or self.errors) else 0
+        return 2 if (self.lowered or self.lowered_flags or self.errors) else 0
 
     def to_dict(self) -> dict:
         return {"base": self.base, "head": self.head, "floor": self.floor,
                 "lowered": [item.to_dict() for item in self.lowered],
+                "lowered_flags": list(self.lowered_flags),
                 "hardened": self.hardened, "unchanged": self.unchanged,
                 "scans": [item.to_dict() for item in self.scans],
                 "unmeasured": [list(item) for item in self.unmeasured],
@@ -122,20 +151,35 @@ class Detection:
         return journal_text(self)
 
 
-def _base_commit(repo: str, ref) -> Optional[str]:
+def _probe_timeout(deadline: Optional[Deadline], what: str) -> float:
+    """Le délai d'une sonde de présence, ramené au temps qui reste."""
+    _check(deadline, what)
+    if deadline is None:
+        return plan_git.PROBE_TIMEOUT_S
+    return deadline.timeout(plan_git.PROBE_TIMEOUT_S)
+
+
+def _base_commit(repo: str, ref, deadline: Optional[Deadline] = None
+                 ) -> Optional[str]:
     """Le commit local d'une ref, sans fetch paresseux (#2851, clone partiel)."""
     text = str(ref or "").strip()
     if not text:
         return None
-    return plan_git.local_commit(repo, text)
+    return plan_git.local_commit(
+        repo, text, timeout=_probe_timeout(deadline, "the lot commits"),
+        deadline=deadline)
 
 
-def _merge_base(repo: str, base: str, head: str) -> str:
+def _merge_base(repo: str, base: str, head: str,
+                deadline: Optional[Deadline] = None) -> str:
     """La base du diff du lot (`merge-base`), ou la base lue si git se tait."""
     try:
-        out = plan_git._out(repo, "merge-base", base, head)
+        proc = canon_mod._git(repo, "merge-base", base, head, deadline=deadline)
+        out = (proc.stdout.decode("utf-8", "replace")
+               if proc.returncode == 0 else None)
     except Exception:  # noqa: BLE001 - dépôt illisible : la base lue reste le doute
         out = None
+    _check(deadline, "merge-base")
     return str(out or "").strip() or base
 
 
@@ -143,28 +187,72 @@ def _absent(exc: Exception, path: str) -> bool:
     return isinstance(exc, mechanics.MechanicsAbsent) and path in str(exc)
 
 
-@functools.lru_cache(maxsize=64)
-def _load_cached(repo: str, commit: str, project: str):
+class _Memo:
+    """Mémoïsation bornée, sans l'échéance dans la clé (#3572).
+
+    Un commit ne change pas : une lecture réussie se garde ; un échec (y
+    compris une échéance épuisée) ne se garde jamais. Le verrou ne couvre que
+    le dictionnaire, jamais la lecture git (comme `functools.lru_cache`).
+    """
+
+    def __init__(self, size: int):
+        self.size = size
+        self.values: dict = {}
+        self.lock = threading.Lock()
+
+    def get(self, key, compute):
+        with self.lock:
+            if key in self.values:
+                return self.values[key]
+        value = compute()
+        with self.lock:
+            if key not in self.values and len(self.values) >= self.size:
+                self.values.pop(next(iter(self.values)))
+            self.values[key] = value
+        return value
+
+    def clear(self) -> None:
+        with self.lock:
+            self.values.clear()
+
+
+_LOADED = _Memo(64)
+_GLOBAL = _Memo(64)
+_TRACKED = _Memo(64)
+_SCANNED = _Memo(32)
+
+
+def _load_cached(repo: str, commit: str, project: str,
+                 deadline: Optional[Deadline] = None):
     """`mechanics.load` mémoïsé : un commit ne change pas, une passe non plus."""
-    return mechanics.load(repo, commit, project)
+    return _LOADED.get((repo, commit, project), lambda: mechanics.load(
+        repo, commit, project, deadline=deadline))
 
 
-def _load(repo: str, commit: str, project: str):
-    """`(paramètres, erreur)` : ne lève jamais pour laisser l'appelant conclure."""
+def _load(repo: str, commit: str, project: str,
+          deadline: Optional[Deadline] = None):
+    """`(paramètres, erreur)` : ne lève que sur une échéance épuisée."""
     try:
-        return _load_cached(repo, commit, project), None
+        return _load_cached(repo, commit, project, deadline), None
     except (mechanics.MechanicsError, canon_mod.CanonError) as exc:
+        # une lecture coupée par l'échéance n'est pas une politique illisible
+        _check(deadline, "the policy of %s" % (project,))
         return None, exc
 
 
-@functools.lru_cache(maxsize=64)
-def _tracked(repo: str, commit: str) -> tuple:
+def _tracked(repo: str, commit: str, deadline: Optional[Deadline] = None) -> tuple:
     """Les fichiers **suivis** au commit : blobs ordinaires et liens symboliques.
 
     Les sous-modules ne sont pas des fichiers du dépôt (leur contenu vit
     ailleurs) ; un lien symbolique, lui, est un chemin que la politique classe.
     """
-    proc = canon_mod._git(repo, "ls-tree", "-r", "-z", "--full-tree", commit)
+    return _TRACKED.get((repo, commit), lambda: _list_tracked(
+        repo, commit, deadline))
+
+
+def _list_tracked(repo: str, commit: str, deadline: Optional[Deadline]) -> tuple:
+    proc = canon_mod._git(repo, "ls-tree", "-r", "-z", "--full-tree", commit,
+                          deadline=deadline)
     if proc.returncode != 0:
         raise canon_mod.GitError(
             "git ls-tree: %s"
@@ -181,7 +269,7 @@ def _tracked(repo: str, commit: str) -> tuple:
     return tuple(sorted(paths))
 
 
-def _project_repository(cfg, project: str):
+def _project_repository(cfg, project: str, deadline: Optional[Deadline] = None):
     """`(racine, cible)` du dépôt déclaré du projet, ou `(None, raison)`."""
     try:
         settings = radar.settings_of(cfg)
@@ -197,26 +285,28 @@ def _project_repository(cfg, project: str):
     if not os.path.isdir(path):
         return None, "repository of project %r is missing: %s" % (project, path)
     try:
-        root = canon_mod.git_toplevel(path)
+        root = canon_mod.git_toplevel(path, deadline=deadline)
     except Exception:  # noqa: BLE001 - pas un dépôt : non mesurable
         root = None
+    _check(deadline, "the repository of %s" % (project,))
     if not root:
         return None, "repository of project %r is not a git checkout: %s" % (
             project, path)
     target = str(getattr(entry, "target", "") or "").strip()
     if not target:
         try:
-            target = plan_git.default_target(root) or ""
+            target = plan_git.default_target(root, deadline=deadline) or ""
         except Exception:  # noqa: BLE001 - pas de cible par défaut : HEAD
             target = ""
+        _check(deadline, "the target of %s" % (project,))
     return (root, target), ""
 
 
-def _revision(repo: str, target: str):
+def _revision(repo: str, target: str, deadline: Optional[Deadline] = None):
     """`(ref, commit)` de la cible du projet, sinon `HEAD`, sinon rien."""
     candidates = []
     if target:
-        remote = canon_mod.remote_branch(repo, target)
+        remote = canon_mod.remote_branch(repo, target, deadline=deadline)
         if remote:
             candidates.append("refs/remotes/" + remote)
         candidates.append(target)
@@ -224,31 +314,37 @@ def _revision(repo: str, target: str):
     for ref in candidates:
         # `local_commit` : jamais de fetch paresseux pour une sonde de présence
         # (#2851), et une tête absente localement est un « non mesuré » explicite.
-        commit = plan_git.local_commit(repo, ref)
+        commit = plan_git.local_commit(
+            repo, ref, timeout=_probe_timeout(deadline, "the project revision"),
+            deadline=deadline)
         if commit:
             return ref, commit
     return "", ""
 
 
 def _scan_project(canon_repo: str, base: str, head: str, project: str,
-                  repo: str, commit: str):
+                  repo: str, commit: str, deadline: Optional[Deadline] = None):
     """Compare `reviews_for` sur les fichiers suivis du dépôt d'un projet.
 
     Mémoïsé par (canon, base, tête, projet, dépôt, commit du dépôt) : un commit
     ne change pas, et la porte relit la même tête plusieurs fois.
     """
-    return _scan_cached(canon_repo, base, head, project, repo, commit)
+    return _SCANNED.get(
+        (canon_repo, base, head, project, repo, commit),
+        lambda: _scan_files(canon_repo, base, head, project, repo, commit,
+                            deadline))
 
 
-@functools.lru_cache(maxsize=32)
-def _scan_cached(canon_repo: str, base: str, head: str, project: str,
-                 repo: str, commit: str):
-    base_loaded = _load_cached(canon_repo, base, project)
-    head_loaded = _load_cached(canon_repo, head, project)
+def _scan_files(canon_repo: str, base: str, head: str, project: str,
+                repo: str, commit: str, deadline: Optional[Deadline]):
+    base_loaded = _load_cached(canon_repo, base, project, deadline)
+    head_loaded = _load_cached(canon_repo, head, project, deadline)
     lowered = []
     hardened = unchanged = base_unreadable = 0
-    tracked = _tracked(repo, commit)
-    for path in tracked:
+    tracked = _tracked(repo, commit, deadline)
+    for index, path in enumerate(tracked):
+        if index % CHECK_EVERY == 0:
+            _check(deadline, "the files of %s" % (project,))
         try:
             before = base_loaded.reviews_for([path])
         except (mechanics.MechanicsError, review.ReviewError):
@@ -287,19 +383,47 @@ def _same_policy(before, after) -> bool:
         == (after.review_policy, after.rules, after.light_reviews)
 
 
-def _scan(cfg, canon_repo: str, base: str, head: str, project: str):
+def _flags(repo: str, base: str, head: str, deadline: Optional[Deadline]):
+    """#3572 : `(drapeaux abaissés, erreurs)` de `processus/mecanique.yaml`.
+
+    `exclude_author_family` / `distinct_families` valent pour tous les fichiers
+    de tous les projets : leur passage true→false est une baisse, sans qu'aucun
+    compte d'avis ne bouge. Une base sans document ou illisible n'impute rien au
+    diff ; une tête qui ne se lit plus, si la base se lisait, est un doute.
+    """
+    def read(commit):
+        return _GLOBAL.get((repo, commit), lambda: mechanics.load_global(
+            repo, commit, deadline=deadline))
+    try:
+        before = read(base)
+    except (mechanics.MechanicsError, canon_mod.CanonError):
+        _check(deadline, mechanics.PATH)
+        return (), []
+    try:
+        after = read(head)
+    except (mechanics.MechanicsError, canon_mod.CanonError) as exc:
+        _check(deadline, mechanics.PATH)
+        return (), ["%s illisible à la tête: %s" % (mechanics.PATH, str(exc)[:200])]
+    return tuple(name for name in FLAGS
+                 if getattr(before, name) and not getattr(after, name)), []
+
+
+def _scan(cfg, canon_repo: str, base: str, head: str, project: str,
+          deadline: Optional[Deadline] = None):
     """Le scan d'un projet : `(baisses, durcis, inchangés, scan, non mesuré)`."""
-    found, reason = _project_repository(cfg, project)
+    found, reason = _project_repository(cfg, project, deadline)
     if found is None:
         return (), 0, 0, None, (project, reason)
     repo, target = found
     try:
-        ref, commit = _revision(repo, target)
+        ref, commit = _revision(repo, target, deadline)
         if not commit:
             return (), 0, 0, None, (project, "no readable revision for %s" % (repo,))
         items, plus, same, unreadable, total = _scan_project(
-            canon_repo, base, head, project, repo, commit)
+            canon_repo, base, head, project, repo, commit, deadline)
     except (canon_mod.GitError, mechanics.MechanicsError, OSError) as exc:
+        # un `ls-tree` coupé par l'échéance n'est pas un dépôt illisible
+        _check(deadline, "the files of %s" % (project,))
         return (), 0, 0, None, (project, "scan impossible: %s: %s"
                                 % (type(exc).__name__, str(exc)[:160]))
     scan = Scan(project=project, repo=repo, ref=ref, commit=commit,
@@ -307,7 +431,8 @@ def _scan(cfg, canon_repo: str, base: str, head: str, project: str):
     return items, plus, same, scan, None
 
 
-def for_lot(cfg, repo: str, base, head, paths: Iterable) -> Optional[Detection]:
+def for_lot(cfg, repo: str, base, head, paths: Iterable, *,
+            deadline: Optional[Deadline] = None) -> Optional[Detection]:
     """La comparaison pour un lot du canon, ou None si elle ne s'applique pas.
 
     None : le diff ne touche pas la politique, ou le dépôt n'est pas un canon
@@ -318,49 +443,70 @@ def for_lot(cfg, repo: str, base, head, paths: Iterable) -> Optional[Detection]:
 
     Ne lève jamais : `lot_class._of_lot` est une lecture (porte, feu,
     paquet-candidats, désignation) et une sonde git qui expire est un doute,
-    jamais une exception qui remonte.
+    jamais une exception qui remonte. #3572 : toute la comparaison tient dans
+    `deadline` (par défaut `BUDGET_S`) ; épuisée, elle conclut au doute.
     """
     paths = list(paths or ())
     if not str(repo or "").strip() or not touches(paths):
         return None
+    if deadline is None:
+        deadline = Deadline(BUDGET_S)
+    expired = "échéance de la sonde épuisée (%.0f s)" % (
+        deadline.at - deadline.started,)
     try:
-        return _for_lot(cfg, repo, base, head, paths)
+        found = _for_lot(cfg, repo, base, head, paths, deadline)
+    except (_Expired, canon_mod.GitDeadline) as exc:
+        return Detection(base=str(base or ""), head=str(head or ""),
+                         errors=("%s: %s" % (expired, str(exc)[:200]),))
     except (canon_mod.GitError, OSError) as exc:
         return Detection(base=str(base or ""), head=str(head or ""),
                          errors=("comparaison impossible: %s: %s"
                                  % (type(exc).__name__, str(exc)[:200]),))
+    if deadline.expired():
+        # Une lecture coupée par l'échéance a pu se lire « non mesuré » ou
+        # « rien à comparer » : le résultat entier devient un doute, en gardant
+        # ce qui a été prouvé avant la coupure.
+        if found is None:
+            return Detection(base=str(base or ""), head=str(head or ""),
+                             errors=(expired,))
+        return dataclasses.replace(found, errors=found.errors + (expired,))
+    return found
 
 
-def _for_lot(cfg, repo: str, base, head, paths) -> Optional[Detection]:
+def _for_lot(cfg, repo: str, base, head, paths,
+             deadline: Optional[Deadline] = None) -> Optional[Detection]:
     """Le corps de `for_lot`, sous la garde de ses erreurs git."""
     base_ref = str(base or "").strip()
     head_ref = str(head or "").strip()
-    base_commit = _base_commit(repo, base_ref)
-    head_commit = _base_commit(repo, head_ref)
+    base_commit = _base_commit(repo, base_ref, deadline)
+    head_commit = _base_commit(repo, head_ref, deadline)
     if not base_commit or not head_commit:
         return None
     if base_commit == head_commit:
         return None
-    start = _merge_base(repo, base_commit, head_commit)
+    start = _merge_base(repo, base_commit, head_commit, deadline)
     if not start:
         return Detection(base=base_commit, head=head_commit,
                          errors=("merge-base illisible",))
     try:
-        base_projects = mechanics.declared_projects(repo, start)
+        base_projects = mechanics.declared_projects(repo, start, deadline=deadline)
     except mechanics.MechanicsAbsent:
         # Pas de canon à la base : un ajout de politique ne peut rien abaisser
         # (le lot part d'un canon qui n'en avait pas).
         return None
     except (mechanics.MechanicsError, canon_mod.CanonError) as exc:
+        _check(deadline, "federation.yaml")
         return Detection(base=start, head=head_commit,
                          errors=("federation.yaml illisible à la base: %s"
                                  % (str(exc)[:240],),))
     try:
-        head_projects = mechanics.declared_projects(repo, head_commit)
+        head_projects = mechanics.declared_projects(repo, head_commit,
+                                                    deadline=deadline)
     except mechanics.MechanicsAbsent:
         return Detection(base=start, head=head_commit,
                          errors=("federation.yaml absent à la tête",))
     except (mechanics.MechanicsError, canon_mod.CanonError) as exc:
+        _check(deadline, "federation.yaml")
         return Detection(base=start, head=head_commit,
                          errors=("federation.yaml illisible à la tête: %s"
                                  % (str(exc)[:240],),))
@@ -369,13 +515,13 @@ def _for_lot(cfg, repo: str, base, head, paths) -> Optional[Detection]:
     hardened = unchanged = 0
     scans: list = []
     unmeasured: list = []
-    errors: list = []
+    flags, errors = _flags(repo, start, head_commit, deadline)
     for project in declared:
-        base_loaded, base_error = _load(repo, start, project)
-        head_loaded, head_error = _load(repo, head_commit, project)
+        base_loaded, base_error = _load(repo, start, project, deadline)
+        head_loaded, head_error = _load(repo, head_commit, project, deadline)
         if base_loaded is not None and head_loaded is not None:
             items, plus, same, scan, missing = _scan(
-                cfg, repo, start, head_commit, project)
+                cfg, repo, start, head_commit, project, deadline)
             lowered.extend(items)
             hardened += plus
             unchanged += same
@@ -411,7 +557,7 @@ def _for_lot(cfg, repo: str, base, head, paths) -> Optional[Detection]:
     return Detection(base=start, head=head_commit, lowered=tuple(lowered),
                      hardened=hardened, unchanged=unchanged,
                      scans=tuple(scans), unmeasured=tuple(unmeasured),
-                     errors=tuple(errors), note=note)
+                     errors=tuple(errors), note=note, lowered_flags=flags)
 
 
 def journal_text(lowering, *, limit: int = MAX_LISTED) -> str:
@@ -427,6 +573,11 @@ def journal_text(lowering, *, limit: int = MAX_LISTED) -> str:
     errors = [str(item) for item in data.get("errors") or () if str(item or "")]
     if errors:
         parts.append("doute: %s" % "; ".join(errors[:4]))
+    flags = [str(name) for name in data.get("lowered_flags") or () if name]
+    if flags:
+        parts.append("%s: drapeau(x) abaissé(s) %s"
+                     % (mechanics.PATH, ", ".join("%s true→false" % name
+                                                  for name in flags)))
     items = list(data.get("lowered") or ())
     if items:
         names = []

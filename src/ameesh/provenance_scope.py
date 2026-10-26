@@ -42,8 +42,13 @@ def production(cfg, item, repo):
     return {"head": sha, "ref": ref, "reason": "published-production"}
 
 
-def exclude(repo, commits, scopes, trace=None):
-    """Exclude only proven ancestry; record each removed input commit."""
+def exclude(repo, commits, scopes, trace=None, **context):
+    """Exclude only proven ancestry; record each removed input commit.
+
+    `context` qualifies the trace rows (#3544: `carried_from`, the prior
+    freeze whose range was carried). A commit already traced is not traced
+    twice: the current range is read first and keeps its own row.
+    """
     remaining = list(commits or ())
     for scope in scopes:
         scope = scope if isinstance(scope, dict) else {
@@ -51,7 +56,9 @@ def exclude(repo, commits, scopes, trace=None):
         after = review_authors._not_in_target(repo, remaining, scope["head"])
         kept = set(after)
         if trace is not None:
-            trace.extend(dict(scope, commit=sha) for sha in remaining if sha not in kept)
+            seen = {row["commit"] for row in trace}
+            trace.extend(dict(scope, commit=sha, **context) for sha in remaining
+                         if sha not in kept and sha not in seen)
         remaining = after
     return remaining
 
@@ -63,6 +70,9 @@ def manifest(exclusions):
     lines = ["## Provenance exclusions", "", "| Commit | Reason | Published ref / admitted head |",
              "| --- | --- | --- |"]
     for row in exclusions:
+        reason = row["reason"]
+        if row.get("carried_from"):
+            reason += " (carried from freeze %s)" % row["carried_from"]
         lines.append("| %s | %s | %s @ %s |" % (
-            row["commit"], row["reason"], row.get("ref", "member"), row["head"]))
+            row["commit"], reason, row.get("ref", "member"), row["head"]))
     return "\n".join(lines) + "\n"

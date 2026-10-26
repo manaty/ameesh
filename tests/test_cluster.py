@@ -109,7 +109,7 @@ FERMEES = {
     "integration_train_fires": {"id", "target_key", "plan_id", "document", "state",
                                 "changed_by", "owner", "epoch", "created_at", "updated_at"},
     "integration_train_queue_receipts": {"id", "work_item_id", "generation", "frozen_id",
-                                         "kind", "created_at"},
+                                         "kind", "created_at", "target"},
     # #1465 (0445), required by #1467: exact provenance receipts also keep
     # their existing closed rights; this does not qualify their producers.
     "provenance_receipts": {"subject", "sha", "actor", "session", "turn", "harness",

@@ -32,6 +32,10 @@ CHECKS = (
     ("garde mécanique #2449", ["scripts/garde-mecanique.py", "--root", "."]),
     # une erreur de syntaxe ne se voit sinon qu'à l'import, dans la part qui l'importe
     ("compilation", ["-m", "compileall", "-q", "-j", "0", "src", "scripts", "tests"]),
+    # #3606 : une source du contrat de train changée sans ré-épinglage ne se
+    # voyait qu'en CI de paquet (#3581, 4 h plus tard)
+    ("contrat de train #3606", ["-m", "unittest", "-q",
+                                "tests.test_3606_train_pins.TrainPinsTest"]),
     # #1632/#1944 : aucune classe de test concrète d'un autre module liée au module
     ("attribution #1632", ["-m", "unittest", "-q",
                            "tests.test_l161e_map.AttributionContractTest",

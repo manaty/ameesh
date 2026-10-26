@@ -16,6 +16,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import types
 import unittest
 from unittest import mock
 import uuid
@@ -438,7 +439,73 @@ def patch_families(testcase, families=("claude", "codex", "deepseek")):
     return patcher
 
 
-class PgTestCase(unittest.TestCase):
+#: #3601 : globaux sensibles du banc, capturés au chargement. Un test peut les
+#: remplacer (mock.patch, redirect_stdout…) à condition de les restaurer avant
+#: la fin de sa classe ; le `tearDownClass` commun le vérifie et nomme la
+#: classe et le global fautifs. #3600 : des patchs entrés depuis un thread et
+#: défaits dans le désordre laissaient `ameesh.db.connect` remplacé ; l'erreur
+#: n'apparaissait que 35 classes plus loin, en `setUpClass`.
+SENSITIVE_GLOBALS = (
+    ("ameesh.db.connect", db_mod, "connect", db_mod.connect),
+    ("sys.stdout", sys, "stdout", sys.stdout),
+    ("sys.stderr", sys, "stderr", sys.stderr),
+)
+
+
+def _describe_global(value) -> str:
+    """Forme courte d'un global, pour le message d'échec."""
+    if isinstance(value, types.FunctionType):
+        return "fonction %s" % value.__qualname__
+    return type(value).__name__
+
+
+def verify_sensitive_globals(cls) -> None:
+    """#3601 : échoue dans `cls` si un global sensible n'est pas restauré.
+
+    Le message nomme la classe et chaque global fautif. Les globaux sont
+    restaurés avant l'échec : seule la classe qui a fui paie, les suivantes
+    restent saines (#3600).
+    """
+    fuites = []
+    for nom, module, attribut, attendu in SENSITIVE_GLOBALS:
+        actuel = getattr(module, attribut)
+        if actuel is attendu:
+            continue
+        setattr(module, attribut, attendu)
+        fuites.append((nom, attendu, actuel))
+    if not fuites:
+        return
+    details = ", ".join(
+        "%s (trouvé %s, attendu %s)" % (nom, _describe_global(actuel),
+                                        _describe_global(attendu))
+        for nom, attendu, actuel in fuites)
+    raise AssertionError(
+        "#3601 : %s.%s a laissé non restauré(s) : %s. Restauré(s) pour la "
+        "classe suivante ; un patch a probablement été défait dans le désordre "
+        "(entré depuis un thread), ou n'a pas été arrêté."
+        % (cls.__module__, cls.__qualname__, details))
+
+
+class SensitiveGlobalsMixin:
+    """#3601 : vérifie à la fin de la classe que les globaux sensibles sont
+    restaurés (`ameesh.db.connect`, `sys.stdout`, `sys.stderr`).
+
+    Un test qui les remplace sans les restaurer fait échouer la classe
+    fautive, en nommant le global ; ils sont restaurés avant l'échec pour que
+    la classe suivante reste saine. Les classes de base voisines peuvent
+    l'hériter ; une sous-classe qui redéfinit `tearDownClass` doit appeler
+    `super().tearDownClass()`.
+    """
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        try:
+            super().tearDownClass()
+        finally:
+            verify_sensitive_globals(cls)
+
+
+class PgTestCase(SensitiveGlobalsMixin, unittest.TestCase):
     """Base : un schéma migré, un bac à sable disque, des utilitaires CLI."""
 
     @classmethod
@@ -481,12 +548,16 @@ class PgTestCase(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls) -> None:
-        noter_tables(cls)
         try:
-            cls.db.execute('DROP SCHEMA IF EXISTS "%s" CASCADE' % cls.schema)
-            cls.db.close()
+            noter_tables(cls)
+            try:
+                cls.db.execute('DROP SCHEMA IF EXISTS "%s" CASCADE' % cls.schema)
+                cls.db.close()
+            finally:
+                shutil.rmtree(cls.tmp, ignore_errors=True)
         finally:
-            shutil.rmtree(cls.tmp, ignore_errors=True)
+            # #3601 : en dernier, même si le ménage de la base a échoué.
+            super().tearDownClass()
 
     # -- utilitaires -------------------------------------------------------
     def setUp(self) -> None:

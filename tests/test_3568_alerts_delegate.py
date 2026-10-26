@@ -25,13 +25,13 @@ blocked past the local deadline.
 """
 from __future__ import annotations
 
-import contextlib
 import dataclasses
 import fcntl
 import io
 import json
 import os
 import shutil
+import sys
 import tempfile
 import threading
 import time
@@ -70,6 +70,28 @@ class _Conn:
             self.db.close()
 
 
+class _PerThread(io.TextIOBase):
+    """`sys.stdout`/`sys.stderr` of the gate witnesses: one buffer per thread.
+
+    The thread that set a buffer in `calls` writes to it, any other thread to
+    the stream it replaces.
+    """
+
+    def __init__(self, fallback, calls: threading.local, name: str):
+        self.fallback = fallback
+        self.calls = calls
+        self.name = name
+
+    def _target(self):
+        return getattr(self.calls, self.name, None) or self.fallback
+
+    def write(self, text):
+        return self._target().write(text)
+
+    def flush(self):
+        self._target().flush()
+
+
 class _AlertsCase(PgTestCase):
     """Two candidate hosts (`banc`, `atelier`) and one elected role."""
 
@@ -90,6 +112,12 @@ class _AlertsCase(PgTestCase):
         env = mock.patch.object(role_timers, "unit_env", return_value=dict(NO_ENV))
         env.start()
         self.addCleanup(env.stop)
+        # #3575: the published route also requires the host's alerts timer;
+        # these witnesses are about the route, so the unit is presumed there
+        # (the timer's own witnesses live in tests/test_3575_alerts_basket.py).
+        timer = mock.patch.object(role_timers, "alerts_timer_gap", return_value="")
+        timer.start()
+        self.addCleanup(timer.stop)
 
     def role(self, *, releve="election", hosts=("banc", "atelier"),
              responsible="human:owner"):
@@ -203,27 +231,45 @@ class AlertsGateTest(_AlertsCase):
         return Namespace(role=role, pass_name=pass_name, min_left=min_left,
                          dry_run=False, json=False, command=list(command))
 
-    def run_cli(self, cfg, args):
-        out = io.StringIO()
-        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
-            with mock.patch.object(role_run.db_mod, "connect",
-                                   return_value=_Conn(self.db)):
-                code = role_run.run(cfg, args)
-        return code, out.getvalue()
-
-    def run_cli_isolated(self, cfg, args):
-        """One real connection per call, as two timer processes would have."""
+    def setUp(self) -> None:
+        super().setUp()
+        # One patch per process global for the whole test, entered and left on
+        # the main thread. Entered by each call, they were undone out of order
+        # when a witness thread's call ended after the main thread's, and the
+        # next classes of the shard kept a `_Conn` for `ameesh.db.connect`
+        # (main 636cc71c, psql 5/16: no attribute 'transaction').
+        self.calls = threading.local()
         original = role_run.db_mod.connect
 
         def connect(cfg_):
+            if getattr(self.calls, "shared", False):
+                return _Conn(self.db)
             return _Conn(original(cfg_), own=True)
 
-        out = io.StringIO()
-        with contextlib.redirect_stdout(out), \
-                contextlib.redirect_stderr(io.StringIO()), \
-                mock.patch.object(role_run.db_mod, "connect", side_effect=connect):
+        for patcher in (
+                mock.patch.object(role_run.db_mod, "connect", side_effect=connect),
+                mock.patch.object(sys, "stdout", _PerThread(sys.stdout, self.calls, "out")),
+                mock.patch.object(sys, "stderr", _PerThread(sys.stderr, self.calls, "err"))):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def _run_cli(self, cfg, args, *, shared: bool):
+        self.calls.shared = shared
+        self.calls.out = io.StringIO()
+        self.calls.err = io.StringIO()
+        try:
             code = role_run.run(cfg, args)
-        return code, out.getvalue()
+            return code, self.calls.out.getvalue()
+        finally:
+            self.calls.shared = False
+            self.calls.out = self.calls.err = None
+
+    def run_cli(self, cfg, args):
+        return self._run_cli(cfg, args, shared=True)
+
+    def run_cli_isolated(self, cfg, args):
+        """One real connection per call, as two timer processes would have."""
+        return self._run_cli(cfg, args, shared=False)
 
     def marker_command(self, marker: str) -> list[str]:
         return ["python3", "-c", "open(%r, 'w').write('x')" % marker]

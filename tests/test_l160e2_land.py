@@ -383,6 +383,38 @@ def _steal_after_gates(test, key="p:main"):
     return mock.patch.object(land, "gates", side_effect=gates)
 
 
+class QueueRemovalBeforeLandingTest(_Land):
+    """#3550 : une sortie de file entre la photographie du passage et
+    l'atterrissage ne laisse pas partir la fusion déjà programmée."""
+
+    LAND = "pr"
+
+    def test_a_queue_removal_before_the_landing_stops_the_pr_merge(self):
+        """#3550 : la photographie de file du passage ne suffit pas. Une sortie
+        de file entre la lecture de `run_pass` et `land_head` annule
+        l'atterrissage (ici la ligne est déjà `landing`, CI verte prête)."""
+        gh = FakeGh()
+        self.queued(4)
+        gh.head = self.tip(4)
+        first = self.land(4, gh=gh)
+        self.assertEqual(first["result"], "landing", first)
+        gh.head, gh.ci = first["sha"], "green"
+        real = land.land_head
+
+        def remove_then_land(cfg, db, project, row, **kw):
+            self.fake.queue_remove(4, note="removed before landing", actor="r2")
+            return real(cfg, db, project, row, **kw)
+
+        report = {"queue": {"targets": {"main": [{"lot": 4, "state": "landing"}]}}}
+        with mock.patch.object(land, "land_head", side_effect=remove_then_land):
+            out = land.run_pass(self.cfg, None, self.project, report, owner="runner-1",
+                                gh=gh)
+        self.assertEqual([(o["lot"], o["result"]) for o in out], [(4, "taken-out")], out)
+        self.assertFalse(any(c[:2] == ["pr", "merge"] for c in gh.calls),
+                         "a removed queue entry must not reach the PR merge")
+        self.assertNotIn(4, self.fake.queue_rows)
+
+
 class Review194Test(_Land):
     """#194 r3: the two P1 and the two P2."""
 

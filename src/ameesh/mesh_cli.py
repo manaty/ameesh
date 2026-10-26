@@ -2324,14 +2324,34 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                 # #3183 : le plancher d'avis du pilote, posé avant la désignation
                 # (il vaut dans tout état ouvert, la désignation exige qa).
                 from . import review_floor
-                floor = review_floor.set_floor(cfg, db, args.id, args.floor,
-                                               reason=args.reason, actor=args.actor)
+                # #3557 : avec un AGENT, la désignation manuelle est le geste
+                # du pilote ; sans lui, le plancher complète la désignation du
+                # dernier gel par la sélection déterministe.
+                floor = review_floor.set_floor(
+                    cfg, db, args.id, args.floor, reason=args.reason,
+                    actor=args.actor, complete=not bool(args.agent))
                 if floor["changed"]:
                     print("lot #%d: review floor %d (was %d, by %s)" % (
                         floor["lot"], floor["floor"], floor["previous"], floor["actor"]))
                 else:
                     print("lot #%d: review floor already %d: nothing written" % (
                         floor["lot"], floor["floor"]))
+                completion = floor.get("designation")
+                if completion:
+                    state = completion.get("state")
+                    if state == "designated":
+                        names = ", ".join(
+                            "%s (%s)" % (r.get("name"), r.get("family"))
+                            for r in completion.get("reviewers") or ())
+                        print("designation: %s%s" % (
+                            "completed — " if completion.get("completed") else "",
+                            names))
+                    elif state in ("unavailable", "waiting", "stale", "unfrozen",
+                                   "none", "manual"):
+                        print("designation: %s — %s" % (
+                            state, completion.get("why") or ""))
+                    else:
+                        print("designation: %s" % state)
                 if not args.agent:
                     return 0
             if not args.agent and not (args.remove or args.no_verdict):
@@ -2580,6 +2600,13 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                         print("designation: kept from carried verdicts (%s)"
                               % ", ".join(str(r.get("name"))
                                           for r in designation.get("reviewers") or ()))
+                    elif designation.get("state") == "waiting":
+                        # #3596 : l'attente peut déjà porter des sièges.
+                        names = ", ".join("%s (%s)" % (r.get("name"), r.get("family"))
+                                          for r in designation.get("reviewers") or ())
+                        print("designation: waiting%s — %s" % (
+                            (" (already designated: %s)" % names) if names else "",
+                            designation.get("why") or ""))
                     else:
                         print("designation: %s — %s" % (
                             designation.get("state"), designation.get("why") or ""))
@@ -2595,6 +2622,12 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                                       for r in applied.get("reviewers") or ())
                     print("designated: %s" % names)
                 elif state == "waiting":
+                    # #3596 : une désignation partielle reste `waiting` mais a
+                    # déjà pourvu des sièges ; les montrer avant l'attente.
+                    names = ", ".join("%s (%s)" % (r.get("name"), r.get("family"))
+                                      for r in applied.get("reviewers") or ())
+                    if names:
+                        print("designated: %s (partial; review pending)" % names)
                     print("waiting    : %s" % (applied.get("why") or ""))
                 elif state == "manual":
                     print("manual     : %s" % (applied.get("why") or ""))
@@ -2682,6 +2715,11 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                 print("reviewers: kept from carried verdicts (%s)" % ", ".join(
                     str(r.get("name")) for r in outcome.get("reviewers") or ()))
             elif state == "waiting":
+                # #3596 : une attente peut déjà avoir pourvu des sièges.
+                names = ", ".join("%s (%s)" % (r.get("name"), r.get("family"))
+                                  for r in outcome.get("reviewers") or ())
+                if names:
+                    print("reviewers: %s (partial)" % names)
                 print("review pending: %s" % (outcome.get("why") or ""))
             elif state == "manual":
                 print("reviewers: manual designation kept (%s)"
@@ -3670,8 +3708,11 @@ def build_parser() -> argparse.ArgumentParser:
                              metavar="N",
                              help="#3183: pilot's review floor: the gate, the freeze "
                                   "designation and paquet-candidats require max(scale, N) "
-                                  "reviews of distinct families; journaled, kept across "
-                                  "refreezes; 0 withdraws it (a human's floor: by a human)")
+                                  "reviews of distinct families; raised after a freeze, it "
+                                  "completes that freeze's designation (#3557; with an "
+                                  "AGENT, the floor alone — --apply completes); journaled, "
+                                  "kept across refreezes; 0 withdraws it (a human's floor: "
+                                  "by a human)")
     pw_reviewer.add_argument("--reason", default="",
                              help="#3183: why the floor (journaled with it)")
     pw_reviewer.set_defaults(func=cmd_work)

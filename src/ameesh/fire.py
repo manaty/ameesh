@@ -1968,6 +1968,76 @@ def _not_ready(db, row: dict, status, out: dict, why: str, *, gh, slug: str,
     return out
 
 
+def _carrier_gap(db, row: dict, fire: dict, status, *, slug: str, target: str, gh,
+                 repo: str | None) -> str:
+    """#3611 : pourquoi le feu seul ne fusionnera pas ce porteur, ou "".
+
+    h-23 v4 (#3599, 25/10) : le porteur poussé, son workflow `paquet.yml` lance
+    la suite complète sur push ; le feu répond « the CI on the frozen commit
+    is still running » alors que rien ne pouvait s'armer — ni PR, ni
+    étiquette `ci-full`, et le check requis de `main` (`tests`) n'existe que
+    sur le run `pull_request` de `ci-full`. La file attend ce run push, puis
+    `land_guard` éjecte faute du check requis : fusion admin forcée.
+
+    Le passage **dit** la cause et nomme le geste ; il ne le fait pas : la
+    publication (PR ouverte, puis `ameesh ci run <porteur> --full`) porte la prévalidation du
+    paquet, l'épinglage de la composition et l'armement (#2813), et lance une
+    suite complète — un geste de pilote, pas un effet de bord d'un passage
+    périodique.
+
+    Rien n'est dit — la voie reste celle d'avant — quand la branche n'est pas
+    un porteur, quand la fusion automatique est déjà armée sur la tête, quand
+    la forge n'impose aucun check (le feu est alors la voie du porteur, #2813)
+    ou que cela ne peut se lire, et quand la tête porte déjà tous les checks
+    requis (la file sait alors l'atterrir). Un diagnostic illisible ne change
+    jamais la voie."""
+    from . import packet_automerge
+    branch = str(row.get("branch") or "")
+    if not packet_automerge.carrier(branch):
+        return ""
+    lot = int(row["id"])
+    sha = merge_queue.pinned(repo, _norm(fire.get("sha"))) if repo else None
+    sha = sha or _norm(fire.get("sha"))
+    try:
+        published = packet_automerge.publication(db, lot, sha)
+    except Exception:  # noqa: BLE001 - journal illisible : la voie ne change pas
+        return ""
+    if published["armed"]:
+        return ""
+    try:
+        names = [name for name, _app in _required_pairs(
+            required_checks(slug, target, None, gh=gh))]
+    except Exception:  # noqa: BLE001 - 403 (aucune garde de la forge) ou illisible
+        return ""
+    if not names:
+        return ""
+    try:
+        present = {r["name"] for r in _head_check_runs(slug, sha, gh=gh)} \
+            | {s["context"] for s in _head_statuses(slug, sha, gh=gh)}
+        missing = [name for name in names if name not in present]
+    except Exception:  # noqa: BLE001 - tête illisible : seules les causes locales
+        missing = None
+    causes = []
+    if status is None:
+        causes.append("no PR for %s" % branch)
+    if not published["requested"]:
+        causes.append("no ci-full-%s label requested" % sha[:12])
+    if missing:
+        causes.append("the required check(s) %s of %s are absent from the head %s (a push "
+                      "run of the packet workflow does not produce them)"
+                      % (", ".join(missing), target, sha[:12]))
+    if not causes or missing == []:
+        return ""
+    gesture = "`ameesh ci run %d --full --reason \"packet\"`" % lot
+    if status is None:
+        # `ci run` exige la PR ouverte (#1343) ; son ouverture ne lance rien
+        gesture = "`gh pr create --repo %s --base %s --head %s`, then %s" % (
+            slug, target, branch, gesture)
+    return ("packet carrier: the fire alone never merges it — %s; the packet auto-merge is "
+            "not armed on %s. Publish it: %s (label ci-full-<head>, arms the auto-merge, "
+            "#2813)" % ("; ".join(causes), sha[:12], gesture))
+
+
 def _queue_landing(cfg, db, row: dict, fire: dict, freeze: dict, status: dict, *,
                    repo: str | None, project, target: str, path: str) -> bool:
     """#3080: only the queue's clean two-parent landing preserves the fire.
@@ -2124,6 +2194,15 @@ def _act(cfg, db, row: dict, marks: list, *, gh, dry_run: bool, repo: str | None
         out.update(result="pr-closed", detail="PR #%s is closed without merge: reopen it"
                    % status.get("number"))
         return out
+
+    # #3611 : un porteur `integration/**` sur une cible dont la forge impose
+    # des checks ne fusionne que par sa publication (`ameesh ci run --full`,
+    # #2813) ; la file attendrait une CI qui ne produit pas ces checks.
+    gap = _carrier_gap(db, row, fire, status, slug=slug, target=target, gh=gh,
+                       repo=work_repo)
+    if gap:
+        return _not_ready(db, row, status, out, gap, gh=gh, slug=slug, dry_run=dry_run,
+                          handle=handle)
 
     # 5. la voie du lot (#2256) : décidée par la déclaration du projet ou
     #    l'état partagé de sa file, jamais par la config de cet hôte. Sans
@@ -2381,7 +2460,12 @@ def _queue(db, row: dict, marks: list, fire: dict, *, project, repo: str | None,
     après ce feu est définitive pour lui : le repli ne ré-entre pas le lot
     (`taken-out`). Sans cela, chaque passage défaisait la sortie, et le lot
     atterrissait dès que la cible se libérait. Un nouveau feu ou un
-    `ameesh work queue add` explicite le remet en file."""
+    `ameesh work queue add` explicite le remet en file.
+
+    #3550 : cette sortie ne vaut que pour l'entrée qu'elle a retirée — sa
+    cible et son gel. Une sortie d'une autre cible, ou d'un gel plus ancien,
+    ne retient pas le repli du feu courant (lecture `queue_withdrawn_since`
+    portée par `target` et `frozen_id`)."""
     lot = int(row["id"])
     if not repo:
         out.update(result="no-repository", detail=(
@@ -2401,8 +2485,11 @@ def _queue(db, row: dict, marks: list, fire: dict, *, project, repo: str | None,
                    % (entry.get("target"), entry.get("reason") or "?"))
         return out
     granted = float(fire.get("at_ts") or 0.0)
+    freeze = freeze_of(marks)
+    frozen_id = freeze.get("id") if freeze else None
     try:
-        removed = storage.of(db).work.queue_withdrawn_since(lot, granted)
+        removed = storage.of(db).work.queue_withdrawn_since(
+            lot, granted, target=target or None, frozen_id=frozen_id)
     except Exception as exc:  # noqa: BLE001 - reçus illisibles : on n'entre pas
         out.update(result="not-ready", detail=(
             "cannot read the queue take-outs of lot #%d (%s: %s): not queued"
@@ -2423,7 +2510,17 @@ def _queue(db, row: dict, marks: list, fire: dict, *, project, repo: str | None,
                                     project=project, clone=clone, cfg=cfg,
                                     withdrawn_after=granted)
     except merge_queue.QueueWithdrawn:
-        removed = storage.of(db).work.queue_withdrawn_since(lot, granted)
+        # #3550: a failed re-read here is a transient refusal (not-ready), not
+        # an error that escapes the fire pass. The read is scoped like the
+        # first one: the take-out must name this target and this freeze.
+        try:
+            removed = storage.of(db).work.queue_withdrawn_since(
+                lot, granted, target=target or None, frozen_id=frozen_id)
+        except Exception as exc:  # noqa: BLE001 - reçus illisibles : on n'entre pas
+            out.update(result="not-ready", detail=(
+                "cannot read the queue take-outs of lot #%d (%s: %s): not queued"
+                % (lot, type(exc).__name__, str(exc)[:120])))
+            return out
         return _taken_out(out, lot, removed or granted, granted)
     except merge_queue.QueueError as exc:
         out.update(result="not-ready", detail=str(exc))
