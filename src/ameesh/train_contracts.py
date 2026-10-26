@@ -46,7 +46,9 @@ def ameesh() -> tuple[Workflow, ...]:
     absent and supply no packet CI: the train refuses it.
     The full matrix is 8 psycopg parts, 16 psql parts, the short macOS
     platform job and the aggregate ``tests`` check; doc-only and version lanes
-    are conditional outside this contract.
+    are conditional outside this contract. #3749: the 16 psql parts run the
+    pilot list and the contract, the whole suite under psql is nightly
+    (``psql-nocturne.yml``, outside the packet proof).
 
     #3198: the packet run no longer carries the full macOS suite (8 psycopg
     parts under macOS, hours long); it lives in ``.github/workflows/macos.yml``
@@ -74,11 +76,11 @@ def ameesh() -> tuple[Workflow, ...]:
         event="push",
         called=".github/workflows/tests.yml",
         sources=((".github/workflows/paquet.yml", "0d4e4c9cae703575b33aa393d6a1c95a81e5c896"),
-                 (".github/workflows/tests.yml", "c220b4dfccc7f3ebec550d92cc8f951b1703aa3f"),
-                 ("scripts/test-plan.py", "e7d7836e0b3164aaa4ca492a1c2ae1e6045d1ef4"),
+                 (".github/workflows/tests.yml", "6cb779b5821b78619fbf2a976d6c5bc57057f641"),
+                 ("scripts/test-plan.py", "8fd4011116346e91f57be7e0feb65f618a060f0d"),
                  ("scripts/test-parts.py", "8536c6ee43aa2b72a324d2de9c697ec98614c30a"),
                  ("scripts/ci-flow.py", "b633b95258f03db4d0760d3f47855a0e832ac8a4"),
-                 ("scripts/ci-agregat.py", "7de7ca4b3463f27f1fa90d32e0020fbbce25b17b"),
+                 ("scripts/ci-agregat.py", "d10a3b6d11f9abf4b9a4e16de68b1ba1a6ccc6f1"),
                  ("scripts/map.py", "7a7516683643ff7cd66abf3d50147b25446a03bb")),
         pins_at="src/ameesh/train_contracts.py",
     ),)
