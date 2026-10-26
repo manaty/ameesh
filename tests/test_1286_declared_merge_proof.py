@@ -115,6 +115,38 @@ class DeclaredMergeProofTest(unittest.TestCase):
         self.assertFalse(plan_git.probe(self.repo, absent, "develop")["merged"])
         self.assertFalse(plan_git._content_ancestor(self.repo, absent, "develop"))
 
+    def test_published_merge_revert_is_seen_with_lagging_local_target(self):
+        self.git("branch", "develop")
+        self.git("checkout", "-qb", "lot/637-x")
+        Path(self.repo, "delivery.txt").write_text("delivery\n")
+        self.git("add", "delivery.txt")
+        frozen = self.commit("Deliver\n\nameesh-work: 637")
+        self.git("checkout", "-q", "main")
+        self.git("merge", "--no-ff", "lot/637-x", "-qm", "Merge delivery")
+        merged = self.git("rev-parse", "HEAD")
+        self.git("revert", "-m", "1", "--no-edit", merged)
+        self.git("update-ref", "refs/remotes/origin/develop", "HEAD")
+        for target in ("develop", "origin/develop"):
+            with self.subTest(target=target):
+                found = plan_git.probe(self.repo, frozen, target)
+                self.assertFalse(found["merged"], found)
+                self.assertEqual(found["how"], "reverted")
+                found = plan_git.branch_probe(self.repo, "lot/637-x", target,
+                                              seen_head=frozen)
+                self.assertFalse(found["merged"], found)
+        st = SimpleNamespace(
+            work=SimpleNamespace(items=lambda **kw: [self.item],
+                                 packet_members=lambda **kw: []),
+            progress=SimpleNamespace(lot_milestones=lambda ids: [
+                {"id": 1, "work_item_id": 637, "kind": "frozen", "sha": frozen,
+                 "at_ts": None}]))
+        with mock.patch.object(plan_git.storage, "of", return_value=st), \
+                mock.patch.object(work, "close_merged") as close:
+            result = plan_git.sync_merges(object(), self.repo, target="develop")
+        self.assertEqual(result["results"][0]["result"], "open")
+        self.assertIn("reverts its content", result["results"][0]["detail"])
+        close.assert_not_called()
+
     def test_explicit_local_target_is_not_replaced_by_remote(self):
         self.git("branch", "develop")
         sha = self.commit("Deliver\n\nameesh-work: 637")

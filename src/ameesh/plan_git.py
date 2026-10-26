@@ -564,7 +564,8 @@ def probe(repo: str, sha: str, target: str, *, lot: int | None = None,
     #1772 : un gel absent localement est rapatrié par un fetch explicite
     borné quand le clone est partiel ; sinon l'absence est conclue telle
     quelle."""
-    head = _target_tip(repo, target)
+    target = _target_ref(repo, target)
+    head = _commit(repo, target)
     if head is None:
         raise MergeProbeError("target %r not found in %s" % (target, repo))
     if not _SHA_RE.match(sha or ""):
@@ -1866,11 +1867,17 @@ def _tip(repo: str, branch: str) -> str | None:
     return None
 
 
+def _target_ref(repo: str, target: str) -> str:
+    """#3747 : résoudre une cible nue pour toutes les lectures de sa preuve."""
+    if not target.startswith(("origin/", "refs/")):
+        published = "refs/remotes/origin/" + target
+        if _commit(repo, published):
+            return published
+    return target
+
+
 def _target_tip(repo: str, target: str) -> str | None:
-    """#3747 : cible nue publiée d'abord ; une ref qualifiée reste explicite."""
-    if target.startswith(("origin/", "refs/")):
-        return _commit(repo, target)
-    return _published_tip(repo, target) or _commit(repo, target)
+    return _commit(repo, _target_ref(repo, target))
 
 
 def _published_tip(repo: str, branch: str) -> str | None:
@@ -2017,7 +2024,8 @@ def branch_probe(repo: str, branch: str, target: str, *, seen_head: str | None =
     été enregistré. Une tête qui était déjà dans la cible à cet instant n'a
     aucun commit propre : le reflog des refs de la cible le dit, et la preuve
     « vu-ancestor » est refusée (`_was_ancestor_at_seen`)."""
-    head = _target_tip(repo, target)
+    target = _target_ref(repo, target)
+    head = _commit(repo, target)
     if head is None:
         raise MergeProbeError("target %r not found in %s" % (target, repo))
     tip = _tip(repo, branch)
@@ -2699,7 +2707,8 @@ def _content_ancestor(repo: str, sha: str, target: str, *,
     frozen = full_commit_id(sha)
     if not frozen:
         return False
-    head = _target_tip(repo, target)
+    target = _target_ref(repo, target)
+    head = _commit(repo, target)
     if head is None:
         return False
     if not _is_ancestor(repo, frozen, head):
@@ -2812,6 +2821,7 @@ def _sweep_target(repo: str, lot: int, row: dict, branch: str | None, target: st
     restée hors de la cible (`_hash_ref_doubt`) ne ferme pas : `unproven`.
     Rend `{found, branch, implicit, row}` ; lève
     MergeProbeError/GitError comme l'examen d'origine."""
+    target = _target_ref(repo, target)
     freeze_sha = ((freeze or {}).get("sha") or "").strip() or None
     found = None
     implicit = False
