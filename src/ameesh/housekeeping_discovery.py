@@ -128,7 +128,10 @@ def discover(db, host: str, agents: dict, roots, *, dry_run: bool,
     remaining = [item for item in sorted(candidates.items())
                  if item[0] not in protected and item[0] not in tracked]
     for path, (row, repo, witness) in remaining[:DISCOVERY_LIMIT]:
-        if time.monotonic() >= deadline:
+        # #3802 B2 : le budget du passage peut être épuisé depuis
+        # l'inventaire ; `_git` rendrait alors None et le doute se lirait à
+        # tort « no longer matches its repository » pour chaque candidat.
+        if exhausted():
             break
         if _marker(path) != "linked" or not hk.same_repository(path, repo,
                                                                 budget=budget):

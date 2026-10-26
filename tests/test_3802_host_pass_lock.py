@@ -19,7 +19,7 @@ import types
 import unittest
 from unittest import mock
 
-from ameesh import exploitation, housekeeping as hk, mesh_cli, storage
+from ameesh import (exploitation, housekeeping as hk, housekeeping_discovery as discovery, mesh_cli, storage)
 from ameesh.housekeeping import HOST_PASS_ALERT_AFTER_S, PassBudget, _PassExpired
 from ameesh.platform import session_lock
 
@@ -153,6 +153,77 @@ class HostPassLockTest(unittest.TestCase):
                          "running on this host\n")
 
 
+    def test_the_worktrees_cursor_survives_in_the_lock_state(self):
+        seen = []
+
+        def first(*args, **kwargs):
+            seen.append(kwargs)
+            kwargs["on_cursor"]([42.0, 7])
+            return {}
+
+        with mock.patch.object(hk, "_run_pass", side_effect=first):
+            self.passage()
+        state = session_lock.read_state(self.dir, "host-pass")
+        key = hk.mesh_key(self.cfg)
+        self.assertEqual(state[hk.WORKTREES_CURSOR_KEY][key], [42.0, 7])
+
+        def second(*args, **kwargs):
+            seen.append(kwargs)
+            return {}
+
+        with mock.patch.object(hk, "_run_pass", side_effect=second):
+            self.passage()
+        self.assertEqual(seen[1]["cursor"], [42.0, 7])
+
+    def test_a_holder_without_record_names_its_pid_and_claims_no_age(self):
+        """#3802 N1 : pas d'enregistrement = pas d'âge, donc pas de fausse
+        alerte sur un runner simplement vieux."""
+        held = session_lock.try_lock(self.dir, "host-pass")
+        self.addCleanup(held.close)
+        report = self.passage()
+        self.assertEqual(report["holder"]["pid"], os.getpid())
+        self.assertEqual(report["holder"]["source"], "proc-locks")
+        self.assertNotIn("held_s", report)
+        self.assertNotIn("blocked", report)
+
+    @unittest.skipIf(os.name == "nt", "POSIX flock")
+    def test_an_exec_child_with_close_fds_false_does_not_keep_the_lock(self):
+        """#3802 N2 : le fd est O_CLOEXEC (PEP 446) ; un enfant EXEC, même
+        lancé avec close_fds=False, ne garde pas la description après la
+        fermeture du parent."""
+        script = (
+            "import fcntl, sys\n"
+            "sys.stdin.readline()\n"
+            "fh = open(sys.argv[1], 'a+b')\n"
+            "try:\n"
+            "    fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)\n"
+            "    print('free')\n"
+            "except OSError:\n"
+            "    print('held')\n")
+        fh = session_lock.try_lock(self.dir, "host-pass")
+        self.assertIsNotNone(fh)
+        proc = subprocess.Popen([sys.executable, "-c", script, self.lock_path],
+                                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                text=True, close_fds=False)
+        fh.close()
+        try:
+            out, _err = proc.communicate("go\n", timeout=10)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+        self.assertIn("free", out)
+
+    def test_a_short_budget_does_not_start_a_destructive_git(self):
+        """#3802 N3 : tuer `git worktree remove` en plein milieu est pire que
+        d'attendre le passage suivant."""
+        budget = hk.PassBudget(5.0)
+        with mock.patch.object(hk, "_git") as git:
+            ok, why = hk.remove_worktree(self.dir, self.dir, budget=budget)
+        self.assertFalse(ok)
+        self.assertIn("budget", why)
+        git.assert_not_called()
+
+
 class HostPassBudgetTest(unittest.TestCase):
     """A blocked phase (a real sleeping subprocess) cannot keep the lock."""
 
@@ -202,6 +273,104 @@ class HostPassBudgetTest(unittest.TestCase):
         lock = session_lock.try_lock(self.dir, "host-pass")
         self.assertIsNotNone(lock)
         lock.close()
+
+
+class _FakeStore:
+    def __init__(self, rows):
+        self.rows = rows
+
+    def worktrees(self, host, statuses, limit=None):
+        return list(self.rows)
+
+
+class _AllowBudget:
+    """A budget that lets `allow` worktrees run, then says the reserve is
+    reached (without the overall budget being expired)."""
+
+    def __init__(self, allow):
+        self.allow = allow
+        self.checks = 0
+
+    def expired(self):
+        return False
+
+    def reserved(self, seconds):
+        self.checks += 1
+        return self.checks > self.allow
+
+
+class WorktreesCursorTest(unittest.TestCase):
+    """#3802 B1 : réserve pour les phases suivantes et curseur de reprise."""
+
+    def setUp(self):
+        self.rows = [{"id": i, "path": "/gone/%d" % i, "created_ts": float(i),
+                      "agent": "a", "lot": None, "repo": "", "status": "active"}
+                     for i in range(1, 6)]
+        store = _FakeStore(self.rows)
+        patcher = mock.patch.object(
+            hk.storage, "of",
+            return_value=types.SimpleNamespace(housekeeping=store))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _pass(self, budget, cursor=None):
+        seen = []
+        _entries, plan = hk._worktree_pass(
+            object(), "pc", dry_run=True, protected=set(), now=time.time(),
+            budget=budget, reserve_s=50.0, cursor=cursor, on_cursor=seen.append)
+        return plan, seen
+
+    def test_the_loop_stops_at_the_reserve_and_saves_a_cursor(self):
+        plan, seen = self._pass(_AllowBudget(2))
+        paths = [row["path"] for row in plan if row["action"] == "disparu"]
+        self.assertEqual(paths, [self.rows[0]["path"], self.rows[1]["path"]])
+        self.assertEqual(seen, [[2.0, 2]])
+        self.assertEqual(plan[-1]["detail"],
+                         "pass budget reached: remaining worktrees left for the "
+                         "next pass")
+
+    def test_the_next_pass_resumes_after_the_cursor(self):
+        plan, seen = self._pass(_AllowBudget(1), cursor=[2.0, 2])
+        paths = [row["path"] for row in plan if row["action"] == "disparu"]
+        self.assertEqual(paths, [self.rows[2]["path"]])   # row id 3, not id 1
+        self.assertEqual(seen, [[3.0, 3]])
+
+    def test_a_full_cycle_clears_the_cursor(self):
+        plan, seen = self._pass(_AllowBudget(5), cursor=[2.0, 2])
+        self.assertEqual(len([row for row in plan if row["action"] == "disparu"]),
+                         len(self.rows))
+        self.assertEqual(seen, [None])
+
+
+class DiscoveryBudgetTest(unittest.TestCase):
+    """#3802 B2 : budget épuisé, pas de faux « no longer matches »."""
+
+    def test_budget_exhausted_stops_the_remaining_loop(self):
+        class Budget:
+            def __init__(self):
+                self.calls = 0
+
+            def expired(self):
+                self.calls += 1
+                return self.calls > 1
+
+        store = mock.Mock()
+        store.housekeeping.worktrees.return_value = []
+        with mock.patch.object(discovery.storage, "of", return_value=store), \
+                mock.patch.object(discovery.hk, "_expand", side_effect=lambda p: p), \
+                mock.patch.object(discovery, "_marker", return_value="linked"), \
+                mock.patch.object(discovery.hk, "list_worktrees",
+                                  return_value=[{"path": "/main"},
+                                                {"path": "/linked", "bare": False}]), \
+                mock.patch.object(discovery.hk, "common_dir", return_value="/repo"), \
+                mock.patch.object(discovery.hk, "same_repository",
+                                  return_value=False) as same:
+            out = discovery.discover(object(), "pc", {"a1": "/cwd"}, ("/root",),
+                                     dry_run=True, budget=Budget())
+        same.assert_not_called()
+        self.assertFalse(any("no longer matches" in (row.get("detail") or "")
+                             for row in out["plan"]))
+        self.assertIn("bounded inventory incomplete", " ".join(out["skipped"]))
 
 
 class HostPassBlockedTest(PgTestCase):
@@ -319,6 +488,54 @@ class HostPassBlockedTest(PgTestCase):
         self.assertIsNotNone(lock)
         lock.close()
 
+    def test_the_tail_phases_run_when_the_worktrees_eat_the_budget(self):
+        """#3802 B1 : la réserve garde conteneurs, volumes, scopes, /tmp et
+        mesure vivants même quand la phase worktrees consomme tout le reste."""
+        now = [0.0]
+        budget = hk.PassBudget(hk.HOST_PASS_BUDGET_S, clock=lambda: now[0])
+        called = {}
+
+        def long_worktrees(db, host, **kwargs):
+            called["reserve"] = kwargs.get("reserve_s")
+            now[0] = hk.HOST_PASS_BUDGET_S - hk.HOST_PASS_RESERVE_S + 1
+            return [], []
+
+        def marker(name, value):
+            def run(*args, **kwargs):
+                called[name] = True
+                return value
+            return run
+
+        real_measure = hk.measure
+
+        def measured(cfg, policy, budget=None):
+            called["measure"] = True
+            return real_measure(cfg, policy, budget=budget)
+
+        conteneurs = {"entries": [], "plan": [], "ameesh": [], "others": [],
+                      "others_total": 0}
+        volumes = {"entries": [], "plan": [], "ours": [], "others": [],
+                   "others_total": 0}
+        policy = hk.Policy(worktrees=True, deps=False, artifacts=(),
+                           docker_volumes=False)
+        with mock.patch.object(hk, "_worktree_pass", side_effect=long_worktrees), \
+                mock.patch.object(hk, "reap_containers",
+                                  side_effect=marker("containers", conteneurs)), \
+                mock.patch.object(hk, "reap_volumes",
+                                  side_effect=marker("volumes", volumes)), \
+                mock.patch.object(hk, "reap_dsh_scopes",
+                                  side_effect=marker("scopes",
+                                                     {"entries": [], "plan": []})), \
+                mock.patch.object(hk, "orphan_pass",
+                                  side_effect=marker("orphans", ([], [], []))), \
+                mock.patch.object(hk, "measure", side_effect=measured):
+            report = hk._run_pass(self.cfgl, self.db, policy, host="pc",
+                                  actor="test", artifact_scan=False, budget=budget)
+        self.assertEqual(called.get("reserve"), hk.HOST_PASS_RESERVE_S)
+        for name in ("containers", "volumes", "scopes", "orphans", "measure"):
+            self.assertTrue(called.get(name), "%s did not run" % name)
+        self.assertNotEqual(report.get("status"), "timed_out")
+
     def test_hosts_shows_the_holder_of_the_held_lock(self):
         self._held()
         self._pass()
@@ -334,7 +551,9 @@ class HostPassBlockedTest(PgTestCase):
 
 @unittest.skipUnless(os.path.exists("/proc/locks"), "Linux /proc/locks")
 class HolderFallbackTest(unittest.TestCase):
-    def test_proc_locks_names_the_pid_when_the_record_is_missing(self):
+    def test_proc_locks_names_the_pid_but_claims_no_age_without_a_record(self):
+        """#3802 N1 : le démarrage du processus n'est pas la prise du verrou.
+        Sans enregistrement, le pid est dit, l'âge ne l'est pas."""
         temporary = tempfile.TemporaryDirectory(prefix="ameesh-3802-proc-")
         self.addCleanup(temporary.cleanup)
         directory = os.path.join(temporary.name, ".menage")
@@ -345,7 +564,7 @@ class HolderFallbackTest(unittest.TestCase):
         self.assertIsNotNone(holder)
         self.assertEqual(holder["pid"], os.getpid())
         self.assertEqual(holder["source"], "proc-locks")
-        self.assertIsNotNone(holder["since"])
+        self.assertIsNone(holder["since"])
 
 
 if __name__ == "__main__":

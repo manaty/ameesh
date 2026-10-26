@@ -190,6 +190,15 @@ HOST_PASS_ALERT_AFTER_S = HOST_PASS_BUDGET_S
 #: #3802 : un blocage constaté n'est re-journalisé qu'à ce rythme, pour que le
 #: journal dise l'épisode sans une ligne par passage sauté.
 HOST_PASS_REFRESH_S = 3600.0
+#: #3802 (B1) : part du budget du passage réservée aux phases qui suivent les
+#: worktrees (clones, artefacts, conteneurs, volumes, scopes, /tmp, mesure).
+#: La boucle des worktrees s'arrête quand le temps restant passe sous cette
+#: réserve ; sans elle, un hôte à 298 worktrees refaisait les mêmes premiers
+#: à chaque passage et les phases suivantes ne tournaient plus jamais.
+HOST_PASS_RESERVE_S = 300.0
+#: #3802 (B1) : clé réservée de l'état du verrou qui garde le curseur de
+#: reprise des worktrees (dernier `(created_ts, id)` examiné), par mesh.
+WORKTREES_CURSOR_KEY = "_worktrees_cursor"
 
 
 class _PassExpired(Exception):
@@ -234,6 +243,11 @@ class PassBudget:
     def expired(self) -> bool:
         return self.clock() >= self.deadline
 
+    def reserved(self, seconds: float) -> bool:
+        """True when no more than `seconds` remain: a phase that must leave
+        room for the following ones stops there (#3802 B1)."""
+        return self.remaining() <= max(0.0, float(seconds))
+
     def check(self, name: str) -> None:
         """Start phase `name`; raise when the budget is already spent, naming
         the phase it was spent in (the one that just ended)."""
@@ -263,12 +277,12 @@ class PassBudget:
                 "timed_out": self.timed_out, "phases": list(self.phases)}
 
 
-def _artifact_budget(budget: PassBudget | None):
+def _artifact_budget(budget: PassBudget | None, reserve_s: float = 0.0):
     """The `build_artifacts.Budget` of one phase: its own cap, never past
-    the pass's remaining time (#3802)."""
+    the pass's remaining time (#3802), and never into `reserve_s`."""
     seconds = build_artifacts.PASS_BUDGET_S
     if budget is not None:
-        seconds = min(seconds, budget.remaining())
+        seconds = min(seconds, max(0.0, budget.remaining() - reserve_s))
     return build_artifacts.Budget(seconds)
 
 
@@ -3085,7 +3099,13 @@ def current_branch(path: str, budget: PassBudget | None = None) -> tuple[bool, s
 
 def remove_worktree(path: str, repo: str,
                     budget: PassBudget | None = None) -> tuple[bool, str]:
-    """`git worktree remove` (jamais `--force`), lancé depuis le dépôt commun."""
+    """`git worktree remove` (jamais `--force`), lancé depuis le dépôt commun.
+
+    #3802 N3 : un budget plus court que `GIT_TIMEOUT` ne lance pas cette
+    commande destructive — la tuer en plein milieu laisserait un retrait
+    partiel. Elle attend le passage suivant, qui aura le temps."""
+    if budget is not None and budget.remaining() < GIT_TIMEOUT:
+        return False, "pass budget too short for git worktree remove; kept for the next pass"
     base = repo if repo and os.path.isdir(repo) else path
     proc = _git(["worktree", "remove", path], base, budget=budget)
     if proc is None:
@@ -3448,7 +3468,9 @@ def _worktree_pass(db, host: str, *, dry_run: bool,
                    skip_roots=(), known_agents=(),
                    blocked: dict | None = None,
                    archive: dict | None = None,
-                   budget: PassBudget | None = None) -> tuple[list[dict], list[dict]]:
+                   budget: PassBudget | None = None,
+                   reserve_s: float = 0.0,
+                   cursor=None, on_cursor=None) -> tuple[list[dict], list[dict]]:
     """Fin de lot des worktrees suivis : (lignes du journal, plan lisible).
 
     Garde-fous (L73b) avant tout retrait : worktree attribué à l'agent du
@@ -3489,7 +3511,15 @@ def _worktree_pass(db, host: str, *, dry_run: bool,
     TOUS les lots nommés ont fini depuis plus de `after` et sans activité
     depuis autant, sans commit absent de la forge (HEAD poussé ou intégré),
     ni verrou git, ni sous-module, ni processus, est archivé
-    (`housekeeping_archive`) puis retiré. Absent : il reste gardé."""
+    (`housekeeping_archive`) puis retiré. Absent : il reste gardé.
+
+    #3802 (B1) : `reserve_s` garde aux phases suivantes cette part du budget ;
+    la boucle s'arrête quand il ne reste que cela. `cursor` est le dernier
+    `(created_ts, id)` examiné au passage précédent : la boucle reprend
+    APRÈS lui (et repart au début après la fin), puis `on_cursor` reçoit le
+    nouveau curseur — `None` quand tous les worktrees ont été examinés. Un
+    hôte dont la phase worktrees dépasse le budget finit donc par tous les
+    voir, au lieu de refaire les mêmes premiers à chaque passage."""
     entries: list[dict] = []
     plan: list[dict] = []
     blocked = blocked if blocked is not None else {}
@@ -3498,16 +3528,40 @@ def _worktree_pass(db, host: str, *, dry_run: bool,
     # #2174: every tracked worktree — with the 500 oldest stuck, a capped
     # read never reached the newer ones (17/10: 822 on agents-1, 789 on
     # agents-2, 1 309 on the workstation)
-    for row in store.worktrees(host, ("active", "kept"), limit=None):
-        if budget is not None and budget.expired():
-            # #3802 : le budget du passage s'arrête ici ; le prochain passage
-            # reprend les worktrees restants (le budget est reparti de zéro).
-            budget.timed_out = True
+    rows = store.worktrees(host, ("active", "kept"), limit=None)
+    # #3802 (B1) : reprendre après le curseur du passage précédent, puis
+    # boucler au début : un worktree ajouté avant le curseur n'est pas oublié.
+    start = 0
+    if cursor is not None and rows:
+        try:
+            after = (float(cursor[0]), int(cursor[1]))
+        except (TypeError, ValueError, IndexError):
+            after = None
+        if after is not None:
+            for index, row in enumerate(rows):
+                try:
+                    here = (float(row.get("created_ts") or 0), int(row.get("id")))
+                except (TypeError, ValueError):
+                    continue
+                if here > after:
+                    start = index
+                    break
+    ordered = rows[start:] + rows[:start]
+    processed = 0
+    last = None
+    for row in ordered:
+        if budget is not None and (budget.expired()
+                                   or budget.reserved(reserve_s)):
+            # #3802 (B1) : le budget du passage s'arrête ici ; le curseur dit
+            # où reprendre au prochain passage, et la réserve garde de quoi
+            # faire tourner les phases suivantes.
             plan.append({"kind": "worktree", "path": "", "agent": None, "lot": None,
                          "action": "attend",
                          "detail": "pass budget reached: remaining worktrees left "
                                    "for the next pass"})
             break
+        processed += 1
+        last = row
         path, lot = row["path"], row.get("lot")
         branch = row.get("branch") or ""
         branch_checked = False
@@ -3739,7 +3793,7 @@ def _worktree_pass(db, host: str, *, dry_run: bool,
             if idle_before is not None:
                 activity = build_artifacts.survey(path, build_artifacts.rules_of(artifacts),
                     skip_roots=skip_roots,
-                    budget=_artifact_budget(budget))
+                    budget=_artifact_budget(budget, reserve_s))
                 if not activity["complete"] or activity["latest"] > idle_before:
                     plan.append(dict(base, action="garde", detail="%s; %s" % (
                         detail, activity["why"] or "worktree active within 24 h")))
@@ -3785,7 +3839,7 @@ def _worktree_pass(db, host: str, *, dry_run: bool,
                 why, "kept for more than 24 h" if grace else "idle for more than 24 h")
             if dry_run:
                 size, _whole = build_artifacts.size_of(
-                    path, budget=_artifact_budget(budget))
+                    path, budget=_artifact_budget(budget, reserve_s))
                 plan.append(dict(base, action="retrait", bytes=size, detail=why))
                 continue
             outcome, freed, note, built = _remove_kept_worktree(
@@ -3848,9 +3902,18 @@ def _worktree_pass(db, host: str, *, dry_run: bool,
                                 detail="%s: clean and integrated, git worktree remove%s" % (
                                     why, "; %s" % branch_note if branch_note else "")))
         else:
-            detail = "%s: removal refused by git — %s" % (why, error)
+            detail = ("%s: %s" % (why, error) if error.startswith("pass budget")
+                      else "%s: removal refused by git — %s" % (why, error))
             store.set_worktree_status(row["id"], "kept", detail)
             entries.append(dict(base, action="kept", detail=detail))
+    if on_cursor is not None:
+        if processed and processed >= len(rows):
+            on_cursor(None)            # a full cycle was examined
+        elif last is not None:
+            try:
+                on_cursor([float(last.get("created_ts") or 0), int(last["id"])])
+            except (TypeError, ValueError):
+                pass
     return entries, plan
 
 
@@ -3980,7 +4043,8 @@ def _shared_roots() -> tuple:
 def _artifact_pass(db, host: str, policy: Policy, *, cwd_of: dict, dry_run: bool,
                    now: float, skip_roots=(), lock_path: str | None = None,
                    journal_path: str | None = None, running=(), known_agents=(),
-                   budget: PassBudget | None = None) -> dict:
+                   budget: PassBudget | None = None,
+                   reserve_s: float = 0.0) -> dict:
     """L230: the worktrees of the repositories of the registered agents (and
     the tracked ones), their build artifacts deleted once idle; in a thread
     at the lowest priority, one worktree at a time.
@@ -4045,7 +4109,8 @@ def _artifact_pass(db, host: str, policy: Policy, *, cwd_of: dict, dry_run: bool
     skip = tuple(skip_roots) + _shared_roots()
     seconds = build_artifacts.PASS_BUDGET_S
     if budget is not None:
-        seconds = min(seconds, budget.remaining())
+        # #3802 (B1) : l'artefact ne mange pas la réserve des phases suivantes
+        seconds = min(seconds, max(0.0, budget.remaining() - reserve_s))
     return build_artifacts.gently(
         lambda: build_artifacts.run(
             candidates(), rules,
@@ -4650,6 +4715,11 @@ def run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool = 
     state = session_lock.read_content(lock)
     holder = {"pid": os.getpid(), "runner": actor or "", "since": tick,
               "host": host, "phase": "", "phase_since": tick, "source": "lock"}
+    key = mesh_key(cfg)
+    cursors = state.get(WORKTREES_CURSOR_KEY)
+    if not isinstance(cursors, dict):
+        cursors = {}
+    state[WORKTREES_CURSOR_KEY] = cursors
 
     def on_phase(name: str) -> None:
         # the lock names the phase its holder is in: what a skipped pass —
@@ -4659,8 +4729,21 @@ def run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool = 
         state[session_lock.HOLDER_KEY] = holder
         session_lock.write_content(lock, state)
 
+    def on_cursor(value) -> None:
+        # #3802 (B1) : le curseur de reprise des worktrees vit dans l'état du
+        # verrou, comme les heures de passage : il survit à une passe
+        # timed_out, sinon chaque passage referait les mêmes premiers.
+        if value is None:
+            cursors.pop(key, None)
+        else:
+            cursors[key] = value
+        session_lock.write_content(lock, state)
+
+    # write the holder before the interval test: the window during which a
+    # skipped pass sees no record is as short as possible (#3802 N1)
+    state[session_lock.HOLDER_KEY] = holder
+    session_lock.write_content(lock, state)
     try:
-        key = mesh_key(cfg)
         completed_passes = state
         if min_interval_s > 0:
             try:
@@ -4670,14 +4753,13 @@ def run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool = 
             if 0 <= elapsed < min_interval_s:
                 return skipped("housekeeping already ran on this host less than %gs ago"
                                % min_interval_s)
-        state[session_lock.HOLDER_KEY] = holder
-        session_lock.write_content(lock, state)
         budget = PassBudget(budget_s, on_phase=on_phase)
         try:
             report = _run_pass(cfg, db, policy, host=host, actor=actor, dry_run=dry_run,
                                busy=busy, agents_in_turn=agents_in_turn, now=now,
                                runtime=runtime, artifact_scan=artifact_scan,
-                               free_target=free_target, budget=budget)
+                               free_target=free_target, budget=budget,
+                               cursor=cursors.get(key), on_cursor=on_cursor)
         except _PassExpired as expired:
             report = _timed_out_report(host, dry_run, budget, expired.phase)
             report["entries"] = list(report["entries"])
@@ -4710,7 +4792,8 @@ def _run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool =
               busy: bool = False, agents_in_turn: set | None = None,
               now: float | None = None,
               runtime=None, artifact_scan: bool = True,
-              free_target: int = 0, budget: PassBudget | None = None) -> dict:
+              free_target: int = 0, budget: PassBudget | None = None,
+              cursor=None, on_cursor=None) -> dict:
     """Un passage de ménage sur CET hôte ; rend le rapport.
 
     * dossiers temporaires : quota par agent (sauf agent en tour) ; dossier
@@ -4761,6 +4844,9 @@ def _run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool =
                 "measure": None}
     if budget is None:
         budget = PassBudget(HOST_PASS_BUDGET_S)
+    # #3802 (B1) : réserve des phases qui suivent les worktrees ; jamais plus
+    # du tiers d'un budget court (un appelant peut borner la passe à moins).
+    reserve = min(HOST_PASS_RESERVE_S, max(0.0, budget.budget / 3.0))
     budget.context = {"entries": entries, "plan": plan, "skipped": skipped,
                       "unowned": unowned, "orphans": []}
     budget.check("registry")
@@ -5121,7 +5207,7 @@ def _run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool =
             # recorded are found there before an entry is deleted
             tops: set = set()
             for cwd in sorted(protected):
-                if budget.expired():
+                if budget.expired() or budget.reserved(reserve):
                     break              # #3802: a bounded host pass
                 tops.update(w["path"] for w in list_worktrees(cwd, budget=budget)
                             if not w.get("bare"))
@@ -5129,7 +5215,8 @@ def _run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool =
 
         for line in deps_mod.gc_node_modules(croot, now=now, idle=policy.deps_idle,
                                              dry_run=dry_run, worktrees=known_worktrees,
-                                             budget=budget):
+                                             budget=budget,
+                                             reserve=reserve):
             if line["action"] == "would-delete":
                 plan.append({"kind": "deps", "path": line["path"], "action": "suppression",
                              "bytes": line["bytes"], "detail": line["detail"]})
@@ -5181,7 +5268,9 @@ def _run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool =
                                              + _shared_roots(),
                                              known_agents=registered or (),
                                              blocked=wt_blocked, archive=archive,
-                                             budget=budget)
+                                             budget=budget,
+                                             reserve_s=reserve,
+                                             cursor=cursor, on_cursor=on_cursor)
         entries += wt_entries
         plan += wt_plan
         budget.check("clones")
@@ -5196,7 +5285,7 @@ def _run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool =
                     artifacts=policy.artifacts, allow=policy.unreadable_ok,
                     lock_path=lock_path, journal_path=journal_path,
                     skip_roots=(troot, croot, cfg.state_dir) + _shared_roots(),
-                    budget_s=budget.remaining())
+                    budget_s=max(0.0, budget.remaining() - reserve))
             except Exception as exc:  # never fatal for the pass
                 cl_entries, cl_plan, cl_skipped = [], [], [
                     "clones: pass failed (%s)" % type(exc).__name__]
@@ -5211,7 +5300,7 @@ def _run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool =
                                  skip_roots=(troot, croot, cfg.state_dir),
                                  lock_path=lock_path, journal_path=journal_path,
                                  running=running, known_agents=registered,
-                                 budget=budget)
+                                 budget=budget, reserve_s=reserve)
         except Exception as exc:  # jamais fatal pour le passage
             art = {"entries": [], "plan": [], "skipped": [
                 "artifacts: pass impossible (%s)" % type(exc).__name__]}

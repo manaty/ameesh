@@ -23,16 +23,15 @@ HOLDER_KEY = "_holder"
 def try_lock(state_dir: str, kind: str):
     """An open exclusive lock, or None. The caller closes it to release it.
 
-    #3802 : the descriptor is explicitly non-inheritable, so a child forked
-    or spawned while the lock is held cannot keep the flock after the pass
-    closes it (flock follows the open file description, not the process)."""
+    #3802 : `open()` already makes the descriptor non-inheritable (PEP 446),
+    so every child that EXECs (all the subprocesses of a pass) loses it and
+    cannot keep the flock after the pass closes it. A fork without exec would
+    share the open file description — flock follows it, not the process — but
+    the pass starts none; the witness checks no descriptor of the lock
+    survives it."""
     os.makedirs(state_dir, mode=0o700, exist_ok=True)
     fh = open(os.path.join(state_dir, kind + ".lock"), "a+b")
     try:
-        try:
-            os.set_inheritable(fh.fileno(), False)
-        except (AttributeError, OSError):   # Windows, exotic platform
-            pass
         if os.name == "nt":
             import msvcrt
             if os.fstat(fh.fileno()).st_size == 0:
@@ -123,32 +122,15 @@ def _process_name(pid: int) -> str:
         return ""
 
 
-def _process_start(pid: int) -> float | None:
-    """When `pid` started (wall clock), from `/proc/<pid>/stat` and the boot
-    time of `/proc/stat`; None if unreadable."""
-    try:
-        with open("/proc/%d/stat" % pid, encoding="ascii", errors="replace") as fh:
-            stat = fh.read()
-        # the command name is parenthesised and may contain spaces: count
-        # fields after the last ')'
-        start_ticks = int(stat.rsplit(")", 1)[1].split()[19])
-        with open("/proc/stat", encoding="ascii") as fh:
-            boot = next(int(line.split()[1]) for line in fh
-                        if line.startswith("btime "))
-        ticks = os.sysconf("SC_CLK_TCK")
-        return boot + start_ticks / float(ticks)
-    except (OSError, ValueError, IndexError, StopIteration):
-        return None
-
-
 def holder(state_dir: str, kind: str) -> dict | None:
     """The holder record of a held lock, or None.
 
     Prefers the record the holder wrote (`pid`, `runner`, `since`, `phase`),
     and falls back to the kernel and `/proc` when the file carries none (an
     older holder, a partial write, a lock taken by another tool): the pid
-    comes from `/proc/locks`, the name from `comm`, and the start time from
-    the process itself — never its argv (#3403)."""
+    comes from `/proc/locks` and the name from `comm` — never the argv
+    (#3403). Without a record the acquisition time is unknown and `since`
+    is None, so no blocked age is claimed (#3802 N1)."""
     path = os.path.join(state_dir, kind + ".lock")
     kernel_pid = _proc_lock_pid(path)
     record = read_state(state_dir, kind).get(HOLDER_KEY)
@@ -166,13 +148,11 @@ def holder(state_dir: str, kind: str) -> dict | None:
     pid = kernel_pid
     if pid is None:
         return None
-    since = _process_start(pid)
-    if since is None:
-        try:
-            since = os.stat(path).st_mtime
-        except OSError:
-            since = None
-    return {"pid": pid, "runner": _process_name(pid), "since": since,
+    # #3802 N1 : sans enregistrement, l'heure de PRISE du verrou est inconnue.
+    # Le démarrage du processus n'en est pas une : un runner vieux de 3 h qui
+    # vient de prendre le verrou serait déclaré bloqué à tort. Pas d'âge,
+    # donc pas d'alerte ; le pid et le nom sont quand même dits.
+    return {"pid": pid, "runner": _process_name(pid), "since": None,
             "source": "proc-locks"}
 
 

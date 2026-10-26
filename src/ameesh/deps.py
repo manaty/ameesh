@@ -1364,7 +1364,8 @@ def entries(cache_root: str) -> list[dict]:
 
 def gc_node_modules(cache_root: str, *, now: float | None = None,
                     idle: float = DEFAULT_DEPS_IDLE_S, dry_run: bool = False,
-                    worktrees=None, holders=None, budget=None) -> list[dict]:
+                    worktrees=None, holders=None, budget=None,
+                    reserve: float = 0.0) -> list[dict]:
     """Delete the entries no worktree links to any more and partial ones left
     by a dead fill. A complete entry goes only after `idle` (at least GRACE_S)
     since its creation, its last link and the last time a link to it was seen
@@ -1377,24 +1378,35 @@ def gc_node_modules(cache_root: str, *, now: float | None = None,
     inode. Returns housekeeping log lines (`kind` "deps").
 
     `budget` (#3802), a `housekeeping.PassBudget`: the loop stops at its next
-    entry when the pass budget is spent, without starting another deletion."""
+    entry when the pass budget is spent, without starting another deletion.
+    `reserve` keeps that many seconds for the phases that follow (worktrees,
+    tail). If the budget runs out DURING the worktree inventory, the list is
+    INCOMPLETE: no entry is deleted (a link nobody recorded may live in an
+    omitted worktree), and the kept line says it. The check is made again
+    under the lock, right before the deletion (#3802 B/P1, cx1)."""
     now = time.time() if now is None else float(now)
     holders = holders or _holders
     root = nm_root(cache_root)
     out = []
     known = None
+    inventory_failed = False
 
     def tops():
-        nonlocal known
+        nonlocal known, inventory_failed
         if known is None:
             try:
                 known = list(worktrees() if callable(worktrees) else (worktrees or ()))
             except Exception:
+                inventory_failed = True
                 known = []
         return known
 
+    def exhausted() -> bool:
+        return inventory_failed or (budget is not None and (
+            budget.expired() or budget.remaining() <= max(0.0, reserve)))
+
     for item in entries(cache_root):
-        if budget is not None and budget.expired():
+        if exhausted():
             break                      # #3802: a bounded host pass
         entry = item["path"]
         if item["temp"]:
@@ -1406,7 +1418,18 @@ def gc_node_modules(cache_root: str, *, now: float | None = None,
                                       holders=lambda _p: [], write=True) is None:
             continue
         # links found by the scan are recorded (kept entries only; no dry run)
-        why = _gc_reason(entry, now=now, idle=idle, worktrees=tops(), holders=holders,
+        found = tops()
+        if exhausted():
+            # #3802 B/P1 : l'inventaire a pu être coupé par le budget ou
+            # échouer ; une entrée ancienne peut avoir un lien vivant dans un
+            # worktree omis. Inventaire incomplet : aucune suppression.
+            out.append({"kind": "deps", "action": "kept", "path": entry,
+                        "bytes": int(item["marker"].get("bytes") or 0),
+                        "detail": "worktree inventory incomplete (%s): kept" % (
+                            "unreadable" if inventory_failed
+                            else "pass budget reached")})
+            break
+        why = _gc_reason(entry, now=now, idle=idle, worktrees=found, holders=holders,
                          write=not dry_run)
         if why is None:
             continue
@@ -1424,6 +1447,12 @@ def gc_node_modules(cache_root: str, *, now: float | None = None,
                              write=True)
             if why is None:
                 continue
+            if exhausted():
+                # #3802 B/P1 : re-vérifier sous le verrou, juste avant l'effet
+                out.append(dict(line, action="kept",
+                                detail="%s ; pass budget reached before deletion: kept"
+                                       % why))
+                break
             remove_tree(entry, root)
         except OSError as exc:
             out.append(dict(line, action="kept", detail="%s ; deletion failed: %s"
