@@ -17,6 +17,13 @@ LOG_COLUMNS = (
     " bytes, agent, lot, detail, data"
 )
 
+#: les mêmes colonnes, qualifiées pour la jointure des lectures à deux temps
+#: (#3631 : les identifiants par l'index, la ligne complète par la clé).
+LOG_COLUMNS_ALIASED = (
+    "l.id, l.host, extract(epoch from l.at)::float8 AS at_ts, l.actor, l.kind,"
+    " l.action, l.path, l.bytes, l.agent, l.lot, l.detail, l.data"
+)
+
 WORKTREE_COLUMNS = (
     "id, host, path, repo, agent, lot, turn_id, branch, head, status, detail,"
     " extract(epoch from created_at)::float8 AS created_ts,"
@@ -105,9 +112,16 @@ class Housekeeping(interface.Housekeeping):
             where += (" AND (host, path) IN (SELECT host, path FROM housekeeping_log"
                       " WHERE " + sub_where + " AND action IN (" + marks + "))")
             params.extend(sub_params + actions)
+        # #3631 : les identifiants de la dernière ligne de chaque (hôte, chemin)
+        # se lisent dans l'index (kind, host, path, at DESC, id DESC) — sans
+        # tri ni accès au tas — et seule la ligne retenue est relue. L'ancien
+        # DISTINCT ON sur la table entière ramenait 200 Mo par appel.
         rows = self.db.query(
-            "SELECT DISTINCT ON (host, path) " + LOG_COLUMNS + " FROM housekeeping_log"
-            + where + " ORDER BY host, path, at DESC, id DESC", tuple(params))
+            "SELECT " + LOG_COLUMNS_ALIASED + " FROM housekeeping_log l"
+            " JOIN (SELECT DISTINCT ON (host, path) host, path, id"
+            "         FROM housekeeping_log" + where +
+            "        ORDER BY host, path, at DESC, id DESC) u ON u.id = l.id"
+            " ORDER BY l.host, l.path", tuple(params))
         return [_data(dict(r)) for r in rows]
 
     def summary(self, host, since_s) -> list[dict]:
@@ -139,10 +153,15 @@ class Housekeeping(interface.Housekeeping):
         if host:
             where = " AND host = %s"
             params.append(host)
+        # #3631 : ids par l'index (kind, host, at DESC, id DESC), une ligne
+        # relue par hôte — l'ancien DISTINCT ON parcourait tout le journal du
+        # ménage (~230 Mo) à chaque passe d'alertes.
         rows = self.db.query(
-            "SELECT DISTINCT ON (host) " + LOG_COLUMNS + " FROM housekeeping_log"
-            " WHERE kind = 'mesure'" + where + " ORDER BY host, at DESC, id DESC",
-            tuple(params))
+            "SELECT " + LOG_COLUMNS_ALIASED + " FROM housekeeping_log l"
+            " JOIN (SELECT DISTINCT ON (host) host, id FROM housekeeping_log"
+            "        WHERE kind = 'mesure'" + where +
+            "       ORDER BY host, at DESC, id DESC) u ON u.id = l.id"
+            " ORDER BY l.host", tuple(params))
         return [_data(dict(r)) for r in rows]
 
     def register_worktree(self, *, host, path, repo, agent, lot, turn_id, branch,

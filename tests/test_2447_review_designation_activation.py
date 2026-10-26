@@ -20,11 +20,13 @@ import time
 import types
 from unittest import mock
 
+from ameesh import db as db_mod
 from ameesh import lot_class, mail, registry, review_authors, review_designation as rd
 from ameesh import review_designation_activation as act
 from ameesh import review_designation_pg as pg
 from ameesh import review_provenance as prov
 from ameesh import storage, verdict_carry, work
+from ameesh.storage.postgres import registry as pg_registry
 from ameesh.work_reviewers import designated
 
 from .support import PgTestCase
@@ -1821,6 +1823,27 @@ class UnreachableDesignationTest(_ActivationFixture, PgTestCase):
         self.assertFalse(self.notes(act.UNAVAILABLE_PREFIX))
         self.assertIn("designation unchanged: no repository holds",
                       self.notes(act.REASSIGN_PREFIX)[-1])
+
+    def test_an_unreadable_input_names_the_read_and_the_query(self):
+        # #3631 : 639 passes perdues en 24 h ne disaient que « inputs
+        # unreadable ». La passe nomme maintenant la lecture fautive et, sur
+        # un statement_timeout, l'instruction que le pilote a mesurée.
+        self.freeze()
+        failure = db_mod.DbError(
+            "canceling statement due to statement timeout",
+            sqlstate=db_mod.QUERY_CANCELED,
+            sql="SELECT name, aliases, retired_ts FROM agent_registry",
+            elapsed_ms=30012.0)
+        with mock.patch.object(pg_registry.Agents, "reachability",
+                               side_effect=failure):
+            report = act.reassign_unreachable(self.cfg, self.db)
+        self.assertEqual(report["summary"],
+                         "no reassignment: inputs unreadable")
+        self.assertEqual(len(report["errors"]), 1, report)
+        self.assertIn("agents.reachability", report["errors"][0])
+        self.assertIn("statement timeout", report["errors"][0])
+        self.assertIn("after 30.0s", report["errors"][0])
+        self.assertIn("SELECT name, aliases", report["errors"][0])
 
     def test_a_pilot_removal_during_the_pass_is_not_written_back(self):
         # Relecture de impl-02 (#3367) : le pilote retire r2 pendant que la
