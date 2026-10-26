@@ -115,11 +115,12 @@ def _fetch_head(repo: str, sha: str) -> bool:
     if not text:
         return False
     try:
-        if plan_git._out(repo, "remote", "get-url", "origin") is None:
+        forge = plan_git.forge_remote(repo)
+        if forge is None:
             return False
         proc = plan_git._git(
             repo, "fetch", "--quiet", "--no-tags", "--no-write-fetch-head",
-            "--", "origin", text, timeout=plan_git.FETCH_TIMEOUT)
+            "--", forge, text, timeout=plan_git.FETCH_TIMEOUT)
     except Exception:  # noqa: BLE001 - forge injoignable : absence
         return False
     if proc.returncode != 0:
