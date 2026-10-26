@@ -92,6 +92,52 @@ class Accounts(interface.Accounts):
                 (host, harness, depart, to, kind, reason, agent))
         return True
 
+    def force_switch(self, host, harness, *, initial, to, reason, agent,
+                     forced_until, now, allow=False) -> dict:
+        """#3755 : bascule forcée, retenue relue sous le verrou de placement."""
+        with self.db.transaction() as tx:
+            _verrou_placement(tx, host, harness)
+            rows = tx.query(
+                "select account, forced,"
+                " extract(epoch from forced_until)::float8 as forced_until"
+                " from account_active"
+                " where host = %s and harness = %s for update", (host, harness))
+            holds = tx.query(
+                "select until_ts, reason from account_holds"
+                " where host = %s and harness = %s and account = %s",
+                (host, harness, to))
+            hold = holds[0] if holds else None
+            held = None
+            if hold is not None and hold.get("until_ts") is not None \
+                    and float(hold["until_ts"]) > now:
+                held = hold.get("reason") or "overage hold"
+                if not allow:
+                    # rien n'est écrit : ni bascule, ni levée de la retenue
+                    return {"changed": False, "held": held}
+            if rows:
+                depart = rows[0]["account"]
+                tx.execute(
+                    "update account_active set account = %s, forced = true,"
+                    " forced_until = to_timestamp(%s), updated_at = now()"
+                    " where host = %s and harness = %s",
+                    (to, forced_until, host, harness))
+            else:
+                depart = initial
+                tx.execute(
+                    "insert into account_active (host, harness, account, forced,"
+                    " forced_until) values (%s, %s, %s, true, to_timestamp(%s))",
+                    (host, harness, to, forced_until))
+            tx.execute(
+                "insert into account_switches (host, harness, from_account, to_account,"
+                " kind, reason, agent) values (%s, %s, %s, %s, 'manuel', %s, %s)",
+                (host, harness, depart, to, reason, agent))
+            # le geste explicite lève la retenue de la cible ; une retenue
+            # échue est nettoyée au passage.
+            tx.execute(
+                "delete from account_holds where host = %s and harness = %s"
+                " and account = %s", (host, harness, to))
+        return {"changed": True, "held": None}
+
     def switch_guarded(self, host, harness, *, expected, to, kind, reason, agent,
                        now, hold_reason=None, hold_until=None) -> bool:
         """#1883 : la bascule ET la retenue du compte quitté, sous le verrou."""

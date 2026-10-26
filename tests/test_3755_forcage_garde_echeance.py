@@ -23,6 +23,7 @@ from __future__ import annotations
 import dataclasses
 import time
 import unittest
+from unittest import mock
 
 from ameesh import accounts, cost, exploitation, mesh_cli, storage
 
@@ -114,6 +115,51 @@ class ForcageGardeTest(_Base):
             book=self._book(), now=now, until=now + 900.0, allow=True,
             reason="sonde de jauge"))
         self.assertEqual(store.holds(self.cfg.host, "codex"), {})
+
+    def test_une_retenue_publiee_pendant_l_evaluation_refuse_le_forcage(self):
+        """B/P2 des deux relecteurs : la retenue est relue sous le verrou de
+        placement, dans la transaction de la bascule. Publiée entre le début
+        de `force` et la bascule, elle refuse sans rien écrire."""
+        items = self._items()
+        now = float(int(time.time()))
+        _journal(items[0].path, week=(34, now + 6 * DAY))
+        _journal(items[1].path, week=(5, now + 6 * DAY))
+        store = storage.of(self.db).accounts
+        real_evaluate = accounts.evaluate
+
+        def evaluate_then_publish(*args, **kwargs):
+            result = real_evaluate(*args, **kwargs)
+            # un autre runner publie la retenue pendant l'évaluation
+            store.hold(self.cfg.host, "codex", "secondaire", now + 600.0,
+                       "codex plan: in overage (billed beyond the plan)")
+            return result
+
+        with mock.patch.object(accounts, "evaluate",
+                               side_effect=evaluate_then_publish):
+            with self.assertRaises(accounts.AccountError) as ctx:
+                accounts.force(self.db, self.cfg.host, "codex", items,
+                               "secondaire", by="human:test",
+                               book=self._book(), now=now)
+        self.assertIn("held", str(ctx.exception))
+        # refus sans écriture : ni forçage, ni levée de la retenue
+        self.assertIsNone(store.active(self.cfg.host, "codex"))
+        self.assertIn("secondaire", store.holds(self.cfg.host, "codex"))
+        self.assertEqual(self._switches(), [])
+
+        with mock.patch.object(accounts, "evaluate",
+                               side_effect=evaluate_then_publish):
+            self.assertTrue(accounts.force(
+                self.db, self.cfg.host, "codex", items, "secondaire",
+                by="human:test", book=self._book(), now=now,
+                until=now + 900.0, allow=True, reason="sonde de jauge"))
+        # le geste explicite lève la retenue
+        self.assertEqual(store.holds(self.cfg.host, "codex"), {})
+        self.assertTrue(store.active(self.cfg.host, "codex")["forced"])
+
+    def _switches(self):
+        return self.db.query(
+            "select kind, from_account, to_account from account_switches"
+            " order by id")
 
 
 class ForcageEcheanceTest(_Base):

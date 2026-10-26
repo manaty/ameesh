@@ -1012,6 +1012,31 @@ class Accounts(Domain):
         toute bascule non forcée efface l'échéance."""
 
     @abc.abstractmethod
+    def force_switch(self, host: str, harness: str, *, initial: str, to: str,
+                     reason: str, agent: str | None, forced_until: float,
+                     now: float, allow: bool = False) -> dict:
+        """#3755 : bascule forcée sous le **verrou de placement**.
+
+        Une seule transaction qui, sous `_verrou_placement` (le verrou de
+        `hold`, `switch_guarded` et `placement_state`) :
+
+        * relit la retenue de `to` (`account_holds`) ; une retenue **valide**
+          (`until_ts > now`) refuse la bascule sans `allow` — rend
+          `{"changed": False, "held": raison}`, rien n'est écrit (pas même la
+          levée de la retenue). C'est la course fermée : une retenue publiée
+          entre la lecture des jauges et la bascule est vue ici, jamais
+          ignorée puis effacée ;
+        * avec `allow` (`--force "raison"`), la bascule passe et la retenue
+          de `to` est levée dans la même transaction (geste explicite) ;
+        * sans retenue valide, la bascule passe et une retenue échue de `to`
+          est nettoyée.
+
+        `initial` est le compte à journaliser comme quitté quand
+        `account_active` n'a pas encore de ligne (premier choix de l'hôte).
+        Rend `{"changed": bool, "held": str | None}` ; `held` n'est renseigné
+        que si la bascule a été refusée pour une retenue valide."""
+
+    @abc.abstractmethod
     def switch_guarded(self, host: str, harness: str, *, expected: str | None, to: str,
                        kind: str, reason: str, agent: str | None, now: float,
                        hold_reason: str | None = None,

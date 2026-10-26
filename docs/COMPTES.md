@@ -222,7 +222,11 @@ ameesh budget                          # plafonds du mesh en vigueur, source, pa
 **Un forçage a une garde et une échéance (#3755).** `ameesh accounts use`
 évalue le compte avant de le forcer : s'il est **en overage** ou **au-delà de
 son rythme** (`accounts.evaluate`), la commande refuse, avec la raison et le
-rappel de `--force`. `--force "raison"` passe outre — la raison est journalisée
+rappel de `--force`. Une retenue d'overage valide publiée par un autre runner
+de l'hôte est relue **sous le verrou de placement**, dans la transaction de la
+bascule : sans `--force` elle refuse sans rien écrire, avec `--force` elle est
+levée dans la même transaction. `--force "raison"` passe outre — la raison est
+journalisée
 dans `account_switches` (visible dans les dernières bascules d'`ameesh accounts
 list`) — mais ne change
 rien à la garde du tour : un compte en overage ou au-delà de ses plafonds n'est
@@ -425,7 +429,10 @@ account in between keeps their force, applied as is for that turn.
 Since #3755 the command itself refuses to force an account already in overage
 or above its pace (`--force "reason"` overrides, journaled), and every force
 carries an expiry (`--for`, 1 h by default): at the deadline the next choice
-reads it as automatic and lifts it (journaled `auto`). The expiry is fenced on
+reads it as automatic and lifts it (journaled `auto`). A valid overage hold
+published by another runner of the host is re-read under the placement lock,
+in the switch transaction: without `--force` it refuses and writes nothing;
+with `--force` it is lifted in that same transaction. The expiry is fenced on
 the forced account that was read, like a threshold lift: a concurrent force of
 another account is kept.
 With the budget guard off (`budget_usd_per_hour` 0) the pace no longer

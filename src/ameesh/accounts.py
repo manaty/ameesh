@@ -2675,11 +2675,13 @@ def force(db, host: str, harness: str, items: list[Profile], name: str, *, by: s
     """Force le compte `name` (forçage manuel, journalisé `manuel`).
 
     #3755 — un forçage ne contourne pas la règle du propriétaire (« jamais de
-    dépassement ») : avec `book`, le compte est évalué, et une retenue
+    dépassement ») : avec `book`, le compte est évalué ; une retenue
     d'overage publiée pour l'hôte (même quand sa lecture locale est saine) est
-    lue ; le forçage est **refusé** s'il est en overage ou au-delà de son
-    rythme. `allow` (`--force "raison"`) passe outre, à condition de donner une
-    `reason`, journalisée dans `account_switches`.
+    relue SOUS le verrou de placement, dans la transaction de la bascule, et
+    le forçage est **refusé** s'il est en overage ou au-delà de son rythme.
+    `allow` (`--force "raison"`) passe outre, à condition de donner une
+    `reason`, journalisée dans `account_switches` ; la retenue est alors levée
+    dans la même transaction.
 
     `until` (epoch) est l'échéance du forçage ; par défaut
     `DEFAULT_FORCE_S` après `now` (#3755). Au terme, le choix et l'affichage
@@ -2693,24 +2695,11 @@ def force(db, host: str, harness: str, items: list[Profile], name: str, *, by: s
         raise AccountError("account %s/%s unusable: %s"
                            % (harness, name, "; ".join(problems)))
     now = time.time() if now is None else float(now)
+    if allow and not (reason or "").strip():
+        raise AccountError(
+            "account %s/%s: --force needs a reason (journalized in "
+            "account_switches)" % (harness, name))
     store = storage.of(db).accounts
-    # #1883/#3755 : une retenue valide publiée par un autre runner de l'hôte
-    # est une preuve d'overage que la lecture locale peut ne pas voir (deux
-    # configurations sous le même nom). La commande refuse alors le forçage
-    # comme un compte en overage ; `--force "raison"` la lève explicitement.
-    hold = store.holds(host, harness).get(name) or {}
-    held_until = hold.get("until_ts")
-    if held_until is not None and float(held_until) > now:
-        detail = hold.get("reason") or "overage hold"
-        if not allow:
-            raise AccountError(
-                "account %s/%s is held for overage by another runner of this host "
-                "(%s) — refusing to force it; use --force \"reason\" to force it "
-                "anyway" % (harness, name, detail))
-        if not (reason or "").strip():
-            raise AccountError(
-                "account %s/%s is held for overage (%s); --force needs a reason "
-                "(journalized in account_switches)" % (harness, name, detail))
     if book is not None:
         try:
             state = evaluate(book, profile, items, now, record=True)
@@ -2722,17 +2711,12 @@ def force(db, host: str, harness: str, items: list[Profile], name: str, *, by: s
         if state.problems:
             raise AccountError("account %s/%s unusable: %s"
                                % (harness, name, "; ".join(state.problems)))
-        if not state.ok:
-            if not allow:
-                raise AccountError(
-                    "account %s/%s is %s — refusing to force it: the owner's rule "
-                    "is never above the plan; use --force \"reason\" to force it "
-                    "anyway (reason and expiry are journalized)"
-                    % (harness, name, state.reason))
-            if not (reason or "").strip():
-                raise AccountError(
-                    "account %s/%s is %s; --force needs a reason (journalized in "
-                    "account_switches)" % (harness, name, state.reason))
+        if not state.ok and not allow:
+            raise AccountError(
+                "account %s/%s is %s — refusing to force it: the owner's rule "
+                "is never above the plan; use --force \"reason\" to force it "
+                "anyway (reason and expiry are journalized)"
+                % (harness, name, state.reason))
     if until is None:
         until = now + DEFAULT_FORCE_S
     try:
@@ -2741,15 +2725,22 @@ def force(db, host: str, harness: str, items: list[Profile], name: str, *, by: s
         raise AccountError("unreadable forcing expiry: %r" % (until,))
     if until <= now:
         raise AccountError("forcing expiry must be in the future")
-    store.init_active(host, harness, items[0].name)
     texte = "manual override by %s" % by
     if (reason or "").strip():
         texte += ": %s" % " ".join(str(reason).split())
-    changed = store.switch(host, harness, expected=None, to=name, kind="manuel",
-                           reason=texte, agent=None, forced=True, forced_until=until)
-    if changed:
-        store.release(host, harness, name)
-    return changed
+    # #1883/#3755 : la retenue de la cible est relue SOUS le verrou de
+    # placement, dans la même transaction que la bascule et sa levée : une
+    # retenue publiée pendant l'évaluation des jauges (ou après une première
+    # lecture) est vue ici — sans `allow`, elle refuse sans rien écrire.
+    result = store.force_switch(host, harness, initial=items[0].name, to=name,
+                                reason=texte, agent=None, forced_until=until,
+                                now=now, allow=allow)
+    if result.get("held"):
+        raise AccountError(
+            "account %s/%s is held for overage by another runner of this host "
+            "(%s) — refusing to force it; use --force \"reason\" to force it "
+            "anyway" % (harness, name, result["held"]))
+    return bool(result.get("changed"))
 
 
 def automatic(db, host: str, harness: str, *, by: str) -> bool:
