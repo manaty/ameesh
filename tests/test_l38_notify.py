@@ -466,6 +466,109 @@ class AlertesReellesTest(_Base):
         self.assertEqual([r["type"] for r in records], ["long_turn"])
 
 
+class DeadRunnerLeaseTest(_Base):
+    """#3630, témoin de bout en bout : un bail qui expire 60 s puis se
+    renouvelle ne pousse rien ; au-delà de la grâce, une alerte et un
+    resolved."""
+
+    def setUp(self):
+        super().setUp()
+        self.register("ouvrier", "claude", cwd=self.tmp)
+        self.db.execute("UPDATE agent_registry SET responsible = 'human:proprio' "
+                        "WHERE name = 'ouvrier'")
+
+    def lease(self, seconds: float) -> None:
+        import time as time_mod
+        self.db.execute(
+            "UPDATE agent_registry SET status = 'running', "
+            "lease_owner = 'runner-ouvrier@laptop', "
+            "lease_expires_at = now() - make_interval(secs => %s) "
+            "WHERE name = 'ouvrier'", (seconds,))
+        self.now = time_mod.time()
+
+    def renew(self) -> None:
+        import time as time_mod
+        self.db.execute(
+            "UPDATE agent_registry SET lease_expires_at = now() + interval '90 seconds' "
+            "WHERE name = 'ouvrier'")
+        self.now = time_mod.time()
+
+    def test_bail_60_s_puis_renouvele_ne_pousse_rien(self):
+        notifier = self.notifier(self.ncfg())
+        self.lease(60)
+        self.assertEqual(self.passe(notifier), [])
+        self.assertEqual(_desktop_log(self.desk), [])
+        self.renew()
+        self.assertEqual(self.passe(notifier), [])
+        self.assertEqual(_desktop_log(self.desk), [])
+
+    def test_panne_au_dela_de_la_grace_pousse_une_alerte_et_un_resolved(self):
+        notifier = self.notifier(self.ncfg())
+        self.lease(301)
+        self.assertEqual([(r["event"], r["type"], r["delivery"])
+                          for r in self.passe(notifier)],
+                         [("raised", "dead_runner", "envoyee")])
+        self.assertEqual(len(_desktop_log(self.desk)), 1)
+        self.renew()
+        self.assertEqual([(r["event"], r["type"], r["delivery"])
+                          for r in self.passe(notifier)],
+                         [("resolved", "dead_runner", "envoyee")])
+        self.assertEqual(len(_desktop_log(self.desk)), 2)
+
+
+class DeadRunnerAntiBounceTest(_Base):
+    """#3630 : une coupure de bail courte reprise seule ne pousse rien ; une
+    panne au-delà de la grâce pousse une alerte, puis un seul resolved."""
+
+    def dead(self, age: float, **extra) -> dict:
+        return _alert("dead_runner", agent="ouvrier", since=self.now - age,
+                      runner="runner-ouvrier@laptop",
+                      responsible="human:proprio",
+                      detail="lease of runner-ouvrier@laptop expired without "
+                             "renewal for %ds" % age, **extra)
+
+    def test_coupure_de_60_s_puis_reprise_ne_pousse_rien(self):
+        notifier = self.notifier(self.ncfg())
+        self.assertEqual(self.passe(notifier, [self.dead(60)]), [])
+        self.assertEqual(_desktop_log(self.desk), [])
+        # le bail est repris avant la fin de la grâce : l'alerte disparaît
+        # sans avoir été poussée, donc aucune résolution ne part.
+        self.now += 30
+        self.assertEqual(self.passe(notifier, []), [])
+        self.assertEqual(_desktop_log(self.desk), [])
+
+    def test_panne_au_dela_de_la_grace_pousse_une_fois_puis_un_resolved(self):
+        notifier = self.notifier(self.ncfg())
+        records = self.passe(notifier, [self.dead(301)])
+        self.assertEqual([(r["event"], r["type"], r["delivery"]) for r in records],
+                         [("raised", "dead_runner", "envoyee")])
+        self.assertEqual(len(_desktop_log(self.desk)), 1)
+        # une alerte qui dure ne repart pas
+        self.now += 30
+        self.assertEqual(self.passe(notifier, [self.dead(331)]), [])
+        # le bail revient : une seule résolution
+        self.assertEqual([(r["event"], r["type"], r["delivery"])
+                          for r in self.passe(notifier, [])],
+                         [("resolved", "dead_runner", "envoyee")])
+        self.assertEqual(len(_desktop_log(self.desk)), 2)
+
+    def test_une_alerte_sans_since_est_poussee_sans_attendre(self):
+        notifier = self.notifier(self.ncfg())
+        alert = self.dead(0)
+        alert["since"] = None
+        self.assertEqual([(r["event"], r["type"])
+                          for r in self.passe(notifier, [alert])],
+                         [("raised", "dead_runner")])
+
+    def test_une_autre_alerte_n_est_pas_retardee(self):
+        notifier = self.notifier(self.ncfg())
+        alert = _alert("stopped_with_mail", since=self.now - 60,
+                       responsible="human:proprio")
+        self.assertEqual([(r["event"], r["type"])
+                          for r in self.passe(notifier, [alert])],
+                         [("raised", "stopped_with_mail")])
+
+
 class FiabiliteTest(_Base):
     def test_dedoublonnage_et_redemarrage(self):
         path = os.path.join(self.tmp, "notify", "state.json")
