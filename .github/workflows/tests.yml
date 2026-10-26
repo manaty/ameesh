@@ -34,6 +34,16 @@
 # #1476 : 16 psql + 8 psycopg = 24 jobs, la taille du pool de #1468 ; le
 # découpage suit les durées mesurées (scripts/test-plan.py, PARTS), jamais ce
 # fichier (rééquilibrage : #3754).
+# #3754 — chaque part psql/psycopg tourne en deux processus de test
+# (`--parallel 2`), chacun son schéma : les runners auto-hébergés offrent
+# 16 vCPU pour 8 jobs, une part série n'occupait qu'un cœur. La charge mesurée
+# de la part peut relever ce nombre jusqu'à 4 (cible ~450 s de tests par
+# processus) : les parts lourdes prennent plus de cœurs, pas plus de temps.
+# Le découpage se fait par classe (son setUpClass reste dans un processus),
+# sauf une classe de plus de 5 min découpée en tests pour isoler un test lent ;
+# il est pondéré par les durées par test mesurées de tests/parts/durees.json ;
+# le flux des tests est fusionné en un seul, avec un `debut`, un `impacted` et
+# un `fin`. La mesure (`carte.yml`) reste série.
 # Le job final « tests » agrège les parts : c'est le nom de vérification stable
 # hors lancement manuel, qui publie « tests (dispatch) » (#1635).
 #
@@ -617,6 +627,33 @@ jobs:
           psql "$AMEESH_TEST_DSN" -q -c "ALTER SYSTEM SET fsync = off" \
             -c "ALTER SYSTEM SET synchronous_commit = off" \
             -c "ALTER SYSTEM SET full_page_writes = off" -c "SELECT pg_reload_conf()"
+      - &pgdump17
+        name: pg_dump 17 pour le gabarit (#3752)
+        # #3752/#3754 : le serveur de la part est postgres:17, le client des
+        # runners Ubuntu 24.04 est 16 ; `pg_dump 16` refuse un serveur 17 et le
+        # gabarit se replie sur migrate() à chaque classe. Le paquet PGDG est
+        # installé une fois par runner (les jobs suivants sautent l'étape) ;
+        # les huit jobs d'un hôte se sérialisent sur les verrous apt.
+        run: |
+          set -euo pipefail
+          if [ -x /usr/lib/postgresql/17/bin/pg_dump ] \
+             || pg_dump --version 2>/dev/null | grep -qE 'pg_dump \(PostgreSQL\) 17\.'; then
+            echo "pg_dump 17 déjà présent"
+            exit 0
+          fi
+          command -v curl >/dev/null || { sudo apt-get update -q; sudo apt-get install -y -q curl; }
+          sudo install -d /usr/share/postgresql-common/pgdg
+          sudo curl -fsSo /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc \
+            https://www.postgresql.org/media/keys/ACCC4CF8.asc
+          . /etc/os-release
+          echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt ${VERSION_CODENAME}-pgdg main" \
+            | sudo tee /etc/apt/sources.list.d/pgdg.list >/dev/null
+          for essai in 1 2 3 4 5; do
+            sudo apt-get -o DPkg::Lock::Timeout=180 update -q && break
+            sleep $((essai * 5))
+          done
+          sudo apt-get -o DPkg::Lock::Timeout=180 install -y -q postgresql-client-17
+          /usr/lib/postgresql/17/bin/pg_dump --version
       - &git
         name: identité git des tests (dépôts temporaires)
         run: |
@@ -652,6 +689,7 @@ jobs:
         run: >-
           .venv-ci/bin/python scripts/test-parts.py run --plan "$RUNNER_TEMP/plan.json"
           --part ${{ matrix.part }} --driver psycopg --flow "$RUNNER_TEMP/flux.jsonl"
+          --parallel 2
       - &fermer
         name: fin du check run du flux
         if: always()
@@ -737,6 +775,7 @@ jobs:
       - name: dépendances des parts psql (pyyaml, crypto)
         run: python -m pip install -q 'pyyaml>=6' 'cryptography>=41'
       - *base
+      - *pgdump17
       - *git
       - *plan
       - *plan_empreinte
@@ -745,6 +784,7 @@ jobs:
         run: >-
           python scripts/test-parts.py run --plan "$RUNNER_TEMP/plan.json"
           --part ${{ matrix.part }} --driver psql --flow "$RUNNER_TEMP/flux.jsonl"
+          --parallel 2
       - *fermer
       - *resume
       - name: flux en artefact
@@ -846,6 +886,7 @@ jobs:
           path: .venv-ci
           key: venv-${{ runner.os }}-${{ runner.environment == 'github-hosted' && 'hosted' || runner.name }}-py${{ steps.py.outputs.python-version }}-psycopg-cov-${{ hashFiles('pyproject.toml') }}-run${{ github.run_id }}-${{ github.run_attempt }}
       - *base
+      - *pgdump17
       - *git
       - *plan
       - *plan_empreinte
