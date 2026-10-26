@@ -128,6 +128,15 @@ A lot is stale when it is open and inactive beyond the configured threshold
   that carries the declaration is not external — it stays a plain agent wait
   and the debit says so in `unreadable`.
 
+  #3773 : the same hold may declare an **external third party** without
+  naming the bureau or the owner — `hold: attente externe : revue Apple`,
+  `hold: attente externe : examen du store`. The third party is in the
+  gesture and the debit reports the executor as `externe`; the hold enters
+  `external_waits` like a named executor's, outside `slow_waits`, with the
+  same reminder at the declared deadline or after the threshold, carried to
+  the bureau (§10). Prose without the colon separator (`attente externe de
+  l'APK`) declares nothing.
+
 Grouped views (`work list`, `progress --json`, the stale alert, the dependency
 labels) read the hold from a targeted storage stream
 (`Progress.lot_hold_events`: state transitions plus the `hold:`/lift notes,
