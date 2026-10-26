@@ -56,6 +56,22 @@ class CriticalPolicyDriftTest(ReviewPolicyFixture, unittest.TestCase):
                     two = self.gate(klass, "codex", "claude")
                     self.assertTrue(two["ok"], two["why"])
 
+    def test_paquet_auto_and_inclusion_scripts_are_critical(self):
+        # #3807 : la composition scriptée du paquet entre dans la porte ;
+        # `paquet-auto` et `paquet-inclusion` exigent deux familles, comme
+        # `paquet-candidats`.
+        for path in ("scripts/paquet-auto.py", "scripts/paquet-inclusion.py",
+                     "scripts/paquet-candidats.py"):
+            with self.subTest(path=path):
+                klass = self.classify([path], default="light")
+                self.assertEqual(klass["class"], "light")
+                self.assertEqual(merge_queue.required_verdicts(klass), 2)
+                one = self.gate(klass, "codex")
+                self.assertEqual(one["required"], 2)
+                self.assertFalse(one["ok"])
+                two = self.gate(klass, "codex", "claude")
+                self.assertTrue(two["ok"], two["why"])
+
     def test_light_critical_entry_in_sensitive_lot_still_counts(self):
         klass = self.classify(["src/ameesh/merge_pr.py", "src/ameesh/budget.py"], rules=[
             {"paths": ["src/ameesh/budget.py"], "class": "sensitive"}])

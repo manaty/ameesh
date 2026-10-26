@@ -151,8 +151,10 @@ CRITICAL_SCOPE = (
                # (#2249 ; ligne perdue dans une composition, restaurée #2374)
                r"^src/ameesh/(?:[^/]+/)*(?:merge_pr|lot_class|review\w*|radar|work|train\w*|plan_git|resolutions)\.py$|"
                # ce qui entre dans un paquet : la liste calculée des lots
-               # prêts et ses remises (#2496)
+               # prêts et ses remises (#2496), et la composition scriptée du
+               # paquet (#3807 : auto et inclusion entrent dans la porte)
                r"^src/ameesh/packet_candidates\.py$|^scripts/paquet-candidats\.py$|"
+               r"^scripts/paquet-(?:auto|inclusion)\.py$|"
                # le report des verdicts acquis sur une tête réalignée (#2442)
                r"^src/ameesh/verdict_carry\.py$|"
                # preuve de famille indépendante des avis (#2265)
