@@ -21,7 +21,8 @@ reprise complète le siège manquant sans réinscrire un siège retiré.
 
 #3661 : un siège retiré d'une attente partielle n'est plus lu dans la marque
 `waiting` effective : ni compté, ni réécrit dans la colonne, ni épargné de
-courrier au profit d'un nouveau siège.
+courrier au profit d'un nouveau siège, sur aucun chemin (y compris une
+reprise sans entrées lisibles).
 """
 from __future__ import annotations
 
@@ -321,6 +322,19 @@ class FloorCompletionTest(base._ActivationFixture, PgTestCase):
         self.assertEqual(len(self.marks()), before_marks + 1)
         mark = pg.designation_of(self.marks()[-1])
         self.assertEqual([r["name"] for r in mark["reviewers"]], ["r3"])
+
+    def test_a_removed_partial_seat_stays_out_on_an_unavailable_retry(self):
+        # #3661 (B dev3, 2e tour) : un --apply qui ne peut pas lire ses
+        # entrées (cible non rafraîchie) ne réécrit pas r2 depuis la marque
+        # `waiting` effective.
+        self._partial_wait_then_remove_r2()
+
+        with mock.patch.object(act, "prepare", return_value=act.Unavailable(
+                "simulated target refresh failure")):
+            again = act.reviewers(self.cfg, self.db, self.lot, apply=True)["applied"]
+
+        self.assertEqual(again["state"], "unavailable", again)
+        self.assertEqual(designated(work.get(self.db, self.lot)), [])
 
     def test_a_floor_with_no_available_family_leaves_a_journaled_wait(self):
         # r1 retiré et r2 mort : aucune famille ne peut être pourvue, rien

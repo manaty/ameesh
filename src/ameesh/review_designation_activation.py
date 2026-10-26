@@ -2038,8 +2038,7 @@ def _lock_current_freeze(db, lot: int, freeze: Mapping) -> bool:
         return False
 
 
-def _sync_reviewers(db, item: Mapping, freeze: Mapping, names, *, text: str = "",
-                    removed=()) -> None:
+def _sync_reviewers(db, item: Mapping, freeze: Mapping, names, *, text: str = "") -> None:
     """Makes the automatic designation visible to the gate and to progress.
 
     The journal mark is the authoritative record, but the reviewers read by
@@ -2059,9 +2058,9 @@ def _sync_reviewers(db, item: Mapping, freeze: Mapping, names, *, text: str = ""
     `text`, when given, is the journal line of this sync (a verdict carry keeps
     the reported reviewers instead of designating, #2487).
 
-    `removed` names the seats of this freeze the pilot removed from the column
-    (#3661): a `waiting` effective mark that still names one never writes it
-    back."""
+    #3661: a `waiting` effective mark keeps only its seats still in the column
+    (or named by the caller). A seat the pilot removed is never written back,
+    whatever the path: a selection, a replay, an unavailable or light outcome."""
     from .storage.postgres.work import has_reviewers
 
     if not has_reviewers(db):
@@ -2110,10 +2109,14 @@ def _sync_reviewers(db, item: Mapping, freeze: Mapping, names, *, text: str = ""
     keep = [name for name in current if name not in retired]
     wanted = [str((reviewer or {}).get("name") or "").strip()
               for reviewer in (effective[2].get("reviewers") or () if effective else ())]
+    if (effective is not None and effective[1] != "carried"
+            and effective[2].get("state") == rd.WAITING):
+        # #3661 : les sièges d'une attente sont écrits avec leur marque ; un
+        # siège absent de la colonne a été retiré par le pilote.
+        wanted = [name for name in wanted if name in current]
     wanted.extend(names)
-    gone = {str(name or "").strip() for name in removed or ()}
     for name in wanted:
-        if name and name not in keep and name not in gone:
+        if name and name not in keep:
             keep.append(name)
     if keep == current:
         return
@@ -3000,7 +3003,8 @@ def designate(cfg, db, lot: int, *, freeze: Optional[Mapping] = None,
             # comme la complétion du plancher (B/P1 dev4) : après une attente
             # partielle écrite par le plancher, la reprise passe ici. #3661 :
             # ni comme candidat, ni comme siège acquis de la marque `waiting`
-            # (le port la lit sans eux, `retired`).
+            # (le port la lit sans eux, `retired`) ; `_sync_reviewers` ne le
+            # réécrit sur aucun chemin.
             removed = _removed_seats(db, int(lot), freeze, live)
             if removed:
                 inputs = dataclasses.replace(
@@ -3023,7 +3027,7 @@ def designate(cfg, db, lot: int, *, freeze: Optional[Mapping] = None,
                              force=force)
             names = ([r.get("name") for r in out.get("reviewers") or ()]
                      if out.get("state") in (rd.DESIGNATED, rd.WAITING) else [])
-            _sync_reviewers(tx, item, freeze, names, removed=removed)
+            _sync_reviewers(tx, item, freeze, names)
             try:
                 _notify_superseded_blocks(tx, item, freeze, out, threads)
             except Exception:  # noqa: BLE001 - une notification ne perd rien
