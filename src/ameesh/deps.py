@@ -1364,7 +1364,7 @@ def entries(cache_root: str) -> list[dict]:
 
 def gc_node_modules(cache_root: str, *, now: float | None = None,
                     idle: float = DEFAULT_DEPS_IDLE_S, dry_run: bool = False,
-                    worktrees=None, holders=None) -> list[dict]:
+                    worktrees=None, holders=None, budget=None) -> list[dict]:
     """Delete the entries no worktree links to any more and partial ones left
     by a dead fill. A complete entry goes only after `idle` (at least GRACE_S)
     since its creation, its last link and the last time a link to it was seen
@@ -1374,7 +1374,10 @@ def gc_node_modules(cache_root: str, *, now: float | None = None,
     are the recorded ones plus those found in `worktrees` (an iterable of
     worktree tops, or a callable returning one, called only if an entry is a
     candidate). Lock files are never deleted: two fillers always lock the same
-    inode. Returns housekeeping log lines (`kind` "deps")."""
+    inode. Returns housekeeping log lines (`kind` "deps").
+
+    `budget` (#3802), a `housekeeping.PassBudget`: the loop stops at its next
+    entry when the pass budget is spent, without starting another deletion."""
     now = time.time() if now is None else float(now)
     holders = holders or _holders
     root = nm_root(cache_root)
@@ -1391,6 +1394,8 @@ def gc_node_modules(cache_root: str, *, now: float | None = None,
         return known
 
     for item in entries(cache_root):
+        if budget is not None and budget.expired():
+            break                      # #3802: a bounded host pass
         entry = item["path"]
         if item["temp"]:
             out += _gc_temp(item, root, now=now, holders=holders, dry_run=dry_run)

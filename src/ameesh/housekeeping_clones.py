@@ -564,7 +564,7 @@ def _removal_check(path: str, cfg, rules, allow, roots, agents) -> str:
 
 
 def _remove(path: str, *, cfg, rules, allow, roots, agents, lock_path, journal_path,
-            skip_roots) -> tuple[str, int, str]:
+            skip_roots, budget_s: float | None = None) -> tuple[str, int, str]:
     """Remove one clone under the host lock and trash journal."""
     if not lock_path or not journal_path:
         return "garde", 0, "neither lock nor housekeeping journal"
@@ -573,7 +573,9 @@ def _remove(path: str, *, cfg, rules, allow, roots, agents, lock_path, journal_p
         return "attend", 0, "another pass is deleting on the host"
     try:
         journal = build_artifacts.Journal(journal_path)
-        budget = build_artifacts.Budget(build_artifacts.PASS_BUDGET_S)
+        seconds = build_artifacts.PASS_BUDGET_S if budget_s is None \
+            else max(0.0, min(build_artifacts.PASS_BUDGET_S, float(budget_s)))
+        budget = build_artifacts.Budget(seconds)
         real = _real(path)
         ident = build_artifacts.identity(real)
         parent_id = build_artifacts.identity(os.path.dirname(real))
@@ -604,7 +606,8 @@ def _remove(path: str, *, cfg, rules, allow, roots, agents, lock_path, journal_p
 
 def reap(db, host: str, cfg, *, roots, agents: dict, protected, dry_run: bool,
          now: float, artifacts=None, allow=(), lock_path: str | None = None,
-         journal_path: str | None = None, skip_roots=()) -> tuple[list[dict], list[dict], list[str]]:
+         journal_path: str | None = None, skip_roots=(),
+         budget_s: float | None = None) -> tuple[list[dict], list[dict], list[str]]:
     """Inventory the ad-hoc clones of a host's work roots: (entries, plan, skipped).
 
     `agents` maps a registered agent name to its working directory;
@@ -614,6 +617,8 @@ def reap(db, host: str, cfg, *, roots, agents: dict, protected, dry_run: bool,
     """
     if not roots or not os.path.isdir(cfg.state_dir):
         return [], [], []
+    if budget_s is not None and budget_s <= 0:
+        return [], [], ["clones: pass budget reached, nothing removed"]
     entries: list[dict] = []
     plan: list[dict] = []
     skipped: list[str] = []
@@ -664,7 +669,11 @@ def reap(db, host: str, cfg, *, roots, agents: dict, protected, dry_run: bool,
             dependents, alternates_doubt = _dependents(copies, candidates)
             if alternates_doubt:
                 skipped.append("clones: %s; nothing removed" % alternates_doubt)
-    deadline = time.monotonic() + CLONE_BUDGET_S
+    # #3802 : le passage ne dépasse pas ce qui lui reste, et ne dépasse pas
+    # son propre plafond de clones.
+    seconds = CLONE_BUDGET_S if budget_s is None \
+        else max(0.0, min(CLONE_BUDGET_S, float(budget_s)))
+    deadline = time.monotonic() + seconds
     inspected = 0
     for path in inventory:
         if inspected >= CLONE_LIMIT or time.monotonic() >= deadline:
@@ -816,7 +825,8 @@ def reap(db, host: str, cfg, *, roots, agents: dict, protected, dry_run: bool,
             continue
         outcome, freed, note = _remove(
             path, cfg=cfg, rules=rules, allow=allow, roots=roots, agents=agents,
-            lock_path=lock_path, journal_path=journal_path, skip_roots=skip_roots)
+            lock_path=lock_path, journal_path=journal_path, skip_roots=skip_roots,
+            budget_s=max(0.0, deadline - time.monotonic()))
         if outcome in ("removed", "partial"):
             detail = "%s: %s" % (detail, "removed (logged trash)" if outcome == "removed"
                                 else "partly removed")

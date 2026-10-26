@@ -78,12 +78,15 @@ def _attribution(db, path: str, branch: str, agents: dict, witness: str):
     return witness, None
 
 
-def discover(db, host: str, agents: dict, roots, *, dry_run: bool) -> dict:
+def discover(db, host: str, agents: dict, roots, *, dry_run: bool,
+             budget=None) -> dict:
     """Bounded, shallow inventory; dry run performs no registration or log.
 
     `agents` contains only this host's registered working directories.
     `roots` comes from its Host card, never from a guess about HOME. Git
     lists each known repository once, including siblings outside the roots.
+    `budget` (#3802), a `housekeeping.PassBudget`: the inventory stops at its
+    next step when the pass budget is spent.
     """
     entries, plan, skipped = [], [], []
     deadline = time.monotonic() + DISCOVERY_BUDGET_S
@@ -91,7 +94,8 @@ def discover(db, host: str, agents: dict, roots, *, dry_run: bool) -> dict:
     inspected = 0
 
     def exhausted():
-        return inspected >= DISCOVERY_LIMIT or time.monotonic() >= deadline
+        return (inspected >= DISCOVERY_LIMIT or time.monotonic() >= deadline
+                or (budget is not None and budget.expired()))
 
     def signal(path, detail):
         line = dict(kind="workcopy", path=path, agent=None, lot=None, detail=detail)
@@ -109,7 +113,7 @@ def discover(db, host: str, agents: dict, roots, *, dry_run: bool) -> dict:
         inspected += 1
         if not listed:
             continue
-        repo = hk.common_dir(cwd)
+        repo = hk.common_dir(cwd, budget=budget)
         if not repo:
             continue
         for index, row in enumerate(listed):
@@ -126,13 +130,15 @@ def discover(db, host: str, agents: dict, roots, *, dry_run: bool) -> dict:
     for path, (row, repo, witness) in remaining[:DISCOVERY_LIMIT]:
         if time.monotonic() >= deadline:
             break
-        if _marker(path) != "linked" or not hk.same_repository(path, repo):
+        if _marker(path) != "linked" or not hk.same_repository(path, repo,
+                                                                budget=budget):
             signal(path, "linked worktree no longer matches its repository; kept")
             continue
         # A checkout or recreation can happen after the repository listing.
         # Attribute the current branch, never the old snapshot's lot.
-        head = hk._git(["rev-parse", "--verify", "HEAD"], path)
-        branch = hk._git(["symbolic-ref", "-q", "--short", "HEAD"], path)
+        head = hk._git(["rev-parse", "--verify", "HEAD"], path, budget=budget)
+        branch = hk._git(["symbolic-ref", "-q", "--short", "HEAD"], path,
+                         budget=budget)
         if head is None or head.returncode != 0 or branch is None \
                 or branch.returncode not in (0, 1):
             signal(path, "current worktree references unreadable; kept")

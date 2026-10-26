@@ -176,6 +176,102 @@ OWNER_DETAIL = "owner from the worktree name: %s (lot not proved)"
 WALK_LIMIT = 300_000
 #: délai maximal d'une commande git (secondes)
 GIT_TIMEOUT = 20.0
+#: #3802 : budget d'un passage de ménage sur l'hôte (secondes). Passé ce
+#: plafond, le passage abandonne sa phase au prochain point de contrôle, rend
+#: le verrou `host-pass` et le dit. Sans lui, une phase qui accumule des
+#: appels bornés (822 worktrees × plusieurs `git` à 20 s) tenait le verrou
+#: des heures : agents-2, 26/10, 3 h 17, plus aucun ménage.
+HOST_PASS_BUDGET_S = 15 * 60.0
+#: #3802 : au-delà de ce temps de détention du verrou `host-pass`, un passage
+#: SAUTÉ nomme le détenteur et lève l'alerte `housekeeping_blocked` (un
+#: passage sain rend le verrou à son plafond ; un détenteur plus vieux est
+#: bloqué, ou d'une version qui ne se borne pas).
+HOST_PASS_ALERT_AFTER_S = HOST_PASS_BUDGET_S
+#: #3802 : un blocage constaté n'est re-journalisé qu'à ce rythme, pour que le
+#: journal dise l'épisode sans une ligne par passage sauté.
+HOST_PASS_REFRESH_S = 3600.0
+
+
+class _PassExpired(Exception):
+    """#3802 : the host pass reached its time budget at a checkpoint."""
+
+    def __init__(self, phase: str):
+        super().__init__(phase)
+        self.phase = phase
+
+
+class PassBudget:
+    """The bounded time of one host pass and the trace of its phases (#3802).
+
+    `check(name)` closes the previous phase, raises `_PassExpired` when the
+    budget is gone and otherwise opens the next one; loops call `expired()`
+    themselves and stop. Every external call takes `timeout(cap)`, so no
+    single `git`, `docker` or `systemctl` can outlive the pass. `on_phase`
+    lets the host lock say which phase its holder is in.
+    """
+
+    def __init__(self, seconds: float, clock=time.monotonic, on_phase=None):
+        self.budget = max(0.0, float(seconds))
+        self.clock = clock
+        self.started = clock()
+        self.deadline = self.started + self.budget
+        self.phase = ""
+        self.phase_started: float | None = None
+        self.phases: list[dict] = []
+        self.on_phase = on_phase
+        self.timed_out = False
+        #: lists of the pass (`entries`, `plan`, ...) kept reachable when a
+        #: checkpoint raises out of `_run_pass`
+        self.context: dict = {}
+
+    def remaining(self) -> float:
+        return max(0.0, self.deadline - self.clock())
+
+    def timeout(self, cap: float) -> float:
+        """The delay of one external call: `cap`, never past the budget."""
+        return max(0.0, min(float(cap), self.remaining()))
+
+    def expired(self) -> bool:
+        return self.clock() >= self.deadline
+
+    def check(self, name: str) -> None:
+        """Start phase `name`; raise when the budget is already spent, naming
+        the phase it was spent in (the one that just ended)."""
+        current = self.phase
+        self.close_phase()
+        if self.expired():
+            self.timed_out = True
+            raise _PassExpired(current or name)
+        self.phase = name
+        self.phase_started = self.clock()
+        if self.on_phase is not None:
+            self.on_phase(name)
+
+    def close_phase(self) -> None:
+        if self.phase_started is None:
+            return
+        end = self.clock()
+        self.phases.append({"phase": self.phase,
+                            "seconds": round(max(0.0, end - self.phase_started), 3)})
+        self.phase = ""
+        self.phase_started = None
+
+    def summary(self) -> dict:
+        self.close_phase()
+        return {"budget_s": self.budget,
+                "spent_s": round(max(0.0, self.clock() - self.started), 3),
+                "timed_out": self.timed_out, "phases": list(self.phases)}
+
+
+def _artifact_budget(budget: PassBudget | None):
+    """The `build_artifacts.Budget` of one phase: its own cap, never past
+    the pass's remaining time (#3802)."""
+    seconds = build_artifacts.PASS_BUDGET_S
+    if budget is not None:
+        seconds = min(seconds, budget.remaining())
+    return build_artifacts.Budget(seconds)
+
+
 #: L162: idle time (seconds) after which a /tmp entry signaled with an agent
 #: (before #222) is deleted (`policy.housekeeping.orphan_idle`)
 DEFAULT_ORPHAN_IDLE_S = 2 * 3600.0
@@ -756,12 +852,12 @@ def tmp_lock(troot: str, name: str, *, exclusive: bool, timeout: float = 0.0):
         fh.close()
 
 
-def last_activity(path: str) -> float | None:
+def last_activity(path: str, budget: PassBudget | None = None) -> float | None:
     """Latest mtime or ctime (an extraction keeps old mtimes) of `path` and
     of everything under it, at any depth; None if the walk is incomplete
-    (unreadable entry, mount point, too many entries): what was not seen is
-    never judged idle."""
-    scan = scan_activity(path)
+    (unreadable entry, mount point, too many entries, pass budget reached):
+    what was not seen is never judged idle."""
+    scan = scan_activity(path, budget=budget)
     return float(scan["latest"]) if scan["complete"] and scan["latest"] is not None else None
 
 
@@ -998,7 +1094,7 @@ def _is_mount_point(directory: str, mounts: set | None) -> bool:
 
 def _files(top: str, limit: int | None = None, *, state: dict | None = None,
            protect_git: bool = False, device: int | None = None,
-           mounts: set | None = None):
+           mounts: set | None = None, budget: PassBudget | None = None):
     """(chemin, taille, mtime, stat) des fichiers sous `top`, sans suivre les
     liens ni changer de système de fichiers ; s'arrête à `limit` entrées
     comptées — fichiers rendus ET dossiers à ouvrir (#530) — (défaut
@@ -1052,11 +1148,14 @@ def _files(top: str, limit: int | None = None, *, state: dict | None = None,
         try:
             with os.scandir(current) as it:
                 for entry in it:
-                    if count >= limit:
+                    if count >= limit or (budget is not None and budget.expired()):
                         # #530 : budget épuisé alors que des entrées restent à
-                        # lire : la liste est partielle
+                        # lire : la liste est partielle. #3802 : le budget du
+                        # passage arrête de même un parcours trop long.
                         if state is not None:
                             state["truncated"] = True
+                            if budget is not None and budget.expired():
+                                state["budget_reached"] = True
                             state.setdefault("truncated_paths", []).append(top)
                         return
                     try:
@@ -1087,16 +1186,18 @@ def _files(top: str, limit: int | None = None, *, state: dict | None = None,
             continue
 
 
-def size_of(path: str, limit: int = WALK_LIMIT) -> int:
+def size_of(path: str, limit: int = WALK_LIMIT,
+            budget: PassBudget | None = None) -> int:
     """Octets occupés sous `path` (fichier ou dossier), bornés à `limit`
-    entrées comptées (#530 : fichiers et dossiers) ; 0 si illisible."""
+    entrées comptées (#530 : fichiers et dossiers) et au budget du passage
+    (#3802) ; 0 si illisible, un minimum si le parcours s'arrête."""
     try:
         st = os.lstat(path)
     except OSError:
         return 0
     if not stat.S_ISDIR(st.st_mode):
         return _used_bytes(st)
-    return sum(size for _p, size, _m, _st in _files(path, limit))
+    return sum(size for _p, size, _m, _st in _files(path, limit, budget=budget))
 
 
 def _in_subtree(path: str, directory: str) -> bool:
@@ -1397,7 +1498,7 @@ def _removable(path: str, uid: int | None, writable: dict) -> bool:
 
 def evict_lru(directories: list[str], root: str, quota: int, *, now: float | None = None,
               min_age: float = EVICT_MIN_AGE_S, dry_run: bool = False,
-              evict_at_least: int = 0) -> dict:
+              evict_at_least: int = 0, budget: PassBudget | None = None) -> dict:
     """Éviction du plus ancien (mtime) au plus récent, jusqu'au quota.
 
     Un fichier modifié depuis moins de `min_age` n'est jamais évincé (il est
@@ -1460,7 +1561,7 @@ def evict_lru(directories: list[str], root: str, quota: int, *, now: float | Non
                 "over_quota": False, "unremovable": 0, "worktrees": [],
                 "worktree_symlinks": [], "truncated": False,
                 "truncated_paths": [], "failed": [], "blocked": False,
-                "mounts_unreadable": True}
+                "mounts_unreadable": True, "budget_reached": False}
     scan: dict = {}
     found = []
     for directory in directories:
@@ -1468,7 +1569,7 @@ def evict_lru(directories: list[str], root: str, quota: int, *, now: float | Non
             break                      # the listing is partial: no eviction (below)
         if os.path.isdir(directory) and not os.path.islink(directory):
             found.extend(_files(directory, state=scan, protect_git=True,
-                                device=root_dev, mounts=mounts))
+                                device=root_dev, mounts=mounts, budget=budget))
     before = sum(size for _p, size, _m, _st in found)
     total, evicted, files = before, 0, 0
     unremovable = 0
@@ -1639,7 +1740,8 @@ def evict_lru(directories: list[str], root: str, quota: int, *, now: float | Non
             "over_quota": counted > quota, "unremovable": unremovable,
             "worktrees": worktrees, "worktree_symlinks": symlinks,
             "truncated": truncated, "truncated_paths": scan.get("truncated_paths") or [],
-            "failed": failed, "blocked": blocked, "mounts_unreadable": False}
+            "failed": failed, "blocked": blocked, "mounts_unreadable": False,
+            "budget_reached": bool(scan.get("budget_reached"))}
 
 
 def tmp_episode(db, host: str, path: str, result: dict, *, now: float) -> dict:
@@ -1872,15 +1974,17 @@ def fmt_idle(seconds: float) -> str:
     return "%d s" % seconds
 
 
-def scan_activity(path: str, limit: int = WALK_LIMIT) -> dict:
+def scan_activity(path: str, limit: int = WALK_LIMIT,
+                  budget: PassBudget | None = None) -> dict:
     """Parcours d'une entrée pour juger de son abandon : `bytes`, `latest` (la
     plus récente des dates de modification ET de changement d'état de
     l'entrée et de tout ce qu'elle contient — le ctime parce qu'une archive
     extraite garde les mtimes de l'archive), `complete`, `why`.
 
     Sans suivre les liens ni changer de système de fichiers. Un point de
-    montage dedans, une entrée illisible ou plus de `limit` entrées rendent le
-    parcours incomplet : on ne juge pas ce qu'on n'a pas vu."""
+    montage dedans, une entrée illisible, plus de `limit` entrées ou le budget
+    du passage (#3802) rendent le parcours incomplet : on ne juge pas ce qu'on
+    n'a pas vu."""
     out: dict = {"bytes": 0, "latest": None, "complete": True, "why": ""}
     try:
         top = os.lstat(path)
@@ -1916,6 +2020,10 @@ def scan_activity(path: str, limit: int = WALK_LIMIT) -> dict:
                     if count >= limit:
                         out.update(complete=False, latest=latest,
                                    why="more than %d entries: activity not verifiable" % limit)
+                        return out
+                    if budget is not None and budget.expired():
+                        out.update(complete=False, latest=latest,
+                                   why="time budget of the pass reached")
                         return out
         except OSError:
             out.update(complete=False, why="unreadable directory: %s" % current)
@@ -2351,7 +2459,8 @@ def _orphan_verdict(row: dict, policy: Policy, *, base: str, registered, protect
 
 
 def orphan_pass(db, host: str, policy: Policy, *, registered, protected: set,
-                running: set, dry_run: bool, now: float) -> tuple[list, list, list]:
+                running: set, dry_run: bool, now: float,
+                budget: PassBudget | None = None) -> tuple[list, list, list]:
     """Entrées de /tmp signalées pendant un tour (L162) : (lignes du journal,
     plan lisible, entrées encore présentes avec leur sort).
 
@@ -2373,6 +2482,9 @@ def orphan_pass(db, host: str, policy: Policy, *, registered, protected: set,
     except Exception:
         return entries, plan, present
     for row in rows:
+        if budget is not None and budget.expired():
+            budget.timed_out = True
+            break                      # #3802: a bounded host pass
         path = row.get("path") or ""
         if not path or row.get("action") != "signaled":
             continue
@@ -2441,7 +2553,8 @@ def _owner(uid: int) -> str:
         return str(uid)
 
 
-def tmp_top(base: str | None = None, n: int = TMP_TOP) -> list[dict]:
+def tmp_top(base: str | None = None, n: int = TMP_TOP,
+            budget: PassBudget | None = None) -> list[dict]:
     """Les `n` plus grosses entrées de premier niveau du /tmp du système
     (lecture seule ; taille bornée à `WALK_LIMIT` fichiers par entrée) :
     `path`, `bytes`, `owner`, `mtime`."""
@@ -2459,8 +2572,11 @@ def tmp_top(base: str | None = None, n: int = TMP_TOP) -> list[dict]:
             continue
         if stat.S_ISLNK(st.st_mode):
             continue
-        out.append({"path": full, "bytes": size_of(full), "owner": _owner(st.st_uid),
-                    "mtime": st.st_mtime})
+        if budget is not None and budget.expired():
+            budget.timed_out = True
+            break                      # #3802: a bounded host pass
+        out.append({"path": full, "bytes": size_of(full, budget=budget),
+                    "owner": _owner(st.st_uid), "mtime": st.st_mtime})
     out.sort(key=lambda e: (-e["bytes"], e["path"]))
     return out[:n]
 
@@ -2490,7 +2606,12 @@ def tmpfs_hint(top, policy: Policy) -> str:
 # worktrees
 # --------------------------------------------------------------------------
 
-def _git(args: list[str], cwd: str, timeout: float = GIT_TIMEOUT, env=None):
+def _git(args: list[str], cwd: str, timeout: float = GIT_TIMEOUT, env=None,
+         budget: PassBudget | None = None):
+    if budget is not None:
+        timeout = budget.timeout(timeout)
+        if timeout <= 0.0:
+            return None
     try:
         proc = subprocess.run(["git", "-C", cwd, *args], capture_output=True, text=True,
                               timeout=timeout, env=env)
@@ -2499,12 +2620,13 @@ def _git(args: list[str], cwd: str, timeout: float = GIT_TIMEOUT, env=None):
     return proc
 
 
-def list_worktrees(cwd: str | None) -> list[dict]:
+def list_worktrees(cwd: str | None, budget: PassBudget | None = None) -> list[dict]:
     """Worktrees du dépôt de `cwd` (`git worktree list --porcelain`) ; le
-    premier est le worktree principal. Vide si `cwd` n'est pas un dépôt."""
+    premier est le worktree principal. Vide si `cwd` n'est pas un dépôt ou si
+    le budget du passage (#3802) est épuisé."""
     if not cwd or not os.path.isdir(cwd):
         return []
-    proc = _git(["worktree", "list", "--porcelain"], cwd)
+    proc = _git(["worktree", "list", "--porcelain"], cwd, budget=budget)
     if proc is None or proc.returncode != 0:
         return []
     out: list[dict] = []
@@ -2532,46 +2654,50 @@ def list_worktrees(cwd: str | None) -> list[dict]:
     return out
 
 
-def common_dir(cwd: str) -> str:
-    proc = _git(["rev-parse", "--git-common-dir"], cwd)
+def common_dir(cwd: str, budget: PassBudget | None = None) -> str:
+    proc = _git(["rev-parse", "--git-common-dir"], cwd, budget=budget)
     if proc is None or proc.returncode != 0 or not proc.stdout.strip():
         return ""
     return os.path.abspath(os.path.join(cwd, proc.stdout.strip()))
 
 
-def same_repository(path: str, repo: str) -> bool:
+def same_repository(path: str, repo: str,
+                    budget: PassBudget | None = None) -> bool:
     """#2180: `path` is a worktree of `repo`, whichever form the record kept
     (common dir from `common_dir`, or top level) and through symlinks."""
-    here = common_dir(path)
-    there = common_dir(repo) if repo and os.path.isdir(repo) else ""
+    here = common_dir(path, budget=budget)
+    there = common_dir(repo, budget=budget) if repo and os.path.isdir(repo) else ""
     return bool(here and there) and _real(here) == _real(there)
 
 
-def _scratch_merge_tree(path: str, ref: str):
+def _scratch_merge_tree(path: str, ref: str, budget: PassBudget | None = None):
     """`git merge-tree --write-tree ref HEAD` whose new objects go to a
     scratch directory (the repository's objects as alternates), deleted
     afterwards: nothing is written in `.git` (L230, like the radar)."""
     import tempfile
-    objects = _git(["rev-parse", "--path-format=absolute", "--git-path", "objects"], path)
+    objects = _git(["rev-parse", "--path-format=absolute", "--git-path", "objects"], path,
+                   budget=budget)
     if objects is None or objects.returncode != 0 or not objects.stdout.strip():
         return None
     scratch = tempfile.mkdtemp(prefix="ameesh-menage-merge-")
     try:
         env = dict(os.environ, GIT_OBJECT_DIRECTORY=scratch,
                    GIT_ALTERNATE_OBJECT_DIRECTORIES=objects.stdout.strip())
-        return _git(["merge-tree", "--write-tree", ref, "HEAD"], path, env=env)
+        return _git(["merge-tree", "--write-tree", ref, "HEAD"], path, env=env,
+                    budget=budget)
     finally:
         shutil.rmtree(scratch, ignore_errors=True)
 
 
-def ignored_leftovers(path: str, rules=()) -> list[str] | None:
+def ignored_leftovers(path: str, rules=(), budget: PassBudget | None = None
+                      ) -> list[str] | None:
     """L230: what `git status --ignored` lists in the worktree (modified,
     untracked or ignored; a directory with nothing tracked inside as one
     line), except the directories of the build output `rules` (none:
     nothing is exempt). An ignored `.env` or dataset that removing the
     worktree would delete. None if git cannot say."""
     proc = _git(["--no-optional-locks", "status", "--porcelain", "--ignored",
-                 "--untracked-files=normal"], path)
+                 "--untracked-files=normal"], path, budget=budget)
     if proc is None or proc.returncode != 0:
         return None
     out = []
@@ -2588,23 +2714,24 @@ def ignored_leftovers(path: str, rules=()) -> list[str] | None:
     return out
 
 
-def _default_remote_ref(path: str) -> str:
+def _default_remote_ref(path: str, budget: PassBudget | None = None) -> str:
     """Branche principale du dépôt distant (`origin/HEAD`, sinon `origin/main`,
     sinon `origin/master`) ; vide si aucune n'existe."""
-    upstream = _git(["rev-parse", "--abbrev-ref", "origin/HEAD"], path)
+    upstream = _git(["rev-parse", "--abbrev-ref", "origin/HEAD"], path, budget=budget)
     candidates = []
     if upstream is not None and upstream.returncode == 0 and upstream.stdout.strip() \
             and upstream.stdout.strip() != "origin/HEAD":
         candidates.append(upstream.stdout.strip())
     candidates += ["origin/main", "origin/master"]
     for ref in candidates:
-        found = _git(["rev-parse", "--verify", "--quiet", ref + "^{commit}"], path)
+        found = _git(["rev-parse", "--verify", "--quiet", ref + "^{commit}"], path,
+                     budget=budget)
         if found is not None and found.returncode == 0:
             return ref
     return ""
 
 
-def worktree_state(path: str) -> dict:
+def worktree_state(path: str, budget: PassBudget | None = None) -> dict:
     """État d'un worktree pour son retrait : `exists`, `clean`, `pushed` (HEAD
     sur une branche distante), `integrated` (HEAD contenu dans la branche
     principale distante, ou intégré par rebase), `locked` (`git worktree
@@ -2619,42 +2746,44 @@ def worktree_state(path: str) -> dict:
     if not out["exists"]:
         out["reason"] = "directory gone"
         return out
-    gitdir = _git(["rev-parse", "--absolute-git-dir"], path)
+    gitdir = _git(["rev-parse", "--absolute-git-dir"], path, budget=budget)
     if gitdir is not None and gitdir.returncode == 0 and gitdir.stdout.strip():
         out["gitdir"] = gitdir.stdout.strip()
         out["locked"] = os.path.exists(os.path.join(out["gitdir"], "locked"))
     out["submodules"] = submodules(path, out["gitdir"])
     # L230: never a write in .git (no index refresh), dry run or not
     status = _git(["--no-optional-locks", "status", "--porcelain", "--untracked-files=normal"],
-                  path)
+                  path, budget=budget)
     if status is None or status.returncode != 0:
         out["reason"] = "git status unreadable"
         return out
     dirty = [line for line in status.stdout.splitlines() if line.strip()]
     out["clean"] = not dirty
-    head = _git(["rev-parse", "HEAD"], path)
+    head = _git(["rev-parse", "HEAD"], path, budget=budget)
     out["head"] = head.stdout.strip() if head is not None and head.returncode == 0 else ""
-    branch = _git(["symbolic-ref", "-q", "--short", "HEAD"], path)
+    branch = _git(["symbolic-ref", "-q", "--short", "HEAD"], path, budget=budget)
     out["branch"] = branch.stdout.strip() if branch is not None and branch.returncode == 0 else ""
-    remote = _git(["for-each-ref", "--contains", "HEAD", "--count=1", "refs/remotes"], path)
+    remote = _git(["for-each-ref", "--contains", "HEAD", "--count=1", "refs/remotes"],
+                  path, budget=budget)
     out["pushed"] = bool(remote is not None and remote.returncode == 0 and remote.stdout.strip())
-    ref = _default_remote_ref(path) if out["head"] else ""
+    ref = _default_remote_ref(path, budget=budget) if out["head"] else ""
     if ref:
-        ancestor = _git(["merge-base", "--is-ancestor", "HEAD", ref], path)
+        ancestor = _git(["merge-base", "--is-ancestor", "HEAD", ref], path,
+                        budget=budget)
         if ancestor is not None and ancestor.returncode == 0:
             out["integrated"] = True
         else:
             # Intégré par rebase : chaque commit propre a un équivalent sur la
             # branche principale du dépôt distant (`git cherry` : lignes « - »).
-            cherry = _git(["cherry", ref, "HEAD"], path)
+            cherry = _git(["cherry", ref, "HEAD"], path, budget=budget)
             if cherry is not None and cherry.returncode == 0:
                 lines = [line for line in cherry.stdout.splitlines() if line.strip()]
                 out["integrated"] = all(line.startswith("-") for line in lines)
         if not out["integrated"]:
             # Fusion par écrasement (squash) : fusionner HEAD dans la branche
             # principale ne changerait rien (`git merge-tree`, git ≥ 2.38).
-            merged = _scratch_merge_tree(path, ref)
-            tree = _git(["rev-parse", ref + "^{tree}"], path)
+            merged = _scratch_merge_tree(path, ref, budget=budget)
+            tree = _git(["rev-parse", ref + "^{tree}"], path, budget=budget)
             if merged is not None and merged.returncode == 0 and tree is not None \
                     and tree.returncode == 0 and merged.stdout.strip():
                 out["integrated"] = (merged.stdout.split()[0] == tree.stdout.strip())
@@ -2942,22 +3071,23 @@ def _blocked_by_holders(blocked: dict, detail: str) -> None:
     blocked.setdefault("detail", detail)
 
 
-def current_branch(path: str) -> tuple[bool, str]:
+def current_branch(path: str, budget: PassBudget | None = None) -> tuple[bool, str]:
     """(lisible, branche) de HEAD du worktree, "" s'il est détaché.
 
     Un Git indisponible, ou un chemin qui n'est pas un worktree, est un
     doute : False, l'appelant garde le worktree au lieu de l'attribuer sur la
     branche enregistrée, qui peut être périmée (#3266, relecture cx3)."""
-    proc = _git(["symbolic-ref", "-q", "--short", "HEAD"], path)
+    proc = _git(["symbolic-ref", "-q", "--short", "HEAD"], path, budget=budget)
     if proc is None or proc.returncode not in (0, 1):
         return False, ""
     return True, proc.stdout.strip() if proc.returncode == 0 else ""
 
 
-def remove_worktree(path: str, repo: str) -> tuple[bool, str]:
+def remove_worktree(path: str, repo: str,
+                    budget: PassBudget | None = None) -> tuple[bool, str]:
     """`git worktree remove` (jamais `--force`), lancé depuis le dépôt commun."""
     base = repo if repo and os.path.isdir(repo) else path
-    proc = _git(["worktree", "remove", path], base)
+    proc = _git(["worktree", "remove", path], base, budget=budget)
     if proc is None:
         return False, "git unavailable"
     if proc.returncode != 0:
@@ -2979,9 +3109,9 @@ def delete_merged_branch(branch: str, repo: str) -> str:
     return "branch %s deleted (merged)" % branch
 
 
-def prune_worktrees(repo: str) -> None:
+def prune_worktrees(repo: str, budget: PassBudget | None = None) -> None:
     if repo and os.path.isdir(repo):
-        _git(["worktree", "prune"], repo)
+        _git(["worktree", "prune"], repo, budget=budget)
 
 
 def _other_agent_cwds(db, agent: str):
@@ -3172,7 +3302,7 @@ class Turn:
 # un passage (exécuteur périodique, ou `ameesh menage`)
 # --------------------------------------------------------------------------
 
-def measure(cfg, policy: Policy) -> dict:
+def measure(cfg, policy: Policy, budget: PassBudget | None = None) -> dict:
     """Occupation des dossiers gérés et du /tmp du système (lecture seule).
 
     L162 : dès que le /tmp en tmpfs atteint l'alerte (ou le seuil de pression
@@ -3182,14 +3312,20 @@ def measure(cfg, policy: Policy) -> dict:
     agents: dict = {}
     if os.path.isdir(troot):
         for name in sorted(os.listdir(troot)):
+            if budget is not None and budget.expired():
+                budget.timed_out = True
+                break                  # #3802: a bounded host pass
             full = os.path.join(troot, name)
             if name != MARKER and os.path.isdir(full) and not os.path.islink(full):
-                agents[name] = size_of(full)
+                agents[name] = size_of(full, budget=budget)
     caches: dict = {}
     for name, _vars in cache_names(policy):
+        if budget is not None and budget.expired():
+            budget.timed_out = True
+            break                      # #3802: a bounded host pass
         full = os.path.join(croot, name)
         if os.path.isdir(full):
-            caches[name] = size_of(full)
+            caches[name] = size_of(full, budget=budget)
     system = resources_mod.fs_usage(resources_mod.system_tmp())
     fraction = resources_mod.tmpfs_fraction(system)
     seuil = min(policy.tmpfs_alert, resources_mod.DEFAULT_MAX_TMPFS_USED)
@@ -3202,7 +3338,8 @@ def measure(cfg, policy: Policy) -> dict:
         "cache_quota": policy.cache_quota,
         "system_tmp": system,
         "system_tmp_fraction": fraction,
-        "system_tmp_top": tmp_top() if fraction is not None and fraction >= seuil else [],
+        "system_tmp_top": (tmp_top(budget=budget)
+                           if fraction is not None and fraction >= seuil else []),
         "tmpfs_alert": policy.tmpfs_alert,
     }
 
@@ -3310,7 +3447,8 @@ def _worktree_pass(db, host: str, *, dry_run: bool,
                    allow=(), lock_path: str | None = None, journal_path: str | None = None,
                    skip_roots=(), known_agents=(),
                    blocked: dict | None = None,
-                   archive: dict | None = None) -> tuple[list[dict], list[dict]]:
+                   archive: dict | None = None,
+                   budget: PassBudget | None = None) -> tuple[list[dict], list[dict]]:
     """Fin de lot des worktrees suivis : (lignes du journal, plan lisible).
 
     Garde-fous (L73b) avant tout retrait : worktree attribué à l'agent du
@@ -3361,6 +3499,15 @@ def _worktree_pass(db, host: str, *, dry_run: bool,
     # read never reached the newer ones (17/10: 822 on agents-1, 789 on
     # agents-2, 1 309 on the workstation)
     for row in store.worktrees(host, ("active", "kept"), limit=None):
+        if budget is not None and budget.expired():
+            # #3802 : le budget du passage s'arrête ici ; le prochain passage
+            # reprend les worktrees restants (le budget est reparti de zéro).
+            budget.timed_out = True
+            plan.append({"kind": "worktree", "path": "", "agent": None, "lot": None,
+                         "action": "attend",
+                         "detail": "pass budget reached: remaining worktrees left "
+                                   "for the next pass"})
+            break
         path, lot = row["path"], row.get("lot")
         branch = row.get("branch") or ""
         branch_checked = False
@@ -3372,7 +3519,7 @@ def _worktree_pass(db, host: str, *, dry_run: bool,
         if not os.path.isdir(path):
             plan.append(dict(base, action="disparu", detail=UNATTRIBUTED))
             if not dry_run:
-                prune_worktrees(row.get("repo") or "")
+                prune_worktrees(row.get("repo") or "", budget=budget)
                 store.set_worktree_status(row["id"], "gone",
                                           "directory gone (%s)" % UNATTRIBUTED)
                 entries.append(dict(base, action="gone", detail="directory gone; "
@@ -3396,7 +3543,7 @@ def _worktree_pass(db, host: str, *, dry_run: bool,
             # worktree change de branche après la découverte (`topic` puis
             # `lot/432`). Relire la branche ACTUELLE avant toute attribution ;
             # illisible = doute, on garde (#3266, relecture cx3).
-            readable, branch = current_branch(path)
+            readable, branch = current_branch(path, budget=budget)
             branch_checked = True
             if not readable:
                 plan.append(dict(base, action="garde",
@@ -3508,7 +3655,7 @@ def _worktree_pass(db, host: str, *, dry_run: bool,
         # n'attribuait jamais, n'avait rien à relire : ce garde protège
         # l'attribution persistée, il ne change pas la règle de fin de lot.
         if not branch_checked:
-            readable, branch = current_branch(path)
+            readable, branch = current_branch(path, budget=budget)
             if not readable:
                 plan.append(dict(base, action="garde",
                                  detail="current branch unreadable; kept"))
@@ -3536,15 +3683,16 @@ def _worktree_pass(db, host: str, *, dry_run: bool,
         # #2180: a reused tracked path may now be a clone, a symlink or a
         # worktree of another repository. Old metadata never authorises it.
         from .housekeeping_discovery import _marker
-        if _marker(path) != "linked" or not same_repository(path, row.get("repo") or ""):
+        if _marker(path) != "linked" or not same_repository(
+                path, row.get("repo") or "", budget=budget):
             plan.append(dict(base, action="garde",
                              detail="linked worktree no longer matches its tracked repository"))
             continue
-        st = worktree_state(path)
+        st = worktree_state(path, budget=budget)
         if not st["exists"]:
             plan.append(dict(base, action="disparu", detail=why))
             if not dry_run:
-                prune_worktrees(row.get("repo") or "")
+                prune_worktrees(row.get("repo") or "", budget=budget)
                 store.set_worktree_status(row["id"], "gone", "directory gone (%s)" % why)
                 entries.append(dict(base, action="gone", detail="directory gone; "
                                     "git worktree prune (%s)" % why))
@@ -3591,12 +3739,13 @@ def _worktree_pass(db, host: str, *, dry_run: bool,
             if idle_before is not None:
                 activity = build_artifacts.survey(path, build_artifacts.rules_of(artifacts),
                     skip_roots=skip_roots,
-                    budget=build_artifacts.Budget(build_artifacts.PASS_BUDGET_S))
+                    budget=_artifact_budget(budget))
                 if not activity["complete"] or activity["latest"] > idle_before:
                     plan.append(dict(base, action="garde", detail="%s; %s" % (
                         detail, activity["why"] or "worktree active within 24 h")))
                     continue
-            leftovers = ignored_leftovers(path, build_artifacts.rules_of(artifacts))
+            leftovers = ignored_leftovers(path, build_artifacts.rules_of(artifacts),
+                                          budget=budget)
             if leftovers is None:
                 hold = "ignored files unreadable (git status --ignored)"
             elif leftovers:
@@ -3636,11 +3785,12 @@ def _worktree_pass(db, host: str, *, dry_run: bool,
                 why, "kept for more than 24 h" if grace else "idle for more than 24 h")
             if dry_run:
                 size, _whole = build_artifacts.size_of(
-                    path, budget=build_artifacts.Budget(build_artifacts.PASS_BUDGET_S))
+                    path, budget=_artifact_budget(budget))
                 plan.append(dict(base, action="retrait", bytes=size, detail=why))
                 continue
             outcome, freed, note, built = _remove_kept_worktree(
-                path, row.get("repo") or common_dir(path), st["gitdir"], artifacts=artifacts,
+                path, row.get("repo") or common_dir(path, budget=budget), st["gitdir"],
+                artifacts=artifacts,
                 allow=allow,
                 lock_path=lock_path, journal_path=journal_path, skip_roots=skip_roots,
                 idle_before=idle_before)
@@ -3689,7 +3839,7 @@ def _worktree_pass(db, host: str, *, dry_run: bool,
         plan.append(dict(base, action="retrait", bytes=size, detail=why))
         if dry_run:
             continue
-        ok, error = remove_worktree(path, row.get("repo") or "")
+        ok, error = remove_worktree(path, row.get("repo") or "", budget=budget)
         if ok:
             store.set_worktree_status(row["id"], "removed", why)
             branch_note = delete_merged_branch(st["branch"], row.get("repo") or "") \
@@ -3829,7 +3979,8 @@ def _shared_roots() -> tuple:
 
 def _artifact_pass(db, host: str, policy: Policy, *, cwd_of: dict, dry_run: bool,
                    now: float, skip_roots=(), lock_path: str | None = None,
-                   journal_path: str | None = None, running=(), known_agents=()) -> dict:
+                   journal_path: str | None = None, running=(), known_agents=(),
+                   budget: PassBudget | None = None) -> dict:
     """L230: the worktrees of the repositories of the registered agents (and
     the tracked ones), their build artifacts deleted once idle; in a thread
     at the lowest priority, one worktree at a time.
@@ -3882,23 +4033,31 @@ def _artifact_pass(db, host: str, policy: Policy, *, cwd_of: dict, dry_run: bool
                 return "lot #%d %s" % (ident, states[ident])
         return ""
 
+    def listed(seed: str) -> list[dict]:
+        return list_worktrees(seed, budget=budget)
+
     def candidates() -> list[dict]:
-        found = build_artifacts.worktrees(seeds, list_worktrees)
+        found = build_artifacts.worktrees(seeds, listed)
         main_of.update((_real(wt["path"]), _real(wt["main"])) for wt in found)
         return found
 
     seeds = list(cwd_of.values()) + [row["path"] for row in tracked]
     skip = tuple(skip_roots) + _shared_roots()
+    seconds = build_artifacts.PASS_BUDGET_S
+    if budget is not None:
+        seconds = min(seconds, budget.remaining())
     return build_artifacts.gently(
         lambda: build_artifacts.run(
             candidates(), rules,
             idle_s=policy.artifact_idle, protected=list(cwd_of.values()), skip_roots=skip,
             owner_of=owner_of, keep=keep, dry_run=dry_run, now=now,
-            allow=policy.unreadable_ok, lock_path=lock_path, journal_path=journal_path))
+            allow=policy.unreadable_ok, lock_path=lock_path, journal_path=journal_path,
+            budget_s=seconds))
 
 
 def reap_containers(runtime, db, host: str, *, dry_run: bool = False,
-                    only_turn: str | None = None) -> dict:
+                    only_turn: str | None = None,
+                    budget: PassBudget | None = None) -> dict:
     """Conteneurs de l'hôte (L73) : ceux qu'un tour d'ameesh a lancés
     (étiquette `ameesh.turn`) sont supprimés une fois leur tour fini — ou,
     s'ils portent `ameesh.lot`, une fois le lot fini ; les autres sont
@@ -3934,6 +4093,9 @@ def reap_containers(runtime, db, host: str, *, dry_run: bool = False,
     ours, others, others_total = [], [], 0
     turns = storage.of(db).turn_resources
     for c in rows:
+        if budget is not None and budget.expired():
+            budget.timed_out = True
+            break                      # #3802: a bounded host pass
         labels = c.get("labels") or {}
         turn = labels.get("ameesh.turn")
         ref = c.get("name") or c.get("id", "")[:12]
@@ -4011,7 +4173,7 @@ def _volume_episode(previous: dict | None, created: float | None) -> float | Non
 
 
 def reap_volumes(runtime, db, host: str, policy: Policy, *, dry_run: bool = False,
-                 now: float | None = None) -> dict:
+                 now: float | None = None, budget: PassBudget | None = None) -> dict:
     """Volumes Docker de l'hôte (L73/#2003) : récolte les volumes SANS
     conteneur (arrêtés compris, `volume ls --filter dangling=true`) dont le
     mesh a DÉCLARÉ le cycle de vie jetable — l'étiquette `ameesh.bench`
@@ -4072,6 +4234,9 @@ def reap_volumes(runtime, db, host: str, policy: Policy, *, dry_run: bool = Fals
 
     declared = []
     for row in all_rows:
+        if budget is not None and budget.expired():
+            budget.timed_out = True
+            break                      # #3802: a bounded host pass
         label = (row.get("labels") or {}).get(containers_mod.BENCH_LABEL)
         if label is None:
             continue
@@ -4082,6 +4247,9 @@ def reap_volumes(runtime, db, host: str, policy: Policy, *, dry_run: bool = Fals
                    "labelled %s=%s: not declared disposable by the mesh"
                    % (containers_mod.BENCH_LABEL, label))
     for row in dangling_rows:
+        if budget is not None and budget.expired():
+            budget.timed_out = True
+            break                      # #3802: a bounded host pass
         labels = row.get("labels") or {}
         if containers_mod.BENCH_LABEL in labels:
             continue                    # déclaré (plus bas) ou déjà signalé
@@ -4105,6 +4273,9 @@ def reap_volumes(runtime, db, host: str, policy: Policy, *, dry_run: bool = Fals
     if stamps is None:                  # inspection illisible : aucune identité
         stamps = {}
     for row in declared:
+        if budget is not None and budget.expired():
+            budget.timed_out = True
+            break                      # #3802: a bounded host pass
         name = row["name"]
         base = {"kind": "volume", "path": name}
         stamp = stamps.get(name)
@@ -4215,7 +4386,8 @@ def dsh_scope_verdict(scope: dict, row: dict | None, host: str,
 
 
 def reap_dsh_scopes(db, host: str, *, dry_run: bool = False, now: float | None = None,
-                    scan=None, terminate=None) -> dict:
+                    scan=None, terminate=None,
+                    budget: PassBudget | None = None) -> dict:
     """#3226 : les scopes systemd `dsh-subprocess-*` laissés par un tour clos
     (dsh sans la garde #490) sont tués — SIGTERM, puis SIGKILL — après
     `DSH_SCOPE_GRACE_S`, par pidfd, journalisés (`dsh_scope`, `killed`) ; ceux qu'on ne
@@ -4241,6 +4413,9 @@ def reap_dsh_scopes(db, host: str, *, dry_run: bool = False, now: float | None =
     last = {row["path"]: row for row in hk.latest_by_path(host, "dsh_scope")}
     seen = set()
     for scope in scopes:
+        if budget is not None and budget.expired():
+            budget.timed_out = True
+            break                      # #3802: a bounded host pass
         unit = (scope or {}).get("unit") or ""
         seen.add(unit)
         try:
@@ -4304,20 +4479,24 @@ def reap_dsh_scopes(db, host: str, *, dry_run: bool = False, now: float | None =
 
 
 def tmp_problem(path: str, owner: str | None, key: str, *, registered: bool,
-                idle_after: float, now: float) -> str:
+                idle_after: float, now: float,
+                budget: PassBudget | None = None) -> str:
     """L219: why the pass keeps the temporary directory `path` of an agent
     not in turn, empty if it may evict (`registered`) or delete it. Another
     mesh's is never touched; one without owner file (another mesh sharing
     the state directory, or before L219) only after `UNOWNED_IDLE_S`
     without any activity; this mesh's of an agent ABSENT from the registry
-    after `idle_after` (a turn writes in it)."""
+    after `idle_after` (a turn writes in it).
+
+    #3802 : `budget` borne le parcours d'activité ; une échéance atteinte
+    rend le dossier « non jugeable » (gardé), jamais idle."""
     if owner is not None and owner != key:
         return "belongs to another mesh"
     if owner is not None and registered:
         return ""
-    latest = last_activity(path)
+    latest = last_activity(path, budget=budget)
     if latest is None:
-        return "activity unreadable (incomplete walk)"
+        return "activity unreadable (incomplete walk or pass budget)"
     idle = now - latest
     if owner is None and idle < UNOWNED_IDLE_S:
         return "no owner (another mesh on this machine, or older than L219), " \
@@ -4327,11 +4506,80 @@ def tmp_problem(path: str, owner: str | None, key: str, *, registered: bool,
     return ""
 
 
+#: #3802 : action of the journal line that names a blocked host pass
+HOST_PASS_KIND = "host_pass"
+
+
+def host_pass_lock(cfg) -> str:
+    """The stable path of the host-wide housekeeping lock (#3802)."""
+    return os.path.join(cfg.state_dir, MANAGED_DIR, "host-pass.lock")
+
+
+def _host_pass_block_line(cfg, host: str, holder: dict, now: float,
+                          reason: str) -> dict:
+    """The journal line of a pass skipped behind a too-old holder (#3802):
+    pid, runner and since, never the holder's argv (#3403)."""
+    since = holder.get("since")
+    return {"kind": HOST_PASS_KIND, "action": "blocked", "path": host_pass_lock(cfg),
+            "bytes": 0, "detail": reason,
+            "data": {"pid": holder.get("pid"), "runner": holder.get("runner") or "",
+                     "since": since, "host": host,
+                     "phase": holder.get("phase") or "",
+                     "source": holder.get("source") or "",
+                     "first_seen": since, "at": now}}
+
+
+def _report_host_pass_blocked(db, cfg, host: str, actor: str, holder: dict,
+                              now: float, reason: str) -> None:
+    """Journal a blocked host pass, at most once per holder and per
+    `HOST_PASS_REFRESH_S`; never raises (a blocked pass has no other voice)."""
+    try:
+        store = storage.of(db).housekeeping
+        path = host_pass_lock(cfg)
+        previous = next((row for row in store.latest_by_path(host, HOST_PASS_KIND)
+                         if row.get("path") == path), None)
+        if previous is not None and previous.get("action") == "blocked":
+            data = previous.get("data") or {}
+            same = (data.get("pid") == holder.get("pid")
+                    and data.get("since") == holder.get("since"))
+            age = now - float(previous.get("at_ts") or 0)
+            if same and age < HOST_PASS_REFRESH_S:
+                return
+        line = _host_pass_block_line(cfg, host, holder, now, reason)
+        if previous is not None and previous.get("action") == "blocked":
+            old = (previous.get("data") or {}).get("first_seen")
+            line["data"]["first_seen"] = old or line["data"]["first_seen"]
+        store.log(host, [line], actor=actor)
+    except Exception:  # noqa: BLE001 - a diagnostic line never breaks a pass
+        pass
+
+
+def _timed_out_report(host: str, dry_run: bool, budget: PassBudget,
+                      phase: str) -> dict:
+    """#3802 : the report of a pass stopped by its own budget. The lists of
+    `_run_pass` are read through `budget.context` (they were mutated in
+    place), so what the pass did before stopping is still journaled."""
+    context = budget.context or {}
+    entries = list(context.get("entries") or ())
+    plan = list(context.get("plan") or ())
+    skipped = list(context.get("skipped") or ())
+    unowned = list(context.get("unowned") or ())
+    orphans = list(context.get("orphans") or ())
+    note = ("pass budget of %ds reached in phase %r: phase abandoned, host lock "
+            "released" % (round(budget.budget), phase))
+    skipped.append(note)
+    summary = budget.summary()
+    return {"host": host, "dry_run": dry_run, "status": "timed_out",
+            "timed_out": True, "phase": phase, "budget": summary,
+            "entries": entries, "plan": plan, "skipped": skipped,
+            "orphans": orphans, "unowned": unowned, "measure": None}
+
+
 def run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool = False,
              busy: bool = False, agents_in_turn: set | None = None,
              now: float | None = None,
              runtime=None, artifact_scan: bool = True, min_interval_s: float = 0.0,
-             free_target: int = 0) -> dict:
+             free_target: int = 0, budget_s: float | None = None) -> dict:
     """One host pass across all runners and the CLI, without waiting.
 
     Periodic callers share the last completed pass's timestamp, under the
@@ -4343,30 +4591,77 @@ def run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool = 
     should keep — the host's `min_disk_free`, the pause threshold. Under it,
     the caches are evicted enough to free the deficit, the npm cache even
     during a turn when no npm runs.
+
+    #3802: `budget_s` bounds the pass (default `HOST_PASS_BUDGET_S`). Past
+    it, the pass stops at its next checkpoint, releases `host-pass.lock` and
+    reports `status: "timed_out"`; a caller woken by a lock it finds held
+    past `HOST_PASS_ALERT_AFTER_S` journals a `host_pass` blocked line that
+    names the holder (pid, runner, since) — the alert `housekeeping_blocked`
+    reads it. The lock file carries the holder record while held, and never
+    after the pass (a dead holder releases the flock in the OS anyway).
     """
     from .platform import session_lock
 
-    def skipped(reason):
+    lock_dir = os.path.join(cfg.state_dir, MANAGED_DIR)
+    lock_path = host_pass_lock(cfg)
+    tick = time.time() if now is None else float(now)
+    budget_s = HOST_PASS_BUDGET_S if budget_s is None else float(budget_s)
+
+    def skipped(reason, holder=None):
         # #2173: a pass that did not run must not read as executed. The
         # dedicated `status` lets the report (and `--json`) tell a skipped
         # pass from an empty one, without touching the lock itself.
-        return {"host": host, "dry_run": dry_run, "status": "skipped",
-                "entries": [], "plan": [], "skipped": [reason], "orphans": [],
-                "unowned": [], "measure": None}
+        report = {"host": host, "dry_run": dry_run, "status": "skipped",
+                  "entries": [], "plan": [], "skipped": [reason], "orphans": [],
+                  "unowned": [], "measure": None}
+        if holder is not None:
+            report["holder"] = holder
+            age = None
+            try:
+                age = max(0.0, tick - float(holder.get("since")))
+            except (TypeError, ValueError):
+                age = None
+            if age is not None:
+                report["held_s"] = round(age, 3)
+                if age >= HOST_PASS_ALERT_AFTER_S:
+                    report["blocked"] = dict(holder, age_s=round(age, 3))
+        return report
 
-    lock = session_lock.try_lock(os.path.join(cfg.state_dir, MANAGED_DIR), "host-pass")
+    lock = session_lock.try_lock(lock_dir, "host-pass")
     if lock is None:
-        return skipped("another housekeeping pass is running on this host")
+        holder = session_lock.holder(lock_dir, "host-pass")
+        if holder is not None:
+            age = None
+            try:
+                age = max(0.0, tick - float(holder.get("since")))
+            except (TypeError, ValueError):
+                age = None
+            if age is not None and age >= HOST_PASS_ALERT_AFTER_S:
+                reason = ("another housekeeping pass is running on this host: "
+                          "host-pass lock held by %s (pid %s) for %s"
+                          % (holder.get("runner") or "?",
+                             holder.get("pid") if holder.get("pid") is not None else "?",
+                             fmt_idle(age)))
+                _report_host_pass_blocked(db, cfg, host, actor, holder, tick, reason)
+                return skipped("another housekeeping pass is running on this host",
+                               holder)
+        return skipped("another housekeeping pass is running on this host", holder)
+
+    state = session_lock.read_content(lock)
+    holder = {"pid": os.getpid(), "runner": actor or "", "since": tick,
+              "host": host, "phase": "", "phase_since": tick, "source": "lock"}
+
+    def on_phase(name: str) -> None:
+        # the lock names the phase its holder is in: what a skipped pass —
+        # and its alert — can say beyond the pid (#3802)
+        holder["phase"] = name
+        holder["phase_since"] = time.time()
+        state[session_lock.HOLDER_KEY] = holder
+        session_lock.write_content(lock, state)
+
     try:
-        tick = time.time() if now is None else float(now)
         key = mesh_key(cfg)
-        try:
-            lock.seek(0)
-            completed_passes = json.loads(lock.read())
-            if not isinstance(completed_passes, dict):
-                completed_passes = {}
-        except ValueError:
-            completed_passes = {}
+        completed_passes = state
         if min_interval_s > 0:
             try:
                 elapsed = tick - float(completed_passes[key])
@@ -4375,26 +4670,47 @@ def run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool = 
             if 0 <= elapsed < min_interval_s:
                 return skipped("housekeeping already ran on this host less than %gs ago"
                                % min_interval_s)
-        report = _run_pass(cfg, db, policy, host=host, actor=actor, dry_run=dry_run,
-                           busy=busy, agents_in_turn=agents_in_turn, now=now,
-                           runtime=runtime, artifact_scan=artifact_scan,
-                           free_target=free_target)
-        if not dry_run and not report.get("disabled"):
-            completed_passes[key] = time.time() if now is None else float(now)
-            lock.seek(0)
-            lock.truncate()
-            lock.write(json.dumps(completed_passes).encode("ascii"))
-            lock.flush()
+        state[session_lock.HOLDER_KEY] = holder
+        session_lock.write_content(lock, state)
+        budget = PassBudget(budget_s, on_phase=on_phase)
+        try:
+            report = _run_pass(cfg, db, policy, host=host, actor=actor, dry_run=dry_run,
+                               busy=busy, agents_in_turn=agents_in_turn, now=now,
+                               runtime=runtime, artifact_scan=artifact_scan,
+                               free_target=free_target, budget=budget)
+        except _PassExpired as expired:
+            report = _timed_out_report(host, dry_run, budget, expired.phase)
+            report["entries"] = list(report["entries"])
+            if not dry_run:
+                report["entries"].append({
+                    "kind": HOST_PASS_KIND, "action": "timed_out", "path": lock_path,
+                    "bytes": 0,
+                    "detail": report["skipped"][-1], "data": report["budget"]})
+                try:
+                    # the work done before the timeout is journaled too: the
+                    # pass will not reach `_run_pass`'s own write
+                    storage.of(db).housekeeping.log(
+                        host, report["entries"], actor=actor)
+                except Exception:  # noqa: BLE001 - the report is already built
+                    pass
+        else:
+            report.setdefault("budget", budget.summary())
+            if not dry_run and not report.get("disabled") and not report.get("timed_out"):
+                state[key] = time.time() if now is None else float(now)
         return report
     finally:
-        lock.close()
+        state.pop(session_lock.HOLDER_KEY, None)
+        try:
+            session_lock.write_content(lock, state)
+        finally:
+            lock.close()
 
 
 def _run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool = False,
               busy: bool = False, agents_in_turn: set | None = None,
               now: float | None = None,
               runtime=None, artifact_scan: bool = True,
-              free_target: int = 0) -> dict:
+              free_target: int = 0, budget: PassBudget | None = None) -> dict:
     """Un passage de ménage sur CET hôte ; rend le rapport.
 
     * dossiers temporaires : quota par agent (sauf agent en tour) ; dossier
@@ -4428,6 +4744,10 @@ def _run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool =
     * bilan (`mesure`), avec les plus grosses entrées de /tmp si le tmpfs
       atteint l'alerte.
 
+    #3802 : `budget` borne chaque phase ; le prochain point de contrôle lève
+    `_PassExpired`, que `run_pass` rend en rapport `timed_out` (avec ce que
+    le passage avait déjà fait, par `budget.context`).
+
     `dry_run` : rien n'est supprimé ni écrit en base ; le plan est rendu."""
     now = time.time() if now is None else float(now)
     agents_in_turn = set(agents_in_turn or ())
@@ -4439,6 +4759,11 @@ def _run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool =
         return {"host": host, "dry_run": dry_run, "disabled": True, "entries": [],
                 "plan": [], "skipped": ["AMEESH_HOUSEKEEPING=off"], "unowned": [],
                 "measure": None}
+    if budget is None:
+        budget = PassBudget(HOST_PASS_BUDGET_S)
+    budget.context = {"entries": entries, "plan": plan, "skipped": skipped,
+                      "unowned": unowned, "orphans": []}
+    budget.check("registry")
     troot, croot = tmp_root(cfg, policy), cache_root(cfg, policy)
     registered: set[str] = set()
     protected: set[str] = set()
@@ -4456,6 +4781,7 @@ def _run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool =
                 running.add(row["name"])
     except Exception:  # registre illisible : on ne supprime aucun dossier d'agent
         registered = None  # type: ignore[assignment]
+    budget.check("tmp")
     # 1. dossiers temporaires des agents
     key = mesh_key(cfg)
     # #2704 : un seul relevé des processus de l'utilisateur par passage (il
@@ -4489,6 +4815,11 @@ def _run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool =
     seen_over: set[str] = set()
     if os.path.isdir(troot) and _managed(troot):
         for name in sorted(os.listdir(troot)):
+            if budget.expired():
+                budget.timed_out = True
+                skipped.append("tmp: pass budget reached, remaining temporary "
+                               "directories left for the next pass")
+                break
             full = os.path.join(troot, name)
             if name == MARKER or not os.path.isdir(full) or os.path.islink(full):
                 continue
@@ -4568,7 +4899,7 @@ def _run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool =
                                 "command": command})
                 continue
             why = tmp_problem(full, owner, key, registered=not orphan,
-                              idle_after=policy.orphan_idle, now=now)
+                              idle_after=policy.orphan_idle, now=now, budget=budget)
             if why:
                 skipped.append("tmp %s kept: %s" % (full, why))
                 continue
@@ -4582,7 +4913,7 @@ def _run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool =
             try:
                 if not dry_run and (read_owner(troot, name) != owner or tmp_problem(
                         full, owner, key, registered=not orphan,
-                        idle_after=policy.orphan_idle, now=now)):
+                        idle_after=policy.orphan_idle, now=now, budget=budget)):
                     skipped.append("tmp %s kept: changed during the pass" % full)
                     continue
                 if orphan:
@@ -4654,7 +4985,7 @@ def _run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool =
                                     "detail": held})
                     continue
                 result = evict_lru([full], troot, policy.tmp_quota, now=now,
-                                   dry_run=dry_run)
+                                   dry_run=dry_run, budget=budget)
                 episode = tmp_episode(db, host, full, result, now=now)
                 if result["files"]:
                     plan.append({"kind": "tmp", "path": full, "agent": agent,
@@ -4666,8 +4997,9 @@ def _run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool =
                     skipped.append("tmp %s: mount table unreadable "
                                    "(platform layer), nothing evicted" % full)
                 elif result["truncated"]:
-                    skipped.append("tmp %s: listing truncated (%s file limit), nothing "
-                                   "evicted" % (full, WALK_LIMIT))
+                    skipped.append("tmp %s: listing truncated (%s), nothing evicted"
+                                   % (full, "pass budget reached" if result.get("budget_reached")
+                                      else "%s file limit" % WALK_LIMIT))
                 elif result["blocked"]:
                     skipped.append("tmp %s: quota held by %s this pass cannot remove, "
                                    "nothing evicted" % (full, resources_mod.fmt_value(
@@ -4698,6 +5030,7 @@ def _run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool =
                     continue
                 entries.append({"kind": "tmp", "action": "gone", "path": path,
                                 "detail": "temporary directory over quota gone"})
+    budget.check("caches")
     # 2. caches partagés
     # #3293 : sous pression disque (moins que `free_target` libre sur le
     # système du cache), libérer au moins le déficit — et, pour le cache npm
@@ -4740,7 +5073,7 @@ def _run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool =
                 directories.append(full)
         if directories:
             result = evict_lru(directories, croot, policy.cache_quota, now=now,
-                               dry_run=dry_run, evict_at_least=deficit)
+                               dry_run=dry_run, evict_at_least=deficit, budget=budget)
             detail = "%d file(s), quota %s" % (
                 result["files"], resources_mod.fmt_value("q", policy.cache_quota))
             if deficit:
@@ -4761,8 +5094,9 @@ def _run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool =
                 skipped.append("caches: mount table unreadable (platform layer), "
                                "nothing evicted")
             elif result["truncated"]:
-                skipped.append("caches: listing truncated (%s file limit), nothing evicted"
-                               % WALK_LIMIT)
+                skipped.append("caches: listing truncated (%s), nothing evicted"
+                               % ("pass budget reached" if result.get("budget_reached")
+                                  else "%s file limit" % WALK_LIMIT))
             elif result["blocked"]:
                 skipped.append("caches: quota held by %s this pass cannot remove, nothing evicted"
                                % resources_mod.fmt_value("q", result["unremovable"]))
@@ -4776,6 +5110,7 @@ def _run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool =
                                "%s freed" % (resources_mod.fmt_value("q", left),
                                              resources_mod.fmt_value("q", int(free_target)),
                                              resources_mod.fmt_value("q", result["evicted"])))
+    budget.check("deps")
     # 2b. #248: node_modules shared per lockfile, entries no worktree links to
     if policy.deps and registered is None:
         skipped.append("deps: registry unreadable, worktrees unknown, nothing deleted")
@@ -4786,11 +5121,15 @@ def _run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool =
             # recorded are found there before an entry is deleted
             tops: set = set()
             for cwd in sorted(protected):
-                tops.update(w["path"] for w in list_worktrees(cwd) if not w.get("bare"))
+                if budget.expired():
+                    break              # #3802: a bounded host pass
+                tops.update(w["path"] for w in list_worktrees(cwd, budget=budget)
+                            if not w.get("bare"))
             return sorted(tops | protected)
 
         for line in deps_mod.gc_node_modules(croot, now=now, idle=policy.deps_idle,
-                                             dry_run=dry_run, worktrees=known_worktrees):
+                                             dry_run=dry_run, worktrees=known_worktrees,
+                                             budget=budget):
             if line["action"] == "would-delete":
                 plan.append({"kind": "deps", "path": line["path"], "action": "suppression",
                              "bytes": line["bytes"], "detail": line["detail"]})
@@ -4798,6 +5137,7 @@ def _run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool =
                 skipped.append("deps %s kept: %s" % (line["path"], line["detail"]))
             else:
                 entries.append(line)
+    budget.check("archive")
     # L230: one deleting pass at a time on the host, and the journal of its trash dirs
     lock_path = os.path.join(cfg.state_dir, MANAGED_DIR, "artifacts.lock")
     journal_path = os.path.join(cfg.state_dir, MANAGED_DIR, "artifacts.journal")
@@ -4816,6 +5156,7 @@ def _run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool =
             plan.append(dict(line, action="suppression"))
         else:
             entries.append(line)
+    budget.check("worktrees")
     # 3. worktrees
     if policy.worktrees and registered is None:
         # sans registre, ni dossiers d'agents ni tours en cours connus
@@ -4826,7 +5167,8 @@ def _run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool =
             local = {row["name"]: row["cwd"] for row in agent_rows
                      if row.get("host") == host and row.get("cwd")}
             found = housekeeping_discovery.discover(
-                db, host, local, policy.worktree_roots, dry_run=dry_run)
+                db, host, local, policy.worktree_roots, dry_run=dry_run,
+                budget=budget)
             entries += found["entries"]
             plan += found["plan"]
             skipped += found["skipped"]
@@ -4838,9 +5180,11 @@ def _run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool =
                                              skip_roots=(troot, croot, cfg.state_dir)
                                              + _shared_roots(),
                                              known_agents=registered or (),
-                                             blocked=wt_blocked, archive=archive)
+                                             blocked=wt_blocked, archive=archive,
+                                             budget=budget)
         entries += wt_entries
         plan += wt_plan
+        budget.check("clones")
         # 3c. #2743: ad-hoc clones of ended lots (dry run by default);
         #     like the discovery, the runner rescans at most every 6 h.
         if artifact_scan:
@@ -4851,42 +5195,49 @@ def _run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool =
                     protected=protected, dry_run=dry_run, now=now,
                     artifacts=policy.artifacts, allow=policy.unreadable_ok,
                     lock_path=lock_path, journal_path=journal_path,
-                    skip_roots=(troot, croot, cfg.state_dir) + _shared_roots())
+                    skip_roots=(troot, croot, cfg.state_dir) + _shared_roots(),
+                    budget_s=budget.remaining())
             except Exception as exc:  # never fatal for the pass
                 cl_entries, cl_plan, cl_skipped = [], [], [
                     "clones: pass failed (%s)" % type(exc).__name__]
             entries += cl_entries
             plan += cl_plan
             skipped += cl_skipped
+    budget.check("artifacts")
     # 3b. L230: regenerable build dirs of idle worktrees
     if artifact_scan and registered is not None:
         try:
             art = _artifact_pass(db, host, policy, cwd_of=cwd_of, dry_run=dry_run, now=now,
                                  skip_roots=(troot, croot, cfg.state_dir),
                                  lock_path=lock_path, journal_path=journal_path,
-                                 running=running, known_agents=registered)
+                                 running=running, known_agents=registered,
+                                 budget=budget)
         except Exception as exc:  # jamais fatal pour le passage
             art = {"entries": [], "plan": [], "skipped": [
                 "artifacts: pass impossible (%s)" % type(exc).__name__]}
         entries += art["entries"]
         plan += art["plan"]
         skipped += art["skipped"]
+    budget.check("containers")
     # 4. conteneurs : ceux des tours d'ameesh finis supprimés, autres signalés
-    conteneurs = reap_containers(runtime, db, host, dry_run=dry_run)
+    conteneurs = reap_containers(runtime, db, host, dry_run=dry_run, budget=budget)
     entries += conteneurs["entries"]
     plan += conteneurs["plan"]
     # 4b. #2003 : volumes Docker sans conteneur — ceux que le mesh a déclarés
     #     jetables (`ameesh.bench=disposable`, banc de lot) récoltés après
     #     `docker_volume_idle` d'absence continue ; les autres signalés,
     #     jamais supprimés
-    volumes = reap_volumes(runtime, db, host, policy, dry_run=dry_run, now=now)
+    budget.check("volumes")
+    volumes = reap_volumes(runtime, db, host, policy, dry_run=dry_run, now=now,
+                           budget=budget)
     entries += volumes["entries"]
     plan += volumes["plan"]
     # 4c. #3226 : scopes systemd `dsh-subprocess-*` laissés par un tour clos
     #     (dsh sans la garde #490) : tués après le délai de grâce ; ceux qu'on
     #     ne sait pas attribuer gardés et signalés
+    budget.check("scopes")
     try:
-        scopes = reap_dsh_scopes(db, host, dry_run=dry_run, now=now)
+        scopes = reap_dsh_scopes(db, host, dry_run=dry_run, now=now, budget=budget)
     except Exception as exc:  # jamais fatal pour le passage
         scopes = {"entries": [], "plan": []}
         skipped.append("dsh scopes: pass failed (%s)" % type(exc).__name__)
@@ -4895,18 +5246,24 @@ def _run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool =
     # 5. /tmp entries signaled during a turn (L162): unattributed ones are
     #    never deleted (#222), an attributed one (before #222) is deleted once
     #    abandoned (`_orphan_verdict` guards), the others are told
+    budget.check("orphans")
     gardes = protected | {troot, croot, cfg.state_dir}
     try:
         orphan_entries, orphan_plan, orphans = orphan_pass(
             db, host, policy, registered=registered, protected=gardes, running=running,
-            dry_run=dry_run, now=now)
+            dry_run=dry_run, now=now, budget=budget)
     except Exception as exc:  # jamais fatal pour le passage
         orphan_entries, orphan_plan, orphans = [], [], []
         skipped.append("/tmp: pass failed (%s)" % type(exc).__name__)
     entries += orphan_entries
     plan += orphan_plan
     skipped += declared_root_refused(cfg, policy)
-    report_measure = measure(cfg, policy)
+    budget.context["orphans"] = orphans
+    budget.check("measure")
+    report_measure = measure(cfg, policy, budget=budget)
+    # #3802 : la trace des phases reste au journal (relevé `mesure`), pas
+    # seulement dans la sortie de cette passe.
+    report_measure["host_pass"] = budget.summary()
     report_measure["worktree_archives"] = dict(
         housekeeping_archive.survey(archive_root),
         after=policy.dirty_worktree_after, retention=policy.dirty_archive_retention)
@@ -4997,13 +5354,27 @@ def print_report(report: dict) -> None:
     # #2173: a pass skipped by the host lock ran nothing; it must not print
     # "executed" (nor "nothing to do": the concurrent pass is doing the work).
     skipped_pass = report.get("status") == "skipped"
+    timed_out = report.get("status") == "timed_out"
     if skipped_pass:
         reason = next(iter(report.get("skipped") or ()), "")
         mode = "skipped" + (" — %s" % reason if reason else "")
+    elif timed_out:
+        reason = next((note for note in report.get("skipped") or ()
+                       if "budget" in note), "")
+        mode = "TIMED OUT" + (" — %s" % reason if reason else "")
     else:
         mode = "DRY RUN (nothing is deleted; --apply to execute)" if report["dry_run"] \
             else "executed"
     print("housekeeping of %s — %s" % (report["host"] or "?", mode))
+    blocked = report.get("blocked")
+    if blocked:
+        # #3802 : a skipped pass past the holder's budget names it here and
+        # raises `housekeeping_blocked` (the journal line is already written).
+        print("  held       by %s (pid %s) for %s%s — alert housekeeping_blocked"
+              % (blocked.get("runner") or "?",
+                 blocked.get("pid") if blocked.get("pid") is not None else "?",
+                 fmt_idle(blocked.get("age_s") or 0),
+                 " in phase %r" % blocked.get("phase") if blocked.get("phase") else ""))
     m = report.get("measure") or {}
     if m:
         print("  temporary dirs        %s (%s); quota %s per agent"

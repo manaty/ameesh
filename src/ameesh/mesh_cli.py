@@ -1018,6 +1018,20 @@ def _host_menage(hk, host: str, policy, measure_row: dict | None,
                "used_bytes": latest.get("tmp_used_bytes"),
                "fraction": res.tmpfs_fraction(latest)}
     worktrees = hk.worktrees(host, ("active", "kept"))
+    # #3802 : un passage sauté derrière un verrou trop vieux est dit ici,
+    # avec son détenteur ; une passe aboutie (relevé plus récent) le clôt.
+    host_pass = None
+    try:
+        rows = [row for row in hk.latest_by_path(host, "host_pass")
+                if row.get("action") == "blocked"]
+        if rows and float(rows[0].get("at_ts") or 0) >= float(
+                (measure_row or {}).get("at_ts") or 0):
+            row = rows[0]
+            item = row.get("data") or {}
+            item = dict(item, at_ts=row.get("at_ts"), detail=row.get("detail") or "")
+            host_pass = item
+    except Exception:  # un journal illisible ne prouve pas un blocage
+        host_pass = None
     return {
         "policy": policy.as_dict(),
         "system_tmp": tmp,
@@ -1025,6 +1039,7 @@ def _host_menage(hk, host: str, policy, measure_row: dict | None,
                             and tmp["fraction"] >= policy.tmpfs_alert),
         "measure": data or None,
         "measured_ts": (measure_row or {}).get("at_ts"),
+        "host_pass": host_pass,
         "last_24h": hk.summary(host, 86400.0),
         "worktrees": {"active": sum(1 for w in worktrees if w["status"] == "active"),
                       "kept": [{"path": w["path"], "agent": w["agent"], "lot": w["lot"],
@@ -1036,6 +1051,15 @@ def _host_menage(hk, host: str, policy, measure_row: dict | None,
 def _print_host_menage(menage: dict) -> None:
     tmp = menage.get("system_tmp")
     policy = menage["policy"]
+    blocked = menage.get("host_pass")
+    if blocked:
+        print("  blocked    housekeeping pass skipped: host-pass lock held by %s "
+              "(pid %s)%s since %s — alert housekeeping_blocked"
+              % (blocked.get("runner") or "?",
+                 blocked.get("pid") if blocked.get("pid") is not None else "?",
+                 " in phase %r" % blocked.get("phase") if blocked.get("phase") else "",
+                 time.strftime("%Y-%m-%d %H:%M:%SZ", time.gmtime(
+                     float(blocked.get("since") or 0))) if blocked.get("since") else "?"))
     if tmp:
         part = tmp.get("fraction")
         print("  /tmp       %s %s / %s%s%s" % (
