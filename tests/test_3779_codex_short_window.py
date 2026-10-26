@@ -374,6 +374,57 @@ class FenetreCourteTest(_Base):
             " WHERE agent = 'rot-a'"),
             [{"harness": "codex", "account": "primaire"}])
 
+    def test_retour_au_harnais_propre_efface_la_place_codex(self):
+        """Avis cx2 : deux anciens emprunteurs Codex revenus sous leur harnais
+        propre ne doivent pas saturer le plafond Codex avec leur vieille place."""
+        for name, propre in (("ret-a", "claude"), ("ret-b", "deepseek")):
+            self.db.execute(
+                "INSERT INTO agent_registry"
+                " (name, chantier, harness, host, status, lease_owner,"
+                "  lease_expires_at)"
+                " VALUES (%s, '', %s, 'h', 'idle', NULL, NULL)", (name, propre))
+        codex = accounts.Profile("codex", "secondaire", max_concurrent=2,
+                                  min_start_gap_s=0.0, path="")
+
+        def ouvrir_pour(nom: str):
+            def ouvrir(tx) -> bool:
+                tx.execute(
+                    "UPDATE agent_registry SET status = 'running',"
+                    " lease_owner = 'runner',"
+                    " lease_expires_at = now() + interval '1 hour',"
+                    " status_since = now() WHERE name = %s", (nom,))
+                return True
+            return ouvrir
+
+        for name in ("ret-a", "ret-b"):
+            admission = account_window.claim_start(
+                self.db, "codex", "secondaire", "h", name, profile=codex,
+                begin=ouvrir_pour(name))
+            self.assertTrue(admission.ok, admission)
+        self.assertEqual(account_window.state(
+            self.db, "codex", "secondaire")["active_count"], 2)
+        # les deux tours Codex finissent ; la place reste jusqu'au départ suivant
+        self.db.execute(
+            "UPDATE agent_registry SET status = 'idle'"
+            " WHERE name IN ('ret-a', 'ret-b')")
+        # retour sous leur harnais propre : claim_start remplace la place même
+        # si ce harnais n'est pas suivi, avant le begin_turn du runner.
+        for name, propre in (("ret-a", "claude"), ("ret-b", "deepseek")):
+            retour = account_window.claim_start(self.db, propre, None, "h", name)
+            self.assertTrue(retour.ok)
+            self.assertFalse(retour.begun)
+            self.db.execute(
+                "UPDATE agent_registry SET status = 'running',"
+                " lease_owner = 'runner',"
+                " lease_expires_at = now() + interval '1 hour'"
+                " WHERE name = %s", (name,))
+        self.assertEqual(account_window.state(
+            self.db, "codex", "secondaire")["active_count"], 0)
+        self.assertEqual(sorted(row["harness"] for row in self.db.query(
+            "SELECT harness FROM account_turn_slots"
+            " WHERE agent IN ('ret-a', 'ret-b')")),
+            ["claude", "deepseek"])
+
     def test_choose_refuse_avant_le_tour_et_le_runner_journalise(self):
         worker = self._worker_codex("cx-3779")
         account_window.record_rate_limit(

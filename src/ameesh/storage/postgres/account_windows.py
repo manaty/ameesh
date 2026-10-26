@@ -61,16 +61,20 @@ class AccountWindows(interface.AccountWindows):
             (harness, account),
         )
 
-    def start(self, harness, account, host, agent) -> None:
-        self.db.execute(
-            "insert into account_turn_starts (harness, account, host, agent)"
-            " values (%s, %s, %s, %s)",
-            (harness, account, host or "", agent or ""),
-        )
+    def start(self, harness, account, host, agent, *, slot_only=False) -> None:
+        if not slot_only:
+            self.db.execute(
+                "insert into account_turn_starts (harness, account, host, agent)"
+                " values (%s, %s, %s, %s)",
+                (harness, account, host or "", agent or ""),
+            )
         # La place active porte le harnais et le compte EFFECTIFS du tour ;
         # elle est écrite dans la transaction d'admission, avec `begin_turn`.
         # Un agent n'a qu'un tour actif : la clé agent remplace la place d'un
-        # tour précédent (rotation, emprunt, retour au harnais propre).
+        # tour précédent (rotation, emprunt, retour au harnais propre). Un
+        # harnais non suivi remplace aussi la place (`slot_only`), sinon
+        # l'ancienne place Codex serait recomptée dès que `begin_turn` remet
+        # l'agent `running` (#3779, avis cx2).
         self.db.execute(
             "insert into account_turn_slots (agent, harness, account, host, at)"
             " values (%s, %s, %s, %s, now())"

@@ -1128,11 +1128,17 @@ class AccountWindows(Domain):
         pas compté : la garde s'ouvre un tour, jamais ne bloque à tort."""
 
     @abc.abstractmethod
-    def start(self, harness: str, account: str, host: str, agent: str) -> None:
+    def start(self, harness: str, account: str, host: str, agent: str,
+              *, slot_only: bool = False) -> None:
         """Journalise le début d'un tour du compte (écart entre deux débuts) et
         pose/actualise sa place active avec le harnais et le compte effectifs
         (`harness`, `account`) — appelé dans la transaction d'admission, avec
-        `begin_turn`."""
+        `begin_turn`.
+
+        `slot_only` : ne journalise pas le début (harnais non suivi, qui n'a
+        pas d'écart à tenir) et ne fait que remplacer la place de l'agent.
+        Un agent qui revient d'un emprunt Codex sous son harnais propre efface
+        ainsi son ancienne place Codex (#3779, avis cx2)."""
 
     @abc.abstractmethod
     def last_start(self, harness: str, account: str) -> dict:

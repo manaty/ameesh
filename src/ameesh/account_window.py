@@ -288,6 +288,19 @@ def claim_start(db, harness: str, account: str | None, host: str, agent: str,
     ici n'a pas commencé.
     """
     if not enabled(harness) or not account:
+        # #3779 (avis cx2) : un tour sous un harnais non suivi — le retour
+        # d'un emprunt Codex sous Claude/DeepSeek — doit remplacer la place de
+        # l'agent. Sinon `begin_turn` le remet `running` et `active()` recompte
+        # l'ancienne place Codex, saturant faussement le plafond. Pas de
+        # journal ni de verrou : ce harnais n'a ni écart ni plafond à tenir.
+        if db is not None and not storage.is_remote(db) and agent:
+            api = _api(db)
+            if api is not None:
+                try:
+                    api.start(harness, account or "", host or "", agent,
+                              slot_only=True)
+                except Exception as exc:  # noqa: BLE001 - garde locale seule
+                    _log("[%s] short-window slot not replaced (%s)" % (agent, exc))
         return Admission()
     if db is None or storage.is_remote(db) or not hasattr(db, "transaction"):
         return Admission()
