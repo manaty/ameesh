@@ -474,7 +474,10 @@ class MultiFamilyAuthorTest(unittest.TestCase):
                 row("codex-one", harness="codex", session="codex"),
                 row("deepseek-one", harness="deepseek", session="deepseek")))
         self.assertEqual(picked["state"], rd.WAITING)
-        self.assertEqual(picked["reviewers"], [])
+        # #3596 : le siège de la famille disponible est pourvu dès le gel ;
+        # l'autre famille reste à couvrir, et le message la nomme par exclusion,
+        # jamais comme une famille inconnue.
+        self.assertEqual([r["name"] for r in picked["reviewers"]], ["claude-one"])
         self.assertEqual(picked["missing"], 1)
         self.assertIn("codex", picked["why"])
         self.assertIn("deepseek", picked["why"])
