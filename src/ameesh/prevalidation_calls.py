@@ -581,10 +581,24 @@ def contract_fallback(prepared: Prepared, params, *, head: str, base: str,
         return None
     block = getattr(params, "params", params)
     declared = tuple(getattr(block, "contracts", ()) or ())
+    #: #3800/N cx2 B1 : `gate_train` lit les contrats sous le bail de la cible.
+    #: La lecture git doit être bornée par la même échéance que le reste du
+    #: passage (`validate` borne déjà `contract_modules` ainsi) ; un
+    #: `git cat-file` suspendu ne doit pas dépasser le budget global.
+    if deadline is not None and deadline.expired():
+        raise prevalidation.PrevalidationError(
+            "run-incomplete",
+            "budget de prévalidation épuisé avant la lecture des contrats")
+    bounded = prevalidation._bounded_runner(subprocess.run, deadline)
     required, problem = prevalidation.contract_modules(
-        declared or FALLBACK_CONTRACTS, repo=prepared.tree, head=head)
+        declared or FALLBACK_CONTRACTS, repo=prepared.tree, head=head,
+        runner=bounded)
     if problem:
         return None
+    if deadline is not None and deadline.expired():
+        raise prevalidation.PrevalidationError(
+            "run-incomplete",
+            "budget de prévalidation épuisé pendant la lecture des contrats")
     modules: list[str] = []
     for name in (*required, *FALLBACK_MODULES):
         if name not in modules:
@@ -620,7 +634,9 @@ def contract_fallback(prepared: Prepared, params, *, head: str, base: str,
         "psql": [],
     }
     if deadline is not None and deadline.expired():
-        return None
+        raise prevalidation.PrevalidationError(
+            "run-incomplete",
+            "budget de prévalidation épuisé avant l'écriture du plan de contrats")
     try:
         with open(prepared.path, "w", encoding="utf-8") as fh:
             json.dump(plan, fh, indent=1, ensure_ascii=False)

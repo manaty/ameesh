@@ -396,6 +396,40 @@ class ContractFallbackTest(unittest.TestCase):
         self.assertTrue(chosen.ok, chosen.why)
         self.assertEqual(chosen.fallback["cause"], "selection-full")
 
+    def test_contract_read_is_bounded_by_the_deadline(self):
+        # #3800/N cx2 B1 : sous le bail de la cible (gate_train), la lecture
+        # des contrats doit recevoir un timeout borné, pas `subprocess.run`
+        # sans borne.
+        prepared = calls.prepare(self.repo.root, self.head, self.repo.base)
+        self.addCleanup(prepared.close)
+        deadline = calls.Deadline(5.0)
+        seen = []
+
+        def suspended(argv, **kw):
+            seen.append(kw.get("timeout"))
+            raise subprocess.TimeoutExpired(argv, kw.get("timeout", 0))
+
+        with mock.patch.object(calls.subprocess, "run", side_effect=suspended):
+            with self.assertRaises(pv.PrevalidationError) as caught:
+                calls.contract_fallback(prepared, self.parameters(),
+                                        head=self.head, base=self.repo.base,
+                                        deadline=deadline)
+        self.assertEqual(caught.exception.cause, "run-incomplete")
+        self.assertTrue(seen and seen[0] is not None)
+        self.assertGreater(seen[0], 0.0)
+        self.assertLessEqual(seen[0], 5.0)
+
+    def test_expired_budget_before_contract_read_is_run_incomplete(self):
+        prepared = calls.prepare(self.repo.root, self.head, self.repo.base)
+        self.addCleanup(prepared.close)
+        with mock.patch.object(calls.subprocess, "run") as run:
+            with self.assertRaises(pv.PrevalidationError) as caught:
+                calls.contract_fallback(prepared, self.parameters(),
+                                        head=self.head, base=self.repo.base,
+                                        deadline=calls.Deadline(0.0))
+        self.assertEqual(caught.exception.cause, "run-incomplete")
+        run.assert_not_called()
+
     def test_run_plays_the_fallback_and_reports_it(self):
         seen = {}
 
