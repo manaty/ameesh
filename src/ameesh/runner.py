@@ -4631,7 +4631,7 @@ class AgentWorker(threading.Thread):
             operation = handoffs.request(self.db, candidate, repository=remote)
             log("[%s] host handoff %s reserved to %s; waits for host preparation and lot boundary"
                 % (self.name, operation["id"], operation["target"]))
-        except (db_mod.DbError, handoffs.HandoffError, OSError, subprocess.SubprocessError):
+        except (db_mod.DbError, handoffs.HandoffError, ValueError, OSError, subprocess.SubprocessError):
             log("[%s] host handoff unavailable; source and worktree retained" % self.name)
         return False
 
@@ -8876,9 +8876,12 @@ class Runner:
         try:
             factory = handoff_factory.load(self._lifecycle_db)
         except handoff_factory.FactoryUnavailable as exc:
+            if getattr(self, "_lifecycle_gap", None) != exc.gap:
+                log_async("host lifecycle: " + exc.gap)
             self._lifecycle_gap = exc.gap
             self._lifecycle_db = None
             return
+        self._lifecycle_gap = None
         self._lifecycle_factory = factory
         self._lifecycle_adapter = factory.adapter
         self._lifecycle_requirements = factory.requirements_for
@@ -10663,6 +10666,11 @@ class Runner:
         """Drive durable requests with the enrolled helper, or record its named gap."""
         from . import handoffs, host_lifecycle
         try:
+            # An operator may finish enrollment after startup. Retry only an
+            # empty binding; a live operation keeps its factory until restart.
+            if (hasattr(self, "_lifecycle_factory")
+                    and self._lifecycle_factory is None):
+                self._bind_lifecycle()
             api = storage.of(db).host_lifecycle
             api.detect_losses(actor=self.runner_id,
                               older_than=int(host_lifecycle.staleness_s(

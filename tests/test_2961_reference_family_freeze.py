@@ -227,6 +227,22 @@ class AmbiguousCoauthorFamilyTest(_Fixture):
         self.assertEqual(out["author_families"], ["claude", "codex"])
         self.assertEqual([row["actor"] for row in out["accepted"]], ["qa"])
 
+    def test_a_caller_entry_without_families_keeps_the_proven_set(self):
+        # #3658 : l'appelant passe le coauteur sans `families` ; la porte ne
+        # retombe pas sur la seule famille du registre (codex), qui laisserait
+        # passer l'avis claude, mais relit l'ensemble prouvé par la plage.
+        # La référence est codex : seul l'ensemble prouvé exclut claude.
+        registry.upsert(self.db, "mesh-design", harness="codex",
+                        host=self.cfg.host, cwd=self.repo.root, status="idle")
+        out = merge_queue.review_gate(
+            self.db, self.marks(), self.frozen, repo=self.repo.root,
+            klass=self.klass(path="src/ameesh/mail.py"),
+            item=work.get(self.db, self.lot), families=FAMILIES,
+            authors=[{"name": "other", "family": ""}])
+        self.assertTrue(out["ok"], out)
+        self.assertEqual(out["author_families"], ["claude", "codex"])
+        self.assertEqual([row["actor"] for row in out["accepted"]], ["qa"])
+
 
 class FreezeReceiptFallbackTest(_Fixture):
     """Le reçu du jalon de gel donne la famille quand le journal est muet."""

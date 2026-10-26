@@ -181,7 +181,12 @@ def proposal(cfg, db, book, *, now: float | None = None, fleet: dict | None = No
     """
     now = time.time() if now is None else now
     try:
-        declared = accounts.parse(getattr(cfg, "accounts", None) or {})
+        # #3680 : la marge lit le rythme de la garde, celui du canon
+        # (`with_canon_pace` : multiplicateur et plancher de sous-utilisation),
+        # jamais le réglage local de l'hôte — la marge annoncée ne surestime
+        # plus la capacité quand la garde retient le compte.
+        declared = accounts.with_canon_pace(
+            cfg, accounts.parse(getattr(cfg, "accounts", None) or {}))
     except accounts.AccountError as exc:
         return Proposal(reason="invalid account configuration: %s" % exc)
     try:

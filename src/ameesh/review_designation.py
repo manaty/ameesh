@@ -415,13 +415,15 @@ def unknown_families(authors: Iterable) -> list[str]:
     Without a proof, a reviewer's independence cannot be proven: a reviewer
     of the same real family would be designated without anyone knowing. A
     row whose `families` set is non-empty is **not** unknown (#3584): the
-    caller excludes each of those families."""
+    caller excludes each of those families. A `test_only` corrector (#3518)
+    forbids only their name, as in `families_of`: their family is not needed,
+    so they are never unknown (#3658)."""
     out = set()
     for author in authors or ():
         row = dict(author or {}) if isinstance(author, Mapping) \
             else {"name": str(author or "").strip()}
         name = str(row.get("name") or "").strip()
-        if name and not proven_families(row):
+        if name and not row.get("test_only") and not proven_families(row):
             out.add(name)
     return sorted(out)
 

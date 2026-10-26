@@ -1186,6 +1186,10 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
             continue
         if family:
             proven = set(proven) | {family.strip().lower()}
+        # #3658 : défense en profondeur — une entrée sans `families` garde
+        # l'ensemble que la lecture de la plage a prouvé pour ce nom, avant
+        # tout repli sur la seule famille du registre.
+        proven = set(proven) | set(proven_families.get(key) or ())
         if not proven:
             # Absence de preuve (aucun ensemble) : le repli historique du
             # registre reste, comme avant #3584. Une famille inconnue y est

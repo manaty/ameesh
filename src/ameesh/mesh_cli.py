@@ -1044,12 +1044,19 @@ def _print_host_menage(menage: dict) -> None:
         from .menage import describe_top
         print("  /tmp large %s" % describe_top(m["system_tmp_top"]))
     if m:
+        # #3728 : les archives des worktrees gardés pour fichiers modifiés
+        # (ce que leur retrait a libéré est dans la ligne 24 h : `worktree
+        # archived`)
+        arch = m.get("worktree_archives") or {}
         print("  cleanup    temporary directories %s (quota %s per agent); caches %s / %s"
-              "%s" % (_fmt_bytes(m.get("tmp_bytes")), _fmt_bytes(m.get("tmp_quota")),
-                      _fmt_bytes(m.get("cache_bytes")), _fmt_bytes(m.get("cache_quota")),
-                      "; %d /tmp entries reported (%s)" % (
-                          m["orphans"], _fmt_bytes(m.get("orphan_bytes")))
-                      if m.get("orphans") else ""))
+              "%s%s" % (_fmt_bytes(m.get("tmp_bytes")), _fmt_bytes(m.get("tmp_quota")),
+                        _fmt_bytes(m.get("cache_bytes")), _fmt_bytes(m.get("cache_quota")),
+                        "; %d /tmp entries reported (%s)" % (
+                            m["orphans"], _fmt_bytes(m.get("orphan_bytes")))
+                        if m.get("orphans") else "",
+                        "; %d worktree archive(s) (%s)" % (
+                            arch["count"], _fmt_bytes(arch.get("bytes")))
+                        if arch.get("count") else ""))
     conteneurs = (m or {}).get("containers") or {}
     if conteneurs.get("ameesh") is not None or conteneurs.get("others") is not None:
         ours = conteneurs.get("ameesh") or []
@@ -2664,6 +2671,11 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                         print("manual     : %s" % ", ".join(out["manual"]))
                     if out.get("error"):
                         print("mark       : %s" % out["error"])
+                    if out.get("historical"):
+                        # #3685 : la marque enregistrée nomme un siège qui
+                        # n'est plus désigné (hôte perdu, retrait du pilote) ;
+                        # la reprise ci-dessous est la désignation vivante.
+                        print("mark       : historical — %s" % out["historical"])
             applied = out.get("applied")
             if applied is not None and not args.json:
                 state = applied.get("state")
@@ -4255,7 +4267,12 @@ def cmd_cost(cfg: Config, args) -> int:
         if what == "over":
             agent = getattr(args, "agent", "all") or "all"
             harness = book.tool_of(agent) if agent != "all" else ""
-            items = accounts_mod.parse(cfg.accounts).get(harness) if harness else None
+            # #3680 : le verdict est celui de la garde — comptes au rythme du
+            # canon (`with_canon_pace` : multiplicateur et plancher de
+            # sous-utilisation), pas le réglage local de l'hôte.
+            items = (accounts_mod.with_canon_pace(
+                cfg, accounts_mod.parse(cfg.accounts)).get(harness)
+                if harness else None)
             if items:
                 # L30 : le forfait n'est « dépassé » que si TOUS les comptes sont au seuil
                 now = time.time()
@@ -4279,11 +4296,19 @@ def cmd_cost(cfg: Config, args) -> int:
             comptes = []
         actifs = {}
         rythmes = {}
+        plafonds = {}
         for ligne in comptes:
             if ligne["active"]:
                 actifs[ligne["harness"]] = (ligne["account"], ligne["_gauges"])
                 rythmes[ligne["harness"]] = ligne.get("pace_multiplier", 1.0)
-        rows = book.report(accounts=actifs, multipliers=rythmes)
+                # #3680 : le plafond de la garde par fenêtre (`limits` calculé
+                # par accounts.report : plancher de sous-utilisation, plafond
+                # de rythme et réserve compris), jamais un rythme recalculé
+                # sans plancher.
+                plafonds[ligne["harness"]] = {
+                    g["key"]: float(g["cap"]) for g in ligne["gauges"]
+                    if g.get("cap") is not None}
+        rows = book.report(accounts=actifs, multipliers=rythmes, caps=plafonds)
         for ligne in comptes:
             for cle in ("_gauges", "_limits", "_ceilings"):
                 ligne.pop(cle, None)
@@ -4338,7 +4363,12 @@ def _cost_report_reads(cfg: Config, db) -> None:
               for ligne in comptes if ligne["active"]}
     rythmes = {ligne["harness"]: ligne.get("pace_multiplier", 1.0)
                for ligne in comptes if ligne["active"]}
-    book.report(accounts=actifs, multipliers=rythmes)
+    # #3680 : les mêmes plafonds de la garde que `cmd_cost` (mêmes lectures,
+    # même cache `db.prefetch`).
+    plafonds = {ligne["harness"]: {g["key"]: float(g["cap"])
+                                   for g in ligne["gauges"] if g.get("cap") is not None}
+                for ligne in comptes if ligne["active"]}
+    book.report(accounts=actifs, multipliers=rythmes, caps=plafonds)
     _real_spend_24h(db)
 
 

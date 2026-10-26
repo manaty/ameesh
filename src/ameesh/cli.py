@@ -504,6 +504,14 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
         return 2
     else:
         text = " ".join(body).strip()
+        if text == "-":
+            # #3693 : un argument « - » entouré de blancs n'est pas le marqueur
+            # d'entrée standard (il doit être seul) ; un corps nettoyé ne vaut
+            # jamais « - » et n'est donc jamais déposé.
+            print("the body is just `-`: write the text after the recipient, or "
+                  "give `-` alone (not quoted, without blanks) to read the body "
+                  "on standard input", file=sys.stderr)
+            return 2
         output = _command_output_in(text)
         if output:
             # #3504 (optionnel) : la sortie d'une commande ameesh dans un corps
