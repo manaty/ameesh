@@ -7,17 +7,19 @@ Composeur : mty-amh-impl-01 (deepseek, agents-1).
 
 Déclencheur : fusion de h-26 (`main` 6d67072c, 07:36Z) et consigne mesh-design
 du 26/10 07:43Z (lot #3681 : 8 unités et motifs des écartés). Liste calculée
-`paquet-candidats` sur `6d67072c` relancée à 07:59Z : **11 prêts**, 5 en
+`paquet-candidats` sur `6d67072c` relancée à 08:20Z : **12 prêts**, 4 en
 attente, 3 erreurs de provenance (chaîne handoff, hors paquet par consigne
-pilote). Les 11 prêts sont composés : les 8 du corps du lot, #3634 (écarté en
+pilote). Les 12 prêts sont composés : les 8 du corps du lot, #3634 (écarté en
 h-26, avis claude + codex acquis sur `ecf26b1d`), #3661 (prêt au calcul, ajouté
-sur consigne), puis **#3642** (rebasé sur `6d67072c` à 07:47Z, avis dev4 à
-07:50Z) et **#3473** (gel `3782ae6b`, avis auditeur, provenance redevenue
-lisible à 07:59Z), apparus prêts pendant la composition et composés plutôt
-qu'écartés (canon §12). #3576 reste écarté (gel ≠ tête publiée, conflit
-`docs/EXECUTEUR-MEDIEE.md`).
+sur consigne), **#3642** (rebasé sur `6d67072c` à 07:47Z, avis dev4 à 07:50Z),
+**#3473** (gel `3782ae6b`, avis auditeur, provenance redevenue lisible à
+07:59Z), puis **#3576** (nouvelle tête `adc7d0d1` à 08:04, avis auditeur +
+cx2 sur le gel 19905, ajouté sur consigne du 07:43Z), entrés prêts pendant la
+composition et composés plutôt qu'écartés (canon §12). #3641 reste hors
+paquet : un seul avis (codex, non prouvé indépendant), avis auditeur en cours
+au gel du porteur.
 
-## Admissions (11 lots, 11 unités)
+## Admissions (12 lots, 12 unités)
 
 | lot | source composée | avis au gel | objet |
 |---|---|---|---|
@@ -32,6 +34,7 @@ qu'écartés (canon §12). #3576 reste écarté (gel ≠ tête publiée, conflit
 | #3626 | `7275eb2b544c` | 1/1 (dev2 claude) | Carte mesurée : documenter la perte de lien des sous-processus |
 | #3642 | `c69b738522b2` | 1/1 (dev4 claude) | Témoins de #3639 : total qui baisse, lecture par `commit_ci`, quota 403 |
 | #3473 | `3782ae6bcae8` | 1/1 (auditeur claude ; 2e avis impl-05 deepseek acquis) | Handoff réel H6 : CLI opérateur advance, cancel, retry |
+| #3576 | `adc7d0d125fb` | 2/2 (auditeur claude, cx2 codex) | Alertes poussées : état de livraison partagé en base, migration additive 0487 |
 
 ## Avis au gel
 
@@ -48,8 +51,9 @@ qu'écartés (canon §12). #3576 reste écarté (gel ≠ tête publiée, conflit
 | #3626 | 19756 | #19839 dev2 (claude) ok |
 | #3642 | 19887 | #19891 dev4 (claude) ok |
 | #3473 | 19226 | #19227 auditeur (claude) ok |
+| #3576 | 19905 | #19909 auditeur (claude) ok, #19907 cx2 (codex) ok |
 
-## Composition (11 unités, 11 lots)
+## Composition (12 unités, 12 lots)
 
 | unité | lot | source | commit |
 |---|---|---|---|
@@ -64,12 +68,13 @@ qu'écartés (canon §12). #3576 reste écarté (gel ≠ tête publiée, conflit
 | 9 | #3626 | `7275eb2b544c` | `19d7775ceda8` |
 | 10 | #3642 | `c69b738522b2` | `1bb7cfc98000` |
 | 11 | #3473 | `3782ae6bcae8` | `6b703fc45e3d` |
+| 12 | #3576 | `adc7d0d125fb` | `dac923b984a5` |
 
-Les 11 unités sont des fusions propres : aucun conflit mécanique, aucune
+Les 12 unités sont des fusions propres : aucun conflit mécanique, aucune
 résolution d'union, aucune adaptation de test. #3584 est composé en premier
 parce que #3473 le déclare en dépendance (elle-même composée après lui) et que
-#3661 touche les mêmes modules de désignation. #3642 et #3473 sont composés
-en dernier, après leur entrée dans la liste des prêts.
+#3661 touche les mêmes modules de désignation. #3642, #3473 et #3576 sont
+composés en dernier, après leur entrée dans la liste des prêts.
 
 ## Écartés de h-27
 
@@ -77,8 +82,7 @@ en dernier, après leur entrée dans la liste des prêts.
 |---|---|
 | #3519 | gel refusé (`freeze-after-verdict`) |
 | #3526 | 1 avis sur 2 requis (sensible), verdicts manquants et conflit `handoff_factory.py` / `runner.py` / `test_3472_handoff_runner.py` |
-| #3576 | gel `30750a74` ≠ tête publiée `98ef370b` (`freeze-not-head`) et conflit `docs/EXECUTEUR-MEDIEE.md` |
-| #3641 | gel `8be9d7fd` sans ses 2 avis indépendants : un OK cx1 (codex) non prouvé indépendant (pas de lecture d'auteur) |
+| #3641 | gel `8be9d7fd` sans ses 2 avis indépendants : un OK cx1 (codex) non prouvé indépendant (pas de lecture d'auteur) ; avis auditeur désigné à 08:11, en cours au gel du porteur |
 | #3658 | gel `4aa0f2a0` sans avis (2 requis, sensible) ; empilé sur #3584 |
 | #3474 | erreur de lecture de la porte : provenance d'auteur inconnue sur les commits gelés (chaîne handoff) |
 | #3506 | erreur de lecture de la porte : provenance d'auteur inconnue sur les commits gelés (chaîne handoff) |
@@ -94,13 +98,16 @@ attendent leur clôture par `sync-merges` ; ce ne sont pas des unités.
 
 ## Contrôles
 
-- Liste calculée `paquet-candidats` sur `6d67072c` relancée à 07:59Z : 11 lots
-  prêts, 5 en attente, 3 erreurs de provenance ; 11 prêts composés, 5 écartés
+- Liste calculée `paquet-candidats` sur `6d67072c` relancée à 08:20Z : 12 lots
+  prêts, 4 en attente, 3 erreurs de provenance ; 12 prêts composés, 4 écartés
   avec motif, 3 erreurs hors paquet par consigne pilote.
-- Composition : 11 unités sur `6d67072c3787` ; aucune fusion en conflit,
+- Composition : 12 unités sur `6d67072c3787` ; aucune fusion en conflit,
   aucune résolution d'union, aucune adaptation.
 - Contrôles statiques de gel (`scripts/freeze-checks.py`, au gel du porteur).
 - Contrôle d'inclusion `scripts/paquet-inclusion.py` sur la tête du manifeste.
 - Une seule suite complète sur la tête gelée, après le gel (`ameesh ci run
   3681 --full`), pas de CI par lot (§11 bis).
-- Aucune migration additive dans ce paquet : rien à appliquer en staging.
+- Migration additive **0487** (#3576, état de livraison des alertes) : à
+  appliquer en staging avant de relancer les exécuteurs (§14). Le registre
+  `schema_migrations` la suit par version : elle s'applique après 0488 même
+  si son numéro est antérieur.
