@@ -23,7 +23,10 @@ l'ordre, sans agent :
 4. les contrôles locaux : `scripts/freeze-checks.py`, puis
    `tests/parts/toujours.txt`, `tests.test_l161f_plan`, `tests.test_cluster`
    et les modules de test apportés par chaque unité. Une unité dont un module
-   rougit est retirée et le paquet est recomposé **une seule fois** ;
+   **rougit** est retirée et le paquet est recomposé **une seule fois**. Un
+   run **non concluant** (délai, base absente, psql/psycopg indisponible, rc
+   inattendu) est consigné au manifeste, à la PR et au courrier, sans retirer
+   d'unité ni arrêter le paquet : le canon §3 le veut, la ci-full tranche ;
 5. le manifeste `reviews/integration-paquet-<nom>.md` : base et SHA de la
    cible, table `## Composition` produite par `paquet-compose.py --units`
    (gabarit #3629), admissions, écartés et leur motif, contrôles locaux ;
@@ -112,10 +115,6 @@ class GitError(PaquetAutoError):
     """Une commande git a échoué."""
 
 
-class TestsInconclusive(PaquetAutoError):
-    """Un test local n'est ni vert ni rouge (environnement, base, timeout)."""
-
-
 @dataclass
 class Candidate:
     """Un lot prêt de la liste calculée, avec la source exacte à composer."""
@@ -183,6 +182,25 @@ class TestRun:
     def skipped(self) -> int:
         found = OK_RE.search(self.output)
         return int(found.group(1) or 0) if found else 0
+
+    def motive(self) -> str:
+        """Pourquoi un run est non concluant, en une ligne."""
+        if self.timed_out:
+            return "délai dépassé"
+        if self.returncode not in (0, 1):
+            return "code de retour %s" % self.returncode
+        found = INCONCLUSIVE_RE.search(self.output)
+        return _one_line(found.group(0)) if found else "résultat non concluant"
+
+    def excerpt(self, lines: int = 3) -> str:
+        """L'extrait : la ligne qui porte le motif, puis la fin de la sortie."""
+        raw = [line.strip() for line in self.output.splitlines() if line.strip()]
+        found = INCONCLUSIVE_RE.search(self.output)
+        chosen: list[str] = []
+        if found:
+            chosen = [line for line in raw if found.group(0) in line][:1]
+        chosen += raw[-lines:]
+        return " | ".join(dict.fromkeys(chosen))
 
 
 # ---------------------------------------------------------------------------
@@ -434,6 +452,41 @@ def remove_worktree(repo: Path, path: Path) -> None:
     git(repo, "worktree", "prune", check=False)
 
 
+def prune_stale_worktrees(repo: Path, max_age_hours: float,
+                          *, now: float | None = None) -> list[str]:
+    """N1 (revue #3807) : borne les worktrees d'échec gardés pour diagnostic.
+
+    Un échec garde son worktree (`--keep-worktree` ou diagnostic) ; une
+    minuterie horaire ne doit pas accumuler des checkouts complets. Seuls les
+    chemins `paquet-auto-*` **du dépôt** sont retirés, au-delà de
+    `max_age_hours` (0 = jamais), puis `worktree prune` ; la branche locale
+    reste (petite), le prochain run peut la supprimer avec `--force`.
+    """
+    if max_age_hours <= 0:
+        return []
+    cutoff = (time.time() if now is None else float(now)) - max_age_hours * 3600
+    listing = out(repo, "worktree", "list", "--porcelain", check=False)
+    removed: list[str] = []
+    for line in listing.splitlines():
+        if not line.startswith("worktree "):
+            continue
+        path = Path(line[len("worktree "):])
+        if path == repo or not path.name.startswith("paquet-auto-"):
+            continue
+        try:
+            stamp = max(path.stat().st_ctime, path.stat().st_mtime)
+        except OSError:
+            continue
+        if stamp >= cutoff:
+            continue
+        git(repo, "worktree", "remove", "--force", str(path), check=False)
+        shutil.rmtree(path, ignore_errors=True)
+        removed.append(str(path))
+    if removed:
+        git(repo, "worktree", "prune", check=False)
+    return removed
+
+
 # ---------------------------------------------------------------------------
 # Liste calculée
 # ---------------------------------------------------------------------------
@@ -552,6 +605,10 @@ def ensure_source(worktree: Path, candidate: Candidate) -> None:
     """Résout la source dans le clone ; la fetch de la branche au besoin."""
     sha = rev(worktree, candidate.source)
     if sha is None and candidate.branch:
+        # N2 (revue #3807) : la branche vient de la base, jamais d'un argument
+        # de commande ; `git fetch` la reçoit après validation, pas avant.
+        validate_branch(worktree, candidate.branch,
+                        "branche du candidat #%d" % candidate.lot)
         git(worktree, "fetch", "--no-tags", "origin", candidate.branch, check=False)
         sha = rev(worktree, candidate.source)
     if sha is None:
@@ -755,7 +812,11 @@ def check_local_tests(worktree: Path, composition: Composition, *,
     """Exécute les modules des unités puis les contrats.
 
     Rend `(exécutions, unités fautives)` ; une unité fautive est celle dont un
-    module a rougi. Un résultat non concluant lève, sans retirer d'unité.
+    module a **rougi** (test négatif). Un résultat non concluant (délai, base
+    absente, psql/psycopg indisponible, rc inattendu) est **consigné** dans
+    `runs` et ne retire aucune unité : le canon §3 veut qu'il ne retienne ni
+    paquet ni release ; la ci-full tranche. Un contrat rouge, lui, arrête
+    (l'attribution d'un rouge de contrat demande un agent).
     """
     runs: list[TestRun] = []
     faulty: list[int] = []
@@ -767,9 +828,9 @@ def check_local_tests(worktree: Path, composition: Composition, *,
         run = run_tests(worktree, "unité #%d" % unit.lot, modules, timeout=timeout)
         runs.append(run)
         if run.inconclusive:
-            raise TestsInconclusive(
-                "%s : résultat non concluant (rc %s)\n%s"
-                % (run.label, run.returncode, _tail(run.output)))
+            log("tests unité #%d : NON CONCLUANT (%s) — consigné, le paquet "
+                "continue" % (unit.lot, run.motive()))
+            continue
         if not run.green:
             faulty.append(unit.lot)
             log("tests unité #%d : ROUGE (%d modules)\n%s"
@@ -783,9 +844,9 @@ def check_local_tests(worktree: Path, composition: Composition, *,
     run = run_tests(worktree, "contrats", modules, timeout=timeout)
     runs.append(run)
     if run.inconclusive:
-        raise TestsInconclusive(
-            "%s : résultat non concluant (rc %s)\n%s"
-            % (run.label, run.returncode, _tail(run.output)))
+        log("tests contrats : NON CONCLUANT (%s) — consigné, le paquet "
+            "continue" % run.motive())
+        return runs, []
     if not run.green:
         raise PaquetAutoError(
             "tests de contrat rouges sur la tête composée (aucune unité retirée "
@@ -884,6 +945,16 @@ def build_manifest(*, name: str, target: str, base_sha: str, carrier: int,
         "",
         "- `scripts/freeze-checks.py` : vert en %.1f s." % freeze_seconds,
         "- Tests locaux : %s." % _tests_summary(tests),
+    ]
+    inconclusive = _inconclusive_lines(tests)
+    if inconclusive:
+        lines += [
+            "",
+            "Non concluants (canon §3 : ne retiennent ni paquet ni release) :",
+            "",
+        ] + inconclusive
+    lines += [
+        "",
         "- `scripts/paquet-inclusion.py` : exécuté sur cette tête après le "
         "manifeste (résultat au courrier du pilote).",
         "",
@@ -895,10 +966,25 @@ def _tests_summary(tests: list[TestRun]) -> str:
     modules = sorted({module for run in tests for module in run.modules})
     total = sum(run.tests for run in tests)
     skipped = sum(run.skipped for run in tests)
-    failures = sum(1 for run in tests if not run.green)
-    return ("%d séries, %d modules, %d tests, %d échec(s), %d sauté(s) : %s"
-            % (len(tests), len(modules), total, failures, skipped,
+    red = sum(1 for run in tests if not run.green and not run.inconclusive)
+    inconclusive = sum(1 for run in tests if run.inconclusive)
+    return ("%d séries, %d modules, %d tests exécutés, %d échec(s), "
+            "%d non concluant(s), %d sauté(s) : %s"
+            % (len(tests), len(modules), total, red, inconclusive, skipped,
                ", ".join("`%s`" % module for module in modules) or "aucun"))
+
+
+def _inconclusive_lines(tests: list[TestRun]) -> list[str]:
+    """Une ligne par run non concluant : module, motif, extrait (canon §3)."""
+    lines: list[str] = []
+    for run in tests:
+        if not run.inconclusive:
+            continue
+        modules = ", ".join(run.modules) or "aucun module"
+        lines.append("- NON CONCLUANT : %s — modules %s — %s — extrait : %s"
+                     % (run.label.replace("#", ""), modules, run.motive(),
+                        _one_line(run.excerpt())[:240]))
+    return lines
 
 
 def write_manifest(worktree: Path, rel: str, text: str, *,
@@ -1095,6 +1181,9 @@ def pr_body(*, name: str, target: str, base_sha: str, carrier: int,
             unit.lot, unit.source[:12], (": " + title) if title else ""))
     lines += [
         "- Tests locaux : %s." % _tests_summary(tests),
+    ]
+    lines += ["  " + line for line in _inconclusive_lines(tests)]
+    lines += [
         "- Contrôle d'inclusion : %s." % ("vert" if inclusion_rc == 0 else "à lire"),
         "- Freeze-checks : vert (%.1f s)." % freeze_seconds,
         "- Manifeste : `%s`." % manifest_rel(name),
@@ -1115,12 +1204,17 @@ def mail_body(*, name: str, target: str, base_sha: str, carrier: int,
         "#%d (%s)" % (item.lot, item.reason) for item in composition.discarded
     ) or "aucun"
     pr = ("PR #%d %s" % (pr_number, pr_url)) if pr_number else (pr_url or "PR non lue")
+    inconclusive = _inconclusive_lines(tests)
+    non_section = ("Non concluants (canon §3, consignés) :\n"
+                   + "\n".join("  " + line for line in inconclusive)) \
+        if inconclusive else "Non concluants : aucun."
     return """\
 Paquet {name} composé sans agent : tête `{head}` sur {target} `{base}` (branche `{branch}`, {pr}).
 
 - Unités ({n}) : {units}.
 - Écartés ({d}) : {discarded}.
 - Tests locaux : {tests}.
+- {non_section}
 - Inclusion : {inclusion}.
 - Gel : `ameesh work milestone` posé sur la tête ; manifeste `{manifest}`.
 
@@ -1129,7 +1223,7 @@ Paquet {name} composé sans agent : tête `{head}` sur {target} `{base}` (branch
         name=name, head=head, target=target, base=base_sha[:12],
         branch=branch, pr=pr, n=len(composition.units), units=units,
         d=len(composition.discarded), discarded=discarded,
-        tests=_tests_summary(tests),
+        tests=_tests_summary(tests), non_section=non_section,
         inclusion="vert" if inclusion_rc == 0 else "à lire",
         manifest=manifest_rel(name),
     )
@@ -1344,6 +1438,9 @@ def compose_packet(args: argparse.Namespace) -> int:
         ensure_carrier_branch(repo, args.carrier, branch, args.target)
     if args.force:
         clear_local_branch(repo, branch)
+    stale = prune_stale_worktrees(repo, args.keep_failed_hours)
+    for path in stale:
+        print("worktree d'échec purgé : %s" % path, flush=True)
     worktree = make_worktree(repo, base_sha, branch)
     keep_worktree = bool(args.keep_worktree)
     success = False
@@ -1475,10 +1572,13 @@ def compose_packet(args: argparse.Namespace) -> int:
         pr_number, pr_url = ensure_pull_request(
             worktree, branch, args.target, title, body)
         print("PR : %s" % (pr_url or pr_number or "?"), flush=True)
+        inconclusive = sum(1 for run in runs if run.inconclusive)
+        tests_note = ("verts" if not inconclusive
+                      else "verts + %d non concluant(s) consigné(s)" % inconclusive)
         note = ("paquet %s composé par scripts/paquet-auto.py : %d unités, "
-                "%d écartés, tests locaux verts, inclusion verte ; manifeste %s"
+                "%d écartés, tests locaux %s, inclusion verte ; manifeste %s"
                 % (args.name, len(composition.units),
-                   len(composition.discarded), rel))
+                   len(composition.discarded), tests_note, rel))
         print(freeze_carrier(worktree, args.carrier, head, note), flush=True)
         mail = mail_body(name=args.name, target=args.target, base_sha=base_sha,
                          carrier=args.carrier, head=head, branch=branch,
@@ -1540,6 +1640,9 @@ def main(argv: list[str] | None = None) -> int:
                         % DEFAULT_TIMEOUT)
     parser.add_argument("--keep-worktree", action="store_true",
                         help="conserver le worktree jetable (diagnostic)")
+    parser.add_argument("--keep-failed-hours", type=float, default=24.0,
+                        help="N1 : purger un worktree d'échec au-delà de N "
+                             "heures (défaut : 24 ; 0 = jamais)")
     parser.add_argument("--no-packet-record", action="store_true",
                         help="banc : ne pas lire/écrire la base (porteur, packet record)")
     args = parser.parse_args(argv)

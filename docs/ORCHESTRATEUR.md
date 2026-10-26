@@ -566,7 +566,10 @@ conflit sans le résoudre, passe les contrôles locaux, écrit le manifeste,
 PR, gèle la tête et couronne le pilote. « Verdict non requis », la CI complète
 et le feu restent au pilote. Un lot rendu en **erreur** par `paquet-candidats`
 n'est jamais composé : il est écarté au manifeste avec son motif (rc 3 et
-`errors_by_lot`, #3813).
+`errors_by_lot`, #3813). Un run local **non concluant** (délai, base absente,
+psql/psycopg indisponible) est consigné au manifeste, à la PR et au courrier,
+sans retirer d'unité ni arrêter le paquet : seul un test négatif bloque
+(canon §3), la ci-full tranche.
 
 ```sh
 scripts/paquet-auto.py --target main --name h-20261027-01 --carrier 3808

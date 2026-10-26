@@ -14,7 +14,9 @@ import pathlib
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
+from unittest import mock
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
 SCRIPT = REPO / "scripts" / "paquet-auto.py"
@@ -104,6 +106,71 @@ class PaquetAutoBanc(unittest.TestCase):
         return first, conflict, third
 
     # -- témoins -----------------------------------------------------------
+    def test_non_concluant_consigne_sans_retirer_d_unite(self) -> None:
+        composition = paquet_auto.Composition(
+            units=[paquet_auto.Unit(1, "0" * 40, "1" * 40)],
+            discarded=[], head="2" * 40)
+        unit_run = paquet_auto.TestRun(
+            "unité #1", ["tests.test_unit"], 1,
+            "OperationalError: could not connect to server", 0.1)
+        contract_run = paquet_auto.TestRun(
+            "contrats", ["tests.test_contract"], None,
+            "did not finish in 1 s", 1.0, timed_out=True)
+        with mock.patch.object(paquet_auto, "unit_test_modules",
+                               return_value=["tests.test_unit"]), \
+                mock.patch.object(paquet_auto, "contract_modules",
+                                  return_value=["tests.test_contract"]), \
+                mock.patch.object(paquet_auto, "run_tests",
+                                  side_effect=[unit_run, contract_run]):
+            runs, faulty = paquet_auto.check_local_tests(
+                pathlib.Path(self.tmp.name), composition, timeout=1,
+                log=lambda _line: None)
+        self.assertEqual(faulty, [])
+        self.assertEqual([run.label for run in runs], ["unité #1", "contrats"])
+        self.assertTrue(runs[0].inconclusive)
+        self.assertTrue(runs[1].inconclusive)
+        manifest = paquet_auto.build_manifest(
+            name="banc", target="main", base_sha=self.base, carrier=99,
+            composition=composition,
+            table="## Composition (1 unité, 1 lot)\n", tests=runs,
+            freeze_seconds=0.0)
+        self.assertIn("Non concluants (canon §3", manifest)
+        self.assertIn("tests.test_unit", manifest)
+        self.assertIn("could not connect", manifest)
+        self.assertIn("délai dépassé", manifest)
+
+    def test_rouge_reel_retire_l_unite(self) -> None:
+        composition = paquet_auto.Composition(
+            units=[paquet_auto.Unit(1, "0" * 40, "1" * 40)],
+            discarded=[], head="2" * 40)
+        red = paquet_auto.TestRun(
+            "unité #1", ["tests.test_unit"], 1,
+            "FAIL: test_x (tests.test_unit.TestX)\nAssertionError", 0.1)
+        with mock.patch.object(paquet_auto, "unit_test_modules",
+                               return_value=["tests.test_unit"]), \
+                mock.patch.object(paquet_auto, "run_tests",
+                                  side_effect=[red]):
+            runs, faulty = paquet_auto.check_local_tests(
+                pathlib.Path(self.tmp.name), composition, timeout=1,
+                log=lambda _line: None)
+        self.assertEqual(faulty, [1])
+        self.assertFalse(runs[0].inconclusive)
+
+    def test_worktree_d_echec_ancien_est_purge(self) -> None:
+        path = pathlib.Path(self.tmp.name) / "paquet-auto-vieux"
+        self.git("worktree", "add", "-b", "tmp/vieux", str(path), self.base,
+                 cwd=self.repo)
+        removed = paquet_auto.prune_stale_worktrees(
+            self.repo, 1, now=time.time() + 3600)
+        self.assertIn(str(path), removed)
+        self.assertFalse(path.exists())
+
+    def test_branche_de_candidat_invalide_refusee_avant_fetch(self) -> None:
+        candidate = paquet_auto.Candidate(
+            1, "deadbeef" * 5, branch="--upload-pack=evil")
+        with self.assertRaises(paquet_auto.InputError):
+            paquet_auto.ensure_source(self.repo, candidate)
+
     def test_conflit_ecarte_sans_rien_commiter(self) -> None:
         first, conflict, third = self.fixture()
         worktree = self.worktree("banc")
