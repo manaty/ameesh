@@ -4444,7 +4444,9 @@ class CiResults(Domain):
     @abc.abstractmethod
     def latest_concluded(self, branches: Sequence[str]) -> list[dict]:
         """Par dépôt, branche et workflow, sur la dernière tête conclue de la
-        branche, l'exécution conclue verte ou rouge la plus récente."""
+        branche, l'exécution conclue verte ou rouge la plus récente. #3686 :
+        un `workflow_dispatch` d'un workflow qui ne tourne jamais autrement
+        sur la branche n'y compte pas (geste d'opérateur, pas l'état fusionné)."""
 
     @abc.abstractmethod
     def head_replaced(self, repo: str, branch: str, head_sha: str, run_id: int) -> bool:
