@@ -989,8 +989,9 @@ class Accounts(Domain):
     def active(self, host: str, harness: str) -> dict | None:
         """La ligne `account_active` (account, forced, forced_until,
         updated_at), ou None. `forced_until` (epoch, #3755) est l'échéance du
-        forçage manuel ; None = pas de forçage, ou forçage antérieur à la
-        migration. `updated_ts` (epoch) date la dernière écriture."""
+        forçage manuel ; None = pas de forçage, ou ligne forcée posée hors
+        `ameesh accounts use` sans échéance. `updated_ts` (epoch) date la
+        dernière écriture."""
 
     @abc.abstractmethod
     def init_active(self, host: str, harness: str, account: str) -> dict:

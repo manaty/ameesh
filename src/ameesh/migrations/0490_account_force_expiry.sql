@@ -7,9 +7,10 @@
 -- pc-smichea le 26/10/2026, le Codex secondaire a été forcé à ~11:45Z et
 -- laissé à 100 %, « in overage (billed beyond the plan) », jusqu'au retour
 -- manuel à l'automatique à 13:41Z. `account_active.forced_until` porte
--- l'instant où le forçage rend la main à l'automate. NULL = ligne antérieure
--- à la migration : le forçage en cours n'est pas levé rétroactivement, il
--- reste sans échéance jusqu'à la prochaine pose.
+-- l'instant où le forçage rend la main à l'automate. Un forçage posé avant
+-- la migration n'a pas d'échéance connue : il en reçoit une (une heure) pour
+-- que le correctif s'applique aussi aux forçages en cours, sans les lever
+-- d'un coup ; une pose ultérieure fixe la sienne.
 --
 -- `account_overage` n'était calculée que par l'hôte qui voit le compte, dans
 -- SA configuration et SES journaux. La passe d'alertes tourne chez le
@@ -18,11 +19,18 @@
 -- publiés avec les jauges dans l'historique partagé : la passe de n'importe
 -- quel hôte peut lever l'alerte pour tous les comptes qui publient.
 --
--- Additif seulement : deux colonnes nullables, aucune donnée réécrite.
+-- Additif seulement : deux colonnes nullables, et une échéance bornée posée
+-- sur les forçages en cours (aucune autre donnée réécrite).
 alter table account_active add column if not exists forced_until timestamptz;
 
 comment on column account_active.forced_until is
-    '#3755: instant where a manual force returns to the automatic choice (NULL: no expiry, legacy force)';
+    '#3755: instant where a manual force returns to the automatic choice (NULL: no force)';
+
+-- #3755 : les forçages posés avant la colonne n'ont pas d'échéance. Ils en
+-- reçoivent une heure : le correctif vaut pour eux aussi, et le choix suivant
+-- au-delà reprend la main (journalisé `auto`), sans attendre un geste manuel.
+update account_active set forced_until = now() + interval '1 hour'
+ where forced and forced_until is null;
 
 alter table quota_gauge_readings add column if not exists overage_capable boolean;
 alter table quota_gauge_readings add column if not exists overage_in_use boolean;
