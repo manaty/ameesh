@@ -58,6 +58,8 @@ se lève à `CHRONIC_S` de cumul ; un quota n'y entre pas (L48 l'arrête déjà)
 from __future__ import annotations
 
 import re
+import json
+import math
 import time
 from datetime import datetime, timezone
 
@@ -307,13 +309,22 @@ def window_total(closed, now: float, ongoing_since: float = 0.0) -> float:
     return total
 
 
-def window_text(base: str, total: float, episodes: int, since: float, at: float) -> str:
+def window_text(base: str, total: float, episodes: int, since: float, at: float,
+                *, closed=None, ongoing: float = 0.0, paused: bool = False) -> str:
     """#3733 : `status_text` suffixé du cumul de l'heure ; `base` tel quel
     sans cumul. `since` est le début de la série, `at` l'heure de la mesure."""
     if total < 1 or episodes < 1 or not since:
         return base
-    return "%s [rate_limited %ds in 1h x%d since %s at %s]" % (
+    texte = "%s [rate_limited %ds in 1h x%d since %s at %s]" % (
         base, int(total), int(episodes), _stamp(since), _stamp(at))
+    if closed is not None:
+        # #3743 : conserver les vrais bords des épisodes et distinguer le
+        # tour en cours de l'attente, sans effacer le marqueur #1270.
+        payload = json.dumps({"closed": window_prune(closed, at),
+                              "ongoing": ongoing, "paused": paused},
+                             separators=(",", ":"))
+        texte += " [rate_window_v2 " + payload + "]"
+    return texte
 
 
 def window_state(status_text: str | None) -> dict | None:
@@ -325,8 +336,23 @@ def window_state(status_text: str | None) -> dict | None:
         since, at = _parse_stamp(m.group(3)), _parse_stamp(m.group(4))
     except ValueError:
         return None
-    return {"total": float(m.group(1)), "episodes": int(m.group(2)),
-            "since": since, "at": at}
+    result = {"total": float(m.group(1)), "episodes": int(m.group(2)),
+              "since": since, "at": at}
+    details = re.search(r"\[rate_window_v2 (\{[^\n]*?\})\]", str(status_text or ""))
+    if details:
+        try:
+            payload = json.loads(details.group(1))
+            closed = [(float(s), float(e)) for s, e in payload["closed"]]
+            ongoing = float(payload["ongoing"])
+            if (len(closed) > WINDOW_MAX or not math.isfinite(ongoing)
+                    or any(not math.isfinite(s) or not math.isfinite(e) or e < s
+                           for s, e in closed)):
+                return None
+            result.update(closed=closed, ongoing=ongoing,
+                          paused=bool(payload["paused"]))
+        except (ValueError, TypeError, KeyError):
+            return None
+    return result
 
 
 def _ongoing(debit: dict | None) -> float:
@@ -344,6 +370,12 @@ def window_seen(fenetre: dict | None, debit: dict | None,
     if not fenetre:
         return 0.0
     maintenant = time.time() if now is None else float(now)
+    if "closed" in fenetre:
+        fin = min(maintenant, fenetre["at"]) if fenetre["paused"] else maintenant
+        ongoing = fenetre["ongoing"]
+        return min(WINDOW_S, window_total(fenetre["closed"], maintenant)
+                   + (max(0.0, fin - max(ongoing, maintenant - WINDOW_S))
+                      if ongoing else 0.0))
     ecart = maintenant - fenetre["at"]
     if ecart >= WINDOW_S:
         return 0.0
@@ -356,12 +388,18 @@ def window_seen(fenetre: dict | None, debit: dict | None,
 def window_restore(fenetre: dict | None, debit: dict | None,
                    now: float | None = None) -> tuple[list, float]:
     """#3733 : (épisodes clos, début de série) relus de la ligne au
-    redémarrage. Le cumul mesuré, moins la part de l'épisode en cours (que
-    l'exécuteur recompte depuis son début), devient un épisode clos qui
-    finit à l'heure de la mesure."""
+    redémarrage. Le format v2 conserve les bornes réelles. L'ancien format
+    agrégé, qui n'a pas ces bornes, garde son repli approximatif jusqu'à
+    expiration de sa mesure (une heure)."""
     if not fenetre:
         return [], 0.0
     maintenant = time.time() if now is None else float(now)
+    if "closed" in fenetre:
+        episodes = list(fenetre["closed"])
+        if fenetre["ongoing"] and not _ongoing(debit):
+            episodes.append((fenetre["ongoing"], fenetre["at"]))
+        episodes = window_prune(episodes, maintenant)
+        return episodes, fenetre["since"] if episodes or fenetre["ongoing"] else 0.0
     if maintenant - fenetre["at"] >= WINDOW_S:
         return [], 0.0
     clos = fenetre["total"]
