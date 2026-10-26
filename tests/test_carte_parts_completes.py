@@ -29,12 +29,14 @@ Sans base : lecture du workflow, de `scripts/map.py` et de
 from __future__ import annotations
 
 import importlib.util
+import io
 import json
 import pathlib
 import re
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
@@ -71,7 +73,7 @@ class MiroirDesPartsTest(unittest.TestCase):
 
     def test_le_miroir_couvre_la_matrice_de_mesure(self):
         matrice = sorted(f"mesure-{p}-{n}" for p, n, _ in INCLUDE.findall(WORKFLOW))
-        self.assertEqual(len(matrice), 14, "matrice de mesure inattendue")
+        self.assertEqual(len(matrice), 18, "matrice de mesure inattendue")
         m = MIROIR.search(WORKFLOW)
         self.assertIsNotNone(m, "PARTS_MESURE introuvable dans carte.yml")
         miroir = sorted(m.group(2).split())
@@ -81,14 +83,14 @@ class MiroirDesPartsTest(unittest.TestCase):
     def test_la_mesure_psql_est_decoupee(self):
         # B : une seule part de 45 modules pesait 38 min de mur pour 40 de
         # plafond, annulée deux fois ; le run 38845518821 (16/10) a annulé
-        # psql 1/2 et 2/2, psycopg 2/4 et 3/4 à 40m30 : 6 parts psql et 8
-        # parts psycopg (#3450 : 4/6 ne tenaient pas sous le plafond de 60 min
-        # sur un pool saturé, run du 24/10).
+        # psql 1/2 et 2/2, psycopg 2/4 et 3/4 à 40m30 : 6 parts psql et 12
+        # parts psycopg (#3450 : 8 ; #3604 : 8 ne tenaient plus sous le
+        # plafond de 60 min sur un pool saturé, run 40177589953 du 25/10).
         psql = [(p, n, of) for p, n, of in INCLUDE.findall(WORKFLOW) if p == "psql"]
         self.assertEqual(psql, [("psql", str(n), "6") for n in range(1, 7)])
         psycopg = [(p, n, of) for p, n, of in INCLUDE.findall(WORKFLOW)
                    if p == "psycopg"]
-        self.assertEqual(psycopg, [("psycopg", str(n), "8") for n in range(1, 9)])
+        self.assertEqual(psycopg, [("psycopg", str(n), "12") for n in range(1, 13)])
 
     def test_le_plafond_des_mesures_est_celui_que_le_plan_verifie(self):
         # #2224 : psycopg 3/6 annulée à 40m46 (run 39015105210), aucune carte.
@@ -404,6 +406,36 @@ class MergeRefuseTest(unittest.TestCase):
             self.assertFalse(sortie.exists(), "aucune carte ne doit être publiée")
             self.assertIn("::error::couverture incomplète", proc.stdout)
             self.assertIn("module du plan non mesuré : b", proc.stdout)
+
+
+class BorneDesTestsSousMesureTest(unittest.TestCase):
+    """#3604 : un test bloqué est nommé, et les suivants tournent."""
+
+    class _Suite(unittest.TestCase):
+        continu = False
+
+        def test_bloque(self):
+            time.sleep(30)
+
+        def test_continue(self):
+            type(self).continu = True
+
+    def test_la_borne_nomme_le_test_et_les_suivants_tournent(self):
+        resultat_cls = parts._result_class(None, {}, None, None, 0.2)
+        runner = unittest.TextTestRunner(stream=io.StringIO(), verbosity=0,
+                                         resultclass=resultat_cls)
+        ancien = parts.armer_borne(0.2)
+        try:
+            resultat = runner.run(
+                unittest.TestLoader().loadTestsFromTestCase(self._Suite))
+        finally:
+            parts.signal.setitimer(parts.signal.ITIMER_REAL, 0)
+            if ancien is not None:
+                parts.signal.signal(parts.signal.SIGALRM, ancien)
+        self.assertEqual(resultat.testsRun, 2)
+        self.assertEqual(len(resultat.errors), 1)
+        self.assertIn("TestTimeout", resultat.errors[0][1])
+        self.assertTrue(self._Suite.continu)
 
 
 if __name__ == "__main__":  # pragma: no cover

@@ -497,6 +497,14 @@ class AgentHostTest(unittest.TestCase):
                         FAKE_DB_PYTHON=str(self.bin / 'db-python'),
                         FAKE_SHARE=str(self.share),
                         PATH=str(self.bin) + os.pathsep + os.environ['PATH'])
+        # #3604 : sous mesure, chaque faux exécutable de la VM (ssh, ameesh,
+        # systemctl…) démarrait sa propre couverture ; test_503 pesait ~62 s
+        # par test (run 40240378071, part psycopg 2/12 coupée à 61 min). Seul
+        # le processus de test est mesuré : ses lectures et son code restent
+        # dans la carte, les enfants ne sont plus instrumentés — même correctif
+        # que test_1252 dans 240a58a7.
+        for variable in ('CARTE_MESURE', 'COVERAGE_PROCESS_START'):
+            self.env.pop(variable, None)
         self.agents = [dict(name=n, host=h, mode=m, status=s) for n,h,m,s in [
             ('dev9', 'host-agents', 'execute', 'idle'),
             ('dev8', 'host-agents', 'execute', 'idle'),
