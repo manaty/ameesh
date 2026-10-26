@@ -61,15 +61,20 @@ auteurs, avec les mêmes exceptions du canon §2 :
   hors du hook), le commit est attribué à la famille de session de son
   committer, lue au journal des tours (`turn_costs`, `_turns_harness`) : un
   commit du relecteur désigné reste sa correction, un commit de l'assigné
-  reste l'auteur. Un tiers non relecteur sans reçu reste inconnu : aucun camp
-  ne le suppose. #2721 : à la désignation, ce repli porte sa trace
-  (`proof: turn-journal`, `fallback_commits`), et un committer distinct de la
-  référence doit être au registre.
+  reste l'auteur. #3805 : quand l'auteur Git est un agent du registre
+  **différent du committer**, les deux familles comptent comme auteurs du
+  contenu (le doute conserve, comme #2924) ; une réémission à patch-id
+  verbatim identique d'un commit qui porte un reçu exact garde ce reçu, et la
+  copie n'est pas attribuée à son committer. Un tiers non relecteur sans reçu
+  et sans auteur Git d'agent reste inconnu : aucun camp ne le suppose. #2721 :
+  à la désignation, ce repli porte sa trace (`proof: turn-journal`,
+  `fallback_commits`), et un committer distinct de la référence doit être au
+  registre.
 
 Le module ne devine jamais une famille depuis un nom Git seul : le committer
-doit porter l'adresse d'agent (`<nom>@ameesh.invalid`) et la famille vient du
-journal des tours. Un reçu exact contradictoire est une erreur, pas une
-absence.
+et l'auteur Git doivent porter l'adresse d'agent (`<nom>@ameesh.invalid`),
+l'agent doit être au registre, et la famille vient du journal des tours. Un
+reçu exact contradictoire est une erreur, pas une absence.
 """
 from __future__ import annotations
 
@@ -422,6 +427,38 @@ def commit_actor(repo: str, sha: str, db=None) -> tuple[str, float]:
     return actor, stamp
 
 
+def commit_author(repo: str, sha: str, db=None) -> tuple[str, float]:
+    """`(acteur, instant)` de l'**auteur Git** d'adresse d'agent, sinon ("", 0).
+
+    L'auteur Git est la signature du contenu ; un rebase ou un amend conserve
+    l'auteur d'origine et change le committer (#2808). Le nom Git seul ne
+    prouve rien : l'adresse `<nom>@ameesh.invalid` est exigée **et l'agent doit
+    être au registre** (#3805) ; l'ancienne adresse `<nom>@ameesh.local` n'est
+    lue qu'avec `db`, datée d'avant la convention et vers un agent du registre
+    (#3111). L'instant (`%at`) sert au journal des tours du commit d'origine,
+    jamais à une proximité arbitraire.
+
+    Une lecture impossible ou un auteur hors registre rendent `("", 0)` : le
+    doute ne devine jamais une famille depuis un nom Git seul."""
+    if not repo or not sha:
+        return "", 0.0
+    text = plan_git._out(repo, "show", "-s", "--format=%ae%x1f%at", sha)
+    if text is None:
+        return "", 0.0
+    fields = str(text).strip().split("\x1f")
+    if len(fields) != 2:
+        return "", 0.0
+    email, raw_ts = fields[0].strip().lower(), fields[1].strip()
+    try:
+        stamp = float(raw_ts)
+    except ValueError:
+        return "", 0.0
+    actor = _agent_of_email(db, email, stamp)
+    if not actor or not _registered(db, actor):
+        return "", 0.0
+    return actor, stamp
+
+
 def commit_ids_written_by(repo: str, commits: Sequence[str], name: str,
                           db=None) -> Optional[list]:
     """Les commits de la plage dont `name` est l'**auteur Git** (`%ae`).
@@ -482,6 +519,229 @@ def actor_family(db, actor: str, at_ts: float, families) -> str:
     except Exception:  # noqa: BLE001 - journal illisible : famille inconnue
         return ""
     return _family(harness, families)
+
+
+# --------------------------------------------------------------------------
+# #3805 : un commit rebasé garde l'auteur de son contenu
+# --------------------------------------------------------------------------
+#
+# Un rebase écrit un nouvel objet : le reçu exact reste sur l'ancien commit et
+# le nouveau n'en a pas. Le committer est alors l'agent qui a réécrit, pas
+# forcément celui qui a écrit le contenu. Deux preuves se complètent :
+#
+# * une réémission à patch-id verbatim identique d'un commit qui porte un reçu
+#   exact **garde ce reçu** : l'auteur Git (conservé par le rebase) et sa date
+#   d'auteur retrouvent l'original, et la copie reste attribuée à son auteur ;
+# * sans ce reçu, l'auteur Git d'adresse d'agent **différent du committer** est
+#   un auteur du contenu comme le committer (le doute conserve, comme #2924) :
+#   les deux familles sont exclues de la relecture.
+#
+# Un nom Git hors registre ne prouve jamais une famille : le doute tient le
+# commit pour inconnu, il ne le crédite pas à un nom deviné.
+
+def _receipt_search_heads(db, item: Mapping, repo: str) -> list:
+    """Les gels antérieurs du lot encore lisibles, pour retrouver un reçu."""
+    lot = int((item or {}).get("id") or 0)
+    if db is None or not lot or not repo:
+        return []
+    try:
+        rows = storage.of(db).work.milestones(lot, None) or []
+    except Exception:  # noqa: BLE001 - jalons illisibles : pas de source
+        return []
+    heads = []
+    for row in rows:
+        if str(row.get("kind") or "") != "frozen":
+            continue
+        sha = str(row.get("sha") or "").strip()
+        if not sha or sha in heads:
+            continue
+        try:
+            if plan_git.local_commit(repo, sha):
+                heads.append(sha)
+        except Exception:  # noqa: BLE001 - dépôt illisible : ce gel est ignoré
+            continue
+    return heads
+
+
+def _same_patch_candidates(db, item: Mapping, repo: str, email: str,
+                           cache: Optional[dict] = None) -> list:
+    """`[(sha, author_stamp)]` des commits non-fusions du même auteur Git.
+
+    `--all` couvre les refs du clone ; les gels antérieurs du lot, souvent
+    détachés après un force-push, sont ajoutés comme point de départ quand
+    leur objet est encore lisible. Le résultat est mis en cache par appelant :
+    une plage rebasée peut contenir plusieurs copies du même auteur.
+    """
+    if cache is not None and email in cache:
+        return cache[email]
+    args = ["log", "--all", "--no-merges",
+            "--format=%H%x1f%ae%x1f%at%x1f%P", "--author=" + email]
+    args.extend(_receipt_search_heads(db, item, repo))
+    try:
+        log = plan_git._out(repo, *args)
+    except Exception:  # noqa: BLE001 - recherche impossible : pas de reçu
+        log = None
+    candidates = []
+    for line in str(log or "").splitlines():
+        parts = line.split("\x1f")
+        if len(parts) != 4:
+            continue
+        candidate, candidate_email, raw_stamp, parents = (
+            part.strip() for part in parts)
+        if candidate_email.lower() != email or len(parents.split()) > 1:
+            continue
+        try:
+            stamp = float(raw_stamp)
+        except ValueError:
+            continue
+        candidates.append((candidate, stamp))
+    if cache is not None:
+        cache[email] = candidates
+    return candidates
+
+
+def _same_patch_receipt(db, item: Mapping, repo: str, sha: str, *,
+                        provider=None, cache: Optional[dict] = None
+                        ) -> Optional[dict]:
+    """Le reçu exact d'une réémission à patch-id verbatim identique (#3805).
+
+    Le rebase conserve l'auteur Git et sa date ; on cherche, parmi les refs et
+    les gels antérieurs du lot, un commit du même auteur au même instant dont
+    le patch est identique et qui porte un reçu exact. Le reçu de l'original
+    vaut alors pour la copie : elle n'est pas attribuée au committer.
+
+    Une lecture impossible ou ambiguë rend None : c'est une absence de preuve,
+    jamais une erreur (le repli committer + auteur Git reste fermé).
+    """
+    if db is None or not repo or not sha:
+        return None
+    text = plan_git._out(repo, "show", "-s", "--format=%ae%x1f%at%x1f%P", sha)
+    if text is None:
+        return None
+    fields = str(text).strip().split("\x1f")
+    if len(fields) != 3:
+        return None
+    email = fields[0].strip().lower()
+    try:
+        stamp = float(fields[1].strip())
+    except ValueError:
+        return None
+    if len(fields[2].split()) > 1:
+        return None                     # un commit de fusion n'a pas ce patch
+    actor = _agent_of_email(db, email, stamp)
+    if not actor or not _registered(db, actor):
+        return None
+    candidates = [candidate for candidate, candidate_stamp
+                  in _same_patch_candidates(db, item, repo, email, cache)
+                  if candidate != sha and candidate_stamp == stamp]
+    if not candidates:
+        return None
+    try:
+        wanted = plan_git._diff_patch_id(repo, sha + "^", sha)
+    except Exception:  # noqa: BLE001 - patch illisible : pas de preuve
+        return None
+    if not wanted:
+        return None
+    for candidate in candidates:
+        try:
+            receipt = _commit_receipt(provider, db, candidate, strict=False)
+        except review_provenance.ProvenanceError:
+            continue                    # un reçu corrompu ne prouve rien ici
+        if not receipt:
+            continue
+        if str(receipt.get("actor") or "").strip().casefold() != actor.casefold():
+            continue
+        try:
+            patch = plan_git._diff_patch_id(repo, candidate + "^", candidate)
+        except Exception:  # noqa: BLE001 - ce candidat reste sans preuve
+            continue
+        if patch and patch == wanted:
+            return receipt
+    return None
+
+
+def _unreceived_role(actor: str, author_name: str, reviewers) -> str:
+    """Le rôle d'un acteur dans la lecture : référence, relecteur ou tiers."""
+    if author_name and str(actor).casefold() == str(author_name).strip().casefold():
+        return "reference"
+    if actor in reviewers:
+        return "reviewer"
+    return "third"
+
+
+def _unreceived_authors(db, item: Mapping, repo: str, sha: str, *,
+                        author_name: str, author_family: str, reviewers,
+                        families, provider=None, carry_receipts: bool = True,
+                        cache: Optional[dict] = None) -> tuple[list, list]:
+    """`(lignes, inconnus)` d'un commit sans reçu exact (#2721/#3805).
+
+    Chaque ligne est `{name, family, role, proof}` ; `role` vaut `reference`,
+    `reviewer` ou `third`, et `proof` dit que la famille vient du journal des
+    tours (trace de la désignation). Un reçu porté par une réémission
+    identique prime sur le committer. Sinon le committer et l'auteur Git
+    d'agent, quand ils diffèrent, sont **tous deux** auteurs du contenu : le
+    doute conserve les deux familles (#2924). Un tiers sans famille prouvée
+    reste inconnu, et un nom Git hors registre n'est jamais lu.
+
+    `carry_receipts=False` (lecture d'un gel antérieur) garde l'attribution
+    committer/auteur Git sans relancer la recherche de reçu par patch-id : le
+    report des gels antérieurs couvre déjà le contenu qui survit (#2924), et
+    une plage historique peut avoir beaucoup de commits sans reçu. `cache`
+    partage la liste des candidats d'un auteur entre les copies d'une même
+    lecture.
+    """
+    committer, committer_stamp = commit_actor(repo, sha, db)
+    git_author, author_stamp = commit_author(repo, sha, db)
+    # #3301 : un objet créé hors d'un tour d'agent (committer hors registre)
+    # n'achète pas le reçu d'une copie : le reçu ne vaut que pour une
+    # réémission faite par un agent. #3805 : un rebase d'agent en est une.
+    agent_made = bool(committer) and (
+        (author_name and committer.casefold() == str(author_name).strip().casefold())
+        or _registered(db, committer))
+    exact = (_same_patch_receipt(db, item, repo, sha, provider=provider,
+                                 cache=cache)
+             if agent_made and carry_receipts else None)
+    if exact is not None:
+        actor = str(exact.get("actor") or "").strip()
+        if not actor:
+            return [], [sha[:12]]
+        return [{"name": actor,
+                 "family": _family(exact.get("harness"), families),
+                 "role": _unreceived_role(actor, author_name, reviewers),
+                 "proof": False}], []
+    if (git_author and committer
+            and git_author.casefold() != committer.casefold()
+            and agent_made):
+        rows, unknown = [], []
+        for actor, stamp in ((committer, committer_stamp),
+                             (git_author, author_stamp)):
+            role = _unreceived_role(actor, author_name, reviewers)
+            proven = actor_family(db, actor, stamp, families)
+            if role == "reference" and not proven:
+                proven = author_family
+            if role == "third" and not proven:
+                if sha[:12] not in unknown:
+                    unknown.append(sha[:12])
+                continue
+            rows.append({"name": actor, "family": proven, "role": role,
+                         "proof": True})
+        if not rows:
+            return [], [sha[:12]]
+        return rows, unknown
+    actor, stamp = committer, committer_stamp
+    if not actor:
+        return [], [sha[:12]]
+    role = _unreceived_role(actor, author_name, reviewers)
+    if role != "reference" and not _registered(db, actor):
+        return [], [sha[:12]]
+    if role == "third":
+        # #2721 : un tiers non relecteur sans reçu reste inconnu ; lui seul ne
+        # prouve pas avoir écrit le contenu de la plage.
+        return [], [sha[:12]]
+    proven = actor_family(db, actor, stamp, families)
+    if role == "reference" and not proven:
+        proven = author_family
+    return [{"name": actor, "family": proven, "role": role, "proof": True}], []
 
 
 # --------------------------------------------------------------------------
@@ -1859,12 +2119,13 @@ def _prior_reading(db, item: Mapping, freeze: Mapping, commits: Sequence[str],
                    ) -> tuple[dict, dict, dict, list]:
     """`(auteurs, commits_écrits, corrections, inconnus)` d'un gel antérieur.
 
-    Même attribution que `reading` — reçu exact, puis committer d'adresse
-    d'agent et journal des tours (#2721) — mais sans la reprise des gels
-    encore plus anciens. `commits_écrits` associe à chaque acteur les commits
-    qu'il a écrits : c'est la preuve de contenu de #2924. `corrections` porte
-    les commits des relecteurs désignés ; leur qualification de « correctif de
-    premier tour » se fait dans `_prior_correctors` (#2888).
+    Même attribution que `reading` — reçu exact, puis committer et auteur Git
+    d'adresse d'agent avec le journal des tours (#2721/#3805) — mais sans la
+    reprise des gels encore plus anciens. `commits_écrits` associe à chaque
+    acteur les commits qu'il a écrits : c'est la preuve de contenu de #2924.
+    `corrections` porte les commits des relecteurs désignés ; leur
+    qualification de « correctif de premier tour » se fait dans
+    `_prior_correctors` (#2888).
 
     `ignore_missing(sha)` (#3301) ne dispense que les commits sans reçu et
     sans attribution : jamais un auteur prouvé ou un reçu contradictoire.
@@ -1920,29 +2181,20 @@ def _prior_reading(db, item: Mapping, freeze: Mapping, commits: Sequence[str],
             record_unreadable(sha)
             continue
         if receipt is None:
-            actor, stamp = commit_actor(repo, sha, db)
-            if not actor:
-                record_unknown(sha)
-                continue
-            if actor != author_name:
-                try:
-                    known = registry.get(db, actor) is not None
-                except Exception:  # noqa: BLE001 - registre illisible : inconnu
-                    known = False
-                if not known:
-                    record_unknown(sha)
-                    continue
-            if actor == author_name:
-                proven = actor_family(db, actor, stamp, families) or author_family
-                by_name.setdefault(actor, set()).add(proven)
+            rows, missing = _unreceived_authors(
+                db, item, repo, sha, author_name=author_name,
+                author_family=author_family, reviewers=reviewers,
+                families=families, provider=provider, carry_receipts=False)
+            for value in missing:
+                record_unknown(value)
+            for row in rows:
+                actor = row["name"]
                 written.setdefault(actor, []).append(sha)
-                continue
-            if actor in reviewers:
-                proven = actor_family(db, actor, stamp, families)
-                review_commits.setdefault(actor, []).append((sha, proven))
-                written.setdefault(actor, []).append(sha)
-                continue
-            record_unknown(sha)
+                if row["role"] == "reviewer":
+                    review_commits.setdefault(actor, []).append(
+                        (sha, row["family"]))
+                else:
+                    by_name.setdefault(actor, set()).add(row["family"])
             continue
         actor = str(receipt.get("actor") or "").strip()
         if not actor:
@@ -2539,7 +2791,11 @@ def reading(db, item: Mapping, milestone: Optional[Mapping],
     Un commit sans reçu est attribué au committer d'adresse d'agent : un commit
     du titulaire de référence reste le sien ; un relecteur désigné reste
     l'auteur de sa correction, avec sa famille de session ; un tiers non
-    relecteur reste inconnu. Le seuil du §2 ne décide que de la trace « correctif
+    relecteur reste inconnu. #3805 : quand l'auteur Git est un agent du
+    registre différent du committer, les deux familles sont auteurs du contenu
+    (le doute conserve) ; une réémission à patch-id verbatim identique d'un
+    commit qui porte un reçu exact garde ce reçu et n'est pas attribuée au
+    committer. Le seuil du §2 ne décide que de la trace « correctif
     de premier tour », jamais de l'auteur (#2888).
 
     Les **correcteurs** (#2739) sont les relecteurs désignés dont le correctif
@@ -2632,6 +2888,9 @@ def reading(db, item: Mapping, milestone: Optional[Mapping],
     unknown: list[str] = []
     review_commits: dict[str, list[tuple[str, str]]] = {}
     proofs: dict[str, set[str]] = {}
+    # #3805 : les copies d'une même réémission partagent la liste des commits
+    # candidats d'un auteur (une seule recherche `git log --all` par auteur).
+    patch_receipt_cache: dict = {}
 
     def record_commit(actor: str, sha: str) -> None:
         """#3742 : le commit attribué à un acteur, pour nommer un refus de gel."""
@@ -2657,36 +2916,22 @@ def reading(db, item: Mapping, milestone: Optional[Mapping],
             unknown.append(sha[:12])
             continue
         if receipt is None:
-            actor, stamp = commit_actor(repo, sha, db)
-            if not actor:
-                unknown.append(sha[:12])
-                continue
-            if actor != author_name:
-                try:
-                    known = registry.get(db, actor) is not None
-                except Exception:  # noqa: BLE001 - registre illisible : inconnu
-                    known = False
-                if not known:
-                    # un committer distinct de la référence doit être un agent
-                    # du registre : un auteur forgé n'achète pas une famille
-                    unknown.append(sha[:12])
-                    continue
-            if actor == author_name:
-                # le journal du tour du commit d'abord : c'est le harnais qui
-                # a réellement tourné ; la famille de gel prend le relais
-                proven = actor_family(db, actor, stamp, families) or author_family
-                by_name.setdefault(actor, set()).add(proven)
-                record_commit(actor, sha)
-                proofs.setdefault(actor, set()).add(sha[:12])
-                continue
-            if actor in reviewers:
-                proven = actor_family(db, actor, stamp, families)
-                review_commits.setdefault(actor, []).append((sha, proven))
-                proofs.setdefault(actor, set()).add(sha[:12])
-                continue
-            # Un tiers sans reçu n'est pas attribuable : aucun camp ne le
-            # suppose, même si un relecteur porte le même nom.
-            unknown.append(sha[:12])
+            rows, missing = _unreceived_authors(
+                db, item, repo, sha, author_name=author_name,
+                author_family=author_family, reviewers=reviewers,
+                families=families, provider=provider,
+                cache=patch_receipt_cache)
+            unknown.extend(missing)
+            for row in rows:
+                actor = row["name"]
+                if row["role"] == "reviewer":
+                    review_commits.setdefault(actor, []).append(
+                        (sha, row["family"]))
+                else:
+                    by_name.setdefault(actor, set()).add(row["family"])
+                    record_commit(actor, sha)
+                if row["proof"]:
+                    proofs.setdefault(actor, set()).add(sha[:12])
             continue
         actor = str(receipt.get("actor") or "").strip()
         if not actor:
