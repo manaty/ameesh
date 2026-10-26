@@ -41,15 +41,24 @@ def drain(cfg, db, host, *, duration=None, critical=(), actor=None):
 
 
 def critical_names(cfg, db):
-    """Declared critical agents and their own canon's coordination/review roles."""
+    """Declared critical agents and the critical roles of their own canon.
+
+    L242c: the roles are each canon's `critical_roles` (`federation.yaml`;
+    the code default applies when it declares none), never a list kept here.
+    An organisation that leaves `relecture` out (manaty/home#179) therefore
+    no longer counts its reviewers as critical when the host is drained.
+    """
     from . import sous_utilisation
     names = set(getattr(cfg, "critical_agents", ()) or ())
-    canons = work.configured_canons(cfg)
-    roles = ("orchestrateur", "orchestrator", "conception", "design", "auditeur", "auditor", "reviewer")
+    by_canon = [(canon, sous_utilisation.critical_roles(canon))
+                for canon in work.configured_canons(cfg)]
     for agent in registry.overview(db):
-        own = [canon for canon in canons if canon.owns(agent.get("canon"))]
-        if agent["name"] in sous_utilisation.role_orchestrators(own, roles):
-            names.add(agent["name"])
+        for canon, roles in by_canon:
+            # `card_role` : la fiche du canon propriétaire seulement, et une
+            # liste vide (`critical_roles: []`) ne rend aucun rôle critique.
+            if roles and sous_utilisation.card_role(agent, [canon], roles):
+                names.add(agent["name"])
+                break
     return names
 
 

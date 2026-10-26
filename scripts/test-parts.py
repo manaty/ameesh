@@ -82,6 +82,11 @@ un autre doublé — toutes avec des `durees.json` non vides.
 signale (`::warning::`) une part dont l'estimation × `SURCOUT_CHARGE` dépasse
 le plafond : la carte source est mesurée dans un autre contexte et sous-estime
 une part chargée (psycopg 3/6 annulée à 40m46, aucune carte publiée).
+
+#3604 — `--test-timeout N` (défaut 600 s, 0 désactive) borne chaque test de la
+part mesurée : un test bloqué est nommé dans la carte comme erreur et la suite
+continue, au lieu de laisser la part consumer le plafond de 60 min (psycopg
+2/8, run 40177589953 : 3 087 s sans sortie après `test_503_agent_host`).
 """
 from __future__ import annotations
 
@@ -122,6 +127,32 @@ EXCERPT_LINES = 40
 #: 3/6 estimée 1 588,7 s, 2 316 s de tests réels (×1,46) ; une part dont
 #: l'estimation × ce facteur dépasse le plafond du job est signalée par le plan
 SURCOUT_CHARGE = 1.5
+#: #3604 — borne par test sous mesure. Le run 40177589953 (main 7d3e776e) a
+#: perdu psycopg 2/8 après 3 087 s sans sortie : un test bloqué a consommé le
+#: plafond de 60 min et annulé la part, donc la carte. La borne nomme le test
+#: (erreur notée dans la carte) et rend la main aux tests suivants ; 0 la
+#: désactive.
+TEST_TIMEOUT = 600
+
+
+class TestTimeout(Exception):
+    """Un test a dépassé la borne de la part mesurée (#3604)."""
+
+
+def armer_borne(secondes: float):
+    """Pose la borne SIGALRM d'un test mesuré ; renvoie l'ancien gestionnaire.
+
+    `_Result` arme et désarme le minuteur par test ; le gestionnaire lève une
+    exception que unittest enregistre comme erreur du test, sans interrompre
+    les tests suivants.
+    """
+    if not hasattr(signal, "SIGALRM"):
+        return None
+
+    def _sonner(signum, frame):
+        raise TestTimeout("test au-delà de %g s sous mesure (#3604)" % secondes)
+
+    return signal.signal(signal.SIGALRM, _sonner)
 
 
 def modules(tests: pathlib.Path = TESTS) -> list[str]:
@@ -457,6 +488,8 @@ class _Result(unittest.TextTestResult):
     flow: Flow | None = None
     classes: dict = {}
     measure = None  # L161e : _Mesure de la part, ou None
+    #: #3604 : borne par test (secondes) ; None/0 : pas de borne
+    test_timeout = None
     #: L161f: P0 and P1 modules of the part, for the provisional green
     #: (None: no `impacted` event, the part does not run from a plan)
     impactes: tuple | None = None
@@ -495,6 +528,8 @@ class _Result(unittest.TextTestResult):
         super().startTest(test)
         self._courant, self._debut = test, time.monotonic()
         self._statut, self._extrait = "succes", ""
+        if self.test_timeout:
+            signal.setitimer(signal.ITIMER_REAL, float(self.test_timeout))
 
     def _record(self, test, statut: str, err=None) -> None:
         extrait = ""
@@ -552,6 +587,8 @@ class _Result(unittest.TextTestResult):
         self.flow.write("test", **ligne)
 
     def stopTest(self, test):
+        if self.test_timeout:
+            signal.setitimer(signal.ITIMER_REAL, 0)
         super().stopTest(test)
         maintenant = time.monotonic()
         self.durations[_module_of(test)] += maintenant - self._depuis
@@ -625,12 +662,13 @@ def _load(part: list[str], measure: _Measure | None) -> unittest.TestSuite:
 
 
 def _result_class(flow: Flow | None, classes: dict, measure: _Measure | None,
-                  impactes: tuple | None) -> type:
+                  impactes: tuple | None, test_timeout: float | None = None) -> type:
     """La classe de résultat de la part : chaque clé porte le nom de
-    l'attribut que lit `_Result` (`measure`, `flow`, `classes`, `impactes`)."""
+    l'attribut que lit `_Result` (`measure`, `flow`, `classes`, `impactes`,
+    `test_timeout`)."""
     return type("_ResultatPart", (_Result,),
                 {"flow": flow, "classes": classes, "measure": measure,
-                 "impactes": impactes})
+                 "impactes": impactes, "test_timeout": test_timeout})
 
 
 def run(args) -> int:
@@ -678,12 +716,18 @@ def run(args) -> int:
     suite = _load(part, measure)
     impactes = None if entree is None else tuple(
         m for m in part if classes.get(m, ("P3", ""))[0] in ("P0", "P1"))
-    resultat_cls = _result_class(flow, classes, measure, impactes)
+    borne = args.test_timeout if measure is not None and hasattr(signal, "SIGALRM") else None
+    resultat_cls = _result_class(flow, classes, measure, impactes, borne)
     runner = unittest.TextTestRunner(verbosity=2, resultclass=resultat_cls)
+    ancien_gestionnaire = armer_borne(borne) if borne else None
     debut, resultat = time.monotonic(), None
     try:
         resultat = runner.run(suite)
     finally:
+        if borne:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+            if ancien_gestionnaire is not None:
+                signal.signal(signal.SIGALRM, ancien_gestionnaire)
         if measure is not None:
             measure.stop()
         if flow:
@@ -739,6 +783,9 @@ def main(argv: list[str] | None = None) -> int:
             p.add_argument("--label", help="nom de la part dans le flux (ex. « psql 1/6 »)")
             p.add_argument("--measure", help="dossier de mesure pour la carte test → code "
                            "(L161e, scripts/map.py)")
+            p.add_argument("--test-timeout", type=float, default=TEST_TIMEOUT,
+                           help="borne chaque test sous mesure (secondes, défaut %(default)s) ; "
+                           "0 la désactive (#3604)")
         p.add_argument("--map", help="carte (carte.json.gz) : durées des modules, "
                        "tests/parts/durees.json en repli (L161e)")
         if nom == "run":

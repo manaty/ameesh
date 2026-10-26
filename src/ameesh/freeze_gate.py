@@ -718,6 +718,14 @@ def milestone(
         freeze_info: dict = {}
         sha = freeze_head(db, item, sha, repo=repo, refreshed=refreshed,
                           outcome=freeze_info)
+        # #3589 : un lot empilé sur un parent ouvert ne gèle pas des copies
+        # de la tête gelée de ce parent (même patch-id, tête absente) : le
+        # refus donne le `git rebase --onto` exact. Lecture seule, avant
+        # toute écriture ; un doute (dépôt, cible, patch-id) ne refuse pas.
+        from . import freeze_stack
+        freeze_stack.guard(
+            db, item, sha, repo=repo or str(freeze_info.get("repo") or ""),
+            target=str(item.get("branch_target") or ""))
         # (5) : la marque des branches où le gel était absent, pour que le
         # balayage ne confonde pas une livraison (avance rapide) avec un gel
         # déjà dans la cible. C'est une preuve machine : une ligne fournie par

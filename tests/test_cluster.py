@@ -160,6 +160,11 @@ FERMEES = {
     "work_packet_members": {"package_id", "work_item_id", "package_branch",
                             "base_sha", "head_sha", "unit_sha", "source_sha",
                             "frozen_sha", "recorded_by", "recorded_at"},
+    # #3631 (0488) : agrégat des relevés d'hôte par tranche de 10 min, tenu
+    # et lu par l'exécuteur (`lend_basis`), pas par le rôle superviseur ;
+    # état de mesure interne, fermé aux deux rôles, aucun GRANT modifié.
+    "host_resource_slots": {"host", "slot_start", "readings", "cpu_sum", "cpu_n",
+                            "free_mem_min", "first_cpu_at", "last_cpu_at"},
     # #2845 (0470) : curseur, reçus et progression de la veille des tickets
     # GitHub. État interne de l'agent de veille, pas un état de supervision ;
     # fermé aux deux rôles superviseur, aucun GRANT modifié.

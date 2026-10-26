@@ -450,6 +450,13 @@ def _sync_packages(db, args: argparse.Namespace) -> int:
         print("  work item #%-5s %-11s %-9s %s" % (
             row["work_item"], row["result"], row.get("how") or "—",
             row.get("detail") or ""))
+    # #3629 : une table qui cite des lots ouverts sans colonne « commit » ne
+    # livre rien ; le relevé le dit au lieu de rendre 0 unité en silence.
+    for warning in report.get("warnings") or ():
+        print("warning: %s:%s (%s): open work item(s) %s: %s" % (
+            warning["manifest"], warning["line_no"], warning["heading"] or "no heading",
+            ", ".join("#%d" % lot for lot in warning["lots"]), warning["message"]),
+            file=sys.stderr)
     return 0
 
 

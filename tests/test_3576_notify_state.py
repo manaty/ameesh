@@ -41,9 +41,12 @@ def decision(since=900.0):
             "detail": "décision #1 en attente", "since": since}
 
 
-def lasting(since=900.0):
+def lasting(since=100.0):
     """Une alerte qui envoie aussi sa résolution (`decision_pending` est
-    silencieuse à la résolution, L124)."""
+    silencieuse à la résolution, L124).
+
+    `since` est antérieur à la grâce anti-rebond de `dead_runner` (#3630,
+    480 s) : le notifier de test est à 1000 s, l'alerte doit être poussée."""
     return {"schema": "ameesh-alert/1", "type": "dead_runner",
             "agent": "mesh-design", "host": "agents-a", "responsible": "human:owner",
             "detail": "runner mort", "since": since}

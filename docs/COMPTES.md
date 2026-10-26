@@ -743,14 +743,16 @@ orchestrator and mesh-design were paused on budget.
 
 **Who is critical** (L242c). An agent is critical by a role on its canon
 Agent card (`roles:`, manaty/home#25), not by its name. The critical roles
-are set per organisation, by `critical_roles` in its `federation.yaml`:
+are set per organisation, by `critical_roles` in its `federation.yaml` — an
+organisation may leave `relecture` out (manaty/home#179):
 
 ```yaml
-critical_roles: [orchestrateur, conception, auditeur, relecture]
+critical_roles: [orchestrateur, conception, auditeur]
 ```
 
-That list is the default when the key is absent; an empty list makes no
-role critical. A role and its usual synonym match each other both ways:
+When the key is absent, the code default applies: `orchestrateur`,
+`conception`, `auditeur` and `relecture`. An empty list makes no role
+critical. A role and its usual synonym match each other both ways:
 `orchestrateur` and `orchestrator`, `conception` and `design`, `auditeur` and
 `auditor`, `relecture` and `review` or `reviewer`. The `auditeur` agent
 without a card is critical while `auditeur` is a critical role.
@@ -760,6 +762,12 @@ canon's `critical_roles`, and only as the canon validated it: a `roles:`
 value that `ameesh canon check` rejects (`agent-roles-invalid`) gives no
 role. A conflicting card with the same name in another canon never makes an
 agent critical.
+
+The same list decides the host withdrawal: the drain's critical set
+(`host_lifecycle.critical_names`, which adds `critical_agents`) is the
+canon's, so an agent is evacuated first and gets the short loss window only
+as its own organisation defines it — a reviewer is not critical there
+either when `relecture` is not one of its critical roles.
 
 **Unreadable canon.** When the agent's own canon cannot be loaded or read,
 or was read only in part (a card or the manifest could not be read:

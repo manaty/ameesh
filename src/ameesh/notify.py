@@ -215,6 +215,16 @@ DEFAULT_RATE_PER_MINUTE = 10
 DEFAULT_MAX_ATTEMPTS = 5
 DEFAULT_TIMEOUT_S = 10.0
 DEFAULT_INTERVAL_S = 30.0
+#: #3630 : anti-rebond du push `dead_runner` au propriétaire. Une coupure de
+#: bail courte (hôte volatil, bail de 90 s renouvelé toutes les 30 s) est
+#: reprise seule par l'exécuteur ; l'alerte n'est poussée qu'au-delà de cette
+#: grâce, mesurée depuis l'échéance du bail (`since`). Le seuil de détection
+#: (`--dead-grace`, 30 s) ne change pas : `ameesh alerts` voit la coupure.
+#: Les coupures mesurées sur pc-smichea le 25/10 (relecture #3630) vont
+#: jusqu'à 5,2 min après l'échéance (dev1 22:12:32 → 22:17:43) ; 8 min laisse
+#: ~2,8 min de marge. Une panne réelle qui persiste au-delà pousse une alerte,
+#: puis un seul `resolved`.
+DEAD_RUNNER_NOTIFY_GRACE_S = 480.0
 #: fenêtre de la limite de débit, et intervalle minimal entre deux résumés
 RATE_WINDOW_S = 60.0
 #: #2395 : rétention du registre `notified` (une notification par identité
@@ -1867,6 +1877,25 @@ def _entry_severity(entry: dict):
     return alert_ack.severity(alert)
 
 
+def _held_dead_runner(alert: dict, now: float) -> bool:
+    """#3630 : l'alerte `dead_runner` est encore dans sa grâce d'anti-rebond.
+
+    La grâce se mesure depuis l'échéance du bail (`since`), comme la
+    détection : une coupure courte (60 s) reprise avant l'échéance de la
+    grâce ne pousse rien. Une alerte sans `since` n'est jamais retenue — on
+    ne tait pas une alerte incomplète —, ni un âge illisible.
+    """
+    if alert.get("type") != "dead_runner":
+        return False
+    since = alert.get("since")
+    if since is None:
+        return False
+    try:
+        return float(now) - float(since) < DEAD_RUNNER_NOTIFY_GRACE_S
+    except (TypeError, ValueError):
+        return False
+
+
 def forces_owner(alert: dict) -> bool:
     """#789 t2, restreint par #2395 : une cible `owner` force la livraison à
     l'humain même hors `notify.types`. Un `slo_breach` n'en bénéficie jamais :
@@ -2113,6 +2142,11 @@ class Notifier:
             muted = key not in audible
             # A partial orphan group only mentions its unacknowledged members.
             alert = audible.get(key, alert)
+            if entry is None and _held_dead_runner(alert, now):
+                # #3630 : coupure courte, peut-être déjà reprise à la passe
+                # suivante ; rien n'est poussé, et faute d'entrée active,
+                # aucune résolution ne partira.
+                continue
             level = alert_ack.severity(alert)
             if (entry is not None and alert.get("type") == "slo_breach"
                     and entry.get("status") == "envoi" and entry.get("human")
