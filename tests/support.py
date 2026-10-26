@@ -96,14 +96,6 @@ REQUIRE_DB = os.environ.get(
 #: schéma t_* laissé par une exécution tuée). Un échec de lecture ne fait
 #: jamais échouer un test ; `AMEESH_BENCH_UPKEEP=0` la désactive.
 BENCH_UPKEEP_DONE = False
-#: #3735 B/P1 : verrou partagé tenu toute la vie du processus ; il couvre les
-#: échanges psql (une connexion par requête), donc la maintenance du banc ne
-#: peut pas admettre un schéma sans marqueur pendant qu'une suite vit, même
-#: sans client backend entre deux échanges.
-BENCH_SUITE_LOCK = None
-#: #3735 B/P1 : une seule tentative de verrou par processus (un timeout de
-#: maintenance ne se paie pas à chaque classe).
-BENCH_LOCK_TRIED = False
 #: L142 : le banc ne dépend pas non plus de l'umask de la session appelante
 #: (0002 sur certains hôtes, 0022 en CI). Les fixtures d'arbres de confiance
 #: créent répertoires 0700 et fichiers 0644 et les vérifient ; un umask
@@ -592,28 +584,16 @@ def _bench_upkeep(db) -> None:
 
     Le banc est partagé par tous les agents de l'hôte (`scripts/pg-up.sh`) :
     une exécution tuée laisse son schéma. La passe est bornée (âge, sessions,
-    verrou court) et ne fait jamais échouer un test. #3735 B/P1 : la suite
-    tient un verrou **partagé** toute la vie du processus, et sa passe est
-    **ordinaire** — les schémas sans marqueur sont gardés ; seuls ceux dont le
-    marqueur prouve un propriétaire mort sont purgés. Leur purge est réservée
-    à une maintenance qui tient le verrou exclusif (aucune suite vivante).
-    Sans le verrou partagé (maintenance trop longue, erreur), la passe est
-    sautée, l'admission reste fermée et la classe suivante réessaie.
+    verrou court) et ne fait jamais échouer un test. #3735 B/P1 : la passe
+    **ordinaire** ne purge que les schémas dont le marqueur prouve un
+    propriétaire mort ; les schémas **sans marqueur** (suite legacy) restent
+    gardés — leur processus Python survit au redémarrage du postmaster et le
+    code ne peut pas prouver son arrêt ; leur purge est un geste d'opérateur
+    explicite (`--admit-unmarked`), après arrêt de toute suite.
     """
-    global BENCH_UPKEEP_DONE, BENCH_SUITE_LOCK, BENCH_LOCK_TRIED
+    global BENCH_UPKEEP_DONE
     if BENCH_UPKEEP_DONE:
         return
-    if BENCH_SUITE_LOCK is None:
-        try:
-            BENCH_SUITE_LOCK = bench_mod.suite_lock()
-        except Exception:  # noqa: BLE001 — jamais un échec de test pour le verrou
-            BENCH_SUITE_LOCK = None
-        if BENCH_SUITE_LOCK is None:
-            # admission fermée (#3735 B/P1) : aucune purge sans le verrou
-            # partagé ; la classe suivante réessaiera (le drapeau « fait »
-            # n'est posé qu'après une passe réelle).
-            return
-        BENCH_LOCK_TRIED = True
     if os.environ.get("AMEESH_BENCH_UPKEEP", "1").lower() in ("0", "false", "no", "off"):
         BENCH_UPKEEP_DONE = True
         return

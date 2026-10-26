@@ -3,22 +3,20 @@
 
 Témoins du lot : un schéma `t_*` assez vieux et **prouvé** orphelin (marqueur
 d'un propriétaire mort) est purgé ; un schéma tenu par une session active, un
-schéma récent, un schéma sans marqueur (client au repos, ou suite psql vivante
-entre deux échanges) et un schéma dont la preuve est illisible sont gardés ;
-les schémas sans marqueur ne sont purgés que par une maintenance qui tient le
-verrou **exclusif** du banc, jamais par un démarrage de suite. Un dernier
-autovacuum ancien est signalé. La base de la suite (`AMEESH_TEST_DSN`) est le
-banc partagé de l'hôte : avec un âge minimal abaissé, les purges des témoins
-sont bornées à leurs propres schémas (`only`), jamais ceux des suites
-voisines.
+schéma récent, un schéma sans marqueur (client au repos, ou suite legacy dont
+le processus Python survit au redémarrage du postmaster et se reconnecte) et
+un schéma dont la preuve est illisible sont gardés. Les schémas sans marqueur
+ne sont admis que par un geste d'opérateur explicite (`--admit-unmarked`),
+après arrêt de toute suite. Un dernier autovacuum ancien est signalé. La base
+de la suite (`AMEESH_TEST_DSN`) est le banc partagé de l'hôte : avec un âge
+minimal abaissé, les purges des témoins sont bornées à leurs propres schémas
+(`only`), jamais ceux des suites voisines.
 """
 from __future__ import annotations
 
 import os
-import shutil
 import subprocess
 import sys
-import tempfile
 import textwrap
 import time
 import unittest
@@ -40,6 +38,39 @@ def _dead_pid() -> int:
     child = subprocess.Popen([sys.executable, "-c", "pass"])
     child.wait()
     return child.pid
+
+
+#: #3735 B/P1 : processus **legacy** réel — aucune connexion persistante
+#: (`PsqlDriver` en ouvre une par échange), aucun verrou. Il crée un schéma
+#: sans marqueur, ferme sa connexion, attend la maintenance (le « redémarrage »
+#: a tué les backends, pas le processus), puis se reconnecte et interroge son
+#: schéma : il doit avoir survécu.
+_LEGACY_PROCESS = r'''
+import dataclasses
+import sys
+
+from ameesh import config as config_mod
+from ameesh import db as db_mod
+
+dsn, name = sys.argv[1], sys.argv[2]
+cfg = dataclasses.replace(config_mod.Config(), dsn=dsn, schema="public",
+                          backend="pg", statement_timeout_ms=120000.0)
+first = db_mod.connect(cfg)
+try:
+    first.execute('CREATE SCHEMA "%s"' % name)
+    first.execute('CREATE TABLE "%s".x (id integer)' % name)
+    first.execute('INSERT INTO "%s".x VALUES (1)' % name)
+finally:
+    first.close()
+print("ready", flush=True)
+sys.stdin.readline()
+second = db_mod.connect(cfg)
+try:
+    row = second.query('SELECT count(*)::bigint AS n FROM "%s".x' % name)[0]
+    print("queried=%s" % row["n"], flush=True)
+finally:
+    second.close()
+'''
 
 
 class BenchCataloguesTest(PgTestCase):
@@ -202,12 +233,12 @@ class BenchCataloguesTest(PgTestCase):
         self.assertNotIn(legacy, result.dropped)
         self.assertTrue(self._exists(legacy))
 
-    def test_suite_upkeep_never_bootstraps(self) -> None:
-        """#3735 B/P1 : le démarrage d'une suite ne lève jamais le doute.
+    def test_suite_upkeep_only_purges_proven_dead(self) -> None:
+        """#3735 B/P1 : le socle ne purge que les preuves mortes.
 
-        `_bench_upkeep` est une passe ordinaire : elle purge les propriétaires
-        prouvés morts et garde les schémas sans marqueur. Leur purge est
-        réservée à la maintenance qui tient le verrou exclusif.
+        `_bench_upkeep` est une passe ordinaire : les propriétaires prouvés
+        morts partent, les schémas sans marqueur restent (une suite legacy
+        peut les posséder) ; seul un opérateur les admet explicitement.
         """
         from . import support
         support.BENCH_UPKEEP_DONE = False
@@ -220,97 +251,59 @@ class BenchCataloguesTest(PgTestCase):
             support.BENCH_UPKEEP_DONE = True
         purge.assert_called_once()
         self.assertIs(purge.call_args.args[0], self.db)
-        self.assertNotIn("bootstrap", purge.call_args.kwargs)
+        self.assertFalse(purge.call_args.kwargs.get("admit_unmarked", False))
 
-    def test_legacy_suite_without_lock_keeps_unmarked_on_running_server(self) -> None:
-        """Le cas legacy du B/P1 codex : pas de verrou partagé, banc non neuf.
+    def test_legacy_process_survives_a_restart_and_requeries(self) -> None:
+        """Le cas du verdict codex : le processus legacy survit au restart.
 
-        Une suite legacy ne prend pas le verrou ; la maintenance exclusive
-        réussit donc. Mais le postmaster n'a pas redémarré : un schéma ancien
-        sans marqueur peut encore lui appartenir sans client backend entre
-        deux échanges. Il est gardé (le redémarrage du banc prouve, lui, la
-        mort des sessions legacy).
+        Il n'a ni verrou ni connexion persistante : ses backends meurent au
+        redémarrage, pas son processus Python ; sa prochaine requête se
+        reconnecte. Son schéma ancien sans marqueur doit survivre à la
+        maintenance, et la requête suivante doit fonctionner.
         """
-        unmarked = _name("legacyold")
-        self._create(unmarked)
-        tmp = tempfile.mkdtemp(prefix="ameesh-bench-legacy-")
-        self.addCleanup(shutil.rmtree, tmp, True)
+        name = _name("legacy")
+        self.addCleanup(self._drop, name)
         env = dict(os.environ)
-        env["AMEESH_BENCH_LOCK"] = os.path.join(tmp, "bench.lock")
         here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         env["PYTHONPATH"] = os.pathsep.join(
             [os.path.join(here, "src"), env.get("PYTHONPATH", "")])
-        time.sleep(1.1)
-        proc = subprocess.run(
-            [sys.executable, "-c", textwrap.dedent(_LEGACY_SCENARIO),
-             bench_mod.bench_dsn(), unmarked],
-            capture_output=True, text=True, env=env, timeout=120)
-        self.assertEqual(proc.returncode, 0, proc.stderr)
-        lines = dict(line.split("=", 1) for line in proc.stdout.splitlines()
-                     if "=" in line)
-        output = proc.stdout + proc.stderr
-        self.assertEqual(lines.get("dropped"), "", output)
-        self.assertIn("did not just restart", lines.get("note", ""), output)
-        self.assertTrue(self._exists(unmarked))
-
-    def test_bootstrap_fresh_server_purges_unmarked(self) -> None:
-        """Le redémarrage du banc prouve la mort des suites legacy.
-
-        Sur un postmaster frais (ici forcé par le témoin), le verrou exclusif
-        et la preuve de fraîcheur admettent le schéma sans marqueur.
-        """
-        unmarked = _name("freshboot")
-        self._create(unmarked)
-        tmp = tempfile.mkdtemp(prefix="ameesh-bench-fresh-")
-        self.addCleanup(shutil.rmtree, tmp, True)
-        with mock.patch.dict(os.environ,
-                             {"AMEESH_BENCH_LOCK": os.path.join(tmp, "bench.lock")}):
-            time.sleep(1.1)
-            result = bench_mod.purge_orphans(
-                self.db, min_age_s=0.5, only={unmarked}, bootstrap=True,
-                fresh=True)
-        self.assertIn(unmarked, result.dropped)
-
-    def test_upkeep_without_shared_lock_closes_admission_and_retries(self) -> None:
-        """#3735 B/P1 : sans verrou partagé, pas de purge et pas de « fait ».
-
-        La passe est sautée (admission fermée) et la classe suivante réessaie :
-        le drapeau de tentative ne se pose qu'après acquisition du verrou.
-        """
-        from . import support
-
-        saved = (support.BENCH_UPKEEP_DONE, support.BENCH_SUITE_LOCK,
-                 support.BENCH_LOCK_TRIED)
+        proc = subprocess.Popen(
+            [sys.executable, "-c", textwrap.dedent(_LEGACY_PROCESS),
+             bench_mod.bench_dsn(), name],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, text=True, env=env)
         try:
-            support.BENCH_UPKEEP_DONE = False
-            support.BENCH_SUITE_LOCK = None
-            support.BENCH_LOCK_TRIED = False
-            with mock.patch.object(support.bench_mod, "suite_lock",
-                                   return_value=None), \
-                    mock.patch.object(support.bench_mod, "purge_orphans") as purge:
-                support._bench_upkeep(self.db)
-                purge.assert_not_called()
-                self.assertFalse(support.BENCH_LOCK_TRIED)
-                self.assertFalse(support.BENCH_UPKEEP_DONE)
-            handle = mock.Mock()
-            with mock.patch.object(support.bench_mod, "suite_lock",
-                                   return_value=handle), \
-                    mock.patch.object(
-                        support.bench_mod, "purge_orphans",
-                        return_value=bench_mod.Purge(0, (), ())) as purge:
-                support._bench_upkeep(self.db)
-                purge.assert_called_once()
-                self.assertIs(support.BENCH_SUITE_LOCK, handle)
-                self.assertTrue(support.BENCH_LOCK_TRIED)
-                self.assertTrue(support.BENCH_UPKEEP_DONE)
+            ready = proc.stdout.readline().strip()
+            self.assertEqual(ready, "ready", "legacy process did not start")
+            # le processus vit ; aucune connexion persistante ni verrou
+            time.sleep(1.1)
+            result = bench_mod.purge_orphans(self.db, min_age_s=0.5,
+                                             only={name})
+            self.assertNotIn(name, result.dropped)
+            self.assertTrue(self._exists(name))
+            proc.stdin.write("\n")
+            proc.stdin.flush()
+            out, err = proc.communicate(timeout=60)
         finally:
-            (support.BENCH_UPKEEP_DONE, support.BENCH_SUITE_LOCK,
-             support.BENCH_LOCK_TRIED) = saved
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
+        self.assertEqual(proc.returncode, 0, err)
+        self.assertIn("queried=1", out, out + err)
+        self.assertTrue(self._exists(name))
 
-    def test_suite_lock_wait_covers_the_maintenance(self) -> None:
-        """La maintenance peut durer plus de 120 s : la suite attend plus."""
-        self.assertGreater(bench_mod.SUITE_LOCK_WAIT_S, bench_mod.PURGE_BUDGET_S)
-        self.assertGreater(bench_mod.SERVER_FRESH_S, 0)
+    def test_unmarked_requires_explicit_operator_admission(self) -> None:
+        """Les schémas sans marqueur ne partent que sur l'assertion opérateur."""
+        name = _name("operator")
+        self._create(name)
+        time.sleep(1.1)
+        kept = bench_mod.purge_orphans(self.db, min_age_s=0.5, only={name})
+        self.assertNotIn(name, kept.dropped)
+        self.assertTrue(self._exists(name))
+        dropped = bench_mod.purge_orphans(self.db, min_age_s=0.5, only={name},
+                                          admit_unmarked=True)
+        self.assertIn(name, dropped.dropped)
+        self.assertFalse(self._exists(name))
 
     def test_owner_marker_round_trip(self) -> None:
         marker = bench_mod.owner_marker()
@@ -368,115 +361,6 @@ class BenchCataloguesTest(PgTestCase):
         self.assertTrue(bench_mod.SCHEMA_RE.match("t_bench_0123abcd"))
         self.assertFalse(bench_mod.SCHEMA_RE.match('t_x"; DROP TABLE x; --'))
         self.assertFalse(bench_mod.SCHEMA_RE.match("public"))
-
-
-#: #3735 B/P1 : scénario **legacy** hors processus — une suite ancienne ne
-#: prend aucun verrou partagé. La maintenance exclusive réussit donc, mais le
-#: banc n'a pas redémarré : un schéma ancien sans marqueur peut encore lui
-#: appartenir (aucun client backend entre deux échanges), il est gardé.
-_LEGACY_SCENARIO = r'''
-import dataclasses
-import sys
-
-from ameesh import bench
-from ameesh import config as config_mod
-from ameesh import db as db_mod
-
-dsn, name = sys.argv[1], sys.argv[2]
-cfg = dataclasses.replace(config_mod.Config(), dsn=dsn, schema="public",
-                          backend="pg", statement_timeout_ms=120000.0)
-database = db_mod.connect(cfg)
-try:
-    result = bench.purge_orphans(database, min_age_s=0.5, only={name},
-                                 bootstrap=True)
-    print("dropped=%s" % ",".join(result.dropped), flush=True)
-    print("note=%s" % result.note, flush=True)
-finally:
-    database.close()
-'''
-
-
-#: #3735 B/P1 : scénario hors processus — une suite vivante **sans client
-#: backend** (comme `PsqlDriver` entre deux échanges) tient le verrou partagé ;
-#: la maintenance ne peut alors pas admettre un schéma sans marqueur. Une fois
-#: la suite morte, la même maintenance, sous verrou exclusif, le purge. Le
-#: schéma est propre au témoin (`only`) et supprimé dans tous les cas.
-_LOCK_SCENARIO = r'''
-import dataclasses
-import os
-import subprocess
-import sys
-import time
-
-from ameesh import bench
-from ameesh import config as config_mod
-from ameesh import db as db_mod
-
-dsn, name = sys.argv[1], sys.argv[2]
-holder = subprocess.Popen(
-    [sys.executable, "-c",
-     "import time\n"
-     "from ameesh import bench\n"
-     "fh = bench.suite_lock()\n"
-     "print('ok' if fh else 'none', flush=True)\n"
-     "time.sleep(60)\n"],
-    stdout=subprocess.PIPE, text=True)
-try:
-    print("holder=%s" % holder.stdout.readline().strip(), flush=True)
-    cfg = dataclasses.replace(config_mod.Config(), dsn=dsn, schema="public",
-                              backend="pg", statement_timeout_ms=120000.0)
-    database = db_mod.connect(cfg)
-    try:
-        database.execute('CREATE SCHEMA "%s"' % name)
-        database.execute('CREATE TABLE "%s".x (id integer)' % name)
-        time.sleep(1.1)
-        first = bench.purge_orphans(database, min_age_s=0.5, only={name},
-                                    bootstrap=True, fresh=True)
-        print("first=%s" % ",".join(first.dropped), flush=True)
-        holder.kill()
-        holder.wait()
-        second = bench.purge_orphans(database, min_age_s=0.5, only={name},
-                                     bootstrap=True, fresh=True)
-        print("second=%s" % ",".join(second.dropped), flush=True)
-        present = database.query(
-            "SELECT to_regnamespace(%s) IS NOT NULL AS present", (name,))[0]
-        print("exists=%s" % bool(present["present"]), flush=True)
-    finally:
-        database.execute('DROP SCHEMA IF EXISTS "%s" CASCADE' % name)
-        database.close()
-finally:
-    holder.kill()
-'''
-
-
-class BenchMaintenanceLockTest(unittest.TestCase):
-    """#3735 B/P1 : la purge des non marqués exige le verrou exclusif.
-
-    Classe sans `PgTestCase` : le scénario tourne dans un processus séparé,
-    qui ne tient pas le verrou partagé de la suite de tests.
-    """
-
-    def test_live_suite_without_client_blocks_the_unmarked_purge(self) -> None:
-        name = _name("locked")
-        tmp = tempfile.mkdtemp(prefix="ameesh-bench-lock-")
-        self.addCleanup(shutil.rmtree, tmp, True)
-        env = dict(os.environ)
-        env["AMEESH_BENCH_LOCK"] = os.path.join(tmp, "bench.lock")
-        here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        env["PYTHONPATH"] = os.pathsep.join(
-            [os.path.join(here, "src"), env.get("PYTHONPATH", "")])
-        proc = subprocess.run(
-            [sys.executable, "-c", textwrap.dedent(_LOCK_SCENARIO),
-             bench_mod.bench_dsn(), name],
-            capture_output=True, text=True, env=env, timeout=240)
-        self.assertEqual(proc.returncode, 0, proc.stderr)
-        lines = dict(line.split("=", 1) for line in proc.stdout.splitlines()
-                     if "=" in line)
-        output = proc.stdout + proc.stderr
-        self.assertEqual(lines.get("holder"), "ok", output)
-        self.assertEqual(lines.get("first"), "", output)
-        self.assertEqual(lines.get("second"), name, output)
-        self.assertEqual(lines.get("exists"), "False", output)
 
 
 if __name__ == "__main__":
