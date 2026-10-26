@@ -242,6 +242,38 @@ class SharedDeliveryTest(PgTestCase):
         self.assertNotIn("pool", shared["active"])
         self.assertNotIn("pool", shared["resolved"])
 
+    def test_a_no_send_local_resolution_pops_the_shared_active_key(self):
+        # Relecture dev4 : acknowledged/notifiee/sans_canal ne laissent pas
+        # d'entrée `resolved`. Le tombstone doit quand même retirer la clé du
+        # partagé, sinon elle reste active et la résolution repart à chaque
+        # tick.
+        for status in ("acknowledged", "notifiee", "sans_canal"):
+            with self.subTest(status=status):
+                key = "pool-" + status
+                entry = self._console_entry("agents-a")
+                entry["status"] = status
+                seeded = self.notifier(self.cfg_a, FakeSender())
+                seeded.state["active"][key] = entry
+                lease, deliver = notify.enter_shared_state(self.db, seeded, self.cfg_a)
+                self.assertTrue(deliver)
+                notify.leave_shared_state(self.db, seeded, lease)
+
+                local = self.notifier(self.cfg_a, FakeSender())
+                local.state["active"][key] = entry
+                with mock.patch.object(pgbouncer_local, "probe", return_value=[]):
+                    local.run_local_pass()
+                self.assertNotIn(key, local.state["active"])
+                self.assertNotIn(key, local.state["resolved"])
+                self.assertIn(key, local.local_resolved_keys)
+
+                lease, deliver = notify.enter_shared_state(self.db, local, self.cfg_a)
+                self.assertTrue(deliver)
+                self.assertFalse(local.local_resolved_keys)
+                notify.leave_shared_state(self.db, local, lease)
+                shared = storage.of(self.db).notify_liveness.read_state("alerts")
+                self.assertNotIn(key, shared["active"])
+                self.assertNotIn(key, shared["resolved"])
+
     def test_another_hosts_console_alert_is_never_resolved(self):
         # Le document partagé porte les alertes de console de A ; la console
         # de B est calme — B ne doit ni la résoudre ni la retirer du partagé.

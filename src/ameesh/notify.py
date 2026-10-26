@@ -1649,7 +1649,8 @@ def _summary_key_host(key) -> str | None:
     return str(parsed[2] or "")
 
 
-def _merge_local_state(local: dict, shared: dict, host) -> None:
+def _merge_local_state(local: dict, shared: dict, host, *,
+                       removed=()) -> None:
     """Reporte dans l'état partagé ce que seul le passage local a produit.
 
     `run_local_pass` tourne avant la base (#532) : ses alertes de console
@@ -1657,8 +1658,12 @@ def _merge_local_state(local: dict, shared: dict, host) -> None:
     Seules les entrées de CET hôte traversent : une entrée de console d'un
     autre hôte reste à lui. Une résolution locale retire la clé de `active` du
     document partagé, sinon elle y reste et le passage suivant la re-résout à
-    chaque tick (relecture cx1). Tout le reste est remplacé par l'état
-    partagé — c'est la règle du dédoublonnage entre hôtes.
+    chaque tick (relecture cx1). `removed` porte les clés que le passage local
+    a retirées même quand `_resolved` n'écrit rien (acknowledged, notifiee,
+    sans_canal, type retiré) : sans elles, la clé resterait active dans le
+    partagé et une ligne resolved repartirait à chaque tick (relecture dev4).
+    Tout le reste est remplacé par l'état partagé — c'est la règle du
+    dédoublonnage entre hôtes.
     """
     owned_keys = set()
     for key, entry in (local.get("active") or {}).items():
@@ -1694,6 +1699,8 @@ def _merge_local_state(local: dict, shared: dict, host) -> None:
                 if not isinstance(target, dict):
                     target = shared["summary"][human] = {}
                 target.setdefault(event, {})[identity] = member
+    for key in removed or ():
+        shared["active"].pop(key, None)
 
 
 def enter_shared_state(db, notifier, cfg: Config, *, dry_run: bool = False,
@@ -1709,8 +1716,10 @@ def enter_shared_state(db, notifier, cfg: Config, *, dry_run: bool = False,
     if dry_run:
         shared = load_shared_state(db)
         if shared is not None:
-            _merge_local_state(notifier.state, shared, getattr(cfg, "host", None))
+            _merge_local_state(notifier.state, shared, getattr(cfg, "host", None),
+                               removed=notifier.local_resolved_keys)
             notifier.state = shared
+            notifier.local_resolved_keys.clear()
         return None, True
     owner = state_owner(cfg)
     try:
@@ -1733,11 +1742,16 @@ def enter_shared_state(db, notifier, cfg: Config, *, dry_run: bool = False,
         shared = load_shared_state(db)
         if shared is None:
             # Premier détenteur depuis la migration : son état local amorce le
-            # document partagé (les autres hôtes liront celui-ci).
+            # document partagé (les autres hôtes liront celui-ci). Le passage
+            # local a déjà retiré ses clés résolues de `active` ; aucun
+            # tombstone n'est donc nécessaire dans le document amorcé.
             save_shared_state(db, notifier.state, owner=owner, epoch=epoch)
+            notifier.local_resolved_keys.clear()
         else:
-            _merge_local_state(notifier.state, shared, getattr(cfg, "host", None))
+            _merge_local_state(notifier.state, shared, getattr(cfg, "host", None),
+                               removed=notifier.local_resolved_keys)
             notifier.state = shared
+            notifier.local_resolved_keys.clear()
     except Exception:
         # Ne pas garder un bail qu'aucune passe n'utilisera (base tombée
         # entre la prise et la lecture) : le prochain essai doit pouvoir le
@@ -1948,6 +1962,11 @@ class Notifier:
         #: None le coupe (défaut : aucun balayage du mesh actif à ce stade)
         self.wip = wip
         self.state = state if state is not None else empty_state()
+        #: #3576 (relecture dev4) : clés de console retirées de `active` par le
+        #: passage local, à retirer du document partagé à la fusion suivante.
+        #: En mémoire seulement : une console calmée sans envoi ne laisse
+        #: aucune entrée `resolved`, et la clé resterait active dans le partagé.
+        self.local_resolved_keys: set = set()
         self.dry_run = dry_run
         self.sender = sender or (DrySender() if dry_run else Sender(timeout=ncfg.timeout))
         #: les enregistrements du dernier passage (remplacé par `run_pass`)
@@ -2245,6 +2264,9 @@ class Notifier:
         wanted = {key_of(a): a for a in current if a.get("type") in self.ncfg.types}
         active = self.state["active"]
         for key, alert in wanted.items():
+            # Une console qui represse la même clé annule le tombstone de
+            # résolution en attente de fusion (#3576, relecture dev4).
+            self.local_resolved_keys.discard(key)
             entry = active.get(key)
             if entry is None:
                 entry = active[key] = {
@@ -2281,6 +2303,11 @@ class Notifier:
             if not _local_entry_owned(entry, host):
                 continue
             del self.state["active"][key]
+            # #3576 (relecture dev4) : la fusion doit retirer la clé du partagé
+            # même quand `_resolved` ne garde rien (acknowledged, notifiee,
+            # sans_canal, type retiré) — sinon l'entrée y reste active et une
+            # résolution repart à chaque tick.
+            self.local_resolved_keys.add(key)
             if entry["alert"].get("type") not in self.ncfg.types:
                 self.log("[%s] removed from notify.types: forgotten without resolution"
                          % entry["alert"].get("type"))
