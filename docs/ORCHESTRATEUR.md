@@ -611,7 +611,10 @@ prêt, `git commit --no-edit` après résolution) ; aucun paquet déjà validé 
 réécrit pour ce seul métadonné.
 Le corps du lot porteur nomme ses unités avec leur tête, `#<lot> <tête>`, la
 ligne qu'imprime `scripts/paquet-compose.py --units --base <cible>` (#2360) :
-un `#N` seul n'y déclare aucune unité (#2335). Quand ce corps omet la liste,
+un `#N` seul n'y déclare aucune unité (#2335). Le manifeste reprend la table
+`## Composition` que le script imprime ensuite (colonnes « lot » et
+« commit », #3629) : sans colonne « commit », `sync-packets` ne ferme aucune
+unité et le dit. Quand ce corps omet la liste,
 la lecture des attentes retrouve les unités par ces trailers `ameesh-work:`
 de la branche, au-dessus de la cible (#2599) ; l'hôte qui lit retrouve un
 clone du registre s'il n'a pas les réglages radar du projet (#2837) ; un `#N`
