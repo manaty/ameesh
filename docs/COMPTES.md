@@ -764,10 +764,13 @@ role. A conflicting card with the same name in another canon never makes an
 agent critical.
 
 The same list decides the host withdrawal: the drain's critical set
-(`host_lifecycle.critical_names`, which adds `critical_agents`) is the
-canon's, so an agent is evacuated first and gets the short loss window only
-as its own organisation defines it — a reviewer is not critical there
-either when `relecture` is not one of its critical roles.
+(`host_lifecycle.critical_names`, which adds `critical_agents`) follows the
+same L242c reading — the canon's roles when it is readable, the last recorded
+verdict when it is not, and critical when no verdict is known — so an agent is
+evacuated first and gets the short loss window only as its own organisation
+defines it. A reviewer is not critical there either when `relecture` is not
+one of its critical roles, and the `auditeur` persona is critical without a
+card while `auditeur` is a critical role.
 
 **Unreadable canon.** When the agent's own canon cannot be loaded or read,
 or was read only in part (a card or the manifest could not be read:
