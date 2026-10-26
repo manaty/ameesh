@@ -157,15 +157,25 @@ class Accounts(interface.Accounts):
                 (host, harness, to, now))
         return True
 
-    def set_auto(self, host, harness, *, reason, expected=None) -> bool:
+    def set_auto(self, host, harness, *, reason, expected=None,
+                 expected_until=None) -> bool:
         with self.db.transaction() as tx:
             rows = tx.query(
-                "select account, forced from account_active"
+                "select account, forced,"
+                " extract(epoch from forced_until)::float8 as forced_until"
+                " from account_active"
                 " where host = %s and harness = %s for update", (host, harness))
             if not rows or not rows[0]["forced"]:
                 return False
             if expected is not None and rows[0]["account"] != expected:
                 return False  # #295: a concurrent human force is kept
+            if expected_until is not None:
+                # #3755 : une levée pour échéance ne doit pas effacer le
+                # renouvellement du MÊME compte lu entre-temps — l'échéance
+                # est comparée sous le verrou de la ligne.
+                stored = rows[0].get("forced_until")
+                if stored is None or abs(float(stored) - float(expected_until)) > 1e-3:
+                    return False
             tx.execute(
                 "update account_active set forced = false, forced_until = null,"
                 " updated_at = now()"

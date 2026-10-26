@@ -2664,7 +2664,8 @@ def _expire_force(store, host: str, harness: str, row: dict | None, now: float,
     if readonly:
         return _effective_active(row, now)
     store.set_auto(host, harness, reason=FORCE_EXPIRED_REASON,
-                   expected=(row or {}).get("account"))
+                   expected=(row or {}).get("account"),
+                   expected_until=(row or {}).get("forced_until"))
     return store.active(host, harness) or _effective_active(row, now)
 
 

@@ -135,6 +135,31 @@ class ForcageEcheanceTest(_Base):
         self.assertEqual(switch["kind"], "auto")
         self.assertIn("forcing expired", switch["reason"])
 
+    def test_l_expiration_ne_leve_pas_un_forcage_renouvele_du_meme_compte(self):
+        """B1 de la relecture : un renouvellement du MÊME compte, lu avant la
+        levée d'expiration, n'est pas effacé par cette levée."""
+        items = self._items()
+        now = float(int(time.time()))
+        self._journal_comptes(items, now)
+        accounts.force(self.db, self.cfg.host, "codex", items, "secondaire",
+                       by="human:test", now=now, until=now + 60.0)
+        store = storage.of(self.db).accounts
+        stale = store.active(self.cfg.host, "codex")
+        self.assertTrue(accounts.force_expired(stale, now + 120.0))
+        renewed = now + 5000.0
+        self.assertTrue(store.switch(
+            self.cfg.host, "codex", expected=None, to="secondaire", kind="manuel",
+            reason="renouvelé par un humain", agent=None, forced=True,
+            forced_until=renewed))
+        row = accounts._expire_force(store, self.cfg.host, "codex", stale,
+                                     now + 120.0, readonly=False)
+        self.assertTrue(row["forced"])
+        self.assertAlmostEqual(float(row["forced_until"]), renewed, delta=1.0)
+        # la levée refusée n'a rien journalisé
+        kinds = [r["kind"] for r in self.db.query(
+            "select kind from account_switches order by id")]
+        self.assertEqual(kinds, ["manuel", "manuel"])
+
     def test_affichage_lit_le_forcage_echu_comme_automatique_sans_ecrire(self):
         comptes = self._codex_comptes()
         cfg = dataclasses.replace(self.cfg, accounts={"codex": comptes})
@@ -203,15 +228,16 @@ class AlerteOverageHorsHoteTest(_Base):
     """#3755 : les drapeaux d'overage publiés en base lèvent l'alerte partout."""
 
     def _reading(self, *, used, resets_at, window_s, account="secondaire",
-                 in_use=True, capable=True, observed_at=None, source="ameesh-cx3"):
+                 in_use=True, capable=True, observed_at=None, source="ameesh-cx3",
+                 produced_at=None, key="codex-300min"):
         self.db.execute(
             "insert into quota_gauge_readings (harness, gauge_key, used, resets_at,"
             " window_s, account, produced_at, source, overage_capable,"
             " overage_in_use, observed_at)"
-            " values ('codex', 'codex-300min', %s, to_timestamp(%s), %s, %s, null,"
-            " %s, %s, %s, coalesce(to_timestamp(%s), now()))",
-            (used, resets_at, window_s, account, source, capable, in_use,
-             observed_at))
+            " values ('codex', %s, %s, to_timestamp(%s), %s, %s,"
+            " to_timestamp(%s), %s, %s, %s, coalesce(to_timestamp(%s), now()))",
+            (key, used, resets_at, window_s, account, produced_at, source,
+             capable, in_use, observed_at))
 
     def _alerts(self, now):
         cfg = dataclasses.replace(self.cfg, accounts={})
@@ -241,6 +267,38 @@ class AlerteOverageHorsHoteTest(_Base):
         self._reading(used=0.0, resets_at=now + 2 * HOUR, window_s=300 * 60,
                       in_use=False, observed_at=now + 1.0)
         self.assertEqual(self._alerts(now + 2.0), [])
+
+    def test_le_drapeau_suit_la_production_pas_la_reinsertion(self):
+        """B2 : une mesure ancienne réinsérée (observation récente) ne rajeunit
+        pas son drapeau ; c'est la production qui départage, comme dans
+        `latest_gauges`."""
+        now = float(int(time.time()))
+        # fenêtre courte : 100 %, overage vrai, produite récemment, observée
+        # avant la réinsertion de la mesure hebdo
+        self._reading(key="codex-300min", used=1.0, resets_at=now + 2 * HOUR,
+                      window_s=300 * 60, in_use=True,
+                      produced_at=now - 10.0, observed_at=now - 5.0)
+        # fenêtre hebdo : 50 %, overage faux, produite anciennement mais
+        # réinsérée après (un autre lecteur)
+        self._reading(key="codex-10080min", used=0.5, resets_at=now + 6 * DAY,
+                      window_s=10080 * 60, in_use=False,
+                      produced_at=now - 200.0, observed_at=now - 1.0)
+        (alert,) = self._alerts(now)
+        self.assertEqual(alert["gauge"], "codex-300min")
+        self.assertAlmostEqual(alert["value"], 1.0)
+
+    def test_un_drapeau_sans_fenetre_saturee_expire_avec_la_remise_a_zero(self):
+        """B3 : comme `Gauges.spent()`, un drapeau explicite sans fenêtre à
+        100 % porte sur TOUTES les fenêtres ; il se résout à leur remise à
+        zéro, pas huit jours plus tard."""
+        now = float(int(time.time()))
+        self._reading(used=0.8, resets_at=now + 60.0, window_s=300 * 60,
+                      in_use=True, observed_at=now)
+        self.assertEqual(len(self._alerts(now)), 1)
+        self.db.execute(
+            "update quota_gauge_readings set resets_at = to_timestamp(%s)",
+            (now - 60.0,))
+        self.assertEqual(self._alerts(now), [])
 
     def test_l_alerte_locale_ne_double_pas_la_lecture_partagee(self):
         now = float(int(time.time()))

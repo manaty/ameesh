@@ -1040,12 +1040,19 @@ class Accounts(Domain):
 
     @abc.abstractmethod
     def set_auto(self, host: str, harness: str, *, reason: str,
-                 expected: str | None = None) -> bool:
+                 expected: str | None = None,
+                 expected_until: float | None = None) -> bool:
         """Lève le forçage manuel (journalisé `auto`) ; faux si rien n'était forcé.
 
         #295 : `expected` (None = n'importe lequel) est le compte forcé que
         l'appelant a lu ; faux sans rien écrire si la ligne a changé de compte
-        entre-temps (un forçage humain concurrent n'est pas défait)."""
+        entre-temps (un forçage humain concurrent n'est pas défait).
+
+        #3755 : `expected_until` (epoch) est l'échéance du forçage que
+        l'appelant a vue échue. Comparée sous le verrou de la ligne, elle
+        refuse la levée si un geste a renouvelé le forçage du MÊME compte avec
+        une autre échéance entre-temps ; None = ne pas comparer (levée
+        manuelle par `ameesh accounts auto`)."""
 
     @abc.abstractmethod
     def holds(self, host: str, harness: str) -> dict[str, dict]:
