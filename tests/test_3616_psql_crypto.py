@@ -45,11 +45,15 @@ class PsqlCryptoTest(unittest.TestCase):
 
     def test_le_temoin_nexlink_ne_se_saute_pas(self):
         # Le canal nexlink n'est pas une option de la suite : un environnement
-        # sans cryptography se corrige, il ne se saute pas.
+        # sans cryptography se corrige, il ne se saute pas. #3609 (h-24) garde
+        # un saut **conditionnel** à l'absence de l'extra ; la part psql, elle,
+        # installe cryptography (voir test_part_psql_installe_cryptography).
         source = NEXLINK.read_text(encoding="utf-8")
         self.assertIn("cryptography", source)
-        self.assertNotIn("skipUnless", source)
-        self.assertNotIn("skipIf", source)
+        self.assertIn("CRYPTOGRAPHY_AVAILABLE", source)
+        self.assertIn("unittest.skipUnless", source)
+        self.assertNotIn("skipUnless(True", source)
+        self.assertNotIn("skipIf(True", source)
 
 
 if __name__ == "__main__":
