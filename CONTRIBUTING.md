@@ -20,12 +20,15 @@ Merci de votre intérêt. Quelques règles avant d'ouvrir une demande de fusion 
   des hôtes auto-hébergés mutualisés (#947, L1211) ; la suite complète tourne
   sur `main`, `release/*` et `integration/*`, et remplace la sélection dès
   qu'elle ne peut pas décider. Une **PR de release** — source ou cible sous
-  `release/*` ou `integration/*` — garde la suite complète, les deux pilotes,
-  sans voie version seule ni documentation seule ni liste pilote psql, y
-  compris dans le plan de repli (canon §3) ; le plan reçoit pour cela les
-  branches source et cible (`--base-ref`, `--head-ref`). Un module de test qui
-  touche la couche base ou un comportement propre à un pilote s'ajoute à
-  `tests/parts/pilote-psql.txt` ;
+  `release/*` ou `integration/*` — garde la suite complète, sans voie version
+  seule ni documentation seule ni sélection d'un lot, y compris dans le plan
+  de repli (canon §3) ; le plan reçoit pour cela les branches source et cible
+  (`--base-ref`, `--head-ref`). Depuis #3749 (règle owner du 26/10 : suite
+  complète en 10 min de mur), la suite complète est **psycopg** ; le pilote
+  psql n'y passe que sa liste pilote et tout le contrat, et la suite psql
+  entière tourne de nuit (`.github/workflows/psql-nocturne.yml`). Un module
+  de test qui touche la couche base ou un comportement propre à un pilote
+  s'ajoute donc à `tests/parts/pilote-psql.txt` ;
   un test de contrat (droits, rôles, migrations, objet global du cluster)
   s'ajoute à `tests/parts/toujours.txt`. Une PR de lot qui ne change
   **que le numéro de version** (`pyproject.toml` seul, la seule ligne

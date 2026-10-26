@@ -272,7 +272,8 @@ POLICY_KEYS = ("tmp_root", "cache_root", "tmp_quota", "cache_quota", "tmpfs_aler
                "orphan_cleanup", "orphan_idle", "deps", "deps_idle", "artifacts",
                "artifact_idle", "unreadable_ok", "docker_orphan_volumes_alert",
                "docker_build_cache_alert", "docker_volumes", "docker_volume_idle",
-               "events_quota", "former_mesh_keys")
+               "events_quota", "former_mesh_keys", "dirty_worktree_after",
+               "dirty_archive_retention")
 #: racines refusées : le ménage n'y supprimerait que ses sous-dossiers, mais
 #: un dossier partagé par tout le système n'est pas un dossier GÉRÉ
 FORBIDDEN_ROOTS = ("/", "~", "/tmp", "/var/tmp", "/dev/shm", "/home", "/root")
@@ -308,7 +309,8 @@ class Policy:
     #: #248: node_modules shared per lockfile (npm wrapper, links, GC)
     deps: bool = True
     #: #248: idle time (seconds) before an unreferenced entry is deleted
-    deps_idle: float = 3 * 24 * 3600.0
+    #: (#3746: 24 h, `deps.DEFAULT_DEPS_IDLE_S`)
+    deps_idle: float = 24 * 3600.0
     #: L230: regenerable build dirs of idle worktrees (None: the defaults of
     #: `build_artifacts.DEFAULT_RULES`; empty: none deleted)
     artifacts: tuple | None = None
@@ -326,6 +328,12 @@ class Policy:
     #: base, avant un changement de DSN : #532, 10.77.0.1:5432 → pgbouncer) ;
     #: leurs dossiers temporaires sont à nous, `housekeeping_stale` les range
     former_mesh_keys: tuple = ()
+    #: #3728 : un worktree d'un lot fini depuis plus longtemps que cela (et
+    #: inactif autant), gardé pour des fichiers modifiés ou non suivis, est
+    #: archivé puis retiré ; None (non déclaré) : jamais, il reste gardé
+    dirty_worktree_after: float | None = None
+    #: #3728 : durée de conservation de ces archives ; None : aucun archivage
+    dirty_archive_retention: float | None = None
     #: #2180: discovery roots derived from Host work_root/work_roots, never
     #: deletion roots. Not a separate housekeeping setting.
     worktree_roots: tuple = ()
@@ -389,7 +397,8 @@ def parse_policy(raw) -> tuple[dict, list[str], list[str]]:
             problems.append("`tmpfs_alert`: fraction expected (0 < x <= 1, or \"60%\")")
         else:
             parsed["tmpfs_alert"] = part
-    for key in ("orphan_idle", "deps_idle", "artifact_idle", "docker_volume_idle"):
+    for key in ("orphan_idle", "deps_idle", "artifact_idle", "docker_volume_idle",
+                "dirty_worktree_after", "dirty_archive_retention"):
         if raw.get(key) is None:
             continue
         seconds = parse_idle(raw[key])
@@ -451,7 +460,8 @@ def effective(canons, host: str) -> Policy:
     (le plus bas), comme les limites physiques de L43. L162 : la suppression
     des entrées de /tmp abandonnées est coupée dès qu'UNE fiche la coupe, et
     l'inactivité exigée est la plus longue. L230: `artifact_idle` too, the
-    longest."""
+    longest. #3728 : `dirty_worktree_after` et `dirty_archive_retention`
+    aussi, les plus longs (garder plus longtemps est le choix prudent)."""
     values: dict = {}
     origin: dict = {}
     roots: set[str] = set()
@@ -487,7 +497,8 @@ def effective(canons, host: str) -> Policy:
                     and value < values[key]:
                 values[key], origin[key] = value, label
             elif (key in ("orphan_idle", "deps_idle", "artifact_idle",
-                          "docker_volume_idle") and value > values[key]) or \
+                          "docker_volume_idle", "dirty_worktree_after",
+                          "dirty_archive_retention") and value > values[key]) or \
                     (key in ("orphan_cleanup", "deps", "docker_volumes") and value is False
                      and values[key] is not False):
                 values[key], origin[key] = value, label
@@ -3212,12 +3223,94 @@ def _mtime(path: str) -> float | None:
         return None
 
 
+def _lots_ended_ts(db, idents) -> float | None:
+    """#3728 : l'instant où le dernier des lots `idents` a fini (`closed_ts`,
+    sinon `updated_ts`, plus tard donc prudent) ; None si l'un est illisible."""
+    moments = []
+    for ident in idents:
+        try:
+            row = storage.of(db).work.get(int(str(ident).lstrip("#")))
+        except Exception:  # registre illisible : rien n'est prouvé
+            return None
+        moment = (row or {}).get("closed_ts") or (row or {}).get("updated_ts")
+        if moment is None:
+            return None
+        moments.append(float(moment))
+    return max(moments) if moments else None
+
+
+def _archive_due(db, idents, archive: dict | None, *, now: float, youngest: float) -> bool:
+    """#3728 : la politique d'archivage est déclarée, TOUS les lots `idents`
+    ont fini depuis plus de `after` et le worktree est inactif depuis autant."""
+    if not archive:
+        return False
+    after = float(archive["after"])
+    ended_ts = _lots_ended_ts(db, idents)
+    return ended_ts is not None and now - ended_ts >= after and now - youngest >= after
+
+
+def _archive_dirty_worktree(path: str, repo: str, base: dict, *, why: str, st: dict, state,
+                            archive: dict, now: float, dry_run: bool, artifacts, allow,
+                            lock_path, journal_path, skip_roots,
+                            held: str = "modified or untracked files") -> dict:
+    """#3728 : archive puis retrait d'un worktree gardé pour des fichiers
+    modifiés ou non suivis (#3734 : ou seulement ignorés, `held`). `plan`
+    (action `archivage` en essai, `retrait`, `garde` ou `attend`), `entries`
+    du journal, `removed`."""
+    from . import housekeeping_archive
+    after = float(archive["after"])
+    why = "%s; kept for %s, ended and idle for more than %s" % (why, held, fmt_idle(after))
+    if dry_run:
+        size, _whole = build_artifacts.size_of(
+            path, budget=build_artifacts.Budget(build_artifacts.PASS_BUDGET_S))
+        return {"plan": dict(base, action="archivage", bytes=size, detail=why),
+                "entries": [], "removed": False}
+    made: dict = {}
+
+    def keep_archive() -> str:
+        try:
+            made.update(housekeeping_archive.archive(
+                path, archive["root"], rules=build_artifacts.rules_of(artifacts),
+                lot=base.get("lot"), state=state or "", branch=st.get("branch") or "",
+                head=st.get("head") or "", now=now, retention_s=float(archive["retention"])))
+        except (housekeeping_archive.ArchiveRefused, OSError) as exc:
+            return "not archived: %s" % exc
+        return ""
+
+    outcome, freed, note, built = _remove_kept_worktree(
+        path, repo or common_dir(path), st["gitdir"], artifacts=artifacts,
+        allow=allow, lock_path=lock_path, journal_path=journal_path, skip_roots=skip_roots,
+        idle_before=now - after, idle_note="worktree active within %s" % fmt_idle(after),
+        archive=keep_archive)
+    entries = [dict(base, kind="artifact", detail="%s; %s" % (why, b.pop("detail")), **b)
+               for b in built]
+    if outcome in ("garde", "attend"):
+        if made:
+            # removal refused after the archive: the archive goes, the
+            # worktree stays as it was (nothing half done)
+            shutil.rmtree(made["archive"], ignore_errors=True)
+        return {"plan": dict(base, action=outcome, detail="%s; %s" % (why, note)),
+                "entries": entries, "removed": False}
+    detail = "%s: archived to %s (%d tracked change(s), %d untracked file(s), kept until " \
+             "%s), deleted (logged trash), git worktree prune%s" % (
+                 why, made.get("archive"), made.get("tracked", 0), made.get("files", 0),
+                 time.strftime("%Y-%m-%d", time.gmtime(made.get("retain_until_ts") or now)),
+                 "; %s" % note if note else "")
+    entries.append(dict(base, action="archived", bytes=freed, detail=detail, data={
+        "archive": made.get("archive"), "archive_bytes": made.get("bytes"),
+        "tracked": made.get("tracked"), "files": made.get("files"),
+        "retain_until_ts": made.get("retain_until_ts"), "outcome": outcome}))
+    return {"plan": dict(base, action="retrait", bytes=freed, detail=detail),
+            "entries": entries, "removed": True}
+
+
 def _worktree_pass(db, host: str, *, dry_run: bool,
                    protected: set[str], now: float,
                    running: set | None = None, artifacts=None,
                    allow=(), lock_path: str | None = None, journal_path: str | None = None,
                    skip_roots=(), known_agents=(),
-                   blocked: dict | None = None) -> tuple[list[dict], list[dict]]:
+                   blocked: dict | None = None,
+                   archive: dict | None = None) -> tuple[list[dict], list[dict]]:
     """Fin de lot des worktrees suivis : (lignes du journal, plan lisible).
 
     Garde-fous (L73b) avant tout retrait : worktree attribué à l'agent du
@@ -3251,7 +3344,14 @@ def _worktree_pass(db, host: str, *, dry_run: bool,
     `blocked` (#3396) : le dict que le passage remplit quand un doute sur les
     processus retient le retrait de worktrees de lots FINIS — `count` et le
     premier `detail` (qui nomme les processus et la clé du canon) ; le relevé
-    d'hôte en fait l'alerte `housekeeping_blocked` après six heures."""
+    d'hôte en fait l'alerte `housekeeping_blocked` après six heures.
+
+    `archive` (#3728) : `after`, `retention` (secondes, de la fiche Host),
+    `root`. Un worktree gardé pour des fichiers modifiés ou non suivis, dont
+    TOUS les lots nommés ont fini depuis plus de `after` et sans activité
+    depuis autant, sans commit absent de la forge (HEAD poussé ou intégré),
+    ni verrou git, ni sous-module, ni processus, est archivé
+    (`housekeeping_archive`) puis retiré. Absent : il reste gardé."""
     entries: list[dict] = []
     plan: list[dict] = []
     blocked = blocked if blocked is not None else {}
@@ -3511,6 +3611,22 @@ def _worktree_pass(db, host: str, *, dry_run: bool,
                 else:
                     hold = ("processes inside (%s)" % ", ".join(held[:3])
                             if held else "")
+            if leftovers and ended and st["head"] \
+                    and _archive_due(db, idents, archive, now=now, youngest=youngest):
+                # #3734 (dev3 N2) : gardé pour des fichiers ignorés seulement
+                # (un `.env`, un `__pycache__`), lot fini depuis plus de
+                # `after` : archivé puis retiré comme un worktree modifié,
+                # mêmes gardes (en cas de doute, gardé)
+                done = _archive_dirty_worktree(
+                    path, row.get("repo") or "", base, why=why, st=st, state=state,
+                    archive=archive, now=now, dry_run=dry_run, artifacts=artifacts,
+                    allow=allow, lock_path=lock_path, journal_path=journal_path,
+                    skip_roots=skip_roots, held="ignored files only")
+                entries += done["entries"]
+                plan.append(done["plan"])
+                if done["removed"]:
+                    store.set_worktree_status(row["id"], "removed", done["plan"]["detail"])
+                continue
             if hold:
                 if ended:
                     _blocked_by_holders(blocked, hold)
@@ -3540,8 +3656,29 @@ def _worktree_pass(db, host: str, *, dry_run: bool,
                                        "git worktree prune%s" % (why, "; %s" % note if note
                                                                  else "")))
             continue
-        elif not st["clean"] or not st["integrated"] or st["submodules"]:
-            plan.append(dict(base, action="garde", detail=detail))
+        # #3728 : gardé pour des fichiers modifiés ou non suivis, lot fini
+        # depuis plus de `after` : archivé puis retiré (en cas de doute, gardé)
+        held_by_archive = None
+        if archive and ended and not st["clean"] and not st["locked"] \
+                and not st["submodules"] and st["head"] and (st["pushed"] or st["integrated"]):
+            if _archive_due(db, idents, archive, now=now, youngest=youngest):
+                done = _archive_dirty_worktree(
+                    path, row.get("repo") or "", base, why=why, st=st, state=state,
+                    archive=archive, now=now, dry_run=dry_run, artifacts=artifacts,
+                    allow=allow, lock_path=lock_path, journal_path=journal_path,
+                    skip_roots=skip_roots)
+                entries += done["entries"]
+                if done["plan"]["action"] != "garde":
+                    plan.append(done["plan"])
+                    if done["removed"]:
+                        store.set_worktree_status(row["id"], "removed", done["plan"]["detail"])
+                    continue
+                held_by_archive = done["plan"]
+                # dev3 N3: the refusal is the kept reason, in the status and
+                # the `kept` line (written when it changes), not only in a plan
+                detail = held_by_archive["detail"]
+        if not st["clean"] or not st["integrated"] or st["submodules"]:
+            plan.append(held_by_archive or dict(base, action="garde", detail=detail))
             if not dry_run and (row["status"] != "kept" or row.get("detail") != detail):
                 store.set_worktree_status(row["id"], "kept", detail)
                 entries.append(dict(base, action="kept", detail=detail, data={
@@ -3568,7 +3705,8 @@ def _worktree_pass(db, host: str, *, dry_run: bool,
 
 
 def _remove_kept_worktree(path: str, repo: str, gitdir: str, *, artifacts, allow, lock_path,
-                          journal_path, skip_roots=(), idle_before: float | None = None
+                          journal_path, skip_roots=(), idle_before: float | None = None,
+                          idle_note: str = "worktree active within 24 h", archive=None
                           ) -> tuple[str, int, str, list]:
     """L230/#1665: removal of a kept worktree (lot merged, or orphan), under the
     host lock of the deleting passes (`build_artifacts`). Its build output
@@ -3580,6 +3718,10 @@ def _remove_kept_worktree(path: str, repo: str, gitdir: str, *, artifacts, allow
     is renamed to a trash recorded in the journal and deleted; git forgets
     it (`git worktree prune`; `git worktree remove` cannot follow a renamed
     directory, its checks are the ones above, stricter).
+
+    #3728 : `archive` (appelable, rend un refus ou "") remplace l'exigence
+    d'un arbre propre : appelé sous le verrou, après la sortie de build, il
+    archive les fichiers modifiés et non suivis ; un refus garde le worktree.
 
     (outcome, bytes freed, note, build output deleted): outcome `removed`,
     `partial` (gone from its path, something left in its trash), or `garde`
@@ -3631,7 +3773,7 @@ def _remove_kept_worktree(path: str, repo: str, gitdir: str, *, artifacts, allow
         if not found["complete"]:
             return "garde", 0, "artifacts: %s" % found["why"], built
         if idle_before is not None and found["latest"] > idle_before:
-            return "garde", 0, "worktree active within 24 h", built
+            return "garde", 0, idle_note, built
         if ident is None or found["identity"] != ident:
             return "garde", 0, "directory changed during the pass", built
         for artifact in found["artifacts"]:
@@ -3654,12 +3796,17 @@ def _remove_kept_worktree(path: str, repo: str, gitdir: str, *, artifacts, allow
                                   "data": {"worktree": path, "trash": done["trash"]}})
             if refusal:
                 return "garde", freed, "artifact %s: %s" % (artifact, refusal), built
-        leftovers = ignored_leftovers(path)
-        if leftovers is None:
-            return "garde", freed, "git state unreadable (git status --ignored)", built
-        if leftovers:
-            return "garde", freed, "%d untracked or ignored file(s) (%s)" % (
-                len(leftovers), leftovers[0]), built
+        if archive is not None:
+            refusal = archive()
+            if refusal:
+                return "garde", freed, refusal, built
+        else:
+            leftovers = ignored_leftovers(path)
+            if leftovers is None:
+                return "garde", freed, "git state unreadable (git status --ignored)", built
+            if leftovers:
+                return "garde", freed, "%d untracked or ignored file(s) (%s)" % (
+                    len(leftovers), leftovers[0]), built
         try:
             done = build_artifacts.remove_worktree_dir(
                 path, (real, ident), parent_id, journal=journal, avoid=avoid, budget=budget,
@@ -4656,6 +4803,19 @@ def _run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool =
     journal_path = os.path.join(cfg.state_dir, MANAGED_DIR, "artifacts.journal")
     #: #3396 : worktrees de lots finis qu'un doute sur les processus retient
     wt_blocked: dict = {}
+    # #3728 : archives des worktrees gardés pour fichiers modifiés (les deux
+    # durées de la fiche Host déclarées, sinon aucun archivage) ; celles dont
+    # la conservation est échue partent à chaque passage, politique ou non
+    from . import housekeeping_archive
+    archive_root = housekeeping_archive.root_of(cfg.state_dir, MANAGED_DIR)
+    archive = {"after": policy.dirty_worktree_after,
+               "retention": policy.dirty_archive_retention, "root": archive_root} \
+        if policy.dirty_worktree_after and policy.dirty_archive_retention else None
+    for line in housekeeping_archive.prune(archive_root, now=now, dry_run=dry_run):
+        if dry_run:
+            plan.append(dict(line, action="suppression"))
+        else:
+            entries.append(line)
     # 3. worktrees
     if policy.worktrees and registered is None:
         # sans registre, ni dossiers d'agents ni tours en cours connus
@@ -4678,7 +4838,7 @@ def _run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool =
                                              skip_roots=(troot, croot, cfg.state_dir)
                                              + _shared_roots(),
                                              known_agents=registered or (),
-                                             blocked=wt_blocked)
+                                             blocked=wt_blocked, archive=archive)
         entries += wt_entries
         plan += wt_plan
         # 3c. #2743: ad-hoc clones of ended lots (dry run by default);
@@ -4747,6 +4907,9 @@ def _run_pass(cfg, db, policy: Policy, *, host: str, actor: str, dry_run: bool =
     plan += orphan_plan
     skipped += declared_root_refused(cfg, policy)
     report_measure = measure(cfg, policy)
+    report_measure["worktree_archives"] = dict(
+        housekeeping_archive.survey(archive_root),
+        after=policy.dirty_worktree_after, retention=policy.dirty_archive_retention)
     # les plus grosses entrées de /tmp, avec ce que le ménage en fera
     sorts = {o["path"]: o for o in orphans}
     for top in report_measure.get("system_tmp_top") or ():
@@ -4819,7 +4982,7 @@ def caller_refusal(env=None) -> str | None:
 #: (the values themselves stay as stored and as in `--json`)
 ACTION_LABELS = {"attend": "waiting", "garde": "kept", "suppression": "delete",
                  "retrait": "remove", "disparu": "gone", "signalé": "flagged",
-                 "éviction": "evict"}
+                 "éviction": "evict", "archivage": "archive then remove"}
 
 
 def action_label(action) -> str:

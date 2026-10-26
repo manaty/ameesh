@@ -365,6 +365,12 @@ def cmd_list(cfg: Config, args: argparse.Namespace) -> int:
             last = _fmt_age(now - presence_ts)
             if presence_source == "wrote":
                 last = "wrote " + last
+                # #3729 : un signe de vie peut venir d'un autre hôte que celui
+                # déclaré (session externe : bureau) ; le nommer évite de lire
+                # la colonne HOST comme la preuve de la dernière activité.
+                wrote_from = (row.get("last_mail_host") or "").strip()
+                if wrote_from and wrote_from != (row.get("host") or "").strip():
+                    last += " from " + wrote_from
             print("%-20s %-12s %-10s %-10s %-11s %-22s %-8d %-5d %-5s %-13s %-4s %s" % (
                 row["name"][:20], project_label(agent_project_label(row))[:12],
                 ((live or "?")[:9] + ("*" if starred else "")),
@@ -1044,12 +1050,19 @@ def _print_host_menage(menage: dict) -> None:
         from .menage import describe_top
         print("  /tmp large %s" % describe_top(m["system_tmp_top"]))
     if m:
+        # #3728 : les archives des worktrees gardés pour fichiers modifiés
+        # (ce que leur retrait a libéré est dans la ligne 24 h : `worktree
+        # archived`)
+        arch = m.get("worktree_archives") or {}
         print("  cleanup    temporary directories %s (quota %s per agent); caches %s / %s"
-              "%s" % (_fmt_bytes(m.get("tmp_bytes")), _fmt_bytes(m.get("tmp_quota")),
-                      _fmt_bytes(m.get("cache_bytes")), _fmt_bytes(m.get("cache_quota")),
-                      "; %d /tmp entries reported (%s)" % (
-                          m["orphans"], _fmt_bytes(m.get("orphan_bytes")))
-                      if m.get("orphans") else ""))
+              "%s%s" % (_fmt_bytes(m.get("tmp_bytes")), _fmt_bytes(m.get("tmp_quota")),
+                        _fmt_bytes(m.get("cache_bytes")), _fmt_bytes(m.get("cache_quota")),
+                        "; %d /tmp entries reported (%s)" % (
+                            m["orphans"], _fmt_bytes(m.get("orphan_bytes")))
+                        if m.get("orphans") else "",
+                        "; %d worktree archive(s) (%s)" % (
+                            arch["count"], _fmt_bytes(arch.get("bytes")))
+                        if arch.get("count") else ""))
     conteneurs = (m or {}).get("containers") or {}
     if conteneurs.get("ameesh") is not None or conteneurs.get("others") is not None:
         ours = conteneurs.get("ameesh") or []
@@ -1217,7 +1230,20 @@ def cmd_show(cfg: Config, args: argparse.Namespace) -> int:
             row.get("turns"), _fmt_moment(row.get("last_turn_ts"))))
         print("error    : %s" % (row.get("last_error") or "—"))
         print("directory: %s" % (row.get("cwd") or "—"))
-        print("seen     : %s" % _fmt_age(time.time() - float(row.get("last_seen_ts") or 0)))
+        # #3729 : le dernier signe de vie, comme la colonne ACTIVITY de `list`
+        # (#3337). `last_seen` seul fait passer une session `externe` pour
+        # absente alors qu'elle vient d'écrire ; l'hôte du dernier dépôt est
+        # nommé quand il diffère de l'hôte déclaré.
+        presence_ts, presence_source = registry.presence(row)
+        activity = _fmt_age(time.time() - presence_ts)
+        if presence_source == "wrote":
+            activity = "wrote " + activity
+            wrote_from = (row.get("last_mail_host") or "").strip()
+            if wrote_from and wrote_from != (row.get("host") or "").strip():
+                activity += " from " + wrote_from
+        else:
+            activity = "seen " + activity
+        print("activity : %s" % activity)
         return 0
     finally:
         db.close()
@@ -1866,6 +1892,14 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
             creator = binding.name if binding.ok else args.actor
             if args.new_project and args.app is None:
                 raise work.WorkError("--new-project goes with --app <project>")
+            if args.body == "-":
+                # #3744 : comme `work note <lot> -` (#3683), le corps vient de
+                # l'entrée standard (heredoc `<<'EOF'`), jamais « - » tel quel ;
+                # une entrée vide ou réduite à « - » est refusée avant création.
+                from . import cli
+                args.body, error = cli._stdin_body("body")
+                if error:
+                    raise work.WorkError(error)
             args.app = work_projects.creation_project(cfg, db, creator, args.app,
                                                       new_project=args.new_project)
             # #506: read before the lot exists (it makes its project known)
@@ -2664,6 +2698,11 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                         print("manual     : %s" % ", ".join(out["manual"]))
                     if out.get("error"):
                         print("mark       : %s" % out["error"])
+                    if out.get("historical"):
+                        # #3685 : la marque enregistrée nomme un siège qui
+                        # n'est plus désigné (hôte perdu, retrait du pilote) ;
+                        # la reprise ci-dessous est la désignation vivante.
+                        print("mark       : historical — %s" % out["historical"])
             applied = out.get("applied")
             if applied is not None and not args.json:
                 state = applied.get("state")
@@ -3625,7 +3664,9 @@ def build_parser() -> argparse.ArgumentParser:
     pw_add.add_argument("--new-project", action="store_true",
                         help="#506: accept an --app project nobody declares yet "
                              "(journaled on the lot); refused otherwise")
-    pw_add.add_argument("--body", default=None)
+    pw_add.add_argument("--body", default=None,
+                        help="the lot's statement; `-` reads it on standard input "
+                             "(heredoc <<'EOF', #3744)")
     pw_add.add_argument("--issue-ref", default=None)
     pw_add.add_argument("--workstream", default=None)
     pw_add.add_argument("--assignee", default=None)
@@ -3926,7 +3967,8 @@ def build_parser() -> argparse.ArgumentParser:
         epilog="#3498: a pilot hold may declare an external wait — "
                "\"hold: attente bureau : <geste>\" (or owner), with an optional "
                "\"(due 2026-10-25 12:00 UTC)\"; ameesh debit lists it as an "
-               "external wait, not an agent wait.")
+               "external wait, not an agent wait. #3773: it may also declare "
+               "a third party — \"hold: attente externe : revue Apple\".")
     pw_note.add_argument("id", type=int)
     pw_note.add_argument("text", help="the note, or - to read it on standard input "
                                       "(heredoc <<'EOF': nothing is expanded)")
@@ -4255,7 +4297,12 @@ def cmd_cost(cfg: Config, args) -> int:
         if what == "over":
             agent = getattr(args, "agent", "all") or "all"
             harness = book.tool_of(agent) if agent != "all" else ""
-            items = accounts_mod.parse(cfg.accounts).get(harness) if harness else None
+            # #3680 : le verdict est celui de la garde — comptes au rythme du
+            # canon (`with_canon_pace` : multiplicateur et plancher de
+            # sous-utilisation), pas le réglage local de l'hôte.
+            items = (accounts_mod.with_canon_pace(
+                cfg, accounts_mod.parse(cfg.accounts)).get(harness)
+                if harness else None)
             if items:
                 # L30 : le forfait n'est « dépassé » que si TOUS les comptes sont au seuil
                 now = time.time()
@@ -4279,11 +4326,19 @@ def cmd_cost(cfg: Config, args) -> int:
             comptes = []
         actifs = {}
         rythmes = {}
+        plafonds = {}
         for ligne in comptes:
             if ligne["active"]:
                 actifs[ligne["harness"]] = (ligne["account"], ligne["_gauges"])
                 rythmes[ligne["harness"]] = ligne.get("pace_multiplier", 1.0)
-        rows = book.report(accounts=actifs, multipliers=rythmes)
+                # #3680 : le plafond de la garde par fenêtre (`limits` calculé
+                # par accounts.report : plancher de sous-utilisation, plafond
+                # de rythme et réserve compris), jamais un rythme recalculé
+                # sans plancher.
+                plafonds[ligne["harness"]] = {
+                    g["key"]: float(g["cap"]) for g in ligne["gauges"]
+                    if g.get("cap") is not None}
+        rows = book.report(accounts=actifs, multipliers=rythmes, caps=plafonds)
         for ligne in comptes:
             for cle in ("_gauges", "_limits", "_ceilings"):
                 ligne.pop(cle, None)
@@ -4338,7 +4393,12 @@ def _cost_report_reads(cfg: Config, db) -> None:
               for ligne in comptes if ligne["active"]}
     rythmes = {ligne["harness"]: ligne.get("pace_multiplier", 1.0)
                for ligne in comptes if ligne["active"]}
-    book.report(accounts=actifs, multipliers=rythmes)
+    # #3680 : les mêmes plafonds de la garde que `cmd_cost` (mêmes lectures,
+    # même cache `db.prefetch`).
+    plafonds = {ligne["harness"]: {g["key"]: float(g["cap"])
+                                   for g in ligne["gauges"] if g.get("cap") is not None}
+                for ligne in comptes if ligne["active"]}
+    book.report(accounts=actifs, multipliers=rythmes, caps=plafonds)
     _real_spend_24h(db)
 
 

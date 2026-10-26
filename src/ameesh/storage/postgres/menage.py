@@ -127,23 +127,26 @@ class Housekeeping(interface.Housekeeping):
     def summary(self, host, since_s) -> list[dict]:
         # #2617: an unattributed /tmp entry is signaled again every 12 h; in
         # the 24 h window each path counts once, with its latest size, or the
-        # report shows its volume twice.
+        # report shows its volume twice. #3728: so does an `unremovable`
+        # reading, written at every pass while the episode lasts (84 lines of
+        # one 1.3 GiB directory read as 106.6 GiB on agents-2).
         where, params = "", [float(since_s)]
         if host:
             where = " AND host = %s"
             params.append(host)
+        once = "((kind = 'orphan' AND action = 'signaled') OR action = 'unremovable')"
         return self.db.query(
             "WITH recent AS ("
             " SELECT host, kind, action, path, bytes, at, id FROM housekeeping_log"
             " WHERE at >= now() - make_interval(secs => %s) AND kind <> 'mesure'" + where +
             "), signaled_once AS ("
-            " SELECT DISTINCT ON (host, path) host, kind, action, bytes FROM recent"
-            " WHERE kind = 'orphan' AND action = 'signaled'"
-            " ORDER BY host, path, at DESC, id DESC)"
+            " SELECT DISTINCT ON (host, kind, action, path) host, kind, action, bytes"
+            " FROM recent WHERE " + once +
+            " ORDER BY host, kind, action, path, at DESC, id DESC)"
             " SELECT host, kind, action, count(*)::int AS n,"
             " coalesce(sum(bytes), 0)::bigint AS bytes FROM ("
             " SELECT host, kind, action, bytes FROM recent"
-            " WHERE NOT (kind = 'orphan' AND action = 'signaled')"
+            " WHERE NOT " + once +
             " UNION ALL SELECT host, kind, action, bytes FROM signaled_once"
             ") AS lignes GROUP BY host, kind, action ORDER BY host, kind, action",
             tuple(params))
@@ -151,16 +154,29 @@ class Housekeeping(interface.Housekeeping):
     def last_measure(self, host) -> list[dict]:
         where, params = "", []
         if host:
-            where = " AND host = %s"
+            where = " WHERE l.host = %s"
             params.append(host)
         # #3631 : ids par l'index (kind, host, at DESC, id DESC), une ligne
         # relue par hôte — l'ancien DISTINCT ON parcourait tout le journal du
         # ménage (~230 Mo) à chaque passe d'alertes.
+        # #3741 : le DISTINCT ON lisait encore toutes les entrées d'index des
+        # mesures (27 000, 0,25 s à vide, 6 s sous charge) ; le parcours
+        # récursif saute d'un hôte au suivant (`host` est NOT NULL) et lit une
+        # entrée d'index par hôte.
         rows = self.db.query(
-            "SELECT " + LOG_COLUMNS_ALIASED + " FROM housekeeping_log l"
-            " JOIN (SELECT DISTINCT ON (host) host, id FROM housekeeping_log"
-            "        WHERE kind = 'mesure'" + where +
-            "       ORDER BY host, at DESC, id DESC) u ON u.id = l.id"
+            "WITH RECURSIVE h(host) AS ("
+            "  (SELECT host FROM housekeeping_log WHERE kind = 'mesure'"
+            "    ORDER BY host LIMIT 1)"
+            "  UNION ALL"
+            "  SELECT (SELECT n.host FROM housekeeping_log n"
+            "           WHERE n.kind = 'mesure' AND n.host > h.host"
+            "           ORDER BY n.host LIMIT 1)"
+            "    FROM h WHERE h.host IS NOT NULL)"
+            "SELECT " + LOG_COLUMNS_ALIASED + " FROM h"
+            " CROSS JOIN LATERAL (SELECT u.id FROM housekeeping_log u"
+            "   WHERE u.kind = 'mesure' AND u.host = h.host"
+            "   ORDER BY u.at DESC, u.id DESC LIMIT 1) u"
+            " JOIN housekeeping_log l ON l.id = u.id" + where +
             " ORDER BY l.host", tuple(params))
         return [_data(dict(r)) for r in rows]
 

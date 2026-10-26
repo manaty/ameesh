@@ -37,6 +37,12 @@ class _Stacked(_ActivationFixture):
 
     def setUp(self):
         super().setUp()
+        # #3742 : ce témoin empile deux familles d'auteurs avec deux avis
+        # requis ; le gel refuse désormais une telle tête. La famille
+        # supplémentaire, sans agent disponible, garde la tête relisible
+        # (deux familles éligibles) et la désignation en attente, ce que ces
+        # témoins vérifient.
+        self.four_families()
         # main : le commit de base du dépôt, hors de la plage du lot.
         self.repo.write("src/ameesh/work.py", "main\n")
         self.base = self.repo.commit("main")

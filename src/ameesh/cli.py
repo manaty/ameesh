@@ -504,6 +504,14 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
         return 2
     else:
         text = " ".join(body).strip()
+        if text == "-":
+            # #3693 : un argument « - » entouré de blancs n'est pas le marqueur
+            # d'entrée standard (il doit être seul) ; un corps nettoyé ne vaut
+            # jamais « - » et n'est donc jamais déposé.
+            print("the body is just `-`: write the text after the recipient, or "
+                  "give `-` alone (not quoted, without blanks) to read the body "
+                  "on standard input", file=sys.stderr)
+            return 2
         output = _command_output_in(text)
         if output:
             # #3504 (optionnel) : la sortie d'une commande ameesh dans un corps
@@ -2001,7 +2009,11 @@ def cmd_probe(cfg: Config) -> int:
     try:
         db = db_mod.connect(cfg)
     except db_mod.Unavailable as exc:
-        print("probe: KO — database unreachable (%s)" % exc)
+        # #3745 : le refus d'un pgbouncer n'est pas une migration manquante
+        hint = ("; a pgbouncer refuses an ameesh session setting: add it to its "
+                "track_extra_parameters and restart it (deploy/pgbouncer-host.md)"
+                if "unsupported startup parameter" in str(exc) else "")
+        print("probe: KO — database unreachable (%s)%s" % (exc, hint))
         return 1
     try:
         db_mod.require_schema(db)
@@ -2194,6 +2206,17 @@ def cmd_doctor(cfg: Config, notify_test: bool, probe: bool = False,
             print(line)
     except Exception as exc:  # a reading never breaks the doctor
         print("network    : not checked (%s)" % (" ".join(str(exc).split())[:120],))
+    # #3745 : le pgbouncer local accepte-t-il les réglages `-c` qu'ameesh
+    # envoie au démarrage de session ? Lu sur sa console avant la connexion
+    # ordinaire, que son refus ferait échouer (`jit` de #3503 sur pc-smichea).
+    from . import pgbouncer_local
+    pool_ok = True
+    try:
+        pool_ok, pool_lines = pgbouncer_local.startup_lines(cfg)
+    except Exception as exc:  # a reading never breaks the doctor
+        pool_lines = ["startup options not checked (%s)" % (" ".join(str(exc).split())[:120],)]
+    for line in pool_lines:
+        print("pgbouncer  : %s" % line)
     # #3735 : le banc Postgres local (schémas t_* orphelins, catalogues
     # gonflés, autovacuum muet) — un signal, jamais un verdict KO : la base
     # du mesh peut être saine alors que le banc de l'hôte ne l'est pas. Lu
@@ -2294,6 +2317,10 @@ def cmd_doctor(cfg: Config, notify_test: bool, probe: bool = False,
     except db_mod.DbError:
         pass
     verdict = 1 if nexlink_ko else 0
+    # #3745 : un réglage de session que le pool local refuserait (ligne
+    # déjà imprimée) casse chaque nouvelle session d'ameesh de l'hôte.
+    if not pool_ok:
+        verdict = 1
     # #3503 : la session d'ameesh doit avoir reçu `-c jit=off` ; sinon le
     # correctif ne s'applique pas à ce processus (ligne déjà imprimée).
     if jit_ko:

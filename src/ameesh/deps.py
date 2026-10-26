@@ -72,10 +72,11 @@ SCHEMA = "ameesh-deps/1"
 FILL_WAIT_S = 1800.0
 #: a partial entry (no marker, lock free) older than this is garbage
 PARTIAL_MIN_AGE_S = 3600.0
-#: an unreferenced entry is deleted after this long without a new link
-DEFAULT_DEPS_IDLE_S = 3 * 24 * 3600.0
-#: and never sooner than this after a link to it was last seen alive
+#: never sooner than this after a link to it was last seen alive
 GRACE_S = 24 * 3600.0
+#: an unreferenced entry is deleted after this long without a new link
+#: (#3746: 24 h, was 3 days; a full agents disk needs the room sooner)
+DEFAULT_DEPS_IDLE_S = GRACE_S
 #: touched by the GC each time it sees a live link to the entry
 ALIVE = ".last-alive"
 #: the one install mode of a fill (part of the key): a full development tree,

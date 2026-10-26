@@ -28,6 +28,7 @@ from ameesh import db as db_mod
 from ameesh import migrations
 from ameesh import work as work_mod
 from ameesh.platform import SYSTEM as PLATFORM_SYSTEM
+from . import gabarit
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SRC = os.path.join(REPO, "src")
@@ -41,6 +42,8 @@ BENCH_ENV_VARS = frozenset((
     "AMEESH_REQUIRE_DB", "AGENT_MESH_REQUIRE_DB",
     "AMEESH_DRIVER", "AGENT_MESH_DRIVER",
     "AMEESH_DB_TRACE",
+    # #3752 : AMEESH_TEST_GABARIT=0 rejoue migrate() à chaque classe
+    "AMEESH_TEST_GABARIT",
 ))
 #: L73/L142 : les caches de gestionnaires de paquets que le ménage redirige
 #: (`menage.CACHES`, `menage.XDG_CACHE`) sont un « choix de l'hôte » que le
@@ -651,7 +654,8 @@ class PgTestCase(SensitiveGlobalsMixin, unittest.TestCase):
                 raise AssertionError(message) from exc
             raise unittest.SkipTest(message) from exc
         _bench_upkeep(cls.db)
-        migrations.migrate(cls.db, log=None)
+        # #3752 : clone du gabarit migré une fois par base, sinon migrate()
+        gabarit.preparer(cls.db, cls.schema)
         # #3735 : preuve de propriété durable du schéma — le processus de la
         # suite vit, même au repos entre deux transactions sans verrou ni
         # requête nommante ; sa mort libère la purge. Best-effort : sans

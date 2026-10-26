@@ -19,6 +19,24 @@ RUN_COLUMNS = """
     urgent_message_id, verdict_message_id
 """
 
+#: #3686 : sur une base, un `workflow_dispatch` d'un workflow qui n'y tourne
+#: jamais de lui-même (aucune exécution push, planifiée… sur la même branche)
+#: est un geste d'opérateur sur une suite qui ne suit pas cette base : refusé
+#: par sa garde, il ne dit rien de l'état fusionné (manaty/nexlink main, 26/10
+#: 05:46Z, six suites refusées et six `ci_main_red` qu'aucun vert ne pouvait
+#: fermer). Une exécution `pull_request*` dont la tête est la base (PR de
+#: synchronisation main → develop) ne prouve pas non plus que la suite la
+#: suit. Un dispatch d'une suite qui tourne aussi sur la base compte comme
+#: avant. Alias `r` pour la ligne examinée.
+FOLLOWS_BASE = """
+    (r.event IS DISTINCT FROM 'workflow_dispatch'
+     OR EXISTS (SELECT 1 FROM ci_runs o
+                 WHERE o.repo = r.repo AND o.branch = r.branch
+                   AND o.workflow IS NOT DISTINCT FROM r.workflow
+                   AND o.event IS DISTINCT FROM 'workflow_dispatch'
+                   AND coalesce(o.event, '') NOT LIKE 'pull_request%%'))
+"""
+
 FAILURE_COLUMNS = """
     repo, run_id, run_attempt, part, test, module, status, inherited, excerpt, replay,
     duration_s, extract(epoch from failed_at)::float8 AS failed_ts, message_id
@@ -92,16 +110,18 @@ class CiResults(interface.CiResults):
             % RUN_COLUMNS, (repo,))
 
     def running_on(self, branches) -> list[dict]:
-        """#846 : tous dépôts confondus, les exécutions en cours d'une base."""
+        """#846 : tous dépôts confondus, les exécutions en cours d'une base
+        (#3686 : hors dispatch d'une suite qui ne suit pas la base)."""
         if not branches:
             return []
         return self.db.query(
             """
-            SELECT %s FROM ci_runs
+            SELECT %s FROM ci_runs r
              WHERE branch IN (SELECT jsonb_array_elements_text(%%s::jsonb))
                AND status = 'running'
+               AND %s
              ORDER BY repo, run_id
-            """ % RUN_COLUMNS, (json.dumps(sorted(branches)),))
+            """ % (RUN_COLUMNS, FOLLOWS_BASE), (json.dumps(sorted(branches)),))
 
     def conclude(self, repo, run_id, status) -> bool:
         from ... import merge_queue, train_events
@@ -267,22 +287,26 @@ class CiResults(interface.CiResults):
     def latest_concluded(self, branches) -> list[dict]:
         if not branches:
             return []
+        # #3686 : la tête courante et la dernière exécution de chaque workflow
+        # se lisent sans les dispatchs d'une suite qui ne suit pas la base
         return self.db.query(
             """
             WITH current AS (
                 SELECT DISTINCT ON (repo, branch) repo, branch, head_sha
-                  FROM ci_runs
+                  FROM ci_runs r
                  WHERE branch IN (SELECT jsonb_array_elements_text(%%s::jsonb))
                    AND status IN ('success', 'failure')
+                   AND %s
                  ORDER BY repo, branch, run_id DESC
             )
             SELECT DISTINCT ON (repo, branch, workflow) %s
-              FROM ci_runs
+              FROM ci_runs r
              WHERE (repo, branch, head_sha) IN
                    (SELECT repo, branch, head_sha FROM current)
                AND status IN ('success', 'failure')
+               AND %s
              ORDER BY repo, branch, workflow, concluded_at DESC, run_id DESC
-            """ % RUN_COLUMNS, (json.dumps(sorted(branches)),))
+            """ % (FOLLOWS_BASE, RUN_COLUMNS, FOLLOWS_BASE), (json.dumps(sorted(branches)),))
 
     # -- #845 : garde de la CI (runners et file) ---------------------------
     def observe_runners(self, repo, runners) -> None:

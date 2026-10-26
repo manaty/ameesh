@@ -259,7 +259,11 @@ class Agents(Domain):
 
     @abc.abstractmethod
     def get(self, name: str) -> dict | None:
-        """Agent by primary or alias; alias resolutions are durably audited."""
+        """Agent by primary or alias; alias resolutions are durably audited.
+
+        #3729 : la ligne porte aussi `last_mail_ts` et `last_mail_host`, le
+        dernier message déposé et l'hôte qui l'a déposé — le signe de vie que
+        `ameesh show` affiche comme `ameesh list` depuis #3337."""
 
     @abc.abstractmethod
     def resolve_name(self, name: str, *, operation: str = "lookup") -> str:
@@ -4139,7 +4143,9 @@ class Housekeeping(Domain):
 
         #2617 : un signalement `orphan` (ré-écrit toutes les 12 h pour une
         entrée non attribuée) compte une fois par chemin, avec sa dernière
-        taille ; les autres actions comptent leurs lignes."""
+        taille ; #3728 : un relevé `unremovable` aussi (réécrit à chaque
+        passage tant que l'épisode dure) ; les autres actions comptent leurs
+        lignes."""
 
     @abc.abstractmethod
     def last_measure(self, host: str | None) -> list[dict]:
@@ -4445,7 +4451,9 @@ class CiResults(Domain):
     @abc.abstractmethod
     def latest_concluded(self, branches: Sequence[str]) -> list[dict]:
         """Par dépôt, branche et workflow, sur la dernière tête conclue de la
-        branche, l'exécution conclue verte ou rouge la plus récente."""
+        branche, l'exécution conclue verte ou rouge la plus récente. #3686 :
+        un `workflow_dispatch` d'un workflow qui ne tourne jamais autrement
+        sur la branche n'y compte pas (geste d'opérateur, pas l'état fusionné)."""
 
     @abc.abstractmethod
     def head_replaced(self, repo: str, branch: str, head_sha: str, run_id: int) -> bool:
