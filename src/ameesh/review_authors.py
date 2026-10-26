@@ -600,48 +600,54 @@ def _same_patch_candidates(db, item: Mapping, repo: str, email: str,
     return candidates
 
 
-def _same_patch_receipt(db, item: Mapping, repo: str, sha: str, *,
-                        provider=None, cache: Optional[dict] = None
-                        ) -> Optional[dict]:
-    """Le reçu exact d'une réémission à patch-id verbatim identique (#3805).
+def _same_patch_receipts(db, item: Mapping, repo: str, sha: str, *,
+                         provider=None, cache: Optional[dict] = None
+                         ) -> list:
+    """Les reçus exacts des réémissions à patch-id verbatim identique (#3805).
 
     Le rebase conserve l'auteur Git et sa date ; on cherche, parmi les refs et
-    les gels antérieurs du lot, un commit du même auteur au même instant dont
-    le patch est identique et qui porte un reçu exact. Le reçu de l'original
-    vaut alors pour la copie : elle n'est pas attribuée au committer.
+    les gels antérieurs du lot, les commits du même auteur au même instant dont
+    le patch est identique et qui portent un reçu exact. **Tous** les reçus
+    retenus comptent : deux réémissions du même contenu peuvent avoir été
+    reçues sous des harnais différents, et en garder un seul ferait disparaître
+    une famille selon l'ordre de `git log` (relecture cx1, #3805). L'appelant
+    réunit leurs familles ; une ambiguïté se transporte, elle ne se tranche
+    pas.
 
-    Une lecture impossible ou ambiguë rend None : c'est une absence de preuve,
+    Une lecture impossible rend une liste vide : c'est une absence de preuve,
     jamais une erreur (le repli committer + auteur Git reste fermé).
     """
     if db is None or not repo or not sha:
-        return None
+        return []
     text = plan_git._out(repo, "show", "-s", "--format=%ae%x1f%at%x1f%P", sha)
     if text is None:
-        return None
+        return []
     fields = str(text).strip().split("\x1f")
     if len(fields) != 3:
-        return None
+        return []
     email = fields[0].strip().lower()
     try:
         stamp = float(fields[1].strip())
     except ValueError:
-        return None
+        return []
     if len(fields[2].split()) > 1:
-        return None                     # un commit de fusion n'a pas ce patch
+        return []                       # un commit de fusion n'a pas ce patch
     actor = _agent_of_email(db, email, stamp)
     if not actor or not _registered(db, actor):
-        return None
+        return []
     candidates = [candidate for candidate, candidate_stamp
                   in _same_patch_candidates(db, item, repo, email, cache)
                   if candidate != sha and candidate_stamp == stamp]
     if not candidates:
-        return None
+        return []
     try:
         wanted = plan_git._diff_patch_id(repo, sha + "^", sha)
     except Exception:  # noqa: BLE001 - patch illisible : pas de preuve
-        return None
+        return []
     if not wanted:
-        return None
+        return []
+    found: list = []
+    seen: set = set()
     for candidate in candidates:
         try:
             receipt = _commit_receipt(provider, db, candidate, strict=False)
@@ -655,9 +661,15 @@ def _same_patch_receipt(db, item: Mapping, repo: str, sha: str, *,
             patch = plan_git._diff_patch_id(repo, candidate + "^", candidate)
         except Exception:  # noqa: BLE001 - ce candidat reste sans preuve
             continue
-        if patch and patch == wanted:
-            return receipt
-    return None
+        if not patch or patch != wanted:
+            continue
+        key = (str(receipt.get("actor") or "").strip().casefold(),
+               str(receipt.get("harness") or "").strip().casefold())
+        if key in seen:
+            continue
+        seen.add(key)
+        found.append(receipt)
+    return found
 
 
 def _unreceived_role(actor: str, author_name: str, reviewers) -> str:
@@ -698,17 +710,26 @@ def _unreceived_authors(db, item: Mapping, repo: str, sha: str, *,
     agent_made = bool(committer) and (
         (author_name and committer.casefold() == str(author_name).strip().casefold())
         or _registered(db, committer))
-    exact = (_same_patch_receipt(db, item, repo, sha, provider=provider,
-                                 cache=cache)
-             if agent_made and carry_receipts else None)
-    if exact is not None:
-        actor = str(exact.get("actor") or "").strip()
+    receipts = (_same_patch_receipts(db, item, repo, sha, provider=provider,
+                                     cache=cache)
+                if agent_made and carry_receipts else [])
+    if receipts:
+        actor = str(receipts[0].get("actor") or "").strip()
         if not actor:
             return [], [sha[:12]]
-        return [{"name": actor,
-                 "family": _family(exact.get("harness"), families),
-                 "role": _unreceived_role(actor, author_name, reviewers),
-                 "proof": False}], []
+        proven = {_family(receipt.get("harness"), families)
+                  for receipt in receipts}
+        proven.discard("")
+        row = {"name": actor,
+               "family": next(iter(proven)) if len(proven) == 1 else "",
+               "role": _unreceived_role(actor, author_name, reviewers),
+               "proof": False}
+        if len(proven) > 1:
+            # #3584/#3805 : deux réémissions du même contenu reçues sous des
+            # harnais différents gardent **toutes** leurs familles ; aucune
+            # n'est choisie selon l'ordre de `git log`.
+            row["families"] = sorted(proven)
+        return [row], []
     if (git_author and committer
             and git_author.casefold() != committer.casefold()
             and agent_made):
@@ -2146,6 +2167,10 @@ def _prior_reading(db, item: Mapping, freeze: Mapping, commits: Sequence[str],
     by_name: dict[str, set] = {}
     written: dict[str, list] = {}
     review_commits: dict[str, list] = {}
+    # #3805 : familles prouvées par une correction de relecteur dont le reçu
+    # vient d'une réémission ambiguë, par commit ; la promotion en auteur les
+    # réunit pour les seuls commits retenus.
+    review_families: dict[str, dict[str, set]] = {}
     unknown: list[str] = []
     cache = {} if cache is None else cache
     commits = _not_in_target(repo, commits, target)
@@ -2190,11 +2215,17 @@ def _prior_reading(db, item: Mapping, freeze: Mapping, commits: Sequence[str],
             for row in rows:
                 actor = row["name"]
                 written.setdefault(actor, []).append(sha)
+                values = {str(value) for value in row.get("families") or ()
+                          if str(value or "").strip()}
+                if row["family"]:
+                    values.add(str(row["family"]))
                 if row["role"] == "reviewer":
                     review_commits.setdefault(actor, []).append(
                         (sha, row["family"]))
+                    review_families.setdefault(actor, {}).setdefault(
+                        sha, set()).update(values)
                 else:
-                    by_name.setdefault(actor, set()).add(row["family"])
+                    by_name.setdefault(actor, set()).update(values)
             continue
         actor = str(receipt.get("actor") or "").strip()
         if not actor:
@@ -2214,9 +2245,13 @@ def _prior_reading(db, item: Mapping, freeze: Mapping, commits: Sequence[str],
         if _test_only_correction(repo, entries, str(item.get("app") or "")):
             continue
         by_name.setdefault(actor, set())
-        for _sha, proven in entries:
+        for sha, proven in entries:
             if proven:
                 by_name[actor].add(proven)
+            # #3805 : une correction reçue sous plusieurs harnais garde toutes
+            # ses familles, pas la première de `git log`.
+            by_name[actor].update(
+                review_families.get(actor, {}).get(sha) or ())
     return by_name, written, review_commits, unknown
 
 
@@ -2887,6 +2922,9 @@ def reading(db, item: Mapping, milestone: Optional[Mapping],
     by_name: dict[str, set] = {}
     unknown: list[str] = []
     review_commits: dict[str, list[tuple[str, str]]] = {}
+    # #3805 : familles d'une correction reçue sous plusieurs harnais, par
+    # commit ; la promotion en auteur ne garde que les commits survivants.
+    review_families: dict[str, dict[str, set]] = {}
     proofs: dict[str, set[str]] = {}
     # #3805 : les copies d'une même réémission partagent la liste des commits
     # candidats d'un auteur (une seule recherche `git log --all` par auteur).
@@ -2924,11 +2962,17 @@ def reading(db, item: Mapping, milestone: Optional[Mapping],
             unknown.extend(missing)
             for row in rows:
                 actor = row["name"]
+                values = {str(value) for value in row.get("families") or ()
+                          if str(value or "").strip()}
+                if row["family"]:
+                    values.add(str(row["family"]))
                 if row["role"] == "reviewer":
                     review_commits.setdefault(actor, []).append(
                         (sha, row["family"]))
+                    review_families.setdefault(actor, {}).setdefault(
+                        sha, set()).update(values)
                 else:
-                    by_name.setdefault(actor, set()).add(row["family"])
+                    by_name.setdefault(actor, set()).update(values)
                     record_commit(actor, sha)
                 if row["proof"]:
                     proofs.setdefault(actor, set()).add(sha[:12])
@@ -3004,6 +3048,10 @@ def reading(db, item: Mapping, milestone: Optional[Mapping],
             for sha, proven in entries:
                 if proven:
                     by_name[actor].add(proven)
+                # #3805 : une correction reçue sous plusieurs harnais garde
+                # toutes ses familles, pas la première de `git log`.
+                by_name[actor].update(
+                    review_families.get(actor, {}).get(sha) or ())
                 record_commit(actor, sha)
         if actor in test_correctors or (not design and total <= REVIEWER_FIX_LINES):
             small_correctors.add(actor)
@@ -3072,6 +3120,8 @@ def reading(db, item: Mapping, milestone: Optional[Mapping],
 
     for actor in sorted(small_correctors):
         proven = {value for _sha, value in review_commits[actor] if value}
+        for sha, _value in review_commits[actor]:
+            proven |= review_families.get(actor, {}).get(sha, set())
         record_corrector(actor, "", proven, test_only=actor in test_correctors)
     # #2924 : un correcteur d'un gel antérieur dont le correctif subsiste garde
     # sa trace. Hors tests seuls (#3518), il est aussi auteur de la tête ;

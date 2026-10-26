@@ -246,3 +246,60 @@ class NonAgentCommitterTest(_RebaseFixture):
             base=self.base, head=self.unmanaged)
         self.assertEqual(authors, [])
         self.assertEqual(unknown, [self.unmanaged[:12]])
+
+
+class _AmbiguousReceiptFixture(_RebaseFixture):
+    """Deux réémissions du même patch, reçues sous des harnais différents.
+
+    Le même contenu, le même auteur et la même date d'auteur portent deux reçus
+    (claude et codex) ; l'ordre de `git log` est fixé par la date de committer
+    des deux originaux. Le lecteur doit garder **les deux** familles, jamais la
+    première rencontrée (relecture cx1, #3805).
+    """
+
+    #: le reçu codex est-il le plus récent (donc vu en premier par git log) ?
+    CODEX_FIRST = True
+
+    def setUp(self):
+        super().setUp()
+        self.second = self._second_original(newer=self.CODEX_FIRST)
+        self.rebase(receipt=False, keep_original=True)
+        self.receipt(self.original, AUTHOR, "claude")
+        self.receipt(self.second, AUTHOR, "codex")
+
+    def _second_original(self, *, newer):
+        first_ct = int(self.repo.git("log", "-1", "--format=%ct",
+                                     self.original))
+        self.repo.git("checkout", "-q", "-B", "main", self.base)
+        self.repo.write("src/ameesh/work.py", "lot\n")
+        env = dict(self.repo.dry,
+                   GIT_AUTHOR_NAME=AUTHOR,
+                   GIT_AUTHOR_EMAIL="%s@ameesh.invalid" % AUTHOR,
+                   GIT_AUTHOR_DATE="%s +0000" % self.author_stamp,
+                   GIT_COMMITTER_NAME=AUTHOR,
+                   GIT_COMMITTER_EMAIL="%s@ameesh.invalid" % AUTHOR,
+                   GIT_COMMITTER_DATE="%d +0000"
+                   % (first_ct + (100 if newer else -100)))
+        self.repo.git("add", "-A")
+        self.repo.git("commit", "-qm", "A: contenu (reçu codex)", env=env)
+        second = self.repo.git("rev-parse", "HEAD")
+        self.repo.git("branch", "-f", "keep-second", second)
+        return second
+
+    def test_all_receipt_families_are_kept_whatever_the_log_order(self):
+        authors, unknown, _correctors = self.reading()
+        self.assertEqual(unknown, [])
+        self.assertEqual(len(authors), 1)
+        row = authors[0]
+        self.assertEqual(row["name"], AUTHOR)
+        # Deux familles prouvées : ambiguïté transportée, pas devinée.
+        self.assertEqual(row["family"], "")
+        self.assertEqual(row["families"], ["claude", "codex"])
+
+
+class AmbiguousReceiptCodexFirstTest(_AmbiguousReceiptFixture):
+    CODEX_FIRST = True
+
+
+class AmbiguousReceiptClaudeFirstTest(_AmbiguousReceiptFixture):
+    CODEX_FIRST = False
