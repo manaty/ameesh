@@ -2217,6 +2217,13 @@ def cmd_doctor(cfg: Config, notify_test: bool, probe: bool = False,
         pool_lines = ["startup options not checked (%s)" % (" ".join(str(exc).split())[:120],)]
     for line in pool_lines:
         print("pgbouncer  : %s" % line)
+    # #3735 : le banc Postgres local (schémas t_* orphelins, catalogues
+    # gonflés, autovacuum muet) — un signal, jamais un verdict KO : la base
+    # du mesh peut être saine alors que le banc de l'hôte ne l'est pas. Lu
+    # avant la connexion au mesh pour rester visible si celle-ci échoue.
+    from . import bench as bench_mod
+    for line in bench_mod.doctor_lines(cfg):
+        print(line)
     started = time.monotonic()
     try:
         db = db_mod.connect(cfg)
