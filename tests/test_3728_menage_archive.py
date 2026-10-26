@@ -69,7 +69,12 @@ class ArchiveThenRemoveTest(_Repo):
 
     def dirty(self, branch):
         wt = self.add_worktree(branch)
+        # cx2 (B/P1): staged content distinct from the working copy (`MM`)
+        _write(os.path.join(wt, "f.txt"), text="staged-only-content\n")
+        _git("add", "f.txt", cwd=wt)
         _write(os.path.join(wt, "f.txt"), text="changed\n")          # tracked, modified
+        _write(os.path.join(wt, "new.txt"), text="staged new file\n")
+        _git("add", "new.txt", cwd=wt)                                # staged only
         _write(os.path.join(wt, "notes", "todo.md"), text="draft\n")  # untracked
         _write(os.path.join(wt, ".env"), text="SECRET=1\n")           # ignored, not output
         _write(os.path.join(wt, "node_modules", "a.js"))              # build output
@@ -91,9 +96,10 @@ class ArchiveThenRemoveTest(_Repo):
         folder = archived["data"]["archive"]
         self.assertTrue(folder.startswith(self.archives + os.sep))
         self.assertEqual(os.stat(self.archives).st_mode & 0o777, 0o700)
-        with open(os.path.join(folder, "tracked.patch")) as fh:
-            patch = fh.read()
-        self.assertIn("+changed", patch)
+        with open(os.path.join(folder, "staged.patch")) as fh:
+            self.assertIn("+staged-only-content", fh.read())
+        with open(os.path.join(folder, "unstaged.patch")) as fh:
+            self.assertIn("+changed", fh.read())
         with tarfile.open(os.path.join(folder, "untracked.tar.gz")) as tar:
             names = sorted(tar.getnames())
         self.assertEqual(names, [".env", "notes/todo.md"])
@@ -102,12 +108,17 @@ class ArchiveThenRemoveTest(_Repo):
         self.assertEqual((manifest["head"], manifest["lot"]), (head, "7"))
         self.assertAlmostEqual(manifest["retain_until_ts"] - manifest["archived_ts"],
                                RETENTION)
-        # the patch applies on the recorded HEAD: nothing is lost
+        # both layers restore on the recorded HEAD: index and working copy
         again = os.path.join(self.base, "restore")
         _git("worktree", "add", "-q", "--detach", again, head, cwd=self.main)
-        _git("apply", "--binary", os.path.join(folder, "tracked.patch"), cwd=again)
+        _git("apply", "--index", "--binary", os.path.join(folder, "staged.patch"), cwd=again)
+        _git("apply", "--binary", os.path.join(folder, "unstaged.patch"), cwd=again)
+        self.assertEqual(_git("show", ":f.txt", cwd=again), "staged-only-content\n")
+        self.assertEqual(_git("show", ":new.txt", cwd=again), "staged new file\n")
         with open(os.path.join(again, "f.txt")) as fh:
             self.assertEqual(fh.read(), "changed\n")
+        self.assertEqual(_git("status", "--porcelain", "--untracked-files=no", cwd=again),
+                         "MM f.txt\nA  new.txt\n")
         self.assertIn("lot-7", _git("branch", "--list", "lot-7", cwd=self.main))
         # retention: the archive goes once its time is past, not before
         self.assertEqual(ha.prune(self.archives, now=time.time() + LATER), [])
@@ -159,6 +170,21 @@ class ArchiveThenRemoveTest(_Repo):
         self.assertEqual(plan[0]["action"], "garde", plan)
         self.assertIn("neither a file nor a link", plan[0]["detail"])
         self.assertTrue(os.path.isdir(wt))
+        self.assertFalse(os.path.exists(self.archives) and os.listdir(self.archives))
+
+
+    def test_conflicted_index_refused(self):
+        wt = self.add_worktree("lot-12")
+        _write(os.path.join(self.main, "f.txt"), text="main side\n")
+        _git("add", "f.txt", cwd=self.main)
+        _git("commit", "-q", "-m", "main side", cwd=self.main)
+        _write(os.path.join(wt, "f.txt"), text="lot side\n")
+        _git("commit", "-q", "-am", "lot side", cwd=wt)
+        subprocess.run(["git", "-C", wt, "merge", "-q", "main"], capture_output=True,
+                       env=dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t",
+                                GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@t"))
+        with self.assertRaisesRegex(ha.ArchiveRefused, "unmerged"):
+            ha.archive(wt, self.archives, retention_s=RETENTION)
         self.assertFalse(os.path.exists(self.archives) and os.listdir(self.archives))
 
 

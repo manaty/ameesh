@@ -10,8 +10,12 @@ the Host card, compiled from the canon; undeclared: nothing is archived),
 the pass archives what removing it would lose, then removes it like a kept
 merged worktree (`housekeeping._remove_kept_worktree`):
 
-- `tracked.patch`: `git diff --binary HEAD` (staged and unstaged changes of
-  tracked files), applicable with `git apply` on the recorded HEAD;
+- `staged.patch` (`git diff --cached --binary HEAD`: HEAD → index) and
+  `unstaged.patch` (`git diff --binary`: index → working copy), two layers so
+  that a file staged then modified again (`MM`) keeps both contents
+  (cx2, B/P1 on b5195435: `git diff HEAD` lost the staged one); restored by
+  `git apply --index` of the first, then `git apply` of the second, on the
+  recorded HEAD; a conflicted index (unmerged entries) is refused;
 - `untracked.tar.gz`: the untracked files and the ignored ones, outside the
   regenerable build output (`artifacts` rules: node_modules, target) and the
   caches (`EXCLUDED_NAMES`); symbolic links stored as links, never followed;
@@ -43,6 +47,8 @@ ARCHIVE_DIR = "worktree-archives"
 PARTIAL_PREFIX = ".partial-"
 #: an archive directory: `<UTC time>-lot<id>-<worktree name>-<random>`
 ARCHIVE_RE = re.compile(r"\A\d{8}T\d{6}Z-lot[0-9A-Za-z#]*-.+-[0-9a-f]{8}\Z")
+#: `git status` codes of an unmerged (conflicted) index entry
+UNMERGED = frozenset(("DD", "AU", "UD", "UA", "DU", "AA", "UU"))
 #: caches never archived (regenerable), besides the build output rules
 EXCLUDED_NAMES = frozenset((
     ".cache", "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache",
@@ -187,11 +193,19 @@ def archive(path: str, root: str, *, rules=(), lot=None, state: str = "",
     max_files = MAX_FILES if max_files is None else max_files
     entries = status_entries(path)
     tracked = [e for e in entries if not e.startswith("?? ")]
-    patch = _git(path, "diff", "--binary", "--no-ext-diff", "--no-textconv", "HEAD").stdout
-    if tracked and not patch:
-        # every tracked change must show in the patch: git says something we
-        # do not understand, the worktree stays
-        raise ArchiveRefused("tracked changes absent from git diff HEAD (%s)" % tracked[0])
+    unmerged = [e for e in tracked if e[:2] in UNMERGED]
+    if unmerged:
+        raise ArchiveRefused("unmerged index entries (%s)" % unmerged[0])
+    diff = ("diff", "--binary", "--no-ext-diff", "--no-textconv")
+    staged = _git(path, *diff, "--cached", "HEAD").stdout
+    unstaged = _git(path, *diff).stdout
+    # every change of a layer must show in that layer's patch: else git says
+    # something we do not understand, and the worktree stays
+    for layer, column, patch in (("staged", 0, staged), ("unstaged", 1, unstaged)):
+        changed = [e for e in tracked if e[column] not in " ?"]
+        if changed and not patch:
+            raise ArchiveRefused("%s changes absent from their patch (%s)" % (
+                layer, changed[0]))
     files = untracked_files(path, rules)
     if len(files) > max_files:
         raise ArchiveRefused("%d untracked file(s) to archive (limit %d)" % (
@@ -210,7 +224,8 @@ def archive(path: str, root: str, *, rules=(), lot=None, state: str = "",
     final = os.path.join(root, name)
     os.mkdir(partial, 0o700)
     try:
-        _write(os.path.join(partial, "tracked.patch"), patch)
+        _write(os.path.join(partial, "staged.patch"), staged)
+        _write(os.path.join(partial, "unstaged.patch"), unstaged)
         if files:
             tar_path = os.path.join(partial, "untracked.tar.gz")
             with tarfile.open(tar_path, "w:gz") as tar:
@@ -226,10 +241,14 @@ def archive(path: str, root: str, *, rules=(), lot=None, state: str = "",
             "schema": "ameesh-worktree-archive/1", "path": path, "branch": branch,
             "head": head, "lot": lot, "lot_state": state, "archived_ts": now,
             "retain_until_ts": now + float(retention_s), "status": entries,
-            "untracked": files, "untracked_bytes": size, "patch_bytes": len(patch),
-            "restore": "git worktree add <path> %s && git -C <path> apply --binary "
-                       "%s/tracked.patch && tar -xzf %s/untracked.tar.gz -C <path>"
-                       % (head or "<HEAD>", final, final)}
+            "untracked": files, "untracked_bytes": size,
+            "patch_bytes": len(staged) + len(unstaged),
+            "restore": "git worktree add --detach <path> %s"
+                       " && git -C <path> apply --index --binary %s/staged.patch"
+                       " && git -C <path> apply --binary %s/unstaged.patch%s"
+                       % (head or "<HEAD>", final, final,
+                          " && tar -xzf %s/untracked.tar.gz -C <path>" % final
+                          if files else "")}
         _write(os.path.join(partial, "manifest.json"),
                (json.dumps(manifest, indent=1, sort_keys=True) + "\n").encode())
         _fsync_dir(partial)
@@ -242,7 +261,8 @@ def archive(path: str, root: str, *, rules=(), lot=None, state: str = "",
         if isinstance(exc, (OSError, tarfile.TarError, ValueError)):
             raise ArchiveRefused("archive not written (%s)" % exc) from exc
         raise
-    return {"archive": final, "bytes": disk_bytes(final), "patch_bytes": len(patch),
+    return {"archive": final, "bytes": disk_bytes(final),
+            "patch_bytes": len(staged) + len(unstaged),
             "files": len(files), "tracked": len(tracked),
             "retain_until_ts": manifest["retain_until_ts"]}
 
