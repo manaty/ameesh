@@ -4139,7 +4139,9 @@ class Housekeeping(Domain):
 
         #2617 : un signalement `orphan` (ré-écrit toutes les 12 h pour une
         entrée non attribuée) compte une fois par chemin, avec sa dernière
-        taille ; les autres actions comptent leurs lignes."""
+        taille ; #3728 : un relevé `unremovable` aussi (réécrit à chaque
+        passage tant que l'épisode dure) ; les autres actions comptent leurs
+        lignes."""
 
     @abc.abstractmethod
     def last_measure(self, host: str | None) -> list[dict]:
