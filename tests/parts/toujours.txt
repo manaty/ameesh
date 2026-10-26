@@ -30,3 +30,4 @@ test_l31_orphans  # #749: orphan resources of a turn, lease and alert contract (
 test_l50_group_orphan_work_items  # #749: orphan work items of a group reattached, lease contract
 test_l72_panne_de_base  # database outage and reconnection
 test_migrations  # migrations: application, idempotence, immuabilité (contrat, L1211)
+test_3752_gabarit  # #3752: a migration changes the template every class clones (clone ≡ migrate)
