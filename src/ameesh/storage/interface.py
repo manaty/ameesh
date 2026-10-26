@@ -1118,16 +1118,21 @@ class AccountWindows(Domain):
 
     @abc.abstractmethod
     def active(self, harness: str, account: str) -> list[dict]:
-        """Les tours `running` du compte, **bail vivant seulement** (`lease_owner`
+        """Les tours actifs du compte, **bail vivant seulement** (`lease_owner`
         posé et `lease_expires_at` futur) : un hôte tombé ne bloque pas le
-        plafond de son compte pour toujours. Rend `name`, `host`,
-        `status_since_ts` (epoch). Un agent sans `session_account` est compté
-        (session d'avant L30, ou premier tour d'une session neuve) :
-        conservateur, jamais un dépassement silencieux."""
+        plafond de son compte pour toujours. La place porte le harnais et le
+        compte **effectifs** du tour (`account_turn_slots`, écrit avec
+        `begin_turn`) : un agent d'un autre harnais qui emprunte ce compte
+        compte dans son plafond. Rend `name`, `host`, `status_since_ts`
+        (epoch). Un agent sans place (tour commencé avant le déploiement) n'est
+        pas compté : la garde s'ouvre un tour, jamais ne bloque à tort."""
 
     @abc.abstractmethod
     def start(self, harness: str, account: str, host: str, agent: str) -> None:
-        """Journalise le début d'un tour du compte (écart entre deux débuts)."""
+        """Journalise le début d'un tour du compte (écart entre deux débuts) et
+        pose/actualise sa place active avec le harnais et le compte effectifs
+        (`harness`, `account`) — appelé dans la transaction d'admission, avec
+        `begin_turn`."""
 
     @abc.abstractmethod
     def last_start(self, harness: str, account: str) -> dict:

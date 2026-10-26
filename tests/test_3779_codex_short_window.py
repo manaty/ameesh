@@ -134,6 +134,11 @@ class FenetreCourteTest(_Base):
                 " VALUES (%s, '', 'codex', %s, 'running', 'primaire', now(),"
                 "         'runner', now() + interval '1 hour')",
                 (name, host))
+            # La place du tour porte le harnais/compte effectifs ; c'est elle
+            # que compte le plafond (#3779, avis cx2).
+            self.db.execute(
+                "INSERT INTO account_turn_slots (agent, harness, account, host, at)"
+                " VALUES (%s, 'codex', 'primaire', %s, now())", (name, host))
         # B1 auditeur : un hôte tombé garde `running` mais son bail est expiré ;
         # il ne doit pas compter dans le plafond (sinon 2/2 pour toujours).
         self.db.execute(
@@ -143,6 +148,9 @@ class FenetreCourteTest(_Base):
             " VALUES ('codex-mort', '', 'codex', 'h3', 'running', 'primaire',"
             "         now() - interval '1 hour', 'runner',"
             "         now() - interval '1 minute')")
+        self.db.execute(
+            "INSERT INTO account_turn_slots (agent, harness, account, host, at)"
+            " VALUES ('codex-mort', 'codex', 'primaire', 'h3', now())")
         etat = account_window.state(self.db, "codex", "primaire")
         self.assertEqual(etat["active_count"], 2)
         raison = account_window.reason(self.db, "codex", "primaire",
@@ -264,6 +272,108 @@ class FenetreCourteTest(_Base):
             "SELECT count(*) AS n FROM agent_registry"
             " WHERE name LIKE 'cap-%' AND status = 'running'")[0]["n"], 2)
 
+    def test_trois_emprunteurs_comptent_dans_le_plafond_codex(self):
+        """Avis cx2 : la place d'un tour porte le harnais effectif ; trois
+        agents Claude/DeepSeek qui empruntent Codex, plafond 2 et écart 0,
+        n'en laissent passer que deux."""
+        for agent, propre in (("pr-a", "claude"), ("pr-b", "deepseek"),
+                              ("pr-c", "claude")):
+            self.db.execute(
+                "INSERT INTO agent_registry"
+                " (name, chantier, harness, host, status, lease_owner,"
+                "  lease_expires_at)"
+                " VALUES (%s, '', %s, 'h', 'idle', NULL, NULL)", (agent, propre))
+        profil = accounts.Profile("codex", "secondaire", max_concurrent=2,
+                                   min_start_gap_s=0.0, path="")
+        barriere = threading.Barrier(3)
+        resultats: list = []
+        garde = threading.Lock()
+
+        def essai(agent: str) -> None:
+            db = self.connect()
+            try:
+                barriere.wait(timeout=10)
+
+                def ouvrir(tx, nom=agent) -> bool:
+                    tx.execute(
+                        "UPDATE agent_registry SET status = 'running',"
+                        " lease_owner = 'runner',"
+                        " lease_expires_at = now() + interval '1 hour',"
+                        " status_since = now() WHERE name = %s", (nom,))
+                    return True
+
+                admission = account_window.claim_start(
+                    db, "codex", "secondaire", "h", agent, profile=profil,
+                    begin=ouvrir)
+            finally:
+                db.close()
+            with garde:
+                resultats.append(admission)
+
+        threads = [threading.Thread(target=essai, args=(agent,))
+                   for agent in ("pr-a", "pr-b", "pr-c")]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=20)
+        self.assertEqual(len(resultats), 3)
+        self.assertEqual(sum(1 for adm in resultats if adm.ok), 2, resultats)
+        refuses = [adm for adm in resultats if not adm.ok]
+        self.assertEqual(len(refuses), 1)
+        self.assertIn("2/2 concurrent turns", refuses[0].reason)
+        self.assertEqual(self.db.query(
+            "SELECT count(*) AS n FROM account_turn_starts"
+            " WHERE account = 'secondaire'")[0]["n"], 2)
+        self.assertEqual(self.db.query(
+            "SELECT count(*) AS n FROM account_turn_slots"
+            " WHERE harness = 'codex' AND account = 'secondaire'")[0]["n"], 2)
+        # le harnais propre des emprunteurs n'a pas bougé
+        self.assertEqual(sorted(row["harness"] for row in self.db.query(
+            "SELECT harness FROM agent_registry WHERE name LIKE 'pr-%'")),
+            ["claude", "claude", "deepseek"])
+
+    def test_place_suit_le_compte_effectif_d_une_rotation(self):
+        """La place est celle du tour effectif : le retour d'un emprunt
+        remplace la place (pas deux places pour le même agent)."""
+        self.db.execute(
+            "INSERT INTO agent_registry"
+            " (name, chantier, harness, host, status, lease_owner, lease_expires_at)"
+            " VALUES ('rot-a', '', 'claude', 'h', 'idle', NULL, NULL)")
+
+        def ouvrir(tx) -> bool:
+            tx.execute(
+                "UPDATE agent_registry SET status = 'running',"
+                " lease_owner = 'runner',"
+                " lease_expires_at = now() + interval '1 hour',"
+                " status_since = now() WHERE name = 'rot-a'")
+            return True
+
+        secondaire = accounts.Profile("codex", "secondaire", max_concurrent=2,
+                                       min_start_gap_s=0.0, path="")
+        premier = account_window.claim_start(
+            self.db, "codex", "secondaire", "h", "rot-a",
+            profile=secondaire, begin=ouvrir)
+        self.assertTrue(premier.ok, premier)
+        self.assertEqual(account_window.state(
+            self.db, "codex", "secondaire")["active_count"], 1)
+        self.assertEqual(account_window.state(
+            self.db, "codex", "primaire")["active_count"], 0)
+        # rotation : le tour suivant repart sous codex/primaire, même agent
+        primaire = accounts.Profile("codex", "primaire", max_concurrent=2,
+                                     min_start_gap_s=0.0, path="")
+        second = account_window.claim_start(
+            self.db, "codex", "primaire", "h", "rot-a",
+            profile=primaire, begin=ouvrir)
+        self.assertTrue(second.ok, second)
+        self.assertEqual(account_window.state(
+            self.db, "codex", "secondaire")["active_count"], 0)
+        self.assertEqual(account_window.state(
+            self.db, "codex", "primaire")["active_count"], 1)
+        self.assertEqual(self.db.query(
+            "SELECT harness, account FROM account_turn_slots"
+            " WHERE agent = 'rot-a'"),
+            [{"harness": "codex", "account": "primaire"}])
+
     def test_choose_refuse_avant_le_tour_et_le_runner_journalise(self):
         worker = self._worker_codex("cx-3779")
         account_window.record_rate_limit(
@@ -297,7 +407,8 @@ class FenetreCourteTest(_Base):
         self.assertIn("start gap", raison or "")
 
     def test_migration_presente(self):
-        for table in ("account_rate_events", "account_turn_starts"):
+        for table in ("account_rate_events", "account_turn_starts",
+                      "account_turn_slots"):
             with self.subTest(table=table):
                 self.assertIsNotNone(self.db.query(
                     "SELECT to_regclass(%s) AS table", (table,))[0]["table"])

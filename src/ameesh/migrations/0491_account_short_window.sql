@@ -16,12 +16,15 @@
 -- the provider's, shared by every runner of the account. The business module
 -- `ameesh.account_window` derives a cooldown from it (base 4 min, raised with
 -- the number of refusals in 15 min, capped at 15 min), a concurrency cap from
--- `agent_registry.status = 'running'` and a minimum gap between two turn
--- starts from `account_turn_starts`. `accounts list` renders the short window
--- read from all three.
+-- `account_turn_slots` (the effective harness/account of each running turn,
+-- not the agent's own harness: a Claude/DeepSeek agent borrowing Codex counts
+-- against the Codex cap) and a minimum gap between two turn starts from
+-- `account_turn_starts`. `accounts list` renders the short window read from
+-- all three.
 --
--- The tables are append-only from the runners; no secret, no prompt, no token:
--- `detail` is the provider error text, truncated by the caller.
+-- The journals are append-only from the runners; `account_turn_slots` is the
+-- one place per agent (replaced at each turn start). No secret, no prompt, no
+-- token: `detail` is the provider error text, truncated by the caller.
 create table if not exists account_rate_events (
     id        bigserial primary key,
     harness   text not null,
@@ -53,9 +56,30 @@ create table if not exists account_turn_starts (
 create index if not exists account_turn_starts_window_idx
     on account_turn_starts (harness, account, at desc);
 
+-- `account_turn_slots` : one row per agent with a live turn, carrying the
+-- EFFECTIVE harness and account of that turn. An agent of any harness may
+-- borrow Codex (`account_turn.fallback`); its `agent_registry.harness` stays
+-- its own, so counting `agent_registry` by harness missed the borrowers. The
+-- slot is upserted in the admission transaction, with `begin_turn`; a turn's
+-- end is seen through the registry status/lease, so no release write is
+-- needed on every ending path (a crashed runner stops counting when its lease
+-- expires).
+create table if not exists account_turn_slots (
+    agent     text primary key,
+    harness   text not null,
+    account   text not null,
+    host      text not null default '',
+    at        timestamptz not null default now()
+);
+
+create index if not exists account_turn_slots_window_idx
+    on account_turn_slots (harness, account);
+
 -- Retention is handled by the housekeeping pass like other operational
 -- journals; the module only reads the last 15 minutes.
 comment on table account_rate_events is
     'Provider short-window refusals (429), shared by (harness, account); #3779';
 comment on table account_turn_starts is
     'Turn starts per logical account, for the short-window start gap; #3779';
+comment on table account_turn_slots is
+    'Active turn slots per agent, effective (harness, account) for the concurrency cap; #3779';

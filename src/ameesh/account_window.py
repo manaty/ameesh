@@ -21,16 +21,19 @@ Ce module rend cette limite **visible et partagée** :
   seulement le fautif ;
 * `claim_start` admet **atomiquement** un début de tour : sous le verrou
   consultatif du compte, il relit le cooldown, l'écart depuis le dernier début
-  et le plafond de tours actifs, puis **ouvre le tour** (`begin_turn`, donc la
-  place `running` visible) et journalise le début (`account_turn_starts`) dans
-  la même transaction. Deux agents qui se présentent ensemble ne peuvent donc
-  pas dépasser le plafond ni l'écart, même avec un écart nul ;
+  et le plafond de tours actifs, puis **ouvre le tour** (`begin_turn`), pose sa
+  place active (`account_turn_slots`, harnais et compte effectifs) et journalise
+  le début (`account_turn_starts`) dans la même transaction. Deux agents qui se
+  présentent ensemble ne peuvent donc pas dépasser le plafond ni l'écart, même
+  avec un écart nul ;
 * `reason` reste le pré-contrôle lisible (choix et affichage) ; il refuse un
   nouveau tour quand le cooldown court, quand l'écart minimal depuis le
-  dernier début n'est pas écoulé, ou quand le nombre de tours `running` du
+  dernier début n'est pas écoulé, ou quand le nombre de places actives du
   compte atteint `max_concurrent` (2 pour Codex ; l'écart de 30 s est le
   levier principal : cinq débuts en 90 s suffisaient à voir des 429 même avec
-  un seul tour actif). Les tours actifs sont lus dans le registre central
+  un seul tour actif). Une place porte le harnais et le compte **effectifs**
+  du tour : un agent Claude/DeepSeek qui emprunte Codex compte dans le plafond
+  Codex. Le bail vivant est relu au registre central
   (`agent_registry.status = 'running'`, **bail vivant**), donc cross-hôtes ;
 * `rows`/`format` nourrissent `ameesh accounts list` : la « jauge de fenêtre
   courte » demandée par le témoin du lot.
@@ -268,14 +271,16 @@ def claim_start(db, harness: str, account: str | None, host: str, agent: str,
     """Admission ATOMIQUE d'un début de tour, place active comprise.
 
     Sous le verrou consultatif du compte, relit le cooldown, l'écart depuis le
-    dernier début et le nombre de tours actifs, puis **ouvre le tour**
-    (`begin(tx)`, le `begin_turn` de l'exécuteur) et journalise le début dans
-    la même transaction. La place active est donc visible des autres runners
-    dès le commit : deux agents qui se présentent ensemble ne peuvent pas tous
-    deux passer sous le plafond, même avec `min_start_gap_s = 0`.
+    dernier début et le nombre de places actives du compte **effectif**, puis
+    **ouvre le tour** (`begin(tx)`, le `begin_turn` de l'exécuteur), pose sa
+    place (`account_turn_slots`, harnais et compte effectifs) et journalise le
+    début dans la même transaction. La place est donc visible des autres
+    runners dès le commit : deux agents qui se présentent ensemble ne peuvent
+    pas tous deux passer sous le plafond, même avec `min_start_gap_s = 0`.
 
     `begin` reçoit la transaction et rend vrai si le bail permet d'ouvrir le
-    tour. Sans `begin` (outil ou test), seul le journal des débuts est écrit.
+    tour. Sans `begin` (outil ou test), le journal des débuts et la place sont
+    écrits ; la place ne compte que si le bail du registre est vivant.
 
     Fail-open si le journal est indisponible (base absente, backend médié sans
     contrat) : `Admission()` sans `begun`, l'appelant ouvre le tour par le

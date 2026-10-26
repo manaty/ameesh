@@ -42,16 +42,21 @@ class AccountWindows(interface.AccountWindows):
         }
 
     def active(self, harness, account) -> list[dict]:
+        # #3779 (avis cx2) : la place est celle du TOUR (harnais et compte
+        # effectifs), pas la ligne `agent_registry.harness` de l'agent : un
+        # agent Claude/DeepSeek qui emprunte Codex pose une place codex et doit
+        # compter dans le plafond Codex. Le bail vivant reste lu au registre.
         return self.db.query(
             """
-            SELECT name, host,
-                   extract(epoch FROM status_since)::float8 AS status_since_ts
-              FROM agent_registry
-             WHERE harness = %s AND status = 'running'
-               AND lease_owner IS NOT NULL
-               AND lease_expires_at > clock_timestamp()
-               AND (session_account IS NULL OR session_account = %s)
-             ORDER BY status_since, name
+            SELECT s.agent AS name, s.host,
+                   extract(epoch FROM s.at)::float8 AS status_since_ts
+              FROM account_turn_slots s
+              JOIN agent_registry r ON r.name = s.agent
+             WHERE s.harness = %s AND s.account = %s
+               AND r.status = 'running'
+               AND r.lease_owner IS NOT NULL
+               AND r.lease_expires_at > clock_timestamp()
+             ORDER BY s.at, s.agent
             """,
             (harness, account),
         )
@@ -61,6 +66,18 @@ class AccountWindows(interface.AccountWindows):
             "insert into account_turn_starts (harness, account, host, agent)"
             " values (%s, %s, %s, %s)",
             (harness, account, host or "", agent or ""),
+        )
+        # La place active porte le harnais et le compte EFFECTIFS du tour ;
+        # elle est écrite dans la transaction d'admission, avec `begin_turn`.
+        # Un agent n'a qu'un tour actif : la clé agent remplace la place d'un
+        # tour précédent (rotation, emprunt, retour au harnais propre).
+        self.db.execute(
+            "insert into account_turn_slots (agent, harness, account, host, at)"
+            " values (%s, %s, %s, %s, now())"
+            " on conflict (agent) do update set"
+            " harness = excluded.harness, account = excluded.account,"
+            " host = excluded.host, at = excluded.at",
+            (agent or "", harness, account, host or ""),
         )
 
     def last_start(self, harness, account) -> dict:
