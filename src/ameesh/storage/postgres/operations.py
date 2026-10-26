@@ -573,12 +573,15 @@ class Operations(interface.Operations):
                     SELECT %s::text AS harness, %s::text AS gauge_key,
                            %s::float8 AS used, to_timestamp(%s::float8) AS resets_at,
                            %s::float8 AS window_s, %s::text AS account,
-                           to_timestamp(%s::float8) AS produced_at, %s::text AS source
+                           to_timestamp(%s::float8) AS produced_at, %s::text AS source,
+                           %s::boolean AS overage_capable,
+                           %s::boolean AS overage_in_use
                 )
                 INSERT INTO quota_gauge_readings (harness, gauge_key, used, resets_at, window_s,
-                                                  account, produced_at, source)
+                                                  account, produced_at, source,
+                                                  overage_capable, overage_in_use)
                 SELECT harness, gauge_key, used, resets_at, window_s, account,
-                       produced_at, source
+                       produced_at, source, overage_capable, overage_in_use
                   FROM candidat c
                  WHERE NOT EXISTS (
                      SELECT 1 FROM quota_gauge_readings r
@@ -586,6 +589,8 @@ class Operations(interface.Operations):
                         AND r.account IS NOT DISTINCT FROM c.account
                         AND r.used = c.used
                         AND r.resets_at IS NOT DISTINCT FROM c.resets_at
+                        AND r.overage_capable IS NOT DISTINCT FROM c.overage_capable
+                        AND r.overage_in_use IS NOT DISTINCT FROM c.overage_in_use
                         AND r.observed_at > now() - interval '10 minutes'
                         AND (
                             (r.produced_at IS NOT NULL
@@ -607,7 +612,8 @@ class Operations(interface.Operations):
                 RETURNING id
                 """,
                 (g["harness"], g["key"], float(g["used"]), g.get("resets_at"),
-                 float(g["window_s"]), account, produced, g.get("source")),
+                 float(g["window_s"]), account, produced, g.get("source"),
+                 g.get("overage_capable"), g.get("overage_in_use")),
             )
             inserted += len(rows)
         return inserted
@@ -616,7 +622,8 @@ class Operations(interface.Operations):
         sql = ("SELECT harness, gauge_key AS key, used,"
                " extract(epoch from resets_at)::float8 AS resets_at_ts, window_s,"
                " extract(epoch from observed_at)::float8 AS observed_ts,"
-               " extract(epoch from produced_at)::float8 AS produced_ts, source, account"
+               " extract(epoch from produced_at)::float8 AS produced_ts, source, account,"
+               " overage_capable, overage_in_use"
                " FROM quota_gauge_readings"
                " WHERE observed_at >= now() - make_interval(secs => %s)")
         params: list = [float(since_s)]
@@ -629,21 +636,26 @@ class Operations(interface.Operations):
         sql += " ORDER BY observed_at, id"
         return _sans_compte_nul(self.db.query(sql, tuple(params)))
 
-    def latest_gauges(self, *, since_s) -> list[dict]:
+    def latest_gauges(self, *, since_s, by_source=False) -> list[dict]:
         """L94 : le DERNIER relevé de chaque jauge, par instant de PRODUCTION
-        (#1132) : un relevé périmé réinséré ne remplace plus le frais."""
+        (#1132) : un relevé périmé réinséré ne remplace plus le frais.
+
+        `by_source` garde une ligne par source de publication (agent) : deux
+        hôtes homonymes ne s'effacent plus dans la sélection (#3755, avis
+        cx1). Les lecteurs de la vue unifiée gardent le défaut."""
+        colonnes = ("harness, account, gauge_key, source" if by_source
+                    else "harness, account, gauge_key")
         return self.db.query(
-            """
-            SELECT DISTINCT ON (harness, account, gauge_key)
-                   harness, gauge_key AS key, used,
-                   extract(epoch from resets_at)::float8 AS resets_at_ts, window_s,
-                   extract(epoch from observed_at)::float8 AS observed_ts,
-                   extract(epoch from produced_at)::float8 AS produced_ts, source, account
-              FROM quota_gauge_readings
-             WHERE observed_at >= now() - make_interval(secs => %s)
-             ORDER BY harness, account, gauge_key,
-                      produced_at DESC NULLS LAST, observed_at DESC, id DESC
-            """,
+            "SELECT DISTINCT ON (" + colonnes + ")"
+            " harness, gauge_key AS key, used,"
+            " extract(epoch from resets_at)::float8 AS resets_at_ts, window_s,"
+            " extract(epoch from observed_at)::float8 AS observed_ts,"
+            " extract(epoch from produced_at)::float8 AS produced_ts, source, account,"
+            " overage_capable, overage_in_use"
+            " FROM quota_gauge_readings"
+            " WHERE observed_at >= now() - make_interval(secs => %s)"
+            " ORDER BY " + colonnes + ","
+            " produced_at DESC NULLS LAST, observed_at DESC, id DESC",
             (float(since_s),))
 
     def gauge_latest(self, *, harness, account) -> list[dict]:
@@ -657,7 +669,8 @@ class Operations(interface.Operations):
                    harness, gauge_key AS key, used,
                    extract(epoch from resets_at)::float8 AS resets_at_ts, window_s,
                    extract(epoch from observed_at)::float8 AS observed_ts,
-                   extract(epoch from produced_at)::float8 AS produced_ts, source, account
+                   extract(epoch from produced_at)::float8 AS produced_ts, source, account,
+                   overage_capable, overage_in_use
               FROM quota_gauge_readings
              WHERE harness = %s AND account = %s
              ORDER BY gauge_key, produced_at DESC NULLS LAST, observed_at DESC, id DESC

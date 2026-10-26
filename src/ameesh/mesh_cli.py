@@ -67,6 +67,7 @@ import sys
 import time
 
 from . import accounts as accounts_mod
+from . import account_window
 from . import balance as balance_mod
 from . import authority, catalog, mail, config as config_mod, cost as cost_mod, db as db_mod, identity
 from . import migrations, placement, progress, registry
@@ -4159,6 +4160,14 @@ def build_parser() -> argparse.ArgumentParser:
     pa_use = acc_sub.add_parser("use", help="force an account (no more automatic choice)")
     pa_use.add_argument("harness")
     pa_use.add_argument("account")
+    pa_use.add_argument(
+        "--for", dest="duration", default="1h", metavar="DUREE",
+        help="forcing expires after this duration (default 1h: 90m, 6h, 2d) and "
+             "the automatic choice returns; --for 0 is refused")
+    pa_use.add_argument(
+        "--force", metavar="RAISON", default=None,
+        help="force even an account in overage or above its pace; the reason is "
+             "journalized in account_switches")
     pa_use.set_defaults(func=cmd_accounts)
     pa_auto = acc_sub.add_parser("auto", help="hand back to the automatic choice (0034)")
     pa_auto.add_argument("harness", nargs="?", default=None,
@@ -4435,13 +4444,35 @@ def cmd_accounts(cfg: Config, args) -> int:
             # placement au tour suivant.
             from . import account_claims
             items = account_claims.mark_refused(cfg, items, db=db)
-            accounts_mod.force(db, cfg.host, args.harness, items, args.account, by=qui)
-            texte = ("Account %s forced for %s on %s by %s: no automatic choice "
-                     "until \"ameesh accounts auto\"." % (args.account, args.harness,
-                                                            cfg.host, qui))
+            # #3755 : un forçage a une échéance (courte par défaut) et ne
+            # contourne pas la garde : le compte est évalué, et refusé s'il
+            # est en overage ou au-delà de son rythme, sauf --force "raison".
+            from . import stagnation
+            try:
+                duree = stagnation.parse_duration(
+                    getattr(args, "duration", None) or "1h")
+            except stagnation.StaleError as exc:
+                print("accounts use: %s" % exc, file=sys.stderr)
+                return 1
+            raison = getattr(args, "force", None)
+            now = time.time()
+            until = now + duree
+            book = cost_mod.CostBook(state_dir=cfg.state_dir, db=db)
+            accounts_mod.force(db, cfg.host, args.harness, items, args.account, by=qui,
+                               book=book, now=now, until=until,
+                               allow=bool(raison), reason=raison or "")
+            echeance = time.strftime("%Y-%m-%d %H:%M", time.localtime(until))
+            texte = ("Account %s forced for %s on %s by %s for %s (until %s): "
+                     "automatic choice returns then." % (
+                         args.account, args.harness, cfg.host, qui,
+                         accounts_mod.duration(duree), echeance))
+            if raison:
+                texte += " Forced above the guard: %s." % " ".join(str(raison).split())
             fil.record(cfg, db, sender=qui, recipients=[], text=texte,
                        meta={"action": "compte", "type": "manuel", "harnais": args.harness,
-                             "vers": args.account, "audit": "accounts"})
+                             "vers": args.account, "audit": "accounts",
+                             "duree_s": duree, "echeance_ts": until,
+                             "raison": raison or ""})
             print(texte)
             return 0
         if what == "auto":
@@ -4502,6 +4533,10 @@ def cmd_accounts(cfg: Config, args) -> int:
         # #1580 point 2 : la marge des forfaits et les agents déplaçables
         # (lecture seule : aucune bascule n'est faite ici)
         prop = rebalance_mod.proposal(cfg, db, book)
+        # #3779 : la fenêtre courte du fournisseur (bucket de rafale partagé
+        # par les sessions du compte), lue dans le journal central — la
+        # « jauge » demandée par le témoin du lot.
+        courte = account_window.rows(db, rows, profiles=declares)
         bascules = storage.of(db).accounts.switches(cfg.host, None, max(0, getattr(args, "last", 5))) \
             if declares else []
         if getattr(args, "json", False):
@@ -4512,7 +4547,8 @@ def cmd_accounts(cfg: Config, args) -> int:
             print(json.dumps({"schema": "ameesh-accounts/1", "host": cfg.host,
                               "config": _config_origin(cfg),
                               "accounts": rows, "switches": bascules,
-                              "credentials": sante, "proposal": prop.as_dict()},
+                              "credentials": sante, "proposal": prop.as_dict(),
+                              "short_window": courte},
                              ensure_ascii=False, indent=2, default=str))
             return 0
         if cfg.config_base:
@@ -4527,6 +4563,11 @@ def cmd_accounts(cfg: Config, args) -> int:
                          "host's; a stale profile diverges silently from other runners")
             print(note)
         print(accounts_mod.format_rows(rows))
+        if courte:
+            print()
+            print("short window (provider burst bucket shared by sessions, #3779):")
+            for ligne in account_window.format_rows(courte):
+                print(ligne)
         print(prop.text())
         if bascules:
             print()

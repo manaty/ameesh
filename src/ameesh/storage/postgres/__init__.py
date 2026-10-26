@@ -13,6 +13,7 @@ from .action_source import ActionSource
 from .api_requests import ApiRequests
 from .alert_acknowledgements import AlertAcknowledgements
 from .accounts import Accounts
+from .account_windows import AccountWindows
 from .actions import Actions
 from .budgets import Budgets
 from .authenticators import Authenticators
@@ -64,6 +65,7 @@ class PostgresStorage(interface.Storage):
         self.pending_spend = PendingSpend(db)
         self.turn_costs = TurnCosts(db)
         self.accounts = Accounts(db)
+        self.account_windows = AccountWindows(db)
         self.credentials = Credentials(db)
         self.budgets = Budgets(db)
         self.api_requests = ApiRequests(db)

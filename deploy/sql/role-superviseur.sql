@@ -363,7 +363,10 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
     ]),
     ('quota_gauge_readings', ARRAY[
         'id', 'harness', 'gauge_key', 'used', 'resets_at', 'window_s', 'observed_at',
-        'account', 'produced_at', 'source'
+        'account', 'produced_at', 'source',
+        -- #3755 (0490) : l'overage publié par l'hôte du compte, lisible depuis
+        -- la passe d'alertes de n'importe quel hôte ; booléens d'état.
+        'overage_capable', 'overage_in_use'
     ]),
     ('provider_balances', ARRAY[
         'id', 'provider', 'currency', 'total', 'granted', 'topped_up', 'available',
@@ -497,9 +500,11 @@ INSERT INTO pg_temp.ameesh_contrat (rel, cols) VALUES
         'id', 'at', 'kind', 'host', 'executor_id', 'actor', 'detail'
     ]),
     -- comptes multiples (L30, 0028) : des NOMS de comptes et l'état de bascule,
-    -- jamais un profil (dossier, clé) : ceux-là restent sur l'hôte
+    -- jamais un profil (dossier, clé) : ceux-là restent sur l'hôte.
+    -- #3755 (0490) : `forced_until` est l'échéance du forçage, état de
+    -- supervision (le forçage rend la main à l'automate à cet instant).
     ('account_active', ARRAY[
-        'host', 'harness', 'account', 'forced', 'updated_at'
+        'host', 'harness', 'account', 'forced', 'forced_until', 'updated_at'
     ]),
     ('account_holds', ARRAY[
         'host', 'harness', 'account', 'until_ts', 'reason', 'created_at'

@@ -340,7 +340,12 @@ class _Base(PgTestCase):
     def _codex_comptes(self) -> list:
         a = _dossier(os.path.join(self.tmp, "comptes", "codex-1"), creds="auth.json")
         b = _dossier(os.path.join(self.tmp, "comptes", "codex-2"), creds="auth.json")
-        return [{"name": "primaire", "path": a}, {"name": "secondaire", "path": b}]
+        # #3779 : ces tests portent sur la rotation et le classement des comptes ;
+        # l'admission de fenêtre courte (2 tours, écart 30 s) a sa propre suite.
+        return [{"name": "primaire", "path": a, "max_concurrent": 0,
+                 "min_start_gap_s": 0},
+                {"name": "secondaire", "path": b, "max_concurrent": 0,
+                 "min_start_gap_s": 0}]
 
     def _worker(self, name: str, harness: str, comptes: dict, **cfg_extra):
         cfg = dataclasses.replace(self.cfg, accounts=comptes, budget_usd_per_hour=10.0,

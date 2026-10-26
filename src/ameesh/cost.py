@@ -1172,10 +1172,17 @@ class CostBook:
         #1702 (N2) : une fenêtre reprise de l'historique (`from_history`) n'y
         est jamais réécrite — elle y est déjà, et la réinscrire sous la source
         de l'hôte évaluateur fabriquait des échos toutes les dix minutes.
+
+        #3755 : les deux drapeaux d'overage du relevé sont publiés avec les
+        jauges (`overage_capable`, `overage_in_use`) : la passe d'alertes d'un
+        autre hôte peut alors lever `account_overage` pour ce compte.
         """
         if self.db is None or not gauges:
             return 0
         try:
+            overage = getattr(gauges, "overage", None)
+            capable = None if overage is None else overage.capable
+            in_use = None if overage is None else bool(overage.in_use)
             lignes = []
             for g in gauges:
                 if getattr(g, "from_history", False):
@@ -1183,7 +1190,8 @@ class CostBook:
                 ligne = {"harness": g.harness, "key": g.key, "used": g.used,
                          "resets_at": g.resets_at, "window_s": g.window_s,
                          "produced_at": getattr(g, "produced_at", None),
-                         "source": getattr(g, "source", "")}
+                         "source": getattr(g, "source", ""),
+                         "overage_capable": capable, "overage_in_use": in_use}
                 if account is not None:
                     ligne["account"] = account
                 lignes.append(ligne)

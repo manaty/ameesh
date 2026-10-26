@@ -493,8 +493,11 @@ class CodexTest(_Verifie):
         b = _dossier(os.path.join(self.tmp, "comptes", "codex-2"), "auth.json")
         os.makedirs(os.path.join(a, "sessions"))
         _session_codex(b, self.FIL)
-        comptes = {"codex": [{"name": "primaire", "path": a},
-                             {"name": "secondaire", "path": b}]}
+        # #3779 : ce témoin enchaîne deux tours sur le même compte pour la
+        # reprise de session ; l'écart de 30 s entre débuts a son propre
+        # témoin (test_3779_codex_short_window), on le neutralise ici.
+        comptes = {"codex": [{"name": "primaire", "path": a, "min_start_gap_s": 0},
+                             {"name": "secondaire", "path": b, "min_start_gap_s": 0}]}
         _runner, worker = self._worker("cx-sec", harness="codex", comptes=comptes)
         self._avec_session(worker, self.FIL)
         self.assertTrue(self._tour(worker, "secondaire"))

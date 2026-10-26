@@ -44,6 +44,12 @@ def main() -> int:
     if "resume" in args:
         thread = args[args.index("resume") + 1]
     print(json.dumps({"type": "thread.started", "thread_id": thread}), flush=True)
+    # #3779 : un tour refusé par le fournisseur (429), comme le vrai CLI.
+    failed = os.environ.get("AMEESH_TEST_TURN_FAILED")
+    if failed:
+        print(json.dumps({"type": "turn.failed",
+                          "error": {"message": failed}}), flush=True)
+        return 1
     # L218 : AMEESH_TEST_MESSAGES, liste JSON des messages de l'agent du tour
     messages = json.loads(os.environ.get("AMEESH_TEST_MESSAGES") or "null")
     for texte in messages if messages is not None else [

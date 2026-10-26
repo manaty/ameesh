@@ -821,6 +821,8 @@ def _account_view(row: dict) -> dict:
     return {
         "harness": row["harness"], "account": row["account"],
         "active": bool(row.get("active")), "forced": bool(row.get("forced")),
+        # #3755 : échéance du forçage (epoch) ; None sans forçage
+        "forced_until": _round(row.get("forced_until")),
         "ok": bool(row.get("ok")), "reason": row.get("reason") or "",
         "next": bool(row.get("next")), "why": row.get("why") or "",
         # #1561 : relevé périmé (non vérifié) ; ni perte ni échéance annoncées
