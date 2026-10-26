@@ -151,6 +151,7 @@ class AlarmOutcomeTest(unittest.TestCase):
                 mock.patch.object(companion, 'load_execution', return_value={}), \
                 mock.patch.object(dispatch, 'os',
                     mock.Mock(geteuid=mock.Mock(return_value=0),
+                              devnull=os.devnull,
                               dup=mock.Mock(return_value=123))), \
                 mock.patch.object(dispatch.socket, 'socket', return_value=channel), \
                 mock.patch.object(dispatch.signal, 'signal',
