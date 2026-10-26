@@ -2062,7 +2062,7 @@ class CostBook:
 
     # -- rapport ------------------------------------------------------------
     def report(self, accounts: dict | None = None, *, record: bool = False,
-               multipliers: dict | None = None) -> list:
+               multipliers: dict | None = None, caps: dict | None = None) -> list:
         """Une ligne par agent : harnais, modèle, dépense 1 h/24 h, jauges.
 
         `accounts` (L30) : `{harnais: (compte actif, [Gauge…])}` pour les
@@ -2071,7 +2071,11 @@ class CostBook:
         #1075) : `{harnais: multiplicateur du compte actif}`, le
         `pace_multiplier` du profil (`accounts.report`) — le plafond affiché
         suit le rythme du compte, jamais le rythme nominal ; un harnais absent
-        garde 1.0.
+        garde 1.0. `caps` (#3680) : `{harnais: {clé de jauge: plafond}}`, les
+        plafonds de la **garde** déjà calculés par `accounts.report`
+        (`gauges[].cap`, `accounts.limits` : plancher de sous-utilisation,
+        plafond de rythme et réserve compris) ; ils priment sur le rythme
+        recalculé ici, qui n'applique ni plancher ni plafond de compte.
 
         L71 : une **lecture** — l'historique des jauges n'est écrit que si
         `record` est vrai. Avec un registre, seuls ses agents sont listés (les
@@ -2081,6 +2085,7 @@ class CostBook:
         now = self.clock()
         accounts = accounts or {}
         multipliers = multipliers or {}
+        caps = caps or {}
         try:
             paid = set(paid_harnesses_of())
         except CostError:
@@ -2117,7 +2122,8 @@ class CostBook:
                         "used": g.used_at(now),          # L71 : 0 si fenêtre échue
                         "last_used": g.used,
                         "reset_passed": g.reset_passed(now),
-                        "cap": g.pace_cap(now, multipliers.get(harness, 1.0)),
+                        "cap": (caps.get(harness) or {}).get(
+                            g.key, g.pace_cap(now, multipliers.get(harness, 1.0))),
                         "elapsed": g.elapsed(now),
                         "resets_at": g.resets_at,
                     }
