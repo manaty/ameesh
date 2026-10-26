@@ -584,7 +584,10 @@ def _bench_upkeep(db) -> None:
 
     Le banc est partagé par tous les agents de l'hôte (`scripts/pg-up.sh`) :
     une exécution tuée laisse son schéma. La passe est bornée (âge, sessions,
-    verrou court) et ne fait jamais échouer un test.
+    verrou court) et ne fait jamais échouer un test. ``bootstrap`` : les
+    schémas sans marqueur ne sont admis que si aucun autre client n'est
+    connecté (démarrage d'une suite) ; les schémas dont le marqueur prouve un
+    propriétaire mort restent purgés (#3735 B/P1).
     """
     global BENCH_UPKEEP_DONE
     if BENCH_UPKEEP_DONE:
@@ -593,7 +596,7 @@ def _bench_upkeep(db) -> None:
     if os.environ.get("AMEESH_BENCH_UPKEEP", "1").lower() in ("0", "false", "no", "off"):
         return
     try:
-        result = bench_mod.purge_orphans(db)
+        result = bench_mod.purge_orphans(db, bootstrap=True)
     except Exception:  # noqa: BLE001 — un ménage de banc ne juge jamais un test
         return
     if result.dropped:

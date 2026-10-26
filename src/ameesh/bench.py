@@ -16,10 +16,13 @@ depuis le 17/10). Cette maintenance :
   un schéma récent n'est jamais purgé), sans propriétaire vivant et sans
   session qui les nomme, les verrouille ou les porte dans un `search_path`
   déclaré. La preuve de propriété est un commentaire de schéma
-  (``ameesh-bench-owner pid=… start=…``, PID et starttime de l'hôte) posé par
-  la suite : une suite au repos entre deux transactions n'a ni verrou ni
+  (``ameesh-bench-owner pid=… [start=…]``, PID et starttime de l'hôte) posé
+  par la suite : une suite au repos entre deux transactions n'a ni verrou ni
   requête nommante, et reste pourtant propriétaire ; sa mort (le processus
-  disparaît) libère la purge ;
+  disparaît) libère la purge. Une preuve **absente ou illisible garde le
+  schéma** (#3735 B/P1) : seule la mort prouvée autorise le DROP ; la passe
+  de démarrage (``--bootstrap``, `pg-up.sh`) n'admet les schémas sans
+  marqueur que s'il n'y a **aucun autre client** sur la base ;
 * signale le gonflement et un dernier autovacuum trop ancien (`doctor`) ;
 * refuse de conclure quand l'activité n'est pas lisible (pas superutilisateur,
   `pg_stat_file` refusé) : le doute ne supprime rien.
@@ -294,12 +297,23 @@ def process_start(pid: int) -> float | None:
         return None
 
 
+#: états d'une preuve de propriété : seul `dead` autorise une purge (#3735 B/P1)
+OWNER_ALIVE = "alive"
+OWNER_DEAD = "dead"
+OWNER_UNKNOWN = "unknown"
+
+
 def owner_marker(pid: int | None = None, start: float | None = None) -> str:
-    """Commentaire de propriété d'un schéma (PID et starttime de l'hôte)."""
+    """Commentaire de propriété d'un schéma (PID, starttime si connue).
+
+    Sans starttime (processus disparu, ou OS qui ne sait pas la donner), le
+    marqueur reste **valide** : « pid=N », sans le suffixe « start= » vide que
+    la lecture refuserait (#3735 B/P1).
+    """
     pid = os.getpid() if pid is None else int(pid)
     start = process_start(pid) if start is None else float(start)
-    return "%s pid=%d start=%s" % (OWNER_TAG, pid,
-                                   "" if start is None else "%.6f" % start)
+    marker = "%s pid=%d" % (OWNER_TAG, pid)
+    return marker if start is None else "%s start=%.6f" % (marker, start)
 
 
 def parse_owner(comment: str | None) -> tuple[int, float | None] | None:
@@ -313,23 +327,35 @@ def parse_owner(comment: str | None) -> tuple[int, float | None] | None:
     return int(match.group(1)), (float(start) if start else None)
 
 
-def owner_alive(comment: str | None) -> bool:
-    """Le propriétaire du schéma (processus de la suite) vit-il encore ?"""
+def owner_state(comment: str | None) -> str:
+    """La preuve de propriété est-elle vivante, morte, ou illisible ?
+
+    Seul ``OWNER_DEAD`` autorise la purge. Un commentaire absent, étranger ou
+    tronqué, et un OS qui ne sait pas lire la preuve, sont ``UNKNOWN`` : le
+    doute ne supprime rien (#3735 B/P1).
+    """
     parsed = parse_owner(comment)
     if parsed is None:
-        return False
+        return OWNER_UNKNOWN
     pid, start = parsed
     try:
         if not platform_mod.alive(pid):
-            return False
+            return OWNER_DEAD
         if start is None:
-            return True
+            return OWNER_ALIVE
         actual = platform_mod.start_time(pid)
         # un start connu et différent = PID réutilisé, donc l'ancien
         # propriétaire est bien parti ; None (disparu entre-temps) = parti.
-        return actual is not None and platform_mod.same_start(start, actual)
+        if actual is None:
+            return OWNER_DEAD
+        return OWNER_ALIVE if platform_mod.same_start(start, actual) else OWNER_DEAD
     except platform_mod.NotAvailable:
-        return True  # l'OS ne sait pas : ne pas purger un schéma qu'on ne juge pas
+        return OWNER_UNKNOWN  # l'OS ne sait pas : ne pas juger
+
+
+def owner_alive(comment: str | None) -> bool:
+    """Le propriétaire du schéma (processus de la suite) vit-il, prouvé ?"""
+    return owner_state(comment) == OWNER_ALIVE
 
 
 def claim_owner(db, schema: str, *, pid: int | None = None,
@@ -455,18 +481,41 @@ def _in_use(db) -> set[str]:
     return used
 
 
+def _other_clients(db) -> int:
+    """Connexions autres que la nôtre sur la base du banc (#3735 B/P1).
+
+    Au démarrage (banc ou suite), un schéma sans preuve de propriétaire n'est
+    admis à la purge que si aucun autre client n'est connecté : une session
+    au repos, dont le search_path ne dit rien, ne peut alors pas l'utiliser.
+    Seuls les ``client backend`` comptent (un autovacuum ne possède pas de
+    schéma `t_*`) ; le doute (lecture impossible) refuse la qualification.
+    """
+    try:
+        row = db.query(
+            "SELECT count(*)::bigint AS n FROM pg_stat_activity "
+            "WHERE datname = current_database() AND pid <> pg_backend_pid() "
+            "AND backend_type = 'client backend'")[0]
+    except db_mod.DbError as exc:
+        raise BenchError("bench clients unreadable: %s" % exc) from exc
+    return int(row["n"] or 0)
+
+
 def orphan_schemas(db, *, min_age_s: float | None = None,
                    now: float | None = None,
-                   only: frozenset[str] | set[str] | None = None) -> list[Orphan]:
+                   only: frozenset[str] | set[str] | None = None,
+                   bootstrap: bool = False) -> list[Orphan]:
     """Schémas ``t_*`` orphelins prouvés : assez vieux, aucune session.
 
     Un schéma sans relation n'a pas d'âge prouvable : il est gardé (le doute
-    ne supprime rien). Un schéma dont le commentaire de propriété désigne un
-    processus encore vivant est gardé, même sans session ni verrou (suite au
-    repos entre deux transactions) ; un commentaire dont le processus est
-    mort ne protège plus. ``only`` borne la passe à ces noms (témoins : le
-    banc est partagé, un âge minimal abaissé n'y vise jamais les schémas des
-    autres suites).
+    ne supprime rien). Une preuve de propriété (``claim_owner``) qui désigne
+    un processus **mort** ne protège plus ; une preuve vivante, absente ou
+    illisible garde le schéma (#3735 B/P1 : seule la mort prouvée autorise
+    un DROP). Un schéma sans marqueur n'est admis que par une passe
+    ``bootstrap`` qui prouve qu'aucun autre client n'est connecté à la base
+    (démarrage du banc ou d'une suite) : une session au repos ne peut alors
+    pas l'utiliser. ``only`` borne la passe à ces noms (témoins : le banc est
+    partagé, un âge minimal abaissé n'y vise jamais les schémas des autres
+    suites).
     """
     minimum = orphan_min_age_s() if min_age_s is None else float(min_age_s)
     if minimum < 0:
@@ -478,6 +527,7 @@ def orphan_schemas(db, *, min_age_s: float | None = None,
     own = _own_schema(db)
     if own:
         used.add(own)
+    admit_unmarked = bool(bootstrap) and _other_clients(db) == 0
     out: list[Orphan] = []
     for row in rows:
         name = str(row["schema"])
@@ -486,7 +536,10 @@ def orphan_schemas(db, *, min_age_s: float | None = None,
         if only is not None and name not in only:
             continue
         comment = owners.get(name)
-        if comment is not None and owner_alive(comment):
+        if comment is not None:
+            if owner_state(comment) != OWNER_DEAD:
+                continue
+        elif not admit_unmarked:
             continue
         if name in used:
             continue
@@ -531,19 +584,23 @@ class Purge:
 def purge_orphans(db, *, min_age_s: float | None = None,
                   now: float | None = None, dry_run: bool = False,
                   budget_s: float = PURGE_BUDGET_S,
-                  only: frozenset[str] | set[str] | None = None) -> Purge:
+                  only: frozenset[str] | set[str] | None = None,
+                  bootstrap: bool = False) -> Purge:
     """Purge les orphelins prouvés, un par un, sous verrou court et budget.
 
     Un `DROP SCHEMA ... CASCADE` qui n'obtient pas son verrou échoue et le
     schéma est gardé (aucune purge forcée). L'âge et l'absence de session sont
     revérifiés juste avant la passe ; une course reste couverte par le
-    ``lock_timeout``.
+    ``lock_timeout``. ``bootstrap`` (démarrage du banc ou d'une suite) admet
+    les schémas sans marqueur seulement si aucun autre client n'est connecté
+    (#3735 B/P1) ; une preuve de propriété vivante ou illisible les garde.
     """
     if not _local_dsn(getattr(getattr(db, "cfg", None), "dsn", "") or ""):
         return Purge(scanned=0, dropped=(), kept=(),
                      unreadable="bench is not local: owner proof is host-local")
     try:
-        orphans = orphan_schemas(db, min_age_s=min_age_s, now=now, only=only)
+        orphans = orphan_schemas(db, min_age_s=min_age_s, now=now, only=only,
+                                 bootstrap=bootstrap)
     except BenchError as exc:
         count = 0
         try:
@@ -635,13 +692,17 @@ def doctor_lines(cfg=None, *, now: float | None = None) -> list[str]:
 
 
 def main(argv: list[str] | None = None) -> int:
-    """``python -m ameesh.bench status|purge [--dry-run] [--dsn DSN]``."""
+    """``python -m ameesh.bench status|purge [--dry-run] [--bootstrap]``."""
     import argparse
     from . import config as config_mod
     parser = argparse.ArgumentParser(description="banc Postgres local (schémas t_*)")
     parser.add_argument("action", choices=("status", "purge"))
     parser.add_argument("--dsn", default=None)
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument(
+        "--bootstrap", action="store_true",
+        help="admettre les schémas sans marqueur seulement si aucun autre "
+             "client n'est connecté (démarrage du banc ou d'une suite)")
     parser.add_argument("--min-age-hours", type=float, default=None)
     args = parser.parse_args(argv)
     dsn = _with_connect_timeout(args.dsn or bench_dsn())
@@ -664,7 +725,8 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         minimum = (None if args.min_age_hours is None
                    else max(0.0, args.min_age_hours) * 3600.0)
-        result = purge_orphans(db, min_age_s=minimum, dry_run=args.dry_run)
+        result = purge_orphans(db, min_age_s=minimum, dry_run=args.dry_run,
+                               bootstrap=args.bootstrap)
         print(result.line())
         return 0 if not result.unreadable else 2
     finally:

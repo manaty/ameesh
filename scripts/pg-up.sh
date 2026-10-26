@@ -107,6 +107,8 @@ garde_sources() {
 # #3735 : un banc démarré (ou créé) purge les schémas t_* qu'une suite tuée a
 # laissés ; un banc déjà en marche n'est jamais touché (les suites le font
 # elles-mêmes, une fois par processus). `AMEESH_PG_UPKEEP=0` désactive.
+# `--bootstrap` : les schémas sans marqueur de propriété ne sont admis que si
+# aucun autre client n'est connecté (au démarrage, il n'y en a aucun).
 STARTED=0
 menage_banc() {
   [ "${AMEESH_PG_UPKEEP:-1}" != 0 ] || return 0
@@ -114,7 +116,7 @@ menage_banc() {
     cd "$(dirname "$0")/.." || exit 0
     if [ -n "$PASSWORD" ]; then export PGPASSWORD="$PASSWORD"; fi
     export AMEESH_DRIVER=psql PYTHONPATH="src${PYTHONPATH:+:$PYTHONPATH}"
-    python3 -m ameesh.bench purge \
+    python3 -m ameesh.bench purge --bootstrap \
       --dsn "postgresql://$USER@127.0.0.1:$PORT/$DB" 2>&1
   ) | sed 's/^/banc : /' || true
 }

@@ -1,12 +1,13 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """#3735 : banc ameesh-pg — orphelins t_*, gonflement, signal doctor.
 
-Témoins du lot : un schéma `t_*` assez vieux et sans session est purgé ; un
-schéma tenu par une session active est gardé ; un schéma récent est gardé ; un
-dernier autovacuum ancien est signalé. La base de la suite (`AMEESH_TEST_DSN`)
-est le banc partagé de l'hôte : avec un âge minimal abaissé, les purges des
-témoins sont bornées à leurs propres schémas (`only`), jamais ceux des suites
-voisines.
+Témoins du lot : un schéma `t_*` assez vieux et **prouvé** orphelin (marqueur
+d'un propriétaire mort) est purgé ; un schéma tenu par une session active, un
+schéma récent, un schéma sans marqueur avec un client au repos et un schéma
+dont la preuve est illisible sont gardés ; un dernier autovacuum ancien est
+signalé. La base de la suite (`AMEESH_TEST_DSN`) est le banc partagé de
+l'hôte : avec un âge minimal abaissé, les purges des témoins sont bornées à
+leurs propres schémas (`only`), jamais ceux des suites voisines.
 """
 from __future__ import annotations
 
@@ -16,6 +17,7 @@ import sys
 import time
 import unittest
 import uuid
+from unittest import mock
 
 from ameesh import bench as bench_mod
 from ameesh import db as db_mod
@@ -25,6 +27,13 @@ from .support import PgTestCase
 
 def _name(tag: str) -> str:
     return "t_%s_%s" % (tag, uuid.uuid4().hex[:8])
+
+
+def _dead_pid() -> int:
+    """PID d'un processus révolu : sa preuve de propriété ne protège plus."""
+    child = subprocess.Popen([sys.executable, "-c", "pass"])
+    child.wait()
+    return child.pid
 
 
 class BenchCataloguesTest(PgTestCase):
@@ -50,6 +59,9 @@ class BenchCataloguesTest(PgTestCase):
         young = _name("young")
         self._create(old)
         self._create(active)
+        # #3735 B/P1 : un schéma sans marqueur garde son doute ; pour le
+        # témoin de purge, `old` porte la preuve d'un propriétaire mort.
+        bench_mod.claim_owner(self.db, old, pid=_dead_pid(), start=0)
         mine = {old, active, young}
         # l'âge lu est celui de la première relation : une seconde de marge
         # suffit pour distinguer « vieux » de « créé après la mesure ».
@@ -84,6 +96,9 @@ class BenchCataloguesTest(PgTestCase):
         neighbour = _name("neighbour")   # la classe d'une autre suite, inactive
         self._create(mine)
         self._create(neighbour)
+        # la purge exige une mort prouvée (#3735 B/P1) : `mine` porte la
+        # preuve, `neighbour` reste sans marqueur et hors de `only`.
+        bench_mod.claim_owner(self.db, mine, pid=_dead_pid(), start=0)
         time.sleep(1.1)
         result = bench_mod.purge_orphans(self.db, min_age_s=0.5, only={mine})
         self.assertIn(mine, result.dropped)
@@ -114,6 +129,85 @@ class BenchCataloguesTest(PgTestCase):
         self.assertTrue(self._exists(owned))
         self.assertIn(gone, result.dropped)
         self.assertFalse(self._exists(gone))
+
+    def test_unmarked_old_schema_with_idle_client_is_kept(self) -> None:
+        """#3735 B/P1 : propriété inconnue = garder, même avec un client idle.
+
+        Une suite lancée avant le marqueur (ou dont `claim_owner` a échoué)
+        laisse un schéma sans commentaire ; une connexion au repos ne nomme
+        pas son schéma et ne le verrouille pas. Le doute ne supprime rien :
+        aucun DROP.
+        """
+        unmarked = _name("unmarked")
+        self._create(unmarked)
+        other = db_mod.connect(self.cfg)
+        try:
+            other.query("SELECT 1")  # client vivant, session au repos
+            time.sleep(1.1)
+            found = {orphan.schema for orphan in bench_mod.orphan_schemas(
+                self.db, min_age_s=0.5, only={unmarked})}
+            self.assertNotIn(unmarked, found)
+            result = bench_mod.purge_orphans(self.db, min_age_s=0.5,
+                                             only={unmarked})
+        finally:
+            other.close()
+        self.assertNotIn(unmarked, result.dropped)
+        self.assertTrue(self._exists(unmarked))
+
+    def test_marker_without_start_protects_a_live_owner(self) -> None:
+        """#3735 B/P1 : starttime indisponible -> marqueur valide sans start.
+
+        L'ancien marqueur « pid=N start= » n'était pas relu : le propriétaire
+        vivant passait pour mort. Le marqueur sans start garde le schéma
+        (aucun DROP).
+        """
+        owned = _name("nostart")
+        self._create(owned)
+        with mock.patch.object(
+                bench_mod.platform_mod, "start_time",
+                side_effect=bench_mod.platform_mod.NotAvailable(
+                    "process start time", "test: starttime indisponible")):
+            marker = bench_mod.owner_marker()
+            self.assertEqual(bench_mod.parse_owner(marker), (os.getpid(), None))
+            self.assertTrue(bench_mod.owner_alive(marker))
+            bench_mod.claim_owner(self.db, owned)
+        time.sleep(1.1)
+        result = bench_mod.purge_orphans(self.db, min_age_s=0.5, only={owned})
+        self.assertNotIn(owned, result.dropped)
+        self.assertTrue(self._exists(owned))
+
+    def test_unreadable_owner_marker_keeps_the_schema(self) -> None:
+        """#3735 B/P1 : preuve illisible = garder (le doute ne supprime rien).
+
+        Le marqueur tronqué écrit par l'ancien chemin (« pid=N start= ») n'est
+        pas relu ; il garde le schéma même si son PID est vivant.
+        """
+        legacy = _name("legacy")
+        self._create(legacy)
+        marker = "ameesh-bench-owner pid=%d start=" % os.getpid()
+        self.db.execute('COMMENT ON SCHEMA "%s" IS %s'
+                        % (legacy, "'" + marker + "'"))
+        self.assertIsNone(bench_mod.parse_owner(marker))
+        self.assertEqual(bench_mod.owner_state(marker), bench_mod.OWNER_UNKNOWN)
+        self.assertFalse(bench_mod.owner_alive(marker))
+        time.sleep(1.1)
+        result = bench_mod.purge_orphans(self.db, min_age_s=0.5, only={legacy})
+        self.assertNotIn(legacy, result.dropped)
+        self.assertTrue(self._exists(legacy))
+
+    def test_bootstrap_admits_unmarked_only_without_other_client(self) -> None:
+        """#3735 B/P1 : le bootstrap ne lève le doute que sans autre client."""
+        old = _name("bootstrap")
+        self._create(old)
+        time.sleep(1.1)
+        with mock.patch.object(bench_mod, "_other_clients", return_value=1):
+            found = {orphan.schema for orphan in bench_mod.orphan_schemas(
+                self.db, min_age_s=0.5, only={old}, bootstrap=True)}
+        self.assertNotIn(old, found)
+        with mock.patch.object(bench_mod, "_other_clients", return_value=0):
+            found = {orphan.schema for orphan in bench_mod.orphan_schemas(
+                self.db, min_age_s=0.5, only={old}, bootstrap=True)}
+        self.assertIn(old, found)
 
     def test_owner_marker_round_trip(self) -> None:
         marker = bench_mod.owner_marker()
