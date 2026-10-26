@@ -259,7 +259,11 @@ class Agents(Domain):
 
     @abc.abstractmethod
     def get(self, name: str) -> dict | None:
-        """Agent by primary or alias; alias resolutions are durably audited."""
+        """Agent by primary or alias; alias resolutions are durably audited.
+
+        #3729 : la ligne porte aussi `last_mail_ts` et `last_mail_host`, le
+        dernier message déposé et l'hôte qui l'a déposé — le signe de vie que
+        `ameesh show` affiche comme `ameesh list` depuis #3337."""
 
     @abc.abstractmethod
     def resolve_name(self, name: str, *, operation: str = "lookup") -> str:
