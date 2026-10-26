@@ -22,9 +22,11 @@ depuis le 17/10). Cette maintenance :
   disparaît) libère la purge. Une preuve **absente ou illisible garde le
   schéma** (#3735 B/P1) : seule la mort prouvée autorise le DROP. Les schémas
   **sans marqueur** ne sont admis que par une maintenance qui tient le verrou
-  **exclusif** du banc (``--bootstrap``, `pg-up.sh`) ; les suites tiennent ce
-  verrou en partagé pendant toute la vie de leur processus, donc une suite
-  vivante — même sans client backend entre deux échanges psql — les garde ;
+  **exclusif** du banc (``--bootstrap``, `pg-up.sh`) **et** sur un postmaster
+  fraîchement démarré : les suites tiennent le verrou en partagé pendant
+  toute la vie de leur processus (une suite vivante, même sans client backend
+  entre deux échanges psql, les garde), et une suite **legacy** ne le prend
+  pas — seul un redémarrage du banc prouve que ses sessions ne vivent plus ;
 * signale le gonflement et un dernier autovacuum trop ancien (`doctor`) ;
 * refuse de conclure quand l'activité n'est pas lisible (pas superutilisateur,
   `pg_stat_file` refusé) : le doute ne supprime rien.
@@ -38,7 +40,9 @@ d'ameesh) :
 * ``AMEESH_BENCH_CATALOG_BYTES`` / ``AMEESH_BENCH_DATABASE_BYTES`` : seuils
   du signal de gonflement (4 Gio / 8 Gio par défaut) ;
 * ``AMEESH_BENCH_LOCK`` (défaut ``~/.local/state/ameesh/bench-maintenance.lock``) :
-  verrou hôte partagé par les suites et la maintenance.
+  verrou hôte partagé par les suites et la maintenance ;
+* ``AMEESH_BENCH_FRESH_S`` (défaut 600) : un schéma sans marqueur n'est admis
+  que si le postmaster a démarré depuis moins de ce délai (redémarrage du banc).
 
 Le volume du banc n'est jamais touché ; aucune opération ici n'est un
 `VACUUM FULL` (geste d'exploitation, hors de cette maintenance).
@@ -79,6 +83,16 @@ DATABASE_WARN_BYTES = 8 * 1024 ** 3
 LOCK_TIMEOUT_S = 5.0
 #: plafond d'une purge, pour ne pas retarder une suite indéfiniment
 PURGE_BUDGET_S = 300.0
+#: attente d'une suite pour le verrou partagé : la maintenance qui tient
+#: l'exclusif peut dépasser 120 s (plafond de purge ci-dessus) ; la suite
+#: attend donc plus longtemps qu'elle. Au-delà, elle ne purge pas (admission
+#: fermée) et retente à la classe suivante.
+SUITE_LOCK_WAIT_S = PURGE_BUDGET_S + 120.0
+#: un schéma sans marqueur n'est admis à la purge que sur un banc dont le
+#: postmaster a démarré il y a moins de ce délai : un redémarrage a tué les
+#: sessions des suites legacy, et une suite legacy démarrée après ne peut
+#: posséder un schéma ancien (elle en crée un neuf). Surcharge : AMEESH_BENCH_FRESH_S.
+SERVER_FRESH_S = 600.0
 #: délai de connexion au banc (un banc absent ne doit pas retarder doctor)
 CONNECT_TIMEOUT_S = 3
 
@@ -510,17 +524,21 @@ def bench_lock_path() -> str:
     return os.path.join(base, "ameesh", BENCH_LOCK_NAME)
 
 
-def suite_lock(*, wait_s: float = 120.0):
+def suite_lock(*, wait_s: float | None = None):
     """Verrou **partagé** d'une suite, tenu toute la vie du processus.
 
     Il couvre les échanges psql (une connexion par requête) : même sans client
     backend entre deux échanges, la suite empêche la maintenance d'admettre un
     schéma sans marqueur. Rend le handle ouvert, ou None si la plateforme ne
     sait pas faire de verrou partagé (la maintenance reste alors
-    conservatrice) ; attend au plus ``wait_s`` la fin d'une maintenance.
+    conservatrice) ; attend au plus ``wait_s`` (défaut
+    ``SUITE_LOCK_WAIT_S``, plus long que le plafond de purge d'une
+    maintenance) la fin d'une maintenance. Un timeout laisse l'appelant
+    **fermer l'admission** de sa purge et réessayer plus tard (#3735 B/P1).
     """
     path = bench_lock_path()
-    deadline = time.monotonic() + max(0.0, float(wait_s))
+    limit = SUITE_LOCK_WAIT_S if wait_s is None else float(wait_s)
+    deadline = time.monotonic() + max(0.0, limit)
     while True:
         handle = bench_lock_mod.try_shared(path)
         if handle is not None:
@@ -556,6 +574,10 @@ def orphan_schemas(db, *, min_age_s: float | None = None,
     échanges).
     ``only`` borne la passe à ces noms (témoins : le banc est partagé, un âge
     minimal abaissé n'y vise jamais les schémas des autres suites).
+    ``admit_unmarked`` doit être posé par une maintenance qui tient le verrou
+    exclusif **et** a prouvé un redémarrage récent du banc (`_server_fresh`) :
+    sans cela, un schéma ancien sans marqueur peut appartenir à une suite
+    legacy vivante sans client backend.
     """
     minimum = orphan_min_age_s() if min_age_s is None else float(min_age_s)
     if minimum < 0:
@@ -605,6 +627,7 @@ class Purge:
     unreadable: str = ""
     freed_bytes: int = 0
     dry_run: bool = False
+    note: str = ""
 
     def line(self) -> str:
         if self.unreadable:
@@ -618,32 +641,73 @@ class Purge:
             text += "; " + ", ".join("%s (%s)" % item for item in self.kept[:5])
             if len(self.kept) > 5:
                 text += ", …"
+        if self.note:
+            text += " — " + self.note
         return text
+
+
+def _server_fresh(db, *, now: float | None = None,
+                  grace_s: float | None = None) -> bool:
+    """Le postmaster a-t-il démarré il y a moins de ``grace_s`` ?
+
+    Preuve d'exclusivité pour les schémas **sans marqueur** : un redémarrage
+    du banc a tué les sessions des suites legacy ; une suite legacy démarrée
+    après le redémarrage crée un schéma neuf (trop jeune pour être candidat),
+    pas un ancien. Sur un banc qui tourne depuis plus longtemps, un schéma
+    ancien sans marqueur peut encore appartenir à une suite legacy vivante
+    sans client backend entre deux échanges : il n'est pas admis.
+    """
+    try:
+        row = db.query(
+            "SELECT extract(epoch FROM pg_postmaster_start_time())::double precision "
+            "AS started")[0]
+        started = float(row["started"])
+    except (db_mod.DbError, TypeError, ValueError):
+        return False
+    moment = time.time() if now is None else float(now)
+    limit = _env_number("AMEESH_BENCH_FRESH_S", SERVER_FRESH_S) if grace_s is None \
+        else max(0.0, float(grace_s))
+    return 0.0 <= moment - started <= limit
 
 
 def purge_orphans(db, *, min_age_s: float | None = None,
                   now: float | None = None, dry_run: bool = False,
                   budget_s: float = PURGE_BUDGET_S,
                   only: frozenset[str] | set[str] | None = None,
-                  bootstrap: bool = False) -> Purge:
+                  bootstrap: bool = False,
+                  fresh: bool | None = None) -> Purge:
     """Purge les orphelins prouvés, un par un, sous verrou court et budget.
 
     Un `DROP SCHEMA ... CASCADE` qui n'obtient pas son verrou échoue et le
     schéma est gardé (aucune purge forcée). L'âge et l'absence de session sont
     revérifiés juste avant la passe ; une course reste couverte par le
     ``lock_timeout``. ``bootstrap`` réserve les schémas **sans marqueur** à
-    une maintenance qui tient le verrou exclusif du banc (#3735 B/P1) : sans
-    ce verrou (une suite vit, même sans client backend), ils sont gardés ;
-    une preuve de propriété vivante ou illisible les garde aussi.
+    une maintenance qui tient le verrou exclusif du banc **et** sur un
+    postmaster fraîchement démarré (#3735 B/P1) : sans ce verrou (une suite
+    vit, même sans client backend) ou sur un banc qui tourne depuis longtemps
+    (une suite legacy peut encore posséder un schéma ancien sans marqueur),
+    ils sont gardés ; une preuve de propriété vivante ou illisible les garde
+    aussi. ``fresh`` force la preuve de fraîcheur (témoins uniquement).
     """
     if not _local_dsn(getattr(getattr(db, "cfg", None), "dsn", "") or ""):
         return Purge(scanned=0, dropped=(), kept=(),
                      unreadable="bench is not local: owner proof is host-local")
     lock = maintenance_lock() if bootstrap else None
+    fresh_server = False
+    note = ""
+    if bootstrap:
+        if lock is None:
+            note = "unmarked kept: a suite holds the bench lock"
+        else:
+            fresh_server = (_server_fresh(db, now=now) if fresh is None
+                            else bool(fresh))
+            if not fresh_server:
+                note = ("unmarked kept: the bench did not just restart (a legacy "
+                        "suite may still own them)")
     try:
         try:
             orphans = orphan_schemas(db, min_age_s=min_age_s, now=now, only=only,
-                                     admit_unmarked=lock is not None)
+                                     admit_unmarked=lock is not None and fresh_server)
         except BenchError as exc:
             count = 0
             try:
@@ -656,7 +720,7 @@ def purge_orphans(db, *, min_age_s: float | None = None,
         if dry_run:
             return Purge(scanned=len(orphans), dropped=(),
                          kept=tuple((orphan.schema, "dry-run") for orphan in orphans),
-                         dry_run=True)
+                         dry_run=True, note=note)
         # un schéma a pu être pris entre la lecture et la passe : on relit les
         # sessions juste avant de supprimer, et un doute laisse tout en place.
         try:
@@ -693,7 +757,7 @@ def purge_orphans(db, *, min_age_s: float | None = None,
         freed = (max(0, before - after)
                  if before is not None and after is not None else 0)
         return Purge(scanned=len(orphans), dropped=tuple(dropped), kept=tuple(kept),
-                     freed_bytes=freed)
+                     freed_bytes=freed, note=note)
     finally:
         if lock is not None:
             lock.close()
@@ -749,7 +813,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--bootstrap", action="store_true",
         help="maintenance avec verrou exclusif du banc : admettre les schémas "
-             "sans marqueur seulement si aucune suite ne vit sur l'hôte")
+             "sans marqueur seulement si aucune suite ne vit et si le banc "
+             "vient de redémarrer (les suites legacy n'ont pas le verrou)")
     parser.add_argument("--min-age-hours", type=float, default=None)
     args = parser.parse_args(argv)
     dsn = _with_connect_timeout(args.dsn or bench_dsn())

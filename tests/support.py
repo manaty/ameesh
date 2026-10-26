@@ -597,23 +597,31 @@ def _bench_upkeep(db) -> None:
     **ordinaire** — les schémas sans marqueur sont gardés ; seuls ceux dont le
     marqueur prouve un propriétaire mort sont purgés. Leur purge est réservée
     à une maintenance qui tient le verrou exclusif (aucune suite vivante).
+    Sans le verrou partagé (maintenance trop longue, erreur), la passe est
+    sautée, l'admission reste fermée et la classe suivante réessaie.
     """
     global BENCH_UPKEEP_DONE, BENCH_SUITE_LOCK, BENCH_LOCK_TRIED
-    if not BENCH_LOCK_TRIED:
-        BENCH_LOCK_TRIED = True
+    if BENCH_UPKEEP_DONE:
+        return
+    if BENCH_SUITE_LOCK is None:
         try:
             BENCH_SUITE_LOCK = bench_mod.suite_lock()
         except Exception:  # noqa: BLE001 — jamais un échec de test pour le verrou
             BENCH_SUITE_LOCK = None
-    if BENCH_UPKEEP_DONE:
-        return
-    BENCH_UPKEEP_DONE = True
+        if BENCH_SUITE_LOCK is None:
+            # admission fermée (#3735 B/P1) : aucune purge sans le verrou
+            # partagé ; la classe suivante réessaiera (le drapeau « fait »
+            # n'est posé qu'après une passe réelle).
+            return
+        BENCH_LOCK_TRIED = True
     if os.environ.get("AMEESH_BENCH_UPKEEP", "1").lower() in ("0", "false", "no", "off"):
+        BENCH_UPKEEP_DONE = True
         return
     try:
         result = bench_mod.purge_orphans(db)
     except Exception:  # noqa: BLE001 — un ménage de banc ne juge jamais un test
         return
+    BENCH_UPKEEP_DONE = True
     if result.dropped:
         print("banc : %d schéma(s) t_* orphelin(s) purgé(s)" % len(result.dropped),
               file=sys.stderr)

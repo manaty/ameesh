@@ -222,6 +222,96 @@ class BenchCataloguesTest(PgTestCase):
         self.assertIs(purge.call_args.args[0], self.db)
         self.assertNotIn("bootstrap", purge.call_args.kwargs)
 
+    def test_legacy_suite_without_lock_keeps_unmarked_on_running_server(self) -> None:
+        """Le cas legacy du B/P1 codex : pas de verrou partagé, banc non neuf.
+
+        Une suite legacy ne prend pas le verrou ; la maintenance exclusive
+        réussit donc. Mais le postmaster n'a pas redémarré : un schéma ancien
+        sans marqueur peut encore lui appartenir sans client backend entre
+        deux échanges. Il est gardé (le redémarrage du banc prouve, lui, la
+        mort des sessions legacy).
+        """
+        unmarked = _name("legacyold")
+        self._create(unmarked)
+        tmp = tempfile.mkdtemp(prefix="ameesh-bench-legacy-")
+        self.addCleanup(shutil.rmtree, tmp, True)
+        env = dict(os.environ)
+        env["AMEESH_BENCH_LOCK"] = os.path.join(tmp, "bench.lock")
+        here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        env["PYTHONPATH"] = os.pathsep.join(
+            [os.path.join(here, "src"), env.get("PYTHONPATH", "")])
+        time.sleep(1.1)
+        proc = subprocess.run(
+            [sys.executable, "-c", textwrap.dedent(_LEGACY_SCENARIO),
+             bench_mod.bench_dsn(), unmarked],
+            capture_output=True, text=True, env=env, timeout=120)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        lines = dict(line.split("=", 1) for line in proc.stdout.splitlines()
+                     if "=" in line)
+        output = proc.stdout + proc.stderr
+        self.assertEqual(lines.get("dropped"), "", output)
+        self.assertIn("did not just restart", lines.get("note", ""), output)
+        self.assertTrue(self._exists(unmarked))
+
+    def test_bootstrap_fresh_server_purges_unmarked(self) -> None:
+        """Le redémarrage du banc prouve la mort des suites legacy.
+
+        Sur un postmaster frais (ici forcé par le témoin), le verrou exclusif
+        et la preuve de fraîcheur admettent le schéma sans marqueur.
+        """
+        unmarked = _name("freshboot")
+        self._create(unmarked)
+        tmp = tempfile.mkdtemp(prefix="ameesh-bench-fresh-")
+        self.addCleanup(shutil.rmtree, tmp, True)
+        with mock.patch.dict(os.environ,
+                             {"AMEESH_BENCH_LOCK": os.path.join(tmp, "bench.lock")}):
+            time.sleep(1.1)
+            result = bench_mod.purge_orphans(
+                self.db, min_age_s=0.5, only={unmarked}, bootstrap=True,
+                fresh=True)
+        self.assertIn(unmarked, result.dropped)
+
+    def test_upkeep_without_shared_lock_closes_admission_and_retries(self) -> None:
+        """#3735 B/P1 : sans verrou partagé, pas de purge et pas de « fait ».
+
+        La passe est sautée (admission fermée) et la classe suivante réessaie :
+        le drapeau de tentative ne se pose qu'après acquisition du verrou.
+        """
+        from . import support
+
+        saved = (support.BENCH_UPKEEP_DONE, support.BENCH_SUITE_LOCK,
+                 support.BENCH_LOCK_TRIED)
+        try:
+            support.BENCH_UPKEEP_DONE = False
+            support.BENCH_SUITE_LOCK = None
+            support.BENCH_LOCK_TRIED = False
+            with mock.patch.object(support.bench_mod, "suite_lock",
+                                   return_value=None), \
+                    mock.patch.object(support.bench_mod, "purge_orphans") as purge:
+                support._bench_upkeep(self.db)
+                purge.assert_not_called()
+                self.assertFalse(support.BENCH_LOCK_TRIED)
+                self.assertFalse(support.BENCH_UPKEEP_DONE)
+            handle = mock.Mock()
+            with mock.patch.object(support.bench_mod, "suite_lock",
+                                   return_value=handle), \
+                    mock.patch.object(
+                        support.bench_mod, "purge_orphans",
+                        return_value=bench_mod.Purge(0, (), ())) as purge:
+                support._bench_upkeep(self.db)
+                purge.assert_called_once()
+                self.assertIs(support.BENCH_SUITE_LOCK, handle)
+                self.assertTrue(support.BENCH_LOCK_TRIED)
+                self.assertTrue(support.BENCH_UPKEEP_DONE)
+        finally:
+            (support.BENCH_UPKEEP_DONE, support.BENCH_SUITE_LOCK,
+             support.BENCH_LOCK_TRIED) = saved
+
+    def test_suite_lock_wait_covers_the_maintenance(self) -> None:
+        """La maintenance peut durer plus de 120 s : la suite attend plus."""
+        self.assertGreater(bench_mod.SUITE_LOCK_WAIT_S, bench_mod.PURGE_BUDGET_S)
+        self.assertGreater(bench_mod.SERVER_FRESH_S, 0)
+
     def test_owner_marker_round_trip(self) -> None:
         marker = bench_mod.owner_marker()
         self.assertEqual(bench_mod.parse_owner(marker)[0], os.getpid())
@@ -280,6 +370,32 @@ class BenchCataloguesTest(PgTestCase):
         self.assertFalse(bench_mod.SCHEMA_RE.match("public"))
 
 
+#: #3735 B/P1 : scénario **legacy** hors processus — une suite ancienne ne
+#: prend aucun verrou partagé. La maintenance exclusive réussit donc, mais le
+#: banc n'a pas redémarré : un schéma ancien sans marqueur peut encore lui
+#: appartenir (aucun client backend entre deux échanges), il est gardé.
+_LEGACY_SCENARIO = r'''
+import dataclasses
+import sys
+
+from ameesh import bench
+from ameesh import config as config_mod
+from ameesh import db as db_mod
+
+dsn, name = sys.argv[1], sys.argv[2]
+cfg = dataclasses.replace(config_mod.Config(), dsn=dsn, schema="public",
+                          backend="pg", statement_timeout_ms=120000.0)
+database = db_mod.connect(cfg)
+try:
+    result = bench.purge_orphans(database, min_age_s=0.5, only={name},
+                                 bootstrap=True)
+    print("dropped=%s" % ",".join(result.dropped), flush=True)
+    print("note=%s" % result.note, flush=True)
+finally:
+    database.close()
+'''
+
+
 #: #3735 B/P1 : scénario hors processus — une suite vivante **sans client
 #: backend** (comme `PsqlDriver` entre deux échanges) tient le verrou partagé ;
 #: la maintenance ne peut alors pas admettre un schéma sans marqueur. Une fois
@@ -315,12 +431,12 @@ try:
         database.execute('CREATE TABLE "%s".x (id integer)' % name)
         time.sleep(1.1)
         first = bench.purge_orphans(database, min_age_s=0.5, only={name},
-                                    bootstrap=True)
+                                    bootstrap=True, fresh=True)
         print("first=%s" % ",".join(first.dropped), flush=True)
         holder.kill()
         holder.wait()
         second = bench.purge_orphans(database, min_age_s=0.5, only={name},
-                                     bootstrap=True)
+                                     bootstrap=True, fresh=True)
         print("second=%s" % ",".join(second.dropped), flush=True)
         present = database.query(
             "SELECT to_regnamespace(%s) IS NOT NULL AS present", (name,))[0]
