@@ -112,6 +112,12 @@ class _AlertsCase(PgTestCase):
         env = mock.patch.object(role_timers, "unit_env", return_value=dict(NO_ENV))
         env.start()
         self.addCleanup(env.stop)
+        # #3575: the published route also requires the host's alerts timer;
+        # these witnesses are about the route, so the unit is presumed there
+        # (the timer's own witnesses live in tests/test_3575_alerts_basket.py).
+        timer = mock.patch.object(role_timers, "alerts_timer_gap", return_value="")
+        timer.start()
+        self.addCleanup(timer.stop)
 
     def role(self, *, releve="election", hosts=("banc", "atelier"),
              responsible="human:owner"):

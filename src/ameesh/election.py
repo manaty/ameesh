@@ -49,6 +49,12 @@ must not make the role's lease ineligible (#3402) — but it elects the pass
 separately: `alerts_delegate` gives the `alerts` timer to the holder when it
 can push, otherwise to the first fresh candidate that can. The delivery thus
 stops depending on the route of whoever happens to hold the lease.
+
+#3575: two edges of that rule. `notify_ok` also requires the host's
+`ameesh-role-alerts.timer` (installed, current, enabled): a route alone would
+elect a host that never runs the pass. And the fallback keeps its **last
+executor** while its shared `notify_liveness` beat is fresh, so two routed
+candidates no longer alternate at every capacity tie-break.
 """
 from __future__ import annotations
 
@@ -379,6 +385,13 @@ def _notify_reach(cfg, role: Mapping) -> tuple[bool, str]:
     A local configuration or secret gap is *reported*, never raised: it only
     chooses the alerts delegate, it never makes the role ineligible (#3402:
     a missing secret is not a negative result, still less a deploy failure).
+
+    #3575: a route is not enough — the delegate must be a host that will
+    *run* the pass. The `ameesh-role-alerts.timer` must be installed, current
+    and enabled there too; otherwise `notify_ok=true` would elect a candidate
+    whose timer does not exist (or still predates `--pass alerts`), and the
+    delivery would stay silent while another routed, equipped candidate
+    waits.
     """
     try:
         from . import role_timers
@@ -386,9 +399,15 @@ def _notify_reach(cfg, role: Mapping) -> tuple[bool, str]:
             cfg, responsible=role.get("responsible"))
     except Exception as exc:  # noqa: BLE001 - a local gap never breaks the election
         return False, "notify reach unreadable: %s" % " ".join(str(exc).split())[:200]
-    if humans:
-        return True, ""
-    return False, error or "no remote push route on this host"
+    if not humans:
+        return False, error or "no remote push route on this host"
+    try:
+        gap = role_timers.alerts_timer_gap(role=role.get("name") or "")
+    except Exception as exc:  # noqa: BLE001 - a local gap never breaks the election
+        return False, "alerts timer unreadable: %s" % " ".join(str(exc).split())[:200]
+    if gap:
+        return False, gap
+    return True, ""
 
 
 def evaluate(cfg, db, role: Mapping, host: str, *, now: float | None = None) -> dict:
@@ -601,6 +620,50 @@ def candidacy(db, name: str, *, now: float | None = None) -> list[dict]:
     return ordered
 
 
+def _last_executor(db, role: Mapping, pool: Sequence[Mapping], *,
+                   now: float) -> Mapping | None:
+    """#3575: the freshest routed candidate that already ran the alerts pass.
+
+    The pass records a shared `notify_liveness` beat for every human it
+    reaches (`notify_gap.beat`), so the last host that actually delivered is
+    visible from every reader without a new table. While that beat is fresh
+    (the same ``ALIVE_S`` as the deliverability alert), keeping that host
+    stops two routed fallbacks from alternating at every capacity tie-break,
+    each losing its own local notify state. A tie keeps the election's order.
+    """
+    from . import notify as notify_mod
+    from . import notify_gap
+    human = notify_mod.normalize_human(role.get("responsible"))
+    if not human or not pool:
+        return None
+    try:
+        rows = storage.of(db).notify_liveness.latest()
+    except Exception:  # noqa: BLE001 - hysteresis is a preference, never a gate
+        return None
+    limit = float(notify_gap.ALIVE_S)
+    last: dict[str, float] = {}
+    for row in rows:
+        if str(row.get("human") or "") != human:
+            continue
+        seen = float(row.get("seen_ts") or 0.0)
+        # Same freshness rule as the deliverability alert: a beat dated a
+        # little in the future (host clock) still counts, a stale one does not.
+        if seen < now - limit:
+            continue
+        host = str(row.get("host") or "")
+        if seen > last.get(host, float("-inf")):
+            last[host] = seen
+    pick = None
+    seen = None
+    for item in pool:  # election order breaks a tie deterministically
+        at = last.get(str(item.get("host") or ""))
+        if at is None:
+            continue
+        if pick is None or at > seen:
+            pick, seen = item, at
+    return pick
+
+
 def alerts_delegate(db, role: Mapping, *, holder: str | None = None,
                     ranked: Sequence[Mapping] | None = None,
                     now: float | None = None) -> dict:
@@ -612,6 +675,12 @@ def alerts_delegate(db, role: Mapping, *, holder: str | None = None,
     capacity, host), so every reader computes the same delegate: the delivery
     no longer goes silent because the elected lease fell to a host without a
     route (#3383). A pinned role keeps its host: there is nowhere to delegate.
+
+    #3575: among those fallbacks, the **last executor** keeps the pass while
+    its shared `notify_liveness` beat is fresh and it is still routed
+    (:func:`_last_executor`): the capacity tie-break no longer makes two
+    equipped hosts alternate and lose their local notify state each time. The
+    holder's route, when it returns, still takes precedence (#3568).
 
     `holder` and `ranked` let a caller that already read them (`status`,
     `role run`) avoid a second, possibly incoherent read; they must come from
@@ -627,6 +696,7 @@ def alerts_delegate(db, role: Mapping, *, holder: str | None = None,
         "holder": holder,
         "delegate": None,
         "holder_notify_ok": False,
+        "last_executor": None,
         "reason": "",
     }
     if str(role.get("releve") or "") != "election":
@@ -642,15 +712,21 @@ def alerts_delegate(db, role: Mapping, *, holder: str | None = None,
     usable = [item for item in items
               if item.get("declared") and item.get("fresh") and item.get("notify_ok")]
     ready = [item for item in usable if item.get("ready")]
-    pick = (ready or usable or [None])[0]
+    pool = ready or usable
+    last = _last_executor(db, role, pool, now=now)
+    pick = last or (pool or [None])[0]
     if pick is None:
         out["reason"] = ("no fresh candidate can push"
                          + (" (holder %s cannot)" % holder if holder else ""))
         return out
-    out.update(delegate=pick["host"],
-               reason=("%s cannot push" % holder if holder
-                       else "no live holder")
-               + "; first candidate that can push")
+    reason = ("%s cannot push" % holder if holder
+              else "no live holder")
+    if last is not None:
+        reason += "; last executor %s stays in charge" % last["host"]
+        out["last_executor"] = last["host"]
+    else:
+        reason += "; first candidate that can push"
+    out.update(delegate=pick["host"], reason=reason)
     return out
 
 
