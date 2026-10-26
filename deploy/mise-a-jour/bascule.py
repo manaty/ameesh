@@ -5,6 +5,7 @@
     bascule.py preparer --venv <venv> --src <code> --version <sha7>
     bascule.py activer  --venv <venv> --version <sha7> [--precedent <sha7>]
     bascule.py retour   --venv <venv>
+    bascule.py menage   --venv <venv> [--apply]
     bascule.py etat     --venv <venv> [--json]
 
 Le venv vivant ne reçoit plus jamais de `pip`, et aucun processus ne dépend
@@ -32,6 +33,15 @@ plus d'un chemin qu'une bascule changerait sous lui :
 
 `retour` repointe vers la version précédente enregistrée, sans pip ; il est
 idempotent. Aucun octet d'un venv versionné n'est modifié après préparation.
+
+`menage` retire les anciens `venv-<version>` d'une installation qui accumule
+un venv complet par mise à jour (#3792) : il garde la CIBLE du lien
+`venv-courant`, le nom écrit dans `venv.precedent`, et tout venv qu'un
+processus vivant nomme par un chemin absolu (`/proc/*/cmdline`, ou `ps` sans
+`/proc`). Le lien `venv-courant` lui-même n'est jamais candidat — on
+n'énumère que des répertoires réels — et rien n'est retiré quand l'état ne
+permet pas de conclure. `activer` l'applique en fin de bascule réussie ; le
+mode à blanc (`--apply` absent) montre ce qui serait retiré.
 """
 from __future__ import annotations
 
@@ -55,6 +65,7 @@ CURRENT = "venv-courant"         # lien : version vivante
 REPORT = "venv.precedent"        # fichier : version précédente enregistrée
 LAUNCHERS = ".bascule-lanceurs"  # marqueur : <venv> porte les lanceurs
 SHEBANG_MAX_LINE = 8192          # borne en octets, même pour un script malformé
+PROC = "/proc"                   # racine des processus vivants (ménage #3792)
 
 _LAUNCHER = """#!/bin/sh
 # #1969 : lanceur stable du venv d'ameesh. Il résout le venv versionné vivant
@@ -584,6 +595,233 @@ def _adopter(venv, version):
 
 
 # --------------------------------------------------------------------------
+# ménage des venvs versionnés (#3792)
+# --------------------------------------------------------------------------
+
+def _repertoire_lie(venv):
+    """Le venv vivant, lu par la CIBLE du lien `venv-courant` (jamais un motif)."""
+    lien = _current(venv)
+    try:
+        cible = os.readlink(lien)
+    except OSError:
+        return None
+    if not os.path.isabs(cible):
+        cible = os.path.join(_base(venv), cible)
+    return os.path.normpath(cible)
+
+
+def _identite(chemin):
+    """(périphérique, inode) : l'identité d'un répertoire, quel que soit son nom."""
+    etat = os.stat(chemin)
+    return (etat.st_dev, etat.st_ino)
+
+
+def _candidats_menage(venv):
+    """Répertoires `venv-<version>` du partage, hors lien `venv-courant`.
+
+    On n'énumère que des RÉPERTOIRES réels : ni `venv` (stable), ni un lien
+    (dont `venv-courant`) ne peut être candidat. Le courant et le précédent
+    sont ensuite écartés par leur identité, jamais par leur nom."""
+    base = _base(venv)
+    try:
+        noms = sorted(os.listdir(base))
+    except OSError:
+        return None
+    candidats = []
+    for nom in noms:
+        if not nom.startswith("venv-") or nom == CURRENT:
+            continue
+        chemin = os.path.join(base, nom)
+        if os.path.islink(chemin) or not os.path.isdir(chemin):
+            continue
+        candidats.append((nom, chemin))
+    return candidats
+
+
+def _chemins_proc(racine):
+    """Chemins absolus nommés par les processus vivants sous `racine` (/proc)."""
+    try:
+        entrees = os.listdir(racine)
+    except OSError:
+        return None
+    chemins = set()
+    for pid in entrees:
+        if not pid.isdigit():
+            continue
+        dossier = os.path.join(racine, pid)
+        try:
+            with open(os.path.join(dossier, "cmdline"), "rb") as handle:
+                brut = handle.read()
+        except FileNotFoundError:
+            # terminé entre l'énumération et la lecture (ou pendant un exec) :
+            # il n'y a plus de ligne de commande à défendre. Ne pas tester
+            # `isdir` ici : le PID peut être réutilisé entre les deux appels,
+            # et la course rendrait le ménage aléatoirement muet.
+            continue
+        except OSError:
+            # un processus vivant illisible ne peut pas être innocenté
+            return None
+        for argument in brut.split(b"\0"):
+            texte = os.fsdecode(argument)
+            if texte and os.path.isabs(texte):
+                chemins.add(os.path.normpath(texte))
+    return chemins
+
+
+def _chemins_ps():
+    """Repli sans `/proc` (macOS) : les lignes de commande de `ps`."""
+    try:
+        sortie = subprocess.run(["ps", "-axww", "-o", "command="],
+                                check=True, capture_output=True, text=True)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    chemins = set()
+    for ligne in sortie.stdout.splitlines():
+        # un argument absolu suffit ; le découpage reste conservateur
+        for mot in re.findall(r"/[^\s'\"]+", ligne):
+            chemins.add(os.path.normpath(mot))
+    return chemins
+
+
+def _chemins_des_processus(racine=PROC):
+    """Chemins absolus nommés par les processus vivants, ou None si illisible."""
+    if os.path.isdir(racine):
+        return _chemins_proc(racine)
+    return _chemins_ps()
+
+
+def _sous(chemin, dossier):
+    """`chemin` est-il `dossier` ou un fichier dedans (comparaison de préfixe) ?"""
+    return chemin == dossier or chemin.startswith(dossier + os.sep)
+
+
+def _menager(venv, appliquer=False, racine=PROC):
+    """Retire les venvs versionnés au-delà du courant, du précédent et de l'usage.
+
+    Le courant est la CIBLE du lien `venv-courant`, le précédent le nom écrit
+    dans `venv.precedent` ; aucun des deux n'est déduit d'un motif. Le lien
+    lui-même n'est jamais candidat, et un venv qu'un processus vivant nomme
+    par un chemin absolu est conservé. Rien n'est retiré si l'état ne permet
+    pas de conclure (lien illisible, processus illisibles) : un venv qu'on ne
+    peut pas innocenter reste en place. Rend un compte rendu ; ne lève pas.
+    """
+    rapport = {"courant": None, "precedent": None, "gardes": [],
+               "retirables": [], "retires": [], "erreurs": [], "probleme": None}
+    if os.path.islink(venv) or not os.path.isdir(venv):
+        rapport["probleme"] = "venv vivant introuvable (%s)" % venv
+        return rapport
+    vivante = _repertoire_lie(venv)
+    if vivante is None:
+        rapport["probleme"] = "lien %s absent ou illisible" % CURRENT
+        return rapport
+    if not os.path.isdir(vivante):
+        rapport["probleme"] = "cible du lien %s introuvable (%s)" % (CURRENT, vivante)
+        return rapport
+    try:
+        gardees = {_identite(vivante): "courant"}
+    except OSError:
+        rapport["probleme"] = "cible du lien %s absente (%s)" % (CURRENT, vivante)
+        return rapport
+    rapport["courant"] = vivante
+    try:
+        precedent = _read_report(venv)
+    except (OSError, UnicodeError):
+        precedent = None  # un rapport illisible ne fait pas échouer le ménage
+    if precedent:
+        chemin = os.path.join(_base(venv), "venv-%s" % precedent)
+        try:
+            gardees.setdefault(_identite(chemin), "précédent")
+        except OSError:
+            pass
+        else:
+            rapport["precedent"] = chemin
+    candidats = _candidats_menage(venv)
+    if candidats is None:
+        rapport["probleme"] = "contenu de %s illisible" % _base(venv)
+        return rapport
+    vivants = _chemins_des_processus(racine)
+    if vivants is None:
+        rapport["probleme"] = "processus vivants illisibles (%s)" % racine
+        return rapport
+    retirables = []
+    for nom, chemin in candidats:
+        try:
+            raison = gardees.get(_identite(chemin))
+        except OSError as exc:
+            # un candidat disparu ou illisible ne se retire pas dans le doute
+            rapport["erreurs"].append((nom, str(exc)))
+            continue
+        if raison:
+            rapport["gardes"].append((nom, raison))
+            continue
+        if any(_sous(utilise, chemin) for utilise in vivants):
+            rapport["gardes"].append((nom, "utilisé par un processus vivant"))
+            continue
+        retirables.append((nom, chemin))
+    rapport["retirables"] = [nom for nom, _ in retirables]
+    if not appliquer:
+        return rapport
+    for nom, chemin in retirables:
+        if _repertoire_lie(venv) != vivante:
+            rapport["probleme"] = ("le lien %s a changé pendant le ménage ; "
+                                   "retrait interrompu" % CURRENT)
+            break
+        try:
+            _supprimer(chemin)
+        except OSError as exc:
+            rapport["erreurs"].append((nom, str(exc)))
+        else:
+            rapport["retires"].append(nom)
+    return rapport
+
+
+def _menager_apres_bascule(venv):
+    """Ménage automatique en fin de bascule : il ne fait jamais échouer celle-ci."""
+    try:
+        rapport = _menager(venv, appliquer=True)
+    except Exception as exc:  # le déploiement reste réussi même si le ménage casse
+        print("bascule: ménage des venvs impossible (%s) ; rien retiré" % exc,
+              file=sys.stderr)
+        return
+    if rapport["retires"]:
+        print("bascule: ménage : %d ancien(s) venv retiré(s) (%s)"
+              % (len(rapport["retires"]), ", ".join(rapport["retires"])))
+    for nom, erreur in rapport["erreurs"]:
+        print("bascule: ménage : %s conservé (%s)" % (nom, erreur), file=sys.stderr)
+    if rapport["probleme"]:
+        print("bascule: ménage des venvs non conclu (%s)"
+              % rapport["probleme"], file=sys.stderr)
+
+
+def menager(args):
+    """`bascule.py menage` : à blanc par défaut, retrait réel avec `--apply`."""
+    rapport = _menager(args.venv, appliquer=args.apply)
+    if rapport["courant"]:
+        print("bascule: courant %s%s" % (
+            os.path.basename(rapport["courant"]),
+            ", précédent %s" % os.path.basename(rapport["precedent"])
+            if rapport["precedent"] else ""))
+    for nom, raison in rapport["gardes"]:
+        print("bascule: gardé %s (%s)" % (nom, raison))
+    for nom in rapport["retires"]:
+        print("bascule: retiré %s" % nom)
+    if not args.apply:
+        for nom in rapport["retirables"]:
+            print("bascule: à retirer %s (à blanc ; --apply pour retirer)" % nom)
+    for nom, erreur in rapport["erreurs"]:
+        print("bascule: non retiré %s : %s" % (nom, erreur), file=sys.stderr)
+    if rapport["probleme"]:
+        if rapport["retires"]:
+            print("bascule: ménage interrompu : %s" % rapport["probleme"],
+                  file=sys.stderr)
+        else:
+            print("bascule: ménage non conclu : %s ; rien retiré"
+                  % rapport["probleme"], file=sys.stderr)
+        return 1
+    return 1 if rapport["erreurs"] else 0
+
+
+# --------------------------------------------------------------------------
 # bascule et retour
 # --------------------------------------------------------------------------
 
@@ -618,12 +856,14 @@ def activer(args):
     if _live_target(venv) == version:
         _retirer_lanceurs(venv, scripts)
         print("bascule: venv-%s déjà actif" % version)
+        _menager_apres_bascule(venv)
         return 0
     if precedent and precedent != version:
         _write_report(venv, precedent)
     _pointer(venv, version)
     _retirer_lanceurs(venv, scripts)
     print("bascule: venv-%s actif%s" % (version, "" if not precedent else " (avant : %s)" % precedent))
+    _menager_apres_bascule(venv)
     return 0
 
 
@@ -719,6 +959,13 @@ def main(argv=None):
     p = sub.add_parser("retour", help="bascule en arrière, sans pip")
     p.add_argument("--venv", required=True)
     p.set_defaults(func=retour)
+    p = sub.add_parser("menage",
+                       help="retirer les anciens venv-<version> (courant, précédent "
+                            "et venvs utilisés gardés ; à blanc par défaut)")
+    p.add_argument("--venv", required=True)
+    p.add_argument("--apply", action="store_true",
+                   help="retirer réellement (défaut : mode à blanc)")
+    p.set_defaults(func=menager)
     p = sub.add_parser("etat", help="version vivante, précédente, préparées")
     p.add_argument("--venv", required=True)
     p.add_argument("--json", action="store_true")
