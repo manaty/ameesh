@@ -656,11 +656,18 @@ def _head(run: dict, lot: dict | None) -> str:
         run.get("url") or "run %s" % run["run_id"])
 
 
-def _failure_lines(failures: list[dict], *, detail: bool) -> list[str]:
+def _failure_lines(failures: list[dict], *, detail: bool,
+                   attribution: dict | None = None) -> list[str]:
+    """Les lignes d'échec ; `attribution` (#3801) nomme l'unité probable."""
+    from . import packet_red
+    by_test = packet_red.tests_by_name(attribution)
     out = []
     for i, f in enumerate(failures):
         out.append("• %s%s (%s, %s)" % (f["test"], " — inherited" if f.get("inherited") else "",
                                         f.get("part") or "?", f.get("status") or "echec"))
+        entry = by_test.get(f["test"])
+        if entry:
+            out.append("  unités probables : %s" % packet_red.evidence_line(entry))
         if f.get("replay"):
             out.append("  replay: %s" % f["replay"])
         if detail and i < DETAILED and f.get("excerpt"):
@@ -673,8 +680,13 @@ def _failure_lines(failures: list[dict], *, detail: bool) -> list[str]:
 
 
 def failure_text(run: dict, lot: dict | None, failures: list[dict], *, first: bool,
-                 detail: bool = True, unknown_base: bool = False) -> str:
-    """Le message d'un ou plusieurs échecs nouveaux d'une exécution."""
+                 detail: bool = True, unknown_base: bool = False,
+                 attribution: dict | None = None) -> str:
+    """Le message d'un ou plusieurs échecs nouveaux d'une exécution.
+
+    `attribution` (#3801) : le relevé `packet_red` du paquet, qui nomme pour
+    chaque test l'unité probable. Absent hors porteur de paquet."""
+    from . import packet_red
     head = _head(run, lot)
     what = ("first failure" if len(failures) == 1 else "first %d failures" % len(failures)) \
         if first else ("next failure" if len(failures) == 1
@@ -684,7 +696,10 @@ def failure_text(run: dict, lot: dict | None, failures: list[dict], *, first: bo
         lines += ["No finished run of %s has been seen yet: these failures may be "
                   "inherited, hence this message without a wake-up." % (run.get("base") or "main"),
                   ""]
-    lines += _failure_lines(failures, detail=detail)
+    lines += _failure_lines(failures, detail=detail, attribution=attribution)
+    note = packet_red.note_of(attribution)
+    if note:
+        lines += ["", note]
     lines += ["", "The suite goes on, verdict at the end. A new push replaces this "
                   "run: the messages you have not read yet will be withdrawn. No need "
                   "to wait for the CI in your turn (gh pr checks --watch): ameesh tells you."]
@@ -692,10 +707,15 @@ def failure_text(run: dict, lot: dict | None, failures: list[dict], *, first: bo
 
 
 def verdict_text(run: dict, lot: dict | None, status: str, failures: list[dict],
-                 pending: list[dict] | None = None) -> str:
+                 pending: list[dict] | None = None,
+                 attribution: dict | None = None) -> str:
     """Le message de fin d'une exécution. `pending` : les autres workflows de
     la même tête encore en cours — le verdict les nomme, pour qu'un vert d'une
-    suite ne soit pas pris pour un vert de toute la CI (#1110)."""
+    suite ne soit pas pris pour un vert de toute la CI (#1110).
+
+    `attribution` (#3801) : le relevé `packet_red` du paquet, s'il est rouge.
+    """
+    from . import packet_red
     head = _head(run, lot)
     own = [f for f in failures if not f.get("inherited")]
     inherited = [f for f in failures if f.get("inherited")]
@@ -721,8 +741,11 @@ def verdict_text(run: dict, lot: dict | None, status: str, failures: list[dict],
                               if inherited else "")
             lines.append("%s: red, %d failure(s)%s." % (head, len(own), inherited_note))
         lines.append("")
-        lines += _failure_lines(own + inherited, detail=False)
+        lines += _failure_lines(own + inherited, detail=False, attribution=attribution)
         first = "\n".join(lines).rstrip()
+    note = packet_red.note_of(attribution)
+    if note and (failures or status != "success"):
+        first += "\n\n" + note
     if others:
         first += ("\n\nOther workflow(s) of this head are still running: %s — their "
                   "verdicts will follow." % ", ".join(others))
@@ -2027,6 +2050,24 @@ class Watcher:
             return None
         return pilots[0]
 
+    def _attribution(self, db, lot, row: dict, failures: list[dict]):
+        """#3801 : les unités probables d'un run rouge de paquet, jamais fatal.
+
+        Le relevé est borné au porteur `integration/**` ; un défaut de lecture
+        ou de téléchargement de carte rend un statut, pas une exception qui
+        retiendrait le courrier.
+        """
+        if not lot or not failures:
+            return None
+        from . import packet_red
+        try:
+            return packet_red.attribute_run(db, lot, row, failures,
+                                            cfg=self.cfg, api=self.api)
+        except Exception as exc:  # noqa: BLE001 - le courrier reste dû
+            self.log("CI %s run %s: packet attribution unreadable (%s)"
+                     % (row.get("repo") or "?", row.get("run_id"), type(exc).__name__))
+            return None
+
     def _failures(self, db, repo: str, row: dict, bases=BASE_BRANCHES,
                   terminal: str = "") -> list[dict]:
         """Les échecs nouveaux d'une exécution suivie, et leur message.
@@ -2116,9 +2157,12 @@ class Watcher:
         first = not row.get("urgent_message_id") and not any(
             f.get("message_id") for f in recorded.values())
         urgent = first and not unknown_base
-        text = failure_text(row, lot, own, first=first, unknown_base=unknown_base)
+        # #3801 : d'où vient probablement chaque échec dans le paquet
+        attribution = self._attribution(db, lot, row, own)
+        text = failure_text(row, lot, own, first=first, unknown_base=unknown_base,
+                            attribution=attribution)
         short = failure_text(row, lot, own, first=first, unknown_base=unknown_base,
-                             detail=False)
+                             detail=False, attribution=attribution)
         payload = {"ci": {"repo": repo, "run_id": row["run_id"], "head_sha": row["head_sha"],
                           "branch": row["branch"], "kind": "failure",
                           "workflow": row.get("workflow") or workflow_of(row.get("path")),
@@ -2267,7 +2311,10 @@ class Watcher:
         # état GitHub, quand la ligne ne les porte pas encore (#901, #1110)
         view = dict(row, run_attempt=run.get("run_attempt") or row.get("run_attempt") or 1,
                     path=run.get("path") or row.get("path") or "")
-        text = verdict_text(view, lot, status, failures, pending=pending)
+        own = [f for f in failures if not f.get("inherited")]
+        attribution = self._attribution(db, lot, row, own)
+        text = verdict_text(view, lot, status, failures, pending=pending,
+                            attribution=attribution)
         payload = {"ci": {"repo": repo, "run_id": row["run_id"], "head_sha": row["head_sha"],
                           "branch": row["branch"], "kind": "verdict", "status": status,
                           "workflow": view.get("workflow") or workflow_of(view.get("path")),
@@ -2380,17 +2427,29 @@ def wait_text(run: dict, now: float) -> str:
 # ameesh ci status
 # --------------------------------------------------------------------------
 
-def status_of(db, item_id: int, limit: int = 5) -> dict:
-    from . import work
+def status_of(db, item_id: int, limit: int = 5, *, cfg=None) -> dict:
+    from . import packet_red, work
     item = work.get(db, int(item_id))
     if item is None:
         raise CiError("lot #%s unknown" % item_id)
+    cfg = cfg if cfg is not None else getattr(db, "cfg", None)
     st = storage.of(db)
-    runs = []
+    rows = []
     for row in st.ci.for_lot(int(item_id), limit):
         failures = st.ci.failures(row["repo"], int(row["run_id"]))
-        runs.append(dict(row, failures=[{k: f.get(k) for k in (
-            "part", "test", "status", "inherited", "replay", "failed_ts")} for f in failures]))
+        rows.append((row, failures))
+    # #3801 : la carte et le clone sont les mêmes pour tous les runs du paquet
+    shared: dict = {}
+    runs = []
+    for row, failures in rows:
+        view = dict(row, failures=[{k: f.get(k) for k in (
+            "part", "test", "module", "status", "inherited", "replay",
+            "failed_ts")} for f in failures])
+        own = [failure for failure in failures if not failure.get("inherited")]
+        if packet_red.is_carrier(item) and own:
+            view["attribution"] = packet_red.attribute_run(
+                db, item, row, own, cfg=cfg, shared=shared)
+        runs.append(view)
     report = {"schema": STATUS_SCHEMA, "work_item": int(item_id), "title": item.get("title"),
               "branch": item.get("branch"), "runs": runs}
     carrier = _carrier_of(db, item)
@@ -2450,6 +2509,7 @@ def render_status(report: dict) -> list[str]:
                          "journal alone does not tell which: the fire reads the protection and "
                          "answers `not-ready` with this cause when it applies (#3611)"
                          % (sha, lot))
+    from . import packet_red
     for run in report["runs"]:
         state = _STATUS_FR.get(run["status"], run["status"])
         attempt = int(run.get("run_attempt") or 1)
@@ -2466,11 +2526,24 @@ def render_status(report: dict) -> list[str]:
             "%d failure(s)" % len(own), ", %d inherited" % inherited if inherited else "",
             "  (%s)" % wait if wait else "",
             "  %s" % run["url"] if run.get("url") else ""))
+        attribution = run.get("attribution") or {}
+        by_test = packet_red.tests_by_name(attribution)
         for f in own[:10]:
             lines.append("      %s (%s)%s" % (f["test"], f.get("part") or "?",
                                               "  → %s" % f["replay"] if f.get("replay") else ""))
+            entry = by_test.get(f["test"])
+            if entry:
+                lines.append("        unités probables : %s"
+                             % packet_red.evidence_line(entry))
         if len(own) > 10:
             lines.append("      … and %d more" % (len(own) - 10))
+        if attribution and attribution.get("status") in ("no-manifest", "no-files") \
+                and attribution.get("why"):
+            lines.append("        unités probables : non attribuable (%s)"
+                         % attribution["why"])
+        note = packet_red.note_of(attribution)
+        if note:
+            lines.append("      %s" % note)
     return lines
 
 
