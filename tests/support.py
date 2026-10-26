@@ -621,7 +621,10 @@ class PgTestCase(SensitiveGlobalsMixin, unittest.TestCase):
         # #3735 : `tearDownClass` n'est pas appelé quand `setUpClass` échoue
         # (migration en erreur, kill) — le schéma resterait à jamais. Le
         # cleanup de classe est enregistré AVANT la migration ; le drop de
-        # `tearDownClass` reste le chemin normal.
+        # `tearDownClass` reste le chemin normal. `_schema_dropped` est remis à
+        # zéro sur CETTE classe (jamais hérité) : le cleanup passé après
+        # `tearDownClass` ne rouvrira pas la base fermée (B/P1 pilote #3735).
+        cls._schema_dropped = False
         cls.addClassCleanup(cls._drop_schema)
         cls.state = os.path.join(cls.tmp, "state")
         cls.v0state = os.path.join(cls.tmp, "v0state")
@@ -665,13 +668,28 @@ class PgTestCase(SensitiveGlobalsMixin, unittest.TestCase):
 
     @classmethod
     def _drop_schema(cls) -> None:
-        """Supprime le schéma de la classe ; tolère une base déjà fermée."""
-        db = getattr(cls, "db", None)
+        """Supprime le schéma une fois, puis ferme la connexion de la classe.
+
+        Le cleanup de classe de `unittest` passe APRÈS `tearDownClass` : sans
+        drapeau, il exécuterait un DROP sur une base déjà fermée — le pilote
+        psycopg rouvrirait une connexion (`_live`) jamais refermée, une fuite
+        par classe (B/P1 pilote #3735, CI h-30). Le drapeau et la connexion
+        sont lus dans ``cls.__dict__`` pour ne pas hériter de la classe
+        parente.
+        """
+        if cls.__dict__.get("_schema_dropped", False):
+            return
+        db = cls.__dict__.get("db")
         if db is None:
             return
         try:
             db.execute('DROP SCHEMA IF EXISTS "%s" CASCADE' % cls.schema)
         except Exception:  # noqa: BLE001 — cleanup : ne masque pas l'erreur d'origine
+            pass
+        cls._schema_dropped = True
+        try:
+            db.close()
+        except Exception:  # noqa: BLE001 — une fermeture ne juge pas la classe
             pass
 
     @classmethod
@@ -680,7 +698,6 @@ class PgTestCase(SensitiveGlobalsMixin, unittest.TestCase):
             noter_tables(cls)
             try:
                 cls._drop_schema()
-                cls.db.close()
             finally:
                 shutil.rmtree(cls.tmp, ignore_errors=True)
         finally:

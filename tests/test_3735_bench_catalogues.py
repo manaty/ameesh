@@ -305,6 +305,38 @@ class BenchCataloguesTest(PgTestCase):
         self.assertIn(name, dropped.dropped)
         self.assertFalse(self._exists(name))
 
+    def _client_connections(self) -> int:
+        row = self.db.query(
+            "SELECT count(*)::bigint AS n FROM pg_stat_activity "
+            "WHERE datname = current_database() "
+            "AND backend_type = 'client backend'")[0]
+        return int(row["n"])
+
+    def test_class_cleanup_does_not_leak_connections(self) -> None:
+        """B/P1 pilote (#3735) : un cleanup de classe ne rouvre pas de connexion.
+
+        Le cleanup `addClassCleanup` passe après `tearDownClass`, qui a fermé
+        la base ; sous psycopg, un DROP sur la base fermée rouvrirait une
+        connexion (`_live`) jamais refermée — une par classe. N classes
+        PgTestCase ne doivent pas faire croître `pg_stat_activity`.
+        """
+        if os.environ.get("AMEESH_DRIVER") != "psycopg":
+            self.skipTest("psycopg driver only (the leak is psycopg's _live)")
+        baseline = self._client_connections()
+        classes = [
+            type("LeakProbe%d" % index, (PgTestCase,), {
+                "test_nothing": lambda self: None,
+            })
+            for index in range(3)
+        ]
+        result = unittest.TestResult()
+        unittest.TestSuite(cls("test_nothing") for cls in classes).run(result)
+        self.assertTrue(result.wasSuccessful(),
+                        "classes: %r" % ((result.errors, result.failures),))
+        self.assertLessEqual(
+            self._client_connections(), baseline,
+            "une connexion par classe fuit après le cleanup (#3735)")
+
     def test_owner_marker_round_trip(self) -> None:
         marker = bench_mod.owner_marker()
         self.assertEqual(bench_mod.parse_owner(marker)[0], os.getpid())
