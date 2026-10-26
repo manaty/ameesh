@@ -41,7 +41,8 @@ auteurs, avec les mêmes exceptions du canon §2 :
   n'est plus contenu par une ref (objet pendant d'un force-push, #3399) garde
   ses auteurs connus dont le contenu survit ; seuls ses inconnus cessent de
   bloquer. Le refus fermé B5 ne vaut que pour un gel encore accessible ;
-* un commit **déjà dans la cible** au moment de la lecture ne compte ni comme
+* un commit **déjà dans la cible** au moment de la lecture, par ascendance ou
+  patch-id verbatim identique (#3762), ne compte ni comme
   auteur ni comme tiers du lot (#3116) : la plage reportée d'un ancien gel,
   calculée avant un rebase, peut contenir du develop déjà relu sous son propre
   lot ; un inconnu d'un gel antérieur qui n'est plus ancêtre de la tête et dont
@@ -560,7 +561,7 @@ def target_commit(repo: str, target: str) -> str:
 
 
 def _not_in_target(repo: str, commits, target: str) -> list:
-    """Les commits de la liste qui ne sont PAS atteignables depuis `target`.
+    """Les commits qui ne sont dans `target` ni par ascendance ni par patch.
 
     #3116 : un commit déjà dans la cible a été relu sous son propre lot ; il
     ne compte ni comme auteur ni comme tiers du lot, qu'il vienne de la plage
@@ -574,7 +575,14 @@ def _not_in_target(repo: str, commits, target: str) -> list:
     l'entrée telle quelle l'écartait alors comme « dans la cible », à l'envers
     du doute : on ne retire désormais que l'entrée **prouvée** dans la cible,
     et une entrée non résolue reste. Un identifiant complet est normalisé sans
-    sonde ; seule une forme non canonique est résolue localement."""
+    sonde ; seule une forme non canonique est résolue localement.
+
+    #3762 : un rebase change le SHA sans changer le patch. Les copies déjà
+    intégrées dans la cible ne portent plus d'auteur du lot, y compris dans
+    les gels antérieurs. Les patch-id **verbatim** conservent les espaces
+    (significatifs en Python) ; fusions, diffs vides ou lecture impossible
+    restent dans la liste. La recherche cible est bornée ; dépasser la borne
+    ne peut que conserver des auteurs, jamais en retirer sans preuve."""
     wanted = [str(commit).strip() for commit in commits or ()
               if str(commit).strip()]
     if not wanted or not target:
@@ -597,7 +605,33 @@ def _not_in_target(repo: str, commits, target: str) -> list:
         if canonical and canonical not in outside:
             continue
         kept.append(canonical or commit)
-    return kept
+    if not kept:
+        return kept
+    try:
+        # Borne commune à TOUS les candidats : exclure l'union de leurs
+        # ancêtres masquerait la cible dès qu'un candidat descend de celle-ci.
+        base = plan_git._out(repo, "merge-base", "--octopus", str(target), *kept)
+        if not base:
+            return kept
+        # Un seul parcours de la cible, puis lecture des seuls candidats.
+        on_target = plan_git._patch_ids(
+            repo, "--max-count=%d" % plan_git.MAX_TARGET_COMMITS,
+            "%s..%s" % (base, target))
+        if not on_target:
+            return kept
+    except Exception:  # noqa: BLE001 - pas de preuve : garder les auteurs
+        return kept
+    equivalent = set()
+    for sha in set(kept):
+        try:
+            # Une entrée par commit : deux copies du même patch doivent être
+            # écartées toutes les deux (le dictionnaire est indexé par patch).
+            patches = plan_git._patch_ids(repo, "--no-walk", sha)
+        except Exception:  # noqa: BLE001 - ce candidat reste dans le doute
+            continue
+        if patches and patches.keys() <= on_target.keys():
+            equivalent.add(sha)
+    return [sha for sha in kept if sha not in equivalent]
 
 
 def _survives_rewrite(repo: str, head: str, sha: str, cache: dict,
