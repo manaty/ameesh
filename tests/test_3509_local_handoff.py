@@ -124,6 +124,8 @@ class AlarmOutcomeTest(unittest.TestCase):
         from .test_3470_handoff_activation import EffectTest, companion
         fixture = EffectTest()
         fixture.setUp()
+        # Isolate the fixture helper from checkout permissions (for example umask 0002).
+        fixture.fx.effects._release = load("environnement-versionne")
         self.addCleanup(fixture.doCleanups)
         fixture.prepared()
         self.assertIs(fixture.call('admit')['ok'], True)

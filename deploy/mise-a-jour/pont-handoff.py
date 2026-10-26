@@ -32,7 +32,7 @@ ENROLLMENT_ROOT = Path('/etc/ameesh-handoff')
 TRANSPORT_NAME = 'transport-release.py'
 MAX_REQUEST_BYTES = 65536
 LOCAL_SOCKET = "/run/ameesh-handoff/local.sock"
-LOCAL_SECONDS = 60
+LOCAL_SECONDS = 90  # includes seal lock + full measurement + request + systemd stop
 
 
 class BridgeError(ValueError):

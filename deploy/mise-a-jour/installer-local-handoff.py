@@ -43,10 +43,7 @@ def validate_bundle(module):
             if path.suffix.lower() == '.pth':
                 raise ValueError('startup path hook')
             if stat.S_ISLNK(info.st_mode):
-                target = path.resolve(strict=True)
-                if target.suffix.lower() == '.pth' or not target.is_file():
-                    raise ValueError('unsafe symlink')
-                module.protected(target)
+                raise ValueError('unsafe symlink')
             elif stat.S_ISREG(info.st_mode):
                 module.protected(path)
             elif stat.S_ISDIR(info.st_mode):
@@ -79,7 +76,7 @@ def main(argv=None):
         if RECEIPT.exists():
             raise ValueError('already installed: rollback before replacing')
         # Include all importable code and venv configuration in the root seal.
-        # Symlinks are accepted only to another protected root-owned target.
+        # No symlink or startup hook belongs in the sealed runtime.
         validate_bundle(module)
         endpoint = ENDPOINT
         endpoint.mkdir(mode=0o755, exist_ok=True)
