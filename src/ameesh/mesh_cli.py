@@ -365,6 +365,12 @@ def cmd_list(cfg: Config, args: argparse.Namespace) -> int:
             last = _fmt_age(now - presence_ts)
             if presence_source == "wrote":
                 last = "wrote " + last
+                # #3729 : un signe de vie peut venir d'un autre hôte que celui
+                # déclaré (session externe : bureau) ; le nommer évite de lire
+                # la colonne HOST comme la preuve de la dernière activité.
+                wrote_from = (row.get("last_mail_host") or "").strip()
+                if wrote_from and wrote_from != (row.get("host") or "").strip():
+                    last += " from " + wrote_from
             print("%-20s %-12s %-10s %-10s %-11s %-22s %-8d %-5d %-5s %-13s %-4s %s" % (
                 row["name"][:20], project_label(agent_project_label(row))[:12],
                 ((live or "?")[:9] + ("*" if starred else "")),
@@ -1224,7 +1230,20 @@ def cmd_show(cfg: Config, args: argparse.Namespace) -> int:
             row.get("turns"), _fmt_moment(row.get("last_turn_ts"))))
         print("error    : %s" % (row.get("last_error") or "—"))
         print("directory: %s" % (row.get("cwd") or "—"))
-        print("seen     : %s" % _fmt_age(time.time() - float(row.get("last_seen_ts") or 0)))
+        # #3729 : le dernier signe de vie, comme la colonne ACTIVITY de `list`
+        # (#3337). `last_seen` seul fait passer une session `externe` pour
+        # absente alors qu'elle vient d'écrire ; l'hôte du dernier dépôt est
+        # nommé quand il diffère de l'hôte déclaré.
+        presence_ts, presence_source = registry.presence(row)
+        activity = _fmt_age(time.time() - presence_ts)
+        if presence_source == "wrote":
+            activity = "wrote " + activity
+            wrote_from = (row.get("last_mail_host") or "").strip()
+            if wrote_from and wrote_from != (row.get("host") or "").strip():
+                activity += " from " + wrote_from
+        else:
+            activity = "seen " + activity
+        print("activity : %s" % activity)
         return 0
     finally:
         db.close()
@@ -1873,6 +1892,14 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
             creator = binding.name if binding.ok else args.actor
             if args.new_project and args.app is None:
                 raise work.WorkError("--new-project goes with --app <project>")
+            if args.body == "-":
+                # #3744 : comme `work note <lot> -` (#3683), le corps vient de
+                # l'entrée standard (heredoc `<<'EOF'`), jamais « - » tel quel ;
+                # une entrée vide ou réduite à « - » est refusée avant création.
+                from . import cli
+                args.body, error = cli._stdin_body("body")
+                if error:
+                    raise work.WorkError(error)
             args.app = work_projects.creation_project(cfg, db, creator, args.app,
                                                       new_project=args.new_project)
             # #506: read before the lot exists (it makes its project known)
@@ -3637,7 +3664,9 @@ def build_parser() -> argparse.ArgumentParser:
     pw_add.add_argument("--new-project", action="store_true",
                         help="#506: accept an --app project nobody declares yet "
                              "(journaled on the lot); refused otherwise")
-    pw_add.add_argument("--body", default=None)
+    pw_add.add_argument("--body", default=None,
+                        help="the lot's statement; `-` reads it on standard input "
+                             "(heredoc <<'EOF', #3744)")
     pw_add.add_argument("--issue-ref", default=None)
     pw_add.add_argument("--workstream", default=None)
     pw_add.add_argument("--assignee", default=None)
