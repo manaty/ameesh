@@ -421,25 +421,30 @@ def commit_actor(repo: str, sha: str, db=None) -> tuple[str, float]:
     return actor, stamp
 
 
-def commits_written_by(repo: str, commits: Sequence[str], name: str,
-                       db=None) -> Optional[bool]:
-    """Un commit de la plage porte `name` comme **auteur Git** (`%ae`).
+def commit_ids_written_by(repo: str, commits: Sequence[str], name: str,
+                          db=None) -> Optional[list]:
+    """Les commits de la plage dont `name` est l'**auteur Git** (`%ae`).
 
     L'auteur Git est la signature du contenu ; le committer (`commit_actor`)
     est l'agent qui a créé l'objet. Un amend ou un rebase conserve l'auteur
     d'origine et change le committer : les deux ont écrit la plage (#2808).
     Le nom Git seul ne prouve rien : l'adresse `<nom>@ameesh.invalid` est
     exigée, comme pour le committer, ou l'ancienne `<nom>@ameesh.local` datée
-    (`%at`) d'avant la convention, vers un agent du registre (#3111)."""
+    (`%at`) d'avant la convention, vers un agent du registre (#3111).
+
+    Rend la liste des SHA, vide si aucun, `None` si la lecture est impossible
+    (un doute n'est pas une absence de preuve). #3742 : le refus de gel nomme
+    les commits à renvoyer à l'assigné, d'où la liste et non un booléen."""
     if not repo or not name:
-        return False
+        return []
     shas = [str(sha).strip() for sha in commits or () if str(sha).strip()]
     if not shas:
-        return False
+        return []
     text = plan_git._out(repo, "log", "--no-walk", "--format=%H%x1f%ae%x1f%at", *shas)
     if text is None or len(str(text).splitlines()) != len(set(shas)):
         return None                     # unreadable is not proof of absence
     wanted = str(name).strip().lower()
+    found = []
     for line in str(text).splitlines():
         fields = line.split("\x1f")
         if len(fields) != 3:
@@ -449,8 +454,18 @@ def commits_written_by(repo: str, commits: Sequence[str], name: str,
         except ValueError:
             return None
         if _agent_of_email(db, fields[1], stamp) == wanted:
-            return True
-    return False
+            found.append(str(fields[0]).strip())
+    return found
+
+
+def commits_written_by(repo: str, commits: Sequence[str], name: str,
+                       db=None) -> Optional[bool]:
+    """`True` si un commit de la plage porte `name` comme auteur Git.
+
+    Même lecture que [`commit_ids_written_by`] (#3111) ; le doute reste
+    `None`, jamais une absence de preuve."""
+    found = commit_ids_written_by(repo, commits, name, db)
+    return None if found is None else bool(found)
 
 
 def actor_family(db, actor: str, at_ts: float, families) -> str:
@@ -2037,7 +2052,8 @@ def _carried_from_previous(db, item: Mapping, milestone: Optional[Mapping],
                            base: str = "", head: str = "", provider=None,
                            strict: bool = False, target: str = "",
                            recover=None, admitted_heads=(),
-                           exclusions_out: Optional[list] = None) -> tuple[list, list, list]:
+                           exclusions_out: Optional[list] = None,
+                           commits_out: Optional[dict] = None) -> tuple[list, list, list]:
     """Auteurs/correcteurs des gels antérieurs dont le contenu subsiste (#2924).
 
     Rend `(auteurs, inconnus, correcteurs)` à fusionner dans la lecture de la
@@ -2046,6 +2062,10 @@ def _carried_from_previous(db, item: Mapping, milestone: Optional[Mapping],
     provenance illisible d'un gel antérieur qui n'est pas déjà couverte par la
     plage courante ajoute un inconnu : l'appelant strict refuse, la désignation
     attend (jamais de famille supposée).
+
+    `commits_out` (#3742) reçoit, pour chaque acteur conservé, les SHA écrits
+    dans les gels antérieurs ; il ne sert qu'à nommer les commits d'un refus de
+    gel et ne change aucune décision.
 
     #2924 B7 : `recover(sha)` est une source de réparation supplémentaire du
     # gel antérieur absent (le dépôt de l'agent, une autre origine) ; #3147
@@ -2373,6 +2393,14 @@ def _carried_from_previous(db, item: Mapping, milestone: Optional[Mapping],
                 continue
             carried.setdefault(actor, set()).update(
                 value for value in proven if value)
+            if commits_out is not None:
+                key = next((name for name in commits_out
+                            if name.lower() == actor.lower()), actor)
+                values = commits_out.setdefault(key, [])
+                for sha in written.get(actor) or ():
+                    value = str(sha or "").strip()
+                    if value and value not in values:
+                        values.append(value)
         for actor in review_commits:
             # #3335 : la trace « correcteur » exige la preuve de contenu même
             # quand le gel antérieur est un ancêtre de la tête (stored) ; un
@@ -2426,7 +2454,8 @@ def reading(db, item: Mapping, milestone: Optional[Mapping],
             families_out: Optional[dict] = None,
             base: str = "", head: str = "", target: str = "",
             recover=None, admitted_heads=(),
-            exclusions_out: Optional[list] = None) -> tuple[list, list, list]:
+            exclusions_out: Optional[list] = None,
+            commits_out: Optional[dict] = None) -> tuple[list, list, list]:
     """`(auteurs, inconnus, correcteurs)` de la plage gelée, même lecture pour tous.
 
     `reference` est l'auteur de référence déjà lu (`reference_author`) : la
@@ -2443,6 +2472,12 @@ def reading(db, item: Mapping, milestone: Optional[Mapping],
     par acteur en minuscules, l'ensemble des familles **prouvées** : une
     famille vide peut être une absence de preuve ou une ambiguïté, et
     l'appelant qui doit les distinguer ne peut pas la deviner.
+
+    `commits_out` (#3742) associe à chaque acteur des listes de SHA que cette
+    lecture lui attribue : la plage courante, puis les commits des gels
+    antérieurs qui ont porté sa famille jusqu'à cette tête. Il ne sert qu'à
+    nommer les commits d'un refus de gel ; aucune décision ne le lit, et son
+    absence ne change rien.
 
     Un commit sans reçu est attribué au committer d'adresse d'agent : un commit
     du titulaire de référence reste le sien ; un relecteur désigné reste
@@ -2540,6 +2575,17 @@ def reading(db, item: Mapping, milestone: Optional[Mapping],
     unknown: list[str] = []
     review_commits: dict[str, list[tuple[str, str]]] = {}
     proofs: dict[str, set[str]] = {}
+
+    def record_commit(actor: str, sha: str) -> None:
+        """#3742 : le commit attribué à un acteur, pour nommer un refus de gel."""
+        if commits_out is None or not actor or not sha:
+            return
+        key = next((name for name in commits_out
+                    if name.lower() == actor.lower()), actor)
+        values = commits_out.setdefault(key, [])
+        if sha not in values:
+            values.append(sha)
+
     for raw in commits or ():
         sha = str(raw or "").strip()
         if not sha:
@@ -2573,6 +2619,7 @@ def reading(db, item: Mapping, milestone: Optional[Mapping],
                 # a réellement tourné ; la famille de gel prend le relais
                 proven = actor_family(db, actor, stamp, families) or author_family
                 by_name.setdefault(actor, set()).add(proven)
+                record_commit(actor, sha)
                 proofs.setdefault(actor, set()).add(sha[:12])
                 continue
             if actor in reviewers:
@@ -2591,12 +2638,14 @@ def reading(db, item: Mapping, milestone: Optional[Mapping],
         proven = _family(receipt.get("harness"), families)
         if actor == author_name:
             by_name.setdefault(actor, set()).add(proven)
+            record_commit(actor, sha)
         elif actor in reviewers:
             # sa correction est un contenu de la tête (#2888) ; le seuil ne
             # décide que de la trace « correcteur de premier tour »
             review_commits.setdefault(actor, []).append((sha, proven))
         else:
             by_name.setdefault(actor, set()).add(proven)
+            record_commit(actor, sha)
     # #3335 : un correctif de relecteur ne pèse que s'il est encore dans la
     # tête. La promotion en auteur (#2888) et la trace « correcteur » suivent la
     # survie du contenu (#3220) : un commit de relecteur dont aucune ligne ne
@@ -2617,12 +2666,14 @@ def reading(db, item: Mapping, milestone: Optional[Mapping],
         authored = next((name for name in by_name
                          if name.lower() == author_name.lower()), "")
         if not authored:
-            written = commits_written_by(repo, commits, author_name, db)
+            written = commit_ids_written_by(repo, commits, author_name, db)
             if written is None:
                 unknown.extend(str(sha)[:12] for sha in commits if str(sha)[:12] not in unknown)
             elif written:
                 authored = author_name
                 by_name.setdefault(authored, set())
+                for sha in written:
+                    record_commit(authored, sha)
         if authored:
             for family in proven_reference.get(author_name.lower()) or ():
                 if family:
@@ -2648,9 +2699,10 @@ def reading(db, item: Mapping, milestone: Optional[Mapping],
             test_correctors.add(actor)
         else:
             by_name.setdefault(actor, set())
-            for _sha, proven in entries:
+            for sha, proven in entries:
                 if proven:
                     by_name[actor].add(proven)
+                record_commit(actor, sha)
         if actor in test_correctors or (not design and total <= REVIEWER_FIX_LINES):
             small_correctors.add(actor)
     # #2924 : les auteurs des gels antérieurs dont le contenu subsiste restent
@@ -2659,7 +2711,8 @@ def reading(db, item: Mapping, milestone: Optional[Mapping],
     carried, carried_unknown, carried_correctors = _carried_from_previous(
         db, item, milestone, commits, repo, families, base=base, head=head,
         provider=provider, strict=strict, target=target_sha, recover=recover,
-        admitted_heads=admitted_heads, exclusions_out=exclusions_out)
+        admitted_heads=admitted_heads, exclusions_out=exclusions_out,
+        commits_out=commits_out)
     unknown.extend(carried_unknown)
     for row in carried:
         values = row.get("families")

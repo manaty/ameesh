@@ -169,6 +169,12 @@ class Policy:
     #: #3554 : la comparaison base/tête d'un lot du canon, quand elle conclut
     #: à une baisse d'exigence (`required` vaut alors au moins 2)
     canon_lowering: Optional[dict] = None
+    #: #3742 : les drapeaux d'indépendance compilés au même commit que les
+    #: familles. Le gel refuse une tête où les familles d'auteurs prouvés
+    #: laissent moins de familles éligibles que d'avis requis ; les valeurs
+    #: viennent de la politique, jamais d'un repli en dur.
+    exclude_author_family: bool = True
+    distinct_families: bool = True
 
 
 @dataclass
@@ -198,6 +204,10 @@ class Inputs:
     #: {family: advance in points over its plan pace} (#2668); empty when no
     #: gauge reading is current, which leaves the load to decide
     advances: dict = field(default_factory=dict)
+    #: #3742 : SHA attribués à chaque acteur par la même lecture que les
+    #: auteurs (plage courante et gels antérieurs reportés). Le refus de gel
+    #: les nomme ; aucune décision ne les lit.
+    author_commits: dict = field(default_factory=dict)
 
 
 # --------------------------------------------------------------------------
@@ -318,7 +328,10 @@ def _policy(cfg, db, project: str, paths: Sequence[str]) -> Policy | Unavailable
                           risk=risk, required=required,
                           ref=str(getattr(loaded, "source", "") or
                                   "%s@%s" % (source.repo, commit)),
-                          commit=commit, source=source.repo)
+                          commit=commit, source=source.repo,
+                          exclude_author_family=bool(
+                              loaded.exclude_author_family),
+                          distinct_families=bool(loaded.distinct_families))
     except NoCanon as exc:
         return Unavailable(str(exc))
     why = "; ".join(errors[:4]) or "no canon declares a review policy for %r" % (project,)
@@ -1585,9 +1598,11 @@ def prepare(cfg, db, lot: int, *, freeze: Optional[Mapping] = None,
                              closed_hosts=closed_hosts)
     if unreadable:
         _note_unreadable(db, int(lot), str(item.get("state") or ""), unreadable)
+    author_commits: dict = {}
     authors, unknown, correctors = review_authors.reading(
         db, item, freeze, commits, repo, families=policy.families, trace=True,
-        base=start, head=frozen_sha, target=read_target)
+        base=start, head=frozen_sha, target=read_target,
+        commits_out=author_commits)
     return Inputs(item=item, freeze=freeze, repo=repo, base=start, paths=paths,
                   commits=commits, policy=policy, authors=authors,
                   unknown_authors=unknown, correctors=correctors,
@@ -1595,7 +1610,7 @@ def prepare(cfg, db, lot: int, *, freeze: Optional[Mapping] = None,
                   manual=manual, waiver=waiver,
                   manual_seats=_manual_seats(manual, listing, authors, families,
                                              correctors=correctors),
-                  advances=_advances(db))
+                  advances=_advances(db), author_commits=author_commits)
 
 
 #: #3572 : le texte de la note et l'erreur du bloc, passés par réglages locaux
@@ -2511,8 +2526,16 @@ def _manual_unavailable(cfg, tx, item: Mapping, freeze: Mapping,
 
 def _designate_in_transaction(cfg, tx, lot: int, *, milestone: Optional[Mapping],
                               threads: list, carried: Optional[Mapping] = None,
-                              reading: Optional[dict] = None, target=None) -> dict:
+                              reading: Optional[dict] = None, target=None,
+                              freezing: bool = False) -> dict:
     """The `on_frozen` body: all writes stay in the freeze's transaction.
+
+    `freezing` (#3742) : l'appel vient du jalon `frozen` lui-même, pas d'un
+    rejeu de désignation. Après la lecture qui précède la sélection, le gel est
+    refusé si les familles d'auteurs prouvés laissent moins de familles
+    éligibles que d'avis requis (canon §2) ; l'exception annule le jalon avec
+    la transaction. Un rejeu (`designate`) garde son comportement : il ne peut
+    pas refuser un gel déjà écrit et se contente de journaliser l'attente.
 
     `carried` (#2487) : le plan du report quand il couvre la tête gelée ; la
     désignation s'abstient alors (marque reportée, relecteurs gardés, aucun
@@ -2526,7 +2549,9 @@ def _designate_in_transaction(cfg, tx, lot: int, *, milestone: Optional[Mapping]
     reviewers already cover the required reviews, or when a `-none` waiver is
     in force. Every expected data problem is journaled and notified, never
     raised: a freeze is a fact of the lot's timeline and must not be lost to a
-    designation input.
+    designation input. Seule exception (#3742) : une tête dont les familles
+    d'auteurs prouvés rendent les avis requis impossibles est refusée avant
+    toute écriture de désignation, avec les commits à renvoyer à l'assigné.
 
     The selection writes inside a **savepoint**: an exception while the mails,
     the mark or the reviewer column are being written rolls the attempt back
@@ -2566,6 +2591,17 @@ def _designate_in_transaction(cfg, tx, lot: int, *, milestone: Optional[Mapping]
             _sync_reviewers(tx, item, freeze, [])
         return {"state": "unavailable", "reviewers": [], "freeze": freeze,
                 "why": inputs.why}
+    if freezing:
+        # #3742 : refus du gel quand les familles d'auteurs prouvés
+        # (correcteurs compris) laissent moins de familles éligibles que
+        # d'avis requis. Avant toute écriture de désignation ; l'exception
+        # annule le jalon et sa transaction. Un `-none` ou un report de
+        # verdicts (#2487) sont sortis plus haut et gardent leur cours : un
+        # report réutilise les avis d'une tête de contenu identique, dont les
+        # auteurs ne peuvent pas avoir augmenté.
+        from . import freeze_families
+
+        freeze_families.enforce(inputs)
     # #3554 : la baisse du canon est un fait du gel, journalisée même quand la
     # couverture manuelle dispense de désigner.
     _note_canon_lowering(tx, item, freeze, inputs)
@@ -2745,17 +2781,21 @@ def _notify_superseded_blocks(db, item: Mapping, freeze: Mapping, outcome: Mappi
 
 def designate_in_transaction(cfg, tx, lot: int, *, milestone: Optional[Mapping],
                              threads: list, carried: Optional[Mapping] = None,
-                             target=None) -> dict:
+                             target=None, freezing: bool = False) -> dict:
     """The `on_frozen` body, plus the superseded-block notification (#2681).
 
     The notification is best-effort: it runs after the designation writes, and
     an error there never loses the freeze or its designation. The gate rule
     (only the frozen head's verdicts) is unchanged; this only tells a reviewer
-    whose earlier block no longer blocks the new head."""
+    whose earlier block no longer blocks the new head. `freezing` (#3742) is
+    passed to the body: from the `frozen` milestone, a head its author families
+    make unreviewable raises before any designation write and rolls the
+    milestone back; a replay of an existing freeze leaves it False."""
     reading: dict = {}
     result = _designate_in_transaction(cfg, tx, lot, milestone=milestone,
                                        threads=threads, carried=carried,
-                                       reading=reading, target=target)
+                                       reading=reading, target=target,
+                                       freezing=freezing)
     try:
         item = work.get(tx, int(lot)) or {"id": int(lot)}
         _notify_superseded_blocks(tx, item, milestone or {}, result, threads,
@@ -2779,7 +2819,8 @@ def hook(cfg, outcome: Optional[dict] = None, *, carried: Optional[Mapping] = No
     def on_frozen(tx, milestone, threads):
         result = designate_in_transaction(cfg, tx, int(milestone["work_item_id"]),
                                           milestone=milestone, threads=threads,
-                                          carried=carried, target=target)
+                                          carried=carried, target=target,
+                                          freezing=True)
         if outcome is not None:
             outcome.clear()
             outcome.update(result)
