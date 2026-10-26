@@ -1989,6 +1989,36 @@ class WatcherTest(PgTestCase):
         self.assertEqual(len(alertes), 1)
         self.assertIn("backend-suite.yml", alertes[0]["detail"])
 
+    def test_dispatch_d_une_suite_qui_ne_suit_pas_la_base(self):
+        """#3686 : un `workflow_dispatch` refusé sur une base où la suite ne
+        tourne jamais autrement (manaty/nexlink main, 26/10 05:46Z) ne lève pas
+        `ci_main_red`, conclu ou en cours ; un dispatch rouge d'une suite qui
+        tourne aussi en push sur la base alerte comme avant."""
+        st = storage.of(self.db)
+        sha = "f6" * 20
+        # une ancienne PR dont la tête est main (synchronisation main →
+        # develop) ne fait pas suivre la base à la suite
+        st.ci.open_run(DEPOT, 2990, head_sha="f5" * 20, branch="main", event="pull_request",
+                       base="main", work_item_id=None, url=None, workflow="backend-suite.yml")
+        st.ci.conclude(DEPOT, 2990, "success")
+        # backend-suite.yml : dispatch seul sur main, refusé par sa garde
+        st.ci.open_run(DEPOT, 3001, head_sha=sha, branch="main", event="workflow_dispatch",
+                       base="main", work_item_id=None, url=None, workflow="backend-suite.yml")
+        st.ci.add_failure(DEPOT, 3001, run_attempt=1, part="job", test="backend",
+                          module="", status="echec", inherited=False, excerpt="",
+                          replay="", duration_s=None, failed_at=None)
+        self.assertEqual(ci.main_red(self.db), [])  # en cours : rien
+        st.ci.conclude(DEPOT, 3001, "failure")
+        self.assertEqual(ci.main_red(self.db), [])
+        self.assertEqual([a for a in exploitation.alerts(self.cfg, self.db)
+                          if a["type"] == "ci_main_red"], [])
+        # tests.yml tourne en push sur main (setUp, run 100) : son dispatch rouge compte
+        st.ci.open_run(DEPOT, 3002, head_sha=sha, branch="main", event="workflow_dispatch",
+                       base="main", work_item_id=None, url=None, workflow="tests.yml")
+        st.ci.conclude(DEPOT, 3002, "failure")
+        self.assertEqual([(r["run_id"], r["workflow"]) for r in ci.main_red(self.db)],
+                         [(3002, "tests.yml")])
+
     def test_main_rouge_execution_orpheline_ecartee(self):
         """#1453 N1 : une exécution de main jamais conclue (supprimée, l'API
         rend `{}`) qui porte un job rouge ne garde pas l'alerte quand une
