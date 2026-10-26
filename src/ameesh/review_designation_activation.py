@@ -74,6 +74,7 @@ import json
 import os
 import re
 import subprocess
+import sys
 import time
 import dataclasses
 from dataclasses import dataclass, field
@@ -1542,12 +1543,24 @@ def prepare(cfg, db, lot: int, *, freeze: Optional[Mapping] = None,
                   advances=_advances(db))
 
 
+#: #3572 : le texte de la note et l'erreur du bloc, passés par réglages locaux
+#: à la transaction (jamais interpolés dans le corps PL/pgSQL)
+_LOWERING_NOTE = "ameesh.canon_lowering_note"
+_LOWERING_ERROR = "ameesh.canon_lowering_error"
+
+
 def _note_canon_lowering(db, item: Mapping, freeze: Mapping, inputs: Inputs) -> None:
     """#3554 : la liste des fichiers abaissés au journal, une fois par tête.
 
     Best-effort : un journal qui refuse ne perd ni le gel ni sa désignation.
     La ligne porte le préfixe `canon-review-lowering:` et les commits exacts ;
-    `once=True` déduit un rejeu de la même tête.
+    un rejeu de la même tête ne la double pas.
+
+    #3572 : dans la transaction du gel, l'écriture passe par un bloc PL/pgSQL
+    à exception, une sous-transaction côté serveur sur les deux pilotes (sous
+    psql, la première erreur ferme la session : un SAVEPOINT client ne
+    rattraperait rien). La note est écrite, ou l'échec est consigné sur stderr
+    et la transaction du gel continue.
     """
     lowering = getattr(inputs.policy, "canon_lowering", None)
     if not lowering or not int(lowering.get("floor") or 0):
@@ -1556,9 +1569,39 @@ def _note_canon_lowering(db, item: Mapping, freeze: Mapping, inputs: Inputs) -> 
     if not text:
         return
     try:
-        work.note(db, int(item["id"]), text, actor=SENDER, once=True)
+        if db_mod.in_transaction(db):
+            _note_in_transaction(db, int(item["id"]), text)
+        else:
+            work.note(db, int(item["id"]), text, actor=SENDER, once=True)
     except Exception:  # noqa: BLE001 - la trace au mieux, le gel reste
         pass
+
+
+def _note_in_transaction(tx, lot: int, text: str) -> None:
+    """La note `once` du journal de baisse, isolée dans un bloc à exception."""
+    tx.query("SELECT set_config(%s, %s, true) AS note, set_config(%s, '', true)"
+             " AS error", (_LOWERING_NOTE, text, _LOWERING_ERROR))
+    body = (
+        "DECLARE v_note text := current_setting(%(note)s); "
+        "BEGIN "
+        "PERFORM 1 FROM work_items WHERE id = %(lot)d FOR NO KEY UPDATE; "
+        "INSERT INTO work_item_events (work_item_id, state, note, actor) "
+        "SELECT w.id, w.state, v_note, %(actor)s FROM work_items w "
+        "WHERE w.id = %(lot)d AND NOT EXISTS (SELECT 1 FROM work_item_events e "
+        "WHERE e.work_item_id = w.id AND e.note = v_note); "
+        "IF FOUND THEN "
+        "UPDATE work_items SET updated_at = now() WHERE id = %(lot)d; "
+        "END IF; "
+        "EXCEPTION WHEN query_canceled OR OTHERS THEN "
+        "PERFORM set_config(%(error)s, SQLERRM, true); "
+        "END" % {"note": db_mod.sql_literal(_LOWERING_NOTE), "lot": int(lot),
+                 "actor": db_mod.sql_literal(SENDER),
+                 "error": db_mod.sql_literal(_LOWERING_ERROR)})
+    tx.execute("DO " + db_mod.sql_literal(body))
+    rows = tx.query("SELECT current_setting(%s) AS error", (_LOWERING_ERROR,))
+    if rows and rows[0]["error"]:
+        print("ameesh: canon lowering journal of lot #%d not recorded: %s"
+              % (int(lot), rows[0]["error"]), file=sys.stderr)
 
 
 # --------------------------------------------------------------------------
