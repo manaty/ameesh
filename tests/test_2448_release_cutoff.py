@@ -912,6 +912,67 @@ class PacketTreeGreenTest(ReleaseFixtureMixin, unittest.TestCase):
         self.assertEqual(plan.previous["tag"], "v1.11.8")
         self.assertFalse(plan.kept_active, plan.kept_active)
 
+    def test_third_packet_on_a_release_on_a_green_tree_is_cut(self):
+        """#3641, B P1 de la revue : un 3e paquet fusionné sur V est coupé.
+
+        V (release sur M rouge à arbre vert) reste la base de coupe, mais
+        `tree_green` ne peut pas prouver la suite contre V, qui n'a pas de
+        suite propre. La preuve se rejoue contre B, le vert qui a validé
+        l'arbre de M : sans cela le plan est vide, « nothing new since
+        v1.11.8 », et le paquet P3 n'est jamais coupé.
+        """
+        base, _second, head, merge = self.second_packet()
+        reading = self.ci(green=(base, head), failed=(merge,))
+        suites = self.suites(base, head)
+        with mock.patch.dict(os.environ,
+                             {"GIT_COMMITTER_DATE": "2026-10-18T11:04:00+0200"}), \
+             mock.patch.object(release_cutoff, "ci_reading", side_effect=reading), \
+             mock.patch.object(release_cutoff, "suite_reading", side_effect=suites):
+            report = release_cutoff.execute(self.cfg, None, self.project,
+                                            now=_paris(11, 5))
+        self.assertEqual(report["result"], "released", report)
+        release_sha = report["release_sha"]
+
+        # 3e paquet : tête verte fusionnée --no-ff sur V (la cible est rouge,
+        # son arbre est celui de la tête du paquet).
+        self.git(self.seed, "fetch", "-q", "origin")
+        self.git(self.seed, "checkout", "-q", "-B", "main", "origin/main")
+        self.git(self.seed, "checkout", "-qb", "integration/paquet-h-3")
+        self.write("packet-3.txt", "packet 3\n")
+        head3 = self.commit("packet head 3")
+        self.git(self.seed, "push", "-q", "origin", "integration/paquet-h-3")
+        self.git(self.seed, "checkout", "-q", "main")
+        self.git(self.seed, "merge", "--no-ff", "-q", "integration/paquet-h-3",
+                 "-m", "Merge pull request #102 from manaty/integration/paquet-h-3")
+        merge3 = self.git(self.seed, "rev-parse", "HEAD")
+        self.git(self.seed, "push", "-q", "origin", "main")
+
+        def reading3(project, sha):
+            if sha in (base, head, head3):
+                return {"green": True}
+            if sha in (merge, merge3):
+                return {"green": False, "pending": [],
+                        "failed": ["tests [main]"], "missing": []}
+            return {"green": False}
+
+        def suites3(project, sha):
+            if sha in (head, head3):
+                return {"head": sha, "runs": self.packet_runs()}
+            if sha == base:
+                return {"head": sha, "runs": [self.reference_run()]}
+            return {"head": sha, "runs": []}
+
+        plan = self.plan(reading3, suites3)
+        self.assertTrue(plan.green, plan)
+        self.assertIsNotNone(plan.tree_green, plan)
+        self.assertEqual(plan.tree_green["head"], head3)
+        self.assertEqual(plan.tree_green["reference"], base)
+        self.assertEqual(plan.base, merge3)
+        self.assertFalse(plan.empty, plan)
+        self.assertEqual(plan.last_green, merge3)
+        self.assertIn("tree of %s" % merge3[:12], plan.notes)
+        self.assertIn(head3[:12], plan.notes)
+
 
 class HeadCiStateTextTest(unittest.TestCase):
     """#3641 : le rapport dit l'état lu de la CI de la tête."""

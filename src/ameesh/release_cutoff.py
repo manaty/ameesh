@@ -731,6 +731,10 @@ def last_green(repo: str, head: str, project: "ProjectRelease", limit: int = 100
     celui d'une tête de paquet verte (#3633) est le vert le plus récent. Son
     propre CI est absente (`[skip ci]`) et son parent M est rouge ; sans cette
     reconnaissance, la coupe suivante sautait V et repartait de B.
+
+    `evidence` reçoit la lecture du vert retenu et, quand c'est une release sur
+    arbre vert, `tree_reference` : le vert B dont la suite a prouvé l'arbre de
+    M. La coupe part de V, mais la preuve de suite se rejoue contre B.
     """
     cursor = head
     candidates: list[tuple[str, str, dict, dict]] = []
@@ -741,6 +745,10 @@ def last_green(repo: str, head: str, project: "ProjectRelease", limit: int = 100
             if chosen is not None:
                 if evidence is not None:
                     evidence.update(chosen[3])
+                    # #3641 : la référence de suite de `tree_green` est le
+                    # vert qui a prouvé l'arbre de M, jamais la release V
+                    # elle-même (sans suite) ; la coupe, elle, part de V.
+                    evidence["tree_reference"] = cursor
                 return chosen[0]
             if evidence is not None:
                 evidence.update(reading)
@@ -750,7 +758,11 @@ def last_green(repo: str, head: str, project: "ProjectRelease", limit: int = 100
             # an inheritance from its red first parent.
             reference = _latest_green_tag(repo, head, project)
             chosen = _release_on_green_tree(repo, project, candidates, reference)
-            return chosen[0] if chosen is not None else reference
+            if chosen is not None:
+                if evidence is not None:
+                    evidence["tree_reference"] = reference
+                return chosen[0]
+            return reference
         if _release_commit(repo, cursor):
             parent = _git(repo, "rev-parse", "--verify", "%s^1" % cursor)
             if not parent.returncode:
@@ -1481,7 +1493,11 @@ def build_plan(cfg, project: ProjectRelease, *, now: float,
         # #2692: a packet merge whose tree is the green packet head's content
         # is green — #3633 : whatever the target's own CI says (décision
         # owner #141353 a).
-        tree_proof = tree_green(project.repo, project, head, green_commit,
+        # #3641 : V (release sur tête rouge à arbre vert) est la base de
+        # coupe, mais la suite se prouve contre le vert B qui a validé l'arbre
+        # de sa tête M — V n'a pas de suite propre.
+        tree_reference = base_reading.get("tree_reference") or green_commit
+        tree_proof = tree_green(project.repo, project, head, tree_reference,
                                 reading=reading)
         if tree_proof is not None:
             green, green_commit = True, head
