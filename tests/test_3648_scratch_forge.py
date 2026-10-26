@@ -18,9 +18,11 @@ from __future__ import annotations
 
 import os
 import shutil
+from unittest import mock
 
 from ameesh import merge_pr, merge_queue, packet_reviews, plan_git, review_provenance, work
 
+from .test_1003_merge_pr import _Base
 from .test_3147_prior_freeze_forge import FAMILIES, _ForgeFixture, _has, _run
 
 
@@ -87,3 +89,27 @@ class ScratchForgeTest(_ForgeFixture):
         self.assertEqual(plan_git.forge_remote(clone), "origin")
         self.assertEqual(plan_git.forge_remote(self.bare_scratch(forge)), forge)
         self.assertIsNone(plan_git.forge_remote(self.bare_scratch()))
+
+
+class DirectMergeScratchForgeTest(_Base):
+    """#3656 : `direct_merge` donne sa forge au scratch de la porte.
+
+    Le correctif #3648 pose `ameesh.forge` dans `_scratch(fetch_url)` ; les
+    témoins ci-dessus couvrent le scratch seul et la lecture partagée, pas le
+    câblage du geste. Ici `direct_merge` complet (dry-run, vraies gardes, faux
+    `gh`) crée son scratch et le premier `_fetch` observe son `ameesh.forge` :
+    sans l'argument, il est vide et le test rougit.
+    """
+
+    def test_direct_merge_gives_its_scratch_the_read_forge(self):
+        observed = {}
+        real_fetch = merge_pr._fetch
+
+        def fetch(owner, fetch_url, *args, **kwargs):
+            observed["forge"] = plan_git.forge_remote(owner)
+            return real_fetch(owner, fetch_url, *args, **kwargs)
+
+        with mock.patch.object(merge_pr, "_fetch", side_effect=fetch):
+            out = self.merge(self.gh(), dry_run=True)
+        self.assertEqual(out["state"], "dry-run", out)
+        self.assertEqual(observed.get("forge"), self.origin)

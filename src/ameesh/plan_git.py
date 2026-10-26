@@ -564,6 +564,7 @@ def probe(repo: str, sha: str, target: str, *, lot: int | None = None,
     #1772 : un gel absent localement est rapatrié par un fetch explicite
     borné quand le clone est partiel ; sinon l'absence est conclue telle
     quelle."""
+    target = _target_ref(repo, target)
     head = _commit(repo, target)
     if head is None:
         raise MergeProbeError("target %r not found in %s" % (target, repo))
@@ -848,7 +849,7 @@ def rebase_identity(repo: str, reviewed: str, frozen: str, target: str) -> dict:
         return {"mechanical": False, "detail": "commit illisible"}
     if old == new:
         return {"mechanical": True, "detail": "même commit"}
-    tgt = _commit(repo, target) if target else None
+    tgt = _target_tip(repo, target) if target else None
     if tgt is None:
         return {"mechanical": False, "detail": "cible illisible"}
     bases = {}
@@ -1382,7 +1383,7 @@ def sync_merges(db, repo_dir: str, *, target: str | None = None, dry_run: bool =
     st = storage.of(db)
     if target is not None:
         try:
-            if _commit(repo_dir, target) is None:
+            if _target_tip(repo_dir, target) is None:
                 raise MergeProbeError("target %r not found in %s" % (target, repo_dir))
         except GitError as exc:
             raise MergeProbeError(str(exc)) from exc
@@ -1866,6 +1867,19 @@ def _tip(repo: str, branch: str) -> str | None:
     return None
 
 
+def _target_ref(repo: str, target: str) -> str:
+    """#3747 : résoudre une cible nue pour toutes les lectures de sa preuve."""
+    if not target.startswith(("origin/", "refs/")):
+        published = "refs/remotes/origin/" + target
+        if _commit(repo, published):
+            return published
+    return target
+
+
+def _target_tip(repo: str, target: str) -> str | None:
+    return _commit(repo, _target_ref(repo, target))
+
+
 def _published_tip(repo: str, branch: str) -> str | None:
     """#2444 : la tête publiée d'abord (`origin/<branche>`), la locale à
     défaut — un avis se confronte à ce que la forge porte, pas à un clone."""
@@ -2010,6 +2024,7 @@ def branch_probe(repo: str, branch: str, target: str, *, seen_head: str | None =
     été enregistré. Une tête qui était déjà dans la cible à cet instant n'a
     aucun commit propre : le reflog des refs de la cible le dit, et la preuve
     « vu-ancestor » est refusée (`_was_ancestor_at_seen`)."""
+    target = _target_ref(repo, target)
     head = _commit(repo, target)
     if head is None:
         raise MergeProbeError("target %r not found in %s" % (target, repo))
@@ -2692,6 +2707,7 @@ def _content_ancestor(repo: str, sha: str, target: str, *,
     frozen = full_commit_id(sha)
     if not frozen:
         return False
+    target = _target_ref(repo, target)
     head = _commit(repo, target)
     if head is None:
         return False
@@ -2805,6 +2821,7 @@ def _sweep_target(repo: str, lot: int, row: dict, branch: str | None, target: st
     restée hors de la cible (`_hash_ref_doubt`) ne ferme pas : `unproven`.
     Rend `{found, branch, implicit, row}` ; lève
     MergeProbeError/GitError comme l'examen d'origine."""
+    target = _target_ref(repo, target)
     freeze_sha = ((freeze or {}).get("sha") or "").strip() or None
     found = None
     implicit = False

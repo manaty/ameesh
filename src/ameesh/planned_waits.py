@@ -109,14 +109,17 @@ def is_hold_lookalike(text) -> bool:
 
 #: #3498 : un hold peut nommer son exécutant externe (bureau ou owner) et le
 #: geste attendu — `hold: attente bureau : <geste>`, `hold: attente owner :
-#: <geste>`, `hold: attente externe (bureau) : <geste>`. Une échéance
-#: facultative `(due 2026-10-25 12:00 UTC)` ou `(échéance …)`, avant ou après
-#: le geste, borne la relance ; sans elle, le débit relance après son seuil.
+#: <geste>`, `hold: attente externe (bureau) : <geste>`. #3773 : il peut aussi
+#: déclarer un tiers extérieur sans nommer le bureau ou l'owner — `hold:
+#: attente externe : revue Apple`. Le tiers est alors dans le geste et
+#: l'exécutant rendu est `externe`. Une échéance facultative `(due
+#: 2026-10-25 12:00 UTC)` ou `(échéance …)`, avant ou après le geste, borne la
+#: relance ; sans elle, le débit relance après son seuil.
 _EXTERNAL_HEAD = re.compile(
     r"(?<![\w])attente\s+"
     r"(?:externe\s*[\(\[]?\s*)?"
     r"(?:de\s+la\s+|du\s+|de\s+l'|de\s+)?"
-    r"(?P<who>bureau|owner|propri[eé]taire)"
+    r"(?P<who>bureau|owner|propri[eé]taire|externe)"
     r"\s*(?:[\)\]]\s*)?"
     r"(?P<tail>.*)", re.I | re.S)
 _EXTERNAL_DUE = re.compile(
@@ -128,15 +131,17 @@ _EXTERNAL_WAKE = re.compile(r"\[\s*réveil programmé\s*:\s*(?P<date>[^\]]+)\]",
                             re.I)
 _EXTERNAL_TOKEN = re.compile(r"(?:^|\s)wake_at=\S+", re.I)
 _EXTERNAL_EXECUTORS = {"bureau": "bureau", "owner": "owner",
-                       "propriétaire": "owner", "proprietaire": "owner"}
+                       "propriétaire": "owner", "proprietaire": "owner",
+                       "externe": "externe"}
 
 
 def external_hold(text) -> dict | None:
     """#3498 : la déclaration d'attente externe portée par un hold, ou None.
 
-    Rend `{executor, gesture, due}` : `executor` est `bureau` ou `owner`
-    (`propriétaire` est normalisé), `gesture` le texte attendu après le
-    séparateur, `due` la date déclarée (texte brut, pour
+    Rend `{executor, gesture, due}` : `executor` est `bureau`, `owner`
+    (`propriétaire` est normalisé) ou `externe` pour un tiers non nommé
+    (#3773, `hold: attente externe : revue Apple`), `gesture` le texte attendu
+    après le séparateur, `due` la date déclarée (texte brut, pour
     `debit.parse_wake_due`) ou None. Une déclaration sans geste n'est pas une
     déclaration : le hold reste une attente ordinaire, et rien n'est deviné
     depuis la prose (« attente du bureau depuis 3 h » ne déclare pas)."""

@@ -37,6 +37,7 @@ queue.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -1324,8 +1325,110 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
     return out
 
 
+#: #3761 : la porte des avis se relit à chaque passe d'alertes. Sa lecture
+#: Git (survie du contenu des correctifs, auteurs de la plage gelée) coûtait
+#: 4 à 5 min de CPU par passe et re-prouvait les mêmes faits tant que le gel,
+#: la cible et les jalons ne bougeaient pas. Le cache ne garde que le verdict
+#: booléen de la porte, indexé par les entrées dont il dépend ; une entrée
+#: périmée (TTL) ou dont la signature change est relue.
+#:
+#: Le cache ne nourrit que la passe d'alertes (`exploitation._slo_breaches`) :
+#: aucun chemin de fusion ne le lit. Une fusion refait toujours la porte
+#: complète ; un verdict mémorisé ne peut donc jamais autoriser un merge.
+GATE_CACHE_VERSION = "3761.2"
+#: Une famille d'acteur ou un reçu de provenance peut changer sans nouveau
+#: jalon : la porte se relit au plus tard après ce délai.
+GATE_CACHE_TTL_S = 3600.0
+#: Le document partagé reste petit : au-delà, les plus anciennes entrées
+#: partent (la porte se relit alors au prochain passage).
+GATE_CACHE_MAX_ENTRIES = 2000
+
+#: Les modules qui décident du verdict de porte. Leur contenu entre dans la
+#: signature : une règle changée par un lot (#3762 par exemple) ne doit jamais
+#: servir un verdict calculé par le code d'avant, même si les jalons et le gel
+#: sont identiques. C'est une empreinte du code réellement exécuté, pas le
+#: numéro de paquet (qui ne bouge qu'aux releases).
+_GATE_CODE_FILES = (
+    "merge_queue.py", "review_authors.py", "review_designation_activation.py",
+    "lot_class.py", "plan_git.py", "canon.py", "review_lot.py", "review.py",
+    "provenance_scope.py", "packet_reviews.py",
+)
+_GATE_CODE_FINGERPRINT: str | None = None
+
+
+def _gate_code_version() -> str:
+    """La version du code de la porte : numéro de paquet + empreinte source.
+
+    L'empreinte est calculée une fois par processus. Un arbre de test lancé par
+    `PYTHONPATH=src` et une installation déployée ont donc chacun la leur."""
+    global _GATE_CODE_FINGERPRINT
+    if _GATE_CODE_FINGERPRINT is not None:
+        return _GATE_CODE_FINGERPRINT
+    digest = hashlib.sha256()
+    root = os.path.dirname(os.path.abspath(__file__))
+    for name in _GATE_CODE_FILES:
+        digest.update(name.encode("utf-8"))
+        try:
+            with open(os.path.join(root, name), "rb") as fh:
+                digest.update(fh.read())
+        except OSError:
+            digest.update(b"unreadable")
+    try:
+        from . import version as ameesh_version
+        label = ameesh_version()
+    except Exception:  # noqa: BLE001 - version illisible : l'empreinte suffit
+        label = "unknown"
+    _GATE_CODE_FINGERPRINT = "%s+%s" % (label, digest.hexdigest()[:16])
+    return _GATE_CODE_FINGERPRINT
+
+
+def _gate_cache_signature(cfg, item, marks, repo, frozen, target, base,
+                          base_sha, klass=None) -> str:
+    """Les entrées dont le verdict de porte dépend, sans lecture Git.
+
+    Les jalons sont figés par identifiant et contenu (une annulation ou un
+    verdict ajouté change la signature) ; la cible et sa base entrent dans la
+    clé, car un commit déjà fusionné ne compte plus comme auteur (#3116). Le
+    canon et sa référence décident de la classe et des familles compilées ;
+    la version du code de la porte périme tout résultat d'avant une règle."""
+    item = dict(item or {})
+    mark_sig = sorted(
+        (str(mark.get("id") or ""), str(mark.get("kind") or ""),
+         str(mark.get("sha") or ""), str(mark.get("actor") or ""),
+         str(mark.get("verdict") or ""), str(mark.get("at_ts") or ""),
+         bool(mark.get("annulled")))
+        for mark in marks or () if isinstance(mark, Mapping))
+    return GATE_CACHE_VERSION + ":" + hashlib.sha256(json.dumps([
+        GATE_CACHE_VERSION,
+        _gate_code_version(),
+        str(item.get("id") or ""), str(item.get("app") or ""),
+        str(item.get("assignee") or ""), str(item.get("package_id") or ""),
+        str(item.get("branch_target") or ""), str(item.get("type") or ""),
+        str(repo or ""), str(frozen or ""), str(target or ""),
+        str(base or ""), str(base_sha or ""),
+        str(getattr(cfg, "canon", "") or ""),
+        str(getattr(cfg, "canon_ref", "") or ""),
+        str((klass or {}).get("class") or ""),
+        mark_sig,
+    ], sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+
+
+def _gate_cache_store(cache, lot, signature, ok, now: float) -> None:
+    """Retient un verdict concluant ; une lecture illisible ne se cache pas."""
+    if not isinstance(cache, dict) or not isinstance(ok, bool):
+        return
+    cache[str(lot)] = {"key": signature, "ok": bool(ok),
+                       "at": round(float(now), 3)}
+    if len(cache) > GATE_CACHE_MAX_ENTRIES:
+        oldest = sorted(cache, key=lambda key: float(
+            (cache.get(key) or {}).get("at") or 0.0))
+        for key in oldest[:len(cache) - GATE_CACHE_MAX_ENTRIES]:
+            cache.pop(key, None)
+
+
 def review_gate_for_item(db, cfg, item: dict, marks, *, klass=None,
-                         overview=None) -> dict | None:
+                         overview=None, gate_cache=None,
+                         now: float | None = None) -> dict | None:
     """La porte des avis du dernier gel d'un lot, lue comme la composition du
     paquet (`packet_candidates`) : dépôt retrouvé par le commit gelé (#2559,
     l'hôte qui lit le lot n'est pas toujours celui de son auteur), gel résolu
@@ -1334,11 +1437,19 @@ def review_gate_for_item(db, cfg, item: dict, marks, *, klass=None,
     `overview` : les lignes de `registry.overview` déjà lues par l'appelant
     (une passe SLO sur N lots = une lecture, #2564) ; `None` les relit.
 
+    `gate_cache` (#3761) : dictionnaire de verdicts déjà lus, porté par l'état
+    de la passe d'alertes. Une signature identique et fraîche rend le verdict
+    sans relire Git ; une entrée absente, périmée ou de signature différente
+    relit la porte et remplace l'entrée. `None` garde la lecture complète.
+    Seule `exploitation._slo_breaches` passe un cache : le feu, la file et le
+    paquet l'appellent sans, donc une fusion ne lit jamais un verdict mémorisé.
+
     Rend None quand la lecture n'est pas concluante (pas de gel, dépôt
     introuvable, classe en doute sans chemin lisible) : l'appelant ne doit
     jamais lire None comme une porte ouverte. Lecture seule."""
     from . import lot_class
 
+    now = time.time() if now is None else float(now)
     freeze = plan_git.latest_freeze(marks or ())
     frozen = str((freeze or {}).get("sha") or "").strip()
     repo, resolved = (lot_class.repo_for_freeze(db, cfg, item, frozen,
@@ -1354,8 +1465,25 @@ def review_gate_for_item(db, cfg, item: dict, marks, *, klass=None,
         target = lot_class.default_base(cfg, item, repo) if repo else None
         base = _class_base(repo, target) if target else None
         base_sha = plan_git._commit(repo, base) if base else None
+    except Exception:  # noqa: BLE001 - une lecture ratée ne conclut pas
+        return None
+    lot = int((item or {}).get("id") or 0)
+    signature = _gate_cache_signature(cfg, item, marks, repo, frozen, target,
+                                      base, base_sha, klass) \
+        if gate_cache is not None else None
+    if gate_cache is not None:
+        entry = gate_cache.get(str(lot))
+        if isinstance(entry, dict) and isinstance(entry.get("ok"), bool) \
+                and entry.get("key") == signature:
+            try:
+                age = now - float(entry.get("at"))
+            except (TypeError, ValueError):
+                age = None
+            if age is not None and 0.0 <= age <= GATE_CACHE_TTL_S:
+                return {"ok": bool(entry.get("ok")), "cached": True}
+    try:
         klass = klass or lot_class.of_lot(
-            db, int((item or {}).get("id") or 0), cfg=cfg, item=item,
+            db, lot, cfg=cfg, item=item,
             repo=repo or None, head=frozen or None, milestones=marks or None,
             base=base, base_sha=base_sha)
     except Exception:  # noqa: BLE001 - une lecture ratée ne conclut pas
@@ -1368,11 +1496,14 @@ def review_gate_for_item(db, cfg, item: dict, marks, *, klass=None,
     if not frozen:
         return None
     try:
-        return review_gate(db, marks or [], frozen,
+        gate = review_gate(db, marks or [], frozen,
                            repo=klass.get("repo") or repo or None,
                            klass=klass, item=item, cfg=cfg, target=target)
     except Exception:  # noqa: BLE001 - une porte illisible ne conclut pas
         return None
+    if gate_cache is not None and isinstance(gate, dict):
+        _gate_cache_store(gate_cache, lot, signature, gate.get("ok"), now)
+    return gate
 
 
 def _remote_branch(name: str) -> str:

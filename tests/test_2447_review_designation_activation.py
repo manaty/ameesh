@@ -219,6 +219,24 @@ class _ActivationFixture:
             " VALUES (%s, %s, %s, to_timestamp(%s))",
             (agent, harness, "s-" + harness, stamp))
 
+    def four_families(self):
+        """Un canon à quatre familles, dont une sans agent disponible.
+
+        Les témoins de provenance (#2721/#2755/#3584) construisent une tête à
+        deux familles d'auteurs et deux avis requis : depuis #3742 le gel
+        refuse cette tête. La famille supplémentaire garde la tête relisible
+        (deux familles éligibles) tout en laissant la désignation attendre la
+        capacité, ce que ces témoins vérifient.
+        """
+        text = MECHANICS.replace(
+            "families: [claude, codex, deepseek]",
+            "families: [claude, codex, deepseek, gemini]")
+        self.canon = _Canon(
+            os.path.join(self.tmp, "canon-4-" + self._testMethodName),
+            mechanics=text)
+        self.cfg = dataclasses.replace(self.cfg, canon=self.canon.root,
+                                       canon_ref="HEAD")
+
     def freeze(self, *, cfg=None, hook=None):
         threads: list = []
         outcome: dict = {}
@@ -824,6 +842,7 @@ class ActivationTest(_ActivationFixture, PgTestCase):
         committer dit qui a réécrit. Le relecteur r2/codex devient donc auteur
         de sa correction (> 50 lignes), avec sa famille de tour : il ne peut
         pas relire son propre contenu."""
+        self.four_families()
         self.repo.git("checkout", "-q", "-B", "amend", self.base)
         self.repo.write("src/ameesh/work.py", "A\n" * 10)
         self.repo.commit("A", agent="author")
@@ -858,6 +877,7 @@ class ActivationTest(_ActivationFixture, PgTestCase):
         celle de tout auteur, et il ne couvre aucun siège, même manuel. La
         sélection attend une famille indépendante ; elle ne désigne pas r2 sur
         sa propre correction (#2739), ni un autre agent codex (#2888)."""
+        self.four_families()
         self.repo.git("checkout", "-q", "-B", "small-amend", self.base)
         self.repo.write("src/ameesh/work.py", "A\n" * 5)
         self.repo.commit("A", agent="author")
@@ -922,6 +942,7 @@ class ActivationTest(_ActivationFixture, PgTestCase):
         familles est exclue, et la désignation partielle (#3596) pourvoit le
         siège claude disponible en attendant l'autre famille.
         """
+        self.four_families()
         self.repo.git("checkout", "-q", "-B", "rotation", self.base)
         stamp = str(int(time.time()) - 120) + " +0000"
         self.repo.dry.update(GIT_AUTHOR_DATE=stamp, GIT_COMMITTER_DATE=stamp)
