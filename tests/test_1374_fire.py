@@ -1735,6 +1735,17 @@ class CompleteAuthorsTest(unittest.TestCase):
                for entry in authors}
         self.assertEqual(got.get("author"), ("deepseek", ()))
         self.assertEqual(got.get("rev1"), ("", ["claude", "codex"]))
+        # Sans famille restante hors de l'ensemble, la porte se ferme : ni
+        # rev1 (co-auteur, et exclu par son nom) ni rev2 (claude) ne comptent.
+        marks = _marks(_mark("frozen", second), _verdict("rev1", sha=second),
+                       _verdict("rev2", sha=second))
+        with mock.patch.object(merge_queue, "actor_family", side_effect=family):
+            gate = merge_queue.review_gate(
+                None, marks, second, item=item, families=FAM.values(),
+                klass={"class": "sensitive"}, required=1, authors=authors,
+                authors_complete=True)
+        self.assertFalse(gate["ok"], gate["why"])
+        self.assertEqual(gate["accepted"], [])
 
     def test_a_malformed_receipt_refuses_instead_of_the_git_fallback(self):
         # R8 B de cx2 : strict=True fait d'un reçu contradictoire une erreur,
