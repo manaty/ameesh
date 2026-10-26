@@ -155,6 +155,10 @@ class Budget:
         self.clock = clock
         self.deadline = clock() + seconds
 
+    def remaining(self) -> float:
+        """Seconds left before the deadline (0 once it is reached)."""
+        return max(0.0, self.deadline - self.clock())
+
     def expired(self) -> bool:
         return self.clock() > self.deadline
 

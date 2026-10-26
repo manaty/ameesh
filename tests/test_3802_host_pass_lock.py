@@ -20,8 +20,8 @@ import unittest
 from unittest import mock
 
 from ameesh import (build_artifacts, exploitation, housekeeping as hk,
-                     housekeeping_archive, housekeeping_discovery as discovery,
-                     mesh_cli, storage)
+                     housekeeping_archive, housekeeping_clones as clones,
+                     housekeeping_discovery as discovery, mesh_cli, storage)
 from ameesh.housekeeping import HOST_PASS_ALERT_AFTER_S, PassBudget, _PassExpired
 from ameesh.platform import session_lock
 
@@ -364,6 +364,103 @@ class RemovalBudgetTest(unittest.TestCase):
                                          retention_s=3600.0,
                                          deadline=time.monotonic() - 1)
         self.assertFalse(os.path.isdir(root))
+
+    def test_each_git_call_asks_for_a_fresh_timeout(self):
+        seen = []
+
+        def fake_git(path, *args, timeout=None):
+            seen.append(timeout)
+            return subprocess.CompletedProcess(args, 0, b"", b"")
+
+        delays = iter([30.0, 20.0])
+        with mock.patch.object(housekeeping_archive, "_git", side_effect=fake_git):
+            self.assertEqual(housekeeping_archive.untracked_files(
+                self.dir, (), timeout=lambda: next(delays)), [])
+        self.assertEqual(seen, [30.0, 20.0])
+
+    def test_a_large_ignored_tree_stops_when_the_deadline_passes_inside_it(self):
+        """#3802 B1/cx2 : l'échéance est contrôlée pendant le walk réel des
+        fichiers ignorés, pas seulement avant de le commencer."""
+        wt = os.path.join(self.dir, "wt")
+        ignored = os.path.join(wt, "ignored")
+        os.makedirs(ignored)
+        for index in range(40):
+            folder = os.path.join(ignored, "d%02d" % index)
+            os.makedirs(folder)
+            with open(os.path.join(folder, "f.txt"), "w") as fh:
+                fh.write("x\n")
+        with open(os.path.join(wt, ".gitignore"), "w") as fh:
+            fh.write("ignored/\n")
+        subprocess.run(["git", "init", "-q", wt], check=True, capture_output=True)
+        subprocess.run(["git", "-C", wt, "add", ".gitignore"], check=True,
+                       capture_output=True)
+        subprocess.run(["git", "-C", wt, "-c", "user.name=t",
+                        "-c", "user.email=t@example.invalid",
+                        "commit", "-qm", "init"], check=True, capture_output=True)
+        clock = [0.0]
+        calls = [0]
+        original = housekeeping_archive._excluded
+
+        def excluded(top, rel, rules):
+            calls[0] += 1
+            if calls[0] >= 5:
+                clock[0] = 100.0          # deadline 60 s: passed from now on
+            return original(top, rel, rules)
+
+        root = os.path.join(self.dir, "archives")
+        with mock.patch.object(housekeeping_archive.time, "monotonic",
+                               side_effect=lambda: clock[0]), \
+                mock.patch.object(housekeeping_archive, "_excluded",
+                                  side_effect=excluded):
+            with self.assertRaises(housekeeping_archive.ArchiveRefused) as caught:
+                housekeeping_archive.archive(wt, root, retention_s=3600.0,
+                                             deadline=60.0)
+        self.assertIn("pass budget reached", str(caught.exception))
+        self.assertFalse(os.path.isdir(root))
+        self.assertLess(calls[0], 10)     # the walk stopped before the 40 folders
+
+    def test_the_removal_recheck_gets_the_remaining_time(self):
+        path = os.path.join(self.dir, "clone")
+        os.mkdir(path)
+        seen = []
+
+        class _Spent:
+            def __init__(self, seconds):
+                self.given = seconds
+
+            def remaining(self):
+                return 1.25
+
+        def fake_remove(worktree, root, parent_id, *, journal, avoid, budget,
+                        check, kind):
+            self.assertEqual(budget.given, 10.0)
+            check()
+            return {"bytes": 0, "left": [], "errors": [], "stopped": False,
+                    "trash": ""}
+
+        def fake_check(path, cfg, rules, allow, roots, agents, budget_s=None):
+            seen.append(budget_s)
+            return "kept"
+
+        with mock.patch.object(clones.build_artifacts, "Budget", _Spent), \
+                mock.patch.object(clones.build_artifacts, "remove_worktree_dir",
+                                  side_effect=fake_remove), \
+                mock.patch.object(clones, "_removal_check", side_effect=fake_check):
+            outcome, freed, note = clones._remove(
+                path, cfg=None, rules=(), allow=(), roots=(self.dir,), agents={},
+                lock_path=self.lock_path, journal_path=self.journal_path,
+                skip_roots=(), budget_s=10.0)
+        self.assertEqual(seen, [1.25])
+        self.assertEqual((outcome, freed), ("removed", 0))
+
+    def test_a_budget_remaining_is_the_time_left(self):
+        clock = [5.0]
+        budget = build_artifacts.Budget(10.0, clock=lambda: clock[0])
+        self.assertEqual(budget.remaining(), 10.0)
+        clock[0] = 12.0
+        self.assertEqual(budget.remaining(), 3.0)
+        clock[0] = 20.0
+        self.assertEqual(budget.remaining(), 0.0)
 
 
 class WorktreesCursorTest(unittest.TestCase):

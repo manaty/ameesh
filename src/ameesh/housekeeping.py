@@ -3930,7 +3930,10 @@ def _worktree_pass(db, host: str, *, dry_run: bool,
                     "command": "git -C %s status ; git -C %s log --all --not --remotes"
                                % (shlex.quote(path), shlex.quote(path))}))
             continue
-        size = size_of(path)
+        # #3802 B1 (cx2) : le relevé d'octets du retrait est borné par le
+        # temps qui reste, réserve déduite — il ne parcourt pas l'arbre entier
+        # sous host-pass.
+        size = size_of(path, budget=_phase_budget(budget, reserve_s))
         plan.append(dict(base, action="retrait", bytes=size, detail=why))
         if dry_run:
             continue

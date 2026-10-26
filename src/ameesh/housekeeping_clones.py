@@ -590,8 +590,10 @@ def _remove(path: str, *, cfg, rules, allow, roots, agents, lock_path, journal_p
             return "garde", 0, "directory unreadable"
 
         def check() -> str:
+            # #3802 B1 (cx2) : chaque inventaire de reprise reçoit le temps
+            # qui reste au retrait, pas le budget initial déjà consommé.
             return _removal_check(path, cfg, rules, allow, roots, agents,
-                                  budget_s=seconds)
+                                  budget_s=budget.remaining())
 
         try:
             done = build_artifacts.remove_worktree_dir(
@@ -663,8 +665,12 @@ def reap(db, host: str, cfg, *, roots, agents: dict, protected, dry_run: bool,
     dependencies_complete = True
     dependencies_why = ""
     if inventory_complete:
+        # #3802 B1 (cx2) : le walk des candidats a déjà consommé une part du
+        # passage ; l'inventaire des dépendances reçoit le temps qui reste,
+        # jamais le budget initial.
         copies, dependencies_complete, dependencies_why = _dependency_inventory(
-            cfg, roots, agents, rules, budget_s=seconds)
+            cfg, roots, agents, rules,
+            budget_s=max(0.0, deadline - time.monotonic()))
         if not dependencies_complete:
             skipped.append("clones: dependency inventory incomplete (%s); nothing "
                            "removed" % dependencies_why)

@@ -119,45 +119,93 @@ def _excluded(top: str, rel: str, rules) -> bool:
     return False
 
 
-def _walk(top: str, rel: str, rules, out: list) -> None:
+def _walk(top: str, rel: str, rules, out: set[str], *, check=None,
+          limit: int | None = None) -> None:
     """Files under the ignored directory `rel`, outside the exclusions; a
-    symbolic link is one entry, never followed."""
-    full = os.path.join(top, rel)
-    for current, dirs, files in os.walk(full):
-        crel = os.path.relpath(current, top)
-        keep = []
-        for name in dirs:
-            sub = os.path.join(crel, name)
-            if os.path.islink(os.path.join(current, name)):
-                out.append(sub)
-            elif not _excluded(top, sub, rules):
-                keep.append(name)
-        dirs[:] = keep
-        out.extend(os.path.join(crel, name) for name in files
-                   if not _excluded(top, os.path.join(crel, name), rules))
+    symbolic link is one entry, never followed.
+
+    `check` is called while walking, at every directory and entry: a large
+    ignored tree cannot outlive the pass budget (#3802 B1, cx2). `limit`
+    stops the walk as soon as more than that many distinct entries are
+    found, so the caller's `max_files` refusal does not wait for the whole
+    tree either."""
+    pending = [rel]
+    while pending:
+        crel = pending.pop()
+        try:
+            with os.scandir(os.path.join(top, crel)) as entries:
+                for entry in entries:
+                    if check is not None:
+                        check()
+                    name = entry.name
+                    sub = os.path.join(crel, name)
+                    try:
+                        link = entry.is_symlink()
+                        is_dir = entry.is_dir(follow_symlinks=False)
+                        target_dir = link and entry.is_dir(follow_symlinks=True)
+                    except OSError:
+                        link, is_dir, target_dir = False, False, False
+                    if is_dir and not link:
+                        if not _excluded(top, sub, rules):
+                            pending.append(sub)
+                    elif link and target_dir:
+                        # a symbolic link is one entry, never followed
+                        out.add(sub)
+                    elif not _excluded(top, sub, rules):
+                        out.add(sub)
+                    if limit is not None and len(out) > limit:
+                        raise ArchiveRefused(
+                            "%d untracked file(s) to archive (limit %d)"
+                            % (len(out), limit))
+        except OSError:
+            continue
+        if check is not None:
+            check()
 
 
-def untracked_files(path: str, rules, *, timeout: float = GIT_TIMEOUT) -> list[str]:
+def untracked_files(path: str, rules, *, timeout=GIT_TIMEOUT, check=None,
+                    max_files: int | None = None) -> list[str]:
     """Untracked and ignored files of the worktree `path`, relative, outside
-    the build output `rules` and `EXCLUDED_NAMES`."""
+    the build output `rules` and `EXCLUDED_NAMES`.
+
+    `timeout` is a delay or a callable returning the delay, evaluated before
+    each `git` call: a slow `git ls-files` never gets the delay already spent
+    by the previous one (#3802 B1, cx2). `check` and `max_files` bound the
+    walk of the ignored directories the same way."""
+    def _delay() -> float:
+        return float(timeout() if callable(timeout) else timeout)
+
     found = _names(_git(path, "ls-files", "-z", "--others", "--exclude-standard",
-                        timeout=timeout).stdout)
+                        timeout=_delay()).stdout)
     ignored = _names(_git(path, "ls-files", "-z", "--others", "--ignored",
-                          "--exclude-standard", "--directory", timeout=timeout).stdout)
-    out = [rel for rel in found if not _excluded(path, rel, rules)]
+                          "--exclude-standard", "--directory",
+                          timeout=_delay()).stdout)
+    out: set[str] = set()
+    for rel in found:
+        if check is not None:
+            check()
+        if not _excluded(path, rel, rules):
+            out.add(rel)
+    if max_files is not None and len(out) > max_files:
+        raise ArchiveRefused("%d untracked file(s) to archive (limit %d)" % (
+            len(out), max_files))
     for rel in ignored:
+        if check is not None:
+            check()
         if _excluded(path, rel, rules):
             continue
         if rel.endswith("/") and not os.path.islink(os.path.join(path, rel.rstrip("/"))):
-            _walk(path, rel.rstrip("/"), rules, out)
+            _walk(path, rel.rstrip("/"), rules, out, check=check, limit=max_files)
         else:
-            out.append(rel.rstrip("/"))
-    return sorted(set(out))
+            out.add(rel.rstrip("/"))
+    return sorted(out)
 
 
-def _size(path: str, files: list[str]) -> int:
+def _size(path: str, files: list[str], *, check=None) -> int:
     total = 0
     for rel in files:
+        if check is not None:
+            check()
         try:
             st = os.lstat(os.path.join(path, rel))
         except OSError as exc:
@@ -230,11 +278,12 @@ def archive(path: str, root: str, *, rules=(), lot=None, state: str = "",
         if changed and not patch:
             raise ArchiveRefused("%s changes absent from their patch (%s)" % (
                 layer, changed[0]))
-    files = untracked_files(path, rules, timeout=_timeout())
+    files = untracked_files(path, rules, timeout=_timeout, check=_check,
+                            max_files=max_files)
     if len(files) > max_files:
         raise ArchiveRefused("%d untracked file(s) to archive (limit %d)" % (
             len(files), max_files))
-    size = _size(path, files)
+    size = _size(path, files, check=_check)
     # dev3 N1: the patches count too
     if size + len(staged) + len(unstaged) > max_bytes:
         raise ArchiveRefused("%d bytes to archive (limit %d)" % (
