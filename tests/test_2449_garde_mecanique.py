@@ -53,6 +53,7 @@ def reader_keys() -> set[str]:
             ("prevalidation", mechanics._PREVALIDATION_KEYS),
             ("backlog", mechanics._BACKLOG_KEYS),
             ("staging", mechanics._STAGING_KEYS),
+            ("accounts", mechanics._ACCOUNTS_KEYS),
             # #3022 : `production.branch` est un bloc **par projet**, pas un
             # bloc du document global ; la garde doit le voir comme les autres.
             ("production", mechanics._PRODUCTION_KEYS)):
@@ -72,7 +73,7 @@ class SchemaCoverageTest(unittest.TestCase):
         self.assertEqual(set(mechanics._DOCUMENT_KEYS),
                          {"schema", "timezone", "cutoffs", "packets", "build",
                           "ci", "reviews", "merge", "prevalidation", "backlog",
-                          "staging", "projects"})
+                          "staging", "accounts", "projects"})
         # #3022 : les surcharges par projet peuvent porter un bloc qui n'est
         # pas un bloc du document global (`production`) ; il reste couvert par
         # `production.branch` ci-dessus, jamais ajouté au schéma du document.
@@ -123,6 +124,8 @@ POSITIVE = {
     "staging.waiting_lots_min": "WAITING_LOTS_MIN = 3\n",
     "staging.before_cutoff_seconds": "BEFORE_CUTOFF_SECONDS = 1200\n",
     "staging.before_packet_seconds": "BEFORE_PACKET_SECONDS = 600\n",
+    "accounts.pace_multipliers": 'PACE_MULTIPLIERS = {"codex": {"primaire": 2}}\n',
+    "accounts.underused_loss": "UNDERUSED_LOSS = 0.5\n",
     "projects": 'PROJECT_OVERRIDES = {"ameesh": {"build": {"max_in_build": 3}}}\n',
     "production.branch": 'production_branch = "main"\n',
 }
