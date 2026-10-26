@@ -36,7 +36,11 @@ externe et le geste attendu (`hold: attente bureau : …`,
 externes », avec une relance à cet exécutant — à l'échéance déclarée
 (`(due 2026-10-25 12:00 UTC)`), sinon après le seuil du débit — et non à
 l'agent. Une attente externe, même échue, ne fait pas sortir `--check` 2 : le
-rapport la relance à chaque passage.
+rapport la relance à chaque passage. #3585 : un hold (ou un réveil) posé
+**après** le jalon terminal d'un lot `closed` ou `delivered` est une note
+périmée sur un lot fermé — il n'entre ni dans les holds, ni dans les attentes,
+ni dans `--check` ; seul un lot `merged`, qui peut encore attendre son
+déploiement, garde sa retenue de fermeture (#3497).
 
 Un lot relu (tous ses avis rendus) dont `branch_target` est la branche d'un
 autre lot **ouvert** n'est pas une attente de paquet : il ne peut entrer
@@ -400,6 +404,25 @@ def _latest_freeze(milestones: list[dict]) -> dict | None:
                                        int(m.get("id") or 0)))
 
 
+#: états terminaux (le jalon, pas seulement la colonne)
+_TERMINAL_STATES = ("merged", "closed", "delivered")
+#: seul un lot dont le dernier jalon terminal est `merged` peut encore
+#: attendre un déploiement (retenue de fermeture #3497). `closed` (abandonné,
+#: remplacé) et `delivered` sont finaux : une note `hold:` posée après eux est
+#: une note périmée sur un lot fermé, jamais une attente due (#3585).
+_CLOSURE_HOLD_KIND = "merged"
+
+
+def _terminal(milestones: list[dict]) -> dict | None:
+    """Le dernier jalon terminal (`merged`, `closed`, `delivered`), ou None."""
+    terminals = [m for m in milestones or ()
+                 if m.get("kind") in _TERMINAL_STATES]
+    if not terminals:
+        return None
+    return max(terminals, key=lambda m: (float(m.get("at_ts") or 0.0),
+                                         int(m.get("id") or 0)))
+
+
 def _terminal_at(milestones: list[dict]) -> float | None:
     """L'instant du dernier jalon terminal (`merged`, `closed`, `delivered`).
 
@@ -408,17 +431,14 @@ def _terminal_at(milestones: list[dict]) -> float | None:
     sur des lots de septembre) ne rouvre pas une revue. Une correction
     `merged → build` est lue dans le journal (`_reopened`), jamais dans une
     colonne périmée."""
-    moments = [float(m.get("at_ts") or 0.0) for m in milestones
-               if m.get("kind") in ("merged", "closed", "delivered")]
-    return max(moments) if moments else None
+    terminal = _terminal(milestones)
+    return None if terminal is None else float(terminal.get("at_ts") or 0.0)
 
 
 #: états d'une vraie reprise de revue : le lot retravaille sa tête
 _OPEN_STATES = ("intake", "build", "qa")
 #: états d'une retenue de fermeture : le contenu est déjà dans la cible
 _CLOSURE_STATES = ("blocked", "waiting_human")
-#: états terminaux (le jalon, pas seulement la colonne)
-_TERMINAL_STATES = ("merged", "closed", "delivered")
 
 
 def _reopened(events: list[dict], terminal_ts: float | None) -> bool:
@@ -453,7 +473,10 @@ def _reopened(events: list[dict], terminal_ts: float | None) -> bool:
 
 def _closure_holds(events: list[dict], terminal_ts: float | None,
                    allowed=None) -> dict[str, dict]:
-    """Les retenues posées après le jalon terminal d'un lot fusionné (#3497).
+    """Les retenues posées après le jalon `merged` d'un lot fusionné (#3497).
+
+    L'appelant ne l'invoque que si le dernier jalon terminal est `merged` :
+    après `closed` ou `delivered`, une note `hold:` est périmée (#3585).
 
     Après une fusion, les écritures d'état du harnais (`merged` d'un
     review-after-merge, `blocked` de la fermeture retenue) ne sont pas des
@@ -840,13 +863,18 @@ def build(*, items: Iterable[Mapping[str, Any]],
         holds = {ident: _holds_from_events(values, allowed=closure_allowed)
                  for ident, values in events_by_lot.items()}
     hold_by_lot = {int(ident): dict(value) for ident, value in (holds or {}).items()}
-    # #3497 : après un jalon terminal, une retenue de fermeture survit aux
+    # #3497 : après un jalon `merged`, une retenue de fermeture survit aux
     # écritures d'état `merged`/`blocked` du harnais (voir `_closure_holds`).
     # Un lot vraiment rouvert (build/qa après la fusion) relève d'`active_holds` :
-    # ses changements d'état sont réels et lèvent la retenue.
+    # ses changements d'état sont réels et lèvent la retenue. Un lot `closed`
+    # ou `delivered` est final : une note de retenue posée après son jalon est
+    # périmée et n'est pas reconstruite (#3585).
     for ident, lot_milestones in milestones_by_lot.items():
-        terminal_ts = _terminal_at(lot_milestones)
-        if terminal_ts is None or _reopened(events_by_lot.get(ident, []), terminal_ts):
+        terminal = _terminal(lot_milestones)
+        if terminal is None or terminal.get("kind") != _CLOSURE_HOLD_KIND:
+            continue
+        terminal_ts = float(terminal.get("at_ts") or 0.0)
+        if _reopened(events_by_lot.get(ident, []), terminal_ts):
             continue
         closure = _closure_holds(events_by_lot.get(ident, []), terminal_ts,
                                  allowed=closure_allowed)
@@ -878,9 +906,13 @@ def build(*, items: Iterable[Mapping[str, Any]],
         lot_milestones = milestones_by_lot.get(ident, [])
         lot_events = events_by_lot.get(ident, [])
         freeze = _latest_freeze(lot_milestones)
-        terminal_ts = _terminal_at(lot_milestones)
+        terminal = _terminal(lot_milestones)
+        terminal_ts = (None if terminal is None
+                       else float(terminal.get("at_ts") or 0.0))
+        terminal_kind = None if terminal is None else str(terminal.get("kind") or "")
         if terminal_ts is not None and _reopened(lot_events, terminal_ts):
             terminal_ts = None
+            terminal_kind = None
         # #3447 : un lot réservé à un exécutant externe n'est pas « sans
         # assigné » ; il attend cet exécutant (bureau, owner), pas un agent.
         # La mesure reste lue sur le journal : la déclaration nommée par
@@ -962,8 +994,14 @@ def build(*, items: Iterable[Mapping[str, Any]],
         # holds (les lots mergés peuvent encore attendre un déploiement)
         lot_holds: list[dict] = []
         for hold in hold_by_lot.get(ident, {}).values():
-            if terminal_ts is not None and float(hold.get("since") or 0.0) <= terminal_ts:
-                continue
+            if terminal_ts is not None:
+                if float(hold.get("since") or 0.0) <= terminal_ts:
+                    continue
+                # Une note posée après une fermeture (`closed`, `delivered`)
+                # ne retient plus rien : seul un lot `merged` peut encore
+                # attendre un déploiement (#3585).
+                if terminal_kind != _CLOSURE_HOLD_KIND:
+                    continue
             note = str(hold.get("note") or "")
             age = _age(now, hold.get("since"))
             # #3498 : la déclaration externe est un geste de pilote ; un hold
@@ -1008,11 +1046,13 @@ def build(*, items: Iterable[Mapping[str, Any]],
             external_by_lot[ident] = chosen
             for entry in lot_holds:
                 entry["external_lot"] = True
-        # réveils
+        # réveils : un réveil posé après une fermeture est périmé, comme un
+        # hold (#3585) ; seul un lot `merged` peut encore en attendre un.
         wake = wake_state(lot_events)
         if (wake is not None and wake.get("due_ts") is not None
                 and not (terminal_ts is not None
-                         and float(wake.get("since") or 0.0) <= terminal_ts)):
+                         and (float(wake.get("since") or 0.0) <= terminal_ts
+                              or terminal_kind != _CLOSURE_HOLD_KIND))):
             entry = {
                 "lot": ident, "title": item.get("title") or "",
                 "app": item.get("app") or None,
@@ -1397,15 +1437,24 @@ _ITEMS_SQL = """
                -- B2 (cx1) : un lot fusionné peut encore porter un hold ou une
                -- réouverture après son jalon terminal (correctif non déployé,
                -- merged → build) ; `build` les lit, `read` doit le sélectionner.
+               -- #3585 : une réouverture sélectionne aussi un lot fermé, mais
+               -- un hold/réveil après `closed`/`delivered` est une note
+               -- périmée : seul un dernier jalon `merged` le fait lire.
                SELECT 1 FROM work_item_events e2
                 WHERE e2.work_item_id = w.id
                   AND e2.created_at > (
                         SELECT max(t.at) FROM work_item_milestones t
                          WHERE t.work_item_id = w.id
                            AND t.kind IN ('merged', 'closed', 'delivered'))
-                  AND (lower(left(e2.note, 21)) LIKE 'hold:%%'
-                       OR lower(left(e2.note, 20)) LIKE 'wake:%%'
-                       OR e2.state IN ('intake', 'build', 'qa'))))
+                  AND (e2.state IN ('intake', 'build', 'qa')
+                       OR ((lower(left(e2.note, 21)) LIKE 'hold:%%'
+                            OR lower(left(e2.note, 20)) LIKE 'wake:%%')
+                           AND (SELECT t.kind
+                                  FROM work_item_milestones t
+                                 WHERE t.work_item_id = w.id
+                                   AND t.kind IN ('merged', 'closed', 'delivered')
+                                 ORDER BY t.at DESC, t.id DESC
+                                 LIMIT 1) = 'merged'))))
      ORDER BY w.id
      LIMIT %s
 """

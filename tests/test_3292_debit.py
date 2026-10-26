@@ -304,6 +304,54 @@ class HoldsAndWakesTest(unittest.TestCase):
         self.assertEqual([row["lot"] for row in report["qa"]], [8])
         self.assertEqual(report["undeployed_holds"], [])
 
+    def test_hold_apres_la_fermeture_d_un_lot_est_ignore(self):
+        # #3585 : fermé (remplacé) à 16:31Z, hold de cx3 posé à 16:37Z. Un lot
+        # fermé n'a plus d'attente : ni hold, ni attente de plus de 2 h.
+        for kind in ("closed", "delivered"):
+            with self.subTest(kind=kind):
+                closed_at = T - 15 * H
+                report = run(
+                    items=[item(3585)],
+                    milestones=[{"work_item_id": 3585, "id": 11, "kind": kind,
+                                 "at_ts": closed_at}],
+                    events=[event(3585, 1, closed_at + 6 * 60,
+                                  "hold: attente du bureau pour appliquer le "
+                                  "correctif", actor="ameesh-cx3", state=kind)])
+                self.assertEqual(report["holds"], [])
+                self.assertEqual(report["totals"]["holds"], 0)
+                self.assertEqual(report["slow_waits"], [])
+                self.assertEqual(report["totals"]["slow_waits"], 0)
+                self.assertNotIn("#3585", debit.format_text(report))
+
+    def test_reveil_apres_la_fermeture_est_ignore(self):
+        # Même règle que le hold (#3585) : un réveil posé après la fermeture
+        # est une note périmée, pas une attente due.
+        closed_at = T - 15 * H
+        report = run(
+            items=[item(1)],
+            milestones=[{"work_item_id": 1, "id": 11, "kind": "closed",
+                         "at_ts": closed_at}],
+            events=[event(1, 1, closed_at + 60,
+                          "wake: reprise (due 2026-10-23 23:00 UTC)",
+                          state="closed")])
+        self.assertEqual(report["wakes"], [])
+        self.assertEqual(report["slow_waits"], [])
+
+    def test_un_lot_ferme_rouvert_garde_ses_holds(self):
+        # Une vraie réouverture (build après la fermeture) rend le lot actif :
+        # ses holds redeviennent des attentes, comme avant #3585.
+        closed_at = T - 15 * H
+        report = run(
+            items=[item(9)],
+            milestones=[{"work_item_id": 9, "id": 11, "kind": "closed",
+                         "at_ts": closed_at}],
+            events=[event(9, 1, closed_at, "fermé", state="closed"),
+                    event(9, 2, closed_at + H, "reprise", state="build"),
+                    event(9, 3, closed_at + 2 * H,
+                          "hold: reprise attendue", state="build")])
+        self.assertEqual([row["lot"] for row in report["holds"]], [9])
+        self.assertEqual([row["kind"] for row in report["slow_waits"]], ["hold"])
+
     def test_une_levee_explicite_leve_la_retenue_de_fermeture(self):
         merged_at = T - 5 * H
         report = run(
@@ -655,6 +703,39 @@ class WitnessTest(PgTestCase):
         self.assertIn((6000, "hold_undeployed"),
                       [(row["lot"], row["kind"]) for row in report["slow_waits"]])
         self.assertIn(6001, [row["lot"] for row in report["qa"]])
+
+    def test_read_ignore_un_hold_apres_la_fermeture(self):
+        # #3585 : le lot 6002 est fermé (remplacé) puis reçoit un hold ; il ne
+        # doit pas être lu ni compter dans les holds. Le 6003, fermé puis
+        # rouvert, reste lu (la réouverture est une activité réelle).
+        canons = self._seed()
+        baseline = debit.read(self.db, cfg=self.cfg, now=T, canons=[canons],
+                              installed="1.20.0", jobs=False)
+        self._item(6002, "ameesh-dev5")
+        self._milestone(6002, 26004, "frozen", T - 30 * H, sha="9" * 40)
+        self._milestone(6002, 26005, "closed", T - 20 * H, sha="9" * 40)
+        self._event(6002, 46006, T - 30 * H, "gel", state="qa")
+        self._event(6002, 46007, T - 20 * H, "fermé (remplacé)", state="closed")
+        self._event(6002, 46008, T - 10 * H,
+                    "hold: attente du bureau pour appliquer le correctif",
+                    actor="ameesh-cx3", state="closed")
+        self._item(6003, "ameesh-dev5")
+        self._milestone(6003, 26006, "frozen", T - 30 * H, sha="8" * 40)
+        self._milestone(6003, 26007, "closed", T - 20 * H, sha="8" * 40)
+        self._event(6003, 46009, T - 30 * H, "gel", state="qa")
+        self._event(6003, 46010, T - 20 * H, "fermé (remplacé)", state="closed")
+        self._event(6003, 46011, T - 10 * H, "reprise", state="build")
+        self._event(6003, 46012, T - 9 * H, "hold: reprise attendue",
+                    actor="pilote", state="build")
+        report = debit.read(self.db, cfg=self.cfg, now=T, canons=[canons],
+                            installed="1.20.0", jobs=False)
+        # Seul le lot rouvert est lu : pas de ligne de plus pour le fermé.
+        self.assertEqual(report["totals"]["lots"], baseline["totals"]["lots"] + 1)
+        self.assertNotIn(6002, [row["lot"] for row in report["holds"]])
+        self.assertNotIn(6002, [row["lot"] for row in report["slow_waits"]])
+        self.assertIn(6003, [row["lot"] for row in report["holds"]])
+        self.assertIn((6003, "hold"),
+                      [(row["lot"], row["kind"]) for row in report["slow_waits"]])
 
     def test_ci_par_job_lue_par_l_api_bornee(self):
         canons = self._seed()
