@@ -92,6 +92,29 @@ class ForcageGardeTest(_Base):
         self.assertIn("--force", str(ctx.exception))
         self.assertFalse((self._active() or {}).get("forced"))
 
+    def test_un_forcage_refuse_une_retenue_d_overage_publiee_par_un_autre_runner(self):
+        """#1883/#3755 : une retenue valide d'un autre runner est une preuve
+        d'overage que la lecture locale peut ne pas voir ; `--force` la lève
+        explicitement."""
+        items = self._items()
+        now = float(int(time.time()))
+        _journal(items[0].path, week=(34, now + 6 * DAY))
+        _journal(items[1].path, week=(5, now + 6 * DAY))
+        store = storage.of(self.db).accounts
+        store.hold(self.cfg.host, "codex", "secondaire", now + 600.0,
+                   "codex plan: in overage (billed beyond the plan)")
+        with self.assertRaises(accounts.AccountError) as ctx:
+            accounts.force(self.db, self.cfg.host, "codex", items, "secondaire",
+                           by="human:test", book=self._book(), now=now)
+        self.assertIn("held", str(ctx.exception))
+        self.assertIn("--force", str(ctx.exception))
+        self.assertIn("secondaire", store.holds(self.cfg.host, "codex"))
+        self.assertTrue(accounts.force(
+            self.db, self.cfg.host, "codex", items, "secondaire", by="human:test",
+            book=self._book(), now=now, until=now + 900.0, allow=True,
+            reason="sonde de jauge"))
+        self.assertEqual(store.holds(self.cfg.host, "codex"), {})
+
 
 class ForcageEcheanceTest(_Base):
     """Un forçage revient seul à l'automatique au terme de `--for`."""
