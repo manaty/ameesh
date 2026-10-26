@@ -2026,7 +2026,8 @@ def _carried_from_previous(db, item: Mapping, milestone: Optional[Mapping],
                            commits: Sequence[str], repo: str, families, *,
                            base: str = "", head: str = "", provider=None,
                            strict: bool = False, target: str = "",
-                           recover=None, admitted_heads=()) -> tuple[list, list, list]:
+                           recover=None, admitted_heads=(),
+                           exclusions_out: Optional[list] = None) -> tuple[list, list, list]:
     """Auteurs/correcteurs des gels antérieurs dont le contenu subsiste (#2924).
 
     Rend `(auteurs, inconnus, correcteurs)` à fusionner dans la lecture de la
@@ -2308,8 +2309,11 @@ def _carried_from_previous(db, item: Mapping, milestone: Optional[Mapping],
         earlier = _commits_between(repo, start, sha)
         if earlier is not None:
             earlier = _not_in_target(repo, earlier, target_sha)
-            for admitted in admitted_heads:
-                earlier = _not_in_target(repo, earlier, admitted)
+            # #3544 : l'exclusion du report se trace comme celle de la plage
+            # courante, avec le gel antérieur d'où vient la plage.
+            from . import provenance_scope
+            earlier = provenance_scope.exclude(repo, earlier, admitted_heads,
+                                               exclusions_out, carried_from=sha)
         if earlier is None:
             if strict:
                 raise review_provenance.ProvenanceError(
@@ -2411,7 +2415,8 @@ def reading(db, item: Mapping, milestone: Optional[Mapping],
             strict: bool = False, trace: bool = False,
             families_out: Optional[dict] = None,
             base: str = "", head: str = "", target: str = "",
-            recover=None, admitted_heads=()) -> tuple[list, list, list]:
+            recover=None, admitted_heads=(),
+            exclusions_out: Optional[list] = None) -> tuple[list, list, list]:
     """`(auteurs, inconnus, correcteurs)` de la plage gelée, même lecture pour tous.
 
     `reference` est l'auteur de référence déjà lu (`reference_author`) : la
@@ -2493,6 +2498,10 @@ def reading(db, item: Mapping, milestone: Optional[Mapping],
     porte du même véhicule. Leurs commits sont écartés de la plage courante
     et des gels antérieurs, comme ceux de la cible ; aucun autre tiers
     ne bénéficie de cette exclusion. Une lecture Git impossible ne retire rien.
+    Une portée est un gel (texte) ou la portée de `provenance_scope` (dict,
+    #3533). #3544 : `exclusions_out` reçoit les commits écartés du report des
+    gels antérieurs (`carried_from` = le gel reporté) ; la plage courante est
+    tracée par la porte.
 
     #3116 : `target` est la cible au moment de la lecture (commit ou ref). Un
     commit qui y est déjà entré ne compte ni comme auteur ni comme tiers du
@@ -2506,7 +2515,8 @@ def reading(db, item: Mapping, milestone: Optional[Mapping],
     target_sha = target_commit(repo, target) or target_commit(repo, base)
     commits = _not_in_target(repo, commits, target_sha)
     for admitted in admitted_heads:
-        commits = _not_in_target(repo, commits, admitted)
+        commits = _not_in_target(repo, commits, admitted["head"]
+                                 if isinstance(admitted, dict) else admitted)
     proven_reference: dict = dict(reference_families or {})
     if reference is None:
         reference = reference_author(db, item, milestone, families,
@@ -2638,7 +2648,7 @@ def reading(db, item: Mapping, milestone: Optional[Mapping],
     carried, carried_unknown, carried_correctors = _carried_from_previous(
         db, item, milestone, commits, repo, families, base=base, head=head,
         provider=provider, strict=strict, target=target_sha, recover=recover,
-        admitted_heads=admitted_heads)
+        admitted_heads=admitted_heads, exclusions_out=exclusions_out)
     unknown.extend(carried_unknown)
     for row in carried:
         values = row.get("families")

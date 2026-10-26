@@ -556,7 +556,7 @@ def _waiver(db, item) -> tuple:
 
 def _attribution_on_freeze(db, marks, frozen, *, repo, klass, item, families=None,
                            commits=None, strict=False, families_out=None,
-                           target="", admitted_heads=()):
+                           target="", admitted_heads=(), exclusions_out=None):
     """Les auteurs et correcteurs de la tête gelée (#2681/#2739/#2888).
 
     Lecture des commits exacts de la plage gelée et de leur provenance, la même
@@ -591,8 +591,8 @@ def _attribution_on_freeze(db, marks, frozen, *, repo, klass, item, families=Non
     authors, unknown, correctors = act.attribution_of_head(
         db, item, milestone, repo, base, frozen, families=families or (),
         commits=commits, strict=strict, families_out=families_out,
-        target=target or base, admitted_heads=tuple(
-            value["head"] if isinstance(value, dict) else value for value in admitted_heads))
+        target=target or base, admitted_heads=tuple(admitted_heads),
+        exclusions_out=exclusions_out)
     if unknown:
         raise ValueError("author provenance unknown for frozen commit(s): %s"
                          % ", ".join(unknown))
@@ -1036,7 +1036,10 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
                                              strict=True,
                                              families_out=proven_families,
                                              target=target or "",
-                                             admitted_heads=scopes)
+                                             admitted_heads=scopes,
+                                             exclusions_out=out["provenance_exclusions"])
+        # #3544 : le report des gels antérieurs complète la trace.
+        out["provenance_manifest"] = provenance_scope.manifest(out["provenance_exclusions"])
     except Exception as exc:  # noqa: BLE001 - une plage illisible ne conclut pas
         out["error"] = str(exc)
         out["why"] = ("no review verdict ok on the freeze %s (class: %s): the frozen "

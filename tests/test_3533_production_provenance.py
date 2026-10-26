@@ -112,6 +112,64 @@ class ProductionGateTest(PgTestCase):
             self.assertIn(sha, out["provenance_manifest"])
         self.assertIn("refs/heads/live", out["provenance_manifest"])
 
+    def carried_lot(self):
+        """#3544: a rewritten prior freeze returned production; the head did not."""
+        remote = os.path.join(self.tmp, "published.git")
+        subprocess.run(["git", "init", "--bare", "-q", remote], check=True)
+        self.repo.git("remote", "add", "origin", remote)
+        self.repo.git("checkout", "-q", "-b", "local-production", self.base)
+        self.repo.write("src/production.py", "published\n")
+        self.carried_published = self.repo.commit("published without receipt", agent="old-agent")
+        self.repo.git("push", "-q", "origin", "HEAD:refs/heads/live")
+        row = work.add(self.db, title="lot", app="ameesh", branch="lot/carry",
+                       branch_target="main")
+        self.lot = int(row["id"])
+        self.db.execute("UPDATE work_items SET assignee = 'author' WHERE id = %s", (self.lot,))
+        self.repo.git("checkout", "-q", "-b", "lot/carry-first", self.base)
+        self.repo.git("merge", "-q", "--no-ff", "--no-commit", "local-production")
+        self.repo.write("src/lot.py", "first\n")
+        self.prior = self.repo.commit("first freeze with production returned", agent="author")
+        self.receipt(self.prior, "author", "deepseek")
+        storage.of(self.db).work.add_milestone(self.lot, "frozen", sha=self.prior,
+                                               actor="author", verdict=None, note="")
+        self.repo.git("checkout", "-q", "-b", "lot/carry", self.base)
+        # The published content survives in the head, so the carry matters.
+        self.repo.write("src/production.py", "published\n")
+        self.repo.write("src/lot.py", "rewritten\n")
+        self.head = self.repo.commit("rewritten without the return", agent="author")
+        self.receipt(self.head, "author", "deepseek")
+        storage.of(self.db).work.add_milestone(self.lot, "frozen", sha=self.head,
+                                               actor="author", verdict=None, note="")
+        self.verdict("r_codex", self.head)
+        self.verdict("r_claude", self.head)
+        self.gate_cfg = types.SimpleNamespace(radar={"projects": {"ameesh": {
+            "repo": self.repo.root, "target": "main", "production_branch": "live"}}})
+
+    def lot_gate(self, cfg=True):
+        return merge_queue.review_gate(
+            self.db, work.milestones(self.db, self.lot), self.head, repo=self.repo.root,
+            klass={"class": "normal", "base_sha": self.base, "files": [{"path": "src/lot.py"}]},
+            item=work.get(self.db, self.lot), cfg=self.gate_cfg if cfg else None,
+            target=self.base)
+
+    def test_carried_prior_freeze_exclusion_is_traced(self):
+        self.carried_lot()
+        out = self.lot_gate()
+        self.assertTrue(out["ok"], out)
+        self.assertEqual(out["provenance_exclusions"], [{
+            "head": self.carried_published, "ref": "refs/heads/live",
+            "reason": "published-production", "commit": self.carried_published,
+            "carried_from": self.prior}])
+        self.assertIn("| %s | published-production (carried from freeze %s) |"
+                      % (self.carried_published, self.prior), out["provenance_manifest"])
+
+    def test_carried_published_commit_counts_without_production(self):
+        self.carried_lot()
+        out = self.lot_gate(cfg=False)
+        self.assertFalse(out["ok"], out)
+        self.assertIn(self.carried_published[:12], out["why"])
+        self.assertEqual(out["provenance_exclusions"], [])
+
     def test_remote_only_target_and_single_production_read(self):
         self.prepare()
         self.repo.git("update-ref", "refs/remotes/origin/develop", self.base)
