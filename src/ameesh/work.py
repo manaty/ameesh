@@ -2807,7 +2807,7 @@ def _declared_merge_commit(item: dict, sha: str, *, repo: str | None = None,
         if not commit:
             raise WorkError("commit %s not found in the lot's repository" % sha)
         target = item.get("branch_target") or plan_git.default_target(checkout)
-        head = plan_git._commit(checkout, target) if target else None
+        head = plan_git._target_tip(checkout, target) if target else None
         if not head:
             raise WorkError("merge target %r not found (fetch or configure ameesh.target)"
                             % target)
