@@ -3028,7 +3028,7 @@ class WorkItems(interface.WorkItems):
 
     # -- paquet de composition (#2443) ---------------------------------------
     #: la lecture commune aux deux méthodes : l'appartenance, le porteur et
-    #: son jalon de fusion, en une requête.
+    #: ses jalons de fusion et de gel, en une requête.
     _PACKET_SELECT = (
         "SELECT m.package_id, m.work_item_id, m.package_branch, m.base_sha,"
         "       m.head_sha, m.unit_sha, m.source_sha, m.frozen_sha,"
@@ -3038,7 +3038,12 @@ class WorkItems(interface.WorkItems):
         "       (SELECT ms.sha FROM work_item_milestones ms"
         "         WHERE ms.work_item_id = m.package_id AND ms.kind = 'merged'"
         "           AND ms.sha <> ''"
-        "         ORDER BY ms.at DESC, ms.id DESC LIMIT 1) AS package_merged_sha"
+        "         ORDER BY ms.at DESC, ms.id DESC LIMIT 1) AS package_merged_sha,"
+        # #3634 : la tête gelée du porteur, sans filtre sur son sha : le
+        # dernier gel fait autorité, même s'il ne nomme aucun commit.
+        "       (SELECT ms.sha FROM work_item_milestones ms"
+        "         WHERE ms.work_item_id = m.package_id AND ms.kind = 'frozen'"
+        "         ORDER BY ms.at DESC, ms.id DESC LIMIT 1) AS package_frozen_sha"
         "  FROM work_packet_members m JOIN work_items p ON p.id = m.package_id"
     )
 
