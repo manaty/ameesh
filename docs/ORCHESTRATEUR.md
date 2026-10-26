@@ -557,6 +557,24 @@ exclut le porteur ; sans cible explicite, le lot occupe conservativement le
 projet. `ameesh release packet-watch --dry-run` montre ce qui
 partirait.
 
+La composition est **scriptée** (`scripts/paquet-auto.py`, #3807) : le
+composeur n'enchaîne plus les outils à la main. Le script part d'un worktree
+jetable à la tête exacte d'`origin/<cible>`, y exécute `paquet-candidats.py`
+(le code de la cible), compose les candidats dans l'ordre rendu, écarte un
+conflit sans le résoudre, passe les contrôles locaux, écrit le manifeste,
+`packet record` et le contrôle d'inclusion, puis pousse la branche, ouvre la
+PR, gèle la tête et couronne le pilote. « Verdict non requis », la CI complète
+et le feu restent au pilote.
+
+```sh
+scripts/paquet-auto.py --target main --name h-20261027-01 --carrier 3808
+```
+
+`--local` s'arrête après le manifeste et `packet record` (contrôle sans
+poussée ni gel) ; `--replay <réf>` rejoue la table `## Composition` d'un
+manifeste gelé et compare l'arbre produit à celui de `<réf>` (témoin de
+fidélité, sans poussée ni écriture en base).
+
 La composition **part d'une liste calculée**, jamais des seuls courriers
 (#2404) : `scripts/paquet-candidats.py` lit tous les lots `qa` du projet (sans
 filtre d'assigné), leur gel effectif confronté à la tête **publiée**, les
