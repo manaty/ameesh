@@ -136,6 +136,28 @@ class TapNodeTest(unittest.TestCase):
         self.assertEqual([f["test"] for f in failures], ["réellement rouge"])
         self.assertIn("boom", failures[0]["excerpt"])
 
+    def test_ligne_numerotee_hors_ligne_ou_dans_extrait(self):
+        """#3783 B/P2 de la relecture : une ligne TAP citée n'est pas un test.
+
+        Seule une ligne qui *commence* par un résultat TAP après le préfixe
+        GitHub compte ; un extrait d'assertion ou un bloc YAML numéroté reste
+        du diagnostic, tandis qu'un vrai sous-test indenté est reconnu."""
+        text = "\n".join([
+            "error: expected not ok 1 - exemple",
+            "console.log('not ok 2 - exemple')",
+            "not ok 3 - vrai échec",
+            "  ---",
+            "  error: |-",
+            "    not ok 4 - dans le bloc YAML",
+            "  ...",
+            "    not ok 5 - sous-test indenté",
+            "      ---",
+            "      error: 'boom'",
+            "      ...",
+        ])
+        self.assertEqual([f["test"] for f in ci.tap_failures(text)],
+                         ["vrai échec", "sous-test indenté"])
+
     def test_nom_tap_echappe_et_ansi(self):
         text = "\x1b[31m2026-10-26T15:58:08.9024484Z not ok 7 - \\#686 : TMPDIR\x1b[0m\n"
         failures = ci.tap_failures(text)

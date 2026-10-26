@@ -216,9 +216,11 @@ JOB_PART = "job"
 #: qui n'a pas ce publisher (Nexlink) ne laissait aucun nom de test, et un
 #: rouge se lisait « no failed test seen » (résultat non concluant, canon §3).
 #: Une ligne TAP est préfixée par l'horodatage du log GitHub (`…Z `), et un
-#: sous-test est indenté ; le numéro est obligatoire (node numérote chaque
-#: test), ce qui évite de prendre une ligne d'extrait pour un test.
-TAP_NOT_OK_RE = re.compile(r"(?:^|\s)not ok\s+(\d+)\s*(?:-\s*)?(.*\S)\s*$")
+#: sous-test est indenté : la reconnaissance est ancrée au début de la ligne
+#: (après ce préfixe), sinon « error: expected not ok 1 - exemple » deviendrait
+#: un faux échec. Le numéro est obligatoire (node numérote chaque test), ce qui
+#: écarte les lignes d'extrait sans numéro.
+TAP_RESULT_RE = re.compile(r"^\s*(not ok|ok)\s+\d+\s*(?:-\s*)?(.*\S)\s*$")
 #: une ligne `not ok … # TODO` / `# SKIP` est une attente, pas un échec
 TAP_DIRECTIVE_RE = re.compile(r"\s+#\s*(?:TODO|SKIP)\b", re.IGNORECASE)
 #: échappements TAP (`\#`, `\\`) : le nom affiché est celui du test
@@ -487,36 +489,59 @@ def tap_failures(text: str) -> list[dict]:
     n'avait aucun nom de test : son rouge se lisait « no failed test seen »
     et passait pour non concluant (canon §3). Les lignes `not ok` de
     `node --test` sont la preuve négative ; `# TODO` et `# SKIP` restent des
-    attentes, et le numéro de test est obligatoire pour ne pas confondre une
-    ligne d'extrait avec un échec. Le bloc YAML qui suit (`error:`, `location`,
-    `stack`) fournit l'extrait et le fichier du test."""
+    attentes, et le numéro de test est obligatoire.
+
+    La reconnaissance est ancrée au début de la ligne TAP (après le préfixe
+    GitHub) : une ligne de console ou d'assertion qui contient « not ok 1 - … »
+    n'est pas un test. Le bloc de diagnostic YAML (`---` … `...`) qui suit un
+    résultat est traversé sans y lire de test : un extrait qui cite une ligne
+    TAP numérotée ne doit pas devenir une preuve négative (relecture #3783).
+    """
     out: list[dict] = []
     seen: dict[str, dict] = {}
     current: dict | None = None
+    in_yaml = False
+    after_result = False
     for raw in str(text or "").splitlines():
         line = _log_line(raw)
-        match = TAP_NOT_OK_RE.search(line)
+        stripped = line.strip()
+        if in_yaml:
+            if stripped == "...":
+                in_yaml = False
+                current = None
+                continue
+            if current is not None:
+                location = re.match(r"\s*location:\s*'?(.*?)'?\s*$", line)
+                if location:
+                    current["module"] = location.group(1).strip()
+                if len(current["excerpt"]) < TAP_EXCERPT_LINES:
+                    current["excerpt"].append(line.rstrip())
+            continue
+        match = TAP_RESULT_RE.match(line)
         if match is not None:
+            after_result = True
+            current = None
+            if match.group(1) != "not ok":
+                continue
             name = TAP_ESCAPE_RE.sub(r"\1", match.group(2).strip())
             if not name or TAP_DIRECTIVE_RE.search(match.group(2)) or name in seen:
-                current = None
                 continue
             current = {"test": name, "excerpt": [], "failed_at": _tap_failed_at(raw),
                        "module": ""}
             seen[name] = current
             out.append(current)
             continue
-        if current is None:
+        if stripped == "---" and after_result:
+            after_result = False
+            in_yaml = True
+            if current is not None:
+                current["excerpt"].append(line.rstrip())
             continue
-        stripped = line.strip()
-        if stripped == "..." or stripped.startswith(("# Subtest:", "ok ", "Bail out!")):
+        # Toute autre ligne (préambule, `# Subtest:`, sortie de console) ne
+        # peut pas être un résultat TAP ; elle ferme l'attente du bloc.
+        after_result = False
+        if current is not None and stripped.startswith(("# Subtest:", "ok ", "Bail out!")):
             current = None
-            continue
-        location = re.match(r"\s*location:\s*'?(.*?)'?\s*$", line)
-        if location:
-            current["module"] = location.group(1).strip()
-        if len(current["excerpt"]) < TAP_EXCERPT_LINES:
-            current["excerpt"].append(line.rstrip())
     for entry in out:
         entry["excerpt"] = "\n".join(entry["excerpt"]).strip()
     return out
