@@ -1024,6 +1024,60 @@ def fallback_readiness(ncfg: NotifyConfig, channel: Channel,
     return out
 
 
+def nexlink_crypto_problem(channel: Channel, env: dict | None = None,
+                           ncfg: "NotifyConfig | None" = None) -> str:
+    """#3619 : le manque de l'extra `crypto` d'un canal `nexlink`, ou ''.
+
+    Le chiffrement n'est pas optionnel : sans `cryptography`, un canal routé
+    ne s'active pas. Le repli `ntfy`/`slack` déclaré et utilisable le couvre
+    (#3536), comme pour `role timers --check`. Le secret du canal primaire
+    n'est pas regardé : ce contrôle porte sur la dépendance de l'hôte, pas
+    sur une credential (#3402).
+    """
+    if channel.kind != "nexlink" or nexlink_alerts.crypto_available():
+        return ""
+    env = dict(os.environ if env is None else env)
+    fallback = (ncfg.channels.get(str(channel.options.get("fallback") or ""))
+                if ncfg is not None else None)
+    if (fallback is not None and fallback.name != channel.name
+            and not remote_push_problem(fallback, env)):
+        return ""
+    return ("the `cryptography` module is missing (install the "
+            "`ameesh[psycopg,crypto]` extra)")
+
+
+def nexlink_activation(cfg, env: dict | None = None) -> tuple[bool, list[str]]:
+    """#3619 : `ameesh doctor` — les canaux `nexlink` routés de cet hôte.
+
+    Rend ``(ok, lignes)``. Un canal routé qui ne peut pas chiffrer et que
+    aucun repli utilisable ne couvre est refusé (``ok=False``) et nommé,
+    **avant tout envoi** : l'activation échoue fermée, jamais par un
+    `ModuleNotFoundError` au premier envoi. Un canal couvert par son repli
+    reste prêt (#3536). Aucun canal `nexlink` routé : ``(True, [])``.
+    """
+    try:
+        ncfg = parse_config(getattr(cfg, "notify", None))
+    except NotifyConfigError as exc:
+        return False, ["configuration refused: %s" % " ".join(str(exc).split())[:200]]
+    names = set()
+    for route in ncfg.routes.values():
+        names.update(route)
+    names.update(ncfg.default)
+    ok = True
+    lines = []
+    for name in sorted(names):
+        channel = ncfg.channels.get(str(name))
+        if channel is None or channel.kind != "nexlink":
+            continue
+        problem = nexlink_crypto_problem(channel, env, ncfg=ncfg)
+        if problem:
+            ok = False
+            lines.append("channel %s refused: %s" % (channel.name, problem))
+        else:
+            lines.append("channel %s ready" % channel.name)
+    return ok, lines
+
+
 def _request(url: str, data: bytes | None, headers: dict, timeout: float, *,
              method: str = "POST", show_url: bool = True,
              secrets: tuple = ()) -> tuple[int, bytes]:

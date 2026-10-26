@@ -254,7 +254,7 @@ else:
 '''
 
 PIP = r'''#!/usr/bin/env python3
-import json, os, sys
+import json, os, re, sys
 from pathlib import Path
 state = Path(os.environ['FAKE_STATE'])
 log = state / 'pip.log'
@@ -273,8 +273,11 @@ if fail_at and len(log.read_text().splitlines()) >= fail_at:
 info = (Path(sys.argv[0]).resolve().parents[1]
         / 'lib/python3.11/site-packages/ameesh-1.9.0.dist-info')
 if info.is_dir():
+    # #3619 : comme le vrai pip, l'URL directe ne porte pas les extras de la
+    # spécification (`<src>[psycopg,crypto]`) ; le chemin installé est le même.
+    cible = re.sub(r'\[[^\]]*\]$', '', sys.argv[-1])
     (info / 'direct_url.json').write_text(json.dumps(
-        {'url': Path(sys.argv[-1]).resolve().as_uri()}))
+        {'url': Path(cible).resolve().as_uri()}))
 '''
 
 # #1969 : le helper de bascule crée un venv versionné (`python3 -m venv`). Sous
