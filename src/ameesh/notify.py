@@ -342,6 +342,10 @@ TYPE_LABELS = {
     # #2729 : plus aucun tour n'aboutit — la préemption prioritaire se répète ;
     # pas poussée par défaut (à ajouter dans `notify.types`), lue par `ameesh alerts`
     "preemption_streak": "agent preempted turn after turn",
+    # #3733 : briefée aux orchestrateurs de l'équipe et aux auditeurs
+    # (alert_briefs) ; pas poussée aux humains par défaut (à ajouter dans
+    # `notify.types`)
+    "rate_limited_chronic": "agent rate-limited a large share of the last hour",
     "critical_roles_unreadable": "canon unreadable: critical roles held",
     # #1466: briefed to the orchestrators and auditors (alert_briefs); not
     # pushed to humans by default (add it to `notify.types` to receive it)

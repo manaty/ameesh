@@ -145,6 +145,14 @@ def socket_conninfo(dsn, socket_dir):
     return psycopg.conninfo.make_conninfo(**params)
 
 
+# #3745: every `-c` setting ameesh sends in its startup packet
+# (`db.startup_options`) must be tracked here, or pgbouncer refuses the session
+# ("unsupported startup parameter in options"). `default_transaction_read_only`
+# is tracked by default. This setting is CF_NO_RELOAD in 1.26: a HUP leaves it
+# unchanged, only a restart applies a new value.
+TRACK_EXTRA_PARAMETERS = 'search_path,statement_timeout,jit'
+
+
 def pool_ini(dbname, upstream, port, *, socket_dir, auth_file, admin_user, tls):
     """The reviewed [pgbouncer] configuration, sizing included (#532)."""
     return f'''[databases]
@@ -168,7 +176,7 @@ default_pool_size = {DEFAULT_POOL_SIZE}
 reserve_pool_size = {RESERVE_POOL_SIZE}
 reserve_pool_timeout = 5
 max_db_connections = {MAX_DB_CONNECTIONS}
-track_extra_parameters = search_path,statement_timeout
+track_extra_parameters = {TRACK_EXTRA_PARAMETERS}
 log_connections = 0
 log_disconnections = 0
 log_stats = 0

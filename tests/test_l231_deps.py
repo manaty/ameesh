@@ -407,6 +407,23 @@ class GcTests(_Base):
                          [("deps", "deleted")])
         self.assertFalse(os.path.lexists(entry))
 
+    def test_unlinked_entry_deleted_after_a_day_by_default(self):
+        # #3746: the default idle time is 24 h (was 3 days)
+        pkg = _package(os.path.join(self.base, "w1"))
+        done = deps.link_package(pkg, self.cache, installer=FakeInstaller())
+        entry = deps.entry_of(deps.nm_root(self.cache), done["key"])
+        os.unlink(os.path.join(pkg, "node_modules"))
+        self.assertEqual(menage.Policy().deps_idle, deps.DEFAULT_DEPS_IDLE_S)
+        self.assertEqual(deps.gc_node_modules(self.cache, now=time.time() + 23 * 3600,
+                                              holders=lambda _p: []), [])
+        self.assertTrue(os.path.isdir(entry))
+        lines = deps.gc_node_modules(self.cache, now=time.time() + 25 * 3600,
+                                     holders=lambda _p: [])
+        self.assertEqual([(line["action"], line["path"]) for line in lines],
+                         [("deleted", entry)])
+        self.assertGreater(lines[0]["bytes"], 0)
+        self.assertFalse(os.path.lexists(entry))
+
     def test_partial_entry_deleted_after_an_hour(self):
         root = deps.nm_root(self.cache)
         partial = os.path.join(root, "f" * 64, "app", "node_modules", "x")

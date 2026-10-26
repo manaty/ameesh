@@ -611,7 +611,14 @@ def add(
     title or the source looks like a non-blocking follow-up (N, P2, P3) — the
     route to the backlog, to be shown by the caller. Nothing is ever refused:
     a human request, a blocking defect and the review-after-merge lot pass
-    unchanged."""
+    unchanged.
+
+    #3744 : le corps « - » est refusé quel que soit l'appelant (comme la
+    note, #3683) : c'est le marqueur de l'entrée standard, jamais un énoncé."""
+    if (body or "").strip() == "-":
+        raise WorkError("body refused: `-` alone is not a statement; write the text, "
+                        "or pass `--body -` to ameesh work add to read it on standard "
+                        "input")
     from .agent_names import resolve as resolve_agent_name
     assignee = resolve_agent_name(assignee, db=db, operation="work.add")
     return _create(db, title=title, type=type, source=source, app=app, body=body,

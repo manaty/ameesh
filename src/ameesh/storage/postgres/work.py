@@ -124,7 +124,7 @@ def has_migration_slots(db) -> bool:
     return found
 
 
-def item_columns(db, ref: str | None = None) -> str:
+def item_columns(db, ref: str | None = None, *, row_json: str | None = None) -> str:
     """Les colonnes d'un lot ; `reviewer` quand 0421 est appliquée, `''` sinon
     (les lectures d'avant la migration ne cassent pas, #705).
 
@@ -141,21 +141,26 @@ def item_columns(db, ref: str | None = None) -> str:
     budget L61, et la sonde de table y coûterait justement l'aller-retour
     qu'il économise. Ces vues rendent `[]` et se replient sur le scalaire
     (`work.migration_line`), jamais sur une erreur : sur une base d'avant
-    0419, la liste est de toute façon vide."""
+    0419, la liste est de toute façon vide.
+
+    #3741 : `row_json` est une expression qui porte déjà `to_jsonb` de la
+    ligne, calculé une fois par la requête de l'appelant ; les colonnes lues
+    par `to_jsonb` la lisent au lieu de recalculer l'appel (0,6 ms par ligne
+    sous charge, trois fois par ligne sur un flux de 3 500 lots)."""
+    doc = row_json or "to_jsonb(%s)" % (ref or "work_items")
     if ref:
-        reviewer = "coalesce(to_jsonb(%s)->>'reviewer', '') AS reviewer" % ref
+        reviewer = "coalesce(%s->>'reviewer', '') AS reviewer" % doc
     elif has_reviewer(db):
         reviewer = "reviewer"
     else:
         reviewer = "''::text AS reviewer"
     # to_jsonb keeps reads compatible with schemas predating 0456, without
     # another catalogue round trip (including bounded progress/list reads).
-    reviewers = "to_jsonb(%s)->'reviewers' AS reviewers" % (ref or "work_items")
+    reviewers = "%s->'reviewers' AS reviewers" % doc
     # #3447 : même compatibilité — la colonne n'existe qu'après 0482.
-    external = ("to_jsonb(%s)->>'external_executor' AS external_executor"
-                % (ref or "work_items"))
-    wake = ("extract(epoch from (to_jsonb(%s)->>'wake_at')::timestamptz)::float8"
-            " as wake_ts" % (ref or "work_items"))
+    external = "%s->>'external_executor' AS external_executor" % doc
+    wake = ("extract(epoch from (%s->>'wake_at')::timestamptz)::float8"
+            " as wake_ts" % doc)
     if ref:
         migrations = "'[]'::jsonb AS migrations"
     elif has_migration_slots(db):
@@ -168,8 +173,6 @@ def item_columns(db, ref: str | None = None) -> str:
             " AS migrations")
     else:
         migrations = "'[]'::jsonb AS migrations"
-    wake = ("extract(epoch from (to_jsonb(%s)->>'wake_at')::timestamptz)::float8"
-            " as wake_ts" % (ref or "work_items"))
     return (_COLUMNS_TEMPLATE
             .replace("__REVIEWER__", reviewer + ", " + reviewers)
             .replace("__EXTERNAL__", external)
@@ -3588,6 +3591,12 @@ class WorkItems(interface.WorkItems):
         portés par la lecture comme B5 les porte dans `work.get` (`to_jsonb`,
         sans sonde de colonne) ; base pré-0452 : `''`, NULL, 0.
         """
+        # #3741 : `to_jsonb(work_items)` une fois par ligne (`j.doc`), non
+        # cinq — sur les ~3 500 lignes du flux, ses cinq appels coûtaient 17 s
+        # sous charge et faisaient expirer la synchro GitHub (27 s mesurées,
+        # contre 30 s de statement_timeout). `OFFSET 0` empêche le planificateur
+        # de remonter la sous-requête latérale, ce qui recopierait l'appel à
+        # chaque référence.
         return self.db.query(
             "SELECT w.*, k.team AS package_team, r.team AS assignee_team,"
             "       r.chantier AS assignee_chantier, r.host AS assignee_host,"
@@ -3596,21 +3605,22 @@ class WorkItems(interface.WorkItems):
             "         WHERE m.work_item_id = w.id AND m.kind = 'merged'"
             "           AND " + _effective_merged("m") + ") AS merged_ts"
             "  FROM (SELECT %s,"
-            "               coalesce(to_jsonb(work_items)->>'workflow_ref', '')"
-            "                 AS workflow_ref,"
-            "               to_jsonb(work_items)->>'workflow_stage' AS workflow_stage,"
-            "               coalesce((to_jsonb(work_items)->>'workflow_version')::bigint, 0)"
+            "               coalesce(j.doc->>'workflow_ref', '') AS workflow_ref,"
+            "               j.doc->>'workflow_stage' AS workflow_stage,"
+            "               coalesce((j.doc->>'workflow_version')::bigint, 0)"
             "                 AS workflow_version,"
             "               to_char(planned_start, 'YYYY-MM-DD') AS planned_start,"
             "               to_char(planned_end, 'YYYY-MM-DD') AS planned_end,"
             "               to_char(planned_delivery, 'YYYY-MM-DD') AS planned_delivery"
             "          FROM work_items"
+            "          CROSS JOIN LATERAL (SELECT to_jsonb(work_items) AS doc OFFSET 0) j"
             "         WHERE state NOT IN %s OR coalesce(btrim(issue_ref), '') <> ''"
-            "            OR coalesce(to_jsonb(work_items)->>'workflow_ref', '') <> ''"
+            "            OR coalesce(j.doc->>'workflow_ref', '') <> ''"
             "         ORDER BY id DESC LIMIT %%s) w"
             "  LEFT JOIN work_packages k ON k.id = w.package_id"
             "  LEFT JOIN agent_registry r ON r.name = w.assignee"
-            " ORDER BY w.id" % (item_columns(self.db), _CLOSED), (int(limit),))
+            " ORDER BY w.id" % (item_columns(self.db, row_json="j.doc"), _CLOSED),
+            (int(limit),))
 
     def set_issue_ref(self, item_id, issue_ref, *, current,
                       migration_repo=interface.UNCHECKED) -> bool:

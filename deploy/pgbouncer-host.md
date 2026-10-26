@@ -84,7 +84,8 @@ systemctl --user kill -s HUP ameesh-pgbouncer.service
 ```
 
 A reload applies the file to new decisions and keeps connected clients; a
-restart is not needed and must not happen in a release window. Verify on the
+restart is not needed for these five values (unlike `track_extra_parameters`,
+see below) and must not happen in a release window. Verify on the
 admin console, which `max_client_conn` does not gate:
 
 ```sh
@@ -100,6 +101,59 @@ other four limits were raised during the incident (250/64/16/80). The gap only
 delays closing an idle server session, it does not affect correctness. It is to
 be reconciled at the next planned restart of the host — not during a release
 window — with the reload above or by writing these values at that restart.
+
+## Session settings the pool must track (#3745)
+
+Every Ameesh session sends its settings in the startup packet
+(`db.startup_options`: `-c search_path=…`, `-c statement_timeout=…`,
+`-c jit=off` since #3503, `-c default_transaction_read_only=on` for read-only
+hosts). PgBouncer **refuses** a session carrying a setting it does not track
+(`FATAL: unsupported startup parameter in options: jit`), so every runner of the
+host fails to connect. It always tracks `application_name`, `client_encoding`,
+`DateStyle`, `default_transaction_read_only`, `IntervalStyle`,
+`scram_iterations`, `search_path`, `session_authorization`,
+`standard_conforming_strings` and `TimeZone`; the recipe adds
+`track_extra_parameters = search_path,statement_timeout,jit`. A setting listed
+in `ignore_startup_parameters` instead is accepted but never applied.
+
+An installation generated before #3745 (pc-smichea, 2026-10-13) stops at
+`search_path,statement_timeout` and is corrected **by hand**. Back up the file
+first (dated name, 0600), then change that line only:
+
+```sh
+cd ~/.config/pgbouncer
+cp -p pgbouncer.ini "pgbouncer.ini.bak-$(date +%Y%m%d-%H%M%S)"
+sed -i 's/^track_extra_parameters = search_path,statement_timeout$/track_extra_parameters = search_path,statement_timeout,jit/' pgbouncer.ini
+grep -n '^track_extra_parameters' pgbouncer.ini
+```
+
+A HUP is **not** enough: in 1.26, `track_extra_parameters` is `CF_NO_RELOAD`
+(`src/main.c`), and a reload silently keeps the old value; `SHOW CONFIG` keeps
+showing it. Only a restart applies it:
+
+```sh
+systemctl --user restart ameesh-pgbouncer.service
+```
+
+In session mode, a restart closes every client session of the host. Bureau does
+it outside a release window (not in the 20 minutes before a cut-off) and then
+checks the host's runners like after `switch`. Verify on the admin console that
+`track_extra_parameters` includes `jit`, then with the doctor:
+
+```sh
+psql "host=$HOME/.local/state/pgbouncer/socket port=6432 user=ameesh dbname=pgbouncer" \
+  -c 'SHOW CONFIG;' | grep track_extra_parameters
+ameesh doctor
+```
+
+When the DSN is the local pool socket, `ameesh doctor` compares the settings an
+Ameesh session sends with the running `SHOW CONFIG` of that pool before it opens
+its connection: `pgbouncer  : startup options accepted (…)`, or `KO` naming the
+refused setting. Its `jit` line shows the session value (`off`). `doctor --probe`,
+which guards host updates, names the pool when its connection fails this way. A
+new setting in `db.startup_options` must be added to `TRACK_EXTRA_PARAMETERS`
+in `deploy/pgbouncer-host.py` (a test fails otherwise) and to every existing
+pool, restarted, **before** that code is deployed on the host.
 
 After the corrected runner release is available and installation verification
 passes, bureau switches and drains/restarts the runner units it manages:

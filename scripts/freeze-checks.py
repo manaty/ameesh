@@ -15,11 +15,22 @@ processus, en parallèle des autres : une quinzaine de secondes en tout, le
 plus long d'entre eux. Un contrôle de plus est une ligne de [`CHECKS`] ;
 `tests/test_2542_freeze_checks.py` vérifie que chaque test nommé existe.
 
+#3687 : quand le diff du lot touche la porte de fusion, les modules de contrat
+de la porte ([`GATE_CONTRACTS`]) tournent aussi, et un rouge refuse le gel :
+#3584 changeait `_complete_authors` sans adapter test_1374, et seule la revue
+de fond l'a vu (h-25 : un regel et une CI complète perdus). Les chemins de la
+porte viennent du garde (`ameesh.freeze_checks`, variable [`GATE_ENV`], lus à
+la politique) ; `[]` n'ajoute rien, une variable absente ou illisible est un
+doute et lance les contrats. Seules leurs classes sans base tournent (le gel
+reste sans Postgres) : les variantes `PgTestCase` restent à la CI du paquet.
+
 Usage : scripts/freeze-checks.py   (à la racine d'un arbre ameesh)
 Sortie : 0 tous verts, 1 au moins un rouge, 2 hors d'un arbre ameesh.
 """
 from __future__ import annotations
 
+import ast
+import json
 import os
 import subprocess
 import sys
@@ -49,10 +60,95 @@ CHECKS = (
     ("doc readers L161a", ["-m", "unittest", "-q",
                            "tests.test_l161a_ci_sans_code.ReadersTest"]),
 )
+#: #3687 : les modules de contrat de la porte de fusion (avis, auteurs, feu,
+#: désignation, report des verdicts) ; seules leurs classes sans base tournent
+GATE_CONTRACTS = (
+    "tests.test_1374_fire",                         # porte des avis, auteurs, feu
+    "tests.test_1617_review_designation",           # désignation des relecteurs
+    "tests.test_1617_review_designation_pg",        # marque de désignation
+    "tests.test_2273_merge_pr_required",            # checks requis hors API
+    "tests.test_2394_review_gate_verdicts",         # verdicts comptés à la porte
+    "tests.test_2442_verdict_carry",                # report sur tête réalignée
+    # test_2447 (activation au gel) n'a que des classes Postgres : CI du paquet
+)
+#: #3687 : les chemins de la porte touchés, en JSON, posés par le garde du gel
+GATE_ENV = "AMEESH_FREEZE_GATE"
+#: la base des classes qui demandent Postgres (tests/support.py)
+PG_BASE = "PgTestCase"
 #: borne d'un contrôle (secondes) ; l'appelant borne l'ensemble
 TIMEOUT = 240
 #: lignes de sortie montrées pour un contrôle rouge
 TAIL = 40
+
+
+def _base_names(node: ast.ClassDef) -> list:
+    names = []
+    for base in node.bases:
+        if isinstance(base, ast.Name):
+            names.append(base.id)
+        elif isinstance(base, ast.Attribute):
+            names.append(base.attr)
+    return names
+
+
+def static_classes(root: str, module: str) -> list:
+    """Les classes de test de `module` qui tournent sans base : publiques, une
+    `…TestCase` parmi leurs bases (celles du module comprises), aucune
+    [`PG_BASE`]. Un module absent ou illisible n'en a aucune."""
+    path = os.path.join(root, *module.split(".")) + ".py"
+    try:
+        with open(path, encoding="utf-8") as fh:
+            tree = ast.parse(fh.read(), filename=path)
+    except (OSError, SyntaxError, ValueError):
+        return []
+    local = {node.name: _base_names(node) for node in tree.body
+             if isinstance(node, ast.ClassDef)}
+
+    def ancestry(name, seen=()):
+        found = set()
+        for base in local.get(name, ()):
+            found.add(base)
+            if base in local and base not in seen:
+                found |= ancestry(base, seen + (name,))
+        return found
+
+    out = []
+    for name in local:
+        bases = ancestry(name)
+        if name.startswith("_") or PG_BASE in bases \
+                or not any(base.endswith("TestCase") for base in bases):
+            continue
+        out.append("%s.%s" % (module, name))
+    return out
+
+
+def gate_touched(environ) -> tuple:
+    """`(lancer les contrats, raison)` d'après [`GATE_ENV`] : une liste vide
+    ne lance rien ; absente ou illisible, le doute les lance."""
+    raw = environ.get(GATE_ENV)
+    if raw is None:
+        return True, "gate paths unknown"
+    try:
+        paths = json.loads(raw)
+    except ValueError:
+        return True, "gate paths unreadable"
+    if not isinstance(paths, list) or not all(isinstance(p, str) for p in paths):
+        return True, "gate paths unreadable"
+    if not paths:
+        return False, "merge gate not touched"
+    shown = ", ".join(paths[:3]) + (" …" if len(paths) > 3 else "")
+    return True, "merge gate touched: %s" % shown
+
+
+def gate_checks(root: str, environ) -> tuple:
+    """`(contrôles, raison)` : le contrôle des contrats de la porte, ou aucun."""
+    touched, why = gate_touched(environ)
+    if not touched:
+        return (), why
+    ids = [ident for module in GATE_CONTRACTS for ident in static_classes(root, module)]
+    if not ids:
+        return (), why + "; no database-free contract class"
+    return (("contrat de la porte #3687", ["-m", "unittest", "-q", *ids]),), why
 
 
 def _run(check, root: str, env: dict) -> tuple:
@@ -77,8 +173,12 @@ def main(argv=None) -> int:
         print("freeze-checks: run from the root of an ameesh tree", file=sys.stderr)
         return 2
     env = dict(os.environ, PYTHONPATH=os.path.join(root, "src"), AMEESH_REQUIRE_DB="0")
-    with ThreadPoolExecutor(max_workers=len(CHECKS)) as pool:
-        results = list(pool.map(lambda check: _run(check, root, env), CHECKS))
+    env.pop(GATE_ENV, None)
+    gate, why = gate_checks(root, os.environ)
+    print("--  gate contracts: %s" % ("run (%s)" % why if gate else "none (%s)" % why))
+    checks = CHECKS + gate
+    with ThreadPoolExecutor(max_workers=max(1, len(checks))) as pool:
+        results = list(pool.map(lambda check: _run(check, root, env), checks))
     red = 0
     for name, code, seconds, output in results:
         print("%-3s %s (%.1f s)" % ("ok" if code == 0 else "RED", name, seconds))

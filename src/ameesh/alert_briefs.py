@@ -57,7 +57,10 @@ BRIEFED_TYPES = ("idle_capacity", "stale_lot", "plan_underused", "estimate_bias"
                  "mail_undeliverable",
                  # #3007 : aucun notificateur vivant ne couvre l'humain qui a
                  # des décisions en attente — les agents doivent le savoir
-                 "notify_undeliverable")
+                 "notify_undeliverable",
+                 # #3733 : un agent bridé une bonne part de l'heure — le
+                 # pilote confie ses relectures dues à une autre famille
+                 "rate_limited_chronic")
 #: #3007 : types qu'un notificateur ne briefe jamais lui-même — leur brief
 #: dépend de sa propre liveness, il est porté par `notify_gap.brief_once`
 #: (ménage du runner) pour survivre à la chute du poste.
@@ -727,6 +730,20 @@ def _budget_pause_long(alert: dict) -> str:
             % (alert.get("detail") or "?"))
 
 
+def _rate_limited_chronic(alert: dict) -> str:
+    """#3733 : des épisodes de débit courts, effacés par un succès, couvrent
+    une bonne part de l'heure. Aux orchestrateurs de l'équipe et aux
+    auditeurs ; pas à l'agent, qui attend sa reprise."""
+    agent = alert.get("agent") or "?"
+    return ("Agent rate-limited for a large share of the last hour: %s. Expected action: "
+            "the runner resumes it by itself, but its work does not move — hand its "
+            "reviews due and urgent lots to an agent of another account or family "
+            "(ameesh work pending-reviews %s; ameesh work reviewer <lot> <agent>); check "
+            "its recent input volume (ameesh cost turns --agent %s) and rotate its "
+            "session earlier if each turn rereads a large context."
+            % (alert.get("detail") or "?", agent, agent))
+
+
 def _notify_undeliverable(alert: dict) -> str:
     """#3007 : aucun notificateur vivant ne couvre l'humain qui a des décisions
     en attente. Aux orchestrateurs et à l'auditeur : la poussée n'a pas eu
@@ -1034,6 +1051,9 @@ def briefs(alert: dict, listing: list, lot_titles: dict | None = None,
         elif kind == "budget_pause_long":
             text = _budget_pause_long(alert)
             teams = _projects(by_name, alert.get("agent"))
+        elif kind == "rate_limited_chronic":
+            text = _rate_limited_chronic(alert)
+            teams = _projects(by_name, alert.get("agent"))
         elif kind == "notify_undeliverable":
             # #3007 : aucun notificateur vivant ne couvre l'humain ; tous les
             # orchestrateurs de l'alerte et l'auditeur la reçoivent.
@@ -1076,7 +1096,7 @@ def briefs(alert: dict, listing: list, lot_titles: dict | None = None,
     if kind not in ("stale_lot", "plan_underused"):
         for name in auditor_names or ():
             out.setdefault(name, audit_text)
-    if kind in ("critical_budget_pause", "budget_pause_long"):
+    if kind in ("critical_budget_pause", "budget_pause_long", "rate_limited_chronic"):
         out.pop(alert.get("agent"), None)       # en pause : il ne le lirait pas
     # #3036 : un destinataire sans bail vivant (ou sur un hôte aux claims
     # fermés) ne lira pas ; il n'est pas compté prévenu. Le brief dit qui

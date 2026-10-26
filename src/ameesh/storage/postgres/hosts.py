@@ -288,13 +288,23 @@ class Hosts(interface.HostResources):
         # — les entrées seulement, pas le tas ; le dernier relevé se lit
         # ensuite par l'index (hôte, instant) — plus de DISTINCT ON sur les
         # 335 000 lignes de l'historique à chaque passe d'alertes.
+        # #3741 : PostgreSQL ne saute pas d'une clé d'index à la suivante —
+        # `SELECT DISTINCT host` restait un parcours parallèle de tout le tas
+        # (2,5 s à vide, 10 s sous charge). Le parcours récursif lit une entrée
+        # d'index par hôte (`host` est NOT NULL).
         params: list[Any] = []
         where = ""
         if host:
             where = " WHERE b.host = %s"
             params.append(host)
         rows = self.db.query(
-            "SELECT r.* FROM (SELECT DISTINCT host FROM host_resources) b"
+            "WITH RECURSIVE b(host) AS ("
+            "  (SELECT host FROM host_resources ORDER BY host LIMIT 1)"
+            "  UNION ALL"
+            "  SELECT (SELECT h.host FROM host_resources h WHERE h.host > b.host"
+            "           ORDER BY h.host LIMIT 1)"
+            "    FROM b WHERE b.host IS NOT NULL)"
+            "SELECT r.* FROM b"
             " CROSS JOIN LATERAL ("
             "  SELECT " + READING_COLUMNS + " FROM host_resources h"
             "   WHERE h.host = b.host"

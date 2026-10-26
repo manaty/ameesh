@@ -29,9 +29,19 @@ autre = rouge ; il ne dure pas plus de [`TIMEOUT`] secondes (au-delà, son
 groupe de processus est tué et le gel refusé). Le script choisit ses
 contrôles : seulement ce que la suite exige déjà, statique et rapide — le gel
 n'est pas une CI.
+
+#3687 : le script reçoit aussi, dans [`GATE_ENV`], les chemins du lot que la
+politique range avec la porte de fusion (JSON, liste de chemins dépôt) : la
+règle de `review_policies.risk_classes` qui classe [`GATE_ANCHOR`] nomme les
+chemins « porte de fusion » du §8, lus au canon configuré, sans liste en dur.
+`[]` dit que la porte n'est pas touchée ; une variable absente dit que le
+garde n'a pas pu le lire (cible, diff ou politique illisibles) — un doute,
+que le script traite comme une porte touchée. Le script choisit ce qu'il en
+fait (ameesh : les classes sans base de ses modules de contrat de la porte).
 """
 from __future__ import annotations
 
+import json
 import os
 import signal
 import subprocess
@@ -40,7 +50,7 @@ import tempfile
 import time
 
 from . import work
-from .canon import GitError, _git, git_toplevel
+from .canon import GitError, _git, git_range_paths, git_toplevel
 
 #: le script de contrôles du projet, chemin dépôt lu au commit gelé
 SCRIPT = "scripts/freeze-checks.py"
@@ -57,6 +67,11 @@ CAUSES = (
     "checks-red",        # le script a rendu une sortie non nulle
     "checks-incomplete",  # le script n'a pas fini dans le délai, ou ne démarre pas
 )
+#: #3687 : le chemin qui désigne la porte de fusion dans la politique ; la
+#: règle de classe qui le nomme porte les autres chemins de la porte (§8)
+GATE_ANCHOR = "src/ameesh/fire.py"
+#: #3687 : la variable où le script lit les chemins de la porte touchés
+GATE_ENV = "AMEESH_FREEZE_GATE"
 #: rappel de l'échappatoire, à la fin de chaque refus
 BYPASS = ('fix the lot and freeze again; to freeze anyway: '
           '--no-static-checks "<reason>" (written in the milestone note)')
@@ -141,13 +156,58 @@ def _tail(output: str) -> str:
     return "\n".join(lines)
 
 
-def run(repo: str, commit: str, *, timeout: float = TIMEOUT) -> dict:
+def gate_rules(canons, project: str | None) -> list:
+    """Les règles de classe qui nomment [`GATE_ANCHOR`], tous canons ; [] si
+    aucune politique lisible ne le nomme."""
+    from . import review
+    rules = []
+    for canon in canons or ():
+        policy, problems = review.policy_from_federation(
+            getattr(canon, "federation", None), project)
+        if any(problem[1] == "error" for problem in problems):
+            continue
+        rules.extend(rule for rule in policy.rules
+                     if any(rx.match(GATE_ANCHOR) for rx in rule.regexes))
+    return rules
+
+
+def gate_paths(cfg, item: dict, repo: str, commit: str, *,
+               canons=None) -> list[str] | None:
+    """Les chemins du diff gelé (merge-base avec la cible..`commit`) que la
+    politique range avec la porte de fusion (#3687), triés ; None quand la
+    cible, le diff ou la politique ne se lisent pas : l'appelant n'affirme
+    alors pas que la porte est hors du diff."""
+    from . import lot_class
+    target = lot_class.default_base(cfg, item, repo)
+    if not target:
+        return None
+    try:
+        paths = git_range_paths(repo, lot_class._landing_ref(repo, target), commit)
+    except GitError:
+        return None
+    if canons is None:
+        canons = work.configured_canons(cfg)
+    rules = gate_rules(canons, str(item.get("app") or "") or None)
+    if not rules:
+        return None
+    return sorted(path for path in paths
+                  if any(rx.match(path) for rule in rules for rx in rule.regexes))
+
+
+def run(repo: str, commit: str, *, timeout: float = TIMEOUT,
+        gate: list[str] | None = None) -> dict:
     """Passe le script de `commit` sur son arbre construit.
 
+    `gate` : les chemins de la porte de fusion touchés ([`gate_paths`]),
+    transmis au script dans [`GATE_ENV`] ; None ne transmet rien (doute).
     Rend `{"result": "none"}` sans script, `{"result": "green", "seconds",
     "output"}` s'il sort à 0 ; lève [`Refused`] sinon."""
     if not declared(repo, commit):
         return {"result": "none"}
+    env = dict(os.environ)
+    env.pop(GATE_ENV, None)
+    if gate is not None:
+        env[GATE_ENV] = json.dumps(list(gate))
     from . import ci_parts
     with tempfile.TemporaryDirectory(prefix="ameesh-freeze-checks-") as tree:
         try:
@@ -156,7 +216,7 @@ def run(repo: str, commit: str, *, timeout: float = TIMEOUT) -> dict:
             raise Refused("tree-unreadable", str(exc)) from exc
         start = time.monotonic()
         try:
-            proc = subprocess.Popen([sys.executable, SCRIPT], cwd=tree,
+            proc = subprocess.Popen([sys.executable, SCRIPT], cwd=tree, env=env,
                                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                     stdin=subprocess.DEVNULL, start_new_session=True)
         except OSError as exc:
@@ -212,7 +272,7 @@ def before_freeze(cfg, db, lot: int, sha: str, *, repo: str | None = None,
              "of the lot's project repository (freeze from the lot's worktree, or --repo)"
              % sha[:12])
         return note
-    result = run(where, commit)
+    result = run(where, commit, gate=gate_paths(cfg, item, where, commit))
     if result["result"] == "none":
         say("static checks: none declared at %s (%s)" % (commit[:12], SCRIPT))
     else:
