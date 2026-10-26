@@ -1943,7 +1943,15 @@ class ProbePartialCloneTest(_Base):
 
     def setUp(self):
         super().setUp()
-        self.remote = os.path.join(self.tmp, "remote1772")
+        # #3822 : un bac par test. `canon._git` retient ses lectures de
+        # contenu par (chemin réel, arguments) ; un chemin réutilisé d'un test
+        # à l'autre (le `self.tmp` est celui de la classe) pouvait rendre
+        # présent le commit d'un test précédent, quand les deux commits —
+        # même contenu, même auteur, même seconde — portaient le même SHA.
+        # Le clone reste neuf et le témoin intact.
+        self.bac = os.path.join(self.tmp, self._testMethodName)
+        os.makedirs(self.bac)
+        self.remote = os.path.join(self.bac, "remote1772")
         os.makedirs(self.remote)
         _git(self.remote, "init", "-q", "-b", "main")
         self.commit(self.remote, "socle")
@@ -1951,12 +1959,12 @@ class ProbePartialCloneTest(_Base):
         # par son sha (fetch explicite d'un commit)
         _git(self.remote, "config", "uploadpack.allowFilter", "true")
         _git(self.remote, "config", "uploadpack.allowAnySHA1InWant", "true")
-        self.repo = os.path.join(self.tmp, "clone1772")
+        self.repo = os.path.join(self.bac, "clone1772")
         _git(self.tmp, "clone", "-q", "--filter=blob:none", "--no-local",
              "file://" + self.remote, self.repo)
         # un second clone partiel, intact : les têtes publiées ensuite n'y sont
         # pas encore (preuve du best-effort sans toucher au premier clone)
-        self.autre = os.path.join(self.tmp, "clone1772-bis")
+        self.autre = os.path.join(self.bac, "clone1772-bis")
         _git(self.tmp, "clone", "-q", "--filter=blob:none", "--no-local",
              "file://" + self.remote, self.autre)
         self.agent("claude1", cwd=self.repo)
@@ -1992,7 +2000,7 @@ class ProbePartialCloneTest(_Base):
         self.assertIn("explicit fetch from origin brought nothing", found["detail"])
 
     def test_1772_clone_complet_ne_fetch_pas(self):
-        complet = os.path.join(self.tmp, "complet1772")
+        complet = os.path.join(self.bac, "complet1772")
         _git(self.tmp, "clone", "-q", "--no-local", "file://" + self.remote, complet)
         sha = self.publish()
         found = plan_git.probe(complet, sha, "origin/main")
