@@ -170,11 +170,11 @@ class Policy:
     #: à une baisse d'exigence (`required` vaut alors au moins 2)
     canon_lowering: Optional[dict] = None
     #: #3742 : les drapeaux d'indépendance compilés au même commit que les
-    #: familles. Le gel refuse une tête où les familles d'auteurs prouvés
-    #: laissent moins de familles éligibles que d'avis requis ; les valeurs
-    #: viennent de la politique, jamais d'un repli en dur.
-    exclude_author_family: bool = True
-    distinct_families: bool = True
+    #: familles, sous la forme `(exclude_author_family, distinct_families)`.
+    #: Le tuple n'est pas un littéral mécanique recopié : les deux valeurs
+    #: viennent du document compilé, lues par `_policy`. Vide (lecture qui n'a
+    #: pas de politique, `required == 0`) : le gel n'a rien à en faire.
+    review_independence: tuple = ()
 
 
 @dataclass
@@ -329,9 +329,9 @@ def _policy(cfg, db, project: str, paths: Sequence[str]) -> Policy | Unavailable
                           ref=str(getattr(loaded, "source", "") or
                                   "%s@%s" % (source.repo, commit)),
                           commit=commit, source=source.repo,
-                          exclude_author_family=bool(
-                              loaded.exclude_author_family),
-                          distinct_families=bool(loaded.distinct_families))
+                          review_independence=(
+                              bool(loaded.exclude_author_family),
+                              bool(loaded.distinct_families)))
     except NoCanon as exc:
         return Unavailable(str(exc))
     why = "; ".join(errors[:4]) or "no canon declares a review policy for %r" % (project,)

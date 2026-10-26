@@ -114,20 +114,29 @@ def assess(inputs) -> dict:
                 if _lower(value)]
     seats = _seats(inputs)
     rows = _rows(inputs)
+    flags = tuple(getattr(policy, "review_independence", ()) or ())
+    if len(flags) >= 2:
+        exclude_author_family, distinct = bool(flags[0]), bool(flags[1])
+    else:
+        # Objet de politique minimal (témoins, ancien appelant) : les noms
+        # directs restent lus, avec la direction stricte en repli — jamais une
+        # valeur du canon recopiée ici.
+        exclude_author_family = bool(
+            getattr(policy, "exclude_author_family", True))
+        distinct = bool(getattr(policy, "distinct_families", True))
     # La porte de fusion (`merge_queue.review_gate`) exclut la famille d'un
     # auteur dès deux avis, et pour un lot léger ou sensible même à un seul :
     # `exclude_author_family` n'étend cette stricte aux autres classes. Le
     # gel applique la même règle, avec la classe et le drapeau compilés.
     risk = _lower(getattr(policy, "risk", ""))
     strict = (required >= 2 or risk in (lot_class.LIGHT, lot_class.SENSITIVE)
-              or bool(getattr(policy, "exclude_author_family", True)))
+              or exclude_author_family)
     forbidden = set()
     if strict:
         for entry in rows.values():
             forbidden.update(entry["families"])
     forbidden.discard("")
     available = [family for family in families if family not in forbidden]
-    distinct = bool(getattr(policy, "distinct_families", True))
     if distinct:
         seat_families = {seat["family"] for seat in seats}
         pool = [family for family in available if family not in seat_families]

@@ -28,7 +28,7 @@ def _inputs(*, authors=(), correctors=(), required=2, families=FAMILIES,
     return types.SimpleNamespace(
         policy=types.SimpleNamespace(
             required=required, families=families, risk=risk,
-            exclude_author_family=exclude, distinct_families=distinct),
+            review_independence=(exclude, distinct)),
         authors=list(authors), correctors=list(correctors),
         manual_seats=list(seats), unknown_authors=list(unknown),
         author_commits=dict(commits or {}),
