@@ -12,13 +12,17 @@ Témoins demandés par le lot : lot sans feu, mauvaise tête, feu retiré, CI
 incomplète ou rouge, événement de fusion terminal ; témoins du gel corrigé :
 verdicts avant PR/file/CI, avis indépendants et blocages non masqués, sortie de
 file et garde de `land` après retrait, jalons relus sous bail, bail renouvelé,
-et autorité pilote déclarée. Tests sans base (routage, jalons, GitHub simulé),
-puis sur Postgres (règles de `give`/`withdraw`, bail, CLI, garde de `land`)."""
+et autorité pilote déclarée. #3598 : `give`/`withdraw` attendent la fenêtre
+libre du bail `fire:<lot>`, refusent à la borne en nommant le détenteur, et un
+passage ne s'arme pas sur un feu retiré pendant l'attente. Tests sans base
+(routage, jalons, GitHub simulé), puis sur Postgres (règles de `give`/`withdraw`,
+bail, CLI, garde de `land`)."""
 from __future__ import annotations
 
 import os
 import subprocess
 import tempfile
+import threading
 import types
 import unittest
 from unittest import mock
@@ -709,6 +713,40 @@ class TargetKeyTest(unittest.TestCase):
             self.assertNotEqual(seen[0][1], fire.LOCK_TTL_S)
 
 
+class LeaseWaitTest(unittest.TestCase):
+    """#3598 : l'attente du bail `fire:<lot>` par `give`/`withdraw`."""
+
+    def test_wait_lock_retries_with_backoff_until_released(self):
+        handles = [None, None, ("ops", "owner", 7, "fire:42")]
+        calls, slept = [], []
+
+        def lock(db, lot):
+            calls.append(lot)
+            return handles.pop(0)
+
+        with mock.patch.object(fire, "_lock", side_effect=lock):
+            handle = fire._wait_lock(None, 42, wait=10.0, sleep=slept.append,
+                                     clock=iter([0.0, 0.0, 1.0]).__next__)
+        self.assertEqual(handle[3], "fire:42")
+        self.assertEqual(calls, [42, 42, 42])
+        self.assertEqual(slept, [fire.LOCK_WAIT_FIRST_S, fire.LOCK_WAIT_FIRST_S * 2])
+
+    def test_wait_lock_refuses_at_the_bound_with_the_holder(self):
+        holder = {"owner": "pass:r5:4242", "expires_at": "2026-10-25T19:00:00Z",
+                  "left_s": 3.0}
+        with mock.patch.object(fire, "_lock", return_value=None), \
+                mock.patch.object(fire, "_land_holder", return_value=holder):
+            with self.assertRaises(fire.FireError) as caught:
+                fire._wait_lock(None, 42, wait=10.0, sleep=lambda _s: None,
+                                clock=iter([0.0, 0.0, 10.0]).__next__)
+        message = str(caught.exception)
+        self.assertIn("another fire operation holds lot #42", message)
+        self.assertIn("pass:r5:4242", message)
+        self.assertIn("2026-10-25T19:00:00Z", message)
+        self.assertIn("3s left", message)
+        self.assertIn("waited 10s", message)
+
+
 class ActTest(unittest.TestCase):
     """Le routage d'un passage : verdicts avant PR/file/CI, fusion au geste
     effectif, jamais d'auto-fusion laissée armée, jamais deux gestes
@@ -780,6 +818,17 @@ class ActTest(unittest.TestCase):
         calls["_disarm"].assert_called_once()
         self.assertIn("no active fire", calls["_disarm"].call_args.args[3])
         calls["_leave_queue"].assert_called_once()
+        calls["_merge_pr"].assert_not_called()
+
+    def test_fire_withdrawn_before_the_gesture_stops_the_pass(self):
+        """P1-3 (#1374) : le passage relit le feu sous son bail ; un unfire
+        arrivé entre-temps l'arrête avant la fusion (#3598, témoin 3)."""
+        out, calls = self._act(
+            _marks(_mark("frozen", A), _mark("fire", A)), _status(),
+            fresh=(self.ROW, _marks(_mark("frozen", A), _mark("fire", A),
+                                    _mark("unfire", A))))
+        self.assertEqual(out["result"], "withdrawn")
+        self.assertIn("withdrawn before the merge", out["detail"])
         calls["_merge_pr"].assert_not_called()
 
     def test_merged_pr_is_terminal(self):
@@ -1116,7 +1165,7 @@ class FireDbTest(PgTestCase):
         self.assertIsNotNone(epoch)
         try:
             with self.assertRaises(fire.FireError) as caught:
-                fire.give(self.db, lot, sha=A, actor="pilote")
+                fire.give(self.db, lot, sha=A, actor="pilote", wait=0.05)
             self.assertIn("another fire operation", str(caught.exception))
         finally:
             ops.land_unlock(key, "another-host", epoch)
@@ -1124,10 +1173,84 @@ class FireDbTest(PgTestCase):
         epoch = ops.land_lock(key, "another-host", 60.0)
         try:
             with self.assertRaises(fire.FireError) as caught:
-                fire.withdraw(self.db, lot, actor="pilote")
+                fire.withdraw(self.db, lot, actor="pilote", wait=0.05)
             self.assertIn("another fire operation", str(caught.exception))
         finally:
             ops.land_unlock(key, "another-host", epoch)
+
+    def test_give_waits_for_the_lease_to_be_released(self):
+        """#3598 : le bail rendu pendant l'attente, le feu se donne."""
+        lot = self._frozen_lot(A)
+        key = "fire:%d" % lot
+        other = self.connect()
+        self.addCleanup(other.close)
+        their_ops = storage.of(other).work
+        epoch = their_ops.land_lock(key, "another-host", 60.0)
+        self.assertIsNotNone(epoch)
+        self.addCleanup(their_ops.land_unlock, key, "another-host", epoch)
+        timer = threading.Timer(
+            0.3, lambda: their_ops.land_unlock(key, "another-host", epoch))
+        timer.start()
+        self.addCleanup(timer.cancel)
+        row = fire.give(self.db, lot, sha=A, actor="pilote", wait=5.0)
+        self.assertEqual(row["kind"], "fire")
+        self.assertTrue(fire.state(self.db, lot)["active"])
+
+    def test_withdraw_waits_for_the_lease_to_be_released(self):
+        """#3598 : le retrait attend la fenêtre libre ; le passage l'ayant
+        rendue, le feu se retire."""
+        lot = self._frozen_lot(A)
+        fire.give(self.db, lot, sha=A, actor="pilote")
+        key = "fire:%d" % lot
+        other = self.connect()
+        self.addCleanup(other.close)
+        their_ops = storage.of(other).work
+        epoch = their_ops.land_lock(key, "pass:r5:4242", 60.0)
+        self.assertIsNotNone(epoch)
+        self.addCleanup(their_ops.land_unlock, key, "pass:r5:4242", epoch)
+        timer = threading.Timer(
+            0.3, lambda: their_ops.land_unlock(key, "pass:r5:4242", epoch))
+        timer.start()
+        self.addCleanup(timer.cancel)
+        row = fire.withdraw(self.db, lot, actor="pilote", wait=5.0)
+        self.assertEqual(row["kind"], "unfire")
+        self.assertFalse(fire.state(self.db, lot)["active"])
+
+    def test_give_refusal_names_the_holder_and_its_expiry(self):
+        """#3598 : à la borne, le refus dit qui tient le bail et jusqu'à quand."""
+        lot = self._frozen_lot(A)
+        ops = storage.of(self.db).work
+        key = "fire:%d" % lot
+        epoch = ops.land_lock(key, "pass:r5:4242", 60.0)
+        self.assertIsNotNone(epoch)
+        try:
+            with self.assertRaises(fire.FireError) as caught:
+                fire.give(self.db, lot, sha=A, actor="pilote", wait=0.05)
+        finally:
+            ops.land_unlock(key, "pass:r5:4242", epoch)
+        message = str(caught.exception)
+        self.assertIn("another fire operation holds lot #%d" % lot, message)
+        self.assertIn("pass:r5:4242", message)
+        self.assertIn("until", message)
+
+    def test_withdraw_refusal_names_the_holder_and_its_expiry(self):
+        """#3598 : le retrait refusé à la borne nomme le détenteur et son
+        échéance, comme `give`."""
+        lot = self._frozen_lot(A)
+        fire.give(self.db, lot, sha=A, actor="pilote")
+        ops = storage.of(self.db).work
+        key = "fire:%d" % lot
+        epoch = ops.land_lock(key, "pass:r5:4242", 60.0)
+        self.assertIsNotNone(epoch)
+        try:
+            with self.assertRaises(fire.FireError) as caught:
+                fire.withdraw(self.db, lot, actor="pilote", wait=0.05)
+        finally:
+            ops.land_unlock(key, "pass:r5:4242", epoch)
+        message = str(caught.exception)
+        self.assertIn("another fire operation holds lot #%d" % lot, message)
+        self.assertIn("pass:r5:4242", message)
+        self.assertIn("until", message)
 
     def test_pass_skips_a_lot_without_fire(self):
         lot = work.add(self.db, title="un lot", branch="lot/1-un-lot")["id"]
