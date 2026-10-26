@@ -1554,7 +1554,10 @@ def empty_state() -> dict:
     return {"schema": STATE_SCHEMA, "active": {}, "resolved": {}, "rate": {},
             "summary": {}, "last_summary": {}, "briefs": {}, "notified": {},
             #: #3536 : replis nexlink déjà envoyés (une fois par alert_id)
-            "fallback": {}}
+            "fallback": {},
+            #: #3761 : verdicts de porte des avis, relus seulement quand le
+            #: gel, la cible, les jalons ou le canon changent
+            "gates": {}}
 
 
 #: #3576 : le document d'envoi et son bail d'exécution sont partagés en base
@@ -2055,8 +2058,17 @@ class Notifier:
             # #1179 : la console du pool local n'est pas lue par la passe
             # ordinaire ; `run_local_pass` la lit depuis `cfg` seule et reste
             # seul juge de ses alertes. Une console illisible n'y échoue plus.
-            current = exploitation.alerts(self.cfg, db, now=now, local_pool=False,
-                                          unreadable=unreadable, **thresholds)
+            # #3761 : la porte des avis est un calcul Git coûteux mais stable
+            # tant que le gel, la cible, les jalons et le canon ne bougent pas ;
+            # son verdict est porté par l'état de la passe (document partagé).
+            gate_cache = self.state.get("gates")
+            if not isinstance(gate_cache, dict):
+                gate_cache = self.state["gates"] = {}
+            from . import canon as canon_mod
+            with canon_mod.configured_cache():
+                current = exploitation.alerts(
+                    self.cfg, db, now=now, local_pool=False,
+                    unreadable=unreadable, gate_cache=gate_cache, **thresholds)
         records: list = []
         self._records = records
         router = Router(self.cfg, db, self.ncfg)
@@ -2263,8 +2275,14 @@ class Notifier:
         if "take" in selected:
             from . import alert_ack
             thresholds = alert_ack.default_thresholds()
-            current = exploitation.alerts(self.cfg, db, now=now, local_pool=False,
-                                          **thresholds)
+            gate_cache = self.state.get("gates")
+            if not isinstance(gate_cache, dict):
+                gate_cache = self.state["gates"] = {}
+            from . import canon as canon_mod
+            with canon_mod.configured_cache():
+                current = exploitation.alerts(
+                    self.cfg, db, now=now, local_pool=False,
+                    gate_cache=gate_cache, **thresholds)
             if self.handoff:
                 self._budget_handoff(db, now)
             if self.take:
