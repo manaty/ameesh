@@ -514,9 +514,17 @@ def message(pr: int, head: str, target: str, tip: str, tree: str, *,
     return "\n".join(lines) + "\n"
 
 
-def _scratch() -> str:
+def _scratch(fetch_url: str = "") -> str:
+    """The gate's working repository: a bare `git init`, no `origin`.
+
+    #3648: it records the read remote as its forge (`ameesh.forge`, not an
+    `origin` remote, which other readings of this repository would follow),
+    so the provenance reading can fetch by exact SHA a prior freeze that a
+    force-push left outside the fetched refs."""
     path = tempfile.mkdtemp(prefix="ameesh-merge-pr-")
     _check(path, "init", "-q")
+    if fetch_url:
+        _check(path, "config", plan_git.FORGE_CONFIG_KEY, fetch_url)
     return path
 
 
@@ -715,7 +723,7 @@ def direct_merge(slug: str, pr: int, head: str, *, lot: int, repo: str, db=None,
     else:
         declare(None if dry_run and exception else db)
 
-    owner = work_dir or _scratch()
+    owner = work_dir or _scratch(fetch_url)
     reservation = None
     temporary = work_dir is None
     try:

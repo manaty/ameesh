@@ -781,6 +781,23 @@ def full_commit_id(value) -> str:
     return text if _FULL_COMMIT_ID.fullmatch(text) else ""
 
 
+#: #3648 : la forge d'un dépôt de travail sans `origin` (le `git init` de
+#: `merge-pr`). Une clé de configuration, pas un remote : un remote `origin`
+#: changerait les autres lectures du dépôt (rafraîchissement, rejeu, cibles).
+FORGE_CONFIG_KEY = "ameesh.forge"
+
+
+def forge_remote(repo: str) -> str | None:
+    """Ce qu'il faut passer à `git fetch` pour demander un SHA à la forge.
+
+    `origin` quand le dépôt en a un ; sinon l'URL de `ameesh.forge` (#3648 :
+    le dépôt scratch de `merge-pr` la reçoit de son URL de lecture) ; sinon
+    None — un dépôt sans forge n'a rien à rapatrier."""
+    if _out(repo, "remote", "get-url", "origin") is not None:
+        return "origin"
+    return (_out(repo, "config", "--get", FORGE_CONFIG_KEY) or "").strip() or None
+
+
 def same_commit(a, b) -> bool:
     """Deux identifiants qui nomment le même commit (préfixe admis, #1756)."""
     a, b = commit_id(a), commit_id(b)

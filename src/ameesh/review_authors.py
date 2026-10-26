@@ -1997,6 +1997,10 @@ def _forge_fetch(repo: str, sha: str) -> bool:
     Un SHA abrégé ne se demande pas (Git exige l'identifiant complet), un
     dépôt sans `origin` n'a pas de forge, et un objet que la forge ne sert pas
     laisse l'absence : le refus fermé de #2924 B5 reste la règle.
+
+    #3648 : le dépôt scratch de `merge-pr` (`git init`, sans `origin`) porte
+    sa forge dans `ameesh.forge` (`plan_git.forge_remote`) ; sans elle, un
+    gel antérieur écrasé par push forcé n'y était jamais rapatrié.
     """
     text = plan_git.full_commit_id(sha)
     if not text:
@@ -2007,11 +2011,12 @@ def _forge_fetch(repo: str, sha: str) -> bool:
     except Exception:  # noqa: BLE001 - dépôt illisible : aucune récupération
         return False
     try:
-        if plan_git._out(repo, "remote", "get-url", "origin") is None:
+        forge = plan_git.forge_remote(repo)
+        if forge is None:
             return False
         proc = plan_git._git(
             repo, "fetch", "--quiet", "--no-tags", "--no-write-fetch-head",
-            "--", "origin", text, timeout=plan_git.FETCH_TIMEOUT)
+            "--", forge, text, timeout=plan_git.FETCH_TIMEOUT)
     except Exception:  # noqa: BLE001 - forge injoignable : absence
         return False
     if proc.returncode != 0:
