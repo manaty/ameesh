@@ -2152,8 +2152,28 @@ def status_of(db, item_id: int, limit: int = 5) -> dict:
         failures = st.ci.failures(row["repo"], int(row["run_id"]))
         runs.append(dict(row, failures=[{k: f.get(k) for k in (
             "part", "test", "status", "inherited", "replay", "failed_ts")} for f in failures]))
-    return {"schema": STATUS_SCHEMA, "work_item": int(item_id), "title": item.get("title"),
-            "branch": item.get("branch"), "runs": runs}
+    report = {"schema": STATUS_SCHEMA, "work_item": int(item_id), "title": item.get("title"),
+              "branch": item.get("branch"), "runs": runs}
+    carrier = _carrier_of(db, item)
+    if carrier is not None:
+        report["carrier"] = carrier
+    return report
+
+
+def _carrier_of(db, item: dict) -> dict | None:
+    """#3611 : la publication d'un porteur `integration/**` gelé, lue au
+    journal (`packet_automerge.publication`) : sans demande `ci-full`, le run
+    push de son workflow de paquet ne produit pas le check requis de la cible
+    — et ce veilleur ne suit pas ce workflow (`WORKFLOWS`). None hors porteur
+    ou sans gel."""
+    from . import packet_automerge
+    if not packet_automerge.carrier(item.get("branch")):
+        return None
+    frozen = frozen_of(db, int(item["id"]))
+    sha = str((frozen or {}).get("sha") or "").strip().lower()
+    if not sha:
+        return None
+    return dict(packet_automerge.publication(db, int(item["id"]), sha), sha=sha)
 
 
 _STATUS_FR = {"running": "running", "success": "green", "failure": "red",
@@ -2168,6 +2188,29 @@ def render_status(report: dict) -> list[str]:
     if not report["runs"]:
         lines.append("  no CI run seen (seen by `ameesh notify` on the host "
                      "named by github.host)")
+    carrier = report.get("carrier")
+    if carrier:
+        sha, lot = carrier["sha"][:12], report["work_item"]
+        if carrier.get("armed"):
+            lines.append("  packet carrier: auto-merge armed on %s → %s (PR #%s): ameesh "
+                         "merges it once the required checks are green"
+                         % (sha, carrier.get("base") or "?", carrier.get("pr")))
+        elif carrier.get("requested"):
+            lines.append("  packet carrier: ci-full requested on %s but the auto-merge is not "
+                         "armed (see the lot's `auto-merge not-armed` note): rerun `ameesh ci "
+                         "run %d --full --reason …`" % (sha, lot))
+        else:
+            # #3614 : le journal ne dit pas si la forge impose des checks à la
+            # cible ; sans check imposé (Nexlink), le feu atterrit le porteur
+            # (`fire._carrier_gap`) — la ligne reste conditionnelle.
+            lines.append("  packet carrier: no ci-full request on the frozen head %s — if the "
+                         "target's forge requires checks (ameesh: `tests` on main), a push run "
+                         "of the packet workflow does not produce them and nothing merges it: "
+                         "open its PR if none, then `ameesh ci run %d --full --reason …` "
+                         "(#2813); without required checks (Nexlink), the fire lands it. The "
+                         "journal alone does not tell which: the fire reads the protection and "
+                         "answers `not-ready` with this cause when it applies (#3611)"
+                         % (sha, lot))
     for run in report["runs"]:
         state = _STATUS_FR.get(run["status"], run["status"])
         attempt = int(run.get("run_attempt") or 1)
@@ -3492,7 +3535,8 @@ def _arm_packet(cfg, db, decision: dict, gh, args) -> dict | None:
         out = packet_automerge.arm(
             cfg, db, args.id, slug=decision["repo"], number=decision["pr"], sha=decision["sha"],
             target=decision.get("base_ref") or "", gh=packet_automerge.gh_of(gh),
-            actor=getattr(args, "actor", "") or work.SYSTEM_SENDER)
+            actor=getattr(args, "actor", "") or work.SYSTEM_SENDER,
+            checkout=getattr(args, "prevalidation_repo", "") or "")
     except Exception as exc:  # noqa: BLE001 - l'étiquette est posée : jamais fatal
         out = {"state": "error", "why": "%s: %s" % (type(exc).__name__, exc)}
     decision["auto_merge"] = out

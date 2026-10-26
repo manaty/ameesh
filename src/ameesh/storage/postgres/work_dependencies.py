@@ -229,6 +229,47 @@ class WorkDependencies(Contract):
                 tx, item_id, "Landing cleared: vehicle #%d" % int(removed[0]["vehicle_id"]), actor)
             return True
 
+    def landings_on_vehicle(self, vehicle_id):
+        """#3641 : les déclarations épinglées à ce véhicule (lecture groupée)."""
+        return self.db.query("""
+            SELECT work_item_id, vehicle_id, pinned_sha,
+                   until_on::text AS until_on, created_by
+              FROM work_landings
+             WHERE vehicle_id = %s
+             ORDER BY work_item_id""", (int(vehicle_id),))
+
+    @staticmethod
+    def _current_freeze(tx, vehicle_id):
+        """#3641 : le gel courant du véhicule, sous le verrou des landings.
+
+        Même règle que `set_landing` et `planned_waits.latest_freeze` : le
+        dernier jalon `frozen` non vide, départagé par `(at, id)`. Rend `''`
+        sans gel."""
+        rows = tx.query("""
+            SELECT sha FROM work_item_milestones
+             WHERE work_item_id = %s AND kind = 'frozen'
+               AND btrim(coalesce(sha, '')) <> ''
+             ORDER BY at DESC, id DESC LIMIT 1""", (int(vehicle_id),))
+        return (rows[0]["sha"] or "").strip() if rows else ""
+
+    def landing_matches(self, item_id, vehicle_id, pinned_sha, *, frozen_sha):
+        """#3641 : la déclaration est-elle encore celle du gel `frozen_sha` ?
+
+        Revalidation sous le verrou des landings, avant de prévenir le
+        déclarant : une déclaration renouvelée depuis, ou un gel plus récent,
+        ne reçoit pas d'avis pour un gel retardé."""
+        with self.db.transaction() as tx:
+            tx.execute(_LOCK)
+            tx.execute("SELECT id FROM work_items WHERE id = %s FOR NO KEY UPDATE",
+                       (int(vehicle_id),))
+            if self._current_freeze(tx, vehicle_id) != frozen_sha:
+                return False
+            rows = tx.query(
+                "SELECT pinned_sha FROM work_landings"
+                " WHERE work_item_id = %s AND vehicle_id = %s",
+                (int(item_id), int(vehicle_id)))
+            return bool(rows) and (rows[0]["pinned_sha"] or "").strip() == pinned_sha
+
     def landings_for(self, item_ids):
         ids = sorted({int(i) for i in item_ids})
         if not ids:

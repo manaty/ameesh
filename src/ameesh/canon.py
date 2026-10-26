@@ -1905,9 +1905,11 @@ def git_read(repo: str, commit: str, path: str, *,
         return None
 
 
-def git_remotes(repo: str) -> list[str]:
+def git_remotes(repo: str, *, deadline: Deadline | None = None) -> list[str]:
+    """Les dépôts distants ; avec ``deadline`` (#3572), une échéance épuisée
+    lève `GitDeadline` au lieu de se lire « aucun dépôt distant »."""
     try:
-        return (_git_out(repo, "remote") or "").split()
+        return (_git_out(repo, "remote", deadline=deadline) or "").split()
     except GitError:
         return []
 
@@ -1915,7 +1917,8 @@ def git_remotes(repo: str) -> list[str]:
 _BRANCH_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9._/-]*$")
 
 
-def remote_branch(repo: str, name: str) -> str | None:
+def remote_branch(repo: str, name: str, *,
+                  deadline: Deadline | None = None) -> str | None:
     """La branche de suivi distant que `name` désigne (`origin/main`), ou None.
 
     `main` → `origin/main` ; `origin/main` (un dépôt distant connu) et
@@ -1932,7 +1935,7 @@ def remote_branch(repo: str, name: str) -> str | None:
         short = text[len("refs/remotes/"):]
     elif text.startswith("refs/heads/"):
         short = "%s/%s" % (DEFAULT_REMOTE, text[len("refs/heads/"):])
-    elif "/" in text and text.split("/", 1)[0] in git_remotes(repo):
+    elif "/" in text and text.split("/", 1)[0] in git_remotes(repo, deadline=deadline):
         short = text
     else:
         short = "%s/%s" % (DEFAULT_REMOTE, text)

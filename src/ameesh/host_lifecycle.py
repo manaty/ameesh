@@ -41,14 +41,36 @@ def drain(cfg, db, host, *, duration=None, critical=(), actor=None):
 
 
 def critical_names(cfg, db):
-    """Declared critical agents and their own canon's coordination/review roles."""
-    from . import sous_utilisation
+    """Declared critical agents and every agent L242c treats as critical.
+
+    #3643: the roles are each canon's `critical_roles` (`federation.yaml`; the
+    code default applies when it declares none), never a list kept here. An
+    organisation that leaves `relecture` out (manaty/home#179) therefore no
+    longer counts its reviewers as critical when the host is drained.
+
+    #3641: the verdict comes from `sous_utilisation.critical_verdict`, the
+    same safe reading as the runner and the auditor (#424): a canon whose
+    owner cannot be read (or is only partly read) falls back to the last
+    recorded verdict, and to critical when none is known; the auditor persona
+    is critical without a card. A role list kept here could only lose those
+    cases silently.
+    """
+    from . import canon as canon_mod, sous_utilisation
     names = set(getattr(cfg, "critical_agents", ()) or ())
     canons = work.configured_canons(cfg)
-    roles = ("orchestrateur", "orchestrator", "conception", "design", "auditeur", "auditor", "reviewer")
+    try:
+        # A canon configured but unreadable yields no loaded canon; it is
+        # still a configured canon, and its agents must fall back to the last
+        # verdict (or critical), never to "no canon on this host".
+        configured = bool(canons) or bool(canon_mod.configured(cfg))
+    except Exception:  # noqa: BLE001 - an unreadable configuration is not "no canon"
+        configured = True
+    known = sous_utilisation.critical_memory(cfg)
     for agent in registry.overview(db):
-        own = [canon for canon in canons if canon.owns(agent.get("canon"))]
-        if agent["name"] in sous_utilisation.role_orchestrators(own, roles):
+        verdict, _unknown = sous_utilisation.critical_verdict(
+            agent, canons, configured=configured,
+            known=sous_utilisation.remembered(known, agent["name"]))
+        if verdict:
             names.add(agent["name"])
     return names
 

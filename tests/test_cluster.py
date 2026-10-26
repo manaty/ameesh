@@ -109,7 +109,7 @@ FERMEES = {
     "integration_train_fires": {"id", "target_key", "plan_id", "document", "state",
                                 "changed_by", "owner", "epoch", "created_at", "updated_at"},
     "integration_train_queue_receipts": {"id", "work_item_id", "generation", "frozen_id",
-                                         "kind", "created_at"},
+                                         "kind", "created_at", "target"},
     # #1465 (0445), required by #1467: exact provenance receipts also keep
     # their existing closed rights; this does not qualify their producers.
     "provenance_receipts": {"subject", "sha", "actor", "session", "turn", "harness",
@@ -160,6 +160,11 @@ FERMEES = {
     "work_packet_members": {"package_id", "work_item_id", "package_branch",
                             "base_sha", "head_sha", "unit_sha", "source_sha",
                             "frozen_sha", "recorded_by", "recorded_at"},
+    # #3631 (0488) : agrégat des relevés d'hôte par tranche de 10 min, tenu
+    # et lu par l'exécuteur (`lend_basis`), pas par le rôle superviseur ;
+    # état de mesure interne, fermé aux deux rôles, aucun GRANT modifié.
+    "host_resource_slots": {"host", "slot_start", "readings", "cpu_sum", "cpu_n",
+                            "free_mem_min", "first_cpu_at", "last_cpu_at"},
     # #2845 (0470) : curseur, reçus et progression de la veille des tickets
     # GitHub. État interne de l'agent de veille, pas un état de supervision ;
     # fermé aux deux rôles superviseur, aucun GRANT modifié.
@@ -174,8 +179,11 @@ FERMEES = {
     # L165 (EP2, 0476) : scores de candidats d'un rôle élu, lus par les
     # exécuteurs candidats et `ameesh role status`, pas par le rôle
     # superviseur ; table interne fermée aux deux rôles, aucun GRANT ajouté.
+    # #3568 (0485) : la route de poussée publiée avec le relevé (notify_ok,
+    # notify_diagnostic) reste interne à l'élection, fermée de même.
     "role_standings": {"id", "name", "host", "evaluated_at", "availability",
-                       "capacity", "score", "ready", "diagnostic"},
+                       "capacity", "score", "ready", "diagnostic",
+                       "notify_ok", "notify_diagnostic"},
     # #3099 (0478) : marque de libération d'une bascule de rôle élu, côté hôte
     # détenteur, relue par l'exécuteur au redémarrage ; état interne fermé aux
     # deux rôles superviseur, aucun GRANT modifié.
@@ -186,6 +194,10 @@ FERMEES = {
     # aux deux rôles, aucun GRANT modifié.
     "notify_liveness": {"host", "human", "seen_at"},
     "notify_briefs": {"recipient", "human", "sent_at"},
+    # #3576 (0487) : document de livraison de la passe alerts et son bail
+    # d'exécution, écrits et lus par le notificateur seul ; état interne fermé
+    # aux deux rôles superviseur, aucun GRANT modifié.
+    "notify_state": {"scope", "body", "owner", "epoch", "expires_at", "updated_at"},
 }
 #: L232b (0417) : l'état interne du contrôleur de release reste hors contrat,
 #: sauf `host_release_fences.host`, lu par `ameesh_host_gate_state` (l.314).

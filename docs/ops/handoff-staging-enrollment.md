@@ -78,7 +78,10 @@ ni ajouter silencieusement le runner à un groupe. H8 remplace l'appel local en 
 ([contrat et installation](../HANDOFF-LOCAL.md)). La décision #137536 b
 autorise son développement ; son enrôlement reste à nommer ici : UID du
 client, hôte, agents admis, SHA du runtime root, politique 0600 et unités
-systemd. Un socket absent ou refusé reste un préalable manquant.
+systemd. Ce manifeste n'attribue pas automatiquement au client local H2 les
+privilèges root du dispatcher distant. Un socket absent ou refusé, ou un
+besoin de privilège local non satisfait, reste un refus à résoudre
+explicitement avant qualification.
 
 ## Clés et restrictions du canal
 

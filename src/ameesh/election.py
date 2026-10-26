@@ -41,6 +41,20 @@ Each candidate host publishes its own standing (`role_standings`,
 `role_standings_pg.py`, pruned after two days); every host reads the fresh
 ones. `ameesh role status` prints the holder, the epoch and the ranked
 candidates.
+
+#3568: the standing also carries the candidate's **route** (`notify_ok`, the
+local ability to push an alert through ntfy/slack, resolved by
+`role_timers.notify_reach`). It does not enter readiness — a missing secret
+must not make the role's lease ineligible (#3402) — but it elects the pass
+separately: `alerts_delegate` gives the `alerts` timer to the holder when it
+can push, otherwise to the first fresh candidate that can. The delivery thus
+stops depending on the route of whoever happens to hold the lease.
+
+#3575: two edges of that rule. `notify_ok` also requires the host's
+`ameesh-role-alerts.timer` (installed, current, enabled): a route alone would
+elect a host that never runs the pass. And the fallback keeps its **last
+executor** while its shared `notify_liveness` beat is fresh, so two routed
+candidates no longer alternate at every capacity tie-break.
 """
 from __future__ import annotations
 
@@ -362,11 +376,49 @@ def _reading_reason(db, host: str, *, now: float | None = None,
     return "", reading
 
 
+def _notify_reach(cfg, role: Mapping) -> tuple[bool, str]:
+    """#3568: can THIS candidate push an alert to the role's required humans?
+
+    Reuses the rule of the alerts timer (`role_timers.notify_reach`): the
+    role's responsible and `notify.default_human` must each have a remote
+    channel (`ntfy`, `slack`) whose secret resolves in the unit environment.
+    A local configuration or secret gap is *reported*, never raised: it only
+    chooses the alerts delegate, it never makes the role ineligible (#3402:
+    a missing secret is not a negative result, still less a deploy failure).
+
+    #3575: a route is not enough — the delegate must be a host that will
+    *run* the pass. The `ameesh-role-alerts.timer` must be installed, current
+    and enabled there too; otherwise `notify_ok=true` would elect a candidate
+    whose timer does not exist (or still predates `--pass alerts`), and the
+    delivery would stay silent while another routed, equipped candidate
+    waits.
+    """
+    try:
+        from . import role_timers
+        humans, error = role_timers.notify_reach(
+            cfg, responsible=role.get("responsible"))
+    except Exception as exc:  # noqa: BLE001 - a local gap never breaks the election
+        return False, "notify reach unreadable: %s" % " ".join(str(exc).split())[:200]
+    if not humans:
+        return False, error or "no remote push route on this host"
+    try:
+        gap = role_timers.alerts_timer_gap(role=role.get("name") or "")
+    except Exception as exc:  # noqa: BLE001 - a local gap never breaks the election
+        return False, "alerts timer unreadable: %s" % " ".join(str(exc).split())[:200]
+    if gap:
+        return False, gap
+    return True, ""
+
+
 def evaluate(cfg, db, role: Mapping, host: str, *, now: float | None = None) -> dict:
     """One candidate's **local** standing: availability, capacity, score.
 
     `ready` is the local part only (`local_readiness`); the reader adds the
     placement, gate, canon and freshness checks (`candidate_state`).
+    `notify_ok` is published beside it (#3568): the candidate can push an
+    alert from this host. It is deliberately NOT part of `ready`: a missing
+    route does not make the role's lease ineligible, it delegates the
+    `alerts` pass to a candidate that can push (`alerts_delegate`).
     """
     now = pg.now_ts(db) if now is None else float(now)
     cover = freshness_s(db, host, now=now,
@@ -375,6 +427,7 @@ def evaluate(cfg, db, role: Mapping, host: str, *, now: float | None = None) -> 
     reading = pg.latest_reading(db, host)
     cap = capacity(reading)
     ready, diagnostic = local_readiness(cfg, db, role, host)
+    notify_ok, notify_diagnostic = _notify_reach(cfg, role)
     if role.get("operator_paused"):
         ready = False
         pause = "operator pause"
@@ -389,6 +442,8 @@ def evaluate(cfg, db, role: Mapping, host: str, *, now: float | None = None) -> 
         "score": score(av["availability"], cap),
         "ready": ready,
         "diagnostic": diagnostic,
+        "notify_ok": notify_ok,
+        "notify_diagnostic": notify_diagnostic,
         "sampled": av,
     }
 
@@ -442,6 +497,8 @@ def candidate_state(db, role: Mapping, host: str, *, now: float | None = None,
         "local_ready": bool(row.get("ready")),
         "ready": not reasons,
         "diagnostic": "; ".join(reasons),
+        "notify_ok": bool(row.get("notify_ok")),
+        "notify_diagnostic": str(row.get("notify_diagnostic") or ""),
         "freshness_limit_s": limit,
         "standing": row,
     }
@@ -486,11 +543,15 @@ def publish_self(cfg, db, host: str, *, interval_s: float = EVAL_INTERVAL_S,
                 "availability": 0.0, "capacity": 0.0, "score": 0.0,
                 "ready": False,
                 "diagnostic": "evaluation failed: %s" % db_mod.explain(exc),
+                "notify_ok": False,
+                "notify_diagnostic": "evaluation failed",
             }
         pg.record(db, role["name"], host,
                   availability=standing["availability"],
                   capacity=standing["capacity"], score=standing["score"],
-                  ready=standing["ready"], diagnostic=standing["diagnostic"])
+                  ready=standing["ready"], diagnostic=standing["diagnostic"],
+                  notify_ok=standing.get("notify_ok", False),
+                  notify_diagnostic=standing.get("notify_diagnostic", ""))
         published += 1
     return published
 
@@ -539,6 +600,8 @@ def candidacy(db, name: str, *, now: float | None = None) -> list[dict]:
             "capacity": None if not row else float(row.get("capacity") or 0.0),
             "score": None if not row else float(row.get("score") or 0.0),
             "diagnostic": diagnostic,
+            "notify_ok": bool(state.get("notify_ok")),
+            "notify_diagnostic": str(state.get("notify_diagnostic") or ""),
             "evaluated_ts": row.get("evaluated_ts"),
             "age_s": (now - float(row["evaluated_ts"])) if row.get("evaluated_ts") else None,
         })
@@ -555,6 +618,116 @@ def candidacy(db, name: str, *, now: float | None = None) -> list[dict]:
         item["rank"] = None
         item["delay_s"] = None
     return ordered
+
+
+def _last_executor(db, role: Mapping, pool: Sequence[Mapping], *,
+                   now: float) -> Mapping | None:
+    """#3575: the freshest routed candidate that already ran the alerts pass.
+
+    The pass records a shared `notify_liveness` beat for every human it
+    reaches (`notify_gap.beat`), so the last host that actually delivered is
+    visible from every reader without a new table. While that beat is fresh
+    (the same ``ALIVE_S`` as the deliverability alert), keeping that host
+    stops two routed fallbacks from alternating at every capacity tie-break,
+    each losing its own local notify state. A tie keeps the election's order.
+    """
+    from . import notify as notify_mod
+    from . import notify_gap
+    human = notify_mod.normalize_human(role.get("responsible"))
+    if not human or not pool:
+        return None
+    try:
+        rows = storage.of(db).notify_liveness.latest()
+    except Exception:  # noqa: BLE001 - hysteresis is a preference, never a gate
+        return None
+    limit = float(notify_gap.ALIVE_S)
+    last: dict[str, float] = {}
+    for row in rows:
+        if str(row.get("human") or "") != human:
+            continue
+        seen = float(row.get("seen_ts") or 0.0)
+        # Same freshness rule as the deliverability alert: a beat dated a
+        # little in the future (host clock) still counts, a stale one does not.
+        if seen < now - limit:
+            continue
+        host = str(row.get("host") or "")
+        if seen > last.get(host, float("-inf")):
+            last[host] = seen
+    pick = None
+    seen = None
+    for item in pool:  # election order breaks a tie deterministically
+        at = last.get(str(item.get("host") or ""))
+        if at is None:
+            continue
+        if pick is None or at > seen:
+            pick, seen = item, at
+    return pick
+
+
+def alerts_delegate(db, role: Mapping, *, holder: str | None = None,
+                    ranked: Sequence[Mapping] | None = None,
+                    now: float | None = None) -> dict:
+    """#3568: which host runs the ``alerts`` pass, and why.
+
+    The lease holder runs the pass when its published standing is fresh and
+    says it can push (`notify_ok`). Otherwise the first fresh candidate that
+    can push takes it, in the election's own order (readiness, availability,
+    capacity, host), so every reader computes the same delegate: the delivery
+    no longer goes silent because the elected lease fell to a host without a
+    route (#3383). A pinned role keeps its host: there is nowhere to delegate.
+
+    #3575: among those fallbacks, the **last executor** keeps the pass while
+    its shared `notify_liveness` beat is fresh and it is still routed
+    (:func:`_last_executor`): the capacity tie-break no longer makes two
+    equipped hosts alternate and lose their local notify state each time. The
+    holder's route, when it returns, still takes precedence (#3568).
+
+    `holder` and `ranked` let a caller that already read them (`status`,
+    `role run`) avoid a second, possibly incoherent read; they must come from
+    the same election snapshot. `delegate` is None when no candidate proves a
+    remote route: the timer then keeps standing by, and the shared
+    `notify_undeliverable` alert names the silence.
+    """
+    now = pg.now_ts(db) if now is None else float(now)
+    items = list(ranked) if ranked is not None else candidacy(
+        db, role.get("name") or "", now=now)
+    out = {
+        "role": role.get("name"),
+        "holder": holder,
+        "delegate": None,
+        "holder_notify_ok": False,
+        "last_executor": None,
+        "reason": "",
+    }
+    if str(role.get("releve") or "") != "election":
+        out["delegate"] = holder
+        out["reason"] = "pinned role: its host runs the pass"
+        return out
+    by_host = {item["host"]: item for item in items}
+    current = by_host.get(holder) if holder else None
+    if current is not None and current.get("fresh") and current.get("notify_ok"):
+        out.update(delegate=holder, holder_notify_ok=True,
+                   reason="the holder can push")
+        return out
+    usable = [item for item in items
+              if item.get("declared") and item.get("fresh") and item.get("notify_ok")]
+    ready = [item for item in usable if item.get("ready")]
+    pool = ready or usable
+    last = _last_executor(db, role, pool, now=now)
+    pick = last or (pool or [None])[0]
+    if pick is None:
+        out["reason"] = ("no fresh candidate can push"
+                         + (" (holder %s cannot)" % holder if holder else ""))
+        return out
+    reason = ("%s cannot push" % holder if holder
+              else "no live holder")
+    if last is not None:
+        reason += "; last executor %s stays in charge" % last["host"]
+        out["last_executor"] = last["host"]
+    else:
+        reason += "; first candidate that can push"
+    out.update(delegate=pick["host"], reason=reason)
+    return out
 
 
 def rank_delay_s(rank: int) -> float:
@@ -739,6 +912,7 @@ def status(db, name: str) -> dict:
               if role.get("lease_owner") and expires is not None
               and float(expires) > now else None)
     ranked = candidacy(db, name, now=now)
+    alerts = alerts_delegate(db, role, holder=holder, ranked=ranked, now=now)
     history = None
     for item in ranked:
         item["holder"] = item["host"] == holder
@@ -766,6 +940,7 @@ def status(db, name: str) -> dict:
                          if holder and expires is not None else None),
         "stopped": role.get("status") == "stopped",
         "candidates": ranked,
+        "alerts_delegate": alerts,
     }
 
 
@@ -783,18 +958,25 @@ def format_status(report: Mapping) -> list[str]:
     else:
         head = "%s: no holder (epoch %s)" % (name, report.get("epoch"))
     lines = [head]
-    lines.append("  %-22s %-5s %8s %8s %8s %5s %6s %7s  %s"
-                 % ("candidate", "ready", "avail.", "capacity", "score",
-                    "rank", "delay", "ahead", "diagnostic"))
+    alerts = report.get("alerts_delegate") or {}
+    if alerts.get("delegate") and alerts.get("delegate") != report.get("holder"):
+        lines.append("  alerts: %s (%s)" % (alerts["delegate"],
+                                            alerts.get("reason") or "delegated"))
+    lines.append("  %-22s %-5s %-5s %8s %8s %8s %5s %6s %7s  %s"
+                 % ("candidate", "ready", "route", "avail.", "capacity",
+                    "score", "rank", "delay", "ahead", "diagnostic"))
     for item in report.get("candidates") or ():
         if item.get("rank") is not None:
             rank = str(item["rank"])
             delay = "%ds" % int(item.get("delay_s") or 0)
         else:
             rank, delay = "—", "—"
-        lines.append("  %-22s %-5s %8s %8s %8s %5s %6s %7s  %s"
+        route = ("—" if item.get("evaluated_ts") is None
+                 else ("yes" if item.get("notify_ok") else "no"))
+        lines.append("  %-22s %-5s %-5s %8s %8s %8s %5s %6s %7s  %s"
                      % (item["host"] + (" *" if item.get("holder") else ""),
                         "yes" if item.get("ready") else "no",
+                        route,
                         "—" if item.get("availability") is None
                         else "%.1f%%" % item["availability"],
                         "—" if item.get("capacity") is None
@@ -806,6 +988,7 @@ def format_status(report: Mapping) -> list[str]:
                         else "%dmn" % int(item["ahead_s"] // 60),
                         item.get("diagnostic") or ""))
     lines.append("  (* holder; rank eligible = fresh, locally ready, gate "
-                 "open, canon ok, placement admitted; delay = rank × %ds)"
+                 "open, canon ok, placement admitted; route = can push an "
+                 "alert from this host (#3568); delay = rank × %ds)"
                  % int(RANK_DELAY_S))
     return lines

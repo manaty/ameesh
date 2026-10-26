@@ -8553,6 +8553,11 @@ RELOADABLE_FIELDS = frozenset({
     "accounts_shared", "account_sharing", "account_registry",
     # binaires de harnais de l'hôte (L106), lus au lancement de chaque tour
     "harness_bins",
+    # #3568 : la route de poussée (clé `notify`) décide le délégué de la passe
+    # alerts que cet hôte publie avec son relevé de candidature ; l'ajouter
+    # sans redémarrer évite de laisser un hôte fraîchement routé en `notify_ok`
+    # faux jusqu'au prochain redémarrage de l'exécuteur.
+    "notify",
 })
 
 

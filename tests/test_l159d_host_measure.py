@@ -363,6 +363,9 @@ class MeasureDbTest(PgTestCase):
     def setUp(self) -> None:
         super().setUp()
         self.db.execute("DELETE FROM host_resources")
+        # #3631 : les tranches survivent à la suppression de l'historique ;
+        # chaque essai part d'une table vide, quel que soit son ordre.
+        self.db.execute("DELETE FROM host_resource_slots")
 
     def test_record_keeps_the_measure(self):
         hosts = storage.of(self.db).hosts

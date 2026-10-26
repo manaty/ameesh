@@ -226,6 +226,9 @@ def python_reviewer_audit(db):
 QUEUE_COLUMNS = """
     q.work_item_id, q.target, q.frozen_sha, q.state, q.rank, q.landing_sha, q.reason,
     q.queued_by, q.source, q.generation, q.frozen_id,
+    EXISTS (SELECT 1 FROM integration_train_queue_receipts tr
+            WHERE tr.work_item_id = q.work_item_id AND tr.generation = q.generation
+              AND tr.kind = 'packet') AS packet_allocated,
     extract(epoch from q.queued_at)::float8 as queued_ts,
     extract(epoch from q.updated_at)::float8 as updated_ts,
     w.title, w.priority, w.state as item_state, w.branch, w.assignee
@@ -580,6 +583,12 @@ class WorkItems(interface.WorkItems):
         gagnant). Le verrou est pris avant les lignes de lots : aucun chemin
         ne prend l'ordre inverse.
 
+        #3607 : la relecture couvre aussi la `source` exacte, pas seulement
+        `issue_ref` — l'identité d'une exécution y vit aussi
+        (`ci-incident:<repo>:<run>`) et la synchro des tickets peut avoir
+        déplacé l'`issue_ref` du gagnant vers son ticket miroir pendant
+        l'attente du verrou.
+
         `parent_lot` (#1193): the explicit parent of a suite lot. The parent is
         read back **under lock in the same transaction**: still open, the
         blocking dependency edge is written with the creation (a failure of the
@@ -634,11 +643,15 @@ class WorkItems(interface.WorkItems):
                 # #2954 : sous le verrou consultatif, la relecture voit le
                 # premier créateur (son commit précède l'acquisition) ; un lot
                 # fermé garde l'identité de l'exécution, comme `_open`.
+                # #3607 : l'identité vit aussi dans `source`, exactement — la
+                # synchro des tickets peut avoir déplacé l'`issue_ref` du
+                # gagnant vers son ticket miroir pendant l'attente du verrou.
                 duplicate = tx.query(
-                    "SELECT id FROM work_items WHERE lower(issue_ref) = lower(%s)"
-                    " ORDER BY id LIMIT 1", (issue_ref,))
+                    "SELECT id FROM work_items"
+                    " WHERE lower(issue_ref) = lower(%s) OR lower(source) = lower(%s)"
+                    " ORDER BY id LIMIT 1", (issue_ref, issue_ref))
                 if duplicate:
-                    raise DbError("issue_ref %s is already carried by lot #%d"
+                    raise DbError("reference %s is already carried by lot #%d"
                                   % (issue_ref, int(duplicate[0]["id"])))
             behind = (WorkItems(tx)._pending(assignee, None)
                       if queued_note is not None and assignee else None)
@@ -2397,12 +2410,20 @@ class WorkItems(interface.WorkItems):
         return rows[0] if rows else None
 
     def queue_add(self, item_id, *, target, frozen_sha, note, actor,
-                  source="", frozen_id=None, packet=None, packet_initial=False, lease=None) -> dict | None:
+                  source="", frozen_id=None, packet=None, packet_initial=False, lease=None,
+                  withdrawn_after=None) -> dict | None:
         with self.db.transaction() as tx:
             lot = tx.query("SELECT state, app, branch, branch_target, type FROM work_items WHERE id = %s"
                            " AND state NOT IN ('merged', 'promoted', 'closed')"
                            " FOR NO KEY UPDATE", (int(item_id),))
             if not lot:
+                return None
+            # #3532: read under the lot row lock that `queue_remove` takes
+            # first, so a take-out cannot slip between this check and insertion.
+            # #3550: the take-out only binds the target and freeze it names.
+            if withdrawn_after is not None and WorkItems(tx).queue_withdrawn_since(
+                    item_id, withdrawn_after, target=target,
+                    frozen_id=frozen_id) is not None:
                 return None
             if lease is not None:
                 key, owner, epoch = lease
@@ -2440,8 +2461,42 @@ class WorkItems(interface.WorkItems):
                         allocated = receipt.get("generation")
                 if current is not None:
                     same = (current["generation"], current["target"], current["frozen_id"],
-                            current["frozen_sha"], current["source"], current["state"])
-                    return current if same == (allocated, target, frozen_id, frozen_sha, source, "queued") else None
+                            current["frozen_sha"], current["source"])
+                    if same != (allocated, target, frozen_id, frozen_sha, source):
+                        return None
+                    if current["state"] == "queued":
+                        return current
+                    if not interface.ci_required_ejection(current):
+                        return None
+                    # #3560 : la file radar a éjecté cette allocation faute de CI
+                    # de lot (§11 bis : il n'y en a pas, la CI du paquet en tient
+                    # lieu). Même gel, même SHA, aucun retrait : l'allocation est
+                    # remise en file sous une nouvelle génération et son reçu ;
+                    # un écrivain resté sur l'ancienne génération est refusé.
+                    # La ligne lue n'est pas verrouillée (une éjection n'écrit
+                    # que merge_queue) : l'UPDATE compare la ligne entière lue,
+                    # cause comprise, et une éjection concurrente pour une autre
+                    # cause le fait échouer (revue cx3, B/P2).
+                    requeued = tx.query(
+                        "UPDATE merge_queue SET state = 'queued', rank = NULL, landing_sha = NULL,"
+                        "   reason = '', generation = nextval('merge_queue_generation_seq'),"
+                        "   queued_by = %s, queued_at = clock_timestamp(), updated_at = now()"
+                        " WHERE work_item_id = %s AND state = 'ejected' AND generation = %s"
+                        "   AND reason = %s AND target = %s AND frozen_id IS NOT DISTINCT FROM %s"
+                        "   AND frozen_sha = %s AND source = %s"
+                        " RETURNING work_item_id",
+                        (actor or "", int(item_id), allocated, current["reason"], target,
+                         frozen_id, frozen_sha, source))
+                    if not requeued:
+                        return None
+                    WorkItems(tx)._event(int(item_id), lot[0]["state"],
+                                         "%s (#3560: allocation ejected for want of a lot CI, "
+                                         "requeued: generation %s)" % (note, allocated), actor)
+                    row = self._queue_row(tx, item_id)
+                    tx.execute("INSERT INTO integration_train_queue_receipts"
+                               " (work_item_id, generation, frozen_id, kind) VALUES (%s, %s, %s, 'packet')",
+                               (row["work_item_id"], row["generation"], row["frozen_id"]))
+                    return dict(row, packet_allocated=True)
                 if allocated is not None:
                     return None  # the allocated entry was withdrawn; do not resurrect it
                 if packet_initial is not True:
@@ -2469,6 +2524,9 @@ class WorkItems(interface.WorkItems):
                 tx.execute("INSERT INTO integration_train_queue_receipts"
                            " (work_item_id, generation, frozen_id, kind) VALUES (%s, %s, %s, 'packet')",
                            (row["work_item_id"], row["generation"], row["frozen_id"]))
+                # #3560 : la ligne rendue est lue avant son reçu ; elle le porte
+                # déjà, comme toute relecture (`packet_allocated`).
+                row = dict(row, packet_allocated=True)
             return row
 
     def queue_update(self, item_id, *, state=None, rank=None, reason=None, landing_sha=None,
@@ -2522,14 +2580,33 @@ class WorkItems(interface.WorkItems):
             # between a packet's check for absence and its insertion.
             lot = tx.query("SELECT state FROM work_items WHERE id = %s FOR NO KEY UPDATE", (int(item_id),))
             rows = tx.query("DELETE FROM merge_queue WHERE work_item_id = %s"
-                            " RETURNING work_item_id, generation, frozen_id", (int(item_id),))
+                            " RETURNING work_item_id, generation, frozen_id, target",
+                            (int(item_id),))
             if not rows:
                 return False
             WorkItems(tx)._event(int(item_id), lot[0]["state"], note, actor)
             tx.execute("INSERT INTO integration_train_queue_receipts"
-                       " (work_item_id, generation, frozen_id, kind) VALUES (%s, %s, %s, 'removed')",
-                       (rows[0]["work_item_id"], rows[0]["generation"], rows[0]["frozen_id"]))
+                       " (work_item_id, generation, frozen_id, target, kind)"
+                       " VALUES (%s, %s, %s, %s, 'removed')",
+                       (rows[0]["work_item_id"], rows[0]["generation"],
+                        rows[0]["frozen_id"], rows[0].get("target")))
             return True
+
+    def queue_withdrawn_since(self, item_id, since_ts, *, target=None,
+                              frozen_id=None) -> float | None:
+        # #3550: a take-out is final only for the queue entry it removed — its
+        # target and freeze. A removal of another target, or of an older
+        # freeze, must not stop a new fire's fallback. Legacy receipts without
+        # a target keep matching (they cannot be told apart); a receipt
+        # without a freeze never matches a named freeze.
+        rows = self.db.query(
+            "SELECT extract(epoch FROM max(created_at))::float8 AS at"
+            " FROM integration_train_queue_receipts WHERE work_item_id = %s"
+            " AND kind = 'removed' AND created_at >= to_timestamp(%s)"
+            " AND (%s::text IS NULL OR target IS NULL OR target = %s)"
+            " AND (%s::bigint IS NULL OR (frozen_id IS NOT NULL AND frozen_id = %s))",
+            (int(item_id), float(since_ts), target, target, frozen_id, frozen_id))
+        return rows[0]["at"] if rows and rows[0]["at"] is not None else None
 
     def land_lock(self, key, owner, ttl_s, *, epoch=None) -> int | None:
         if epoch is not None:  # renewal: only the holder, at its epoch
@@ -2556,6 +2633,20 @@ class WorkItems(interface.WorkItems):
             " WHERE target = %s AND owner = %s AND epoch = %s RETURNING target",
             (key, owner, int(epoch)))
         return bool(rows)
+
+    def land_holder(self, key) -> dict | None:
+        """#3598 : qui tient le bail, et jusqu'à quand, pour le refus de
+        `give`/`withdraw`. Horloge de la base, lecture seule, jamais une garde.
+        L'échéance est rendue en UTC ISO (`…Z`), identique sous les deux
+        pilotes plutôt que datetime (psycopg) ou texte (psql)."""
+        rows = self.db.query(
+            "SELECT owner,"
+            " to_char(expires_at AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"')"
+            "   AS expires_at,"
+            " extract(epoch FROM (expires_at - clock_timestamp()))::float8 AS left_s"
+            " FROM merge_locks WHERE target = %s AND owner IS NOT NULL"
+            "   AND expires_at > clock_timestamp()", (key,))
+        return dict(rows[0]) if rows else None
 
     def train_read(self, key) -> dict | None:
         rows = self.db.query(
@@ -2967,6 +3058,19 @@ class WorkItems(interface.WorkItems):
             "SELECT %s FROM work_items WHERE lower(issue_ref) = lower(%%s)"
             " ORDER BY id" % item_columns(self.db), (str(ref or ""),))
 
+    def by_source(self, source) -> list[dict]:
+        """#3607 : les lots dont la `source` vaut exactement cette référence,
+        quel que soit leur état. La comparaison est à la casse près, comme
+        `by_issue_ref` (la casse d'un dépôt GitHub ne fait pas une autre
+        exécution). Une source vide ne désigne rien : sans la garde, elle
+        rendrait tous les lots sans source."""
+        text = str(source or "").strip()
+        if not text:
+            return []
+        return self.db.query(
+            "SELECT %s FROM work_items WHERE lower(source) = lower(%%s)"
+            " ORDER BY id" % item_columns(self.db), (text,))
+
     def by_package(self, package_id) -> list[dict]:
         return self.db.query(
             "SELECT %s FROM work_items WHERE package_id = %%s ORDER BY id" % item_columns(self.db),
@@ -2974,7 +3078,7 @@ class WorkItems(interface.WorkItems):
 
     # -- paquet de composition (#2443) ---------------------------------------
     #: la lecture commune aux deux méthodes : l'appartenance, le porteur et
-    #: son jalon de fusion, en une requête.
+    #: ses jalons de fusion et de gel, en une requête.
     _PACKET_SELECT = (
         "SELECT m.package_id, m.work_item_id, m.package_branch, m.base_sha,"
         "       m.head_sha, m.unit_sha, m.source_sha, m.frozen_sha,"
@@ -2984,7 +3088,12 @@ class WorkItems(interface.WorkItems):
         "       (SELECT ms.sha FROM work_item_milestones ms"
         "         WHERE ms.work_item_id = m.package_id AND ms.kind = 'merged'"
         "           AND ms.sha <> ''"
-        "         ORDER BY ms.at DESC, ms.id DESC LIMIT 1) AS package_merged_sha"
+        "         ORDER BY ms.at DESC, ms.id DESC LIMIT 1) AS package_merged_sha,"
+        # #3634 : la tête gelée du porteur, sans filtre sur son sha : le
+        # dernier gel fait autorité, même s'il ne nomme aucun commit.
+        "       (SELECT ms.sha FROM work_item_milestones ms"
+        "         WHERE ms.work_item_id = m.package_id AND ms.kind = 'frozen'"
+        "         ORDER BY ms.at DESC, ms.id DESC LIMIT 1) AS package_frozen_sha"
         "  FROM work_packet_members m JOIN work_items p ON p.id = m.package_id"
     )
 

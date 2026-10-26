@@ -254,7 +254,7 @@ else:
 '''
 
 PIP = r'''#!/usr/bin/env python3
-import json, os, sys
+import json, os, re, sys
 from pathlib import Path
 state = Path(os.environ['FAKE_STATE'])
 log = state / 'pip.log'
@@ -273,8 +273,11 @@ if fail_at and len(log.read_text().splitlines()) >= fail_at:
 info = (Path(sys.argv[0]).resolve().parents[1]
         / 'lib/python3.11/site-packages/ameesh-1.9.0.dist-info')
 if info.is_dir():
+    # #3619 : comme le vrai pip, l'URL directe ne porte pas les extras de la
+    # spécification (`<src>[psycopg,crypto]`) ; le chemin installé est le même.
+    cible = re.sub(r'\[[^\]]*\]$', '', sys.argv[-1])
     (info / 'direct_url.json').write_text(json.dumps(
-        {'url': Path(sys.argv[-1]).resolve().as_uri()}))
+        {'url': Path(cible).resolve().as_uri()}))
 '''
 
 # #1969 : le helper de bascule crée un venv versionné (`python3 -m venv`). Sous
@@ -400,6 +403,13 @@ class VmAgentsHarness(unittest.TestCase):
         # vient de l'EnvironmentFile simulé ou du fichier de configuration.
         for nom in ('AMEESH_HOST', 'AGENT_MESH_HOST', 'AMEESH_CONFIG', 'AGENT_MESH_CONFIG'):
             self.env.pop(nom, None)
+        # #3604 : sous mesure, chaque faux exécutable de la VM (ssh, pip,
+        # ameesh, systemctl…) démarrait sa propre couverture ; le module pesait
+        # 2 413 s sur la part psycopg 1/8 (67 %), coupée au plafond de 60 min.
+        # Seul le processus de test est mesuré : ses lectures et son code
+        # restent dans la carte, les enfants ne sont plus instrumentés.
+        for variable in ('CARTE_MESURE', 'COVERAGE_PROCESS_START'):
+            self.env.pop(variable, None)
         # Le dépôt d'origine est bâti par le test : la CI clone la tête en
         # profondeur 1, l'historique du checkout n'est donc pas une dépendance
         # admissible (défaut de test, canon §3). Trois commits réels :

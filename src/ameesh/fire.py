@@ -43,6 +43,12 @@ relus sous le bail, renouvelé et vérifié juste avant chaque geste externe, et
 feu, gel et verdicts sont revalidés juste avant la PR, la file ou la fusion.
 Un détenteur périmé s'arrête (`busy`) au lieu d'agir sur un instantané
 (P1-3, P2-6).
+
+#3598 : un passage tient ce bail 15 à 20 s et le rend entre deux passages ;
+`give` et `withdraw` l'attendent donc par tentatives courtes et espacées
+jusqu'à `LOCK_WAIT_S` avant de refuser, en nommant le détenteur et son
+échéance. Le feu ne se pose ni ne se retire sur un instantané : il attend la
+fenêtre libre, sans jamais écrire hors bail.
 """
 from __future__ import annotations
 
@@ -50,6 +56,7 @@ import json
 import os
 import re
 import socket
+import time
 from urllib.parse import quote
 
 from . import land, lot_class, merge_queue, packet_guard, plan_git, storage, work
@@ -61,6 +68,14 @@ FIRE_KINDS = (FIRE, UNFIRE)
 MAX_LOTS = 1000
 #: durée du bail d'une opération de feu
 LOCK_TTL_S = 120.0
+#: #3598 : budget d'attente du bail par `give`/`withdraw` avant le refus. Un
+#: passage d'auto-fusion tient le bail 15 à 20 s et le rend entre deux
+#: passages : le retrait trouve une fenêtre libre bien avant la borne. À la
+#: borne, le refus nomme le détenteur et son échéance.
+LOCK_WAIT_S = LOCK_TTL_S
+#: première attente entre deux tentatives, doublée jusqu'à LOCK_WAIT_MAX_S
+LOCK_WAIT_FIRST_S = 0.25
+LOCK_WAIT_MAX_S = 2.0
 #: L165 (EP4) : marge du bail élu renouvelée juste avant `gh pr merge`
 #: (timeout de 120 s + relecture de la PR). La course résiduelle est
 #: documentée dans `docs/HOST-HANDOFFS.md`.
@@ -168,7 +183,7 @@ def state(db, lot: int) -> dict:
 
 
 def give(db, lot: int, *, sha: str, actor: str, note: str = "", repo: str | None = None,
-         exception: str = "", reason: str = "") -> dict:
+         exception: str = "", reason: str = "", wait: float | None = None) -> dict:
     """Donne le feu du pilote sur la tête gelée `sha` du lot (jalon `fire`).
 
     Refuse un lot terminé, un lot non gelé, un `sha` qui n'est pas un commit,
@@ -184,10 +199,9 @@ def give(db, lot: int, *, sha: str, actor: str, note: str = "", repo: str | None
     Le geste prend le bail du feu (`fire:<lot>`), celui du passage : un
     passage en cours d'armement ou de fusion ne peut pas ignorer un feu qui
     arrive, et le feu ne peut pas se poser pendant qu'un autre hôte agit
-    (#1374, P1-3)."""
-    handle = _lock(db, lot)
-    if handle is None:
-        raise FireError("another fire operation holds lot #%d: retry once it is done" % lot)
+    (#1374, P1-3). Il l'attend jusqu'à `wait` (LOCK_WAIT_S par défaut) avant
+    de refuser, en nommant alors le détenteur et son échéance (#3598)."""
+    handle = _wait_lock(db, lot, wait=wait)
     try:
         # L165 (EP4) : le feu du pilote est un geste hors base (il arme la
         # fusion) ; l'époque du bail élu est vérifiée et journalisée avant.
@@ -269,13 +283,15 @@ def _give_locked(db, lot: int, *, sha: str, actor: str, note: str = "",
                               note=(note or "").strip())
 
 
-def withdraw(db, lot: int, *, actor: str, note: str = "", repo: str | None = None) -> dict:
+def withdraw(db, lot: int, *, actor: str, note: str = "", repo: str | None = None,
+             wait: float | None = None) -> dict:
     """Retire le feu actif d'un lot (jalon `unfire`) : l'auto-fusion est
     désarmée et la ligne de file retirée au passage suivant, rien d'autre n'est
-    annulé. Même bail que le passage (#1374, P1-3)."""
-    handle = _lock(db, lot)
-    if handle is None:
-        raise FireError("another fire operation holds lot #%d: retry once it is done" % lot)
+    annulé. Même bail que le passage (#1374, P1-3), attendu jusqu'à `wait`
+    (LOCK_WAIT_S par défaut) : un passage le tient 15 à 20 s, le retrait doit
+    trouver sa fenêtre ; à la borne, le refus nomme le détenteur et son
+    échéance (#3598)."""
+    handle = _wait_lock(db, lot, wait=wait)
     try:
         from . import pilot_gesture
         try:
@@ -1745,6 +1761,59 @@ def _renew(handle, ttl: float = LOCK_TTL_S) -> bool:
         return False
 
 
+def _land_holder(db, lot: int) -> dict | None:
+    """Le détenteur du bail `fire:<lot>`, pour le refus (#3598).
+
+    Lecture de diagnostic, jamais une garde : un backend qui ne l'expose pas,
+    ou une lecture en échec, laisse le message générique."""
+    try:
+        reader = getattr(storage.of(db).work, "land_holder", None)
+        return reader("fire:%d" % lot) if reader is not None else None
+    except Exception:  # noqa: BLE001 - un message ne casse pas le refus
+        return None
+
+
+def _held_error(lot: int, holder: dict | None, waited: float) -> FireError:
+    """Le refus du bail, avec son détenteur et son échéance (#3598)."""
+    prefix = "another fire operation holds lot #%d" % lot
+    if not holder:
+        return FireError("%s: retry once it is done (waited %ds)" % (prefix, int(waited)))
+    owner = str(holder.get("owner") or "?")
+    until = str(holder.get("expires_at") or "?")
+    left = holder.get("left_s")
+    left_s = ""
+    if left is not None:
+        try:
+            left_s = " (%.0fs left)" % float(left)
+        except (TypeError, ValueError):
+            left_s = ""
+    return FireError("%s: held by %s until %s%s; retry once it is done (waited %ds)"
+                     % (prefix, owner, until, left_s, int(waited)))
+
+
+def _wait_lock(db, lot: int, *, wait: float | None = None,
+               sleep=time.sleep, clock=time.monotonic):
+    """Le bail `fire:<lot>`, en attendant qu'un passage le rende (#3598).
+
+    `give`/`withdraw` ne doivent plus échouer au premier refus : les passages
+    d'auto-fusion tiennent le bail 15 à 20 s, et le retrait doit passer dans
+    une fenêtre libre. Tentatives courtes et espacées jusqu'à `wait`
+    (`LOCK_WAIT_S` par défaut), puis refus nommant le détenteur et son
+    échéance. `sleep`/`clock` sont injectables pour les témoins."""
+    budget = LOCK_WAIT_S if wait is None else max(0.0, float(wait))
+    deadline = clock() + budget
+    interval = LOCK_WAIT_FIRST_S
+    while True:
+        handle = _lock(db, lot)
+        if handle is not None:
+            return handle
+        remaining = deadline - clock()
+        if remaining <= 0:
+            raise _held_error(lot, _land_holder(db, lot), budget)
+        sleep(min(interval, remaining))
+        interval = min(interval * 2.0, LOCK_WAIT_MAX_S)
+
+
 def _reconcile(db, row: dict, marks: list, status: dict, *, slug: str, repo: str | None,
                target: str, dry_run: bool) -> dict:
     """La PR est fusionnée : le lot passe `merged` tout de suite."""
@@ -1968,6 +2037,76 @@ def _not_ready(db, row: dict, status, out: dict, why: str, *, gh, slug: str,
     return out
 
 
+def _carrier_gap(db, row: dict, fire: dict, status, *, slug: str, target: str, gh,
+                 repo: str | None) -> str:
+    """#3611 : pourquoi le feu seul ne fusionnera pas ce porteur, ou "".
+
+    h-23 v4 (#3599, 25/10) : le porteur poussé, son workflow `paquet.yml` lance
+    la suite complète sur push ; le feu répond « the CI on the frozen commit
+    is still running » alors que rien ne pouvait s'armer — ni PR, ni
+    étiquette `ci-full`, et le check requis de `main` (`tests`) n'existe que
+    sur le run `pull_request` de `ci-full`. La file attend ce run push, puis
+    `land_guard` éjecte faute du check requis : fusion admin forcée.
+
+    Le passage **dit** la cause et nomme le geste ; il ne le fait pas : la
+    publication (PR ouverte, puis `ameesh ci run <porteur> --full`) porte la prévalidation du
+    paquet, l'épinglage de la composition et l'armement (#2813), et lance une
+    suite complète — un geste de pilote, pas un effet de bord d'un passage
+    périodique.
+
+    Rien n'est dit — la voie reste celle d'avant — quand la branche n'est pas
+    un porteur, quand la fusion automatique est déjà armée sur la tête, quand
+    la forge n'impose aucun check (le feu est alors la voie du porteur, #2813)
+    ou que cela ne peut se lire, et quand la tête porte déjà tous les checks
+    requis (la file sait alors l'atterrir). Un diagnostic illisible ne change
+    jamais la voie."""
+    from . import packet_automerge
+    branch = str(row.get("branch") or "")
+    if not packet_automerge.carrier(branch):
+        return ""
+    lot = int(row["id"])
+    sha = merge_queue.pinned(repo, _norm(fire.get("sha"))) if repo else None
+    sha = sha or _norm(fire.get("sha"))
+    try:
+        published = packet_automerge.publication(db, lot, sha)
+    except Exception:  # noqa: BLE001 - journal illisible : la voie ne change pas
+        return ""
+    if published["armed"]:
+        return ""
+    try:
+        names = [name for name, _app in _required_pairs(
+            required_checks(slug, target, None, gh=gh))]
+    except Exception:  # noqa: BLE001 - 403 (aucune garde de la forge) ou illisible
+        return ""
+    if not names:
+        return ""
+    try:
+        present = {r["name"] for r in _head_check_runs(slug, sha, gh=gh)} \
+            | {s["context"] for s in _head_statuses(slug, sha, gh=gh)}
+        missing = [name for name in names if name not in present]
+    except Exception:  # noqa: BLE001 - tête illisible : seules les causes locales
+        missing = None
+    causes = []
+    if status is None:
+        causes.append("no PR for %s" % branch)
+    if not published["requested"]:
+        causes.append("no ci-full-%s label requested" % sha[:12])
+    if missing:
+        causes.append("the required check(s) %s of %s are absent from the head %s (a push "
+                      "run of the packet workflow does not produce them)"
+                      % (", ".join(missing), target, sha[:12]))
+    if not causes or missing == []:
+        return ""
+    gesture = "`ameesh ci run %d --full --reason \"packet\"`" % lot
+    if status is None:
+        # `ci run` exige la PR ouverte (#1343) ; son ouverture ne lance rien
+        gesture = "`gh pr create --repo %s --base %s --head %s`, then %s" % (
+            slug, target, branch, gesture)
+    return ("packet carrier: the fire alone never merges it — %s; the packet auto-merge is "
+            "not armed on %s. Publish it: %s (label ci-full-<head>, arms the auto-merge, "
+            "#2813)" % ("; ".join(causes), sha[:12], gesture))
+
+
 def _queue_landing(cfg, db, row: dict, fire: dict, freeze: dict, status: dict, *,
                    repo: str | None, project, target: str, path: str) -> bool:
     """#3080: only the queue's clean two-parent landing preserves the fire.
@@ -2124,6 +2263,15 @@ def _act(cfg, db, row: dict, marks: list, *, gh, dry_run: bool, repo: str | None
         out.update(result="pr-closed", detail="PR #%s is closed without merge: reopen it"
                    % status.get("number"))
         return out
+
+    # #3611 : un porteur `integration/**` sur une cible dont la forge impose
+    # des checks ne fusionne que par sa publication (`ameesh ci run --full`,
+    # #2813) ; la file attendrait une CI qui ne produit pas ces checks.
+    gap = _carrier_gap(db, row, fire, status, slug=slug, target=target, gh=gh,
+                       repo=work_repo)
+    if gap:
+        return _not_ready(db, row, status, out, gap, gh=gh, slug=slug, dry_run=dry_run,
+                          handle=handle)
 
     # 5. la voie du lot (#2256) : décidée par la déclaration du projet ou
     #    l'état partagé de sa file, jamais par la config de cet hôte. Sans
@@ -2375,7 +2523,18 @@ def _queue(db, row: dict, marks: list, fire: dict, *, project, repo: str | None,
     dont la protection de branche GitHub n'est pas exploitable (Nexlink, plan
     gratuit : la lecture répond 403). Le contrôle de la cible y est celui de
     `merge_queue.enter` — la CI du commit gelé quand le projet déclare
-    `ci_required` (#2285 N3, hors périmètre de ce lot)."""
+    `ci_required` (#2285 N3, hors périmètre de ce lot).
+
+    #3532 : une sortie de file (`queue remove`, reçu typé `removed`) écrite
+    après ce feu est définitive pour lui : le repli ne ré-entre pas le lot
+    (`taken-out`). Sans cela, chaque passage défaisait la sortie, et le lot
+    atterrissait dès que la cible se libérait. Un nouveau feu ou un
+    `ameesh work queue add` explicite le remet en file.
+
+    #3550 : cette sortie ne vaut que pour l'entrée qu'elle a retirée — sa
+    cible et son gel. Une sortie d'une autre cible, ou d'un gel plus ancien,
+    ne retient pas le repli du feu courant (lecture `queue_withdrawn_since`
+    portée par `target` et `frozen_id`)."""
     lot = int(row["id"])
     if not repo:
         out.update(result="no-repository", detail=(
@@ -2394,6 +2553,19 @@ def _queue(db, row: dict, marks: list, fire: dict, *, project, repo: str | None,
         out.update(result="ejected", detail="merge queue of %s: ejected (%s)"
                    % (entry.get("target"), entry.get("reason") or "?"))
         return out
+    granted = float(fire.get("at_ts") or 0.0)
+    freeze = freeze_of(marks)
+    frozen_id = freeze.get("id") if freeze else None
+    try:
+        removed = storage.of(db).work.queue_withdrawn_since(
+            lot, granted, target=target or None, frozen_id=frozen_id)
+    except Exception as exc:  # noqa: BLE001 - reçus illisibles : on n'entre pas
+        out.update(result="not-ready", detail=(
+            "cannot read the queue take-outs of lot #%d (%s: %s): not queued"
+            % (lot, type(exc).__name__, str(exc)[:120])))
+        return out
+    if removed is not None:
+        return _taken_out(out, lot, removed, granted)
     if dry_run:
         out.update(result="would-queue", detail="enter the merge queue of %s" % (target or "?"))
         return out
@@ -2404,7 +2576,21 @@ def _queue(db, row: dict, marks: list, fire: dict, *, project, repo: str | None,
         target=getattr(project, "target", "") or "") if repo else None
     try:
         entered = merge_queue.enter(db, lot, repo=repo, actor=work.SYSTEM_SENDER,
-                                    project=project, clone=clone, cfg=cfg)
+                                    project=project, clone=clone, cfg=cfg,
+                                    withdrawn_after=granted)
+    except merge_queue.QueueWithdrawn:
+        # #3550: a failed re-read here is a transient refusal (not-ready), not
+        # an error that escapes the fire pass. The read is scoped like the
+        # first one: the take-out must name this target and this freeze.
+        try:
+            removed = storage.of(db).work.queue_withdrawn_since(
+                lot, granted, target=target or None, frozen_id=frozen_id)
+        except Exception as exc:  # noqa: BLE001 - reçus illisibles : on n'entre pas
+            out.update(result="not-ready", detail=(
+                "cannot read the queue take-outs of lot #%d (%s: %s): not queued"
+                % (lot, type(exc).__name__, str(exc)[:120])))
+            return out
+        return _taken_out(out, lot, removed or granted, granted)
     except merge_queue.QueueError as exc:
         out.update(result="not-ready", detail=str(exc))
         return out
@@ -2417,6 +2603,14 @@ def _queue(db, row: dict, marks: list, fire: dict, *, project, repo: str | None,
            ", PR #%s" % entered.get("pr") if entered.get("pr") else "")),
         {"project": row.get("app") or "", "target": entered.get("target"),
          "sha": fire.get("sha")})
+    return out
+
+
+def _taken_out(out: dict, lot: int, removed: float, granted: float) -> dict:
+    out.update(result="taken-out", detail=(
+        "lot #%d was taken out of the merge queue at %s, after its fire (%s): the fire's "
+        "fallback does not queue it again; fire again or `ameesh work queue add %d`"
+        % (lot, merge_queue._utc(removed), merge_queue._utc(granted), lot)))
     return out
 
 
@@ -2505,9 +2699,11 @@ def add_parser(work_sub, func) -> None:
                      "which departs at green CI")
     parser.add_argument("id", type=int)
     parser.add_argument("--sha", default="",
-                        help="the frozen head the fire covers (to give the fire)")
+                        help="the frozen head the fire covers (to give the fire); waits for an "
+                             "in-flight pass's lease (up to ~2 min) before refusing")
     parser.add_argument("--withdraw", action="store_true",
-                        help="withdraw the fire: the automatic merge is disarmed")
+                        help="withdraw the fire: the automatic merge is disarmed; waits for an "
+                             "in-flight pass's lease (up to ~2 min) before refusing (#3598)")
     parser.add_argument("--repo", default=None,
                         help="the lot's repository: a checkout path, or the current "
                              "checkout's owner/name (default: the current git repository)")

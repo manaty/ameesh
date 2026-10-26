@@ -90,6 +90,8 @@ _CONNECT_HINTS = (
 UNIQUE_VIOLATION = "23505"
 #: code SQLSTATE de PostgreSQL pour un interblocage détecté (#1496)
 DEADLOCK_DETECTED = "40P01"
+#: code SQLSTATE d'une requête annulée — dont `statement_timeout` (#3631)
+QUERY_CANCELED = "57014"
 #: une ligne de sévérité psql en verbosité `verbose` : « ERROR:  23505: … ».
 #: Le libellé de sévérité est traduit par le client (`ERREUR` en français) :
 #: on ne le reconnaît pas à son nom, mais à la forme « <mot>: <code>: » — le
@@ -137,13 +139,23 @@ class DbError(RuntimeError):
     serveur et le nom de la contrainte violée, quand le pilote les donne
     (psycopg par ses diagnostics, psql par ses champs `verbose`) ; None
     sinon. Le texte du message ne sert jamais à classifier : il dépend de
-    `lc_messages` du serveur (codex #478 r2)."""
+    `lc_messages` du serveur (codex #478 r2).
+
+    #3631 : `sql` et `elapsed_ms` nomment l'instruction qui a échoué et sa
+    durée, quand le pilote les a mesurées — un `statement_timeout` ne dit pas
+    quelle requête a expiré, et c'est ce que la passe de redésignation perdait
+    sans le dire. Le message reste inchangé (aucune classification par son
+    texte)."""
 
     def __init__(self, message, *, sqlstate: str | None = None,
-                 constraint: str | None = None) -> None:
+                 constraint: str | None = None,
+                 sql: str | None = None,
+                 elapsed_ms: float | None = None) -> None:
         super().__init__(message)
         self.sqlstate = sqlstate
         self.constraint = constraint
+        self.sql = sql
+        self.elapsed_ms = elapsed_ms
 
 
 def is_unique_violation(exc: BaseException, constraint: str | None = None) -> bool:
@@ -534,7 +546,9 @@ class PsqlDriver:
                 raise Unavailable("psql: %s" % message)
             raise DbError("psql: %s" % message)
 
-    def _fail(self, proc: subprocess.CompletedProcess) -> DbError:
+    def _fail(self, proc: subprocess.CompletedProcess, *,
+              sql: str | None = None,
+              elapsed_ms: float | None = None) -> DbError:
         stderr = proc.stderr or ""
         lines = [l for l in stderr.strip().splitlines() if l.strip()]
         message = lines[-1] if lines else "code %d" % proc.returncode
@@ -555,13 +569,15 @@ class PsqlDriver:
         name = _constraint_name(stderr, state[1]) if state else None
         return DbError("psql: %s" % message,
                        sqlstate=state[0] if state else None,
-                       constraint=name)
+                       constraint=name, sql=sql, elapsed_ms=elapsed_ms)
 
     # -- interface ---------------------------------------------------------
     def query(self, sql: str, params: Sequence[Any] = ()) -> list[dict]:
+        started = time.monotonic()
         proc = self._run(["-c", _json_query(bind(sql, params))])
         if proc.returncode != 0:
-            raise self._fail(proc)
+            raise self._fail(proc, sql=sql,
+                             elapsed_ms=(time.monotonic() - started) * 1000.0)
         return _parse_json_rows(proc.stdout.strip())
 
     def query_batch(self, items: Sequence[tuple]) -> list[list[dict]]:
@@ -596,9 +612,11 @@ class PsqlDriver:
         return out
 
     def execute(self, sql: str, params: Sequence[Any] = ()) -> int:
+        started = time.monotonic()
         proc = self._run(["-c", bind(sql, params)])
         if proc.returncode != 0:
-            raise self._fail(proc)
+            raise self._fail(proc, sql=sql,
+                             elapsed_ms=(time.monotonic() - started) * 1000.0)
         return 0
 
     def script(self, sql: str) -> None:
@@ -1131,6 +1149,7 @@ class PsycopgDriver:
         if self._deferred(sql):
             return self._run_batch([(sql, params)], probe=True, fetch=True)[0]
         TRACE.trip(sql)
+        started = time.monotonic()
         try:
             with self.conn.cursor() as cur:
                 if params:
@@ -1139,7 +1158,8 @@ class PsycopgDriver:
                     cur.execute(sql)
                 return [_normalize_row(dict(row)) for row in cur.fetchall()]
         except Exception as exc:
-            raise _map_error(exc) from exc
+            raise _map_error(exc, sql=sql,
+                             elapsed_ms=(time.monotonic() - started) * 1000.0) from exc
 
     @_serial
     def query_batch(self, items: Sequence[tuple]) -> list[list[dict]]:
@@ -1176,6 +1196,7 @@ class PsycopgDriver:
         if self._deferred(sql):
             return self._run_batch([(sql, params)], probe=True, fetch=False)[0]
         TRACE.trip(sql)
+        started = time.monotonic()
         try:
             with self.conn.cursor() as cur:
                 if params:
@@ -1184,7 +1205,8 @@ class PsycopgDriver:
                     cur.execute(sql)
                 return cur.rowcount
         except Exception as exc:
-            raise _map_error(exc) from exc
+            raise _map_error(exc, sql=sql,
+                             elapsed_ms=(time.monotonic() - started) * 1000.0) from exc
 
     @_serial
     def script(self, sql: str) -> None:
@@ -1346,14 +1368,36 @@ def _constraint(exc: Exception) -> str | None:
     return name if isinstance(name, str) and name else None
 
 
-def _map_error(exc: Exception) -> DbError:
+def _map_error(exc: Exception, *, sql: str | None = None,
+               elapsed_ms: float | None = None) -> DbError:
     text = _one_line(exc).lower()
     state = _sqlstate(exc)
     if any(hint in text for hint in _CONNECT_HINTS):
-        return Unavailable(_one_line(exc), sqlstate=state)
+        return Unavailable(_one_line(exc), sqlstate=state, sql=sql,
+                           elapsed_ms=elapsed_ms)
     if "does not exist" in text and ("relation" in text or "table" in text):
-        return SchemaMissing(_one_line(exc), sqlstate=state)
-    return DbError(_one_line(exc), sqlstate=state, constraint=_constraint(exc))
+        return SchemaMissing(_one_line(exc), sqlstate=state, sql=sql,
+                             elapsed_ms=elapsed_ms)
+    return DbError(_one_line(exc), sqlstate=state, constraint=_constraint(exc),
+                   sql=sql, elapsed_ms=elapsed_ms)
+
+
+def timeout_detail(exc: BaseException, limit: int = 240) -> str:
+    """#3631 : nomme la requête qu'un `statement_timeout` a annulée.
+
+    Un délai dépassé ne dit pas, à lui seul, quelle instruction a expiré :
+    le pilote attache l'instruction et sa durée à `DbError` (`sql`,
+    `elapsed_ms`). Rend le message d'origine pour toute autre erreur, et
+    l'instruction tronquée quand elle est connue — le journal de l'exécuteur
+    porte alors le nom de la requête coupable, pas seulement « timeout ».
+    """
+    text = _one_line(exc)
+    sql = getattr(exc, "sql", None)
+    if not sql or getattr(exc, "sqlstate", None) != QUERY_CANCELED:
+        return text
+    elapsed = getattr(exc, "elapsed_ms", None)
+    took = "" if elapsed is None else " after %.1fs" % (float(elapsed) / 1000.0)
+    return "%s%s on: %s" % (text, took, _one_line(sql)[:limit])
 
 
 def is_unavailable(exc: BaseException) -> bool:

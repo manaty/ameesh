@@ -1270,7 +1270,8 @@ def guard_delivery(db, item: dict) -> dict:
         if author and actor and actor.lower() == author.lower():
             continue                  # on ne relit pas son propre travail
         try:
-            family = merge_queue.actor_family(db, actor)
+            # #3578 : la famille du verdict (son reçu), pas la session courante
+            family = merge_queue.verdict_family(db, mark)
         except merge_queue.RegistryReadError:
             family = ""              # #2521 : lecture impossible, famille non prouvée
         if family and author_family and family == author_family:

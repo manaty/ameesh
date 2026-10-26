@@ -48,12 +48,21 @@ class OptionalJobReadingTest(unittest.TestCase):
             return release.ci_reading(self.project, "a" * 40)
 
     def test_non_conclusive_optional_jobs_are_candidates_and_consigned(self):
-        for conclusion in ("cancelled", None, "timed_out", "startup_failure"):
+        for conclusion in ("cancelled", "timed_out", "startup_failure"):
             with self.subTest(conclusion=conclusion):
                 reading = self.read(suite(mac=conclusion))
                 self.assertTrue(release.reading_is_green(reading), reading)
                 self.assertTrue(any("plateforme macOS" in text and "actions/runs/600" in text
                                     for text in reading["inconclusive"]))
+
+    def test_an_in_progress_optional_job_waits_and_is_not_consigned(self):
+        # #3530 : une part encore en cours n'a pas conclu ; elle attend, elle
+        # n'ouvre pas de lot de correction.
+        reading = self.read(suite(mac=None))
+        self.assertTrue(release.reading_is_green(reading), reading)
+        self.assertEqual(reading["inconclusive"], [])
+        self.assertEqual(release._run_evidence(suite(mac=None)["runs"][0])["inconclusive"],
+                         [])
 
     def test_jobs_skipped_by_design_are_not_consigned(self):
         # Real push run on main: these jobs are skipped by their `if:`.
@@ -66,24 +75,38 @@ class OptionalJobReadingTest(unittest.TestCase):
         self.assertEqual(release._run_evidence(data["runs"][0])["inconclusive"], [])
 
     def test_separate_macos_workflow_is_consigned_without_blocking(self):
-        for conclusion in (None, "cancelled", "timed_out", "startup_failure"):
+        for conclusion in ("cancelled", "timed_out", "startup_failure"):
             with self.subTest(conclusion=conclusion):
                 data = suite(mac="success")
                 data["runs"].append(fixture._run(700, [fixture._job(
-                    "suite macOS complète", conclusion or "",
-                    "completed" if conclusion else "in_progress")],
-                    workflow="macos", conclusion=conclusion or ""))
+                    "suite macOS complète", conclusion,
+                    "completed")],
+                    workflow="macos", conclusion=conclusion))
                 reading = self.read(data, {
                     **rollup(), "negative": [], "failed": [],
-                    "pending": [] if conclusion else ["macos"],
-                    "inconclusive": ["macos"] if conclusion else [],
+                    "pending": [], "inconclusive": ["macos"],
                 })
                 self.assertTrue(reading["green"], reading)
                 self.assertEqual(reading["pending"], [])
                 self.assertEqual(reading["inconclusive"], [
                     "suite macOS complète (%s; https://github.com/manaty/ameesh/actions/runs/700)"
-                    % (conclusion or "in_progress")])
+                    % conclusion])
                 self.assertEqual(release._full_suite_run(data)["id"], 600)
+
+    def test_a_running_separate_macos_workflow_waits_without_blocking(self):
+        # #3530 : le workflow facultatif encore en cours n'est pas consigné et
+        # ne retient pas l'agrégat vert.
+        data = suite(mac="success")
+        data["runs"].append(fixture._run(700, [fixture._job(
+            "suite macOS complète", "", "in_progress")],
+            workflow="macos", conclusion=""))
+        reading = self.read(data, {
+            **rollup(), "negative": [], "failed": [], "pending": ["macos"],
+        })
+        self.assertTrue(reading["green"], reading)
+        self.assertEqual(reading["pending"], [])
+        self.assertEqual(reading["inconclusive"], [])
+        self.assertEqual(release._full_suite_run(data)["id"], 600)
 
     def test_separate_macos_workflow_failure_still_blocks(self):
         data = suite(mac="success")
@@ -342,21 +365,36 @@ class OptionalJobReadingTest(unittest.TestCase):
 
 class OptionalJobPlanTest(fixture.ReleaseFixtureMixin, unittest.TestCase):
     def plan(self, *, mac="cancelled", tests="success"):
+        # #3633 : la tête du paquet (^2) porte le même arbre que la tête ; elle
+        # a donc la même suite, sinon son vert ferait hériter la tête (décision
+        # owner #141353 a) et le témoin ne lirait plus la CI propre de la tête.
+        packet = self.git(self.seed, "rev-parse", self.head + "^2")
+
         def jobs(project, sha):
-            return suite(mac=mac, tests=tests) if sha == self.head else suite(mac="success")
+            if sha in (self.head, packet):
+                return suite(mac=mac, tests=tests)
+            return suite(mac="success")
         with mock.patch.object(release.radar, "commit_ci", return_value=rollup()), \
              mock.patch.object(release, "suite_reading", side_effect=jobs):
             return release.build_plan(self.cfg, self.project, now=fixture._paris(11, 5))
 
     def test_head_is_selected_and_optional_job_is_in_release_notes(self):
-        for conclusion in ("cancelled", None, "timed_out", "startup_failure"):
+        for conclusion in ("cancelled", "timed_out", "startup_failure"):
             with self.subTest(conclusion=conclusion):
                 plan = self.plan(mac=conclusion)
                 self.assertEqual(plan.base, self.head)
                 self.assertTrue(plan.green)
                 self.assertIn("plateforme macOS", plan.notes)
-                self.assertIn(conclusion or "in_progress", plan.notes)
+                self.assertIn(conclusion, plan.notes)
                 self.assertIn("actions/runs/600", plan.notes)
+
+    def test_a_running_optional_job_stays_out_of_the_release_notes(self):
+        # #3530 : un job encore en cours n'est pas un non concluant ; il ne
+        # s'écrit pas dans les notes et n'ouvre pas de lot.
+        plan = self.plan(mac=None)
+        self.assertEqual(plan.base, self.head)
+        self.assertTrue(plan.green)
+        self.assertNotIn("plateforme macOS", plan.notes)
 
     def test_optional_failure_falls_back_to_previous_green_commit(self):
         plan = self.plan(mac="failure")
@@ -375,6 +413,26 @@ class OptionalJobPlanTest(fixture.ReleaseFixtureMixin, unittest.TestCase):
             if sha == self.head:
                 return suite(tests=None)
             if sha == packet:
+                return suite(mac="cancelled")
+            return suite(mac="success", run_id=500)
+
+        with mock.patch.object(release.radar, "commit_ci", return_value={
+                **rollup(), "negative": [], "pending": ["tests"], "failed": []}), \
+             mock.patch.object(release, "suite_reading", side_effect=jobs):
+            plan = release.build_plan(self.cfg, self.project, now=fixture._paris(11, 5))
+        self.assertEqual(plan.base, self.head)
+        self.assertEqual(plan.tree_green["head"], packet)
+        self.assertIn("plateforme macOS (cancelled", plan.notes)
+
+    def test_inherited_packet_proof_leaves_a_running_job_out_of_the_notes(self):
+        # #3530 : un job encore en cours sur la tête du paquet n'est pas un
+        # non concluant à citer.
+        packet = self.git(self.seed, "rev-parse", self.head + "^2")
+
+        def jobs(project, sha):
+            if sha == self.head:
+                return suite(mac=None, tests=None)
+            if sha == packet:
                 return suite(mac=None)
             return suite(mac="success", run_id=500)
 
@@ -384,7 +442,7 @@ class OptionalJobPlanTest(fixture.ReleaseFixtureMixin, unittest.TestCase):
             plan = release.build_plan(self.cfg, self.project, now=fixture._paris(11, 5))
         self.assertEqual(plan.base, self.head)
         self.assertEqual(plan.tree_green["head"], packet)
-        self.assertIn("plateforme macOS (in_progress)", plan.notes)
+        self.assertNotIn("plateforme macOS", plan.notes)
 
     def test_fallback_base_keeps_its_optional_job_in_release_notes(self):
         self.write("red.txt", "red\n")

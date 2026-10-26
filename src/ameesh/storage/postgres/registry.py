@@ -567,6 +567,19 @@ class Agents(interface.Agents):
                .replace("__CLAIM_OK__", canon_claim_predicate_sql("r"))
         )
 
+    def reachability(self) -> list[dict]:
+        # #3631 : la passe de redésignation n'a besoin que de ces six
+        # colonnes ; `overview()` y ajoutait le canon, les baux, les jauges et
+        # des colonnes larges (`pending_prompt`, `last_error`), et expirait
+        # sous la pression de la base commune. `retired_ts` est la forme que
+        # lit `review_designation.is_retired`.
+        return self.db.query(
+            "SELECT name, aliases,"
+            "       extract(epoch from retired_at)::float8 AS retired_ts,"
+            "       mode, status, host"
+            "  FROM agent_registry"
+            " ORDER BY name")
+
     def claimable(self, host, names, *, require_responsible) -> list[dict]:
         # L165 (EP1) : un agent `releve: election` est visible sur tout hôte
         # candidat, même si sa ligne est encore sur un autre. Le dossier et
@@ -730,6 +743,8 @@ class Agents(interface.Agents):
             """
             SELECT r.name, r.mode, r.status, r.stop_reason, r.responsible, r.host,
                    r.canon_ref, r.placement_ok, r.placement_diagnostic,
+                   -- #3460 : le retrait est un état, pas une attente de canon
+                   extract(epoch from r.retired_at)::float8 AS retired_ts,
                    -- #2200 : la pause opérateur fait partie de la disponibilité
                    r.operator_paused, r.operator_pause_reason, r.operator_pause_by,
                    (NOT r.ephemeral OR r.ephemeral_expires_at > now()) AS alive,

@@ -10,6 +10,7 @@ import subprocess
 import shutil
 import sys
 import tempfile
+import threading
 import time
 import unittest
 
@@ -33,6 +34,11 @@ if os.environ.get('FAKE_STALL_SSH') \
         sys.exit(128 + signum)
     signal.signal(signal.SIGINT, _recu)
     signal.signal(signal.SIGTERM, _recu)
+    # #3608 : le pid de cette session (l'enfant ssh vit hors du groupe bash)
+    # permet au banc de tuer le dernier détenteur des tuyaux quand le client
+    # est tué avant lui.
+    if os.environ.get('FAKE_STALL_PID'):
+        Path(os.environ['FAKE_STALL_PID']).write_text(str(os.getpid()))
     # Le témoin n'est posé qu'une fois les gestionnaires installés : le banc
     # peut alors envoyer le signal sans course.
     if os.environ.get('FAKE_STALL_STARTED'):
@@ -458,6 +464,9 @@ DATE = ('#!/bin/sh\n'
 
 
 class AgentHostTest(unittest.TestCase):
+    #: #3608 : le faux ssh stallé écrit son pid ici (sa session propre).
+    SSH_PID = 'ssh-pid'
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(prefix='ameesh-503-')
         self.addCleanup(self.tmp.cleanup)
@@ -488,6 +497,14 @@ class AgentHostTest(unittest.TestCase):
                         FAKE_DB_PYTHON=str(self.bin / 'db-python'),
                         FAKE_SHARE=str(self.share),
                         PATH=str(self.bin) + os.pathsep + os.environ['PATH'])
+        # #3604 : sous mesure, chaque faux exécutable de la VM (ssh, ameesh,
+        # systemctl…) démarrait sa propre couverture ; test_503 pesait ~62 s
+        # par test (run 40240378071, part psycopg 2/12 coupée à 61 min). Seul
+        # le processus de test est mesuré : ses lectures et son code restent
+        # dans la carte, les enfants ne sont plus instrumentés — même correctif
+        # que test_1252 dans 240a58a7.
+        for variable in ('CARTE_MESURE', 'COVERAGE_PROCESS_START'):
+            self.env.pop(variable, None)
         self.agents = [dict(name=n, host=h, mode=m, status=s) for n,h,m,s in [
             ('dev9', 'host-agents', 'execute', 'idle'),
             ('dev8', 'host-agents', 'execute', 'idle'),
@@ -520,6 +537,56 @@ class AgentHostTest(unittest.TestCase):
         if enfant.poll() is None:
             enfant.terminate()
         enfant.communicate(timeout=5)
+
+    @staticmethod
+    def _tuer_la_session_ssh(pid_file):
+        """#3608 : tue la session de l'enfant ssh, dernier détenteur des tuyaux."""
+        try:
+            pid = int(Path(pid_file).read_text())
+        except (OSError, ValueError):
+            return
+        if pid <= 1:
+            return
+        try:
+            # pid recyclé ou processus hors session propre : killpg(pid)
+            # tuerait un groupe étranger, pas celui du faux ssh.
+            if os.getsid(pid) != pid:
+                return
+        except ProcessLookupError:
+            return
+        try:
+            os.killpg(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
+    def _terminer_l_appel(self, proc):
+        """#3608 : borner la récolte après le killpg du groupe bash.
+
+        L'enfant ssh vit dans sa propre session (`start_new_session` côté
+        client) : il survit au killpg du groupe bash et garde stdout/stderr
+        ouverts, donc `communicate()` sans borne ne rend jamais la main
+        (run carte 40177589953 : 3 087 s sans sortie). On tue d'abord sa
+        session par le pid du faux ssh, puis on borne la récolte : sous
+        charge, l'échec est attribué au test au lieu d'attendre le plafond de
+        la part de CI.
+        """
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        self._tuer_la_session_ssh(self.state / self.SSH_PID)
+        try:
+            proc.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            # Une session ssh inconnue retient encore les tuyaux : renoncer
+            # promptement, sans jamais attendre la fin du plafond de CI.
+            try:
+                proc.kill()
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
+            self.fail("l'appel de drain n'a pas rendu ses tuyaux dans la "
+                      "borne de récolte")
 
     def units(self):
         path = self.state / 'units.log'
@@ -738,6 +805,7 @@ class AgentHostTest(unittest.TestCase):
         (self.state / 'horloge').write_text('0')
         self.env.update(DRAIN_ATTENTE='1', FAKE_STALL_SSH='1',
                         FAKE_STALL_MATCH='ameesh pause dev9',
+                        FAKE_STALL_PID=str(self.state / self.SSH_PID),
                         DRAIN_ECHEANCE='1', DRAIN_BORNE_INSTRUCTION='1',
                         DRAIN_DERIVE='1',
                         HORLOGE_FICHIER=str(self.state / 'horloge'))
@@ -754,8 +822,7 @@ class AgentHostTest(unittest.TestCase):
         try:
             _, stderr = proc.communicate(timeout=10)
         except subprocess.TimeoutExpired:
-            os.killpg(proc.pid, 9)
-            proc.communicate()
+            self._terminer_l_appel(proc)
             self.fail('drain call outlived its deadline with a live SSH client')
         self.assertNotEqual(proc.returncode, 0)
         self.assertIn('appel de drain expiré', stderr)
@@ -775,8 +842,7 @@ class AgentHostTest(unittest.TestCase):
         try:
             _, stderr = proc.communicate(timeout=10)
         except subprocess.TimeoutExpired:
-            os.killpg(proc.pid, 9)
-            proc.communicate()
+            self._terminer_l_appel(proc)
             self.fail('drain call outlived its deadline with a live SSH client')
         ecoule = time.monotonic() - debut
         self.assertNotEqual(proc.returncode, 0)
@@ -802,15 +868,65 @@ class AgentHostTest(unittest.TestCase):
                     and time.monotonic() < limite:
                 time.sleep(0.05)
             self.assertTrue((self.state / 'ssh-commence').exists())
+            # #3608 : le pid de la session ssh doit être publié avant le
+            # témoin, pour que la récolte de repli puisse la tuer.
+            self.assertTrue((self.state / self.SSH_PID).exists())
             os.killpg(proc.pid, signal.SIGINT)
             _, stderr = proc.communicate(timeout=10)
         except subprocess.TimeoutExpired:
-            os.killpg(proc.pid, 9)
-            proc.communicate()
+            self._terminer_l_appel(proc)
             self.fail('interrupted drain call did not end')
         self.assertTrue((self.state / 'signal').exists(), stderr)
         self.assertEqual((self.state / 'signal').read_text(), str(signal.SIGINT))
         self.assertNotEqual(proc.returncode, 0)
+
+    def test_the_fallback_cleanup_kills_the_ssh_session_and_is_bounded(self):
+        """#3608 : après le killpg du groupe bash, l'enfant ssh (session propre)
+        garde stdout/stderr ouverts ; la récolte de repli doit tuer sa session
+        puis rendre la main, pas attendre le plafond de la part de CI (run
+        carte 40177589953)."""
+        pid_file = self.state / self.SSH_PID
+        client = self.state / 'client-detache.py'
+        client.write_text(
+            'import subprocess, sys, time\n'
+            'subprocess.Popen(\n'
+            '    [sys.executable, "-c",\n'
+            '     "import os, signal, sys; from pathlib import Path; "\n'
+            '     "Path(sys.argv[1]).write_text(str(os.getpid())); "\n'
+            '     "signal.pause()", sys.argv[1]],\n'
+            '    start_new_session=True)\n'
+            'time.sleep(60)\n')
+        proc = subprocess.Popen([sys.executable, str(client), str(pid_file)],
+                                stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, text=True,
+                                start_new_session=True)
+        self.addCleanup(self._nettoyer_client, proc, pid_file)
+        limite = time.monotonic() + 10
+        while not pid_file.exists() and time.monotonic() < limite:
+            time.sleep(0.05)
+        self.assertTrue(pid_file.exists(), "le faux ssh n'a pas démarré")
+        # Filet du test lui-même : si la borne de récolte disparaissait, ce
+        # témoin tue la session et le test échoue, au lieu de pendre jusqu'au
+        # plafond de la part de CI.
+        minuteur = threading.Timer(8, self._tuer_la_session_ssh, (pid_file,))
+        minuteur.start()
+        self.addCleanup(minuteur.cancel)
+        debut = time.monotonic()
+        self._terminer_l_appel(proc)
+        self.assertLess(time.monotonic() - debut, 5,
+                        'la récolte de repli doit être bornée')
+
+    def _nettoyer_client(self, proc, pid_file):
+        self._tuer_la_session_ssh(pid_file)
+        if proc.poll() is None:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        try:
+            proc.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.kill()
 
     def test_reads_are_bounded_by_their_own_deadline(self):
         """#2198/N4 : list/show/--help ont une borne plus courte que celle des

@@ -714,14 +714,54 @@ class PacketTreeGreenTest(ReleaseFixtureMixin, unittest.TestCase):
         self.assertIn("reference run", plan.notes)
         self.assertIn("#2000", plan.notes)
 
-    def test_equal_tree_with_a_red_target_never_inherits(self):
-        """Witness 2: arbre égal + main rouge → pas vert."""
+    def test_equal_tree_with_a_red_target_inherits(self):
+        """Witness 2, #3633 (décision owner #141353 a) : arbre égal + paquet
+        vert + main rouge → vert. Avant, un rouge conclu restait rouge."""
         base, _second, head, merge = self.second_packet()
         plan = self.plan(self.ci(green=(base, head), failed=(merge,)),
+                         self.suites(base, head))
+        self.assertTrue(plan.ci.get("failed"), plan.ci)
+        self.assertTrue(plan.green)
+        self.assertEqual(plan.base, merge)
+        self.assertEqual(plan.last_green, merge)
+        self.assertEqual(plan.tree_green["head"], head)
+        self.assertEqual(plan.tree_green["reference"], base)
+        self.assertIn("tree of %s" % merge[:12], plan.notes)
+
+    def test_equal_tree_with_a_target_without_ci_inherits(self):
+        """#3633 : une tête sans aucune lecture de CI (annulée, jamais lancée)
+        hérite de la même façon."""
+        base, _second, head, merge = self.second_packet()
+
+        def reading(project, sha):
+            if sha in (base, head):
+                return {"green": True}
+            return {"green": False, "pending": [], "failed": [],
+                    "missing": ["tests"]}
+
+        plan = self.plan(reading, self.suites(base, head))
+        self.assertTrue(plan.green)
+        self.assertEqual(plan.base, merge)
+        self.assertEqual(plan.tree_green["head"], head)
+
+    def test_a_red_target_with_a_red_packet_head_stays_red(self):
+        """#3633 : l'héritage exige une tête de paquet entièrement verte."""
+        base, _second, head, merge = self.second_packet()
+        plan = self.plan(self.ci(green=(base,), failed=(merge, head)),
                          self.suites(base, head))
         self.assertFalse(plan.green)
         self.assertIsNone(plan.tree_green)
         self.assertEqual(plan.base, base)
+
+    def test_a_red_target_with_a_different_tree_stays_red(self):
+        """#3633 : une résolution de conflit rend l'arbre différent ; le rouge
+        de la cible reste alors rouge."""
+        base, second, head, merge = self.second_packet(conflict=True)
+        plan = self.plan(self.ci(green=(base, second, head), failed=(merge,)),
+                         self.suites(second, head))
+        self.assertFalse(plan.green)
+        self.assertIsNone(plan.tree_green)
+        self.assertEqual(plan.base, second)
         self.assertNotIn("tree of %s" % merge[:12], plan.notes)
 
     def test_different_tree_never_inherits(self):
@@ -831,6 +871,130 @@ class PacketTreeGreenTest(ReleaseFixtureMixin, unittest.TestCase):
         self.assertIn("actions/runs/501", notes)
         self.assertTrue(any("arbre identique" in text for text in report["deviations"]),
                         report["deviations"])
+
+    def test_next_cutoff_starts_from_the_release_on_a_green_tree(self):
+        """#3641 : V, release sur M rouge à arbre vert, est le dernier vert.
+
+        La coupe suivante doit repartir de V (déjà taguée), pas du vert B
+        antérieur : sinon `staging_pending.regressions(B)` voit V actif et
+        retient le paquet suivant (`kept_active` vide de release).
+        """
+        base, _second, head, merge = self.second_packet()
+        reading = self.ci(green=(base, head), failed=(merge,))
+        suites = self.suites(base, head)
+        planned = self.plan(reading, suites)
+        with mock.patch.dict(os.environ,
+                             {"GIT_COMMITTER_DATE": "2026-10-18T11:04:00+0200"}), \
+             mock.patch.object(release_cutoff, "ci_reading", side_effect=reading), \
+             mock.patch.object(release_cutoff, "suite_reading", side_effect=suites):
+            report = release_cutoff.execute(self.cfg, None, self.project,
+                                            now=_paris(11, 5))
+        self.assertEqual(report["result"], "released", report)
+        release_sha = report["release_sha"]
+        self.assertEqual(self.git(self.clone, "rev-parse", "%s^1" % release_sha), merge)
+        # #3641 : la tête est rouge, pas « en cours » ; la preuve d'arbre
+        # reste citée à part dans le rapport et dans l'écart.
+        self.assertTrue(any("CI rouge" in text for text in report["deviations"]),
+                        report["deviations"])
+        body = release_cutoff._report_body(
+            self.project, planned, result="released", version=planned.version,
+            tag="v1.11.8", release_sha=release_sha, staging=None,
+            deviations=report["deviations"], previous=planned.previous,
+            cutoff_at=planned.cutoff_at, cutoff_label=planned.cutoff_label,
+            rules=types.SimpleNamespace(zone=lambda: ZoneInfo("Europe/Paris")))
+        self.assertIn("CI tête: rouge", body)
+
+        plan = self.plan(reading, suites)
+
+        self.assertEqual(plan.head, release_sha)
+        self.assertEqual(plan.base, release_sha)
+        self.assertTrue(plan.empty, plan)
+        self.assertEqual(plan.previous["tag"], "v1.11.8")
+        self.assertFalse(plan.kept_active, plan.kept_active)
+
+    def test_third_packet_on_a_release_on_a_green_tree_is_cut(self):
+        """#3641, B P1 de la revue : un 3e paquet fusionné sur V est coupé.
+
+        V (release sur M rouge à arbre vert) reste la base de coupe, mais
+        `tree_green` ne peut pas prouver la suite contre V, qui n'a pas de
+        suite propre. La preuve se rejoue contre B, le vert qui a validé
+        l'arbre de M : sans cela le plan est vide, « nothing new since
+        v1.11.8 », et le paquet P3 n'est jamais coupé.
+        """
+        base, _second, head, merge = self.second_packet()
+        reading = self.ci(green=(base, head), failed=(merge,))
+        suites = self.suites(base, head)
+        with mock.patch.dict(os.environ,
+                             {"GIT_COMMITTER_DATE": "2026-10-18T11:04:00+0200"}), \
+             mock.patch.object(release_cutoff, "ci_reading", side_effect=reading), \
+             mock.patch.object(release_cutoff, "suite_reading", side_effect=suites):
+            report = release_cutoff.execute(self.cfg, None, self.project,
+                                            now=_paris(11, 5))
+        self.assertEqual(report["result"], "released", report)
+        release_sha = report["release_sha"]
+
+        # 3e paquet : tête verte fusionnée --no-ff sur V (la cible est rouge,
+        # son arbre est celui de la tête du paquet).
+        self.git(self.seed, "fetch", "-q", "origin")
+        self.git(self.seed, "checkout", "-q", "-B", "main", "origin/main")
+        self.git(self.seed, "checkout", "-qb", "integration/paquet-h-3")
+        self.write("packet-3.txt", "packet 3\n")
+        head3 = self.commit("packet head 3")
+        self.git(self.seed, "push", "-q", "origin", "integration/paquet-h-3")
+        self.git(self.seed, "checkout", "-q", "main")
+        self.git(self.seed, "merge", "--no-ff", "-q", "integration/paquet-h-3",
+                 "-m", "Merge pull request #102 from manaty/integration/paquet-h-3")
+        merge3 = self.git(self.seed, "rev-parse", "HEAD")
+        self.git(self.seed, "push", "-q", "origin", "main")
+
+        def reading3(project, sha):
+            if sha in (base, head, head3):
+                return {"green": True}
+            if sha in (merge, merge3):
+                return {"green": False, "pending": [],
+                        "failed": ["tests [main]"], "missing": []}
+            return {"green": False}
+
+        def suites3(project, sha):
+            if sha in (head, head3):
+                return {"head": sha, "runs": self.packet_runs()}
+            if sha == base:
+                return {"head": sha, "runs": [self.reference_run()]}
+            return {"head": sha, "runs": []}
+
+        plan = self.plan(reading3, suites3)
+        self.assertTrue(plan.green, plan)
+        self.assertIsNotNone(plan.tree_green, plan)
+        self.assertEqual(plan.tree_green["head"], head3)
+        self.assertEqual(plan.tree_green["reference"], base)
+        self.assertEqual(plan.base, merge3)
+        self.assertFalse(plan.empty, plan)
+        self.assertEqual(plan.last_green, merge3)
+        self.assertIn("tree of %s" % merge3[:12], plan.notes)
+        self.assertIn(head3[:12], plan.notes)
+
+
+class HeadCiStateTextTest(unittest.TestCase):
+    """#3641 : le rapport dit l'état lu de la CI de la tête."""
+
+    def test_red_running_cancelled_and_absent_are_named(self):
+        self.assertEqual(release_cutoff.ci_state_text({"green": True}), "verte")
+        self.assertEqual(release_cutoff.ci_state_text(
+            {"green": False, "failed": ["tests [main]"]}), "rouge")
+        self.assertEqual(release_cutoff.ci_state_text(
+            {"green": False, "negative": ["tests"]}), "rouge")
+        self.assertEqual(release_cutoff.ci_state_text(
+            {"green": False, "pending": ["tests [main]"]}), "en cours")
+        self.assertEqual(release_cutoff.ci_state_text(
+            {"green": False, "unconcluded": [{"check": "tests"}]}), "non conclue")
+        self.assertEqual(release_cutoff.ci_state_text(
+            {"green": False, "inconclusive": ["tests"], "failed": ["tests"]}),
+            "non concluante")
+        self.assertEqual(release_cutoff.ci_state_text(
+            {"green": False, "missing": ["tests"]}), "absente")
+        self.assertEqual(release_cutoff.ci_state_text({"green": False, "runs": 0}),
+                         "absente")
+        self.assertEqual(release_cutoff.ci_state_text(None), "absente")
 
 
 class StagingTimeoutTest(unittest.TestCase):

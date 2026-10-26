@@ -32,7 +32,8 @@ class SelectCorrectorFamilyTest(TestCase):
 
     def test_the_corrector_family_cannot_cover_the_second_opinion(self):
         # Auteur Claude, correcteur Codex : il ne reste que DeepSeek pour deux
-        # avis. Codex (correcteur ou un autre agent de sa famille) est exclu.
+        # avis. Codex (correcteur ou un autre agent de sa famille) est exclu ;
+        # #3596 pourvoit tout de suite le siège DeepSeek disponible.
         out = rd.select(
             required=2,
             authors=[{"name": "author", "family": "claude"},
@@ -44,7 +45,8 @@ class SelectCorrectorFamilyTest(TestCase):
             fixers=[{"name": "cx2", "family": "codex"}],
         )
         self.assertEqual(out["state"], rd.WAITING, out)
-        self.assertEqual(out["reviewers"], [])
+        self.assertEqual([r["name"] for r in out["reviewers"]], ["dev1"])
+        self.assertEqual(out["missing"], 1)
         self.assertIn("forbidden claude, codex", out["why"])
         self.assertIn("1 eligible family", out["why"])
 

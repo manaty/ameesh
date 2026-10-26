@@ -4548,7 +4548,8 @@
     "note_unleased",
     "operator_pause",
     "retire",
-    "restore"
+    "restore",
+    "reachability"
    ],
    "alert_acknowledgements": [
     "acknowledge",
@@ -4882,6 +4883,7 @@
     "backlog_basket_add",
     "by_issue_ref",
     "by_package",
+    "by_source",
     "claim_review_proposal",
     "close",
     "close_merged",
@@ -4904,6 +4906,7 @@
     "issue_feed",
     "items",
     "items_missing_ref",
+    "land_holder",
     "land_lock",
     "land_unlock",
     "train_read",
@@ -4933,6 +4936,7 @@
     "queue_add",
     "queue_remove",
     "queue_update",
+    "queue_withdrawn_since",
     "recent_or_cited",
     "record_landed_migration",
     "record_packet",
@@ -5024,10 +5028,14 @@
     "scan"
    ],
    "notify_liveness": [
+    "acquire_state",
     "beat",
     "claim_brief",
     "latest",
-    "release_brief"
+    "read_state",
+    "release_brief",
+    "release_state",
+    "save_state"
    ]
   }
  },

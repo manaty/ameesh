@@ -275,10 +275,17 @@ class _Store:
     def __init__(self, rows=None):
         self.rows = list(rows or [])
         self.by_ref = []
+        self.by_source_refs = []
 
     def by_issue_ref(self, ref):
         self.by_ref.append(ref)
         return [r for r in self.rows if r.get("issue_ref") == ref]
+
+    def by_source(self, source):
+        # #3607 : l'identité de l'exécution peut vivre dans `source`, l'`issue_ref`
+        # étant devenu le ticket miroir.
+        self.by_source_refs.append(source)
+        return [r for r in self.rows if r.get("source") == source]
 
 
 class _Ops:
@@ -454,6 +461,52 @@ class TestOuverture(unittest.TestCase):
         self.assertFalse(out["created"])
         self.assertIn("course perdue", out["why"])
 
+    def test_incident_ouvert_a_la_main_par_la_source(self):
+        """#3607 : l'exécution portée par `source`, l'`issue_ref` étant devenu
+        le ticket miroir, est déjà ouverte : l'outil ne crée pas de doublon.
+
+        Le cas réel : #3600 ouvert à la main à 19:23Z pour le run 40223148747
+        (`source = ci-incident:…`), la synchro posant ensuite
+        `issue_ref = manaty/ameesh#2787` ; à 19:56Z `open_incident` a créé le
+        P1 #3603 pour la même exécution.
+        """
+        ref = "ci-incident:manaty/ameesh:40223148747"
+        store = _Store([{"id": 8999, "source": ref, "issue_ref": "manaty/ameesh#2787",
+                         "state": "qa"}])
+        with self._db(_Ops(store)), \
+                mock.patch.object(incident.work, "add") as add, \
+                mock.patch.object(incident.work, "assign") as assign:
+            out = incident.open_incident(object(), repo="manaty/ameesh", branch="main",
+                                         run_id=40223148747, app="ameesh")
+        self.assertFalse(out["created"])
+        self.assertEqual(out["id"], 8999)
+        self.assertIn("incident #8999 déjà ouvert", out["why"])
+        add.assert_not_called()
+        assign.assert_not_called()
+        self.assertEqual(store.by_source_refs, [ref])
+
+    def test_course_perdue_rend_le_gagnant_au_ticket_miroir(self):
+        """#3607 : sous le verrou unique_ref, le gagnant a déjà reçu son ticket
+        miroir quand le perdant relit ; `source` garde l'identité de
+        l'exécution et le perdant rend le gagnant, sans second lot."""
+        ref = "ci-incident:manaty/nexlink:79"
+        store = _Store()
+        winner = {"id": 9007, "source": ref, "issue_ref": "manaty/nexlink#12",
+                  "state": "intake"}
+
+        def losing_add(*_a, **_k):
+            store.rows.append(winner)
+            raise RuntimeError("verrou")
+
+        with self._db(_Ops(store)), \
+                mock.patch.object(incident.work, "add", side_effect=losing_add), \
+                mock.patch.object(incident.work, "assign"):
+            out = incident.open_incident(object(), repo="manaty/nexlink",
+                                         branch="develop", run_id=79)
+        self.assertEqual(out["id"], 9007)
+        self.assertFalse(out["created"])
+        self.assertIn("course perdue", out["why"])
+
     def test_auteur_non_assignable_le_lot_reste_dans_la_file(self):
         store = _Store()
         with self._db(_Ops(store)), \
@@ -581,6 +634,21 @@ class TestConsommateur(unittest.TestCase):
         diagnoses.assert_not_called()
         add.assert_not_called()
         self.assertEqual(out[0]["id"], 9200)
+        self.assertIn("déjà ouvert", out[0]["why"])
+
+    def test_incident_ouvert_a_la_main_par_la_source_sans_releve_github(self):
+        """#3607 : le veilleur voit le lot ouvert à la main par sa `source`,
+        même quand la synchro a posé l'`issue_ref` au ticket miroir."""
+        store = _Store([{"id": 9201,
+                         "source": "ci-incident:manaty/nexlink:501",
+                         "issue_ref": "manaty/nexlink#42", "state": "qa"}])
+        lands = mock.Mock(return_value=[])
+        with self._db(_CiStore([self._run()]), store), \
+                mock.patch.object(incident.work, "add") as add:
+            out = incident.consume(object(), lands=lands, links=self.LINKS)
+        lands.assert_not_called()
+        add.assert_not_called()
+        self.assertEqual(out[0]["id"], 9201)
         self.assertIn("déjà ouvert", out[0]["why"])
 
     def test_atterrissage_illisible_reste_dans_le_motif(self):

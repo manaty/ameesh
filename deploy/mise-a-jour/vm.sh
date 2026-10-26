@@ -14,7 +14,7 @@
 #
 #   verifier     contrôles, rien n'est modifié
 #   installer    code REF dans /opt/ameesh/src (détaché), venv versionné
-#                préparé à l'écart (dépendance psycopg comprise) puis bascule
+#                préparé à l'écart (dépendances psycopg et crypto, #3619) puis bascule
 #                atomique du venv (#1969) ; refuse tant que la base du mesh
 #                n'a pas toutes les migrations de REF
 #   redemarrer   ameesh-runner@<persona>, une par une : arrêt prouvé
@@ -1402,7 +1402,7 @@ reinstaller_agents() {
     P=/home/ameesh/.local/share/ameesh; V=\$P/venv
     python3 $BASCULE_AGENTS preparer --venv \"\$V\" --src \"\$P/src-$court\" --version $court
     python3 $BASCULE_AGENTS activer --venv \"\$V\" --version $court ${precedent:+--precedent $precedent}
-    \"\$V/bin/python\" -c 'import psycopg, ameesh; print(\"psycopg\", psycopg.__version__)'"
+    \"\$V/bin/python\" -c 'import psycopg, cryptography, ameesh; print(\"psycopg\", psycopg.__version__, \"crypto\", cryptography.__version__)'"
 }
 # --- agent GnuPG des VM d'agents (#3320) -----------------------------------
 # Un hôte d'agents ne tient aucune clé privée : l'agent GnuPG n'y sert à rien
@@ -1754,7 +1754,7 @@ installer() {
     python3 $BASCULE_VM preparer --venv $VENV --src $SRC --version ${sha:0:7}
     python3 $BASCULE_VM activer --venv $VENV --version ${sha:0:7} --precedent \$(cut -c1-7 $PRECEDENT)
     rm -f $BASCULE_VM
-    $VENV/bin/python -c 'import psycopg, ameesh.budget, ameesh.projects; print(\"psycopg\", psycopg.__version__, \": modules L70 et L62 présents\")'"
+    $VENV/bin/python -c 'import psycopg, cryptography, ameesh.budget, ameesh.projects; print(\"psycopg\", psycopg.__version__, \"crypto\", cryptography.__version__, \": modules L70 et L62 présents\")'"
   echo "installé. Les exécuteurs tournent encore l'ancien code : redemarrer, sans tarder."
 }
 

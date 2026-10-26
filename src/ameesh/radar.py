@@ -78,7 +78,7 @@ SCHEMA = "ameesh-radar/1"
 SETTINGS_KEYS = ("projects",)
 PROJECT_KEYS = ("repo", "migrations", "target", "github", "land", "gates", "merge_method",
                 "lease_ref", "generated", "ci_required", "protected", "full_suite", "ci_parts",
-                "required_statuses", "required_checks")
+                "required_statuses", "required_checks", "production_branch")
 #: L1651 : clés de la déclaration `ci_parts` (les espaces réservés d'`argv`
 #: sont ceux du contrat, `ci_parts.PLACEHOLDERS`)
 CI_PARTS_KEYS = ("selector", "rev", "argv", "schema", "due")
@@ -213,6 +213,8 @@ class Project:
     #: de plan prouvé (`Upgrade to GitHub Pro…`) ; l'absence de clé garde le
     #: refus fail-closed. Ce drapeau distingue `[]` de l'absence.
     required_checks_declared: bool = False
+    #: #3533: published ancestry excluded from packet author attribution.
+    production_branch: str = ""
 
 
 @dataclass
@@ -340,13 +342,15 @@ def parse_settings(raw) -> Settings:
         if not isinstance(repo, str) or not repo.strip():
             raise SettingsError("%s.repo: repository path expected" % where)
         texts = {}
-        for key in ("migrations", "target", "github"):
+        for key in ("migrations", "target", "github", "production_branch"):
             text = value.get(key) or ""
             if not isinstance(text, str):
                 raise SettingsError("%s.%s: text expected" % (where, key))
             texts[key] = text.strip().strip("/")
         if texts["target"]:
             plan_git.check_ref(texts["target"], "cible")
+        if texts["production_branch"]:
+            plan_git.check_ref(texts["production_branch"], "production_branch")
         if texts["github"] and not _GITHUB_RE.match(texts["github"]):
             raise SettingsError("%s.github: \"owner/repo\" repository expected" % where)
         land = value.get("land") or "off"
@@ -503,6 +507,7 @@ def parse_settings(raw) -> Settings:
         projects[name] = Project(name=name, repo=os.path.expanduser(repo.strip()),
                                  migrations=texts["migrations"], target=texts["target"],
                                  github=texts["github"], land=land,
+                                 production_branch=texts["production_branch"],
                                  gates=tuple(gates), merge_method=method,
                                  lease_ref=lease_ref,
                                  generated=tuple(generated), path_gates=tuple(by_path),
@@ -1677,8 +1682,15 @@ def never_concluded(state) -> bool:
 
 
 #: #3221 : les états qu'une porte écrit entre parenthèses après le nom consigné
+#: #3530 : `ci_reading` écrit aussi `(état; URL)` et l'état d'un job encore en
+#: cours (`in_progress`, `queued`) — la casse reste libre.
 CI_CONSIGNED_STATES = (CI_INCONCLUSIVE | CI_INCONCLUSIVE_STATES | CI_NEGATIVE
-                       | frozenset(("SUCCESS", "PENDING", "EXPECTED", "?")))
+                       | frozenset(("SUCCESS", "PENDING", "EXPECTED", "?",
+                                    "IN_PROGRESS", "QUEUED")))
+
+#: #3530 : l'URL du run que `release_cutoff.ci_reading` met après l'état dans
+#: le suffixe consigné. Absente ou vide (`(cancelled; )`) : rien à garder.
+_CONSIGNED_URL = re.compile(r"^https?://\S*$", re.IGNORECASE)
 
 #: #3251 : check de détail publié par l'étape « bilan des parts » de
 #: `.github/workflows/tests.yml` (scripts/ci-agregat.py), à chaque exécution.
@@ -1713,18 +1725,31 @@ def aggregate_detail_entries(rollup) -> list:
     return latest_rollup(rows)
 
 
+def _consigned_suffix(group: str) -> bool:
+    """#3530 : le suffixe d'occurrence écrit par `release_cutoff.ci_reading` —
+    `ÉTAT[, ÉTAT]` puis, éventuellement, `; URL` — ne contient que des états
+    connus. Une parenthèse du nom (`linux`, `linux; arm64`) ne l'est pas."""
+    chunks = [chunk.strip() for chunk in str(group or "").split(";")]
+    states = [state.strip().upper() for state in chunks[0].split(",")]
+    if not states or not all(states) \
+            or any(state not in CI_CONSIGNED_STATES for state in states):
+        return False
+    return all(not chunk or _CONSIGNED_URL.match(chunk) for chunk in chunks[1:])
+
+
 def nonconclusive_source(app: str, entry: str) -> str:
     """#3209 : la clé du lot de correction d'un check non concluant — l'app
     et le **nom du check**, sans l'état consigné (`tests (CANCELLED)` →
     `tests`) ni la tête : le même check au paquet suivant ou à la release
     retrouve le lot encore ouvert (`work.add_or_note`).
     #3221 : seul un suffixe fait d'états connus est retiré ; une parenthèse du
-    nom (`tests (linux)`, nom brut de la release) reste dans la clé."""
+    nom (`tests (linux)`, nom brut de la release) reste dans la clé.
+    #3530 : `ci_reading` écrit `(état; URL)` (et l'état d'un job encore en
+    cours, `in_progress` / `queued`) ; l'URL et l'état ne font pas partie de
+    la clé, sinon chaque occurrence rouvre un lot."""
     text = str(entry or "").strip()
     match = re.match(r"^(.*?)\s*\(([^()]*)\)$", text)
-    if match and match.group(1) and all(
-            state.strip().upper() in CI_CONSIGNED_STATES
-            for state in match.group(2).split(",")):
+    if match and match.group(1) and _consigned_suffix(match.group(2)):
         text = match.group(1)
     return "nonconclusive:%s:%s" % (app, text)
 
@@ -2044,6 +2069,41 @@ def run_result(run) -> str:
     return conclusion_result(run.get("status"), run.get("conclusion"))
 
 
+#: #3639 : l'API rend au plus 1 000 check-runs par commit (10 pages de 100).
+CHECK_RUNS_PAGE = 100
+CHECK_RUNS_MAX_PAGES = 10
+
+
+def commit_check_runs(gh, slug: str, sha: str) -> list:
+    """Tous les check-runs du commit `sha`, page par page (#3639).
+
+    Une tête qui porte la suite complète dépasse 100 check-runs (141 sur
+    fb8b7403, 145 sur 47d72915). Une seule page la rendait illisible, et la
+    coupe ne lisait plus la CI de main. Les gardes restent celles d'une page :
+    chaque réponse est bien formée, le total ne change pas d'une page à
+    l'autre, et le nombre lu à la fin est égal au total. Sinon la lecture lève
+    `GithubError` et n'est jamais prise pour « pas de CI ». La première page
+    garde l'URL d'avant ; seules les suivantes portent `&page=`."""
+    from . import plan_github
+    path = "repos/%s/commits/%s/check-runs?filter=all&per_page=%d" % (
+        slug, sha, CHECK_RUNS_PAGE)
+    runs: list = []
+    total = None
+    for page in range(1, CHECK_RUNS_MAX_PAGES + 1):
+        data = plan_github._json(gh, ["api", path if page == 1 else "%s&page=%d" % (path, page)])
+        if (not isinstance(data, dict) or type(data.get("total_count")) is not int
+                or not isinstance(data.get("check_runs"), list)
+                or (total is not None and data["total_count"] != total)):
+            raise plan_github.GithubError("commit checks: malformed or truncated response")
+        total = data["total_count"]
+        runs.extend(data["check_runs"])
+        if len(runs) >= total or len(data["check_runs"]) < CHECK_RUNS_PAGE:
+            break
+    if total is None or len(runs) != total:
+        raise plan_github.GithubError("commit checks: malformed or truncated response")
+    return runs
+
+
 def commit_ci(project: Project, sha: str, gh=None, *, branch: str | None = None,
               required=()) -> dict:
     """L160g (#473, `ci_required`): GitHub's CI on the commit `sha` itself
@@ -2147,16 +2207,9 @@ def commit_ci(project: Project, sha: str, gh=None, *, branch: str | None = None,
              else ("success" if (run.get("conclusion") or "").lower() in CI_DUE_OK else "failed"))
     # Actions alone cannot certify a commit: GitHub Apps and classic commit
     # statuses can also block it. Read the same exact SHA, never the PR head.
-    checks = plan_github._json(gh, ["api", "repos/%s/commits/%s/check-runs?filter=all&per_page=100"
-                                   % (slug, sha)])
-    if (not isinstance(checks, dict) or type(checks.get("total_count")) is not int
-            or not isinstance(checks.get("check_runs"), list)
-            or checks["total_count"] != len(checks["check_runs"])
-            or checks["total_count"] >= 100):
-        raise plan_github.GithubError("commit checks: malformed or truncated response")
     external = {}
     activity = {}
-    for check in checks["check_runs"]:
+    for check in commit_check_runs(gh, slug, sha):
         if (not isinstance(check, dict) or check.get("head_sha") != sha
                 or not isinstance(check.get("app"), dict)
                 or type(check["app"].get("id")) is not int

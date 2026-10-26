@@ -16,6 +16,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import types
 import unittest
 from unittest import mock
 import uuid
@@ -438,11 +439,147 @@ def patch_families(testcase, families=("claude", "codex", "deepseek")):
     return patcher
 
 
-class PgTestCase(unittest.TestCase):
+#: #3601 : globaux sensibles du banc. Un test peut les remplacer (mock.patch,
+#: redirect_stdout…) à condition de les restaurer avant la fin de sa classe ;
+#: le `tearDownClass` commun le vérifie et nomme la classe et le global
+#: fautifs. #3600 : des patchs entrés depuis un thread et défaits dans le
+#: désordre laissaient `ameesh.db.connect` remplacé ; l'erreur n'apparaissait
+#: que 35 classes plus loin, en `setUpClass`.
+SENSITIVE_GLOBALS = (
+    ("ameesh.db.connect", db_mod, "connect", db_mod.connect),
+    ("sys.stdout", sys, "stdout", sys.stdout),
+    ("sys.stderr", sys, "stderr", sys.stderr),
+)
+
+#: #3625/#3641 : sous `python -m unittest -b`, unittest remplace `sys.stdout`
+#: et `sys.stderr` par ses tampons avant `setUpClass` et `tearDownClass`. Leur
+#: référence n'est prise par classe que si c'est le tampon du résultat actif ;
+#: sinon la référence du chargement reste la vérité, pour qu'une fuite d'une
+#: classe précédente (hors du mixin) reste visible. `ameesh.db.connect` garde
+#: toujours celle du chargement.
+SENSITIVE_GLOBALS_PER_CLASS = frozenset(("sys.stdout", "sys.stderr"))
+
+
+def _describe_global(value) -> str:
+    """Forme courte d'un global, pour le message d'échec."""
+    if isinstance(value, types.FunctionType):
+        return "fonction %s" % value.__qualname__
+    return type(value).__name__
+
+
+def _active_result_streams() -> dict:
+    """#3641 : les flux du résultat tamponné de la classe en cours, s'il les
+    possède réellement.
+
+    Sous `-b`, `unittest` appelle `setUpClass` entre `TestResult._setupStdout`
+    et `_restoreStdout` ; la trame de `TestSuite._handleClassSetUp` tient
+    encore le `result`, et ses deux tampons sont exactement les flux courants.
+    Seuls ceux-là sont pris par classe : un autre `StringIO` est une fuite
+    d'une classe hors du mixin, que la garde #3601 doit continuer de voir
+    (#3625 la masquait en le prenant pour la référence de la classe).
+    """
+    frame = sys._getframe(1)
+    try:
+        while frame is not None:
+            result = frame.f_locals.get("result")
+            if (getattr(result, "buffer", False)
+                    and sys.stdout is getattr(result, "_stdout_buffer", None)
+                    and sys.stderr is getattr(result, "_stderr_buffer", None)):
+                return {"sys.stdout": sys.stdout, "sys.stderr": sys.stderr}
+            frame = frame.f_back
+    finally:
+        del frame
+    return {}
+
+
+def capture_sensitive_globals(cls) -> None:
+    """#3625/#3641 : fige la référence des globaux sensibles pour cette classe.
+
+    Appelé en tête de `setUpClass`. Les flux ne sont pris par classe que
+    lorsqu'ils sont le tampon du résultat tamponné actif (`-b`) : leur
+    référence de classe distingue alors une fuite du tampon du lanceur, et la
+    restauration remet ce tampon, pas le flux réel que
+    `TestResult._restoreStdout` utiliserait ensuite (`AttributeError:
+    getvalue`). Hors `-b`, ou quand la référence courante n'est pas ce
+    tampon, la référence du chargement reste la vérité : une fuite d'une
+    classe simple, hors du mixin, n'est plus masquée (#3641).
+    """
+    streams = _active_result_streams()
+    cls._sensitive_globals_baseline = {
+        nom: streams[nom]
+        for nom, _module, _attribut, _expected in SENSITIVE_GLOBALS
+        if nom in SENSITIVE_GLOBALS_PER_CLASS and nom in streams
+    }
+
+
+def _expected_sensitive_globals(cls):
+    """Globaux attendus de `cls` : flux pris à sa tête, le reste au chargement."""
+    baseline = cls.__dict__.get("_sensitive_globals_baseline") or {}
+    return tuple(
+        (nom, module, attribut, baseline.get(nom, attendu))
+        for nom, module, attribut, attendu in SENSITIVE_GLOBALS
+    )
+
+
+def verify_sensitive_globals(cls) -> None:
+    """#3601 : échoue dans `cls` si un global sensible n'est pas restauré.
+
+    Le message nomme la classe et chaque global fautif. Les globaux sont
+    restaurés avant l'échec : seule la classe qui a fui paie, les suivantes
+    restent saines (#3600). Les flux sont restaurés vers la référence de la
+    classe (#3625), qui est le tampon du lanceur sous `-b`.
+    """
+    fuites = []
+    for nom, module, attribut, attendu in _expected_sensitive_globals(cls):
+        actuel = getattr(module, attribut)
+        if actuel is attendu:
+            continue
+        setattr(module, attribut, attendu)
+        fuites.append((nom, attendu, actuel))
+    if not fuites:
+        return
+    details = ", ".join(
+        "%s (trouvé %s, attendu %s)" % (nom, _describe_global(actuel),
+                                        _describe_global(attendu))
+        for nom, attendu, actuel in fuites)
+    raise AssertionError(
+        "#3601 : %s.%s a laissé non restauré(s) : %s. Restauré(s) pour la "
+        "classe suivante ; un patch a probablement été défait dans le désordre "
+        "(entré depuis un thread), ou n'a pas été arrêté."
+        % (cls.__module__, cls.__qualname__, details))
+
+
+class SensitiveGlobalsMixin:
+    """#3601 : vérifie à la fin de la classe que les globaux sensibles sont
+    restaurés (`ameesh.db.connect`, `sys.stdout`, `sys.stderr`).
+
+    Un test qui les remplace sans les restaurer fait échouer la classe
+    fautive, en nommant le global ; ils sont restaurés avant l'échec pour que
+    la classe suivante reste saine. Les classes de base voisines peuvent
+    l'hériter ; une sous-classe qui redéfinit `setUpClass` ou `tearDownClass`
+    doit appeler `super()` (les flux sont référencés à la tête de la classe,
+    #3625).
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        capture_sensitive_globals(cls)
+        super().setUpClass()
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        try:
+            super().tearDownClass()
+        finally:
+            verify_sensitive_globals(cls)
+
+
+class PgTestCase(SensitiveGlobalsMixin, unittest.TestCase):
     """Base : un schéma migré, un bac à sable disque, des utilitaires CLI."""
 
     @classmethod
     def setUpClass(cls) -> None:
+        super().setUpClass()
         cls.schema = "t_%s_%s" % (
             cls.__name__.lower().replace("test", "")[:18] or "x",
             uuid.uuid4().hex[:8],
@@ -481,12 +618,16 @@ class PgTestCase(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls) -> None:
-        noter_tables(cls)
         try:
-            cls.db.execute('DROP SCHEMA IF EXISTS "%s" CASCADE' % cls.schema)
-            cls.db.close()
+            noter_tables(cls)
+            try:
+                cls.db.execute('DROP SCHEMA IF EXISTS "%s" CASCADE' % cls.schema)
+                cls.db.close()
+            finally:
+                shutil.rmtree(cls.tmp, ignore_errors=True)
         finally:
-            shutil.rmtree(cls.tmp, ignore_errors=True)
+            # #3601 : en dernier, même si le ménage de la base a échoué.
+            super().tearDownClass()
 
     # -- utilitaires -------------------------------------------------------
     def setUp(self) -> None:

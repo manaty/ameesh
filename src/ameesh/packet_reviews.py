@@ -115,11 +115,12 @@ def _fetch_head(repo: str, sha: str) -> bool:
     if not text:
         return False
     try:
-        if plan_git._out(repo, "remote", "get-url", "origin") is None:
+        forge = plan_git.forge_remote(repo)
+        if forge is None:
             return False
         proc = plan_git._git(
             repo, "fetch", "--quiet", "--no-tags", "--no-write-fetch-head",
-            "--", "origin", text, timeout=plan_git.FETCH_TIMEOUT)
+            "--", forge, text, timeout=plan_git.FETCH_TIMEOUT)
     except Exception:  # noqa: BLE001 - forge injoignable : absence
         return False
     if proc.returncode != 0:
@@ -370,6 +371,32 @@ def _ancestor(repo: str, tip: str, base: str) -> bool:
     return proc.returncode == 0
 
 
+def _stack_order(repo: str, prepared: list) -> list:
+    """Les membres préparés, chaque prédécesseur empilé avant ses successeurs.
+
+    `prepared` est rangé par numéro de lot. Un membre dont la tête gelée est
+    ancêtre de celle d'un autre est lu avant lui, quels que soient leurs
+    numéros (#3516) : sa tête admise doit déjà couvrir la provenance héritée
+    quand la porte du successeur la lit. Entre membres sans lien d'ascendance,
+    l'ordre des numéros reste celui de la lecture. Deux têtes identiques ne se
+    précèdent pas.
+    """
+    heads = [item["frozen"] for item in prepared]
+    before = {index: set() for index in range(len(prepared))}
+    for later, head in enumerate(heads):
+        for earlier, other in enumerate(heads):
+            if other != head and _ancestor(repo, other, head):
+                before[later].add(earlier)
+    ordered: list = []
+    done: set = set()
+    while len(ordered) < len(prepared):
+        # Une ascendance stricte n'a pas de cycle : un membre prêt existe.
+        index = min(i for i in before if i not in done and before[i] <= done)
+        done.add(index)
+        ordered.append(prepared[index])
+    return ordered
+
+
 def _packet_base(db, vehicle: int, repo: str, head: str, target: str) -> tuple[str, str]:
     """La base enregistrée de la composition du véhicule, prouvée sur la cible.
 
@@ -471,7 +498,10 @@ def need(db, vehicle: int, row, marks, repo: str, base: str, head: str,
         return None
     total = len(found)
     frozen_sources = []
+    production_cache = {}
+    admitted_sources = []
     constituents = []
+    prepared = []
     for entry in found:
         lot = int(entry["lot"])
         try:
@@ -517,8 +547,19 @@ def need(db, vehicle: int, row, marks, repo: str, base: str, head: str,
                     "why": "constituent #%d: composed source %s does not carry its "
                            "frozen head %s" % (lot, resolved[:12], frozen[:12]),
                     "members": found, "own_paths": []}
-        frozen_sources.append(frozen)
-        constituents.append(entry)
+        prepared.append({"entry": entry, "lot": lot, "row": member_row,
+                         "marks": member_marks, "frozen": frozen})
+    # #3516 : les portes se lisent dans l'ordre de l'empilement, pas des
+    # numéros. Un prédécesseur de numéro supérieur, lu trop tard, ne couvrait
+    # pas encore les commits que son successeur hérite de lui.
+    try:
+        prepared = _stack_order(repo, prepared)
+    except VehicleError as exc:
+        return {"ok": False, "required": None, "klass": None,
+                "why": str(exc), "members": found, "own_paths": []}
+    for item in prepared:
+        entry, lot, frozen = item["entry"], item["lot"], item["frozen"]
+        member_row, member_marks = item["row"], item["marks"]
         # L'avis du membre se lit sur SA tête gelée et SA classe, pas sur le
         # diff du paquet (#2766).
         try:
@@ -549,7 +590,9 @@ def need(db, vehicle: int, row, marks, repo: str, base: str, head: str,
                                      base=packet_target or base,
                                      base_sha=member_base)
             gate = merge_queue.review_gate(db, member_marks, frozen, repo=repo,
-                                           klass=klass, item=member_row)
+                                           klass=klass, item=member_row, cfg=cfg,
+                                           admitted_heads=tuple(admitted_sources),
+                                           production_cache=production_cache)
         except Exception as exc:  # noqa: BLE001 - lecture impossible : refus
             return {"ok": False, "required": None, "klass": None,
                     "why": "constituent #%d: cannot read its review gate: %s"
@@ -558,6 +601,12 @@ def need(db, vehicle: int, row, marks, repo: str, base: str, head: str,
             return {"ok": False, "required": None, "klass": None,
                     "why": "constituent #%d: %s" % (lot, gate.get("why") or "no review"),
                     "members": found, "own_paths": []}
+        # A waived/no-review gate can open without reading provenance. It
+        # covers its vehicle delta, but cannot attest inherited authors.
+        if gate.get("attribution_read"):
+            admitted_sources.append(frozen)
+        frozen_sources.append(frozen)
+        constituents.append(entry)
     total = len(constituents)
     if not total:
         return None
@@ -575,7 +624,8 @@ def need(db, vehicle: int, row, marks, repo: str, base: str, head: str,
                 "members": found, "own_paths": []}
     if not own["paths"]:
         return {"ok": True, "required": 0, "klass": None, "members": found,
-                "own_paths": [], "why": ("%d constituent(s) reviewed on their frozen "
+                "own_paths": [], "admitted_heads": admitted_sources, "production_cache": production_cache,
+                "why": ("%d constituent(s) reviewed on their frozen "
                                          "head(s); no proper vehicle delta" % total)}
     try:
         from . import lot_class
@@ -596,4 +646,5 @@ def need(db, vehicle: int, row, marks, repo: str, base: str, head: str,
                 "own_paths": own["paths"]}
     return {"ok": None, "required": required, "klass": klass, "members": found,
             "own_paths": own["paths"], "commits": own["commits"],
+            "admitted_heads": admitted_sources, "production_cache": production_cache,
             "why": "proper delta: %d path(s)" % len(own["paths"])}

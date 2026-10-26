@@ -173,6 +173,63 @@ def compile_glob(pattern: str) -> re.Pattern:
     return re.compile("".join(out), re.DOTALL)
 
 
+def is_catch_all(pattern: str) -> bool:
+    """Le motif est-il une portée générique, sans aucun littéral ?
+
+    Un motif non vide composé uniquement de `*`, `?` et `/` (`*`, `*/*`, `?`,
+    `**`, `**/*`, `***`, `*/**`…) ne nomme aucun chemin : il couvre une portée
+    générique, peut relever un compte d'avis, jamais abaisser le plancher
+    critique (#3542, #3562). [`compile_glob`] fait de `**` et de `**/*` des
+    motifs qui traversent les séparateurs ; `*` et `*/*` n'y couvrent qu'un ou
+    deux composants, mais ne nomment pas davantage le chemin qu'ils matchent.
+    Un littéral (`deploy/**`, `**/*.sql`, `src/ameesh/**`, `*.py`) nomme, lui,
+    la portée qu'il couvre. Un `/` de tête est ancré à la racine, les
+    composants vides sont retirés.
+    """
+    text = normalize_path(str(pattern or ""))
+    if text.startswith("/"):
+        text = text[1:]
+    return bool(text) and all(char in "*/?" for char in text)
+
+
+def declared_reviews(rules, paths) -> tuple[dict, int]:
+    """Les avis déclarés par chemin (`train_reviews`), nommés vs attrape-tout.
+
+    `rules` est une suite de `(motifs, avis)` : les motifs sont les chaînes du
+    canon, lues au même commit. Rend `(nommés, attrape-tout)` :
+    `nommés[chemin]` est le plus grand nombre d'avis d'une règle qui **nomme**
+    ce chemin (au moins un de ses motifs, autre qu'un attrape-tout, le couvre) ;
+    `attrape-tout` est le plus grand nombre porté par une règle sans littéral
+    (`**`, `*`, `*/*`…) qui **couvre effectivement** au moins un chemin changé.
+    Un `**` couvre tous les chemins sans en nommer aucun : il peut relever un
+    compte, jamais abaisser le plancher critique (#3542). Un attrape-tout plus
+    étroit (`*`, `*/*`, `*/**`, `*/*/**`) ne relève de même que s'il matche un
+    chemin du diff : sa portée se lit, elle ne se suppose pas (#3562). Un
+    motif invalide lève `re.error`, comme [`compile_glob`] : l'appelant en fait
+    un doute, jamais un repli rassurant.
+    """
+    wanted = [str(path) for path in paths or () if str(path or "")]
+    named: dict[str, int] = {}
+    wide = 0
+    for patterns, reviews in rules or ():
+        count = int(reviews)
+        compiled = []
+        catch = []
+        for pattern in patterns or ():
+            regex = compile_glob(pattern)
+            if is_catch_all(pattern):
+                catch.append(regex)
+            else:
+                compiled.append(regex)
+        if wanted and any(regex.fullmatch(path)
+                          for regex in catch for path in wanted):
+            wide = max(wide, count)
+        for path in wanted:
+            if any(regex.fullmatch(path) for regex in compiled):
+                named[path] = max(named.get(path, 0), count)
+    return named, wide
+
+
 def parse(policies) -> tuple[ReviewPolicy, list[tuple[str, str, str]]]:
     """`(politique, constats)` — ne lève jamais, pour que `canon check` rapporte.
 

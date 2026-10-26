@@ -324,13 +324,13 @@ installer() {
   # la bascule n'est qu'un rename : un appel concurrent des agents voit
   # l'ancien ou le nouveau code entier, jamais un état incomplet. La première
   # conversion adopte le venv réel comme version précédente, sans pip.
-  etape "préparation isolée du venv de $court (code puis dépendances, dont psycopg)"
+  etape "préparation isolée du venv de $court (code puis dépendances, dont psycopg et cryptography, #3619)"
   python3 "$ICI/bascule.py" preparer --venv "$VENV" --src "$cible" --version "$court"
   etape "bascule atomique du venv et du code courant"
   python3 "$ICI/bascule.py" activer --venv "$VENV" --version "$court" \
     ${precedent_court:+--precedent "$precedent_court"}
   ln -sfn "src-$court" "$PARTAGE/src-current"
-  "$VENV/bin/python" -c 'import psycopg, ameesh.budget, ameesh.projects; print("psycopg", psycopg.__version__, ": modules L70 et L62 présents")'
+  "$VENV/bin/python" -c 'import psycopg, cryptography, ameesh.budget, ameesh.projects; print("psycopg", psycopg.__version__, "crypto", cryptography.__version__, ": modules L70 et L62 présents")'
   echo "installé : src-$court. Les exécuteurs tournent encore l'ancien code : redemarrer, sans tarder."
 }
 

@@ -286,12 +286,14 @@ _COMMAND_OUTPUT_RE = re.compile(
     r")")
 
 
-def _stdin_body() -> tuple[str | None, str | None]:
+def _stdin_body(what: str = "body") -> tuple[str | None, str | None]:
     """#3504 : corps de `send <dest> -`, lu sur l'entrée standard.
 
     Rend `(texte, None)` ou `(None, erreur)`. Le texte est nettoyé des blancs
     de bord comme un corps passé en arguments ; une entrée illisible (UTF-8
-    invalide) ou vide est refusée avant tout dépôt.
+    invalide) ou vide est refusée avant tout dépôt. #3683 : une entrée réduite
+    au marqueur « - » l'est aussi, et `ameesh work note <lot> -` la partage
+    (`what` nomme le texte dans l'erreur).
     """
     try:
         data = sys.stdin.buffer.read()
@@ -301,12 +303,16 @@ def _stdin_body() -> tuple[str | None, str | None]:
         try:
             data = data.decode("utf-8")
         except UnicodeDecodeError:
-            return None, ("the body on standard input is not valid UTF-8; "
-                          "write plain text")
+            return None, ("the %s on standard input is not valid UTF-8; "
+                          "write plain text" % what)
     text = data.strip()
     if not text:
-        return None, ("empty body on standard input: write the message before "
-                      "closing standard input")
+        return None, ("empty %s on standard input: write the text before "
+                      "closing standard input (a failed command piped into "
+                      "`-` sends nothing)" % what)
+    if text == "-":
+        return None, ("the %s on standard input is just `-`: write the text "
+                      "itself" % what)
     return text, None
 
 
@@ -498,6 +504,14 @@ def cmd_send(bk, cfg: Config, args: list[str]) -> int:
         return 2
     else:
         text = " ".join(body).strip()
+        if text == "-":
+            # #3693 : un argument « - » entouré de blancs n'est pas le marqueur
+            # d'entrée standard (il doit être seul) ; un corps nettoyé ne vaut
+            # jamais « - » et n'est donc jamais déposé.
+            print("the body is just `-`: write the text after the recipient, or "
+                  "give `-` alone (not quoted, without blanks) to read the body "
+                  "on standard input", file=sys.stderr)
+            return 2
         output = _command_output_in(text)
         if output:
             # #3504 (optionnel) : la sortie d'une commande ameesh dans un corps
@@ -2153,6 +2167,19 @@ def cmd_doctor(cfg: Config, notify_test: bool, probe: bool = False,
         print("profiles   : not checked (audit failed)")
     else:
         profile_ko = _print_profile_audit(audit)
+    # #3619 : un canal `nexlink` routé ne s'active pas sans l'extra `crypto`
+    # (l'installeur et la mise à jour des hôtes le posent). Contrôle sans
+    # base, avant tout envoi : le canal est refusé, fermé, et nommé ; un repli
+    # `ntfy`/`slack` utilisable le couvre (#3536).
+    nexlink_ko = False
+    try:
+        from . import notify as notify_mod
+        nexlink_ok, nexlink_lines = notify_mod.nexlink_activation(cfg)
+        nexlink_ko = not nexlink_ok
+    except Exception as exc:  # a reading never breaks the doctor
+        nexlink_lines = ["not checked (%s)" % (" ".join(str(exc).split())[:120],)]
+    for line in nexlink_lines:
+        print("notify     : %s" % line)
     from . import persona_memory
     from . import canon as canon_mod
     memory_note = ""
@@ -2267,7 +2294,7 @@ def cmd_doctor(cfg: Config, notify_test: bool, probe: bool = False,
             print(line)
     except db_mod.DbError:
         pass
-    verdict = 0
+    verdict = 1 if nexlink_ko else 0
     # #3503 : la session d'ameesh doit avoir reçu `-c jit=off` ; sinon le
     # correctif ne s'applique pas à ce processus (ligne déjà imprimée).
     if jit_ko:

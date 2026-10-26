@@ -163,6 +163,75 @@ def clear_landing(db, item_id, *, actor):
     return storage.of(db).work_dependencies.clear_landing(item_id, actor=actor)
 
 
+def _warn_landing_stale(db, row, frozen_sha, actor):
+    """#3641 : prévient le déclarant qu'un regel ne reporte plus sa déclaration.
+
+    Le journal et le courrier portent sur le VÉHICULE, jamais sur le lot
+    déclaré : une note ou un courrier lié au lot déclaré compterait comme son
+    activité récente et effacerait le signal stale que la déclaration devenue
+    caduque doit justement rendre (#1945, revue B)."""
+    from . import mail
+    item_id = int(row["work_item_id"])
+    vehicle_id = int(row["vehicle_id"])
+    pinned = str(row.get("pinned_sha") or "").strip()
+    recipient = str(row.get("created_by") or "").strip()
+    text = ("Lot #%d: vehicle #%d was re-frozen on %s, while its planned landing is "
+            "pinned to %s. The declaration is not carried automatically: renew it "
+            "(`ameesh work landing %d --vehicle %d --until YYYY-MM-DD`) or clear it."
+            % (item_id, vehicle_id, frozen_sha[:12], pinned[:12], item_id, vehicle_id))
+    try:
+        work.note(db, vehicle_id,
+                  "Landing declaration of lot #%d needs renewal: vehicle re-frozen "
+                  "on %s, declaration pinned to %s."
+                  % (item_id, frozen_sha[:12], pinned[:12]),
+                  actor=actor or work.SYSTEM_SENDER)
+    except Exception:  # noqa: BLE001 - un journal en échec ne défait pas le gel
+        pass
+    if not recipient or recipient.startswith(work.HUMAN_PREFIX) \
+            or recipient == work.SYSTEM_SENDER:
+        return
+    try:
+        mail.send(db, work.SYSTEM_SENDER, recipient, text, kind="event",
+                  work_item_id=str(vehicle_id))
+    except Exception:  # noqa: BLE001 - destinataire inconnu ou courrier indisponible
+        pass
+
+
+def warn_landings_after_freeze(db, vehicle_id, frozen_sha, *, actor=""):
+    """#3641 : un regel de véhicule ne reporte pas silencieusement une déclaration.
+
+    Une déclaration est épinglée à un gel ; un nouveau gel la rend caduque.
+    Reporter automatiquement sur une tête descendante a été essayé puis retiré
+    (revue codex #142034) : l'ascendance et la détection de revert ne prouvent
+    pas le contenu courant — un commit ordinaire peut retirer l'unité, et
+    `plan_git` ne reconnaît que les `Revert` qui citent le commit. Le geste sûr
+    est donc de **prévenir le déclarant sans aucun report** : la déclaration
+    reste en place, le signal stale revient (#1945), et le pilote renouvelle
+    explicitement sur la nouvelle tête.
+
+    La prévention est revalidée sous le verrou des landings et le verrou de
+    ligne du véhicule : `frozen_sha` doit encore être le gel COURANT et la ligne
+    doit encore porter `pinned_sha`. Un gel retardé ne prévient donc pas une
+    déclaration déjà renouvelée sur un gel plus récent, et une déclaration
+    remplacée n'est ni touchée ni signalée.
+    """
+    st = storage.of(db)
+    rows = st.work_dependencies.landings_on_vehicle(int(vehicle_id))
+    result = {"notified": [], "skipped": []}
+    for row in rows:
+        item_id = int(row["work_item_id"])
+        pinned = str(row.get("pinned_sha") or "").strip()
+        if not pinned or pinned == frozen_sha:
+            continue
+        if not st.work_dependencies.landing_matches(
+                item_id, int(vehicle_id), pinned, frozen_sha=frozen_sha):
+            result["skipped"].append(item_id)
+            continue
+        result["notified"].append(item_id)
+        _warn_landing_stale(db, row, frozen_sha, actor or "")
+    return result
+
+
 def landings(db, item_ids):
     """`{lot: ligne}` des atterrissages déclarés (lecture groupée)."""
     return {int(row["work_item_id"]): row

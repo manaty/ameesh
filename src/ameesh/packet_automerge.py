@@ -37,7 +37,10 @@ repos/<slug>/merges`, `base=<cible épinglée>`, `head=<tête publiée>`)
 * **Le passage** (`watch`, `ameesh release tick` des projets de
   `packet_watch`, toutes les cinq minutes) relit chaque porteur ouvert armé :
   tête, cible ou gel changé depuis la publication → désarmé (journal, et
-  auto-fusion GitHub éventuelle retirée). Sinon la fusion passe les mêmes
+  auto-fusion GitHub éventuelle retirée). Une cible qui n'a avancé que par
+  des atterrissages de coupure (ligne de version seule et notes
+  `docs/versions/*.md`, manaty/home#173) ne désarme pas : le contenu testé
+  n'a pas changé. Sinon la fusion passe les mêmes
   portes que le feu (R1, ameesh-cx3) : `fire.ready_verdicts` (classe, avis
   requis et indépendants sur la tête gelée, membres d'un porteur et delta,
   #2766), puis au moins un check imposé par la forge — et tous ceux épinglés
@@ -85,10 +88,28 @@ MARK_RE = re.compile(
     r"^auto-merge (?P<state>armed|disarmed|merged|not-armed|held) "
     r"repo=(?P<repo>[\w.-]+/[\w.-]+) pr=(?P<pr>\d+) sha=(?P<sha>[0-9a-f]{40})"
     r"(?: base=(?P<base>[\w./-]+))?(?: method=[a-z]+)?(?: required=(?P<required>\S+))?"
+    r"(?: composition=(?P<composition>[0-9a-f]{40}))?"
     r"(?:\s|$)(?: *— *(?P<why>.*))?", re.S)
 #: marques qui referment un armement de la même PR
 CLOSING = ("disarmed", "merged")
 _SHA = re.compile(r"[0-9a-f]{40}")
+#: #3534 / manaty/home#173 : un atterrissage de coupure ne change que la
+#: ligne de version et les notes de version.
+NOTES_DIR = "docs/versions"
+_VERSION_LINE = re.compile(r'^version\s*=\s*"[^"\s]+"\s*$')
+#: #3558 : les agrégats requis dont le rouge se prouve par les parts lues —
+#: les mêmes noms que `release_cutoff._aggregates` (#3244). Un agrégat n'a
+#: pas de test à son nom : il est le seul check requis exempté de la preuve
+#: par part. Tout autre check requis rouge (`lint`, une part, un portier)
+#: exige sa propre part lue et son flux `FAILURE` (relectures B/P1 du 25/10).
+INHERITED_RED_AGGREGATES = frozenset((
+    "tests", "tests (dispatch)", "suite complète du paquet / tests"))
+#: #3558 (ameesh-dev4 + ameesh-cx3 B/P1) : ligne que `ci-flow.py` ajoute à la
+#: sortie d'un flux quand `MAX_TEXT` l'a obligé à omettre des échecs. Ces
+#: événements ne sont pas publiés : `ci.events_of` l'ignore, donc une telle
+#: sortie ne prouve jamais la liste complète des échecs.
+OMITTED_EVENTS_RE = re.compile(
+    r"(?m)^\d+ échec\(s\) de plus, hors de la limite de taille de GitHub\.\s*$")
 
 
 def carrier(head_ref) -> bool:
@@ -125,6 +146,7 @@ def marks(db, lot: int) -> list[dict]:
             out.append({"id": int(ev.get("id") or 0), "state": m.group("state"),
                         "repo": m.group("repo"), "pr": int(m.group("pr")),
                         "sha": m.group("sha"), "base": m.group("base") or "",
+                        "composition": (m.group("composition") or "").strip().lower(),
                         "required": tuple(unquote(name) for name in
                                           (m.group("required") or "").split(",") if name),
                         "why": (m.group("why") or "").strip()})
@@ -146,6 +168,28 @@ def active(rows) -> dict | None:
                 and current["pr"] == row["pr"] and current["repo"] == row["repo"]:
             current = None
     return current
+
+
+def publication(db, lot: int, sha: str) -> dict:
+    """#3611 : ce que le journal du porteur dit de sa publication sur `sha`.
+
+    `requested` : une demande `ci-full-<sha>` posée par `ameesh ci run --full`
+    (marque `ci-label applied`) ; `armed` : la fusion automatique armée sur
+    cette tête (`active`), avec sa PR et sa cible. Lecture locale seulement :
+    la lecture porte sur les seules notes `ci-label `, comme `marks` (#3279)."""
+    from . import ci
+    sha = str(sha or "").strip().lower()
+    requested = False
+    for ev in work.events_noted(db, int(lot), "ci-label ", 0.0) or ():
+        m = ci.REQUEST_RE.match((ev.get("note") or "").strip())
+        if m and m.group("state") == "applied" and m.group("mode") == "full" \
+                and fire._same_head(m.group("sha"), sha):
+            requested = True
+    current = active(marks(db, lot))
+    armed = bool(current and fire._same_head(current["sha"], sha))
+    return {"requested": requested, "armed": armed,
+            "pr": current["pr"] if armed else None,
+            "base": current["base"] if armed else ""}
 
 
 def _note(db, lot: int, state: str, slug: str, number: int, sha: str, rest: str,
@@ -222,6 +266,156 @@ def _unlock(handle) -> None:
 
 
 # --------------------------------------------------------------------------
+# cible et base de composition (#3534, manaty/home#173)
+# --------------------------------------------------------------------------
+
+def _git(repo: str, *args: str, timeout: float = 60.0) -> str | None:
+    """La sortie d'un git local, ou None (dépôt absent, commande en échec)."""
+    try:
+        proc = subprocess.run(["git", "-C", repo, *args], capture_output=True,
+                              text=True, timeout=timeout)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return proc.stdout if proc.returncode == 0 else None
+
+
+def _composition_base(db, lot: int, sha: str, target: str = "") -> str:
+    """La base de composition enregistrée du paquet (`work_packet_members`),
+    pour la tête `sha` ; "" si absente ou illisible.
+
+    #3534 : c'est la seule borne qui ne dépende pas du SHA courant de la
+    cible ; elle est écrite par `work packet record` au moment de la
+    composition."""
+    if db is None:
+        return ""
+    try:
+        rows = storage.of(db).work.packet_members(package_ids=[int(lot)])
+    except Exception:  # noqa: BLE001 - base ou schéma illisible : repli
+        return ""
+    head = str(sha or "").strip().lower()
+    for row in rows or ():
+        row = row or {}
+        if str(row.get("head_sha") or "").strip().lower() != head:
+            continue
+        base = str(row.get("base_sha") or "").strip().lower()
+        if not base:
+            continue
+        recorded_target = str(row.get("package_target") or "").strip()
+        if target and recorded_target and recorded_target != target:
+            continue
+        return base
+    return ""
+
+
+def _cutoff_commit(repo: str, sha: str) -> bool:
+    """Un commit d'atterrissage de coupure (manaty/home#173) : message de
+    release, et diff contre sa première parente limité à la ligne de version
+    de `pyproject.toml` et aux notes `docs/versions/*.md`."""
+    message = _git(repo, "log", "-1", "--format=%B", sha) or ""
+    if "ameesh-release:" not in message:
+        return False
+    parents = (_git(repo, "rev-list", "--parents", "-n", "1", sha) or "").split()
+    if len(parents) < 2:
+        return False
+    parent = parents[1]
+    names = (_git(repo, "diff", "--name-only", "--no-renames", parent, sha)
+             or "").splitlines()
+    if not names:
+        return False
+    for name in names:
+        if name == "pyproject.toml":
+            patch = _git(repo, "diff", "-U0", parent, sha, "--", "pyproject.toml")
+            if patch is None:
+                return False
+            removed, added = [], []
+            for line in patch.splitlines():
+                if line.startswith(("+++", "---")):
+                    continue
+                if line.startswith("+"):
+                    added.append(line[1:])
+                elif line.startswith("-"):
+                    removed.append(line[1:])
+            if len(removed) != 1 or len(added) != 1:
+                return False
+            if not (_VERSION_LINE.match(removed[0].strip())
+                    and _VERSION_LINE.match(added[0].strip())):
+                return False
+        elif name.startswith(NOTES_DIR + "/") and name.endswith(".md"):
+            continue
+        else:
+            return False
+    return True
+
+
+def _cutoff_landing_only(repo: str, base: str, head: str) -> bool:
+    """La cible n'a avancé que par des atterrissages de coupure (#173).
+
+    `base` doit être un ancêtre de `head` ; chaque commit de l'intervalle doit
+    être un atterrissage (version + notes). Un dépôt illisible, une cible
+    absente ou un commit de code rendent False : on ne fusionne pas un arbre
+    que la CI n'a pas testé."""
+    if not repo or not base or not head or base == head:
+        return False
+    if _git(repo, "merge-base", "--is-ancestor", base, head) is None:
+        return False
+    commits = _git(repo, "rev-list", "--reverse", "%s..%s" % (base, head))
+    if commits is None:
+        return False
+    shas = commits.split()
+    return bool(shas) and all(_cutoff_commit(repo, sha) for sha in shas)
+
+
+def _merge_base(repo: str, a: str, b: str) -> str:
+    """Le dernier commit commun de `a` et `b`, ou ""."""
+    if not repo or not a or not b:
+        return ""
+    return (_git(repo, "merge-base", a, b) or "").strip().lower()
+
+
+def _target_tested(repo: str, target: str, head: str, composition: str = "") -> bool:
+    """La cible est-elle couverte par la tête testée `head` ?
+
+    #3534 (B2) : la borne n'est pas la base du manifeste mais le dernier
+    commit de la cible **contenu dans la tête** (`merge-base`) ; c'est lui qui
+    a été testé avec le paquet. Si la cible a ensuite avancé, seul le delta
+    depuis ce commit doit être un atterrissage de coupure. Sans tête lisible
+    (clone en retard, tête absente), le repli est la base du manifeste : une
+    cible qui n'a pas bougé depuis la composition reste couverte."""
+    if not repo or not target or not head:
+        return False
+    included = _merge_base(repo, target, head)
+    if not included:
+        return bool(composition) and _cutoff_landing_only(repo, composition, target)
+    if included == target:
+        return True
+    return _cutoff_landing_only(repo, included, target)
+
+
+def _gate_repo(cfg, db, row, slug: str, checkout: str = "") -> str:
+    """Le clone où lire le delta de la cible, résolu comme la porte des avis.
+
+    #3534 (relecture cx3 B3) : `ci run`/`arm` laissent `checkout` vide ; le
+    registre de l'assigné et le clone du projet (`radar.projects`) sont les
+    mêmes sources que `_verdicts`, et doivent être lues **avant** la garde du
+    delta, pas seulement plus tard par la porte des avis."""
+    repo = None
+    try:
+        repo = fire._repo_of(db, row)
+        if repo is not None and not fire._same_repository(repo, slug):
+            repo = None
+        project = fire._project(cfg, repo, slug)
+        if repo is None:
+            repo = fire._project_checkout(project)
+    except Exception:  # noqa: BLE001 - registre/radar illisibles : repli
+        repo = None
+    if repo is None and checkout:
+        repo = fire._checkout(checkout)
+        if repo is not None and not fire._same_repository(repo, slug):
+            repo = None
+    return repo or ""
+
+
+# --------------------------------------------------------------------------
 # GitHub
 # --------------------------------------------------------------------------
 
@@ -282,7 +476,7 @@ def pr_status(slug: str, number: int, *, gh) -> dict:
 # --------------------------------------------------------------------------
 
 def arm(cfg, db, lot: int, *, slug: str, number: int, sha: str, target: str, gh,
-        actor: str = work.SYSTEM_SENDER) -> dict:
+        actor: str = work.SYSTEM_SENDER, checkout: str = "") -> dict:
     """Arme la fusion du porteur `lot` (PR `number` de `slug`) sur `sha`,
     vers `target`.
 
@@ -315,7 +509,7 @@ def arm(cfg, db, lot: int, *, slug: str, number: int, sha: str, target: str, gh,
         if out["state"] in ("armed", "already-armed"):
             # une composition déjà verte fusionne tout de suite, sous le même bail
             out["merge"] = _check_locked(cfg, db, lot, gh=gh, dry_run=False, actor=actor,
-                                         handle=handle, fence=fence)
+                                         handle=handle, fence=fence, checkout=checkout)
         return out
     finally:
         _unlock(handle)
@@ -377,12 +571,19 @@ def _arm_locked(db, lot: int, *, slug: str, number: int, sha: str, target: str, 
                 "why": "already armed on %s → %s" % (sha[:12], target)}
     names = ",".join(dict.fromkeys(quote(context, safe="")
                                    for context, _app in required))
+    # #3534 : la base de composition est épinglée avec la tête et la cible ;
+    # le passage compare la cible courante à cette borne, pas à elle-même.
+    composition = (_composition_base(db, lot, sha, target)
+                   or str(view.get("base_oid") or "").strip().lower())
+    pinned = "base=%s method=%s required=%s" % (target, METHOD, names)
+    if composition:
+        pinned += " composition=%s" % composition
     if not _renew(handle):
         return lost
     if not _note_fenced(db, fence, lot, "armed", slug, number, sha,
-                        "base=%s method=%s required=%s — ameesh merges this head into %s "
-                        "once its required checks are green; a new push or a retarget "
-                        "disarms it" % (target, METHOD, names, target), actor,
+                        "%s — ameesh merges this head into %s once its required checks "
+                        "are green; a new push, a retarget or a target that advanced "
+                        "since composition disarms it" % (pinned, target), actor,
                         margin_s=AUTOMERGE_CALL_MARGIN_S):
         return {"state": "error", "why": "the elected pilot lease was lost before "
                                          "arming: nothing armed"}
@@ -608,6 +809,453 @@ def _held(db, lot: int, mine: dict, rows, out: dict, *, actor: str, fence=None) 
         pass
 
 
+def _masked_green(entry: dict) -> dict:
+    """La même entrée, verte : relit les portes de `fire` comme si le rouge
+    hérité prouvé n'existait pas. Un statut de commit porte `state`, un check
+    run `status`/`conclusion`."""
+    row = dict(entry)
+    if row.get("__typename") == "StatusContext" \
+            or "state" in row and "conclusion" not in row:
+        row["state"] = "SUCCESS"
+    else:
+        row["status"] = "COMPLETED"
+        row["conclusion"] = "SUCCESS"
+    return row
+
+
+def _flux_part(name: str, prefix: str) -> str | None:
+    """La part d'un check `tests (flux) <part>`, ou None si ce n'est pas un
+    flux de test (le préfixe est celui du veilleur, `ci.CHECK_PREFIX`)."""
+    head = prefix + " "
+    return name[len(head):] if name.startswith(head) and len(name) > len(head) else None
+
+
+def _fresh_run(slug: str, rid: int, *, gh) -> dict | None:
+    """L'état frais d'une exécution GitHub (`status`, `conclusion`,
+    `run_attempt`, `head_sha`), ou None.
+
+    #3558 (ameesh-cx3 B/P1) : la base peut être en retard sur la forge — une
+    ligne encore `running`, ou un flux d'un autre attempt. Une lecture
+    impossible ne prouve rien : la porte reste fermée."""
+    try:
+        proc = gh(["api", "repos/%s/actions/runs/%d" % (slug, int(rid))])
+    except Exception:  # noqa: BLE001 - une lecture illisible ne prouve rien
+        return None
+    if proc.returncode != 0:
+        return None
+    try:
+        data = json.loads(proc.stdout or "{}")
+    except ValueError:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _fresh_events(slug: str, head: str, rid: int, attempt: int, *, gh) -> list[dict] | None:
+    """Les événements d'échec **terminaux** de l'attempt `attempt` de
+    l'exécution `rid`, relus sur la tête exacte.
+
+    #3558 (ameesh-cx3 B/P1) : `st.ci.failures` peut ne pas encore porter le
+    dernier échec publié, même quand le veilleur a conclu la ligne. Relire la
+    sortie des flux terminaux et la comparer aux lignes en base prouve que le
+    relevé est complet, au lieu de supposer que la dernière passe a tout vu.
+
+    La lecture est celle du veilleur (`commits/<sha>/check-runs`, 100 par
+    page) ; #3593 : toutes les pages sont lues (`--paginate`), pas seulement
+    la première — au-delà de 100 check-runs, la preuve restait sinon inerte.
+    Une lecture partielle (pages absentes, `total_count` non couvert, compte
+    qui change d'une page à l'autre) ne prouve pas la complétude et rend
+    None. None aussi si une sortie de flux porte le marqueur d'omission de
+    `ci-flow.py` (relectures B/P1 du 25/10) : les échecs coupés par `MAX_TEXT`
+    ne sont ni publiés ni lus, donc `events_of` les ignore et le relevé
+    semblerait complet à tort."""
+    from . import ci as ci_mod
+    path = "repos/%s/commits/%s/check-runs?per_page=100" % (slug, quote(head, safe=""))
+    try:
+        pages = fire._api_pages(gh, path, "gh api %s" % path)
+    except Exception:  # noqa: BLE001 - une lecture illisible ne prouve rien
+        return None
+    runs = []
+    total = None
+    for data in pages:
+        if not isinstance(data, dict) or not isinstance(data.get("check_runs"), list):
+            return None
+        count = data.get("total_count")
+        if type(count) is not int or count < 0:
+            return None
+        if total is None:
+            total = count
+        elif count != total:
+            # Un check est né entre deux pages : l'ensemble lu n'est pas
+            # celui que `total_count` décrit, la preuve est incomplète.
+            return None
+        runs.extend(run for run in data["check_runs"] if isinstance(run, dict))
+    if total is None or len(runs) != total:
+        return None
+    for run in runs:
+        if not str(run.get("name") or "").startswith(ci_mod.CHECK_PREFIX):
+            continue
+        output = run.get("output")
+        text = output.get("text") if isinstance(output, dict) else ""
+        if isinstance(text, str) and OMITTED_EVENTS_RE.search(text):
+            return None
+    return ci_mod.events_of(runs, int(rid), int(attempt))
+
+
+def _inherited_red(db, *, slug: str, base: str, sha: str, view: dict, required,
+                   project, gh) -> dict | None:
+    """#3558 : la preuve qu'une tête n'est rouge que d'échecs **hérités** de
+    la cible, ou None.
+
+    Le veilleur marque chaque échec `inherited` quand son test était déjà
+    rouge au dernier relevé conclu de la cible (`ci.py`, `st.ci.failures`).
+    `fire.ready_pr` exige pourtant tous les checks requis verts : un paquet
+    dont le seul rouge est ce passif restait `pending`, et un humain forçait
+    la fusion à la main (h-18 #3510, h-19 #3538). Le §3 du canon (« seul un
+    test négatif bloque » ; un test dépendant de l'environnement se corrige à
+    la source) et le §11 bis (« rouge après fusion : corriger en avant »)
+    demandent de fusionner ce paquet en journalisant l'héritage.
+
+    La preuve est fermée par défaut :
+
+    * la ligne du veilleur est conclue `failure`, et la forge dit le même
+      run `completed` en échec, sur **le même attempt** et la même tête : un
+      flux d'un autre attempt, ou une ligne encore `running`, ne prouve rien ;
+    * les événements terminaux relus sur la tête pour cet attempt sont
+      exactement ceux enregistrés (part, test) : un dernier échec publié après
+      la passe du veilleur bloque tant qu'il n'est pas lu ;
+    * aucune sortie de flux ne porte le marqueur d'omission de `ci-flow.py`
+      (`MAX_TEXT`) : des échecs coupés ne sont jamais publiés, donc le relevé
+      semblerait complet à tort (relectures B/P1 du 25/10) ;
+    * chaque échec lu sur la tête porte `inherited`, et son test figure encore
+      dans le dernier relevé conclu de la cible (un marqueur périmé, une base
+      devenue verte ou sans relevé conclu ne rouvrent rien) ;
+    * au moins un échec de **test** est identifié avec sa part (une ligne
+      `job` ne suffit pas) ;
+    * chaque check rouge de la même exécution que le check requis a un test lu
+      — une part rouge sans test identifié reste bloquante ; l'exemption par
+      part ne vaut que pour un agrégat requis reconnu (`tests`), tout autre
+      check requis rouge (`lint`) a sa propre part et son test ;
+    * chaque part lue exige son flux `tests (flux) <part>` présent et
+      `FAILURE` : un flux CANCELLED (runner mort avant sa ligne `fin`) ne
+      prouve pas la fin de la part et bloque, comme un flux absent ou en cours ;
+    * tout check de cette exécution qui n'est ni vert, ni sauté/neutre, ni
+      rouge identifié (en attente, annulé, expiré, jamais conclu) bloque ;
+    * les écarts hors CI de `fire.ready_pr` (brouillon, cible, gel, statuts
+      exigés) sont relus : seul un rouge de CI peut être rouvert. Un statut
+      exigé non concluant (`ERROR`) ne rouvre rien mais se consigne (#3593 N1),
+      comme sur le chemin vert (`#3085`, règle owner 23/10).
+
+    Le masquage est lié aux identités exactes `(nom, exécution)` : une entrée
+    de provenance homonyme d'une autre exécution (même application requise)
+    reste un rouge non prouvé (relecture ameesh-cx3 B/P1).
+
+    Rend `{parts, tests, base_shas, runs}` (matière de la note) et, s'il y en
+    a, `consigned` (statuts exigés non concluants à consigner), ou None."""
+    from . import ci as ci_mod, radar
+    try:
+        st = storage.of(db).ci
+        filtered = _required_ci(view, required, project)
+    except Exception:  # noqa: BLE001 - une preuve illisible ne fusionne pas
+        return None
+    rollup = filtered.get("rollup") or ()
+    reds = [entry for entry in radar.latest_rollup(rollup)
+            if radar.check_result(entry) == radar.CI_NEGATIVE_RESULT]
+    if not reds:
+        return None
+    head = str(view.get("head") or "").strip().lower()
+    if head != str(sha or "").strip().lower() or view.get("draft"):
+        return None
+    if base and view.get("base") and view["base"] != base:
+        return None
+    pairs = fire._required_pairs(required)
+    required_names = {name for name, _app in pairs}
+    if not pairs:
+        # La fusion auto n'est armée que sur une protection prouvée (#2813) ;
+        # sans check requis, il n'y a pas de rouge de CI à rouvrir ici.
+        return None
+    # #3558 (ameesh-cx1, B/P1) : seul un agrégat reconnu est exempté de la
+    # preuve par part ; `lint` ou tout autre check requis rouge doit avoir sa
+    # part et son test lus, sinon il ne se masque pas en vert.
+    aggregates = required_names & INHERITED_RED_AGGREGATES
+    prefix = ci_mod.CHECK_PREFIX
+    provenance = None
+    if any(app is not None for _, app in pairs):
+        try:
+            provenance = fire._head_check_runs(slug, head, gh=gh)
+        except land.LandError:
+            return None
+    status_consigned: list[str] = []
+    try:
+        statuses = radar.required_statuses(project, view.get("branch"))
+        status_gaps = []
+        if statuses:
+            entries = [entry for entry in rollup
+                       if isinstance(entry, dict)
+                       and (entry.get("__typename") == "StatusContext"
+                            or "state" in entry and "conclusion" not in entry)]
+            status_gaps, status_consigned = fire._required_status_gate(entries, statuses)
+    except Exception:  # noqa: BLE001 - une porte illisible ne fusionne pas
+        return None
+    if status_gaps:
+        # `ready_pr` refuse aussi sur un statut exigé : hors CI, rien n'est
+        # rouvert (le brouillon, la cible et le gel sont relus plus haut).
+        return None
+    explained_names: set[str] = set()
+    explained_runs: set[tuple[str, int]] = set()
+    explained_rest: set[str] = set()
+    seen: set[int] = set()
+    bases: dict[int, dict] = {}
+    parts: set[str] = set()
+    tests: set[str] = set()
+    for entry in reds:
+        rid = radar.actions_run_id(slug, entry)
+        if rid is None:
+            continue
+        if rid not in seen:
+            seen.add(rid)
+            run = st.run(slug, rid)
+            if not isinstance(run, dict) \
+                    or str(run.get("head_sha") or "").strip().lower() != head:
+                return None
+            # #3558 (ameesh-dev2, B/P1) : le veilleur CI et ce passage
+            # tournent séparément. Tant que `_conclude` n'a pas figé la ligne
+            # en `failure`, `st.ci.failures` peut n'avoir lu qu'un échec hérité
+            # et manquer le dernier échec propre. Une ligne conclue prouve
+            # qu'une dernière passe `_failures` a eu lieu (relecture cx3).
+            if str(run.get("status") or "") != "failure":
+                return None
+            attempt = int(run.get("run_attempt") or 1)
+            # #3558 (ameesh-cx3, B/P1) : la ligne peut être restée sur un
+            # attempt précédent pendant qu'un flux plus récent a déjà conclu.
+            # Seul un relevé de la forge terminé en échec, sur le **même
+            # attempt** et la même tête, prouve le rouge lu.
+            remote = _fresh_run(slug, rid, gh=gh)
+            if not isinstance(remote, dict) \
+                    or str(remote.get("status") or "") != "completed" \
+                    or str(remote.get("conclusion") or "").lower() \
+                    not in ("failure", "timed_out") \
+                    or int(remote.get("run_attempt") or 1) != attempt \
+                    or str(remote.get("head_sha") or "").strip().lower() != head:
+                return None
+            # #3558 (ameesh-cx3, B/P1) : relire les événements terminaux de cet
+            # attempt et les comparer au relevé en base. Un échec publié après
+            # la dernière passe du veilleur — même sur une ligne déjà conclue —
+            # n'est pas encore enregistré : le masquer fusionnerait par-dessus.
+            events = _fresh_events(slug, head, rid, attempt, gh=gh)
+            if not events:
+                return None
+            failures = st.failures(slug, rid)
+            if not failures or any(not f.get("inherited") for f in failures):
+                return None
+            recorded = {(str(f.get("part") or ""), str(f.get("test") or ""))
+                        for f in failures}
+            terminal = {(str(ev.get("part") or ""), str(ev["test"]))
+                        for ev in events}
+            if recorded != terminal:
+                return None
+            workflow = str(run.get("workflow") or "")
+            reference = st.base_failures(slug, base, workflow=workflow)
+            if not isinstance(reference, dict) or not reference.get("run_id") \
+                    or not str(reference.get("head_sha") or "").strip():
+                return None
+            known = {str(test) for test in reference.get("tests") or ()}
+            if any(str(f.get("test") or "") not in known for f in failures):
+                return None
+            # Une ligne `job` (panne sans événement de test, `ci.JOB_PART`)
+            # n'identifie aucun test : la compter rouvrirait la fusion sur une
+            # preuve absente.
+            run_parts = {str(f.get("part") or "") for f in failures
+                         if f.get("part") and str(f.get("part")) != ci_mod.JOB_PART
+                         and f.get("test")}
+            if not run_parts:
+                return None
+            # Chaque check de l'exécution est relu : une part rouge sans test
+            # identifié, une part encore en cours ou annulée/expirée bloque.
+            # #3558 (ameesh-cx1, B/P1) : l'exemption ne vaut que pour un
+            # agrégat requis reconnu (`tests`) ; tout autre check requis rouge
+            # — `lint`, par exemple — exige sa part et son test propres. Le
+            # saut de tous les `required_names` le masquait en vert sans preuve.
+            red_parts = set()
+            for other in view.get("rollup") or ():
+                if radar.actions_run_id(slug, other) != rid:
+                    continue
+                name = str(other.get("name") or other.get("context") or "")
+                if name in aggregates:
+                    # L'agrégat se prouve par les parts, pas par un test à son
+                    # nom : il n'a pas de part propre.
+                    continue
+                result = radar.check_result(other)
+                if result == radar.CI_NEGATIVE_RESULT:
+                    if name not in run_parts:
+                        return None
+                    red_parts.add(name)
+                elif result == radar.CI_WAITING_RESULT:
+                    return None
+                elif result == radar.CI_INCONCLUSIVE_RESULT:
+                    state = str(other.get("conclusion") or other.get("state") or "").upper()
+                    if state not in ("SKIPPED", "NEUTRAL"):
+                        return None
+            # #3558 (ameesh-dev4, B/P1) : un runner mort après un échec hérité
+            # publie ses événements mais pas sa ligne `fin` ; le flux de la
+            # part conclut alors CANCELLED — un non concluant que le portier
+            # se contente de consigner, et la part lue masquerait le job rouge.
+            # Chaque part de `run_parts` exige donc son flux présent et
+            # FAILURE ; absent, annulé, expiré ou en cours bloque.
+            # #3558 (ameesh-dev4, N) : lire le rollup complet de la tête, pas
+            # le rollup filtré : un flux de part reste une preuve même quand
+            # `_required_ci` ne l'a pas retenu (nom hors exigences).
+            flux_results: dict[str, list[str]] = {}
+            for other in radar.latest_rollup(view.get("rollup") or ()):
+                part = _flux_part(str(other.get("name")
+                                      or other.get("context") or ""), prefix)
+                if part is not None:
+                    flux_results.setdefault(part, []).append(
+                        radar.check_result(other))
+            for part in run_parts:
+                results = flux_results.get(part)
+                if not results or any(result != radar.CI_NEGATIVE_RESULT
+                                      for result in results):
+                    return None
+            if not red_parts and not (run_parts & required_names):
+                # Un agrégat rouge sans aucune part rouge lue n'est pas un
+                # échec de test identifié : le cas de #3558 ne s'applique pas.
+                return None
+            # L'incident est celui de l'exécution de **base** dont les échecs
+            # sont hérités, pas du run du paquet.
+            bases[int(reference["run_id"])] = {
+                "head_sha": str(reference.get("head_sha") or ""),
+                "workflow": workflow, "url": ""}
+            parts |= run_parts
+            tests |= {str(f.get("test")) for f in failures if f.get("test")}
+        name = str(entry.get("name") or entry.get("context") or "")
+        explained_names.add(name)
+        explained_runs.add((name, int(rid)))
+    if not seen or not bases or not parts:
+        return None
+    if not any(name in explained_names for name in required_names):
+        # Sans un check **requis** rouge et prouvé, il n'y a pas de porte de
+        # paquet à rouvrir : un flux ou un détail rouge seul n'est pas le cas
+        # de #3558.
+        return None
+    # Les rouges sans exécution Actions (le détail de l'agrégat et les flux)
+    # ne se prouvent que par la part qu'ils nomment, ou par l'agrégat prouvé.
+    for entry in reds:
+        name = str(entry.get("name") or entry.get("context") or "")
+        if radar.actions_run_id(slug, entry) is not None:
+            continue
+        if name == radar.AGGREGATE_DETAIL_CHECK:
+            explained_rest.add(name)
+            explained_names.add(name)
+            continue
+        part = _flux_part(name, prefix)
+        if part is None or part not in parts:
+            return None
+        explained_rest.add(name)
+        explained_names.add(name)
+    # La relecture qui décide : les seules entrées masquées sont les rouges
+    # prouvés ci-dessus. Tout autre écart de `ready_pr` — check absent, en
+    # attente, jamais conclu, portier rouge non expliqué — reste dans les
+    # portes relues et garde la fusion fermée, même à côté d'un héritage réel.
+    # #3558 (ameesh-cx3, B/P1) : l'identité est exacte — `(nom, exécution)` —
+    # jamais le seul nom. Une entrée de provenance homonyme d'une autre suite
+    # ou d'un autre run (même application requise) reste un rouge non prouvé.
+    def proven(entry) -> bool:
+        name = str(entry.get("name") or entry.get("context") or "")
+        rid = radar.actions_run_id(slug, entry)
+        if rid is None:
+            return name in explained_rest
+        return (name, int(rid)) in explained_runs
+
+    def masked(entry):
+        if proven(entry) and radar.check_result(entry) == radar.CI_NEGATIVE_RESULT:
+            return _masked_green(entry)
+        return entry
+
+    def masked_run(run):
+        if str(run.get("conclusion") or "").upper() == "FAILURE" and proven(run):
+            return _masked_green(run)
+        return run
+
+    masked_rollup = [masked(entry) for entry in rollup]
+    masked_provenance = ([masked_run(run) for run in provenance]
+                         if provenance is not None else None)
+    try:
+        gaps, _consigned = fire._required_gate(pairs, masked_rollup,
+                                               masked_provenance, strict=False)
+        proof_gaps, _proof_consigned = fire._packet_proof_gate(masked_rollup)
+        detail_gaps, _detail_consigned = fire._aggregate_detail_gate(masked_rollup)
+    except Exception:  # noqa: BLE001 - une porte illisible ne fusionne pas
+        return None
+    if gaps or proof_gaps or detail_gaps:
+        return None
+    proof = {"parts": sorted(parts), "tests": sorted(tests),
+             "base_shas": sorted({row["head_sha"] for row in bases.values()
+                                  if row.get("head_sha")}),
+             "runs": bases}
+    # #3593 (N1) : `ready_pr` s'arrête sur les checks rouges avant de relire
+    # les statuts exigés ; le statut non concluant (ERROR) consigné ici ne
+    # doit pas être jeté — il se consigne et ouvre son lot de correction comme
+    # sur le chemin vert (`#3085`, règle owner 23/10).
+    if status_consigned:
+        proof["consigned"] = sorted(set(status_consigned))
+    return proof
+
+
+def _inherited_text(proof: dict) -> str:
+    """La phrase de journal d'une fusion sur rouge hérité (#3558)."""
+    return ("merged over inherited red: %s %s base %s"
+            % (", ".join(proof["parts"]), ",".join(proof["tests"]),
+               ",".join(proof["base_shas"])))
+
+
+def _note_inherited_incident(db, row: dict, *, slug: str, base: str, number: int,
+                             sha: str, proof: dict, actor: str) -> None:
+    """#3558 : la cible reste rouge après la fusion ; l'occurrence est notée
+    sur le lot d'incident **ouvert** de l'exécution de base, ou le lot est
+    ouvert (même geste que `_open_correction`, #3085).
+
+    L'écriture ne défait jamais la fusion déjà journalisée : tout échec est
+    avalé, la trace est un suivi."""
+    from . import incident
+    occurrence = ("%s — packet #%d (PR #%d, head %s) merged by ameesh over the red "
+                  "target; the target stays red until the correction lands"
+                  % (_inherited_text(proof), int(row.get("id") or 0), int(number),
+                     sha[:12]))
+    for rid, run in (proof.get("runs") or {}).items():
+        source = incident.ref_of(slug, rid)
+        try:
+            existing = work.open_with_source(db, source)
+        except Exception:  # noqa: BLE001 - lecture impossible : on ouvre
+            existing = None
+        if existing is not None:
+            try:
+                work.note(db, int(existing["id"]), occurrence, actor=actor)
+            except Exception:  # noqa: BLE001 - la trace ne défait pas la fusion
+                pass
+            continue
+        try:
+            work.add(
+                db,
+                title=incident.title_of(branch=base, run_id=rid,
+                                        workflow=run.get("workflow") or ""),
+                type="bug", priority=1, app=str(row.get("app") or ""),
+                source=source, issue_ref=source, unique_ref=True,
+                body=incident.body_of(
+                    repo=slug, branch=base, run_id=rid,
+                    head_sha=run.get("head_sha") or "",
+                    workflow=run.get("workflow") or "", url=run.get("url") or "",
+                    tests=proof["tests"],
+                    attribution={"status": "unknown"}) + "\n\n" + occurrence,
+                actor=actor)
+        except Exception:  # noqa: BLE001 - l'incident existe déjà (même fermé)
+            try:
+                rows = storage.of(db).work.by_issue_ref(source) or []
+                if rows:
+                    work.note(db, int(rows[0]["id"]), occurrence, actor=actor)
+            except Exception:  # noqa: BLE001 - aucun suivi possible
+                pass
+
+
 def _gate_locked(cfg, db, lot: int, mine: dict, *, gh, dry_run: bool, actor: str,
                  handle=None, fence=None, checkout: str = "") -> dict:
     slug, number, sha, base = mine["repo"], mine["pr"], mine["sha"], mine["base"]
@@ -622,7 +1270,25 @@ def _gate_locked(cfg, db, lot: int, mine: dict, *, gh, dry_run: bool, actor: str
     if row is None:
         return dict(out, result="error", error="lot #%d not found" % lot)
     frozen = fire._norm((fire.freeze_of(milestones) or {}).get("sha"))
+    base_oid = str(view.get("base_oid") or "").strip().lower()
+    composition = (_composition_base(db, lot, sha, base)
+                   or str(mine.get("composition") or "").strip().lower())
+    # #3534 (B3) : le clone se résout comme pour la porte des avis, avant la
+    # garde du delta ; `checkout` est vide dans `ci run`/`arm`.
+    repo = _gate_repo(cfg, db, row, slug, checkout)
     moved = []
+    # #3534 : la cible doit être couverte par la tête testée, soit directement
+    # (H2 = merge(H, C)), soit par une avance limitée aux atterrissages de
+    # coupure depuis le dernier commit de la cible déjà dans la tête (B2,
+    # #173). Sinon la CI du paquet n'a pas testé cet arbre : on désarme.
+    target_moved = ""
+    if base_oid and composition and base_oid != composition:
+        if repo:
+            _fetch_into(repo, (view.get("branch") or "", base))
+        if not _target_tested(repo, base_oid, sha, composition):
+            target_moved = ("target advanced since composition %s → %s"
+                            % (composition[:12], base_oid[:12]))
+            moved.append(target_moved)
     if view["head"] != sha:
         moved.append("head=%s" % (view["head"] or "?"))
     if view["base"] != base:
@@ -643,10 +1309,13 @@ def _gate_locked(cfg, db, lot: int, mine: dict, *, gh, dry_run: bool, actor: str
             error = land.pr_disable_auto(slug, number, gh=gh)
             if error is not None:
                 return dict(out, result="error", error="disarm: %s" % error)
+        why = ("the target advanced since composition; the packet must be updated "
+               "and its CI relaunched: `ameesh ci run %d --full` re-arms on the new head"
+               % int(lot)) if target_moved else (
+               "the PR changed since its publication; `ameesh ci run %d --full` "
+               "re-arms on the new head" % int(lot))
         if not _note_fenced(db, fence, lot, "disarmed", slug, number, sha,
-                            "base=%s %s — the PR changed since its publication; `ameesh "
-                            "ci run %d --full` re-arms on the new head"
-                            % (base, " ".join(moved), int(lot)), actor):
+                            "base=%s %s — %s" % (base, " ".join(moved), why), actor):
             return dict(out, result="error",
                         error="the elected pilot lease was lost before journaling "
                               "the disarm")
@@ -665,10 +1334,13 @@ def _gate_locked(cfg, db, lot: int, mine: dict, *, gh, dry_run: bool, actor: str
     # R1 B1 (cx3) : la porte complète des verdicts, comme le feu (classe,
     # avis requis et indépendants sur la tête gelée, membres d'un porteur et
     # delta, #2766), avant toute lecture de CI et tout geste de fusion.
-    # #3091 : la cible résolue de la PR prouve la base de composition du
-    # paquet ; la ref locale du checkout de l'assigné peut être en retard.
-    base_oid = str(view.get("base_oid") or "").strip().lower()
-    extra = {"base_sha": base_oid} if base_oid else {}
+    # #3091 : la cible résolue de la PR est la preuve transmise à
+    # `fire.ready_verdicts` ; `packet_reviews._packet_base` choisit ensuite la
+    # base du manifeste et la prouve sur cette cible. #3534 (B4) : ne jamais
+    # transmettre la base enregistrée à sa place — un `record --base X` où X
+    # est un commit sensible du paquet sortirait B..X du périmètre de revue.
+    verdict_base = base_oid
+    extra = {"base_sha": verdict_base} if verdict_base else {}
     if checkout:
         extra.update(checkout=checkout, branch=view.get("branch") or "")
     ok, why, project = _verdicts(cfg, db, row, milestones, slug=slug, base=base,
@@ -697,6 +1369,20 @@ def _gate_locked(cfg, db, lot: int, mine: dict, *, gh, dry_run: bool, actor: str
     ok, why = fire.ready_pr(_required_ci(view, required, project),
                             target=base, project=project, frozen=sha,
                             required=required, slug=slug, gh=gh, report=report)
+    inherited = None
+    if not ok:
+        # #3558 (canon §3, §11 bis) : un rouge que le paquet n'introduit pas —
+        # chaque échec marqué `inherited` au dernier relevé conclu de la cible —
+        # ne retient pas sa fusion. La preuve est relue ici, jamais supposée :
+        # tout échec propre, une part rouge sans test lu, une base sans relevé
+        # conclu ou une autre porte de `ready_pr` gardent la porte fermée.
+        try:
+            inherited = _inherited_red(db, slug=slug, base=base, sha=sha, view=view,
+                                       required=required, project=project, gh=gh)
+        except Exception:  # noqa: BLE001 - une preuve illisible ne fusionne pas
+            inherited = None
+        if inherited is not None:
+            ok = True
     if not ok:
         # #3186 (décision owner #128512) : un check requis jamais conclu est
         # une preuve absente ; la porte reste fermée et relance son run une
@@ -711,7 +1397,8 @@ def _gate_locked(cfg, db, lot: int, mine: dict, *, gh, dry_run: bool, actor: str
                         why="%s — %s" % (why, radar.describe_reruns(reruns)))
         return dict(out, result="pending", why=why)
     if dry_run:
-        return dict(out, result="would-merge")
+        return dict(out, result="would-merge",
+                    **({"inherited": inherited} if inherited else {}))
     # La PR est relue juste avant le geste, après toutes les lectures de la
     # porte ; une tête, une cible ou un état changés depuis ne fusionnent pas
     # (le passage suivant désarme).
@@ -719,11 +1406,17 @@ def _gate_locked(cfg, db, lot: int, mine: dict, *, gh, dry_run: bool, actor: str
         fresh = pr_status(slug, number, gh=gh)
     except land.LandError as exc:
         return dict(out, result="error", error="fresh read: %s" % exc)
-    if (fresh["state"], fresh["head"], fresh["base"]) != ("OPEN", sha, base):
+    # #3534 (B1) : la cible est relue **et comparée à son SHA de la porte**,
+    # pas seulement à son nom ; une avance de code pendant les lectures ne
+    # fusionne pas un arbre non testé (le passage suivant désarmera).
+    if (fresh["state"], fresh["head"], fresh["base"], fresh["base_oid"]) != \
+            ("OPEN", sha, base, base_oid):
         return dict(out, result="pending", why=(
-            "PR #%d changed just before the merge (%s, head %s, base %s): nothing merged"
+            "PR #%d changed just before the merge (%s, head %s, base %s, target %s — "
+            "expected target %s): nothing merged"
             % (number, fresh["state"] or "?", fresh["head"][:12] or "?",
-               fresh["base"] or "?")))
+               fresh["base"] or "?", fresh["base_oid"][:12] or "?",
+               base_oid[:12] or "?")))
     if not _renew(handle):
         return dict(out, result="busy")
     # L165 (EP4) : renouvellement du bail élu juste avant `POST /merges`, avec
@@ -740,8 +1433,18 @@ def _gate_locked(cfg, db, lot: int, mine: dict, *, gh, dry_run: bool, actor: str
     if error is not None:
         return dict(out, result="error", error="merge: %s" % error)
     consigned = list(report.get("consigned") or ())
-    note = ("base=%s commit=%s — merged by ameesh into %s at its published head, gates green"
-            % (base, commit or "already-contained", base))
+    # #3593 (N1) : les statuts exigés non concluants relus par la preuve du
+    # rouge hérité (ERROR) n'ont pas été consignés par `ready_pr`, qui s'arrête
+    # sur les checks rouges avant cette lecture. Ils se joignent à la liste,
+    # sans doublon quand `ready_pr` les a déjà portés.
+    for text in (inherited or {}).get("consigned") or ():
+        if text not in consigned:
+            consigned.append(text)
+    verdict = "gates green" if not inherited else "gates green apart from inherited red"
+    note = ("base=%s commit=%s — merged by ameesh into %s at its published head, %s"
+            % (base, commit or "already-contained", base, verdict))
+    if inherited:
+        note += "; " + _inherited_text(inherited)
     if consigned:
         note += ("; required checks non concluants consignés (règle owner 23/10) : %s"
                  % ", ".join(consigned))
@@ -749,7 +1452,11 @@ def _gate_locked(cfg, db, lot: int, mine: dict, *, gh, dry_run: bool, actor: str
     if consigned:
         _open_correction(db, row, slug=slug, number=number, sha=sha, base=base,
                          consigned=consigned, actor=actor)
-    return dict(out, result="merged", commit=commit, consigned=consigned)
+    if inherited:
+        _note_inherited_incident(db, row, slug=slug, base=base, number=number,
+                                 sha=sha, proof=inherited, actor=actor)
+    return dict(out, result="merged", commit=commit, consigned=consigned,
+                **({"inherited": inherited} if inherited else {}))
 
 
 def _open_correction(db, row: dict, *, slug: str, number: int, sha: str, base: str,

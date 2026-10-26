@@ -173,6 +173,26 @@ class LocalLandTest(_Land):
         off = dataclasses.replace(self.project, land="off")
         self.assertEqual(land.run_pass(self.cfg, None, off, report, owner="r"), [])
 
+    def test_run_pass_never_lands_a_row_the_train_enrolled(self):
+        """#3560 : la ligne d'un lot inscrit par le train (reçu `packet` sur sa
+        génération) est portée par le train ; la file ne l'atterrit pas seule,
+        ne l'éjecte pas, et atterrit la tête suivante."""
+        self.queued(4)
+        self.queued(3)
+        self.fake.queue_rows[3]["rank"] = 2
+        self.fake.queue_rows[4]["packet_allocated"] = True
+        report = {"queue": {"targets": {"main": [{"lot": 4, "rank": 1, "state": "queued"},
+                                                 {"lot": 3, "rank": 2, "state": "queued"}]}}}
+        out = land.run_pass(self.cfg, None, self.project, report, owner="runner-1")
+        self.assertEqual([(o["lot"], o["result"]) for o in out], [(3, "landed")])
+        self.assertEqual(self.fake.queue_rows[4]["state"], "queued")
+        self.assertEqual(self.fake.queue_rows[4].get("reason") or "", "")
+        # en « landing » non plus : seul le train la fait avancer
+        self.fake.queue_rows[4]["state"] = "landing"
+        only = {"queue": {"targets": {"main": [{"lot": 4, "rank": 1, "state": "landing"}]}}}
+        self.assertEqual(land.run_pass(self.cfg, None, self.project, only, owner="runner-1"), [])
+        self.assertEqual(self.fake.queue_rows[4]["state"], "landing")
+
 
 class ReviewAfterMergeTest(LocalLandTest):
     """L539 : la fusion confirmée d'un lot léger ouvre le lot de relecture §2."""
@@ -361,6 +381,38 @@ def _steal_after_gates(test, key="p:main"):
         test.assertIsNotNone(test.locks.land_lock(key, "runner-2", 600))
         return out
     return mock.patch.object(land, "gates", side_effect=gates)
+
+
+class QueueRemovalBeforeLandingTest(_Land):
+    """#3550 : une sortie de file entre la photographie du passage et
+    l'atterrissage ne laisse pas partir la fusion déjà programmée."""
+
+    LAND = "pr"
+
+    def test_a_queue_removal_before_the_landing_stops_the_pr_merge(self):
+        """#3550 : la photographie de file du passage ne suffit pas. Une sortie
+        de file entre la lecture de `run_pass` et `land_head` annule
+        l'atterrissage (ici la ligne est déjà `landing`, CI verte prête)."""
+        gh = FakeGh()
+        self.queued(4)
+        gh.head = self.tip(4)
+        first = self.land(4, gh=gh)
+        self.assertEqual(first["result"], "landing", first)
+        gh.head, gh.ci = first["sha"], "green"
+        real = land.land_head
+
+        def remove_then_land(cfg, db, project, row, **kw):
+            self.fake.queue_remove(4, note="removed before landing", actor="r2")
+            return real(cfg, db, project, row, **kw)
+
+        report = {"queue": {"targets": {"main": [{"lot": 4, "state": "landing"}]}}}
+        with mock.patch.object(land, "land_head", side_effect=remove_then_land):
+            out = land.run_pass(self.cfg, None, self.project, report, owner="runner-1",
+                                gh=gh)
+        self.assertEqual([(o["lot"], o["result"]) for o in out], [(4, "taken-out")], out)
+        self.assertFalse(any(c[:2] == ["pr", "merge"] for c in gh.calls),
+                         "a removed queue entry must not reach the PR merge")
+        self.assertNotIn(4, self.fake.queue_rows)
 
 
 class Review194Test(_Land):
@@ -1099,6 +1151,21 @@ class SettingsAndAlertTest(unittest.TestCase):
                          [("merge_blocked", 1, "a1")])
         self.assertIn("bloquée derrière le lot #1", alerts[0]["detail"])
 
+    def test_merge_blocked_ignores_a_row_the_train_enrolled(self):
+        """#3569 : la file saute la ligne d'un lot inscrit par le train (#3560) ;
+        une longue CI de paquet ne la rend pas « bloquante »."""
+        now = time.time()
+        rows = [{"work_item_id": 1, "target": "main", "state": "queued", "rank": 1,
+                 "updated_ts": now - 3600, "packet_allocated": True},
+                {"work_item_id": 3, "target": "dev", "state": "landing", "rank": 1,
+                 "updated_ts": now - 3600, "packet_allocated": True},
+                {"work_item_id": 4, "target": "ops", "state": "queued", "rank": 1,
+                 "updated_ts": now - 3600, "packet_allocated": False}]
+        store = mock.Mock()
+        store.work.queue.return_value = rows
+        with mock.patch.object(storage, "of", return_value=store):
+            self.assertEqual([r["work_item_id"] for r in land.blocked(None, now)], [4])
+
 
 class LeaseDbTest(PgTestCase):
     def test_lease(self):
@@ -1121,6 +1188,20 @@ class LeaseDbTest(PgTestCase):
         self.assertIsNone(ops.land_lock("p:main", "r2", 60, epoch=3))
         self.assertFalse(ops.land_unlock("p:main", "r2", 3))
         self.assertEqual(ops.land_lock("p:other", "r2", 60), 1)
+
+    def test_land_holder_names_the_live_lease_and_hides_an_expired_one(self):
+        """#3598 : le détenteur du bail et son échéance, pour le refus de
+        `give`/`withdraw` ; un bail expiré n'est plus un détenteur."""
+        ops = storage.of(self.db).work
+        self.assertIsNone(ops.land_holder("h:main"))
+        self.assertIsNotNone(ops.land_lock("h:main", "pass:r5:4242", 60))
+        holder = ops.land_holder("h:main")
+        self.assertEqual(holder["owner"], "pass:r5:4242")
+        self.assertGreater(holder["left_s"], 0)
+        self.assertTrue(str(holder["expires_at"]).endswith("Z"))
+        self.db.execute("UPDATE merge_locks SET expires_at = clock_timestamp()"
+                        " - interval '1 second' WHERE target = 'h:main'")
+        self.assertIsNone(ops.land_holder("h:main"))
 
     def test_queue_write_fenced_by_the_lease(self):
         """#194 r5: a queue write under a lease happens only while it holds."""
