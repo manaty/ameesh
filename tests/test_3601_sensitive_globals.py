@@ -6,9 +6,15 @@ portée de la découverte et les passe à un lanceur `unittest` imbriqué. La
 classe qui fuit échoue à son propre `tearDownClass`, en nommant la classe et
 le global ; la classe suivante reste saine (#3600 : l'erreur n'apparaissait
 que 35 classes plus loin, en `setUpClass`).
+
+#3625 : sous `python -m unittest -b`, `TextTestRunner(buffer=True)` remplace
+`sys.stdout`/`sys.stderr` avant les fixtures de classe ; la référence des flux
+est donc prise à la tête de chaque classe, et le lanceur tamponné ne casse
+plus au `tearDownClass` d'un `PgTestCase` (`AttributeError: getvalue`).
 """
 from __future__ import annotations
 
+import io
 import sys
 import tempfile
 import unittest
@@ -16,7 +22,10 @@ from unittest import mock
 
 from ameesh import db as db_mod
 
-from .support import PgTestCase, SENSITIVE_GLOBALS, SensitiveGlobalsMixin
+from .support import (
+    PgTestCase, SENSITIVE_GLOBALS, SensitiveGlobalsMixin,
+    capture_sensitive_globals,
+)
 
 
 def _fuiter_les_globaux() -> list:
@@ -43,6 +52,16 @@ def _lancer(*classes) -> unittest.TestResult:
     return resultat
 
 
+def _lancer_bufferise(*classes) -> unittest.TestResult:
+    """Le cas `python -m unittest -b` : le lanceur tamponne les flux."""
+    suite = unittest.TestSuite(
+        unittest.defaultTestLoader.loadTestsFromTestCase(classe)
+        for classe in classes)
+    runner = unittest.TextTestRunner(stream=io.StringIO(), buffer=True,
+                                     verbosity=0)
+    return runner.run(suite)
+
+
 class SensitiveGlobalsTest(unittest.TestCase):
     def test_pgtestcase_fuite_echoue_dans_sa_classe_et_la_suivante_est_saine(self):
         connect, stdout, stderr = db_mod.connect, sys.stdout, sys.stderr
@@ -54,6 +73,7 @@ class SensitiveGlobalsTest(unittest.TestCase):
             # pilote ; seule la vérification des globaux nous intéresse.
             @classmethod
             def setUpClass(cls):
+                capture_sensitive_globals(cls)
                 cls.schema = "t_fuite_3601"
                 cls.tmp = tempfile.mkdtemp(prefix="ameesh-3601-")
                 cls.db = mock.MagicMock()
@@ -67,6 +87,7 @@ class SensitiveGlobalsTest(unittest.TestCase):
         class SuivantePg(PgTestCase):
             @classmethod
             def setUpClass(cls):
+                capture_sensitive_globals(cls)
                 cls.schema = "t_suivante_3601"
                 cls.tmp = tempfile.mkdtemp(prefix="ameesh-3601-")
                 cls.db = mock.MagicMock()
@@ -113,3 +134,58 @@ class SensitiveGlobalsTest(unittest.TestCase):
         self.assertEqual(resultat.failures, [])
         self.assertEqual((db_mod.connect, sys.stdout, sys.stderr),
                          (connect, stdout, stderr))
+
+    def test_runner_tamponne_ne_casse_pas_au_teardownclass(self):
+        """#3625 : `-b` ne doit ni faire échouer une classe saine, ni casser
+        le lanceur en restaurant le flux réel à la place de son tampon."""
+        class TamponneePg(PgTestCase):
+            @classmethod
+            def setUpClass(cls):
+                capture_sensitive_globals(cls)
+                cls.schema = "t_tamponnee_3625"
+                cls.tmp = tempfile.mkdtemp(prefix="ameesh-3625-")
+                cls.db = mock.MagicMock()
+
+            def setUp(self):
+                pass
+
+            def test_saine(self):
+                pass
+
+        resultat = _lancer_bufferise(TamponneePg)
+
+        self.assertEqual(resultat.testsRun, 1)
+        self.assertEqual(resultat.errors, [])
+        self.assertEqual(resultat.failures, [])
+
+    def test_runner_tamponne_nomme_une_fuite_de_connect(self):
+        """Sous `-b`, une vraie fuite reste nommée et le lanceur survit à la
+        restauration (#3625) : les flux, eux, sont rendus au tampon."""
+        class FuiteConnectPg(PgTestCase):
+            patcheur = None
+
+            @classmethod
+            def setUpClass(cls):
+                capture_sensitive_globals(cls)
+                cls.schema = "t_fuite_connect_3625"
+                cls.tmp = tempfile.mkdtemp(prefix="ameesh-3625-")
+                cls.db = mock.MagicMock()
+
+            def setUp(self):
+                pass
+
+            def test_fuite(self):
+                FuiteConnectPg.patcheur = mock.patch.object(
+                    db_mod, "connect", new=mock.Mock())
+                FuiteConnectPg.patcheur.start()
+
+        try:
+            resultat = _lancer_bufferise(FuiteConnectPg)
+        finally:
+            if FuiteConnectPg.patcheur is not None:
+                FuiteConnectPg.patcheur.stop()
+
+        self.assertEqual(resultat.testsRun, 1)
+        self.assertEqual(resultat.failures, [])
+        self.assertEqual(len(resultat.errors), 1, resultat.errors)
+        self.assertIn("ameesh.db.connect", resultat.errors[0][1])

@@ -217,7 +217,21 @@ lot porteur** et le manifeste reprennent la ligne que le script imprime :
 ```sh
 scripts/paquet-compose.py --units --base origin/main [--head <réf>]
 # 2 unités de fusion, 3 lots portés : #2131 ef22692ba6a3, #2140 0a1b2c3d4e5f, #2157 112233445566
+#
+# ## Composition (2 unités, 3 lots)
+#
+# | unité | lot(s) | source | commit | note |
+# |---|---|---|---|---|
+# | 1 | #2131, #2140 | `ef22692ba6a3` | `9f8e7d6c5b4a` | composition |
+# | 2 | #2157 | `112233445566` | `aabbccddeeff` | composition |
 ```
+
+La table qui suit la ligne est le gabarit du manifeste (#3629) : la section
+`## Composition` et ses colonnes « lot » et « commit » sont la seule forme que
+lisent `ameesh work sync-packets` (fermeture des unités à la fusion) et la
+coupe de release. Une table qui cite des lots sans colonne « commit » ne livre
+rien ; `sync-packets` l'avertit maintenant, en nommant le manifeste, la ligne
+et ses lots encore ouverts (#3514 : trois unités restées en qa).
 
 Les unités de fusion sont les commits de fusion de première parente depuis
 `--base` qui portent `ameesh-work:` (tête = second parent) ; une mise à jour

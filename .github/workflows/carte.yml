@@ -5,12 +5,17 @@
 # carte, pas reporté.
 #
 # La suite passe sous mesure (couverture par test, sous-processus compris,
-# fichiers lus, tables touchées) : psycopg en 8 parts, plus les modules
+# fichiers lus, tables touchées) : psycopg en 12 parts, plus les modules
 # « pilote » en psql en 6 parts (le code propre au pilote psql n'est exécuté
 # que là). #3450 : le 24/10, six des dix parts ont été coupées au plafond de
 # 60 min sur un pool saturé ; des parts plus courtes gardent la mesure sous
 # le plafond même quand le pool est chargé, sans publier de carte partielle
-# (une carte incomplète est refusée par le plan : #1341 D).
+# (une carte incomplète est refusée par le plan : #1341 D). #3604 : le 25/10,
+# psycopg 1/8 et 2/8 ont encore été coupées à 60 min (test_1252 mesuré dans
+# ses sous-processus : 2 413 s ; test_503 bloqué 3 087 s sur un communicate
+# sans borne) ; le passage à 12 parts, la mesure des sous-processus de
+# test_1252 désactivée et une borne par test (`--test-timeout`) gardent la
+# mesure sous le plafond.
 # Le job « carte » fusionne les mesures en carte.json.gz (ameesh-carte/1) :
 #   - cache GitHub Actions `carte-<sha>` (une PR lit les caches de sa branche
 #     de base ; clé de repli `carte-`), sur main et à la main seulement ;
@@ -26,10 +31,11 @@
 #     couverture : le surcoût de la mesure varie de 1,2× à 9,3× selon les
 #     modules, et la table statique ne couvre que 76 modules sur 250 ;
 #   - B : les modules « pilote » psql sont mesurés en 6 parts, et les modules
-#     psycopg en 8 (#3450 ; une seule part de 45 modules pesait 38 min de mur
-#     pour un plafond de 40, annulée deux fois ; le run 38845518821 du 16/10 a
-#     encore annulé psycopg 2/4, 3/4 et psql 1/2, 2/2 à 40m30, d'où le
-#     resserrage à plafond conservé — arbitrage pilote du 16/10) ;
+#     psycopg en 12 (#3450 : 8 ; une seule part de 45 modules pesait 38 min de
+#     mur pour un plafond de 40, annulée deux fois ; le run 38845518821 du
+#     16/10 a encore annulé psycopg 2/4, 3/4 et psql 1/2, 2/2 à 40m30, d'où le
+#     resserrage à plafond conservé — arbitrage pilote du 16/10 ; #3604 : 8 ne
+#     tenaient plus le 25/10, voir l'en-tête) ;
 #   - D : la fusion refuse de publier une carte si une part attendue manque ou
 #     n'a pas écrit ses `durees.json` (part annulée), ou si la matrice de
 #     mesure n'est pas verte ; elle vérifie aussi la couverture *effective*
@@ -111,6 +117,7 @@ env:
   PARTS_MESURE: >-
     mesure-psycopg-1 mesure-psycopg-2 mesure-psycopg-3 mesure-psycopg-4
     mesure-psycopg-5 mesure-psycopg-6 mesure-psycopg-7 mesure-psycopg-8
+    mesure-psycopg-9 mesure-psycopg-10 mesure-psycopg-11 mesure-psycopg-12
     mesure-psql-1 mesure-psql-2 mesure-psql-3 mesure-psql-4
     mesure-psql-5 mesure-psql-6
 
@@ -168,19 +175,28 @@ jobs:
     # 1 588,7 s, 2 316 s de tests réels (test_503_agent_host ×2,4 sous charge).
     # Plafond porté à 60 min, la borne de #755 ; le plan signale une part
     # dont l'estimation × 1,5 dépasse ce plafond (`--plafond-min`, même valeur).
+    # #3604 — run 40177589953 (main 7d3e776e) : psycopg 1/8 et 2/8 coupées à
+    # 60 min (test_1252 à 2 413 s sous mesure, test_503 bloqué 3 087 s), carte
+    # non publiée. 12 parts, sous-processus de test_1252 non mesurés et borne
+    # par test (`--test-timeout`) : chaque part garde de la marge sous le
+    # plafond même avec une carte périmée.
     timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
         include:
-          - { pilote: psycopg, part: 1, parts: 8 }
-          - { pilote: psycopg, part: 2, parts: 8 }
-          - { pilote: psycopg, part: 3, parts: 8 }
-          - { pilote: psycopg, part: 4, parts: 8 }
-          - { pilote: psycopg, part: 5, parts: 8 }
-          - { pilote: psycopg, part: 6, parts: 8 }
-          - { pilote: psycopg, part: 7, parts: 8 }
-          - { pilote: psycopg, part: 8, parts: 8 }
+          - { pilote: psycopg, part: 1, parts: 12 }
+          - { pilote: psycopg, part: 2, parts: 12 }
+          - { pilote: psycopg, part: 3, parts: 12 }
+          - { pilote: psycopg, part: 4, parts: 12 }
+          - { pilote: psycopg, part: 5, parts: 12 }
+          - { pilote: psycopg, part: 6, parts: 12 }
+          - { pilote: psycopg, part: 7, parts: 12 }
+          - { pilote: psycopg, part: 8, parts: 12 }
+          - { pilote: psycopg, part: 9, parts: 12 }
+          - { pilote: psycopg, part: 10, parts: 12 }
+          - { pilote: psycopg, part: 11, parts: 12 }
+          - { pilote: psycopg, part: 12, parts: 12 }
           - { pilote: psql, part: 1, parts: 6 }
           - { pilote: psql, part: 2, parts: 6 }
           - { pilote: psql, part: 3, parts: 6 }
@@ -246,8 +262,10 @@ jobs:
           # toutes les parts ; plus de carte restaurée ni de découpage
           # recalculé ici.
           # jamais bloquant : un échec sous mesure est noté dans la carte
+          # #3604 : une borne par test (10 min) nomme un test bloqué au lieu
+          # de laisser la part consommer le plafond de 60 min.
           .venv-carte/bin/python scripts/test-parts.py run --plan "$RUNNER_TEMP/plan.json" \
-            --part ${{ matrix.part }} --driver "$AMEESH_DRIVER" \
+            --part ${{ matrix.part }} --driver "$AMEESH_DRIVER" --test-timeout 600 \
             --measure "$M" --output-durations "$M/durees.json" --flow "$M/flux.jsonl" \
             || echo "::warning::tests en échec sous mesure (notés dans la carte)"
           echo "durée sous mesure : $(( $(date +%s) - debut )) s" >> "$GITHUB_STEP_SUMMARY"

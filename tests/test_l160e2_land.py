@@ -1189,6 +1189,20 @@ class LeaseDbTest(PgTestCase):
         self.assertFalse(ops.land_unlock("p:main", "r2", 3))
         self.assertEqual(ops.land_lock("p:other", "r2", 60), 1)
 
+    def test_land_holder_names_the_live_lease_and_hides_an_expired_one(self):
+        """#3598 : le détenteur du bail et son échéance, pour le refus de
+        `give`/`withdraw` ; un bail expiré n'est plus un détenteur."""
+        ops = storage.of(self.db).work
+        self.assertIsNone(ops.land_holder("h:main"))
+        self.assertIsNotNone(ops.land_lock("h:main", "pass:r5:4242", 60))
+        holder = ops.land_holder("h:main")
+        self.assertEqual(holder["owner"], "pass:r5:4242")
+        self.assertGreater(holder["left_s"], 0)
+        self.assertTrue(str(holder["expires_at"]).endswith("Z"))
+        self.db.execute("UPDATE merge_locks SET expires_at = clock_timestamp()"
+                        " - interval '1 second' WHERE target = 'h:main'")
+        self.assertIsNone(ops.land_holder("h:main"))
+
     def test_queue_write_fenced_by_the_lease(self):
         """#194 r5: a queue write under a lease happens only while it holds."""
         ops = storage.of(self.db).work

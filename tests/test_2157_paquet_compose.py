@@ -207,7 +207,8 @@ class PaquetComposeTest(unittest.TestCase):
 
         proc = self.compose("--units", "--base", self.base)
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        line = proc.stdout.strip()
+        # la ligne d'unités, puis le gabarit du manifeste (#3629)
+        line = proc.stdout.splitlines()[0]
         # #7 recomposé : une seule unité (la plus récente) et un seul lot
         self.assertEqual(line, "2 unités de fusion, 2 lots portés : #7 %s, #8 %s"
                          % (remise[:12], huit[:12]))
@@ -229,7 +230,7 @@ class PaquetComposeTest(unittest.TestCase):
         proc = self.compose("--units", "--base", self.base)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(
-            proc.stdout.strip(),
+            proc.stdout.splitlines()[0],
             "2 unités de fusion, 3 lots portés : #7 %s, #8 %s, #9 %s"
             % (sept[:12], sept[:12], neuf[:12]))
 
@@ -243,9 +244,41 @@ class PaquetComposeTest(unittest.TestCase):
         proc = self.compose("--units", "--base", self.base)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(
-            proc.stdout.strip(),
+            proc.stdout.splitlines()[0],
             "3 unités de fusion, 3 lots portés : #7 %s, #8 %s, #9 %s"
             % (sept[:12], remise[:12], neuf[:12]))
+
+    def test_units_imprime_le_gabarit_lu_par_sync_packets(self) -> None:
+        # #3629 : le gabarit est la table `## Composition` que lisent
+        # packet_close.parse_manifest et la coupe de release ; une table sans
+        # colonne « commit » ne livrait aucune unité (#3514).
+        from ameesh import packet_close
+        self.git("switch", "-q", "-c", "integration/paquet-banc")
+        sept = self.lot_file(7, "sept.txt", "sept\n")
+        neuf = self.lot_file(9, "neuf.txt", "neuf\n")
+        self.git("switch", "-q", "integration/paquet-banc")
+        proc = self.compose("--lot", "7", "--lot", "8", "--source", sept)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        multi = self.rev("HEAD")
+        proc = self.compose("--lot", "9", "--source", neuf)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        single = self.rev("HEAD")
+        proc = self.compose("--units", "--base", self.base)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        template = proc.stdout.split("\n\n", 1)[1]
+        self.assertTrue(template.startswith("## Composition (2 unités, 3 lots)"), template)
+        self.assertIn("| 1 | #7, #8 | `%s` | `%s` | composition |"
+                      % (sept[:12], multi[:12]), template)
+        self.assertIn("| 2 | #9 | `%s` | `%s` | composition |"
+                      % (neuf[:12], single[:12]), template)
+        entries = packet_close.parse_manifest(template)
+        self.assertEqual([entry["lots"] for entry in entries], [[7, 8], [9]])
+        self.assertEqual([entry["commits"] for entry in entries],
+                         [[multi[:12]], [single[:12]]])
+        self.assertEqual([entry["sources"] for entry in entries],
+                         [[sept[:12]], [neuf[:12]]])
+        self.assertFalse(any(entry["withdrawn"] for entry in entries))
+        self.assertEqual(packet_close.manifest_gaps(template), [])
 
     def test_units_sans_unite_ou_mal_appele(self) -> None:
         proc = self.compose("--units", "--base", self.base)

@@ -316,6 +316,18 @@ class Agents(Domain):
         """Vue d'observabilité (`mesh list --json`), colonnes du canon comprises."""
 
     @abc.abstractmethod
+    def reachability(self) -> list[dict]:
+        """#3631 : les seules colonnes qui disent si un relecteur désigné lira
+        son courrier — `name`, `aliases`, `retired_ts`, `mode`, `status`,
+        `host`.
+
+        La passe de redésignation lit ce fait à chaque synchronisation de
+        canon sur chaque exécuteur : `overview()` y joignait le canon, les
+        baux et des colonnes larges, et expirait sous la pression de la base
+        commune (639 passes perdues en 24 h). Aucune décision de sélection
+        n'est prise ici, seulement la preuve de joignabilité."""
+
+    @abc.abstractmethod
     def claimable(self, host: str, names: Sequence[str] | None, *,
                   require_responsible: bool) -> list[dict]:
         """Agents de l'hôte sans bail vivant, réclamables (mêmes règles que `claim`).
@@ -1813,6 +1825,12 @@ class WorkItems(Domain):
     @abc.abstractmethod
     def land_unlock(self, key: str, owner: str, epoch: int) -> bool:
         """L160e2 (0058): frees the lease, if still held at that epoch."""
+
+    @abc.abstractmethod
+    def land_holder(self, key: str) -> dict | None:
+        """#3598: the live holder of the merge lease of `key`, for a refusal
+        message: `{owner, expires_at, left_s}`, or None. A diagnostic read,
+        never a guard; server-only, like `land_lock`/`land_unlock`."""
 
     @abc.abstractmethod
     def train_read(self, key: str) -> dict | None:

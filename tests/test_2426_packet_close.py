@@ -270,8 +270,92 @@ class PacketCloseTest(_PlanDb):
         self.assertEqual(report["merged"], 1)
         self.assertEqual(work.get(self.db, unit["id"])["state"], "merged")
 
+    def _manifest_sans_commit(self, items: list[dict]) -> None:
+        """#3629 : la forme du manifeste de #3514 — colonne « lot », aucune
+        colonne « commit » — posée sur la cible après la fusion du paquet."""
+        rows = ["# Paquet test", "", "## Composition", "",
+                "| lot | source composée | gel | avis indépendants |",
+                "|---|---|---|---|"]
+        rows.extend("| #%d | `%s` | gel | deux avis |" % (item["id"], "a" * 12)
+                    for item in items)
+        write(self.repo, "reviews/integration-paquet-sans-commit.md", "\n".join(rows) + "\n")
+        git(self.repo, "add", "-A")
+        git(self.repo, "commit", "-q", "-m", "manifeste sans colonne commit")
+
+    def test_3629_un_manifeste_sans_colonne_commit_est_signale(self):
+        ouvert, ferme = self.item("unité ouverte"), self.item("unité fermée")
+        units = self.package([ouvert, ferme], manifest=False)
+        for item, unit in zip((ouvert, ferme), units):
+            self.freeze(item, unit["source"])
+        self._manifest_sans_commit([ouvert, ferme])
+        work.close(self.db, ferme["id"], abandoned=True, actor="banc")
+        report = self.sync()
+        # rien n'est livré par ce manifeste, et le relevé le dit
+        self.assertEqual((report["units"], report["results"]), (0, []))
+        [warning] = report["warnings"]
+        self.assertEqual(warning["manifest"], "reviews/integration-paquet-sans-commit.md")
+        self.assertEqual(warning["line_no"], 5)
+        self.assertEqual(warning["heading"], "Composition")
+        # seul le lot encore ouvert est nommé ; le lot fermé ne relance rien
+        self.assertEqual(warning["lots"], [ouvert["id"]])
+        self.assertIn("'commit' column", warning["message"])
+        self.assertEqual(work.get(self.db, ouvert["id"])["state"], "qa")
+        out = self.mesh("work", "sync-packets", "--git-dir", self.repo,
+                        "--target", "main")
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertIn("warning: reviews/integration-paquet-sans-commit.md:5 (Composition)",
+                      out.stderr)
+        self.assertIn("#%d" % ouvert["id"], out.stderr)
+        self.assertNotIn("#%d:" % ferme["id"], out.stderr)
+
+    def test_3629_un_manifeste_dont_tous_les_lots_sont_fermes_ne_dit_rien(self):
+        ferme = self.item("unité fermée")
+        units = self.package([ferme], manifest=False)
+        self.freeze(ferme, units[0]["source"])
+        self._manifest_sans_commit([ferme])
+        work.close(self.db, ferme["id"], abandoned=True, actor="banc")
+        self.assertEqual(self.sync()["warnings"], [])
+
+    def test_3629_un_paquet_bien_forme_ne_rend_aucun_avertissement(self):
+        unit = self.item("unité")
+        units = self.package([unit])
+        self.freeze(unit, units[0]["source"])
+        report = self.sync()
+        self.assertEqual(report["merged"], 1)
+        self.assertEqual(report["warnings"], [])
+
 
 class ManifestParseTest(unittest.TestCase):
+    def test_3629_une_table_de_lots_sans_commit_est_une_lacune(self):
+        text = "\n".join([
+            "# Paquet", "", "## Composition", "",
+            "| lot | source composée | gel | avis indépendants |",
+            "|---|---|---|---|",
+            "| #2309 | `aaaaaaaaaaaa` | 19001 | cx1, auditeur |",
+            "| #2882, #3067 | `bbbbbbbbbbbb` | 19002 | dev4 |", ""])
+        self.assertEqual(packet_close.parse_manifest(text), [])
+        self.assertEqual(packet_close.manifest_gaps(text), [
+            {"line_no": 5, "heading": "Composition", "lots": [2309, 2882, 3067]}])
+
+    def test_3629_un_manifeste_qui_livre_ne_signale_pas_ses_autres_tables(self):
+        # une table d'avis à colonne « lot » à côté d'une vraie composition
+        text = "\n".join([
+            "## Composition", "",
+            "| unité | lot | source | commit | note |", "|---|---|---|---|---|",
+            "| 1 | #10 | `aaaaaaaaaaaa` | `bbbbbbbbbbbb` | composition |", "",
+            "## Avis", "", "| lot | relecteur | verdict |", "|---|---|---|",
+            "| #10 | auditeur | ok |", ""])
+        self.assertEqual(len(packet_close.parse_manifest(text)), 1)
+        self.assertEqual(packet_close.manifest_gaps(text), [])
+
+    def test_3629_une_table_de_retrait_sans_commit_n_est_pas_une_lacune(self):
+        text = "\n".join([
+            "## Écartés (ce véhicule)", "", "| lot | motif |", "|---|---|",
+            "| #11 | retiré du paquet |", ""])
+        self.assertEqual(packet_close.parse_manifest(text), [])
+        self.assertEqual(packet_close.manifest_gaps(text), [])
+        self.assertEqual(packet_close.manifest_gaps(""), [])
+
     def test_table_de_composition_et_retrait(self):
         text = """# Paquet test
 
