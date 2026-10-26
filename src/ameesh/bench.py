@@ -48,6 +48,7 @@ from dataclasses import dataclass
 from urllib.parse import urlsplit
 
 from . import db as db_mod
+from . import platform as platform_mod
 
 #: préfixe des schémas de test (`tests/support.py: PgTestCase`)
 SCHEMA_PREFIX = "t_"
@@ -278,37 +279,30 @@ class Orphan:
 
 #: préfixe du commentaire de schéma qui prouve son propriétaire (suite de test)
 OWNER_TAG = "ameesh-bench-owner"
-_OWNER_RE = re.compile(r"^ameesh-bench-owner pid=(\d+)(?: start=(\d*))?$")
+_OWNER_RE = re.compile(r"^ameesh-bench-owner pid=(\d+)(?: start=(\d+(?:\.\d+)?))?$")
 
 
-def process_start(pid: int) -> int | None:
-    """Champ 22 (starttime) de /proc/<pid>/stat ; None si absent/illisible.
+def process_start(pid: int) -> float | None:
+    """Heure de démarrage du processus (epoch), via la couche plateforme.
 
-    Sert à distinguer un propriétaire d'un processus qui a réutilisé son PID.
-    Sur un système sans /proc (macOS), None : la vivacité se juge alors au
-    seul ``os.kill``.
+    Sert à distinguer un propriétaire d'un processus qui a réutilisé son PID ;
+    None si le processus n'existe pas ou si l'OS ne sait pas la donner.
     """
     try:
-        with open("/proc/%d/stat" % int(pid), "r", encoding="ascii",
-                  errors="replace") as fh:
-            text = fh.read()
-    except (OSError, ValueError, TypeError):
-        return None
-    try:
-        fields = text.rsplit(")", 1)[1].split()
-        return int(fields[19])
-    except (IndexError, ValueError):
+        return platform_mod.start_time(int(pid))
+    except platform_mod.NotAvailable:
         return None
 
 
-def owner_marker(pid: int | None = None, start: int | None = None) -> str:
+def owner_marker(pid: int | None = None, start: float | None = None) -> str:
     """Commentaire de propriété d'un schéma (PID et starttime de l'hôte)."""
     pid = os.getpid() if pid is None else int(pid)
-    start = process_start(pid) if start is None else int(start)
-    return "%s pid=%d start=%s" % (OWNER_TAG, pid, "" if start is None else start)
+    start = process_start(pid) if start is None else float(start)
+    return "%s pid=%d start=%s" % (OWNER_TAG, pid,
+                                   "" if start is None else "%.6f" % start)
 
 
-def parse_owner(comment: str | None) -> tuple[int, int | None] | None:
+def parse_owner(comment: str | None) -> tuple[int, float | None] | None:
     """(pid, start) d'un commentaire de propriété, ou None si étranger."""
     if not comment:
         return None
@@ -316,7 +310,7 @@ def parse_owner(comment: str | None) -> tuple[int, int | None] | None:
     if match is None:
         return None
     start = match.group(2)
-    return int(match.group(1)), (int(start) if start else None)
+    return int(match.group(1)), (float(start) if start else None)
 
 
 def owner_alive(comment: str | None) -> bool:
@@ -326,23 +320,20 @@ def owner_alive(comment: str | None) -> bool:
         return False
     pid, start = parsed
     try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        pass  # le processus existe, il n'est pas à nous
-    except OSError:
-        return False
-    if start is None:
-        return True
-    actual = process_start(pid)
-    # /proc illisible (macOS) : le kill suffit ; un start connu et différent =
-    # PID réutilisé, donc l'ancien propriétaire est bien parti.
-    return actual is None or actual == start
+        if not platform_mod.alive(pid):
+            return False
+        if start is None:
+            return True
+        actual = platform_mod.start_time(pid)
+        # un start connu et différent = PID réutilisé, donc l'ancien
+        # propriétaire est bien parti ; None (disparu entre-temps) = parti.
+        return actual is not None and platform_mod.same_start(start, actual)
+    except platform_mod.NotAvailable:
+        return True  # l'OS ne sait pas : ne pas purger un schéma qu'on ne juge pas
 
 
 def claim_owner(db, schema: str, *, pid: int | None = None,
-                start: int | None = None) -> None:
+                start: float | None = None) -> None:
     """Pose la preuve de propriété du schéma, tenue par toute la classe.
 
     ``pid``/``start`` sont ceux du processus de la suite par défaut ; les
