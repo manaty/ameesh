@@ -1118,10 +1118,12 @@ class AccountWindows(Domain):
 
     @abc.abstractmethod
     def active(self, harness: str, account: str) -> list[dict]:
-        """Les tours `running` du compte : `name`, `host`, `status_since_ts`
-        (epoch). Un agent sans `session_account` est compté (session d'avant
-        L30, ou premier tour d'une session neuve) : conservateur, jamais un
-        dépassement silencieux."""
+        """Les tours `running` du compte, **bail vivant seulement** (`lease_owner`
+        posé et `lease_expires_at` futur) : un hôte tombé ne bloque pas le
+        plafond de son compte pour toujours. Rend `name`, `host`,
+        `status_since_ts` (epoch). Un agent sans `session_account` est compté
+        (session d'avant L30, ou premier tour d'une session neuve) :
+        conservateur, jamais un dépassement silencieux."""
 
     @abc.abstractmethod
     def start(self, harness: str, account: str, host: str, agent: str) -> None:

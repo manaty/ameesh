@@ -10,6 +10,7 @@ et le branchement du runner.
 from __future__ import annotations
 
 import os
+import threading
 import unittest
 
 from ameesh import account_turn, account_window, accounts, cost
@@ -128,9 +129,20 @@ class FenetreCourteTest(_Base):
         for name, host in (("codex-autre-1", "h1"), ("codex-autre-2", "h2")):
             self.db.execute(
                 "INSERT INTO agent_registry"
-                " (name, chantier, harness, host, status, session_account, status_since)"
-                " VALUES (%s, '', 'codex', %s, 'running', 'primaire', now())",
+                " (name, chantier, harness, host, status, session_account,"
+                "  status_since, lease_owner, lease_expires_at)"
+                " VALUES (%s, '', 'codex', %s, 'running', 'primaire', now(),"
+                "         'runner', now() + interval '1 hour')",
                 (name, host))
+        # B1 auditeur : un hôte tombé garde `running` mais son bail est expiré ;
+        # il ne doit pas compter dans le plafond (sinon 2/2 pour toujours).
+        self.db.execute(
+            "INSERT INTO agent_registry"
+            " (name, chantier, harness, host, status, session_account,"
+            "  status_since, lease_owner, lease_expires_at)"
+            " VALUES ('codex-mort', '', 'codex', 'h3', 'running', 'primaire',"
+            "         now() - interval '1 hour', 'runner',"
+            "         now() - interval '1 minute')")
         etat = account_window.state(self.db, "codex", "primaire")
         self.assertEqual(etat["active_count"], 2)
         raison = account_window.reason(self.db, "codex", "primaire",
@@ -145,6 +157,57 @@ class FenetreCourteTest(_Base):
         self.assertEqual(account_window.state(
             self.db, "codex", "primaire", profile=profil,
             exclude_agent="moi")["max_active"], 3)
+
+    def test_admission_atomique(self):
+        premier = account_window.claim_start(
+            self.db, "codex", "primaire", "ameesh-agents-1", "codex1")
+        self.assertEqual(premier, "")
+        self.assertEqual(len(self.db.query(
+            "SELECT id FROM account_turn_starts")), 1)
+        second = account_window.claim_start(
+            self.db, "codex", "primaire", "ameesh-agents-2", "cx2")
+        self.assertIn("start gap", second)
+        self.assertEqual(len(self.db.query(
+            "SELECT id FROM account_turn_starts")), 1)
+        # le cooldown est relu sous le même verrou
+        self.db.execute("DELETE FROM account_turn_starts")
+        account_window.record_rate_limit(
+            self.db, "codex", "primaire", "h", "cx1", ERREUR_429)
+        self.assertIn("cooldown", account_window.claim_start(
+            self.db, "codex", "primaire", "h", "cx2"))
+
+    def test_departs_concurrents_ne_depassent_pas_l_ecart(self):
+        """Témoin cx2 : deux runners cross-hôtes se présentent ensemble ; le
+        verrou du compte et l insertion du départ dans la même transaction
+        n en laissent passer qu un."""
+        barriere = threading.Barrier(2)
+        resultats: list[str] = []
+        garde = threading.Lock()
+
+        def essai(agent: str) -> None:
+            db = self.connect()
+            try:
+                barriere.wait(timeout=10)
+                raison = account_window.claim_start(
+                    db, "codex", "primaire", "h", agent)
+            finally:
+                db.close()
+            with garde:
+                resultats.append(raison)
+
+        threads = [threading.Thread(target=essai, args=(agent,))
+                   for agent in ("cx-a", "cx-b")]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=20)
+        self.assertEqual(len(resultats), 2)
+        self.assertEqual(sum(1 for raison in resultats if raison == ""), 1,
+                         resultats)
+        self.assertEqual(sum(1 for raison in resultats if "start gap" in raison), 1,
+                         resultats)
+        self.assertEqual(len(self.db.query(
+            "SELECT id FROM account_turn_starts")), 1)
 
     def test_choose_refuse_avant_le_tour_et_le_runner_journalise(self):
         worker = self._worker_codex("cx-3779")

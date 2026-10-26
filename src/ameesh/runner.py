@@ -7127,13 +7127,15 @@ class AgentWorker(threading.Thread):
             log("[%s] %s turn (dry-run, session %s): %s"
                 % (self.name, shown, session or "new", " ".join(argv)))
             return True
-        # #3779 : seconde lecture de la fenêtre courte juste avant d'ouvrir le
-        # tour. La première (dans `account_turn.choose`) a pu laisser passer
-        # deux agents dans la même fenêtre ; ici l'écart avec `begin_turn` est
-        # minimal. Un tour refusé ici n'est pas un échec : consigne remise.
-        raison_courte = account_window.reason(
-            self.db, harness, getattr(compte, "name", ""),
-            exclude_agent=self.name, profile=compte)
+        # #3779 : admission ATOMIQUE juste avant d'ouvrir le tour. La première
+        # lecture (dans `account_turn.choose`) n'est qu'un pré-contrôle : deux
+        # agents peuvent s'y présenter ensemble. Ici le cooldown, l'écart depuis
+        # le dernier début et le plafond de tours actifs sont relus sous le
+        # verrou du compte, et le début est journalisé dans la même transaction.
+        # Un tour refusé ici n'a pas commencé : consigne remise, pas un échec.
+        raison_courte = account_window.claim_start(
+            self.db, harness, getattr(compte, "name", None), self.cfg.host,
+            self.name, profile=compte)
         if raison_courte:
             log("[%s] turn postponed: %s" % (self.name, raison_courte))
             registry.restore_prompt(self.db, self.name, self.runner.runner_id, self.epoch)
@@ -7148,11 +7150,6 @@ class AgentWorker(threading.Thread):
             registry.restore_prompt(self.db, self.name, self.runner.runner_id, self.epoch)
             log("[%s] lease lost, agent stopped or operator paused before the turn" % self.name)
             return False
-        # #3779 : début effectif du tour, journalisé pour l'écart minimal entre
-        # deux débuts du compte (le `status_since` seul ne le donne pas après
-        # la fin du tour). Best-effort : le tour part même si le journal échoue.
-        account_window.record_start(
-            self.db, harness, getattr(compte, "name", None), self.cfg.host, self.name)
         lot = spec.get("lot")
         if lot and not spec.get("lot_finished") \
                 and str(lot) != str(self.agent.get("session_work_item") or ""):

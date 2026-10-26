@@ -1068,7 +1068,9 @@ ensemble :
   supplémentaire dans les 15 min, plafonné à 15 min. Il retarde le **début**
   des tours, jamais un tour en cours ;
 * `account_turn_starts` porte les débuts de tour du compte ; l'écart minimal
-  par défaut est de **30 s**, le plafond de tours actifs de **2** (Codex) ;
+  par défaut est de **30 s**, le plafond de tours actifs de **2** (Codex). Ce
+  plafond ne compte que les baux **vivants** (`lease_expires_at` futur) : un
+  hôte tombé ne bloque pas le compte pour toujours ;
 * `ameesh accounts list` affiche la jauge `codex-short-window` (texte et
   `--json`) : tours actifs, écart de début, 429 récents et cooldown.
 

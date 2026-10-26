@@ -19,13 +19,18 @@ Ce module rend cette limite **visible et partagée** :
   compte** : 4 min après le premier refus, doublé à chaque refus supplémentaire
   de la fenêtre, plafonné à 15 min. Tous les agents du compte s'arrêtent, pas
   seulement le fautif ;
-* `record_start` journalise le début d'un tour (`account_turn_starts`) ;
-* `reason` refuse un nouveau tour quand le cooldown court, quand l'écart
-  minimal depuis le dernier début n'est pas écoulé, ou quand le nombre de
-  tours `running` du compte atteint `max_concurrent` (2 pour Codex ; l'écart
-  de 30 s est le levier principal : cinq débuts en 90 s suffisaient à voir
-  des 429 même avec un seul tour actif). La lecture des tours actifs est celle
-  du registre central (`agent_registry.status = 'running'`), donc cross-hôtes ;
+* `claim_start` admet **atomiquement** un début de tour : sous le verrou
+  consultatif du compte, il relit le cooldown, l'écart depuis le dernier début
+  et le plafond de tours actifs, puis journalise le début
+  (`account_turn_starts`) dans la même transaction. Deux agents qui se
+  présentent ensemble ne peuvent donc pas dépasser le plafond ni l'écart ;
+* `reason` reste le pré-contrôle lisible (choix et affichage) ; il refuse un
+  nouveau tour quand le cooldown court, quand l'écart minimal depuis le
+  dernier début n'est pas écoulé, ou quand le nombre de tours `running` du
+  compte atteint `max_concurrent` (2 pour Codex ; l'écart de 30 s est le
+  levier principal : cinq débuts en 90 s suffisaient à voir des 429 même avec
+  un seul tour actif). Les tours actifs sont lus dans le registre central
+  (`agent_registry.status = 'running'`, **bail vivant**), donc cross-hôtes ;
 * `rows`/`format` nourrissent `ameesh accounts list` : la « jauge de fenêtre
   courte » demandée par le témoin du lot.
 
@@ -200,18 +205,9 @@ def _delay(seconds: float) -> str:
     return "%d h %02d" % (hours, minutes) if minutes else "%d h" % hours
 
 
-def reason(db, harness: str, account: str, now: float | None = None,
-           exclude_agent: str | None = None, profile=None) -> str:
-    """La raison de pause de fenêtre courte, ou '' (aucune garde).
-
-    Le cooldown et l'écart de début RETARDENT le prochain tour ; ils ne
-    coupent jamais un tour en cours (`reason` n'est lu qu'avant `begin_turn`).
-    """
-    now = time.time() if now is None else float(now)
-    if not enabled(harness) or not account:
-        return ""
-    st = state(db, harness, account, now=now, exclude_agent=exclude_agent,
-               profile=profile)
+def _reason_from_state(st: dict, now: float) -> str:
+    """La raison de pause déduite d'un état déjà lu (aucune E/S)."""
+    account = st.get("account") or "?"
     if st.get("cooldown_until") and float(st["cooldown_until"]) > now:
         return ("account %s: short-window cooldown until %s (in %s; %d provider "
                 "429 in %s, shared burst bucket, #3779)" % (
@@ -230,6 +226,57 @@ def reason(db, harness: str, account: str, now: float | None = None,
                 "by sessions, #3779%s)" % (
                     account, st["active_count"], st["max_active"],
                     "; running: %s" % others if others else ""))
+    return ""
+
+
+def reason(db, harness: str, account: str, now: float | None = None,
+           exclude_agent: str | None = None, profile=None) -> str:
+    """La raison de pause de fenêtre courte, ou '' (aucune garde).
+
+    Le cooldown et l'écart de début RETARDENT le prochain tour ; ils ne
+    coupent jamais un tour en cours (`reason` n'est lu qu'avant `begin_turn`).
+    """
+    now = time.time() if now is None else float(now)
+    if not enabled(harness) or not account:
+        return ""
+    st = state(db, harness, account, now=now, exclude_agent=exclude_agent,
+               profile=profile)
+    return _reason_from_state(st, now)
+
+
+def claim_start(db, harness: str, account: str | None, host: str, agent: str,
+                profile=None) -> str:
+    """Admission ATOMIQUE d'un début de tour ; '' si le tour peut partir.
+
+    Sous le verrou consultatif du compte, relit le cooldown, l'écart depuis le
+    dernier début et le nombre de tours actifs, puis journalise le début dans
+    la même transaction. C'est cette écriture, et non la lecture préalable de
+    `reason`, qui garantit le plafond : deux agents qui se présentent ensemble
+    ne peuvent pas tous deux insérer leur début sans que le second voie le
+    premier.
+
+    Fail-open si le journal est indisponible (base absente, backend médié sans
+    contrat) : la garde locale de l'agent (#1270) reste, et un journal en panne
+    ne doit pas arrêter la famille. Un tour refusé ici n'a pas commencé.
+    """
+    if not enabled(harness) or not account:
+        return ""
+    if db is None or storage.is_remote(db) or not hasattr(db, "transaction"):
+        return ""
+    try:
+        with db.transaction() as tx:
+            tx.query("select pg_advisory_xact_lock(hashtext(%s))",
+                     ("ameesh-account:%s:%s" % (harness, account),))
+            st = state(tx, harness, account, exclude_agent=agent, profile=profile)
+            why = _reason_from_state(st, time.time())
+            if why:
+                return why
+            api = _api(tx)
+            if api is None:
+                return ""
+            api.start(harness, account, host or "", agent or "")
+    except Exception as exc:  # noqa: BLE001 - journal en panne : garde locale seule
+        _log("[%s] short-window admission unreadable (%s)" % (agent, exc))
     return ""
 
 

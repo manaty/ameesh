@@ -48,6 +48,8 @@ class AccountWindows(interface.AccountWindows):
                    extract(epoch FROM status_since)::float8 AS status_since_ts
               FROM agent_registry
              WHERE harness = %s AND status = 'running'
+               AND lease_owner IS NOT NULL
+               AND lease_expires_at > clock_timestamp()
                AND (session_account IS NULL OR session_account = %s)
              ORDER BY status_since, name
             """,
