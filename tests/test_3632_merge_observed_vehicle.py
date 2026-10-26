@@ -14,7 +14,7 @@ from __future__ import annotations
 import time
 from unittest import mock
 
-from ameesh import mail, notify, slo_delivery, storage, work
+from ameesh import exploitation, mail, notify, slo_delivery, storage, work
 
 from .test_789_slo_alerts import _Base
 
@@ -24,6 +24,11 @@ class VehicleMergedTest(_Base):
 
     def setUp(self):
         super().setUp()
+        # #3644 : le niveau 3 attendu est celui du repli de 30 min ; le p80 de
+        # CI mesuré sur l'hôte (1 h 05 sur ameesh-agents-2) le ramenait à 2.
+        p80 = mock.patch.object(exploitation, "_ci_suite_p80", return_value=None)
+        p80.start()
+        self.addCleanup(p80.stop)
         self.freeze = "d" * 40
         work.move(self.db, self.lot["id"], "build")
         work.move(self.db, self.lot["id"], "qa")
