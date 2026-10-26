@@ -68,12 +68,24 @@ class WorkDependencies(abc.ABC):
         """
 
     @abc.abstractmethod
-    def repin_landing(self, item_id: int, vehicle_id: int, pinned_sha: str, *,
-                      actor: str) -> bool:
-        """#3641: move one still-pinned declaration to the vehicle's new head.
+    def repin_landing(self, item_id: int, vehicle_id: int, old_pin: str,
+                      new_pin: str, *, frozen_sha: str, actor: str) -> str:
+        """#3641: carry one declaration to the vehicle's new head, under lock.
 
-        Journaled on the unit lot like a declaration. False when the row is
-        gone or now names another vehicle (the caller reads it again).
+        Revalidates that `frozen_sha` is still the vehicle's current freeze and
+        that the row still carries `old_pin` (CAS), so a delayed older freeze
+        never overwrites a declaration renewed meanwhile. Journaled on the unit
+        lot like a declaration. Returns `re-pinned`, `stale` (a newer freeze is
+        authoritative) or `moved` (renewed, moved or removed row).
+        """
+
+    @abc.abstractmethod
+    def landing_matches(self, item_id: int, vehicle_id: int, pinned_sha: str, *,
+                        frozen_sha: str) -> bool:
+        """#3641: is the declaration still the one pinned at `frozen_sha`?
+
+        Read under the same lock, before warning the declarant: a declaration
+        renewed since, or a newer freeze, gets no warning for a delayed one.
         """
 
     @abc.abstractmethod

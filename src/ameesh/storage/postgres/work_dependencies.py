@@ -238,27 +238,69 @@ class WorkDependencies(Contract):
              WHERE vehicle_id = %s
              ORDER BY work_item_id""", (int(vehicle_id),))
 
-    def repin_landing(self, item_id, vehicle_id, pinned_sha, *, actor):
+    @staticmethod
+    def _current_freeze(tx, vehicle_id):
+        """#3641 : le gel courant du véhicule, sous le verrou des landings.
+
+        Même règle que `set_landing` et `planned_waits.latest_freeze` : le
+        dernier jalon `frozen` non vide, départagé par `(at, id)`. Rend `''`
+        sans gel."""
+        rows = tx.query("""
+            SELECT sha FROM work_item_milestones
+             WHERE work_item_id = %s AND kind = 'frozen'
+               AND btrim(coalesce(sha, '')) <> ''
+             ORDER BY at DESC, id DESC LIMIT 1""", (int(vehicle_id),))
+        return (rows[0]["sha"] or "").strip() if rows else ""
+
+    def repin_landing(self, item_id, vehicle_id, old_pin, new_pin, *,
+                      frozen_sha, actor):
         """#3641 : reporte une déclaration sur la nouvelle tête du véhicule.
 
-        Le geste est celui d'un gel antérieur à nouveau ancêtre direct : il ne
-        s'applique qu'à la ligne encore épinglée au véhicule. Rend False si la
-        déclaration a disparu ou changé de véhicule entre-temps ; le journal du
-        lot porte la nouvelle tête, comme une déclaration."""
+        Revalidation sous le verrou des landings : le gel `frozen_sha` doit être
+        encore le gel COURANT du véhicule (un gel plus récent est autoritaire),
+        et l'épingle doit être encore `old_pin` (CAS) — une déclaration
+        renouvelée entre la lecture et le geste n'est jamais écrasée par un gel
+        retardé. Rend `re-pinned`, `stale` (le gel courant a changé) ou `moved`
+        (la déclaration a été renouvelée, déplacée ou retirée) ; seul
+        `re-pinned` écrit le journal."""
         with self.db.transaction() as tx:
             tx.execute(_LOCK)                 # même verrou que le graphe et les landings
+            # Même verrou de ligne que `add_milestone` : un gel concurrent ne
+            # peut pas s'insérer entre la lecture du gel courant et l'UPDATE.
+            tx.execute("SELECT id FROM work_items WHERE id = %s FOR NO KEY UPDATE",
+                       (int(vehicle_id),))
+            if self._current_freeze(tx, vehicle_id) != frozen_sha:
+                return "stale"
             rows = tx.query(
                 "UPDATE work_landings SET pinned_sha = %s"
-                " WHERE work_item_id = %s AND vehicle_id = %s"
+                " WHERE work_item_id = %s AND vehicle_id = %s AND pinned_sha = %s"
                 " RETURNING work_item_id",
-                (pinned_sha, int(item_id), int(vehicle_id)))
+                (new_pin, int(item_id), int(vehicle_id), old_pin))
             if not rows:
-                return False
+                return "moved"
             self._landing_journal(
                 tx, int(item_id),
                 "Landing re-pinned after the vehicle re-freeze: vehicle #%d frozen %s"
-                % (int(vehicle_id), pinned_sha[:12]), actor)
-            return True
+                % (int(vehicle_id), new_pin[:12]), actor)
+            return "re-pinned"
+
+    def landing_matches(self, item_id, vehicle_id, pinned_sha, *, frozen_sha):
+        """#3641 : la déclaration est-elle encore celle du gel `frozen_sha` ?
+
+        Revalidation sous le verrou des landings, avant de prévenir le
+        déclarant : une déclaration renouvelée depuis, ou un gel plus récent,
+        ne reçoit pas d'avis pour un gel retardé."""
+        with self.db.transaction() as tx:
+            tx.execute(_LOCK)
+            tx.execute("SELECT id FROM work_items WHERE id = %s FOR NO KEY UPDATE",
+                       (int(vehicle_id),))
+            if self._current_freeze(tx, vehicle_id) != frozen_sha:
+                return False
+            rows = tx.query(
+                "SELECT pinned_sha FROM work_landings"
+                " WHERE work_item_id = %s AND vehicle_id = %s",
+                (int(item_id), int(vehicle_id)))
+            return bool(rows) and (rows[0]["pinned_sha"] or "").strip() == pinned_sha
 
     def landings_for(self, item_ids):
         ids = sorted({int(i) for i in item_ids})
