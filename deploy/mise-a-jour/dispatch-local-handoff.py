@@ -142,6 +142,8 @@ def main(argv=None):
         rules = policy()
         consistent_policy(rules, module.load_execution())
         channel = socket.socket(fileno=os.dup(0))
+        with open(os.devnull, 'rb') as empty:
+            os.dup2(empty.fileno(), 0)
         if channel.family != socket.AF_UNIX or channel.type != socket.SOCK_STREAM:
             raise Refused('channel')
         pid, uid, _ = struct.unpack('3i', channel.getsockopt(

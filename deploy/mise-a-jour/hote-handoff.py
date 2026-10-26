@@ -672,6 +672,7 @@ def _bounded_run(argv, *, timeout, env, cwd=None, check=True):
     process = None
     try:
         process = subprocess.Popen(argv, cwd=cwd, env=env,
+                                   stdin=subprocess.DEVNULL,
                                    stdout=subprocess.PIPE,
                                    stderr=subprocess.PIPE, text=True,
                                    start_new_session=True)
