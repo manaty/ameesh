@@ -14,7 +14,9 @@ from __future__ import annotations
 
 from .. import interface
 
-_ACTIVE = ("select account, forced, extract(epoch from updated_at)::float8 as updated_ts"
+_ACTIVE = ("select account, forced,"
+           " extract(epoch from forced_until)::float8 as forced_until,"
+           " extract(epoch from updated_at)::float8 as updated_ts"
            " from account_active where host = %s and harness = %s")
 
 
@@ -49,10 +51,12 @@ class Accounts(interface.Accounts):
         return self.active(host, harness) or {"account": account, "forced": False}
 
     def switch(self, host, harness, *, expected, to, kind, reason, agent,
-               forced=False) -> bool:
+               forced=False, forced_until=None) -> bool:
         with self.db.transaction() as tx:
             rows = tx.query(
-                "select account, forced from account_active"
+                "select account, forced,"
+                " extract(epoch from forced_until)::float8 as forced_until"
+                " from account_active"
                 " where host = %s and harness = %s for update", (host, harness))
             if rows:
                 ligne = rows[0]
@@ -60,18 +64,27 @@ class Accounts(interface.Accounts):
                     return False
                 if not forced and kind != "config" and ligne["forced"]:
                     return False  # un forçage manuel n'est jamais défait par l'automate
-                if ligne["account"] == to and bool(ligne["forced"]) == bool(forced):
+                if ligne["account"] == to and not forced and not ligne["forced"]:
                     return False
+                # #3755 : un forçage se repose (nouvelle échéance, journalisée) ;
+                # toute bascule non forcée efface l'échéance.
                 tx.execute(
-                    "update account_active set account = %s, forced = %s, updated_at = now()"
-                    " where host = %s and harness = %s", (to, bool(forced), host, harness))
+                    "update account_active set account = %s, forced = %s,"
+                    " forced_until = case when %s then to_timestamp(%s) else null end,"
+                    " updated_at = now()"
+                    " where host = %s and harness = %s",
+                    (to, bool(forced), bool(forced), forced_until if forced else None,
+                     host, harness))
                 depart = ligne["account"]
             else:
                 if expected is not None:
                     return False
                 tx.execute(
-                    "insert into account_active (host, harness, account, forced)"
-                    " values (%s, %s, %s, %s)", (host, harness, to, bool(forced)))
+                    "insert into account_active (host, harness, account, forced,"
+                    " forced_until) values (%s, %s, %s, %s,"
+                    " case when %s then to_timestamp(%s) else null end)",
+                    (host, harness, to, bool(forced), bool(forced),
+                     forced_until if forced else None))
                 depart = None
             tx.execute(
                 "insert into account_switches (host, harness, from_account, to_account,"
@@ -110,7 +123,8 @@ class Accounts(interface.Accounts):
                     return False
                 tx.execute(
                     "update account_active set account = %s, forced = false,"
-                    " updated_at = now() where host = %s and harness = %s",
+                    " forced_until = null, updated_at = now()"
+                    " where host = %s and harness = %s",
                     (to, host, harness))
                 depart = ligne["account"]
             else:
@@ -153,7 +167,8 @@ class Accounts(interface.Accounts):
             if expected is not None and rows[0]["account"] != expected:
                 return False  # #295: a concurrent human force is kept
             tx.execute(
-                "update account_active set forced = false, updated_at = now()"
+                "update account_active set forced = false, forced_until = null,"
+                " updated_at = now()"
                 " where host = %s and harness = %s", (host, harness))
             tx.execute(
                 "insert into account_switches (host, harness, from_account, to_account,"

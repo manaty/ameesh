@@ -987,7 +987,10 @@ class Accounts(Domain):
 
     @abc.abstractmethod
     def active(self, host: str, harness: str) -> dict | None:
-        """La ligne `account_active` (account, forced, updated_at), ou None."""
+        """La ligne `account_active` (account, forced, forced_until,
+        updated_at), ou None. `forced_until` (epoch, #3755) est l'échéance du
+        forçage manuel ; None = pas de forçage, ou forçage antérieur à la
+        migration. `updated_ts` (epoch) date la dernière écriture."""
 
     @abc.abstractmethod
     def init_active(self, host: str, harness: str, account: str) -> dict:
@@ -995,13 +998,17 @@ class Accounts(Domain):
 
     @abc.abstractmethod
     def switch(self, host: str, harness: str, *, expected: str | None, to: str,
-               kind: str, reason: str, agent: str | None, forced: bool = False) -> bool:
+               kind: str, reason: str, agent: str | None, forced: bool = False,
+               forced_until: float | None = None) -> bool:
         """Change le compte actif ET journalise la bascule, en UNE instruction.
 
         Comparer-et-changer : `expected` est le compte que l'appelant a vu
         actif (None = n'importe lequel, forçage manuel). Une bascule
         automatique (`forced` faux) ne touche jamais un compte forcé. Faux si
-        un autre worker a déjà basculé : rien n'est écrit."""
+        un autre worker a déjà basculé : rien n'est écrit.
+
+        #3755 : `forced_until` (epoch) pose l'échéance d'un forçage manuel ;
+        toute bascule non forcée efface l'échéance."""
 
     @abc.abstractmethod
     def switch_guarded(self, host: str, harness: str, *, expected: str | None, to: str,
@@ -3734,19 +3741,22 @@ class Operations(Domain):
     def record_gauges(self, readings: Sequence[dict]) -> int:
         """Ajoute les relevés de jauge (harness, key, used, resets_at,
         window_s, `account` facultatif — L30, 0028, `produced_at` et `source`
-        facultatifs — #1132, 0434) qui CHANGENT le dernier relevé de leur jauge
+        facultatifs — #1132, 0434, `overage_capable` et `overage_in_use`
+        facultatifs — #3755) qui CHANGENT le dernier relevé de leur jauge
         (du même compte), ou dont le dernier relevé a plus de dix minutes. Rend
         le nombre de lignes. `produced_at` (epoch) est l'instant de PRODUCTION
         du relevé, NULL quand le flux ne le date pas ; `source` nomme le
-        journal d'origine."""
+        journal d'origine. Les drapeaux d'overage font partie de la comparaison
+        (#3755) : un relevé identique dont les drapeaux changent est écrit."""
 
     @abc.abstractmethod
     def gauge_history(self, *, since_s: float, harness: str | None,
                       account: str | None = None) -> list[dict]:
         """Relevés des `since_s` dernières secondes, dans l'ordre
         chronologique d'insertion : harness, key, used, resets_at_ts, window_s,
-        observed_ts, produced_ts (#1132 ; None si non daté), source (#1132) et
-        account (L30 ; None sans comptes). `account` filtre."""
+        observed_ts, produced_ts (#1132 ; None si non daté), source (#1132),
+        account (L30 ; None sans comptes) et les drapeaux d'overage
+        (`overage_capable`, `overage_in_use`, #3755). `account` filtre."""
 
     @abc.abstractmethod
     def latest_gauges(self, *, since_s: float) -> list[dict]:
@@ -3754,7 +3764,8 @@ class Operations(Domain):
         observé dans les `since_s` dernières secondes, choisi par instant de
         PRODUCTION (#1132 : `produced_at` d'abord, NULL en dernier, puis
         `observed_at`) : harness, key, used, resets_at_ts, window_s,
-        observed_ts, produced_ts, source, account (None sans comptes)."""
+        observed_ts, produced_ts, source, account (None sans comptes) et les
+        drapeaux d'overage (#3755)."""
 
     @abc.abstractmethod
     def gauge_latest(self, *, harness: str, account: str) -> list[dict]:
@@ -3762,7 +3773,8 @@ class Operations(Domain):
         sans limite d'âge : le plus récent par instant de production
         (`produced_at` d'abord, NULL en dernier), puis par insertion — harness,
         key, used, resets_at_ts, window_s, observed_ts, produced_ts, source,
-        account. Aucune ligne pour un compte inconnu."""
+        account, drapeaux d'overage (#3755). Aucune ligne pour un compte
+        inconnu."""
 
     @abc.abstractmethod
     def assigners(self, *, since_s: float) -> list[str]:

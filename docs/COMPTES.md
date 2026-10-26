@@ -207,14 +207,31 @@ dans le canon :
 
 ```sh
 ameesh accounts list [--json]          # comptes, dernier choix, état, jauges, pertes, bascules
-ameesh accounts use claude secondaire  # forçage manuel (levé seul au seuil si un autre compte est libre)
-ameesh accounts auto [claude]          # retour au choix automatique (0034)
+ameesh accounts use claude secondaire --for 1h
+                                       # forçage manuel, avec échéance (levé seul au seuil si un autre compte est libre)
+ameesh accounts use claude secondaire --force "sonde de jauge" --for 15m
+                                       # passe outre la garde (overage/rythme), raison journalisée
+ameesh accounts auto [claude]          # retour au choix automatique (0034), avant l'échéance
 ameesh accounts healthy claude secondaire  # compte reconnecté : déclaré sain (L226b)
 ameesh cost report                     # dépense par agent, compte actif, jauges par compte
 ameesh cost gauges                     # historique des jauges, par compte
 ameesh cost balance --record           # soldes, par compte de clé d'API
 ameesh budget                          # plafonds du mesh en vigueur, source, pauses (L70)
 ```
+
+**Un forçage a une garde et une échéance (#3755).** `ameesh accounts use`
+évalue le compte avant de le forcer : s'il est **en overage** ou **au-delà de
+son rythme** (`accounts.evaluate`), la commande refuse, avec la raison et le
+rappel de `--force`. `--force "raison"` passe outre — la raison est journalisée
+dans `account_switches` (visible dans les dernières bascules d'`ameesh accounts
+list`) — mais ne change
+rien à la garde du tour : un compte en overage ou au-delà de ses plafonds n'est
+jamais lancé, même forcé. `--for DUREE` (défaut **1 h** : `90m`, `6h`, `2j`)
+pose l'échéance du forçage ; au terme, le choix suivant le lit comme
+automatique, le lève (journalisé `auto`, raison « forcing expired ») et reprend
+la règle 0034. `--for 0` est refusé : pas de forçage sans échéance. `ameesh
+accounts list` affiche l'échéance ; `ameesh accounts auto` rend la main avant
+elle.
 
 `ameesh accounts list` montre, pour chaque compte, la capacité **perdue à la
 prochaine remise à zéro** de chaque fenêtre en cours si rien ne change, et le
@@ -405,6 +422,12 @@ agents while another healthy account is under its own: the force is lifted
 no other account free, the force holds and the agents pause. The lift is
 fenced on the forced account that was read (#295): a human who forces another
 account in between keeps their force, applied as is for that turn.
+Since #3755 the command itself refuses to force an account already in overage
+or above its pace (`--force "reason"` overrides, journaled), and every force
+carries an expiry (`--for`, 1 h by default): at the deadline the next choice
+reads it as automatic and lifts it (journaled `auto`). The expiry is fenced on
+the forced account that was read, like a threshold lift: a concurrent force of
+another account is kept.
 With the budget guard off (`budget_usd_per_hour` 0) the pace no longer
 pauses, but these rules still hold: an account in overage or past `cap` /
 `overage_cap` is never chosen, and with no other account the agent is

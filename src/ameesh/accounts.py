@@ -183,6 +183,14 @@ OTHER_PRIORITY = 50
 #: du délai, et une lecture locale saine n'est jamais bloquée par une retenue
 #: qu'aucune bascule n'a posée.
 OVERAGE_HOLD_S = 600.0
+#: #3755 : durée par défaut d'un forçage manuel (`ameesh accounts use --for`).
+#: Un forçage retire le choix automatique : sans échéance il reste en place
+#: jusqu'à ce qu'on pense à le lever (le Codex secondaire de pc-smichea,
+#: forcé le 26/10/2026, est resté en dépassement ~2 h). Court par défaut : le
+#: geste « une fois » rend la main à l'automate au terme.
+DEFAULT_FORCE_S = 3600.0
+#: Raison journalisée quand un forçage arrive à son échéance (`kind` `auto`).
+FORCE_EXPIRED_REASON = "forcing expired (--for): back to the automatic choice"
 #: `overage` setting: read from the harness's journals, or declared
 OVERAGE_MODES = ("auto", "allowed", "none")
 #: windows up to this length are "short" (`short_window_cap`): 5 h for both plans
@@ -2317,6 +2325,9 @@ def choose(db, host: str, harness: str, items: list[Profile], book, *,
     row = store.active(host, harness) or (
         {"account": items[0].name, "forced": False} if readonly
         else store.init_active(host, harness, items[0].name))
+    # #3755 : un forçage arrivé à échéance rend la main à l'automate, même si
+    # personne n'a lancé `ameesh accounts auto` (journalisé `auto`).
+    row = _expire_force(store, host, harness, row, now, readonly=readonly)
     names = [p.name for p in items]
     cache: dict[str, Evaluation] = {}
 
@@ -2615,6 +2626,7 @@ def healthy(items: list[Profile], sick: dict) -> list[Profile]:
 def current(db, host: str, harness: str, items: list[Profile]) -> Profile:
     """Le compte actif, sans évaluer les jauges (garde de budget désactivée)."""
     row = storage.of(db).accounts.active(host, harness)
+    row = _effective_active(row, time.time())
     return by_name(items, (row or {}).get("account")) or items[0]
 
 
@@ -2622,8 +2634,54 @@ def current(db, host: str, harness: str, items: list[Profile]) -> Profile:
 # forçage manuel (`ameesh accounts use|auto`)
 # --------------------------------------------------------------------------
 
-def force(db, host: str, harness: str, items: list[Profile], name: str, *, by: str) -> bool:
-    """Force le compte `name` (forçage manuel, journalisé `manuel`)."""
+def force_expired(row: dict | None, now: float) -> bool:
+    """#3755 : le forçage de `row` a-t-il atteint son échéance ?"""
+    if not row or not row.get("forced"):
+        return False
+    until = row.get("forced_until")
+    try:
+        return until is not None and float(until) <= float(now)
+    except (TypeError, ValueError):
+        return False
+
+
+def _effective_active(row: dict | None, now: float) -> dict | None:
+    """La ligne active, forçage échu lu comme automatique (sans écriture)."""
+    if force_expired(row, now):
+        return dict(row, forced=False, forced_until=None)
+    return row
+
+
+def _expire_force(store, host: str, harness: str, row: dict | None, now: float,
+                  *, readonly: bool) -> dict | None:
+    """#3755 : lève un forçage échu (`auto`, journalisé) et relit la ligne.
+
+    Un choix en simulation ou critique ne doit aucune écriture partagée
+    (L39, #324 r1) : il lit le forçage échu comme automatique, sans le lever
+    en base — le prochain choix d'un exécuteur le fera."""
+    if not force_expired(row, now):
+        return row
+    if readonly:
+        return _effective_active(row, now)
+    store.set_auto(host, harness, reason=FORCE_EXPIRED_REASON,
+                   expected=(row or {}).get("account"))
+    return store.active(host, harness) or _effective_active(row, now)
+
+
+def force(db, host: str, harness: str, items: list[Profile], name: str, *, by: str,
+          book=None, now: float | None = None, until: float | None = None,
+          allow: bool = False, reason: str = "") -> bool:
+    """Force le compte `name` (forçage manuel, journalisé `manuel`).
+
+    #3755 — un forçage ne contourne pas la règle du propriétaire (« jamais de
+    dépassement ») : avec `book`, le compte est évalué et le forçage est
+    **refusé** s'il est en overage ou au-delà de son rythme. `allow`
+    (`--force "raison"`) passe outre, à condition de donner une `reason`,
+    journalisée dans `account_switches`.
+
+    `until` (epoch) est l'échéance du forçage ; par défaut
+    `DEFAULT_FORCE_S` après `now` (#3755). Au terme, le choix et l'affichage
+    le lisent comme automatique et le choix le lève (journalisé `auto`)."""
     profile = by_name(items, name)
     if profile is None:
         raise AccountError("unknown account for %s: %r (known: %s)"
@@ -2632,10 +2690,44 @@ def force(db, host: str, harness: str, items: list[Profile], name: str, *, by: s
     if problems:
         raise AccountError("account %s/%s unusable: %s"
                            % (harness, name, "; ".join(problems)))
+    now = time.time() if now is None else float(now)
+    if book is not None:
+        try:
+            state = evaluate(book, profile, items, now, record=True)
+        except Exception as exc:  # noqa: BLE001 - garde fail-closed
+            raise AccountError(
+                "account %s/%s cannot be evaluated (%s): refusing to force it; "
+                "repair the reading first (no force overrides an unreadable gauge)"
+                % (harness, name, exc))
+        if state.problems:
+            raise AccountError("account %s/%s unusable: %s"
+                               % (harness, name, "; ".join(state.problems)))
+        if not state.ok:
+            if not allow:
+                raise AccountError(
+                    "account %s/%s is %s — refusing to force it: the owner's rule "
+                    "is never above the plan; use --force \"reason\" to force it "
+                    "anyway (reason and expiry are journalized)"
+                    % (harness, name, state.reason))
+            if not (reason or "").strip():
+                raise AccountError(
+                    "account %s/%s is %s; --force needs a reason (journalized in "
+                    "account_switches)" % (harness, name, state.reason))
+    if until is None:
+        until = now + DEFAULT_FORCE_S
+    try:
+        until = float(until)
+    except (TypeError, ValueError):
+        raise AccountError("unreadable forcing expiry: %r" % (until,))
+    if until <= now:
+        raise AccountError("forcing expiry must be in the future")
     store = storage.of(db).accounts
     store.init_active(host, harness, items[0].name)
+    texte = "manual override by %s" % by
+    if (reason or "").strip():
+        texte += ": %s" % " ".join(str(reason).split())
     changed = store.switch(host, harness, expected=None, to=name, kind="manuel",
-                           reason="manual override by %s" % by, agent=None, forced=True)
+                           reason=texte, agent=None, forced=True, forced_until=until)
     if changed:
         store.release(host, harness, name)
     return changed
@@ -2689,6 +2781,8 @@ def report(cfg, db, book, *, now: float | None = None,
         if harnesses and harness not in harnesses:
             continue
         active = store.active(cfg.host, harness) if store else None
+        # #3755 : un forçage échu s'affiche comme automatique (lecture seule).
+        active = _effective_active(active, now)
         holds = store.holds(cfg.host, harness) if store else {}
         active_name = (active or {}).get("account") or items[0].name
         evaluations = {}
@@ -2718,6 +2812,9 @@ def report(cfg, db, book, *, now: float | None = None,
                 "where": profile.describe(),
                 "active": profile.name == active_name,
                 "forced": bool((active or {}).get("forced")) and profile.name == active_name,
+                # #3755 : l'échéance du forçage (epoch), None sans forçage
+                "forced_until": ((active or {}).get("forced_until")
+                                 if profile.name == active_name else None),
                 "ok": result.ok,
                 "reason": result.reason,
                 "problems": list(result.problems),
@@ -2892,6 +2989,14 @@ def format_rows(rows: list[dict]) -> str:
         if row.get("next"):
             lines.append("%-9s %-14s %-7s %-8s ↳ next choice for a new session: %s"
                          % ("", "", "", "", row.get("why") or "—"))
+        if row.get("forced") and row.get("forced_until"):
+            # #3755 : le forçage a une échéance ; elle est dite en clair.
+            lines.append("%-9s %-14s %-7s %-8s ↳ forcing expires in %s (%s), "
+                         "then the automatic choice returns" % (
+                             "", "", "", "",
+                             duration(float(row["forced_until"]) - time.time()),
+                             time.strftime("%Y-%m-%d %H:%M",
+                                           time.localtime(float(row["forced_until"])))))
         if row.get("hold_until") and float(row["hold_until"]) > time.time():
             lines.append("%-9s %-14s %-7s %-8s ↳ held until %s" % (
                 "", "", "", "", time.strftime("%Y-%m-%d %H:%M",

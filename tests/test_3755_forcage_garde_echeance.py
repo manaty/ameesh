@@ -1,0 +1,263 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+"""#3755 — forçage de compte : garde à la commande, échéance, alerte vue de
+n'importe quel hôte.
+
+Incident du 26/10/2026 : à ~11:45Z, `ameesh accounts use codex secondaire` a
+été forcé sur pc-smichea parce que le primaire était en limite et codex3
+bloqué en 429. Le forçage retire le choix automatique ; à 13:40Z le secondaire
+affichait 100 % et « in overage (billed beyond the plan) », et il a fallu le
+rendre à la main à l'automatique à 13:41Z. La passe d'alertes, chez le
+détenteur du bail (agents-1/2), n'a pas vu ce dépassement : `account_overage`
+n'était calculée que sur l'hôte qui voit le compte.
+
+Témoins :
+* un forçage sur un compte à 100 % (ou en overage) est refusé sans
+  `--force "raison"` ; avec la raison, le forçage est posé et journalisé ;
+* un forçage a une échéance et revient seul à l'automatique, journalisé
+  `auto` ;
+* les drapeaux d'overage publiés avec les jauges par l'hôte du compte lèvent
+  `account_overage` dans `ameesh alerts` lu depuis un autre hôte.
+"""
+from __future__ import annotations
+
+import dataclasses
+import time
+import unittest
+
+from ameesh import accounts, cost, exploitation, mesh_cli, storage
+
+from .test_1883_overage_boucle import CREDITS, DAY, HOUR, _journal
+from .test_l30_accounts import _Base
+
+
+class ForcageGardeTest(_Base):
+    """`accounts.force` refuse un compte au-delà de son rythme ou en overage."""
+
+    def _items(self):
+        return accounts.parse({"codex": self._codex_comptes()})["codex"]
+
+    def _book(self):
+        return cost.CostBook(state_dir=self.cfg.state_dir, db=self.db)
+
+    def _active(self):
+        return storage.of(self.db).accounts.active(self.cfg.host, "codex")
+
+    def test_forcage_refuse_un_compte_en_depassement(self):
+        items = self._items()
+        now = float(int(time.time()))
+        _journal(items[0].path, week=(34, now + 6 * DAY))
+        _journal(items[1].path, short=(100, now + 2 * HOUR),
+                 week=(47, now + 5 * DAY), credits=CREDITS)
+
+        with self.assertRaises(accounts.AccountError) as ctx:
+            accounts.force(self.db, self.cfg.host, "codex", items, "secondaire",
+                           by="human:test", book=self._book(), now=now)
+        message = str(ctx.exception)
+        self.assertIn("in overage", message)
+        self.assertIn("--force", message)
+        self.assertFalse((self._active() or {}).get("forced"))
+
+        # même avec --force, une raison est exigée (journalisée)
+        with self.assertRaises(accounts.AccountError) as ctx:
+            accounts.force(self.db, self.cfg.host, "codex", items, "secondaire",
+                           by="human:test", book=self._book(), now=now,
+                           allow=True, reason="  ")
+        self.assertIn("reason", str(ctx.exception))
+
+        until = now + 900.0
+        self.assertTrue(accounts.force(
+            self.db, self.cfg.host, "codex", items, "secondaire", by="human:test",
+            book=self._book(), now=now, until=until, allow=True,
+            reason="sonde de jauge du secondaire"))
+        active = self._active()
+        self.assertTrue(active["forced"])
+        self.assertAlmostEqual(float(active["forced_until"]), until, delta=1.0)
+        switch = self.db.query(
+            "select kind, reason from account_switches order by id desc limit 1")[0]
+        self.assertEqual(switch["kind"], "manuel")
+        self.assertIn("sonde de jauge du secondaire", switch["reason"])
+
+    def test_forcage_refuse_un_compte_au_dela_de_son_rythme(self):
+        items = self._items()
+        now = float(int(time.time()))
+        _journal(items[0].path, week=(34, now + 6 * DAY))
+        # 100 % de la fenêtre courte, sans crédits : au-delà du rythme, pas
+        # encore en overage (le harnais ne dit pas qu'il peut facturer).
+        _journal(items[1].path, short=(100, now + 2 * HOUR),
+                 week=(47, now + 5 * DAY))
+        with self.assertRaises(accounts.AccountError) as ctx:
+            accounts.force(self.db, self.cfg.host, "codex", items, "secondaire",
+                           by="human:test", book=self._book(), now=now)
+        self.assertIn("100%", str(ctx.exception))
+        self.assertIn("--force", str(ctx.exception))
+        self.assertFalse((self._active() or {}).get("forced"))
+
+
+class ForcageEcheanceTest(_Base):
+    """Un forçage revient seul à l'automatique au terme de `--for`."""
+
+    def _items(self):
+        return accounts.parse({"codex": self._codex_comptes()})["codex"]
+
+    def _book(self):
+        return cost.CostBook(state_dir=self.cfg.state_dir, db=self.db)
+
+    def _active(self):
+        return storage.of(self.db).accounts.active(self.cfg.host, "codex")
+
+    def _journal_comptes(self, items, now):
+        _journal(items[0].path, week=(34, now + 6 * DAY))
+        _journal(items[1].path, week=(5, now + 6 * DAY))
+
+    def test_le_forcage_expire_et_journalise_auto(self):
+        items = self._items()
+        now = float(int(time.time()))
+        self._journal_comptes(items, now)
+        until = now + 60.0
+        self.assertTrue(accounts.force(self.db, self.cfg.host, "codex", items,
+                                       "secondaire", by="human:test", now=now,
+                                       until=until))
+        # avant l'échéance, le forçage tient
+        choice = accounts.choose(self.db, self.cfg.host, "codex", items,
+                                 self._book(), now=now + 30.0)
+        self.assertTrue(choice.forced)
+        self.assertEqual((self._active() or {}).get("account"), "secondaire")
+
+        # au terme, le choix suivant le lit comme automatique ET le lève
+        choice = accounts.choose(self.db, self.cfg.host, "codex", items,
+                                 self._book(), now=now + 61.0)
+        self.assertFalse(choice.forced)
+        active = self._active()
+        self.assertFalse(active["forced"])
+        self.assertIsNone(active["forced_until"])
+        switch = self.db.query(
+            "select kind, reason from account_switches order by id desc limit 1")[0]
+        self.assertEqual(switch["kind"], "auto")
+        self.assertIn("forcing expired", switch["reason"])
+
+    def test_affichage_lit_le_forcage_echu_comme_automatique_sans_ecrire(self):
+        comptes = self._codex_comptes()
+        cfg = dataclasses.replace(self.cfg, accounts={"codex": comptes})
+        items = accounts.parse(cfg.accounts)["codex"]
+        now = float(int(time.time()))
+        self._journal_comptes(items, now)
+        accounts.force(self.db, cfg.host, "codex", items, "secondaire",
+                       by="human:test", now=now, until=now + 60.0)
+        rows = accounts.report(cfg, self.db, self._book(), now=now + 120.0,
+                               record=False)
+        row = [r for r in rows if r["account"] == "secondaire"][0]
+        self.assertFalse(row["forced"])
+        self.assertIsNone(row["forced_until"])
+        # la lecture d'affichage n'a rien levé en base : le choix suivant le fera
+        self.assertTrue((storage.of(self.db).accounts.active(
+            cfg.host, "codex") or {}).get("forced"))
+
+
+class ForcageCliTest(_Base):
+    """`ameesh accounts use` : options `--for` et `--force` (témoin du lot)."""
+
+    def _cfg_items(self):
+        comptes = self._codex_comptes()
+        cfg = dataclasses.replace(self.cfg, accounts={"codex": comptes})
+        return cfg, accounts.parse(cfg.accounts)["codex"]
+
+    def _args(self, *extra):
+        return mesh_cli.build_parser().parse_args(
+            ["accounts", "use", "codex", "secondaire"] + list(extra))
+
+    def test_les_options_for_et_force_sont_analysees(self):
+        self.assertEqual(self._args().duration, "1h")
+        args = self._args("--force", "sonde de jauge", "--for", "15m")
+        self.assertEqual(args.force, "sonde de jauge")
+        self.assertEqual(args.duration, "15m")
+
+    def test_use_refuse_sans_force_et_force_avec_echeance(self):
+        cfg, items = self._cfg_items()
+        now = float(int(time.time()))
+        _journal(items[0].path, week=(34, now + 6 * DAY))
+        _journal(items[1].path, short=(100, now + 2 * HOUR),
+                 week=(47, now + 5 * DAY), credits=CREDITS)
+        args = self._args("--for", "15m")
+        with self.assertRaises(accounts.AccountError) as ctx:
+            mesh_cli.cmd_accounts(cfg, args)
+        self.assertIn("--force", str(ctx.exception))
+
+        args = self._args("--force", "sonde de jauge", "--for", "15m")
+        self.assertEqual(mesh_cli.cmd_accounts(cfg, args), 0)
+        active = storage.of(self.db).accounts.active(cfg.host, "codex")
+        self.assertTrue(active["forced"])
+        remaining = float(active["forced_until"]) - time.time()
+        self.assertGreater(remaining, 840.0)
+        self.assertLessEqual(remaining, 900.0)
+        switch = self.db.query(
+            "select reason from account_switches order by id desc limit 1")[0]
+        self.assertIn("sonde de jauge", switch["reason"])
+
+    def test_use_refuse_une_echeance_nulle(self):
+        cfg, _ = self._cfg_items()
+        args = self._args("--for", "0")
+        self.assertEqual(mesh_cli.cmd_accounts(cfg, args), 1)
+
+
+class AlerteOverageHorsHoteTest(_Base):
+    """#3755 : les drapeaux d'overage publiés en base lèvent l'alerte partout."""
+
+    def _reading(self, *, used, resets_at, window_s, account="secondaire",
+                 in_use=True, capable=True, observed_at=None, source="ameesh-cx3"):
+        self.db.execute(
+            "insert into quota_gauge_readings (harness, gauge_key, used, resets_at,"
+            " window_s, account, produced_at, source, overage_capable,"
+            " overage_in_use, observed_at)"
+            " values ('codex', 'codex-300min', %s, to_timestamp(%s), %s, %s, null,"
+            " %s, %s, %s, coalesce(to_timestamp(%s), now()))",
+            (used, resets_at, window_s, account, source, capable, in_use,
+             observed_at))
+
+    def _alerts(self, now):
+        cfg = dataclasses.replace(self.cfg, accounts={})
+        return [a for a in exploitation.alerts(cfg, self.db, now=now)
+                if a["type"] == "account_overage"]
+
+    def test_un_compte_d_un_autre_hote_leve_account_overage(self):
+        now = float(int(time.time()))
+        self._reading(used=1.0, resets_at=now + 2 * HOUR, window_s=300 * 60)
+        (alert,) = self._alerts(now)
+        self.assertEqual(alert["harness"], "codex")
+        self.assertEqual(alert["account"], "secondaire")
+        self.assertIsNone(alert["host"])          # source absente du registre
+        self.assertAlmostEqual(alert["value"], 1.0)
+        self.assertAlmostEqual(alert["since"], now + 2 * HOUR - 300 * 60, delta=2.0)
+
+    def test_une_fenetre_remise_a_zero_resout_l_alerte(self):
+        now = float(int(time.time()))
+        self._reading(used=1.0, resets_at=now - 60.0, window_s=300 * 60)
+        self.assertEqual(self._alerts(now), [])
+
+    def test_un_releve_plus_recent_sans_overage_resout_l_alerte(self):
+        now = float(int(time.time()))
+        self._reading(used=1.0, resets_at=now + 2 * HOUR, window_s=300 * 60,
+                      observed_at=now)
+        self.assertEqual(len(self._alerts(now)), 1)
+        self._reading(used=0.0, resets_at=now + 2 * HOUR, window_s=300 * 60,
+                      in_use=False, observed_at=now + 1.0)
+        self.assertEqual(self._alerts(now + 2.0), [])
+
+    def test_l_alerte_locale_ne_double_pas_la_lecture_partagee(self):
+        now = float(int(time.time()))
+        comptes = self._codex_comptes()
+        cfg = dataclasses.replace(self.cfg, accounts={"codex": comptes})
+        items = accounts.parse(cfg.accounts)["codex"]
+        _journal(items[1].path, short=(100, now + 2 * HOUR),
+                 week=(47, now + 5 * DAY), credits=CREDITS)
+        # le relevé local de la passe d'alertes n'écrit pas l'historique : on
+        # publie à la main celui que l'hôte du compte aurait écrit.
+        self._reading(used=1.0, resets_at=now + 2 * HOUR, window_s=300 * 60,
+                      observed_at=now)
+        alerts = [a for a in exploitation.alerts(cfg, self.db, now=now)
+                  if a["type"] == "account_overage"]
+        self.assertEqual(len(alerts), 1)
+        self.assertEqual(alerts[0]["host"], self.cfg.host)
+
+
+if __name__ == "__main__":
+    unittest.main()
