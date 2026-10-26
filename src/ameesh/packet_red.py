@@ -170,20 +170,11 @@ def _members_from_manifest(checkout: str, branch: str, head: str, *,
         return None, ""
     path = manifest_name(branch)
     text = _file_text(checkout, head, path, api=api, repo=repo)
-    if text is None and checkout and plan_git.local_commit(checkout, head):
-        # la convention peut changer : chercher un manifeste de paquet de la
-        # tête, borné, et prendre le seul qui porte une composition.
-        listing = plan_git._out(checkout, "ls-tree", "-r", "--name-only", head,
-                                "reviews") or ""
-        candidates = [name for name in listing.splitlines()
-                      if packet_close.MANIFEST.match(name)]
-        candidates.sort(key=lambda name: (name != path, -len(name)))
-        for candidate in candidates[:20]:
-            text = plan_git._out(checkout, "show", "%s:%s" % (head, candidate))
-            if text is not None:
-                path = candidate
-                break
     if text is None:
+        # pas de repli sur un autre manifeste de la tête : `main` en porte des
+        # dizaines (anciens paquets) et le premier lisible nommerait les lots
+        # d'un autre paquet. Sans le manifeste conventionnel, la composition
+        # enregistrée (`work packet`) à la tête exacte fait foi, sinon rien.
         return None, ""
     members = []
     for entry in packet_close.parse_manifest(text):
@@ -402,12 +393,17 @@ def carte_for(cfg, slug: str, *, repo: str = "", fetch=None, now: float | None =
         if card is None:
             return None, {"status": "absente", "origin": "", "commit": "",
                           "age_s": None, "why": "artefact carte illisible"}
+        age = _card_age(card, path, now=now)
+        if age is not None and age > CARD_MAX_S:
+            return None, {"status": "absente", "origin": "",
+                          "commit": _text(card.get("commit")),
+                          "age_s": int(age),
+                          "why": "artefact carte trop vieux (> 7 jours)"}
         if cache:
             try:
                 _copy_atomic(path, cache)
             except OSError:
                 pass
-        age = _card_age(card, path, now=now)
         return card, {"status": "périmée" if age is not None and age > CARD_STALE_S
                       else "lue", "origin": "téléchargée",
                       "commit": _text(card.get("commit")),

@@ -1052,6 +1052,11 @@ class Watcher:
         #: exécutions `pending` déjà signalées (une fois par service : la
         #: mémoire de `ci_runs` ne porte pas ce message, additif sans migration)
         self._pending_alerted: set = set()
+        #: #3801 : par dépôt, le clone et la carte d'impact déjà lus (ou
+        #: l'échec de leur lecture) pour les courriers d'un paquet rouge. Un
+        #: téléchargement de carte raté n'est pas retenté à chaque échec du
+        #: même dépôt (N2 du gel #20746).
+        self._packet_shared: dict = {}
 
     def _cache_ttl(self) -> float:
         """La garde des lectures CI : le réglage `github.ci_ttl`, sinon le défaut."""
@@ -2060,9 +2065,11 @@ class Watcher:
         if not lot or not failures:
             return None
         from . import packet_red
+        shared = self._packet_shared.setdefault(str(row.get("repo") or "").strip(), {})
         try:
             return packet_red.attribute_run(db, lot, row, failures,
-                                            cfg=self.cfg, api=self.api)
+                                            cfg=self.cfg, api=self.api,
+                                            shared=shared)
         except Exception as exc:  # noqa: BLE001 - le courrier reste dû
             self.log("CI %s run %s: packet attribution unreadable (%s)"
                      % (row.get("repo") or "?", row.get("run_id"), type(exc).__name__))

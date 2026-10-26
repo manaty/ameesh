@@ -234,6 +234,21 @@ class CompositionTest(unittest.TestCase):
         self.assertEqual(out["status"], "no-manifest")
         self.assertIn("manifeste", out["why"])
 
+    def test_manifeste_ancien_hors_branche_ignore(self):
+        """Un ancien manifeste de `main` ne décrit pas la tête de la branche."""
+        self.repo.write("reviews/integration-paquet-old.md",
+                        "# Paquet old\n\n## Composition (1 unité, 1 lot)\n\n"
+                        "| unité | lot | source | commit |\n|---|---|---|---|\n"
+                        "| 1 | #900 | `aaaaaaa` | `bbbbbbb` |\n")
+        self.repo.commit("ancien manifeste")
+        self.repo.git("checkout", "-q", "-b", "integration/paquet-h-new")
+        self.repo.write("src/ameesh/new.py", "x = 1\n")
+        head = self.repo.commit("paquet sans manifeste")
+        item = {"id": 1, "branch": "integration/paquet-h-new"}
+        comp = packet_red.composition(None, item, head, checkout=self.repo.path)
+        self.assertEqual(comp["source"], "none")
+        self.assertEqual(comp["members"], [])
+
     def test_enregistrement_seulement_si_la_tete_est_la_meme(self):
         head = "c" * 40
         rows = [{"work_item_id": 101, "unit_sha": "a" * 40,
@@ -330,6 +345,20 @@ class CarteTest(unittest.TestCase):
         self.assertIsNone(found)
         self.assertEqual(prov["status"], "absente")
 
+    def test_telechargement_trop_vieux_refuse(self):
+        old = time.time() - 8 * 24 * 3600
+        source = os.path.join(self.tmp, "download", "carte.json.gz")
+        self.write(source, card(genere=time.strftime(
+            "%Y-%m-%dT%H:%M:%SZ", time.gmtime(old))))
+        cfg = types.SimpleNamespace(state_dir=os.path.join(self.tmp, "state"))
+        found, prov = packet_red.carte_for(
+            cfg, "manaty/ameesh", fetch=lambda: (source, ""))
+        self.assertIsNone(found)
+        self.assertEqual(prov["status"], "absente")
+        self.assertIn("trop vieux", prov["why"])
+        self.assertFalse(os.path.exists(os.path.join(
+            self.tmp, "state", "packet-red", "carte-manaty-ameesh.json.gz")))
+
     def test_schema_inconnu_absent(self):
         path = os.path.join(self.tmp, "carte", "carte.json.gz")
         self.write(path, {"schema": "autre/1"})
@@ -375,6 +404,21 @@ class RunTest(unittest.TestCase):
         self.assertEqual(out["status"], "no-card")
         self.assertEqual(out["tests"][0]["units"][0]["lot"], 102)
         self.assertEqual(out["tests"][0]["units"][0]["evidence"][0]["kind"], "test")
+
+    def test_echec_de_carte_memorise(self):
+        """Un téléchargement raté n'est pas retenté à chaque courrier (N2)."""
+        shared = {}
+        with mock.patch.object(packet_red, "carte_for",
+                               return_value=(None, {"status": "absente",
+                                                    "why": "test"})) as fetched:
+            for _ in range(2):
+                out = packet_red.attribute_run(
+                    None, self.item, self.run,
+                    [{"test": "tests.test_a.T.t", "module": "test_a"}],
+                    checkout=self.repo.path, card=None, card_known=False,
+                    shared=shared)
+                self.assertEqual(out["status"], "no-card")
+        self.assertEqual(fetched.call_count, 1)
 
     def test_porteur_hors_paquet_ignore(self):
         out = packet_red.attribute_run(
