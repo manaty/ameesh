@@ -163,80 +163,28 @@ def clear_landing(db, item_id, *, actor):
     return storage.of(db).work_dependencies.clear_landing(item_id, actor=actor)
 
 
-def _is_ancestor(repo: str, ancestor: str, descendant: str) -> bool:
-    """Vrai si `ancestor` est un ancêtre de `descendant` dans `repo`."""
-    try:
-        from . import plan_git
-        return plan_git._is_ancestor(repo, ancestor, descendant)
-    except Exception:  # noqa: BLE001 - un dépôt illisible ne prouve rien
-        return False
-
-
-def _unit_carried(db, repo, vehicle_id, item_id, frozen_sha):
-    """#3641 : prouve que le lot `item_id` est encore porté à `frozen_sha`.
-
-    La composition enregistrée (`work_packet_members`, écrite par `ameesh work
-    packet record`) doit placer le lot à une tête qui est un ancêtre du gel, et
-    aucun revert postérieur ne doit annuler le commit de composition ni sa
-    source (#1825, même détection au mieux que `plan_git.probe`). Sans dépôt,
-    sans composition enregistrée ou si la tête enregistrée n'est pas un
-    ancêtre, rien n'est prouvé : le gel ne reporte pas la déclaration et
-    prévient son auteur. Un `packet record` refait sans le lot a remplacé la
-    ligne : l'absence de ligne est donc aussi une non-preuve."""
-    if not repo:
-        return False
-    try:
-        rows = [row for row in storage.of(db).work.packet_members(
-                    package_ids=[int(vehicle_id)])
-                if int(row["work_item_id"]) == int(item_id)]
-    except Exception:  # noqa: BLE001 - lecture impossible : rien n'est prouvé
-        return False
-    if not rows:
-        return False
-    from . import plan_git
-    for row in rows:
-        head = str(row.get("head_sha") or "").strip()
-        if not head:
-            continue
-        if head != frozen_sha and not _is_ancestor(repo, head, frozen_sha):
-            continue
-        try:
-            for sha in (row.get("unit_sha"), row.get("source_sha")):
-                sha = str(sha or "").strip()
-                if not sha:
-                    continue
-                reverted = plan_git._effective_revert(
-                    repo, sha, frozen_sha,
-                    lambda undone, _message, sha=sha: undone == sha)
-                if reverted is not None:
-                    return False
-        except Exception:  # noqa: BLE001 - lecture git impossible : rien n'est prouvé
-            return False
-        return True
-    return False
-
-
-def _notify_landing_lost(db, row, frozen_sha, detail):
-    """#3641 : prévient le déclarant quand sa déclaration ne suit pas le regel.
+def _warn_landing_stale(db, row, frozen_sha, actor):
+    """#3641 : prévient le déclarant qu'un regel ne reporte plus sa déclaration.
 
     Le journal et le courrier portent sur le VÉHICULE, jamais sur le lot
     déclaré : une note ou un courrier lié au lot déclaré compterait comme son
-    activité récente et effacerait le signal stale que la déclaration perdue
-    doit justement rendre (#1945, revue B)."""
+    activité récente et effacerait le signal stale que la déclaration devenue
+    caduque doit justement rendre (#1945, revue B)."""
     from . import mail
     item_id = int(row["work_item_id"])
     vehicle_id = int(row["vehicle_id"])
     pinned = str(row.get("pinned_sha") or "").strip()
     recipient = str(row.get("created_by") or "").strip()
-    text = ("Lot #%d: vehicle #%d was re-frozen on %s, but %s. The planned landing "
-            "no longer holds. Renew it (`ameesh work landing %d --vehicle %d "
-            "--until YYYY-MM-DD`) or clear it."
-            % (item_id, vehicle_id, frozen_sha[:12], detail, item_id, vehicle_id))
+    text = ("Lot #%d: vehicle #%d was re-frozen on %s, while its planned landing is "
+            "pinned to %s. The declaration is not carried automatically: renew it "
+            "(`ameesh work landing %d --vehicle %d --until YYYY-MM-DD`) or clear it."
+            % (item_id, vehicle_id, frozen_sha[:12], pinned[:12], item_id, vehicle_id))
     try:
         work.note(db, vehicle_id,
-                  "Landing declaration of lot #%d invalidated: vehicle re-frozen "
-                  "on %s, %s." % (item_id, frozen_sha[:12], detail),
-                  actor=work.SYSTEM_SENDER)
+                  "Landing declaration of lot #%d needs renewal: vehicle re-frozen "
+                  "on %s, declaration pinned to %s."
+                  % (item_id, frozen_sha[:12], pinned[:12]),
+                  actor=actor or work.SYSTEM_SENDER)
     except Exception:  # noqa: BLE001 - un journal en échec ne défait pas le gel
         pass
     if not recipient or recipient.startswith(work.HUMAN_PREFIX) \
@@ -249,54 +197,38 @@ def _notify_landing_lost(db, row, frozen_sha, detail):
         pass
 
 
-def repin_after_freeze(db, vehicle_id, frozen_sha, *, repo="", actor=""):
-    """#3641 : un regel du véhicule qui garde ses unités garde les déclarations.
+def warn_landings_after_freeze(db, vehicle_id, frozen_sha, *, actor=""):
+    """#3641 : un regel de véhicule ne reporte pas silencieusement une déclaration.
 
-    Une déclaration d'atterrissage est épinglée à une tête de gel ; un nouveau
-    gel la rendait caduque, et le lot porté retombait en SLO `verdict_merge`
-    alors qu'il attendait toujours le même paquet (#3619/#3616, #3627). Le
-    report n'est fait que si les trois preuves tiennent :
+    Une déclaration est épinglée à un gel ; un nouveau gel la rend caduque.
+    Reporter automatiquement sur une tête descendante a été essayé puis retiré
+    (revue codex #142034) : l'ascendance et la détection de revert ne prouvent
+    pas le contenu courant — un commit ordinaire peut retirer l'unité, et
+    `plan_git` ne reconnaît que les `Revert` qui citent le commit. Le geste sûr
+    est donc de **prévenir le déclarant sans aucun report** : la déclaration
+    reste en place, le signal stale revient (#1945), et le pilote renouvelle
+    explicitement sur la nouvelle tête.
 
-    1. la tête épinglée est un ancêtre de la nouvelle tête (le véhicule a
-       avancé, il n'a pas été réécrit) ;
-    2. la composition enregistrée prouve que le lot est encore porté, et aucun
-       revert ne l'annule (`_unit_carried`) ;
-    3. sous le verrou des landings, `frozen_sha` est encore le gel COURANT du
-       véhicule et l'épingle est encore celle lue (CAS) — un gel retardé
-       n'écrase pas une déclaration renouvelée depuis.
-
-    Sans preuve 1 ou 2, la déclaration est laissée telle quelle et son auteur
-    est prévenu (journal du véhicule et courrier), sauf si la déclaration a été
-    renouvelée entre-temps : elle n'est alors ni touchée ni signalée.
+    La prévention est revalidée sous le verrou des landings et le verrou de
+    ligne du véhicule : `frozen_sha` doit encore être le gel COURANT et la ligne
+    doit encore porter `pinned_sha`. Un gel retardé ne prévient donc pas une
+    déclaration déjà renouvelée sur un gel plus récent, et une déclaration
+    remplacée n'est ni touchée ni signalée.
     """
     st = storage.of(db)
     rows = st.work_dependencies.landings_on_vehicle(int(vehicle_id))
-    result = {"pinned": [], "notified": [], "skipped": []}
+    result = {"notified": [], "skipped": []}
     for row in rows:
         item_id = int(row["work_item_id"])
         pinned = str(row.get("pinned_sha") or "").strip()
         if not pinned or pinned == frozen_sha:
             continue
-        descends = bool(repo) and _is_ancestor(repo, pinned, frozen_sha)
-        if descends and _unit_carried(db, repo, int(vehicle_id), item_id,
-                                      frozen_sha):
-            status = st.work_dependencies.repin_landing(
-                item_id, int(vehicle_id), pinned, frozen_sha,
-                frozen_sha=frozen_sha, actor=actor or work.SYSTEM_SENDER)
-            if status == "re-pinned":
-                result["pinned"].append(item_id)
-            else:
-                result["skipped"].append(item_id)
-            continue
         if not st.work_dependencies.landing_matches(
                 item_id, int(vehicle_id), pinned, frozen_sha=frozen_sha):
             result["skipped"].append(item_id)
             continue
-        detail = ("the pinned head %s is not an ancestor of the new head"
-                  % pinned[:12] if not descends else
-                  "the unit is no longer carried by the composition")
         result["notified"].append(item_id)
-        _notify_landing_lost(db, row, frozen_sha, detail)
+        _warn_landing_stale(db, row, frozen_sha, actor or "")
     return result
 
 

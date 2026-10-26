@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: AGPL-3.0-only
-"""#3641 : un regel de véhicule à unités constantes garde les atterrissages.
+"""#3641 : un regel de véhicule prévient le déclarant, sans report automatique.
 
 Constat (mesh-design #141541, 26/10 03:22Z) : les déclarations d'atterrissage
 visaient la tête gelée 011c4073 du véhicule #3627 ; le regel sur 67aaf293, avec
@@ -7,12 +7,14 @@ les mêmes 17 unités, les a fait tomber sans prévenir le pilote, et l'étape S
 `verdict_merge` de #3619 est passée au niveau 3 alors que le lot attendait
 seulement son paquet.
 
-Une tête qui avance (nouvelle tête descendante de la tête épinglée) reporte la
-déclaration, à condition que la composition enregistrée prouve encore l'unité
-et qu'aucun revert ne l'annule. Une tête réécrite, un lot retiré de la
-composition ou une unité annulée ne la reportent pas et préviennent le
-déclarant. Le report revalide sous verrou le gel courant et l'ancienne épingle
-(CAS) : un gel retardé n'écrase pas une déclaration renouvelée depuis.
+Le report automatique sur une tête descendante a été retiré après la revue
+codex #142034 : l'ascendance et la détection de revert ne prouvent pas le
+contenu courant (un commit ordinaire peut retirer l'unité, et `plan_git` ne
+reconnaît que les `Revert` qui citent le commit). Le geste sûr est de prévenir
+le déclarant et de laisser la déclaration en place : le signal stale revient,
+le pilote renouvelle explicitement. L'avis est revalidé sous verrou (gel
+courant + ancienne épingle) pour qu'un gel retardé ne prévienne pas une
+déclaration déjà renouvelée.
 """
 from __future__ import annotations
 
@@ -35,7 +37,7 @@ def _git(repo, *args):
     return proc.stdout.strip()
 
 
-class LandingRepinTest(PgTestCase):
+class LandingRefreezeTest(PgTestCase):
     def setUp(self):
         super().setUp()
         self.repo = Path(tempfile.mkdtemp(prefix="ameesh-3641-repo-", dir=self.tmp))
@@ -90,6 +92,10 @@ class LandingRepinTest(PgTestCase):
     def vehicle_notes(self):
         return [row["note"] for row in work.events(self.db, int(self.vehicle["id"]))]
 
+    def message_bodies(self):
+        return [row.get("body") or ""
+                for row in self.st.mailbox.unread("decl", 50)]
+
     def record_member(self, head, unit_sha, source_sha=""):
         self.st.work.record_packet(
             int(self.vehicle["id"]), branch="integration/paquet-3641",
@@ -98,20 +104,20 @@ class LandingRepinTest(PgTestCase):
                     "source_sha": source_sha, "frozen_sha": head}],
             note="composition #3641", actor="mty-amh-impl-07")
 
-    def test_a_forward_refreeze_keeps_the_declaration_on_the_new_head(self):
+    def test_a_refreeze_warns_and_leaves_the_declaration(self):
         self.record_member(self.old, self.old)
 
         work.milestone(self.db, int(self.vehicle["id"]), "frozen", sha=self.new,
                        repo=str(self.repo), actor="mty-amh-impl-07")
 
-        self.assertEqual(self.pin(), self.new)
-        notes = [row["note"] for row in work.events(self.db, int(self.unit["id"]))]
-        self.assertTrue(any("Landing re-pinned" in note for note in notes), notes)
+        self.assertEqual(self.pin(), self.old)
+        self.assertTrue(any("needs renewal" in note for note in self.vehicle_notes()),
+                        self.vehicle_notes())
+        self.assertTrue(any("pinned to" in body and "renew it" in body
+                            for body in self.message_bodies()), self.message_bodies())
 
-    def test_a_unit_removed_by_a_revert_is_not_repinned_and_warns(self):
-        # Composition : une unité U entre par une fusion sur la branche du
-        # véhicule ; le gel A la porte. Une nouvelle tête B annule sa fusion
-        # par `git revert -m 1` et corrige le manifeste.
+    def test_an_ordinary_removal_never_repins_the_declaration(self):
+        """Le témoin statique de la revue : B descend de A et retire U sans revert."""
         _git(self.repo, "checkout", "-q", "-b", "unite", self.base)
         (self.repo / "u.txt").write_text("unit\n")
         _git(self.repo, "add", "-A")
@@ -126,21 +132,20 @@ class LandingRepinTest(PgTestCase):
                                int(self.vehicle["id"]), until_on=self.until,
                                actor="decl")
         self.record_member(composed, composed, source_sha=unit_sha)
-        _git(self.repo, "revert", "-m", "1", "--no-edit", composed)
-        reverted = _git(self.repo, "rev-parse", "HEAD")
+        (self.repo / "u.txt").unlink()
+        _git(self.repo, "add", "-A")
+        _git(self.repo, "commit", "-qm", "remove U")
+        removed = _git(self.repo, "rev-parse", "HEAD")
 
-        work.milestone(self.db, int(self.vehicle["id"]), "frozen", sha=reverted,
+        work.milestone(self.db, int(self.vehicle["id"]), "frozen", sha=removed,
                        repo=str(self.repo), actor="mty-amh-impl-07")
 
         self.assertEqual(self.pin(), composed)
-        self.assertTrue(any("no longer carried" in note
-                            for note in self.vehicle_notes()), self.vehicle_notes())
-        messages = self.st.mailbox.unread("decl", 20)
-        self.assertTrue(any("no longer holds" in (row.get("body") or "")
-                            for row in messages), messages)
+        self.assertTrue(any("needs renewal" in note for note in self.vehicle_notes()),
+                        self.vehicle_notes())
 
-    def test_a_unit_dropped_from_the_recorded_composition_is_not_repinned(self):
-        """Un `packet record` refait sans U ne prouve plus sa présence."""
+    def test_a_record_replacement_never_decides_the_declaration(self):
+        """Un `packet record` refait sans U ne change rien : l'avis ne re-pin pas."""
         self.record_member(self.old, self.old)
         self.st.work.record_packet(
             int(self.vehicle["id"]), branch="integration/paquet-3641",
@@ -151,31 +156,40 @@ class LandingRepinTest(PgTestCase):
                        repo=str(self.repo), actor="mty-amh-impl-07")
 
         self.assertEqual(self.pin(), self.old)
-        self.assertTrue(any("no longer carried" in note
-                            for note in self.vehicle_notes()), self.vehicle_notes())
+        self.assertTrue(any("needs renewal" in note for note in self.vehicle_notes()),
+                        self.vehicle_notes())
 
-    def test_a_delayed_older_freeze_does_not_overwrite_a_renewed_pin(self):
+    def test_a_delayed_older_freeze_does_not_warn_a_renewed_declaration(self):
         self.record_member(self.old, self.old)
         work.milestone(self.db, int(self.vehicle["id"]), "frozen", sha=self.mid,
                        repo=str(self.repo), actor="mty-amh-impl-07")
         work.milestone(self.db, int(self.vehicle["id"]), "frozen", sha=self.new,
                        repo=str(self.repo), actor="mty-amh-impl-07")
+        work_dependencies.land(self.db, int(self.unit["id"]),
+                               int(self.vehicle["id"]), until_on=self.until,
+                               actor="pilot")
         self.assertEqual(self.pin(), self.new)
-
-        # Le processus du gel `mid` avait lu l'épingle avant le renouvellement
-        # sur `new` : son écriture doit être refusée sous verrou.
+        before = len(self.vehicle_notes())
         stale = [dict(self.landing(), pinned_sha=self.old)]
-        with mock.patch.object(self.st.work_dependencies, "landings_on_vehicle",
+
+        # Gel `mid` retardé : le gel courant est `new`, l'avis est refusé.
+        with mock.patch("ameesh.storage.of", return_value=self.st), \
+             mock.patch.object(self.st.work_dependencies, "landings_on_vehicle",
                                return_value=stale):
-            result = work_dependencies.repin_after_freeze(
-                self.db, int(self.vehicle["id"]), self.mid, repo=str(self.repo))
-        self.assertEqual(result["pinned"], [])
+            result = work_dependencies.warn_landings_after_freeze(
+                self.db, int(self.vehicle["id"]), self.mid)
+        self.assertEqual((result["notified"], result["skipped"]),
+                         ([], [int(self.unit["id"])]))
+        self.assertEqual(len(self.vehicle_notes()), before)
         self.assertEqual(self.pin(), self.new)
 
-        # Même gel courant, mais l'ancienne épingle a changé : CAS refuse.
-        self.assertEqual(
-            self.st.work_dependencies.repin_landing(
-                int(self.unit["id"]), int(self.vehicle["id"]), self.old,
-                self.other, frozen_sha=self.new, actor="mty-amh-impl-07"),
-            "moved")
+        # Même gel courant, mais l'ancienne épingle a changé : refus aussi.
+        with mock.patch("ameesh.storage.of", return_value=self.st), \
+             mock.patch.object(self.st.work_dependencies, "landings_on_vehicle",
+                               return_value=stale):
+            result = work_dependencies.warn_landings_after_freeze(
+                self.db, int(self.vehicle["id"]), self.new)
+        self.assertEqual((result["notified"], result["skipped"]),
+                         ([], [int(self.unit["id"])]))
+        self.assertEqual(len(self.vehicle_notes()), before)
         self.assertEqual(self.pin(), self.new)

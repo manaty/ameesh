@@ -62,21 +62,9 @@ class WorkDependencies(abc.ABC):
     def landings_on_vehicle(self, vehicle_id: int) -> list[dict]:
         """#3641: declarations pinned to this vehicle, one row per unit.
 
-        Read by the freeze path to carry a declaration to a new head when the
-        vehicle moved forward: `work_item_id`, `vehicle_id`, `pinned_sha`,
+        Read by the freeze path to warn the declarants when a re-freeze makes
+        their declaration stale: `work_item_id`, `vehicle_id`, `pinned_sha`,
         `until_on`, `created_by`.
-        """
-
-    @abc.abstractmethod
-    def repin_landing(self, item_id: int, vehicle_id: int, old_pin: str,
-                      new_pin: str, *, frozen_sha: str, actor: str) -> str:
-        """#3641: carry one declaration to the vehicle's new head, under lock.
-
-        Revalidates that `frozen_sha` is still the vehicle's current freeze and
-        that the row still carries `old_pin` (CAS), so a delayed older freeze
-        never overwrites a declaration renewed meanwhile. Journaled on the unit
-        lot like a declaration. Returns `re-pinned`, `stale` (a newer freeze is
-        authoritative) or `moved` (renewed, moved or removed row).
         """
 
     @abc.abstractmethod

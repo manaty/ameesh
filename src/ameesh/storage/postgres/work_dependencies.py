@@ -252,38 +252,6 @@ class WorkDependencies(Contract):
              ORDER BY at DESC, id DESC LIMIT 1""", (int(vehicle_id),))
         return (rows[0]["sha"] or "").strip() if rows else ""
 
-    def repin_landing(self, item_id, vehicle_id, old_pin, new_pin, *,
-                      frozen_sha, actor):
-        """#3641 : reporte une déclaration sur la nouvelle tête du véhicule.
-
-        Revalidation sous le verrou des landings : le gel `frozen_sha` doit être
-        encore le gel COURANT du véhicule (un gel plus récent est autoritaire),
-        et l'épingle doit être encore `old_pin` (CAS) — une déclaration
-        renouvelée entre la lecture et le geste n'est jamais écrasée par un gel
-        retardé. Rend `re-pinned`, `stale` (le gel courant a changé) ou `moved`
-        (la déclaration a été renouvelée, déplacée ou retirée) ; seul
-        `re-pinned` écrit le journal."""
-        with self.db.transaction() as tx:
-            tx.execute(_LOCK)                 # même verrou que le graphe et les landings
-            # Même verrou de ligne que `add_milestone` : un gel concurrent ne
-            # peut pas s'insérer entre la lecture du gel courant et l'UPDATE.
-            tx.execute("SELECT id FROM work_items WHERE id = %s FOR NO KEY UPDATE",
-                       (int(vehicle_id),))
-            if self._current_freeze(tx, vehicle_id) != frozen_sha:
-                return "stale"
-            rows = tx.query(
-                "UPDATE work_landings SET pinned_sha = %s"
-                " WHERE work_item_id = %s AND vehicle_id = %s AND pinned_sha = %s"
-                " RETURNING work_item_id",
-                (new_pin, int(item_id), int(vehicle_id), old_pin))
-            if not rows:
-                return "moved"
-            self._landing_journal(
-                tx, int(item_id),
-                "Landing re-pinned after the vehicle re-freeze: vehicle #%d frozen %s"
-                % (int(vehicle_id), new_pin[:12]), actor)
-            return "re-pinned"
-
     def landing_matches(self, item_id, vehicle_id, pinned_sha, *, frozen_sha):
         """#3641 : la déclaration est-elle encore celle du gel `frozen_sha` ?
 
