@@ -3032,18 +3032,27 @@ def _replay_designation(cfg, db, lot: int, freeze: Mapping, item: Mapping,
                 dead, kept = _dead_seats(cfg, db, int(lot), freeze,
                                          effective[2], sorted(live), by_name,
                                          closed)
-            except Exception:  # noqa: BLE001 - unreadable evidence: plain replay
-                dead, kept = [], []
-            recorded = {str((row or {}).get("name") or "").strip()
-                        for row in (effective[2] or {}).get("reviewers") or ()}
-            recorded.discard("")
-            removed = sorted(recorded - live)
+            except Exception as exc:  # noqa: BLE001 - unreadable evidence
+                # #3685 (B2) : on ne peut pas dire quels sièges sont morts.
+                # Poursuivre `designate` afficherait la marque enregistrée
+                # comme vivante, avec son siège mort : on rend `unavailable`
+                # sans rien écrire ni affirmer de siège vivant.
+                return ({"state": "unavailable", "reviewers": [],
+                         "freeze": freeze,
+                         "why": "reviewer evidence unreadable: %s: %s"
+                                % (type(exc).__name__, str(exc)[:200])}, "")
+            removed = _removed_seats(effective[2], live)
     if dead:
         reason = ("freeze #%s named unreachable reviewer(s): %s"
                   % (freeze.get("id"),
                      ", ".join("%s (%s)" % (name, why) for name, why in dead)))
+        if removed:
+            reason += ("; removed by the pilot: %s" % ", ".join(removed))
+        # #3685 (B1) : un siège retiré par le pilote reste exclu de la
+        # sélection, même quand un autre siège de la marque est mort : la
+        # branche `reseat` ne doit pas le réinscrire.
         return reseat(cfg, db, int(lot), freeze=freeze, kept=kept, dead=dead,
-                      mark_id=int(effective[0])), reason
+                      mark_id=int(effective[0]), excluded=removed), reason
     reason = ""
     if removed:
         reason = ("freeze #%s named reviewer(s) removed by the pilot: %s"
@@ -3470,6 +3479,21 @@ def _dead_seats(cfg, db, lot: int, freeze: Mapping, payload: Mapping,
     return dead, kept
 
 
+def _removed_seats(payload: Mapping, column: Sequence[str]) -> list:
+    """The seats a designation mark names but the pilot removed (#3685).
+
+    The live column is authoritative: a name the mark still carries but the
+    column no longer does is history, and a recovery must not choose it again
+    — even when another seat of the same mark is dead and moves by `reseat`.
+    """
+    live = {str(name or "").strip() for name in column or ()
+            if str(name or "").strip()}
+    recorded = {str((row or {}).get("name") or "").strip()
+                for row in (payload or {}).get("reviewers") or ()}
+    recorded.discard("")
+    return sorted(recorded - live)
+
+
 def _unreachable_lots(db, *, after: int, hosts: Sequence[str],
                       scan: int = REASSIGN_SCAN) -> list:
     """Open lots whose reviewer column names an unreachable agent (#3328).
@@ -3576,7 +3600,10 @@ class _ReseatPort(_ForcedPort):
     examined (kept and dead) must also still be in the reviewer column: a
     pilot's `work reviewer --remove` writes no mark, and `prepare` can take
     seconds, so a removal in that window would otherwise be written back
-    (review of impl-02 on #3367). Without a
+    (review of impl-02 on #3367). #3685: a seat the mark names but the pilot
+    removed (`excluded`) is never selected again; a selection that still
+    names it after a concurrent removal refuses the write instead of
+    resurrecting the seat. Without a
     replacement (`waiting`), no **designation** mark is written: a waiting mark
     would retire the live seats from the column, so the designation stays as
     it is. The journal note of that waiting outcome is written under this same
@@ -3585,7 +3612,8 @@ class _ReseatPort(_ForcedPort):
     """
 
     def __init__(self, port, *, kept: Sequence[Mapping], mark_id: int,
-                 dead: Sequence[str] = ()) -> None:
+                 dead: Sequence[str] = (),
+                 excluded: Sequence[str] = ()) -> None:
         super().__init__(port)
         self.kept = [{"name": str((seat or {}).get("name") or "").strip(),
                       "family": str((seat or {}).get("family") or "").strip()}
@@ -3594,6 +3622,8 @@ class _ReseatPort(_ForcedPort):
         self.seats = ({seat["name"] for seat in self.kept}
                       | {str(name or "").strip() for name in dead or ()
                          if str(name or "").strip()})
+        self.excluded = {str(name or "").strip() for name in excluded or ()
+                         if str(name or "").strip()}
 
     def commit(self, lot: int, **kwargs) -> dict:
         db = self.port.db
@@ -3618,6 +3648,12 @@ class _ReseatPort(_ForcedPort):
         kwargs["reviewers"] = self.kept + [
             dict(row) for row in kwargs.get("reviewers") or ()
             if str((row or {}).get("name") or "").strip() not in names]
+        chosen = {str((row or {}).get("name") or "").strip()
+                  for row in kwargs.get("reviewers") or ()}
+        clash = sorted(self.excluded & chosen)
+        if clash:
+            raise _SeatsMoved("reviewer column changed during the pass (%s removed)"
+                              " nothing written" % ", ".join(clash))
         return super().commit(lot, **kwargs)
 
 
@@ -3652,7 +3688,8 @@ def _reseat_alert(db, item: Mapping, freeze: Mapping, notify: str,
 
 
 def reseat(cfg, db, lot: int, *, freeze: Mapping, kept: Sequence[Mapping],
-           dead: Sequence[tuple], mark_id: int) -> dict:
+           dead: Sequence[tuple], mark_id: int,
+           excluded: Sequence[str] = ()) -> dict:
     """Replaces only the dead seats of a freeze's designation (#3367).
 
     `reassign_unreachable` used to replay the whole designation (`force`): a
@@ -3662,6 +3699,10 @@ def reseat(cfg, db, lot: int, *, freeze: Mapping, kept: Sequence[Mapping],
     missing ones are selected and mailed, and the new mark names the kept
     seats then the replacements. When the kept seats already cover the
     required opinions, the dead seats are simply dropped (no mail).
+
+    #3685: `excluded` names the seats the mark records but the pilot removed.
+    They are never candidates again, even when the same mark has a dead seat to
+    move (#3328/#3367); the port refuses a write that would bring one back.
 
     Nothing is written when the replay cannot conclude: a head or policy that
     cannot be read, no review due, or a freeze that moved returns the outcome
@@ -3689,10 +3730,19 @@ def reseat(cfg, db, lot: int, *, freeze: Mapping, kept: Sequence[Mapping],
             return unchanged("unavailable", inputs.why)
         if not inputs.paths or inputs.policy.required == 0:
             return unchanged(rd.NONE, LIGHT_WHY if inputs.paths else NO_PATH_WHY)
+        excluded_names = {str(name or "").strip() for name in excluded or ()
+                          if str(name or "").strip()}
+        if excluded_names:
+            inputs = dataclasses.replace(
+                inputs,
+                candidates=[candidate for candidate in inputs.candidates
+                            if str(getattr(candidate, "name", "") or "").strip()
+                            not in excluded_names])
         with db.transaction() as tx:
             port = _ReseatPort(pg.PgPort(tx, after_commit=threads, at_freeze=False),
                                kept=kept, mark_id=mark_id,
-                               dead=[name for name, _why in dead or ()])
+                               dead=[name for name, _why in dead or ()],
+                               excluded=sorted(excluded_names))
             out = _selection(inputs, port, kept=port.kept)
             if out.get("state") == "manual" and port.kept:
                 out = port.commit(
@@ -3863,6 +3913,10 @@ def reassign_unreachable(cfg, db, *, limit: int = RETRY_LIMIT) -> dict:
             if not dead:
                 out["skipped"] += 1
                 continue
+            # #3685 (B1) : a seat the mark records but the column no longer
+            # names was removed by the pilot. It stays out of the replacement
+            # selection even when another seat of the same mark is dead.
+            removed = _removed_seats(mark[2], row.get("reviewers") or ())
             prefix = _reassign_prefix(lot, freeze_id, dead)
             since = float(freeze.get("at_ts") or 0.0)
             if storage.of(db).work.events_noted(prefix, since, ids=[lot]):
@@ -3871,7 +3925,7 @@ def reassign_unreachable(cfg, db, *, limit: int = RETRY_LIMIT) -> dict:
             out["examined"] += 1
             attempted += 1
             result = reseat(cfg, db, lot, freeze=freeze, kept=kept, dead=dead,
-                            mark_id=int(mark[0]))
+                            mark_id=int(mark[0]), excluded=removed)
         except Exception as exc:  # noqa: BLE001 - one lot never stops the pass
             out["errors"].append("#%d: %s: %s"
                                  % (lot, type(exc).__name__, str(exc)[:160]))

@@ -1933,6 +1933,65 @@ class UnreachableDesignationTest(_ActivationFixture, PgTestCase):
         self.assertEqual([m["recipient"] for m in self.mailbox()[before_mail:]],
                          ["r3"])
 
+    def test_a_removed_seat_stays_out_when_another_seat_is_dead(self):
+        # #3685 B1 (cx3) : retrait + siège mort dans la même marque. r1
+        # (claude) a été retiré par le pilote, r2 (codex) est mort. Sans
+        # l'exclusion, la branche `reseat` reprend r1 — le claude le moins
+        # chargé — et annule le retrait ; avec elle, r3 (claude, déjà chargé)
+        # et r4 (codex, libre) sont les vrais remplaçants.
+        self._agent("r3", "claude")
+        self._agent("r4", "codex")
+        self.db.execute(
+            "INSERT INTO work_items (title, app, state, assignee)"
+            " VALUES ('charge r3', 'ameesh', 'qa', 'r3')")
+        self.freeze()
+        self.db.execute(
+            "UPDATE work_items SET reviewers = ARRAY['r2'] WHERE id = %s",
+            (self.lot,))
+        self._move_to_lost("r2")
+        self._lose_host()
+        before_mail = len(self.mailbox())
+        sight = act.reviewers(self.cfg, self.db, self.lot, apply=True)
+        applied = sight["applied"]
+        self.assertEqual(applied["state"], rd.DESIGNATED, applied)
+        names = sorted(r["name"] for r in applied["reviewers"])
+        self.assertNotIn("r1", names, applied)
+        self.assertEqual(names, ["r3", "r4"], applied)
+        self.assertIn("unreachable reviewer(s)", sight["historical"])
+        self.assertIn("r2", sight["historical"])
+        self.assertIn("removed by the pilot", sight["historical"])
+        self.assertIn("r1", sight["historical"])
+        self.assertEqual(sorted(self._column()), ["r3", "r4"])
+        mails = [m["recipient"] for m in self.mailbox()[before_mail:]]
+        self.assertNotIn("r1", mails)
+        self.assertEqual(sorted(mails), ["r3", "r4"])
+
+    def test_the_recovery_is_unavailable_when_the_verdict_read_fails(self):
+        # #3685 B2 (cx3) : r2 est mort, mais la lecture des verdicts de la
+        # tête échoue (statement timeout). La reprise ne doit pas afficher la
+        # marque [r1, r2] comme vivante : elle rend unavailable, sans mutation
+        # ni siège affirmé.
+        self.freeze()
+        self._move_to_lost("r2")
+        self._lose_host()
+        marks, mails = len(self.marks()), len(self.mailbox())
+        column = sorted(self._column())
+        failure = db_mod.DbError(
+            "canceling statement due to statement timeout",
+            sqlstate=db_mod.QUERY_CANCELED,
+            sql="SELECT kind, sha, actor FROM work_item_milestones",
+            elapsed_ms=30012.0)
+        with mock.patch.object(act, "_head_voters", side_effect=failure):
+            sight = act.reviewers(self.cfg, self.db, self.lot, apply=True)
+        applied = sight["applied"]
+        self.assertEqual(applied["state"], "unavailable", applied)
+        self.assertEqual(list(applied["reviewers"]), [])
+        self.assertIn("reviewer evidence unreadable", applied["why"])
+        self.assertIn("statement timeout", applied["why"])
+        self.assertEqual(len(self.marks()), marks)
+        self.assertEqual(len(self.mailbox()), mails)
+        self.assertEqual(sorted(self._column()), column)
+
     def test_the_recovery_of_a_dead_seat_without_replacement_says_waiting(self):
         # #3685 : sans famille de remplacement, `--apply` ne réaffiche pas le
         # siège mort comme désigné : il dit l'attente, et la marque enregistrée
