@@ -160,7 +160,7 @@ def _job_stats(jobs, expected):
 def classify(*, event, plan, version, version_only, docs_only, doc_readers,
              psycopg, psycopg_parts, psql, psql_parts,
              platform_macos=None, fs_class=None,
-             psycopg_jobs=None, psql_jobs=None) -> dict:
+             psycopg_jobs=None, psql_jobs=None, psql_full=False) -> dict:
     """Classe l'agrégat sans réseau : `{state, red, missing, consigned, parts}`.
 
     `state` vaut `green` quand la preuve Linux est acquise (chaque famille
@@ -175,7 +175,11 @@ def classify(*, event, plan, version, version_only, docs_only, doc_readers,
     part Linux planifiée annulée, expirée, absente ou en échec rougit la
     famille, même si les 15 autres ont réussi (15/16 = rouge, #128512).
     Sans jobs lisibles, une famille non concluante est une preuve absente
-    (jamais un vert sur une lecture manquante)."""
+    (jamais un vert sur une lecture manquante).
+
+    `psql_full` (#3749) : le nocturne psql (`psql-nocturne.yml`, entrée
+    `psql-full` de tests.yml) ne planifie aucune part psycopg ; c'est le seul
+    cas où une famille psycopg vide (`[]`) et sautée est légitime."""
     red: list[str] = []
     missing: list[str] = []
     consigned: list[dict] = []
@@ -275,11 +279,14 @@ def classify(*, event, plan, version, version_only, docs_only, doc_readers,
     # #3449 : psycopg est toujours planifiée (les voies version/doc sont
     # sorties plus haut) ; un job sauté, absent ou sans part réussie y est un
     # manque. psql n'est requise que si le plan sélectionne des parts : une
-    # liste explicitement vide (`[]`) est son seul saut légitime.
+    # liste explicitement vide (`[]`) est son seul saut légitime. #3749 : le
+    # nocturne psql est la seule exception côté psycopg, et seulement avec une
+    # liste explicitement vide.
     psycopg_expected = len(_json_list(psycopg_parts) or [])
     psql_expected = len(_json_list(psql_parts) or [])
+    psycopg_off = _flag(psql_full) and _json_list(psycopg_parts) == []
     add("psycopg", psycopg, str(psycopg_parts or "").strip(),
-        skipped_ok=False, required=True,
+        skipped_ok=psycopg_off, required=not psycopg_off,
         jobs=psycopg_jobs, expected=psycopg_expected)
     add("psql", psql, str(psql_parts or "").strip(),
         skipped_ok=(_json_list(psql_parts) == []),
@@ -439,6 +446,8 @@ def _parse(argv=None) -> argparse.Namespace:
     parser.add_argument("--psycopg-parts", default="")
     parser.add_argument("--psql", default="")
     parser.add_argument("--psql-parts", default="")
+    parser.add_argument("--psql-full", default="false",
+                        help="nocturne psql (#3749) : psycopg sans part admise")
     parser.add_argument("--plateforme-macos", dest="platform_macos", default=None)
     parser.add_argument("--autre-fs", dest="fs_class", default=None)
     parser.add_argument("--run-id", default=os.environ.get("GITHUB_RUN_ID", ""),
@@ -465,7 +474,8 @@ def main(argv=None, gh=None, jobs=None) -> int:
             psycopg=args.psycopg, psycopg_parts=args.psycopg_parts,
             psql=args.psql, psql_parts=args.psql_parts,
             platform_macos=args.platform_macos, fs_class=args.fs_class,
-            psycopg_jobs=psycopg_jobs, psql_jobs=psql_jobs)
+            psycopg_jobs=psycopg_jobs, psql_jobs=psql_jobs,
+            psql_full=args.psql_full)
     except (TypeError, ValueError) as exc:  # pragma: no cover - garde-fou
         print("ci-agregat : %s" % exc, file=sys.stderr)
         return 2

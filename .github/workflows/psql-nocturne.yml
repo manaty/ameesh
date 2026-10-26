@@ -1,0 +1,53 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# #3749 — la suite psql complète, de nuit, hors du chemin du paquet.
+#
+# Règle owner du 26/10 (canon home#184) : une suite complète en 10 min de mur
+# au plus. La suite entière tournait sous les deux pilotes à chaque paquet,
+# à chaque poussée de main et à chaque release (16 psql + 8 psycopg, ≈ 800 min
+# de job). Elle ne tourne plus qu'avec psycopg ; le pilote psql n'y passe que
+# sa liste pilote (tests/parts/pilote-psql.txt) et tout le contrat
+# (tests/parts/toujours.txt). La suite entière sous psql vit ici :
+#   - `schedule` : une fois par nuit sur main ;
+#   - `workflow_dispatch` : la même à la main (main, release/**,
+#     integration/**, validation/** — porte #1635 de tests.yml), pour
+#     rejouer un nocturne rouge sans attendre la nuit.
+#
+# Le workflow appelle tests.yml (workflow_call) avec `psql-full: true` :
+# psql sur tous les modules, aucune part psycopg (scripts/test-plan.py,
+# `--psql-full`), l'agrégat l'admet (scripts/ci-agregat.py, `--psql-full`).
+# Ses checks portent le préfixe de ce job (« suite psql complète
+# (nocturne) / … ») : jamais le contexte requis `tests` d'une PR, et
+# release_cutoff ne le prend pas pour la preuve de suite d'un commit (seuls
+# les runs `tests` et `paquet` le sont) ; une part en échec reste un négatif
+# lisible sur ce commit.
+name: psql-nocturne
+
+on:
+  schedule:
+    # 01:47 UTC : hors des coupures de release (11:00, 23:00 Europe/Paris) et
+    # avant le nocturne macOS (03:17) et la carte (03:30).
+    - cron: "47 1 * * *"
+  workflow_dispatch:
+
+# un nocturne n'est jamais annulé par le suivant : il attend son tour
+concurrency:
+  group: psql-nocturne-${{ github.ref }}
+  cancel-in-progress: false
+
+# les droits passés au reusable sont ceux du workflow : tout ce que tests.yml
+# demande (contents, pull-requests, actions, checks), comme paquet.yml
+# (témoin tests/test_2134_portier_permissions.py pour le portier).
+permissions:
+  contents: read
+  pull-requests: read
+  checks: write
+  actions: read
+
+jobs:
+  # un job qui appelle un workflow réutilisable ne porte pas de
+  # `timeout-minutes` : chaque job de tests.yml garde le sien.
+  suite:
+    name: suite psql complète (nocturne)
+    uses: ./.github/workflows/tests.yml
+    with:
+      psql-full: true

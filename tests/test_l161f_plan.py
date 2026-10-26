@@ -1983,7 +1983,11 @@ class PlanTest(unittest.TestCase):
         self.assertEqual(p["unsure"], ["no map"])
         mods = parts.modules()
         self.assertEqual(sorted(m for ps in p["parts"]["psycopg"] for m in ps["modules"]), mods)
-        self.assertEqual(sorted(m for ps in p["parts"]["psql"] for m in ps["modules"]), mods)
+        # #3749 : hors nocturne, psql passe sa liste pilote et le contrat
+        pilot = set(parts.read_list(plan.PILOT_FILE, mods)) | set(
+            plan.read_list(plan.ALWAYS_FILE, mods))
+        self.assertEqual(sorted(m for ps in p["parts"]["psql"] for m in ps["modules"]),
+                         sorted(pilot))
         # #1476 : la suite complète passe à 16 psql et 8 psycopg
         self.assertEqual([ps["of"] for ps in p["parts"]["psycopg"]],
                          _full_suite_parts("psycopg"))
@@ -2103,7 +2107,10 @@ class PlanTest(unittest.TestCase):
         f = pathlib.Path(tempfile.mkdtemp()) / "plan.json"
         self.addCleanup(shutil.rmtree, f.parent)
         f.write_text(json.dumps(p), encoding="utf-8")
-        self.assertIsNone(parts.read_plan(f, "psql", 1))
+        # psycopg : sans liste, test-parts.py découpe la suite lui-même ;
+        # psql (#3749, R1 cx3) : la liste pilote et le contrat, explicites
+        self.assertIsNone(parts.read_plan(f, "psycopg", 1))
+        self.assertIsNotNone(parts.read_plan(f, "psql", 1))
         self.assertTrue(parts._driver_plan(str(f)))
         self.assertEqual(json.loads(plan.outputs(p)["psycopg"]),
                          list(range(1, plan.PARTS["psycopg"][1] + 1)))
@@ -2124,14 +2131,22 @@ class PlanTest(unittest.TestCase):
                 "blocs": {}, "donnees": {}, "dossiers": {}, "tables": {}, "migrations": {}}
         p = plan.make_plan("push", card, NOW)
         self.assertTrue(p["map"]["used"], p["map"])
-        # #749 : une fusion a main passe la suite complete sous les deux pilotes
-        # (psql en 16 parts depuis #1476), pas seulement la CI de release.
+        # #749 : une fusion a main passe la suite complete, pas seulement la
+        # CI de release. #3749 : psycopg en entier, psql sur sa liste pilote et
+        # tout le contrat, dans le découpage de la suite complète ; le
+        # nocturne (`psql_full`) passe toute la suite sous psql.
         self.assertEqual([ps["of"] for ps in p["parts"]["psql"]],
                          _full_suite_parts("psql"))
-        for driver in ("psycopg", "psql"):
-            with self.subTest(driver=driver):
-                seen = [m for ps in p["parts"][driver] for m in ps["modules"]]
-                self.assertEqual(sorted(seen), mods)  # every one, none twice
+        pilot = set(parts.read_list(plan.PILOT_FILE, mods)) | set(
+            plan.read_list(plan.ALWAYS_FILE, mods))
+        night = plan.make_plan("schedule", card, NOW, psql_full=True)
+        cases = {"psycopg": (p, mods), "psql": (p, sorted(pilot)),
+                 "psql nocturne": (night, mods)}
+        for name, (got, expected) in cases.items():
+            with self.subTest(driver=name):
+                seen = [m for ps in got["parts"][name.split()[0]] for m in ps["modules"]]
+                self.assertEqual(sorted(seen), expected)  # every one, none twice
+        self.assertEqual(night["parts"]["psycopg"], [])
 
     def _main_plan(self) -> dict:
         d = pathlib.Path(tempfile.mkdtemp())
@@ -2305,11 +2320,12 @@ class LotBranchTest(unittest.TestCase):
 
     def test_full_request_on_a_lot_pull_request_runs_the_whole_suite(self):
         # #1343 : `ci-full-<sha>` (release, paquet, demande explicite) sur une
-        # PR ordinaire garde la suite complète, les deux pilotes.
+        # PR ordinaire garde la suite complète. #3749 : psycopg en entier,
+        # psql sur sa liste pilote et tout le contrat.
         p = self._plan(event="pull_request", mode="full")
         self.assertEqual(p["selection"]["mode"], "full")
         self.assertEqual(self._ran(p), sorted(self.mods))
-        self.assertEqual(self._ran(p, "psql"), sorted(self.mods))
+        self.assertEqual(self._ran(p, "psql"), sorted(set(self.pilot) | set(self.contract)))
         self.assertEqual([ps["of"] for ps in p["parts"]["psycopg"]],
                          _full_suite_parts("psycopg"))
         self.assertEqual([ps["of"] for ps in p["parts"]["psql"]],
@@ -2318,8 +2334,8 @@ class LotBranchTest(unittest.TestCase):
     def test_release_pull_request_never_takes_the_impacted_selection(self):
         # R1 Codex (B1) : la carte est fraîche et sûre (les impactés sont
         # décidables), mais une PR dont la source ou la cible est release/**
-        # ou integration/** garde la suite complète, les deux pilotes, sans
-        # liste pilote psql (canon §3).
+        # ou integration/** garde la suite complète (canon §3) : #3749,
+        # psycopg en entier, psql sur sa liste pilote et tout le contrat.
         cases = {
             "source release": {"base_ref": "main", "head_ref": "release/1.10.0"},
             "source integration": {"base_ref": "main", "head_ref": "integration/1.10.0"},
@@ -2334,12 +2350,12 @@ class LotBranchTest(unittest.TestCase):
                 self.assertEqual(p["selection"]["mode"], "full", why)
                 self.assertIn("release/**", p["selection"]["why"])
                 self.assertEqual(self._ran(p), sorted(self.mods), why)
-                self.assertEqual(self._ran(p, "psql"), sorted(self.mods), why)
+                self.assertEqual(self._ran(p, "psql"),
+                                 sorted(set(self.pilot) | set(self.contract)), why)
                 self.assertEqual([ps["of"] for ps in p["parts"]["psycopg"]],
                                  _full_suite_parts("psycopg"))
                 self.assertEqual([ps["of"] for ps in p["parts"]["psql"]],
                                  _full_suite_parts("psql"))
-                self.assertFalse(any(ps.get("pilot_list") for ps in p["parts"]["psql"]))
                 self.assertEqual(plan.outputs(p)["code"], "true")
 
     def test_version_or_documentation_only_release_runs_the_full_suite(self):
@@ -2359,16 +2375,17 @@ class LotBranchTest(unittest.TestCase):
                 self.assertEqual(lot["parts"]["psycopg"], [], why)
                 self.assertEqual(plan.outputs(lot)["code"], "false", why)
 
-    def test_fallback_of_a_release_pull_request_keeps_both_pilots_full(self):
+    def test_fallback_of_a_release_pull_request_keeps_the_full_suite(self):
         # R1 Codex : « y compris fallback » — le repli d'une PR de release ne
-        # reprend ni la liste pilote psql ni le découpage d'une PR de lot.
+        # reprend pas le découpage d'une PR de lot. #3749 : la suite complète
+        # est psycopg en entier et la liste pilote sous psql.
         p = plan.fallback_plan("pull_request", "boom", base_ref="main",
                                head_ref="release/1.10.0")
         self.assertEqual(json.loads(plan.outputs(p)["psycopg"]),
                          list(range(1, plan.PARTS["psycopg"][1] + 1)))
         self.assertEqual(json.loads(plan.outputs(p)["psql"]),
                          list(range(1, plan.PARTS["psql"][1] + 1)))
-        self.assertFalse(any(ps.get("pilot_list") for ps in p["parts"]["psql"]))
+        self.assertTrue(all(ps.get("pilot_list") for ps in p["parts"]["psql"]))
         self.assertIn("release/**", p["selection"]["why"])
         lot = plan.fallback_plan("pull_request", "boom", base_ref="main", head_ref="lot/x")
         self.assertEqual(json.loads(plan.outputs(lot)["psycopg"]),
@@ -3493,9 +3510,10 @@ class LotFreezePlanTest(unittest.TestCase):
     def test_repli_d_un_gel_release_garde_la_suite_complete(self):
         p = plan.fallback_plan("pull_request", "boom", mode="lot",
                                base_ref="main", head_ref="release/1.10.0")
+        self.assertEqual([ps["of"] for ps in p["parts"]["psycopg"]],
+                         _full_suite_parts("psycopg"))
         self.assertEqual([ps["of"] for ps in p["parts"]["psql"]],
                          _full_suite_parts("psql"))
-        self.assertFalse(any(ps.get("pilot_list") for ps in p["parts"]["psql"]))
 
     def test_cli_mode_lot_sans_base_refuse(self):
         # sans la base demandée, la sélection porterait sur HEAD^1 et

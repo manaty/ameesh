@@ -95,6 +95,7 @@ class WorkflowContractTest(unittest.TestCase):
         "needs.plan.outputs.psycopg": "--psycopg-parts",
         "needs.psql.result": "--psql",
         "needs.plan.outputs.psql": "--psql-parts",
+        "inputs.psql-full": "--psql-full",
         "needs.platform-macos.result": "--plateforme-macos",
         "needs.fs-class.result": "--autre-fs",
     }
