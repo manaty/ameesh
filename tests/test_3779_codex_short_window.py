@@ -161,20 +161,24 @@ class FenetreCourteTest(_Base):
     def test_admission_atomique(self):
         premier = account_window.claim_start(
             self.db, "codex", "primaire", "ameesh-agents-1", "codex1")
-        self.assertEqual(premier, "")
+        self.assertTrue(premier.ok)
+        self.assertFalse(premier.begun)
         self.assertEqual(len(self.db.query(
             "SELECT id FROM account_turn_starts")), 1)
         second = account_window.claim_start(
             self.db, "codex", "primaire", "ameesh-agents-2", "cx2")
-        self.assertIn("start gap", second)
+        self.assertFalse(second.ok)
+        self.assertIn("start gap", second.reason)
         self.assertEqual(len(self.db.query(
             "SELECT id FROM account_turn_starts")), 1)
         # le cooldown est relu sous le même verrou
         self.db.execute("DELETE FROM account_turn_starts")
         account_window.record_rate_limit(
             self.db, "codex", "primaire", "h", "cx1", ERREUR_429)
-        self.assertIn("cooldown", account_window.claim_start(
-            self.db, "codex", "primaire", "h", "cx2"))
+        troisieme = account_window.claim_start(
+            self.db, "codex", "primaire", "h", "cx2")
+        self.assertFalse(troisieme.ok)
+        self.assertIn("cooldown", troisieme.reason)
 
     def test_departs_concurrents_ne_depassent_pas_l_ecart(self):
         """Témoin cx2 : deux runners cross-hôtes se présentent ensemble ; le
@@ -188,12 +192,12 @@ class FenetreCourteTest(_Base):
             db = self.connect()
             try:
                 barriere.wait(timeout=10)
-                raison = account_window.claim_start(
+                admission = account_window.claim_start(
                     db, "codex", "primaire", "h", agent)
             finally:
                 db.close()
             with garde:
-                resultats.append(raison)
+                resultats.append(admission)
 
         threads = [threading.Thread(target=essai, args=(agent,))
                    for agent in ("cx-a", "cx-b")]
@@ -202,12 +206,63 @@ class FenetreCourteTest(_Base):
         for thread in threads:
             thread.join(timeout=20)
         self.assertEqual(len(resultats), 2)
-        self.assertEqual(sum(1 for raison in resultats if raison == ""), 1,
-                         resultats)
-        self.assertEqual(sum(1 for raison in resultats if "start gap" in raison), 1,
+        self.assertEqual(sum(1 for adm in resultats if adm.ok), 1, resultats)
+        self.assertEqual(sum(1 for adm in resultats if "start gap" in adm.reason), 1,
                          resultats)
         self.assertEqual(len(self.db.query(
             "SELECT id FROM account_turn_starts")), 1)
+
+    def test_plafond_atomique_avec_ecart_nul(self):
+        """Témoin cx2 : trois runners, plafond 2, écart 0 — la place `running`
+        posée dans la transaction d'admission en laisse passer exactement 2."""
+        for agent in ("cap-a", "cap-b", "cap-c"):
+            self.db.execute(
+                "INSERT INTO agent_registry"
+                " (name, chantier, harness, host, status, session_account)"
+                " VALUES (%s, '', 'codex', 'h', 'idle', 'primaire')", (agent,))
+        profile = accounts.Profile("codex", "primaire", max_concurrent=2,
+                                   min_start_gap_s=0.0, path="")
+        barriere = threading.Barrier(3)
+        resultats: list = []
+        garde = threading.Lock()
+
+        def essai(agent: str) -> None:
+            db = self.connect()
+            try:
+                barriere.wait(timeout=10)
+
+                def ouvrir(tx, nom=agent) -> bool:
+                    tx.execute(
+                        "UPDATE agent_registry SET status = 'running',"
+                        " lease_owner = 'runner',"
+                        " lease_expires_at = now() + interval '1 hour',"
+                        " status_since = now() WHERE name = %s", (nom,))
+                    return True
+
+                admission = account_window.claim_start(
+                    db, "codex", "primaire", "h", agent, profile=profile,
+                    begin=ouvrir)
+            finally:
+                db.close()
+            with garde:
+                resultats.append(admission)
+
+        threads = [threading.Thread(target=essai, args=(agent,))
+                   for agent in ("cap-a", "cap-b", "cap-c")]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=20)
+        self.assertEqual(len(resultats), 3)
+        self.assertEqual(sum(1 for adm in resultats if adm.ok), 2, resultats)
+        refuses = [adm for adm in resultats if not adm.ok]
+        self.assertEqual(len(refuses), 1)
+        self.assertIn("2/2 concurrent turns", refuses[0].reason)
+        self.assertEqual(len(self.db.query(
+            "SELECT id FROM account_turn_starts")), 2)
+        self.assertEqual(self.db.query(
+            "SELECT count(*) AS n FROM agent_registry"
+            " WHERE name LIKE 'cap-%' AND status = 'running'")[0]["n"], 2)
 
     def test_choose_refuse_avant_le_tour_et_le_runner_journalise(self):
         worker = self._worker_codex("cx-3779")

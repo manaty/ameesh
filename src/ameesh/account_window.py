@@ -21,9 +21,10 @@ Ce module rend cette limite **visible et partagée** :
   seulement le fautif ;
 * `claim_start` admet **atomiquement** un début de tour : sous le verrou
   consultatif du compte, il relit le cooldown, l'écart depuis le dernier début
-  et le plafond de tours actifs, puis journalise le début
-  (`account_turn_starts`) dans la même transaction. Deux agents qui se
-  présentent ensemble ne peuvent donc pas dépasser le plafond ni l'écart ;
+  et le plafond de tours actifs, puis **ouvre le tour** (`begin_turn`, donc la
+  place `running` visible) et journalise le début (`account_turn_starts`) dans
+  la même transaction. Deux agents qui se présentent ensemble ne peuvent donc
+  pas dépasser le plafond ni l'écart, même avec un écart nul ;
 * `reason` reste le pré-contrôle lisible (choix et affichage) ; il refuse un
   nouveau tour quand le cooldown court, quand l'écart minimal depuis le
   dernier début n'est pas écoulé, ou quand le nombre de tours `running` du
@@ -41,6 +42,7 @@ retombe sur le comportement d'avant, jamais sur une erreur de tour.
 """
 from __future__ import annotations
 
+import dataclasses
 import time
 
 from . import storage
@@ -244,25 +246,46 @@ def reason(db, harness: str, account: str, now: float | None = None,
     return _reason_from_state(st, now)
 
 
+@dataclasses.dataclass(frozen=True)
+class Admission:
+    """Issue de `claim_start` : le tour peut partir, et a-t-il déjà été ouvert ?
+
+    `ok=False` : refus (cooldown, écart, plafond) ou `begin_turn` refusé.
+    `begun=True` : le statut `running` a été posé DANS la transaction
+    d'admission (donc la place est visible des autres runners dès le commit).
+    `begun=False` avec `ok=True` : aucune garde n'a pu être posée (harnais non
+    suivi, base indisponible) — l'appelant ouvre le tour par le chemin normal.
+    """
+
+    ok: bool = True
+    reason: str = ""
+    begun: bool = False
+    begin_failed: bool = False
+
+
 def claim_start(db, harness: str, account: str | None, host: str, agent: str,
-                profile=None) -> str:
-    """Admission ATOMIQUE d'un début de tour ; '' si le tour peut partir.
+                profile=None, begin=None) -> Admission:
+    """Admission ATOMIQUE d'un début de tour, place active comprise.
 
     Sous le verrou consultatif du compte, relit le cooldown, l'écart depuis le
-    dernier début et le nombre de tours actifs, puis journalise le début dans
-    la même transaction. C'est cette écriture, et non la lecture préalable de
-    `reason`, qui garantit le plafond : deux agents qui se présentent ensemble
-    ne peuvent pas tous deux insérer leur début sans que le second voie le
-    premier.
+    dernier début et le nombre de tours actifs, puis **ouvre le tour**
+    (`begin(tx)`, le `begin_turn` de l'exécuteur) et journalise le début dans
+    la même transaction. La place active est donc visible des autres runners
+    dès le commit : deux agents qui se présentent ensemble ne peuvent pas tous
+    deux passer sous le plafond, même avec `min_start_gap_s = 0`.
+
+    `begin` reçoit la transaction et rend vrai si le bail permet d'ouvrir le
+    tour. Sans `begin` (outil ou test), seul le journal des débuts est écrit.
 
     Fail-open si le journal est indisponible (base absente, backend médié sans
-    contrat) : la garde locale de l'agent (#1270) reste, et un journal en panne
-    ne doit pas arrêter la famille. Un tour refusé ici n'a pas commencé.
+    contrat) : `Admission()` sans `begun`, l'appelant ouvre le tour par le
+    chemin normal et la garde locale de l'agent (#1270) reste. Un tour refusé
+    ici n'a pas commencé.
     """
     if not enabled(harness) or not account:
-        return ""
+        return Admission()
     if db is None or storage.is_remote(db) or not hasattr(db, "transaction"):
-        return ""
+        return Admission()
     try:
         with db.transaction() as tx:
             tx.query("select pg_advisory_xact_lock(hashtext(%s))",
@@ -270,14 +293,21 @@ def claim_start(db, harness: str, account: str | None, host: str, agent: str,
             st = state(tx, harness, account, exclude_agent=agent, profile=profile)
             why = _reason_from_state(st, time.time())
             if why:
-                return why
+                return Admission(False, why)
+            begun = False
+            if begin is not None:
+                if not begin(tx):
+                    return Admission(False,
+                                     "lease lost or agent stopped before the turn",
+                                     begin_failed=True)
+                begun = True
             api = _api(tx)
-            if api is None:
-                return ""
-            api.start(harness, account, host or "", agent or "")
+            if api is not None:
+                api.start(harness, account, host or "", agent or "")
+            return Admission(True, begun=begun)
     except Exception as exc:  # noqa: BLE001 - journal en panne : garde locale seule
         _log("[%s] short-window admission unreadable (%s)" % (agent, exc))
-    return ""
+    return Admission()
 
 
 def record_rate_limit(db, harness: str, account: str | None, host: str,

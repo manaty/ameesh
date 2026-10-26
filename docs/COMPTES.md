@@ -1070,7 +1070,11 @@ ensemble :
 * `account_turn_starts` porte les débuts de tour du compte ; l'écart minimal
   par défaut est de **30 s**, le plafond de tours actifs de **2** (Codex). Ce
   plafond ne compte que les baux **vivants** (`lease_expires_at` futur) : un
-  hôte tombé ne bloque pas le compte pour toujours ;
+  hôte tombé ne bloque pas le compte pour toujours. L'admission est atomique
+  sous un verrou par compte : `begin_turn` (la place `running`) et le journal
+  du départ sont dans la même transaction que la relecture du cooldown, de
+  l'écart et du plafond, donc deux runners d'hôtes différents ne peuvent pas
+  se glisser ensemble sous le plafond, même avec un écart nul ;
 * `ameesh accounts list` affiche la jauge `codex-short-window` (texte et
   `--json`) : tours actifs, écart de début, 429 récents et cooldown.
 

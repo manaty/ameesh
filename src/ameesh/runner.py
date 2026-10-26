@@ -7131,25 +7131,40 @@ class AgentWorker(threading.Thread):
         # lecture (dans `account_turn.choose`) n'est qu'un pré-contrôle : deux
         # agents peuvent s'y présenter ensemble. Ici le cooldown, l'écart depuis
         # le dernier début et le plafond de tours actifs sont relus sous le
-        # verrou du compte, et le début est journalisé dans la même transaction.
+        # verrou du compte, et `begin_turn` (donc la place `running`) est posé
+        # dans la MÊME transaction que le journal des débuts : la place est
+        # visible des autres runners dès le commit, même avec un écart nul.
         # Un tour refusé ici n'a pas commencé : consigne remise, pas un échec.
-        raison_courte = account_window.claim_start(
+        marqueurs = self._marqueurs_durables("%s turn (%s)" % (shown, harness))
+        admission = account_window.claim_start(
             self.db, harness, getattr(compte, "name", None), self.cfg.host,
-            self.name, profile=compte)
-        if raison_courte:
-            log("[%s] turn postponed: %s" % (self.name, raison_courte))
+            self.name, profile=compte,
+            begin=lambda tx: registry.begin_turn(
+                tx, self.name, self.runner.runner_id, self.epoch, marqueurs))
+        if not admission.ok:
+            if admission.begin_failed:
+                # L87b: pause may have won the row lock after pick/run_turn.
+                # Return a prompt already taken, without rewriting concurrent status.
+                registry.restore_prompt(self.db, self.name, self.runner.runner_id,
+                                        self.epoch)
+                log("[%s] lease lost, agent stopped or operator paused before the turn"
+                    % self.name)
+                return False
+            log("[%s] turn postponed: %s" % (self.name, admission.reason))
             registry.restore_prompt(self.db, self.name, self.runner.runner_id, self.epoch)
             registry.set_status(self.db, self.name, "blocked",
-                                status_text=raison_courte)
+                                status_text=admission.reason)
             return False
-        if not registry.begin_turn(self.db, self.name, self.runner.runner_id, self.epoch,
-                                   self._marqueurs_durables(
-                                       "%s turn (%s)" % (shown, harness))):
-            # L87b: pause may have won the row lock after pick/run_turn.
-            # Return a prompt already taken, without rewriting concurrent status.
-            registry.restore_prompt(self.db, self.name, self.runner.runner_id, self.epoch)
-            log("[%s] lease lost, agent stopped or operator paused before the turn" % self.name)
-            return False
+        if not admission.begun:
+            if not registry.begin_turn(self.db, self.name, self.runner.runner_id,
+                                       self.epoch, marqueurs):
+                # L87b: pause may have won the row lock after pick/run_turn.
+                # Return a prompt already taken, without rewriting concurrent status.
+                registry.restore_prompt(self.db, self.name, self.runner.runner_id,
+                                        self.epoch)
+                log("[%s] lease lost, agent stopped or operator paused before the turn"
+                    % self.name)
+                return False
         lot = spec.get("lot")
         if lot and not spec.get("lot_finished") \
                 and str(lot) != str(self.agent.get("session_work_item") or ""):
