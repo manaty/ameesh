@@ -2664,6 +2664,11 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                         print("manual     : %s" % ", ".join(out["manual"]))
                     if out.get("error"):
                         print("mark       : %s" % out["error"])
+                    if out.get("historical"):
+                        # #3685 : la marque enregistrée nomme un siège qui
+                        # n'est plus désigné (hôte perdu, retrait du pilote) ;
+                        # la reprise ci-dessous est la désignation vivante.
+                        print("mark       : historical — %s" % out["historical"])
             applied = out.get("applied")
             if applied is not None and not args.json:
                 state = applied.get("state")

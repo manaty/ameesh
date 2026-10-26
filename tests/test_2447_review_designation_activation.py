@@ -1816,6 +1816,8 @@ class UnreachableDesignationTest(_ActivationFixture, PgTestCase):
         # #3341 à 15:56Z : le rejeu n'a trouvé aucun dépôt tenant la tête
         # gelée, et le chemin « indisponible » a vidé la colonne (cx1, dev7).
         # La reprise n'écrit plus rien quand elle ne peut pas conclure.
+        # #3685 : l'échec transitoire ne consomme plus la marque — il est
+        # journalisé sous son propre préfixe et retenté à la passe suivante.
         self._agent("r3", "claude")
         self.freeze()
         self._move_to_lost("r1")
@@ -1826,12 +1828,190 @@ class UnreachableDesignationTest(_ActivationFixture, PgTestCase):
         with mock.patch.object(act, "prepare", return_value=unreadable):
             report = act.reassign_unreachable(self.cfg, self.db)
         self.assertEqual(report["reassigned"], 0, report)
+        self.assertEqual(report["retried"], 1, report)
         self.assertEqual(sorted(self._column()), ["r1", "r2"])
         self.assertEqual(len(self.marks()), marks)
         self.assertEqual(len(self.mailbox()), mails)
         self.assertFalse(self.notes(act.UNAVAILABLE_PREFIX))
-        self.assertIn("designation unchanged: no repository holds",
-                      self.notes(act.REASSIGN_PREFIX)[-1])
+        self.assertFalse(self.notes(act.REASSIGN_PREFIX))
+        retries = self.notes(act.REASSIGN_RETRY_PREFIX)
+        self.assertEqual(len(retries), 1, retries)
+        self.assertIn("attempt 1/%d" % act.REASSIGN_RETRY_MAX, retries[0])
+        self.assertIn("no repository holds", retries[0])
+
+    def test_a_transient_unreadable_head_is_retried_on_the_next_pass(self):
+        # #3685, témoin du lot : passe 1 sans tête lisible (dépôt sans fetch),
+        # passe 2 avec la tête revenue → le siège mort est remplacé. Sans le
+        # correctif, la marque du 1er échec faisait sauter la passe 2.
+        self._agent("r3", "claude")
+        _, out = self.freeze()
+        self.assertEqual(sorted(r["name"] for r in out["reviewers"]),
+                         ["r1", "r2"])
+        self._move_to_lost("r1")
+        self._lose_host()
+        unreadable = act.Unavailable(
+            "no repository holds the frozen head: cannot read the frozen diff")
+        with mock.patch.object(act, "prepare", return_value=unreadable):
+            first = act.reassign_unreachable(self.cfg, self.db)
+        self.assertEqual(first["examined"], 1, first)
+        self.assertEqual(first["retried"], 1, first)
+        self.assertEqual(first["reassigned"], 0, first)
+        self.assertEqual(sorted(self._column()), ["r1", "r2"])
+        self.assertFalse(self.notes(act.REASSIGN_PREFIX))
+        self.assertTrue(self.notes(act.REASSIGN_RETRY_PREFIX))
+        # the head is readable again: the next pass moves the dead seat
+        second = act.reassign_unreachable(self.cfg, self.db)
+        self.assertEqual(second["reassigned"], 1, second)
+        noted = self._designated()
+        self.assertEqual([r["name"] for r in noted["reviewers"]], ["r2", "r3"],
+                         noted)
+        self.assertEqual(sorted(self._column()), ["r2", "r3"])
+        self.assertEqual(len(self.notes(act.REASSIGN_PREFIX)), 1,
+                         self.notes(act.REASSIGN_PREFIX))
+
+    def test_a_transient_failure_is_capped_and_left_to_the_pilot(self):
+        # #3685 : un échec qui dure ne boucle pas. Après le plafond, la marque
+        # est consommée par une note explicite qui laisse le siège au pilote ;
+        # les passes suivantes ne réessaient plus (la reprise manuelle
+        # `work reviewers --apply` reste disponible).
+        self._agent("r3", "claude")
+        self.freeze()
+        self._move_to_lost("r1")
+        self._lose_host()
+        unreadable = act.Unavailable("no repository holds the frozen head")
+        with mock.patch.object(act, "prepare", return_value=unreadable):
+            reports = [act.reassign_unreachable(self.cfg, self.db)
+                       for _ in range(act.REASSIGN_RETRY_MAX)]
+            self.assertTrue(all(r["retried"] == 1 for r in reports), reports)
+            self.assertFalse(self.notes(act.REASSIGN_PREFIX))
+            self.assertEqual(len(self.notes(act.REASSIGN_RETRY_PREFIX)),
+                             act.REASSIGN_RETRY_MAX)
+            final = act.reassign_unreachable(self.cfg, self.db)
+            again = act.reassign_unreachable(self.cfg, self.db)
+        self.assertEqual(final["exhausted"], 1, final)
+        self.assertEqual(final["retried"], 0, final)
+        notes = self.notes(act.REASSIGN_PREFIX)
+        self.assertEqual(len(notes), 1, notes)
+        self.assertIn("retry cap %d reached" % act.REASSIGN_RETRY_MAX, notes[0])
+        self.assertIn("left to the pilot", notes[0])
+        self.assertEqual(again["examined"], 0, again)
+        self.assertEqual(len(self.notes(act.REASSIGN_PREFIX)), 1,
+                         self.notes(act.REASSIGN_PREFIX))
+        self.assertEqual(sorted(self._column()), ["r1", "r2"])
+
+    def test_the_recovery_does_not_echo_a_seat_the_pilot_removed(self):
+        # #3685, second piège : le pilote a retiré r1 de la colonne, la marque
+        # le nomme encore. `--apply` ne doit pas afficher « designated: r1 » :
+        # la désignation vivante est complétée par une autre famille.
+        self._agent("r3", "claude")
+        self.freeze()
+        self.db.execute(
+            "UPDATE work_items SET reviewers = ARRAY['r2'] WHERE id = %s",
+            (self.lot,))
+        before_mail, before_marks = len(self.mailbox()), len(self.marks())
+        sight = act.reviewers(self.cfg, self.db, self.lot, apply=True)
+        applied = sight["applied"]
+        self.assertEqual(applied["state"], rd.DESIGNATED, applied)
+        names = [r["name"] for r in applied["reviewers"]]
+        self.assertNotIn("r1", names, applied)
+        self.assertEqual(sorted(names), ["r2", "r3"])
+        self.assertIn("removed by the pilot", sight["historical"])
+        self.assertIn("r1", sight["historical"])
+        self.assertEqual(sorted(self._column()), ["r2", "r3"])
+        self.assertEqual(len(self.marks()), before_marks + 1)
+        self.assertEqual([m["recipient"] for m in self.mailbox()[before_mail:]],
+                         ["r3"])
+
+    def test_the_recovery_moves_a_seat_whose_host_is_lost(self):
+        # #3685 : la marque désigne r1, dont l'hôte est perdu. `--apply` doit
+        # déplacer ce siège (mêmes preuves que la passe du runner), conserver
+        # r2 vivant, et dire que la marque enregistrée est historique.
+        self._agent("r3", "claude")
+        self.freeze()
+        self._move_to_lost("r1")
+        self._lose_host()
+        before_mail = len(self.mailbox())
+        sight = act.reviewers(self.cfg, self.db, self.lot, apply=True)
+        applied = sight["applied"]
+        self.assertEqual(applied["state"], rd.DESIGNATED, applied)
+        self.assertEqual(sorted(r["name"] for r in applied["reviewers"]),
+                         ["r2", "r3"])
+        self.assertIn("unreachable reviewer(s)", sight["historical"])
+        self.assertIn("r1", sight["historical"])
+        self.assertEqual(sorted(self._column()), ["r2", "r3"])
+        self.assertEqual([m["recipient"] for m in self.mailbox()[before_mail:]],
+                         ["r3"])
+
+    def test_a_removed_seat_stays_out_when_another_seat_is_dead(self):
+        # #3685 B1 (cx3) : retrait + siège mort dans la même marque. r1
+        # (claude) a été retiré par le pilote, r2 (codex) est mort. Sans
+        # l'exclusion, la branche `reseat` reprend r1 — le claude le moins
+        # chargé — et annule le retrait ; avec elle, r3 (claude, déjà chargé)
+        # et r4 (codex, libre) sont les vrais remplaçants.
+        self._agent("r3", "claude")
+        self._agent("r4", "codex")
+        self.db.execute(
+            "INSERT INTO work_items (title, app, state, assignee)"
+            " VALUES ('charge r3', 'ameesh', 'qa', 'r3')")
+        self.freeze()
+        self.db.execute(
+            "UPDATE work_items SET reviewers = ARRAY['r2'] WHERE id = %s",
+            (self.lot,))
+        self._move_to_lost("r2")
+        self._lose_host()
+        before_mail = len(self.mailbox())
+        sight = act.reviewers(self.cfg, self.db, self.lot, apply=True)
+        applied = sight["applied"]
+        self.assertEqual(applied["state"], rd.DESIGNATED, applied)
+        names = sorted(r["name"] for r in applied["reviewers"])
+        self.assertNotIn("r1", names, applied)
+        self.assertEqual(names, ["r3", "r4"], applied)
+        self.assertIn("unreachable reviewer(s)", sight["historical"])
+        self.assertIn("r2", sight["historical"])
+        self.assertIn("removed by the pilot", sight["historical"])
+        self.assertIn("r1", sight["historical"])
+        self.assertEqual(sorted(self._column()), ["r3", "r4"])
+        mails = [m["recipient"] for m in self.mailbox()[before_mail:]]
+        self.assertNotIn("r1", mails)
+        self.assertEqual(sorted(mails), ["r3", "r4"])
+
+    def test_the_recovery_is_unavailable_when_the_verdict_read_fails(self):
+        # #3685 B2 (cx3) : r2 est mort, mais la lecture des verdicts de la
+        # tête échoue (statement timeout). La reprise ne doit pas afficher la
+        # marque [r1, r2] comme vivante : elle rend unavailable, sans mutation
+        # ni siège affirmé.
+        self.freeze()
+        self._move_to_lost("r2")
+        self._lose_host()
+        marks, mails = len(self.marks()), len(self.mailbox())
+        column = sorted(self._column())
+        failure = db_mod.DbError(
+            "canceling statement due to statement timeout",
+            sqlstate=db_mod.QUERY_CANCELED,
+            sql="SELECT kind, sha, actor FROM work_item_milestones",
+            elapsed_ms=30012.0)
+        with mock.patch.object(act, "_head_voters", side_effect=failure):
+            sight = act.reviewers(self.cfg, self.db, self.lot, apply=True)
+        applied = sight["applied"]
+        self.assertEqual(applied["state"], "unavailable", applied)
+        self.assertEqual(list(applied["reviewers"]), [])
+        self.assertIn("reviewer evidence unreadable", applied["why"])
+        self.assertIn("statement timeout", applied["why"])
+        self.assertEqual(len(self.marks()), marks)
+        self.assertEqual(len(self.mailbox()), mails)
+        self.assertEqual(sorted(self._column()), column)
+
+    def test_the_recovery_of_a_dead_seat_without_replacement_says_waiting(self):
+        # #3685 : sans famille de remplacement, `--apply` ne réaffiche pas le
+        # siège mort comme désigné : il dit l'attente, et la marque enregistrée
+        # est annoncée historique.
+        self.freeze()
+        self._move_to_lost("r1")
+        self._lose_host()
+        sight = act.reviewers(self.cfg, self.db, self.lot, apply=True)
+        self.assertEqual(sight["applied"]["state"], rd.WAITING, sight)
+        self.assertIn("unreachable reviewer(s)", sight["historical"])
+        self.assertEqual(sorted(self._column()), ["r1", "r2"])
 
     def test_an_unreadable_input_names_the_read_and_the_query(self):
         # #3631 : 639 passes perdues en 24 h ne disaient que « inputs
@@ -2297,3 +2477,27 @@ class ActivationCliTest(_ActivationFixture, PgTestCase):
         self.assertIn('"state": "designated"', proc.stdout)
         # a designating replay does not mail a second time
         self.assertEqual(self.mailbox(), [])
+
+    def test_the_cli_apply_does_not_echo_a_removed_seat(self):
+        # #3685 : le pilote a retiré r1 ; `--apply` affichait « designated:
+        # r1 », repris de la marque. La sortie nomme la marque historique et la
+        # désignation vivante, jamais le siège retiré comme redésigné.
+        registry.upsert(self.db, "r3", harness="claude", host=self.cfg.host,
+                        cwd=self.repo.root, status="idle")
+        self.db.execute("UPDATE agent_registry SET team = 'ameesh' WHERE name = %s",
+                        ("r3",))
+        self.freeze()
+        self.db.execute(
+            "UPDATE work_items SET reviewers = ARRAY['r2'] WHERE id = %s",
+            (self.lot,))
+        proc = self.mesh("work", "reviewers", str(self.lot), "--apply",
+                         env=self.env(AMEESH_CANON=self.canon.root,
+                                      AMEESH_CANON_REF="HEAD"))
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        lines = [line for line in proc.stdout.splitlines()
+                 if line.startswith("designated:")]
+        self.assertEqual(len(lines), 1, proc.stdout)
+        self.assertNotIn("r1", lines[0])
+        self.assertIn("r3", lines[0])
+        self.assertIn("mark       : historical", proc.stdout)
+        self.assertIn("removed by the pilot", proc.stdout)
