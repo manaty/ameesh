@@ -151,16 +151,29 @@ class Housekeeping(interface.Housekeeping):
     def last_measure(self, host) -> list[dict]:
         where, params = "", []
         if host:
-            where = " AND host = %s"
+            where = " WHERE l.host = %s"
             params.append(host)
         # #3631 : ids par l'index (kind, host, at DESC, id DESC), une ligne
         # relue par hôte — l'ancien DISTINCT ON parcourait tout le journal du
         # ménage (~230 Mo) à chaque passe d'alertes.
+        # #3741 : le DISTINCT ON lisait encore toutes les entrées d'index des
+        # mesures (27 000, 0,25 s à vide, 6 s sous charge) ; le parcours
+        # récursif saute d'un hôte au suivant (`host` est NOT NULL) et lit une
+        # entrée d'index par hôte.
         rows = self.db.query(
-            "SELECT " + LOG_COLUMNS_ALIASED + " FROM housekeeping_log l"
-            " JOIN (SELECT DISTINCT ON (host) host, id FROM housekeeping_log"
-            "        WHERE kind = 'mesure'" + where +
-            "       ORDER BY host, at DESC, id DESC) u ON u.id = l.id"
+            "WITH RECURSIVE h(host) AS ("
+            "  (SELECT host FROM housekeeping_log WHERE kind = 'mesure'"
+            "    ORDER BY host LIMIT 1)"
+            "  UNION ALL"
+            "  SELECT (SELECT n.host FROM housekeeping_log n"
+            "           WHERE n.kind = 'mesure' AND n.host > h.host"
+            "           ORDER BY n.host LIMIT 1)"
+            "    FROM h WHERE h.host IS NOT NULL)"
+            "SELECT " + LOG_COLUMNS_ALIASED + " FROM h"
+            " CROSS JOIN LATERAL (SELECT u.id FROM housekeeping_log u"
+            "   WHERE u.kind = 'mesure' AND u.host = h.host"
+            "   ORDER BY u.at DESC, u.id DESC LIMIT 1) u"
+            " JOIN housekeeping_log l ON l.id = u.id" + where +
             " ORDER BY l.host", tuple(params))
         return [_data(dict(r)) for r in rows]
 

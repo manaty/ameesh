@@ -71,6 +71,8 @@ _RESERVED_SQL = """
 #: information sans geste attendu (#3451), jamais urgent —
 #: n'ouvre pas de tour à lui seul (même règle que `mail.passive_reason`).
 #: `{t}` : l'alias de la table `agent_mailbox` (`PASSIVE_SQL.format(t="mb")`).
+#: #3741 : l'index partiel `agent_mailbox_passive_unread_idx` (0489) porte ce
+#: prédicat au mot près ; le changer appelle une migration de l'index.
 PASSIVE_SQL = (
     "(NOT {t}.payload @> '{{\"urgent\": true}}'::jsonb"
     " AND ({t}.payload @> '{{\"ack\": true}}'::jsonb"
