@@ -308,7 +308,8 @@ class Policy:
     #: #248: node_modules shared per lockfile (npm wrapper, links, GC)
     deps: bool = True
     #: #248: idle time (seconds) before an unreferenced entry is deleted
-    deps_idle: float = 3 * 24 * 3600.0
+    #: (#3746: 24 h, `deps.DEFAULT_DEPS_IDLE_S`)
+    deps_idle: float = 24 * 3600.0
     #: L230: regenerable build dirs of idle worktrees (None: the defaults of
     #: `build_artifacts.DEFAULT_RULES`; empty: none deleted)
     artifacts: tuple | None = None

@@ -232,7 +232,7 @@ all of these hold:
   worktrees (every worktree of the agents' repositories, checked at
   `<worktree>/<label>/node_modules`). Links are recorded BEFORE they are
   created, so a crash leaves a stale record, never a link the GC cannot see;
-* `deps_idle` (default 3 days, never less than 24 h) has passed since its
+* `deps_idle` (default and floor 24 h) has passed since its
   creation, its last link, and the last time the GC saw a link to it alive;
 * no process uses a file in it: current directory, open file, executable or
   mapped file such as a native `.node` module or the electron binary
@@ -256,7 +256,7 @@ symlinked `node_modules` and never enters `<cache_root>/nm`.
 policy:
   housekeeping:
     deps: true          # npm wrapper, turn-start links, GC (default true)
-    deps_idle: 3d       # an unreferenced entry is deleted after this long
+    deps_idle: 24h      # an unreferenced entry is deleted after this long
 ```
 
 ## Rust: one CARGO_TARGET_DIR per agent
