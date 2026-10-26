@@ -12,9 +12,11 @@ lecture exacte de la désignation (`review_authors.reading`) — et écarte tout
 les familles d'auteur. Sans lecture durable (pas de marque pour ce gel, famille
 d'auteur inconnue), elle ne propose rien : l'indépendance ne se suppose pas.
 
-#3596 : le gel pourvoit désormais le siège disponible et lui écrit ; les
-témoins ci-dessous vérifient puis consomment ce courrier de désignation du gel,
-et ne comptent ensuite que ce que la proposition ajoute.
+#3596 : le gel pourvoit désormais le siège disponible et lui écrit. Pour que
+les témoins ci-dessous lisent vraiment la marque (et non la garde SQL qui
+écarte un lot déjà muni d'un relecteur), le siège indépendant est rendu
+indisponible au gel puis disponible : la proposition de #2864 est alors la
+seule à pouvoir le désigner.
 """
 from __future__ import annotations
 
@@ -101,37 +103,44 @@ class _Stacked(_ActivationFixture):
 
 
 class PropositionFamillesTest(_Stacked, PgTestCase):
-    def consommer_designation_au_gel(self):
-        """#3596 : le gel pourvoit le siège indépendant disponible (claude,
-        r1) et lui écrit. Les témoins de #2864 ne comptent ensuite que le
-        courrier de la proposition : on vérifie la désignation du gel puis on
-        vide la boîte du relecteur."""
-        mails = self.mails("r1")
-        self.assertEqual(len(mails), 1, mails)
-        self.assertIn("Automatic designation at freeze", mails[0]["body"])
-        self.db.execute("DELETE FROM agent_mailbox WHERE recipient = %s", ("r1",))
+    def freeze_sans_siege(self):
+        """Gèle le lot sans siège : le seul relecteur indépendant (r1, claude)
+        est indisponible au gel, puis rendu au repos.
 
-    def test_le_lot_empile_designe_la_famille_independante(self):
+        Sans cela, la désignation partielle de #3596 pourvoit r1 au gel et la
+        garde SQL de `review_proposals` (`reviewer` non vide, postgres/work.py)
+        écarte le lot avant toute lecture des marques : les témoins négatifs de
+        #2864 passeraient sans rien prouver. Ici la colonne reste vide, `take()`
+        lit la marque, et la proposition est la seule à pouvoir désigner r1."""
+        self.db.execute(
+            "UPDATE agent_registry SET status = 'dead' WHERE name = 'r1'")
         _row, outcome = self.freeze()
         self.assertEqual(outcome["state"], rd.WAITING, outcome)
+        self.assertEqual(outcome["reviewers"], [], outcome)
+        self.assertEqual(self.mails("r1"), [], "aucun siège pourvu au gel")
+        self.db.execute(
+            "UPDATE agent_registry SET status = 'idle',"
+            " status_since = now() - interval '2 hours' WHERE name = 'r1'")
+        return outcome
+
+    def test_le_lot_empile_propose_la_famille_independante(self):
+        self.freeze_sans_siege()
         mark = pg.designation_of(self.marks()[0])
         self.assertEqual({row["name"]: row["family"] for row in mark["authors"]},
                          {"author": "deepseek", "cx2": "codex"})
         self.assertIn("forbidden", mark["why"])
+        self.assertFalse(work.get(self.db, self.lot).get("reviewer"),
+                         "le gel sans siège ne pourvoit personne")
 
-        # #3596 : le gel pourvoit le siège de la seule famille indépendante
-        # (claude) ; cx1 (codex, auteur de la plage) ne reçoit rien et la
-        # prise ne re-propose pas un siège déjà pourvu.
-        self.consommer_designation_au_gel()
-        self.assertEqual(work.get(self.db, self.lot)["reviewer"], "r1")
-        self.assertEqual(self.take(), [])
+        out = self.take()
+        self.assertEqual([(t["kind"], t["agent"], t["item"]["id"]) for t in out],
+                         [("review", "r1", self.lot)])
         self.assertEqual(self.mails("cx1"), [], "codex est auteur de la plage")
-        self.assertEqual(self.mails("r1"), [], "le siège désigné n'est pas re-proposé")
+        self.assertEqual(len(self.mails("r1")), 1)
         self.assertEqual(work.get(self.db, self.lot)["reviewer"], "r1")
 
     def test_sans_marque_de_designation_aucune_proposition(self):
-        self.freeze()
-        self.consommer_designation_au_gel()
+        self.freeze_sans_siege()
         self.retire_marques()
         self.assertEqual(self.take(), [])
         self.assertEqual(self.mails("cx1"), [])
@@ -154,8 +163,7 @@ class PropositionFamillesTest(_Stacked, PgTestCase):
         self.assertEqual(self.mails("r1"), [])
 
     def test_une_marque_sans_liste_inconnue_ne_prouve_rien(self):
-        self.freeze()
-        self.consommer_designation_au_gel()
+        self.freeze_sans_siege()
         # La marque la plus récente ne porte pas la liste de complétude : la
         # lecture ne prouve pas l'absence d'auteur inconnu, donc rien n'est
         # proposé (échec fermé), même avec des familles connues.
@@ -166,8 +174,7 @@ class PropositionFamillesTest(_Stacked, PgTestCase):
         self.assertEqual(self.mails("r1"), [])
 
     def test_une_famille_d_auteur_inconnue_ne_propose_rien(self):
-        self.freeze()
-        self.consommer_designation_au_gel()
+        self.freeze_sans_siege()
         self.marque([{"name": "author", "family": ""},
                      {"name": "cx2", "family": "codex"}])
         self.assertEqual(self.take(), [])
@@ -175,8 +182,7 @@ class PropositionFamillesTest(_Stacked, PgTestCase):
         self.assertEqual(self.mails("r1"), [])
 
     def test_la_marque_d_un_gel_anterieur_ne_couvre_pas_le_nouveau(self):
-        self.freeze()
-        self.consommer_designation_au_gel()
+        self.freeze_sans_siege()
         # nouveau gel sans désignation : la lecture du gel courant manque.
         # Posé au stockage, ce témoin lit les marques, pas la porte du gel.
         storage.of(self.db).work.add_milestone(

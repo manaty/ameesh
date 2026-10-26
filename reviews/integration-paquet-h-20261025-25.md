@@ -114,11 +114,14 @@ cet ordre sans conflit.
    vérifie que le saut reste conditionnel et que la part psql installe
    l'extra (test voisin `test_part_psql_installe_cryptography`).
 4. **#3596 × #2864** (`tests/test_2864_proposition_familles.py`, test seul) :
-   la désignation partielle de #3596 pourvoit le siège indépendant disponible
-   dès le gel et lui écrit ; les témoins de #2864 vérifient puis consomment ce
-   courrier de gel, constatent que `r1` (claude) est désigné au gel, que
-   `cx1` (codex, auteur de la plage) ne l'est jamais, et que `take()` ne
-   re-propose pas un siège déjà pourvu. Aucune ligne de code touchée.
+   la désignation partielle de #3596 pourvoit le siège disponible au gel. Pour
+   que les témoins de #2864 lisent vraiment la marque au lieu d'être écartés
+   par la garde SQL du relecteur déjà désigné (`reviewer` non vide), le siège
+   indépendant (`r1`, claude) est indisponible au gel puis rendu disponible : le
+   témoin positif constate que la proposition va à `r1` et jamais à `cx1`
+   (codex, auteur de la plage), et les quatre témoins négatifs (pas de marque,
+   liste d'inconnus absente, famille d'auteur inconnue, marque d'un gel
+   antérieur) échouent fermé en lisant la marque. Aucune ligne de code touchée.
 
 Le commit d'adaptation porte les adaptations 3 et 4, plus la mention des
 adaptations 1 et 2 consignées dans leurs unités. Aucun avis demandé (§2).
@@ -172,8 +175,11 @@ paquet.
   #3616), réécritures attendues par les unités suivantes et les adaptations.
 - La ci-full du gel `8158e9d7aa` (run 40257561779) a révélé 5 rouges
   `test_2864_proposition_familles` (désignation partielle #3596 non adaptée) ;
-  l'adaptation 4 les corrige, test seul, et la ci-full est relancée sur le
-  nouveau gel.
+  l'adaptation 4 les corrige, test seul. L'auditeur a bloqué la tête
+  `011c4073d811` : le premier jet ne lisait pas la marque (garde SQL du
+  relecteur déjà désigné) et perdait le témoin positif ; l'adaptation 4 est
+  reprise (siège indisponible au gel, témoin positif conservé) et la ci-full
+  est relancée sur la nouvelle tête gelée.
 - Une seule suite complète sur la tête gelée, après le gel (`ameesh ci run
   <porteur> --full`), pas de CI par lot (§11 bis).
 - Après fusion : `main` reçoit la désignation partielle et la
