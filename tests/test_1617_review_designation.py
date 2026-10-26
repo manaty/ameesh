@@ -456,6 +456,14 @@ class MultiFamilyAuthorTest(unittest.TestCase):
         self.assertEqual(rd.unknown_families([{"name": "cx1", "family": ""}]),
                          ["cx1"])
 
+    def test_a_test_only_corrector_is_never_unknown(self):
+        # #3658 : un correcteur test_only n'interdit que son nom (#3518),
+        # dans `unknown_families` comme dans `families_of`.
+        rows = [{"name": "impl-06", "family": "deepseek"},
+                {"name": "dev4", "family": "claude", "test_only": True}]
+        self.assertEqual(rd.unknown_families(rows), [])
+        self.assertEqual(rd.families_of(rows), ({"impl-06", "dev4"}, {"deepseek"}))
+
     def test_one_opinion_from_an_outside_family_is_designated(self):
         picked = rd.select(
             families=FAMILIES, required=1, authors=[self.MULTI],
