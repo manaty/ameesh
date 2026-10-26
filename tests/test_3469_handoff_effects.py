@@ -909,6 +909,47 @@ class EffectsTest(RequestMixin, unittest.TestCase):
         self.assertEqual(self.fx.system.shows, shown)
 
 
+class ReleaseLoaderTest(unittest.TestCase):
+    """#3788: the real release loader stays covered, not only the fixture.
+
+    The preparation fixture supplies the pinned helper directly (#3785), so
+    ``_trusted_file`` and the exec of ``_release_revision`` would otherwise
+    never run. These tests pin the loader on a private copy of the helper,
+    outside the checkout whose permissions depend on the clone's umask.
+    """
+
+    def setUp(self):
+        self.fx = Fixture()
+        self.addCleanup(self.fx.close)
+
+    def loader(self, mode):
+        directory = self.fx.root / ('helper-%04o' % mode)
+        directory.mkdir(mode=0o700)
+        helper = directory / 'environnement-versionne.py'
+        shutil.copyfile(REPO / 'deploy' / 'mise-a-jour'
+                        / 'environnement-versionne.py', helper)
+        helper.chmod(mode)
+        effects = companion.HostEffects(
+            enrollment=self.fx.execution, system=self.fx.system, git=self.fx.git,
+            work_dir=lambda agent, project: str(self.fx.work / agent))
+        # The companion loads its helper from the directory of its pinned
+        # source; point that directory at the private copy.
+        pinned = mock.patch.object(
+            companion, '__file__', str(directory / 'hote-handoff.py'))
+        return effects, pinned
+
+    def test_release_loader_reads_a_trusted_helper_copy(self):
+        effects, pinned = self.loader(0o644)
+        with pinned:
+            self.assertEqual(effects._release_revision(), COMMIT)
+
+    def test_release_loader_refuses_a_group_writable_helper_copy(self):
+        effects, pinned = self.loader(0o664)
+        with pinned, self.assertRaises(companion.Refused) as caught:
+            effects._release_revision()
+        self.assertEqual(str(caught.exception), 'release')
+
+
 class DispatcherTest(unittest.TestCase):
     def test_executor_loads_a_private_enrollment_and_answers_inventory(self):
         with tempfile.TemporaryDirectory() as temp:
