@@ -2038,7 +2038,8 @@ def _lock_current_freeze(db, lot: int, freeze: Mapping) -> bool:
         return False
 
 
-def _sync_reviewers(db, item: Mapping, freeze: Mapping, names, *, text: str = "") -> None:
+def _sync_reviewers(db, item: Mapping, freeze: Mapping, names, *, text: str = "",
+                    removed=()) -> None:
     """Makes the automatic designation visible to the gate and to progress.
 
     The journal mark is the authoritative record, but the reviewers read by
@@ -2056,7 +2057,11 @@ def _sync_reviewers(db, item: Mapping, freeze: Mapping, names, *, text: str = ""
     gesture is never dropped on a read we cannot prove.
 
     `text`, when given, is the journal line of this sync (a verdict carry keeps
-    the reported reviewers instead of designating, #2487)."""
+    the reported reviewers instead of designating, #2487).
+
+    `removed` names the seats of this freeze the pilot removed from the column
+    (#3661): a `waiting` effective mark that still names one never writes it
+    back."""
     from .storage.postgres.work import has_reviewers
 
     if not has_reviewers(db):
@@ -2106,8 +2111,9 @@ def _sync_reviewers(db, item: Mapping, freeze: Mapping, names, *, text: str = ""
     wanted = [str((reviewer or {}).get("name") or "").strip()
               for reviewer in (effective[2].get("reviewers") or () if effective else ())]
     wanted.extend(names)
+    gone = {str(name or "").strip() for name in removed or ()}
     for name in wanted:
-        if name and name not in keep:
+        if name and name not in keep and name not in gone:
             keep.append(name)
     if keep == current:
         return
@@ -2987,11 +2993,14 @@ def designate(cfg, db, lot: int, *, freeze: Optional[Mapping] = None,
                                     [r.get("name") for r in out.get("reviewers") or ()])
             _drain(db, threads)
             return out
+        removed = set()
         if waiting and live is not None:
             # #3617 : la reprise d'une attente (partielle ou non) ne réinscrit
             # pas un siège de CE gel que le pilote a retiré de la colonne,
             # comme la complétion du plancher (B/P1 dev4) : après une attente
-            # partielle écrite par le plancher, la reprise passe ici.
+            # partielle écrite par le plancher, la reprise passe ici. #3661 :
+            # ni comme candidat, ni comme siège acquis de la marque `waiting`
+            # (le port la lit sans eux, `retired`).
             removed = _removed_seats(db, int(lot), freeze, live)
             if removed:
                 inputs = dataclasses.replace(
@@ -3010,10 +3019,11 @@ def designate(cfg, db, lot: int, *, freeze: Optional[Mapping] = None,
                     "freeze": freeze, "why": why}
         with db.transaction() as tx:
             out = _selection(inputs, pg.PgPort(tx, after_commit=threads,
-                                                at_freeze=False), force=force)
+                                                at_freeze=False, retired=removed),
+                             force=force)
             names = ([r.get("name") for r in out.get("reviewers") or ()]
                      if out.get("state") in (rd.DESIGNATED, rd.WAITING) else [])
-            _sync_reviewers(tx, item, freeze, names)
+            _sync_reviewers(tx, item, freeze, names, removed=removed)
             try:
                 _notify_superseded_blocks(tx, item, freeze, out, threads)
             except Exception:  # noqa: BLE001 - une notification ne perd rien
