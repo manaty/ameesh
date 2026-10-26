@@ -248,6 +248,12 @@ class PassBudget:
         room for the following ones stops there (#3802 B1)."""
         return self.remaining() <= max(0.0, float(seconds))
 
+    def window(self, reserve: float = 0.0):
+        """A view of this budget that ends `reserve` seconds earlier: the
+        external calls of a removal or an archive cannot eat the reserve
+        kept for the following phases (#3802 B1, cx2)."""
+        return _BudgetWindow(self, reserve)
+
     def check(self, name: str) -> None:
         """Start phase `name`; raise when the budget is already spent, naming
         the phase it was spent in (the one that just ended)."""
@@ -277,7 +283,26 @@ class PassBudget:
                 "timed_out": self.timed_out, "phases": list(self.phases)}
 
 
-def _artifact_budget(budget: PassBudget | None, reserve_s: float = 0.0):
+class _BudgetWindow:
+    """`PassBudget` minus a reserve: same duck-typed interface (`remaining`,
+    `expired`, `timeout`), used to bound the external calls of a removal or an
+    archive (#3802 B1, cx2)."""
+
+    def __init__(self, budget: PassBudget, reserve: float = 0.0):
+        self.budget = budget
+        self.reserve = max(0.0, float(reserve))
+
+    def remaining(self) -> float:
+        return max(0.0, self.budget.remaining() - self.reserve)
+
+    def expired(self) -> bool:
+        return self.remaining() <= 0.0
+
+    def timeout(self, cap: float) -> float:
+        return max(0.0, min(float(cap), self.remaining()))
+
+
+def _phase_budget(budget: PassBudget | None, reserve_s: float = 0.0):
     """The `build_artifacts.Budget` of one phase: its own cap, never past
     the pass's remaining time (#3802), and never into `reserve_s`."""
     seconds = build_artifacts.PASS_BUDGET_S
@@ -3409,7 +3434,9 @@ def _archive_due(db, idents, archive: dict | None, *, now: float, youngest: floa
 def _archive_dirty_worktree(path: str, repo: str, base: dict, *, why: str, st: dict, state,
                             archive: dict, now: float, dry_run: bool, artifacts, allow,
                             lock_path, journal_path, skip_roots,
-                            held: str = "modified or untracked files") -> dict:
+                            held: str = "modified or untracked files",
+                            budget: PassBudget | None = None,
+                            reserve_s: float = 0.0) -> dict:
     """#3728 : archive puis retrait d'un worktree gardé pour des fichiers
     modifiés ou non suivis (#3734 : ou seulement ignorés, `held`). `plan`
     (action `archivage` en essai, `retrait`, `garde` ou `attend`), `entries`
@@ -3417,9 +3444,16 @@ def _archive_dirty_worktree(path: str, repo: str, base: dict, *, why: str, st: d
     from . import housekeeping_archive
     after = float(archive["after"])
     why = "%s; kept for %s, ended and idle for more than %s" % (why, held, fmt_idle(after))
+    # #3802 B1 (cx2) : l'archivage et le retrait ne commencent pas dans la
+    # réserve gardée aux phases suivantes.
+    if budget is not None and budget.reserved(reserve_s):
+        return {"plan": dict(base, action="attend",
+                             detail="%s; pass budget reached: archive and removal "
+                                    "left for the next pass" % why),
+                "entries": [], "removed": False}
     if dry_run:
         size, _whole = build_artifacts.size_of(
-            path, budget=build_artifacts.Budget(build_artifacts.PASS_BUDGET_S))
+            path, budget=_phase_budget(budget, reserve_s))
         return {"plan": dict(base, action="archivage", bytes=size, detail=why),
                 "entries": [], "removed": False}
     made: dict = {}
@@ -3429,7 +3463,10 @@ def _archive_dirty_worktree(path: str, repo: str, base: dict, *, why: str, st: d
             made.update(housekeeping_archive.archive(
                 path, archive["root"], rules=build_artifacts.rules_of(artifacts),
                 lot=base.get("lot"), state=state or "", branch=st.get("branch") or "",
-                head=st.get("head") or "", now=now, retention_s=float(archive["retention"])))
+                head=st.get("head") or "", now=now,
+                retention_s=float(archive["retention"]),
+                deadline=(None if budget is None
+                          else budget.deadline - max(0.0, reserve_s))))
         except (housekeeping_archive.ArchiveRefused, OSError) as exc:
             return "not archived: %s" % exc
         return ""
@@ -3438,7 +3475,7 @@ def _archive_dirty_worktree(path: str, repo: str, base: dict, *, why: str, st: d
         path, repo or common_dir(path), st["gitdir"], artifacts=artifacts,
         allow=allow, lock_path=lock_path, journal_path=journal_path, skip_roots=skip_roots,
         idle_before=now - after, idle_note="worktree active within %s" % fmt_idle(after),
-        archive=keep_archive)
+        archive=keep_archive, budget=budget, reserve_s=reserve_s)
     entries = [dict(base, kind="artifact", detail="%s; %s" % (why, b.pop("detail")), **b)
                for b in built]
     if outcome in ("garde", "attend"):
@@ -3549,6 +3586,9 @@ def _worktree_pass(db, host: str, *, dry_run: bool,
     ordered = rows[start:] + rows[:start]
     processed = 0
     last = None
+    # view of the budget that ends at the reserve: the git calls of one row
+    # cannot eat the time kept for the following phases (#3802 B1, cx2)
+    window = budget.window(reserve_s) if budget is not None else None
     for row in ordered:
         if budget is not None and (budget.expired()
                                    or budget.reserved(reserve_s)):
@@ -3573,7 +3613,7 @@ def _worktree_pass(db, host: str, *, dry_run: bool,
         if not os.path.isdir(path):
             plan.append(dict(base, action="disparu", detail=UNATTRIBUTED))
             if not dry_run:
-                prune_worktrees(row.get("repo") or "", budget=budget)
+                prune_worktrees(row.get("repo") or "", budget=window)
                 store.set_worktree_status(row["id"], "gone",
                                           "directory gone (%s)" % UNATTRIBUTED)
                 entries.append(dict(base, action="gone", detail="directory gone; "
@@ -3597,7 +3637,7 @@ def _worktree_pass(db, host: str, *, dry_run: bool,
             # worktree change de branche après la découverte (`topic` puis
             # `lot/432`). Relire la branche ACTUELLE avant toute attribution ;
             # illisible = doute, on garde (#3266, relecture cx3).
-            readable, branch = current_branch(path, budget=budget)
+            readable, branch = current_branch(path, budget=window)
             branch_checked = True
             if not readable:
                 plan.append(dict(base, action="garde",
@@ -3709,7 +3749,7 @@ def _worktree_pass(db, host: str, *, dry_run: bool,
         # n'attribuait jamais, n'avait rien à relire : ce garde protège
         # l'attribution persistée, il ne change pas la règle de fin de lot.
         if not branch_checked:
-            readable, branch = current_branch(path, budget=budget)
+            readable, branch = current_branch(path, budget=window)
             if not readable:
                 plan.append(dict(base, action="garde",
                                  detail="current branch unreadable; kept"))
@@ -3738,15 +3778,15 @@ def _worktree_pass(db, host: str, *, dry_run: bool,
         # worktree of another repository. Old metadata never authorises it.
         from .housekeeping_discovery import _marker
         if _marker(path) != "linked" or not same_repository(
-                path, row.get("repo") or "", budget=budget):
+                path, row.get("repo") or "", budget=window):
             plan.append(dict(base, action="garde",
                              detail="linked worktree no longer matches its tracked repository"))
             continue
-        st = worktree_state(path, budget=budget)
+        st = worktree_state(path, budget=window)
         if not st["exists"]:
             plan.append(dict(base, action="disparu", detail=why))
             if not dry_run:
-                prune_worktrees(row.get("repo") or "", budget=budget)
+                prune_worktrees(row.get("repo") or "", budget=window)
                 store.set_worktree_status(row["id"], "gone", "directory gone (%s)" % why)
                 entries.append(dict(base, action="gone", detail="directory gone; "
                                     "git worktree prune (%s)" % why))
@@ -3793,13 +3833,13 @@ def _worktree_pass(db, host: str, *, dry_run: bool,
             if idle_before is not None:
                 activity = build_artifacts.survey(path, build_artifacts.rules_of(artifacts),
                     skip_roots=skip_roots,
-                    budget=_artifact_budget(budget, reserve_s))
+                    budget=_phase_budget(budget, reserve_s))
                 if not activity["complete"] or activity["latest"] > idle_before:
                     plan.append(dict(base, action="garde", detail="%s; %s" % (
                         detail, activity["why"] or "worktree active within 24 h")))
                     continue
             leftovers = ignored_leftovers(path, build_artifacts.rules_of(artifacts),
-                                          budget=budget)
+                                          budget=window)
             if leftovers is None:
                 hold = "ignored files unreadable (git status --ignored)"
             elif leftovers:
@@ -3824,7 +3864,8 @@ def _worktree_pass(db, host: str, *, dry_run: bool,
                     path, row.get("repo") or "", base, why=why, st=st, state=state,
                     archive=archive, now=now, dry_run=dry_run, artifacts=artifacts,
                     allow=allow, lock_path=lock_path, journal_path=journal_path,
-                    skip_roots=skip_roots, held="ignored files only")
+                    skip_roots=skip_roots, held="ignored files only",
+                    budget=budget, reserve_s=reserve_s)
                 entries += done["entries"]
                 plan.append(done["plan"])
                 if done["removed"]:
@@ -3839,15 +3880,15 @@ def _worktree_pass(db, host: str, *, dry_run: bool,
                 why, "kept for more than 24 h" if grace else "idle for more than 24 h")
             if dry_run:
                 size, _whole = build_artifacts.size_of(
-                    path, budget=_artifact_budget(budget, reserve_s))
+                    path, budget=_phase_budget(budget, reserve_s))
                 plan.append(dict(base, action="retrait", bytes=size, detail=why))
                 continue
             outcome, freed, note, built = _remove_kept_worktree(
-                path, row.get("repo") or common_dir(path, budget=budget), st["gitdir"],
+                path, row.get("repo") or common_dir(path, budget=window), st["gitdir"],
                 artifacts=artifacts,
                 allow=allow,
                 lock_path=lock_path, journal_path=journal_path, skip_roots=skip_roots,
-                idle_before=idle_before)
+                idle_before=idle_before, budget=budget, reserve_s=reserve_s)
             entries += [dict(base, kind="artifact", detail="%s; %s" % (why, b.pop("detail")),
                              **b) for b in built]
             if outcome in ("garde", "attend"):
@@ -3870,7 +3911,7 @@ def _worktree_pass(db, host: str, *, dry_run: bool,
                     path, row.get("repo") or "", base, why=why, st=st, state=state,
                     archive=archive, now=now, dry_run=dry_run, artifacts=artifacts,
                     allow=allow, lock_path=lock_path, journal_path=journal_path,
-                    skip_roots=skip_roots)
+                    skip_roots=skip_roots, budget=budget, reserve_s=reserve_s)
                 entries += done["entries"]
                 if done["plan"]["action"] != "garde":
                     plan.append(done["plan"])
@@ -3893,7 +3934,7 @@ def _worktree_pass(db, host: str, *, dry_run: bool,
         plan.append(dict(base, action="retrait", bytes=size, detail=why))
         if dry_run:
             continue
-        ok, error = remove_worktree(path, row.get("repo") or "", budget=budget)
+        ok, error = remove_worktree(path, row.get("repo") or "", budget=window)
         if ok:
             store.set_worktree_status(row["id"], "removed", why)
             branch_note = delete_merged_branch(st["branch"], row.get("repo") or "") \
@@ -3919,7 +3960,8 @@ def _worktree_pass(db, host: str, *, dry_run: bool,
 
 def _remove_kept_worktree(path: str, repo: str, gitdir: str, *, artifacts, allow, lock_path,
                           journal_path, skip_roots=(), idle_before: float | None = None,
-                          idle_note: str = "worktree active within 24 h", archive=None
+                          idle_note: str = "worktree active within 24 h", archive=None,
+                          budget: PassBudget | None = None, reserve_s: float = 0.0
                           ) -> tuple[str, int, str, list]:
     """L230/#1665: removal of a kept worktree (lot merged, or orphan), under the
     host lock of the deleting passes (`build_artifacts`). Its build output
@@ -3943,6 +3985,11 @@ def _remove_kept_worktree(path: str, repo: str, gitdir: str, *, artifacts, allow
     built: list[dict] = []
     if not lock_path or not journal_path:
         return "garde", 0, "neither lock nor housekeeping journal", built
+    # #3802 B1 (cx2) : le retrait ne commence pas dans la réserve gardée aux
+    # phases suivantes ; son budget interne est celui qui reste, pas 600 s.
+    if budget is not None and budget.reserved(reserve_s):
+        return "garde", 0, "pass budget reached: removal left for the next pass", built
+    window = budget.window(reserve_s) if budget is not None else None
     lock = build_artifacts._lock(lock_path)
     if lock is None:
         return "attend", 0, "another pass is deleting on the host", built
@@ -3952,7 +3999,7 @@ def _remove_kept_worktree(path: str, repo: str, gitdir: str, *, artifacts, allow
             skip_ids = [tuple(r["id"]) for r in journal.records() if r.get("id")]
         except OSError as exc:
             return "garde", 0, "housekeeping journal unreadable (%s)" % (exc.strerror or exc), built
-        budget = build_artifacts.Budget(build_artifacts.PASS_BUDGET_S)
+        work_budget = _phase_budget(budget, reserve_s)
         rules = build_artifacts.rules_of(artifacts)
         roots = [_real(p) for p in skip_roots if p]
         avoid = build_artifacts._identities(roots)
@@ -3982,7 +4029,7 @@ def _remove_kept_worktree(path: str, repo: str, gitdir: str, *, artifacts, allow
 
         freed = 0
         found = build_artifacts.survey(path, rules, skip_roots=skip_roots, skip_ids=skip_ids,
-                                       budget=budget)
+                                       budget=work_budget)
         if not found["complete"]:
             return "garde", 0, "artifacts: %s" % found["why"], built
         if idle_before is not None and found["latest"] > idle_before:
@@ -3992,12 +4039,12 @@ def _remove_kept_worktree(path: str, repo: str, gitdir: str, *, artifacts, allow
         for artifact in found["artifacts"]:
             inside = [r for r in roots if _under(r, _real(artifact))]
             refusal = ("contains a managed root (%s)" % inside[0]) if inside else \
-                build_artifacts.tracked(path, artifact)
+                build_artifacts.tracked(path, artifact, budget=window)
             if not refusal:
                 try:
                     done = build_artifacts.remove_artifact(
                         artifact, path, root=(real, ident), journal=journal, rules=rules,
-                        avoid=avoid, budget=budget, check=check)
+                        avoid=avoid, budget=work_budget, check=check)
                 except (OSError, ValueError) as exc:
                     refusal = str(exc)
                 else:
@@ -4014,7 +4061,7 @@ def _remove_kept_worktree(path: str, repo: str, gitdir: str, *, artifacts, allow
             if refusal:
                 return "garde", freed, refusal, built
         else:
-            leftovers = ignored_leftovers(path)
+            leftovers = ignored_leftovers(path, budget=window)
             if leftovers is None:
                 return "garde", freed, "git state unreadable (git status --ignored)", built
             if leftovers:
@@ -4022,11 +4069,11 @@ def _remove_kept_worktree(path: str, repo: str, gitdir: str, *, artifacts, allow
                     len(leftovers), leftovers[0]), built
         try:
             done = build_artifacts.remove_worktree_dir(
-                path, (real, ident), parent_id, journal=journal, avoid=avoid, budget=budget,
-                check=check)
+                path, (real, ident), parent_id, journal=journal, avoid=avoid,
+                budget=work_budget, check=check)
         except (OSError, ValueError) as exc:
             return "garde", freed, "removal refused: %s" % exc, built
-        prune_worktrees(repo)
+        prune_worktrees(repo, budget=window)
         freed += done["bytes"]
         if notes(done):
             return "partial", freed, "left in %s: %s" % (done["trash"], notes(done)), built

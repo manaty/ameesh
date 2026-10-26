@@ -109,7 +109,7 @@ def discover(db, host: str, agents: dict, roots, *, dry_run: bool,
         cwd = hk._expand(cwd)
         if cwd in seen or _marker(cwd) not in ("clone", "linked"):
             continue
-        listed = hk.list_worktrees(cwd)
+        listed = hk.list_worktrees(cwd, budget=budget)
         inspected += 1
         if not listed:
             continue

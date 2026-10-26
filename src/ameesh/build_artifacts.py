@@ -327,13 +327,21 @@ def survey(worktree: str, rules, *, skip_roots=(), skip_ids=(), limit: int = WAL
     return out
 
 
-def tracked(worktree: str, artifact: str) -> str:
+def tracked(worktree: str, artifact: str, budget=None) -> str:
     """Why `artifact` is not regenerable as far as git knows ('' if it is):
-    a file tracked by git inside, or git unable to say."""
+    a file tracked by git inside, or git unable to say.
+
+    `budget` (#3802): a `PassBudget`/window; the git call takes only what is
+    left, and is not started when there is nothing left."""
     rel = os.path.relpath(artifact, worktree)
+    timeout = GIT_TIMEOUT
+    if budget is not None:
+        timeout = budget.timeout(timeout)
+        if timeout <= 0.0:
+            return "pass budget reached: git not asked"
     try:
         proc = subprocess.run(["git", "-C", worktree, "--no-optional-locks", "ls-files", "-z",
-                               "--", rel], capture_output=True, timeout=GIT_TIMEOUT)
+                               "--", rel], capture_output=True, timeout=timeout)
     except (OSError, subprocess.SubprocessError) as exc:
         return "git ls-files impossible (%s)" % type(exc).__name__
     if proc.returncode != 0:

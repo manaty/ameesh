@@ -72,10 +72,10 @@ def root_of(state_dir: str, managed_dir: str) -> str:
     return os.path.join(state_dir, managed_dir, ARCHIVE_DIR)
 
 
-def _git(path: str, *args: str) -> subprocess.CompletedProcess:
+def _git(path: str, *args: str, timeout: float = GIT_TIMEOUT) -> subprocess.CompletedProcess:
     try:
         proc = subprocess.run(["git", "-C", path, "--no-optional-locks", *args],
-                              capture_output=True, timeout=GIT_TIMEOUT)
+                              capture_output=True, timeout=timeout)
     except (OSError, subprocess.SubprocessError) as exc:
         raise ArchiveRefused("git %s failed (%s)" % (args[0], exc)) from exc
     if proc.returncode != 0:
@@ -88,11 +88,11 @@ def _names(raw: bytes) -> list[str]:
     return [os.fsdecode(item) for item in raw.split(b"\0") if item]
 
 
-def status_entries(path: str) -> list[str]:
+def status_entries(path: str, *, timeout: float = GIT_TIMEOUT) -> list[str]:
     """`git status --porcelain -z` as `XY path` lines; a rename or copy
     carries its origin (`XY path <- origin`), the next field of `-z`."""
     fields = _names(_git(path, "status", "--porcelain=v1", "-z",
-                         "--untracked-files=normal").stdout)
+                         "--untracked-files=normal", timeout=timeout).stdout)
     out: list[str] = []
     it = iter(fields)
     for field in it:
@@ -137,12 +137,13 @@ def _walk(top: str, rel: str, rules, out: list) -> None:
                    if not _excluded(top, os.path.join(crel, name), rules))
 
 
-def untracked_files(path: str, rules) -> list[str]:
+def untracked_files(path: str, rules, *, timeout: float = GIT_TIMEOUT) -> list[str]:
     """Untracked and ignored files of the worktree `path`, relative, outside
     the build output `rules` and `EXCLUDED_NAMES`."""
-    found = _names(_git(path, "ls-files", "-z", "--others", "--exclude-standard").stdout)
+    found = _names(_git(path, "ls-files", "-z", "--others", "--exclude-standard",
+                        timeout=timeout).stdout)
     ignored = _names(_git(path, "ls-files", "-z", "--others", "--ignored",
-                          "--exclude-standard", "--directory").stdout)
+                          "--exclude-standard", "--directory", timeout=timeout).stdout)
     out = [rel for rel in found if not _excluded(path, rel, rules)]
     for rel in ignored:
         if _excluded(path, rel, rules):
@@ -186,7 +187,7 @@ def _write(path: str, data: bytes) -> None:
 def archive(path: str, root: str, *, rules=(), lot=None, state: str = "",
             branch: str = "", head: str = "", now: float | None = None,
             retention_s: float, max_bytes: int | None = None,
-            max_files: int | None = None) -> dict:
+            max_files: int | None = None, deadline: float | None = None) -> dict:
     """Archives the worktree `path` under `root` (created 0700). Returns
     `archive` (its directory), `bytes` (on disk), `patch_bytes`, `files`
     (untracked archived), `tracked` (tracked entries changed),
@@ -195,14 +196,33 @@ def archive(path: str, root: str, *, rules=(), lot=None, state: str = "",
     now = time.time() if now is None else now
     max_bytes = MAX_BYTES if max_bytes is None else max_bytes
     max_files = MAX_FILES if max_files is None else max_files
-    entries = status_entries(path)
+
+    # #3802 B1 (cx2) : `deadline` est l'échéance monotone du passage, réserve
+    # déduite. Ce qui reste à archiver attend le passage suivant : jamais un
+    # archivage à moitié (le dossier partiel est retiré par le `except`).
+    def _left() -> float | None:
+        return None if deadline is None else deadline - time.monotonic()
+
+    def _check() -> None:
+        if deadline is not None and time.monotonic() >= deadline:
+            raise ArchiveRefused("pass budget reached: archive left for the next pass")
+
+    def _timeout() -> float:
+        left = _left()
+        if left is None:
+            return GIT_TIMEOUT
+        _check()
+        return min(GIT_TIMEOUT, max(0.1, left))
+
+    _check()
+    entries = status_entries(path, timeout=_timeout())
     tracked = [e for e in entries if not e.startswith("?? ")]
     unmerged = [e for e in tracked if e[:2] in UNMERGED]
     if unmerged:
         raise ArchiveRefused("unmerged index entries (%s)" % unmerged[0])
     diff = ("diff", "--binary", "--no-ext-diff", "--no-textconv")
-    staged = _git(path, *diff, "--cached", "HEAD").stdout
-    unstaged = _git(path, *diff).stdout
+    staged = _git(path, *diff, "--cached", "HEAD", timeout=_timeout()).stdout
+    unstaged = _git(path, *diff, timeout=_timeout()).stdout
     # every change of a layer must show in that layer's patch: else git says
     # something we do not understand, and the worktree stays
     for layer, column, patch in (("staged", 0, staged), ("unstaged", 1, unstaged)):
@@ -210,7 +230,7 @@ def archive(path: str, root: str, *, rules=(), lot=None, state: str = "",
         if changed and not patch:
             raise ArchiveRefused("%s changes absent from their patch (%s)" % (
                 layer, changed[0]))
-    files = untracked_files(path, rules)
+    files = untracked_files(path, rules, timeout=_timeout())
     if len(files) > max_files:
         raise ArchiveRefused("%d untracked file(s) to archive (limit %d)" % (
             len(files), max_files))
@@ -227,6 +247,7 @@ def archive(path: str, root: str, *, rules=(), lot=None, state: str = "",
     final = os.path.join(root, name)
     # dev3 B1: creating the root or the partial directory may fail (ENOSPC,
     # EACCES, a file in the way): a refusal, never an aborted pass
+    _check()
     try:
         os.makedirs(root, mode=0o700, exist_ok=True)
         os.chmod(root, 0o700)
@@ -240,6 +261,7 @@ def archive(path: str, root: str, *, rules=(), lot=None, state: str = "",
             tar_path = os.path.join(partial, "untracked.tar.gz")
             with tarfile.open(tar_path, "w:gz") as tar:
                 for rel in files:
+                    _check()
                     tar.add(os.path.join(path, rel), arcname=rel, recursive=False)
             with open(tar_path, "rb") as fh:
                 os.fsync(fh.fileno())

@@ -19,7 +19,9 @@ import types
 import unittest
 from unittest import mock
 
-from ameesh import (exploitation, housekeeping as hk, housekeeping_discovery as discovery, mesh_cli, storage)
+from ameesh import (build_artifacts, exploitation, housekeeping as hk,
+                     housekeeping_archive, housekeeping_discovery as discovery,
+                     mesh_cli, storage)
 from ameesh.housekeeping import HOST_PASS_ALERT_AFTER_S, PassBudget, _PassExpired
 from ameesh.platform import session_lock
 
@@ -297,6 +299,71 @@ class _AllowBudget:
     def reserved(self, seconds):
         self.checks += 1
         return self.checks > self.allow
+
+    def window(self, reserve):
+        return self
+
+
+class RemovalBudgetTest(unittest.TestCase):
+    """#3802 B1 (cx2) : le retrait réel et l'archivage ne recréent plus un
+    budget de 600 s qui ignore la réserve et l'échéance du passage."""
+
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory(prefix="ameesh-3802-removal-")
+        self.addCleanup(temporary.cleanup)
+        self.dir = temporary.name
+        self.lock_path = os.path.join(self.dir, "artifacts.lock")
+        self.journal_path = os.path.join(self.dir, "artifacts.journal")
+
+    def _pass_budget(self, now, consumed=0.0):
+        clock = [consumed]
+        budget = hk.PassBudget(hk.HOST_PASS_BUDGET_S, clock=lambda: clock[0])
+        return budget, clock
+
+    def test_a_removal_in_the_reserve_is_not_started(self):
+        budget, clock = self._pass_budget(0)
+        clock[0] = hk.HOST_PASS_BUDGET_S - hk.HOST_PASS_RESERVE_S + 1
+        with mock.patch.object(build_artifacts, "_lock") as lock, \
+                mock.patch.object(build_artifacts, "survey") as survey:
+            outcome, freed, note, built = hk._remove_kept_worktree(
+                os.path.join(self.dir, "wt"), os.path.join(self.dir, "repo"),
+                os.path.join(self.dir, "gitdir"), artifacts=(), allow=(),
+                lock_path=self.lock_path, journal_path=self.journal_path,
+                budget=budget, reserve_s=hk.HOST_PASS_RESERVE_S)
+        self.assertEqual((outcome, freed, built), ("garde", 0, []))
+        self.assertIn("pass budget reached", note)
+        lock.assert_not_called()
+        survey.assert_not_called()
+
+    def test_a_removal_gets_the_remaining_time_not_600_seconds(self):
+        budget, clock = self._pass_budget(0)
+        clock[0] = hk.HOST_PASS_BUDGET_S - hk.HOST_PASS_RESERVE_S - 10
+        captured = {}
+
+        def survey(path, rules, **kwargs):
+            captured["budget"] = kwargs["budget"]
+            return {"complete": False, "why": "time budget of the pass reached"}
+
+        with mock.patch.object(build_artifacts, "survey", side_effect=survey):
+            outcome, _freed, note, _built = hk._remove_kept_worktree(
+                os.path.join(self.dir, "wt"), os.path.join(self.dir, "repo"),
+                os.path.join(self.dir, "gitdir"), artifacts=(), allow=(),
+                lock_path=self.lock_path, journal_path=self.journal_path,
+                budget=budget, reserve_s=hk.HOST_PASS_RESERVE_S)
+        self.assertEqual(outcome, "garde")
+        self.assertIn("time budget", note)
+        work = captured["budget"]
+        left = work.deadline - work.clock()
+        self.assertLessEqual(left, 10.001)      # remaining (310) - reserve (300)
+        self.assertLess(left, build_artifacts.PASS_BUDGET_S)
+
+    def test_an_archive_past_the_pass_deadline_refuses_and_leaves_nothing(self):
+        root = os.path.join(self.dir, "archives")
+        with self.assertRaises(housekeeping_archive.ArchiveRefused):
+            housekeeping_archive.archive(os.path.join(self.dir, "wt"), root,
+                                         retention_s=3600.0,
+                                         deadline=time.monotonic() - 1)
+        self.assertFalse(os.path.isdir(root))
 
 
 class WorktreesCursorTest(unittest.TestCase):
