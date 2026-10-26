@@ -1967,6 +1967,13 @@ class ProbePartialCloneTest(_Base):
         self.autre = os.path.join(self.bac, "clone1772-bis")
         _git(self.tmp, "clone", "-q", "--filter=blob:none", "--no-local",
              "file://" + self.remote, self.autre)
+        # #3822 : le témoin n'existe que sur un clone réellement partiel
+        # (remote promisor). Un git ou un serveur sans filtre ne peut pas le
+        # produire : le dire, plutôt que d'échouer sur une assertion trompeuse.
+        if plan_git._out(self.repo, "config", "--bool",
+                         "remote.origin.promisor") != "true":
+            self.skipTest("clone partiel indisponible (remote.origin.promisor "
+                          "absent) : le témoin #1772 ne peut pas s'exercer")
         self.agent("claude1", cwd=self.repo)
 
     def commit(self, repo, name):
