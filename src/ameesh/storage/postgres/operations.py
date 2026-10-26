@@ -636,22 +636,26 @@ class Operations(interface.Operations):
         sql += " ORDER BY observed_at, id"
         return _sans_compte_nul(self.db.query(sql, tuple(params)))
 
-    def latest_gauges(self, *, since_s) -> list[dict]:
+    def latest_gauges(self, *, since_s, by_source=False) -> list[dict]:
         """L94 : le DERNIER relevé de chaque jauge, par instant de PRODUCTION
-        (#1132) : un relevé périmé réinséré ne remplace plus le frais."""
+        (#1132) : un relevé périmé réinséré ne remplace plus le frais.
+
+        `by_source` garde une ligne par source de publication (agent) : deux
+        hôtes homonymes ne s'effacent plus dans la sélection (#3755, avis
+        cx1). Les lecteurs de la vue unifiée gardent le défaut."""
+        colonnes = ("harness, account, gauge_key, source" if by_source
+                    else "harness, account, gauge_key")
         return self.db.query(
-            """
-            SELECT DISTINCT ON (harness, account, gauge_key)
-                   harness, gauge_key AS key, used,
-                   extract(epoch from resets_at)::float8 AS resets_at_ts, window_s,
-                   extract(epoch from observed_at)::float8 AS observed_ts,
-                   extract(epoch from produced_at)::float8 AS produced_ts, source, account,
-                   overage_capable, overage_in_use
-              FROM quota_gauge_readings
-             WHERE observed_at >= now() - make_interval(secs => %s)
-             ORDER BY harness, account, gauge_key,
-                      produced_at DESC NULLS LAST, observed_at DESC, id DESC
-            """,
+            "SELECT DISTINCT ON (" + colonnes + ")"
+            " harness, gauge_key AS key, used,"
+            " extract(epoch from resets_at)::float8 AS resets_at_ts, window_s,"
+            " extract(epoch from observed_at)::float8 AS observed_ts,"
+            " extract(epoch from produced_at)::float8 AS produced_ts, source, account,"
+            " overage_capable, overage_in_use"
+            " FROM quota_gauge_readings"
+            " WHERE observed_at >= now() - make_interval(secs => %s)"
+            " ORDER BY " + colonnes + ","
+            " produced_at DESC NULLS LAST, observed_at DESC, id DESC",
             (float(since_s),))
 
     def gauge_latest(self, *, harness, account) -> list[dict]:

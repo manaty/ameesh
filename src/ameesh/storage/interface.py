@@ -3792,13 +3792,20 @@ class Operations(Domain):
         (`overage_capable`, `overage_in_use`, #3755). `account` filtre."""
 
     @abc.abstractmethod
-    def latest_gauges(self, *, since_s: float) -> list[dict]:
+    def latest_gauges(self, *, since_s: float, by_source: bool = False) -> list[dict]:
         """L94 : le DERNIER relevé de chaque jauge (harness, account, key)
         observé dans les `since_s` dernières secondes, choisi par instant de
         PRODUCTION (#1132 : `produced_at` d'abord, NULL en dernier, puis
         `observed_at`) : harness, key, used, resets_at_ts, window_s,
         observed_ts, produced_ts, source, account (None sans comptes) et les
-        drapeaux d'overage (#3755)."""
+        drapeaux d'overage (#3755).
+
+        `by_source` (défaut faux) : une ligne par SOURCE de publication
+        (l'agent qui a produit le relevé) au lieu d'une par compte/jauge. Deux
+        hôtes peuvent déclarer un compte homonyme (`codex/secondaire`) ; la
+        vue unifiée garde le dernier relevé, la vue par source permet à
+        l'alerte d'overage de ne pas laisser le relevé d'un hôte effacer
+        celui d'un autre. Les autres lecteurs gardent la vue unifiée."""
 
     @abc.abstractmethod
     def gauge_latest(self, *, harness: str, account: str) -> list[dict]:

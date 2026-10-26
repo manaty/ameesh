@@ -323,6 +323,46 @@ class AlerteOverageHorsHoteTest(_Base):
         self.assertAlmostEqual(alert["value"], 1.0)
         self.assertAlmostEqual(alert["since"], now + 2 * HOUR - 300 * 60, delta=2.0)
 
+    def _deux_hotes(self) -> None:
+        """Deux hôtes homonymes : le même compte codex/secondaire chez chacun."""
+        for name, host in (("runner-a", "host-a"), ("runner-b", "host-b")):
+            self.db.execute(
+                "INSERT INTO agent_registry (name, chantier, harness, host, status)"
+                " VALUES (%s, '', 'codex', %s, 'idle')", (name, host))
+
+    def test_deux_hotes_homonymes_meme_jauge_ne_s_effacent_pas(self):
+        """Avis cx1 : à gauge_key égale, le relevé plus récent de l'hôte B ne
+        doit pas effacer le dépassement publié par A avant le groupement."""
+        now = float(int(time.time()))
+        self._deux_hotes()
+        self._reading(key="codex-300min", used=1.0, resets_at=now + 2 * HOUR,
+                      window_s=300 * 60, in_use=True, source="runner-a",
+                      produced_at=now - 10.0, observed_at=now - 5.0)
+        self._reading(key="codex-300min", used=0.1, resets_at=now + 2 * HOUR,
+                      window_s=300 * 60, in_use=False, source="runner-b",
+                      produced_at=now, observed_at=now)
+        (alert,) = self._alerts(now)
+        self.assertEqual(alert["host"], "host-a")
+        self.assertEqual(alert["gauge"], "codex-300min")
+        self.assertAlmostEqual(alert["value"], 1.0)
+
+    def test_deux_hotes_homonymes_fenetres_differentes_gardent_l_alerte(self):
+        """Le relevé hebdomadaire faux et plus récent de B ne masque pas le
+        dépassement de la fenêtre courte publié par A."""
+        now = float(int(time.time()))
+        self._deux_hotes()
+        self._reading(key="codex-300min", used=1.0, resets_at=now + 2 * HOUR,
+                      window_s=300 * 60, in_use=True, source="runner-a",
+                      produced_at=now - 10.0, observed_at=now - 5.0)
+        self._reading(key="codex-10080min", used=0.1,
+                      resets_at=now + 6 * DAY, window_s=10080 * 60,
+                      in_use=False, source="runner-b",
+                      produced_at=now, observed_at=now)
+        (alert,) = self._alerts(now)
+        self.assertEqual(alert["host"], "host-a")
+        self.assertEqual(alert["gauge"], "codex-300min")
+        self.assertAlmostEqual(alert["value"], 1.0)
+
     def test_une_fenetre_remise_a_zero_resout_l_alerte(self):
         now = float(int(time.time()))
         self._reading(used=1.0, resets_at=now - 60.0, window_s=300 * 60)
