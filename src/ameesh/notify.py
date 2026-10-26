@@ -214,10 +214,11 @@ DEFAULT_INTERVAL_S = 30.0
 #: reprise seule par l'exécuteur ; l'alerte n'est poussée qu'au-delà de cette
 #: grâce, mesurée depuis l'échéance du bail (`since`). Le seuil de détection
 #: (`--dead-grace`, 30 s) ne change pas : `ameesh alerts` voit la coupure.
-#: Les reprises observées sur pc-smichea arrivent 2 à 4 min après l'échéance ;
-#: une panne réelle qui persiste au-delà pousse une alerte, puis un seul
-#: `resolved`.
-DEAD_RUNNER_NOTIFY_GRACE_S = 300.0
+#: Les coupures mesurées sur pc-smichea le 25/10 (relecture #3630) vont
+#: jusqu'à 5,2 min après l'échéance (dev1 22:12:32 → 22:17:43) ; 8 min laisse
+#: ~2,8 min de marge. Une panne réelle qui persiste au-delà pousse une alerte,
+#: puis un seul `resolved`.
+DEAD_RUNNER_NOTIFY_GRACE_S = 480.0
 #: fenêtre de la limite de débit, et intervalle minimal entre deux résumés
 RATE_WINDOW_S = 60.0
 #: #2395 : rétention du registre `notified` (une notification par identité

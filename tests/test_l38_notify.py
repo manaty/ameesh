@@ -467,9 +467,9 @@ class AlertesReellesTest(_Base):
 
 
 class DeadRunnerLeaseTest(_Base):
-    """#3630, témoin de bout en bout : un bail qui expire 60 s puis se
-    renouvelle ne pousse rien ; au-delà de la grâce, une alerte et un
-    resolved."""
+    """#3630, témoin de bout en bout : un bail qui expire 60 s (ou 5,2 min,
+    coupure mesurée le 25/10) puis se renouvelle ne pousse rien ; au-delà de
+    la grâce, une alerte et un resolved."""
 
     def setUp(self):
         super().setUp()
@@ -502,9 +502,18 @@ class DeadRunnerLeaseTest(_Base):
         self.assertEqual(self.passe(notifier), [])
         self.assertEqual(_desktop_log(self.desk), [])
 
+    def test_coupure_mesuree_de_5_min_2_puis_renouvelee_ne_pousse_rien(self):
+        notifier = self.notifier(self.ncfg())
+        self.lease(311)
+        self.assertEqual(self.passe(notifier), [])
+        self.assertEqual(_desktop_log(self.desk), [])
+        self.renew()
+        self.assertEqual(self.passe(notifier), [])
+        self.assertEqual(_desktop_log(self.desk), [])
+
     def test_panne_au_dela_de_la_grace_pousse_une_alerte_et_un_resolved(self):
         notifier = self.notifier(self.ncfg())
-        self.lease(301)
+        self.lease(notify.DEAD_RUNNER_NOTIFY_GRACE_S + 1)
         self.assertEqual([(r["event"], r["type"], r["delivery"])
                           for r in self.passe(notifier)],
                          [("raised", "dead_runner", "envoyee")])
@@ -537,15 +546,21 @@ class DeadRunnerAntiBounceTest(_Base):
         self.assertEqual(self.passe(notifier, []), [])
         self.assertEqual(_desktop_log(self.desk), [])
 
+    def test_coupure_mesuree_de_5_min_2_reste_dans_la_grace(self):
+        notifier = self.notifier(self.ncfg())
+        self.assertEqual(self.passe(notifier, [self.dead(311)]), [])
+        self.assertEqual(_desktop_log(self.desk), [])
+
     def test_panne_au_dela_de_la_grace_pousse_une_fois_puis_un_resolved(self):
         notifier = self.notifier(self.ncfg())
-        records = self.passe(notifier, [self.dead(301)])
+        records = self.passe(notifier, [self.dead(notify.DEAD_RUNNER_NOTIFY_GRACE_S + 1)])
         self.assertEqual([(r["event"], r["type"], r["delivery"]) for r in records],
                          [("raised", "dead_runner", "envoyee")])
         self.assertEqual(len(_desktop_log(self.desk)), 1)
         # une alerte qui dure ne repart pas
         self.now += 30
-        self.assertEqual(self.passe(notifier, [self.dead(331)]), [])
+        self.assertEqual(self.passe(notifier,
+                                    [self.dead(notify.DEAD_RUNNER_NOTIFY_GRACE_S + 31)]), [])
         # le bail revient : une seule résolution
         self.assertEqual([(r["event"], r["type"], r["delivery"])
                           for r in self.passe(notifier, [])],
