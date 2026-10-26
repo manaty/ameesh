@@ -9,7 +9,9 @@ base réelle : `storage.of` est simulé, comme dans les témoins de la file.
 """
 from __future__ import annotations
 
+import contextlib
 import importlib.util
+import io
 import json
 import os
 import pathlib
@@ -815,6 +817,88 @@ class StrictPilotAuthorityTest(unittest.TestCase):
         self.assertFalse(held[7]["mesh-design"]["pilot"])
 
 
+class CodeProvenanceTest(unittest.TestCase):
+    """#3782 : le code exécuté (le `src` importé) est la tête de la cible.
+
+    Le refus doit couvrir les deux sens du décalage (code en avance ou en
+    retard), un dépôt sans la tête de la cible, un arbre non commité et un
+    HEAD illisible. Un calcul fait depuis un vieux checkout ne doit plus
+    pouvoir passer pour un calcul sur main.
+    """
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.mkdtemp(prefix="ameesh-3782-")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.repo = os.path.join(self.tmp, "repo")
+        os.makedirs(self.repo)
+        _git(self.repo, "init", "-q", "-b", "main")
+        _git(self.repo, "config", "user.name", "banc")
+        _git(self.repo, "config", "user.email", "banc@example.invalid")
+        _git(self.repo, "config", "commit.gpgsign", "false")
+        _write(self.repo, "src/ameesh/__init__.py", "one\n")
+        _commit(self.repo, "base")
+        self.target = _git(self.repo, "rev-parse", "HEAD")
+
+    def test_the_code_of_the_target_is_accepted(self):
+        prov = candidates_script.code_provenance(self.repo, self.target)
+        self.assertEqual(prov["code_sha"], self.target)
+        self.assertEqual(prov["code_relation"], "same")
+        self.assertTrue(prov["code_contains_target"])
+        self.assertFalse(prov["code_dirty"])
+        self.assertEqual(candidates_script.code_refusal(prov, self.target), "")
+
+    def test_a_code_ahead_of_the_target_is_refused(self):
+        _write(self.repo, "src/ameesh/next.py", "two\n")
+        ahead = _commit(self.repo, "next")
+        prov = candidates_script.code_provenance(self.repo, self.target)
+        self.assertEqual(prov["code_sha"], ahead)
+        self.assertEqual(prov["code_relation"], "ahead")
+        self.assertTrue(prov["code_contains_target"])
+        refusal = candidates_script.code_refusal(prov, self.target)
+        self.assertIn("en avance", refusal)
+        self.assertIn(self.target[:12], refusal)
+        self.assertIn("--allow-code-mismatch", refusal)
+
+    def test_a_code_behind_the_target_is_refused(self):
+        _write(self.repo, "src/ameesh/next.py", "two\n")
+        ahead = _commit(self.repo, "next")
+        _git(self.repo, "switch", "-q", "--detach", self.target)
+        prov = candidates_script.code_provenance(self.repo, ahead)
+        self.assertEqual(prov["code_relation"], "behind")
+        self.assertFalse(prov["code_contains_target"])
+        self.assertIn("antérieur", candidates_script.code_refusal(prov, ahead))
+
+    def test_an_unrelated_code_is_refused(self):
+        _git(self.repo, "switch", "-q", "--orphan", "autre")
+        _write(self.repo, "src/ameesh/autre.py", "x\n")
+        _commit(self.repo, "autre")
+        prov = candidates_script.code_provenance(self.repo, self.target)
+        self.assertNotEqual(prov["code_sha"], self.target)
+        self.assertEqual(prov["code_relation"], "diverged")
+        self.assertFalse(prov["code_contains_target"])
+        self.assertIn("sans rapport",
+                      candidates_script.code_refusal(prov, self.target))
+
+    def test_an_absent_target_is_refused(self):
+        missing = "f" * 40
+        prov = candidates_script.code_provenance(self.repo, missing)
+        self.assertEqual(prov["code_relation"], "absent")
+        self.assertIn("absente", candidates_script.code_refusal(prov, missing))
+
+    def test_a_dirty_code_tree_is_refused(self):
+        _write(self.repo, "src/ameesh/__init__.py", "modified\n")
+        prov = candidates_script.code_provenance(self.repo, self.target)
+        self.assertTrue(prov["code_dirty"])
+        self.assertEqual(prov["code_relation"], "dirty")
+        self.assertIn("non commit", candidates_script.code_refusal(prov, self.target))
+
+    def test_an_unreadable_head_is_refused(self):
+        prov = candidates_script.code_provenance(
+            os.path.join(self.tmp, "absent"), self.target)
+        self.assertEqual(prov["code_relation"], "unknown")
+        self.assertIn("inconnu", candidates_script.code_refusal(prov, self.target))
+
+
 class ReadyOutTest(unittest.TestCase):
     """Relecture cx2 B3 : un inventaire incomplet ne laisse jamais d'export."""
 
@@ -822,6 +906,21 @@ class ReadyOutTest(unittest.TestCase):
         self.tmp = tempfile.mkdtemp(prefix="ameesh-2404-ready-")
         self.addCleanup(shutil.rmtree, self.tmp, True)
         self.path = pathlib.Path(self.tmp) / "prets.txt"
+
+    def provenance(self, relation="same", sha="a" * 40):
+        return {"code_sha": sha, "code_repo": self.tmp,
+                "code_relation": relation,
+                "code_contains_target": relation in ("same", "ahead", "dirty"),
+                "code_dirty": relation == "dirty"}
+
+    def payload(self, *, errors=None):
+        return {
+            "schema": "ameesh-packet-candidates/1", "project": "ameesh",
+            "repo": self.tmp, "clone": self.tmp, "target": "main",
+            "target_head": "a" * 40, "base": "a" * 40, "base_source": "target",
+            "candidates": [], "ready": [], "waiting": [],
+            "errors": list(errors or []),
+        }
 
     def test_ready_out_removed_when_inventory_has_errors(self):
         self.path.write_text("#100\n", encoding="utf-8")
@@ -870,6 +969,8 @@ class ReadyOutTest(unittest.TestCase):
                 mock.patch.object(candidates_script.db, "connect", return_value=conn), \
                 mock.patch.object(candidates_script.merge_queue, "working_clone",
                                   return_value=(self.tmp, None)), \
+                mock.patch.object(candidates_script, "code_provenance",
+                                  return_value=self.provenance()), \
                 mock.patch.object(candidates_script.packet_candidates, "inventory",
                                   return_value=payload):
             code = candidates_script.main(
@@ -894,6 +995,8 @@ class ReadyOutTest(unittest.TestCase):
                 mock.patch.object(candidates_script.db, "connect", return_value=conn), \
                 mock.patch.object(candidates_script.merge_queue, "working_clone",
                                   return_value=(self.tmp, None)), \
+                mock.patch.object(candidates_script, "code_provenance",
+                                  return_value=self.provenance()), \
                 mock.patch.object(candidates_script.packet_candidates, "inventory",
                                   side_effect=error):
             code = candidates_script.main(
@@ -902,6 +1005,61 @@ class ReadyOutTest(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertFalse(self.path.exists())
         conn.close.assert_called_once()
+
+    def test_script_refuses_a_code_that_is_not_the_target_head(self):
+        # #3782 : le calcul d'un vieux checkout ne rend plus une liste.
+        self.path.write_text("#100\n", encoding="utf-8")
+        project = SimpleNamespace(name="ameesh", target="main")
+        conn = mock.Mock()
+        with mock.patch.object(candidates_script.config, "load",
+                               return_value=object()), \
+                mock.patch.object(candidates_script, "resolve_project",
+                                  return_value=(project, True)), \
+                mock.patch.object(candidates_script.db, "connect", return_value=conn), \
+                mock.patch.object(candidates_script.merge_queue, "working_clone",
+                                  return_value=(self.tmp, None)), \
+                mock.patch.object(candidates_script.packet_candidates, "inventory",
+                                  return_value=self.payload()), \
+                mock.patch.object(candidates_script, "code_provenance",
+                                  return_value=self.provenance("behind", "b" * 40)):
+            code = candidates_script.main(
+                ["--repo", self.tmp, "--project", "ameesh", "--target", "main",
+                 "--ready-out", str(self.path)])
+        self.assertEqual(code, 2)
+        self.assertFalse(self.path.exists())
+
+    def test_script_runs_an_assumed_mismatch_and_says_it(self):
+        project = SimpleNamespace(name="ameesh", target="main")
+        conn = mock.Mock()
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with mock.patch.object(candidates_script.config, "load",
+                               return_value=object()), \
+                mock.patch.object(candidates_script, "resolve_project",
+                                  return_value=(project, True)), \
+                mock.patch.object(candidates_script.db, "connect", return_value=conn), \
+                mock.patch.object(candidates_script.merge_queue, "working_clone",
+                                  return_value=(self.tmp, None)), \
+                mock.patch.object(candidates_script.packet_candidates, "inventory",
+                                  return_value=self.payload()), \
+                mock.patch.object(candidates_script, "code_provenance",
+                                  return_value=self.provenance("ahead", "b" * 40)), \
+                contextlib.redirect_stdout(stdout), \
+                contextlib.redirect_stderr(stderr):
+            code = candidates_script.main(
+                ["--repo", self.tmp, "--project", "ameesh", "--target", "main",
+                 "--ready-out", str(self.path), "--allow-code-mismatch"])
+        self.assertEqual(code, 0)
+        self.assertIn("en avance sur la cible", stdout.getvalue())
+        self.assertIn("DÉCALAGE ASSUMÉ", stdout.getvalue())
+        self.assertIn("AVERTISSEMENT", stderr.getvalue())
+        self.assertIn("code bbbbbbbbbbbb", self.path.read_text(encoding="utf-8"))
+
+    def test_script_render_shows_the_code_sha_next_to_the_target(self):
+        payload = self.payload()
+        payload.update(self.provenance())
+        text = candidates_script.render(payload)
+        self.assertIn("code aaaaaaaaaaaa", text)
+        self.assertIn("tête de la cible", text)
 
 
 class HoldOverrideJournalTest(unittest.TestCase):
@@ -993,6 +1151,12 @@ class HoldOverrideJournalTest(unittest.TestCase):
                                   return_value=(tmp, None)), \
                 mock.patch.object(candidates_script.packet_candidates, "inventory",
                                   return_value=self.payload()), \
+                mock.patch.object(candidates_script, "code_provenance",
+                                  return_value={"code_sha": "a" * 40,
+                                                "code_repo": tmp,
+                                                "code_relation": "same",
+                                                "code_contains_target": True,
+                                                "code_dirty": False}), \
                 mock.patch.object(candidates_script, "hold_actor",
                                   return_value="mty-amh-impl-01"), \
                 mock.patch.object(candidates_script.work, "note") as note:
