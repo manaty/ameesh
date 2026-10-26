@@ -6,7 +6,9 @@ qui bouge produit une autre clé, une ref symbolique n'est jamais cachée, et
 les lectures d'état (statut, remote, refs) ne le traversent pas. Un objet
 absent n'est pas mémorisé non plus : un fetch peut le rendre lisible plus
 tard. Les témoins ci-dessous comptent les lancements réels de `git` (le cache
-doit les faire tomber) et vérifient qu'un nouveau commit est relu.
+doit les faire tomber) et vérifient qu'un nouveau commit est relu. Les
+exclusions de #3777 (dates relatives, mailmap, describe/decorate, fichier de
+motifs) sont couvertes ici : leur sortie ne dépend pas du seul objet lu.
 """
 from __future__ import annotations
 
@@ -163,6 +165,42 @@ class GitContentCacheTest(unittest.TestCase):
         content = canon._content_cache_key(
             self.repo.root, ("log", "-1", "--format=%H", self.first), None, None)
         self.assertIsNotNone(content)
+
+    def test_a_relative_or_mailmap_format_is_not_cached(self):
+        def key(*args):
+            return canon._content_cache_key(self.repo.root, args, None, None)
+
+        for placeholder in ("%ar", "%ah", "%cr", "%ch", "%aN", "%aE",
+                            "%cN", "%cE", "%(describe)", "%(describe:tags)",
+                            "%(decorate)"):
+            self.assertIsNone(key("log", "-1", "--format=" + placeholder,
+                                  self.first), placeholder)
+        # noms, courriels et dates bruts sont dans l'objet : eux se cachent
+        for placeholder in ("%an", "%ae", "%cn", "%ce", "%at", "%ct"):
+            self.assertIsNotNone(key("log", "-1", "--format=" + placeholder,
+                                     self.first), placeholder)
+
+    def test_a_relative_date_option_is_not_cached(self):
+        def key(*args):
+            return canon._content_cache_key(self.repo.root, args, None, None)
+
+        for option in (("--date=relative",), ("--date=human",),
+                       ("--date", "relative"), ("--date", "human")):
+            self.assertIsNone(key("log", "-1", *option, self.first), option)
+            self.assertIsNone(key("show", "-s", *option, self.first), option)
+        # une date absolue ne dépend pas de l'instant de lecture
+        self.assertIsNotNone(key("log", "-1", "--date=iso", self.first))
+        self.assertIsNotNone(key("log", "-1", "--date", "iso", self.first))
+
+    def test_a_grep_patterns_file_is_not_cached(self):
+        def key(*args, stdin=None):
+            return canon._content_cache_key(self.repo.root, args, stdin, None)
+
+        self.assertIsNone(key("grep", "-f", "pats", self.first))
+        self.assertIsNone(key("grep", "--no-color", "-l", "-F", "-f", "pats",
+                              self.first))
+        # `-f -` lit stdin, qui fait partie de la clé
+        self.assertIsNotNone(key("grep", "-f", "-", self.first, stdin=b"a\n"))
 
     def test_the_cache_key_includes_the_repository(self):
         other = _Repo(os.path.join(self.tmp, "autre"))
