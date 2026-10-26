@@ -160,9 +160,14 @@ class ArchiveThenRemoveTest(_Repo):
     def test_too_big_or_nested_repository_kept_and_nothing_left(self):
         wt = self.dirty("lot-11")
         with mock.patch.object(ha, "MAX_BYTES", 4):
-            _store, _e, plan = self.run_pass(wt, {11: "merged"})
+            store, entries, plan = self.run_pass(wt, {11: "merged"})
         self.assertEqual(plan[0]["action"], "garde", plan)
         self.assertIn("not archived", plan[0]["detail"])
+        # dev3 N3: the refusal is persisted, not only planned
+        self.assertEqual(store.statuses[-1][1], "kept")
+        self.assertIn("not archived", store.statuses[-1][2])
+        kept, = [e for e in entries if e["action"] == "kept"]
+        self.assertIn("not archived", kept["detail"])
         self.assertTrue(os.path.isfile(os.path.join(wt, "notes", "todo.md")))
         self.assertFalse(os.path.exists(self.archives) and os.listdir(self.archives))
         subprocess.run(["git", "init", "-q", os.path.join(wt, "notes", "inner")], check=True)
@@ -172,6 +177,46 @@ class ArchiveThenRemoveTest(_Repo):
         self.assertTrue(os.path.isdir(wt))
         self.assertFalse(os.path.exists(self.archives) and os.listdir(self.archives))
 
+
+    def test_archive_root_unusable_keeps_and_pass_goes_on(self):
+        # dev3 B1: a file where the archive root goes (or ENOSPC, EACCES)
+        wt = self.dirty("lot-13")
+        os.makedirs(os.path.dirname(self.archives), exist_ok=True)
+        _write(self.archives, text="in the way\n")
+        store, _e, plan = self.run_pass(wt, {13: "merged"})
+        self.assertEqual(plan[0]["action"], "garde", plan)
+        self.assertIn("archive directory not created", plan[0]["detail"])
+        self.assertTrue(os.path.isfile(os.path.join(wt, "notes", "todo.md")))
+        self.assertEqual(store.statuses[-1][1], "kept")
+
+    def test_single_layer_archives_restore_with_the_manifest_command(self):
+        # dev3 B2: `git apply` of an empty patch exits 128; dev3 N1: the
+        # patches count against the size limit
+        for label, staged, unstaged, untracked in (
+                ("unstaged only", False, True, False), ("staged only", True, False, False),
+                ("untracked only", False, False, True)):
+            with self.subTest(label):
+                branch = "lot-%d" % (20 + len(label))
+                wt = self.add_worktree(branch)
+                head = _git("rev-parse", "HEAD", cwd=wt).strip()
+                if staged or unstaged:
+                    _write(os.path.join(wt, "f.txt"), text="%s\n" % label)
+                if staged:
+                    _git("add", "f.txt", cwd=wt)
+                if untracked:
+                    _write(os.path.join(wt, "notes.md"), text="draft\n")
+                with self.assertRaisesRegex(ha.ArchiveRefused, "bytes to archive"):
+                    ha.archive(wt, self.archives, retention_s=RETENTION, max_bytes=4)
+                made = ha.archive(wt, self.archives, retention_s=RETENTION, head=head)
+                with open(os.path.join(made["archive"], "manifest.json")) as fh:
+                    command = json.load(fh)["restore"]
+                target = os.path.join(self.base, "restored-" + branch)
+                proc = subprocess.run(["bash", "-c", command.replace("<path>", target)],
+                                      cwd=self.main, capture_output=True, text=True)
+                self.assertEqual(proc.returncode, 0, (command, proc.stderr))
+                self.assertEqual(
+                    _git("status", "--porcelain", cwd=target),
+                    _git("status", "--porcelain", cwd=wt))
 
     def test_conflicted_index_refused(self):
         wt = self.add_worktree("lot-12")

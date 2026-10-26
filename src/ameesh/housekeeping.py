@@ -3261,7 +3261,7 @@ def _archive_dirty_worktree(path: str, repo: str, base: dict, *, why: str, st: d
                 path, archive["root"], rules=build_artifacts.rules_of(artifacts),
                 lot=base.get("lot"), state=state or "", branch=st.get("branch") or "",
                 head=st.get("head") or "", now=now, retention_s=float(archive["retention"])))
-        except housekeeping_archive.ArchiveRefused as exc:
+        except (housekeeping_archive.ArchiveRefused, OSError) as exc:
             return "not archived: %s" % exc
         return ""
 
@@ -3648,6 +3648,9 @@ def _worktree_pass(db, host: str, *, dry_run: bool,
                         store.set_worktree_status(row["id"], "removed", done["plan"]["detail"])
                     continue
                 held_by_archive = done["plan"]
+                # dev3 N3: the refusal is the kept reason, in the status and
+                # the `kept` line (written when it changes), not only in a plan
+                detail = held_by_archive["detail"]
         if not st["clean"] or not st["integrated"] or st["submodules"]:
             plan.append(held_by_archive or dict(base, action="garde", detail=detail))
             if not dry_run and (row["status"] != "kept" or row.get("detail") != detail):

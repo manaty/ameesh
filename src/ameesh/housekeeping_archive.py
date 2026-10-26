@@ -211,18 +211,24 @@ def archive(path: str, root: str, *, rules=(), lot=None, state: str = "",
         raise ArchiveRefused("%d untracked file(s) to archive (limit %d)" % (
             len(files), max_files))
     size = _size(path, files)
-    if size > max_bytes:
-        raise ArchiveRefused("untracked files of %d bytes to archive (limit %d)" % (
-            size, max_bytes))
-    os.makedirs(root, mode=0o700, exist_ok=True)
-    os.chmod(root, 0o700)
+    # dev3 N1: the patches count too
+    if size + len(staged) + len(unstaged) > max_bytes:
+        raise ArchiveRefused("%d bytes to archive (limit %d)" % (
+            size + len(staged) + len(unstaged), max_bytes))
     stamp = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime(now))
     label = re.sub(r"[^0-9A-Za-z._-]", "_", os.path.basename(path.rstrip("/")))[:80] or "wt"
     name = "%s-lot%s-%s-%s" % (stamp, re.sub(r"[^0-9A-Za-z]", "", str(lot or "")),
                                label, secrets.token_hex(4))
     partial = os.path.join(root, PARTIAL_PREFIX + name)
     final = os.path.join(root, name)
-    os.mkdir(partial, 0o700)
+    # dev3 B1: creating the root or the partial directory may fail (ENOSPC,
+    # EACCES, a file in the way): a refusal, never an aborted pass
+    try:
+        os.makedirs(root, mode=0o700, exist_ok=True)
+        os.chmod(root, 0o700)
+        os.mkdir(partial, 0o700)
+    except OSError as exc:
+        raise ArchiveRefused("archive directory not created (%s)" % exc) from exc
     try:
         _write(os.path.join(partial, "staged.patch"), staged)
         _write(os.path.join(partial, "unstaged.patch"), unstaged)
@@ -243,12 +249,15 @@ def archive(path: str, root: str, *, rules=(), lot=None, state: str = "",
             "retain_until_ts": now + float(retention_s), "status": entries,
             "untracked": files, "untracked_bytes": size,
             "patch_bytes": len(staged) + len(unstaged),
-            "restore": "git worktree add --detach <path> %s"
-                       " && git -C <path> apply --index --binary %s/staged.patch"
-                       " && git -C <path> apply --binary %s/unstaged.patch%s"
-                       % (head or "<HEAD>", final, final,
-                          " && tar -xzf %s/untracked.tar.gz -C <path>" % final
-                          if files else "")}
+            # dev3 B2: `git apply` refuses an empty patch (exit 128): only
+            # the layers that hold something are in the command
+            "restore": " && ".join(
+                ["git worktree add --detach <path> %s" % (head or "<HEAD>")]
+                + (["git -C <path> apply --index --binary %s/staged.patch" % final]
+                   if staged else [])
+                + (["git -C <path> apply --binary %s/unstaged.patch" % final]
+                   if unstaged else [])
+                + (["tar -xzf %s/untracked.tar.gz -C <path>" % final] if files else []))}
         _write(os.path.join(partial, "manifest.json"),
                (json.dumps(manifest, indent=1, sort_keys=True) + "\n").encode())
         _fsync_dir(partial)
