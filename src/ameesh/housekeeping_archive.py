@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 """#3728 — archive, then removal, of a worktree of an ended lot kept only for
-modified or untracked files.
+modified or untracked files (#3734: or for ignored files only).
 
 The housekeeping keeps such a worktree for good (`kept — N file(s) modified
 or untracked`): 137 on ameesh-agents-2 and 147 on ameesh-agents-1 on
@@ -18,7 +18,8 @@ merged worktree (`housekeeping._remove_kept_worktree`):
   recorded HEAD; a conflicted index (unmerged entries) is refused;
 - `untracked.tar.gz`: the untracked files and the ignored ones, outside the
   regenerable build output (`artifacts` rules: node_modules, target) and the
-  caches (`EXCLUDED_NAMES`); symbolic links stored as links, never followed;
+  cache directories (`EXCLUDED_NAMES`; #3734: a file or a link so named is
+  archived); symbolic links stored as links, never followed;
 - `manifest.json`: path, branch, HEAD, lot, `git status`, the archived files,
   sizes, and `retain_until_ts` (`policy.housekeeping.dirty_archive_retention`).
 
@@ -106,12 +107,15 @@ def _excluded(top: str, rel: str, rules) -> bool:
     parts = rel.rstrip("/").split("/")
     parent = top
     for name in parts:
-        if name in EXCLUDED_NAMES or name.startswith(".ameesh-trash-"):
+        here = os.path.join(parent, name)
+        # #3734: a cache name excludes a directory only; a file or a link so
+        # named (a `.cache` note, a link to a cache) is archived
+        if (name in EXCLUDED_NAMES or name.startswith(".ameesh-trash-")) \
+                and os.path.isdir(here) and not os.path.islink(here):
             return True
-        if any(rule.matches(parent, name) for rule in rules) \
-                and os.path.isdir(os.path.join(parent, name)):
+        if any(rule.matches(parent, name) for rule in rules) and os.path.isdir(here):
             return True
-        parent = os.path.join(parent, name)
+        parent = here
     return False
 
 

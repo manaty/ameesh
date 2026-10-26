@@ -3239,16 +3239,27 @@ def _lots_ended_ts(db, idents) -> float | None:
     return max(moments) if moments else None
 
 
+def _archive_due(db, idents, archive: dict | None, *, now: float, youngest: float) -> bool:
+    """#3728 : la politique d'archivage est déclarée, TOUS les lots `idents`
+    ont fini depuis plus de `after` et le worktree est inactif depuis autant."""
+    if not archive:
+        return False
+    after = float(archive["after"])
+    ended_ts = _lots_ended_ts(db, idents)
+    return ended_ts is not None and now - ended_ts >= after and now - youngest >= after
+
+
 def _archive_dirty_worktree(path: str, repo: str, base: dict, *, why: str, st: dict, state,
                             archive: dict, now: float, dry_run: bool, artifacts, allow,
-                            lock_path, journal_path, skip_roots) -> dict:
+                            lock_path, journal_path, skip_roots,
+                            held: str = "modified or untracked files") -> dict:
     """#3728 : archive puis retrait d'un worktree gardé pour des fichiers
-    modifiés ou non suivis. `plan` (action `archivage` en essai, `retrait`,
-    `garde` ou `attend`), `entries` du journal, `removed`."""
+    modifiés ou non suivis (#3734 : ou seulement ignorés, `held`). `plan`
+    (action `archivage` en essai, `retrait`, `garde` ou `attend`), `entries`
+    du journal, `removed`."""
     from . import housekeeping_archive
     after = float(archive["after"])
-    why = "%s; kept for modified or untracked files, ended and idle for more than %s" % (
-        why, fmt_idle(after))
+    why = "%s; kept for %s, ended and idle for more than %s" % (why, held, fmt_idle(after))
     if dry_run:
         size, _whole = build_artifacts.size_of(
             path, budget=build_artifacts.Budget(build_artifacts.PASS_BUDGET_S))
@@ -3600,6 +3611,22 @@ def _worktree_pass(db, host: str, *, dry_run: bool,
                 else:
                     hold = ("processes inside (%s)" % ", ".join(held[:3])
                             if held else "")
+            if leftovers and ended and st["head"] \
+                    and _archive_due(db, idents, archive, now=now, youngest=youngest):
+                # #3734 (dev3 N2) : gardé pour des fichiers ignorés seulement
+                # (un `.env`, un `__pycache__`), lot fini depuis plus de
+                # `after` : archivé puis retiré comme un worktree modifié,
+                # mêmes gardes (en cas de doute, gardé)
+                done = _archive_dirty_worktree(
+                    path, row.get("repo") or "", base, why=why, st=st, state=state,
+                    archive=archive, now=now, dry_run=dry_run, artifacts=artifacts,
+                    allow=allow, lock_path=lock_path, journal_path=journal_path,
+                    skip_roots=skip_roots, held="ignored files only")
+                entries += done["entries"]
+                plan.append(done["plan"])
+                if done["removed"]:
+                    store.set_worktree_status(row["id"], "removed", done["plan"]["detail"])
+                continue
             if hold:
                 if ended:
                     _blocked_by_holders(blocked, hold)
@@ -3634,9 +3661,7 @@ def _worktree_pass(db, host: str, *, dry_run: bool,
         held_by_archive = None
         if archive and ended and not st["clean"] and not st["locked"] \
                 and not st["submodules"] and st["head"] and (st["pushed"] or st["integrated"]):
-            after = float(archive["after"])
-            ended_ts = _lots_ended_ts(db, idents)
-            if ended_ts is not None and now - ended_ts >= after and now - youngest >= after:
+            if _archive_due(db, idents, archive, now=now, youngest=youngest):
                 done = _archive_dirty_worktree(
                     path, row.get("repo") or "", base, why=why, st=st, state=state,
                     archive=archive, now=now, dry_run=dry_run, artifacts=artifacts,
