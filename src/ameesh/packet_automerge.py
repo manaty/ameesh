@@ -170,6 +170,28 @@ def active(rows) -> dict | None:
     return current
 
 
+def publication(db, lot: int, sha: str) -> dict:
+    """#3611 : ce que le journal du porteur dit de sa publication sur `sha`.
+
+    `requested` : une demande `ci-full-<sha>` posée par `ameesh ci run --full`
+    (marque `ci-label applied`) ; `armed` : la fusion automatique armée sur
+    cette tête (`active`), avec sa PR et sa cible. Lecture locale seulement :
+    la lecture porte sur les seules notes `ci-label `, comme `marks` (#3279)."""
+    from . import ci
+    sha = str(sha or "").strip().lower()
+    requested = False
+    for ev in work.events_noted(db, int(lot), "ci-label ", 0.0) or ():
+        m = ci.REQUEST_RE.match((ev.get("note") or "").strip())
+        if m and m.group("state") == "applied" and m.group("mode") == "full" \
+                and fire._same_head(m.group("sha"), sha):
+            requested = True
+    current = active(marks(db, lot))
+    armed = bool(current and fire._same_head(current["sha"], sha))
+    return {"requested": requested, "armed": armed,
+            "pr": current["pr"] if armed else None,
+            "base": current["base"] if armed else ""}
+
+
 def _note(db, lot: int, state: str, slug: str, number: int, sha: str, rest: str,
           actor: str) -> None:
     work.note(db, int(lot), "auto-merge %s repo=%s pr=%d sha=%s %s"
