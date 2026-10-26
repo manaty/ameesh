@@ -98,13 +98,24 @@ INCONCLUSIVE_RE = re.compile(
     r"ModuleNotFoundError: No module named 'psycopg)",
     re.IGNORECASE,
 )
+#: le **message** d'une exception d'environnement (sans les noms de types :
+#: un `AssertionError: expected OperationalError` reste un rouge réel)
+ENV_MESSAGE_RE = re.compile(
+    r"could not connect|connection refused|server closed the connection|"
+    r"database system is starting up|psql: error|"
+    r"No such file or directory: 'psql'|"
+    r"could not translate host name|Temporary failure in name resolution|"
+    r"No module named 'psycopg'",
+    re.IGNORECASE,
+)
 #: une ligne de résumé unittest
 RAN_RE = re.compile(r"^Ran (\d+) tests? in ", re.MULTILINE)
 OK_RE = re.compile(r"^OK(?: \(skipped=(\d+)\))?", re.MULTILINE)
 FAILED_SUMMARY_RE = re.compile(r"^FAILED \((.*?)\)", re.MULTILINE)
 FAIL_HEADER_RE = re.compile(r"^FAIL: ", re.MULTILINE)
 ERROR_HEADER_RE = re.compile(r"^ERROR: .*$", re.MULTILINE)
-EXCEPTION_LINE_RE = re.compile(r"^[\w.]+(?:Error|Exception):.*$", re.MULTILINE)
+EXCEPTION_LINE_RE = re.compile(
+    r"^([\w.]+(?:Error|Exception)):\s*(.*)$", re.MULTILINE)
 BLOCK_END_RE = re.compile(r"^=+$", re.MULTILINE)
 
 
@@ -179,10 +190,24 @@ class TestRun:
 
     @staticmethod
     def _error_is_environment(block: str) -> bool:
-        """La dernière exception du bloc est-elle une panne d'environnement ?"""
+        """La dernière exception du bloc est-elle une panne d'environnement ?
+
+        Le **nom du type** ne suffit pas : `AssertionError: expected
+        OperationalError` est un rouge réel. On lit le message de la dernière
+        exception, et `AssertionError` est toujours réelle. Sans ligne
+        d'exception (sortie psql), on cherche un motif d'infrastructure.
+        """
         lines = EXCEPTION_LINE_RE.findall(block)
         if lines:
-            return bool(INCONCLUSIVE_RE.search(lines[-1]))
+            kind, message = lines[-1]
+            name = kind.rsplit(".", 1)[-1]
+            if name == "AssertionError":
+                return False
+            if ENV_MESSAGE_RE.search(message):
+                return True
+            if name in ("ModuleNotFoundError", "ImportError") and "psycopg" in message:
+                return True
+            return False
         return bool(INCONCLUSIVE_RE.search(block))
 
     @property

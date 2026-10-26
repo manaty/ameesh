@@ -199,6 +199,23 @@ class PaquetAutoBanc(unittest.TestCase):
         self.assertEqual(faulty, [1])
         self.assertFalse(runs[0].inconclusive)
 
+    def test_error_assertion_avec_motif_environment_est_rouge(self) -> None:
+        # Le nom du type prime : une AssertionError qui cite « OperationalError »
+        # dans son message reste un rouge réel, pas une panne d'environnement.
+        run = paquet_auto.TestRun(
+            "unité #1", ["tests.test_unit"], 1,
+            "======================================================================\n"
+            "ERROR: test_regression (tests.test_unit.TestX)\n"
+            "----------------------------------------------------------------------\n"
+            "Traceback (most recent call last):\n"
+            "  ...\n"
+            "AssertionError: expected OperationalError: connection refused\n"
+            "\n"
+            "FAILED (errors=1)\n",
+            0.1)
+        self.assertTrue(run.real_failure)
+        self.assertFalse(run.inconclusive)
+
     def test_contrat_mixte_est_rouge(self) -> None:
         composition = paquet_auto.Composition(
             units=[paquet_auto.Unit(1, "0" * 40, "1" * 40)],
