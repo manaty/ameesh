@@ -59,6 +59,24 @@ class WorkDependencies(abc.ABC):
         """
 
     @abc.abstractmethod
+    def landings_on_vehicle(self, vehicle_id: int) -> list[dict]:
+        """#3641: declarations pinned to this vehicle, one row per unit.
+
+        Read by the freeze path to carry a declaration to a new head when the
+        vehicle moved forward: `work_item_id`, `vehicle_id`, `pinned_sha`,
+        `until_on`, `created_by`.
+        """
+
+    @abc.abstractmethod
+    def repin_landing(self, item_id: int, vehicle_id: int, pinned_sha: str, *,
+                      actor: str) -> bool:
+        """#3641: move one still-pinned declaration to the vehicle's new head.
+
+        Journaled on the unit lot like a declaration. False when the row is
+        gone or now names another vehicle (the caller reads it again).
+        """
+
+    @abc.abstractmethod
     def release_unassigned(self, item_ids: Sequence[int], *, actor: str) -> list[int]:
         """Return still-unassigned blocked candidates to intake and journal them.
 

@@ -707,6 +707,7 @@ def milestone(
     note = "\n".join(
         line for line in str(note or "").splitlines()
         if not FREEZE_MACHINE_LINE.match(line.strip())).strip()
+    freeze_info: dict = {}
     if kind == "verdict":
         # #2674 : refuser à l'écriture un avis qui ne nomme pas la tête relue.
         sha = reviewed_head(db, item, sha, repo=repo)
@@ -715,7 +716,6 @@ def milestone(
         # résoudrait dans son clone. Le cache de fetch est partagé avec la
         # marque (5) : la cible publiée n'est rafraîchie qu'une fois.
         refreshed: dict = {}
-        freeze_info: dict = {}
         sha = freeze_head(db, item, sha, repo=repo, refreshed=refreshed,
                           outcome=freeze_info)
         # #3589 : un lot empilé sur un parent ouvert ne gèle pas des copies
@@ -861,4 +861,16 @@ def milestone(
         # the internal `with` has committed: the readable thread can leave now
         for record in drain:
             record(db.cfg, db)
+    if kind == "frozen":
+        # #3641 : un regel de véhicule à unités constantes ne doit pas faire
+        # tomber les déclarations d'atterrissage de ses unités (SLO
+        # `verdict_merge` fantôme). Une tête qui avance reporte la déclaration ;
+        # une réécriture prévient le déclarant. Jamais d'échec du gel pour ça.
+        try:
+            from . import work_dependencies
+            work_dependencies.repin_after_freeze(
+                db, item_id, sha.strip(),
+                repo=str(freeze_info.get("repo") or repo or ""), actor=actor or "")
+        except Exception:  # noqa: BLE001 - le gel est écrit ; le report se répare
+            pass
     return row

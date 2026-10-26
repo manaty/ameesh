@@ -60,7 +60,12 @@ A lot is stale when it is open and inactive beyond the configured threshold
   hold), the lot is not stale. A new freeze, a vehicle left without a freeze,
   a vehicle moved to `blocked`, `ameesh work landing <id> --clear`, a closed
   or merged vehicle, or a past deadline all give the signal back: the pilot
-  renews the declaration explicitly on the new head. A
+  renews the declaration explicitly on the new head. Since #3641, a re-freeze
+  whose new head descends from the pinned one carries the declaration to the
+  new head (journaled like a declaration): a vehicle re-frozen with the same
+  units no longer makes a lot it carries look stale. A rewritten head or one
+  from another lineage leaves the declaration in place but warns its author,
+  who renews it explicitly. A
   self, unknown or finished vehicle does not suppress the alert; nor does
   prose, a bare admission to a packet or an old transport chain.
 

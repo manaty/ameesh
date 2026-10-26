@@ -163,6 +163,82 @@ def clear_landing(db, item_id, *, actor):
     return storage.of(db).work_dependencies.clear_landing(item_id, actor=actor)
 
 
+def _is_ancestor(repo: str, ancestor: str, descendant: str) -> bool:
+    """Vrai si `ancestor` est un ancêtre de `descendant` dans `repo`."""
+    try:
+        from . import plan_git
+        return plan_git._is_ancestor(repo, ancestor, descendant)
+    except Exception:  # noqa: BLE001 - un dépôt illisible ne prouve rien
+        return False
+
+
+def _notify_landing_lost(db, row, frozen_sha):
+    """#3641 : prévient le déclarant quand sa déclaration ne suit pas le regel.
+
+    Le journal et le courrier portent sur le VÉHICULE, jamais sur le lot
+    déclaré : une note ou un courrier lié au lot déclaré compterait comme son
+    activité récente et effacerait le signal stale que la déclaration perdue
+    doit justement rendre (#1945, revue B)."""
+    from . import mail
+    item_id = int(row["work_item_id"])
+    vehicle_id = int(row["vehicle_id"])
+    pinned = str(row.get("pinned_sha") or "").strip()
+    recipient = str(row.get("created_by") or "").strip()
+    text = ("Lot #%d: vehicle #%d was re-frozen on %s; the pinned head %s is not "
+            "an ancestor, so the planned landing no longer holds. Renew it "
+            "(`ameesh work landing %d --vehicle %d --until YYYY-MM-DD`) or clear it."
+            % (item_id, vehicle_id, frozen_sha[:12], pinned[:12], item_id, vehicle_id))
+    try:
+        work.note(db, vehicle_id,
+                  "Landing declaration of lot #%d invalidated: vehicle re-frozen "
+                  "on %s, pinned head %s is not an ancestor."
+                  % (item_id, frozen_sha[:12], pinned[:12]),
+                  actor=work.SYSTEM_SENDER)
+    except Exception:  # noqa: BLE001 - un journal en échec ne défait pas le gel
+        pass
+    if not recipient or recipient.startswith(work.HUMAN_PREFIX) \
+            or recipient == work.SYSTEM_SENDER:
+        return
+    try:
+        mail.send(db, work.SYSTEM_SENDER, recipient, text, kind="event",
+                  work_item_id=str(vehicle_id))
+    except Exception:  # noqa: BLE001 - destinataire inconnu ou courrier indisponible
+        pass
+
+
+def repin_after_freeze(db, vehicle_id, frozen_sha, *, repo="", actor=""):
+    """#3641 : un regel du véhicule qui garde ses unités garde les déclarations.
+
+    Une déclaration d'atterrissage est épinglée à une tête de gel ; un nouveau
+    gel la rendait caduque, et le lot porté retombait en SLO `verdict_merge`
+    alors qu'il attendait toujours le même paquet (#3619/#3616, #3627). Si la
+    nouvelle tête descend de la tête épinglée, le véhicule a seulement avancé :
+    la déclaration est reportée sur la nouvelle tête, avec une ligne de journal.
+    Sinon — réécriture, recomposition ou tête d'une autre lignée — elle reste
+    inchangée et le déclarant est prévenu (journal du lot et courrier).
+
+    Ne lit que `work_landings` et, pour l'ascendance, le dépôt qui a résolu le
+    gel ; sans dépôt lisible, aucune déclaration n'est reportée (on prévient).
+    """
+    st = storage.of(db)
+    rows = st.work_dependencies.landings_on_vehicle(int(vehicle_id))
+    result = {"pinned": [], "notified": []}
+    for row in rows:
+        item_id = int(row["work_item_id"])
+        pinned = str(row.get("pinned_sha") or "").strip()
+        if not pinned or pinned == frozen_sha:
+            continue
+        if repo and _is_ancestor(repo, pinned, frozen_sha) \
+                and st.work_dependencies.repin_landing(
+                    item_id, int(vehicle_id), frozen_sha,
+                    actor=actor or work.SYSTEM_SENDER):
+            result["pinned"].append(item_id)
+            continue
+        result["notified"].append(item_id)
+        _notify_landing_lost(db, row, frozen_sha)
+    return result
+
+
 def landings(db, item_ids):
     """`{lot: ligne}` des atterrissages déclarés (lecture groupée)."""
     return {int(row["work_item_id"]): row

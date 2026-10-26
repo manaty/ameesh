@@ -229,6 +229,37 @@ class WorkDependencies(Contract):
                 tx, item_id, "Landing cleared: vehicle #%d" % int(removed[0]["vehicle_id"]), actor)
             return True
 
+    def landings_on_vehicle(self, vehicle_id):
+        """#3641 : les déclarations épinglées à ce véhicule (lecture groupée)."""
+        return self.db.query("""
+            SELECT work_item_id, vehicle_id, pinned_sha,
+                   until_on::text AS until_on, created_by
+              FROM work_landings
+             WHERE vehicle_id = %s
+             ORDER BY work_item_id""", (int(vehicle_id),))
+
+    def repin_landing(self, item_id, vehicle_id, pinned_sha, *, actor):
+        """#3641 : reporte une déclaration sur la nouvelle tête du véhicule.
+
+        Le geste est celui d'un gel antérieur à nouveau ancêtre direct : il ne
+        s'applique qu'à la ligne encore épinglée au véhicule. Rend False si la
+        déclaration a disparu ou changé de véhicule entre-temps ; le journal du
+        lot porte la nouvelle tête, comme une déclaration."""
+        with self.db.transaction() as tx:
+            tx.execute(_LOCK)                 # même verrou que le graphe et les landings
+            rows = tx.query(
+                "UPDATE work_landings SET pinned_sha = %s"
+                " WHERE work_item_id = %s AND vehicle_id = %s"
+                " RETURNING work_item_id",
+                (pinned_sha, int(item_id), int(vehicle_id)))
+            if not rows:
+                return False
+            self._landing_journal(
+                tx, int(item_id),
+                "Landing re-pinned after the vehicle re-freeze: vehicle #%d frozen %s"
+                % (int(vehicle_id), pinned_sha[:12]), actor)
+            return True
+
     def landings_for(self, item_ids):
         ids = sorted({int(i) for i in item_ids})
         if not ids:
