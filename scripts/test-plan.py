@@ -1500,6 +1500,39 @@ def _overhead(card: dict | None, driver: str) -> float:
     return facteur if facteur > 0 else 1.0
 
 
+def _instant(value) -> datetime.datetime | None:
+    """Un horodatage ISO de carte ou de table, ou None s'il est illisible.
+
+    Un horodatage sans fuseau (anciennes cartes) est lu comme UTC : la
+    comparaison `_table_fresh` ne doit pas lever entre naïf et conscient.
+    """
+    if not value:
+        return None
+    try:
+        instant = datetime.datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if instant.tzinfo is None:
+        instant = instant.replace(tzinfo=datetime.timezone.utc)
+    return instant
+
+
+def _table_fresh(mesurees: dict, card: dict | None) -> bool:
+    """#3754 : la table `durees.json` est-elle plus récente que la carte ?
+
+    La table est régénérée par une ci-full réelle (durées sans couverture,
+    sous la charge de la CI) ; la carte est mesurée sous couverture et peut
+    avoir 48 h. Quand la table est plus récente, c'est elle qui décrit le
+    mieux le découpage ; sinon la carte garde la priorité (#1476). Une table
+    sans `_generated` (ancien format) ne prend jamais la priorité.
+    """
+    table = _instant(mesurees.get("_generated"))
+    if table is None:
+        return False
+    carte = _instant(card.get("genere") if card else None)
+    return carte is None or table > carte
+
+
 def weights(modules: list[str], driver: str, card: dict | None) -> dict[str, float]:
     table = None
     if card:
@@ -1522,12 +1555,27 @@ def weights(modules: list[str], driver: str, card: dict | None) -> dict[str, flo
     # #2397 : la table ne comble ces trous qu'à l'échelle de la carte (sous
     # couverture) : son `surcout` la convertit, au lieu de mélanger une durée
     # pleine suite et une durée sous couverture dans le même découpage.
-    if table is not None and parts.TABLE.exists():
-        mesurees = json.loads(parts.TABLE.read_text(encoding="utf-8"))
+    # #3754 : le dernier relevé gagne. Une table régénérée depuis une ci-full
+    # réelle (clé `_generated`) est plus proche des durées du job que la carte
+    # sous couverture : elle passe devant, et la carte ne comble que les
+    # modules qu'elle ne mesure pas. Tant que la carte est plus récente, le
+    # comportement de #1476 est inchangé.
+    mesurees = (json.loads(parts.TABLE.read_text(encoding="utf-8"))
+                if parts.TABLE.exists() else {})
+    statique = {d: dict(v) for d, v in mesurees.items()
+                if isinstance(v, dict) and d != "tests"}
+    if statique and _table_fresh(mesurees, card):
+        complete = {d: {m: (float(v) if isinstance(v, (int, float)) else v)
+                        for m, v in valeurs.items()}
+                    for d, valeurs in statique.items()}
+        for d, valeurs in (table or {}).items():
+            cible = complete.setdefault(d, {})
+            for module, duree in valeurs.items():
+                cible.setdefault(module, duree)
+        table = complete
+    elif table is not None and statique:
         complete = {}
-        for d, valeurs in mesurees.items():
-            if not isinstance(valeurs, dict):
-                continue  # `_source` et autres métadonnées de la table
+        for d, valeurs in statique.items():
             facteur = _overhead(card, d)
             complete[d] = {m: (float(v) * facteur if isinstance(v, (int, float)) else v)
                            for m, v in valeurs.items()}
