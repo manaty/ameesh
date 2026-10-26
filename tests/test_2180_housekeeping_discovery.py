@@ -197,7 +197,7 @@ class DiscoveryTest(PgTestCase):
         branch = "lot/%s-current" % lot
         original = hk.list_worktrees
 
-        def listing(cwd):
+        def listing(cwd, budget=None):
             rows = original(cwd)
             _git("checkout", "-q", "-b", branch, cwd=path)
             _git("commit", "-q", "--allow-empty", "-m", "new HEAD", cwd=path)

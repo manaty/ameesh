@@ -201,3 +201,20 @@ class HousekeepingBlockedTest(PgTestCase):
         self.assertIn("housekeeping blocked on this host", alert["detail"])
         self.assertIn("493 worktree(s) of ended lots", alert["detail"])
         self.assertIn("23223 gpg-agent", alert["detail"])
+
+    def test_host_disk_soon_full_cites_a_held_host_pass(self):
+        """#3802 B/P1 (cx1) : disque bas ET verrou host-pass bloqué — les
+        deux conditions de l'alerte combinées ; `menage_mod` doit être
+        importé dans la fonction, sinon NameError au lieu de l'alerte."""
+        limits = resources.thresholds(None)
+        low = reading(10 * GIB)
+        self.store.log("pc", [{
+            "kind": "host_pass", "action": "blocked",
+            "path": os.path.join(self.root, "host-pass.lock"),
+            "detail": "pass held",
+            "data": {"since": time.time() - 2 * HOUR, "pid": 4242,
+                     "runner": "runner-a", "phase": "worktrees"}}], actor="test")
+        alert = exploitation._disk_soon_full_alert(self.db, low, limits)
+        self.assertEqual(alert["type"], "host_disk_soon_full")
+        self.assertIn("no housekeeping pass can run", alert["detail"])
+        self.assertIn("held by runner-a (pid 4242) for", alert["detail"])

@@ -355,7 +355,8 @@ def _inventory_top(path: str) -> tuple[bool, str]:
     return stat.S_ISDIR(st.st_mode), ""
 
 
-def _dependency_inventory(cfg, roots, agents, rules) -> tuple[list[tuple[str, str]], bool, str]:
+def _dependency_inventory(cfg, roots, agents, rules, *,
+                          budget_s: float | None = None) -> tuple[list[tuple[str, str]], bool, str]:
     """Every Git copy whose alternates could depend on a candidate: (copies, complete, why).
 
     Perimeter: the work roots, the radar/train trees and the registered
@@ -372,7 +373,9 @@ def _dependency_inventory(cfg, roots, agents, rules) -> tuple[list[tuple[str, st
     seen: set[str] = set()
     walked: set[str] = set()
     copies: list[tuple[str, str]] = []
-    budget = build_artifacts.Budget(DEPENDENCY_BUDGET_S)
+    seconds = DEPENDENCY_BUDGET_S if budget_s is None \
+        else max(0.0, min(DEPENDENCY_BUDGET_S, float(budget_s)))
+    budget = build_artifacts.Budget(seconds)
     opened = 0
 
     def add(path: str) -> tuple[str, str]:
@@ -537,7 +540,8 @@ def _objects_dir(repo: str) -> str:
     return objects
 
 
-def _removal_check(path: str, cfg, rules, allow, roots, agents) -> str:
+def _removal_check(path: str, cfg, rules, allow, roots, agents,
+                   budget_s: float | None = None) -> str:
     """Why the clone must stay, right before it is renamed ('' to go).
 
     The dependency inventory is read again, whole: a bounded or unreadable
@@ -552,7 +556,8 @@ def _removal_check(path: str, cfg, rules, allow, roots, agents) -> str:
         return saved
     if not _objects_dir(path):
         return "candidate object directory unreadable"
-    copies, complete, why = _dependency_inventory(cfg, roots, agents, rules)
+    copies, complete, why = _dependency_inventory(cfg, roots, agents, rules,
+                                                  budget_s=budget_s)
     if not complete:
         return "dependency inventory incomplete (%s)" % why
     dependents, doubt = _dependents(copies, [path])
@@ -564,7 +569,7 @@ def _removal_check(path: str, cfg, rules, allow, roots, agents) -> str:
 
 
 def _remove(path: str, *, cfg, rules, allow, roots, agents, lock_path, journal_path,
-            skip_roots) -> tuple[str, int, str]:
+            skip_roots, budget_s: float | None = None) -> tuple[str, int, str]:
     """Remove one clone under the host lock and trash journal."""
     if not lock_path or not journal_path:
         return "garde", 0, "neither lock nor housekeeping journal"
@@ -573,7 +578,9 @@ def _remove(path: str, *, cfg, rules, allow, roots, agents, lock_path, journal_p
         return "attend", 0, "another pass is deleting on the host"
     try:
         journal = build_artifacts.Journal(journal_path)
-        budget = build_artifacts.Budget(build_artifacts.PASS_BUDGET_S)
+        seconds = build_artifacts.PASS_BUDGET_S if budget_s is None \
+            else max(0.0, min(build_artifacts.PASS_BUDGET_S, float(budget_s)))
+        budget = build_artifacts.Budget(seconds)
         real = _real(path)
         ident = build_artifacts.identity(real)
         parent_id = build_artifacts.identity(os.path.dirname(real))
@@ -583,7 +590,10 @@ def _remove(path: str, *, cfg, rules, allow, roots, agents, lock_path, journal_p
             return "garde", 0, "directory unreadable"
 
         def check() -> str:
-            return _removal_check(path, cfg, rules, allow, roots, agents)
+            # #3802 B1 (cx2) : chaque inventaire de reprise reçoit le temps
+            # qui reste au retrait, pas le budget initial déjà consommé.
+            return _removal_check(path, cfg, rules, allow, roots, agents,
+                                  budget_s=budget.remaining())
 
         try:
             done = build_artifacts.remove_worktree_dir(
@@ -604,16 +614,22 @@ def _remove(path: str, *, cfg, rules, allow, roots, agents, lock_path, journal_p
 
 def reap(db, host: str, cfg, *, roots, agents: dict, protected, dry_run: bool,
          now: float, artifacts=None, allow=(), lock_path: str | None = None,
-         journal_path: str | None = None, skip_roots=()) -> tuple[list[dict], list[dict], list[str]]:
+         journal_path: str | None = None, skip_roots=(),
+         budget_s: float | None = None) -> tuple[list[dict], list[dict], list[str]]:
     """Inventory the ad-hoc clones of a host's work roots: (entries, plan, skipped).
 
     `agents` maps a registered agent name to its working directory;
     `protected` holds the working directories of this host (never removed
     or entered). Dry run writes nothing and returns the same plan a real
-    pass would act on.
+    pass would act on. `budget_s` (#3802) borne l'inventaire profond (walks
+    des racines de travail) et les retraits par le temps qui reste au
+    passage, réserve déduite par l'appelant ; un inventaire coupé est
+    incomplet, donc rien n'est retiré.
     """
     if not roots or not os.path.isdir(cfg.state_dir):
         return [], [], []
+    if budget_s is not None and budget_s <= 0:
+        return [], [], ["clones: pass budget reached, nothing removed"]
     entries: list[dict] = []
     plan: list[dict] = []
     skipped: list[str] = []
@@ -631,6 +647,12 @@ def reap(db, host: str, cfg, *, roots, agents: dict, protected, dry_run: bool,
     except Exception:
         skipped.append("clones: tracked worktrees unreadable, nothing removed")
         return [], [], skipped
+    # #3802 B1/cx2 : l'inventaire profond (walks de /home/ameesh/work) est
+    # borné par le budget du passage, pas par son seul plafond de 60 s ; il
+    # tourne sous le verrou host-pass, donc il ne doit pas manger la réserve.
+    seconds = CLONE_BUDGET_S if budget_s is None \
+        else max(0.0, min(CLONE_BUDGET_S, float(budget_s)))
+    deadline = time.monotonic() + seconds
     inventory, inventory_complete, inventory_why = _clones_under(roots)
     if not inventory:
         if not inventory_complete:
@@ -643,8 +665,12 @@ def reap(db, host: str, cfg, *, roots, agents: dict, protected, dry_run: bool,
     dependencies_complete = True
     dependencies_why = ""
     if inventory_complete:
+        # #3802 B1 (cx2) : le walk des candidats a déjà consommé une part du
+        # passage ; l'inventaire des dépendances reçoit le temps qui reste,
+        # jamais le budget initial.
         copies, dependencies_complete, dependencies_why = _dependency_inventory(
-            cfg, roots, agents, rules)
+            cfg, roots, agents, rules,
+            budget_s=max(0.0, deadline - time.monotonic()))
         if not dependencies_complete:
             skipped.append("clones: dependency inventory incomplete (%s); nothing "
                            "removed" % dependencies_why)
@@ -664,7 +690,6 @@ def reap(db, host: str, cfg, *, roots, agents: dict, protected, dry_run: bool,
             dependents, alternates_doubt = _dependents(copies, candidates)
             if alternates_doubt:
                 skipped.append("clones: %s; nothing removed" % alternates_doubt)
-    deadline = time.monotonic() + CLONE_BUDGET_S
     inspected = 0
     for path in inventory:
         if inspected >= CLONE_LIMIT or time.monotonic() >= deadline:
@@ -816,7 +841,8 @@ def reap(db, host: str, cfg, *, roots, agents: dict, protected, dry_run: bool,
             continue
         outcome, freed, note = _remove(
             path, cfg=cfg, rules=rules, allow=allow, roots=roots, agents=agents,
-            lock_path=lock_path, journal_path=journal_path, skip_roots=skip_roots)
+            lock_path=lock_path, journal_path=journal_path, skip_roots=skip_roots,
+            budget_s=max(0.0, deadline - time.monotonic()))
         if outcome in ("removed", "partial"):
             detail = "%s: %s" % (detail, "removed (logged trash)" if outcome == "removed"
                                 else "partly removed")
