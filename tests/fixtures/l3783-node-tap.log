@@ -1,0 +1,83 @@
+# Extrait réel du job « scripts » du run 40354337937 (manaty/nexlink, 2026-10-26) :
+# https://github.com/manaty/nexlink/actions/runs/40354337937 — TAP de node --test.
+2026-10-26T15:58:08.9023089Z # Subtest: CI-JOB-TIMEOUTS: every job carries a bounded timeout-minutes
+2026-10-26T15:58:08.9024484Z not ok 107 - CI-JOB-TIMEOUTS: every job carries a bounded timeout-minutes
+2026-10-26T15:58:08.9025314Z   ---
+2026-10-26T15:58:08.9025838Z   duration_ms: 204.329155
+2026-10-26T15:58:08.9026423Z   type: 'test'
+2026-10-26T15:58:08.9027607Z   location: '/home/runner/r4/_work/nexlink/nexlink/scripts/__tests__/ci-job-timeouts.test.mjs:152:1'
+2026-10-26T15:58:08.9028713Z   failureType: 'testCodeFailure'
+2026-10-26T15:58:08.9029340Z   error: |-
+2026-10-26T15:58:08.9029944Z     timeout-minutes outside [5, 180] minutes:
+2026-10-26T15:58:08.9030703Z       backend-suite.yml:backend = 2
+2026-10-26T15:58:08.9031354Z     + actual - expected
+2026-10-26T15:58:08.9031896Z     
+2026-10-26T15:58:08.9032370Z     + [
+2026-10-26T15:58:08.9032935Z     +   'backend-suite.yml:backend = 2'
+2026-10-26T15:58:08.9033902Z     + ]
+2026-10-26T15:58:08.9034896Z     - []
+2026-10-26T15:58:08.9035377Z     
+2026-10-26T15:58:08.9035862Z   code: 'ERR_ASSERTION'
+2026-10-26T15:58:08.9036440Z   name: 'AssertionError'
+2026-10-26T15:58:08.9037216Z   expected:
+2026-10-26T15:58:08.9037741Z   actual:
+2026-10-26T15:58:08.9038330Z     0: 'backend-suite.yml:backend = 2'
+2026-10-26T15:58:08.9039426Z   operator: 'deepStrictEqual'
+2026-10-26T15:58:08.9040840Z   stack: |-
+2026-10-26T15:58:08.9043005Z     TestContext.<anonymous> (file:///home/runner/r4/_work/nexlink/nexlink/scripts/__tests__/ci-job-timeouts.test.mjs:155:10)
+2026-10-26T15:58:08.9044743Z     Test.runInAsyncScope (node:async_hooks:214:14)
+2026-10-26T15:58:08.9045617Z     Test.run (node:internal/test_runner/test:1047:25)
+2026-10-26T15:58:08.9046981Z     Test.start (node:internal/test_runner/test:944:17)
+2026-10-26T15:58:08.9048084Z     startSubtestAfterBootstrap (node:internal/test_runner/harness:296:17)
+2026-10-26T15:58:08.9049296Z   ...
+2026-10-26T15:58:08.9050458Z # Subtest: CI-JOB-TIMEOUTS (\#861): null, string and list jobs are reported, not skipped
+2026-10-26T15:58:08.9101116Z   type: 'test'
+2026-10-26T15:58:08.9101617Z   ...
+2026-10-26T15:58:08.9102554Z # Subtest: the fail-closed wiring bites: dropping the plan from the terminal is caught
+2026-10-26T15:58:08.9104024Z not ok 118 - the fail-closed wiring bites: dropping the plan from the terminal is caught
+2026-10-26T15:58:08.9104964Z   ---
+2026-10-26T15:58:08.9105470Z   duration_ms: 6.63121
+2026-10-26T15:58:08.9106022Z   type: 'test'
+2026-10-26T15:58:08.9107157Z   location: '/home/runner/r4/_work/nexlink/nexlink/scripts/__tests__/ci-lot-plan.test.mjs:444:1'
+2026-10-26T15:58:08.9108239Z   failureType: 'testCodeFailure'
+2026-10-26T15:58:08.9108986Z   error: 'the mutation must be observable'
+2026-10-26T15:58:08.9109680Z   code: 'ERR_ASSERTION'
+2026-10-26T15:58:08.9110260Z   name: 'AssertionError'
+2026-10-26T15:58:08.9111124Z   expected: true
+2026-10-26T15:58:08.9111710Z   actual: false
+2026-10-26T15:58:08.9112247Z   operator: '=='
+2026-10-26T15:58:08.9112763Z   stack: |-
+2026-10-26T15:58:08.9113965Z     TestContext.<anonymous> (file:///home/runner/r4/_work/nexlink/nexlink/scripts/__tests__/ci-lot-plan.test.mjs:463:12)
+2026-10-26T15:58:08.9115274Z     Test.runInAsyncScope (node:async_hooks:214:14)
+2026-10-26T15:58:08.9116131Z     Test.run (node:internal/test_runner/test:1047:25)
+2026-10-26T15:58:08.9117327Z     Test.processPendingSubtests (node:internal/test_runner/test:744:18)
+2026-10-26T15:58:08.9118408Z     Test.postRun (node:internal/test_runner/test:1173:19)
+2026-10-26T15:58:08.9119268Z     Test.run (node:internal/test_runner/test:1101:12)
+2026-10-26T15:58:08.9120252Z     async Test.processPendingSubtests (node:internal/test_runner/test:744:7)
+2026-10-26T15:58:08.9121138Z   ...
+2026-10-26T15:58:08.9122192Z # Subtest: the plan workflow announces a pending for every due part without one, and nothing else
+2026-10-26T15:58:20.8734019Z # Subtest: CI-TMPDIR (\#686): the /tmp-heavy workflows keep their temp files on the runner
+2026-10-26T15:58:20.8734980Z not ok 250 - CI-TMPDIR (\#686): the /tmp-heavy workflows keep their temp files on the runner
+2026-10-26T15:58:20.8735461Z   ---
+2026-10-26T15:58:20.8735692Z   duration_ms: 1.213334
+2026-10-26T15:58:20.8735960Z   type: 'test'
+2026-10-26T15:58:20.8736520Z   location: '/home/runner/r4/_work/nexlink/nexlink/scripts/__tests__/ci-self-hosted.test.mjs:1145:1'
+2026-10-26T15:58:20.8737375Z   failureType: 'testCodeFailure'
+2026-10-26T15:58:20.8737895Z   error: 'backend-suite.yml: backend never publishes TMPDIR=${{ runner.temp }}'
+2026-10-26T15:58:20.8738390Z   code: 'ERR_ASSERTION'
+2026-10-26T15:58:20.8738678Z   name: 'AssertionError'
+2026-10-26T15:58:20.8738958Z   expected: true
+2026-10-26T15:58:20.8739226Z   operator: '=='
+2026-10-26T15:58:20.8739483Z   stack: |-
+2026-10-26T15:58:20.8740133Z     TestContext.<anonymous> (file:///home/runner/r4/_work/nexlink/nexlink/scripts/__tests__/ci-self-hosted.test.mjs:1157:14)
+2026-10-26T15:58:20.8740895Z     Test.runInAsyncScope (node:async_hooks:214:14)
+2026-10-26T15:58:20.8741389Z     Test.run (node:internal/test_runner/test:1047:25)
+2026-10-26T15:58:20.8741949Z     Test.processPendingSubtests (node:internal/test_runner/test:744:18)
+2026-10-26T15:58:20.8742665Z     Test.postRun (node:internal/test_runner/test:1173:19)
+2026-10-26T15:58:20.8743132Z     Test.run (node:internal/test_runner/test:1101:12)
+2026-10-26T15:58:20.8743759Z     async Test.processPendingSubtests (node:internal/test_runner/test:744:7)
+2026-10-26T15:58:20.8744210Z   ...
+2026-10-26T15:58:20.8744640Z # Subtest: CI-RUNNER: setup-node caches npm on the GitHub fallback only
+2026-10-26T15:58:20.8745288Z ok 251 - CI-RUNNER: setup-node caches npm on the GitHub fallback only
+2026-10-26T15:58:20.8745695Z   ---
+2026-10-26T16:00:07.3042222Z # fail 3
