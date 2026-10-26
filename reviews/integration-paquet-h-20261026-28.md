@@ -70,8 +70,17 @@ Note du lot #3681 du 26/10 11:08Z (mesh-design, pilote) :
 | 7 | #3693 | `0b10ea4f74ca` | `73b5a3803a87` |
 | 8 | #3728 | `b2bad7843165` | `d07161594e36` |
 
-Les 8 unités sont des fusions propres : aucun conflit mécanique, aucune
-résolution d'union, aucune adaptation de test. #3682 précède #3685 (même
+Les 8 unités sont des fusions propres : aucun conflit textuel, aucune
+résolution d'union. Une seule **adaptation mécanique** a été nécessaire après
+l'intégration : `review_designation_activation._removed_seats` de #3685 (deux
+paramètres, ajouté sur une base antérieure à h-27) et `_removed_seats` de #3584
+déjà dans main (quatre paramètres) portaient le même nom ; la définition de
+#3685, plus bas dans le fichier, masquait celle de main et `designate` levait
+un `TypeError`, relevé par `test_an_undrained_host_is_designated_on_the_next_pass`.
+Correction : renommage du helper de #3685 en `_removed_seats_from_mark` et de
+ses deux appelants, sans changement de comportement ni de test. Avis non
+requis : conflit mécanique de nom local, pas de delta sémantique (§11 bis) ;
+signalé au pilote et à l'auteur de #3685. #3682 précède #3685 (même
 fichier `review_designation_activation.py`) ; #3685 précède #3680 (même
 `mesh_cli.py`) et #3658 vient ensuite (fichiers de la porte) ; #3474, #3693 et
 #3728 sont composés en dernier, après leur entrée dans la liste des prêts. Le
@@ -100,13 +109,17 @@ disparu et #3474 a été composé ; #3506 et #3509 restent illisibles.
   écartés avec motif. Le calcul sort en code 1 à cause des deux erreurs
   connues de la chaîne handoff ; la liste des prêts reste utilisable par
   consigne pilote (même traitement en h-22 à h-27).
-- Composition : 8 unités sur `d4c31822a6e3` ; aucune fusion en conflit, aucune
-  résolution d'union, aucune adaptation.
+- Composition : 8 unités sur `d4c31822a6e3` ; aucun conflit textuel, aucune
+  résolution d'union ; une adaptation mécanique (renommage du helper de #3685
+  en `_removed_seats_from_mark`, sans changement de comportement, cf. plus haut).
 - Contrôles statiques de gel (`scripts/freeze-checks.py`, au gel du porteur).
 - Contrôle d'inclusion `scripts/paquet-inclusion.py` sur la tête du manifeste.
-- Tests ciblés verts : TESTS_PLACEHOLDER (3682, 3685, 3686, 3680, 3658, 3474,
-  3693, 3728) ; une seule suite complète sur la tête gelée (`ameesh ci run
-  3737 --full --avis 0`), pas de CI par lot (§11 bis).
+- Tests ciblés : 60 tests exécutés sur l'arbre intégré (témoins des 8 lots),
+  59 verts au premier passage ; l'unique erreur (collision de helper
+  `_removed_seats` ci-dessus) corrigée, les 9 tests de désignation rejoués
+  verts (dont les 8 témoins de #3685), soit 60/60. Une seule suite complète
+  sur la tête gelée (`ameesh ci run 3737 --full --avis 0`), pas de CI par lot
+  (§11 bis).
 - Staging de d4c31822 fait à 11:10Z (venv-courant → venv-d4c3182) ; migration
   additive **0487** (`notify_state`, #3576 de h-27) appliquée à 11:09:13Z avant
   la relance des exécuteurs. Ce paquet n'apporte aucune migration.

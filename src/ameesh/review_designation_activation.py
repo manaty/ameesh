@@ -3124,7 +3124,7 @@ def _replay_designation(cfg, db, lot: int, freeze: Mapping, item: Mapping,
                          "freeze": freeze,
                          "why": "reviewer evidence unreadable: %s: %s"
                                 % (type(exc).__name__, str(exc)[:200])}, "")
-            removed = _removed_seats(effective[2], live)
+            removed = _removed_seats_from_mark(effective[2], live)
     if dead:
         reason = ("freeze #%s named unreachable reviewer(s): %s"
                   % (freeze.get("id"),
@@ -3562,7 +3562,7 @@ def _dead_seats(cfg, db, lot: int, freeze: Mapping, payload: Mapping,
     return dead, kept
 
 
-def _removed_seats(payload: Mapping, column: Sequence[str]) -> list:
+def _removed_seats_from_mark(payload: Mapping, column: Sequence[str]) -> list:
     """The seats a designation mark names but the pilot removed (#3685).
 
     The live column is authoritative: a name the mark still carries but the
@@ -4000,7 +4000,7 @@ def reassign_unreachable(cfg, db, *, limit: int = RETRY_LIMIT) -> dict:
             # #3685 (B1) : a seat the mark records but the column no longer
             # names was removed by the pilot. It stays out of the replacement
             # selection even when another seat of the same mark is dead.
-            removed = _removed_seats(mark[2], row.get("reviewers") or ())
+            removed = _removed_seats_from_mark(mark[2], row.get("reviewers") or ())
             prefix = _reassign_prefix(lot, freeze_id, dead)
             since = float(freeze.get("at_ts") or 0.0)
             if storage.of(db).work.events_noted(prefix, since, ids=[lot]):
