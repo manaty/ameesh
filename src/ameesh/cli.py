@@ -286,12 +286,14 @@ _COMMAND_OUTPUT_RE = re.compile(
     r")")
 
 
-def _stdin_body() -> tuple[str | None, str | None]:
+def _stdin_body(what: str = "body") -> tuple[str | None, str | None]:
     """#3504 : corps de `send <dest> -`, lu sur l'entrée standard.
 
     Rend `(texte, None)` ou `(None, erreur)`. Le texte est nettoyé des blancs
     de bord comme un corps passé en arguments ; une entrée illisible (UTF-8
-    invalide) ou vide est refusée avant tout dépôt.
+    invalide) ou vide est refusée avant tout dépôt. #3683 : une entrée réduite
+    au marqueur « - » l'est aussi, et `ameesh work note <lot> -` la partage
+    (`what` nomme le texte dans l'erreur).
     """
     try:
         data = sys.stdin.buffer.read()
@@ -301,12 +303,16 @@ def _stdin_body() -> tuple[str | None, str | None]:
         try:
             data = data.decode("utf-8")
         except UnicodeDecodeError:
-            return None, ("the body on standard input is not valid UTF-8; "
-                          "write plain text")
+            return None, ("the %s on standard input is not valid UTF-8; "
+                          "write plain text" % what)
     text = data.strip()
     if not text:
-        return None, ("empty body on standard input: write the message before "
-                      "closing standard input")
+        return None, ("empty %s on standard input: write the text before "
+                      "closing standard input (a failed command piped into "
+                      "`-` sends nothing)" % what)
+    if text == "-":
+        return None, ("the %s on standard input is just `-`: write the text "
+                      "itself" % what)
     return text, None
 
 

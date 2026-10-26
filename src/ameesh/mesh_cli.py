@@ -2477,7 +2477,15 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                 print("%s: %s" % (done["item"].get("app") or "?", done["item"]["title"]))
             return 0
         if args.work_command == "note":
-            work.note(db, args.id, args.text, actor=args.actor,
+            text = args.text
+            if text == "-":
+                # #3683 : comme `agent-mail send <dest> -`, le texte vient de
+                # l'entrée standard (heredoc `<<'EOF'`), jamais « - » tel quel.
+                from . import cli
+                text, error = cli._stdin_body("note")
+                if error:
+                    raise work.WorkError(error)
+            work.note(db, args.id, text, actor=args.actor,
                       wake_ts=_wake_deadline(args))
             print("note added to lot #%d" % args.id)
             return 0
@@ -3920,7 +3928,8 @@ def build_parser() -> argparse.ArgumentParser:
                "\"(due 2026-10-25 12:00 UTC)\"; ameesh debit lists it as an "
                "external wait, not an agent wait.")
     pw_note.add_argument("id", type=int)
-    pw_note.add_argument("text")
+    pw_note.add_argument("text", help="the note, or - to read it on standard input "
+                                      "(heredoc <<'EOF': nothing is expanded)")
     pw_note.add_argument("--wake-at", default=None, metavar="TIME",
                          help="#2466: also arm a scheduled wake at this absolute time "
                               "(ISO 8601 with timezone, e.g. 2026-10-18T13:45:00+02:00); "
