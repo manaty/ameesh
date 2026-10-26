@@ -209,11 +209,53 @@ def agent_detail(db, name: str) -> dict | None:
     return row
 
 
+def _handoff_operator(cfg, db, args):
+    """H6: one authorized controller step and a closed public response."""
+    from . import handoffs, host_lifecycle
+    work.corrector(cfg, db, args.actor, what="handoff operator", history=False)
+    operation = storage.of(db).handoffs.get(args.operation)
+    if operation is None:
+        raise ValueError("unknown handoff")
+    try:
+        from . import handoff_factory
+        binding = handoff_factory.load(db)
+        adapter = binding.adapter
+        if "lifecycle_host" in operation.get("plan", {}):
+            adapter = host_lifecycle._ReadyAdapter(db, adapter,
+                                                  binding.requirements_for)
+        if args.handoff_command == "retry":
+            result = handoffs.retry(db, args.operation, adapter,
+                                    renew_ttl=args.renew_ttl)
+        elif args.handoff_command == "cancel":
+            result = handoffs.cancel(db, args.operation, adapter)
+        else:
+            result = handoffs.advance(db, args.operation, adapter)
+    except Exception:
+        raise ValueError("handoff step refused; inspect the protected controller journal") from None
+    public = {key: result[key] for key in
+              ("id", "agent", "source", "target", "state", "reserved_until_ts")
+              if key in result}
+    print(json.dumps({"operation": public}, ensure_ascii=False))
+    return 0
+
+
+def _handoff_ttl(value):
+    try:
+        ttl = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError("TTL must be seconds in 30..7200") from None
+    if not 30 <= ttl <= 7200:
+        raise argparse.ArgumentTypeError("TTL must be seconds in 30..7200")
+    return ttl
+
+
 def cmd_handoff(cfg: Config, args: argparse.Namespace) -> int:
     """L232a planner/journal; activation is supplied by the L232b controller."""
     from . import canon, handoffs, identity, resources, storage
     db = _open(cfg)
     try:
+        if args.handoff_command in ("advance", "cancel", "retry"):
+            return _handoff_operator(cfg, db, args)
         if args.handoff_command == "show":
             row = storage.of(db).handoffs.get(args.operation)
             if row is None:
@@ -3472,6 +3514,15 @@ def build_parser() -> argparse.ArgumentParser:
     p_handoff_show = handoff_sub.add_parser("show")
     p_handoff_show.add_argument("operation")
     p_handoff_show.set_defaults(func=cmd_handoff)
+    for command in ("advance", "cancel", "retry"):
+        operator = handoff_sub.add_parser(command, help="one authorized recoverable step")
+        operator.add_argument("operation")
+        operator.add_argument("--actor", default=None)
+        if command == "retry":
+            operator.add_argument("--renew-ttl", type=_handoff_ttl, default=None,
+                                  metavar="SECONDS",
+                                  help="explicit renewal after reconciliation (30..7200)")
+        operator.set_defaults(func=cmd_handoff)
 
     p_key = sub.add_parser("key", help="owner public keys")
     key_sub = p_key.add_subparsers(dest="key_command")
