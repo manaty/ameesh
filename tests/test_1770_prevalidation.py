@@ -69,6 +69,41 @@ def flux_complet(statut_2: str = "succes") -> str:
     return "\n".join(lignes)
 
 
+def plan_contrat() -> dict:
+    """#3800 : le plan de repli écrit quand la sélection n'est pas prouvée."""
+    return {
+        "schema": pv.PLAN_SCHEMA, "head": A,
+        "map": {"used": False, "problem": "carte absente"},
+        "selection": {"mode": "contract", "why": "sélection incertaine",
+                      "modules": 2, "impacted": 2, "contract": 2,
+                      "selected": 2, "skipped": 0},
+        "sure": False, "phase2_safe": False, "unsure": ["carte absente"],
+        "fallback": {"cause": "selection-full",
+                     "causes": ["selection-full"],
+                     "why": "selection unsure (deploy/x.py)",
+                     "contracts": ["test_cluster"],
+                     "modules": ["test_a", "test_cluster"]},
+        "contract": ["test_cluster"],
+        "classes": {"test_a": ["P1", "contrat"],
+                    "test_cluster": ["P1", "contrat"]},
+        "parts": {"psycopg": [{"part": 1, "of": 1, "modules": ["test_a", "test_cluster"],
+                               "estimate_s": 10}],
+                  "psql": []},
+    }
+
+
+def flux_contrat(statut: str = "succes") -> str:
+    part = "psycopg:1"
+    lignes = [pv.PART_MARK + part]
+    for module in ("test_a", "test_cluster"):
+        lignes.append(json.dumps({"v": 1, "schema": pv.FLOW_SCHEMA, "type": "test",
+                                  "part": part, "module": module,
+                                  "test": "test_x", "statut": "succes"}))
+    lignes.append(json.dumps({"v": 1, "schema": pv.FLOW_SCHEMA, "type": "fin",
+                              "part": part, "statut": statut, "duree_s": 1.2}))
+    return "\n".join(lignes)
+
+
 class SelectionTest(unittest.TestCase):
     def test_plan_sain_accepte(self):
         sel = pv.selection(plan_sain(), head=A)
@@ -97,6 +132,20 @@ class SelectionTest(unittest.TestCase):
                              "modules": 0, "selected": 0}
         sel = pv.selection(plan, head=A)
         self.assertIn("selection-full", sel.causes)
+
+    def test_plan_de_contrat_accepte_malgre_la_selection_incertaine(self):
+        # #3800 : le plan de repli ne se fait pas passer pour une sélection
+        # impactée ; il porte sa cause et ses modules de contrat.
+        sel = pv.selection(plan_contrat(), head=A)
+        self.assertTrue(sel.ok, sel.why)
+        self.assertEqual(sel.fallback["cause"], "selection-full")
+        self.assertEqual(sel.modules, ("test_a", "test_cluster"))
+
+    def test_mode_contrat_sans_repli_refuse(self):
+        plan = plan_contrat()
+        plan["fallback"] = None
+        sel = pv.selection(plan, head=A)
+        self.assertIn("selection-unsafe", sel.causes)
 
     def test_selection_non_sure_refusee(self):
         plan = plan_sain()
@@ -172,6 +221,18 @@ class ProofTest(unittest.TestCase):
         self.assertEqual(rapport["planned_parts"], ["psycopg:1", "psycopg:2"])
         self.assertEqual(rapport["sha"], A)
         self.assertEqual(rapport["host"], "vm-agents-1")
+
+    def test_un_repli_contractuel_dit_toujours_les_contrats_joues(self):
+        # #3800 : un vert de contrat ne se lit pas comme un vert de sélection.
+        sel = pv.selection(plan_contrat(), head=A)
+        rapport = sel.proof(lot=7, host="vm",
+                            run={"outcome": "green", "exit": 0, "seconds": 1.0},
+                            flow=pv.parse_flow(flux_contrat()))
+        self.assertTrue(rapport["ok"], rapport)
+        self.assertEqual(rapport["selection"], "contract")
+        self.assertEqual(rapport["fallback"]["cause"], "selection-full")
+        self.assertIn("contrats seuls", " ".join(rapport["detail"]))
+        self.assertEqual(rapport["modules"], ["test_a", "test_cluster"])
 
     def test_une_seule_part_ne_vaut_pas_vert(self):
         """Repro cx1 : une part verte sur deux, un module sur trois -> refus."""

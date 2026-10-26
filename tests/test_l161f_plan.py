@@ -327,6 +327,45 @@ class JudgeTest(unittest.TestCase):
         self.assertEqual(sorted(impact.textual), ["scripts/tool.py", "tests/support.py"])
         self.assertEqual(len(impact.unsure), 2)
 
+    def test_python_outside_socle_changed_by_target_is_not_a_doubt(self):
+        # #3800 : la cible a ajouté deploy/mise-a-jour/canari-handoff.py après
+        # la carte ; la branche ne le touche pas. Son range propre (`own`) ne
+        # le contient pas, donc le fichier ne doit plus rendre la sélection
+        # « non sûre » (sinon tout lot gelé retombait sur la suite complète).
+        self.repo.write("deploy/mise-a-jour/canari-handoff.py", "print(1)\n")
+        target = self.repo.commit()
+        self.repo.write("src/ameesh/code.py", CODE_V1.replace("x + 1", "x + 2"))
+        self.repo.commit()
+        impact = plan.judge(
+            self.repo.card(),
+            plan.changed_files(self.repo.base, "HEAD", self.repo.path),
+            ["test_a", "test_b", "test_c", "test_db"], "HEAD", self.repo.path,
+            own={"src/ameesh/code.py"}, own_base=target)
+        self.assertEqual(impact.unsure, [])
+        self.assertEqual(impact.p1, {"test_a": "src/ameesh/code.py::used"})
+
+    def test_python_outside_socle_changed_by_the_branch_is_a_doubt(self):
+        # #3800 : le repli ne couvre que les changements de la cible ; un
+        # fichier hors socle que la branche change elle-même reste un doute.
+        self.repo.write("deploy/mise-a-jour/canari-handoff.py", "print(1)\n")
+        self.repo.commit()
+        impact = self.repo.judge()
+        self.assertIn("deploy/mise-a-jour/canari-handoff.py: Python outside "
+                      "src/ameesh/ is not measured", impact.unsure)
+
+    def test_python_outside_socle_without_an_own_range_is_conservative(self):
+        # #3800 : `own` inconnu (range illisible) garde le doute, comme pour
+        # le socle et les données.
+        self.repo.write("deploy/mise-a-jour/canari-handoff.py", "print(1)\n")
+        self.repo.commit()
+        impact = plan.judge(
+            self.repo.card(),
+            plan.changed_files(self.repo.base, "HEAD", self.repo.path),
+            ["test_a", "test_b", "test_c", "test_db"], "HEAD", self.repo.path,
+            own=None)
+        self.assertTrue(any("canari-handoff.py" in reason
+                            for reason in impact.unsure))
+
     def test_new_additive_migration(self):
         self.repo.write("src/ameesh/migrations/0002_more.sql",
                         "alter table things add column name text;\n")
