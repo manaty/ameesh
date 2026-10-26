@@ -50,7 +50,10 @@ La correction a deux jambes, toutes deux dans ce dépôt :
 2. `scripts/paquet-inclusion.py --ready-file` confronte cette liste au
    manifeste : tout lot prêt doit être **composé**, ou figurer dans la table
    « Écartés (ce véhicule) » avec un **motif**. Une ligne sans motif ne compte
-   pas.
+   pas. Un lot que la liste calculée dit **en erreur** (`!<lot> : <motif>`) ne
+   peut pas être composé : le trouver dans une entrée est un défaut bloquant ;
+   absent du manifeste, il y est consigné comme écarté avec ce motif, sans
+   recopie manuelle (#3813).
 
 ## Partir de la liste calculée
 
@@ -117,17 +120,22 @@ reste en place : le calcul suivant écarte de nouveau le lot tant qu'un
 `unhold:` (ou un changement d'état) ne l'a pas levé.
 
 `paquet-candidats.py` ne compose rien et n'écrit dans aucun dépôt : il lit la
-base, les jalons et Git (clone privé du radar, ou clone jetable). Son code de
-retour est `1` si une lecture a échoué — une liste incomplète ne doit pas
-servir de base à un paquet — et, dans ce cas, `--ready-out` est retiré, y
-compris un export d'une exécution précédente : `paquet-inclusion.py` s'arrête
-alors sur un fichier absent (code `2`) au lieu de lire une liste partielle. Le
-seul cas où il écrit en base est le geste explicite `--hold-override`, qui
-journalise la surcharge sur le lot. `--json` rend le schéma
-`ameesh-packet-candidates/1` avec, par lot, la tête publiée, le gel effectif,
-la classe, la porte des avis, l'essai de fusion et les **codes** de refus
-(`freeze-not-head`, `verdicts-missing`, `conflict`, `pilot-hold`,
-`already-in-target`, …).
+base, les jalons et Git (clone privé du radar, ou clone jetable). Une lecture
+impossible **propre à un lot** (gel ou porte illisible) n'invalide pas les
+autres : le code de retour est `3`, `--ready-out` reste écrit et une section
+`# erreurs` nomme les lots à écarter (`!3506 : <motif>`). Une erreur **globale**
+(base, cible, base de données, inventaire, ou erreur non attribuable à un lot)
+garde le comportement ancien : code `1`, et `--ready-out` est retiré, y compris
+un export d'une exécution précédente : `paquet-inclusion.py` s'arrête alors sur
+un fichier absent (code `2`) au lieu de lire une liste partielle. Le fichier
+n'est jamais une liste partielle trompeuse : il dit explicitement quels lots
+sont en erreur (#2404 B3, #3813). Le seul cas où il écrit en base est le geste
+explicite `--hold-override`, qui journalise la surcharge sur le lot. `--json`
+rend le schéma `ameesh-packet-candidates/1` avec, par lot, la tête publiée, le
+gel effectif, la classe, la porte des avis, l'essai de fusion et les **codes**
+de refus (`freeze-not-head`, `verdicts-missing`, `conflict`, `pilot-hold`,
+`already-in-target`, …), plus `errors` et `errors_by_lot` (`{work_item,
+error}`) pour les lots que le calcul n'a pas pu lire.
 Un lot y est dit prêt quand **aucun** refus n'est calculé.
 
 ## Usage
@@ -162,10 +170,14 @@ scripts/paquet-inclusion.py … --no-expected
   s'arrête en `2`, sauf `--no-expected` explicite — une sortie `0` laisserait
   croire que le contrôle « admissions × manifeste » a eu lieu.
 - `--ready` / `--ready-file` : la liste **calculée** des lots prêts (#2404),
-  telle que la produit `scripts/paquet-candidats.py --ready-out` (un id par
-  ligne). Tout lot prêt doit être composé ou écarté avec un motif ; c'est la
-  liste de départ de la composition, pas une seconde liste d'admissions. Un
-  fichier fourni mais vide est un calcul valide (« aucun lot prêt »).
+  telle que la produit `scripts/paquet-candidats.py --ready-out` : un id prêt
+  par ligne (`#123`), puis une section `# erreurs` avec `!123 : motif` pour les
+  lots que le calcul n'a pas pu lire (#3813). Tout lot prêt doit être composé
+  ou écarté avec un motif ; c'est la liste de départ de la composition, pas une
+  seconde liste d'admissions. Un lot en erreur ne peut pas être composé
+  (défaut bloquant s'il figure au manifeste) et, absent du manifeste, il est
+  consigné comme écarté avec son motif, sans recopie manuelle. Un fichier
+  fourni mais vide est un calcul valide (« aucun lot prêt »).
 - `--no-ready` : **refusé** (#2464). Il servait à assumer un contrôle sans
   liste calculée ; utilisé sur la recomposition de h-1300, il a laissé passer
   #2384 sans ligne « écarté ». L'absence de source prête arrête désormais le
@@ -280,10 +292,11 @@ restent la preuve de ses lots.
 
 Sortie : un rapport lisible ou `--json` (schéma `ameesh-paquet-inclusion/1`).
 Codes de retour : `0` aucun défaut ; `1` une inclusion manquante, un lot prêt
-ni composé ni écarté avec un motif, un contenu absent non expliqué ou un commit
-introuvable, ou bien, sous `--strict`, un contenu partiel ou vide non
-expliqué ; `2` entrée invalide (manifeste ou tête introuvable, fichier de lots
-absent ou illisible, aucune source de liste prête, `--no-ready` refusé, ou
+ni composé ni écarté avec un motif, un lot composé alors que la liste calculée
+le dit en erreur, un contenu absent non expliqué ou un commit introuvable, ou
+bien, sous `--strict`, un contenu partiel ou vide non expliqué ; `2` entrée
+invalide (manifeste ou tête introuvable, fichier de lots absent ou illisible,
+ligne `!lot` sans motif, aucune source de liste prête, `--no-ready` refusé, ou
 aucune source de liste attendue sans `--no-expected`).
 
 ## Ce qu'il ne prouve pas

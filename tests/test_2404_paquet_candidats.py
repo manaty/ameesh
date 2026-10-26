@@ -41,6 +41,7 @@ def _load_script(name: str, filename: str):
 
 
 candidates_script = _load_script("test_paquet_candidats_script", "paquet-candidats.py")
+inclusion_script = _load_script("test_paquet_candidats_inclusion", "paquet-inclusion.py")
 
 
 def _git(repo: str, *args: str) -> str:
@@ -451,6 +452,11 @@ class InventoryTest(unittest.TestCase):
                          [cause["code"] for cause in entry["causes"]])
         self.assertIn(1, [e["work_item"] for e in payload["candidates"] if e["error"]])
         self.assertTrue(any("aliases" in error for error in payload["errors"]))
+        # #3813 : la même erreur, attribuée au lot, pour un export utilisable.
+        self.assertIn(1, [item["work_item"] for item in payload["errors_by_lot"]])
+        self.assertIn("aliases", next(
+            item["error"] for item in payload["errors_by_lot"]
+            if item["work_item"] == 1))
         self.assertNotIn(1, payload["waiting"])
         self.assertNotIn(1, payload["ready"])
 
@@ -982,21 +988,55 @@ class ReadyOutTest(unittest.TestCase):
                 "code_contains_ref": relation in ("same", "ahead", "dirty"),
                 "code_dirty": relation == "dirty"}
 
-    def payload(self, *, errors=None):
+    def payload(self, *, errors=None, errors_by_lot=None):
         return {
             "schema": "ameesh-packet-candidates/1", "project": "ameesh",
             "repo": self.tmp, "clone": self.tmp, "target": "main",
             "target_head": "a" * 40, "base": "a" * 40, "base_source": "target",
             "candidates": [], "ready": [], "waiting": [],
             "errors": list(errors or []),
+            "errors_by_lot": list(errors_by_lot or []),
         }
 
     def test_ready_out_removed_when_inventory_has_errors(self):
+        # #2404 B3 : une erreur non attribuée à un lot ne laisse aucun export.
         self.path.write_text("#100\n", encoding="utf-8")
         candidates_script.write_ready_out(self.path, {
             "target": "main", "base": "a" * 40, "ready": [100],
             "errors": ["#500 : lecture impossible"],
         })
+        self.assertFalse(self.path.exists())
+
+    def test_ready_out_lists_the_ready_lots_and_names_the_error_lots(self):
+        # #3813 : l'erreur d'un lot n'invalide pas la liste des autres ; le
+        # fichier dit explicitement lequel écarter, et paquet-inclusion le lit.
+        self.path.write_text("#100\n", encoding="utf-8")
+        listed = candidates_script.write_ready_out(self.path, {
+            "target": "main", "base": "a" * 40, "ready": [100, 200],
+            "errors": ["#500 : cannot read the review gate: provenance unknown"],
+            "errors_by_lot": [{"work_item": 500, "error":
+                               "cannot read the review gate: provenance unknown"}],
+        })
+        self.assertEqual(listed, {
+            500: "cannot read the review gate: provenance unknown"})
+        content = self.path.read_text(encoding="utf-8")
+        self.assertIn("# prêts", content)
+        self.assertIn("#100", content)
+        self.assertIn("#200", content)
+        self.assertIn("# erreurs", content)
+        self.assertIn("!500 : cannot read the review gate: provenance unknown",
+                      content)
+        ids, errors = inclusion_script.read_ready_file(self.path)
+        self.assertEqual(ids, [100, 200])
+        self.assertEqual(errors, {
+            500: "cannot read the review gate: provenance unknown"})
+
+    def test_ready_out_refuses_an_error_that_is_also_ready(self):
+        self.assertIsNone(candidates_script.write_ready_out(self.path, {
+            "target": "main", "base": "a" * 40, "ready": [500],
+            "errors": ["#500 : lecture impossible"],
+            "errors_by_lot": [{"work_item": 500, "error": "lecture impossible"}],
+        }))
         self.assertFalse(self.path.exists())
 
     def test_ready_out_written_when_inventory_is_complete(self):
@@ -1019,8 +1059,9 @@ class ReadyOutTest(unittest.TestCase):
         self.assertFalse(self.path.exists())
 
     def test_script_exits_1_and_clears_ready_out_on_a_read_error(self):
-        # #2521 : une lecture du registre impossible rend la liste incomplète :
-        # code 1 et aucun export, comme une porte illisible.
+        # #2404 B3 / #3813 : une erreur que l'inventaire ne rattache à aucun lot
+        # reste globale : code 1 et aucun export. Une porte illisible, elle,
+        # est attribuée au lot et laisse la liste utilisable (rc 3).
         self.path.write_text("#100\n", encoding="utf-8")
         payload = {
             "schema": "ameesh-packet-candidates/1", "project": "ameesh",
@@ -1050,6 +1091,46 @@ class ReadyOutTest(unittest.TestCase):
             )
         self.assertEqual(code, 1)
         self.assertFalse(self.path.exists())
+        conn.close.assert_called_once()
+
+    def test_script_exits_3_and_keeps_a_usable_export_on_a_per_lot_error(self):
+        # #3813 : une porte illisible sur un lot n'invalide pas les autres.
+        payload = self.payload(
+            errors=["#1 : cannot read the review gate: registry unreadable"],
+            errors_by_lot=[{"work_item": 1, "error":
+                            "cannot read the review gate: registry unreadable"}])
+        payload["ready"] = [7]
+        payload["candidates"] = [{
+            "work_item": 7, "published_head": "b" * 40,
+            "branch": "lot/7-temoin", "review_class": {"class": "léger"},
+            "source": "b" * 40, "assignee": "agent",
+        }]
+        project = SimpleNamespace(name="ameesh", target="main")
+        conn = mock.Mock()
+        stdout = io.StringIO()
+        with mock.patch.object(candidates_script.config, "load",
+                               return_value=object()), \
+                mock.patch.object(candidates_script, "resolve_project",
+                                  return_value=(project, True)), \
+                mock.patch.object(candidates_script.db, "connect", return_value=conn), \
+                mock.patch.object(candidates_script.merge_queue, "working_clone",
+                                  return_value=(self.tmp, None)), \
+                mock.patch.object(candidates_script, "code_reference",
+                                  return_value=("a" * 40, "project-target")), \
+                mock.patch.object(candidates_script, "code_provenance",
+                                  return_value=self.provenance()), \
+                mock.patch.object(candidates_script.packet_candidates, "inventory",
+                                  return_value=payload), \
+                contextlib.redirect_stdout(stdout):
+            code = candidates_script.main(
+                ["--repo", self.tmp, "--project", "ameesh", "--target", "main",
+                 "--ready-out", str(self.path)])
+        self.assertEqual(code, 3)
+        content = self.path.read_text(encoding="utf-8")
+        self.assertIn("#7", content)
+        self.assertIn("!1 : cannot read the review gate: registry unreadable",
+                      content)
+        self.assertIn("liste reste utilisable", stdout.getvalue())
         conn.close.assert_called_once()
 
     def test_script_exits_1_and_clears_ready_out_on_a_pilot_authority_error(self):

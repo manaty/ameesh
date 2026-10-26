@@ -45,6 +45,12 @@ forte. Seul le lot en tête de ligne est le sujet d'une exclusion ; un id cité
 dans le motif reste une référence faible. Une ligne « écartée » sans motif ne
 lève pas l'omission (#2404).
 
+#3813 : la liste calculée peut nommer des lots **en erreur** (`!<lot> :
+<motif>`) sans devenir inutilisable. Un tel lot ne peut pas être composé :
+le trouver dans une entrée du manifeste est un défaut bloquant. S'il est
+absent du manifeste, il est consigné comme écarté avec ce motif, sans recopie
+manuelle ; les nombres du motif ne sont jamais relus comme des ids.
+
 Sortie : un rapport lisible, ou `--json` (schéma `ameesh-paquet-inclusion/1`).
 La liste des lots prêts est **exigée** : sans source `--ready`/`--ready-file`,
 le contrôle s'arrête en 2 ; `--no-ready` est refusé (#2464 : une recomposition
@@ -53,11 +59,12 @@ l'a utilisé et a laissé passer un lot prêt). Un fichier fourni mais vide
 invalide. Sur une recomposition, la liste est recalculée sur la cible de la
 recomposition (`scripts/paquet-candidats.py --ready-out`).
 Codes de retour : 0 si aucun défaut ; 1 si une inclusion manquante, un lot
-prêt ni composé ni écarté avec un motif, un contenu absent non expliqué ou un
-commit introuvable, ou bien, sous `--strict`, un contenu partiel ou vide non
+prêt ni composé ni écarté avec un motif, un lot composé alors que la liste
+calculée le dit en erreur (#3813), un contenu absent non expliqué ou un commit
+introuvable, ou bien, sous `--strict`, un contenu partiel ou vide non
 expliqué ; 2 si l'entrée est invalide (manifeste ou tête introuvable, fichier
-de lots absent ou illisible, aucune source de liste prête, ou aucune source de
-liste attendue sans `--no-expected`).
+de lots absent ou illisible, ligne `!lot` sans motif, aucune source de liste
+prête, ou aucune source de liste attendue sans `--no-expected`).
 Le script est en lecture seule : aucun réseau, aucune écriture dans le dépôt.
 """
 
@@ -91,6 +98,7 @@ NO_ADMISSION_HEADING_RE = re.compile(
 )
 EXCLUSION_HEADING_RE = re.compile(
     r"écart|ecart|retrait|retir|revert|report|exclu|différ", re.IGNORECASE)
+READY_ERROR_RE = re.compile(r"^!(\d+)\s*(?::\s*(.*))?$")
 
 
 class GitError(RuntimeError):
@@ -655,7 +663,8 @@ def run(args: argparse.Namespace) -> tuple[int, dict]:
     expected = collect_ids(args.expected, args.expected_file)
     if not expected and manifest.admissions:
         expected = list(manifest.admissions)
-    ready = collect_ids(getattr(args, "ready", []), getattr(args, "ready_file", []))
+    ready, ready_errors = collect_ready(
+        getattr(args, "ready", []), getattr(args, "ready_file", []))
     if getattr(args, "no_ready", False):
         # #2464 : sur la recomposition de h-1300, le composeur a gardé le
         # manifeste et sauté le contrôle « prêts × manifeste » avec --no-ready ;
@@ -714,6 +723,19 @@ def run(args: argparse.Namespace) -> tuple[int, dict]:
     contents: list[dict] = []
     errors: list[str] = []
     warnings: list[str] = []
+    # #3813 : un lot en erreur n'est pas composable. Absent du manifeste, il y
+    # est consigné comme écarté avec le motif du calcul, sans recopie manuelle.
+    computed_errors: dict[int, str] = {
+        int(lot): " ".join(str(motive).split())
+        for lot, motive in ready_errors.items()
+    }
+    ready_error_exclusions: dict[int, str] = {}
+    for lot, motive in sorted(computed_errors.items()):
+        if lot in composed:
+            continue
+        reason = explained.get(lot) or excused.get(lot)
+        ready_error_exclusions[lot] = reason or (
+            "lot en erreur dans la liste calculée : %s" % motive)
 
     def explain(lot: int, verdict: str) -> bool:
         """Consigne une exclusion (forte, faible ou déclarée) si elle existe."""
@@ -740,11 +762,17 @@ def run(args: argparse.Namespace) -> tuple[int, dict]:
         return (lot in manifest.ecartes and lot not in manifest.explained
                 and lot not in excused)
 
+    # #3813 : les lots que le calcul n'a pas pu lire sont des exclusions
+    # fortes, avec le motif du calcul ; ils ne comptent pas comme omissions.
+    for lot, reason in sorted(ready_error_exclusions.items()):
+        exclusions.append({"lot": lot, "reason": reason, "verdict": "erreur",
+                           "computed_error": True})
+
     # 1. Chaque lot attendu doit apparaître au manifeste (ou être expliqué).
     # Une mention faible (prose sans retrait du lot) ne lève pas l'omission :
     # « retour à l'état #1333 » sous « Retraits » ne dit pas que #1333 est exclu.
     for lot in expected:
-        if lot in composed:
+        if lot in composed or lot in ready_error_exclusions:
             continue
         if ecarte_sans_motif(lot):
             omissions.append({"lot": lot, "reason": "écarté au manifeste sans "
@@ -814,6 +842,13 @@ def run(args: argparse.Namespace) -> tuple[int, dict]:
                       "aucun retrait/report consigné",
         })
 
+    # #3813 : une unité du manifeste que la liste calculée dit en erreur est
+    # un défaut bloquant — sa préparation n'a pas pu être lue.
+    for lot, motive in sorted(computed_errors.items()):
+        if lot in composed:
+            errors.append(
+                f"#{lot} : composé alors que la liste calculée le dit en "
+                f"erreur ({motive})")
     errors.extend(f"#{item['lot']} : {item['reason']}" for item in omissions)
     errors.extend(f"#{item['lot']} : {item['reason']}" for item in removed)
     for result in entry_results:
@@ -841,6 +876,8 @@ def run(args: argparse.Namespace) -> tuple[int, dict]:
         ),
         "expected": expected,
         "ready": ready,
+        "ready_errors": {str(lot): motive
+                         for lot, motive in sorted(computed_errors.items())},
         "ready_source": (
             "options" if ready_source else None
         ),
@@ -896,6 +933,12 @@ def render(payload: dict) -> str:
             f"Prêts : {len(payload['ready'])} lots (liste calculée, "
             f"{payload['ready_source']}) — {liste}"
         )
+        if payload.get("ready_errors"):
+            erreurs = ", ".join(f"#{lot}" for lot in payload["ready_errors"])
+            out.append(
+                f"En erreur : {len(payload['ready_errors'])} lot(s) de la liste "
+                f"calculée, à écarter — {erreurs}"
+            )
     out.append("")
 
     if payload["omissions"]:
@@ -1012,6 +1055,78 @@ def collect_ids(values, files) -> list[int]:
     return list(dict.fromkeys(ids))
 
 
+def read_ready_file(path: Path) -> tuple[list[int], dict[int, str]]:
+    """Lit l'export de `paquet-candidats.py --ready-out` (#2404, #3813).
+
+    Les lots prêts sont `#123` (ou un id nu, format antérieur) ; un lot en
+    erreur est `!123 : motif`. Seule cette ligne nomme un lot en erreur : les
+    nombres du motif ne sont jamais relus comme des ids. Les en-têtes
+    (`# paquet-candidats …`, `# prêts`, `# erreurs`) sont ignorés.
+    """
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as error:
+        # Un export absent (ou retiré parce que l'inventaire était incomplet)
+        # n'est pas une liste vide : c'est une entrée invalide (#2404, cx2 B3).
+        raise InputError(f"fichier de lots illisible : {path} ({error})") from error
+    ids: list[int] = []
+    errors: dict[int, str] = {}
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line:
+            continue
+        match = READY_ERROR_RE.match(line)
+        if match:
+            lot = int(match.group(1))
+            motive = " ".join((match.group(2) or "").split())
+            if not motive:
+                raise InputError(
+                    f"lot en erreur sans motif dans {path} : {line!r}")
+            errors.setdefault(lot, motive)
+            continue
+        if line.startswith("!"):
+            raise InputError(
+                f"ligne de lot en erreur illisible dans {path} : {line!r}")
+        if line.startswith("#"):
+            # Un id prêt est `#123` (le reste de la ligne est une note) ; un
+            # en-tête `# prêts`/`# erreurs` ou un commentaire n'en est pas un.
+            ids.extend(int(found) for found in re.findall(r"#(\d+)\b", line))
+            continue
+        ids.extend(parse_id_list(line))
+    both = sorted(set(ids) & set(errors))
+    if both:
+        raise InputError(
+            "lots à la fois prêts et en erreur dans %s : %s"
+            % (path, ", ".join("#%d" % lot for lot in both)))
+    return list(dict.fromkeys(ids)), errors
+
+
+def collect_ready(values, files) -> tuple[list[int], dict[int, str]]:
+    """Ids prêts et lots en erreur, depuis les options et les fichiers (#3813)."""
+    ids: list[int] = []
+    for value in values:
+        if isinstance(value, int):
+            ids.append(value)
+        else:
+            ids.extend(parse_id_list(str(value)))
+    errors: dict[int, str] = {}
+    for name in files:
+        file_ids, file_errors = read_ready_file(Path(name))
+        ids.extend(file_ids)
+        for lot, motive in file_errors.items():
+            if lot in errors and errors[lot] != motive:
+                raise InputError(
+                    "motifs contradictoires pour #%d dans les listes prêtes : "
+                    "%r / %r" % (lot, errors[lot], motive))
+            errors[lot] = motive
+    both = sorted(set(ids) & set(errors))
+    if both:
+        raise InputError(
+            "lots à la fois prêts et en erreur : %s"
+            % ", ".join("#%d" % lot for lot in both))
+    return list(dict.fromkeys(ids)), errors
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         description="Contrôle d'inclusion des lots d'un paquet §12 avant le feu."
@@ -1030,7 +1145,8 @@ def main(argv: list[str] | None = None) -> int:
                              "ids ou virgules")
     parser.add_argument("--ready-file", action="append", default=[],
                         help="fichier des lots prêts (paquet-candidats.py "
-                             "--ready-out), un id par ligne")
+                             "--ready-out : ids prêts, puis !lot : motif pour "
+                             "les lots en erreur)")
     parser.add_argument("--excused", action="append", default=[],
                         help="lots reportés/retirés hors manifeste (ids)")
     parser.add_argument("--excused-file", action="append", default=[],
