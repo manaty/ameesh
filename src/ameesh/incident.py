@@ -23,8 +23,12 @@ Ce module porte la règle seule :
   candidat : jamais « prouvé » sans reçu. Le module ne dépend pas de #1467 à
   l'exécution, le rapport lui est fourni ;
 * `open_incident` écrit le lot, **une seule fois** par exécution (identité
-  portée par `issue_ref = ci-incident:<repo>:<run_id>`, quel que soit l'état du
-  lot), et **ne lève jamais** : un incident non écrit est rendu, pas propagé ;
+  portée par `issue_ref` **et** par `source` exactement égale à
+  `ci-incident:<repo>:<run_id>`, quel que soit l'état du lot), et **ne lève
+  jamais** : un incident non écrit est rendu, pas propagé. La `source` est
+  l'identité durable : la synchro des tickets remplace l'`issue_ref` par le
+  ticket miroir, et un lot ouvert à la main pour la même exécution resterait
+  sinon invisible ;
 * `consume` est le **consommateur de l'événement CI terminal** : il lit la
   source courante du veilleur (`ci.latest_concluded`) sur la branche
   d'intégration de chaque dépôt (`INTEGRATION`), ignore une tête remplacée, et
@@ -42,7 +46,8 @@ Ce module porte la règle seule :
 Le relevé Git/API (commits de l'atterrissage) reste chez `ci` : ce module ne
 parle ni à GitHub ni au réseau. Deux passages **concurrents** (deux hôtes dans
 la même fenêtre) sont sérialisés par `work.add(unique_ref=True)` : un seul lot
-par exécution, les passages suivants restant idempotents par `issue_ref`.
+par exécution, les passages suivants restant idempotents par `issue_ref` et par
+`source`.
 """
 from __future__ import annotations
 
@@ -51,7 +56,7 @@ from typing import Iterable, Optional
 
 from . import storage, work
 
-#: l'identité de l'incident d'une exécution, portée par `issue_ref`
+#: l'identité de l'incident d'une exécution, portée par `issue_ref` et `source`
 PREFIX = "ci-incident:"
 #: le schéma du rapport factuel commun produit par le train (#1467, #1616) —
 #: lu comme une donnée, sans dépendre de son module à l'exécution
@@ -430,8 +435,15 @@ def body_of(*, repo: str, branch: str, run_id: int, head_sha: str = "", workflow
 
 
 def _open(ops, ref: str) -> Optional[dict]:
-    """L'incident déjà écrit pour `ref`, quel que soit son état."""
-    for name in ("by_issue_ref", "open_by_ref"):
+    """L'incident déjà écrit pour `ref`, quel que soit son état.
+
+    #3607 : l'identité de l'exécution vit aussi dans `source`
+    (`ci-incident:<repo>:<run>`), où un lot ouvert à la main la porte quand la
+    synchro des tickets a posé son `issue_ref` au ticket miroir. La `source`
+    est lue la première, exactement (`by_source`) : `by_issue_ref` ne verrait
+    que le lot automatique, `open_by_ref` seulement les lots ouverts.
+    """
+    for name in ("by_source", "by_issue_ref", "open_by_ref"):
         reader = getattr(ops, name, None)
         if reader is None:
             continue
@@ -469,11 +481,16 @@ def open_incident(db, *, repo: str, branch: str, run_id: int, head_sha: str = ""
 
     Ref `ci-incident:<repo>:<run>` identifie l'exécution **une seule fois**,
     quel que soit l'état du lot : deux watchers concurrents (deux hôtes) ne
-    peuvent plus ouvrir deux lots P1. La création passe par `work.add` avec
-    `unique_ref` (#2954) : verrou consultatif de transaction sur la référence
-    puis relecture, toutes états confondus ; le perdant reçoit `DbError` et
-    relit le gagnant ci-dessous. Une fois la course perdue, il ne désigne ni
-    n'assigne l'auteur du second lot — le gagnant garde la file.
+    peuvent plus ouvrir deux lots P1. Elle est lue exactement dans `source`
+    (#3607) autant que dans `issue_ref` : un lot ouvert à la main pour la même
+    exécution, dont l'`issue_ref` est devenu le ticket miroir
+    (`owner/repo#N`), empêche l'ouverture automatique d'un second lot — c'est
+    le cas #3600/#3603. La création passe par `work.add` avec `unique_ref`
+    (#2954) : verrou consultatif de transaction sur la référence puis
+    relecture de l'`issue_ref` **et** de la `source`, tous états confondus ; le
+    perdant reçoit `DbError` et relit le gagnant ci-dessous. Une fois la course
+    perdue, il ne désigne ni n'assigne l'auteur du second lot — le gagnant
+    garde la file.
 
     Le lot est créé `bug` priorité 1, **sans assigné** (une création assignée
     refuserait un auteur non réveillable et perdrait l'incident), puis l'auteur

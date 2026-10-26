@@ -209,7 +209,9 @@ On the second consecutive failure (or at once on a permanent error) the text
 channel, prefixed `repli nexlink —`; the primary keeps being retried and a
 fallback success is not a Nexlink delivery. `ameesh notify --test` prints the read receipt
 (`GET /mesh/alerts/{id}`). The `cryptography` extra is required
-(`pip install 'ameesh[crypto]'`). ntfy stays the transition channel and is
+(`pip install 'ameesh[crypto]'`; the host installers pose
+`ameesh[psycopg,crypto]` and `ameesh doctor` refuses a routed `nexlink`
+channel without it, naming it before the first send). ntfy stays the transition channel and is
 removed only after 7 green days in production **and** a real urgent alert read
 with the app closed.
 

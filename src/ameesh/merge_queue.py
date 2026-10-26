@@ -556,7 +556,7 @@ def _waiver(db, item) -> tuple:
 
 def _attribution_on_freeze(db, marks, frozen, *, repo, klass, item, families=None,
                            commits=None, strict=False, families_out=None,
-                           target="", admitted_heads=()):
+                           target="", admitted_heads=(), exclusions_out=None):
     """Les auteurs et correcteurs de la tête gelée (#2681/#2739/#2888).
 
     Lecture des commits exacts de la plage gelée et de leur provenance, la même
@@ -591,8 +591,8 @@ def _attribution_on_freeze(db, marks, frozen, *, repo, klass, item, families=Non
     authors, unknown, correctors = act.attribution_of_head(
         db, item, milestone, repo, base, frozen, families=families or (),
         commits=commits, strict=strict, families_out=families_out,
-        target=target or base, admitted_heads=tuple(
-            value["head"] if isinstance(value, dict) else value for value in admitted_heads))
+        target=target or base, admitted_heads=tuple(admitted_heads),
+        exclusions_out=exclusions_out)
     if unknown:
         raise ValueError("author provenance unknown for frozen commit(s): %s"
                          % ", ".join(unknown))
@@ -1036,7 +1036,10 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
                                              strict=True,
                                              families_out=proven_families,
                                              target=target or "",
-                                             admitted_heads=scopes)
+                                             admitted_heads=scopes,
+                                             exclusions_out=out["provenance_exclusions"])
+        # #3544 : le report des gels antérieurs complète la trace.
+        out["provenance_manifest"] = provenance_scope.manifest(out["provenance_exclusions"])
     except Exception as exc:  # noqa: BLE001 - une plage illisible ne conclut pas
         out["error"] = str(exc)
         out["why"] = ("no review verdict ok on the freeze %s (class: %s): the frozen "
@@ -2641,7 +2644,8 @@ def enter(db, lot: int, *, repo: str, actor: str = "", ci="github", project=None
     #3532: `withdrawn_after` (epoch instant) is the gesture's own date — the
     fire's grant for its fallback. A take-out written since then is final
     for that gesture: `QueueWithdrawn`, checked again in the insertion's
-    transaction."""
+    transaction. #3550: only a take-out of the same target and freeze binds
+    the gesture; an old entry of another target or freeze does not."""
     # L165 (EP4) : l'entrée en file est un geste du pilote hors base (la file
     # poussera). Le bail élu est vérifié avant les lectures de préparation et
     # journalisé dans la transaction de l'écriture ; le radar et un humain ne
@@ -2691,10 +2695,12 @@ def enter(db, lot: int, *, repo: str, actor: str = "", ci="github", project=None
             row = add(tx)
     if row is None:
         if withdrawn_after is not None:
-            at = storage.of(db).work.queue_withdrawn_since(lot, withdrawn_after)
+            at = storage.of(db).work.queue_withdrawn_since(
+                lot, withdrawn_after, target=ready["target"],
+                frozen_id=ready.get("frozen_id"))
             if at is not None:
-                raise QueueWithdrawn("lot #%d was taken out of the queue at %s"
-                                     % (lot, _utc(at)))
+                raise QueueWithdrawn("lot #%d was taken out of the queue of %s at %s"
+                                     % (lot, ready["target"], _utc(at)))
         raise QueueError("lot #%d is no longer open" % lot)
     # L539 : la classe lue à l'entrée, rendue avec la ligne de file (lecture)
     row["class"] = ready.get("class")

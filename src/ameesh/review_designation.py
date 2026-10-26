@@ -448,6 +448,45 @@ def manual_seats(already: Iterable, *, authors: Iterable = (), fixers: Iterable 
     return seats
 
 
+def automatic_seats(automatic: Iterable, *, authors: Iterable = (), fixers: Iterable = (),
+                    families) -> list:
+    """The automatic reviewers already designated for **the same freeze** (#3596).
+
+    A retry of the same freeze keeps the seats it already handed out: they
+    count as covered seats; only the missing ones are selected, and none is
+    mailed again. They remain **automatic** (a new freeze retires them as
+    today) and are therefore kept apart from `manual_seats`, which carries the
+    manual exception. A manual seat that names the same agent or family is
+    discarded by the caller, never the automatic one: the seat was already
+    provided, and counting it twice would admit an opinion nobody holds.
+
+    The independence rules are those of the first selection: a known family
+    from the policy, outside every author's family and every corrector's
+    family, and the agent itself is never a seat. An author of unknown family
+    makes independence unprovable: no seat counts (canon §2).
+    """
+    if unknown_families(authors):
+        return []
+    names, forbidden = families_of(authors)
+    fixer_names = names_of(fixers)
+    forbidden = forbidden | families_of(fixers)[1]
+    covered = set(forbidden)
+    seats = []
+    seen_names = set()
+    for row in automatic or ():
+        row = dict(row or {})
+        name = str(row.get("name") or "").strip()
+        family = str(row.get("family") or "").strip().lower()
+        if (not name or name in seen_names or name in names or name in fixer_names
+                or not family or family in PLACEHOLDER_FAMILIES
+                or family not in families or family in covered):
+            continue
+        seen_names.add(name)
+        covered.add(family)
+        seats.append({"name": name, "family": family})
+    return seats
+
+
 def _finite(value) -> Optional[float]:
     """A finite float, or None; a malformed advance is ignored, never guessed."""
     try:
@@ -517,7 +556,7 @@ def _advance_of(candidate, pace: Mapping) -> float:
 
 def select(*, required: int, authors: Iterable = (), candidates: Iterable = (),
            families, already: Iterable = (), fixers: Iterable = (),
-           advances: Optional[Mapping] = None) -> dict:
+           advances: Optional[Mapping] = None, automatic: Iterable = ()) -> dict:
     """Chooses `required` (1 or 2) independent reviewers, by plan pace then load.
 
     - each reviewer's family differs from that of **every** author, and for two
@@ -548,6 +587,11 @@ def select(*, required: int, authors: Iterable = (), candidates: Iterable = (),
     - `already` names the manual reviewers already designated (#2627). The ones
       that prove an independent family cover a seat; only the **missing** seats
       are designated, never a manual reviewer removed or overridden;
+    - `automatic` names the automatic reviewers already designated for **this
+      freeze** (#3596): a retry keeps their seats and only provides the missing
+      ones. They count like the manual seats, never twice (a name or family
+      already covered by a manual seat is skipped), and they stay automatic:
+      a new freeze retires them as today;
     - `fixers` names the designated reviewers whose small first-round
       correction is an authored commit of the head (#2739/#2888). Their family
       is forbidden like any author's family; their exact name is excluded too,
@@ -556,13 +600,14 @@ def select(*, required: int, authors: Iterable = (), candidates: Iterable = (),
     Returns `{state, required, reviewers, missing, manual, why, forbidden,
     families, fixers}`: `waiting` when independent families are missing or an author
     family is unknown, with the missing count — never an implicit admission.
-    `reviewers` names only the automatic reviewers of this call; `manual` the
-    manual seats that count; `families` the eligible automatic families
-    (outside the authors and the manual seats). With the manual seats, that
-    count is the independent families available on this head: a reviewer's
-    correction that makes the reviewer an author of the head removes one, so
-    it is receivable only if the rest still covers the required opinions
-    (canon §2, #2670).
+    A partial designation is still `waiting`, but `reviewers` names the seats
+    it could already provide (families available now); the missing ones wait
+    for capacity. `manual` the manual seats that count; `families` the eligible
+    automatic families, previously designated ones included (outside the
+    authors and the manual seats). With the manual seats, that count is the
+    independent families available on this head: a reviewer's correction that
+    makes the reviewer an author of the head removes one, so it is receivable
+    only if the rest still covers the required opinions (canon §2, #2670).
     """
     if type(required) is not int or required not in (0, 1, 2):
         raise DesignationError("required reviews must be 0, 1 or 2, not %r" % (required,))
@@ -570,26 +615,43 @@ def select(*, required: int, authors: Iterable = (), candidates: Iterable = (),
     fixer_names = names_of(fixers)
     forbidden = forbidden | families_of(fixers)[1]
     seats = manual_seats(already, authors=authors, fixers=fixers, families=families)
+    kept = automatic_seats(automatic, authors=authors, fixers=fixers,
+                           families=families)
+    if kept:
+        # #3596: an automatic seat already provided on this freeze is never
+        # counted twice, and it is the one kept (the manual column may name the
+        # same agent or family): only a genuinely additional manual seat counts.
+        kept_names = {row["name"] for row in kept}
+        kept_families = {row["family"] for row in kept}
+        seats = [row for row in seats
+                 if row["name"] not in kept_names
+                 and row["family"] not in kept_families]
     out = {"state": NONE, "required": required, "reviewers": [], "missing": 0,
            "manual": seats, "why": "no review required",
            "forbidden": sorted(forbidden), "families": [],
            "fixers": sorted(fixer_names)}
     if required == 0:
         return out
-    remaining = max(required - len(seats), 0)
+    out["families"] = sorted({row["family"] for row in kept})
+    remaining = max(required - len(seats) - len(kept), 0)
     if remaining == 0:
         out.update({"state": DESIGNATED, "missing": 0,
-                    "why": "manual reviewer(s) already cover the required reviews"})
+                    "reviewers": [dict(row) for row in kept],
+                    "why": ("reviewer(s) already designated for this freeze cover"
+                            " the required reviews") if kept
+                           else "manual reviewer(s) already cover the required reviews"})
         return out
     unknown = unknown_families(authors)
     if unknown:
-        # An author with no known real family: independence is not proven,
-        # so we wait instead of discarding the only name (canon §2).
+        # An author with no known real family: independence is not proven, so
+        # we wait instead of discarding the only name (canon §2).
         out.update({"state": WAITING, "missing": remaining,
+                    "reviewers": [dict(row) for row in kept],
                     "why": "author family unknown: %s" % ", ".join(unknown)})
         return out
-    seat_names = {row["name"] for row in seats}
-    seat_families = {row["family"] for row in seats}
+    seat_names = {row["name"] for row in seats} | {row["name"] for row in kept}
+    seat_families = ({row["family"] for row in seats}
+                     | {row["family"] for row in kept})
     eligible = [c for c in candidates or ()
                 if c.eligible(forbidden_names=names | seat_names | fixer_names,
                               forbidden_families=forbidden | seat_families,
@@ -616,26 +678,33 @@ def select(*, required: int, authors: Iterable = (), candidates: Iterable = (),
     # pace first, then load, then name; a family absent from `pace` is neutral
     ordered.sort(key=lambda c: (_advance_of(c, pace), c.load, c.name))
     chosen = ordered[:remaining]
-    out["reviewers"] = [{"name": c.name, "family": c.family} for c in chosen]
-    out["families"] = sorted(best)
+    reviewers = [dict(row) for row in kept]
+    reviewers.extend({"name": c.name, "family": c.family} for c in chosen)
+    out["reviewers"] = reviewers
+    out["families"] = sorted(set(best) | {row["family"] for row in kept})
     if len(chosen) < remaining:
         missing_why = ("%d independent %s missing: %d eligible famil%s (%s), "
                        "forbidden %s" % (
                            remaining - len(chosen),
-                           "review" if remaining == 1 else "reviews",
+                           "review" if remaining - len(chosen) == 1 else "reviews",
                            len(ordered), "y" if len(ordered) == 1 else "ies",
                            ", ".join(sorted(best)) or "none",
                            ", ".join(sorted(forbidden | seat_families)) or "none"))
+        if kept:
+            missing_why += (" (already designated: %s)"
+                            % ", ".join(row["name"] for row in kept))
         if fixer_names:
             missing_why += " (corrector(s) excluded: %s)" % ", ".join(sorted(fixer_names))
         out.update({
             "state": WAITING,
             "missing": remaining - len(chosen),
-            "reviewers": [],
+            "reviewers": reviewers,
             "why": missing_why,
         })
         return out
     why = "designated %d reviewer(s)" % len(chosen)
+    if kept:
+        why += " (kept %d already designated for this freeze)" % len(kept)
     if fixer_names:
         why += " (corrector(s) excluded: %s)" % ", ".join(sorted(fixer_names))
     if pace:
@@ -864,29 +933,43 @@ def covering_request(rows: Iterable[Mapping], *, lot, reviewer: str,
 
 
 def capacity_message(lot: dict, *, freeze: Mapping, required: int, missing: int,
-                     why: str, families: str = "") -> str:
-    """The waiting notification: no independent reviewer can be designated.
+                     why: str, families: str = "", designated: Iterable = ()) -> str:
+    """The waiting notification: independent review capacity is missing.
 
     It states what is missing — review capacity or author evidence — and asks
     for no admission: the lot remains waiting for the required number of
-    opinions.
+    opinions. `designated` names the seats already provided on this freeze
+    (#3596): the notice then says the designation is incomplete, not
+    impossible, and the missing seats alone wait for capacity.
     """
     row = dict(lot or {})
-    return "\n".join([
-        "Designation at freeze impossible (canon §2, #1617) — review pending.",
+    kept = [dict(entry or {}) for entry in designated or ()]
+    first = ("Designation at freeze incomplete (canon §2, #1617) — review pending."
+             if kept else
+             "Designation at freeze impossible (canon §2, #1617) — review pending.")
+    lines = [
+        first,
         "",
         "Lot: #%s \"%s\"" % (row.get("id"), " ".join(str(row.get("title") or "").split())),
         "- Freeze: frozen milestone #%s, head %s." % ((freeze or {}).get("id"),
                                                 str((freeze or {}).get("sha") or "")[:12]),
         "- Required opinions: %d; missing: %d." % (required, missing),
         "- Reason: %s" % why,
-    ] + (["- Available families: %s." % families] if families else []) + [
+    ]
+    if kept:
+        lines.append("- Already designated: %s." % ", ".join(
+            "%s (%s)" % (entry.get("name"), entry.get("family") or "?")
+            for entry in kept))
+    if families:
+        lines.append("- Available families: %s." % families)
+    lines += [
         "",
         "No implicit admission: the lot remains pending its opinions. Restore the "
         "missing capacity or evidence (another model family in the registry, an "
         "available reviewer, the exact provenance of the commits) then rerun the "
         "designation.",
-    ])
+    ]
+    return "\n".join(lines)
 
 
 # --------------------------------------------------------------------------
@@ -1027,21 +1110,36 @@ def apply(lot_item: Mapping, *, policy, paths: Iterable[str], port: Port,
         out = dict(existing)
         out["replayed"] = True
         return out
+    # #3596: a retry of the same freeze keeps the automatic seats it already
+    # named. They count as seats (never re-mailed), so only the missing ones
+    # are selected — and a waiting state that gains no seat stays replayable.
+    previous = []
+    if existing and existing.get("state") == WAITING:
+        previous = [{"name": str(row.get("name") or "").strip(),
+                     "family": str(row.get("family") or "").strip()}
+                    for row in existing.get("reviewers") or ()
+                    if isinstance(row, Mapping) and str(row.get("name") or "").strip()]
+    previous_names = {row["name"] for row in previous}
     if unknown:
         # A missing author proof forbids proving independence: explicit
-        # waiting, notification, no reviewer designated.
+        # waiting, notification, no **new** reviewer designated.
         why = ("author provenance unknown for %d commit(s) of the frozen range: %s"
                % (len(unknown), ", ".join(unknown[:5])))
-        selection = {"state": WAITING, "required": required, "reviewers": [],
-                     "missing": required, "manual": [], "why": why}
+        selection = {"state": WAITING, "required": required,
+                     "reviewers": [dict(row) for row in previous],
+                     "missing": max(required - len(previous), 0),
+                     "manual": [], "why": why}
     else:
         selection = select(required=required, authors=authors, candidates=candidates,
                            families=families, already=already, fixers=fixers,
-                           advances=advances)
-    if selection["state"] == WAITING and existing:
-        # The waiting state of this freeze is already recorded and notified: we
-        # do not send a second one, but the selection was retried — if capacity
-        # came back, the branch below finally designates.
+                           advances=advances, automatic=previous)
+    if (existing is not None and existing.get("state") == WAITING
+            and selection["state"] == WAITING
+            and {str(row.get("name") or "") for row in selection["reviewers"]}
+            <= previous_names):
+        # The same waiting state of this freeze is already recorded and
+        # notified: no second notice, no rewrite. If capacity came back, the
+        # selection is a superset and is written below.
         out = dict(existing)
         out["replayed"] = True
         return out
@@ -1053,31 +1151,38 @@ def apply(lot_item: Mapping, *, policy, paths: Iterable[str], port: Port,
                 "missing": 0, "manual": [dict(row) for row in selection["manual"]],
                 "why": selection["why"], "freeze": freeze}
     messages = []
-    if state == DESIGNATED:
-        first_rank = len(selection.get("manual") or ()) + 1
-        # The independent families available on this head: the manual seats and
-        # the automatic families. Any reviewer correction authors the head and
-        # removes its own family from the opinions (canon §2, #2670/#2888).
-        eligible_families = (len(selection.get("manual") or ())
-                             + len(selection.get("families") or ()))
-        for rank, reviewer in enumerate(selection["reviewers"], start=first_rank):
-            messages.append({
-                "to": reviewer["name"],
-                "family": reviewer["family"],
-                "kind": REQUEST_KIND,
-                "body": reviewer_message(item, freeze=freeze, required=required,
-                                         rank=rank, reviewer=reviewer, authors=authors,
-                                         base=base, risk=risk, policy_ref=policy_ref,
-                                         eligible_families=eligible_families),
-            })
-    else:
+    if state == WAITING and not existing:
+        # One capacity notice per freeze; a retry adds only the seats it can
+        # now provide (their request mails), without a second notice.
         messages.append({
             "to": notify,
             "family": "",
             "kind": "notify",
             "body": capacity_message(item, freeze=freeze, required=required,
-                                     missing=selection["missing"], why=selection["why"]),
+                                     missing=selection["missing"], why=selection["why"],
+                                     designated=selection["reviewers"]),
             "capacity": True,
+        })
+    first_rank = len(selection.get("manual") or ()) + 1
+    # The independent families available on this head: the manual seats and
+    # the automatic families, the already designated ones included. Any
+    # reviewer correction authors the head and removes its own family from the
+    # opinions (canon §2, #2670/#2888).
+    eligible_families = (len(selection.get("manual") or ())
+                         + len(selection.get("families") or ()))
+    for index, reviewer in enumerate(selection.get("reviewers") or ()):
+        if str(reviewer.get("name") or "") in previous_names:
+            # #3596: an automatic seat of this freeze already holds its request.
+            continue
+        messages.append({
+            "to": reviewer["name"],
+            "family": reviewer["family"],
+            "kind": REQUEST_KIND,
+            "body": reviewer_message(item, freeze=freeze, required=required,
+                                     rank=first_rank + index, reviewer=reviewer,
+                                     authors=authors, base=base, risk=risk,
+                                     policy_ref=policy_ref,
+                                     eligible_families=eligible_families),
         })
     try:
         return port.commit(lot, freeze=freeze, required=required, state=state,

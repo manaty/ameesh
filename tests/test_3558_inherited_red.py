@@ -15,7 +15,8 @@ une base sans relevé conclu → `pending`. Les relectures B/P1 du 25/10 ajouten
 les fermetures du relevé : ligne encore `running`, attempt différent du flux,
 dernier échec publié après la passe du veilleur, sortie de flux tronquée par
 `MAX_TEXT` (marqueur d'omission), et provenance homonyme d'un autre run
-(jamais masquée par le seul nom).
+(jamais masquée par le seul nom). #3593 (N1/N2) consigne le statut exigé non
+concluant sur ce chemin et lit toutes les pages de check-runs au-delà de 100.
 """
 from __future__ import annotations
 
@@ -81,6 +82,12 @@ def flux(name, conclusion, *, workflow="paquet"):
             "detailsUrl": "https://github.com/%s/runs/121135624438" % SLUG}
 
 
+def status_context(context, state):
+    """Un statut de commit exigé par préfixe (`required_statuses`)."""
+    return {"__typename": "StatusContext", "context": context, "state": state,
+            "targetUrl": "https://github.com/%s/commit/%s" % (SLUG, HEAD)}
+
+
 class Ci:
     """La lecture de CI du lot : exécutions, échecs et référence de base."""
 
@@ -127,6 +134,8 @@ class InheritedGh(FakeGh):
         self.events = None
         #: `total_count` de la page REST (un au-delà = lecture tronquée)
         self.check_runs_total = None
+        #: taille de page REST ; None : toute la liste dans une page
+        self.check_runs_page_size = None
         #: nombre d'échecs omis par `ci-flow.py` dans la sortie des flux
         self.omitted = 0
         #: des checks REST supplémentaires (provenance d'une autre suite/run)
@@ -171,10 +180,19 @@ class InheritedGh(FakeGh):
             self.calls.append(list(args))
             runs = self.check_runs()
             total = len(runs) if self.check_runs_total is None else self.check_runs_total
-            page = {"total_count": total, "check_runs": runs}
-            # `_head_check_runs` lit `--paginate --slurp` : une liste de pages ;
-            # la relecture des événements lit la page du veilleur, seule.
-            return 0, json.dumps([page] if "--paginate" in args else page), ""
+            size = int(self.check_runs_page_size or 0)
+            # #3593 (N2) : la forge ne rend qu'une page à la fois ; un lecteur
+            # qui ne pagine pas ne voit que les `size` premiers checks.
+            if "--paginate" in args:
+                if not size:
+                    return 0, json.dumps([{"total_count": total,
+                                           "check_runs": runs}]), ""
+                pages = [{"total_count": total, "check_runs": runs[index:index + size]}
+                         for index in range(0, len(runs), size)]
+                return 0, json.dumps(pages), ""
+            page = {"total_count": total,
+                    "check_runs": runs[:size] if size else runs}
+            return 0, json.dumps(page), ""
         return super().answer(args)
 
 
@@ -332,6 +350,40 @@ class InheritedRedTest(Journal):
         out = self.check(gh)
         self.assertEqual(out["result"], "pending", out)
         self.assertEqual(gh.landed, [])
+
+    def test_a_read_past_the_first_page_proves_the_events(self):
+        # #3593 (N2) : au-delà de 100 check-runs, la relecture ne lisait que
+        # la première page et refusait (`total_count` non couvert) : la preuve
+        # restait inerte. Toutes les pages sont lues ; les checks
+        # supplémentaires, verts et hors exigences, ne changent rien.
+        extras = [_check_run("optional %d" % index, "success",
+                             details_url="https://github.com/%s/actions/runs/%d/job/%d"
+                                          % (SLUG, 500 + index, 500 + index),
+                             suite=500 + index, started="2026-10-25T12:05:00Z")
+                  for index in range(110)]
+        gh = InheritedGh(self.rollup())
+        gh.check_runs_extra = extras
+        gh.check_runs_page_size = 100
+        out = self.check(gh)
+        self.assertEqual(out["result"], "merged", out)
+        self.assertEqual(gh.landed, [("main", HEAD)])
+
+    def test_a_non_conclusive_required_status_is_consigned_on_the_inherited_path(self):
+        # #3593 (N1) : `ready_pr` s'arrête sur le rouge de CI avant de relire
+        # les statuts exigés ; la preuve du rouge hérité les relit et jetait le
+        # statut ERROR. Il se consigne (règle owner 23/10) et ouvre son lot de
+        # correction, comme sur le chemin vert (#3085).
+        project = types.SimpleNamespace(required_statuses=(("integration/**", "ci/"),))
+        self.gate = (True, "", project)
+        gh = InheritedGh(self.rollup(extra=[status_context("ci/tests", "ERROR")]))
+        out = self.check(gh)
+        self.assertEqual(out["result"], "merged", out)
+        self.assertEqual(gh.landed, [("main", HEAD)])
+        self.assertEqual(out["consigned"], ["ci/* (ERROR)"])
+        self.assertIn("ci/* (ERROR)", self.merged_notes()[0])
+        titles = [row["title"] for row in self.created]
+        self.assertTrue(any("CI non concluante" in title and "ci/* (ERROR)" in title
+                            for title in titles), titles)
 
     def test_a_truncated_flux_output_blocks(self):
         # #3558 (ameesh-dev4 + ameesh-cx3 B/P1) : `ci-flow.py` a omis des

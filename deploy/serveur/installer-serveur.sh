@@ -130,7 +130,10 @@ log "ameesh ($(echo "$VERSION")) dans $VENV"
 [[ -d $VENV ]] || python3 -m venv "$VENV"
 "$VENV/bin/pip" install -q --upgrade pip
 "$VENV/bin/pip" install -q --force-reinstall --no-deps "$SRC"
-"$VENV/bin/pip" install -q "$SRC"
+# #3619 : crypto = cryptography>=41, le canal d'alertes nexlink ; posé ici
+# comme sur les autres hôtes, contrôlé avant de servir le code.
+"$VENV/bin/pip" install -q "$SRC[psycopg,crypto]"
+"$VENV/bin/python" -c 'import psycopg, cryptography, ameesh'
 for b in ameesh agent-runner agent-mail; do ln -sfn "$VENV/bin/$b" "/usr/local/bin/$b"; done
 CFG=/home/ameesh/.config/ameesh/config.json
 if [[ ! -f $CFG ]]; then

@@ -48,6 +48,11 @@ acquisition and extended only by a successful renewal; a watchdog that never
 touches the database TERMs then KILLs the child on that deadline, before
 another host can take the execution lease. The other passes never take it.
 
+#3575: the stop is a **process-group** stop. The child leads its own session
+and that pgid is kept for life; after the grace a descendant that ignores
+SIGTERM is KILLed even when the leader already exited or was reaped. A lost
+lease therefore never leaves an auxiliary of the pass alive.
+
 The command is an argument vector, never a shell string. Its exit code is
 returned unchanged. The wrapper's own refusals are:
 
@@ -114,7 +119,7 @@ _SCHEMA = "ameesh-role-run/1"
 #: the row read by the gate. The database clock is read in the same statement:
 #: a host clock that drifts cannot make a dead lease look alive.
 _READ_SQL = """
-    SELECT name, host, releve, candidats, status,
+    SELECT name, host, releve, candidats, status, responsible,
            lease_owner, lease_epoch,
            extract(epoch from lease_expires_at)::float8 AS lease_expires_ts,
            extract(epoch from clock_timestamp())::float8  AS now_ts
@@ -230,10 +235,17 @@ class _AlertsLease:
             return False
 
 
-def _signal_child_group(proc, sig: int) -> None:
-    """Signal the child's whole session, not only its own process."""
+def _signal_child_group(proc, sig: int, *, pgid: int | None = None) -> None:
+    """Signal the child's whole session, not only its own process.
+
+    #3575: the pgid is the one `start_new_session` created (the child's own
+    pid), never re-read with ``os.getpgid(proc.pid)``: once the leader has
+    been reaped that call raises, while the group of its descendants still
+    exists. `proc.pid` remains the group id as long as a member lives.
+    """
+    group = int(proc.pid if pgid is None else pgid)
     try:
-        os.killpg(os.getpgid(proc.pid), sig)
+        os.killpg(group, sig)
     except ProcessLookupError:
         pass
     except OSError:
@@ -243,21 +255,61 @@ def _signal_child_group(proc, sig: int) -> None:
             pass
 
 
-def _stop_child(proc, grace: float) -> None:
-    """TERM the child, then KILL it if it is still alive after ``grace``.
+def _group_alive(pgid: int) -> bool:
+    """Does any process still belong to this process group?
+
+    Signal 0 asks the kernel without delivering anything. A zombie leader
+    counts until it is reaped, which is why the callers reap it with
+    ``proc.poll()`` before concluding.
+    """
+    try:
+        os.killpg(int(pgid), 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def _stop_child(proc, grace: float, *, pgid: int | None = None) -> None:
+    """TERM the child's group, then KILL it if it is still alive after ``grace``.
 
     The deadline watchdog owns the process reaping (the main thread is in
     ``proc.wait()``); this only signals and escalates, so a child that ignores
     SIGTERM cannot outlive the local deadline that precedes the lease expiry.
+
+    #3575: the verdict is the *group's* liveness, never the leader's exit
+    status. A leader that exits on TERM while a descendant ignores it must
+    still receive the SIGKILL escalation; the group id created by
+    ``start_new_session`` is used directly because it stays valid after the
+    leader is gone (review cx3 and dev2).
     """
-    if proc.poll() is not None:
-        return
-    _signal_child_group(proc, signal.SIGTERM)
+    group = int(proc.pid if pgid is None else pgid)
+    # Reap the leader if it already exited: its zombie would otherwise hold
+    # the group alive for the whole grace, without hiding a live descendant.
+    proc.poll()
+    _signal_child_group(proc, signal.SIGTERM, pgid=group)
     deadline = time.monotonic() + max(0.0, grace)
-    while proc.poll() is None and time.monotonic() < deadline:
+    while True:
+        proc.poll()
+        if not _group_alive(group):
+            return
+        if time.monotonic() >= deadline:
+            break
         time.sleep(0.01)
-    if proc.poll() is None:
-        _signal_child_group(proc, signal.SIGKILL)
+    # The group still has a member after the grace, whether or not the leader
+    # is alive: escalate on the group, not on `proc.poll()`.
+    _signal_child_group(proc, signal.SIGKILL, pgid=group)
+    # SIGKILL is synchronous, but the kernel still schedules the death: wait
+    # a bounded moment so the lease is not released under a live descendant.
+    limit = time.monotonic() + min(max(0.0, grace), 0.2)
+    while time.monotonic() < limit:
+        proc.poll()
+        if not _group_alive(group):
+            return
+        time.sleep(0.01)
 
 
 class _AlertsExecution:
@@ -276,6 +328,8 @@ class _AlertsExecution:
         self.lease = lease
         self.lock = threading.Lock()
         self.proc = None
+        #: #3575: the process group created by start_new_session (== child pid)
+        self.pgid = None
         self.lost = threading.Event()
         self.stopped = threading.Event()
         self.stop = threading.Event()
@@ -306,7 +360,10 @@ class _AlertsExecution:
                 return None
             # Its own session lets the watchdog stop the command's children
             # too: a wrapper that leaves a helper behind is still one pass.
+            # #3575: keep that pgid (== pid with start_new_session), so a
+            # descendant can be signalled after the leader is reaped.
             self.proc = subprocess.Popen(argv, env=env, start_new_session=True)
+            self.pgid = self.proc.pid
             return self.proc
 
     def kill(self) -> None:
@@ -317,8 +374,9 @@ class _AlertsExecution:
                 return
             self.stopped.set()
             proc = self.proc
+            pgid = self.pgid
         if proc is not None:
-            _stop_child(proc, self.lease.kill_grace)
+            _stop_child(proc, self.lease.kill_grace, pgid=pgid)
 
 
 def _watch_alerts_lease(lease: _AlertsLease, execution: _AlertsExecution,
@@ -393,6 +451,9 @@ def _report(row: dict, *, epoch: int | None = None) -> dict:
         "host": row.get("host"),
         "releve": row.get("releve"),
         "candidates": list(row.get("candidats") or ()),
+        # #3575: the delegate hysteresis prefers the role's last executor and
+        # needs the same required human as the election read.
+        "responsible": row.get("responsible"),
         "holder": row.get("host") if held else None,
         "owner": row.get("lease_owner"),
         "epoch": row.get("lease_epoch"),
@@ -513,7 +574,8 @@ def _alerts_delegation(db, report: dict, *, host: str) -> dict:
     """
     from . import election
     role = {"name": report.get("role"), "releve": report.get("releve"),
-            "candidats": list(report.get("candidates") or ())}
+            "candidats": list(report.get("candidates") or ()),
+            "responsible": report.get("responsible")}
     decision = election.alerts_delegate(db, role, holder=report.get("holder"))
     decision["this_host"] = host
     return decision

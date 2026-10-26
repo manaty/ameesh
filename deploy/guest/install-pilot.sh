@@ -73,7 +73,8 @@
 #     layout given by hand, or the 2710 of L159b, is not reopened; L159b2's
 #     install.sh gives $ROOT/home to the job user, whose passwd home it is,
 #     and --check accepts that owner — tmp and work stay the guest's alone);
-#   * /opt/ameesh/venv: ameesh[psycopg] from this checkout (root-owned);
+#   * /opt/ameesh/venv: ameesh[psycopg,crypto] from this checkout (root-owned;
+#     crypto = cryptography>=41, the nexlink alert channel, #3619);
 #   * /etc/systemd/system: ameesh-guest.slice, ameesh.slice.d/guest-weight.conf,
 #     ameesh-guest-runner@.service (its paths on --root, + a PATH drop-in),
 #     ameesh-guard.service;
@@ -832,6 +833,11 @@ if [ "$MODE" = check ]; then
   [ -x "$(at "$VENV")/bin/ameesh" ] \
     && ok "$VENV ($("$(at "$VENV")/bin/ameesh" --version 2>/dev/null || echo '?'))" \
     || ko "missing $VENV/bin/ameesh"
+  if [ -x "$(at "$VENV")/bin/python" ]; then
+    "$(at "$VENV")/bin/python" -c 'import cryptography' >/dev/null 2>&1 \
+      && ok "$VENV imports cryptography (nexlink channel, #3619)" \
+      || ko "$VENV lacks cryptography: install the ameesh[psycopg,crypto] extra (#3619)"
+  fi
   [ -d "$(at /run/ameesh-gate/ack)" ] && ok "/run/ameesh-gate/ack" || ko "missing /run/ameesh-gate/ack"
   if host_says systemctl is-active --quiet ameesh-guard; then
     ok "ameesh-guard active ($(grep -h '^AMEESH_GUARD_ARGS=' "$ETC/guard.env" 2>/dev/null || echo 'mode ?'))"
@@ -1341,7 +1347,10 @@ else
     }
   fi
 fi
-run "$VENV/bin/pip" install --quiet --upgrade "$CHECKOUT[psycopg]"
+run "$VENV/bin/pip" install --quiet --upgrade "$CHECKOUT[psycopg,crypto]"
+# #3619 : la dépendance est posée AVANT toute activation du canal nexlink ;
+# un import cassé arrête l'installation plutôt que le premier envoi.
+run "$VENV/bin/python" -c 'import cryptography'
 
 say "3. units, gate directories, guard"
 run install -m 0644 "$HERE/ameesh-guest.slice" "$UNITS/"

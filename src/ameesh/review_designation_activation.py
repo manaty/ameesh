@@ -74,6 +74,7 @@ import json
 import os
 import re
 import subprocess
+import sys
 import time
 import dataclasses
 from dataclasses import dataclass, field
@@ -98,6 +99,9 @@ NONE_PREFIX = "review-designation-none:"
 #: note per (freeze, floor): a replay that finds the seats already kept writes
 #: nothing, and a waiting outcome cannot be re-noted by a concurrent pass.
 FLOOR_PREFIX = "review-designation-floor:"
+#: journal prefix of a manual designation that covers the required reviews
+#: (#3596): the retry queue treats it as final without re-reading the policy
+MANUAL_PREFIX = "review-designation-manual:"
 #: journal prefix of an unreadable mark ignored by the reviewer load (#3047):
 #: the line names the offending lot and the id of the note it ignored
 UNREADABLE_PREFIX = "review-designation-unreadable:"
@@ -689,43 +693,62 @@ def _designation_authority(db, actor: str) -> bool:
         return False
 
 
-def _journal_reviewers(db, lot: int, *, until=None) -> list:
-    """The reviewer names designated by hand in the lot journal (#2739).
+def _manual_designations(db, lot: int, *, until=None) -> Optional[dict]:
+    """The manual reviewer designations of the lot, by name (#2739/#3602).
 
-    `work_items.reviewers` is the live column; `work reviewer --remove` retires
-    a manual seat and the column no longer carries the name. The journal keeps
-    the designation (`reviewer X designated`), so a manual reviewer who pushed
-    a first-round correction stays recognizable after their seat is retired,
-    exactly like the automatic names of the marks (#2638). Only a line written
-    by a designation authority counts (`_designation_authority`): a free note
-    carrying the same words is not a designation. The read is bounded by the
-    note prefix and the lot, never by the last 500 events: a designation older
-    than a talkative lot's recent journal stays read (#2776, same reason as
-    #1448 N2). With `until` (the freeze instant), a reviewer named after the
-    freeze is ignored: they did not review that head.
+    Returns `{name: (journal id, created_ts)}` for the latest
+    `reviewer X designated` line of each name. `work_items.reviewers` is the
+    live column; `work reviewer --remove` retires a manual seat and the column
+    no longer carries the name. The journal keeps the designation, so a manual
+    reviewer who pushed a first-round correction stays recognizable after
+    their seat is retired, exactly like the automatic names of the marks
+    (#2638). Only a line written by a designation authority counts
+    (`_designation_authority`): a free note carrying the same words is not a
+    designation. The read is bounded by the note prefix and the lot, never by
+    the last 500 events: a designation older than a talkative lot's recent
+    journal stays read (#2776, same reason as #1448 N2).
+
+    The journal id is what orders the gesture against the designation marks:
+    a manual line written after a mark that carries the same name means the
+    pilot re-designated it (#3602), whatever the name's automatic past. With
+    `until` (the freeze instant), a line after the freeze is ignored here.
+    None when the journal cannot be read: the caller decides, never a guess.
     """
-    names: list[str] = []
     try:
         events = storage.of(db).work.events_noted(
             "reviewer ", 0.0, ids=[int(lot)]) or []
-    except Exception:  # noqa: BLE001 - unreadable journal: no manual name
-        return names
+    except Exception:  # noqa: BLE001 - unreadable journal: read unknown
+        return None
+    found: dict = {}
     for event in events:
         note = str((event or {}).get("note") or "").strip()
         if not note.startswith("reviewer ") or not note.endswith(" designated"):
             continue
         if not _designation_authority(db, (event or {}).get("actor")):
             continue
-        if until is not None:
-            try:
-                if float((event or {}).get("created_ts") or 0.0) > float(until):
-                    continue
-            except (TypeError, ValueError):
-                continue
         name = note[len("reviewer "):-len(" designated")].strip()
-        if name and name not in names:
-            names.append(name)
-    return names
+        if not name:
+            continue
+        try:
+            row_id = int((event or {}).get("id") or 0)
+            stamp = float((event or {}).get("created_ts") or 0.0)
+        except (TypeError, ValueError):
+            continue
+        if until is not None and stamp > float(until):
+            continue
+        if name not in found or row_id > found[name][0]:
+            found[name] = (row_id, stamp)
+    return found
+
+
+def _journal_reviewers(db, lot: int, *, until=None) -> list:
+    """The reviewer names designated by hand in the lot journal (#2739).
+
+    The names of `_manual_designations`, oldest designation first. With
+    `until` (the freeze instant), a reviewer named after the freeze is
+    ignored: they did not review that head.
+    """
+    return list(_manual_designations(db, lot, until=until) or ())
 
 
 def _designated_reviewers(db, item: Mapping, milestone: Optional[Mapping],
@@ -765,7 +788,8 @@ def attribution_of_head(db, item: Mapping, milestone: Optional[Mapping],
                         repo: str, base: str, head: str, *, families=(),
                         commits=None, strict: bool = False,
                         families_out: Optional[dict] = None,
-                        target: str = "", admitted_heads=()) -> tuple[list, list, list]:
+                        target: str = "", admitted_heads=(),
+                        exclusions_out: Optional[list] = None) -> tuple[list, list, list]:
     """`(auteurs, inconnus, correcteurs)` de la plage gelée `base..head` (#2681/#2739).
 
     La même lecture partagée que la désignation (`review_authors.reading`),
@@ -794,7 +818,8 @@ def attribution_of_head(db, item: Mapping, milestone: Optional[Mapping],
                                   families=families, strict=strict,
                                   families_out=families_out,
                                   base=base, head=head, target=target,
-                                  admitted_heads=admitted_heads)
+                                  admitted_heads=admitted_heads,
+                                  exclusions_out=exclusions_out)
 
 
 def corrections_of_head(db, item: Mapping, milestone: Optional[Mapping],
@@ -861,10 +886,11 @@ def _mark_reviewers(note: str) -> Optional[list]:
 #: #3033 / #3047: the journal facts of every open lot that the pending-review
 #: and fix calculation (`_owed_read`) needs, in **one** statement: the latest
 #: freeze, its latest mark, every designation mark of the lot, the manual
-#: designations since that freeze and the verdicts (actor, head, verdict and
-#: instant — #3288 reads the blocks from the same rows). Every note comes back
-#: as **text** and is parsed in Python: no note is ever cast by PostgreSQL, so
-#: no bad note can abort the freeze transaction this read runs in.
+#: designations (their journal id orders them against the marks, #3602) and
+#: the verdicts (actor, head, verdict and instant — #3288 reads the blocks
+#: from the same rows). Every note comes back as **text** and is parsed in
+#: Python: no note is ever cast by PostgreSQL, so no bad note can abort the
+#: freeze transaction this read runs in.
 _PENDING_FACTS_SQL = """
     WITH open_items AS (
         SELECT id, assignee, reviewers, title, state, app
@@ -889,13 +915,13 @@ _PENDING_FACTS_SQL = """
          GROUP BY e.work_item_id
     ), manual AS (
         SELECT e.work_item_id AS lot,
+               array_agg(e.id ORDER BY e.id) AS ids,
                array_agg(e.note ORDER BY e.id) AS notes,
                array_agg(extract(epoch FROM e.created_at)::float8
                          ORDER BY e.id) AS ts
           FROM work_item_events e
           JOIN latest_freeze f ON f.lot = e.work_item_id
-         WHERE e.created_at >= f.at
-           AND starts_with(e.note, 'reviewer ')
+         WHERE starts_with(e.note, 'reviewer ')
            AND right(e.note, length(' designated')) = ' designated'
          GROUP BY e.work_item_id
     ), verdicts AS (
@@ -913,6 +939,7 @@ _PENDING_FACTS_SQL = """
            f.sha AS freeze_sha, extract(epoch FROM f.at)::float8 AS freeze_ts,
            mark.id AS note_id, extract(epoch FROM mark.created_at)::float8 AS mark_ts,
            mk.ids AS mark_ids, mk.notes AS mark_notes,
+           mn.ids AS manual_ids,
            mn.notes AS manual_notes, mn.ts AS manual_ts,
            vd.actors AS verdict_actors, vd.shas AS verdict_shas,
            vd.kinds AS verdict_kinds, vd.ts AS verdict_ts
@@ -963,9 +990,10 @@ def _owed_read(db, *, unreadable: Optional[list] = None) -> tuple[list, list, li
       report, the last one in journal order — the mark `_sync_reviewers`
       derives the column from);
     - a manual designation: a name that no automatic mark of the lot ever
-      carried (kept across freezes by `_sync_reviewers`), or one designated by
-      hand (`reviewer X designated`, `ameesh work reviewer`) since the latest
-      freeze.
+      carried (kept across freezes by `_sync_reviewers`), or a name whose
+      latest `reviewer X designated` line (`ameesh work reviewer`) follows
+      the latest mark carrying it (#3602: the pilot re-designated a name an
+      earlier selection had already carried).
 
     An automatic name of an older freeze is therefore not a pending review of
     the new head — including during the selection itself, when the column has
@@ -975,7 +1003,7 @@ def _owed_read(db, *, unreadable: Optional[list] = None) -> tuple[list, list, li
     rule; a `blocked` verdict counts, the reviewer has rendered it. A closed,
     merged or promoted lot owes nothing. `designated_ts` is when the agent was
     designated for this head (latest of the freeze, the mark naming them, a
-    manual designation since the freeze): the start of the §9 clock.
+    manual designation after the mark): the start of the §9 clock.
 
     #3288: a fix is due when the latest freeze carries a `blocked` verdict
     that no later verdict of the **same actor** on the same head cancelled,
@@ -1023,12 +1051,24 @@ def _owed_read(db, *, unreadable: Optional[list] = None) -> tuple[list, list, li
                 unreadable.append((lot_id, int(note_id)))
         effective = (set(marks.get(int(row["note_id"])) or ())
                      if row.get("note_id") is not None else set())
-        ever = {name for names in marks.values() for name in names or ()}
-        # `reviewer X designated` since the freeze: X, at its latest line
+        # The latest mark carrying each name: #3602 compares it with the
+        # manual gesture that may have re-designated the same name later.
+        ever: dict = {}
+        for note_id, names in marks.items():
+            for name in names or ():
+                ever[name] = max(ever.get(name, 0), int(note_id))
+        # `reviewer X designated`: X, at its latest line (journal id, instant)
         manual: dict = {}
-        for note, ts in zip(row.get("manual_notes") or (), row.get("manual_ts") or ()):
+        for note, note_id, ts in zip(row.get("manual_notes") or (),
+                                     row.get("manual_ids") or (),
+                                     row.get("manual_ts") or ()):
             name = str(note or "")[len("reviewer "):-len(" designated")]
-            manual[name] = max(float(ts), manual.get(name, float(ts)))
+            try:
+                event_id, stamp = int(note_id), float(ts)
+            except (TypeError, ValueError):
+                continue
+            if name not in manual or event_id > manual[name][0]:
+                manual[name] = (event_id, stamp)
         verdicts = list(zip(row.get("verdict_actors") or (),
                             row.get("verdict_shas") or (),
                             row.get("verdict_kinds") or (),
@@ -1040,7 +1080,8 @@ def _owed_read(db, *, unreadable: Optional[list] = None) -> tuple[list, list, li
             if name in ("", "-none") or name in seen:
                 continue
             seen.add(name)
-            if name not in effective and name in ever and name not in manual:
+            manual_seat = name in manual and manual[name][0] > ever.get(name, 0)
+            if name not in effective and name in ever and not manual_seat:
                 continue
             if any(str(actor or "").strip().lower() == name.lower()
                    and rd._same_freeze(frozen_sha, sha)
@@ -1049,7 +1090,7 @@ def _owed_read(db, *, unreadable: Optional[list] = None) -> tuple[list, list, li
             since = [float(ts) for ts in (
                 freeze_ts,
                 row.get("mark_ts") if name in effective else None,
-                manual.get(name)) if ts is not None]
+                manual[name][1] if manual_seat else None) if ts is not None]
             pending.append({"lot": lot_id, "name": name, "sha": frozen_sha,
                             "designated_ts": max(since) if since else None,
                             "title": row.get("title") or "",
@@ -1304,10 +1345,16 @@ def _candidates(listing: Sequence[Mapping], *, loads: Mapping, project: str, fam
 def _manual(db, item: Mapping) -> list:
     """The reviewer names that were designated by hand, not by a past freeze.
 
-    `work_items.reviewers` holds both. The automatic names are exactly the ones
-    a `review-designation:` mark already carries; subtracting them keeps the
-    manual exception visible on a replays and lets a new freeze clear only the
-    names it wrote itself.
+    `work_items.reviewers` holds both. An automatic name is one a
+    `review-designation:` mark carries; subtracting them keeps the manual
+    exception visible on a replay and lets a new freeze clear only the names
+    it wrote itself. #3602: the name alone is not enough — a pilot may
+    re-designate a name an earlier mark already carried. The manual journal
+    line (`reviewer X designated`) is dated by its journal id: the name is
+    manual again when that gesture follows the latest mark carrying it. A
+    later selection that names the same reviewer makes it automatic again.
+    An unreadable mark set keeps every current name manual (no gesture is
+    dropped on a read we cannot prove).
     """
     from .work_reviewers import designated
 
@@ -1317,11 +1364,22 @@ def _manual(db, item: Mapping) -> list:
         return []
     if not names:
         return []
-    try:
-        automatic = set(_previous_reviewers(db, int(item.get("id") or 0), 0))
-    except Exception:  # noqa: BLE001 - unreadable marks: treat all as manual
+    lot = int((item or {}).get("id") or 0)
+    marks = _marks(db, lot)
+    if marks is None:
         return names
-    return [name for name in names if name not in automatic]
+    carried: dict = {}
+    for row_id, _kind, noted, _ts in marks:
+        for reviewer in noted.get("reviewers") or ():
+            name = str((reviewer or {}).get("name") or "").strip()
+            if name:
+                carried[name] = max(carried.get(name, 0), int(row_id))
+    manual = _manual_designations(db, lot)
+    if manual is None:
+        return [name for name in names if name not in carried]
+    return [name for name in names
+            if name not in carried
+            or (name in manual and manual[name][0] > carried[name])]
 
 
 def _waiver(item: Mapping) -> bool:
@@ -1540,12 +1598,24 @@ def prepare(cfg, db, lot: int, *, freeze: Optional[Mapping] = None,
                   advances=_advances(db))
 
 
+#: #3572 : le texte de la note et l'erreur du bloc, passés par réglages locaux
+#: à la transaction (jamais interpolés dans le corps PL/pgSQL)
+_LOWERING_NOTE = "ameesh.canon_lowering_note"
+_LOWERING_ERROR = "ameesh.canon_lowering_error"
+
+
 def _note_canon_lowering(db, item: Mapping, freeze: Mapping, inputs: Inputs) -> None:
     """#3554 : la liste des fichiers abaissés au journal, une fois par tête.
 
     Best-effort : un journal qui refuse ne perd ni le gel ni sa désignation.
     La ligne porte le préfixe `canon-review-lowering:` et les commits exacts ;
-    `once=True` déduit un rejeu de la même tête.
+    un rejeu de la même tête ne la double pas.
+
+    #3572 : dans la transaction du gel, l'écriture passe par un bloc PL/pgSQL
+    à exception, une sous-transaction côté serveur sur les deux pilotes (sous
+    psql, la première erreur ferme la session : un SAVEPOINT client ne
+    rattraperait rien). La note est écrite, ou l'échec est consigné sur stderr
+    et la transaction du gel continue.
     """
     lowering = getattr(inputs.policy, "canon_lowering", None)
     if not lowering or not int(lowering.get("floor") or 0):
@@ -1554,9 +1624,39 @@ def _note_canon_lowering(db, item: Mapping, freeze: Mapping, inputs: Inputs) -> 
     if not text:
         return
     try:
-        work.note(db, int(item["id"]), text, actor=SENDER, once=True)
+        if db_mod.in_transaction(db):
+            _note_in_transaction(db, int(item["id"]), text)
+        else:
+            work.note(db, int(item["id"]), text, actor=SENDER, once=True)
     except Exception:  # noqa: BLE001 - la trace au mieux, le gel reste
         pass
+
+
+def _note_in_transaction(tx, lot: int, text: str) -> None:
+    """La note `once` du journal de baisse, isolée dans un bloc à exception."""
+    tx.query("SELECT set_config(%s, %s, true) AS note, set_config(%s, '', true)"
+             " AS error", (_LOWERING_NOTE, text, _LOWERING_ERROR))
+    body = (
+        "DECLARE v_note text := current_setting(%(note)s); "
+        "BEGIN "
+        "PERFORM 1 FROM work_items WHERE id = %(lot)d FOR NO KEY UPDATE; "
+        "INSERT INTO work_item_events (work_item_id, state, note, actor) "
+        "SELECT w.id, w.state, v_note, %(actor)s FROM work_items w "
+        "WHERE w.id = %(lot)d AND NOT EXISTS (SELECT 1 FROM work_item_events e "
+        "WHERE e.work_item_id = w.id AND e.note = v_note); "
+        "IF FOUND THEN "
+        "UPDATE work_items SET updated_at = now() WHERE id = %(lot)d; "
+        "END IF; "
+        "EXCEPTION WHEN query_canceled OR OTHERS THEN "
+        "PERFORM set_config(%(error)s, SQLERRM, true); "
+        "END" % {"note": db_mod.sql_literal(_LOWERING_NOTE), "lot": int(lot),
+                 "actor": db_mod.sql_literal(SENDER),
+                 "error": db_mod.sql_literal(_LOWERING_ERROR)})
+    tx.execute("DO " + db_mod.sql_literal(body))
+    rows = tx.query("SELECT current_setting(%s) AS error", (_LOWERING_ERROR,))
+    if rows and rows[0]["error"]:
+        print("ameesh: canon lowering journal of lot #%d not recorded: %s"
+              % (int(lot), rows[0]["error"]), file=sys.stderr)
 
 
 # --------------------------------------------------------------------------
@@ -1573,16 +1673,12 @@ def _floor_prefix(lot: int, freeze_id: int, floor: int) -> str:
 
 
 def _floor_of(db, lot: int, cfg) -> int:
-    """The lot's current review floor, 0 when the journal cannot be read.
+    """The lot's current review floor; raises when the journal cannot be read.
 
-    A read failure is not guessed here: `prepare` reads the same floor and
-    fails closed (`Unavailable`), which is the path that matters for a
-    designation. This cheap read only decides whether a recorded designation
-    should be completed."""
-    try:
-        return int(review_floor.of_lot(db, int(lot), cfg=cfg).get("floor") or 0)
-    except Exception:  # noqa: BLE001 - prepare will report it, fail closed
-        return 0
+    #3592 : an unreadable journal must not read as a floor of 0, otherwise a
+    recorded designation looks complete and its completion is skipped without
+    a trace. The caller reports the failure and writes nothing."""
+    return int(review_floor.of_lot(db, int(lot), cfg=cfg).get("floor") or 0)
 
 
 def _mark_covers(mark: Mapping, floor: int, *, column=None) -> bool:
@@ -1784,17 +1880,19 @@ def _previous_reviewers(db, lot: int, freeze_id: int) -> list:
 
     Only the journal marks are read: a name that never appeared in a mark is a
     manual designation and must survive a new freeze. A `waiting` designation
-    names no reviewer. A carried mark (#2487) is an automatic designation too.
+    may name the seats already provided (#3596): they are automatic too, so
+    they are read here — a new freeze retires them like any automatic name
+    unless the pilot re-designated them after the mark (#3602, `_manual` and
+    `_sync_reviewers` compare the dated manual lines themselves). A carried
+    mark (#2487) is an automatic designation too.
     """
     names: list[str] = []
-    for _row_id, kind, noted, _ts in _marks(db, lot) or ():
+    for _row_id, _kind, noted, _ts in _marks(db, lot) or ():
         try:
             noted_freeze = int((noted.get("freeze") or {}).get("id") or 0)
         except (TypeError, ValueError):
             continue
         if noted_freeze == int(freeze_id):
-            continue
-        if kind == "designation" and noted.get("state") != rd.DESIGNATED:
             continue
         for reviewer in noted.get("reviewers") or ():
             name = str((reviewer or {}).get("name") or "").strip()
@@ -1932,7 +2030,12 @@ def _sync_reviewers(db, item: Mapping, freeze: Mapping, names, *, text: str = ""
     freeze — the last one in journal order, selection or carried (#2487): a
     late carry therefore removes the selection it supersedes, even in the same
     freeze. A name that never appeared in a mark is a manual designation and is
-    preserved. A manual waiver (`-none`) is never overridden.
+    preserved. #3602: a name a mark carried, then re-designated by hand after
+    that mark, is preserved too — the journal id of the manual gesture orders
+    it against each carrying mark, so a later selection naming the same
+    reviewer makes it automatic again. A manual waiver (`-none`) is never
+    overridden. An unreadable manual journal retires nothing: a pilot's
+    gesture is never dropped on a read we cannot prove.
 
     `text`, when given, is the journal line of this sync (a verdict carry keeps
     the reported reviewers instead of designating, #2487)."""
@@ -1959,15 +2062,27 @@ def _sync_reviewers(db, item: Mapping, freeze: Mapping, names, *, text: str = ""
     marks = _marks(db, lot)
     if marks is None:
         return                    # journal illisible : aucun nom retiré
-    effective = _effective_mark(db, lot, freeze_id) if names else None
+    # The effective mark of this freeze is authoritative even when the caller
+    # names no new reviewer: a partial waiting designation (#3596) keeps the
+    # seats it already provided, exactly like a carried mark (#2487).
+    effective = _effective_mark(db, lot, freeze_id)
     keep_marks = {effective[0]} if effective else set()
+    manual = _manual_designations(db, lot)
     retired = set()
-    for row_id, _kind, noted, _ts in marks:
-        if row_id in keep_marks:
-            continue
-        for reviewer in noted.get("reviewers") or ():
-            name = str((reviewer or {}).get("name") or "").strip()
-            if name:
+    if manual is not None:
+        for row_id, _kind, noted, _ts in marks:
+            if row_id in keep_marks:
+                continue
+            for reviewer in noted.get("reviewers") or ():
+                name = str((reviewer or {}).get("name") or "").strip()
+                if not name:
+                    continue
+                gesture = manual.get(name)
+                if gesture is not None and gesture[0] > row_id:
+                    # #3602: the pilot re-designated this name after the mark
+                    # that carries it; the dated journal gesture wins over the
+                    # automatic past.
+                    continue
                 retired.add(name)
     keep = [name for name in current if name not in retired]
     wanted = [str((reviewer or {}).get("name") or "").strip()
@@ -2270,8 +2385,9 @@ def _manual_outcome(db, item: Mapping, freeze: Mapping, manual: Sequence[str], *
 
     The note says why no automatic reviewer was added. The column is synced
     with an empty selection so a previous freeze's automatic names are retired
-    while the manual names survive (`_sync_reviewers` never removes a name that
-    no mark carries) and a `-none` waiver is never overridden.
+    while the manual names survive (`_sync_reviewers` keeps a name no mark
+    carries, and now also a name the pilot re-designated after the mark that
+    carried it, #3602) and a `-none` waiver is never overridden.
 
     `unknown` (#2637): the selection could not compute the coverage (prepare
     failed, or the policy is unavailable). The note no longer claims the manual
@@ -2295,6 +2411,10 @@ def _manual_outcome(db, item: Mapping, freeze: Mapping, manual: Sequence[str], *
                 " reviewer(s) already cover the required review(s) (%s); the"
                 " manual designation remains the journaled exception"
                 % (_freeze_label(freeze), ", ".join(manual)))
+        # #3596: the retry queue reads this marker instead of re-reading the
+        # policy for every manual seat; the freeze id keeps it bounded.
+        text = "%s%d:%d: %s" % (MANUAL_PREFIX, lot,
+                                int((freeze or {}).get("id") or 0), text)
         why = "manual reviewer designation"
     if note:
         storage.of(db).work.note(lot, str((item or {}).get("state") or ""), text, SENDER)
@@ -2406,7 +2526,9 @@ def _designate_in_transaction(cfg, tx, lot: int, *, milestone: Optional[Mapping]
             _sync_reviewers(tx, item, freeze, [])
         else:
             out = _selection(inputs, pg.PgPort(tx, after_commit=threads))
-            if out.get("state") == rd.DESIGNATED:
+            if out.get("state") in (rd.DESIGNATED, rd.WAITING):
+                # #3596 : une désignation partielle reste `waiting` et nomme
+                # les sièges déjà pourvus ; la colonne les garde.
                 _sync_reviewers(tx, item, freeze,
                                 [r.get("name") for r in out.get("reviewers") or ()])
             else:
@@ -2674,9 +2796,21 @@ def designate(cfg, db, lot: int, *, freeze: Optional[Mapping] = None,
                 "why": "manual waiver (-none)"}
     # #3557 : un plancher posé après le gel relève le besoin ; la désignation
     # enregistrée doit être **complétée** pour ce même gel, pas rejouée telle
-    # quelle. `floor` vaut 0 quand le journal est illisible : `prepare` le
-    # relit et échoue fermé, la complétion ne devine rien.
-    floor = _floor_of(db, int(lot), cfg)
+    # quelle. #3592 : un journal illisible n'est pas un plancher nul — une
+    # marque enregistrée n'est pas rendue comme si un plancher de 0 la
+    # couvrait ; la complétion rapporte l'échec et n'écrit rien (marque et
+    # colonne restent la désignation valide du gel).
+    floor_error = ""
+    try:
+        floor = _floor_of(db, int(lot), cfg)
+    except Exception as exc:  # noqa: BLE001 - fail closed, never guess 0
+        floor_error = "%s: %s" % (type(exc).__name__, str(exc)[:200])
+        floor = 0
+    if floor_error and force:
+        return {"state": "unavailable", "reviewers": [], "freeze": freeze,
+                "why": ("review floor unreadable: %s; the designation of "
+                        "freeze #%s is left untouched"
+                        % (floor_error, freeze.get("id")))}
     # the live reviewer column, the same reading `_kept_seats` and the port
     # use: a seat the pilot removed is not part of the designation any more
     live = None
@@ -2694,7 +2828,14 @@ def designate(cfg, db, lot: int, *, freeze: Optional[Mapping] = None,
             # #2487 : la dernière marque du gel fait foi, sélection ou report.
             # Une sélection `waiting` est retentée : la capacité peut être
             # revenue, et la même marque devient `designated`.
-            if effective[1] == "carried":
+            if floor_error:
+                # #3592 : ne pas rendre la marque ; `prepare` relit le
+                # plancher et échoue fermé, la branche « complétion » rend
+                # `unavailable` sans écrire.
+                shape = (_carried_shape(effective[2])
+                         if effective[1] == "carried" else dict(effective[2]))
+                completion = {"mark_id": int(effective[0]), "shape": shape}
+            elif effective[1] == "carried":
                 carried = _carried_shape(effective[2])
                 if _mark_covers(carried, floor, column=live):
                     return carried
@@ -2708,7 +2849,7 @@ def designate(cfg, db, lot: int, *, freeze: Optional[Mapping] = None,
                 # par la même sélection déterministe (famille opposée, charge,
                 # disponibilité) et notifiés.
                 completion = {"mark_id": int(effective[0]), "shape": existing}
-        if completion is None:
+        if completion is None and not floor_error:
             plan = carried_plan(cfg, db, int(lot), str(freeze.get("sha") or ""))
             if plan:
                 with db.transaction() as tx:
@@ -2751,9 +2892,10 @@ def designate(cfg, db, lot: int, *, freeze: Optional[Mapping] = None,
         # #3554 : même journal hors du hook (reprise), une fois par tête.
         _note_canon_lowering(db, item, freeze, inputs)
         if _manual_covers(inputs):
-            return {"state": "manual", "reviewers": [], "freeze": freeze,
-                    "why": "manual reviewer(s) already cover the required review(s): %s"
-                           % ", ".join(inputs.manual)}
+            # #3596 : la couverture manuelle finale est marquée au journal
+            # (`MANUAL_PREFIX`) pour que la boucle de reprise ne relise pas la
+            # politique à chaque passe.
+            return _manual_outcome(db, item, freeze, inputs.manual)
         if completion is not None:
             # #3557 : la désignation du gel est complétée, jamais remplacée.
             if not inputs.paths or inputs.policy.required == 0:
@@ -2810,7 +2952,7 @@ def designate(cfg, db, lot: int, *, freeze: Optional[Mapping] = None,
             out = _selection(inputs, pg.PgPort(tx, after_commit=threads,
                                                 at_freeze=False), force=force)
             names = ([r.get("name") for r in out.get("reviewers") or ()]
-                     if out.get("state") == rd.DESIGNATED else [])
+                     if out.get("state") in (rd.DESIGNATED, rd.WAITING) else [])
             _sync_reviewers(tx, item, freeze, names)
             try:
                 _notify_superseded_blocks(tx, item, freeze, out, threads)
@@ -2883,24 +3025,24 @@ def reviewers(cfg, db, lot: int, *, apply: bool = False) -> dict:
 def _retry_resolved(db, lot: int, freeze: Mapping) -> bool:
     """True when this freeze already has a final outcome.
 
-    A manual designation, a `none` note or a designated/light mark is final. A
-    `waiting` mark is not: capacity or evidence may have returned, which is
+    A `none` note, a manual designation whose coverage is journaled
+    (`MANUAL_PREFIX`, #3596), a carried/designated mark or a light outcome is
+    final. A **manual seat alone** is not trusted as final: the retry reads
+    the coverage once, and `designate` either writes the manual marker (it
+    covers) or provides the missing automatic seat beside it. A `waiting`
+    mark is not final: capacity or evidence may have returned, which is
     exactly what a retry is for (#1617).
     """
-    try:
-        item = work.get(db, int(lot))
-        if item is not None and _manual(db, item):
-            return True
-    except Exception:  # noqa: BLE001 - unreadable manual list: retry the freeze
-        pass
     freeze_id = int((freeze or {}).get("id") or 0)
     since = float((freeze or {}).get("at_ts") or 0.0)
-    try:
-        if storage.of(db).work.events_noted(
-                "%s%d:%d:" % (NONE_PREFIX, int(lot), freeze_id), since, ids=[int(lot)]):
-            return True
-    except Exception:  # noqa: BLE001 - unreadable journal: let `designate` decide
-        pass
+    for prefix in (NONE_PREFIX, MANUAL_PREFIX):
+        try:
+            if storage.of(db).work.events_noted(
+                    "%s%d:%d:" % (prefix, int(lot), freeze_id), since,
+                    ids=[int(lot)]):
+                return True
+        except Exception:  # noqa: BLE001 - unreadable journal: retry the freeze
+            pass
     # #2487: the effective mark of the freeze can be a carried one (verdicts
     # reported from an earlier head); it is final too, exactly like a
     # designation. A waiting selection is retried.
@@ -2910,7 +3052,8 @@ def _retry_resolved(db, lot: int, freeze: Mapping) -> bool:
     effective = marks[-1]
     if effective[1] == "carried":
         return True
-    return str((effective[2] or {}).get("state") or "") in (rd.DESIGNATED, rd.NONE)
+    state = str((effective[2] or {}).get("state") or "")
+    return state in (rd.DESIGNATED, rd.NONE)
 
 
 def _cursor_path(cfg, name: str) -> str:
@@ -2980,10 +3123,11 @@ def retry_pending(cfg, db, *, limit: int = RETRY_LIMIT) -> dict:
 
     The pass is a **fair slice** of the queue, not the newest 20 notes again:
     `RETRY_CURSOR` keeps the last note examined, the pass resumes after it and
-    wraps at the end. A resolved lot (manual, `none`, carried or designated) is
-    skipped without consuming an attempt, and a note that no longer matches the
-    lot's latest freeze is skipped too; neither can hold a slot forever. A
-    blocked or unavailable lot itself does not vanish: it is seen again on the
+    wraps at the end. A resolved lot (manual coverage journaled, `none`,
+    carried or designated) is skipped without consuming an attempt, and a note
+    that no longer matches the lot's latest freeze is skipped too; neither can
+    hold a slot forever. A blocked or unavailable lot itself does not vanish:
+    it is seen again on the
     next turn of the cursor. A new freeze's note is a new id, so the cursor
     reaches it on its next turn; the link to the freeze is re-read on every
     pass, never stored in the cursor.
