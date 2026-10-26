@@ -334,11 +334,14 @@ def _in_use(db) -> set[str]:
 
 
 def orphan_schemas(db, *, min_age_s: float | None = None,
-                   now: float | None = None) -> list[Orphan]:
+                   now: float | None = None,
+                   only: frozenset[str] | set[str] | None = None) -> list[Orphan]:
     """Schémas ``t_*`` orphelins prouvés : assez vieux, aucune session.
 
     Un schéma sans relation n'a pas d'âge prouvable : il est gardé (le doute
-    ne supprime rien).
+    ne supprime rien). ``only`` borne la passe à ces noms (témoins : le banc
+    est partagé, un âge minimal abaissé n'y vise jamais les schémas des autres
+    suites).
     """
     minimum = orphan_min_age_s() if min_age_s is None else float(min_age_s)
     if minimum < 0:
@@ -353,6 +356,8 @@ def orphan_schemas(db, *, min_age_s: float | None = None,
     for row in rows:
         name = str(row["schema"])
         if not SCHEMA_RE.match(name):
+            continue
+        if only is not None and name not in only:
             continue
         if name in used:
             continue
@@ -396,7 +401,8 @@ class Purge:
 
 def purge_orphans(db, *, min_age_s: float | None = None,
                   now: float | None = None, dry_run: bool = False,
-                  budget_s: float = PURGE_BUDGET_S) -> Purge:
+                  budget_s: float = PURGE_BUDGET_S,
+                  only: frozenset[str] | set[str] | None = None) -> Purge:
     """Purge les orphelins prouvés, un par un, sous verrou court et budget.
 
     Un `DROP SCHEMA ... CASCADE` qui n'obtient pas son verrou échoue et le
@@ -405,7 +411,7 @@ def purge_orphans(db, *, min_age_s: float | None = None,
     ``lock_timeout``.
     """
     try:
-        orphans = orphan_schemas(db, min_age_s=min_age_s, now=now)
+        orphans = orphan_schemas(db, min_age_s=min_age_s, now=now, only=only)
     except BenchError as exc:
         count = 0
         try:

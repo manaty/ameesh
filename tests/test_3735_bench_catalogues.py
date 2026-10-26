@@ -3,8 +3,10 @@
 
 Témoins du lot : un schéma `t_*` assez vieux et sans session est purgé ; un
 schéma tenu par une session active est gardé ; un schéma récent est gardé ; un
-dernier autovacuum ancien est signalé. Le banc réel n'est pas modifié par ces
-témoins : ils travaillent sur la base jetable de la suite (`AMEESH_TEST_DSN`).
+dernier autovacuum ancien est signalé. La base de la suite (`AMEESH_TEST_DSN`)
+est le banc partagé de l'hôte : avec un âge minimal abaissé, les purges des
+témoins sont bornées à leurs propres schémas (`only`), jamais ceux des suites
+voisines.
 """
 from __future__ import annotations
 
@@ -45,6 +47,7 @@ class BenchCataloguesTest(PgTestCase):
         young = _name("young")
         self._create(old)
         self._create(active)
+        mine = {old, active, young}
         # l'âge lu est celui de la première relation : une seconde de marge
         # suffit pour distinguer « vieux » de « créé après la mesure ».
         time.sleep(1.1)
@@ -53,13 +56,14 @@ class BenchCataloguesTest(PgTestCase):
             with other.transaction() as tx:
                 tx.query('SELECT * FROM "%s".x' % active)
                 found = {orphan.schema for orphan in bench_mod.orphan_schemas(
-                    self.db, min_age_s=0.5)}
+                    self.db, min_age_s=0.5, only=mine)}
                 self.assertIn(old, found)
                 self.assertNotIn(active, found)   # session qui tient un verrou
-                dry = bench_mod.purge_orphans(self.db, min_age_s=0.5, dry_run=True)
+                dry = bench_mod.purge_orphans(self.db, min_age_s=0.5, dry_run=True,
+                                             only=mine)
                 self.assertIn(old, [schema for schema, _ in dry.kept])
                 self.assertTrue(self._exists(old))
-                result = bench_mod.purge_orphans(self.db, min_age_s=0.5)
+                result = bench_mod.purge_orphans(self.db, min_age_s=0.5, only=mine)
         finally:
             other.close()
         self.assertIn(old, result.dropped)
@@ -68,9 +72,20 @@ class BenchCataloguesTest(PgTestCase):
         self.assertTrue(self._exists(active))
         # le schéma créé après la mesure est trop jeune : jamais purgé
         self._create(young)
-        fresh = bench_mod.purge_orphans(self.db, min_age_s=3600.0)
+        fresh = bench_mod.purge_orphans(self.db, min_age_s=3600.0, only=mine)
         self.assertNotIn(young, fresh.dropped)
         self.assertTrue(self._exists(young))
+
+    def test_purge_scoped_to_only_spares_neighbours(self) -> None:
+        mine = _name("mine")
+        neighbour = _name("neighbour")   # la classe d'une autre suite, inactive
+        self._create(mine)
+        self._create(neighbour)
+        time.sleep(1.1)
+        result = bench_mod.purge_orphans(self.db, min_age_s=0.5, only={mine})
+        self.assertIn(mine, result.dropped)
+        self.assertNotIn(neighbour, result.dropped)
+        self.assertTrue(self._exists(neighbour))
 
     def test_read_counts_orphans_and_catalogs(self) -> None:
         reading = bench_mod.read(self.db)
