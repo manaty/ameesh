@@ -306,7 +306,7 @@ class Gauge:
         return min(max(1.0 - (self.resets_at - now) / self.window_s, 0.0), 1.0)
 
     def pace_cap(self, now: float, multiplier: float = 1.0,
-                 ceiling: float = PACE_CEILING) -> float:
+                 ceiling: float = PACE_CEILING, floor: float = 0.0) -> float:
         """Le plafond de rythme : min(`ceiling`, part écoulée × `multiplier` + 10 points).
 
         `multiplier` (#1075, bureau 13/10) : multiplicateur de rythme propre au
@@ -319,8 +319,13 @@ class Gauge:
         défaut `PACE_CEILING`), ou son plafond de fin de fenêtre
         (`pace_ceiling_end`) quand le relèvement s'applique. Les autres termes
         — marge, part écoulée, utilisation relevée — sont inchangés.
+
+        `floor` (#3647, décision owner #141793 a) : le rythme relevé d'une
+        fenêtre dont la perte prévue au reset dépasse le seuil du canon
+        (`accounts.underused_floor`) ; jamais au-dessus de `ceiling`, et les
+        plafonds fixes s'appliquent ensuite (`accounts.limits`).
         """
-        return min(ceiling, self.elapsed(now) * multiplier + PACE_MARGIN)
+        return min(ceiling, max(self.elapsed(now) * multiplier + PACE_MARGIN, floor))
 
     def used_at(self, now: float) -> float:
         """L'utilisation **valable à `now`** : 0 si la fenêtre est échue (L71).
@@ -333,7 +338,8 @@ class Gauge:
         return 0.0 if self.reset_passed(now) else self.used
 
     def held_cap(self, now: float, reserve: float = 0.0,
-                 multiplier: float = 1.0, ceiling: float = PACE_CEILING) -> float:
+                 multiplier: float = 1.0, ceiling: float = PACE_CEILING,
+                 floor: float = 0.0) -> float:
         """Le seuil effectif de la fenêtre : le rythme moins `reserve` (L242b),
         jamais sous `PACE_MARGIN` quand une réserve s'applique.
 
@@ -356,7 +362,7 @@ class Gauge:
         `ceiling` (#1176) est transmis à `pace_cap` : le plafond du compte ou
         son plafond de fin de fenêtre.
         """
-        cap = max(0.0, self.pace_cap(now, multiplier, ceiling) - reserve)
+        cap = max(0.0, self.pace_cap(now, multiplier, ceiling, floor) - reserve)
         return max(cap, PACE_MARGIN) if reserve else cap
 
     def exceeded(self, now: float, reserve: float = 0.0,

@@ -341,7 +341,9 @@ def _declared_profiles(cfg) -> dict:
     if cfg is None:
         return {}
     try:
-        return accounts_mod.parse(getattr(cfg, "accounts", None) or {})
+        # #3647 : au rythme compilé du canon, comme le choix
+        return accounts_mod.with_canon_pace(
+            cfg, accounts_mod.parse(getattr(cfg, "accounts", None) or {}))
     except accounts_mod.AccountError:
         return {}
 

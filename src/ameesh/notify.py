@@ -149,6 +149,8 @@ DEFAULT_TYPES = ("stopped_with_mail", "orphan_lot", "dead_runner", "idle_with_ma
                  # #1883 : deux configurations de l'hôte déclarent le même nom de
                  # compte vers deux dossiers — lecture ambiguë, compte refusé
                  "account_identity",
+                 # #3647 : un rythme de compte local, hors du canon (§11)
+                 "account_pace_local",
                  # #313 : un autre mesh de l'hôte déclare le même identifiant de
                  # compte — quota et sessions partagés, contraire à 0033
                  "account_shared",
