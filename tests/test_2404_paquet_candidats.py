@@ -843,7 +843,7 @@ class CodeProvenanceTest(unittest.TestCase):
         prov = candidates_script.code_provenance(self.repo, self.target)
         self.assertEqual(prov["code_sha"], self.target)
         self.assertEqual(prov["code_relation"], "same")
-        self.assertTrue(prov["code_contains_target"])
+        self.assertTrue(prov["code_contains_ref"])
         self.assertFalse(prov["code_dirty"])
         self.assertEqual(candidates_script.code_refusal(prov, self.target), "")
 
@@ -853,7 +853,7 @@ class CodeProvenanceTest(unittest.TestCase):
         prov = candidates_script.code_provenance(self.repo, self.target)
         self.assertEqual(prov["code_sha"], ahead)
         self.assertEqual(prov["code_relation"], "ahead")
-        self.assertTrue(prov["code_contains_target"])
+        self.assertTrue(prov["code_contains_ref"])
         refusal = candidates_script.code_refusal(prov, self.target)
         self.assertIn("en avance", refusal)
         self.assertIn(self.target[:12], refusal)
@@ -865,7 +865,7 @@ class CodeProvenanceTest(unittest.TestCase):
         _git(self.repo, "switch", "-q", "--detach", self.target)
         prov = candidates_script.code_provenance(self.repo, ahead)
         self.assertEqual(prov["code_relation"], "behind")
-        self.assertFalse(prov["code_contains_target"])
+        self.assertFalse(prov["code_contains_ref"])
         self.assertIn("antérieur", candidates_script.code_refusal(prov, ahead))
 
     def test_an_unrelated_code_is_refused(self):
@@ -875,7 +875,7 @@ class CodeProvenanceTest(unittest.TestCase):
         prov = candidates_script.code_provenance(self.repo, self.target)
         self.assertNotEqual(prov["code_sha"], self.target)
         self.assertEqual(prov["code_relation"], "diverged")
-        self.assertFalse(prov["code_contains_target"])
+        self.assertFalse(prov["code_contains_ref"])
         self.assertIn("sans rapport",
                       candidates_script.code_refusal(prov, self.target))
 
@@ -892,11 +892,80 @@ class CodeProvenanceTest(unittest.TestCase):
         self.assertEqual(prov["code_relation"], "dirty")
         self.assertIn("non commit", candidates_script.code_refusal(prov, self.target))
 
+    def test_an_untracked_module_shadow_is_refused(self):
+        # Relecture cx2 B/P2 : un paquet non suivi sous src masque un module.
+        _write(self.repo, "src/ameesh/packet_candidates/__init__.py", "shadow\n")
+        prov = candidates_script.code_provenance(self.repo, self.target)
+        self.assertTrue(prov["code_dirty"])
+        self.assertEqual(prov["code_relation"], "dirty")
+        self.assertIn("non commit",
+                      candidates_script.code_refusal(prov, self.target))
+
     def test_an_unreadable_head_is_refused(self):
         prov = candidates_script.code_provenance(
             os.path.join(self.tmp, "absent"), self.target)
         self.assertEqual(prov["code_relation"], "unknown")
         self.assertIn("inconnu", candidates_script.code_refusal(prov, self.target))
+
+
+class CodeReferenceTest(unittest.TestCase):
+    """#3782 : la référence de l'outillage, distincte de la cible du projet.
+
+    Pour le projet ameesh (même origine que le dépôt du code), la référence
+    est la tête de la cible. Pour un autre projet (Nexlink), la cible est un
+    commit du projet : la référence est `origin/main` du dépôt du code.
+    """
+
+    def setUp(self) -> None:
+        self.tmp = tempfile.mkdtemp(prefix="ameesh-3782-ref-")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.remote = os.path.join(self.tmp, "origin.git")
+        _git(self.tmp, "init", "-q", "--bare", "-b", "main", self.remote)
+        self.repo = os.path.join(self.tmp, "code")
+        os.makedirs(self.repo)
+        _git(self.repo, "init", "-q", "-b", "main")
+        _git(self.repo, "config", "user.name", "banc")
+        _git(self.repo, "config", "user.email", "banc@example.invalid")
+        _git(self.repo, "config", "commit.gpgsign", "false")
+        _write(self.repo, "src/ameesh/__init__.py", "one\n")
+        _commit(self.repo, "base")
+        _git(self.repo, "remote", "add", "origin", self.remote)
+        _git(self.repo, "push", "-q", "-u", "origin", "main")
+        self.ref = _git(self.repo, "rev-parse", "HEAD")
+
+    def project(self, name, remote=None):
+        path = os.path.join(self.tmp, name)
+        os.makedirs(path)
+        _git(path, "init", "-q", "-b", "develop")
+        _git(path, "config", "user.name", "banc")
+        _git(path, "config", "user.email", "banc@example.invalid")
+        _write(path, "README", "x\n")
+        _commit(path, "project")
+        if remote:
+            _git(path, "remote", "add", "origin", remote)
+        return path
+
+    def test_the_same_origin_uses_the_project_target(self):
+        project = self.project("same", self.remote)
+        ref, source = candidates_script.code_reference(
+            self.repo, project, "a" * 40)
+        self.assertEqual((ref, source), ("a" * 40, "project-target"))
+
+    def test_another_project_uses_the_tooling_origin_main(self):
+        other_remote = os.path.join(self.tmp, "other.git")
+        _git(self.tmp, "init", "-q", "--bare", "-b", "develop", other_remote)
+        other = self.project("other", other_remote)
+        ref, source = candidates_script.code_reference(
+            self.repo, other, "b" * 40)
+        self.assertEqual(ref, self.ref)
+        self.assertEqual(source, "tooling-origin-main")
+
+    def test_an_unreadable_origin_main_is_unknown(self):
+        local = os.path.join(self.tmp, "local")
+        os.makedirs(local)
+        _git(local, "init", "-q", "-b", "main")
+        ref, source = candidates_script.code_reference(local, local, "a" * 40)
+        self.assertEqual((ref, source), ("", "unknown"))
 
 
 class ReadyOutTest(unittest.TestCase):
@@ -910,7 +979,7 @@ class ReadyOutTest(unittest.TestCase):
     def provenance(self, relation="same", sha="a" * 40):
         return {"code_sha": sha, "code_repo": self.tmp,
                 "code_relation": relation,
-                "code_contains_target": relation in ("same", "ahead", "dirty"),
+                "code_contains_ref": relation in ("same", "ahead", "dirty"),
                 "code_dirty": relation == "dirty"}
 
     def payload(self, *, errors=None):
@@ -969,6 +1038,8 @@ class ReadyOutTest(unittest.TestCase):
                 mock.patch.object(candidates_script.db, "connect", return_value=conn), \
                 mock.patch.object(candidates_script.merge_queue, "working_clone",
                                   return_value=(self.tmp, None)), \
+                mock.patch.object(candidates_script, "code_reference",
+                                  return_value=("a" * 40, "project-target")), \
                 mock.patch.object(candidates_script, "code_provenance",
                                   return_value=self.provenance()), \
                 mock.patch.object(candidates_script.packet_candidates, "inventory",
@@ -995,6 +1066,8 @@ class ReadyOutTest(unittest.TestCase):
                 mock.patch.object(candidates_script.db, "connect", return_value=conn), \
                 mock.patch.object(candidates_script.merge_queue, "working_clone",
                                   return_value=(self.tmp, None)), \
+                mock.patch.object(candidates_script, "code_reference",
+                                  return_value=("a" * 40, "project-target")), \
                 mock.patch.object(candidates_script, "code_provenance",
                                   return_value=self.provenance()), \
                 mock.patch.object(candidates_script.packet_candidates, "inventory",
@@ -1020,6 +1093,8 @@ class ReadyOutTest(unittest.TestCase):
                                   return_value=(self.tmp, None)), \
                 mock.patch.object(candidates_script.packet_candidates, "inventory",
                                   return_value=self.payload()), \
+                mock.patch.object(candidates_script, "code_reference",
+                                  return_value=("a" * 40, "project-target")), \
                 mock.patch.object(candidates_script, "code_provenance",
                                   return_value=self.provenance("behind", "b" * 40)):
             code = candidates_script.main(
@@ -1041,6 +1116,8 @@ class ReadyOutTest(unittest.TestCase):
                                   return_value=(self.tmp, None)), \
                 mock.patch.object(candidates_script.packet_candidates, "inventory",
                                   return_value=self.payload()), \
+                mock.patch.object(candidates_script, "code_reference",
+                                  return_value=("a" * 40, "project-target")), \
                 mock.patch.object(candidates_script, "code_provenance",
                                   return_value=self.provenance("ahead", "b" * 40)), \
                 contextlib.redirect_stdout(stdout), \
@@ -1049,7 +1126,7 @@ class ReadyOutTest(unittest.TestCase):
                 ["--repo", self.tmp, "--project", "ameesh", "--target", "main",
                  "--ready-out", str(self.path), "--allow-code-mismatch"])
         self.assertEqual(code, 0)
-        self.assertIn("en avance sur la cible", stdout.getvalue())
+        self.assertIn("en avance sur la référence", stdout.getvalue())
         self.assertIn("DÉCALAGE ASSUMÉ", stdout.getvalue())
         self.assertIn("AVERTISSEMENT", stderr.getvalue())
         self.assertIn("code bbbbbbbbbbbb", self.path.read_text(encoding="utf-8"))
@@ -1057,9 +1134,12 @@ class ReadyOutTest(unittest.TestCase):
     def test_script_render_shows_the_code_sha_next_to_the_target(self):
         payload = self.payload()
         payload.update(self.provenance())
+        payload["code_ref"] = "a" * 40
+        payload["code_ref_source"] = "project-target"
         text = candidates_script.render(payload)
         self.assertIn("code aaaaaaaaaaaa", text)
-        self.assertIn("tête de la cible", text)
+        self.assertIn("réf aaaaaaaaaaaa : project-target", text)
+        self.assertIn("la référence exacte", text)
 
 
 class HoldOverrideJournalTest(unittest.TestCase):
@@ -1151,11 +1231,13 @@ class HoldOverrideJournalTest(unittest.TestCase):
                                   return_value=(tmp, None)), \
                 mock.patch.object(candidates_script.packet_candidates, "inventory",
                                   return_value=self.payload()), \
+                mock.patch.object(candidates_script, "code_reference",
+                                  return_value=("a" * 40, "project-target")), \
                 mock.patch.object(candidates_script, "code_provenance",
                                   return_value={"code_sha": "a" * 40,
                                                 "code_repo": tmp,
                                                 "code_relation": "same",
-                                                "code_contains_target": True,
+                                                "code_contains_ref": True,
                                                 "code_dirty": False}), \
                 mock.patch.object(candidates_script, "hold_actor",
                                   return_value="mty-amh-impl-01"), \
