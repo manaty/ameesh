@@ -401,6 +401,9 @@ ameesh work milestone <id> <frozen|verdict> [ok|blocked] [--sha SHA] [--note N] 
                        [--repo R] [--no-static-checks REASON]
         # frozen: the project's static checks (scripts/freeze-checks.py of SHA,
         # run on SHA's tree) pass first; red refuses the freeze (#2542)
+        # a diff that touches the merge gate (paths of the canon rule naming
+        # src/ameesh/fire.py) also runs the gate's database-free contract
+        # classes; unknown gate paths run them too (#3687)
         # frozen SHA: full 40-hex commit, or a 12+ hex abbreviation resolved in
         # the author's repository and written full; HEAD/a branch is refused,
         # and a legacy non-full freeze is a doubt, never a merge (#2786)
