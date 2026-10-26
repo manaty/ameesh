@@ -89,6 +89,13 @@ ajouté à 05:1xZ) est composé après lui avec cette nouvelle version.
    intégré : 72 opérations, **439 refusées**, interface entière **511**. Le
    document est ajusté dans `023a8da3c` ; `tests.test_l107_executor_contract`
    23/23 vert. Aucun avis demandé (§2).
+2. **#3598 × `test_lease`, isolation du banc** (`tests/test_l160e2_land.py`,
+   test seul) : le test du détenteur ajouté par #3598 verrouillait `p:main`,
+   cible de `LeaseDbTest.test_lease`, et laissait le bail expiré dans
+   `merge_locks` ; `test_lease` prenait l'époque 2 et échouait (`2 != 1`,
+   psycopg 6/8, run 40275356197). Le test du détenteur utilise une cible
+   distincte (`h:main`) ; `LeaseDbTest` 8/8 vert. Aucun avis (§2, adaptation
+   de test).
 
 ## Écartés de h-26
 
@@ -116,8 +123,8 @@ attendent leur clôture par `sync-merges` ; ce ne sont pas des unités.
 ## Contrôles
 
 - Composition : 12 unités sur `5d21c7534711` ; aucune fusion en conflit,
-  aucune résolution d'union ; une adaptation (compteurs du contrat médié,
-  ci-dessus).
+  aucune résolution d'union ; deux adaptations (compteurs du contrat médié,
+  isolation de `test_lease` — ci-dessus).
 - Liste calculée `paquet-candidats` sur `5d21c753` : 12 lots prêts au total
   (11 au calcul de 05:0xZ, #3389 ajouté après son avis de 05:08Z) ; 12
   composés ; #3634 non prêt au calcul (avis manquants) et écarté au
@@ -127,9 +134,12 @@ attendent leur clôture par `sync-merges` ; ce ne sont pas des unités.
 - Tests ciblés locaux sur l'arbre intégré : 166 tests OK (2448/3244 coupe
   release, 3589 gel empilé, 2157/2426 composition et clôture de paquet, 3606
   épingles du contrat de train, parts de la carte, 3643 noms critiques) ;
-  23 tests du contrat exécuteur (l107) OK après l'adaptation des compteurs.
-  Les modules de feu, désignation, notify et SLO sont couverts par la
-  ci-full unique sur la tête gelée.
+  23 tests du contrat exécuteur (l107) OK après l'adaptation des compteurs ;
+  `LeaseDbTest` 8/8 après l'adaptation 2. La première ci-full (run
+  40275356197, tête `97fe4ce8b`) a révélé le rouge `test_lease` ci-dessus ;
+  la tête est refaite avec l'adaptation 2 et une nouvelle ci-full unique est
+  demandée. Les modules de feu, désignation, notify et SLO restent couverts
+  par cette ci-full.
 - Contrôle d'inclusion `scripts/paquet-inclusion.py` sur la tête du
   manifeste : aucun défaut ; 12 compositions, 12 contenus présents ;
   #3634 seul écarté au manifeste avec motif.
