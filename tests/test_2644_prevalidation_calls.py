@@ -91,8 +91,28 @@ p.add_argument('--ref', default='')
 a = p.parse_args()
 head = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
 plan = {'schema': 'ameesh-test-plan/1', 'head': head, 'map': {'used': True},
+        'base_arg': a.base,
         'selection': {'mode': 'impacted', 'selected': 1}, 'sure': True,
         'phase2_safe': True, 'classes': {}, 'contract': [], 'parts': {}}
+open(a.out, 'w', encoding='utf-8').write(json.dumps(plan))
+"""
+
+
+FULL_PLAN_SCRIPT = """#!/usr/bin/env python3
+import argparse, json, subprocess
+p = argparse.ArgumentParser()
+p.add_argument('command'); p.add_argument('--out'); p.add_argument('--event')
+p.add_argument('--base')
+p.add_argument('--mode'); p.add_argument('--map', default='')
+p.add_argument('--ref', default='')
+a = p.parse_args()
+head = subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip()
+plan = {'schema': 'ameesh-test-plan/1', 'head': head,
+        'map': {'commit': a.base, 'used': True, 'age_h': 1.0},
+        'selection': {'mode': 'full', 'why': 'test full suite'}, 'sure': False,
+        'phase2_safe': False, 'phase2_why': 'test',
+        'unsure': ['selection unsure (test)'], 'classes': {}, 'contract': [],
+        'parts': {}}
 open(a.out, 'w', encoding='utf-8').write(json.dumps(plan))
 """
 
@@ -275,6 +295,20 @@ class PrepareTest(unittest.TestCase):
             calls.prepare(self.repo.root, self.repo.head, "f" * 40)
         self.assertEqual(caught.exception.cause, "selection-unsafe")
 
+    def test_plan_base_is_the_merge_base_not_the_target_tip(self):
+        # #3800 : comparer le tip de la cible à la tête fait passer les
+        # changements de la cible pour ceux du lot ; `--base` doit être le
+        # merge-base (ici le point de branche).
+        self.repo.write("target.txt", "t\n")
+        target = self.repo.commit("target")
+        git(self.repo.root, "checkout", "-q", "-b", "lot", self.repo.head)
+        self.repo.write("lot.txt", "l\n")
+        branch = self.repo.commit("lot")
+        prepared = calls.prepare(self.repo.root, branch, target)
+        self.addCleanup(prepared.close)
+        self.assertEqual(prepared.plan["base_arg"], self.repo.head)
+        self.assertNotEqual(prepared.plan["base_arg"], target)
+
     def test_failing_script_is_named_and_cleaned(self):
         self.repo.write("scripts/test-plan.py", "import sys\nsys.exit(3)\n")
         head = self.repo.commit("red script")
@@ -318,6 +352,99 @@ class PrepareTest(unittest.TestCase):
                               deadline=deadline)
         self.assertEqual(caught.exception.cause, "run-incomplete")
         self.assertAlmostEqual(seen["timeout"], 0.03)
+
+
+class ContractFallbackTest(unittest.TestCase):
+    """#3800 : sur sélection incertaine, les contrats tournent quand même."""
+
+    def setUp(self):
+        self.repo = Repo(script=FULL_PLAN_SCRIPT)
+        self.addCleanup(self.repo.cleanup)
+        self.repo.write("tests/parts/toujours.txt",
+                        "test_cluster  # rôles du cluster\n"
+                        "test_migrations  # migrations\n")
+        self.repo.write("tests/test_cluster.py", "x = 1\n")
+        self.repo.write("tests/test_l161f_plan.py", "x = 1\n")
+        self.head = self.repo.commit("contracts")
+
+    def block(self):
+        return replace(params(hosts=("vm1",)),
+                       contracts=("tests/parts/toujours.txt",))
+
+    def parameters(self):
+        return calls.Parameters(params=self.block(), repo="/canon",
+                                commit="c" * 40, project="ameesh")
+
+    def test_uncertain_selection_produces_a_contract_plan(self):
+        prepared = calls.prepare(self.repo.root, self.head, self.repo.base)
+        self.addCleanup(prepared.close)
+        fallback = calls.contract_fallback(prepared, self.parameters(),
+                                           head=self.head, base=self.repo.base)
+        self.assertIsNotNone(fallback)
+        plan = prepared.plan
+        self.assertEqual(plan["selection"]["mode"], "contract")
+        self.assertEqual(plan["fallback"]["cause"], "selection-full")
+        modules = plan["parts"]["psycopg"][0]["modules"]
+        self.assertIn("test_cluster", modules)
+        self.assertIn("test_migrations", modules)
+        self.assertIn("test_l161f_plan", modules)
+        self.assertEqual(plan["contract"], ["test_cluster", "test_migrations"])
+        self.assertIn(plan["classes"]["test_l161f_plan"][0], ("P0", "P1"))
+        # la preuve se relit comme une sélection de contrat, pas comme un plan
+        # impacté ordinaire
+        chosen = pv.selection(plan, head=self.head, base=self.repo.base)
+        self.assertTrue(chosen.ok, chosen.why)
+        self.assertEqual(chosen.fallback["cause"], "selection-full")
+
+    def test_run_plays_the_fallback_and_reports_it(self):
+        seen = {}
+
+        def validate(**kw):
+            with open(kw["plan_path"], "r", encoding="utf-8") as fh:
+                seen["plan"] = json.load(fh)
+            return report()
+
+        with mock.patch.object(calls, "parameters", return_value=self.parameters()), \
+                mock.patch.object(calls, "map_for", return_value=("", "")):
+            got = calls.run(None, None, 3800, repo=self.repo.root, head=self.head,
+                            base=self.repo.base, project="ameesh", validate=validate)
+        self.assertTrue(got["ok"])
+        self.assertEqual(seen["plan"]["selection"]["mode"], "contract")
+        self.assertEqual(seen["plan"]["fallback"]["cause"], "selection-full")
+        self.assertEqual(got["fallback"]["cause"], "selection-full")
+        self.assertEqual(got["selection"], "contract")
+
+    def test_train_plays_the_fallback_before_publication(self):
+        seen = {}
+
+        def hosts(prepared, params_, **kw):
+            with open(prepared.path, "r", encoding="utf-8") as fh:
+                seen["plan"] = json.load(fh)
+            return report()
+
+        with mock.patch.object(calls, "parameters", return_value=self.parameters()), \
+                mock.patch.object(calls, "map_for", return_value=("", "")), \
+                mock.patch.object(calls, "_run_hosts", side_effect=hosts):
+            got = calls.gate_train(None, repo=self.repo.root, head=self.head,
+                                   base=self.repo.base)
+        self.assertEqual(got["state"], "green")
+        self.assertEqual(seen["plan"]["selection"]["mode"], "contract")
+        self.assertEqual(got["report"]["fallback"]["cause"], "selection-full")
+
+    def test_packet_gate_uses_the_fallback(self):
+        # #3800 point (3) : le porteur `integration/**` suit la même règle que
+        # le gel d'un lot.
+        with mock.patch.object(calls, "parameters", return_value=self.parameters()), \
+                mock.patch.object(calls, "map_for", return_value=("", "")), \
+                mock.patch.object(calls, "_run_hosts", return_value=report()):
+            got = calls.gate_packet(
+                None, None, {"id": 3800, "app": "ameesh"},
+                {"sha": self.head, "base": self.repo.base,
+                 "branch": "integration/paquet-3800"},
+                repo=self.repo.root)
+        self.assertEqual(got["state"], "green")
+        self.assertEqual(got["report"]["fallback"]["cause"], "selection-full")
+        self.assertEqual(got["report"]["selection"], "contract")
 
 
 class CommitProbeTest(unittest.TestCase):
@@ -498,6 +625,15 @@ class FreezeTest(unittest.TestCase):
         outcome = self.freeze(returns=report())
         self.assertEqual(outcome["state"], "green")
         self.assertTrue(any(n.startswith("prevalidation green") for n in self.notes))
+
+    def test_a_contract_fallback_is_named_in_the_journal(self):
+        # #3800 : le gel dit que la sélection était incertaine et que seuls
+        # les contrats ont tourné.
+        outcome = self.freeze(returns=report(
+            detail=("sélection incertaine (selection-full) : contrats seuls "
+                    "(12 module(s))",)))
+        self.assertEqual(outcome["state"], "green")
+        self.assertTrue(any("contrats seuls" in n for n in self.notes))
 
     def test_red_result_never_blocks_the_freeze(self):
         outcome = self.freeze(returns=report(ok=False, causes=("run-red",),

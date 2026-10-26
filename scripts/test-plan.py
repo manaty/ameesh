@@ -1247,6 +1247,17 @@ def judge(card: dict, changes: list[tuple[str, str]], modules: list[str],
         if path.startswith(CODE_ROOT) and path.endswith(".py"):
             _python(card, impact, status, path, head, repo)
         elif path.endswith(".py"):
+            #: #3800 : un `.py` hors socle est hors de portée de la carte (pas
+            #: de blocs mesurés), mais un changement venu de la **cible** après
+            #: la carte a déjà passé sa suite complète : sans cette exemption,
+            #: l'ajout de `deploy/mise-a-jour/canari-handoff.py` sur `main`
+            #: rendait toute branche de lot « non sûre » et renvoyait chaque
+            #: prévalidation au refus `selection-full`. Même règle que le socle
+            #: et les données : le doute ne tient que si la branche change le
+            #: fichier, ou si son range propre est illisible (`own` inconnu).
+            if own is not None and path not in own:
+                impact.hit(card.get("donnees", {}).get(path, ()), path)
+                continue
             impact.doubt(f"{path}: Python outside {CODE_ROOT} is not measured", path)
         elif path.startswith(MIGRATIONS_DIR) and path.endswith(".sql"):
             _migration(card, impact, status, path, head, repo)
