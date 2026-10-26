@@ -1673,16 +1673,12 @@ def _floor_prefix(lot: int, freeze_id: int, floor: int) -> str:
 
 
 def _floor_of(db, lot: int, cfg) -> int:
-    """The lot's current review floor, 0 when the journal cannot be read.
+    """The lot's current review floor; raises when the journal cannot be read.
 
-    A read failure is not guessed here: `prepare` reads the same floor and
-    fails closed (`Unavailable`), which is the path that matters for a
-    designation. This cheap read only decides whether a recorded designation
-    should be completed."""
-    try:
-        return int(review_floor.of_lot(db, int(lot), cfg=cfg).get("floor") or 0)
-    except Exception:  # noqa: BLE001 - prepare will report it, fail closed
-        return 0
+    #3592 : an unreadable journal must not read as a floor of 0, otherwise a
+    recorded designation looks complete and its completion is skipped without
+    a trace. The caller reports the failure and writes nothing."""
+    return int(review_floor.of_lot(db, int(lot), cfg=cfg).get("floor") or 0)
 
 
 def _mark_covers(mark: Mapping, floor: int, *, column=None) -> bool:
@@ -2800,9 +2796,21 @@ def designate(cfg, db, lot: int, *, freeze: Optional[Mapping] = None,
                 "why": "manual waiver (-none)"}
     # #3557 : un plancher posé après le gel relève le besoin ; la désignation
     # enregistrée doit être **complétée** pour ce même gel, pas rejouée telle
-    # quelle. `floor` vaut 0 quand le journal est illisible : `prepare` le
-    # relit et échoue fermé, la complétion ne devine rien.
-    floor = _floor_of(db, int(lot), cfg)
+    # quelle. #3592 : un journal illisible n'est pas un plancher nul — une
+    # marque enregistrée n'est pas rendue comme si un plancher de 0 la
+    # couvrait ; la complétion rapporte l'échec et n'écrit rien (marque et
+    # colonne restent la désignation valide du gel).
+    floor_error = ""
+    try:
+        floor = _floor_of(db, int(lot), cfg)
+    except Exception as exc:  # noqa: BLE001 - fail closed, never guess 0
+        floor_error = "%s: %s" % (type(exc).__name__, str(exc)[:200])
+        floor = 0
+    if floor_error and force:
+        return {"state": "unavailable", "reviewers": [], "freeze": freeze,
+                "why": ("review floor unreadable: %s; the designation of "
+                        "freeze #%s is left untouched"
+                        % (floor_error, freeze.get("id")))}
     # the live reviewer column, the same reading `_kept_seats` and the port
     # use: a seat the pilot removed is not part of the designation any more
     live = None
@@ -2820,7 +2828,14 @@ def designate(cfg, db, lot: int, *, freeze: Optional[Mapping] = None,
             # #2487 : la dernière marque du gel fait foi, sélection ou report.
             # Une sélection `waiting` est retentée : la capacité peut être
             # revenue, et la même marque devient `designated`.
-            if effective[1] == "carried":
+            if floor_error:
+                # #3592 : ne pas rendre la marque ; `prepare` relit le
+                # plancher et échoue fermé, la branche « complétion » rend
+                # `unavailable` sans écrire.
+                shape = (_carried_shape(effective[2])
+                         if effective[1] == "carried" else dict(effective[2]))
+                completion = {"mark_id": int(effective[0]), "shape": shape}
+            elif effective[1] == "carried":
                 carried = _carried_shape(effective[2])
                 if _mark_covers(carried, floor, column=live):
                     return carried
@@ -2834,7 +2849,7 @@ def designate(cfg, db, lot: int, *, freeze: Optional[Mapping] = None,
                 # par la même sélection déterministe (famille opposée, charge,
                 # disponibilité) et notifiés.
                 completion = {"mark_id": int(effective[0]), "shape": existing}
-        if completion is None:
+        if completion is None and not floor_error:
             plan = carried_plan(cfg, db, int(lot), str(freeze.get("sha") or ""))
             if plan:
                 with db.transaction() as tx:
