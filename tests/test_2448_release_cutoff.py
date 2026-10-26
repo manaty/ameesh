@@ -872,6 +872,69 @@ class PacketTreeGreenTest(ReleaseFixtureMixin, unittest.TestCase):
         self.assertTrue(any("arbre identique" in text for text in report["deviations"]),
                         report["deviations"])
 
+    def test_next_cutoff_starts_from_the_release_on_a_green_tree(self):
+        """#3641 : V, release sur M rouge à arbre vert, est le dernier vert.
+
+        La coupe suivante doit repartir de V (déjà taguée), pas du vert B
+        antérieur : sinon `staging_pending.regressions(B)` voit V actif et
+        retient le paquet suivant (`kept_active` vide de release).
+        """
+        base, _second, head, merge = self.second_packet()
+        reading = self.ci(green=(base, head), failed=(merge,))
+        suites = self.suites(base, head)
+        planned = self.plan(reading, suites)
+        with mock.patch.dict(os.environ,
+                             {"GIT_COMMITTER_DATE": "2026-10-18T11:04:00+0200"}), \
+             mock.patch.object(release_cutoff, "ci_reading", side_effect=reading), \
+             mock.patch.object(release_cutoff, "suite_reading", side_effect=suites):
+            report = release_cutoff.execute(self.cfg, None, self.project,
+                                            now=_paris(11, 5))
+        self.assertEqual(report["result"], "released", report)
+        release_sha = report["release_sha"]
+        self.assertEqual(self.git(self.clone, "rev-parse", "%s^1" % release_sha), merge)
+        # #3641 : la tête est rouge, pas « en cours » ; la preuve d'arbre
+        # reste citée à part dans le rapport et dans l'écart.
+        self.assertTrue(any("CI rouge" in text for text in report["deviations"]),
+                        report["deviations"])
+        body = release_cutoff._report_body(
+            self.project, planned, result="released", version=planned.version,
+            tag="v1.11.8", release_sha=release_sha, staging=None,
+            deviations=report["deviations"], previous=planned.previous,
+            cutoff_at=planned.cutoff_at, cutoff_label=planned.cutoff_label,
+            rules=types.SimpleNamespace(zone=lambda: ZoneInfo("Europe/Paris")))
+        self.assertIn("CI tête: rouge", body)
+
+        plan = self.plan(reading, suites)
+
+        self.assertEqual(plan.head, release_sha)
+        self.assertEqual(plan.base, release_sha)
+        self.assertTrue(plan.empty, plan)
+        self.assertEqual(plan.previous["tag"], "v1.11.8")
+        self.assertFalse(plan.kept_active, plan.kept_active)
+
+
+class HeadCiStateTextTest(unittest.TestCase):
+    """#3641 : le rapport dit l'état lu de la CI de la tête."""
+
+    def test_red_running_cancelled_and_absent_are_named(self):
+        self.assertEqual(release_cutoff.ci_state_text({"green": True}), "verte")
+        self.assertEqual(release_cutoff.ci_state_text(
+            {"green": False, "failed": ["tests [main]"]}), "rouge")
+        self.assertEqual(release_cutoff.ci_state_text(
+            {"green": False, "negative": ["tests"]}), "rouge")
+        self.assertEqual(release_cutoff.ci_state_text(
+            {"green": False, "pending": ["tests [main]"]}), "en cours")
+        self.assertEqual(release_cutoff.ci_state_text(
+            {"green": False, "unconcluded": [{"check": "tests"}]}), "non conclue")
+        self.assertEqual(release_cutoff.ci_state_text(
+            {"green": False, "inconclusive": ["tests"], "failed": ["tests"]}),
+            "non concluante")
+        self.assertEqual(release_cutoff.ci_state_text(
+            {"green": False, "missing": ["tests"]}), "absente")
+        self.assertEqual(release_cutoff.ci_state_text({"green": False, "runs": 0}),
+                         "absente")
+        self.assertEqual(release_cutoff.ci_state_text(None), "absente")
+
 
 class StagingTimeoutTest(unittest.TestCase):
     def test_timeout_accepts_bytes_and_kills_the_process_group(self):
