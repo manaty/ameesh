@@ -24,6 +24,11 @@ STAGING_WORKFLOWS = ("deploy-api.yml", "deploy-web.yml", "deploy-media-worker.ym
 STAGING_SERVICES = dict(zip(STAGING_WORKFLOWS,
     ("nexlink-api-staging", "nexlink-web-staging", "nexlink-media-worker-staging")))
 STAGING_DATABASES = {"hub": "krbuozsvvodmrpixdinc", "content": "ewvfhdihqgoipmsblaed"}
+# #3640: a Nexlink packet lands on develop as
+# `Merge #3654 « Nexlink package 180 on develop — … » (integration/paquet-180-nexlink)`;
+# GitHub's own subject (`Merge pull request #N from owner/integration/…`) is
+# read by release_cutoff.
+_PACKET_MERGE = re.compile(r"^Merge #(\d+) « .* » \((integration/[^\s()]+)\)\s*$")
 
 
 def ci_plan(project, pending):
@@ -155,34 +160,109 @@ def previous_release(project, fallback):
     return known[latest]
 
 
+def packet_head(repo, sha):
+    """#3640: the packet head ^2 a develop merge integrated with its exact tree.
+
+    The subject only names a packet merge; the proof is the second parent
+    carrying the merge's tree (#2692: a conflict resolution proves nothing).
+    """
+    subject = rc._out(repo, "log", "-1", "--format=%s", sha)
+    if not (_PACKET_MERGE.match(subject) or rc._PACKAGE_MERGE.match(subject)):
+        return None
+    parents = rc._out(repo, "rev-list", "--parents", "-n", "1", sha).split()
+    if len(parents) != 3:
+        return None
+    head = parents[2]
+    return head if rc.same_tree(repo, sha, head) else None
+
+
+def _latest_runs(suite):
+    """The latest attempt of each workflow; a skipped run executed nothing."""
+    latest = {}
+    for run in suite.get("runs", ()):
+        if run.get("conclusion") == "skipped":
+            continue
+        workflow = run.get("workflow")
+        if workflow not in latest or int(run["id"]) > int(latest[workflow]["id"]):
+            latest[workflow] = run
+    return latest
+
+
+def tree_green(project, sha, reading):
+    """#3640 (décision owner #141353 a, #3633 pour ameesh): develop's head is
+    green for the cutoff when its tree is a green packet head's.
+
+    Its own CI does not count (red, cancelled, absent or in progress). The
+    packet head must be the merge's ^2 with the same tree, its CI reading
+    green, and every workflow that ran on the head must have its latest
+    attempt successful on the packet head: Nexlink suites are path-filtered,
+    so the head's own workflows are the suite of this content, not the last
+    green commit's. A head without any run inherits from the packet head's
+    green; the final-tree CI (`ci_plan`) still runs before publishing.
+    Returns the evidence or None; a read failure stays transient.
+    """
+    if rc.reading_is_green(reading):
+        return None
+    head = packet_head(project.repo, sha)
+    if head is None:
+        return None
+    if not rc.reading_is_green(rc.ci_reading(project, head)):
+        return None
+    proven = _latest_runs(rc.suite_reading(project, head))
+    required = _latest_runs(rc.suite_reading(project, sha))
+    runs = []
+    for workflow in sorted(required):
+        run = proven.get(workflow)
+        if run is None or run.get("conclusion") != "success":
+            return None
+        runs.append(run)
+    return {"head": head,
+            "tree": rc._out(project.repo, "rev-parse", "--verify", "%s^{tree}" % sha),
+            "required": sorted(required),
+            "runs": [rc._run_evidence(run) for run in runs]}
+
+
+def tree_proof_text(sha, proof):
+    runs = ", ".join(run["url"] or "run %s" % run["id"] for run in proof["runs"])
+    return ("tree of %s equals packet head %s, green on the head's workflows: %s"
+            % (sha[:12], proof["head"][:12], runs or "no run on the head"))
+
+
 def snapshot(project):
     rc.fetch(project.repo, project.remote, project.target)
     rc.fetch(project.repo, project.remote, "main")
     head = rc.commit_of(project.repo, "%s/develop" % project.remote)
     main = rc.commit_of(project.repo, "%s/main" % project.remote)
     reading = rc.ci_reading(project, head)
-    base = head if rc.commit_is_green(project.repo, project, head, reading=reading) else \
-        rc.last_green(project.repo, head, project)
+    proof = None
+    if rc.commit_is_green(project.repo, project, head, reading=reading):
+        base = head
+    else:
+        proof = tree_green(project, head, reading)
+        base = head if proof is not None else rc.last_green(project.repo, head, project)
     if base is None:
         raise rc.ReleaseError("Nexlink develop has no green first-parent commit")
-    return head, base, main, reading
+    return head, base, main, reading, proof
 
 
 def plan(cfg, project, *, now, version=None):
     """Read-only preview; the final merge must still pass its own CI."""
     rules, source = rc.compiled_rules(cfg, project.name)
     at, label = rc.cutoff_slot(rules, now)
-    head, base, main, reading = snapshot(project)
+    head, base, main, reading, proof = snapshot(project)
     value = choose_version(project, version)
     previous = previous_release(project, main)
+    notes = "Merge develop %s + main %s; final-tree CI pending." % (base, main)
+    if proof is not None:
+        notes += " " + tree_proof_text(head, proof)
     return rc.Plan(project=project, rules=rules, canon_commit=source.commit,
                    cutoff_at=at, cutoff_label=label, head=head, ci=reading,
                    green=base == head, last_green=base, base=base,
                    current_version="", previous={"commit": main, "release_commit": previous}, version=value,
                    floor="patch", floor_reason="Nexlink release branch sequence",
                    packets=[], direct=[], migrations=[], included=[], excluded=[],
-                   notes="Merge develop %s + main %s; final-tree CI pending." % (base, main),
-                   empty=rc.same_tree(project.repo, base, previous))
+                   notes=notes, empty=rc.same_tree(project.repo, base, previous),
+                   tree_green=proof)
 
 
 def merge_candidate(project, base, main):
@@ -408,7 +488,7 @@ def execute(cfg, db, project, *, now, force=False, no_staging=False, version=Non
                 slot["last_cutoff"] = at
                 save()
                 return {"result": "missed", "cutoff_at": at}
-            head, base, main, reading = snapshot(project)
+            head, base, main, reading, proof = snapshot(project)
             value = choose_version(project, version)
             sha = merge_candidate(project, base, main)
             previous = previous_release(project, main)
@@ -417,7 +497,7 @@ def execute(cfg, db, project, *, now, force=False, no_staging=False, version=Non
                 version=value, tag="nexlink-" + value, integration="integration/release-" + value,
                 head=head, base=base, main=main, sha=sha, cutoff_at=at, label=label,
                 previous=previous, empty=rc.same_tree(project.repo, previous, sha),
-                canon_commit=source.commit)
+                canon_commit=source.commit, tree_green=proof)
             save()
         elif version and version != pending["version"]:
             raise rc.ReleaseError("a frozen Nexlink cutoff is already in progress")
