@@ -3802,10 +3802,11 @@ def reassign_unreachable(cfg, db, *, limit: int = RETRY_LIMIT) -> dict:
 
     #3685 : a transient read failure (frozen head or policy unreadable) writes
     no consuming note. It is journaled under `REASSIGN_RETRY_PREFIX` and
-    retried on the next pass, up to `REASSIGN_RETRY_MAX`; only a replacement or
-    an explicit "no candidate" consumes the `(freeze, names)` mark. The last
-    transient failure consumes it with a note that leaves the seat to the
-    pilot, so an unreadable head cannot loop or disappear silently.
+    retried on the next pass, at most `REASSIGN_RETRY_MAX` times; only a
+    replacement or an explicit "no candidate" consumes the `(freeze, names)`
+    mark. The failure **after** the last retry consumes it with a note that
+    leaves the seat to the pilot (so `REASSIGN_RETRY_MAX` retries then one
+    final read), so an unreadable head cannot loop or disappear silently.
 
     #3367 : only the dead seats move. A live seat is never replaced, and an
     unreachable reviewer whose verdict is acquired on the exact frozen head
