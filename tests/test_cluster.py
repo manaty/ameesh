@@ -198,6 +198,13 @@ FERMEES = {
     # d'exécution, écrits et lus par le notificateur seul ; état interne fermé
     # aux deux rôles superviseur, aucun GRANT modifié.
     "notify_state": {"scope", "body", "owner", "epoch", "expires_at", "updated_at"},
+    # #3779 (0491) : journal partagé des refus de fenêtre courte (429) et des
+    # départs de tour par compte logique, lu par `ameesh.account_window` et
+    # l'exécuteur, pas par le rôle superviseur ; état interne d'admission,
+    # fermé aux deux rôles, aucun GRANT modifié.
+    "account_rate_events": {"id", "harness", "account", "host", "agent", "kind",
+                            "detail", "at"},
+    "account_turn_starts": {"id", "harness", "account", "host", "agent", "at"},
 }
 #: L232b (0417) : l'état interne du contrôleur de release reste hors contrat,
 #: sauf `host_release_fences.host`, lu par `ameesh_host_gate_state` (l.314).
