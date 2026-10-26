@@ -365,8 +365,15 @@ class OptionalJobReadingTest(unittest.TestCase):
 
 class OptionalJobPlanTest(fixture.ReleaseFixtureMixin, unittest.TestCase):
     def plan(self, *, mac="cancelled", tests="success"):
+        # #3633 : la tête du paquet (^2) porte le même arbre que la tête ; elle
+        # a donc la même suite, sinon son vert ferait hériter la tête (décision
+        # owner #141353 a) et le témoin ne lirait plus la CI propre de la tête.
+        packet = self.git(self.seed, "rev-parse", self.head + "^2")
+
         def jobs(project, sha):
-            return suite(mac=mac, tests=tests) if sha == self.head else suite(mac="success")
+            if sha in (self.head, packet):
+                return suite(mac=mac, tests=tests)
+            return suite(mac="success")
         with mock.patch.object(release.radar, "commit_ci", return_value=rollup()), \
              mock.patch.object(release, "suite_reading", side_effect=jobs):
             return release.build_plan(self.cfg, self.project, now=fixture._paris(11, 5))

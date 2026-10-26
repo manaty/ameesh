@@ -714,14 +714,54 @@ class PacketTreeGreenTest(ReleaseFixtureMixin, unittest.TestCase):
         self.assertIn("reference run", plan.notes)
         self.assertIn("#2000", plan.notes)
 
-    def test_equal_tree_with_a_red_target_never_inherits(self):
-        """Witness 2: arbre égal + main rouge → pas vert."""
+    def test_equal_tree_with_a_red_target_inherits(self):
+        """Witness 2, #3633 (décision owner #141353 a) : arbre égal + paquet
+        vert + main rouge → vert. Avant, un rouge conclu restait rouge."""
         base, _second, head, merge = self.second_packet()
         plan = self.plan(self.ci(green=(base, head), failed=(merge,)),
+                         self.suites(base, head))
+        self.assertTrue(plan.ci.get("failed"), plan.ci)
+        self.assertTrue(plan.green)
+        self.assertEqual(plan.base, merge)
+        self.assertEqual(plan.last_green, merge)
+        self.assertEqual(plan.tree_green["head"], head)
+        self.assertEqual(plan.tree_green["reference"], base)
+        self.assertIn("tree of %s" % merge[:12], plan.notes)
+
+    def test_equal_tree_with_a_target_without_ci_inherits(self):
+        """#3633 : une tête sans aucune lecture de CI (annulée, jamais lancée)
+        hérite de la même façon."""
+        base, _second, head, merge = self.second_packet()
+
+        def reading(project, sha):
+            if sha in (base, head):
+                return {"green": True}
+            return {"green": False, "pending": [], "failed": [],
+                    "missing": ["tests"]}
+
+        plan = self.plan(reading, self.suites(base, head))
+        self.assertTrue(plan.green)
+        self.assertEqual(plan.base, merge)
+        self.assertEqual(plan.tree_green["head"], head)
+
+    def test_a_red_target_with_a_red_packet_head_stays_red(self):
+        """#3633 : l'héritage exige une tête de paquet entièrement verte."""
+        base, _second, head, merge = self.second_packet()
+        plan = self.plan(self.ci(green=(base,), failed=(merge, head)),
                          self.suites(base, head))
         self.assertFalse(plan.green)
         self.assertIsNone(plan.tree_green)
         self.assertEqual(plan.base, base)
+
+    def test_a_red_target_with_a_different_tree_stays_red(self):
+        """#3633 : une résolution de conflit rend l'arbre différent ; le rouge
+        de la cible reste alors rouge."""
+        base, second, head, merge = self.second_packet(conflict=True)
+        plan = self.plan(self.ci(green=(base, second, head), failed=(merge,)),
+                         self.suites(second, head))
+        self.assertFalse(plan.green)
+        self.assertIsNone(plan.tree_green)
+        self.assertEqual(plan.base, second)
         self.assertNotIn("tree of %s" % merge[:12], plan.notes)
 
     def test_different_tree_never_inherits(self):
