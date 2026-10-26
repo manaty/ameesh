@@ -1678,12 +1678,13 @@ def format_text(report: Mapping[str, Any]) -> str:
                             str(row.get("title") or "")[:48]))
             lines.append("         → %s" % row.get("gesture"))
             if row.get("reminder_due"):
-                # #3773 : un tiers extérieur se suit au bureau ; seul un
-                # exécutant owner nommé porte la relance à l'owner.
+                # #3773 : un tiers extérieur (`externe`) se suit au bureau ;
+                # les autres exécutants gardent la règle #3498 (bureau, sinon
+                # owner).
                 lines.append("         ! relance due le %s — porter au %s (canon §10)"
                              % (row.get("reminder") or "?",
-                                "owner" if row.get("who") == "owner"
-                                else "bureau"))
+                                "bureau" if row.get("who") in ("bureau", "externe")
+                                else "owner"))
     else:
         lines.append("Attentes externes, hors --check : aucune.")
     reviews = report.get("reviews_by_reviewer") or []
