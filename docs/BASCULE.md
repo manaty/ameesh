@@ -1394,8 +1394,23 @@ rollback before any switch is a no-op. A preparation failure removes its
 partial directory and leaves the active version untouched. `src-current` and
 `previous-sha` keep their meaning. The helper is
 `deploy/mise-a-jour/bascule.py` (`preparer`, `activer --precedent`, `retour`,
-`etat`), copied to the VM (server and agents) so that install and rollback use
-the same version whatever commit is deployed.
+`menage`, `etat`), copied to the VM (server and agents) so that install and
+rollback use the same version whatever commit is deployed.
+
+Each update creates a complete venv, and `menage` (#3792) stops them from
+accumulating: `activer` applies it at the end of a successful switch
+(best-effort, it never fails the switch), and
+`bascule.py menage --venv <venv>` shows what it would do (`--apply` to remove).
+It keeps the **target** of `venv-courant` (read from the symlink, never from a
+name pattern), the name recorded in `venv.precedent`, and every venv a live
+process names by an absolute path (`/proc/<pid>/cmdline`, or `ps` without
+`/proc`). The `venv-courant` symlink and other links are never candidates —
+only real directories are enumerated — and nothing is removed when the link,
+the share or the processes cannot be read. A venv prepared but never activated
+cannot be told apart from an old one: the cleanup may remove it, and
+`preparer` rebuilds it. `retour` does not clean up: the version it switches
+away from stays on disk for inspection and a retry.
+
 When writing a launcher fails, its temporary file is removed on a best effort
 basis and the previous destination stays intact; a cleanup error preserves the
 original write error.

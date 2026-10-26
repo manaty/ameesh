@@ -273,12 +273,16 @@ class BasculeTest(unittest.TestCase):
         outil.write_text("#!%s/bin/python\nimport pkg1969\nprint(pkg1969.VALUE)\n"
                          % (self.base / "venv-v2"))
         outil.chmod(0o755)
-        vrai_venv(self.base, "v3", "v3", "v3")
-        (self.base / "venv-v3" / bascule.MARKER).write_text(json.dumps({"version": "v3"}))
 
         self.assertEqual(0, activer(self.venv, "v2", precedent="v1"))
         lanceur = self.venv / "bin" / "outil-v2"
         self.assertTrue(lanceur.is_file())
+
+        # #3792 : v3 est préparé APRÈS l'activation de v2. Un venv préparé
+        # d'avance, ni courant ni précédent, serait retiré par le ménage de
+        # l'activation précédente — le préparer après garde le scénario testé.
+        vrai_venv(self.base, "v3", "v3", "v3")
+        (self.base / "venv-v3" / bascule.MARKER).write_text(json.dumps({"version": "v3"}))
 
         # L'activation de v3 écrit ses lanceurs et son marqueur, puis échoue
         # avant la bascule (écriture de la précédente impossible) : le

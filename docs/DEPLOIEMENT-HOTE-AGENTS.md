@@ -192,6 +192,12 @@ disque est haché et comparé aux objets du commit, sans passer par l’index :
 absent, en trop ou au mauvais mode fait refuser l’instantané, qui n’est jamais
 écrasé — le retirer à la main pour le reconstruire.
 
+`installer` prépare ensuite le venv versionné du code visé et bascule le lien
+`venv-courant` ; à la fin d’une bascule réussie, `bascule.py menage` retire les
+anciens `venv-<sha7>` en gardant la cible de `venv-courant`, le nom de
+`venv.precedent` et tout venv qu’un processus vivant nomme par un chemin
+absolu. Le lien `venv-courant` lui-même n’est jamais candidat (#3792).
+
 Après une installation réussie, et seulement en mode agents, `installer` retire
 l’agent GnuPG inutile de la VM : si `~/.gnupg/private-keys-v1.d` est absent ou
 vide, il masque les sockets utilisateur `gpg-agent.socket`,
