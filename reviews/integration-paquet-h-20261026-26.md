@@ -106,6 +106,15 @@ ajouté à 05:1xZ) est composé après lui avec cette nouvelle version.
    observé (1 h 05), donc les deux témoins de niveau ne dépendent plus de
    l'heure de la passe. Aucun avis (§2, adaptation de test) ; #3644 (prêt,
    revu) porte l'isolation du p80 pour le paquet suivant.
+4. **#3631 × classement du rôle superviseur** (`tests/test_cluster.py`, test
+   seul) : la migration 0488 crée `host_resource_slots` sans aucun GRANT ; le
+   garde de classement exige que chaque colonne du schéma soit accordée ou
+   listée fermée. La table est un agrégat interne de l'exécuteur
+   (`lend_basis`), fermé aux deux rôles : classée dans `FERMEES` avec #3631
+   et 0488, comme `notify_liveness`/`role_handover`. La ci-full 40279533609
+   sur `ba3f1b070` l'a révélé (`host_resource_slots.* : refusée — colonne
+   absente du contrat`, psycopg 8/8). `SuperviseurRoleTest` vert (50 s).
+   Aucun avis (§2, adaptation de test), décision pilote du 06:40Z.
 
 ## Écartés de h-26
 
@@ -133,8 +142,9 @@ attendent leur clôture par `sync-merges` ; ce ne sont pas des unités.
 ## Contrôles
 
 - Composition : 12 unités sur `5d21c7534711` ; aucune fusion en conflit,
-  aucune résolution d'union ; trois adaptations (compteurs du contrat médié,
-  isolation de `test_lease`, horloge du banc #3632 — ci-dessus).
+  aucune résolution d'union ; quatre adaptations (compteurs du contrat médié,
+  isolation de `test_lease`, horloge du banc #3632, classement du rôle
+  superviseur — ci-dessus).
 - Liste calculée `paquet-candidats` sur `5d21c753` : 12 lots prêts au total
   (11 au calcul de 05:0xZ, #3389 ajouté après son avis de 05:08Z) ; 12
   composés ; #3634 non prêt au calcul (avis manquants) et écarté au
@@ -151,7 +161,12 @@ attendent leur clôture par `sync-merges` ; ce ne sont pas des unités.
   demandée. La deuxième ci-full (run 40276625764, tête `fb965c9e`) a révélé
   les deux témoins de niveau de `test_3632` (2 au lieu de 3, psql 5/16),
   dépendants de l'heure de la passe ; la tête est refaite avec l'adaptation 3
-  et une nouvelle ci-full unique est demandée. Les modules de feu,
+  et une nouvelle ci-full unique est demandée. La troisième ci-full (run
+  40279533609, tête `ba3f1b070`) a révélé le classement oublié de
+  `host_resource_slots` (psycopg 8/8) ; la tête est refaite avec l'adaptation 4
+  et une nouvelle ci-full unique est demandée. Le run `carte` n'est pas une
+  vérification requise et n'est pas gardé sur la nouvelle tête (consigne
+  pilote du 06:40Z) ; seul `tests` fait foi. Les modules de feu,
   désignation, notify et SLO restent couverts par cette ci-full.
 - Contrôle d'inclusion `scripts/paquet-inclusion.py` sur la tête du
   manifeste : aucun défaut ; 12 compositions, 12 contenus présents ;
