@@ -11,6 +11,10 @@ La proposition lit désormais la marque `review-designation` du dernier gel — 
 lecture exacte de la désignation (`review_authors.reading`) — et écarte toutes
 les familles d'auteur. Sans lecture durable (pas de marque pour ce gel, famille
 d'auteur inconnue), elle ne propose rien : l'indépendance ne se suppose pas.
+
+#3596 : le gel pourvoit désormais le siège disponible et lui écrit ; les
+témoins ci-dessous vérifient puis consomment ce courrier de désignation du gel,
+et ne comptent ensuite que ce que la proposition ajoute.
 """
 from __future__ import annotations
 
@@ -97,7 +101,17 @@ class _Stacked(_ActivationFixture):
 
 
 class PropositionFamillesTest(_Stacked, PgTestCase):
-    def test_le_lot_empile_propose_la_famille_independante(self):
+    def consommer_designation_au_gel(self):
+        """#3596 : le gel pourvoit le siège indépendant disponible (claude,
+        r1) et lui écrit. Les témoins de #2864 ne comptent ensuite que le
+        courrier de la proposition : on vérifie la désignation du gel puis on
+        vide la boîte du relecteur."""
+        mails = self.mails("r1")
+        self.assertEqual(len(mails), 1, mails)
+        self.assertIn("Automatic designation at freeze", mails[0]["body"])
+        self.db.execute("DELETE FROM agent_mailbox WHERE recipient = %s", ("r1",))
+
+    def test_le_lot_empile_designe_la_famille_independante(self):
         _row, outcome = self.freeze()
         self.assertEqual(outcome["state"], rd.WAITING, outcome)
         mark = pg.designation_of(self.marks()[0])
@@ -105,15 +119,19 @@ class PropositionFamillesTest(_Stacked, PgTestCase):
                          {"author": "deepseek", "cx2": "codex"})
         self.assertIn("forbidden", mark["why"])
 
-        out = self.take()
-        self.assertEqual([(t["kind"], t["agent"], t["item"]["id"]) for t in out],
-                         [("review", "r1", self.lot)])
+        # #3596 : le gel pourvoit le siège de la seule famille indépendante
+        # (claude) ; cx1 (codex, auteur de la plage) ne reçoit rien et la
+        # prise ne re-propose pas un siège déjà pourvu.
+        self.consommer_designation_au_gel()
+        self.assertEqual(work.get(self.db, self.lot)["reviewer"], "r1")
+        self.assertEqual(self.take(), [])
         self.assertEqual(self.mails("cx1"), [], "codex est auteur de la plage")
-        self.assertEqual(len(self.mails("r1")), 1)
+        self.assertEqual(self.mails("r1"), [], "le siège désigné n'est pas re-proposé")
         self.assertEqual(work.get(self.db, self.lot)["reviewer"], "r1")
 
     def test_sans_marque_de_designation_aucune_proposition(self):
         self.freeze()
+        self.consommer_designation_au_gel()
         self.retire_marques()
         self.assertEqual(self.take(), [])
         self.assertEqual(self.mails("cx1"), [])
@@ -137,6 +155,7 @@ class PropositionFamillesTest(_Stacked, PgTestCase):
 
     def test_une_marque_sans_liste_inconnue_ne_prouve_rien(self):
         self.freeze()
+        self.consommer_designation_au_gel()
         # La marque la plus récente ne porte pas la liste de complétude : la
         # lecture ne prouve pas l'absence d'auteur inconnu, donc rien n'est
         # proposé (échec fermé), même avec des familles connues.
@@ -148,6 +167,7 @@ class PropositionFamillesTest(_Stacked, PgTestCase):
 
     def test_une_famille_d_auteur_inconnue_ne_propose_rien(self):
         self.freeze()
+        self.consommer_designation_au_gel()
         self.marque([{"name": "author", "family": ""},
                      {"name": "cx2", "family": "codex"}])
         self.assertEqual(self.take(), [])
@@ -156,6 +176,7 @@ class PropositionFamillesTest(_Stacked, PgTestCase):
 
     def test_la_marque_d_un_gel_anterieur_ne_couvre_pas_le_nouveau(self):
         self.freeze()
+        self.consommer_designation_au_gel()
         # nouveau gel sans désignation : la lecture du gel courant manque.
         # Posé au stockage, ce témoin lit les marques, pas la porte du gel.
         storage.of(self.db).work.add_milestone(

@@ -113,9 +113,15 @@ cet ordre sans conflit.
    y garde un saut **conditionnel** à l'absence de `cryptography` ; le test
    vérifie que le saut reste conditionnel et que la part psql installe
    l'extra (test voisin `test_part_psql_installe_cryptography`).
+4. **#3596 × #2864** (`tests/test_2864_proposition_familles.py`, test seul) :
+   la désignation partielle de #3596 pourvoit le siège indépendant disponible
+   dès le gel et lui écrit ; les témoins de #2864 vérifient puis consomment ce
+   courrier de gel, constatent que `r1` (claude) est désigné au gel, que
+   `cx1` (codex, auteur de la plage) ne l'est jamais, et que `take()` ne
+   re-propose pas un siège déjà pourvu. Aucune ligne de code touchée.
 
-Le commit d'adaptation porte l'adaptation 3, plus la mention des adaptations
-1 et 2 consignées dans leurs unités. Aucun avis demandé (§2).
+Le commit d'adaptation porte les adaptations 3 et 4, plus la mention des
+adaptations 1 et 2 consignées dans leurs unités. Aucun avis demandé (§2).
 
 ## Écartés de h-25
 
@@ -144,15 +150,16 @@ paquet.
 ## Contrôles
 
 - Composition : 17 unités sur `fb8b74038e6c9b7ed1143dc9c1baf0c3a71acec1` ;
-  deux conflits mécaniques résolus (#3596/#3557, #3616/#3581) et une
-  adaptation de test (#3616/#3609), sans avis (§2).
+  deux conflits mécaniques résolus (#3596/#3557, #3616/#3581) et deux
+  adaptations de test (#3616/#3609, #3596/#2864), sans avis (§2).
 - Liste calculée `paquet-candidats` sur `fb8b7403` : **18 prêts** ; 15
   composés, #3617 écarté avec motif, #3604 sorti sur consigne du 00:35Z et
   #3584 retiré sur consigne du 01:44Z ; #3596 et #3602 ajoutés sur consigne
   pilote ; #3519 non complet (lecture de porte).
 - Tests ciblés locaux sur l'arbre intégré : 12 tests
   `test_1374_fire.CompleteAuthorsTest` OK ; 66 tests de désignation
-  (1617, 3596, 3602) OK ; 20 tests de contrat et de CI (3562, 3616, 3581,
+  (1617, 3596, 3602) OK ; 6 tests `test_2864_proposition_familles` OK
+  (adaptation 4) ; 20 tests de contrat et de CI (3562, 3616, 3581,
   3606, 2446) OK ; le témoin #2447
   `test_a_manual_reviewer_with_an_unavailable_policy_alerts_and_says_unknown`
   OK. Le module #2447 complet et les autres modules touchés (3557, 2739,
@@ -162,7 +169,11 @@ paquet.
 - Contrôle d'inclusion `scripts/paquet-inclusion.py` sur la tête du
   manifeste : aucun défaut ; 18 prêts, 17 admissions, #3604, #3584 et #3617
   écartés au manifeste ; 14 contenus présents, 3 partiels lus (#3611, #3596,
-  #3616), réécritures attendues par les unités suivantes et l'adaptation.
+  #3616), réécritures attendues par les unités suivantes et les adaptations.
+- La ci-full du gel `8158e9d7aa` (run 40257561779) a révélé 5 rouges
+  `test_2864_proposition_familles` (désignation partielle #3596 non adaptée) ;
+  l'adaptation 4 les corrige, test seul, et la ci-full est relancée sur le
+  nouveau gel.
 - Une seule suite complète sur la tête gelée, après le gel (`ameesh ci run
   <porteur> --full`), pas de CI par lot (§11 bis).
 - Après fusion : `main` reçoit la désignation partielle et la
