@@ -913,10 +913,15 @@ class ActivationTest(_ActivationFixture, PgTestCase):
         self.assertEqual([r["name"] for r in out["reviewers"]], ["r1"])
         self.assertEqual(out["missing"], 1)
 
-    def test_a_freeze_family_different_from_the_commit_turn_waits(self):
-        """#2755 / #2721 N : deux familles prouvées restent ambiguës."""
-        # Le commit précède le tour de gel : leurs familles sont deux preuves
-        # historiques distinctes, pas une divergence avec le registre courant.
+    def test_a_freeze_family_different_from_the_commit_turn_excludes_both(self):
+        """#2755 / #2721 N, #3584 : deux familles prouvées sont toutes exclues.
+
+        Le commit précède le tour de gel : codex et deepseek sont deux preuves
+        historiques distinctes, pas une divergence avec le registre courant.
+        #3584 : cet ensemble n'est ni inconnu ni ambigu — chacune de ses
+        familles est exclue, et la désignation partielle (#3596) pourvoit le
+        siège claude disponible en attendant l'autre famille.
+        """
         self.repo.git("checkout", "-q", "-B", "rotation", self.base)
         stamp = str(int(time.time()) - 120) + " +0000"
         self.repo.dry.update(GIT_AUTHOR_DATE=stamp, GIT_COMMITTER_DATE=stamp)
@@ -938,15 +943,19 @@ class ActivationTest(_ActivationFixture, PgTestCase):
             self.db, "author", float(self.repo.git("log", "-1", "--format=%ct", head)),
             ("claude", "codex", "deepseek")), "codex")
         self.assertEqual(out["state"], rd.WAITING, out)
-        self.assertIn("author family unknown: author", out["why"])
-        self.assertNotIn("provenance unknown", out["why"])
-        self.assertEqual(out["reviewers"], [])
+        self.assertIn("forbidden codex, deepseek", out["why"])
+        self.assertNotIn("unknown", out["why"])
+        self.assertEqual(out["reviewers"], [{"name": "r1", "family": "claude"}])
+        self.assertEqual(out["missing"], 1)
         mark = pg.designation_of(self.marks()[0])
+        self.assertEqual(mark["reviewers"], [{"name": "r1", "family": "claude"}])
         self.assertEqual(mark["authors"], [{
-            "name": "author", "family": "", "proof": "turn-journal",
+            "name": "author", "family": "",
+            "families": ["codex", "deepseek"], "proof": "turn-journal",
             "fallback_commits": [head[:12]],
         }])
-        self.assertEqual([m["recipient"] for m in self.mailbox()], ["pilot"])
+        # #3596 : le siège claude est pourvu dès le gel, l'autre famille attend.
+        self.assertEqual([m["recipient"] for m in self.mailbox()], ["pilot", "r1"])
 
     def test_an_unknown_author_family_waits(self):
         self.db.execute("DELETE FROM turn_costs")

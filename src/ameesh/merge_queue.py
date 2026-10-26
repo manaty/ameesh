@@ -451,6 +451,16 @@ def _actor_family(db, name, families, *, declared=False) -> str:
     return actor_family(db, name, families=families, declared=declared)
 
 
+def _author_families(entry) -> set:
+    """Toutes les familles prouvées d'une entrée auteur (#3584).
+
+    `family` porte la famille unique ; `families` porte l'ensemble quand
+    l'acteur a écrit sous plusieurs familles. Une entrée sans preuve rend un
+    ensemble vide, jamais une famille devinée."""
+    from . import review_designation
+    return review_designation.proven_families(entry)
+
+
 def verdict_family(db, mark, *, families=None, receipt=None) -> str:
     """La famille de modèle d'un verdict (#3578), "" si elle n'est pas connue.
 
@@ -759,8 +769,10 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
     # l'indépendance est prouvée, vide quand la porte se ferme sans la lire.
 
     Rend `{ok, why, class, required, accepted, accepted_unfiltered, blocked,
-    waived, author, author_family, authors, corrections, on_freeze, unproven,
-    completed_ts, vehicle, attribution_read}` ; ne lève jamais.
+    waived, author, author_family, author_families, authors, corrections,
+    on_freeze, unproven, completed_ts, vehicle, attribution_read}` ; ne lève
+    jamais. `author_families` porte toutes les familles prouvées exclues
+    (#3584) ; `author_family` reste la famille unique, vide si plusieurs.
     `attribution_read` prouve une lecture effective de la provenance ; une
     dispense ou une porte sans avis requis ne fournit pas cette preuve.
     """
@@ -940,14 +952,21 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
                               receipt=receipts.get(id(mark)))
 
     provided: dict[str, str] = {}
+    provided_families: dict[str, set] = {}
     for entry in authors or ():
         if isinstance(entry, Mapping):
             name = str(entry.get("name") or "").strip()
             family = str(entry.get("family") or "").strip()
+            proven = _author_families(entry)
         else:
-            name, family = str(entry or "").strip(), ""
-        if name and family:
+            name, family, proven = str(entry or "").strip(), "", set()
+        if not name:
+            continue
+        if family:
             provided.setdefault(name.lower(), family)
+            proven = set(proven) | {family.strip().lower()}
+        if proven:
+            provided_families.setdefault(name.lower(), set()).update(proven)
     # #3397 : la porte se ferme sans lire la plage gelée quand les `ok` de la
     # tête sont déjà trop peu nombreux pour atteindre le compte requis, quels
     # que soient leurs auteurs. `_attribution_on_freeze` lit Git sur chaque
@@ -1068,7 +1087,7 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
     # puis rouvert en claude au registre garde codex comme référence (#2892).
     # `proven_families` distingue une famille vide par absence de preuve d'une
     # famille vide par ambiguïté (B1) : seule l'absence garde le repli
-    # historique, l'ambiguïté refuse plus bas.
+    # historique ; l'ensemble prouvé est exclu famille par famille (#3584).
     reference_entry = next(
         (row for row in range_authors or ()
          if isinstance(row, Mapping) and author
@@ -1093,31 +1112,25 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
             range_authors)
     else:
         reference_is_author = True
-    # #2961 B1 : une famille vide n'est pas toujours une absence de preuve.
-    # `families_out` porte les familles réellement prouvées : >1 pour la
-    # référence est une **ambiguïté** (journal du gel codex + reçu de commit
-    # claude, par exemple), jamais un choix à faire au registre courant
-    # (#2755). L'absence de preuve garde, elle, le repli historique.
+    # #2961 B1 / #3584 : une famille vide n'est pas toujours une absence de
+    # preuve. `families_out` porte les familles réellement prouvées ; >1 pour
+    # la référence (journal du gel codex + reçu de commit claude, par exemple)
+    # n'est pas une ambiguïté à refuser : chacune de ses familles est exclue,
+    # et aucune famille unique n'est devinée au registre courant (#2755).
+    # L'absence de preuve garde, elle, le repli historique.
     reference_proven: set = set()
-    if attribution is not None and author and reference_is_author:
-        reference_proven = set(proven_families.get(author.lower()) or ())
-        if len(reference_proven) > 1:
-            out["error"] = ("ambiguous historical author family for %s: %s"
-                            % (author, ", ".join(sorted(reference_proven))))
-            out["why"] = (
-                "no review verdict ok on the freeze %s (class: %s): the reference "
-                "author %s has %d proven model families (%s), so no verdict can be "
-                "proven independent (canon §2: independence is never assumed)"
-                % (frozen[:12], cls, author, len(reference_proven),
-                   ", ".join(sorted(reference_proven))))
-            return out
+    if author and reference_is_author:
+        if attribution is not None:
+            reference_proven = set(proven_families.get(author.lower()) or ())
+        reference_proven |= set(provided_families.get(author.lower()) or ())
     try:
         if family_of is not None:
             author_family = _family_of(author)
             if not author_family and author.lower() in provided:
                 author_family = provided[author.lower()]
-        elif reference_is_author and len(reference_proven) == 1:
-            author_family = next(iter(reference_proven))
+        elif reference_is_author and reference_proven:
+            author_family = (next(iter(reference_proven))
+                             if len(reference_proven) == 1 else "")
         elif reference_entry is not None and not exact:
             author_family = str(reference_entry.get("family") or "")
             if not author_family:
@@ -1138,40 +1151,27 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
                       % (frozen[:12], cls, exc))
         return out
     out["author_family"] = author_family
-    # #2961 (auditeur) : la même distinction pour les autres auteurs lus. Une
-    # entrée sans famille peut cacher deux familles prouvées ; `_complete_authors`
-    # refuse déjà ce cas (R9 B cx2), la porte du composeur doit faire de même.
-    for entry in authors or ():
-        if not isinstance(entry, Mapping):
-            continue
-        name = str(entry.get("name") or "").strip()
-        if not name or str(entry.get("family") or "").strip():
-            continue
-        if author and name.lower() == author.lower():
-            continue
-        proven = set(proven_families.get(name.lower()) or ())
-        if len(proven) > 1:
-            out["error"] = ("ambiguous historical author family for %s: %s"
-                            % (name, ", ".join(sorted(proven))))
-            out["why"] = (
-                "no review verdict ok on the freeze %s (class: %s): the author %s "
-                "has %d proven model families (%s), so no verdict can be proven "
-                "independent (canon §2: independence is never assumed)"
-                % (frozen[:12], cls, name, len(proven), ", ".join(sorted(proven))))
-            return out
+    # #3584 : un auteur lu sans famille unique mais avec un ensemble prouvé
+    # n'est pas refusé ici : `recognized` porte l'ensemble et la porte exclut
+    # chacune de ses familles. Une entrée sans aucune preuve reste refusée
+    # plus bas (famille inconnue, indépendance non prouvée).
     # #2681/#2808/#2888 : les auteurs **reconnus** de la tête, quand l'appelant
     # les a lus (`review_authors.authors`). Un tiers avec reçu exact et tout
     # relecteur qui a poussé un correctif, même petit, s'y ajoutent : leur
     # famille est exclue.
     recognized: dict = {}
     if author and not exact and reference_is_author:
-        recognized[author.lower()] = {"name": author, "family": author_family}
+        row = {"name": author, "family": author_family}
+        if len(reference_proven) > 1:
+            row["families"] = sorted(reference_proven)
+        recognized[author.lower()] = row
     for entry in authors or ():
         if isinstance(entry, Mapping):
             name = str(entry.get("name") or "").strip()
             family = str(entry.get("family") or "").strip()
+            proven = _author_families(entry)
         else:
-            name, family = str(entry or "").strip(), ""
+            name, family, proven = str(entry or "").strip(), "", set()
         if not name:
             continue
         key = name.lower()
@@ -1184,7 +1184,12 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
             # l'assigné n'est pas une référence : seul un reçu de commit le
             # nomme auteur.
             continue
-        if not family:
+        if family:
+            proven = set(proven) | {family.strip().lower()}
+        if not proven:
+            # Absence de preuve (aucun ensemble) : le repli historique du
+            # registre reste, comme avant #3584. Une famille inconnue y est
+            # refusée par le contrôle strict plus bas.
             try:
                 family = _family_of(name)
             except RegistryReadError as exc:
@@ -1194,11 +1199,24 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
                               "proven independent (canon §2: independence is never assumed)"
                               % (frozen[:12], cls, exc, name))
                 return out
+            if family:
+                proven = {family.strip().lower()}
         known = recognized.get(key)
         if known is None:
-            recognized[key] = {"name": name, "family": family}
-        elif family and not known["family"]:
-            known["family"] = family
+            row = {"name": name, "family": ""}
+            if len(proven) == 1:
+                row["family"] = next(iter(proven))
+            elif len(proven) > 1:
+                row["families"] = sorted(proven)
+            recognized[key] = row
+        else:
+            merged = _author_families(known) | proven
+            known.pop("families", None)
+            if len(merged) > 1:
+                known["family"] = ""
+                known["families"] = sorted(merged)
+            elif len(merged) == 1:
+                known["family"] = next(iter(merged))
     out["authors"] = sorted(recognized.values(), key=lambda entry: entry["name"].lower())
     # L'indépendance ne se suppose jamais (canon §2, décision 18855a) : une
     # classe sensible — y compris un doute de classe, qui peut cacher SQL, la
@@ -1225,14 +1243,20 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
         return out
     if strict:
         for entry in recognized.values():
-            if entry["family"] or entry["name"].lower().startswith(work.HUMAN_PREFIX):
+            # #3584 : un ensemble prouvé (même de plusieurs familles) est une
+            # preuve ; seule une entrée sans aucune famille reste inconnue.
+            if (_author_families(entry)
+                    or entry["name"].lower().startswith(work.HUMAN_PREFIX)):
                 continue
             out["why"] = ("no review verdict ok on the freeze %s (class: %s): the author %s "
                           "has no known model family, so no verdict can be proven "
                           "independent (canon §2: independence is never assumed)"
                           % (frozen[:12], cls, entry["name"]))
             return out
-    author_families = {entry["family"] for entry in recognized.values() if entry["family"]}
+    author_families: set = set()
+    for entry in recognized.values():
+        author_families.update(_author_families(entry))
+    out["author_families"] = sorted(author_families)
     accepted = []
     for mark in sorted((m for m in latest.values() if (m.get("verdict") or "") == "ok"),
                        key=_mark_order):
@@ -1646,9 +1670,10 @@ def _complete_authors(db, item, frozen, repo: str | None, target: str | None,
     #2924 B7 : le clone scratch de `merge-pr` ne contient que la cible et la
     tête. Un gel antérieur réécrit y est absent ; la porte tente de le
     rapatrier par SHA depuis le dépôt de l'agent puis l'origine du projet
-    (`recover`), et ne refuse que si cette récupération échoue. Les familles
-    ambiguës d'un même acteur (`families_out`) refusent la porte, jamais une
-    famille devinée.
+    (`recover`), et ne refuse que si cette récupération échoue. Un acteur
+    prouvé sous plusieurs familles (`families_out`, #3584) rend tout l'ensemble
+    dans `families` : chacune de ses familles est exclue, jamais une famille
+    unique devinée.
 
     Un auteur hors registre (outil, humain non préfixé) n'a pas de famille de
     modèle à comparer : il est omis de la liste, jamais supposé. Un correctif
@@ -1697,15 +1722,19 @@ def _complete_authors(db, item, frozen, repo: str | None, target: str | None,
     proven_families: dict[str, set] = {}
     found: dict[str, dict] = {}
 
-    def add(name, family="") -> None:
+    def add(name, family="", families=()) -> None:
         name = str(name or "").strip()
         if not name or name.lower().startswith(work.HUMAN_PREFIX) or ":" in name:
             return
         key = name.lower()
-        if key not in found:
-            found[key] = {"name": name, "family": str(family or "").strip()}
-        elif family and not found[key]["family"]:
-            found[key]["family"] = str(family).strip()
+        row = found.setdefault(key, {"name": name, "families": set()})
+        values = [family]
+        if isinstance(families, (list, tuple, set, frozenset)):
+            values.extend(families)
+        for value in values:
+            value = str(value or "").strip().lower()
+            if value:
+                row["families"].add(value)
 
     if db is None:
         # Sans magasin (banc, dry-run), la provenance n'est pas lisible : on
@@ -1750,7 +1779,7 @@ def _complete_authors(db, item, frozen, repo: str | None, target: str | None,
             name = str(entry.get("name") or "").strip()
             if name:
                 reader_names.add(name.lower())
-            add(name, entry.get("family"))
+            add(name, entry.get("family"), entry.get("families"))
         for sha in unknown or ():
             # #2924 B5 : un inconnu qui n'est même pas un commit lisible (un gel
             # antérieur absent du dépôt scratch, un marqueur « freeze:N ») ne
@@ -1765,29 +1794,34 @@ def _complete_authors(db, item, frozen, repo: str | None, target: str | None,
         add(name)
     authors: list[dict] = []
     for key, entry in found.items():
-        family = entry["family"]
-        if not family:
+        proven = set(entry["families"])
+        if not proven:
             # Une entrée du lecteur partagé sans famille unique peut cacher
             # plusieurs familles historiques prouvées (#2681) : le registre
             # courant ne les remplace pas, même pour l'assigné (R9 B de cx2).
             # Une absence de preuve reste distinguable d'une ambiguïté : seule
             # la référence garde alors son repli historique.
-            proven = proven_families.get(key) or set()
-            if len(proven) > 1:
-                raise _ProvenanceError(
-                    "the family of the author %s is ambiguous (%s); the current "
-                    "registry cannot replace it"
-                    % (entry["name"], ", ".join(sorted(proven))))
-            if key in reader_names and not proven and key != reference_name:
-                raise _ProvenanceError(
-                    "the family of the author %s is not proven; the current "
-                    "registry cannot replace it" % entry["name"])
-            try:
-                family = actor_family(db, entry["name"], families=families)
-            except RegistryReadError as exc:
-                raise _ProvenanceError("the agent registry cannot be read (%s)"
-                                       % exc) from exc
-            entry["family"] = family
+            proven = set(proven_families.get(key) or ())
+        if len(proven) > 1:
+            # #3584 : un ensemble prouvé n'est pas une famille inconnue. On
+            # exclut chacune de ses familles au lieu de refuser l'ensemble ;
+            # la porte ne devine jamais une famille unique.
+            authors.append({"name": entry["name"], "family": "",
+                            "families": sorted(proven)})
+            continue
+        if len(proven) == 1:
+            authors.append({"name": entry["name"],
+                            "family": next(iter(proven))})
+            continue
+        if key in reader_names and key != reference_name:
+            raise _ProvenanceError(
+                "the family of the author %s is not proven; the current "
+                "registry cannot replace it" % entry["name"])
+        try:
+            family = actor_family(db, entry["name"], families=families)
+        except RegistryReadError as exc:
+            raise _ProvenanceError("the agent registry cannot be read (%s)"
+                                   % exc) from exc
         if family:
             authors.append({"name": entry["name"], "family": family})
     return authors, families

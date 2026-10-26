@@ -278,7 +278,12 @@ def reference_author(db, item: Mapping, milestone: Optional[Mapping], families,
     if families_out is not None:
         families_out[name.lower()] = set(proven)
     family = next(iter(proven)) if len(proven) == 1 else ""
-    return {"name": name, "family": family}
+    row = {"name": name, "family": family}
+    if len(proven) > 1:
+        # #3584 : un auteur prouvé sous plusieurs familles transporte tout
+        # l'ensemble ; la désignation et la porte excluent chacune d'elles.
+        row["families"] = sorted(proven)
+    return row
 
 
 def designated_reviewers(db, item: Mapping, milestone: Optional[Mapping],
@@ -2427,11 +2432,12 @@ def reading(db, item: Mapping, milestone: Optional[Mapping],
     exact de reçus (#1465) ; `strict` fait d'un reçu corrompu une erreur (le
     train), au lieu d'une absence (la désignation attend). `trace=True`
     (désignation) ajoute aux auteurs du repli `proof: turn-journal` et
-    `fallback_commits` ; le train et la porte gardent la forme exacte
-    `{name, family}`. `families_out` reçoit, par acteur en minuscules,
-    l'ensemble des familles **prouvées** : une famille vide peut être une
-    absence de preuve ou une ambiguïté, et l'appelant qui doit les distinguer
-    ne peut pas la deviner.
+    `fallback_commits`. Une entrée est `{name, family}`, plus `families` quand
+    plusieurs familles sont prouvées (#3584) : le train et la porte reçoivent
+    alors tout l'ensemble, jamais une famille devinée. `families_out` reçoit,
+    par acteur en minuscules, l'ensemble des familles **prouvées** : une
+    famille vide peut être une absence de preuve ou une ambiguïté, et
+    l'appelant qui doit les distinguer ne peut pas la deviner.
 
     Un commit sans reçu est attribué au committer d'adresse d'agent : un commit
     du titulaire de référence reste le sien ; un relecteur désigné reste
@@ -2664,12 +2670,17 @@ def reading(db, item: Mapping, milestone: Optional[Mapping],
         proven = {value for value in by_name[actor] if value}
         if families_out is not None:
             families_out[actor.lower()] = set(proven)
-        # un acteur à deux familles prouvées est ambigu : jamais deviné
+        # un acteur à deux familles prouvées est ambigu : jamais deviné, et
+        # l'ensemble est transporté pour que la désignation et la porte en
+        # excluent chacune (#3584), au lieu de le lire comme une famille
+        # inconnue.
         family = next(iter(proven)) if len(proven) == 1 else ""
         row = {"name": actor, "family": family}
+        if len(proven) > 1:
+            row["families"] = sorted(proven)
         if trace and proofs.get(actor):
-            # #2721 : la trace est celle de la désignation (`trace=True`) ; le
-            # train et la porte gardent la forme exacte `{name, family}`.
+            # #2721 : la trace est celle de la désignation (`trace=True`) ;
+            # l'ensemble `families` reste porté par la ligne (#3584).
             row["proof"] = "turn-journal"
             row["fallback_commits"] = sorted(proofs[actor])
         out.append(row)

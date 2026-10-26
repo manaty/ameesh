@@ -1956,7 +1956,8 @@ def frozen_authors(db, item: Mapping) -> Optional[list]:
     prouvent pas qu'aucun autre commit ne l'est pas. Une marque sans cette
     liste (antérieure au champ), ou qui la porte non vide, ne prouve donc rien.
 
-    Rend la liste `{name, family}`, ou None quand aucune lecture **complète**
+    Rend la liste `{name, family}`, plus `families` pour un acteur prouvé sous
+    plusieurs familles (#3584), ou None quand aucune lecture **complète**
     n'est disponible : pas de gel, pas de marque pour ce gel, journal
     illisible, marque antérieure à #2721 (sans `authors`), liste
     `unknown_authors` absente ou non vide, ou liste d'auteurs vide. L'appelant
@@ -1989,9 +1990,19 @@ def frozen_authors(db, item: Mapping) -> Optional[list]:
             if not isinstance(row, Mapping):
                 continue
             name = str(row.get("name") or "").strip()
-            if name:
-                authors.append({"name": name,
-                                "family": str(row.get("family") or "").strip().lower()})
+            if not name:
+                continue
+            author = {"name": name,
+                      "family": str(row.get("family") or "").strip().lower()}
+            families = row.get("families")
+            if isinstance(families, (list, tuple, set, frozenset)):
+                values = sorted({str(value).strip().lower() for value in families
+                                 if str(value or "").strip()})
+                if values:
+                    # #3584 : une marque écrite après ce lot garde l'ensemble
+                    # prouvé ; la proposition de relecture en exclut chacune.
+                    author["families"] = values
+            authors.append(author)
         return authors or None
     return None
 

@@ -399,8 +399,8 @@ class AmbiguousFamiliesTest(_RewriteFixture):
     Le même agent a écrit sous codex puis sous deepseek dans un gel antérieur ;
     le squash à arbre identique est signé deepseek. La lecture courante ne doit
     pas réduire {codex, deepseek} à la seule famille du reçu courant : les deux
-    familles restent prouvées, la famille de l'auteur reste ambiguë et la porte
-    refuse de deviner.
+    familles restent prouvées, et la porte les exclut chacune au lieu de
+    deviner une famille unique (#3584).
     """
 
     def setUp(self):
@@ -432,22 +432,46 @@ class AmbiguousFamiliesTest(_RewriteFixture):
         got = {row["name"]: row["family"] for row in authors}
         self.assertEqual(got.get("impl"), "")
         self.assertEqual(families_out.get("impl"), {"codex", "deepseek"})
+        # #3584 : l'ensemble est aussi porté par la ligne d'auteur, pour que
+        # la désignation et la porte l'excluent sans relire families_out.
+        carried = next(row for row in authors if row["name"] == "impl")
+        self.assertEqual(carried.get("families"), ["codex", "deepseek"])
 
-    def test_the_gate_does_not_guess_the_ambiguous_family(self):
+    def test_the_gate_excludes_each_ambiguous_family(self):
         klass = {"class": "sensitive", "doubt": False,
                  "files": [{"path": "src/ameesh/runner.py",
                             "class": "sensitive",
                             "rule": ["src/ameesh/runner.py"]}],
                  "repo": self.repo.root, "target": self.base,
                  "base_sha": self.base}
-        with self.assertRaises(merge_queue._ProvenanceError) as caught:
-            merge_queue._complete_authors(
-                self.db, self.lot_item(), self.head_b, self.repo.root,
-                self.base, klass=klass,
-                marks=work.milestones(self.db, self.lot))
-        self.assertIn("ambiguous", str(caught.exception))
-        self.assertIn("codex", str(caught.exception))
-        self.assertIn("deepseek", str(caught.exception))
+        authors, _families = merge_queue._complete_authors(
+            self.db, self.lot_item(), self.head_b, self.repo.root,
+            self.base, klass=klass,
+            marks=work.milestones(self.db, self.lot))
+        self.assertEqual(authors, [{"name": "impl", "family": "",
+                                    "families": ["codex", "deepseek"]}])
+
+    def test_one_claude_opinion_is_admitted_outside_both_proven_families(self):
+        # Témoin #3584 : un auteur {codex, deepseek} n'exclut pas claude quand
+        # un seul avis est requis sur un chemin sensible non critique.
+        klass = {"class": "sensitive", "doubt": False,
+                 "files": [{"path": "src/ameesh/mail.py",
+                            "class": "sensitive",
+                            "rule": ["src/ameesh/mail.py"]}],
+                 "repo": self.repo.root, "target": self.base,
+                 "base_sha": self.base}
+        authors, _families = merge_queue._complete_authors(
+            self.db, self.lot_item(), self.head_b, self.repo.root,
+            self.base, klass=klass,
+            marks=work.milestones(self.db, self.lot))
+        self.verdict("dev1", self.head_b)      # claude, avec son reçu exact
+        gate = merge_queue.review_gate(
+            self.db, work.milestones(self.db, self.lot), self.head_b,
+            repo=self.repo.root, klass=klass, item=self.lot_item(),
+            authors=authors, authors_complete=True, families=FAMILIES)
+        self.assertTrue(gate["ok"], gate)
+        self.assertEqual(gate["author_families"], ["codex", "deepseek"])
+        self.assertEqual([row["actor"] for row in gate["accepted"]], ["dev1"])
 
 
 class MissingPriorFreezeTest(_RewriteFixture):
