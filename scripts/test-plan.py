@@ -1972,8 +1972,10 @@ def fallback_plan(event: str, error: str, base_ref: str | None = None,
     The lot shape of `mode` is kept: a lot CI that cannot plan still runs the
     full suite on both drivers, with the full-suite part counts (#3343) and the
     psql pilot list — never fewer parts than the impacted selection would have
-    had. #3749 : outside a lot too, psql keeps the pilot list (the night run,
-    `psql_full`, keeps the whole suite under psql and no psycopg part).
+    had. #3749 : outside a lot too, psql runs the pilot list and the whole
+    contract, as an explicit module list split by the static weights; if
+    either list cannot be read, psql runs the whole suite. The night run
+    (`psql_full`) keeps the whole suite under psql and no psycopg part.
     """
     base_ref = _env_ref("GITHUB_BASE_REF", base_ref)
     head_ref = _env_ref("GITHUB_HEAD_REF", head_ref)
@@ -1982,8 +1984,9 @@ def fallback_plan(event: str, error: str, base_ref: str | None = None,
         #: #1343 : le repli d'un dispatch de lot garde la règle release/**.
         release = release or release_pr(None, _branch(ref))
     #: #3749 : le repli d'un lot comme celui d'une release passe psycopg en
-    #: entier et la liste pilote sous psql (test-parts.py, `pilot_list`) ;
-    #: seul le nocturne garde la suite psql entière.
+    #: entier et, sous psql, la liste pilote ET tout le contrat — en liste
+    #: explicite : test-parts.py ne joint pas toujours.txt à `pilot_list`
+    #: (R1 cx3). Une liste illisible rend la suite psql entière.
     why = "planning failed" + (f"; {release}" if release else "")
     modules = parts.modules()
     plan = {"schema": PLAN_SCHEMA, "event": event, "head": "", "tested": "",
@@ -1996,6 +1999,19 @@ def fallback_plan(event: str, error: str, base_ref: str | None = None,
             "importers": {}, "certified": {}, "uncovered": [],
             "doc_readers": [],
             "contract": [], "classes": {m: ["P3", ""] for m in modules}, "parts": {}}
+    psql_split = None
+    if not psql_full:
+        try:
+            pilot = read_list(PILOT_FILE, modules, required=True)
+            contract = read_list(ALWAYS_FILE, modules, required=True)
+            if not pilot or not contract:
+                raise ValueError("empty pilot or contract list")
+            chosen = psql_pr_modules(pilot, contract)
+            weighed, _ = parts.weight(chosen, "psql")
+            psql_split = [(part, sum(weighed[m] for m in part))
+                          for part in parts.split(weighed, PARTS["psql"][1])]
+        except (Exception, SystemExit) as exc:  # the fallback must not fail
+            plan["unsure"].append(f"psql lists unreadable ({exc}); whole suite under psql")
     for driver, (n_pr, n_other) in PARTS.items():
         # #3343 : le repli est toujours la suite complète, y compris pour une
         # branche de lot : il prend les parts de main, sinon les trois parts
@@ -2004,10 +2020,16 @@ def fallback_plan(event: str, error: str, base_ref: str | None = None,
         if driver == "psycopg" and psql_full:
             plan["parts"][driver] = []
             continue
+        if driver == "psql" and psql_split is not None:
+            plan["parts"][driver] = [
+                {"part": i, "of": n, "label": f"{driver} {i}/{n}", "modules": part,
+                 "pilot_list": True, "estimate_s": round(estimate, 1)}
+                for i, (part, estimate) in enumerate(psql_split, 1)]
+            continue
         # no module list: scripts/test-parts.py splits the suite itself (L116)
         plan["parts"][driver] = [
             {"part": i, "of": n, "label": f"{driver} {i}/{n}", "modules": None,
-             "pilot_list": driver == "psql" and not psql_full, "estimate_s": 0}
+             "pilot_list": False, "estimate_s": 0}
             for i in range(1, n + 1)]
     plan["selection"] = {"mode": "full", "why": why, "modules": len(modules),
                          "impacted": 0, "contract": 0, "selected": len(modules), "skipped": 0,

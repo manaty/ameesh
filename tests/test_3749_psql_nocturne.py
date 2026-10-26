@@ -117,15 +117,61 @@ class PlanTest(unittest.TestCase):
         self.assertEqual(self._ran(p, "psql"),
                          sorted(set(self.pilot) & set(self.contract)))
 
+    @staticmethod
+    def _consumer_modules(p, driver):
+        """Les modules que scripts/test-parts.py `run --plan` passe vraiment,
+        part par part : la liste explicite du plan, sinon (repli L116) la
+        liste pilote seule si le plan la demande, sinon toute la suite."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = pathlib.Path(tmp) / "plan.json"
+            path.write_text(json.dumps(p), encoding="utf-8")
+            seen = set()
+            for entry in p["parts"][driver]:
+                got = plan.parts.read_plan(path, driver, entry["part"])
+                if got is not None:
+                    seen.update(got["modules"])
+                elif driver == "psql" and plan.parts._driver_plan(path):
+                    seen.update(plan.parts.read_list(plan.PILOT_FILE, plan.parts.modules()))
+                else:
+                    seen.update(plan.parts.modules())
+            return sorted(seen)
+
     def test_repli(self):
-        p = plan.fallback_plan("push", "boom")
-        self.assertTrue(all(ps["pilot_list"] for ps in p["parts"]["psql"]))
-        self.assertEqual(len(p["parts"]["psycopg"]), plan.PARTS["psycopg"][1])
+        # R1 cx3 (B/P2) : le repli hors nocturne passait `pilot_list` sans
+        # module ; test-parts.py ne lisait alors que pilote-psql.txt et sept
+        # contrats sautaient psql. Le témoin lit ce que le consommateur
+        # exécute, pas seulement le drapeau.
+        expected = sorted(set(self.pilot) | set(self.contract))
+        cases = {
+            "push main": plan.fallback_plan("push", "boom"),
+            "PR de release": plan.fallback_plan("pull_request", "boom", base_ref="main",
+                                                head_ref="release/1.2.0"),
+            "gel de lot": plan.fallback_plan("pull_request", "boom", mode="lot",
+                                             base_ref="main", head_ref="lot/x"),
+        }
+        for why, p in cases.items():
+            with self.subTest(why):
+                self.assertEqual(self._consumer_modules(p, "psql"), expected)
+                self.assertEqual({ps["of"] for ps in p["parts"]["psql"]},
+                                 {plan.PARTS["psql"][1]})
+                self.assertEqual(self._consumer_modules(p, "psycopg"), self.mods)
         night = plan.fallback_plan("schedule", "boom", psql_full=True)
         self.assertEqual(night["parts"]["psycopg"], [])
-        self.assertFalse(any(ps["pilot_list"] for ps in night["parts"]["psql"]))
+        self.assertEqual(self._consumer_modules(night, "psql"), self.mods)
         self.assertEqual(len(night["parts"]["psql"]), plan.PARTS["psql"][1])
         self.assertEqual(plan.outputs(night)["psycopg"], "[]")
+
+    def test_repli_sur_listes_illisibles_rend_la_suite_psql_entiere(self):
+        for failure in (ValueError("stale entry"), FileNotFoundError("absent"), []):
+            with self.subTest(failure=failure):
+                effect = failure if isinstance(failure, Exception) else None
+                value = failure if effect is None else None
+                with mock.patch.object(plan, "read_list", side_effect=effect,
+                                       return_value=value):
+                    p = plan.fallback_plan("push", "boom")
+                self.assertEqual(self._consumer_modules(p, "psql"), self.mods)
+                self.assertFalse(any(ps["pilot_list"] for ps in p["parts"]["psql"]))
+                self.assertIn("whole suite under psql", " ".join(p["unsure"]))
 
     def test_cli_psql_full(self):
         with tempfile.TemporaryDirectory() as tmp:

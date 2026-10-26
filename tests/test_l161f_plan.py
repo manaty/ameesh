@@ -2107,7 +2107,10 @@ class PlanTest(unittest.TestCase):
         f = pathlib.Path(tempfile.mkdtemp()) / "plan.json"
         self.addCleanup(shutil.rmtree, f.parent)
         f.write_text(json.dumps(p), encoding="utf-8")
-        self.assertIsNone(parts.read_plan(f, "psql", 1))
+        # psycopg : sans liste, test-parts.py découpe la suite lui-même ;
+        # psql (#3749, R1 cx3) : la liste pilote et le contrat, explicites
+        self.assertIsNone(parts.read_plan(f, "psycopg", 1))
+        self.assertIsNotNone(parts.read_plan(f, "psql", 1))
         self.assertTrue(parts._driver_plan(str(f)))
         self.assertEqual(json.loads(plan.outputs(p)["psycopg"]),
                          list(range(1, plan.PARTS["psycopg"][1] + 1)))
