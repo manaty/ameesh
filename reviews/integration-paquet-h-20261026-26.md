@@ -10,14 +10,16 @@ mesh-design des 26/10 03:40Z (triage h-26), 04:03Z (#3625), 04:09Z (#3634
 empilé sur #3632), 04:20Z (#3643), 04:29Z (#3629) et 04:57Z (#3604 et #3631
 inclus ; #3598, #3589 et #3629 dès leurs avis cx1 ; #3639 hors paquet).
 Liste calculée `paquet-candidats` sur `5d21c753` (05:0xZ) : **11 prêts** ;
-10 composés, #3639 écarté sur consigne pilote, #3634 hors avis (pas prêt au
-calcul) ; #3633, prêt et non cité par le pilote, est composé (canon §12 : un
-lot prêt est composé ou écarté avec un motif au manifeste). #3389, gelé à
-05:04Z sur `9804af64` et relu par mesh-design à 05:08Z (doc seule), est
-ajouté sur consigne pilote du 05:09Z après vérification de son gel et de sa
-fusion à blanc ; il n'apparaissait pas encore dans le calcul de 05:0xZ.
+10 composés, #3634 hors avis (pas prêt au calcul) ; #3633, prêt et non cité
+par le pilote, est composé (canon §12 : un lot prêt est composé ou écarté
+avec un motif au manifeste). #3389, gelé à 05:04Z sur `9804af64` et relu par
+mesh-design à 05:08Z (doc seule), est ajouté sur consigne pilote du 05:09Z
+après vérification de son gel et de sa fusion à blanc ; #3639, prêt au calcul
+mais d'abord écarté (consigne 04:57Z), est finalement composé sur consigne
+pilote du 05:34Z (P1 à faire entrer avant la coupe de 10:00Z, CI de lot non
+concluante). Au total : **12 unités, 12 lots**.
 
-## Admissions (11 lots, 11 unités)
+## Admissions (12 lots, 12 unités)
 
 | lot | source composée | avis au gel | objet |
 |---|---|---|---|
@@ -32,6 +34,7 @@ fusion à blanc ; il n'apparaissait pas encore dans le calcul de 05:0xZ.
 | #3643 | `2a551f478262` | 2/2 (mesh-design claude, auditeur claude) | `host_lifecycle.critical_names` : rôles critiques lus par la politique, plus de liste en dur (#2829) |
 | #3629 | `38133669b226` | 2/2 (impl-04 deepseek, cx1 codex) | Manifeste de paquet sans commit : lecture des unités par les trailers `ameesh-work` (#2816) |
 | #3389 | `9804af64b3a4` | 1/1 (mesh-design claude) | Rapport du pilote résident 24 h (R1) — doc seule (#2833) |
+| #3639 | `d9bf46e5515e` | 2/2 (impl-03 deepseek, cx2 codex) | `radar.commit_ci` : lecture paginée de tous les check-runs du commit (P1, coupe 10:00Z) (#2825) |
 
 ## Avis au gel
 
@@ -48,8 +51,9 @@ fusion à blanc ; il n'apparaissait pas encore dans le calcul de 05:0xZ.
 | #3643 | 19624 | #19625 mesh-design (claude) ok, #19626 auditeur (claude) ok |
 | #3629 | 19627 | #19632 impl-04 (deepseek) ok, #19646 cx1 (codex) ok |
 | #3389 | 19666 | #19673 mesh-design (claude) ok |
+| #3639 | 19608 | #19615 impl-03 (deepseek) ok, #19634 cx2 (codex) ok |
 
-## Composition (11 unités, 11 lots)
+## Composition (12 unités, 12 lots)
 
 | unité | lot | source | commit |
 |---|---|---|---|
@@ -64,8 +68,9 @@ fusion à blanc ; il n'apparaissait pas encore dans le calcul de 05:0xZ.
 | 9 | #3643 | `2a551f478262` | `9aafdb44e` |
 | 10 | #3629 | `38133669b226` | `19cc1f879` |
 | 11 | #3389 | `9804af64b3a4` | `630858e77` |
+| 12 | #3639 | `d9bf46e5515e` | `5cab476dd` |
 
-Les 11 unités sont des fusions propres : aucun conflit mécanique, aucune
+Les 12 unités sont des fusions propres : aucun conflit mécanique, aucune
 résolution d'union. Une adaptation de delta véhicule (compteurs du contrat
 médié) est décrite ci-dessous. #3629 est composé en dixième : il modifie
 `scripts/paquet-compose.py`, et les neuf unités précédentes ont été composées
@@ -89,7 +94,6 @@ ajouté à 05:1xZ) est composé après lui avec cette nouvelle version.
 
 | lot | motif |
 |---|---|
-| #3639 | consigne pilote (mesh-design 04:57Z) : hors paquet, déblocage CI hors coupure, sa CI tourne sur la PR #2832 ; il dépend en outre de #3633, dont le contenu entre ici |
 | #3634 | pas prêt au calcul : gel `ecf26b1d629e` (sensible) sans ses 2 avis indépendants — un seul avis, mesh-design ; la consigne pilote du 04:09Z ne suffit pas à la porte |
 | #3617 | rebase en cours par impl-03 depuis 05:00Z ; au moment de la composition son dernier gel reste `e4ab8cb7`, en conflit avec `main` sur `src/ameesh/review_designation_activation.py` — pas de nouveau gel avec avis : h-27 |
 | #3584 | hold pilote (attente de h-25 levée) : rebase sur `main` puis 2 avis claude+codex sur le passage refus → exclusion ; conflit `src/ameesh/review_designation.py` |
@@ -111,13 +115,14 @@ attendent leur clôture par `sync-merges` ; ce ne sont pas des unités.
 
 ## Contrôles
 
-- Composition : 11 unités sur `5d21c7534711` ; aucune fusion en conflit,
+- Composition : 12 unités sur `5d21c7534711` ; aucune fusion en conflit,
   aucune résolution d'union ; une adaptation (compteurs du contrat médié,
   ci-dessus).
-- Liste calculée `paquet-candidats` sur `5d21c753` : **11 prêts** ; 10
-  composés ; #3639 écarté avec motif (consigne pilote) ; #3634 non prêt au
-  calcul (avis manquants) ; #3633, non cité par le pilote, composé ; #3389
-  ajouté après le calcul sur consigne pilote du 05:09Z, gel et avis vérifiés.
+- Liste calculée `paquet-candidats` sur `5d21c753` : 12 lots prêts au total
+  (11 au calcul de 05:0xZ, #3389 ajouté après son avis de 05:08Z) ; 12
+  composés ; #3634 non prêt au calcul (avis manquants) et écarté au
+  manifeste ; #3633, non cité par le pilote, composé ; #3639 ajouté sur
+  consigne pilote du 05:34Z.
 - Contrôles statiques de gel (`scripts/freeze-checks.py`) : 7/7 verts.
 - Tests ciblés locaux sur l'arbre intégré : 166 tests OK (2448/3244 coupe
   release, 3589 gel empilé, 2157/2426 composition et clôture de paquet, 3606
@@ -126,8 +131,8 @@ attendent leur clôture par `sync-merges` ; ce ne sont pas des unités.
   Les modules de feu, désignation, notify et SLO sont couverts par la
   ci-full unique sur la tête gelée.
 - Contrôle d'inclusion `scripts/paquet-inclusion.py` sur la tête du
-  manifeste : aucun défaut ; 11 compositions, 11 contenus présents ;
-  #3639 et #3634 écartés au manifeste avec motif.
+  manifeste : aucun défaut ; 12 compositions, 12 contenus présents ;
+  #3634 seul écarté au manifeste avec motif.
 - Une seule suite complète sur la tête gelée, après le gel (`ameesh ci run
   3637 --full`), pas de CI par lot (§11 bis).
 - La migration additive **0488** (#3631) est à appliquer en staging avant de
