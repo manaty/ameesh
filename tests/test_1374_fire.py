@@ -1687,10 +1687,15 @@ class CompleteAuthorsTest(unittest.TestCase):
         self.assertEqual(got.get("merger"), "codex",
                          "l'auteur d'une fusion ajoute du contenu au lot")
 
-    def test_two_historical_families_for_a_coauthor_refuse(self):
-        # R8 B de cx2 : la famille vide rendue par reading peut cacher deux
-        # familles historiques prouvées ; le registre courant ne les remplace
-        # pas, la porte refuse au lieu de laisser rev1 relire son travail.
+    def test_two_historical_families_for_a_coauthor_are_excluded_not_refused(self):
+        # #3584 (décision du 26/10, notée au lot) : un ensemble de familles
+        # prouvées n'est pas une famille inconnue. L'ancien refus de #2681 R8
+        # (une famille vide pouvait cacher deux preuves) est remplacé par
+        # l'exclusion de **chaque** famille : ni codex ni claude ne peuvent
+        # compter pour rev1, et rev1 lui-même reste exclu par son nom. C'est au
+        # moins aussi strict pour l'indépendance, sans bloquer la relecture
+        # quand une famille hors de l'ensemble existe. Sans famille restante,
+        # la porte se ferme (aucune admission implicite).
         with tempfile.TemporaryDirectory() as tmp:
             git = self._git(tmp)
             base, _head = self._repo(tmp, git)
@@ -1723,10 +1728,13 @@ class CompleteAuthorsTest(unittest.TestCase):
                                       return_value=("claude", "codex", "deepseek")), \
                     mock.patch.object(review_authors, "_commit_receipt",
                                       side_effect=providers):
-                with self.assertRaises(merge_queue._ProvenanceError):
-                    merge_queue._complete_authors(
-                        _EmptyHistoryDb(), item, second, tmp, "main",
-                        klass={"class": "sensitive", "base_sha": base}, marks=[])
+                authors, _families = merge_queue._complete_authors(
+                    _EmptyHistoryDb(), item, second, tmp, "main",
+                    klass={"class": "sensitive", "base_sha": base}, marks=[])
+        got = {entry["name"]: (entry["family"], entry.get("families") or ())
+               for entry in authors}
+        self.assertEqual(got.get("author"), ("deepseek", ()))
+        self.assertEqual(got.get("rev1"), ("", ["claude", "codex"]))
 
     def test_a_malformed_receipt_refuses_instead_of_the_git_fallback(self):
         # R8 B de cx2 : strict=True fait d'un reçu contradictoire une erreur,
@@ -1747,9 +1755,13 @@ class CompleteAuthorsTest(unittest.TestCase):
                         _EmptyHistoryDb(), item, frozen, tmp, "main",
                         klass={"class": "sensitive", "base_sha": base}, marks=[])
 
-    def test_two_historical_families_for_the_reference_refuse(self):
-        # R9 B de cx2 : l'assigné lui-même peut avoir deux familles
-        # historiques prouvées ; il n'est plus exempté de l'ambiguïté.
+    def test_two_historical_families_for_the_reference_are_excluded_not_refused(self):
+        # #3584 (décision du 26/10, notée au lot) : la référence elle-même
+        # peut avoir deux familles historiques. L'ancien refus de #2681 R9
+        # est remplacé par l'exclusion des deux : un avis claude ou codex ne
+        # compte pas, un avis d'une famille hors de l'ensemble (ici deepseek)
+        # reste recevable. L'avis du relecteur de la famille de l'auteur tombe
+        # donc, sans admettre implicitement le lot.
         with tempfile.TemporaryDirectory() as tmp:
             git = self._git(tmp)
             base, _head = self._repo(tmp, git)
@@ -1774,7 +1786,7 @@ class CompleteAuthorsTest(unittest.TestCase):
                 return receipts.get(sha)
 
             def family(_db, name, **_kw):
-                return {"author": "deepseek"}.get(name, "")
+                return {"author": "", "rev2": "claude", "dev1": "deepseek"}.get(name, "")
 
             item = {"id": 7, "assignee": "author", "branch_target": "main"}
             with mock.patch.object(merge_queue, "actor_family", side_effect=family), \
@@ -1782,10 +1794,21 @@ class CompleteAuthorsTest(unittest.TestCase):
                                       return_value=("claude", "codex", "deepseek")), \
                     mock.patch.object(review_authors, "_commit_receipt",
                                       side_effect=providers):
-                with self.assertRaises(merge_queue._ProvenanceError):
-                    merge_queue._complete_authors(
-                        _EmptyHistoryDb(), item, second, tmp, "main",
-                        klass={"class": "sensitive", "base_sha": base}, marks=[])
+                authors, _families = merge_queue._complete_authors(
+                    _EmptyHistoryDb(), item, second, tmp, "main",
+                    klass={"class": "sensitive", "base_sha": base}, marks=[])
+        self.assertEqual(authors, [{"name": "author", "family": "",
+                                    "families": ["claude", "codex"]}])
+        # La porte exclut claude et codex : seul dev1 (deepseek) compte.
+        marks = _marks(_mark("frozen", second), _verdict("rev2", sha=second),
+                       _verdict("dev1", sha=second))
+        with mock.patch.object(merge_queue, "actor_family", side_effect=family):
+            gate = merge_queue.review_gate(
+                None, marks, second, item=item, families=FAM.values(),
+                klass={"class": "sensitive"}, required=1, authors=authors,
+                authors_complete=True)
+        self.assertTrue(gate["ok"], gate)
+        self.assertEqual([row["actor"] for row in gate["accepted"]], ["dev1"])
 
     def test_an_unreadable_author_range_refuses(self):
         # Une plage que le lecteur partagé ne peut pas lire ne laisse pas
