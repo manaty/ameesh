@@ -560,6 +560,26 @@ def target_commit(repo: str, target: str) -> str:
     return ""
 
 
+def _applied_in(repo: str, target: str, sha: str) -> bool:
+    """Le patch est encore appliqué : le rejouer ne change pas la cible.
+
+    Un patch-id historique seul ne suffit pas après un revert ou une
+    réécriture. Toute fusion conflictuelle ou lecture impossible garde l'auteur.
+    """
+    try:
+        tree = _tree_of(repo, target)
+        if not tree:
+            return False
+        proc = plan_git._git(repo, "merge-tree", "--write-tree",
+                             "--merge-base", sha + "^", target, sha)
+        if proc.returncode != 0:
+            return False
+        lines = proc.stdout.decode("utf-8", "strict").splitlines()
+        return bool(lines and lines[0].strip() == tree)
+    except Exception:  # noqa: BLE001 - sans preuve, garder l'auteur
+        return False
+
+
 def _not_in_target(repo: str, commits, target: str) -> list:
     """Les commits qui ne sont dans `target` ni par ascendance ni par patch.
 
@@ -582,7 +602,9 @@ def _not_in_target(repo: str, commits, target: str) -> list:
     les gels antérieurs. Les patch-id **verbatim** conservent les espaces
     (significatifs en Python) ; fusions, diffs vides ou lecture impossible
     restent dans la liste. La recherche cible est bornée ; dépasser la borne
-    ne peut que conserver des auteurs, jamais en retirer sans preuve."""
+    ne peut que conserver des auteurs, jamais en retirer sans preuve. Un
+    patch historique n'est écarté que si son rejeu laisse la cible inchangée,
+    pour conserver l'auteur après un revert ou une réécriture de la cible."""
     wanted = [str(commit).strip() for commit in commits or ()
               if str(commit).strip()]
     if not wanted or not target:
@@ -629,7 +651,8 @@ def _not_in_target(repo: str, commits, target: str) -> list:
             patches = plan_git._patch_ids(repo, "--no-walk", sha)
         except Exception:  # noqa: BLE001 - ce candidat reste dans le doute
             continue
-        if patches and patches.keys() <= on_target.keys():
+        if (patches and patches.keys() <= on_target.keys()
+                and _applied_in(repo, str(target), sha)):
             equivalent.add(sha)
     return [sha for sha in kept if sha not in equivalent]
 

@@ -39,6 +39,27 @@ class TargetPatchTest(unittest.TestCase):
     def test_abbreviated_patch_is_excluded(self):
         self.assertEqual(self.remaining([self.original[:12]]), [])
 
+    def test_reverted_target_patch_keeps_author(self):
+        self.repo.git("revert", "--no-edit", self.target)
+        self.target = self.repo.git("rev-parse", "HEAD")
+        self.assertEqual(self.remaining([self.original]), [self.original])
+
+    def test_rewritten_target_patch_keeps_author(self):
+        self.repo.write("fix.py", "different_content()\n")
+        self.target = self.repo.commit("rewrite target patch")
+        self.assertEqual(self.remaining([self.original]), [self.original])
+
+    def test_replay_read_failure_keeps_author(self):
+        git = plan_git._git
+
+        def fail_merge(repo, *args, **kwargs):
+            if args[0] == "merge-tree":
+                raise OSError("unreadable replay")
+            return git(repo, *args, **kwargs)
+
+        with mock.patch.object(plan_git, "_git", side_effect=fail_merge):
+            self.assertEqual(self.remaining([self.original]), [self.original])
+
     def test_patch_absent_from_target_keeps_corrector(self):
         self.repo.git("checkout", "-q", "-b", "unmerged", self.original)
         self.repo.write("guard.py", "enforce_review_independence()\n")
