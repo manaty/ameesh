@@ -547,13 +547,37 @@ def make_worktree(repo: Path, base_sha: str, branch: str) -> Path:
     return path
 
 
-def clear_local_branch(repo: Path, branch: str) -> None:
-    """Retire une branche locale de recomposition, si elle n'est pas ouverte."""
+def _worktrees_on(repo: Path, branch: str) -> list[Path]:
+    """Les worktrees du dépôt ouverts sur la branche locale `branch`."""
+    listing = out(repo, "worktree", "list", "--porcelain")
+    paths: list[Path] = []
+    path = None
+    for line in listing.splitlines():
+        line = line.strip()
+        if line.startswith("worktree "):
+            path = Path(line[len("worktree "):])
+        elif line == "branch refs/heads/" + branch and path is not None:
+            paths.append(path)
+    return paths
+
+
+def clear_local_branch(repo: Path, branch: str, log=print) -> None:
+    """Retire une branche locale de recomposition.
+
+    #3916 : un worktree `paquet-auto-*` gardé par la tentative précédente sur
+    cette branche (diagnostic d'échec, déjà dans son courrier) est fermé ;
+    tout autre worktree ouvert dessus refuse la recomposition.
+    """
     if rev(repo, "refs/heads/" + branch) is None:
         return
-    listing = out(repo, "worktree", "list", "--porcelain")
-    if any(line.strip() == "branch refs/heads/" + branch
-           for line in listing.splitlines()):
+    for path in _worktrees_on(repo, branch):
+        if path == repo or not path.name.startswith("paquet-auto-"):
+            raise InputError(
+                "branche locale %s encore ouverte dans un worktree (%s) : le "
+                "fermer avant de recomposer" % (branch, path))
+        log("worktree gardé par la tentative précédente fermé : %s" % path)
+        remove_worktree(repo, path)
+    if _worktrees_on(repo, branch):
         raise InputError(
             "branche locale %s encore ouverte dans un worktree : le fermer "
             "avant de recomposer" % branch)
@@ -1798,7 +1822,7 @@ def compose_packet(args: argparse.Namespace) -> int:
             remote_sha = rev(repo, "origin/" + branch) or remote_sha
         ensure_carrier_branch(repo, args.carrier, branch, args.target)
     if args.force:
-        clear_local_branch(repo, branch)
+        clear_local_branch(repo, branch, log=lambda line: print(line, flush=True))
     stale = prune_stale_worktrees(repo, args.keep_failed_hours)
     for path in stale:
         print("worktree d'échec purgé : %s" % path, flush=True)
