@@ -1637,7 +1637,8 @@ def _print_assignment(check: dict | None) -> None:
 
 #: sous-commandes `work` dont `--actor` a son propre sens (le délégant de
 #: `delegate`) ou son propre défaut non vide (relevés, échéances)
-_OWN_ACTOR = ("delegate", "expire-delegations", "sync-branches", "device-gates")
+_OWN_ACTOR = ("delegate", "expire-delegations", "sync-branches", "device-gates",
+              "fingerprint")
 
 
 def _work_actor(cfg: Config, db, args: argparse.Namespace) -> None:
@@ -2002,6 +2003,36 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                 print("neighbor: %s" % intake_neighbors.format_neighbor(neighbor),
                       file=sys.stderr)
             return 0
+        if args.work_command == "fingerprint":
+            # #3885 : primitive idempotente de la règle §16 — un lot par
+            # empreinte nouvelle, les doublons notés, P1 si un utilisateur est
+            # touché, récidive après clôture.
+            from . import fingerprints
+            if getattr(args, "fingerprint_command", None) != "open":
+                print("ameesh work fingerprint: `open` is the only command "
+                      "(ameesh work fingerprint open --app P --key K --title T)",
+                      file=sys.stderr)
+                return 2
+            result = fingerprints.open_lot(
+                db, app=args.app, key=args.key, title=args.title,
+                users=args.users, count=args.count, route=args.route,
+                code=args.code, revision=args.revision,
+                first_seen=args.first_seen, last_seen=args.last_seen,
+                actor=args.actor)
+            if args.json:
+                print(json.dumps(result, ensure_ascii=False, indent=2))
+                return 0
+            if result["created"]:
+                print("lot #%d opened for %s (priority %s%s)"
+                      % (result["lot"], result["source"], result["priority"],
+                         ", récidive de #%d" % result["recurrence_of"]
+                         if result.get("recurrence_of") else ""))
+            else:
+                print("lot #%d already open for %s: occurrence noted%s"
+                      % (result["lot"], result["source"],
+                         " (P1: a user is touched)" if result.get("escalated")
+                         else ""))
+            return 0
         if args.work_command == "assign":
             out = work.assign(db, args.id, args.agent, externe=args.externe,
                               actor=args.actor, cfg=cfg, branch=args.branch,
@@ -2360,7 +2391,8 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
             # L122 : numéro de migration réservé au lot, avant d'écrire le fichier
             item = work.reserve_migration(db, args.id, args.number, release=args.release,
                                           repo=args.repo, actor=args.actor, cfg=cfg,
-                                          skip_branches=tuple(args.skip_branch or ()))
+                                          skip_branches=tuple(args.skip_branch or ()),
+                                          repository=getattr(args, "repository", None))
             if args.json:
                 print(json.dumps(item, ensure_ascii=False, indent=2))
             elif not item.get("migration"):
@@ -3730,6 +3762,31 @@ def build_parser() -> argparse.ArgumentParser:
                              "<sha>` in the creation note. A review-born lot without it "
                              "is still created, marked `absent` and warned")
     pw_add.set_defaults(func=cmd_work)
+    pw_fp = work_sub.add_parser(
+        "fingerprint", help="#3885: one lot per server-failure fingerprint (canon §16), "
+                            "idempotent: an open lot is noted, a closed one opens a "
+                            "recurrence lot")
+    fp_sub = pw_fp.add_subparsers(dest="fingerprint_command")
+    pw_fp_open = fp_sub.add_parser(
+        "open", help="open a lot for empreinte:<app>:<key>, or note the open one; "
+                     "P1 as soon as one user is touched")
+    pw_fp_open.add_argument("--app", required=True, help="the project of the failure")
+    pw_fp_open.add_argument("--key", required=True,
+                            help="the stable fingerprint key (route+code+revision, a hash, …)")
+    pw_fp_open.add_argument("--title", required=True, help="the lot title")
+    pw_fp_open.add_argument("--users", type=int, default=0,
+                            help="number of users touched (P1 when > 0)")
+    pw_fp_open.add_argument("--count", type=int, default=0,
+                            help="occurrences reported by the source")
+    pw_fp_open.add_argument("--route", default="")
+    pw_fp_open.add_argument("--code", default="", help="SQLSTATE or exception name")
+    pw_fp_open.add_argument("--revision", default="", help="deployed revision")
+    pw_fp_open.add_argument("--first-seen", default="", help="ISO timestamp of the first view")
+    pw_fp_open.add_argument("--last-seen", default="", help="ISO timestamp of the last view")
+    pw_fp_open.add_argument("--actor", default="",
+                            help="default: AMEESH_ROLE, else the bound identity")
+    pw_fp_open.add_argument("--json", action="store_true")
+    pw_fp_open.set_defaults(func=cmd_work)
     pw_list = work_sub.add_parser("list")
     pw_list.add_argument("--state", default=None)
     pw_list.add_argument("--assignee", default=None)
@@ -3785,6 +3842,11 @@ def build_parser() -> argparse.ArgumentParser:
                              "lot's own branch (repeatable): the integration branch of a package "
                              "being composed, whose renumbered files must not count against the "
                              "reservation (#1603); an exact number reads the target only (#2620)")
+    pw_mig.add_argument("--repository", default=None, metavar="OWNER/REPO",
+                        help="#3885: reserve in this repository when the code lives in another "
+                             "repository than the lot's issue (a mirror ticket); the local clone "
+                             "given by --repo must be a clone of it (default: the issue's "
+                             "repository)")
     pw_mig.add_argument("--json", action="store_true")
     pw_mig.add_argument("--actor", default="",
                         help="default: the session's bound identity (AGENT_MAIL_NAME)")

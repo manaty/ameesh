@@ -4789,6 +4789,29 @@ class GithubWatch(Domain):
         """Persist or clear partial progress atomically with mailbox delivery."""
 
 
+class FingerprintWatch(Domain):
+    """#3885: the resume cursor of the failure-fingerprint pass, per project.
+
+    The source is read with a read-only token; the cursor is opaque and only
+    advances after a complete, strictly validated page. A failed read keeps
+    the previous cursor so the next pass replays the same window.
+    """
+
+    @abc.abstractmethod
+    def state(self, project: str) -> dict | None:
+        """`{cursor, last_read_at, last_error}`, or None before the first read."""
+
+    @abc.abstractmethod
+    def advance(self, project: str, url: str, cursor: str | None, *,
+                now: float | None = None) -> None:
+        """Record a complete read: move the cursor, clear the last error."""
+
+    @abc.abstractmethod
+    def fail(self, project: str, url: str, error: str, *,
+             now: float | None = None) -> None:
+        """Record an explicit refusal/read failure; never move the cursor."""
+
+
 class NotifyLiveness(Domain):
     """#3007 : preuve partagée que le notificateur joint un humain.
 
@@ -4880,6 +4903,7 @@ class Storage(abc.ABC):
     events: Events
     mailbox: Mailbox
     github_watch: GithubWatch
+    fingerprints: FingerprintWatch
     notify_liveness: NotifyLiveness
     wakeups: Wakeups
     keys: Keys
