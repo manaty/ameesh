@@ -1792,6 +1792,18 @@ class WorkItems(interface.WorkItems):
             (int(item_id), None if limit is None else int(limit)),
         )
 
+    def earlier_freezes(self, app, lot, before_ts) -> list[dict]:
+        return self.db.query(
+            """
+            SELECT m.id, m.work_item_id, m.sha, m.actor, m.note,
+                   extract(epoch from m.at)::float8 AS at_ts
+              FROM work_item_milestones m
+              JOIN work_items w ON w.id = m.work_item_id
+             WHERE m.kind = 'frozen' AND w.app = %s
+               AND m.work_item_id <> %s AND m.at <= to_timestamp(%s)
+             ORDER BY m.at DESC, m.id DESC LIMIT 256
+            """, (str(app), int(lot), float(before_ts)))
+
     def add_milestone(self, item_id, kind, *, sha, actor, verdict, note,
                       on_frozen=None, after_commit=None, proof=None) -> dict:
         """Écrit le jalon sous le verrou de la ligne du lot (L29) : un gel ne

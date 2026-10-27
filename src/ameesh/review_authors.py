@@ -78,6 +78,8 @@ reçu exact contradictoire est une erreur, pas une absence.
 """
 from __future__ import annotations
 
+import re
+
 from typing import Mapping, Optional, Sequence
 
 from . import plan_git, registry, review_lot, review_provenance, storage
@@ -876,7 +878,7 @@ def _applied_in(repo: str, target: str, sha: str) -> bool:
         return False
 
 
-def _text_delta(repo: str, before: str, after: str):
+def _text_delta(repo: str, before: str, after: str, *, path: str = ""):
     """Exact added/removed lines, or None for unreadable/non-text changes.
 
     Compare globally, including trivial lines and whitespace: a rename or a
@@ -885,7 +887,8 @@ def _text_delta(repo: str, before: str, after: str):
     """
     proc = plan_git._git(repo, "diff", "--no-color", "--no-ext-diff", "--no-textconv",
                          "--ignore-submodules=none",
-                         "--no-renames", "--unified=0", before, after, "--")
+                         "--no-renames", "--unified=0", before, after, "--",
+                         *([path] if path else []))
     if proc.returncode:
         return None
     text = proc.stdout.decode("utf-8", "strict")
@@ -930,6 +933,110 @@ def _no_reintroduced_patch(repo: str, sha: str, landing) -> bool:
     if patch is None or not any(patch):
         return False
     return not (patch[0] & landing[0] or patch[1] & landing[1])
+
+
+def _delivered_paths(repo: str, target: str, tree: str):
+    """Exact landing lines by destination path; unreadable changes fail closed."""
+    proc = plan_git._git(repo, "diff", "--no-renames", "--name-only", "-z",
+                         target, tree, "--")
+    if proc.returncode:
+        return None
+    result = {}
+    for raw in proc.stdout.split(b"\0"):
+        if not raw:
+            continue
+        path = raw.decode("utf-8", "strict")
+        delta = _text_delta(repo, target, tree, path=path)
+        if delta is None:
+            return None
+        result[path] = delta
+    return result
+
+
+def _outside_delivered(repo: str, target: str, commit: str, landing,
+                       cache: dict) -> bool:
+    """No candidate line is brought by this landing, including copies/moves.
+
+    Existing occurrences on target never excuse new occurrences in a landing.
+    A repeated generic line conservatively retains its historical author.
+    Historical removals retain authors even when reverted (#3220); this
+    exception must not bypass the existing conservative removal proof.
+    """
+    if landing is None:
+        return False
+    try:
+        patch = _text_delta(repo, commit + "^", commit)
+        if patch is None or not any(patch) or patch[1]:
+            return False
+        if any(patch[0] & delta[0] or patch[1] & delta[1]
+               for delta in landing.values()):
+            return False
+        cache[("delivered-proof", target, commit)] = {}
+        return True
+    except Exception:  # noqa: BLE001 - uncertainty retains every author
+        return False
+
+
+def _attributed_from_other_freeze(db, item: Mapping, freeze: Mapping,
+                                  commit: str, repo: str, families, *,
+                                  provider=None, cache: dict, target: str = ""):
+    """Resolve an unknown in its earlier originating lot, never remove it.
+
+    Only exact membership and recorded provenance count. Re-read the exact
+    commit using the other lot's historical reference; no recursive carry.
+    Bounded/missing/unreadable candidates leave the unknown unchanged.
+    """
+    lot = int(item.get("id") or 0)
+    app = str(item.get("app") or "")
+    at_ts = freeze.get("at_ts")
+    if not app or not lot or at_ts is None:
+        return None
+    try:
+        port = storage.of(db).work
+        key = ("other-freezes", app, lot, float(at_ts))
+        if key not in cache:
+            cache[key] = port.earlier_freezes(app, lot, float(at_ts))
+        for source in cache[key] or ():
+            source_lot = int(source.get("work_item_id") or 0)
+            source_sha = plan_git.full_commit_id(source.get("sha"))
+            stamp = source.get("at_ts")
+            if (not source_lot or source_lot == lot or not source_sha
+                    or stamp is None or float(stamp) > float(at_ts)):
+                continue
+            if _is_ancestor(repo, commit, source_sha) is not True:
+                continue
+            source_item = port.get(source_lot)
+            if (not source_item or source_item.get("app") != app
+                    or packet_composer(source_item)):
+                continue
+            # The source range is above its common baseline with the exact
+            # target. A baseline ancestor is never attributed by this proof.
+            start = plan_git._out(repo, "merge-base", target, source_sha) if target else None
+            if not start or _is_ancestor(repo, commit, start) is not False:
+                continue
+            # Freeze receipt pins the source head.
+            receipt = _milestone_receipt(provider, db, int(source["id"]), strict=True)
+            if not receipt or receipt.get("commit") != source_sha:
+                continue
+            known, written, corrections, unknown = _prior_reading(
+                db, source_item, source, [commit], repo, families,
+                provider=provider, strict=True)
+            if unknown or not known or any(not values or "" in values
+                                           for values in known.values()):
+                continue
+            if any(commit not in written.get(actor, ()) for actor in known):
+                continue
+            from . import work
+            work.note(db, lot,
+                      "#3837 : commit %s attribué par le gel #%s du lot #%s ; "
+                      "auteurs ajoutés : %s" % (
+                          commit, source["id"], source_lot,
+                          ", ".join("%s (%s)" % (actor, ", ".join(sorted(values)))
+                                    for actor, values in sorted(known.items()))), once=True)
+            return known, written, corrections
+    except Exception:  # noqa: BLE001 - no recorded proof, no attribution
+        return None
+    return None
 
 
 def _not_in_target(repo: str, commits, target: str, *, head: str = "") -> list:
@@ -2761,6 +2868,7 @@ def _carried_from_previous(db, item: Mapping, milestone: Optional[Mapping],
     file_cache: dict = {}
     patch_cache: dict = {}
     received_patches = None
+    delivered, delivered_read = None, False
 
     def obsolete_missing(commit: str, *, stored: bool) -> bool:
         nonlocal received_patches
@@ -2998,6 +3106,46 @@ def _carried_from_previous(db, item: Mapping, milestone: Optional[Mapping],
                         reason=access_why.get(sha, ""), repo=repo))
             unknown.append(freeze_unknown(sha[:12], reachable=access))
             continue
+        # #3837: only rewritten freezes get this extra scope proof. A squash
+        # whose content is still delivered keeps every contributing author.
+        if target_sha and _is_ancestor(repo, sha, head_sha) is False:
+            if not delivered_read:
+                delivered_read = True
+                try:
+                    tree = _merged_tree(repo, target_sha, head_sha)
+                    delivered = _delivered_paths(repo, target_sha, tree) if tree else None
+                except Exception:  # noqa: BLE001 - uncertainty retains authors
+                    delivered = None
+            outside = [commit for commit in earlier
+                       if _is_ancestor(repo, commit, head_sha) is False
+                       and _outside_delivered(repo, target_sha, commit, delivered,
+                                              file_cache)]
+            if outside:
+                # Journal before granting an exception. Read-only/unavailable
+                # storage cannot silently remove provenance from the gate.
+                from . import work
+                details = "; ".join(
+                    "%s : %s" % (commit, ", ".join(
+                        "%d lignes déjà présentes dans %s de la cible" % (count, path)
+                        for path, count in file_cache.get(
+                            ("delivered-proof", target_sha, commit), {}).items())
+                        or "0 lignes communes au delta livré")
+                    for commit in outside)
+                message = ("#3837 : gel #%s (%s), contenu déjà dans la cible ; "
+                           "aucune contribution de ces commits au delta livré "
+                           "vers %s sur %s : %s"
+                           % (row_id, sha, target_sha, head_sha,
+                              details))
+                try:
+                    work.note(db, lot, message, once=True)
+                except Exception:  # noqa: BLE001 - no trace, no exception
+                    outside = []
+                if exclusions_out is not None:
+                    exclusions_out.extend({"commit": commit, "head": target_sha,
+                                           "reason": "contenu déjà dans la cible",
+                                           "carried_from": sha, "freeze_id": row_id}
+                                          for commit in outside)
+                earlier = [commit for commit in earlier if commit not in outside]
         processed.append(sha)
         if not earlier or all(plan_git.full_commit_id(value) in current_set
                               for value in earlier):
@@ -3023,6 +3171,29 @@ def _carried_from_previous(db, item: Mapping, milestone: Optional[Mapping],
                         reason=access_why.get(sha, ""), repo=repo)) from exc
             unknown.append(freeze_unknown(sha[:12], reachable=access))
             continue
+        for value in list(unreadable):
+            matches = [candidate for candidate in earlier if candidate.startswith(value)]
+            if len(matches) != 1:
+                continue
+            commit = matches[0]
+            # Never replace a contradictory exact receipt with another source.
+            try:
+                if _commit_receipt(provider, db, commit, strict=True) is not None:
+                    continue
+            except Exception:  # noqa: BLE001 - unreadable receipt stays unknown
+                continue
+            attributed = _attributed_from_other_freeze(
+                db, item, row, commit, repo, families,
+                provider=provider, cache=file_cache, target=target_sha)
+            if attributed is None:
+                continue
+            source_authors, source_written, source_corrections = attributed
+            for actor, values in source_authors.items():
+                by_name.setdefault(actor, set()).update(values)
+                written.setdefault(actor, []).extend(source_written.get(actor, ()))
+            for actor, entries in source_corrections.items():
+                review_commits.setdefault(actor, []).extend(entries)
+            unreadable.remove(value)
         if unreadable:
             access = at_ref(sha)
             unknown.extend(freeze_unknown(value, reachable=access)
