@@ -168,6 +168,92 @@ class ProofTest(unittest.TestCase):
         self.assertFalse(report["ok"])
         self.assertIn("run-red", report["causes"])
 
+    def test_a_red_part_without_named_failure_stays_red_next_to_an_excluded_one(self):
+        # part 1 : échec d'un module exclu ; part 2 : fin rouge sans test nommé
+        # (crash, import) — elle ne se lit jamais comme verte.
+        plan = plan_with_host()
+        plan["parts"]["psycopg"][0]["of"] = 2
+        plan["parts"]["psycopg"].append(
+            {"part": 2, "of": 2, "modules": ["test_b"], "estimate_s": 10})
+        plan["classes"]["test_b"] = ["P0", "b"]
+        plan["selection"].update(selected=4, modules=4, impacted=4)
+        chosen = pv.selection(plan, head=A, excluded=exclusions())
+        self.assertTrue(chosen.ok, chosen.causes)
+        part = "psycopg:2"
+        flux = "\n".join((
+            flux_with(failures=(FAKE,)), pv.PART_MARK + part,
+            json.dumps({"v": 1, "schema": pv.FLOW_SCHEMA, "type": "test",
+                        "part": part, "module": "test_b",
+                        "test": "tests.test_b.C.test_y", "statut": "succes"}),
+            json.dumps({"v": 1, "schema": pv.FLOW_SCHEMA, "type": "fin",
+                        "part": part, "statut": "echec", "duree_s": 1.0})))
+        report = chosen.proof(
+            lot=4071, host="ameesh-agents-3",
+            run={"outcome": "run-red", "exit": 1, "seconds": 1.0},
+            flow=pv.parse_flow(flux))
+        self.assertFalse(report["ok"], report)
+        self.assertEqual(report["outcome"], "run-red")
+        self.assertIn("parts rouges: psycopg:2", report["detail"])
+
+    def multi_selection(self) -> pv.Selection:
+        """Deux parts : les échecs exclus ne doivent jamais verdir l'autre."""
+        return pv.Selection(
+            head=A, modules=("test_real", "test_autre"),
+            parts=(
+                {"driver": "psycopg", "part": 1, "of": 2,
+                 "modules": ("test_real",)},
+                {"driver": "psycopg", "part": 2, "of": 2,
+                 "modules": ("test_autre",)},
+            ),
+            excluded=exclusions())
+
+    def test_all_parts_with_only_excluded_failures_are_green(self):
+        lignes: list[str] = []
+        for part, module in (("psycopg:1", "test_real"),
+                             ("psycopg:2", "test_autre")):
+            lignes += [pv.PART_MARK + part,
+                       json.dumps({"v": 1, "schema": pv.FLOW_SCHEMA,
+                                   "type": "test", "part": part,
+                                   "module": module,
+                                   "test": "tests.%s.C.test_x" % module,
+                                   "statut": "succes"}),
+                       json.dumps({"v": 1, "schema": pv.FLOW_SCHEMA,
+                                   "type": "test", "part": part,
+                                   "module": FAKE,
+                                   "test": "tests.%s.C.test_%s"
+                                           % (FAKE, part.replace(":", "_")),
+                                   "statut": "echec"}),
+                       json.dumps({"v": 1, "schema": pv.FLOW_SCHEMA,
+                                   "type": "fin", "part": part,
+                                   "statut": "echec", "duree_s": 1.0})]
+        report = self.multi_selection().proof(
+            lot=4071, host="ameesh-agents-3",
+            run={"outcome": "run-red", "exit": 1, "seconds": 1.0},
+            flow=pv.parse_flow("\n".join(lignes)))
+        self.assertTrue(report["ok"], report)
+        self.assertEqual(report["outcome"], "green")
+        self.assertEqual(len(report["excluded_failed"]), 2)
+
+    def test_an_old_flow_without_failed_by_part_still_neutralises_an_excluded_failure(self):
+        # compatibilité de la preuve : un flux construit sans failed_by_part
+        # (bancs anciens) garde le repli global quand tous les échecs nommés
+        # sont exclus.
+        selection = pv.Selection(
+            head=A, modules=("test_real",),
+            parts=({"driver": "psycopg", "part": 1, "of": 1,
+                    "modules": ("test_real",)},),
+            excluded=exclusions())
+        flow = {"modules": ("test_real", FAKE),
+                "failed": ("tests.%s.C.test_x" % FAKE,),
+                "fins_par_part": {"psycopg:1": "echec"},
+                "parts": ("psycopg:1",), "tests": 1}
+        report = selection.proof(
+            lot=4071, host="ameesh-agents-3",
+            run={"outcome": "run-red", "exit": 1, "seconds": 1.0},
+            flow=flow)
+        self.assertTrue(report["ok"], report)
+        self.assertEqual(report["outcome"], "green")
+
     def test_a_missing_excluded_module_is_not_run_incomplete(self):
         # le plan n'a pas été filtré (appel direct), le module exclu est muet :
         # son absence n'est pas un module planifié non exécuté.

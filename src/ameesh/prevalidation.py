@@ -313,10 +313,11 @@ class Selection:
             if named and all(test_module(t) in excluded_names for t in named):
                 continue
             red.append(part)
-        if red and all_failed and not failed \
+        if red and all_failed and not failed and "failed_by_part" not in flow \
                 and all(test_module(t) in excluded_names for t in all_failed):
             # flux ancien, sans `failed_by_part` : tous les échecs observés
-            # sont exclus ; aucune preuve réelle ne reste.
+            # sont exclus ; aucune preuve réelle ne reste. Avec `failed_by_part`,
+            # une part rouge sans test exclu nommé reste rouge (crash, import).
             red = []
         unfinished = [p for p in planned_parts
                       if fins_par_part.get(p) not in ("succes", "echec")]
