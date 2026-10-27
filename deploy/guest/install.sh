@@ -371,8 +371,12 @@ run usermod -p '*' "$GUEST"
 # pilot's layout); install.sh gives that home to the job user below, so the
 # guest's passwd home must be $ROOT or sshd cannot chdir to it ("Permission
 # denied", then the client loses the connection). A fresh useradd already
-# sets it; this repairs an install where the pilot ran first (#4011).
-run usermod --home "$ROOT" "$GUEST"
+# sets it; this repairs an install where the pilot ran first (#4011). Only
+# when it differs: usermod -d refuses a user with live processes (the full
+# pilot's guest runners), even for the same home, and set -e would stop here.
+if [ "$(getent passwd "$GUEST" | cut -d: -f6)" != "$ROOT" ]; then
+  run usermod --home "$ROOT" "$GUEST"
+fi
 check_no_power_groups "$GUEST"
 uid=$(guest_uid)
 add_subids "$GUEST"

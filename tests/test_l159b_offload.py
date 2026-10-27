@@ -1167,6 +1167,34 @@ class InstallScriptTest(unittest.TestCase):
                         res.stdout.index("install -d -m 0700 -o ameesh-job "
                                          "-g ameesh-jobs /srv/ameesh-guest/home"))
 
+    def test_dry_run_leaves_a_guest_already_at_root_alone(self):
+        # #4011: usermod -d refuses a user with live processes (the full
+        # pilot's guest runners) even for the same home; under set -e the
+        # install would stop there. A guest already at $ROOT is not touched.
+        guest = "ameesh-guest-dry-run"
+        real_id, real_getent = shutil.which("id"), shutil.which("getent")
+        self.assertIsNotNone(real_id)
+        self.assertIsNotNone(real_getent)
+        bindir = tempfile.mkdtemp(prefix="l159b-install-home-")
+        self.addCleanup(shutil.rmtree, bindir, True)
+        for name, body in (
+                ("id", 'if [ "$1" = "-u" ] && [ "$2" = "%s" ]; then echo 997; exit 0; fi\n'
+                       'exec %s "$@"\n' % (guest, real_id)),
+                ("getent", 'if [ "$1" = "passwd" ] && [ "$2" = "%s" ]; then\n'
+                           '  echo "%s:x:997:997::/srv/ameesh-guest:/bin/sh"; exit 0\n'
+                           'fi\nexec %s "$@"\n' % (guest, guest, real_getent))):
+            path = os.path.join(bindir, name)
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write("#!/bin/sh\n" + body)
+            os.chmod(path, 0o755)
+        env = dict(os.environ, PATH=bindir + os.pathsep + os.environ.get("PATH", ""))
+        res = subprocess.run(["bash", self.SCRIPT, "--dry-run", "--user", guest,
+                              "--key", "ssh-ed25519 AAAAC3Nza test@poste",
+                              "--from", "203.0.113.7"],
+                             capture_output=True, text=True, env=env)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertNotIn("usermod --home", res.stdout)
+
     def test_the_legacy_dry_run_keeps_the_guest_alone(self):
         # --no-job-user: no job user, no group, no launcher, no rule the
         # guest cannot satisfy; the volume stays the guest's own (L159b)
