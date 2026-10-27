@@ -231,8 +231,21 @@ REMOTE_TIP_FETCH_BUDGET = 16
 REMOTE_EXTRA_TIP_FETCH_BUDGET = 512
 
 
+def _doubt_reason(exc: BaseException) -> str:
+    """Le motif d'un doute de lecture, pour que le refus le dise (#3835).
+
+    ``"timeout"`` est le seul motif qui n'est pas une preuve d'illisibilité :
+    un appelant qui le reçoit ne doit pas le présenter comme un dépôt cassé,
+    mais comme un relevé qui n'a pas conclu dans le délai."""
+    text = str(exc)
+    if "timed out" in text:
+        return "timeout"
+    return text
+
+
 def ref_reachable(repo: str, rev: str, *,
-                  timeout: float | None = REACHABLE_TIMEOUT_S) -> bool | None:
+                  timeout: float | None = REACHABLE_TIMEOUT_S,
+                  why: list[str] | None = None) -> bool | None:
     """`rev` est-il contenu par une **ref** de `repo` (#3399) ?
 
     `True` : au moins une ref locale (`refs/heads`, `refs/remotes`,
@@ -246,20 +259,58 @@ def ref_reachable(repo: str, rev: str, *,
     un `rev-parse` qui lit un objet pendant) de son accessibilité. #3399 : un
     force-push retire le commit de toute ref sans l'élaguer ; le remplacer ne
     doit donc plus être refusé par la seule présence dans l'ODB. La lecture
-    est locale et sans fetch paresseux (`for-each-ref --contains`, un seul
-    processus) ; un délai ou un dépôt illisible rend `None`, jamais `False`.
+    est locale et sans fetch paresseux ; un délai ou un dépôt illisible rend
+    `None`, jamais `False`.
+
+    #3835 : `for-each-ref --contains` coûte ~8 s sur un clone de 5 500 refs
+    (mesuré sur un clone nexlink ; le commit-graph n'y change rien). `name-rev
+    --name-only` lit la même accessibilité en ~0,1 s : il nomme le commit
+    depuis les refs, et rend `undefined` quand aucune ne le contient. Le
+    chemin rapide passe d'abord ; un échec de `name-rev` retombe sur
+    `for-each-ref --contains`, qui reste la référence. `why` reçoit le motif
+    d'un `None` (`"timeout"` ou le message git) : un délai se dit comme tel
+    au lieu d'être confondu avec un dépôt illisible.
 
     Ne voit que les refs **locales** : les refs distantes non rapatriées
     (toute l'annonce : tags, branches hors refspec, `refs/archive/…`,
     `refs/pull/N/head`) sont couvertes par [`remote_reachable`] (#3399 B1)."""
     rev = str(rev or "").strip()
     if not repo or not rev or rev.startswith("-") or not os.path.isdir(repo):
+        if why is not None:
+            why.append("repository or commit unreadable")
         return None
     bound = {} if timeout is None else {"timeout": timeout}
+
+    def doubt(exc: BaseException) -> None:
+        if why is not None:
+            why.append(_doubt_reason(exc))
+
+    # #3835 : chemin rapide. `name-rev` couvre toutes les refs (y compris
+    # `refs/ameesh/…`, `refs/pull/…`), pas seulement heads/tags/remotes.
+    try:
+        fast = _git(repo, "name-rev", "--name-only", rev,
+                    env_extra=NO_LAZY_FETCH, **bound)
+    except (GitError, OSError) as exc:
+        doubt(exc)
+        return None
+    if fast.returncode == 0:
+        name = fast.stdout.decode("utf-8", "replace").strip()
+        if name == "undefined":
+            # Sentinelle de `name-rev` ; une ref dont le nom court est
+            # exactement `undefined` rendrait le même texte. Dans ce seul cas
+            # ambigu, on retombe sur la lecture de référence.
+            clash = _out(repo, "for-each-ref", "--format=%(refname)",
+                         "refs/heads/undefined", "refs/undefined")
+            if clash is not None and not clash.strip():
+                return False
+        elif name:
+            return True
+    # `name-rev` en échec (ou ambigu) : la lecture de référence tranche.
     try:
         proc = _git(repo, "for-each-ref", "--contains=" + rev,
                     "--format=%(refname)", env_extra=NO_LAZY_FETCH, **bound)
-    except (GitError, OSError):
+    except (GitError, OSError) as exc:
+        doubt(exc)
         return None
     if proc.returncode != 0:
         return None

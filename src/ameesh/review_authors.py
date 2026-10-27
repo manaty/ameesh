@@ -2064,6 +2064,127 @@ def _superseded_freeze_ids(freezes: Sequence[Mapping]) -> set[int]:
     return out
 
 
+class PriorFreezeUnknown(str):
+    """Un inconnu de provenance porté par un gel antérieur (#3835).
+
+    Sous-classe de `str` : les appelants qui comparent, joignent ou tronquent
+    un SHA continuent de fonctionner. Les attributs disent d'où vient le
+    doute, pour que le refus nomme le gel, son SHA et le lot au lieu de rendre
+    un SHA nu que l'orchestrateur ne peut rattacher à rien."""
+
+    freeze_id: int = 0
+    freeze_sha: str = ""
+    lot: int = 0
+    reachable: bool | None = None
+    reason: str = ""
+    repo: str = ""
+
+    def __new__(cls, value, *, freeze_id: int = 0, freeze_sha: str = "",
+                lot: int = 0, reachable: bool | None = None,
+                reason: str = "", repo: str = ""):
+        obj = super().__new__(cls, str(value))
+        obj.freeze_id = int(freeze_id or 0)
+        obj.freeze_sha = str(freeze_sha or "")
+        obj.lot = int(lot or 0)
+        obj.reachable = reachable
+        obj.reason = str(reason or "")
+        obj.repo = str(repo or "")
+        return obj
+
+
+def _supersedes_remedy(lot: int, head_sha: str, freeze_ids: Sequence[int]) -> str:
+    """La commande exacte qui déclare ces gels remplacés (#3835)."""
+    flags = " ".join("--supersedes %d" % int(value) for value in freeze_ids)
+    return ("`ameesh work milestone %d frozen --sha %s %s`"
+            % (int(lot), str(head_sha or "").strip() or "<current head>", flags))
+
+
+def _access_detail(reason: str, repo: str) -> str:
+    """Dit un motif de doute d'accessibilité sans le confondre avec un refus."""
+    if reason == "timeout":
+        return ("accessibility not established: the ref reachability check "
+                "(`name-rev`/`for-each-ref --contains`) timed out after %gs in %s"
+                % (plan_git.REACHABLE_TIMEOUT_S, repo or "the repository"))
+    if reason:
+        return ("accessibility not established: %s in %s"
+                % (reason, repo or "the repository"))
+    return ""
+
+
+def prior_freeze_problem(lot: int, freeze_id: int, sha: str, detail: str, *,
+                         head_sha: str = "", reachable: bool | None = None,
+                         reason: str = "", repo: str = "") -> str:
+    """Le refus d'un gel antérieur illisible, nommé et actionnable (#3835)."""
+    text = "prior freeze #%d" % int(freeze_id)
+    if sha:
+        text += " (%s)" % str(sha)[:12]
+    text += " of lot #%d: %s" % (int(lot), detail)
+    said = _access_detail(reason, repo)
+    if said:
+        text += "; " + said
+    if reachable is False and freeze_id:
+        text += ("; no local ref contains this freeze: if no remote ref contains "
+                 "it either, declare it replaced with %s"
+                 % _supersedes_remedy(lot, head_sha, [freeze_id]))
+    elif reachable is True:
+        text += ("; a ref still contains this freeze, so `--supersedes` would be "
+                 "refused: its authors must stay carried")
+    elif sha:
+        text += ("; its accessibility is not proven, so `--supersedes` cannot be "
+                 "offered yet")
+    return text
+
+
+def unknown_refusal(unknown: Sequence[str], *, head_sha: str = "") -> str:
+    """Le refus actionnable d'inconnus de provenance (#3835).
+
+    Chaque inconnu porté par un gel antérieur est nommé avec son gel, son SHA
+    et le lot. Un délai de `ref_reachable` est dit comme tel. Le remède
+    `--supersedes` n'est proposé que pour les gels dont l'absence de toute ref
+    **locale** est prouvée ; la commande vérifie ensuite les refs distantes et
+    refuse si l'une les contient. Un gel encore accessible ou d'accessibilité
+    inconnue est signalé, jamais présenté comme remplaçable. Les inconnus de la
+    plage courante, sans gel antérieur, gardent le message historique."""
+    names: list[str] = []
+    unreachable: dict[int, list[int]] = {}
+    reachable: list[PriorFreezeUnknown] = []
+    doubts: list[PriorFreezeUnknown] = []
+    for value in unknown or ():
+        if not isinstance(value, PriorFreezeUnknown):
+            names.append(str(value))
+            continue
+        text = str(value)
+        text += (" (prior freeze #%d sha %s of lot #%d"
+                 % (value.freeze_id, value.freeze_sha[:12], value.lot))
+        said = _access_detail(value.reason, value.repo)
+        if said:
+            text += "; " + said
+        text += ")"
+        names.append(text)
+        if value.reachable is False and value.freeze_id:
+            unreachable.setdefault(value.lot, []).append(value.freeze_id)
+        elif value.reachable is True:
+            reachable.append(value)
+        else:
+            doubts.append(value)
+    out = "author provenance unknown for frozen commit(s): " + ", ".join(names or ["?"])
+    for frozen_lot, freeze_ids in sorted(unreachable.items()):
+        unique = sorted({int(value) for value in freeze_ids})
+        out += ("; no local ref contains prior freeze(s) %s of lot #%d: if no "
+                "remote ref contains them either, declare them replaced with %s"
+                % (", ".join("#%d" % value for value in unique), frozen_lot,
+                   _supersedes_remedy(frozen_lot, head_sha, unique)))
+    for value in reachable:
+        out += ("; prior freeze #%d (%s) is still reachable from a ref, so "
+                "`--supersedes` would be refused: its authors must stay carried"
+                % (value.freeze_id, value.freeze_sha[:12]))
+    for value in doubts:
+        out += ("; the accessibility of prior freeze #%d (%s) is not proven, "
+                "so `--supersedes` cannot be offered yet; retry once the "
+                "repository answers" % (value.freeze_id, value.freeze_sha[:12]))
+    return out
+
+
 def _forge_fetch(repo: str, sha: str) -> bool:
     """Rapatrie le commit exact `sha` depuis la forge du clone (`origin`).
 
@@ -2285,6 +2406,9 @@ def _carried_from_previous(db, item: Mapping, milestone: Optional[Mapping],
         except Exception:  # noqa: BLE001 - dépôt illisible : absence
             return False
 
+    access_cache: dict[str, bool | None] = {}
+    access_why: dict[str, str] = {}
+
     def at_ref(commit: str) -> bool | None:
         """Le commit est-il contenu par une **ref** du dépôt de lecture (#3399) ?
 
@@ -2292,14 +2416,27 @@ def _carried_from_previous(db, item: Mapping, milestone: Optional[Mapping],
         n'est pas consultée, c'est justement ce que #3399 distingue. `None` :
         accessibilité illisible (doute) ; l'appelant relit alors le gel, le
         refus fermé B5 garde sa force pour un contenu peut-être accessible.
+
+        #3835 : le motif d'un `None` (délai ou lecture git en échec) est gardé
+        pour que le refus le dise, et le résultat est mis en cache : un gel
+        antérieur peut produire plusieurs inconnus, et le relevé est le geste
+        lent de la lecture (`for-each-ref --contains`, ~8 s sur un gros clone).
         """
+        key = str(commit or "").strip()
+        if key in access_cache:
+            return access_cache[key]
+        reasons: list[str] = []
         try:
-            full = plan_git.local_commit(repo, str(commit or "").strip())
+            full = plan_git.local_commit(repo, key)
             if not full:
+                access_cache[key] = False
                 return False
-            return plan_git.ref_reachable(repo, full)
+            access_cache[key] = plan_git.ref_reachable(repo, full, why=reasons)
         except Exception:  # noqa: BLE001 - lecture impossible : doute
-            return None
+            access_cache[key] = None
+        if reasons:
+            access_why[key] = reasons[0]
+        return access_cache[key]
 
     def recover_one(commit: str) -> bool:
         """Tente de rapatrier un gel absent ; True seulement s'il est lisible.
@@ -2352,12 +2489,24 @@ def _carried_from_previous(db, item: Mapping, milestone: Optional[Mapping],
                 ignore_unknown = True
             # accessible (ou accessibilité illisible) : lecture normale, B5.
         sha = str(row.get("sha") or "").strip()
+
+        def freeze_unknown(value, *, reachable=None):
+            """Un inconnu de ce gel, avec le contexte du refus (#3835)."""
+            if reachable is None and sha:
+                reachable = at_ref(sha)
+            return PriorFreezeUnknown(
+                value, freeze_id=row_id, freeze_sha=sha, lot=lot,
+                reachable=reachable, reason=access_why.get(sha, ""),
+                repo=repo)
+
         if not sha:
             if strict:
                 raise review_provenance.ProvenanceError(
-                    "prior freeze #%s of lot #%d names no commit: its authors "
-                    "cannot be carried" % (row.get("id"), lot))
-            unknown.append("freeze:%d" % int(row.get("id") or 0))
+                    prior_freeze_problem(
+                        lot, row_id, "",
+                        "names no commit: its authors cannot be carried",
+                        head_sha=head_sha))
+            unknown.append(freeze_unknown("freeze:%d" % row_id))
             continue
         # un gel déjà attribué par la plage courante n'a pas besoin d'objets
         if plan_git.full_commit_id(sha) in current_set:
@@ -2365,12 +2514,16 @@ def _carried_from_previous(db, item: Mapping, milestone: Optional[Mapping],
         if not present(sha) and not recover_one(sha):
             # #2924 B7 : sans les objets, impossible de prouver qu'aucun
             # correcteur n'est en cause ; B5 refuse plutôt que de deviner.
+            access = at_ref(sha)
             if strict:
                 raise review_provenance.ProvenanceError(
-                    "prior freeze %s of lot #%d is absent from the repository "
-                    "and cannot be recovered: its authors cannot be carried"
-                    % (sha[:12], lot))
-            unknown.append(sha[:12])
+                    prior_freeze_problem(
+                        lot, row_id, sha,
+                        "is absent from the repository and cannot be recovered: "
+                        "its authors cannot be carried",
+                        head_sha=head_sha, reachable=access,
+                        reason=access_why.get(sha, ""), repo=repo))
+            unknown.append(freeze_unknown(sha[:12], reachable=access))
             continue
         if base and not present(base):
             recover_one(base)
@@ -2387,11 +2540,16 @@ def _carried_from_previous(db, item: Mapping, milestone: Optional[Mapping],
             continue
         start = plan_git._out(repo, "merge-base", sha, base or head_sha)
         if not start:
+            access = at_ref(sha)
             if strict:
                 raise review_provenance.ProvenanceError(
-                    "prior freeze %s of lot #%d is not readable against the base: "
-                    "its authors cannot be carried" % (sha[:12], lot))
-            unknown.append(sha[:12])
+                    prior_freeze_problem(
+                        lot, row_id, sha,
+                        "is not readable against the base: its authors cannot "
+                        "be carried",
+                        head_sha=head_sha, reachable=access,
+                        reason=access_why.get(sha, ""), repo=repo))
+            unknown.append(freeze_unknown(sha[:12], reachable=access))
             continue
         earlier = _commits_between(repo, start, sha)
         if earlier is not None:
@@ -2402,11 +2560,16 @@ def _carried_from_previous(db, item: Mapping, milestone: Optional[Mapping],
             earlier = provenance_scope.exclude(repo, earlier, admitted_heads,
                                                exclusions_out, carried_from=sha)
         if earlier is None:
+            access = at_ref(sha)
             if strict:
                 raise review_provenance.ProvenanceError(
-                    "the commit range of prior freeze %s of lot #%d is unreadable"
-                    % (sha[:12], lot))
-            unknown.append(sha[:12])
+                    prior_freeze_problem(
+                        lot, row_id, sha,
+                        "its commit range is unreadable: its authors cannot be "
+                        "carried",
+                        head_sha=head_sha, reachable=access,
+                        reason=access_why.get(sha, ""), repo=repo))
+            unknown.append(freeze_unknown(sha[:12], reachable=access))
             continue
         processed.append(sha)
         if not earlier or all(plan_git.full_commit_id(value) in current_set
@@ -2423,13 +2586,20 @@ def _carried_from_previous(db, item: Mapping, milestone: Optional[Mapping],
                 ignore_unknown=ignore_unknown,
                 ignore_missing=lambda commit: obsolete_missing(commit, stored=stored))
         except Exception as exc:  # noqa: BLE001 - un gel antérieur illisible
+            access = at_ref(sha)
             if strict:
                 raise review_provenance.ProvenanceError(
-                    "the authors of prior freeze %s of lot #%d cannot be read (%s)"
-                    % (sha[:12], lot, exc)) from exc
-            unknown.append(sha[:12])
+                    prior_freeze_problem(
+                        lot, row_id, sha,
+                        "the authors cannot be read (%s)" % exc,
+                        head_sha=head_sha, reachable=access,
+                        reason=access_why.get(sha, ""), repo=repo)) from exc
+            unknown.append(freeze_unknown(sha[:12], reachable=access))
             continue
-        unknown.extend(unreadable)
+        if unreadable:
+            access = at_ref(sha)
+            unknown.extend(freeze_unknown(value, reachable=access)
+                           for value in unreadable)
         for actor, proven in by_name.items():
             # #3335 (auditeur B1) : un relecteur promu auteur d'un gel antérieur
             # (#2924 B4) ne garde pas le raccourci d'ascendance (`stored`) : un
