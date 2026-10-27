@@ -151,7 +151,10 @@ class LeaseStorageTest(PgTestCase):
         self.assertEqual(int(row["epoch"]), epoch)
         self.assertGreater(float(row["expires_ts"]) - float(row["now_ts"]), 3.0)
 
-    def test_an_expired_lease_is_never_resurrected_by_a_renewal(self):
+    def test_a_lease_expired_at_a_past_deadline_is_never_resurrected(self):
+        # Témoin déterministe : l'expiration est écrite dans `expires_at`, sans
+        # attente. La seconde définition du même nom (TTL courte + sleep)
+        # l'écrasait auparavant.
         epoch = self.store().acquire_state("alerts", "agents-a:1", 60)
         self.assertIsNotNone(epoch)
         self.db.execute(
