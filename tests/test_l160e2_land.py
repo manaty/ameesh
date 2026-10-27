@@ -1311,7 +1311,9 @@ class LeaseDbTest(PgTestCase):
         dead = ops.land_lock("dead-pass:main", "radar-dead", 0.2)
         self.assertEqual(dead, 1)
         time.sleep(0.5)
-        live = ops.land_lock("dead-pass:main", "radar-live", 0.2)
+        # le bail vivant n'a pas de borne courte à prouver : un TTL court
+        # expirait avant queue_update sous le pilote psql (rouge CI de h-41)
+        live = ops.land_lock("dead-pass:main", "radar-live", 60)
         self.assertEqual(live, 2)
         self.assertFalse(ops.land_unlock("dead-pass:main", "radar-dead", dead))
         self.assertIsNone(ops.queue_update(lot, state="landing",
