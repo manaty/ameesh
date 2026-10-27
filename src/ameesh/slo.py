@@ -169,18 +169,27 @@ def targets(level_: int, *, critical: bool = False) -> tuple:
 # mesure depuis les événements du lot
 # --------------------------------------------------------------------------
 
+#: #4002 : la note que `packet_link.record` écrit sur le porteur à chaque
+#: composition enregistrée (test de concordance dans test_789_slo).
+PACKET_COMPOSITION_NOTE = "packet composition recorded: "
+
+
 def start_ts(events: Iterable[dict]) -> float | None:
     """L'instant mesuré du début du lot : le premier passage en `build`, ou le
     début mesuré (premier tour du porteur, `estimates.START_NOTE`) s'il est
     antérieur (#3162). Un lot dont le porteur travaille déjà reste parfois en
-    intake : le début mesuré conclut alors `intake_started`. `None` sans
-    aucun de ces faits."""
+    intake : le début mesuré conclut alors `intake_started`. #4002 : un
+    porteur de paquet reste en intake jusqu'au gel, la composition en cours ;
+    sa première composition enregistrée (`PACKET_COMPOSITION_NOTE`) est
+    son début. Sans aucune composition, l'alerte de démarrage reste due.
+    `None` sans aucun de ces faits."""
     from . import estimates
 
+    starts = (estimates.START_NOTE, PACKET_COMPOSITION_NOTE)
     stamps = [float(ev["created_ts"]) for ev in events
               if ev.get("created_ts") is not None
               and (ev.get("state") == "build"
-                   or (ev.get("note") or "").startswith(estimates.START_NOTE))]
+                   or (ev.get("note") or "").startswith(starts))]
     return min(stamps) if stamps else None
 
 
