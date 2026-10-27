@@ -225,6 +225,8 @@ class LocalNeighborsTest(unittest.TestCase):
         self.assertEqual(calls[0], ("unité #1", ["tests.test_propre_1",
                                                  "tests.test_3512_slo_merged"]))
         self.assertEqual(faulty, [1])
+        self.assertIn("1 échec(s), 0 run(s) rouge(s) sans effet",
+                      paquet_auto._tests_summary(runs))
         manifest = paquet_auto.build_manifest(
             name="banc", target="main", base_sha="4" * 40, carrier=99,
             composition=self.composition, table="## Composition\n",
@@ -267,7 +269,7 @@ class LocalNeighborsTest(unittest.TestCase):
         name = "tests.test_1651_ci_parts.T.test_x"
         for at_base in ({name}, None):
             with self.subTest(at_base=at_base):
-                _calls, (_runs, faulty, _removals) = self.run_check(
+                _calls, (runs, faulty, _removals) = self.run_check(
                     {1: [support]}, {
                         "unité #1": lambda m: _red("unité #1", m,
                                                    "tests.test_1651_ci_parts"),
@@ -276,6 +278,31 @@ class LocalNeighborsTest(unittest.TestCase):
                     }, at_base=at_base)
                 self.assertEqual(self.replayed, [["tests.test_1651_ci_parts"]])
                 self.assertEqual(faulty, [])
+                self.assertFalse(runs[0].green)
+                self.assertTrue(runs[0].ignored_red)
+                manifest = paquet_auto.build_manifest(
+                    name="banc", target="main", base_sha="4" * 40, carrier=99,
+                    composition=self.composition, table="## Composition\n",
+                    tests=runs, freeze_seconds=0.0)
+                self.assertIn("0 échec(s), 1 run(s) rouge(s) sans effet", manifest)
+
+    def test_rouge_mixte_garde_l_echec_propre(self) -> None:
+        support = {"module": "tests.test_voisin", "reason": "support",
+                   "files": ["tests/test_support.py"]}
+        def mixed(modules):
+            run = _red("unité #1", modules, "tests.test_voisin")
+            run.output += _red("unité #1", modules,
+                               "tests.test_propre_1").output
+            return run
+        _calls, (runs, faulty, _removals) = self.run_check({1: [support]}, {
+            "unité #1": mixed,
+            "unité #2": lambda m: _green("unité #2", m),
+            "contrats": lambda m: _green("contrats", m),
+        }, at_base={"tests.test_voisin.T.test_x"})
+        self.assertEqual(faulty, [1])
+        self.assertFalse(runs[0].ignored_red)
+        self.assertIn("1 échec(s), 0 run(s) rouge(s) sans effet",
+                      paquet_auto._tests_summary(runs))
 
     def test_module_propre_rouge_n_est_pas_rejoue(self) -> None:
         _calls, (_runs, faulty, _removals) = self.run_check({}, {
