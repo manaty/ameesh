@@ -9663,14 +9663,21 @@ class Runner:
         ici, sur l'hôte où ces agents tournent, avec les mêmes garde-fous
         (repos réel, budget, hôtes en pause, `balance_low`, plafonds horaires
         comptés en base). Seuls les agents servis par cet exécuteur — leurs
-        workers vivants — sont preneurs ; la liste du mesh reste entière pour
-        les gardes et l'avertissement des orchestrateurs. Un hôte sous pression
-        est écarté comme par `ameesh notify` (alerte `host_pressure` locale).
+        workers vivants et encore admis — sont preneurs ; la liste du mesh
+        reste entière pour les gardes et l'avertissement des orchestrateurs.
+        Un hôte sous pression est écarté comme par `ameesh notify` (alerte
+        `host_pressure` locale).
+
+        #3972 : un worker retiré de l'admission reste vivant jusqu'à la fin
+        de son tour ; il ne prend plus de lot entre-temps.
         """
         if self.once or self.mediated or not self.take:
             return []
         with self.lock:
             names = {name for name, worker in self.workers.items() if worker.is_alive()}
+            flt = getattr(self, "agents_filter", None)
+        if flt is not None:
+            names &= set(flt)
         if not names:
             return []
         alerts = []
@@ -11258,11 +11265,11 @@ class Runner:
         try:
             from .scoped_db import ScopedDb
             db = ScopedDb(self.cfg)
-            # #3925 : `{""}` pour une liste d'admission vide (un ensemble
-            # vide se lirait « tous les agents »)
+            # #3972 : un filtre d'admission vide ne sélectionne aucun agent
+            # (un ensemble vide n'est jamais « tous les agents »)
             report = plan_git.sync_branches(
-                db, host=self.host, agents=set(self.agents_filter or ("",))
-                if self.agents_filter is not None else None,
+                db, host=self.host,
+                agents=set(self.agents_filter) if self.agents_filter is not None else None,
                 dry_run=self.dry_run, actor="runner %s" % self.runner_id)
             for entry in report["results"]:
                 if entry["result"] in ("merged", "would-merge"):
@@ -11405,7 +11412,7 @@ class Runner:
             errors: list = []
             for row in lot_measures.measure_pending(
                     db, host=self.host,
-                    agents=(set(self.agents_filter or ("",))
+                    agents=(set(self.agents_filter)
                             if self.agents_filter is not None else None),
                     errors=errors):
                 log_async("work item #%s measured: %s" % (
