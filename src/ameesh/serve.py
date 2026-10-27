@@ -1138,7 +1138,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if faults is None:
             return
         path = urllib.parse.urlsplit(self.path).path
-        faults.record(fault_route(self.command, path), exc)
+        faults.record(fault_route(self.command, path), exc,
+                      subject=server_faults.HUMAN)
         self._kick_faults()
 
     def _kick_faults(self, *, every: float = 0.0) -> None:
