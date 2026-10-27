@@ -522,12 +522,18 @@ class AgentHostTest(unittest.TestCase):
         (self.state / 'scenario').write_text(scenario)
         (self.state / 'agents.json').write_text(json.dumps(self.agents if agents is None else agents))
         return subprocess.run(['bash', str(SCRIPT), 'agents', action], env=self.env,
-                              capture_output=True, text=True, timeout=120)
+                              capture_output=True, text=True, timeout=300)
 
     def _processus_venv(self, venv, marque='mainpid'):
-        """#3311 : processus vivant dont l'argv[0] est le python concret du venv."""
+        """#3311 : processus vivant dont l'argv[0] est le python concret du venv.
+
+        #3832 : il doit vivre tout le test. 60 s suffisaient à vide ; sous
+        --parallel, quatre scénarios `controler` peuvent dépasser la minute et
+        le processus disparaissait, faisant dire au script « venv courant non
+        prouvé » (rouge h-32, test_runner_id_forms). Le cleanup l'arrête.
+        """
         enfant = subprocess.Popen([str(venv / 'bin/python'), '-c',
-                                    'import time; time.sleep(60)'])
+                                    'import time; time.sleep(600)'])
         self.addCleanup(self._arreter, enfant)
         (self.state / marque).write_text(str(enfant.pid) + '\n')
         return enfant
@@ -576,13 +582,16 @@ class AgentHostTest(unittest.TestCase):
             pass
         self._tuer_la_session_ssh(self.state / self.SSH_PID)
         try:
-            proc.communicate(timeout=5)
+            # #3832 : la récolte reste bornée, mais 5 s ne suffisent plus sous
+            # --parallel ; 30 s laisse le groupe rendre ses tuyaux sans
+            # attendre le plafond de la part.
+            proc.communicate(timeout=30)
         except subprocess.TimeoutExpired:
             # Une session ssh inconnue retient encore les tuyaux : renoncer
             # promptement, sans jamais attendre la fin du plafond de CI.
             try:
                 proc.kill()
-                proc.wait(timeout=5)
+                proc.wait(timeout=30)
             except subprocess.TimeoutExpired:
                 pass
             self.fail("l'appel de drain n'a pas rendu ses tuyaux dans la "
@@ -820,7 +829,9 @@ class AgentHostTest(unittest.TestCase):
                                 stderr=subprocess.PIPE, text=True,
                                 start_new_session=True)
         try:
-            _, stderr = proc.communicate(timeout=10)
+            # #3832 : la borne locale vaut 2 s ; 10 s de récolte ne laissaient
+            # pas de marge à l'ordonnancement sous --parallel (h-32).
+            _, stderr = proc.communicate(timeout=30)
         except subprocess.TimeoutExpired:
             self._terminer_l_appel(proc)
             self.fail('drain call outlived its deadline with a live SSH client')
@@ -840,7 +851,7 @@ class AgentHostTest(unittest.TestCase):
                                 stderr=subprocess.PIPE, text=True,
                                 start_new_session=True)
         try:
-            _, stderr = proc.communicate(timeout=10)
+            _, stderr = proc.communicate(timeout=30)
         except subprocess.TimeoutExpired:
             self._terminer_l_appel(proc)
             self.fail('drain call outlived its deadline with a live SSH client')
@@ -863,7 +874,7 @@ class AgentHostTest(unittest.TestCase):
                                 stderr=subprocess.PIPE, text=True,
                                 start_new_session=True)
         try:
-            limite = time.monotonic() + 10
+            limite = time.monotonic() + 30
             while not (self.state / 'ssh-commence').exists() \
                     and time.monotonic() < limite:
                 time.sleep(0.05)
@@ -872,7 +883,7 @@ class AgentHostTest(unittest.TestCase):
             # témoin, pour que la récolte de repli puisse la tuer.
             self.assertTrue((self.state / self.SSH_PID).exists())
             os.killpg(proc.pid, signal.SIGINT)
-            _, stderr = proc.communicate(timeout=10)
+            _, stderr = proc.communicate(timeout=30)
         except subprocess.TimeoutExpired:
             self._terminer_l_appel(proc)
             self.fail('interrupted drain call did not end')
@@ -901,19 +912,20 @@ class AgentHostTest(unittest.TestCase):
                                 stderr=subprocess.PIPE, text=True,
                                 start_new_session=True)
         self.addCleanup(self._nettoyer_client, proc, pid_file)
-        limite = time.monotonic() + 10
+        limite = time.monotonic() + 30
         while not pid_file.exists() and time.monotonic() < limite:
             time.sleep(0.05)
         self.assertTrue(pid_file.exists(), "le faux ssh n'a pas démarré")
         # Filet du test lui-même : si la borne de récolte disparaissait, ce
         # témoin tue la session et le test échoue, au lieu de pendre jusqu'au
-        # plafond de la part de CI.
-        minuteur = threading.Timer(8, self._tuer_la_session_ssh, (pid_file,))
+        # plafond de la part de CI. #3832 : la récolte est bornée à 30 s sous
+        # charge, le filet passe au-delà.
+        minuteur = threading.Timer(60, self._tuer_la_session_ssh, (pid_file,))
         minuteur.start()
         self.addCleanup(minuteur.cancel)
         debut = time.monotonic()
         self._terminer_l_appel(proc)
-        self.assertLess(time.monotonic() - debut, 5,
+        self.assertLess(time.monotonic() - debut, 30,
                         'la récolte de repli doit être bornée')
 
     def _nettoyer_client(self, proc, pid_file):
@@ -937,7 +949,9 @@ class AgentHostTest(unittest.TestCase):
         p = self.run_vm(scenario='show-lent')
         ecoule = time.monotonic() - debut
         self.assertNotEqual(p.returncode, 0)
-        self.assertLess(ecoule, 5,
+        # #3832 : 8 s reste strictement sous la borne des gestes de drain
+        # (10 s) et laisse la marge d'ordonnancement de --parallel.
+        self.assertLess(ecoule, 8,
                         'show doit être coupé par DRAIN_LECTURE_DELAI, pas par '
                         'DRAIN_APPEL_DELAI')
 

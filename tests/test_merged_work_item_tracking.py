@@ -1993,7 +1993,13 @@ class ProbePartialCloneTest(_Base):
 
     def test_1772_gel_absent_rapatrie_par_un_fetch_explicite(self):
         sha = self.publish()
-        self.assertIsNone(plan_git._commit(self.repo, sha))      # absent du clone
+        # #3832 : la prémisse est « absent des objets LOCAUX ». `_commit` s'en
+        # remet à GIT_NO_LAZY_FETCH, que git 2.43 n'honore pas toujours : sous
+        # charge, un fetch paresseux pouvait aboutir et le témoin devenait
+        # « présent » (rouge h-32). `local_commit` lit un magasin d'objets sans
+        # remote, donc sans fetch possible ; la sonde suivante prouve le
+        # rapatriement explicite.
+        self.assertIsNone(plan_git.local_commit(self.repo, sha))  # absent du clone
         found = plan_git.probe(self.repo, sha, "origin/main")
         self.assertFalse(found["merged"], found)
         self.assertNotIn("not in the repository", found["detail"])
