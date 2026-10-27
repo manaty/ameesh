@@ -2,6 +2,7 @@
 """work_items : machine à états, boucle QA bornée, journal des transitions."""
 from __future__ import annotations
 
+import json
 import threading
 import time
 import unittest
@@ -15,6 +16,33 @@ from .support import PgTestCase, hold_for_owner
 class WorkTest(PgTestCase):
     def _add(self, title: str = "un lot", **kwargs) -> dict:
         return work.add(self.db, title=title, actor="orchestrateur", **kwargs)
+
+    def _wait_own_notification(self, listener, item, timeout: float = 5.0):
+        """La notification de CE lot, les autres ignorées.
+
+        Le canal `work_item` est commun à toute la base, pas au schéma du test :
+        une autre classe (autre schéma) y dépose ses changements d'état pendant
+        l'attente (#3958, même classe de défaut que #3933 pour `ameesh_train`).
+        On ne retient donc que la charge de son propre lot — id et titre, ce
+        dernier portant l'espace de noms du test. Un écouteur en panne
+        (`event`) n'est jamais avalé."""
+        attendu = (int(item["id"]), item["title"][:80])
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            recu = listener.wait(max(0.0, min(1.0, deadline - time.monotonic())))
+            if recu is None:
+                continue
+            if "event" in recu:          # panne de l'écouteur : jamais avalée
+                return recu
+            try:
+                charge = json.loads(recu.get("payload") or "")
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(charge, dict):
+                continue
+            if (charge.get("id"), charge.get("title")) == attendu:
+                return recu
+        return None
 
     def test_cycle_complet(self):
         item = self._add("Banc v1")
@@ -207,18 +235,24 @@ class WorkTest(PgTestCase):
         self.assertEqual(work.get(self.db, item["id"])["state"], "build")
 
     def test_notify_sur_changement_d_etat(self):
+        # Le titre porte l'espace de noms du test : le canal est commun à la
+        # base, un autre schéma peut notifier un lot homonyme (même id, même
+        # état) pendant l'attente. Le lot « deux » est le témoin : sa
+        # notification part avant celle du lot attendu, et ne doit pas la
+        # satisfaire.
+        titre = "notifie-moi %s" % self.schema
         listener = self.db.listen(["work_item"])
         try:
             time.sleep(0.6)
-            item = self._add("notifie-moi")
-            recu = None
-            deadline = time.monotonic() + 5.0
-            while recu is None and time.monotonic() < deadline:
-                recu = listener.wait(timeout=1.0)
+            self._add("deux")
+            item = self._add(titre)
+            recu = self._wait_own_notification(listener, item)
             self.assertIsNotNone(recu)
             self.assertEqual(recu["channel"], "work_item")
-            self.assertIn('"state"', recu["payload"])
-            self.assertIn(str(item["id"]), recu["payload"])
+            charge = json.loads(recu["payload"])
+            self.assertEqual(charge["id"], item["id"])
+            self.assertEqual(charge["state"], "intake")
+            self.assertEqual(charge["title"], titre)
         finally:
             listener.close()
 
