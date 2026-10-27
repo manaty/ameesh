@@ -47,6 +47,13 @@ Two consequences are made explicit instead of silent:
   and every other pass — take, budget handoff, WIP sweep — is kept by
   default. ``alerts`` is skipped only where its timer is installed.
 
+#3854: the hourly packet tick of #3845 (``scripts/paquet-horaire.py``) is a
+role timer too, under the same ``mesh-design`` lease. Its unit keeps the name
+of ``deploy/systemd/ameesh-paquet-horaire.{service,timer}`` so a copy made by
+hand is replaced, not doubled; it needs the dedicated clone declared in
+``paquet-horaire.env``, and a candidate without it reports the gap as an
+advisory warning, like the alerts route.
+
 The units are user units, like ``ameesh-release.timer``. This module never
 runs ``systemctl`` during rendering; ``--install``/``--remove``/``--check``
 do, unless ``--no-apply`` is given.
@@ -86,6 +93,14 @@ _MIN_INTERVAL_S = 60
 ALERTS_INTERVAL_S = 30
 #: the passes the full service always leaves to the role timers (#3327)
 _OBSERVATION_PASSES = ("issues", "github-watch", "ci")
+#: #3854: the hourly packet tick (#3845), a tick every ten minutes; the script
+#: composes at most one carrier per hour and otherwise follows the open one
+PAQUET_PASS = "paquet-horaire"
+PAQUET_UNIT = "ameesh-paquet-horaire"
+PAQUET_INTERVAL_S = 600
+PAQUET_ENV = "~/.config/ameesh/paquet-horaire.env"
+PAQUET_SCRIPT = "scripts/paquet-horaire.py"
+PAQUET_DESCRIPTION = "ameesh paquet horaire sans agent (#3845)"
 
 
 class TimerError(RuntimeError):
@@ -109,6 +124,8 @@ class TimerSpec:
 
     @property
     def unit(self) -> str:
+        if self.name == PAQUET_PASS:
+            return PAQUET_UNIT
         return "ameesh-role-%s" % self.name
 
     @property
@@ -304,9 +321,14 @@ def unit_env(path: str | None = None) -> dict:
     A missing file is the optional ``EnvironmentFile=-`` of the unit. Values
     are never printed.
     """
-    env = dict(os.environ)
+    return dict(os.environ, **_env_file(path or NOTIFY_ENV))
+
+
+def _env_file(path: str) -> dict:
+    """The ``KEY=VALUE`` pairs of an ``EnvironmentFile`` (empty when absent)."""
+    env = {}
     try:
-        text = Path(os.path.expanduser(path or NOTIFY_ENV)).read_text(encoding="utf-8")
+        text = Path(os.path.expanduser(path)).read_text(encoding="utf-8")
     except OSError:
         return env
     for line in text.splitlines():
@@ -321,6 +343,54 @@ def unit_env(path: str | None = None) -> dict:
             value = value[1:-1]
         env[key.strip()] = value
     return env
+
+
+def paquet_reach(path: str | None = None, *, git=None) -> tuple[str, str]:
+    """#3854: ``(blocked, detail)`` for the hourly packet tick on this host.
+
+    The unit runs the script of a dedicated clone (``AMEESH_PAQUET_REPO`` in
+    ``paquet-horaire.env``), advanced on ``origin/<target>`` before each tick.
+    Without that file, that clone, or the script on the target (#3845 not
+    landed, clone behind), the tick would fail every ten minutes: the pass is
+    blocked instead. Empty strings when it can run. The path must be absolute:
+    systemd reads ``EnvironmentFile`` literally (no ``~``, no working
+    directory). ``origin/<target>`` is what the tick runs, so it is read first;
+    the work tree only answers when git cannot.
+    """
+    target_path = Path(os.path.expanduser(path or PAQUET_ENV))
+    if not target_path.is_file():
+        return ("%s missing" % (path or PAQUET_ENV),
+                "declare AMEESH_PAQUET_REPO, the dedicated clone of the project "
+                "(see EXPLOITATION, Pose automatique)")
+    # the file alone: the unit does not inherit this shell's environment
+    env = _env_file(str(target_path))
+    repo = (env.get("AMEESH_PAQUET_REPO") or "").strip()
+    if not repo:
+        return ("AMEESH_PAQUET_REPO missing",
+                "declare it in %s (see EXPLOITATION, Pose automatique)"
+                % (path or PAQUET_ENV))
+    if any(ch.isspace() for ch in repo):
+        return ("AMEESH_PAQUET_REPO contains whitespace", repr(repo))
+    if not repo.startswith("/"):
+        return ("AMEESH_PAQUET_REPO is not an absolute path",
+                "%r: systemd reads paquet-horaire.env literally" % repo)
+    root = Path(repo)
+    if not (root / ".git").exists():
+        return ("AMEESH_PAQUET_REPO is not a git clone", repo)
+    target = (env.get("AMEESH_PAQUET_TARGET") or "main").strip() or "main"
+    run = git or (lambda *args: subprocess.run(
+        ["git", "-C", str(root), *args], capture_output=True, text=True, timeout=30))
+    try:
+        found = run("cat-file", "-e", "origin/%s:%s" % (target, PAQUET_SCRIPT))
+    except (OSError, subprocess.SubprocessError):
+        found = None
+    if found is not None and found.returncode == 0:
+        return "", repo
+    if found is None and (root / PAQUET_SCRIPT).is_file():
+        return "", repo
+    return ("%s absent from the clone" % PAQUET_SCRIPT,
+            "%s on origin/%s: #3845 not landed, or the clone is behind "
+            "(git -C %s pull --ff-only)" % (repo, target, repo))
 
 
 def notify_reach(cfg, *, responsible=None, env: dict | None = None) -> tuple[list[str], str]:
@@ -422,7 +492,7 @@ def alerts_timer_gap(*, role: str, directory: Path | None = None,
 
 def plan(*, host: str, role: str, row: dict, settings, watch_intervals,
          watch_error: str = "", expected_projects=None, notify_humans=None,
-         notify_error: str = "") -> dict:
+         notify_error: str = "", paquet=None) -> dict:
     """The timers this host should run, without touching the filesystem.
 
     ``row`` is the role's ``agent_registry`` row: an elected role is a
@@ -432,6 +502,9 @@ def plan(*, host: str, role: str, row: dict, settings, watch_intervals,
     ``github.projects`` is reported, never silently ignored. ``notify_humans``
     and ``notify_error`` come from :func:`notify_reach`: without a remote push
     to every required human, the ``alerts`` pass is blocked (#3383).
+    ``paquet`` is the ``(blocked, detail)`` of :func:`paquet_reach`; ``None``
+    leaves the hourly packet tick out of the plan (#3854), as does any role
+    but ``mesh-design``, whose lease carries the tick.
     """
     declared = candidates(row)
     candidate = is_candidate(row, host)
@@ -500,6 +573,12 @@ def plan(*, host: str, role: str, row: dict, settings, watch_intervals,
         reported.append(TimerSpec(
             "alerts", "alerts", ALERTS_INTERVAL_S, description,
             detail="reaches %s" % ", ".join(notify_humans)))
+    if paquet is not None and role == DEFAULT_ROLE:
+        blocked, detail = paquet
+        # #3854: a missing clone is a host setting, not a negative result (§3)
+        reported.append(TimerSpec(
+            PAQUET_PASS, PAQUET_PASS, PAQUET_INTERVAL_S, PAQUET_DESCRIPTION,
+            blocked=blocked, detail=detail, advisory=bool(blocked)))
     report["timers"] = [item.as_json() for item in reported]
     return report
 
@@ -520,6 +599,8 @@ def render_service(spec: TimerSpec, *, role: str, bin_path: str = DEFAULT_BIN) -
     can hand it to a candidate that proves a remote route when the lease
     holder cannot push; the other passes stay bound to the holder alone.
     """
+    if spec.name == PAQUET_PASS:
+        return render_paquet_service(role=role, bin_path=bin_path)
     delegated = " --pass alerts" if spec.name == "alerts" else ""
     return "\n".join((
         "# generated by `ameesh role timers` — do not edit; rerun the command",
@@ -543,8 +624,63 @@ def render_service(spec: TimerSpec, *, role: str, bin_path: str = DEFAULT_BIN) -
     ))
 
 
+def render_paquet_service(*, role: str, bin_path: str = DEFAULT_BIN) -> str:
+    """#3854: the unit of ``deploy/systemd/ameesh-paquet-horaire.service``.
+
+    The tick reads everything in the database and the forge; it runs the
+    script of the target (lesson #3767), so the clone is advanced first and a
+    clone that does not advance has no tick. The interpreter is the one of
+    the venv that carries ``bin_path``.
+    """
+    binary = _check_bin(bin_path)
+    python = binary.rsplit("/", 1)[0] + "/python" if "/" in binary else "python3"
+    return "\n".join((
+        "# generated by `ameesh role timers` — do not edit; rerun the command",
+        "# #3845: composition, ci-full and removal of a red unit, without an agent;",
+        "# only the holder of the %s lease ticks (`role run`)." % role,
+        "[Unit]",
+        "Description=%s" % PAQUET_DESCRIPTION,
+        "After=network-online.target",
+        "Wants=network-online.target",
+        "",
+        "[Service]",
+        "Type=oneshot",
+        "Environment=PATH=%h/.local/bin:/opt/node/bin:/usr/local/bin:/usr/bin:/bin",
+        "Environment=AMEESH_PAQUET_TARGET=main",
+        "Environment=AMEESH_PAQUET_PILOT=%s" % DEFAULT_ROLE,
+        "EnvironmentFile=%h/.config/ameesh/env",
+        "EnvironmentFile=-%h/.config/ameesh/release.env",
+        "EnvironmentFile=%s" % PAQUET_ENV.replace("~", "%h", 1),
+        "ExecStartPre=/usr/bin/git -C ${AMEESH_PAQUET_REPO} pull --ff-only --quiet "
+        "origin ${AMEESH_PAQUET_TARGET}",
+        "ExecStart=%s role run %s -- %s ${AMEESH_PAQUET_REPO}/%s tick "
+        "--repo ${AMEESH_PAQUET_REPO} --target ${AMEESH_PAQUET_TARGET} "
+        "--pilot ${AMEESH_PAQUET_PILOT}" % (binary, role, python, PAQUET_SCRIPT),
+        # a composition (local tests included) is bounded to three hours by the script
+        "TimeoutStartSec=4h",
+        "NoNewPrivileges=yes",
+        "",
+    ))
+
+
 def render_timer(spec: TimerSpec) -> str:
     """The timer that wakes ``render_service``; bounded for the takeover."""
+    if spec.name == PAQUET_PASS:
+        # #3845: on the wall clock, so every candidate ticks at the same minutes
+        return "\n".join((
+            "# generated by `ameesh role timers` — do not edit; rerun the command",
+            "[Unit]",
+            "Description=ameesh paquet horaire, tic (#3845)",
+            "",
+            "[Timer]",
+            "OnCalendar=*:0/10",
+            "AccuracySec=30s",
+            "Persistent=true",
+            "",
+            "[Install]",
+            "WantedBy=timers.target",
+            "",
+        ))
     delay = min(20, max(1, spec.interval_s // 10))
     return "\n".join((
         "# generated by `ameesh role timers` — do not edit; rerun the command",
@@ -904,7 +1040,8 @@ def main(argv: list[str] | None = None) -> int:
         report = plan(host=host, role=args.role,
                       row=row, settings=settings, watch_intervals=intervals,
                       watch_error=watch_error, expected_projects=expected,
-                      notify_humans=humans, notify_error=notify_error)
+                      notify_humans=humans, notify_error=notify_error,
+                      paquet=paquet_reach() if args.role == DEFAULT_ROLE else None)
         if sync is not None:
             report["github_sync"] = sync
         directory = systemd_dir(args.systemd_dir)
