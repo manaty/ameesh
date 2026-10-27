@@ -71,6 +71,7 @@ from pathlib import Path
 
 from . import config as config_mod
 from . import db as db_mod
+from . import fingerprints
 from . import plan_github
 from . import registry
 
@@ -492,7 +493,8 @@ def alerts_timer_gap(*, role: str, directory: Path | None = None,
 
 def plan(*, host: str, role: str, row: dict, settings, watch_intervals,
          watch_error: str = "", expected_projects=None, notify_humans=None,
-         notify_error: str = "", paquet=None) -> dict:
+         notify_error: str = "", paquet=None, fingerprint_intervals=(),
+         fingerprint_error: str = "") -> dict:
     """The timers this host should run, without touching the filesystem.
 
     ``row`` is the role's ``agent_registry`` row: an elected role is a
@@ -505,6 +507,9 @@ def plan(*, host: str, role: str, row: dict, settings, watch_intervals,
     ``paquet`` is the ``(blocked, detail)`` of :func:`paquet_reach`; ``None``
     leaves the hourly packet tick out of the plan (#3854), as does any role
     but ``mesh-design``, whose lease carries the tick.
+    ``fingerprint_intervals`` are the cadences of the canon's ``fingerprints``
+    cards (#3885): at least one declaration installs the pass; none installs
+    nothing, and an unreadable declaration is reported blocked.
     """
     declared = candidates(row)
     candidate = is_candidate(row, host)
@@ -561,6 +566,16 @@ def plan(*, host: str, role: str, row: dict, settings, watch_intervals,
                 blocked="github.projects missing on this host", detail=detail))
 
     description = ALERTS_DESCRIPTION
+    if fingerprint_error:
+        reported.append(TimerSpec(
+            "fingerprints", "fingerprints", _MIN_INTERVAL_S,
+            "ameesh — failure fingerprints under the elected role lease (#3885)",
+            blocked=fingerprint_error))
+    elif fingerprint_intervals:
+        reported.append(TimerSpec(
+            "fingerprints", "fingerprints",
+            _clamp_interval(min(float(v) for v in fingerprint_intervals), default=60),
+            "ameesh — failure fingerprints under the elected role lease (#3885)"))
     if notify_error or not notify_humans:
         reported.append(TimerSpec(
             "alerts", "alerts", ALERTS_INTERVAL_S, description,
@@ -1037,11 +1052,17 @@ def main(argv: list[str] | None = None) -> int:
                     raise TimerError("configuration invalid after adding projects: %s"
                                      % exc) from None
         humans, notify_error = notify_reach(cfg, responsible=row.get("responsible"))
+        fingerprint_sources, fingerprint_error = fingerprints.declarations_of_config(
+            cfg, lambda text: print("role timers: %s" % text, file=sys.stderr))
+        fingerprint_intervals = sorted(
+            {float(item.interval) for item in fingerprint_sources})
         report = plan(host=host, role=args.role,
                       row=row, settings=settings, watch_intervals=intervals,
                       watch_error=watch_error, expected_projects=expected,
                       notify_humans=humans, notify_error=notify_error,
-                      paquet=paquet_reach() if args.role == DEFAULT_ROLE else None)
+                      paquet=paquet_reach() if args.role == DEFAULT_ROLE else None,
+                      fingerprint_intervals=fingerprint_intervals,
+                      fingerprint_error=fingerprint_error)
         if sync is not None:
             report["github_sync"] = sync
         directory = systemd_dir(args.systemd_dir)

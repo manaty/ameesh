@@ -926,6 +926,8 @@ def detach_branch(db: Db, item_id: int, branch: str | None = None, *, reason: st
 _ISSUE_REPO_RE = re.compile(r"^([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)#[0-9]+$")
 #: #2603 : une PR fusionnée hors du dépôt du lot, `owner/repo#N`
 _PR_REF_RE = re.compile(r"^(?P<slug>[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)#(?P<number>[0-9]+)$")
+#: #3885 : le dépôt d'une réservation de migration, quand il diffère de l'issue
+_REPO_SLUG_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 
 
 def lot_repository(item: dict, cfg=None) -> str:
@@ -1005,7 +1007,8 @@ def reserve_migration(db: Db, item_id: int, number: int | None = None, *,
                       actor: str = "", cfg=None,
                       skip_branches: tuple[str, ...] = (),
                       skip_worktree: bool = False,
-                      target: str | None = None) -> dict:
+                      target: str | None = None,
+                      repository: str | None = None) -> dict:
     """L122, #443, #2481, #2620 : réserve au lot le numéro de sa migration,
     avant d'écrire le fichier, dans le dépôt du lot (`lot_repository`) : le
     dossier et la numérotation sont les siens, jamais ceux d'ameesh pour un
@@ -1035,6 +1038,11 @@ def reserve_migration(db: Db, item_id: int, number: int | None = None, *,
     `target` (#2620) : la cible à lire pour un numéro exact quand l'appelant la
     connaît déjà (le train compose une cible explicite), sinon la cible
     déclarée du lot (#2660).
+    `repository` (#3885) : le dépôt dont l'espace de numérotation est réservé,
+    quand le code vit dans un autre dépôt que l'issue du lot (un lot ameesh
+    dont le ticket miroir vit dans Nexlink). Sans lui, le dépôt reste celui de
+    l'issue (`lot_repository`). Le clone passé par `--repo` doit être celui de
+    ce dépôt.
     Rend le lot, avec `migration_file` et la liste `migrations`. Une correction
     concurrente de `issue_ref` pendant le scan du dépôt est refusée (#1830 :
     `issue reference changed meanwhile, retry`), jamais écrite en silence."""
@@ -1084,7 +1092,16 @@ def reserve_migration(db: Db, item_id: int, number: int | None = None, *,
         number = int(number)
         if number in held:
             return _with_file(item, cfg)
-    slug = lot_repository(item, cfg)
+    if repository:
+        # #3885 : le code peut vivre dans un autre dépôt que l'issue (un lot
+        # ameesh dont le ticket miroir est dans Nexlink). L'option est
+        # explicite : jamais de repli deviné.
+        repository = (repository or "").strip().lower()
+        if not _REPO_SLUG_RE.match(repository):
+            raise WorkError("--repository: expected owner/repo, not %r" % repository)
+        slug = migrations.repo_key(repository)
+    else:
+        slug = lot_repository(item, cfg)
     layout = migrations.layout_for(slug, cfg)
     if layout is None:
         raise WorkError("repository %s: migrations directory unknown (declare it in the host "
