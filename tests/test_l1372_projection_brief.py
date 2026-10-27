@@ -57,6 +57,18 @@ def carte_longue(proj: str = PROJECTION_COURTE, **fields) -> str:
     return carte(body=corps_long(projection(proj) if proj else ""), **fields)
 
 
+def _regles(loaded) -> tuple[str, list[str]]:
+    """Les règles du bloc et ses diagnostics, comme `reprise` les injecte."""
+    textes, diags = [], []
+    for process in loaded.processes:
+        if process.valid:
+            texte, diag = reprise._process_fragment(process)
+            textes.append(texte)
+            if diag:
+                diags.append(diag)
+    return "\n\n".join(textes).strip(), diags
+
+
 class ProjectionLectureTest(_TmpMixin, unittest.TestCase):
     """Lecture et validation de la projection (`canon check`)."""
 
@@ -153,12 +165,16 @@ class ProjectionLectureTest(_TmpMixin, unittest.TestCase):
                            canon.PROCESS_PROJECTION_MAX)
         findings = canon.validate(loaded)
         self.assertIn("process-projection-too-long", codes(findings))
-        self.assertNotIn("process-projection-near-limit", codes(findings))
+        # #3867 : le bloc entier déborde aussi, et c'est lui qui fait échouer
+        # `canon check` — sans bloquer aucun agent (sujet Process)
+        self.assertIn("process-rules-block-too-long", codes(findings))
         self.assertNotIn("process-too-long", codes(findings))
         self.assertEqual(canon.blocking(findings).global_errors, [])
 
-    def test_une_projection_au_budget_est_valide(self):
-        # La borne haute est inclusive : préavis, mais aucune coupe.
+    def test_une_projection_au_plafond_fait_deborder_le_bloc(self):
+        # #3867 : le plafond d'une projection est la place entière des règles ;
+        # sa carte y ajoute titre et métadonnées : la projection n'est pas
+        # coupée, mais le bloc l'est, et `canon check` le dit.
         exacte = "a" * canon.PROCESS_PROJECTION_MAX
         loaded = self.charge(carte_longue(exacte))
         self.assertEqual(len(loaded.processes[0].projection.encode()),
@@ -166,28 +182,67 @@ class ProjectionLectureTest(_TmpMixin, unittest.TestCase):
         findings = canon.validate(loaded)
         self.assertNotIn("process-too-long", codes(findings))
         self.assertNotIn("process-projection-too-long", codes(findings))
-        self.assertIn("process-projection-near-limit", codes(findings))
+        self.assertIn("process-rules-block-too-long", codes(findings))
         self.assertEqual(loaded.processes[0].projection_error, "")
 
-    def test_le_preavis_a_90_pourcent_compte_les_octets_utf8(self):
-        # #3137 : le prédicat du code est `proj * 10 >= MAX * 9`, soit
-        # `proj >= ⌈9·MAX/10⌉` ; `MAX*9//10` (plancher) rate la borne d'un
-        # octet quand le budget est impair.
-        seuil = (canon.PROCESS_PROJECTION_MAX * 9 + 9) // 10
-        for taille in (seuil - 1, seuil, seuil + 1, 13352):
+    def _fixe(self) -> int:
+        """Octets du bloc hors projection (en-tête, pied, autres cartes)."""
+        loaded = self.charge(carte_longue("a"))
+        rules, _ = _regles(loaded)
+        return len(reprise._rules_bloc(rules, canon.RULES_BLOC_LIMIT).encode()) - 1
+
+    def test_le_preavis_a_90_pourcent_mesure_le_bloc_en_octets_utf8(self):
+        # #3137, #3867 : le prédicat est `bloc * 10 >= LIMIT * 9`, soit
+        # `bloc >= ⌈9·LIMIT/10⌉`, sur le bloc ENTIER (pas la projection seule).
+        seuil = (canon.RULES_BLOC_LIMIT * 9 + 9) // 10 - self._fixe()
+        for taille in (seuil - 1, seuil, seuil + 1):
             with self.subTest(octets=taille):
                 texte = "é" * (taille // 2) + "a" * (taille % 2)
                 loaded = self.charge(carte_longue(texte))
                 findings = canon.validate(loaded)
                 preavis = [f for f in findings
-                           if f.code == "process-projection-near-limit"]
+                           if f.code == "process-rules-block-near-limit"]
                 self.assertEqual(bool(preavis), taille >= seuil)
-                self.assertNotIn("process-projection-too-long", codes(findings))
+                self.assertNotIn("process-rules-block-too-long", codes(findings))
                 if preavis:
                     self.assertEqual(preavis[0].severity, canon.WARNING)
-                    self.assertIn(str(taille), preavis[0].message)
-                    self.assertIn(str(canon.PROCESS_PROJECTION_MAX), preavis[0].message)
+                    self.assertIn(TITRE, preavis[0].message)
+                    self.assertIn(str(canon.RULES_BLOC_LIMIT), preavis[0].message)
                 self.assertEqual(canon.blocking(findings).global_errors, [])
+
+    def test_deux_cartes_sous_budget_debordent_ensemble(self):
+        # #3867 (témoin) : chaque carte est sous son budget, leur somme dépasse
+        # la place du bloc ; avant, `canon check` restait muet et le brief
+        # coupait la fin des règles (home d8131b3 : 16 813 octets pour 14 919).
+        moitie = "- règle de la première carte\n" * 280      # ≈ 8 700 octets
+        autre = "- règle de la seconde carte\n" * 280
+        self.assertLess(len(moitie.encode()), canon.PROCESS_BODY_MAX * 2)
+        root = self.example_copy()
+        write(root, RACINE, carte_longue(moitie))
+        write(root, "processus/autre.md",
+              carte(body="# Autre\n\n" + projection(autre), title="Autre carte"))
+        loaded = canon.load(root, untrusted=True)
+        for process in loaded.processes:
+            self.assertLess(len(process.projection.encode()),
+                            canon.PROCESS_PROJECTION_MAX)
+        findings = canon.validate(loaded)
+        self.assertNotIn("process-projection-too-long", codes(findings))
+        trop = [f for f in findings if f.code == "process-rules-block-too-long"]
+        self.assertEqual(len(trop), 1, sorted(codes(findings)))
+        self.assertEqual(trop[0].severity, canon.ERROR)
+        self.assertIn(TITRE, trop[0].message)
+        self.assertIn("Autre carte", trop[0].message)
+        self.assertTrue(canon.errors(findings))
+        self.assertEqual(canon.blocking(findings).global_errors, [])
+        # même calcul que le brief : celui-ci coupe bien la fin des règles
+        rules, diags = _regles(loaded)
+        self.assertNotIn(rules, reprise._rules_bloc(rules, canon.RULES_BLOC_LIMIT, diags))
+        # une seule des deux cartes tient : aucun constat de bloc
+        write(root, "processus/autre.md",
+              carte(body="# Autre\n\n" + projection("- courte\n"), title="Autre carte"))
+        findings = canon.validate(canon.load(root, untrusted=True))
+        self.assertNotIn("process-rules-block-too-long", codes(findings))
+        self.assertNotIn("process-rules-block-near-limit", codes(findings))
 
     def test_la_projection_est_exposee_dans_show_json(self):
         loaded = self.charge(carte_longue())
@@ -359,8 +414,13 @@ class ProjectionBriefTest(_TmpMixin, PgTestCase):
         # du 23/10/2026), compétence mesh-design/bureau confirmée par l'avis
         # auditeur #127227 — pas une décision owner.
         self.assertEqual(reprise.BRIEF_MAX_BYTES, 19000)
-        self.assertEqual(canon.PROCESS_PROJECTION_MAX, 14600)
         self.assertEqual(reprise.BRIEF_TEXT_MIN_BYTES, 4000)
+        # #3867 : place du bloc et plafond d'une projection dérivés de ces
+        # bornes partagées (plus de marge fixe de 320 octets)
+        self.assertIs(reprise.BRIEF_MAX_BYTES, canon.BRIEF_MAX_BYTES)
+        self.assertEqual(canon.RULES_BLOC_LIMIT, 14998)
+        self.assertEqual(canon.RULES_BLOC_ROOM, 14919)
+        self.assertEqual(canon.PROCESS_PROJECTION_MAX, canon.RULES_BLOC_ROOM)
 
     def test_le_plafond_nominal_de_consigne_et_le_pire_cas_sont_documentes(self):
         # #3137 : un brief plein (BRIEF_MAX_BYTES) et son cadre de reprise
@@ -391,18 +451,19 @@ class ProjectionBriefTest(_TmpMixin, PgTestCase):
         self.assertNotIn("too long", texte)
         self.assertLessEqual(len(texte.encode()), reprise.BRIEF_MAX_BYTES)
 
-    def test_une_projection_a_son_budget_est_injectee_entiere(self):
-        # borne haute : une projection de exactement `PROCESS_PROJECTION_MAX`
-        # octets tient dans le bloc, même avec la part texte réservée pleine
-        # (4 000 octets) — le budget annoncé est bien celui qui est injectable
+    def test_une_projection_a_son_plafond_coupe_le_bloc_et_le_dit(self):
+        # #3867 : le plafond d'une projection est la place entière des règles ;
+        # titre et métadonnées de sa carte s'y ajoutent : le bloc est coupé, et
+        # le brief le DIT (`canon check` le signale : process-rules-block-too-long)
         exacte = "a" * canon.PROCESS_PROJECTION_MAX
         write(self.clone, RACINE, carte_longue(exacte))
-        commit_all(self.clone, "projection au budget exact")
+        commit_all(self.clone, "projection au plafond exact")
         relu = reprise.with_process_rules(self.cfg, "b" * reprise.BRIEF_TEXT_MIN_BYTES,
                                           agent="ouvrier", host=self.cfg.host)
-        self.assertIn(exacte, relu)             # la projection entière est là
-        self.assertNotIn("[…]", relu)           # ni les règles ni la consigne coupées
-        self.assertIn("b" * 100, relu)
+        self.assertNotIn(exacte, relu)
+        self.assertIn("the rules block is cut", relu)
+        self.assertNotIn("too long", relu)      # la projection n'est pas coupée
+        self.assertIn("b" * reprise.BRIEF_TEXT_MIN_BYTES, relu)
         self.assertLessEqual(len(relu.encode()), reprise.BRIEF_MAX_BYTES)
 
 
