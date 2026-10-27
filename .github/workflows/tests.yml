@@ -39,6 +39,9 @@
 # 16 vCPU pour 8 jobs, une part série n'occupait qu'un cœur. La charge mesurée
 # de la part peut relever ce nombre jusqu'à 4 (cible ~450 s de tests par
 # processus) : les parts lourdes prennent plus de cœurs, pas plus de temps.
+# #3945 — sans dépasser la part de l'hôte, vCPU // AMEESH_CI_JOBS_PER_HOST :
+# 73 processus et 24 Postgres sur 48 vCPU ont rendu main rouge cinq runs de
+# suite, un test de timing différent à chaque fois.
 # Le découpage se fait par classe (son setUpClass reste dans un processus),
 # sauf une classe de plus de 5 min découpée en tests pour isoler un test lent ;
 # il est pondéré par les durées par test mesurées de tests/parts/durees.json ;
@@ -234,6 +237,11 @@ env:
   AMEESH_REQUIRE_DB: "1"
   AMEESH_BALANCE_INTERVAL: "0"
   PYTHONPATH: src
+  # #3945 : runners par hôte auto-hébergé (8 sur ameesh-ci-1..3) ; une part
+  # prend au plus vCPU // ce nombre de processus (scripts/test-parts.py,
+  # host_cap). Réglable sans PR par la variable du dépôt ; une fourche
+  # (ubuntu-latest, un job par machine) en a un seul.
+  AMEESH_CI_JOBS_PER_HOST: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && (vars.AMEESH_CI_JOBS_PER_HOST || '8') || '1' }}
 
 # Linux jobs run on the self-hosted ameesh-ci runners (one persistent host,
 # four runners): GitHub's free tier caps hosted jobs at 20 for the whole
