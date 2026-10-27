@@ -1899,7 +1899,7 @@ class CostBook:
         return self.paid_spent(paid, 3600.0)
 
     def paid_spent(self, paid: Sequence[str], seconds: float = 3600.0,
-                   agent: str = "all") -> float:
+                   agent: str = "all", *, cache: dict | None = None) -> float:
         """#513 : `paid_hour` sur les `seconds` dernières secondes, pour le
         mesh (`agent="all"`) ou pour un agent. La dépense mesurée (baisse des
         soldes) fait foi ; l'estimation du grand livre ne sert qu'entre deux
@@ -1909,7 +1909,16 @@ class CostBook:
         (L242b, `paid_hour`) ; un agent reçoit, de ce montant, la part de ses
         estimations dans celles de son compte **dans la fenêtre**. Une baisse
         sans estimation dans la fenêtre n'est attribuable à personne : la part
-        de l'agent est nulle (le mesh garde, lui, le repli temporel)."""
+        de l'agent est nulle (le mesh garde, lui, le repli temporel).
+
+        `cache` (#3923) : un dict fourni par une **passe** (la prise
+        automatique) partage la lecture des soldes entre ses appels — les
+        fenêtres du mesh sont les mêmes pour chaque candidat. Sans cache,
+        chaque appel relit comme avant : un appelant qui rend la main entre
+        deux passes n'obtient jamais une valeur d'une autre passe."""
+        key = (tuple(paid), float(seconds), agent) if cache is not None else None
+        if key is not None and key in cache:
+            return cache[key]
         ledger = self.spent(agent, seconds, harnesses=paid)
         if self.db is None or not paid:
             return ledger
@@ -1917,9 +1926,12 @@ class CostBook:
         # base) — pas `self.clock`, l'horloge des jauges
         now = time.time()
         try:
-            return self._paid_spent(list(paid), now - float(seconds), now, agent)
+            total = self._paid_spent(list(paid), now - float(seconds), now, agent)
         except Exception:  # noqa: BLE001 - soldes illisibles : l'estimation
-            return ledger
+            total = ledger
+        if key is not None:
+            cache[key] = total
+        return total
 
     def _paid_spent(self, paid: list, start: float, now: float, agent: str) -> float:
         from . import balance
@@ -2009,7 +2021,7 @@ class CostBook:
     def over(self, agent: str = "all", *,
              paid_harnesses: Sequence[str] | None = None, pace: bool = True,
              reserve: float = 0.0, hourly_share: float = 1.0,
-             account_checked: bool = False) -> str:
+             account_checked: bool = False, cache: dict | None = None) -> str:
         """Le garde-fou : raison si l'agent (ou le compte) doit s'arrêter, sinon ''.
 
         Le plafond horaire ne somme que l'usage payé au token
@@ -2033,6 +2045,9 @@ class CostBook:
 
         #513 : tous ces plafonds comptent la dépense mesurée sur les soldes
         (`paid_spent`), l'estimation ne servant qu'entre deux relevés.
+
+        `cache` (#3923) : le dict d'une passe de prise, partagé par ses
+        candidats — les fenêtres du mesh ne sont pas relues pour chacun.
         """
         harness = self.tool_of(agent) if agent != "all" else ""
         reason = ""
@@ -2050,7 +2065,7 @@ class CostBook:
         # L70 : plafonds du mesh (heure, jour glissant), puis ceux de l'agent
         for window, cap in ((3600, self.hourly_usd), (86400, self.daily_usd)):
             if cap and cap > 0:
-                total = self.paid_spent(paid, window)
+                total = self.paid_spent(paid, window, cache=cache)
                 held = cap * hourly_share if window == 3600 else cap
                 if total >= held:
                     return ("%s budget (pay-per-token): %.2f $ over %s "
@@ -2061,7 +2076,7 @@ class CostBook:
         if agent != "all":
             for window, cap in sorted((self.agent_limits.get(agent) or {}).items()):
                 if cap and cap > 0 and window in WINDOW_LABELS:
-                    total = self.paid_spent(paid, window, agent)
+                    total = self.paid_spent(paid, window, agent, cache=cache)
                     if total >= cap:
                         return ("%s budget of agent %s (pay-per-token): %.2f $ over %s "
                                 "(cap %.2f $)" % (WINDOW_LABELS[window][0], agent, total,

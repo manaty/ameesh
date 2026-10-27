@@ -197,12 +197,20 @@ class Operations(interface.Operations):
               LEFT JOIN spend_pending p ON p.agent = r.name
               LEFT JOIN LATERAL (
                   -- L125 : `unread` = le courrier qui ouvrira un tour ; le
-                  -- courrier passif (accusé, copie, diffusion) est compté à part
-                  SELECT count(*) FILTER (WHERE NOT """ + _PASSIVE + """) AS n,
-                         min(created_at) FILTER (WHERE NOT """ + _PASSIVE + """) AS oldest,
-                         count(*) FILTER (WHERE """ + _PASSIVE + """) AS n_passive
-                    FROM agent_mailbox mb
-                   WHERE mb.recipient = r.name AND mb.delivered_at IS NULL) m ON true
+                  -- courrier passif (accusé, copie, diffusion) est compté à part.
+                  -- #3923 : deux index partiels disjoints (actif 0495, passif
+                  -- 0489) au lieu d'un parcours du tas de tous les non-lus —
+                  -- les 5 074 non-lus de `bureau` coûtaient 443 ms à eux seuls.
+                  SELECT actif.n, actif.oldest, passif.n_passive
+                    FROM (SELECT count(*) AS n,
+                                 min(mb.created_at) AS oldest
+                            FROM agent_mailbox mb
+                           WHERE mb.recipient = r.name AND mb.delivered_at IS NULL
+                             AND NOT """ + _PASSIVE + """) actif
+                   CROSS JOIN (SELECT count(*) AS n_passive
+                                 FROM agent_mailbox mb
+                                WHERE mb.recipient = r.name AND mb.delivered_at IS NULL
+                                  AND """ + _PASSIVE + """) passif) m ON true
               LEFT JOIN LATERAL (
                   SELECT w.title, w.state, w.planned_start FROM work_items w
                    WHERE w.id = CASE WHEN r.session_work_item ~ '^[0-9]{1,18}$'
@@ -755,21 +763,37 @@ class Operations(interface.Operations):
         if account:
             filtre += " AND account = %s"
             extra.append(account)
-        params: list = [float(since_s)] + extra + [float(since_s)] + extra
-        # DISTINCT ON inclut le compte (L30) : chaque clé d'API a sa série.
+        # #3923 : plus de DISTINCT ON sur tout l'historique (un tri de ~3 000
+        # lignes à chaque lecture, 211 ms mesurés) ; la fenêtre se lit
+        # directement, puis une sonde par série rend le dernier relevé
+        # antérieur. Mêmes lignes, même ordre (`observed_at`, `id`).
+        params: list = [float(since_s)] + extra + extra + [float(since_s)]
         return _sans_compte_nul(self.db.query(
             """
             SELECT provider, currency, total::float8 AS total, granted::float8 AS granted,
                    topped_up::float8 AS topped_up, available, account,
                    extract(epoch from observed_at)::float8 AS observed_ts
               FROM (
-                SELECT * FROM provider_balances
+                SELECT provider, currency, total, granted, topped_up, available,
+                       account, observed_at, id
+                  FROM provider_balances
                  WHERE observed_at >= now() - make_interval(secs => %s)""" + filtre + """
-                UNION
-                (SELECT DISTINCT ON (provider, currency, account) * FROM provider_balances
-                  WHERE observed_at < now() - make_interval(secs => %s)""" + filtre + """
-                  ORDER BY provider, currency, account, observed_at DESC, id DESC)
-              ) b
+                UNION ALL
+                SELECT last.provider, last.currency, last.total, last.granted,
+                       last.topped_up, last.available, last.account,
+                       last.observed_at, last.id
+                  FROM (SELECT DISTINCT provider, currency, account
+                          FROM provider_balances
+                         WHERE true""" + filtre + """) s
+                  CROSS JOIN LATERAL (
+                    SELECT pb.* FROM provider_balances pb
+                     WHERE pb.provider = s.provider
+                       AND pb.currency = s.currency
+                       AND pb.account IS NOT DISTINCT FROM s.account
+                       AND pb.observed_at < now() - make_interval(secs => %s)
+                     ORDER BY pb.observed_at DESC, pb.id DESC
+                     LIMIT 1) last
+              ) u
              ORDER BY observed_at, id
             """,
             tuple(params),

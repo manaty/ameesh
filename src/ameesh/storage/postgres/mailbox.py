@@ -73,6 +73,9 @@ _RESERVED_SQL = """
 #: `{t}` : l'alias de la table `agent_mailbox` (`PASSIVE_SQL.format(t="mb")`).
 #: #3741 : l'index partiel `agent_mailbox_passive_unread_idx` (0489) porte ce
 #: prédicat au mot près ; le changer appelle une migration de l'index.
+#: #3923 : son complément `agent_mailbox_unread_active_idx` (0495) porte la
+#: négation, pour le compte des non-lus actifs de `operations.listing` ;
+#: le changer appelle aussi une migration de cet index.
 PASSIVE_SQL = (
     "(NOT {t}.payload @> '{{\"urgent\": true}}'::jsonb"
     " AND ({t}.payload @> '{{\"ack\": true}}'::jsonb"
