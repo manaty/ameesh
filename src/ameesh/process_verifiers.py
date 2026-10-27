@@ -57,7 +57,8 @@ contournement ; une avance depuis une retenue est refusee (`hold-advance`).
 Les reparations sont bornees par `MAX_REPAIRS` ; aucune reouverture terminale.
 
 Collections d'un snapshot (noms des sources lues par B) : `milestones`,
-`receipts`, `observations`, `decisions`, `deliveries`.
+`receipts`, `observations`, `decisions`, `deliveries`, `approvals` (#4006 :
+projection locale IMA/GitHub, presente seulement si elle est fraiche).
 
 Matrice de capacite : `capabilities()` distingue une garde **connue** du
 contrat de son **installation** reelle dans le registre de B
@@ -152,6 +153,7 @@ SOURCE_COLLECTIONS = (
     "observations",
     "decisions",
     "deliveries",
+    "approvals",
 )
 
 #: Codes de refus stables (le code d'acceptation est `accepted`).
@@ -240,6 +242,9 @@ class Snapshot:
     observations: tuple[Mapping[str, Any], ...] = ()
     decisions_pending: int = 0
     deliveries: tuple[Mapping[str, Any], ...] = ()
+    #: #4006 : projection locale IMA/GitHub, `{"projection": ..., "records":
+    #: [...]}` ; vide quand B n'a pas collecte de projection fraiche.
+    approvals: Mapping[str, Any] = field(default_factory=dict)
     sources: tuple[str, ...] = ()
 
 
@@ -1302,6 +1307,9 @@ def context_snapshot(context: Any) -> Snapshot:
     sources = _context_sources(context) or {}
     milestones = tuple(sources.get("milestones", ()) or ())
     decisions = tuple(sources.get("decisions", ()) or ())
+    approvals = sources.get("approvals") or {}
+    if not isinstance(approvals, Mapping):
+        approvals = {}
     return Snapshot(
         item=item,
         workflow_ref=_text(item.get("workflow_ref")),
@@ -1313,8 +1321,23 @@ def context_snapshot(context: Any) -> Snapshot:
         observations=tuple(sources.get("observations", ()) or ()),
         decisions_pending=len(decisions),
         deliveries=tuple(sources.get("deliveries", ()) or ()),
+        approvals=dict(approvals),
         sources=tuple(name for name in SOURCE_COLLECTIONS if name in sources),
     )
+
+
+def approval_records(snapshot: Snapshot) -> tuple[Mapping[str, Any], ...]:
+    """#4006 : les approbations normalisees du snapshot (jamais un defaut).
+
+    Un snapshot sans projection fraiche rend une collection vide ; la garde
+    qui exige une approbation doit d'abord exiger la source `approvals`
+    (`source-unavailable`) avant d'interpreter cette collection.
+    """
+    value = snapshot.approvals
+    records = value.get("records") if isinstance(value, Mapping) else None
+    if not isinstance(records, (list, tuple)):
+        return ()
+    return tuple(record for record in records if isinstance(record, Mapping))
 
 
 _SERVER_VERIFIERS: dict[tuple, Callable] = {}
