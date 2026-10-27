@@ -644,7 +644,7 @@ class _PassLeaseRenewal:
 
     def keep(self, ttl: float):
         """#3932: stop the pass heartbeat, then renew the SAME lease for the
-        inter-pass `ttl`; returns the epoch, or None when the lease is gone.
+        inter-pass `ttl`; returns True, or False/None when the lease is gone.
 
         The lock orders this final renewal after any beat already in flight,
         so no late short renewal can shorten it; once stopped, `_run` does not
@@ -1008,7 +1008,7 @@ def land_head(cfg, db, project, row: dict, *, owner: str, replayer=None, locks=N
                 kept = None
                 print("ameesh: merge lease %s not kept for the next pass (%s: %s)"
                       % (key, type(exc).__name__, exc), file=sys.stderr)
-            if kept is None:
+            if not kept:
                 locks.pop(key, None)
         else:
             try:
