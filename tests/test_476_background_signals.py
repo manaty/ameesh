@@ -619,8 +619,9 @@ class BackgroundSignalTest(unittest.TestCase):
                                                pgid=parent.pid, members=members,
                                                containers=[], grace_s=1, now=0, handles=held.handles)
                 self.tracker.TERM_GRACE_S = 0
+                # Default FREEZE_CONFIRM_S: the confirmation window is the
+                # section budget, never a fixed .5 s (#3991).
                 self.tracker.CLEANUP_SECTION_S = 60
-                self.tracker.FREEZE_CONFIRM_S = 30
                 with mock.patch.object(os, "killpg") as killpg, \
                         mock.patch.object(ProcessHandle, "freeze", late_freeze), \
                         mock.patch.object(signals, "_stat_fields", late_stat), \
