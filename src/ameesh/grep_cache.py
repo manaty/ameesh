@@ -14,8 +14,15 @@ options (fixées par l'appelant, jamais lues de la configuration : `--no-color`,
 et l'empreinte des motifs, sur le modèle du cache de lectures GitHub (#848) :
 un fichier par clé sous l'état de l'hôte, partagé par tous les exécuteurs du
 même utilisateur. Seuls les résultats réussis (`grep` à 0 ou 1) se gardent :
-un échec reste un doute et se relit au passage suivant. Les attributs
-(`-I`, fichier binaire) restent ceux du dépôt lecteur, comme dans #3753.
+un échec reste un doute et se relit au passage suivant.
+
+Attributs (B/P2 cx2 sur b4e42699) : `-I` dépend de l'attribut `binary`, que git
+lit dans les `.gitattributes` du dépôt de travail, `info/attributes`,
+`core.attributesFile` et le fichier système. Le balayage lit donc les
+attributs **de l'arbre balayé** (`GIT_ATTR_SOURCE`, git ≥ 2.40), sans fichier
+global ni système (`neutral_attributes`) ; le seul contexte local restant,
+`info/attributes` du dépôt commun, entre dans la clé par son contenu. Un git
+sans `GIT_ATTR_SOURCE` ne cache rien.
 
 Deux processus qui calculent la même clé ne balaient pas deux fois : le second
 attend le verrou de la clé (borné) puis relit le résultat du premier.
@@ -48,7 +55,9 @@ LOCK_WAIT_S = canon.GIT_TIMEOUT
 #: pas de l'attente du verrou (s)
 LOCK_STEP_S = 0.1
 #: version du format : un changement de format change toutes les clés
-FORMAT = 1
+FORMAT = 2
+#: première version de git qui lit `GIT_ATTR_SOURCE`
+ATTR_SOURCE_GIT = (2, 40)
 
 _stores = 0
 #: interrupteur du processus (la suite de tests le met à False)
@@ -69,6 +78,55 @@ def root() -> str:
     return os.path.join(os.path.expanduser(state), CACHE_DIR)
 
 
+def neutral_attributes(rev: str) -> dict:
+    """L'environnement d'un balayage dont les attributs ne dépendent que de
+    l'arbre de `rev` et de `info/attributes` (lié à la clé)."""
+    return {"GIT_ATTR_SOURCE": str(rev), "GIT_ATTR_NOSYSTEM": "1",
+            "GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "core.attributesFile",
+            "GIT_CONFIG_VALUE_0": os.devnull}
+
+
+_git_version_cache: list = []
+
+
+def _attr_source_supported() -> bool:
+    if not _git_version_cache:
+        version = None
+        try:
+            proc = canon._git(".", "--version", timeout=10.0)
+            text = proc.stdout.decode("ascii", "replace").split()
+            numbers = text[2].split(".") if len(text) >= 3 else []
+            version = (int(numbers[0]), int(numbers[1]))
+        except Exception:  # noqa: BLE001 - version illisible : pas de cache
+            version = None
+        _git_version_cache.append(version)
+    version = _git_version_cache[0]
+    return version is not None and version >= ATTR_SOURCE_GIT
+
+
+def attributes_token(repo: str) -> Optional[str]:
+    """L'empreinte du contenu de `info/attributes` du dépôt commun (vide s'il
+    n'existe pas), ou None si elle ne peut pas être lue."""
+    try:
+        proc = canon._git(repo, "rev-parse", "--path-format=absolute",
+                          "--git-common-dir", timeout=10.0)
+    except Exception:  # noqa: BLE001 - dépôt illisible : pas de cache
+        return None
+    if proc.returncode != 0:
+        return None
+    common = proc.stdout.decode("utf-8", "replace").strip()
+    if not common:
+        return None
+    try:
+        with open(os.path.join(common, "info", "attributes"), "rb") as handle:
+            data = handle.read()
+    except FileNotFoundError:
+        data = b""
+    except OSError:
+        return None
+    return hashlib.sha256(data).hexdigest()
+
+
 def tree_of(repo: str, rev: str) -> Optional[str]:
     """L'objet arbre de `rev`, lu dans les objets locaux, ou None."""
     try:
@@ -84,9 +142,11 @@ def tree_of(repo: str, rev: str) -> Optional[str]:
         ch in "0123456789abcdef" for ch in tree) else None
 
 
-def key(tree: str, mode: str, patterns: Sequence[str]) -> str:
+def key(tree: str, mode: str, patterns: Sequence[str],
+        attributes: str = "") -> str:
     digest = hashlib.sha256()
-    digest.update(("%d\0%s\0%s\0" % (FORMAT, mode, tree)).encode("utf-8"))
+    digest.update(("%d\0%s\0%s\0%s\0" % (FORMAT, mode, tree, attributes)
+                   ).encode("utf-8"))
     for line in patterns:
         digest.update(str(line).encode("utf-8", "surrogatepass") + b"\0")
     return digest.hexdigest()
@@ -219,14 +279,16 @@ def cached(repo: str, rev: str, mode: str, patterns: Sequence[str],
     """Le résultat de `compute()` pour (arbre de `rev`, `mode`, `patterns`).
 
     `compute` rend une liste JSON (le résultat) ou None (lecture impossible,
-    jamais gardée). Sans cache, sans arbre lisible ou sans dossier inscriptible,
-    `compute` est simplement appelé."""
-    if not enabled() or not repo or not rev:
+    jamais gardée) ; il balaie avec `neutral_attributes(rev)`. Sans cache,
+    sans arbre ou attributs lisibles, sans `GIT_ATTR_SOURCE` ou sans dossier
+    inscriptible, `compute` est simplement appelé."""
+    if not enabled() or not repo or not rev or not _attr_source_supported():
         return compute()
     tree = tree_of(repo, rev)
-    if tree is None:
+    attributes = attributes_token(repo) if tree else None
+    if tree is None or attributes is None:
         return compute()
-    name = key(tree, mode, patterns)
+    name = key(tree, mode, patterns, attributes)
     found, value = _read(name)
     if found:
         return value

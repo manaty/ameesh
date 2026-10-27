@@ -140,16 +140,21 @@ def _sweep_grep(repo: str, rev: str, args: Sequence[str], patterns: Sequence[str
                 step: str):
     """`git grep <args> -f - <rev>` borné par l'échéance courante, s'il y en a.
 
+    Les attributs lus sont ceux de l'arbre de `rev` (`grep_cache`).
     Rend le processus (ou lève `SweepDeadline`) ; une autre erreur remonte
     à l'appelant, qui la lit comme un doute."""
     sweep = _SWEEP.get()
     stdin = ("\n".join(patterns) + "\n").encode("utf-8")
+    # B/P2 cx2 : les attributs (`-I`) sont ceux de l'arbre balayé, jamais ceux
+    # du dépôt de travail lecteur ; le résultat se partage entre clones.
+    env = grep_cache.neutral_attributes(rev)
     if sweep is None:
-        return plan_git._git(repo, "grep", *args, "-f", "-", str(rev), stdin=stdin)
+        return plan_git._git(repo, "grep", *args, "-f", "-", str(rev), stdin=stdin,
+                             env_extra=env)
     sweep.check(step)
     try:
         return plan_git._git(repo, "grep", *args, "-f", "-", str(rev),
-                             stdin=stdin, deadline=sweep.deadline)
+                             stdin=stdin, deadline=sweep.deadline, env_extra=env)
     except canon.GitDeadline:
         sweep.trip(step)
 

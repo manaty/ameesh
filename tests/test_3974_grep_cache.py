@@ -150,6 +150,68 @@ class GrepCacheTest(unittest.TestCase):
                               lambda: calls.append(1) or [])
         self.assertEqual(len(calls), 4)
 
+    def _info_attributes(self, text: str) -> None:
+        path = os.path.join(self.repo, ".git", "info", "attributes")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(text)
+
+    def test_changed_info_attributes_change_the_key(self):
+        # B/P2 cx2 : même arbre, `a.py binary` dans info/attributes → -I l'écarte
+        first, _launched = self.counted(review_authors._tree_lines, self.repo,
+                                        self.first, ["un = 1"])
+        self.assertEqual(first, {"un = 1"})
+        self._info_attributes("a.py binary\n")
+        value, launched = self.counted(review_authors._tree_lines, self.repo,
+                                       self.first, ["un = 1"])
+        self.assertEqual((value, launched), (set(), 1))
+        sources, launched = self.counted(review_authors._source_paths, self.repo,
+                                         self.first, ["un = 1"], {})
+        self.assertEqual((sources, launched), (set(), 1))
+        self._info_attributes("")
+        value, launched = self.counted(review_authors._tree_lines, self.repo,
+                                       self.first, ["un = 1"])
+        self.assertEqual((value, launched), ({"un = 1"}, 0))
+
+    def test_another_clone_with_other_attributes_does_not_share(self):
+        self.counted(review_authors._tree_lines, self.repo, self.first, ["un = 1"])
+        other = os.path.join(self.tmp, "autre")
+        _git(self.tmp, "clone", "-q", self.repo, other)
+        path = os.path.join(other, ".git", "info", "attributes")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write("a.py binary\n")
+        value, launched = self.counted(review_authors._tree_lines, other,
+                                       self.first, ["un = 1"])
+        self.assertEqual((value, launched), (set(), 1))
+
+    def test_worktree_attributes_do_not_change_the_reading(self):
+        # le balayage lit les attributs de l'arbre balayé, pas du dépôt de travail
+        self.write(".gitattributes", "a.py binary\n")
+        value, launched = self.counted(review_authors._tree_lines, self.repo,
+                                       self.first, ["un = 1"])
+        self.assertEqual((value, launched), ({"un = 1"}, 1))
+        os.unlink(os.path.join(self.repo, ".gitattributes"))
+        value, launched = self.counted(review_authors._tree_lines, self.repo,
+                                       self.first, ["un = 1"])
+        self.assertEqual((value, launched), ({"un = 1"}, 0))
+
+    def test_attributes_committed_in_the_tree_apply(self):
+        self.write(".gitattributes", "a.py binary\n")
+        second = self.commit()
+        value, _launched = self.counted(review_authors._tree_lines, self.repo,
+                                        second, ["un = 1"])
+        self.assertEqual(value, set())
+
+    def test_an_old_git_caches_nothing(self):
+        calls = []
+        with mock.patch.object(grep_cache, "_attr_source_supported",
+                               return_value=False):
+            for _ in range(2):
+                grep_cache.cached(self.repo, self.first, "m", ["x"],
+                                  lambda: calls.append(1) or [])
+        self.assertEqual(len(calls), 2)
+
     def test_prune_keeps_the_most_recently_read(self):
         for index in range(5):
             grep_cache._write(grep_cache.key("t%d" % index, "m", ["x"]), [index])
