@@ -669,6 +669,16 @@ def lot_steps(item: dict, jalons: dict, events: Iterable[dict], *,
         if latest_build is not None and latest_build >= float(verdict):
             returned = latest_build
 
+    # #3936 : un lot release (tête ou cible `release/**`, type release) ne
+    # gèle plus après un retour en build ou un avis bloquant : la porte des
+    # familles refuse son gel (plage des lots déjà relus, trois familles) et
+    # sa fusion est le geste du pilote sur la tête verte (canon §2). Aucun
+    # nouveau gel n'est donc dû ; seul `build_quiet` mesure son silence.
+    from . import lot_class
+    if lot_class.release_vehicle(item):
+        returned = None
+        fixes = []
+
     if state == "build" and returned is None and not fixes:
         # #3487 : le correctif dû (avis bloquant ou retour en build) a sa
         # propre horloge ; `build_quiet` ne la double pas.
