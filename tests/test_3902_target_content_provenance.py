@@ -281,6 +281,55 @@ class ContentBeforeHeadTest(unittest.TestCase):
         self.assertTrue(review_authors._content_before_head(
             repo.root, removed, earlier))
 
+    def test_removal_at_end_still_present_keeps_the_unknown(self):
+        """Une suppression en bout de fichier n'est pas prouvée par son seul
+        contexte : la ligne retirée doit avoir disparu de la cible."""
+        repo = _Repo(os.path.join(self.tmp, "tail-removal"))
+        repo.write("feature.py", "keep()\ndrop_me()\n")
+        base = repo.commit("base")
+        repo.write("feature.py", "keep()\n")
+        earlier = repo.commit("parent deletes the last line", agent="parent")
+        # cible qui n'applique pas le retrait et avance ailleurs
+        repo.git("checkout", "-q", "-b", "tail-kept", base)
+        repo.write("anchor.txt", "target advanced\n")
+        kept = repo.commit("target keeps the line", agent="other")
+        self.assertFalse(review_authors._content_before_head(
+            repo.root, kept, earlier))
+        self.assertEqual(review_authors._not_in_target(
+            repo.root, [earlier], kept, head=kept), [earlier])
+        self.assertTrue(review_authors._survives_rewrite(
+            repo.root, kept, earlier, {}, kept, kept))
+        # cible qui applique le retrait
+        repo.git("checkout", "-q", "-b", "tail-delivered", base)
+        repo.git("cherry-pick", earlier)
+        repo.write("anchor.txt", "target advanced\n")
+        delivered = repo.commit("target deletes the line", agent="other")
+        self.assertTrue(review_authors._content_before_head(
+            repo.root, delivered, earlier))
+        self.assertEqual(review_authors._not_in_target(
+            repo.root, [earlier], delivered, head=delivered), [])
+
+    def test_removal_at_start_still_present_keeps_the_unknown(self):
+        """Même preuve pour une suppression en tête de fichier."""
+        repo = _Repo(os.path.join(self.tmp, "head-removal"))
+        repo.write("feature.py", "drop_me()\nkeep()\n")
+        base = repo.commit("base")
+        repo.write("feature.py", "keep()\n")
+        earlier = repo.commit("parent deletes the first line", agent="parent")
+        repo.git("checkout", "-q", "-b", "head-kept", base)
+        repo.write("anchor.txt", "target advanced\n")
+        kept = repo.commit("target keeps the line", agent="other")
+        self.assertFalse(review_authors._content_before_head(
+            repo.root, kept, earlier))
+        self.assertEqual(review_authors._not_in_target(
+            repo.root, [earlier], kept, head=kept), [earlier])
+        repo.git("checkout", "-q", "-b", "head-delivered", base)
+        repo.git("cherry-pick", earlier)
+        repo.write("anchor.txt", "target advanced\n")
+        delivered = repo.commit("target deletes the line", agent="other")
+        self.assertTrue(review_authors._content_before_head(
+            repo.root, delivered, earlier))
+
     def test_delivered_reorder_is_proven(self):
         """La preuve stricte accepte un réordre réellement livré."""
         repo = _Repo(os.path.join(self.tmp, "reorder-delivered"))

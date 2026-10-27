@@ -1199,8 +1199,9 @@ def _commit_hunks(repo: str, sha: str):
     """`{chemin: [hunk]}` du patch complet, ordre et indentation compris.
 
     Chaque hunk porte `new` (contexte + lignes ajoutées, image postérieure),
-    `old` (contexte + lignes retirées) et `changed` (lignes ajoutées/retirées
-    seules). Un diff binaire ou une lecture impossible rend None : l'appelant
+    `old` (contexte + lignes retirées), `changed` (lignes ajoutées/retirées
+    seules) et `lead`/`trail` (contexte de tête/queue, identique dans les deux
+    images). Un diff binaire ou une lecture impossible rend None : l'appelant
     garde le doute. Le contexte est celui de `--unified=1` : une évolution
     voisine de la cible empêche la preuve au lieu de la contourner. Les
     renommages sont lus comme suppression + création (`--no-renames`).
@@ -1229,7 +1230,8 @@ def _commit_hunks(repo: str, sha: str):
         if line.startswith("@@"):
             if not path:
                 return None
-            current = {"new": [], "old": [], "changed": []}
+            current = {"new": [], "old": [], "changed": [], "lead": 0,
+                       "trail": 0, "changed_seen": False}
             hunks.setdefault(path, []).append(current)
             in_hunk = True
             continue
@@ -1238,12 +1240,20 @@ def _commit_hunks(repo: str, sha: str):
         if line.startswith("+"):
             current["new"].append(line[1:])
             current["changed"].append(line[1:])
+            current["changed_seen"] = True
+            current["trail"] = 0
         elif line.startswith("-"):
             current["old"].append(line[1:])
             current["changed"].append(line[1:])
+            current["changed_seen"] = True
+            current["trail"] = 0
         elif line.startswith(" "):
             current["new"].append(line[1:])
             current["old"].append(line[1:])
+            if current["changed_seen"]:
+                current["trail"] += 1
+            else:
+                current["lead"] += 1
     return hunks
 
 
@@ -1290,6 +1300,9 @@ def _content_before_head(repo: str, before: str, sha: str,
       (contexte `--unified=1` + lignes ajoutées), ordre et indentation
       compris, apparaît telle quelle dans `before` ; les hunks se suivent dans
       l'ordre du commit ;
+    * au même endroit, l'image antérieure du hunk (contexte + lignes
+      retirées) ne doit pas être encore là : une suppression restée en place
+      n'est pas une livraison, même quand le contexte seul y ressemble ;
     * une suppression totale de chemin se prouve par l'absence du chemin ;
     * un réordre ou une réindentation change l'image : il n'est pas prouvé
       par le seul compte de lignes.
@@ -1326,6 +1339,34 @@ def _content_before_head(repo: str, before: str, sha: str,
             index = _find_block(here, block, position)
             if index < 0:
                 return False
+            # L'image antérieure du hunk ne doit pas être encore à sa place :
+            # une suppression non appliquée n'est pas une livraison, même si
+            # son contexte seul se retrouve tel quel (suppression en bout de
+            # fichier, par exemple). Les lignes de contexte de tête sont
+            # communes aux deux images ; on compare donc le cœur du hunk.
+            old = hunk["old"]
+            end = len(old) - hunk["trail"] if hunk["trail"] else len(old)
+            old_core = old[hunk["lead"]:end]
+            if old_core:
+                if len(block) == hunk["lead"] + hunk["trail"]:
+                    # suppression pure : le bloc postérieur n'est que du
+                    # contexte, il peut se retrouver décalé. Dans l'image
+                    # antérieure le cœur retiré est juste après le contexte de
+                    # tête, ou juste avant le contexte de queue s'il n'y en a
+                    # pas.
+                    if hunk["lead"]:
+                        start = index + hunk["lead"]
+                        if list(here[start:start + len(old_core)]) == old_core:
+                            return False
+                    elif hunk["trail"]:
+                        start = index - len(old_core)
+                        if (start >= 0
+                                and list(here[start:index]) == old_core):
+                            return False
+                else:
+                    start = index + hunk["lead"]
+                    if list(here[start:start + len(old_core)]) == old_core:
+                        return False
             position = index + len(block)
     return meaningful
 
