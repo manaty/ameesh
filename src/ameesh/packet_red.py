@@ -158,16 +158,34 @@ def _file_text(checkout: str, head: str, path: str, *, api=None, repo: str = "")
         return None
 
 
+def _manifest_base(text: str) -> str:
+    """La base de composition déclarée par un manifeste (« Base : main `sha` »).
+
+    Le manifeste d'un paquet nomme la tête exacte de la cible dont il est
+    parti ; #3954 en a besoin pour dire si la carte d'impact a été mesurée
+    avant cette base. Un manifeste ancien ou sans ligne de base rend "" : la
+    comparaison est alors inconnue, jamais supposée.
+    """
+    for line in (text or "").splitlines():
+        if not line.strip().lower().startswith("base"):
+            continue
+        for token in re.findall(r"`([^`]+)`", line):
+            if re.fullmatch(r"[0-9a-fA-F]{7,64}", token):
+                return token.lower()
+    return ""
+
+
 def _members_from_manifest(checkout: str, branch: str, head: str, *,
                            api=None, repo: str = "") -> tuple:
     """Les unités du manifeste de paquet **à la tête du run**, ou (None, "").
 
     Le manifeste est versionné dans la branche : une tête recomposée garde son
     propre manifeste, même si la composition courante enregistrée est plus
-    récente. Un manifeste sans table de composition n'établit rien.
+    récente. Un manifeste sans table de composition n'établit rien. Rend
+    aussi la base déclarée (#3954), "" quand elle n'est pas lisible.
     """
     if not branch or not head:
-        return None, ""
+        return None, "", ""
     path = manifest_name(branch)
     text = _file_text(checkout, head, path, api=api, repo=repo)
     if text is None:
@@ -175,7 +193,7 @@ def _members_from_manifest(checkout: str, branch: str, head: str, *,
         # dizaines (anciens paquets) et le premier lisible nommerait les lots
         # d'un autre paquet. Sans le manifeste conventionnel, la composition
         # enregistrée (`work packet`) à la tête exacte fait foi, sinon rien.
-        return None, ""
+        return None, "", ""
     members = []
     for entry in packet_close.parse_manifest(text):
         if entry.get("withdrawn"):
@@ -186,7 +204,7 @@ def _members_from_manifest(checkout: str, branch: str, head: str, *,
         for lot in entry.get("lots") or ():
             members.append({"lot": int(lot), "unit_sha": commits[0],
                             "source_sha": sources[0] if sources else ""})
-    return (members or None), path
+    return (members or None), path, _manifest_base(text)
 
 
 def _members_from_record(db, package_id: int, head: str) -> tuple:
@@ -194,13 +212,14 @@ def _members_from_record(db, package_id: int, head: str) -> tuple:
     try:
         rows = storage.of(db).work.packet_members(package_ids=[int(package_id)])
     except Exception as exc:  # noqa: BLE001 - un magasin incomplet ne conclut pas
-        return None, "composition enregistrée illisible : %s" % type(exc).__name__
+        return None, ("composition enregistrée illisible : %s"
+                      % type(exc).__name__), ""
     if not rows:
-        return None, "aucune composition enregistrée"
+        return None, "aucune composition enregistrée", ""
     recorded = _text(rows[0].get("head_sha"))
     if recorded and not same_head(recorded, head):
         return None, ("composition enregistrée pour %s, pas pour la tête %s"
-                      % (recorded[:12], _text(head)[:12]))
+                      % (recorded[:12], _text(head)[:12])), ""
     members = [{"lot": int(row["work_item_id"]),
                 "unit_sha": _text(row.get("unit_sha")),
                 "source_sha": _text(row.get("source_sha")),
@@ -208,25 +227,31 @@ def _members_from_record(db, package_id: int, head: str) -> tuple:
                 "recorded_ts": row.get("recorded_ts")}
                for row in rows if row.get("unit_sha")]
     return members or None, ("composition enregistrée" if members
-                             else "composition enregistrée sans unité")
+                             else "composition enregistrée sans unité"), \
+        (_text(rows[0].get("base_sha")) if members else "")
 
 
 def composition(db, item, head: str, *, checkout: str = "", api=None,
                 repo: str = "") -> dict:
     """Les unités de la composition qui a produit `head` (manifeste, sinon
-    enregistrement), avec la preuve de leur origine."""
+    enregistrement), avec la preuve de leur origine et la base (#3954)."""
     branch = _text((item or {}).get("branch"))
-    members, path = _members_from_manifest(checkout, branch, head, api=api, repo=repo)
+    members, path, base = _members_from_manifest(checkout, branch, head,
+                                                 api=api, repo=repo)
     if members:
         return {"members": members, "source": "manifest", "path": path,
+                "base": base,
                 "why": "manifeste de la tête %s" % _text(head)[:12]}
-    members, why = _members_from_record(db, int(item.get("id") or 0), head)
+    members, why, recorded_base = _members_from_record(
+        db, int(item.get("id") or 0), head)
     if members:
-        return {"members": members, "source": "record", "path": "", "why": why}
+        return {"members": members, "source": "record", "path": "",
+                "base": recorded_base or base, "why": why}
     if path:
         return {"members": [], "source": "none", "path": path,
+                "base": base,
                 "why": "manifeste %s sans composition" % path}
-    return {"members": [], "source": "none", "path": "",
+    return {"members": [], "source": "none", "path": "", "base": "",
             "why": "manifeste de paquet absent à la tête %s ; %s"
                    % (_text(head)[:12], why)}
 
@@ -648,6 +673,27 @@ def _card_ancestor(checkout: str, head: str, commit: str):
     return done.returncode == 0
 
 
+def _card_before_base(checkout: str, commit: str, base: str):
+    """La carte a-t-elle été mesurée avant la base du paquet (True/False/None) ?"""
+    if not checkout or not commit or not base:
+        return None
+    if same_head(commit, base):
+        return False
+    if not plan_git.local_commit(checkout, commit) \
+            or not plan_git.local_commit(checkout, base):
+        return None
+    try:
+        if plan_git._git(checkout, "merge-base", "--is-ancestor",
+                         commit, base).returncode == 0:
+            return True
+        if plan_git._git(checkout, "merge-base", "--is-ancestor",
+                         base, commit).returncode == 0:
+            return False
+    except Exception:  # noqa: BLE001 - une provenance illisible n'est pas une preuve
+        return None
+    return None
+
+
 def note_of(attribution) -> str:
     """La provenance courte du relevé (manifeste, carte), pour le courrier."""
     attribution = attribution or {}
@@ -667,6 +713,14 @@ def note_of(attribution) -> str:
             suffix += ", périmée"
         if card.get("ancestor") is False:
             suffix += ", non ancêtre de la tête"
+        if card.get("older_than_base"):
+            #: #3954 : la carte précède la base du paquet ; ses liens test →
+            #: fichier peuvent dater d'avant les changements déjà dans la
+            #: base. Le verdict le dit avant de nommer une unité, pour qu'une
+            #: attribution de h-37 (#3923/#3885/#3920 pour un rouge de #3925)
+            #: ne se lise pas comme une preuve.
+            suffix += (", antérieure à la base du paquet %s — unités indicatives"
+                       % (_text(card.get("base"))[:12] or "?"))
         parts.append("carte d'impact %s%s%s"
                      % (card["commit"][:12], when, suffix))
     if not parts:
@@ -768,6 +822,11 @@ def _attribute_run(db, item, run, failures, *, cfg=None, api=None, checkout: str
     if card is not None and out["card"].get("commit"):
         out["card"]["ancestor"] = _card_ancestor(
             path, head, _text(out["card"].get("commit")))
+        base = _text(comp.get("base"))
+        if base:
+            out["card"]["base"] = base
+            out["card"]["older_than_base"] = _card_before_base(
+                path, _text(out["card"]["commit"]), base)
     index = card_index(card)
     texts: dict[str, str] = {}
 

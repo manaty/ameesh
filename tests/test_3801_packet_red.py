@@ -186,6 +186,8 @@ class GitRepo:
 
     def manifest(self, units):
         lines = ["# Paquet integration/paquet-h-test", "",
+                 "Base : `main` **`%s`** (tête exacte d'`origin/main`)." % self.base,
+                 "",
                  "## Composition (%d unité(s), %d lot(s))" % (len(units), len(units)), "",
                  "| unité | lot | source | commit |", "|---|---|---|---|"]
         for index, (lot, source, commit) in enumerate(units, 1):
@@ -451,6 +453,53 @@ class RunTest(unittest.TestCase):
             [{"test": "tests.test_a.T.t", "module": "test_a"}],
             checkout=self.repo.path, card=card(), card_known=True)
         self.assertEqual(out["status"], "not-carrier")
+
+
+class CardBaseTest(unittest.TestCase):
+    """#3954 : une carte mesurée avant la base du paquet est dite au verdict.
+
+    Le rouge de h-37 (#3925, test_1425) avait été attribué à #3923/#3885/#3920
+    par une carte vieille de 21 h, antérieure à la base du paquet : le verdict
+    doit le dire, pour qu'une unité « probable » ne se lise pas comme une
+    preuve.
+    """
+
+    def setUp(self):
+        self.repo = GitRepo()
+        self.addCleanup(self.repo.close)
+        # la carte est mesurée sur la base initiale ; le paquet part d'une
+        # tête plus récente de main (comme h-37 : carte du 26/10, base du 27).
+        self.card_commit = self.repo.base
+        self.repo.write("README", "base2\n")
+        self.repo.base = self.repo.commit("base2")
+        source, merge = self.repo.unit(101, {"tests/test_a.py": "x = 1\n"})
+        self.head = self.repo.manifest([(101, source, merge)])
+        self.item = {"id": 1, "branch": "integration/paquet-h-test"}
+
+    def attribute(self, commit):
+        return packet_red.attribute_run(
+            None, self.item, {"head_sha": self.head},
+            [{"test": "tests.test_a.T.t", "module": "test_a"}],
+            checkout=self.repo.path, card=card(commit=commit),
+            card_prov={"status": "lue"}, card_known=True)
+
+    def test_carte_anterieure_a_la_base_est_dite(self):
+        out = self.attribute(self.card_commit)
+        self.assertEqual(out["status"], "ok")
+        self.assertEqual(out["card"]["base"], self.repo.base)
+        self.assertTrue(out["card"]["older_than_base"])
+        note = packet_red.note_of(out)
+        self.assertIn("antérieure à la base du paquet", note)
+        self.assertIn("unités indicatives", note)
+        # l'attribution reste nommée, seulement signalée : aucun retrait.
+        self.assertEqual(out["tests"][0]["units"][0]["lot"], 101)
+
+    def test_carte_a_la_base_n_est_pas_anterieure(self):
+        out = self.attribute(self.repo.base)
+        self.assertEqual(out["card"]["base"], self.repo.base)
+        self.assertFalse(out["card"]["older_than_base"])
+        self.assertNotIn("antérieure à la base du paquet",
+                         packet_red.note_of(out))
 
 
 class RecordedRunTest(unittest.TestCase):
