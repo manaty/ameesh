@@ -117,6 +117,8 @@ class PgUpVolumeTest(unittest.TestCase):
             "FAKE_DOCKER_STATE": self.state,
             "FAKE_DOCKER_LOG": self.log,
             "FAKE_DOCKER_LABEL_LOG": self.labels,
+            # le faux `run` ne crée rien : ne jamais purger le vrai banc (#3886)
+            "AMEESH_PG_UPKEEP": "0",
         }
 
     def tearDown(self):
