@@ -290,13 +290,32 @@ poussée ne couvre (#2957). Les profils humains sont aussi exclus de
 
 Le signal est porté par
 [`deploy/mise-a-jour/staging.sh`](../deploy/mise-a-jour/staging.sh) : une
-séquence **complète et saine** — les quatre hôtes, `installer`,
-`redemarrer`, `controler` et sonde de courrier réellement remise — écrit une
-attestation durable sous
+séquence **complète et saine** — les trois VM, plus le poste s’il est en ligne,
+`installer`, `redemarrer`, `controler` et sonde de courrier réellement remise —
+écrit une attestation durable sous
 `~/.local/state/ameesh/mise-a-jour/actif-<commit>.json` et réveille les
 rapporteurs déclarés avec `--lots "917 988"` et
 `--rapporteurs "mty-amh-docs-01"` (ou `LOTS_VERIF` / `RAPPORTEURS_VERIF` dans
 `BASCULE_ENV`).
+
+La séquence est lançable **depuis une VM** (bureau-goal ou une VM d’agents),
+pas seulement depuis le poste. Le poste ne se met à jour qu’en local
+(`poste.sh`, unités systemd du poste) : exécutée ailleurs, `staging.sh` le
+déclare absent (`absent`/`reporte` dans le journal), saute ses étapes
+`verifier`, sauvegarde, migrations, `role`, `installer`, `redemarrer`,
+`controler` et `sante`, et n’attend pas son retour. Les trois VM sont
+déployées normalement ; l’attestation porte leurs preuves et le champ
+`reportes` nomme le poste, la raison et sa mise à jour « à son retour, jamais
+en dessous ». Un poste absent ne retient ni staging ni lots ; un poste présent
+mais omis de `--hotes` reste une séquence partielle, sans attestation. La
+sauvegarde et les migrations locales du poste ne sont alors pas faites : la
+base doit déjà porter les migrations de la cible par le chemin VM
+(`ameesh migrate --additive-only` depuis un instantané sur une VM), et
+`vm.sh agents installer` refuse avant toute mutation sinon. L’hôte local est
+`HOTE_LOCAL`, sinon `AMEESH_HOST`, sinon le champ `host` de la configuration
+ameesh, sinon `hostname -s` ; `HOTE_LOCAL=pc-smichea` dans `BASCULE_ENV`
+lève toute ambiguïté sur une VM dont la configuration recopierait celle du
+poste.
 
 Sur le poste, `redemarrer` et `retour` passent par des unités transitoires
 `poste-maj-staging-<pid>-<action>` (`systemd-run --user --collect --wait --pipe`,
@@ -306,12 +325,13 @@ Cette enveloppe dans `staging.sh` couvre aussi le retour depuis le tick
 `ameesh-release.service`, sans modifier la garde #2950 de `poste.sh` qui
 refuse les appels directs depuis une unité `ameesh-*`.
 
-Le courrier nomme les hôtes, le commit **relu actif** sur chacun après la
-séquence, les preuves `installer`/`redemarrer`/`controler`/`sante` et les lots
-concernés. Un échec, un retour automatique, une séquence partielle
-(`--hotes`), un journal d’une autre exécution ou une santé sans sonde de
-remise réelle (`--sans-sonde`, `SONDE_<HOTE>=jamais`, `auto` sans persona
-menée, ou toutes occupées ou en pause) n’émettent **aucun signal de réussite** :
+Le courrier nomme les hôtes prouvés, le commit **relu actif** sur chacun après
+la séquence, les preuves `installer`/`redemarrer`/`controler`/`sante`, les lots
+concernés et, s’il y a lieu, le poste reporté avec sa raison. Un échec, un
+retour automatique, une séquence partielle de VM (`--hotes`), un journal d’une
+autre exécution ou une santé sans sonde de remise réelle (`--sans-sonde`,
+`SONDE_<HOTE>=jamais`, `auto` sans persona menée, ou toutes occupées ou en
+pause) n’émettent **aucun signal de réussite** :
 chaque événement de la fenêtre doit porter le commit visé, et le message de sonde est
 relu en base
 (expéditeur système, destinataire, hôte, commit, remise effective). Aucune
@@ -430,7 +450,10 @@ borne le retard toléré après une coupure ; `lock_wait_s` (défaut 3600) borne
 l'attente du verrou d'écriture de la cible. `version_bump` vaut `level` (le
 plancher de `scripts/version-level.py`, appliqué par le pilote pour #2448) ou
 `patch` (dérogation explicite) ; un niveau `major` n'est jamais publié sans
-go owner.
+go owner. Le **coupeur** reste sur le poste ; quand il est éteint, le staging
+des VM peut être lancé à la main depuis une VM (bureau-goal) avec le même
+`BASCULE_ENV` — `HOTE_LOCAL` y nomme la VM, jamais `pc-smichea` —, ce qui
+atteste les trois VM et reporte le poste à son retour (`#3848`).
 
 **Activation** (une fois, par l'opérateur) :
 
@@ -513,6 +536,7 @@ poussée atomique, puis le rend. `staging.sh` refuse deux séquences simultanée
 (code 75, `staging.lock`).
 
 **Preuve** : le journal `~/.local/state/ameesh/mise-a-jour/staging-<date>.jsonl`,
-l'attestation `actif-<sha>.json` (quatre hôtes, sonde de courrier remise) et le
-rapport JSON du tick. Aucune prod : le staging n'est pas une release de prod
-(canon §14), un go owner reste requis pour la prod.
+l'attestation `actif-<sha>.json` (trois VM et sonde de courrier remise, plus le
+poste quand il est en ligne ou le champ `reportes` sinon) et le rapport JSON du
+tick. Aucune prod : le staging n'est pas une release de prod (canon §14), un go
+owner reste requis pour la prod.

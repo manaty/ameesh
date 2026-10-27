@@ -8,6 +8,7 @@ temporary HOME. No network, no host, no database.
 from __future__ import annotations
 
 import dataclasses
+import json
 import os
 import shlex
 import shutil
@@ -270,6 +271,58 @@ class ReleaseFixture(ReleaseFixtureMixin, unittest.TestCase):
         self.assertEqual(second["result"], "already-recorded")
         self.assertEqual(self.git(self.clone, "rev-parse", "origin/main"),
                          first["release_sha"])
+
+    def test_reported_poste_attestation_is_complete_but_reruns_staging(self):
+        """#3848 : trois VM + poste reporte = attestation complete, mais une
+        release relance le staging pour que le poste rattrape son retour."""
+        sha = self.git(self.clone, "rev-parse", "origin/main")
+        folder = self.home / ".local/state/ameesh/mise-a-jour"
+        folder.mkdir(parents=True)
+        path = folder / ("actif-%s.json" % sha[:12])
+        data = {"sha": sha, "date": "2026-10-18T09:00:00Z",
+                "hotes": {hote: {"actif": sha} for hote in release_cutoff.STAGING_VMS},
+                "reportes": {"pc-smichea": {"raison": "poste absent",
+                                            "mise_a_jour": "a son retour"}}}
+        path.write_text(json.dumps(data))
+        self.assertEqual(release_cutoff.read_attestation(sha)["reportes"],
+                         data["reportes"])
+        with mock.patch.object(release_cutoff, "run_staging",
+                               return_value={"exit": 0}) as stage:
+            out = release_cutoff.maybe_staging(self.project, sha, [], self.cfg.state_dir)
+        stage.assert_called_once()
+        self.assertEqual(out["exit"], 0)
+        # les quatre hotes prouves : plus de relance
+        data["hotes"]["pc-smichea"] = {"actif": sha}
+        data.pop("reportes")
+        path.write_text(json.dumps(data))
+        with mock.patch.object(release_cutoff, "run_staging") as stage:
+            out = release_cutoff.maybe_staging(self.project, sha, [], self.cfg.state_dir)
+        stage.assert_not_called()
+        self.assertEqual(out["skipped"], "already attested")
+
+    def test_reported_poste_attestation_must_be_exact(self):
+        sha = self.git(self.clone, "rev-parse", "origin/main")
+        folder = self.home / ".local/state/ameesh/mise-a-jour"
+        folder.mkdir(parents=True)
+        path = folder / ("actif-%s.json" % sha[:12])
+        vms = {hote: {"actif": sha} for hote in release_cutoff.STAGING_VMS}
+        cas = {
+            'trois VM sans report': {"sha": sha, "hotes": vms},
+            'deux VM seulement': {"sha": sha,
+                                  "hotes": {k: vms[k] for k in list(vms)[:2]},
+                                  "reportes": {"pc-smichea": {"raison": "absent"}}},
+            'hote reporte inconnu': {"sha": sha, "hotes": vms,
+                                     "reportes": {"ailleurs": {"raison": "absent"}}},
+            'raison vide': {"sha": sha, "hotes": vms,
+                            "reportes": {"pc-smichea": {"raison": ""}}},
+            'actif sans rapport': {"sha": sha,
+                                   "hotes": {**vms, "pc-smichea": {"actif": "b" * 40}},
+                                   "reportes": {"pc-smichea": {"raison": "absent"}}},
+        }
+        for nom, contenu in cas.items():
+            with self.subTest(nom):
+                path.write_text(json.dumps(contenu))
+                self.assertIsNone(release_cutoff.read_attestation(sha))
 
     def test_tag_recent_is_reconciled_without_second_version(self):
         first = self.execute()

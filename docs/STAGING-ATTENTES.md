@@ -21,6 +21,9 @@ conflit ou une relecture, n'est pas une attente. Une description de lot, un
 ancien hold levé ou un jalon de fusion annulé ne créent pas d'attente. Les
 commits actifs viennent de la dernière attestation de chaque hôte
 (`mise-a-jour/actif-<commit>.json`), dont la date est rendue dans le relevé.
+Un poste reporté absent par la dernière attestation (`reportes`, #3848) n'est
+pas un hôte actif : il ne retient ni staging ni lots ; le staging suivant le
+met à jour à son retour, jamais en dessous.
 Une référence fusionnée absente du clone de release, comme un commit actif
 qu'il ne contient pas, apparaît dans `unknown` et ne compte pas dans le seuil :
 le relevé reste lisible. Une preuve active illisible empêche en plus de

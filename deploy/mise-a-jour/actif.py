@@ -10,6 +10,13 @@ le signal que si l'ACTIVATION est prouvee, hote par hote :
   fenetre de cette execution (depuis `--depuis`), chaque evenement portant le
   commit vise (un journal d'une autre execution ne prouve rien) ;
 * aucun `retour` (rollback) dans cette fenetre ;
+* un hote declare absent (`--absent nom=raison`, seul le poste pc-smichea est
+  reportable) est prouve par un evenement `absent`/`reporte` portant le commit
+  vise et une raison, et par AUCUNE preuve d'activation : le staging lance
+  depuis une VM ne peut pas mettre le poste a jour. L'attestation porte alors
+  les trois VM et le champ `reportes` qui nomme l'hote et sa mise a jour a son
+  retour ; un staging complet le remplace plus tard pour le meme commit. Un
+  hote VM absent, une absence non tracee ou contredite ne prouvent rien ;
 * le detail de `sante` est le rapport JSON de `sante-courrier.py` : verdict
   `ok` et sonde reellement remise (message, destinataire, hote destinataire,
   delai), du bon hote et du bon commit — un detail absent, textuel ou
@@ -59,8 +66,17 @@ SCHEMA = "ameesh-staging-actif/1"
 ISO_UTC = "%Y-%m-%dT%H:%M:%SZ"
 #: instant ISO UTC, tel que produit par `date -u +%Y-%m-%dT%H:%M:%SZ`
 DEPUIS_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
-#: hôtes du staging complet (canon §14) : un sous-ensemble n'atteste rien
+#: hotes du staging complet (canon §14) : les trois VM sont toujours requises ;
+#: pc-smichea est reportable quand la sequence part d'une VM ou qu'il est
+#: declare absent (`--absent`), jamais une VM.
 HOTES_CANON = ("ameesh-agents-1", "ameesh-agents-2", "manaty-mesh-1", "pc-smichea")
+#: les trois VM : sans leur preuve, aucune attestation
+HOTES_VMS = HOTES_CANON[:3]
+#: seul le poste peut etre declare absent (mise a jour a son retour)
+HOTES_REPORTABLES = ("pc-smichea",)
+#: etape de trace qui prouve l'absence declaree d'un hote
+ETAPE_ABSENCE = "absent"
+VERDICT_ABSENCE = "reporte"
 #: modes d'hote connus : `serveur` (sans executant) prouve son activation par
 #: une sonde croisee, tout autre mode exige une remise locale.
 MODES = ("agents", "poste", "serveur")
@@ -197,20 +213,72 @@ def horodatage(ts: object) -> float | None:
         return None
 
 
+def preuve_absence(hote: str, evenements: list[dict], sha: str,
+                   raison: str = "") -> str:
+    """Raison de l'absence d'un hote, prouvee par la trace, ou PreuveManquante.
+
+    Une absence declaree sans evenement `absent`/`reporte` au commit vise est
+    une simple affirmation ; une preuve d'activation du meme hote la contredit.
+    Le detail de l'evenement (la trace de staging.sh) fait foi ; la raison de
+    la ligne de commande n'est qu'un repli.
+    """
+    siens = [e for e in evenements if e.get("hote") == hote]
+    if not siens:
+        raise PreuveManquante("%s : absence declaree mais aucune trace" % hote)
+    autres = [e for e in siens if e.get("etape") != ETAPE_ABSENCE]
+    if autres:
+        raise PreuveManquante(
+            "%s : absence declaree mais %d evenement(s) d'activation la contredisent"
+            % (hote, len(autres)))
+    valides = [e for e in siens
+               if e.get("etape") == ETAPE_ABSENCE
+               and e.get("verdict") == VERDICT_ABSENCE
+               and prefixe_du_commit(sha, str(e.get("sha") or ""))]
+    if not valides:
+        raise PreuveManquante(
+            "%s : absence non prouvee (etape %s et verdict %s attendus)"
+            % (hote, ETAPE_ABSENCE, VERDICT_ABSENCE))
+    detail = str(valides[-1].get("detail") or "").strip()
+    detail = detail or str(raison or "").strip()
+    if not detail:
+        raise PreuveManquante("%s : absence sans raison" % hote)
+    return detail
+
+
 def preuves(evenements: list[dict], sha: str, actifs: dict[str, str],
-            modes: dict[str, str] | None = None) -> dict:
-    """{hote: preuves} pour la sequence attestee, ou PreuveManquante.
+            modes: dict[str, str] | None = None,
+            absents: dict[str, str] | None = None
+            ) -> tuple[dict, dict]:
+    """(preuves, reportes) pour la sequence attestee, ou PreuveManquante.
 
     La comparaison du commit actif est un prefixe dans les deux sens : le
     poste publie un nom court (`src-<7>`), les VM un SHA complet. `modes`
     (nom -> mode, defaut `agents`) decide quelle remise prouve chaque hote.
+    `absents` (nom -> raison) declare les hotes reportes : seules les trois VM
+    restent requises, et chaque absence doit etre prouvee par la trace.
     """
     modes = modes or {}
-    if sorted(actifs) != sorted(HOTES_CANON):
-        raise PreuveManquante(
-            "sequence partielle (%s) : un staging complet des quatre hotes est requis"
-            % ", ".join(sorted(actifs)))
+    absents = dict(absents or {})
     sha = sha.lower()
+    inconnus = sorted(h for h in absents if h not in HOTES_CANON)
+    if inconnus:
+        raise PreuveManquante(
+            "hote(s) absent(s) inconnu(s) : %s" % ", ".join(inconnus))
+    non_reportables = sorted(h for h in absents if h not in HOTES_REPORTABLES)
+    if non_reportables:
+        raise PreuveManquante(
+            "seul le poste peut etre reporte : %s" % ", ".join(non_reportables))
+    contradictoires = sorted(h for h in absents if h in actifs)
+    if contradictoires:
+        raise PreuveManquante(
+            "hote(s) a la fois actif(s) et absent(s) : %s"
+            % ", ".join(contradictoires))
+    requis = [h for h in HOTES_CANON if h not in absents]
+    if sorted(actifs) != sorted(requis):
+        raise PreuveManquante(
+            "sequence partielle (%s) : les trois VM%s sont requises"
+            % (", ".join(sorted(actifs)),
+               "" if absents else " et le poste en ligne"))
     retours = [e for e in evenements if e.get("etape") == "retour"]
     if retours:
         raise PreuveManquante("retour/rollback present dans la fenetre (%d evenement(s))"
@@ -226,8 +294,14 @@ def preuves(evenements: list[dict], sha: str, actifs: dict[str, str],
     fins = [e for e in evenements if e.get("etape") == "sequence"]
     if not fins or fins[-1].get("verdict") != "ok":
         raise PreuveManquante("sequence staging non terminee (verdict ok absent)")
+    reportes = {}
+    for hote in sorted(absents):
+        reportes[hote] = {
+            "raison": preuve_absence(hote, evenements, sha, absents[hote]),
+            "mise_a_jour": "a son retour au commit actif, jamais en dessous",
+        }
     resultat = {}
-    for hote in HOTES_CANON:
+    for hote in requis:
         actif = (actifs.get(hote) or "").lower()
         if not actif:
             raise PreuveManquante("%s : commit actif illisible" % hote)
@@ -260,7 +334,7 @@ def preuves(evenements: list[dict], sha: str, actifs: dict[str, str],
                           "etapes": {e: etapes[e] for e in ETAPES_REQUISES},
                           "sante": detail, "sonde": sonde,
                           "redemarrage_ts": redemarrage_ts}
-    return resultat
+    return resultat, reportes
 
 
 def controle_message(row: object, hote: str, sonde: dict, sha: str,
@@ -310,10 +384,10 @@ def verifier_remise(conn, hote: str, sonde: dict, sha: str,
 
 
 def verifier_remises(preuve: dict, sha: str) -> None:
-    """Relit en base les quatre messages de sonde de la sequence."""
+    """Relit en base les messages de sonde des hotes prouves."""
     conn = db_mod.connect(config.load())
     try:
-        for hote in HOTES_CANON:
+        for hote in preuve:
             sonde = preuve[hote]["sonde"]
             apres_ts = (preuve[hote].get("redemarrage_ts")
                         if sonde["hote_destinataire"] != hote else None)
@@ -398,8 +472,13 @@ def envoyer(dest: str, corps: str, charge: dict) -> int:
 
 
 def corps_courrier(attestation: dict, chemin: Path) -> str:
-    lignes = ["Staging actif : commit %s, installe ET actif sur les %d hotes."
-              % (attestation["sha"][:9], len(attestation["hotes"])), ""]
+    reportes = attestation.get("reportes") or {}
+    entete = "Staging actif : commit %s, installe ET actif sur %d hotes." % (
+        attestation["sha"][:9], len(attestation["hotes"]))
+    if reportes:
+        entete = "Staging actif : commit %s, installe ET actif sur %d hotes ; %d reporte(s)." % (
+            attestation["sha"][:9], len(attestation["hotes"]), len(reportes))
+    lignes = [entete, ""]
     for hote, preuve in sorted(attestation["hotes"].items()):
         sonde = preuve.get("sonde") or {}
         detail = ""
@@ -413,6 +492,9 @@ def corps_courrier(attestation: dict, chemin: Path) -> str:
         lignes.append("- %s : actif %s (%s)%s"
                       % (hote, preuve["actif"][:9],
                          ", ".join("%s ok" % e for e in ETAPES_REQUISES), detail))
+    for hote, detail in sorted(reportes.items()):
+        lignes.append("- %s : REPORTE — %s ; mise a jour a son retour, jamais "
+                      "en dessous" % (hote, (detail or {}).get("raison") or "absent"))
     if attestation["lots"]:
         lignes += ["", "Lots concernes : %s"
                    % ", ".join("#%s" % lot for lot in attestation["lots"])]
@@ -433,6 +515,9 @@ def analyseur() -> argparse.ArgumentParser:
                         help="debut de l'execution (ISO UTC, AAAA-MM-JJTHH:MM:SSZ)")
     parser.add_argument("--hote", action="append", default=[], metavar="NOM=SHA_ACTIF",
                         help="commit relu actif sur l'hote apres la sequence")
+    parser.add_argument("--absent", action="append", default=[], metavar="NOM=RAISON",
+                        help="hote reporte (seul pc-smichea ; une trace %s/%s est exigee)"
+                             % (ETAPE_ABSENCE, VERDICT_ABSENCE))
     parser.add_argument("--mode", action="append", default=[], metavar="NOM=MODE",
                         help="mode de l'hote (%s ; defaut %s)"
                              % (", ".join(MODES), MODE_DEFAUT))
@@ -456,6 +541,12 @@ def main(argv: list[str] | None = None) -> int:
         if not nom or not valeur:
             parser.error("--hote attend NOM=SHA_ACTIF (recu : %s)" % entree)
         actifs[nom] = valeur
+    absents = {}
+    for entree in args.absent:
+        nom, _, valeur = entree.partition("=")
+        if not nom or not valeur.strip():
+            parser.error("--absent attend NOM=RAISON (recu : %s)" % entree)
+        absents[nom] = valeur.strip()
     modes = {}
     for entree in args.mode:
         nom, _, valeur = entree.partition("=")
@@ -477,7 +568,7 @@ def main(argv: list[str] | None = None) -> int:
             raise PreuveManquante(
                 "sante sans sonde de remise reelle : activation non prouvee")
         evenements = lire_journal(journal, args.depuis)
-        preuve = preuves(evenements, sha, actifs, modes)
+        preuve, reportes = preuves(evenements, sha, actifs, modes, absents)
         try:
             verifier_remises(preuve, sha)
         except PreuveManquante:
@@ -500,12 +591,14 @@ def main(argv: list[str] | None = None) -> int:
     emissions = dict(ancienne.get("emissions") or {})
     attestation = {
         "schema": SCHEMA,
-        "cle": "%s-%dhotes" % (sha[:12], len(HOTES_CANON)),
+        "cle": "%s-%dhotes%s" % (sha[:12], len(preuve),
+                                 ("-%dreporte" % len(reportes)) if reportes else ""),
         "date": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "sha": sha,
         "sha_court": sha[:9],
         "journal": str(journal),
         "hotes": preuve,
+        "reportes": reportes,
         "lots": sorted(set(args.lot)),
         "rapporteurs": sorted(set(args.rapporteur)),
         "notifies": notifies,
@@ -564,6 +657,7 @@ def main(argv: list[str] | None = None) -> int:
         try:
             message = envoyer(nom, corps_courrier(attestation, chemin),
                               {"sha": sha, "hotes": sorted(preuve),
+                               "reportes": sorted(reportes),
                                "lots": attestation["lots"], "emission": cle})
         except Exception as exc:  # noqa: BLE001 — le signal durable reste ecrit
             echecs.append(nom)
@@ -580,8 +674,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.json:
         print(json.dumps(attestation, ensure_ascii=False))
     else:
-        print("staging actif : %s sur %d hotes (attestation %s)"
-              % (sha[:9], len(preuve), chemin))
+        print("staging actif : %s sur %d hotes%s (attestation %s)"
+              % (sha[:9], len(preuve),
+                 (" (%d reporte(s))" % len(reportes)) if reportes else "", chemin))
         if attestation["rapporteurs"]:
             print("rapporteurs : %s" % ", ".join(
                 "%s%s" % (nom, "" if nom in notifies else " (non remis)")

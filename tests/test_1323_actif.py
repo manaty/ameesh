@@ -114,6 +114,30 @@ def journal_serveur(hote_destinataire='ameesh-agents-1', personas=0,
     return out
 
 
+def journal_poste_absent(raison='poste absent, mise a jour a son retour',
+                         avec_poste=False):
+    """Sequence de trois VM, poste reporte (trace `absent`/`reporte`, #3848)."""
+    out = []
+    for hote in HOTES:
+        if hote == 'pc-smichea':
+            out.append(evenement(hote, 'absent', verdict='reporte', detail=raison))
+            continue
+        out.append(evenement(hote, 'installer', detail='installe %s' % SHA[:9]))
+        out.append(evenement(hote, 'redemarrer'))
+        out.append(evenement(hote, 'controler'))
+        if hote == 'manaty-mesh-1':
+            detail = detail_sonde(hote, personas=0,
+                                  hote_destinataire='ameesh-agents-1')
+        else:
+            detail = detail_sonde(hote)
+        out.append(evenement(hote, 'sante', detail=detail))
+    if avec_poste:
+        out.append(evenement('pc-smichea', 'sante',
+                             detail=detail_sonde('pc-smichea')))
+    out.append(evenement(None, 'sequence'))
+    return out
+
+
 class ActifTest(unittest.TestCase):
     """actif.py : ce qui merite un signal, et ce qui n'en merite pas."""
 
@@ -167,6 +191,16 @@ class ActifTest(unittest.TestCase):
             out += ['--hote', '%s=%s' % (hote, valeurs[hote])]
             if modes and hote in modes:
                 out += ['--mode', '%s=%s' % (hote, modes[hote])]
+        return out
+
+    def hotes_sans_poste(self, actifs=None):
+        """Les trois VM seules ; manaty-mesh-1 en mode serveur (sonde croisee)."""
+        valeurs = actifs or {h: SHA for h in HOTES[:3]}
+        out = []
+        for hote in HOTES[:3]:
+            out += ['--hote', '%s=%s' % (hote, valeurs[hote])]
+            out += ['--mode', '%s=%s' % (
+                hote, 'serveur' if hote == 'manaty-mesh-1' else 'agents')]
         return out
 
     def attestations(self):
@@ -384,6 +418,74 @@ class ActifTest(unittest.TestCase):
         self.assertEqual(code, 3, erreur)
         self.assertIn('partielle', erreur)
         self.assertEqual(self.envois, [])
+
+    def test_poste_absent_atteste_les_trois_vm_et_le_mentionne(self):
+        """#3848 : une sequence de VM avec poste absent atteste, le courrier
+        nomme le report et sa mise a jour au retour."""
+        raison = 'poste absent (sequence lancee depuis ameesh-agents-1) : ' \
+                 'mise a jour a son retour, jamais en dessous'
+        self.ecrire(journal_poste_absent(raison))
+        code, sortie, erreur = self.lancer(*self.hotes_sans_poste(),
+                                           '--absent', 'pc-smichea=%s' % raison,
+                                           '--lot', '917',
+                                           '--rapporteur', 'docs01')
+        self.assertEqual(code, 0, erreur)
+        fichiers = self.attestations()
+        self.assertEqual(len(fichiers), 1, fichiers)
+        attestation = json.loads(fichiers[0].read_text())
+        self.assertEqual(sorted(attestation['hotes']),
+                         ['ameesh-agents-1', 'ameesh-agents-2', 'manaty-mesh-1'])
+        self.assertNotIn('pc-smichea', attestation['hotes'])
+        self.assertEqual(attestation['reportes']['pc-smichea']['raison'], raison)
+        self.assertIn('a son retour', attestation['reportes']['pc-smichea']['mise_a_jour'])
+        self.assertEqual(attestation['cle'], '%s-3hotes-1reporte' % SHA[:12])
+        self.assertEqual(len(self.envois), 1)
+        corps = self.envois[0]['corps']
+        self.assertIn('3 hotes', corps)
+        self.assertIn('pc-smichea : REPORTE', corps)
+        self.assertIn(raison, corps)
+        self.assertIn('mise a jour a son retour', corps)
+        self.assertEqual(self.envois[0]['charge']['reportes'], ['pc-smichea'])
+
+    def test_absence_non_tracee_refusee(self):
+        """Une absence affirmee sans evenement `absent`/`reporte` ne prouve rien."""
+        self.ecrire([e for e in journal_poste_absent()
+                     if not (e['hote'] == 'pc-smichea')])
+        code, _, erreur = self.lancer(*self.hotes_sans_poste(),
+                                      '--absent', 'pc-smichea=absent',
+                                      '--rapporteur', 'docs01')
+        self.assertEqual(code, 3, erreur)
+        self.assertIn('absence', erreur)
+        self.assertEqual(self.attestations(), [])
+        self.assertEqual(self.envois, [])
+
+    def test_absence_contredite_par_une_preuve_refusee(self):
+        self.ecrire(journal_poste_absent(avec_poste=True))
+        code, _, erreur = self.lancer(*self.hotes_sans_poste(),
+                                      '--absent', 'pc-smichea=absent',
+                                      '--rapporteur', 'docs01')
+        self.assertEqual(code, 3, erreur)
+        self.assertIn('contredisent', erreur)
+        self.assertEqual(self.attestations(), [])
+
+    def test_vm_declaree_absente_refusee(self):
+        """Seul le poste est reportable : une VM absente n'atteste jamais."""
+        self.ecrire(journal_poste_absent())
+        code, _, erreur = self.lancer(*self.hotes_sans_poste(),
+                                      '--absent', 'ameesh-agents-1=absente',
+                                      '--rapporteur', 'docs01')
+        self.assertEqual(code, 3, erreur)
+        self.assertIn('seul le poste', erreur)
+        self.assertEqual(self.envois, [])
+
+    def test_absent_sans_raison_refuse_par_argparse(self):
+        self.ecrire(journal_poste_absent())
+        argv = ['--journal', str(self.journal), '--sha', SHA, '--depuis', DEPUIS,
+                '--etat-dir', str(self.etat)] + self.hotes_sans_poste()
+        argv += ['--absent', 'pc-smichea=']
+        with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as ctx:
+            self.actif.main(argv)
+        self.assertEqual(ctx.exception.code, 2)
 
     def test_sans_sonde_refuse(self):
         self.ecrire(journal_complet())
@@ -936,6 +1038,9 @@ class StagingSignalTest(unittest.TestCase):
                         FAKE_STATE=str(self.state),
                         PATH=str(self.bin) + os.pathsep + base.get('PATH', ''),
                         TMPDIR=str(bacs['tmp']),
+                        # #3848 : le banc tourne sur une VM ; les sequences
+                        # completes doivent rester celles des quatre hotes.
+                        HOTE_LOCAL='pc-smichea',
                         AMEESH_CONFIG=str(self.root / 'config-absente.json'),
                         AMEESH_STATE=str(bacs['etat']),
                         AGENT_MESH_STATE=str(bacs['etat']),
@@ -1060,6 +1165,25 @@ class StagingSignalTest(unittest.TestCase):
         self.assertEqual(p.returncode, 0, p.stderr + p.stdout)
         self.assertEqual(self.actifs(), [])
         self.assertIn('sequence partielle', p.stderr)
+
+    def test_poste_absent_appelle_le_signal_avec_absent(self):
+        """#3848 : depuis une VM, le signal porte --absent et les trois VM."""
+        env = dict(self.env, HOTE_LOCAL='ameesh-agents-1')
+        p = self.run_staging('--lots', '917', '--rapporteurs', 'docs01', env=env)
+        self.assertEqual(p.returncode, 0, p.stderr + p.stdout)
+        appels = self.actifs()
+        self.assertEqual(len(appels), 1, self.calls())
+        ligne = appels[0]
+        self.assertIn('--absent pc-smichea=', ligne)
+        self.assertNotIn('--hote pc-smichea=', ligne)
+        for hote in HOTES[:3]:
+            self.assertIn('--hote %s=' % hote, ligne)
+        trace = next(t for t in self.journal()
+                     if t['hote'] == 'pc-smichea' and t['etape'] == 'absent')
+        self.assertEqual(trace['verdict'], 'reporte')
+        self.assertEqual(trace['sha'], self.sha)
+        self.assertIn('mise a jour a son retour', trace['detail'])
+        self.assertIn('poste absent', p.stdout)
 
     def test_sans_sonde_transmet_le_refus(self):
         self.creer_poste_installe()
