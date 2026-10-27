@@ -46,6 +46,7 @@ retombe sur le comportement d'avant, jamais sur une erreur de tour.
 from __future__ import annotations
 
 import dataclasses
+import re
 import time
 
 from . import storage
@@ -232,6 +233,23 @@ def _reason_from_state(st: dict, now: float) -> str:
                     account, st["active_count"], st["max_active"],
                     "; running: %s" % others if others else ""))
     return ""
+
+
+#: #3876 : les trois raisons de `_reason_from_state` (cooldown, écart de
+#: début, plafond de tours). Toutes durent au plus `COOLDOWN_MAX_S` : un agent
+#: ainsi retenu reste un relecteur, sa prochaine admission lira le courrier.
+_SHORT_WINDOW = re.compile(
+    r"account [^:]*: (?:short-window cooldown until |next turn in "
+    r"|\d+/\d+ concurrent turns )", re.IGNORECASE)
+
+
+def is_short_window(text: str) -> bool:
+    """La raison de pause est-elle celle de la fenêtre courte (#3779) ?
+
+    Lue par la désignation des relecteurs (#3876) : une pause de quelques
+    minutes du compte ne retire pas l'agent des candidats, contrairement à
+    une pause de jauge (seuil du compte, overage), qui dure des heures."""
+    return bool(_SHORT_WINDOW.match(str(text or "").strip()))
 
 
 def reason(db, harness: str, account: str, now: float | None = None,

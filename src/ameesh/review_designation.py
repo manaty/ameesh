@@ -241,7 +241,8 @@ def is_available(row: Mapping, *, closed_hosts: Iterable[str] = ()) -> bool:
     next turn. Unavailable are a `stopped`/`dead`/`paused` agent (#3415: a
     reaped lease writes `dead`), an `external` session (never run by the
     executor, L46), an operations or budget pause (`status_text` "paused…" or
-    "budget : …"), an operator pause (`operator_paused`, a column: the row keeps
+    "budget : …", except the short-window pause of the account, #3876), an
+    operator pause (`operator_paused`, a column: the row keeps
     `status` `idle` and its text "last turn: …", so the status and the prefixes
     never see it), and — #3328 — an agent whose host is `draining`/`lost`
     (claims closed): the request deposited there is not read until the host
@@ -263,11 +264,35 @@ def is_available(row: Mapping, *, closed_hosts: Iterable[str] = ()) -> bool:
     if not status or status in UNAVAILABLE_STATUS:
         return False
     text = str(row.get("status_text") or "").strip().lower()
-    if any(text.startswith(prefix) for prefix in PAUSE_PREFIXES):
+    if any(text.startswith(prefix) for prefix in PAUSE_PREFIXES) \
+            and not is_short_window_pause(text):
         return False
     host = str(row.get("host") or "").strip()
     closed = {str(value).strip() for value in closed_hosts or () if str(value).strip()}
     return not (host and host in closed)
+
+
+def is_short_window_pause(text: str) -> bool:
+    """#3876: a budget pause that is only the account's short window (#3779).
+
+    The runner writes the short-window refusal (cooldown, start gap, `2/2
+    concurrent turns`) under the budget prefix, like a gauge pause. It lasts
+    minutes, at most `account_window.COOLDOWN_MAX_S`: on 27/10 such a pause on
+    cx1 and cx2 removed the whole codex family from the freeze of #3843, and a
+    two-opinion lot waited for a hand designation while cx2 reviewed again
+    within minutes. The request mail waits for the next admitted turn, as for
+    an agent in a turn; a gauge pause (threshold, overage) stays unavailable.
+    """
+    from . import account_window, budget
+    text = str(text or "").strip()
+    prefix = budget.PAUSE_PREFIX.strip().lower()
+    if not text.lower().startswith(prefix):
+        return False
+    rest = text[len(prefix):].lstrip()
+    mark = budget.CRITICAL_MARK.lower()
+    if rest.lower().startswith(mark):
+        rest = rest[len(mark):]
+    return account_window.is_short_window(rest)
 
 
 def reviewed_projects(row: Mapping) -> list[str]:
