@@ -375,12 +375,12 @@ class PrivateBackupTest(unittest.TestCase):
     def snapshot_fixture(self, *, versions=((1, "checksum"),)):
         source, context = mock.MagicMock(), mock.MagicMock()
         context.__enter__.return_value = source
-        cursors = [mock.MagicMock() for _ in range(6)]
-        cursors[1].fetchone.return_value = ("00000003-000000AE-1",)
-        cursors[2].fetchall.return_value = list(versions)
-        cursors[3].fetchone.return_value = (5,)
-        cursors[4].fetchone.return_value = (2,)
-        cursors[5].fetchone.return_value = (4096,)
+        cursors = [mock.MagicMock() for _ in range(7)]
+        cursors[2].fetchone.return_value = ("00000003-000000AE-1",)
+        cursors[3].fetchall.return_value = list(versions)
+        cursors[4].fetchone.return_value = (5,)
+        cursors[5].fetchone.return_value = (2,)
+        cursors[6].fetchone.return_value = (4096,)
         source.execute.side_effect = cursors
         return source, context, cursors
 
@@ -394,7 +394,7 @@ class PrivateBackupTest(unittest.TestCase):
                 self.assertEqual(args[args.index("--snapshot") + 1], "00000003-000000AE-1")
                 # Subsequent source changes cannot change the expected snapshot
                 # counts already captured by this transaction.
-                cursors[4].fetchone.return_value = (999,)
+                cursors[5].fetchone.return_value = (999,)
                 Path(args[-1]).write_bytes(b"snapshot archive")
         with mock.patch("psycopg.connect", return_value=context), mock.patch.object(backup, "run", side_effect=child):
             proof = backup.snapshot_dump(self.config, self.output, inventory)
@@ -406,6 +406,12 @@ class PrivateBackupTest(unittest.TestCase):
         self.assertEqual(proof["artifact_sha256"], expected["artifact_sha256"])
         self.assertEqual(stat.S_IMODE(inventory.stat().st_mode), 0o600)
         self.assertNotIn("CANARY", inventory.read_text())
+        # #3836/#3844 : la garde idle-in-transaction ne doit pas tuer l'export
+        # de snapshot pendant pg_dump ; l'exemption est locale à la transaction.
+        self.assertEqual(source.execute.call_args_list[0].args[0],
+                         "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+        self.assertEqual(source.execute.call_args_list[1].args[0],
+                         "SET LOCAL idle_in_transaction_session_timeout = 0")
         context.__exit__.assert_called_once()
 
     def test_failed_snapshot_dump_never_publishes_expected_inventory(self):
