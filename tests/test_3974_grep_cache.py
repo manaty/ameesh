@@ -238,6 +238,49 @@ class GrepCacheTest(unittest.TestCase):
                                   lambda: calls.append(1) or [])
         self.assertEqual(len(calls), 2)
 
+    def test_a_key_lock_stays_one_lock_when_nothing_is_published(self):
+        # B/P2 cx3 sur bdd1baf9 : A calcule sans rien publier (lecture
+        # impossible) ; B attendait ; C arrive pendant que B tient le verrou.
+        import threading
+        name = grep_cache.key("t", "m", ["x"])
+        b_holds, b_release = threading.Event(), threading.Event()
+        outcome = {}
+
+        def waiter():
+            with grep_cache._KeyLock(name, wait=10) as lock:
+                outcome["b"] = lock.held
+                b_holds.set()
+                b_release.wait(10)
+
+        with grep_cache._KeyLock(name, wait=0) as first:
+            self.assertTrue(first.held)
+            thread = threading.Thread(target=waiter)
+            thread.start()
+            import time
+            time.sleep(0.3)                # B a ouvert le fichier et attend
+            self.assertIsNone(grep_cache._read(name)[1])   # rien de publié
+        self.assertTrue(b_holds.wait(10))
+        try:
+            with grep_cache._KeyLock(name, wait=0) as third:
+                self.assertFalse(third.held)   # jamais deux verrous exclusifs
+        finally:
+            b_release.set()
+            thread.join(10)
+        self.assertTrue(outcome["b"])
+        with grep_cache._KeyLock(name, wait=0) as again:
+            self.assertTrue(again.held)        # le même verrou se reprend
+
+    def test_lock_files_are_stable_and_bounded(self):
+        name = grep_cache.key("t", "m", ["x"])
+        with grep_cache._KeyLock(name, wait=0) as lock:
+            path = lock.path
+        self.assertTrue(os.path.exists(path))     # jamais supprimé
+        self.assertEqual(os.path.basename(path),
+                         name[:grep_cache.LOCK_STRIPE_CHARS] + ".lock")
+        grep_cache._write(name, [1])
+        self.assertEqual(grep_cache.prune(limit=0), 1)
+        self.assertTrue(os.path.exists(path))     # l'élagage n'y touche pas
+
     def test_prune_keeps_the_most_recently_read(self):
         for index in range(5):
             grep_cache._write(grep_cache.key("t%d" % index, "m", ["x"]), [index])

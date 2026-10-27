@@ -249,11 +249,23 @@ def prune(limit: int = MAX_ENTRIES) -> int:
     return removed
 
 
+#: tranches de verrou (préfixe hexadécimal de la clé) : des fichiers stables
+#: et en nombre borné, jamais supprimés (B/P2 cx3 sur bdd1baf9 : supprimer le
+#: fichier à la sortie laissait un attendant sur l'ancien inode et un nouveau
+#: venu sur le nouveau, deux verrous exclusifs pour la même clé)
+LOCK_STRIPE_CHARS = 3
+LOCK_DIR = "locks"
+
+
 class _KeyLock:
-    """Verrou consultatif d'une clé, pris au mieux dans `LOCK_WAIT_S`."""
+    """Verrou consultatif d'une clé, pris au mieux dans `LOCK_WAIT_S`.
+
+    Le fichier de verrou est celui de la tranche de la clé : il n'est jamais
+    supprimé, donc tous les processus verrouillent le même inode."""
 
     def __init__(self, name: str, wait: float):
-        self.path = _path(name)[:-len(".json")] + ".lock"
+        self.path = os.path.join(root(), LOCK_DIR,
+                                 name[:LOCK_STRIPE_CHARS] + ".lock")
         self.wait = wait
         self.fd = None
 
@@ -277,16 +289,17 @@ class _KeyLock:
                     return self
             time.sleep(LOCK_STEP_S)
 
+    @property
+    def held(self) -> bool:
+        return self.fd is not None
+
     def __exit__(self, *_exc):
         if self.fd is not None:
             try:
                 fcntl.flock(self.fd, fcntl.LOCK_UN)
             finally:
                 os.close(self.fd)
-            try:
-                os.unlink(self.path)
-            except OSError:
-                pass
+                self.fd = None
         return False
 
 
