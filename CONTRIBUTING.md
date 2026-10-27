@@ -82,6 +82,8 @@ Merci de votre intérêt. Quelques règles avant d'ouvrir une demande de fusion 
 - **Historique : git et les PR** (L160a) : la description de la PR dit ce
   qui change et pourquoi ; aucun journal tenu à la main. Les PR fusionnées
   sont liées depuis `docs/design/index.md`.
+- **Language**: documentation and commit messages are written in English.
+  File names keep their current form.
 - **Rebaser une branche de lot** : `git rebase --continue`, comme
   `git commit --amend`, ouvre un éditeur dont le nettoyage par défaut retire
   une ligne commençant par `#` — le sujet `#<lot> …` disparaît et le corps

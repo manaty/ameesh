@@ -1,78 +1,101 @@
 ---
 type: Exploration
 status: exploration
-title: "Versionnement pour agents : dépendances explicites et attestation par changement"
+title: "Versioning for agents: explicit dependencies and per-change attestation"
 ---
 
-# Versionnement pour agents : dépendances explicites et attestation par changement
+# Versioning for agents: explicit dependencies and per-change attestation
 
-## Problème
+## Problem
 
-Des lots verts séparément peuvent se contredire une fois composés : le
-conflit n'est pas textuel mais sémantique (#794 ; #1266 contre
-`test_l161f` ; #928 contre `test_l56`), des tests dépendent du nombre de
-modules chargés. Un revert peut annuler le contenu d'une fusion tout en
-conservant son ascendance : une tête ancêtre ne prouve donc plus que son
-contenu est présent (#1825). Git mémorise des instantanés et leur
-ascendance ; il ne prouve ni leur compatibilité sémantique, ni la cause
-d'un test rouge.
+Lots that are green separately can contradict each other once composed: the
+conflict is semantic, not textual (#794; #1266 against `test_l161f`; #928
+against `test_l56`), and some tests depend on the number of loaded modules.
+A revert can cancel the content of a merge while keeping its ancestry: an
+ancestor head therefore no longer proves that its content is present
+(#1825). Git records snapshots and their ancestry; it proves neither their
+semantic compatibility nor the cause of a red test.
 
-Le diagnostic se paie donc en `bisect --first-parent` sur des paquets
-horaires déjà fusionnés (#1293, #1308, #1346), alors que la preuve de test
-reste attachée au commit et non au contenu du changement. La carte
-test → code mesurée (L161e) rapproche déjà chaque test des blocs qu'il
-exerce, mais elle ne relie pas cette mesure à la composition des lots.
+Diagnosis is therefore paid for with `bisect --first-parent` over hourly
+packets that are already merged (#1293, #1308, #1346), while the test proof
+stays attached to the commit rather than to the content of the change. The
+measured test → code map (L161e) already relates each test to the blocks it
+exercises, but it does not link that measurement to how lots are composed.
 
 ## Intuitions
 
-- **Changements à dépendances explicites qui commutent.** Pijul ou Darcs
-  montrent qu'une unité de changement peut déclarer ce dont elle dépend et
-  ne s'appliquer que si ses dépendances sont présentes : la composition
-  devient un calcul de commutation, et un désaccord devient une
-  incompatibilité nommée plutôt qu'un marqueur de conflit. Ces garanties
-  portent sur les patches : elles ne détectent pas seules les dépendances
-  sémantiques entre lots, comme le précise la
-  [motivation de Darcs](https://darcs.net/Theory/Motivation). La
-  [théorie de Pijul](https://pijul.org/manual/theory.html) distingue aussi
-  les dépendances structurelles des dépendances sémantiques à ajouter.
-  Le pilote
-  Mergiraf (L160g) a mesuré la fusion syntaxique et ne l'a pas adoptée ;
-  l'intuition porte sur l'unité composée, pas sur un meilleur recollement
-  ligne à ligne.
-- **Attestation de tests attachée au contenu d'un changement.** Une preuve
-  (tests verts, portée, environnement) voyagerait avec le contenu qu'elle
-  couvre ; après une commutation ou une recomposition, elle serait rejouée
-  ou invalidée explicitement, au lieu d'être supposée par héritage du
-  commit.
-- **Désignation directe du changement fautif.** La carte test → code L161e
-  mesure les blocs exercés par chaque test. Croisée avec les blocs modifiés
-  par les lots et leurs attestations, elle pourrait réduire les candidats
-  d'un rouge de paquet. Distinguer un lot fautif d'une interaction entre
-  lots demande encore une preuve ; la couverture seule ne le démontre pas.
-- **Composition horaire sans revert.** Un paquet horaire deviendrait une
-  sélection de changements qui commutent, dont le retrait serait exact et
-  n'obligerait ni revert de fusion ni rejeu complet.
+- **Changes with explicit dependencies that commute.** Pijul and Darcs show
+  that a unit of change can declare what it depends on and apply only when
+  its dependencies are present: composition becomes a commutation
+  computation, and a disagreement becomes a named incompatibility rather
+  than a conflict marker. These guarantees concern patches: on their own,
+  they do not detect semantic dependencies between lots, as the
+  [Darcs motivation](https://darcs.net/Theory/Motivation) points out. The
+  [Pijul theory](https://pijul.org/manual/theory.html) also separates
+  structural dependencies from semantic ones that must be added. The
+  Mergiraf pilot (L160g) measured syntactic merging and did not adopt it;
+  the intuition is about the composed unit, not about better line-by-line
+  stitching.
+- **Test attestation attached to the content of a change.** A proof (green
+  tests, scope, environment) would travel with the content it covers; after
+  a commutation or a recomposition, it would be replayed or explicitly
+  invalidated, instead of being assumed by inheritance from the commit.
+- **Pointing directly at the faulty change.** The L161e test → code map
+  measures the blocks each test exercises. Crossed with the blocks changed
+  by the lots and with their attestations, it could narrow the candidates
+  for a red packet. Telling a faulty lot from an interaction between lots
+  still needs a proof; coverage alone does not demonstrate it.
+- **Hourly composition without reverts.** An hourly packet would become a
+  selection of changes that commute, whose withdrawal would be exact and
+  would require neither a merge revert nor a full replay.
+- **The database as the source of truth for landings.** Today, whether a
+  lot was delivered is re-derived from git on every read: `plan_git.probe`
+  tries ancestry, then looks for a revert in at most 200 commits
+  (`MAX_REVERT_SCAN`, message "This reverts commit"), then compares
+  `patch-id`s; `scripts/paquet-inclusion.py` checks the content at a
+  packet's head line by line. The database already records the merge (the
+  `merged` milestone and its commit, `merge_queue` in `landed`, train
+  withdrawals), but neither the revert nor the withdrawal of a composed
+  lot. If each transition (composed into a packet, landed, withdrawn or
+  reverted) were written by whoever performs it, when they perform it, "is
+  this lot delivered?" would become a read, and git a cross-check: a
+  mismatch between the database and the tree would be an alert, never a
+  silent correction. Anthropic describes the same principle: ask the
+  review tool when a change landed rather than re-reading the history (see
+  context).
 
-## Questions ouvertes
+## Open questions
 
-- Comment représenter une dépendance entre changements sans imposer un DAG
-  complet à chaque auteur ?
-- Que devient une attestation dont le contenu a commuté depuis : rejouer,
-  invalider, ou redemander ?
-- Quel contexte de dépendances, de données et d'environnement une
-  attestation doit-elle couvrir pour rester valable après recomposition ?
-- Comment un agent sait-il qu'un test rouge vient de son changement plutôt
-  que d'un voisin composé dans le même paquet ?
-- Le retrait d'un changement déjà composé peut-il être exact, et que
-  deviennent les attestations de ses voisins ?
-- Quelles garanties d'audit et de signature si l'unité de preuve n'est
-  plus le commit ?
-- Que garde-t-on de git — revue, PR, historique — et qu'est-ce qui change
-  de nature ?
+- How can a dependency between changes be represented without imposing a
+  full DAG on every author?
+- What happens to an attestation whose content has commuted since: replay,
+  invalidate, or ask again?
+- Which dependency, data and environment context must an attestation cover
+  to stay valid after recomposition?
+- How does an agent know that a red test comes from its change rather than
+  from a neighbour composed in the same packet?
+- Can the withdrawal of an already composed change be exact, and what
+  happens to its neighbours' attestations?
+- Which audit and signature guarantees remain if the unit of proof is no
+  longer the commit?
+- What is kept from git (review, PR, history) and what changes nature?
+- How many reverts escape the current detection (beyond the 200-commit
+  window, or made without the standard message), and how many lots were
+  closed wrongly, then reopened?
+- How many admitted lots were left out of a packet's composition without
+  anything recording it, before the inclusion check existed?
+- A revert made outside ameesh (a human, a direct `git revert`): should the
+  radar record it on its own, or only alert when it cannot tell which lot
+  it belongs to?
+- Does a reverted lot go back to `build` for its agent, or stay `blocked`
+  until a human decides?
 
-Contexte : [Étude tests par impact](../etudes/l161-tests-par-impact.md)
-(carte test → code), [Radar de conflits](../etudes/l160-radar-de-conflits.md),
-[Pilote Mergiraf](../etudes/l160g-mergiraf-pilot.md), et le
-[processus de lot](https://github.com/manaty/home/blob/main/processus/lots.md)
-(paquets horaires). Ces références éclairent la question ; elles ne
-promeuvent pas cette fiche en étude ou en travail décidé.
+Existing context: [Impact-based tests study](../etudes/l161-tests-par-impact.md)
+(test → code map), [Conflict radar](../etudes/l160-radar-de-conflits.md),
+[Mergiraf pilot](../etudes/l160g-mergiraf-pilot.md), the
+[lot process](https://github.com/manaty/home/blob/main/processus/lots.md)
+(hourly packets), and
+[Redesigning source control at Anthropic](https://www.anthropic.com/engineering/redesigning-source-control)
+(Scion: changesets, server-side queries, post-merge testing). These
+references inform the question; they do not promote this card to a study or
+to decided work.
