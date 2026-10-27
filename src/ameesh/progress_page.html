@@ -369,35 +369,51 @@ p.summary { font-size: .86rem; margin: 6px 0; }
   var RETRY_MS = [2000, 5000, 15000, 30000, 60000];
 
   // outbox:begin — §16 (#3889) : la boîte d'envoi de la conversation.
-  // Chaque message est gardé sur l'appareil (localStorage) avec son
-  // Idempotency-Key AVANT l'envoi, renvoyé tel quel après une panne (réseau,
-  // 503, 429), effacé à l'accusé (200) seulement ; un refus (4xx) le garde,
-  // marqué, sans renvoi automatique, de retour dans la saisie. Issue
-  // inconnue (500, clé en cours) : gardé, sans renvoi automatique, à vérifier
-  // dans la conversation ; le même texte renvoyé reprend la même clé. Une page
-  // rechargée reprend les envois en attente : jamais perdu, jamais déposé deux fois.
+  // Chaque message a SA propre entrée sur l'appareil (localStorage), écrite
+  // avec son Idempotency-Key AVANT l'envoi ; aucun nouvel envoi n'efface un
+  // message non acquitté. Panne (réseau, 503, 429) : renvoi tel quel. Issue
+  // inconnue (500, 502, clé en cours 409) : la page se réconcilie seule — elle
+  // relit la conversation (le message y est : acquitté), sinon renvoie la
+  // MÊME clé, sans jamais la libérer ; jusqu'à l'accusé. Jeton refusé (401) :
+  // gardé, repris par une page rouverte avec le bon jeton. Saisie refusée
+  // (autre 4xx) : gardée, rendue à la saisie, renvoyée par l'humain seul.
   var Outbox = (function () {
     var PREFIX = "ameesh-progress:outbox:", MAX_AGE_MS = 7 * 86400 * 1000;
+    //: écart toléré entre l'horloge de la page et celle du serveur (s)
+    var SKEW_S = 120;
     var views = {}, flying = {};
     function store() { try { return window.localStorage; } catch (e) { return null; } }
-    function read(agent) {
-      var s = store(); if (!s) return null;
+    function slot(m) { return PREFIX + m.agent + "\n" + m.key; }
+    function write(m) { var s = store(); try { if (s) s.setItem(slot(m), JSON.stringify(m)); } catch (e) {} }
+    function drop(m) { var s = store(); try { if (s) s.removeItem(slot(m)); } catch (e) {} }
+    function all() {
+      var s = store(), out = [];
+      if (!s) return out;
       try {
-        var m = JSON.parse(s.getItem(PREFIX + agent) || "null");
-        return m && typeof m.text === "string" && typeof m.key === "string" ? m : null;
-      } catch (e) { return null; }
+        for (var i = s.length - 1; i >= 0; i--) {
+          var k = s.key(i);
+          if (!k || k.indexOf(PREFIX) !== 0) continue;
+          var m = JSON.parse(s.getItem(k) || "null");
+          if (!m || typeof m.text !== "string" || typeof m.key !== "string"
+              || typeof m.agent !== "string" || !(Date.now() - m.at < MAX_AGE_MS)) {
+            s.removeItem(k); continue;
+          }
+          out.push(m);
+        }
+      } catch (e) {}
+      return out.sort(function (x, y) { return x.at - y.at; });
     }
-    function write(agent, m) { var s = store(); try { if (s) s.setItem(PREFIX + agent, JSON.stringify(m)); } catch (e) {} }
-    function drop(agent) { var s = store(); try { if (s) s.removeItem(PREFIX + agent); } catch (e) {} }
+    function of(agent) { return all().filter(function (m) { return m.agent === agent; }); }
     var quiet = {sending: function () {}, sent: function () {}, checking: function () {}, refused: function () {}};
     function view(agent) { return views[agent] || quiet; }
-    function post(agent, m) {
+    function delay(n) { return RETRY_MS[Math.min(n, RETRY_MS.length - 1)]; }
+    function post(m) {
       return fetch(CHAT, {method: "POST", credentials: "omit", cache: "no-store",
                           headers: {"Accept": "application/json",
                                     "Content-Type": "application/json",
                                     "Authorization": "Bearer " + TOKEN,
                                     "Idempotency-Key": m.key},
-                          body: JSON.stringify({agent: agent, text: m.text})})
+                          body: JSON.stringify({agent: m.agent, text: m.text})})
         .then(function (r) {
           return r.text().then(function (t) {
             var d = {};
@@ -406,62 +422,89 @@ p.summary { font-size: .86rem; margin: 6px 0; }
           });
         }, function () { return {status: 0, data: {}}; });
     }
-    function attempt(agent, m, n) {
-      flying[agent] = true;
-      view(agent).sending(n);
-      post(agent, m).then(function (res) {
-        if (res.status === 0 || res.status === 503 || res.status === 429) {
-          setTimeout(function () { attempt(agent, m, n + 1); }, RETRY_MS[Math.min(n, RETRY_MS.length - 1)]);
+    // le message est-il déjà dans la conversation (issue inconnue levée) ?
+    function delivered(m) {
+      return fetch(CHAT + "?agent=" + encodeURIComponent(m.agent) + "&limit=200",
+                   {credentials: "omit", cache: "no-store",
+                    headers: {"Accept": "application/json", "Authorization": "Bearer " + TOKEN}})
+        .then(function (r) { return r.ok ? r.json() : null; })
+        .then(function (d) {
+          if (!d) return null;   // illisible : ni oui ni non, on réessaie plus tard
+          return (d.entries || []).some(function (e) {
+            return e.kind === "human_message" && e.text === m.text
+              && typeof e.ts === "number" && e.ts >= m.at / 1000 - SKEW_S;
+          });
+        }, function () { return null; });
+    }
+    function settle(m, res, n) {
+      if (res.status === 200) { flying[m.key] = false; drop(m); view(m.agent).sent(m); return; }
+      if (res.status === 0 || res.status === 503 || res.status === 429) {
+        m.state = "sending"; write(m);
+        setTimeout(function () { attempt(m, n + 1); }, delay(n));
+        return;
+      }
+      if (res.status >= 500 || res.data.error === "idempotency_in_progress") {
+        m.state = "checking"; write(m); view(m.agent).checking(m);
+        setTimeout(function () { reconcile(m, n + 1); }, delay(Math.max(n, 2)));
+        return;
+      }
+      flying[m.key] = false;
+      m.state = res.status === 401 ? "auth" : "refused";
+      m.refused = res.status === 401
+        ? "token refused: open the URL printed at start (a restart draws a new one)"
+        : (res.data.message || ("HTTP " + res.status));
+      write(m);
+      view(m.agent).refused(m);
+    }
+    function attempt(m, n) {
+      flying[m.key] = true;
+      view(m.agent).sending(n);
+      post(m).then(function (res) { settle(m, res, n); });
+    }
+    function reconcile(m, n) {
+      flying[m.key] = true;
+      delivered(m).then(function (yes) {
+        if (yes === true) { flying[m.key] = false; drop(m); view(m.agent).sent(m); return; }
+        if (yes === null) {
+          setTimeout(function () { reconcile(m, n + 1); }, delay(Math.max(n, 2)));
           return;
         }
-        flying[agent] = false;
-        if (res.status === 200) { drop(agent); view(agent).sent(); return; }
-        if (res.status >= 500 || res.data.error === "idempotency_in_progress") {
-          m.checking = true; write(agent, m); view(agent).checking(); return;
-        }
-        // un refus (jeton, saisie) guide sans rien perdre : le message reste
-        // gardé, marqué, et revient dans la saisie quand sa fiche s'ouvre ;
-        // seul l'accusé l'efface
-        m.refused = res.status === 401
-          ? "token refused: open the URL printed at start (a restart draws a new one)"
-          : (res.data.message || ("HTTP " + res.status));
-        write(agent, m);
-        view(agent).refused(m.refused);
+        // absent de la conversation : la MÊME clé (rejeu si le serveur a
+        // répondu entre-temps, 409 tant que l'issue reste inconnue)
+        post(m).then(function (res) { settle(m, res, n); });
       });
     }
     function send(agent, text) {
-      if (flying[agent]) return;
-      var m = read(agent);
-      if (!m || m.text !== text) {
-        m = {text: text, at: Date.now(),
+      var mine = of(agent).filter(function (m) { return m.text === text; });
+      var m = mine.length ? mine[mine.length - 1] : null;
+      if (m && flying[m.key]) return;
+      if (!m) {
+        m = {agent: agent, text: text, at: Date.now(),
              key: "web-" + Date.now() + "-" + Math.random().toString(36).slice(2, 10)};
       }
-      m.checking = false; m.refused = "";
-      write(agent, m);           // gardé AVANT l'envoi
-      attempt(agent, m, 0);
+      m.state = "sending"; m.refused = "";
+      write(m);                  // gardé AVANT l'envoi
+      attempt(m, 0);
     }
     function resume() {
-      var s = store(); if (!s) return;
-      var agents = [];
-      try {
-        for (var i = s.length - 1; i >= 0; i--) {
-          var k = s.key(i);
-          if (k && k.indexOf(PREFIX) === 0) agents.push(k.slice(PREFIX.length));
-        }
-      } catch (e) { return; }
-      agents.forEach(function (agent) {
-        var m = read(agent);
-        if (!m || !(Date.now() - m.at < MAX_AGE_MS)) { drop(agent); return; }
-        if (!m.checking && !m.refused && !flying[agent]) attempt(agent, m, 0);
+      all().forEach(function (m) {
+        if (flying[m.key] || m.state === "refused") return;
+        if (m.state === "checking") reconcile(m, 2); else attempt(m, 0);
       });
     }
-    return {send: send, resume: resume, pending: read,
+    // le message à rendre à la saisie : le dernier refusé (geste humain dû)
+    function pending(agent) {
+      var refused = of(agent).filter(function (m) { return m.state === "refused" || m.state === "auth"; });
+      return refused.length ? refused[refused.length - 1] : null;
+    }
+    return {send: send, resume: resume, pending: pending, all: all,
             watch: function (agent, ui) {
               views[agent] = ui;
-              var m = read(agent);
-              if (flying[agent]) ui.sending(1);
-              else if (m && m.checking) ui.checking();
-              else if (m && m.refused) ui.refused(m.refused);
+              of(agent).forEach(function (m) {
+                if (flying[m.key] && m.state !== "checking") ui.sending(1);
+                else if (m.state === "checking") ui.checking(m);
+                else if (m.state === "refused" || m.state === "auth") ui.refused(m);
+              });
             }};
   })();
   // outbox:end
@@ -551,21 +594,22 @@ p.summary { font-size: .86rem; margin: 6px 0; }
     // sur l'appareil avec sa clé jusqu'à l'accusé, renvoyé tel quel.
     Outbox.watch(name, {
       sending: function (n) {
-        send.disabled = true; state.className = "conv-head";
+        state.className = "conv-head";
         state.textContent = n ? "sending… (the server is busy, retrying by itself)" : "sending…";
       },
-      sent: function () {
-        send.disabled = false; input.value = ""; state.textContent = "sent";
+      sent: function (m) {
+        send.disabled = false; state.className = "conv-head"; state.textContent = "sent";
+        if (input.value.trim() === m.text) input.value = "";
         loadConversation(name, list);
       },
       checking: function () {
-        send.disabled = false; state.className = "conv-head warn";
-        state.textContent = "being checked: look at the conversation below before sending again";
-        loadConversation(name, list);
+        send.disabled = false; state.className = "conv-head";
+        state.textContent = "sending… (being confirmed with the server, by itself)";
       },
-      refused: function (message) {
+      refused: function (m) {
         send.disabled = false; state.className = "conv-head warn";
-        state.textContent = "not sent: " + message;
+        state.textContent = "not sent: " + m.refused;
+        if (!input.value.trim()) input.value = m.text;
       }
     });
     var kept = Outbox.pending(name);
@@ -573,8 +617,9 @@ p.summary { font-size: .86rem; margin: 6px 0; }
     form.addEventListener("submit", function (ev) {
       ev.preventDefault();
       var text = input.value.trim();
-      if (!text || send.disabled) return;
+      if (!text) return;
       Outbox.send(name, text);
+      input.value = "";
     });
     wrap.appendChild(form);
     loadConversation(name, list);

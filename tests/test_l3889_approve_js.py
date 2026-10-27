@@ -32,13 +32,18 @@ const status = { textContent: "", className: "" };
 const listeners = {};
 const button = (id) => ({ id, disabled: false,
   addEventListener(_e, fn) { listeners[id] = fn; } });
-const buttons = { approve: button("approve"), deny: button("deny"), enroll: button("enroll") };
+const buttons = { approve: button("approve"), deny: button("deny"), enroll: button("enroll"),
+                  "login-open": button("login-open"), "login-done": button("login-done"),
+                  "login-cancel": button("login-cancel"), "login-private": button("login-private"),
+                  "login-url": button("login-url"), "login-code": button("login-code") };
 const roots = {
   "ameesh-approval": { dataset: { kind: "", rpId: "example.org", credentials: "",
                                   challengeApprove: "AA", challengeDeny: "AA" } },
   "ameesh-enroll": { dataset: { rpId: "example.org", rpName: "x", userId: "AA",
                                 userName: "human:dave", challenge: "AA", exclude: "" } },
   "ameesh-wait": { dataset: { retry: "15" } },
+  "ameesh-login": { dataset: { rpId: "example.org", credentials: "", challengeView: "AA",
+                               challengeCancel: "AA" } },
 };
 const rootId = "ameesh-" + (scenario.root || "approval");
 let reloads = 0;
@@ -57,7 +62,7 @@ function fetch(_url, init) {
   sent.push(init.body);
   keptAtSend.push(storage.has("ameesh-approve:pending:" + PATH));
   const a = answers.shift();
-  if (a === "network") return Promise.reject(new TypeError("Failed to fetch"));
+  if (a === undefined || a === "network") return Promise.reject(new TypeError("Failed to fetch"));
   return Promise.resolve({ ok: a.status < 300, status: a.status,
                            json: () => Promise.resolve(a.body || {}) });
 }
@@ -80,7 +85,7 @@ setTimeout(function wait(n) {
   setImmediate(() => setImmediate(() => {
     process.stdout.write(JSON.stringify({ sent, keptAtSend, status, statuses, reloads,
       kept: storage.get("ameesh-approve:pending:" + PATH) || null,
-      storage: Array.from(storage.keys()) }));
+      storage: Array.from(storage.keys()) }), () => process.exit(0));
   }));
 }, 20);
 """
@@ -179,6 +184,53 @@ class ApproveJsDeliveryTest(unittest.TestCase):
     def test_page_d_attente_sans_corps_se_recharge(self):
         result = self.run_page({"root": "wait", "answers": []})
         self.assertEqual((result["sent"], result["reloads"]), ([], 1))
+
+    LOGIN = {"rawId": [1, 2], "response": {"authenticatorData": [3], "clientDataJSON": [4],
+                                           "signature": [5]}}
+
+    def test_login_final_garde_sur_l_appareil_avant_l_envoi(self):
+        """B1 (cx3) : cancel signé, POST 503 : le corps reste sur l'appareil
+        (la page fermée là ne perd pas la signature)."""
+        result = self.run_page({"root": "login", "click": "login-cancel",
+                                "credential": self.LOGIN,
+                                "answers": [{"status": 503, "body": {"retry": True}}]})
+        self.assertEqual(result["keptAtSend"][0], True)
+        kept = json.loads(result["kept"])
+        self.assertEqual((kept["kind"], kept["body"]["decision"]), ("login", "cancel"))
+
+    def test_login_rouvert_renvoie_le_corps_garde(self):
+        body = dict(BODY, decision="cancel")
+        result = self.run_page({"root": "login", "storage": self.kept_as("login", body),
+                                "answers": [{"status": 200, "body": {"decision": "cancel"}}]})
+        self.assertEqual([json.loads(b) for b in result["sent"]], [body])
+        self.assertEqual((result["status"]["className"], result["kept"]), ("done", None))
+        self.assertIn("Cancellation signed", result["status"]["textContent"])
+
+    def test_page_d_attente_renvoie_un_login_garde(self):
+        body = dict(BODY, decision="done")
+        result = self.run_page({"root": "wait", "storage": self.kept_as("login", body),
+                                "answers": [{"status": 503, "body": {}},
+                                            {"status": 200, "body": {"decision": "done"}}]})
+        self.assertEqual([json.loads(b) for b in result["sent"]], [body, body])
+        self.assertIn("Done signed", result["status"]["textContent"])
+        self.assertEqual(result["reloads"], 0)
+
+    def test_login_view_jamais_garde(self):
+        result = self.run_page({"root": "login", "click": "login-open", "credential": self.LOGIN,
+                                "answers": [{"status": 503, "body": {}}]})
+        # renvoyé en mémoire (même corps), jamais écrit sur l'appareil
+        self.assertTrue(result["keptAtSend"])
+        self.assertFalse(any(result["keptAtSend"]))
+        self.assertEqual(len(set(result["sent"])), 1)
+        self.assertIsNone(result["kept"])
+
+    def test_login_refus_voulu_non_rejoue(self):
+        body = dict(BODY, decision="done")
+        result = self.run_page({"root": "login", "storage": self.kept_as("login", body),
+                                "answers": [{"status": 410, "body": {"error": "closed",
+                                                                     "message": "closed"}}]})
+        self.assertEqual(len(result["sent"]), 1)
+        self.assertEqual((result["status"]["className"], result["kept"]), ("error", None))
 
     def test_corps_garde_trop_ancien_oublie(self):
         result = self.run_page({"storage": self.kept(at=0), "answers": []})

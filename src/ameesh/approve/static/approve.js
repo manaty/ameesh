@@ -193,9 +193,10 @@
     var entry = kept();
     if (entry) {
       say("Sending what you signed…");
-      sendKept(entry.kind, entry.body, entry.kind === "enroll" ? enrolled : function () {
-        return "Your signed answer is recorded. You can close this page.";
-      });
+      sendKept(entry.kind, entry.body, entry.kind === "enroll" ? enrolled
+        : entry.kind === "login" ? settledLogin : function () {
+          return "Your signed answer is recorded. You can close this page.";
+        });
       return;
     }
     var delay = parseInt(root.dataset.retry || "15", 10) || 15;
@@ -280,6 +281,12 @@
   // Le lien seul est muet : l'URL et le code ne sont demandés au service
   // qu'après une assertion (`view`) acceptée. Ils ne sont jamais écrits dans
   // le document HTML initial, seulement dans ces deux <code> par textContent.
+  function settledLogin(result) {
+    return result.data.decision === "cancel"
+      ? "Cancellation signed and recorded. You can close this page."
+      : "Done signed and recorded. You can close this page.";
+  }
+
   function login(root) {
     var data = root.dataset;
     var privateSection = document.getElementById("login-private");
@@ -287,6 +294,12 @@
     var doneButton = document.getElementById("login-done");
     var cancelButton = document.getElementById("login-cancel");
     var doneChallenge = "";
+
+    var entry = kept();
+    if (entry && entry.kind === "login") {   // done/cancel déjà signé repart
+      say("Sending what you signed…");
+      sendKept("login", entry.body, settledLogin);
+    }
 
     function sign(decision, challenge) {
       setBusy(true);
@@ -302,15 +315,26 @@
           }
         }).then(function (credential) {
           var response = credential.response;
-          deliver({
+          var body = {
             decision: decision,
             credential_id: toB64u(credential.rawId),
             authenticatorData: toB64u(response.authenticatorData),
             clientDataJSON: toB64u(response.clientDataJSON),
             signature: toB64u(response.signature)
-          }, function () {
+          };
+          // §16 (#3889) : done/cancel (un reçu) gardés sur l'appareil AVANT
+          // l'envoi et repris au rechargement ; jamais `view` (sa réponse
+          // porte l'URL et le code privés, et elle ne s'écrit nulle part)
+          var final = decision !== "view";
+          if (final) {
+            keep("login", body);
+          }
+          deliver(body, function () {
             say(pendingText(), "pending");
           }).then(function (result) {
+            if (final) {
+              forget();
+            }
             if (result.ok) {
               resolve(result.data);
             } else {
