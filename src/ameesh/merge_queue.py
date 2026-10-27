@@ -807,6 +807,7 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
            "waived": waived, "waived_by": waived_by,
            "author": author, "author_family": "", "authors": [],
            "corrections": [], "on_freeze": 0, "unproven": [], "vehicle": None,
+           "vehicle_why": "",
            "attribution_read": False, "provenance_exclusions": [],
            "provenance_manifest": "",
            "exclude_author_family": exclude_author_family,
@@ -846,12 +847,21 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
             cls = str(klass.get("class") or cls)
             if klass.get("doubt"):
                 cls = lot_class.SENSITIVE
+            # #4041 : la porte lit la classe du delta propre, pas celle du
+            # diff gelé entier ; la trace le dit.
+            out["vehicle_why"] = "proper delta %s (%s)" % (
+                cls, klass.get("why") or ", ".join(vehicle.get("own_paths") or ())
+                or "?")
     vehicle_required = 0
     if vehicle is not None and vehicle.get("ok") is not False:
         vehicle_required = int(vehicle.get("required") or 0)
         if vehicle.get("ok") is True and vehicle_required == 0 and cls != lot_class.RELEASE:
             klass = {"class": lot_class.LIGHT, "files": []}
             cls = lot_class.LIGHT
+            # #4041 : sans cette trace, `queue add` affichait « class light »
+            # suivi de la raison sensible du diff gelé entier.
+            out["vehicle_why"] = (vehicle.get("why")
+                                  or "constituents reviewed on their frozen heads")
     # #2803 : le seul contenu que la porte du véhicule relit est son delta
     # propre (`commits`) ; les membres ont leurs avis sur leur propre tête.
     own_commits = [str(sha).strip() for sha in (vehicle or {}).get("commits") or ()
@@ -2652,10 +2662,27 @@ def _readiness(db, lot: int, repo: str, *, ci=None, clone=None, project=None,
         proof = getattr(parts, "proof", None)
     return {"target": target, "frozen_sha": tip, "frozen_id": freeze["id"],
             "pr": (status or {}).get("number"),
-            "class": gate.get("class") or klass.get("class"),
-            "class_why": klass.get("why") or "", "parts": proof,
+            "class": klass.get("class") or gate.get("class"),
+            "class_why": klass.get("why") or "", "vehicle": _vehicle_note(gate),
+            "parts": proof,
             "waived": bool(gate.get("waived")),
             "waived_by": gate.get("waived_by") or ""}
+
+
+def _vehicle_note(gate: dict) -> str:
+    """La preuve du véhicule de paquet, nommée à part de la classe (#4041).
+
+    Sur un véhicule (§12, #2803), la porte lit les avis des membres sur leur
+    tête gelée et ne compte sur le véhicule que les avis de son delta propre.
+    La classe affichée reste celle du diff gelé entier ; cette note dit
+    pourquoi la porte n'a pas exigé ses avis.
+    """
+    why = str(gate.get("vehicle_why") or "")
+    if not why:
+        return ""
+    required = int(gate.get("required") or 0)
+    return "§12 vehicle proven by its members: %s; %d verdict%s on the vehicle (#2803)" % (
+        why, required, "" if required == 1 else "s")
 
 
 def _class_of(db, lot: int, row: dict, repo: str, where: str | None, target: str | None,
@@ -2950,6 +2977,7 @@ def enter(db, lot: int, *, repo: str, actor: str = "", ci="github", project=None
                                                  len(proof.get("due") or ()))
     # #2281 : la dispense de re-verdict du pilote (#1979) est nommée dans la
     # note de file, avec l'auteur du geste lu au journal du lot.
+    vehicle_note = ", %s" % ready["vehicle"] if ready.get("vehicle") else ""
     waived_note = ""
     if ready.get("waived"):
         waived_note = ", verdict waived by %s (#1979)" % (
@@ -2961,11 +2989,12 @@ def enter(db, lot: int, *, repo: str, actor: str = "", ci="github", project=None
         return storage.of(tx).work.queue_add(
             lot, target=ready["target"], frozen_sha=ready["frozen_sha"],
             frozen_id=ready["frozen_id"], source=source_of(repo),
-            note="merge queue of %s: queued at %s%s, class %s%s%s%s" % (
+            note="merge queue of %s: queued at %s%s, class %s%s%s%s%s" % (
                 ready["target"], ready["frozen_sha"][:12],
                 ", PR #%s green" % ready["pr"] if ready["pr"] else "",
                 ready.get("class") or "?", " (%s)" % ready["class_why"]
-                if ready.get("class_why") else "", parts_note, waived_note),
+                if ready.get("class_why") else "", vehicle_note, parts_note,
+                waived_note),
             actor=actor, **guard)
 
     if fence is None:
@@ -2986,6 +3015,7 @@ def enter(db, lot: int, *, repo: str, actor: str = "", ci="github", project=None
     # L539 : la classe lue à l'entrée, rendue avec la ligne de file (lecture)
     row["class"] = ready.get("class")
     row["class_why"] = ready.get("class_why")
+    row["vehicle"] = ready.get("vehicle") or ""
     row["waived"] = bool(ready.get("waived"))
     return row
 
@@ -3616,9 +3646,11 @@ def run(cfg, db, args) -> int:
                 if scratch:
                     shutil.rmtree(scratch, ignore_errors=True)
             print(json.dumps(row, ensure_ascii=False, indent=2, default=str) if args.json else
-                  "lot #%d queued for %s at %s, class %s; the radar orders the queue at its "
-                  "next pass" % (args.id, row["target"], row["frozen_sha"][:12],
-                                 row.get("class") or "?"))
+                  "lot #%d queued for %s at %s, class %s%s; the radar orders the queue at "
+                  "its next pass" % (args.id, row["target"], row["frozen_sha"][:12],
+                                     row.get("class") or "?",
+                                     " (%s)" % row["vehicle"] if row.get("vehicle")
+                                     else ""))
             return 0
         if args.queue_command == "remove":
             train = live_train(cfg, db, args.id)

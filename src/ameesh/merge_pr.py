@@ -842,7 +842,8 @@ def direct_merge(slug: str, pr: int, head: str, *, lot: int, repo: str, db=None,
                     "merge_state": merge_state,
                     "admission": {"target": ready.get("target") or "",
                                   "class": ready.get("class") or "",
-                                  "class_why": ready.get("class_why") or ""},
+                                  "class_why": ready.get("class_why") or "",
+                                  "vehicle": ready.get("vehicle") or ""},
                     "message": text}
         if reservation is not None:
             # #1703 N2: the identity actually held is observable, so an
