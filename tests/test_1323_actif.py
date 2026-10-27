@@ -1458,5 +1458,17 @@ raise SystemExit(subprocess.run(args[index:], cwd=cwd, env=env).returncode)
 '''
 
 
+class HotesPartagesTest(unittest.TestCase):
+    """#3965 : la coupure relit l'attestation avec les memes hotes qu'actif.py."""
+
+    def test_release_cutoff_et_actif_listent_les_memes_hotes(self):
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'src'))
+        from ameesh import release_cutoff
+        actif = charger_actif()
+        self.assertEqual(release_cutoff.STAGING_AGENTS, actif.HOTES_AGENTS)
+        self.assertEqual(release_cutoff.STAGING_VMS, actif.HOTES_VMS)
+        self.assertEqual(release_cutoff.STAGING_HOSTS, actif.HOTES_CANON)
+
+
 if __name__ == '__main__':
     unittest.main()

@@ -77,7 +77,7 @@
 # ~/.local/state/ameesh/mise-a-jour/actif-<commit>.json et chaque rapporteur
 # recoit un courrier unique par commit (hotes, commit relu actif, preuves
 # installer/redemarrer/controler/sante). « Complete » = les quatre VM prouvees,
-# plus le poste s'il est en ligne ; poste absent, l'attestation porte les trois
+# plus le poste s'il est en ligne ; poste absent, l'attestation porte les quatre
 # VM et le champ `reportes` qui nomme le poste et sa mise a jour a son retour.
 # Un echec ou un retour n'emet aucun signal de reussite ; un sous-ensemble de
 # VM n'atteste rien ; aucun lot n'est clos automatiquement.
