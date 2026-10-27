@@ -1701,6 +1701,15 @@ _CACHE_OPTION_VALUES = frozenset(("-n", "-f", "-e", "--max-count", "--format",
 #: pas survivre au passage qui l'a supprimé).
 _CACHE_DROP_COMMANDS = frozenset(("gc", "prune", "repack", "init", "clone"))
 
+#: #3777 : placeholders de format qui lisent autre chose que l'objet — refs
+#: (décorations, reflog, signature, notes, ref, `describe`), dates relatives
+#: ou humaines, noms et courriels résolus par `.mailmap`. Leur sortie dépend
+#: des refs, de l'heure ou du mailmap, pas du seul commit lu : jamais cachée.
+_FORMAT_STATE_RE = re.compile(
+    r"%(?:d|D|g|G|N|S|[ac][rhNE]|\(describe|\(decorate)")
+#: #3777 : dates dont la sortie dépend de l'instant de lecture.
+_CACHE_STATEFUL_DATES = frozenset(("relative", "human"))
+
 
 def _repo_cache_key(repo: str) -> str:
     """Le dépôt lu, indépendamment d'un chemin relatif ou d'un lien."""
@@ -1798,9 +1807,14 @@ def _content_options(sub: str, tokens: list[str]):
             continue
         if any(token.startswith(prefix) for prefix in rules["prefix"]):
             # `%d`/`%D` (décorations), `%g` (reflog), `%G` (signature), `%N`
-            # (notes) et `%S` (ref) lisent l'état des refs, pas le seul objet.
+            # (notes), `%S` (ref), `%ar`/`%ah` (date relative/humaine),
+            # `%aN`/`%aE` (mailmap) et `%(describe)`/`%(decorate)` lisent
+            # autre chose que l'objet.
             if (token.startswith(("--format=", "--pretty="))
-                    and re.search(r"%(?:d|D|g|G|N|S)", token)):
+                    and _FORMAT_STATE_RE.search(token)):
+                return None
+            if (token.startswith("--date=")
+                    and token[len("--date="):] in _CACHE_STATEFUL_DATES):
                 return None
             index += 1
             continue
@@ -1808,7 +1822,14 @@ def _content_options(sub: str, tokens: list[str]):
             if index + 1 >= len(tokens):
                 return None
             if (token in ("--format", "--pretty")
-                    and re.search(r"%(?:d|D|g|G|N|S)", tokens[index + 1])):
+                    and _FORMAT_STATE_RE.search(tokens[index + 1])):
+                return None
+            if (token == "--date"
+                    and tokens[index + 1] in _CACHE_STATEFUL_DATES):
+                return None
+            if (sub == "grep" and token == "-f"
+                    and tokens[index + 1] != "-"):
+                # le fichier de motifs n'est pas dans la clé ; `-` (stdin) l'est
                 return None
             index += 2
             continue
