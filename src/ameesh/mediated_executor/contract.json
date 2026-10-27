@@ -4905,6 +4905,7 @@
     "designate_reviewer",
     "detach_branch",
     "due_delegations",
+    "earlier_freezes",
     "estimate_history",
     "estimates",
     "events",

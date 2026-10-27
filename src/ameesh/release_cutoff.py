@@ -80,6 +80,13 @@ VERSION_FILE = "pyproject.toml"
 NOTES_DIR = "docs/versions"
 #: staging attestation of the installed source
 ATTESTATION_DIR = "mise-a-jour"
+#: staging hosts (canon §14): the three VMs are always proved; the poste may be
+#: reported absent only when the sequence runs from a VM (#3848)
+STAGING_HOSTS = ("ameesh-agents-1", "ameesh-agents-2", "manaty-mesh-1", "pc-smichea")
+STAGING_AGENTS = STAGING_HOSTS[:2]
+STAGING_SERVEUR = STAGING_HOSTS[2]
+STAGING_POSTE = STAGING_HOSTS[3]
+STAGING_VMS = STAGING_HOSTS[:3]
 _VERSION_LINE = re.compile(r'^version\s*=\s*"([^"\s]+)"\s*$', re.MULTILINE)
 _SEMVER = re.compile(r"^v?(\d+)\.(\d+)\.(\d+)$")
 _TAG = re.compile(r"^v(\d+)\.(\d+)\.(\d+)$")
@@ -1881,7 +1888,13 @@ def attestation_path(sha: str) -> str:
 
 
 def read_attestation(sha: str) -> dict | None:
-    """The durable 4-host attestation of `sha`, if present and complete."""
+    """The durable attestation of `sha`, if present and complete.
+
+    Complete = the three VM hosts proved; the poste either proved itself or is
+    explicitly reported absent (`reportes`, #3848). A reported poste does not
+    make the VMs inactive, but `maybe_staging` reruns the sequence so the
+    poste catches up when it is back.
+    """
     path = attestation_path(sha)
     try:
         with open(path, encoding="utf-8") as stream:
@@ -1891,8 +1904,24 @@ def read_attestation(sha: str) -> dict | None:
     if not isinstance(data, dict) or data.get("sha", "")[:len(sha)] != sha[:len(sha)]:
         return None
     hosts = data.get("hotes")
-    if not isinstance(hosts, dict) or len(hosts) != 4:
+    reportes = data.get("reportes") or {}
+    if not isinstance(hosts, dict) or not isinstance(reportes, dict):
         return None
+    if set(reportes) - {STAGING_SERVEUR, STAGING_POSTE}:
+        return None
+    requis = (set(STAGING_AGENTS) | ({STAGING_SERVEUR} - set(reportes))
+              | ({STAGING_POSTE} - set(reportes)))
+    if set(hosts) != requis:
+        return None
+    for host, detail in hosts.items():
+        if not isinstance(detail, dict):
+            return None
+        actif = str(detail.get("actif") or "").lower()
+        if not actif or not (sha.startswith(actif) or actif.startswith(sha)):
+            return None
+    for host, detail in reportes.items():
+        if not isinstance(detail, dict) or not str(detail.get("raison") or "").strip():
+            return None
     return data
 
 
@@ -2497,7 +2526,11 @@ def _staging_step(project: ProjectRelease, release_sha: str, included: list[int]
 def maybe_staging(project: ProjectRelease, release_sha: str, included: list[int],
                   state_dir: str) -> dict:
     attestation = read_attestation(release_sha)
-    if attestation:
+    # Un poste reporte ne prouve pas le staging complet : relancer permet de le
+    # mettre a jour au commit actif a son retour, jamais en dessous (#3848).
+    # Un serveur sans acces root reporte ne justifie pas de relancer : il n'a
+    # aucun runner, la prochaine release le reprendra s'il redevient joignable.
+    if attestation and STAGING_POSTE not in (attestation.get("reportes") or {}):
         return {"exit": 0, "duration_s": 0.0, "log": "", "summary": [],
                 "attestation": attestation, "skipped": "already attested"}
     return run_staging(project, release_sha, included, state_dir=state_dir)

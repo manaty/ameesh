@@ -708,11 +708,18 @@ class ExecuteurTest(PgTestCase):
         ecrit_etat(self.state_path, etat("available", 1))
         os.environ["L112_ETAPES"] = "6"
         self.addCleanup(os.environ.pop, "L112_ETAPES", None)
-        self.lance()
+        runner = self.lance()
         self.assertTrue(attendre(lambda: any("outil" in m for m in self.harnais())))
-        finis_avant = sum(1 for m in self.harnais() if "fini" in m)
         ecrit_etat(self.state_path, etat("draining", 2,
                                          drain_deadline_ts=time.time() + 60))
+        # #3846 : la porte est appliquée par un fil (tick 0,25 s) ; sous la
+        # charge d'une CI de paquet, il peut être ordonnancé après l'appel
+        # d'outil en cours (0,6 s). Le témoin compte les appels finis à partir
+        # de l'état *appliqué*, celui que voit l'exécuteur : sinon la latence
+        # du fil se confond avec un dépassement du point sûr.
+        self.assertTrue(attendre(runner.gate_holds, timeout=10.0),
+                        "la porte doit passer draining")
+        finis_avant = sum(1 for m in self.harnais() if "fini" in m)
         ack = attendre(lambda: (self.ack() or {}).get("drained") and self.ack())
         self.assertTrue(ack, "le retrait doit finir par un acquittement drained")
         self.assertEqual((ack["seq"], ack["state"], ack["held"]), (2, "draining", []))

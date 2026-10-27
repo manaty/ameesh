@@ -1230,8 +1230,12 @@ def freeze_carrier(worktree: Path, carrier: int, head: str, note: str) -> str:
     return _output(proc)
 
 
-def send_mail(pilot: str, carrier: int, body: str) -> str:
+def send_mail(pilot: str, carrier: int, body: str, sender: str | None = None) -> str:
     cmd = ["agent-mail", "send", pilot, "-", "--lot", str(carrier)]
+    if sender:
+        # #3845 : sous `ameesh role run`, AGENT_MAIL_NAME est retiré ; sans
+        # --from, agent-mail refuse (« unbound sender »).
+        cmd += ["--from", sender]
     proc = run_command(cmd, input_text=body, timeout=120)
     if proc.returncode != 0:
         raise PaquetAutoError(
@@ -1536,6 +1540,17 @@ def compose_packet(args: argparse.Namespace) -> int:
                                                  base_sha, ready_out)
         errors = error_discards(payload)
         error_lots = {item.lot for item in errors}
+        # #3845 : un lot retiré sur un rouge de ci-full (paquet-horaire.py,
+        # unité nommée par #3801) n'est pas recomposé ; il reste au manifeste.
+        excluded = [lot for lot in getattr(args, "exclude", None) or []
+                    if lot not in error_lots]
+        if excluded:
+            candidates = [candidate for candidate in candidates
+                          if candidate.lot not in set(excluded)]
+            errors = errors + [Discarded(
+                lot, "retiré : ci-full rouge attribuée à son unité (#3801)",
+                "--exclude, recomposition sans lui") for lot in excluded]
+            error_lots |= set(excluded)
         for item in errors:
             print("écarté #%d : %s — %s"
                   % (item.lot, item.reason, item.detail), flush=True)
@@ -1669,7 +1684,7 @@ def compose_packet(args: argparse.Namespace) -> int:
                          inclusion_rc=inclusion_rc, pr_number=pr_number,
                          pr_url=pr_url)
         try:
-            send_mail(args.pilot, args.carrier, mail)
+            send_mail(args.pilot, args.carrier, mail, getattr(args, "sender", None))
         except PaquetAutoError as error:
             print("courrier non envoyé : %s\n\n%s" % (error, mail),
                   file=sys.stderr)
@@ -1697,12 +1712,20 @@ def main(argv: list[str] | None = None) -> int:
                         help="lot porteur du paquet")
     parser.add_argument("--pilot", default="mesh-design",
                         help="destinataire du courrier (défaut : mesh-design)")
+    parser.add_argument("--from", dest="sender",
+                        default=os.environ.get("AMEESH_ROLE") or None,
+                        help="expéditeur du courrier (défaut : AMEESH_ROLE, sinon "
+                             "l'identité liée)")
     parser.add_argument("--local", action="store_true",
                         help="s'arrêter après le manifeste et packet record")
     parser.add_argument("--force", action="store_true",
                         help="recomposer un paquet existant : réécrit la "
                              "branche distante sous --force-with-lease (retirer "
                              "la CI et le feu avant)")
+    parser.add_argument("--exclude", type=int, action="append", default=[],
+                        metavar="LOT",
+                        help="#3845 : ne pas composer ce lot prêt (répétable) ; "
+                             "il est écrit aux écartés du manifeste")
     parser.add_argument("--replay", default=None, metavar="REF",
                         help="rejouer le manifeste d'une référence et comparer "
                              "les arbres (avec --candidates-json : refuser une "

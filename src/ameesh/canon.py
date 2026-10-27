@@ -90,12 +90,30 @@ PROCESS_BODY_MAX = 6000
 #: carte, par le même responsable).
 PROCESS_PROJECTION_START = "<!-- projection courte : début -->"
 PROCESS_PROJECTION_END = "<!-- projection courte : fin -->"
-#: #1372, #3126 : budget d'une projection (octets UTF-8). `BRIEF_MAX_BYTES`
-#: 19 000 - réserve texte 4 000 - en-tête/pied 80 - marge du bloc 320 = 14 600.
-#: La marge garde la place des diagnostics et d'une autre fiche courte. Une
-#: projection au-delà est signalée et coupée à ce budget, jamais silencieusement ;
-#: dès 90 % du budget, `canon check` prévient avant la coupe.
-PROCESS_PROJECTION_MAX = 14600
+#: #3867 : bornes du brief, PARTAGÉES par `reprise` (qui les reprend) et par
+#: `canon check` (qui mesure le bloc de règles avec le même calcul). Plafond du
+#: brief (octets UTF-8) ; part qu'un texte accompagné de règles garde au plus.
+BRIEF_MAX_BYTES = 19000
+BRIEF_TEXT_MIN_BYTES = 4000
+#: #538 : en-tête et pied du bloc de règles d'un brief.
+PROCESS_RULES_HEADER = "## Working rules (canon Process cards)"
+PROCESS_RULES_FOOTER = "<!-- end of the canon Process rules -->"
+#: #3867 : place du bloc de règles quand le texte du brief (résumé de rotation,
+#: brief préparé) prend toute sa réserve — le cas le plus serré de
+#: `reprise.with_process_rules` (2 octets pour le `\n\n` qui recolle le texte).
+RULES_BLOC_LIMIT = BRIEF_MAX_BYTES - 2 - BRIEF_TEXT_MIN_BYTES
+#: #3867 : place des règles elles-mêmes dans ce bloc, sans en-tête ni pied
+#: (14 919 octets) : toutes les cartes Process servies, titres et métadonnées
+#: compris, doivent y tenir — `canon check` le vérifie (`process-rules-block-*`).
+RULES_BLOC_ROOM = (RULES_BLOC_LIMIT - len((PROCESS_RULES_HEADER + "\n").encode("utf-8"))
+                   - len(("\n" + PROCESS_RULES_FOOTER).encode("utf-8")))
+#: #1372, #3126, #3867 : plafond d'une projection seule (octets UTF-8) : la place
+#: entière des règles. Une projection au-delà est signalée et coupée à ce
+#: plafond, jamais silencieusement. Ce n'est PAS un budget suffisant : les
+#: autres cartes servies partagent la même place, et c'est le contrôle du bloc
+#: entier qui prévient (#3867 : une projection « sous budget » à 12 Ko laissait
+#: déborder le bloc de 2 Ko, la marge fixe de 320 octets supposant une carte seule).
+PROCESS_PROJECTION_MAX = RULES_BLOC_ROOM
 #: les sortes de fiches WorkPackage (plan de travail, L29) et les parents admis
 PACKAGE_KINDS = ("milestone", "epic", "lot")
 #: L96 : dates d'une fiche WorkPackage (`date` = date d'un jalon, alias de `delivery`)
@@ -4790,11 +4808,6 @@ def _validate_processes(canon: Canon, add) -> None:
                 "Process card %s: short projection of %d bytes (limit %s) — a "
                 "brief cuts its end" % (process.title, proj, PROCESS_PROJECTION_MAX),
                 where, **subject)
-        elif process.projection and proj * 10 >= PROCESS_PROJECTION_MAX * 9:
-            add("process-projection-near-limit", WARNING,
-                "Process card %s: short projection of %d bytes (limit %s) — at "
-                "least 90%% of its budget; shorten it before a brief cuts its end"
-                % (process.title, proj, PROCESS_PROJECTION_MAX), where, **subject)
         elif not process.projection and taille > PROCESS_BODY_MAX:
             add("process-too-long", WARNING,
                 "Process card %s: %d bytes of rules (limit %s, about two pages); "
@@ -4808,6 +4821,51 @@ def _validate_processes(canon: Canon, add) -> None:
                 "Process card %s marked `expire: %s`, a past date: the rule is "
                 "still read, review it" % (process.title, process.expire),
                 where, **subject)
+    _validate_process_block(canon, add)
+
+
+def _validate_process_block(canon: Canon, add) -> None:
+    """#3867 : le bloc de règles RÉELLEMENT injecté tient-il dans sa place ?
+
+    Le bloc porte toutes les cartes Process valides du canon (projection ou
+    texte entier, titres et lignes de métadonnées, diagnostics) : chaque agent
+    de ce canon reçoit le même. Il est construit par `reprise` (même code que
+    le brief) et mesuré dans le cas le plus serré (`RULES_BLOC_LIMIT`, texte du
+    brief à sa réserve pleine). Dès 90 % de la place : avertissement ; au-delà
+    (le brief coupe la fin des règles) : erreur, qui ne bloque aucun agent
+    (`blocking` : sujet Process) mais fait échouer `canon check`. Le constat
+    nomme les cartes et leur poids, de la plus lourde à la plus légère."""
+    from . import reprise
+    servies = [p for p in canon.processes if p.valid]
+    if not servies:
+        return
+    fragments, diagnostics = [], []
+    for process in servies:
+        texte, diag = reprise._process_fragment(process)
+        if diag:
+            diagnostics.append(diag)
+        fragments.append((process, texte))
+    rules = "\n\n".join(t for _, t in fragments if t).strip()
+    if not rules:
+        return
+    bloc = reprise._rules_bloc(rules, RULES_BLOC_LIMIT, diagnostics)
+    taille = len(bloc.encode("utf-8"))
+    cartes = ", ".join(
+        "%s (%d)" % (p.title, len(t.encode("utf-8")))
+        for p, t in sorted(fragments, key=lambda f: -len(f[1].encode("utf-8"))))
+    sujet = {"process": ", ".join(p.title for p, _ in fragments)}
+    if rules not in bloc:
+        add("process-rules-block-too-long", ERROR,
+            "Process rules block: %d bytes of rules for %d bytes of room (brief "
+            "block limit %d) — a brief with a full text cuts the end of the rules; "
+            "shorten the cards: %s"
+            % (len(rules.encode("utf-8")), RULES_BLOC_ROOM, RULES_BLOC_LIMIT, cartes),
+            servies[0].fiche, **sujet)
+    elif taille * 10 >= RULES_BLOC_LIMIT * 9:
+        add("process-rules-block-near-limit", WARNING,
+            "Process rules block: %d bytes of %d (at least 90%%) — shorten the "
+            "cards before a brief cuts the end of the rules: %s"
+            % (taille, RULES_BLOC_LIMIT, cartes), servies[0].fiche, **sujet)
 
 
 def errors(findings: Iterable[Finding]) -> list[Finding]:

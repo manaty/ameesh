@@ -2411,6 +2411,13 @@ class WorkItems(Domain):
         correction `merged → build` postérieure a annulé (#2317)."""
 
     @abc.abstractmethod
+    def earlier_freezes(self, app: str, lot: int, before_ts: float) -> list[dict]:
+        """Up to 256 earlier freezes of other lots in this project.
+
+        A bounded provenance lookup: missing candidates retain unknown authors.
+        """
+
+    @abc.abstractmethod
     def add_milestone(self, item_id: int, kind: str, *, sha: str, actor: str,
                       verdict: str | None, note: str, on_frozen=None,
                       after_commit: list | None = None,
