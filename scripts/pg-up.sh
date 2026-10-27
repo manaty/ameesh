@@ -111,14 +111,33 @@ garde_sources() {
 # Python, qui se reconnecte — seul l'opérateur les admet explicitement
 # (`--admit-unmarked`), après avoir arrêté toute suite. `AMEESH_PG_UPKEEP=0`
 # désactive.
+#
+# #3886 : une copie déployée du script (staging) n'a pas de src/ à côté ; le
+# python3 du système n'y connaît pas ameesh. L'interpréteur est AMEESH_PYTHON,
+# sinon celui du venv d'ameesh, sinon python3 ; src/ n'est ajouté au chemin
+# que dans un clone, où il prime sur le paquet installé. Un interpréteur sans
+# ameesh.bench (aucun venv, ou un venv antérieur à #3735) saute la purge en
+# une ligne, sans trace d'erreur.
 STARTED=0
 menage_banc() {
   [ "${AMEESH_PG_UPKEEP:-1}" != 0 ] || return 0
   (
     cd "$(dirname "$0")/.." || exit 0
     if [ -n "$PASSWORD" ]; then export PGPASSWORD="$PASSWORD"; fi
-    export AMEESH_DRIVER=psql PYTHONPATH="src${PYTHONPATH:+:$PYTHONPATH}"
-    python3 -m ameesh.bench purge \
+    py=${AMEESH_PYTHON:-}
+    if [ -z "$py" ]; then
+      py=$HOME/.local/share/ameesh/venv/bin/python
+      [ -x "$py" ] || py=python3
+    fi
+    if [ -d src/ameesh ]; then
+      export PYTHONPATH="src${PYTHONPATH:+:$PYTHONPATH}"
+    fi
+    if ! "$py" -c 'import ameesh.bench' >/dev/null 2>&1; then
+      echo "purge sautée : ameesh.bench introuvable pour $py (AMEESH_PYTHON)"
+      exit 0
+    fi
+    export AMEESH_DRIVER=psql
+    "$py" -m ameesh.bench purge \
       --dsn "postgresql://$USER@127.0.0.1:$PORT/$DB" 2>&1
   ) | sed 's/^/banc : /' || true
 }
