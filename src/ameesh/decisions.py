@@ -902,6 +902,10 @@ def _release_lot(db, view: dict, *, actor: str, note: str, replay: bool = False)
             return {"lot": int(lot), "state": target, "moved": True, "others": 0}
         except work.WorkError:
             item = work.get(db, int(lot)) or item
+    if replay:
+        # une réponse identique ne laisse jamais de seconde note sur le lot
+        return {"lot": int(lot), "state": item["state"], "moved": False,
+                "others": len(others)}
     suffix = ""
     if item["state"] == "waiting_human":
         suffix = (" — the work item stays waiting: %d other decision(s) pending" % len(others)
