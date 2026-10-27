@@ -483,6 +483,40 @@ class ContractFallbackTest(unittest.TestCase):
         self.assertEqual(got["report"]["fallback"]["cause"], "selection-full")
         self.assertEqual(got["report"]["selection"], "contract")
 
+    def test_fallback_adds_transverse_contracts_and_changed_tests(self):
+        # #3954 : un lot qui change l'interface de stockage rend le contrat de
+        # l'exécuteur (#3885, tête 68c30d91) et son test changé (P0, #3916,
+        # tête 7ae1e095) reste joué par le repli « contrats ».
+        script = FULL_PLAN_SCRIPT.replace(
+            "'classes': {}",
+            "'classes': {'test_3845_paquet_horaire': ['P0', 'test changé'],"
+            " 'test_a': ['P3', '']}")
+        self.repo.write("scripts/test-plan.py", script)
+        self.repo.write("src/ameesh/storage/interface.py",
+                        "class Storage:\n    def ops(self):\n        return 1\n")
+        self.repo.write("tests/test_3845_paquet_horaire.py", "x = 1\n")
+        self.head = self.repo.commit("transverse")
+        prepared = calls.prepare(self.repo.root, self.head, self.repo.base)
+        self.addCleanup(prepared.close)
+        fallback = calls.contract_fallback(prepared, self.parameters(),
+                                           head=self.head, base=self.repo.base)
+        self.assertIsNotNone(fallback)
+        plan = prepared.plan
+        self.assertEqual(plan["selection"]["mode"], "contract")
+        self.assertIn("contrats et tests du lot", plan["selection"]["why"])
+        self.assertEqual(fallback["transverse"], ["test_l107_executor_contract"])
+        self.assertEqual(fallback["changed_tests"], ["test_3845_paquet_horaire"])
+        modules = plan["parts"]["psycopg"][0]["modules"]
+        self.assertIn("test_l107_executor_contract", modules)
+        self.assertIn("test_3845_paquet_horaire", modules)
+        self.assertIn("test_cluster", modules)
+        # la preuve se relit comme un repli déclaré, pas comme un vert de
+        # sélection : les modules supplémentaires sont dans les classes du plan.
+        chosen = pv.selection(plan, head=self.head, base=self.repo.base)
+        self.assertTrue(chosen.ok, chosen.why)
+        self.assertEqual(chosen.fallback["transverse"],
+                         ["test_l107_executor_contract"])
+
 
 class CommitProbeTest(unittest.TestCase):
     def test_the_probe_keeps_no_lazy_fetch_and_the_bound(self):

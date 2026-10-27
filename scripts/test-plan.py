@@ -189,6 +189,12 @@ LEAKS_SCHEMA = "ameesh-test-leaks/1"
 ALWAYS_FILE = REPO / "tests" / "parts" / "toujours.txt"
 PILOT_FILE = REPO / "tests" / "parts" / "pilote-psql.txt"
 
+#: #3954 : les contrats transverses (module → fichiers lus) sont du code du
+#: dépôt, versionné avec la sélection ; la déclaration voyage avec l'arbre du
+#: candidat, comme le sélecteur lui-même.
+sys.path.insert(0, str(REPO / "src"))
+from ameesh import transverse_contracts  # noqa: E402
+
 #: une carte plus vieille est « périmée » (#3343/#3344) : un lot la garde pour
 #: juger son propre diff (#3450), la voie documentation et la prévalidation
 #: exigent mieux ; l'alerte `map_stale` se lève à ce seuil.
@@ -1473,6 +1479,18 @@ def classify(modules: list[str], card: dict | None, now: datetime.datetime,
     for m, r in triggered.items():
         if classes.get(m, ("P3",))[0] not in ("P0", "P1"):
             classes[m] = ("P1", r)
+    #: #3954 : un contrat transverse dont un fichier lu change est dû, même
+    #: quand la carte ne relie pas ce fichier au test (un import déjà chargé
+    #: par le harnais, une lecture de données). Il rejoint les impactés P1 ;
+    #: `make_plan` refuse une déclaration qui nomme un module disparu (la
+    #: liste complète des modules n'est connue que là).
+    out["transverse"] = {}
+    for m, path in sorted(transverse_contracts.hits(changes).items()):
+        if m not in modules:
+            continue
+        out["transverse"][m] = path
+        if classes.get(m, ("P3",))[0] not in ("P0", "P1"):
+            classes[m] = ("P1", "contrat transverse: %s" % path)
     for m, r in recent_failures(card, now).items():
         if m in modules and classes.get(m, ("P3",))[0] == "P3":
             classes[m] = ("P2", r)
@@ -2171,6 +2189,12 @@ def summary(plan: dict) -> str:
     else:
         lines.append(f"* full suite: {sel['selected']} module(s) run"
                      + (f" ({sel['why']})" if sel.get("why") else ""))
+    if plan.get("transverse"):
+        #: #3954 : le contrat transverse est dû par un fichier lu, pas par la
+        #: mesure par blocs ; le résumé dit lequel et pourquoi.
+        lines.append("* contrats transverses (#3954): " + _listing(
+            [f"`{module}` ({path})" for module, path
+             in sorted(plan["transverse"].items())]))
     if sel.get("mode") != "skipped":
         psql_n = len({m for p in plan["parts"].get("psql", []) for m in p["modules"] or ()})
         if plan.get("psql_full"):
