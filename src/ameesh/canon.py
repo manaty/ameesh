@@ -1605,6 +1605,10 @@ NO_LAZY_FETCH = {"GIT_NO_LAZY_FETCH": "1"}
 #: aucune ref symbolique, aucun chemin du dépôt de travail, ni aucune lecture
 #: d'état (fetch, statut, remote, refs) n'entre ici. Un échec n'est jamais
 #: retenu : un objet absent peut être rapatrié plus tard par un fetch.
+#: #3829 : la clé porte aussi l'identité de l'**instance** du dépôt, pas
+#: seulement son chemin : un dépôt supprimé puis recréé au même chemin (clone,
+#: `init`, `rm -rf` suivi d'un clone hors de `canon._git`) ne doit jamais
+#: relire une réponse positive de l'ancien (présence d'un objet, contenu).
 _CONTENT_CACHE: dict = {}
 _CONTENT_CACHE_LOCK = threading.Lock()
 _CONTENT_CACHE_BYTES = 0
@@ -1709,6 +1713,78 @@ _FORMAT_STATE_RE = re.compile(
     r"%(?:d|D|g|G|N|S|[ac][rhNE]|\(describe|\(decorate)")
 #: #3777 : dates dont la sortie dépend de l'instant de lecture.
 _CACHE_STATEFUL_DATES = frozenset(("relative", "human"))
+#: #3829 : options de `clone`/`init` qui consomment l'argument suivant ; sans
+#: cette table, la valeur d'une option se lirait comme un chemin à oublier.
+#: Une option inconnue est traitée comme sans valeur : au pire un chemin est
+#: vidé sans entrée, jamais un dépôt recréé ne garde son ancienne lecture.
+_CLONE_VALUE_OPTIONS = frozenset((
+    "-b", "--branch", "-o", "--origin", "-u", "--upload-pack", "--template",
+    "--reference", "--reference-if-able", "--separate-git-dir", "--depth",
+    "--shallow-since", "--shallow-exclude", "--filter", "-c", "--config",
+    "-j", "--jobs", "--server-option", "--revision", "--ref-format",
+))
+_INIT_VALUE_OPTIONS = frozenset((
+    "-b", "--initial-branch", "--template", "--separate-git-dir",
+    "--object-format", "--ref-format",
+))
+
+
+def _command_positionals(tokens: tuple[str, ...],
+                         valued: frozenset[str]) -> list[str]:
+    """Les arguments positionnels d'une commande, options et valeurs écartées."""
+    out: list[str] = []
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        if token == "--":
+            out.extend(tokens[index + 1:])
+            break
+        if token.startswith("-") and token != "-":
+            index += 2 if "=" not in token and token in valued else 1
+            continue
+        out.append(token)
+        index += 1
+    return out
+
+
+def _clone_directory(source: str, *, bare: bool) -> str | None:
+    """Le dossier qu'un `git clone <source>` sans destination crée."""
+    text = source.rstrip("/")
+    if "://" not in text and ":" in text:        # forme scp `hôte:chemin`
+        text = text.rsplit(":", 1)[1]
+    if text.endswith("/.git"):
+        text = os.path.dirname(text)
+    name = os.path.basename(text)
+    if name.endswith(".git"):
+        name = name[:-4]
+    if not name or name in (".", ".."):
+        return None
+    return name + ".git" if bare else name
+
+
+def _recreated_repository_paths(sub: str, repo: str,
+                                tokens: tuple[str, ...]) -> list[str]:
+    """Les chemins dont `init`/`clone` viennent de (re)créer le dépôt (#3829).
+
+    `repo` est le cwd de la commande : une destination relative l'est aussi.
+    """
+    if sub == "init":
+        values = _command_positionals(tokens, _INIT_VALUE_OPTIONS)
+        created = values[:1]
+    elif sub == "clone":
+        values = _command_positionals(tokens, _CLONE_VALUE_OPTIONS)
+        if len(values) >= 2:
+            created = [values[-1]]
+        elif len(values) == 1:
+            name = _clone_directory(
+                values[0], bare=any(flag in tokens for flag in ("--bare", "--mirror")))
+            created = [name] if name else []
+        else:
+            created = []
+    else:
+        return []
+    return [value if os.path.isabs(value) else os.path.join(repo, value)
+            for value in created]
 
 
 def _repo_cache_key(repo: str) -> str:
@@ -1716,12 +1792,74 @@ def _repo_cache_key(repo: str) -> str:
     return os.path.realpath(os.path.abspath(repo or "."))
 
 
+def _stat_token(path: str):
+    """`(périphérique, inode, ctime)` d'un chemin, ou None s'il est illisible."""
+    try:
+        info = os.stat(path)
+    except OSError:
+        return None
+    return (info.st_dev, info.st_ino, info.st_ctime_ns)
+
+
+def _git_directory(repo: str, env_extra: dict | None = None) -> str | None:
+    """Le répertoire git qu'une commande lancée dans `repo` lit effectivement."""
+    explicit = (env_extra or {}).get("GIT_DIR")
+    if explicit:
+        path = explicit if os.path.isabs(explicit) else os.path.join(repo, explicit)
+        return os.path.realpath(path)
+    start = _repo_cache_key(repo)
+    directory = start
+    while True:
+        marker = os.path.join(directory, ".git")
+        if os.path.lexists(marker):
+            return os.path.realpath(marker)
+        parent = os.path.dirname(directory)
+        if parent == directory:
+            break
+        directory = parent
+    # dépôt nu : ni `.git` ni parent git, le chemin EST le répertoire git
+    if (os.path.exists(os.path.join(start, "HEAD"))
+            and os.path.isdir(os.path.join(start, "objects"))):
+        return start
+    return None
+
+
+def _repository_identity(repo: str, env_extra: dict | None = None):
+    """L'instance du dépôt lu, pas seulement son chemin (#3829).
+
+    Le contenu d'un objet adressé par un SHA ne change jamais ; sa **présence**
+    dépend du dépôt qui est au chemin. `(périphérique, inode, ctime)` du
+    répertoire git change quand un dépôt est recréé au même chemin — y compris
+    par un `rm -rf` puis un clone faits hors de `canon._git` : une lecture
+    retenue pour l'ancien n'est alors jamais servie au nouveau. Un dépôt
+    seulement mis à jour (fetch, nouveau commit) garde son identité, donc le
+    gain de #3753 est conservé.
+    """
+    gitdir = _git_directory(repo, env_extra)
+    if not gitdir:
+        return None
+    token = _stat_token(gitdir)
+    if token is None:
+        return None
+    objects = (env_extra or {}).get("GIT_OBJECT_DIRECTORY")
+    if objects:
+        # `plan_git.local_commit` lit les objets d'un autre magasin que le cwd :
+        # l'identité doit suivre le magasin réellement lu.
+        path = objects if os.path.isabs(objects) else os.path.join(repo, objects)
+        object_token = _stat_token(os.path.realpath(path))
+        if object_token is None:
+            return None
+        token = (token, object_token)
+    return token
+
+
 def _content_cache_clear(repo: str | None = None) -> None:
     """Vide le cache de contenu (tout, ou les seules entrées d'un dépôt).
 
     Les tests s'en servent pour compter des lancements ; la production n'a
     pas besoin de l'appeler à la main (les commandes destructrices ci-dessus
-    oublient d'elles-mêmes le dépôt concerné).
+    oublient d'elles-mêmes le dépôt concerné, et `init`/`clone` aussi leur
+    destination, #3829).
     """
     global _CONTENT_CACHE_BYTES
     with _CONTENT_CACHE_LOCK:
@@ -1940,7 +2078,12 @@ def _content_cache_key(repo: str, args: tuple[str, ...],
             return None
     else:
         return None
-    return (_repo_cache_key(repo), tuple(args), stdin or b"",
+    identity = _repository_identity(repo, env_extra)
+    if identity is None:
+        # dépôt introuvable ou illisible : la commande va échouer, et un échec
+        # ne se retient pas ; mieux vaut ne rien cacher que deviner l'instance.
+        return None
+    return (_repo_cache_key(repo), identity, tuple(args), stdin or b"",
             tuple(sorted((env_extra or {}).items())))
 
 
@@ -2014,8 +2157,11 @@ def _git(repo: str, *args: str, stdin: bytes | None = None,
     if args and args[0] in _CACHE_DROP_COMMANDS and proc.returncode == 0:
         # `gc`/`prune` peuvent supprimer des objets : une lecture retenue pour
         # ce dépôt ne doit pas survivre à leur disparition. `init`/`clone`
-        # couvrent un chemin réutilisé par un autre dépôt.
+        # couvrent un chemin réutilisé par un autre dépôt ; leur destination
+        # est un argument (relative au cwd de la commande), pas le cwd (#3829).
         _content_cache_clear(repo)
+        for path in _recreated_repository_paths(args[0], repo, args[1:]):
+            _content_cache_clear(path)
     return proc
 
 
