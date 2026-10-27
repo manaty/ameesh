@@ -583,6 +583,8 @@ def operator_pause_of(row: dict) -> dict | None:
         "by": row.get("operator_pause_by"),
         "for": row.get("operator_pause_for"),
         "since_ts": _round(row.get("operator_pause_ts")),
+        # #3961 : l'échéance de la pause (None = sans fin, `--indefinite`)
+        "until_ts": _round(row.get("operator_pause_until_ts")),
         "after_turn": row.get("status") == "running",
     }
 
@@ -1394,9 +1396,12 @@ def format_text(snap: dict, width: int | None = None) -> str:
             line("reason: %s" % agent["status_text"], "    ")
         hold = agent.get("operator_pause")
         if hold:
-            line("operator pause%s: %s (by %s for %s)" % (
+            from . import agent_pause
+            line("operator pause%s: %s (by %s for %s; %s)" % (
                 " after this turn" if hold["after_turn"] else "",
-                hold["reason"], hold["by"], hold["for"]), "    ")
+                hold["reason"], hold["by"], hold["for"],
+                "until %s" % agent_pause.until_label(hold["until_ts"])
+                if hold.get("until_ts") else "no deadline"), "    ")
 
     out.append("")
     if snap["milestones"]:
