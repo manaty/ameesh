@@ -12,6 +12,7 @@ import argparse
 import importlib.util
 import json
 import pathlib
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -318,6 +319,29 @@ class PaquetAutoBanc(unittest.TestCase):
             self.repo, 1, now=time.time() + 3600)
         self.assertIn(str(path), removed)
         self.assertFalse(path.exists())
+
+    def test_reprise_ferme_le_worktree_garde_par_la_tentative_1(self) -> None:
+        # #3916 : la tentative 1 a échoué et gardé son worktree sur la branche
+        # du paquet ; la reprise (--force) le ferme puis recompose.
+        branch = "integration/paquet-h-reprise"
+        kept = paquet_auto.make_worktree(self.repo, self.base, branch)
+        self.addCleanup(shutil.rmtree, kept, True)
+        self.assertTrue(kept.name.startswith("paquet-auto-"))
+        logged: list[str] = []
+        paquet_auto.clear_local_branch(self.repo, branch, log=logged.append)
+        self.assertFalse(kept.exists())
+        self.assertIn(str(kept), "\n".join(logged))
+        again = paquet_auto.make_worktree(self.repo, self.base, branch)
+        self.addCleanup(paquet_auto.remove_worktree, self.repo, again)
+        self.assertEqual(paquet_auto.rev(again, "HEAD"), self.base)
+
+    def test_reprise_refuse_un_worktree_qui_n_est_pas_le_sien(self) -> None:
+        branch = "integration/paquet-autre"
+        path = pathlib.Path(self.tmp.name) / "a-la-main"
+        self.git("worktree", "add", "-b", branch, str(path), self.base)
+        with self.assertRaises(paquet_auto.InputError):
+            paquet_auto.clear_local_branch(self.repo, branch, log=lambda _l: None)
+        self.assertTrue(path.exists())
 
     def test_branche_de_candidat_invalide_refusee_avant_fetch(self) -> None:
         candidate = paquet_auto.Candidate(
