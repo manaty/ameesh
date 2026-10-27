@@ -148,10 +148,16 @@ agent's first turn must open its session after that reset, on a free account.
 
 ### Device and account
 
-* test agent `pilot-resident-4064`, ephemeral Claude on `ameesh-agents-2`,
-  created by mesh-design (the creator passes its host and harness), TTL 2 d,
-  cwd `/home/ameesh/work/pilot-resident-4064`, runner unit
-  `ameesh-runner-agent@pilot-resident-4064.service`;
+* test agent `pilot-resident-4064`, ephemeral Claude, created by mesh-design
+  at 06:00Z on the staging host where mesh-design is elected (the creator
+  passes its host and harness; B-1 records the host), TTL 2 d, cwd
+  `/home/ameesh/work/pilot-resident-4064`, runner unit
+  `ameesh-runner-agent@pilot-resident-4064.service` started without `enable`;
+* the agent is not created before 06:00Z: the staging cut restarts and
+  controls the runners (22:20Z→~01:30Z), and a pre-created unit could be
+  started by that pass. At 06:00Z the pilot checks the account, mails
+  mesh-design "B-1 prêt", and mesh-design creates and starts the agent, then
+  returns the host and state;
 * capabilities read/propose: the agent takes no lot and no review; any item
   assigned to it is returned and reported, never worked;
 * the agent's runner reads the staging launcher (`venv-courant`); B-1 records
@@ -170,7 +176,7 @@ below.
 
 | Point | When | What is measured |
 |---|---|---|
-| B-1 | 06:00Z, read-only, before any setting | staging and runner identity, `resident=off`, no resident process, account, zero lot/review |
+| B-1 | 06:00Z, read-only, before any setting | staging and runner identity, host, `resident=off`, no resident process, account, zero lot/review, SSH reachability from the pilot (observation only) |
 | B0 | T0 | `resident=on resident_sleep=30m mail_batch=0`; sampler started; T0; session/account/PID |
 | B1 | T0+3 min | first resident turn: session, PID, epoch, usage, cache split |
 | B2 | B1+17 min | awake memory at rest; `probe_due` window; sampler headroom |
@@ -188,7 +194,15 @@ report the absence of `silent`/`liveness probe failed` lines. Here the probe is
 made to fail on purpose, between turns, with a known cause; B5d proves that the
 runner refuses to serve a turn to a silent resident, counts one resident
 failure and falls back to one turn per event. The failure is counted, not
-imputed, and it is not a probe-failure series.
+imputed, and it is not a probe-failure series. The B5c `SIGSTOP` is scheduled
+by the test agent itself, on its own host (`systemd-run --user
+--on-active=60s /bin/kill -STOP <resident pid>`): it does not depend on a
+cross-host SSH access. B-1 records whether the pilot can also reach the host
+over SSH, for observation. Before B5c the pilot sends an information line to
+the auditor and the bureau: the failure is intentional and must not be
+escalated to the owner. The runner's `_resident_failed` is a journal line and
+a 60 s backoff, not a notify alert; the information line keeps the night
+routing explicit.
 
 ### Cache split (the one-hour question)
 
