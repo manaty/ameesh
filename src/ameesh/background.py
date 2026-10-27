@@ -267,8 +267,12 @@ class Tracker:
     STRAYS_EVERY_S = 60.0
     UNKNOWN_ZOMBIES_WARN = 32
     CLEANUP_SECTION_S = 2.0
-    #: confirmation de l'arrêt (SIGSTOP) avant le signal, dans la section
-    FREEZE_CONFIRM_S = .5
+    #: confirmation de l'arrêt (SIGSTOP) avant le signal ; None : tout le
+    #: reste de la section (#3991 : sous charge, 0,5 s sautait TERM et KILL)
+    FREEZE_CONFIRM_S: float | None = None
+    #: arrêt confirmé au-delà de ce délai : journalisé avec la durée de
+    #: verrouillage (CLEANUP_SIGNAL_LOCK tenu pendant l'attente)
+    FREEZE_SLOW_S = .5
     #: fin de tour : délai laissé aux processus qui se ferment avec le
     #: harnais (serveurs MCP) avant de parler de travail de fond
     SETTLE_S = 2.0
@@ -715,11 +719,19 @@ class Tracker:
                     if not remaining:
                         continue
                     stop_attempted = True
-                    if not handle.freeze(timeout=min(self.FREEZE_CONFIRM_S, remaining)):
+                    window = remaining if self.FREEZE_CONFIRM_S is None \
+                        else min(self.FREEZE_CONFIRM_S, remaining)
+                    if not handle.freeze(timeout=window):
                         entry.unverified |= bool(handle.live())
-                        note = "stop not confirmed; no termination signal"
+                        note = ("stop not confirmed within %.2f s under lock; "
+                                "no termination signal" % window)
                         continue
-                    if not self._cleanup_remaining(entry, deadline):
+                    # The wait is measured on the section's own clock reads.
+                    after = self._cleanup_remaining(entry, deadline)
+                    if remaining - after > self.FREEZE_SLOW_S:
+                        note = ("stop confirmed late, %.2f s under lock"
+                                % (remaining - after))
+                    if not after:
                         continue
                     location = handle.location()
                     if not self._cleanup_remaining(entry, deadline):
