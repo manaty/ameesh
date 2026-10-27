@@ -206,6 +206,12 @@ FERMEES = {
                             "detail", "at"},
     "account_turn_starts": {"id", "harness", "account", "host", "agent", "at"},
     "account_turn_slots": {"agent", "harness", "account", "host", "at"},
+    # #3885 (0492) : curseur et état de la passe de veille des empreintes
+    # d'échec (projet, URL, curseur, dernier relevé et erreur), tenus et lus
+    # par l'agent de veille, pas par le rôle superviseur ; état interne fermé
+    # aux deux rôles, aucun GRANT modifié.
+    "fingerprint_watch_state": {"project", "url", "cursor", "last_read_at",
+                                "last_error", "updated_at"},
 }
 #: L232b (0417) : l'état interne du contrôleur de release reste hors contrat,
 #: sauf `host_release_fences.host`, lu par `ameesh_host_gate_state` (l.314).
