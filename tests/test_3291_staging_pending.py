@@ -31,6 +31,19 @@ class ActiveFloorTest(ReleaseFixtureMixin, unittest.TestCase):
         stage.assert_not_called()
         self.assertEqual(self.git(self.clone, "tag", "-l", "v1.11.8"), "")
 
+    def test_shared_attestation_feeds_the_active_view(self):
+        """#3981 : une preuve ecrite sur HOTE_OUTILS (evenement du journal)
+        compte dans la vue des hotes actifs, sans fichier local."""
+        data = {"sha": self.head, "date": "2026-10-24T04:00:00Z",
+                "hotes": {hote: {"actif": self.head}
+                          for hote in release_cutoff.STAGING_AGENTS}}
+        with mock.patch.object(release_cutoff, "stored_attestations",
+                               return_value=[data]):
+            active = staging_pending.active_hosts(db=object())
+        for hote in release_cutoff.STAGING_AGENTS:
+            self.assertEqual(active[hote]["sha"], self.head)
+            self.assertTrue(active[hote]["attestation"].startswith("ameesh_events:"))
+
     def test_reported_poste_supersedes_older_active_and_does_not_regress(self):
         """#3848 : une attestation plus recente qui reporte le poste remplace
         son ancien commit actif ; le poste absent ne retient aucun contenu."""
@@ -284,7 +297,8 @@ class WaitingTest(ReleaseFixtureMixin, unittest.TestCase):
              mock.patch.object(release_cutoff, "_staging_step", return_value={"exit": 0}) as stage:
             result = staging_pending.apply(self.cfg, None, self.project, now=_paris(22, 30))
             self.assertEqual(result["result"], "staged")
-            stage.assert_called_once_with(self.project, self.head, [3111], self.cfg.state_dir)
+            stage.assert_called_once_with(self.project, self.head, [3111],
+                                          self.cfg.state_dir, db=None)
             self.assertEqual(self.st.work.land_lock.call_count, 2)
             self.st.work.land_unlock.assert_called_once()
             stage.reset_mock()

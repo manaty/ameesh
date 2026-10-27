@@ -164,6 +164,12 @@ deploy/mise-a-jour/vm.sh agents controler
 deploy/mise-a-jour/vm.sh agents retour
 ```
 
+Sur un hôte d’agents, le banc Pg local (`scripts/test.sh`, conteneur
+`ameesh-pg` sur `127.0.0.1:55432`) lit `~/.pgpass` (0600) : sans l’entrée
+`127.0.0.1:55432:agent_mesh:agent_mesh:<mot de passe du conteneur>`, les
+tests Pg ciblés échouent en `fe_sendauth` (#4065). Le mot de passe n’est
+jamais affiché ni versionné.
+
 `installer` et `retour` refusent d’abord si l’identité effective du compte
 runner — `AMEESH_HOST` de son `EnvironmentFile`, lue dans l’environnement de
 l’unité — n’est pas `HOTE_AGENTS` : un `BASCULE_ENV` qui vise une autre VM
@@ -332,8 +338,9 @@ ssh root@<vm> 'runuser -u ameesh -- git clone https://github.com/manaty/ameesh.g
 Un `DEPOT_VM` différent se déclare dans l’environnement du lanceur. Lancée hors
 du poste et des VM d’agents (bureau-goal,
 sans venv ameesh ni route vers la base), la séquence fait tourner la sonde de
-courrier et la notification sur `HOTE_OUTILS` (par défaut `HOTE_MIGRATIONS`),
-par ssh, sous l’utilisateur `ameesh`, avec l’instantané du commit (#3976). Une
+courrier, la notification **et `actif.py`** sur `HOTE_OUTILS` (par défaut
+`HOTE_MIGRATIONS`), par ssh, sous l’utilisateur `ameesh`, avec l’instantané du
+commit ; le journal de la séquence lui est recopié (#3976, #3981). Une
 sonde qui **n’a pas pu tourner** (python absent, code 126/127, ssh en échec,
 base injoignable : verdict `non-concluant`) est non concluante (canon §3) :
 aucun retour de l’hôte, trace `sante`/`non-concluant`, séquence arrêtée en 3
@@ -579,8 +586,12 @@ poussée atomique, puis le rend. `staging.sh` refuse deux séquences simultanée
 **Preuve** : le journal `~/.local/state/ameesh/mise-a-jour/staging-<date>.jsonl`,
 l'attestation `actif-<sha>.json` (quatre VM et sonde de courrier remise, plus le
 poste quand il est en ligne ou le champ `reportes` sinon) et le rapport JSON du
-tick. Aucune prod : le staging n'est pas une release de prod (canon §14), un go
-owner reste requis pour la prod.
+tick. Depuis une VM, cette attestation est écrite sur `HOTE_OUTILS` et
+`actif.py` dépose aussi une forme compacte dans le journal partagé
+`ameesh_events` (type `staging.attested`) ; le poste qui fait la coupure la
+relit sans ssh et la matérialise dans son état local (#3981). Aucune prod : le
+staging n'est pas une release de prod (canon §14), un go owner reste requis
+pour la prod.
 
 La recette PgBouncer autorise aussi `ameesh-agents-3` sous l’utilisateur
 `ameesh`. Elle prévoit pour cet hôte 32 connexions ordinaires et 8 de réserve

@@ -181,6 +181,10 @@ class ActifTest(unittest.TestCase):
         patcheur.start(); self.addCleanup(patcheur.stop)
         patcheur = mock.patch.object(self.actif, 'verifier_remises')
         patcheur.start(); self.addCleanup(patcheur.stop)
+        #: #3981 : le journal partage est un transport de plus ; les temoins
+        #: locaux ne touchent pas la base et peuvent inspecter l'evenement.
+        patcheur = mock.patch.object(self.actif, 'enregistrer_attestation')
+        self.enregistre = patcheur.start(); self.addCleanup(patcheur.stop)
 
     def faux_envoi(self, dest, corps, charge):
         self.envois.append({'dest': dest, 'corps': corps, 'charge': charge})
@@ -302,6 +306,33 @@ class ActifTest(unittest.TestCase):
                                       '--rapporteur', 'docs01')
         self.assertEqual(code, 0, erreur)
         self.assertEqual(len(self.envois), 1)
+        self.assertEqual(len(self.attestations()), 1)
+
+    def test_attestation_est_aussi_partagee_dans_le_journal(self):
+        """#3981 : la preuve locale part dans `ameesh_events` sous une forme
+        compacte, lisible du poste qui fait la coupure sans ssh."""
+        self.ecrire(journal_complet())
+        self.lancer(*self.hotes(), '--lot', '917', '--rapporteur', 'docs01')
+        self.enregistre.assert_called_once()
+        evenement = self.enregistre.call_args.args[0]
+        self.assertEqual(evenement['sha'], SHA)
+        self.assertEqual(sorted(evenement['hotes']), sorted(HOTES))
+        self.assertEqual(evenement['lots'], ['917'])
+        for hote in HOTES:
+            self.assertEqual(evenement['hotes'][hote]['actif'], SHA)
+            self.assertNotIn('sante', evenement['hotes'][hote])
+        self.assertNotIn('notifies', evenement)
+        self.assertNotIn('emissions', evenement)
+
+    def test_echec_du_partage_rend_le_code_echec_sans_perdre_la_preuve(self):
+        """#3981 : un journal du mesh injoignable ne fait pas perdre le
+        deploiement ; l'attestation locale reste et le code 4 le dit."""
+        self.ecrire(journal_complet())
+        with mock.patch.object(self.actif, 'enregistrer_attestation',
+                               side_effect=RuntimeError('base absente')):
+            code, _, erreur = self.lancer(*self.hotes())
+        self.assertEqual(code, 4, erreur)
+        self.assertIn('non partagee', erreur)
         self.assertEqual(len(self.attestations()), 1)
 
     def test_un_rapporteur_deja_prevenu_n_est_pas_reveille_pour_un_autre(self):

@@ -627,7 +627,7 @@ export interface components {
             project: string | null;
             ts: number;
             /** @enum {unknown} */
-            type: "lot.updated" | "turn.started" | "turn.ended" | "agent.updated" | "agent.moved" | "cost.recorded" | "thread.entry" | "decision.created" | "decision.closed" | "action.updated" | "receipt.attached" | "approval.recorded" | "alert.raised" | "alert.resolved" | "pilot.gesture";
+            type: "lot.updated" | "turn.started" | "turn.ended" | "agent.updated" | "agent.moved" | "cost.recorded" | "thread.entry" | "decision.created" | "decision.closed" | "action.updated" | "receipt.attached" | "approval.recorded" | "alert.raised" | "alert.resolved" | "pilot.gesture" | "staging.attested";
         };
         "ameesh-host-1": {
             history: Record<string, never>[];

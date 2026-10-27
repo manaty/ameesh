@@ -30,6 +30,22 @@ class Events(interface.Events):
             "select " + _COLUMNS + " from ameesh_events where id > %s order by id limit %s",
             (int(after_id), int(limit)))
 
+    def recent_type(self, type, days, limit, object=None) -> list:
+        # #3981 : la preuve de staging vit dans le journal partagé. La borne
+        # `created_at` garde la lecture sur l'index de rétention (l'index
+        # partiel type/objet demanderait une migration) : la preuve de staging
+        # n'a de sens que récente, et la bornure est dite à l'appelant.
+        sql = ("select " + _COLUMNS + " from ameesh_events"
+               " where type = %s"
+               "   and created_at > now() - make_interval(days => %s::int)")
+        params = [type, int(days)]
+        if object is not None:
+            sql += " and object = %s"
+            params.append(object)
+        sql += " order by id desc limit %s"
+        params.append(int(limit))
+        return self.db.query(sql, tuple(params))
+
     def readable(self, position, limit) -> tuple:
         # ONE statement, so ONE snapshot: the rows and the bounds agree (with
         # two snapshots, a transaction ending in between hid both).

@@ -31,10 +31,13 @@
 # atteste ; l'attestation le nomme dans `reportes`, sans bloquer la sequence
 # (bureau #147558). Les trois VM d'agents ne sont jamais reportables.
 #
-# Les outils python de la sequence (sonde de courrier, notification) tournent
-# avec le venv du lanceur sur le poste et les VM d'agents ; ailleurs
-# (bureau-goal, sans venv ameesh ni route vers la base), sur HOTE_OUTILS, une
-# VM d'agents de la sequence (HOTE_MIGRATIONS par defaut), par ssh (#3976).
+# Les outils python de la sequence (sonde de courrier, notification, et
+# actif.py en fin de sequence) tournent avec le venv du lanceur sur le poste et
+# les VM d'agents ; ailleurs (bureau-goal, sans venv ameesh ni route vers la
+# base), sur HOTE_OUTILS, une VM d'agents de la sequence (HOTE_MIGRATIONS par
+# defaut), par ssh (#3976). Le journal est recopie a actif.py, qui ecrit son
+# attestation sur la VM et la depose aussi dans le journal partage du mesh
+# (`ameesh_events`, #3981) ; le poste la relit sans ssh.
 # Une sonde qui n'a pas pu tourner (outil absent, ssh, base injoignable) est
 # non concluante (canon §3) : aucun retour de l'hote, sequence arretee en 3.
 #
@@ -142,6 +145,11 @@ VENV="$PARTAGE/venv"
 AMEESH="$VENV/bin/ameesh"
 TRAVAIL="$HOME/.local/state/ameesh/mise-a-jour"
 JOURNAL="$TRAVAIL/staging-$(date +%F).jsonl"
+#: #3981 : etat de l'utilisateur ameesh sur HOTE_OUTILS, ou actif.py tourne
+#: quand le lanceur n'a ni venv ni base (bureau-goal). Meme arbre que
+#: py_sequence, qui y vise le venv et l'instantane src.
+HOME_OUTILS=/home/ameesh
+TRAVAIL_OUTILS="$HOME_OUTILS/.local/state/ameesh/mise-a-jour"
 #: debut de l'execution (UTC) : fenetre de l'attestation, le journal etant
 #: quotidien et pouvant contenir une execution precedente du meme jour.
 DEPUIS="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -702,6 +710,16 @@ py_sequence() {  # script|- [args…]
       "${CIBLE[$HOTE_OUTILS]}" "$commande" < "$script"
   fi
 }
+# #3981 : le journal de la sequence reste ecrit par le lanceur ; actif.py qui
+# tourne sur HOTE_OUTILS doit le lire la-bas. Copie root puis propriete a
+# ameesh, 0600 : l'outil distant (runuser -u ameesh) le relit sans privilege.
+copier_journal_outils() {  # source locale distant
+  local source=$1 distant=$2
+  ssh -o BatchMode=yes -o ConnectTimeout=10 -o ServerAliveInterval=30 \
+    "${CIBLE[$HOTE_OUTILS]}" \
+    "umask 077; mkdir -p $(citer "$TRAVAIL_OUTILS") && cat > $(citer "$distant") && chown ameesh:ameesh $(citer "$distant")" \
+    < "$source"
+}
 # Verdict d'une sonde de courrier (#3976, canon §3) : « ok » (code 0), « ko »
 # (code 1 ET rapport JSON de sante-courrier.py au verdict ko : la sonde a
 # tourne et constate un defaut de l'hote), sinon « non-concluant » : outil
@@ -994,7 +1012,7 @@ if [ "$SEQUENCE_COMPLETE" != 1 ]; then
   echo "signal actif : sequence partielle (${HOTES[*]}), aucune attestation staging" >&2
 else
   etape "signal actif staging ($SHA_TRAVE)"
-  ARGS_ACTIF=(--journal "$JOURNAL" --sha "$SHA" --depuis "$DEPUIS")
+  ARGS_ACTIF=(--sha "$SHA" --depuis "$DEPUIS")
   [ "$SONDE" = 1 ] || ARGS_ACTIF+=(--sans-sonde)
   for nom in "${HOTES[@]}"; do
     actif_sha=$(sha_installe "$nom" || true)
@@ -1013,12 +1031,30 @@ else
     ARGS_ACTIF+=(--rapporteur "$rapporteur")
   done
   rc=0
-  "$VENV/bin/python" "$ACTIF_PY" "${ARGS_ACTIF[@]}" || rc=$?
+  ATTESTATION_ACTIF="$TRAVAIL/actif-${SHA_TRAVE:0:12}.json"
+  JOURNAL_ACTIF="$JOURNAL"
+  # #3981 : depuis bureau-goal, actif.py tourne sur HOTE_OUTILS avec le venv et
+  # la base d'une VM ; le journal local part avec lui. La preuve partagee est
+  # un evenement `ameesh_events` que release_cutoff relit sur le poste.
+  if [ "$OUTILS_DISTANTS" = 1 ]; then
+    ATTESTATION_ACTIF="$TRAVAIL_OUTILS/actif-${SHA_TRAVE:0:12}.json"
+    JOURNAL_ACTIF="$TRAVAIL_OUTILS/staging-$(date +%F)-$$.jsonl"
+    if copier_journal_outils "$JOURNAL" "$JOURNAL_ACTIF"; then
+      py_sequence "$ACTIF_PY" --journal "$JOURNAL_ACTIF" "${ARGS_ACTIF[@]}" || rc=$?
+    else
+      echo "signal actif non emis : journal non copie vers $HOTE_OUTILS ($JOURNAL)" >&2
+      rc=1
+    fi
+  else
+    "$VENV/bin/python" "$ACTIF_PY" --journal "$JOURNAL_ACTIF" "${ARGS_ACTIF[@]}" || rc=$?
+  fi
   if [ "$rc" -ne 0 ]; then
     if [ "$rc" -eq 5 ]; then
-      echo "signal actif ambigu (emission anterieure non prouvee, aucun renvoi automatique) : attestation $TRAVAIL/actif-${SHA_TRAVE:0:12}.json a verifier, journal $JOURNAL a relayer a la main" >&2
+      echo "signal actif ambigu (emission anterieure non prouvee, aucun renvoi automatique) : attestation $ATTESTATION_ACTIF a verifier, journal $JOURNAL_ACTIF a relayer a la main" >&2
+    elif [ "$OUTILS_DISTANTS" = 1 ]; then
+      echo "signal actif non emis (rc=$rc) : journal $JOURNAL_ACTIF sur $HOTE_OUTILS a relayer a la main" >&2
     else
-      echo "signal actif non emis (rc=$rc) : journal $JOURNAL a relayer a la main" >&2
+      echo "signal actif non emis (rc=$rc) : journal $JOURNAL_ACTIF a relayer a la main" >&2
     fi
   fi
 fi

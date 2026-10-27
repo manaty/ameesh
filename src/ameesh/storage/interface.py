@@ -975,6 +975,15 @@ class Events(Domain):
         most `limit` (a listing for humans: ids are not in commit order)."""
 
     @abc.abstractmethod
+    def recent_type(self, type: str, days: int, limit: int,
+                    object: str | None = None) -> list[dict]:
+        """The most recent events of `type` (optionally about `object`) written
+        in the last `days`, newest first, at most `limit` (#3981: the shared
+        staging attestation). The `created_at` bound keeps the read on the
+        retention index; `days` is the durability the caller needs, never a
+        substitute for an absent event."""
+
+    @abc.abstractmethod
     def readable(self, position: tuple, limit: int) -> tuple[list[dict], str | None, tuple]:
         """The reader's order: (the events after `position` = (tx, id) whose
         transaction is over for good (`tx` below the snapshot's xmin), by
