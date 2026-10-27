@@ -55,6 +55,10 @@ class Action:
     summary: str
     build: Callable                 # (ctx, db, params, body) -> dict (the result)
     body: dict                      # field -> (OpenAPI schema, required)
+    #: §16 (#3889): (ctx, db, params, body) -> the result already produced
+    #: under `ctx.idempotency_key`, or None if the action never acted; an
+    #: action with an outcome makes its effect exclusive per key
+    outcome: Callable | None = None
 
     @property
     def regex(self) -> re.Pattern:
@@ -189,8 +193,30 @@ def _chat(ctx, db, params, body) -> dict:
                                  explicit=True)
     except undeliverable.Refused as exc:
         raise ActionError(409, "refused", str(exc)) from exc
-    return chat.post_human_message(ctx.cfg, db, human=ctx.human, sender=sender,
-                                   agent=params["agent"], text=text, lot=lot)
+    try:
+        return chat.post_human_message(ctx.cfg, db, human=ctx.human, sender=sender,
+                                       agent=params["agent"], text=text, lot=lot,
+                                       idempotency_key=getattr(ctx, "idempotency_key", ""))
+    except chat.KeyReused as exc:
+        raise ActionError(422, "idempotency_mismatch", str(exc)) from exc
+
+
+def _chat_outcome(ctx, db, params, body) -> dict | None:
+    """§16 (#3889): the chat message already delivered under the request's
+    key (its mail carries it), or None: never a second mail."""
+    from . import chat
+    key = getattr(ctx, "idempotency_key", "")
+    if not key:
+        return None
+    # le lot tel que demandé, jamais revalidé : un lot fermé depuis ne rend
+    # pas l'accusé d'un message déjà délivré impossible
+    lot = body.get("lot")
+    try:
+        return chat.delivered_human_message(
+            ctx.cfg, db, human=ctx.human, sender=mail_name(ctx), agent=params["agent"],
+            text=_text(body, "text"), lot=lot, idempotency_key=key)
+    except chat.KeyReused as exc:
+        raise ActionError(422, "idempotency_mismatch", str(exc)) from exc
 
 
 def _publish(ctx, db, params, body) -> dict:
@@ -372,7 +398,8 @@ ACTIONS = (
     Action("/agents/{agent}/chat", "chat",
            "A message to an agent's shared conversation (L83: the server writes the entry "
            "and wakes the agent by mail)", _chat,
-           {"text": _TEXT, "lot": ({"type": ["integer", "null"], "minimum": 1}, False)}),
+           {"text": _TEXT, "lot": ({"type": ["integer", "null"], "minimum": 1}, False)},
+           outcome=_chat_outcome),
     Action("/threads/{project}", "publish", "Publish in a project's thread", _publish,
            {"text": _TEXT}),
     Action("/threads/{project}/{lot}", "publish", "Publish in a lot's thread", _publish,

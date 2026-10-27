@@ -1492,6 +1492,20 @@ def cmd_verify(cfg: Config, args: argparse.Namespace) -> int:
 # lots (work_items)
 # --------------------------------------------------------------------------
 
+def _note_arg(note: str | None) -> str:
+    """#4023 : `--note -` de `work move`, `merged` et `milestone` se lit sur
+    l'entrée standard (heredoc `<<'EOF'`), comme `work note <lot> -` (#3683)
+    et `work add --body -` (#3744), jamais « - » tel quel ; une entrée vide
+    ou réduite à « - » est refusée avant toute écriture."""
+    if note != "-":
+        return note or ""
+    from . import cli
+    text, error = cli._stdin_body("note")
+    if error:
+        raise work.WorkError(error)
+    return text
+
+
 def _delays_cell(row: dict | None, now: float) -> str:
     """La phase courante d'un lot et l'âge de son dernier jalon (R19)."""
     if not row:
@@ -2419,7 +2433,7 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                         or "<migrations>/%s_<name>.sql" % row["label"]))
             return 0
         if args.work_command == "move":
-            note = args.note or ""
+            note = _note_arg(args.note)
             if args.device:
                 # #3070 : la séance attendue sur un appareil, déclarée en note
                 from . import device_gates
@@ -2551,7 +2565,7 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                 print("commit %s (%s): %s"
                       % (constat["sha"][:12], constat["how"], constat["subject"]))
 
-            done = work.merged(db, args.id, sha=args.sha or "", note=args.note or "",
+            done = work.merged(db, args.id, sha=args.sha or "", note=_note_arg(args.note),
                                actor=args.actor, repo=args.repo,
                                migration_landed=args.migration_landed,
                                cfg=cfg, announce=_declare_constat, pr=args.pr)
@@ -2794,7 +2808,7 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
         if args.work_command == "milestone":
             from . import review_designation_activation as activation
             outcome: dict = {}
-            note = args.note or ""
+            note = _note_arg(args.note)
             sha = args.sha or ""
             if args.kind == "frozen":
                 # #2786 : la tête du gel est un commit complet, résolu dans le

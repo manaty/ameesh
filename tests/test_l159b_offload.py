@@ -1106,6 +1106,9 @@ class InstallScriptTest(unittest.TestCase):
         self.assertEqual(res.returncode, 0, res.stderr)
         self.assertIn("useradd", res.stdout)
         self.assertIn("usermod -p * " + guest, res.stdout)
+        # #4011: the guest's passwd home must be $ROOT, even when the user
+        # already exists (install-pilot.sh --offload-only ran first)
+        self.assertIn("usermod --home /srv/ameesh-guest " + guest, res.stdout)
         self.assertIn('restrict,from="203.0.113.7",command="exec ', res.stdout)
         self.assertIn("MemoryMax=", res.stdout)
         self.assertIn("meta skuid", res.stdout)
@@ -1127,6 +1130,102 @@ class InstallScriptTest(unittest.TestCase):
             self.assertIn("install -d -m 2750 -o %s -g ameesh-jobs /srv/ameesh-guest/%s"
                           % (guest, sub), res.stdout)
         self.assertNotIn("No such file", res.stderr)
+
+    def test_dry_run_repairs_an_existing_guest_home(self):
+        # #4011: when install-pilot.sh --offload-only ran first, ameesh-guest
+        # exists with $ROOT/home; install.sh then gives that home to the job
+        # user, so sshd cannot chdir for the guest ("Permission denied", then
+        # "lost the connection"). The dry run must show the usermod that moves
+        # the guest to $ROOT, before the job's home is installed.
+        guest = "ameesh-guest-dry-run"
+        real_id = shutil.which("id")
+        self.assertIsNotNone(real_id)
+        bindir = tempfile.mkdtemp(prefix="l159b-install-id-")
+        self.addCleanup(shutil.rmtree, bindir, True)
+        fake = os.path.join(bindir, "id")
+        with open(fake, "w", encoding="utf-8") as fh:
+            fh.write(textwrap.dedent("""\
+                #!/bin/sh
+                if [ "$1" = "-u" ] && [ "$2" = "%s" ]; then
+                  echo 997
+                  exit 0
+                fi
+                exec %s "$@"
+                """) % (guest, real_id))
+        os.chmod(fake, 0o755)
+        env = dict(os.environ, PATH=bindir + os.pathsep + os.environ.get("PATH", ""))
+        res = subprocess.run(["bash", self.SCRIPT, "--dry-run", "--user", guest,
+                              "--key", "ssh-ed25519 AAAAC3Nza test@poste",
+                              "--from", "203.0.113.7"],
+                             capture_output=True, text=True, env=env)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        # the guest is not created again; its passwd home is moved to $ROOT
+        self.assertNotIn("ameesh offloaded test jobs (L159b) " + guest, res.stdout)
+        self.assertIn("usermod --home /srv/ameesh-guest " + guest, res.stdout)
+        # and before the job user's own home is installed over $ROOT/home
+        self.assertLess(res.stdout.index("usermod --home /srv/ameesh-guest " + guest),
+                        res.stdout.index("install -d -m 0700 -o ameesh-job "
+                                         "-g ameesh-jobs /srv/ameesh-guest/home"))
+
+    def test_dry_run_leaves_a_guest_already_at_root_alone(self):
+        # #4011: usermod -d refuses a user with live processes (the full
+        # pilot's guest runners) even for the same home; under set -e the
+        # install would stop there. A guest already at $ROOT is not touched.
+        guest = "ameesh-guest-dry-run"
+        real_id, real_getent = shutil.which("id"), shutil.which("getent")
+        self.assertIsNotNone(real_id)
+        self.assertIsNotNone(real_getent)
+        bindir = tempfile.mkdtemp(prefix="l159b-install-home-")
+        self.addCleanup(shutil.rmtree, bindir, True)
+        for name, body in (
+                ("id", 'if [ "$1" = "-u" ] && [ "$2" = "%s" ]; then echo 997; exit 0; fi\n'
+                       'exec %s "$@"\n' % (guest, real_id)),
+                ("getent", 'if [ "$1" = "passwd" ] && [ "$2" = "%s" ]; then\n'
+                           '  echo "%s:x:997:997::/srv/ameesh-guest:/bin/sh"; exit 0\n'
+                           'fi\nexec %s "$@"\n' % (guest, guest, real_getent))):
+            path = os.path.join(bindir, name)
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write("#!/bin/sh\n" + body)
+            os.chmod(path, 0o755)
+        env = dict(os.environ, PATH=bindir + os.pathsep + os.environ.get("PATH", ""))
+        res = subprocess.run(["bash", self.SCRIPT, "--dry-run", "--user", guest,
+                              "--key", "ssh-ed25519 AAAAC3Nza test@poste",
+                              "--from", "203.0.113.7"],
+                             capture_output=True, text=True, env=env)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertNotIn("usermod --home", res.stdout)
+
+    def test_live_pilot_home_change_has_named_refusal(self):
+        # Exercise the real account setup with harmless shell doubles.
+        # usermod's refusal must stop installation before any job-home setup,
+        # with an actionable diagnostic rather than its raw exit code (9).
+        with open(self.SCRIPT, encoding="utf-8") as fh:
+            script = fh.read()
+        account_setup = script[script.index('say "user $GUEST '):
+                               script.index('check_no_power_groups "$GUEST"')]
+        harness = textwrap.dedent("""\
+            set -e
+            GUEST=ameesh-guest
+            ROOT=/srv/ameesh-guest
+            say() { :; }
+            die() { echo "install.sh: $*" >&2; exit 1; }
+            id() { echo 997; }
+            getent() { echo "ameesh-guest:x:997:997::$ROOT/home:/bin/sh"; }
+            run() { "$@"; }
+            usermod() {
+              if [ "$1" = --home ]; then
+                echo "usermod: user ameesh-guest is currently used by process 123" >&2
+                return 9
+              fi
+            }
+            """)
+        res = subprocess.run(["bash", "-c", harness + account_setup +
+                              '\necho job-home-setup-reached\n'],
+                             capture_output=True, text=True)
+        self.assertEqual(res.returncode, 1, res.stderr)
+        self.assertIn("guest-home-change refused for ameesh-guest", res.stderr)
+        self.assertIn("stop them before rerunning install.sh", res.stderr)
+        self.assertNotIn("job-home-setup-reached", res.stdout)
 
     def test_the_legacy_dry_run_keeps_the_guest_alone(self):
         # --no-job-user: no job user, no group, no launcher, no rule the

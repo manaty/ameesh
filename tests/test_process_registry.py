@@ -1576,9 +1576,15 @@ class RegistryTest(PgTestCase):
             command=self.command(lot, frm="implementation", to="review",
                                  guard="review_requested", version=receipt.version),
             spec=self.spec, from_stage="implementation", to_stage="review")
-        sources = pr.read_sources(context)
-        self.assertEqual(set(sources), set(pr.SOURCE_KEYS))
+        from ameesh import process_approvals as approvals_mod
+        with mock.patch.object(
+                approvals_mod, "local_projection",
+                side_effect=approvals_mod.ProjectionError(
+                    "projection-missing", "test bench")):
+            sources = pr.read_sources(context)
+        self.assertEqual(set(sources), set(pr.SOURCE_KEYS) - {"approvals"})
         self.assertNotIn("observations", sources)      # source not installed
+        self.assertNotIn("approvals", sources)         # no projection here
         got = sources["receipts"][0]
         self.assertTrue(got["accepted"])
         self.assertEqual(got["guard"], "review_requested")

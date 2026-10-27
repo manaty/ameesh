@@ -44,6 +44,7 @@ import dataclasses
 import hmac
 import http.server
 import json
+import os
 import re
 import secrets
 import sys
@@ -52,12 +53,16 @@ import time
 import urllib.parse
 
 from . import db as db_mod
-from . import progress
+from . import progress, server_faults
 
 BIND = "127.0.0.1"
 DEFAULT_PORT = 8765
 #: durée de vie d'un instantané servi (secondes)
 CACHE_S = 5.0
+#: délai suggéré à la page avant un nouvel essai, après une panne (secondes)
+RETRY_AFTER = 15
+#: §16 (#3889) : au plus un rapport des pannes gardées par intervalle, hors panne
+REPORT_EVERY_S = 60.0
 API = "/api/progress.json"
 #: la conversation d'un agent (L83) : lecture, et la seule écriture du serveur
 CHAT = "/api/conversation.json"
@@ -83,26 +88,80 @@ class ServeError(ValueError):
         self.status = status
 
 
+class FaultReporter:
+    """§16 (#3889) : le journal des pannes de la page, rapporté à la primitive
+    de #3885 (un lot `ameesh` par empreinte) sur une connexion d'écriture à
+    part, en arrière-plan : un seul rapport à la fois, jamais une erreur
+    montrée. Un rapport échoué (base encore en panne) garde les entrées ; il
+    est repris au prochain `kick` (une panne, ou une lecture réussie)."""
+
+    def __init__(self, journal, write, *, report=None):
+        self.journal = journal
+        self._write = write
+        self._report = report
+        self._busy = threading.Lock()
+        self._last = float("-inf")
+
+    def record(self, route: str, exc: BaseException, *, subject: str | None = None) -> str:
+        return self.journal.record(route, exc, subject=subject)
+
+    def kick(self, *, wait: bool = False, every: float = 0.0) -> None:
+        """Un rapport en arrière-plan ; `every` : pas plus souvent (secondes)."""
+        if time.monotonic() - self._last < every or not self._busy.acquire(blocking=False):
+            return
+        self._last = time.monotonic()
+        thread = threading.Thread(target=self._run, daemon=True, name="progress-faults")
+        thread.start()
+        if wait:
+            thread.join(30)
+
+    def _run(self) -> None:
+        try:
+            if self.journal.pending:
+                self._write(lambda db: self.journal.report(db, self._report))
+        except Exception as exc:  # noqa: BLE001 — repris au prochain kick
+            sys.stderr.write("progress --serve: fault report deferred (%s)\n"
+                             % type(exc).__name__)
+        finally:
+            self._busy.release()
+
+
 class Snapshots:
     """Les instantanés servis : construits à la demande, gardés `cache_s`.
 
     `build(project)` rend l'instantané d'un projet (None : tous). Une seule
     construction à la fois : deux onglets ne doublent pas la lecture."""
 
-    def __init__(self, build, *, cache_s: float = CACHE_S, clock=time.monotonic):
+    def __init__(self, build, *, cache_s: float = CACHE_S, clock=time.monotonic,
+                 on_fault=None, on_recovery=None):
         self._build = build
         self._cache_s = float(cache_s)
         self._clock = clock
         self._lock = threading.Lock()
         self._cache: dict = {}
+        #: §16 (#3889) : chaque lecture échouée, versée au journal par empreinte
+        self._on_fault = on_fault
+        #: une lecture réussie : l'occasion de rapporter les pannes gardées
+        self._on_recovery = on_recovery
 
     def get(self, project: str | None) -> dict:
+        """§16 (#3889) : une lecture qui échoue rend le dernier instantané lu,
+        marqué `stale` (son âge est `generated_ts`) ; sans instantané, elle lève."""
         with self._lock:
             hit = self._cache.get(project)
             if hit is not None and self._clock() - hit[0] < self._cache_s:
                 return hit[1]
-            snap = self._build(project)
+            try:
+                snap = self._build(project)
+            except Exception as exc:
+                if self._on_fault is not None:
+                    self._on_fault(exc)
+                if hit is None:
+                    raise
+                return dict(hit[1], stale=True)
             self._cache[project] = (self._clock(), snap)
+            if self._on_recovery is not None:
+                self._on_recovery()
             return snap
 
     def known_projects(self) -> set:
@@ -208,6 +267,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
     read_chat = None
     write_chat = None
     default_project: str | None = None
+    #: §16 (#3889) : journal des pannes par empreinte (server_faults.Journal)
+    faults = None
 
     # -- garde --------------------------------------------------------------
 
@@ -235,7 +296,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if self.command != "HEAD":
             self.wfile.write(body)
 
-    def _error(self, status: int, message: str, extra=()) -> None:
+    def _error(self, status: int, message: str, extra=(), *, retry: bool = False) -> None:
+        if retry:   # §16 (#3889) : une panne, pas un refus ; la page réessaie
+            extra = tuple(extra) + (("Retry-After", str(RETRY_AFTER)),)
         self._send(status, (message + "\n").encode("utf-8"), "text/plain; charset=utf-8", extra)
 
     def _refuse(self) -> None:
@@ -314,11 +377,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
         except (progress.ProgressError, db_mod.DbError, db_mod.Unavailable,
                 db_mod.SchemaMissing) as exc:
-            self._error(503, "conversation unavailable: %s" % exc)
+            # §16 (#3889) : rien de déposé ; la page renvoie la même clé
+            self._fault("POST " + CHAT, exc)
+            self._error(503, "the conversation is busy: the message will be sent again",
+                        retry=True)
             return
         except Exception as exc:  # noqa: BLE001 — an answer, never a trace
             # `serve.act` keeps the key reserved: the message may be delivered
             self.log_message("conversation input: internal error (%s)", type(exc).__name__)
+            self._fault("POST " + CHAT, exc)
             self._error(500, "internal error: the message may have been delivered; "
                              "check the conversation before sending it again")
             return
@@ -352,13 +419,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
             except ServeError as exc:
                 self._error(exc.status, str(exc))
                 return
-            except (progress.ProgressError, db_mod.DbError, db_mod.Unavailable,
-                    db_mod.SchemaMissing) as exc:
-                self._error(503, "conversation unavailable: %s" % exc)
-                return
             except Exception as exc:  # noqa: BLE001 — an answer, never a trace
-                self.log_message("conversation: internal error (%s)", type(exc).__name__)
-                self._error(500, "internal error")
+                # §16 (#3889) : une panne n'est pas montrée ; la page réessaie
+                self.log_message("conversation: read failed (%s)", type(exc).__name__)
+                self._fault("GET " + CHAT, exc)
+                self._error(503, "the conversation is loading", retry=True)
                 return
             data = json.dumps(page, ensure_ascii=False, sort_keys=True)
             self._send(200, data.encode("utf-8"), "application/json; charset=utf-8")
@@ -376,9 +441,16 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._send(200, data.encode("utf-8"), "application/json; charset=utf-8")
         except ServeError as exc:
             self._error(exc.status, str(exc))
-        except (progress.ProgressError, db_mod.DbError, db_mod.Unavailable,
-                db_mod.SchemaMissing) as exc:
-            self._error(503, "snapshot unavailable: %s" % exc)
+        except Exception as exc:  # noqa: BLE001 — §16 (#3889) : jamais une trace
+            # aucun instantané encore lu (déjà versé au journal par `Snapshots`)
+            self.log_message("snapshot: read failed (%s)", type(exc).__name__)
+            self._error(503, "the data is loading", retry=True)
+
+    def _fault(self, route: str, exc: BaseException) -> None:
+        # le porteur du jeton de la page est un humain (l'owner) : touché
+        if self.faults is not None:
+            self.faults.record(route, exc, subject=server_faults.HUMAN)
+            self.faults.kick()
 
     def _project(self, query: dict) -> str | None:
         values = query.get("project")
@@ -414,14 +486,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
 
 def make_server(snapshots: Snapshots, *, port: int = DEFAULT_PORT, token: str | None = None,
-                project: str | None = None,
-                chat: tuple | None = None) -> http.server.ThreadingHTTPServer:
+                project: str | None = None, chat: tuple | None = None,
+                faults=None) -> http.server.ThreadingHTTPServer:
     """Le serveur, lié à 127.0.0.1 (port 0 : un port libre). Son jeton est
     `server.token` ; un nouveau à chaque appel si `token` n'est pas donné.
     `chat=(read, write)` ouvre la conversation (L83) ; sans lui, tout POST
     reste refusé (405) et la conversation n'est pas servie."""
     token = token or secrets.token_urlsafe(24)
-    attributes = {"snapshots": snapshots, "token": token, "default_project": project}
+    attributes = {"snapshots": snapshots, "token": token, "default_project": project,
+                  "faults": faults}
     if chat:
         attributes["read_chat"] = staticmethod(chat[0])
         attributes["write_chat"] = staticmethod(chat[1])
@@ -445,12 +518,28 @@ def serve(cfg, *, port: int, since: str, stale_after: float, gantt: bool,
           project: str | None = None, versions: bool = True, out=None) -> int:
     """`ameesh progress --serve` : sert jusqu'à Ctrl-C."""
     out = out or sys.stdout
+    from . import serve as serve_mod
+    faults = FaultReporter(
+        server_faults.Journal(os.path.join(cfg.state_dir, "faults-progress.json"),
+                              "ameesh-progress"),
+        serve_mod.db_writer(cfg))
+
+    def on_fault(exc):
+        faults.record("GET " + API, exc, subject=server_faults.HUMAN)
+        faults.kick()
     snapshots = Snapshots(db_builder(cfg, since=since, stale_after=stale_after, gantt=gantt,
-                                     versions=versions))
-    # une première lecture : base injoignable ou schéma absent, dit tout de suite
-    snapshots.get(project)
+                                     versions=versions),
+                          on_fault=on_fault,
+                          on_recovery=lambda: faults.kick(every=REPORT_EVERY_S))
+    # une première lecture : base injoignable ou schéma absent, dit tout de
+    # suite — sans empêcher de servir (§16, #3889) : la page attend les données
+    try:
+        snapshots.get(project)
+    except Exception as exc:  # noqa: BLE001 — déjà au journal par `Snapshots`
+        print("progress --serve: no data yet (%s); the page will show it as soon as it "
+              "can be read" % type(exc).__name__, file=out, flush=True)
     chat = db_chat(cfg)
-    server = make_server(snapshots, port=port, project=project, chat=chat)
+    server = make_server(snapshots, port=port, project=project, chat=chat, faults=faults)
     print("progress page (read-only except the conversation input): %s" % url_of(server),
           file=out, flush=True)
     print("Ctrl-C to stop; a restart draws a new token.", file=out, flush=True)

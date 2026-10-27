@@ -458,6 +458,7 @@ class ContractFallbackTest(unittest.TestCase):
         def hosts(prepared, params_, **kw):
             with open(prepared.path, "r", encoding="utf-8") as fh:
                 seen["plan"] = json.load(fh)
+            seen["profile"] = kw.get("profile")
             return report()
 
         with mock.patch.object(calls, "parameters", return_value=self.parameters()), \
@@ -467,20 +468,30 @@ class ContractFallbackTest(unittest.TestCase):
                                    base=self.repo.base)
         self.assertEqual(got["state"], "green")
         self.assertEqual(seen["plan"]["selection"]["mode"], "contract")
+        # #4008 : le train aussi joue le profil du projet, pas `default`.
+        self.assertEqual(seen["profile"], "ameesh")
         self.assertEqual(got["report"]["fallback"]["cause"], "selection-full")
 
     def test_packet_gate_uses_the_fallback(self):
         # #3800 point (3) : le porteur `integration/**` suit la même règle que
         # le gel d'un lot.
+        seen = {}
+
+        def hosts(prepared, params_, **kw):
+            seen["profile"] = kw.get("profile")
+            return report()
+
         with mock.patch.object(calls, "parameters", return_value=self.parameters()), \
                 mock.patch.object(calls, "map_for", return_value=("", "")), \
-                mock.patch.object(calls, "_run_hosts", return_value=report()):
+                mock.patch.object(calls, "_run_hosts", side_effect=hosts):
             got = calls.gate_packet(
                 None, None, {"id": 3800, "app": "ameesh"},
                 {"sha": self.head, "base": self.repo.base,
                  "branch": "integration/paquet-3800"},
                 repo=self.repo.root)
         self.assertEqual(got["state"], "green")
+        # #4008 : la porte du paquet joue le profil du projet, pas `default`.
+        self.assertEqual(seen["profile"], "ameesh")
         self.assertEqual(got["report"]["fallback"]["cause"], "selection-full")
         self.assertEqual(got["report"]["selection"], "contract")
 
@@ -577,7 +588,8 @@ class RunTest(unittest.TestCase):
                               path=os.path.join(tree, "plan.json"),
                               rel="plan.json", plan={})
 
-    def call(self, validate, *, hosts=("vm1", "vm2"), database=None):
+    def call(self, validate, *, hosts=("vm1", "vm2"), database=None,
+             profile=""):
         prepared = self.fake_prepared()
         block = params(hosts=hosts)
         with mock.patch.object(calls, "prepare", return_value=prepared), \
@@ -588,7 +600,32 @@ class RunTest(unittest.TestCase):
                                       commit="c" * 40, project="ameesh")):
             return calls.run(None, database, 2644, repo=self.repo.root,
                              head=self.repo.head, base=self.repo.base,
-                             project="ameesh", validate=validate)
+                             project="ameesh", profile=profile, validate=validate)
+
+    def test_run_uses_the_project_profile_by_default(self):
+        # #4008 : sans profil nommé, l'automatisme jouait `default` (sans
+        # base) et les contrats tombaient en setUpClass. Le profil du projet
+        # (`ameesh`) porte le venv et la base jetable.
+        seen = {}
+
+        def validate(**kw):
+            seen["profile"] = kw.get("profile")
+            return report()
+
+        got = self.call(validate)
+        self.assertTrue(got["ok"])
+        self.assertEqual(seen["profile"], "ameesh")
+
+    def test_an_explicit_profile_wins(self):
+        seen = {}
+
+        def validate(**kw):
+            seen["profile"] = kw.get("profile")
+            return report()
+
+        got = self.call(validate, profile="postgres")
+        self.assertTrue(got["ok"])
+        self.assertEqual(seen["profile"], "postgres")
 
     def test_transport_unavailability_tries_the_next_host(self):
         seen = []

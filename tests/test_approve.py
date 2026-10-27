@@ -366,7 +366,7 @@ class ApproveFlowTest(ApproveBase):
         self.assertEqual(status, 410)
         status, _headers, text = self.page(path)
         self.assertEqual(status, 410)
-        self.assertIn("already been used", text)
+        self.assertIn("already recorded", text)
         status, receipt = self.fetch_receipt(data["request_id"])
         self.assertEqual(receipt["request"]["decision"], "approve")
 
@@ -1012,10 +1012,16 @@ class ApproveEnrollTest(ApproveBase):
         self.assertIn('member: "human:dave"', proposal)
         self.assertIn("status: proposed", proposal)
         self.assertIn("attestation_verified: false", proposal)
-        # usage unique
+        # usage unique : le même corps renvoyé rend la même proposition (§16,
+        # #3889) ; une autre passkey sur ce lien est refusée
         self.assertEqual(self.page(path)[0], 410)
-        status, _r = self.submit(path, attestation(dave, receipts.b64u_decode(page["challenge"])))
+        status, again = self.submit(path, attestation(dave, receipts.b64u_decode(page["challenge"])))
+        self.assertEqual((status, again.get("proposal"), again.get("replayed")),
+                         (200, result["proposal"], True))
+        status, _r = self.submit(path, attestation(SoftWebAuthn("ES256"),
+                                                   receipts.b64u_decode(page["challenge"])))
         self.assertEqual(status, 410)
+        self.assertEqual(self.proposals(), [result["proposal"]])
 
         # la proposition, une fois reportée au canon (PR fusionnée), fait autorité
         entry = dict(re.findall(r'^  (facade|credential_id|public_key|aaguid|level): (.*)$',

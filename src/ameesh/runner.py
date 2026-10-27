@@ -4231,6 +4231,9 @@ class AgentWorker(threading.Thread):
                                     else budget_mod.PAUSE_PREFIX, marque, raison))
             # #2934 : une note par nature de pause (compte, fenêtre, échéance),
             # pas à chaque variation du pourcentage, qui reste dans `status_text`.
+            # #4020 : la fenêtre courte (#3779 : cooldown, écart de départ,
+            # plafond de tours) retient quelques secondes après chaque tour ;
+            # elle reste dans `status_text`, sans note au fil.
             nature = accounts_mod.pause_nature(raison)
             if nature != self._budget_nature:
                 self._budget_nature = nature
@@ -4239,7 +4242,7 @@ class AgentWorker(threading.Thread):
                                    "the host configuration is fixed (ameesh doctor)."
                                    % raison,
                                    meta={"action": "account_config", "raison": raison})
-                else:
+                elif not account_window.is_short_window(raison):
                     self._fil_note("Budget pause: %s. No turn until the gauge goes "
                                    "back down." % raison,
                                    meta={"action": "budget", "raison": raison})

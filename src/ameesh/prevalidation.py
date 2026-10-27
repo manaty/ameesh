@@ -142,9 +142,12 @@ SECONDS_MARK = "ameesh-prevalidation-seconds="
 PART_MARK = "ameesh-prevalidation-part="
 _SECONDS_RE = re.compile(r"^%s(\d+)\s*$" % re.escape(SECONDS_MARK), re.M)
 _PART_RE = re.compile(r"^%s([A-Za-z0-9_.:-]+)\s*$" % re.escape(PART_MARK), re.M)
-#: note du client offload quand la porte de l'hôte arrête un run (drain)
-_GATE_STOP_RE = re.compile(r"^ameesh offload: stopped on .*: host (?:stopped|draining)\b",
-                           re.M)
+#: notes du client offload quand la porte de l'hôte refuse ou arrête un run
+#: (drain) : avant le départ du job (`refused on …`) comme pendant son cours
+#: (`stopped on …`). Un refus de porte n'est pas une VM absente (#2298).
+_GATE_STOP_RE = re.compile(
+    r"^ameesh offload: (?:stopped on|refused on) .*: host (?:stopped|draining)\b",
+    re.M)
 
 
 def _same_commit(a: str | None, b: str | None) -> bool:
@@ -657,10 +660,11 @@ def classify(exit_code: int, output: str = "") -> str:
     """Le sort du run depuis le code de sortie de l'offload (contrat L159b).
 
     Le code 75 couvre l'absence d'hôte, le refus/arrêt du job **et** la
-    connexion perdue : les notes de l'offload les distinguent. Un run arrêté
-    par la porte de l'hôte (drain, `stopped on … host stopped|draining`) est
-    une `gate-preempted`, jamais un `no-vm` : la VM existe, c'est l'hôte qui a
-    préempté le run (#2298)."""
+    connexion perdue : les notes de l'offload les distinguent. Un job refusé
+    **avant son départ** (`refused on … host stopped|draining`) ou arrêté par
+    la porte de l'hôte (drain, `stopped on … host stopped|draining`) est une
+    `gate-preempted`, jamais un `no-vm` : la VM existe, c'est l'hôte qui a
+    refusé ou préempté le run (#2298, #4008)."""
     code = int(exit_code)
     output = output or ""
     if code == 75 and "lost the connection" in output:

@@ -103,3 +103,25 @@ class BudgetPauseNoteTest(PgTestCase):
             worker.watchdog_stop.set()
         self.assertEqual(len(notes), 3, notes)
         self.assertIn("secondaire", registry.get(self.db, "notes")["status_text"])
+
+    def test_4020_fenetre_courte_sans_note_au_fil(self):
+        """#4020 : l'écart de départ, le cooldown et le plafond de tours (#3779)
+        restent dans `status_text` ; une pause de jauge qui suit a sa note."""
+        _runner, worker = self._worker()
+        courtes = [
+            "account primaire: next turn in 25s (start gap 30s between turns, "
+            "#3779; last start 16:45)",
+            "account primaire: next turn in 26s (start gap 30s between turns, "
+            "#3779; last start 16:46)",
+            "account primaire: short-window cooldown until 16:52 (in 4 min; 3 "
+            "provider 429 in 2 min, shared burst bucket, #3779)",
+            "account primaire: 2/2 concurrent turns (provider burst bucket shared "
+            "by sessions, #3779; running: cx1, cx2)",
+        ]
+        try:
+            notes = self._notes(worker, courtes + [raison(83)])
+        finally:
+            worker.watchdog_stop.set()
+        self.assertEqual(len(notes), 1, notes)
+        self.assertIn("83 %", notes[0][0])
+        self.assertEqual(notes[0][1]["action"], "budget")

@@ -51,7 +51,20 @@
     }
   }
 
+  // -- envoi (canon §16, lot #3889) ----------------------------------------
+  // Une panne du service (réseau, 5xx, 429) n'est pas un refus : le MÊME corps
+  // signé est renvoyé, avec un délai croissant, jusqu'à une réponse définitive.
+  // Le service rend le reçu déjà gardé pour un corps identique : aucun double
+  // effet, et l'humain ne re-signe jamais. Un refus voulu (4xx) est expliqué,
+  // jamais renvoyé.
+  var POST_TIMEOUT_MS = 30000;
+  var RETRY_DELAYS_S = [2, 5, 10, 15, 30, 60];
+
   function post(body) {
+    var controller = typeof AbortController === "function" ? new AbortController() : null;
+    var timer = controller ? setTimeout(function () {
+      controller.abort();
+    }, POST_TIMEOUT_MS) : null;
     return fetch(window.location.pathname, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -59,14 +72,168 @@
       credentials: "omit",
       cache: "no-store",
       redirect: "error",
-      referrerPolicy: "no-referrer"
+      referrerPolicy: "no-referrer",
+      signal: controller ? controller.signal : undefined
     }).then(function (response) {
+      // corps illisible (HTML d'un mandataire, coupé après les en-têtes) :
+      // `data` null, jamais une réponse du service
       return response.json().catch(function () {
-        return {};
+        return null;
       }).then(function (data) {
-        return { ok: response.ok, status: response.status, data: data };
+        return { ok: response.ok, status: response.status,
+                 data: data && typeof data === "object" ? data : null };
       });
+    }).finally(function () {
+      if (timer) {
+        clearTimeout(timer);
+      }
     });
+  }
+
+  function transient(result) {
+    return result.status >= 500 || result.status === 429;
+  }
+
+  // §16 (#3889) : l'accusé vérifiable d'un envoi de ce type — jamais un 2xx
+  // quelconque (cx2, gel #21680)
+  var ACKS = {
+    approve: function (body, d) {
+      return typeof d.request_id === "string" && d.decision === body.decision;
+    },
+    login: function (body, d) {
+      return typeof d.login_id === "string" && (body.decision === "view"
+        ? typeof d.url === "string" : d.decision === body.decision);
+    },
+    enroll: function (body, d) {
+      return typeof d.proposal === "string" && typeof d.key_fingerprint === "string";
+    }
+  };
+
+  // une réponse du service : son accusé, ou son refus nommé (`error`)
+  function verified(kind, body, result) {
+    if (!result.data) {
+      return false;
+    }
+    if (result.ok) {
+      return !!ACKS[kind] && ACKS[kind](body, result.data);
+    }
+    return typeof result.data.error === "string";
+  }
+
+  // Rend la réponse définitive et vérifiée (l'accusé du type `kind`, ou un
+  // refus 4xx du service) ; une panne, ou une réponse illisible ou sans
+  // accusé, repart avec le MÊME corps ; `waiting(n)` est appelé avant chaque
+  // nouvel essai. Ne rejette jamais.
+  function deliver(kind, body, waiting) {
+    var attempt = 0;
+    return new Promise(function (resolve) {
+      function again() {
+        var delay = RETRY_DELAYS_S[Math.min(attempt, RETRY_DELAYS_S.length - 1)];
+        attempt += 1;
+        waiting(attempt);
+        setTimeout(once, delay * 1000);
+      }
+      function once() {
+        post(body).then(function (result) {
+          if (transient(result) || !verified(kind, body, result)) {
+            again();
+          } else {
+            resolve(result);
+          }
+        }, again);
+      }
+      once();
+    });
+  }
+
+  function pendingText() {
+    return "Sending… The service is busy: your signed answer is kept and will be " +
+      "sent by itself. You do not need to sign again.";
+  }
+
+  function refused(result) {
+    return "Refused by the service (" + (result.data.error || result.status) + "): " +
+      (result.data.message || "");
+  }
+
+  // Le corps signé (approbation, passkey d'un enrôlement), gardé sur
+  // l'appareil AVANT l'envoi et jusqu'à la réponse définitive : une page
+  // rechargée, rouverte ou en attente (« Just a moment ») le renvoie d'elle-même.
+  var KEPT_PREFIX = "ameesh-approve:pending:";
+  var KEPT_MAX_AGE_MS = 7 * 86400 * 1000;
+
+  function keep(kind, body) {
+    try {
+      window.localStorage.setItem(KEPT_PREFIX + window.location.pathname,
+        JSON.stringify({ at: Date.now(), kind: kind, body: body }));
+    } catch (e) { /* stockage refusé : l'envoi continue en mémoire */ }
+  }
+
+  function forget() {
+    try {
+      window.localStorage.removeItem(KEPT_PREFIX + window.location.pathname);
+    } catch (e) { /* rien */ }
+  }
+
+  // { kind, body } gardé pour cette page, ou null ; élague les trop anciens
+  function kept() {
+    try {
+      var store = window.localStorage;
+      for (var i = store.length - 1; i >= 0; i--) {
+        var key = store.key(i);
+        if (key && key.indexOf(KEPT_PREFIX) === 0) {
+          var entry = JSON.parse(store.getItem(key) || "null");
+          if (!entry || !(Date.now() - entry.at < KEPT_MAX_AGE_MS)) {
+            store.removeItem(key);
+          }
+        }
+      }
+      var mine = JSON.parse(store.getItem(KEPT_PREFIX + window.location.pathname) || "null");
+      return mine && mine.body ? { kind: mine.kind || "approve", body: mine.body } : null;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  // garde, envoie, renvoie après une panne, oublie à la réponse définitive
+  function sendKept(kind, body, doneText) {
+    setBusy(true);
+    keep(kind, body);
+    deliver(kind, body, function () {
+      say(pendingText(), "pending");
+    }).then(function (result) {
+      forget();
+      if (result.ok) {
+        say(doneText(result), "done");
+      } else {
+        setBusy(false);
+        say(refused(result), "error");
+      }
+    });
+  }
+
+  function enrolled(result) {
+    return "Passkey created. Key fingerprint: " +
+      String(result.data.key_fingerprint || "").slice(0, 16) +
+      ". It will be active after the canon PR is reviewed and merged.";
+  }
+
+  // la page d'attente (service momentanément indisponible) : un corps gardé
+  // part d'ici ; sans lui, elle se recharge seule
+  function waiting(root) {
+    var entry = kept();
+    if (entry) {
+      say("Sending what you signed…");
+      sendKept(entry.kind, entry.body, entry.kind === "enroll" ? enrolled
+        : entry.kind === "login" ? settledLogin : function () {
+          return "Your signed answer is recorded. You can close this page.";
+        });
+      return;
+    }
+    var delay = parseInt(root.dataset.retry || "15", 10) || 15;
+    setTimeout(function () {
+      window.location.reload();
+    }, delay * 1000);
   }
 
   function supported() {
@@ -80,6 +247,20 @@
   // -- approbation ---------------------------------------------------------
   function approval(root) {
     var data = root.dataset;
+
+    function signed(decision) {
+      return decision === "approve"
+        ? (data.kind === "assume-duplicate"
+          ? "Decision signed: you assume the risk of a duplicate. You can close this page."
+          : "Approval signed and recorded. You can close this page.")
+        : "Denial signed and recorded. You can close this page.";
+    }
+
+    function send(body) {
+      sendKept("approve", body, function () {
+        return signed(body.decision);
+      });
+    }
 
     function decide(decision) {
       if (!supported()) {
@@ -99,7 +280,8 @@
         }
       }).then(function (credential) {
         var response = credential.response;
-        return post({
+        say("Sending your signed answer…");
+        send({
           decision: decision,
           credential_id: toB64u(credential.rawId),
           authenticatorData: toB64u(response.authenticatorData),
@@ -107,26 +289,15 @@
           signature: toB64u(response.signature)
         });
       }, function () {
-        throw new Error("cancelled");
-      }).then(function (result) {
-        if (result.ok) {
-          var approved = data.kind === "assume-duplicate"
-            ? "Decision signed: you assume the risk of a duplicate. You can close this page."
-            : "Approval signed and recorded. You can close this page.";
-          say(decision === "approve"
-            ? approved
-            : "Denial signed and recorded. You can close this page.", "done");
-        } else {
-          setBusy(false);
-          say("Refused by the service (" + (result.data.error || result.status) + "): " +
-            (result.data.message || ""), "error");
-        }
-      }).catch(function (error) {
         setBusy(false);
-        say(error && error.message === "cancelled"
-          ? "Signing cancelled or refused by the device."
-          : "Network error: try again.", "error");
+        say("Signing cancelled or refused by the device.", "error");
       });
+    }
+
+    var entry = kept();
+    if (entry && entry.kind === "approve") {
+      say("Sending your signed answer…");
+      send(entry.body);
     }
 
     document.getElementById("approve").addEventListener("click", function () {
@@ -141,6 +312,12 @@
   // Le lien seul est muet : l'URL et le code ne sont demandés au service
   // qu'après une assertion (`view`) acceptée. Ils ne sont jamais écrits dans
   // le document HTML initial, seulement dans ces deux <code> par textContent.
+  function settledLogin(result) {
+    return result.data.decision === "cancel"
+      ? "Cancellation signed and recorded. You can close this page."
+      : "Done signed and recorded. You can close this page.";
+  }
+
   function login(root) {
     var data = root.dataset;
     var privateSection = document.getElementById("login-private");
@@ -148,6 +325,12 @@
     var doneButton = document.getElementById("login-done");
     var cancelButton = document.getElementById("login-cancel");
     var doneChallenge = "";
+
+    var entry = kept();
+    if (entry && entry.kind === "login") {   // done/cancel déjà signé repart
+      say("Sending what you signed…");
+      sendKept("login", entry.body, settledLogin);
+    }
 
     function sign(decision, challenge) {
       setBusy(true);
@@ -163,25 +346,33 @@
           }
         }).then(function (credential) {
           var response = credential.response;
-          post({
+          var body = {
             decision: decision,
             credential_id: toB64u(credential.rawId),
             authenticatorData: toB64u(response.authenticatorData),
             clientDataJSON: toB64u(response.clientDataJSON),
             signature: toB64u(response.signature)
+          };
+          // §16 (#3889) : done/cancel (un reçu) gardés sur l'appareil AVANT
+          // l'envoi et repris au rechargement ; jamais `view` (sa réponse
+          // porte l'URL et le code privés, et elle ne s'écrit nulle part)
+          var final = decision !== "view";
+          if (final) {
+            keep("login", body);
+          }
+          deliver("login", body, function () {
+            say(pendingText(), "pending");
           }).then(function (result) {
+            if (final) {
+              forget();
+            }
             if (result.ok) {
               resolve(result.data);
             } else {
               setBusy(false);
-              say("Refused by the service (" + (result.data.error || result.status) + "): " +
-                (result.data.message || ""), "error");
+              say(refused(result), "error");
               reject(new Error("refused"));
             }
-          }).catch(function () {
-            setBusy(false);
-            say("Network error: try again.", "error");
-            reject(new Error("network"));
           });
         }, function () {
           setBusy(false);
@@ -238,6 +429,11 @@
   // -- enrôlement ----------------------------------------------------------
   function enrollment(root) {
     var data = root.dataset;
+    var entry = kept();
+    if (entry && entry.kind === "enroll") {   // la passkey déjà créée repart
+      say("Sending the new passkey…");
+      sendKept("enroll", entry.body, enrolled);
+    }
     document.getElementById("enroll").addEventListener("click", function () {
       if (!supported()) {
         return;
@@ -265,23 +461,11 @@
         if (typeof response.getTransports === "function") {
           body.transports = response.getTransports();
         }
-        return post(body);
+        say("Sending the new passkey…");
+        sendKept("enroll", body, enrolled);
       }, function () {
-        throw new Error("cancelled");
-      }).then(function (result) {
-        if (result.ok) {
-          say("Passkey created. Key fingerprint: " + String(result.data.key_fingerprint || "").slice(0, 16) +
-            ". It will be active after the canon PR is reviewed and merged.", "done");
-        } else {
-          setBusy(false);
-          say("Refused by the service (" + (result.data.error || result.status) + "): " +
-            (result.data.message || ""), "error");
-        }
-      }).catch(function (error) {
         setBusy(false);
-        say(error && error.message === "cancelled"
-          ? "Creation cancelled or refused by the device."
-          : "Network error: try again.", "error");
+        say("Creation cancelled or refused by the device.", "error");
       });
     });
   }
@@ -298,6 +482,10 @@
     root = document.getElementById("ameesh-enroll");
     if (root) {
       enrollment(root);
+    }
+    root = document.getElementById("ameesh-wait");
+    if (root) {
+      waiting(root);
     }
   });
 })();
