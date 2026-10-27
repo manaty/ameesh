@@ -253,6 +253,13 @@ class Mailbox(interface.Mailbox):
             (recipient, int(limit)),
         )
 
+    def by_idempotency_key(self, sender, recipient, key) -> int | None:
+        rows = self.db.query(
+            "SELECT id FROM agent_mailbox WHERE sender = %s AND recipient = %s"
+            " AND payload->>'idempotency_key' = %s ORDER BY id LIMIT 1",
+            (sender, recipient, key))
+        return int(rows[0]["id"]) if rows else None
+
     def get(self, message_id) -> dict | None:
         rows = self.db.query("SELECT %s FROM agent_mailbox WHERE id = %%s" % MAIL_COLUMNS,
                              (int(message_id),))

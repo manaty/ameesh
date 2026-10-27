@@ -68,6 +68,7 @@ import threading
 import time
 
 from . import config as config_mod
+from . import db as db_mod
 from . import platform
 from .config import NAME_RE, Config
 from .deprecated import DeprecatedAlias
@@ -219,8 +220,13 @@ CLIENT_HELP_TEXT = (
 # L83 : l'écriture serveur d'un message humain dans la conversation
 # --------------------------------------------------------------------------
 
+#: #3889 : un courrier par (expéditeur, destinataire, Idempotency-Key)
+IDEMPOTENT_MAIL_INDEX = "agent_mailbox_idempotency_key_idx"
+
+
 def post_human_message(cfg: Config, db, *, human: str, sender: str, agent: str,
-                       text: str, lot=None, event_id: str | None = None) -> dict:
+                       text: str, lot=None, event_id: str | None = None,
+                       idempotency_key: str = "") -> dict:
     """Le message d'un humain dans la conversation partagée d'un agent (L83).
 
     Le serveur écrit : l'appelant a authentifié `human` (`human:<id>`, le
@@ -238,16 +244,76 @@ def post_human_message(cfg: Config, db, *, human: str, sender: str, agent: str,
 
     `event_id` est stable (`mail:<id>` par défaut) : un rejeu après la
     délivrance ne crée pas de seconde entrée.
+
+    §16 (#3889) : `idempotency_key`, la clé de la requête de l'API, part
+    dans le courrier (`payload.idempotency_key`). C'est l'accusé vérifiable
+    d'une issue restée inconnue : `delivered_human_message` le retrouve et
+    rend la même réponse, sans second envoi. Le dépôt est exclusif par clé
+    (index 0497) : un second exécuteur sous la même clé rend le message déjà
+    déposé, jamais un second courrier.
     """
-    from . import conversation, fil, mail, registry
+    from . import mail, registry
     if not NAME_RE.match(agent or ""):
         raise ValueError("invalid agent name: %r" % (agent,))
     row = registry.get(db, agent)
     work_item_id = None if lot is None else str(lot)
     from . import resident_queue
     sender = resident_queue.human_ref(sender) or sender
-    message_id = mail.send(db, sender, agent, text, host=cfg.host, kind="notify",
-                           payload={"human": True}, work_item_id=work_item_id)
+    payload = {"human": True}
+    if idempotency_key:
+        payload["idempotency_key"] = idempotency_key
+    try:
+        message_id = mail.send(db, sender, agent, text, host=cfg.host, kind="notify",
+                               payload=payload, work_item_id=work_item_id)
+    except db_mod.DbError as exc:
+        # déjà déposé sous cette clé par un autre exécuteur (0497) : le sien
+        if not (idempotency_key and db_mod.is_unique_violation(exc, IDEMPOTENT_MAIL_INDEX)):
+            raise
+        from . import storage
+        mailbox = storage.of(db).mailbox
+        message_id = mailbox.by_idempotency_key(sender, agent, idempotency_key)
+        if message_id is None:
+            raise
+        # la même requête seulement : jamais un reflet d'un autre texte
+        _same_message(mailbox.get(message_id), text, lot)
+    return _reflect_human_message(cfg, db, row=row, human=human, agent=agent, text=text,
+                                  lot=lot, message_id=message_id, event_id=event_id)
+
+
+class KeyReused(ValueError):
+    """L'Idempotency-Key d'un message déjà déposé, pour un autre texte ou lot."""
+
+
+def _same_message(row: dict | None, text: str, lot) -> None:
+    """Le courrier déposé sous une clé est-il ce message (texte et lot) ?"""
+    row = row or {}
+    if (row.get("body") != text
+            or (row.get("work_item_id") or "") != ("" if lot is None else str(lot))):
+        raise KeyReused("this Idempotency-Key was used for another message")
+
+
+def delivered_human_message(cfg: Config, db, *, human: str, sender: str, agent: str,
+                            text: str, lot=None, idempotency_key: str) -> dict | None:
+    """§16 (#3889) : le message déjà délivré sous `idempotency_key` (son
+    reflet dans la conversation complété, idempotent), ou None s'il n'est
+    jamais parti. Jamais un second courrier. Lève `KeyReused` si le courrier
+    de cette clé porte un autre texte ou un autre lot : ce n'est pas la même
+    requête (la réservation de la clé a pu être purgée depuis)."""
+    from . import registry, resident_queue, storage
+    sender = resident_queue.human_ref(sender) or sender
+    mailbox = storage.of(db).mailbox
+    message_id = mailbox.by_idempotency_key(sender, agent, idempotency_key)
+    if message_id is None:
+        return None
+    _same_message(mailbox.get(message_id), text, lot)
+    return _reflect_human_message(cfg, db, row=registry.get(db, agent), human=human,
+                                  agent=agent, text=text, lot=lot, message_id=message_id)
+
+
+def _reflect_human_message(cfg: Config, db, *, row, human: str, agent: str, text: str,
+                           lot, message_id: int, event_id: str | None = None) -> dict:
+    from . import conversation, fil
+    work_item_id = None if lot is None else str(lot)
     log = conversation.Log(db, cfg, agent=agent,
                            project=fil.project_for(cfg, fil.lot_project(db, work_item_id),
                                                    fil.agent_project(row)),

@@ -85,6 +85,102 @@ class ServerCase(unittest.TestCase):
                 out += chunk
 
 
+class StaleSnapshotTest(unittest.TestCase):
+    """§16 (#3889) : une lecture en panne rend le dernier instantané avec son
+    âge, jamais une erreur ; sans instantané, le serveur dit « en cours »."""
+
+    def setUp(self):
+        self.clock = [0.0]
+        self.fail = None
+        self.faults = []
+
+        def build(project):
+            if self.fail is not None:
+                raise self.fail
+            return _projects_snap(project)
+        self.snapshots = progress_serve.Snapshots(build, clock=lambda: self.clock[0],
+                                                  on_fault=self.faults.append)
+
+    def test_dernier_instantane_marque_stale(self):
+        first = self.snapshots.get(None)
+        self.assertNotIn("stale", first)
+        self.clock[0] = 60.0
+        self.fail = db_mod.Unavailable("connection refused to 10.0.0.1")
+        again = self.snapshots.get(None)
+        self.assertTrue(again["stale"])
+        self.assertEqual(again["generated_ts"], first["generated_ts"])
+        self.assertEqual(len(self.faults), 1)
+        # le retour de la base rend un instantané frais
+        self.fail = None
+        self.assertNotIn("stale", self.snapshots.get(None))
+
+    def test_sans_instantane_le_serveur_dit_en_cours(self):
+        self.fail = RuntimeError("secret-detail")
+        server = progress_serve.make_server(self.snapshots, port=0)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        self.addCleanup(thread.join, 5)
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        conn = http.client.HTTPConnection("127.0.0.1", server.server_address[1], timeout=10)
+        with mock.patch("sys.stderr"):
+            conn.request("GET", progress_serve.API, headers={
+                "Host": "127.0.0.1:%d" % server.server_address[1],
+                "Authorization": "Bearer %s" % server.token})
+            resp = conn.getresponse()
+            body = resp.read().decode()
+        conn.close()
+        self.assertEqual(resp.status, 503)
+        self.assertEqual(resp.getheader("Retry-After"), str(progress_serve.RETRY_AFTER))
+        self.assertNotIn("secret-detail", body)
+        self.assertNotIn("error", body)
+        self.assertEqual([type(e) for e in self.faults], [RuntimeError])
+
+
+class FaultReporterTest(unittest.TestCase):
+    """§16 (#3889) : les pannes de la page deviennent des lots `ameesh` par la
+    primitive de #3885, en arrière-plan, sans jamais lever."""
+
+    def setUp(self):
+        import shutil
+        import tempfile
+        from ameesh import server_faults
+        directory = tempfile.mkdtemp(prefix="ameesh-progress-faults-")
+        self.addCleanup(shutil.rmtree, directory, True)
+        self.journal = server_faults.Journal(directory + "/faults.json", "ameesh-progress",
+                                             revision="1")
+        self.opened, self.down = [], [True]
+
+        def write(fn):
+            if self.down[0]:
+                raise db_mod.Unavailable("connection refused")
+            return fn("db")
+
+        def open_lot(db, **fields):
+            self.opened.append(fields)
+            return {"lot": 7, "created": True}
+        self.reporter = progress_serve.FaultReporter(self.journal, write, report=open_lot)
+
+    def test_base_en_panne_puis_rapport_a_la_reprise(self):
+        from ameesh import server_faults
+        self.reporter.record("GET " + progress_serve.API, db_mod.Unavailable("x"),
+                             subject=server_faults.HUMAN)
+        with mock.patch("sys.stderr"):
+            self.reporter.kick(wait=True)
+        self.assertEqual(self.opened, [])
+        self.assertTrue(self.journal.pending)
+        self.down[0] = False
+        self.reporter.kick(wait=True)
+        [fields] = self.opened
+        self.assertEqual((fields["app"], fields["users"], fields["route"]),
+                         ("ameesh", 1, "ameesh-progress GET " + progress_serve.API))
+        self.assertFalse(self.journal.pending)
+        # au plus un rapport par intervalle hors panne
+        self.reporter.record("GET " + progress_serve.API, db_mod.Unavailable("x"))
+        self.reporter.kick(wait=True, every=3600)
+        self.assertEqual(len(self.opened), 1)
+
+
 class ServeTest(ServerCase):
     def test_lie_a_127_0_0_1_seulement(self):
         self.assertEqual(self.server.server_address[0], "127.0.0.1")
@@ -522,12 +618,15 @@ class ConversationGuardTest(unittest.TestCase):
         self.assertNotIn("secret-detail", body)
         self.assertEqual(len(self.calls), 1)
 
-    def test_erreur_imprevue_de_la_lecture_repond_500(self):
+    def test_erreur_imprevue_de_la_lecture_repond_503_a_reessayer(self):
+        """§16 (#3889) : une lecture en panne n'est pas une erreur montrée."""
         self.fail_with = KeyError("secret-detail")
         with mock.patch("sys.stderr"):
             resp, body = self.request("GET", progress_serve.CHAT + "?agent=a1")
-        self.assertEqual(resp.status, 500)
+        self.assertEqual(resp.status, 503)
+        self.assertEqual(resp.getheader("Retry-After"), str(progress_serve.RETRY_AFTER))
         self.assertNotIn("secret-detail", body)
+        self.assertNotIn("error", body)
 
     def test_405_dit_ce_que_dit_allow(self):
         resp, body = self.request("PUT", progress_serve.CHAT, b"{}")

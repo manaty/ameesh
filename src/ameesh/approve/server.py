@@ -109,11 +109,23 @@ _ROUTES = (
     ("login-api", "POST", re.compile(r"^/login-close/(lgn_[0-9a-z]{26})$")),
     ("login-api", "GET", re.compile(r"^/login-receipts/(lgn_[0-9a-z]{26})$")),
     ("health", "GET", re.compile(r"^/health$")),
+    # §16 (#3889) : le journal des pannes, source de la passe `fingerprints` (#3885)
+    ("fingerprints", "GET", re.compile(r"^/fingerprints$")),
     ("approve", "GET POST", re.compile(r"^/a/%s$" % _TOKEN_PATH)),
     ("login", "GET POST", re.compile(r"^/login/%s$" % _TOKEN_PATH)),
     ("enroll", "GET POST", re.compile(r"^/enroll/%s$" % _TOKEN_PATH)),
     ("static", "GET", re.compile(r"^/static/([a-z]+\.(?:js|css))$")),
 )
+#: gabarit de route d'une empreinte de panne (jamais le chemin : il porte le jeton)
+_ROUTE_TEMPLATES = {"api": "/requests|/receipts/<id>", "login-api": "/login-*",
+                    "health": "/health", "approve": "/a/<token>", "login": "/login/<token>",
+                    "enroll": "/enroll/<token>", "static": "/static/<file>",
+                    "fingerprints": "/fingerprints"}
+_SINCE_RE = re.compile(r"^since=([0-9]{1,18})$")
+#: délai suggéré au client avant de renvoyer après une panne (secondes)
+RETRY_AFTER = 15
+#: 503 voulus (une attente, pas une panne) : jamais versés au journal
+WAITING_CODES = frozenset({"enroll_pending"})
 #: un corps refusé mais pas plus gros que ceci est lu et jeté avant la
 #: fermeture (sinon le noyau répond RST et le client perd la réponse)
 DRAIN_LIMIT = 1024 * 1024
@@ -229,13 +241,52 @@ class ApproveHandler(BaseHTTPRequestHandler):
         self._send(status, page.encode("utf-8"), "text/html; charset=utf-8")
 
     def _error(self, kind: str, exc: ApproveError, extra: tuple = ()) -> None:
+        if exc.status >= 500:
+            # §16 (#3889) : une panne n'est pas un refus. La page de lien se
+            # recharge seule ; la réponse JSON dit au client de renvoyer le
+            # MÊME corps (`retry`), jamais de re-signer.
+            extra = extra + (("Retry-After", str(RETRY_AFTER)),)
+            if kind in ("approve", "enroll", "login") and self.command == "GET":
+                return self._html(exc.status, render.unavailable_page(RETRY_AFTER))
+            return self._json(exc.status, {"error": exc.code, "message": exc.message,
+                                           "retry": True}, extra)
         if kind in ("approve", "enroll", "login") and self.command == "GET":
             titles = {404: "Unknown link", 410: "Unusable link", 409: "Obsolete request",
-                      429: "Too many requests", 503: "Service unavailable"}
+                      429: "Too many requests"}
+            if exc.code == "used" and kind == "enroll":   # gardée : pas un échec
+                return self._html(exc.status, render.message_page(
+                    "Passkey already sent", "The passkey of this link is recorded and its "
+                    "proposal awaits review. You can close this page."))
+            if exc.code == "used":
+                return self._html(exc.status, render.message_page(
+                    "Already answered", "An answer to this link is already recorded. "
+                    "You can close this page."))
             self._html(exc.status, render.message_page(
                 titles.get(exc.status, "Error"), exc.message))
         else:
             self._json(exc.status, {"error": exc.code, "message": exc.message}, extra)
+
+    def _fault(self, kind: str | None, exc: BaseException, token: str | None) -> None:
+        """Verse la panne au journal par empreinte : gabarit de route, classe
+        d'exception, version ; le sujet est le lien (condensé), jamais la donnée."""
+        service = self.server.service
+        route = "%s %s" % (self.command, _ROUTE_TEMPLATES.get(kind or "", kind or "?"))
+        service.faults.record(route, exc, subject=service.subject_of(kind or "", token))
+
+    def _fingerprints(self, raw_path: str) -> None:
+        """`GET /fingerprints[?since=N]` : une page `nexlink-fingerprints/1`,
+        au seul porteur du jeton de lecture (route fermée sans lui)."""
+        if self.headers.get("Origin") is not None:
+            raise ApproveError(403, "origin", "fingerprints: no browser allowed")
+        service = self.server.service
+        scheme, _, presented = (self.headers.get("Authorization") or "").partition(" ")
+        if scheme.lower() != "bearer" or not service.check_fingerprints_token(presented.strip()):
+            raise ApproveError(401, "unauthorized", "fingerprints token missing or invalid")
+        query = raw_path.partition("?")[2]
+        match = _SINCE_RE.fullmatch(query) if query else None
+        if query and match is None:
+            raise ApproveError(400, "format", "expected query: since=<cursor>")
+        self._json(200, service.faults.page(match.group(1) if match else None))
 
     # -- méthodes ----------------------------------------------------------
     def do_GET(self) -> None:
@@ -266,6 +317,9 @@ class ApproveHandler(BaseHTTPRequestHandler):
         if len(hosts) != 1:
             return False
         host = hosts[0].strip().lower()
+        if kind == "fingerprints":
+            # lue par la passe de veille d'un autre hôte, en HTTPS (#3885)
+            return host in self.server.local_hosts | self.server.public_hosts
         if kind in ("api", "login-api", "health"):
             allowed = self.server.local_hosts
             if self.server.service.cfg.api_via_public:
@@ -345,6 +399,8 @@ class ApproveHandler(BaseHTTPRequestHandler):
                 raise ApproveError(421, "host", "Host header not allowed")
             if kind == "static":
                 return self._static(value)
+            if kind == "fingerprints":
+                return self._fingerprints(raw_path)
             if kind == "health":
                 if self.headers.get("Origin") is not None:
                     raise ApproveError(403, "origin", "no browser allowed")
@@ -359,14 +415,17 @@ class ApproveHandler(BaseHTTPRequestHandler):
         except ApproveError as exc:
             self._discard_body()
             extra = (("Retry-After", "60"),) if exc.status == 429 else ()
+            if exc.status >= 500 and exc.code not in WAITING_CODES:
+                self._fault(kind, exc, value)
             self._error(kind or "api", exc, extra)
         except (ConnectionError, socket.timeout):
             self.close_connection = True       # client parti : rien à répondre
         except Exception as exc:  # pas de trace (ni de donnée) vers le client
             log.error("internal error %s on %s %s", type(exc).__name__, self.command,
                       redact(path)[:120])
+            self._fault(kind, exc, value)
             self.close_connection = True
-            self._json(500, {"error": "internal", "message": "internal error"})
+            self._error(kind or "api", ApproveError(500, "internal", "internal error"))
 
     def _static(self, name: str) -> None:
         entry = self.server.static.get(name)

@@ -163,6 +163,11 @@ button:disabled {
   font-weight: 600;
 }
 
+/* §16 (#3889) : envoi en cours après une panne, pas une erreur */
+#status.pending {
+  color: var(--warn);
+}
+
 /* défi de connexion (L232d) : la vue privée n'apparaît qu'après assertion */
 .private {
   border: 2px solid var(--warn);

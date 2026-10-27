@@ -103,6 +103,9 @@ CSP = "default-src 'none'; frame-ancestors 'none'"
 #: `Idempotency-Key` of an action (L87), and how long its response is kept
 _IDEMPOTENCY_RE = re.compile(r"^[A-Za-z0-9_-]{8,128}$")
 IDEMPOTENCY_RETENTION_S = 86400
+#: §16 (#3889): a key reserved this long without an outcome is reconciled from
+#: the action's own trace (`Action.outcome`) instead of answering 409 forever
+RECONCILE_AFTER_S = 120.0
 #: event stream (L85): streams at once (below MAX_CONNECTIONS: the other
 #: routes stay reachable), heartbeat, lifetime, events read per query, the
 #: client's reconnection delay, the poll without LISTEN
@@ -159,6 +162,8 @@ class Context:
     organisation: str | None = None
     #: the principal a deputy acts for (0033 §7, team mode L86); local mode: None
     on_behalf_of: str | None = None
+    #: §16 (#3889): the request's Idempotency-Key, while an action runs (`act`)
+    idempotency_key: str = ""
     #: #3397 : `{alerts, at}` snapshot of the alerts route, owned by this
     #: server's context (a new server, a new context: never a shared cache).
     alerts_cache: dict = dataclasses.field(default_factory=dict, compare=False,
@@ -722,7 +727,15 @@ def act(ctx: Context, db, action, params: dict, body: dict, key: str,
     unknown (the server stopped in between): 409, nothing done — retrying with
     a new key could act twice, so check first. A refusal is stored like a
     success (the same request is refused the same way); a transient failure
-    (5xx) releases the key, so the same request can be retried with it."""
+    (5xx) releases the key, so the same request can be retried with it.
+
+    §16 (#3889): an action that leaves a trace under its key (`Action.outcome`,
+    the chat mail) is reconciled once its reservation is RECONCILE_AFTER_S
+    old. One request takes the reservation over (`retake`, atomic); the trace
+    found, its response is stored and replayed; none, the action runs once
+    more under the same key. Its effect must be exclusive per key (the chat
+    mail: index 0497), as the first request may still be running."""
+    ctx = dataclasses.replace(ctx, idempotency_key=key)
     requests = storage.of(db).api_requests
     row = requests.reserve(ctx.human, key, digest, retention_s=IDEMPOTENCY_RETENTION_S)
     if row is not None:
@@ -730,19 +743,87 @@ def act(ctx: Context, db, action, params: dict, body: dict, key: str,
             return 422, _err("idempotency_mismatch",
                              "this Idempotency-Key was used for another request"), False
         if row["status"] is None:
+            settled = _reconcile(ctx, db, action, params, body, key)
+            if settled is not None:
+                return settled
             return 409, _err("idempotency_in_progress",
                              "the first request with this Idempotency-Key has not answered, "
                              "or its outcome is unknown: check before acting again, then "
                              "release the key with `ameesh serve --release-key KEY`"), False
         return row["status"], row["response"], True
+    # §16 (#3889): a new reservation, but the key's trace may outlive its
+    # purge (the page keeps a message and its key 7 days): replayed, not redone
+    if action.outcome is not None:
+        try:
+            settled = _settle(ctx, db, action, params, body, key)
+        except Exception as exc:  # the effect stays exclusive per key
+            log.warning("trace of %s: %s", action.name, type(exc).__name__)
+            settled = None
+        if settled is not None:
+            return settled
+    return _run(ctx, db, action, params, body, key)
+
+
+def _envelope(ctx: Context, action, result: dict) -> dict:
+    return {"schema": "ameesh-action/1", "action": action.name, "by": ctx.human,
+            "for": serve_actions.principal(ctx), "result": result}
+
+
+def _reconcile(ctx: Context, db, action, params: dict, body: dict,
+               key: str) -> tuple[int, dict, bool] | None:
+    """§16 (#3889): the outcome of a reservation left unknown, read from the
+    action's trace under its key; None: still 409 (no trace reader, too
+    recent, or another request settled it first)."""
+    if action.outcome is None:
+        return None
+    requests = storage.of(db).api_requests
+    # one request only takes the abandoned reservation over (its instant
+    # becomes now); the others still answer 409
+    if not requests.retake(ctx.human, key, RECONCILE_AFTER_S):
+        return None
+    try:
+        settled = _settle(ctx, db, action, params, body, key)
+    except Exception as exc:
+        log.warning("reconcile %s: %s", action.name, type(exc).__name__)
+        return None
+    if settled is not None:
+        return settled
+    # no trace yet: the action runs under the same key. A first request still
+    # alive may write its trace meanwhile: the effect is exclusive per key
+    # (`Action.outcome`), so the later of the two returns the earlier's.
+    return _run(ctx, db, action, params, body, key)
+
+
+def _settle(ctx: Context, db, action, params: dict, body: dict,
+            key: str) -> tuple[int, dict, bool] | None:
+    """The key's answer read from the action's trace, stored: the result
+    already produced (200, replayed), or a refusal (another request under the
+    same key); None without a trace. Raises if the trace cannot be read."""
+    requests = storage.of(db).api_requests
+    try:
+        result = action.outcome(ctx, db, params, body)
+    except serve_actions.ActionError as exc:
+        if exc.status >= 500:
+            raise
+        data = _err(exc.code, str(exc))
+        requests.complete(ctx.human, key, exc.status, data)
+        return exc.status, data, False
+    if result is None:
+        return None
+    data = _envelope(ctx, action, result)
+    requests.complete(ctx.human, key, 200, data)
+    return 200, data, True
+
+
+def _run(ctx: Context, db, action, params: dict, body: dict,
+         key: str) -> tuple[int, dict, bool]:
+    requests = storage.of(db).api_requests
     try:
         result = action.build(ctx, db, params, body)
     except serve_actions.ActionError as exc:
         status, data = exc.status, _err(exc.code, str(exc))
     else:
-        status, data = 200, {"schema": "ameesh-action/1", "action": action.name,
-                             "by": ctx.human, "for": serve_actions.principal(ctx),
-                             "result": result}
+        status, data = 200, _envelope(ctx, action, result)
     # any other exception leaves the key reserved: the action may have been
     # done, a retry must not do it twice (409 above). Once the human has
     # checked, `ameesh serve --release-key KEY` frees it (#1497 N2) instead of

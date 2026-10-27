@@ -53,3 +53,10 @@ class ApiRequests(interface.ApiRequests):
         return bool(self.db.query(
             "delete from api_idempotency where human = %s and key = %s and status is null"
             " returning key", (human, key)))
+
+    def retake(self, human, key, older_than_s) -> bool:
+        return bool(self.db.query(
+            "update api_idempotency set created_at = now()"
+            " where human = %s and key = %s and status is null"
+            " and created_at <= now() - %s * interval '1 second' returning key",
+            (human, key, float(older_than_s))))
