@@ -70,7 +70,6 @@ import hashlib
 import hmac
 import json
 import os
-import platform
 import re
 import stat
 import tempfile
@@ -1117,7 +1116,6 @@ def build_projection(source: Source, issue: Mapping, comments: Iterable[Mapping]
         approvers=approvers, approvals=tuple(approvals),
         revocations=tuple(revocations), refusals=tuple(refusals),
         reader={"name": reader or source.reader,
-                "host": platform.node()[:200],
                 "ameesh": _version()})
     # Le digest couvre tout sauf lui-meme.
     digest = hashlib.sha256(jcs.canonicalize(projection._payload())).hexdigest()
