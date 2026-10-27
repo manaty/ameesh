@@ -383,6 +383,7 @@ p.summary { font-size: .86rem; margin: 6px 0; }
   // gardée, rendue à la saisie, renvoyée par l'humain seul.
   var Outbox = (function () {
     var PREFIX = "ameesh-progress:outbox:", MAX_AGE_MS = 7 * 86400 * 1000;
+    var POST_TIMEOUT_MS = 30000;
     var views = {}, flying = {};
     function store() { try { return window.localStorage; } catch (e) { return null; } }
     function slot(m) { return PREFIX + m.agent + "\n" + m.key; }
@@ -410,22 +411,37 @@ p.summary { font-size: .86rem; margin: 6px 0; }
     function view(agent) { return views[agent] || quiet; }
     function delay(n) { return RETRY_MS[Math.min(n, RETRY_MS.length - 1)]; }
     function post(m) {
-      return fetch(CHAT, {method: "POST", credentials: "omit", cache: "no-store",
-                          headers: {"Accept": "application/json",
-                                    "Content-Type": "application/json",
-                                    "Authorization": "Bearer " + TOKEN,
-                                    "Idempotency-Key": m.key},
-                          body: JSON.stringify({agent: m.agent, text: m.text})})
+      // réponse ou corps suspendus (mandataire, connexion à demi morte) : le
+      // délai couvre la requête ET la lecture du corps, puis abandonne ; sans
+      // lui, flying[key] restait vrai et rien ne reprenait le message (cx1)
+      var ctl = typeof AbortController === "function" ? new AbortController() : null;
+      var timer = null;
+      var expired = new Promise(function (_, reject) {
+        timer = setTimeout(function () {
+          if (ctl) { try { ctl.abort(); } catch (e) {} }
+          reject(new Error("timeout"));
+        }, POST_TIMEOUT_MS);
+      });
+      var call = fetch(CHAT, {method: "POST", credentials: "omit", cache: "no-store",
+                              headers: {"Accept": "application/json",
+                                        "Content-Type": "application/json",
+                                        "Authorization": "Bearer " + TOKEN,
+                                        "Idempotency-Key": m.key},
+                              body: JSON.stringify({agent: m.agent, text: m.text}),
+                              signal: ctl ? ctl.signal : undefined})
         .then(function (r) {
           return r.text().then(function (t) {
             var d = {};
             try { d = JSON.parse(t) || {}; } catch (e) { d = {message: t.trim()}; }
             return {status: r.status, data: d};
           });
-        })
-        // réseau coupé, ou corps illisible après les en-têtes (même un 200) :
-        // issue indéterminée, la même clé repart (le serveur rejoue son accusé)
-        .then(null, function () { return {status: 0, data: {}}; });
+        });
+      return Promise.race([call, expired])
+        // réseau coupé, corps illisible après les en-têtes (même un 200) ou
+        // délai dépassé : issue indéterminée, la même clé repart avec le même
+        // corps (le serveur rejoue son accusé), jamais une clé neuve
+        .then(null, function () { return {status: 0, data: {}}; })
+        .then(function (res) { clearTimeout(timer); return res; });
     }
     // l'accusé du serveur pour CE message : l'enveloppe de l'action « chat »,
     // pour son agent, avec le message déposé (jamais la réponse d'une autre

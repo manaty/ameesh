@@ -36,7 +36,7 @@ const localStorage = {
   removeItem(k) { storage.delete(k); },
 };
 const posts = (scenario.posts || []).slice(), reads = (scenario.reads || []).slice();
-const sent = [];
+const sent = [], aborts = [];
 function outbox() {
   return Array.from(storage.keys()).filter((k) => k.startsWith(PREFIX)).map((k) => JSON.parse(storage.get(k)));
 }
@@ -46,8 +46,14 @@ function fetch(url, init) {
                keptBefore: outbox().some((m) => m.key === init.headers["Idempotency-Key"])});
     const a = posts.shift();
     if (a === undefined || a === "network") return Promise.reject(new TypeError("Failed to fetch"));
+    // suspendu : ne se règle qu'à l'abandon du client (AbortController)
+    const hung = () => new Promise((_, reject) => {
+      if (init.signal) init.signal.addEventListener("abort", () => { aborts.push(a.hang ? "fetch" : "body"); reject(new Error("aborted")); });
+    });
+    if (a.hang) return hung();
     return Promise.resolve({status: a.status,
-      text: () => a.bodyFails ? Promise.reject(new TypeError("network error while reading"))
+      text: () => a.bodyHangs ? hung()
+        : a.bodyFails ? Promise.reject(new TypeError("network error while reading"))
         : Promise.resolve(typeof a.body === "string" ? a.body : JSON.stringify(a.body || {}))});
   }
   sent.push({method: "GET"});
@@ -58,7 +64,8 @@ function fetch(url, init) {
 const events = [];
 const ctx = {window: {localStorage}, fetch, JSON, Math, Date, Promise, String, Error,
              encodeURIComponent, CHAT: "/api/conversation.json", TOKEN: "t",
-             RETRY_MS: [1, 1, 1, 1, 1], setTimeout: (fn) => setImmediate(fn)};
+             RETRY_MS: [1, 1, 1, 1, 1], setTimeout: (fn) => setImmediate(fn),
+             clearTimeout: (h) => clearImmediate(h), AbortController};
 vm.createContext(ctx);
 vm.runInContext(block + "\n;this.Outbox = Outbox;", ctx);
 const ui = {sending: (n) => events.push("sending"), sent: (m) => events.push("sent:" + m.text),
@@ -76,7 +83,7 @@ function done(n) {
     if (idle++ < 30) return setImmediate(settle);
     if (scenario.watchLate) ctx.Outbox.watch("a1", ui);
     const pending = ctx.Outbox.pending("a1");
-    process.stdout.write(JSON.stringify({sent, events, input: pending ? pending.text : null,
+    process.stdout.write(JSON.stringify({sent, events, aborts, input: pending ? pending.text : null,
                                          outbox: outbox()}),
                          () => process.exit(0));   // une réconciliation sans fin s'arrête ici
   })();
@@ -300,6 +307,34 @@ class ProgressOutboxTest(unittest.TestCase):
         result = self.run_outbox({"storage": entry(at=0), "steps": ["resume"]})
         self.assertEqual((result["sent"], result["outbox"]), ([], []))
 
+
+    def test_requete_suspendue_abandonnee_puis_accuse_meme_cle(self):
+        """B/P2 (cx1, gel #22297) : une réponse suspendue est abandonnée au
+        délai ; renvoyer le même texte ou reprendre pendant l'attente ne
+        double rien ; la même clé repart et l'accusé l'efface."""
+        result = self.run_outbox({"steps": ["bonjour", "resume", "bonjour"], "posts": [
+            {"hang": True}, {"status": 200, "body": ACK}]})
+        posts = self.posted(result)
+        self.assertEqual(len(posts), 2)
+        self.assertEqual(len({(p["key"], p["text"]) for p in posts}), 1)
+        self.assertEqual(result["aborts"], ["fetch"])
+        self.assertEqual(result["events"][-1], "sent:bonjour")
+        self.assertEqual(result["outbox"], [])
+
+    def test_corps_suspendu_abandonne_puis_accuse_meme_cle(self):
+        result = self.run_outbox({"steps": ["bonjour"], "posts": [
+            {"status": 200, "bodyHangs": True}, {"status": 200, "body": ACK}]})
+        posts = self.posted(result)
+        self.assertEqual(len(posts), 2)
+        self.assertEqual(len({p["key"] for p in posts}), 1)
+        self.assertEqual(result["aborts"], ["body"])
+        self.assertEqual(result["events"][-1], "sent:bonjour")
+        self.assertEqual(result["outbox"], [])
+
+    def test_reponse_a_temps_aucun_abandon(self):
+        result = self.run_outbox({"steps": ["bonjour"], "posts": [{"status": 200, "body": ACK}]})
+        self.assertEqual(result["aborts"], [])
+        self.assertEqual(len(self.posted(result)), 1)
 
 if __name__ == "__main__":
     unittest.main()
