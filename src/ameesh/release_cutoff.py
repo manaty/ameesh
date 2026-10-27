@@ -83,8 +83,10 @@ ATTESTATION_DIR = "mise-a-jour"
 #: staging hosts (canon §14): the three VMs are always proved; the poste may be
 #: reported absent only when the sequence runs from a VM (#3848)
 STAGING_HOSTS = ("ameesh-agents-1", "ameesh-agents-2", "manaty-mesh-1", "pc-smichea")
+STAGING_AGENTS = STAGING_HOSTS[:2]
+STAGING_SERVEUR = STAGING_HOSTS[2]
+STAGING_POSTE = STAGING_HOSTS[3]
 STAGING_VMS = STAGING_HOSTS[:3]
-STAGING_POSTE = "pc-smichea"
 _VERSION_LINE = re.compile(r'^version\s*=\s*"([^"\s]+)"\s*$', re.MULTILINE)
 _SEMVER = re.compile(r"^v?(\d+)\.(\d+)\.(\d+)$")
 _TAG = re.compile(r"^v(\d+)\.(\d+)\.(\d+)$")
@@ -1905,9 +1907,10 @@ def read_attestation(sha: str) -> dict | None:
     reportes = data.get("reportes") or {}
     if not isinstance(hosts, dict) or not isinstance(reportes, dict):
         return None
-    if set(reportes) - {STAGING_POSTE}:
+    if set(reportes) - {STAGING_SERVEUR, STAGING_POSTE}:
         return None
-    requis = set(STAGING_VMS) | ({STAGING_POSTE} - set(reportes))
+    requis = (set(STAGING_AGENTS) | ({STAGING_SERVEUR} - set(reportes))
+              | ({STAGING_POSTE} - set(reportes)))
     if set(hosts) != requis:
         return None
     for host, detail in hosts.items():
@@ -2525,7 +2528,9 @@ def maybe_staging(project: ProjectRelease, release_sha: str, included: list[int]
     attestation = read_attestation(release_sha)
     # Un poste reporte ne prouve pas le staging complet : relancer permet de le
     # mettre a jour au commit actif a son retour, jamais en dessous (#3848).
-    if attestation and not attestation.get("reportes"):
+    # Un serveur sans acces root reporte ne justifie pas de relancer : il n'a
+    # aucun runner, la prochaine release le reprendra s'il redevient joignable.
+    if attestation and STAGING_POSTE not in (attestation.get("reportes") or {}):
         return {"exit": 0, "duration_s": 0.0, "log": "", "summary": [],
                 "attestation": attestation, "skipped": "already attested"}
     return run_staging(project, release_sha, included, state_dir=state_dir)

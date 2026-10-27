@@ -691,6 +691,32 @@ class StagingTest(unittest.TestCase):
         self.assertIn('--lot 917', ligne)
         self.assertIn('--rapporteur docs01', ligne)
 
+    def test_vm_sequence_without_server_access_reports_it(self):
+        """#3848 : sans acces root au serveur, il est reporte comme le poste ;
+        les deux VM d'agents restent requises et attestees."""
+        p = self.run_vm('--absent', 'manaty-mesh-1=sans-acces')
+        self.assertEqual(p.returncode, 0, p.stderr + p.stdout)
+        actions = self.actions()
+        self.assertFalse([a for a in actions if a[0] == 'manaty-mesh-1'], actions)
+        self.assertEqual([a for a in actions if a[1] == 'installer'],
+                         [('ameesh-agents-1', 'installer'),
+                          ('ameesh-agents-2', 'installer')])
+        migrations = [i for i, ligne in enumerate(self.calls())
+                      if ligne.startswith('stub ') and 'bash -s -- %s' % self.sha in ligne]
+        self.assertEqual(len(migrations), 1, self.calls())
+        trace = next(t for t in self.traces()
+                     if t['hote'] == 'manaty-mesh-1' and t['etape'] == 'absent')
+        self.assertEqual(trace['verdict'], 'reporte')
+        self.assertEqual(trace['sha'], self.sha)
+        self.assertIn('sans-acces', trace['detail'])
+        self.assertIn('manaty-mesh-1 : absent', p.stdout)
+        ligne = self.actif_args()
+        self.assertIn('--absent manaty-mesh-1=sans-acces', ligne)
+        self.assertIn('--absent pc-smichea=', ligne)
+        self.assertNotIn('--hote manaty-mesh-1=', ligne)
+        self.assertIn('--hote ameesh-agents-1=', ligne)
+        self.assertIn('--hote ameesh-agents-2=', ligne)
+
     def test_vm_migration_failure_installs_nothing(self):
         """Une migration en echec arrete avant toute installation (#3848)."""
         (self.state / 'scenario').write_text('ko=migration\n')

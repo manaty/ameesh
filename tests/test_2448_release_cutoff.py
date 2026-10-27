@@ -300,6 +300,33 @@ class ReleaseFixture(ReleaseFixtureMixin, unittest.TestCase):
         stage.assert_not_called()
         self.assertEqual(out["skipped"], "already attested")
 
+    def test_reported_server_attestation_is_complete(self):
+        """#147558 : sans acces root, le serveur peut etre reporte ; les deux
+        VM d'agents restent requises et le poste prouve fait sauter la relance."""
+        sha = self.git(self.clone, "rev-parse", "origin/main")
+        folder = self.home / ".local/state/ameesh/mise-a-jour"
+        folder.mkdir(parents=True)
+        path = folder / ("actif-%s.json" % sha[:12])
+        data = {"sha": sha, "date": "2026-10-18T09:00:00Z",
+                "hotes": {hote: {"actif": sha} for hote in (
+                    *release_cutoff.STAGING_AGENTS, release_cutoff.STAGING_POSTE)},
+                "reportes": {"manaty-mesh-1": {"raison": "sans-acces root"}}}
+        path.write_text(json.dumps(data))
+        self.assertIsNotNone(release_cutoff.read_attestation(sha))
+        with mock.patch.object(release_cutoff, "run_staging") as stage:
+            out = release_cutoff.maybe_staging(self.project, sha, [], self.cfg.state_dir)
+        stage.assert_not_called()
+        self.assertEqual(out["skipped"], "already attested")
+        # poste reporte en plus : la relance reste due pour son retour
+        data["reportes"]["pc-smichea"] = {"raison": "poste absent"}
+        data["hotes"].pop("pc-smichea")
+        path.write_text(json.dumps(data))
+        self.assertIsNotNone(release_cutoff.read_attestation(sha))
+        with mock.patch.object(release_cutoff, "run_staging",
+                               return_value={"exit": 0}) as stage:
+            release_cutoff.maybe_staging(self.project, sha, [], self.cfg.state_dir)
+        stage.assert_called_once()
+
     def test_reported_poste_attestation_must_be_exact(self):
         sha = self.git(self.clone, "rev-parse", "origin/main")
         folder = self.home / ".local/state/ameesh/mise-a-jour"

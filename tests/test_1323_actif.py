@@ -138,6 +138,23 @@ def journal_poste_absent(raison='poste absent, mise a jour a son retour',
     return out
 
 
+def journal_deux_vm_absents(raison_serveur='serveur sans acces root',
+                            raison_poste='poste absent, mise a jour a son retour'):
+    """Deux VM d'agents prouvees ; serveur et poste reportes (#147558/#3848)."""
+    out = []
+    for hote in HOTES[:2]:
+        out.append(evenement(hote, 'installer', detail='installe %s' % SHA[:9]))
+        out.append(evenement(hote, 'redemarrer'))
+        out.append(evenement(hote, 'controler'))
+        out.append(evenement(hote, 'sante', detail=detail_sonde(hote)))
+    out.append(evenement('manaty-mesh-1', 'absent', verdict='reporte',
+                         detail=raison_serveur))
+    out.append(evenement('pc-smichea', 'absent', verdict='reporte',
+                         detail=raison_poste))
+    out.append(evenement(None, 'sequence'))
+    return out
+
+
 class ActifTest(unittest.TestCase):
     """actif.py : ce qui merite un signal, et ce qui n'en merite pas."""
 
@@ -201,6 +218,12 @@ class ActifTest(unittest.TestCase):
             out += ['--hote', '%s=%s' % (hote, valeurs[hote])]
             out += ['--mode', '%s=%s' % (
                 hote, 'serveur' if hote == 'manaty-mesh-1' else 'agents')]
+        return out
+
+    def hotes_deux_agents(self):
+        out = []
+        for hote in HOTES[:2]:
+            out += ['--hote', '%s=%s' % (hote, SHA), '--mode', '%s=agents' % hote]
         return out
 
     def attestations(self):
@@ -447,6 +470,38 @@ class ActifTest(unittest.TestCase):
         self.assertIn('mise a jour a son retour', corps)
         self.assertEqual(self.envois[0]['charge']['reportes'], ['pc-smichea'])
 
+    def test_serveur_absent_atteste_les_deux_vm_et_le_mentionne(self):
+        """#147558 : sans acces root, le serveur est reporte comme le poste ;
+        les deux VM d'agents restent la preuve minimale."""
+        self.ecrire(journal_deux_vm_absents(raison_serveur='sans-acces'))
+        code, _, erreur = self.lancer(*self.hotes_deux_agents(),
+                                      '--absent', 'manaty-mesh-1=sans-acces',
+                                      '--absent', 'pc-smichea=poste absent',
+                                      '--rapporteur', 'docs01')
+        self.assertEqual(code, 0, erreur)
+        fichiers = self.attestations()
+        self.assertEqual(len(fichiers), 1, fichiers)
+        attestation = json.loads(fichiers[0].read_text())
+        self.assertEqual(sorted(attestation['hotes']),
+                         ['ameesh-agents-1', 'ameesh-agents-2'])
+        self.assertEqual(sorted(attestation['reportes']),
+                         ['manaty-mesh-1', 'pc-smichea'])
+        self.assertIn('sans-acces', attestation['reportes']['manaty-mesh-1']['raison'])
+        self.assertEqual(attestation['cle'], '%s-2hotes-2reporte' % SHA[:12])
+        corps = self.envois[0]['corps']
+        self.assertIn('manaty-mesh-1 : REPORTE', corps)
+        self.assertIn('sans-acces', corps)
+
+    def test_serveur_absent_sans_trace_refuse(self):
+        self.ecrire([e for e in journal_deux_vm_absents()
+                     if not (e['hote'] == 'manaty-mesh-1')])
+        code, _, erreur = self.lancer(*self.hotes_deux_agents(),
+                                      '--absent', 'manaty-mesh-1=sans-acces',
+                                      '--absent', 'pc-smichea=poste absent')
+        self.assertEqual(code, 3, erreur)
+        self.assertIn('absence', erreur)
+        self.assertEqual(self.envois, [])
+
     def test_absence_non_tracee_refusee(self):
         """Une absence affirmee sans evenement `absent`/`reporte` ne prouve rien."""
         self.ecrire([e for e in journal_poste_absent()
@@ -475,7 +530,7 @@ class ActifTest(unittest.TestCase):
                                       '--absent', 'ameesh-agents-1=absente',
                                       '--rapporteur', 'docs01')
         self.assertEqual(code, 3, erreur)
-        self.assertIn('seul le poste', erreur)
+        self.assertIn('peuvent etre reportes', erreur)
         self.assertEqual(self.envois, [])
 
     def test_absent_sans_raison_refuse_par_argparse(self):

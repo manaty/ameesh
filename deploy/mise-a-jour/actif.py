@@ -10,13 +10,15 @@ le signal que si l'ACTIVATION est prouvee, hote par hote :
   fenetre de cette execution (depuis `--depuis`), chaque evenement portant le
   commit vise (un journal d'une autre execution ne prouve rien) ;
 * aucun `retour` (rollback) dans cette fenetre ;
-* un hote declare absent (`--absent nom=raison`, seul le poste pc-smichea est
-  reportable) est prouve par un evenement `absent`/`reporte` portant le commit
-  vise et une raison, et par AUCUNE preuve d'activation : le staging lance
-  depuis une VM ne peut pas mettre le poste a jour. L'attestation porte alors
-  les trois VM et le champ `reportes` qui nomme l'hote et sa mise a jour a son
-  retour ; un staging complet le remplace plus tard pour le meme commit. Un
-  hote VM absent, une absence non tracee ou contredite ne prouvent rien ;
+* un hote declare absent (`--absent nom=raison`) est prouve par un evenement
+  `absent`/`reporte` portant le commit vise et une raison, et par AUCUNE preuve
+  d'activation. Seuls le poste pc-smichea (mise a jour a son retour) et le
+  serveur manaty-mesh-1 (aucun executant, sans acces root : bureau #147558)
+  sont reportables ; les deux VM d'agents ne le sont jamais. L'attestation
+  porte alors les hotes prouves et le champ `reportes` qui nomme chaque hote
+  et sa mise a jour a son retour ; un staging complet le remplace plus tard
+  pour le meme commit. Un hote VM d'agents absent, une absence non tracee ou
+  contredite ne prouvent rien ;
 * le detail de `sante` est le rapport JSON de `sante-courrier.py` : verdict
   `ok` et sonde reellement remise (message, destinataire, hote destinataire,
   delai), du bon hote et du bon commit — un detail absent, textuel ou
@@ -72,8 +74,12 @@ DEPUIS_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
 HOTES_CANON = ("ameesh-agents-1", "ameesh-agents-2", "manaty-mesh-1", "pc-smichea")
 #: les trois VM : sans leur preuve, aucune attestation
 HOTES_VMS = HOTES_CANON[:3]
-#: seul le poste peut etre declare absent (mise a jour a son retour)
-HOTES_REPORTABLES = ("pc-smichea",)
+#: seuls les hotes sans executant et sans acces root peuvent etre reportes :
+#: le poste (mise a jour a son retour) et le serveur du mesh (aucun runner,
+#: sauvegarde seulement ; acces root a decider par l'owner, bureau #147558)
+HOTES_REPORTABLES = ("manaty-mesh-1", "pc-smichea")
+#: les deux VM d'agents ne sont jamais reportables
+HOTES_AGENTS = HOTES_CANON[:2]
 #: etape de trace qui prouve l'absence declaree d'un hote
 ETAPE_ABSENCE = "absent"
 VERDICT_ABSENCE = "reporte"
@@ -267,18 +273,19 @@ def preuves(evenements: list[dict], sha: str, actifs: dict[str, str],
     non_reportables = sorted(h for h in absents if h not in HOTES_REPORTABLES)
     if non_reportables:
         raise PreuveManquante(
-            "seul le poste peut etre reporte : %s" % ", ".join(non_reportables))
+            "seuls %s peuvent etre reportes : %s"
+            % (", ".join(HOTES_REPORTABLES), ", ".join(non_reportables)))
     contradictoires = sorted(h for h in absents if h in actifs)
     if contradictoires:
         raise PreuveManquante(
             "hote(s) a la fois actif(s) et absent(s) : %s"
             % ", ".join(contradictoires))
     requis = [h for h in HOTES_CANON if h not in absents]
-    if sorted(actifs) != sorted(requis):
+    agents_manquants = [h for h in HOTES_AGENTS if h not in requis]
+    if agents_manquants or sorted(actifs) != sorted(requis):
         raise PreuveManquante(
-            "sequence partielle (%s) : les trois VM%s sont requises"
-            % (", ".join(sorted(actifs)),
-               "" if absents else " et le poste en ligne"))
+            "sequence partielle (%s) : les deux VM d'agents sont requises"
+            % ", ".join(sorted(actifs)))
     retours = [e for e in evenements if e.get("etape") == "retour"]
     if retours:
         raise PreuveManquante("retour/rollback present dans la fenetre (%d evenement(s))"
@@ -516,8 +523,8 @@ def analyseur() -> argparse.ArgumentParser:
     parser.add_argument("--hote", action="append", default=[], metavar="NOM=SHA_ACTIF",
                         help="commit relu actif sur l'hote apres la sequence")
     parser.add_argument("--absent", action="append", default=[], metavar="NOM=RAISON",
-                        help="hote reporte (seul pc-smichea ; une trace %s/%s est exigee)"
-                             % (ETAPE_ABSENCE, VERDICT_ABSENCE))
+                        help="hote reporte (manaty-mesh-1 ou pc-smichea ; une trace %s/%s"
+                             " est exigee)" % (ETAPE_ABSENCE, VERDICT_ABSENCE))
     parser.add_argument("--mode", action="append", default=[], metavar="NOM=MODE",
                         help="mode de l'hote (%s ; defaut %s)"
                              % (", ".join(MODES), MODE_DEFAUT))

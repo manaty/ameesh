@@ -303,11 +303,16 @@ pas seulement depuis le poste. Le poste ne se met à jour qu’en local
 (`poste.sh`, unités systemd du poste) : exécutée ailleurs, `staging.sh` le
 déclare absent (`absent`/`reporte` dans le journal), saute ses étapes
 `verifier`, sauvegarde, `role`, `installer`, `redemarrer`, `controler` et
-`sante`, et n’attend pas son retour. Les trois VM sont déployées normalement ;
-l’attestation porte leurs preuves et le champ `reportes` nomme le poste, la
-raison et sa mise à jour « à son retour, jamais en dessous ». Un poste absent
-ne retient ni staging ni lots ; un poste présent mais omis de `--hotes` reste
-une séquence partielle, sans attestation. Les migrations sont alors appliquées
+`sante`, et n’attend pas son retour. Les hôtes joignables de la séquence sont
+déployés normalement ; l’attestation porte leurs preuves et le champ
+`reportes` nomme le poste, la raison et sa mise à jour « à son retour, jamais
+en dessous ». Un poste absent ne retient ni staging ni lots ; un poste présent
+mais omis de `--hotes` reste une séquence partielle, sans attestation. Un
+**serveur sans accès root** (`manaty-mesh-1`, aucun exécutant, sauvegarde
+seulement) peut être reporté de la même façon avec
+`--absent manaty-mesh-1=raison` : les deux VM d’agents restent requises et
+attestées, le serveur est nommé dans `reportes` ; sans cette option, la
+séquence exige les trois VM. Les migrations sont alors appliquées
 depuis une VM d’agents (`HOTE_MIGRATIONS`, par défaut `ameesh-agents-2`) :
 instantané `git archive` de `src`, `ameesh migrate --dry-run --additive-only`
 puis `--additive-only`, comme le chemin bureau-goal ; un échec arrête avant
