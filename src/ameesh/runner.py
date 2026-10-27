@@ -1115,11 +1115,41 @@ class AgentWorker(threading.Thread):
         # L113 : le travail part au serveur sous le bail, puis le dossier est
         # effacé (même bail perdu : rien ne doit rester sur l'appareil)
         self._depot_push(final=True)
+        self._reserve_restart()
         try:
             registry.release(self.db, self.name, self.runner.runner_id, self.epoch)
         except db_mod.DbError:
             return False
         return True
+
+    def _reserve_restart(self) -> None:
+        """#4086 : un rôle élu rendu parce que l'exécuteur s'arrête (drainage,
+        `vm.sh redemarrer`, code périmé) reste réservé à cet hôte pendant
+        `RESTART_RESERVE_S`, écrit AVANT le retour du bail : l'exécuteur
+        relancé le reprend sans relève croisée et garde sa session. Jamais
+        pour une bascule planifiée (le challenger doit pouvoir réclamer), ni
+        bail perdu, ni une seconde fois. Une écriture impossible ne retient
+        pas l'arrêt : la relève par rang reste la règle."""
+        runner_obj = self.runner
+        if (getattr(self, "_restart_reserved", False) or self.lease_lost.is_set()
+                or str((self.agent or {}).get("releve") or "") != "election"):
+            return
+        stopping = getattr(runner_obj, "restart_pending", None)
+        if stopping is None or not stopping():
+            return
+        if self.name in (getattr(runner_obj, "_handover_released", None) or {}):
+            return
+        self._restart_reserved = True
+        from . import election, role_handover_pg
+        try:
+            role_handover_pg.reserve_restart(self.db, runner_obj.host, self.name,
+                                             election.RESTART_RESERVE_S)
+        except Exception as exc:  # noqa: BLE001 - confort, jamais une garde d'arrêt
+            log_async("[%s] restart reservation not recorded (%s)"
+                      % (self.name, db_mod.brief(exc)))
+            return
+        log_async("[%s] elected role reserved to %s for %ds (executor restart)"
+                  % (self.name, runner_obj.host, int(election.RESTART_RESERVE_S)))
 
     #: délai laissé au harnais entre SIGTERM et SIGKILL
     TERMINATE_GRACE = 3.0
@@ -9334,6 +9364,17 @@ class Runner:
                 self._handover_failed.setdefault(name, {})[challenger] = (
                     now_mono + (until - now_ts))
 
+    def _clear_restart_reservation(self, name: str) -> None:
+        """#4086 : le rôle est repris ; une réservation de redémarrage de cet
+        hôte est consommée (sinon elle retiendrait encore le challenger d'une
+        bascule planifiée qui suivrait). Échec : elle expire d'elle-même."""
+        from . import role_handover_pg as pg
+        try:
+            pg.clear_restart(self.db, self.host, name)
+        except Exception as exc:  # noqa: BLE001 - la réservation est bornée
+            log_async("[%s] restart reservation not cleared (%s)"
+                      % (name, db_mod.brief(exc)))
+
     def note_handover_release(self, name: str, challenger: str,
                               delay_s: float = 0.0) -> None:
         """L165 (EP2) : ce détenteur vient de rendre le rôle pour une bascule.
@@ -9404,6 +9445,16 @@ class Runner:
             self._handover_failed.pop(name, None)
             return ()
         return tuple(sorted(current))
+
+    def restart_pending(self) -> bool:
+        """#4086 : cet exécuteur s'arrête (signal, drainage, code périmé,
+        retrait médié) : un rôle élu qu'il rend reste réservé à l'hôte.
+        Jamais en passage unique ni médié (pas d'élection côté appareil)."""
+        if self.once or self.dry_run or getattr(self, "mediated", False):
+            return False
+        return (self.stop.is_set() or self.draining.is_set()
+                or bool(getattr(self, "restart_for_stale", False))
+                or bool(getattr(self, "sigterm_requested", False)))
 
     def election_claim_allowed(self, agent: dict) -> tuple[bool, str, dict | None]:
         """L165 (EP2) : ce rôle élu peut-il être tenté maintenant, à son rang ?
@@ -9979,6 +10030,8 @@ class Runner:
                     self._release_slot(agent["name"])
                     continue  # un autre exécuteur a gagné la course
                 self._election_free_since.pop(agent["name"], None)
+                if agent.get("releve") == "election":
+                    self._clear_restart_reservation(agent["name"])
                 # L165 (EP1) : un rôle élu peut être réclamé depuis cet hôte
                 # alors que sa ligne était chez un autre candidat ; le worker
                 # doit lire l'hôte et le dossier effectivement acquis.
