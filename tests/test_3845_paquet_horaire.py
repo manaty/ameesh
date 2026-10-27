@@ -474,26 +474,75 @@ class FreshTest(unittest.TestCase):
                 ph.check_fresh(ctx)
 
     def test_main_refuse_sans_aucun_geste(self):
-        saved = (ph.check_fresh, ph.tick)
+        saved = (ph.check_fresh, ph.tick, ph.align_schema)
         ticked = []
         def stale(ctx):
             raise ph.HoraireError("code périmé")
         ph.check_fresh, ph.tick = stale, lambda ctx: ticked.append(ctx) or "x"
+        ph.align_schema = lambda ctx: ticked.append("schéma")
         try:
             with mock.patch.dict(os.environ, {}, clear=False):
                 self.assertEqual(ph.main(["tick", "--repo", str(ROOT)]), 1)
         finally:
-            ph.check_fresh, ph.tick = saved
+            ph.check_fresh, ph.tick, ph.align_schema = saved
         self.assertEqual(ticked, [])
+
+
+class SchemaTest(unittest.TestCase):
+    """#4075 : le tic pose les migrations additives de la tête avant tout geste."""
+
+    def ctx(self, rc, out="", *, dry_run=False):
+        calls = []
+
+        class Py:
+            def run(self, cmd, **kw):
+                calls.append(cmd)
+                return ph.Result(rc, out, "")
+        return ph.Context(repo=ROOT, target="main", project="ameesh", pilot="p",
+                          actor="p", shell=Py(), python="python3", zone=ZONE,
+                          dry_run=dry_run), calls
+
+    def test_pose_additive_depuis_le_src_du_clone(self):
+        ctx, calls = self.ctx(0, "0499_operator_pause_until applied\n1 migration(s) applied\n")
+        ph.align_schema(ctx)
+        self.assertEqual(calls[0][:2], ["python3", "-c"])
+        self.assertEqual(calls[0][3:], [str(ROOT / "src"), "--additive-only"])
+        self.assertTrue(any("0499" in line for line in ctx.log))
+
+    def test_a_jour_silencieux(self):
+        ctx, _ = self.ctx(0, "schema up to date: no migration to apply\n")
+        ph.align_schema(ctx)
+        self.assertEqual(ctx.log, [])
+
+    def test_non_additive_ou_echec_aucun_geste(self):
+        for rc in (3, 1):
+            ctx, _ = self.ctx(rc, "0500_x: NOT additive — DROP COLUMN")
+            with self.assertRaises(ph.HoraireError) as caught:
+                ph.align_schema(ctx)
+            self.assertIn("0500", str(caught.exception))
+
+    def test_essai_lit_seulement(self):
+        ctx, calls = self.ctx(0, "0499_operator_pause_until: additive\n", dry_run=True)
+        ph.align_schema(ctx)
+        self.assertEqual(calls[0][-1], "--dry-run")
+
+    def test_code_reel_charge_le_src_donne(self):
+        # Le code passé à `-c` importe `ameesh.cli` depuis argv[1] ; `--help`
+        # n'exécute jamais `migrate` (cli.main), donc aucune base n'est lue.
+        proc = subprocess.run([sys.executable, "-I", "-c", ph.MIGRATE_CODE,
+                               str(ROOT / "src"), "--help"],
+                              capture_output=True, text=True, timeout=120, cwd=str(ROOT))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertIn("agent-mail migrate", proc.stdout)
 
 
 class GitIdentityTest(unittest.TestCase):
     """#3916 : un HOME sans .gitconfig, la composition commite quand même."""
 
     def test_main_pose_l_identite_du_pilote(self):
-        saved = (ph.check_fresh, ph.tick)
+        saved = (ph.check_fresh, ph.tick, ph.align_schema)
         seen = []
-        ph.check_fresh = lambda ctx: None
+        ph.check_fresh = ph.align_schema = lambda ctx: None
         ph.tick = lambda ctx: seen.append(
             (os.environ.get("GIT_AUTHOR_NAME"),
              os.environ.get("GIT_COMMITTER_EMAIL"))) or "x"
@@ -511,7 +560,7 @@ class GitIdentityTest(unittest.TestCase):
                 self.assertEqual(ph.main(["tick", "--repo", str(ROOT),
                                           "--pilot", "pilote-x"]), 0)
         finally:
-            ph.check_fresh, ph.tick = saved
+            ph.check_fresh, ph.tick, ph.align_schema = saved
         self.assertEqual(seen, [("pilote-x", "pilote-x@ameesh.invalid")])
 
     def test_commit_sans_gitconfig(self):

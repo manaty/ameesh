@@ -12,6 +12,10 @@ recomposer (h-32 : bisect à la main pour #3779). Ce script fait ces gestes, un
 (lots, journal du porteur) et de la forge, si bien qu'un tic perdu, un hôte
 arrêté ou un bail repris par un autre candidat ne laisse rien en suspens.
 
+Avant tout geste, le tic pose les migrations **additives** de la tête que la
+base partagée n'a pas encore (#4075) : sinon le code de la tête lit des
+colonnes absentes. Une migration non additive en attente : aucun geste.
+
 Un tic (la minuterie `deploy/systemd/ameesh-paquet-horaire.timer`, sous
 `ameesh role run`, ne le lance que sur l'hôte qui détient le bail) :
 
@@ -832,6 +836,39 @@ def check_fresh(ctx: Context) -> None:
         raise HoraireError("clone modifié : aucun geste\n%s" % auto._tail(dirty.text, 5))
 
 
+#: `agent-mail migrate` chargé depuis `src` du clone (argv[1]), pas depuis le
+#: paquet installé : ce sont les migrations de la tête qu'il faut poser.
+MIGRATE_CODE = ("import sys; sys.path.insert(0, sys.argv[1]); from ameesh import cli; "
+                "sys.exit(cli.main(['migrate', sys.argv[2]]))")
+
+
+def align_schema(ctx: Context) -> None:
+    """#4075 : la base partagée porte-t-elle les migrations de la tête ?
+
+    Le tic et `paquet-candidats` exécutent le code de la tête exacte de la
+    cible (#3782, `check_fresh`) contre la base partagée. Un paquet qui vient
+    de fusionner une migration rend ce code incompatible avec la base tant que
+    personne ne l'a posée (h-45 : « column operator_pause_until does not
+    exist » à chaque tic, jusqu'à la pose manuelle de 0499). Le tic pose donc
+    d'abord les migrations manquantes de la tête, **additives seulement**
+    (§11 bis : l'ancien code des exécuteurs reste compatible) ; une migration
+    non additive n'est jamais posée ici : aucun geste, le pilote la fait poser.
+    En essai, la liste des manquantes est seulement lue (`--dry-run`).
+    """
+    flag = "--dry-run" if ctx.dry_run else "--additive-only"
+    result = ctx.shell.run([ctx.python, "-c", MIGRATE_CODE, str(ctx.repo / "src"), flag],
+                           cwd=ctx.repo, timeout=COMMAND_TIMEOUT)
+    if result.returncode == 3:
+        raise HoraireError("migration non additive en attente sur la tête de %s : "
+                           "aucun geste, pose au pilote (§11 bis)\n%s"
+                           % (ctx.target, auto._tail(result.text, 10)))
+    if result.returncode != 0:
+        raise HoraireError("migrations de la tête : rc %d : %s"
+                           % (result.returncode, auto._tail(result.text, 10)))
+    if "applied" in result.stdout or ctx.dry_run:
+        ctx.say("schéma : %s" % auto._tail(result.text, 10))
+
+
 def tick(ctx: Context) -> str:
     rows = open_lots(ctx)
     carriers = [row for row in rows if is_carrier(row, ctx.project, ctx.target)]
@@ -896,6 +933,7 @@ def main(argv: list[str] | None = None) -> int:
                   dry_run=args.dry_run, zone=zone)
     try:
         check_fresh(ctx)
+        align_schema(ctx)
         print(tick(ctx), flush=True)
         return 0
     except InputError as error:
