@@ -81,14 +81,17 @@ vm.createContext(context);
 vm.runInContext(fs.readFileSync(script, "utf8"), context);
 document.ready();
 if (scenario.click) listeners[scenario.click]();
-setTimeout(function wait(n) {
-  if (answers.length && n < 50) return setImmediate(wait, (n || 0) + 1);
-  setImmediate(() => setImmediate(() => {
-    process.stdout.write(JSON.stringify({ sent, keptAtSend, status, statuses, reloads,
-      kept: storage.get("ameesh-approve:pending:" + PATH) || null,
-      storage: Array.from(storage.keys()) }), () => process.exit(0));
-  }));
-}, 20);
+// #4032 : attente comptée en tours de boucle, jamais en temps réel (sous
+// charge, 20 ms passaient avant les renvois) : tant qu'une réponse reste et
+// que les envois bougent, puis 30 tours pour les suites de la dernière
+let seen = -1, still = 0, drained = 0;
+setImmediate(function wait() {
+  if (sent.length !== seen) { seen = sent.length; still = 0; } else still += 1;
+  if (answers.length ? still < 200 : drained++ < 30) return setImmediate(wait);
+  process.stdout.write(JSON.stringify({ sent, keptAtSend, status, statuses, reloads,
+    kept: storage.get("ameesh-approve:pending:" + PATH) || null,
+    storage: Array.from(storage.keys()) }), () => process.exit(0));
+});
 """
 
 BODY = {"decision": "approve", "credential_id": "Y3JlZA", "authenticatorData": "YXV0aA",

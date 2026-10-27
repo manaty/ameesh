@@ -27,6 +27,8 @@ activity.
 3. un verdict `blocked` portant sur le dernier gel (même SHA, même quand le
    gel a été renouvelé après l'avis) → `fix` (l'auteur) ;
 4. puis selon l'état : `start`, `build`, `unblock`, `verdict`, `merge`.
+   #4028 : un lot revenu en `build` avec un GO courant (retiré d'un paquet)
+   attend `fix` de son assigné, pas `build`.
 
 #2511 : une fusion d'un lot du canon (branche `canon/…`, dépôt `manaty/home`)
 attend le **bureau**, qui fusionne ce dépôt ; aucun paquet ameesh ne le porte.
@@ -220,6 +222,11 @@ def waiting(item: dict, jalons: dict, actions: Iterable[dict] = (), *,
         # externe, <responsable> »).
         return _waiting("start", assignee or (item.get("external_executor") or None))
     if state == lifecycle.IN_PROGRESS:
+        if jalons.get("verdict_kind") == "ok" and jalons.get("verdict_current"):
+            # #4028 : revenu en build après son GO courant (retiré d'un paquet
+            # pour un test négatif, #3487) : le correctif de l'assigné est dû,
+            # jusqu'au regel qui rend ce GO caduc.
+            return _waiting("fix", assignee)
         return _waiting("build", assignee or (item.get("external_executor") or None))
     # qa : en revue — approuvé par un verdict `ok` courant, ou dispensé de
     # re-verdict par le pilote (#1979 : résolution de composition mécanique,
