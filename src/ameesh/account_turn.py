@@ -580,7 +580,8 @@ def turn_hold(cfg, db, name: str, row: dict, *, now: float | None = None) -> str
     (appelable d'un tour de CLI) :
 
     * la pause DÉJÀ ANNONCÉE par l'exécuteur (`status` `blocked` et
-      `status_text` « budget : … », la règle de `handoff.paused`) : elle vient
+      `status_text` « budget : … », la règle de `handoff.paused`, ou #3973
+      « accounts : … », aucun compte valide sur l'hôte, #3969) : elle vient
       de l'hôte de l'agent, seul à connaître ses comptes — elle vaut donc
       aussi pour un agent d'un autre hôte ;
     * une évaluation FRAÎCHE, quand l'agent est sur CET hôte et que son
@@ -603,6 +604,12 @@ def turn_hold(cfg, db, name: str, row: dict, *, now: float | None = None) -> str
 
     if handoff.paused(row):
         return (row.get("status_text") or "")[len(budget_mod.PAUSE_PREFIX):].strip()
+    # #3973 : le blocage de configuration de comptes annoncé par l'exécuteur
+    # (#3969, aucun compte valide sur l'hôte) tient l'agent comme une pause :
+    # pour un agent distant, c'est la seule trace lisible ici
+    texte = row.get("status_text") or ""
+    if row.get("status") == "blocked" and texte.startswith(accounts.CONFIG_BLOCK_PREFIX):
+        return texte[len(accounts.CONFIG_BLOCK_PREFIX):].strip()
     host = getattr(cfg, "host", None) if cfg is not None else None
     if not host or (row.get("host") or "") != host:
         return ""
