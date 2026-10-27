@@ -1238,6 +1238,13 @@ def transfer_revision(db: Db, *, work_item_id: int, command_id: str,
     `revision_transfer` server verifier must be installed: no
     transfer is possible by default, and the caller never provides its
     result (`_transfer` reserves injection for the test bench).
+
+    #4007: slice C installs it (`process_verifiers.install_verifiers`,
+    contract `revision-transfer/1`). Its proof source is the conditional
+    `approvals` collection of `read_sources` (IMA #704 projection, #4006):
+    the current approval of the exact pinned artifact, cited by the
+    `evidence` (`approval`, `lot`, `project`). The accepted proof lands in the
+    receipt under `verification.facts.proof`.
     """
     return _transfer(db, work_item_id=work_item_id, command_id=command_id,
                      expected_version=expected_version, workflow_ref=workflow_ref,

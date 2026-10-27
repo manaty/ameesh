@@ -1617,7 +1617,7 @@ class RegistryTest(PgTestCase):
 
     @unittest.skipUnless(pv is not None, "slice C (#1924) missing from main")
     def test_real_seam_with_slice_c(self):
-        """With the 15 callables of C installed, the public API makes them talk.
+        """With the 16 callables of C installed, the public API makes them talk.
 
         The real C reads the snapshot via `read_sources(context)`: advance
         guarded by `planning`, hold `blocked` and release by the reserved name
@@ -1631,8 +1631,9 @@ class RegistryTest(PgTestCase):
 
         self.addCleanup(restore)
         names = pv.install_verifiers(pr)
-        self.assertEqual(len(names), len(pv.GUARD_NAMES) + 1)
+        self.assertEqual(len(names), len(pv.GUARD_NAMES) + 2)
         self.assertIn(pr.HOLD_VERIFIER, names)
+        self.assertIn(pr.TRANSFER_VERIFIER, names)      # #4007
 
         lot = self.pinned(stage="draft", state="intake")
         first = pr.apply_command(self.db, self.command(lot), spec=self.spec)

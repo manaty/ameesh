@@ -107,7 +107,12 @@ class SeamTest(unittest.TestCase):
         registry = Registry()
         names = install_verifiers(registry)
         report = capability_report(registry=registry, sources=SOURCES)
-        self.assertEqual(report.executable_guards, names)
+        # #4007 : sans projection d'approbations, le transfert est installe
+        # mais pas executable (fail-closed), les autres le sont.
+        self.assertEqual(report.executable_guards,
+                         tuple(n for n in names if n != "revision_transfer"))
+        self.assertEqual(report.refusal("revision_transfer"),
+                         "source-unavailable")
         self.assertEqual(tuple(cap.guard for cap in report.reserved),
                          RESERVED_VERIFIERS)
         self.assertTrue(report.capability("hold").reserved)
