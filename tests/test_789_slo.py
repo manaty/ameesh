@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import unittest
 
-from ameesh import progress, slo
+from ameesh import packet_link, progress, slo
 
 T0 = 1_700_000_000.0
 
@@ -386,6 +386,35 @@ class MesureTest(unittest.TestCase):
                 item = _item(state=state, assignee="executant", updated_ts=T0)
                 rows = slo.lot_steps(item, _jalons(item, events), events, now=T0 + 7200)
                 self.assertEqual([r for r in rows if r["step"] == "intake_started"], [])
+
+    def test_porteur_en_composition_n_est_pas_en_retard_de_demarrage(self):
+        # #4002 : le porteur d'un paquet horaire reste en intake jusqu'au gel ;
+        # sa première composition enregistrée est son début (cas réel h-41,
+        # #3997 : 16 min en composition, alerte P1 à tort).
+        note = slo.PACKET_COMPOSITION_NOTE + "3 unit(s) aaa..bbb (branch integration/x)"
+        events = [_ev("intake", T0), _ev("intake", T0 + 300, note),
+                  _ev("intake", T0 + 900, note)]
+        item = _item(assignee="pilote", priority=1)
+        rows = slo.lot_steps(item, _jalons(item, events), events, now=T0 + 1200)
+        row = self._row(rows, "intake_started")
+        self.assertEqual(row["done_ts"], T0 + 300)
+        self.assertEqual(row["level"], 0)
+        self.assertEqual(slo.breaches(rows), [])
+
+    def test_note_de_composition_concorde_avec_packet_link(self):
+        # #4002 : le préfixe lu par le SLO est celui qu'écrit l'enregistrement.
+        import inspect
+        self.assertIn('"%s%%d unit(s)' % slo.PACKET_COMPOSITION_NOTE,
+                      inspect.getsource(packet_link))
+
+    def test_porteur_sans_composition_reste_en_retard_de_demarrage(self):
+        # #4002 : sans aucune composition enregistrée, l'alerte reste due.
+        events = [_ev("intake", T0), _ev("intake", T0 + 300, "intention : composition n=1")]
+        item = _item(assignee="pilote", priority=1)
+        rows = slo.lot_steps(item, _jalons(item, events), events, now=T0 + 1200)
+        row = self._row(rows, "intake_started")
+        self.assertNotIn("done_ts", row)
+        self.assertEqual(row["level"], 1)
 
     def test_build_sans_evenement(self):
         events = [_ev("intake", T0), _ev("build", T0 + 600)]
