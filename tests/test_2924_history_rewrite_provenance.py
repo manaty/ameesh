@@ -183,6 +183,52 @@ class IdenticalRewriteTest(_RewriteFixture):
         self.assertIn("2 independent review verdict(s) required", out["why"])
 
 
+class RefreezePriorSelectionTest(_RewriteFixture):
+    """#3948 N/P3 — re-geler un sha déjà gelé ne tronque pas `prior`.
+
+    `prepare` lit avant l'INSERT du jalon avec un id provisoire,
+    `max(id du lot) + 1`, absent des gels. L'ancien repli par sha prenait
+    l'ancien gel du même sha pour tête et ne lisait que les gels qui le
+    précédaient : les gels arrivés depuis n'étaient plus « antérieurs » au
+    nouveau. Un id de tête absent des gels est un nouveau gel ; tous les gels
+    existants lui sont antérieurs.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.repo.write("src/ameesh/runner.py", "base\nlot\nsuite\n")
+        self.head_b = self.repo.commit("impl: suite", agent="impl")
+        self.receipt("impl", "deepseek", [self.head_b])
+        self.freeze_b = self.freeze(self.head_b)
+
+    def test_a_refreeze_of_the_same_sha_reads_every_existing_freeze_as_prior(self):
+        old_a = next(row for row in work.milestones(self.db, self.lot)
+                     if row.get("kind") == "frozen"
+                     and row.get("sha") == self.head_a)
+        new_id = int(self.db.query(
+            "SELECT coalesce(max(id), 0) + 1 AS id"
+            "  FROM work_item_milestones WHERE work_item_id = %s",
+            (self.lot,))[0]["id"])
+        seen = []
+
+        def reading(db, item, freeze, commits, repo, families, **kwargs):
+            seen.append(int(freeze["id"]))
+            return {}, {}, {}, []
+
+        with mock.patch.object(review_authors, "_prior_reading",
+                               side_effect=reading):
+            review_authors._carried_from_previous(
+                self.db, self.lot_item(),
+                {"id": new_id, "sha": self.head_a, "actor": "impl"},
+                [self.head_a], self.repo.root, FAMILIES,
+                base=self.base, head=self.head_a, target=self.base)
+        # L'ancien gel de la tête A est couvert par la plage courante : il
+        # n'est pas relu. Le gel postérieur, lui, doit être lu comme antérieur
+        # au nouveau gel — sinon la frise est tronquée.
+        self.assertNotIn(int(old_a["id"]), seen)
+        self.assertIn(int(self.freeze_b["id"]), seen)
+
+
 class RealCaseMergeTest(_RewriteFixture):
     """Cas réel : B = fusion de A avec une cible avancée, signée deepseek."""
 

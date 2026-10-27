@@ -2654,6 +2654,167 @@ class FreezeReadingOutsideTransactionTest(_ActivationFixture, PgTestCase):
                             for note in notes), notes)
         self.assertEqual(designated(work.get(self.db, self.lot)), [])
 
+    def _prepare_then(self, change):
+        original = act.prepare
+
+        def prepare(*args, **kwargs):
+            inputs = original(*args, **kwargs)
+            change()
+            return inputs
+
+        return mock.patch.object(act, "prepare", side_effect=prepare)
+
+    def test_a_target_change_during_the_reading_does_not_designate(self):
+        # #3948 / relecture cx2 : la cible peut changer pendant les ~140 s de
+        # lecture. Le hook doit refuser la préparation, pas désigner sur
+        # l'ancienne cible.
+        def change():
+            self.db.execute(
+                "UPDATE work_items SET branch_target = %s WHERE id = %s",
+                ("origin/release", self.lot))
+
+        with self._prepare_then(change):
+            row = work.milestone(self.db, self.lot, "frozen", sha=self.frozen,
+                                 actor="author")
+        self.assertEqual(row["kind"], "frozen")
+        notes = self.notes("review-designation-unavailable:")
+        self.assertTrue(any("target changed" in note for note in notes), notes)
+        self.assertEqual(designated(work.get(self.db, self.lot)), [])
+
+    def test_a_freeze_written_during_the_reading_does_not_designate(self):
+        # #3948 / relecture cx2 : un gel concurrent arrive après la lecture des
+        # gels antérieurs ; ses auteurs ne sont pas dans la préparation.
+        def change():
+            self.db.execute(
+                "INSERT INTO work_item_milestones"
+                " (work_item_id, kind, sha, actor, at)"
+                " VALUES (%s, 'frozen', %s, 'author', now())",
+                (self.lot, "b" * 40))
+
+        with self._prepare_then(change):
+            row = work.milestone(self.db, self.lot, "frozen", sha=self.frozen,
+                                 actor="author")
+        self.assertEqual(row["kind"], "frozen")
+        notes = self.notes("review-designation-unavailable:")
+        self.assertTrue(any("a freeze was written" in note for note in notes),
+                        notes)
+        self.assertEqual(designated(work.get(self.db, self.lot)), [])
+
+    def test_an_assignee_change_during_the_reading_does_not_designate(self):
+        # #3948 / relecture cx2 : l'assignation porte l'auteur de référence.
+        def change():
+            self.db.execute(
+                "UPDATE work_items SET assignee = %s WHERE id = %s",
+                ("r1", self.lot))
+
+        with self._prepare_then(change):
+            row = work.milestone(self.db, self.lot, "frozen", sha=self.frozen,
+                                 actor="author")
+        self.assertEqual(row["kind"], "frozen")
+        notes = self.notes("review-designation-unavailable:")
+        self.assertTrue(any("assignee changed" in note for note in notes), notes)
+        self.assertEqual(designated(work.get(self.db, self.lot)), [])
+
+    def test_a_freeze_written_just_before_the_marker_is_still_detected(self):
+        # #3948 / relecture cx2, course fine : un gel concurrent écrit APRÈS
+        # l'id provisoire mais AVANT la capture de la marque. La marque de
+        # préparation doit être bornée comme la lecture (`id < gel`), et se
+        # lire par id : `at` est l'heure de début de transaction, qu'un gel
+        # concurrent plus ancien peut précéder. Sinon la marque contient déjà
+        # le concurrent et le hook le croit lu, alors que ses auteurs n'ont pas
+        # été lus.
+        self.db.execute(
+            "INSERT INTO work_item_milestones"
+            " (work_item_id, kind, sha, actor, at)"
+            " VALUES (%s, 'frozen', %s, 'author', now())",
+            (self.lot, self.base))
+        original = act._latest_freeze_marker
+        inserted = []
+
+        def marker(db, lot, *, before_id=None):
+            if not inserted:
+                inserted.append(True)
+                self.db.execute(
+                    "INSERT INTO work_item_milestones"
+                    " (work_item_id, kind, sha, actor, at)"
+                    " VALUES (%s, 'frozen', %s, 'author',"
+                    "         now() - interval '1 hour')",
+                    (self.lot, "d" * 40))
+            return original(db, lot, before_id=before_id)
+
+        with mock.patch.object(act, "_latest_freeze_marker",
+                               side_effect=marker):
+            row = work.milestone(self.db, self.lot, "frozen", sha=self.frozen,
+                                 actor="author")
+        self.assertEqual(row["kind"], "frozen")
+        notes = self.notes("review-designation-unavailable:")
+        self.assertTrue(any("a freeze was written" in note for note in notes),
+                        notes)
+        self.assertEqual(designated(work.get(self.db, self.lot)), [])
+
+    def test_a_review_floor_raised_during_the_reading_does_not_designate(self):
+        # #3948 / #3557 : un plancher posé pendant la lecture ne doit pas
+        # laisser la préparation désigner avec l'ancien compte d'avis. Canon à
+        # un avis : le plancher 2 dépasse le compte préparé.
+        from ameesh import review_floor
+
+        self.canon = _Canon(
+            os.path.join(self.tmp, "canon-un-avis-" + self._testMethodName),
+            federation=_federation(reviews=1))
+        self.cfg = dataclasses.replace(self.cfg, canon=self.canon.root,
+                                       canon_ref="HEAD")
+        self.db.cfg = self.cfg
+
+        def change():
+            review_floor.set_floor(self.cfg, self.db, self.lot, 2,
+                                   reason="plancher pendant la lecture",
+                                   actor="human:smichea", complete=False)
+
+        with self._prepare_then(change):
+            row = work.milestone(self.db, self.lot, "frozen", sha=self.frozen,
+                                 actor="author")
+        self.assertEqual(row["kind"], "frozen")
+        notes = self.notes("review-designation-unavailable:")
+        self.assertTrue(any("review floor was raised" in note for note in notes),
+                        notes)
+        self.assertEqual(designated(work.get(self.db, self.lot)), [])
+
+
+class FreezeProvisionalProofTest(_ActivationFixture, PgTestCase):
+    """#3948 B2 — le reçu du jalon provisoire n'est jamais lu.
+
+    Un gel hors tour n'a pas de preuve (`proof is None`). L'id provisoire du
+    jalon, `max(id du lot) + 1`, est un bigserial **global** : il désigne en
+    général le jalon d'un autre lot, dont le reçu prouverait à tort la famille
+    du gel. La preuve du gel doit être vide (`{}`), pas absente (`None`).
+    """
+
+    def setUp(self):
+        previous = self.db.cfg
+        super().setUp()
+        self.db.cfg = self.cfg
+        self.addCleanup(setattr, self.db, "cfg", previous)
+
+    def test_an_out_of_turn_freeze_reads_no_foreign_receipt(self):
+        reads = []
+
+        def receipt(provider, db, milestone_id, *, strict):
+            reads.append(int(milestone_id))
+            return {"subject": "milestone:%d" % int(milestone_id),
+                    "sha": self.frozen, "actor": "author", "session": "s",
+                    "turn": "t", "harness": "claude", "record": "r"}
+
+        with mock.patch.object(review_authors, "_milestone_receipt",
+                               side_effect=receipt), \
+                mock.patch.object(prov, "proof_for_current_turn",
+                                  return_value=None):
+            row = work.milestone(self.db, self.lot, "frozen", sha=self.frozen,
+                                 actor="author")
+        self.assertEqual(row["kind"], "frozen")
+        self.assertEqual(reads, [],
+                         "le gel hors tour a lu le reçu d'un id provisoire")
+        self.assertEqual(designated(work.get(self.db, self.lot)), ["r1", "r2"])
+
 
 class FreezeLockWaitTest(_ActivationFixture, PgTestCase):
     """#3836 — un gel n'attend pas un verrou en tenant ceux du mesh.

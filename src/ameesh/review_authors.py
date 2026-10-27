@@ -2840,7 +2840,7 @@ def _carried_from_previous(db, item: Mapping, milestone: Optional[Mapping],
     if head_id:
         current = next((row for row in freezes
                         if int(row.get("id") or 0) == head_id), None)
-    if current is None and head_sha:
+    if current is None and head_sha and not head_id:
         current = next((row for row in reversed(freezes)
                         if plan_git.same_commit(row.get("sha"), head_sha)), None)
     if not head_sha:
@@ -2861,7 +2861,16 @@ def _carried_from_previous(db, item: Mapping, milestone: Optional[Mapping],
     if not head_sha:
         return [], [], []
     target_sha = target_commit(repo, target) or target_commit(repo, base)
-    if current is not None:
+    if head_id:
+        # #3948 (N dev4) : l'id de tête absent des gels est le **nouveau** gel
+        # — `prepare` le prépare avant l'INSERT, au-delà des marques du lot.
+        # Tous les gels existants lui sont antérieurs, y compris quand on
+        # re-gèle un sha déjà gelé : la lecture ne se tronque plus à l'ancien
+        # gel de ce sha (son contenu, et celui des gels arrivés depuis, reste
+        # reportable).
+        prior = [row for row in freezes
+                 if int(row.get("id") or 0) < head_id]
+    elif current is not None:
         prior = [row for row in freezes
                  if int(row.get("id") or 0) < int(current.get("id") or 0)]
     else:
