@@ -53,3 +53,9 @@ class ApiRequests(interface.ApiRequests):
         return bool(self.db.query(
             "delete from api_idempotency where human = %s and key = %s and status is null"
             " returning key", (human, key)))
+
+    def age(self, human, key) -> float | None:
+        rows = self.db.query(
+            "select extract(epoch from now() - created_at)::float8 as age"
+            " from api_idempotency where human = %s and key = %s", (human, key))
+        return float(rows[0]["age"]) if rows else None

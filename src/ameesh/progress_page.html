@@ -371,16 +371,17 @@ p.summary { font-size: .86rem; margin: 6px 0; }
   // outbox:begin — §16 (#3889) : la boîte d'envoi de la conversation.
   // Chaque message a SA propre entrée sur l'appareil (localStorage), écrite
   // avec son Idempotency-Key AVANT l'envoi ; aucun nouvel envoi n'efface un
-  // message non acquitté. Panne (réseau, 503, 429) : renvoi tel quel. Issue
-  // inconnue (500, 502, clé en cours 409) : la page se réconcilie seule — elle
-  // relit la conversation (le message y est : acquitté), sinon renvoie la
-  // MÊME clé, sans jamais la libérer ; jusqu'à l'accusé. Jeton refusé (401) :
-  // gardé, repris par une page rouverte avec le bon jeton. Saisie refusée
-  // (autre 4xx) : gardée, rendue à la saisie, renvoyée par l'humain seul.
+  // message non acquitté. Panne (réseau, corps de réponse illisible, 503,
+  // 429) : renvoi tel quel, même clé. Issue inconnue (500, 502, clé en cours
+  // 409) : la MÊME clé est renvoyée avec un délai croissant, sans jamais la
+  // libérer ; seul l'accusé du serveur POUR CETTE CLÉ (200, rejeu compris)
+  // acquitte — le serveur la réconcilie lui-même (serve.act : le courrier
+  // déposé sous la clé, sinon l'action rejouée sous elle). Un même texte vu
+  // dans la conversation n'acquitte jamais. Jeton refusé (401) : gardé, repris
+  // par une page rouverte avec le bon jeton. Saisie refusée (autre 4xx) :
+  // gardée, rendue à la saisie, renvoyée par l'humain seul.
   var Outbox = (function () {
     var PREFIX = "ameesh-progress:outbox:", MAX_AGE_MS = 7 * 86400 * 1000;
-    //: écart toléré entre l'horloge de la page et celle du serveur (s)
-    var SKEW_S = 120;
     var views = {}, flying = {};
     function store() { try { return window.localStorage; } catch (e) { return null; } }
     function slot(m) { return PREFIX + m.agent + "\n" + m.key; }
@@ -420,26 +421,17 @@ p.summary { font-size: .86rem; margin: 6px 0; }
             try { d = JSON.parse(t) || {}; } catch (e) { d = {message: t.trim()}; }
             return {status: r.status, data: d};
           });
-        }, function () { return {status: 0, data: {}}; });
-    }
-    // le message est-il déjà dans la conversation (issue inconnue levée) ?
-    function delivered(m) {
-      return fetch(CHAT + "?agent=" + encodeURIComponent(m.agent) + "&limit=200",
-                   {credentials: "omit", cache: "no-store",
-                    headers: {"Accept": "application/json", "Authorization": "Bearer " + TOKEN}})
-        .then(function (r) { return r.ok ? r.json() : null; })
-        .then(function (d) {
-          if (!d) return null;   // illisible : ni oui ni non, on réessaie plus tard
-          return (d.entries || []).some(function (e) {
-            return e.kind === "human_message" && e.text === m.text
-              && typeof e.ts === "number" && e.ts >= m.at / 1000 - SKEW_S;
-          });
-        }, function () { return null; });
+        })
+        // réseau coupé, ou corps illisible après les en-têtes (même un 200) :
+        // issue indéterminée, la même clé repart (le serveur rejoue son accusé)
+        .then(null, function () { return {status: 0, data: {}}; });
     }
     function settle(m, res, n) {
       if (res.status === 200) { flying[m.key] = false; drop(m); view(m.agent).sent(m); return; }
       if (res.status === 0 || res.status === 503 || res.status === 429) {
-        m.state = "sending"; write(m);
+        // une issue déjà inconnue le reste : seul un accusé la lève
+        if (m.state !== "checking") m.state = "sending";
+        write(m);
         setTimeout(function () { attempt(m, n + 1); }, delay(n));
         return;
       }
@@ -461,18 +453,11 @@ p.summary { font-size: .86rem; margin: 6px 0; }
       view(m.agent).sending(n);
       post(m).then(function (res) { settle(m, res, n); });
     }
+    // issue inconnue : la MÊME clé, seul juge (rejeu de l'accusé si le
+    // serveur a répondu, 409 tant qu'il ne l'a pas réconciliée)
     function reconcile(m, n) {
       flying[m.key] = true;
-      delivered(m).then(function (yes) {
-        if (yes === true) { flying[m.key] = false; drop(m); view(m.agent).sent(m); return; }
-        if (yes === null) {
-          setTimeout(function () { reconcile(m, n + 1); }, delay(Math.max(n, 2)));
-          return;
-        }
-        // absent de la conversation : la MÊME clé (rejeu si le serveur a
-        // répondu entre-temps, 409 tant que l'issue reste inconnue)
-        post(m).then(function (res) { settle(m, res, n); });
-      });
+      post(m).then(function (res) { settle(m, res, n); });
     }
     function send(agent, text) {
       var mine = of(agent).filter(function (m) { return m.text === text; });

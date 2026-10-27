@@ -104,7 +104,11 @@ class ApproveJsDeliveryTest(unittest.TestCase):
         with open(harness, "w", encoding="utf-8") as fh:
             fh.write(HARNESS)
         out = subprocess.run(["node", harness, os.path.abspath(SCRIPT), json.dumps(scenario)],
-                             capture_output=True, text=True, timeout=60, check=True)
+                             capture_output=True, text=True, timeout=60, cwd=directory)
+        # cwd : le dossier du test — un `node` de mise ne lit pas la
+        # configuration du dépôt, dont la confiance vit dans le vrai
+        # XDG_STATE_HOME que tests.support déplace
+        self.assertEqual(out.returncode, 0, out.stderr[-2000:])
         return json.loads(out.stdout)
 
     def kept(self, body=BODY, at=None):
