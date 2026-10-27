@@ -2403,9 +2403,42 @@ def target_tip(repo: str, target: str, clone=None) -> tuple[str | None, str]:
     return tips[target], where
 
 
-def readiness(db, lot: int, repo: str, *, ci=None, clone=None, project=None,
-              commit_ci=None, full_ci=None, cfg=None, parts=None,
-              packet_exception=None) -> dict:
+#: #3974 : durée au plus de la lecture d'auctorialité d'un lot à l'entrée de
+#: file (balayages `git grep` de `review_authors`) ; au-delà, refus explicite
+#: qui nomme le lot et l'étape, jamais 25 min sans sortie. Les balayages faits
+#: restent dans le cache de l'hôte : l'essai suivant repart plus loin.
+AUTHORS_SWEEP_BUDGET_S = 300.0
+
+
+def readiness(db, lot: int, repo: str, **kwargs) -> dict:
+    """`_readiness`, la lecture d'auctorialité bornée (#3974)."""
+    from . import review_authors
+    with review_authors.sweep_deadline(AUTHORS_SWEEP_BUDGET_S,
+                                       "lot #%d" % int(lot)) as sweep:
+        try:
+            ready = _readiness(db, lot, repo, **kwargs)
+        except review_authors.SweepDeadline as exc:
+            raise QueueError("%s; retry: the sweeps already done are cached on "
+                             "this host" % exc) from exc
+        except QueueError as exc:
+            if not sweep.tripped:
+                raise
+            raise QueueError("lot #%d: the authorship sweep exceeded %d s at step "
+                             "%s (%s); retry: the sweeps already done are cached "
+                             "on this host" % (int(lot), int(AUTHORS_SWEEP_BUDGET_S),
+                                               sweep.tripped, exc)) from exc
+        if sweep.tripped:
+            # une couche a lu l'échéance comme un doute : rien n'est prouvé
+            raise QueueError("lot #%d: the authorship sweep exceeded %d s at step "
+                             "%s; retry: the sweeps already done are cached on "
+                             "this host" % (int(lot), int(AUTHORS_SWEEP_BUDGET_S),
+                                            sweep.tripped))
+    return ready
+
+
+def _readiness(db, lot: int, repo: str, *, ci=None, clone=None, project=None,
+               commit_ci=None, full_ci=None, cfg=None, parts=None,
+               packet_exception=None) -> dict:
     """Checks that `lot` may enter its queue. Returns `{target, frozen_sha,
     pr, class, class_why, waived}`; QueueError says what is missing. Commit ids
     are resolved to full ones before being compared; `ci` (`radar.github_ci(...,
