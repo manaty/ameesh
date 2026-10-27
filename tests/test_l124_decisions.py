@@ -292,6 +292,23 @@ class ReponseTest(_Base):
         self.assertEqual(self.lot_state(), "build")
         self.assertEqual(replay["lot"]["moved"], False)
 
+    def test_un_ancien_etat_partiel_est_rejoue_jusqu_au_lot_et_au_courrier(self):
+        """#3892 : réponse gardée, lot resté waiting_human, courrier absent —
+        la re-saisie identique libère le lot et renvoie le courrier."""
+        view = self.ask()
+        record = {"state": "answered", "answer": {
+            "by": ALICE, "channel": "cli", "text": "a", "option": "a",
+            "option_label": "oui, fusionner maintenant", "ts": time.time(),
+            "host": self.cfg.host, "proof": None}}
+        self.assertIsNotNone(storage.of(self.db).decisions.close(
+            view["id"], status="answered", record=record))
+        self.assertEqual(self.lot_state(), "waiting_human")
+        self.assertEqual(self.db.query("SELECT id FROM agent_mailbox WHERE kind = 'reply'"), [])
+        replay = self.answer(view["id"], "a")
+        self.assertTrue(replay["replayed"])
+        self.assertEqual(self.lot_state(), "build")
+        self.assertEqual(len(self.db.query("SELECT id FROM agent_mailbox WHERE kind = 'reply'")), 1)
+
     def test_une_panne_entre_reponse_et_lot_annule_la_reponse(self):
         """#3892 : clôture et libération du lot sont UNE transaction : une
         panne de la seconde ne laisse pas la réponse seule."""
