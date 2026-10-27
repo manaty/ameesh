@@ -25,7 +25,7 @@ from .support import PgTestCase
 
 def _jalons(**extra):
     jalons = {"verdict_kind": None, "verdict_current": False, "reviewer": None,
-              "blocked_verdicts": 0}
+              "blocked_verdicts": 0, "frozen": 1}
     jalons.update(extra)
     return jalons
 
@@ -138,6 +138,7 @@ class VuesClasseTest(PgTestCase):
         self.lot = int(self.item["id"])
         work.move(self.db, self.lot, "build", actor="auteur")
         work.move(self.db, self.lot, "qa", actor="auteur")
+        work.milestone(self.db, self.lot, "frozen", sha="a" * 40, actor="auteur")
 
     def _book(self):
         return cost.CostBook(state_dir=self.state,

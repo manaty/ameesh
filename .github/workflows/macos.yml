@@ -31,6 +31,9 @@
 # #3026 (macOS vert) décidera de la désignation du check requis macOS, sans
 # ramener la suite longue dans le chemin du paquet.
 #
+# #4063 : le plan une fois (job `plan`, Linux), puis une part psycopg par job
+# macOS, côte à côte ; les huit parts en série dans un job dépassaient 240 min.
+#
 # #3042 : PostgreSQL n'est pas un `service:` — macOS n'a pas de conteneurs —
 # et les outils GNU (findutils pour `find -printf`) viennent de Homebrew, pour
 # donner à la suite le même socle shell que les hôtes Linux qu'elle teste.
@@ -59,8 +62,12 @@ concurrency:
   cancel-in-progress: ${{ github.event.label.name == 'ci-macos' }}
 
 jobs:
-  suite:
-    name: suite macOS complète
+  # #4063 : le plan une fois, sur Linux (la sélection `--mode full` ne dépend
+  # pas de l'OS), puis une part psycopg par job macOS. Les huit parts en série
+  # dans un seul job dépassaient le plafond : runs 40295524043 (part 8 coupée
+  # à 240 min) et 40477342997 (runner perdu après 3 h 34, part 5).
+  plan:
+    name: plan
     # `labeled` se déclenche pour toute étiquette : ici seulement `ci-macos`,
     # sur une tête du dépôt (une fourche n'exécute pas notre code sur un
     # runner hébergé avec le jeton du dépôt).
@@ -70,15 +77,12 @@ jobs:
       || (github.event_name == 'pull_request_target'
           && github.event.label.name == 'ci-macos'
           && github.event.pull_request.head.repo.full_name == github.repository)
-    runs-on: macos-26-intel
-    # 8 parts psycopg exécutées l'une après l'autre : ~90 min de travail
-    # mesuré sous Linux, jusqu'à 3 h 50 mesuré sous macOS. Plafond de 240 min
-    # (sous le maximum GitHub de 6 h) : il ne retient aucun runner de la
-    # flotte et ne bloque aucune fusion.
-    timeout-minutes: 240
-    env:
-      AMEESH_REQUIRE_DB: "1"
-      AMEESH_CI_TETE: ${{ github.event.pull_request.head.sha || github.sha }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      psycopg: ${{ steps.plan.outputs.psycopg }}
+      psycopg_parts: ${{ steps.plan.outputs.psycopg_parts }}
+      plan_sha256: ${{ steps.plan_digest.outputs.sha256 }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -92,6 +96,69 @@ jobs:
           # setup-python écrirait un cache dans la portée de la branche de
           # base à partir du pyproject de la PR (l'auditeur de #3198 l'a
           # écarté ; une suite par nuit ou à la demande n'en a pas besoin).
+      - id: plan
+        name: plan complet (toute la suite, quel que soit le diff)
+        # `--mode full` : la preuve macOS ne dépend pas de la sélection
+        # impactés du lot ; même une PR de documentation passe toute la suite.
+        env:
+          EVENT: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
+          HEAD_REF: ${{ github.head_ref }}
+        run: |
+          python3 scripts/test-plan.py plan --out plan.json --mode full \
+            --event "$EVENT" --base HEAD^1 --ref "$GITHUB_REF" \
+            --base-ref "$BASE_REF" --head-ref "$HEAD_REF" \
+            --github-output "$GITHUB_OUTPUT" --summary "$GITHUB_STEP_SUMMARY"
+      - name: le plan donne des parts psycopg
+        env:
+          PARTS: ${{ steps.plan.outputs.psycopg_parts }}
+        run: |
+          case "$PARTS" in
+            ''|0)
+              echo "::error::le plan complet ne donne aucune part psycopg" >&2
+              exit 1 ;;
+          esac
+      - id: plan_digest
+        name: empreinte du plan (canal artefacts, #1256 B4)
+        run: echo "sha256=$(sha256sum plan.json | awk '{print $1}')" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: plan
+          path: plan.json
+          retention-days: 3
+
+  suite:
+    name: suite macOS complète ${{ matrix.part }}/${{ needs.plan.outputs.psycopg_parts }}
+    needs: plan
+    if: >-
+      github.event_name == 'schedule'
+      || github.event_name == 'workflow_dispatch'
+      || (github.event_name == 'pull_request_target'
+          && github.event.label.name == 'ci-macos'
+          && github.event.pull_request.head.repo.full_name == github.repository)
+    runs-on: macos-26-intel
+    strategy:
+      # N1 de la revue #393 : toutes les parts tournent avant l'échec ; une
+      # part rouge n'annule pas les autres.
+      fail-fast: false
+      matrix:
+        part: ${{ fromJSON(needs.plan.outputs.psycopg) }}
+    # Une part : 20 à 47 min mesurées sous macOS (runs 40176501547,
+    # 40477342997), plus ~5 min d'installation. 90 min laissent la marge d'un
+    # runner lent sans retenir une part bloquée pendant des heures.
+    timeout-minutes: 90
+    env:
+      AMEESH_REQUIRE_DB: "1"
+      AMEESH_CI_TETE: ${{ github.event.pull_request.head.sha || github.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0  # des tests lisent l'historique du dépôt
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          # #3207 : pas de cache pip (voir le job plan).
       - name: PostgreSQL et outils GNU (Homebrew)
         env:
           HOMEBREW_NO_AUTO_UPDATE: "1"
@@ -138,27 +205,15 @@ jobs:
           'cryptography>=41' 'pyyaml>=6' 'coverage>=7.10'
       - name: paquet importable par les sous-processus hors du dépôt
         run: python -m pip install --no-deps -e .
-      - id: plan
-        name: plan complet (toute la suite, quel que soit le diff)
-        # `--mode full` : la preuve macOS ne dépend pas de la sélection
-        # impactés du lot ; même une PR de documentation passe toute la suite.
-        env:
-          EVENT: ${{ github.event_name }}
-          BASE_REF: ${{ github.base_ref }}
-          HEAD_REF: ${{ github.head_ref }}
-        run: |
-          python3 scripts/test-plan.py plan --out plan.json --mode full \
-            --event "$EVENT" --base HEAD^1 --ref "$GITHUB_REF" \
-            --base-ref "$BASE_REF" --head-ref "$HEAD_REF" \
-            --github-output "$GITHUB_OUTPUT" --summary "$GITHUB_STEP_SUMMARY"
-      - name: le plan donne des parts psycopg
-        run: |
-          case "${{ steps.plan.outputs.psycopg_parts }}" in
-            ''|0)
-              echo "::error::le plan complet ne donne aucune part psycopg" >&2
-              exit 1 ;;
-          esac
-      - name: suite complète (pilote psycopg)
+      - uses: actions/download-artifact@v4
+        with:
+          name: plan
+          path: ${{ runner.temp }}
+      - name: le plan téléchargé est celui du plan (empreinte, #1256 B4)
+        # L'empreinte vient de la sortie du job plan, qu'aucun autre job ne
+        # réécrit : une part dont le plan ne correspond pas n'exécute rien.
+        run: echo "${{ needs.plan.outputs.plan_sha256 }}  $RUNNER_TEMP/plan.json" | shasum -a 256 -c -
+      - name: part ${{ matrix.part }}/${{ needs.plan.outputs.psycopg_parts }} (pilote psycopg)
         env:
           AMEESH_DRIVER: psycopg
           AMEESH_TEST_DSN: postgresql://ameesh@127.0.0.1:5432/ameesh
@@ -168,15 +223,5 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p "$TMPDIR"
-          parts="${{ steps.plan.outputs.psycopg_parts }}"
-          rc=0
-          part=1
-          while [ "$part" -le "$parts" ]; do
-            python3 scripts/test-parts.py run --plan plan.json \
-              --part "$part" --driver psycopg || rc=1
-            part=$((part + 1))
-          done
-          if [ "$rc" -ne 0 ]; then
-            echo "::error::une ou plusieurs parts psycopg ont échoué (voir les tests ci-dessus)" >&2
-          fi
-          exit "$rc"
+          python3 scripts/test-parts.py run --plan "$RUNNER_TEMP/plan.json" \
+            --part ${{ matrix.part }} --driver psycopg

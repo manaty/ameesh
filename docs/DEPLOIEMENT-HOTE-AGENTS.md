@@ -317,7 +317,20 @@ séquence exige les quatre VM. Les migrations sont alors appliquées
 depuis une VM d’agents (`HOTE_MIGRATIONS`, par défaut `ameesh-agents-2`) :
 instantané `git archive` de `src`, `ameesh migrate --dry-run --additive-only`
 puis `--additive-only`, comme le chemin bureau-goal ; un échec arrête avant
-toute installation. Lancée hors du poste et des VM d’agents (bureau-goal,
+toute installation. Le clone de travail des migrations (`DEPOT_VM`, par défaut
+`~/work/ameesh-release`) doit exister sur `HOTE_MIGRATIONS`, sous le compte
+`ameesh` : le préflight le vérifie avant la sauvegarde, les migrations et tout
+arrêt d’exécuteur ; absent ou illisible, la séquence s’arrête sur un refus
+nommé qui donne le geste exact, sans retour automatique et sans rien modifier.
+Provisionner un hôte neuf comprend donc ce clone complet (jamais `--depth` ni
+`--shallow`, canon §7) :
+
+```sh
+ssh root@<vm> 'runuser -u ameesh -- git clone https://github.com/manaty/ameesh.git /home/ameesh/work/ameesh-release'
+```
+
+Un `DEPOT_VM` différent se déclare dans l’environnement du lanceur. Lancée hors
+du poste et des VM d’agents (bureau-goal,
 sans venv ameesh ni route vers la base), la séquence fait tourner la sonde de
 courrier et la notification sur `HOTE_OUTILS` (par défaut `HOTE_MIGRATIONS`),
 par ssh, sous l’utilisateur `ameesh`, avec l’instantané du commit (#3976). Une

@@ -52,10 +52,12 @@ class MergedSloTest(_Base):
         self.db.execute("UPDATE work_items SET branch = 'lot/3512-test',"
                         " branch_target = 'main', branch_head = %s WHERE id = %s",
                         (self.head, self.lot["id"]))
+        # Replace the QA helper's synthetic freeze with this repository's head;
+        # a second, older freeze would leave the synthetic one authoritative.
         self.db.execute(
-            "INSERT INTO work_item_milestones (work_item_id, kind, at, sha, note)"
-            " VALUES (%s, 'frozen', now() - interval '3 hours', %s, %s)",
-            (self.lot["id"], self.head, "ameesh-freeze-absent: main"))
+            "UPDATE work_item_milestones SET sha = %s, note = %s"
+            " WHERE work_item_id = %s AND kind = 'frozen'",
+            (self.head, "ameesh-freeze-absent: main", self.lot["id"]))
         self.db.execute("UPDATE work_item_milestones SET sha = %s"
                         " WHERE work_item_id = %s AND kind = 'verdict'",
                         (self.head, self.lot["id"]))

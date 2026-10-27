@@ -2916,7 +2916,9 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                 prevalidation_calls.after_freeze(
                     cfg, db, args.id, row.get("sha") or args.sha or "",
                     repo=args.repo or "",
-                    map_path=args.prevalidation_map or "")
+                    map_path=args.prevalidation_map or "",
+                    deadline=prevalidation_calls.caller_deadline(
+                        getattr(args, "prevalidation_budget", None)))
             return 0
         print(USAGE_HINT % "unknown work subcommand", file=sys.stderr)
         return 2
@@ -3599,6 +3601,12 @@ def build_parser() -> argparse.ArgumentParser:
                           help="#2644: measured map (carte.json.gz) for the L161f plan; "
                                "absent, the last carte artifact is used, or the prevalidation "
                                "is reported unavailable (never blocking)")
+    p_ci_run.add_argument("--prevalidation-budget", type=float, default=None,
+                          metavar="SECONDS",
+                          help="#4067: the whole packet prevalidation (host queue "
+                               "included) returns within SECONDS (default 420, under the "
+                               "composer's 600 s); spent, it is unavailable (timeout), "
+                               "never blocking, and the remote job is cancelled")
     p_ci_run.add_argument("--dry-run", action="store_true",
                           help="decide and print, pose no label")
     p_ci_run.add_argument("--json", action="store_true", help="`ameesh-ci-gel/1` report")
@@ -4194,6 +4202,12 @@ def build_parser() -> argparse.ArgumentParser:
     pw_ms.add_argument("--prevalidation-map", default="",
                        help="#2644: measured map (carte.json.gz) for the freeze "
                             "prevalidation; default: the last carte artifact")
+    pw_ms.add_argument("--prevalidation-budget", type=float, default=None,
+                       metavar="SECONDS",
+                       help="#4067: the freeze prevalidation (host queue included) "
+                            "returns within SECONDS (default 420, under the composer's "
+                            "600 s); spent, it is journalled unavailable (timeout) and "
+                            "the remote job is cancelled; the freeze stays written")
     pw_ms.add_argument("--no-static-checks", dest="no_static_checks", default=None,
                        metavar="REASON",
                        help="frozen: freeze without the project's static checks "

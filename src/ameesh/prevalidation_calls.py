@@ -86,6 +86,34 @@ TRAIN_RUN_TIMEOUT = 1200
 TRAIN_LOCK_MARGIN = 300.0
 #: borne du nettoyage d'un arbre préparé (retrait du worktree git)
 TRAIN_CLEANUP_TIMEOUT = 120
+#: #4067 : budget entier d'une prévalidation appelée par un gel
+#: (``work milestone frozen``) ou une demande de CI (``ci run``), file
+#: d'attente de l'hôte comprise. Le compositeur borne ces commandes à 600 s
+#: (``FREEZE_TIMEOUT`` de paquet-auto, ``COMMAND_TIMEOUT`` de paquet-horaire) ;
+#: sans échéance, l'offload attendait jusqu'au ``timeout_seconds`` du canon
+#: (3600 s) et la commande était tuée avant de rendre la main. L'appelant peut
+#: la régler (``--prevalidation-budget``) ; épuisée, elle est ``run-incomplete``
+#: (« timeout »), indisponible, jamais un rouge.
+CALLER_BUDGET_S = 420.0
+
+
+def caller_deadline(budget: float | None = None, clock=time.monotonic) -> Deadline:
+    """L'échéance d'une prévalidation appelée par un gel ou un ``ci run``."""
+    seconds = CALLER_BUDGET_S if budget is None else float(budget)
+    return Deadline(max(0.0, seconds), clock=clock)
+
+
+def _timeout_error(deadline: Deadline, where: str) -> prevalidation.PrevalidationError:
+    """Une échéance de l'appelant épuisée : indisponible, motif ``timeout``."""
+    return prevalidation.PrevalidationError("run-incomplete", _timed_out(deadline, where))
+
+
+def _timed_out(deadline: Deadline | None, why: str) -> str:
+    """``why`` préfixé de « timeout » quand l'échéance de l'appelant est épuisée."""
+    if deadline is None or not deadline.expired() or str(why).startswith("timeout"):
+        return why
+    head = "timeout — budget de l'appelant (%d s) épuisé" % round(deadline.at - deadline.started)
+    return "%s%s" % (head, (" " + why) if why else "")
 
 
 def train_deadline(clock=time.monotonic) -> Deadline:
@@ -808,7 +836,7 @@ def describe(report: dict) -> str:
 def run(cfg, db, lot: int, *, repo: str, head: str, base: str, project: str,
         branch: str = "", map_path: str = "", repo_slug: str = "", profile: str = "",
         record: bool = True, say=None, warn=None, executable: str = "ameesh",
-        validate=None) -> dict:
+        validate=None, deadline: Deadline | None = None) -> dict:
     """Le geste complet : canon, plan du candidat, run sur les hôtes, rapport.
 
     Les hôtes du canon sont essayés dans l'ordre quand l'indisponibilité est
@@ -823,9 +851,20 @@ def run(cfg, db, lot: int, *, repo: str, head: str, base: str, project: str,
     base jetable). Un automatisme qui ne le nommait pas jouait le profil
     `default`, sans base : les contrats tombaient en `setUpClass` et la
     prévalidation rendait un faux rouge (#4008).
+
+    Avec ``deadline`` (#4067), le passage entier — canon, carte, plan, run
+    sur l'hôte (attente de la file comprise), nettoyage — lit la même
+    échéance : le job distant est annulé à l'échéance (``--wait-timeout``) et
+    le geste rend ``run-incomplete`` (« timeout ») dans le délai de l'appelant.
     """
     profile = (profile or project or "").strip()
-    params = parameters(cfg, project)
+    params = parameters(cfg, project, deadline=deadline)
+    if deadline is not None:
+        cap = int(getattr(params.params, "timeout_seconds", 0) or 0)
+        governed = int(max(1.0, min(cap or deadline.remaining(), deadline.remaining())))
+        params = Parameters(params=replace(params.params, timeout_seconds=governed),
+                            repo=params.repo, commit=params.commit,
+                            project=params.project)
     if not repo:
         raise prevalidation.PrevalidationError(
             "selection-unsafe", "aucun arbre ne porte la tête %s" % (head or "?")[:12])
@@ -839,21 +878,28 @@ def run(cfg, db, lot: int, *, repo: str, head: str, base: str, project: str,
         raise prevalidation.PrevalidationError(
             "no-vm", "aucun hôte de prévalidation autorisé (%s)"
             % ", ".join(declared))
-    tooling(repo, head, params)
-    carte, cleanup = map_for(repo_slug, repo, explicit=map_path)
+    tooling(repo, head, params, deadline=deadline)
+    carte, cleanup = map_for(repo_slug, repo, explicit=map_path, deadline=deadline)
     prepared = None
     try:
-        prepared = prepare(repo, head, base, map_path=carte)
-        fallback = contract_fallback(prepared, params, head=head, base=base)
+        if deadline is not None and deadline.expired():
+            raise _timeout_error(deadline, "avant l'arbre du SHA")
+        prepared = prepare(repo, head, base, map_path=carte, deadline=deadline)
+        fallback = contract_fallback(prepared, params, head=head, base=base,
+                                     deadline=deadline)
+        if deadline is not None and deadline.expired():
+            raise _timeout_error(deadline, "avant l'hôte")
         report = _run_hosts(prepared, params, lot=lot, head=head, base=base,
                             branch=branch, profile=profile, say=say,
-                            executable=executable, validate=validate)
+                            executable=executable, validate=validate,
+                            deadline=deadline)
         if fallback:
             report.setdefault("fallback", fallback)
             report.setdefault("selection", "contract")
     finally:
         if prepared is not None:
-            prepared.close()
+            prepared.close(timeout=TRAIN_CLEANUP_TIMEOUT if deadline is None
+                           else max(1.0, deadline.timeout(TRAIN_CLEANUP_TIMEOUT)))
         if cleanup:
             shutil.rmtree(cleanup, ignore_errors=True)
     if record and db is not None \
@@ -931,7 +977,8 @@ def _run_hosts(prepared: Prepared, params: Parameters, *, lot: int, head: str,
 # --------------------------------------------------------------------------
 
 def gate_packet(cfg, db, item, decision: dict, *, repo: str = "",
-                map_path: str = "", say=None, warn=None) -> dict:
+                map_path: str = "", say=None, warn=None,
+                deadline: Deadline | None = None) -> dict:
     """La prévalidation d'un porteur ``integration/**`` : rouge, ou état dit.
 
     Décision du pilote (19/10, #2644) : **seul un rouge bloque** ``ci run``.
@@ -947,7 +994,13 @@ def gate_packet(cfg, db, item, decision: dict, *, repo: str = "",
 
     L'exception déclarée au journal du paquet n'est pas lue ici : elle
     appartient à l'appelant (packet_guard), qui choisit de ne pas bloquer.
+
+    #4067 : le passage est borné par ``deadline`` (par défaut
+    ``CALLER_BUDGET_S``) pour que ``ci run`` rende la main sous le délai du
+    compositeur ; une échéance épuisée est ``unavailable`` (« timeout »).
     """
+    if deadline is None:
+        deadline = caller_deadline()
     head = str(decision.get("sha") or "").strip().lower()
     item = item or {}
     lot = int(item.get("id") or decision.get("work_item") or 0)
@@ -961,12 +1014,17 @@ def gate_packet(cfg, db, item, decision: dict, *, repo: str = "",
                      base=decision.get("base") or "",
                      project=str(item.get("app") or "ameesh"),
                      branch=str(item.get("branch") or ""), map_path=map_path,
-                     repo_slug=str(decision.get("repo") or ""), say=say, warn=warn)
+                     repo_slug=str(decision.get("repo") or ""), say=say, warn=warn,
+                     deadline=deadline)
     except prevalidation.PrevalidationError as exc:
-        return {"state": "unavailable", "cause": exc.cause, "why": exc.why}
+        return {"state": "unavailable", "cause": exc.cause,
+                "why": _timed_out(deadline, exc.why)}
     except Exception as exc:  # noqa: BLE001 - une indisponibilité, jamais un vert
-        return {"state": "unavailable", "cause": "selection-unsafe",
-                "why": "%s: %s" % (type(exc).__name__, str(exc)[:300])}
+        why = "%s: %s" % (type(exc).__name__, str(exc)[:300])
+        if deadline.expired():
+            return {"state": "unavailable", "cause": "run-incomplete",
+                    "why": _timed_out(deadline, why)}
+        return {"state": "unavailable", "cause": "selection-unsafe", "why": why}
     state = report_state(report)
     if state == "green":
         return {"state": "green", "report": report}
@@ -974,7 +1032,7 @@ def gate_packet(cfg, db, item, decision: dict, *, repo: str = "",
         return {"state": "red", "report": report, "why": describe(report)}
     return {"state": "unavailable",
             "cause": (report.get("causes") or ("run-incomplete",))[0],
-            "why": describe(report), "report": report}
+            "why": _timed_out(deadline, describe(report)), "report": report}
 
 
 # --------------------------------------------------------------------------
@@ -992,21 +1050,27 @@ def _journal(db, lot: int, text: str) -> None:
 
 
 def after_freeze(cfg, db, lot: int, sha: str, *, repo: str = "",
-                 map_path: str = "", say=None, warn=None) -> dict:
+                 map_path: str = "", say=None, warn=None,
+                 deadline: Deadline | None = None) -> dict:
     """La prévalidation du gel, après que le jalon ``frozen`` est écrit.
 
     Le résultat est attaché à la tête gelée dans ``prevalidation_reports`` et
     résumé au journal. Un rouge, une sélection non prouvée ou une
     indisponibilité ne défont pas le gel : il est déjà écrit, et ce geste ne
     lève pas. Rend ``{"state": "green"|"red"|"unavailable", ...}``.
+
+    #4067 : borné par ``deadline`` (par défaut ``CALLER_BUDGET_S``), pour que
+    ``work milestone frozen`` rende la main sous le délai du compositeur.
     """
+    if deadline is None:
+        deadline = caller_deadline()
     try:
         return _after_freeze(cfg, db, lot, sha, repo=repo, map_path=map_path,
-                             say=say, warn=warn)
+                             say=say, warn=warn, deadline=deadline)
     except Exception as exc:  # noqa: BLE001 - le gel est déjà écrit, rien ne le défait
-        _journal(db, lot, "%s unavailable: %s: %s"
-                 % (JOURNAL_PREFIX, type(exc).__name__, str(exc)[:300]))
-        return {"state": "unavailable", "why": "%s: %s" % (type(exc).__name__, exc)}
+        why = _timed_out(deadline, "%s: %s" % (type(exc).__name__, str(exc)[:300]))
+        _journal(db, lot, "%s unavailable: %s" % (JOURNAL_PREFIX, why))
+        return {"state": "unavailable", "why": why}
 
 
 def _repo_slug(cfg, item) -> str:
@@ -1019,7 +1083,8 @@ def _repo_slug(cfg, item) -> str:
 
 
 def _after_freeze(cfg, db, lot: int, sha: str, *, repo: str = "",
-                  map_path: str = "", say=None, warn=None) -> dict:
+                  map_path: str = "", say=None, warn=None,
+                  deadline: Deadline | None = None) -> dict:
     item = work.get(db, int(lot)) if db is not None else None
     if item is None:
         return {"state": "unavailable", "why": "lot inconnu"}
@@ -1041,14 +1106,19 @@ def _after_freeze(cfg, db, lot: int, sha: str, *, repo: str = "",
         report = run(cfg, db, lot, repo=where, head=head, base=base,
                      project=str(item.get("app") or "ameesh"),
                      branch=str(item.get("branch") or ""), map_path=map_path,
-                     repo_slug=_repo_slug(cfg, item), say=say, warn=warn)
+                     repo_slug=_repo_slug(cfg, item), say=say, warn=warn,
+                     deadline=deadline)
     except prevalidation.PrevalidationError as exc:
+        why = _timed_out(deadline, exc.why)
         text = "%s unavailable: %s%s" % (
-            JOURNAL_PREFIX, exc.cause, (" — " + exc.why) if exc.why else "")
+            JOURNAL_PREFIX, exc.cause, (" — " + why) if why else "")
         _journal(db, lot, text)
-        return {"state": "unavailable", "cause": exc.cause, "why": exc.why}
+        return {"state": "unavailable", "cause": exc.cause, "why": why}
     state = report_state(report)
-    text = "%s %s %s: %s" % (JOURNAL_PREFIX, state, head[:12], describe(report))
+    why = describe(report)
+    if state == "unavailable":
+        why = _timed_out(deadline, why)
+    text = "%s %s %s: %s" % (JOURNAL_PREFIX, state, head[:12], why)
     _journal(db, lot, text)
     return {"state": state, "report": report}
 
@@ -1120,9 +1190,8 @@ def gate_train(cfg, *, repo: str, head: str, base: str, canon_repo: str = "",
             if cleanup:
                 shutil.rmtree(cleanup, ignore_errors=True)
     except prevalidation.PrevalidationError as exc:
-        if exc.cause == "run-red":
-            raise
-        return {"state": "unavailable", "cause": exc.cause, "why": exc.why}
+        return {"state": "unavailable", "cause": exc.cause,
+                "why": _timed_out(deadline, exc.why)}
     except Exception as exc:  # noqa: BLE001 - panne d'outillage : indisponible
         return {"state": "unavailable", "cause": "internal",
                 "why": "%s: %s" % (type(exc).__name__, str(exc)[:300])}

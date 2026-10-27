@@ -382,6 +382,51 @@ class HandoffTest(_Handoff):
         self.assertEqual(self.hand(), [])
         self.assertEqual(self.assignee(intake), "claude1")
 
+    def test_fenetre_courte_ne_retire_aucun_lot(self):
+        # #4066 : la fenêtre courte du compte (#3779) s'écrit sous « budget : »
+        # comme une pause de jauge ; tenu quelques secondes, l'agent garde ses
+        # lots, critique ou non
+        self.team()
+        intake = self.lot("export")
+        build = self.lot("import", state="build", branch="lot/import")
+        for reason in ("account claude-1: next turn in 25 s (start gap)",
+                       "account claude-1: short-window cooldown until 20:31",
+                       budget.CRITICAL_MARK + "account claude-1: 2/2 concurrent turns "
+                       "(short window)"):
+            self.db.execute("UPDATE agent_registry SET status_text = %s WHERE name = %s",
+                            (budget.PAUSE_PREFIX + reason, "claude1"))
+            row = {"status": "blocked", "status_text": budget.PAUSE_PREFIX + reason}
+            self.assertTrue(handoff.paused(row))       # la tenue reste vue
+            self.assertFalse(handoff.gauge_paused(row))
+            with mock.patch.object(handoff, "lot_git", return_value=GIT_OK):
+                self.assertEqual(self.hand(), [])
+        self.assertEqual(self.assignee(intake), "claude1")
+        self.assertEqual(self.assignee(build), "claude1")
+        # une pause de jauge les retire comme avant
+        self.pause("claude1")
+        with mock.patch.object(handoff, "lot_git", return_value=GIT_OK):
+            self.assertEqual(len(self.hand()), 2)
+        self.assertIsNone(self.assignee(intake))
+        self.assertEqual(self.assignee(build), "deepseek1")
+
+    def test_fenetre_courte_relue_sous_verrou(self):
+        # #4066 : la pause de jauge devenue fenêtre courte entre le listage et
+        # l'écriture ne cède plus le lot
+        self.team()
+        intake = self.lot("export")
+        real = storage.of(self.db).work.handoff
+
+        def flipped(*args, **kw):
+            self.db.execute("UPDATE agent_registry SET status_text = %s WHERE name = %s",
+                            (budget.PAUSE_PREFIX + "account claude-1: next turn in 9 s",
+                             "claude1"))
+            return real(*args, **kw)
+
+        with mock.patch.object(type(storage.of(self.db).work), "handoff",
+                               side_effect=flipped, autospec=False):
+            self.assertEqual(self.hand(), [])
+        self.assertEqual(self.assignee(intake), "claude1")
+
     def test_agent_critique_d_un_canon_secondaire(self):
         # codex r1 (#409) : le canon propriétaire est lu au registre, pas dans
         # la ligne du listing (sans `canon`, donc jugée au canon par défaut)

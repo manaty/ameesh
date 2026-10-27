@@ -241,3 +241,49 @@ class TenueAttributionTest(_Comptes):
     def _adapters(self):
         return mock.patch.object(account_turn.adapters, "adapter_for",
                                  return_value=object())
+
+
+class FenetreCourteAttributionTest(_Comptes):
+    """#4056 : la fenêtre courte du compte (#3779) n'est qu'un avertissement.
+
+    Le 27/10 à 19:33, #4046 et #4048 n'ont pu aller ni à cx2 ni à cx1 :
+    « account primaire: next turn in 25s (start gap 30s between turns) »,
+    renouvelé à chaque départ d'un agent du même compte."""
+
+    def lot(self):
+        return work.add(self.db, title="a confier", cfg=self.cfg)
+
+    def _pause(self, texte: str) -> None:
+        registry.upsert(self.db, "cx2", harness="codex", host="hote-voisin",
+                        cwd=self.tmp)
+        self.db.execute(
+            "UPDATE agent_registry SET status = 'blocked', status_text = %s"
+            " WHERE name = %s", (budget.PAUSE_PREFIX + texte, "cx2"))
+
+    def test_ecart_de_depart_accepte_avec_avertissement(self):
+        self._pause("account primaire: next turn in 25s (start gap 30s between "
+                    "turns, #3779; last start 19:33)")
+        lot = self.lot()
+        res = work.check_assignee(self.db, "cx2", cfg=self.cfg)
+        self.assertEqual(res["assignee"], "cx2")
+        self.assertIn("briefly held", res["warning"])
+        self.assertIn("next turn in 25s", res["warning"])
+        work.assign(self.db, lot["id"], "cx2", cfg=self.cfg)
+        self.assertEqual(work.get(self.db, lot["id"])["assignee"], "cx2")
+
+    def test_cooldown_et_plafond_de_tours_acceptes(self):
+        for texte in (
+                "account primaire: short-window cooldown until 19:40 (in 5 min; "
+                "2 provider 429 in 15 min, shared burst bucket, #3779)",
+                budget.CRITICAL_MARK + "account primaire: 2/2 concurrent turns "
+                "(provider burst bucket shared by sessions, #3779; running: cx1)"):
+            self._pause(texte)
+            res = work.check_assignee(self.db, "cx2", cfg=self.cfg)
+            self.assertIn("briefly held", res["warning"])
+
+    def test_pause_de_jauge_reste_refusee(self):
+        self._pause("pause (account primaire, codex-300min 96 %) until 21:20; "
+                    "all codex accounts at threshold")
+        with self.assertRaises(work.WorkError) as ctx:
+            work.check_assignee(self.db, "cx2", cfg=self.cfg)
+        self.assertIn("is held —", str(ctx.exception))

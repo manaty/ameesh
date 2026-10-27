@@ -39,6 +39,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import signal
 import subprocess
 import sys
 
@@ -166,7 +167,11 @@ class BoutEnBoutTest(PgTestCase):
         proc = subprocess.Popen(
             [sys.executable, "-m", "ameesh.approve", "serve", "--bind", "127.0.0.1",
              "--port", "0", "--token-file", self.token_file, "--state-dir", self.approve_state],
-            stdout=log, stderr=subprocess.STDOUT, env=self.e(), cwd=self.tmp)
+            # #4063 : `PYTHONFAULTHANDLER` — un service muet au-delà du délai
+            # écrit la pile de chacun de ses fils dans son journal sur SIGABRT
+            # (ci-dessous) ; sous macOS, trois nuits rouges sans une ligne.
+            stdout=log, stderr=subprocess.STDOUT, env=self.e(PYTHONFAULTHANDLER="1"),
+            cwd=self.tmp)
 
         def stop() -> None:
             proc.terminate()
@@ -187,8 +192,19 @@ class BoutEnBoutTest(PgTestCase):
             if proc.poll() is not None:
                 self.fail("ameesh-approve s'est arrêté (code %s) :\n%s" % (proc.returncode, text))
             return None
-        found = self.wait_for(port, timeout=30,
-                              msg=lambda: Path(log_path).read_text(encoding="utf-8"))
+        def silent() -> str:
+            # #4063 : le journal seul était vide sous macOS ; la pile du
+            # service dit où il attend.
+            if proc.poll() is None:
+                proc.send_signal(signal.SIGABRT)
+                try:
+                    proc.wait(10)
+                except subprocess.TimeoutExpired:
+                    pass
+            return "code %s, journal :\n%s" % (
+                proc.returncode, Path(log_path).read_text(encoding="utf-8", errors="replace"))
+        # 90 s : le démarrage à froid d'un runner macOS hébergé (#4063)
+        found = self.wait_for(port, timeout=90, msg=silent)
         self.approve_url = "http://127.0.0.1:%d" % found
         return found
 

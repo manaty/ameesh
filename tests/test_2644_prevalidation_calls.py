@@ -1014,6 +1014,148 @@ class GateTrainTest(unittest.TestCase):
         self.assertIn("tests.test_x", caught.exception.why)
 
 
+class CallerDeadlineTest(unittest.TestCase):
+    """#4067 : le gel et ``ci run`` rendent la main sous le délai du compositeur.
+
+    Le canon déclare ``timeout_seconds: 3600`` ; sans échéance, l'offload
+    attendait la file d'agents-3 et la commande était tuée à 600 s.
+    """
+
+    def setUp(self):
+        self.now = [1000.0]
+        self.clock = lambda: self.now[0]
+        self.item = {"id": 4052, "app": "ameesh", "branch": "integration/h-44",
+                     "branch_target": "main"}
+        self.notes = []
+        tree = tempfile.mkdtemp(prefix="ameesh-4067-tree-")
+        self.addCleanup(shutil.rmtree, tree, True)
+        prepared = calls.Prepared(repo=tree, root=tree, tree=tree,
+                                  path=os.path.join(tree, "plan.json"),
+                                  rel="plan.json", plan={})
+        block = replace(params(hosts=("ameesh-agents-3",)), timeout_seconds=3600)
+        for patch in (
+                mock.patch.object(calls, "repository", return_value="/repo"),
+                mock.patch.object(calls, "target_base", return_value="b" * 40),
+                mock.patch.object(calls, "tooling"),
+                mock.patch.object(calls, "map_for", return_value=("", "")),
+                mock.patch.object(calls, "prepare", return_value=prepared),
+                mock.patch.object(calls, "contract_fallback", return_value=None),
+                mock.patch.object(calls, "parameters", return_value=calls.Parameters(
+                    params=block, repo="/canon", commit="c" * 40, project="ameesh")),
+                mock.patch.object(pv, "host_allowed", return_value=(True, "")),
+                mock.patch.object(pv, "record"),
+                mock.patch("ameesh.work.get", return_value=self.item),
+                mock.patch("ameesh.work.note", side_effect=lambda db, lot, text, **kw:
+                           self.notes.append(text))):
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def offload(self, outcome):
+        """Un ``validate`` qui lit l'échéance reçue, puis consomme du temps."""
+        seen = {}
+
+        def validate(**kw):
+            deadline = kw["deadline"]
+            seen["budget"] = deadline.remaining()
+            seen["timeout_seconds"] = kw["params"].timeout_seconds
+            if outcome == "slow":
+                # la file de l'hôte retient le job : le client annule à l'échéance
+                self.now[0] += deadline.remaining()
+                return report(ok=False, causes=("run-incomplete",),
+                              outcome="run-incomplete")
+            self.now[0] += 30.0
+            if outcome == "red":
+                return report(ok=False, causes=("run-red",), failed=("tests.test_x",))
+            return report()
+        return validate, seen
+
+    def packet(self, validate):
+        with mock.patch.object(pv, "validate", side_effect=validate):
+            return calls.gate_packet(
+                None, None, self.item, {"sha": "a" * 40, "base": "b" * 40},
+                deadline=calls.caller_deadline(clock=self.clock))
+
+    def freeze(self, validate):
+        with mock.patch.object(pv, "validate", side_effect=validate):
+            return calls.after_freeze(
+                None, object(), 4052, "a" * 40,
+                deadline=calls.caller_deadline(clock=self.clock))
+
+    def test_the_caller_budget_stays_under_the_composer_timeout(self):
+        self.assertLess(calls.CALLER_BUDGET_S + pv.OFFLOAD_LOCAL_GRACE_S, 600)
+
+    def test_a_slow_packet_offload_returns_unavailable_timeout_in_time(self):
+        validate, seen = self.offload("slow")
+        got = self.packet(validate)
+        self.assertEqual(got["state"], "unavailable")
+        self.assertEqual(got["cause"], "run-incomplete")
+        self.assertTrue(got["why"].startswith("timeout"), got["why"])
+        self.assertLessEqual(seen["timeout_seconds"], calls.CALLER_BUDGET_S)
+        self.assertLessEqual(seen["budget"], calls.CALLER_BUDGET_S)
+        self.assertLessEqual(self.now[0] - 1000.0, calls.CALLER_BUDGET_S)
+
+    def test_a_slow_freeze_offload_is_journaled_timeout_in_time(self):
+        validate, seen = self.offload("slow")
+        got = self.freeze(validate)
+        self.assertEqual(got["state"], "unavailable")
+        self.assertTrue(any(n.startswith("prevalidation unavailable") and "timeout" in n
+                            for n in self.notes), self.notes)
+        self.assertLessEqual(seen["timeout_seconds"], calls.CALLER_BUDGET_S)
+        self.assertLessEqual(self.now[0] - 1000.0, calls.CALLER_BUDGET_S)
+
+    def test_a_fast_green_offload_is_unchanged(self):
+        validate, _ = self.offload("green")
+        self.assertEqual(self.packet(validate)["state"], "green")
+        validate, _ = self.offload("green")
+        self.assertEqual(self.freeze(validate)["state"], "green")
+        self.assertFalse(any("timeout" in n for n in self.notes))
+
+    def test_a_real_red_still_blocks_the_packet(self):
+        validate, _ = self.offload("red")
+        got = self.packet(validate)
+        self.assertEqual(got["state"], "red")
+        self.assertIn("tests.test_x", got["why"])
+
+    def test_an_expired_budget_launches_no_offload(self):
+        with mock.patch.object(pv, "validate") as validate:
+            got = calls.gate_packet(None, None, self.item,
+                                    {"sha": "a" * 40, "base": "b" * 40},
+                                    deadline=calls.caller_deadline(0, clock=self.clock))
+        validate.assert_not_called()
+        self.assertEqual(got["state"], "unavailable")
+        self.assertTrue(got["why"].startswith("timeout"), got["why"])
+
+    def test_a_git_timeout_after_the_budget_is_timeout_not_unsafe(self):
+        def slow(*a, **kw):
+            self.now[0] += calls.CALLER_BUDGET_S
+            raise subprocess.TimeoutExpired(["git"], 1)
+
+        with mock.patch.object(calls, "prepare", side_effect=slow):
+            got = calls.gate_packet(None, None, self.item,
+                                    {"sha": "a" * 40, "base": "b" * 40},
+                                    deadline=calls.caller_deadline(clock=self.clock))
+        self.assertEqual(got["cause"], "run-incomplete")
+        self.assertTrue(got["why"].startswith("timeout"), got["why"])
+
+    def test_the_offload_client_cancels_its_job_within_the_budget(self):
+        # canon 3600 s, budget 420 s : --timeout et --wait-timeout sous le budget,
+        # le garde-fou local à budget + grâce.
+        seen = {}
+
+        def runner(argv, **kw):
+            seen["argv"], seen["timeout"] = argv, kw.get("timeout")
+            raise subprocess.TimeoutExpired(argv, kw.get("timeout"))
+
+        got = pv.run_offload("ameesh-agents-3", "true", timeout=3600, runner=runner,
+                             deadline=calls.caller_deadline(clock=self.clock))
+        argv = seen["argv"]
+        self.assertLessEqual(int(argv[argv.index("--timeout") + 1]), calls.CALLER_BUDGET_S)
+        self.assertLess(int(argv[argv.index("--wait-timeout") + 1]), calls.CALLER_BUDGET_S)
+        self.assertLessEqual(seen["timeout"],
+                             calls.CALLER_BUDGET_S + pv.OFFLOAD_LOCAL_GRACE_S)
+        self.assertEqual(got["outcome"], "run-incomplete")
+
+
 class DeadlineTest(unittest.TestCase):
     def test_timeout_never_exceeds_the_shared_deadline(self):
         now = [100.0]

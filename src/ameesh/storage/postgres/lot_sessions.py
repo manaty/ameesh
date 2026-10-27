@@ -8,6 +8,7 @@ import time
 
 from .. import interface
 from .work import has_wake_at
+from .work_dependencies import freeze_due
 
 _CLOSED = "('merged', 'promoted', 'closed')"
 
@@ -129,7 +130,9 @@ class LotSessions(interface.LotSessions):
               LEFT JOIN LATERAL (
                   SELECT max(b.created_at) AS at FROM agent_mailbox b
                    WHERE btrim(b.work_item_id) = w.id::text) mb ON true
-             WHERE w.assignee = %s AND w.state IN ('intake', 'build')
+             WHERE w.assignee = %s
+               AND (w.state IN ('intake', 'build')
+                    OR (w.state = 'qa' AND """ + freeze_due("w") + """))
                AND (w.planned_start IS NULL OR w.planned_start <= %s::date)
                AND NOT EXISTS (SELECT 1 FROM agent_mailbox b
                                 WHERE b.delivered_at IS NULL AND b.kind = 'request'
