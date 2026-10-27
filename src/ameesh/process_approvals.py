@@ -949,21 +949,30 @@ def _structured_artifacts(
     return found, refusals
 
 
-def _revocation_scope(body: str, envelope: Mapping | None,
-                      source: Source) -> list[Artifact]:
-    """Portee d'une revocation : depot + chemin, quelle que soit la revision.
+def _scope_artifacts(body: str, envelope: Mapping | None, source: Source,
+                     *, strict: bool = False) -> tuple[list[Artifact], list[dict]]:
+    """References d'une decision, bornees par depot + chemin.
 
-    Une revocation par portee ne depend pas d'un SHA exact : une URL de
-    branche ou un SHA court non resolu doit revoquer la portee, jamais etre
-    ignore (fail-closed). Le champ `revision` du scope est un marqueur
-    (0*40), `_apply_revocations` ne compare que depot et chemin.
+    La revision est ignoree : une URL de branche ou un SHA court non resolu
+    nomme quand meme une portee (fail-closed). Le champ `revision` du scope
+    est un marqueur (0*40) ; `_apply_revocations` ne compare que depot et
+    chemin. En mode ``strict`` (approbation editee), une reference reconnue
+    mais non bornable (depot hors perimetre, chemin invalide, entree
+    structuree illisible) est remontee : l'appelant doit refuser la
+    projection, pas se contenter des references valides.
     """
     items: list[tuple[Any, Any]] = []
+    unbounded: list[dict] = []
     if envelope is not None:
         raw = envelope.get("artifacts", envelope.get("scope"))
-        if isinstance(raw, list):
-            items = [(item.get("repo"), item.get("path"))
-                     for item in raw if isinstance(item, Mapping)]
+        if not isinstance(raw, list):
+            unbounded.append({"code": "approval-envelope-invalid"})
+            raw = []
+        for item in raw:
+            if isinstance(item, Mapping):
+                items.append((item.get("repo"), item.get("path")))
+            else:
+                unbounded.append({"code": "approval-envelope-invalid"})
     else:
         items += [(match.group(1), match.group(3))
                   for match in _BLOB_URL_RE.finditer(body)]
@@ -975,17 +984,30 @@ def _revocation_scope(body: str, envelope: Mapping | None,
     seen: set[tuple[str, str]] = set()
     for repo, path in items:
         try:
-            repo = _check_repo(repo, "revocation repo")
+            repo = _check_repo(repo, "scope repo")
             path = _check_path(urllib.parse.unquote(str(path)).rstrip(".,;:`"))
         except (TypeError, ValueError):
+            unbounded.append({"code": "path-invalid"})
             continue
-        if repo not in source.repos or (repo, path) in seen:
+        if repo not in source.repos:
+            unbounded.append({"code": "out-of-scope"})
+            continue
+        if (repo, path) in seen:
             continue
         seen.add((repo, path))
         found.append(Artifact(repo=repo, revision="0" * 40, path=path))
-        if len(found) >= MAX_ARTIFACTS_PER_COMMENT:
+        if len(found) > MAX_ARTIFACTS_PER_COMMENT:
+            unbounded.append({"code": "approval-invalid"})
             break
-    return found
+    if not strict:
+        return found, []
+    return found, unbounded
+
+
+def _revocation_scope(body: str, envelope: Mapping | None,
+                      source: Source) -> list[Artifact]:
+    """Portee d'une revocation, toleree aux references non bornables."""
+    return _scope_artifacts(body, envelope, source)[0]
 
 
 def _revocation_targets(body: str) -> tuple[int, ...]:
@@ -1041,15 +1063,13 @@ def _normalize_comment(comment: Mapping, source: Source,
     if updated != created and not revocation:
         # Une approbation modifiee n'est pas une decision. Mais si elle
         # remplace un accord anterieur, l'ignorer reactiverait cet accord :
-        # on borne la portee qu'elle nomme et on refuse l'approbation.
-        try:
-            artifacts, _extra = (
-                _structured_artifacts(envelope, source, resolve)
-                if envelope is not None
-                else _legacy_artifacts(body, source, resolve))
-        except ApprovalRefusal:
-            artifacts = []
-        if not artifacts:
+        # on borne TOUTES les references qu'elle nomme, revision comprise,
+        # et on refuse l'approbation. Une reference reconnue mais non
+        # bornable interdit la projection : une liste partielle ne prouve
+        # pas que l'ancien accord est entierement couvert.
+        artifacts, unbounded = _scope_artifacts(
+            body, envelope, source, strict=True)
+        if unbounded or not artifacts:
             raise ProjectionError(
                 "projection-invalid",
                 "an edited approval cannot be scoped safely")

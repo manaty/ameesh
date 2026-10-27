@@ -281,6 +281,44 @@ class ApprovalCase(unittest.TestCase):
                                 path=PATH_A, now=NOW)
         self.assertEqual(caught.exception.code, "approval-revoked")
 
+    def test_an_edited_approval_fences_every_named_path(self):
+        source = self.source(repo="target/repo", issue=ISSUE,
+                             approvers=(APPROVER,))
+        first = _comment(
+            1200, "Owner approval recorded\n\ntarget/repo@%s:docs/a.md\n"
+                  % ("a" * 40))
+        edited = _comment(
+            1201, "Owner approval recorded\n\n"
+                  "target/repo@main:docs/a.md\n"
+                  "target/repo@%s:docs/b.md\n" % ("b" * 40),
+            created="2026-10-17T00:00:00Z",
+            updated="2026-10-17T00:05:00Z")
+        projection = pa.build_projection(
+            source, _issue(), [first, edited], now=NOW)
+        self.assertEqual([a.state for a in projection.approvals], ["revoked"])
+        self.assertEqual(projection.approvals[0].revoked_by, "edited:1201")
+        with self.assertRaises(pa.ApprovalRefusal) as caught:
+            pa.require_approval(
+                projection, repo="target/repo", revision="a" * 40,
+                path="docs/a.md", now=NOW)
+        self.assertEqual(caught.exception.code, "approval-revoked")
+
+    def test_an_edited_approval_with_an_unbounded_reference_refuses(self):
+        source = self.source(repo="target/repo", issue=ISSUE,
+                             approvers=(APPROVER,))
+        first = _comment(
+            1202, "Owner approval recorded\n\ntarget/repo@%s:docs/a.md\n"
+                  % ("a" * 40))
+        edited = _comment(
+            1203, "Owner approval recorded\n\n"
+                  "target/repo@%s:docs/b.md\n"
+                  "other/repo@main:docs/c.md\n" % ("b" * 40),
+            created="2026-10-17T00:00:00Z",
+            updated="2026-10-17T00:05:00Z")
+        with self.assertRaises(pa.ProjectionError) as caught:
+            pa.build_projection(source, _issue(), [first, edited], now=NOW)
+        self.assertEqual(caught.exception.code, "projection-invalid")
+
     def test_an_unscoped_edited_approval_refuses_the_projection(self):
         edited = _comment(
             1034, "Owner approval recorded \u2014 no artifact reference",

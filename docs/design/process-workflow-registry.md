@@ -332,9 +332,12 @@ An owner approval is a comment that:
   A revocation by scope ignores the revision: a branch URL or an unresolved
   short SHA still revokes its repository + path (it never becomes a silent
   no-op). An edited revocation still revokes; an edited replacement approval
-  fences the scope it names so the previous approval cannot become current
-  again, and an edited approval whose scope cannot be established refuses the
-  whole projection.
+  fences **every** repository + path it names, regardless of each reference's
+  revision, so the previous approval cannot become current again. A
+  recognised reference that cannot be bounded (out-of-scope repository,
+  invalid path, malformed envelope entry) refuses the whole projection: a
+  non-empty partial list is never taken as proof that the old approval is
+  fully covered.
 
 A comment edited after creation (`updated_at != created_at`) is refused
 (`approval-edited`): the projection never accepts a decision whose text can
@@ -453,7 +456,7 @@ Bridge codes (stable, module-level; `ApprovalError.code`):
 
 ### Qualification
 
-`tests/test_process_approvals.py` (55 pure/fixture cases, no database and no
+`tests/test_process_approvals.py` (57 pure/fixture cases, no database and no
 network in the core, one loopback HTTP case) covers every refusal witness
 requested by the lot: absent, revoked, stale-head, expired approval, stale
 projection and unavailable reader. `tests/test_process_approvals_704.py`
