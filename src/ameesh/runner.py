@@ -9642,8 +9642,15 @@ class Runner:
 
         if getattr(self, "mediated", False):
             return []  # L109 : le registre est tenu par le serveur
+        # #3907 : le balayage tourne à chaque passe de chaque exécuteur, et une
+        # passe suit chaque NOTIFY du mesh. `overview()` y coûtait 0,4 à 1,2 s
+        # et saturait la base commune (27/10, charge 44 sur 4 vCPU) : le filtre
+        # ne lit plus que `status` et `stop_reason` du registre. La liste
+        # complète n'est lue (par `measurement_actor`) que s'il y a un lot à
+        # rendre.
         try:
-            agents = registry.overview(self.db)
+            names = storage.of(self.db).agents.stopped_with(
+                work_mod.RELEASABLE_STOP_REASONS)
         except db_mod.DbError as exc:
             message = "stopped agents not swept (%s)" % exc
             if message != getattr(self, "_stopped_lots_error", None):
@@ -9654,8 +9661,7 @@ class Runner:
         # #1425 (N5) : ne payer la résolution de l'auditeur (lecture des canons)
         # que s'il y a un arrêt délibéré à dessaisir ; le balayage tourne à
         # chaque passe.
-        stopped = [a for a in agents if a.get("status") == "stopped"
-                   and a.get("stop_reason") in work_mod.RELEASABLE_STOP_REASONS]
+        stopped = [{"name": name} for name in names]
         if not stopped:
             return []
         # #2877 : ce que ces agents tiennent encore, en UNE lecture sans verrou.
@@ -9683,7 +9689,7 @@ class Runner:
                      work_mod.configured_canons(getattr(self, "cfg", None)))
             self._measure_canons_cache = cache
         measure_actor = work_mod.measurement_actor(
-            self.db, self.cfg, listing=agents, canons=cache[1])
+            self.db, self.cfg, canons=cache[1])
         measure_reason = ("promoted lot whose measurement is still to be redone: "
                           "handed to %s (#753)" % measure_actor) if measure_actor else ""
         out: list[dict] = []
