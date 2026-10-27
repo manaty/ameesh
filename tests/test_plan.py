@@ -193,7 +193,8 @@ class PlanUnitTest(unittest.TestCase):
 
     def test_attentes(self):
         item = {"state": "qa", "assignee": "ouvrier"}
-        none = {"verdict_kind": None, "verdict_current": False, "reviewer": None}
+        none = {"verdict_kind": None, "verdict_current": False, "reviewer": None,
+                "freeze_declared": True}
         self.assertEqual(stagnation.waiting(item, none)["label"],
                          "verdict from a reviewer (none designated)")
         prior = dict(none, reviewer="relecteur")
@@ -201,7 +202,7 @@ class PlanUnitTest(unittest.TestCase):
         blocked = {"verdict_kind": "blocked", "verdict_current": True}
         self.assertEqual(stagnation.waiting(item, blocked),
                          {"what": "fix", "who": "ouvrier", "label": "fix by ouvrier"})
-        ok = {"verdict_kind": "ok", "verdict_current": True}
+        ok = {"verdict_kind": "ok", "verdict_current": True, "freeze_declared": True}
         self.assertEqual(stagnation.waiting(item, ok, responsible="human:alice")["label"],
                          "merge by human:alice")
         merge = {"connector": "git-merge", "state": "proposed", "approvers": ["human:bob"]}
@@ -932,6 +933,7 @@ class ProgressPlanTest(_PlanDb):
         a = work.add(self.db, title="recherche", package="cat-recherche", assignee="ouvrier")
         for state in ("build", "qa"):
             work.move(self.db, a["id"], state)
+        work.milestone(self.db, a["id"], "frozen", sha=SHA, actor="ouvrier")
         b = work.add(self.db, title="export", package="cat-export")
         work.close_merged(self.db, b["id"], sha=SHA)
         c = work.add(self.db, title="vieux", package="pay-webhook", assignee="ouvrier")
@@ -1025,6 +1027,7 @@ class StagnationUnifiedTest(_PlanDb):
         a = work.add(self.db, title="oublié", package="cat-export", assignee="ouvrier")
         for state in ("build", "qa"):
             work.move(self.db, a["id"], state)
+        work.milestone(self.db, a["id"], "frozen", sha=SHA, actor="ouvrier")
         b = work.add(self.db, title="abandonné", assignee="ouvrier")
         work.close(self.db, b["id"], abandoned=True)
         self._vieux(a["id"])

@@ -26,7 +26,7 @@ activity.
 2. `waiting_human` → `decision` (du responsable de la fiche du lot) ;
 3. un verdict `blocked` portant sur le dernier gel (même SHA, même quand le
    gel a été renouvelé après l'avis) → `fix` (l'auteur) ;
-4. puis selon l'état : `start`, `build`, `unblock`, `verdict`, `merge`.
+4. puis selon l'état : `start`, `build`, `unblock`, `freeze`, `verdict`, `merge`.
    #4028 : un lot revenu en `build` avec un GO courant (retiré d'un paquet)
    attend `fix` de son assigné, pas `build`.
 
@@ -53,9 +53,9 @@ STALE_ENV = "AMEESH_STALE_AFTER"
 #: ce qu'un lot peut attendre, forme résumée de L26 (valeurs de `waiting_for`)
 WAITING_FOR = ("verdict", "correction", "fusion", "decision_humaine")
 #: ce qu'un lot peut attendre, forme détaillée (`waiting.what`)
-WHATS = ("start", "build", "verdict", "fix", "merge-approval", "merge", "merge-outcome",
+WHATS = ("start", "build", "freeze", "verdict", "fix", "merge-approval", "merge", "merge-outcome",
          "decision", "unblock", "packet")
-_LEGACY = {"verdict": "verdict", "fix": "correction", "merge": "fusion",
+_LEGACY = {"freeze": "correction", "verdict": "verdict", "fix": "correction", "merge": "fusion",
            "decision": "decision_humaine", "merge-approval": "decision_humaine",
            "merge-outcome": "decision_humaine", "packet": "fusion"}
 #: états d'un lot qui n'attend plus rien
@@ -125,6 +125,7 @@ def stale(state: str, last_ts: float | None, now: float, threshold: float) -> di
 _LABELS = {
     "start": ("start by %s", "assignment (lot unassigned)"),
     "build": ("work by %s", "work (lot unassigned)"),
+    "freeze": ("freeze by %s", "freeze (lot unassigned)"),
     "verdict": ("verdict by %s", "verdict from a reviewer (none designated)"),
     "fix": ("fix by %s", "fix (author not designated)"),
     "merge-approval": ("merge approval by %s", "merge approval"),
@@ -192,7 +193,7 @@ def waiting(item: dict, jalons: dict, actions: Iterable[dict] = (), *,
     l'appelant l'a résolue ; la relecture d'un lot **léger** suit la fusion
     (§2), donc un lot léger sans verdict courant attend la fusion, pas un
     verdict (#1822). `None` (classe inconnue) garde l'attente prudente d'un
-    verdict, sans deviner aucune classe."""
+    verdict ou gel manquant, sans deviner aucune classe."""
     state = item.get("state") or ""
     assignee = item.get("assignee") or None
     canon = canon_target(item)
@@ -233,7 +234,9 @@ def waiting(item: dict, jalons: dict, actions: Iterable[dict] = (), *,
     # canon §11 bis/#87), ou lot léger dont la relecture suit la fusion
     # (#1822, §2) ; dans tous les cas la suite est la fusion, et aucun rappel
     # ne part à un relecteur.
-    if (jalons.get("verdict_kind") == "ok" and jalons.get("verdict_current")) \
+    freeze_declared = jalons.get("freeze_declared", jalons.get("frozen") is not None)
+    if (freeze_declared and jalons.get("verdict_kind") == "ok"
+            and jalons.get("verdict_current")) \
             or jalons.get("verdict_required", True) is False:
         return _merge_wait(actions, responsible, assignee, canon=canon)
     from . import lot_class  # import tardif : lot_class lit work et canon
@@ -241,6 +244,8 @@ def waiting(item: dict, jalons: dict, actions: Iterable[dict] = (), *,
         # §2 : la relecture d'un lot léger suit la fusion ; aucun verdict
         # n'est dû avant, même si un relecteur est désigné (#1822).
         return _merge_wait(actions, responsible, assignee, canon=canon)
+    if state == lifecycle.TO_VALIDATE and not freeze_declared:
+        return _waiting("freeze", assignee)
     if jalons.get("pending_reviewers"):
         return _waiting("verdict", jalons["pending_reviewers"])
     return _waiting("verdict", jalons.get("reviewer"))
@@ -287,7 +292,7 @@ def review_class_of(db, row: dict, *, cfg=None, memo: dict | None = None,
 
 
 #: attentes dont le `who` est un agent qui doit travailler (L36)
-_AGENT_WAITS = ("start", "build", "fix", "verdict")
+_AGENT_WAITS = ("start", "build", "freeze", "fix", "verdict")
 
 
 def agent_states(db) -> dict[str, str]:
@@ -463,7 +468,7 @@ def describe(db, rows: list[dict], *, now: float | None = None,
                              responsible=package.get("responsible"))
             # #1822 : la classe n'est lue que pour un lot qui attendrait un
             # verdict ; déjà résolue par l'appelant, elle ne l'est pas relue.
-            if detail is not None and detail.get("what") == "verdict":
+            if detail is not None and detail.get("what") in ("verdict", "freeze"):
                 cls = known[rid] if rid in known else review_class_of(
                     db, row, cfg=cfg, memo=classes, milestones=milestones.get(rid, []))
                 if cls:

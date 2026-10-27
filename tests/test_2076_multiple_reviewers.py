@@ -166,6 +166,7 @@ class MultipleReviewersTest(PgTestCase):
                                                           actor="chief", **kwargs)
 
     def test_accumulation_cli_removal_and_assignment(self):
+        work.milestone(self.db, self.lot["id"], "frozen", sha="a" * 40, actor="author")
         self.designate("first")
         self.designate("second")
         self.designate("second")

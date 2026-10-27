@@ -163,6 +163,8 @@ class ReviewerDesignationTest(PgTestCase):
         proc = self.mesh("work", "move", str(lot["id"]), "build",
                          env=self._env())
         self.assertEqual(proc.returncode, 0, proc.stderr)
+        # These fixtures exercise reviewer routing after a declared freeze.
+        self._freeze_at(lot, "a" * 40)
         return self.mesh("work", "move", str(lot["id"]), "qa", *args, "--actor", "chef",
                          env=self._env())
 
@@ -486,7 +488,7 @@ class ReviewerDesignationTest(PgTestCase):
         redesignate()
         self.assertEqual(len(requests()), 1)
         mail.mark_delivered(self.db, [r["id"] for r in requests()])
-        work.milestone(self.db, lot["id"], "frozen", sha="a" * 40, actor="auteur")
+        work.milestone(self.db, lot["id"], "frozen", sha="b" * 40, actor="auteur")
         redesignate()
         self.assertEqual(len(requests()), 2)
         redesignate()
