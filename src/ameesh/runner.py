@@ -312,10 +312,14 @@ def local_balance_alerts(db, thresholds, now: float) -> list:
     seuils qu'`ameesh alerts` et `ameesh notify` — un agent au token ne prend
     jamais sous cette alerte. `notify` ne publie pas d'état d'alerte : on
     relit le solde au moment de la passe, une seule implémentation
-    (`sous_utilisation.balance_low`)."""
+    (`sous_utilisation.balance_low`).
+
+    #3923 : la garde locale ne lit plus le registre complet. `balance_low`
+    n'en tire que le `responsible` de l'alerte routée ; ici elle n'est qu'un
+    verrou de prise, sans destinataire (`notify` passe, lui, son listing).
+    Cette lecture coûtait 1,2 s par passe et par exécuteur."""
     from . import sous_utilisation
-    listing = storage.of(db).operations.listing()
-    return sous_utilisation.balance_low(db, listing, now, **(thresholds or {}))
+    return sous_utilisation.balance_low(db, (), now, **(thresholds or {}))
 
 
 def _ecrire_sans_attendre(fd: int, data: bytes) -> None:

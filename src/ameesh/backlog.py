@@ -757,8 +757,14 @@ def _default_budget_check(cfg, db):
     from . import cost as cost_mod
     limits = budget_mod.current(cfg, db)
     book = cost_mod.CostBook(state_dir=cfg.state_dir, db=db, **limits.book_kwargs())
+    # #3923 : une passe, une lecture des soldes. `over` était appelé pour
+    # chaque candidat de chaque boucle (lots, propositions, file), soit ~4
+    # lectures de `provider_balances` par passe et par exécuteur ; le cache
+    # ne vit que le temps de cette passe (le lambda).
+    cache: dict = {}
     return lambda agent: book.over(
-        agent, pace=False, account_checked=bool(cfg.accounts.get(book.tool_of(agent))))
+        agent, pace=False,
+        account_checked=bool(cfg.accounts.get(book.tool_of(agent))), cache=cache)
 
 
 def lot_take_message(item: dict, orchestras: list) -> str:
