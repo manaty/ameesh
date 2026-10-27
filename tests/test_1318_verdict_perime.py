@@ -47,7 +47,8 @@ class VerdictPerimeTest(unittest.TestCase):
             {"state": "build", "created_ts": 2.0, "actor": "relecteur"},
             {"state": "qa", "created_ts": 3.0},
         ]
-        jalons = progress._work_item_milestones(self._item(), events, [])
+        rows = [{"kind": "frozen", "at_ts": 3.0, "sha": "a" * 40}]
+        jalons = progress._work_item_milestones(self._item(), events, [], rows)
         self.assertFalse(jalons["verdict_current"])
         self.assertIsNone(jalons["reviewer"])
         self.assertEqual(stagnation.waiting(self._item(), jalons, [])["label"],
