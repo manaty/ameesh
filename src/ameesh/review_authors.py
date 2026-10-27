@@ -1284,17 +1284,23 @@ def _commit_hunks(repo: str, sha: str):
 
 
 def _path_lines(repo: str, rev: str, path: str, cache: dict):
-    """Les lignes exactes de `path` dans `rev`, ou None si absentes/illisibles."""
+    """`(lignes, saut de ligne final)` de `path` dans `rev`, ou (None, None).
+
+    Le saut de ligne final fait partie du contenu : `git show` le restitue,
+    et deux blobs identiques en texte mais pas en fin de fichier ne sont pas
+    la même livraison (#3902 B/P2, témoin cx1). Un fichier vide est tenu pour
+    terminé par un saut de ligne (la question n'a pas de sens)."""
     key = ("path-lines", str(rev), str(path))
     if key not in cache:
         text = _raw_out(repo, "show", "%s:%s" % (rev, path))
         if text is None:
-            cache[key] = None
+            cache[key] = (None, None)
         else:
+            eof = text.endswith("\n") if text else True
             lines = text.split("\n")
             if lines and lines[-1] == "":
                 lines.pop()
-            cache[key] = lines
+            cache[key] = (lines, eof)
     return cache[key]
 
 
@@ -1507,12 +1513,23 @@ def _content_before_head_value(repo: str, before: str, sha: str,
         if str(old_mode) != str(new_mode):
             meaningful = True
     for path, path_hunks in sorted(hunks.items()):
-        here = _path_lines(repo, before, path, cache)
-        if here is None:
+        here, here_eof = _path_lines(repo, before, path, cache)
+        here_present = here is not None
+        if not here_present:
             if _path_absent(repo, before, path, cache) is not True:
                 return False
             here = []
-        parent = _path_lines(repo, str(sha) + "^", path, cache)
+            here_eof = True
+        after, after_eof = _path_lines(repo, sha, path, cache)
+        if after is None:
+            if _path_absent(repo, sha, path, cache) is not True:
+                return False
+        elif here_present and bool(here_eof) != bool(after_eof):
+            # Le saut de ligne final fait partie du contenu : la cible peut
+            # porter le même texte sans la même fin de fichier (#3902 B/P2,
+            # témoin cx1). Le doute garde l'auteur.
+            return False
+        parent, _parent_eof = _path_lines(repo, str(sha) + "^", path, cache)
         if parent is None:
             if _path_absent(repo, str(sha) + "^", path, cache) is not True:
                 return False
@@ -1555,10 +1572,13 @@ def _content_before_head_value(repo: str, before: str, sha: str,
                 if old:
                     # L'image postérieure commence au début du fichier (le
                     # hunk n'a pas de contexte de tête) et l'ancien contenu
-                    # ne doit plus y figurer, même après une évolution.
+                    # ne doit plus y figurer, même après une évolution. Un
+                    # changement de seule fin de fichier a old == new : c'est
+                    # la comparaison des sauts de ligne qui tranche.
                     if list(here[:len(block)]) != list(block):
                         return False
-                    if _find_block(here, old, 0) >= 0:
+                    if (list(old) != list(block)
+                            and _find_block(here, old, 0) >= 0):
                         return False
                     index = 0
                 else:
@@ -1570,7 +1590,7 @@ def _content_before_head_value(repo: str, before: str, sha: str,
             # son contexte seul se retrouve tel quel (suppression en bout de
             # fichier, par exemple). Les lignes de contexte de tête sont
             # communes aux deux images ; on compare donc le cœur du hunk.
-            if old_core:
+            if old_core and list(old_core) != list(block):
                 if len(block) == hunk["lead"] + hunk["trail"]:
                     # suppression pure : le bloc postérieur n'est que du
                     # contexte, il peut se retrouver décalé. Dans l'image

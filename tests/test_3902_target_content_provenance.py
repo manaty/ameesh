@@ -106,7 +106,7 @@ class ContentBeforeHeadTest(unittest.TestCase):
 
     def test_unreadable_target_content_keeps_the_unknown(self):
         with mock.patch.object(review_authors, "_path_lines",
-                               return_value=None):
+                               return_value=(None, None)):
             self.assertEqual(self.remaining(),
                              [self.fixture.parent_commit])
 
@@ -617,6 +617,61 @@ class ContentBeforeHeadTest(unittest.TestCase):
         repo.git("checkout", "-q", "-b", "same-mode-delivered", base)
         repo.write("script.sh", "#!/bin/sh\necho new\n")
         delivered = repo.commit("target applies text, mode kept", agent="other")
+        self.assertTrue(review_authors._content_before_head(
+            repo.root, delivered, earlier))
+
+    def test_final_newline_is_part_of_the_proof(self):
+        """#3902 B/P2 (cx1) : même texte, fin de fichier différente — la
+        cible n'a pas livré le saut de ligne du candidat."""
+        repo = _Repo(os.path.join(self.tmp, "final-newline"))
+        repo.write("script.sh", "echo old\n")
+        base = repo.commit("base")
+        repo.write("script.sh", "echo new\n")
+        earlier = repo.commit("parent changes text with a final newline",
+                              agent="parent")
+        # cible : même texte, sans saut de ligne final
+        repo.git("checkout", "-q", "-b", "eof-target", base)
+        repo.write("script.sh", "echo new")
+        target = repo.commit("target drops the final newline", agent="other")
+        self.assertFalse(review_authors._content_before_head(
+            repo.root, target, earlier))
+        # tête : la cible + le saut de ligne, donc la livraison reste à faire
+        repo.git("checkout", "-q", "-b", "eof-head", target)
+        repo.write("script.sh", "echo new\n")
+        head = repo.commit("head restores the final newline", agent="impl")
+        self.assertEqual(review_authors._not_in_target(
+            repo.root, [earlier], target, head=head), [earlier])
+        self.assertTrue(review_authors._survives_rewrite(
+            repo.root, head, earlier, {}, target, target))
+        # positif : même texte et même fin de fichier
+        repo.git("checkout", "-q", "-b", "eof-delivered", base)
+        repo.write("script.sh", "echo new\n")
+        delivered = repo.commit("target applies text and newline",
+                                agent="other")
+        self.assertTrue(review_authors._content_before_head(
+            repo.root, delivered, earlier))
+        self.assertEqual(review_authors._not_in_target(
+            repo.root, [earlier], delivered, head=head), [])
+
+    def test_final_newline_only_change_is_not_proven(self):
+        """Un changement de seule fin de fichier (même texte) suit la même
+        règle : la cible doit porter le même statut EOF."""
+        repo = _Repo(os.path.join(self.tmp, "eof-only"))
+        repo.write("script.sh", "echo new\n")
+        base = repo.commit("base with a final newline")
+        repo.write("script.sh", "echo new")
+        earlier = repo.commit("parent removes the final newline", agent="parent")
+        # cible qui garde le saut de ligne
+        repo.git("checkout", "-q", "-b", "eof-only-kept", base)
+        repo.write("anchor.txt", "target advanced\n")
+        kept = repo.commit("target keeps the newline", agent="other")
+        self.assertFalse(review_authors._content_before_head(
+            repo.root, kept, earlier))
+        # cible qui applique le retrait du saut de ligne
+        repo.git("checkout", "-q", "-b", "eof-only-applied", base)
+        repo.write("script.sh", "echo new")
+        repo.write("anchor.txt", "target advanced\n")
+        delivered = repo.commit("target removes the newline", agent="other")
         self.assertTrue(review_authors._content_before_head(
             repo.root, delivered, earlier))
 
