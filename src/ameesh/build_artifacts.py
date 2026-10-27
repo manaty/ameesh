@@ -13,17 +13,22 @@ housekeeping pass frees what a build regenerates:
   cache: skipped, not even unlinked), never under the managed cache root.
 * **When**: the worktree had no activity (mtime or ctime of anything outside
   its artifacts, and of its git index and HEAD) for `artifact_idle` (24 h by
-  default), and NO process of the user has its cwd, its executable, an open
-  file or a mapped file inside it (`platform.user_paths`, read again right
-  before each deletion). A process of the user that cannot be read leaves a
-  doubt: no deletion at all for the pass (the dry run still lists its plan,
-  #3195), unless its name is allowed by the policy (`unreadable_ok`, empty
-  by default; logged) or it is the user's service manager (`systemd --user`:
-  not dumpable, lives in `/`). A key agent (`gpg-agent`) is not dumpable on
-  purpose and its open descriptors cannot be proven from outside: it stays a
-  doubt (#3195 R5); an agent host runs none (docs/EXPLOITATION.md).
-* **Never**: the main checkout of a repository, an agent's working directory
-  or a directory that contains one, a worktree charged to an agent in turn or
+  default), or for `artifact_ended_idle` (6 h by default, #3956) when every
+  lot it names is finished: nothing rebuilds in it any more, so its
+  regenerable output is only weight. And NO process of the user has its cwd,
+  its executable, an open file or a mapped file inside it
+  (`platform.user_paths`, read again right before each deletion). A process
+  of the user that cannot be read leaves a doubt: no deletion at all for the
+  pass (the dry run still lists its plan, #3195), unless its name is allowed
+  by the policy (`unreadable_ok`, empty by default; logged) or it is the
+  user's service manager (`systemd --user`: not dumpable, lives in `/`). A
+  key agent (`gpg-agent`) is not dumpable on purpose and its open descriptors
+  cannot be proven from outside: it stays a doubt (#3195 R5); an agent host
+  runs none (docs/EXPLOITATION.md).
+* **Never**: the main checkout of a repository, a directory that contains an
+  agent's working directory (the directory itself is only guarded by `keep()`
+  and the process check: #3956 removes its artifacts once its lots are all
+  finished and it is idle), a worktree charged to an agent in turn or
   named (branch or directory) after a lot still open (#3195: `keep`), a
   locked worktree (`git worktree lock`),
   a worktree whose walk is incomplete (unreadable entry, mount point, too many
@@ -77,6 +82,14 @@ DEFAULT_RULES = ("node_modules", "target:Cargo.toml")
 #: never bypassable by the policy: a `target` only counts beside a `Cargo.toml`
 FORCED_BESIDE = {"target": "Cargo.toml"}
 DEFAULT_IDLE_S = 24 * 3600.0
+#: #3956 : inactivité exigée d'un worktree dont TOUS les lots cités sont finis.
+#: Plus rien ne s'y reconstruit : ses sorties régénérables ne sont que du poids,
+#: et les garder 24 h comme un worktree sans lot a rempli le disque d'agents-1.
+DEFAULT_ENDED_IDLE_S = 6 * 3600.0
+#: #3956 : un worktree qui CONTIENT le dossier de travail d'un agent n'est
+#: jamais touché ; ce dossier lui-même ne l'est plus par statut — ses artefacts
+#: ne partent que si `keep()` le permet (aucun lot ouvert, aucun tour) et
+#: qu'aucun processus ne s'y tient, sinon ses node_modules restaient à vie.
 #: the walk of a worktree (outside its artifacts) stops being trusted beyond this
 WALK_LIMIT = 300_000
 #: sizes of artifacts are counted up to this many files (dry run)
@@ -776,6 +789,7 @@ def _identities(paths) -> set:
 
 
 def run(candidates: list[dict], rules, *, idle_s: float, protected, skip_roots=(),
+        ended_idle_s: float | None = None, ended_of=lambda worktree: False,
         owner_of=lambda path: None, keep=lambda worktree: "", dry_run: bool, now: float,
         allow=(), budget_s: float = PASS_BUDGET_S, clock=time.monotonic,
         lock_path: str | None = None, journal_path: str | None = None) -> dict:
@@ -783,12 +797,17 @@ def run(candidates: list[dict], rules, *, idle_s: float, protected, skip_roots=(
     and first finishes the trash dirs of the journal.
 
     `candidates`: from `worktrees()`; `protected`: agents' working
-    directories (a worktree that is or contains one is never touched);
-    `skip_roots`: managed roots, never entered nor deleted; `owner_of(path)`:
-    the agent a worktree is charged to; `keep(candidate)`: why an idle
-    worktree keeps its artifacts all the same ('' if nothing: #3195, an open
-    lot — recorded, or named by its branch or directory —, a turn in
-    progress); `allow`: names of unreadable processes that do
+    directories (a worktree that CONTAINS one is never touched; such a
+    directory itself is guarded by `keep()` and the process check, so its
+    artifacts can go — #3956); `skip_roots`: managed roots, never entered nor
+    deleted; `ended_idle_s`: shorter inactivity for a worktree whose cited
+    lots are all finished (`ended_of`, #3956), None to use `idle_s` only;
+    those worktrees are scanned first, so a pass cut by its budget frees them
+    before the others;
+    `owner_of(path)`: the agent a worktree is charged to; `keep(candidate)`:
+    why an idle worktree keeps its artifacts all the same ('' if nothing:
+    #3195, an open lot — recorded, or named by its branch or directory —,
+    a turn in progress); `allow`: names of unreadable processes that do
     not block (policy `unreadable_ok`); `lock_path`: the host-wide lock of
     deleting passes; `journal_path`: the journal of the trash dirs
     (`Journal`), without which nothing is deleted. A doubt on the processes
@@ -834,7 +853,11 @@ def run(candidates: list[dict], rules, *, idle_s: float, protected, skip_roots=(
         _resume(pending, journal, result, scan=scan, avoid=avoid, owner_of=owner_of,
                 dry_run=dry_run, budget=budget)
         if rules and candidates:
+            if ended_idle_s is not None:
+                # #3956: a pass cut by its budget must free the finished lots first
+                candidates = _ended_first(candidates, ended_of)
             _run(candidates, rules, result, idle_s=idle_s, protected=protected,
+                 ended_idle_s=ended_idle_s, ended_of=ended_of,
                  skip_roots=skip_roots, owner_of=owner_of, keep=keep, dry_run=dry_run, now=now,
                  allow=allow, scan=scan, avoid=avoid, journal=journal,
                  skip_ids=[tuple(r["id"]) for r in pending if r.get("id")], budget=budget)
@@ -890,7 +913,24 @@ def _log(result, base, path, why, done, worktree, rule, allowed) -> None:
                                         "unreadable_allowed": list(allowed), "rule": rule}))
 
 
-def _run(candidates, rules, result, *, idle_s, protected, skip_roots, owner_of, keep, dry_run,
+def _ended_first(candidates: list[dict], ended_of) -> list[dict]:
+    """#3956: the worktrees of finished lots first, then the others by path.
+
+    A pass is cut by its time budget (`PASS_BUDGET_S`, and the host pass
+    shares its own): keeping the candidates in their discovery order let the
+    tail wait for ever. Nothing here raises: an unreadable lot state only
+    leaves the worktree in the second group."""
+    def key(wt: dict):
+        try:
+            finished = bool(ended_of(wt))
+        except Exception:  # noqa: BLE001 - an unreadable state never reorders nor fails
+            finished = False
+        return (0 if finished else 1, str(wt.get("path") or ""))
+    return sorted(candidates, key=key)
+
+
+def _run(candidates, rules, result, *, idle_s, protected, skip_roots, ended_idle_s,
+         ended_of, owner_of, keep, dry_run,
          now, allow, scan, avoid, journal, skip_ids, budget: Budget) -> None:
     plan, skipped = result["plan"], result["skipped"]
     protected = [os.path.realpath(p) for p in protected if p]
@@ -904,7 +944,10 @@ def _run(candidates, rules, result, *, idle_s, protected, skip_roots, owner_of, 
             break
         path = wt["path"]
         real = os.path.realpath(path)
-        if wt.get("locked") or any(p == real or p.startswith(real.rstrip(os.sep) + os.sep)
+        # #3956 : `p != real` — le dossier de travail d'un agent n'est plus
+        # exempté par son seul statut ; un worktree qui en CONTIENT un reste
+        # intouchable (le ménage ne juge pas les artefacts d'un autre dossier).
+        if wt.get("locked") or any(p != real and p.startswith(real.rstrip(os.sep) + os.sep)
                                    for p in protected):
             continue
         found = survey(path, rules, skip_roots=skip_roots, skip_ids=skip_ids, budget=budget)
@@ -920,7 +963,12 @@ def _run(candidates, rules, result, *, idle_s, protected, skip_roots, owner_of, 
             skipped.append("artifacts of %s kept: %s" % (path, found["why"]))
             continue
         idle = now - float(found["latest"])
-        if idle < idle_s:
+        try:
+            finished = bool(ended_idle_s is not None and ended_of(wt))
+        except Exception:  # noqa: BLE001 - un état illisible ne raccourcit rien
+            finished = False
+        limit = ended_idle_s if finished and ended_idle_s is not None else idle_s
+        if idle < limit:
             recent += 1
             continue
         try:
@@ -934,7 +982,9 @@ def _run(candidates, rules, result, *, idle_s, protected, skip_roots, owner_of, 
         if held:
             skipped.append("artifacts of %s kept: process inside (%s)" % (path, ", ".join(held[:3])))
             continue
-        why = "worktree %s idle for %s" % (path, _fmt_age(idle))
+        why = "worktree %s idle for %s (%s)" % (
+            path, _fmt_age(idle),
+            "lots finished" if finished and limit == ended_idle_s else "no open lot")
         for artifact in found["artifacts"]:
             if budget.expired():
                 plan.append(dict(base, path=artifact, action="remis",
