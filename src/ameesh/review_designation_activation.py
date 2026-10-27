@@ -208,6 +208,15 @@ class Inputs:
     #: auteurs (plage courante et gels antérieurs reportés). Le refus de gel
     #: les nomme ; aucune décision ne les lit.
     author_commits: dict = field(default_factory=dict)
+    #: #3948 : marques de charge illisibles, lues avec les entrées. La note
+    #: est écrite dans la transaction du gel (hors de la lecture préalable),
+    #: pour ne pas séparer un diagnostic de son gel.
+    unreadable: tuple = ()
+    #: #3948 : état lu avec les entrées (assignation, cible, dernier gel).
+    #: Relu sous le verrou du gel : une préparation longue ne doit pas désigner
+    #: sur une cible ou une frise qui a bougé. Le plancher d'avis est relu à
+    #: part, sous le même verrou.
+    basis: dict = field(default_factory=dict)
 
 
 # --------------------------------------------------------------------------
@@ -1497,13 +1506,64 @@ def prepare_target(cfg, db, item: Mapping, head: str, *,
     return Target(repo, base, sha, head)
 
 
+def _latest_freeze_marker(db, lot: int, *, before_id: Optional[int] = None) -> Optional[list]:
+    """`[id, sha]` du `frozen` de plus grand id (strictement avant `before_id`).
+
+    #3948 : la lecture hors transaction capture cette marque ; le hook la relit
+    sous le verrou. Un gel concurrent écrit pendant la lecture rend la
+    préparation incomplète (ses auteurs ne sont pas dans la lecture) : la
+    désignation attend alors le rejeu de récupération au lieu de désigner sur
+    une frise périmée. La borne est l'**id**, comme le filtre `id < gel` de la
+    lecture des gels antérieurs — jamais `at` : l'horodatage est celui du début
+    de la transaction, et un gel concurrent peut avoir commencé plus tôt.
+    None = frise illisible, jamais un zéro supposé.
+    """
+    try:
+        rows = storage.of(db).work.milestones(int(lot), None) or []
+        if before_id is not None:
+            rows = [row for row in rows
+                    if int(row.get("id") or 0) < int(before_id)]
+        rows = [row for row in rows if row.get("kind") == "frozen"]
+        row = max(rows, key=lambda value: int(value.get("id") or 0),
+                  default=None)
+    except Exception:  # noqa: BLE001 - frise illisible : l'appelant attend
+        return None
+    if row is None:
+        return []
+    return [int(row.get("id") or 0), str(row.get("sha") or "").strip().lower()]
+
+
+def _prepared_basis(item: Mapping, target, latest) -> dict:
+    """L'état dont dépend la lecture préparée, à revérifier sous le verrou.
+
+    La politique d'avis vient du contenu gelé et du commit de canon audité :
+    elle ne dépend pas des verrous du lot et n'est pas relue ici (ce serait une
+    lecture Git sous le verrou). Le plancher d'avis est un journal du lot : il
+    est relu à part, car seul un plancher qui dépasse le compte préparé change
+    le besoin (un plancher plus bas ne retire aucun avis dû).
+    """
+    return {
+        "assignee": str((item or {}).get("assignee") or ""),
+        "target_declared": str(getattr(target, "declared", "") or ""),
+        "latest_freeze": latest,
+    }
+
+
 def prepare(cfg, db, lot: int, *, freeze: Optional[Mapping] = None,
-            fetch: bool = True, target=None) -> Inputs | Unavailable:
+            fetch: bool = True, target=None, note_unreadable: bool = True,
+            milestone_proof: Optional[Mapping] = None) -> Inputs | Unavailable:
     """Reads the machine inputs of a freeze; an expected refusal is `Unavailable`.
 
     `fetch=False` keeps the read local (no `git fetch`), as the freeze
     transaction requires. A branch target then needs the `target` snapshot
-    prepared outside the transaction; otherwise the read is unavailable."""
+    prepared outside the transaction; otherwise the read is unavailable.
+
+    `note_unreadable=False` (#3948) skips the charge note written by the
+    reading: the caller reads outside the freeze transaction and carries the
+    list in `Inputs.unreadable`, so the note stays in the freeze's
+    transaction. `milestone_proof` is the already-captured proof of the
+    `frozen` milestone being written: it serves as the reference author's
+    receipt when the milestone does not exist yet."""
     item = work.get(db, int(lot))
     if item is None:
         return Unavailable("lot #%d not found" % int(lot))
@@ -1564,12 +1624,18 @@ def prepare(cfg, db, lot: int, *, freeze: Optional[Mapping] = None,
     waiver = _waiver(item)
     if not paths:
         # no changed file: no review is due, and no policy needs to be read
+        # #3948 : la marque est bornée par l'id provisoire du gel, comme la
+        # lecture des auteurs (`id < gel`) : un gel concurrent arrivé après la
+        # préparation du jalon doit rester « nouveau » sous le verrou.
+        latest = _latest_freeze_marker(db, int(lot),
+                                       before_id=int(freeze.get("id") or 0))
         return Inputs(item=item, freeze=freeze, repo=repo, base=start, paths=[],
                       commits=commits,
                       policy=Policy(rules=(), families=(), risk="light", required=0,
                                     ref="", commit="", source=""),
                       authors=[], unknown_authors=[], correctors=[], candidates=[],
-                      notify="", manual=manual, waiver=waiver)
+                      notify="", manual=manual, waiver=waiver,
+                      basis=_prepared_basis(item, target, latest))
     policy = _policy(cfg, db, project, paths)
     if isinstance(policy, Unavailable):
         return policy
@@ -1599,13 +1665,22 @@ def prepare(cfg, db, lot: int, *, freeze: Optional[Mapping] = None,
     candidates = _candidates(listing, loads=_loads(db, unreadable=unreadable),
                              project=project, families=families, pilot=notify,
                              closed_hosts=closed_hosts)
-    if unreadable:
+    if unreadable and note_unreadable:
         _note_unreadable(db, int(lot), str(item.get("state") or ""), unreadable)
+    # #3948 : capturée AVANT la lecture des auteurs, la marque doit être
+    # antérieure à ce que cette lecture voit ; sinon un gel arrivé entre les
+    # deux serait réputé déjà lu et ses auteurs manqueraient. La borne est
+    # l'id provisoire du gel, exactement le filtre `id < gel` de la lecture
+    # des gels antérieurs : sous le verrou, la même marque est relue avant le
+    # vrai id du jalon, et tout gel concurrent apparaît entre les deux.
+    latest = _latest_freeze_marker(db, int(lot),
+                                   before_id=int(freeze.get("id") or 0))
     author_commits: dict = {}
     authors, unknown, correctors = review_authors.reading(
         db, item, freeze, commits, repo, families=policy.families, trace=True,
         base=start, head=frozen_sha, target=read_target,
-        commits_out=author_commits, fetch=fetch)
+        commits_out=author_commits, fetch=fetch,
+        milestone_proof=milestone_proof)
     return Inputs(item=item, freeze=freeze, repo=repo, base=start, paths=paths,
                   commits=commits, policy=policy, authors=authors,
                   unknown_authors=unknown, correctors=correctors,
@@ -1613,7 +1688,85 @@ def prepare(cfg, db, lot: int, *, freeze: Optional[Mapping] = None,
                   manual=manual, waiver=waiver,
                   manual_seats=_manual_seats(manual, listing, authors, families,
                                              correctors=correctors),
-                  advances=_advances(db), author_commits=author_commits)
+                  advances=_advances(db), author_commits=author_commits,
+                  unreadable=tuple(unreadable),
+                  basis=_prepared_basis(item, target, latest))
+
+
+@dataclass(frozen=True)
+class PrepareFailure:
+    """A `prepare` exception captured before the freeze transaction (#3948).
+
+    `_designate_in_transaction` journals it like an in-transaction failure;
+    the exception never escapes before the milestone is written, so a read
+    error still leaves the freeze to the journal instead of losing it."""
+
+    error: Exception
+
+
+def _provisional_freeze(db, lot: int, head: str, actor: str) -> dict:
+    """Le jalon lu avant l'INSERT : identifiant au-delà des marques du lot.
+
+    La lecture hors transaction précède l'INSERT : elle doit voir exactement
+    les marques que le futur jalon verra. Un identifiant au-delà de tous ceux
+    du lot donne le même ensemble `id < gel` ; la base attribuera le vrai.
+    `at_ts` est l'heure de la base, comme le jalon (jamais l'horloge de
+    l'hôte, qui peut diverger). Une lecture impossible garde une borne haute
+    et l'heure locale : la désignation lira alors toutes les marques
+    antérieures, ce qui est le comportement sûr.
+    """
+    next_id = 2 ** 31 - 1
+    at_ts = time.time()
+    try:
+        rows = db.query(
+            "SELECT coalesce(max(id), 0) + 1 AS next_id,"
+            "       extract(epoch from now())::float8 AS now_ts"
+            "  FROM work_item_milestones WHERE work_item_id = %s", (int(lot),))
+        row = (rows or [{}])[0]
+        next_id = int(row.get("next_id") or 1)
+        at_ts = float(row.get("now_ts") or at_ts)
+    except Exception:  # noqa: BLE001 - lecture impossible : borne haute
+        pass
+    return {"id": next_id, "sha": str(head or "").strip(),
+            "at_ts": at_ts, "actor": str(actor or "")}
+
+
+def prepare_for_freeze(cfg, db, item: Mapping, head: str, *, target=None,
+                       actor: str = "",
+                       proof: Optional[Mapping] = None) -> Inputs | Unavailable | PrepareFailure:
+    """Lit les entrées de la désignation **avant** la transaction du gel (#3948).
+
+    `prepare` fait des lectures Git (plage gelée, politique du canon, et
+    surtout `_carried_from_previous` sur tous les gels antérieurs). Appelée
+    dans la transaction du jalon, elle la laissait `idle in transaction` plus
+    de 180 s sur un lot à nombreux gels (incident #3889) ; la garde
+    `idle_in_transaction_session_timeout` tuait alors la connexion, et le gel
+    échouait sans que rien ne soit écrit.
+
+    La lecture se fait donc ici, hors transaction, avec la cible déjà épinglée
+    (`prepare_target`) et les objets des gels antérieurs déjà rapatriés
+    (`prefetch_freeze_objects`). Le hook reçoit le résultat et ne fait plus que
+    les écritures, sous le verrou du lot.
+
+    `freeze` est provisoire : son identifiant est au-delà de tous les jalons du
+    lot (même ensemble de marques antérieures), son `at_ts` est l'instant de
+    la lecture (le jalon sera daté par la base), et `proof` tient lieu de reçu
+    pour `reference_author` puisque le jalon n'existe pas encore. Hors tour
+    (`proof is None`), la preuve est **vide** et non absente : sans cette
+    distinction, `reference_author` lirait le reçu du jalon provisoire, dont
+    l'id — `max(id du lot) + 1` — est un bigserial global qui désigne en
+    général le jalon d'un autre lot (#3948, B2 dev4). Une exception est
+    capturée dans `PrepareFailure` : le gel reste écrit, la désignation attend
+    et le journal le dit, comme avant.
+    """
+    lot = int(item["id"])
+    freeze = _provisional_freeze(db, lot, head, actor)
+    try:
+        return prepare(cfg, db, lot, freeze=freeze, fetch=False, target=target,
+                       note_unreadable=False,
+                       milestone_proof=proof if proof is not None else {})
+    except Exception as exc:  # noqa: BLE001 - journalisé, jamais perdu
+        return PrepareFailure(exc)
 
 
 def prefetch_freeze_objects(db, item: Mapping, target, head: str) -> list[str]:
@@ -2585,11 +2738,114 @@ def _excluded_names(inputs: Inputs) -> set[str]:
             if str(row.get("name") or "").strip()}
 
 
+def _fresh_prepared(cfg, tx, item: Mapping, freeze: Mapping,
+                    inputs: Inputs) -> Inputs | Unavailable:
+    """Recolle la lecture préalable sur l'état pris sous le verrou (#3948).
+
+    Les entrées viennent d'une lecture faite hors transaction : l'assignation,
+    la cible, la frise des gels et le plancher d'avis ont pu bouger pendant ses
+    ~140 s. Ils sont revérifiés ici, sous le verrou du lot ; un changement rend
+    la préparation périmée et la désignation attend le rejeu de récupération
+    (le gel, lui, reste écrit). Les gestes manuels (colonne `reviewers`,
+    dispense `-none`) sont relus de la même façon. Le reste de la lecture
+    (plage, politique, auteurs) est celui de la cible et de la frise vérifiées.
+    """
+    basis = dict(inputs.basis or {})
+    if basis:
+        lot = int(item.get("id") or 0)
+        if str(item.get("assignee") or "") != str(basis.get("assignee") or ""):
+            return Unavailable(
+                "the reading is stale: the assignee changed during the "
+                "pre-transaction reading; the designation is left to the "
+                "recovery path")
+        try:
+            current_target = lot_class.default_base(cfg, item, inputs.repo) or ""
+        except Exception:  # noqa: BLE001 - cible illisible : périmé par doute
+            current_target = ""
+        if str(current_target) != str(basis.get("target_declared") or ""):
+            return Unavailable(
+                "the reading is stale: the target changed during the "
+                "pre-transaction reading (%s -> %s); the designation is left "
+                "to the recovery path"
+                % (basis.get("target_declared") or "?", current_target or "?"))
+        expected = basis.get("latest_freeze")
+        if expected is None:
+            return Unavailable(
+                "the reading cannot be validated: the prior freezes were "
+                "unreadable when it was prepared; the designation is left to "
+                "the recovery path")
+        current = _latest_freeze_marker(
+            tx, lot, before_id=int(freeze.get("id") or 0))
+        if current is None:
+            return Unavailable(
+                "the reading cannot be validated: the prior freezes are "
+                "unreadable under the lock; the designation is left to the "
+                "recovery path")
+        if list(current) != list(expected or []):
+            return Unavailable(
+                "the reading is stale: a freeze was written during the "
+                "pre-transaction reading; the designation is left to the "
+                "recovery path")
+        # #3557 : un plancher posé pendant la lecture complète la désignation
+        # de son côté ; la préparation, elle, a compté les avis avec l'ancien.
+        # Seul un plancher qui dépasse le compte préparé manque des avis : un
+        # plancher plus bas ne retire rien et laisse la lecture valable.
+        floor = review_floor.apply({}, tx, lot, cfg=cfg)
+        if floor.get("reviews_floor_unreadable"):
+            return Unavailable(
+                "the reading cannot be validated: the review floor is "
+                "unreadable under the lock; the designation is left to the "
+                "recovery path")
+        if inputs.paths and int(floor.get("reviews_floor") or 0) > int(
+                inputs.policy.required):
+            return Unavailable(
+                "the reading is stale: the review floor was raised during the "
+                "pre-transaction reading (%s review(s) prepared, %s now "
+                "required); the designation is left to the recovery path"
+                % (int(inputs.policy.required),
+                   int(floor.get("reviews_floor") or 0)))
+    manual = _manual(tx, item)
+    waiver = _waiver(item)
+    if list(manual) == list(inputs.manual) and bool(waiver) == bool(inputs.waiver):
+        return dataclasses.replace(inputs, item=dict(item), freeze=dict(freeze))
+    listing = registry.overview(tx)
+    return dataclasses.replace(
+        inputs, item=dict(item), freeze=dict(freeze), manual=list(manual),
+        waiver=bool(waiver),
+        manual_seats=_manual_seats(manual, listing, inputs.authors,
+                                   inputs.policy.families,
+                                   correctors=inputs.correctors))
+
+
+def _unavailable_in_transaction(cfg, tx, item: Mapping, freeze: Mapping,
+                                manual: Sequence[str], threads: list,
+                                why: str, *, silent: bool = False) -> dict:
+    """Journalise et notifie une désignation indisponible, sans écriture Git."""
+    if manual:
+        return _manual_unavailable(cfg, tx, item, freeze, manual, threads,
+                                   why, silent=silent)
+    if not silent:
+        notify = _notify(cfg, tx, str(item.get("app") or ""),
+                         registry.overview(tx))
+        _note_unavailable(tx, item, freeze, why, threads, notify)
+        _sync_reviewers(tx, item, freeze, [])
+    return {"state": "unavailable", "reviewers": [], "freeze": dict(freeze),
+            "why": why}
+
+
 def _designate_in_transaction(cfg, tx, lot: int, *, milestone: Optional[Mapping],
                               threads: list, carried: Optional[Mapping] = None,
                               reading: Optional[dict] = None, target=None,
-                              freezing: bool = False) -> dict:
+                              freezing: bool = False,
+                              prepared: Optional[object] = None) -> dict:
     """The `on_frozen` body: all writes stay in the freeze's transaction.
+
+    `prepared` (#3948) est le résultat de `prepare_for_freeze`, lu **avant**
+    l'ouverture de la transaction : `Inputs`, `Unavailable` ou
+    `PrepareFailure`. Il évite de refaire dans la transaction les lectures Git
+    des gels antérieurs, qui l'ont laissée inactive plus de 180 s et l'ont
+    fait tuer par la garde. Absent (rejeu, appelant qui fournit son propre
+    hook), la lecture se fait ici comme avant.
 
     `freezing` (#3742) : l'appel vient du jalon `frozen` lui-même, pas d'un
     rejeu de désignation. Après la lecture qui précède la sélection, le gel est
@@ -2631,27 +2887,45 @@ def _designate_in_transaction(cfg, tx, lot: int, *, milestone: Optional[Mapping]
         return _manual_outcome(tx, item, freeze, manual, waiver=True)
     if carried:
         return _carried_in_transaction(tx, item, freeze, carried)
-    try:
-        # no network read inside the freeze transaction (see the docstring)
-        inputs = prepare(cfg, tx, int(lot), freeze=freeze, fetch=False, target=target)
-    except Exception as exc:  # noqa: BLE001 - recorded below, never guessed
+    if prepared is None:
+        try:
+            # no network read inside the freeze transaction (see the docstring)
+            inputs = prepare(cfg, tx, int(lot), freeze=freeze, fetch=False,
+                             target=target)
+        except Exception as exc:  # noqa: BLE001 - recorded below, never guessed
+            if manual:
+                return _manual_unavailable(
+                    cfg, tx, item, freeze, manual, threads,
+                    "internal designation error: %s: %s"
+                    % (type(exc).__name__, str(exc)[:240]))
+            return _internal_failure(cfg, tx, item, freeze, threads, exc)
+    elif isinstance(prepared, PrepareFailure):
+        exc = prepared.error
         if manual:
             return _manual_unavailable(
                 cfg, tx, item, freeze, manual, threads,
                 "internal designation error: %s: %s"
                 % (type(exc).__name__, str(exc)[:240]))
         return _internal_failure(cfg, tx, item, freeze, threads, exc)
+    else:
+        inputs = prepared
     if isinstance(inputs, Unavailable):
-        if manual:
-            return _manual_unavailable(cfg, tx, item, freeze, manual, threads,
-                                       inputs.why, silent=inputs.silent)
-        if not inputs.silent:
-            notify = _notify(cfg, tx, str(item.get("app") or ""),
-                             registry.overview(tx))
-            _note_unavailable(tx, item, freeze, inputs.why, threads, notify)
-            _sync_reviewers(tx, item, freeze, [])
-        return {"state": "unavailable", "reviewers": [], "freeze": freeze,
-                "why": inputs.why}
+        return _unavailable_in_transaction(
+            cfg, tx, item, freeze, manual, threads, inputs.why,
+            silent=inputs.silent)
+    if prepared is not None:
+        # #3948 : la lecture est antérieure à la transaction ; l'état du lot
+        # (assignation, cible, frise, colonne des relecteurs, dispense) est
+        # revérifié sous le verrou. Une préparation périmée ne désigne pas.
+        refreshed = _fresh_prepared(cfg, tx, item, freeze, inputs)
+        if isinstance(refreshed, Unavailable):
+            return _unavailable_in_transaction(
+                cfg, tx, item, freeze, manual, threads, refreshed.why,
+                silent=refreshed.silent)
+        inputs = refreshed
+        if inputs.unreadable:
+            _note_unreadable(tx, int(lot), str(item.get("state") or ""),
+                             list(inputs.unreadable))
     if freezing:
         # #3742 : refus du gel quand les familles d'auteurs prouvés
         # (correcteurs compris) laissent moins de familles éligibles que
@@ -2752,34 +3026,21 @@ def _excluded_on_freeze(cfg, db, item: Mapping, freeze: Mapping, *,
             if str(row.get("name") or "").strip()}
 
 
-def _notify_superseded_blocks(db, item: Mapping, freeze: Mapping, outcome: Mapping,
-                              threads: list, *, cfg=None,
-                              excluded: set[str] | None = None,
-                              fetch: bool = True) -> None:
-    """Notifie le relecteur dont le blocage portait sur une tête antérieure.
+def _superseded_candidates(db, item: Mapping, freeze: Mapping,
+                           outcome: Mapping) -> tuple:
+    """`(lot, gel, sha, candidats)` de la notification #2681, sans lecture Git.
 
-    #2681 : la porte ne lit que les verdicts de la tête gelée ; un blocage
-    posé sur une tête antérieure ne bloque plus, et un `ok` indépendant sur la
-    nouvelle tête suffit. Le relecteur qui a bloqué doit le savoir : un
-    `notify` par (lot, gel, relecteur), jamais un doublon, et pas de courrier
-    quand sa désignation du gel le prévient déjà. Une lecture impossible ne
-    perd jamais un gel : la notification est au mieux.
-
-    #2812 : on n'invite pas un agent que la porte écarte sur cette tête — un
-    auteur de la plage gelée, y compris un relecteur dont la correction est un
-    commit de la tête (#2888). `excluded` est la lecture déjà faite par la
-    désignation ; à défaut (`None`), elle est refaite ici, et son échec laisse
-    le courrier historique.
-
-    `fetch=False` (#3836) interdit le rapatriement par la forge : la
-    notification tourne dans la transaction du gel et ne doit jamais y attendre
-    le réseau."""
+    Un candidat est le dernier verdict d'un acteur qui a bloqué une **autre**
+    tête et que la désignation du gel ne prévient pas déjà. La lecture est
+    purement base de données : l'appelant décide quand la preuve d'exclusion
+    (Git) est nécessaire, et ne la lance jamais sous le verrou du gel (#3948
+    B cx3)."""
     lot = int((item or {}).get("id") or 0)
     freeze_id = int((freeze or {}).get("id") or 0)
     sha = str((freeze or {}).get("sha") or "").strip().lower()
     state = str((outcome or {}).get("state") or "")
     if not lot or not freeze_id or not sha or state in ("unavailable", "stale"):
-        return
+        return lot, freeze_id, sha, []
     rows = storage.of(db).work.milestones(lot, None)
     latest: dict = {}
     for row in rows or ():
@@ -2809,6 +3070,34 @@ def _notify_superseded_blocks(db, item: Mapping, freeze: Mapping, outcome: Mappi
             # du gel envoie déjà son propre courrier au relecteur
             continue
         candidates.append((key, row, mark_sha))
+    return lot, freeze_id, sha, candidates
+
+
+def _notify_superseded_blocks(db, item: Mapping, freeze: Mapping, outcome: Mapping,
+                              threads: Optional[list], *, cfg=None,
+                              excluded: set[str] | None = None,
+                              fetch: bool = True) -> None:
+    """Notifie le relecteur dont le blocage portait sur une tête antérieure.
+
+    #2681 : la porte ne lit que les verdicts de la tête gelée ; un blocage
+    posé sur une tête antérieure ne bloque plus, et un `ok` indépendant sur la
+    nouvelle tête suffit. Le relecteur qui a bloqué doit le savoir : un
+    `notify` par (lot, gel, relecteur), jamais un doublon, et pas de courrier
+    quand sa désignation du gel le prévient déjà. Une lecture impossible ne
+    perd jamais un gel : la notification est au mieux.
+
+    #2812 : on n'invite pas un agent que la porte écarte sur cette tête — un
+    auteur de la plage gelée, y compris un relecteur dont la correction est un
+    commit de la tête (#2888). `excluded` est la lecture déjà faite par la
+    désignation ; à défaut (`None`), elle est refaite ici, et son échec laisse
+    le courrier historique.
+
+    `fetch=False` (#3836) interdit le rapatriement par la forge : la
+    notification tourne dans la transaction du gel et ne doit jamais y attendre
+    le réseau. `threads=None` écrit le courrier dans la transaction courante
+    (chemin différé après commit, #3948) ; une liste le diffère à son tour."""
+    lot, freeze_id, sha, candidates = _superseded_candidates(
+        db, item, freeze, outcome)
     if not candidates:
         return
     if excluded is None:
@@ -2846,9 +3135,37 @@ def _notify_superseded_blocks(db, item: Mapping, freeze: Mapping, outcome: Mappi
                   after_commit=threads)
 
 
+def _deferred_superseded(cfg, lot: int, freeze: Mapping, result: Mapping):
+    """La notification #2681 rejouée **après** le COMMIT du gel (#3948 B cx3).
+
+    Les chemins `carried` et `waiver` de `_designate_in_transaction` sortent
+    avant de renseigner la lecture d'exclusion. La notification ne doit pas
+    refaire `_excluded_on_freeze` sous le verrou du gel : un lot réaligné à
+    nombreux gels y relancerait `_carried_from_previous` plus de deux minutes,
+    le défaut que ce lot corrige. La preuve d'exclusion est donc lue après
+    commit (autocommit, aucun verrou tenu), puis la note et le courrier
+    s'écrivent ensemble dans une transaction courte.
+    """
+    def notify(db_cfg, db):
+        try:
+            item = work.get(db, int(lot)) or {"id": int(lot)}
+            candidates = _superseded_candidates(db, item, freeze, result)[3]
+            if not candidates:
+                return
+            excluded = _excluded_on_freeze(cfg, db, item, freeze, fetch=False)
+            with db.transaction() as tx:
+                _notify_superseded_blocks(tx, item, freeze, result, None,
+                                          cfg=cfg, excluded=excluded,
+                                          fetch=False)
+        except Exception:  # noqa: BLE001 - notification au mieux, gel gardé
+            pass
+    return notify
+
+
 def designate_in_transaction(cfg, tx, lot: int, *, milestone: Optional[Mapping],
                              threads: list, carried: Optional[Mapping] = None,
-                             target=None, freezing: bool = False) -> dict:
+                             target=None, freezing: bool = False,
+                             prepared: Optional[object] = None) -> dict:
     """The `on_frozen` body, plus the superseded-block notification (#2681).
 
     The notification is best-effort: it runs after the designation writes, and
@@ -2857,12 +3174,26 @@ def designate_in_transaction(cfg, tx, lot: int, *, milestone: Optional[Mapping],
     whose earlier block no longer blocks the new head. `freezing` (#3742) is
     passed to the body: from the `frozen` milestone, a head its author families
     make unreviewable raises before any designation write and rolls the
-    milestone back; a replay of an existing freeze leaves it False."""
+    milestone back; a replay of an existing freeze leaves it False.
+    `prepared` (#3948) is the pre-transaction reading, handed to the body
+    unchanged so no Git reading runs under the freeze's lock. Quand le corps
+    sort par un chemin sans lecture préparée (`carried`, `waiver`), la
+    notification #2681 est différée après le COMMIT : `_excluded_on_freeze`
+    relit les gels antérieurs et ne doit jamais tourner sous le verrou du gel
+    (#3948 B cx3)."""
     reading: dict = {}
     result = _designate_in_transaction(cfg, tx, lot, milestone=milestone,
                                        threads=threads, carried=carried,
                                        reading=reading, target=target,
-                                       freezing=freezing)
+                                       freezing=freezing, prepared=prepared)
+    if (reading.get("excluded") is None
+            and str(result.get("state") or "") not in ("unavailable", "stale")):
+        # #3948 B cx3 : pas de lecture préparée sur ces chemins ; la
+        # notification est au mieux et se rejoue hors transaction.
+        threads.append(_deferred_superseded(cfg, int(lot),
+                                            dict(milestone or {}),
+                                            dict(result)))
+        return result
     try:
         item = work.get(tx, int(lot)) or {"id": int(lot)}
         _notify_superseded_blocks(tx, item, milestone or {}, result, threads,
@@ -2874,7 +3205,7 @@ def designate_in_transaction(cfg, tx, lot: int, *, milestone: Optional[Mapping],
 
 
 def hook(cfg, outcome: Optional[dict] = None, *, carried: Optional[Mapping] = None,
-         target=None):
+         target=None, prepared: Optional[object] = None):
     """The callback installed on the CLI's `frozen` milestone.
 
     `outcome`, when given, receives the designation shape for the command's
@@ -2883,12 +3214,13 @@ def hook(cfg, outcome: Optional[dict] = None, *, carried: Optional[Mapping] = No
     (#2487): the callback then keeps the reported reviewers and mails nobody.
     `target` (#3250) is prepared before opening the transaction; without it a
     branch target defers to recovery instead of trusting the clone's old ref.
-    """
+    `prepared` (#3948) is the machine reading prepared before the transaction;
+    the hook only writes under the lock."""
     def on_frozen(tx, milestone, threads):
         result = designate_in_transaction(cfg, tx, int(milestone["work_item_id"]),
                                           milestone=milestone, threads=threads,
                                           carried=carried, target=target,
-                                          freezing=True)
+                                          freezing=True, prepared=prepared)
         if outcome is not None:
             outcome.clear()
             outcome.update(result)
