@@ -160,7 +160,9 @@ class PanneDeBaseTest(PgTestCase):
 
         with mock.patch.object(worker, "run_turn", side_effect=tour):
             self._lance(worker)
-            worker.join(timeout=10)
+            # 30 s : sous charge, la base met 2 à 4 s à revenir ; la borne à 10 s
+            # était au ras en local et rougissait sous --parallel (#3832).
+            worker.join(timeout=30)
         self.assertFalse(worker.is_alive())
         self.assertEqual(len(appels), 2, "la consigne remise doit être reprise")
         self.assertEqual(appels[1]["prompt"], "fais le lot")
