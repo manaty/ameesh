@@ -560,6 +560,66 @@ class ContentBeforeHeadTest(unittest.TestCase):
         self.assertTrue(review_authors._content_before_head(
             repo.root, delivered, earlier))
 
+    def test_whole_file_rewrite_without_context_is_not_proven_by_free_search(self):
+        """#3902 B2 (dev1) : un hunk sans contexte couvre tout le fichier ;
+        le bloc postérieur trouvé ailleurs ne prouve pas la réécriture."""
+        repo = _Repo(os.path.join(self.tmp, "whole-rewrite"))
+        repo.write("f.py", "alpha_line();\nbeta_line();\n")
+        base = repo.commit("base")
+        repo.write("f.py", "gamma_line();\ndelta_line();\n")
+        earlier = repo.commit("parent rewrites the whole file", agent="parent")
+        # cible qui garde l'ancien contenu puis ajoute le nouveau
+        repo.git("checkout", "-q", "-b", "rewrite-target", base)
+        repo.write("f.py", "alpha_line();\nbeta_line();\n"
+                          "gamma_line();\ndelta_line();\n")
+        target = repo.commit("target appends the post-image", agent="other")
+        self.assertFalse(review_authors._content_before_head(
+            repo.root, target, earlier))
+        self.assertEqual(review_authors._not_in_target(
+            repo.root, [earlier], target, head=earlier), [earlier])
+        # cible où la réécriture est réellement appliquée
+        repo.git("checkout", "-q", "-b", "rewrite-delivered", base)
+        repo.write("f.py", "gamma_line();\ndelta_line();\n")
+        delivered = repo.commit("target rewrites the file", agent="other")
+        self.assertTrue(review_authors._content_before_head(
+            repo.root, delivered, earlier))
+        self.assertEqual(review_authors._not_in_target(
+            repo.root, [earlier], delivered, head=earlier), [])
+
+    def test_empty_file_creation_mode_is_checked(self):
+        """#3902 B1 (dev1) : une création vide ou exécutable sans hunk est
+        prouvée par le mode et la présence du chemin, jamais par omission."""
+        repo = _Repo(os.path.join(self.tmp, "empty-creation"))
+        repo.write("base.txt", "base\n")
+        base = repo.commit("base")
+        open(os.path.join(repo.root, "tool.sh"), "w").close()
+        os.chmod(os.path.join(repo.root, "tool.sh"), 0o755)
+        earlier = repo.commit("parent creates an executable empty file",
+                              agent="parent")
+        # cible sans le fichier
+        repo.git("checkout", "-q", "-b", "empty-target", base)
+        repo.write("anchor.txt", "target advanced\n")
+        target = repo.commit("target does not create it", agent="other")
+        self.assertFalse(review_authors._content_before_head(
+            repo.root, target, earlier))
+        self.assertEqual(review_authors._not_in_target(
+            repo.root, [earlier], target, head=earlier), [earlier])
+        # cible avec le fichier mais au mauvais mode
+        repo.git("checkout", "-q", "-b", "empty-wrong-mode", base)
+        open(os.path.join(repo.root, "tool.sh"), "w").close()
+        repo.write("anchor.txt", "target advanced\n")
+        wrong = repo.commit("target creates it non-executable", agent="other")
+        self.assertFalse(review_authors._content_before_head(
+            repo.root, wrong, earlier))
+        # cible avec le fichier vide au bon mode
+        repo.git("checkout", "-q", "-b", "empty-delivered", base)
+        open(os.path.join(repo.root, "tool.sh"), "w").close()
+        os.chmod(os.path.join(repo.root, "tool.sh"), 0o755)
+        repo.write("anchor.txt", "target advanced\n")
+        delivered = repo.commit("target creates it executable", agent="other")
+        self.assertTrue(review_authors._content_before_head(
+            repo.root, delivered, earlier))
+
     def test_delivered_reorder_is_proven(self):
         """La preuve stricte accepte un réordre réellement livré."""
         repo = _Repo(os.path.join(self.tmp, "reorder-delivered"))

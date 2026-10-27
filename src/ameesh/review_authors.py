@@ -1435,6 +1435,20 @@ def _content_before_head(repo: str, before: str, sha: str,
                          cache: Optional[dict] = None) -> bool:
     """Preuve positive que le patch de `sha` est déjà dans `before` (#3902).
 
+    Le résultat est mis en cache par `(cible, sha)` : la désignation et la
+    porte relisent le même commit, et l'alignement coûte cher sur un gros
+    fichier (#3902 N de dev1)."""
+    cache = {} if cache is None else cache
+    key = ("content-before", str(before), str(sha))
+    if key not in cache:
+        cache[key] = _content_before_head_value(repo, before, sha, cache)
+    return bool(cache[key])
+
+
+def _content_before_head_value(repo: str, before: str, sha: str,
+                               cache: Optional[dict] = None) -> bool:
+    """Preuve positive que le patch de `sha` est déjà dans `before` (#3902).
+
     Un gel antérieur peut porter les commits d'un lot parent que la cible a
     depuis intégrés **sous d'autres SHA** (squash, empilement, réécriture) :
     ces commits ne comptent ni comme auteurs ni comme inconnus du lot courant.
@@ -1527,12 +1541,25 @@ def _content_before_head(repo: str, before: str, sha: str,
                 if list(here[index:index + len(block)]) != block:
                     return False
             else:
-                # ni contexte de tête ni de queue : création de fichier ou
-                # ligne isolée ; la recherche historique reste la seule
-                # preuve possible, et le doute la borne.
-                index = _find_block(here, block, position)
-                if index < 0:
-                    return False
+                # ni contexte de tête ni de queue : avec une image antérieure
+                # non vide, le hunk couvre tout le fichier (réécriture
+                # entière) ; le bloc doit être le fichier entier, jamais un
+                # bloc trouvé ailleurs (#3902 B2 dev1). Pour une création
+                # (ancienne image vide), la recherche historique reste la
+                # seule preuve possible, et le doute la borne.
+                if old:
+                    # L'image postérieure commence au début du fichier (le
+                    # hunk n'a pas de contexte de tête) et l'ancien contenu
+                    # ne doit plus y figurer, même après une évolution.
+                    if list(here[:len(block)]) != list(block):
+                        return False
+                    if _find_block(here, old, 0) >= 0:
+                        return False
+                    index = 0
+                else:
+                    index = _find_block(here, block, position)
+                    if index < 0:
+                        return False
             # L'image antérieure du hunk ne doit pas être encore à sa place :
             # une suppression non appliquée n'est pas une livraison, même si
             # son contexte seul se retrouve tel quel (suppression en bout de
