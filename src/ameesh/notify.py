@@ -112,6 +112,7 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import time
 import uuid
 import urllib.error
@@ -1570,11 +1571,21 @@ def empty_state() -> dict:
 
 #: #3576 : le document d'envoi et son bail d'exécution sont partagés en base
 #: (`notify_state`), pour que la passe `alerts` change d'hôte sans re-pousser.
-#: La durée du bail couvre le `TimeoutStartSec=10min` de l'unité de rôle
-#: (`role_timers.render_service`) : un passage anormalement long ne livre
-#: jamais au-delà de l'expiration de son unité.
+#: #3913 : le bail ne vaut plus 10 min. Il est RENOUVELÉ pendant la passe
+#: (`_StateRenewal`) : une passe tuée (redémarrage de la base, SIGKILL, timeout
+#: de l'unité) ne laisse donc pas un bail orphelin plus longtemps que cette
+#: durée. Avec la cadence de la minuterie de rôle (30 s), la reprise arrive en
+#: ~2 min, très en dessous de `notify_gap.ALIVE_S` (600 s) : un incident de
+#: cette forme ne lève plus `notify_undeliverable`, et le témoin de #3007 n'est
+#: plus confondu avec une panne de 10 min. Le plafond du renouvellement est le
+#: `TimeoutStartSec=10min` de l'unité de rôle (`role_timers.render_service`) :
+#: la passe s'arrête d'elle-même avant.
 STATE_SCOPE = "alerts"
-STATE_LEASE_S = 600.0
+STATE_LEASE_S = 90.0
+#: intervalle de renouvellement : trois occasions avant l'expiration
+STATE_RENEW_S = STATE_LEASE_S / 3.0
+#: attente maximale du fil de renouvellement au rendu du bail
+STATE_RENEW_STOP_S = 2.0
 
 
 def _state_from_document(data) -> dict | None:
@@ -1730,16 +1741,204 @@ def _merge_local_state(local: dict, shared: dict, host, *,
         shared["active"].pop(key, None)
 
 
+class _StateRenewal:
+    """Renouvelle le bail d'état partagé pendant une passe qui dure (#3913).
+
+    Une connexion à part : la passe tient la sienne, et une transaction longue
+    du passage ne retarde pas le renouvellement. Un échec réseau n'arrête pas
+    le fil (la base peut revenir avant l'expiration) ; un refus du bail
+    (`False`) le marque perdu et l'écriture finale échouera, comme il se doit.
+    """
+
+    def __init__(self, cfg: Config, owner: str, epoch: int, *,
+                 ttl: float, interval: float, log=None):
+        self.cfg, self.owner, self.epoch = cfg, owner, int(epoch)
+        self.ttl, self.interval = float(ttl), max(0.01, float(interval))
+        self.log = log or (lambda text: None)
+        self.lost = False
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._warned = False
+
+    def start(self) -> None:
+        self._thread = threading.Thread(target=self._run, daemon=True,
+                                        name="notify-state-lease")
+        self._thread.start()
+
+    def _run(self) -> None:
+        conn = None
+        try:
+            while not self._stop.wait(self.interval):
+                try:
+                    if conn is None:
+                        conn = db_mod.connect(self.cfg)
+                    ok = storage.of(conn).notify_liveness.renew_state(
+                        STATE_SCOPE, self.owner, self.epoch, self.ttl)
+                except Exception as exc:  # noqa: BLE001 — le fil ne tombe pas
+                    if conn is not None:
+                        try:
+                            conn.close()
+                        except Exception:
+                            pass
+                        conn = None
+                    if not self._warned:
+                        self._warned = True
+                        self.log("shared delivery state lease not renewed (%s): "
+                                 "retrying" % exc)
+                    continue
+                self._warned = False
+                if not ok:
+                    self.lost = True
+                    return
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+    def stop(self) -> None:
+        self._stop.set()
+        thread = self._thread
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=STATE_RENEW_STOP_S)
+
+
+class StateLease:
+    """Le bail d'état partagé et son renouvellement (#3913).
+
+    Il se lit comme l'ancien couple ``(owner, epoch)`` : ``lease[0]``,
+    ``lease[1]``, l'itération et l'unpacking restent ceux d'avant.
+    """
+
+    __slots__ = ("owner", "epoch", "renewal")
+
+    def __init__(self, owner: str, epoch: int, renewal=None):
+        self.owner, self.epoch, self.renewal = str(owner), int(epoch), renewal
+
+    def __iter__(self):
+        return iter((self.owner, self.epoch))
+
+    def __getitem__(self, index: int):
+        return (self.owner, self.epoch)[index]
+
+    def stop(self) -> None:
+        if self.renewal is not None:
+            self.renewal.stop()
+
+
+def _pid_alive(pid: int) -> bool:
+    """Ce PID existe-t-il sur CET hôte ? (0 et négatifs : jamais)."""
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except (OSError, OverflowError):
+        return True
+    return True
+
+
+def reclaim_dead_local_state(db, cfg: Config, *, log=None) -> dict | None:
+    """Rend un bail d'état laissé par un processus MORT de cet hôte (#3913).
+
+    L'owner porte ``hôte:PID:jeton`` (`state_owner`) : un autre hôte ne peut
+    pas juger ce PID, mais le même hôte le voit dans son espace de PIDs. Un
+    PID recyclé par un processus vivant ne fait qu'attendre la TTL (jamais un
+    vol), et le jeton de run empêche un nouveau processus de reprendre le bail
+    d'une incarnation précédente. Le rendu est un CAS sur ``(owner, epoch)`` :
+    si le bail a bougé, rien n'est rendu.
+    """
+    try:
+        row = storage.of(db).notify_liveness.state_lease(STATE_SCOPE)
+    except Exception:  # noqa: BLE001 — pas de lecture, pas de reprise
+        return None
+    if not row or not row.get("owner"):
+        return None
+    owner = str(row["owner"])
+    host, _, rest = owner.partition(":")
+    pid_text, _, _token = rest.partition(":")
+    if host != str(getattr(cfg, "host", "") or ""):
+        return None
+    try:
+        pid = int(pid_text)
+    except (TypeError, ValueError):
+        return None
+    if _pid_alive(pid):
+        return None
+    try:
+        released = storage.of(db).notify_liveness.release_state(
+            STATE_SCOPE, owner, int(row["epoch"]))
+    except (db_mod.DbError, TypeError, ValueError):
+        return None
+    if not released:
+        return None
+    if log:
+        log("shared delivery state lease taken back from a dead local process "
+            "(%s)" % owner)
+    return row
+
+
+def release_shared_state(db, lease, *, cfg: Config | None = None,
+                         log=None) -> bool:
+    """Rend le bail, au mieux, même si la connexion de la passe est morte.
+
+    #3913 : le rendu de la boucle `main` passait par la connexion qui venait
+    de tomber (redémarrage de la base) ; l'échec était avalé et le bail restait
+    orphelin jusqu'à son expiration. Une connexion NEUVE, ouverte seulement
+    pour ce geste, rend le bail tout de suite quand la base est revenue.
+    """
+    if lease is None:
+        return True
+    stop = getattr(lease, "stop", None)
+    if stop is not None:
+        stop()
+    owner, epoch = lease
+    first: Exception | None = None
+    try:
+        return storage.of(db).notify_liveness.release_state(
+            STATE_SCOPE, owner, epoch)
+    except Exception as exc:  # noqa: BLE001 — la connexion de la passe est morte
+        first = exc
+    if cfg is None:
+        return False
+    fresh = None
+    try:
+        fresh = db_mod.connect(cfg)
+        released = storage.of(fresh).notify_liveness.release_state(
+            STATE_SCOPE, owner, epoch)
+    except Exception:  # noqa: BLE001 — la base peut être encore en redémarrage
+        return False
+    finally:
+        if fresh is not None:
+            try:
+                fresh.close()
+            except Exception:
+                pass
+    if released and log:
+        log("shared delivery state lease released on a new connection (%s)"
+            % first)
+    return released
+
+
 def enter_shared_state(db, notifier, cfg: Config, *, dry_run: bool = False,
-                       log=None) -> tuple[tuple[str, int] | None, bool]:
+                       log=None, lease_s: float | None = None,
+                       renew_s: float | None = None
+                       ) -> tuple[StateLease | None, bool]:
     """Prend le bail d'état partagé et lit le document (rendu ``(bail,
     livre)``).
 
     ``livre`` est faux quand un autre hôte détient le bail : ce passage se
     met en veille, sans livrer ni écrire (l'autre hôte le fait). En
     ``--dry-run``, le document est lu sans bail et rien n'est écrit.
+    ``lease_s``/``renew_s`` ne servent qu'aux tests de renouvellement.
     """
     log = log or notifier.log
+    ttl = STATE_LEASE_S if lease_s is None else float(lease_s)
+    interval = STATE_RENEW_S if renew_s is None else float(renew_s)
     if dry_run:
         shared = load_shared_state(db)
         if shared is not None:
@@ -1751,7 +1950,7 @@ def enter_shared_state(db, notifier, cfg: Config, *, dry_run: bool = False,
     owner = state_owner(cfg)
     try:
         epoch = storage.of(db).notify_liveness.acquire_state(
-            STATE_SCOPE, owner, STATE_LEASE_S)
+            STATE_SCOPE, owner, ttl)
     except db_mod.DbError as exc:
         if getattr(exc, "sqlstate", None) != "42P01":
             raise
@@ -1762,9 +1961,20 @@ def enter_shared_state(db, notifier, cfg: Config, *, dry_run: bool = False,
             "delivering from the local state, duplicates possible until it is")
         return None, True
     if epoch is None:
+        # #3913 : une passe tuée laisse `hôte:PID:jeton` ; le MÊME hôte sait
+        # que ce PID n'existe plus et reprend le bail sans attendre la TTL.
+        if reclaim_dead_local_state(db, cfg, log=log) is not None:
+            epoch = storage.of(db).notify_liveness.acquire_state(
+                STATE_SCOPE, owner, ttl)
+    if epoch is None:
         log("another host holds the alerts delivery state (shared lease): "
             "standing by, nothing is delivered")
         return None, False
+    lease = StateLease(owner, epoch, _StateRenewal(
+        cfg, owner, epoch, ttl=ttl, interval=interval, log=log))
+    # #3913 : le renouvellement commence AVANT la lecture/le calcul, qui peut
+    # durer : sans lui, un bail de 90 s expirerait au milieu d'une passe lente.
+    lease.renewal.start()
     try:
         shared = load_shared_state(db)
         if shared is None:
@@ -1783,15 +1993,13 @@ def enter_shared_state(db, notifier, cfg: Config, *, dry_run: bool = False,
         # Ne pas garder un bail qu'aucune passe n'utilisera (base tombée
         # entre la prise et la lecture) : le prochain essai doit pouvoir le
         # prendre sans attendre son expiration.
-        try:
-            storage.of(db).notify_liveness.release_state(STATE_SCOPE, owner, epoch)
-        except Exception:
-            pass
+        release_shared_state(db, lease, cfg=cfg)
         raise
-    return (owner, epoch), True
+    return lease, True
 
 
-def leave_shared_state(db, notifier, lease, *, log=None) -> bool:
+def leave_shared_state(db, notifier, lease, *, log=None,
+                       cfg: Config | None = None) -> bool:
     """Écrit le document partagé sous le bail, puis le rend.
 
     False si l'écriture a été refusée (bail perdu ou expiré) : la livraison a
@@ -1809,7 +2017,7 @@ def leave_shared_state(db, notifier, lease, *, log=None) -> bool:
                 "expired; the next holder may re-push")
         return saved
     finally:
-        storage.of(db).notify_liveness.release_state(STATE_SCOPE, owner, epoch)
+        release_shared_state(db, lease, cfg=cfg)
 
 
 def key_of(alert: dict) -> str:
@@ -4155,19 +4363,17 @@ def cmd_notify(cfg: Config, ncfg: NotifyConfig, args) -> int:
                     # #3576 : le document partagé d'abord (le bail peut
                     # expirer), le miroir local ensuite quoi qu'il arrive.
                     try:
-                        leave_shared_state(db, notifier, lease)
+                        leave_shared_state(db, notifier, lease, cfg=cfg)
                     finally:
                         lease = None
                         save_state(path, notifier.state)
             except db_mod.SchemaMissing:
                 raise
             except db_mod.DbError as exc:
-                if lease is not None and db is not None:
-                    try:
-                        storage.of(db).notify_liveness.release_state(
-                            STATE_SCOPE, lease[0], lease[1])
-                    except Exception:
-                        pass  # le bail expirera ; la base est déjà en défaut
+                if lease is not None:
+                    # #3913 : la connexion de la passe vient de tomber ; le
+                    # rendu tente une connexion neuve au lieu d'avaler l'échec.
+                    release_shared_state(db, lease, cfg=cfg, log=_stderr_log)
                     lease = None
                 if args.once:
                     raise
@@ -4184,12 +4390,8 @@ def cmd_notify(cfg: Config, ncfg: NotifyConfig, args) -> int:
     except KeyboardInterrupt:
         return 0
     finally:
-        if lease is not None and db is not None:
-            try:
-                storage.of(db).notify_liveness.release_state(
-                    STATE_SCOPE, lease[0], lease[1])
-            except Exception:
-                pass
+        if lease is not None:
+            release_shared_state(db, lease, cfg=cfg, log=_stderr_log)
         if db is not None:
             db.close()
         if lock is not None:

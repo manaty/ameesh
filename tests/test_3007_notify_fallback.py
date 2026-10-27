@@ -405,6 +405,29 @@ class AlertesTest(PgTestCase):
         self.assertEqual(len(bodies), 2)
         self.assertIn("Reminder", bodies[-1])
 
+    def test_un_nouvel_episode_n_est_pas_une_relance(self):
+        # #3913 : la réclamation de brief survit au trou résorbé ; un nouvel
+        # épisode, même après six heures, part avec le texte simple et son
+        # propre âge — pas « Reminder, alert still active for 15 h 53 ».
+        self.ask()
+        now = self.beat(age=3600)
+        first = notify_gap.brief_once(self.cfg, self.db, now=now)
+        self.assertEqual(len(first["sent"]), 1)
+        # le trou se résorbe, puis un nouveau trou naît plus de 6 h après le
+        # premier brief : la réclamation existe encore mais précède l'épisode.
+        later = now + 10 * 3600
+        self.beat(now=later)
+        self.db.execute(
+            "UPDATE notify_liveness SET seen_at = to_timestamp(%s)"
+            " WHERE host = %s", (later - 3600, HOST))
+        third = notify_gap.brief_once(self.cfg, self.db, now=later)
+        self.assertEqual(len(third["sent"]), 1)
+        bodies = [row["body"] for row in self.gap_mails()]
+        self.assertEqual(len(bodies), 2)
+        self.assertFalse(bodies[0].startswith("Reminder"))
+        self.assertFalse(bodies[1].startswith("Reminder"))
+        self.assertIn("no living notifier", bodies[1])
+
     def test_le_runner_porte_le_brief_sans_le_poste(self):
         from ameesh import runner as runner_mod
         self.ask()
