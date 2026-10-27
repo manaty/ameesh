@@ -675,6 +675,35 @@ class ContentBeforeHeadTest(unittest.TestCase):
         self.assertTrue(review_authors._content_before_head(
             repo.root, delivered, earlier))
 
+    def test_non_utf8_bytes_are_not_confused_by_the_proof(self):
+        """#3902 B/P2 (cx2) : deux octets non-UTF-8 distincts ne doivent pas
+        devenir le même U+FFFD dans la preuve ; le décodage strict garde le
+        doute et l'auteur."""
+        repo = _Repo(os.path.join(self.tmp, "non-utf8"))
+        feature = os.path.join(repo.root, "feature.py")
+        with open(feature, "wb") as handle:
+            handle.write(b'# coding: latin-1\nprint("old")\n')
+        base = repo.commit("base")
+        with open(feature, "wb") as handle:
+            handle.write(b'# coding: latin-1\nprint("\x80")\n')
+        earlier = repo.commit("parent writes non-UTF-8 bytes", agent="parent")
+        # cible : autres octets non-UTF-8, même après décodage « replace »
+        repo.git("checkout", "-q", "-b", "bytes-target", base)
+        with open(feature, "wb") as handle:
+            handle.write(b'# coding: latin-1\nprint("\x81")\n')
+        target = repo.commit("target writes other bytes", agent="other")
+        self.assertFalse(review_authors._content_before_head(
+            repo.root, target, earlier))
+        # tête : la cible + les octets du candidat, contribution à livrer
+        repo.git("checkout", "-q", "-b", "bytes-head", target)
+        with open(feature, "wb") as handle:
+            handle.write(b'# coding: latin-1\nprint("\x80")\n')
+        head = repo.commit("head delivers the candidate bytes", agent="impl")
+        self.assertEqual(review_authors._not_in_target(
+            repo.root, [earlier], target, head=head), [earlier])
+        self.assertTrue(review_authors._survives_rewrite(
+            repo.root, head, earlier, {}, target, target))
+
     def test_whole_file_rewrite_without_context_is_not_proven_by_free_search(self):
         """#3902 B2 (dev1) : un hunk sans contexte couvre tout le fichier ;
         le bloc postérieur trouvé ailleurs ne prouve pas la réécriture."""

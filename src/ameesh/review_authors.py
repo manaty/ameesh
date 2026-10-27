@@ -1223,8 +1223,8 @@ def _commit_hunks(repo: str, sha: str):
     preuve au lieu de la contourner. Les renommages sont lus comme
     suppression + création (`--no-renames`).
     """
-    text = _raw_out(repo, "show", "--format=", "--raw", "--unified=1",
-                    "--no-renames", sha)
+    text = _raw_out_strict(repo, "show", "--format=", "--raw", "--unified=1",
+                           "--no-renames", sha)
     if text is None:
         return None
     hunks: dict = {}
@@ -1292,7 +1292,7 @@ def _path_lines(repo: str, rev: str, path: str, cache: dict):
     terminé par un saut de ligne (la question n'a pas de sens)."""
     key = ("path-lines", str(rev), str(path))
     if key not in cache:
-        text = _raw_out(repo, "show", "%s:%s" % (rev, path))
+        text = _raw_out_strict(repo, "show", "%s:%s" % (rev, path))
         if text is None:
             cache[key] = (None, None)
         else:
@@ -2313,6 +2313,22 @@ def _raw_out(repo: str, *args: str) -> Optional[str]:
     if proc.returncode != 0:
         return None
     return proc.stdout.decode("utf-8", "replace")
+
+
+def _raw_out_strict(repo: str, *args: str) -> Optional[str]:
+    """Comme `_raw_out`, mais refuse un contenu non-UTF-8 (None = doute).
+
+    `_content_before_head` compare des blobs et des hunks : un décodage
+    `replace` y confondrait des octets distincts (`\x80` et `\x81` donnent
+    le même U+FFFD) et pourrait écarter un auteur dont la contribution reste
+    à livrer (#3902 B/P2, témoin cx2). Le doute conserve l'auteur."""
+    proc = plan_git._git(repo, *args)
+    if proc.returncode != 0:
+        return None
+    try:
+        return proc.stdout.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
 
 
 def _hunks_survive(repo: str, head: str, sha: str, path: str,
