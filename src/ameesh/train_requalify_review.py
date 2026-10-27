@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import re
 
-from . import (assignments, mechanics, merge_queue, resolutions, review_lot,
+from . import (assignments, mechanics, merge_queue, resolutions, review_authors, review_lot,
                review_provenance, storage, train_assembly, work)
 from .train import TrainError
 
@@ -71,10 +71,11 @@ def qualify(cfg, db, spec, pin, gate, changed, references):
     guard = set(changed).intersection(train_assembly.REQUALIFY_GUARD)
     if guard:
         authors = []
+        source_items = [work.get(db, lot) for lot in lots]
         commits = resolutions._run(spec.canon, "rev-list", "--parents", pin + ".." + gate)
         if commits.returncode:
             raise TrainError("cannot read canon authors")
-        for line in commits.stdout.splitlines():
+        for line in resolutions._text(commits).splitlines():
             commit, *parents = line.split()
             if len(parents) > 1:
                 # A hosting merge whose tree is exactly a parent adds no
@@ -83,14 +84,34 @@ def qualify(cfg, db, spec, pin, gate, changed, references):
                                          *(parent + "^{tree}" for parent in parents))
                 if trees.returncode:
                     raise TrainError("cannot read canon merge trees")
-                tree, *parent_trees = trees.stdout.split()
+                tree, *parent_trees = resolutions._text(trees).split()
                 if tree in parent_trees:
                     continue
             receipt = review_provenance.receipt_for_commit(db, commit)
             family = review_lot.family_of((receipt or {}).get("harness"), families)
-            if not receipt or not family:
+            if receipt and family:
+                authors.append({"name": receipt["actor"], "family": family})
+                continue
+            if not receipt:
+                # Canon commits made outside the hook use the same historical
+                # author fallback as the train: registered source-lot author,
+                # agent Git identity AND family proved by the turn journal.
+                # Neither the Git name alone nor today's harness is evidence.
+                for item in source_items:
+                    if not item:
+                        continue
+                    rows, unknown = review_authors._unreceived_authors(
+                        db, item, spec.canon, commit,
+                        author_name=item.get("assignee") or "", author_family="",
+                        reviewers=item.get("reviewers") or [], families=families,
+                        carry_receipts=False)
+                    if rows and not unknown and all(row.get("family") for row in rows):
+                        authors.extend(rows)
+                        break
+                else:
+                    raise TrainError("canon author provenance missing for %s" % commit)
+            else:
                 raise TrainError("canon author provenance missing for %s" % commit)
-            authors.append({"name": receipt["actor"], "family": family})
         if not authors:
             raise TrainError("canon author provenance missing")
         need = max(rule.reviews_for(changed).reviews for rule in rules)

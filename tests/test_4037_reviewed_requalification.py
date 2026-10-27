@@ -51,6 +51,8 @@ class ReviewedMoveTest(unittest.TestCase):
         self.commit_proof = self.stack.enter_context(mock.patch.object(
             review.review_provenance, 'receipt_for_commit',
             return_value=dict(actor='author', harness='deepseek')))
+        self.historical_authors = self.stack.enter_context(mock.patch.object(
+            review.review_authors, '_unreceived_authors', return_value=([], ['unknown'])))
         store = types.SimpleNamespace(provenance=types.SimpleNamespace(
             get=lambda reference: dict(work_item_id=4011)))
         self.stack.enter_context(mock.patch.object(review.storage, 'of', return_value=store))
@@ -158,6 +160,13 @@ class ReviewedMoveTest(unittest.TestCase):
             self.receipts.clear()
             self.receipts.update(saved)
             self.commit_proof.return_value = dict(actor='author', harness='deepseek')
+
+    def test_canon_author_without_hook_uses_existing_historical_proof(self):
+        self.commit_proof.return_value = None
+        self.historical_authors.return_value = (
+            [dict(name='author', family='deepseek', proof=True)], [])
+        self.assertEqual(self.execute()['state'], 'requalified')
+        self.assertFalse(self.historical_authors.call_args.kwargs['carry_receipts'])
 
     def test_uncited_newer_block_is_not_hidden(self):
         self.marks.append(dict(self.marks[0], id=3, verdict='blocked', at_ts=3))
