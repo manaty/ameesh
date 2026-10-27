@@ -2,7 +2,7 @@
 """Alerts pushed to the responsible human (lot L38, decision 0030 point 4).
 
   ameesh notify [--once] [--dry-run] [--json] [--interval S]
-                [--only alerts|take|issues|github-watch|ci]
+                [--only alerts|take|issues|github-watch|ci|fingerprints]
                 [--skip issues|github-watch|ci|alerts] [--long-turn S]
                 [--idle-mail S] [--dead-grace S]
                 [--session-tokens N] [--stale-lot S] [--orphan-lot S]
@@ -133,12 +133,18 @@ STATE_SCHEMA = "ameesh-notify-state/1"
 #: `alerts` owns the delivery state and its lock; `take` observes the alerts
 #: but writes no state; `issues`, `github-watch` and `ci` are independent.
 ONLY_PASSES = ("alerts", "take", "issues", "github-watch", "ci")
+#: #3885 (canon §16): passes that exist ONLY under `ameesh role run`. The
+#: full notifier never runs them (a source must be read by the lease holder
+#: alone); they are accepted by `--only`, and the pass itself refuses without
+#: `AMEESH_ROLE`.
+ROLE_ONLY_PASSES = ("fingerprints",)
 #: #3327: the passes a role timer carries. A full notifier may skip exactly
 #: these (and only these) from its loop; every other pass (take, budget
 #: handoff, WIP sweep) stays in the service. #3383: `alerts` joined them — the
 #: owner channel follows the elected lease instead of the one host that held
 #: the routes; a service that skips it takes no state lock, so the role timer
-#: of the same host can.
+#: of the same host can. `fingerprints` is never part of the full loop at all
+#: (#3885): it lives only under `role run`.
 SKIPPABLE_PASSES = ("issues", "github-watch", "ci", "alerts")
 
 #: L38 (0030) : types envoyés par défaut. `delegation_expired` arrive avec L40 :
@@ -664,9 +670,9 @@ def _only_set(values) -> frozenset | None:
             part = part.strip()
             if not part:
                 continue
-            if part not in ONLY_PASSES:
+            if part not in ONLY_PASSES + ROLE_ONLY_PASSES:
                 raise ValueError("unknown pass %r (known: %s)"
-                                 % (part, ", ".join(ONLY_PASSES)))
+                                 % (part, ", ".join(ONLY_PASSES + ROLE_ONLY_PASSES)))
             selected.add(part)
     return frozenset(selected) if selected else None
 
@@ -2267,10 +2273,12 @@ class Notifier:
     def _run_tail(self, db, now: float, selected) -> list:
         """The independent mechanical passes, without the alert delivery.
 
-        `--only github-watch`, `--only ci` and `--only issues` are the role
-        timers of EP5: they write no notify state and take no state lock, so
-        two of them may share a host with the alert producer. `--only take`
-        still observes the alerts first, because auto-take uses them.
+        `--only github-watch`, `--only ci`, `--only issues` and `--only
+        fingerprints` are the role timers of EP5: they write no notify state
+        and take no state lock, so two of them may share a host with the alert
+        producer. `--only take` still observes the alerts first, because
+        auto-take uses them. `fingerprints` (#3885) also refuses outside
+        `ameesh role run`.
         """
         records: list = []
         self._records = records
@@ -2297,6 +2305,8 @@ class Notifier:
             self._github_inputs(db, now)
         if "ci" in selected:
             self._ci_failures(db)
+        if "fingerprints" in selected:
+            self._fingerprints(db, now)
         return records
 
     def run_local_pass(self, now: float | None = None) -> list:
@@ -2516,6 +2526,28 @@ class Notifier:
                 self.log(ci.describe(record))
         except Exception as exc:  # noqa: BLE001 - jamais fatal au passage des alertes
             self.log("CI: poll failed (%s)" % _clean(exc, 200))
+
+    # -- empreintes d'échec (canon §16, #3885) --------------------------------
+    def _fingerprints(self, db, now: float) -> None:
+        """La passe des empreintes d'échec : un lot par empreinte nouvelle.
+
+        #3885 : elle n'existe QUE sous `ameesh role run` (le détenteur du bail
+        lit la source avec un jeton en lecture seule). Le service complet ne
+        l'exécute jamais ; un `--only fingerprints` lancé hors du rôle refuse
+        explicitement, comme une source sans jeton.
+        """
+        from . import fingerprints
+        if not (os.environ.get("AMEESH_ROLE") or "").strip():
+            raise fingerprints.FingerprintError(
+                "fingerprints pass refused: run it under the elected role "
+                "(`ameesh role run <role> -- ameesh notify --once --only "
+                "fingerprints`), never from the full notifier")
+        results = fingerprints.tick(self.cfg, db, now=now, log=self.log)
+        for result in results:
+            self.log("fingerprints %s: lot #%d %s (occurrences %d, users %d)"
+                     % (result.get("project"), result["lot"],
+                        "opened" if result.get("created") else "noted",
+                        result.get("occurrences", 0), result.get("users", 0)))
 
     # -- prise automatique (L119, décision 0037) ------------------------------
     def _auto_take(self, db, current: list, now: float) -> None:
@@ -3860,8 +3892,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--only", action="append", metavar="PASS[,PASS]",
                         default=None,
                         help="L165: run only these passes (%s; repeatable, "
-                             "comma-separated); requires --once"
-                             % ", ".join(ONLY_PASSES))
+                             "comma-separated); requires --once. #3885: "
+                             "`fingerprints` runs only under `ameesh role run`"
+                             % ", ".join(ONLY_PASSES + ROLE_ONLY_PASSES))
     parser.add_argument("--skip", action="append", metavar="PASS[,PASS]",
                         default=None,
                         help="L165/#3327: exclude these mechanical passes from "

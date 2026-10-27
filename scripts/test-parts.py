@@ -165,6 +165,15 @@ UNIT_SPLIT_S = 300.0
 #: 46 processus à 450 s, soit un mur théorique de ~7,5 min avant mise en place.
 PARALLEL_TARGET_S = 450.0
 PARALLEL_MAX = 4
+#: #3945 — le plafond de l'hôte. Le calcul ci-dessus visait 48 processus ;
+#: le run 40470243300 (main ad042a0c, 27/10) en a lancé 73 (25, 24 et 24 par
+#: hôte : charge totale ~28 400 s, arrondis, plancher 2 et plafond 4), plus
+#: les 8 Postgres de chaque hôte, sur 16 vCPU par hôte : main a été rouge cinq
+#: runs de suite sur un test de timing différent à chaque fois. Chaque job
+#: prend donc au plus sa part des vCPU de l'hôte, `vCPU // runners de
+#: l'hôte` (2 sur 16 vCPU et 8 runners), même au-dessus du `--parallel`
+#: demandé ; sans la variable (poste, fourche), pas de plafond.
+JOBS_PER_HOST_ENV = "AMEESH_CI_JOBS_PER_HOST"
 #: #3754 — un processus de la part parallèle : il exécute un sous-ensemble de
 #: tests (plan dérivé) et ne refait pas de fan-out. La variable évite la
 #: récursion du découpage.
@@ -806,6 +815,37 @@ def parallel_count(charge: float, minimum: int = 1) -> int:
     return max(1, minimum, min(PARALLEL_MAX, max(1, besoin)))
 
 
+def host_cpus() -> int:
+    """#3945 : les vCPU que ce processus peut occuper (affinité, sinon l'hôte)."""
+    try:
+        return len(os.sched_getaffinity(0))
+    except (AttributeError, OSError):
+        return os.cpu_count() or 1
+
+
+def host_cap() -> int | None:
+    """#3945 : le plafond de processus d'une part, `vCPU // runners de l'hôte`.
+
+    `None` sans `AMEESH_CI_JOBS_PER_HOST` (ou valeur illisible ou nulle) :
+    le poste d'un développeur et une fourche gardent le seul `PARALLEL_MAX`.
+    """
+    try:
+        jobs = int(os.environ.get(JOBS_PER_HOST_ENV, "").strip() or 0)
+    except ValueError:
+        return None
+    if jobs <= 0:
+        return None
+    return max(1, host_cpus() // jobs)
+
+
+def _charge_systeme() -> str:
+    """#3945 : la charge moyenne sur 1 min de l'hôte, pour mesurer sa saturation."""
+    try:
+        return f"{os.getloadavg()[0]:.1f}"
+    except (AttributeError, OSError):
+        return "?"
+
+
 def _affiner_unites(unites: dict[str, list[str]], pesees: dict[str, float],
                     par_test: dict[str, float]) -> tuple[dict[str, list[str]], dict[str, float]]:
     """#3754 : découpe une classe trop lourde en tests, avec leur durée mesurée.
@@ -920,6 +960,11 @@ def run_parallel(args) -> int | None:
     unites, pesees = _affiner_unites(unites, pesees, _poids_par_test(args.driver))
     charge = sum(pesees.values())
     processus = min(parallel_count(charge, max(1, args.parallel)), max(1, len(pesees)))
+    plafond = host_cap()
+    if plafond is not None and processus > plafond:
+        print(f"#3945 : {processus} processus ramenés à {plafond} ({host_cpus()} vCPU, "
+              f"{os.environ.get(JOBS_PER_HOST_ENV)} runners par hôte)", file=sys.stderr, flush=True)
+        processus = plafond
     shards = [s for s in split(pesees, processus) if s]
     if len(shards) <= 1:  # une seule unité : rien à paralléliser
         return None
@@ -936,6 +981,7 @@ def run_parallel(args) -> int | None:
     procs: list[subprocess.Popen] = []
     fils: list[threading.Thread] = []
     debut = time.monotonic()
+    charge_systeme_debut = _charge_systeme()
 
     def arreter(signum, _frame):
         for proc in procs:
@@ -1016,7 +1062,8 @@ def run_parallel(args) -> int | None:
                            indent=1, sort_keys=True) + "\n", encoding="utf-8")
         print(f"part {args.part}/{args.parts} ({args.driver}) : {len(shards)} processus, "
               f"charge ~{charge:.0f} s, {len(recus)} test(s), "
-              f"{time.monotonic() - debut:.0f} s", flush=True)
+              f"{time.monotonic() - debut:.0f} s, hôte {host_cpus()} vCPU, "
+              f"charge système {charge_systeme_debut} → {_charge_systeme()}", flush=True)
         return 0 if all(code == 0 for code in codes) else 1
     finally:
         fini.set()

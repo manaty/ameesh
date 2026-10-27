@@ -223,7 +223,7 @@ def listing(db, item_id, slots=None):
 
 
 def update(db, item_id, slots, *, target_branch, target_sha, repo=None, action='reserve',
-           actor='', cfg=None, reservation_ids=None):
+           actor='', cfg=None, reservation_ids=None, repository=None):
     if not slots or len(set(slots)) != len(slots) or any(
             not _SLOT.fullmatch(slot) or slot == 'default' for slot in slots):
         raise work.WorkError('supply distinct symbolic slots; default is reserved for legacy L122')
@@ -237,7 +237,14 @@ def update(db, item_id, slots, *, target_branch, target_sha, repo=None, action='
     project = item.get('app') or ''
     if not project:
         raise work.WorkError('lot needs a project before reserving migration slots')
-    slug = work.lot_repository(item, cfg)
+    if repository:
+        # #3885 : même override explicite que le chemin legacy L122.
+        repository = (repository or '').strip().lower()
+        if not work._REPO_SLUG_RE.match(repository):
+            raise work.WorkError('--repository: expected owner/repo, not %r' % repository)
+        slug = migrations.repo_key(repository)
+    else:
+        slug = work.lot_repository(item, cfg)
     checkout = work._checkout(slug, repo, cfg)
     layout = migrations.layout_for(slug, cfg)
     if layout is None:
@@ -341,7 +348,8 @@ def run(db, args, cfg):
         records = update(db, args.id, args.slot, target_branch=args.target_branch,
                          target_sha=args.target_sha, repo=args.repo, actor=args.actor, cfg=cfg,
                          action='release' if args.release else 'landed' if args.landed else 'reserve',
-                         reservation_ids=args.reservation_id)
+                         reservation_ids=args.reservation_id,
+                         repository=getattr(args, 'repository', None))
     if args.json:
         print(json.dumps(records, ensure_ascii=False, indent=2))
     else:

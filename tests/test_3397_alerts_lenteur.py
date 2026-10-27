@@ -152,6 +152,37 @@ class TurnCostsIndexTest(PgTestCase):
         definition = rows[0]["indexdef"].lower()
         self.assertIn("(agent, recorded_at desc, id desc)", definition)
 
+    def _fill_turn_costs(self):
+        """#3941 : remplit la table sans le coût du trigger d'évènements.
+
+        Chaque insertion appelait `ameesh_events_cost` → `ameesh_event` ; sous
+        la charge de la CI, les 20 000 lignes dépassaient le `statement_timeout`
+        du banc (`canceling statement due to statement timeout`) alors que le
+        test ne lit que le plan. Le trigger est coupé le temps du remplissage
+        (schéma du test seulement), puis rétabli même si l'insertion échoue.
+        """
+        self.db.execute(
+            "ALTER TABLE turn_costs DISABLE TRIGGER ameesh_events_cost")
+        try:
+            self.db.execute(
+                "INSERT INTO turn_costs (agent, harness, recorded_at) "
+                "SELECT 'a' || mod(g, 5), 'deepseek', "
+                "now() - (g || ' minutes')::interval "
+                "FROM generate_series(1, 20000) g")
+        finally:
+            self.db.execute(
+                "ALTER TABLE turn_costs ENABLE TRIGGER ameesh_events_cost")
+
+    def test_the_fill_does_not_fire_the_cost_trigger(self):
+        """#3941 : témoin — le banc n'écrit plus 20 000 `cost.recorded`."""
+        self.db.execute("TRUNCATE turn_costs")
+        before = self.db.query(
+            "SELECT count(*) AS n FROM ameesh_events")[0]["n"]
+        self._fill_turn_costs()
+        after = self.db.query(
+            "SELECT count(*) AS n FROM ameesh_events")[0]["n"]
+        self.assertEqual(after, before)
+
     def test_the_last_turn_lookup_uses_it(self):
         # The psql driver wraps every read in a JSON aggregate; `EXPLAIN`
         # cannot be wrapped, so the plan is read on the psycopg driver (the
@@ -159,10 +190,7 @@ class TurnCostsIndexTest(PgTestCase):
         if not isinstance(self.db, db_mod.PsycopgDriver):
             self.skipTest("EXPLAIN is wrapped by the psql driver")
         self.db.execute("TRUNCATE turn_costs")
-        self.db.execute(
-            "INSERT INTO turn_costs (agent, harness, recorded_at) "
-            "SELECT 'a' || mod(g, 5), 'deepseek', now() - (g || ' minutes')::interval "
-            "FROM generate_series(1, 20000) g")
+        self._fill_turn_costs()
         self.db.execute("ANALYZE turn_costs")
         plan = self.db.query(
             "EXPLAIN (FORMAT JSON) SELECT id FROM turn_costs WHERE agent = %s "

@@ -574,9 +574,10 @@ def lot_diff_range(repo: str, sha: str, target: str | None = None,
     que le gel d'avant fusion ; sans gel porté par la fusion, le deuxième
     parent reste la tête lue (#2374).
 
-    Un gel connu mais non ancêtre de la fusion (réécriture, cherry-pick)
-    lève `UnprovenLotDiff` (#2823) : aucun delta propre au lot n'est prouvé.
-    L'appelant doit douter, sans repli sur le diff du paquet.
+    Un gel non ancêtre exige une preuve de contenu dans CETTE fusion
+    (#3938) : `plan_git.probe` reconnaît les patch-ids verbatim (y compris
+    squash) et refuse un contenu annulé. Sans preuve, `UnprovenLotDiff`
+    (#2823) interdit toujours le repli sur le diff du paquet.
 
     Une cible locale périmée (#2702) ne porte pas `sha` : le repli
     `merge-base(cible, sha)..sha` emporterait tout l'historique entre les deux.
@@ -608,9 +609,17 @@ def lot_diff_range(repo: str, sha: str, target: str | None = None,
         return None
     head = (frozen or "").strip()
     if head and not _is_ancestor(repo, head, merge):
-        raise UnprovenLotDiff(
-            "gel %s non ancêtre de la fusion %s : delta du lot non prouvé"
-            % (head[:12], merge[:12]))
+        from . import plan_git
+        try:
+            # Le SHA de fusion borne la preuve : une copie entrée plus tard
+            # dans la cible ne prouve pas le contenu de cette livraison.
+            proof = plan_git.probe(repo, head, merge)
+        except Exception:  # une preuve illisible ne permet aucun repli
+            proof = {}
+        if not proof.get("merged") or proof.get("how") not in ("patch-id", "squash"):
+            raise UnprovenLotDiff(
+                "gel %s non ancêtre de la fusion %s : delta du lot non prouvé"
+                % (head[:12], merge[:12]))
     if head == merge:
         head = ""
     if head:

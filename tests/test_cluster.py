@@ -165,6 +165,10 @@ FERMEES = {
     # état de mesure interne, fermé aux deux rôles, aucun GRANT modifié.
     "host_resource_slots": {"host", "slot_start", "readings", "cpu_sum", "cpu_n",
                             "free_mem_min", "first_cpu_at", "last_cpu_at"},
+    # #3921 (0496) : présence des relevés d'hôte par tranche de 120 s, tenue
+    # par déclencheurs et lue par l'élection (`role_standings_pg.coverage`) ;
+    # état de mesure interne, fermé aux deux rôles, aucun GRANT modifié.
+    "host_presence": {"host", "bucket_start", "readings", "first_at", "last_at"},
     # #2845 (0470) : curseur, reçus et progression de la veille des tickets
     # GitHub. État interne de l'agent de veille, pas un état de supervision ;
     # fermé aux deux rôles superviseur, aucun GRANT modifié.
@@ -206,6 +210,12 @@ FERMEES = {
                             "detail", "at"},
     "account_turn_starts": {"id", "harness", "account", "host", "agent", "at"},
     "account_turn_slots": {"agent", "harness", "account", "host", "at"},
+    # #3885 (0492) : curseur et état de la passe de veille des empreintes
+    # d'échec (projet, URL, curseur, dernier relevé et erreur), tenus et lus
+    # par l'agent de veille, pas par le rôle superviseur ; état interne fermé
+    # aux deux rôles, aucun GRANT modifié.
+    "fingerprint_watch_state": {"project", "url", "cursor", "last_read_at",
+                                "last_error", "updated_at"},
 }
 #: L232b (0417) : l'état interne du contrôleur de release reste hors contrat,
 #: sauf `host_release_fences.host`, lu par `ameesh_host_gate_state` (l.314).

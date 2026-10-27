@@ -125,23 +125,19 @@ def availability(db, host: str, *, now: float | None = None,
     start = now - pg.WINDOW_S
     if cover_s is None:
         cover_s = freshness_s(db, host, now=now)
-    times = pg.samples(db, host, start)
-    covered = 0.0
-    for index, ts in enumerate(times):
-        end = min(now, ts + cover_s)
-        if index + 1 < len(times):
-            end = min(end, times[index + 1])
-        if end > ts:
-            covered += end - ts
+    # #3921: summed by the database over `host_presence`, never the 7 days of
+    # readings brought back one by one
+    cov = pg.coverage(db, host, start, now=now, cover_s=cover_s)
+    covered = cov["covered_s"]
     span = now - start
     return {
         "availability": round(100.0 * covered / span, 3) if span > 0 else 0.0,
         "covered_s": round(covered, 3),
         "span_s": round(span, 3),
-        "first_ts": times[0] if times else None,
-        "last_ts": times[-1] if times else None,
-        "age_s": (now - times[-1]) if times else None,
-        "samples": len(times),
+        "first_ts": cov["first_ts"],
+        "last_ts": cov["last_ts"],
+        "age_s": (now - cov["last_ts"]) if cov["last_ts"] is not None else None,
+        "samples": cov["samples"],
     }
 
 

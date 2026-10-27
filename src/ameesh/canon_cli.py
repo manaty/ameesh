@@ -7,11 +7,15 @@
                                          placements de l'hôte admis ou refusés (C4)
   ameesh canon show [--json]             fiches lues, et d'où (commit)
   ameesh canon sync [--host H] [--json] [--bootstrap-ref BRANCHE]
+                     [--allow-rewind]
                                          canon → registre de l'hôte (§4.4) ; enregistre
                                          l'état du canon (canon_state), même illisible,
                                          et le verdict de placement de chaque agent ;
                                          recopie Member.authenticators dans le registre
-                                         de confiance (§8.2) ; code 1 si erreur
+                                         de confiance (§8.2) ; code 1 si erreur.
+                                         #3955 : sans --allow-rewind, le commit audité
+                                         (last_good_commit) ne recule jamais ; le
+                                         retour arrière déclaré est journalisé au fil
   ameesh placement check [--agent A] [--json]
                                          admissions actuelles (hôtes admis, verdicts
                                          de placement) et hôtes admissibles (hôtes,
@@ -431,7 +435,8 @@ def _sync_one(db, cfg: Config, args: argparse.Namespace, canon: canon_mod.Canon,
         # --bootstrap-ref au premier amorçage
         report = canon_sync.sync(db, canon, host,
                                  trusted_ref=canon_sync.configured_ref_for(cfg, canon),
-                                 bootstrap_ref=args.bootstrap_ref or "")
+                                 bootstrap_ref=args.bootstrap_ref or "",
+                                 allow_rewind=bool(getattr(args, "allow_rewind", False)))
     except canon_sync.CanonUnreadable as exc:
         return _print_unreadable(args, canon, exc, sink=sink)
     except canon_sync.CanonStale as exc:
@@ -1113,6 +1118,11 @@ def add_parsers(sub) -> None:
                              "(no AMEESH_CANON_REF, no commit applied yet): trusted "
                              "canonical branch (origin/<BRANCH>), logged; "
                              "ignored afterwards")
+    p_sync.add_argument("--allow-rewind", action="store_true",
+                        help="declare a REWIND of the audited commit (last_good_commit): "
+                             "without it a commit that does not descend from the recorded "
+                             "one is never written; with it the rewind is accepted and "
+                             "logged in the project thread (#3955)")
     p_sync.set_defaults(func=cmd_sync)
     _add_agent_parsers(canon_sub)
 

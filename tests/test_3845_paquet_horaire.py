@@ -445,10 +445,66 @@ class FreshTest(unittest.TestCase):
             raise ph.HoraireError("code périmé")
         ph.check_fresh, ph.tick = stale, lambda ctx: ticked.append(ctx) or "x"
         try:
-            self.assertEqual(ph.main(["tick", "--repo", str(ROOT)]), 1)
+            with mock.patch.dict(os.environ, {}, clear=False):
+                self.assertEqual(ph.main(["tick", "--repo", str(ROOT)]), 1)
         finally:
             ph.check_fresh, ph.tick = saved
         self.assertEqual(ticked, [])
+
+
+class GitIdentityTest(unittest.TestCase):
+    """#3916 : un HOME sans .gitconfig, la composition commite quand même."""
+
+    def test_main_pose_l_identite_du_pilote(self):
+        saved = (ph.check_fresh, ph.tick)
+        seen = []
+        ph.check_fresh = lambda ctx: None
+        ph.tick = lambda ctx: seen.append(
+            (os.environ.get("GIT_AUTHOR_NAME"),
+             os.environ.get("GIT_COMMITTER_EMAIL"))) or "x"
+        # La CI n'a pas de canon compilé (config vide) : le fuseau est simulé,
+        # comme check_fresh et tick, pour ne tester que l'identité posée.
+        from ameesh import config as config_mod, mechanics
+        zone = mock.Mock(timezone="Europe/Paris")
+        try:
+            with mock.patch.dict(os.environ, {}, clear=False), \
+                    mock.patch.object(config_mod, "load", lambda *a, **k: {}), \
+                    mock.patch.object(mechanics, "configured", lambda *a, **k: zone):
+                for key in ("GIT_AUTHOR_NAME", "GIT_AUTHOR_EMAIL",
+                            "GIT_COMMITTER_NAME", "GIT_COMMITTER_EMAIL"):
+                    os.environ.pop(key, None)
+                self.assertEqual(ph.main(["tick", "--repo", str(ROOT),
+                                          "--pilot", "pilote-x"]), 0)
+        finally:
+            ph.check_fresh, ph.tick = saved
+        self.assertEqual(seen, [("pilote-x", "pilote-x@ameesh.invalid")])
+
+    def test_commit_sans_gitconfig(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.dict(os.environ, {}, clear=False):
+            home = Path(tmp) / "home"
+            home.mkdir()
+            repo = Path(tmp) / "repo"
+            for key in list(os.environ):
+                if key.startswith("GIT_"):
+                    os.environ.pop(key)
+            os.environ.update({"HOME": str(home), "XDG_CONFIG_HOME": str(home),
+                               "GIT_CONFIG_NOSYSTEM": "1",
+                               "EMAIL": "", "GIT_CONFIG_GLOBAL": os.devnull})
+            subprocess.run(["git", "init", "-q", str(repo)], check=True)
+            env = ph.pose_git_identity("pilote-x")
+            done = subprocess.run(
+                ["git", "-C", str(repo), "-c", "user.useConfigOnly=true",
+                 "commit", "-q", "--allow-empty", "-m", "témoin"],
+                capture_output=True, text=True)
+            self.assertEqual(done.returncode, 0, done.stderr)
+            who = subprocess.run(
+                ["git", "-C", str(repo), "log", "-1", "--format=%an <%ae> / %cn <%ce>"],
+                capture_output=True, text=True, check=True).stdout.strip()
+        self.assertEqual(env["GIT_COMMITTER_NAME"], "pilote-x")
+        self.assertEqual(who, "pilote-x <pilote-x@ameesh.invalid> / "
+                              "pilote-x <pilote-x@ameesh.invalid>")
 
 
 class ExcludeOptionTest(unittest.TestCase):

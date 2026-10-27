@@ -12,6 +12,7 @@ import argparse
 import importlib.util
 import json
 import pathlib
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -329,11 +330,59 @@ class PaquetAutoBanc(unittest.TestCase):
         self.assertIn(str(path), removed)
         self.assertFalse(path.exists())
 
+    def test_reprise_ferme_le_worktree_garde_par_la_tentative_1(self) -> None:
+        # #3916 : la tentative 1 a échoué et gardé son worktree sur la branche
+        # du paquet ; la reprise (--force) le ferme puis recompose.
+        branch = "integration/paquet-h-reprise"
+        kept = paquet_auto.make_worktree(self.repo, self.base, branch)
+        self.addCleanup(shutil.rmtree, kept, True)
+        self.assertTrue(kept.name.startswith("paquet-auto-"))
+        logged: list[str] = []
+        paquet_auto.clear_local_branch(self.repo, branch, log=logged.append)
+        self.assertFalse(kept.exists())
+        self.assertIn(str(kept), "\n".join(logged))
+        again = paquet_auto.make_worktree(self.repo, self.base, branch)
+        self.addCleanup(paquet_auto.remove_worktree, self.repo, again)
+        self.assertEqual(paquet_auto.rev(again, "HEAD"), self.base)
+
+    def test_reprise_refuse_un_worktree_qui_n_est_pas_le_sien(self) -> None:
+        branch = "integration/paquet-autre"
+        path = pathlib.Path(self.tmp.name) / "a-la-main"
+        self.git("worktree", "add", "-b", branch, str(path), self.base)
+        with self.assertRaises(paquet_auto.InputError):
+            paquet_auto.clear_local_branch(self.repo, branch, log=lambda _l: None)
+        self.assertTrue(path.exists())
+
     def test_branche_de_candidat_invalide_refusee_avant_fetch(self) -> None:
         candidate = paquet_auto.Candidate(
             1, "deadbeef" * 5, branch="--upload-pack=evil")
         with self.assertRaises(paquet_auto.InputError):
             paquet_auto.ensure_source(self.repo, candidate)
+
+    def test_source_remise_fetchee_par_sa_ref(self) -> None:
+        # #3916 : la remise n'est que sous refs/ameesh/resolutions/ d'origin ;
+        # fetcher la branche ne l'apporte pas, sa ref si.
+        origin = pathlib.Path(self.tmp.name) / "origin"
+        self.git("clone", "-q", "--bare", str(self.repo), str(origin))
+        remise = self.lot(7, "remise.txt", "remise\n")
+        ref = "refs/ameesh/resolutions/7/main-%s" % remise[:9]
+        self.git("push", "-q", str(origin), "%s:%s" % (remise, ref))
+        self.git("branch", "-D", "lot/7")
+        clone = pathlib.Path(self.tmp.name) / "clone"
+        self.git("clone", "-q", "--no-local", str(origin), str(clone))
+        self.assertIsNone(paquet_auto.rev(clone, remise))
+        candidate = paquet_auto.Candidate(
+            7, remise, branch="lot/7", remise_ref=ref)
+        paquet_auto.ensure_source(clone, candidate)
+        self.assertEqual(candidate.source, remise)
+
+    def test_remise_d_un_autre_lot_refusee_avant_fetch(self) -> None:
+        for ref in ("refs/ameesh/resolutions/8/main-abc",
+                    "refs/heads/main", "--upload-pack=evil",
+                    "refs/ameesh/resolutions/7/"):
+            candidate = paquet_auto.Candidate(7, "deadbeef" * 5, remise_ref=ref)
+            with self.assertRaises(paquet_auto.InputError, msg=ref):
+                paquet_auto.ensure_source(self.repo, candidate)
 
     def test_conflit_ecarte_sans_rien_commiter(self) -> None:
         first, conflict, third = self.fixture()
@@ -397,6 +446,26 @@ class PaquetAutoBanc(unittest.TestCase):
         self.assertEqual([item.lot for item in errors], [7])
         self.assertIn("jamais composé", errors[0].reason)
         self.assertIn("porte illisible", errors[0].detail)
+
+    def test_remise_portee_par_le_candidat(self) -> None:
+        ref = "refs/ameesh/resolutions/7/main-fb029a526"
+        payload = {
+            "schema": "ameesh-packet-candidates/1",
+            "base_source": "option",
+            "ready": [7, 8],
+            "candidates": [
+                {"work_item": 7, "source": self.base,
+                 "remise": {"ref": ref, "sha": self.base}},
+                {"work_item": 8, "source": self.base, "remise": None},
+            ],
+            "errors": [],
+        }
+        head = self._fake_candidates(payload, 0)
+        worktree = self.worktree("candidats-remise", head)
+        ready = pathlib.Path(self.tmp.name) / "prets.txt"
+        candidates, _got = paquet_auto.compute_candidates(
+            worktree, "main", self.base, ready)
+        self.assertEqual([c.remise_ref for c in candidates], [ref, ""])
 
     def test_erreur_globale_interrompt_la_composition(self) -> None:
         payload = {

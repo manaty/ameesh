@@ -588,7 +588,26 @@ class AuthorMailTest(unittest.TestCase):
         self.assertEqual((recipient, lot), ("mty-amh-impl-06", 3885))
         self.assertIn("retiré du paquet h-20261027-36", body)
         self.assertIn("0492_x.sql", body)
+        self.assertIn("la lecture #3801 désigne ton unité", body)
         self.assertEqual(sender, "mesh-design")
+
+    def test_un_retrait_de_repli_ne_revendique_pas_3801(self) -> None:
+        # #3942 : sans attribution sûre, le courrier nomme le module propre
+        # rouge et ne prétend pas que la lecture #3801 désigne l'unité.
+        removal = paquet_auto.Removal(
+            3885, tests=["tests.test_cluster.T.test_x"], attributed=False)
+        with mock.patch.object(paquet_auto, "lot_author",
+                               return_value="mty-amh-impl-06"), \
+                mock.patch.object(paquet_auto, "send_mail") as send:
+            failed = paquet_auto.notify_removals(
+                pathlib.Path("."), "h-20261027-36", [removal],
+                sender="mesh-design", log=lambda _line: None)
+        self.assertEqual(failed, [])
+        _recipient, _lot, body, _sender = send.call_args.args
+        self.assertIn("module propre de ton unité est rouge", body)
+        self.assertIn("sans attribution #3801 sûre", body)
+        self.assertNotIn("la lecture #3801 désigne ton unité", body)
+        self.assertIn("tests.test_cluster.T.test_x", body)
 
     def test_un_courrier_qui_echoue_ne_bloque_pas_la_recomposition(self) -> None:
         removal = paquet_auto.Removal(2, tests=["t"], attributed=True)
