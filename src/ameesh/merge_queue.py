@@ -803,6 +803,7 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
     author = str(row.get("assignee") or "").strip()
     out = {"ok": False, "why": "", "error": "", "class": cls, "required": 0,
            "accepted": [], "accepted_unfiltered": [], "blocked": [],
+           "rejected": [],
            "waived": waived, "waived_by": waived_by,
            "author": author, "author_family": "", "authors": [],
            "corrections": [], "on_freeze": 0, "unproven": [], "vehicle": None,
@@ -957,6 +958,7 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
 
     provided: dict[str, str] = {}
     provided_families: dict[str, set] = {}
+    known_authors: dict[str, dict] = {}
     for entry in authors or ():
         if isinstance(entry, Mapping):
             name = str(entry.get("name") or "").strip()
@@ -971,6 +973,12 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
             proven = set(proven) | {family.strip().lower()}
         if proven:
             provided_families.setdefault(name.lower(), set()).update(proven)
+        # #3968 : la lecture d'auteurs déjà faite par l'appelant (la file, le
+        # feu) permet au refus anticipé de nommer les auteurs et leurs familles
+        # au lieu d'affirmer « no author reading ».
+        known_authors[name.lower()] = {
+            "name": name,
+            "families": sorted(value for value in proven if value)}
     # #3397 : la porte se ferme sans lire la plage gelée quand les `ok` de la
     # tête sont déjà trop peu nombreux pour atteindre le compte requis, quels
     # que soient leurs auteurs. `_attribution_on_freeze` lit Git sur chaque
@@ -1010,7 +1018,38 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
         if unproven:
             out["why"] += ("; %d verdict(s) without an exact provenance receipt were "
                            "not counted (sensitive class, #2928)" % len(unproven))
-        if unfiltered:
+        # #3968 : quand l'appelant a déjà lu les auteurs (la file les passe pour
+        # que chaque avis soit prouvé indépendant), le refus les nomme. Dire
+        # « no author reading » alors que la lecture existe faisait chercher un
+        # défaut d'attribution : sur #3882 la famille codex venait du siège
+        # manuel codex1, pas d'un auteur, et le refus ne le disait pas.
+        if authors is not None:
+            rows = []
+            declared = set()
+            for key in sorted(known_authors):
+                entry = known_authors[key]
+                entry_families = list(entry["families"])
+                declared.update(entry_families)
+                row = {"name": entry["name"],
+                       "family": entry_families[0] if len(entry_families) == 1 else ""}
+                if len(entry_families) > 1:
+                    row["families"] = entry_families
+                rows.append(row)
+            out["authors"] = rows
+            out["author_families"] = sorted(declared)
+            if rows:
+                reading = ", ".join(
+                    "%s (%s)" % (row["name"],
+                                 ", ".join(row["families"]) if row.get("families")
+                                 else row["family"] or "family unknown")
+                    for row in rows)
+                out["why"] += ("; author reading of this head: %s; the missing ok "
+                               "verdict(s) are not on this head (a verdict on another "
+                               "head does not count)" % reading)
+            else:
+                out["why"] += ("; the supplied author reading names no author of this "
+                               "head and no other ok verdict names it")
+        elif unfiltered:
             out["why"] += ("; these %d ok verdict(s) are not proven independent "
                            "(no author reading)" % len(unfiltered))
         return out
@@ -1266,12 +1305,22 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
         author_families.update(_author_families(entry))
     out["author_families"] = sorted(author_families)
     accepted = []
+    rejected: list[dict] = []
     for mark in sorted((m for m in latest.values() if (m.get("verdict") or "") == "ok"),
                        key=_mark_order):
         actor = str(mark.get("actor") or "").strip()
         if actor and actor.lower() in recognized:
+            # #3968 : le refus nommera cet avis et sa cause, au lieu de laisser
+            # le lecteur deviner pourquoi une famille « interdite » l'est.
+            raised = recognized.get(actor.lower()) or {}
+            raised_families = sorted(_author_families(raised))
+            rejected.append({"actor": actor,
+                             "family": (raised_families[0]
+                                        if len(raised_families) == 1 else ""),
+                             "families": raised_families, "reason": "author"})
             continue                      # on ne relit pas son propre travail
         if actor and actor.lower() in corrections:
+            rejected.append({"actor": actor, "family": "", "reason": "corrector"})
             continue                      # l'auteur d'un correctif ne le relit pas (#2739)
         try:
             family = _verdict_family(mark)
@@ -1284,11 +1333,16 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
             return out
         if strict:
             if not family:
+                rejected.append({"actor": actor, "family": "",
+                                 "reason": "unknown-family"})
                 continue                  # famille du relecteur inconnue : non prouvée
             if family in author_families:
+                rejected.append({"actor": actor, "family": family,
+                                 "reason": "author-family"})
                 continue                  # la famille d'un auteur ne compte pas
         accepted.append({"actor": actor, "family": family, "id": mark.get("id"),
                          "at_ts": mark.get("at_ts")})
+    out["rejected"] = rejected
     # #2965 : la période ouverte courante se lit sur **tous** les avis
     # retenus, pas seulement sur les `required` premiers choisis pour la
     # famille : un avis d'une troisième famille peut être celui qui a rouvert
@@ -1322,6 +1376,22 @@ def review_gate(db, marks, frozen, *, repo: str | None = None, klass=None,
     out["why"] = ("no review verdict ok on the freeze %s (class: %s): %d independent review "
                   "verdict(s) required, %s; got %s"
                   % (frozen[:12], cls, required, need, got))
+    # #3968 : le refus nomme les familles d'auteurs de la tête et chaque avis
+    # écarté avec sa cause. Une famille « interdite » sans cette preuve se
+    # lisait comme un défaut d'attribution (nexlink #3882 : la famille codex
+    # venait d'un siège manuel, pas d'un commit de la plage).
+    if author_families:
+        out["why"] += ("; author families of this head: %s"
+                       % ", ".join(sorted(author_families)))
+    if rejected:
+        causes = {"author": "author of the head",
+                  "corrector": "reviewer who corrected the head",
+                  "unknown-family": "unknown model family (independence not proven)",
+                  "author-family": "family of an author of the head"}
+        out["why"] += "; not counted: %s" % ", ".join(
+            "%s (%s): %s" % (row["actor"] or "?", row["family"] or "family unknown",
+                             causes.get(row["reason"], row["reason"]))
+            for row in rejected)
     if unproven:
         out["why"] += ("; %d verdict(s) without an exact provenance receipt were not "
                        "counted (sensitive class, #2928)" % len(unproven))

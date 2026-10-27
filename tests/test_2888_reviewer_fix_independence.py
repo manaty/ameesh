@@ -47,7 +47,7 @@ class SelectCorrectorFamilyTest(TestCase):
         self.assertEqual(out["state"], rd.WAITING, out)
         self.assertEqual([r["name"] for r in out["reviewers"]], ["dev1"])
         self.assertEqual(out["missing"], 1)
-        self.assertIn("forbidden claude, codex", out["why"])
+        self.assertIn("forbidden author families: claude, codex", out["why"])
         self.assertIn("1 eligible family", out["why"])
 
     def test_a_small_correction_is_receivable_when_a_family_remains(self):
