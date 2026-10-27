@@ -1868,6 +1868,8 @@ def check_assignee(db: Db, assignee: str, *, externe: bool = False, cfg=None) ->
     lui donnerait pas de tour, le lot dormirait. C'est le point de passage
     unique des attributions (`work assign`, `work add --assignee`, courrier
     `--lot`/`--new-lot`, `delegate`, `backlog.auto_take`, `handoff`).
+    #4056 : la seule fenêtre courte du compte (#3779) n'est qu'un
+    avertissement : elle se lève en minutes.
     """
     from . import registry
 
@@ -1927,17 +1929,25 @@ def check_assignee(db: Db, assignee: str, *, externe: bool = False, cfg=None) ->
     # lot dormirait (#885/#886/#967, confiés à des agents Codex en pause
     # budget). Un agent arrêté garde son avertissement : l'arrêt est un geste
     # humain, réversible, pas une tenue.
+    warnings = []
     if row.get("status") not in ("stopped", "dead"):
         from . import account_turn
 
         hold = account_turn.turn_hold(cfg, db, name, row)
-        if hold:
+        if hold and _short_window_hold(hold):
+            # #4056 : la fenêtre courte du compte (#3779 : écart de départ,
+            # cooldown, plafond de tours) se lève en minutes, et sur un compte
+            # partagé l'écart de départ se renouvelle à chaque tour d'un voisin
+            # (cx1/cx2 le 27/10, 19:33) : le refus ne passait jamais. Le lot
+            # attend le prochain tour admis, comme une désignation (#3876).
+            warnings.append("%s is briefly held — %s; the lot waits for its next "
+                            "admitted turn" % (name, hold))
+        elif hold:
             raise WorkError(
                 "assignment refused: %s is held — %s; its runner will not start a "
                 "turn before the hold lifts: wait for the release, assign another "
                 "agent, or leave the lot unassigned (the team queue takes it)"
                 % (name, hold))
-    warnings = []
     if row.get("status") == "stopped":
         warnings.append("%s is stopped (%s): the lot will wait for it to resume"
                         % (name, row.get("stop_reason") or "unknown reason"))
@@ -1945,6 +1955,18 @@ def check_assignee(db: Db, assignee: str, *, externe: bool = False, cfg=None) ->
         warnings.append(note)
     return {"assignee": name, "externe": False, "responsible": responsible,
             "warning": "; ".join(warnings) or None}
+
+
+def _short_window_hold(hold: str) -> bool:
+    """#4056 : la tenue rendue par `account_turn.turn_hold` (préfixe de pause
+    déjà retiré, marque d'agent critique possible) est-elle la seule fenêtre
+    courte du compte (#3779), qui dure au plus `COOLDOWN_MAX_S` ?"""
+    from . import account_window, budget
+
+    text = (hold or "").strip()
+    if text.lower().startswith(budget.CRITICAL_MARK.lower()):
+        text = text[len(budget.CRITICAL_MARK):]
+    return account_window.is_short_window(text)
 
 
 def is_pilot(cfg, db: Db, actor: str) -> bool:
