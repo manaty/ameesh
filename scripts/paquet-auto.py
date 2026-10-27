@@ -129,7 +129,7 @@ ATTRIBUTION_SCRIPT = "scripts/paquet-attribution.py"
 #: un en-tête d'échec unittest (`FAIL: test (tests.test_x.T.t)`) ; une ligne
 #: `FAIL:` produite par le test lui-même n'a pas ce nom pointé et est ignorée
 FAIL_LINE_RE = re.compile(
-    r"^(?:FAIL|ERROR):\s+.+?\(((?:tests\.|unittest\.loader\.)[^()]*)\)",
+    r"^(FAIL|ERROR):\s+.+?\(((?:tests\.|unittest\.loader\.)[^()]*)\)",
     re.MULTILINE)
 TEST_MODULE_RE = re.compile(r"(?:^|\.)tests\.(test_[A-Za-z0-9_]+)")
 
@@ -920,14 +920,22 @@ def unittest_failures(output: str) -> list[dict]:
 
     `FAIL: test_x (tests.test_module.Class.test_x)` et
     `ERROR: setUpClass (tests.test_module.Class)` donnent le même nom pointé
-    que la CI ; un sous-test (`... (i=1)`) ne change pas le nom.
+    que la CI ; un sous-test (`... (i=1)`) ne change pas le nom. Une
+    `ERROR:` d'environnement (psql/psycopg absent) n'est pas un rouge du lot :
+    elle est ignorée, comme `TestRun.real_failure` la classe.
     """
     seen: set[str] = set()
     out: list[dict] = []
     for match in FAIL_LINE_RE.finditer(output or ""):
-        test = match.group(1).strip()
+        kind, test = match.group(1), match.group(2).strip()
         if not test or test in seen:
             continue
+        if kind == "ERROR":
+            rest = (output or "")[match.end():]
+            end = BLOCK_END_RE.search(rest)
+            block = rest[:end.start()] if end else rest
+            if TestRun._error_is_environment(block):
+                continue
         seen.add(test)
         module = ""
         found = TEST_MODULE_RE.search(test)

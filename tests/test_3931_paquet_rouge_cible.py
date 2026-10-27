@@ -88,6 +88,25 @@ class FailureReaderTest(unittest.TestCase):
     def test_resume_non_lu_comme_un_echec(self) -> None:
         self.assertEqual(paquet_auto.unittest_failures("FAILED (failures=1)"), [])
 
+    def test_erreur_d_environnement_ignoree(self) -> None:
+        text = (
+            "======================================================================\n"
+            "FAIL: test_x (tests.test_cluster.T.test_x)\n"
+            "AssertionError: rouge\n"
+            "\n"
+            "======================================================================\n"
+            "ERROR: test_db (tests.test_unit.T.test_db)\n"
+            "----------------------------------------------------------------------\n"
+            "Traceback (most recent call last):\n"
+            "psycopg.OperationalError: connection refused\n"
+            "\n"
+            "----------------------------------------------------------------------\n"
+            "FAILED (failures=1, errors=1)\n"
+        )
+        self.assertEqual(
+            paquet_auto.unittest_failures(text),
+            [{"test": "tests.test_cluster.T.test_x", "module": "test_cluster"}])
+
 
 class DesignationTest(unittest.TestCase):
     def test_une_preuve_forte_et_une_seule_unite(self) -> None:
