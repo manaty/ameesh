@@ -1470,13 +1470,19 @@ def notify_removals(repo: Path, name: str, removals: list[Removal], *,
             log("auteur de #%d inconnu : courrier non envoyé" % removal.lot)
             continue
         tests = ", ".join(removal.tests[:3]) or "tests ciblés"
-        evidence = " ; ".join(removal.evidence[:3]) or "attribution #3801"
+        if removal.attributed:
+            why = ("les tests ciblés de la composition ont rougi sur la tête "
+                   "composée, et la lecture #3801 désigne ton unité (%s)"
+                   % (" ; ".join(removal.evidence[:3]) or "attribution #3801"))
+        else:
+            why = ("les tests ciblés de la composition ont rougi sur la tête "
+                   "composée ; le module propre de ton unité est rouge "
+                   "(retrait de repli, sans attribution #3801 sûre)")
         body = (
-            "#%d retiré du paquet %s : les tests ciblés de la composition ont "
-            "rougi sur la tête composée, et la lecture #3801 désigne ton unité "
-            "(%s). Tests : %s. Le paquet est recomposé sans ton lot ; corrige "
-            "puis regèle, il reviendra à une coupure suivante."
-            % (removal.lot, name, evidence, tests))
+            "#%d retiré du paquet %s : %s. Tests : %s. Le paquet est recomposé "
+            "sans ton lot ; corrige puis regèle, il reviendra à une coupure "
+            "suivante."
+            % (removal.lot, name, why, tests))
         try:
             send_mail(author, removal.lot, body, sender)
         except PaquetAutoError as exc:
