@@ -72,29 +72,30 @@ def reserve_restart(db, host: str, name: str, ttl_s: float, *,
     """#4086: `host` stops while holding `name` and reserves it for `ttl_s`.
 
     Written BEFORE the lease is returned, so no candidate sees the role free
-    without the reservation. B1 of the review: written only while `owner`
-    holds the exact live lease `epoch`, under the registry row lock that
-    `registry.claim` takes first. A worker whose lease expired and was taken
-    elsewhere, without having seen it, writes nothing. Returns whether the
-    reservation was written.
+    without the reservation, and only while `owner` holds the exact live lease
+    `epoch` (B1 of the review). Same pattern as `registry.claim`: the registry
+    row is locked by name first, then the lease is re-checked by the NEXT
+    statement, under that lock, with `clock_timestamp()`. A check in the
+    locking statement itself would be evaluated before the lock wait and not
+    redone when the holder releases the row unmodified: a lease that expired
+    meanwhile would still reserve. Returns whether the reservation was written.
     """
-    rows = db.query(
-        """
-        WITH holder AS (
-            SELECT name FROM agent_registry
-             WHERE name = %s AND lease_owner = %s AND lease_epoch = %s
-               AND lease_expires_at > clock_timestamp()
-               FOR UPDATE
-        )
-        INSERT INTO role_handover (host, name, challenger, released_until)
-        SELECT %s, holder.name, %s,
-               clock_timestamp() + make_interval(secs => %s::float8)
-          FROM holder
-        ON CONFLICT (host, name, challenger) DO UPDATE
-           SET released_until = excluded.released_until,
-               updated_at = now()
-        RETURNING host
-        """, (name, owner, int(epoch), host, RESTART, max(0.0, float(ttl_s))))
+    with db.transaction() as tx:
+        tx.query("SELECT name FROM agent_registry WHERE name = %s FOR UPDATE",
+                 (name,))
+        rows = tx.query(
+            """
+            INSERT INTO role_handover (host, name, challenger, released_until)
+            SELECT %s, r.name, %s,
+                   clock_timestamp() + make_interval(secs => %s::float8)
+              FROM agent_registry r
+             WHERE r.name = %s AND r.lease_owner = %s AND r.lease_epoch = %s
+               AND r.lease_expires_at > clock_timestamp()
+            ON CONFLICT (host, name, challenger) DO UPDATE
+               SET released_until = excluded.released_until,
+                   updated_at = now()
+            RETURNING host
+            """, (host, RESTART, max(0.0, float(ttl_s)), name, owner, int(epoch)))
     return bool(rows)
 
 

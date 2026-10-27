@@ -10,6 +10,7 @@ pendant la lecture n'est plus « daté dans le futur ».
 """
 from __future__ import annotations
 
+import threading
 import time
 import unittest
 
@@ -140,6 +141,41 @@ class RestartReservationTest(_RoleCase):
         self.assertTrue(handover_pg.reserve_restart(
             self.db, "banc", "pilote", 90.0, owner=obj.runner_id, epoch=7))
         self.assertEqual(self.reserved()["host"], "banc")
+
+    def test_bail_echu_pendant_l_attente_du_verrou_ne_reserve_pas(self):
+        # B1 (2e tour) : une autre connexion tient la ligne du registre SANS la
+        # modifier au-delà de l'échéance du bail, puis la rend. Le contrôle
+        # doit être refait sous le verrou, pas avant son attente.
+        obj = self.runner()
+        self.worker(obj)
+        self.db.execute("UPDATE agent_registry SET lease_expires_at ="
+                        " clock_timestamp() + interval '1 second' WHERE name = 'pilote'")
+        other = self.connect()
+        self.addCleanup(other.close)
+        locked, done = threading.Event(), threading.Event()
+
+        def hold_lock():
+            try:
+                with other.transaction() as tx:
+                    tx.query("SELECT name FROM agent_registry WHERE name = 'pilote'"
+                             " FOR UPDATE")
+                    locked.set()
+                    time.sleep(2.0)  # au-delà de l'échéance, aucune écriture
+            finally:
+                locked.set()
+                done.set()
+
+        thread = threading.Thread(target=hold_lock, daemon=True)
+        thread.start()
+        self.assertTrue(locked.wait(30))
+        started = time.monotonic()
+        written = handover_pg.reserve_restart(
+            self.db, "banc", "pilote", 90.0, owner=obj.runner_id, epoch=7)
+        thread.join(30)
+        self.assertTrue(done.is_set())
+        self.assertGreater(time.monotonic() - started, 1.0)  # a bien attendu
+        self.assertFalse(written)
+        self.assertIsNone(self.reserved())
 
     def test_la_reprise_consomme_la_reservation(self):
         obj = self.runner()
