@@ -228,7 +228,9 @@ REMOTE_TIP_FETCH_BUDGET = 16
 #: séparé : une forge en annonce des milliers, et au-delà de ce nombre la
 #: preuve d'absence reste impossible (`None`, jamais un `False` déduit des
 #: refs ignorées).
-REMOTE_EXTRA_TIP_FETCH_BUDGET = 512
+# #3904 : une seule négociation Git pour les milliers de pointes de PR.
+# Le plafond reste explicite ; aucune ref au-delà du budget n'est ignorée.
+REMOTE_EXTRA_TIP_FETCH_BUDGET = 4096
 
 
 def _doubt_reason(exc: BaseException) -> str:
@@ -519,16 +521,18 @@ def remote_reachable(repo: str, rev: str, remote: str = "origin", *,
     if len(pending_extra) > extra_budget:
         return None                 # trop d'autres refs inconnues : doute
     pending = pending_heads + pending_extra
-    for start in range(0, len(pending), 64):
-        chunk = pending[start:start + 64]
-        try:
-            proc = _git(repo, "fetch", "--quiet", "--no-tags",
-                        "--no-write-fetch-head", "--", remote, *chunk,
-                        timeout=timeout)
-        except (GitError, OSError):
-            return None
-        if proc.returncode != 0:
-            return None
+    # Un seul fetch : 3 000 PR ne doivent pas lancer 47 négociations réseau.
+    # stdin évite la limite de taille d'argv ; les SHA exacts ne créent ni
+    # ref locale ni FETCH_HEAD et toutes les ascendances restent vérifiées.
+    try:
+        proc = _git(repo, "fetch", "--quiet", "--no-tags", "--stdin",
+                    "--no-write-fetch-head", "--", remote,
+                    stdin=("\n".join(pending) + "\n").encode(),
+                    timeout=timeout)
+    except (GitError, OSError):
+        return None
+    if proc.returncode != 0:
+        return None
     for tip in pending:
         commit = local_commit(repo, tip)
         if commit is None:

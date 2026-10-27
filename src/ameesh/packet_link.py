@@ -145,7 +145,16 @@ def record(db, package_id: int, *, repo: str | None = None, base: str | None = N
             "packet carrier #%s has branch %r: a package is a lot on an "
             "`integration/**` branch" % (package_id, package_branch or ""))
     declared_branch = _text(package.get("branch"))
-    if declared_branch and _text(branch) and _text(branch) != declared_branch:
+    if not declared_branch:
+        # #3905 : sans branche déclarée, `packet_reviews.is_vehicle` lit le
+        # porteur comme un lot ordinaire ; son gel compte alors les auteurs de
+        # toutes les unités et refuse toute famille (h-35 #3879). `--branch`
+        # seul n'écrit que les membres : la branche se pose d'abord.
+        raise PacketLinkError(
+            "packet carrier #%s has no declared branch: associate it first "
+            "(`ameesh work branch %s %s`), or its freeze reads it as an "
+            "ordinary lot" % (package_id, package_id, package_branch))
+    if _text(branch) and _text(branch) != declared_branch:
         raise PacketLinkError(
             "packet carrier #%s is on %s, not %s: correct the carrier's branch "
             "first (`ameesh work branch %s %s`)"
