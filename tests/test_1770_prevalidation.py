@@ -465,6 +465,14 @@ class RunTest(unittest.TestCase):
         self.assertEqual(pv.classify(75, "ameesh offload: stopped on vm-agents-1: host "
                                          "draining: over deadline; no fallback (--fallback none)"),
                          "gate-preempted")
+        # #4008 : un job refusé par la porte AVANT son départ est aussi une
+        # préemption, pas une VM absente.
+        self.assertEqual(pv.classify(75, "ameesh offload: refused on ameesh-agents-1: "
+                                         "host stopped: app_cpu; no fallback (--fallback none)"),
+                         "gate-preempted")
+        self.assertEqual(pv.classify(75, "ameesh offload: refused on ameesh-agents-1: "
+                                         "host draining: maintenance; no fallback (--fallback none)"),
+                         "gate-preempted")
         self.assertEqual(pv.classify(124), "run-incomplete")
         self.assertEqual(pv.classify(130), "run-incomplete")
         self.assertEqual(pv.classify(70), "run-incomplete")
