@@ -1747,7 +1747,11 @@ class _StateRenewal:
     Une connexion à part : la passe tient la sienne, et une transaction longue
     du passage ne retarde pas le renouvellement. Un échec réseau n'arrête pas
     le fil (la base peut revenir avant l'expiration) ; un refus du bail
-    (`False`) le marque perdu et l'écriture finale échouera, comme il se doit.
+    (`False`) le marque perdu. Une **échéance monotone locale**, fixée à la
+    prise et prolongée seulement par un renouvellement réussi, dit au passage
+    qu'il ne doit plus rien pousser même quand la base ne répond plus
+    (`expired`, lu par `Notifier._delivery_open`) : un fil bloqué ou une base
+    injoignable ne laisse pas livrer au-delà de la TTL.
     """
 
     def __init__(self, cfg: Config, owner: str, epoch: int, *,
@@ -1759,6 +1763,12 @@ class _StateRenewal:
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._warned = False
+        #: échéance LOCALE : avance à chaque renouvellement réussi seulement
+        self._deadline = time.monotonic() + self.ttl
+
+    def expired(self) -> bool:
+        """Le bail ne couvre plus cette passe (perdu, ou échéance locale) ?"""
+        return self.lost or time.monotonic() >= self._deadline
 
     def start(self) -> None:
         self._thread = threading.Thread(target=self._run, daemon=True,
@@ -1772,6 +1782,10 @@ class _StateRenewal:
                 try:
                     if conn is None:
                         conn = db_mod.connect(self.cfg)
+                    # L'échéance locale démarre AVANT l'appel : l'heure de la
+                    # base est postérieure au départ, donc la marge est du bon
+                    # côté (on ne dépasse jamais le bail du serveur).
+                    started = time.monotonic()
                     ok = storage.of(conn).notify_liveness.renew_state(
                         STATE_SCOPE, self.owner, self.epoch, self.ttl)
                 except Exception as exc:  # noqa: BLE001 — le fil ne tombe pas
@@ -1790,6 +1804,7 @@ class _StateRenewal:
                 if not ok:
                     self.lost = True
                     return
+                self._deadline = started + self.ttl
         finally:
             if conn is not None:
                 try:
@@ -1821,6 +1836,10 @@ class StateLease:
 
     def __getitem__(self, index: int):
         return (self.owner, self.epoch)[index]
+
+    def expired(self) -> bool:
+        """Le bail ne couvre plus cette passe (#3913 B1)."""
+        return self.renewal is not None and self.renewal.expired()
 
     def stop(self) -> None:
         if self.renewal is not None:
@@ -1939,6 +1958,8 @@ def enter_shared_state(db, notifier, cfg: Config, *, dry_run: bool = False,
     log = log or notifier.log
     ttl = STATE_LEASE_S if lease_s is None else float(lease_s)
     interval = STATE_RENEW_S if renew_s is None else float(renew_s)
+    #: aucun bail périmé d'un appel antérieur ne doit autoriser la suite
+    notifier.lease = None
     if dry_run:
         shared = load_shared_state(db)
         if shared is not None:
@@ -1972,6 +1993,10 @@ def enter_shared_state(db, notifier, cfg: Config, *, dry_run: bool = False,
         return None, False
     lease = StateLease(owner, epoch, _StateRenewal(
         cfg, owner, epoch, ttl=ttl, interval=interval, log=log))
+    # #3913 B1 : la passe consulte ce bail avant chaque envoi ; le retirer au
+    # rendu ou sur toute sortie en erreur est aussi important que le poser.
+    notifier.lease = lease
+    notifier._lease_warned = False
     # #3913 : le renouvellement commence AVANT la lecture/le calcul, qui peut
     # durer : sans lui, un bail de 90 s expirerait au milieu d'une passe lente.
     lease.renewal.start()
@@ -1993,6 +2018,7 @@ def enter_shared_state(db, notifier, cfg: Config, *, dry_run: bool = False,
         # Ne pas garder un bail qu'aucune passe n'utilisera (base tombée
         # entre la prise et la lecture) : le prochain essai doit pouvoir le
         # prendre sans attendre son expiration.
+        notifier.lease = None
         release_shared_state(db, lease, cfg=cfg)
         raise
     return lease, True
@@ -2011,12 +2037,20 @@ def leave_shared_state(db, notifier, lease, *, log=None,
     log = log or notifier.log
     saved = False
     try:
+        expired = getattr(lease, "expired", None)
+        if expired is not None and expired():
+            # #3913 B1 : ne pas écrire un document sous un bail mort — et le
+            # dire, plutôt que de laisser `save_state` refuser à la fin.
+            log("alerts delivery state NOT saved: the shared lease was lost or "
+                "expired; the pass stopped before any new send")
+            return False
         saved = save_shared_state(db, notifier.state, owner=owner, epoch=epoch)
         if not saved:
             log("alerts delivery state NOT saved: the shared lease was lost or "
                 "expired; the next holder may re-push")
         return saved
     finally:
+        notifier.lease = None
         release_shared_state(db, lease, cfg=cfg)
 
 
@@ -2223,6 +2257,12 @@ class Notifier:
         self.local_resolved_keys: set = set()
         self.dry_run = dry_run
         self.sender = sender or (DrySender() if dry_run else Sender(timeout=ncfg.timeout))
+        #: #3913 B1 : le bail d'état partagé de CETTE passe (posé par
+        #: `enter_shared_state`, retiré au rendu). None hors d'une passe
+        #: d'alertes ou en `--dry-run`. `_delivery_open` le consulte avant
+        #: chaque envoi : un détenteur périmé ne pousse plus rien.
+        self.lease = None
+        self._lease_warned = False
         #: les enregistrements du dernier passage (remplacé par `run_pass`)
         self._records: list = []
         self.emit = emit or (lambda record: None)
@@ -2235,6 +2275,36 @@ class Notifier:
         self._ci_watcher = None
 
     # -- passage --------------------------------------------------------------
+    def _delivery_open(self) -> bool:
+        """Le bail partagé autorise-t-il encore des effets ? (#3913 B1)
+
+        Un détenteur qui a perdu son bail pendant une passe longue ne doit
+        plus pousser ni déposer de courrier : le refus de `save_state` à la fin
+        ne répare pas un envoi déjà parti. Le bail local porte une échéance
+        monotone, prolongée seulement par un renouvellement réussi ; une base
+        injoignable ou un fil de renouvellement bloqué ne laisse donc pas
+        livrer au-delà de la TTL. Sans bail (passage direct, `--dry-run`,
+        `run_local_pass`), la passe est autorisée : le bail ne ferme que la
+        livraison partagée.
+        """
+        lease = self.lease
+        if lease is None:
+            return True
+        expired = getattr(lease, "expired", None)
+        if expired is None or not expired():
+            return True
+        if not self._lease_warned:
+            self._lease_warned = True
+            self.log("alerts delivery lease lost: pass stopped before any new send")
+        return False
+
+    def _tail_without_alerts(self, db, now: float, selected):
+        """Les passes mécaniques gardent leur tour quand le bail est perdu."""
+        rest = (frozenset(selected) if selected is not None
+                else frozenset(ONLY_PASSES) - set(self.skip or ()))
+        rest = rest - {"alerts"}
+        return self._run_tail(db, now, rest) if rest else []
+
     def run_pass(self, db, current: list | None = None, thresholds: dict | None = None,
                  only=None) -> list:
         from . import alert_ack
@@ -2250,6 +2320,12 @@ class Notifier:
         # auditeur, #3202).
         if selected is not None and "alerts" not in selected:
             return self._run_tail(db, now, selected)
+        # #3913 B1 : le bail peut s'être perdu ENTRE la prise et ce passage
+        # (passe retardée, base tombée). Ne rien battre ni pousser : le
+        # nouveau détenteur livre et son état fait foi ; les passes
+        # mécaniques indépendantes gardent leur tour.
+        if not self._delivery_open():
+            return self._tail_without_alerts(db, now, selected)
         # #3007 : ce passage prouve, pour tout le maillage, que CE notificateur
         # joint ses humains. Un poste sain ne lève donc plus d'alerte de voie
         # depuis les VM ; son silence, lui, se voit partout.
@@ -2285,6 +2361,12 @@ class Notifier:
                 current = exploitation.alerts(
                     self.cfg, db, now=now, local_pool=False,
                     unreadable=unreadable, gate_cache=gate_cache, **thresholds)
+        # #3913 B1 : la lecture/le calcul a pu durer plus que le bail. Avant
+        # la première écriture (les accusés) et la première poussée, on
+        # reprend le verdict : un détenteur périmé se tait, même si son
+        # échéance locale n'a pas encore été vue par le fil de renouvellement.
+        if not self._delivery_open():
+            return self._tail_without_alerts(db, now, selected)
         records: list = []
         self._records = records
         router = Router(self.cfg, db, self.ncfg)
@@ -2865,7 +2947,7 @@ class Notifier:
     def _event(self, db, kind: str, key: str, alert: dict) -> None:
         """L85: the alert in the event log (`GET /api/v1/events`); a base
         error is said, never fatal to the pass."""
-        if self.dry_run or db is None:
+        if self.dry_run or db is None or not self._delivery_open():
             return
         from . import events
         data = {name: alert.get(name) for name in ("agent", "lot", "host")
@@ -2878,6 +2960,8 @@ class Notifier:
             self.log("event %s not recorded: %s" % (kind, type(exc).__name__))
 
     def _raise(self, entry: dict, router: Router, now: float) -> None:
+        if not self._delivery_open():
+            return
         alert = entry["alert"]
         first = entry["status"] == "nouvelle"
         human, source = router.resolve(alert)
@@ -2935,6 +3019,8 @@ class Notifier:
         d'une passe (perte projetée qui oscille autour du seuil) ne refait pas
         briefer la même fenêtre avant la relance de 6 h. Indépendant de
         `notify.types` (qui ne règle que l'humain). Jamais fatal au passage."""
+        if not self._delivery_open():
+            return
         sent = self.state["briefs"]
         # #3007 : le brief de `notify_undeliverable` dépend de la vie de CE
         # notificateur ; c'est `notify_gap.brief_once`, au ménage du runner,
@@ -3168,6 +3254,8 @@ class Notifier:
             # son activité (stagnation) et effacerait l'alerte qu'il signale
             delivered = []
             for name, text in sorted(briefs.items()):
+                if not self._delivery_open():
+                    break
                 if self.dry_run:
                     self.log("[%s] mail to %s (dry run): %s" % (kind, name, text))
                     continue
@@ -3289,6 +3377,8 @@ class Notifier:
 
     # -- résolution -----------------------------------------------------------
     def _resolved(self, key: str, entry: dict, now: float) -> None:
+        if not self._delivery_open():
+            return
         alert, human = entry["alert"], entry.get("human")
         status = entry.get("status")
         if alert.get("type") in QUIET_RESOLUTION_TYPES:
@@ -3350,10 +3440,14 @@ class Notifier:
                 if not st.get("ok") and st.get("attempts", 0) < self.ncfg.max_attempts]
 
     def _retry(self, entry: dict, event: str, now: float) -> None:
+        if not self._delivery_open():
+            return
         if entry.get("status") == "envoi" and self._pending(entry):
             self._attempt(entry, event, now)
 
     def _attempt(self, entry: dict, event: str, now: float) -> None:
+        if not self._delivery_open():
+            return
         message = render(entry["alert"], event, now, raised_ts=entry.get("raised_ts"))
         # #3536 : l'identité que porte le canal nexlink — le registre `notified`
         # (#2395) haché, donc stable d'un redémarrage à l'autre ; l'instant est
@@ -3464,6 +3558,8 @@ class Notifier:
     def _attempt_fallback(self, entry: dict, name: str, message: Message,
                           now: float) -> str | None:
         """Envoie (ou annule) un repli en attente ; rend le résultat du journal."""
+        if not self._delivery_open():
+            return None
         st = entry["channels"][name]
         if st.get("ok"):
             return None
@@ -3502,6 +3598,10 @@ class Notifier:
         return "failed: %s" % failure
 
     def _send(self, channel: Channel, message: Message) -> tuple:
+        if not self._delivery_open():
+            # Dernier verrou : un chemin d'envoi ajouté plus tard ne peut pas
+            # pousser depuis un détenteur périmé, même s'il a oublié son garde.
+            return False, ChannelError("alerts delivery lease lost")
         try:
             self.sender.send(channel, message)
             return True, None
@@ -3841,6 +3941,8 @@ class Notifier:
         self._summary_clear_episode(bucket)
 
     def _summaries(self, now: float) -> None:
+        if not self._delivery_open():
+            return
         for human in list(self.state["summary"]):
             bucket = self._bucket(human)
             self._drop_notified_members(bucket, human)
@@ -4373,6 +4475,7 @@ def cmd_notify(cfg: Config, ncfg: NotifyConfig, args) -> int:
                 if lease is not None:
                     # #3913 : la connexion de la passe vient de tomber ; le
                     # rendu tente une connexion neuve au lieu d'avaler l'échec.
+                    notifier.lease = None
                     release_shared_state(db, lease, cfg=cfg, log=_stderr_log)
                     lease = None
                 if args.once:
@@ -4391,6 +4494,7 @@ def cmd_notify(cfg: Config, ncfg: NotifyConfig, args) -> int:
         return 0
     finally:
         if lease is not None:
+            notifier.lease = None
             release_shared_state(db, lease, cfg=cfg, log=_stderr_log)
         if db is not None:
             db.close()

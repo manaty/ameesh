@@ -47,6 +47,13 @@ class FakeSender:
         self.sent.append((channel.name, message.title))
 
 
+def decision(since=900.0):
+    """Une demande de décision routée vers human:owner par `ncfg()`."""
+    return {"schema": "ameesh-alert/1", "type": "decision_pending",
+            "agent": "mesh-design", "lot": 3913, "responsible": "human:owner",
+            "detail": "décision #1 en attente", "since": since}
+
+
 class LeaseBoundsTest(unittest.TestCase):
     """Le bail perdu doit se reprendre avant le seuil de l'alerte."""
 
@@ -60,6 +67,17 @@ class LeaseBoundsTest(unittest.TestCase):
         self.assertLess(
             notify.STATE_LEASE_S + role_timers.ALERTS_INTERVAL_S,
             notify_gap.ALIVE_S)
+
+    def test_a_local_deadline_stops_a_pass_without_any_database_call(self):
+        # #3913 B1 : même si le fil de renouvellement est bloqué ou la base
+        # muette, l'échéance monotone locale interdit de livrer au-delà de la
+        # TTL (aucun aller-retour base dans ce témoin).
+        renewal = notify._StateRenewal(object(), "agents-a:1:tok", 1,
+                                       ttl=0.05, interval=10)
+        lease = notify.StateLease("agents-a:1:tok", 1, renewal)
+        self.assertFalse(lease.expired())
+        time.sleep(0.1)
+        self.assertTrue(lease.expired())
 
 
 class BriefBodyTest(unittest.TestCase):
@@ -217,6 +235,64 @@ class LeaseRecoveryTest(PgTestCase):
         self.assertIsNone(lease)
         self.assertTrue(storage.of(self.db).notify_liveness.release_state(
             "alerts", owner, epoch))
+
+    def test_a_stale_pass_pushes_nothing_after_another_host_took_the_lease(self):
+        # #3913 B1 (témoin de la relecture cx3) : A prend, sa passe est
+        # retardée au-delà de la TTL, B prend et livre ; A reprend sa passe
+        # périmée -> aucune poussée, et l'état de B n'est pas écrasé.
+        notifier_a = self.notifier(self.cfg_a)
+        lease_a, deliver_a = notify.enter_shared_state(
+            self.db, notifier_a, self.cfg_a, lease_s=0.2, renew_s=0.05)
+        self.assertTrue(deliver_a)
+        lease_a.renewal.stop()            # la passe A ne renouvelle plus
+        time.sleep(0.3)                   # sa TTL est passée
+        notifier_b = self.notifier(self.cfg_b)
+        lease_b, deliver_b = notify.enter_shared_state(
+            self.db, notifier_b, self.cfg_b, lease_s=60, renew_s=20)
+        self.assertTrue(deliver_b)
+        notifier_b.run_pass(self.db, current=[decision()])
+        self.assertEqual(len(notifier_b.sender.sent), 1)
+        saved_b = storage.of(self.db).notify_liveness.read_state("alerts")
+        # A reprend sa passe avec la même décision : rien ne part, et son
+        # rendu ne réécrit pas le document de B.
+        notifier_a.run_pass(self.db, current=[decision()])
+        self.assertEqual(notifier_a.sender.sent, [])
+        self.assertFalse(notify.leave_shared_state(
+            self.db, notifier_a, lease_a, cfg=self.cfg_a))
+        self.assertEqual(
+            storage.of(self.db).notify_liveness.read_state("alerts"), saved_b)
+        notify.leave_shared_state(self.db, notifier_b, lease_b, cfg=self.cfg_b)
+
+    def test_a_pass_stops_as_soon_as_the_renewal_is_refused(self):
+        # #3913 B1 : `renew_state` refuse explicitement (bail pris ailleurs) ;
+        # la passe ne doit pas pousser même si son échéance locale court encore.
+        notifier = self.notifier(self.cfg_a)
+        lease, deliver = notify.enter_shared_state(
+            self.db, notifier, self.cfg_a)
+        self.assertTrue(deliver)
+        lease.renewal.lost = True
+        notifier.run_pass(self.db, current=[decision()])
+        self.assertEqual(notifier.sender.sent, [])
+        self.assertFalse(notify.leave_shared_state(
+            self.db, notifier, lease, cfg=self.cfg_a))
+
+    def test_a_pass_stops_when_the_lease_is_lost_during_the_observation(self):
+        # #3913 B1 : le bail survit à la prise, puis se perd PENDANT la
+        # lecture/le calcul. Le second verdict, juste avant les accusés et la
+        # première poussée, doit arrêter la passe.
+        notifier = self.notifier(self.cfg_a)
+        notifier.only = frozenset({"alerts"})
+        lease, deliver = notify.enter_shared_state(
+            self.db, notifier, self.cfg_a)
+        self.assertTrue(deliver)
+        with mock.patch.object(notifier, "_delivery_open",
+                               side_effect=[True, False]) as gate, \
+                mock.patch.object(notify.exploitation, "alerts",
+                                  return_value=[decision()]):
+            notifier.run_pass(self.db)
+        self.assertEqual(gate.call_count, 2)
+        self.assertEqual(notifier.sender.sent, [])
+        notify.leave_shared_state(self.db, notifier, lease, cfg=self.cfg_a)
 
 
 class ReleaseOnFreshConnectionTest(PgTestCase):
