@@ -651,10 +651,11 @@ class Operations(interface.Operations):
         `by_source` garde une ligne par source de publication (agent) : deux
         hôtes homonymes ne s'effacent plus dans la sélection (#3755, avis
         cx1). Les lecteurs de la vue unifiée gardent le défaut."""
-        colonnes = ("harness, account, gauge_key, source" if by_source
-                    else "harness, account, gauge_key")
+        if not by_source:
+            return self._gauge_heads(since_s=since_s)
+        # Per-source history keeps its existing contract (#3755).
         return self.db.query(
-            "SELECT DISTINCT ON (" + colonnes + ")"
+            "SELECT DISTINCT ON (harness, account, gauge_key, source)"
             " harness, gauge_key AS key, used,"
             " extract(epoch from resets_at)::float8 AS resets_at_ts, window_s,"
             " extract(epoch from observed_at)::float8 AS observed_ts,"
@@ -662,28 +663,59 @@ class Operations(interface.Operations):
             " overage_capable, overage_in_use"
             " FROM quota_gauge_readings"
             " WHERE observed_at >= now() - make_interval(secs => %s)"
-            " ORDER BY " + colonnes + ","
+            " ORDER BY harness, account, gauge_key, source,"
             " produced_at DESC NULLS LAST, observed_at DESC, id DESC",
             (float(since_s),))
 
     def gauge_latest(self, *, harness, account) -> list[dict]:
-        """#1132 : le dernier relevé CONNU de chaque jauge d'un compte nommé,
-        sans limite d'âge : le plus récent par instant de production (NULL en
-        dernier), puis par insertion. Sert à l'exécuteur pour ne pas juger un
-        compte sur son seul flux local quand un autre état a produit plus frais."""
+        """Latest known production per gauge, without an age limit (#1132)."""
+        if harness is None or account is None:
+            return []
+        return self._gauge_heads(harness=harness, account=account)
+
+    def _gauge_heads(self, *, since_s=None, harness=None, account=None):
+        """#3922: seek each group once, then fetch its winning reading.
+
+        DISTINCT ON walks every historical reading even with an ordered index.
+        The recursive key walk instead jumps past each entire group. Account's
+        null flag keeps NULL distinct from an empty named account and makes the
+        tuple comparable (SQL row comparisons containing NULL cannot seek).
+        The additive gauge_seek index matches these expressions exactly.
+        """
+        key = "harness, (account IS NULL), coalesce(account, ''), gauge_key"
+        params = []
+        scope = ""
+        if harness is not None:
+            scope = "harness = %s AND (account IS NULL) = false AND coalesce(account, '') = %s AND "
+            params.extend((harness, account))
+        age = ""
+        if since_s is not None:
+            age = " AND observed_at >= now() - make_interval(secs => %s)"
+            params.append(float(since_s))
         return self.db.query(
-            """
-            SELECT DISTINCT ON (gauge_key)
-                   harness, gauge_key AS key, used,
-                   extract(epoch from resets_at)::float8 AS resets_at_ts, window_s,
-                   extract(epoch from observed_at)::float8 AS observed_ts,
-                   extract(epoch from produced_at)::float8 AS produced_ts, source, account,
-                   overage_capable, overage_in_use
-              FROM quota_gauge_readings
-             WHERE harness = %s AND account = %s
-             ORDER BY gauge_key, produced_at DESC NULLS LAST, observed_at DESC, id DESC
-            """,
-            (harness, account))
+            "WITH RECURSIVE keys(harness, unnamed, account_key, gauge_key) AS ("
+            " (SELECT " + key + " FROM quota_gauge_readings WHERE " + scope +
+            " true ORDER BY " + key + " LIMIT 1)"
+            " UNION ALL"
+            " SELECT n.* FROM keys k CROSS JOIN LATERAL ("
+            " SELECT " + key + " FROM quota_gauge_readings WHERE (" + key + ")"
+            " > (k.harness, k.unnamed, k.account_key, k.gauge_key)"
+            " ORDER BY " + key + " LIMIT 1) n(harness, unnamed, account_key, gauge_key)"
+            # A scoped walk must stop at the end of its account, rather than
+            # enumerate every subsequent account in the global index.
+            + (" WHERE n.harness = k.harness AND n.unnamed = k.unnamed"
+               " AND n.account_key = k.account_key" if harness is not None else "") +
+            ") SELECT r.harness, r.gauge_key AS key, r.used,"
+            " extract(epoch from r.resets_at)::float8 AS resets_at_ts, r.window_s,"
+            " extract(epoch from r.observed_at)::float8 AS observed_ts,"
+            " extract(epoch from r.produced_at)::float8 AS produced_ts, r.source, r.account,"
+            " r.overage_capable, r.overage_in_use"
+            " FROM keys k CROSS JOIN LATERAL ("
+            " SELECT * FROM quota_gauge_readings WHERE harness = k.harness"
+            " AND (account IS NULL) = k.unnamed AND coalesce(account, '') = k.account_key"
+            " AND gauge_key = k.gauge_key" + age +
+            " ORDER BY produced_at DESC NULLS LAST, observed_at DESC, id DESC LIMIT 1) r"
+            " ORDER BY r.harness, r.account, r.gauge_key", tuple(params))
 
     def assigners(self, *, since_s) -> list[str]:
         rows = self.db.query(
