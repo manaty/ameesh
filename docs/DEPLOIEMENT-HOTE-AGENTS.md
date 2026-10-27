@@ -316,7 +316,15 @@ séquence exige les quatre VM. Les migrations sont alors appliquées
 depuis une VM d’agents (`HOTE_MIGRATIONS`, par défaut `ameesh-agents-2`) :
 instantané `git archive` de `src`, `ameesh migrate --dry-run --additive-only`
 puis `--additive-only`, comme le chemin bureau-goal ; un échec arrête avant
-toute installation. La sauvegarde locale du poste est remplacée par un dump
+toute installation. Lancée hors du poste et des VM d’agents (bureau-goal,
+sans venv ameesh ni route vers la base), la séquence fait tourner la sonde de
+courrier et la notification sur `HOTE_OUTILS` (par défaut `HOTE_MIGRATIONS`),
+par ssh, sous l’utilisateur `ameesh`, avec l’instantané du commit (#3976). Une
+sonde qui **n’a pas pu tourner** (python absent, code 126/127, ssh en échec,
+base injoignable : verdict `non-concluant`) est non concluante (canon §3) :
+aucun retour de l’hôte, trace `sante`/`non-concluant`, séquence arrêtée en 3
+et notifiée ; seule une sonde qui a tourné et constaté un défaut vaut
+« malsain ». La sauvegarde locale du poste est remplacée par un dump
 du serveur seul : `ameesh-sauvegarde.service` lancé sur `manaty-mesh-1`, un
 nouveau dump exigé (chemin, taille, SHA-256 dans la trace), gardé sur la VM
 sans rapatriement ; un échec arrête avant les migrations ; serveur reporté
