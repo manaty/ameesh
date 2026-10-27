@@ -91,6 +91,26 @@ class MailTest(PgTestCase):
         # sur la même horloge que les timbres...
         self.assertTrue(all(debut < s <= fin for s in stamps), (debut, stamps, fin))
 
+    def test_cle_idempotence_rejoue_ou_refuse(self):
+        """#3892 : une clé rejouée rend le même message ; réutilisée pour un
+        autre corps ou un autre lot, elle est refusée — jamais rendue comme
+        envoyée, sinon une demande jamais partie passerait pour livrée."""
+        registry.upsert(self.db, "beta", harness="codex", host="autre")
+        first = mail.send(self.db, "alpha", "beta", "bonjour", host="laptop",
+                          idempotency_key="cle-1")
+        self.assertEqual(
+            mail.send(self.db, "alpha", "beta", "bonjour", host="laptop",
+                      idempotency_key="cle-1"),
+            first)
+        self.assertEqual(len(mail.unread(self.db, "beta")), 1)
+        with self.assertRaises(ValueError):
+            mail.send(self.db, "alpha", "beta", "autre texte", host="laptop",
+                      idempotency_key="cle-1")
+        with self.assertRaises(ValueError):
+            mail.send(self.db, "alpha", "beta", "bonjour", host="laptop",
+                      work_item_id="42", idempotency_key="cle-1")
+        self.assertEqual(len(mail.unread(self.db, "beta")), 1)
+
     def test_normalize_forme_commune(self):
         mail.send(self.db, "alpha", "beta", "coucou", host="laptop")
         row = mail.normalize(mail.unread(self.db, "beta")[0])

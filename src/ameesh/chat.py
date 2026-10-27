@@ -700,6 +700,12 @@ class TerminalClient:
                 self.outbox.pop(0)
                 self.view.line("  ! message not dropped: %s" % exc)
                 continue
+            except ValueError as exc:
+                # #3892 : clé réutilisée pour un autre corps/lot (refus
+                # déterministe) : la ligne ne partira jamais, on le dit.
+                self.outbox.pop(0)
+                self.view.line("  ! not sent: %s" % exc)
+                continue
             except storage.MailboxRefused as exc:
                 self.outbox.pop(0)
                 self.view.line("  ! not sent: %s" % exc)

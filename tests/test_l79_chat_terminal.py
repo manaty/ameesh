@@ -238,6 +238,18 @@ class ClientTest(unittest.TestCase):
         self.assertIn("sent to dev1 (mail #7)", client.view.out.getvalue())
         self.assertIn("sent to dev1 (mail #8)", client.view.out.getvalue())
 
+    def test_a_key_reused_for_another_text_is_refused_not_sent(self):
+        """#3892 : un refus déterministe de clé (autre corps, autre lot) ne
+        quitte pas le client et n'annonce jamais « sent » ; la ligne est
+        retirée, elle ne partira pas sous cette clé."""
+        client = self.client()
+        mail.send.side_effect = ValueError("idempotency key 'k' already used")
+        self.assertTrue(client.handle("bonjour"))
+        out = client.view.out.getvalue()
+        self.assertIn("not sent:", out)
+        self.assertNotIn("sent to dev1", out)
+        self.assertEqual(client.outbox, [])
+
     def test_quit_is_refused_while_a_line_is_still_kept(self):
         client = self.client()
         mail.send.side_effect = db_mod.DbError("connexion perdue")
