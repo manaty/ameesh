@@ -963,10 +963,22 @@ class Tracker:
         moi = os.getpid()
         with self.observed_lock:
             known = dict(self.observed_children)
-        suivis_pgid = {e.pgid for e in suivis if e.pgid}
         unknown = []
         with self.runner.launch_lock:
             proteges = set(self.runner.harness_pids)
+            # #3944 : `suivis` est figé au début du passage ; une entrée
+            # inscrite depuis (`start`) doit protéger son groupe et ses jobs,
+            # sinon le statut du travail de fond est consommé ici et le tour
+            # suivant lit « exit code unknown ». Relu sous `launch_lock` : le
+            # runner n'ôte le harnais de `harness_pids` qu'après l'inscription.
+            with self.lock:
+                courants = [e for e in self.entries if e.state == "running"]
+            suivis_pgid = set()
+            for e in list(suivis) + courants:
+                if e.pgid:
+                    suivis_pgid.add(e.pgid)
+                proteges.update(job.pid for job in e.jobs.values() if job.ended is None)
+                proteges.update(e.handles)
             # le verrou des `Popen` tient toute la passe : aucun enfant ne
             # peut naître, mourir et être pris pour un adopté entre deux
             with _own_lock:
