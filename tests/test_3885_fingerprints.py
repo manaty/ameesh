@@ -158,7 +158,10 @@ class PrimitiveTest(PgTestCase):
     def test_a_secret_or_an_email_in_the_source_is_refused(self):
         for field, value in (
                 ("route", "/x token=abc123456789012"),
-                ("code", "user@example.com")):
+                ("code", "user@example.com"),
+                ("key", "user@example.com"),
+                ("key", "/x token=abc123456789012"),
+                ("app", "ghp_0123456789abcdefghij")):
             with self.subTest(field=field):
                 with self.assertRaises(fingerprints.FingerprintError):
                     self.open(**{field: value})
@@ -333,6 +336,24 @@ class TickTest(PgTestCase):
         notes = [row["note"] for row in self.db.query(
             "SELECT note FROM work_item_events ORDER BY id")]
         self.assertEqual(sum(1 for note in notes if "Empreinte revue" in note), 2)
+
+    def test_a_null_cursor_never_clears_the_previous_one(self):
+        payload = page()
+        first = dict(payload, cursor="cur-1")
+        second = dict(payload, cursor=None)
+        with mock.patch.object(fingerprints, "declarations_of_config",
+                               return_value=([declaration()], "")), \
+                mock.patch.object(fingerprints, "read_page",
+                                  side_effect=[first, second]) as read:
+            fingerprints.tick(self.cfg, self.db, token_file=self.token_file(),
+                              actor="mesh-design", now=1000.0)
+            fingerprints.tick(self.cfg, self.db, token_file=self.token_file(),
+                              actor="mesh-design", now=1061.0)
+        state = storage.of(self.db).fingerprints.state("nexlink")
+        self.assertEqual(state["cursor"], "cur-1")
+        # the second read still asked for the previous cursor, never without
+        self.assertEqual(read.call_args_list[1].args[1], "cur-1")
+        self.assertEqual(len(self.db.query("SELECT id FROM work_items")), 2)
 
     def test_the_declared_cadence_skips_a_too_early_read(self):
         payload = page()

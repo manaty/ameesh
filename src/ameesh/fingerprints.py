@@ -160,6 +160,12 @@ def _count(value, field: str) -> int:
 def _checked(*, app, key, title, users, count, route, code, revision,
              first_seen, last_seen):
     source = source_of(app, key)
+    # #3885 relecture cx2 B/P2 : la clé et le projet finissent dans la source,
+    # copiée au corps du lot. La garde « pas de donnée personnelle/secrète »
+    # couvre donc aussi ces deux champs, pas seulement le titre et les
+    # métadonnées.
+    _check_no_secret(app, "--app")
+    _check_no_secret(key, "--key")
     title = _one_line(title, "--title", MAX_TITLE, required=True)
     users = _count(users, "--users")
     count = _count(count, "--count")
@@ -446,6 +452,8 @@ def parse_page(payload: dict) -> tuple[list[Entry], str | None]:
     page may carry the same fingerprint for several revisions (the source's
     key is ``(fingerprint, revision)``), and each revision is kept so its
     occurrence is noted.  Exact duplicates are collapsed on the last row.
+    ``cursor`` may be null (a source that does not advance on this page); the
+    caller keeps the previous cursor instead of clearing it.
     """
     if not isinstance(payload, dict):
         raise FingerprintError("fingerprints page: a JSON object is required")
@@ -647,8 +655,12 @@ def tick(cfg, db, *, now: float | None = None, log=None,
                     "opened" if result["created"] else "noted",
                     entry.occurrences, entry.users))
         if not project_failed:
+            # #3885 relecture dev1 B/P1 : un `cursor: null` ne recule jamais.
+            # Le garder ferait relire tout le journal au passage suivant et
+            # rouvrirait chaque empreinte déjà close (récidive à chaque tick).
+            effective = next_cursor if next_cursor is not None else cursor
             storage.of(db).fingerprints.advance(
-                decl.project, decl.url, next_cursor, now=now)
+                decl.project, decl.url, effective, now=now)
     if failures:
         raise FingerprintError("; ".join(failures)[:1000])
     return results
