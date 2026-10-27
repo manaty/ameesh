@@ -23,7 +23,8 @@ import tempfile
 import unittest
 from unittest import mock
 
-from ameesh import freeze_checks, registry, work
+from ameesh import freeze_checks, prevalidation_calls, registry, work
+from ameesh.deadline import Deadline
 
 from .support import PgTestCase
 
@@ -364,6 +365,94 @@ class CliTest(PgTestCase):
                          env=self.env(AGENT_MAIL_NAME="rev"))
         self.assertEqual(proc.returncode, 1)
         self.assertIn("only apply to a freeze", proc.stderr)
+
+
+class FreezeBudgetTest(unittest.TestCase):
+    """#4073 : les contrôles statiques ne prennent que le temps qui reste."""
+
+    def setUp(self) -> None:
+        self.repo = Repo()
+        self.addCleanup(self.repo.cleanup)
+        self.sha = self.repo.commit(script=GREEN)
+
+    def before(self, deadline):
+        seen = {}
+
+        def run(where, commit, *, gate=None, timeout=freeze_checks.TIMEOUT):
+            seen["timeout"] = timeout
+            return {"result": "green", "seconds": 0.0, "output": ""}
+
+        with mock.patch("ameesh.work.get", return_value={"id": 4073}), \
+                mock.patch.object(freeze_checks, "gate_paths", return_value=None), \
+                mock.patch.object(freeze_checks, "run", side_effect=run):
+            freeze_checks.before_freeze(None, None, 4073, self.sha,
+                                        repo=self.repo.root, deadline=deadline)
+        return seen.get("timeout")
+
+    def test_checks_take_only_what_the_freeze_budget_leaves(self):
+        now = [100.0]
+        deadline = Deadline(120.0, clock=lambda: now[0])
+        self.assertEqual(self.before(deadline), 120.0)
+        now[0] += 100.0
+        self.assertEqual(self.before(deadline), 20.0)
+
+    def test_an_expired_freeze_budget_refuses_before_running(self):
+        deadline = Deadline(0.0)
+        with mock.patch("ameesh.work.get", return_value={"id": 4073}), \
+                mock.patch.object(freeze_checks, "gate_paths", return_value=None), \
+                mock.patch.object(freeze_checks, "run") as run:
+            with self.assertRaises(freeze_checks.Refused) as caught:
+                freeze_checks.before_freeze(None, None, 4073, self.sha,
+                                            repo=self.repo.root, deadline=deadline)
+        self.assertEqual(caught.exception.cause, "checks-incomplete")
+        run.assert_not_called()
+
+
+class FreezeDeadlineWiringTest(unittest.TestCase):
+    """#4073 : `work milestone frozen` partage son échéance en CLI."""
+
+    def test_checks_and_prevalidation_share_the_freeze_budget(self):
+        from ameesh import mesh_cli
+        now = [1000.0]
+        deadline = prevalidation_calls.freeze_deadline(clock=lambda: now[0])
+        seen = {}
+
+        def checks(cfg, db, lot, sha, *, deadline=None, **kw):
+            seen["checks"] = deadline
+            now[0] += 300.0  # contrôles statiques au plafond
+            return ""
+
+        def pv(cfg, db, lot, sha, *, deadline=None, **kw):
+            seen["pv"] = deadline
+            return {}
+
+        args = mesh_cli.build_parser().parse_args([
+            "work", "milestone", "4073", "frozen", "--sha", "a" * 40,
+            "--actor", "author"])
+        row = {"kind": "frozen", "sha": "a" * 40, "note": "", "verdict": None}
+        with mock.patch.object(mesh_cli, "_open", return_value=mock.Mock()), \
+                mock.patch.object(mesh_cli, "_work_actor"), \
+                mock.patch.object(mesh_cli.work, "get", return_value={"id": 4073}), \
+                mock.patch.object(mesh_cli.work, "freeze_head", return_value="a" * 40), \
+                mock.patch.object(mesh_cli.work, "milestone", return_value=row), \
+                mock.patch("ameesh.verdict_carry.carry",
+                           return_value={"result": "idle"}), \
+                mock.patch.object(prevalidation_calls, "freeze_deadline",
+                                  return_value=deadline), \
+                mock.patch.object(freeze_checks, "before_freeze",
+                                  side_effect=checks), \
+                mock.patch.object(prevalidation_calls, "after_freeze",
+                                  side_effect=pv), \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(mesh_cli.cmd_work(object(), args), 0)
+        self.assertIs(seen["checks"], deadline)
+        self.assertLessEqual(seen["pv"].remaining(),
+                             prevalidation_calls.FREEZE_BUDGET_S - 300.0)
+        self.assertLessEqual(seen["pv"].remaining(),
+                             prevalidation_calls.CALLER_BUDGET_S)
+        self.assertLess(seen["pv"].remaining(),
+                        prevalidation_calls.CALLER_BUDGET_S)
+        self.assertLess(prevalidation_calls.FREEZE_BUDGET_S, 600)
 
 
 if __name__ == "__main__":
