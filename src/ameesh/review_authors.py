@@ -2585,13 +2585,65 @@ def _forge_fetch(repo: str, sha: str) -> bool:
         return False
 
 
+def prefetch_prior_freezes(db, item: Mapping, repo: str, head: str = "") -> list[str]:
+    """Rapatrie, **hors transaction**, les objets des gels antérieurs (#3836).
+
+    La désignation d'un gel lit les gels antérieurs du lot pour savoir quels
+    auteurs leur contenu porte encore. Quand un objet n'est plus dans le clone
+    (rebase, push forcé), `reading` le demandait à la forge par SHA exact —
+    `git fetch`, jusqu'à `FETCH_TIMEOUT` (180 s) par objet. Appelé depuis la
+    transaction du gel, ce fetch laissait la session `idle in transaction`
+    pendant sept minutes, tenant le verrou du dépôt de migration et le verrou
+    consultatif du projet (incident du 27/10, #3836).
+
+    Cette fonction fait le même rapatriement **avant** l'ouverture de la
+    transaction, sur le dépôt que la désignation lira. Elle est de mieux : le
+    gel ne peut plus bloquer le mesh sur le réseau. Un objet que la forge ne
+    sert pas reste absent ; la lecture du gel le traite comme avant (un gel
+    remplacé est ignoré, un autre rend la désignation en attente).
+
+    Rend les SHA effectivement rapatriés. Jamais d'exception : une forge
+    injoignable est une absence, pas une erreur du gel.
+    """
+    try:
+        lot = int((item or {}).get("id") or 0)
+    except (TypeError, ValueError):
+        return []
+    if not lot or not repo:
+        return []
+    try:
+        rows = storage.of(db).work.milestones(lot, None) or []
+    except Exception:  # noqa: BLE001 - jalons illisibles : rien à rapatrier
+        return []
+    current = str(head or "").strip().lower()
+    fetched: list[str] = []
+    for row in rows:
+        if row.get("kind") != "frozen":
+            continue
+        sha = str(row.get("sha") or "").strip().lower()
+        if not sha or sha == current or not plan_git.full_commit_id(sha):
+            continue
+        try:
+            if plan_git.local_commit(repo, sha):
+                continue
+        except Exception:  # noqa: BLE001 - dépôt illisible : rien à faire
+            continue
+        try:
+            if _forge_fetch(repo, sha):
+                fetched.append(sha)
+        except Exception:  # noqa: BLE001 - forge injoignable : absence
+            continue
+    return fetched
+
+
 def _carried_from_previous(db, item: Mapping, milestone: Optional[Mapping],
                            commits: Sequence[str], repo: str, families, *,
                            base: str = "", head: str = "", provider=None,
                            strict: bool = False, target: str = "",
                            recover=None, admitted_heads=(),
                            exclusions_out: Optional[list] = None,
-                           commits_out: Optional[dict] = None) -> tuple[list, list, list]:
+                           commits_out: Optional[dict] = None,
+                           fetch: bool = True) -> tuple[list, list, list]:
     """Auteurs/correcteurs des gels antérieurs dont le contenu subsiste (#2924).
 
     Rend `(auteurs, inconnus, correcteurs)` à fusionner dans la lecture de la
@@ -2635,7 +2687,14 @@ def _carried_from_previous(db, item: Mapping, milestone: Optional[Mapping],
     compte ni comme auteur ni comme tiers, même s'il apparaît dans la plage
     d'un gel antérieur calculée avant un rebase. Un gel entièrement contenu
     dans la cible n'est pas relu. Sans `target` lisible, `base` (toujours un
-    ancêtre de la cible) sert de borne sûre."""
+    ancêtre de la cible) sert de borne sûre.
+
+    `fetch=False` (#3836) interdit toute récupération : ni `recover`, ni la
+    forge du clone. C'est la lecture d'une transaction de gel — un `git fetch`
+    de 180 s y laissait la session `idle in transaction` et retenait ses
+    verrous. Les objets manquants sont alors une absence prouvée localement,
+    et l'appelant les rapatrie avant la transaction s'il les veut
+    (`prefetch_prior_freezes`)."""
     item = dict(item or {})
     if db is None or not repo or packet_composer(item):
         return [], [], []
@@ -2806,11 +2865,19 @@ def _carried_from_previous(db, item: Mapping, milestone: Optional[Mapping],
         (dépôt de l'agent, autre origine) essayée d'abord quand elle est
         fournie. Un hook qui échoue ne prive pas la forge de sa tentative ;
         une forge qui ne sert pas l'objet laisse le refus fermé.
+
+        #3836 : `fetch=False` coupe les deux sources. La lecture du gel tourne
+        dans la transaction qui tient les verrous du lot et du dépôt de
+        migration ; un fetch de forge y a laissé une session `idle in
+        transaction` sept minutes (incident du 27/10). Les objets doivent être
+        rapatriés **avant** la transaction (`prefetch_prior_freezes`).
         """
         try:
             if present(commit):
                 return True
         except Exception:  # noqa: BLE001 - dépôt illisible : absence
+            return False
+        if not fetch:
             return False
         if recover is not None:
             try:
@@ -3042,7 +3109,8 @@ def reading(db, item: Mapping, milestone: Optional[Mapping],
             base: str = "", head: str = "", target: str = "",
             recover=None, admitted_heads=(),
             exclusions_out: Optional[list] = None,
-            commits_out: Optional[dict] = None) -> tuple[list, list, list]:
+            commits_out: Optional[dict] = None,
+            fetch: bool = True) -> tuple[list, list, list]:
     """`(auteurs, inconnus, correcteurs)` de la plage gelée, même lecture pour tous.
 
     `reference` est l'auteur de référence déjà lu (`reference_author`) : la
@@ -3146,6 +3214,11 @@ def reading(db, item: Mapping, milestone: Optional[Mapping],
     il a été relu sous son propre lot. Sans `target`, `base` — toujours un
     ancêtre de la cible — sert de borne sûre ; sans l'un ni l'autre, la
     lecture garde son comportement d'avant (aucun commit écarté).
+
+    `fetch=False` (#3836) ne rapatrie rien : c'est la lecture d'une
+    transaction de gel, qui ne doit jamais attendre le réseau en tenant ses
+    verrous. Les objets des gels antérieurs se préparent hors transaction par
+    `prefetch_prior_freezes`.
     """
     item = dict(item or {})
     packet = bool(packet_composer(item))
@@ -3306,7 +3379,7 @@ def reading(db, item: Mapping, milestone: Optional[Mapping],
         db, item, milestone, commits, repo, families, base=base, head=head,
         provider=provider, strict=strict, target=target_sha, recover=recover,
         admitted_heads=admitted_heads, exclusions_out=exclusions_out,
-        commits_out=commits_out)
+        commits_out=commits_out, fetch=fetch)
     unknown.extend(carried_unknown)
     for row in carried:
         values = row.get("families")

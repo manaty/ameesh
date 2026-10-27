@@ -850,6 +850,12 @@ def milestone(
             # Pin the exact published target before taking the lot's lock.
             target = (None if carried else
                       activation.prepare_target(cfg, db, item, sha))
+            # #3836 : la désignation lit les gels antérieurs du lot dans la
+            # transaction du jalon ; ses objets absents se rapatrient ici, hors
+            # transaction. Un `git fetch` de forge dans la transaction laissait
+            # la session `idle in transaction` sept minutes, verrous tenus.
+            if not carried:
+                activation.prefetch_freeze_objects(db, item, target, sha)
             on_frozen = activation.hook(cfg, outcome, carried=carried, target=target)
             if after_commit is None:
                 after_commit = []

@@ -21,12 +21,13 @@ import types
 from unittest import mock
 
 from ameesh import db as db_mod
-from ameesh import lot_class, mail, registry, review_authors, review_designation as rd
+from ameesh import freeze_gate, lot_class, mail, registry, review_authors, review_designation as rd
 from ameesh import review_designation_activation as act
 from ameesh import review_designation_pg as pg
 from ameesh import review_provenance as prov
 from ameesh import storage, verdict_carry, work
 from ameesh.storage.postgres import registry as pg_registry
+from ameesh.storage.postgres import work as pg_work
 from ameesh.work_reviewers import designated
 
 from .support import PgTestCase
@@ -2522,3 +2523,92 @@ class ActivationCliTest(_ActivationFixture, PgTestCase):
         self.assertIn("r3", lines[0])
         self.assertIn("mark       : historical", proc.stdout)
         self.assertIn("removed by the pilot", proc.stdout)
+
+
+class FreezeTransactionNetworkTest(_ActivationFixture, PgTestCase):
+    """#3836 — le réseau ne se lit jamais dans la transaction du gel.
+
+    Incident du 27/10 : le gel de #3700 lisait un gel antérieur absent ; la
+    forge était demandée par SHA exact dans la transaction, qui tenait le
+    verrou du dépôt de migration et celui du projet. La session est restée
+    `idle in transaction` sept minutes et les écritures du mesh ont attendu.
+    """
+
+    def _prior_ghost(self) -> int:
+        ghost = "a" * 40
+        self.db.execute(
+            "INSERT INTO work_item_milestones (work_item_id, kind, sha, actor, at)"
+            " VALUES (%s, 'frozen', %s, 'author', now() - interval '1 hour')",
+            (self.lot, ghost))
+        return int(self.db.query(
+            "SELECT id FROM work_item_milestones"
+            " WHERE work_item_id = %s AND sha = %s", (self.lot, ghost))[0]["id"])
+
+    def test_the_freeze_reading_never_fetches_inside_the_transaction(self):
+        prior = self._prior_ghost()
+        calls = []
+
+        def forge(repo, sha):
+            calls.append((sha, freeze_gate._in_transaction(self.db)))
+            return False
+
+        threads: list = []
+        outcome: dict = {}
+        with mock.patch.object(review_authors, "_forge_fetch", side_effect=forge):
+            work.milestone(
+                self.db, self.lot, "frozen", sha=self.frozen, actor="author",
+                supersedes=prior, on_frozen=act.hook(self.cfg, outcome),
+                after_commit=threads)
+        for record in threads:
+            record(self.db.cfg, self.db)
+        self.assertEqual(calls, [],
+                         "la lecture du gel a demandé la forge dans sa transaction")
+
+    def test_the_gate_prefetches_the_prior_object_before_the_transaction(self):
+        prior = self._prior_ghost()
+        calls = []
+
+        def prefetch(db, item, target, head):
+            calls.append(("prefetch", freeze_gate._in_transaction(db)))
+            return []
+
+        def forge(repo, sha):
+            calls.append(("forge", freeze_gate._in_transaction(self.db)))
+            return False
+
+        self.db.cfg = self.cfg
+        with mock.patch.object(act, "prefetch_freeze_objects", side_effect=prefetch), \
+                mock.patch.object(review_authors, "_forge_fetch", side_effect=forge):
+            work.milestone(self.db, self.lot, "frozen", sha=self.frozen,
+                           actor="author", supersedes=prior)
+        self.assertIn(("prefetch", False), calls)
+        self.assertNotIn(("forge", True), calls)
+
+
+class FreezeLockWaitTest(_ActivationFixture, PgTestCase):
+    """#3836 — un gel n'attend pas un verrou en tenant ceux du mesh.
+
+    La récidive #3820 a attendu 174 s le lookup de provenance de son gel en
+    tenant le verrou du dépôt de migration et celui du projet ; la transaction
+    est restée ouverte. La transaction du jalon borne ses attentes à 15 s.
+    """
+
+    def test_a_locked_lot_fails_the_freeze_and_releases_its_locks(self):
+        pid = int(self.db.query("SELECT pg_backend_pid() AS pid")[0]["pid"])
+        other = db_mod.connect(self.cfg)
+        try:
+            with other.transaction() as tx:
+                tx.query("SELECT id FROM work_items WHERE id = %s FOR UPDATE",
+                         (self.lot,))
+                with mock.patch.object(pg_work, "FREEZE_LOCK_TIMEOUT_MS", 200):
+                    with self.assertRaises(db_mod.DbError) as caught:
+                        work.milestone(self.db, self.lot, "frozen",
+                                       sha=self.frozen, actor="author")
+                self.assertIn("lock timeout", str(caught.exception).lower())
+        finally:
+            other.close()
+        leftover = self.db.query(
+            "SELECT count(*)::int AS n FROM pg_locks"
+            " WHERE pid = %s AND locktype = 'advisory'", (pid,))[0]["n"]
+        self.assertEqual(leftover, 0,
+                         "le jalon annulé a laissé ses verrous consultatifs")
