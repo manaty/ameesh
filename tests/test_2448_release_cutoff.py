@@ -273,8 +273,9 @@ class ReleaseFixture(ReleaseFixtureMixin, unittest.TestCase):
                          first["release_sha"])
 
     def test_reported_poste_attestation_is_complete_but_reruns_staging(self):
-        """#3848 : trois VM + poste reporte = attestation complete, mais une
-        release relance le staging pour que le poste rattrape son retour."""
+        """#3848 : trois VM + poste reporte = attestation complete, et une
+        release ne relance le staging que sur le poste revenu, pour qu'il
+        rattrape le commit actif (relecture dev1, #3853)."""
         sha = self.git(self.clone, "rev-parse", "origin/main")
         folder = self.home / ".local/state/ameesh/mise-a-jour"
         folder.mkdir(parents=True)
@@ -286,8 +287,16 @@ class ReleaseFixture(ReleaseFixtureMixin, unittest.TestCase):
         path.write_text(json.dumps(data))
         self.assertEqual(release_cutoff.read_attestation(sha)["reportes"],
                          data["reportes"])
-        with mock.patch.object(release_cutoff, "run_staging",
-                               return_value={"exit": 0}) as stage:
+        # depuis une VM, le poste serait encore reporte : pas de relance a vide
+        with mock.patch.dict(os.environ, {"HOTE_LOCAL": "ameesh-agents-1"}), \
+                mock.patch.object(release_cutoff, "run_staging") as stage:
+            out = release_cutoff.maybe_staging(self.project, sha, [], self.cfg.state_dir)
+        stage.assert_not_called()
+        self.assertEqual(out["skipped"], "already attested")
+        # le poste revenu (la sequence tourne sur lui) : relance pour le rattraper
+        with mock.patch.dict(os.environ, {"HOTE_LOCAL": "pc-smichea"}), \
+                mock.patch.object(release_cutoff, "run_staging",
+                                  return_value={"exit": 0}) as stage:
             out = release_cutoff.maybe_staging(self.project, sha, [], self.cfg.state_dir)
         stage.assert_called_once()
         self.assertEqual(out["exit"], 0)
@@ -322,10 +331,29 @@ class ReleaseFixture(ReleaseFixtureMixin, unittest.TestCase):
         data["hotes"].pop("pc-smichea")
         path.write_text(json.dumps(data))
         self.assertIsNotNone(release_cutoff.read_attestation(sha))
-        with mock.patch.object(release_cutoff, "run_staging",
-                               return_value={"exit": 0}) as stage:
+        with mock.patch.dict(os.environ, {"HOTE_LOCAL": "pc-smichea"}), \
+                mock.patch.object(release_cutoff, "run_staging",
+                                  return_value={"exit": 0}) as stage:
             release_cutoff.maybe_staging(self.project, sha, [], self.cfg.state_dir)
         stage.assert_called_once()
+
+    def test_staging_local_host_follows_staging_sh(self):
+        """Meme ordre que staging.sh : HOTE_LOCAL, AMEESH_HOST, config, nom court."""
+        config = self.root / "config-hote.json"
+        config.write_text(json.dumps({"host": "PC-Smichea"}))
+        propre = {k: v for k, v in os.environ.items()
+                  if k not in ("HOTE_LOCAL", "AMEESH_HOST", "AGENT_MESH_HOST",
+                               "AGENT_MESH_CONFIG")}
+        cas = [({"HOTE_LOCAL": "ameesh-agents-1", "AMEESH_HOST": "pc-smichea"},
+                "ameesh-agents-1"),
+               ({"AMEESH_HOST": "Ameesh-Agents-2"}, "ameesh-agents-2"),
+               ({"AMEESH_CONFIG": str(config)}, "pc-smichea"),
+               ({"AMEESH_CONFIG": str(config) + ".absent"},
+                os.uname().nodename.split(".")[0].lower())]
+        for env, attendu in cas:
+            with self.subTest(env), mock.patch.dict(os.environ, dict(propre, **env),
+                                                    clear=True):
+                self.assertEqual(release_cutoff.staging_local_host(), attendu)
 
     def test_reported_poste_attestation_must_be_exact(self):
         sha = self.git(self.clone, "rev-parse", "origin/main")

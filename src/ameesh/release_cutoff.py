@@ -1892,8 +1892,8 @@ def read_attestation(sha: str) -> dict | None:
 
     Complete = the three VM hosts proved; the poste either proved itself or is
     explicitly reported absent (`reportes`, #3848). A reported poste does not
-    make the VMs inactive, but `maybe_staging` reruns the sequence so the
-    poste catches up when it is back.
+    make the VMs inactive; `maybe_staging` reruns the sequence only on the
+    poste, so it catches up when it is back.
     """
     path = attestation_path(sha)
     try:
@@ -2523,14 +2523,37 @@ def _staging_step(project: ProjectRelease, release_sha: str, included: list[int]
     return result
 
 
+def staging_local_host() -> str:
+    """The host `staging.sh` runs on, by its own rule (#3848): HOTE_LOCAL,
+    otherwise AMEESH_HOST / AGENT_MESH_HOST, otherwise the config `host`,
+    otherwise the short hostname."""
+    for name in ("HOTE_LOCAL", "AMEESH_HOST", "AGENT_MESH_HOST"):
+        value = os.environ.get(name, "").strip()
+        if value:
+            return value.lower()
+    path = (os.environ.get("AMEESH_CONFIG") or os.environ.get("AGENT_MESH_CONFIG")
+            or os.path.expanduser("~/.config/ameesh/config.json"))
+    try:
+        with open(path, encoding="utf-8") as stream:
+            host = json.load(stream).get("host")
+    except (OSError, ValueError, AttributeError):
+        host = None
+    if isinstance(host, str) and host.strip():
+        return host.strip().lower()
+    return os.uname().nodename.split(".")[0].lower()
+
+
 def maybe_staging(project: ProjectRelease, release_sha: str, included: list[int],
                   state_dir: str) -> dict:
     attestation = read_attestation(release_sha)
-    # Un poste reporte ne prouve pas le staging complet : relancer permet de le
-    # mettre a jour au commit actif a son retour, jamais en dessous (#3848).
-    # Un serveur sans acces root reporte ne justifie pas de relancer : il n'a
+    # Un poste reporte ne prouve pas le staging complet : relancer le met a jour
+    # au commit actif a son retour, jamais en dessous (#3848). Lancee ailleurs
+    # que sur le poste, la sequence le reporterait encore : relancer referait
+    # migrations, controles et sondes des VM deja au commit, pour rien. Un
+    # serveur sans acces root reporte ne justifie pas de relancer : il n'a
     # aucun runner, la prochaine release le reprendra s'il redevient joignable.
-    if attestation and STAGING_POSTE not in (attestation.get("reportes") or {}):
+    if attestation and (STAGING_POSTE not in (attestation.get("reportes") or {})
+                        or staging_local_host() != STAGING_POSTE):
         return {"exit": 0, "duration_s": 0.0, "log": "", "summary": [],
                 "attestation": attestation, "skipped": "already attested"}
     return run_staging(project, release_sha, included, state_dir=state_dir)

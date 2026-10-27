@@ -1360,6 +1360,9 @@ printf 'stub %s %s\n' "$0" "$*" >> "${FAKE_STATE:?}/calls.log"
 printf 'ssh %s\n' "$*" >> "${FAKE_STATE:?}/calls.log"
 case "$*" in
   *"bash -s -- "*) cat >/dev/null || true; exit 0 ;;   # migrations depuis une VM (#3848)
+  *ameesh-sauvegarde.service*)   # dump serveur, poste absent (relecture dev1 #3848)
+    cat >/dev/null || true
+    printf '/home/ameesh/sauvegardes/ameesh-t.dump\n4096\n%064d\n' 0; exit 0 ;;
 esac
 exit 255
 '''
