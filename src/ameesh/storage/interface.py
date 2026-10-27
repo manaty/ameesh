@@ -991,7 +991,11 @@ class Accounts(Domain):
 
     @abc.abstractmethod
     def active(self, host: str, harness: str) -> dict | None:
-        """La ligne `account_active` (account, forced, updated_at), ou None."""
+        """La ligne `account_active` (account, forced, forced_until,
+        updated_at), ou None. `forced_until` (epoch, #3755) est l'échéance du
+        forçage manuel ; None = pas de forçage, ou ligne forcée posée hors
+        `ameesh accounts use` sans échéance. `updated_ts` (epoch) date la
+        dernière écriture."""
 
     @abc.abstractmethod
     def init_active(self, host: str, harness: str, account: str) -> dict:
@@ -999,13 +1003,42 @@ class Accounts(Domain):
 
     @abc.abstractmethod
     def switch(self, host: str, harness: str, *, expected: str | None, to: str,
-               kind: str, reason: str, agent: str | None, forced: bool = False) -> bool:
+               kind: str, reason: str, agent: str | None, forced: bool = False,
+               forced_until: float | None = None) -> bool:
         """Change le compte actif ET journalise la bascule, en UNE instruction.
 
         Comparer-et-changer : `expected` est le compte que l'appelant a vu
         actif (None = n'importe lequel, forçage manuel). Une bascule
         automatique (`forced` faux) ne touche jamais un compte forcé. Faux si
-        un autre worker a déjà basculé : rien n'est écrit."""
+        un autre worker a déjà basculé : rien n'est écrit.
+
+        #3755 : `forced_until` (epoch) pose l'échéance d'un forçage manuel ;
+        toute bascule non forcée efface l'échéance."""
+
+    @abc.abstractmethod
+    def force_switch(self, host: str, harness: str, *, initial: str, to: str,
+                     reason: str, agent: str | None, forced_until: float,
+                     now: float, allow: bool = False) -> dict:
+        """#3755 : bascule forcée sous le **verrou de placement**.
+
+        Une seule transaction qui, sous `_verrou_placement` (le verrou de
+        `hold`, `switch_guarded` et `placement_state`) :
+
+        * relit la retenue de `to` (`account_holds`) ; une retenue **valide**
+          (`until_ts > now`) refuse la bascule sans `allow` — rend
+          `{"changed": False, "held": raison}`, rien n'est écrit (pas même la
+          levée de la retenue). C'est la course fermée : une retenue publiée
+          entre la lecture des jauges et la bascule est vue ici, jamais
+          ignorée puis effacée ;
+        * avec `allow` (`--force "raison"`), la bascule passe et la retenue
+          de `to` est levée dans la même transaction (geste explicite) ;
+        * sans retenue valide, la bascule passe et une retenue échue de `to`
+          est nettoyée.
+
+        `initial` est le compte à journaliser comme quitté quand
+        `account_active` n'a pas encore de ligne (premier choix de l'hôte).
+        Rend `{"changed": bool, "held": str | None}` ; `held` n'est renseigné
+        que si la bascule a été refusée pour une retenue valide."""
 
     @abc.abstractmethod
     def switch_guarded(self, host: str, harness: str, *, expected: str | None, to: str,
@@ -1036,12 +1069,19 @@ class Accounts(Domain):
 
     @abc.abstractmethod
     def set_auto(self, host: str, harness: str, *, reason: str,
-                 expected: str | None = None) -> bool:
+                 expected: str | None = None,
+                 expected_until: float | None = None) -> bool:
         """Lève le forçage manuel (journalisé `auto`) ; faux si rien n'était forcé.
 
         #295 : `expected` (None = n'importe lequel) est le compte forcé que
         l'appelant a lu ; faux sans rien écrire si la ligne a changé de compte
-        entre-temps (un forçage humain concurrent n'est pas défait)."""
+        entre-temps (un forçage humain concurrent n'est pas défait).
+
+        #3755 : `expected_until` (epoch) est l'échéance du forçage que
+        l'appelant a vue échue. Comparée sous le verrou de la ligne, elle
+        refuse la levée si un geste a renouvelé le forçage du MÊME compte avec
+        une autre échéance entre-temps ; None = ne pas comparer (levée
+        manuelle par `ameesh accounts auto`)."""
 
     @abc.abstractmethod
     def holds(self, host: str, harness: str) -> dict[str, dict]:
@@ -1088,6 +1128,63 @@ class Accounts(Domain):
     @abc.abstractmethod
     def switches(self, host: str, harness: str | None, limit: int) -> list[dict]:
         """Les dernières bascules de l'hôte (toutes ou d'un harnais), récentes d'abord."""
+
+
+# --------------------------------------------------------------------------
+# fenêtre courte du fournisseur, par compte logique (#3779)
+# --------------------------------------------------------------------------
+
+class AccountWindows(Domain):
+    """Refus 429 du fournisseur, partagés par les exécuteurs d'un même compte.
+
+    Les lignes de `account_rate_events` ne portent que des noms de comptes,
+    des noms d'agents, l'hôte et le texte d'erreur du fournisseur (borné) :
+    jamais de secret, d'invite ni de jeton. La clé est le compte **logique**
+    (`harness`, `account`), le même nom sur tous les hôtes du réservoir (Codex :
+    `primaire`) — le bucket de rafale est celui du fournisseur, pas celui d'un
+    hôte.
+    """
+
+    @abc.abstractmethod
+    def record(self, harness: str, account: str, host: str, agent: str,
+               kind: str, detail: str | None) -> None:
+        """Ajoute un refus fournisseur (`kind` = `rate_limited`)."""
+
+    @abc.abstractmethod
+    def recent(self, harness: str, account: str, since_s: float) -> dict:
+        """Les refus des `since_s` dernières secondes : `count`, `last_at_ts`
+        (epoch), `last_agent`, `last_host`, `last_detail`. Zéros et None sans
+        refus ; l'instant est celui de la base (`now()`), commun aux hôtes."""
+
+    @abc.abstractmethod
+    def active(self, harness: str, account: str) -> list[dict]:
+        """Les tours actifs du compte, **bail vivant seulement** (`lease_owner`
+        posé et `lease_expires_at` futur) : un hôte tombé ne bloque pas le
+        plafond de son compte pour toujours. La place porte le harnais et le
+        compte **effectifs** du tour (`account_turn_slots`, écrit avec
+        `begin_turn`) : un agent d'un autre harnais qui emprunte ce compte
+        compte dans son plafond. Rend `name`, `host`, `status_since_ts`
+        (epoch). Un agent sans place (tour commencé avant le déploiement) n'est
+        pas compté : la garde s'ouvre un tour, jamais ne bloque à tort."""
+
+    @abc.abstractmethod
+    def start(self, harness: str, account: str, host: str, agent: str,
+              *, slot_only: bool = False) -> None:
+        """Journalise le début d'un tour du compte (écart entre deux débuts) et
+        pose/actualise sa place active avec le harnais et le compte effectifs
+        (`harness`, `account`) — appelé dans la transaction d'admission, avec
+        `begin_turn`.
+
+        `slot_only` : ne journalise pas le début (harnais non suivi, qui n'a
+        pas d'écart à tenir) et ne fait que remplacer la place de l'agent.
+        Un agent qui revient d'un emprunt Codex sous son harnais propre efface
+        ainsi son ancienne place Codex (#3779, avis cx2)."""
+
+    @abc.abstractmethod
+    def last_start(self, harness: str, account: str) -> dict:
+        """Le dernier début de tour du compte : `last_at_ts` (epoch, None sans
+        début) et `last_agent`, `last_host`. Instant de la base, commun aux
+        hôtes."""
 
 
 # --------------------------------------------------------------------------
@@ -3738,27 +3835,38 @@ class Operations(Domain):
     def record_gauges(self, readings: Sequence[dict]) -> int:
         """Ajoute les relevés de jauge (harness, key, used, resets_at,
         window_s, `account` facultatif — L30, 0028, `produced_at` et `source`
-        facultatifs — #1132, 0434) qui CHANGENT le dernier relevé de leur jauge
+        facultatifs — #1132, 0434, `overage_capable` et `overage_in_use`
+        facultatifs — #3755) qui CHANGENT le dernier relevé de leur jauge
         (du même compte), ou dont le dernier relevé a plus de dix minutes. Rend
         le nombre de lignes. `produced_at` (epoch) est l'instant de PRODUCTION
         du relevé, NULL quand le flux ne le date pas ; `source` nomme le
-        journal d'origine."""
+        journal d'origine. Les drapeaux d'overage font partie de la comparaison
+        (#3755) : un relevé identique dont les drapeaux changent est écrit."""
 
     @abc.abstractmethod
     def gauge_history(self, *, since_s: float, harness: str | None,
                       account: str | None = None) -> list[dict]:
         """Relevés des `since_s` dernières secondes, dans l'ordre
         chronologique d'insertion : harness, key, used, resets_at_ts, window_s,
-        observed_ts, produced_ts (#1132 ; None si non daté), source (#1132) et
-        account (L30 ; None sans comptes). `account` filtre."""
+        observed_ts, produced_ts (#1132 ; None si non daté), source (#1132),
+        account (L30 ; None sans comptes) et les drapeaux d'overage
+        (`overage_capable`, `overage_in_use`, #3755). `account` filtre."""
 
     @abc.abstractmethod
-    def latest_gauges(self, *, since_s: float) -> list[dict]:
+    def latest_gauges(self, *, since_s: float, by_source: bool = False) -> list[dict]:
         """L94 : le DERNIER relevé de chaque jauge (harness, account, key)
         observé dans les `since_s` dernières secondes, choisi par instant de
         PRODUCTION (#1132 : `produced_at` d'abord, NULL en dernier, puis
         `observed_at`) : harness, key, used, resets_at_ts, window_s,
-        observed_ts, produced_ts, source, account (None sans comptes)."""
+        observed_ts, produced_ts, source, account (None sans comptes) et les
+        drapeaux d'overage (#3755).
+
+        `by_source` (défaut faux) : une ligne par SOURCE de publication
+        (l'agent qui a produit le relevé) au lieu d'une par compte/jauge. Deux
+        hôtes peuvent déclarer un compte homonyme (`codex/secondaire`) ; la
+        vue unifiée garde le dernier relevé, la vue par source permet à
+        l'alerte d'overage de ne pas laisser le relevé d'un hôte effacer
+        celui d'un autre. Les autres lecteurs gardent la vue unifiée."""
 
     @abc.abstractmethod
     def gauge_latest(self, *, harness: str, account: str) -> list[dict]:
@@ -3766,7 +3874,8 @@ class Operations(Domain):
         sans limite d'âge : le plus récent par instant de production
         (`produced_at` d'abord, NULL en dernier), puis par insertion — harness,
         key, used, resets_at_ts, window_s, observed_ts, produced_ts, source,
-        account. Aucune ligne pour un compte inconnu."""
+        account, drapeaux d'overage (#3755). Aucune ligne pour un compte
+        inconnu."""
 
     @abc.abstractmethod
     def assigners(self, *, since_s: float) -> list[str]:
@@ -4762,6 +4871,7 @@ class Storage(abc.ABC):
     pending_spend: PendingSpend
     turn_costs: TurnCosts
     accounts: Accounts
+    account_windows: AccountWindows
     credentials: Credentials
     budgets: Budgets
     api_requests: ApiRequests

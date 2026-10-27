@@ -26,6 +26,7 @@ import sys
 import time
 
 from . import accounts, adapters, auth_failure, cost as cost_mod, db as db_mod, registry
+from . import account_window
 
 #: compte indisponible (configuration ou base) : le tour ne part pas
 INVALID = object()
@@ -122,8 +123,19 @@ def choose(worker, book=None, *, pause: bool = True, margin: bool | None = None)
         # levé le rythme ; il ne reste que des comptes en overage ou au-dessus
         # d'un plafond fixe (L226b) — pas de tour, quels que soient les réglages
         return choice.reason
+    # #3779 : la fenêtre courte du fournisseur (bucket de rafale/concurrence
+    # non exposé, partagé par toutes les sessions du compte) est une garde
+    # ABSOLUE, comme l'overage : elle ne dépend ni du rythme ni de `pause`.
+    # Le cooldown et le plafond de tours actifs sont lus en base, donc sur
+    # tous les hôtes ; l'agent en cours est exclu du compte (il ne se bloque
+    # pas lui-même au moment de choisir).
+    raison_courte = account_window.reason(
+        worker.db, harness, choice.profile.name, exclude_agent=worker.name,
+        profile=choice.profile)
     log_choice(worker, harness, choice)
     worker._account = choice.profile
+    if raison_courte:
+        return raison_courte
     return ""
 
 
@@ -172,6 +184,15 @@ def fallback(worker, reason: str, limits=None) -> str:
                 continue
             if book.over(worker.name, pace=False, account_checked=bool(items)):
                 continue                    # payé au token : plafond du mesh
+            # #3779 : même un agent critique qui emprunte Codex ne contourne pas
+            # la fenêtre courte du compte (cooldown partagé, plafond de tours).
+            raison_courte = account_window.reason(
+                worker.db, harness, profile.name if profile else "",
+                exclude_agent=worker.name, profile=profile)
+            if raison_courte:
+                _log("[%s] fallback %s refused: %s"
+                     % (worker.name, harness, raison_courte))
+                continue
         except db_mod.Unavailable:
             raise
         except Exception as exc:  # noqa: BLE001 - état illisible : suivant

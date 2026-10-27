@@ -4460,6 +4460,7 @@
  ],
  "refused": {
   "reasons": {
+   "account_windows": "fenêtre courte du fournisseur (#3779) : l'exécuteur médié garde son cooldown local, le compte partagé est coordonné par les runners du mesh",
    "accounts": "hors du sous-ensemble de l'exécuteur médié",
    "action_source": "autorité (0012)",
    "actions": "hors du sous-ensemble de l'exécuteur médié",
@@ -4506,7 +4507,15 @@
    "notify_liveness": "notifier liveness and off-notifier brief claims (#3007): mesh server only"
   },
   "operations": {
+   "account_windows": [
+    "active",
+    "last_start",
+    "recent",
+    "record",
+    "start"
+   ],
    "accounts": [
+    "force_switch",
     "hold",
     "holds",
     "identities",

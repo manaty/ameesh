@@ -242,8 +242,11 @@ class OveragePartageTest(_Base):
         items = self._items(b)
         now = float(int(time.time()))
         self._depassement(items, now)
+        # #3755 : le forçage explicite (`--force "raison"`) lève la retenue
+        # publiée ; la garde du tour doit quand même écarter le compte.
         self.assertTrue(accounts.force(self.db, self.cfg.host, "codex", items,
-                                       "secondaire", by="test"))
+                                       "secondaire", by="test",
+                                       allow=True, reason="témoin #1883"))
         choix = accounts.choose(self.db, self.cfg.host, "codex", items,
                                 self._book(), now=now + 1.0)
         self.assertEqual(choix.profile.name, "primaire", choix.why)
