@@ -1,0 +1,13 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+# #3845 — un tic toutes les dix minutes ; le script compose au plus un porteur
+# par heure et suit sinon le porteur ouvert (ci-full, rouge, recomposition).
+[Unit]
+Description=ameesh paquet horaire, tic (#3845)
+
+[Timer]
+OnCalendar=*:0/10
+AccuracySec=30s
+Persistent=true
+
+[Install]
+WantedBy=timers.target

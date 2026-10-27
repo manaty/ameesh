@@ -1,0 +1,43 @@
+# SPDX-License-Identifier: AGPL-3.0-only
+#
+# ameesh paquet horaire — composition, ci-full et retrait d'une unité rouge,
+# sans agent (#3845, #1606 point 1). Service UTILISATEUR, installé sur chaque
+# hôte candidat du bail `mesh-design` : `ameesh role run` ne lance le tic que
+# sur l'hôte qui détient le bail (L165/EP5), les autres sortent en 0.
+#
+# Le tic lit tout dans la base et la forge (aucun état local) : il compose au
+# plus un porteur par heure (Europe/Paris), ne fait rien tant qu'un porteur
+# réserve la cible (§12), et ne fusionne jamais (fusion automatique de
+# packet_automerge, tic de release, sur la CI verte).
+#
+# Préalable : un clone dédié du projet, `AMEESH_PAQUET_REPO`, déclaré dans
+# ~/.config/ameesh/paquet-horaire.env (avec, au besoin, AMEESH_PAQUET_TARGET,
+# AMEESH_PAQUET_PILOT). Le clone est avancé sur origin/<cible> avant chaque
+# tic : le script exécuté est celui de la cible (leçon #3767).
+#
+# Install:
+#   install -m 0644 deploy/systemd/ameesh-paquet-horaire.service \
+#                      deploy/systemd/ameesh-paquet-horaire.timer ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now ameesh-paquet-horaire.timer
+#   journalctl --user -u ameesh-paquet-horaire -f
+[Unit]
+Description=ameesh paquet horaire sans agent (#3845)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+Environment=PATH=%h/.local/bin:/opt/node/bin:/usr/local/bin:/usr/bin:/bin
+Environment=AMEESH_PAQUET_TARGET=main
+Environment=AMEESH_PAQUET_PILOT=mesh-design
+EnvironmentFile=%h/.config/ameesh/env
+EnvironmentFile=-%h/.config/ameesh/release.env
+EnvironmentFile=%h/.config/ameesh/paquet-horaire.env
+ExecStartPre=-/usr/bin/git -C ${AMEESH_PAQUET_REPO} pull --ff-only --quiet origin ${AMEESH_PAQUET_TARGET}
+ExecStart=%h/.local/share/ameesh/venv/bin/ameesh role run mesh-design -- \
+    %h/.local/share/ameesh/venv/bin/python ${AMEESH_PAQUET_REPO}/scripts/paquet-horaire.py tick \
+    --repo ${AMEESH_PAQUET_REPO} --target ${AMEESH_PAQUET_TARGET} --pilot ${AMEESH_PAQUET_PILOT}
+# Une composition (tests locaux compris) est bornée à trois heures par le script.
+TimeoutStartSec=4h
+NoNewPrivileges=yes

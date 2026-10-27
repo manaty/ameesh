@@ -1536,6 +1536,17 @@ def compose_packet(args: argparse.Namespace) -> int:
                                                  base_sha, ready_out)
         errors = error_discards(payload)
         error_lots = {item.lot for item in errors}
+        # #3845 : un lot retiré sur un rouge de ci-full (paquet-horaire.py,
+        # unité nommée par #3801) n'est pas recomposé ; il reste au manifeste.
+        excluded = [lot for lot in getattr(args, "exclude", None) or []
+                    if lot not in error_lots]
+        if excluded:
+            candidates = [candidate for candidate in candidates
+                          if candidate.lot not in set(excluded)]
+            errors = errors + [Discarded(
+                lot, "retiré : ci-full rouge attribuée à son unité (#3801)",
+                "--exclude, recomposition sans lui") for lot in excluded]
+            error_lots |= set(excluded)
         for item in errors:
             print("écarté #%d : %s — %s"
                   % (item.lot, item.reason, item.detail), flush=True)
@@ -1703,6 +1714,10 @@ def main(argv: list[str] | None = None) -> int:
                         help="recomposer un paquet existant : réécrit la "
                              "branche distante sous --force-with-lease (retirer "
                              "la CI et le feu avant)")
+    parser.add_argument("--exclude", type=int, action="append", default=[],
+                        metavar="LOT",
+                        help="#3845 : ne pas composer ce lot prêt (répétable) ; "
+                             "il est écrit aux écartés du manifeste")
     parser.add_argument("--replay", default=None, metavar="REF",
                         help="rejouer le manifeste d'une référence et comparer "
                              "les arbres (avec --candidates-json : refuser une "
