@@ -498,6 +498,25 @@ class MailProjectTests(_Base):
         event = work.events(self.db, lot["id"])[0]
         self.assertEqual((event["actor"], event["note"]), ("orch", "project 'old' → 'new'"))
 
+    def test_package_exclusion_is_the_pilot_gesture(self):
+        # #4043 : `move … build --package-exclusion` (sans boucle d'auteur)
+        # passe la garde de `--correct` : refusé à un agent de développement.
+        lot = work.add(self.db, title="Excluded")
+        work.move(self.db, lot["id"], "build")
+        work.move(self.db, lot["id"], "qa")
+        cmd = ("work", "move", str(lot["id"]), "build", "--package-exclusion")
+        proc = self.mesh(*cmd, env=self.env(AGENT_MAIL_NAME="dev1",
+                                            AMEESH_ALERT_ORCHESTRATORS="orch"))
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertIn("package exclusion refused", proc.stderr)
+        self.assertEqual(work.get(self.db, lot["id"])["state"], "qa")
+        proc = self.mesh(*cmd, env=self.env(AGENT_MAIL_NAME="orch",
+                                            AMEESH_ALERT_ORCHESTRATORS="orch"))
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        item = work.get(self.db, lot["id"])
+        self.assertEqual((item["state"], int(item["loops"])), ("build", 0))
+        self.assertEqual(work.events(self.db, lot["id"])[0]["actor"], "orch")
+
     def rejected_correction_identity(self, **identity_env):
         lot = work.add(self.db, title="Unclassified")
         events = work.events(self.db, lot["id"])

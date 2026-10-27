@@ -40,8 +40,9 @@ Un tic (la minuterie `deploy/systemd/ameesh-paquet-horaire.timer`, sous
    (`paquet-auto.py --force --exclude`), **une fois**, et l'auteur de chaque
    unité retirée reçoit un courrier. Chaque lot retiré repasse en `build`
    avec sa trace (`paquet-horaire: exclu …` : paquet, porteur, run, tests ;
-   #4028) : il attend le correctif de son assigné jusqu'à un nouveau gel, et
-   l'alerte SLO vise l'auteur, pas le pilote. Un rouge non concluant (§3 : run annulé ou
+   #4028), sans consommer de boucle d'auteur (#4043) : il attend le correctif
+   de son assigné jusqu'à un nouveau gel, et l'alerte SLO vise l'auteur, pas
+   le pilote. Un rouge non concluant (§3 : run annulé ou
    hors délai, échec de job sans test, échec non attribuable ou ambigu, test
    vert en local) ne retire rien : il est consigné au journal du porteur et le
    pilote est prévenu, une fois.
@@ -785,16 +786,17 @@ def exclude(ctx: Context, lot: int, carrier: int, name: str, run_id: str,
     repasse en `build` : il attend le correctif de son assigné, et un nouveau
     gel le ramène en qa (puis au paquet). Sans cela il restait en qa, gelé avec
     son GO, et l'attente « merge » faisait réclamer au bureau son inclusion au
-    paquet suivant. Une transition refusée (lot déjà sorti de qa, boucles
-    qa → build épuisées) laisse la trace seule, en note."""
+    paquet suivant. #4043 : le retrait n'est pas une boucle d'auteur
+    (`--package-exclusion` : `loops` inchangé, jamais refusé à la limite). Une
+    transition refusée (lot déjà sorti de qa) laisse la trace seule, en note."""
     trace = "%s%s porteur=#%d run=%s tests=%s : correctif dû par l'assigné, " \
             "regel pour revenir au paquet" % (MARK_EXCLUDED, name, carrier, run_id,
                                               ",".join(tests) or "?")
     if ctx.dry_run:
         ctx.say("[essai] #%d → build : %s" % (lot, trace))
         return
-    moved = ctx.ameesh("work", "move", str(lot), "build", "--note", trace,
-                       "--actor", ctx.actor)
+    moved = ctx.ameesh("work", "move", str(lot), "build", "--package-exclusion",
+                       "--note", trace, "--actor", ctx.actor)
     if moved.returncode == 0:
         return
     ctx.say("#%d non repassé en build : %s" % (lot, auto._tail(moved.text, 5)))

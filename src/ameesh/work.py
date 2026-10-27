@@ -3562,7 +3562,8 @@ def _adopted_ref(db: Db, item_id: int) -> str:
 
 
 def move(db: Db, item_id: int, state: str, *, note: str = "", actor: str = "",
-         correct: str | None = None, reviewer: str | None = None) -> dict:
+         correct: str | None = None, reviewer: str | None = None,
+         package_exclusion: bool = False) -> dict:
     """Déplace un lot en vérifiant la transition, la boucle QA et le terminal.
 
     `correct` (la raison) : correction d'un état posé par erreur, hors machine
@@ -3580,7 +3581,19 @@ def move(db: Db, item_id: int, state: str, *, note: str = "", actor: str = "",
     déclaré** que l'auteur rend un avertissement indicatif (#800), jamais un
     refus : il est posé sur la ligne rendue (`reviewer_warning`). La
     désignation dépose un `request` lié au lot (#2478) qui réveille le
-    relecteur ; une remise en échec est un `reviewer_request_warning`."""
+    relecteur ; une remise en échec est un `reviewer_request_warning`.
+
+    `package_exclusion` (#4043) : le lot retiré d'un paquet pour un test
+    négatif (`paquet-horaire.exclude`, #4028) repasse de `qa` en `build` sans
+    consommer de boucle d'auteur (`loops` inchangé, pas de refus à
+    `MAX_QA_LOOPS`) : le retrait est un geste du pilote, pas un renvoi de
+    relecture. Seulement qa → build ; l'appelant a vérifié qui exclut
+    (`corrector`)."""
+    if package_exclusion and correct is not None:
+        raise WorkError("--package-exclusion and --correct are distinct gestures")
+    if package_exclusion and state != "build":
+        raise WorkError("--package-exclusion: a lot excluded from a package returns "
+                        "to build (ameesh work move %s build --package-exclusion)" % item_id)
     if state not in STATES:
         raise WorkError("unknown state: %r (%s)" % (state, ", ".join(STATES)))
     if state == "closed":
@@ -3654,7 +3667,11 @@ def move(db: Db, item_id: int, state: str, *, note: str = "", actor: str = "",
                % (item_id, state) if (current, state) in CORRECTIONS else ""))
     if state == "waiting_human" and not storage.of(db).decisions.pending_for_lot(str(item_id)):
         raise WorkError(WAITING_WITHOUT_QUESTION % {"id": item_id})
-    returning_loop = current == "qa" and state == "build"
+    if package_exclusion and current != "qa":
+        raise WorkError("--package-exclusion: lot %s is in %s, not in qa: only a "
+                        "frozen lot under review is in a package" % (item_id, current))
+    # #4043 : un retrait de paquet n'est pas une boucle d'auteur
+    returning_loop = current == "qa" and state == "build" and not package_exclusion
     if returning_loop and int(item["loops"]) >= MAX_QA_LOOPS:
         raise WorkError(
             "qa → build loop exhausted (%d): move the lot to blocked, or ask the "
