@@ -560,6 +560,66 @@ class ContentBeforeHeadTest(unittest.TestCase):
         self.assertTrue(review_authors._content_before_head(
             repo.root, delivered, earlier))
 
+    def test_symlink_replaced_by_regular_file_is_not_proven_by_same_blob(self):
+        """#3902 B/P2 (cx2) : même blob, mode final différent (120000 vs
+        100644) — le symlink reste à livrer, l'auteur est conservé."""
+        repo = _Repo(os.path.join(self.tmp, "symlink-mode"))
+        link = os.path.join(repo.root, "link")
+        os.symlink("old-target", link)
+        base = repo.commit("base with a symlink")
+        os.remove(link)
+        os.symlink("new-target", link)
+        earlier = repo.commit("parent retargets the symlink", agent="parent")
+        # cible : le symlink devient un fichier ordinaire au même blob
+        repo.git("checkout", "-q", "-b", "symlink-target", base)
+        os.remove(link)
+        with open(link, "w", encoding="utf-8") as handle:
+            handle.write("new-target")
+        target = repo.commit("target turns it into a regular file", agent="other")
+        self.assertFalse(review_authors._content_before_head(
+            repo.root, target, earlier))
+        # tête : la cible + le symlink, donc la livraison reste à faire
+        repo.git("checkout", "-q", "-b", "symlink-head", target)
+        os.remove(link)
+        os.symlink("new-target", link)
+        head = repo.commit("head restores the symlink", agent="impl")
+        self.assertEqual(review_authors._not_in_target(
+            repo.root, [earlier], target, head=head), [earlier])
+        self.assertTrue(review_authors._survives_rewrite(
+            repo.root, head, earlier, {}, target, target))
+        # cible où le symlink est réellement livré : même contenu, même mode
+        repo.git("checkout", "-q", "-b", "symlink-delivered", base)
+        os.remove(link)
+        os.symlink("new-target", link)
+        delivered = repo.commit("target applies the symlink", agent="other")
+        self.assertTrue(review_authors._content_before_head(
+            repo.root, delivered, earlier))
+        self.assertEqual(review_authors._not_in_target(
+            repo.root, [earlier], delivered, head=head), [])
+
+    def test_executable_mode_unchanged_in_candidate_is_still_checked(self):
+        """Un script déjà exécutable côté candidat mais 100644 dans la cible
+        est un doute : le mode final compte pour tout chemin touché."""
+        repo = _Repo(os.path.join(self.tmp, "same-mode-script"))
+        repo.write("script.sh", "#!/bin/sh\necho old\n")
+        os.chmod(os.path.join(repo.root, "script.sh"), 0o755)
+        base = repo.commit("base executable")
+        repo.write("script.sh", "#!/bin/sh\necho new\n")
+        earlier = repo.commit("parent changes text only", agent="parent")
+        repo.git("checkout", "-q", "-b", "same-mode-target", base)
+        os.chmod(os.path.join(repo.root, "script.sh"), 0o644)
+        repo.write("script.sh", "#!/bin/sh\necho new\n")
+        target = repo.commit("target loses the executable bit", agent="other")
+        self.assertFalse(review_authors._content_before_head(
+            repo.root, target, earlier))
+        self.assertEqual(review_authors._not_in_target(
+            repo.root, [earlier], target, head=earlier), [earlier])
+        repo.git("checkout", "-q", "-b", "same-mode-delivered", base)
+        repo.write("script.sh", "#!/bin/sh\necho new\n")
+        delivered = repo.commit("target applies text, mode kept", agent="other")
+        self.assertTrue(review_authors._content_before_head(
+            repo.root, delivered, earlier))
+
     def test_whole_file_rewrite_without_context_is_not_proven_by_free_search(self):
         """#3902 B2 (dev1) : un hunk sans contexte couvre tout le fichier ;
         le bloc postérieur trouvé ailleurs ne prouve pas la réécriture."""

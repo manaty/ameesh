@@ -1333,9 +1333,11 @@ def _mode_delivery(repo: str, target: str, sha: str, cache: dict) -> Optional[bo
     if not parsed:
         return True
     _hunks, modes = parsed
-    for path, (old_mode, new_mode) in sorted(modes.items()):
-        if str(old_mode) == str(new_mode):
-            continue
+    for path, (_old_mode, new_mode) in sorted(modes.items()):
+        # Le mode FINAL compte pour tout chemin touché, même quand le
+        # candidat ne change pas le mode : un symlink 120000 remplacé par un
+        # fichier ordinaire 100644 au même blob n'est pas le même contenu
+        # (#3902 B/P2, témoin cx2).
         if str(new_mode) == "000000":
             if _path_absent(repo, target, path, cache) is not True:
                 return False
@@ -1491,16 +1493,19 @@ def _content_before_head_value(repo: str, before: str, sha: str,
         return False
     meaningful = False
     for path, (old_mode, new_mode) in sorted(modes.items()):
-        if str(old_mode) == str(new_mode):
-            continue
+        # Le mode final est vérifié pour tout chemin touché, même sans
+        # changement de mode dans le candidat (#3902 B/P2, témoin cx2) ;
+        # seul un vrai changement de mode rend le commit significatif.
         if str(new_mode) == "000000":
             if _path_absent(repo, before, path, cache) is not True:
                 return False
-            meaningful = True
+            if str(old_mode) != str(new_mode):
+                meaningful = True
             continue
         if _path_mode(repo, before, path, cache) != str(new_mode):
             return False
-        meaningful = True
+        if str(old_mode) != str(new_mode):
+            meaningful = True
     for path, path_hunks in sorted(hunks.items()):
         here = _path_lines(repo, before, path, cache)
         if here is None:
