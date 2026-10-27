@@ -961,7 +961,7 @@ def _reply_for(db, view: dict, human: str) -> dict | None:
 
 
 def _answer_mail(cfg: Config, db, view: dict, *, human: str,
-                 after: list | None = None) -> tuple[int | None, str | None]:
+                 after: list | None = None) -> tuple[int | None, str | None, bool]:
     """Dépose le courrier de la réponse gardée, ou rend celui déjà déposé.
 
     Rejouable : le courrier se recompose depuis `payload.decision.answer`. Un
@@ -971,7 +971,7 @@ def _answer_mail(cfg: Config, db, view: dict, *, human: str,
     from . import identity, mail, resident_queue
     existing = _reply_for(db, view, human)
     if existing is not None:
-        return int(existing["id"]), None
+        return int(existing["id"]), None, False
     binding = identity.resolve_binding(cfg, db)
     human_account = ""
     if binding.source == "none":
@@ -998,13 +998,13 @@ def _answer_mail(cfg: Config, db, view: dict, *, human: str,
             after_commit=after)
     except (fil.UnreadableBody, storage.MailboxRefused) as exc:
         return None, ("answer recorded, but the mail to %s was not delivered (%s): "
-                      "let them know" % (view["requester"], exc))
+                      "let them know" % (view["requester"], exc)), False
     except Exception as exc:  # noqa: BLE001 - la réponse est gardée : le dire
         if isinstance(exc, db_mod.DbError):
             raise
         return None, ("answer recorded, but the mail to %s was not delivered (%s): "
-                      "let them know" % (view["requester"], exc))
-    return int(message_id), None
+                      "let them know" % (view["requester"], exc)), False
+    return int(message_id), None, True
 
 
 def _replay_answer(cfg: Config, db, view: dict, *, text: str, option: str | None,
@@ -1015,9 +1015,9 @@ def _replay_answer(cfg: Config, db, view: dict, *, text: str, option: str | None
             % (view["id"], human))
     if storage.is_remote(db):
         lot = _release_lot(db, view, actor=human, note=note, replay=True)
-        message_id, warning = _answer_mail(cfg, db, view, human=human)
+        message_id, warning, sent = _answer_mail(cfg, db, view, human=human)
         return {"decision": view, "lot": lot, "message_id": message_id,
-                "warning": warning, "replayed": True}
+                "warning": warning, "replayed": True, "mail_sent": sent}
     after: list = []
     with db.transaction() as tx:
         latest = get(tx, view["id"], now) or view
@@ -1025,11 +1025,11 @@ def _replay_answer(cfg: Config, db, view: dict, *, text: str, option: str | None
             raise DecisionError(_closed_reason(latest))
         view = latest
         lot = _release_lot(tx, view, actor=human, note=note, replay=True)
-        message_id, warning = _answer_mail(cfg, tx, view, human=human, after=after)
+        message_id, warning, sent = _answer_mail(cfg, tx, view, human=human, after=after)
     for record in after:
         record(cfg, db)
     return {"decision": view, "lot": lot, "message_id": message_id,
-            "warning": warning, "replayed": True}
+            "warning": warning, "replayed": True, "mail_sent": sent}
 
 
 def answer(cfg: Config, db, decision_id: int, text: str, *, human: str, channel: str,
@@ -1108,7 +1108,7 @@ def answer(cfg: Config, db, decision_id: int, text: str, *, human: str, channel:
         view = view_of(closed, now)
         lot = _release_lot(db, view, actor=human, note="decision #%d answered by %s (%s): %s"
                            % (view["id"], human, CHANNEL_LABELS[channel], said(view)))
-        message_id, warning = _answer_mail(cfg, db, view, human=human)
+        message_id, warning, _sent = _answer_mail(cfg, db, view, human=human)
         return {"decision": view, "lot": lot, "message_id": message_id,
                 "warning": warning, "replayed": False}
 
@@ -1128,7 +1128,8 @@ def answer(cfg: Config, db, decision_id: int, text: str, *, human: str, channel:
                 tx, view, actor=human,
                 note="decision #%d answered by %s (%s): %s"
                      % (view["id"], human, CHANNEL_LABELS[channel], said(view)))
-            message_id, warning = _answer_mail(cfg, tx, view, human=human, after=after)
+            message_id, warning, _sent = _answer_mail(
+                cfg, tx, view, human=human, after=after)
     except _DecisionRace:
         latest = get(db, decision_id, now)
         if latest is not None and _same_answer(latest, text, option, human):
@@ -1459,7 +1460,10 @@ def cmd_answer(cfg: Config, argv: list[str]) -> int:
                                            " (%d other decision(s) pending)"
                                            % lot["others"] if lot.get("others") else ""))
     if result.get("message_id"):
-        if replayed:
+        if replayed and result.get("mail_sent"):
+            print("answer mail sent now (message #%d): the missing reply is delivered"
+                  % result["message_id"])
+        elif replayed:
             print("answer mail already present (message #%d): nothing sent twice"
                   % result["message_id"])
         else:

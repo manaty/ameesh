@@ -268,6 +268,7 @@ class ReponseTest(_Base):
         replies = self.db.query("SELECT id FROM agent_mailbox WHERE kind = 'reply'")
         second = self.answer(view["id"], "a")
         self.assertTrue(second["replayed"])
+        self.assertFalse(second["mail_sent"])   # le courrier était déjà là
         self.assertEqual(second["decision"]["answer"]["text"], "a")
         self.assertEqual(second["lot"]["state"], "build")
         self.assertEqual(second["message_id"], first["message_id"])
@@ -286,6 +287,7 @@ class ReponseTest(_Base):
         self.db.execute("DELETE FROM agent_mailbox WHERE kind = 'reply'")
         replay = self.answer(view["id"], "a")
         self.assertTrue(replay["replayed"])
+        self.assertTrue(replay["mail_sent"])    # le courrier manquait : il est renvoyé
         self.assertIsNotNone(replay["message_id"])
         rows = self.db.query("SELECT id FROM agent_mailbox WHERE kind = 'reply'")
         self.assertEqual(len(rows), 1)
@@ -306,6 +308,7 @@ class ReponseTest(_Base):
         self.assertEqual(self.db.query("SELECT id FROM agent_mailbox WHERE kind = 'reply'"), [])
         replay = self.answer(view["id"], "a")
         self.assertTrue(replay["replayed"])
+        self.assertTrue(replay["mail_sent"])
         self.assertEqual(self.lot_state(), "build")
         self.assertEqual(len(self.db.query("SELECT id FROM agent_mailbox WHERE kind = 'reply'")), 1)
 
