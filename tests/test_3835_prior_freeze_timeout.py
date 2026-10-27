@@ -101,6 +101,39 @@ class RefReachableFastPathTest(TestCase):
         self.assertEqual(why, ["git name-rev: bad revision"])
 
 
+class UnknownRefusalTextTest(TestCase):
+    """Le texte du refus, sans base : groupement et motifs."""
+
+    def test_two_freezes_share_one_supersedes_command(self):
+        first = review_authors.PriorFreezeUnknown(
+            "a410a7ac5ad4", freeze_id=20009,
+            freeze_sha="0610094b3df8fa4df2ab2fcb0e5478302ee03914", lot=3699,
+            reachable=False, repo="/clone")
+        second = review_authors.PriorFreezeUnknown(
+            "a410a7ac5ad4", freeze_id=20066,
+            freeze_sha="ef279c071293027af50e3c45d84788081d3cbc7f", lot=3699,
+            reachable=False, repo="/clone")
+        text = review_authors.unknown_refusal(
+            [first, second], head_sha="66274f581c959ca5c59f4cf6fe5096bfe44a691c")
+        self.assertIn("prior freeze #20009", text)
+        self.assertIn("prior freeze #20066", text)
+        self.assertIn("sha 0610094b3df8", text)
+        self.assertIn("of lot #3699", text)
+        self.assertIn(
+            "ameesh work milestone 3699 frozen --sha "
+            "66274f581c959ca5c59f4cf6fe5096bfe44a691c "
+            "--supersedes 20009 --supersedes 20066", text)
+
+    def test_a_doubt_is_not_presented_as_replaceable(self):
+        value = review_authors.PriorFreezeUnknown(
+            "a410a7ac5ad4", freeze_id=20009,
+            freeze_sha="0610094b3df8fa4df2ab2fcb0e5478302ee03914", lot=3699,
+            reachable=None, reason="timeout", repo="/clone")
+        text = review_authors.unknown_refusal([value], head_sha="66" * 20)
+        self.assertIn("timed out after 30s in /clone", text)
+        self.assertNotIn("ameesh work milestone", text)
+
+
 class PriorFreezeRefusalTest(_RewriteFixture):
     """Un gel antérieur pendant dont l'inconnu bloque la porte."""
 
