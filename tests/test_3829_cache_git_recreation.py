@@ -8,6 +8,12 @@ dépôt qui est au chemin : un dépôt supprimé puis recréé au même chemin (
 une lecture positive — `rev-parse <sha>^{commit}`, `show <sha>:<chemin>` —
 faite sur l'ancien. La clé porte donc l'identité de l'instance du dépôt ; sur
 un dépôt stable, le gain de #3753 reste intact (une lecture, un lancement).
+
+#3834 (N1 et N2 du verdict de #3829) : un dépôt nu placé dans un arbre de
+travail est reconnu à son propre chemin avant le `.git` englobant, et
+l'identité ne suit plus le ctime du répertoire git — `index.lock`,
+`pack-refs`, `gc.pid` ou une réécriture de `HEAD` ne font plus perdre les
+hits d'un clone actif, fetch compris.
 """
 from __future__ import annotations
 
@@ -175,6 +181,79 @@ class RecreatedRepositoryTest(unittest.TestCase):
                                wraps=subprocess.run) as run:
             self.assertEqual(canon._git_out(worktree, *args), "un")
             self.assertEqual(canon._git_out(worktree, *args), "un")
+        self.assertEqual(_canon_launches(run), 1)
+
+    def test_a_bare_repository_in_a_work_tree_is_its_own_repository(self):
+        """#3834 (N1) : git reconnaît le dépôt nu avant le `.git` englobant."""
+        outer = _Repo(os.path.join(self.tmp, "outer"))
+        outer.write("a.txt", "un\n")
+        sha = outer.commit("un")
+        bare = os.path.join(outer.root, "awake.git")
+        _git(self.tmp, "clone", "-q", "--bare", outer.root, bare)
+        self.assertEqual(canon.git_commit(bare, sha), sha)
+
+        # recréé hors de canon._git, le dépôt nu n'a plus l'objet : la lecture
+        # positive de l'ancien ne doit pas être resservie (rc 0 au lieu de 1).
+        before = canon._repository_identity(bare)
+        shutil.rmtree(bare)
+        os.makedirs(bare)
+        _git(bare, "init", "-q", "--bare")
+        self.assertIsNone(canon.git_commit(bare, sha))
+        self.assertIsNone(canon._git_out(bare, "show", sha + ":a.txt"))
+        self.assertNotEqual(canon._repository_identity(bare), before)
+        self.assertEqual(canon._git_directory(bare), os.path.realpath(bare))
+
+    def test_top_level_git_writes_do_not_lose_the_hits(self):
+        """#3834 (N2) : un clone actif écrit dans `.git` sans perdre le cache."""
+        repo = _Repo(os.path.join(self.tmp, "actif"))
+        repo.write("a.txt", "un\n")
+        sha = repo.commit("un")
+        args = ("show", sha + ":a.txt")
+        with mock.patch.object(canon.subprocess, "run",
+                               wraps=subprocess.run) as run:
+            self.assertEqual(canon._git_out(repo.root, *args), "un")
+            before = canon._repository_identity(repo.root)
+
+            # écritures au premier niveau de `.git`, comme un clone actif :
+            # verrou d'index, refs compactées, gc.pid, HEAD réécrit
+            lock = os.path.join(repo.root, ".git", "index.lock")
+            with open(lock, "w", encoding="utf-8") as handle:
+                handle.write("")
+            os.unlink(lock)
+            _git(repo.root, "pack-refs", "--all")
+            with open(os.path.join(repo.root, ".git", "gc.pid"), "w",
+                      encoding="utf-8") as handle:
+                handle.write("1")
+            os.unlink(os.path.join(repo.root, ".git", "gc.pid"))
+            head = os.path.join(repo.root, ".git", "HEAD")
+            with open(head, "r", encoding="utf-8") as handle:
+                content = handle.read()
+            with open(head + ".lock", "w", encoding="utf-8") as handle:
+                handle.write(content)
+            os.replace(head + ".lock", head)
+
+            self.assertEqual(canon._repository_identity(repo.root), before)
+            self.assertEqual(canon._git_out(repo.root, *args), "un")
+        self.assertEqual(_canon_launches(run), 1)
+
+    def test_a_fetch_in_an_active_clone_keeps_the_hits(self):
+        """#3834 (N2) : un fetch qui écrit des objets ne perd pas les hits."""
+        source = _Repo(os.path.join(self.tmp, "source-fetch"))
+        source.write("a.txt", "un\n")
+        sha = source.commit("un")
+        clone = os.path.join(self.tmp, "clone-fetch")
+        _git(self.tmp, "clone", "-q", "--no-local", source.root, clone)
+        args = ("show", sha + ":a.txt")
+        with mock.patch.object(canon.subprocess, "run",
+                               wraps=subprocess.run) as run:
+            self.assertEqual(canon._git_out(clone, *args), "un")
+            before = canon._repository_identity(clone)
+            source.write("a.txt", "deux\n")
+            source.write("b.txt", "nouveau\n")
+            source.commit("deux")
+            _git(clone, "fetch", "-q", "origin")
+            self.assertEqual(canon._repository_identity(clone), before)
+            self.assertEqual(canon._git_out(clone, *args), "un")
         self.assertEqual(_canon_launches(run), 1)
 
 

@@ -1793,6 +1793,48 @@ def _stat_token(path: str):
     return (info.st_dev, info.st_ino, info.st_ctime_ns)
 
 
+def _instance_token(path: str):
+    """`(périphérique, inode)` : l'instance d'un répertoire, sans son ctime.
+
+    #3834 (N2 de #3829) : le ctime d'un répertoire git change à chaque
+    écriture au premier niveau (un `index.lock` créé puis supprimé, un
+    `pack-refs`, `gc.pid`, `HEAD` réécrit) ; le garder dans la clé faisait
+    perdre les hits d'un clone actif. L'inode ne bouge pas sur ces écritures.
+    """
+    token = _stat_token(path)
+    return token[:2] if token is not None else None
+
+
+def _objects_identity(objects: str):
+    """L'instance du magasin d'objets, sans le ctime de `objects/` lui-même.
+
+    #3834 (N2 de #3829) : `objects/` change de ctime dès qu'un fetch ou un
+    commit y crée un nouveau préfixe de deux caractères ; dans un clone
+    actif, s'en servir perdait les hits. `objects/info/` est créé avec le
+    dépôt puis n'est touché ni par les commits, ni par les fetches, ni par
+    `pack-refs` : son ctime date l'instance. L'inode seul ne suffit pas à
+    détecter une recréation (constaté : réutilisation immédiate) ; le ctime
+    de `objects/info/` si, et il reste stable sur l'activité courante. Un
+    dépôt sans `objects/info/` retombe sur `objects/` : mieux vaut un hit
+    perdu qu'une lecture périmée.
+    """
+    base = _instance_token(objects)
+    if base is None:
+        return None
+    born = _stat_token(os.path.join(objects, "info"))
+    if born is None:
+        born = _stat_token(objects)
+    if born is None:
+        return None
+    return (base, born)
+
+
+def _looks_like_git_directory(path: str) -> bool:
+    """Un répertoire git nu : `HEAD` et un magasin `objects/` à ce chemin."""
+    return (os.path.exists(os.path.join(path, "HEAD"))
+            and os.path.isdir(os.path.join(path, "objects")))
+
+
 def _git_directory(repo: str, env_extra: dict | None = None) -> str | None:
     """Le répertoire git qu'une commande lancée dans `repo` lit effectivement."""
     explicit = (env_extra or {}).get("GIT_DIR")
@@ -1800,6 +1842,11 @@ def _git_directory(repo: str, env_extra: dict | None = None) -> str | None:
         path = explicit if os.path.isabs(explicit) else os.path.join(repo, explicit)
         return os.path.realpath(path)
     start = _repo_cache_key(repo)
+    # #3834 (N1 de #3829) : git reconnaît d'abord le dépôt nu (ou le
+    # répertoire git) placé à ce chemin ; remonter avant lui faisait prendre
+    # à un dépôt nu l'identité du `.git` englobant.
+    if _looks_like_git_directory(start):
+        return start
     directory = start
     while True:
         marker = os.path.join(directory, ".git")
@@ -1809,28 +1856,34 @@ def _git_directory(repo: str, env_extra: dict | None = None) -> str | None:
         if parent == directory:
             break
         directory = parent
-    # dépôt nu : ni `.git` ni parent git, le chemin EST le répertoire git
-    if (os.path.exists(os.path.join(start, "HEAD"))
-            and os.path.isdir(os.path.join(start, "objects"))):
-        return start
     return None
 
 
 def _repository_identity(repo: str, env_extra: dict | None = None):
-    """L'instance du dépôt lu, pas seulement son chemin (#3829).
+    """L'instance du dépôt lu, pas seulement son chemin (#3829, #3834).
 
     Le contenu d'un objet adressé par un SHA ne change jamais ; sa **présence**
-    dépend du dépôt qui est au chemin. `(périphérique, inode, ctime)` du
-    répertoire git change quand un dépôt est recréé au même chemin — y compris
-    par un `rm -rf` puis un clone faits hors de `canon._git` : une lecture
-    retenue pour l'ancien n'est alors jamais servie au nouveau. Un dépôt
-    seulement mis à jour (fetch, nouveau commit) garde son identité, donc le
-    gain de #3753 est conservé.
+    dépend du dépôt qui est au chemin. Un dépôt recréé au même chemin — y
+    compris par un `rm -rf` puis un clone faits hors de `canon._git` — ne doit
+    jamais relire une réponse positive de l'ancien ; un dépôt seulement mis à
+    jour (fetch, nouveau commit) garde son identité, donc le gain de #3753 est
+    conservé.
+
+    L'identité porte l'inode du répertoire git (stable sur les écritures de
+    son premier niveau, N2) et la naissance du magasin d'objets (`objects/info`,
+    qui ne bouge pas sur un fetch ou un commit). Le ctime du répertoire git
+    lui-même est volontairement absent : `index.lock`, `pack-refs`, `gc.pid`
+    ou une réécriture de `HEAD` le font changer sans recréer le dépôt.
     """
     gitdir = _git_directory(repo, env_extra)
     if not gitdir:
         return None
-    token = _stat_token(gitdir)
+    if os.path.isdir(gitdir):
+        token = _instance_token(gitdir)
+    else:
+        # `.git` d'un worktree lié : un fichier que git ne réécrit pas ; son
+        # magasin d'objets vit dans le dépôt principal, hors de ce chemin.
+        token = _stat_token(gitdir)
     if token is None:
         return None
     objects = (env_extra or {}).get("GIT_OBJECT_DIRECTORY")
@@ -1838,11 +1891,15 @@ def _repository_identity(repo: str, env_extra: dict | None = None):
         # `plan_git.local_commit` lit les objets d'un autre magasin que le cwd :
         # l'identité doit suivre le magasin réellement lu.
         path = objects if os.path.isabs(objects) else os.path.join(repo, objects)
-        object_token = _stat_token(os.path.realpath(path))
-        if object_token is None:
-            return None
-        token = (token, object_token)
-    return token
+        object_dir = os.path.realpath(path)
+    elif os.path.isdir(gitdir):
+        object_dir = os.path.join(gitdir, "objects")
+    else:
+        return token
+    object_token = _objects_identity(object_dir)
+    if object_token is None:
+        return None
+    return (token, object_token)
 
 
 def _content_cache_clear(repo: str | None = None) -> None:
