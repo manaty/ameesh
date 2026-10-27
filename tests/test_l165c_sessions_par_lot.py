@@ -295,6 +295,35 @@ class StockageTest(_Base):
         self.assertNotIn(demain, ids)
         self.assertTrue(all(r["activity_ts"] for r in self.st.actionable("a6")))
 
+    def test_note_de_l_outillage_ne_leve_pas_la_retenue(self):
+        """#3992 : une note écrite par l'outillage après un `hold:` (composition
+        de paquet, runner, git…) ne lève pas la retenue ; celle de l'assigné,
+        d'un autre agent du registre ou d'un humain la lève, comme avant."""
+        self.bail("a7")
+        def lot(title):
+            return work.add(self.db, title=title, assignee="a7", force=_FORCE)["id"]
+        def tenu(title):
+            item = lot(title)
+            work.note(self.db, item, "hold: composition par la minuterie", actor="a7")
+            return item
+        mecaniques = []
+        for actor in ("inconnu", "", "ameesh", "runner runner-a7@hote",
+                      "git:origin/main", "composition:42"):
+            item = tenu("tenu, puis %r" % actor)
+            work.note(self.db, item, "packet composition recorded: 5 unit(s)",
+                      actor=actor)
+            mecaniques.append(item)
+        par_l_assigne = tenu("levé par l'assigné")
+        work.note(self.db, par_l_assigne, "reprise", actor="a7")
+        self.register("pilote7", "claude")
+        par_un_agent = tenu("levé par un agent")
+        work.note(self.db, par_un_agent, "à toi", actor="agent:pilote7")
+        par_l_owner = tenu("levé par l'owner")
+        work.note(self.db, par_l_owner, "go", actor="human:owner")
+        ids = {r["id"] for r in self.st.actionable("a7")}
+        self.assertFalse(ids & set(mecaniques), "note mécanique : retenue gardée")
+        self.assertEqual(ids, {par_l_assigne, par_un_agent, par_l_owner})
+
     def test_reveil_programme_tenu_est_du_et_consomme_une_fois(self):
         """#2466 : une note hold: portant une échéance réveille à l'échéance,
         une seule fois, et laisse un témoin `wake:` qui ne lève pas la retenue."""
