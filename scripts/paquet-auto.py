@@ -83,6 +83,9 @@ CONTRACT_MODULES = ("tests.test_l161f_plan", "tests.test_cluster")
 COMPOSE_SCRIPT = "scripts/paquet-compose.py"
 CANDIDATES_SCRIPT = "scripts/paquet-candidats.py"
 INCLUSION_SCRIPT = "scripts/paquet-inclusion.py"
+#: #3916 : les remises (`ameesh.resolutions.REF_PREFIX`) et leur copie locale
+REMISE_PREFIX = "refs/ameesh/resolutions/"
+REMISE_LOCAL = "refs/ameesh/paquet-auto/remise/"
 FREEZE_CHECKS_SCRIPT = "scripts/freeze-checks.py"
 DEFAULT_TIMEOUT = 1800
 FREEZE_TIMEOUT = 600
@@ -139,6 +142,9 @@ class Candidate:
     source: str
     branch: str = ""
     title: str = ""
+    #: #3916 : la ref de la remise (`refs/ameesh/resolutions/<lot>/…`) quand
+    #: la source en est une ; elle n'est sur aucune branche, on la fetch.
+    remise_ref: str = ""
 
 
 @dataclass
@@ -679,14 +685,35 @@ def compute_candidates(worktree: Path, target: str, base_sha: str,
         source = str(entry.get("source") or entry.get("published_head") or "").strip()
         if not source:
             raise PaquetAutoError("paquet-candidats : #%d prêt sans source" % lot)
+        remise = entry.get("remise")
+        remise_ref = str(remise.get("ref") or "") if isinstance(remise, dict) else ""
         candidates.append(Candidate(
             lot=lot, source=source, branch=str(entry.get("branch") or ""),
-            title=str(entry.get("title") or "")))
+            title=str(entry.get("title") or ""), remise_ref=remise_ref))
     return candidates, payload
 
+def validate_remise_ref(repo: Path, ref: str, lot: int) -> None:
+    """#3916 : une remise du lot, sous `refs/ameesh/resolutions/<lot>/`."""
+    prefix = "%s%d/" % (REMISE_PREFIX, lot)
+    if not ref.startswith(prefix) or len(ref) == len(prefix):
+        raise InputError("remise du candidat #%d : ref inattendue %r" % (lot, ref))
+    if git(repo, "check-ref-format", ref, check=False).returncode != 0:
+        raise InputError("remise du candidat #%d : ref invalide %r" % (lot, ref))
+
+
 def ensure_source(worktree: Path, candidate: Candidate) -> None:
-    """Résout la source dans le clone ; la fetch de la branche au besoin."""
+    """Résout la source dans le clone ; la fetch au besoin (remise, sinon
+    branche)."""
     sha = rev(worktree, candidate.source)
+    if sha is None and candidate.remise_ref:
+        # #3916 : une remise n'est sur aucune branche : fetcher la branche ne
+        # l'apporte jamais ; on fetch sa ref, validée, sous un nom local.
+        validate_remise_ref(worktree, candidate.remise_ref, candidate.lot)
+        local = REMISE_LOCAL + candidate.remise_ref[len(REMISE_PREFIX):]
+        git(worktree, "fetch", "--no-tags", "origin",
+            "+%s:%s" % (candidate.remise_ref, local), check=False,
+            timeout=GIT_TIMEOUT)
+        sha = rev(worktree, candidate.source)
     if sha is None and candidate.branch:
         # N2 (revue #3807) : la branche vient de la base, jamais d'un argument
         # de commande ; `git fetch` la reçoit après validation, pas avant.
@@ -696,9 +723,11 @@ def ensure_source(worktree: Path, candidate: Candidate) -> None:
         sha = rev(worktree, candidate.source)
     if sha is None:
         raise PaquetAutoError(
-            "source %s de #%d introuvable dans le clone : la branche n'a pas "
-            "été fetchée (ou la source a été réécrite)"
-            % (candidate.source[:12], candidate.lot))
+            "source %s de #%d introuvable dans le clone : la branche%s n'a "
+            "pas été fetchée (ou la source a été réécrite)"
+            % (candidate.source[:12], candidate.lot,
+               " ou la remise %s" % candidate.remise_ref
+               if candidate.remise_ref else ""))
     candidate.source = sha
 
 
