@@ -224,6 +224,20 @@ class ClientTest(unittest.TestCase):
                          second.kwargs["idempotency_key"])
         self.assertIn("sent to dev1 (mail #9)", client.view.out.getvalue())
 
+    def test_kept_lines_are_resent_in_order(self):
+        client = self.client()
+        mail.send.side_effect = [db_mod.DbError("coupure"), db_mod.DbError("coupure"),
+                                 7, 8]
+        client.handle("un")
+        client.handle("deux")
+        self.assertEqual([item["text"] for item in client.outbox], ["un", "deux"])
+        client.flush_outbox()
+        self.assertEqual(client.outbox, [])
+        bodies = [call.args[3] for call in mail.send.call_args_list[-2:]]
+        self.assertEqual(bodies, ["un", "deux"])
+        self.assertIn("sent to dev1 (mail #7)", client.view.out.getvalue())
+        self.assertIn("sent to dev1 (mail #8)", client.view.out.getvalue())
+
     def test_quit_is_refused_while_a_line_is_still_kept(self):
         client = self.client()
         mail.send.side_effect = db_mod.DbError("connexion perdue")
