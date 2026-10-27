@@ -206,7 +206,7 @@ Test from each of the three clients as `ameesh`:
 
 ```sh
 ameesh offload status --host ameesh-agents-3
-ameesh offload run --host ameesh-agents-3 --profile default -- uname -n
+ameesh offload run --host ameesh-agents-3 --profile default --fallback none -- uname -n
 ```
 
 The first must show `"gate": "available"` (if `stopped`, read
@@ -221,9 +221,13 @@ a few minutes). `scripts/test.sh` is exactly what the prevalidation runs,
 with `AMEESH_TEST_VENV` and `AMEESH_TEST_DSN` from the profile:
 
 ```sh
-ameesh offload run --host ameesh-agents-3 --profile ameesh -- \
-  'scripts/test.sh tests/test_1770_prevalidation.py'
+ameesh offload run --host ameesh-agents-3 --profile ameesh --fallback none -- \
+  scripts/test.sh tests/test_1770_prevalidation.py
 ```
+
+The command after `--` is a list of words, not one quoted string: the offload
+launcher execs the first word with the others as arguments. A single quoted
+`'scripts/test.sh tests/…'` is one argv and fails with `cannot exec` (ENOENT).
 
 ## 4. The witness
 
