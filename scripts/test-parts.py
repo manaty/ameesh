@@ -8,9 +8,11 @@
                                 [--flow F.jsonl] [--label "psql 1/6"]
                                 [--measure DIR] [--map carte.json.gz]
     scripts/test-parts.py run   --plan plan.json --part K --driver psql [--flow F.jsonl]
+                                [--parallel N]
     scripts/test-parts.py plan  --out plan.json --parts "mesure-psycopg-1 …"
                                 [--list-psql F] [--map carte.json.gz] [--summary F]
     scripts/test-parts.py durations --driver psql F.json [F.json…]
+                                [--flows F.jsonl…] [--min-test-s 5]
 
 La répartition est **déterministe** et se fait **par module** de test
 (`tests/test*.py`, le motif de `unittest discover`) : un module n'est jamais
@@ -20,6 +22,19 @@ puis placés du plus lourd au plus léger dans la part la moins chargée.
 Un module absent de la table (nouveau) est pesé par son nombre de tests
 (`def test_`) multiplié par la durée moyenne d'un test du pilote : c'est le
 repli, signalé sur la sortie d'erreur pour qu'on rafraîchisse la table.
+
+#3754 — **parallélisme dans le job** : `run --parallel N` découpe la part en
+N processus au moins, chacun sur son schéma par défaut (`AMEESH_SCHEMA`), et
+fusionne leur flux en un seul (`debut`, `impacted`, `fin` compris). La charge
+mesurée de la part peut relever N jusqu'à 4 : avec 24 jobs sur 48 vCPU, une
+part deux fois plus lourde prend deux fois plus de processus (cible ~450 s
+par processus). Le découpage se fait par **unité insécable** : une classe de
+test entière (son `setUpClass` reste dans un processus), sauf une classe de
+plus de 5 min découpée en tests pour isoler un test lent ; les unités sont
+pondérées par les durées par test de `durees.json` (`tests.<pilote>`) quand
+elles existent. Les tests d'une classe partagent déjà un schéma unique par
+classe dans `PgTestCase` : deux processus de la même base ne se voient pas.
+La mesure (`--measure`) reste série : ses couvertures ne se fusionnent pas.
 
 `--list` restreint la suite aux modules d'un fichier (un nom par ligne, `#`
 pour les commentaires) : `tests/parts/pilote-psql.txt` sur une PR de lot (le
@@ -97,9 +112,12 @@ import json
 import os
 import pathlib
 import re
+import shutil
 import signal
 import subprocess
 import sys
+import tempfile
+import threading
 import time
 import unittest
 
@@ -133,6 +151,24 @@ SURCOUT_CHARGE = 1.5
 #: (erreur notée dans la carte) et rend la main aux tests suivants ; 0 la
 #: désactive.
 TEST_TIMEOUT = 600
+#: #3754 — une classe dont la durée mesurée dépasse ce seuil est découpée en
+#: tests (sinon elle reste insécable) : une classe de 11 min dans une part de
+#: 13 min n'aiderait pas deux processus. Le test lent d'une classe (503 s
+#: mesurées dans test_l108_executor_server) est ainsi isolé, les autres tests
+#: de la classe tournent en parallèle.
+UNIT_SPLIT_S = 300.0
+#: #3754 — charge visée par processus d'une part parallèle. Le pool de 24
+#: runners offre 48 vCPU (16 par hôte, 8 jobs) ; à ~450 s de tests par
+#: processus, la somme des besoins des 24 parts tient dans 48 processus (le
+#: `--parallel` demandé est un plancher, `PARALLEL_MAX` un plafond). Le run
+#: 40384366825 (main f444955b, 26/10) pèse 12 034 s psql + ~8 500 s psycopg :
+#: 46 processus à 450 s, soit un mur théorique de ~7,5 min avant mise en place.
+PARALLEL_TARGET_S = 450.0
+PARALLEL_MAX = 4
+#: #3754 — un processus de la part parallèle : il exécute un sous-ensemble de
+#: tests (plan dérivé) et ne refait pas de fan-out. La variable évite la
+#: récursion du découpage.
+PARALLEL_ENV = "AMEESH_TEST_PARALLEL_WORKER"
 
 
 class TestTimeout(Exception):
@@ -451,12 +487,21 @@ class Flow:
     def __init__(self, chemin: str | os.PathLike, context: dict):
         self._f = open(chemin, "w", encoding="utf-8")
         self.context = context
+        self._verrou = threading.Lock()
 
     def write(self, type_: str, **champs) -> None:
         ligne = {"v": 1, "schema": FLOW_SCHEMA, "type": type_, **self.context, **champs,
                  "ts": _timestamp()}
-        self._f.write(json.dumps(ligne, ensure_ascii=False) + "\n")
-        self._f.flush()
+        with self._verrou:
+            self._f.write(json.dumps(ligne, ensure_ascii=False) + "\n")
+            self._f.flush()
+
+    def write_raw(self, ligne: str) -> None:
+        """#3754 : recopie une ligne déjà sérialisée d'un processus de la part
+        parallèle (même contexte et même horodatage que son émission)."""
+        with self._verrou:
+            self._f.write(ligne.rstrip("\n") + "\n")
+            self._f.flush()
 
     def close(self) -> None:
         self._f.close()
@@ -649,7 +694,12 @@ def _measured_suite(measure: _Measure) -> type:
     return _Suite
 
 
-def _load(part: list[str], measure: _Measure | None) -> unittest.TestSuite:
+def _load(part: list[str], measure: _Measure | None,
+          tests: list[str] | None = None) -> unittest.TestSuite:
+    if tests is not None:
+        # #3754 : le processus parallèle reçoit ses unités (classes ou
+        # fonctions) déjà découpées ; le chargement ne dépend pas des modules.
+        return unittest.TestLoader().loadTestsFromNames(tests)
     if measure is None:
         return unittest.TestLoader().loadTestsFromNames([f"tests.{m}" for m in part])
     chargeur = unittest.TestLoader()
@@ -671,8 +721,323 @@ def _result_class(flow: Flow | None, classes: dict, measure: _Measure | None,
                  "impactes": impactes, "test_timeout": test_timeout})
 
 
+def _iter_tests(suite):
+    """Tous les cas de test d'une suite, récursivement."""
+    for element in suite:
+        if isinstance(element, unittest.TestSuite):
+            yield from _iter_tests(element)
+        else:
+            yield element
+
+
+def _module_of_test_id(test_id: str) -> str:
+    """Le module d'un identifiant `tests.<module>[.<Classe>].<test>`."""
+    morceaux = test_id.split(".")
+    if len(morceaux) >= 3 and morceaux[0] == "tests":
+        return morceaux[1]
+    return morceaux[-1]
+
+
+def _unites_de(part: list[str]) -> dict[str, list[str]]:
+    """#3754 : les unités insécables d'une part, pour ses processus parallèles.
+
+    Une unité est une **classe** de test (tous ses tests restent dans le même
+    processus : son `setUpClass` et l'état de classe ne sont pas partagés), ou
+    une fonction de test seule. Découper par module ne suffisait pas : un
+    module peut porter un test de plusieurs minutes (`test_l108_executor_server`,
+    10 min à lui seul) et resterait le chemin critique d'une part. Les schémas
+    de test étant uniques par classe, deux processus ne se voient pas.
+    """
+    suite = unittest.TestLoader().loadTestsFromNames([f"tests.{m}" for m in part])
+    unites: dict[str, list[str]] = {}
+    for test in _iter_tests(suite):
+        test_id = test.id()
+        morceaux = test_id.split(".")
+        cle = ".".join(morceaux[:3]) if len(morceaux) >= 4 else test_id
+        unites.setdefault(cle, []).append(test_id)
+    return unites
+
+
+def _poids_par_test(driver: str) -> dict[str, float]:
+    """Les durées par test de `durees.json` (`tests.<pilote>`), ou {}."""
+    if not TABLE.exists():
+        return {}
+    table = json.loads(TABLE.read_text(encoding="utf-8"))
+    par_test = (table.get("tests") or {}).get(driver) if isinstance(
+        table.get("tests"), dict) else None
+    return par_test if isinstance(par_test, dict) else {}
+
+
+def _pesees_unites(unites: dict[str, list[str]], driver: str,
+                   part: list[str]) -> dict[str, float]:
+    """Poids de chaque unité : durée mesurée du test quand la table la porte
+    (`tests.<pilote>` de `durees.json`), sinon part du module au prorata de ses
+    tests. Somme les tests d'une classe pour qu'un test lent pèse son coût."""
+    par_test = _poids_par_test(driver)
+    poids_modules, _ = weight(part, driver)
+    comptes: collections.Counter = collections.Counter()
+    for test_ids in unites.values():
+        for test_id in test_ids:
+            comptes[_module_of_test_id(test_id)] += 1
+    pesees: dict[str, float] = {}
+    for unite, test_ids in unites.items():
+        total = 0.0
+        for test_id in test_ids:
+            mesure = par_test.get(test_id)
+            if isinstance(mesure, (int, float)) and not isinstance(mesure, bool) and mesure > 0:
+                total += float(mesure)
+            else:
+                module = _module_of_test_id(test_id)
+                n = max(comptes[module], 1)
+                total += poids_modules.get(module, MIN_WEIGHT * n) / n
+        pesees[unite] = max(total, MIN_WEIGHT)
+    return pesees
+
+
+def parallel_count(charge: float, minimum: int = 1) -> int:
+    """#3754 : nombre de processus d'une part, à charge visée constante.
+
+    `minimum` est le plancher demandé (`--parallel`) ; la charge mesurée de la
+    part peut le relever jusqu'à `PARALLEL_MAX`, pour que les parts lourdes
+    n'attendent pas derrière les légères sur un pool de 48 vCPU.
+    """
+    besoin = int(charge // PARALLEL_TARGET_S) \
+        + (1 if charge % PARALLEL_TARGET_S > 0 else 0)
+    return max(1, minimum, min(PARALLEL_MAX, max(1, besoin)))
+
+
+def _affiner_unites(unites: dict[str, list[str]], pesees: dict[str, float],
+                    par_test: dict[str, float]) -> tuple[dict[str, list[str]], dict[str, float]]:
+    """#3754 : découpe une classe trop lourde en tests, avec leur durée mesurée.
+
+    Une classe de plus de `UNIT_SPLIT_S` resterait seule dans un processus et
+    fixerait le mur de la part ; ses tests, eux, sont indépendants (chaque
+    `setUp` remet le schéma à zéro). Les tests sans durée connue reçoivent la
+    moyenne de leur classe, pour ne pas surcharger un processus.
+    """
+    nouveaux: dict[str, list[str]] = {}
+    nouvelles: dict[str, float] = {}
+    for unite, test_ids in unites.items():
+        if pesees.get(unite, 0.0) <= UNIT_SPLIT_S or len(test_ids) <= 1:
+            nouveaux[unite] = test_ids
+            nouvelles[unite] = max(pesees.get(unite, MIN_WEIGHT), MIN_WEIGHT)
+            continue
+        connus = {t: float(par_test[t]) for t in test_ids
+                  if isinstance(par_test.get(t), (int, float))
+                  and not isinstance(par_test.get(t), bool) and par_test[t] > 0}
+        inconnus = [t for t in test_ids if t not in connus]
+        residuel = max(pesees[unite] - sum(connus.values()), 0.0)
+        moyenne = residuel / len(inconnus) if inconnus else 0.0
+        for test_id in test_ids:
+            poids = connus.get(test_id, moyenne)
+            nouveaux[test_id] = [test_id]
+            nouvelles[test_id] = max(poids, MIN_WEIGHT)
+    return nouveaux, nouvelles
+
+
+def _suivre_flux(chemin: str, flow: Flow, evenements: list, verrou: threading.Lock,
+                 fini: threading.Event) -> None:
+    """#3754 : recopie en direct les lignes `test` d'un processus parallèle
+    dans le flux de la part. Les lignes `debut`/`fin`/`impacted` de chaque
+    processus restent locales : le parent écrit les siennes une seule fois."""
+    fichier = None
+    tampon = ""
+
+    def traiter(ligne: str) -> None:
+        nonlocal tampon
+        tampon += ligne
+        while "\n" in tampon:
+            complete, tampon = tampon.split("\n", 1)
+            if not complete.strip():
+                continue
+            try:
+                evenement = json.loads(complete)
+            except json.JSONDecodeError:
+                continue
+            if evenement.get("type") != "test":
+                continue
+            flow.write_raw(complete)
+            with verrou:
+                evenements.append(evenement)
+
+    while True:
+        if fichier is None:
+            try:
+                fichier = open(chemin, encoding="utf-8")
+            except FileNotFoundError:
+                if fini.is_set():
+                    return
+                time.sleep(0.1)
+                continue
+        ligne = fichier.readline()
+        if ligne:
+            traiter(ligne)
+            continue
+        if fini.is_set():
+            traiter(fichier.read())
+            if tampon.strip():  # ligne coupée : illisible, jamais comptée
+                try:
+                    evenement = json.loads(tampon)
+                except json.JSONDecodeError:
+                    evenement = None
+                if isinstance(evenement, dict) and evenement.get("type") == "test":
+                    flow.write_raw(tampon)
+                    with verrou:
+                        evenements.append(evenement)
+            return
+        time.sleep(0.2)
+
+
+def run_parallel(args) -> int | None:
+    """#3754 — exécute la part en N processus `run`, chacun sur son schéma.
+
+    Le découpage se fait par unités (classes de test), pondérées par les
+    durées mesurées de `durees.json` (`tests.<pilote>`) : un test lent ne
+    retient plus sa classe entière dans le chemin critique. Chaque processus
+    reçoit un plan dérivé (mêmes métadonnées, `tests` = ses identifiants) et
+    un schéma par défaut unique ; le flux des tests est fusionné en direct
+    dans celui de la part, avec un seul `debut`, un seul `impacted` et un seul
+    `fin`. `None` rend la main à l'exécution série (pas de plan, ou mesure).
+    """
+    if not args.plan or args.measure:
+        return None
+    entree = read_plan(args.plan, args.driver, args.part)
+    if entree is None or not entree.get("modules"):
+        return None
+    plan = json.loads(pathlib.Path(args.plan).read_text(encoding="utf-8"))
+    part = list(entree["modules"])
+    args.parts = entree.get("of") or args.parts
+    classes = {m: tuple(c) for m, c in plan.get("classes", {}).items()}
+    etiquette = args.label or entree.get("label") or f"{args.driver} {args.part}/{args.parts}"
+    os.chdir(REPO)
+    sys.path[:0] = [str(REPO), str(REPO / "src")]
+    try:
+        unites = _unites_de(part)
+    except Exception as exc:  # un module qui n'importe pas : découpage par module
+        print(f"découpage parallèle par module ({exc})", file=sys.stderr, flush=True)
+        unites = {m: [f"tests.{m}"] for m in part}
+    pesees = _pesees_unites(unites, args.driver, part)
+    unites, pesees = _affiner_unites(unites, pesees, _poids_par_test(args.driver))
+    charge = sum(pesees.values())
+    processus = min(parallel_count(charge, max(1, args.parallel)), max(1, len(pesees)))
+    shards = [s for s in split(pesees, processus) if s]
+    if len(shards) <= 1:  # une seule unité : rien à paralléliser
+        return None
+    base_tmp = os.environ.get("RUNNER_TEMP") or None
+    tmp = tempfile.mkdtemp(prefix="ameesh-parts-", dir=base_tmp)
+    flow = Flow(args.flow, ci_context(etiquette)) if args.flow else None
+    if flow:
+        flow.write("debut", pilote=args.driver, modules=part,
+                   classes={m: classes.get(m, ("P3", ""))[0] for m in part},
+                   estimee_s=round(sum(pesees.values()), 1))
+    evenements: list = []
+    verrou = threading.Lock()
+    fini = threading.Event()
+    procs: list[subprocess.Popen] = []
+    fils: list[threading.Thread] = []
+    debut = time.monotonic()
+
+    def arreter(signum, _frame):
+        for proc in procs:
+            if proc.poll() is None:
+                proc.terminate()
+        fini.set()
+        raise SystemExit(128 + signum)
+
+    anciens = {sig: signal.getsignal(sig) for sig in (signal.SIGTERM, signal.SIGINT)}
+    signal.signal(signal.SIGTERM, arreter)
+    signal.signal(signal.SIGINT, arreter)
+    try:
+        for i, shard in enumerate(shards, 1):
+            tests = [test_id for unite in shard for test_id in unites[unite]]
+            modules = sorted({_module_of_test_id(t) for t in tests})
+            worker = json.loads(json.dumps(plan))
+            trouve = False
+            for candidat in worker.get("parts", {}).get(args.driver, []):
+                if candidat.get("part") == args.part:
+                    candidat["tests"] = tests
+                    candidat["modules"] = modules
+                    candidat["estimate_s"] = round(sum(pesees[u] for u in shard), 1)
+                    trouve = True
+            if not trouve:
+                raise SystemExit(f"plan {args.plan} : part {args.part} introuvable")
+            worker_plan = os.path.join(tmp, f"plan-{i}.json")
+            pathlib.Path(worker_plan).write_text(
+                json.dumps(worker, ensure_ascii=False), encoding="utf-8")
+            commande = [sys.executable, str(pathlib.Path(__file__).resolve()), "run",
+                        "--plan", worker_plan, "--part", str(args.part),
+                        "--driver", args.driver]
+            worker_flow = os.path.join(tmp, f"flux-{i}.jsonl")
+            if flow:
+                commande += ["--flow", worker_flow]
+            worker_durees = os.path.join(tmp, f"durees-{i}.json")
+            if args.output_durations:
+                commande += ["--output-durations", worker_durees]
+            env = dict(os.environ)
+            env[PARALLEL_ENV] = "1"
+            env["AMEESH_SCHEMA"] = "t_par_%d_%d_%d" % (args.part, i, os.getpid())
+            procs.append(subprocess.Popen(commande, cwd=REPO, env=env))
+            if flow:
+                fil = threading.Thread(target=_suivre_flux,
+                                       args=(worker_flow, flow, evenements, verrou, fini),
+                                       daemon=True)
+                fil.start()
+                fils.append(fil)
+        codes = [proc.wait() for proc in procs]
+        fini.set()
+        for fil in fils:
+            fil.join(timeout=10)
+        with verrou:
+            recus = list(evenements)
+        if flow:
+            comptes = collections.Counter(e.get("statut") for e in recus)
+            impactes = [m for m in part if classes.get(m, ("P3", ""))[0] in ("P0", "P1")]
+            rouges = sorted({e.get("module") for e in recus
+                             if e.get("module") in impactes
+                             and e.get("statut") in ("echec", "erreur")})
+            flow.write("impacted", statut="rouge" if rouges else "vert",
+                       modules=impactes, rouges=rouges)
+            echec = any(code != 0 for code in codes) \
+                or bool(comptes.get("echec") or comptes.get("erreur"))
+            flow.write("fin", statut="echec" if echec else "succes",
+                       comptes=dict(comptes), duree_s=round(time.monotonic() - debut, 1))
+            flow.close()
+        if args.output_durations:
+            fusion: dict = {}
+            for i in range(1, len(shards) + 1):
+                chemin = os.path.join(tmp, f"durees-{i}.json")
+                if not os.path.exists(chemin):
+                    continue
+                for driver, valeurs in json.loads(
+                        pathlib.Path(chemin).read_text(encoding="utf-8")).items():
+                    fusion.setdefault(driver, {}).update(valeurs)
+            pathlib.Path(args.output_durations).write_text(
+                json.dumps({d: dict(sorted(v.items())) for d, v in fusion.items()},
+                           indent=1, sort_keys=True) + "\n", encoding="utf-8")
+        print(f"part {args.part}/{args.parts} ({args.driver}) : {len(shards)} processus, "
+              f"charge ~{charge:.0f} s, {len(recus)} test(s), "
+              f"{time.monotonic() - debut:.0f} s", flush=True)
+        return 0 if all(code == 0 for code in codes) else 1
+    finally:
+        fini.set()
+        for proc in procs:
+            if proc.poll() is None:
+                proc.terminate()
+        for fil in fils:
+            fil.join(timeout=5)
+        for sig, ancien in anciens.items():
+            signal.signal(sig, ancien)
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def run(args) -> int:
     signal.signal(signal.SIGINT, signal.default_int_handler)
+    if getattr(args, "parallel", 1) > 1 and not os.environ.get(PARALLEL_ENV):
+        resultat = run_parallel(args)
+        if resultat is not None:
+            return resultat
+        print(f"parallélisme {args.parallel} non applicable : exécution série",
+              file=sys.stderr, flush=True)
     entree = read_plan(args.plan, args.driver, args.part) if args.plan else None
     if args.plan and entree is None:  # fallback plan: the L116 split
         print(f"plan {args.plan} : pas de modules pour {args.driver} {args.part} ; "
@@ -681,8 +1046,10 @@ def run(args) -> int:
             encoding="utf-8"))["parts"][args.driver][0]["of"]
         if args.driver == "psql" and not args.list and _driver_plan(args.plan):
             args.list = str(TESTS / "parts" / "pilote-psql.txt")
+    tests_du_plan = None
     if entree is not None:
         part, estimee, repli = entree["modules"], entree.get("estimate_s", 0.0), []
+        tests_du_plan = entree.get("tests")
         args.parts = entree["of"]
         args.label = args.label or entree.get("label")
     else:
@@ -713,7 +1080,7 @@ def run(args) -> int:
     os.chdir(REPO)
     measure = _Measure(args.measure) if args.measure else None
     sys.path[:0] = [str(REPO), str(REPO / "src")]
-    suite = _load(part, measure)
+    suite = _load(part, measure, tests_du_plan)
     impactes = None if entree is None else tuple(
         m for m in part if classes.get(m, ("P3", ""))[0] in ("P0", "P1"))
     borne = args.test_timeout if measure is not None and hasattr(signal, "SIGALRM") else None
@@ -759,10 +1126,50 @@ def durations(args) -> int:
     for f in args.files:
         mesures.update(json.loads(pathlib.Path(f).read_text(encoding="utf-8")).get(args.driver, {}))
     connus = set(modules())
+    if getattr(args, "flows", None):
+        # #3754 : les flux d'une ci-full portent la durée de chaque test et,
+        # sommées, celle de chaque module ; seuls les tests assez lents pour
+        # peser sur un découpage sont gardés dans `tests.<pilote>`. La table du
+        # pilote est remplacée, jamais complétée : rejouer les mêmes flux (ou
+        # les compléter) ne doit pas additionner deux fois leurs durées.
+        table.setdefault("tests", {})
+        par_test: dict = {}
+        par_module: collections.Counter = collections.Counter()
+        for f in args.flows:
+            for ligne in pathlib.Path(f).read_text(encoding="utf-8").splitlines():
+                try:
+                    evenement = json.loads(ligne)
+                except json.JSONDecodeError:
+                    continue
+                if evenement.get("type") != "test" or evenement.get("module") not in connus:
+                    continue
+                test_id = evenement.get("test")
+                duree = evenement.get("duree_s")
+                if not test_id or not isinstance(duree, (int, float)) \
+                        or isinstance(duree, bool):
+                    continue
+                par_test[test_id] = round(par_test.get(test_id, 0.0) + float(duree), 1)
+                par_module[evenement["module"]] += float(duree)
+        mesures.update({m: round(t, 1) for m, t in par_module.items()})
+        seuil = float(getattr(args, "min_test_s", 5.0) or 0.0)
+        par_test = {t: d for t, d in sorted(par_test.items()) if d >= seuil}
+        if par_test:
+            table["tests"][args.driver] = par_test
+        else:
+            table["tests"].pop(args.driver, None)
+        # Seul un relevé de flux est une mesure de ci-full : la fraîcheur
+        # (`_generated`, lue par test-plan.py) ne marque pas une fusion de
+        # fichiers partiels (`--files`, scripts/test-parallele.sh).
+        table["_generated"] = datetime.datetime.now(datetime.timezone.utc) \
+            .isoformat(timespec="seconds").replace("+00:00", "Z")
     table[args.driver] = {m: t for m, t in sorted(mesures.items()) if m in connus}
     TABLE.write_text(json.dumps(table, indent=1, sort_keys=True, ensure_ascii=False) + "\n",
                      encoding="utf-8")
-    print(f"{TABLE.relative_to(REPO)} : {len(table[args.driver])} module(s) pour {args.driver}")
+    try:
+        etiquette_table = TABLE.relative_to(REPO).as_posix()
+    except ValueError:
+        etiquette_table = str(TABLE)
+    print(f"{etiquette_table} : {len(table[args.driver])} module(s) pour {args.driver}")
     return 0
 
 
@@ -786,6 +1193,10 @@ def main(argv: list[str] | None = None) -> int:
             p.add_argument("--test-timeout", type=float, default=TEST_TIMEOUT,
                            help="borne chaque test sous mesure (secondes, défaut %(default)s) ; "
                            "0 la désactive (#3604)")
+            p.add_argument("--parallel", type=int, default=1,
+                           help="#3754 : N processus de test au moins dans la part, "
+                           "chacun son schéma (1 = série, défaut) ; la charge mesurée "
+                           "peut en lancer jusqu'à 4 ; nécessite --plan")
         p.add_argument("--map", help="carte (carte.json.gz) : durées des modules, "
                        "tests/parts/durees.json en repli (L161e)")
         if nom == "run":
@@ -793,7 +1204,11 @@ def main(argv: list[str] | None = None) -> int:
                            "modules, order and classes of the part")
     p = sous.add_parser("durations")
     p.add_argument("--driver", choices=("psql", "psycopg"), required=True)
-    p.add_argument("files", nargs="+")
+    p.add_argument("files", nargs="*")
+    p.add_argument("--flows", nargs="+",
+                   help="#3754 : flux JSONL d'une ci-full, pour les durées par test")
+    p.add_argument("--min-test-s", type=float, default=5.0,
+                   help="durée minimale d'un test conservé dans tests.<pilote> (défaut 5 s)")
     # #1341 R1 — le plan de la mesure, lu une fois par run (job `plan-mesure`) :
     # `run --plan` le consomme dans chaque part.
     p = sous.add_parser("plan", help="découpage de toutes les parts d'une mesure, "
@@ -819,6 +1234,8 @@ def main(argv: list[str] | None = None) -> int:
         print("\n".join(f"tests.{m}" for m in part))
         print(f"~{estimee:.0f} s estimées", file=sys.stderr)
         return 0
+    if args.commande == "durations" and not args.files and not args.flows:
+        ap.error("durations: au moins un fichier de durées ou un flux est requis")
     return run(args) if args.commande == "run" else durations(args)
 
 
