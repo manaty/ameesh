@@ -78,7 +78,8 @@ class _Base(PgTestCase):
         holders.start()
         self.addCleanup(holders.stop)
         for table in ("account_active", "account_holds", "account_switches", "turn_costs",
-                      "spend_pending", "quota_gauge_readings"):
+                      "spend_pending", "quota_gauge_readings",
+                      "account_rate_events", "account_turn_slots", "account_turn_starts"):
             self.db.execute("DELETE FROM %s" % table)
         self.travail = os.path.join(self.tmp, "travail")
         os.makedirs(self.travail, exist_ok=True)
