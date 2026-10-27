@@ -198,6 +198,13 @@ class ReviewedMoveTest(unittest.TestCase):
         self.marks.append(dict(self.marks[0], id=3, verdict='blocked', at_ts=3))
         self.assertEqual(self.execute()['state'], 'requalified')
 
+    def test_human_block_without_turn_receipt_still_refuses(self):
+        self.marks.append(dict(self.marks[0], id=3, actor='human:smichea',
+                               verdict='blocked', at_ts=3))
+        with self.assertRaisesRegex(TrainError, 'blocking opinion'):
+            self.execute()
+        self.assert_unchanged()
+
     def test_dry_run_validates_without_writing(self):
         self.assertTrue(self.execute(dry_run=True)['dry_run'])
         self.assert_unchanged()

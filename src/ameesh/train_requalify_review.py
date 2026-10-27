@@ -62,6 +62,11 @@ def qualify(cfg, db, spec, pin, gate, changed, references):
              if mark.get("kind") == "verdict" and mark.get("sha") == gate]
     latest = {}
     for mark in sorted(marks, key=lambda m: (m["at_ts"], m["id"])):
+        if str(mark.get("actor") or "").startswith(work.HUMAN_PREFIX):
+            # As in the merge gate (#2928): a human verdict has no managed
+            # turn; an owner's block on the gate commit still refuses.
+            latest[mark["actor"]] = mark
+            continue
         receipt = selected.get(mark["id"]) or review_provenance.receipt_for_milestone(
             db, mark["id"])
         if (receipt and receipt["commit"] == gate and receipt["actor"] == mark["actor"]
