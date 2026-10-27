@@ -3638,6 +3638,18 @@ class Decisions(Domain):
         (état, réponse ou retrait). Rend la ligne close, ou None (déjà close,
         inconnue) — rien n'est écrit."""
 
+    def reply_for(self, decision_id: int, *, sender: str | None = None) -> dict | None:
+        """#3892 : le courrier de réponse déjà déposé pour `decision_id`
+        (`kind = 'reply'`, `payload.decision_answer.decision`), ou None.
+
+        Il rend le même rejeu possible après une panne entre la réponse
+        gardée et son courrier : le courrier manquant est renvoyé, le courrier
+        déjà déposé n'est jamais doublé. `sender` borne la lecture au
+        répondeur. Pas une opération du contrat médié : un pilote qui ne
+        l'implémente pas lève NotImplementedError et l'appelant envoie le
+        courrier sous une clé d'idempotence."""
+        raise NotImplementedError
+
     @abc.abstractmethod
     def source_mail(self, message_id: int) -> dict | None:
         """L233: mail `message_id` (id, sender, recipient, body, kind,

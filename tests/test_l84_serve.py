@@ -21,7 +21,7 @@ import unittest
 from pathlib import Path
 
 from ameesh import db as db_mod
-from ameesh import fil, httpkit, mesh_cli, registry, serve, storage, work
+from ameesh import fil, httpkit, mesh_cli, registry, serve, server_faults, storage, work
 from ameesh import resources as res
 from ameesh import version as package_version
 
@@ -421,6 +421,78 @@ class BuildersTest(unittest.TestCase):
                      "work_detail(cfg, db, args.id", "_host_json(part)"):
             self.assertIn(name, cli)
         self.assertTrue(callable(mesh_cli.agent_rows))
+
+
+class FaultJournalTest(ServerMixin, unittest.TestCase):
+    """#3892 (§16) : une panne de `ameesh serve` est comptée par empreinte —
+    gabarit de route, classe d'exception, version — jamais le message reçu."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="l84-faults-")
+        cfg = type("Cfg", (), {"approve_url": None,
+                               "threads_dir": os.path.join(self.tmp, "fils"),
+                               "threads_root": os.path.join(self.tmp, "fils"),
+                               "state_dir": self.tmp})()
+        self.failure = db_mod.Unavailable("database at 10.1.2.3 refused for alice")
+
+        def read(fn):
+            raise self.failure
+        self.start(serve.Context(cfg=cfg, human="human:owner", organisation="Example"), read,
+                   rate_per_minute=1000)
+
+    def faults(self):
+        with open(os.path.join(self.tmp, "faults-serve.json"), encoding="utf-8") as fh:
+            return json.load(fh)["faults"]
+
+    def test_a_database_fault_is_journaled_by_route_template(self):
+        status, body = self.get_json("/api/v1/lots/123")
+        self.assertEqual((status, body["error"]), (503, "unavailable"))
+        [entry] = self.faults().values()
+        self.assertEqual((entry["route"], entry["code"]),
+                         ("ameesh-serve GET /api/v1/lots/{id}",
+                          "EXCEPTION:Unavailable"))
+        self.assertEqual(entry["occurrences"], 1)
+        raw = json.dumps(self.faults())
+        self.assertNotIn("10.1.2.3", raw)
+        self.assertNotIn("alice", raw)
+        self.assertNotIn("/lots/123", raw)
+
+    def test_an_unexpected_fault_is_journaled_too(self):
+        self.failure = RuntimeError("boom at 10.1.2.3")
+        status, body = self.get_json("/api/v1/projects")
+        self.assertEqual((status, body["error"]), (500, "internal"))
+        [entry] = self.faults().values()
+        self.assertEqual((entry["route"], entry["code"]),
+                         ("ameesh-serve GET /api/v1/projects", "EXCEPTION:RuntimeError"))
+        self.assertNotIn("10.1.2.3", json.dumps(self.faults()))
+
+
+class FaultReporterTest(unittest.TestCase):
+    """#3892 : le journal nourrit la primitive de #3885, une fois, sans double lot."""
+
+    def test_the_reporter_feeds_the_primitive_once(self):
+        tmp = tempfile.mkdtemp(prefix="l84-reporter-")
+        journal = server_faults.Journal(os.path.join(tmp, "faults-serve.json"),
+                                        "ameesh-serve")
+        reported = []
+
+        def report(db, **kwargs):
+            reported.append(kwargs)
+            return {"id": 7, "created": True}
+
+        reporter = serve.FaultReporter(journal, lambda fn: fn(None), report=report)
+        reporter.record("GET /api/v1/lots/{id}",
+                        db_mod.Unavailable("database at 10.1.2.3 refused"))
+        reporter.kick(wait=True)
+        self.assertEqual(len(reported), 1)
+        entry = reported[0]
+        self.assertEqual((entry["app"], entry["route"], entry["code"]),
+                         ("ameesh", "ameesh-serve GET /api/v1/lots/{id}",
+                          "EXCEPTION:Unavailable"))
+        self.assertEqual((entry["count"], entry["users"]), (1, 0))
+        # entrée rapportée : un second rapport ne rouvre pas de lot
+        reporter.kick(wait=True)
+        self.assertEqual(len(reported), 1)
 
 
 if __name__ == "__main__":

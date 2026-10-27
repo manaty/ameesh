@@ -71,7 +71,7 @@ import time
 import urllib.parse
 from typing import Callable
 
-from . import events, httpkit, serve_actions, storage, version
+from . import events, httpkit, serve_actions, server_faults, storage, version
 from . import db as db_mod
 
 BIND = "127.0.0.1"
@@ -488,6 +488,23 @@ def match_action(path: str) -> tuple[serve_actions.Action, dict] | None:
     return None
 
 
+def fault_route(command: str, path: str) -> str:
+    """Gabarit de route du journal des pannes (§16, #3892) : le chemin REÇU
+    n'y entre jamais (il peut porter un identifiant), seulement le gabarit
+    déclaré de la route, ou `/ui/<file>` pour la page et ses fichiers."""
+    try:
+        if path == UI or path.startswith(UI + "/"):
+            return "%s /ui/<file>" % command
+        found = match(path)
+        if found is None:
+            found = match_action(path)
+        if found is not None:
+            return "%s %s" % (command, found[0].path)
+    except Exception:  # noqa: BLE001 — un gabarit ne fait jamais échouer la réponse
+        pass
+    return "%s <unknown>" % command
+
+
 def discovery(ctx: Context) -> dict:
     """`GET /.well-known/ameesh` (study §3)."""
     return {"schema": "ameesh-discovery/1", "organisation": ctx.organisation,
@@ -880,6 +897,52 @@ def db_reader(cfg) -> Callable:
     return read
 
 
+class FaultReporter:
+    """§16 (#3892) : le journal des pannes de `ameesh serve`, rapporté à la
+    primitive de #3885 (un lot `ameesh` par empreinte) sur une connexion
+    d'écriture à part, en arrière-plan : un seul rapport à la fois, jamais une
+    erreur montrée. Un rapport échoué (base encore en panne) garde les
+    entrées ; il est repris par un `kick` ultérieur (panne suivante ou
+    lecture réussie). Même forme que le rapporteur de `progress --serve`
+    (#3889), que ce module ne peut pas importer (cycle)."""
+
+    def __init__(self, journal, write, *, report=None):
+        self.journal = journal
+        self._write = write
+        self._report = report
+        self._busy = threading.Lock()
+        self._last = float("-inf")
+        self._dirty = False
+
+    def record(self, route: str, exc: BaseException, *, subject: str | None = None) -> str:
+        key = self.journal.record(route, exc, subject=subject)
+        self._dirty = True
+        return key
+
+    def kick(self, *, wait: bool = False, every: float = 0.0) -> None:
+        """Un rapport en arrière-plan ; `every` : pas plus souvent (secondes)."""
+        if self._write is None or not self._dirty:
+            return
+        if time.monotonic() - self._last < every or not self._busy.acquire(blocking=False):
+            return
+        self._last = time.monotonic()
+        thread = threading.Thread(target=self._run, daemon=True, name="serve-faults")
+        thread.start()
+        if wait:
+            thread.join(30)
+
+    def _run(self) -> None:
+        try:
+            if self.journal.pending:
+                self._write(lambda db: self.journal.report(db, self._report))
+            self._dirty = bool(self.journal.pending)
+        except Exception as exc:  # noqa: BLE001 — repris au prochain kick
+            sys.stderr.write("ameesh serve: fault report deferred (%s)\n"
+                             % type(exc).__name__)
+        finally:
+            self._busy.release()
+
+
 class Hub:
     """The process's single `LISTEN ameesh_events` connection: each
     notification (or, without LISTEN, each poll that sees a new event) moves
@@ -1055,12 +1118,38 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self._error(exc.status, exc.code, str(exc))
         except (db_mod.DbError, db_mod.Unavailable, db_mod.SchemaMissing) as exc:
             log.warning("database unavailable: %s", type(exc).__name__)
+            self._fault(exc)
             self._error(503, "unavailable", "database unavailable")
         except (BrokenPipeError, ConnectionResetError):
             pass
         except Exception as exc:  # noqa: BLE001 — never a trace to the client
             log.warning("internal error: %s", type(exc).__name__)
+            self._fault(exc)
             self._error(500, "internal", "internal error")
+        else:
+            # #3892 : une lecture réussie est l'occasion de rapporter les
+            # pannes gardées depuis que la base répond (au plus toutes les 60 s).
+            self._kick_faults(every=60.0)
+
+    def _fault(self, exc: BaseException) -> None:
+        """Verse la panne au journal par empreinte (#3892, §16) : gabarit de
+        route, classe d'exception, version ; jamais le message ni le chemin."""
+        faults = getattr(self.server, "faults", None)
+        if faults is None:
+            return
+        path = urllib.parse.urlsplit(self.path).path
+        faults.record(fault_route(self.command, path), exc,
+                      subject=server_faults.HUMAN)
+        self._kick_faults()
+
+    def _kick_faults(self, *, every: float = 0.0) -> None:
+        """Déclenche le rapport du journal sans jamais faire échouer la réponse."""
+        kick = getattr(getattr(self.server, "faults", None), "kick", None)
+        if kick is not None:
+            try:
+                kick(every=every)
+            except Exception:  # noqa: BLE001 — un rapport en retard n'est pas une panne
+                pass
 
     def _guard(self) -> None:
         if not self._host_ok():
@@ -1394,6 +1483,8 @@ def _ui_open(name: str) -> int:
 class ServeHTTPServer(httpkit.BoundedHTTPServer):
     log = log
     hub: "Hub | None" = None
+    #: §16 (#3892) : journal des pannes par empreinte (`server_faults.Journal`)
+    faults = None
 
     def server_close(self) -> None:
         if self.hub is not None:
@@ -1416,6 +1507,15 @@ def make_server(ctx: Context, *, token: str, read: Callable, port: int = DEFAULT
         attrs["write"] = staticmethod(write)
     handler = type("ServeHandler", (Handler,), attrs)
     server = ServeHTTPServer((BIND, int(port)), handler, max_connections=max_connections)
+    state_dir = getattr(ctx.cfg, "state_dir", None)
+    if state_dir:
+        # #3892 (§16) : une panne serveur est comptée par empreinte, sans
+        # donnée personnelle ; le journal ne lève jamais. Le rapport à la
+        # primitive de #3885 passe par la connexion d'écriture des actions.
+        server.faults = FaultReporter(
+            server_faults.Journal(os.path.join(state_dir, "faults-serve.json"),
+                                  "ameesh-serve"),
+            write)
     server.limiter = httpkit.RateLimiter(rate_per_minute)
     server.streams = threading.BoundedSemaphore(max_streams)
     server.hub = hub

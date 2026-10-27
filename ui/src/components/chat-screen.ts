@@ -33,6 +33,7 @@ export class AmeeshChat extends ReadView {
   static override properties = {
     ...ReadView.properties,
     draft: { state: true }, sending: { state: true }, failed: { state: true },
+    uncertain: { state: true },
   };
   static override styles = [...ReadView.styles, css`
     textarea { display: block; width: 100%; box-sizing: border-box; font: inherit; }
@@ -44,6 +45,11 @@ export class AmeeshChat extends ReadView {
   sending = false;
   /** Code of the last refused send, shown under the form. */
   failed = "";
+  /** Code of a send whose outcome is unknown (network, 5xx, or the first
+   * request with that key still running): the message may already be
+   * delivered. It is not a refusal: the draft and the key stay, and the next
+   * send with the same key replays instead of acting twice. */
+  uncertain = "";
   //: one key per message: a retry after an uncertain failure replays it, never
   //: sends it twice; a new text, or a delivered one, takes a fresh key
   #key: { text: string; agent: string; lot: number | null; client: Client; key: string } | null = null;
@@ -56,7 +62,9 @@ export class AmeeshChat extends ReadView {
     super.willUpdate(changed);
     // a refusal belongs to the target it was made for: changing the agent or
     // the lot must not show it under the new one (the draft may stay)
-    if (changed.has("agent") || changed.has("lot")) this.failed = "";
+    if (changed.has("agent") || changed.has("lot")) { this.failed = ""; this.uncertain = ""; }
+    // another text is another request: the previous outcome says nothing of it
+    if (changed.has("draft")) this.uncertain = "";
   }
 
   /** Where the server writes a message without a lot: the agent's project. */
@@ -160,7 +168,7 @@ export class AmeeshChat extends ReadView {
       || this.#key.lot !== lot || this.#key.client !== client) {
       this.#key = { text, agent: this.agent, lot, client, key: idempotencyKey() };
     }
-    this.sending = true; this.failed = "";
+    this.sending = true; this.failed = ""; this.uncertain = "";
     try {
       await client.post("/api/v1/agents/{agent}/chat", {
         path: { agent: this.agent },
@@ -171,13 +179,16 @@ export class AmeeshChat extends ReadView {
       if (this.draft.trim() === text) this.draft = "";
       await this.refresh();
     } catch (error) {
-      this.failed = error instanceof ApiError ? error.code : "network";
-      // The API stores a refusal under its key and replays it: keeping that key
-      // would refuse the same message again after the cause is fixed. Keep it
-      // only while the outcome is unknown (network, 5xx, first request still
-      // running); a deterministic answer releases it.
-      if (error instanceof ApiError && error.status < 500
-          && error.code !== "idempotency_in_progress") {
+      if (error instanceof ApiError && error.code === "idempotency_in_progress") {
+        // §16 (#3892) : l'action a peut-être été faite ; ce n'est pas un échec.
+        this.uncertain = "in_progress";
+      } else if (!(error instanceof ApiError) || error.status >= 500) {
+        // network, 5xx: the outcome is unknown, the message is kept under its key
+        this.uncertain = error instanceof ApiError ? error.code : "network";
+      } else {
+        this.failed = error.code;
+        // The API stores a refusal under its key and replays it: keeping that key
+        // would refuse the same message again after the cause is fixed.
         this.#key = null;
       }
     } finally {
@@ -229,6 +240,9 @@ export class AmeeshChat extends ReadView {
           ? this.t("chat.sending") : this.t("chat.send")}</button>
           ${refused ? nothing : html`<span class="muted">${this.t("chat.hint")}</span>`}</p>
         ${this.failed ? html`<p role="alert" class="critical">${this.t("chat.failed", { code: this.failed })}</p>` : nothing}
+        ${this.uncertain ? html`<p role="status" class="muted">${this.t(
+          this.uncertain === "in_progress" ? "chat.pending" : "chat.uncertain",
+          { code: this.uncertain })}</p>` : nothing}
       </form>`;
   }
 }
