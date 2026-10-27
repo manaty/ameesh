@@ -132,19 +132,6 @@ class Mailbox(interface.Mailbox):
                 % (recipient, recipient))
         return rows[0]
 
-    def sent_with_key(self, sender, key) -> dict | None:
-        # #3892 : rejeu d'un envoi dont la réponse s'est perdue. Une clé est
-        # tirée par le client et rangée dans `payload.idempotency_key` ; la
-        # lecture est bornée à l'expéditeur (index `sender`) et rend le
-        # message déjà déposé, sans jamais en créer un second.
-        rows = self.db.query(
-            "SELECT %s FROM agent_mailbox"
-            " WHERE sender = %%s AND payload->>'idempotency_key' = %%s"
-            " ORDER BY id DESC LIMIT 1" % MAIL_COLUMNS,
-            (sender, str(key)),
-        )
-        return rows[0] if rows else None
-
     def unread(self, recipient, limit) -> list[dict]:
         return self.db.query(
             """

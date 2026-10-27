@@ -1293,17 +1293,6 @@ class Mailbox(Domain):
         """Dépose un message ; rend id, created_ts et les projets du fil
         (`sender_project`, `recipient_project`) des deux agents."""
 
-    def sent_with_key(self, sender: str, key: str) -> dict | None:
-        """#3892 : le message déjà déposé par `sender` sous cette clé
-        d'idempotence (`payload.idempotency_key`), ou None.
-
-        Lecture seule, pour rejouer un envoi dont la réponse s'est perdue
-        (panne de base au milieu du chat terminal) : le même corps n'est pas
-        déposé deux fois. Pas une opération du contrat médié (le client
-        terminal lit sa propre base) : un pilote qui ne l'implémente pas lève
-        NotImplementedError et l'appelant retombe sur un envoi ordinaire."""
-        raise NotImplementedError
-
     @abc.abstractmethod
     def unread(self, recipient: str, limit: int) -> list[dict]:
         """Messages non remis, du plus ancien au plus récent, avec leur lot

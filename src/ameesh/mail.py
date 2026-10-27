@@ -82,9 +82,10 @@ def send(
 
     #3892 : `idempotency_key` (une chaîne stable du client, rangée dans
     `payload.idempotency_key`) rejoue un envoi dont la réponse s'est perdue.
-    Un message déjà déposé par le même expéditeur sous cette clé est rendu
-    tel quel, jamais déposé une seconde fois (base locale ; un exécuteur
-    médié n'a pas cette lecture et envoie comme avant).
+    Un message déjà déposé par le même expéditeur vers le même destinataire
+    sous cette clé est rendu tel quel, jamais déposé une seconde fois ; le
+    dépôt reste exclusif par clé (index 0497 de #3889), y compris pour un
+    exécuteur médié qui n'a pas cette lecture préalable.
     """
     from .agent_names import resolve as resolve_agent_name
     sender = resolve_agent_name(sender, db=db, operation="mail.send")
@@ -94,12 +95,10 @@ def send(
         if not _IDEMPOTENCY_KEY_RE.match(idempotency_key):
             raise ValueError("invalid idempotency key: %r" % idempotency_key)
         if not storage.is_remote(db):
-            try:
-                existing = storage.of(db).mailbox.sent_with_key(sender, idempotency_key)
-            except NotImplementedError:
-                existing = None
+            existing = storage.of(db).mailbox.by_idempotency_key(
+                sender, recipient, idempotency_key)
             if existing is not None:
-                return int(existing["id"])
+                return int(existing)
         payload = dict(payload or {})
         if payload.get("idempotency_key") not in (None, idempotency_key):
             raise ValueError("payload.idempotency_key does not match the key")
