@@ -9,6 +9,10 @@ commit pendant une minute et refusé de composer.
 Attendu : l'avance du commit audité est conditionnelle (CAS sur la valeur
 enregistrée) et gardée par l'ascendance git ; seul un retour arrière DÉCLARÉ
 (`--allow-rewind`), journalisé au fil, peut faire reculer le commit.
+
+#3964 : le même CAS couvre la provenance (statut, racine, source, diagnostic,
+horodatage) — une écriture au CAS perdu ne laisse pas la provenance périmée
+derrière un commit plus récent.
 """
 from __future__ import annotations
 
@@ -88,22 +92,26 @@ class CanonCommitMonotoneTest(_TmpMixin, PgTestCase):
 
     def test_ecriture_conditionnelle_detecte_une_avance_concurrente(self):
         """Le CAS de `record_state` : une écriture fondée sur une lecture
-        périmée laisse le commit déjà avancé par une autre synchro."""
+        périmée laisse la ligne déjà avancée par une autre synchro — commit
+        ET provenance (statut, racine, source, diagnostic, horodatage)."""
         self.sync()
-        stale = canon.load(self.clone)
         c2 = self.change()
-        fresh = canon.load(self.clone)
         store = storage.of(self.db).canon
         # B enregistre C2 entre la lecture de A (C1) et son écriture.
         written = store.record_state(
-            HOST, canon_sync.CANON_OK, root=fresh.root, source=fresh.source_label(),
-            commit=c2, good=True, diagnostic="", canon="", expected=self.c1)
+            HOST, canon_sync.CANON_OK, root="/neuf", source="neuf@" + c2[:12],
+            commit=c2, good=True, diagnostic="neuf", canon="", expected=self.c1)
         self.assertEqual(written, c2)
+        before = store.state(HOST, "")
         written = store.record_state(
-            HOST, canon_sync.CANON_OK, root=stale.root, source=stale.source_label(),
-            commit=self.c1, good=True, diagnostic="", canon="", expected=self.c1)
+            HOST, canon_sync.CANON_OK, root="/perime", source="perime@" + self.c1[:12],
+            commit=self.c1, good=True, diagnostic="perime", canon="", expected=self.c1)
         self.assertEqual(written, c2)            # CAS perdu : C1 n'a pas écrasé C2
         self.assertEqual(self.last_good(), c2)
+        # #3964 : la provenance du gagnant n'est pas remplacée par la périmée
+        after = store.state(HOST, "")
+        for field in ("status", "root", "source", "diagnostic", "checked_ts"):
+            self.assertEqual(after[field], before[field], field)
 
     def test_retour_arriere_declare_est_accepte_et_journalise(self):
         self.sync()
