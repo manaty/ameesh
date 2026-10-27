@@ -606,9 +606,21 @@ for i in range(int(os.environ.get("L112_ETAPES", "3"))):
         {"type": "tool_use", "id": "t%d" % i, "name": "Bash", "input": {}}]}}), flush=True)
     note({"outil": i})
     time.sleep(float(os.environ.get("L112_DUREE", "0.6")))
+    # #3910 : le témoin « fini » est durable AVANT le tool_result qui publie
+    # le point sûr. Sinon la porte peut s'appliquer entre les deux : le compte
+    # lu juste après `gate_holds()` oublierait l'étape que l'exécuteur vient de
+    # dépasser et rougirait (2 au lieu de 0 ou 1) sans dépassement du point sûr.
+    note({"fini": i})
     print(json.dumps({"type": "user", "message": {"content": [
         {"type": "tool_result", "tool_use_id": "t%d" % i, "content": "ok"}]}}), flush=True)
-    note({"fini": i})
+    # Le bloc optionnel reproduit la fenêtre : le point sûr est publié, le
+    # témoin est déjà au journal ; le témoin déterministe s'arrête là.
+    bloc = os.environ.get("L112_BLOC")
+    if bloc and i == 0:
+        with open(bloc + ".pret", "w") as fh:
+            fh.write(str(i))
+        while not os.path.exists(bloc + ".suite"):
+            time.sleep(0.01)
 print(json.dumps({"type": "result", "subtype": "success", "result": "fini",
                   "total_cost_usd": 0.0, "session_id": session}), flush=True)
 note({"fin": True})
@@ -631,6 +643,53 @@ class HarnessProbeTest(unittest.TestCase):
             self.assertEqual(proc.returncode, 0, proc.stderr)
             self.assertEqual(proc.stdout.strip(), "claude-l112 1.0.0")
             self.assertFalse(os.path.exists(journal))
+
+
+class TemoinPointSurTest(unittest.TestCase):
+    def test_le_temoin_fini_precede_le_point_sur(self):
+        """#3910 : le témoin « fini » doit être durable avant le tool_result.
+
+        Le test de retrait échantillonne les appels finis dès que la porte est
+        appliquée (`gate_holds()`). Si le faux harnais publie d'abord le
+        tool_result puis écrit « fini », la porte peut s'appliquer dans cet
+        intervalle : le compte ignore l'étape que l'exécuteur a déjà franchie
+        et rougit (2 au lieu de 0 ou 1) sans qu'il ait dépassé le point sûr.
+        Ce témoin reproduit la fenêtre de façon déterministe : il attend le
+        point sûr publié et vérifie que « fini » est déjà au journal.
+        """
+        with tempfile.TemporaryDirectory(prefix="l112-temoin-") as tmp:
+            script = os.path.join(tmp, "claude")
+            journal = os.path.join(tmp, "journal.jsonl")
+            bloc = os.path.join(tmp, "bloc")
+            with open(script, "w") as fh:
+                fh.write(FAUX_HARNAIS)
+            os.chmod(script, 0o755)
+            proc = subprocess.Popen(
+                [sys.executable, script], stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                env=dict(os.environ, L112_JOURNAL=journal, L112_ETAPES="1",
+                         L112_DUREE="0", L112_BLOC=bloc))
+
+            def relacher():
+                with open(bloc + ".suite", "w"):
+                    pass
+                try:
+                    proc.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait(timeout=10)
+
+            try:
+                self.assertIsNotNone(
+                    attendre(lambda: os.path.exists(bloc + ".pret"), timeout=10.0),
+                    "le faux harnais doit publier son point sûr")
+                with open(journal, encoding="utf-8") as fh:
+                    marques = [json.loads(line) for line in fh if line.strip()]
+                self.assertTrue(
+                    any("fini" in m for m in marques),
+                    "« fini » doit être écrit avant le tool_result qui publie le point sûr")
+            finally:
+                relacher()
 
 
 class ExecuteurTest(PgTestCase):
@@ -720,6 +779,9 @@ class ExecuteurTest(PgTestCase):
         self.assertTrue(attendre(runner.gate_holds, timeout=10.0),
                         "la porte doit passer draining")
         finis_avant = sum(1 for m in self.harnais() if "fini" in m)
+        # #3910 : le faux harnais écrit « fini » avant le tool_result qui
+        # publie le point sûr : une étape franchie par l'exécuteur est donc
+        # toujours comptée ici, même si la porte s'applique juste après.
         ack = attendre(lambda: (self.ack() or {}).get("drained") and self.ack())
         self.assertTrue(ack, "le retrait doit finir par un acquittement drained")
         self.assertEqual((ack["seq"], ack["state"], ack["held"]), (2, "draining", []))
