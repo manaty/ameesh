@@ -591,12 +591,18 @@ lot prêt absent du paquet doit figurer dans la table « Écartés (ce véhicule
 du manifeste avec un motif ; sinon il n'est ni composé ni visible. Un lot sous
 **hold de pilote actif** n'est pas prêt (`planned_waits`, #3375) : le calcul le
 rend `pilot-hold`, motif « hold pilote » au manifeste ; l'autorité de pilote est
-lue en strict, donc un registre ou un canon illisible rend la liste incomplète
-(rc 1, `--ready-out` retiré) au lieu de libérer le lot. Le composeur ne le
-passe qu'avec `--hold-override <lot> --hold-reason "…"`, la raison étant
-journalisée sur le lot. Si le calcul est incomplet (une lecture impossible),
-`--ready-out` est retiré, y compris un export précédent : le contrôle
-s'arrête plutôt que de lire une liste partielle.
+lue en strict, donc un registre ou un canon illisible rend la liste
+inutilisable (`CandidateError`, rc 1, `--ready-out` retiré) au lieu de libérer
+le lot. Le composeur ne le passe qu'avec `--hold-override <lot>
+--hold-reason "…"`, la raison étant journalisée sur le lot. Une lecture
+impossible **propre à un lot** (gel ou porte illisible) ne retire plus toute la
+liste : le calcul sort en `3`, `--ready-out` reste écrit avec une section
+`# erreurs` (`!<lot> : <motif>`), et `paquet-inclusion` refuse toute unité en
+erreur et consigne les autres comme écartées avec leur motif (#3813). Une
+erreur **globale** (base, cible, base de données, inventaire) garde le
+comportement ancien : rc 1 et `--ready-out` retiré, y compris un export
+précédent, pour que le contrôle s'arrête plutôt que de lire une liste
+partielle.
 
 Avant la CI complète et le feu, le contrôle d'inclusion confronte cette liste
 calculée, les admissions ou routages du paquet, les lignes du manifeste **et**
@@ -611,13 +617,16 @@ scripts/paquet-inclusion.py --manifest reviews/2026-10-15-paquet-23h.md \
 ```
 
 Il sort `1` si un lot attendu **ou prêt** manque au manifeste (ni composition
-ni « écarté » motivé), ou si le contenu d'un lot composé a disparu de la tête
-(revert non consigné) — l'ascendance d'une tête ne suffit pas après un revert
-(#1638). Sans liste prête, il sort `2` (`--no-ready` est refusé) ; sans liste
-attendue, il sort `2` sauf `--no-expected` explicite. Un fichier de lots prêts
-fourni mais vide est valide. Sur une recomposition, la liste est recalculée sur
-la cible de la recomposition. Un contenu *partiel* ou *vide* est listé « à
-lire » (union, adaptation, remise fraîche) ; `--strict` le rend bloquant.
+ni « écarté » motivé), si un lot que la liste calculée dit en erreur y est
+composé, ou si le contenu d'un lot composé a disparu de la tête (revert non
+consigné) — l'ascendance d'une tête ne suffit pas après un revert (#1638).
+Sans liste prête, il sort `2` (`--no-ready` est refusé) ; sans liste attendue,
+il sort `2` sauf `--no-expected` explicite. Un fichier de lots prêts fourni
+mais vide est valide ; un lot en erreur absent du manifeste y est consigné
+comme écarté avec son motif (#3813). Sur une recomposition, la liste est
+recalculée sur la cible de la recomposition. Un contenu *partiel* ou *vide*
+est listé « à lire » (union, adaptation, remise fraîche) ; `--strict` le rend
+bloquant.
 Détail, format de la liste attendue et validation sur le paquet 11h :
 `docs/PAQUET-INCLUSION.md`.
 

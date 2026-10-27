@@ -683,6 +683,82 @@ class PaquetInclusionTest(unittest.TestCase):
             self.assertEqual(inclusion.parse_manifest(manifest).admissions, [],
                              titre)
 
+    def test_ready_export_names_error_lots_without_inventing_ids(self) -> None:
+        # #3813 : les nombres d'un motif ne sont jamais relus comme des ids.
+        ready = pathlib.Path(self.tmp.name) / "prets-erreurs.txt"
+        ready.write_text(
+            "# paquet-candidats main f444955b2eeb code 6d89c0aeca21\n"
+            "# prêts\n#100\n#200  prêt\n"
+            "# erreurs\n"
+            "!3506 : freeze #3506 du 26/10 20:35Z introuvable, 4096 essais\n",
+            encoding="utf-8",
+        )
+        ids, errors = inclusion.read_ready_file(ready)
+        self.assertEqual(ids, [100, 200])
+        self.assertEqual(list(errors), [3506])
+        self.assertIn("20:35Z", errors[3506])
+
+    def test_ready_error_lot_absent_from_manifest_is_an_exclusion(self) -> None:
+        # Témoin h-31 v4 : #3506 en erreur, absent du manifeste, n'est pas une
+        # recopie manuelle ni une omission : il est consigné écarté et le
+        # paquet des autres lots passe (#3813).
+        ready = pathlib.Path(self.tmp.name) / "prets-erreurs.txt"
+        ready.write_text(
+            "# paquet-candidats main f444955b2eeb code 6d89c0aeca21\n"
+            "# prêts\n#100\n# erreurs\n"
+            "!3506 : cannot read the review gate: provenance unknown\n",
+            encoding="utf-8",
+        )
+        manifest = self.manifest_simple(100, self.src100, self.c100)
+        code, payload = inclusion.run(self.namespace(
+            expected=[100, 3506], manifest=manifest, ready_file=[str(ready)]))
+        self.assertEqual(code, 0, payload["errors"])
+        self.assertEqual(payload["ready_errors"],
+                         {"3506": "cannot read the review gate: provenance unknown"})
+        exclusions = {item["lot"]: item for item in payload["exclusions"]}
+        self.assertIn(3506, exclusions)
+        self.assertIn("cannot read the review gate", exclusions[3506]["reason"])
+        self.assertEqual(payload["omissions"], [])
+
+    def test_ready_error_lot_composed_is_a_blocking_defect(self) -> None:
+        # Témoin h-31 v3 : une unité que la liste calculée dit en erreur est
+        # un défaut bloquant, même si son contenu semble présent (#3813).
+        ready = pathlib.Path(self.tmp.name) / "prets-erreurs.txt"
+        ready.write_text(
+            "# prêts\n#100\n# erreurs\n"
+            "!3506 : cannot read the review gate: provenance unknown\n",
+            encoding="utf-8",
+        )
+        manifest = pathlib.Path(self.tmp.name) / "manifeste-v3.md"
+        manifest.write_text(
+            "# Manifeste v3\n\n"
+            "| # | lot(s) | tête source | commit | note |\n"
+            "|---|---|---|---|---|\n"
+            "| 1 | #100 | `%s` | `%s` |  |\n"
+            "| 2 | #3506 | `%s` | `%s` |  |\n"
+            % (self.src100[:12], self.c100[:12],
+               self.src100[:12], self.c100[:12]),
+            encoding="utf-8",
+        )
+        code, payload = inclusion.run(self.namespace(
+            expected=[100], manifest=manifest, ready_file=[str(ready)]))
+        self.assertEqual(code, 1)
+        self.assertTrue(any(
+            "#3506" in error and "en erreur" in error
+            for error in payload["errors"]), payload["errors"])
+
+    def test_ready_error_line_without_motive_is_invalid_input(self) -> None:
+        ready = pathlib.Path(self.tmp.name) / "prets-casse.txt"
+        ready.write_text("!3506\n", encoding="utf-8")
+        with self.assertRaises(inclusion.InputError):
+            inclusion.read_ready_file(ready)
+
+    def test_ready_error_lot_also_ready_is_invalid_input(self) -> None:
+        ready = pathlib.Path(self.tmp.name) / "prets-casse.txt"
+        ready.write_text("#3506\n!3506 : porte illisible\n", encoding="utf-8")
+        with self.assertRaises(inclusion.InputError):
+            inclusion.read_ready_file(ready)
+
     # -- helpers de banc ---------------------------------------------------
     def ecrire_manifeste_sans_admissions(self) -> None:
         self.manifest.write_text(

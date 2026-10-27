@@ -20,8 +20,9 @@ clone radar figé sur une release périmée écartait en silence tous les lots s
 Sortie lisible par défaut : les lots prêts d'abord, puis les lots en attente
 avec leur motif (`freeze-not-head`, `verdicts-missing`, `conflict`, …), puis
 les lectures impossibles. `--json` rend le schéma
-`ameesh-packet-candidates/1`. `--ready-out` écrit les ids prêts, un par ligne,
-dans le format de `scripts/paquet-inclusion.py --ready-file` :
+`ameesh-packet-candidates/1`. `--ready-out` écrit les ids prêts puis les lots
+en erreur (`!<lot> : <motif>`), dans le format de
+`scripts/paquet-inclusion.py --ready-file` :
 
     scripts/paquet-candidats.py --repo . --ready-out "$TMPDIR/prets-0800.txt"
     scripts/paquet-inclusion.py --manifest reviews/integration-paquet-h-…md \\
@@ -54,12 +55,25 @@ projet n'est pas comparable). Un calcul lancé depuis un vieux checkout ne peut
 donc plus passer pour un calcul sur la cible. `--allow-code-mismatch` assume
 explicitement le décalage : il est alors dit dans la sortie lisible et le JSON.
 
-Codes de retour : 0 si la liste est complète (même sans lot prêt), 1 si une
-lecture a échoué (la liste est incomplète : ne pas composer dessus), 2 si
-l'entrée est invalide (dépôt, projet, base, surcharge de hold sans objet,
-code exécuté qui n'est pas la tête de la cible). En cas d'échec, `--ready-out`
+Codes de retour : 0 si la liste est complète (même sans lot prêt), 3 si la
+liste reste utilisable mais qu'un ou plusieurs lots sont en erreur (lecture de
+leur gel ou de leur porte impossible : ils sont nommés, à écarter), 1 si une
+lecture globale a échoué (base, cible, base de données, inventaire) et 2 si
+l'entrée est invalide (dépôt, projet, base, surcharge de hold sans objet, code
+exécuté qui n'est pas la tête de la cible). En cas d'échec global, `--ready-out`
 est retiré — y compris un export d'une exécution précédente — pour qu'aucune
-liste partielle ne serve de base au contrôle d'inclusion.
+liste partielle ne serve de base au contrôle d'inclusion. En `3`, l'export
+reste écrit et nomme explicitement les lots en erreur :
+
+    # paquet-candidats main f444955b2eeb code 6d89c0aeca21
+    # prêts
+    #3782
+    # erreurs
+    !3506 : <motif sur une ligne>
+
+`scripts/paquet-inclusion.py` lit ce format : un lot en erreur qui est composé
+au manifeste est un défaut bloquant ; un lot en erreur absent du manifeste est
+consigné comme écarté avec son motif, sans recopie manuelle (#3813).
 
 Lecture seule, sauf le geste explicite `--hold-override` : la base n'est
 modifiée que pour y journaliser la raison de la surcharge sur le lot ; les
@@ -339,9 +353,51 @@ def render(payload: dict) -> str:
             lines.append("  #%-5d %s  %s"
                          % (lot, (entry.get("published_head") or "-")[:12], reasons))
     if payload["errors"]:
-        lines += ["", "ERREURS (liste incomplète : ne pas composer dessus)"]
+        lines += ["", "ERREURS (lots à écarter ; la liste reste utilisable)"]
         lines += ["  %s" % error for error in payload["errors"]]
     return "\n".join(lines)
+
+
+def _one_line(text) -> str:
+    """Un motif d'erreur tient sur une ligne : l'export reste lisible."""
+    return " ".join(str(text or "").split())
+
+
+def error_lots(payload: dict) -> dict[int, str] | None:
+    """#3813 : les lots en erreur attribués, ou None si l'erreur est globale.
+
+    Une erreur propre à un lot (gel, porte, essai de fusion) laisse la liste
+    utilisable : rc 3, et l'export nomme les lots à écarter. Une erreur qui
+    n'est pas attribuable à un lot (base, cible, inventaire, `errors` sans
+    `errors_by_lot`) rend la liste inutilisable : rc 1, aucun export
+    (#2404, relecture cx2 B3).
+    """
+    messages = [str(message) for message in payload.get("errors") or ()]
+    if not messages:
+        return {}
+    listed = payload.get("errors_by_lot")
+    if not isinstance(listed, list) or len(listed) != len(messages):
+        return None
+    out: dict[int, str] = {}
+    for item in listed:
+        if not isinstance(item, dict):
+            return None
+        lot = item.get("work_item")
+        motive = _one_line(item.get("error"))
+        if (not isinstance(lot, int) or isinstance(lot, bool) or lot <= 0
+                or not motive or lot in out):
+            return None
+        out[lot] = motive
+    if {_one_line(message) for message in messages} != {
+            "#%d : %s" % (lot, motive) for lot, motive in out.items()}:
+        return None
+    try:
+        ready = {int(lot) for lot in payload.get("ready") or ()}
+    except (TypeError, ValueError):
+        return None
+    if ready & set(out):
+        return None
+    return out
 
 
 def clear_ready_out(path: Path) -> None:
@@ -352,27 +408,34 @@ def clear_ready_out(path: Path) -> None:
         pass
 
 
-def write_ready_out(path: Path, payload: dict) -> None:
-    """Écrit les lots prêts, ou retire l'export si l'inventaire est incomplet.
+def write_ready_out(path: Path, payload: dict) -> dict[int, str] | None:
+    """Écrit la liste prête et la section des lots en erreur (#3813).
 
-    Un fichier d'une exécution précédente est retiré même quand la présente
-    exécution échoue : `paquet-inclusion.py` doit voir une entrée absente
-    (code 2) plutôt qu'une liste partielle trompeuse (#2404, relecture cx2 B3).
+    Rend les erreurs attribuées quand l'export est utilisable (`{}` si la
+    liste est complète), `None` quand elle ne l'est pas : le fichier est alors
+    retiré, y compris un export d'une exécution précédente, pour qu'aucune
+    liste partielle ne serve de base au contrôle d'inclusion (#2404 B3). Le
+    fichier dit toujours explicitement quels lots sont en erreur.
     """
-    if payload.get("errors"):
+    errors = error_lots(payload)
+    if errors is None:
         clear_ready_out(path)
-        return
+        return None
     code = (("code %s" % payload["code_sha"][:12])
             if payload.get("code_sha") else "code ?")
-    content = "# paquet-candidats %s %s %s\n%s\n" % (
-        payload["target"],
-        payload["base"][:12],
-        code,
+    content = "\n".join([
+        "# paquet-candidats %s %s %s"
+        % (payload["target"], payload["base"][:12], code),
+        "# prêts",
         "\n".join("#%d" % lot for lot in payload["ready"]),
-    )
+        "# erreurs",
+        "\n".join("!%d : %s" % (lot, motive)
+                  for lot, motive in sorted(errors.items())),
+    ]) + "\n"
     temporary = path.with_name("%s.%d.tmp" % (path.name, os.getpid()))
     temporary.write_text(content, encoding="utf-8")
     os.replace(temporary, path)
+    return errors
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -391,7 +454,8 @@ def main(argv: list[str] | None = None) -> int:
                              "(défaut : tête fraîche de la cible)")
     parser.add_argument("--json", action="store_true", help="sortie JSON")
     parser.add_argument("--ready-out", default=None, metavar="FILE",
-                        help="écrit les ids prêts, un par ligne, pour --ready-file")
+                        help="écrit les ids prêts puis les lots en erreur "
+                             "(!lot : motif), pour --ready-file")
     parser.add_argument("--allow-code-mismatch", action="store_true",
                         help="#3782 : calculer même si le code exécuté n'est pas la "
                              "tête de la cible ; le décalage est dit dans la sortie")
@@ -461,16 +525,27 @@ def main(argv: list[str] | None = None) -> int:
                                        code.get("code_relation")),
                      ref_source),
                   file=sys.stderr)
-        if hold_overrides and not payload["errors"]:
+        if hold_overrides:
             # #3375 : la raison est écrite avant l'export de la liste prête ;
             # une surcharge sans effet réel (autre refus) est refusée ici.
+            # #3813 : une erreur sur un autre lot ne retire pas la liste, donc
+            # elle ne doit pas faire taire la journalisation d'une surcharge.
             journal_hold_overrides(conn, payload, hold_overrides,
                                    actor=hold_actor(cfg, conn))
+        error_lots_by_id = error_lots(payload)
+        if error_lots_by_id is None:
+            # #3813 : une erreur qui n'est pas attribuable à un lot est
+            # globale ; aucune liste partielle ne doit sortir.
+            if ready_out is not None:
+                clear_ready_out(ready_out)
+            print("paquet-candidats: erreur(s) non attribuable(s) à un lot : "
+                  "la liste est inutilisable, aucun export", file=sys.stderr)
+            return 1
         if ready_out is not None:
             write_ready_out(ready_out, payload)
         print(json.dumps(payload, ensure_ascii=False, indent=2, default=str)
               if args.json else render(payload))
-        return 1 if payload["errors"] else 0
+        return 3 if error_lots_by_id else 0
     except HoldOverrideError as exc:
         print("paquet-candidats: %s" % exc, file=sys.stderr)
         return 2

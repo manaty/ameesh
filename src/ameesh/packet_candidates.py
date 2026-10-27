@@ -49,8 +49,11 @@ L'autorité de pilote est lue **en strict** : un registre ou un canon illisible
 rend la liste incomplète (`CandidateError`), jamais un lot réputé libre.
 
 Un lot dont la préparation n'a pas pu être lue (branche, cible, classe, porte)
-n'est ni prêt ni écarté : il porte `error`, et l'appelant doit refuser de
-composer sur une liste incomplète plutôt que de l'omettre en silence.
+n'est ni prêt ni écarté : il porte `error` et il est nommé dans `errors` et
+`errors_by_lot`. L'appelant peut alors composer les autres lots, mais il doit
+écarter explicitement chaque lot en erreur : l'omettre en silence reste
+interdit (#3813). Seule une erreur globale (base, cible, base de données,
+inventaire) lève `CandidateError` et rend toute la liste inutilisable.
 """
 from __future__ import annotations
 
@@ -573,8 +576,11 @@ def inventory(db, project, *, repo: str, clone, target: str | None = None,
 
     Rend le schéma `ameesh-packet-candidates/1` : `candidates` (tous les lots
     `qa` du projet, prêts ou refusés avec leurs codes), `ready` (ids, ordre de
-    priorité) et `errors` (lectures impossibles, à corriger avant de
-    composer). Aucune écriture, aucun effet hors du clone `clone`.
+    priorité), `errors` (lectures impossibles propres à un lot, à écarter) et
+    `errors_by_lot` (`[{work_item, error}]`, même information attribuée au lot
+    pour les consommateurs — #3813). Une erreur globale lève `CandidateError`
+    et ne rend aucune liste. Aucune écriture, aucun effet hors du clone
+    `clone`.
     """
     app = (app or getattr(project, "name", "") or default_app(repo)).strip()
     target_branch, target_source = resolve_target(project, repo, target)
@@ -614,6 +620,7 @@ def inventory(db, project, *, repo: str, clone, target: str | None = None,
     canons = work.configured_canons(cfg)
     candidates: list[dict] = []
     errors: list[str] = []
+    errors_by_lot: list[dict] = []
     # #2496 : les remises sur la cible, lues avant les gels — un verdict rendu
     # sur une remise couvre la remise, il n'est pas un nouveau gel de la
     # branche (sinon `freeze_candidate` y verrait un rebase de la tête).
@@ -641,6 +648,10 @@ def inventory(db, project, *, repo: str, clone, target: str | None = None,
             entry["source"] = entry["published_head"]
         if entry["error"]:
             errors.append("#%d : %s" % (entry["work_item"], entry["error"]))
+            # #3813 : la même erreur, attribuée au lot. L'export lisible peut
+            # alors rester utilisable et nommer les lots à écarter.
+            errors_by_lot.append({"work_item": int(entry["work_item"]),
+                                  "error": entry["error"]})
     by_id = {entry["work_item"]: entry for entry in candidates}
     ready = sorted((entry["work_item"] for entry in candidates if entry["ready"]),
                    key=lambda lot: _ready_order(by_id[lot]))
@@ -659,6 +670,7 @@ def inventory(db, project, *, repo: str, clone, target: str | None = None,
         "waiting": sorted(entry["work_item"] for entry in candidates
                           if not entry["ready"] and not entry["error"]),
         "errors": errors,
+        "errors_by_lot": errors_by_lot,
     }
 
 

@@ -299,7 +299,8 @@ def body(watch: ProjectWatch, at: dict, payload: dict, *, now: float | None = No
                                                   or entry.get("published_head") or "")[:12],
                                          entry.get("branch") or ""))
     if payload.get("errors"):
-        lines += ["", "Lectures impossibles (liste incomplète) :"]
+        # #3813 : une erreur propre à un lot laisse les autres composables.
+        lines += ["", "Lectures impossibles (lots à écarter) :"]
         lines += ["  %s" % error for error in payload["errors"]]
     fallback_at = _dt.datetime.fromtimestamp(
         (now if now is not None else float(at["at"]) + watch.grace_s)
