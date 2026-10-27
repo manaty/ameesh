@@ -332,6 +332,16 @@ class Agents(Domain):
         n'est prise ici, seulement la preuve de joignabilité."""
 
     @abc.abstractmethod
+    def stopped_with(self, reasons: Sequence[str]) -> list[str]:
+        """#3907 : les noms des agents `stopped` dont `stop_reason` est dans
+        `reasons`, triés ; aucune raison, aucune lecture.
+
+        Le balayage des agents arrêtés (#753) tourne à chaque passe de chaque
+        exécuteur, et une passe suit chaque NOTIFY du mesh : `overview()` y
+        coûtait 0,4 à 1,2 s et saturait la base commune (27/10, charge 44 sur
+        4 vCPU). Le filtre ne lit que deux colonnes du registre."""
+
+    @abc.abstractmethod
     def claimable(self, host: str, names: Sequence[str] | None, *,
                   require_responsible: bool) -> list[dict]:
         """Agents de l'hôte sans bail vivant, réclamables (mêmes règles que `claim`).

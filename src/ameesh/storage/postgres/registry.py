@@ -596,6 +596,19 @@ class Agents(interface.Agents):
             "  FROM agent_registry"
             " ORDER BY name")
 
+    def stopped_with(self, reasons) -> list[str]:
+        # #3907 : le balayage #753 de chaque passe ne lit plus `overview()` ;
+        # `status` et `stop_reason` sont les colonnes du registre que la vue
+        # recopie telles quelles.
+        reasons = sorted({str(reason) for reason in reasons or () if reason})
+        if not reasons:
+            return []
+        rows = self.db.query(
+            "SELECT name FROM agent_registry"
+            " WHERE status = 'stopped' AND stop_reason IN (%s)"
+            " ORDER BY name" % ", ".join(["%s"] * len(reasons)), tuple(reasons))
+        return [row["name"] for row in rows]
+
     def claimable(self, host, names, *, require_responsible) -> list[dict]:
         # L165 (EP1) : un agent `releve: election` est visible sur tout hôte
         # candidat, même si sa ligne est encore sur un autre. Le dossier et

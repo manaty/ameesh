@@ -4558,7 +4558,8 @@
     "operator_pause",
     "retire",
     "restore",
-    "reachability"
+    "reachability",
+    "stopped_with"
    ],
    "alert_acknowledgements": [
     "acknowledge",
