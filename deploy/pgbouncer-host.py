@@ -28,6 +28,7 @@ URL = f'https://www.pgbouncer.org/downloads/files/{VERSION}/pgbouncer-{VERSION}.
 APPROVED_OPERATORS = {
     'ameesh-agents-1': 'ameesh',
     'ameesh-agents-2': 'ameesh',
+    'ameesh-agents-3': 'ameesh',
 }
 #: Pool sizing (#532). Session mode holds one server session per client
 #: session, so a host of runners needs one client slot and one server slot per
@@ -36,11 +37,20 @@ APPROVED_OPERATORS = {
 #: then `no more connections allowed`): these are the values applied by hand on
 #: pc-smichea and kept here so a redeployment does not lower them again.
 #: `default_pool_size + reserve_pool_size` must not exceed
-#: `max_db_connections`; the three hosts stay under the server's 300.
+#: `max_db_connections`. #3965 preserves the existing three 80-slot pools
+#: and gives agents-3 32+8 slots: 80+80+80+40 = 280 < 300, with 20 slots
+#: left for direct administration/monitoring. Existing pools are not resized.
 MAX_CLIENT_CONN = 250
 DEFAULT_POOL_SIZE = 64
 RESERVE_POOL_SIZE = 16
 MAX_DB_CONNECTIONS = 80
+# Named runner hosts, including the workstation whose pool is installed separately.
+POOL_LIMITS = {
+    'pc-smichea': (64, 16, 80),
+    'ameesh-agents-1': (64, 16, 80),
+    'ameesh-agents-2': (64, 16, 80),
+    'ameesh-agents-3': (32, 8, 40),
+}
 
 
 def approved_home():
@@ -153,8 +163,11 @@ def socket_conninfo(dsn, socket_dir):
 TRACK_EXTRA_PARAMETERS = 'search_path,statement_timeout,jit'
 
 
-def pool_ini(dbname, upstream, port, *, socket_dir, auth_file, admin_user, tls):
+def pool_ini(dbname, upstream, port, *, socket_dir, auth_file, admin_user, tls, host=None):
     """The reviewed [pgbouncer] configuration, sizing included (#532)."""
+    default_pool, reserve_pool, max_db = POOL_LIMITS.get(
+        host or socket.gethostname(),
+        (DEFAULT_POOL_SIZE, RESERVE_POOL_SIZE, MAX_DB_CONNECTIONS))
     return f'''[databases]
 {dbname} = host={upstream} port={port} dbname={dbname}
 
@@ -172,10 +185,10 @@ server_tls_sslmode = {tls}
 server_idle_timeout = 30
 server_lifetime = 3600
 max_client_conn = {MAX_CLIENT_CONN}
-default_pool_size = {DEFAULT_POOL_SIZE}
-reserve_pool_size = {RESERVE_POOL_SIZE}
+default_pool_size = {default_pool}
+reserve_pool_size = {reserve_pool}
 reserve_pool_timeout = 5
-max_db_connections = {MAX_DB_CONNECTIONS}
+max_db_connections = {max_db}
 track_extra_parameters = {TRACK_EXTRA_PARAMETERS}
 log_connections = 0
 log_disconnections = 0

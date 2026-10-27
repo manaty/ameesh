@@ -213,7 +213,7 @@ class OperatorRecipe(unittest.TestCase):
                     with self.assertRaises(ValueError):
                         self.recipe.main()
                     mutation.assert_not_called()
-        for host in ('ameesh-agents-1', 'ameesh-agents-2'):
+        for host in ('ameesh-agents-1', 'ameesh-agents-2', 'ameesh-agents-3'):
             with mock.patch.object(self.recipe.socket, 'gethostname', return_value=host), \
                     mock.patch.object(self.recipe.os, 'getuid', return_value=1001), \
                     mock.patch.object(self.recipe.os, 'geteuid', return_value=1001), \
