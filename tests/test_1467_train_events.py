@@ -2,6 +2,7 @@
 """Train wake-up routing and commit visibility, with no live CI or train."""
 import json
 import threading
+import time
 import types
 import unittest
 from unittest import mock
@@ -9,6 +10,44 @@ from unittest import mock
 from ameesh import ci, storage, train_events, train_runner, train_store, work
 from ameesh.runner import Runner
 from .support import PgTestCase
+
+
+class OwnNamespaceListener:
+    """Filtre d'écoute des tests : le canal est commun, le schéma ne l'est pas.
+
+    `ameesh_train` est un canal NOTIFY de la base entière : un test d'une autre
+    classe (autre schéma) peut livrer son réveil pendant une attente. La
+    production filtre déjà par namespace (`train_events.receive`) ; les tests
+    qui inspectent l'enveloppe brute font de même ici, sinon un message
+    étranger satisfait (ou casse) leurs attentes négatives (#3933).
+    """
+
+    def __init__(self, listener, namespace):
+        self.listener = listener
+        self.namespace = namespace
+
+    def own(self, item):
+        if not isinstance(item, dict):
+            return True
+        if "event" in item:  # panne de l'écouteur : jamais avalée
+            return True
+        try:
+            signal = json.loads(item.get("payload"))
+        except (TypeError, ValueError, RecursionError, UnicodeError):
+            return False
+        return isinstance(signal, dict) and signal.get("namespace") == self.namespace
+
+    def wait(self, timeout):
+        deadline = time.monotonic() + timeout
+        while True:
+            item = self.listener.wait(max(0.0, deadline - time.monotonic()))
+            if item is None or self.own(item):
+                return item
+            if time.monotonic() >= deadline:
+                return None
+
+    def close(self):
+        self.listener.close()
 
 
 class TrainEventRoutingTest(unittest.TestCase):
@@ -108,6 +147,9 @@ class TrainEventRoutingTest(unittest.TestCase):
 
 
 class TrainEventTransactionTest(PgTestCase):
+    #: schéma d'un test d'une autre classe, sur le même canal (database-wide)
+    FOREIGN_NAMESPACE = "t_other_3933"
+
     def setUp(self):
         super().setUp()
         self.db.execute("TRUNCATE ci_runs, merge_locks RESTART IDENTITY CASCADE")
@@ -116,12 +158,33 @@ class TrainEventTransactionTest(PgTestCase):
         listener = storage.of(self.db).wakeups.subscribe([train_events.CHANNEL])
         self.assertIsNotNone(listener, "LISTEN is required for train event qualification")
         self.addCleanup(listener.close)
-        return listener
+        return OwnNamespaceListener(listener, self.cfg.schema)
 
     def emit(self, db, **fields):
         args = dict(kind="verdict", project="event-test", target="main")
         args.update(fields)
         train_events.emit(db, **args)
+
+    def foreign_hint(self):
+        return json.dumps(dict(schema=train_events.SCHEMA,
+                               namespace=self.FOREIGN_NAMESPACE, kind="verdict",
+                               project="event-test", target="main"))
+
+    def test_other_namespace_hint_during_wait_is_ignored(self):
+        listener = self.listener()
+        # Le canal est commun à toute la base : une transaction d'un autre
+        # schéma peut livrer son réveil pendant l'attente. La file du même
+        # producteur garde l'ordre, donc l'écouteur pré-#3933 rend le message
+        # étranger ici.
+        self.db.execute("SELECT pg_notify(%s, %s)",
+                        (train_events.CHANNEL, self.foreign_hint()))
+        self.emit(self.db)
+        item = listener.wait(3)
+        self.assertIsNotNone(item)
+        self.assertEqual(json.loads(item["payload"])["namespace"], self.cfg.schema,
+                         "a hint from another namespace satisfied this test's wait")
+        self.assertIsNone(listener.wait(0.1),
+                          "a hint from another namespace failed a negative wait")
 
     def test_committed_event_schedules_fresh_passage_reading_the_committed_state(self):
         listener = self.listener()
