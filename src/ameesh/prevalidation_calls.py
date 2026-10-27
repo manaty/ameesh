@@ -15,7 +15,9 @@ classes, contrats, hôtes, délai, lanceur de part) :
   demande part (décision pilote 19/10) ;
 * ``after_freeze`` au jalon ``frozen`` : le rapport est attaché à la tête
   gelée, le gel n'est jamais refusé ni perdu (il est déjà écrit quand ce
-  module s'exécute) ; une indisponibilité est journalisée ;
+  module s'exécute) ; une indisponibilité est journalisée ; son échéance est
+  plafonnée par celle du **gel entier** (#4073), qui couvre aussi les
+  contrôles statiques passés avant lui ;
 * ``gate_train`` dans le passage du train, avant publication : un rouge
   arrête la publication, une indisponibilité est journalisée et la CI reste
   la preuve finale ; son passage entier est borné sous ``land.LOCK_TTL_S``
@@ -95,12 +97,36 @@ TRAIN_CLEANUP_TIMEOUT = 120
 #: la régler (``--prevalidation-budget``) ; épuisée, elle est ``run-incomplete``
 #: (« timeout »), indisponible, jamais un rouge.
 CALLER_BUDGET_S = 420.0
+#: #4073 : budget entier du geste ``work milestone ... frozen`` — contrôles
+#: statiques du gel ([`freeze_checks.TIMEOUT`], 300 s) puis prévalidation,
+#: sous le même ``FREEZE_TIMEOUT`` de 600 s du compositeur. Les deux étapes
+#: partagent cette échéance au lieu d'additionner leurs plafonds (300 + 420) ;
+#: la marge de 30 s couvre le démarrage du processus et la sortie.
+FREEZE_BUDGET_S = 570.0
 
 
-def caller_deadline(budget: float | None = None, clock=time.monotonic) -> Deadline:
-    """L'échéance d'une prévalidation appelée par un gel ou un ``ci run``."""
+def caller_deadline(budget: float | None = None, clock=time.monotonic,
+                    limit: Deadline | None = None) -> Deadline:
+    """L'échéance d'une prévalidation appelée par un gel ou un ``ci run``.
+
+    ``limit`` (#4073) plafonne le budget par le temps qui reste d'une échéance
+    déjà commencée — celle du gel entier, contrôles statiques compris.
+    """
     seconds = CALLER_BUDGET_S if budget is None else float(budget)
+    if limit is not None:
+        seconds = min(seconds, limit.remaining())
     return Deadline(max(0.0, seconds), clock=clock)
+
+
+def freeze_deadline(clock=time.monotonic) -> Deadline:
+    """L'échéance du geste ``work milestone ... frozen`` entier (#4073).
+
+    Elle commence avant les contrôles statiques et se partage entre eux et la
+    prévalidation, pour que la commande rende la main sous les 600 s du
+    compositeur (``FREEZE_TIMEOUT`` de paquet-auto, ``COMMAND_TIMEOUT`` de
+    paquet-horaire).
+    """
+    return Deadline(FREEZE_BUDGET_S, clock=clock)
 
 
 def _timeout_error(deadline: Deadline, where: str) -> prevalidation.PrevalidationError:
@@ -1200,6 +1226,10 @@ def gate_train(cfg, *, repo: str, head: str, base: str, canon_repo: str = "",
             if cleanup:
                 shutil.rmtree(cleanup, ignore_errors=True)
     except prevalidation.PrevalidationError as exc:
+        # #2644/#4073 : un rouge levé (rapport, hôte ou contrat) n'est pas une
+        # indisponibilité ; le train ne publie pas.
+        if exc.cause == "run-red":
+            raise
         return {"state": "unavailable", "cause": exc.cause,
                 "why": _timed_out(deadline, exc.why)}
     except Exception as exc:  # noqa: BLE001 - panne d'outillage : indisponible

@@ -2818,6 +2818,13 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
             return 0
         if args.work_command == "milestone":
             from . import review_designation_activation as activation
+            from . import prevalidation_calls
+            # #4073 : une seule échéance pour le geste de gel entier, créée
+            # avant les contrôles statiques ; la prévalidation ne reçoit que ce
+            # qui reste, sous son propre plafond d'appelant, pour que la
+            # commande rende la main sous les 600 s du compositeur.
+            freeze_deadline = (prevalidation_calls.freeze_deadline()
+                               if args.kind == "frozen" else None)
             outcome: dict = {}
             note = _note_arg(args.note)
             sha = args.sha or ""
@@ -2833,7 +2840,8 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                 from . import freeze_checks
                 note = freeze_checks.before_freeze(
                     cfg, db, args.id, sha, repo=args.repo,
-                    skip=args.no_static_checks, note=note)
+                    skip=args.no_static_checks, note=note,
+                    deadline=freeze_deadline)
             elif args.no_static_checks is not None or args.prevalidation_map:
                 raise work.WorkError("--no-static-checks and --prevalidation-map "
                                      "only apply to a freeze")
@@ -2912,13 +2920,13 @@ def cmd_work(cfg: Config, args: argparse.Namespace) -> int:
                 # le jalon et la désignation. Il ne défait jamais le gel : le
                 # run peut être rouge, incomplet ou indisponible, la frise est
                 # déjà écrite et l'échec est journalisé.
-                from . import prevalidation_calls
                 prevalidation_calls.after_freeze(
                     cfg, db, args.id, row.get("sha") or args.sha or "",
                     repo=args.repo or "",
                     map_path=args.prevalidation_map or "",
                     deadline=prevalidation_calls.caller_deadline(
-                        getattr(args, "prevalidation_budget", None)))
+                        getattr(args, "prevalidation_budget", None),
+                        limit=freeze_deadline))
             return 0
         print(USAGE_HINT % "unknown work subcommand", file=sys.stderr)
         return 2

@@ -1013,6 +1013,25 @@ class GateTrainTest(unittest.TestCase):
         self.assertEqual(caught.exception.cause, "run-red")
         self.assertIn("tests.test_x", caught.exception.why)
 
+    def test_a_run_red_raised_inside_the_try_is_not_downgraded(self):
+        # #4073 : la garde #2644 doit rester — un run-red levé par une étape
+        # (hôte, contrat, arbre) n'est pas une indisponibilité ; le train ne
+        # publie pas. Sans la garde, `gate_train` rendrait `unavailable`.
+        prepared = SimpleNamespace(close=lambda *a, **kw: None)
+        with mock.patch.object(calls, "parameters",
+                               return_value=calls.Parameters(
+                                   params=params(), repo="/canon",
+                                   commit="c" * 40, project="ameesh")), \
+                mock.patch.object(calls, "map_for", return_value=("", "")), \
+                mock.patch.object(calls, "prepare", return_value=prepared), \
+                mock.patch.object(calls, "_run_hosts",
+                                  side_effect=pv.PrevalidationError(
+                                      "run-red", "tests.test_x")):
+            with self.assertRaises(pv.PrevalidationError) as caught:
+                calls.gate_train(None, repo="/repo", head="a" * 40, base="b" * 40)
+        self.assertEqual(caught.exception.cause, "run-red")
+        self.assertIn("tests.test_x", caught.exception.why)
+
 
 class CallerDeadlineTest(unittest.TestCase):
     """#4067 : le gel et ``ci run`` rendent la main sous le délai du compositeur.
@@ -1154,6 +1173,40 @@ class CallerDeadlineTest(unittest.TestCase):
         self.assertLessEqual(seen["timeout"],
                              calls.CALLER_BUDGET_S + pv.OFFLOAD_LOCAL_GRACE_S)
         self.assertEqual(got["outcome"], "run-incomplete")
+
+    def test_the_freeze_budget_stays_under_the_composer_timeout(self):
+        # #4073 : le gel entier (contrôles statiques + prévalidation) doit
+        # rendre la main sous les 600 s du compositeur, et ne pas raccourcir
+        # la prévalidation quand les contrôles sont rapides.
+        self.assertLess(calls.FREEZE_BUDGET_S, 600)
+        self.assertGreaterEqual(calls.FREEZE_BUDGET_S, calls.CALLER_BUDGET_S)
+
+    def test_the_freeze_budget_caps_the_caller_deadline(self):
+        # 300 s de contrôles statiques : il reste 270 s de prévalidation, pas
+        # le budget d'appelant de 420 s.
+        self.now[0] = 1000.0
+        limit = calls.freeze_deadline(clock=self.clock)
+        self.now[0] += 300.0
+        deadline = calls.caller_deadline(clock=self.clock, limit=limit)
+        self.assertLessEqual(deadline.remaining(), calls.FREEZE_BUDGET_S - 300.0)
+        self.assertLessEqual(deadline.remaining(), calls.CALLER_BUDGET_S)
+        # un budget d'appelant plus court reste prioritaire
+        smaller = calls.caller_deadline(90, clock=self.clock, limit=limit)
+        self.assertLessEqual(smaller.remaining(), 90.0)
+
+    def test_an_expired_freeze_budget_launches_no_offload(self):
+        # L'échéance du gel entier épuisée : aucune prévalidation ne part.
+        self.now[0] = 1000.0
+        limit = calls.freeze_deadline(clock=self.clock)
+        self.now[0] += calls.FREEZE_BUDGET_S
+        deadline = calls.caller_deadline(clock=self.clock, limit=limit)
+        self.assertTrue(deadline.expired())
+        with mock.patch.object(pv, "validate") as validate:
+            got = calls.after_freeze(None, object(), 4052, "a" * 40,
+                                     deadline=deadline)
+        validate.assert_not_called()
+        self.assertEqual(got["state"], "unavailable")
+        self.assertTrue(got["why"].startswith("timeout"), got["why"])
 
 
 class DeadlineTest(unittest.TestCase):
