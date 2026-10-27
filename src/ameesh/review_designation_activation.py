@@ -855,8 +855,9 @@ def corrections_of_head(db, item: Mapping, milestone: Optional[Mapping],
     _authors, unknown, correctors = attribution_of_head(
         db, item, milestone, repo, base, head, families=families)
     if unknown:
-        raise ActivationError("author provenance unknown for frozen commit(s): %s"
-                              % ", ".join(unknown))
+        # #3835 : nommer le gel antérieur et le lot qui portent l'inconnu.
+        raise ActivationError(
+            review_authors.unknown_refusal(unknown, head_sha=head))
     return correctors
 
 

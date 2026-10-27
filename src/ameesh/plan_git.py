@@ -231,8 +231,21 @@ REMOTE_TIP_FETCH_BUDGET = 16
 REMOTE_EXTRA_TIP_FETCH_BUDGET = 512
 
 
+def _doubt_reason(exc: BaseException) -> str:
+    """Le motif d'un doute de lecture, pour que le refus le dise (#3835).
+
+    ``"timeout"`` est le seul motif qui n'est pas une preuve d'illisibilité :
+    un appelant qui le reçoit ne doit pas le présenter comme un dépôt cassé,
+    mais comme un relevé qui n'a pas conclu dans le délai."""
+    text = str(exc)
+    if "timed out" in text:
+        return "timeout"
+    return text
+
+
 def ref_reachable(repo: str, rev: str, *,
-                  timeout: float | None = REACHABLE_TIMEOUT_S) -> bool | None:
+                  timeout: float | None = REACHABLE_TIMEOUT_S,
+                  why: list[str] | None = None) -> bool | None:
     """`rev` est-il contenu par une **ref** de `repo` (#3399) ?
 
     `True` : au moins une ref locale (`refs/heads`, `refs/remotes`,
@@ -246,22 +259,88 @@ def ref_reachable(repo: str, rev: str, *,
     un `rev-parse` qui lit un objet pendant) de son accessibilité. #3399 : un
     force-push retire le commit de toute ref sans l'élaguer ; le remplacer ne
     doit donc plus être refusé par la seule présence dans l'ODB. La lecture
-    est locale et sans fetch paresseux (`for-each-ref --contains`, un seul
-    processus) ; un délai ou un dépôt illisible rend `None`, jamais `False`.
+    est locale et sans fetch paresseux ; un délai ou un dépôt illisible rend
+    `None`, jamais `False`.
+
+    #3835 : `for-each-ref --contains` coûte ~8 s sur un clone de 5 500 refs
+    (mesuré sur un clone nexlink ; le commit-graph n'y change rien). `name-rev
+    --name-only` élague par date de commit et rend `undefined` pour un ancêtre
+    dont l'enfant est daté avant lui (faux négatif prouvé par ameesh-cx1 et
+    l'auditeur). `--annotate-stdin` désactive cette coupure : il nomme le
+    commit si une ref le contient, et rend le SHA tel quel sinon. On résout
+    d'abord la révision en commit complet (une abréviation n'est pas
+    substituée et se lirait « absente »), puis on lit l'annotation en ~0,3 s.
+    Un SHA rendu inchangé est une absence, sauf si une ref porte exactement ce
+    nom de SHA (cas pathologique) : on retombe alors, comme sur un échec de
+    `name-rev`, sur `for-each-ref --contains`, la preuve de référence. `why`
+    reçoit le motif d'un `None` (`"timeout"` ou le message git) : un délai se
+    dit comme tel au lieu d'être confondu avec un dépôt illisible.
 
     Ne voit que les refs **locales** : les refs distantes non rapatriées
     (toute l'annonce : tags, branches hors refspec, `refs/archive/…`,
     `refs/pull/N/head`) sont couvertes par [`remote_reachable`] (#3399 B1)."""
     rev = str(rev or "").strip()
     if not repo or not rev or rev.startswith("-") or not os.path.isdir(repo):
+        if why is not None:
+            why.append("repository or commit unreadable")
         return None
     bound = {} if timeout is None else {"timeout": timeout}
+
+    def doubt(exc: BaseException) -> None:
+        if why is not None:
+            why.append(_doubt_reason(exc))
+
+    # `--annotate-stdin` ne substitue que des SHA complets : une abréviation
+    # serait rendue telle quelle et lue à tort comme une absence.
     try:
-        proc = _git(repo, "for-each-ref", "--contains=" + rev,
+        full = _commit(repo, rev, timeout=PROBE_TIMEOUT_S)
+    except GitError as exc:
+        doubt(exc)
+        return None
+    if not full:
+        if why is not None:
+            why.append("commit not found")
+        return None
+
+    # #3835 : chemin rapide. `name-rev` couvre toutes les refs (y compris
+    # `refs/ameesh/…`, `refs/pull/…`), pas seulement heads/tags/remotes, et
+    # `--annotate-stdin` désactive l'élagage par date.
+    try:
+        fast = _git(repo, "name-rev", "--annotate-stdin", "--name-only",
+                    stdin=(full + "\n").encode(),
+                    env_extra=NO_LAZY_FETCH, **bound)
+    except GitError as exc:
+        if _doubt_reason(exc) == "timeout":
+            doubt(exc)
+            return None
+        # échec non temporel : la lecture de référence tranche
+    except OSError as exc:
+        doubt(exc)
+        return None
+    else:
+        if fast.returncode == 0:
+            name = fast.stdout.decode("utf-8", "replace").strip()
+            if name and name != full:
+                return True
+            if name == full:
+                # Un SHA rendu inchangé est une absence, sauf si une ref dont
+                # le nom court est exactement ce SHA le contient : `name-rev`
+                # rendrait alors le même texte. Ce seul cas va à la référence.
+                clash = _out(repo, "for-each-ref", "--format=%(refname)",
+                             "refs/heads/" + full, "refs/" + full)
+                if clash is not None and not clash.strip():
+                    return False
+    # `name-rev` ambigu, vide ou en échec : la lecture de référence tranche.
+    try:
+        proc = _git(repo, "for-each-ref", "--contains=" + full,
                     "--format=%(refname)", env_extra=NO_LAZY_FETCH, **bound)
-    except (GitError, OSError):
+    except (GitError, OSError) as exc:
+        doubt(exc)
         return None
     if proc.returncode != 0:
+        if why is not None:
+            why.append("`git for-each-ref --contains` failed (code %d)"
+                       % proc.returncode)
         return None
     return bool(proc.stdout.strip())
 

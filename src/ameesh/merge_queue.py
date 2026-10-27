@@ -599,7 +599,7 @@ def _attribution_on_freeze(db, marks, frozen, *, repo, klass, item, families=Non
         return None
     if commits is None and not base:
         return None
-    from . import review_designation_activation as act
+    from . import review_authors, review_designation_activation as act
     milestone = _freeze_milestone(marks, frozen, repo)
     authors, unknown, correctors = act.attribution_of_head(
         db, item, milestone, repo, base, frozen, families=families or (),
@@ -607,8 +607,9 @@ def _attribution_on_freeze(db, marks, frozen, *, repo, klass, item, families=Non
         target=target or base, admitted_heads=tuple(admitted_heads),
         exclusions_out=exclusions_out)
     if unknown:
-        raise ValueError("author provenance unknown for frozen commit(s): %s"
-                         % ", ".join(unknown))
+        # #3835 : nommer le gel antérieur et le lot qui portent l'inconnu, et
+        # ne proposer `--supersedes` que pour un gel prouvé hors de toute ref.
+        raise ValueError(review_authors.unknown_refusal(unknown, head_sha=frozen))
     return authors, correctors
 
 
@@ -1923,6 +1924,12 @@ def _complete_authors(db, item, frozen, repo: str | None, target: str | None,
             # doit pas être silencieusement ignoré : la porte refuse fermé.
             fallback = _commit_author(places, sha)
             if not fallback:
+                if isinstance(sha, review_authors.PriorFreezeUnknown):
+                    # #3835 : un inconnu d'un gel antérieur nomme son gel, son
+                    # SHA et son lot, et propose `--supersedes` quand il est
+                    # prouvé hors de toute ref.
+                    raise _ProvenanceError(
+                        review_authors.unknown_refusal([sha], head_sha=frozen))
                 raise _ProvenanceError(
                     "historical author unreadable for the unknown %s" % sha)
             add(fallback)
