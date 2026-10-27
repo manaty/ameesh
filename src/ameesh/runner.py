@@ -1142,11 +1142,19 @@ class AgentWorker(threading.Thread):
         self._restart_reserved = True
         from . import election, role_handover_pg
         try:
-            role_handover_pg.reserve_restart(self.db, runner_obj.host, self.name,
-                                             election.RESTART_RESERVE_S)
+            # B1 de la relecture : gardée en base par le bail vivant exact
+            # (propriétaire + epoch) — un bail échu repris ailleurs sans que
+            # ce worker l'ait vu n'écrit rien.
+            written = role_handover_pg.reserve_restart(
+                self.db, runner_obj.host, self.name, election.RESTART_RESERVE_S,
+                owner=runner_obj.runner_id, epoch=self.epoch)
         except Exception as exc:  # noqa: BLE001 - confort, jamais une garde d'arrêt
             log_async("[%s] restart reservation not recorded (%s)"
                       % (self.name, db_mod.brief(exc)))
+            return
+        if not written:
+            log_async("[%s] restart reservation skipped: lease (epoch %d) no longer ours"
+                      % (self.name, self.epoch))
             return
         log_async("[%s] elected role reserved to %s for %ds (executor restart)"
                   % (self.name, runner_obj.host, int(election.RESTART_RESERVE_S)))
@@ -9365,12 +9373,12 @@ class Runner:
                     now_mono + (until - now_ts))
 
     def _clear_restart_reservation(self, name: str) -> None:
-        """#4086 : le rôle est repris ; une réservation de redémarrage de cet
-        hôte est consommée (sinon elle retiendrait encore le challenger d'une
-        bascule planifiée qui suivrait). Échec : elle expire d'elle-même."""
+        """#4086 : le rôle est repris ; toute réservation de redémarrage est
+        consommée (sinon elle retiendrait encore le challenger d'une bascule
+        planifiée qui suivrait). Échec : elle expire d'elle-même."""
         from . import role_handover_pg as pg
         try:
-            pg.clear_restart(self.db, self.host, name)
+            pg.clear_restart(self.db, name)
         except Exception as exc:  # noqa: BLE001 - la réservation est bornée
             log_async("[%s] restart reservation not cleared (%s)"
                       % (name, db_mod.brief(exc)))

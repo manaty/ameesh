@@ -67,21 +67,45 @@ def release(db, host: str, name: str, challenger: str, ttl_s: float) -> None:
         """, (host, name, challenger, max(0.0, float(ttl_s))))
 
 
-def reserve_restart(db, host: str, name: str, ttl_s: float) -> None:
+def reserve_restart(db, host: str, name: str, ttl_s: float, *,
+                    owner: str, epoch: int) -> bool:
     """#4086: `host` stops while holding `name` and reserves it for `ttl_s`.
 
     Written BEFORE the lease is returned, so no candidate sees the role free
-    without the reservation. A later reservation of the same host replaces it.
+    without the reservation. B1 of the review: written only while `owner`
+    holds the exact live lease `epoch`, under the registry row lock that
+    `registry.claim` takes first. A worker whose lease expired and was taken
+    elsewhere, without having seen it, writes nothing. Returns whether the
+    reservation was written.
     """
-    release(db, host, name, RESTART, ttl_s)
+    rows = db.query(
+        """
+        WITH holder AS (
+            SELECT name FROM agent_registry
+             WHERE name = %s AND lease_owner = %s AND lease_epoch = %s
+               AND lease_expires_at > clock_timestamp()
+               FOR UPDATE
+        )
+        INSERT INTO role_handover (host, name, challenger, released_until)
+        SELECT %s, holder.name, %s,
+               clock_timestamp() + make_interval(secs => %s::float8)
+          FROM holder
+        ON CONFLICT (host, name, challenger) DO UPDATE
+           SET released_until = excluded.released_until,
+               updated_at = now()
+        RETURNING host
+        """, (name, owner, int(epoch), host, RESTART, max(0.0, float(ttl_s))))
+    return bool(rows)
 
 
 def restart_reservation(db, name: str) -> dict | None:
     """#4086: the live restart reservation of `name`, if any.
 
     `{"host", "left_s"}` on the database clock (`clock_timestamp()`, not the
-    reader's transaction start). The latest one wins when two hosts stopped
-    in turn: only the last holder can have held the lease.
+    reader's transaction start). Each one was written under the exact live
+    lease of its host (`reserve_restart`) and any claim consumes them all
+    (`clear_restart`), so a live one names the last holder; the latest wins
+    all the same.
     """
     rows = db.query(
         """
@@ -96,11 +120,11 @@ def restart_reservation(db, name: str) -> dict | None:
     return rows[0] if rows else None
 
 
-def clear_restart(db, host: str, name: str) -> None:
-    """#4086: `host` holds `name` again; its reservation is spent."""
+def clear_restart(db, name: str) -> None:
+    """#4086: `name` is held again; every restart reservation of it is spent."""
     db.execute(
-        "DELETE FROM role_handover WHERE host = %s AND name = %s AND challenger = %s",
-        (host, name, RESTART))
+        "DELETE FROM role_handover WHERE name = %s AND challenger = %s",
+        (name, RESTART))
 
 
 def prune(db, *, keep_s: float = HISTORY_S) -> int:

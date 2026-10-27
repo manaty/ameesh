@@ -35,6 +35,9 @@ class RestartReservationTest(_RoleCase):
 
     def worker(self, obj):
         row = self.hold("pilote", "banc", epoch=7, expires_in=300)
+        self.db.execute("UPDATE agent_registry SET lease_owner = %s WHERE name = 'pilote'",
+                        (obj.runner_id,))
+        row = registry.get(self.db, "pilote")
         worker = runner.AgentWorker(obj, registry.get(self.db, "pilote"), row)
         self.addCleanup(worker.watchdog_stop.set)
         return worker
@@ -101,13 +104,54 @@ class RestartReservationTest(_RoleCase):
         once.stop.set()
         self.assertFalse(once.restart_pending())
 
-    def test_la_reprise_consomme_la_reservation(self):
-        handover_pg.reserve_restart(self.db, "banc", "pilote", 90.0)
+    def test_ancien_epoch_repris_ailleurs_ne_reserve_pas(self):
+        # B1 de la relecture : le bail de banc a échu et atelier l'a repris ;
+        # le worker de banc ne l'a pas vu (`lease_lost` reste faux).
         obj = self.runner()
+        worker = self.worker(obj)
+        self.db.execute(
+            "UPDATE agent_registry SET host = 'atelier', lease_owner = 'runner-atelier',"
+            " lease_epoch = 8, lease_expires_at = clock_timestamp() + interval '5 minutes'"
+            " WHERE name = 'pilote'")
+        self.assertFalse(worker.lease_lost.is_set())
+        obj.draining.set()
+        worker.release_lease()
+        self.assertIsNone(self.reserved())
+        self.assertEqual(registry.get(self.db, "pilote")["lease_epoch"], 8)
+
+    def test_bail_echu_non_repris_ne_reserve_pas(self):
+        obj = self.runner()
+        worker = self.worker(obj)
+        self.db.execute("UPDATE agent_registry"
+                        " SET lease_expires_at = clock_timestamp() - interval '1 second'"
+                        " WHERE name = 'pilote'")
+        obj.draining.set()
+        worker.release_lease()
+        self.assertIsNone(self.reserved())
+
+    def test_reservation_gardee_par_proprietaire_et_epoch(self):
+        obj = self.runner()
+        self.worker(obj)  # bail vivant de obj, epoch 7
+        self.assertFalse(handover_pg.reserve_restart(
+            self.db, "banc", "pilote", 90.0, owner=obj.runner_id, epoch=6))
+        self.assertFalse(handover_pg.reserve_restart(
+            self.db, "banc", "pilote", 90.0, owner="autre", epoch=7))
+        self.assertIsNone(self.reserved())
+        self.assertTrue(handover_pg.reserve_restart(
+            self.db, "banc", "pilote", 90.0, owner=obj.runner_id, epoch=7))
+        self.assertEqual(self.reserved()["host"], "banc")
+
+    def test_la_reprise_consomme_la_reservation(self):
+        obj = self.runner()
+        self.worker(obj)
+        lease = dict(owner=obj.runner_id, epoch=7)
+        handover_pg.reserve_restart(self.db, "banc", "pilote", 90.0, **lease)
+        handover_pg.reserve_restart(self.db, "atelier", "pilote", 90.0, **lease)
+        # Toute reprise, de quelque hôte, consomme toutes les réservations.
         obj._clear_restart_reservation("pilote")
         self.assertIsNone(self.reserved())
         # Le chargeur des marques de bascule ne lit jamais la réservation.
-        handover_pg.reserve_restart(self.db, "banc", "pilote", 90.0)
+        handover_pg.reserve_restart(self.db, "banc", "pilote", 90.0, **lease)
         self.assertEqual(handover_pg.load(self.db, "banc"), [])
 
 
