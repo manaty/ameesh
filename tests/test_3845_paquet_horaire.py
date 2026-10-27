@@ -489,42 +489,81 @@ class FreshTest(unittest.TestCase):
 
 
 class SchemaTest(unittest.TestCase):
-    """#4075 : le tic pose les migrations additives de la tête avant tout geste."""
+    """#4075 : le tic pose les migrations additives de la tête avant tout geste ;
+    un refus nomme les migrations, ouvre un lot d'empreinte et écrit au pilote
+    et au bureau, une fois par empreinte."""
 
-    def ctx(self, rc, out="", *, dry_run=False):
-        calls = []
+    ADDITIVE = "0499_operator_pause_until: additive\n"
 
-        class Py:
-            def run(self, cmd, **kw):
+    def ctx(self, read=(0, ""), apply=(0, "1 migration(s) applied\n"), *,
+            dry_run=False, created=True):
+        calls, mails = [], []
+
+        class Sh:
+            def run(self, cmd, input_text=None, **kw):
                 calls.append(cmd)
+                if cmd[0] == "agent-mail":
+                    mails.append((cmd[2], cmd, input_text))
+                    return ph.Result(0)
+                if cmd[0] == "ameesh":
+                    return ph.Result(0, json.dumps({"created": created, "lot": 4100}))
+                rc, out = read if cmd[-1] == "--dry-run" else apply
                 return ph.Result(rc, out, "")
-        return ph.Context(repo=ROOT, target="main", project="ameesh", pilot="p",
-                          actor="p", shell=Py(), python="python3", zone=ZONE,
-                          dry_run=dry_run), calls
+        ctx = ph.Context(repo=ROOT, target="main", project="ameesh", pilot="mesh-design",
+                         actor="mesh-design", shell=Sh(), python="python3", zone=ZONE,
+                         dry_run=dry_run)
+        return ctx, calls, mails
+
+    def test_a_jour_une_seule_lecture(self):
+        ctx, calls, mails = self.ctx(read=(0, "schema up to date: no migration to apply\n"))
+        ph.align_schema(ctx)
+        self.assertEqual([c[-1] for c in calls], ["--dry-run"])
+        self.assertEqual((ctx.log, mails), ([], []))
 
     def test_pose_additive_depuis_le_src_du_clone(self):
-        ctx, calls = self.ctx(0, "0499_operator_pause_until applied\n1 migration(s) applied\n")
+        ctx, calls, mails = self.ctx(read=(0, self.ADDITIVE))
         ph.align_schema(ctx)
-        self.assertEqual(calls[0][:2], ["python3", "-c"])
-        self.assertEqual(calls[0][3:], [str(ROOT / "src"), "--additive-only"])
-        self.assertTrue(any("0499" in line for line in ctx.log))
+        self.assertEqual(calls[1][:2], ["python3", "-c"])
+        self.assertEqual(calls[1][3:], [str(ROOT / "src"), "--additive-only"])
+        self.assertTrue(any("0499_operator_pause_until" in line for line in ctx.log))
+        self.assertEqual(mails, [])
 
-    def test_a_jour_silencieux(self):
-        ctx, _ = self.ctx(0, "schema up to date: no migration to apply\n")
-        ph.align_schema(ctx)
-        self.assertEqual(ctx.log, [])
+    def test_non_additive_jamais_posee(self):
+        ctx, calls, mails = self.ctx(read=(0, self.ADDITIVE + "0500_x: NOT additive — drop column\n"))
+        with self.assertRaises(ph.HoraireError) as caught:
+            ph.align_schema(ctx)
+        self.assertNotIn("--additive-only", [c[-1] for c in calls])
+        self.assertIn("0500_x", str(caught.exception))
+        self.assertEqual([m[0] for m in mails], ["mesh-design", "bureau"])
 
-    def test_non_additive_ou_echec_aucun_geste(self):
-        for rc in (3, 1):
-            ctx, _ = self.ctx(rc, "0500_x: NOT additive — DROP COLUMN")
-            with self.assertRaises(ph.HoraireError) as caught:
-                ph.align_schema(ctx)
-            self.assertIn("0500", str(caught.exception))
+    def test_droit_ddl_absent_nomme_et_alerte(self):
+        ctx, calls, mails = self.ctx(
+            read=(0, self.ADDITIVE),
+            apply=(1, "migration failed: permission denied for table work_items\n"))
+        with self.assertRaises(ph.HoraireError) as caught:
+            ph.align_schema(ctx)
+        text = str(caught.exception)
+        self.assertIn("0499_operator_pause_until", text)
+        self.assertIn("droit DDL", text)
+        fingerprint = [c for c in calls if c[0] == "ameesh"][0]
+        self.assertEqual(fingerprint[1:4], ["work", "fingerprint", "open"])
+        self.assertIn("paquet-horaire:schema:droit-ddl:0499_operator_pause_until", fingerprint)
+        self.assertEqual([m[0] for m in mails], ["mesh-design", "bureau"])
+        self.assertIn("4100", mails[0][1])
+        self.assertIn("droit DDL", mails[0][2])
+
+    def test_empreinte_deja_ouverte_aucun_courrier(self):
+        ctx, _, mails = self.ctx(read=(0, self.ADDITIVE), apply=(1, "permission denied"),
+                                 created=False)
+        with self.assertRaises(ph.HoraireError):
+            ph.align_schema(ctx)
+        self.assertEqual(mails, [])
 
     def test_essai_lit_seulement(self):
-        ctx, calls = self.ctx(0, "0499_operator_pause_until: additive\n", dry_run=True)
+        ctx, calls, mails = self.ctx(read=(0, self.ADDITIVE), dry_run=True)
         ph.align_schema(ctx)
-        self.assertEqual(calls[0][-1], "--dry-run")
+        self.assertEqual([c[-1] for c in calls], ["--dry-run"])
+        self.assertEqual(mails, [])
 
     def test_code_reel_charge_le_src_donne(self):
         # Le code passé à `-c` importe `ameesh.cli` depuis argv[1] ; `--help`
