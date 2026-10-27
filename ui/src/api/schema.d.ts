@@ -131,7 +131,7 @@ export interface paths {
         };
         get?: never;
         put?: never;
-        /** Operator pause: finish this turn, start no new one */
+        /** Operator pause: finish this turn, start no new one; lifted at `until` (epoch; default: in 4h) unless `indefinite` */
         post: operations["post_agents_agent_pause"];
         delete?: never;
         options?: never;
@@ -1373,12 +1373,14 @@ export interface operations {
         requestBody: {
             content: {
                 "application/json": {
+                    indefinite?: boolean;
                     reason: string;
+                    until?: number;
                 };
             };
         };
         responses: {
-            /** @description Operator pause: finish this turn, start no new one */
+            /** @description Operator pause: finish this turn, start no new one; lifted at `until` (epoch; default: in 4h) unless `indefinite` */
             200: {
                 headers: {
                     [name: string]: unknown;

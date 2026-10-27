@@ -43,7 +43,9 @@ SIGNATURES = {
                        # tard comme état s'il est jugé utile à la supervision.
                        "operator_paused", "operator_pause_reason",
                        "operator_pause_by", "operator_pause_for",
-                       "operator_pause_at"},
+                       "operator_pause_at",
+                       # #3961 (0499) : échéance de la pause, même choix fermé.
+                       "operator_pause_until"},
     "agent_mesh_overview": {"public_key"},
     "key_holders": {"public_key"},     # #330
     "mesh_keys": {"public_key"},
@@ -62,7 +64,8 @@ SIGNATURES = {
                         "created_at", "done_at"},
     # L87b (0441) : journal des transitions de la pause opérateur.
     "operator_pause_events": {"id", "agent", "paused", "reason", "actor",
-                              "principal", "created_at"},
+                              "principal", "created_at",
+                              "until"},  # #3961 (0499)
     # L87c (0444): native-operator acknowledgement audit. Preserve the
     # migration's closed rights; this classification adds no GRANT.
     # (#1473/0457) : `perimeter` garde les seuils de l'accusé, même refus.

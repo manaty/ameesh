@@ -315,6 +315,7 @@ jobs:
       AMEESH_CI_HEAD: ${{ github.event.pull_request.head.sha || github.sha }}
       AMEESH_CI_LABEL: ${{ github.event.label.name }}
     outputs:
+      client_types: ${{ steps.client_types.outcome }}
       version_only: ${{ steps.plan.outputs.version_only }}
       docs_only: ${{ steps.plan.outputs.docs_only }}
       doc_readers: ${{ steps.plan.outputs.doc_readers }}
@@ -443,6 +444,18 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: python3 scripts/dispatch-guard.py
+      # #4036 : `ui` n'est pas requis. Cette vérification du contrat client
+      # passe donc dans plan, dont l'échec rougit l'agrégat requis `tests`.
+      # Avant les parts, sans build UI ni scripts d'installation npm.
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4
+        with:
+          node-version: "22"
+      - name: dépendances du générateur de types clients
+        working-directory: ui
+        run: npm ci --ignore-scripts --no-audit --no-fund
+      - name: types clients à jour
+        id: client_types
+        run: node ui/scripts/gen-api.mjs --check
       # the most recent map of main (a PR reads the caches of its base branch)
       - uses: actions/cache/restore@v4
         with:
@@ -1170,6 +1183,13 @@ jobs:
       - uses: actions/checkout@v4
         if: always()
         continue-on-error: true
+      - name: bilan des types clients
+        if: always()
+        env:
+          CLIENT_TYPES: ${{ needs.plan.outputs.client_types }}
+        run: |
+          printf 'Types clients à jour (gen-api --check, requis via plan) : **%s**.\n' \
+            "${CLIENT_TYPES:-non exécuté}" >> "$GITHUB_STEP_SUMMARY"
       - name: bilan des parts
         env:
           # #3251 : le classifieur publie le check de détail de l'agrégat.

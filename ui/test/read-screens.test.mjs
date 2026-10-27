@@ -122,6 +122,24 @@ test("a refused refresh clears a previous snapshot, reports the refusal and perm
   assert.match(text(el), /ada/);
 });
 
+test("a transient refresh failure keeps the last data with its age, not an error alone", async () => {
+  const { client } = fixture(); let failing = false;
+  const wrapped = { ...client, get: (path, opts) => {
+    if (failing) return Promise.reject(new ui.ApiError(503, "unavailable", "down"));
+    return client.get(path, opts);
+  } };
+  const el = await mount("ameesh-projects", wrapped);
+  assert.match(text(el), /ada/);
+  failing = true; await el.refresh(); await settle(el);
+  // #3892: the data is kept and its age is shown; no "cannot reach database" wall
+  assert.match(text(el), /ada/);
+  assert.match(text(el), /last data read at .+\(\d+ s ago\)/);
+  assert.doesNotMatch(text(el), /cannot reach its database/);
+  failing = false; el.shadowRoot.querySelector("button").click(); await settle(el);
+  assert.doesNotMatch(text(el), /last data read at/);
+  assert.match(text(el), /ada/);
+});
+
 test("an event during a request schedules a fresh snapshot after that request", async () => {
   const { client, streams } = fixture({}, { live: true }); let release, calls = 0;
   const wrapped = { ...client, get: async () => {

@@ -4557,6 +4557,7 @@
     "wake_check",
     "note_unleased",
     "operator_pause",
+    "operator_pause_expire",
     "retire",
     "restore",
     "reachability",

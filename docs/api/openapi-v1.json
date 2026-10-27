@@ -1675,10 +1675,17 @@
               "schema": {
                 "additionalProperties": false,
                 "properties": {
+                  "indefinite": {
+                    "type": "boolean"
+                  },
                   "reason": {
                     "maxLength": 2000,
                     "minLength": 1,
                     "type": "string"
+                  },
+                  "until": {
+                    "exclusiveMinimum": 0,
+                    "type": "number"
                   }
                 },
                 "required": [
@@ -1699,7 +1706,7 @@
                 }
               }
             },
-            "description": "Operator pause: finish this turn, start no new one"
+            "description": "Operator pause: finish this turn, start no new one; lifted at `until` (epoch; default: in 4h) unless `indefinite`"
           },
           "400": {
             "content": {
@@ -1792,7 +1799,7 @@
             "description": "database unavailable"
           }
         },
-        "summary": "Operator pause: finish this turn, start no new one"
+        "summary": "Operator pause: finish this turn, start no new one; lifted at `until` (epoch; default: in 4h) unless `indefinite`"
       }
     },
     "/api/v1/agents/{agent}/peek": {

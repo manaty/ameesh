@@ -85,7 +85,9 @@ test("a message is sent once to the shared conversation, then waits for the next
   const el = await mount(wrapped, { agent: "ada", lot: "7" });
   el.draft = "Please rebase"; await settle(el);
   el.shadowRoot.querySelector("form button").click(); await settle(el);
-  assert.match(text(el), /not sent \(unavailable\)/);
+  // #3892: a 5xx is not a refusal — the outcome is unknown, the message is kept
+  assert.match(text(el), /message is kept.*unavailable/i);
+  assert.doesNotMatch(text(el), /not sent/i);
   assert.equal(el.draft, "Please rebase");
   failing = false;
   // the thread now ends with the human's message
@@ -106,6 +108,28 @@ test("a message is sent once to the shared conversation, then waits for the next
   } finally {
     routes["/api/v1/threads/ameesh/7"][1].entries.pop();
   }
+});
+
+test("an in-progress send is reported as pending, never as a failure, and replays with its key", async () => {
+  const { client } = fixture();
+  const keys = [];
+  let first = true;
+  const wrapped = { ...client, post: async (path, options) => {
+    keys.push(options.headers["Idempotency-Key"]);
+    if (first) { first = false; throw new ui.ApiError(409, "idempotency_in_progress", "unknown"); }
+    return client.post(path, options);
+  } };
+  const el = await mount(wrapped, { agent: "ada", lot: "7" });
+  el.draft = "Status?"; await settle(el);
+  el.shadowRoot.querySelector("form button").click(); await settle(el);
+  // #3892: the outcome is unknown, not a refusal; the message and its key stay
+  assert.match(text(el), /send is in progress/i);
+  assert.doesNotMatch(text(el), /not sent/i);
+  assert.equal(el.draft, "Status?");
+  el.shadowRoot.querySelector("form button").click(); await settle(el);
+  assert.equal(keys.length, 2);
+  assert.equal(keys[0], keys[1]);   // the retry replays the same request
+  assert.equal(el.draft, "");
 });
 
 test("a refused send takes a fresh key: the stored refusal does not block the retry", async () => {

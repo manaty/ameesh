@@ -236,6 +236,8 @@ class FollowTest(Base):
         self.assertTrue(trace.startswith(ph.MARK_EXCLUDED + "h-20261027-04 porteur=#4000 "
                                          "run=77 tests=tests.test_x.T.test_a"))
         self.assertEqual(move[0][move[0].index("--actor") + 1], "mesh-design")
+        # #4043 : le retrait ne consomme pas de boucle d'auteur
+        self.assertIn("--package-exclusion", move[0])
         self.assertEqual(self.shell.ran("work", "move", "3807"), [])
 
     def test_transition_refusee_laisse_la_trace_en_note(self):

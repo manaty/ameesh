@@ -643,8 +643,13 @@ def wake_status(db: Db, cfg, name: str) -> tuple[bool, str, str]:
         # qui ne le prendra pas. `resume --operator` la lève nommément.
         reason = (row.get("operator_pause_reason") or "").strip()
         by = (row.get("operator_pause_by") or "").strip()
-        return False, ("%s is under operator pause%s%s"
-                       % (name, " by %s" % by if by else "",
+        # #3961 : le demandeur sait jusqu'à quand (code `operator_paused`)
+        until = row.get("operator_pause_until_ts")
+        if until:
+            from .agent_pause import until_label
+            until = " until %s" % until_label(until)
+        return False, ("%s is under operator pause%s%s%s"
+                       % (name, " by %s" % by if by else "", until or " (no deadline)",
                           ": %s" % reason if reason else "")), ""
     if not row.get("alive"):
         return False, "%s is an expired ephemeral agent" % name, ""

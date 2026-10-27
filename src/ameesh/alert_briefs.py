@@ -53,6 +53,9 @@ BRIEFED_TYPES = ("idle_capacity", "stale_lot", "plan_underused", "estimate_bias"
                  "budget_pause_long",
                  # #3969 : un compte invalide sur l'hôte — l'équipe le répare
                  "account_config_invalid",
+                 # #3961 : une pause opérateur restée posée (maintenance
+                 # oubliée) ; les orchestrateurs la lèvent ou la confirment
+                 "operator_pause_long", "operator_pause_host",
                  # #3036 : le courrier en souffrance part aux orchestrateurs
                  # VIVANTS ; le brief est ainsi suivi et re-tenté comme les
                  # autres, au lieu d'une remise unique à un hôte perdu.
@@ -740,6 +743,15 @@ def _budget_pause_long(alert: dict) -> str:
             % (alert.get("detail") or "?"))
 
 
+def _operator_pause(alert: dict) -> str:
+    """#3961 : une pause opérateur qui dure (un agent, ou la plupart des
+    agents d'un hôte). Aux orchestrateurs de l'équipe et aux auditeurs."""
+    return ("Operator pause still in place: %s. Expected action: check with whoever set it "
+            "(ameesh show <agent>) whether the maintenance is over; if so, lift it "
+            "(ameesh resume <agent> --operator --reason <reason>), otherwise hand the "
+            "agent's urgent lots to another agent." % (alert.get("detail") or "?"))
+
+
 def _rate_limited_chronic(alert: dict) -> str:
     """#3733 : des épisodes de débit courts, effacés par un succès, couvrent
     une bonne part de l'heure. Aux orchestrateurs de l'équipe et aux
@@ -1067,6 +1079,10 @@ def briefs(alert: dict, listing: list, lot_titles: dict | None = None,
         elif kind == "rate_limited_chronic":
             text = _rate_limited_chronic(alert)
             teams = _projects(by_name, alert.get("agent"))
+        elif kind in ("operator_pause_long", "operator_pause_host"):
+            text = _operator_pause(alert)
+            teams = ({p for n in alert.get("agents") or () for p in _projects(by_name, n)}
+                     if kind == "operator_pause_host" else _projects(by_name, alert.get("agent")))
         elif kind == "notify_undeliverable":
             # #3007 : aucun notificateur vivant ne couvre l'humain ; tous les
             # orchestrateurs de l'alerte et l'auditeur la reçoivent.
@@ -1110,8 +1126,11 @@ def briefs(alert: dict, listing: list, lot_titles: dict | None = None,
         for name in auditor_names or ():
             out.setdefault(name, audit_text)
     if kind in ("critical_budget_pause", "budget_pause_long", "rate_limited_chronic",
-                "account_config_invalid"):
+                "account_config_invalid", "operator_pause_long"):
         out.pop(alert.get("agent"), None)       # en pause : il ne le lirait pas
+    if kind == "operator_pause_host":
+        for name in alert.get("agents") or ():
+            out.pop(name, None)
     # #3036 : un destinataire sans bail vivant (ou sur un hôte aux claims
     # fermés) ne lira pas ; il n'est pas compté prévenu. Le brief dit qui
     # manquait aux destinataires restants. Si plus aucun agent ne lit, la

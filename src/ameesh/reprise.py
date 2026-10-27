@@ -1890,8 +1890,19 @@ def build_parser() -> argparse.ArgumentParser:
     p_pause.add_argument("--not-after", type=float, default=None, metavar="EPOCH",
                          help="deadline (epoch) after which the database refuses "
                               "the pause; set by the drain before a remote call")
+    from . import agent_pause, stagnation
+    # #3961 : une pause a une échéance ; sans option, DEFAULT_MAX_S (4 h)
+    echeance = p_pause.add_mutually_exclusive_group()
+    echeance.add_argument("--for", dest="for_s", type=stagnation.parse_duration,
+                          default=None, metavar="DURATION",
+                          help="pause length (90s, 30m, 2h); lifted by the runner after it")
+    echeance.add_argument("--until", type=agent_pause.parse_until, default=None,
+                          metavar="WHEN", help="deadline: epoch or ISO 8601 date (UTC "
+                          "without zone); lifted by the runner after it")
+    echeance.add_argument("--indefinite", action="store_true",
+                          help="no deadline (signalled by operator_pause_long); default: "
+                               "the pause ends after 4h")
     p_pause.add_argument("--json", action="store_true")
-    from . import agent_pause
     p_pause.set_defaults(func=lambda cfg, args: agent_pause.cmd_cli(cfg, args, paused=True))
     p_ad = sub.add_parser("adopt", help="existing interactive session → runner (L39)")
     p_ad.add_argument("agent")

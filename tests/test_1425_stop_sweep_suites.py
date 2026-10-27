@@ -135,6 +135,7 @@ class SweepAfterGuardsTest(_Base):
             take_interval=0, _take_next=0.0)
         fake._gate_settled.set()
         fake.expire_delegations_once = lambda: None
+        fake.expire_operator_pauses_once = lambda: None  # #3961
         # L165 (EP2) : `sweep` publie les scores de rôles puis purge les
         # libertés d'élection observées ; la doublure n'a ni horloge ni
         # registre de rôles, elle neutralise la passe et part sans liberté.

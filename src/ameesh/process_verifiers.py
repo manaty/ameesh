@@ -70,6 +70,7 @@ declare executable sans preuve : ni source simulee, ni installation supposee.
 """
 from __future__ import annotations
 
+import re
 import uuid
 from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping
@@ -113,15 +114,32 @@ MAX_REPAIRS = 2
 #: Retenues natives : elles gardent l'etape et la revision.
 HOLDS = ("blocked", "waiting_human")
 
-#: Actions du registre B : une avance gardee, une retenue, sa reprise.
-ACTIONS = ("advance", "hold", "release")
+#: Actions du registre B : une avance gardee, une retenue, sa reprise, un
+#: transfert de revision Process (`transfer_revision`, #4007).
+ACTIONS = ("advance", "hold", "release", "transfer")
 
 #: Nom reserve du verificateur des retenues/reprises : B l'appelle pour
 #: `action` `hold` et `release`, comme `revision_transfer` pour un transfert.
 HOLD_VERIFIER = "hold"
 
+#: #4007 : nom reserve du verificateur de transfert de revision Process ; il
+#: vaut `process_registry.TRANSFER_VERIFIER` (B l'appelle depuis
+#: `transfer_revision`, pour une premiere adoption comme pour un transfert).
+TRANSFER_VERIFIER = "revision_transfer"
+
 #: Verificateurs reserves installes par C en plus des 14 gardes.
-RESERVED_VERIFIERS = (HOLD_VERIFIER,)
+RESERVED_VERIFIERS = (HOLD_VERIFIER, TRANSFER_VERIFIER)
+
+#: #4007 : contrat publie du transfert. La source d'approbation et la version
+#: du contrat sont des constantes du module, jamais des parametres : aucun
+#: appelant (test compris) ne remplace la source ni n'abaisse la regle.
+TRANSFER_CONTRACT = "revision-transfer/1"
+#: Seule source d'approbation admise : la projection GitHub de l'issue IMA
+#: (#4006) ; `api` n'est jamais une autorite.
+TRANSFER_APPROVAL_SOURCE = "github"
+#: References exigees d'un transfert : l'approbation citee, le lot et le
+#: projet vises (lies a la ligne verrouillee par B).
+TRANSFER_REFERENCES = ("approval", "lot", "project")
 
 #: Le registre de B (#1922) refuse lui-meme une garde sans verificateur avec ce
 #: code : la matrice de capacite le publie, mais C ne le rend jamais dans un
@@ -137,6 +155,13 @@ _RESERVED_SPECS = {
         "decision native reellement en attente",
         (),
         ("decisions",),
+    ),
+    TRANSFER_VERIFIER: (
+        "adoption/transfert de revision Process : approbation IMA courante "
+        "de la revision exacte, liee au lot et au projet, approbateur "
+        "independant",
+        ("approvals",),
+        (),
     ),
 }
 
@@ -218,6 +243,10 @@ class Command:
     action: str = "advance"
     hold: str = ""
     references: Mapping[str, Any] = field(default_factory=dict)
+    #: #4007 : revision Process visee par un transfert (`action="transfer"`) ;
+    #: vide pour les autres actions, qui restent sur la revision du lot.
+    workflow_ref: str = ""
+    workflow_version: int = 0
 
 
 @dataclass(frozen=True)
@@ -257,6 +286,12 @@ class Decision:
     message: str = ""
     stage: str = ""
     references: tuple[str, ...] = ()
+    #: #4007 : le code du pont d'approbation (#4006) derriere un refus de
+    #: transfert (`approval-revoked`, ...) ; jamais un code Process nouveau.
+    detail: str = ""
+    #: #4007 : la preuve retenue par un transfert accepte, recopiee dans le
+    #: recu de B (`verification.facts.proof`).
+    proof: Mapping[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -959,6 +994,15 @@ def _command_problem(command: Any) -> str:
     elif action == "hold":
         if _text(command.hold) not in HOLDS:
             return "retenue %r hors de %s" % (command.hold, ", ".join(HOLDS))
+    elif action == "transfer":
+        if _text(command.hold) or _text(command.guard):
+            return "un transfert ne porte ni retenue ni garde"
+        if not _text(command.workflow_ref):
+            return "transfert sans workflow_ref vise"
+        if (isinstance(command.workflow_version, bool)
+                or not isinstance(command.workflow_version, int)
+                or command.workflow_version < 0):
+            return "workflow_version vise : entier >= 0 attendu"
     elif _text(command.hold):
         return "une reprise ne porte pas de retenue"
     refs = command.references or {}
@@ -1009,6 +1053,143 @@ def _verify_hold_action(command: Command, snapshot: Snapshot) -> Decision:
     return _accept_hold(snapshot)
 
 
+# --------------------------------------------------------------------------
+# transfert de revision Process (#4007, A de #2846)
+# --------------------------------------------------------------------------
+
+#: Une revision Process transferable est pinnee sur un commit complet :
+#: `owner/depot@<sha de 40>:<chemin>` (la forme `pin` du pont #4006). Une
+#: reference mobile ou abregee ne se lie a aucune approbation exacte.
+_TRANSFER_PIN_RE = re.compile(
+    r"([A-Za-z0-9][A-Za-z0-9_.-]{0,99}/[A-Za-z0-9_.-]{1,100})"
+    r"@([0-9a-fA-F]{40}):(\S+)")
+
+#: Codes du pont d'approbation (#4006) -> codes Process deja publies. Aucun
+#: code nouveau (un code nouveau passe d'abord par le pilote) : le code du
+#: pont reste lisible dans `Decision.detail` (`facts["detail"]` du recu).
+#: Toute famille `projection-*` vaut `source-unavailable`.
+_TRANSFER_REFUSALS = {
+    "approval-missing": "evidence-missing",
+    "approval-stale": "revision-mismatch",
+    "approval-superseded": "revision-mismatch",
+    "approval-revoked": "evidence-invalid",
+    "approval-expired": "evidence-invalid",
+    "approval-ambiguous": "evidence-invalid",
+    "approval-invalid": "evidence-invalid",
+    "approval-source": "evidence-invalid",
+    "approval-api-not-authority": "evidence-invalid",
+}
+
+
+def transfer_refusal_code(bridge_code: str) -> str:
+    """Le code Process publie pour un code du pont d'approbation (#4006)."""
+    if bridge_code.startswith("projection-"):
+        return "source-unavailable"
+    return _TRANSFER_REFUSALS.get(bridge_code, "evidence-invalid")
+
+
+def _transfer_pin(ref: str) -> tuple[str, str, str] | None:
+    match = _TRANSFER_PIN_RE.fullmatch(_text(ref))
+    if match is None:
+        return None
+    return match.group(1), match.group(2).lower(), match.group(3)
+
+
+def _verify_transfer(command: Command, snapshot: Snapshot) -> Decision:
+    """Adoption ou transfert de revision Process, sur approbation IMA reelle.
+
+    Contrat `TRANSFER_CONTRACT` : la revision visee (`workflow_ref`) est un
+    pin exact `owner/depot@<sha>:<chemin>` ; la projection `approvals` (#4006)
+    porte une approbation **courante** de cet artefact exact ; la commande la
+    cite (`approval` : id ou comment_id) et nomme le lot (`lot`) et le projet
+    (`project`) de la ligne verrouillee par B ; l'approbateur n'est ni
+    l'acteur de la commande ni l'assigne du lot. Rien n'est accepte par
+    defaut : source absente, approbation absente, perimee, revoquee ou d'une
+    autre revision refusent, avec le code du pont dans `detail`.
+    """
+    if _closed(snapshot):
+        return _refuse("terminal-reopening",
+                       "lot terminal : aucun transfert de revision", snapshot)
+    pin = _transfer_pin(command.workflow_ref)
+    if pin is None:
+        return _refuse("evidence-invalid",
+                       "workflow_ref %r : pin owner/depot@<sha de 40>:<chemin> "
+                       "attendu" % command.workflow_ref, snapshot)
+    if "approvals" not in set(snapshot.sources):
+        return _refuse("source-unavailable",
+                       "collection approvals non collectee (projection absente "
+                       "ou perimee)", snapshot)
+    refs = command.references or {}
+    unknown = [key for key in refs if key not in TRANSFER_REFERENCES]
+    if unknown:
+        return _refuse("evidence-invalid",
+                       "references inconnues: %s" % ", ".join(sorted(unknown)),
+                       snapshot)
+    missing = [key for key in TRANSFER_REFERENCES if not _present(refs.get(key))]
+    if missing:
+        return _refuse("evidence-missing",
+                       "references requises absentes: %s" % ", ".join(missing),
+                       snapshot)
+    lot = _as_int(snapshot.item.get("id"))
+    if _as_int(refs.get("lot")) != lot:
+        return _refuse("item-mismatch",
+                       "transfert cite le lot %r, lot verrouille %s"
+                       % (refs.get("lot"), lot), snapshot)
+    project = _text(snapshot.item.get("app"))
+    if not project or _ref(command, "project") != project:
+        return _refuse("item-mismatch",
+                       "transfert cite le projet %r, lot du projet %r"
+                       % (refs.get("project"), project), snapshot)
+
+    from . import process_approvals as approvals_mod
+    repo, revision, path = pin
+    try:
+        projection = approvals_mod.projection_from_source(snapshot.approvals)
+        approval = approvals_mod.require_approval(
+            projection, repo=repo, revision=revision, path=path,
+            source=TRANSFER_APPROVAL_SOURCE)
+    except approvals_mod.ApprovalError as exc:
+        decision = _refuse(transfer_refusal_code(exc.code),
+                           "%s : %s" % (exc.code, exc.message), snapshot)
+        return Decision(decision.accepted, decision.code, decision.message,
+                        decision.stage, detail=exc.code)
+    cited = _ref(command, "approval")
+    if cited not in (approval.id, str(approval.comment_id)):
+        return _refuse("evidence-invalid",
+                       "approbation citee %r : l'approbation courante de "
+                       "l'artefact est %s" % (cited, approval.id), snapshot)
+    author = approval.author.lower()
+    if projection.approvers and author not in projection.approvers:
+        return _refuse("evidence-invalid",
+                       "auteur %s hors des approbateurs de la projection"
+                       % author, snapshot)
+    actors = {_text(command.actor).lower(),
+              _text(snapshot.item.get("assignee")).lower()} - {""}
+    if author in actors:
+        return _refuse("reviewer-not-independent",
+                       "approbateur %s : acteur du transfert ou assigne du lot"
+                       % author, snapshot)
+    meta = snapshot.approvals.get("projection") or {}
+    record = approval.as_dict()
+    proof = {
+        "contract": TRANSFER_CONTRACT,
+        "approval_source": TRANSFER_APPROVAL_SOURCE,
+        "authority": approvals_mod.AUTHORITY,
+        "lot": lot,
+        "project": project,
+        "workflow_ref": command.workflow_ref,
+        "workflow_version": int(command.workflow_version),
+        "approval": {key: record[key] for key in (
+            "id", "comment_id", "author", "created_at", "url",
+            "body_sha256", "artifact")},
+        "projection": {key: meta.get(key) for key in (
+            "digest", "source_digest", "generated_at", "expires_at",
+            "repo", "issue")},
+    }
+    return Decision(True, "accepted", "", command.to_stage,
+                    TRANSFER_REFERENCES, proof=proof)
+
+
 def verify(command: Command, snapshot: Snapshot) -> Decision:
     """Le verdict de C pour une commande, sur des preuves reelles. Sans exception.
 
@@ -1028,6 +1209,10 @@ def verify(command: Command, snapshot: Snapshot) -> Decision:
     if _as_int(snapshot.item.get("id")) != command.work_item_id:
         return _refuse("item-mismatch", "le snapshot ne porte pas ce lot",
                        snapshot)
+    if _text(command.action) == "transfer":
+        # une premiere adoption n'a pas encore de revision : le transfert
+        # passe avant `workflow-absent`.
+        return _verify_transfer(command, snapshot)
     if not _text(snapshot.workflow_ref):
         return _refuse("workflow-absent",
                        "projet sans workflow : aucune transition C", snapshot)
@@ -1246,6 +1431,8 @@ def context_command(context: Any) -> Command:
         action=_text(getattr(raw, "action", "")) or "advance",
         hold=_text(getattr(raw, "hold", "")),
         references=dict(references) if isinstance(references, Mapping) else {},
+        workflow_ref=_text(getattr(raw, "workflow_ref", "")),
+        workflow_version=_as_int(getattr(raw, "workflow_version", 0)),
     )
 
 
@@ -1362,10 +1549,15 @@ def server_verifier(guard: str, verification_cls: Any = None) -> Callable:
         if cls is None:
             from . import process_registry as registry
             cls = registry.Verification
+        facts = {"code": decision.code, "stage": decision.stage,
+                 "references": list(decision.references)}
+        if decision.detail:
+            facts["detail"] = decision.detail
+        if decision.proof:
+            facts["proof"] = dict(decision.proof)
         return cls(ok=decision.accepted,
                    reason=decision.message or decision.code,
-                   facts={"code": decision.code, "stage": decision.stage,
-                          "references": list(decision.references)})
+                   facts=facts)
 
     _SERVER_VERIFIERS[key] = check
     return check
@@ -1374,12 +1566,13 @@ def server_verifier(guard: str, verification_cls: Any = None) -> Callable:
 def install_verifiers(registry: Any = None) -> tuple[str, ...]:
     """Installe les appelables serveur dans `process_registry` (B) : les 14
     gardes du registre fini, puis `RESERVED_VERIFIERS` (le nom reserve
-    `hold`, pour les actions `hold` et `release`).
+    `hold`, pour les actions `hold` et `release`, et `revision_transfer`,
+    pour `transfer_revision`, #4007 ; son recu : `installation_receipt`).
 
     Sans `registry`, importe `ameesh.process_registry` ; avec, utilise l'objet
     fourni (tests, autre hote). Rend les noms installes, dans cet ordre. Aucun
-    verificateur par defaut cote B : sans cet appel, une avance, une retenue ou
-    une reprise reste `verifier-uninstalled`.
+    verificateur par defaut cote B : sans cet appel, une avance, une retenue,
+    une reprise ou un transfert reste `verifier-uninstalled`.
     """
     if registry is None:
         from . import process_registry as registry
@@ -1388,3 +1581,49 @@ def install_verifiers(registry: Any = None) -> tuple[str, ...]:
     for name in names:
         registry.install_verifier(name, server_verifier(name, verification_cls))
     return names
+
+
+#: Schema du recu d'installation d'un verificateur reserve (#4007).
+INSTALL_RECEIPT_SCHEMA = "process-verifier-install/1"
+
+
+def installation_receipt(registry: Any = None) -> dict:
+    """Le recu d'installation de `revision_transfer` (#4007), sans effet.
+
+    Dit ce qui est **reellement** installe dans le registre de B : le nom
+    reserve, si l'appelable installe est bien celui de C (`installed`), le
+    contrat, la source d'approbation et l'autorite (constantes du module), et
+    l'empreinte SHA-256 des sources qui decident (ce module et le pont
+    #4006). Un appelable etranger sous ce nom rend `installed=False` : le
+    recu ne prouve jamais une installation qu'il n'a pas vue.
+    """
+    import hashlib
+
+    if registry is None:
+        from . import process_registry as registry
+    probe = getattr(registry, "installed_verifiers", None)
+    mapping = probe() if callable(probe) else getattr(
+        registry, "INSTALLED_VERIFIERS", None)
+    current = mapping.get(TRANSFER_VERIFIER) if isinstance(mapping, Mapping) else None
+    verification_cls = getattr(registry, "Verification", None)
+    ours = (current is not None and verification_cls is not None
+            and current is _SERVER_VERIFIERS.get((TRANSFER_VERIFIER,
+                                                  verification_cls)))
+    from . import process_approvals as approvals_mod
+    digests = {}
+    for name, path in ((__name__, __file__),
+                       (approvals_mod.__name__, approvals_mod.__file__)):
+        with open(path, "rb") as handle:
+            digests[name] = hashlib.sha256(handle.read()).hexdigest()
+    return {
+        "schema": INSTALL_RECEIPT_SCHEMA,
+        "verifier": TRANSFER_VERIFIER,
+        "installed": bool(ours),
+        "contract": TRANSFER_CONTRACT,
+        "approval_source": TRANSFER_APPROVAL_SOURCE,
+        "authority": approvals_mod.AUTHORITY,
+        "references": list(TRANSFER_REFERENCES),
+        "sources": ["approvals"],
+        "version": approvals_mod._version(),
+        "source_sha256": digests,
+    }

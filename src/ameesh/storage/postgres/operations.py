@@ -156,6 +156,7 @@ class Operations(interface.Operations):
                    r.operator_paused, r.operator_pause_reason, r.operator_pause_by,
                    r.operator_pause_for,
                    extract(epoch from r.operator_pause_at)::float8 AS operator_pause_ts,
+                   extract(epoch from r.operator_pause_until)::float8 AS operator_pause_until_ts,
                    r.canon,  -- L242c : le canon propriétaire (rôles de sa fiche)
                    -- #3460 : un agent retiré ne prend rien et n'alerte plus
                    extract(epoch from r.retired_at)::float8 AS retired_ts,

@@ -37,6 +37,28 @@ PROJECT_SQL = _pg.PROJECT_SQL
 #: colonnes rendues pour un message (pilote Postgres ; alias de compatibilité)
 MAIL_COLUMNS = _pg.MAIL_COLUMNS
 
+#: #3892 : forme d'une clé d'idempotence d'envoi (stable, du client)
+_IDEMPOTENCY_KEY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$")
+
+
+def _replay_id(mailbox, message_id: int, body: str, work_item_id: str | None,
+               key: str) -> int:
+    """#3892 : l'id d'un message déjà déposé sous `key`, s'il est bien le même.
+
+    Une clé réutilisée pour un autre corps ou un autre lot est un refus
+    déterministe : la rendre comme « envoyé » ferait croire livrée une demande
+    qui n'est jamais partie (#3889, relecture cx1 : lier la clé au corps
+    original et refuser tout écart).
+    """
+    existing = mailbox.get(int(message_id))
+    if existing is None:
+        raise ValueError("idempotency key %r: message %d not found" % (key, message_id))
+    same_body = (existing.get("body") or "") == (body or "")
+    same_lot = (existing.get("work_item_id") or "") == (work_item_id or "")
+    if not (same_body and same_lot):
+        raise ValueError("idempotency key %r already used for another message" % (key,))
+    return int(message_id)
+
 
 def send(
     db: Db,
@@ -58,6 +80,7 @@ def send(
     thread: bool = True,
     thread_meta: dict | None = None,
     after_commit: list | None = None,
+    idempotency_key: str | None = None,
 ) -> int:
     """Dépose un message pour UN destinataire, l'écrit dans son fil. Renvoie son id.
 
@@ -75,10 +98,32 @@ def send(
     destinataire — son équipe (`team`) s'il est gouverné par le canon, sinon
     son chantier —, sinon AMEESH_PROJECT, sinon `default` ; lot :
     `work_item_id`.
+
+    #3892 : `idempotency_key` (une chaîne stable du client, rangée dans
+    `payload.idempotency_key`) rejoue un envoi dont la réponse s'est perdue.
+    Un message déjà déposé par le même expéditeur vers le même destinataire
+    sous cette clé est rendu tel quel, jamais déposé une seconde fois ; le
+    dépôt reste exclusif par clé (index 0497 de #3889), y compris pour un
+    exécuteur médié qui n'a pas cette lecture préalable. Une clé réutilisée
+    pour un autre corps ou un autre lot est refusée (`ValueError`), jamais
+    rendue comme envoyée.
     """
     from .agent_names import resolve as resolve_agent_name
     sender = resolve_agent_name(sender, db=db, operation="mail.send")
     recipient = resolve_agent_name(recipient, db=db, operation="mail.send")
+    if idempotency_key is not None:
+        idempotency_key = str(idempotency_key).strip()
+        if not _IDEMPOTENCY_KEY_RE.match(idempotency_key):
+            raise ValueError("invalid idempotency key: %r" % idempotency_key)
+        if not storage.is_remote(db):
+            mailbox = storage.of(db).mailbox
+            existing = mailbox.by_idempotency_key(sender, recipient, idempotency_key)
+            if existing is not None:
+                return _replay_id(mailbox, existing, body, work_item_id, idempotency_key)
+        payload = dict(payload or {})
+        if payload.get("idempotency_key") not in (None, idempotency_key):
+            raise ValueError("payload.idempotency_key does not match the key")
+        payload["idempotency_key"] = idempotency_key
     fil.ensure_readable(body, allow_structured)
     row = storage.of(db).mailbox.send(
         sender, recipient, body, host=host, kind=kind, payload=payload,

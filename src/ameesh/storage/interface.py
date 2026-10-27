@@ -273,7 +273,9 @@ class Agents(Domain):
     def operator_pause(self, name: str, *, paused: bool, reason: str,
                        actor: str, principal: str,
                        expect_reason: str | None = None,
-                       not_after: float | None = None) -> dict | None:
+                       not_after: float | None = None,
+                       until: float | None = None,
+                       indefinite: bool = False) -> dict | None:
         """Native human hold: row lock, state and audit in one atomic statement.
 
         No status/prompt/lease changes; repeated state has no new event.
@@ -289,7 +291,18 @@ class Agents(Domain):
         base la compare à son horloge sous le verrou de ligne et refuse la
         pose au-delà (`changed=false`, `refusal='not_after'`). Une pose
         distante retardée ne peut donc pas committer après le nettoyage.
+
+        `until` (#3961) : échéance (epoch) de la pause posée, levée ensuite
+        par `operator_pause_expire` ; une échéance déjà passée est refusée
+        (`refusal='until_past'`). `indefinite` : pose sans échéance, choix
+        explicite (sans lui, une pose exige `until`).
         """
+
+    @abc.abstractmethod
+    def operator_pause_expire(self, name: str | None = None) -> list[dict]:
+        """#3961 : lève les pauses opérateur échues (toutes, ou celle de
+        `name`), une fois chacune, avec un événement d'audit au nom de
+        l'humain qui les avait posées ; rend les pauses levées."""
 
     @abc.abstractmethod
     def retire(self, name: str, *, actor: str, reason: str) -> dict | None:
@@ -3624,6 +3637,18 @@ class Decisions(Domain):
         (`answered` | `delivered`), `record` fusionné dans `payload.decision`
         (état, réponse ou retrait). Rend la ligne close, ou None (déjà close,
         inconnue) — rien n'est écrit."""
+
+    def reply_for(self, decision_id: int, *, sender: str | None = None) -> dict | None:
+        """#3892 : le courrier de réponse déjà déposé pour `decision_id`
+        (`kind = 'reply'`, `payload.decision_answer.decision`), ou None.
+
+        Il rend le même rejeu possible après une panne entre la réponse
+        gardée et son courrier : le courrier manquant est renvoyé, le courrier
+        déjà déposé n'est jamais doublé. `sender` borne la lecture au
+        répondeur. Pas une opération du contrat médié : un pilote qui ne
+        l'implémente pas lève NotImplementedError et l'appelant envoie le
+        courrier sous une clé d'idempotence."""
+        raise NotImplementedError
 
     @abc.abstractmethod
     def source_mail(self, message_id: int) -> dict | None:

@@ -104,6 +104,21 @@ class Decisions(interface.Decisions):
         )
         return rows[0] if rows else None
 
+    def reply_for(self, decision_id, *, sender=None) -> dict | None:
+        # #3892 : le courrier déjà déposé pour cette réponse. Borné à
+        # l'expéditeur (index `sender`) : le répondeur est l'humain qui a
+        # gardé la réponse, jamais un homonyme. Le rejeu ne double pas le
+        # courrier quand il est là, le renvoie quand il manque.
+        sql = ("SELECT %s FROM agent_mailbox"
+               " WHERE kind = 'reply'"
+               " AND payload->'decision_answer'->>'decision' = %%s" % _COLUMNS)
+        params: tuple = (str(int(decision_id)),)
+        if sender is not None:
+            sql += " AND sender = %s"
+            params += (sender,)
+        rows = self.db.query(sql + " ORDER BY id DESC LIMIT 1", params)
+        return rows[0] if rows else None
+
     def source_mail(self, message_id) -> dict | None:
         rows = self.db.query(
             "SELECT %s FROM agent_mailbox m WHERE m.id = %%s" % _MAIL_COLUMNS,

@@ -73,6 +73,7 @@ WITH unread AS (
            r.operator_paused, r.operator_pause_reason, r.operator_pause_by,
            r.operator_pause_for,
            extract(epoch from r.operator_pause_at)::float8 AS operator_pause_ts,
+           extract(epoch from r.operator_pause_until)::float8 AS operator_pause_until_ts,
            (r.lease_owner IS NOT NULL
             AND r.lease_expires_at > clock_timestamp()) AS lease_live,
            extract(epoch from p.created_at)::float8     AS turn_started_ts,

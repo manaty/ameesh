@@ -642,7 +642,7 @@ class PaquetTest(_Base):
              carrier["id"], status, workflow, self.now - 60.0,
              None if status == "running" else self.now))
 
-    def _return_to_build(self, at, *, qa_at=None):
+    def _return_to_build(self, at, *, qa_at=None, package_exclusion=False):
         """#3487 : le lot quitte qa pour build à `at` (transition datée)."""
         if qa_at is not None:
             self.db.execute(
@@ -650,7 +650,7 @@ class PaquetTest(_Base):
                 " WHERE id = (SELECT max(id) FROM work_item_events"
                 "             WHERE work_item_id = %s AND state = 'qa')",
                 (float(qa_at), self.lot["id"]))
-        work.move(self.db, self.lot["id"], "build")
+        work.move(self.db, self.lot["id"], "build", package_exclusion=package_exclusion)
         self.db.execute(
             "UPDATE work_item_events SET created_at = to_timestamp(%s)"
             " WHERE id = (SELECT max(id) FROM work_item_events"
@@ -909,6 +909,27 @@ class PaquetTest(_Base):
         info = stagnation.describe(self.db, rows, now=self.now,
                                    open_items=rows)[self.lot["id"]]
         self.assertNotEqual(info["waiting"]["what"], "fix")
+
+    def test_exclusion_a_la_limite_des_boucles_repasse_en_build(self):
+        # #4043 (relecture #4028, cas #3961) : à loops == MAX_QA_LOOPS, un
+        # renvoi d'auteur est refusé, mais le retrait d'un paquet n'est pas
+        # une boucle : le lot repasse en build avec sa trace, loops inchangé,
+        # et attend le correctif ; le niveau 3 ne réclame plus son inclusion.
+        self.qa_at(self.GO)
+        self.db.execute("UPDATE work_items SET loops = %s WHERE id = %s",
+                        (work.MAX_QA_LOOPS, self.lot["id"]))
+        with self.assertRaises(work.WorkError):
+            work.move(self.db, self.lot["id"], "build")
+        self._return_to_build(self.GO + 30 * 60, qa_at=self.GO, package_exclusion=True)
+        item = work.get(self.db, self.lot["id"])
+        self.assertEqual((item["state"], int(item["loops"])),
+                         ("build", work.MAX_QA_LOOPS))
+        self.now = self.GO + 30 * 60 + 6 * HEURE
+        alerts = [a for a in self.slo() if a["level"] == 3]
+        self.assertEqual([a["step"] for a in alerts], ["blocked_freeze"])
+        self.assertEqual(alerts[0]["waiting"]["what"], "fix")
+        for text in self.briefs(alerts[0]).values():
+            self.assertNotIn("include it in the next package", text)
 
     def test_ci_du_paquet_verte_seulement_si_tous_les_workflows_le_sont(self):
         # #3487 (avis cx3) : un workflow vert n'efface pas un autre en cours ou

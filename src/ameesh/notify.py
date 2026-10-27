@@ -172,6 +172,9 @@ DEFAULT_TYPES = ("stopped_with_mail", "orphan_lot", "dead_runner", "idle_with_ma
                  # #2341 : un hôte dont l'échantillonneur s'est tu n'alimente plus
                  # les autres alertes ; son propriétaire l'apprend
                  "host_unsampled",
+                 # #3961 : la plupart des agents d'un hôte en pause opérateur
+                 # depuis 15 min — une maintenance a laissé sa pause (#3014)
+                 "operator_pause_host",
                  # L124 : une demande de décision attend le propriétaire, et sa
                  # relance à l'échéance (urgentes si la demande l'est)
                  "decision_pending", "decision_overdue",
@@ -362,6 +365,10 @@ TYPE_LABELS = {
     # #1466: briefed to the orchestrators and auditors (alert_briefs); not
     # pushed to humans by default (add it to `notify.types` to receive it)
     "budget_pause_long": "agent paused on budget for a long time",
+    # #3961: briefed to the orchestrators and auditors; the host-wide one is
+    # also pushed to humans by default (DEFAULT_TYPES)
+    "operator_pause_long": "agent under operator pause for a long time",
+    "operator_pause_host": "most agents of a host under operator pause",
     # #254: not pushed by default (add it to `notify.types`)
     "host_hold": "host on hold",
     "budget_drift": "counted spend strays from the provider balance",

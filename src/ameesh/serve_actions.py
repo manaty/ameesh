@@ -276,9 +276,18 @@ def _stop(ctx, db, params, body) -> dict:
 def _operator_pause(ctx, db, params, body, *, paused: bool) -> dict:
     from . import agent_pause
     reason = _text(body, "reason", limit=agent_pause.REASON_MAX)
+    extra = {}
+    if paused:
+        # #3961 : échéance (epoch) ou `indefinite` ; sans l'un ni l'autre, la
+        # pause est plafonnée à `agent_pause.DEFAULT_MAX_S`
+        until = body.get("until")
+        if until is not None and (isinstance(until, bool)
+                                  or not isinstance(until, (int, float))):
+            raise ActionError(400, "bad_body", "until: an epoch is required")
+        extra = {"until": until, "indefinite": _bool(body, "indefinite")}
     try:
         return agent_pause.change(db, params["agent"], paused=paused, reason=reason,
-                                  actor=ctx.human, principal=principal(ctx))
+                                  actor=ctx.human, principal=principal(ctx), **extra)
     except agent_pause.PauseRefused as exc:
         if exc.code == "unknown_agent":
             raise ActionError(404, "not_found", str(exc)) from exc
@@ -411,8 +420,11 @@ ACTIONS = (
            "Stop an agent by hand, with a reason (0030 §4: `manuel`)", _stop,
            {"reason": ({"type": "string", "minLength": 1, "maxLength": 500}, True)}),
     Action("/agents/{agent}/pause", "pause",
-           "Operator pause: finish this turn, start no new one", _pause,
-           {"reason": ({"type": "string", "minLength": 1, "maxLength": 2000}, True)}),
+           "Operator pause: finish this turn, start no new one; lifted at `until` "
+           "(epoch; default: in 4h) unless `indefinite`", _pause,
+           {"reason": ({"type": "string", "minLength": 1, "maxLength": 2000}, True),
+            "until": ({"type": "number", "exclusiveMinimum": 0}, False),
+            "indefinite": ({"type": "boolean"}, False)}),
     Action("/agents/{agent}/resume", "resume",
            "Lift only the operator pause; do not restart a stopped agent", _resume,
            {"reason": ({"type": "string", "minLength": 1, "maxLength": 2000}, True)}),

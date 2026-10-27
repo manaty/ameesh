@@ -202,8 +202,61 @@ class ClientTest(unittest.TestCase):
         self.assertTrue(client.handle("bonjour"))
         mail.send.assert_called_once_with(
             client.db, "human:tester", "dev1", "bonjour", host=self.cfg.host, kind="notify",
-            payload={"human": True, "human_account": mock.ANY})
+            payload={"human": True, "human_account": mock.ANY},
+            idempotency_key=mock.ANY)
+        self.assertTrue(mail.send.call_args.kwargs["idempotency_key"].startswith("chat:dev1:"))
         self.assertIn("sent to dev1 (mail #7)", client.view.out.getvalue())
+
+    def test_a_database_cut_keeps_the_line_and_resends_it_with_the_same_key(self):
+        """#3892 : un DbError ne quitte plus le client et ne perd pas la ligne."""
+        client = self.client()
+        mail.send.side_effect = [db_mod.DbError("connexion perdue"), 9]
+        self.assertTrue(client.handle("bonjour"))
+        out = client.view.out.getvalue()
+        self.assertIn("sending: the line is kept", out)
+        self.assertNotIn("sent to dev1", out)
+        self.assertEqual([item["text"] for item in client.outbox], ["bonjour"])
+        # la boucle retente ; le second envoi est le même corps, la même clé
+        client.flush_outbox()
+        self.assertEqual(client.outbox, [])
+        first, second = mail.send.call_args_list
+        self.assertEqual(first.kwargs["idempotency_key"],
+                         second.kwargs["idempotency_key"])
+        self.assertIn("sent to dev1 (mail #9)", client.view.out.getvalue())
+
+    def test_kept_lines_are_resent_in_order(self):
+        client = self.client()
+        mail.send.side_effect = [db_mod.DbError("coupure"), db_mod.DbError("coupure"),
+                                 7, 8]
+        client.handle("un")
+        client.handle("deux")
+        self.assertEqual([item["text"] for item in client.outbox], ["un", "deux"])
+        client.flush_outbox()
+        self.assertEqual(client.outbox, [])
+        bodies = [call.args[3] for call in mail.send.call_args_list[-2:]]
+        self.assertEqual(bodies, ["un", "deux"])
+        self.assertIn("sent to dev1 (mail #7)", client.view.out.getvalue())
+        self.assertIn("sent to dev1 (mail #8)", client.view.out.getvalue())
+
+    def test_a_key_reused_for_another_text_is_refused_not_sent(self):
+        """#3892 : un refus déterministe de clé (autre corps, autre lot) ne
+        quitte pas le client et n'annonce jamais « sent » ; la ligne est
+        retirée, elle ne partira pas sous cette clé."""
+        client = self.client()
+        mail.send.side_effect = ValueError("idempotency key 'k' already used")
+        self.assertTrue(client.handle("bonjour"))
+        out = client.view.out.getvalue()
+        self.assertIn("not sent:", out)
+        self.assertNotIn("sent to dev1", out)
+        self.assertEqual(client.outbox, [])
+
+    def test_quit_is_refused_while_a_line_is_still_kept(self):
+        client = self.client()
+        mail.send.side_effect = db_mod.DbError("connexion perdue")
+        client.handle("bonjour")
+        self.assertTrue(client.handle("!quit"))
+        self.assertIn("kept and retried", client.view.out.getvalue())
+        self.assertEqual(len(client.outbox), 1)
 
     def test_urgent_without_authorisation_falls_back_to_a_normal_message(self):
         client = self.client()
