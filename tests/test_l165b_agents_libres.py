@@ -26,7 +26,13 @@ class _Libres(_Lots):
             work.move(self.db, item["id"], "build")
             if state != "build":
                 work.move(self.db, item["id"], state)
+                if state == "qa":
+                    self.geler(item)
         return item
+
+    def geler(self, item):
+        # A QA lot waiting for someone else has already been frozen by its author.
+        work.milestone(self.db, item["id"], "frozen", sha="a" * 40, actor="test")
 
     def listing(self):
         return storage.of(self.db).operations.listing()
@@ -53,6 +59,7 @@ class PriseTest(_Libres):
         self.lot("à prendre")
         self.assertEqual(self.take(), [])
         work.move(self.db, en_cours["id"], "qa")
+        self.geler(en_cours)
         self.assertEqual(len(self.take()), 1)
         # le lot pris (intake, assigné) l'occupe : pas de deuxième prise
         self.lot("un autre")
@@ -112,6 +119,7 @@ class PriseTest(_Libres):
                         " WHERE name = 'dev7'", (str(session["id"]),))
         self.assertEqual(self.take(), [])
         work.move(self.db, session["id"], "qa")
+        self.geler(session)
         self.assertEqual(len(self.take()), 1)
 
     def test_la_file_d_amelioration_reste_stricte(self):
@@ -178,6 +186,7 @@ class IdleCapacityTest(_Libres):
             self.db, self.listing(), time.time(), ["orchestrateur"])
         self.assertEqual([a["agents"] for a in alerts], [["dev7"]])
         work.move(self.db, session["id"], "qa")
+        self.geler(session)
         alerts = sous_utilisation.idle_capacity(
             self.db, self.listing(), time.time(), ["orchestrateur"])
         # (claude2, dont le lot passe en qa, est libre lui aussi)
