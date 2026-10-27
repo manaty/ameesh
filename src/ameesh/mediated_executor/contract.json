@@ -4569,10 +4569,10 @@
     "live"
    ],
    "api_requests": [
-    "age",
     "complete",
     "release",
-    "reserve"
+    "reserve",
+    "retake"
    ],
    "approvals": [
     "candidates",

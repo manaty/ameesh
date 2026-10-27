@@ -56,7 +56,8 @@ class Action:
     build: Callable                 # (ctx, db, params, body) -> dict (the result)
     body: dict                      # field -> (OpenAPI schema, required)
     #: §16 (#3889): (ctx, db, params, body) -> the result already produced
-    #: under `ctx.idempotency_key`, or None if the action never acted
+    #: under `ctx.idempotency_key`, or None if the action never acted; an
+    #: action with an outcome makes its effect exclusive per key
     outcome: Callable | None = None
 
     @property

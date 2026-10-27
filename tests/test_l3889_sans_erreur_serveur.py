@@ -24,7 +24,9 @@ import threading
 import unittest
 from unittest import mock
 
-from ameesh import chat, conversation, receipts, registry, serve, server_faults, storage
+from ameesh import (chat, conversation, mail, receipts, registry, serve, serve_actions,
+                    server_faults, storage)
+from ameesh import db as db_mod
 from ameesh.approve import enroll as enroll_mod
 from ameesh.approve import server as approve_server
 from ameesh.approve.sources import ActionSourceError
@@ -604,6 +606,61 @@ class ChatReconcileTest(PgTestCase):
         self.assertEqual(json.loads(mail_row["payload"])["idempotency_key"], self.KEY)
         self.assertEqual(self.act()[2], True)
         self.assertEqual(len(self.mails()), 1)
+
+    def test_deux_reprises_synchronisees_un_seul_courrier(self):
+        """B (cx2, gel #21556) : deux reprises simultanées d'une réservation
+        abandonnée : une seule la reprend (retake atomique), un seul courrier."""
+        storage.of(self.db).api_requests.reserve("human:owner", self.KEY, self.digest,
+                                                 retention_s=86400)
+        self.age(serve.RECONCILE_AFTER_S + 1)
+        barrier, results = threading.Barrier(2), []
+
+        def one():
+            db = db_mod.connect(self.cfg)
+            try:
+                barrier.wait(10)
+                results.append(serve.act(self.ctx, db, self.action, self.params,
+                                         self.body, self.KEY, self.digest)[0])
+            finally:
+                db.close()
+        threads = [threading.Thread(target=one) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(30)
+        self.assertEqual(sorted(results), [200, 409])
+        self.assertEqual(len(self.mails()), 1)
+
+    def test_premiere_requete_vivante_au_dela_du_seuil_un_seul_courrier(self):
+        """B (cx2) : aucune trace à la reprise, mais la première requête,
+        encore vivante, dépose son courrier juste après : la reprise rend ce
+        courrier (index 0497), jamais un second."""
+        storage.of(self.db).api_requests.reserve("human:owner", self.KEY, self.digest,
+                                                 retention_s=86400)
+        self.age(serve.RECONCILE_AFTER_S + 1)
+        first = {}
+        real = self.action.outcome
+
+        def outcome(ctx, db, params, body):
+            found = real(ctx, db, params, body)
+            # la première requête dépose maintenant, sous la même clé
+            first["out"] = serve_actions._chat(ctx, db, params, body)
+            return found
+        action = dataclasses.replace(self.action, outcome=outcome)
+        status, data, _r = serve.act(self.ctx, self.db, action, self.params, self.body,
+                                     self.KEY, self.digest)
+        self.assertEqual(status, 200)
+        self.assertEqual(len(self.mails()), 1)
+        self.assertEqual(data["result"]["message_id"], first["out"]["message_id"])
+        self.assertEqual(self.texts(), ["bonjour"])
+
+    def test_un_autre_index_unique_n_est_pas_pris_pour_un_rejeu(self):
+        error = DbError("duplicate", sqlstate="23505", constraint="autre_idx")
+        with mock.patch.object(mail, "send", side_effect=error):
+            with self.assertRaises(DbError):
+                chat.post_human_message(self.cfg, self.db, human="human:owner",
+                                        sender="owner", agent="a1", text="x",
+                                        idempotency_key=self.KEY)
 
     def test_trop_recent_reste_409_rien_envoye(self):
         storage.of(self.db).api_requests.reserve("human:owner", self.KEY, self.digest,

@@ -68,6 +68,7 @@ import threading
 import time
 
 from . import config as config_mod
+from . import db as db_mod
 from . import platform
 from .config import NAME_RE, Config
 from .deprecated import DeprecatedAlias
@@ -219,6 +220,10 @@ CLIENT_HELP_TEXT = (
 # L83 : l'écriture serveur d'un message humain dans la conversation
 # --------------------------------------------------------------------------
 
+#: #3889 : un courrier par (expéditeur, destinataire, Idempotency-Key)
+IDEMPOTENT_MAIL_INDEX = "agent_mailbox_idempotency_key_idx"
+
+
 def post_human_message(cfg: Config, db, *, human: str, sender: str, agent: str,
                        text: str, lot=None, event_id: str | None = None,
                        idempotency_key: str = "") -> dict:
@@ -243,7 +248,9 @@ def post_human_message(cfg: Config, db, *, human: str, sender: str, agent: str,
     §16 (#3889) : `idempotency_key`, la clé de la requête de l'API, part
     dans le courrier (`payload.idempotency_key`). C'est l'accusé vérifiable
     d'une issue restée inconnue : `delivered_human_message` le retrouve et
-    rend la même réponse, sans second envoi.
+    rend la même réponse, sans second envoi. Le dépôt est exclusif par clé
+    (index 0497) : un second exécuteur sous la même clé rend le message déjà
+    déposé, jamais un second courrier.
     """
     from . import mail, registry
     if not NAME_RE.match(agent or ""):
@@ -255,8 +262,17 @@ def post_human_message(cfg: Config, db, *, human: str, sender: str, agent: str,
     payload = {"human": True}
     if idempotency_key:
         payload["idempotency_key"] = idempotency_key
-    message_id = mail.send(db, sender, agent, text, host=cfg.host, kind="notify",
-                           payload=payload, work_item_id=work_item_id)
+    try:
+        message_id = mail.send(db, sender, agent, text, host=cfg.host, kind="notify",
+                               payload=payload, work_item_id=work_item_id)
+    except db_mod.DbError as exc:
+        # déjà déposé sous cette clé par un autre exécuteur (0497) : le sien
+        if not (idempotency_key and db_mod.is_unique_violation(exc, IDEMPOTENT_MAIL_INDEX)):
+            raise
+        from . import storage
+        message_id = storage.of(db).mailbox.by_idempotency_key(sender, agent, idempotency_key)
+        if message_id is None:
+            raise
     return _reflect_human_message(cfg, db, row=row, human=human, agent=agent, text=text,
                                   lot=lot, message_id=message_id, event_id=event_id)
 

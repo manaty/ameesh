@@ -54,8 +54,9 @@ class ApiRequests(interface.ApiRequests):
             "delete from api_idempotency where human = %s and key = %s and status is null"
             " returning key", (human, key)))
 
-    def age(self, human, key) -> float | None:
-        rows = self.db.query(
-            "select extract(epoch from now() - created_at)::float8 as age"
-            " from api_idempotency where human = %s and key = %s", (human, key))
-        return float(rows[0]["age"]) if rows else None
+    def retake(self, human, key, older_than_s) -> bool:
+        return bool(self.db.query(
+            "update api_idempotency set created_at = now()"
+            " where human = %s and key = %s and status is null"
+            " and created_at <= now() - %s * interval '1 second' returning key",
+            (human, key, float(older_than_s))))

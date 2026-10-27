@@ -901,9 +901,11 @@ class ApiRequests(Domain):
         the client may retry with the same key); False if there was none."""
 
     @abc.abstractmethod
-    def age(self, human: str, key: str) -> float | None:
-        """Seconds since (human, key) was reserved; None without a row (§16,
-        #3889: an outcome left unknown is reconciled once old enough)."""
+    def retake(self, human: str, key: str, older_than_s: float) -> bool:
+        """Takes over a reservation left unanswered for `older_than_s`: its
+        reservation instant becomes now, in one statement, so one caller only
+        wins (§16, #3889: an outcome left unknown is reconciled); False if
+        the row is answered, more recent, absent or taken by another."""
 
 
 # --------------------------------------------------------------------------

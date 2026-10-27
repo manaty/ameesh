@@ -731,8 +731,10 @@ def act(ctx: Context, db, action, params: dict, body: dict, key: str,
 
     §16 (#3889): an action that leaves a trace under its key (`Action.outcome`,
     the chat mail) is reconciled once its reservation is RECONCILE_AFTER_S
-    old: the trace found, its response is stored and replayed; none, the key
-    is released and the action runs once more under the same key."""
+    old. One request takes the reservation over (`retake`, atomic); the trace
+    found, its response is stored and replayed; none, the action runs once
+    more under the same key. Its effect must be exclusive per key (the chat
+    mail: index 0497), as the first request may still be running."""
     ctx = dataclasses.replace(ctx, idempotency_key=key)
     requests = storage.of(db).api_requests
     row = requests.reserve(ctx.human, key, digest, retention_s=IDEMPOTENCY_RETENTION_S)
@@ -741,7 +743,7 @@ def act(ctx: Context, db, action, params: dict, body: dict, key: str,
             return 422, _err("idempotency_mismatch",
                              "this Idempotency-Key was used for another request"), False
         if row["status"] is None:
-            settled = _reconcile(ctx, db, action, params, body, key, digest)
+            settled = _reconcile(ctx, db, action, params, body, key)
             if settled is not None:
                 return settled
             return 409, _err("idempotency_in_progress",
@@ -757,16 +759,17 @@ def _envelope(ctx: Context, action, result: dict) -> dict:
             "for": serve_actions.principal(ctx), "result": result}
 
 
-def _reconcile(ctx: Context, db, action, params: dict, body: dict, key: str,
-               digest: str) -> tuple[int, dict, bool] | None:
+def _reconcile(ctx: Context, db, action, params: dict, body: dict,
+               key: str) -> tuple[int, dict, bool] | None:
     """§16 (#3889): the outcome of a reservation left unknown, read from the
     action's trace under its key; None: still 409 (no trace reader, too
     recent, or another request settled it first)."""
     if action.outcome is None:
         return None
     requests = storage.of(db).api_requests
-    age = requests.age(ctx.human, key)
-    if age is None or age < RECONCILE_AFTER_S:
+    # one request only takes the abandoned reservation over (its instant
+    # becomes now); the others still answer 409
+    if not requests.retake(ctx.human, key, RECONCILE_AFTER_S):
         return None
     try:
         result = action.outcome(ctx, db, params, body)
@@ -778,13 +781,9 @@ def _reconcile(ctx: Context, db, action, params: dict, body: dict, key: str,
         if not requests.complete(ctx.human, key, 200, data):
             return None
         return 200, data, True
-    # no trace: the action never acted. Free the key, take it again (one
-    # request only wins) and run it under the same key.
-    if not requests.release(ctx.human, key):
-        return None
-    if requests.reserve(ctx.human, key, digest,
-                        retention_s=IDEMPOTENCY_RETENTION_S) is not None:
-        return None
+    # no trace yet: the action runs under the same key. A first request still
+    # alive may write its trace meanwhile: the effect is exclusive per key
+    # (`Action.outcome`), so the later of the two returns the earlier's.
     return _run(ctx, db, action, params, body, key)
 
 
