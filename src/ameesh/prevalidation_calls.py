@@ -662,7 +662,9 @@ def contract_fallback(prepared: Prepared, params, *, head: str, base: str,
     (P0 du plan) : un test d'identité changé et un contrat de l'exécuteur ne
     dépendent pas de la mesure par blocs pour être dus. Le plan écrit dans
     l'arbre porte ``fallback`` : le rapport dit la cause d'origine et les
-    modules joués, il ne se lit pas comme un vert de sélection.
+    modules joués, il ne se lit pas comme un vert de sélection. `validate`
+    retire ensuite de ce plan les tests que le guest ne peut pas exécuter
+    (#4071, `GUEST_EXCLUSIONS`) ; la suite complète les garde.
 
     Rend le bloc ``fallback`` quand le repli a été écrit, ``None`` sinon (le
     refus d'origine reste alors la réponse). Un contrat déclaré illisible ne
@@ -894,7 +896,15 @@ def run(cfg, db, lot: int, *, repo: str, head: str, base: str, project: str,
                             executable=executable, validate=validate,
                             deadline=deadline)
         if fallback:
-            report.setdefault("fallback", fallback)
+            #: #4071 : le plan de repli est filtré par `validate` avant le run ;
+            #: quand le rapport ne porte pas déjà son bloc (validate simulé),
+            #: il dit au moins les modules réellement planifiés et les exclus.
+            played = dict(fallback)
+            if isinstance(report.get("planned"), list):
+                played["modules"] = list(report["planned"])
+            if "excluded" in report:
+                played["excluded"] = list(report.get("excluded") or ())
+            report.setdefault("fallback", played)
             report.setdefault("selection", "contract")
     finally:
         if prepared is not None:
