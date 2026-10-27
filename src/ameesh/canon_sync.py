@@ -138,9 +138,11 @@ authentificateurs, verrou compris, y est UNE opération
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
+import uuid
 from dataclasses import dataclass, field
 
 from . import canon as canon_mod
@@ -350,6 +352,7 @@ class SyncReport:
     processes: "ProcessSync | None" = None
     #: #1616 : paramètres mécaniques compilés du canon appliqué (constat)
     mechanics: "MechanicsSync | None" = None
+    shared: bool = False             # #3963: reused periodic host result
 
     @property
     def errors(self) -> list[Finding]:
@@ -739,16 +742,15 @@ def record_authenticators(db: Db, host: str, done: AuthenticatorSync,
     quiet = status == AUTH_STATE_ERROR and done.transient
     st = storage.of(db).canon
     previous = st.record_auth_state(
-        host, status, _clip(QUIET_MARK + diagnostic) if quiet else diagnostic, key)
+        host, status, diagnostic, key, quiet_prefix=QUIET_MARK if quiet else "")
     before = (previous.get("auth_status"), previous.get("auth_diagnostic") or "") \
         if previous is not None else (None, "")
     was_quiet = before[0] == AUTH_STATE_ERROR and before[1].startswith(QUIET_MARK)
     if quiet:
         if before[0] != AUTH_STATE_ERROR:
             return
-        # une erreur précède : passagère répétée (annoncée maintenant) ou
-        # erreur déjà annoncée — le diagnostic durable perd sa marque
-        st.record_auth_state(host, status, diagnostic, key)
+        # The storage transition already promoted a repeated transient error
+        # under the same lock; never overwrite another executor's recovery.
     # L44 (0031) : chaque canon a son registre ; le fil dit lequel
     which = " (canon %s)" % key if key else ""
     option = " --canon %s" % key if key else ""
@@ -1532,6 +1534,35 @@ def _same(row: dict, values: dict) -> bool:
         if old != new:
             return False
     return True
+
+
+def periodic_sync(db: Db, canon: Canon, host: str, interval_s: float) -> SyncReport | None:
+    """#3963: one complete sync per host/canon/interval, without a long lock.
+
+    Other executors reuse only a completed result for the same immutable
+    sources and trust configuration. Pending, failed or different snapshots
+    never settle the host gate. Explicit CLI sync remains unconditional.
+    """
+    if interval_s <= 0 or canon.untrusted or not canon.readable or not canon.sources:
+        return sync(db, canon, host)
+    key = state_key(db, canon, host)
+    signature = hashlib.sha256(json.dumps({
+        "sources": [(s.member, s.commit, s.mode) for s in canon.sources],
+        "trusted_ref": configured_ref(db, canon),
+        "id": canon.id, "default": canon.is_default,
+        "findings": [str(f) for f in canon.load_findings],
+    }, sort_keys=True).encode()).hexdigest()
+    store = storage.of(db).canon
+    token = uuid.uuid4().hex
+    if not store.claim_sync(host, key, token, interval_s):
+        shared = store.shared_sync(host, key)
+        if shared is None or shared["sync_signature"] != signature:
+            return None
+        return SyncReport(host, str(canon.root), False, [], [],
+                          status=shared["status"], diagnostic=shared["diagnostic"], shared=True)
+    report = sync(db, canon, host)
+    store.complete_sync(host, key, token, signature)
+    return report
 
 
 def sync(db: Db, canon: Canon, host: str, findings: list[Finding] | None = None, *,
