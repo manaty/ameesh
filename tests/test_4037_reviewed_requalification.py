@@ -182,6 +182,18 @@ class ReviewedMoveTest(unittest.TestCase):
             self.execute()
         self.assert_unchanged()
 
+    def test_opinion_family_comes_from_current_receipt_not_reference_order(self):
+        self.receipts[1]['harness'] = 'codex'
+        self.receipts[2]['harness'] = 'claude'
+        self.marks.append(dict(self.marks[0], id=3, at_ts=3))
+        self.receipts[3] = dict(self.receipts[1], harness='deepseek',
+                                milestone=self.marks[-1])
+        # L'ancien avis codex est cité en dernier ; il ne doit pas remplacer
+        # la famille deepseek du nouvel avis (celle de l'auteur du canon).
+        with self.assertRaisesRegex(TrainError, 'diff reviews refused'):
+            self.execute(reviews=['milestone:3', 'milestone:2', 'milestone:1'])
+        self.assert_unchanged()
+
     def test_unproven_block_does_not_revoke_a_proven_opinion(self):
         self.marks.append(dict(self.marks[0], id=3, verdict='blocked', at_ts=3))
         self.assertEqual(self.execute()['state'], 'requalified')

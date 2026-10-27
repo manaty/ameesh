@@ -119,12 +119,9 @@ def qualify(cfg, db, spec, pin, gate, changed, references):
         if not authors:
             raise TrainError("canon author provenance missing")
         need = max(rule.reviews_for(changed).reviews for rule in rules)
-        family_by_actor = {r["actor"]: review_lot.family_of(r["harness"], families)
-                           for r in selected.values()}
         verdict = merge_queue.review_gate(
             db, current, gate, repo=spec.canon, klass={"class": "sensitive"},
             families=families, required=need, authors=authors, authors_complete=True,
-            family_of=lambda name: family_by_actor.get(name, ""),
             exclude_author_family=any(rule.exclude_author_family for rule in rules),
             distinct_families=any(rule.distinct_families for rule in rules))
         if not verdict["ok"]:
