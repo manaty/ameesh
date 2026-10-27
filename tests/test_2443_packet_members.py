@@ -201,6 +201,30 @@ class PacketLinkTest(_TmpMixin, PgTestCase):
         self.assertEqual({u["work_item_id"] for u in report["units"]}, {one["id"]})
         self.assertEqual(packet_link.for_item(self.db, other["id"]), [])
 
+    def test_record_refuses_a_carrier_without_declared_branch(self):
+        """#3905 (h-35 #3879) : `--branch` seul ne fait pas un véhicule."""
+        sha = self.unit_branch("lot/dix", "src/dix.py", "dix\n", "dix")
+        item = self.lot("dix")
+        self.freeze(item, sha)
+        head = self.compose("integration/paquet-1", [(item["id"], sha)])
+        porteur = work.add(self.db, title="paquet", issue_ref="acme/web#1",
+                           actor="pilote", source="composition")
+        with self.assertRaises(packet_link.PacketLinkError) as ctx:
+            packet_link.record(self.db, porteur["id"], repo=self.repo,
+                               base=self.base, head=head,
+                               branch="integration/paquet-1", actor="pilote",
+                               cfg=self.cfg)
+        self.assertIn("ameesh work branch %d integration/paquet-1" % porteur["id"],
+                      str(ctx.exception))
+        self.assertEqual(packet_link.memberships(self.db, package_ids=[porteur["id"]]), [])
+        # la branche posée, la même composition s'enregistre
+        work.set_branch(self.db, porteur["id"], "integration/paquet-1", "main",
+                        actor="pilote")
+        report = packet_link.record(self.db, porteur["id"], repo=self.repo,
+                                    base=self.base, head=head, actor="pilote",
+                                    cfg=self.cfg)
+        self.assertTrue(report["recorded"])
+
     def test_record_refuses_unknown_unit_and_foreign_repo(self):
         sha = self.unit_branch("lot/neuf", "src/cinq.py", "cinq\n", "cinq")
         item = self.lot("cinq")
