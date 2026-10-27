@@ -137,6 +137,98 @@ including B0b setup and the #3456 auto-take) is outside the window.
   Claude-specific; on Codex the liveness evidence is the sampler and journal
   (no silent/failure line reported).
 
+## R1 bis — Claude resident, protocol (planned 2026-10-28)
+
+**Status: prepared, not run.** This is the follow-up R1 left open: the Claude
+resident stayed outside R1, so the Claude liveness probe, the one-hour cache
+and Claude's cost over a day are still unmeasured. The run starts no earlier
+than **2026-10-28T06:00:00Z**, the reset of the `tertiaire` Claude account's
+seven-day window (`resets_at=1793167200` in `ameesh accounts list`); the test
+agent's first turn must open its session after that reset, on a free account.
+
+### Device and account
+
+* test agent `pilot-resident-4064`, ephemeral Claude on `ameesh-agents-2`,
+  created by mesh-design (the creator passes its host and harness), TTL 2 d,
+  cwd `/home/ameesh/work/pilot-resident-4064`, runner unit
+  `ameesh-runner-agent@pilot-resident-4064.service`;
+* capabilities read/propose: the agent takes no lot and no review; any item
+  assigned to it is returned and reported, never worked;
+* the agent's runner reads the staging launcher (`venv-courant`); B-1 records
+  the concrete venv, its mtime, the runner start time and `ameesh doctor`;
+* account gate: `ameesh accounts list` must show a Claude account `ok`, not
+  paused, and the next choice for a new session; B0 records `session_account`
+  and the account's gauges. No free account at 06:00Z: the run is not started,
+  the reading is recorded and a new date is proposed.
+
+### Protocol
+
+Same protocol as R1 (#3389): `resident=on`, `resident_sleep=30m`,
+`mail_batch=0`, one checkpoint per step, a sampler unit outside the turns,
+`resident=off` at B6 and a one-per-event B7. T0 is B0. Deviations are named
+below.
+
+| Point | When | What is measured |
+|---|---|---|
+| B-1 | 06:00Z, read-only, before any setting | staging and runner identity, `resident=off`, no resident process, account, zero lot/review |
+| B0 | T0 | `resident=on resident_sleep=30m mail_batch=0`; sampler started; T0; session/account/PID |
+| B1 | T0+3 min | first resident turn: session, PID, epoch, usage, cache split |
+| B2 | B1+17 min | awake memory at rest; `probe_due` window; sampler headroom |
+| B3 | B2+35 min | first dormancy (sleep 30 min) and wake; dormant status, RSS given back, usage |
+| B4 | B3+60 min | second wake, gap under 1 h: `cache_read` / `cache_creation` split |
+| B5 | B4+70 min | third wake, gap over 1 h: **the one-hour-cache question**, same split; then schedule the controlled unit restart |
+| B5b | B5+5 min | lease after the restart: epoch increment, old PID dead, new PID, same session, `resident=on` |
+| B5c | B5b+5 min | controlled silent resident: schedule `SIGSTOP` of the resident PID 60 s after the turn |
+| B5d | B5c+90 s | pre-turn probe: the silent process must not serve the turn; journal `liveness probe failed` / `silent`, process stopped, turn one-per-event (60 s backoff) |
+| B6 | T0+24 h | 24 h cost, cache, memory, dormant runs; then `resident=off` |
+| B7 | B6+5 min | return: `resident=off`, no resident process, one-per-event turn; sampler and runner stopped |
+
+The controlled B5c/B5d test is the Claude-specific addition: R1 could only
+report the absence of `silent`/`liveness probe failed` lines. Here the probe is
+made to fail on purpose, between turns, with a known cause; B5d proves that the
+runner refuses to serve a turn to a silent resident, counts one resident
+failure and falls back to one turn per event. The failure is counted, not
+imputed, and it is not a probe-failure series.
+
+### Cache split (the one-hour question)
+
+Claude's `result` event carries the cache breakdown the ledger does not keep
+(it is nested under `usage`):
+
+```json
+"usage": {"cache_creation": {"ephemeral_1h_input_tokens": 0,
+                             "ephemeral_5m_input_tokens": 0}}
+```
+
+For each checkpoint the report gives `cache_read_input_tokens`,
+`cache_creation_input_tokens` and the two `ephemeral_*` shares, with the gap
+since the previous turn (`cost turns` started/recorded timestamps). B4 (gap
+under 1 h) and B5 (gap over 1 h) are the comparison; B6 (24 h) is the control.
+The study's warning is kept: token cost follows session size, not resident
+mode; no token saving is claimed from the mode.
+
+### Measurements and sources
+
+| Point | Measurement | Source |
+|---|---|---|
+| Memory, awake | RSS of the resident `pids` just after a turn, at B2 and at each wake; host `MemAvailable` | sampler, `/proc/<pid>/status` |
+| Memory, asleep | `pids=[]` runs, `dormant:` status, `MemAvailable` at sleep | sampler, `ameesh show` |
+| Cost over a day | USD and turns on the ledger for T0→B6, cache read/creation; B6 and B7 separately | `ameesh cost turns --since T0 --json`, events |
+| Cache on spaced turns | per-turn `cache_read`, `cache_creation`, `ephemeral_1h/5m`, gap | `events.jsonl` results, ledger |
+| Latency | `started_ts`→`recorded_ts` per turn, against the 4–12 s startup baseline | `cost turns` |
+| Liveness and silence | journal `liveness probe failed`, `silent between turns`, `silent: no answer`; B5c/B5d controlled proof; sleep/wake/restart lines | runner journal, sampler |
+| Lease | B5b epoch before/after, old PID dead, new PID, same session; B6/B7 no process outlives the lease | journal, `ameesh show`, sampler |
+| Return | `resident=off`, `resident process stopped (resident=off)`, B7 one-per-event without resident process | journal, `ameesh show`, B7 |
+
+### Abort rules
+
+The R1 abort rules apply unchanged: a resident group that survives its lease
+or a host withdrawal, a silent resident that serves a turn up to the cap, a
+memory not given back at sleep under host pressure, or a growing probe-failure
+series with no understood cause stops the pilot immediately, evidence kept.
+The controlled B5c/B5d failure is understood and counted; a second, unexplained
+failure in the same run stops it.
+
 ## State
 
 T1/T2 are merged and active in staging (`771e447`, h-19; main `47bf1fe68` after
@@ -144,4 +236,5 @@ h-20). `resident=off`; the resident process is stopped (`resident process
 stopped (resident=off)` at 2026-10-26T04:45:30Z); B7 proved one-per-event with
 no resident process; the sampler is stopped and the test agent's runner is
 stopped after B7 (the ephemeral expires 2026-10-27 02:18Z). No resident agent
-remains.
+remains. R1 bis (Claude) is prepared for after 2026-10-28T06:00:00Z; its
+protocol is above and its result will be added here.
