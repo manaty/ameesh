@@ -117,12 +117,18 @@ ALTER ROLE ameesh PASSWORD '$PW';
 -- coupe déjà dans chaque session ; ce réglage couvre les sessions qui ne
 -- passent pas par ameesh (psql, script de déploiement, nouveau rôle).
 ALTER ROLE ameesh SET jit = off;
+-- #3836 : une session laissée `idle in transaction` tenait les verrous du
+-- mesh (sept minutes lors du gel #3700). La garde serveur la coupe à 2 min ;
+-- le code du gel ne va plus au réseau dans sa transaction, et cette valeur
+-- couvre le travail local légitime qui y reste.
+ALTER ROLE ameesh SET idle_in_transaction_session_timeout = '180s';
 SQL
 runuser -u postgres -- psql -tAc "SELECT 1 FROM pg_database WHERE datname = 'ameesh'" | grep -q 1 \
   || runuser -u postgres -- createdb -O ameesh ameesh
 # même réglage pour la base : un NOUVEAU rôle qui s'y connecte en hérite.
 runuser -u postgres -- psql -v ON_ERROR_STOP=1 -q -d ameesh \
-  -c "ALTER DATABASE ameesh SET jit = off"
+  -c "ALTER DATABASE ameesh SET jit = off" \
+  -c "ALTER DATABASE ameesh SET idle_in_transaction_session_timeout = '180s'"
 unset PW
 
 # --- ameesh --------------------------------------------------------------------

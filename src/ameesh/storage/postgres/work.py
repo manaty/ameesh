@@ -286,6 +286,14 @@ MIGRATION_SLOTS_INDEX = "work_migration_reservations_active_idx"
 #: l'index unique (dépôt, numéro atterri) de #1567 : deux lots d'un même dépôt
 #: ne nomment jamais le même numéro atterri
 MIGRATION_LANDED_INDEX = "work_items_migration_landed_idx"
+#: #3836 : un gel prend le verrou consultatif du dépôt de migration et, par la
+#: transition d'état, celui du projet. Il ne doit jamais attendre un verrou
+#: plusieurs minutes en les tenant : une attente de 174 s sur le lookup de
+#: provenance de #3820 a expiré sur `statement_timeout` et laissé une
+#: transaction `idle in transaction` qui a bloqué les écritures du mesh. Le
+#: `lock_timeout` fait échouer l'attente, la transaction du jalon est annulée
+#: (donc ses verrous relâchés), et l'appelant relance après le détenteur.
+FREEZE_LOCK_TIMEOUT_MS = 15000
 #: L233b : une reprise sur pause budget à la fois pour tout le mesh
 _HANDOFF_LOCK = ("SELECT pg_advisory_xact_lock("
                  "hashtextextended(current_schema() || ':budget_handoff', 0))")
@@ -1818,6 +1826,17 @@ class WorkItems(interface.WorkItems):
             # Other milestones never move the lot and may follow a note that
             # already holds its row (e.g. a fenced fire exception).
             if kind == "frozen":
+                # #3836 : ne jamais attendre un verrou des minutes en tenant
+                # ceux du mesh. `SET LOCAL` vaut pour cette transaction, sur
+                # les deux pilotes ; une attente expirée lève, le `with` annule
+                # le jalon et relâche les verrous, l'appelant relance. Un
+                # `lock_timeout` déjà plus court posé par l'appelant est gardé.
+                current = float(tx.query(
+                    "SELECT extract(epoch FROM current_setting('lock_timeout')"
+                    "::interval) AS seconds")[0]["seconds"] or 0)
+                if current == 0 or current * 1000 > FREEZE_LOCK_TIMEOUT_MS:
+                    tx.execute("SET LOCAL lock_timeout = '%dms'"
+                               % int(FREEZE_LOCK_TIMEOUT_MS))
                 _lock_migration_writer(tx, item_id)
             items = tx.query("SELECT id, app, branch_target, state,"
                              " coalesce(to_jsonb(work_items)->>'workflow_ref', '') AS workflow_ref"

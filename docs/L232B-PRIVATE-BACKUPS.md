@@ -21,6 +21,11 @@ restorability.
 inventory. Archive and inventory must be new files in the same directory.
 The source uses a read-only repeatable-read transaction and exports its
 snapshot to `pg_dump`; that transaction stays open until the dump finishes.
+It disables the server's `idle_in_transaction_session_timeout` for that
+transaction only (`SET LOCAL … = 0`, #3836/#3844): a 180 s idle guard on the
+mesh database must not take the deliberate snapshot holder for an abandoned
+client when a dump outlives it (the session is read-only, dies with the
+process, and `pg_dump` already exempts its own session the same way).
 The archive covers the database, and the inventory records the selected mesh
 schema's migration versions/checksums, representative row counts, archive
 SHA-256 and the uncompressed live size (`source_bytes`, the copy a verified

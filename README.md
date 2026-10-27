@@ -103,6 +103,12 @@ scripts/pg-up.sh                    # container ameesh-pg, postgres:17, 127.0.0.
 # its <name>-data volume after 24 h without a container (conservation by
 # default; the shared ameesh-pg volume is never declared disposable)
 # (its volume is then <name>-data; a volume already mounted is refused)
+# #3833: the bench is created with docker-init (--init) and a shell-free
+# healthcheck (`exec pg_isready`): without them, a healthcheck killed at its
+# 3 s timeout leaves an orphaned pg_isready that exits 2, and the postmaster
+# (PID 1) reaps it as a dead backend and restarts the bench. A container
+# created before this guard must be recreated once (docker stop/rm, then
+# scripts/pg-up.sh); the volume and its data are kept.
 export PYTHONPATH=src
 # Aucun secret n'est codé dans le dépôt : le mot de passe du banc vient de
 # PGPASSWORD ou de ~/.pgpass (mode 600) ; sinon donnez le DSN complet.

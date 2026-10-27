@@ -170,6 +170,14 @@ def snapshot_dump(config, output, inventory, *, schema="public", tables=("agent_
     parameters = parameters_from(config)
     with psycopg.connect(make_conninfo(**parameters)) as source:
         source.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+        # #3836/#3844 : l'export de snapshot reste ouvert pendant tout le
+        # pg_dump (minutes sur une base qui grossit). La garde serveur
+        # idle_in_transaction_session_timeout (180 s, rôle ameesh et base) le
+        # prendrait pour une transaction abandonnée et tuerait un dump
+        # légitime. Ce détenteur est explicite, en lecture seule, et meurt
+        # avec le processus ; pg_dump fait de même pour sa propre session.
+        # L'exemption vaut pour cette transaction seulement.
+        source.execute("SET LOCAL idle_in_transaction_session_timeout = 0")
         snapshot = source.execute("SELECT pg_export_snapshot()").fetchone()[0]
         if not isinstance(snapshot, str) or not re.fullmatch(r"[0-9A-Fa-f-]+", snapshot):
             raise BackupError("source did not export a valid snapshot")

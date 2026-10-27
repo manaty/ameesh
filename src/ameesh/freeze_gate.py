@@ -762,14 +762,29 @@ def milestone(
                 for where in known:
                     if not where or not freeze_checks.commit_in(where, replaced_sha):
                         continue
-                    reachable = plan_git.ref_reachable(where, replaced_sha)
+                    why: list[str] = []
+                    reachable = plan_git.ref_reachable(
+                        where, replaced_sha, why=why)
                     if reachable is None:
+                        # #3835 : un délai n'est pas un dépôt cassé ; le refus
+                        # le dit et n'invite pas à purger des refs pour rien.
+                        if why and why[0] == "timeout":
+                            raise WorkError(
+                                "--supersedes %s: freeze %s is present in %s but "
+                                "its accessibility could not be established: the "
+                                "ref reachability check timed out after %gs — "
+                                "cannot prove it is out of every ref; retry once "
+                                "the repository answers (a freeze that may still "
+                                "be accessible is never replaced, #2989/#3399)"
+                                % (freeze_id, replaced_sha[:12], where,
+                                   plan_git.REACHABLE_TIMEOUT_S))
                         raise WorkError(
                             "--supersedes %s: freeze %s is present in %s and its "
-                            "refs cannot be read — cannot prove it is out of every "
-                            "ref; refusing to replace a freeze that may still be "
-                            "accessible (#2989/#3399)"
-                            % (freeze_id, replaced_sha[:12], where))
+                            "refs cannot be read (%s) — cannot prove it is out of "
+                            "every ref; refusing to replace a freeze that may still "
+                            "be accessible (#2989/#3399)"
+                            % (freeze_id, replaced_sha[:12], where,
+                               why[0] if why else "unreadable"))
                     if reachable:
                         raise WorkError(
                             "--supersedes %s: freeze %s is still reachable from a "
@@ -835,6 +850,12 @@ def milestone(
             # Pin the exact published target before taking the lot's lock.
             target = (None if carried else
                       activation.prepare_target(cfg, db, item, sha))
+            # #3836 : la désignation lit les gels antérieurs du lot dans la
+            # transaction du jalon ; ses objets absents se rapatrient ici, hors
+            # transaction. Un `git fetch` de forge dans la transaction laissait
+            # la session `idle in transaction` sept minutes, verrous tenus.
+            if not carried:
+                activation.prefetch_freeze_objects(db, item, target, sha)
             on_frozen = activation.hook(cfg, outcome, carried=carried, target=target)
             if after_commit is None:
                 after_commit = []

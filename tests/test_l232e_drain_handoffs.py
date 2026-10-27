@@ -27,15 +27,28 @@ class DrainHandoffTest(PgTestCase):
         for host in ("source", "target"):
             self.api.canon.record_state(host, "ok", root="/canon", source="local", commit=fixtures.COMMIT,
                                         good=True, diagnostic="")
-            for _ in range(3):
-                self.api.hosts.record({"host": host, "mem_available_bytes": 24*fixtures.GIB,
-                                      "swap_used_bytes": 0, "cpu_count": 8, "load1": 0.0,
-                                      "disk_free_bytes": 100*fixtures.GIB, "gate_state": "available"})
             for harness in ("codex", "gh", "gcloud"):
                 self.api.credentials.report(host, harness, "", "healthy", source="manual")
+        for _ in range(3):
+            self.battement()
         self.limits = dict(resources.thresholds({"resources": {"min_mem_available": "4GiB",
                                                                "min_disk_free": "1GiB"}}), max_agents=4)
         self.adapter = Adapter()
+
+    def battement(self):
+        """Un relevé frais des deux hôtes, comme le service le publie.
+
+        #3832 : les neuf passes d'un retour peuvent dépasser MAX_AGE (60 s)
+        quand l'hôte est chargé (--parallel) ; les relevés du setUp
+        vieillissaient alors, `handoffs.plan` refusait la cible et l'agent
+        restait sur target (rouge h-32). On publie donc un relevé avant
+        chaque passe, comme le monde réel.
+        """
+        for host in ("source", "target"):
+            self.api.hosts.record({"host": host, "mem_available_bytes": 24*fixtures.GIB,
+                                   "swap_used_bytes": 0, "cpu_count": 8, "load1": 0.0,
+                                   "disk_free_bytes": 100*fixtures.GIB,
+                                   "gate_state": "available"})
 
     def requirements(self, agent, target):
         return host_preflight.Requirements(target, agent["harness"], secret_refs=("mesh/api",))
@@ -51,6 +64,7 @@ class DrainHandoffTest(PgTestCase):
         work.move(self.db, lot["id"], "build")
         self.api.host_lifecycle.drain("source", actor="orch", critical=("dev",))
         for _ in range(9):
+            self.battement()
             result = self.step()[0]
         self.assertEqual(result["operation"]["state"], "verified")
         self.assertEqual(registry.get(self.db, "dev")["host"], "target")
@@ -98,11 +112,13 @@ class DrainHandoffTest(PgTestCase):
     def test_undrain_brings_agent_back_despite_same_capacity_and_cooldown(self):
         self.api.host_lifecycle.drain("source", actor="orch")
         for _ in range(9):
+            self.battement()
             self.step()
         self.assertEqual(registry.get(self.db, "dev")["host"], "target")
         self.assertIsNotNone(registry.claim(self.db, "dev", "target-runner", ttl_seconds=300))
         self.api.host_lifecycle.undrain("source", actor="orch")
         for _ in range(9):
+            self.battement()
             result = self.step()[0]
         self.assertEqual(result["operation"]["state"], "verified")
         self.assertEqual(registry.get(self.db, "dev")["host"], "source")

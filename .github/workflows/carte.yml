@@ -23,7 +23,14 @@
 # Jamais dans le dépôt : elle changerait à chaque fusion.
 #
 # Sur une PR qui touche la mesure elle-même, la carte est produite pour
-# contrôle (artefact seulement, pas de cache).
+# contrôle (artefact seulement, pas de cache) — sauf sur une PR de paquet
+# (`integration/paquet-*`, #3838) : le lot d'origine a déjà été mesuré sur sa
+# propre PR, la carte quotidienne de 03:30Z couvre le reste, et ses 18 jobs de
+# mesure tenaient 18 des 24 runners auto-hébergés contre la ci-full du paquet
+# (runs 40417160764 et 40424552119 du 27/10). Le filtre est une condition de
+# job (`github.head_ref`) : GitHub ne filtre `on.pull_request` que sur la
+# branche de base, pas sur la tête. tests/test_3838_carte_paquet.py tient la
+# règle.
 #
 # #1341 — répartition et complétude de la mesure :
 #   - A : le découpage des parts sous mesure est pondéré par les durées de la
@@ -132,6 +139,11 @@ jobs:
   # plus de la carte présente sur chaque runner au moment où le job démarre.
   plan-mesure:
     name: plan de mesure
+    # #3838 : aucune mesure sur une PR de paquet (tête `integration/paquet-*`) —
+    # le lot d'origine a été mesuré sur sa propre PR, la carte quotidienne
+    # couvre le reste. La garde est répétée sur chaque job : `carte` et
+    # `menage-mesures` portent `always()`, qui les recréerait malgré ce saut.
+    if: github.event_name != 'pull_request' || !startsWith(github.head_ref, 'integration/paquet-')
     runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted", "linux", "ameesh-ci"]') || 'ubuntu-latest' }}
     timeout-minutes: 15
     steps:
@@ -166,6 +178,9 @@ jobs:
   mesure:
     name: mesure ${{ matrix.pilote }} ${{ matrix.part }}/${{ matrix.parts }}
     needs: plan-mesure
+    # #3838 : la garde du plan est répétée ici (défense en profondeur) pour que
+    # la règle tienne même si le `needs` change.
+    if: github.event_name != 'pull_request' || !startsWith(github.head_ref, 'integration/paquet-')
     runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted", "linux", "ameesh-ci"]') || 'ubuntu-latest' }}
     # 16/10 — arbitrage pilote sur le run 38845518821 (main fae0df2b3) :
     # répartition resserrée à 6 parts psycopg et 4 parts psql (psycopg 2/4,
@@ -283,7 +298,9 @@ jobs:
     needs: mesure
     # #876 : la mesure n'est jamais bloquante, mais une exécution annulée ne
     # doit pas laisser cet agrégat en file des heures (always() seul le recrée).
-    if: always() && !cancelled()
+    # #3838 : et jamais sur une PR de paquet — `always()` recréerait ce job
+    # malgré le saut de `mesure`.
+    if: always() && !cancelled() && (github.event_name != 'pull_request' || !startsWith(github.head_ref, 'integration/paquet-'))
     runs-on: ${{ (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && fromJSON('["self-hosted", "linux", "ameesh-ci"]') || 'ubuntu-latest' }}
     # #2175 : l'assemblage d'une carte complète (10 parts) coûte ~11 min à 100 % CPU
     # localement ; à 15 min il a été annulé à 15m20 au run 38985327391 alors que les
@@ -369,7 +386,9 @@ jobs:
   menage-mesures:
     name: ménage des mesures
     needs: [mesure, carte]
-    if: always() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)
+    # #3838 : rien à ménager quand aucun job de mesure n'a tourné sur une PR de
+    # paquet ; `always()` recréerait ce job malgré le saut de ses dépendances.
+    if: always() && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) && (github.event_name != 'pull_request' || !startsWith(github.head_ref, 'integration/paquet-'))
     permissions:
       actions: write
     runs-on: ubuntu-latest
