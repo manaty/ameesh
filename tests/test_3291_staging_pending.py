@@ -31,6 +31,37 @@ class ActiveFloorTest(ReleaseFixtureMixin, unittest.TestCase):
         stage.assert_not_called()
         self.assertEqual(self.git(self.clone, "tag", "-l", "v1.11.8"), "")
 
+    def test_reported_poste_supersedes_older_active_and_does_not_regress(self):
+        """#3848 : une attestation plus recente qui reporte le poste remplace
+        son ancien commit actif ; le poste absent ne retient aucun contenu."""
+        old = self.git(self.clone, "rev-parse", "v1.11.7^{commit}")
+        folder = Path(release_cutoff.attestation_path("0" * 40)).parent
+        folder.mkdir(parents=True, exist_ok=True)
+
+        def ecrire(nom, contenu):
+            (folder / nom).write_text(json.dumps(contenu))
+
+        ecrire("actif-ancienne.json", {
+            "sha": old, "date": "2026-10-24T04:00:00Z",
+            "hotes": {hote: {"actif": old} for hote in release_cutoff.STAGING_HOSTS}
+            | {"pc-smichea": {"actif": self.head}}})
+        ecrire("actif-reportee.json", {
+            "sha": self.head, "date": "2026-10-24T05:00:00Z",
+            "hotes": {hote: {"actif": old} for hote in release_cutoff.STAGING_VMS},
+            "reportes": {"pc-smichea": {"raison": "poste absent",
+                                        "mise_a_jour": "a son retour"}}})
+        active = staging_pending.active_hosts()
+        self.assertTrue(active["pc-smichea"]["absent"])
+        self.assertIsNone(active["pc-smichea"]["sha"])
+        self.assertEqual(staging_pending.regressions(self.project, old), {})
+        # une attestation complete plus recente reprend le poste
+        ecrire("actif-complete.json", {
+            "sha": old, "date": "2026-10-24T06:00:00Z",
+            "hotes": {hote: {"actif": old} for hote in release_cutoff.STAGING_HOSTS}})
+        active = staging_pending.active_hosts()
+        self.assertFalse(active["pc-smichea"].get("absent"))
+        self.assertEqual(active["pc-smichea"]["sha"], old)
+
     def test_guard_also_covers_reconciliation_and_direct_staging(self):
         self.attest(self.head)
         old = self.git(self.clone, "rev-parse", "v1.11.7^{commit}")
@@ -95,6 +126,18 @@ class WaitingTest(ReleaseFixtureMixin, unittest.TestCase):
         self.assertEqual(result["waiting"][0]["merged_at"], 5)
         self.active["vm"]["sha"] = self.head
         self.assertEqual(self.scan()["lots"], [])
+
+    def test_reported_poste_does_not_hold_lots(self):
+        """#3848 : poste absent = il ne retient ni staging ni lots."""
+        self.hold(1, "hold: #3111 non actif")
+        self.active = {"ameesh-agents-1": {"sha": self.head},
+                       "ameesh-agents-2": {"sha": self.head},
+                       "manaty-mesh-1": {"sha": self.head},
+                       "pc-smichea": {"sha": None, "absent": True,
+                                      "raison": "poste absent"}}
+        result = self.scan()
+        self.assertEqual(result["lots"], [])
+        self.assertEqual(result["waiting"], [])
 
     def test_lifted_hold_column_reviewer_and_body_do_not_create_wait(self):
         self.hold(1, "hold: #3111 non actif")
