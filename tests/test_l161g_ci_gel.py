@@ -59,6 +59,7 @@ from urllib.parse import unquote
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from ameesh import ci, mesh_cli, plan_github, prevalidation, work  # noqa: E402
+from ameesh import prevalidation_calls  # noqa: E402
 
 DEPOT = "manaty/ameesh"
 GEL = "a" * 40
@@ -1815,6 +1816,25 @@ class RequestTest(GelTestCase):
         kwargs = gate.call_args.kwargs
         self.assertEqual(kwargs["repo"], "/arbre-paquet")
         self.assertEqual(kwargs["map_path"], "/carte/carte.json.gz")
+        # #4067 : l'échéance par défaut reste sous les 600 s du compositeur
+        self.assertLessEqual(kwargs["deadline"].remaining(),
+                             prevalidation_calls.CALLER_BUDGET_S)
+
+    def test_le_budget_de_prevalidation_vient_de_l_appelant(self):
+        # #4067 : `ci run --prevalidation-budget` borne la prévalidation du porteur.
+        gh = Gh()
+        with mock.patch("ameesh.prevalidation_calls.gate_packet",
+                        return_value={"state": "unavailable", "cause": "run-incomplete",
+                                      "why": "timeout — budget de l'appelant (90 s) "
+                                             "épuisé"}) as gate:
+            code, notes = self.run_cmd(self.packet_api(), gh,
+                                       args=self.packet_args(prevalidation_budget=90),
+                                       packet=False)
+        self.assertEqual(code, 0, notes)
+        self.assertIn(LABEL_FULL, gh.poses())
+        self.assertLessEqual(gate.call_args.kwargs["deadline"].remaining(), 90)
+        self.assertTrue(any(n.startswith("prevalidation-unavailable: run-incomplete — timeout")
+                            for n in notes), notes)
 
     def test_paquet_rouge_ne_pose_aucune_etiquette(self):
         gh = Gh()
