@@ -354,9 +354,20 @@ class Selection:
         #: #4039 : seuls les échecs réels (non exclus du guest) comptent pour
         #: la qualification d'environnement ; un échec d'un module exclu ne
         #: doit ni empêcher un run purement environnemental d'être non
-        #: concluant, ni verdir une part rouge anonyme.
+        #: concluant, ni verdir une part rouge anonyme. Une part rouge n'est
+        #: expliquée que par ses **propres** échecs nommés d'environnement :
+        #: une part sans test nommé (crash, import) reste rouge.
         environment = set(str(t) for t in (flow.get("environment") or ())) & set(failed)
-        environment_only = bool(failed) and all(t in environment for t in failed)
+        explained = True
+        for part in red:
+            named = [str(t) for t in
+                     ((flow.get("failed_by_part") or {}).get(part) or ())]
+            named = [t for t in named if test_module(t) not in excluded_names]
+            if not named or any(t not in environment for t in named):
+                explained = False
+                break
+        environment_only = (bool(failed) and all(t in environment for t in failed)
+                            and explained)
         if causes:
             outcome = "refused"
         elif environment_only and (outcome == "run-red"

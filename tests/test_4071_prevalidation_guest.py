@@ -299,6 +299,62 @@ class ProofTest(unittest.TestCase):
         self.assertEqual(report["excluded_failed"],
                          ["tests.%s.C.test_x" % FAKE])
 
+    def environment_selection(self) -> pv.Selection:
+        return pv.Selection(
+            head=A, modules=("test_real", "test_autre"),
+            parts=(
+                {"driver": "psycopg", "part": 1, "of": 2,
+                 "modules": ("test_real",)},
+                {"driver": "psycopg", "part": 2, "of": 2,
+                 "modules": ("test_autre",)},
+            ))
+
+    def environment_flow(self, first: str, second: str) -> dict:
+        """Deux parts rouges : `environment`, `code` ou `none` (muette)."""
+        lignes: list[str] = []
+        for part, module, kind in (("psycopg:1", "test_real", first),
+                                   ("psycopg:2", "test_autre", second)):
+            lignes.append(pv.PART_MARK + part)
+            evenement = {"v": 1, "schema": pv.FLOW_SCHEMA, "type": "test",
+                         "part": part, "module": module,
+                         "test": "tests.%s.C.test_x" % module,
+                         "statut": "succes" if kind == "none" else "echec"}
+            if kind == "environment":
+                evenement["extrait"] = "Postgres injoignable (banc)"
+            lignes.append(json.dumps(evenement))
+            lignes.append(json.dumps({"v": 1, "schema": pv.FLOW_SCHEMA,
+                                      "type": "fin", "part": part,
+                                      "statut": "echec", "duree_s": 1.0}))
+        return pv.parse_flow("\n".join(lignes))
+
+    def test_an_environment_failure_does_not_hide_an_anonymous_red_part(self):
+        """B/P1 cx3 : la part 2 muette reste rouge à côté d'une part env."""
+        report = self.environment_selection().proof(
+            lot=4071, host="ameesh-agents-3",
+            run={"outcome": "run-red", "exit": 1, "seconds": 1.0},
+            flow=self.environment_flow("environment", "none"))
+        self.assertFalse(report["ok"], report)
+        self.assertIn("run-red", report["causes"])
+        self.assertNotIn("run-incomplete", report["causes"])
+        self.assertIn("psycopg:2", " ".join(report["detail"]))
+
+    def test_all_red_parts_explained_by_environment_are_nonconclusive(self):
+        report = self.environment_selection().proof(
+            lot=4071, host="ameesh-agents-3",
+            run={"outcome": "run-red", "exit": 1, "seconds": 1.0},
+            flow=self.environment_flow("environment", "environment"))
+        self.assertFalse(report["ok"], report)
+        self.assertIn("run-incomplete", report["causes"])
+        self.assertNotIn("run-red", report["causes"])
+
+    def test_an_environment_failure_does_not_hide_a_real_code_failure(self):
+        report = self.environment_selection().proof(
+            lot=4071, host="ameesh-agents-3",
+            run={"outcome": "run-red", "exit": 1, "seconds": 1.0},
+            flow=self.environment_flow("environment", "code"))
+        self.assertFalse(report["ok"], report)
+        self.assertIn("run-red", report["causes"])
+
 
 class ValidateTest(unittest.TestCase):
     def test_validate_sends_the_filtered_plan_and_reports_the_exclusions(self):
