@@ -31,7 +31,7 @@ class RemoteTipBatchTest(TestCase):
     def test_many_absent_pull_tips_prove_absence_in_one_fetch(self):
         before = self.repo.git("for-each-ref")
         with mock.patch.object(plan_git, "_git", wraps=plan_git._git) as git:
-            self.assertFalse(plan_git.remote_reachable(self.repo.root, self.ghost))
+            self.assertFalse(plan_git.remote_reachable(self.repo.root, self.ghost, timeout=None))
         fetches = [call for call in git.call_args_list if call.args[1] == "fetch"]
         self.assertEqual(len(fetches), 1)
         self.assertEqual(len(fetches[0].kwargs["stdin"].splitlines()), 513)
@@ -44,7 +44,29 @@ class RemoteTipBatchTest(TestCase):
         child = self.remote.git("commit-tree", tree, "-p", self.ghost, "-m", "child")
         self.remote.git("update-ref", "refs/pull/9999/head", child)
         self.remote.git("update-ref", "-d", "refs/archive/seed")
-        self.assertTrue(plan_git.remote_reachable(self.repo.root, self.ghost))
+        real = plan_git._git
+
+        def constrained_fetch(repo, *args, **kwargs):
+            # #3970 : simuler un fetch plus lent que tout budget fini,
+            # sans sleep et sans dépendre de la charge de la machine.
+            if args[0] == "fetch" and kwargs.get("timeout") is not None:
+                raise plan_git.GitError("git fetch: timed out")
+            return real(repo, *args, **kwargs)
+
+        with mock.patch.object(plan_git, "_git", side_effect=constrained_fetch) as git:
+            # La borne finie reste conservatrice en production.
+            self.assertIsNone(plan_git.remote_reachable(
+                self.repo.root, self.ghost, timeout=plan_git.FETCH_TIMEOUT))
+            self.assertEqual(sum(c.args[1] == "fetch" for c in git.call_args_list), 1)
+            git.reset_mock()
+            # La preuve de portée utilise le vrai Git, sans borne de fetch.
+            self.assertTrue(plan_git.remote_reachable(self.repo.root, self.ghost, timeout=None))
+        fetches = [call for call in git.call_args_list if call.args[1] == "fetch"]
+        self.assertEqual(len(fetches), 1)
+        tips = fetches[0].kwargs["stdin"].decode().splitlines()
+        self.assertEqual(len(tips), 514)
+        self.assertIn(child, tips)
+        self.assertIsNone(fetches[0].kwargs["timeout"])
 
     def test_exhausted_budget_or_failed_fetch_keeps_the_doubt(self):
         self.assertIsNone(plan_git.remote_reachable(
@@ -57,4 +79,4 @@ class RemoteTipBatchTest(TestCase):
             return real(repo, *args, **kwargs)
 
         with mock.patch.object(plan_git, "_git", side_effect=fail_fetch):
-            self.assertIsNone(plan_git.remote_reachable(self.repo.root, self.ghost))
+            self.assertIsNone(plan_git.remote_reachable(self.repo.root, self.ghost, timeout=None))
