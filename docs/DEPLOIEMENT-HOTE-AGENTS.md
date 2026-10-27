@@ -320,7 +320,8 @@ toute installation. La sauvegarde locale du poste est remplacée par un dump
 du serveur seul : `ameesh-sauvegarde.service` lancé sur `manaty-mesh-1`, un
 nouveau dump exigé (chemin, taille, SHA-256 dans la trace), gardé sur la VM
 sans rapatriement ; un échec arrête avant les migrations ; serveur reporté
-(`--absent manaty-mesh-1=…`), le dump est sauté et tracé `reporte`. Nommé dans
+(`--absent manaty-mesh-1=…`), le dump est sauté, sans autre événement à son
+nom que `absent`/`reporte` (une autre étape contredirait l’absence). Nommé dans
 `--hotes` alors qu’il est absent, le poste est ignoré : la sélection est celle
 des VM nommées. Le tick de release ne relance une séquence déjà attestée avec
 le poste reporté que s’il tourne sur le poste (même détection d’hôte), pour le

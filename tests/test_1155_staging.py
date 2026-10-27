@@ -730,11 +730,12 @@ class StagingTest(unittest.TestCase):
         self.assertEqual(trace['sha'], self.sha)
         self.assertIn('sans-acces', trace['detail'])
         self.assertIn('manaty-mesh-1 : absent', p.stdout)
-        # aucun dump tente sur un serveur sans acces ; le saut est trace (#3853)
+        # aucun dump tente sur un serveur sans acces ; le serveur reporte ne
+        # porte que son evenement absent (actif.py, preuve_absence ; #3853)
         self.assertFalse([l for l in self.calls() if l.startswith('sauvegarde-serveur ')])
-        sauvegarde = next(t for t in self.traces() if t['etape'] == 'sauvegarde')
-        self.assertEqual((sauvegarde['hote'], sauvegarde['verdict']),
-                         ('manaty-mesh-1', 'reporte'))
+        self.assertIn('sauvegarde sautee', p.stdout)
+        self.assertEqual([t['etape'] for t in self.traces()
+                          if t['hote'] == 'manaty-mesh-1'], ['absent'])
         ligne = self.actif_args()
         self.assertIn('--absent manaty-mesh-1=sans-acces', ligne)
         self.assertIn('--absent pc-smichea=', ligne)

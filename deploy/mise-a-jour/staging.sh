@@ -743,9 +743,11 @@ done
 if [ "$SAUVER" = 1 ]; then
   if [ "$POSTE_ABSENT" = 1 ] && [ "$SERVEUR_ABSENT" = 1 ]; then
     # serveur reporte (aucun acces root) : aucun dump possible d'ici ; la
-    # sauvegarde quotidienne du serveur reste la seule (bureau #147558).
+    # sauvegarde quotidienne du serveur reste la seule (bureau #147558). Rien
+    # n'est journalise a son nom : un hote reporte ne porte que son evenement
+    # absent/reporte, toute autre etape contredirait l'absence (actif.py,
+    # preuve_absence ; avis cx2 sur h-34).
     etape "sauvegarde sautee (poste et serveur reportes)"
-    trace "$HOTE_SERVEUR" sauvegarde reporte "serveur sans acces : dump avant migrations non fait, sauvegarde quotidienne du serveur seule"
     echo "  sauvegarde non faite (poste et serveur reportes) ; sauvegarde quotidienne du serveur seule"
   elif [ "$POSTE_ABSENT" = 1 ]; then
     etape "sauvegarde du serveur sur manaty-mesh-1 (poste absent, dump garde sur la VM)"

@@ -1221,6 +1221,39 @@ class StagingSignalTest(unittest.TestCase):
         self.assertEqual(self.actifs(), [])
         self.assertIn('sequence partielle', p.stderr)
 
+    def preuves_du_journal_reel(self):
+        """Le vrai controle d'actif.py (preuves) sur le journal que staging.sh
+        vient d'ecrire, avec les arguments exacts du signal : la couture que
+        les bancs separes ne voient pas (avis cx2 h-34, #3853)."""
+        argv = (self.state / 'actif.args').read_bytes().decode().split('\0')[1:-1]
+        actif = charger_actif()
+        args = actif.analyseur().parse_args(argv)
+        couples = lambda liste: dict(e.partition('=')[::2] for e in liste)
+        # le banc ssh ne relit pas le commit installe des VM (valeur vide) :
+        # cette relecture n'est pas la couture visee, le journal l'est.
+        actifs = {nom: valeur or args.sha for nom, valeur in couples(args.hote).items()}
+        evenements = actif.lire_journal(Path(args.journal), args.depuis)
+        return actif.preuves(evenements, args.sha, actifs,
+                             couples(args.mode), couples(args.absent))
+
+    def test_journal_reel_depuis_une_vm_est_attestable(self):
+        """Depuis une VM, serveur present (dump serveur journalise) ou reporte
+        (sans acces root, sauvegarde par defaut) : le journal complet passe
+        le controle reel des preuves."""
+        cas = {'serveur present': (),
+               'serveur reporte': ('--absent', 'manaty-mesh-1=sans acces root')}
+        for nom, options in cas.items():
+            with self.subTest(nom):
+                for f in (self.home / '.local/state/ameesh/mise-a-jour').glob('staging-*.jsonl'):
+                    f.unlink()
+                env = dict(self.env, HOTE_LOCAL='ameesh-agents-1')
+                p = self.run_staging(*options, '--rapporteurs', 'docs01', env=env)
+                self.assertEqual(p.returncode, 0, p.stderr + p.stdout)
+                preuve, reportes = self.preuves_du_journal_reel()
+                attendus = {'pc-smichea'} | ({'manaty-mesh-1'} if options else set())
+                self.assertEqual(set(reportes), attendus)
+                self.assertNotIn('pc-smichea', preuve)
+
     def test_poste_absent_appelle_le_signal_avec_absent(self):
         """#3848 : depuis une VM, le signal porte --absent et les trois VM."""
         env = dict(self.env, HOTE_LOCAL='ameesh-agents-1')
@@ -1316,6 +1349,9 @@ case "${1:-}" in
 esac
 if [ "$(basename "${1:-}")" = actif.py ]; then
   printf 'actif %s\n' "$*" >> "$state/calls.log"
+  # arguments exacts (une raison contient des espaces) pour rejouer le vrai
+  # controle des preuves sur le journal reel (#3853)
+  printf '%s\0' "$@" > "$state/actif.args"
   if grep -qx "ko=actif:5" "$state/scenario" 2>/dev/null; then
     grep -vx "ko=actif:5" "$state/scenario" > "$state/scenario.tmp" || true
     mv "$state/scenario.tmp" "$state/scenario"
