@@ -129,6 +129,15 @@ SSH = r'''#!/usr/bin/env bash
 printf 'stub %s %s\n' "$0" "$*" >> "${FAKE_STATE:?}/calls.log"
 printf 'ssh %s\n' "$*" >> "${FAKE_STATE:?}/calls.log"
 case "$*" in
+  *"rev-parse --verify HEAD"*)
+    # #4050 : clone de travail des migrations (DEPOT_VM) ; absent par scenario,
+    # comme sur un hote neuf avant le premier staging.
+    if grep -qx "clone=absent" "$FAKE_STATE/scenario" 2>/dev/null; then
+      echo "fatal: not a git repository (or any of the parent directories): .git" >&2
+      exit 128
+    fi
+    echo "0123456789abcdef0123456789abcdef01234567"
+    exit 0 ;;
   *"bash -s -- "*)
     cat >/dev/null || true
     if grep -qx "ko=migration" "$FAKE_STATE/scenario" 2>/dev/null; then
@@ -439,6 +448,10 @@ class StagingTest(unittest.TestCase):
             ('pc-smichea', 'controler'),
         ])
         self.assertIn('venv-ameesh doctor --harness', self.calls())
+        # #4050 : le clone des migrations n'est exige que du chemin sans poste ;
+        # une sequence lancee sur le poste ne sonde pas les VM.
+        self.assertFalse([ligne for ligne in self.calls()
+                          if 'rev-parse --verify HEAD' in ligne])
         for host in ('ameesh-agents-1', 'ameesh-agents-2', 'ameesh-agents-3', 'manaty-mesh-1', 'pc-smichea'):
             self.assertIn('courrier %s : ok' % host, p.stdout)
         traces = self.traces()
@@ -698,7 +711,43 @@ class StagingTest(unittest.TestCase):
                          [('ameesh-agents-3', 'installer')])
         self.assertTrue(any(t['hote'] == 'ameesh-agents-3' and t['etape'] == 'migrations'
                             for t in self.traces()))
+        # #4050 : le clone de migrations est verifie au preflight, avant la
+        # migration qui part de cette VM.
+        sondes = [i for i, ligne in enumerate(self.calls())
+                  if ligne.startswith('stub ') and 'rev-parse --verify HEAD' in ligne]
+        self.assertEqual(len(sondes), 1, self.calls())
+        migrations = [i for i, ligne in enumerate(self.calls())
+                      if ligne.startswith('stub ') and 'bash -s -- %s' % self.sha in ligne]
+        self.assertEqual(len(migrations), 1, self.calls())
+        self.assertLess(sondes[0], migrations[0])
         self.assertNotIn('actif.py', ' '.join(self.calls()))
+
+    def test_vm_migration_host_without_clone_is_refused_before_mutation(self):
+        """#4050 : hote neuf sans clone de migrations (~/work/ameesh-release) :
+        refus nomme au preflight, avec le geste exact, avant sauvegarde,
+        migration et tout arret de runner ; aucun retour automatique."""
+        (self.state / 'scenario').write_text('clone=absent\n')
+        p = self.run_vm('--hotes', 'ameesh-agents-3')
+        self.assertEqual(p.returncode, 1, p.stdout + p.stderr)
+        self.assertIn('clone des migrations absent ou illisible sur ameesh-agents-3',
+                      p.stderr)
+        self.assertIn('/home/ameesh/work/ameesh-release', p.stderr)
+        self.assertIn('git clone https://github.com/manaty/ameesh.git '
+                      '/home/ameesh/work/ameesh-release', p.stderr)
+        self.assertIn('aucun retour automatique', p.stderr)
+        self.assertTrue(any('rev-parse --verify HEAD' in ligne
+                            for ligne in self.calls()))
+        # le preflight s'arrete la : aucune sauvegarde, migration (bash -s),
+        # installation ni retour ; rien d'autre n'a ete appele.
+        self.assertFalse([ligne for ligne in self.calls()
+                          if ligne.startswith('sauvegarde-serveur ')])
+        self.assertFalse([ligne for ligne in self.calls()
+                          if ligne.startswith('stub ') and 'bash -s -- ' in ligne])
+        self.assertEqual(self.actions(), [], self.calls())
+        self.assertNotIn('actif.py', ' '.join(self.calls()))
+        trace = next(t for t in self.traces() if t['etape'] == 'verifier')
+        self.assertEqual((trace['hote'], trace['verdict']), ('ameesh-agents-3', 'ko'))
+        self.assertIn('clone des migrations', trace['detail'])
 
     def test_third_agent_failure_rolls_back_before_workstation(self):
         (self.state / 'scenario').write_text('ko=sante:ameesh-agents-3\n')
