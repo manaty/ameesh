@@ -60,8 +60,13 @@ database, so `actif.py` accepts it only after the server's restart (#1323, avis
 R2 B1). A server that does have executants keeps the local rule; a host with
 agents and no free driven persona is still a `sans-sonde` refusal.
 
-Run it on the workstation with the workstation venv, where the mesh
-configuration lives. No secret is read or printed.
+Run it with an ameesh venv and a route to the mesh database: the workstation,
+or an agents VM (`staging.sh` runs it there when launched elsewhere, #3976).
+When the configuration or the database cannot be reached from that machine,
+nothing was observed on the probed host: the verdict is ``non-concluant``
+(exit 3), never a KO that would roll the host back — except with
+``--serveur``, whose database is the probed host's own. No secret is read or
+printed.
 """
 from __future__ import annotations
 
@@ -448,8 +453,26 @@ def main(argv: list[str] | None = None) -> int:
                "sonde": None, "pourquoi": None, "attente_s": args.attente,
                "souffrance_s": args.souffrance}
     conn = None
+    erreur_base = None
     try:
         conn = db_mod.connect(config.load())
+    except Exception as exc:  # noqa: BLE001 — l'outil n'a pas pu tourner
+        if not args.serveur:
+            # #3976 : configuration absente ou base injoignable depuis la
+            # machine qui fait tourner la sonde : rien n'a ete constate sur
+            # l'hote sonde. Non concluant (canon §3), jamais un KO qui
+            # remettrait l'hote en arriere. Le serveur garde le KO : la base
+            # est la sienne et vient d'etre redemarree.
+            rapport.update(verdict="non-concluant",
+                           erreur="%s: %s" % (type(exc).__name__, exc))
+            print(json.dumps(rapport, ensure_ascii=False) if args.json
+                  else "courrier %s : sonde non concluante (%s)"
+                  % (args.hote, rapport["erreur"]))
+            return 3
+        erreur_base = exc
+    try:
+        if erreur_base is not None:
+            raise erreur_base
         now = time.time()
         rows = personas(conn, args.hote)
         rapport["personas"] = len(rows)
