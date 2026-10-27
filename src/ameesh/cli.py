@@ -2206,6 +2206,16 @@ def cmd_doctor(cfg: Config, notify_test: bool, probe: bool = False,
             print(line)
     except Exception as exc:  # a reading never breaks the doctor
         print("network    : not checked (%s)" % (" ".join(str(exc).split())[:120],))
+    # #3969 : un compte déclaré que la sélection jugerait invalide (profil
+    # en 755 à la mise en service d'agents-3) tient ses agents sans tour
+    accounts_ko = False
+    try:
+        from . import accounts as accounts_mod
+        accounts_ko, account_lines = accounts_mod.doctor_lines(cfg)
+    except Exception as exc:  # a reading never breaks the doctor
+        account_lines = ["not checked (%s)" % (" ".join(str(exc).split())[:120],)]
+    for line in account_lines:
+        print("accounts   : %s" % line)
     # #3745 : le pgbouncer local accepte-t-il les réglages `-c` qu'ameesh
     # envoie au démarrage de session ? Lu sur sa console avant la connexion
     # ordinaire, que son refus ferait échouer (`jit` de #3503 sur pc-smichea).
@@ -2336,6 +2346,8 @@ def cmd_doctor(cfg: Config, notify_test: bool, probe: bool = False,
     # #3345 : un profil de l'hôte qui diverge sur train, github ou release
     # n'est pas un état vert — le runner d'à côté ne fait pas la même chose.
     if profile_ko:
+        verdict = 1
+    if accounts_ko:
         verdict = 1
     # #2763 : installation éditable, ou ameesh chargé hors du venv déployé
     from . import venv_guard

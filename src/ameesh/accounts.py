@@ -1736,6 +1736,98 @@ class Choice:
     per_agent: bool = False
 
 
+#: #3969 : la raison d'un choix sans compte plaçable parce qu'un compte
+#: déclaré est INVALIDE (dossier non privé, profil absent, identifiants
+#: manquants) — une configuration de l'hôte, pas un budget : elle ne porte
+#: jamais l'échéance d'une pause (`pause_label`). L'exécuteur la pose sous
+#: `CONFIG_BLOCK_PREFIX`, d'où l'alerte `account_config_invalid`.
+NO_VALID_PREFIX = "no valid "
+#: #3969 : le `status_text` d'un agent bloqué par une configuration de comptes
+CONFIG_BLOCK_PREFIX = "accounts : "
+
+
+def remedy(profile: Profile, problem: str) -> str:
+    """Le geste qui répare un problème de `check` (#3969), ou ''."""
+    if problem.startswith("directory not private"):
+        return "chmod 700 %s" % profile.path
+    if problem.startswith("key file too permissive"):
+        return "chmod 600 %s" % profile.key_file
+    if problem.startswith("missing directory"):
+        return "install -d -m 700 %s, then log in" % profile.path
+    if problem.startswith("credentials missing"):
+        return "log in with %s=%s" % (config_env_of(profile.harness) or "the harness",
+                                      profile.path)
+    return ""
+
+
+def invalid(profile: Profile, problems: list[str]) -> list[str]:
+    """Les problèmes de configuration d'un compte, remède compris (#3969).
+    Un compte refusé par ce mesh (#313, `refused`) n'en est pas un : c'est
+    une règle, pas une erreur d'hôte."""
+    if getattr(profile, "refused", ""):
+        return []
+    out = []
+    for problem in problems:
+        geste = remedy(profile, problem)
+        out.append("%s (fix: %s)" % (problem, geste) if geste else problem)
+    return out
+
+
+def no_valid_reason(harness: str, evaluations: dict) -> str:
+    """#3969 : « no valid <harness> account: … » quand au moins un compte
+    déclaré est invalide et qu'aucun n'est plaçable, sinon ''. Les autres
+    comptes suivent, avec leur raison (seuil, relevé) : réparer la
+    configuration suffit à rouvrir le placement, l'échéance d'un compte au
+    seuil n'est pas la cause."""
+    bad = {name: invalid(ev.profile, ev.problems) for name, ev in evaluations.items()}
+    bad = {name: problems for name, problems in bad.items() if problems}
+    if not bad:
+        return ""
+    why = "%s%s account: %s" % (NO_VALID_PREFIX, harness, "; ".join(
+        "%s: %s" % (name, ", ".join(problems)) for name, problems in bad.items()))
+    rest = {name: ev for name, ev in evaluations.items() if name not in bad}
+    if rest:
+        why += " — other accounts: %s" % _label(rest)
+    return why
+
+
+def doctor_lines(cfg, environ=None) -> tuple[bool, list[str]]:
+    """#3969 : `(ko, lignes)` de `ameesh doctor` — chaque compte déclaré sur
+    l'hôte que la sélection jugerait invalide (`check`), avec son remède. Le
+    27/10, à la mise en service d'agents-3, des profils laissés en 755 ont
+    tenu des agents en « pause budget » sous un doctor vert.
+
+    Lu par l'utilisateur qui lance doctor : un dossier à un autre
+    utilisateur (doctor lancé hors du compte de l'exécuteur) n'est pas jugé,
+    ni une variable de clé, que porte l'environnement de l'exécuteur."""
+    environ = os.environ if environ is None else environ
+    try:
+        declared = parse(getattr(cfg, "accounts", None) or {})
+    except AccountError as exc:
+        return True, ["KO — invalid account configuration: %s" % exc]
+    uid = os.getuid() if hasattr(os, "getuid") else None
+    ko, lines = False, []
+    for harness, items in declared.items():
+        for profile in items:
+            label = "%s/%s" % (harness, profile.name)
+            if profile.kind == "api_key_env":
+                continue
+            if profile.kind == "config_dir" and not profile.default and uid is not None:
+                try:
+                    owner = os.stat(profile.path).st_uid
+                except OSError:
+                    owner = uid
+                if owner != uid:
+                    lines.append("%s not checked (%s belongs to uid %d: run doctor as "
+                                 "the runner's user)" % (label, profile.path, owner))
+                    continue
+            problems = invalid(profile, _check(profile, environ))
+            if problems:
+                ko = True
+                lines.append("KO — %s invalid: %s" % (label, "; ".join(problems)))
+    return ko, lines
+
+
 def pause_label(evaluations: dict) -> str:
     """L242b (4) : la pause en court, devant sa raison détaillée — le compte
     qui se libère le premier : « pause (account secondaire, five_hour 96 %)
@@ -2529,6 +2621,10 @@ def choose(db, host: str, harness: str, items: list[Profile], book, *,
                         for p in items
                         if p.name not in sick and cache[p.name].gauges
                         and reading_outdated(cache[p.name].gauges, now)]
+            # #3969 : un compte invalide (profil en 755 à la mise en service
+            # d'agents-3) n'est pas une pause budget jusqu'au reset du compte
+            # au seuil : la configuration de l'hôte est la cause, dite telle
+            invalides = no_valid_reason(harness, cache)
             why = "%sall %s accounts at threshold — %s" % (
                 pause_label(cache), harness, _label(cache))
             ecartes_why = []
@@ -2539,7 +2635,9 @@ def choose(db, host: str, harness: str, items: list[Profile], book, *,
             if retenus:
                 ecartes_why.append("%s held for overage seen on this host"
                                    % ", ".join(sorted(retenus)))
-            if ecartes_why:
+            if invalides:
+                why = invalides + "".join("; %s" % e for e in ecartes_why)
+            elif ecartes_why:
                 why = ("%sno %s account to place: %s — %s"
                        % (pause_label(cache), harness, "; ".join(ecartes_why),
                           _label(cache)))
