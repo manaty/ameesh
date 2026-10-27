@@ -203,6 +203,32 @@ class GrepCacheTest(unittest.TestCase):
                                         second, ["un = 1"])
         self.assertEqual(value, set())
 
+    def test_the_process_cache_follows_info_attributes(self):
+        # relevé cx2 sur fbf586ac : sans vider le cache mémoire de #3753
+        canon._content_cache_clear()
+        with mock.patch.object(grep_cache, "ENABLED", False):
+            first = review_authors._tree_lines(self.repo, self.first, ["un = 1"])
+            self._info_attributes("a.py binary\n")
+            after = review_authors._tree_lines(self.repo, self.first, ["un = 1"])
+            sources = review_authors._source_paths(self.repo, self.first,
+                                                   ["un = 1"], {})
+        self.assertEqual((first, after, sources), ({"un = 1"}, set(), set()))
+        # puis le cache disque, rallumé, ne garde pas une lecture périmée
+        value, launched = self.counted(review_authors._tree_lines, self.repo,
+                                       self.first, ["un = 1"])
+        self.assertEqual((value, launched), (set(), 1))
+
+    def test_git_2_40_is_not_trusted_with_attr_source(self):
+        self.assertEqual(grep_cache.ATTR_SOURCE_GIT, (2, 41))
+        with mock.patch.object(grep_cache, "_git_version_cache", [(2, 40)]):
+            self.assertFalse(grep_cache._attr_source_supported())
+            one = grep_cache.neutral_attributes(self.first, self.repo)
+            two = grep_cache.neutral_attributes(self.first, self.repo)
+        self.assertNotEqual(one[grep_cache.ATTR_TOKEN_ENV],
+                            two[grep_cache.ATTR_TOKEN_ENV])
+        with mock.patch.object(grep_cache, "_git_version_cache", [(2, 41)]):
+            self.assertTrue(grep_cache._attr_source_supported())
+
     def test_an_old_git_caches_nothing(self):
         calls = []
         with mock.patch.object(grep_cache, "_attr_source_supported",

@@ -19,10 +19,10 @@ un échec reste un doute et se relit au passage suivant.
 Attributs (B/P2 cx2 sur b4e42699) : `-I` dépend de l'attribut `binary`, que git
 lit dans les `.gitattributes` du dépôt de travail, `info/attributes`,
 `core.attributesFile` et le fichier système. Le balayage lit donc les
-attributs **de l'arbre balayé** (`GIT_ATTR_SOURCE`, git ≥ 2.40), sans fichier
+attributs **de l'arbre balayé** (`GIT_ATTR_SOURCE`, git ≥ 2.41), sans fichier
 global ni système (`neutral_attributes`) ; le seul contexte local restant,
 `info/attributes` du dépôt commun, entre dans la clé par son contenu. Un git
-sans `GIT_ATTR_SOURCE` ne cache rien.
+sans `GIT_ATTR_SOURCE` (< 2.41) ne cache rien.
 
 Deux processus qui calculent la même clé ne balaient pas deux fois : le second
 attend le verrou de la clé (borné) puis relit le résultat du premier.
@@ -56,8 +56,12 @@ LOCK_WAIT_S = canon.GIT_TIMEOUT
 LOCK_STEP_S = 0.1
 #: version du format : un changement de format change toutes les clés
 FORMAT = 2
-#: première version de git qui lit `GIT_ATTR_SOURCE`
-ATTR_SOURCE_GIT = (2, 40)
+#: première version de git qui lit `GIT_ATTR_SOURCE` (absent de l'attr.c de
+#: v2.40.0, présent en v2.41.0 : relevé cx2)
+ATTR_SOURCE_GIT = (2, 41)
+#: variable sans effet sur git qui porte l'empreinte de `info/attributes` dans
+#: `env_extra`, donc dans la clé du cache mémoire de `canon._git` (#3753)
+ATTR_TOKEN_ENV = "AMEESH_INFO_ATTRIBUTES"
 
 _stores = 0
 #: interrupteur du processus (la suite de tests le met à False)
@@ -78,12 +82,25 @@ def root() -> str:
     return os.path.join(os.path.expanduser(state), CACHE_DIR)
 
 
-def neutral_attributes(rev: str) -> dict:
+def neutral_attributes(rev: str, repo: str = "") -> dict:
     """L'environnement d'un balayage dont les attributs ne dépendent que de
-    l'arbre de `rev` et de `info/attributes` (lié à la clé)."""
-    return {"GIT_ATTR_SOURCE": str(rev), "GIT_ATTR_NOSYSTEM": "1",
-            "GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "core.attributesFile",
-            "GIT_CONFIG_VALUE_0": os.devnull}
+    l'arbre de `rev` et de `info/attributes` (lié à la clé).
+
+    Avec `repo`, l'empreinte de `info/attributes` entre aussi dans
+    l'environnement : le cache mémoire de `canon._git` (clé : args, stdin,
+    `env_extra`, dépôt) ne relit jamais un balayage fait sous d'autres
+    attributs (relevé cx2 sur fbf586ac). Une empreinte illisible donne une
+    valeur unique : rien n'est alors relu du cache mémoire."""
+    env = {"GIT_ATTR_SOURCE": str(rev), "GIT_ATTR_NOSYSTEM": "1",
+           "GIT_CONFIG_COUNT": "1", "GIT_CONFIG_KEY_0": "core.attributesFile",
+           "GIT_CONFIG_VALUE_0": os.devnull}
+    if repo:
+        # sans `GIT_ATTR_SOURCE`, les attributs du dépôt de travail comptent
+        # encore : aucune relecture du cache mémoire non plus
+        token = attributes_token(repo) if _attr_source_supported() else None
+        env[ATTR_TOKEN_ENV] = token if token is not None else (
+            "unreadable-" + os.urandom(16).hex())
+    return env
 
 
 _git_version_cache: list = []

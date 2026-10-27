@@ -147,7 +147,7 @@ def _sweep_grep(repo: str, rev: str, args: Sequence[str], patterns: Sequence[str
     stdin = ("\n".join(patterns) + "\n").encode("utf-8")
     # B/P2 cx2 : les attributs (`-I`) sont ceux de l'arbre balayé, jamais ceux
     # du dépôt de travail lecteur ; le résultat se partage entre clones.
-    env = grep_cache.neutral_attributes(rev)
+    env = grep_cache.neutral_attributes(rev, repo)
     if sweep is None:
         return plan_git._git(repo, "grep", *args, "-f", "-", str(rev), stdin=stdin,
                              env_extra=env)
