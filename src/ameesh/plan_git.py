@@ -264,12 +264,17 @@ def ref_reachable(repo: str, rev: str, *,
 
     #3835 : `for-each-ref --contains` coûte ~8 s sur un clone de 5 500 refs
     (mesuré sur un clone nexlink ; le commit-graph n'y change rien). `name-rev
-    --name-only` lit la même accessibilité en ~0,1 s : il nomme le commit
-    depuis les refs, et rend `undefined` quand aucune ne le contient. Le
-    chemin rapide passe d'abord ; un échec de `name-rev` retombe sur
-    `for-each-ref --contains`, qui reste la référence. `why` reçoit le motif
-    d'un `None` (`"timeout"` ou le message git) : un délai se dit comme tel
-    au lieu d'être confondu avec un dépôt illisible.
+    --name-only` élague par date de commit et rend `undefined` pour un ancêtre
+    dont l'enfant est daté avant lui (faux négatif prouvé par ameesh-cx1 et
+    l'auditeur). `--annotate-stdin` désactive cette coupure : il nomme le
+    commit si une ref le contient, et rend le SHA tel quel sinon. On résout
+    d'abord la révision en commit complet (une abréviation n'est pas
+    substituée et se lirait « absente »), puis on lit l'annotation en ~0,3 s.
+    Un SHA rendu inchangé est une absence, sauf si une ref porte exactement ce
+    nom de SHA (cas pathologique) : on retombe alors, comme sur un échec de
+    `name-rev`, sur `for-each-ref --contains`, la preuve de référence. `why`
+    reçoit le motif d'un `None` (`"timeout"` ou le message git) : un délai se
+    dit comme tel au lieu d'être confondu avec un dépôt illisible.
 
     Ne voit que les refs **locales** : les refs distantes non rapatriées
     (toute l'annonce : tags, branches hors refspec, `refs/archive/…`,
@@ -285,34 +290,57 @@ def ref_reachable(repo: str, rev: str, *,
         if why is not None:
             why.append(_doubt_reason(exc))
 
-    # #3835 : chemin rapide. `name-rev` couvre toutes les refs (y compris
-    # `refs/ameesh/…`, `refs/pull/…`), pas seulement heads/tags/remotes.
+    # `--annotate-stdin` ne substitue que des SHA complets : une abréviation
+    # serait rendue telle quelle et lue à tort comme une absence.
     try:
-        fast = _git(repo, "name-rev", "--name-only", rev,
-                    env_extra=NO_LAZY_FETCH, **bound)
-    except (GitError, OSError) as exc:
+        full = _commit(repo, rev, timeout=PROBE_TIMEOUT_S)
+    except GitError as exc:
         doubt(exc)
         return None
-    if fast.returncode == 0:
-        name = fast.stdout.decode("utf-8", "replace").strip()
-        if name == "undefined":
-            # Sentinelle de `name-rev` ; une ref dont le nom court est
-            # exactement `undefined` rendrait le même texte. Dans ce seul cas
-            # ambigu, on retombe sur la lecture de référence.
-            clash = _out(repo, "for-each-ref", "--format=%(refname)",
-                         "refs/heads/undefined", "refs/undefined")
-            if clash is not None and not clash.strip():
-                return False
-        elif name:
-            return True
-    # `name-rev` en échec (ou ambigu) : la lecture de référence tranche.
+    if not full:
+        if why is not None:
+            why.append("commit not found")
+        return None
+
+    # #3835 : chemin rapide. `name-rev` couvre toutes les refs (y compris
+    # `refs/ameesh/…`, `refs/pull/…`), pas seulement heads/tags/remotes, et
+    # `--annotate-stdin` désactive l'élagage par date.
     try:
-        proc = _git(repo, "for-each-ref", "--contains=" + rev,
+        fast = _git(repo, "name-rev", "--annotate-stdin", "--name-only",
+                    stdin=(full + "\n").encode(),
+                    env_extra=NO_LAZY_FETCH, **bound)
+    except GitError as exc:
+        if _doubt_reason(exc) == "timeout":
+            doubt(exc)
+            return None
+        # échec non temporel : la lecture de référence tranche
+    except OSError as exc:
+        doubt(exc)
+        return None
+    else:
+        if fast.returncode == 0:
+            name = fast.stdout.decode("utf-8", "replace").strip()
+            if name and name != full:
+                return True
+            if name == full:
+                # Un SHA rendu inchangé est une absence, sauf si une ref dont
+                # le nom court est exactement ce SHA le contient : `name-rev`
+                # rendrait alors le même texte. Ce seul cas va à la référence.
+                clash = _out(repo, "for-each-ref", "--format=%(refname)",
+                             "refs/heads/" + full, "refs/" + full)
+                if clash is not None and not clash.strip():
+                    return False
+    # `name-rev` ambigu, vide ou en échec : la lecture de référence tranche.
+    try:
+        proc = _git(repo, "for-each-ref", "--contains=" + full,
                     "--format=%(refname)", env_extra=NO_LAZY_FETCH, **bound)
     except (GitError, OSError) as exc:
         doubt(exc)
         return None
     if proc.returncode != 0:
+        if why is not None:
+            why.append("`git for-each-ref --contains` failed (code %d)"
+                       % proc.returncode)
         return None
     return bool(proc.stdout.strip())
 

@@ -69,33 +69,65 @@ class RefReachableFastPathTest(TestCase):
         self.repo.git("update-ref", "refs/heads/undefined", self.dangling)
         self.assertTrue(plan_git.ref_reachable(self.repo.root, self.dangling))
 
+    def test_a_negative_from_name_rev_is_confirmed_by_the_reference_reader(self):
+        # B/P1 d'ameesh-cx1 : `name-rev` élague par date. Un enfant daté avant
+        # son parent rend `undefined` pour le parent, pourtant contenu par la
+        # branche : un `False` rapide ferait accepter --supersedes et
+        # ignore_unknown sur un gel encore accessible (#2989/#3399).
+        root = tempfile.mkdtemp(prefix="ameesh-3835-dates-")
+        self.addCleanup(shutil.rmtree, root, True)
+        repo = _Repo(root)
+        repo.write("f", "seed\n")
+        seed = repo.commit("seed")
+        tree = repo.git("rev-parse", seed + "^{tree}")
+
+        def env(date):
+            return dict(repo.dry, GIT_AUTHOR_DATE=date, GIT_COMMITTER_DATE=date)
+
+        base = repo.git("commit-tree", tree, "-m", "base daté aujourd'hui",
+                        env=env("2026-10-27T12:00:00 +0000"))
+        child = repo.git("commit-tree", tree, "-p", base, "-m",
+                         "enfant daté 2000", env=env("2000-01-01T00:00:00 +0000"))
+        repo.git("update-ref", "refs/heads/master", child)
+        # la prémisse du témoin : name-rev se trompe, la référence non.
+        self.assertEqual(repo.git("name-rev", "--name-only", base), "undefined")
+        self.assertIn("refs/heads/master", repo.git(
+            "for-each-ref", "--contains=" + base, "--format=%(refname)"))
+        self.assertTrue(plan_git.ref_reachable(repo.root, base))
+
     def test_the_fast_path_is_used_before_for_each_ref(self):
         seen = []
 
         def fake(repo, *args, **kwargs):
             seen.append(args[0])
+            if args[0] == "rev-parse":
+                return self._proc(("git",) + args, 0,
+                                  (self.dangling + "\n").encode())
             if args[0] == "name-rev":
                 return self._proc(("git",) + args, 0, b"keep~1\n")
             raise AssertionError("for-each-ref must not be the first reader")
 
         with mock.patch.object(plan_git, "_git", side_effect=fake):
             self.assertTrue(plan_git.ref_reachable(self.repo.root, self.dangling))
-        self.assertEqual(seen[0], "name-rev")
+        self.assertIn("name-rev", seen)
+        self.assertNotIn("for-each-ref", seen)
 
     def test_a_timeout_is_reported_as_a_timeout(self):
         why = []
-        with mock.patch.object(
-                plan_git, "_git",
-                side_effect=GitError("git name-rev: timed out")):
+        with mock.patch.object(plan_git, "_commit", return_value=self.head), \
+                mock.patch.object(
+                    plan_git, "_git",
+                    side_effect=GitError("git name-rev: timed out")):
             self.assertIsNone(
                 plan_git.ref_reachable(self.repo.root, self.head, why=why))
         self.assertEqual(why, ["timeout"])
 
     def test_an_unreadable_git_is_not_called_a_timeout(self):
         why = []
-        with mock.patch.object(
-                plan_git, "_git",
-                side_effect=GitError("git name-rev: bad revision")):
+        with mock.patch.object(plan_git, "_commit", return_value="0" * 40), \
+                mock.patch.object(
+                    plan_git, "_git",
+                    side_effect=GitError("git name-rev: bad revision")):
             self.assertIsNone(
                 plan_git.ref_reachable(self.repo.root, "0" * 40, why=why))
         self.assertEqual(why, ["git name-rev: bad revision"])
@@ -204,6 +236,26 @@ class PriorFreezeRefusalTest(_RewriteFixture):
 
     def test_a_reachable_prior_freeze_is_not_offered_for_replacement(self):
         self.repo.git("branch", "keep/old-freeze", self.op)
+        with self.assertRaises(ValueError) as caught:
+            self.complete_authors()
+        text = str(caught.exception)
+        self.assertIn("still reachable from a ref", text)
+        self.assertNotIn("frozen --sha %s --supersedes" % self.head_b, text)
+
+    def test_a_false_negative_of_name_rev_does_not_unlock_supersedes(self):
+        # B/P1 d'ameesh-cx1 : un enfant daté avant son parent fait rendre
+        # `undefined` à name-rev pour un gel pourtant contenu par une ref. La
+        # lecture de référence doit garder le gel accessible et le refus fermé.
+        tree = self.repo.git("rev-parse", self.op + "^{tree}")
+        env = dict(self.repo.dry, GIT_AUTHOR_DATE="2000-01-01T00:00:00 +0000",
+                   GIT_COMMITTER_DATE="2000-01-01T00:00:00 +0000")
+        child = self.repo.git("commit-tree", tree, "-p", self.op, "-m",
+                              "enfant daté 2000", env=env)
+        self.repo.git("update-ref", "refs/heads/keep/date-inverted", child)
+        self.assertEqual(self.repo.git("name-rev", "--name-only", self.op),
+                         "undefined")
+        self.assertIn("keep/date-inverted", self.repo.git(
+            "for-each-ref", "--contains=" + self.op, "--format=%(refname)"))
         with self.assertRaises(ValueError) as caught:
             self.complete_authors()
         text = str(caught.exception)
