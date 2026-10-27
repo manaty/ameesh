@@ -17,4 +17,6 @@ if _tmpdir != tempfile.gettempdir():
 # #3974 : le cache de l'hôte des balayages `git grep` (`grep_cache`) vit sous
 # l'état de l'utilisateur ; les tests le coupent, sauf ceux qui le visent avec
 # un dossier jetable.
-os.environ.setdefault("AMEESH_GREP_CACHE", "off")
+# un drapeau de module, pas une variable : des tests vident l'environnement.
+from ameesh import grep_cache as _grep_cache  # noqa: E402
+_grep_cache.ENABLED = False

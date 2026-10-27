@@ -20,7 +20,8 @@ un échec reste un doute et se relit au passage suivant. Les attributs
 Deux processus qui calculent la même clé ne balaient pas deux fois : le second
 attend le verrou de la clé (borné) puis relit le résultat du premier.
 
-`AMEESH_GREP_CACHE=off` coupe le cache (la suite de tests le coupe par défaut) ;
+`AMEESH_GREP_CACHE=off` coupe le cache ; la suite de tests le coupe par
+`ENABLED` (un test qui vide l'environnement ne le rallume pas) ;
 `AMEESH_GREP_CACHE_DIR` choisit le dossier, sinon `<AMEESH_STATE>/git-grep`.
 """
 from __future__ import annotations
@@ -50,10 +51,12 @@ LOCK_STEP_S = 0.1
 FORMAT = 1
 
 _stores = 0
+#: interrupteur du processus (la suite de tests le met à False)
+ENABLED = True
 
 
 def enabled() -> bool:
-    return str(os.environ.get("AMEESH_GREP_CACHE") or "").strip().lower() not in (
+    return ENABLED and str(os.environ.get("AMEESH_GREP_CACHE") or "").strip().lower() not in (
         "off", "0", "no", "false")
 
 

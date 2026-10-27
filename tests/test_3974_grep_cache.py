@@ -53,6 +53,9 @@ class GrepCacheTest(unittest.TestCase):
             "AMEESH_GREP_CACHE_DIR": os.path.join(self.tmp, "cache")})
         env.start()
         self.addCleanup(env.stop)
+        switch = mock.patch.object(grep_cache, "ENABLED", True)
+        switch.start()
+        self.addCleanup(switch.stop)
         canon._content_cache_clear()
         self.addCleanup(canon._content_cache_clear)
 
