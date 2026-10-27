@@ -480,6 +480,76 @@ class PaquetTest(_Base):
         self.assertIn("packet merge", info["waiting"]["label"])
         self.assertIsNone(info["stale"])
 
+    def test_composition_en_base_sans_clone_tait_le_slo_jusqu_au_retrait(self):
+        self.qa_at(self.GO)
+        head, source = "b" * 40, "a" * 40
+        self.db.execute(
+            "INSERT INTO work_item_milestones (work_item_id, kind, at, sha, actor)"
+            " VALUES (%s, 'frozen', to_timestamp(%s), %s, 'dev1')",
+            (self.lot["id"], self.GO - 1, source))
+        self.db.execute("UPDATE work_items SET branch_head = %s WHERE id = %s",
+                        (source, self.lot["id"]))
+        self.db.execute("UPDATE work_item_milestones SET sha = %s"
+                        " WHERE work_item_id = %s AND kind = 'verdict'",
+                        (source, self.lot["id"]))
+        carrier = self.packet(body="composition enregistrée sans manifeste", head=head)
+        reader = storage.of(self.db).work
+
+        def record(units):
+            reader.record_packet(
+                carrier["id"], branch="integration/paquet-test",
+                base_sha="c" * 40, head_sha=head, units=units,
+                note="packet composition recorded", actor="orch")
+
+        unit = {"work_item_id": self.lot["id"], "unit_sha": "d" * 40,
+                "source_sha": source, "frozen_sha": source}
+        self.now = self.GO + 8 * HEURE
+        # No Git evidence and no explicit landing declaration: database only.
+        with mock.patch.object(planned_waits, "packet_attachments", return_value={}):
+            record([unit])
+            self.assertEqual(self.slo(), [])
+            record([])
+            self.assertIn(self.lot["id"], [a["lot"] for a in self.slo()])
+            record([unit])
+            self.assertEqual(self.slo(), [])
+            work.close(self.db, carrier["id"], abandoned=True, actor="orch")
+            self.assertIn(self.lot["id"], [a["lot"] for a in self.slo()])
+
+    def test_composition_perimee_ne_tait_pas_le_slo(self):
+        self.qa_at(self.GO)
+        head, source = "b" * 40, "a" * 40
+        self.db.execute(
+            "INSERT INTO work_item_milestones (work_item_id, kind, at, sha, actor)"
+            " VALUES (%s, 'frozen', to_timestamp(%s), %s, 'dev1')",
+            (self.lot["id"], self.GO - 1, source))
+        self.db.execute("UPDATE work_items SET branch_head = %s WHERE id = %s",
+                        (source, self.lot["id"]))
+        self.db.execute("UPDATE work_item_milestones SET sha = %s"
+                        " WHERE work_item_id = %s AND kind = 'verdict'",
+                        (source, self.lot["id"]))
+        carrier = self.packet(head=head)
+        storage.of(self.db).work.record_packet(
+            carrier["id"], branch="integration/paquet-test", base_sha="c" * 40,
+            head_sha=head, units=[{"work_item_id": self.lot["id"],
+                                  "unit_sha": "d" * 40, "source_sha": source}],
+            note="packet composition recorded", actor="orch")
+        self.now = self.GO + 8 * HEURE
+        with mock.patch.object(planned_waits, "packet_attachments", return_value={}):
+            for changed in (carrier, self.lot):
+                with self.subTest(changed=changed["id"]):
+                    self.db.execute("UPDATE work_items SET branch_head = %s WHERE id = %s",
+                                    ("e" * 40, changed["id"]))
+                    if changed is self.lot:
+                        self.db.execute("UPDATE work_item_milestones SET sha = %s"
+                                        " WHERE work_item_id = %s AND kind = 'frozen'",
+                                        ("e" * 40, self.lot["id"]))
+                        self.db.execute("UPDATE work_item_milestones SET sha = %s"
+                                        " WHERE work_item_id = %s AND kind = 'verdict'",
+                                        ("e" * 40, self.lot["id"]))
+                    self.assertIn(self.lot["id"], [a["lot"] for a in self.slo()])
+                    self.db.execute("UPDATE work_items SET branch_head = %s WHERE id = %s",
+                                    (head if changed is carrier else source, changed["id"]))
+
     def test_membre_d_un_vehicule_ouvert_ne_leve_pas_le_slo_et_revient_s_il_est_retire(self):
         # #2837 : la composition se lit sur un clone du registre quand l'hôte
         # n'a pas les réglages radar ; l'unité d'un véhicule ouvert est tue,

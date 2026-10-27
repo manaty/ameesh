@@ -625,6 +625,49 @@ def _packet_wait(carrier):
     return out
 
 
+def recorded_packet_attachments(st, open_items, rows):
+    """#4082: read current packet membership without a local Git clone.
+
+    Membership is replaced by record_packet on recomposition. Bind it to the
+    observed carrier head and unit head, so stale records cannot hide work
+    excluded from the current packet or added since its composition.
+    """
+    from . import plan_git
+
+    carriers = packet_carriers(open_items)
+    if not carriers:
+        return {}
+    try:
+        members = st.work.packet_members(package_ids=list(carriers),
+                                         item_ids=[int(r["id"]) for r in rows])
+        if not members:
+            return {}
+        marks = {}
+        for mark in st.progress.lot_milestones(
+                sorted({int(m["work_item_id"]) for m in members})):
+            marks.setdefault(int(mark["work_item_id"]), []).append(mark)
+    except Exception:  # unreadable membership never suppresses an alert
+        return {}
+    units = {int(r["id"]): r for r in rows}
+    out = {}
+    for member in members:
+        cid, uid = int(member["package_id"]), int(member["work_item_id"])
+        carrier, unit = carriers.get(cid), units.get(uid)
+        if carrier is None or unit is None or unit.get("state") != "qa":
+            continue
+        if not plan_git.same_commit(member.get("head_sha"), carrier.get("branch_head")):
+            continue
+        frozen = latest_freeze(marks.get(uid, ())) or {}
+        current = unit.get("branch_head") or frozen.get("sha")
+        source = member.get("source_sha") or member.get("frozen_sha")
+        if not current or not source or not plan_git.same_commit(current, source):
+            continue
+        if frozen and not plan_git.same_commit(frozen["sha"], source):
+            continue
+        out.setdefault(cid, set()).add(uid)
+    return out
+
+
 def packet_waits(rows, open_items=None, attachments=None):
     """#2335 : `{lot: wait}` pour tout lot ouvert nommé par un paquet.
 
@@ -931,7 +974,12 @@ def read(db, rows, *, now=None, packages=None, open_items=None, dependencies=Non
     #2599 : quand un porteur est lu, les `ameesh-work:` de sa branche
     (`packet_attachments`) complètent le corps, qui peut manquer la liste
     « #N <tête> ». Dépôt ou branche illisibles : aucun attachement, l'alerte
-    reste due (le sens sûr)."""
+    reste due (le sens sûr).
+
+    #4082 : la composition enregistrée en base complète ces preuves sans
+    clone local ; elle n'est valable qu'aux têtes composées encore courantes.
+    Sa suppression par recomposition ou la fermeture du porteur la lève.
+    """
     if not rows:
         return {}
     now = time.time() if now is None else float(now)
@@ -957,6 +1005,10 @@ def read(db, rows, *, now=None, packages=None, open_items=None, dependencies=Non
     attached = (packet_attachments(getattr(db, "cfg", None), open_items, rows,
                                    db=db)
                 if want_packets and not _dry_pass(db) else {})
+    attached = {cid: set(members) for cid, members in attached.items()}
+    if want_packets and not _dry_pass(db):
+        for cid, members in recorded_packet_attachments(st, open_items, rows).items():
+            attached.setdefault(cid, set()).update(members)
     packet = packet_waits(rows, open_items, attachments=attached) if want_packets else {}
     landings = _with_heads(st, _admitted(
         st, rows, st.work_dependencies.landings_for([int(r["id"]) for r in rows])))
