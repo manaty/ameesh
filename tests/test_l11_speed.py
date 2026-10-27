@@ -477,7 +477,9 @@ class CanonSyncTest(PgTestCase):
             return type("R", (), {"status": "ok"})()
 
         with mock.patch("ameesh.canon.from_config", return_value="canon-fictif"), \
-                mock.patch("ameesh.canon_sync.sync", side_effect=faux_sync):
+                mock.patch("ameesh.canon_sync.periodic_sync",
+                           side_effect=lambda db, canon, host, interval:
+                           faux_sync(db, canon, host)):
             self.assertTrue(runner.canon_sync_once())
         self.assertEqual(appels, [("canon-fictif", self.cfg.host)])
 
@@ -485,6 +487,23 @@ class CanonSyncTest(PgTestCase):
         runner = self._runner(canon="/tmp/canon-fictif")
         with mock.patch("ameesh.canon.from_config", side_effect=OSError("canon absent")):
             self.assertFalse(runner.canon_sync_once())
+
+    def test_pending_shared_sync_does_not_settle_gate_or_retry_reviews(self):
+        runner = self._runner(canon="/tmp/canon-fictif")
+        with mock.patch("ameesh.canon.from_config", return_value="canon-fictif"), \
+                mock.patch("ameesh.canon_sync.periodic_sync", return_value=None):
+            self.assertTrue(runner.canon_sync_once())
+        self.assertFalse(runner._canon_complete)
+        self.assertFalse(runner._designation_retry_ready)
+
+    def test_shared_sync_settles_gate_without_replaying_designations(self):
+        runner = self._runner(canon="/tmp/canon-fictif")
+        report = type("R", (), {"status": "ok", "shared": True})()
+        with mock.patch("ameesh.canon.from_config", return_value="canon-fictif"), \
+                mock.patch("ameesh.canon_sync.periodic_sync", return_value=report):
+            self.assertTrue(runner.canon_sync_once())
+        self.assertTrue(runner._canon_complete)
+        self.assertFalse(runner._designation_retry_ready)
 
     def test_one_shot_synchronise_au_demarrage(self):
         runner = self._runner(canon="/tmp/canon-fictif")

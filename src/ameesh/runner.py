@@ -10660,9 +10660,17 @@ class Runner:
                     # de l'ancien pour les siennes. Rien n'est fermé non plus.
                     loaded = []
             synced: list = []
+            actually_synced = False
             for canon in loaded:
                 try:
-                    report = canon_sync.sync(db, canon, self.host)
+                    interval = getattr(self, "canon_sync_interval", 0.0)
+                    report = (canon_sync.periodic_sync(db, canon, self.host, interval)
+                              if interval > 0 else canon_sync.sync(db, canon, self.host))
+                    if report is None:
+                        # Another executor is syncing, or this snapshot differs
+                        # from its completed one: do not open the host gate.
+                        continue
+                    actually_synced |= not getattr(report, "shared", False)
                     synced.append(canon)
                     status = getattr(report, "status", None)
                     if status and status != canon_sync.CANON_OK:
@@ -10705,7 +10713,7 @@ class Runner:
             self._canon_complete = bool(entries) and len(synced) == len(entries)
             # #2561: only a pass that actually synced a canon may replay the
             # pending designations (a mocked/test `canon_sync_once` must not).
-            self._designation_retry_ready = bool(synced)
+            self._designation_retry_ready = actually_synced
             refresh = getattr(self, "refresh_host_limits", None)
             if refresh is not None and synced:
                 refresh(*synced, complete=self._canon_complete)

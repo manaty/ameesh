@@ -2905,14 +2905,29 @@ class Canon(Domain):
 
     @abc.abstractmethod
     def record_auth_state(self, host: str, status: str, diagnostic: str,
-                          canon: str = "") -> dict | None:
-        """Inscrit l'issue de la synchronisation des authentificateurs ; rend
-        l'issue précédente (`auth_status`, `auth_diagnostic`), ou None."""
+                          canon: str = "", *, quiet_prefix: str = "") -> dict | None:
+        """Atomic transition; returns the previous state under its row lock.
+
+        quiet_prefix marks only a first transient error (previous status not
+        error); a repeated error stores the unmarked diagnostic atomically.
+        """
 
     @abc.abstractmethod
     def close_others(self, host: str, keep: Sequence[str], diagnostic: str) -> list[str]:
         """Passe `invalid` les états `ok` de l'hôte dont la clé n'est pas dans
         `keep` (canons retirés de la configuration, L42) ; rend leurs clés."""
+
+    @abc.abstractmethod
+    def claim_sync(self, host: str, canon: str, token: str, interval_s: float) -> bool:
+        """Claim one periodic sync per host/canon/interval in a short statement."""
+
+    @abc.abstractmethod
+    def complete_sync(self, host: str, canon: str, token: str, signature: str) -> None:
+        """Publish completion only if this claim is still current."""
+
+    @abc.abstractmethod
+    def shared_sync(self, host: str, canon: str) -> dict | None:
+        """Completed current claim's state; None while pending or absent."""
 
     @abc.abstractmethod
     def lock_default_state(self, host: str) -> dict | None:

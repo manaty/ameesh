@@ -21,7 +21,8 @@ class ModuleStore:
         # Serialized across all canons; ownership conflicts must never steal
         # another canon's project, including projects removed in this sync.
         self.db.execute("SELECT pg_advisory_xact_lock(hashtext('ameesh-project-modules'))")
-        existing = self.db.query("SELECT project, canon FROM project_modules")
+        existing = self.db.query("SELECT project, module, canon, types, schemas, rules "
+                                 "FROM project_modules")
         for entry in declarations:
             if any(row["project"] == entry["project"] and row["canon"] != canon
                    for row in existing):
@@ -31,6 +32,14 @@ class ModuleStore:
         wanted = set()
         for entry in sorted(declarations, key=lambda row: (row["project"], row["module"])):
             wanted.add((entry["project"], entry["module"]))
+            # Skip the INSERT entirely: a BEFORE INSERT policy trigger also
+            # acquires project locks, even if ON CONFLICT would change nothing.
+            if any(row["project"] == entry["project"]
+                   and row["module"] == entry["module"]
+                   and row["canon"] == canon
+                   and all(row[name] == entry[name] for name in ("types", "schemas", "rules"))
+                   for row in existing):
+                continue
             self.db.execute(
                 "INSERT INTO project_modules (project, module, canon, types, schemas, rules) "
                 "VALUES (%s, %s, %s, %s::jsonb, %s::jsonb, %s::jsonb) "

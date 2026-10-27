@@ -40,8 +40,10 @@ class _FakeCanonStore:
     def __init__(self) -> None:
         self.row: dict | None = {"auth_status": "ok", "auth_diagnostic": ""}
 
-    def record_auth_state(self, host, status, diagnostic, canon=""):
+    def record_auth_state(self, host, status, diagnostic, canon="", *, quiet_prefix=""):
         previous = dict(self.row) if self.row is not None else None
+        if quiet_prefix and (previous or {}).get("auth_status") != "error":
+            diagnostic = (quiet_prefix + diagnostic)[:4000]
         self.row = {"auth_status": status, "auth_diagnostic": diagnostic}
         return previous
 
