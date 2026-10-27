@@ -817,9 +817,14 @@ class ExecuteurTest(PgTestCase):
         # qui rend son unique résultat puis bloque au point sûr.
         with open(avant + ".suite", "w"):
             pass
+        relache = time.monotonic()
         ack = attendre(lambda: (self.ack() or {}).get("drained") and self.ack())
         self.assertTrue(ack, "le retrait doit finir par un acquittement drained")
         self.assertEqual((ack["seq"], ack["state"], ack["held"]), (2, "draining", []))
+        # Le harnais bloque au point sûr : sans fermeture à ce point, seule
+        # l'échéance (60 s) drainerait. 30 s les distingue sous charge (#3832).
+        self.assertLess(time.monotonic() - relache, 30.0,
+                        "fermeture au point sûr, pas à l'échéance")
         vus = self.harnais()
         self.assertFalse(any(m.get("fin") for m in vus), "tour arrêté avant sa fin")
         # l'appel d'outil en cours a fini (point sûr), aucun autre après lui
