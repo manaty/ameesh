@@ -8,8 +8,9 @@ orders, the agent merges) and its `gates`, for the head of each queue:
 1. lease per target (`merge_locks`): one merge at a time, which removes
    the catch-up merges; the queue pass holds it for the length of one pass,
    renewed by a heartbeat, so a dead pass frees it at the short pass TTL
-   (`AMEESH_LAND_PASS_TTL`, 180 s), never after the train's 30 min; the
-   epoch fence still refuses a late holder's writes;
+   (`AMEESH_LAND_PASS_TTL`, 180 s), never after the train's 30 min, even
+   while a PR waits between two passes (#3993: the heartbeat is carried to
+   the next pass); the epoch fence still refuses a late holder's writes;
 2. in the radar's private clone: the target, fresh from `origin`, and the
    frozen commit of the lot merged into it (`--no-ff`, line `ameesh-work:
    <lot>`), `rerere` primed by every resolution prepared with the lot; a
@@ -603,13 +604,28 @@ class _PassLeaseRenewal:
     refuses every external gesture from then on. A database that is briefly
     unreachable only skips a beat; the main thread's own ``held()`` check
     remains the last gate before a push or a merge.
+
+    #3993: a failed beat is not silent. The first failure of a run, and the
+    first success after failures, go to the pass's error channel (stderr);
+    ``failures`` and ``first_error`` let a refused gesture name the cause.
+
+    #3993: between two passes (a PR waiting for its CI, a merge in doubt) the
+    same heartbeat keeps running (`carry`), at the short TTL, until the next
+    pass of this process takes it back (`_reclaim`) or `LOCK_TTL_S` has
+    elapsed. A runner that dies frees the target at the short bound, not
+    after the train's 30 min; a live but stuck one never holds it longer.
     """
 
-    def __init__(self, renew, *, ttl: float, interval: float | None = None):
+    def __init__(self, renew, *, ttl: float, interval: float | None = None,
+                 key: str = ""):
         self._renew = renew
         self.ttl = float(ttl)
         self.interval = max(0.05, float(ttl / 3.0 if interval is None else interval))
+        self.key = key
         self.lost = False
+        self.failures = 0
+        self.first_error = ""
+        self._until: float | None = None
         self._stop = threading.Event()
         self._lock = threading.Lock()
         self._thread: threading.Thread | None = None
@@ -625,13 +641,41 @@ class _PassLeaseRenewal:
             with self._lock:
                 if self._stop.is_set():
                     return
+                if self._until is not None and time.monotonic() >= self._until:
+                    # #3993: never held between passes beyond the train's TTL;
+                    # the last short renewal expires on its own
+                    return
                 try:
                     renewed = bool(self._renew(self.ttl))
-                except Exception:  # noqa: BLE001 - database hiccup: retry the next beat
+                except Exception as exc:  # noqa: BLE001 - database hiccup: retry the next beat
+                    self._failed(exc)
                     continue
                 if not renewed:
                     self.lost = True
+                    if self.failures:
+                        print("ameesh: merge lease %s lost after %d failed renewal(s) "
+                              "(first: %s)" % (self.key, self.failures, self.first_error),
+                              file=sys.stderr)
                     return
+                if self.failures:
+                    print("ameesh: merge lease %s renewed again after %d failed renewal(s)"
+                          % (self.key, self.failures), file=sys.stderr)
+                    self.failures, self.first_error = 0, ""
+
+    def _failed(self, exc: BaseException) -> None:
+        self.failures += 1
+        if self.failures == 1:
+            self.first_error = "%s: %s" % (type(exc).__name__, str(exc)[:200])
+            print("ameesh: merge lease %s not renewed (%s); retried every %.0fs, "
+                  "it expires in %.0fs without a renewal"
+                  % (self.key, self.first_error, self.interval, self.ttl), file=sys.stderr)
+
+    def cause(self) -> str:
+        """#3993: why the heartbeat could not vouch for the lease, or ''."""
+        if not self.failures:
+            return ""
+        return "lease heartbeat: %d failed renewal(s), first: %s" % (
+            self.failures, self.first_error)
 
     def stop(self) -> None:
         self._stop.set()
@@ -642,25 +686,44 @@ class _PassLeaseRenewal:
             # lease is a no-op (the epoch/owner check refuses it).
             thread.join(timeout=5.0)
 
-    def keep(self, ttl: float):
-        """#3932: stop the pass heartbeat, then renew the SAME lease for the
-        inter-pass `ttl`; returns True, or False/None when the lease is gone.
-
-        The lock orders this final renewal after any beat already in flight,
-        so no late short renewal can shorten it; once stopped, `_run` does not
-        renew again. A database call blocked past the timeout leaves the
-        caller with None: the short pass TTL still frees the target, and no
-        other holder can act while the database is unreadable.
-        """
-        self._stop.set()
+    def carry(self, bound: float) -> bool:
+        """#3993: keep beating after the pass, for `bound` seconds at most;
+        False when the lease is already lost (nothing to carry)."""
         if not self._lock.acquire(timeout=5.0):
-            return None
+            return False          # a beat blocked in the database: not vouched for
         try:
-            if self.lost:
-                return None
-            return self._renew(ttl)
+            if self.lost or self._stop.is_set():
+                return False
+            self._until = time.monotonic() + max(0.0, float(bound))
+            return True
         finally:
             self._lock.release()
+
+
+#: #3993: heartbeats carried between two passes, per `(key, owner)`. Only
+#: this process's next pass takes one back; a dead process carries nothing.
+_CARRIED: dict = {}
+_CARRIED_LOCK = threading.Lock()
+
+
+def _carry(key: str, owner: str, renewal: _PassLeaseRenewal) -> bool:
+    if not renewal.carry(LOCK_TTL_S):
+        return False
+    with _CARRIED_LOCK:
+        previous = _CARRIED.pop((key, owner), None)
+        _CARRIED[(key, owner)] = renewal
+    if previous is not None and previous is not renewal:
+        previous.stop()
+    return True
+
+
+def _reclaim(key: str, owner: str) -> None:
+    """#3993: the next pass stops the carried heartbeat before renewing the
+    lease itself; whatever it held is renewed (or lost) by that pass."""
+    with _CARRIED_LOCK:
+        carried = _CARRIED.pop((key, owner), None)
+    if carried is not None:
+        carried.stop()
 
 
 class _Landing:
@@ -702,7 +765,9 @@ class _Landing:
 
     def busy(self, why: str) -> dict:
         self.locks.pop(self.key, None)
-        return {"lot": self.lot, "result": "busy", "error": why}
+        cause = self.renewal.cause() if self.renewal is not None else ""
+        return {"lot": self.lot, "result": "busy",
+                "error": "%s (%s)" % (why, cause) if cause else why}
 
     def retry(self, why: str) -> dict:
         """#2306 : un refus passager garde la ligne en file (état `queued`,
@@ -937,7 +1002,9 @@ def land_head(cfg, db, project, row: dict, *, owner: str, replayer=None, locks=N
     # pass TTL and renewed by the heartbeat below while the pass runs; a pass
     # that dies stops renewing and frees the target at that bound, well before
     # the train's 30 min. The epoch fence is unchanged: a late holder's queue
-    # writes and its `held()` checks fail at the new epoch.
+    # writes and its `held()` checks fail at the new epoch. #3993: the
+    # heartbeat a previous pass carried is stopped first; this pass renews.
+    _reclaim(key, owner)
     epoch = ops.land_lock(key, owner, LAND_PASS_TTL_S, epoch=locks.get(key)) \
         if key in locks else None
     if epoch is None:
@@ -948,7 +1015,7 @@ def land_head(cfg, db, project, row: dict, *, owner: str, replayer=None, locks=N
     locks[key] = epoch
     renewal = _PassLeaseRenewal(
         lambda ttl: ops.land_lock(key, owner, ttl, epoch=epoch) is not None,
-        ttl=LAND_PASS_TTL_S)
+        ttl=LAND_PASS_TTL_S, key=key)
     landing = None
     try:
         renewal.start()
@@ -994,23 +1061,23 @@ def land_head(cfg, db, project, row: dict, *, owner: str, replayer=None, locks=N
     finally:
         # #3932: the lease only covers the pass, except where the lot waits on
         # its PR (CI pending, refused merge) or on a merge in doubt: there it
-        # stays held, renewed for the long inter-pass TTL, so neither the train
-        # nor a direct fire can merge into the target under a PR whose CI
-        # qualified an older base. Every other exit — result, early return,
-        # exception — releases it. A release that fails is not fatal: without
-        # its heartbeat, the short TTL frees the target at a new epoch (the old
+        # stays held, so neither the train nor a direct fire can merge into
+        # the target under a PR whose CI qualified an older base. #3993: it is
+        # held by the same short heartbeat, carried until the next pass of
+        # this process (at most `LOCK_TTL_S`): a runner that dies frees it at
+        # the short bound. Every other exit — result, early return, exception
+        # — releases it. A release that fails is not fatal: without its
+        # heartbeat, the short TTL frees the target at a new epoch (the old
         # holder is fenced by its epoch).
-        renewal.stop()
-        if landing is not None and landing.keep:
-            try:
-                kept = renewal.keep(LOCK_TTL_S)
-            except Exception as exc:  # noqa: BLE001 - the short TTL still frees it
-                kept = None
-                print("ameesh: merge lease %s not kept for the next pass (%s: %s)"
-                      % (key, type(exc).__name__, exc), file=sys.stderr)
-            if not kept:
-                locks.pop(key, None)
+        if landing is not None and landing.keep and _carry(key, owner, renewal):
+            pass
+        elif landing is not None and landing.keep:
+            renewal.stop()
+            print("ameesh: merge lease %s not kept for the next pass (%s)"
+                  % (key, renewal.cause() or "lost"), file=sys.stderr)
+            locks.pop(key, None)
         else:
+            renewal.stop()
             try:
                 ops.land_unlock(key, owner, epoch)
             except Exception as exc:  # noqa: BLE001 - the TTL still frees the lease

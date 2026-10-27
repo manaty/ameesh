@@ -72,6 +72,7 @@ class _Land(_Base):
         self.fake.land_unlock = locks.land_unlock
         self.fake.lease_ok = locks.holds
         self.locks = locks
+        self.addCleanup(self.drop_carried)
         self.origin = os.path.join(self.tmp, "origin.git")
         _git(self.tmp, "clone", "-q", "--bare", self.repo, self.origin)
         _git(self.repo, "remote", "add", "origin", self.origin)
@@ -83,6 +84,15 @@ class _Land(_Base):
                                   self.sent.append((to, body, kw)) or len(self.sent))
         patch.start()
         self.addCleanup(patch.stop)
+
+    @staticmethod
+    def drop_carried():
+        """#3993: a heartbeat carried between passes never outlives its test."""
+        with land._CARRIED_LOCK:
+            carried = list(land._CARRIED.values())
+            land._CARRIED.clear()
+        for renewal in carried:
+            renewal.stop()
 
     def enter(self, lot, ci="green"):
         """Admission fetches origin into the radar's clone (L160e1); the CI is
@@ -273,6 +283,93 @@ class PassLeaseTest(_Land):
         self.assertEqual(taken, [land.LAND_PASS_TTL_S])
 
 
+class CarriedLeaseTest(_Land):
+    """#3993 : entre deux passes, la cible d'une PR en attente reste gardée par
+    le battement court de la passe, porté jusqu'à la passe suivante : un
+    exécuteur mort la libère à la borne courte, jamais après 30 min ; un
+    battement qui échoue le dit."""
+    LAND = "pr"
+
+    def pending(self, locks):
+        gh = FakeGh()
+        self.queued(4)
+        gh.head = self.tip(4)
+        out = self.land(4, gh=gh, locks=locks)
+        self.assertEqual(out["result"], "landing", out)
+        return gh, out
+
+    def test_a_live_executor_keeps_the_target_between_passes(self):
+        # a beat every 1/3 s: a loaded bench may delay one by 0.6 s
+        with mock.patch.object(land, "LAND_PASS_TTL_S", 1.0):
+            locks: dict = {}
+            gh, out = self.pending(locks)
+            time.sleep(2.5)
+            self.assertTrue(self.locks.holds(("p:main", "runner-1", locks["p:main"])),
+                            "the carried heartbeat renews the lease past the short bound")
+            self.assertIsNone(self.locks.land_lock("p:main", "train:x", 60))
+            gh.head, gh.ci = out["sha"], "green"
+            self.assertEqual(self.land(4, gh=gh, locks=locks)["result"], "landed")
+        self.assertNotIn(("p:main", "runner-1"), land._CARRIED,
+                         "the next pass takes the heartbeat back")
+        self.assertIsNone(self.locks.held["p:main"][0], "and releases the lease")
+
+    def test_a_dead_executor_frees_the_target_at_the_short_bound(self):
+        with mock.patch.object(land, "LAND_PASS_TTL_S", 0.3):
+            self.pending({})
+            # the executor dies: its daemon heartbeat dies with it
+            land._CARRIED.pop(("p:main", "runner-1")).stop()
+            time.sleep(0.5)
+            self.assertIsNotNone(self.locks.land_lock("p:main", "runner-2", 60),
+                                 "another executor takes the target at the short bound")
+
+    def test_a_carried_heartbeat_stops_at_the_train_ttl(self):
+        with mock.patch.object(land, "LAND_PASS_TTL_S", 0.3), \
+                mock.patch.object(land, "LOCK_TTL_S", 0.4):
+            self.pending({})
+            time.sleep(1.2)
+            self.assertIsNotNone(self.locks.land_lock("p:main", "runner-2", 60),
+                                 "a stuck executor never holds it beyond LOCK_TTL_S")
+
+    def test_failed_renewals_are_reported_and_named_in_the_refusal(self):
+        import io
+        calls = []
+
+        def renew(ttl):
+            calls.append(ttl)
+            if len(calls) <= 2:
+                raise db_mod.DbError("connection lost")
+            return len(calls) == 3
+
+        err = io.StringIO()
+        with mock.patch("sys.stderr", err):
+            renewal = land._PassLeaseRenewal(renew, ttl=0.3, interval=0.05, key="p:main")
+            renewal.start()
+            deadline = time.time() + 3
+            while not renewal.lost and time.time() < deadline:
+                time.sleep(0.02)
+            renewal.stop()
+        self.assertTrue(renewal.lost)
+        lines = err.getvalue().splitlines()
+        self.assertEqual(len([l for l in lines if "not renewed" in l]), 1,
+                         "the first failure only, not one line per beat: %r" % lines)
+        self.assertIn("connection lost", lines[0])
+        self.assertTrue(any("renewed again after 2 failed" in l for l in lines), lines)
+
+        failing = land._PassLeaseRenewal(lambda ttl: (_ for _ in ()).throw(
+            RuntimeError("db down")), ttl=0.3, interval=0.05, key="p:main")
+        with mock.patch("sys.stderr", io.StringIO()):
+            failing.start()
+            deadline = time.time() + 3
+            while failing.failures < 2 and time.time() < deadline:
+                time.sleep(0.02)
+            failing.stop()
+        landing = land._Landing(None, self.project, {"work_item_id": 4},
+                                "p:main", "runner-1", 1, {}, renewal=failing)
+        out = landing.busy("lease lost before merging PR #1")
+        self.assertIn("lease heartbeat:", out["error"])
+        self.assertIn("db down", out["error"])
+
+
 class ReviewAfterMergeTest(LocalLandTest):
     """L539 : la fusion confirmée d'un lot léger ouvre le lot de relecture §2."""
 
@@ -390,9 +487,10 @@ class PrLandTest(_Land):
         self.assertTrue(locks, "the lease is kept between two passes")
         owner, epoch, expires = self.locks.held["p:main"]
         self.assertEqual((owner, epoch), ("runner-1", locks["p:main"]))
-        self.assertGreaterEqual(expires - time.time(), land.LOCK_TTL_S * 0.9,
-                                "the kept lease covers the interval between passes, "
-                                "not the short pass bound")
+        self.assertLessEqual(expires - time.time(), land.LAND_PASS_TTL_S + 1,
+                             "#3993: the kept lease stays at the short pass bound")
+        self.assertIn(("p:main", "runner-1"), land._CARRIED,
+                      "#3993: the pass heartbeat is carried to the next pass")
         handle, blocked = fire._target_lock(None, self.project, "main")
         self.assertIsNone(handle)
         self.assertTrue(blocked, "a concurrent fire finds the target busy")
