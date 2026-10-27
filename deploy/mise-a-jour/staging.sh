@@ -59,7 +59,8 @@
 # separateur (espace, tabulation, nouvelle ligne). Le poste ne peut pas y
 # figurer sans les trois VM : le canon §14 exige des VM saines avant toute
 # modification du poste, et un sous-ensemble n'en apporte aucune preuve. Nomme
-# alors que le poste est absent, il est ignore (deja reporte).
+# alors que le poste est absent, il est ignore (deja reporte) : la selection
+# est celle des VM nommees, sans lui.
 #
 # --sans-poste (ou SANS_POSTE=1 dans BASCULE_ENV) declare le poste absent meme
 # si la sequence tourne sur lui : ses etapes sont sautees et tracees, comme
@@ -89,9 +90,10 @@
 # persona menee) n'atteste rien, et une remise croisee n'y est pas acceptee.
 #
 # Etapes : verifier chaque hote (lecture seule) ; sauvegarder puis migrer REF
-# (additif seulement, base partagee) — la sauvegarde est celle du poste et est
-# sautee quand il est absent ; les migrations sont alors appliquees depuis une
-# VM d'agents (snapshot git archive de src, dry-run additif d'abord, puis
+# (additif seulement, base partagee) — la sauvegarde est celle du poste ; quand
+# il est absent, c'est le dump du serveur seul (ameesh-sauvegarde.service sur
+# manaty-mesh-1, gardé sur la VM, sans rapatriement), et les migrations sont
+# alors appliquees depuis une VM d'agents (snapshot git archive de src, dry-run additif d'abord, puis
 # --additive-only), comme le chemin bureau-goal (#3848) ; puis, hote par hote
 # dans l'ordre ci-dessus : installer, [poste] role, redemarrer, controler,
 # sante (unites, baux et doctor par `controler`, puis courrier reellement remis
@@ -153,6 +155,9 @@ SERVEUR_ABSENT=0
 SERVEUR_RAISON=""
 POSTE_RAISON_DECLAREE=""
 declare -A ABSENT_DECLARE=()
+#: dossier des dumps de ameesh-sauvegarde.service sur manaty-mesh-1 (poste.sh)
+SAUVEGARDES_VM=${SAUVEGARDES_VM:-/home/ameesh/sauvegardes}
+SAUVEGARDES_VM=${SAUVEGARDES_VM%/}
 CONFIG_HOTE=${AMEESH_CONFIG:-${AGENT_MESH_CONFIG:-$HOME/.config/ameesh/config.json}}
 #: hote qui execute la sequence : le poste (pc-smichea) ne se met a jour qu'en
 #: local ; ailleurs, il est absent et sa mise a jour est reportee a son retour.
@@ -375,6 +380,12 @@ if [ -n "$HOTES_FILTRE" ]; then
     CHOISI[$choisi]=1
   done
   set +f
+  # Poste absent : nomme, il est ignore (deja reporte), et le controle §14
+  # ci-dessous ne porte que sur un poste reellement mis a jour (relecture dev1).
+  if [ "$POSTE_ABSENT" = 1 ] && [ -n "${CHOISI[pc-smichea]:-}" ]; then
+    unset 'CHOISI[pc-smichea]'
+    echo "--hotes : pc-smichea ignore (poste absent, deja reporte)" >&2
+  fi
 else
   for nom in "${HOTES_VMS[@]}"; do CHOISI[$nom]=1; done
   [ "$POSTE_ABSENT" = 1 ] || CHOISI[pc-smichea]=1
@@ -396,7 +407,6 @@ fi
 HOTES=()
 for nom in "${ORDRE[@]}"; do
   [ -n "${CHOISI[$nom]:-}" ] || continue
-  if [ "$nom" = pc-smichea ] && [ "$POSTE_ABSENT" = 1 ]; then continue; fi
   if [ "$nom" = manaty-mesh-1 ] && [ "$SERVEUR_ABSENT" = 1 ]; then continue; fi
   HOTES+=("$nom")
 done
@@ -569,6 +579,36 @@ PYTHONPATH="$d/src" "$HOME/.local/share/ameesh/venv/bin/python3" -m ameesh migra
 PYTHONPATH="$d/src" "$HOME/.local/share/ameesh/venv/bin/python3" -m ameesh migrate --additive-only
 REMOTE
 }
+# Sauvegarde du serveur quand le poste est absent (relecture dev1 #3848) : le
+# meme service que poste.sh (ameesh-sauvegarde.service, pg_dump sur la VM),
+# dont un nouveau dump est exige ; il reste sur manaty-mesh-1, sans
+# rapatriement. Sortie : chemin, taille, SHA-256. Aucun DSN ne traverse la
+# commande.
+sauvegarde_serveur_vm() {
+  printf '%s\n' "$SAUVEGARDES_VM" | ssh -o BatchMode=yes -o ConnectTimeout=10 \
+    "${CIBLE[manaty-mesh-1]}" 'set -eu
+    IFS= read -r d
+    test -d "$d"
+    before=$(mktemp "$d/.liste-avant.XXXXXX")
+    after=$(mktemp "$d/.liste-apres.XXXXXX")
+    trap "rm -f -- \"$before\" \"$after\"" EXIT HUP INT TERM
+    find "$d" -maxdepth 1 -type f -name "ameesh-*.dump" -printf "%f %i %s %T@\n" | sort > "$before"
+    systemctl start ameesh-sauvegarde.service
+    test "$(systemctl show ameesh-sauvegarde.service -p Result --value)" = success
+    test "$(systemctl show ameesh-sauvegarde.service -p ExecMainStatus --value)" = 0
+    find "$d" -maxdepth 1 -type f -name "ameesh-*.dump" -printf "%f %i %s %T@\n" | sort > "$after"
+    new=$(comm -13 "$before" "$after" | tail -1 | cut -d" " -f1)
+    if [ -z "$new" ]; then
+      echo "ameesh-sauvegarde : aucun nouveau dump dans $d" >&2
+      exit 1
+    fi
+    f="$d/$new"
+    test -f "$f"
+    printf "%s\n" "$f"
+    stat -c %s -- "$f"
+    sha256sum -- "$f" | cut -d" " -f1
+  '
+}
 sante_hote() {  # nom [jamais] : la preuve (rapport JSON) va dans SANTE_DETAIL
   local nom=$1 sans=${2:-} cible_sonde var sortie args_hote=()
   SANTE_DETAIL=""
@@ -665,7 +705,7 @@ if [ "$SERVEUR_ABSENT" = 1 ]; then
 fi
 if [ "$A_BLANC" = 1 ]; then
   if [ "$POSTE_ABSENT" = 1 ]; then
-    echo "  etapes : verifier les VM de la sequence ; sauvegarde du poste sautee ; migrations appliquees depuis une VM d'agents (additif, dry-run d'abord) ; puis par hote installer, redemarrer, controler, sante"
+    echo "  etapes : verifier les VM de la sequence ; sauvegarde du serveur sur manaty-mesh-1 (poste absent ; sautee si le serveur est reporte) ; migrations appliquees depuis une VM d'agents (additif, dry-run d'abord) ; puis par hote installer, redemarrer, controler, sante"
   else
     echo "  etapes : verifier partout, sauvegarder+migrer ${SHA_TRAVE} (additif), puis par hote installer, redemarrer, controler, sante"
   fi
@@ -701,9 +741,35 @@ for nom in "${HOTES[@]}"; do
 done
 
 if [ "$SAUVER" = 1 ]; then
-  if [ "$POSTE_ABSENT" = 1 ]; then
-    etape "sauvegarde du poste sautee (poste absent)"
-    echo "  sauvegarde du poste non faite (poste absent) ; les migrations suivent depuis une VM d'agents (instantané git archive, additif, dry-run d'abord)"
+  if [ "$POSTE_ABSENT" = 1 ] && [ "$SERVEUR_ABSENT" = 1 ]; then
+    # serveur reporte (aucun acces root) : aucun dump possible d'ici ; la
+    # sauvegarde quotidienne du serveur reste la seule (bureau #147558). Rien
+    # n'est journalise a son nom : un hote reporte ne porte que son evenement
+    # absent/reporte, toute autre etape contredirait l'absence (actif.py,
+    # preuve_absence ; avis cx2 sur h-34).
+    etape "sauvegarde sautee (poste et serveur reportes)"
+    echo "  sauvegarde non faite (poste et serveur reportes) ; sauvegarde quotidienne du serveur seule"
+  elif [ "$POSTE_ABSENT" = 1 ]; then
+    etape "sauvegarde du serveur sur manaty-mesh-1 (poste absent, dump garde sur la VM)"
+    if ! meta=$(sauvegarde_serveur_vm); then
+      trace manaty-mesh-1 sauvegarde ko "sauvegarde serveur en echec"
+      echo "sauvegarde serveur en echec : rien n'a ete modifie" >&2
+      exit 1
+    fi
+    dump=$(sed -n '1p' <<<"$meta")
+    taille=$(sed -n '2p' <<<"$meta")
+    empreinte=$(sed -n '3p' <<<"$meta")
+    case "$dump" in
+      "$SAUVEGARDES_VM"/ameesh-*.dump) ;;
+      *) echo "sauvegarde serveur : chemin de dump inattendu" >&2; exit 1 ;;
+    esac
+    case "$taille" in ''|*[!0-9]*|0) echo "sauvegarde serveur : taille invalide" >&2; exit 1 ;; esac
+    case "$empreinte" in
+      ''|*[!0-9a-f]*) echo "sauvegarde serveur : empreinte invalide" >&2; exit 1 ;;
+    esac
+    [ "${#empreinte}" -eq 64 ] || { echo "sauvegarde serveur : empreinte invalide" >&2; exit 1; }
+    trace manaty-mesh-1 sauvegarde ok "dump serveur avant migrations : $dump ($taille octets, sha256 $empreinte)"
+    echo "  sauvegarde serveur : $dump ($taille octets)"
   else
     etape "sauvegarde de la base du mesh (poste.sh sauvegarder)"
     "$POSTE_SH" sauvegarder || { echo "sauvegarde en echec : rien n'a ete modifie" >&2; exit 1; }
