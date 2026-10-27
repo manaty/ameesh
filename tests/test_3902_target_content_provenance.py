@@ -480,6 +480,86 @@ class ContentBeforeHeadTest(unittest.TestCase):
         self.assertEqual(review_authors._not_in_target(
             repo.root, [earlier], delivered, head=head), [])
 
+    def test_mode_change_not_delivered_keeps_the_unknown(self):
+        """#3902 B/P2 (cx1) : un mode encore absent de la cible est un doute,
+        même quand le texte du même commit y est déjà."""
+        repo = _Repo(os.path.join(self.tmp, "mode-change"))
+        repo.write("script.sh", "#!/bin/sh\necho old\n")
+        base = repo.commit("base")
+        repo.write("script.sh", "#!/bin/sh\necho new\n")
+        os.chmod(os.path.join(repo.root, "script.sh"), 0o755)
+        earlier = repo.commit("parent changes text and mode", agent="parent")
+        # cible : texte livré, mode encore 100644
+        repo.git("checkout", "-q", "-b", "mode-target", base)
+        repo.write("script.sh", "#!/bin/sh\necho new\n")
+        target = repo.commit("target applies text only", agent="other")
+        self.assertFalse(review_authors._content_before_head(
+            repo.root, target, earlier))
+        self.assertEqual(review_authors._not_in_target(
+            repo.root, [earlier], target, head=earlier), [earlier])
+        self.assertTrue(review_authors._survives_rewrite(
+            repo.root, earlier, earlier, {}, target, target))
+        # cible où texte et mode sont livrés
+        repo.git("checkout", "-q", "-b", "mode-delivered", base)
+        repo.write("script.sh", "#!/bin/sh\necho new\n")
+        os.chmod(os.path.join(repo.root, "script.sh"), 0o755)
+        delivered = repo.commit("target applies text and mode", agent="other")
+        self.assertTrue(review_authors._content_before_head(
+            repo.root, delivered, earlier))
+        self.assertEqual(review_authors._not_in_target(
+            repo.root, [earlier], delivered, head=earlier), [])
+        self.assertFalse(review_authors._survives_rewrite(
+            repo.root, earlier, earlier, {}, delivered, delivered))
+
+    def test_mode_only_path_in_a_text_commit_not_delivered(self):
+        """Un chemin à mode seul dans un commit qui change du texte ailleurs
+        ne peut pas être écarté par la preuve de texte."""
+        repo = _Repo(os.path.join(self.tmp, "mode-only-path"))
+        repo.write("code.py", "old();\n")
+        repo.write("tool.sh", "#!/bin/sh\necho tool\n")
+        base = repo.commit("base")
+        repo.write("code.py", "new();\n")
+        os.chmod(os.path.join(repo.root, "tool.sh"), 0o755)
+        earlier = repo.commit("parent changes text and a mode-only path",
+                              agent="parent")
+        # cible : le texte est livré, le mode de tool.sh ne l'est pas
+        repo.git("checkout", "-q", "-b", "mode-only-target", base)
+        repo.write("code.py", "new();\n")
+        target = repo.commit("target applies text only", agent="other")
+        self.assertFalse(review_authors._content_before_head(
+            repo.root, target, earlier))
+        self.assertEqual(review_authors._not_in_target(
+            repo.root, [earlier], target, head=earlier), [earlier])
+        # cible où le mode du chemin à mode seul est aussi livré
+        repo.git("checkout", "-q", "-b", "mode-only-delivered", base)
+        repo.write("code.py", "new();\n")
+        os.chmod(os.path.join(repo.root, "tool.sh"), 0o755)
+        delivered = repo.commit("target applies text and mode", agent="other")
+        self.assertTrue(review_authors._content_before_head(
+            repo.root, delivered, earlier))
+        self.assertEqual(review_authors._not_in_target(
+            repo.root, [earlier], delivered, head=earlier), [])
+
+    def test_mode_only_commit_is_proven_by_its_delivered_mode(self):
+        """Un commit à mode seul est une contribution : livré, il s'écarte ;
+        non livré, il garde son auteur."""
+        repo = _Repo(os.path.join(self.tmp, "mode-only-commit"))
+        repo.write("script.sh", "#!/bin/sh\necho x\n")
+        base = repo.commit("base")
+        os.chmod(os.path.join(repo.root, "script.sh"), 0o755)
+        earlier = repo.commit("parent changes the mode only", agent="parent")
+        repo.git("checkout", "-q", "-b", "mode-only-kept", base)
+        repo.write("anchor.txt", "target advanced\n")
+        kept = repo.commit("target keeps the mode", agent="other")
+        self.assertFalse(review_authors._content_before_head(
+            repo.root, kept, earlier))
+        repo.git("checkout", "-q", "-b", "mode-only-applied", base)
+        os.chmod(os.path.join(repo.root, "script.sh"), 0o755)
+        repo.write("anchor.txt", "target advanced\n")
+        delivered = repo.commit("target applies the mode", agent="other")
+        self.assertTrue(review_authors._content_before_head(
+            repo.root, delivered, earlier))
+
     def test_delivered_reorder_is_proven(self):
         """La preuve stricte accepte un réordre réellement livré."""
         repo = _Repo(os.path.join(self.tmp, "reorder-delivered"))

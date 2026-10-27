@@ -78,6 +78,7 @@ reçu exact contradictoire est une erreur, pas une absence.
 """
 from __future__ import annotations
 
+import codecs
 import contextlib
 import contextvars
 import difflib
@@ -1186,9 +1187,21 @@ def _attributed_from_other_freeze(db, item: Mapping, freeze: Mapping,
     return None
 
 
+def _git_unquote(raw: str) -> str:
+    """Décode un chemin Git entre guillemets C (`"a/\303\251"`), sinon tel quel."""
+    value = str(raw or "")
+    if len(value) >= 2 and value[0] == '"' and value[-1] == '"':
+        try:
+            data, _ = codecs.escape_decode(value[1:-1].encode("utf-8"))
+            return data.decode("utf-8", "replace")
+        except Exception:  # noqa: BLE001 - chemin illisible : tel quel
+            return value
+    return value
+
+
 def _diff_path(raw: str) -> Optional[str]:
     """Le chemin d'un en-tête `---`/`+++`, ou None pour `/dev/null`."""
-    value = str(raw or "").strip()
+    value = _git_unquote(str(raw or "").strip())
     if value == "/dev/null":
         return None
     if value[:2] in ("a/", "b/"):
@@ -1197,26 +1210,36 @@ def _diff_path(raw: str) -> Optional[str]:
 
 
 def _commit_hunks(repo: str, sha: str):
-    """`{chemin: [hunk]}` du patch complet, ordre et indentation compris.
+    """`({chemin: [hunk]}, {chemin: (mode ancien, mode nouveau)})` du patch.
 
     Chaque hunk porte `new` (contexte + lignes ajoutées, image postérieure),
     `old` (contexte + lignes retirées), `changed` (lignes ajoutées/retirées
     seules) et `lead`/`trail` (contexte de tête/queue, identique dans les deux
-    images). Un diff binaire ou une lecture impossible rend None : l'appelant
-    garde le doute. Le contexte est celui de `--unified=1` : une évolution
-    voisine de la cible empêche la preuve au lieu de la contourner. Les
-    renommages sont lus comme suppression + création (`--no-renames`).
+    images). Les modes viennent des lignes brutes (`--raw`) : un changement
+    de mode seul, ou sur un chemin qui change aussi du texte, doit être
+    vérifié contre la cible (#3902 B/P2, témoin cx1). Un diff binaire ou une
+    lecture impossible rend None : l'appelant garde le doute. Le contexte est
+    celui de `--unified=1` : une évolution voisine de la cible empêche la
+    preuve au lieu de la contourner. Les renommages sont lus comme
+    suppression + création (`--no-renames`).
     """
-    text = _raw_out(repo, "show", "--format=", "--unified=1", "--no-renames",
-                    sha)
+    text = _raw_out(repo, "show", "--format=", "--raw", "--unified=1",
+                    "--no-renames", sha)
     if text is None:
         return None
     hunks: dict = {}
+    modes: dict = {}
     path = ""
     old_path = ""
     current = None
     in_hunk = False
     for line in text.split("\n"):
+        if line.startswith(":"):
+            meta, sep, raw_path = line[1:].partition("\t")
+            fields = meta.split()
+            if sep and len(fields) >= 2:
+                modes[_git_unquote(raw_path)] = (fields[0], fields[1])
+            continue
         if line.startswith("diff --git "):
             path, old_path, current, in_hunk = "", "", None, False
             continue
@@ -1257,7 +1280,7 @@ def _commit_hunks(repo: str, sha: str):
                 current["trail"] += 1
             else:
                 current["lead"] += 1
-    return hunks
+    return hunks, modes
 
 
 def _path_lines(repo: str, rev: str, path: str, cache: dict):
@@ -1273,6 +1296,52 @@ def _path_lines(repo: str, rev: str, path: str, cache: dict):
                 lines.pop()
             cache[key] = lines
     return cache[key]
+
+
+def _path_mode(repo: str, rev: str, path: str, cache: dict):
+    """Mode Git de `path` dans `rev` (`"100644"`, `"100755"`, ...), ou None."""
+    key = ("path-mode", str(rev), str(path))
+    if key not in cache:
+        text = plan_git._out(repo, "ls-tree", str(rev), "--", str(path))
+        if text is None:
+            cache[key] = None
+        else:
+            fields = str(text).split(None, 3)
+            cache[key] = fields[0] if len(fields) >= 3 else None
+    return cache[key]
+
+
+def _parsed_hunks(repo: str, sha: str, cache: dict):
+    """`_commit_hunks` mis en cache, None si la lecture est impossible."""
+    key = ("commit-hunks", str(sha))
+    if key not in cache:
+        try:
+            cache[key] = _commit_hunks(repo, sha)
+        except Exception:  # noqa: BLE001 - lecture impossible : doute
+            cache[key] = None
+    return cache[key]
+
+
+def _mode_delivery(repo: str, target: str, sha: str, cache: dict) -> Optional[bool]:
+    """Les changements de mode de `sha` sont-ils livrés dans `target` ?
+
+    True quand chaque mode postérieur s'y trouve (ou quand la lecture des
+    modes est impossible : les autres preuves gardent alors le doute), False
+    dès qu'un mode annoncé n'y est pas. Un chemin à mode seul compte comme
+    les autres (#3902 B/P2, témoin cx1)."""
+    parsed = _parsed_hunks(repo, sha, cache)
+    if not parsed:
+        return True
+    _hunks, modes = parsed
+    for path, (old_mode, new_mode) in sorted(modes.items()):
+        if str(old_mode) == str(new_mode):
+            continue
+        if str(new_mode) == "000000":
+            if _path_absent(repo, target, path, cache) is not True:
+                return False
+        elif _path_mode(repo, target, path, cache) != str(new_mode):
+            return False
+    return True
 
 
 def _find_block(lines: Sequence[str], block: Sequence[str], start: int) -> int:
@@ -1387,23 +1456,37 @@ def _content_before_head(repo: str, before: str, sha: str,
     * au même endroit, l'image antérieure du hunk (contexte + lignes
       retirées) ne doit pas être encore là : une suppression restée en place
       n'est pas une livraison, même quand le contexte seul y ressemble ;
+    * les modes postérieurs du commit, y compris un chemin à mode seul dans
+      un commit qui change du texte ailleurs, sont vérifiés contre la cible :
+      un mode encore absent est un doute (#3902 B/P2, témoin cx1) ;
     * une suppression totale de chemin se prouve par l'absence du chemin ;
     * un réordre ou une réindentation change l'image : il n'est pas prouvé
       par le seul compte de lignes.
 
     Toute lecture impossible, tout hunk non prouvé, tout déplacement de
     chemin est un doute : le commit reste (le doute ne retire jamais un
-    auteur). Un commit sans ligne significative (binaire, vide, blanc) n'est
-    jamais prouvé : il reste aussi.
+    auteur). Un commit sans ligne significative et sans changement de mode
+    (binaire, vide, blanc) n'est jamais prouvé : il reste aussi.
     """
     cache = {} if cache is None else cache
-    try:
-        hunks = _commit_hunks(repo, sha)
-    except Exception:  # noqa: BLE001 - lecture impossible : doute
+    parsed = _parsed_hunks(repo, sha, cache)
+    if not parsed:
         return False
-    if not hunks:
+    hunks, modes = parsed
+    if not hunks and not modes:
         return False
     meaningful = False
+    for path, (old_mode, new_mode) in sorted(modes.items()):
+        if str(old_mode) == str(new_mode):
+            continue
+        if str(new_mode) == "000000":
+            if _path_absent(repo, before, path, cache) is not True:
+                return False
+            meaningful = True
+            continue
+        if _path_mode(repo, before, path, cache) != str(new_mode):
+            return False
+        meaningful = True
     for path, path_hunks in sorted(hunks.items()):
         here = _path_lines(repo, before, path, cache)
         if here is None:
@@ -1562,6 +1645,11 @@ def _not_in_target(repo: str, commits, target: str, *, head: str = "",
             patches = plan_git._patch_ids(repo, "--no-walk", sha)
         except Exception:  # noqa: BLE001 - ce candidat reste dans le doute
             continue
+        # Un mode encore absent de la cible est un doute : aucune autre
+        # preuve (contenu, patch-id, rejeu) ne peut écarter le commit tant
+        # que sa livraison complète n'est pas établie (#3902, témoin cx1).
+        if _mode_delivery(repo, str(target), sha, cache) is False:
+            continue
         if before and _content_before_head(repo, before, sha, cache):
             equivalent.add(sha)
             continue
@@ -1606,7 +1694,7 @@ def _survives_rewrite(repo: str, head: str, sha: str, cache: dict,
         return True
     if target and _is_ancestor(repo, sha, target) is True:
         return False
-    if target:
+    if target and _mode_delivery(repo, str(target), sha, cache) is not False:
         if _content_before_head(repo, str(target), sha, cache):
             return False
         if _patch_in_target(repo, str(target), sha, cache):
